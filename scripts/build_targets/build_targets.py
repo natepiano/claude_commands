@@ -38,6 +38,8 @@ from targets import (
 )
 import offload
 import build_hold
+import override_guard
+from user_zone import user_zone
 
 
 
@@ -68,7 +70,7 @@ class CliArguments(argparse.Namespace):
 
 
 def local_time(instant: datetime) -> str:
-    return instant.astimezone().strftime("%H:%M %Z")
+    return instant.astimezone(user_zone()).strftime("%H:%M %Z")
 
 
 def display_field(value: str) -> str:
@@ -274,9 +276,9 @@ def command_wait_local(call_id: str, *, pid: int = 0) -> int:
         print(wait_diagnostic(str(error)), file=sys.stderr, flush=True)
         return 12
     finally:
-        if cancelled and registered[0]:
+        if cancelled and key:
             try:
-                build_hold.remove_call(key, call_id, cycle_id=registered[0])
+                build_hold.remove_call(key, call_id)
             except (OSError, build_hold.ReleaseRecordReadError):
                 pass
         for signum, handler in previous_handlers.items():
@@ -418,6 +420,7 @@ def parser() -> argparse.ArgumentParser:
 
 
 def main() -> int:
+    override_guard.refuse_overrides(Path(__file__), "build_targets/build_targets.py")
     args = parser().parse_args(namespace=CliArguments())
     if args.command == "eligible":
         routing = LocalRequired(args.local_reason) if args.local_reason else ANY_ELIGIBLE_TARGET

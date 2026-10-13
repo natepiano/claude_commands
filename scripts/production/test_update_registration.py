@@ -10,6 +10,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 from typing import cast, override
 
@@ -43,6 +44,11 @@ elif args[0] == "stop":
 else:
     raise SystemExit(2)
 '''
+
+
+def setUpModule() -> None:
+    """The times these tests expect are Pacific; the user's zone setting must not change them."""
+    unittest.enterModuleContext(mock.patch.dict(os.environ, {"USER_ZONE": "America/Los_Angeles"}))
 
 
 class RegistrationTests(unittest.TestCase):
@@ -127,7 +133,7 @@ class RegistrationTests(unittest.TestCase):
     def copied_command(self) -> Path:
         tree = Path(tempfile.mkdtemp(prefix="command-copy-", dir=self.root))
         _ = shutil.copytree(SCRIPT.parent, tree / "scripts/production")
-        for name in ("build_hold", "lint", "mac_test", "message", "usage", "whoami"):
+        for name in ("build_hold", "lib", "lint", "mac_test", "message", "usage", "whoami"):
             _ = shutil.copytree(SCRIPT.parent.parent / name, tree / "scripts" / name)
         hooks = tree / "scripts/hooks"
         hooks.mkdir(parents=True)
@@ -394,6 +400,32 @@ with patch.object(agents_log, 'append', side_effect=RuntimeError('recording fail
         self.assertEqual(enabled.returncode, 0, enabled.stdout + enabled.stderr)
         self.assertIn("next dailies:", enabled.stdout)
 
+    def test_footer_switch_off_still_stores_what_waits_on_the_user(self) -> None:
+        switch = self.state / "showrunner/footers-off/example"
+        switch.parent.mkdir(parents=True)
+        switch.touch()
+        outstanding = self.outstanding()
+        state = self.root / "judgment.json"
+        _ = state.write_text(json.dumps({"open_for_user": [
+            "review colors", {"text": "choose layout", "after": "2099-01-01T08:00"}]}), encoding="utf-8")
+        stored = self.run_command("footer", "--state", str(state))
+        self.assertEqual(stored.returncode, 0, stored.stdout + stored.stderr)
+        self.assertEqual(stored.stdout.strip(), "footer: ok — footers off")
+        entries = cast(list[dict[str, str]], json.loads(outstanding.read_text(encoding="utf-8")))
+        self.assertEqual([entry["text"] for entry in entries], ["review colors", "choose layout"])
+        self.assertEqual(entries[1]["after"], "2099-01-01T08:00")
+        before = outstanding.read_bytes()
+        _ = state.write_text(json.dumps({"units": []}), encoding="utf-8")
+        kept = self.run_command("footer", "--state", str(state))
+        self.assertEqual(kept.stdout.strip(), "footer: ok — footers off")
+        self.assertEqual(outstanding.read_bytes(), before)
+        _ = state.write_text(json.dumps({"open_for_user": [{"text": "choose layout", "after": "tomorrow"}]}),
+                             encoding="utf-8")
+        bad = self.run_command("footer", "--state", str(state))
+        self.assertEqual(bad.returncode, 2, bad.stdout + bad.stderr)
+        self.assertIn("footer: failed", bad.stdout)
+        self.assertEqual(outstanding.read_bytes(), before)
+
     def test_footer_switch_off_drops_all_output_and_on_renders_footer(self) -> None:
         switch = self.state / "showrunner/footers-off/example"
         switch.parent.mkdir(parents=True)
@@ -407,6 +439,98 @@ with patch.object(agents_log, 'append', side_effect=RuntimeError('recording fail
         self.assertIn("footer: ok", on.stdout)
         self.assertIn("update:", on.stdout)
         self.assertIn("no dailies scheduled", on.stdout)
+
+    def timer(self, slug: str) -> None:
+        """A production with a complete update timer, so the tree counts it."""
+        instance = self.state / "notifier" / f"showrunner-{slug}"
+        instance.mkdir(parents=True)
+        _ = (instance / "conf").write_text(
+            f"TARGET=session:{slug}-session\nCHECK=zsh /x/production_check.sh {self.doc}\n", encoding="utf-8")
+
+    def attach(self, child: str, parent: str) -> None:
+        edge = self.state / "showrunner" / child / "parent"
+        edge.parent.mkdir(parents=True, exist_ok=True)
+        _ = edge.write_text(parent + "\n", encoding="utf-8")
+
+    def write_open_for(self, slug: str, *items: dict[str, str]) -> None:
+        _ = self.outstanding().with_name(f"{slug}.json").write_text(json.dumps(list(items)), encoding="utf-8")
+
+    def open_lines(self) -> list[str]:
+        listed = self.run_command("open")
+        self.assertEqual(listed.returncode, 0, listed.stdout + listed.stderr)
+        return listed.stdout.splitlines()
+
+    def test_footer_of_a_root_covers_lower_lists_and_a_lower_one_names_its_root(self) -> None:
+        for slug in ("example", "kid"):
+            self.timer(slug)
+        self.attach("kid", "example")
+        quiet = self.run_command("footer", "--nothing-needed")
+        self.assertIn(" - nothing needed", quiet.stdout)
+        self.write_open_for("kid", {"since": "2026-10-06T08:00", "text": "merge today?"})
+        counted = self.run_command("footer", "--nothing-needed")
+        self.assertEqual(counted.returncode, 0, counted.stdout + counted.stderr)
+        self.assertNotIn("nothing needed", counted.stdout)
+        self.assertNotIn("merge today?", counted.stdout)
+        _ = self.outstanding().with_name("kid.json").write_text("{bad", encoding="utf-8")
+        unread = self.run_command("footer", "--nothing-needed")
+        self.assertEqual(unread.returncode, 0, unread.stdout + unread.stderr)
+        self.assertIn("* kid: needs-user list unreadable", unread.stdout.splitlines())
+        self.timer("top")
+        self.attach("example", "top")
+        lower = self.run_command("footer")
+        self.assertIn("* reports to top", lower.stdout.splitlines())
+        self.assertNotIn("* kid: needs-user list unreadable", lower.stdout.splitlines())
+
+    def test_open_lists_every_item_below_a_root_in_full_oldest_first(self) -> None:
+        for slug in ("example", "kid", "grandkid", "stranger"):
+            self.timer(slug)
+        self.attach("kid", "example")
+        self.attach("grandkid", "kid")
+        self.write_open_for("example", {"since": "2026-10-06T09:00", "text": "choose layout"},
+                            {"since": "2026-10-05T07:00", "text": "review colors", "after": "2099-01-02T08:00"})
+        self.write_open_for("kid", {"since": "2026-10-06T08:00", "text": "merge today, or after the release?"})
+        self.write_open_for("grandkid", {"since": "2026-09-28T10:30", "text": "keep the old key binding?"})
+        self.write_open_for("stranger", {"since": "2026-10-01T08:00", "text": "not this tree's"})
+        self.assertEqual(self.open_lines(), [
+            "1. grandkid, since Mon Sep 28 10:30: keep the old key binding?",
+            "2. kid, since Tue Oct 06 08:00: merge today, or after the release?",
+            "3. example, since Tue Oct 06 09:00: choose layout",
+            "deferred until Fri Jan 02 08:00: example: review colors",
+            "open: ok — 3 due, 1 deferred",
+        ])
+
+    def test_open_names_an_unreadable_list_and_still_lists_the_rest(self) -> None:
+        for slug in ("example", "kid"):
+            self.timer(slug)
+        self.attach("kid", "example")
+        self.write_open_for("example", {"since": "2026-10-06T09:00", "text": "choose layout"})
+        _ = self.outstanding().with_name("kid.json").write_text("{bad", encoding="utf-8")
+        self.assertEqual(self.open_lines(), [
+            "1. example, since Tue Oct 06 09:00: choose layout",
+            "kid: needs-user list unreadable",
+            "open: ok — 1 due, 0 deferred, 1 unreadable",
+        ])
+
+    def test_open_below_a_root_lists_only_its_own_items(self) -> None:
+        for slug in ("top", "example", "kid"):
+            self.timer(slug)
+        self.attach("example", "top")
+        self.attach("kid", "example")
+        self.write_open_for("example", {"since": "2026-10-06T09:00", "text": "choose layout"})
+        self.write_open_for("kid", {"since": "2026-10-06T08:00", "text": "merge today?"})
+        self.write_open_for("top", {"since": "2026-10-06T07:00", "text": "ship it?"})
+        self.assertEqual(self.open_lines(), [
+            "1. example, since Tue Oct 06 09:00: choose layout",
+            "open: ok — 1 due, 0 deferred",
+        ])
+
+    def test_open_with_nothing_attached_lists_its_own_items_or_none(self) -> None:
+        self.assertEqual(self.open_lines(), ["open: ok — 0 due, 0 deferred"])
+        self.write_open_for("example", {"since": "2026-10-06T09:00", "text": "choose layout"})
+        self.assertEqual(self.open_lines(), [
+            "1. example, since Tue Oct 06 09:00: choose layout",
+            "open: ok — 1 due, 0 deferred",
+        ])
 
 
 if __name__ == "__main__":

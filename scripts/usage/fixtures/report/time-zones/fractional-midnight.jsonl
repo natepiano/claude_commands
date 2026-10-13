@@ -1,0 +1,2 @@
+{"type":"assistant","timestamp":"2026-10-10T18:14:59.999999Z","requestId":"fractional-before","message":{"id":"fractional-before","model":"claude-opus-4-6","usage":{"input_tokens":10,"output_tokens":0}}}
+{"type":"assistant","timestamp":"2026-10-10T18:15:00.000001Z","requestId":"fractional-after","message":{"id":"fractional-after","model":"claude-opus-4-6","usage":{"input_tokens":20,"output_tokens":0}}}

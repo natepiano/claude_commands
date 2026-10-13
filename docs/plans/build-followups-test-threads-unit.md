@@ -57,14 +57,13 @@ User, 2026-10-09 16:4x PDT, approving the nightly 2026-10-08 rust main proposal 
   - Width selection never fails, prints or changes a status: a core count it cannot read adds no flag.
   - Tests never read the live `~/.local/state/buildlog` (`BUILDLOG_DIR` points at a temp dir) and never run real `cargo`.
   - Python: no `Any`, a `TypedDict` per JSON shape, no file-level ignores.
-  - Times shown to the user are America/Los_Angeles; build-log stamps are UTC.
+  - Times shown to the user are America/New_York (the user, 2026-10-12; America/Los_Angeles before that); the scorecard prints PDT, and build-log stamps are UTC.
 
 ## Gates
 
 | Gate | Waiting | Waits on | Clears when |
 | --- | --- | --- | --- |
 | G1 | Phase 3 | T0 + 72 h (+ 24 h if the sample is short) | the clock, after the showrunner has fast-forwarded Phase 2 to `~/.claude` main |
-| G2 | Phase 4 | T1 + 48 h, where T1 is when Phase 3's width reaches `~/.claude` main | the clock; dropped when the verdict reverts |
 
 While G1 holds, each time the unit director wakes it runs `width_trial.py report --since <T0> --until <now>` (seconds) and messages natedev only when T or F fails by the Rules with at least 30 whole-hana runs per arm.
 
@@ -100,73 +99,104 @@ While G1 holds, each time the unit director wakes it runs `width_trial.py report
 
 ### Phase 2 — The trial starts: each nextest step runs at 16 or 32 by block  · status: done
 
-#### Work Order
+#### As-built
 
-**Goal:** every nextest step `invoke.sh` runs names its width: natedev alternates 16 and 32 by 100-minute block, the Mac runs 12, and a caller's own width is kept.
-
-**Spec:**
-
-`scripts/lint/invoke.sh`, beside `run_nextest`:
-- `LINT_TEST_WIDTH=trial` — the mode: `trial` (block parity), `physical`, `logical`. A comment names Phase 3 as the line that sets the verdict, and `width_trial.py`'s `BLOCK_S` as the twin of the block length.
-- `nextest_physical_cores [sysfs_root]` sets `LINT_PHYSICAL_CORES` once per shell: on Linux, the number of distinct `physical_package_id:core_id` pairs under `${1:-/sys/devices/system/cpu}/cpu[0-9]*/topology/`, read with `read` (no forks, no associative arrays); on darwin `sysctl -n hw.physicalcpu`. `nextest_logical_cores` sets `LINT_LOGICAL_CORES` once: `getconf _NPROCESSORS_ONLN`. A value that is empty or not a positive integer stays empty.
-- `nextest_width_arm EPOCH` prints nothing and sets `LINT_TEST_WIDTH_ARM` to `physical` when `(EPOCH / 6000) % 2 == 0`, else `logical`.
-- `run_nextest`: unless an argument is `--test-threads`, `--test-threads=*`, `-j` or `-j*`, or `NEXTEST_TEST_THREADS` is set: pick the arm (`trial`: `nextest_width_arm "${EPOCHSECONDS:-$(date +%s)}"`; otherwise the mode itself), take that core count, and when it is set run `cargo nextest run --test-threads <N> "$@"`. The flag goes before `"$@"`, since a caller's `--` hands what follows to the test binaries. Otherwise run as today.
+- `invoke.sh` holds the mode line `LINT_TEST_WIDTH=trial` (values `trial`, `physical`, `logical`) beside `run_nextest`; its comment names the modes and `width_trial.py`'s `BLOCK_S` as the block length's twin.
+- `nextest_physical_cores [sysfs_root]` sets `LINT_PHYSICAL_CORES` once per shell: on Linux the count of distinct `physical_package_id:core_id` pairs under `${1:-/sys/devices/system/cpu}/cpu[0-9]*/topology/`, read with `read`; on darwin `sysctl -n hw.physicalcpu`. `nextest_logical_cores` sets `LINT_LOGICAL_CORES` once from `getconf _NPROCESSORS_ONLN`. A value that is not a positive integer stays empty.
+- `nextest_width_arm EPOCH` sets `LINT_TEST_WIDTH_ARM` to `physical` when `(EPOCH / 6000) % 2 == 0`, else `logical`, and prints nothing.
+- `run_nextest` runs `cargo nextest run --test-threads <N> "$@"`, N from the mode's arm (`trial` reads `${EPOCHSECONDS:-$(date +%s)}`). It adds nothing when `NEXTEST_TEST_THREADS` is set, when an argument before `--` is `--test-threads`, `--test-threads=*`, `-j` or `-j*`, or when the core count is unreadable, and the status passes through unchanged. Arguments after `--` belong to the test binaries and never suppress the width.
+- natedev's arms are 16 and 32; the Mac reads 12 for both, and `bash -n` passes under its bash 3.2.
 
 **Files:**
-- `scripts/lint/invoke.sh` — the width functions and `run_nextest`.
-- `scripts/lint/test_nextest_width.py` — new.
+- `scripts/lint/invoke.sh` — the mode line, the width functions and `run_nextest`.
+- `scripts/lint/test_nextest_width.py` — core counts and their cache, arm boundaries, trial parity, fixed modes, caller overrides, `--` handling, status passthrough.
+- `scripts/delegate/test_verify_mac_offload.py` — the local run's argv carries the width pair.
 
-**Seats:** `1 writer + 1 tester` — one function group in one file; the tester writes from the rules above.
-- `impl` — `scripts/lint/invoke.sh`
-- `test` — `scripts/lint/test_nextest_width.py`, sourcing `invoke.sh` as `test_invoke_scope.py` does, with a stand-in `cargo` on `PATH` that prints its argv and `run` replaced by a function that prints its argv: a fake sysfs root with 4 CPUs on 2 cores gives 2; `nextest_width_arm` at 0, 5999, 6000 and 12000; `trial` at an even and an odd block gives `--test-threads 2` and the logical count; `physical` and `logical` modes; `-j 4`, `--test-threads=3` and `NEXTEST_TEST_THREADS=5` add nothing; a trailing `-- --nocapture` stays after the flag; an unreadable core count adds nothing and the status passes through
+**Binds later work:**
+- The verdict changes only the value on the mode line; `test_nextest_width.py` sets the mode in every case, so it passes under any default.
+- `memory_admit.test_threads(argv)` reads the first width in argv, so the width `invoke.sh` adds before the caller's arguments is the one each reservation, anon-peak record and the scorecard see.
+- T0 is when this phase's checkpoint reaches `~/.claude` main: the reflog entry that brings it in.
 
-**Constraints from prior phases:** Phase 1: `memory_admit.test_threads(argv)` reads `--test-threads N`, so each width keys its own reservation from the first step; each new width starts with no measured records and uses the index tier until it has five. `width_trial.py`'s `BLOCK_S = 6000`; arm names `physical` (16) and `logical` (32).
+**Gotchas:**
+- `~/rust/rust-template` is a cargo-generate template with no `Cargo.toml`; a live width check runs on a real crate such as `~/rust/cargo-liner` (at an even block it ran `--test-threads 16`, 4,679 tests passed, and its anon-peak record carried `test_threads` 16).
+- A step run outside `verify.sh` records `call_id` None; whole-hana runs all come through `verify.sh`.
 
-**Acceptance gate:** `python3 -m unittest discover -s scripts/lint -p 'test_*.py'` green; `basedpyright scripts/lint/test_nextest_width.py` clean; `bash -n scripts/lint/invoke.sh`. Live on natedev: `bash -c 'source <worktree>/scripts/lint/invoke.sh; cd ~/rust/rust-template && run_nextest --workspace'` runs with `--test-threads 16` or `32` (the current block's), the build log step's argv shows it, and its `anon_peaks.jsonl` record carries `test_threads`; over `ssh mac` (prints `rc=`), `bash -n` on the worktree's file passes. After the showrunner fast-forwards it to main: T0 from the reflog, sent to natedev with G1's time, and the first organic hana nextest steps carry the flag.
+**Ruled out:** reading the last width in argv in `memory_admit` or `width_trial` — the first-width rule already reads `invoke.sh`'s flag and keeps the frozen hashes.
 
-### Phase 3 — Readout: the verdict, and the width it sets  · status: todo
+### Phase 3 — Readout: the verdict, and the width it sets  · status: done
+
+#### As-built
+
+- The 72 h trial's pre-registered scorecard over W = `2026-10-09T18:05:32-07:00` – `2026-10-12T18:05:32-07:00` (2026-10-09 18:05 PDT – 2026-10-12 18:05 PDT; 2026-10-09 21:05 EDT – 2026-10-12 21:05 EDT) returns `verdict: revert — W none`; sample ok, no extension.
+- Action rule: W `none` → revert → `scripts/lint/invoke.sh` holds `LINT_TEST_WIDTH=logical`. Every natedev nextest step runs `--test-threads <logical core count>` (32, nextest's own default) and records width `logical`; `test_nextest_width.py` pins each mode. G2 and the rollout check are dropped. The width functions and the `trial`/`physical` modes remain, so switching back is one value.
+- Hashes: `memory_admit.py` on `~/.claude` main matches `1ecd402a…`; `width_trial.py` on main is `e80d583f…`, not the frozen `a35ac694…`. Main's script (commit 397d3125, a display-zone change: `_clock` reads `user_zone()`) prints identical output apart from the header line; the verdict is read from the frozen script.
+- Ledger line 25 of `~/.local/state/nightly-review/ledger.md` carries `; trial 2026-10-09–2026-10-12: revert, W 1.05 (0.53–2.27), P 7.06 GiB, R 9.80 GiB, T 1.13, F −7.0pt; logical (~/.claude 9cd72746)`; natedev has the verdict line and table.
+
+Frozen script output (`width_trial.py report --since 2026-10-09T18:05:32-07:00 --until 2026-10-12T18:05:32-07:00`):
+```
+Width trial natedev 2026-10-09 18:05 PDT – 2026-10-12 18:05 PDT (72.0 h) · width_trial.py sha256 a35ac69482d2
+arm        blocks  hana steps  whole-hana runs
+physical       22       1,393              114
+logical        22       1,451              103
+sample: ok
+metric                                        physical    logical     ratio    90% interval rule                          result
+W memory wait per hana test step (s)              19.2       18.2      1.05       0.53–2.27 ≤ 0.50, high < 1.00           none
+P whole-hana anon peak p50 (GiB)                  7.06       8.69      0.81       0.75–0.91 physical ≤ 6.50               unmet
+R gate reservation, hana nextest (GiB)            9.80       9.70         —               — physical ≤ 9.00               unmet
+T whole-hana exec p50 (s)                          372        330      1.13       1.00–1.21 fails > 1.11 and low > 1      pass
+F whole-hana failed runs (%)                      38.6       45.6    −7.0pt     −17.9–5.1pt fails > +5pt and low > 0      pass
+  timed-out tests per 100 whole-hana runs          0.0        0.0
+  memory wait per gated step, all natedev         13.3       11.6
+verdict: revert — W none
+```
+Main's script header line: `Width trial natedev 2026-10-09 21:05 EDT – 2026-10-12 21:05 EDT (72.0 h) · width_trial.py sha256 e80d583f28d1`.
+
+In-window merges to `~/.claude` main touching `verify.sh`, `invoke.sh`, `memory_gate.sh` or `record.py` (none edits the hashed files or the width code; routing changes move how many runs reach natedev, for both arms alike):
+- `44584b49` 2026-10-10T14:20:53-07:00 — Mac-first routing in `verify.sh`, one field in `record.py`.
+- `1fc62564` 2026-10-11T18:19:36-07:00 — `build_hold_mark` credits the owning session.
+- `0fc140c9` 2026-10-11T22:17:24-07:00 — a local `verify.sh` step waits out a natedev build hold, recorded only as `BUILDLOG_HOLD_WAIT_S`; `run_nextest` waits before it picks its width.
+- `87444ee6` 2026-10-12T04:37:21-07:00 — a test goes to the first free target.
+
+Build holds inside W stay in the readout (they reach both arms): hana's on 2026-10-11; tile-fixes' for about 20 min from 2026-10-12T11:37-07:00; hana's from 2026-10-12T13:42-07:00.
+
+**Files:**
+- `scripts/lint/invoke.sh` — the nextest width mode line, `LINT_TEST_WIDTH=logical`, and its comment naming the three modes (`trial` alternates physical and logical by block; `physical` or `logical` fixes the width) and `BLOCK_S` in `width_trial.py` as the block length's twin.
+
+**Binds later work:** `invoke.sh` runs `logical`; the rollout check and G2 are gone; the hash freeze on `width_trial.py` and `memory_admit.py` ended with the readout.
+
+**Gotchas:**
+- T read as failing by the Rules at the 64.2 h check (2026-10-12T10:19-07:00) and passed at 72 h (low end exactly 1.00); interim reads of a pre-registered trial move.
+- P and R stay unmet under physical: 16 threads cut the whole-hana anon peak p50 by about a fifth but do not lower the gate's reservation, which follows the gate's own recorded peaks.
+
+**Ruled out:**
+- Keeping 16 threads: no memory-wait gain (W ratio 1.05, interval 0.53–2.27) to pay for 13% slower whole-hana runs.
+- Reading the verdict from main's changed script: the frozen script is the pre-registered instrument.
+
+### Phase 4 — The local lint covers what CI's Clippy job covers  · status: todo
 
 #### Work Order
 
-**Blocked by:** G1.
-
-**Goal:** the scorecard over W gives the verdict, the width it calls for is set, and the verdict reaches natedev and the ledger.
+**Goal:** `verify.sh lint` runs clippy with the targets and features CI's Clippy job uses, so code behind a non-default feature, a bench and an example fail locally before CI, and the cost on hana is measured before and after.
 
 **Spec:**
-- The SHA-256 of `width_trial.py` and `memory_admit.py` on `~/.claude` main equals Phase 1's As-built; a mismatch stops the phase and goes to natedev.
-- Run `report --since <T0> --until <T0 + 72 h>`. On `sample: short`, extend once to `T0 + 96 h` (end the turn blocked until then), and read that.
-- Apply the Action rule: keep → `LINT_TEST_WIDTH=physical`; revert → `LINT_TEST_WIDTH=logical`, and G2 is dropped; trade-off → send natedev `--need decision` with W, T and F and both choices, change nothing, and end the turn blocked until the answer.
-- Ledger line 25 (`~/.local/state/nightly-review/ledger.md`): append `; trial <T0 date>–<end date>: <verdict>, W <ratio> (<interval>), P <GiB>, R <GiB>, T <ratio>, F <points>pt; <width> (~/.claude <sha>)`.
-- natedev gets the verdict line and the table.
+- In the `lint` arm of `scripts/delegate/verify.sh`, the clippy stage becomes `invoke_clippy --workspace --all-targets --all-features`. It takes no `FEATURE_FLAGS`: `--all-features` covers a trailing `--features`, which still reaches mend and rustdoc.
+- This is CI's command. Job `clippy` in `~/rust/hana/.github/workflows/ci.yml` runs `cargo clippy --workspace --all-targets --all-features -- -D warnings`, the other repos' workflows hold the same line, and `scripts/release/pre_release_checks.sh` already runs it at the push gate, so the dev loop and the push gate share one all-features set of check artifacts. CI's second pass, for the Windows target, stays CI's alone.
+- `check`, `test`, `example`, `final`, mend, fmt and rustdoc keep their scope. The `example` verb stays: one example, while iterating.
+- Comments and usage in `verify.sh` say what is true after the change: the header (the dev-loop target pinning, `Nothing below final uses --all-targets`, `with default features`), the `lint` and `--features` usage lines, the comment in `compose_nextest_args` on what the lint half compiles under clippy, and the `example` arm's `lint never sees an example`.
+- Tests run the real `verify.sh` with a stand-in `cargo` that answers `cargo metadata` from synthetic JSON and records each call's argv (the pattern in `scripts/delegate/test_verify_mac_offload.py`; `test_verify_release_ack.py` stubs the lint-config reader and silences skip notices, so it does not fit), and the real lint-config reader over a temporary `lint.conf`: `lint <pkg>` gives clippy exactly `--workspace --all-targets --all-features -- -D warnings`; `lint <pkg> --features a` gives clippy the same argv and gives mend and rustdoc the qualified `--features`; `example` argv is unchanged; with clippy off in `lint.conf` the skip line names the new command.
+- The unit director measures, after the seats finish; no seat runs this. In a detached scratch worktree of `~/rust/hana`, removed after:
+  - At hana's main tip, `verify.sh lint hana --no-cache` with `~/.claude` main's script (before) and with this branch's script (after); every measured run passes `--no-cache`, because touching a file leaves the content-based pass key unchanged and a cached pass replays without running clippy. For each: one run, then one more after touching one source file under `crates/hana` (the dev-loop case). The after script's first run also pays the one-time all-features dependency check; report it apart.
+  - At `af5958758eebabca33a6123bfbfb38809be0c29b` (hana `init/catalyst`, CI run 38306974911): the before script passes and the after script fails on the missing `#[must_use]` in hana_diegetic's `bench_support`.
+  - Per run: the `clippy` step's `duration_s`, `finished_s` and `mem_wait_s` from the build log, its anon peak from `anon_peaks.jsonl` by `call_id`, and the gate's reservation `memory_admit.expected_peak("hana", "clippy", "natedev", …)` before and after. The table goes in the As-built and the checkpoint notice.
+- A touched-file lint that takes more than twice as long, or an anon peak more than 2 GiB higher, goes to natedev with the table before the checkpoint, beside the narrower choice: the dev-loop lint unchanged and CI's clippy run once per checkpoint by the unit director (natedev confirmed the two limits and the scratch worktree, 2026-10-12).
 
 **Files:**
-- `scripts/lint/invoke.sh` — the mode line.
-- `docs/plans/build-followups-test-threads-unit.md` — the As-built table.
-
-**Seats:** `1 writer` — `impl` runs the scorecard, changes one line and reports.
-
-**Constraints from prior phases:** Phase 1: the scorecard and its frozen SHA-256 hashes — `scripts/buildlog/width_trial.py` `a35ac69482d24493fe2ad5a9e0e975376c5de4dc92650cccf47bb613b2282fc9`, `scripts/lint/memory_admit.py` `1ecd402ab4ee4f0d5df19716bb406d17aa0cf1e4864040faad67f623e95a486b` (Phase 1 As-built holds the `unset` baseline). The sample minimum counts only the `physical` and `logical` arms; steps without a width print as an `unset` column. `expected_peak` takes only records before its `now`, so R re-reads the same at any later time. Phase 2: T0, the mode variable `LINT_TEST_WIDTH` and its values.
-
-**Acceptance gate:** the hashes match; the report exits 0; the As-built holds the full output, the action and its rule; for keep or revert, `bash -n scripts/lint/invoke.sh` and `python3 -m unittest discover -s scripts/lint -p 'test_nextest_width.py'` green with that mode.
-
-### Phase 4 — Rollout check: the kept width holds with every step on it  · status: todo
-
-#### Work Order
-
-**Blocked by:** G2.
-
-**Goal:** 48 hours with every natedev step at 16 show the reservation and the waits the trial's physical arm showed.
-
-**Spec:**
-- Run `report --since <T1> --until <T1 + 48 h>` (one arm).
-- Holds when R ≤ 9.0 GiB, W's mean is at most the trial's physical-arm interval's high end, and T's p50 is at most the trial's logical p50 × 1.11. Any miss goes to natedev with the numbers; nothing reverts on its own.
-- Ledger line 25: append `; rollout <T1 date>–<end date>: <holds | misses …>`. natedev gets the line.
-
-**Files:**
+- `scripts/delegate/verify.sh` — the clippy stage, the comments and the usage text.
+- `scripts/delegate/test_verify_lint_scope.py` — the tests, a new file.
 - `docs/plans/build-followups-test-threads-unit.md` — the As-built.
 
-**Seats:** `1 writer` — `impl` runs the report and records it.
+**Seats:** `1 writer + 1 tester` — `impl` owns `verify.sh`; `test` owns `test_verify_lint_scope.py`.
 
-**Constraints from prior phases:** Phase 3: the verdict, T1 and the trial's per-arm values and intervals.
+**Constraints from prior phases:** Source: natedev, 2026-10-12, from hana: CI run 38306974911 failed Clippy on code behind the non-default feature `bench_support`, which `lint`'s `--workspace --lib --bins --tests` with default features never compiles. Phase 3: merge `build-followups` into the branch first; build-report's phases 2, 3, 5 and 10 changed `verify.sh`. Phase 3's verdict was revert: `invoke.sh` runs nextest at `logical` width, the rollout phase is dropped, and the trial's hash freeze on `memory_admit.py` and `width_trial.py` ended with that readout. This phase edits neither: the clippy reservation key is unchanged, so the gate learns the wider peak from its own records. hana's features that reach dependencies under `--all-features`: `hana/hotpatching` (`bevy/hotpatching`), `tween` (`dep:bevy_tween`), `monitor-probe` (`dep:tracing`), `hana_video/test` (`zbus/bus-impl`, `zbus/p2p`); the first means a second check of the bevy tree. `verify.sh`'s pass key hashes these scripts, so every recorded lint pass misses once after the change. `verify.sh` waits out a natedev build hold by itself. Delegation Context's line numbers in `verify.sh` and `invoke.sh` predate build-report's changes and this plan's width code (`run_nextest` now picks the width before it calls nextest); find each place by name. The same gap outside this phase, sent to natedev: `scripts/lint/lint clippy` (`/clippy`, the fix pipeline) passes `--all-targets` with the caller's features, and `verify.sh test` runs default features where CI's nextest runs `--all-features`.
 
-**Acceptance gate:** the report exits 0; the As-built states each condition with its number.
+**Acceptance gate:** `python3 -m unittest discover -s scripts/delegate -p 'test_verify_lint_scope.py'` and `python3 -m unittest discover -s scripts/delegate -p 'test_*.py'` green; basedpyright clean on the new file; `bash -n scripts/delegate/verify.sh`; the after script passes on hana's main tip and fails on `af59587` as the Spec says; the As-built holds the before and after table.

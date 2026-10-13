@@ -102,6 +102,26 @@ class UnitLookupTests(unittest.TestCase):
         with self.assertRaisesRegex(OSError, "both carry the mark of trunk-unit"):
             _ = unit_lookup.marked_units("show")
 
+    def test_every_productions_units_come_from_one_read_and_a_fault_leaves_out_only_its_production(self) -> None:
+        fake_tmux.write(self.state, {
+            "$1": marked("trunk", "%4", "trunk-unit"),
+            "$2": FakeSession(label="two-panes", panes=["%5", "%6"],
+                              env={"SHOWRUNNER_UNIT": "other", "SHOWRUNNER_UNIT_ID": "fps-unit"}),
+            "$3": marked("copy-a", "%7", "dup-unit", slug="faulty"),
+            "$4": marked("copy-b", "%8", "dup-unit", slug="faulty"),
+            "$5": FakeSession(label="unmarked", panes=["%9"], env={}),
+        })
+        self.claude("fps", "%6")
+        found = unit_lookup.every_marked_unit()
+        self.assertEqual(sorted(found.units), ["other", "show"])
+        self.assertEqual(found.faults, {"faulty": "tmux sessions copy-a and copy-b both carry the mark of dup-unit"})
+        # A unit director's pane is the one its Claude runs in.
+        self.assertEqual(found.units["other"]["fps-unit"].pane, "%6")
+        self.assertIsInstance(found.units["show"]["trunk-unit"].claude, ClaudeNotRunning)
+        self.assertEqual(list(unit_lookup.marked_units("other")), ["fps-unit"])
+        with self.assertRaisesRegex(OSError, "both carry the mark of dup-unit"):
+            _ = unit_lookup.marked_units("faulty")
+
     def test_the_command_prints_the_pane_and_tells_absent_from_cannot_tell(self) -> None:
         fake_tmux.write(self.state, {"$1": marked("trunk", "%4", "trunk-unit")})
         self.claude("trunk", "%4")

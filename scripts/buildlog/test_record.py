@@ -15,6 +15,7 @@ import sys
 import tempfile
 import time
 import unittest
+from unittest import mock
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import cast, override
@@ -35,6 +36,8 @@ AMBIENT = (
     "BUILDLOG_CALLER",
     "BUILDLOG_CALL_ID",
     "BUILDLOG_LOCAL_REASON",
+    "BUILDLOG_TARGET",
+    "BUILDLOG_HOLD_WAIT_S",
     "LINT_OUTPUT_DIR",
     "VALIDATE_TARGET_DIR",
     "CLAUDECODE",
@@ -65,6 +68,11 @@ def ledger_line(**fields: object) -> str:
     }
     event.update(fields)
     return json.dumps(event)
+
+
+def setUpModule() -> None:
+    """The times these tests expect are Pacific; the user's zone setting must not change them."""
+    unittest.enterModuleContext(mock.patch.dict(os.environ, {"USER_ZONE": "America/Los_Angeles"}))
 
 
 class RecordTests(unittest.TestCase):
@@ -631,6 +639,33 @@ class RecordTests(unittest.TestCase):
         )
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(self.records()[-1]["local_reason"], "")
+
+    def test_call_records_target_and_fractional_hold_wait(self) -> None:
+        for target in ("mac", "natedev", ""):
+            with self.subTest(target=target):
+                result = self.record(
+                    "call", "ran", "0", "0", "9", "1", "", "0", "10", "test", "hana",
+                    extra={"BUILDLOG_TARGET": target, "BUILDLOG_HOLD_WAIT_S": "0.4"},
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(self.records()[-1]["target"], target)
+                self.assertEqual(self.records()[-1]["hold_wait_s"], 0.4)
+
+    def test_call_records_null_hold_wait_for_invalid_numbers(self) -> None:
+        for value in ("", "abc", "-0.4", "nan", "inf"):
+            with self.subTest(value=value):
+                result = self.record(
+                    "call", "ran", "0", "0", "9", "1", "", "0", "10", "test", "hana",
+                    extra={"BUILDLOG_HOLD_WAIT_S": value},
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIsNone(self.records()[-1]["hold_wait_s"])
+
+    def test_call_records_empty_target_and_null_hold_wait_when_unset(self) -> None:
+        result = self.record("call", "ran", "0", "0", "9", "1", "", "0", "10", "test", "hana")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.records()[-1]["target"], "")
+        self.assertIsNone(self.records()[-1]["hold_wait_s"])
 
     def test_call_records_null_mac_seconds_when_value_is_unusable(self) -> None:
         for value in ("", "abc", "-1"):

@@ -81,6 +81,11 @@ elif name == "nix":
 '''
 
 
+def setUpModule() -> None:
+    """The times these tests expect are Pacific; the user's zone setting must not change them."""
+    unittest.enterModuleContext(patch.dict(os.environ, {"USER_ZONE": "America/Los_Angeles"}))
+
+
 @final
 class AddUnitTests(ShutdownTestCase):
     def __init__(self, methodName: str = "runTest") -> None:
@@ -1115,6 +1120,37 @@ class AddUnitTests(ShutdownTestCase):
         self.assertEqual(len(self.log.read_text().splitlines()), 1)
         self.assertIn("alpha-unit started: tmux attach -t alpha", result.stdout)
 
+    def test_review_unit_uses_an_ordinary_row_and_worktree_with_review_direct_opening(self) -> None:
+        _ = self.doc.write_text(self.doc.read_text().replace("## Units", "- **Review pool:** code\n\n## Units"))
+        _ = self.successful("review", "--plan", "docs/plans/given.md")
+        worktree = self.root / "project-review"
+        self.assertTrue(worktree.is_dir())
+        self.assertEqual(self.git("rev-parse", "--abbrev-ref", "HEAD", cwd=worktree),
+                         "build-followups-review")
+        row = next(line for line in self.doc.read_text().splitlines() if line.startswith("| review-unit |"))
+        self.assertEqual([cell.strip() for cell in row.strip("|").split("|")],
+                         ["review-unit", "docs/plans/given.md", str(worktree),
+                          "build-followups-review", "—", "—"])
+        self.assertTrue(row.endswith("| — | — |"), row)
+        self.assertEqual(self.marks("review"),
+                         {"SHOWRUNNER_UNIT": "build-followups", "SHOWRUNNER_UNIT_ID": "review-unit"})
+        self.assertIn(shlex.quote(f"/review:direct {self.doc}"), self.launch_command())
+        self.assertNotIn("/unit:direct", self.launch_command())
+
+    def test_promoted_review_unit_uses_review_direct_with_its_identity(self) -> None:
+        _ = self.doc.write_text(self.doc.read_text().replace("## Units", "- **Review pool:** code\n\n## Units"))
+        _ = self.successful("review-unit", "--plan", "docs/plans/given.md",
+                            "--resume", "session-123", "--cwd", str(self.checkout))
+        command = self.launch_command()
+        self.assertIn("You are now review-unit in production build-followups", command)
+        self.assertIn(f"Run /review:direct {self.doc}.", command)
+        self.assertNotIn("Run /unit:direct", command)
+
+    def test_review_named_unit_without_a_pool_keeps_unit_direct_opening(self) -> None:
+        _ = self.successful("review", "--plan", "docs/plans/given.md")
+        self.assertIn(shlex.quote("/unit:direct docs/plans/given.md"), self.launch_command())
+        self.assertNotIn("/review:direct", self.launch_command())
+
     def test_named_unit_account_is_quoted_inside_tmux_command(self) -> None:
         home = self.root / "home with 'quotes' $()"
         _ = Path(self.env["HOME"]).rename(home)
@@ -1279,7 +1315,7 @@ class AddUnitTests(ShutdownTestCase):
                 self.assertEqual(result.returncode, 2, (result.stdout, result.stderr))
                 self.assertEqual(
                     result.stderr,
-                    f"add_unit: unit account claude 3: accounts: {directory} is missing; /accounts status\n",
+                    f"add_unit: unit account claude 3: accounts: {directory} is missing; /showrunner:accounts\n",
                 )
                 self.assert_no_launch_change(document, head)
                 self.assertFalse(Path(self.env["SHUTDOWN_STATE_DIR"]).exists())
@@ -1295,7 +1331,7 @@ class AddUnitTests(ShutdownTestCase):
         self.assertEqual(result.returncode, 2, (result.stdout, result.stderr))
         self.assertEqual(
             result.stderr,
-            f"add_unit: unit account claude 3: accounts: {directory / 'projects'} is missing; /accounts status\n",
+            f"add_unit: unit account claude 3: accounts: {directory / 'projects'} is missing; /showrunner:accounts\n",
         )
         self.assert_no_launch_change(document, head)
         self.assertFalse(Path(self.env["SHUTDOWN_STATE_DIR"]).exists())
@@ -1551,10 +1587,18 @@ class AddUnitTests(ShutdownTestCase):
 
     def test_refuses_missing_production_field(self) -> None:
         original = self.doc.read_text()
-        _ = self.doc.write_text(original.replace("- **User zone:** America/Los_Angeles — reports use PDT\n", ""))
+        _ = self.doc.write_text(original.replace("- **Log:** `docs/plans/build-followups-log.md` — git-excluded\n", ""))
         result = self.cli("alpha", "--plan", "docs/plans/given.md")
         self.assertEqual(result.returncode, 2, (result.stdout, result.stderr))
         self.assertNotIn("| alpha-unit |", self.doc.read_text())
+
+    def test_a_doc_without_a_user_zone_line_still_adds_a_unit(self) -> None:
+        # The zone is the user's setting; a production doc no longer has to name one.
+        original = self.doc.read_text()
+        _ = self.doc.write_text(original.replace("- **User zone:** America/Los_Angeles — reports use PDT\n", ""))
+        result = self.cli("alpha", "--plan", "docs/plans/given.md")
+        self.assertEqual(result.returncode, 0, (result.stdout, result.stderr))
+        self.assertIn("| alpha-unit |", self.doc.read_text())
 
     def test_refuses_checkout_off_merge_branch(self) -> None:
         _ = self.git("checkout", "-b", "wrong-branch")

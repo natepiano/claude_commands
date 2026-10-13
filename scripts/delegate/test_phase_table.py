@@ -29,6 +29,11 @@ def plan_text(*lines: str) -> str:
     return "\n".join((*lines, ""))
 
 
+def setUpModule() -> None:
+    """The times these tests expect are UTC; the user's zone setting must not change them."""
+    unittest.enterModuleContext(patch.dict(os.environ, {"USER_ZONE": "UTC"}))
+
+
 class PhaseTableTests(unittest.TestCase):
     temporary: tempfile.TemporaryDirectory[str]  # pyright: ignore[reportUninitializedInstanceVariable]
     root: Path  # pyright: ignore[reportUninitializedInstanceVariable]
@@ -2012,6 +2017,8 @@ class PhaseTableTests(unittest.TestCase):
     def test_production_json_resolves_each_plan_from_its_unit_worktree(
         self,
     ) -> None:
+        # The offset this test expects is Pacific.
+        self.enterContext(patch.dict(os.environ, {"USER_ZONE": "America/Los_Angeles"}))
         worktree = self.make_live_worktree("unit-worktree")
         plan = worktree / "docs" / "unit-plan.md"
         plan.parent.mkdir()
@@ -2157,6 +2164,7 @@ class PhaseTableTests(unittest.TestCase):
                     "phase_table: true",
                     "production: show",
                     "unit: table-unit",
+                    'now: "Phase 1 of 1 — Current delivery"',
                     "---",
                     "",
                     "# live-name",
@@ -2191,6 +2199,97 @@ class PhaseTableTests(unittest.TestCase):
                 if path.is_file()
             },
             history_before,
+        )
+
+    def test_refresh_with_no_open_phase_writes_done_count_and_body_heading(self) -> None:
+        self.write_production_plan()
+        self.write_plan(
+            plan_text(
+                "# Delivery plan",
+                "",
+                "> **Production: show** — unit `table-unit`; production doc `docs/show-production.md`",
+                "",
+                "### Phase 1 — Prior delivery  · status: done",
+                "",
+                "### Phase 2 — Next delivery  · status: todo",
+            )
+        )
+        _ = self.write_run(
+            "current",
+            900,
+            self.phase_event("phase_started", "1", "one", 1_000, phase_title="Prior delivery"),
+            self.phase_event(
+                "phase_finished", "1", "one", 1_100,
+                status="completed", phase_elapsed_seconds=100,
+            ),
+            {"event_type": "run_finished", "timestamp_epoch": 1_110},
+        )
+        self.mark_unit("table")
+
+        result = self.run_refresh()
+
+        self.assertEqual((result.returncode, result.stdout, result.stderr), (0, "", ""))
+        lines = (self.vault_root / "showrunner" / "table.md").read_text(encoding="utf-8").splitlines()
+        self.assertEqual(lines[4], 'now: "No phase running — 1 of 2 done"')
+        heading = next(line for line in lines if line.startswith("**"))
+        self.assertEqual(json.loads(lines[4].removeprefix("now: ")), heading[2:-2])
+
+    def test_refresh_escapes_title_in_now_and_replaces_owned_note(self) -> None:
+        self.write_production_plan()
+        title = 'Delivery: "quoted" \\ path'
+        self.write_plan(
+            plan_text(
+                "# Delivery plan",
+                "",
+                "> **Production: show** — unit `table-unit`; production doc `docs/show-production.md`",
+                "",
+                f"### Phase 1 — {title}  · status: todo",
+            )
+        )
+        _ = self.write_run(
+            "current", 900,
+            self.phase_event("phase_started", "1", "one", 1_000, phase_title=title),
+        )
+        self.mark_unit("table")
+        result = self.run_refresh()
+        self.assertEqual((result.returncode, result.stdout, result.stderr), (0, "", ""))
+        note = self.vault_root / "showrunner" / "table.md"
+        text = note.read_text(encoding="utf-8")
+        self.assertEqual(
+            text.splitlines()[4],
+            'now: "Phase 1 of 1 — Delivery: \\"quoted\\" \\\\ path"',
+        )
+        self.assertIn(f"**Phase 1 of 1 — {title}**\n", text)
+        _ = note.write_text(text + "old copy\n", encoding="utf-8")
+
+        second = self.run_refresh(at=1_300)
+
+        self.assertEqual((second.returncode, second.stdout, second.stderr), (0, "", ""))
+        refreshed = note.read_text(encoding="utf-8")
+        self.assertNotIn("old copy", refreshed)
+        self.assertEqual(refreshed.splitlines()[4], text.splitlines()[4])
+        self.assertIn(f"**Phase 1 of 1 — {title}**\n", refreshed)
+        self.assertIn("| Updated | 01-01 00:21 UTC |", refreshed)
+
+    def test_refresh_replaces_three_key_note_with_current_heading(self) -> None:
+        self.write_production_plan()
+        self.mark_unit("table")
+        note = self.write_phase_note("showrunner", "table", "show", "table-unit")
+        self.assertNotIn("now:", note.read_text(encoding="utf-8"))
+
+        result = self.run_refresh()
+
+        self.assertEqual((result.returncode, result.stdout, result.stderr), (0, "", ""))
+        self.assertEqual(
+            note.read_text(encoding="utf-8").splitlines()[:6],
+            [
+                "---",
+                "phase_table: true",
+                "production: show",
+                "unit: table-unit",
+                'now: "Phase 1 of 1 — Current delivery"',
+                "---",
+            ],
         )
 
     def test_refresh_uses_unit_id_without_a_live_claude(self) -> None:

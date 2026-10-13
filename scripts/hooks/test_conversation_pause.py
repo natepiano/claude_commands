@@ -17,6 +17,7 @@ from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import conversation_pause
+import showrunner_footer
 
 
 LIBRARY = Path(__file__).with_name("conversation_pause.py")
@@ -173,24 +174,35 @@ instance = root / name
 if action == "new" and os.environ.get("FAIL_NEW") == "1":
     print("notifier new refused", file=sys.stderr)
     sys.exit(9)
-if action == "stop":
+if action in {"stop", "pause"}:
     delay = float(os.environ.get("STOP_DELAY", "0"))
     if delay:
         time.sleep(delay)
     if name in os.environ.get("FAIL_STOP_FOR", "").split(","):
         print(f"notifier stop refused for {name}", file=sys.stderr)
         sys.exit(8)
-if action == "resume" and name in os.environ.get("FAIL_RESUME_FOR", "").split(","):
+if action in {"resume", "unpause"} and name in os.environ.get("FAIL_RESUME_FOR", "").split(","):
     print(f"notifier resume refused for {name}", file=sys.stderr)
     sys.exit(8)
-if action in {"stop", "resume"} and instance.exists():
+if action in {"stop", "resume", "pause", "unpause"} and instance.exists():
+    # Mirrors notifier.sh: `pause` marks a running timer, `unpause` brings back only a marked one,
+    # and `stop` or `resume` clears the mark.
     state = instance / "state"
-    enabled = "0" if action == "stop" else "1"
     lines = state.read_text().splitlines()
-    state.write_text("\\n".join(
-        f"ENABLED={enabled}" if line.startswith("ENABLED=") else line
-        for line in lines
-    ) + "\\n")
+    enabled = "ENABLED=1" in lines
+    paused = "PAUSED=1" in lines
+    if action == "pause":
+        paused, enabled = enabled, False
+    elif action == "unpause":
+        if paused:
+            print("next_due=1")
+        enabled = enabled or paused
+        paused = False
+    else:
+        paused, enabled = False, action == "resume"
+    kept = [line for line in lines if not line.startswith(("ENABLED=", "PAUSED="))]
+    marks = [f"ENABLED={int(enabled)}"] + (["PAUSED=1"] if paused else [])
+    state.write_text("\\n".join(marks + kept) + "\\n")
 elif action == "new":
     instance.mkdir(parents=True, exist_ok=True)
     command = args[args.index("--run") + 1]
@@ -263,6 +275,7 @@ print("SENT: delivered")
         *,
         session_id: str = SESSION,
         enabled: bool = True,
+        paused: bool = False,
         sender: str = "",
         run: str = "",
     ) -> Path:
@@ -275,20 +288,21 @@ print("SENT: delivered")
             if sender:
                 conf += f"FROM={sender}\n"
         _ = (instance / "conf").write_text(conf)
-        _ = (instance / "state").write_text(
-            f"ENABLED={int(enabled)}\nNEXT_DUE=12000\n"
-        )
+        self.set_enabled(instance, enabled, paused=paused)
         return instance
 
-    def set_enabled(self, instance: Path, enabled: bool) -> None:
+    def set_enabled(self, instance: Path, enabled: bool, *, paused: bool = False) -> None:
+        """`paused` marks the timer as one a conversation pause stopped, as `notifier.sh pause` does."""
+        mark = "PAUSED=1\n" if paused else ""
         _ = (instance / "state").write_text(
-            f"ENABLED={int(enabled)}\nNEXT_DUE=12000\n"
+            f"ENABLED={int(enabled)}\n{mark}NEXT_DUE=12000\n"
         )
 
-    def footer_off(self, slug: str) -> Path:
+    def footer_off(self, slug: str, *, by_hand: bool = False) -> Path:
+        """Turn a footer off as a pause does, or as `/showrunner:footer off` does when `by_hand`."""
         switch = self.showrunner_root / "footers-off" / slug
         switch.parent.mkdir(parents=True, exist_ok=True)
-        switch.touch()
+        _ = switch.write_text("" if by_hand else showrunner_footer.PAUSE_MARK)
         return switch
 
     def write_record(
@@ -301,9 +315,16 @@ print("SENT: delivered")
         scheduled: bool = True,
     ) -> Path:
         # A paused item is one whose schedule still exists; `scheduled=False` writes a record
-        # naming schedules removed since, as switching a production to on demand does.
+        # naming schedules removed since, as switching a production to on demand does. An item
+        # the test has not set up yet is set up as the pause leaves it: stopped and marked.
         for name in (*instances, *(f"showrunner-{slug}" for slug in footers)) if scheduled else ():
             (self.notifier_root / name).mkdir(exist_ok=True)
+        for name in instances if scheduled else ():
+            if not (self.notifier_root / name / "state").exists():
+                self.set_enabled(self.notifier_root / name, False, paused=True)
+        for slug in footers:
+            if not (self.showrunner_root / "footers-off" / slug).exists():
+                _ = self.footer_off(slug)
         self.pause_root.mkdir(parents=True, exist_ok=True)
         path = self.pause_root / f"{session_id}.json"
         _ = path.write_text(json.dumps({
@@ -707,7 +728,7 @@ print("SENT: delivered")
             [
                 ["remove", "conversation-pause"],
                 ["new", "conversation-pause"],
-                ["stop", "delegate-abc"],
+                ["pause", "delegate-abc"],
             ],
         )
         self.assertTrue((instance / "state").read_text().startswith("ENABLED=0\n"))
@@ -735,7 +756,7 @@ print("SENT: delivered")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(
             [call[:2] for call in self.calls(self.notifier_log)[:2]],
-            [["resume", "conversation-pause"], ["stop", "delegate-abc"]],
+            [["resume", "conversation-pause"], ["pause", "delegate-abc"]],
         )
         self.assertTrue((watcher / "state").read_text().startswith("ENABLED=1\n"))
         self.assertTrue((instance / "state").read_text().startswith("ENABLED=0\n"))
@@ -770,7 +791,7 @@ print("SENT: delivered")
         )
         result = self.run_prompt("again", now=120)
         self.assertEqual((result.returncode, result.stdout, result.stderr), (0, "", ""))
-        self.assertIn(["stop", "delegate-abc"], self.calls(self.notifier_log))
+        self.assertIn(["pause", "delegate-abc"], self.calls(self.notifier_log))
         self.assertTrue((instance / "state").read_text().startswith("ENABLED=0\n"))
         self.assertEqual(self.record()["instances"], ["delegate-abc"])
 
@@ -786,7 +807,7 @@ print("SENT: delivered")
 
         resumed = self.run_cli("resume")
         self.assertEqual(resumed.returncode, 0, resumed.stderr)
-        self.assertEqual(self.calls(self.notifier_log), [["resume", "delegate-beta"]])
+        self.assertEqual(self.calls(self.notifier_log), [["unpause", "delegate-beta"]])
         self.assertTrue((failed / "state").read_text().startswith("ENABLED=1\n"))
         self.assertTrue((stopped / "state").read_text().startswith("ENABLED=1\n"))
 
@@ -1056,7 +1077,7 @@ print("SENT: delivered")
             self.assertIsInstance(context, conversation_pause.ContextOnly)
 
     def test_cli_resume_skips_missing_instance_restores_footer_and_deletes_record(self) -> None:
-        instance = self.create_instance("showrunner-demo", enabled=False)
+        instance = self.create_instance("showrunner-demo", enabled=False, paused=True)
         switch = self.footer_off("demo")
         record_path = self.write_record(
             {"kind": "replying", "user_wrote_at": 1},
@@ -1066,14 +1087,95 @@ print("SENT: delivered")
         result = self.run_cli("resume")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout, "automatic updates on: dailies, footer\n")
-        self.assertEqual(self.calls(self.notifier_log), [["resume", "showrunner-demo"]])
+        self.assertEqual(self.calls(self.notifier_log), [["unpause", "showrunner-demo"]])
         self.assertTrue((instance / "state").read_text().startswith("ENABLED=1\n"))
         self.assertFalse(switch.exists())
         self.assertFalse(record_path.exists())
 
+    def test_a_timer_and_footer_stopped_during_the_pause_stay_stopped_at_resume(self) -> None:
+        dailies = self.create_instance("showrunner-demo")
+        unit_report = self.create_instance("delegate-abc")
+        _ = self.run_prompt("hello", now=100)
+        # The showrunner stops its dailies and footer on purpose while the user talks.
+        self.set_enabled(dailies, False)
+        switch = self.footer_off("demo", by_hand=True)
+
+        result = self.run_cli("resume")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, "automatic updates on: status reports\n")
+        self.assertTrue((unit_report / "state").read_text().startswith("ENABLED=1\n"))
+        self.assertTrue((dailies / "state").read_text().startswith("ENABLED=0\n"))
+        self.assertTrue(switch.exists())
+        self.assertFalse((self.pause_root / f"{SESSION}.json").exists())
+
+    def test_a_timer_and_footer_stopped_before_the_pause_stay_stopped_at_resume(self) -> None:
+        dailies = self.create_instance("showrunner-demo", enabled=False)
+        switch = self.footer_off("demo", by_hand=True)
+        unit_report = self.create_instance("delegate-abc")
+        _ = self.run_prompt("hello", now=100)
+        self.assertEqual(self.record()["instances"], ["delegate-abc"])
+        self.assertEqual(self.record()["footers"], [])
+
+        result = self.run_cli("resume")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, "automatic updates on: status reports\n")
+        self.assertTrue((unit_report / "state").read_text().startswith("ENABLED=1\n"))
+        self.assertTrue((dailies / "state").read_text().startswith("ENABLED=0\n"))
+        self.assertTrue(switch.exists())
+
+    def test_the_timeout_return_leaves_what_was_stopped_during_the_pause(self) -> None:
+        dailies = self.create_instance("showrunner-demo", enabled=False)
+        unit_report = self.create_instance("delegate-abc", enabled=False, paused=True)
+        _ = self.create_instance("conversation-pause", run="tick")
+        switch = self.footer_off("demo", by_hand=True)
+        _ = self.write_record(
+            asked_read(100, 1), instances=("showrunner-demo", "delegate-abc"), footers=("demo",),
+        )
+
+        tick = self.run_cli("tick", now=400)
+
+        self.assertEqual(tick.returncode, 0, tick.stderr)
+        self.assertEqual(self.record()["phase"], {"kind": "returned", "returned_at": 400})
+        self.assertTrue((unit_report / "state").read_text().startswith("ENABLED=1\n"))
+        self.assertTrue((dailies / "state").read_text().startswith("ENABLED=0\n"))
+        self.assertTrue(switch.exists())
+
+    def test_a_tick_drops_what_was_stopped_by_hand_from_the_pause_record(self) -> None:
+        dailies = self.create_instance("showrunner-demo")
+        _ = self.create_instance("delegate-abc")
+        _ = self.create_instance("conversation-pause", run="tick")
+        _ = self.run_prompt("hello", now=100)
+        self.set_enabled(dailies, False)
+        switch = self.footer_off("demo", by_hand=True)
+
+        tick = self.run_cli("tick", now=150)
+
+        self.assertEqual(tick.returncode, 0, tick.stderr)
+        self.assertEqual(self.record()["instances"], ["delegate-abc"])
+        self.assertEqual(self.record()["footers"], [])
+        self.assertTrue(switch.exists())
+
+    def test_a_record_from_before_the_pause_marks_restarts_nothing(self) -> None:
+        # Records written before `notifier.sh pause` existed name timers stopped with no mark and
+        # footer switches that are empty files; nothing tells them from ones stopped on purpose.
+        instance = self.create_instance("showrunner-demo", enabled=False)
+        switch = self.footer_off("demo", by_hand=True)
+        record_path = self.write_record(
+            {"kind": "replying", "user_wrote_at": 1}, instances=("showrunner-demo",), footers=("demo",),
+        )
+
+        result = self.run_cli("resume")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue((instance / "state").read_text().startswith("ENABLED=0\n"))
+        self.assertTrue(switch.exists())
+        self.assertFalse(record_path.exists())
+
     def test_resume_verb_keeps_only_failed_items_for_retry(self) -> None:
-        failed = self.create_instance("delegate-alpha", enabled=False)
-        restored = self.create_instance("delegate-beta", enabled=False)
+        failed = self.create_instance("delegate-alpha", enabled=False, paused=True)
+        restored = self.create_instance("delegate-beta", enabled=False, paused=True)
         switch = self.footer_off("demo")
         _ = self.write_record(
             {"kind": "replying", "user_wrote_at": 100},
@@ -1101,8 +1203,8 @@ print("SENT: delivered")
         self.assertEqual(second.stdout, "automatic updates on: status reports\n")
         self.assertFalse((self.pause_root / f"{SESSION}.json").exists())
         calls = self.calls(self.notifier_log)
-        self.assertEqual(calls.count(["resume", failed.name]), 2)
-        self.assertEqual(calls.count(["resume", restored.name]), 1)
+        self.assertEqual(calls.count(["unpause", failed.name]), 2)
+        self.assertEqual(calls.count(["unpause", restored.name]), 1)
 
     def test_cli_status_and_keep(self) -> None:
         self.assertEqual(self.run_cli("status").stdout, "not paused\n")
@@ -1245,7 +1347,7 @@ print("SENT: delivered")
         self.assertFalse(path.exists())
 
     def test_stop_hook_active_event_does_not_count_reply_twice(self) -> None:
-        instance = self.create_instance("delegate-abc", enabled=False)
+        instance = self.create_instance("delegate-abc", enabled=False, paused=True)
         _ = self.write_record(
             asked_read(100, 0),
             instances=(instance.name,),
@@ -1323,7 +1425,7 @@ print("SENT: delivered")
         self.assertEqual(self.record()["phase"], asked_not_read(1_810))
 
     def test_queued_question_stays_pending_and_yes_restarts_replying(self) -> None:
-        instance = self.create_instance("delegate-abc", enabled=False)
+        instance = self.create_instance("delegate-abc", enabled=False, paused=True)
         _ = self.create_instance("conversation-pause", run="tick")
         _ = self.write_record(
             {"kind": "question_pending", "due_at": 100},
@@ -1341,7 +1443,7 @@ print("SENT: delivered")
         self.assertEqual(
             self.record()["phase"], {"kind": "replying", "user_wrote_at": 160}
         )
-        self.assertNotIn(["resume", "delegate-abc"], self.calls(self.notifier_log))
+        self.assertNotIn(["unpause", "delegate-abc"], self.calls(self.notifier_log))
         self.assertTrue((instance / "state").read_text().startswith("ENABLED=0\n"))
 
     def test_delivered_question_records_delivery_time(self) -> None:
@@ -1353,7 +1455,7 @@ print("SENT: delivered")
         self.assertEqual(len(self.calls(self.send_log)), 1)
 
     def test_prompt_before_send_return_stays_read_and_yes_resumes(self) -> None:
-        instance = self.create_instance("delegate-abc", enabled=False)
+        instance = self.create_instance("delegate-abc", enabled=False, paused=True)
         _ = self.write_record(
             {"kind": "question_pending", "due_at": 100},
             instances=(instance.name,),
@@ -1380,7 +1482,7 @@ print("SENT: delivered")
         self.assertTrue((instance / "state").read_text().startswith("ENABLED=1\n"))
 
     def test_prompt_before_send_return_reserves_yes_after_newer_reply(self) -> None:
-        instance = self.create_instance("delegate-abc", enabled=False)
+        instance = self.create_instance("delegate-abc", enabled=False, paused=True)
         _ = self.write_record(
             {"kind": "question_pending", "due_at": 100},
             instances=(instance.name,),
@@ -1424,7 +1526,7 @@ print("SENT: delivered")
         self.assertEqual(self.record()["phase"], asked_read(150, 0))
 
     def test_undelivered_question_returns_updates_after_five_minutes(self) -> None:
-        instance = self.create_instance("delegate-abc", enabled=False)
+        instance = self.create_instance("delegate-abc", enabled=False, paused=True)
         watcher = self.create_instance("conversation-pause", run="tick")
         _ = self.write_record(
             {"kind": "question_pending", "due_at": 100},
@@ -1459,7 +1561,7 @@ print("SENT: delivered")
             ))
         )
         send.chmod(0o755)
-        instance = self.create_instance("delegate-abc", enabled=False)
+        instance = self.create_instance("delegate-abc", enabled=False, paused=True)
         _ = self.create_instance("conversation-pause", run="tick")
         _ = self.write_record(
             {"kind": "question_pending", "due_at": 100},
@@ -1543,14 +1645,14 @@ print("SENT: delivered")
         )
 
     def test_asked_yes_variants_resume(self) -> None:
-        instance = self.create_instance("delegate-abc", enabled=False)
+        instance = self.create_instance("delegate-abc", enabled=False, paused=True)
         for prompt in ("Yes.", " y "):
             with self.subTest(prompt=prompt):
                 _ = self.write_record(
                     asked_not_read(100),
                     instances=("delegate-abc",),
                 )
-                self.set_enabled(instance, False)
+                self.set_enabled(instance, False, paused=True)
                 self.notifier_log.unlink(missing_ok=True)
                 question = self.run_prompt(
                     cross_session("conversation-pause", QUESTION),
@@ -1579,12 +1681,12 @@ print("SENT: delivered")
                     },
                 })
                 self.assertEqual(
-                    self.calls(self.notifier_log), [["resume", "delegate-abc"]]
+                    self.calls(self.notifier_log), [["unpause", "delegate-abc"]]
                 )
                 self.assertFalse((self.pause_root / f"{SESSION}.json").exists())
 
     def test_asked_no_keeps_updates_off(self) -> None:
-        instance = self.create_instance("delegate-abc", enabled=False)
+        instance = self.create_instance("delegate-abc", enabled=False, paused=True)
         _ = self.write_record(
             asked_read(100, 1),
             instances=("delegate-abc",),
@@ -1601,10 +1703,10 @@ print("SENT: delivered")
         self.assertTrue((instance / "state").read_text().startswith("ENABLED=0\n"))
 
     def test_reply_running_before_question_does_not_take_bare_answer(self) -> None:
-        instance = self.create_instance("delegate-abc", enabled=False)
+        instance = self.create_instance("delegate-abc", enabled=False, paused=True)
         for prompt in ("yes", "no"):
             with self.subTest(prompt=prompt):
-                self.set_enabled(instance, False)
+                self.set_enabled(instance, False, paused=True)
                 _ = self.write_record(
                     asked_not_read(100),
                     instances=(instance.name,),
@@ -1661,10 +1763,10 @@ print("SENT: delivered")
                     )
 
     def test_newer_reply_reserves_bare_answers_for_session_until_timeout(self) -> None:
-        instance = self.create_instance("delegate-abc", enabled=False)
+        instance = self.create_instance("delegate-abc", enabled=False, paused=True)
         for prompt in ("yes", "no"):
             with self.subTest(prompt=prompt):
-                self.set_enabled(instance, False)
+                self.set_enabled(instance, False, paused=True)
                 _ = self.write_record(
                     asked_not_read(100),
                     instances=(instance.name,),
@@ -1716,7 +1818,7 @@ print("SENT: delivered")
                 )
 
     def test_asked_records_without_reading_use_reply_count_or_default(self) -> None:
-        instance = self.create_instance("delegate-abc", enabled=False)
+        instance = self.create_instance("delegate-abc", enabled=False, paused=True)
         legacy_records: tuple[tuple[dict[str, object], int], ...] = (
             ({"kind": "asked", "asked_at": 100}, 1),
             (
@@ -1759,13 +1861,13 @@ print("SENT: delivered")
         self.assertTrue((instance / "state").read_text().startswith("ENABLED=1\n"))
 
     def test_session_answer_commands_apply_after_newer_reply(self) -> None:
-        instance = self.create_instance("delegate-abc", enabled=False)
+        instance = self.create_instance("delegate-abc", enabled=False, paused=True)
         for prompt, action in (
             ("Please return the automatic updates", "resume"),
             ("Keep the automatic updates off", "keep"),
         ):
             with self.subTest(action=action):
-                self.set_enabled(instance, False)
+                self.set_enabled(instance, False, paused=True)
                 _ = self.write_record(
                     asked_read(100, 2),
                     instances=(instance.name,),
@@ -1795,14 +1897,14 @@ print("SENT: delivered")
                     )
 
     def test_asked_other_and_peer_yes_restart_replying(self) -> None:
-        instance = self.create_instance("delegate-abc", enabled=False)
+        instance = self.create_instance("delegate-abc", enabled=False, paused=True)
         for prompt in ("later", cross_session("natedev", "yes")):
             with self.subTest(prompt=prompt):
                 _ = self.write_record(
                     asked_read(100, 1),
                     instances=("delegate-abc",),
                 )
-                self.set_enabled(instance, False)
+                self.set_enabled(instance, False, paused=True)
                 result = self.run_prompt(prompt, now=200)
                 if prompt == "later":
                     reply = self.parsed_reply(result)
@@ -1862,8 +1964,8 @@ print("SENT: delivered")
         self.assertTrue((instance / "state").read_text().startswith("ENABLED=0\n"))
 
     def test_question_timeout_returns_updates_and_late_yes_removes_record(self) -> None:
-        instance = self.create_instance("showrunner-demo", enabled=False)
-        unit_report = self.create_instance("delegate-abc", enabled=False)
+        instance = self.create_instance("showrunner-demo", enabled=False, paused=True)
+        unit_report = self.create_instance("delegate-abc", enabled=False, paused=True)
         watcher = self.create_instance("conversation-pause", run="tick")
         switch = self.footer_off("demo")
         _ = self.write_record(
@@ -1885,8 +1987,8 @@ print("SENT: delivered")
         self.assertTrue((instance / "state").read_text().startswith("ENABLED=1\n"))
         self.assertTrue((unit_report / "state").read_text().startswith("ENABLED=1\n"))
         self.assertFalse(switch.exists())
-        self.assertIn(["resume", "showrunner-demo"], self.calls(self.notifier_log))
-        self.assertIn(["resume", "delegate-abc"], self.calls(self.notifier_log))
+        self.assertIn(["unpause", "showrunner-demo"], self.calls(self.notifier_log))
+        self.assertIn(["unpause", "delegate-abc"], self.calls(self.notifier_log))
         self.assertNotIn(["remove", "conversation-pause"], self.calls(self.notifier_log))
         self.assertTrue(watcher.exists())
 
@@ -1897,8 +1999,8 @@ print("SENT: delivered")
         self.assertTrue((unit_report / "state").read_text().startswith("ENABLED=1\n"))
 
     def test_timeout_restore_keeps_only_failed_items_for_retry(self) -> None:
-        failed = self.create_instance("delegate-alpha", enabled=False)
-        restored = self.create_instance("delegate-beta", enabled=False)
+        failed = self.create_instance("delegate-alpha", enabled=False, paused=True)
+        restored = self.create_instance("delegate-beta", enabled=False, paused=True)
         watcher = self.create_instance("conversation-pause", run="tick")
         switch = self.footer_off("demo")
         _ = self.write_record(
@@ -1929,8 +2031,8 @@ print("SENT: delivered")
             self.record()["phase"], {"kind": "returned", "returned_at": 401}
         )
         calls = self.calls(self.notifier_log)
-        self.assertEqual(calls.count(["resume", failed.name]), 2)
-        self.assertEqual(calls.count(["resume", restored.name]), 1)
+        self.assertEqual(calls.count(["unpause", failed.name]), 2)
+        self.assertEqual(calls.count(["unpause", restored.name]), 1)
 
     def test_late_no_after_timeout_pauses_and_marks_kept_off(self) -> None:
         instance = self.create_instance("delegate-abc")
@@ -1944,7 +2046,7 @@ print("SENT: delivered")
         self.assertTrue((instance / "state").read_text().startswith("ENABLED=0\n"))
 
     def test_kept_off_survives_tick_then_typed_message_starts_replying(self) -> None:
-        instance = self.create_instance("delegate-abc", enabled=False)
+        instance = self.create_instance("delegate-abc", enabled=False, paused=True)
         watcher = self.create_instance("conversation-pause", run="tick")
         _ = self.write_record(
             {"kind": "kept_off"}, instances=("delegate-abc",)
@@ -1963,7 +2065,7 @@ print("SENT: delivered")
         )
 
     def test_kept_off_session_end_restores_items_and_removes_watcher(self) -> None:
-        instance = self.create_instance("showrunner-demo", enabled=False)
+        instance = self.create_instance("showrunner-demo", enabled=False, paused=True)
         switch = self.footer_off("demo")
         watcher = self.create_instance("conversation-pause", run="tick")
         record_path = self.write_record(
@@ -1984,8 +2086,8 @@ print("SENT: delivered")
         self.assertFalse(watcher.exists())
 
     def test_ended_session_restore_keeps_only_failed_items_for_retry(self) -> None:
-        failed = self.create_instance("delegate-alpha", enabled=False)
-        restored = self.create_instance("delegate-beta", enabled=False)
+        failed = self.create_instance("delegate-alpha", enabled=False, paused=True)
+        restored = self.create_instance("delegate-beta", enabled=False, paused=True)
         watcher = self.create_instance("conversation-pause", run="tick")
         switch = self.footer_off("demo")
         path = self.write_record(
@@ -2016,11 +2118,11 @@ print("SENT: delivered")
         self.assertFalse(path.exists())
         self.assertFalse(watcher.exists())
         calls = self.calls(self.notifier_log)
-        self.assertEqual(calls.count(["resume", failed.name]), 2)
-        self.assertEqual(calls.count(["resume", restored.name]), 1)
+        self.assertEqual(calls.count(["unpause", failed.name]), 2)
+        self.assertEqual(calls.count(["unpause", restored.name]), 1)
 
     def test_missing_session_returns_updates_and_deletes_record(self) -> None:
-        instance = self.create_instance("showrunner-demo", enabled=False)
+        instance = self.create_instance("showrunner-demo", enabled=False, paused=True)
         switch = self.footer_off("demo")
         _ = self.write_record(
             {"kind": "replying", "user_wrote_at": 10},
@@ -2084,13 +2186,13 @@ print("SENT: delivered")
         _ = failing.write_text("#!/usr/bin/env python3\nimport sys\nsys.exit(3)\n")
         failing.chmod(0o755)
         quiet_instance = self.create_instance(
-            "delegate-quiet", session_id="quiet-session", enabled=False
+            "delegate-quiet", session_id="quiet-session", enabled=False, paused=True
         )
         asked_instance = self.create_instance(
-            "delegate-asked", session_id="asked-session", enabled=False
+            "delegate-asked", session_id="asked-session", enabled=False, paused=True
         )
         kept_instance = self.create_instance(
-            "delegate-kept", session_id="kept-session", enabled=False
+            "delegate-kept", session_id="kept-session", enabled=False, paused=True
         )
         watcher = self.create_instance("conversation-pause", run="tick")
         _ = self.write_record(
@@ -2151,7 +2253,7 @@ print("SENT: delivered")
         )
 
     def test_missing_session_registry_keeps_pause_record_and_report_off(self) -> None:
-        instance = self.create_instance("delegate-abc", enabled=False)
+        instance = self.create_instance("delegate-abc", enabled=False, paused=True)
         _ = self.create_instance("conversation-pause", run="tick")
         _ = self.write_record(
             {"kind": "quiet", "user_wrote_at": 10, "reply_ended_at": 100},
@@ -2179,13 +2281,13 @@ print("SENT: delivered")
 
     def test_open_reviews_leave_all_phases_byte_identical(self) -> None:
         asked_instance = self.create_instance(
-            "showrunner-asked", session_id="asked-session", enabled=False
+            "showrunner-asked", session_id="asked-session", enabled=False, paused=True
         )
         quiet_instance = self.create_instance(
-            "showrunner-quiet", session_id="quiet-session", enabled=False
+            "showrunner-quiet", session_id="quiet-session", enabled=False, paused=True
         )
         returned_instance = self.create_instance(
-            "showrunner-returned", session_id="returned-session", enabled=False
+            "showrunner-returned", session_id="returned-session", enabled=False, paused=True
         )
         _ = self.footer_off("asked")
         _ = self.footer_off("quiet")
@@ -2225,7 +2327,7 @@ print("SENT: delivered")
         )
         self.assertEqual(self.calls(self.send_log), [])
         self.assertEqual(
-            [call for call in self.calls(self.notifier_log) if call[0] == "resume"],
+            [call for call in self.calls(self.notifier_log) if call[0] == "unpause"],
             [],
         )
 
@@ -2245,7 +2347,7 @@ print("SENT: delivered")
         self.assertEqual(len(self.calls(self.send_log)), 1)
 
     def test_review_file_is_ignored_without_a_showrunner_item(self) -> None:
-        instance = self.create_instance("delegate-abc", enabled=False)
+        instance = self.create_instance("delegate-abc", enabled=False, paused=True)
         _ = self.create_instance("conversation-pause", run="tick")
         _ = self.write_record(
             asked_read(100, 1),
@@ -2263,7 +2365,7 @@ print("SENT: delivered")
         self.assertTrue((instance / "state").read_text().startswith("ENABLED=1\n"))
 
     def test_unreadable_record_does_not_block_another_session(self) -> None:
-        instance = self.create_instance("delegate-abc", enabled=False)
+        instance = self.create_instance("delegate-abc", enabled=False, paused=True)
         self.pause_root.mkdir(parents=True, exist_ok=True)
         _ = (self.pause_root / "a-broken.json").write_text("{not json")
         _ = self.write_record(
@@ -2308,8 +2410,28 @@ print("SENT: delivered")
         result = self.run_cli("status")
         self.assertEqual((result.returncode, result.stdout), (0, "not paused (returned)\n"))
 
+    def test_release_leaves_out_what_was_stopped_by_hand_since_the_pause(self) -> None:
+        paused = self.create_instance("delegate-abc", enabled=False, paused=True)
+        stopped = self.create_instance("showrunner-demo", enabled=False)
+        _ = self.footer_off("demo", by_hand=True)
+        _ = self.write_record(
+            {"kind": "replying", "user_wrote_at": 1},
+            instances=(paused.name, stopped.name),
+            footers=("demo",),
+        )
+
+        with patch.dict(os.environ, self.environment, clear=True):
+            released = conversation_pause.release(SESSION)
+
+        self.assertEqual(
+            released,
+            conversation_pause.PauseRecord(
+                SESSION, (paused.name,), (), conversation_pause.Replying(1),
+            ),
+        )
+
     def test_release_returns_record_and_later_tick_resumes_nothing(self) -> None:
-        instance = self.create_instance("delegate-abc", enabled=False)
+        instance = self.create_instance("delegate-abc", enabled=False, paused=True)
         watcher = self.create_instance("conversation-pause", run="tick")
         path = self.write_record(
             {"kind": "kept_off"},
@@ -2338,7 +2460,7 @@ print("SENT: delivered")
         self.assertTrue((instance / "state").read_text().startswith("ENABLED=0\n"))
         self.assertFalse(watcher.exists())
         self.assertNotIn(
-            ["resume", instance.name],
+            ["unpause", instance.name],
             self.calls(self.notifier_log),
         )
 

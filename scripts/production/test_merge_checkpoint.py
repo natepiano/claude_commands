@@ -12,6 +12,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 from typing import NamedTuple, cast, final, override
 
@@ -78,6 +79,11 @@ if name == "basedpyright":
     print("0 errors, 0 warnings, 0 notes")
     raise SystemExit(3)
 '''
+
+
+def setUpModule() -> None:
+    """The times these tests expect are Pacific; the user's zone setting must not change them."""
+    unittest.enterModuleContext(mock.patch.dict(os.environ, {"USER_ZONE": "America/Los_Angeles"}))
 
 
 class MergeResult(NamedTuple):
@@ -721,7 +727,7 @@ class MergeCheckpointTests(unittest.TestCase):
         merged_at = review[0][review[0].index("--merged") + 1]
         self.assertRegex(merged_at, r"^\d{4}-\d\d-\d\dT")
         self.assertEqual(review[0], [
-            "add", "--unit", "alpha-unit", "--phase", "2", "--regime", "trial",
+            "add", "--unit", "alpha-unit", "--plan", "docs/plans/alpha.md", "--phase", "2", "--regime", "trial",
             "--started", STARTED, "--merged", merged_at, "--holds", "2",
             "--merge-defects", "1", "--ux-findings", "2", "--code-findings", "3",
             "--review-minutes", "14", "--ux-check-minutes", "4",

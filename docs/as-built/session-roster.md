@@ -31,7 +31,7 @@ The roster joins records that each name one part of the picture. A session's rol
 |---|---|---|
 | Claude session registry | `~/.claude/sessions/<pid>.json` (`NOTIFIER_SESSIONS_DIR`) | `pid`, `sessionId`, `name`, `messagingSocketPath`, `updatedAt`, `procStart`, `tmux` pane, `formerNames`; the roster also reads `cwd` and `status` raw |
 | Showrunner registrations | notifier timers under `~/.local/state/notifier/showrunner-*` (`NOTIFIER_STATE_DIR`), via `showrunners.registered_showrunners()` | session name, socket, production slug, production doc |
-| Unit marks | tmux sessions marked for a production, via `live_units.production_units(doc)` | each unit's marked pane and the live Claude in it |
+| Unit marks | tmux sessions marked for a production, one read for every production (`unit_lookup.every_marked_unit`) joined per doc by `live_units.units_in(doc, every)` | each unit's marked pane and the live Claude in it |
 | Units table | the production doc, via `add_unit.live_unit_table` | `Unit` and `Worktree` per row (fallback only) |
 | Run markers | `/tmp/claude/delegate/active/<director session id>` (`ROSTER_DELEGATE_ROOT`) | first line: the run's session directory |
 | Run heartbeats | `<run>/heartbeat.log` | a run is live if written within `remove_seats.LIVE_HEARTBEAT_SECS` (600 s) |

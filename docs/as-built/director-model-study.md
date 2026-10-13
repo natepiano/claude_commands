@@ -89,7 +89,7 @@ State directory files: `turns.jsonl`, `compactions.jsonl`, `extract.json`, `comp
 - Privacy: no prompt text, tool argument, tool result or file path from a transcript reaches an output file or the screen; rows hold numbers and allowlisted fields. Tests assert it (`test_turns.py`, `test_rerun.py`).
 - Recommendation: harm evidence (net time `slower`, or requests per 1,000 words or repair rounds `more`) gives `opus`; else `lower` cost per request or `faster` net time gives `sonnet`; else `sonnet stays`.
 - Gate G1: at least 4 switched directors with 150 filtered Sonnet continuation requests each, or `SAMPLE_DEADLINE_PDT`, whichever comes first; `ready` exits 0 or 3. It is advisory: no command refuses to run before it holds.
-- Every time in an output is PDT (`America/Los_Angeles`); transcripts and run history are UTC. Costs are API-equivalent at `PRICES`, not subscription weights.
+- Every time in an output is in the user's zone (`config/user_zone.conf`, read through `scripts/lib/user_zone.py`), with the zone's own label; transcripts and run history are UTC. The roster's `switched_by_pdt` and `director_from_pdt` columns stay Pacific wall times, as they were recorded (`RECORDED_ZONE` in `turns.py`). Costs are API-equivalent at `PRICES`, not subscription weights.
 - Python is typed throughout with no `Any` and no file-level type ignores; every JSON record is a `TypedDict` or dataclass. Unavailable values are `None` and JSON null (rendered `—`), not named variants.
 - Tests build synthetic transcripts in temporary directories; they never read a real transcript or write the real state directory.
 - The study covers natedev's directors only.

@@ -17,7 +17,9 @@ from contextlib import contextmanager
 from datetime import date, datetime
 from pathlib import Path
 from typing import Callable, Literal, NamedTuple, NoReturn, TypedDict, cast
-from zoneinfo import ZoneInfo
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
+from user_zone import user_zone  # noqa: E402
 
 
 class ProjectSpec(NamedTuple):
@@ -181,7 +183,61 @@ class AmendEvent(TypedDict):
     releases_added: list[str]
 
 
-FeatureLogEvent = AddEvent | SupersedeEvent | LegacyAmendEvent | AmendEvent
+class ReleaseEvent(TypedDict):
+    at: str
+    verb: Literal["release"]
+    project: str
+    crate: str
+    version: str
+    titles: list[str]
+
+
+FeatureLogEvent = AddEvent | SupersedeEvent | LegacyAmendEvent | AmendEvent | ReleaseEvent
+
+
+class ChangelogSelection(NamedTuple):
+    section: str
+    titles: list[str]
+
+
+class ForwardFailed(NamedTuple):
+    exit: int
+    stderr: str
+
+
+class ChangelogSelectionJson(TypedDict):
+    section: str
+    titles: list[str]
+
+
+class ReviewedReleaseContents(TypedDict):
+    crate: str
+    titles: list[str]
+
+
+class NoSavedContents(NamedTuple):
+    """Compare without keeping a release snapshot."""
+
+
+class SaveReviewedContents(NamedTuple):
+    path: Path
+
+
+class RenderSection(NamedTuple):
+    crate: str
+    version: str
+    selection_json: bool
+
+
+class CompareSection(NamedTuple):
+    crate: str
+    version: str
+    path: Path
+    saving: NoSavedContents | SaveReviewedContents
+
+
+ForwardedReader = Callable[[list[str]], ChangelogSelection | ForwardFailed]
+ReleaseForwarder = Callable[[list[str], ReviewedReleaseContents], int]
 
 
 class KeepAcceptingProvenance(NamedTuple):
@@ -196,6 +252,17 @@ class CorrectAcceptingProvenance(NamedTuple):
 
 
 AcceptingProvenanceAmendment = KeepAcceptingProvenance | CorrectAcceptingProvenance
+
+
+class ReplaceLiveNotes(NamedTuple):
+    """Replace live notes, allowing repeats of the same replacement."""
+
+
+class ExtendReplacementSet(NamedTuple):
+    """Add a replacement even when an old note is already superseded."""
+
+
+ReplacementPolicy = ReplaceLiveNotes | ExtendReplacementSet
 
 
 class ProposalArgs(TypedDict):
@@ -280,6 +347,41 @@ def today() -> str:
 def _run_ssh(command: list[str]) -> int:
     """Run a feature-log command on the vault host with inherited output."""
     return subprocess.run(command, check=False).returncode
+
+
+def _ssh_command(argv: list[str]) -> list[str]:
+    remote = "~/.claude/scripts/lib/py ~/.claude/scripts/feature_log/feature_log.py "
+    return ["ssh", "natedev", remote + shlex.join(argv)]
+
+
+def _read_forwarded_selection(command: list[str]) -> ChangelogSelection | ForwardFailed:
+    """Read a selection from the vault host without forwarding local paths."""
+    try:
+        result = subprocess.run(command, capture_output=True, text=True, check=False)
+    except (OSError, UnicodeError) as error:
+        return ForwardFailed(2, str(error))
+    if result.returncode != 0:
+        return ForwardFailed(result.returncode, result.stderr)
+    try:
+        decoded = cast(object, json.loads(result.stdout))
+        value = _json_object(decoded, "changelog selection")
+        _require_json_keys(value, frozenset({"section", "titles"}), "changelog selection")
+        return ChangelogSelection(
+            _json_string(value.get("section"), "selection section"),
+            _reviewed_titles(value.get("titles")),
+        )
+    except (json.JSONDecodeError, FeatureLogError) as error:
+        return ForwardFailed(2, f"invalid forwarded changelog selection: {error}")
+
+
+def _forward_release(command: list[str], contents: ReviewedReleaseContents) -> int:
+    """Send caller-validated reviewed contents on stdin to the vault host."""
+    try:
+        return subprocess.run(
+            command, input=json.dumps(contents), text=True, check=False
+        ).returncode
+    except (OSError, UnicodeError) as error:
+        raise FeatureLogError(f"cannot forward release: {error}") from error
 
 
 FRONTMATTER_KEYS = frozenset(
@@ -652,7 +754,14 @@ def _validate_release_values(project: str, crates: list[str], releases: list[str
         if not VERSION_RE.fullmatch(version):
             raise FeatureLogError(f"invalid release version {version}")
         validated.add(release)
-    return sorted(validated)
+    sorted_releases = sorted(validated)
+    for release in sorted_releases:
+        crate, _, version = release.partition("@")
+        if version != "Unreleased" and f"{crate}@Unreleased" in validated:
+            raise FeatureLogError(
+                f"release cannot hold both {crate}@Unreleased and {release}"
+            )
+    return sorted_releases
 
 
 def _canonical_link(project: str, value: str) -> str:
@@ -860,7 +969,7 @@ def _write_json(path: Path, value: object) -> None:
 
 
 def _event_time() -> str:
-    return datetime.now(ZoneInfo("America/Los_Angeles")).replace(microsecond=0).isoformat()
+    return datetime.now(user_zone()).replace(microsecond=0).isoformat()
 
 
 def _append_event(event: FeatureLogEvent) -> None:
@@ -971,6 +1080,19 @@ def _parse_event(line: str, line_number: int) -> FeatureLogEvent:
         raise FeatureLogError(f"events.jsonl line {line_number} is invalid JSON") from error
     value = _json_object(decoded, f"events.jsonl line {line_number}")
     verb = _json_string(value.get("verb"), "event verb")
+    if verb == "release":
+        _require_json_keys(
+            value, frozenset({"at", "verb", "project", "crate", "version", "titles"}),
+            "release event",
+        )
+        return {
+            "at": _json_string(value.get("at"), "event at"),
+            "verb": "release",
+            "project": _json_string(value.get("project"), "event project"),
+            "crate": _json_string(value.get("crate"), "event crate"),
+            "version": _json_string(value.get("version"), "event version"),
+            "titles": _json_string_list(value.get("titles"), "event titles"),
+        }
     if verb == "add":
         _require_json_keys(
             value,
@@ -1065,6 +1187,7 @@ def _event_recorded(verb: str, project: str, title: str) -> bool:
     return any(
         event["verb"] == verb
         and event["project"] == project
+        and event["verb"] != "release"
         and event["title"] == title
         for event in _read_events()
     )
@@ -1189,7 +1312,9 @@ def _updated_replacement(note: Note, replacement: str) -> Note:
     return updated
 
 
-def _apply_supersede(note: Note, arguments: argparse.Namespace) -> list[str]:
+def _apply_supersede(
+    note: Note, arguments: argparse.Namespace, policy: ReplacementPolicy
+) -> list[str]:
     old_titles = [normalize_title(item) for item in cast(list[str], arguments.old)]
     old_titles = list(dict.fromkeys(old_titles))
     if note["title"] in old_titles:
@@ -1215,7 +1340,11 @@ def _apply_supersede(note: Note, arguments: argparse.Namespace) -> list[str]:
                 (old_path, _updated_replacement(old_note, note["title"]), old_title)
             )
         elif note["title"] not in old_note["replaced_by"]:
-            raise FeatureLogError(f"old note {old_title} is not live")
+            if isinstance(policy, ReplaceLiveNotes):
+                raise FeatureLogError(f"old note {old_title} is not live")
+            replacements.append(
+                (old_path, _updated_replacement(old_note, note["title"]), old_title)
+            )
 
     if write_new:
         _write_note(new_path, stored)
@@ -1232,10 +1361,10 @@ def _apply_supersede(note: Note, arguments: argparse.Namespace) -> list[str]:
     return outputs
 
 
-def _run_supersede(arguments: argparse.Namespace) -> int:
+def _run_supersede(arguments: argparse.Namespace, policy: ReplacementPolicy) -> int:
     note = _new_note(arguments)
     with locked():
-        outputs = _apply_supersede(note, arguments)
+        outputs = _apply_supersede(note, arguments, policy)
     for output in outputs:
         print(output)
     return 0
@@ -1502,7 +1631,7 @@ def _run_review_land(verb: Literal["add", "supersede"], row_value: str) -> int:
         outputs = (
             _apply_add(note, saved_arguments)
             if verb == "add"
-            else _apply_supersede(note, saved_arguments)
+            else _apply_supersede(note, saved_arguments, ReplaceLiveNotes())
         )
         landed: LandedProposal = {
             "row": row,
@@ -1647,10 +1776,21 @@ def _run_amend(arguments: argparse.Namespace) -> int:
                     if release.partition("@")[0] in crates
                 ]
                 changed.append("crate")
-        historical_releases = _validate_release_values(project, updated["crate"], release_additions)
-        if any(release.partition("@")[2] == "Unreleased" for release in historical_releases):
-            raise FeatureLogError("--release requires an exact historical version, not Unreleased")
-        releases = sorted(set(updated["release"]) | set(historical_releases))
+        validated_releases = _validate_release_values(project, updated["crate"], release_additions)
+        for release in validated_releases:
+            crate, _, version = release.partition("@")
+            if version != "Unreleased":
+                pending_release = f"{crate}@Unreleased"
+                if pending_release in note["release"]:
+                    raise FeatureLogError(f"{title} already holds {pending_release}")
+                continue
+            if note["state"] != "live":
+                raise FeatureLogError("a superseded note cannot be pending")
+            for existing_release in note["release"]:
+                existing_crate, _, existing_version = existing_release.partition("@")
+                if existing_crate == crate and existing_version != "Unreleased":
+                    raise FeatureLogError(f"{title} already holds {existing_release}")
+        releases = sorted(set(updated["release"]) | set(validated_releases))
         if releases != updated["release"]:
             updated["release"] = releases
             changed.append("release")
@@ -1724,6 +1864,264 @@ def _run_live(arguments: argparse.Namespace) -> int:
     return 0
 
 
+CHANGELOG_HEADINGS = ("Added", "Changed", "Deprecated", "Removed", "Fixed", "Security")
+KIND_HEADING = {
+    "feature": "Added",
+    "fix": "Fixed",
+    "change": "Changed",
+    "perf": "Changed",
+    "deprecation": "Deprecated",
+    "removal": "Removed",
+    "security": "Security",
+}
+
+
+def _published_project(crate: str) -> str:
+    for project, spec in PROJECTS.items():
+        if crate in spec.published:
+            return project
+    raise FeatureLogError(f"crate {crate} is not published")
+
+
+def _changelog_request(arguments: argparse.Namespace) -> RenderSection | CompareSection:
+    crate = cast(str, arguments.crate)
+    version = cast(str, arguments.version)
+    _ = _published_project(crate)
+    if not VERSION_RE.fullmatch(version):
+        raise FeatureLogError(f"invalid release version {version}")
+    compare = cast(str | None, arguments.compare)
+    save = cast(str | None, arguments.save)
+    selection_json = cast(bool, arguments.selection)
+    if compare is None:
+        if save is not None:
+            raise FeatureLogError("--save requires --compare")
+        return RenderSection(crate, version, selection_json)
+    if version != "Unreleased":
+        raise FeatureLogError("--compare requires --version Unreleased")
+    if selection_json:
+        raise FeatureLogError("--selection cannot be combined with --compare")
+    saving = NoSavedContents() if save is None else SaveReviewedContents(Path(save))
+    return CompareSection(crate, version, Path(compare), saving)
+
+
+def _select_changelog(crate: str, version: str) -> ChangelogSelection:
+    project = _published_project(crate)
+    with locked():
+        notes = [
+            note for _, note in _project_notes(project)
+            if crate in note["crate"]
+            and f"{crate}@{version}" in note["release"]
+            and (version != "Unreleased" or note["state"] == "live")
+        ]
+    lines = [f"## [{version}]"]
+    for heading in CHANGELOG_HEADINGS:
+        summaries = sorted(
+            note["summary"] for note in notes if KIND_HEADING[note["kind"]] == heading
+        )
+        if summaries:
+            lines.extend(["", f"### {heading}", ""])
+            lines.extend(f"- {summary}" for summary in summaries)
+    return ChangelogSelection("\n".join(lines) + "\n", sorted(note["title"] for note in notes))
+
+
+def _section_bullets(text: str, version: str) -> dict[str, list[str]]:
+    """Read the requested section's bullets, including repeats and wrapped lines."""
+    headings: dict[str, list[str]] = {}
+    in_section = False
+    found = False
+    heading = ""
+    bullet_parts: list[str] = []
+
+    def finish_bullet() -> None:
+        if bullet_parts:
+            headings.setdefault(heading, []).append(" ".join(bullet_parts))
+            bullet_parts.clear()
+
+    for line in text.splitlines():
+        section = re.match(r"^##\s+\[([^]]+)\]", line)
+        if section is not None:
+            if in_section:
+                break
+            in_section = section.group(1) == version
+            found = found or in_section
+            continue
+        if not in_section:
+            continue
+        if line.startswith("## "):
+            break
+        category = re.match(r"^###\s+(.+?)\s*$", line)
+        if category is not None:
+            finish_bullet()
+            heading = category.group(1)
+            continue
+        bullet = re.match(r"^[-*+]\s+(.+)$", line)
+        if bullet is not None:
+            finish_bullet()
+            bullet_parts.append(bullet.group(1).strip())
+        elif bullet_parts and line[:1].isspace() and line.strip():
+            bullet_parts.append(line.strip())
+    finish_bullet()
+    if not found:
+        raise FeatureLogError(f"changelog has no ## [{version}] section")
+    return headings
+
+
+def _run_changelog(
+    request: RenderSection | CompareSection, off_host: bool, forwarded_reader: ForwardedReader
+) -> int:
+    if isinstance(request, CompareSection) and isinstance(request.saving, SaveReviewedContents):
+        try:
+            request.saving.path.unlink(missing_ok=True)
+        except OSError as error:
+            raise FeatureLogError(f"cannot remove saved release contents: {error}") from error
+    if off_host:
+        result = forwarded_reader(_ssh_command([
+            "changelog", "--crate", request.crate, "--version", request.version, "--selection",
+        ]))
+        if isinstance(result, ForwardFailed):
+            raise FeatureLogError(result.stderr or f"forwarded read failed (exit {result.exit})")
+        selection = result
+    else:
+        selection = _select_changelog(request.crate, request.version)
+    if isinstance(request, RenderSection):
+        if request.selection_json:
+            selection_json: ChangelogSelectionJson = {
+                "section": selection.section, "titles": selection.titles,
+            }
+            print(json.dumps(selection_json, ensure_ascii=False))
+        else:
+            print(selection.section, end="")
+        return 0
+    try:
+        changelog = request.path.read_text(encoding="utf-8")
+    except (OSError, UnicodeError) as error:
+        raise FeatureLogError(f"cannot read changelog: {error}") from error
+    expected = _section_bullets(selection.section, request.version)
+    actual = _section_bullets(changelog, request.version)
+    different = False
+    for heading in (*CHANGELOG_HEADINGS, ""):
+        expected_bullets = set(expected.get(heading, []))
+        actual_bullets = set(actual.get(heading, []))
+        missing = expected_bullets - actual_bullets
+        extra = actual_bullets - expected_bullets
+        if not missing and not extra:
+            continue
+        different = True
+        print(f"### {heading}" if heading else "Uncategorized")
+        if missing:
+            print("Only in feature log:")
+            for summary in sorted(missing):
+                print(f"- {summary}")
+        if extra:
+            print("Only in changelog:")
+            for summary in sorted(extra):
+                print(f"- {summary}")
+    if not different:
+        if isinstance(request.saving, SaveReviewedContents):
+            contents: ReviewedReleaseContents = {"crate": request.crate, "titles": selection.titles}
+            try:
+                _write_json(request.saving.path, contents)
+            except (OSError, UnicodeError) as error:
+                raise FeatureLogError(f"cannot save reviewed release contents: {error}") from error
+        print("match")
+    not_compared: list[str] = []
+    for heading in sorted(actual.keys() - set(CHANGELOG_HEADINGS) - {""}):
+        count = len(actual[heading])
+        noun = "bullet" if count == 1 else "bullets"
+        not_compared.append(f"{heading} ({count} {noun})")
+    if not_compared:
+        print(f"not compared: {', '.join(not_compared)}")
+    return 1 if different else 0
+
+
+def _reviewed_titles(value: object) -> list[str]:
+    titles = _json_string_list(value, "reviewed titles")
+    _validate_sorted_unique(titles, "reviewed titles")
+    if any(normalize_title(title) != title for title in titles):
+        raise FeatureLogError("reviewed titles must be normalized note titles")
+    return titles
+
+
+def _parse_reviewed_contents(text: str, crate: str) -> ReviewedReleaseContents:
+    try:
+        decoded = cast(object, json.loads(text))
+    except json.JSONDecodeError as error:
+        raise FeatureLogError(f"invalid reviewed release contents JSON: {error}") from error
+    contents = _json_object(decoded, "reviewed release contents")
+    _require_json_keys(contents, frozenset({"crate", "titles"}), "reviewed release contents")
+    saved_crate = _json_string(contents.get("crate"), "reviewed crate")
+    if saved_crate != crate:
+        raise FeatureLogError(f"reviewed contents are for {saved_crate}, not {crate}")
+    return {"crate": crate, "titles": _reviewed_titles(contents.get("titles"))}
+
+
+def _release_contents(arguments: argparse.Namespace) -> ReviewedReleaseContents:
+    crate = cast(str, arguments.crate)
+    _ = _published_project(crate)
+    version = cast(str, arguments.version)
+    if version == "Unreleased" or not VERSION_RE.fullmatch(version):
+        raise FeatureLogError(f"release requires an exact version, not {version}")
+    try:
+        if cast(bool, arguments.contents_stdin):
+            text = sys.stdin.read()
+        else:
+            text = Path(cast(str, arguments.contents)).read_text(encoding="utf-8")
+    except (OSError, UnicodeError) as error:
+        raise FeatureLogError(f"cannot read reviewed release contents: {error}") from error
+    return _parse_reviewed_contents(text, crate)
+
+
+def _run_release(crate: str, version: str, contents: ReviewedReleaseContents) -> int:
+    project = _published_project(crate)
+    unreleased = f"{crate}@Unreleased"
+    released = f"{crate}@{version}"
+    reviewed = set(contents["titles"])
+    with locked():
+        notes = _project_notes(project)
+        by_title = {note["title"]: note for _, note in notes}
+        for title in contents["titles"]:
+            if title not in by_title:
+                raise FeatureLogError(f"reviewed note {title} does not exist")
+            note = by_title[title]
+            if crate not in note["crate"] or not {unreleased, released}.intersection(note["release"]):
+                raise FeatureLogError(f"reviewed note {title} has no pending or stamped {crate} release")
+        # A publish retry must leave all work logged after the original stamp pending.
+        previous = any(
+            event["verb"] == "release" and event["crate"] == crate and event["version"] == version
+            for event in _read_events()
+        )
+        if previous:
+            if any(released not in by_title[title]["release"] for title in reviewed):
+                raise FeatureLogError(f"{released} was already stamped with different contents")
+            print("unchanged")
+            return 0
+        changes: list[tuple[Path, Note]] = []
+        for path, note in notes:
+            if crate not in note["crate"] or unreleased not in note["release"]:
+                continue
+            # A superseded note absent from the reviewed contents never shipped; remove its pending marker.
+            if note["title"] not in reviewed and note["state"] == "live":
+                continue
+            updated = note.copy()
+            releases = set(note["release"]) - {unreleased}
+            if note["title"] in reviewed:
+                releases.add(released)
+            updated["release"] = sorted(releases)
+            updated["date_modified"] = today()
+            validate_note(updated, project)
+            changes.append((path, updated))
+        for path, note in changes:
+            _write_note(path, note)
+        event: ReleaseEvent = {
+            "at": _event_time(), "verb": "release", "project": project,
+            "crate": crate, "version": version,
+            "titles": sorted(note["title"] for _, note in changes),
+        }
+        _append_event(event)
+    print(f"released {released} ({len(changes)} notes)")
+    return 0
+
+
 def _read_digest_cursor() -> DigestCursor | None:
     path = state_dir() / "digest.json"
     if not path.exists():
@@ -1750,7 +2148,7 @@ def _event_datetime(value: str) -> datetime:
         raise FeatureLogError(f"event time is invalid: {value}") from error
     if parsed.tzinfo is None:
         raise FeatureLogError(f"event time has no timezone: {value}")
-    return parsed.astimezone(ZoneInfo("America/Los_Angeles"))
+    return parsed.astimezone(user_zone())
 
 
 def _digest_time_label(value: str) -> str:
@@ -1758,7 +2156,7 @@ def _digest_time_label(value: str) -> str:
 
 
 def _print_digest(selected: list[FeatureLogEvent], since_label: str) -> int:
-    visible = [event for event in selected if not event["backfill"]]
+    visible = [event for event in selected if event["verb"] == "release" or not event["backfill"]]
     for project in PROJECTS:
         project_events = [event for event in visible if event["project"] == project]
         if not project_events:
@@ -1770,6 +2168,8 @@ def _print_digest(selected: list[FeatureLogEvent], since_label: str) -> int:
             elif event["verb"] == "supersede":
                 for old in event["old"]:
                     print(f"→ {old} ⇒ {event['title']}")
+            elif event["verb"] == "release":
+                print(f"= {event['crate']}@{event['version']} ({len(event['titles'])} notes)")
             else:
                 print(f"~ {event['title']} ({', '.join(event['fields'])})")
 
@@ -1785,9 +2185,7 @@ def _run_digest(arguments: argparse.Namespace) -> int:
     if since is not None:
         _validate_date(since, "since")
         events = _read_events()
-        boundary = datetime.fromisoformat(f"{since}T00:00:00").replace(
-            tzinfo=ZoneInfo("America/Los_Angeles")
-        )
+        boundary = datetime.fromisoformat(f"{since}T00:00:00").replace(tzinfo=user_zone())
         selected = [event for event in events if _event_datetime(event["at"]) >= boundary]
         return _print_digest(selected, boundary.strftime("%Y-%m-%d %H:%M %Z"))
 
@@ -1902,6 +2300,10 @@ def _parser() -> FeatureLogArgumentParser:
     supersede = subparsers.add_parser("supersede")
     _ = supersede.add_argument("--review")
     _ = supersede.add_argument("--old", action="append")
+    _ = supersede.add_argument(
+        "--split", dest="replacement_policy", action="store_const",
+        const=ExtendReplacementSet(), default=ReplaceLiveNotes(),
+    )
     _add_new_note_arguments(supersede, required=False)
 
     propose = subparsers.add_parser("propose")
@@ -1939,6 +2341,20 @@ def _parser() -> FeatureLogArgumentParser:
     digest = subparsers.add_parser("digest")
     _ = digest.add_argument("--since")
 
+    changelog = subparsers.add_parser("changelog")
+    _ = changelog.add_argument("--crate", required=True)
+    _ = changelog.add_argument("--version", required=True)
+    _ = changelog.add_argument("--compare")
+    _ = changelog.add_argument("--save")
+    _ = changelog.add_argument("--selection", action="store_true", help=argparse.SUPPRESS)
+
+    release = subparsers.add_parser("release")
+    _ = release.add_argument("--crate", required=True)
+    _ = release.add_argument("--version", required=True)
+    contents = release.add_mutually_exclusive_group(required=True)
+    _ = contents.add_argument("--contents")
+    _ = contents.add_argument("--contents-stdin", action="store_true", help=argparse.SUPPRESS)
+
     project_of_parser = subparsers.add_parser("project-of")
     _ = project_of_parser.add_argument("path", nargs="?", default=".")
 
@@ -1946,20 +2362,33 @@ def _parser() -> FeatureLogArgumentParser:
     return parser
 
 
-def main(argv: list[str], ssh_runner: SshRunner = _run_ssh) -> int:
-    if (
+def main(
+    argv: list[str],
+    ssh_runner: SshRunner = _run_ssh,
+    forwarded_reader: ForwardedReader = _read_forwarded_selection,
+    release_forwarder: ReleaseForwarder = _forward_release,
+) -> int:
+    off_host = (
         (not argv or argv[0] != "project-of")
         and socket.gethostname().split(".", 1)[0] != "natedev"
         and "FEATURE_LOG_VAULT" not in os.environ
-    ):
-        remote_command = (
-            "~/.claude/scripts/lib/py ~/.claude/scripts/feature_log/feature_log.py "
-            + shlex.join(argv)
-        )
-        return ssh_runner(["ssh", "natedev", remote_command])
+    )
+    if off_host and (not argv or argv[0] not in {"changelog", "release"}):
+        return ssh_runner(_ssh_command(argv))
     try:
         arguments = _parser().parse_args(argv)
         command = cast(str, arguments.command)
+        if command == "changelog":
+            return _run_changelog(_changelog_request(arguments), off_host, forwarded_reader)
+        if command == "release":
+            contents = _release_contents(arguments)
+            crate = cast(str, arguments.crate)
+            version = cast(str, arguments.version)
+            if off_host:
+                return release_forwarder(_ssh_command([
+                    "release", "--crate", crate, "--version", version, "--contents-stdin",
+                ]), contents)
+            return _run_release(crate, version, contents)
         if command == "add":
             review = cast(str | None, arguments.review)
             if review is not None:
@@ -1968,12 +2397,15 @@ def main(argv: list[str], ssh_runner: SshRunner = _run_ssh) -> int:
             return _run_add(arguments)
         if command == "supersede":
             review = cast(str | None, arguments.review)
+            policy = cast(ReplacementPolicy, arguments.replacement_policy)
             if review is not None:
+                if isinstance(policy, ExtendReplacementSet):
+                    raise FeatureLogError("--split cannot be combined with --review")
                 return _run_review_land("supersede", review)
             _require_new_note_arguments(arguments)
             if cast(list[str] | None, arguments.old) is None:
                 raise FeatureLogError("the following arguments are required: --old")
-            return _run_supersede(arguments)
+            return _run_supersede(arguments, policy)
         if command == "propose":
             return _run_propose(arguments)
         if command == "drop":

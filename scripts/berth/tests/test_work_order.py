@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Work Order validation: the optional Seats field."""
+"""Work Order validation: the optional Seats field and lettered phases."""
 
 from __future__ import annotations
 
@@ -12,7 +12,10 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from berth.work_order import (  # noqa: E402
+    EveryWorkOrderSelection,
     ExactPhaseSelection,
+    ValidatedWorkOrder,
+    WorkOrderSelection,
     WorkOrderValidationError,
     _validated_orders,  # pyright: ignore[reportPrivateUsage]
 )
@@ -77,6 +80,50 @@ class SeatsFieldTest(unittest.TestCase):
         with self.assertRaises(WorkOrderValidationError) as caught:
             self._validate("\n**Seats:**\n")
         self.assertIn("empty **Seats:** section", " ".join(caught.exception.errors))
+
+
+def _phase(identifier: str) -> str:
+    return textwrap.dedent(
+        f"""\
+        ### Phase {identifier} — Replay  · status: todo
+
+        #### Work Order
+
+        **Goal:** phase {identifier} works.
+
+        **Spec:**
+        Replay the log.
+
+        **Files:**
+        - `src/phase_{identifier}.rs` — the replay loop
+
+        """
+    )
+
+
+class LetteredPhaseTest(unittest.TestCase):
+    def _orders(
+        self, identifiers: tuple[str, ...], selection: WorkOrderSelection
+    ) -> tuple[ValidatedWorkOrder, ...]:
+        with tempfile.TemporaryDirectory() as root:
+            plan = Path(root) / "plan.md"
+            _ = plan.write_text(
+                "# Feature\n\n## Phases\n\n" + "".join(_phase(i) for i in identifiers),
+                encoding="utf-8",
+            )
+            _, orders = _validated_orders(str(plan), Path(root), selection)
+            return orders
+
+    def test_lettered_phase_validates(self) -> None:
+        orders = self._orders(("46c",), EveryWorkOrderSelection())
+        self.assertEqual([order.phase for order in orders], ["46c"])
+
+    def test_selection_picks_only_its_own_phase(self) -> None:
+        for selector in ("46", "46c"):
+            with self.subTest(selector=selector):
+                orders = self._orders(("46", "46c"), ExactPhaseSelection(selector))
+                self.assertEqual([order.phase for order in orders], [selector])
+                self.assertEqual(orders[0].goal, f"phase {selector} works.")
 
 
 if __name__ == "__main__":

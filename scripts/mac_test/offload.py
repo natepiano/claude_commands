@@ -23,6 +23,8 @@ from typing import Literal, TextIO, cast, final
 
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lint"))
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "build_hold"))
+import override_guard
 import sweep
 
 
@@ -179,6 +181,24 @@ class ProbeSnapshot:
 
 
 @dataclass(frozen=True)
+class LeftoversEnded:
+    """Both selectors completed and found no remaining remote work."""
+
+
+@dataclass(frozen=True)
+class LeftoversRemain:
+    count: int
+
+
+@dataclass(frozen=True)
+class LeftoverCheckFailed:
+    reason: str
+
+
+LeftoverCheckResult = LeftoversEnded | LeftoversRemain | LeftoverCheckFailed
+
+
+@dataclass(frozen=True)
 class CommandOutput:
     """Exit status and text from a command that completed."""
 
@@ -198,6 +218,35 @@ class CommandCouldNotStart:
 CapturedCommandResult = CommandOutput | CommandTimedOut | CommandCouldNotStart
 COMMAND_TIMED_OUT = CommandTimedOut()
 COMMAND_COULD_NOT_START = CommandCouldNotStart()
+
+
+@dataclass(frozen=True)
+class FreshMacClaim:
+    """New capacity with no remote job started under it."""
+
+
+@dataclass(frozen=True)
+class TakenOverMacClaim:
+    """Capacity inherited from a lost job on the host in the claim's reply."""
+
+    host: str
+
+
+@dataclass(frozen=True)
+class TakeoverHostUnreadable:
+    """A takeover reply that cannot name the host for its leftover check."""
+
+
+@dataclass(frozen=True)
+class MacClaimNotConfirmed:
+    """A refusal or failed call that supplies no confirmed claim to release."""
+
+    reason: MacDeclineReason
+    stdout: str
+    stderr: str
+
+
+MacClaimAnswer = FreshMacClaim | TakenOverMacClaim | TakeoverHostUnreadable | MacClaimNotConfirmed
 
 
 class IgnoredPathListingFailed:
@@ -234,7 +283,22 @@ class RunningProcess:
     process: subprocess.Popen[str]
 
 
-ActiveProcess = IdleProcess | RunningProcess
+class NoClaimInterrupt:
+    """No signal arrived while the local claim was completing."""
+
+
+NO_CLAIM_INTERRUPT = NoClaimInterrupt()
+
+
+@dataclass
+class LocalClaimAttempt:
+    """A local claim whose answer is retained before a signal takes effect."""
+
+    answer: MacClaimAnswer = MacClaimNotConfirmed("state", "", "")
+    interruption: NoClaimInterrupt | OffloadInterrupted = NO_CLAIM_INTERRUPT
+
+
+ActiveProcess = IdleProcess | RunningProcess | LocalClaimAttempt
 IDLE_PROCESS = IdleProcess()
 
 
@@ -322,6 +386,8 @@ class ProcessController:
 
     def stop(self) -> None:
         active = self.active
+        if isinstance(active, LocalClaimAttempt):
+            return
         self.active = IDLE_PROCESS
         if not isinstance(active, RunningProcess):
             return
@@ -334,6 +400,32 @@ class ProcessController:
         except subprocess.TimeoutExpired:
             process.kill()
             _ = process.wait()
+
+    def defer_claim_interrupt(self, signal_number: int) -> bool:
+        if not isinstance(self.active, LocalClaimAttempt):
+            return False
+        self.active.interruption = OffloadInterrupted(signal_number)
+        return True
+
+    def complete_claim(self, arguments: Sequence[str], attempt: LocalClaimAttempt) -> None:
+        """Read the bounded local claim's reply even when the runner is signalled."""
+        self.active = attempt
+        try:
+            try:
+                process = subprocess.Popen(
+                    arguments,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    start_new_session=True,
+                )
+            except OSError:
+                attempt.answer = read_claim_answer(COMMAND_COULD_NOT_START)
+            else:
+                stdout, stderr = process.communicate()
+                attempt.answer = read_claim_answer(CommandOutput(process.returncode, stdout, stderr))
+        finally:
+            self.active = IDLE_PROCESS
 
     def capture(
         self,
@@ -394,14 +486,14 @@ class ProcessController:
                     held_status_line = line
                 else:
                     print(line, end="", flush=True)
-            status = process.wait()
+            _ = process.wait()
         finally:
             self.active = IDLE_PROCESS
             output.close()
         status_match = re.fullmatch(
             r"mac_exit=([0-9]+)", held_status_line.rstrip("\r\n")
         )
-        if status_match is None or status == 255:
+        if status_match is None:
             return MISSING_MAC_STATUS
         mac_status = int(status_match.group(1))
         if mac_status > 255:
@@ -609,7 +701,7 @@ def parse_probe(output: str) -> ProbeResult:
     return ProbeSnapshot(power, free_gib, hostname)
 
 
-def claim_arguments(request: OffloadRequest) -> list[str]:
+def claim_arguments(request: OffloadRequest, config: OffloadConfig) -> list[str]:
     return [
         sys.executable,
         str(Path(__file__).with_name("mac_test.py")),
@@ -620,6 +712,8 @@ def claim_arguments(request: OffloadRequest) -> list[str]:
         f"nextest {request.package}",
         "--worktree",
         str(request.repo_root),
+        "--remote",
+        config.host,
     ]
 
 
@@ -633,6 +727,23 @@ def release_claim(controller: ProcessController) -> None:
             str(os.getpid()),
         ]
     )
+
+
+def read_claim_answer(result: CapturedCommandResult) -> MacClaimAnswer:
+    if not isinstance(result, CommandOutput):
+        return MacClaimNotConfirmed("state", "", "")
+    if result.status == 0:
+        return FreshMacClaim()
+    if result.status == 13:
+        hosts = [line.removeprefix("leftovers: ").strip() for line in result.stdout.splitlines()
+                 if line.startswith("leftovers: ")]
+        if len(hosts) == 1 and hosts[0]:
+            return TakenOverMacClaim(hosts[0])
+        return TakeoverHostUnreadable()
+    reason: MacDeclineReason = (
+        "blocked" if result.status == 10 else "busy" if result.status == 11 else "state"
+    )
+    return MacClaimNotConfirmed(reason, result.stdout, result.stderr)
 
 
 def probe_reachability(
@@ -784,21 +895,108 @@ def remote_test_command(
     )
 
 
-def end_remote_work(config: OffloadConfig, repository: KnownRepository) -> None:
+def leftover_check_script() -> str:
+    return r'''select_leftovers() {
+    if command_pids=$(pgrep -f '[.]local/state/mac-test/mirror/'); then
+        :
+    else
+        selector_result=$?
+        [ "$selector_result" -eq 1 ] || return 1
+    fi
+    cwd_records=$(lsof -a -u "$(id -u)" -d cwd -Fpn) || return 1
+    cwd_pids=$(printf '%s\n' "$cwd_records" | awk '/^p/ { pid = substr($0, 2) } /^n.*\/[.]local\/state\/mac-test\/mirror(\/|$)/ { print pid }') || return 1
+    printf '%s\n%s\n' "$command_pids" "$cwd_pids" | awk '/^[0-9]+$/ && !seen[$0]++ { print }'
+}
+leftover_pids=$(select_leftovers) || exit 1
+printf '%s\n' "$leftover_pids" | while IFS= read -r leftover_pid; do
+    [ -n "$leftover_pid" ] && kill "$leftover_pid" 2>/dev/null
+done
+sleep 1 || exit 1
+leftover_pids=$(select_leftovers) || exit 1
+printf '%s\n' "$leftover_pids" | while IFS= read -r leftover_pid; do
+    [ -n "$leftover_pid" ] && kill -9 "$leftover_pid" 2>/dev/null
+done
+leftover_pids=$(select_leftovers) || exit 1
+leftover_count=$(printf '%s\n' "$leftover_pids" | awk 'NF { count++ } END { print count+0 }') || exit 1
+printf 'leftovers=%s\nrc=0\n' "$leftover_count"
+'''
+
+
+def parse_leftover_check(output: str) -> LeftoverCheckResult:
+    values: dict[str, str] = {}
+    for line in output.splitlines():
+        key, separator, value = line.partition("=")
+        if separator:
+            values[key] = value
+    count_text = values.get("leftovers", "")
+    if values.get("rc") != "0" or not count_text.isascii() or not count_text.isdecimal():
+        return LeftoverCheckFailed("the leftover check answer could not be read")
+    count = int(count_text)
+    return LeftoversEnded() if count == 0 else LeftoversRemain(count)
+
+
+def check_leftovers(config: OffloadConfig, host: str) -> LeftoverCheckResult:
+    """End and count mirror work without exposing the check to a second signal."""
     try:
-        _ = subprocess.run(
-            [
-                *ssh_prefix(config),
-                f"pkill -f {shlex.quote(remote_mirror(repository))}",
-            ],
+        result = subprocess.run(
+            ["ssh", *ssh_options(config), host, leftover_check_script()],
             stdin=subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
             check=False,
             timeout=10,
         )
-    except (OSError, subprocess.TimeoutExpired):
-        return
+    except subprocess.TimeoutExpired:
+        return LeftoverCheckFailed("SSH leftover check timed out after 10 s")
+    except OSError:
+        return LeftoverCheckFailed("SSH leftover check could not start (time limit 10 s)")
+    answer = parse_leftover_check(result.stdout)
+    if isinstance(answer, LeftoverCheckFailed):
+        reason = " ".join(result.stderr.split())
+        if reason:
+            return LeftoverCheckFailed(reason)
+    return answer
+
+
+def report_leftover_check(result: LeftoverCheckResult, request: OffloadRequest) -> None:
+    if isinstance(result, LeftoversRemain):
+        if not decline_already_shown("busy", request.last_decline):
+            print(f"mac_test: {result.count} leftover processes of a lost run are still on the Mac; "
+                  + "it stays busy until they end", file=sys.stderr, flush=True)
+    elif isinstance(result, LeftoverCheckFailed):
+        if not decline_already_shown("unreachable", request.last_decline):
+            print("mac_test: could not confirm that a lost run's leftovers ended: "
+                  + f"{result.reason}; the Mac stays busy", file=sys.stderr, flush=True)
+
+
+def check_taken_over_claim(
+    config: OffloadConfig, claim: TakenOverMacClaim | TakeoverHostUnreadable
+) -> LeftoverCheckResult:
+    if isinstance(claim, TakenOverMacClaim):
+        return check_leftovers(config, claim.host)
+    return LeftoverCheckFailed("the kept claim's host could not be read")
+
+
+def claim_for_run(
+    controller: ProcessController, config: OffloadConfig, request: OffloadRequest
+) -> MacClaimAnswer:
+    attempt = LocalClaimAttempt()
+    try:
+        controller.complete_claim(claim_arguments(request, config), attempt)
+        if isinstance(attempt.interruption, OffloadInterrupted):
+            raise attempt.interruption
+        return attempt.answer
+    except OffloadInterrupted:
+        claim = attempt.answer
+        if isinstance(claim, FreshMacClaim):
+            release_claim(controller)
+        elif isinstance(claim, (TakenOverMacClaim, TakeoverHostUnreadable)):
+            checked = check_taken_over_claim(config, claim)
+            report_leftover_check(checked, request)
+            if isinstance(checked, LeftoversEnded):
+                release_claim(controller)
+        raise
 
 
 def claimed_run(
@@ -808,6 +1006,7 @@ def claimed_run(
     repository: KnownRepository,
     started: float,
 ) -> MacOffloadResult:
+    release_allowed = True
     try:
         probe = probe_mac(controller, config, repository)
         if isinstance(probe, UnavailableProbe):
@@ -827,6 +1026,7 @@ def claimed_run(
             + f"(macOS, host {probe.hostname}); tree copied in {copy_seconds:.1f} s",
             flush=True,
         )
+        release_allowed = False
         remote_status = controller.stream_mac_run(
             [
                 *ssh_prefix(config),
@@ -835,16 +1035,25 @@ def claimed_run(
         )
         seconds = elapsed_seconds(started)
         if isinstance(remote_status, MissingMacStatus):
-            end_remote_work(config, repository)
+            checked = check_leftovers(config, config.host)
+            release_allowed = isinstance(checked, LeftoversEnded)
+            report_leftover_check(checked, request)
             return LostMacRun(elapsed_seconds(started))
+        release_allowed = True
         if remote_status.status == 0:
             return PassedOnMac(seconds)
         if remote_status.status == 4:
             return NoTestMatchedOnMac(seconds)
         return FailedOnMac(remote_status.status, seconds)
     except OffloadInterrupted:
-        end_remote_work(config, repository)
+        if not release_allowed:
+            checked = check_leftovers(config, config.host)
+            release_allowed = isinstance(checked, LeftoversEnded)
+            report_leftover_check(checked, request)
         raise
+    finally:
+        if release_allowed:
+            release_claim(controller)
 
 
 def run_offload(
@@ -868,27 +1077,27 @@ def run_offload(
     if isinstance(backoff, ActiveBackoff):
         return declined("backoff", started)
 
-    release_may_be_needed = True
-    try:
-        claim = controller.capture(claim_arguments(request))
-        if not isinstance(claim, CommandOutput):
-            release_may_be_needed = False
-            return declined("state", started)
-        if claim.status != 0:
-            release_may_be_needed = False
-            reason: MacDeclineReason = (
-                "blocked" if claim.status == 10 else "busy" if claim.status == 11 else "state"
-            )
-            if not decline_already_shown(reason, request.last_decline):
-                if claim.stdout:
-                    print(claim.stdout, end="" if claim.stdout.endswith("\n") else "\n", file=sys.stderr, flush=True)
-                if claim.stderr:
-                    print(claim.stderr, end="" if claim.stderr.endswith("\n") else "\n", file=sys.stderr, flush=True)
-            return declined(reason, started)
-        return claimed_run(controller, config, request, repository, started)
-    finally:
-        if release_may_be_needed:
-            release_claim(controller)
+    claim = claim_for_run(controller, config, request)
+    if isinstance(claim, (TakenOverMacClaim, TakeoverHostUnreadable)):
+        checked = check_taken_over_claim(config, claim)
+        report_leftover_check(checked, request)
+        if isinstance(checked, LeftoverCheckFailed):
+            write_backoff(time.time() + config.unreachable_backoff_s)
+            return declined("unreachable", started)
+        if isinstance(checked, LeftoversRemain):
+            return declined("busy", started)
+        release_claim(controller)
+        claim = claim_for_run(controller, config, request)
+        if isinstance(claim, (TakenOverMacClaim, TakeoverHostUnreadable)):
+            return declined("busy", started)
+    if isinstance(claim, MacClaimNotConfirmed):
+        if not decline_already_shown(claim.reason, request.last_decline):
+            if claim.stdout:
+                print(claim.stdout, end="" if claim.stdout.endswith("\n") else "\n", file=sys.stderr, flush=True)
+            if claim.stderr:
+                print(claim.stderr, end="" if claim.stderr.endswith("\n") else "\n", file=sys.stderr, flush=True)
+        return declined(claim.reason, started)
+    return claimed_run(controller, config, request, repository, started)
 
 
 @contextmanager
@@ -902,6 +1111,8 @@ def interrupt_handlers(controller: ProcessController) -> Generator[None, None, N
         _ = signal.signal(signal.SIGINT, signal.SIG_IGN)
         _ = signal.signal(signal.SIGTERM, signal.SIG_IGN)
         _ = signal.signal(signal.SIGHUP, signal.SIG_IGN)
+        if controller.defer_claim_interrupt(signal_number):
+            return
         controller.stop()
         raise OffloadInterrupted(signal_number)
 
@@ -959,6 +1170,7 @@ def restore_ignored_interrupt_default(arguments: CliArguments) -> None:
 
 
 def main() -> int:
+    override_guard.refuse_overrides(Path(__file__), "mac_test/offload.py")
     arguments = parser().parse_args(namespace=CliArguments())
     restore_ignored_interrupt_default(arguments)
     request = request_from_arguments(arguments)

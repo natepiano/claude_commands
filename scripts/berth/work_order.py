@@ -26,7 +26,7 @@ PENDING_DECISION_HEADING = re.compile(
     r"^\*\*Pending decision:\s*(?P<subject>[^*\n]+)\*\*\s*$", re.MULTILINE
 )
 WORK_ORDER_HEADING = re.compile(r"^#### Work Order\s*$", re.MULTILINE)
-PHASE_HEADING = re.compile(r"^### Phase\s+(?P<identifier>\d+)\b(?P<title>.*)$", re.MULTILINE)
+PHASE_HEADING = re.compile(r"^### Phase\s+(?P<identifier>\d+[a-z]?)\b(?P<title>.*)$", re.MULTILINE)
 SECTION_HEADING = re.compile(r"^## ", re.MULTILINE)
 CODE_SPAN = re.compile(r"`([^`]+)`")
 LINE_REFERENCE = re.compile(r"(?::\d+(?:-\d+)?|#L\d+(?:-L\d+)?)$")

@@ -22,10 +22,9 @@ from datetime import datetime
 from enum import Enum
 from pathlib import Path
 from typing import Literal, Protocol, TypedDict, cast
-from zoneinfo import ZoneInfo
 
 SCRIPTS = Path(__file__).resolve().parents[1]
-for dependency in ("whoami", "message", "notify", "production", "hooks"):
+for dependency in ("whoami", "message", "notify", "production", "hooks", "lib"):
     sys.path.insert(0, str(SCRIPTS / dependency))
 
 from account import (  # noqa: E402
@@ -78,6 +77,7 @@ import sessions  # noqa: E402
 import showrunner_footer  # noqa: E402
 import stop as stop_work  # noqa: E402
 from user_action import ActionRequired  # noqa: E402
+from user_zone import user_zone  # noqa: E402
 
 
 class RestartMessageSent(TypedDict):
@@ -121,7 +121,6 @@ SESSION_POLL_SECONDS = 0.5
 RESTART_LAUNCH_WORKERS = 6
 REMOTE_CONTROL_WAIT_SECONDS = 10.0
 WINDOW_DELAY_SECONDS = 1.2
-PACIFIC = ZoneInfo("America/Los_Angeles")
 RESTARTABLE_PROGRESS = frozenset({"stopped", "already gone", "process identity lost", "manual restart", "restart failed", "timers pending"})
 COMPLETE_PROGRESS = frozenset({"restarted"})
 # Worst wins when one machine's `up` attempts several records.
@@ -431,8 +430,8 @@ def remote_control_missing(records: list[SessionShutdown], confirmation: Registr
     return missing
 
 
-def _pacific(value: str) -> str:
-    return datetime.fromisoformat(value).astimezone(PACIFIC).strftime(
+def _user_time(value: str) -> str:
+    return datetime.fromisoformat(value).astimezone(user_zone()).strftime(
         "%Y-%m-%d %H:%M %Z"
     )
 
@@ -443,8 +442,8 @@ def restart_note(
     """Build the exact first prompt given to a resumed session."""
     opening = (
         f"Restarted after /shutdown of {record['label']} "
-        f"(stopped {_pacific(record['requested_at'])}, "
-        f"restarted {_pacific(restarted_at)}). "
+        f"(stopped {_user_time(record['requested_at'])}, "
+        f"restarted {_user_time(restarted_at)}). "
     )
     where = record["where"]
     if where["kind"] == "said":
@@ -1592,7 +1591,7 @@ def _account_candidate_lines(
     session_logins = {record["login"].casefold() for record in records}
     for hold in holds:
         if hold["login"].casefold() not in session_logins:
-            since = datetime.fromisoformat(hold["requested_at"]).astimezone(PACIFIC).strftime(
+            since = datetime.fromisoformat(hold["requested_at"]).astimezone(user_zone()).strftime(
                 "%Y-%m-%d %H:%M %Z"
             )
             lines.append(f"{hold['machine']}: {hold['label']} is held by a shutdown (since {since})")

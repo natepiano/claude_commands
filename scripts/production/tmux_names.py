@@ -151,16 +151,17 @@ def fault(kind: str, old: str, new: str, settings: showrunners.ShowrunnerSetting
         return
     try:
         socket = showrunners.socket_for(settings["faults_to"])
-        # The session named for faults is not live: every running showrunner is told instead, and told why.
+        # The session named for faults is not live: each tree's highest running showrunner is told
+        # instead, and told why. A showrunner below it hears nothing, so the user hears once.
         sockets = [socket] if socket is not None else [
-            runner["socket"] for runner in showrunners.registered_showrunners() if runner["socket"]]
+            runner["socket"] for runner in showrunners.highest_running(showrunners.registered_showrunners())]
     except OSError as error:
         print(f"tmux-names: {error}", file=sys.stderr)
         return
     message = f"tmux-names: skipped {old} → {new}: {kind}"
     if socket is None:
         message += (f". {settings['faults_to']}, which {showrunners.CONFIG} names for faults, is not a live session,"
-                    + " so every running showrunner is told.")
+                    + " so every running showrunner that reports to no running one is told.")
     if not sockets:
         print(f"{message} No showrunner is running to tell.", file=sys.stderr)
         return

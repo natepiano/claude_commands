@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from datetime import datetime, timedelta, timezone
 import json
 import os
@@ -23,6 +24,7 @@ from typing import Literal, NotRequired, TypedDict, cast, final, override
 from unittest import mock
 
 import offload
+import mac_test
 
 
 SCRIPT = Path(__file__).with_name("offload.py")
@@ -50,6 +52,11 @@ class CommandFixture(TypedDict):
     cleanup_status: int
     cleanup_delay_s: float
     hold_cleanup: bool
+    cleanup_lines: list[str]
+    cleanup_error: str
+    selector_shell: str
+    selector_pgrep_status: int
+    selector_lsof_status: int
 
 
 class CommandEvent(TypedDict):
@@ -59,10 +66,24 @@ class CommandEvent(TypedDict):
     exclude: NotRequired[str]
 
 
+class SelectorEvent(TypedDict):
+    command: str
+    args: list[str]
+
+
 class WireResult(TypedDict):
     mac: str
     reason: str
     seconds: str
+
+
+class RemoteClaimRecord(TypedDict):
+    pid: int
+    proc_start: str
+    what: str
+    worktree: str
+    since: str
+    remote_host: str
 
 
 COMMAND_STUB = r'''
@@ -73,6 +94,9 @@ import os
 from pathlib import Path
 import sys
 import time
+import shutil
+import subprocess
+import shlex
 
 root = Path(os.environ["MAC_TEST_STUB_DIR"])
 fixture = json.loads((root / "fixture.json").read_text(encoding="utf-8"))
@@ -104,13 +128,34 @@ if command != "ssh":
     raise SystemExit(99)
 
 remote = arguments[-1]
-if "pkill -f" in remote:
+if "pgrep -f" in remote and "lsof" in remote:
     (root / "cleanup-called").write_text("called\n", encoding="utf-8")
     time.sleep(float(fixture["cleanup_delay_s"]))
     if fixture["hold_cleanup"]:
         (root / "cleanup-started").write_text("started\n", encoding="utf-8")
         while not (root / "continue-cleanup").exists():
             time.sleep(0.01)
+    if fixture["selector_shell"]:
+        selectors = root / "selectors"
+        environment = {**os.environ, "PATH": str(selectors) + os.pathsep + os.environ["PATH"]}
+        for name in ("pgrep", "lsof", "sleep"):
+            expected = str(selectors / name)
+            if shutil.which(name, path=environment["PATH"]) != expected:
+                raise SystemExit("selector stand-in missing: " + name)
+        shell = ["/bin/sh"] if fixture["selector_shell"] == "sh" else ["zsh", "-f"]
+        checks = "\n".join(
+            '[ "$(command -v ' + name + ')" = ' + shlex.quote(str(selectors / name)) + ' ] || exit 99'
+            for name in ("pgrep", "lsof", "sleep")
+        )
+        answer = subprocess.run([*shell, "-c", checks + "\n" + remote], env=environment, capture_output=True, text=True, timeout=3)
+        print(answer.stdout, end="", flush=True)
+        print(answer.stderr, end="", file=sys.stderr, flush=True)
+        (root / "selector-answer").write_text(answer.stdout)
+        raise SystemExit(answer.returncode)
+    if fixture["cleanup_error"]:
+        print(fixture["cleanup_error"], file=sys.stderr, flush=True)
+    for line in fixture["cleanup_lines"]:
+        print(line, flush=True)
     raise SystemExit(int(fixture["cleanup_status"]))
 if "lint nextest" in remote:
     (root / "run-started").write_text("started\n", encoding="utf-8")
@@ -137,30 +182,80 @@ raise SystemExit(int(fixture["probe_status"]))
 '''
 
 
+SELECTOR_STUB = r'''
+import json
+import os
+from pathlib import Path
+import sys
+
+root = Path(os.environ["MAC_TEST_STUB_DIR"])
+fixture = json.loads((root / "fixture.json").read_text())
+command = Path(sys.argv[0]).name
+with (root / "selector-events.jsonl").open("a") as output:
+    output.write(json.dumps({"command": command, "args": sys.argv[1:]}) + "\n")
+# Selectors print no process ids, so the tested shell text can signal no process.
+if command == "pgrep":
+    raise SystemExit(fixture["selector_pgrep_status"])
+if command == "lsof":
+    raise SystemExit(fixture["selector_lsof_status"])
+if command == "sleep":
+    raise SystemExit(0)
+raise SystemExit(99)
+'''
+
+
 CLAIM_STUB = r'''
 from __future__ import annotations
 
+import json
 import os
 from pathlib import Path
 import sys
 import time
 
-root = Path(os.environ["MAC_TEST_STUB_DIR"])
-state = Path(os.environ["MAC_TEST_STATE_DIR"])
-action = sys.argv[1]
-with (root / "state-events").open("a", encoding="utf-8") as output:
-    output.write(action + "\n")
-if action == "claim":
-    state.mkdir(parents=True, exist_ok=True)
-    (state / "run.json").write_text("claimed\n", encoding="utf-8")
-    (root / "claim-started").write_text("started\n", encoding="utf-8")
-    while not (root / "finish-claim").exists():
-        time.sleep(0.01)
-    raise SystemExit(0)
-if action == "release":
-    (state / "run.json").unlink(missing_ok=True)
-    raise SystemExit(0)
-raise SystemExit(12)
+def main() -> int:
+    root = Path(os.environ["MAC_TEST_STUB_DIR"])
+    state = Path(os.environ["MAC_TEST_STATE_DIR"])
+    action = sys.argv[1]
+    with (root / "state-events").open("a", encoding="utf-8") as output:
+        output.write(action + "\n")
+    if action == "claim":
+        state.mkdir(parents=True, exist_ok=True)
+        arguments = sys.argv[2:]
+        owner_pid = int(arguments[arguments.index("--pid") + 1])
+        proc_start = Path(f"/proc/{owner_pid}/stat").read_text().rpartition(")")[2].split()[19]
+        record = {"pid": owner_pid, "proc_start": proc_start, "what": "nextest hana",
+                  "worktree": arguments[arguments.index("--worktree") + 1], "since": "2026-10-12T00:00:00+00:00",
+                  "remote_host": arguments[arguments.index("--remote") + 1]}
+        actions = (root / "state-events").read_text().splitlines()
+        if (os.environ.get("MAC_TEST_TAKEOVER_TWICE") == "1"
+                or os.environ.get("MAC_TEST_TAKEOVER_FIRST") == "1" and actions == ["claim"]):
+            record["what"] = "older tests"
+            record["remote_host"] = "previous-mac"
+            (state / "run.json").write_text(json.dumps(record))
+            print("leftovers: previous-mac", flush=True)
+            return 13
+        takeover = os.environ.get("MAC_TEST_HELD_TAKEOVER") == "1"
+        if takeover:
+            record["what"] = "older tests"
+            record["remote_host"] = "previous-mac"
+        (state / "run.json").write_text(json.dumps(record), encoding="utf-8")
+        (root / "claim-started").write_text("started\n", encoding="utf-8")
+        while not (root / "finish-claim").exists():
+            time.sleep(0.01)
+        if takeover:
+            print("leftovers: " + os.environ.get("MAC_TEST_TAKEOVER_REPLY", "reply-mac"), flush=True)
+            return 13
+        return 0
+    if action == "release":
+        (state / "run.json").unlink(missing_ok=True)
+        return 0
+    return 12
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+__file__ = os.environ["MAC_TEST_REAL_STATE"]
+exec(compile(Path(__file__).read_text(), __file__, "exec"), globals())
 '''
 
 
@@ -278,20 +373,64 @@ class OffloadSettingsTests(unittest.TestCase):
         self.assertNotIn("pgrep", script)
         self.assertNotIn("procs", script)
 
+    def test_leftover_check_requires_count_and_printed_success_on_the_named_host(self) -> None:
+        config = offload.read_config(self.settings)
+        for answer, expected in (("leftovers=0\nrc=0\n", offload.LeftoversEnded()),
+                                 ("leftovers=4\nrc=0\n", offload.LeftoversRemain(4))):
+            with self.subTest(answer=answer):
+                response = subprocess.CompletedProcess(["ssh"], 0, answer, "")
+                with mock.patch.object(subprocess, "run", return_value=response) as run:
+                    self.assertEqual(offload.check_leftovers(config, "kept-host"), expected)
+                arguments = cast(list[str], run.call_args.args[0])
+                self.assertEqual(arguments[:-1], ["ssh", *offload.ssh_options(config), "kept-host"])
+                self.assertEqual(run.call_args.kwargs["timeout"], 10)
+                self.assertIn("pgrep -f '[.]local/state/mac-test/mirror/'", arguments[-1])
+        for answer in ("leftovers=0\n", "rc=0\n", "leftovers=-1\nrc=0\n", "leftovers=bad\nrc=0\n"):
+            with self.subTest(answer=answer):
+                response = subprocess.CompletedProcess(["ssh"], 0, answer, "")
+                with mock.patch.object(subprocess, "run", return_value=response):
+                    result = offload.check_leftovers(config, "kept-host")
+                self.assertIsInstance(result, offload.LeftoverCheckFailed)
+                if isinstance(result, offload.LeftoverCheckFailed):
+                    self.assertIn("answer could not be read", result.reason)
+
+    def test_leftover_check_reports_timeout_start_failure_and_ssh_error(self) -> None:
+        config = offload.read_config(self.settings)
+        for error, expected in ((subprocess.TimeoutExpired("ssh", 10), "timed out after 10"),
+                                (FileNotFoundError("ssh missing"), "could not start")):
+            with self.subTest(error=type(error).__name__):
+                with mock.patch.object(subprocess, "run", side_effect=error):
+                    result = offload.check_leftovers(config, "kept-host")
+                self.assertIsInstance(result, offload.LeftoverCheckFailed)
+                if isinstance(result, offload.LeftoverCheckFailed):
+                    self.assertIn(expected, result.reason)
+                    self.assertIn("10", result.reason)
+        response = subprocess.CompletedProcess(["ssh"], 255, "", "connection\n refused\tby host")
+        with mock.patch.object(subprocess, "run", return_value=response):
+            result = offload.check_leftovers(config, "kept-host")
+        self.assertIsInstance(result, offload.LeftoverCheckFailed)
+        if isinstance(result, offload.LeftoverCheckFailed):
+            self.assertEqual(result.reason, "connection refused by host")
+
     def test_probe_that_cannot_start_reports_its_limit_through_run(self) -> None:
         _ = self.settings.write_text("offload=on\nlinux_only.hana=\nprobe_timeout_s=2.5\n")
         destination = self.root / "result"
-        responses = [offload.CommandOutput(0, "", ""), offload.COMMAND_COULD_NOT_START,
-                     offload.CommandOutput(0, "", "")]
+        responses = [offload.COMMAND_COULD_NOT_START, offload.CommandOutput(0, "", "")]
+
+        def complete_claim(arguments: Sequence[str], attempt: offload.LocalClaimAttempt) -> None:
+            _ = arguments
+            attempt.answer = offload.FreshMacClaim()
+
         with mock.patch.object(sys, "argv", ["offload.py", "run", "--repo-root", str(self.root),
                                              "--package", "hana", "--call-id", "probe-start", "--result", str(destination)]), \
              mock.patch.object(offload, "repository_identity", return_value=offload.KnownRepository("hana")), \
+             mock.patch.object(offload.ProcessController, "complete_claim", side_effect=complete_claim), \
              mock.patch.object(offload.ProcessController, "capture", side_effect=responses) as capture, \
              redirect_stdout(io.StringIO()) as output, redirect_stderr(io.StringIO()) as errors:
             self.assertEqual(offload.main(), 75)
         self.assertEqual(output.getvalue(), "mac_test: not running on the Mac (unreachable)\n")
         self.assertRegex(errors.getvalue(), r"^mac_test: could not reach the Mac: .*could not start.*2\.5.*\n$")
-        self.assertEqual(capture.call_count, 3)
+        self.assertEqual(capture.call_count, 2)
         self.assertEqual(destination.read_text().splitlines()[:2], ["mac=declined", "reason=unreachable"])
         self.assertTrue((self.root / "state" / "unreachable_until").exists())
 
@@ -325,6 +464,11 @@ class OffloadCommandTests(unittest.TestCase):
             "cleanup_status": 0,
             "cleanup_delay_s": 0.0,
             "hold_cleanup": False,
+            "cleanup_lines": ["leftovers=0", "rc=0"],
+            "cleanup_error": "",
+            "selector_shell": "",
+            "selector_pgrep_status": 1,
+            "selector_lsof_status": 0,
         }
 
     @override
@@ -386,6 +530,11 @@ class OffloadCommandTests(unittest.TestCase):
             "cleanup_status": 0,
             "cleanup_delay_s": 0.0,
             "hold_cleanup": False,
+            "cleanup_lines": ["leftovers=0", "rc=0"],
+            "cleanup_error": "",
+            "selector_shell": "",
+            "selector_pgrep_status": 1,
+            "selector_lsof_status": 0,
         }
         self.sync_config()
         self.sync_fixture()
@@ -396,6 +545,7 @@ class OffloadCommandTests(unittest.TestCase):
             "MAC_TEST_STATE_DIR": str(self.state_directory),
             "MAC_TEST_CONFIG": str(self.config_path),
             "MAC_TEST_STUB_DIR": str(self.stub_directory),
+            "MAC_TEST_REAL_STATE": str(STATE_SCRIPT),
             "BUILD_HOLD_DIR": str(self.root / "holders"),
             "BUILD_HOLD_RELEASE_DIR": str(self.root / "release"),
             "PLAN_DELEGATE_ACTIVE_DIR": str(self.root / "active"),
@@ -466,6 +616,7 @@ class OffloadCommandTests(unittest.TestCase):
         script: Path = SCRIPT,
         extra: dict[str, str] | None = None,
         ignore_interrupt: bool = False,
+        start_new_session: bool = False,
     ) -> subprocess.Popen[str]:
         self.result_path.unlink(missing_ok=True)
         arguments = [
@@ -498,6 +649,7 @@ class OffloadCommandTests(unittest.TestCase):
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
+            start_new_session=start_new_session,
         )
 
     def claim_stub_runner(self) -> Path:
@@ -510,6 +662,7 @@ class OffloadCommandTests(unittest.TestCase):
         (scripts_directory / "lint").symlink_to(
             SCRIPT.parent.parent / "lint", target_is_directory=True
         )
+        (scripts_directory / "build_hold").symlink_to(SCRIPT.parent.parent / "build_hold", target_is_directory=True)
         return runner
 
     def state_command(self, *arguments: str) -> subprocess.CompletedProcess[str]:
@@ -569,6 +722,73 @@ class OffloadCommandTests(unittest.TestCase):
         for event in self.events():
             if event["command"] in {"ssh", "rsync"}:
                 self.assertTrue(event["claimed"], event)
+
+    def leftover_events(self) -> list[CommandEvent]:
+        return [event for event in self.events_for("ssh") if "pgrep -f" in event["args"][-1]]
+
+    def assert_leftover_selectors(self, remote: str) -> None:
+        self.assertIn("pgrep -f '[.]local/state/mac-test/mirror/'", remote)
+        self.assertIn('lsof -a -u "$(id -u)" -d cwd -Fpn', remote)
+        self.assertIn("awk '/^p/ { pid = substr($0, 2) } /^n.*\\/[.]local\\/state\\/mac-test\\/mirror(\\/|$)/ { print pid }'", remote)
+        self.assertNotIn("pkill", remote)
+        self.assertNotIn("PIPESTATUS", remote)
+        self.assertNotIn(".local/state/mac-test/mirror/", remote.replace("[.]local/state/mac-test/mirror/", ""))
+
+    def remote_claim(self) -> RemoteClaimRecord:
+        return cast(RemoteClaimRecord, json.loads((self.state_directory / "run.json").read_text()))
+
+    def write_kept_claim(self, host: str = "previous-mac") -> RemoteClaimRecord:
+        self.state_directory.mkdir(exist_ok=True)
+        record: RemoteClaimRecord = {"pid": 1073741824, "proc_start": "gone", "what": "older tests",
+                                     "worktree": str(self.repository), "since": datetime.now(timezone.utc).isoformat(),
+                                     "remote_host": host}
+        _ = (self.state_directory / "run.json").write_text(json.dumps(record))
+        return record
+
+    def assert_claim_is_kept(self, host: str = "mac") -> None:
+        path = self.state_directory / "run.json"
+        self.assertTrue(path.exists())
+        record = self.remote_claim()
+        self.assertEqual(record["remote_host"], host)
+        self.assertIsNone(mac_test.process_start_time(record["pid"]))
+        decoded = mac_test.read_run(path)
+        self.assertNotIsInstance(decoded, mac_test.NoRun)
+        if not isinstance(decoded, mac_test.NoRun):
+            self.assertTrue(mac_test.run_is_live(decoded))
+
+    def reset_leftover_case(self) -> None:
+        self.clear_events()
+        (self.state_directory / "run.json").unlink(missing_ok=True)
+        (self.state_directory / "unreachable_until").unlink(missing_ok=True)
+        for name in ("run-started", "cleanup-called", "selector-events.jsonl", "selector-answer"):
+            (self.stub_directory / name).unlink(missing_ok=True)
+
+    def set_leftover_answer(self, outcome: str) -> None:
+        self.fixture["cleanup_lines"] = ["leftovers=0", "rc=0"]
+        self.fixture["cleanup_status"] = 0
+        self.fixture["cleanup_error"] = ""
+        self.fixture["cleanup_delay_s"] = 0
+        if outcome == "remaining":
+            self.fixture["cleanup_lines"] = ["leftovers=3", "rc=0"]
+        elif outcome == "missing_status":
+            self.fixture["cleanup_lines"] = ["leftovers=0"]
+        elif outcome == "timeout":
+            self.fixture["cleanup_delay_s"] = 12
+        elif outcome == "ssh_error":
+            self.fixture["cleanup_lines"] = []
+            self.fixture["cleanup_status"] = 255
+            self.fixture["cleanup_error"] = "connection\n  refused\tby host"
+        self.sync_fixture()
+
+    def assert_leftover_diagnostic(self, output: str, outcome: str) -> None:
+        if outcome == "remaining":
+            self.assertIn("mac_test: 3 leftover processes of a lost run are still on the Mac; it stays busy until they end\n", output)
+        else:
+            self.assertRegex(output, r"mac_test: could not confirm that a lost run's leftovers ended: [^\n]+; the Mac stays busy\n")
+            if outcome == "timeout":
+                self.assertRegex(output, r"timed out after 10(?:\.0)? s")
+            if outcome == "ssh_error":
+                self.assertIn("connection refused by host", output)
 
     def wait_for_path(self, path: Path) -> None:
         deadline = time.monotonic() + 5
@@ -856,22 +1076,125 @@ class OffloadCommandTests(unittest.TestCase):
         self.assertEqual(text.count("mac_test: running on the Mac (macOS, host Mac); tree copied in "), 1)
         self.assert_wire("passed", "")
 
-    def test_signal_during_claim_releases_a_possible_claim(self) -> None:
-        process = self.start_command(script=self.claim_stub_runner())
+    def interrupt_held_claim(
+        self, *, takeover: bool = False, after_takeover: bool = False,
+        signal_group: bool = False, signal_number: int = signal.SIGTERM,
+        reply_host: str = "reply-mac",
+    ) -> str:
+        process = self.start_command(
+            script=self.claim_stub_runner(),
+            extra={"MAC_TEST_HELD_TAKEOVER": "1" if takeover else "0",
+                   "MAC_TEST_TAKEOVER_FIRST": "1" if after_takeover else "0",
+                   "MAC_TEST_TAKEOVER_REPLY": reply_host},
+            start_new_session=signal_group,
+        )
         try:
             self.wait_for_path(self.stub_directory / "claim-started")
-            process.send_signal(signal.SIGTERM)
+            if signal_group:
+                os.killpg(process.pid, signal_number)
+            else:
+                process.send_signal(signal_number)
+            self.wait_for_ignored_signals(process)
+            _ = (self.stub_directory / "finish-claim").write_text("continue\n")
             output, _ = process.communicate(timeout=15)
-        except BaseException:
-            process.kill()
-            _ = process.communicate(timeout=5)
-            raise
-        self.assertEqual(process.returncode, 128 + signal.SIGTERM, output)
+        finally:
+            _ = (self.stub_directory / "finish-claim").write_text("continue\n")
+            if process.poll() is None:
+                process.kill()
+                _ = process.communicate(timeout=5)
+        self.assertEqual(process.returncode, 128 + signal_number, output)
+        self.assertFalse(self.result_path.exists())
+        self.assertFalse((self.state_directory / "unreachable_until").exists())
+        return output
+
+    def wait_for_ignored_signals(self, process: subprocess.Popen[str]) -> None:
+        expected = sum(1 << (number - 1) for number in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP))
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            if process.poll() is not None:
+                return
+            try:
+                status = Path(f"/proc/{process.pid}/status").read_text()
+            except FileNotFoundError:
+                continue
+            masks = [line.split()[1] for line in status.splitlines() if line.startswith("SigIgn:")]
+            if masks and int(masks[0], 16) & expected == expected:
+                return
+            time.sleep(0.01)
+        self.fail("runner did not handle the claim signal")
+
+    def assert_fresh_claim_signal_releases_without_ssh(self, outcome: str) -> None:
+        self.set_leftover_answer(outcome)
+        output = self.interrupt_held_claim()
         state_events = (self.stub_directory / "state-events").read_text(
             encoding="utf-8"
         )
-        self.assertEqual(state_events.splitlines(), ["claim", "release"])
+        self.assertEqual(state_events.splitlines(), ["claim", "release"], output)
+        self.assertFalse((self.state_directory / "run.json").exists(), output)
+        self.assertEqual(self.events_for("ssh"), [])
+        self.assertFalse((self.stub_directory / "cleanup-called").exists())
+
+    def test_signal_during_fresh_claim_releases_without_ssh_when_check_would_time_out(self) -> None:
+        self.assert_fresh_claim_signal_releases_without_ssh("timeout")
+
+    def test_signal_during_fresh_claim_releases_without_ssh_when_check_would_fail(self) -> None:
+        self.assert_fresh_claim_signal_releases_without_ssh("ssh_error")
+
+    def test_signal_during_fresh_claim_releases_without_ssh_when_check_would_omit_status(self) -> None:
+        self.assert_fresh_claim_signal_releases_without_ssh("missing_status")
+
+    def assert_takeover_signal_checks_reply_host(self, outcome: str) -> None:
+        self.set_leftover_answer(outcome)
+        output = self.interrupt_held_claim(takeover=True)
+        ssh = self.events_for("ssh")
+        self.assertEqual(len(ssh), 1, output)
+        self.assertEqual(ssh[0]["args"][-2], "reply-mac", output)
+        self.assertTrue((self.stub_directory / "cleanup-called").exists())
+        state_events = (self.stub_directory / "state-events").read_text().splitlines()
+        if outcome == "clean":
+            self.assertEqual(state_events, ["claim", "release"])
+            self.assertFalse((self.state_directory / "run.json").exists())
+            self.assertEqual(output, "")
+        else:
+            self.assertEqual(state_events, ["claim"])
+            self.assert_claim_is_kept("previous-mac")
+            self.assert_leftover_diagnostic(output, outcome)
+
+    def test_signal_during_takeover_checks_reply_host_and_keeps_claim_when_check_fails(self) -> None:
+        self.assert_takeover_signal_checks_reply_host("ssh_error")
+
+    def test_signal_during_takeover_checks_reply_host_and_keeps_claim_when_leftovers_remain(self) -> None:
+        self.assert_takeover_signal_checks_reply_host("remaining")
+
+    def test_signal_during_takeover_checks_reply_host_and_releases_claim_when_check_is_clean(self) -> None:
+        self.assert_takeover_signal_checks_reply_host("clean")
+
+    def test_signal_during_fresh_claim_from_process_group_preserves_reply_and_releases_without_ssh(self) -> None:
+        self.set_leftover_answer("ssh_error")
+        output = self.interrupt_held_claim(signal_group=True, signal_number=signal.SIGINT)
+        self.assertEqual((self.stub_directory / "state-events").read_text().splitlines(),
+                         ["claim", "release"], output)
         self.assertFalse((self.state_directory / "run.json").exists())
+        self.assertEqual(self.events_for("ssh"), [])
+        self.assertFalse((self.stub_directory / "cleanup-called").exists())
+
+    def test_signal_during_second_fresh_claim_releases_without_another_leftover_check(self) -> None:
+        output = self.interrupt_held_claim(after_takeover=True)
+        self.assertEqual((self.stub_directory / "state-events").read_text().splitlines(),
+                         ["claim", "release", "claim", "release"], output)
+        self.assertFalse((self.state_directory / "run.json").exists())
+        ssh = self.events_for("ssh")
+        self.assertEqual(len(ssh), 1)
+        self.assertEqual(ssh[0]["args"][-2], "previous-mac")
+
+    def test_signal_during_takeover_with_no_reply_host_keeps_claim_without_ssh(self) -> None:
+        output = self.interrupt_held_claim(takeover=True, reply_host="")
+        self.assertEqual((self.stub_directory / "state-events").read_text().splitlines(), ["claim"])
+        self.assert_claim_is_kept("previous-mac")
+        self.assert_leftover_diagnostic(output, "missing_status")
+        self.assertIn("the kept claim's host could not be read", output)
+        self.assertEqual(self.events_for("ssh"), [])
+        self.assertFalse((self.stub_directory / "cleanup-called").exists())
 
     def test_copy_failure_releases_claim(self) -> None:
         self.fixture["rsync_status"] = 23
@@ -1121,12 +1444,216 @@ class OffloadCommandTests(unittest.TestCase):
         cleanup_events = [
             event
             for event in self.events_for("ssh")
-            if "pkill -f" in event["args"][-1]
+            if "pgrep -f" in event["args"][-1]
         ]
         self.assertEqual(len(cleanup_events), 1, self.events())
         cleanup = cleanup_events[0]
         self.assertTrue(cleanup["claimed"], cleanup)
-        self.assertIn(".local/state/mac-test/mirror/hana", cleanup["args"][-1])
+        self.assert_leftover_selectors(cleanup["args"][-1])
+
+    def test_lost_run_keeps_claim_when_leftover_check_does_not_prove_completion(self) -> None:
+        self.fixture["run_status_reported"] = False
+        for outcome in ("remaining", "missing_status", "timeout", "ssh_error"):
+            with self.subTest(outcome=outcome):
+                self.reset_leftover_case()
+                self.set_leftover_answer(outcome)
+                result = self.command(separate_stderr=True, timeout=20)
+                self.assertEqual(result.returncode, 75, result.stdout + result.stderr)
+                self.assert_wire("lost", "")
+                self.assertIn("mac_test: the link to the Mac dropped; running on natedev instead\n", result.stdout)
+                self.assert_leftover_diagnostic(result.stderr, outcome)
+                self.assert_claim_is_kept()
+                self.assertEqual(len(self.leftover_events()), 1)
+                self.assert_leftover_selectors(self.leftover_events()[0]["args"][-1])
+                if outcome == "timeout":
+                    self.assertGreaterEqual(float(self.wire_result()["seconds"]), 10)
+
+    def test_signal_keeps_claim_when_leftover_check_does_not_prove_completion(self) -> None:
+        self.fixture["run_delay_s"] = 30
+        for outcome in ("remaining", "missing_status", "timeout", "ssh_error"):
+            with self.subTest(outcome=outcome):
+                self.reset_leftover_case()
+                self.set_leftover_answer(outcome)
+                process = self.start_command("--workspace")
+                try:
+                    self.wait_for_path(self.stub_directory / "run-started")
+                    process.send_signal(signal.SIGTERM)
+                    output, _ = process.communicate(timeout=20)
+                finally:
+                    if process.poll() is None:
+                        process.kill()
+                        _ = process.communicate(timeout=5)
+                self.assertEqual(process.returncode, 128 + signal.SIGTERM, output)
+                self.assert_leftover_diagnostic(output, outcome)
+                self.assert_claim_is_kept()
+                self.assertEqual(len(self.leftover_events()), 1)
+
+    def test_signal_before_remote_command_starts_releases_without_leftover_check(self) -> None:
+        for stage in ("probe", "copy"):
+            with self.subTest(stage=stage):
+                self.reset_leftover_case()
+                (self.stub_directory / f"{stage}-started").unlink(missing_ok=True)
+                self.fixture["probe_delay_s"] = 30 if stage == "probe" else 0
+                self.fixture["hold_copy"] = stage == "copy"
+                self.sync_fixture()
+                process = self.start_command()
+                try:
+                    self.wait_for_path(self.stub_directory / f"{stage}-started")
+                    process.send_signal(signal.SIGTERM)
+                    output, _ = process.communicate(timeout=15)
+                finally:
+                    if process.poll() is None:
+                        process.kill()
+                        _ = process.communicate(timeout=5)
+                self.assertEqual(process.returncode, 128 + signal.SIGTERM, output)
+                self.assertFalse((self.state_directory / "run.json").exists())
+                self.assertEqual(self.leftover_events(), [])
+
+    def test_takeover_ends_leftovers_on_recorded_host_then_runs_on_settings_host(self) -> None:
+        _ = self.write_kept_claim()
+        alternate = self.root / "alternate-settings.conf"
+        values = {**self.config, "host": "next-mac", "connect_timeout_s": "2"}
+        _ = alternate.write_text("".join(f"{key}={value}\n" for key, value in values.items()))
+        result = self.command("--no-fail-fast", settings=alternate)
+        self.assertEqual(result.returncode, 0, result.stdout)
+        self.assert_wire("passed", "")
+        self.assertFalse((self.state_directory / "run.json").exists())
+        events = self.events()
+        self.assertEqual([event["command"] for event in events], ["ssh", "ssh", "rsync", "ssh"])
+        cleanup = events[0]
+        self.assertEqual(cleanup["args"][-2], "previous-mac")
+        self.assertIn("ConnectTimeout=2", cleanup["args"])
+        self.assert_leftover_selectors(cleanup["args"][-1])
+        self.assertTrue(cleanup["claimed"])
+        for event in self.events_for("ssh")[1:]:
+            self.assertEqual(event["args"][-2], "next-mac")
+        self.assert_claimed_commands()
+
+    def test_takeover_with_remaining_leftovers_declines_busy_and_preserves_job(self) -> None:
+        old = self.write_kept_claim()
+        self.set_leftover_answer("remaining")
+        result = self.command(separate_stderr=True)
+        self.assertEqual(result.returncode, 75, result.stdout + result.stderr)
+        self.assertEqual(result.stdout, "mac_test: not running on the Mac (busy)\n")
+        self.assert_wire("declined", "busy")
+        self.assert_leftover_diagnostic(result.stderr, "remaining")
+        self.assert_claim_is_kept("previous-mac")
+        self.assertEqual(self.remote_claim()["what"], old["what"])
+        self.assertEqual(self.remote_claim()["since"], old["since"])
+        self.assertEqual(self.remote_claim()["worktree"], old["worktree"])
+        self.assertEqual(len(self.events()), 1)
+        self.assertEqual(self.leftover_events()[0]["args"][-2], "previous-mac")
+
+    def test_second_takeover_declines_busy_without_releasing_the_new_kept_claim(self) -> None:
+        process = self.start_command(script=self.claim_stub_runner(), extra={"MAC_TEST_TAKEOVER_TWICE": "1"})
+        try:
+            output, _ = process.communicate(timeout=15)
+        finally:
+            if process.poll() is None:
+                process.kill()
+                _ = process.communicate(timeout=5)
+        self.assertEqual(process.returncode, 75, output)
+        self.assert_wire("declined", "busy")
+        self.assertTrue((self.state_directory / "run.json").exists())
+        self.assertEqual((self.stub_directory / "state-events").read_text().splitlines(), ["claim", "release", "claim"])
+        self.assertEqual(len(self.events()), 1)
+        self.assertEqual(self.leftover_events()[0]["args"][-2], "previous-mac")
+
+    def test_takeover_check_failure_declines_unreachable_keeps_claim_and_sets_backoff(self) -> None:
+        _ = self.write_kept_claim()
+        self.set_leftover_answer("ssh_error")
+        result = self.command(separate_stderr=True)
+        self.assertEqual(result.returncode, 75, result.stdout + result.stderr)
+        self.assertEqual(result.stdout, "mac_test: not running on the Mac (unreachable)\n")
+        self.assert_wire("declined", "unreachable")
+        self.assert_leftover_diagnostic(result.stderr, "ssh_error")
+        self.assert_claim_is_kept("previous-mac")
+        self.assertTrue((self.state_directory / "unreachable_until").exists())
+        self.assertEqual(len(self.events()), 1)
+        self.clear_events()
+        repeated = self.command()
+        self.assertEqual(repeated.returncode, 75, repeated.stdout)
+        self.assert_wire("declined", "backoff")
+        self.assertEqual(self.events(), [])
+        self.assert_claim_is_kept("previous-mac")
+
+    def test_takeover_under_block_ends_leftovers_before_declining_blocked(self) -> None:
+        _ = self.write_kept_claim()
+        now = datetime.now(timezone.utc)
+        block = {"version": 2, "holder": "alice", "for": "restore CI first",
+                 "since": now.isoformat(), "expires": (now + timedelta(hours=1)).isoformat(),
+                 "session": None, "showrunner": None, "state": "active", "ci": "not_configured",
+                 "free_message": {"kind": "not_needed"}}
+        path = self.state_directory / "block.json"
+        _ = path.write_text(json.dumps(block))
+        before = path.read_bytes()
+        result = self.command(separate_stderr=True)
+        self.assertEqual(result.returncode, 75, result.stdout + result.stderr)
+        self.assertEqual(result.stdout, "mac_test: not running on the Mac (blocked)\n")
+        self.assert_wire("declined", "blocked")
+        self.assertIn("blocked by alice: restore CI first", result.stderr)
+        self.assertFalse((self.state_directory / "run.json").exists())
+        self.assertEqual(path.read_bytes(), before)
+        self.assertEqual(len(self.events_for("ssh")), 1)
+        self.assertEqual(self.events_for("rsync"), [])
+        self.assertEqual(self.leftover_events()[0]["args"][-2], "previous-mac")
+
+    def test_repeated_takeover_decline_suppresses_leftover_diagnostic(self) -> None:
+        for outcome, previous_reason in (("remaining", "busy"), ("missing_status", "blocked")):
+            with self.subTest(outcome=outcome):
+                self.reset_leftover_case()
+                _ = self.write_kept_claim()
+                self.set_leftover_answer(outcome)
+                result = self.command(last_decline=previous_reason, separate_stderr=True)
+                self.assertEqual(result.returncode, 75, result.stdout + result.stderr)
+                reason = "busy" if outcome == "remaining" else "unreachable"
+                self.assert_wire("declined", reason)
+                if reason == previous_reason:
+                    self.assertEqual((result.stdout, result.stderr), ("", ""))
+                else:
+                    self.assert_leftover_diagnostic(result.stderr, outcome)
+                self.assert_claim_is_kept("previous-mac")
+
+    def test_leftover_selectors_complete_under_sh_and_zsh_before_releasing_claim(self) -> None:
+        selectors = self.stub_directory / "selectors"
+        selectors.mkdir()
+        for name in ("pgrep", "lsof", "sleep"):
+            self.write_executable(selectors / name, SELECTOR_STUB)
+        self.fixture["run_status_reported"] = False
+        for shell in ("sh", "zsh"):
+            for pgrep_status, lsof_status in ((1, 1), (1, 0), (2, 0)):
+                with self.subTest(shell=shell, pgrep_status=pgrep_status, lsof_status=lsof_status):
+                    self.reset_leftover_case()
+                    self.fixture["selector_shell"] = shell
+                    self.fixture["selector_pgrep_status"] = pgrep_status
+                    self.fixture["selector_lsof_status"] = lsof_status
+                    self.sync_fixture()
+                    result = self.command(separate_stderr=True)
+                    self.assertEqual(result.returncode, 75, result.stdout + result.stderr)
+                    self.assert_wire("lost", "")
+                    cleanup = self.leftover_events()
+                    self.assertEqual(len(cleanup), 1)
+                    self.assert_leftover_selectors(cleanup[0]["args"][-1])
+                    path = self.stub_directory / "selector-events.jsonl"
+                    calls = [cast(SelectorEvent, json.loads(line)) for line in path.read_text().splitlines()]
+                    names = [call["command"] for call in calls]
+                    self.assertIn("pgrep", names)
+                    if pgrep_status == 1:
+                        self.assertIn("lsof", names)
+                    for call in calls:
+                        if call["command"] == "pgrep":
+                            self.assertEqual(call["args"], ["-f", "[.]local/state/mac-test/mirror/"])
+                        if call["command"] == "lsof":
+                            self.assertEqual(call["args"], ["-a", "-u", str(os.getuid()), "-d", "cwd", "-Fpn"])
+                    answer = (self.stub_directory / "selector-answer").read_text()
+                    if pgrep_status == 1 and lsof_status == 0:
+                        self.assertIn("sleep", names)
+                        self.assertEqual(answer.splitlines(), ["leftovers=0", "rc=0"])
+                        self.assertFalse((self.state_directory / "run.json").exists())
+                    else:
+                        self.assertNotIn("rc=0", answer.splitlines())
+                        self.assert_claim_is_kept()
+                        self.assert_leftover_diagnostic(result.stderr, "missing_status")
 
     def test_run_signals_request_remote_cleanup_and_release_claim(self) -> None:
         self.fixture["run_delay_s"] = 30.0
@@ -1168,8 +1695,7 @@ class OffloadCommandTests(unittest.TestCase):
                     ],
                 )
                 cleanup = cleanup_arguments[-1]
-                self.assertIn("pkill -f", cleanup)
-                self.assertIn(".local/state/mac-test/mirror/hana", cleanup)
+                self.assert_leftover_selectors(cleanup)
                 self.assert_claimed_commands()
 
     def test_second_signal_during_cleanup_keeps_first_status_and_releases(self) -> None:

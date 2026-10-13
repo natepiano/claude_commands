@@ -25,11 +25,21 @@ import sys
 import time
 from collections.abc import Generator
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import TYPE_CHECKING, Literal, NamedTuple, TypedDict, cast
+from typing import TYPE_CHECKING, Literal, NamedTuple, NotRequired, TypedDict, cast
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "notify"))
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "whoami"))
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "production"))
+from showrunners import load_settings, registered_showrunners
+if TYPE_CHECKING:
+    from ..whoami.agent_accounts import (KnownCodexAccount, UnknownCodexAccount, StoredCodexAccount,
+                                        codex_account, seats_home)
+else:
+    from scripts.whoami.agent_accounts import (KnownCodexAccount, UnknownCodexAccount, StoredCodexAccount,
+                                codex_account, seats_home)
 from user_action import (FIX, ActionRefused, ActionRequired, ActionUnstated, NoActionRequired, UserAction,
                          parse_user_action)
 
@@ -73,6 +83,32 @@ class LegacyHeld:
 
 
 @dataclass(frozen=True)
+class UnownedHold:
+    """A hold for another tool, or a record predating Codex account ownership."""
+
+
+HoldOwner = UnownedHold | KnownCodexAccount
+UNOWNED_HOLD = UnownedHold()
+
+
+class HeldRelay(TypedDict):
+    recipient: str
+    key: str
+
+
+class StoredHeldMessage(TypedDict):
+    summary: str
+    text: str
+    need: Need
+    held_at: float
+    minutes: int
+    outcome: Outcome
+    action: _StoredUserAction
+    codex_owner: NotRequired[StoredCodexAccount]
+    relays: NotRequired[list[HeldRelay]]
+
+
+@dataclass(frozen=True)
 class HeldMessage:
     summary: str
     text: str
@@ -81,6 +117,8 @@ class HeldMessage:
     minutes: int
     outcome: Outcome
     action: UserAction
+    owner: HoldOwner = field(default_factory=UnownedHold)
+    relays: tuple[HeldRelay, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -164,6 +202,9 @@ def read(path: Path) -> ReadHeld:
     action = _read_user_action(record["action"])
     if isinstance(action, UnreadableHeld):
         return action
+    owner = _read_owner(record.get("codex_owner"))
+    if isinstance(owner, UnreadableHeld):
+        return owner
     return HeldMessage(
         summary=legacy.summary,
         text=legacy.text,
@@ -172,13 +213,39 @@ def read(path: Path) -> ReadHeld:
         minutes=legacy.minutes,
         outcome=legacy.outcome,
         action=action,
+        owner=owner,
+        relays=_read_relays(record.get("relays")),
     )
+
+
+def _read_relays(value: object) -> tuple[HeldRelay, ...]:
+    if not isinstance(value, list):
+        return ()
+    relays: list[HeldRelay] = []
+    for item in cast(list[object], value):
+        if isinstance(item, dict):
+            fields = cast(dict[str, object], item)
+            recipient, key = fields.get("recipient"), fields.get("key")
+            if isinstance(recipient, str) and isinstance(key, str):
+                relays.append(HeldRelay(recipient=recipient, key=key))
+    return tuple(relays)
+
+
+def _read_owner(value: object) -> HoldOwner | UnreadableHeld:
+    if value is None:
+        return UnownedHold()
+    if isinstance(value, dict):
+        fields = cast(dict[str, object], value)
+        home, login, label = fields.get("home"), fields.get("login"), fields.get("label")
+        if isinstance(home, str) and isinstance(login, str) and isinstance(label, str):
+            return KnownCodexAccount(Path(home), login, label)
+    return UnreadableHeld()
 
 
 def write(path: Path, held: HeldMessage) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     scratch = path.with_suffix(".tmp")
-    record = {
+    record: StoredHeldMessage = {
         "summary": held.summary,
         "text": held.text,
         "need": held.need,
@@ -187,6 +254,11 @@ def write(path: Path, held: HeldMessage) -> None:
         "outcome": held.outcome,
         "action": _stored_action(held.action),
     }
+    if held.relays:
+        record["relays"] = list(held.relays)
+    if isinstance(held.owner, KnownCodexAccount):
+        record["codex_owner"] = StoredCodexAccount(home=str(held.owner.home),
+            login=held.owner.login, label=held.owner.label)
     _ = scratch.write_text(json.dumps(record), encoding="utf-8")
     _ = scratch.replace(path)
 
@@ -217,7 +289,8 @@ def _stored_action(action: UserAction) -> _StoredUserAction:
 
 
 def hold(key: str, summary: str, text: str, action: UserAction, minutes: int = 15,
-         need: Need = "decision") -> bool:
+         need: Need = "decision", *, owner: HoldOwner = UNOWNED_HOLD,
+         relays: tuple[HeldRelay, ...] = ()) -> bool:
     """Start KEY's wait; false when KEY is already held."""
     if isinstance(action, NoActionRequired) and need != "note":
         raise ValueError(f"need {need} requires an action")
@@ -227,7 +300,7 @@ def hold(key: str, summary: str, text: str, action: UserAction, minutes: int = 1
         if isinstance(existing, (HeldMessage, UnreadableHeld)):
             return False
         schedule()
-        write(path, HeldMessage(summary, text, need, time.time(), minutes, "waiting", action))
+        write(path, HeldMessage(summary, text, need, time.time(), minutes, "waiting", action, owner, relays))
     return True
 
 
@@ -239,6 +312,33 @@ def close(key: str) -> bool:
         except FileNotFoundError:
             return False
     return True
+
+
+def _cancel_outgoing_codex_holds(home: Path, login: str) -> None:
+    for path in (STATE / "held").glob("*.json"):
+        held = read(path)
+        if path.stem == "five-hour-codex" or (isinstance(held, HeldMessage)
+                and isinstance(held.owner, KnownCodexAccount)
+                and (held.owner.home != home or held.owner.login.casefold() != login.casefold())):
+            relays = held.relays if isinstance(held, HeldMessage) else ()
+            if not relays:
+                try:
+                    names = [*load_settings()["always"], *(runner["session"] for runner in registered_showrunners())]
+                except (OSError, ValueError):
+                    names = []
+                label = held.owner.label if isinstance(held, HeldMessage) and isinstance(held.owner, KnownCodexAccount) else "Codex"
+                relays = tuple(HeldRelay(recipient=name, key=f"5-hour {label}") for name in dict.fromkeys(names))
+            for relay in relays:
+                _ = subprocess.run([sys.executable, str(SEND), "retire", "--to", relay["recipient"],
+                                    "--from", "quota_alert", "--key", relay["key"]],
+                                   capture_output=True, text=True, check=False)
+            path.unlink(missing_ok=True)
+
+
+def reconcile_codex_holds(home: Path, login: str) -> None:
+    """Cancel outgoing and legacy Codex holds after a known selection, without a recovery notice."""
+    with locked():
+        _cancel_outgoing_codex_holds(home, login)
 
 
 def deliver(held: HeldMessage) -> str:
@@ -254,14 +354,21 @@ def due(now: float) -> list[Settled]:
     """Settle each waiting message: answered when the user typed since it was held, sent once its time is up."""
     settled: list[Settled] = []
     with locked():
+        try:
+            identity = codex_account(seats_home())
+        except (OSError, ValueError):
+            identity = UnknownCodexAccount(Path.home() / ".codex", "seats identity cannot be read")
+        if isinstance(identity, KnownCodexAccount):
+            _cancel_outgoing_codex_holds(identity.home, identity.login)
         seen = typed_at()
         for path in sorted((STATE / "held").glob("*.json")):
             held = read(path)
             if not isinstance(held, HeldMessage) or held.outcome != "waiting":
                 continue
+            if (path.stem == "five-hour-codex" or isinstance(held.owner, KnownCodexAccount)) and isinstance(identity, UnknownCodexAccount):
+                continue
             if seen >= held.held_at:
-                held = HeldMessage(held.summary, held.text, held.need, held.held_at, held.minutes, "answered",
-                                   held.action)
+                held = replace(held, outcome="answered")
                 line = "the user typed in a terminal; not sent"
             elif now < held.held_at + held.minutes * 60:
                 continue
@@ -269,8 +376,7 @@ def due(now: float) -> list[Settled]:
                 settled.append(Settled(f"{path.stem}: NOT sent: {problem}", True))
                 continue
             else:
-                held = HeldMessage(held.summary, held.text, held.need, held.held_at, held.minutes, "sent",
-                                   held.action)
+                held = replace(held, outcome="sent")
                 line = "sent to the user"
             write(path, held)
             settled.append(Settled(f"{path.stem}: {line}", False))

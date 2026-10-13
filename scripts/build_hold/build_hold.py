@@ -23,6 +23,8 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "message"))
 from sessions import addressed, live_sessions  # noqa: E402
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import override_guard
 
 
 BUILD_COMMANDS = frozenset({"cargo", "rustc", "cargo-nextest"})
@@ -488,6 +490,41 @@ def prune_calls(entry: ReleaseEntry) -> None:
         store_release_state(entry, AwaitingRelease() if entry["calls"] or entry["session_pending"] else NoPendingTurn())
 
 
+def open_turn(entry: ReleaseEntry, generation: int) -> bool:
+    return (not entry["session_id"].startswith("verify:") and not entry["active_call_id"]
+            and entry["delivery"]["generation"] == generation
+            and isinstance(read_release_state(entry), (ReleasedAwaitingAdmission, DeliveryQueued)))
+
+
+def turn_answer(cycle: HoldCycle, key: str, call_id: str) -> AwaitingTurn | AdmittedTurn:
+    generation = cycle.get("holder_generation", 1)
+    waiting = AwaitingTurn(cycle["id"], generation)
+    admitted = AdmittedTurn(cycle["id"], generation)
+    late = admitted if cycle["release_started_at"] else waiting
+    for entry in cycle["entries"]:
+        if entry["session_id"] != key:
+            continue
+        state = read_release_state(entry)
+        if call_id:
+            call = next((call for call in entry["calls"] if call["call_id"] == call_id), None)
+            if call is None or not call_is_live(call):
+                return waiting if open_turn(entry, generation) else late
+            if call["admitted_generation"] == generation:
+                return admitted
+            if entry["active_call_id"] != call_id:
+                return waiting
+            allowed = (DeliveryQueued, ReleasedAwaitingAdmission, WaitingForMemory, RecipientGone, DeliveryFailed)
+            return admitted if isinstance(state, allowed) else waiting
+        if entry["session_admitted_generation"] == generation:
+            return admitted
+        if entry["active_call_id"]:
+            return waiting
+        if isinstance(state, (DeliveryQueued, ReleasedAwaitingAdmission, WaitingForMemory)):
+            return admitted
+        return waiting if entry["session_pending"] else late
+    return late
+
+
 def read_admission(key: str, call_id: str = "") -> Admission:
     try:
         cycle = read_cycle()
@@ -497,28 +534,7 @@ def read_admission(key: str, call_id: str = "") -> Admission:
         signature = cycle.get("holder_signature", "")
         if signature and signature != holders_signature():
             return AwaitingTurn(cycle["id"], generation + 1)
-        waiting = AwaitingTurn(cycle["id"], generation)
-        for entry in cycle["entries"]:
-            if entry["session_id"] != key:
-                continue
-            state = read_release_state(entry)
-            if call_id:
-                call = next((call for call in entry["calls"] if call["call_id"] == call_id), None)
-                if call is None or not call_is_live(call):
-                    return waiting
-                if call["admitted_generation"] == generation:
-                    return AdmittedTurn(cycle["id"], generation)
-                if entry["active_call_id"] != call_id:
-                    return waiting
-                allowed = (DeliveryQueued, ReleasedAwaitingAdmission, WaitingForMemory, RecipientGone, DeliveryFailed)
-            else:
-                if entry["session_admitted_generation"] == generation:
-                    return AdmittedTurn(cycle["id"], generation)
-                if entry["active_call_id"]:
-                    return waiting
-                allowed = (DeliveryQueued, ReleasedAwaitingAdmission, WaitingForMemory)
-            return AdmittedTurn(cycle["id"], generation) if isinstance(state, allowed) else waiting
-        return waiting
+        return turn_answer(cycle, key, call_id)
     except ReleaseRecordReadError as error:
         return AdmissionReadError(f"release record could not be read: {error}")
     except (OSError, UnicodeError) as error:
@@ -629,6 +645,18 @@ def has_holder_file(directory: Path) -> bool:
         return False
 
 
+def live_holds(cycle: HoldCycle, directory: Path) -> tuple[Holder, ...]:
+    holders = read_holders(directory)
+    if isinstance(holders, NoHolders):
+        return ()
+    return tuple(holder for holder in holders.holders if not any(
+        holder_path(directory, key).name == holder.key
+        and aware_instant(instants["since"]) == holder.since
+        and instants["released_at"]
+        for key, instants in cycle["holders"].items()
+    ))
+
+
 def release_eta_text(release: ReleaseEta) -> str:
     if isinstance(release, UnknownReleaseEta):
         return "unknown"
@@ -637,6 +665,11 @@ def release_eta_text(release: ReleaseEta) -> str:
 
 def holder_text(holder: Holder) -> str:
     return f"{holder.name} (for {holder.purpose}, release eta {release_eta_text(holder.release)})"
+
+
+def resume_refusal(holders: tuple[Holder, ...]) -> str:
+    return ("a hold is in force (" + "; ".join(holder_text(holder) for holder in holders)
+            + "); --resume only continues a release already begun. Release that hold without --resume.")
 
 
 def release_request(release_time: str | None, zone_name: str | None) -> ReleaseRequest:
@@ -670,7 +703,10 @@ def write_hold(directory: Path, name: str, purpose: str, request: ReleaseRequest
         release_eta = release.isoformat()
     directory.mkdir(parents=True, exist_ok=True)
     record = {"holder": label or name, "since": now.isoformat(), "for": purpose.strip(), "release_eta": release_eta}
-    _ = holder_path(directory, name).write_text(json.dumps(record, ensure_ascii=False) + "\n")
+    path = holder_path(directory, name)
+    temporary = directory.parent / f"{directory.name}.{path.name}.tmp"
+    _ = temporary.write_text(json.dumps(record, ensure_ascii=False) + "\n")
+    os.replace(temporary, path)
     return f"/build_hold from {label or name}: stop any cargo or verify.sh you are running and start none until I release. No release after 2 h: ask me. For: {purpose.strip()}"
 
 
@@ -734,6 +770,7 @@ def read_cycle() -> HoldCycle | None:
             fields = cast(dict[str, object], instants)
             if not isinstance(fields.get("since"), str) or not isinstance(fields.get("released_at"), str):
                 raise ValueError(f"invalid holder {name}: expected since and released_at strings")
+            _ = aware_instant(cast(str, fields["since"]))
         recipients = cycle.get("recipients")
         if not isinstance(recipients, dict):
             raise ValueError("invalid recipients: expected object")
@@ -840,7 +877,9 @@ def save_cycle(cycle: HoldCycle) -> None:
 def open_cycle(now: datetime) -> HoldCycle:
     cycle: HoldCycle = {"id": uuid.uuid4().hex, "opened_at": now.isoformat(), "holders": {}, "recipients": {}, "entries": [], "release_started_at": "", "holder_generation": 1, "holder_signature": ""}
     save_cycle(cycle)
-    _ = (release_directory() / "current").write_text(cycle["id"] + "\n")
+    temporary = release_directory() / "current.tmp"
+    _ = temporary.write_text(cycle["id"] + "\n")
+    os.replace(temporary, release_directory() / "current")
     return cycle
 
 
@@ -870,6 +909,8 @@ def record_recipients(recipients: Sequence[tuple[str, str]]) -> None:
         cycle = read_cycle_for_change()
         if isinstance(cycle, (NoCycle, DamagedRecordSetAside)):
             return
+        if cycle["release_started_at"]:
+            return
         for name, session_id in recipients:
             if session_id:
                 cycle["recipients"][session_id] = name
@@ -894,6 +935,14 @@ def register_wait(session_id: str, name: str = "", *, call_id: str = "", pid: in
         update_holder_generation(cycle)
         generation = cycle.get("holder_generation", 1)
         existing = next((entry for entry in cycle["entries"] if entry["session_id"] == session_id), None)
+        if (cycle["release_started_at"]
+            and not (call_id and existing is not None
+                     and not any(call["call_id"] == call_id for call in existing["calls"])
+                     and open_turn(existing, generation))):
+            answer = turn_answer(cycle, session_id, call_id)
+            save_cycle(cycle)
+            action = "builds now" if isinstance(answer, AdmittedTurn) else "keeps its queued turn"
+            return f"release under way; {session_id} {action}"
         if existing is None:
             existing = new_entry(session_id, name or cycle["recipients"].get(session_id, session_id))
             existing["session_pending"] = not bool(call_id)
@@ -909,9 +958,7 @@ def register_wait(session_id: str, name: str = "", *, call_id: str = "", pid: in
                 pending_call: PendingCall = {"call_id": call_id, "pid": process, "proc_start": identity,
                                              "started": started, "admitted_generation": 0}
                 existing["calls"].append(pending_call)
-                if (not session_id.startswith("verify:") and not existing["active_call_id"]
-                    and existing["delivery"]["generation"] == generation
-                    and isinstance(read_release_state(existing), (ReleasedAwaitingAdmission, DeliveryQueued))):
+                if open_turn(existing, generation):
                     existing["active_call_id"] = call_id
                     existing["session_admitted_generation"] = generation
                     existing["session_pending"] = False
@@ -987,7 +1034,9 @@ def mark_gate(session_id: str, state: str, outcome: str = "", *, call_id: str = 
             if entry["active_call_id"] != call_id:
                 continue
             previous = read_release_state(entry)
-            if not isinstance(previous, (ReleasedAwaitingAdmission, DeliveryQueued, WaitingForMemory, RecipientGone, DeliveryFailed)):
+            allowed = ((ReleasedAwaitingAdmission, DeliveryQueued, WaitingForMemory, RecipientGone, DeliveryFailed)
+                       if call_id else (ReleasedAwaitingAdmission, DeliveryQueued, WaitingForMemory))
+            if not isinstance(previous, allowed):
                 continue
             instant = release_clock()
             if call_id:
@@ -1193,6 +1242,12 @@ def advance_release(cycle: HoldCycle, now: datetime, *, clock: Callable[[], date
             continue
         if isinstance(state, WaitingForMemory):
             if (now - state.wait_started_at).total_seconds() < int(os.environ.get("BUILDLOG_MEM_WAIT_LIMIT_S", "900")) + RELEASE_SETTLE_S:
+                if not entry["active_call_id"] and isinstance(socket_for(entry["session_id"]), RecipientGone):
+                    entry["session_pending"] = False
+                    store_release_state(entry, RecipientGone())
+                    save_cycle(cycle)
+                    queue_told_sessions(cycle, now)
+                    continue
                 return False, entry_text(entry)
             entry["active_call_id"] = ""
             entry["session_pending"] = False
@@ -1303,27 +1358,70 @@ def advance_release(cycle: HoldCycle, now: datetime, *, clock: Callable[[], date
     return True, "; ".join(entry_text(entry) for entry in entries) or "NoRegistration timeout; no recipients registered"
 
 
-def release_cycle(directory: Path, name: str) -> str:
+@dataclass(frozen=True)
+class FirstRelease:
+    pass
+
+
+@dataclass(frozen=True)
+class ResumedRelease:
+    pass
+
+
+FIRST_RELEASE = FirstRelease()
+
+
+def release_cycle(directory: Path, name: str, start: FirstRelease | ResumedRelease = FIRST_RELEASE) -> str:
+    release_since: FirstRelease | datetime = FIRST_RELEASE
     while True:
         with release_lock():
+            path = holder_path(directory, name)
+            if not isinstance(release_since, FirstRelease):
+                if not path.is_file():
+                    remaining = read_holders(directory)
+                    if isinstance(remaining, ActiveHolders):
+                        return ("release ended: another release command finished it; still held by "
+                                + "; ".join(holder_text(other) for other in remaining.holders))
+                    return "release ended: another release command finished it; builds may resume."
+                holder = read_holder(path)
+                if holder.since != release_since:
+                    return (f"release stopped: {holder.name} placed a new hold at {holder.since.astimezone():%H:%M %Z}; "
+                            + "that hold's release serves the sessions still waiting.")
+            if not path.is_file() and isinstance(start, FirstRelease):
+                raise ValueError(f"{name} held nothing")
             cycle = read_cycle_for_change()
+            if (isinstance(release_since, FirstRelease) and isinstance(start, ResumedRelease)
+                and not isinstance(cycle, (NoCycle, DamagedRecordSetAside))):
+                holds = live_holds(cycle, directory)
+                if holds:
+                    raise ValueError(resume_refusal(holds))
+            if not path.is_file():
+                raise ValueError(f"{name} held nothing")
+            holder = read_holder(path)
             if isinstance(cycle, (NoCycle, DamagedRecordSetAside)):
                 result = release_hold(directory, name)
                 if result == "released, builds may resume.":
                     return result + " No hold cycle: broadcast this release to every session."
                 return result
-            path = holder_path(directory, name)
-            if not path.is_file():
-                raise ValueError(f"{name} held nothing")
             now = datetime.now().astimezone()
             update_holder_generation(cycle)
             holders = read_holders(directory)
-            if cycle["holders"].get(name, {}).get("released_at", "") == "":
-                cycle["holders"].setdefault(name, {"since": now.isoformat(), "released_at": ""})["released_at"] = now.isoformat()
-                save_cycle(cycle)
+            if isinstance(start, FirstRelease):
+                if (name not in cycle["holders"]
+                    or aware_instant(cycle["holders"][name]["since"]) != holder.since):
+                    cycle["holders"][name] = {"since": holder.since.isoformat(), "released_at": ""}
+                if not cycle["holders"][name]["released_at"]:
+                    for key, instants in cycle["holders"].items():
+                        if (holder_path(directory, key).name == holder.key
+                            and aware_instant(instants["since"]) == holder.since
+                            and not instants["released_at"]):
+                            instants["released_at"] = now.isoformat()
+                    save_cycle(cycle)
+            if isinstance(release_since, FirstRelease):
+                release_since = holder.since
             if isinstance(holders, ActiveHolders) and len(holders.holders) > 1:
                 path.unlink()
-                return "released; still held by " + "; ".join(holder_text(holder) for holder in holders.holders if holder.key != name)
+                return "released; still held by " + "; ".join(holder_text(other) for other in holders.holders if other.key != holder.key)
             if not cycle["release_started_at"]:
                 cycle["release_started_at"] = now.isoformat()
                 save_cycle(cycle)
@@ -1390,6 +1488,7 @@ def wait_for_quiet(
 
 
 def main(arguments: list[str]) -> int:
+    override_guard.refuse_overrides(Path(__file__), "build_hold/build_hold.py")
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="action", required=True)
     hold = commands.add_parser("hold")
@@ -1436,7 +1535,13 @@ def main(arguments: list[str]) -> int:
                 with release_lock():
                     cycle = read_cycle_for_change()
                     if not isinstance(cycle, (NoCycle, DamagedRecordSetAside)):
-                        name = next((holder for holder, instants in cycle["holders"].items() if instants["released_at"] and holder_path(holder_directory(), holder).is_file()), None)
+                        name = next((key for key, instants in cycle["holders"].items()
+                                     if instants["released_at"] and holder_path(holder_directory(), key).is_file()
+                                     and aware_instant(instants["since"]) == read_holder(holder_path(holder_directory(), key)).since), None)
+                        if name is None:
+                            holds = live_holds(cycle, holder_directory())
+                            if holds:
+                                raise ValueError(resume_refusal(holds))
                     elif isinstance(cycle, DamagedRecordSetAside):
                         state = read_holders(holder_directory())
                         if isinstance(state, ActiveHolders) and len(state.holders) == 1:
@@ -1445,7 +1550,7 @@ def main(arguments: list[str]) -> int:
                 raise ValueError("release needs --holder, or --resume for an active release")
             if name is None:
                 name = held_key(holder_directory(), given)
-            print(release_cycle(holder_directory(), name))
+            print(release_cycle(holder_directory(), name, ResumedRelease() if resume_requested else FirstRelease()))
         elif action == "wait":
             print(register_wait(os.environ.get("CLAUDE_CODE_SESSION_ID", "")))
         elif action == "nothing-to-build":

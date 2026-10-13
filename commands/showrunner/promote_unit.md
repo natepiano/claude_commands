@@ -4,6 +4,8 @@ description: Make a named running session a unit director under this showrunner 
 
 **Usage:** `/showrunner:promote_unit <session name> [unit plan]`. Run it in a showrunner session during `/showrunner:produce`, with that command's state (`PRODUCTION_DOC`, `CHECKOUT`, `MERGE_BRANCH`, `LOG`, `ZONE`, `PROMPT_FILE`).
 
+The other direction, a unit becoming the showrunner of its own production under this one, is `/showrunner:promote_showrunner`.
+
 1. **Find it.** Its `ListAgents` name matches `name` in one `~/.claude/sessions/<pid>.json`, which gives `pid`, `sessionId`, `cwd` and `tmux`. Read its pane or its transcript's tail for what it is doing. For `<unit name>`, replace each run of characters outside letters, digits, `-` and `_` in the ListAgents name with one `-`, then drop leading and trailing `-`.
 2. **Check fit.** Stop and say why when:
    - its work is in a repository other than the production's;

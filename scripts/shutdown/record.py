@@ -8,6 +8,7 @@ import json
 import os
 import re
 import stat
+import sys
 import tempfile
 import time
 from collections.abc import Callable, Generator
@@ -16,10 +17,12 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Literal, NotRequired, TypedDict, cast
-from zoneinfo import ZoneInfo
 
 from inventory import Session, parse_session
 from launch_permission import launch_barrier, shutdown_state_root
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
+from user_zone import user_zone  # noqa: E402
 
 CLAIM_STALE_SECONDS = 120
 CONDUCTOR_LOCK_RETRY_DELAYS = (0.05,) * 5
@@ -1328,7 +1331,7 @@ def migrate(login: str) -> list[str]:
         for (source, saved), target in zip(sources, targets):
             os.replace(source, target)
             when = datetime.fromisoformat(saved["requested_at"]).astimezone(
-                ZoneInfo("America/Los_Angeles")
+                user_zone()
             ).strftime("%Y-%m-%d %H:%M %Z")
             lines.append(f"shutdown: converted the {saved['state']} record of {saved['label']} from {when}")
         return lines
