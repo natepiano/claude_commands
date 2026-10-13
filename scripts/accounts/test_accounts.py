@@ -2133,19 +2133,20 @@ class AccountsTests(unittest.TestCase):
         self.assertEqual(rows[1][2:], ("unit@example.invalid", "spare", *("unavailable",) * 4, "—", "—", "—"))
         self.assertEqual(self.live_reads.call_count, 2)
 
-    def test_status_times_use_this_machines_zone_when_no_production_runs_or_none_can_be_read(self) -> None:
+    def test_status_times_use_the_users_zone_setting_when_no_production_runs_or_none_can_be_read(self) -> None:
         self.write_main_config()
         self.login_directory("claude 2", "main@example.invalid", default=True)
         resets = datetime.now(timezone.utc) + timedelta(days=3)
         usage_store.save([self.reading(
             "main@example.invalid", agent_accounts.Quota("5-hour", 50.0, resets), agent_accounts.Quota("Weekly", 50.0, resets),
         )], datetime.now(timezone.utc))
-        local = resets.astimezone().strftime("%a %m-%d %H:%M %Z")
+        setting = resets.astimezone(ZoneInfo("Europe/Paris")).strftime("%a %m-%d %H:%M %Z")
 
-        with patch.object(showrunners, "registered_showrunners", return_value=[]):
-            self.assertEqual(self.status_rows()[0][7], local)
-        with patch.object(showrunners, "registered_showrunners", side_effect=OSError("session records unreadable")):
-            self.assertEqual(self.status_rows()[0][7], local)
+        with patch.dict(os.environ, {"USER_ZONE": "Europe/Paris"}):
+            with patch.object(showrunners, "registered_showrunners", return_value=[]):
+                self.assertEqual(self.status_rows()[0][7], setting)
+            with patch.object(showrunners, "registered_showrunners", side_effect=OSError("session records unreadable")):
+                self.assertEqual(self.status_rows()[0][7], setting)
         self.assertEqual(
             self.status_rows()[0][7],
             resets.astimezone(ZoneInfo("America/Los_Angeles")).strftime("%a %m-%d %H:%M %Z"),

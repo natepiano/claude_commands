@@ -291,6 +291,7 @@ class ReviewLauncherPassTests(unittest.TestCase):
         # The wrapper reaches python3 through ../lib/py, resolved from its own
         # directory.
         _ = shutil.copy2(DELEGATE_DIR.parent / "lib" / "py", lib / "py")
+        _ = shutil.copy2(DELEGATE_DIR.parent / "lib" / "user_zone.py", lib / "user_zone.py")
         for name in (
             "review.sh", "implement.sh", "progress_history.py", "findings.py",
             "board.sh", "seat_name.sh",
