@@ -21,4 +21,4 @@ Every message says what the user does with `--action`, or says nothing is needed
 
 - One alert per block. If it is still blocked an hour after the user acknowledged, send `decision` saying what changed, never the same text.
 - Never for progress, finished work, or anything a session can decide or retry itself. Sessions with their own alert policy (`/showrunner:produce`) follow it.
-- `FAILED` (exit 3): fall back to PushNotification, beginning its message with the same `Action: <what the user does>` or `No action needed.` line.
+- `FAILED` (exit 3): fall back to PushNotification with the `fallback text:` that `send.py` printed.

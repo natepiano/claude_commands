@@ -1086,8 +1086,8 @@ def floor_out_of_reach_text(now: float, removed: int, free: int, floor: int,
     held = f"{held_count} target dirs a build holds ({gib(held_bytes)}), which the sweep takes once their builds end; " if held_count else ""
     for path_limit in (256, 128, 96, 72, 56, 40, 24, 16):
         message = "\n".join([
-            f"Disk floor sweep at {pacific_time(now)} removed {gib(removed)} and has no build cache left that it may remove; free space is {gib(free)}, under the {gib(floor)} floor.",
-            f"To get back over the floor, free {gib(floor - free)} outside build caches.",
+            f"Build cache cleanup removed {gib(removed)}, but natedev still has only {gib(free)} free. Builds need {gib(floor)} free. No build cache is left to remove.",
+            f"Free {gib(floor - free)} outside build caches in a terminal on natedev.",
             f"Not swept: {held}CI's targets ({gib(ci_bytes)}).",
             *([f"Could not remove {failures} {'path' if failures == 1 else 'paths'} this sweep; the next sweep tries again."] if failures else []),
             *disk_measurement_lines(measurement, 0, 0, now, False, path_limit),
@@ -1105,9 +1105,10 @@ def send_floor_alert(message: str, channels: FloorAlertChannels) -> bool:
     if channels is FloorAlertChannels.NATEDEV_AND_PHONE:
         commands.append(("phone", [
             sys.executable, str(scripts / "message/send.py"),
-            "--to", "user", "--need", "note",
-            "--action", "Free disk space outside build caches on natedev.",
-            "--summary", "natedev: disk under its floor", "--text", message,
+            "--to", "user", "--from", "sweep", "--need", "note",
+            "--action", (message.splitlines()[1] if len(message.splitlines()) > 1 else
+                         "In a terminal on natedev, free disk space outside build caches.") + " Builds need this space to run.",
+            "--summary", "Builds need more disk space", "--text", (message.splitlines() or [""])[0],
         ]))
     delivered = False
     for channel, command in commands:

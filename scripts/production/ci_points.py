@@ -213,6 +213,28 @@ def ci_collect(production: Production, state_dir: Path, no_ci: bool) -> None:
     print(f"--ci-green {tip}")
 
 
+def review_watch_push(table: str) -> tuple[str, str, str]:
+    title = "Reviewer removal lacks comparison data"
+    result = "The report has no comparable defect counts."
+    recommendation = "Acknowledge (recommended after reading): stop this report reminder."
+    for line in table.splitlines():
+        cells = [cell.strip() for cell in line.strip("|").split("|")]
+        if len(cells) == 4 and cells[0] == "merge design-check defects per phase (mean)":
+            title = "Reviewer removal: merge defects compared"
+            result = f"Defects found at merge per phase: {cells[2]} before removal, {cells[3]} after."
+            if cells[2] == cells[3] and cells[2] != "—":
+                title = "Reviewer removal left defects unchanged"
+                result = f"Defects found at merge stayed at {cells[3]} per phase before and after."
+                recommendation = "Acknowledge (recommended, since defects did not rise): stop the reminder."
+            break
+    body = ("An extra code reviewer was removed. " + result + " Work continues either way.\n\n"
+            + "Read the report:\n"
+            + "python3 ~/.claude/scripts/production/review_regime.py report\n"
+            + recommendation + " Run it with ack in place of report.\n\n"
+            + "Discuss: raise concerns in the natedev Claude session.")
+    return title, "In a natedev terminal, read the report, then acknowledge it or discuss concerns in the natedev Claude session.", body
+
+
 def review_watch(production: Production, state_dir: Path) -> WatchFirstAlert | WatchRepeat | WatchBelowThreshold:
     review_script = Path(os.environ.get("CI_POINTS_REVIEW_REGIME", os.environ.get(
         "DAILIES_REVIEW_REGIME", str(Path(__file__).with_name("review_regime.py")))))
@@ -230,11 +252,11 @@ def review_watch(production: Production, state_dir: Path) -> WatchFirstAlert | W
         if record.exists():
             return WatchRepeat(line)
         table = required(command("watch", sys.executable, str(review_script), "report", "--since", "2026-09-28"), "watch")
-        notice = f"{line}; the table is in this session"
+        title, action, notice = review_watch_push(table)
         send = Path.home() / ".claude/scripts/message/send.py"
-        _ = required(command("watch", sys.executable, str(send), "--to", "user", "--need", "decision",
-                             "--action", "Acknowledge the review watch in this session.",
-                             "--summary", "Hana: review watch", "--text", notice), "watch")
+        _ = required(command("watch", sys.executable, str(send), "--to", "user", "--from", "ci_points", "--need", "decision",
+                             "--action", action,
+                             "--summary", title, "--text", notice), "watch")
         moment = datetime.now(production.zone).strftime("%H:%M %Z")
         production.log.parent.mkdir(parents=True, exist_ok=True)
         with production.log.open("a", encoding="utf-8") as log:

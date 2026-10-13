@@ -444,9 +444,9 @@ class FloorTests(SweepCase):
         self.assertEqual(send.call_count, 1)
         self.assertEqual(send.call_args.args[1], sweep.FloorAlertChannels.NATEDEV_AND_PHONE)
         message = cast(str, send.call_args.args[0])
-        self.assertIn("has no build cache left that it may remove", message)
-        self.assertIn("free space is 9.0 GiB, under the 10.0 GiB floor", message)
-        self.assertIn("free 1.0 GiB outside build caches", message)
+        self.assertIn("No build cache is left to remove", message)
+        self.assertIn("natedev still has only 9.0 GiB free. Builds need 10.0 GiB free", message)
+        self.assertIn("Free 1.0 GiB outside build caches", message)
         self.assertIn(f"Not swept: 1 target dirs a build holds ({sweep.gib(held_bytes)})", message)
         self.assertIn(f"CI's targets ({sweep.gib(ci_bytes)})", message)
         self.assertNotIn("Could not remove", message)
@@ -602,9 +602,9 @@ raise SystemExit(int(os.environ[variable]))
         errors = io.StringIO()
         expected_commands = [
             [sys.executable, str(sender), "--to", "natedev", "--from", "disk_floor", "--timeout", "30"],
-            [sys.executable, str(sender), "--to", "user", "--need", "note", "--action",
-             "Free disk space outside build caches on natedev.", "--summary",
-             "natedev: disk under its floor", "--text", "disk notice"],
+            [sys.executable, str(sender), "--to", "user", "--from", "sweep", "--need", "note", "--action",
+             "In a terminal on natedev, free disk space outside build caches. Builds need this space to run.", "--summary",
+             "Builds need more disk space", "--text", "disk notice"],
         ]
         real_run = subprocess.run
         with (mock.patch.object(sweep, "__file__", str(fake_module)),
@@ -627,6 +627,23 @@ raise SystemExit(int(os.environ[variable]))
               mock.patch.dict(os.environ, {"SWEEP_NATEDEV_EXIT": "3", "SWEEP_USER_EXIT": "3"}),
               redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO())):
             self.assertFalse(sweep.send_floor_alert("disk notice", sweep.FloorAlertChannels.NATEDEV_AND_PHONE))
+
+    def test_phone_disk_alert_keeps_action_and_build_shortfall_without_directory_dump(self) -> None:
+        """F011: the disk action states how much to free and the body explains why."""
+        text = sweep.floor_out_of_reach_text(2000, 2 * GIB, 9 * GIB, 10 * GIB,
+            0, 0, 0, sweep.UnavailableDiskMeasurement("missing"), 0)
+        with (mock.patch.object(subprocess, "run", return_value=subprocess.CompletedProcess([], 0, "", "")) as run,
+              redirect_stdout(io.StringIO())):
+            self.assertTrue(sweep.send_floor_alert(text, sweep.FloorAlertChannels.NATEDEV_AND_PHONE))
+        self.assertEqual(run.call_args_list[0].kwargs["input"], text)
+        command = cast(list[str], run.call_args_list[1].args[0])
+        body = command[command.index("--text") + 1]
+        action = command[command.index("--action") + 1]
+        self.assertIn("Builds need 10.0 GiB", body)
+        self.assertIn("Free 1.0 GiB", action)
+        self.assertIn("terminal on natedev", action)
+        self.assertNotIn("measurement unavailable", body)
+        self.assertLess(len("Action: " + action + "\n" + body), 500)
 
     def test_failed_phone_send_reports_the_cause_printed_on_stdout(self) -> None:
         fake_module = Path(self.enterContext(tempfile.TemporaryDirectory())) / "scripts/lint/sweep.py"
