@@ -38,7 +38,7 @@
 | feature-log-unit-unit | `docs/as-built/feature-log.md` (run done) | /home/natepiano/worktrees/claude-build-followups-feature-log-unit | build-followups-feature-log-unit | 15798 (Phase 8 app checks only) | scripts/feature_log/; commands/validate_and_push.md (<FeatureLogCloseOut/> only); commands/showrunner/produce.md (<ChangeReviewFeatureLog/> and <CloseChangeReview/> only); commands/feature_log.md; commands/release.md (the changelog compare and release stamp steps only); pyrightconfig.json (its feature_log entry only); `docs/as-built/feature-log.md` |
 | two-accounts-unit | docs/plans/build-followups-two-accounts.md | /home/natepiano/worktrees/claude-build-followups-two-accounts | build-followups-two-accounts | — | docs/plans/build-followups-two-accounts.md |
 | review-pool-unit | docs/plans/build-followups-review-pool.md | /home/natepiano/worktrees/claude-build-followups-review-pool | build-followups-review-pool | — | scripts/delegate/review_pool.py, commands/review/ |
-| bevy-upgrade-unit | docs/plans/build-followups-bevy-upgrade.md | /home/natepiano/worktrees/claude-build-followups-bevy-upgrade | build-followups-bevy-upgrade | — | scripts/bevy_upgrade/, commands/showrunner/bevy_upgrade.md |
+| bevy-upgrade-unit | docs/as-built/bevy-upgrade.md | /home/natepiano/worktrees/claude-build-followups-bevy-upgrade | build-followups-bevy-upgrade | — | scripts/bevy_upgrade/, commands/showrunner/bevy_upgrade.md |
 
 ## Hub files
 
