@@ -589,12 +589,10 @@ message.
    When the production doc has a **Review pool** line, send `review-unit`
    one line per merged code checkpoint:
    `review merge: unit <unit>; phase <phase>; session dir <path>; design check: <verdict>`.
-   Find the unit's newest run in the local history root (`PLAN_DELEGATE_HISTORY_DIR`
-   or `~/.local/state/plan-delegate`), else the Mac's over ssh at
-   `collect.MAC_HOST` from `scripts/usage/collect.py`: read `runs/<run id>.jsonl`
-   whose `run_started` event's `working_dir` matches the unit's Worktree cell,
-   choose the greatest `run_started_at`, and use `<run id>` as the session
-   dir's name in the merge line. Take the verdict from step 3;
+   Run `~/.claude/scripts/lib/py ~/.claude/scripts/production/unit_run.py
+   --production PRODUCTION_DOC <unit>`: its first field is the session
+   directory's name for the merge line; on exit 1, send the merge line with
+   `session dir unavailable` and tell `review-unit` why. Take the verdict from step 3;
    use `not applicable` when nothing users see changed. Append the same line
    to `LOG`. A shrink sends no memory line.
 </MergeCheckpoint>

@@ -61,7 +61,7 @@ The four items of `docs/plans/build-followups-review-pool-next.md`, each placed 
 
 **Ruled out:** reading a second machine's verdict pairs in `render_shadow` — reopen when a unit on the Mac runs design checks.
 
-### Phase 2 — One command gives the showrunner a unit's review history location  · status: todo
+### Phase 2 — One command gives the showrunner a unit's review history location  · status: done
 
 #### Work Order
 
