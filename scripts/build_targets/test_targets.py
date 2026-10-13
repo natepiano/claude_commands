@@ -304,9 +304,16 @@ class TargetStateTests(IsolatedTargetTest):
         args.what = "nextest hana"
         args.worktree = str(self.root)
         output = io.StringIO()
-        with mock.patch.object(mac_test, "process_start_time", return_value="test-run-start"):
+        with mock.patch.object(mac_test, "process_start_time", return_value="test-run-start"), \
+             mock.patch.object(mac_test, "start_claim_watcher") as watcher:
             with redirect_stdout(output):
                 code = mac_test.command_claim(args, mac_test.StatePaths(self.mac_state))
+        if code == 0:
+            watcher.assert_called_once()
+            paths = cast(mac_test.StatePaths, watcher.call_args.args[0])
+            self.assertEqual(paths.directory, self.mac_state)
+        else:
+            watcher.assert_not_called()
         return code, output.getvalue()
 
     def test_retained_expired_block_is_held_and_refuses_claim(self) -> None:
