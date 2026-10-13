@@ -299,6 +299,7 @@ run() {
 SWEEP_EVERY_S=300
 
 sweep_after_step() {
+    [[ "${LINT_SKIP_SWEEP:-}" == 1 ]] && return 0
     local arg now last=0 dir stamp
     for arg in "$@"; do
         [[ "$arg" == */sweep.py ]] && return 0

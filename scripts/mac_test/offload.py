@@ -374,10 +374,41 @@ IDLE_PROCESS = IdleProcess()
 
 
 @dataclass(frozen=True)
+class CleanupDone:
+    """The remote mirror's build output was removed."""
+
+
+@dataclass(frozen=True)
+class CleanupFailed:
+    """The remote delete returned a nonzero status."""
+
+    rc: int
+
+
+@dataclass(frozen=True)
+class CleanupSkipped:
+    """The run selected another target directory."""
+
+
+@dataclass(frozen=True)
+class CleanupKept:
+    """The mirror's build output was kept after the free-space check."""
+
+
+@dataclass(frozen=True)
+class CleanupUnconfirmed:
+    """The remote command did not report a usable cleanup status."""
+
+
+CleanupOutcome = CleanupDone | CleanupFailed | CleanupSkipped | CleanupKept | CleanupUnconfirmed
+
+
+@dataclass(frozen=True)
 class ReportedMacStatus:
     """The test status printed by the remote command."""
 
     status: int
+    cleanup: CleanupOutcome = CleanupUnconfirmed()
 
 
 class MissingMacStatus:
@@ -547,29 +578,67 @@ class ProcessController:
             return MISSING_MAC_STATUS
         output = cast(TextIO, raw_output)
         self.active = RunningProcess(process)
+        status: RemoteRunStatus = MISSING_MAC_STATUS
+        cleanup: CleanupOutcome = CleanupUnconfirmed()
         held_status_line = ""
         try:
             for line in output:
+                marker = line.rstrip("\r\n")
+                status_match = re.fullmatch(r"mac_exit=([0-9]+)", marker)
+                if status_match is not None:
+                    if held_status_line:
+                        print(held_status_line, end="", flush=True)
+                    status_digits = status_match.group(1).lstrip("0") or "0"
+                    mac_status = int(status_digits) if len(status_digits) <= 3 else 256
+                    status = ReportedMacStatus(mac_status) if mac_status <= 255 else MISSING_MAC_STATUS
+                    if isinstance(status, ReportedMacStatus):
+                        held_status_line = line
+                    else:
+                        held_status_line = ""
+                        print(line, end="", flush=True)
+                    cleanup = CleanupUnconfirmed()
+                    continue
+                if marker.startswith("mac_cleanup="):
+                    cleanup = parse_cleanup(marker.removeprefix("mac_cleanup="))
+                    continue
                 if held_status_line:
                     print(held_status_line, end="", flush=True)
                     held_status_line = ""
-                if re.fullmatch(r"mac_exit=([0-9]+)", line.rstrip("\r\n")):
-                    held_status_line = line
-                else:
-                    print(line, end="", flush=True)
+                status = MISSING_MAC_STATUS
+                cleanup = CleanupUnconfirmed()
+                print(line, end="", flush=True)
             _ = process.wait()
         finally:
             self.active = IDLE_PROCESS
             output.close()
-        status_match = re.fullmatch(
-            r"mac_exit=([0-9]+)", held_status_line.rstrip("\r\n")
-        )
-        if status_match is None:
-            return MISSING_MAC_STATUS
-        mac_status = int(status_match.group(1))
-        if mac_status > 255:
-            return MISSING_MAC_STATUS
-        return ReportedMacStatus(mac_status)
+        if isinstance(status, ReportedMacStatus):
+            return ReportedMacStatus(status.status, cleanup)
+        return MISSING_MAC_STATUS
+
+
+def parse_cleanup(value: str) -> CleanupOutcome:
+    if value == "skipped":
+        return CleanupSkipped()
+    if value == "kept":
+        return CleanupKept()
+    if not re.fullmatch(r"[0-9]+", value):
+        return CleanupUnconfirmed()
+    digits = value.lstrip("0") or "0"
+    if len(digits) > 3:
+        return CleanupUnconfirmed()
+    rc = int(digits)
+    if rc > 255:
+        return CleanupUnconfirmed()
+    return CleanupDone() if rc == 0 else CleanupFailed(rc)
+
+
+def report_cleanup(cleanup: CleanupOutcome) -> None:
+    if isinstance(cleanup, CleanupFailed):
+        print(f"Mac build output not removed: {cleanup.rc}", flush=True)
+    elif isinstance(cleanup, CleanupSkipped):
+        print("Mac build output kept: the run used another target dir", flush=True)
+    elif isinstance(cleanup, CleanupUnconfirmed):
+        print("Mac build output cleanup unconfirmed", flush=True)
 
 
 def config_path() -> Path:
@@ -975,6 +1044,20 @@ def remote_test_command(
         f"BUILDLOG_SENT_TREE_KEY={shlex.quote(sent_tree_key.value)} "
         if isinstance(sent_tree_key, KnownTreeKey) else ""
     )
+    if any(word == "--target-dir" or word.startswith("--target-dir=") for word in words):
+        cleanup_command = "echo mac_cleanup=skipped"
+    else:
+        target = shlex.quote(f"{remote_mirror(repository)}/target")
+        floor = shlex.quote(f"{config.free_floor_gib:g}")
+        cleanup_command = (
+            'if free_gib=$(df -g "$HOME"); then '
+            + "free_gib=$(printf '%s\\n' \"$free_gib\" | awk 'NR == 2 {print $4}'); "
+            + 'else free_gib=; fi; '
+            + f'if awk -v free="$free_gib" -v floor={floor} '
+            + "'BEGIN { exit !(free ~ /^[0-9]+([.][0-9]+)?$/ && (free + 0) < (floor + 0)) }'; then "
+            + f'if rm -rf -- "$HOME"/{target}; then echo mac_cleanup=0; '
+            + "else echo mac_cleanup=$?; fi; else echo mac_cleanup=kept; fi"
+        )
     return (
         f"cd {shlex.quote(remote_mirror(repository))} && "
         'PATH="$HOME/.cargo/bin:$PATH" '
@@ -982,9 +1065,10 @@ def remote_test_command(
         f"BUILDLOG_CALL_ID={shlex.quote(request.call_id)} "
         f"{sent_tree}"
         "BUILDLOG_SYNC=1 "
+        "LINT_SKIP_SWEEP=1 "
         f"LINT_SWEEP_BUDGET_GIB={shlex.quote(budget)} "
         f"MACOSX_DEPLOYMENT_TARGET={MACOSX_DEPLOYMENT_TARGET} "
-        f"~/.claude/scripts/lint/lint {invocation}; echo mac_exit=$?"
+        f"~/.claude/scripts/lint/lint {invocation}; echo mac_exit=$?; {cleanup_command}"
     )
 
 
@@ -1138,7 +1222,13 @@ def claimed_run(
             release_allowed = isinstance(checked, LeftoversEnded)
             report_leftover_check(checked, request)
             return LostMacRun(elapsed_seconds(started))
-        release_allowed = True
+        report_cleanup(remote_status.cleanup)
+        if isinstance(remote_status.cleanup, CleanupUnconfirmed):
+            checked = check_leftovers(config, config.host)
+            release_allowed = isinstance(checked, LeftoversEnded)
+            report_leftover_check(checked, request)
+        else:
+            release_allowed = True
         if remote_status.status == 0:
             return PassedOnMac(seconds)
         if remote_status.status == 4:
