@@ -15,10 +15,11 @@ from contextlib import redirect_stdout
 from datetime import datetime, timedelta, timezone, tzinfo
 from pathlib import Path
 from typing import Self, cast, override
-from unittest.mock import patch
+from unittest.mock import call, patch
 
 import agent_notes
 import note_file
+import account
 import agent_accounts
 import codex_pacer
 import five_hour
@@ -79,9 +80,15 @@ class AgentNotesTests(unittest.TestCase):
         return directory
 
     def select_unit(self, label: str) -> None:
-        config = accounts.accounts_config_file()
-        config.parent.mkdir(parents=True, exist_ok=True)
-        _ = config.write_text(json.dumps(accounts.AccountsConfiguration(unit=label)))
+        """Represent a live local session on this account for the activity snapshot."""
+        from scripts.message import sessions
+        identity = accounts.account_identity(accounts.account_dir(label))
+        assert isinstance(identity, agent_accounts.KnownClaudeAccount)
+        _ = self.enterContext(patch.object(sessions, "live_sessions", return_value=[sessions.SessionRecord(
+            pid=43210, sessionId="activity-fixture", name="live unit", messagingSocketPath="/fixture.sock",
+            updatedAt=1, tmux="", formerNames=[])]))
+        _ = self.enterContext(patch.object(account, "account_of",
+            return_value=account.Account("claude", identity.login, identity.label)))
 
     def select_seats(self, label: str) -> None:
         self.assertEqual(accounts.main(["set-role", "seats", label]), 0)
@@ -102,7 +109,7 @@ class AgentNotesTests(unittest.TestCase):
         reports = [Report("Codex", email="seats@example.com", source=CodexHomeSource(default)),
                    Report("Codex", email="spare@example.com", source=CodexHomeSource(spare))]
 
-        async def collect(selection: agent_accounts.ClaudeAccountSelection, seats_home: Path) -> list[Report]:
+        async def collect(selection: agent_accounts.ClaudeAccountsInUse, seats_home: Path) -> list[Report]:
             del selection
             self.assertEqual(seats_home, default)
             self.select_seats("codex 2")
@@ -246,8 +253,8 @@ class AgentNotesTests(unittest.TestCase):
         seats_report = Report("Codex", problem="Account unavailable", source=CodexHomeSource(selected))
         spare_report = Report("Codex", email="spare@example.com", source=CodexHomeSource(default),
             quotas=[Quota("Weekly", 95, self.future)], credit_balance="23")
-        selection = agent_accounts.ClaudeAccountSelection(
-            agent_accounts.UnreadableClaudeAccount(), agent_accounts.UnreadableClaudeAccount(), False, (),
+        selection = agent_accounts.ClaudeAccountsInUse(
+            agent_accounts.UnreadableClaudeAccount(), False, (), frozenset(),
         )
 
         with (
@@ -379,7 +386,7 @@ class AgentNotesTests(unittest.TestCase):
             quotas=[Quota("Weekly", 100, self.future)]),
             Report("Codex", email="next@example.com", source=CodexHomeSource(next_home),
                 quotas=[Quota("Weekly", 10, self.future)])]
-        async def read(_selection: agent_accounts.ClaudeAccountSelection, seats_home: Path) -> list[Report]:
+        async def read(_selection: agent_accounts.ClaudeAccountsInUse, seats_home: Path) -> list[Report]:
             self.assertEqual(seats_home, selected)
             self.select_seats("codex 3")
             return reports
@@ -474,35 +481,110 @@ class AgentNotesTests(unittest.TestCase):
         )
         self.assertNotIn("@", by_label)
 
-    def test_role_swap_during_update_keeps_one_unit_login_active(self) -> None:
-        """Every note uses the same role selection for the entire update."""
+    def test_update_keeps_its_live_login_snapshot_when_sessions_change_mid_read(self) -> None:
         _ = self.account_dir("default", "main@example.com", "main-token")
         _ = self.account_dir("claude 1", "old-unit@example.com", "old-token")
         _ = self.account_dir("claude 3", "new-unit@example.com", "new-token")
         self.select_unit("claude 1")
-        for label, login in (("claude 1", "old-unit@example.com"),
-                             ("claude 2", "main@example.com"),
+        for label, login in (("claude 1", "old-unit@example.com"), ("claude 2", "main@example.com"),
                              ("claude 3", "new-unit@example.com")):
             _ = self.note(f"{label}.md", login)
-        resolve = accounts.role_account
+        resolve = accounts.claude_account_selection
 
-        def swap_after_selection(role: str) -> accounts.AccountSelection:
-            selected = resolve(role)
+        def changed_after_snapshot() -> agent_accounts.ClaudeAccountsInUse:
+            selection = resolve()
             self.select_unit("claude 3")
-            return selected
+            return selection
 
         reports = [Report("Claude", email=login, quotas=[Quota("Weekly", 20, self.future)])
                    for login in ("old-unit@example.com", "main@example.com", "new-unit@example.com")]
-        with (
-            patch.object(accounts, "role_account", side_effect=swap_after_selection) as selection,
-            patch.object(agent_notes, "live_reports", return_value=reports),
-            patch.object(five_hour, "watch", return_value=[]),
-        ):
+        with (patch.object(accounts, "claude_account_selection", side_effect=changed_after_snapshot) as snapshot,
+              patch.object(agent_notes, "live_reports", return_value=reports),
+              patch.object(five_hour, "watch", return_value=[])):
             _ = agent_notes.update()
-        selection.assert_called_once_with("unit")
+        snapshot.assert_called_once_with()
         self.assertEqual({note.path.stem: note.get("state") for note in note_file.read_notes()}, {
-            "claude 1": "active", "claude 2": "active", "claude 3": "inactive",
-        })
+            "claude 1": "active", "claude 2": "active", "claude 3": "inactive"})
+
+    def test_sessions_on_multiple_logins_all_stay_visible_in_notes_and_whoami(self) -> None:
+        from scripts.message import sessions
+        _ = self.account_dir("default", "main@example.com", "main-token")
+        _ = self.account_dir("claude 1", "first@example.com", "first-token")
+        _ = self.account_dir("claude 3", "third@example.com", "third-token")
+        for label, login in (("claude 1", "first@example.com"), ("claude 2", "main@example.com"),
+                             ("claude 3", "third@example.com")):
+            _ = self.note(f"{label}.md", login)
+        owners = [sessions.SessionRecord(pid=pid, sessionId=str(pid), name=str(pid),
+                  messagingSocketPath="/fixture.sock", updatedAt=1, tmux="", formerNames=[])
+                  for pid in (10001, 10003, 10009)]
+        identities = {10001: account.Account("claude", "FIRST@example.com", "claude 1"),
+                      10003: account.Account("claude", "third@example.com", "claude 3")}
+        reports = [Report("Claude", email=login, quotas=[Quota("Weekly", 20, self.future)])
+                   for login in ("main@example.com", "first@example.com", "third@example.com")]
+        def observed_account(pid: int) -> account.Account | None:
+            return identities.get(pid)
+        with (patch.object(sessions, "live_sessions", return_value=owners),
+              patch.object(account, "account_of", side_effect=observed_account),
+              patch.object(agent_notes, "live_reports", return_value=reports),
+              patch.object(five_hour, "watch", return_value=[])):
+            selection = accounts.claude_account_selection()
+            _ = agent_notes.update_for_selection(selection, agent_accounts.seats_home())
+            output = io.StringIO()
+            with patch.object(whoami, "live_reports", return_value=reports), redirect_stdout(output):
+                asyncio.run(whoami.main())
+        self.assertEqual({note.path.stem: note.get("state") for note in note_file.read_notes()}, {
+            "claude 1": "active", "claude 2": "active", "claude 3": "active"})
+        for label in ("claude 1", "claude 2", "claude 3"):
+            self.assertIn(label, output.getvalue())
+
+    def test_live_unfit_and_external_accounts_are_collected_once_and_remain_visible(self) -> None:
+        from scripts.message import sessions
+        default = self.account_dir("default", "main@example.com", "main-token")
+        unfit = self.account_dir("claude 3", "unfit@example.com", "unfit-token")
+        (unfit / "projects").unlink()
+        external = self.root / "external account"
+        external.mkdir()
+        _ = (external / ".claude.json").write_text(json.dumps({"oauthAccount": {"emailAddress": "external@example.com"}}))
+        for label, login in (("claude 2", "main@example.com"), ("claude 3", "unfit@example.com"),
+                             ("claude 4", "external@example.com")):
+            _ = self.note(label + ".md", login)
+        directories = {10001: unfit, 10002: external, 10003: external, 10004: default}
+        owners = [sessions.SessionRecord(pid=pid, sessionId=str(pid), name=str(pid),
+            messagingSocketPath="/fixture.sock", updatedAt=1, tmux="", formerNames=[]) for pid in directories]
+        logins = {default: "main@example.com", unfit: "unfit@example.com", external: "external@example.com"}
+        def process_directory(pid: int) -> Path | None:
+            return directories.get(pid)
+        def process_account(pid: int) -> account.Account | None:
+            directory = directories.get(pid)
+            return account.Account("claude", logins[directory], "fixture") if directory is not None else None
+        def live(directory: Path) -> Report:
+            return Report("Claude", email=logins[directory], quotas=[Quota("Weekly", 96, self.future)],
+                          source=agent_accounts.ClaudeDirectorySource(directory))
+        with (patch.object(sessions, "live_sessions", return_value=owners) as observed_sessions,
+              patch.object(account, "process_config_dir", side_effect=process_directory) as observed_directories,
+              patch.object(account, "account_of", side_effect=process_account)):
+            selection = accounts.claude_account_selection()
+        observed_sessions.assert_called_once_with()
+        self.assertEqual(observed_directories.call_args_list, [call(pid) for pid in directories])
+        self.assertCountEqual(selection.live_directories, logins)
+        self.assertEqual(selection.named_accounts, ())
+        self.assertTrue(selection.is_in_use("external@example.com"))
+        with (patch.object(agent_accounts, "claude_live", side_effect=live) as reads,
+              patch.object(agent_accounts, "codex_homes", return_value=[]),
+              patch.object(accounts, "claude_account_selection", return_value=selection),
+              patch.object(five_hour, "watch", return_value=[]),
+              patch.object(agent_notes, "alert", return_value=[])):
+            _ = agent_notes.update_for_selection(selection, self.root / ".codex")
+            self.assertCountEqual(reads.call_args_list, [call(directory) for directory in logins])
+            reads.reset_mock()
+            output = io.StringIO()
+            with redirect_stdout(output):
+                asyncio.run(whoami.main())
+            self.assertCountEqual(reads.call_args_list, [call(directory) for directory in logins])
+        self.assertEqual({note.path.stem: note.get("state") for note in note_file.read_notes()},
+                         {"claude 2": "active", "claude 3": "active", "claude 4": "active"})
+        for login in logins.values():
+            self.assertIn(login, output.getvalue())
 
     def test_five_hour_watch_uses_the_default_directory_independent_of_report_order(self) -> None:
         """Order, shared logins and missing emails cannot select the named reading."""
@@ -550,7 +632,8 @@ class AgentNotesTests(unittest.TestCase):
         notice_roles = cast(object, alert.call_args.kwargs["selection"])
         self.assertIs(notice_roles, selection)
 
-    def test_legacy_live_collection_keeps_the_original_call_and_note_states(self) -> None:
+    def test_default_account_collection_reads_its_directory_and_keeps_note_states(self) -> None:
+        _ = self.account_dir("default", "main@example.com", "main-token")
         active = self.note("claude 2.md", "main@example.com")
         spare = self.note("claude 3.md", "other@example.com")
         report = Report("Claude", email="main@example.com", quotas=[Quota("Weekly", 20, self.future)])
@@ -558,7 +641,7 @@ class AgentNotesTests(unittest.TestCase):
               patch.object(agent_accounts, "codex_live", return_value=Report("Codex")),
               patch.object(five_hour, "watch", return_value=[])):
             _ = agent_notes.update()
-        claude.assert_called_once_with()
+        claude.assert_called_once_with(self.root / ".claude")
         updated = {note.path.stem: note for note in note_file.read_notes()}
         self.assertEqual(updated[active.path.stem].get("state"), "active")
         self.assertEqual(updated[spare.path.stem].get("state"), "inactive")
@@ -627,40 +710,41 @@ class AgentNotesTests(unittest.TestCase):
             Report("Claude", email="spare@example.com"), Report("Codex", problem="fixture"),
         ]), redirect_stdout(output)):
             asyncio.run(whoami.main())
-        self.assertIn("Account: claude 2 (showrunners)", output.getvalue())
-        self.assertIn("Account: claude 3 (unit directors)", output.getvalue())
+        self.assertIn("Account: claude 2 (in use)", output.getvalue())
+        self.assertIn("Account: claude 3 (in use)", output.getvalue())
         self.assertNotIn("spare@example.com", output.getvalue())
 
-    def test_whoami_filter_and_labels_share_one_role_selection_during_a_swap(self) -> None:
-        """One display cannot switch unit accounts between filtering and rendering."""
+    def test_whoami_filters_inactive_accounts_even_when_only_default_is_configured(self) -> None:
+        _ = self.account_dir("default", "main@example.com", "main-token")
+        _ = self.note("claude 2.md", "main@example.com")
+        _ = self.note("claude 3.md", "inactive@example.com")
+        reports = [Report("Claude", email="main@example.com"), Report("Claude", email="inactive@example.com")]
+        output = io.StringIO()
+        with patch.object(whoami, "live_reports", return_value=reports), redirect_stdout(output):
+            asyncio.run(whoami.main())
+        self.assertIn("main@example.com", output.getvalue())
+        self.assertNotIn("inactive@example.com", output.getvalue())
+
+    def test_whoami_filters_and_renders_from_one_live_account_snapshot(self) -> None:
         _ = self.account_dir("default", "main@example.com", "main-token")
         _ = self.account_dir("claude 1", "old-unit@example.com", "old-token")
         _ = self.account_dir("claude 3", "new-unit@example.com", "new-token")
         self.select_unit("claude 1")
-        for label, login in (("claude 1", "old-unit@example.com"),
-                             ("claude 2", "main@example.com"),
-                             ("claude 3", "new-unit@example.com")):
+        for label, login in (("claude 1", "old-unit@example.com"), ("claude 2", "main@example.com"), ("claude 3", "new-unit@example.com")):
             _ = self.note(f"{label}.md", login)
-        resolve = accounts.role_account
-
-        def swap_after_selection(role: str) -> accounts.AccountSelection:
-            selected = resolve(role)
+        resolve = accounts.claude_account_selection
+        def changed_after_snapshot() -> agent_accounts.ClaudeAccountsInUse:
+            selected = resolve()
             self.select_unit("claude 3")
             return selected
-
-        reports = [Report("Claude", email=login) for login in (
-            "old-unit@example.com", "main@example.com", "new-unit@example.com",
-        )]
+        reports = [Report("Claude", email=login) for login in ("old-unit@example.com", "main@example.com", "new-unit@example.com")]
         output = io.StringIO()
-        with (
-            patch.object(accounts, "role_account", side_effect=swap_after_selection) as selection,
-            patch.object(whoami, "live_reports", return_value=reports),
-            redirect_stdout(output),
-        ):
+        with (patch.object(accounts, "claude_account_selection", side_effect=changed_after_snapshot) as snapshot,
+              patch.object(whoami, "live_reports", return_value=reports), redirect_stdout(output)):
             asyncio.run(whoami.main())
-        selection.assert_called_once_with("unit")
-        self.assertIn("Account: claude 1 (unit directors)", output.getvalue())
-        self.assertIn("Account: claude 2 (showrunners)", output.getvalue())
+        snapshot.assert_called_once_with()
+        self.assertIn("Account: claude 1 (in use)", output.getvalue())
+        self.assertIn("Account: claude 2 (in use)", output.getvalue())
         self.assertNotIn("new-unit@example.com", output.getvalue())
 
     def test_legacy_whoami_account_line_is_unchanged(self) -> None:

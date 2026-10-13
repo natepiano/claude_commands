@@ -338,6 +338,27 @@ class RestartTests(ShutdownTestCase):
         self.assertEqual(launch[launch.index("-t") + 1], "%move")
         self.assert_move_resume(launch[-1], owner)
 
+    def test_tmux_account_move_updates_retained_directory_for_named_and_default_targets(self) -> None:
+        for target, directory in (("claude 3", self.root / ".claude3"), ("default", self.root / ".claude")):
+            with self.subTest(target=target):
+                owner = showrunner("moved-showrunner", host=recorded_tmux_host("kept", "%move", 420))
+                owner["config_dir"] = str(self.root / ".claude1")
+                saved = entry(owner)
+                saved["target"] = target
+                commands = CommandRecorder()
+                with (patch.object(restart, "_run", commands),
+                      patch.object(restart, "_tmux_pane_state", return_value=restart.ReusableTmuxPane()),
+                      patch.object(restart, "_record_scheduled_restart_prompt"),
+                      patch.object(restart, "_retire"),
+                      patch.object(restart, "_live_session_ids", return_value=frozenset())):
+                    result = restart.launch_entry(saved, RESTARTED, self.desktop_state, dry_run=False)
+                self.assertIsInstance(result, restart.EntryLaunched)
+                options = [argv for argv in commands.calls if "@claude_config_dir" in argv]
+                self.assertEqual(len(options), 1, commands.calls)
+                self.assertEqual(options[0][-1], str(directory))
+                self.assertIn(options[0][options[0].index("-t") + 1], ("=kept", "%move", "$8"))
+                self.assertEqual(len([argv for argv in commands.calls if argv[:2] == ["tmux", "respawn-pane"]]), 1)
+
     def test_move_target_relaunches_unit_with_explicit_account(self) -> None:
         owner = unit("move-unit")
         commands, _ = self.moved_restart(owner)
@@ -1027,7 +1048,7 @@ class RestartTests(ShutdownTestCase):
                     self.assertEqual(argv, ["pgrep", "-P", "700"])
                     return subprocess.CompletedProcess(argv, 1, "", "")
                 with patch.dict(os.environ, {"SHUTDOWN_TMUX": "/test/tmux"}), patch.object(restart, "_probe", probe), patch.object(restart, "_run", commands):
-                    restart._tmux_launch("resume owner", owner, dry_run=False)  # pyright: ignore[reportPrivateUsage]
+                    _ = restart._tmux_launch("resume owner", owner, dry_run=False)  # pyright: ignore[reportPrivateUsage]
                 self.assertEqual(commands.calls, [["/test/tmux", "respawn-pane", "-k", "-t", "%8",
                     "-c", owner["cwd"], "zsh", "-ic", "resume owner"]])
                 self.assertEqual(sum(argv[1:2] == ["display"] for argv in probes), 1)
@@ -1068,7 +1089,7 @@ class RestartTests(ShutdownTestCase):
                     self.assertEqual(argv[:3], ["/test/tmux", "has-session", "-t"])
                     return subprocess.CompletedProcess(argv, 0 if argv[3] in available else 1, "", "")
                 with patch.dict(os.environ, {"SHUTDOWN_TMUX": "/test/tmux"}), patch.object(restart, "_probe", probe), patch.object(restart, "_run", commands):
-                    restart._tmux_launch("resume owner", owner, dry_run=False)  # pyright: ignore[reportPrivateUsage]
+                    _ = restart._tmux_launch("resume owner", owner, dry_run=False)  # pyright: ignore[reportPrivateUsage]
                 prefix = (["/test/tmux", "new-session", "-d", "-s", "old name"] if target == "new session"
                           else ["/test/tmux", "new-window", "-t", target])
                 self.assertEqual(commands.calls, [prefix + ["-c", owner["cwd"], "zsh", "-ic", "resume owner"]])
@@ -1099,7 +1120,7 @@ class RestartTests(ShutdownTestCase):
                         self.assertEqual(argv, ["/test/tmux", "has-session", "-t", "=old name"])
                         return subprocess.CompletedProcess(argv, 0 if name_exists else 1, "", "")
                     with patch.dict(os.environ, {"SHUTDOWN_TMUX": "/test/tmux"}), patch.object(restart, "_probe", probe), patch.object(restart, "_run", commands):
-                        restart._tmux_launch("resume owner", owner, dry_run=False)  # pyright: ignore[reportPrivateUsage]
+                        _ = restart._tmux_launch("resume owner", owner, dry_run=False)  # pyright: ignore[reportPrivateUsage]
                     prefix = (["/test/tmux", "new-window", "-t", "=old name:"] if name_exists
                               else ["/test/tmux", "new-session", "-d", "-s", "old name"])
                     self.assertEqual(commands.calls, [prefix + ["-c", owner["cwd"], "zsh", "-ic", "resume owner"]])
@@ -1129,7 +1150,7 @@ class RestartTests(ShutdownTestCase):
                         self.assertEqual(argv, ["/test/tmux", "has-session", "-t", "=old name"])
                         return subprocess.CompletedProcess(argv, 0 if name_exists else 1, "", "")
                     with patch.dict(os.environ, {"SHUTDOWN_TMUX": "/test/tmux"}), patch.object(restart, "_probe", probe), patch.object(restart, "_run", commands):
-                        restart._tmux_launch("resume owner", owner, dry_run=False)  # pyright: ignore[reportPrivateUsage]
+                        _ = restart._tmux_launch("resume owner", owner, dry_run=False)  # pyright: ignore[reportPrivateUsage]
                     prefix = (["/test/tmux", "new-window", "-t", "=old name:"] if name_exists
                               else ["/test/tmux", "new-session", "-d", "-s", "old name"])
                     self.assertEqual(commands.calls, [prefix + ["-c", owner["cwd"], "zsh", "-ic", "resume owner"]])
@@ -1164,7 +1185,7 @@ class RestartTests(ShutdownTestCase):
                         self.assertEqual(argv, ["/test/tmux", "has-session", "-t", "=old name"])
                         return subprocess.CompletedProcess(argv, 0 if name_exists else 1, "", "")
                     with patch.dict(os.environ, {"SHUTDOWN_TMUX": "/test/tmux"}), patch.object(restart, "_probe", probe), patch.object(restart, "_run", commands):
-                        restart._tmux_launch("resume legacy", parsed, dry_run=False)  # pyright: ignore[reportPrivateUsage]
+                        _ = restart._tmux_launch("resume legacy", parsed, dry_run=False)  # pyright: ignore[reportPrivateUsage]
                     prefix = (["/test/tmux", "new-window", "-t", "=old name:"] if name_exists
                               else ["/test/tmux", "new-session", "-d", "-s", "old name"])
                     self.assertEqual(commands.calls, [prefix + ["-c", parsed["cwd"], "zsh", "-ic", "resume legacy"]])
@@ -1188,7 +1209,7 @@ class RestartTests(ShutdownTestCase):
                     probes.append(argv)
                     return subprocess.CompletedProcess(argv, 0 if survives else 1, "", "")
                 with patch.dict(os.environ, {"SHUTDOWN_TMUX": "/test/tmux"}), patch.object(restart, "_probe", probe), patch.object(restart, "_run", commands):
-                    restart._tmux_launch("resume legacy", parsed["session"], dry_run=False)  # pyright: ignore[reportPrivateUsage]
+                    _ = restart._tmux_launch("resume legacy", parsed["session"], dry_run=False)  # pyright: ignore[reportPrivateUsage]
                 self.assertEqual(probes, [["/test/tmux", "has-session", "-t", "=old name"]])
                 prefix = (["/test/tmux", "new-window", "-t", "=old name:"] if survives
                           else ["/test/tmux", "new-session", "-d", "-s", "old name"])

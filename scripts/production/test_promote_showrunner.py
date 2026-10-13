@@ -7,11 +7,12 @@ import io
 import json
 import os
 import subprocess
+import shlex
 import tempfile
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
-from typing import final, override
+from typing import cast, final, override
 from unittest import mock
 
 import add_showrunner
@@ -95,9 +96,11 @@ class PromoteShowrunnerTests(unittest.TestCase):
         self.marked = {"demo-unit": unit_lookup.MarkedUnit(
             "demo-unit", PANE, "demo", unit_lookup.LiveClaude("demo", SESSION, "/sock", PID))}
         self.unit_account = accounts.DefaultAccount()
+        (self.root / ".claude").mkdir()
+        _ = (self.root / ".claude.json").write_text(json.dumps({"oauthAccount": {"emailAddress": "default@example.invalid"}}))
         self.runs_production, self.pane, self.child_refusal = True, unit_effort.Ready(), ""
         self.enterContext(mock.patch.dict(os.environ, {
-            "NOTIFIER_SESSIONS_DIR": str(sessions), "PLAN_DELEGATE_ACTIVE_DIR": str(self.root / "active")}))
+            "HOME": str(self.root), "NOTIFIER_SESSIONS_DIR": str(sessions), "PLAN_DELEGATE_ACTIVE_DIR": str(self.root / "active")}))
         for module, name, stand_in in (
                 (showrunners, "production_of", self.production_of), (unit_lookup, "marked_units", self.marked_units),
                 (promote_showrunner, "_tmux", self.tmux), (promote_showrunner, "_alive", self.is_alive),
@@ -121,14 +124,17 @@ class PromoteShowrunnerTests(unittest.TestCase):
     def tmux(self, *arguments: str) -> subprocess.CompletedProcess[str]:
         self.events.append(" ".join(("tmux", *arguments)))
         shown = "╭───╮\n│ > │\n╰───╯\n" if arguments[0] == "capture-pane" else ""
+        if arguments[0] == "show-options" and arguments[-1] == "@claude_config_dir":
+            shown = str(self.root / ".claude" if isinstance(self.unit_account, accounts.DefaultAccount) else self.unit_account.dir) + "\n"
         return subprocess.CompletedProcess(["tmux", *arguments], 0, shown, "")
 
     def is_alive(self, pid: int) -> bool:
         self.assertEqual(pid, PID)
         return self.alive.pop(0) if len(self.alive) > 1 else self.alive[0]
 
-    def child_checked(self, _child: Production, caller: str, ending: str = "", start_in: Path | None = None) -> str:
+    def child_checked(self, _child: Production, caller: str, ending: str = "", start_in: Path | None = None, *, config_dir: Path | None = None) -> str:
         self.events.append(f"check child for {caller}, ending {ending}, starting in {start_in}")
+        self.assertEqual(config_dir, self.root / ".claude" if isinstance(self.unit_account, accounts.DefaultAccount) else self.unit_account.dir)
         if self.child_refusal:
             raise Refusal(f"{self.child_refusal} (ending {ending})")
         return "tmux"
@@ -235,13 +241,54 @@ class PromoteShowrunnerTests(unittest.TestCase):
         subject = subprocess.run(["git", "-C", str(self.root / "parent"), "log", "-1", "--format=%s"],
                                  check=True, capture_output=True, text=True).stdout.strip()
         self.assertEqual(subject, "production(parent): retire demo-unit, promoted to showrunner of child")
-        self.assertIn("demo-unit is now the showrunner of child; same account, no move", out)
+        self.assertIn("demo-unit is now the showrunner of child", out)
 
-    def test_a_unit_on_its_own_account_moves_to_the_showrunner_account(self) -> None:
-        self.unit_account = accounts.NamedAccount("2", self.root / "account-2")
-        code, out, err = self.run_main()
+    def test_promotion_reads_the_units_account_before_destroying_tmux_and_passes_it_to_resume(self) -> None:
+        notes = self.root / "notes"
+        notes.mkdir()
+        _ = (notes / "claude 3.md").write_text("---\nlogin: unit@example.invalid\n---\n")
+        _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {"AGENT_NOTES_DIR": str(notes)})))
+        self.assertEqual(accounts.setup("claude 3"), [])
+        directory = accounts.account_dir("claude 3")
+        _ = (directory / ".claude.json").write_text(json.dumps({"oauthAccount": {"emailAddress": "unit@example.invalid"}}))
+        self.unit_account = accounts.NamedAccount("claude 3", directory)
+        code, _, err = self.run_main()
         self.assertEqual(code, 0, err)
-        self.assertIn("moved from 2 to the showrunner account", out)
+        read_at = next(index for index, event in enumerate(self.events)
+                       if "show-options" in event and "@claude_config_dir" in event)
+        kill_at = next(index for index, event in enumerate(self.events) if "kill-session" in event)
+        start_at = next(index for index, event in enumerate(self.events) if event.startswith("start"))
+        self.assertLess(read_at, kill_at)
+        self.assertLess(kill_at, start_at)
+        self.assertIn("--config-dir", self.events[start_at])
+        self.assertIn(str(directory), self.events[start_at])
+        self.assertNotIn("env unit", self.events[start_at])
+
+    def test_promotion_retains_external_account_directory_and_restore_uses_same_directory(self) -> None:
+        directory = self.root / "external account"
+        directory.mkdir()
+        self.unit_account = accounts.NamedAccount("external", directory)
+        self.started = 2
+        code, out, err = self.run_main()
+        self.assertEqual((code, err), (1, ""))
+        start = next(event for event in self.events if event.startswith("start"))
+        self.assertIn("--config-dir " + str(directory), start)
+        self.assertNotIn("--account", start)
+        self.assertIn("--config-dir " + shlex.quote(str(directory)), out)
+        self.assertFalse(plan_cell_is_retired(self.demo_row()["Plan"]))
+
+    def test_promotion_refuses_missing_retained_account_before_stopping_the_unit(self) -> None:
+        original = self.tmux
+        def missing(*arguments: str) -> subprocess.CompletedProcess[str]:
+            if arguments[0] == "show-options":
+                return subprocess.CompletedProcess(list(arguments), 1, "", "")
+            return original(*arguments)
+        with mock.patch.object(promote_showrunner, "_tmux", side_effect=missing):
+            code, _, err = self.run_main()
+        self.assertEqual(code, 2)
+        self.assertIn("--account", err)
+        self.assertEqual(len(err.splitlines()), 1)
+        self.assert_nothing_stopped()
 
     def test_a_unit_still_running_after_exit_is_not_restarted(self) -> None:
         self.alive = [True]
