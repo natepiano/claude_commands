@@ -43,6 +43,7 @@ import secrets
 import subprocess
 import sys
 import time
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import NamedTuple, TypedDict, cast
@@ -212,6 +213,22 @@ def tree_facts(start: str | None, end: str | None) -> dict[str, object]:
     return {"tree_key": start if start == end else None, "tree_changed": start != end}
 
 
+@dataclass(frozen=True)
+class SentTreeKey:
+    value: str
+
+
+@dataclass(frozen=True)
+class NoSentTreeKey:
+    pass
+
+
+def sent_tree_key() -> SentTreeKey | NoSentTreeKey:
+    if key := os.environ.get("BUILDLOG_SENT_TREE_KEY"):
+        return SentTreeKey(key)
+    return NoSentTreeKey()
+
+
 def keep_log(data: bytes, host: str, epoch: float, record_id: str) -> str:
     relative = f"{host}/{store.LOGS_DIR}/{store.month(epoch)}/{record_id}.log.gz"
     target = store.root() / relative
@@ -235,6 +252,10 @@ def step(args: list[str]) -> None:
         cwd = os.getcwd()
         directory = git_directory(argv, cwd)
         tree = tree_facts(os.environ.get("BUILDLOG_TREE_START"), treekey.tree_key(directory))
+        step_caller = caller(tty)
+        sent_key = sent_tree_key()
+        if step_caller == "verify-mac" and tree["tree_changed"] is None and isinstance(sent_key, SentTreeKey):
+            tree["tree_key"] = sent_key.value
         name = parse.step_name(argv)
         record_id = new_id(host, start)
         facts = parse.no_facts()
@@ -264,7 +285,7 @@ def step(args: list[str]) -> None:
             "cwd": cwd,
             **git_facts(directory),
             **tree,
-            "caller": caller(tty),
+            "caller": step_caller,
             **who(),
             "call_id": os.environ.get("BUILDLOG_CALL_ID") or None,
             "tty": tty,

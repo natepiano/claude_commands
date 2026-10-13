@@ -47,6 +47,7 @@ AMBIENT = (
     "CLAUDE_CODE_SESSION_ID",
     "MANIFEST_PATH",
     "BUILDLOG_TREE_START",
+    "BUILDLOG_SENT_TREE_KEY",
     "BUILDLOG_MEM_WAIT_S",
 )
 Record = dict[str, object]
@@ -532,6 +533,79 @@ class RecordTests(unittest.TestCase):
         self.assertEqual((unknown["tree_key"], unknown["tree_changed"]), (None, None))
         _ = (self.repo / "new.rs").write_text("\n")
         self.assertNotEqual(self.key(*NEXTEST), key)
+
+    def test_verify_mac_step_without_git_records_the_sent_tree_key_and_call_id(self) -> None:
+        mirror = self.base / "mirror"
+        mirror.mkdir()
+        sent_key = "a" * 64
+        result = self.record(
+            "step", "1", str(START), str(START + 1), "0", "", "", *NEXTEST,
+            cwd=mirror,
+            extra={"BUILDLOG_CALLER": "verify-mac", "BUILDLOG_CALL_ID": CALL_ID,
+                   "BUILDLOG_SENT_TREE_KEY": sent_key},
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        row = self.records()[-1]
+        self.assertEqual((row["caller"], row["call_id"], row["step"]), ("verify-mac", CALL_ID, "nextest"))
+        self.assertEqual((row["tree_key"], row["tree_changed"]), (sent_key, None))
+
+    def assert_unverified_mac_step_uses_sent_key(self) -> None:
+        # The fallback must work where the preceding step's guard does not apply.
+        mirror = self.base / "mirror-control"
+        mirror.mkdir()
+        sent_key = "a" * 64
+        result = self.record(
+            "step", "1", str(START + 20), str(START + 21), "0", "", "", *NEXTEST,
+            cwd=mirror, extra={"BUILDLOG_CALLER": "verify-mac", "BUILDLOG_SENT_TREE_KEY": sent_key},
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        row = self.records()[-1]
+        self.assertEqual((row["tree_key"], row["tree_changed"]), (sent_key, None))
+
+    def test_local_step_with_changed_tree_does_not_use_the_sent_tree_key(self) -> None:
+        end_key = self.key(*NEXTEST)
+        start_key = "0" * 64
+        self.assertNotEqual(start_key, end_key)
+        row = self.step(0, "0", "", "", NEXTEST, {
+            "BUILDLOG_CALLER": "verify", "BUILDLOG_TREE_START": start_key,
+            "BUILDLOG_SENT_TREE_KEY": "a" * 64,
+        })
+        self.assertEqual((row["tree_key"], row["tree_changed"]), (None, True))
+        self.assert_unverified_mac_step_uses_sent_key()
+
+    def test_verify_mac_step_with_changed_tree_does_not_use_the_sent_tree_key(self) -> None:
+        end_key = self.key(*NEXTEST)
+        start_key = "0" * 64
+        self.assertNotEqual(start_key, end_key)
+        row = self.step(1, "0", "", "", NEXTEST, {
+            "BUILDLOG_CALLER": "verify-mac", "BUILDLOG_TREE_START": start_key,
+            "BUILDLOG_SENT_TREE_KEY": "a" * 64,
+        })
+        self.assertEqual((row["tree_key"], row["tree_changed"]), (None, True))
+        self.assert_unverified_mac_step_uses_sent_key()
+
+    def test_verify_mac_step_keeps_its_own_verified_key_over_a_different_sent_key(self) -> None:
+        own_key = self.key(*NEXTEST)
+        sent_key = "a" * 64
+        self.assertNotEqual(own_key, sent_key)
+        row = self.step(1, "0", "", "", NEXTEST, {
+            "BUILDLOG_CALLER": "verify-mac", "BUILDLOG_TREE_START": own_key,
+            "BUILDLOG_SENT_TREE_KEY": sent_key,
+        })
+        self.assertEqual((row["tree_key"], row["tree_changed"]), (own_key, False))
+        self.assert_unverified_mac_step_uses_sent_key()
+
+    def test_local_step_without_git_does_not_use_the_sent_tree_key(self) -> None:
+        mirror = self.base / "local-without-git"
+        mirror.mkdir()
+        result = self.record(
+            "step", "0", str(START), str(START + 1), "0", "", "", *NEXTEST,
+            cwd=mirror, extra={"BUILDLOG_CALLER": "verify", "BUILDLOG_SENT_TREE_KEY": "a" * 64},
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        row = self.records()[-1]
+        self.assertEqual((row["tree_key"], row["tree_changed"]), (None, None))
+        self.assert_unverified_mac_step_uses_sent_key()
 
     def test_key_follows_the_manifest_and_is_empty_outside_git(self) -> None:
         elsewhere = self.base / "elsewhere"
