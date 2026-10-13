@@ -159,7 +159,7 @@ class RustReleaseTests(unittest.TestCase):
             with self.subTest(status=trial["status"]):
                 text = rust_release.release_push_text("1.100.0", "1.99.0", trial)
                 self.assertEqual(text.count("recommended"), 1)
-                self.assertIn("Upgrade (recommended)" if trial["status"] == "finished" else "Wait (recommended)", text)
+                self.assertIn("Upgrade (recommended" if trial["status"] == "finished" else "Wait (recommended)", text)
                 self.assertLess(len(text) + 90, 500)
                 self.assertIn("Hana, the editor project, builds with 1.99.0", text)
 
@@ -169,10 +169,12 @@ class RustReleaseTests(unittest.TestCase):
             "warning_crates": 1, "errors": 0, "error_crates": 0, "mend_builds": True,
             "target_gib": 1, "mend_target_gib": 1}
         text = rust_release.release_push_text("1.100.0", "1.99.0", trial)
-        self.assertIn("Both code checks passed", text)
-        self.assertIn("compiled with 1.100.0", text)
-        self.assertIn("Hana moves to 1.100.0", text)
-        self.assertIn("Hana stays on 1.99.0", text)
+        self.assertIn("Hana's compiler check passed on 1.100.0: no errors, 2 new warnings", text)
+        self.assertIn("recommended because the check passed", text)
+        self.assertNotIn("tool", text)
+        self.assertLess(len("Action: In the natedev Claude session, reply upgrade or wait.\n" + text), 500)
+        self.assertIn("Hana builds with 1.100.0 from now on", text)
+        self.assertIn("Wait: keep building Hana with 1.99.0", text)
         for outcome in (trial, rust_release.TrialWaiting(status="waiting", version="1.100.0", reason="build hold active")):
             self.assertLess(len(rust_release.release_push_title(outcome)), 45)
             self.assertNotIn("upgrade decision", rust_release.release_push_title(outcome))

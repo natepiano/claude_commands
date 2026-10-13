@@ -187,7 +187,7 @@ The design is `~/.local/state/plan-backlog/2026-10-13-user-message-clarity.md`, 
 
 **Acceptance gate:** Test lines for `scripts/production`, `scripts/hooks`, `scripts/notify` green; basedpyright 0/0; tests cover a held question failing registration, its rerun accepted, a reply missing the reviewed text blocked, an unrecorded `(recommended` line blocked.
 
-### Phase 6 — Nightly messages pass  · status: todo
+### Phase 6 — Nightly messages pass  · status: done
 
 #### Work Order
 

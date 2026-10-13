@@ -1163,20 +1163,41 @@ def _send_holdout_alert(due: list[tuple[SessionShutdown, str]]) -> None:
         lines.append(f"{saved['machine']} {name}: {reason}; {action}")
     text = "\n".join(lines)
     summary = "; ".join(summaries)
-    waiting = " ".join(f"Its session named {saved['session']['name']} on {saved['machine']} is {reason}." for saved, reason in due)
+    waiting = [f"Its session named {saved['session']['name']} on {saved['machine']} is {reason}, so it has not stopped." for saved, reason in due]
     account = json.dumps(first["label"])
     names = ",".join(saved["session"]["name"] for saved, _ in due)
     subject = "it" if len(due) == 1 else "them"
     possessive = "its" if len(due) == 1 else "their"
-    form_instruction = " Read any open form in that session's terminal before stopping it." if len(due) == 1 else ""
-    phone_text = (f"Shutdown of Claude account {account} is waiting. " + waiting[:120]
-                  + form_instruction + "\n\n"
-                  + f"Cancel (recommended): /shutdown cancel {account} --only {names} keeps {subject} running so you can check {possessive} work.\n\n"
-                  + f"Stop now: /shutdown now {account} --only {names} stops {subject} without waiting.")
+    form_instruction = " Read any open form in that session's terminal before choosing." if len(due) == 1 else ""
+    opening = f"Shutdown of Claude account {account} is waiting for sessions to stop. "
+    action_text = "In the natedev Claude session, choose cancel or stop now."
+    choices = (f"\n\nCancel (recommended): /shutdown cancel {account} --only {names}. This keeps {subject} running so you can check {possessive} work.\n\n"
+               + f"Stop now: /shutdown now {account} --only {names}. This stops {subject} without waiting.")
+    omitted = f"{len(waiting)} more sessions are waiting."
+    fixed_length = len("Action: " + action_text + "\n" + opening + form_instruction)
+    account_wide = len(due) > 1 and fixed_length + len(choices) + len(omitted) >= 500
+    if account_wide:
+        choices = (f"\n\nCancel (recommended): /shutdown cancel {account}. This keeps every waiting session running so you can check their work.\n\n"
+                   + f"Stop now: /shutdown now {account}. This stops every waiting session without waiting for its work to finish.")
+    budget = min(120, 499 - fixed_length - len(choices))
+    included: list[str] = []
+    for index, sentence in enumerate(waiting):
+        remaining = len(waiting) - index - 1
+        suffix = f"{remaining} more {'session is' if remaining == 1 else 'sessions are'} waiting." if remaining else ""
+        if len(" ".join([*included, sentence, *([suffix] if suffix else [])])) > budget:
+            break
+        included.append(sentence)
+        omitted = suffix
+    if account_wide and not included:
+        omitted = f"{len(waiting)} sessions are waiting."
+        reason_sentence = f"One is {due[0][1]}, so it has not stopped."
+        if len(omitted + " " + reason_sentence) <= budget:
+            omitted += " " + reason_sentence
+    phone_text = opening + " ".join([*included, *([omitted] if omitted else [])]) + form_instruction + choices
     title = "Shutdown waits on a session showing a form" if any("form" in reason for _, reason in due) else "Shutdown waits on running Claude sessions"
     try:
         alert_user(title, phone_text,
-            ActionRequired("In the natedev Claude session, choose cancel or stop now using the commands below."),
+            ActionRequired(action_text),
             machine="natedev" if local_machine().casefold() == "mac" else "")
     finally:
         origins = {saved["requested_by"]["session_id"] for saved, _ in due if saved["requested_by"]["kind"] == "session"}

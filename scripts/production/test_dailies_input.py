@@ -1466,11 +1466,13 @@ class DailiesInputTests(unittest.TestCase):
         self.assertEqual(sum(row[0] == "review_regime.py" and row[1] == "report" for row in calls), 1)
         self.assertEqual([row for row in calls if row[0] == "send.py"], [[
             "send.py", "--to", "user", "--from", "ci_points", "--need", "decision", "--action",
-            "In a natedev terminal, read the report, then acknowledge it or discuss concerns in the natedev Claude session.",
+            "On natedev, read the report. Choose acknowledge or discuss.",
             "--summary", "Reviewer removal lacks comparison data", "--text",
-            "An extra code reviewer was removed. The report has no comparable defect counts. Work continues either way.\n\n"
-            + "Read the report:\npython3 ~/.claude/scripts/production/review_regime.py report\n"
-            + "Acknowledge (recommended after reading): stop this report reminder. Run it with ack in place of report.\n\n"
+            "An extra code reviewer was removed from merge review. "
+            + "The report has no comparable defect counts, so the removal's effect is unknown.\n\n"
+            + "In a terminal on natedev, read:\npython3 ~/.claude/scripts/production/review_regime.py report\n"
+            + "Acknowledge (recommended; work continues either way): "
+            + "rerun with ack instead of report to stop these report notices.\n\n"
             + "Discuss: raise concerns in the natedev Claude session.",
         ]])
         self.assertEqual((self.checkout / "production.log").read_text().count("review watch"), 1)
@@ -1489,11 +1491,13 @@ class DailiesInputTests(unittest.TestCase):
         self.assertEqual(sum(row[0] == "review_regime.py" and row[1] == "report" for row in calls), 1)
         self.assertEqual([row for row in calls if row[0] == "send.py"], [[
             "send.py", "--to", "user", "--from", "ci_points", "--need", "decision", "--action",
-            "In a natedev terminal, read the report, then acknowledge it or discuss concerns in the natedev Claude session.",
+            "On natedev, read the report. Choose acknowledge or discuss.",
             "--summary", "Reviewer removal lacks comparison data", "--text",
-            "An extra code reviewer was removed. The report has no comparable defect counts. Work continues either way.\n\n"
-            + "Read the report:\npython3 ~/.claude/scripts/production/review_regime.py report\n"
-            + "Acknowledge (recommended after reading): stop this report reminder. Run it with ack in place of report.\n\n"
+            "An extra code reviewer was removed from merge review. "
+            + "The report has no comparable defect counts, so the removal's effect is unknown.\n\n"
+            + "In a terminal on natedev, read:\npython3 ~/.claude/scripts/production/review_regime.py report\n"
+            + "Acknowledge (recommended; work continues either way): "
+            + "rerun with ack instead of report to stop these report notices.\n\n"
             + "Discuss: raise concerns in the natedev Claude session.",
         ]])
         self.assertEqual((self.checkout / "production.log").read_text().count("review watch"), 1)

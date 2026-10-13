@@ -1,12 +1,12 @@
 ---
-description: Nightly read-only review ending in one improvement proposal per mode, each with a measured baseline. `config` covers machine configuration; `rust` covers ~/rust code, style and the development process. The nightly-review timer launches one session on natedev at 01:00 that does both, `config` first.
-argument-hint: config | rust | config rust
+description: Nightly read-only review with one proposal per mode. The timer runs config, rust, then messages at 01:00 on natedev.
+argument-hint: config | rust | messages | config rust messages
 ---
 
 Modes: `$ARGUMENTS`, done one at a time in the order given. Finish a mode, its report written and its message sent, before starting the next; a mode that cannot finish says why in its report, and the next still runs. NIGHT is the local date when the session started, DIR is `~/.local/state/nightly-review/NIGHT`, LEDGER is `~/.local/state/nightly-review/ledger.md`.
 
 <Rules>
-- Read-only: write nothing outside DIR. No edits, commits, pushes, rebuilds or installs. A worktree only when a measurement needs a build that must not touch a working copy; remove it after.
+- Read-only: write nothing outside DIR except `review.jsonl` dry sample records. No edits, commits, pushes, rebuilds or installs. A worktree only when a measurement needs a build that must not touch a working copy; remove it after.
 - Start research subagents when a candidate needs more evidence than you can gather directly.
 - Nobody is watching. A denied or failed action is a finding, not a blocker: note it and continue.
 - Read LEDGER first. A proposal marked declined comes back only with new evidence, named as such.
@@ -22,12 +22,17 @@ One target a night, by weight: hana 12, cargo-liner 3, bevy_brp 2, showrunner 1,
 - `showrunner`: the showrunner, producer and unit commands under `~/.claude/commands/` with their docs and scripts, against run history (`/history`) and delegate progress logs: steps that repeat work, stall, or wait on the user without need.
 </Scope>
 
+<Scope mode="messages">
+Run `~/.claude/scripts/lib/py ~/.claude/scripts/nightly_review/nightly_review.py messages`: it reads the last 24 hours of live verdicts from `~/.local/state/notify/review.jsonl` and dry-reviews up to 20 replies that ask nothing, using `reply,all` guide rules. Discovery includes showrunners and natedev in each session's own account; recorded transcript paths take precedence, renamed showrunners retain their timer identity, and reply timestamps select the interval. Allow up to 20 minutes at the default review limit; do not impose a shorter command timeout.
+Report live and sampled totals separately, failures by rule, `Unreviewed` separately, and questions absent from registration records separately. `check`, `replay`, and `sample` records are never live messages. Read tonight's messages and `~/rust/nate_style/message/`; propose at most one new rule with its stem, test, source quoting the user's words, and a Bad/Good pair from tonight. Write `DIR/messages.md` through the proposal and ledger process below; propose no rule when the evidence supports none. Never post a push or hold a reply.
+</Scope>
+
 <Proposal>
 For each mode, pick the single change with the largest measurable gain for its cost, and measure its baseline tonight. Write `DIR/<mode>.md`:
 
 ```
 # <title>
-**Target:** config | rust/<target>
+**Target:** config | rust/<target> | messages (~/rust/nate_style/message/<stem>.md)
 **Innovation:** <the change, one or two sentences>
 **Measurable improvement:** <metric>: <baseline tonight> → <target>, measured by <command or method>
 **Gain per week:** <`N min` or `N h` of user-visible time (waiting, red CI, failed runs) and what it is, else `N% of tokens`, from tonight's numbers; `unmeasured` when neither can be measured>
