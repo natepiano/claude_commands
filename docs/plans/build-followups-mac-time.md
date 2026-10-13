@@ -142,7 +142,7 @@ Source: steps recorded on the Mac; failed follows the build log's failure rule, 
 
 **Ruled out:** releasing on the leftover check's answer, which kills what it finds; counting the user's own shells under the clones as activity; messaging the showrunner as well as the holder.
 
-### Phase 3 — Each test run sent to the Mac deletes its build output when it finishes  · status: todo
+### Phase 3 — Each test run sent to the Mac deletes its build output when it finishes  · status: done
 
 #### Work Order
 
