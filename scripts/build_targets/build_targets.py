@@ -340,6 +340,15 @@ def command_check_admission(call_id: str) -> int:
         return 12
 
 
+def holds_only_own(owner: build_hold.OwningSession, directory: Path) -> bool:
+    try:
+        holds = build_hold.natedev_holds(directory)
+        key = build_hold.holder_path(directory, owner.session_id).name
+    except ValueError:
+        return False
+    return bool(holds.in_force) and all(holder.key == key for holder in holds.in_force)
+
+
 def command_check_local() -> int:
     try:
         state = target_state(local_target())
@@ -349,6 +358,8 @@ def command_check_local() -> int:
         if not isinstance(state, Held):
             return 0
         owner = build_hold.owning_session()
+        if isinstance(owner, build_hold.OwningSession) and holds_only_own(owner, build_hold.holder_directory()):
+            return 0
         key = owner.session_id if isinstance(owner, build_hold.OwningSession) else ""
         admission = build_hold.read_admission(key)
         if isinstance(admission, build_hold.AdmissionReadError):
