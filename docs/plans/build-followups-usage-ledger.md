@@ -319,7 +319,7 @@ The store is at `PRAGMA user_version` 6 (`STORE_VERSION`) and holds what the wor
 
 **Ruled out:** repairing the late same-thread roster write together with the size state (that defect is older than the size state); raising `PLAN_DELEGATE_COMPACT_ABOVE_TOKENS` to 200,000 as a stopgap (arithmetic on 42 compactions shows no gain).
 
-### Phase 11 — A late compaction leaves a newer turn's record alone · status: todo
+### Phase 11 — A late compaction leaves a newer turn's record alone · status: done
 
 #### Work Order
 
@@ -356,7 +356,42 @@ The store is at `PRAGMA user_version` 6 (`STORE_VERSION`) and holds what the wor
 
 **Acceptance gate:** `python3 -m unittest scripts.agents.test_codex_mesh` green from the repo root; basedpyright 0/0/0 on `scripts/agents/codex_mesh.py scripts/agents/test_codex_mesh.py`.
 
-### Phase 12 — What seat compactions cost, and a limit chosen by replay · status: todo
+### Phase 12 — A Codex request is keyed by its session file too · status: todo
+
+#### Work Order
+
+**Goal:** Two session files of one Codex thread never share a key, so a request or an edit in a later file is stored and not dropped because an earlier file used the same byte offset.
+
+**Spec:**
+- The defect. `CodexContext.consume` in `scripts/usage/collect.py` gives a Codex request the key `str(offset)`, its byte offset inside one session file, and gives an edit the same. The `turns` key is `(machine, family, parent_id, agent_id, turn_key)`, the `edits` key is `(machine, family, parent_id, agent_id, edit_key)`, and `save_measurement` stores both with `INSERT OR IGNORE`. A thread can have more than one session file: a reset starts a new file under the same thread id. A request or an edit in the second file, at an offset the first file also used, is dropped and nothing says so. Measured on natedev 2026-10-12: 218 Codex threads since 10-10, 2 with more than one file, no collision yet; a review pool that resets its reviewer before every check makes a new file each time.
+- The repair. A Codex `turn_key` and `edit_key` become `<session file name>:<offset>`. The file name is the last component of the session file's path, so it is the same on the machine that wrote the file and on a machine that reads it remotely. The offset stays the number it is today.
+- The reader gives the Codex context its file's name where the file is opened, and the remote read of the Mac builds its keys the same way.
+- Rows already stored keep their keys, and there is no migration: a session file only grows, and the collector reads each file from its stored cursor, so no stored request is read a second time under the new key. `SCHEMA` and `migrate_store` do not change.
+- Claude rows are untouched: their keys come from `claude_turn_key`.
+- Types follow the Type Design Contract: the key is built in one place, by one named function or type, and a Codex context cannot be built without its file name. No optional file name.
+- Done when the tests below pass.
+
+**Files:**
+- `scripts/usage/collect.py` — the Codex key.
+- `scripts/usage/test_collect.py` — the repair's tests.
+- `scripts/usage/test_outcomes.py` — only where it states a Codex key.
+- `scripts/whoami/test_seat_usage.py` — only where it states a Codex key.
+
+**Seats:** `1 writer + 1 tester`.
+- `impl` — `scripts/usage/collect.py`.
+- `test` — `scripts/usage/test_collect.py`, `scripts/usage/test_outcomes.py`, `scripts/whoami/test_seat_usage.py`, from this Spec alone, on stores and session files the tests build in a temporary directory. The first two tests below fail on the code before the repair. The tests pin:
+  - two session files of one thread, each with a request at one byte offset: both requests are stored, under different keys;
+  - the same for two edits at one byte offset;
+  - a stored Codex key is `<file name>:<offset>`, with the last path component only, whatever directory the file is read from;
+  - one file read twice, the second time from its cursor, stores each request once;
+  - a store that already holds a row keyed by a bare offset is read and added to with no error, and that row is left as it is;
+  - a Claude request's key is what it was.
+
+**Constraints from prior phases:** Work only in the worktree `/home/natepiano/worktrees/claude-build-followups-model-study`, branch `build-followups-model-study`. In `scripts/usage/collect.py`, `CodexContext.consume(self, line, offset)` builds `Turn(self.agent, str(offset), …)` and `Edit(self.agent, str(offset), at)`; `read_file(machine, path, family, …)` builds `CodexContext(machine)`; `save_measurement` uses `INSERT OR IGNORE` for `turns`, `edits` and `compactions`; the `cursors` table is keyed `(machine, path)` and holds the offset each file has been read to. Another unit's trial report builds stores through `SCHEMA`, `migrate_store`, `read_file`, `save_measurement` and `RoleResolver` and reads the tables `openings`, `folders`, `turns`, `compactions` and `turn_sources` through `usage_report.open_read_store`: this phase renames or removes none of those names, tables or columns, and a new parameter of `read_file` or `save_measurement` is not needed. Tests never write to the real `~/.local/state/usage-model/`; a seat never runs the collector against the real store, the real session directories or the real Mac.
+
+**Acceptance gate:** `python3 -m unittest scripts.usage.test_collect scripts.usage.test_outcomes scripts.whoami.test_seat_usage` green from the repo root; basedpyright 0/0/0 on `scripts/usage` and `scripts/whoami/test_seat_usage.py`. Live, by the unit director, into a scratch copy of the store: one collection run over natedev's session files adds rows in the new key form and no thread's count of stored requests goes down.
+
+### Phase 13 — What seat compactions cost, and a limit chosen by replay · status: todo
 
 #### Work Order
 
@@ -407,7 +442,7 @@ The store is at `PRAGMA user_version` 6 (`STORE_VERSION`) and holds what the wor
 
 **Acceptance gate:** `python3 -m unittest scripts.usage.test_usage_report scripts.usage.test_compaction_replay` green from the repo root; basedpyright 0/0/0 on `scripts/usage`. Live, by the unit director, read-only over natedev's store: the report prints the new metric by role and model, the replay prints its table, and the `limit 100,000` row is within 10% of the stored weighted tokens of the same threads, and the replay prints a fitted line, not `fit unavailable`.
 
-### Phase 13 — Weights for gpt-6-sol and gpt-6-astra · status: todo
+### Phase 14 — Weights for gpt-6-sol and gpt-6-astra · status: todo
 
 #### Work Order
 
