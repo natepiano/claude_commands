@@ -8,6 +8,8 @@ import json
 import math
 import os
 import shlex
+import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -106,15 +108,55 @@ class HerdrRefusal(TypedDict):
     error: HerdrError
 
 
-class CodexDaemon(TypedDict):
+class ProcessIdentity(TypedDict):
     pid: int
     start_time: int
 
 
+class CodexDaemon(ProcessIdentity):
+    """A managed account-owned Codex app-server identity."""
+
+
 class StartedResources(TypedDict):
     systemd_units: list[str]
+    notifier_instances: NotRequired[list[str]]
     codex_daemons_before: NotRequired[list[CodexDaemon]]
     codex_daemons_started: NotRequired[list[CodexDaemon]]
+
+
+class CleanupManifest(TypedDict):
+    scratch_root: str
+    systemd_units: list[str]
+    notifier_instances: list[str]
+    state_paths: list[str]
+    herdr_config: str
+    codex_home: str
+    claude_config: str
+    codex_daemons_before: list[CodexDaemon]
+    codex_daemons_started: list[CodexDaemon]
+
+
+@dataclass(frozen=True)
+class InspectedProcess:
+    identity: ProcessIdentity
+    arguments: tuple[str, ...]
+    environment: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class MissingProcess:
+    pid: int
+
+
+@dataclass(frozen=True)
+class ForeignUserProcess:
+    pid: int
+
+
+@dataclass(frozen=True)
+class UnreadableProcess:
+    pid: int
+    reason: str
 
 
 class TrialIssue(TypedDict):
@@ -427,6 +469,10 @@ def started_resources() -> StartedResources:
     resources["systemd_units"] = [
         json_text(item, str(path)) for item in json_items(data.get("systemd_units"), str(path))
     ]
+    if "notifier_instances" in data:
+        resources["notifier_instances"] = [
+            json_text(item, str(path)) for item in json_items(data["notifier_instances"], str(path))
+        ]
     for key in ("codex_daemons_before", "codex_daemons_started"):
         if key in data:
             daemons: list[CodexDaemon] = []
@@ -905,8 +951,11 @@ def codex_daemons(home: Path) -> list[CodexDaemon]:
         if not directory.name.isdecimal():
             continue
         try:
+            if directory.stat().st_uid != os.getuid():
+                continue
             arguments = directory.joinpath("cmdline").read_bytes().decode(errors="replace").split("\0")
-            if "app-server" not in arguments or not any("codex" in argument for argument in arguments):
+            if ("app-server" not in arguments or "--managed-daemon" not in arguments
+                    or not any("codex" in argument for argument in arguments)):
                 continue
             try:
                 environment = directory.joinpath("environ").read_bytes().decode(errors="replace").split("\0")
@@ -1073,6 +1122,348 @@ def launch(herdr: Herdr) -> None:
         start_agent(herdr, agent, milliseconds)
 
 
+def cleanup_manifest_path() -> Path:
+    return Path(os.environ.get("HERDR_TRIAL_MANIFEST",
+                "~/.local/state/herdr-trial/cleanup.json")).expanduser().absolute()
+
+
+def cleanup_daemons(value: object, context: str) -> list[CodexDaemon]:
+    daemons: list[CodexDaemon] = []
+    for item in json_items(value, context):
+        entry = json_object(item, context)
+        pid, start = entry.get("pid"), entry.get("start_time")
+        if (not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0
+                or not isinstance(start, int) or isinstance(start, bool) or start < 0):
+            raise TrialFailure(f"{context}: invalid process identity")
+        daemons.append({"pid": pid, "start_time": start})
+    return daemons
+
+
+def cleanup_manifest() -> CleanupManifest:
+    """Use the persisted inventory on retries, including after scratch deletion."""
+    path = cleanup_manifest_path()
+    if path.exists():
+        data = decode_object(path.read_text(), str(path))
+        return CleanupManifest(
+            scratch_root=json_text(data.get("scratch_root"), str(path)),
+            systemd_units=[json_text(item, str(path)) for item in json_items(data.get("systemd_units"), str(path))],
+            notifier_instances=[json_text(item, str(path)) for item in json_items(data.get("notifier_instances"), str(path))],
+            state_paths=[json_text(item, str(path)) for item in json_items(data.get("state_paths"), str(path))],
+            herdr_config=json_text(data.get("herdr_config"), str(path)),
+            codex_home=json_text(data.get("codex_home"), str(path)),
+            claude_config=json_text(data.get("claude_config"), str(path)),
+            codex_daemons_before=cleanup_daemons(data.get("codex_daemons_before"), str(path)),
+            codex_daemons_started=cleanup_daemons(data.get("codex_daemons_started"), str(path)),
+        )
+    root = scratch_root().absolute()
+    if path.is_relative_to(root):
+        raise TrialFailure(f"cleanup manifest {path} must be outside scratch {root}")
+    accounts = launch_accounts()
+    resources = started_resources()
+    notifier_root = Path(os.environ.get("HERDR_TRIAL_NOTIFIER_ROOT", "~/.local/state/notifier")).expanduser().absolute()
+    showrunner_root = Path(os.environ.get("HERDR_TRIAL_SHOWRUNNER_STATE", "~/.local/state/showrunner")).expanduser().absolute()
+    herdr_config = Path(os.environ.get("HERDR_TRIAL_HERDR_CONFIG", "~/.config/herdr")).expanduser().absolute()
+    instances: list[str] = ["showrunner-herdr-fake"]
+    for instance in resources.get("notifier_instances", []):
+        if instance not in instances:
+            instances.append(instance)
+    if any(not name or Path(name).name != name or name in (".", "..") for name in instances):
+        raise TrialFailure("recorded notifier instance must be an exact directory name")
+    return CleanupManifest(
+        scratch_root=str(root), systemd_units=resources["systemd_units"], notifier_instances=instances,
+        state_paths=[*(str(notifier_root / name) for name in instances), str(showrunner_root / "herdr-fake"),
+                     str(herdr_config / "sessions/herdr-trial"), str(herdr_config / "sessions/herdr-devcheck"),
+                     str(herdr_config / ".plugins.lock"), str(herdr_config / "release-notes.json")],
+        herdr_config=str(herdr_config), codex_home=str(accounts.codex_home), claude_config=str(accounts.claude_config),
+        codex_daemons_before=resources.get("codex_daemons_before", []),
+        codex_daemons_started=resources.get("codex_daemons_started", []),
+    )
+
+
+def persist_cleanup_manifest(manifest: CleanupManifest) -> None:
+    path = cleanup_manifest_path()
+    root = Path(manifest["scratch_root"])
+    if path.resolve().is_relative_to(root.resolve()):
+        raise TrialFailure(f"cleanup manifest {path} must be outside scratch {root}")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(mode="w", dir=path.parent, prefix=".cleanup-", delete=False) as output:
+        temporary = Path(output.name)
+        try:
+            _ = output.write(json.dumps(manifest) + "\n")
+            output.close()
+            os.replace(temporary, path)
+        finally:
+            temporary.unlink(missing_ok=True)
+
+
+def inspect_process(pid: int) -> InspectedProcess | MissingProcess | ForeignUserProcess | UnreadableProcess:
+    directory = Path(os.environ.get("HERDR_TRIAL_PROC", "/proc")) / str(pid)
+    if not directory.exists():
+        return MissingProcess(pid)
+    try:
+        if directory.stat().st_uid != os.getuid():
+            return ForeignUserProcess(pid)
+        fields = (directory / "stat").read_text().rpartition(")")[2].split()
+        identity: ProcessIdentity = {"pid": pid, "start_time": int(fields[19])}
+        arguments = tuple((directory / "cmdline").read_bytes().decode(errors="replace").split("\0"))
+        environment = tuple((directory / "environ").read_bytes().decode(errors="replace").split("\0"))
+        return InspectedProcess(identity, arguments, environment)
+    except (OSError, ValueError, IndexError) as error:
+        if not directory.exists():
+            return MissingProcess(pid)
+        return UnreadableProcess(pid, str(error))
+
+
+def account_process(process: InspectedProcess, home: Path) -> bool:
+    if f"CODEX_HOME={home}" in process.environment:
+        return True
+    try:
+        executable = Path(os.readlink(Path(os.environ.get("HERDR_TRIAL_PROC", "/proc")) /
+                                      str(process.identity["pid"]) / "exe"))
+        return executable.is_relative_to(home)
+    except OSError:
+        return False
+
+
+def codex_process(process: InspectedProcess) -> bool:
+    return any("codex" in Path(argument).name for argument in process.arguments if argument)
+
+
+def daemon_process(process: InspectedProcess, home: Path) -> bool:
+    return codex_process(process) and "app-server" in process.arguments and account_process(process, home)
+
+
+def managed_daemon_process(process: InspectedProcess, home: Path) -> bool:
+    return "--managed-daemon" in process.arguments and daemon_process(process, home)
+
+
+def inspected_processes() -> list[InspectedProcess | UnreadableProcess]:
+    proc = Path(os.environ.get("HERDR_TRIAL_PROC", "/proc"))
+    processes: list[InspectedProcess | UnreadableProcess] = []
+    for directory in proc.iterdir():
+        if directory.name.isdecimal():
+            process = inspect_process(int(directory.name))
+            if not isinstance(process, (MissingProcess, ForeignUserProcess)):
+                processes.append(process)
+    return processes
+
+
+def stop_process(pid: int) -> None:
+    """An injectable boundary; callers must first validate the recorded identity."""
+    if "HERDR_TRIAL_STOP_PROCESS" in os.environ:
+        require_success(run_program([os.environ["HERDR_TRIAL_STOP_PROCESS"], str(pid)]), f"stop process {pid}")
+    else:
+        os.kill(pid, signal.SIGTERM)
+
+
+def stop_owned_daemons(manifest: CleanupManifest) -> None:
+    home = Path(manifest["codex_home"])
+    processes = inspected_processes()
+    # After closing the trial and stopping its server, every remaining account
+    # client is outside cleanup's ownership. Only current-user unreadable
+    # processes fail closed; inspection skips processes owned by other users.
+    shared = any(isinstance(process, UnreadableProcess)
+                 or (codex_process(process) and account_process(process, home)
+                     and "app-server" not in process.arguments) for process in processes)
+    before = {entry["pid"] for entry in manifest["codex_daemons_before"]}
+    for identity in manifest["codex_daemons_started"]:
+        pid = identity["pid"]
+        if pid in before:
+            continue
+        current = inspect_process(pid)
+        if isinstance(current, (MissingProcess, ForeignUserProcess)):
+            continue
+        if isinstance(current, UnreadableProcess):
+            print(f"process {pid}: identity unreadable; retained")
+            continue
+        if not managed_daemon_process(current, home):
+            print(f"process {pid}: not a managed Codex daemon; retained")
+            continue
+        if current.identity != identity:
+            print(f"process {pid}: recorded identity replaced or account changed; retained")
+            continue
+        if shared:
+            print(f"codex daemon {pid} shared: outside client or unreadable process; retained")
+            continue
+        # Reinspect immediately before crossing the stop boundary.
+        checked = inspect_process(pid)
+        if isinstance(checked, InspectedProcess):
+            if not managed_daemon_process(checked, home):
+                print(f"process {pid}: not a managed Codex daemon; retained")
+            elif checked.identity == identity:
+                stop_process(pid)
+
+
+def remove_exact_path(path: Path) -> None:
+    if path.is_symlink():
+        path.unlink()
+    elif path.is_dir():
+        shutil.rmtree(path)
+    else:
+        path.unlink(missing_ok=True)
+
+
+def report_retained_grants(manifest: CleanupManifest) -> None:
+    key = str(Path(manifest["scratch_root"]) / "repo")
+    claude = Path(manifest["claude_config"]) / ".claude.json"
+    codex = Path(manifest["codex_home"]) / "config.toml"
+    try:
+        projects = json_object(decode_object(claude.read_text(), str(claude)).get("projects", {}), str(claude))
+        entry = json_object(projects.get(key, {}), str(claude))
+        if "hasTrustDialogAccepted" in entry:
+            print(f"retained Claude trust {key}: hasTrustDialogAccepted={entry['hasTrustDialogAccepted']} ({claude})")
+    except (OSError, TrialFailure) as error:
+        print(f"retained Claude configuration could not be read: {claude}: {error}")
+    try:
+        with codex.open("rb") as source:
+            configuration = cast(dict[str, object], tomllib.load(source))
+        projects = json_object(configuration.get("projects", {}), str(codex))
+        entry = json_object(projects.get(key, {}), str(codex))
+        if "trust_level" in entry:
+            print(f"retained Codex trust {key}: trust_level={entry['trust_level']} ({codex})")
+        hooks = json_object(configuration.get("hooks", {}), str(codex))
+        if hooks:
+            print(f"retained Codex hooks trust ({codex}): {json.dumps(hooks, sort_keys=True)}")
+    except (OSError, ValueError, TrialFailure) as error:
+        print(f"retained Codex configuration could not be read: {codex}: {error}")
+
+
+def trial_process(process: InspectedProcess, root: Path) -> bool:
+    targeted_session = any(
+        argument == "--session" and index + 1 < len(process.arguments)
+        and process.arguments[index + 1] in (SESSION, "herdr-devcheck")
+        for index, argument in enumerate(process.arguments)
+    )
+    if ("SHOWRUNNER_UNIT=herdr-fake" in process.environment
+            or f"HERDR_SESSION={SESSION}" in process.environment
+            or "--title=herdr-trial" in process.arguments or targeted_session):
+        return True
+    try:
+        cwd = Path(os.readlink(Path(os.environ.get("HERDR_TRIAL_PROC", "/proc")) /
+                               str(process.identity["pid"]) / "cwd"))
+        return cwd.is_relative_to(root)
+    except OSError:
+        return False
+
+
+def leftover_resources(herdr: Herdr, manifest: CleanupManifest) -> list[str]:
+    remains: list[str] = []
+    root = Path(manifest["scratch_root"])
+    if root.exists() or root.is_symlink():
+        remains.append(f"scratch {root}")
+    for name in manifest["state_paths"]:
+        path = Path(name)
+        if path.exists() or path.is_symlink():
+            remains.append(f"state {path}")
+    for unit in manifest["systemd_units"]:
+        result = systemctl("is-active", unit)
+        if result.returncode == 0:
+            remains.append(f"systemd unit {unit}")
+        elif result.returncode not in (3, 4):
+            remains.append(f"systemd unit {unit}: status unknown ({result.returncode})")
+    status = run_program(herdr.argv("status", "server"))
+    if server_answering(status):
+        remains.append(f"server {SESSION}")
+        result = herdr.result("workspace", "list")
+        for value in json_items(result.get("workspaces"), "herdr workspace list"):
+            workspace = json_object(value, "herdr workspace")
+            remains.append(f"workspace {json_text(workspace.get('workspace_id'), 'herdr workspace id')}")
+    home = Path(manifest["codex_home"])
+    before = manifest["codex_daemons_before"]
+    owned = manifest["codex_daemons_started"]
+    processes = inspected_processes()
+    account_shared = any(
+        isinstance(process, UnreadableProcess)
+        or (codex_process(process) and account_process(process, home)
+            and "app-server" not in process.arguments and not trial_process(process, root))
+        for process in processes
+    )
+    for process in processes:
+        if isinstance(process, UnreadableProcess):
+            if (process.pid in {entry["pid"] for entry in owned}
+                    and process.pid not in {entry["pid"] for entry in before}):
+                remains.append(f"process {process.pid}: identity unreadable")
+            continue
+        if daemon_process(process, home):
+            if (managed_daemon_process(process, home) and process.identity in owned
+                    and process.identity not in before):
+                disposition = "shared" if account_shared else "trial-started"
+                remains.append(f"codex daemon {process.identity['pid']} {disposition}")
+        elif trial_process(process, root):
+            remains.append(f"trial process {process.identity['pid']}")
+    return remains
+
+
+def leftovers(herdr: Herdr) -> bool:
+    manifest = cleanup_manifest()
+    remains = leftover_resources(herdr, manifest)
+    for item in remains:
+        print(item)
+    report_retained_grants(manifest)
+    return not remains
+
+
+def teardown(herdr: Herdr) -> None:
+    manifest = cleanup_manifest()
+    persist_cleanup_manifest(manifest)
+    root = Path(manifest["scratch_root"])
+    issues = root / "issues.jsonl"
+    if issues.is_file():
+        archive = cleanup_manifest_path().with_name("issues.jsonl")
+        _ = shutil.copyfile(issues, archive)
+        print(f"issues preserved for the phase notice: {archive}")
+    # Only raw close commands: even an unrecognized trust UI receives no input.
+    # A failed RPC must not prevent the recorded systemd units from stopping.
+    failures: list[str] = []
+    try:
+        status = run_program(herdr.argv("status", "server"))
+        if server_answering(status):
+            result = herdr.result("workspace", "list")
+            for value in json_items(result.get("workspaces"), "herdr workspace list"):
+                workspace = json_object(value, "herdr workspace")
+                workspace_id = json_text(workspace.get("workspace_id"), "herdr workspace id")
+                try:
+                    _ = herdr.run("workspace", "close", workspace_id)
+                except (TrialFailure, OSError, subprocess.SubprocessError) as error:
+                    failures.append(str(error))
+            _ = herdr.run("server", "stop")
+    except (TrialFailure, OSError, subprocess.SubprocessError) as error:
+        failures.append(str(error))
+    for unit in manifest["systemd_units"]:
+        try:
+            state = systemctl("is-active", unit)
+            if state.returncode == 0:
+                require_success(systemctl("stop", unit), f"stop {unit}")
+            elif state.returncode not in (3, 4):
+                require_success(state, f"inspect {unit}")
+        except (TrialFailure, OSError, subprocess.SubprocessError) as error:
+            failures.append(str(error))
+    if failures:
+        raise TrialFailure("cleanup shutdown failed; state retained: " + "; ".join(failures))
+    if server_answering(run_program(herdr.argv("status", "server"))):
+        raise TrialFailure("server herdr-trial still running; retaining scratch and state")
+    stop_owned_daemons(manifest)
+    # Do not remove runtime or scratch evidence while a trial process survives.
+    remaining_processes = [process for process in inspected_processes()
+                           if isinstance(process, InspectedProcess) and not daemon_process(process, Path(manifest["codex_home"]))
+                           and trial_process(process, root)]
+    if remaining_processes:
+        raise TrialFailure("trial processes remain; retaining scratch and state for cleanup retry")
+    for name in manifest["state_paths"]:
+        remove_exact_path(Path(name))
+    config = Path(manifest["herdr_config"])
+    for path in (config / "sessions", config):
+        if path.is_dir() and not path.is_symlink() and not any(path.iterdir()):
+            path.rmdir()
+    remove_exact_path(root)
+    remains = leftover_resources(herdr, manifest)
+    for item in remains:
+        print(item)
+    report_retained_grants(manifest)
+    if remains:
+        raise TrialFailure("cleanup incomplete; resources listed above remain")
+
+
 def requested_desktop(text: str) -> RequestedDesktop:
     try:
         number = int(text)
@@ -1108,6 +1499,8 @@ def parser() -> TrialParser:
     _ = commands.add_parser("agents")
     _ = commands.add_parser("scaffold")
     _ = commands.add_parser("launch")
+    _ = commands.add_parser("teardown")
+    _ = commands.add_parser("leftovers")
     for command in ("work", "wait"):
         worker_parser = commands.add_parser(command)
         _ = worker_parser.add_argument("unit", choices=tuple(unit.name for unit in scaffold_files.UNITS))
@@ -1163,6 +1556,10 @@ def main(argv: list[str]) -> int:
             scaffold()
         elif args.command == "launch":
             launch(herdr)
+        elif args.command == "teardown":
+            teardown(herdr)
+        elif args.command == "leftovers":
+            return 0 if leftovers(herdr) else 1
         elif args.command == "work":
             work(herdr, args.unit, args.role, args.file)
         elif args.command == "wait":

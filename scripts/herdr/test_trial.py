@@ -27,6 +27,8 @@ class CommandResponse(TypedDict):
     code: int
     stderr: NotRequired[str]
     write_files: NotRequired[dict[str, str]]
+    require_paths: NotRequired[list[str]]
+    remove_paths: NotRequired[list[str]]
 
 
 class PaneDetails(TypedDict):
@@ -262,6 +264,12 @@ class TrialTests(unittest.TestCase):
             "HERDR_TRIAL_TERMINAL": "/fixture/ghostty",
             "HERDR_TRIAL_GIT": GIT_BINARY,
             "HERDR_TRIAL_ROOT": str(self.scratch),
+            "HERDR_TRIAL_PROC": str(self.root / "proc-fixture"),
+            "HERDR_TRIAL_STOP_PROCESS": str(self.fake),
+            "HERDR_TRIAL_MANIFEST": str(self.root / "cleanup/cleanup.json"),
+            "HERDR_TRIAL_NOTIFIER_ROOT": str(self.root / "notifier"),
+            "HERDR_TRIAL_SHOWRUNNER_STATE": str(self.root / "showrunner"),
+            "HERDR_TRIAL_HERDR_CONFIG": str(self.root / "herdr-config"),
             "HERDR_TRIAL_START_TIMEOUT": "0.5",
             "FAKE_HERDR_LOG": str(self.log),
             "FAKE_HERDR_RESPONSES": str(self.response_file),
@@ -820,9 +828,9 @@ class TrialTests(unittest.TestCase):
 
     def test_launch_records_matching_daemon_baseline_before_panes_and_new_daemons_before_directors(self) -> None:
         self.launch_fixture()
-        self.proc_process(31401, 9981, ["/outside/bin/codex", "app-server"], str(self.codex), Path("/outside/bin/codex"))
-        self.proc_process(31402, 9982, ["codex", "app-server"], "", self.codex / "bin/codex")
-        self.proc_process(31403, 9983, ["codex", "app-server"], str(self.root / "other-account"), Path("/outside/bin/codex"))
+        self.proc_process(31401, 9981, ["/outside/bin/codex", "app-server", "--managed-daemon"], str(self.codex), Path("/outside/bin/codex"))
+        self.proc_process(31402, 9982, ["codex", "app-server", "--managed-daemon"], "", self.codex / "bin/codex")
+        self.proc_process(31403, 9983, ["codex", "app-server", "--managed-daemon"], str(self.root / "other-account"), Path("/outside/bin/codex"))
         self.proc_process(31404, 9984, ["codex", "exec"], str(self.codex), self.codex / "bin/codex")
         (self.root / "proc-fixture/31405").mkdir()  # process vanished mid-scan
         baseline: list[CodexDaemonIdentity] = [{"pid": 31401, "start_time": 9981}, {"pid": 31402, "start_time": 9982}]
@@ -837,7 +845,7 @@ class TrialTests(unittest.TestCase):
                 self.assertEqual(record["systemd_units"], ["herdr-trial-server", "herdr-trial-client"])
                 seen_before = True
             if command[:3] == ["agent", "start", "count-unit-review"]:
-                self.proc_process(31409, 9999, ["codex", "app-server"], str(self.codex), Path("/outside/bin/codex"))
+                self.proc_process(31409, 9999, ["codex", "app-server", "--managed-daemon"], str(self.codex), Path("/outside/bin/codex"))
             if command[:3] == ["agent", "start", "slug-unit"]:
                 record = cast(LaunchStartedResources, json.loads((self.scratch / "started.json").read_text()))
                 self.assertEqual(record["codex_daemons_started"], [{"pid": 31409, "start_time": 9999}])
@@ -849,6 +857,30 @@ class TrialTests(unittest.TestCase):
         record = cast(LaunchStartedResources, json.loads((self.scratch / "started.json").read_text()))
         self.assertCountEqual(record["codex_daemons_before"], baseline)
         self.assertEqual(record["codex_daemons_started"], [{"pid": 31409, "start_time": 9999}])
+
+    def test_launch_records_managed_daemons_without_recording_delegate_mesh_servers(self) -> None:
+        self.launch_fixture()
+        self.proc_process(31501, 10001, ["codex", "app-server", "--managed-daemon"],
+                          str(self.codex), self.codex / "bin/codex")
+        self.proc_process(31502, 10002, ["codex", "-c", "thread_unload_delay_secs=0",
+                                      "app-server", "--listen", "ws://127.0.0.1:41001"],
+                          str(self.codex), self.codex / "bin/codex")
+
+        def observe(command: list[str]) -> None:
+            if command[:3] == ["agent", "start", "count-unit-review"]:
+                self.proc_process(31503, 10003, ["codex", "app-server", "--listen",
+                                              "ws://127.0.0.1:41002"],
+                                  str(self.codex), self.codex / "bin/codex")
+                self.proc_process(31504, 10004, ["codex", "app-server", "--listen", "unix://",
+                                              "--analytics-default-enabled", "--managed-daemon"],
+                                  str(self.codex), self.codex / "bin/codex")
+
+        self.assert_success(self.invoke_launch(observe))
+        record = cast(LaunchStartedResources, json.loads((self.scratch / "started.json").read_text()))
+        self.assertEqual(record["codex_daemons_started"], [{"pid": 31504, "start_time": 10004}])
+        self.assertEqual(record["codex_daemons_before"], [{"pid": 31501, "start_time": 10001}])
+        for pid in (31502, 31503):
+            self.assertTrue((self.root / "proc-fixture" / str(pid)).is_dir())
 
     def test_launch_retry_preserves_original_daemon_baseline_and_accumulates_owned_daemons(self) -> None:
         self.launch_fixture()
@@ -863,7 +895,7 @@ class TrialTests(unittest.TestCase):
         tracking = self.scratch / "started.json"
         _ = tracking.write_text(json.dumps(resources))
         for daemon in (baseline, previously_started, newly_seen):
-            self.proc_process(daemon["pid"], daemon["start_time"], ["codex", "app-server"],
+            self.proc_process(daemon["pid"], daemon["start_time"], ["codex", "app-server", "--managed-daemon"],
                               str(self.codex), Path("/outside/bin/codex"))
 
         self.assert_success(self.invoke_launch())
@@ -1952,6 +1984,381 @@ class TrialTests(unittest.TestCase):
         self.assertFalse((self.claude / ".claude.json").exists())
         self.assertFalse((self.codex / "config.toml").exists())
         self.assertEqual(self.calls(), [])
+
+    def cleanup_fixture(self, before: tuple[CodexDaemonIdentity, ...] = (),
+                        started: tuple[CodexDaemonIdentity, ...] = ()) -> Path:
+        self.scratch.mkdir()
+        proc = self.root / "proc-fixture"
+        proc.mkdir()
+        os.environ.update({
+            "HERDR_TRIAL_CLAUDE_CONFIG_DIR": str(self.claude),
+            "HERDR_TRIAL_CODEX_HOME": str(self.codex),
+        })
+        record: LaunchStartedResources = {
+            "systemd_units": ["herdr-trial-server", "herdr-trial-client", "fixture-extra.timer"],
+            "codex_daemons_before": list(before), "codex_daemons_started": list(started),
+        }
+        _ = (self.scratch / "started.json").write_text(json.dumps(record))
+        _ = (self.scratch / "issues.jsonl").write_text(
+            '{"time":"2026-10-13T18:15:00+00:00","session":"showrunner",' +
+            '"expected":"lookup finds unit","happened":"tmux lookup missed herdr"}\n')
+        for resource in (
+            self.root / "notifier/showrunner-herdr-fake",
+            self.root / "showrunner/herdr-fake",
+            self.root / "herdr-config/sessions/herdr-trial",
+            self.root / "herdr-config/sessions/herdr-devcheck",
+        ):
+            resource.mkdir(parents=True)
+            _ = (resource / "fixture-state").write_text("trial owned\n")
+        for name in (".plugins.lock", "release-notes.json"):
+            _ = (self.root / "herdr-config" / name).write_text("trial state\n")
+        workspace: WorkspaceListResponse = {"ok": True, "result": {"workspaces": [
+            {"workspace_id": "w9", "label": "herdr-fake"},
+        ]}}
+        self.configure(herdr_args("workspace", "list"), json.dumps(workspace))
+        self.pane_list([
+            {"pane_id": "w9:p71", "label": "slug-unit-impl", "workspace_id": "w9"},
+            {"pane_id": "w9:p82", "label": "clamp-unit-review", "workspace_id": "w9"},
+        ])
+        self.worker_state("w9:p71", "blocked", True)
+        self.worker_state("w9:p82", "idle", False)
+        self.responses[" ".join(herdr_args("status", "server"))] = [
+            {"stdout": "status: running\n", "code": 0},
+            {"stdout": "status: not running\n", "code": 0},
+        ]
+        for unit in record["systemd_units"]:
+            active = ["--user", "is-active", unit]
+            self.responses[" ".join(active)] = [
+                {"stdout": "active\n", "code": 0},
+                {"stdout": "inactive\n", "code": 3},
+            ]
+            self.configure(["--user", "stop", unit])
+        return self.root / "cleanup/cleanup.json"
+
+    def assert_no_shutdown_input(self) -> None:
+        for call in self.calls():
+            self.assertFalse(any(word in call for word in (
+                "send-text", "send-keys", "prompt", "run", "start",
+            )), call)
+
+    def test_teardown_stops_every_recorded_unit_before_removing_scratch(self) -> None:
+        manifest = self.cleanup_fixture()
+        issue_text = (self.scratch / "issues.jsonl").read_text()
+        for unit in ("herdr-trial-server", "herdr-trial-client", "fixture-extra.timer"):
+            self.responses[" ".join(["--user", "stop", unit])] = {
+                "stdout": "", "code": 0,
+                "require_paths": [str(self.scratch / "started.json"), str(manifest)],
+            }
+        result = self.invoke("teardown")
+        self.assert_success(result)
+        for unit in ("herdr-trial-server", "herdr-trial-client", "fixture-extra.timer"):
+            self.assertIn(["--user", "stop", unit], self.calls())
+        self.assertFalse(self.scratch.exists())
+        self.assertTrue(manifest.is_file())
+        archived = [p for p in manifest.parent.iterdir()
+                    if p.is_file() and p != manifest and issue_text in p.read_text()]
+        self.assertTrue(archived, "issues must survive scratch deletion outside scratch")
+        self.assert_no_shutdown_input()
+
+    def test_teardown_closes_blocked_and_unready_panes_without_any_input(self) -> None:
+        _ = self.cleanup_fixture()
+        self.assert_success(self.invoke("teardown"))
+        calls = self.calls()
+        workspace_close = herdr_args("workspace", "close", "w9")
+        pane_closes = [herdr_args("pane", "close", pane) for pane in ("w9:p71", "w9:p82")]
+        self.assertTrue(workspace_close in calls or all(call in calls for call in pane_closes), calls)
+        self.assert_no_shutdown_input()
+
+    def test_teardown_removes_exact_trial_state_and_preserves_other_sessions(self) -> None:
+        _ = self.cleanup_fixture()
+        other_paths = [
+            self.root / "herdr-config/sessions/keep-me/state",
+            self.root / "notifier/showrunner-unrelated/state",
+            self.root / "showrunner/unrelated/state",
+            self.root / "scratch-other/state",
+        ]
+        for path in other_paths:
+            path.parent.mkdir(parents=True)
+            _ = path.write_text("unrelated survives\n")
+        self.assert_success(self.invoke("teardown"))
+        for path in other_paths:
+            self.assertEqual(path.read_text(), "unrelated survives\n")
+        for path in (
+            self.root / "herdr-config/sessions/herdr-trial",
+            self.root / "herdr-config/sessions/herdr-devcheck",
+            self.root / "herdr-config/.plugins.lock",
+            self.root / "herdr-config/release-notes.json",
+            self.root / "notifier/showrunner-herdr-fake",
+            self.root / "showrunner/herdr-fake",
+        ):
+            self.assertFalse(path.exists(), str(path))
+
+    def daemon_fixture(self, identity: CodexDaemonIdentity) -> None:
+        self.proc_process(identity["pid"], identity["start_time"], ["codex", "app-server", "--managed-daemon"],
+                          str(self.codex), self.codex / "bin/codex")
+        self.responses[str(identity["pid"])] = {
+            "stdout": "", "code": 0,
+            "remove_paths": [str(self.root / "proc-fixture" / str(identity["pid"]))],
+        }
+
+    def test_teardown_never_stops_a_daemon_from_the_original_baseline(self) -> None:
+        baseline: CodexDaemonIdentity = {"pid": 27101, "start_time": 4100}
+        _ = self.cleanup_fixture(before=(baseline,), started=(baseline,))
+        self.daemon_fixture(baseline)
+        result = self.invoke("teardown")
+        self.assert_success(result)
+        self.assertFalse(any("daemon" in line for line in result.stdout.splitlines()), result.stdout)
+        self.assertNotIn(["27101"], self.calls())
+        self.assertTrue((self.root / "proc-fixture/27101").is_dir())
+        self.assertFalse(self.scratch.exists())
+
+    def test_teardown_stops_only_a_matching_trial_started_daemon_without_outside_clients(self) -> None:
+        daemon: CodexDaemonIdentity = {"pid": 27102, "start_time": 4200}
+        _ = self.cleanup_fixture(started=(daemon,))
+        self.daemon_fixture(daemon)
+        self.assert_success(self.invoke("teardown"))
+        self.assertEqual(self.calls().count(["27102"]), 1)
+        self.assertFalse((self.root / "proc-fixture/27102").exists())
+        self.assertLess(self.calls().index(herdr_args("workspace", "close", "w9")),
+                        self.calls().index(["27102"]))
+        self.assertLess(self.calls().index(["--user", "stop", "herdr-trial-server"]),
+                        self.calls().index(["27102"]))
+        self.assert_no_shutdown_input()
+
+    def test_teardown_preserves_a_trial_started_daemon_shared_by_an_outside_account_client(self) -> None:
+        daemon: CodexDaemonIdentity = {"pid": 27103, "start_time": 4300}
+        _ = self.cleanup_fixture(started=(daemon,))
+        self.daemon_fixture(daemon)
+        self.proc_process(28103, 9300, ["codex", "-m", "outside-model"], str(self.codex),
+                          self.codex / "bin/codex")
+        result = self.invoke("teardown")
+        self.assertEqual(result.code, 1, result.stderr)
+        self.assertIn("27103", result.stdout)
+        self.assertIn("shared", result.stdout)
+        self.assertNotIn(["27103"], self.calls())
+        self.assertNotIn(["28103"], self.calls())
+        self.assertTrue((self.root / "proc-fixture/27103").exists())
+        self.assertTrue((self.root / "proc-fixture/28103").exists())
+        self.assertFalse(self.scratch.exists())
+        result = self.invoke_cli("leftovers")
+        self.assertEqual(result.code, 1, result.stderr)
+        daemon_lines = [line for line in result.stdout.splitlines()
+                        if "daemon" in line and "27103" in line]
+        self.assertEqual(len(daemon_lines), 1, result.stdout)
+        self.assertIn("shared", daemon_lines[0])
+        self.assertNotIn("trial-started", daemon_lines[0])
+        self.assertNotIn(["27103"], self.calls())
+
+    def test_teardown_does_not_stop_a_reused_pid_with_a_different_start_time(self) -> None:
+        recorded: CodexDaemonIdentity = {"pid": 27104, "start_time": 4400}
+        _ = self.cleanup_fixture(started=(recorded,))
+        self.daemon_fixture({"pid": 27104, "start_time": 9900})
+        result = self.invoke("teardown")
+        self.assert_success(result)
+        self.assertNotIn(["27104"], self.calls())
+        self.assertTrue((self.root / "proc-fixture/27104").is_dir())
+        self.assertIn("27104", result.stdout)
+
+    def test_teardown_does_not_stop_a_recorded_pid_with_unreadable_identity(self) -> None:
+        daemon: CodexDaemonIdentity = {"pid": 27105, "start_time": 4500}
+        _ = self.cleanup_fixture(started=(daemon,))
+        self.daemon_fixture(daemon)
+        (self.root / "proc-fixture/27105/stat").unlink()
+        result = self.invoke("teardown")
+        self.assertEqual(result.code, 1, result.stderr)
+        self.assertNotIn(["27105"], self.calls())
+        self.assertTrue((self.root / "proc-fixture/27105").is_dir())
+        self.assertIn("27105", result.stdout)
+        self.assertIn("unreadable", result.stdout.casefold())
+
+    def test_teardown_does_not_stop_a_recorded_pid_when_its_command_or_account_changed(self) -> None:
+        first: CodexDaemonIdentity = {"pid": 27106, "start_time": 4600}
+        second: CodexDaemonIdentity = {"pid": 27107, "start_time": 4700}
+        missing: CodexDaemonIdentity = {"pid": 27108, "start_time": 4800}
+        _ = self.cleanup_fixture(started=(first, second, missing))
+        self.proc_process(27106, 4600, ["sleep", "3600"], str(self.codex), self.root / "bin/sleep")
+        self.proc_process(27107, 4700, ["codex", "app-server", "--managed-daemon"], str(self.root / "other-account"),
+                          self.root / "other-account/bin/codex")
+        self.assert_success(self.invoke("teardown"))
+        for pid in (27106, 27107, 27108):
+            self.assertNotIn([str(pid)], self.calls())
+        self.assertTrue((self.root / "proc-fixture/27106").is_dir())
+        self.assertTrue((self.root / "proc-fixture/27107").is_dir())
+
+    def test_leftovers_in_a_separate_invocation_uses_manifest_after_scratch_deletion(self) -> None:
+        daemon: CodexDaemonIdentity = {"pid": 27109, "start_time": 4900}
+        manifest = self.cleanup_fixture(started=(daemon,))
+        self.daemon_fixture(daemon)
+        self.proc_process(28109, 9400, ["codex", "-m", "outside-model"], str(self.codex),
+                          self.codex / "bin/codex")
+        result = self.invoke("teardown")
+        self.assertEqual(result.code, 1, result.stderr)
+        self.assertFalse(self.scratch.exists())
+        original_manifest = manifest.read_bytes()
+        self.configure(herdr_args("status", "server"), "status: not running\n")
+        for unit in ("herdr-trial-server", "herdr-trial-client", "fixture-extra.timer"):
+            self.configure(["--user", "is-active", unit], "inactive\n", code=3)
+        before = len(self.calls())
+        result = self.invoke_cli("leftovers")
+        self.assertEqual(result.code, 1, result.stderr)
+        self.assertIn("27109", result.stdout)
+        self.assertIn("shared", result.stdout)
+        self.assertNotIn("scratch " + str(self.scratch), result.stdout)
+        self.assertEqual(manifest.read_bytes(), original_manifest)
+        for call in self.calls()[before:]:
+            self.assertNotIn("stop", call)
+        self.assertFalse(self.scratch.exists())
+
+    def test_leftovers_names_each_surviving_runtime_resource(self) -> None:
+        shared: CodexDaemonIdentity = {"pid": 27110, "start_time": 5000}
+        owned: CodexDaemonIdentity = {"pid": 27111, "start_time": 5100}
+        _ = self.cleanup_fixture(before=(shared,), started=(owned,))
+        self.daemon_fixture(shared)
+        self.daemon_fixture(owned)
+        self.proc_process(28111, 9500, ["claude"], str(self.codex), self.root / "bin/claude")
+        (self.root / "proc-fixture/28111/cwd").symlink_to(self.scratch / "repo")
+        result = self.invoke("leftovers")
+        self.assertEqual(result.code, 1, result.stderr)
+        for resource in (
+            str(self.scratch), "herdr-trial-server", "herdr-trial-client", "fixture-extra.timer",
+            str(self.root / "notifier/showrunner-herdr-fake"),
+            str(self.root / "showrunner/herdr-fake"),
+            str(self.root / "herdr-config/sessions/herdr-trial"),
+            str(self.root / "herdr-config/sessions/herdr-devcheck"),
+            str(self.root / "herdr-config/.plugins.lock"),
+            str(self.root / "herdr-config/release-notes.json"), "w9", "28111",
+        ):
+            self.assertIn(resource, result.stdout)
+        lines = result.stdout.splitlines()
+        self.assertFalse(any("daemon" in line and "27110" in line for line in lines), result.stdout)
+        self.assertTrue(any("27111" in line and "trial-started" in line for line in lines))
+        self.assertTrue(self.scratch.exists())
+        self.assert_no_shutdown_input()
+        self.assertFalse(any("stop" in call or "close" in call for call in self.calls()))
+
+    def test_unreadable_process_shares_a_trial_daemon_only_when_owned_by_the_current_user(self) -> None:
+        daemon: CodexDaemonIdentity = {"pid": 27201, "start_time": 6201}
+        _ = self.cleanup_fixture(started=(daemon,))
+        self.daemon_fixture(daemon)
+        self.proc_process(28201, 9201, ["python", "outside-session"], "", self.root / "bin/python")
+        unreadable = self.root / "proc-fixture/28201"
+        (unreadable / "environ").unlink()
+        original_stat = Path.stat
+        owner_uid = os.getuid() + 1
+
+        def fixture_stat(path: Path, *, follow_symlinks: bool = True) -> os.stat_result:
+            actual = original_stat(path, follow_symlinks=follow_symlinks)
+            if path != unreadable:
+                return actual
+            return os.stat_result((actual.st_mode, actual.st_ino, actual.st_dev,
+                                   actual.st_nlink, owner_uid, actual.st_gid,
+                                   actual.st_size, actual.st_atime, actual.st_mtime, actual.st_ctime))
+
+        with patch.object(Path, "stat", fixture_stat):
+            result = self.invoke("leftovers")
+            self.assertEqual(result.code, 1, result.stderr)
+            daemon_lines = [line for line in result.stdout.splitlines()
+                            if line.startswith("codex daemon 27201 ")]
+            self.assertEqual(daemon_lines, ["codex daemon 27201 trial-started"], result.stdout)
+            self.assert_success(self.invoke("teardown"))
+            self.assertEqual(self.calls().count(["27201"]), 1)
+            self.assertFalse((self.root / "proc-fixture/27201").exists())
+            self.assertTrue(unreadable.is_dir())
+
+            # Replay the recorded daemon with a current-user inspection failure.
+            # It must be shared and retained, including on a cleanup retry.
+            self.daemon_fixture(daemon)
+            owner_uid = os.getuid()
+            result = self.invoke("leftovers")
+            self.assertEqual(result.code, 1, result.stderr)
+            daemon_lines = [line for line in result.stdout.splitlines()
+                            if line.startswith("codex daemon 27201 ")]
+            self.assertEqual(daemon_lines, ["codex daemon 27201 shared"], result.stdout)
+            result = self.invoke("teardown")
+            self.assertEqual(result.code, 1, result.stderr)
+            self.assertEqual(self.calls().count(["27201"]), 1,
+                             "current-user uncertainty must not cross the stop boundary")
+            self.assertTrue((self.root / "proc-fixture/27201").is_dir())
+        self.assert_no_shutdown_input()
+
+    def test_teardown_retains_a_recorded_delegate_mesh_server_without_signalling_it(self) -> None:
+        mesh: CodexDaemonIdentity = {"pid": 27203, "start_time": 6203}
+        _ = self.cleanup_fixture(started=(mesh,))
+        self.proc_process(mesh["pid"], mesh["start_time"],
+                          ["codex", "-c", "thread_unload_delay_secs=0", "app-server",
+                           "--listen", "ws://127.0.0.1:41003"],
+                          str(self.codex), self.codex / "bin/codex")
+        self.responses[str(mesh["pid"])] = {
+            "stdout": "", "code": 0,
+            "remove_paths": [str(self.root / "proc-fixture" / str(mesh["pid"]))],
+        }
+        result = self.invoke("teardown")
+        self.assert_success(result)
+        self.assertNotIn([str(mesh["pid"])], self.calls())
+        self.assertTrue((self.root / "proc-fixture" / str(mesh["pid"])).is_dir())
+        self.assertEqual(result.stdout.splitlines().count(
+            "process 27203: not a managed Codex daemon; retained"), 1, result.stdout)
+        self.assert_no_shutdown_input()
+
+    def test_leftovers_ignores_baseline_and_unrecorded_daemons_and_delegate_mesh_servers(self) -> None:
+        baseline: CodexDaemonIdentity = {"pid": 27204, "start_time": 6204}
+        unrecorded: CodexDaemonIdentity = {"pid": 27205, "start_time": 6205}
+        manifest = self.cleanup_fixture(before=(baseline,))
+        self.daemon_fixture(baseline)
+        self.daemon_fixture(unrecorded)
+        self.proc_process(27206, 6206, ["codex", "app-server", "--listen", "ws://127.0.0.1:41004"],
+                          str(self.codex), self.codex / "bin/codex")
+        # Publish the manifest and remove fixture trial resources; all remaining
+        # processes belong to sessions outside the trial.
+        _ = self.invoke("teardown")
+        self.assertTrue(manifest.is_file())
+        self.assertFalse(self.scratch.exists())
+        result = self.invoke_cli("leftovers")
+        self.assert_success(result)
+        self.assertFalse(any("daemon" in line for line in result.stdout.splitlines()), result.stdout)
+        for pid in (27204, 27205, 27206):
+            self.assertTrue((self.root / "proc-fixture" / str(pid)).is_dir())
+            self.assertNotIn([str(pid)], self.calls())
+        self.assert_no_shutdown_input()
+
+    def test_leftovers_succeeds_after_complete_cleanup_and_teardown_retry_is_safe(self) -> None:
+        manifest = self.cleanup_fixture()
+        self.assert_success(self.invoke("teardown"))
+        before = manifest.read_bytes()
+        self.assert_success(self.invoke_cli("leftovers"))
+        self.assert_success(self.invoke("teardown"))
+        self.assert_success(self.invoke_cli("leftovers"))
+        self.assertEqual(manifest.read_bytes(), before)
+        self.assertFalse(self.scratch.exists())
+        self.assertFalse((self.root / "herdr-config").exists())
+        self.assert_no_shutdown_input()
+
+    def test_teardown_and_leftovers_report_retained_trust_grants_without_editing_configs(self) -> None:
+        _ = self.cleanup_fixture()
+        repo = self.scratch / "repo"
+        self.trust_configs({str(repo): True}, {str(repo): "trusted"})
+        with (self.codex / "config.toml").open("a") as output:
+            _ = output.write('[hooks]\ntrust = "all"\n')
+        files = [self.claude / ".claude.json", self.codex / "config.toml"]
+        original = [file.read_bytes() for file in files]
+        for command in ("teardown", "leftovers"):
+            result = self.invoke(command)
+            self.assert_success(result)
+            for text in ("Claude", "Codex", "hooks", str(repo), str(self.claude), str(self.codex)):
+                self.assertIn(text, result.stdout)
+            self.assertEqual([file.read_bytes() for file in files], original)
+
+    def test_teardown_retains_scratch_and_manifest_when_a_recorded_unit_cannot_stop(self) -> None:
+        manifest = self.cleanup_fixture()
+        self.configure(["--user", "stop", "herdr-trial-client"], code=1,
+                       stderr="fixture stop denied\n")
+        result = self.invoke("teardown")
+        self.assertEqual(result.code, 1, result.stderr)
+        self.assertTrue(self.scratch.exists(), "a failed stop must keep cleanup evidence")
+        self.assertTrue((self.scratch / "started.json").exists())
+        self.assertTrue(manifest.is_file())
+        self.assertIn("herdr-trial-client", result.stderr + result.stdout)
+        self.assert_no_shutdown_input()
 
     def test_usage_errors_are_single_lines_and_have_no_effects(self) -> None:
         for arguments in ([], ["unknown"], ["server"], ["client", "bad"],
