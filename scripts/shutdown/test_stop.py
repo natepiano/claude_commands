@@ -15,7 +15,7 @@ from contextlib import redirect_stdout
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from collections.abc import Callable
-from typing import cast, final, override
+from typing import Literal, cast, final, override
 from unittest.mock import patch
 
 from test_support import ShutdownTestCase
@@ -140,6 +140,7 @@ def unit(
     pid: int,
     *,
     tmux_session: str | None = None,
+    session_host: Literal["tmux", "herdr"] = "tmux",
     run_dirs: list[str] | None = None,
     codex_servers: list[inventory.CodexServer] | None = None,
 ) -> inventory.UnitSession:
@@ -157,7 +158,8 @@ def unit(
             production="demo",
             unit=session_id,
             doc="/tmp/demo.md",
-            tmux_session=tmux_session or f"tmux-{session_id}",
+            session_name=tmux_session or f"tmux-{session_id}",
+            session_host=session_host,
             plan=inventory.NoRunRecord(kind="no run record"),
         ),
     )
@@ -474,6 +476,30 @@ class StopTests(ShutdownTestCase):
         self.assertEqual(codex_calls, [['stop', '--session-dir', run_dir]])
         self.assertEqual(tmux_calls, [['kill-session', '-t', '=exact-unit-pane'], ['has-session', '-t', '=exact-unit-pane']])
         self.assertNotEqual(report['progress']['kind'], 'stopping')
+
+    def test_herdr_unit_stop_never_touches_tmux_or_records_a_tmux_issue(self) -> None:
+        for state in ("present", "absent", "identity lost"):
+            with self.subTest(state=state):
+                owner = unit(f"herdr-{state}", 101, tmux_session="same-name-as-tmux", session_host="herdr")
+                self.create([entry(owner)])
+                current = (unit(owner["session_id"], 202, session_host="herdr")
+                           if state == "identity lost" else owner)
+                tmux_calls: list[list[str]] = []
+                saved = record.find_session(LOGIN, owner["session_id"])
+                self.assertIsNotNone(saved)
+                if saved is None:
+                    self.fail("herdr unit record was not created")
+                report = stop.stop_session(saved,
+                    kill=lambda _pid, _signal: None, is_alive=lambda _pid: state == "identity lost",
+                    fresh_inventory=lambda _login, _scope: machine_inventory([] if state == "absent" else [current]),
+                    clock=lambda: NOW_UTC, codex_mesh=lambda _args: 0,
+                    tmux=lambda arguments: tmux_calls.append(arguments) or 0,
+                    sleep=lambda _seconds: None, session_record_exists=lambda _pid: False)
+                self.assertEqual(tmux_calls, [])
+                self.assertEqual(report["stop_issues"], [])
+                self.assertEqual(report["progress"]["kind"], {
+                    "present": "stopped", "absent": "already gone", "identity lost": "process identity lost",
+                }[state])
 
     def test_process_identity_changed_before_first_signal_is_left_running(self) -> None:
         run_dir = str(self.root / 'run')

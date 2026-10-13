@@ -105,7 +105,7 @@ Evidence: `docs/as-built/herdr-trial.md` (findings 1–8, gotchas, reusable and 
 
 **Ruled out:** a store-path fallback in `herdr_binary` — a garbage-collected path fails late.
 
-### Phase 2 — Unit lookup, roster and shutdown inventory see herdr sessions  · status: todo
+### Phase 2 — Unit lookup, roster and shutdown inventory see herdr sessions  · status: done
 
 **User sees:** before — a Claude unit in herdr reads `session: gone` in `production_lifecycle.py load`, `freestanding` in the roster, is missed by `waiting.py quota`, and shows as an unknown host in `/shutdown`; after — all four list herdr-hosted units and sessions correctly, while tmux units read as before.
 
@@ -128,7 +128,7 @@ Evidence: `docs/as-built/herdr-trial.md` (findings 1–8, gotchas, reusable and 
    - `_host`: after the unit branch, `TMUX_PANE` as now; else `herdr.herdr_place_of(pid)` gives a `HerdrHost`; else the window and terminal branches as now.
    - `_unit_sessions` uses `marked_unit.label` for `session_name` for both hosts.
 4. `scripts/shutdown/record.py` and `scripts/shutdown/shutdown.py`: parse and print `HerdrHost` (`herdr <session>`); `restart.py` and `stop.py` treat a `herdr` host as a manual restart with its printed command until Phase 5 (one `case "herdr"` each).
-5. `scripts/production/waiting.py` is not changed; a test proves `quota` reaches a herdr unit.
+5. `scripts/production/waiting.py` is not changed; a test proves `quota` reaches a herdr unit. **Moved to Phase 5:** `test_waiting.py` is held by two-accounts Phase 14, and Phases 3 and 4 wait on this phase's merge.
 6. `pyrightconfig.json`: add `scripts/herdr` to `extraPaths` of the `scripts/production`, `scripts/message` and `scripts/shutdown` environments. Each importer inserts `scripts/herdr` on `sys.path` as `unit_lookup.py` does for `scripts/message`.
 
 **Files:**
@@ -280,6 +280,7 @@ Evidence: `docs/as-built/herdr-trial.md` (findings 1–8, gotchas, reusable and 
    - `case "herdr"` in the host dispatch calls it; the Phase 2 manual-restart stand-in is removed.
 3. `settle.py` issue text and `shutdown.py` host text cover the herdr forms. `commands/shutdown.md` line 33 names herdr sessions beside tmux sessions.
 4. Live check (not a test): a throwaway Claude in herdr session `herdr-stopcheck` in a trusted scratch folder; `shutdown.py down <account> --here --only herdr-stopcheck --restart`; it stops, comes back in `herdr-stopcheck` and answers a question about its earlier turn. Then stop the herdr server by hand (`herdr --session herdr-stopcheck server stop`), and confirm `claude --resume <id>` in a new herdr session restores the conversation without herdr's Claude integration. Stop and delete the session.
+5. Carried from Phase 2, once the showrunner says two-accounts Phase 14 landed (merge `origin/build-followups` first): `scripts/production/test_waiting.py` proves `waiting.py quota` reaches a herdr unit; `waiting.py` itself is not changed.
 
 **Decided by the showrunner, 2026-10-13: no herdr Claude integration.** Resume by session id works, and the install would write `~/.claude` settings and hooks. The record below keeps the reasoning.
 
@@ -298,6 +299,7 @@ Recommendation:
 Do not install the integration. Our own records already resume every session, and the install changes hooks and settings for every session on the machine.
 
 **Files:**
+- `scripts/production/test_waiting.py` — quota reaches a herdr unit (carried from Phase 2).
 - `scripts/shutdown/stop.py` — herdr unit stop.
 - `scripts/shutdown/record.py` — generalized issue kind, old form parsed.
 - `scripts/shutdown/restart.py` — `_herdr_launch`, `--host-session`.

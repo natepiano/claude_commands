@@ -14,6 +14,7 @@ from unittest import mock
 
 import fake_tmux
 import unit_lookup
+import herdr
 from fake_tmux import FakeSession
 from unit_lookup import ClaudeNotRunning, ClaudeUnknown, LiveClaude, UnitState
 
@@ -39,8 +40,31 @@ class UnitLookupTests(unittest.TestCase):
         self.records.mkdir()
         self.environment = {**os.environ, "FAKE_TMUX_STATE": str(self.state), "UNIT_LOOKUP_TMUX": FAKE,
                             "NOTIFIER_SESSIONS_DIR": str(self.records),
-                            "PLAN_DELEGATE_HISTORY_DIR": str(self.root / "history")}
+                            "PLAN_DELEGATE_HISTORY_DIR": str(self.root / "history"),
+                            "HERDR_BIN": str(SCRIPT.parents[1] / "herdr/fake_herdr.py"),
+                            "HERDR_PROC": str(self.root / "proc"),
+                            "FAKE_HERDR_LOG": str(self.root / "herdr.jsonl"),
+                            "FAKE_HERDR_RESPONSES": str(self.root / "herdr-responses.json")}
+        _ = (self.root / "herdr-responses.json").write_text(json.dumps({"default": {"stdout": "", "code": 1}}))
         self.enterContext(mock.patch.dict(os.environ, self.environment))
+
+    def process(self, pid: int, parent: int, argv: list[str], **environment: str) -> None:
+        directory = self.root / "proc" / str(pid)
+        directory.mkdir(parents=True, exist_ok=True)
+        _ = (directory / "stat").write_text(f"{pid} (fixture) S {parent} 0 0")
+        _ = (directory / "cmdline").write_bytes(("\0".join(argv) + "\0").encode())
+        _ = (directory / "environ").write_bytes("\0".join(f"{key}={value}" for key, value in environment.items()).encode())
+        (directory / "cwd").symlink_to(self.root)
+
+    def herdr_session(self, name: str = "native", pane: str = "w1:p1", unit: str = "trunk-unit") -> None:
+        _ = (self.root / "herdr-responses.json").write_text(json.dumps({
+            "--session default session list --json": {"code": 0, "stdout": json.dumps({"sessions": [{
+                "name": name, "running": True, "default": False, "session_dir": "/fixture", "socket_path": "/fixture/sock"
+            }]})}
+        }))
+        self.process(991000, 0, ["herdr", "--session", name, "server"])
+        self.process(os.getpid(), 991000, ["claude"], HERDR_PANE_ID=pane,
+                     SHOWRUNNER_UNIT="show", SHOWRUNNER_UNIT_ID=unit)
 
     def claude(self, name: str, pane: str, *, updated: int = 1, session_id: str = "") -> None:
         """Record a live Claude in `pane`: this test process stands in for it."""
@@ -50,7 +74,7 @@ class UnitLookupTests(unittest.TestCase):
         self.addCleanup(held.close)
         _ = (self.records / f"{name}-{updated}.json").write_text(json.dumps({
             "pid": os.getpid(), "sessionId": session_id or f"id-{name}", "name": name,
-            "messagingSocketPath": str(path), "updatedAt": updated, "tmux": f"label-at-start:@1.{pane}"}))
+            "messagingSocketPath": str(path), "updatedAt": updated, "tmux": f"label-at-start:@1.{pane}" if pane else ""}))
 
     def run_script(self, *arguments: str, pane: str = "") -> subprocess.CompletedProcess[str]:
         environment = {**self.environment, "TMUX_PANE": pane}
@@ -143,6 +167,72 @@ class UnitLookupTests(unittest.TestCase):
         self.assertEqual(list(unit_lookup.marked_units("show")), ["trunk-unit"])
         # A state is not something to set: the command that set one is gone.
         self.assertEqual(self.run_script("state", "show", "trunk-unit", "run-finished").returncode, 2)
+
+    def test_a_herdr_unit_joins_its_newest_live_claude_and_deduplicates_processes(self) -> None:
+        self.herdr_session()
+        self.process(991001, 991000, ["zsh"], HERDR_PANE_ID="w1:p1",
+                     SHOWRUNNER_UNIT="show", SHOWRUNNER_UNIT_ID="trunk-unit")
+        self.claude("old", "", updated=1)
+        self.claude("current", "", updated=2)
+        found = unit_lookup.marked_units("show")
+        self.assertEqual(list(found), ["trunk-unit"])
+        unit = found["trunk-unit"]
+        self.assertEqual((unit.pane, unit.label, unit.place), ("", "native", herdr.HerdrPlace("native", "w1:p1")))
+        assert isinstance(unit.claude, LiveClaude)
+        self.assertEqual(unit.claude.name, "current")
+        self.assertEqual(self.run_script("pane", "show", "trunk-unit").stdout, "herdr:native:w1:p1\n")
+        self.assertEqual(self.run_script("list", "show").stdout.split("\t")[:4],
+                         ["trunk-unit", "herdr:native:w1:p1", "native", "live"])
+
+    def test_a_herdr_unit_without_a_live_record_is_stopped_or_unknown(self) -> None:
+        self.herdr_session()
+        self.assertIsInstance(unit_lookup.marked_units("show")["trunk-unit"].claude, ClaudeNotRunning)
+        _ = (self.records / "broken.json").write_text("{")
+        self.assertIsInstance(unit_lookup.marked_units("show")["trunk-unit"].claude, ClaudeUnknown)
+
+    def test_pane_keeps_tmux_targets_bare_and_identifies_herdr_targets(self) -> None:
+        fake_tmux.write(self.state, {"$1": marked("trunk", "%41", "trunk-unit")})
+        self.herdr_session(unit="native-unit")
+        tmux = self.run_script("pane", "show", "trunk-unit")
+        native = self.run_script("pane", "show", "native-unit")
+        self.assertEqual((tmux.returncode, tmux.stdout), (0, "%41\n"))
+        self.assertEqual((native.returncode, native.stdout), (0, "herdr:native:w1:p1\n"))
+
+    def test_excluding_tmux_reads_herdr_without_resolving_tmux(self) -> None:
+        self.herdr_session()
+        with mock.patch.object(unit_lookup, "tmux_binary", side_effect=AssertionError("tmux must be skipped")) as resolver:
+            found = unit_lookup.every_marked_unit(include_tmux=False)
+        resolver.assert_not_called()
+        self.assertEqual(list(found.units["show"]), ["trunk-unit"])
+        self.assertEqual(found.faults, {})
+
+    def test_excluding_tmux_reports_only_an_unreadable_herdr_source(self) -> None:
+        with mock.patch.object(unit_lookup, "tmux_binary", side_effect=AssertionError("tmux must be skipped")) as resolver, \
+                self.assertRaises(OSError) as refused:
+            _ = unit_lookup.every_marked_unit(include_tmux=False)
+        resolver.assert_not_called()
+        self.assertNotIn("tmux", str(refused.exception))
+
+    def test_herdr_units_are_found_without_a_tmux_binary(self) -> None:
+        self.herdr_session()
+        with mock.patch.dict(os.environ, {"UNIT_LOOKUP_TMUX": str(self.root / "missing-tmux")}):
+            self.assertEqual(list(unit_lookup.marked_units("show")), ["trunk-unit"])
+
+    def test_an_empty_herdr_answer_is_enough_when_tmux_cannot_answer(self) -> None:
+        _ = (self.root / "herdr-responses.json").write_text(json.dumps({"default": {"code": 0, "stdout": '{"sessions": []}'}}))
+        with mock.patch.dict(os.environ, {"UNIT_LOOKUP_TMUX": str(self.root / "missing-tmux")}):
+            self.assertEqual(unit_lookup.marked_units("show"), {})
+
+    def test_marks_in_both_hosts_are_a_fault(self) -> None:
+        self.herdr_session()
+        fake_tmux.write(self.state, {"$1": marked("trunk", "%4", "trunk-unit")})
+        with self.assertRaisesRegex(OSError, "tmux session trunk and herdr session native both carry the mark of trunk-unit"):
+            _ = unit_lookup.marked_units("show")
+
+    def test_a_tmux_place_is_kept_for_existing_unit_constructors(self) -> None:
+        unit = unit_lookup.MarkedUnit("u", "%41", "label", ClaudeNotRunning())
+        self.assertEqual(unit.place, unit_lookup.TmuxPlace("%41"))
+        self.assertEqual(unit_lookup.place_text(unit.place), "%41")
 
     def record(self, name: str, worktree: Path, started: float, *later: str) -> Path:
         """Write the record of a /unit:direct run in `worktree`, as the recorder would."""
