@@ -180,21 +180,14 @@ Showrunner's brief and approval, 2026-10-13 10:3x–10:4x EDT (not the user's wo
 
 ### Phase 6 — Tear down the trial and close the findings  · status: done
 
-#### Work Order
+#### As-built
 
-**Goal:** Nothing from the trial is left running or on disk, and the as-built records how it ended.
-
-**Spec:**
-- Starts only when the user says they are done with the trial; until then the herdr session, its window, the 10 agents and the scratch production stay up.
-- The unit director runs `trial.py teardown`, then `trial.py leftovers` until it exits 0, from the complete worktree.
-- Fill the `docs/as-built/herdr-trial.md` Status with the teardown result, the leftovers output and the retained grants; include the archived `issues.jsonl` path in the checkpoint notice, then delete `~/.local/state/herdr-trial/`.
-- Delete `scripts/herdr/` unless the as-built names a reason to keep it; record the call in the as-built.
+- The user ended the trial at 15:13 EDT. `trial.py teardown` exited 0: it closed workspaces `w8` and `w9` without sending input, stopped the herdr server and both units, removed the scratch tree, the fake showrunner's notifier and showrunner state, and herdr's `herdr-trial` and `herdr-devcheck` session state. It named the five delegate mesh servers as not managed daemons and left them running. `trial.py leftovers` then exited 0.
+- `~/.local/state/herdr-trial/` was deleted after the checkpoint notice; the 20 issues live in `docs/as-built/herdr-trial.md`.
+- New finding, measured before teardown: herdr 0.9.0 windows keep their own view. `agent focus` moves herdr's recorded focus but no attached window, and a new attach does not open on it. Showing one unit by command needs one herdr session per unit.
+- `scripts/herdr/` is kept: the user is moving productions and standalone sessions to herdr, and its helpers are the tested starting point.
 
 **Files:**
-- `docs/as-built/herdr-trial.md` — Status filled
-- `scripts/herdr/trial.py`, `scripts/herdr/test_trial.py`, `scripts/herdr/fake_herdr.py` — deleted unless the as-built keeps them
+- `docs/as-built/herdr-trial.md` — Status filled; the "Showing one unit" finding added
 
-**Seats:** none — the unit director runs it.
-
-**Constraints from prior phases:**
-- Phase 5's teardown stops only a managed Codex daemon (`--managed-daemon`) it recorded as started; the live `started.json` lists five delegate mesh servers as started, which teardown retains and never signals. Two minor edges remain (one outside-client scan before all stops; any `app-server` argv token hides an outside client); neither can stop anything in this trial.
+**Ruled out:** a `herdr-show` command over one shared session (no CLI, API or config way to choose an attached window's tab).
