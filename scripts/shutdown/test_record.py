@@ -802,6 +802,34 @@ class SessionRecordTests(ShutdownTestCase):
                     self.assertEqual(record.stop_incomplete(saved), kind == "stop failed" or (
                         issues and kind in {"stopped", "already gone", "process identity lost"}))
 
+    def test_usage_limit_progress_and_not_ready_issue_round_trip(self) -> None:
+        held = record.SessionHeldByUsageLimit(kind="held by usage limit", at=NOW)
+        saved = session_shutdown(progress=held)
+        saved["stop_issues"] = [record.NotReadyToStop(kind="not ready to stop", at=NOW,
+            status="idle", progress="held by usage limit")]
+        self.assertTrue(record.create_session(saved))
+        self.assertEqual(record.find_session(saved["login"], "session-1"), saved)
+        self.assertEqual(record.parse_session_records(json.dumps([saved])), [saved])
+        restarting = session_shutdown(number=2, progress=record.SessionRestarting(
+            kind="restarting", at=LATER, prior=held))
+        self.assertEqual(record.parse_session_records(json.dumps([restarting])), [restarting])
+        old = shutdown_record(progress=record.SessionReadyToStop(kind="ready", at=NOW))
+        write_old(old)
+        self.assertEqual(record.find_session(saved["login"], "session-1"), saved)
+        record.archive_session(saved["login"], "session-1")
+        legacy = record.find_session(saved["login"], "session-1")
+        assert legacy is not None
+        self.assertEqual(legacy["progress"], {"kind": "ready", "at": NOW})
+
+    def test_withdraw_session_takes_usage_limit_held_owner_out(self) -> None:
+        saved = session_shutdown(progress=record.SessionHeldByUsageLimit(kind="held by usage limit", at=NOW))
+        self.assertTrue(record.create_session(saved))
+        restore = Mock()
+        result = record.withdraw_session(saved["login"], "session-1", restore)
+        self.assertIsInstance(result, record.SessionWithdrawn)
+        restore.assert_called_once_with(saved)
+        self.assertIsNone(record.find_session(saved["login"], "session-1"))
+
     def test_withdraw_session_keeps_a_stop_claim_and_does_not_restore_timers(self) -> None:
         saved = session_shutdown(progress=record.SessionStopping(kind="stopping", at=NOW))
         self.assertTrue(record.create_session(saved))

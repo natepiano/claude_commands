@@ -93,7 +93,7 @@ class NotReadyToStop(TypedDict):
     kind: Literal["not ready to stop"]
     at: str
     status: str
-    progress: Literal["waiting", "ready", "passive seat ready"]
+    progress: Literal["waiting", "ready", "held by usage limit", "passive seat ready"]
 
 
 class StillRunningAfterStop(TypedDict):
@@ -208,6 +208,11 @@ class SessionReadyToStop(TypedDict):
     at: str
 
 
+class SessionHeldByUsageLimit(TypedDict):
+    kind: Literal["held by usage limit"]
+    at: str
+
+
 class _LegacyPassiveSeatReady(TypedDict):
     kind: Literal["passive seat ready"]
     at: str
@@ -280,6 +285,7 @@ class SessionNeedsManualRestart(TypedDict):
 SessionRestartPrior = (
     SessionWaiting
     | SessionReadyToStop
+    | SessionHeldByUsageLimit
     | SessionStopped
     | SessionStopping
     | SessionAlreadyGone
@@ -400,6 +406,7 @@ _RECORD_STATES = frozenset(
 _PROGRESS_WITH_TIME = frozenset(
     {
         "ready",
+        "held by usage limit",
         "passive seat ready",
         "stopped",
         "stopping",
@@ -651,7 +658,7 @@ def _session_stop_issue(value: object, place: str, *, legacy: bool = False) -> S
         progress = _string(
             _required(values, "progress", place), f"{place}.progress"
         )
-        if progress not in {"waiting", "ready", "passive seat ready"}:
+        if progress not in {"waiting", "ready", "held by usage limit", "passive seat ready"}:
             raise InvalidRecord(f"{place}.progress is invalid")
     elif kind == "still running":
         _ = _string(_required(values, "reason", place), f"{place}.reason")
@@ -1402,7 +1409,7 @@ def _withdraw_session(
         if saved["session"]["session_id"] != session_id:
             raise InvalidRecord(f"{path} is used by a different session id")
         progress = saved["progress"]["kind"]
-        if progress not in {"waiting", "ready"} and not (
+        if progress not in {"waiting", "ready", "held by usage limit"} and not (
             progress == "stop failed" and identity_check(saved)
         ):
             return SessionRetained(saved)

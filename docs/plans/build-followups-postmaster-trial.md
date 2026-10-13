@@ -140,7 +140,7 @@ The user, 2026-10-12: "Let's trial post master to see if it works". Scope is sec
 
 **Ruled out:** `$.clock.every` (not measured live); pacing sends in the mod; a sweep in the mod (it has no remove or rename); any file rewritten whole as it grows.
 
-### Phase 4 — Shutdown stops a session held by a usage limit without waiting for it  · status: todo
+### Phase 4 — Shutdown stops a session held by a usage limit without waiting for it  · status: done
 
 #### Work Order
 
