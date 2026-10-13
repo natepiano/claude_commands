@@ -351,46 +351,40 @@ The store is at `PRAGMA user_version` 6 (`STORE_VERSION`) and holds what the wor
 
 ### Phase 12 — A Codex request is keyed by its session file too · status: done
 
-#### Work Order
+#### As-built
 
-**Goal:** Two session files of one Codex thread never share a key, so a request or an edit in a later file is stored and not dropped because an earlier file used the same byte offset.
-
-**Spec:**
-- The defect. `CodexContext.consume` in `scripts/usage/collect.py` gives a Codex request the key `str(offset)`, its byte offset inside one session file, and gives an edit the same. The `turns` key is `(machine, family, parent_id, agent_id, turn_key)`, the `edits` key is `(machine, family, parent_id, agent_id, edit_key)`, and `save_measurement` stores both with `INSERT OR IGNORE`. A thread can have more than one session file: a reset starts a new file under the same thread id. A request or an edit in the second file, at an offset the first file also used, is dropped and nothing says so. Measured on natedev 2026-10-12: 218 Codex threads since 10-10, 2 with more than one file, no collision yet; a review pool that resets its reviewer before every check makes a new file each time.
-- The repair. A Codex `turn_key` and `edit_key` become `<session file name>:<offset>`. The file name is the last component of the session file's path, so it is the same on the machine that wrote the file and on a machine that reads it remotely. The offset stays the number it is today.
-- `read_file` gives the Codex context its file's name, `path.name`, on this machine and on the Mac. The remote read carries a Codex edit key as text: `measurement_record`, which converts it with `int(value.key)` today, sends it as text, and `remote_measurement`, which requires an integer today, validates it as text.
-- No stored row is given a new key and nothing is migrated. No usage store exists on natedev or on the Mac (checked 2026-10-12; the collector's timer first runs at the user's rebuild), so the first live run builds its store with the new keys. With one key form, a file read a second time from its start stores nothing twice: the same event gets the same key.
-- `STORE_VERSION` becomes 8, the first version whose Codex keys carry the file name; that first version is a named constant. A store stamped with a version from 1 through 7 holds Codex rows under bare offsets, and reading its files again would store each of them a second time, so `migrate_store` refuses it: it raises a named error that carries the store's version, and the store keeps its version, its rows and its cursors. The collector's entry point prints one line to stderr, `collect: store version <n> predates file-named Codex keys; delete <db path> and run the collector again to rebuild it`, and exits 1. A store never stamped (version 0) is stamped 8 as today, and the existing step that deletes the cursors when the version rises stays for later versions.
-- `usage_report.check_store_version` reads `collect.STORE_VERSION` and does not change.
-- Claude rows are untouched: their keys come from `claude_turn_key`.
-- Types follow the Type Design Contract: the key is built in one place, by one named function or type, and a Codex context cannot be built without its file name. No optional file name. The refusal is a named error type, not a bare string and not a `None` return.
-- Done when the tests below pass.
+- A Codex request's `turn_key` and a Codex edit's `edit_key` are `<session file name>:<byte offset>`. `codex_key(file_name: str, offset: int) -> str` in `scripts/usage/collect.py` is the one place the key is built. `CodexContext(machine, file_name)` has no default for the file name, so a context cannot be built without one, and no optional file name exists. `read_file` passes `path.name`, the last path component, on this machine and in the reader that runs on the Mac.
+- Two session files of one thread that reach the same byte offset each keep their rows. A file read again from its start, or moved to another directory under the same name, produces the same keys, so `save_measurement`'s `INSERT OR IGNORE` stores nothing twice. A Claude request's key still comes from `claude_turn_key`.
+- `FILE_NAMED_CODEX_KEYS_VERSION = 8` names the first store version whose Codex keys carry the file name, and `STORE_VERSION` equals it. `migrate_store(db)` deletes the cursors of a new store, or of a store never stamped (version 0), and stamps it 8.
+- `check_store_key_version(db) -> int` returns the store's version, or raises `StorePredatesFileNamedCodexKeys`, which carries `version`, for a store stamped 1 through 7. Such a store holds Codex rows under bare offsets, and reading its files again would store each one a second time. `collect_pass` calls the check before its first write, ahead of `PRAGMA journal_mode=WAL` and the schema script, and before any local or Mac source is read. `migrate_store(db)` calls it too. `main` prints `collect: store version <n> predates file-named Codex keys; delete <db path> and run the collector again to rebuild it` on stderr and returns 1. The refused store's file bytes, journal mode, tables, version, rows and cursors are what they were.
+- The reader that runs on the Mac sends an edit's key as text (`measurement_record`), and `remote_measurement` reads it with `remote_string`, for Claude and Codex alike. No code in `scripts/usage`, `scripts/whoami` or `scripts/model_study` reads a key as a number.
 
 **Files:**
-- `scripts/usage/collect.py` — the Codex key, the remote edit key as text, the store version and the refusal of an older store.
-- `scripts/usage/test_collect.py` — the repair's tests.
-- `scripts/usage/test_outcomes.py` — only where it states a Codex key or a store version.
-- `scripts/usage/test_usage_report.py` — only where it states a store version.
-- `scripts/whoami/test_seat_usage.py` — only where it states a Codex key.
+- `scripts/usage/collect.py` — the key, the version constant, the refusal, the remote edit key as text.
+- `scripts/usage/test_collect.py` — 84 tests, eight of them new and one renamed for the new key form: requests and edits at matching offsets, repeated and replayed reads and a moved file, the refusals, the stamp of a new store, the Claude key, the remote text keys.
+- `scripts/usage/test_outcomes.py` — 46 tests. The two that stamp a store 6 pin the refusal: no folder or turn is read again, and the Mac is not read.
+- `scripts/usage/test_usage_report.py` — 35 tests. The version tests build the refusal text from `collect.STORE_VERSION`, for one version below it and one above. `fixtures/report/expected/store-version-6.txt` and `store-version-8.txt` are removed.
 
-**Seats:** `1 writer + 1 tester`.
-- `impl` — `scripts/usage/collect.py`.
-- `test` — `scripts/usage/test_collect.py`, `scripts/usage/test_outcomes.py`, `scripts/usage/test_usage_report.py`, `scripts/whoami/test_seat_usage.py`, from this Spec alone, on stores and session files the tests build in a temporary directory. The first two tests below fail on the code before the repair. The tests pin:
-  - two session files of one thread, each with a request at one byte offset: both requests are stored, under different keys;
-  - the same for two edits at one byte offset;
-  - a stored Codex key is `<file name>:<offset>`, with the last path component only, whatever directory the file is read from;
-  - one file read twice, the second time from its cursor, stores each request once;
-  - one file read again from its start after its cursor is removed, and a file moved to another directory under the same name and read again: nothing is stored twice and the token totals are what they were;
-  - through the fixture SSH read of the Mac: requests and edits from two session files at matching offsets are all stored, under text keys;
-  - a store stamped 7, and one stamped 1: the collector exits 1 with the line above on stderr, and the store's version, rows and cursors are what they were;
-  - a new store is stamped 8;
-  - an existing test that stamps a store 6 and expects it read again now pins the refusal; the reading again after a version rise stays covered by the tests that reset the stamp to 0;
-  - in `test_usage_report.py`, the older and the newer version the report refuses are stated from `collect.STORE_VERSION`, not as the numbers 6 and 8;
-  - a Claude request's key is what it was.
+**State and consequence:**
+- The refusal of a store stamped 1 through 7, a new outcome: `check_store_key_version` produces it on every pass over such a store until the store is deleted. Whoever runs the collector sees exit 1 and the one stderr line, which says what to do. Tests: `test_offset_key_store_versions_are_refused_without_changing_rows_or_cursors`, `test_legacy_store_refusal_preserves_bytes_journal_and_schema`, and in `test_outcomes.py` `test_version_six_store_is_refused_without_replaying_folders_or_turns` and `test_version_six_mac_store_is_refused_without_reading_remote_sources`.
+- The key form `<session file name>:<byte offset>`, a changed stored value: the collector writes it, and every reader takes a key as text. Tests: `test_two_session_files_keep_requests_at_the_same_byte_offset`, `test_two_session_files_keep_edits_at_the_same_byte_offset`, `test_codex_turn_keys_use_the_file_name_and_byte_offset`, `test_repeated_cursor_reads_replayed_files_and_relocation_keep_each_event_once`.
+- The remote reader's edit key as text, a changed value on the wire between the collector and the reader it sends to the Mac: nothing else reads it. Test: `test_remote_session_files_keep_matching_request_and_edit_offsets_as_text_keys`.
 
-**Constraints from prior phases:** Work only in the worktree `/home/natepiano/worktrees/claude-build-followups-model-study`, branch `build-followups-model-study`. In `scripts/usage/collect.py`, `CodexContext.consume(self, line, offset)` builds `Turn(self.agent, str(offset), …)` and `Edit(self.agent, str(offset), at)`; `read_file(machine, path, family, …)` builds `CodexContext(machine)`; `save_measurement` uses `INSERT OR IGNORE` for `turns`, `edits` and `compactions`; the `cursors` table is keyed `(machine, path)` and holds the offset each file has been read to. `STORE_VERSION` is 7; `migrate_store(db)` deletes the cursors and stamps the version when the stored version is lower; `collect_pass` runs `SCHEMA` and then `migrate_store(db)`; the entry point catches `OSError` and `sqlite3.Error`, prints a `collect: …` line to stderr and returns 1. Another unit's trial report builds stores through `SCHEMA`, `migrate_store`, `read_file`, `save_measurement` and `RoleResolver`, calls `migrate_store(db)` on a new store, and reads the tables `openings`, `folders`, `turns`, `compactions` and `turn_sources` through `usage_report.open_read_store`: this phase renames or removes none of those names, tables or columns, `migrate_store` keeps its one parameter, and a new parameter of `read_file` or `save_measurement` is not needed. Codex gives each session file a name of the form `rollout-<date-time>-<id>.jsonl` with an id of its own: on natedev on 2026-10-12, 2,481 session files had 2,481 distinct names and no id appeared in two names, so the last path component identifies a file wherever it is moved. `measurement_record` and `remote_measurement` are the only code in `scripts/usage`, `scripts/whoami` and `scripts/model_study` that reads a key as a number; nothing orders by one. Tests never write to the real `~/.local/state/usage-model/`; a seat never runs the collector against the real session directories or the real Mac.
+**Deviations:** the refusal check is its own function, called before the collector's first write as well as from `migrate_store`: the journal-mode change and the schema script both write to the store file, so a check inside `migrate_store` alone comes after them. The usage report's version tests read no fixture file.
 
-**Acceptance gate:** `python3 -m unittest scripts.usage.test_collect scripts.usage.test_outcomes scripts.usage.test_usage_report scripts.whoami.test_seat_usage` green from the repo root; basedpyright 0/0/0 on `scripts/usage` and `scripts/whoami/test_seat_usage.py`. Live, by the unit director, into a new store in a scratch directory: after one collection pass over natedev's session files the store is compared with the requests and edits counted straight from those files: each is stored once, every Codex key has the file-name form, and a second pass changes neither a count nor a token total.
+**Binds later work:**
+- "What seat compactions cost, and a limit chosen by replay" orders requests by `(at, turn_key)`. A Codex `turn_key` is text of the form `<session file name>:<byte offset>`: it is compared as text, and no number is read out of it. No store holds a bare-offset Codex key, because a store stamped 1 through 7 is refused.
+- `migrate_store(db)` keeps its one parameter, and `SCHEMA`, `read_file`, `save_measurement` and the store's tables and columns are unchanged, so a caller that builds its own store through them gets a store stamped 8. `usage_report.check_store_version` still reads `collect.STORE_VERSION`, so the report accepts only a store stamped 8.
+- A store for a later live run, the one for "Weights for gpt-6-sol and gpt-6-astra" included, is built by this code: a store stamped by older code is refused, not read again.
+
+**Gotchas:**
+- `check_store_key_version` stays ahead of every statement in `collect_pass` that changes the store. A step placed above it writes to a store that is then refused. `main` takes the pass lock before the check, so `<db path>.lock` is still created beside a refused store.
+- A refusal test starts from a store the collector would not create: another journal mode, a missing table. A store with the current schema in WAL mode cannot show a write made before the refusal.
+- The key holds the last path component only: a moved file keeps its keys, and two files of one thread with one name would share them. Codex names a session file `rollout-<date-time>-<id>.jsonl`.
+- The usage report tells the owner of an older store `run the collector once`; the collector then says to delete the store and run it again. `usage_report.check_store_version` is unchanged.
+- Measured 2026-10-12 on natedev, into a new store with no Mac read: 519,380 Codex requests and 34,019 Codex edits stored from 2,485 session files, equal to the counts taken from the files, every key distinct; a second pass changed no stored row and stored nothing twice.
+
+**Ruled out:** rewriting an older store's keys in place (checked 2026-10-12: natedev, the machine the hourly collector is to run on, holds no usage store, so a rebuild costs one collection pass).
 
 ### Phase 13 — What seat compactions cost, and a limit chosen by replay · status: todo
 
