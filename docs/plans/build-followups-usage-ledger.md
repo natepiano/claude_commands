@@ -386,7 +386,7 @@ The store is at `PRAGMA user_version` 6 (`STORE_VERSION`) and holds what the wor
 
 **Ruled out:** rewriting an older store's keys in place (checked 2026-10-12: natedev, the machine the hourly collector is to run on, holds no usage store, so a rebuild costs one collection pass).
 
-### Phase 13 — What seat compactions cost, and a limit chosen by replay · status: todo
+### Phase 13 — What seat compactions cost, and a limit chosen by replay · status: done
 
 #### Work Order
 
