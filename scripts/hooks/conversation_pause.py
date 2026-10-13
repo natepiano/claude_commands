@@ -370,10 +370,14 @@ def prompt_source(
     return PromptSource.TYPED
 
 
-def pauses(source: PromptSource, showrunner_session: bool) -> bool:
-    if source is PromptSource.TYPED:
-        return True
-    return source is PromptSource.PEER and not showrunner_session
+def pauses(source: PromptSource) -> bool:
+    """Only the user's own input pauses: a peer message, a tick or a relay never does.
+
+    Until 2026-10-13 a peer message paused a unit director too, so a review unit's hourly health
+    tick, relayed by another session, paused its timer and asked the user to return six times
+    while the user never typed in that pane.
+    """
+    return source is PromptSource.TYPED
 
 
 def is_showrunner_session(session_id: str) -> bool:

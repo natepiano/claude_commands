@@ -690,7 +690,7 @@ def credit_line(note: AgentNote) -> str:
 def user_time(stamp: str | None) -> str:
     """A machine-local note time rendered in the user's zone."""
     try:
-        return datetime.fromisoformat(stamp or "").astimezone(user_zone()).strftime("%a %m-%d %H:%M %Z")
+        return datetime.fromisoformat(stamp or "").astimezone(user_zone()).strftime("%Y-%m-%d %H:%M %Z")
     except ValueError:
         return "an unknown time"
 
@@ -699,30 +699,46 @@ def run_out_push(note: AgentNote, selection: ClaudeAccountSelection) -> UserPush
     """The one direct user message sent when this account's episode opens."""
     name = note.path.stem
     roles = claude_roles(note, selection)
-    display_name = f"{name} ({', '.join(roles)})" if roles else name
-    summary = f"{name} weekly limit"
-    first = f"{display_name} has {percent(note)} of its weekly usage left; it refills {user_time(note.get('resets'))}."
+    purposes = ", ".join("production coordination" if role == "showrunners" else "delegated work" for role in roles)
+    display_name = f"{name}, used for {purposes}," if roles else name
+    summary = "Claude work needs more usage" if note.tool == "claude" else "Codex weekly usage is low"
+    first = f"The {display_name} account has {percent(note)} weekly usage left. It refills {user_time(note.get('resets'))}."
     if note.tool == "codex":
         return UserPush(name, summary, f"{first} Codex keeps working on its credits. {credit_line(note)}", None)
-    count = note.get("limit_reset_count")
-    resets = f" ({count} available)" if count is not None and count != "null" else ""
-    return UserPush(name, summary, first,
-                    Ask("decision", f"Log in to another Claude account, or redeem a limit reset{resets}."))
+    # Nothing reads a Claude limit-reset count live, so the push offers no redeem it cannot back.
+    text = (first + " Its work may stop until then.\n\n"
+            + "Sign in: switch to an account with usage left so work continues.")
+    return UserPush(name, summary, text, Ask("decision", "In a Claude session on natedev, sign in to another account."))
+
+
+def short_reason(reason: str) -> str:
+    """Keep complete words in a phone explanation of at most 60 characters."""
+    if len(reason) <= 60:
+        return reason
+    complete: list[str] = []
+    for word in reason.split():
+        if len(" ".join([*complete, word])) > 59:
+            break
+        complete.append(word)
+    return " ".join(complete) + "…"
 
 
 def refusal_push(note: AgentNote, switch: CodexQuotaFallback, failed: str | None, already: bool) -> UserPush:
     """The one direct user message sent when Codex refuses this episode."""
     if not isinstance(switch, NoCodexQuotaFallback):
         verb = "had already moved" if already else "moved"
-        outcome = f"The automatic switch {verb} {', '.join(switch.moved)} to Claude"
+        outcome = f"The automatic switch {verb} work from Codex to Claude"
     elif failed:
         reason = re.sub(r"/\S+", "the account registry", failed)
-        outcome = f"The automatic switch to Claude failed: {reason}"
+        outcome = f"The automatic switch to Claude failed: {short_reason(reason)}"
     else:
         outcome = "Nothing was on Codex, so the automatic switch moved nothing"
     name = note.path.stem
-    return UserPush(name, "Codex refused work", f"Codex refused work on {name}. {credit_line(note)} {outcome}.",
-                    Ask("decision", f"Add credits to {name} or redeem a limit reset to bring Codex back."))
+    text = (f"Codex refused work on the {name} account. {credit_line(note)} {outcome}.\n\n"
+            "Reset (recommended, if available): refill usage without buying credits.\n\n"
+            "Add credits: pay for more Codex usage.")
+    return UserPush(name, "Codex work needs usage or credits", text,
+                    Ask("decision", f"In a Claude session on natedev, redeem a limit reset or add credits to {name} to restore Codex work."))
 
 
 def instruction(tool: str, switch: CodexQuotaFallback, failed: str | None) -> str:
@@ -760,9 +776,10 @@ def message(note: AgentNote, notes: list[AgentNote], config: Config, switch: Cod
         swap_line = codex_swap_line(readings, now or datetime.now(timezone.utc))
         if swap_line:
             lines.append(swap_line)
-    count = note.get("limit_reset_count")
-    if count and count != "null":
-        lines.append(f"Limit resets available on {name}: {count}, earliest expiring {note.get('limit_reset')}.")
+        # Only a Codex count is read live; a Claude note's count is never stated.
+        count = note.get("limit_reset_count")
+        if count and count != "null":
+            lines.append(f"Limit resets available on {name}: {count}, earliest expiring {note.get('limit_reset')}.")
     for other in notes:
         if other.tool == note.tool and other.path != note.path:
             lines.append(f"{other.path.stem}: {other.get('state')}, {percent(other)} weekly usage left, "
@@ -852,16 +869,19 @@ def deliver(jobs: list[Job]) -> list[str | None]:
 
 
 def deliver_and_record(jobs: list[Job], stamp: str) -> list[str]:
-    """Deliver every job, stamp each alert's attempt on its episode, and return one log line per job."""
-    errors = deliver(jobs)
-    log: list[str] = []
+    """Stamp each alert's attempt on its episode, then deliver every job; one log line per job.
+
+    The stamp comes first: the snapshot timer kills a run that outlasts its budget, and a kill
+    after the sends but before a later stamp sent every alert again on the next run. A kill now
+    costs at most one repeat.
+    """
     with state_file() as state:
-        for job, error in zip(jobs, errors):
+        for job in jobs:
             if job.kind == "alert" and job.name in state["episodes"]:
                 state["episodes"][job.name]["last"][job.recipient] = stamp
-            outcome = "sent" if error is None else f"not delivered: {error}"
-            log.append(f"quota {job.kind} {job.name} -> {job.recipient}: {outcome}")
-    return log
+    errors = deliver(jobs)
+    return [f"quota {job.kind} {job.name} -> {job.recipient}: "
+            + ("sent" if error is None else f"not delivered: {error}") for job, error in zip(jobs, errors)]
 
 
 def alert(notes: list[AgentNote], now: datetime | None = None, *,
@@ -897,8 +917,11 @@ def alert(notes: list[AgentNote], now: datetime | None = None, *,
             episode = episodes[name]
             if episode.get("push") == "due":
                 push = run_out_push(note, selection)
-                swap_line = codex_swap_line(codex_readings, now) if note.tool == "codex" else ""
-                pushes.append(UserPush(push.name, push.summary, push.text + ("\n" + swap_line if swap_line else ""), push.ask))
+                if note.tool == "codex":
+                    log.append(f"quota status {name}: {push.text}")
+                    episode["push"] = stamp
+                else:
+                    pushes.append(push)
             if "acknowledged" in episode:
                 continue
             switch = state["fallback"] if note.tool == "codex" else NoCodexQuotaFallback()
@@ -1039,11 +1062,12 @@ def blocked(notes: list[AgentNote], refusing_account: agent_accounts.RefusingCod
             push = refusal_push(note, fallback, failed, already)
         else:
             text = f"Codex refused work on {name}, {account_status}. Nothing switched to Claude."
-            push = UserPush(name, f"{name} refused work", text, None)
+            if "push" not in notice:
+                log.append(f"quota status {name}: {text}")
+                notice["push"] = stamp
+            return log
         swap_line = codex_swap_line(readings, now)
         if swap_line:
-            if not owns_role:
-                text += "\n" + swap_line
             push = UserPush(push.name, push.summary, push.text + "\n" + swap_line, push.ask)
         new_failure = owns_role and not already and failed is not None and failed not in notice.get("failure_pushes", [])
         if not moved and not new_failure and ("push" in notice or episode is not None and "refusal_push" in episode):

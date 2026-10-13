@@ -104,6 +104,10 @@ root = Path(os.environ["MAC_TEST_STUB_DIR"])
 fixture = json.loads((root / "fixture.json").read_text(encoding="utf-8"))
 command = Path(sys.argv[0]).name
 arguments = sys.argv[1:]
+if command == "systemd-run":
+    with (root / "systemd-run.jsonl").open("a", encoding="utf-8") as output:
+        output.write(json.dumps(arguments) + "\n")
+    raise SystemExit(0)
 event = {
     "command": command,
     "args": arguments,
@@ -130,7 +134,7 @@ if command != "ssh":
     raise SystemExit(99)
 
 remote = arguments[-1]
-if "pgrep -f" in remote and "lsof" in remote:
+if "select_leftovers()" in remote and "lsof" in remote:
     (root / "cleanup-called").write_text("called\n", encoding="utf-8")
     time.sleep(float(fixture["cleanup_delay_s"]))
     if fixture["hold_cleanup"]:
@@ -203,6 +207,23 @@ if command == "lsof":
 if command == "sleep":
     raise SystemExit(0)
 raise SystemExit(99)
+'''
+
+
+ACTIVITY_SELECTOR_STUB = r'''
+import json
+import os
+from pathlib import Path
+import sys
+
+root = Path(os.environ["ACTIVITY_TEST_DIR"])
+name = Path(sys.argv[0]).name
+responses = json.loads((root / "responses.json").read_text())
+with (root / "commands.jsonl").open("a") as output:
+    output.write(json.dumps({"command": name, "args": sys.argv[1:]}) + "\n")
+status, answer = responses[name]
+print(answer, end="")
+raise SystemExit(status)
 '''
 
 
@@ -386,7 +407,7 @@ class OffloadSettingsTests(unittest.TestCase):
                 arguments = cast(list[str], run.call_args.args[0])
                 self.assertEqual(arguments[:-1], ["ssh", *offload.ssh_options(config), "kept-host"])
                 self.assertEqual(run.call_args.kwargs["timeout"], 10)
-                self.assertIn("pgrep -f '[.]local/state/mac-test/mirror/'", arguments[-1])
+                self.assertIn('pgrep -u "$(id -u)" -f \'[.]local/state/mac-test/mirror/\'', arguments[-1])
         for answer in ("leftovers=0\n", "rc=0\n", "leftovers=-1\nrc=0\n", "leftovers=bad\nrc=0\n"):
             with self.subTest(answer=answer):
                 response = subprocess.CompletedProcess(["ssh"], 0, answer, "")
@@ -756,10 +777,10 @@ class OffloadCommandTests(unittest.TestCase):
                 self.assertTrue(event["claimed"], event)
 
     def leftover_events(self) -> list[CommandEvent]:
-        return [event for event in self.events_for("ssh") if "pgrep -f" in event["args"][-1]]
+        return [event for event in self.events_for("ssh") if "select_leftovers()" in event["args"][-1]]
 
     def assert_leftover_selectors(self, remote: str) -> None:
-        self.assertIn("pgrep -f '[.]local/state/mac-test/mirror/'", remote)
+        self.assertIn('pgrep -u "$(id -u)" -f \'[.]local/state/mac-test/mirror/\'', remote)
         self.assertIn('lsof -a -u "$(id -u)" -d cwd -Fpn', remote)
         self.assertIn("awk '/^p/ { pid = substr($0, 2) } /^n.*\\/[.]local\\/state\\/mac-test\\/mirror(\\/|$)/ { print pid }'", remote)
         self.assertNotIn("pkill", remote)
@@ -1583,7 +1604,7 @@ class OffloadCommandTests(unittest.TestCase):
         cleanup_events = [
             event
             for event in self.events_for("ssh")
-            if "pgrep -f" in event["args"][-1]
+            if "select_leftovers()" in event["args"][-1]
         ]
         self.assertEqual(len(cleanup_events), 1, self.events())
         cleanup = cleanup_events[0]
@@ -1783,7 +1804,7 @@ class OffloadCommandTests(unittest.TestCase):
                         self.assertIn("lsof", names)
                     for call in calls:
                         if call["command"] == "pgrep":
-                            self.assertEqual(call["args"], ["-f", "[.]local/state/mac-test/mirror/"])
+                            self.assertEqual(call["args"], ["-u", str(os.getuid()), "-f", "[.]local/state/mac-test/mirror/"])
                         if call["command"] == "lsof":
                             self.assertEqual(call["args"], ["-a", "-u", str(os.getuid()), "-d", "cwd", "-Fpn"])
                     answer = (self.stub_directory / "selector-answer").read_text()
@@ -1922,6 +1943,87 @@ class OffloadCommandTests(unittest.TestCase):
         self.assertIn("mac_test: not running on the Mac (off)\n", result.stdout)
         self.assertIn("FileNotFoundError", result.stdout)
         self.assertFalse(self.result_path.exists())
+
+
+class MacActivityShellTests(unittest.TestCase):
+    root: Path = Path()
+    bin_directory: Path = Path()
+
+    @override
+    def setUp(self) -> None:
+        self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        self.bin_directory = self.root / "bin"
+        self.bin_directory.mkdir()
+        for name in ("pgrep", "lsof", "ps", "id"):
+            path = self.bin_directory / name
+            _ = path.write_text(f"#!{sys.executable}\n" + ACTIVITY_SELECTOR_STUB)
+            path.chmod(0o755)
+
+    def run_activity(self, shell: list[str], responses: dict[str, tuple[int, str]]) -> subprocess.CompletedProcess[str]:
+        _ = (self.root / "responses.json").write_text(json.dumps(responses))
+        (self.root / "commands.jsonl").unlink(missing_ok=True)
+        environment = {**os.environ, "PATH": str(self.bin_directory) + os.pathsep + os.environ["PATH"],
+                       "ACTIVITY_TEST_DIR": str(self.root)}
+        checks = "\n".join(
+            '[ "$(command -v ' + name + ')" = ' + shlex.quote(str(self.bin_directory / name)) + ' ] || exit 99'
+            for name in ("pgrep", "lsof", "ps", "id")
+        )
+        text = "kill() { printf 'signal requested\\n' >&2; return 99; }\n" + checks + "\n" + mac_test.mac_activity_script()
+        return subprocess.run([*shell, "-c", text], env=environment, capture_output=True, text=True, timeout=3, check=False)
+
+    def test_activity_text_has_zero_for_only_shells_in_clones_under_sh_and_zsh(self) -> None:
+        responses = {
+            "id": (0, "501\n"), "pgrep": (1, ""),
+            "lsof": (0, "p101\nn/Users/test/rust/hana\np102\nn/Users/test/rust/other\n"),
+            "ps": (0, "101 501 /bin/zsh\n102 501 /bin/sh\n103 999 /opt/cargo\n"),
+        }
+        for shell in (["/bin/sh"], ["zsh", "-f"]):
+            with self.subTest(shell=shell):
+                answer = self.run_activity(shell, responses)
+                self.assertEqual((answer.returncode, answer.stdout, answer.stderr), (0, "active=0\nrc=0\n", ""))
+
+    def test_activity_text_counts_each_matching_user_pid_once_under_sh_and_zsh(self) -> None:
+        responses = {
+            "id": (0, "501\n"), "pgrep": (0, "101\n102\n"),
+            "lsof": (0, "p102\nn/Users/test/.local/state/mac-test/mirror/hana\n"
+                     + "p103\nn/Users/test/.local/state/mac-test/mirror\np104\nn/Users/test/rust/hana\n"),
+            "ps": (0, "101 501 /opt/rust/bin/cargo\n105 501 /opt/rust/bin/rustc\n106 501 cargo-nextest\n"
+                   + "107 501 /Users/test/rust/hana/target/debug/app\n108 999 /opt/cargo\n"
+                   + "109 501 /bin/zsh\n110 501 /opt/cargo-helper\n112 501 /Users/test/my project/target/debug/app\n"),
+        }
+        for shell in (["/bin/sh"], ["zsh", "-f"]):
+            with self.subTest(shell=shell):
+                answer = self.run_activity(shell, responses)
+                self.assertEqual((answer.returncode, answer.stdout, answer.stderr), (0, "active=7\nrc=0\n", ""))
+                calls = [cast(SelectorEvent, json.loads(line)) for line in (self.root / "commands.jsonl").read_text().splitlines()]
+                pgrep = [call for call in calls if call["command"] == "pgrep"]
+                lsof = [call for call in calls if call["command"] == "lsof"]
+                ps = [call for call in calls if call["command"] == "ps"]
+                self.assertEqual(len(pgrep), 1)
+                self.assertIn("-u", pgrep[0]["args"])
+                self.assertIn("501", pgrep[0]["args"])
+                self.assertIn("[.]local/state/mac-test/mirror/", pgrep[0]["args"])
+                self.assertEqual(lsof[0]["args"], ["-a", "-u", "501", "-d", "cwd", "-Fpn"])
+                self.assertEqual(len(ps), 1)
+
+    def test_activity_selector_failure_prints_no_success_under_sh_and_zsh(self) -> None:
+        for shell in (["/bin/sh"], ["zsh", "-f"]):
+            for name, status in (("pgrep", 2), ("lsof", 1), ("ps", 1)):
+                with self.subTest(shell=shell, selector=name):
+                    responses = {"id": (0, "501\n"), "pgrep": (1, ""), "lsof": (0, ""), "ps": (0, "")}
+                    responses[name] = (status, "")
+                    answer = self.run_activity(shell, responses)
+                    self.assertNotEqual(answer.returncode, 0)
+                    self.assertNotIn("rc=0", answer.stdout)
+                    self.assertNotIn("active=0", answer.stdout)
+                    self.assertNotIn("signal requested", answer.stderr)
+
+    def test_activity_and_leftover_texts_use_the_shared_mirror_selector(self) -> None:
+        marker = "select_leftovers() { return 1; }\n"
+        with mock.patch.object(offload, "mirror_selector_script", return_value=marker) as selector:
+            self.assertTrue(offload.leftover_check_script().startswith(marker))
+            self.assertTrue(mac_test.mac_activity_script().startswith(marker))
+        self.assertEqual(selector.call_count, 2)
 
 
 if __name__ == "__main__":

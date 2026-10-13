@@ -161,6 +161,7 @@
     {
       "root": "scripts/shutdown",
       "extraPaths": [
+        ".",
         "scripts/shutdown",
         "scripts/whoami",
         "scripts/message",

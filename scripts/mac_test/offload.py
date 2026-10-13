@@ -988,9 +988,9 @@ def remote_test_command(
     )
 
 
-def leftover_check_script() -> str:
+def mirror_selector_script() -> str:
     return r'''select_leftovers() {
-    if command_pids=$(pgrep -f '[.]local/state/mac-test/mirror/'); then
+    if command_pids=$(pgrep -u "$(id -u)" -f '[.]local/state/mac-test/mirror/'); then
         :
     else
         selector_result=$?
@@ -1000,6 +1000,11 @@ def leftover_check_script() -> str:
     cwd_pids=$(printf '%s\n' "$cwd_records" | awk '/^p/ { pid = substr($0, 2) } /^n.*\/[.]local\/state\/mac-test\/mirror(\/|$)/ { print pid }') || return 1
     printf '%s\n%s\n' "$command_pids" "$cwd_pids" | awk '/^[0-9]+$/ && !seen[$0]++ { print }'
 }
+'''
+
+
+def leftover_check_script() -> str:
+    return mirror_selector_script() + r'''
 leftover_pids=$(select_leftovers) || exit 1
 printf '%s\n' "$leftover_pids" | while IFS= read -r leftover_pid; do
     [ -n "$leftover_pid" ] && kill "$leftover_pid" 2>/dev/null

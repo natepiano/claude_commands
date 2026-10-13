@@ -736,6 +736,22 @@ class LifecycleTests(unittest.TestCase):
         self.assertEqual(sent[sent.index("--text") + 1], "example wrapped, so it no longer reports to you.")
         self.assertIn("wrapped", self.doc.read_text())
 
+    def test_wrap_deletes_its_own_state_files_and_keeps_other_productions(self) -> None:
+        self.merged_units()
+        state = self.state / "showrunner"
+        own = (state / "footers-off/example", state / "review-paused/example.json",
+               state / "outstanding/example.json", state / "example/prompt.txt")
+        other = (state / "footers-off/other", state / "outstanding/other.json", state / "other/prompt.txt")
+        for path in (*own, *other):
+            self.write(path, "[]\n")
+        result = self.run_lifecycle("wrap", "--no-ci")
+        self.assert_step(result, "ok")
+        self.assertRegex(result.stdout, r"(?m)^tidy: ok — removed footers-off/example, review-paused/example.json, "
+                         + r"outstanding/example.json, example/$")
+        self.assertFalse(any(path.exists() for path in own))
+        self.assertFalse((state / "example").exists())
+        self.assertTrue(all(path.exists() for path in other))
+
     def test_wrap_holds_while_a_child_showrunner_runs(self) -> None:
         self.merged_units()
         self.showrunner("kid", live=True)

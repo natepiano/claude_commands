@@ -21,7 +21,8 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta, timezone, tzinfo
 from pathlib import Path
-from typing import Literal, NotRequired, TypedDict, cast, overload
+from typing import TYPE_CHECKING, Literal, NotRequired, Protocol, TypedDict, cast, overload
+from importlib import import_module
 
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
@@ -33,6 +34,13 @@ import account  # noqa: E402
 import agent_accounts  # noqa: E402
 import note_file  # noqa: E402
 import usage_store  # noqa: E402
+
+if TYPE_CHECKING:
+    from scripts.shutdown.inventory import Session
+
+
+class ManualMoveResume(Protocol):
+    def resume_command(self, session: Session, target: str, source_label: str = "", why: str = "") -> str: ...
 
 
 # Shared means Claude Code reads the entry as user content or cross-session
@@ -383,6 +391,10 @@ class CommandLine(argparse.Namespace):
     until: str = ""
     dry_run: bool = False
     claude_args: list[str] = []
+    session: str = ""
+    source: str = ""
+    target: str = ""
+    why: str = ""
 
 
 @dataclass(frozen=True)
@@ -839,6 +851,8 @@ def _inspect_account_directory(selected: NamedAccount, expected: AccountNote) ->
 
 def check(label: str) -> list[str]:
     """Return every reason a named account is not fit to launch."""
+    if label == "default":
+        return _login_problem(main_config_dir())
     if CODEX_LABEL_PATTERN.fullmatch(label):
         return _check_codex_home(label, _seats_home())
     return list(account_directory_readiness(label).problems)
@@ -978,6 +992,8 @@ def exec_account(label: str, arguments: list[str]) -> None:
     """Replace this process with Claude on the selected, safe directory."""
     if label == "unit":
         selected = role_account("unit")
+    elif label == "default":
+        selected = DefaultAccount()
     else:
         selected = NamedAccount(label, account_dir(label))
     environment = dict(os.environ)
@@ -992,12 +1008,18 @@ def exec_account(label: str, arguments: list[str]) -> None:
                 raise AccountsError(
                     f'accounts: ~/.claude{selected.label.removeprefix("claude ")} is not set up; /showrunner:accounts setup "{selected.label}" first'
                 )
-            if not isinstance(readiness, (AccountDirectoryReady, AccountDirectoryLoggedOut)):
+            if not isinstance(readiness, (AccountDirectoryReady, AccountDirectoryLoggedOut)) or (
+                "--resume" in arguments and isinstance(readiness, AccountDirectoryLoggedOut)
+            ):
                 raise AccountsError(readiness.problems[0])
             environment.update(account.named_account_environment(selected.dir))
         else:
             _drop_named_account(environment)
     else:
+        if "--resume" in arguments:
+            problems = check("default")
+            if problems:
+                raise AccountsError(problems[0])
         _drop_named_account(environment)
     try:
         os.execvpe("claude", ["claude", *arguments], environment)
@@ -1549,6 +1571,164 @@ def _shutdown_argv(*arguments: str) -> tuple[str, ...]:
     return (sys.executable, str(SCRIPTS / "shutdown" / "shutdown.py"), *arguments)
 
 
+@dataclass(frozen=True)
+class MoveRefused:
+    reason: str
+
+
+@dataclass(frozen=True)
+class MoveStarted:
+    session_id: str
+    target: str
+    stdout: str
+    stderr: str
+    returncode: int
+
+
+@dataclass(frozen=True)
+class MoveStartFailed:
+    session_id: str
+    target: str
+    stdout: str
+    stderr: str
+    returncode: int
+
+
+@dataclass(frozen=True)
+class ShowrunnersMoveStartFailed:
+    session_ids: tuple[str, ...]
+    target: str
+    stdout: str
+    stderr: str
+    returncode: int
+
+
+@dataclass(frozen=True)
+class ShowrunnersMoveDryRun:
+    session_ids: tuple[str, ...]
+    lines: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class ShowrunnersMoveStarted:
+    session_ids: tuple[str, ...]
+    target: str
+    stdout: str
+    stderr: str
+    returncode: int
+
+
+def _move_target(target: str) -> agent_accounts.KnownClaudeAccount | MoveRefused:
+    default = account_identity(main_config_dir())
+    destination = default if target == "default" else account_identity(account_dir(target))
+    if target != "default" and isinstance(default, agent_accounts.KnownClaudeAccount) and (
+        target.casefold() == default.label.casefold() or
+        isinstance(destination, agent_accounts.KnownClaudeAccount) and
+        destination.login.casefold() == default.login.casefold()
+    ):
+        return MoveRefused(f"{target} is the default account; use default")
+    problems = check(target)
+    if problems:
+        return MoveRefused(problems[0])
+    if isinstance(destination, agent_accounts.UnreadableClaudeAccount):
+        return MoveRefused(f"account identity for {target} is unreadable")
+    return destination
+
+
+def move_showrunners(source: str, target: str, *, dry_run: bool = False, why: str = "") -> ShowrunnersMoveStarted | ShowrunnersMoveStartFailed | ShowrunnersMoveDryRun | MoveRefused:
+    """Move all local showrunners on one login through one selected shutdown."""
+    sys.path.insert(0, str(SCRIPTS / "shutdown"))
+    if TYPE_CHECKING:
+        from scripts.shutdown import inventory, record
+    else:
+        inventory = import_module("inventory")
+        record = import_module("record")
+    try:
+        current = account.named_claude_account(source)
+        destination = _move_target(target)
+        if isinstance(destination, MoveRefused):
+            return destination
+        if destination.login.casefold() == current.login.casefold():
+            return MoveRefused(f"{source} is already on {destination.label}")
+        owners = [item for item in inventory.inventory(current.login)["sessions"] if item["kind"] == "showrunner"]
+        if not owners:
+            return MoveRefused(f"no showrunner on {source} on this machine")
+        open_ids = {saved["session"]["session_id"] for saved in record.all_session_records()}
+        skipped = tuple(f"{owner['name']} already has a shutdown in progress" for owner in owners if owner["session_id"] in open_ids)
+        selected = [owner for owner in owners if owner["session_id"] not in open_ids]
+        ids = tuple(owner["session_id"] for owner in selected)
+        if not ids:
+            return ShowrunnersMoveDryRun((), skipped) if dry_run else ShowrunnersMoveStarted((), target, "\n".join(skipped) + "\n", "", 0)
+        reason = why or f"{current.label} is out of usage"
+        command = _shutdown_argv("down", source, "--here", "--only", ",".join(ids), "--restart", "--to", target, "--why", reason)
+        restart = cast(ManualMoveResume, cast(object, import_module("restart")))
+        if dry_run:
+            return ShowrunnersMoveDryRun(ids, (*skipped, *(f"{owner['name']}: {owner['session_id']}" for owner in selected),
+                shlex.join(command), *(restart.resume_command(owner, target, current.label, why) for owner in selected)))
+        for owner in selected:
+            if owner["host"]["kind"] == "unknown":
+                print(f"run this once {owner['name']} has exited: {restart.resume_command(owner, target, current.label, why)}", flush=True)
+        result = subprocess.run(command, capture_output=True, text=True, check=False)
+        prefix = "\n".join(skipped) + "\n" if skipped else ""
+        outcome = ShowrunnersMoveStartFailed if result.returncode else ShowrunnersMoveStarted
+        return outcome(ids, target, prefix + result.stdout, result.stderr, result.returncode)
+    except (AccountsError, account.UnknownAccountName, record.InvalidRecord, inventory.InvalidInventory, OSError, ValueError) as error:
+        return MoveRefused(str(error))
+
+
+def move(session: str, target: str, *, why: str = "") -> MoveStarted | MoveStartFailed | MoveRefused:
+    """Move one local live owner after completing every read-only refusal check."""
+    sys.path.insert(0, str(SCRIPTS / "shutdown"))
+    if TYPE_CHECKING:
+        from scripts.shutdown import inventory, record
+        from scripts.message import sessions
+    else:
+        inventory = import_module("inventory")
+        record = import_module("record")
+        sessions = import_module("sessions")
+
+    try:
+        live = sessions.live_sessions()
+        matches = [item for item in live if item["sessionId"] == session]
+        if not matches:
+            matches = [item for item in live if item["name"] == session]
+        if not matches:
+            return MoveRefused(f"no live session by id or name {session} on this machine; a session on the other machine moves from there")
+        if len(matches) != 1:
+            return MoveRefused(f"{session} names multiple live sessions: " + ", ".join(item["sessionId"] for item in matches))
+        found = matches[0]
+        directory = account.process_config_dir(found["pid"])
+        if directory is None:
+            return MoveRefused(f"{found['name'] or session}: account unreadable")
+        current = account_identity(directory)
+        if isinstance(current, agent_accounts.UnreadableClaudeAccount):
+            return MoveRefused(f"{found['name'] or session}: account unreadable")
+        report = inventory.inventory(current.login, frozenset((found["sessionId"],)))
+        owners = [item for item in report["sessions"] if item["session_id"] == found["sessionId"]]
+        if not owners:
+            return MoveRefused(f"{found['name'] or session}: live session account could not be confirmed")
+        owner = owners[0]
+        name = owner["name"] or owner["session_id"]
+        if owner["kind"] == "seat":
+            return MoveRefused("seats move with their unit director")
+        destination = _move_target(target)
+        if isinstance(destination, MoveRefused):
+            return destination
+        if destination.login.casefold() == current.login.casefold():
+            return MoveRefused(f"{name} is already on {destination.label}")
+        if any(saved["session"]["session_id"] == owner["session_id"] for saved in record.all_session_records()):
+            return MoveRefused(f"{name} already has a shutdown in progress")
+        if owner["host"]["kind"] == "unknown":
+            restart = cast(ManualMoveResume, cast(object, import_module("restart")))
+            print(f"run this once {name} has exited: {restart.resume_command(owner, target, current.label, why)}", flush=True)
+        command = _shutdown_argv("down", current.label, "--here", "--only", owner["session_id"], "--restart", "--to", target, "--why", why or f"{current.label} is out of usage")
+        result = subprocess.run(command, capture_output=True, text=True, check=False)
+        outcome = MoveStartFailed if result.returncode else MoveStarted
+        return outcome(owner["session_id"], target, result.stdout, result.stderr, result.returncode)
+    except (AccountsError, record.InvalidRecord, inventory.InvalidInventory, OSError, ValueError) as error:
+        return MoveRefused(str(error))
+
+
 def check_codex_target(label: str, seats_home: Path) -> SelectableCodexAccount:
     home = accounts_home() / ".codex" if label == "default" else codex_account_home(label)
     problems = (_check_default_codex_home(seats_home) if label == "default"
@@ -1644,8 +1824,21 @@ def swap(role: str, label: str, *, dry_run: bool = False) -> SwapOutcome | Seats
     if status.returncode:
         reason = (status.stderr or status.stdout).strip()
         raise AccountsError(f"accounts: shutdown status {old.label} failed: {reason}")
-    _require_moving_sessions(_swap_inventories(status.stdout, old), old.label)
-    down_command = _shutdown_argv("down", old.label, "--restart")
+    inventories = _swap_inventories(status.stdout, old)
+    _require_moving_sessions(inventories, old.label)
+    sys.path.insert(0, str(SCRIPTS / "shutdown"))
+    if TYPE_CHECKING:
+        from scripts.shutdown import record
+    else:
+        record = import_module("record")
+    try:
+        open_ids = {saved["session"]["session_id"] for saved in record.all_session_records()}
+    except (record.InvalidRecord, OSError) as error:
+        raise AccountsError(f"accounts: shutdown state unreadable: {error}") from error
+    for session in inventories[0]["sessions"]:
+        if session["kind"] == "unit" and session["session_id"] in open_ids:
+            raise AccountsError(f"accounts: {session['name']} already has a shutdown in progress")
+    down_command = _shutdown_argv("down", old.label, "--restart", "--to", label)
     if dry_run:
         return SwapDryRun((sys.executable, str(Path(__file__).resolve()), "set-role", role, label), down_command)
     previous = _write_unit_role(label, target)
@@ -2053,6 +2246,13 @@ def _parser() -> argparse.ArgumentParser:
     exec_command = commands.add_parser("exec")
     _ = exec_command.add_argument("label")
     _ = exec_command.add_argument("claude_args", nargs=argparse.REMAINDER)
+    move_command = commands.add_parser("move")
+    _ = move_command.add_argument("session")
+    _ = move_command.add_argument("label", nargs="?", default="")
+    _ = move_command.add_argument("--from", dest="source", default="")
+    _ = move_command.add_argument("--to", dest="target", default="")
+    _ = move_command.add_argument("--dry-run", action="store_true")
+    _ = move_command.add_argument("--why", default="")
     for action in ("role", "env"):
         command = commands.add_parser(action)
         _ = command.add_argument("role")
@@ -2075,6 +2275,24 @@ def main(argv: list[str]) -> int:
         if options.action == "exec":
             exec_account(options.label, options.claude_args)
             return 0
+        if options.action == "move":
+            if options.session == "showrunners":
+                if not options.source or not options.target or options.label:
+                    raise AccountsError("move showrunners requires --from <label> --to <target>")
+                moved = move_showrunners(options.source, options.target, dry_run=options.dry_run, why=options.why)
+            else:
+                if not options.label or options.source or options.target or options.dry_run:
+                    raise AccountsError("move requires <session-id|name> <claude N|default>")
+                moved = move(options.session, options.label, why=options.why)
+            if isinstance(moved, MoveRefused):
+                print(moved.reason, file=sys.stderr)
+                return 1
+            if isinstance(moved, ShowrunnersMoveDryRun):
+                print("\n".join(moved.lines))
+                return 0
+            _ = sys.stdout.write(moved.stdout)
+            _ = sys.stderr.write(moved.stderr)
+            return moved.returncode
         if options.action == "setup":
             problems = setup(options.label)
             for problem in problems:

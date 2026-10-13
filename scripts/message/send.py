@@ -40,7 +40,7 @@ same recipient inside the window is skipped; `ack` skips every later send with
 the key until `reopen`. The window counts from the last attempt, delivered or
 not, as the queue keeps what did not arrive.
 
-(user, 2026-10-05) Outcomes are printed as one line and logged with the full
+(user, 2026-10-05) Outcomes have a header followed by any payload lines and are logged with the full
 message text as one JSON line in STATE/log.jsonl:
   SENT: how                                                       exit 0
   SKIPPED: why   acknowledged, or inside the repeat window        exit 0
@@ -52,6 +52,7 @@ message text as one JSON line in STATE/log.jsonl:
   FAILED: why    not delivered and not kept: a Codex recipient,   exit 3
                  the user, or ssh to HOST
   REFUSED: why   rejected before delivery; not kept              exit 2
+  HELD: questions  revise within 5 minutes, or the best version sends  exit 4
 Usage errors, an unreadable --file and an empty message exit 2. STATE is $XDG_STATE_HOME/message, or ~/.local/state/message.
 """
 
@@ -82,7 +83,7 @@ import postmaster  # noqa: E402
 import codex_daemon  # noqa: E402
 import roster  # noqa: E402
 from user_action import (FIX, REFUSED_BEFORE_SENDING, ActionRefused, ActionRequired, ActionUnstated,
-                         UserAction, parse_user_action)  # noqa: E402
+                         UserAction, NoActionRequired, first_line, parse_user_action)  # noqa: E402
 
 STATE = Path(os.environ.get("XDG_STATE_HOME") or Path.home() / ".local" / "state") / "message"
 CLAUDE = Path.home() / ".local" / "bin" / "claude"
@@ -98,10 +99,10 @@ PERMISSION_MODE = "auto"
 TIMEOUT = 40
 KILL_GRACE = 10
 
-Outcome = Literal["sent", "skipped", "queued", "failed", "refused"]
+Outcome = Literal["sent", "skipped", "queued", "failed", "refused", "held"]
 Need = Literal["note", "decision", "blocked"]
 CHANNEL_PRIORITY: dict[Need, str] = {"note": "0", "decision": "1", "blocked": "2"}
-EXIT: dict[Outcome, int] = {"sent": 0, "skipped": 0, "queued": 1, "failed": 3, "refused": 2}
+EXIT: dict[Outcome, int] = {"sent": 0, "skipped": 0, "queued": 1, "failed": 3, "refused": 2, "held": 4}
 
 LogEntry = TypedDict("LogEntry", {"time": str, "machine": str, "from": str, "to": str, "key": str | None,
                                   "summary": str, "text": str, "outcome": Outcome, "detail": str,
@@ -154,9 +155,72 @@ class Message(NamedTuple):
     key: str | None
 
 
+@dataclass(frozen=True)
+class NoHeldRevision:
+    pass
+
+
+@dataclass(frozen=True)
+class HeldRevision:
+    source: str
+    identity: str
+    machine: str = ""
+
+
+RevisionHold = NoHeldRevision | HeldRevision
+NO_HELD_REVISION = NoHeldRevision()
+
+
+@dataclass(frozen=True)
+class FailedPush:
+    title: str
+    action: UserAction
+    body: str
+    hold: RevisionHold = NO_HELD_REVISION
+
+    @property
+    def message(self) -> str:
+        return first_line(self.action) + "\n" + self.body
+
+    @property
+    def text(self) -> str:
+        line = " ".join((self.title + " — " + first_line(self.action)).split())
+        if len(line) <= 200:
+            return line
+        shortened = line[:199]
+        if not line[199].isspace() and " " in shortened:
+            shortened = shortened.rsplit(" ", 1)[0]
+        return shortened.rstrip() + "…"
+
+
+@dataclass(frozen=True)
+class NoFailedPush:
+    pass
+
+
+FailureText = FailedPush | NoFailedPush
+NO_FAILED_PUSH = NoFailedPush()
+
+
+class ReviewedPushRecord(TypedDict):
+    title: str
+    action: str | None
+    body: str
+    held_source: NotRequired[str]
+    held_identity: NotRequired[str]
+    held_machine: NotRequired[str]
+
+
+class FailedPushRecord(ReviewedPushRecord):
+    time: float
+    message: str
+    fallback: str
+
+
 class Result(NamedTuple):
     outcome: Outcome
     detail: str
+    failure: FailureText = NO_FAILED_PUSH
 
 
 @dataclass(frozen=True)
@@ -280,6 +344,7 @@ class Options(NamedTuple):
     action: MessageUserAction
     text: str | None
     file: str | None
+    answerable: bool = False
 
     @property
     def to(self) -> str:
@@ -827,17 +892,41 @@ def action_arguments(action: UserAction) -> list[str]:
     return ["--no-action"]
 
 
-def user(message: Message, need: Need, action: UserAction, timeout: float) -> Result:
+def reviewed_failure(stdout: str, original: FailedPush, *,
+                     prefix: str = "pushover: reviewed JSON: ", machine: str = "") -> FailedPush:
+    for line in stdout.splitlines():
+        if not line.startswith(prefix):
+            continue
+        record = as_dict(loads(line.removeprefix(prefix)))
+        title, body = record.get("title"), record.get("body")
+        action = parse_user_action(optional_str(record.get("action")), record.get("action") is None)
+        if isinstance(title, str) and isinstance(body, str) and isinstance(action, (ActionRequired, NoActionRequired)):
+            source = record.get("held_source")
+            identity = record.get("held_identity")
+            hold: RevisionHold = (HeldRevision(source, identity, machine)
+                                  if isinstance(source, str) and source and isinstance(identity, str) and identity
+                                  else NO_HELD_REVISION)
+            return FailedPush(title, action, body, hold)
+        return original
+    return original
+
+
+def user(message: Message, need: Need, action: UserAction, timeout: float, *, answerable: bool = False) -> Result:
     """Reach the user. The channel is this function's business alone."""
     command = [sys.executable, str(USER_CHANNEL), "--priority", CHANNEL_PRIORITY[need], "--source", message.sender,
-               *action_arguments(action), message.summary, message.text]
+               *(["--answerable"] if answerable else []), *action_arguments(action), message.summary, message.text]
     code, out, err = run(command, "", timeout)
+    if code == 4:
+        return Result("held", err.removesuffix("\n") or out.removesuffix("\n"))
     if code == 0:
-        return Result("sent", "to the user")
+        before, separator, sent = out.partition("pushover: sent as rewritten:\n")
+        del before
+        return Result("sent", "to the user, rewritten:\n" + sent.removesuffix("\n") if separator else "to the user")
     why = one_line(err or out) or ("timed out" if code is None else f"exit {code}")
     if code == 2 and f"{REFUSED_BEFORE_SENDING}:" in err:
         return Result("refused", why)
-    return Result("failed", f"the user was not reached: {why}")
+    failed = reviewed_failure(out, FailedPush(message.summary, action, message.text))
+    return Result("failed", f"the user was not reached: {why} fallback text:\n{failed.text}", failed)
 
 
 def remote(message: Message, host: str, options: Options) -> Result:
@@ -848,6 +937,8 @@ def remote(message: Message, host: str, options: Options) -> Result:
         forwarded += ["--key", message.key]
     if message.to == USER:
         forwarded += ["--need", options.need]
+        if options.answerable:
+            forwarded += ["--answerable"]
         if isinstance(options.action, NoUserRecipient):
             raise AssertionError("a user message must state its action")
         forwarded += action_arguments(options.action)
@@ -855,20 +946,62 @@ def remote(message: Message, host: str, options: Options) -> Result:
         forwarded += ["--codex", "--session-dir", options.selection.session_dir]
     if options.repeat_minutes is not None:
         forwarded += ["--repeat-minutes", f"{options.repeat_minutes:g}"]
-    command = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", host, f"{REMOTE} {shlex.join(forwarded)}"]
+    command = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", host, f"{'CLAUDE_PID= ' if message.to == USER else ''}{REMOTE} {shlex.join(forwarded)}"]
     code, out, err = run(command, message.text, options.timeout + KILL_GRACE + 30)
-    line = (out.strip().splitlines() or [""])[-1]
-    word, _, detail = line.partition(": ")
-    outcome = cast(Outcome, word.lower()) if word in ("SENT", "SKIPPED", "QUEUED", "FAILED", "REFUSED") else None
-    if outcome is None:
+    lines = out.removesuffix("\n").split("\n")
+    headers = [(index, line.partition(": ")) for index, line in enumerate(lines)
+               if line.partition(": ")[0] in ("SENT", "HELD", "SKIPPED", "QUEUED", "FAILED", "REFUSED")]
+    if not headers:
         why = one_line(err or out) or ("timed out" if code is None else f"exit {code}")
         return Result("failed", f"ssh {host}: {why}")
-    return Result(outcome, f"on {host}: {detail}")
+    index, (word, _, detail) = headers[0]
+    payload = "\n".join(lines[index + 1:])
+    if payload:
+        detail += "\n" + payload
+    failure: FailureText = NO_FAILED_PUSH
+    if word == "FAILED" and message.to == USER and "send.py: failed push JSON: " in err:
+        if isinstance(options.action, NoUserRecipient):
+            raise AssertionError("a user message must state its action")
+        failure = reviewed_failure(err, FailedPush(message.summary, options.action, message.text),
+                                   prefix="send.py: failed push JSON: ", machine=host)
+    return Result(cast(Outcome, word.lower()), f"on {host}: {detail}", failure)
 
 
 # ---------------------------------------------------------------------------
 # Command line
 # ---------------------------------------------------------------------------
+
+
+def user_failure(message: Message, action: MessageUserAction, result: Result) -> Result:
+    if isinstance(action, NoUserRecipient):
+        raise AssertionError("a user message must state its action")
+    failed = result.failure
+    if isinstance(failed, NoFailedPush):
+        failed = FailedPush(message.summary, action, message.text)
+    reason, _, _ = result.detail.partition(" fallback text:")
+    result = Result("failed", reason + " fallback text:\n" + failed.text, failed)
+    try:
+        pid = os.environ.get("CLAUDE_PID", "")
+        if not pid:
+            return Result(result.outcome, result.detail, failed)
+        record = as_dict(loads((SESSIONS / f"{pid}.json").read_text(encoding="utf-8")))
+        session_id = as_str(record.get("sessionId"))
+        if session_id and Path(session_id).name == session_id and session_id not in (".", ".."):
+            entry: FailedPushRecord = {"time": time.time(), "title": failed.title,
+                "action": failed.action.text if isinstance(failed.action, ActionRequired) else None,
+                "body": failed.body, "message": failed.message, "fallback": failed.text}
+            if isinstance(failed.hold, HeldRevision):
+                entry["held_source"] = failed.hold.source
+                entry["held_identity"] = failed.hold.identity
+                entry["held_machine"] = failed.hold.machine
+            directory = Path(os.environ.get("NOTIFY_STATE_DIR", str(Path.home() / ".local/state/notify"))) / "failed"
+            directory.mkdir(parents=True, exist_ok=True)
+            with (directory / ".lock").open("a") as lock:
+                fcntl.flock(lock, fcntl.LOCK_EX)
+                write_atomic(directory / f"{session_id}.json", json.dumps(entry))
+    except OSError as error:
+        print(f"send.py: could not write fallback marker: {error}", file=sys.stderr)
+    return Result(result.outcome, result.detail, failed)
 
 
 def default_sender() -> str:
@@ -909,6 +1042,7 @@ def parse(argv: list[str]) -> Options:
             "seat:<run id>/<seat name>, codex:<thread id>, or user"
         ),
     )
+    _ = parser.add_argument("--answerable", action="store_true", help=argparse.SUPPRESS)
     _ = parser.add_argument("--from", dest="sender", help="the sender name the recipient sees")
     _ = parser.add_argument("--summary", help="SendMessage's short label, default the first line; the title to `user`")
     _ = parser.add_argument("--need", choices=list(CHANNEL_PRIORITY), default="note",
@@ -931,6 +1065,8 @@ def parse(argv: list[str]) -> Options:
     action_text = optional_str(attr(args, "action"))
     no_action = attr(args, "no_action") is True
     if to != USER:
+        if attr(args, "answerable") is True:
+            parser.error("--answerable goes with --to user")
         if action_text is not None or no_action:
             parser.error("--action and --no-action go with --to user")
         action: MessageUserAction = NoUserRecipient()
@@ -956,7 +1092,7 @@ def parse(argv: list[str]) -> Options:
                       key=optional_str(get["key"]), repeat_minutes=optional_float(get["repeat_minutes"]),
                       scope=scope, timeout=optional_float(get["timeout"]) or TIMEOUT,
                       need=cast(Need, get["need"]), action=action, text=optional_str(get["text"]),
-                      file=optional_str(get["file"]))
+                      file=optional_str(get["file"]), answerable=get["answerable"] is True)
     if options.to == USER and (options.summary is None or isinstance(options.selection, MeshSeat)):
         parser.error("--to user needs --summary, its title, and takes no --codex")
     if options.to != USER and options.need != "note":
@@ -1026,7 +1162,10 @@ def send(options: Options) -> Result:
     else:
         route = resolve_recipient(options.to, options.scope)
     destination = route.address if isinstance(route, SessionRecipient | RemoteDelivery) else options.to
-    message = Message(destination, options.sender or default_sender(), summary, text, options.key)
+    sender = options.sender or default_sender()
+    if options.to == USER and options.sender is None and sender != "send.py":
+        options = options._replace(answerable=True)
+    message = Message(destination, sender, summary, text, options.key)
     started = now()
     window = None if options.repeat_minutes is None else timedelta(minutes=options.repeat_minutes)
     skip = claim(message, window, started)
@@ -1040,7 +1179,7 @@ def send(options: Options) -> Result:
     elif isinstance(route, UserDelivery):
         if isinstance(options.action, NoUserRecipient):
             raise AssertionError("a user message must state its action")
-        result = user(message, options.need, options.action, options.timeout)
+        result = user(message, options.need, options.action, options.timeout, answerable=options.answerable)
     elif isinstance(route, CodexSeatRecipient):
         transport = Message(
             route.name,
@@ -1095,6 +1234,8 @@ def send(options: Options) -> Result:
     if result.outcome == "sent" and message.key is not None:
         for recipient in dict.fromkeys((message.to, options.to)):
             _ = remove_queued_key(recipient, message.key)
+    if message.to == USER and result.outcome == "failed":
+        result = user_failure(message, options.action, result)
     log(message, result, started, log_route)
     return result
 
@@ -1121,6 +1262,15 @@ def main(argv: list[str]) -> int:
         case _:
             result = send(parse(argv))
             print(f"{result.outcome.upper()}: {result.detail}")
+            if isinstance(result.failure, FailedPush):
+                failed = result.failure
+                record: ReviewedPushRecord = {"title": failed.title,
+                    "action": failed.action.text if isinstance(failed.action, ActionRequired) else None,
+                    "body": failed.body}
+                if isinstance(failed.hold, HeldRevision):
+                    record["held_source"] = failed.hold.source
+                    record["held_identity"] = failed.hold.identity
+                print("send.py: failed push JSON: " + json.dumps(record), file=sys.stderr)
             return EXIT[result.outcome]
     return 0
 

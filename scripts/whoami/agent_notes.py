@@ -198,6 +198,11 @@ def apply(
         elif isinstance(activity, ObservedAccountActivity) and account.email:
             updates["state"] = "active" if matching else "inactive"
         matched = matched or matching
+        if note.tool == "claude":
+            # Nothing reads a Claude limit-reset count live, so a recorded one only goes stale.
+            for key in ("limit_reset_count", "limit_reset"):
+                if note.get(key) not in (None, "null"):
+                    updates[key] = "null"
         if matching:
             if account.tool.lower() == "codex" and account.limit_reset_count is not None:
                 updates["limit_reset_count"] = str(account.limit_reset_count)
@@ -279,7 +284,10 @@ def update_alert_pass(selection: ClaudeAccountSelection, seats_home: Path) -> Up
     if not notes:
         messages.append(f"no agent notes in {note_file.AGENTS_DIR}")
     try:
-        usage_store.save(reports, checked_at)
+        # Each Claude note's stem is the label a session's account-label names.
+        logins = {note.path.stem: login for note in notes
+                  if note.tool == "claude" and (login := note.get("login"))}
+        usage_store.save(reports, checked_at, logins)
     except (OSError, ValueError) as error:
         # The saved readings must never cost the notes or the alerts.
         messages.append(f"usage store: {error}")

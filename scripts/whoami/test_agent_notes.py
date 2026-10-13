@@ -465,6 +465,13 @@ class AgentNotesTests(unittest.TestCase):
             {login: usage.get("weekly", {}).get("left") for login, usage in usage_store.load().items()},
             {"main@example.com": 80.0, "unit@example.com": 4.0},
         )
+        by_label = (self.root / ".local/state/agent-notes/by-label.json").read_text(encoding="utf-8")
+        self.assertEqual(
+            {label: usage["weekly"]["left"]
+             for label, usage in cast(dict[str, dict[str, dict[str, float]]], json.loads(by_label)).items()},
+            {"claude 2": 80.0, "claude 3": 4.0},
+        )
+        self.assertNotIn("@", by_label)
 
     def test_role_swap_during_update_keeps_one_unit_login_active(self) -> None:
         """Every note uses the same role selection for the entire update."""
@@ -759,11 +766,18 @@ class AgentNotesTests(unittest.TestCase):
             {"account": "codex 2", "at": self.now.isoformat(timespec="seconds"), "remaining": 60},
         ])
 
-    def test_claude_manual_reset_fields_are_preserved(self):
-        note = self.note("claude 1.md", "a@example.com", "limit_reset: 2026-10-22\nlimit_reset_count: 1\n")
+    def test_a_refresh_clears_a_stale_claude_reset_count_on_every_claude_note(self):
+        signed_in = self.note("claude 1.md", "a@example.com", "limit_reset: 2026-10-22T12:34:00\nlimit_reset_count: 1\n")
+        other = self.note("claude 2.md", "b@example.com", "limit_reset: null\nlimit_reset_count: 0\n")
+        _ = apply([signed_in, other], Report("Claude", email="a@example.com"), self.now)
+        for note in (signed_in, other):
+            self.assertEqual((note.get("limit_reset_count"), note.get("limit_reset")), ("null", "null"))
+
+    def test_a_claude_note_with_no_reset_count_gains_none(self):
+        note = self.note("claude 1.md", "a@example.com")
         _ = apply([note], Report("Claude", email="a@example.com"), self.now)
-        self.assertEqual(note.get("limit_reset"), "2026-10-22")
-        self.assertEqual(note.get("limit_reset_count"), "1")
+        self.assertIsNone(note.get("limit_reset_count"))
+        self.assertIsNone(note.get("limit_reset"))
 
     def test_reading_for_each_active_value_and_none_for_null_or_inactive(self):
         checked = datetime(2026, 10, 5, 19, 45, tzinfo=timezone.utc)

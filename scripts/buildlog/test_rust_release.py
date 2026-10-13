@@ -143,6 +143,36 @@ class RustReleaseTests(unittest.TestCase):
         self.assertEqual([], texts)
         self.assertEqual([], rust_release.report_line())
 
+    def test_release_choices_recommend_wait_until_both_build_checks_pass(self) -> None:
+        trials: list[rust_release.TrialOutcome] = [
+            {"status": "waiting", "version": "1.100.0", "reason": "build hold active"},
+            {"status": "failed", "version": "1.100.0", "step": "build", "reason": "error " * 200,
+             "target_gib": 0, "mend_target_gib": 0},
+            {"status": "finished", "version": "1.100.0", "warnings": 2, "warning_crates": 1,
+             "errors": 0, "error_crates": 0, "mend_builds": True, "target_gib": 1, "mend_target_gib": 1},
+        ]
+        for trial in trials:
+            with self.subTest(status=trial["status"]):
+                text = rust_release.release_push_text("1.100.0", "1.99.0", trial)
+                self.assertEqual(text.count("recommended"), 1)
+                self.assertIn("Upgrade (recommended)" if trial["status"] == "finished" else "Wait (recommended)", text)
+                self.assertLess(len(text) + 90, 500)
+                self.assertIn("Hana, the editor project, builds with 1.99.0", text)
+
+    def test_release_push_names_the_compiler_checks_and_version_choices(self) -> None:
+        """F010: the compiler decision identifies the checks and each version choice."""
+        trial: rust_release.TrialFinished = {"status": "finished", "version": "1.100.0", "warnings": 2,
+            "warning_crates": 1, "errors": 0, "error_crates": 0, "mend_builds": True,
+            "target_gib": 1, "mend_target_gib": 1}
+        text = rust_release.release_push_text("1.100.0", "1.99.0", trial)
+        self.assertIn("Compiler compatibility checks", text)
+        self.assertIn("compiled with 1.100.0", text)
+        self.assertIn("Hana moves to 1.100.0", text)
+        self.assertIn("Hana stays on 1.99.0", text)
+        for outcome in (trial, rust_release.TrialWaiting(status="waiting", version="1.100.0", reason="build hold active")):
+            self.assertLess(len(rust_release.release_push_title(outcome)), 45)
+            self.assertNotIn("upgrade decision", rust_release.release_push_title(outcome))
+
     def test_release_text_uses_user_send_and_only_success_returns_true(self) -> None:
         fake_module = self.scratch / "scripts/buildlog/rust_release.py"
         sender = self.scratch / "scripts/message/send.py"
@@ -152,8 +182,8 @@ class RustReleaseTests(unittest.TestCase):
             encoding="utf-8",
         )
         command = [
-            "python3", str(sender), "--to", "user", "--need", "note",
-            "--action", "Tell natedev to bump Rust or wait.",
+            "python3", str(sender), "--to", "user", "--from", "rust_release", "--need", "decision",
+            "--action", "In the natedev Claude session, reply upgrade or wait.",
             "--summary", "Rust 1.100.0 out", "--text", "trial passed",
         ]
         real_run = subprocess.run
@@ -215,8 +245,9 @@ class RustReleaseTests(unittest.TestCase):
         self.assertEqual(0, self.invoke(held=True, texts=texts))
         self.assertEqual(0, self.invoke(held=True, texts=texts))
         self.assertEqual(1, len(texts))
-        self.assertEqual("Rust 1.100.0 out", texts[0][0])
-        self.assertIn("trial waiting: build hold active", texts[0][1])
+        self.assertEqual("Rust upgrade waits on an untested build", texts[0][0])
+        self.assertIn("The test of Hana on 1.100.0 has not finished", texts[0][1])
+        self.assertIn("Wait (recommended)", texts[0][1])
         state = rust_release.read_state()
         assert state is not None
         self.assertEqual("waiting", state["trial"]["status"])
@@ -298,9 +329,8 @@ class RustReleaseTests(unittest.TestCase):
         self.assertEqual("1", mend[2]["RUSTC_BOOTSTRAP"])
         self.assertEqual(str(clone / "mend-target"), mend[2]["CARGO_TARGET_DIR"])
         self.assertEqual(1, len(texts))
-        self.assertIn("2 new warnings in 2 crates", texts[0][1])
-        self.assertIn("1 error in 1 crate", texts[0][1])
-        self.assertIn("cargo-mend builds", texts[0][1])
+        self.assertIn("1 error and 2 new warnings", texts[0][1])
+        self.assertIn("A tool for repairing Rust builds compiled with 1.100.0", texts[0][1])
 
     def test_stale_trial_clone_is_removed_before_commands_and_after_success(self) -> None:
         clone = self.scratch / "rust-release-trial-1.100.0"
@@ -330,7 +360,7 @@ class RustReleaseTests(unittest.TestCase):
         assert trial["status"] == "finished"
         self.assertFalse(trial["mend_builds"])
         self.assertFalse(clone.exists())
-        self.assertIn("cargo-mend does not build", texts[0][1])
+        self.assertIn("A tool for repairing Rust builds failed to compile with 1.100.0", texts[0][1])
 
     def test_failed_clippy_step_records_first_error_and_is_not_retried(self) -> None:
         clone = self.scratch / "rust-release-trial-1.100.0"
@@ -409,7 +439,7 @@ class RustReleaseTests(unittest.TestCase):
         texts: list[tuple[str, str]] = []
         self.assertEqual(0, self.invoke(held=True, texts=texts))
         self.assertEqual(0, self.invoke(version="1.101.0", at=datetime(2026, 11, 13, 3), held=True, texts=texts))
-        self.assertEqual(["Rust 1.100.0 out", "Rust 1.101.0 out"], [title for title, _ in texts])
+        self.assertEqual(["Rust upgrade waits on an untested build", "Rust upgrade waits on an untested build"], [title for title, _ in texts])
 
     def test_clippy_diagnostics_finish_trial_but_non_diagnostic_exit_fails(self) -> None:
         clone = self.scratch / "rust-release-trial-1.100.0"
@@ -423,8 +453,8 @@ class RustReleaseTests(unittest.TestCase):
         assert trial["status"] == "finished"
         self.assertEqual((1, 1), (trial["errors"], trial["error_crates"]))
         self.assertEqual("cargo", runner.calls[-1][0][0])
-        self.assertIn("1 error in 1 crate", texts[0][1])
-        self.assertIn("cargo-mend builds", texts[0][1])
+        self.assertIn("1 error", texts[0][1])
+        self.assertIn("A tool for repairing Rust builds compiled with 1.100.0", texts[0][1])
         self.assertIn("1 error in 1 crate, cargo-mend builds", rust_release.report_line()[0])
 
         rust_release.state_path().unlink()

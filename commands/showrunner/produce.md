@@ -366,11 +366,10 @@ When a unit director is blocked on a full context, first capture its pane to
 confirm the block remains and no compaction is running. Type `/compact` into its pane with
 `tmux send-keys -t <pane> -l`, then send `Enter` separately.
 
-**Resume.** To bring back a unit director whose session ended, first run
-   `~/.claude/scripts/lib/py ~/.claude/scripts/accounts/accounts.py env unit`. If it exits nonzero, do not resume and tell the user its line. Its output (empty for the default account) is `<account>`; put it verbatim before both commands below.
-   Use `<account>claude --resume <session-id> <flags> --remote-control <session> -n <session>`, which keeps its link and its place in the list.
-   First run `<account>$HOME/.claude/scripts/lib/py $HOME/.claude/scripts/shutdown/shutdown.py launch-blocked --restart-of <session-id>`. Continue only when it exits 1. On any other exit, do not resume and tell the user its line; exit 0 means the account is held by a shutdown, and `/shutdown restart` brings the unit back.
-   Get `<flags>` first, from `bash -c 'source ~/.claude/scripts/agents/agents_config.sh && agents_resolve production.director || exit 1; [[ "$AGENT_FAMILY" == claude ]] || { echo "unit directors launch only on claude; production.director resolves to $AGENT_FAMILY ($AGENT_MODEL)" >&2; exit 1; }; agents_claude_args'`, which prints `--model <model> [--effort <effort>]`. If it exits nonzero, stop and tell the user its line; never run `claude --resume` without the flags.
+**Resume.** To bring back a unit director whose session ended, use
+   `$HOME/.claude/scripts/lib/py $HOME/.claude/scripts/production/add_unit.py --production PRODUCTION_DOC <name> --plan <unit plan> --resume <session-id> --cwd <recorded cwd>`.
+   The launcher keeps the unit's recorded account and model, checks shutdown holds, and preserves its name and Remote Control link.
+   If it reports no recorded account, stop and tell the user its line; give `--account "claude N"|default` only when the user chooses the account.
 </LaunchUnits>
 
 ---
@@ -557,7 +556,9 @@ notice to the unit director before any merge command runs:
    phase no merge design check judged (`report` and `watch` leave it out). The
    default regime is `after`; both counts default to zero. Give `--scratch
    <SCRATCH>` to keep its merge message and test log there. For a phase shrink
-   notice, add `--shrink`; omit `--review-trial` and `--delivers`. Add
+   notice, add `--shrink`; for a unit's closing as-built commit (its as-built
+   docs and the plan's deletion, after its last phase merged), add
+   `--as-built`; with either, omit `--review-trial` and `--delivers`. Add
    `--cancel-prior` only with `Push: validate_and_push` when this push supersedes
    an older queued or running CI run on the merge branch and no CI point is
    watching its result or diagnosing a red run. The script checks ancestry,
@@ -945,8 +946,7 @@ message is the one action or fact, under 500 characters, per the message guide. 
 what the user does with `--action`, or says nothing is needed with
 `--no-action`. Emergency (`--need blocked`) is only for an action the user must
 take now. Exit 0 means sent. On `FAILED` (exit 3), fall back to PushNotification
-with the same `Action: <what the user does>` or `No action needed.` first line,
-and say so in the log. Never
+with the `fallback text:` that `send.py` printed, and say so in the log. Never
 read or print `~/.config/pushover/env`. Every attempt is logged in
 `~/.local/state/message/log.jsonl`.
 
@@ -1114,7 +1114,8 @@ that condition.
    a dirty worktree, an unmerged branch, or a lower showrunner that still runs
    and reports to this one (**Nested showrunners** above). It promotes main, retires the unit
    worktrees and branches, removes the update instance, removes the
-   production's links in the showrunner tree, archives the production's
+   production's links in the showrunner tree, deletes its own footer, pause,
+   open-question and state files, archives the production's
    phase notes in the vault, wraps and pushes the doc, and prints the final report.
    Leave tmux sessions for the user to close.
 </Wrap>

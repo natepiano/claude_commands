@@ -19,7 +19,7 @@ The design is `~/.local/state/plan-backlog/2026-10-13-user-message-clarity.md`, 
 - **Project:** `~/.claude` config repo, plus the style repo `~/rust/nate_style`. Worktree `/home/natepiano/worktrees/claude-build-followups-message-clarity`, branch `build-followups-message-clarity` (unit `message-clarity-unit`); name both in every dispatch. Guide files go in the nate_style worktree `/home/natepiano/worktrees/nate_style-message-clarity`, branch `message-guide` (the showrunner merges it to nate_style main with the phase; showrunner's call 2026-10-13).
 - **Project started:** 2026-10-13T11:38:57.992+00:00
 - **Stack:** Python 3 standard library, checked by basedpyright; zsh; Markdown commands and rule files; `claude -p` for the reviewer.
-- **Layout:** `scripts/notify/` (owned: `pushover.py`, `user_action.py`, new `review.py`, `reviewer_prompt.md`, tests) · `scripts/message/send.py` and `commands/message.md` (owner shutdown-unit; also touches) · `commands/alert_user.md`, `commands/showrunner/produce.md` `<Notify>` (hub, owner stalls-unit; also touches) · `docs/user_facing_explanation.md` · new `commands/message_style.md`, `commands/message_review.md` · new `scripts/hooks/pre-tool-use-push-gate.py` · `scripts/production/update_registration.py`, `scripts/hooks/showrunner_footer.py` (Phase 4) · `scripts/nightly_review/nightly_review.py`, `commands/nightly_review.md` (Phase 5) · `~/rust/nate_style/message/` (new). State: `~/.local/state/notify/` (`pushover.jsonl` today; new `review.jsonl`, `held/`, `failed/`, `review_off`).
+- **Layout:** `scripts/notify/` (owned: `pushover.py`, `user_action.py`, new `review.py`, `reviewer_prompt.md`, tests) · `scripts/message/send.py` and `commands/message.md` (owner shutdown-unit; also touches) · `commands/alert_user.md`, `commands/showrunner/produce.md` `<Notify>` (hub, owner stalls-unit; also touches) · `docs/user_facing_explanation.md` · new `commands/message_style.md`, `commands/message_review.md` · new `scripts/hooks/pre-tool-use-push-gate.py` · `scripts/production/update_registration.py`, `scripts/hooks/showrunner_footer.py` (Phase 5) · `scripts/nightly_review/nightly_review.py`, `commands/nightly_review.md` (Phase 6) · `~/rust/nate_style/message/` (new). State: `~/.local/state/notify/` (`pushover.jsonl` today; new `review.jsonl`, `held/`, `failed/`, `review_off`).
 - **Key files:**
   - `scripts/notify/pushover.py` — `parse` 133, `posted_message` 172, `refuse` 178, `send` 185: parses, checks the action (`parse_user_action`, `refused_at`), builds `message = posted_message(...)` (the `Action: …` / `No action needed.` first line + body), reads keys, posts, logs to `LOG_FILE` (`pushover.jsonl`). Limits `TITLE_MAX` 250, `MESSAGE_MAX` 1024. Exit 0 sent, 1 Pushover refused/unreachable, 2 refused before sending/usage/keys. `post: Post` is injectable for tests.
   - `scripts/notify/user_action.py` — `ActionRequired(text)`, `NoActionRequired`, `parse_user_action`, `refused_at`, `first_line`, `REFUSED_BEFORE_SENDING`, `FIX`.
@@ -36,7 +36,7 @@ The design is `~/.local/state/plan-backlog/2026-10-13-user-message-clarity.md`, 
   - `commands/alert_user.md` — the alert send line and fallback.
 - **Test lanes:** none (no `tests/` directories); tests sit beside the code as `test_*.py` and import their sibling by bare name.
 - **Build:** none.
-- **Test:** `python3 -m unittest discover -s scripts/notify -p 'test_*.py'` and `python3 -m unittest discover -s scripts/message -p 'test_*.py'`; Phase 4 adds `-s scripts/production` and `-s scripts/hooks`; Phase 5 adds `-s scripts/nightly_review`.
+- **Test:** `python3 -m unittest discover -s scripts/notify -p 'test_*.py'` and `python3 -m unittest discover -s scripts/message -p 'test_*.py'`; Phase 5 adds `-s scripts/production` and `-s scripts/hooks`; Phase 6 adds `-s scripts/nightly_review`.
 - **Lint:** `basedpyright <changed .py files>` — pass is its `0 errors, 0 warnings` line (it exits 3 on the missing `.venv`).
 - **Invariants:**
   - **No test or live check reaches the phone** (user rule, memory `phone-push-must-be-actionable`; showrunner 2026-10-13). Tests fake the reviewer process and `post`; a live check uses `review.py replay` or `--dry-run`, which never posts.
@@ -92,72 +92,78 @@ The design is `~/.local/state/plan-backlog/2026-10-13-user-message-clarity.md`, 
 
 **Gotchas:** without an explicit instruction, the reviewer repeats the action line at the top of its body; `validate` strips it. A sender killed mid-post can cause one repeat post after 120 s, because the remote accept and the local release cannot be atomic.
 
-### Phase 3 — send.py's review outcomes, the built-in push gate and every script's fixed push text  · status: todo
+### Phase 3 — send.py's review outcomes, the built-in push gate and every script's fixed push text  · status: done
+
+#### As-built
+
+- `send.py` passes `--answerable` to `pushover.py` when the send has no `--from` and `default_sender()` resolved a session name; `--answerable` is an internal flag (only with `--to user`), and `remote()` forwards it. Outcomes for `--to user`: pushover exit 4 → `HELD: pushover: held for review: …` plus the numbered questions (exit 4); exit 0 with `pushover: sent as rewritten:` → `SENT: to the user, rewritten:` followed by the sent title, action and body lines, untruncated; refusal (exit 2 with `refused before sending:`) → `REFUSED`; any other failure (exit 1, exit 2 for missing keys, timeout) → `FAILED: the user was not reached: <why> fallback text:` and one line.
+- The fallback line is `FailedPush.text`: `<title> — <action line>`, whitespace-collapsed, at most 200 characters, cut at a word boundary with `…`. Built-in PushNotification takes only `message` (one line under 200 characters, no title), so the gate compares that one line.
+- `pushover.py` prints `pushover: reviewed JSON: {title, action, body[, held_source, held_identity]}` before posting; `held_*` appear when a revision claimed a hold, with `held_identity = review.hold_identity(hold)` (sha256 of the hold record). `send.py` parses it into `FailedPush`, so the fallback carries the reviewed text.
+- `remote()` takes the first `SENT|HELD|SKIPPED|QUEUED|FAILED|REFUSED: ` line of the ssh output as the header and keeps every line after it, prefixed `on <host>: `. The far side runs with `CLAUDE_PID=` empty, so it never writes a marker; on `FAILED` it prints `send.py: failed push JSON: …` to stderr, and the originating `send.py` writes the marker with `held_machine=<host>`.
+- `scripts/hooks/pre-tool-use-push-gate.py` (PreToolUse, matcher `PushNotification`) allows only when `failed/<session_id>.json` is under 600 s old and the push's `message` equals the marker's `fallback` (whitespace-normalised); it then releases the named hold and deletes the marker, under `failed/.lock`. Otherwise it denies with `PushNotification is only the fallback for a failed send. Send with ~/.claude/scripts/message/send.py --to user (see /alert_user); it is reviewed for clarity first.` Any exception allows and prints `push gate: <type>: <error>` to stderr.
+- Script push texts pass the guide's `push` and `all` checklists, and every script sends with `--from <script name>`, so none is held. Quota status notes that ask nothing of the user go to the quota log (`quota status <name>: …`), not the phone.
+
+**Files:**
+- `scripts/message/send.py` — `HELD`, rewritten `SENT`, `--answerable`, `FailedPush`, `user_failure()` marker writer, remote header parsing
+- `scripts/notify/pushover.py` — `pushover: reviewed JSON:` line with the claimed hold's source and identity
+- `scripts/notify/review.py` — `hold_identity(held)`, `release_if_matches(source, identity)`, `review.py release --identity <id> -- <source>`
+- `scripts/hooks/pre-tool-use-push-gate.py` / `test_push_gate.py` — the gate and its tests
+- `commands/message.md` — `HELD` and rewritten `SENT` outcomes; `commands/{alert_user,build/report,fix,watcher}.md`, `commands/showrunner/produce.md` `<Notify>` — a failed send to the user falls back to PushNotification with the printed `fallback text:`; `/message` keeps no fallback between sessions
+- `scripts/buildlog/rust_release.py`, `scripts/lint/sweep.py`, `scripts/production/{ci_points,codex_winddown}.py`, `scripts/shutdown/{restart,settle}.py`, `scripts/whoami/quota_alert.py` and their tests — fixed push texts; `shutdown/record.py`, `shutdown/shutdown.py` and `message/escalate.py` already passed
+
+**Binds later work:** The marker `~/.local/state/notify/failed/<session_id>.json` (`NOTIFY_STATE_DIR` overrides the base) holds `time`, `title`, `action`, `body`, `message`, `fallback`, and optional `held_source`, `held_identity` (`review.hold_identity`) and `held_machine` (empty = local). It is written by `send.py` only under a Claude session (`~/.claude/sessions/$CLAUDE_PID.json` → `sessionId`) on every user-delivery failure, never on a refusal. On a matching fallback the gate releases the hold before consuming the marker: locally via `review.release_if_matches(source, identity)`, or `ssh -o BatchMode=yes -o ConnectTimeout=10 <machine> '~/.claude/scripts/lib/py ~/.claude/scripts/notify/review.py release --identity <id> -- <source>'`; any gate error allows. `release_if_matches` reads only `held/<id>.json`, so a claimed `.sending` hold is not released and can still post after the fallback — the phase "A fallback push never lets a claimed hold post too, and the reviewer passes its own rewrite" owns that. The hook stays inactive until the showrunner adds the `settings.json` PreToolUse entry `{"matcher": "PushNotification", "hooks": [{"type": "command", "command": "\"$HOME/.claude/scripts/lib/py\" \"$HOME/.claude/scripts/hooks/pre-tool-use-push-gate.py\""}]}`.
+
+**Gotchas:** The live reviewer is not stable on its own rewrite (2 of 4 rewrites re-passed; one flipped to `ask`, one kept failing push-body-under-500 on about 330 characters), so `review.py check` over the script texts gives `send` for 6 of 15 and a reword-only `rewrite` for 9, never `ask`. Work that builds on `review.review` (questions, the nightly sample) sees that noise until the reviewer is stable.
+
+**Ruled out:** Denying the fallback outright while a claim is live — the user could get no push at all.
+
+### Phase 4 — A fallback push never lets a claimed hold post too, and the reviewer passes its own rewrite  · status: todo
 
 #### Work Order
 
-**Goal:** A session's push can be held with questions and its writer sees exactly what was sent; Claude's built-in PushNotification works only right after a failed send and carries the reviewed text; every script's fixed push text passes the guide.
+**Goal:** When the push gate allows a failed revision's fallback, the held version that revision replaced does not reach the phone afterwards (a gate error still allows the fallback, so a rare duplicate stays possible), whether it still sits in `held/` or an expiry worker has claimed it. The reviewer leaves a text that meets the guide unchanged, so a clean script text gets `send` every time.
 
 **Spec:**
-- `send.py`:
-  - `answerable` is true when the send has no `--from` and `default_sender()` resolved a session name; `user()` passes `--answerable` to pushover then. `remote()` forwards `--answerable` for a `--to user` send that is answerable here, and `send.py` accepts it as an internal flag (`--answerable`, only with `--to user`).
-  - Pushover exit 4 → new outcome `held` (printed `HELD: <the questions, all lines, untruncated>`, exit 4); `remote()` recognises `HELD`. Exit 0 with `sent as rewritten:` → `SENT: to the user, rewritten:` followed by the sent text lines (not passed through `one_line`).
-- `commands/message.md` "Outcomes and recovery": add `HELD: <questions>` (exit 4): the reviewer held your push; send a revision with the answers within 5 minutes (the same `--summary` is not required); a revision is never held again; with no revision the reviewer's version goes out at 5 minutes. And: `SENT: to the user, rewritten:` shows exactly what the user received.
-- On `FAILED` for a `--to user` send (pushover exit 1 after review), `send.py` writes `~/.local/state/notify/failed/<session_id>.json` (`time`, the reviewed title/action/body that failed to post) when it runs under a Claude session (session id from the `~/.claude/sessions/$CLAUDE_PID.json` record), and its `FAILED:` output ends with `fallback text:` and the reviewed text, so the fallback carries it. `pushover.py` prints the reviewed text on its failure path for `send.py` to pass on.
-- New `scripts/hooks/pre-tool-use-push-gate.py` (PreToolUse, matcher `PushNotification`): reads the hook payload's `session_id`; allows when `failed/<session_id>.json` is under 10 minutes old and deletes it; otherwise denies with: `PushNotification is only the fallback for a failed send. Send with ~/.claude/scripts/message/send.py --to user (see /alert_user); it is reviewed for clarity first.` Any hook error allows (a push is never lost) and prints the error to stderr. Test file `scripts/hooks/test_push_gate.py`.
-- Proposed `settings.json` lines for the showrunner (not committed): a `PreToolUse` entry `{"matcher": "PushNotification", "hooks": [{"type": "command", "command": "~/.claude/scripts/lib/py ~/.claude/scripts/hooks/pre-tool-use-push-gate.py"}]}` (copy the exact command form the existing `mcp__brp__brp_launch` entry uses).
-- `commands/alert_user.md` and produce.md `<Notify>`: the `FAILED` fallback line becomes "fall back to PushNotification with the `fallback text:` that `send.py` printed".
-- Fixed push texts: read each script's user-bound text once against the guide's `push` and `all` checklist, and fix every one that fails where it is written: `scripts/buildlog/rust_release.py`, `scripts/lint/sweep.py`, `scripts/production/ci_points.py`, `scripts/production/codex_winddown.py`, `scripts/shutdown/{record,restart,settle,shutdown}.py`, `scripts/whoami/quota_alert.py`, `scripts/message/escalate.py` (only the text it composes). Each sends with `--from <script name>` (add it where missing, so the reviewer never holds a script). Their tests that assert the old text change with it.
-- Unit director's note in the phase notice: each script file's owner unit, so the showrunner can tell them.
-
-- Remote outcomes: `send.py`'s output is a header line (`SENT|HELD|FAILED|REFUSED|SKIPPED|QUEUED: …`) followed by payload lines; `remote()` finds the last header line in the ssh output and keeps every line after it, so `HELD` questions, rewritten `SENT` text and `fallback text:` survive the hop. The failure marker is written by the originating machine's `send.py` for its own session after `remote()` returns `FAILED`; the far side never writes one.
-- A marker is written for every user-delivery failure: pushover exit 1, exit 2 without `refused before sending:` (missing keys), and a pushover timeout. A refusal writes none. The marker holds the reviewed title and message.
-- The push gate allows only when the PushNotification's title and message match the marker's reviewed text (whitespace-normalised), then deletes the marker; a mismatch denies and keeps it. Tests: mismatched content denied, a second use denied.
-- Fallback lines: `commands/build/report.md`, `commands/fix.md`, `commands/watcher.md` and `commands/message.md` say a failed send to the user falls back to PushNotification with the `fallback text:` `send.py` printed; `/message` keeps "no fallback" for sends between sessions.
+- Follow-up from Phase 3 (landing rule, round 3): two fixes left one case open. The gate releases the restored hold through `review.release_if_matches`, which reads only `held/<id>.json`. If `review.py due` has claimed that hold (renamed to `<id>.sending`) and the worker exits before posting, the release finds nothing, the fallback is allowed, and stale-claim recovery posts the held version once more after `CLAIM_STALE_SECONDS`. A live claim posts it at once. Either way the user gets two pushes.
+- Release protocol (showrunner's call 2026-10-13, after Phase 3's phase review; losing a push is worse than a rare second copy): `review.py` keeps a delivered record keyed by the hold's identity (`held/delivered/<identity>`, kept 1 hour). `release_if_matches(source, identity)` answers, under the review lock: `delivered` (the record exists), `released` (a matching `.json`, or matching claim older than `CLAIM_STALE_SECONDS`, is deleted and a cancel mark `held/<id>.cancel` holding the identity is written), `posting` (a matching younger claim), or `none` (no hold, or one with another identity, left alone).
+- `due()` and a revision's post re-check, under the lock immediately before posting, that their claim still exists and carries no cancel mark for its identity; a cancelled claim is dropped unposted. A successful post writes the delivered record before releasing the lock.
+- The gate: `delivered` denies the fallback (`The held version of this push was already sent.`); `released` and `none` allow it; `posting` waits up to 20 s, re-asking each second, then follows the delivered or released answer, and allows on timeout. The marker is consumed in every case. Any gate error allows the fallback (a push is never lost), so a rare duplicate remains possible; this plan accepts it.
+- `review.py release --identity I -- SOURCE` prints the answer word on one line; the gate's remote path reads it from the ssh output.
+- Tests (deterministic, fakes only): expiry delivers then the fallback arrives (local and remote) → denied; posting then worker fails → allowed after release; a suspended worker resuming after release → drops its claim unposted (interleaving test); a newer hold with another identity is kept.
+- Reviewer stability (measured 2026-10-13 after Phase 3's repair round 3): re-checking the reviewer's own rewrite gave `send` for 2 of 4 texts; one flipped to `ask`, and one kept failing `push-body-under-500` on a body of about 330 characters. Length limits are counted by `review.validate` in code, never judged by the model; the reviewer prompt (`scripts/notify/reviewer_prompt.md`) says a text that meets every rule is returned unchanged with `send`, and a rule failure must quote the failing words. Test: a fake reviewer that flags `push-body-under-500` on a short body is overruled by the code count.
+- Review findings folded after Phase 3 (unit director's calls): length rules are counted in code against both the original and the proposed text (title under 45 characters, action plus body under 500), apart from the 250/1024 transport limits; a false length failure is removed and the other failures kept. A rule failure carries quoted words (`{rule, quote}` in the reviewer schema, `review.py` 196); a quote not found in the text is rejected. The prompt rule that passing text returns unchanged already exists (`reviewer_prompt.md` 3): this phase enforces it. `quota_alert.UserPush.ask: Ask | None` becomes two delivery roles (a phone push with its ask, a log-only note). The checkpoint notice hands the showrunner a fake-payload check that the installed settings hook denies a push with no marker.
+- Live gate: the 15 Phase 3 script texts (`round3_samples.txt` shape, rendered from the code) each get at most three live checks; a quoted failure is fixed in the script and that script re-checked; a text still not `send` after three is listed in the notice. Deterministic tests, not the live gate, prove the code rules.
 
 **Files:**
-- `scripts/message/send.py` — `HELD`, rewritten `SENT`, `--answerable`, failure marker and `fallback text:`
-- `scripts/message/test_send.py` — those, plus `HELD`, rewritten `SENT` and `--answerable`
-- `commands/message.md` — `HELD` and rewritten `SENT` outcomes
-- `scripts/notify/pushover.py` — prints the reviewed text on failure
-- `scripts/notify/test_pushover.py` — that
-- `scripts/hooks/pre-tool-use-push-gate.py` — new
-- `scripts/hooks/test_push_gate.py` — new
-- `commands/alert_user.md` — fallback line
-- `commands/showrunner/produce.md` — `<Notify>` fallback line
-- `scripts/buildlog/rust_release.py` — push text, `--from`
-- `scripts/lint/sweep.py` — push text
-- `scripts/production/ci_points.py` — push text, `--from`
-- `scripts/production/codex_winddown.py` — push text
-- `scripts/shutdown/record.py` — push text
-- `scripts/shutdown/restart.py` — push text
-- `scripts/shutdown/settle.py` — push text
-- `scripts/shutdown/shutdown.py` — push text
-- `scripts/whoami/quota_alert.py` — push text
-- `scripts/message/escalate.py` — the text it composes
-- `scripts/buildlog/test_rust_release.py` — where the old text is asserted
-- `scripts/lint/test_sweep.py` — where the old text is asserted
-- `scripts/production/test_ci_points.py` — where the old text is asserted
-- `scripts/production/test_codex_winddown.py` — where the old text is asserted
-- `scripts/shutdown/test_record.py` — where the old text is asserted
-- `scripts/shutdown/test_restart.py` — where the old text is asserted
-- `scripts/shutdown/test_settle.py` — where the old text is asserted
-- `scripts/shutdown/test_shutdown_cli.py` — where the old text is asserted
-- `scripts/whoami/test_quota_alert.py` — where the old text is asserted
-- `scripts/message/test_escalate.py` — where the old text is asserted
-- `commands/build/report.md` — fallback line
-- `commands/fix.md` — fallback line
-- `commands/watcher.md` — fallback line
+- `scripts/notify/review.py` — `release_if_matches` outcomes and the `release` command's output
+- `scripts/notify/test_review.py` — those cases
+- `scripts/hooks/pre-tool-use-push-gate.py` — deny on `posting`, read the remote outcome
+- `scripts/hooks/test_push_gate.py` — those cases
+- `scripts/notify/reviewer_prompt.md` — unchanged text returns `send`; failures quote their words
+- `scripts/whoami/quota_alert.py`, `scripts/whoami/test_quota_alert.py` — the two delivery roles
+- `scripts/buildlog/rust_release.py` — its push text, only where a quoted rule fails
+- `scripts/buildlog/test_rust_release.py` — its push text, only where a quoted rule fails
+- `scripts/lint/sweep.py` — its push text, only where a quoted rule fails
+- `scripts/lint/test_sweep.py` — its push text, only where a quoted rule fails
+- `scripts/production/ci_points.py` — its push text, only where a quoted rule fails
+- `scripts/production/test_ci_points.py` — its push text, only where a quoted rule fails
+- `scripts/production/codex_winddown.py` — its push text, only where a quoted rule fails
+- `scripts/production/test_codex_winddown.py` — its push text, only where a quoted rule fails
+- `scripts/shutdown/restart.py` — its push text, only where a quoted rule fails
+- `scripts/shutdown/test_restart.py` — its push text, only where a quoted rule fails
+- `scripts/shutdown/settle.py` — its push text, only where a quoted rule fails
+- `scripts/shutdown/test_settle.py` — its push text, only where a quoted rule fails
+- `scripts/production/test_dailies_input.py` — its ci_points send assertions
 
-**Seats:** 2 writers (no test lane; `test` opens as impl)
-- `impl` — `send.py`, `pushover.py`, the push gate hook and their tests, `commands/message.md` and the fallback-line edits in `alert_user.md`, `produce.md`, `build/report.md`, `fix.md`, `watcher.md`; hub: `scripts/message/send.py`
-- `test` (opens as impl) — the ten scripts' fixed texts and their tests
+**Seats:** 2 writers
+- `impl` — `review.py`, `reviewer_prompt.md`, the push gate and their tests; hub: `scripts/notify/review.py`
+- `test` — `quota_alert.py`, the script texts and their tests
 
-**Constraints from prior phases:** Before dispatch, check each of the ten scripts against its owner's branch and worktree for unmerged edits; `scripts/shutdown/*` and `scripts/message/send.py` land only after shutdown-unit's Phases 8–9 merge (showrunner, 2026-10-13), else tell the showrunner which file blocks. Phase 2 built `pushover.py`'s `--answerable` flag and hold path but nothing passes the flag yet; this phase's `send.py` does. Phase 2's contract: pushover exit 0 sent (stdout `sent as rewritten:` + lines on a rewrite), 1 post failed, 2 refused, 4 held; `send.py` outcomes add `HELD` (exit 4); scripts with `--from` are never held (their failed text is rewritten at once and logged `rewritten, script text failed`); `review.py replay` reviews without posting. As built in Phase 2 (dcad3ceb): `pushover.send()` reviews after the action checks and before the keys; exit 4 also covers a revision whose source's hold is claimed by a live sender (`pushover: held for review: this source's push is being sent`); a claim is a stamped rename to `<id>.sending`, and one older than `review.CLAIM_STALE_SECONDS` (120 s) is dead and is recovered by `review.py due` or by a revision; `due` posts one hold at a time; a revision's budget is review 20 s plus post 15 s, inside `send.py`'s 40 s wait. `review.validate` drops a reviewer body line that repeats the action line and an `Action: ` prefix on the reviewer's action. Live reviews take 10–13 s on opus/medium. `review.py check --title T (--action A | --no-action) --text B [--priority N]` is the dry review the gate uses. `config/agents.conf` lines `message_review=claude` / `[message_review.claude] reviewer=opus:medium` were proposed to the showrunner; until added, the reviewer falls back to opus/medium.
+**Constraints from prior phases:** Phase 3 built the gate: the marker `failed/<session_id>.json` holds `fallback`, the restored hold's `source`, its identity (`review.hold_identity`) and the delivery machine; the gate allows when the push's `message` matches `fallback`, consumes the marker, then releases locally or over `ssh -o BatchMode=yes <machine> … review.py release --identity <id> -- <source>`; any gate error allows. Fix 1 released by source and deleted newer holds; fix 2 added the identity check but reads only `.json`. A claim is a stamped rename to `<id>.sending`; `due` takes over a claim older than 120 s.
 
-**Acceptance gate:** Test lines for `scripts/notify`, `scripts/message`, `scripts/hooks`, `scripts/buildlog`, `scripts/lint`, `scripts/production`, `scripts/shutdown`, `scripts/whoami` green; basedpyright 0/0; the hook test covers allow-after-failure, deny otherwise, marker consumed, hook error allows; `review.py check` over each changed script's new text returns `send`.
+**Acceptance gate:** Test lines for `scripts/notify`, `scripts/hooks`, `scripts/message`, `scripts/whoami`, `scripts/buildlog`, `scripts/lint`, `scripts/production`, `scripts/shutdown`, run one after another, green; basedpyright 0/0 on the changed files; the tests above present; the live gate above.
 
-### Phase 4 — Questions in showrunner replies  · status: todo
+### Phase 5 — Questions in showrunner replies  · status: todo
 
 #### Work Order
 
@@ -174,6 +180,9 @@ The design is `~/.local/state/plan-backlog/2026-10-13-user-message-clarity.md`, 
 - Turn identity: registration writes `pending_reviewed.json` in the showrunner's instance directory (`[{text, reviewed}]`); `block_reason` checks the reply against it and deletes it when the reply passes. Later replies carry only the open-question count, as the guide's ask-once rule says.
 - The reviewed-text check runs before the footers-off return in `block_reason` and before `stop-showrunner-footer.py`'s `stop_hook_active` skip; test with footers off and on the retry after a block.
 - A new question is an `open_for_user` object item whose `text` is not in the outstanding list. Registration refuses a new item without `question` ("a new question needs its full text in `question`"); string items and items already outstanding stay reminders. A question never registered is outside this check; the nightly messages pass counts those.
+- Question identity (unit director's call after Phase 3's phase review): a question hold is keyed by `sha256(slug + item text)[:16]`, never by slug alone, so two held questions from one showrunner revise independently; test that case. `judgment_state(path, step)` stays a parser (it is also called for logging, `update_registration.py:334`); the question review runs once, in registration, after parsing. `review.py` publishes its question-mode API before either seat starts: `review_question(slug, text, revision) -> QuestionOutcome`, guide tags `question,all`, its own `questions/` store, revision found by the same key.
+- Turn identity: `pending_reviewed.json` holds `{session_id, turn, items: [{text, reviewed}]}`; a second registration in the same turn adds to it, a held question in a batch fails the whole registration and writes nothing, and the file is deleted only once the whole Stop-hook check passes. Tests: repeated registration, a partly held batch, an unrelated footer rejection, a later turn.
+- Types: reminders, questions awaiting facts and reviewed questions are separate record types, converted from JSON at the boundary; `Outstanding` gains no further bare optional fields.
 
 **Files:**
 - `scripts/production/update_registration.py` — `question` field and its review
@@ -195,7 +204,7 @@ The design is `~/.local/state/plan-backlog/2026-10-13-user-message-clarity.md`, 
 
 **Acceptance gate:** Test lines for `scripts/production`, `scripts/hooks`, `scripts/notify` green; basedpyright 0/0; tests cover a held question failing registration, its rerun accepted, a reply missing the reviewed text blocked, an unrecorded `(recommended` line blocked.
 
-### Phase 5 — Nightly messages pass  · status: todo
+### Phase 6 — Nightly messages pass  · status: todo
 
 #### Work Order
 
@@ -221,6 +230,6 @@ The design is `~/.local/state/plan-backlog/2026-10-13-user-message-clarity.md`, 
 - `impl` — `review.py sample` and its tests; hub: `scripts/notify/review.py`
 - `test` (opens as impl) — `nightly_review.py`, its test, `commands/nightly_review.md`, `commands/nightly_next.md`
 
-**Constraints from prior phases:** `review.jsonl` line shape from Phase 2; reply review uses guide tags `reply,all`; the question review of Phase 4 already covers replies that ask.
+**Constraints from prior phases:** `review.jsonl` line shape from Phase 2; reply review uses guide tags `reply,all`; the question review of Phase 5 already covers replies that ask. Unregistered questions (unit director's call after Phase 3's phase review): the nightly pass also counts replies that ask the user a question no registration record carries, reported apart from failures and from `Unreviewed`; test a transcript holding one. Transcript discovery uses each showrunner session's own account (showrunners run on the showrunner account, `scripts/production/add_showrunner.py:120`) and its recorded transcript path, and filters by each reply's timestamp, not file modification time; test distinct account homes, a renamed session and an old transcript modified today.
 
 **Acceptance gate:** Test lines for `scripts/nightly_review` and `scripts/notify` green; basedpyright 0/0; `review.py sample` over two real transcripts prints verdicts and posts nothing.
