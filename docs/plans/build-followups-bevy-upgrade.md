@@ -240,40 +240,40 @@ def line(record: Record, zone: ZoneInfo, now: datetime, next_due: datetime | Non
 
 ### Phase 5 — The dailies carries the upgrade as a topic read from the record  · status: done
 
-#### Work Order
+#### As-built
 
-**Goal:** Every dailies of a production with an open watch shows one `Bevy upgrade` topic whose text is the record's line, and it needs the user only while a git pin waits for their answer.
+While a watch is open, every dailies carries a `Bevy upgrade` topic whose text is the upgrade's `line` sentence, marked as needing the user while a git pin has no answer. The builder reads it from the upgrade command, never from the record file.
 
-**Spec:**
-Work only in the worktree and branch the Delegation Context names. This phase edits three files owned by other units (the showrunner allowed it; name them in the checkpoint notice as `also touches`).
+```python
+# bevy_upgrade.py
+class UpgradeUpdate(TypedDict): update: str; needs_user: bool
+# upgrade_report.py
+def waiting(record: Record) -> int: ...   # entries whose state is `git ready` with no answer
+# dailies_input.py
+class OpenBevyUpgradeWatch(NamedTuple): update: str; needs_user: bool
+class NoOpenBevyUpgradeWatch(NamedTuple): ...
+class BevyUpgradeUnavailable(NamedTuple): reason: str
+BevyUpgradeWatch = OpenBevyUpgradeWatch | NoOpenBevyUpgradeWatch | BevyUpgradeUnavailable
+def bevy_upgrade_watch(production: Production) -> BevyUpgradeWatch: ...
+def bounded_bevy_update(text: str) -> str: ...
+```
 
-`bevy_upgrade.py`: `line --json` prints one JSON object, `{"update": "<the line sentence>", "needs_user": <true when an entry is git ready with no answer>}`, or nothing when there is no open record. Stdout holds that object and nothing else, also when the pins re-read failed: the sentence then carries its pins clause. `needs_user` is `upgrade_report.waiting(record) > 0`. `waiting(record: Record) -> int` is a new function in `upgrade_report.py`: the number of entries whose state is `git ready` and whose `answer` is `None`. `upgrade_report.line` takes its `(<k> waiting for your answer)` count from the same function, so the sentence and `needs_user` never disagree.
-
-`scripts/production/dailies_input.py`, directly after the review watch block (the `report("review watch", …)` call near line 910):
-
-- Run `"<python>" <script> --production <production doc> line --json`, where `<script>` is `DAILIES_BEVY_UPGRADE` when set, else `scripts/bevy_upgrade/bevy_upgrade.py` beside this repo's `scripts/production/`. Timeout 30 s.
-- Exit 0 with a JSON object: append `{"title": "Bevy upgrade", "update": <update>, "eta": "no ETA stated yet", "needs_user": <needs_user>}` to `topics_out`, then `report("bevy upgrade", "ok", <update>)`.
-- Exit 0 with no output: no topic; `report("bevy upgrade", "ok", "no open watch")`.
-- Any other outcome (non-zero exit, timeout, output that is not that object): append the topic with update `the record could not be read: <first stderr line or the reason>` and `needs_user` false, and `report("bevy upgrade", "unavailable", <the same text>)`. The step is never `failed`: the command file tells the showrunner to stop and correct the input on a `failed` line, and the builder prints one only as it exits 2. `unavailable` is the state `phase tables` and `counts` already print for a report that is still built.
-
-`commands/showrunner/dailies.md`, in **Gather**, after the Review watch item: one item saying the input builder adds the `Bevy upgrade` topic from the record while a watch is open, and that nothing else in the report states the upgrade's status. In **Output**, beside the `phase tables: unavailable` sentence: when the builder prints `bevy upgrade: unavailable — <reason>`, continue; the report carries the topic with that reason.
+- **`line --json`.** Prints one object `{"update": <the line sentence>, "needs_user": <bool>}`, or nothing for no record or a closed one. `needs_user` is `waiting(record) > 0`, read from the record the sentence is built from; `line` uses the same count for `(<k> waiting for your answer)`.
+- **Lookup.** `bevy_upgrade_watch` runs `<sys.executable> <script> --production <doc> line --json` with a 30-second timeout. The script is `DAILIES_BEVY_UPGRADE`, else `scripts/bevy_upgrade/bevy_upgrade.py`. Empty or whitespace-only output is `NoOpenBevyUpgradeWatch`. An object with a non-blank single-line `update` string and a boolean `needs_user` is `OpenBevyUpgradeWatch`; extra keys are ignored. Everything else is `BevyUpgradeUnavailable`: a non-zero exit, a timeout, an `OSError`, invalid JSON, or an object of another form. Its reason is the first stderr line when there is one, else `command exited <code>`, `timed out after 30 seconds`, or the error text of the parser or the operating system.
+- **Topic.** `run()` adds the topic after the review watch topic, with the title `Bevy upgrade`, the ETA `no ETA stated yet` and the lookup's `needs_user`. For an unavailable lookup the text is `the record could not be read: <reason>` and `needs_user` is false. `bounded_bevy_update` cuts the text to the smallest finite value in `dailies_render.LENGTHS`, ending in `…`. With no open watch there is no topic.
+- **Step line.** `bevy upgrade: ok — <text>`, `bevy upgrade: ok — no open watch`, or `bevy upgrade: unavailable — <text>`. A failed lookup never fails the builder.
 
 **Files:**
-- `scripts/bevy_upgrade/bevy_upgrade.py` — `line --json`.
-- `scripts/bevy_upgrade/upgrade_report.py` — `waiting`, used by `line`.
-- `scripts/bevy_upgrade/test_upgrade_report.py` — `waiting` with an unanswered, an approved and a declined git pin.
-- `scripts/bevy_upgrade/test_cli.py` — `line --json` with and without an unanswered git pin, with no record, and with a failed pins read.
-- `scripts/production/dailies_input.py` — the topic, after the review watch block.
-- `scripts/production/test_dailies_input.py` — the topic present, absent and failed, through a stub script.
-- `commands/showrunner/dailies.md` — the Gather item and the `unavailable` sentence in Output.
+- `scripts/bevy_upgrade/bevy_upgrade.py` — `line --json` and `UpgradeUpdate`.
+- `scripts/bevy_upgrade/upgrade_report.py` — `waiting`.
+- `scripts/bevy_upgrade/test_cli.py`, `test_upgrade_report.py` — their tests.
+- `scripts/production/dailies_input.py` — the lookup, the cut and the topic (owner phase-tables-unit).
+- `scripts/production/test_dailies_input.py` — the topic's tests (owner phase-tables-unit).
+- `commands/showrunner/dailies.md` — Gather item 7 and the Output sentence for the `unavailable` line (owner phase-tables-unit).
 
-**Seats:** 2 writers — the split is by directory, and each writer tests its own side.
-- `impl` — `scripts/bevy_upgrade/bevy_upgrade.py`, `scripts/bevy_upgrade/test_cli.py`, `scripts/bevy_upgrade/upgrade_report.py`, `scripts/bevy_upgrade/test_upgrade_report.py`.
-- `test` opens as impl — `scripts/production/dailies_input.py`, `scripts/production/test_dailies_input.py`, `commands/showrunner/dailies.md`. It codes against the JSON object above and a stub script set through `DAILIES_BEVY_UPGRADE`, the way `watch_stubs` in `test_dailies_input.py` replaces `review_regime.py`.
+**Gotchas:** Every test in `test_dailies_input.py` runs behind a `DAILIES_BEVY_UPGRADE` stand-in set in the shared `setUp`, so none reaches the real upgrade command, which for an open watch calls the notifier. The timeout test replaces `subprocess.run` in-process and waits for nothing. A change that lengthens the `line` sentence shows in the dailies cut at the renderer's limit, 240 characters today.
 
-**Constraints from prior phases:** `bevy_upgrade.py line` prints one sentence for an open record and nothing otherwise. It takes no lock, saves nothing and never changes `announced`, so the dailies never waits behind a running check. `_line(production, now)` in `bevy_upgrade.py` is that verb: for an open record it calls `upgrade_schedule.ensure_job` and `upgrade_schedule.next_check`, two notifier calls through `BEVY_UPGRADE_NOTIFIER`, and never the sender. Every other hand verb that saves makes one `send.py retire` call after its save; `line` makes none and `line --json` must make none. In `test_cli.py` the stand-ins record each call: `tool_args("notifier")` and `tool_args("send")` give the argument lists, `retire_calls()` the retire calls, and `clear_calls()` empties them. `upgrade_report.line(record, zone, now, next_due, pins_error)` builds that sentence; with a failed pins read it ends `; pins not re-read since <YYYY-MM-DD HH:MM zone>`. A `git ready` entry's `answer` is `None` until the user approves or declines. `test_cli.py` sets `BEVY_UPGRADE_FIXTURES` in `setUp`, and its subprocess rejects real network access. In `dailies_input.py`, `report(step, state, detail)` (line 242) prints `<step>: <state> — <detail>`; the states in use are `ok`, `unavailable`, and `failed`, which is printed only before `return 2`.
-
-**Acceptance gate:** `python3 -m unittest discover -s scripts/bevy_upgrade -p 'test_*.py'` and `python3 -m unittest discover -s scripts/production -p 'test_dailies_input.py'` pass. `basedpyright scripts/bevy_upgrade scripts/production/dailies_input.py scripts/production/test_dailies_input.py` prints `0 errors, 0 warnings, 0 notes`. The CLI tests cover `line --json` output that parses as one JSON object when the pins re-read failed. The dailies tests cover the topic with `needs_user` true and false, no topic for empty output, and the `unavailable` form for a non-zero exit: the builder exits 0, prints `bevy upgrade: unavailable — …` and writes the input with the topic. Before the checkpoint notice, trial-merge the owner's tip per the production contract (item 9) and run the dailies tests.
+**Ruled out:** A second copy of the 240 limit in the builder. Shortening the `line` sentence itself.
 
 ### Phase 6 — The migration plan's dependency check sees crates that depend only on Bevy's sub-crates  · status: todo
 
