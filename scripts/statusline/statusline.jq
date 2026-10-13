@@ -60,7 +60,7 @@ def user_time($fmt):
 # That reading stands only while it is under 10 minutes old and its window has
 # not reset; otherwise the response's figure does, so the line never goes blank.
 def window($name; $live):
-  (($ARGS.named.labels // [])[0] // {} | .[$account] // {} | .[$name] // null) as $stored
+  (($ARGS.named.labels // [])[0] // {} | .[$ARGS.named.account // ""] // {} | .[$name] // null) as $stored
   | if ($stored | type) == "object"
        and ($stored.at | type) == "number" and (now - $stored.at) <= 600
        and (($stored.resets_at | type) != "number" or $stored.resets_at > now)
