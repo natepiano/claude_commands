@@ -558,7 +558,7 @@ It drops the "any cargo, rustc or nextest running on the Mac" check. That check 
 
 **Ruled out:** `mac_tries`, `after_decline` and `unreachable`/`reachable`/`battery`/`disk` events (no report line reads them; call rows already record those declines); one row per hold (`forget` would leave half an interval); a waited recorder subprocess (a locked log file kept `hold` from returning while it held `release.lock`); a block key in whole seconds (block, unblock and block within one second shared a key); a wall-clock limit for the report's timed case (a busy machine failed it with no code cause); folding the early-return absence checks into a later phase's scope (later phases only avoid adding new ones).
 
-### Phase 14 — The Mac report counts Mac failures that natedev passed on the same tree  · status: todo
+### Phase 14 — The Mac report counts Mac failures that natedev passed on the same tree  · status: done
 
 #### Work Order
 
