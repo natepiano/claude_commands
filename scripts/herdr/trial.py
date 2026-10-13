@@ -84,8 +84,17 @@ class AgentWaitResult(TypedDict):
     agent: AgentLifecycle
 
 
+class WorkerReadiness(TypedDict):
+    agent_status: str
+    interactive_ready: bool
+
+
+class AgentGetResult(TypedDict):
+    agent: WorkerReadiness
+
+
 class HerdrReply(TypedDict):
-    result: PaneListResult | AgentListResult | CreatedWorkspace | AgentWaitResult | WorkspaceListResult | CreatedTab | SplitPane
+    result: PaneListResult | AgentListResult | CreatedWorkspace | AgentWaitResult | WorkspaceListResult | CreatedTab | SplitPane | AgentGetResult
 
 
 class HerdrError(TypedDict):
@@ -625,8 +634,12 @@ def worker_label(unit: str, role: str) -> WorkerLabel:
     return cast(WorkerLabel, f"{unit}-{role}")
 
 
+def work_record(label: WorkerLabel) -> Path:
+    return scratch_root() / "work" / f"{label}.json"
+
+
 def assigned_work(label: WorkerLabel) -> AssignedWork | NoAssignedWork:
-    path = scratch_root() / "work" / f"{label}.json"
+    path = work_record(label)
     try:
         text = path.read_text()
     except FileNotFoundError:
@@ -636,7 +649,8 @@ def assigned_work(label: WorkerLabel) -> AssignedWork | NoAssignedWork:
 
 
 def record_work(label: WorkerLabel, assignment: AssignedWork) -> None:
-    directory = scratch_root() / "work"
+    record = work_record(label)
+    directory = record.parent
     directory.mkdir(parents=True, exist_ok=True)
     order: WorkerWorkOrder = {"file": str(assignment.file)}
     with tempfile.NamedTemporaryFile(mode="w", dir=directory, prefix=f".{label}-", delete=False) as output:
@@ -644,7 +658,7 @@ def record_work(label: WorkerLabel, assignment: AssignedWork) -> None:
         try:
             _ = output.write(json.dumps(order) + "\n")
             output.close()
-            os.replace(temporary_path, directory / f"{label}.json")
+            os.replace(temporary_path, record)
         finally:
             temporary_path.unlink(missing_ok=True)
 
@@ -665,27 +679,55 @@ def worker_blocked(label: str, expected: str, happened: str) -> NoReturn:
     raise BlockedWorker(f"{label}: {happened}")
 
 
+def worker_readiness(herdr: Herdr, pane: str) -> WorkerReadiness:
+    result = herdr.result("agent", "get", pane)
+    agent = json_object(result.get("agent"), "herdr agent get")
+    status = json_text(agent.get("agent_status"), "herdr agent readiness status")
+    ready = agent.get("interactive_ready")
+    if not isinstance(ready, bool):
+        raise TrialFailure("herdr agent readiness: expected interactive_ready boolean")
+    return {"agent_status": status, "interactive_ready": ready}
+
+
 def work(herdr: Herdr, unit: str, role: str, file: str) -> None:
     label = worker_label(unit, role)
+    milliseconds = timeout_milliseconds("HERDR_TRIAL_TURN_START_TIMEOUT", 60000)
     assignment = AssignedWork(Path(file).expanduser().resolve())
     if not assignment.file.is_file():
         raise TrialFailure(f"work order missing: {assignment.file}")
     pane = herdr.pane_id(label)
+    readiness = worker_readiness(herdr, pane)
+    if not readiness["interactive_ready"] or readiness["agent_status"] not in ("idle", "done"):
+        worker_blocked(label, "worker is ready for its Work Order",
+                       f"agent_status={readiness['agent_status']}, interactive_ready={readiness['interactive_ready']}")
     assignment.report.unlink(missing_ok=True)
     record_work(label, assignment)
     prompt = f"Read and carry out {assignment.file}. When done, write your report to {assignment.report}."
     result = run_program(herdr.argv("agent", "prompt", pane, prompt))
     check_worker_result(result, label, "carry out the assigned work")
+    outcome = wait_for_agent(herdr, label, pane, milliseconds, "--until", "working")
+    if isinstance(outcome, ObservedAgentState) and outcome.status == "working":
+        return
+    if assignment.report.is_file():
+        return
+    work_record(label).unlink(missing_ok=True)
+    happened = f"prompt submitted, no turn started within {milliseconds} ms"
+    write_issue(label, "worker starts a turn on its Work Order", happened)
+    raise TrialFailure(f"{label}: {happened}")
+
+
+def timeout_milliseconds(variable: str, default: int) -> int:
+    try:
+        milliseconds = int(os.environ.get(variable, str(default)))
+    except ValueError as error:
+        raise UsageFailure(f"{variable} must be a nonnegative integer in milliseconds") from error
+    if milliseconds < 0:
+        raise UsageFailure(f"{variable} must be a nonnegative integer in milliseconds")
+    return milliseconds
 
 
 def wait_timeout() -> int:
-    try:
-        milliseconds = int(os.environ.get("HERDR_TRIAL_WAIT_TIMEOUT", "1800000"))
-    except ValueError as error:
-        raise UsageFailure("HERDR_TRIAL_WAIT_TIMEOUT must be a nonnegative integer in milliseconds") from error
-    if milliseconds < 0:
-        raise UsageFailure("HERDR_TRIAL_WAIT_TIMEOUT must be a nonnegative integer in milliseconds")
-    return milliseconds
+    return timeout_milliseconds("HERDR_TRIAL_WAIT_TIMEOUT", 1800000)
 
 
 def wait_for_agent(herdr: Herdr, label: WorkerLabel, pane: str, milliseconds: int,

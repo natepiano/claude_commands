@@ -2,8 +2,8 @@
 """Record argv and replay configured responses without starting external tools.
 
 FAKE_HERDR_RESPONSES maps space-joined argv (excluding the executable) to
-{stdout, code} entries, optionally with stderr. The "default" entry is used
-for unmatched argv. A list of entries replays successive responses, keeping
+{stdout, code} entries, optionally with stderr and write_files (path-to-text
+report fixtures). The "default" entry is used for unmatched argv. A list of entries replays successive responses, keeping
 the final response for subsequent calls.
 """
 
@@ -20,6 +20,7 @@ class CommandResponse(TypedDict):
     stdout: str
     code: int
     stderr: NotRequired[str]
+    write_files: NotRequired[dict[str, str]]
 
 
 def main(argv: list[str]) -> int:
@@ -37,6 +38,8 @@ def main(argv: list[str]) -> int:
     if isinstance(response, list):
         seen = sum(cast(list[str], json.loads(line)) == argv for line in previous)
         response = response[min(seen, len(response) - 1)]
+    for file, text in response.get("write_files", {}).items():
+        _ = Path(file).write_text(text)
     _ = sys.stdout.write(response["stdout"])
     _ = sys.stderr.write(response.get("stderr", ""))
     return response["code"]
