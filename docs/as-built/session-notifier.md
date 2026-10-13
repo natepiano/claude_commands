@@ -85,6 +85,8 @@ The slot is claimed before the check runs, so a concurrent tick or `fire` cannot
 | `start <instance>` | `ENABLED=1`, schedules from now, prints `next_due`. |
 | `resume <instance>` | `ENABLED=1`, keeps `NEXT_DUE` unchanged, and prints `next_due`. A missed slot runs on the next tick; a future slot runs at its existing time. |
 | `stop <instance>` | `ENABLED=0`; `NEXT_DUE` stays. |
+| `pause <instance>` | For the conversation pause: an enabled instance gets `ENABLED=0` and `PAUSED=1`; a stopped one is left alone. Prints nothing. |
+| `unpause <instance>` | Only while `PAUSED=1` is there: `ENABLED=1`, `NEXT_DUE` unchanged, prints `next_due`. Otherwise changes nothing and prints nothing. `start`, `resume`, `stop` and `restart` clear the mark, so a timer someone stopped or started during a pause stays as they left it. |
 | `restart <instance>` | `LAST_RESTART=now`, schedules from now, prints `next_due`. Leaves `ENABLED` alone. |
 | `interval <instance> <min>` | Sets `EVERY`, then does what `restart` does. Bad minutes exit 2 before the instance lookup. |
 | `fire <instance>` | Runs one tick now, ignoring `ENABLED`, `NEXT_DUE` and the hold. Still runs the check and needs a live socket. Prints `next_due` (the clock moves). Exits 0 whatever the send outcome; the outcome is in `fire.log`. |
