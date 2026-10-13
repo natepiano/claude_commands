@@ -63,35 +63,22 @@ The four items of `docs/plans/build-followups-review-pool-next.md`, each placed 
 
 ### Phase 2 — One command gives the showrunner a unit's review history location  · status: done
 
-#### Work Order
+#### As-built
 
-**Goal:** At each merged code checkpoint the showrunner fills the `review merge:` line's session directory from one command's output, with no run records read by hand.
-
-**Spec:**
-
-- New script `scripts/production/unit_run.py`, run through `scripts/lib/py`:
-  `unit_run.py --production <production doc> <unit> [--root <history root>] [--no-mac]`
-- It reads the unit's Worktree cell from the production doc's Units table through `units_table.py`. A unit that has no row exits 1 with `unit_run: no Units row for <unit>`.
-- It reads every `runs/*.jsonl` under the history root (`--root`, else `PLAN_DELEGATE_HISTORY_DIR`, else `~/.local/state/plan-delegate`), keeps the files whose `run_started` event has `working_dir` equal to the Worktree cell after `os.path.normpath`, and chooses the greatest `run_started_at`. A file that is unreadable or holds no `run_started` is skipped.
-- With no local match and without `--no-mac`, it does the same on the Mac over ssh at `collect.MAC_HOST` (`scripts/usage/collect.py`), in one remote command. A failed ssh is reported on stderr as `unit_run: Mac unavailable: <reason>` and counts as no match.
-- On a match it prints exactly one line, tab-separated: `<run id>`, `<machine>` (`natedev` or `mac`), `<run_started_at as ISO-8601 UTC>`. The run id is the file's stem; it is the session directory's name, which is what the merge line carries. Exit 0.
-- With no match anywhere: `unit_run: no run found for <unit> in <worktree>` on stderr, exit 1.
-- In `commands/showrunner/produce.md` <MergeCheckpoint/>, replace the hand lookup (the sentences from "Find the unit's newest run" through "as the session dir's name in the merge line") with the command and one sentence: its first field is the session directory's name for the merge line; on exit 1, send the merge line with `session dir unavailable` and tell `review-unit` why.
-- `commands/review/direct.md`: where the review unit director reads a merge line, a `session dir unavailable` line keeps that merge pending, as an unreadable history file does today.
+- `scripts/lib/py scripts/production/unit_run.py --production <production doc> <unit> [--root <history root>] [--no-mac]` prints `<run id>\t<natedev|mac>\t<run_started_at as ISO-8601 UTC>`, exit 0. The run id is the run file's stem: the session directory's name for the `review merge:` line.
+- The Worktree cell comes from the Units table through `add_unit.unit_table` / `add_unit.cell_value`; no row exits 1 with `unit_run: no Units row for <unit>`.
+- History root: `--root`, else `PLAN_DELEGATE_HISTORY_DIR`, else `~/.local/state/plan-delegate`. Among `runs/*.jsonl` whose `run_started.working_dir` equals the Worktree cell after `os.path.normpath`, the greatest numeric `run_started_at` wins (ties: first sorted name); unreadable files and files with no matching `run_started` are skipped.
+- No local match and no `--no-mac`: one batch-mode `ssh` to `collect.MAC_HOST` (30 s limit) runs the same scan on the Mac; failure prints `unit_run: Mac unavailable: <reason>` and counts as no match. No match anywhere: `unit_run: no run found for <unit> in <worktree>`, exit 1.
+- `commands/showrunner/produce.md` <MergeCheckpoint/> takes the merge line's session directory from the first field; on exit 1 it sends `session dir unavailable` and tells `review-unit` why, and `commands/review/direct.md` keeps that merge pending.
 
 **Files:**
-- `scripts/production/unit_run.py` — new
-- `scripts/production/test_unit_run.py` — new
-- `commands/showrunner/produce.md` — <MergeCheckpoint/> names the command
-- `commands/review/direct.md` — the `session dir unavailable` case
+- `scripts/production/unit_run.py` — the lookup
+- `scripts/production/test_unit_run.py` — 16 tests; a fake `ssh` on `PATH` covers the Mac path
+- `commands/showrunner/produce.md`, `commands/review/direct.md` — the merge-line steps above
 
-**Seats:** `1 writer + 1 tester`.
-- `impl` — `scripts/production/unit_run.py`, `commands/showrunner/produce.md`, `commands/review/direct.md`
-- `test` — `scripts/production/test_unit_run.py`, from the Spec alone, with a temporary history root and a temporary production doc: the newest of several runs of one worktree; a run of another worktree ignored; a worktree path with a trailing slash; a file with no `run_started` skipped; no Units row; no run found with `--no-mac`; the Mac path through a fake `ssh` on `PATH` (match, and failure).
+**Gotchas:** a run file counts once its `run_started` line reads; undecodable bytes later in it do not demote it.
 
-**Constraints from prior phases:** none.
-
-**Acceptance gate:** `scripts/lib/py -m unittest discover -s scripts/production -p 'test_unit_run.py'` green; `basedpyright scripts/production/unit_run.py scripts/production/test_unit_run.py` prints `0 errors, 0 warnings`; `scripts/lib/py scripts/production/unit_run.py --production docs/plans/build-followups-production.md review-pool-unit --no-mac` prints this unit's newest run id.
+**Ruled out:** reading the Units table through `units_table.py` — it has no Units-table reader; skipping a newest run with undecodable later bytes — that names an older run's session directory.
 
 ### Phase 3 — A pooled design check reads no file on its turn  · status: todo
 
