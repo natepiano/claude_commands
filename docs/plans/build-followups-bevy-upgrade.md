@@ -316,7 +316,7 @@ def find_bevy_compatible_version(crate_name: str, all_versions: list[str], targe
 
 **Ruled out:** Sharing the requirement rule's code with `scripts/bevy_upgrade/upstream.release_requirement`: this script runs alone and prints its own warnings.
 
-### Phase 7 — The check reads a workspace member's Bevy requirement and asks again about a kept open pull request  · status: todo
+### Phase 7 — The check reads a workspace member's Bevy requirement and asks again about a kept open pull request  · status: done
 
 #### Work Order
 

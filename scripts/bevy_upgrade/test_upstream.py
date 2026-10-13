@@ -256,7 +256,7 @@ class UpstreamTests(unittest.TestCase):
         for manifest, expected in manifests:
             with self.subTest(manifest=manifest):
                 fetch = CannedFetch({url: manifest})
-                self.assertEqual(upstream.manifest_requirement(fetch, "owner/project", "abcdef",
+                self.assertEqual(upstream.manifest_requirement(fetch, "owner/project", "abcdef", "adapter",
                                  frozenset({"bevy_ecs", "bevy_app"})), expected)
                 self.assertEqual(fetch.urls, [url])
 
@@ -264,21 +264,148 @@ class UpstreamTests(unittest.TestCase):
         url = "https://raw.githubusercontent.com/owner/project/abcdef/Cargo.toml"
         fetch = CannedFetch({url: "[broken"})
         with self.assertRaises(upstream.FetchFailure) as caught:
-            _ = upstream.manifest_requirement(fetch, "owner/project", "abcdef", frozenset({"bevy_ecs"}))
+            _ = upstream.manifest_requirement(fetch, "owner/project", "abcdef", "adapter", frozenset({"bevy_ecs"}))
         self.assertTrue(str(caught.exception).startswith("raw.githubusercontent.com: "))
 
     def test_missing_manifest_names_no_requirement_but_server_failure_is_preserved(self) -> None:
         url = "https://raw.githubusercontent.com/owner/project/abcdef/Cargo.toml"
         fetch = CannedFetch({url: None})
-        self.assertEqual(upstream.manifest_requirement(fetch, "owner/project", "abcdef",
+        self.assertEqual(upstream.manifest_requirement(fetch, "owner/project", "abcdef", "adapter",
                          frozenset({"bevy_ecs"})), "")
         self.assertEqual(fetch.urls, [url])
         fetch = CannedFetch({url: upstream.FetchFailure("raw.githubusercontent.com: HTTP 500")})
         with self.assertRaises(upstream.FetchFailure) as caught:
-            _ = upstream.manifest_requirement(fetch, "owner/project", "abcdef", frozenset({"bevy_ecs"}))
+            _ = upstream.manifest_requirement(fetch, "owner/project", "abcdef", "adapter", frozenset({"bevy_ecs"}))
         self.assertNotIsInstance(caught.exception, upstream.NotFound)
         self.assertEqual(str(caught.exception), "raw.githubusercontent.com: HTTP 500")
         self.assertEqual(fetch.urls, [url])
+
+    def workspace_fetch(self, paths: tuple[str, ...], root: str = '[workspace]\nmembers = ["crates/*"]\n') -> CannedFetch:
+        return CannedFetch({
+            "https://raw.githubusercontent.com/owner/project/abcdef/Cargo.toml": root,
+            "https://api.github.com/repos/owner/project/git/trees/abcdef?recursive=1": {
+                "tree": [{"path": path, "type": "blob"} for path in paths]},
+        })
+
+    def member_requirement(self, fetch: CannedFetch, crate: str = "adapter") -> str:
+        return upstream.manifest_requirement(fetch, "owner/project", "abcdef", crate,
+                                             frozenset({"bevy", "bevy_app", "bevy_ecs"}))
+
+    def test_member_manifest_paths_reads_one_tree_and_sorts_only_nested_manifest_blobs(self) -> None:
+        url = "https://api.github.com/repos/owner/project/git/trees/abcdef?recursive=1"
+        fetch = CannedFetch({url: {"tree": [
+            {"path": "z/Cargo.toml", "type": "blob"}, {"path": "Cargo.toml", "type": "blob"},
+            {"path": "a/Cargo.toml", "type": "blob"}, {"path": "b/Cargo.toml", "type": "tree"},
+            {"path": "a/src/lib.rs", "type": "blob"},
+        ]}})
+        self.assertEqual(upstream.member_manifest_paths(fetch, "owner/project", "abcdef"),
+                         ["a/Cargo.toml", "z/Cargo.toml"])
+        self.assertEqual(fetch.urls, [url])
+
+    def test_member_manifest_paths_invalid_tree_is_a_fetch_failure(self) -> None:
+        url = "https://api.github.com/repos/owner/project/git/trees/abcdef?recursive=1"
+        cases: tuple[object, ...] = ([], {}, {"tree": {}}, {"tree": ["not an object"]},
+                                   {"tree": [{"path": 1, "type": "blob"}]}, "invalid JSON")
+        for body in cases:
+            with self.subTest(body=body):
+                fetch = CannedFetch({url: body})
+                with self.assertRaises(upstream.FetchFailure):
+                    _ = upstream.member_manifest_paths(fetch, "owner/project", "abcdef")
+                self.assertEqual(fetch.urls, [url])
+
+    def test_workspace_member_named_like_crate_is_read_in_three_requests(self) -> None:
+        path = "crates/adapter/Cargo.toml"
+        fetch = self.workspace_fetch(("a-other/Cargo.toml", path))
+        member = f"https://raw.githubusercontent.com/owner/project/abcdef/{path}"
+        fetch.bodies[member] = '[package]\nname = "adapter"\n[dependencies]\nbevy_ecs = "^0.20"\n'
+        self.assertEqual(self.member_requirement(fetch), "^0.20")
+        self.assertEqual(fetch.urls, [
+            "https://raw.githubusercontent.com/owner/project/abcdef/Cargo.toml",
+            "https://api.github.com/repos/owner/project/git/trees/abcdef?recursive=1", member])
+
+    def test_workspace_member_inheritance_without_root_version_is_unknown(self) -> None:
+        fetch = self.workspace_fetch(("crates/adapter/Cargo.toml",),
+            '[workspace.dependencies]\nbevy = { path = "../bevy" }\n')
+        fetch.bodies["https://raw.githubusercontent.com/owner/project/abcdef/crates/adapter/Cargo.toml"] = (
+            '[package]\nname = "adapter"\n[dependencies]\nbevy = { workspace = true }\n')
+        self.assertEqual(self.member_requirement(fetch), "")
+        self.assertEqual(len(fetch.urls), 3)
+
+    def test_workspace_member_without_bevy_requirement_is_unknown(self) -> None:
+        fetch = self.workspace_fetch(("crates/adapter/Cargo.toml", "z/Cargo.toml"))
+        fetch.bodies["https://raw.githubusercontent.com/owner/project/abcdef/crates/adapter/Cargo.toml"] = (
+            '[package]\nname = "adapter"\n[dependencies]\nbevy_egui = "^0.20"\n')
+        self.assertEqual(self.member_requirement(fetch), "")
+        self.assertEqual(len(fetch.urls), 3, "a matching package ends the member search")
+
+    def test_unreadable_or_invalid_member_manifest_is_a_fetch_failure(self) -> None:
+        path = "crates/adapter/Cargo.toml"
+        url = f"https://raw.githubusercontent.com/owner/project/abcdef/{path}"
+        cases: tuple[object, ...] = (
+            "[broken", upstream.FetchFailure("raw.githubusercontent.com: HTTP 500"),
+            'package = "wrong type"\n',
+            '[package]\nname = "adapter"\n[dependencies]\nbevy = 20\n',
+            'dependencies = "wrong type"\n[package]\nname = "adapter"\n',
+        )
+        for body in cases:
+            with self.subTest(body=body):
+                fetch = self.workspace_fetch((path,))
+                fetch.bodies[url] = body
+                with self.assertRaises(upstream.FetchFailure):
+                    _ = self.member_requirement(fetch)
+                self.assertEqual(len(fetch.urls), 3)
+
+    def test_missing_member_is_skipped_and_counts_towards_five_read_limit(self) -> None:
+        paths = tuple(f"{number}/Cargo.toml" for number in range(6))
+        fetch = self.workspace_fetch(paths)
+        for path in paths[:4]:
+            fetch.bodies[f"https://raw.githubusercontent.com/owner/project/abcdef/{path}"] = None
+        fifth = f"https://raw.githubusercontent.com/owner/project/abcdef/{paths[4]}"
+        fetch.bodies[fifth] = '[package]\nname = "adapter"\n[dependencies]\nbevy = "^0.20"\n'
+        self.assertEqual(self.member_requirement(fetch), "^0.20")
+        self.assertEqual(len(fetch.urls), 7)
+        self.assertEqual(fetch.urls[-1], fifth)
+
+    def test_workspace_tree_without_member_manifests_is_unknown_in_two_requests(self) -> None:
+        fetch = self.workspace_fetch(())
+        self.assertEqual(self.member_requirement(fetch), "")
+        self.assertEqual(len(fetch.urls), 2)
+
+    def test_member_directory_matches_hyphenated_crate_with_underscore(self) -> None:
+        path = "crates/scene_save/Cargo.toml"
+        fetch = self.workspace_fetch(("a/Cargo.toml", path))
+        fetch.bodies[f"https://raw.githubusercontent.com/owner/project/abcdef/{path}"] = (
+            '[package]\nname = "scene-save"\n[dependencies]\nbevy = "^0.20"\n')
+        self.assertEqual(self.member_requirement(fetch, "scene-save"), "^0.20")
+        self.assertEqual(len(fetch.urls), 3)
+
+    def test_member_search_stops_after_five_nonmatching_manifests(self) -> None:
+        paths = tuple(f"{number}/Cargo.toml" for number in range(6))
+        fetch = self.workspace_fetch(tuple(reversed(paths)))
+        for path in paths[:5]:
+            fetch.bodies[f"https://raw.githubusercontent.com/owner/project/abcdef/{path}"] = (
+                '[package]\nname = "other"\n[dependencies]\nbevy = "^0.20"\n')
+        self.assertEqual(self.member_requirement(fetch), "")
+        self.assertEqual(fetch.urls[2:], [
+            f"https://raw.githubusercontent.com/owner/project/abcdef/{path}" for path in paths[:5]])
+
+    def test_member_without_package_is_skipped_and_workspace_globs_do_not_filter_tree(self) -> None:
+        fetch = self.workspace_fetch(("a/Cargo.toml", "outside/Cargo.toml"),
+            '[workspace]\nmembers = ["missing/*"]\nexclude = ["outside"]\n')
+        fetch.bodies["https://raw.githubusercontent.com/owner/project/abcdef/a/Cargo.toml"] = (
+            '[dependencies]\nbevy = "^0.99"\n')
+        fetch.bodies["https://raw.githubusercontent.com/owner/project/abcdef/outside/Cargo.toml"] = (
+            '[package]\nname = "adapter"\n[dependencies]\nbevy = "^0.20"\n')
+        self.assertEqual(self.member_requirement(fetch), "^0.20")
+        self.assertEqual(len(fetch.urls), 4)
+
+    def test_workspace_root_requirement_needs_no_tree_or_member_request(self) -> None:
+        for root in ('[workspace]\n[dependencies]\nbevy = "^0.20"\n',
+                     '[workspace.dependencies]\nbevy = "^0.20"\n'):
+            with self.subTest(root=root):
+                fetch = CannedFetch({"https://raw.githubusercontent.com/owner/project/abcdef/Cargo.toml": root})
+                self.assertEqual(self.member_requirement(fetch), "^0.20")
+                self.assertEqual(len(fetch.urls), 1)
 
     def test_port_items_filter_title_substrings_and_creation_date(self) -> None:
         url = ("https://api.github.com/repos/owner/project/issues?state=all&since=2026-10-01T00:00:00Z"
