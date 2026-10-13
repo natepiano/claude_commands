@@ -153,7 +153,8 @@ def unit(
     session_id: str,
     *,
     plan: inventory.UnitPlan | None = None,
-    tmux_session: str | None = None,
+    session_name: str | None = None,
+    session_host: Literal["tmux", "herdr"] = "tmux",
     run_dirs: list[str] | None = None,
     doc: str = "/tmp/demo production.md",
 ) -> inventory.UnitSession:
@@ -165,7 +166,8 @@ def unit(
             production="demo",
             unit=f"{session_id}-unit",
             doc=doc,
-            tmux_session=tmux_session or f"tmux-{session_id}",
+            session_name=session_name or f"tmux-{session_id}",
+            session_host=session_host,
             plan=plan or inventory.PlanFromRunRecord(kind="plan", path=f"/tmp/{session_id} plan.md"),
         ),
     )
@@ -379,6 +381,89 @@ class RestartTests(ShutdownTestCase):
         prefix = "manual restart kept name: "
         self.assertTrue(lines[0].startswith(prefix), output)
         self.assert_move_resume(lines[0].removeprefix(prefix), owner)
+
+    def test_tmux_unit_restart_keeps_its_recorded_session_name(self) -> None:
+        owner = unit("kept-unit", session_name="kept tmux session")
+        commands, _ = self.moved_restart(owner)
+        launch = next(argv for argv in commands if any(part.endswith("/add_unit.py") for part in argv))
+        self.assertEqual(launch[launch.index("--tmux-session") + 1], "kept tmux session")
+
+    def test_herdr_host_is_reported_as_manual_without_launching_or_scheduling_a_prompt(self) -> None:
+        for dry_run in (True, False):
+            with self.subTest(dry_run=dry_run):
+                identity = f"herdr-manual-{dry_run}"
+                owner = top_level(identity, host=inventory.HerdrHost(
+                    kind="herdr", herdr_session="writing", pane_id="w1:p1",
+                ))
+                saved = entry(owner)
+                self.create([saved])
+                conversation_pause.record_scheduled_prompts(identity, ("existing wakeup",))
+                output = io.StringIO()
+                with (
+                    patch.object(restart, "_retire"),
+                    patch.object(restart, "_live_session_ids", return_value=frozenset()),
+                    patch.object(restart, "_run") as launch,
+                    patch.object(restart, "wait_for_confirmation") as confirm,
+                    redirect_stdout(output),
+                ):
+                    current = restart.relaunch_session(saved, dry_run=dry_run,
+                        desktop_state=self.desktop_state)
+                launch.assert_not_called()
+                confirm.assert_not_called()
+                prefix = f"manual restart {identity}: "
+                self.assertTrue(output.getvalue().startswith(prefix), output.getvalue())
+                command = output.getvalue().removeprefix(prefix).strip()
+                arguments = shlex.split(command)
+                self.assertEqual(arguments[arguments.index("--resume") + 1], identity)
+                self.assertEqual(conversation_pause.read_scheduled_prompts(identity), ("existing wakeup",))
+                if dry_run:
+                    self.assertEqual(current, saved)
+                    self.assertEqual(record.find_session(LOGIN, identity), saved)
+                else:
+                    self.assertEqual(current["progress"], record.SessionNeedsManualRestart(
+                        kind="manual restart", command=command,
+                    ))
+                    self.assertEqual(record.find_session(LOGIN, identity), current)
+
+    def test_herdr_unit_restart_is_manual_without_launching_or_scheduling_a_prompt(self) -> None:
+        for dry_run in (True, False):
+            for has_plan in (True, False):
+                with self.subTest(dry_run=dry_run, has_plan=has_plan):
+                    identity = f"herdr-unit-{dry_run}-{has_plan}"
+                    owner = unit(identity, session_host="herdr", session_name="same-name-as-tmux",
+                        plan=(inventory.PlanFromRunRecord(kind="plan", path="/tmp/unit.md")
+                              if has_plan else inventory.NoRunRecord(kind="no run record")))
+                    saved = entry(owner)
+                    self.create([saved])
+                    conversation_pause.record_scheduled_prompts(identity, ("existing wakeup",))
+                    output = io.StringIO()
+                    with (
+                        patch.object(restart, "_retire"),
+                        patch.object(restart, "_live_session_ids", return_value=frozenset()),
+                        patch.object(restart, "_run") as launch,
+                        patch.object(restart, "_write_note") as write_note,
+                        patch.object(restart, "wait_for_confirmation") as confirm,
+                        redirect_stdout(output),
+                    ):
+                        current = restart.relaunch_session(saved, dry_run=dry_run,
+                            desktop_state=self.desktop_state)
+                    launch.assert_not_called()
+                    write_note.assert_not_called()
+                    confirm.assert_not_called()
+                    prefix = f"manual restart {identity}: "
+                    self.assertTrue(output.getvalue().startswith(prefix), output.getvalue())
+                    command = output.getvalue().removeprefix(prefix).strip()
+                    arguments = shlex.split(command)
+                    self.assertEqual(arguments[arguments.index("--resume") + 1], identity)
+                    self.assertNotIn("--tmux-session", arguments)
+                    self.assertEqual(conversation_pause.read_scheduled_prompts(identity), ("existing wakeup",))
+                    if dry_run:
+                        self.assertEqual(current, saved)
+                    else:
+                        self.assertEqual(current["progress"], record.SessionNeedsManualRestart(
+                            kind="manual restart", command=command,
+                        ))
+                    self.assertEqual(record.find_session(LOGIN, identity), current)
 
     def test_move_target_showrunner_resumes_its_production_conversation(self) -> None:
         owner = showrunner("move-showrunner")

@@ -197,6 +197,90 @@ class SessionRecordTests(ShutdownTestCase):
         self.assertEqual(record.parse_session_records(json.dumps([first, second])), [first, second])
         self.assertFalse((self.directory / "record.json").exists())
 
+    def test_herdr_hosts_round_trip_for_owners_and_their_seats(self) -> None:
+        saved = session_shutdown()
+        owner = session()
+        owner["host"] = inventory.HerdrHost(kind="herdr", herdr_session="director", pane_id="w1:p1")
+        saved["session"] = owner
+        seat = owned_seat()
+        seat["host"] = inventory.HerdrHost(kind="herdr", herdr_session="director", pane_id="w1:p2")
+        saved["seats"] = [seat]
+        self.assertTrue(record.create_session(saved))
+        self.assertEqual(record.find_session(saved["login"], "session-1"), saved)
+        self.assertEqual(record.parse_session_records(json.dumps([saved])), [saved])
+
+    def test_unit_host_without_transport_defaults_to_tmux_with_either_name_key(self) -> None:
+        saved = session_shutdown()
+        unit = cast(inventory.UnitSession, cast(object, {
+            **session(), "kind": "unit",
+            "host": inventory.UnitHost(kind="unit", production="build", unit="one", doc="/tmp/build.md",
+                                       session_name="unit-session", session_host="tmux", plan=inventory.NoRunRecord(kind="no run record")),
+        }))
+        saved["session"] = unit
+        for key in ("session_name", "tmux_session"):
+            with self.subTest(key=key):
+                document = cast(dict[str, object], json.loads(json.dumps(saved)))
+                wire_session = cast(dict[str, object], document["session"])
+                host = cast(dict[str, object], wire_session["host"])
+                del host["session_host"]
+                del host["session_name"]
+                host[key] = "unit-session"
+                self.assertEqual(record.parse_session_records(json.dumps([document])), [saved])
+                path = self.directory / "sessions" / "session-1.json"
+                path.parent.mkdir(parents=True, exist_ok=True)
+                _ = path.write_text(json.dumps(document))
+                self.assertEqual(record.find_session(saved["login"], "session-1"), saved)
+
+    def test_herdr_unit_transport_round_trips_through_the_record_store(self) -> None:
+        saved = session_shutdown()
+        saved["session"] = cast(inventory.UnitSession, cast(object, {
+            **session(), "kind": "unit", "host": inventory.UnitHost(kind="unit", production="build", unit="one",
+                doc="/tmp/build.md", session_name="herdr-unit", session_host="herdr",
+                plan=inventory.NoRunRecord(kind="no run record")),
+        }))
+        self.assertTrue(record.create_session(saved))
+        self.assertEqual(record.find_session(saved["login"], "session-1"), saved)
+        self.assertEqual(record.parse_session_records(json.dumps([saved])), [saved])
+
+    def test_unit_host_rejects_invalid_transport_instead_of_defaulting_to_tmux(self) -> None:
+        for transport in ("unknown", "", None, 4, ["invalid"]):
+            with self.subTest(transport=transport):
+                saved = session_shutdown()
+                document = cast(dict[str, object], json.loads(json.dumps(saved)))
+                wire_session = cast(dict[str, object], document["session"])
+                wire_session["kind"] = "unit"
+                wire_session["host"] = {
+                    "kind": "unit", "production": "build", "unit": "one", "doc": "/tmp/build.md",
+                    "session_name": "unit", "session_host": transport, "plan": {"kind": "no run record"},
+                }
+                with self.assertRaises(record.InvalidRecord):
+                    _ = record.parse_session_records(json.dumps([document]))
+
+    def test_unit_host_prefers_the_new_name_when_both_keys_are_present(self) -> None:
+        saved = session_shutdown()
+        document = cast(dict[str, object], json.loads(json.dumps(saved)))
+        wire_session = cast(dict[str, object], document["session"])
+        wire_session["kind"] = "unit"
+        wire_session["host"] = {
+            "kind": "unit", "production": "build", "unit": "one", "doc": "/tmp/build.md",
+            "session_name": "new", "tmux_session": "old", "plan": {"kind": "no run record"},
+        }
+        parsed = record.parse_session_records(json.dumps([document]))[0]["session"]["host"]
+        self.assertEqual(parsed.get("session_name"), "new")
+        self.assertNotIn("tmux_session", parsed)
+
+    def test_herdr_host_rejects_missing_or_nontext_identity_fields(self) -> None:
+        for host in ({"kind": "herdr", "pane_id": "w1:p1"},
+                     {"kind": "herdr", "herdr_session": "owner"},
+                     {"kind": "herdr", "herdr_session": "owner", "pane_id": 4}):
+            with self.subTest(host=host):
+                saved = session_shutdown()
+                document = cast(dict[str, object], json.loads(json.dumps(saved)))
+                wire_session = cast(dict[str, object], document["session"])
+                wire_session["host"] = host
+                with self.assertRaises(record.InvalidRecord):
+                    _ = record.parse_session_records(json.dumps([document]))
+
     def test_session_records_second_create_leaves_the_existing_file_unchanged(self) -> None:
         first = session_shutdown()
         self.assertTrue(record.create_session(first))

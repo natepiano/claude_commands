@@ -18,18 +18,18 @@ from collections.abc import Iterable, Mapping
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass, fields
 from pathlib import Path
-from typing import Literal, TypedDict, cast
+from typing import Literal, TypedDict, cast, override
 
 SCRIPTS = Path(__file__).resolve().parents[1]
-for _directory in (SCRIPTS / "production", SCRIPTS / "delegate", SCRIPTS / "shutdown"):
+for _directory in (SCRIPTS / "production", SCRIPTS / "delegate", SCRIPTS / "shutdown", SCRIPTS / "herdr"):
     if str(_directory) not in sys.path:
         sys.path.insert(0, str(_directory))
 
 import add_unit  # noqa: E402
-import live_units  # noqa: E402
 import remove_seats  # noqa: E402
 import showrunners  # noqa: E402
 import unit_lookup  # noqa: E402
+import herdr  # noqa: E402
 import codex_daemon  # noqa: E402
 import process_table  # noqa: E402
 import remote as remote  # noqa: E402
@@ -603,15 +603,34 @@ def _showrunner_ids(
     return found
 
 
-def _production_rows(doc: Path, slug: str) -> list[dict[str, str]]:
+class _ProductionUnitMarks(add_unit.SessionMarks):
+    """Use the roster's known marks, retaining rows when those marks are unreadable."""
+
+    def __init__(self, slug: str, every: unit_lookup.MarkedProductions | OSError) -> None:
+        super().__init__(slug)
+        self._known: set[str] | OSError = (
+            every if isinstance(every, OSError)
+            else OSError(every.faults[slug]) if slug in every.faults
+            else set(every.units.get(slug, {}))
+        )
+
+    @override
+    def has(self, unit: str) -> bool:
+        return isinstance(self._known, OSError) or unit in self._known
+
+
+def _production_rows(
+    doc: Path, slug: str, every: unit_lookup.MarkedProductions | OSError,
+) -> list[dict[str, str]]:
     lines = doc.read_text(encoding="utf-8").splitlines()
-    return add_unit.live_unit_table(lines, slug)
+    marks = _ProductionUnitMarks(slug, every)
+    return [row for row in add_unit.unit_table(lines) if not add_unit.unit_is_retired(row, marks)]
 
 
-def _every_marked_unit() -> unit_lookup.MarkedProductions | OSError:
-    """Every production's marked units, or why tmux could not say which sessions exist."""
+def _every_marked_unit(*, include_tmux: bool) -> unit_lookup.MarkedProductions | OSError:
+    """Every production's marked units, or why the included hosts could not answer."""
     try:
-        return unit_lookup.every_marked_unit()
+        return unit_lookup.every_marked_unit(include_tmux=include_tmux)
     except OSError as error:
         return error
 
@@ -626,7 +645,7 @@ def _production_places(
     places: dict[str, _ProductionPlace] = {}
     has_tmux = shutil.which(os.environ.get("UNIT_LOOKUP_TMUX") or "tmux") is not None
     # One read of every production's marks serves every showrunner below.
-    every = _every_marked_unit() if has_tmux and registered else OSError("no tmux binary")
+    every = _every_marked_unit(include_tmux=has_tmux) if registered else unit_lookup.MarkedProductions({}, {})
     for runner in registered:
         doc = Path(runner["doc"])
         runner_address = addresses.get(runner["slug"], "")
@@ -638,29 +657,36 @@ def _production_places(
         try:
             if isinstance(every, OSError):
                 raise every
-            units = live_units.units_in(doc, every)
-        except (OSError, ValueError) as error:
-            if has_tmux:
-                _problem(problems, f"tmux for {runner['slug']} was not read", error)
+            if runner["slug"] in every.faults:
+                raise OSError(every.faults[runner["slug"]])
+            rows = _production_rows(doc, runner["slug"], every)
+            units = every.units.get(runner["slug"], {})
+        except (OSError, UnicodeError, ValueError, add_unit.Refusal) as error:
+            _problem(problems, f"unit hosts for {runner['slug']} were not read", error)
         else:
-            for unit in units:
-                marked = unit.session
+            for row in rows:
+                unit_name = add_unit.cell_value(row.get("Unit", ""))
+                marked = units.get(unit_name)
                 if marked is None:
                     continue
-                place = _ProductionPlace(showrunner, DirectsUnit(unit.unit))
+                place = _ProductionPlace(showrunner, DirectsUnit(unit_name))
                 if isinstance(marked.claude, unit_lookup.LiveClaude):
                     _ = places.setdefault(marked.claude.session_id, place)
                     continue
                 # A socketless director is still identified by its marked pane.
                 for record in records:
-                    if (record["sessionId"] not in ledger_workers and marked.pane
-                            and record["tmux"].rpartition(".")[2] == marked.pane):
+                    same_place = (
+                        record["tmux"].rpartition(".")[2] == marked.place.pane
+                        if isinstance(marked.place, unit_lookup.TmuxPlace)
+                        else herdr.herdr_place_of(record["pid"]) == marked.place
+                    )
+                    if record["sessionId"] not in ledger_workers and same_place:
                         _ = places.setdefault(record["sessionId"], place)
                         break
             continue
-        # Worktree ownership is a fallback only when tmux could not be read.
+        # Worktree ownership is a fallback only when neither host could be read.
         try:
-            rows = _production_rows(doc, runner["slug"])
+            rows = _production_rows(doc, runner["slug"], every)
         except (OSError, UnicodeError, ValueError, add_unit.Refusal) as fallback_error:
             _problem(problems, f"units in {doc}", fallback_error)
             continue
@@ -1080,6 +1106,40 @@ def _delegate_workers(
     return entries, worker_threads
 
 
+def _herdr_codex_panes(machine: str) -> Roster:
+    """Interactive Codex panes have no messaging address; preserve partial reads."""
+    entries: list[RosterEntry] = []
+    problems: list[str] = []
+    try:
+        sessions = herdr.live_sessions()
+    except herdr.HerdrMissing:
+        # A machine without herdr has no herdr panes to list.
+        return Roster(entries, problems)
+    except herdr.HerdrFailure as error:
+        _problem(problems, "herdr sessions", error)
+        return Roster(entries, problems)
+    cwds = {process.place: process.cwd for process in herdr.herdr_processes()}
+    for session in sessions:
+        name = session["name"]
+        try:
+            agents = herdr.Herdr(name).agents()
+        except herdr.HerdrFailure as error:
+            _problem(problems, f"herdr session {name}", error)
+            continue
+        for agent in agents:
+            if agent.get("agent") != "codex":
+                continue
+            pane = agent["pane_id"]
+            entries.append(RosterEntry(
+                machine=machine, kind="codex", role="freestanding",
+                name=f"herdr {name}:{pane}", status=agent["agent_status"],
+                reach=CannotReceiveMessages("interactive Codex in a herdr pane"),
+                cwd=cwds.get(herdr.HerdrPlace(name, pane), ""),
+                showrunner=NoShowrunner(), director=NoDirector(), assignment=NotAWorker(),
+            ))
+    return Roster(entries, problems)
+
+
 def machine_name() -> str:
     return socket.gethostname().split(".", 1)[0]
 
@@ -1125,7 +1185,9 @@ def _local_roster(environment: Mapping[str, str]) -> Roster:
             for session in daemon
             if session.thread_id not in worker_threads
         ]
-    entries = [*claude.values(), *delegate_workers, *codex_sessions]
+    interactive = _herdr_codex_panes(machine)
+    problems.extend(interactive.problems)
+    entries = [*claude.values(), *delegate_workers, *codex_sessions, *interactive.entries]
     return Roster(entries, problems)
 
 

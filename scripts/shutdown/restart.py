@@ -614,7 +614,7 @@ def _unit_argv(
         "--session-name",
         session["name"],
         "--tmux-session",
-        host["tmux_session"],
+        host["session_name"],
         "--restart-note",
         str(note_path),
     ]
@@ -922,6 +922,10 @@ def _launch_session(
     if session["kind"] == "unit":
         if host["kind"] != "unit":
             raise ValueError("unit session has no unit host")
+        if host["session_host"] == "herdr":
+            command = (resume_command(session, record["target"], record.get("source_label", record["label"]), record.get("why", ""))
+                       if "target" in record else _resume_command(session, note))
+            return ManualRestartRequired(command)
         if host["plan"]["kind"] == "no run record":
             _write_note(_note_path(record, session["session_id"]), note, dry_run)
             return ManualRestartRequired(
@@ -944,6 +948,8 @@ def _launch_session(
     if host["kind"] == "unknown":
         if "target" in record:
             command = resume_command(session, record["target"], record.get("source_label", record["label"]), record.get("why", ""))
+        return ManualRestartRequired(command)
+    if host["kind"] == "herdr":
         return ManualRestartRequired(command)
     _record_scheduled_restart_prompt(
         session["session_id"], prompt, dry_run=dry_run

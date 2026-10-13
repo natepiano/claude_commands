@@ -128,7 +128,8 @@ def unit(
             production=production,
             unit=name,
             doc=f"/tmp/{production}.md",
-            tmux_session=name,
+            session_name=name,
+            session_host="tmux",
             plan=inventory.NoRunRecord(kind="no run record"),
         ),
     )
