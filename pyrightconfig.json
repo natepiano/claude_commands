@@ -10,6 +10,15 @@
   ],
   "executionEnvironments": [
     {
+      "root": "scripts/herdr",
+      "extraPaths": [
+        "scripts/herdr",
+        "scripts/message",
+        "scripts/production",
+        "scripts/lib"
+      ]
+    },
+    {
       "root": "scripts/accounts",
       "extraPaths": [
         ".",

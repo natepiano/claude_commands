@@ -48,6 +48,8 @@ class CommandFixture(TypedDict):
     run_lines: list[RemoteLine]
     run_status_reported: bool
     run_status_line: str
+    run_cleanup_line: str
+    run_ssh_status: int
     run_delay_s: float
     hold_after_first_line: bool
     cleanup_status: int
@@ -176,7 +178,9 @@ if "lint nextest" in remote:
         time.sleep(0.02)
     if fixture["run_status_reported"]:
         print(fixture["run_status_line"], flush=True)
-    raise SystemExit(0)
+        if fixture["run_cleanup_line"]:
+            print(fixture["run_cleanup_line"], flush=True)
+    raise SystemExit(int(fixture["run_ssh_status"]))
 
 (root / "probe-started").write_text("started\n", encoding="utf-8")
 time.sleep(float(fixture["probe_delay_s"]))
@@ -508,6 +512,8 @@ class OffloadCommandTests(unittest.TestCase):
             "run_lines": [],
             "run_status_reported": True,
             "run_status_line": "mac_exit=0",
+            "run_cleanup_line": "mac_cleanup=0",
+            "run_ssh_status": 0,
             "run_delay_s": 0.0,
             "hold_after_first_line": False,
             "cleanup_status": 0,
@@ -574,6 +580,8 @@ class OffloadCommandTests(unittest.TestCase):
             "run_lines": [],
             "run_status_reported": True,
             "run_status_line": "mac_exit=0",
+            "run_cleanup_line": "mac_cleanup=0",
+            "run_ssh_status": 0,
             "run_delay_s": 0.0,
             "hold_after_first_line": False,
             "cleanup_status": 0,
@@ -1443,7 +1451,7 @@ class OffloadCommandTests(unittest.TestCase):
         remote = run[-1]
         run_command, separator, status_command = remote.rpartition("; echo mac_exit=$?")
         self.assertEqual(separator, "; echo mac_exit=$?")
-        self.assertEqual(status_command, "")
+        self.assertIn("mac_cleanup=", status_command)
         remote_words = shlex.split(run_command)
         lint_index = remote_words.index("~/.claude/scripts/lint/lint")
         self.assertEqual(
@@ -1481,7 +1489,7 @@ class OffloadCommandTests(unittest.TestCase):
         remote = self.events_for("ssh")[-1]["args"][-1]
         run_command, separator, status_command = remote.rpartition("; echo mac_exit=$?")
         self.assertEqual(separator, "; echo mac_exit=$?")
-        self.assertEqual(status_command, "")
+        self.assertIn("mac_cleanup=", status_command)
         remote_words = shlex.split(run_command)
         self.assertIn(f"({FILTER}) & not (test(slow) | test(gpu))", remote_words)
         self.assertNotIn(FILTER, remote_words)
@@ -1576,6 +1584,92 @@ class OffloadCommandTests(unittest.TestCase):
 
         self.assertEqual(result.returncode, 1, result.stdout)
         self.assert_wire("failed", "")
+
+    def test_cleanup_success_keeps_the_reported_test_result_and_hides_markers(self) -> None:
+        for status in (0, 1, 42):
+            with self.subTest(status=status):
+                self.fixture["run_status_line"] = f"mac_exit={status}"
+                self.sync_fixture()
+                result = self.command()
+                self.assertEqual(result.returncode, status, result.stdout)
+                self.assert_wire("passed" if status == 0 else "failed", "")
+                self.assertNotIn("mac_exit=", result.stdout)
+                self.assertNotIn("mac_cleanup=", result.stdout)
+                self.assertNotIn("Mac build output", result.stdout)
+
+    def test_cleanup_failure_reports_once_without_changing_test_result(self) -> None:
+        for status in (0, 42):
+            with self.subTest(status=status):
+                self.fixture["run_status_line"] = f"mac_exit={status}"
+                self.fixture["run_cleanup_line"] = "mac_cleanup=7"
+                self.sync_fixture()
+                result = self.command()
+                self.assertEqual(result.returncode, status, result.stdout)
+                self.assert_wire("passed" if status == 0 else "failed", "")
+                self.assertEqual(result.stdout.count("Mac build output not removed: 7\n"), 1)
+                self.assertNotIn("mac_cleanup=", result.stdout)
+
+    def test_kept_build_output_releases_claim_without_leftover_check_or_notice(self) -> None:
+        self.fixture["run_cleanup_line"] = "mac_cleanup=kept"
+        for status in (0, 42):
+            with self.subTest(status=status):
+                self.fixture["run_status_line"] = f"mac_exit={status}"
+                self.sync_fixture()
+                result = self.command()
+                self.assertEqual(result.returncode, status, result.stdout)
+                self.assert_wire("passed" if status == 0 else "failed", "")
+                self.assertEqual(self.leftover_events(), [])
+                self.assertFalse((self.state_directory / "run.json").exists())
+                self.assertNotIn("Mac build output", result.stdout)
+                self.assertNotIn("mac_cleanup=", result.stdout)
+
+    def test_other_target_dir_reports_kept_output_without_changing_test_result(self) -> None:
+        for status in (0, 42):
+            with self.subTest(status=status):
+                self.fixture["run_status_line"] = f"mac_exit={status}"
+                self.fixture["run_cleanup_line"] = "mac_cleanup=skipped"
+                self.sync_fixture()
+                result = self.command("--target-dir", "other target")
+                self.assertEqual(result.returncode, status, result.stdout)
+                self.assert_wire("passed" if status == 0 else "failed", "")
+                self.assertEqual(result.stdout.count("Mac build output kept: the run used another target dir\n"), 1)
+                self.assertNotIn("mac_cleanup=", result.stdout)
+
+    def test_disconnect_after_test_status_reports_unconfirmed_cleanup_and_keeps_result(self) -> None:
+        for status in (0, 42):
+            with self.subTest(status=status):
+                self.fixture["run_status_line"] = f"mac_exit={status}"
+                self.fixture["run_cleanup_line"] = ""
+                self.fixture["run_ssh_status"] = 255
+                self.sync_fixture()
+                result = self.command()
+                self.assertEqual(result.returncode, status, result.stdout)
+                self.assert_wire("passed" if status == 0 else "failed", "")
+                self.assertEqual(result.stdout.count("Mac build output cleanup unconfirmed\n"), 1)
+                self.assertNotIn("mac_exit=", result.stdout)
+
+    def test_unconfirmed_cleanup_checks_leftovers_before_release_and_keeps_test_result(self) -> None:
+        self.fixture["run_cleanup_line"] = ""
+        self.fixture["run_ssh_status"] = 255
+        for status in (0, 42):
+            for outcome in ("clean", "remaining", "missing_status", "ssh_error"):
+                with self.subTest(status=status, outcome=outcome):
+                    self.reset_leftover_case()
+                    self.fixture["run_status_line"] = f"mac_exit={status}"
+                    self.set_leftover_answer(outcome)
+                    result = self.command(separate_stderr=True)
+                    self.assertEqual(result.returncode, status, result.stdout + result.stderr)
+                    self.assert_wire("passed" if status == 0 else "failed", "")
+                    self.assertEqual(result.stdout.count("Mac build output cleanup unconfirmed\n"), 1)
+                    checks = self.leftover_events()
+                    self.assertEqual(len(checks), 1)
+                    self.assertTrue(checks[0]["claimed"], checks[0])
+                    self.assert_leftover_selectors(checks[0]["args"][-1])
+                    if outcome == "clean":
+                        self.assertFalse((self.state_directory / "run.json").exists())
+                    else:
+                        self.assert_claim_is_kept()
+                        self.assert_leftover_diagnostic(result.stderr, outcome)
 
     def test_lost_run_time_includes_remote_cleanup(self) -> None:
         self.fixture["run_lines"] = [
@@ -1943,6 +2037,217 @@ class OffloadCommandTests(unittest.TestCase):
         self.assertIn("mac_test: not running on the Mac (off)\n", result.stdout)
         self.assertIn("FileNotFoundError", result.stdout)
         self.assertFalse(self.result_path.exists())
+
+
+class MacCleanupProtocolTests(unittest.TestCase):
+    def test_status_marker_followed_by_ordinary_output_is_printed_and_not_a_result(self) -> None:
+        output = io.StringIO()
+        controller = offload.ProcessController()
+        text = "mac_exit=0\ntest still running\n"
+        with redirect_stdout(output):
+            answer = controller.stream_mac_run([
+                sys.executable, "-c", "import sys; sys.stdout.write(sys.argv[1]); sys.exit(255)", text,
+            ])
+        self.assertIsInstance(answer, offload.MissingMacStatus)
+        self.assertEqual(output.getvalue(), text)
+
+    def test_stream_returns_cleanup_outcome_beside_the_reported_test_status(self) -> None:
+        cases = (
+            ("mac_cleanup=0\n", 0, offload.CleanupDone()),
+            ("mac_cleanup=kept\n", 0, offload.CleanupKept()),
+            ("mac_cleanup=7\n", 0, offload.CleanupFailed(7)),
+            ("mac_cleanup=skipped\n", 0, offload.CleanupSkipped()),
+            ("", 255, offload.CleanupUnconfirmed()),
+        )
+        for marker, ssh_status, expected in cases:
+            with self.subTest(marker=marker, ssh_status=ssh_status):
+                output = io.StringIO()
+                controller = offload.ProcessController()
+                with redirect_stdout(output):
+                    answer = controller.stream_mac_run([
+                        sys.executable, "-c", "import sys; sys.stdout.write(sys.argv[1]); sys.exit(int(sys.argv[2]))",
+                        "test output\nmac_exit=42\n" + marker, str(ssh_status),
+                    ])
+                self.assertEqual(answer, offload.ReportedMacStatus(42, expected))
+                self.assertEqual(output.getvalue(), "test output\n")
+
+
+class MacTargetCleanupShellTests(unittest.TestCase):
+    root: Path = Path()
+    home_directory: Path = Path()
+    mirror: Path = Path()
+    temporary_directory: Path = Path()
+    bin_directory: Path = Path()
+
+    @override
+    def setUp(self) -> None:
+        self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        self.home_directory = self.root / "home with spaces"
+        self.mirror = self.home_directory / offload.remote_mirror(offload.KnownRepository("hana's project"))
+        self.mirror.mkdir(parents=True)
+        self.temporary_directory = self.root / "tmp"
+        self.temporary_directory.mkdir()
+        self.bin_directory = self.root / "bin"
+        self.bin_directory.mkdir()
+        disk_space = self.bin_directory / "df"
+        _ = disk_space.write_text(f"#!{sys.executable}\n" + r'''
+import json
+import os
+from pathlib import Path
+import sys
+
+(Path(os.environ["CLEANUP_TEST_DIR"]) / "df-arguments.json").write_text(json.dumps(sys.argv[1:]))
+print(os.environ["CLEANUP_TEST_DF_OUTPUT"], end="")
+raise SystemExit(int(os.environ["CLEANUP_TEST_DF_STATUS"]))
+''')
+        disk_space.chmod(0o755)
+        lint = self.home_directory / ".claude/scripts/lint/lint"
+        lint.parent.mkdir(parents=True)
+        _ = lint.write_text(f"#!{sys.executable}\n" + r'''
+import json
+import os
+from pathlib import Path
+import sys
+
+root = Path(os.environ["CLEANUP_TEST_DIR"])
+(root / "lint-arguments.json").write_text(json.dumps(sys.argv[1:]))
+(root / "sweep-switch").write_text(os.environ.get("LINT_SKIP_SWEEP", ""))
+target = Path("target")
+for index, word in enumerate(sys.argv[1:], 1):
+    if word == "--target-dir":
+        target = Path(sys.argv[index + 1])
+    elif word.startswith("--target-dir="):
+        target = Path(word.split("=", 1)[1])
+target.mkdir(parents=True, exist_ok=True)
+(target / "nextest-output").write_text("built\n")
+print("nextest finished", flush=True)
+raise SystemExit(int(os.environ["CLEANUP_TEST_STATUS"]))
+''')
+        lint.chmod(0o755)
+
+    def run_remote(
+        self, shell: list[str], status: int, words: tuple[str, ...] = (), *,
+        disk_output: str = "Filesystem GiB Used Available Capacity Mounted\nfixture 500 401 99 80% /\n",
+        disk_status: int = 0,
+        free_floor_gib: float = 100,
+    ) -> subprocess.CompletedProcess[str]:
+        request = offload.OffloadRequest(self.root, "hana", "cleanup-call", offload.NO_RESULT_FILE, words)
+        config = offload.OffloadConfig(
+            enabled=True, host="unused-host", connect_timeout_s=6, probe_timeout_s=1,
+            unreachable_backoff_s=300, free_floor_gib=free_floor_gib,
+            default_target_budget_gib="24", values={},
+        )
+        text = (
+            '[ "$(command -v df)" = ' + shlex.quote(str(self.bin_directory / "df")) + ' ] || exit 99\n'
+            + offload.remote_test_command(config, request, offload.KnownRepository("hana's project"))
+        )
+        return subprocess.run(
+            [*shell, "-c", text], cwd=self.home_directory,
+            env={**os.environ, "HOME": str(self.home_directory), "TMPDIR": str(self.temporary_directory),
+                 "PATH": str(self.bin_directory) + os.pathsep + os.environ["PATH"],
+                 "CLEANUP_TEST_DIR": str(self.root), "CLEANUP_TEST_STATUS": str(status),
+                 "CLEANUP_TEST_DF_OUTPUT": disk_output, "CLEANUP_TEST_DF_STATUS": str(disk_status)},
+            capture_output=True, text=True, check=False, timeout=5,
+        )
+
+    def test_remote_text_below_space_floor_removes_only_repository_target_after_pass_and_failure(self) -> None:
+        target = self.mirror / "target"
+        sibling = self.mirror / "keep-source"
+        temporary_file = self.temporary_directory / "keep-temporary"
+        other_target = self.mirror.parent / "other-repository" / "target" / "keep-build"
+        other_target.parent.mkdir(parents=True)
+        for path in (sibling, temporary_file, other_target):
+            _ = path.write_text("keep\n")
+        for shell in (["/bin/sh"], ["zsh", "-f"]):
+            for status in (0, 42):
+                with self.subTest(shell=shell, status=status):
+                    target.mkdir(exist_ok=True)
+                    _ = (target / "previous-build").write_text("old\n")
+                    answer = self.run_remote(shell, status)
+                    self.assertEqual(answer.returncode, 0, answer.stdout + answer.stderr)
+                    self.assertEqual(answer.stdout.splitlines(), ["nextest finished", f"mac_exit={status}", "mac_cleanup=0"])
+                    self.assertEqual(answer.stderr, "")
+                    self.assertFalse(target.exists())
+                    self.assertEqual((self.root / "sweep-switch").read_text(), "1")
+                    self.assertEqual(
+                        cast(list[str], json.loads((self.root / "df-arguments.json").read_text())),
+                        ["-g", str(self.home_directory)],
+                    )
+                    for path in (sibling, temporary_file, other_target):
+                        self.assertEqual(path.read_text(), "keep\n")
+
+    def test_remote_text_at_or_above_space_floor_keeps_build_output(self) -> None:
+        target = self.mirror / "target"
+        target.mkdir()
+        existing = target / "previous-build"
+        _ = existing.write_text("keep\n")
+        for shell in (["/bin/sh"], ["zsh", "-f"]):
+            for status in (0, 42):
+                for free_space, floor in ((100, 100), (101, 100), (50, 50)):
+                    with self.subTest(shell=shell, status=status, free_space=free_space, floor=floor):
+                        answer = self.run_remote(
+                            shell, status, free_floor_gib=floor,
+                            disk_output=f"Filesystem GiB Used Available Capacity Mounted\nfixture 500 400 {free_space} 80% /\n",
+                        )
+                        self.assertEqual(answer.returncode, 0, answer.stdout + answer.stderr)
+                        self.assertEqual(answer.stdout.splitlines(), ["nextest finished", f"mac_exit={status}", "mac_cleanup=kept"])
+                        self.assertEqual(existing.read_text(), "keep\n")
+                        self.assertEqual((target / "nextest-output").read_text(), "built\n")
+
+    def test_remote_text_with_unreadable_space_keeps_build_output(self) -> None:
+        target = self.mirror / "target"
+        target.mkdir()
+        existing = target / "previous-build"
+        _ = existing.write_text("keep\n")
+        for shell in (["/bin/sh"], ["zsh", "-f"]):
+            for status in (0, 42):
+                for disk_output, disk_status in (("", 0), ("header\nfixture 500 400 unavailable\n", 0), ("", 1)):
+                    with self.subTest(shell=shell, status=status, disk_output=disk_output, disk_status=disk_status):
+                        answer = self.run_remote(shell, status, disk_output=disk_output, disk_status=disk_status)
+                        self.assertEqual(answer.returncode, 0, answer.stdout + answer.stderr)
+                        self.assertEqual(answer.stdout.splitlines(), ["nextest finished", f"mac_exit={status}", "mac_cleanup=kept"])
+                        self.assertEqual(existing.read_text(), "keep\n")
+                        self.assertEqual((target / "nextest-output").read_text(), "built\n")
+
+    def test_remote_text_with_another_target_dir_keeps_every_build_directory(self) -> None:
+        target = self.mirror / "target"
+        target.mkdir()
+        existing = target / "previous-build"
+        _ = existing.write_text("keep\n")
+        other_target = self.temporary_directory / "other build"
+        for shell in (["/bin/sh"], ["zsh", "-f"]):
+            for status in (0, 42):
+                for words in (("--target-dir", str(other_target)), (f"--target-dir={other_target}",)):
+                    with self.subTest(shell=shell, status=status, words=words):
+                        answer = self.run_remote(shell, status, words)
+                        self.assertEqual(answer.returncode, 0, answer.stdout + answer.stderr)
+                        self.assertEqual(answer.stdout.splitlines(), ["nextest finished", f"mac_exit={status}", "mac_cleanup=skipped"])
+                        self.assertEqual(existing.read_text(), "keep\n")
+                        self.assertEqual((other_target / "nextest-output").read_text(), "built\n")
+                        self.assertEqual(cast(list[str], json.loads((self.root / "lint-arguments.json").read_text())), ["nextest", *words])
+
+    def test_remote_text_reports_delete_failure_after_the_test_status(self) -> None:
+        remove = self.bin_directory / "rm"
+        _ = remove.write_text(f"#!{sys.executable}\n" + r'''
+import json
+import os
+from pathlib import Path
+import sys
+
+(Path(os.environ["CLEANUP_TEST_DIR"]) / "remove-arguments.json").write_text(json.dumps(sys.argv[1:]))
+raise SystemExit(7)
+''')
+        remove.chmod(0o755)
+        with mock.patch.dict(os.environ, {"PATH": str(self.bin_directory) + os.pathsep + os.environ["PATH"]}):
+            for shell in (["/bin/sh"], ["zsh", "-f"]):
+                for status in (0, 42):
+                    with self.subTest(shell=shell, status=status):
+                        answer = self.run_remote(shell, status)
+                        self.assertEqual(answer.returncode, 0, answer.stdout + answer.stderr)
+                        self.assertEqual(answer.stdout.splitlines(), ["nextest finished", f"mac_exit={status}", "mac_cleanup=7"])
+                        self.assertTrue((self.mirror / "target" / "nextest-output").exists())
+                        arguments = cast(list[str], json.loads((self.root / "remove-arguments.json").read_text()))
+                        self.assertEqual([word for word in arguments if not word.startswith("-")], [str(self.mirror / "target")])
 
 
 class MacActivityShellTests(unittest.TestCase):
