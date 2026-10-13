@@ -82,35 +82,20 @@ The four items of `docs/plans/build-followups-review-pool-next.md`, each placed 
 
 ### Phase 3 — A pooled design check reads no file on its turn  · status: done
 
-#### Work Order
+#### As-built
 
-**Goal:** A pooled UI reviewer judges its shots from its standing instructions alone: its turn reads neither `ux_eval.md` nor a rule file, and it reports the same defect rows as the Claude helper.
-
-**Spec:**
-
-Today every UI turn starts from a reset thread whose standing instructions hold the checklist, yet three things make the reviewer read files again on each turn: the shared prompt opens with "Read `~/.claude/commands/ux_eval.md` and follow it"; `config/review_pool/ui.md` says "Follow `~/.claude/commands/ux_eval.md`" and "Read a rule's full text before reporting its defect"; and the rule text itself is only in the guide's files. Each read is one more request that re-sends the whole thread.
-
-- **The standing prompt holds everything.** `config/review_pool/ui.md` keeps the role line, the Three Gods sentence and the checklist, and gains the report format and the judging steps of `commands/ux_eval.md` written out in full (the `Verdict:` line, the `| Shot | Rule | Defect | Fix |` table, the `Canonical candidates` section, how to measure size and contrast with `~/.claude/scripts/ux_style/measure_text.py`). It no longer tells the reviewer to follow `ux_eval.md` or to read a rule's text. Its line about rule paths becomes: the full text of each rule follows under `## Rules`.
-- **The review director adds the rules' text.** In `commands/review/direct.md`, building `<pool dir>/standing/ui.md` becomes: `config/review_pool/ui.md`, then `## Rules` with each rule file of the production doc's **UX guide** in name order as `### <file name>` and its text, then `docs/design-decisions.md` of the repository that holds the production doc when present (the file the helper reads from a unit's worktree), then the `ui` section of `memory/repository.md`. With no UX guide in the production doc, the `ui` type is not primed and the director says so in one line. The director rebuilds and primes at start and on resume as today; a changed rule file changes the hash, which makes a new template.
-- **The pooled prompt.** In `commands/unit/direct.md` <UXReview/> step 3, the unit director writes two prompt files. The Claude helper's is unchanged. The pool's is:
-
-  > Judge these shots by your standing instructions, which hold the rules and the report format: <paths>. Scale: <shot pixels per logical pixel>. Context: <unit> phase <N> — <what changed, every state the shots must show, and each shot's window size in logical pixels>. Production rules: <the production doc's rules that concern looks>. You only review: edit nothing. Return only the verdict and the table.
-
-  It names no file to read: no `ux_eval.md`, no guide path, no rule path. The shots reach the reviewer as images through `ux_shots_<pass>.txt`, as today.
-- **The stale sentence.** `commands/review/direct.md` l. 130 says the launcher sends a unit's memory file only at lease ordinal 1. Correct it: at ordinal 1 for `code`, and on every `ui` turn.
-- **Live check, by the unit director.** In a scratch pool (`REVIEW_POOL_STATE` and `PLAN_DELEGATE_HISTORY_DIR` set to scratch directories), prime `ui` from a standing prompt built as above from `~/rust/hanadocs/ux/`, run one shadow check on the shots the first plan's live check used, and read the pool turn's log: no read of `ux_eval.md` or of a rule file, the same defect rows as the helper by `review_pool_report.py --shadow`, and the turn's weighted tokens beside the earlier check's.
+- `config/review_pool/ui.md` holds the pooled UI reviewer's whole procedure: the checklist, the judging steps (shrink each shot, check context coverage, canonical-candidate slots, contrast and text size measured with `measure_text.py`, window-size normalisation, confirming each defect against the included rule text) and the report format (`Verdict: pass | defects`, the `| Shot | Rule | Defect | Fix |` table, canonical candidates). It tells the reviewer not to load command or rule files.
+- `commands/review/direct.md` <PrimeReviewMemory/> builds `standing/ui.md` from `ui.md`, then `## Rules` (`UX guide: <absolute path>`, then each guide-root `.md` with a non-empty frontmatter `test:`, in file-name order, as `### <file name>` plus its text), then `docs/design-decisions.md` of the repository that holds the production doc under `## Design decisions`, then the `ui` memory section. With no UX guide, `ui` is not primed and the director tells the showrunner `UI pool not primed: production has no UX guide`. An unreadable guide or rule fails the prime.
+- <ReviewMemory/> now says the launcher sends unit memory at lease ordinal 1 for `code` and on every `ui` turn, as `review.sh` already did.
+- `commands/unit/direct.md` <UXReview/> step 3 writes `${SESSION_DIR}/ux_prompt_<PASS_INDEX>_helper.md` (the unchanged `ux_eval.md` prompt) and `ux_prompt_<PASS_INDEX>_pool.md` ("Judge these shots by your standing instructions, which hold the rules and the report format: …"), and launches the pool with the pool file.
+- Live check (scratch pool, hana guide, 30 rules, one stored shot): the pooled turn read neither `ux_eval.md` nor a rule file, `review_pool_report.py --shadow` gave `pool missed defects: 0`, and the turn cost 79,903 weighted tokens in 6 requests against 102,264 in 8 for the earlier check.
 
 **Files:**
-- `config/review_pool/ui.md` — the report format and judging steps in full; no instruction to read a file
-- `commands/review/direct.md` — the UI standing prompt's build with the rules' text; the unit-memory sentence
-- `commands/unit/direct.md` — <UXReview/> step 3: the pool's own prompt
-- `scripts/delegate/test_review_pool.py` — the test below
-- `docs/as-built/review-pool.md` — Prompts and UI pool sections, at the as-built pass
+- `config/review_pool/ui.md` — the self-contained standing instructions
+- `commands/review/direct.md` — building and priming `standing/ui.md`
+- `commands/unit/direct.md` — the helper and pool prompt files
+- `scripts/delegate/test_review_pool.py` — `UIStandingPromptTests` pins the verdict line, the table header, `measure_text.py`, and the absence of the old read instructions
 
-**Seats:** `1 writer + 1 tester` — the three markdown files are one writer's; the test reads only `config/review_pool/ui.md`.
-- `impl` — `config/review_pool/ui.md`, `commands/review/direct.md`, `commands/unit/direct.md`
-- `test` — in `scripts/delegate/test_review_pool.py`: `config/review_pool/ui.md` holds the verdict line format and the four-column table header that `read_ux_verdict` requires, names `measure_text.py`, and contains neither `Follow \`~/.claude/commands/ux_eval.md\`` nor `Read a rule's full text`.
+**Gotchas:** rule selection matches `scripts/ux_style/load-ux-style.sh`, so README and notes are left out. Design decisions come from the production's repository, the file `ux_eval.md` reads from a unit's worktree, never from the guide. The pooled turn may still read `measure_text.py`'s source for its flags; that is a script, not a rule.
 
-**Constraints from prior phases:** `review_pool_report.py --shadow` prints the `Machine:` line (the trial-report phase); the live check's output carries it.
-
-**Acceptance gate:** `scripts/lib/py -m unittest discover -s scripts/delegate -p 'test_review_pool.py'` green; the live check above: no file read on the pool's turn, and `pool missed defects: 0`.
+**Ruled out:** taking design decisions from the guide — the helper and the pool would then judge against different exceptions.
