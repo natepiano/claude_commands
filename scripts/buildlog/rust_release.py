@@ -10,6 +10,7 @@ import shutil
 import socket
 import stat
 import subprocess
+import sys
 import tempfile
 import tomllib
 import urllib.request
@@ -19,6 +20,8 @@ from pathlib import Path
 from typing import BinaryIO, Literal, TypedDict, cast
 
 import store
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "build_hold"))
+import override_guard
 
 CHANNEL_URL = "https://static.rust-lang.org/dist/channel-rust-stable.toml"
 HANA = Path.home() / "rust/hana"
@@ -133,6 +136,7 @@ def free_space_gib() -> float:
 
 
 def build_hold_active(folder: Path = HOLD_DIR) -> bool:
+    override_guard.refuse_overrides(Path(__file__), "buildlog/rust_release.py")
     try:
         for entry in folder.iterdir():
             try:
@@ -157,6 +161,7 @@ def send_release_text(title: str, message: str) -> bool:
     sender = Path(__file__).resolve().parents[1] / "message/send.py"
     result = subprocess.run(
         ["python3", str(sender), "--to", "user", "--need", "note",
+         "--action", "Tell natedev to bump Rust or wait.",
          "--summary", title, "--text", message],
         capture_output=True, text=True, timeout=30, stdin=subprocess.DEVNULL,
     )

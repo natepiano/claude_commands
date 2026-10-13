@@ -24,6 +24,7 @@ if not __package__:
 sys.path.insert(0, str(PRODUCTION_SCRIPTS))
 
 from scripts.delegate import progress_history
+from scripts.lib.user_zone import user_zone
 from scripts.production import showrunners, unit_lookup
 from scripts.production.add_unit import (
     Production,
@@ -81,6 +82,7 @@ class FirstStatedEtaTarget(NamedTuple):
     """The target promised by a phase instance's first stated ETA."""
 
     time: datetime
+    repair_rounds: int
 
 
 class EtaNeverStated(NamedTuple):
@@ -593,6 +595,29 @@ def _reported_eta(
     )
 
 
+def _repair_rounds_started_after(
+    runs: list[list[dict[str, object]]],
+    instance_id: str,
+    stated_at: datetime,
+) -> int:
+    starts: dict[int, datetime] = {}
+    for events in runs:
+        for event in events:
+            fix_pass = event.get("fix_pass")
+            if (
+                _text(event.get("event_type")) != "pass_started"
+                or _text(event.get("phase_instance_id")) != instance_id
+                or isinstance(fix_pass, bool)
+                or not isinstance(fix_pass, int)
+                or fix_pass < 1
+            ):
+                continue
+            started = _moment(event.get("timestamp_epoch"))
+            if started is not None and (fix_pass not in starts or started < starts[fix_pass]):
+                starts[fix_pass] = started
+    return sum(started > stated_at for started in starts.values())
+
+
 def _latest_stated_eta(
     runs: list[list[dict[str, object]]], instance_id: str
 ) -> LatestStatedEtaEvent | NoStatedEtaEvent:
@@ -623,7 +648,10 @@ def _latest_stated_eta(
                 basis=_text(event.get("basis")),
             )
             if isinstance(first, EtaNeverStated):
-                first = FirstStatedEtaTarget(time=stated.time)
+                first = FirstStatedEtaTarget(
+                    time=stated.time,
+                    repair_rounds=_repair_rounds_started_after(runs, instance_id, stated.stated_at),
+                )
             latest = stated
     if isinstance(latest, NoStatedEtaEvent) or isinstance(first, EtaNeverStated):
         return NoStatedEtaEvent()
@@ -893,16 +921,18 @@ def _row_clocks(
     return "—", "—"
 
 
-def render(record: PhaseRecord, zone: ZoneInfo) -> str:
-    """Render a phase record as the compact Markdown report."""
+def _heading_text(record: PhaseRecord) -> str:
     current = record.current
     if isinstance(current, NoOpenPhase):
         done = sum(isinstance(row, DonePhase) for row in record.phases)
-        heading = f"**No phase running — {done} of {len(record.phases)} done**"
-    else:
-        heading = (
-            f"**Phase {current.phase} of {len(record.phases)} — {current.title}**"
-        )
+        return f"No phase running — {done} of {len(record.phases)} done"
+    return f"Phase {current.phase} of {len(record.phases)} — {current.title}"
+
+
+def render(record: PhaseRecord, zone: ZoneInfo) -> str:
+    """Render a phase record as the compact Markdown report."""
+    current = record.current
+    heading = f"**{_heading_text(record)}**"
 
     started = "—"
     percent = "—"
@@ -1011,8 +1041,10 @@ def _json_record(record: PhaseRecord, zone: ZoneInfo) -> dict[str, object]:
         if isinstance(current.progress, ReportedPhaseProgress):
             percent = current.progress.percent
         first_stated_eta_target: str | None = None
+        repair_rounds_since_first_stated_eta: int | None = None
         if isinstance(current.first_stated, FirstStatedEtaTarget):
             first_stated_eta_target = _iso(current.first_stated.time, zone)
+            repair_rounds_since_first_stated_eta = current.first_stated.repair_rounds
         if isinstance(current.eta, ProjectedEta):
             eta = current.eta
             eta_json = {
@@ -1048,6 +1080,7 @@ def _json_record(record: PhaseRecord, zone: ZoneInfo) -> dict[str, object]:
             "percent": percent,
             "eta": eta_json,
             "first_stated_eta_target": first_stated_eta_target,
+            "repair_rounds_since_first_stated_eta": repair_rounds_since_first_stated_eta,
         }
     plan_finish: str | None = None
     if isinstance(record.plan_finish, FinishedAt | PredictedFinish):
@@ -1220,6 +1253,7 @@ def _note_text(
             "phase_table: true",
             f"production: {production}",
             f"unit: {unit}",
+            f"now: {json.dumps(_heading_text(record), ensure_ascii=False)}",
             "---",
             "",
             f"# {name}",
@@ -1323,8 +1357,70 @@ def _vault_root() -> Path:
     ).expanduser()
 
 
+def _archive_note(candidate: Path, vault_root: Path, slug: str) -> Path:
+    """Move one generated phase note into the vault's archive and return its new path."""
+    # Outside showrunners, the archive stays out of every scan and in the vault's Git history.
+    folder = vault_root.parent / "archive" / candidate.parent.name / slug
+    try:
+        folder.mkdir(parents=True, exist_ok=True)
+    except OSError as error:
+        raise Refusal(f"cannot archive phase note {candidate}: {error}") from error
+
+    target = folder / candidate.name
+    suffix = 2
+    while True:
+        try:
+            os.link(candidate, target)
+            break
+        except FileExistsError:
+            target = folder / f"{candidate.stem}-{suffix}.md"
+            suffix += 1
+        except OSError as error:
+            raise Refusal(f"cannot archive phase note {candidate}: {error}") from error
+
+    try:
+        candidate.unlink()
+    except OSError as error:
+        try:
+            os.unlink(target)
+        except OSError:
+            pass
+        raise Refusal(f"cannot archive phase note {candidate}: {error}") from error
+
+    try:
+        candidate.parent.rmdir()
+    except OSError as error:
+        try:
+            if any(candidate.parent.iterdir()):
+                return target
+        except OSError:
+            pass
+        raise Refusal(
+            f"cannot remove empty phase note directory {candidate.parent}: {error}"
+        ) from error
+    return target
+
+
+def archive(production_doc: Path) -> list[Path]:
+    """Move a production's generated phase notes into the vault's archive."""
+    production = read_production(production_doc)
+    vault_root = _vault_root()
+    if not vault_root.parent.exists():
+        return []
+    archived: list[Path] = []
+    for candidate in sorted(vault_root.glob("*/*.md")):
+        ownership = _note_ownership(candidate)
+        if (
+            not isinstance(ownership, NoteOwnership)
+            or ownership.production != production.slug
+        ):
+            continue
+        archived.append(_archive_note(candidate, vault_root, production.slug))
+    return archived
+
+
 def prune(production_doc: Path) -> None:
-    """Remove generated notes for units no longer live in a production."""
+    """Archive generated notes for units no longer live in a production."""
     production = read_production(production_doc)
     live_units = {
         unit_plan.unit for unit_plan in _production_unit_plans(production)
@@ -1338,23 +1434,7 @@ def prune(production_doc: Path) -> None:
             or ownership.unit in live_units
         ):
             continue
-        try:
-            candidate.unlink()
-        except OSError as error:
-            raise Refusal(
-                f"cannot remove retired phase note {candidate}: {error}"
-            ) from error
-        try:
-            candidate.parent.rmdir()
-        except OSError as error:
-            try:
-                if any(candidate.parent.iterdir()):
-                    continue
-            except OSError:
-                pass
-            raise Refusal(
-                f"cannot remove empty phase note directory {candidate.parent}: {error}"
-            ) from error
+        _ = _archive_note(candidate, vault_root, production.slug)
 
 
 def refresh(session_dir: Path) -> None:
@@ -1399,24 +1479,6 @@ def refresh(session_dir: Path) -> None:
     _remove_stale_notes(vault_root, target, ownership)
 
 
-def _local_zone() -> ZoneInfo:
-    configured = os.environ.get("TZ")
-    if configured:
-        try:
-            return ZoneInfo(configured)
-        except ZoneInfoNotFoundError:
-            pass
-    try:
-        localtime = Path("/etc/localtime").resolve()
-        marker = "/zoneinfo/"
-        if marker in str(localtime):
-            return ZoneInfo(str(localtime).split(marker, 1)[1])
-    except (OSError, ZoneInfoNotFoundError):
-        pass
-    local = datetime.now().astimezone().tzinfo
-    return local if isinstance(local, ZoneInfo) else ZoneInfo("UTC")
-
-
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Show or refresh a unit run's plan phases."
@@ -1432,6 +1494,8 @@ def _build_parser() -> argparse.ArgumentParser:
     _ = refresh_parser.add_argument("--session-dir", type=Path, required=True)
     prune_parser = commands.add_parser("prune")
     _ = prune_parser.add_argument("--production-doc", type=Path, required=True)
+    archive_parser = commands.add_parser("archive")
+    _ = archive_parser.add_argument("--production-doc", type=Path, required=True)
     return parser
 
 
@@ -1455,11 +1519,17 @@ def main() -> int:
                 raise Refusal("prune requires a production document")
             prune(production_doc.expanduser().resolve())
             return 0
+        if command == "archive":
+            if production_doc is None:
+                raise Refusal("archive requires a production document")
+            for archived_path in archive(production_doc.expanduser().resolve()):
+                print(archived_path)
+            return 0
         if production_doc is not None:
             output = show_production(production_doc.expanduser().resolve())
             print(output)
             return 0
-        zone = ZoneInfo(zone_name) if zone_name else _local_zone()
+        zone = ZoneInfo(zone_name) if zone_name else user_zone()
         output = show(session_dir.expanduser().resolve(), zone, json_value is True)
     except (NoState, NoPlan, Refusal, ZoneInfoNotFoundError) as error:
         print(str(error), file=sys.stderr)

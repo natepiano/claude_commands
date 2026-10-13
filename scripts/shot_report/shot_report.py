@@ -11,6 +11,7 @@ import os
 import shlex
 import statistics
 import subprocess
+import sys
 import tempfile
 import time
 import zlib
@@ -20,7 +21,6 @@ from dataclasses import dataclass
 from datetime import datetime, time as clock_time, timedelta, timezone
 from pathlib import Path
 from typing import BinaryIO, cast
-from zoneinfo import ZoneInfo
 
 if __package__:
     from .changes import Change, MeasurementChange, ProductChange, read_changes
@@ -45,7 +45,9 @@ else:
         PersistentScanCache, UnavailableTimingSource, scan_calls, survey_counts,
     )
 
-PACIFIC = ZoneInfo("America/Los_Angeles")
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from scripts.lib.user_zone import user_zone, user_zone_name  # noqa: E402
+
 STATE_DIR = Path.home() / ".local/state/screenshot-analysis"
 CLAUDE_ROOT = Path.home() / ".claude/projects"
 CODEX_ROOT = Path.home() / ".codex/sessions"
@@ -333,7 +335,7 @@ def _mac_evidence(state_dir: Path) -> MacEvidence:
 
 
 def _pacific(value: datetime) -> str:
-    return value.astimezone(PACIFIC).strftime("%Y-%m-%d %H:%M %Z (%z)")
+    return value.astimezone(user_zone()).strftime("%Y-%m-%d %H:%M %Z (%z)")
 
 
 def _utc_now() -> datetime:
@@ -357,9 +359,9 @@ def _save_object(path: Path, value: dict[str, object]) -> None:
 
 def _window_stamp(value: str) -> datetime:
     if "T" not in value:
-        return datetime.combine(datetime.fromisoformat(value).date(), clock_time(), PACIFIC)
+        return datetime.combine(datetime.fromisoformat(value).date(), clock_time(), user_zone())
     parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
-    return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=PACIFIC)
+    return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=user_zone())
 
 
 def _percentile(values: list[float], percentile: float) -> float:
@@ -510,7 +512,7 @@ def _longest_episode_rows(episodes: Iterable[Episode], mac_claude: str) -> list[
                                                                GAP_CATEGORIES.index(category)))[:2]
         rows.append([
             _host_label(episode.source_host, mac_claude), episode.agent, episode.project, episode.session_id,
-            episode.start.astimezone(PACIFIC).isoformat(timespec="minutes"), f"{episode.minutes:.1f}",
+            episode.start.astimezone(user_zone()).isoformat(timespec="minutes"), f"{episode.minutes:.1f}",
             largest[0], f"{category_minutes[largest[0]]:.1f}",
             largest[1], f"{category_minutes[largest[1]]:.1f}",
         ])
@@ -593,7 +595,7 @@ def _weekly_trend(episodes: Iterable[Episode]) -> list[str]:
     for episode in episodes:
         if episode.split != 300:
             continue
-        local = episode.start.astimezone(PACIFIC)
+        local = episode.start.astimezone(user_zone())
         monday = (local - timedelta(days=local.weekday())).replace(hour=0, minute=0, second=0, microsecond=0)
         weeks[monday][episode.method].append(episode)
     rows: list[list[str]] = []
@@ -779,7 +781,7 @@ def report(state_dir: Path, since: str = "", until: str = "", project: str = "")
     ]
     start_label = _pacific(start) if start else "all available"
     end_label = _pacific(end) if end else "latest saved"
-    lines = [f"Window: {start_label} to {end_label} (America/Los_Angeles); n counts episodes; duration in hours and minutes"]
+    lines = [f"Window: {start_label} to {end_label} ({user_zone_name()}); n counts episodes; duration in hours and minutes"]
     status = _read_object(state_dir / "scan_status.json")
     last_scan = status.get("last_success")
     if isinstance(last_scan, str):

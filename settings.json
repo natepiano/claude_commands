@@ -41,6 +41,9 @@
       "Bash(~/.claude/scripts/release/*)",
       "Bash(~/rust/**/.git/**)",
       "Edit(~/.claude/**)",
+      "Edit(~/.claude1/**)",
+      "Edit(~/.claude2/**)",
+      "Edit(~/.claude3/**)",
       "Edit(~/Library/Application Support/**)",
       "Edit(//tmp/claude/**)",
       "Read(~/.cargo/registry/src**)",
@@ -183,11 +186,19 @@
           },
           {
             "type": "command",
+            "command": "\"$HOME/.claude/scripts/lib/py\" \"$HOME/.claude/scripts/whoami/account.py\" --write-label >/dev/null 2>&1 || true"
+          },
+          {
+            "type": "command",
             "command": "\"$HOME/.claude/scripts/settings/ensure_git_filters.sh\""
           },
           {
             "type": "command",
             "command": "\"$HOME/.claude/scripts/berth/install/hooks/berth_session_start.sh\""
+          },
+          {
+            "type": "command",
+            "command": "\"$HOME/.claude/scripts/lib/py\" \"$HOME/.claude/scripts/hooks/session-start-agents-log.py\""
           }
         ]
       },
@@ -223,6 +234,16 @@
         ]
       }
     ],
+    "SubagentStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"$HOME/.claude/scripts/lib/py\" \"$HOME/.claude/scripts/hooks/session-start-agents-log.py\""
+          }
+        ]
+      }
+    ],
     "UserPromptSubmit": [
       {
         "hooks": [
@@ -236,7 +257,7 @@
   },
   "statusLine": {
     "type": "command",
-    "command": "exec jq -r --arg pwd \"$PWD\" -f \"$HOME/.claude/scripts/statusline/statusline.jq\""
+    "command": "read -r account 2>/dev/null < \"${CLAUDE_CONFIG_DIR:-$HOME/.claude}/account-label\"; exec jq -r --arg pwd \"$PWD\" --arg account \"$account\" -f \"$HOME/.claude/scripts/statusline/statusline.jq\""
   },
   "enabledPlugins": {
     "rust-analyzer-lsp@claude-plugins-official": false
@@ -259,6 +280,9 @@
       "allowWrite": [
         "~/.cargo",
         "~/.claude",
+        "~/.claude1",
+        "~/.claude2",
+        "~/.claude3",
         "~/.local/state/gh-1password",
         "~/.local/state/plan-delegate",
         "~/Library/Application Support",

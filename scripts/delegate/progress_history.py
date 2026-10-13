@@ -25,6 +25,10 @@ from pathlib import Path
 from typing import NamedTuple, NoReturn, TypedDict, cast
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
+if not __package__:
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from scripts.lib.user_zone import user_zone  # noqa: E402
+
 
 SCHEMA_VERSION = 1
 # The shared history spine, read by scripts/history/history.py. Kept separate
@@ -357,14 +361,14 @@ def _refuse_eta(message: str) -> NoReturn:
 
 
 def _process_timezone() -> tzinfo:
+    """The zone a caller names in `TZ`, else the user's zone setting."""
     configured = os.environ.get("TZ")
     if configured:
         try:
             return ZoneInfo(configured)
         except ZoneInfoNotFoundError:
             pass
-    detected = datetime.now().astimezone().tzinfo
-    return detected if detected is not None else UTC
+    return user_zone()
 
 
 def _local_eta_epoch(value: str, option: str) -> float:
@@ -2129,7 +2133,7 @@ def _clock_line(now: float, next_report_at: float | None) -> str:
     never when. This line is the one place a reader can tell whether the report
     they are looking at is current and how long until the next one lands.
     """
-    line = f"**now {datetime.fromtimestamp(now):%Y-%m-%d %H:%M:%S}"
+    line = f"**now {datetime.fromtimestamp(now, _process_timezone()):%Y-%m-%d %H:%M:%S}"
     if next_report_at is not None:
         line += f" - next report {_moment_stamp(next_report_at, now)}"
     return line + "**"
@@ -2137,8 +2141,8 @@ def _clock_line(now: float, next_report_at: float | None) -> str:
 
 def _moment_stamp(epoch: float, now: float) -> str:
     """A local clock time, dated only when it falls on a day other than `now`'s."""
-    moment = datetime.fromtimestamp(epoch)
-    if moment.date() == datetime.fromtimestamp(now).date():
+    moment = datetime.fromtimestamp(epoch, _process_timezone())
+    if moment.date() == datetime.fromtimestamp(now, _process_timezone()).date():
         return f"{moment:%H:%M:%S}"
     return f"{moment:%Y-%m-%d %H:%M:%S}"
 
@@ -2159,12 +2163,6 @@ ROUND_SLOTS: tuple[str, ...] = ("impl", "test")
 # so it is a third column only when a stage the table shows seated it, and a
 # table without one keeps the two columns it always had.
 REVIEW_SLOT = "review"
-# The header each slot is reported under. A slot name doubles as a role word,
-# and `impl` under a column headed `Test` read as a contradiction; a numbered
-# seat carries no role, so the cell alone says what the seat is doing. The
-# bullets under the table keep the slot in parentheses so the reader can still
-# find `impl_status_<slot>` and the `[slot]` board lines.
-SEAT_LABELS: dict[str, str] = {"impl": "Agent 1", "test": "Agent 2", REVIEW_SLOT: "Agent 3"}
 # The statuses that mean a window is being worked right now. Narrower than the
 # set `_window_span` runs to the clock: a window left `open` is one whose finish
 # was never recorded, so its launcher is gone and its span is merely unbounded.
@@ -2250,7 +2248,7 @@ def _agent_display(model: str, effort: str) -> str:
 
 
 def _clock_stamp(epoch: float) -> str:
-    return f"{datetime.fromtimestamp(epoch):%H:%M:%S}"
+    return f"{datetime.fromtimestamp(epoch, _process_timezone()):%H:%M:%S}"
 
 
 def _started_window(event: dict[str, object], event_type: str) -> StageWindow:
@@ -2688,10 +2686,7 @@ def _board_role_changes(session_dir: Path) -> list[RoleChange]:
             continue
         role = re.search(r"\brole=(\w+)", match.group(3))
         at = _board_stamp(line)
-        # The writing seats only. The craft reviewer in `review` never hands
-        # off, so it has no movement to split a row on, and its cell reads the
-        # kind its own pass recorded.
-        if role is None or at is None or match.group(1) not in ROUND_SLOTS:
+        if role is None or at is None:
             continue
         changes.append(
             RoleChange(
@@ -3074,12 +3069,13 @@ def _round_segments(
         )
         for index in range(1, depth)
     }
-    # No writer sits in the review seat, so its first occupancy is a re-seating
-    # too: the craft reviewer sits down with the other lenses, and landing a
-    # second ahead of them must not put a sliver of review in the writers' row.
-    review_seated = occupancies.get(REVIEW_SLOT)
-    if review_seated:
-        waves.add(review_seated[0]["started_at"])
+    # A seat outside the phase's opening impl/test pair joins the round when its
+    # first occupancy begins. Treat that as a re-seating wave just like the
+    # original craft-review seat, so `review2` and `fix2` do not appear to have
+    # worked from the writers' start time.
+    for slot, seated in occupancies.items():
+        if slot not in ROUND_SLOTS and seated:
+            waves.add(seated[0]["started_at"])
     candidates = sorted({change["at"] for change in _role_movements(changes)} | waves)
     boundaries = [start]
     for at in candidates:
@@ -3240,23 +3236,53 @@ class RoundTable(TypedDict):
 
 def _round_headers(slots: tuple[str, ...]) -> list[str]:
     """The round table's header, with a column for each seat in `slots`."""
-    return ["Stage", "Start", "Elapsed", *(SEAT_LABELS[slot] for slot in slots), "Result"]
+    return [
+        "Stage",
+        "Start",
+        "Elapsed",
+        *(f"Agent {index}" for index, _slot in enumerate(slots, start=1)),
+        "Result",
+    ]
 
 
-def _shown_slots(shown: list[list[RoundEntry]]) -> tuple[str, ...]:
-    """The seat columns the shown stages need.
+def _reported_slots(
+    shown: list[list[RoundEntry]],
+    windows: list[StageWindow],
+    changes: list[RoleChange],
+) -> tuple[str, ...]:
+    """The seat columns this phase needs, in first-seen order after impl/test.
 
     The writers' two always, so a phase without a craft review keeps the table
-    it always drew. The review seat only when one of these stages seated it:
-    a column of dashes for a seat nothing sat in would read as a stalled agent.
+    it always drew. The original `review` seat retains its prior visibility
+    rule when it only recorded a pass: it appears while a shown stage seats it,
+    keeping existing impl/test/review tables byte-identical. Every other seat
+    that recorded a phase pass, plus every seat with a board handoff, gets a
+    column ordered by the first of those records.
     """
-    seated = {
+    shown_seated = {
         member["slot"]
         for group in shown
         for entry in group
         for member in entry["members"]
     }
-    return (*ROUND_SLOTS, REVIEW_SLOT) if REVIEW_SLOT in seated else ROUND_SLOTS
+    appearances: list[tuple[float, str]] = []
+    for window in windows:
+        slot = window["slot"]
+        if not slot or slot in ROUND_SLOTS:
+            continue
+        if slot == REVIEW_SLOT and REVIEW_SLOT not in shown_seated:
+            continue
+        appearances.append((window["started_at"], slot))
+    appearances.extend(
+        (change["at"], change["slot"])
+        for change in changes
+        if change["kind"] == "handoff" and change["slot"] not in ROUND_SLOTS
+    )
+    extra: list[str] = []
+    for _at, slot in sorted(appearances, key=lambda appearance: appearance[0]):
+        if slot not in extra:
+            extra.append(slot)
+    return (*ROUND_SLOTS, *extra)
 
 
 def _round_table(
@@ -3289,7 +3315,7 @@ def _round_table(
     }
     groups = _stage_groups(_round_entries(windows, labels))
     shown = groups[-ROUND_TABLE_STAGES:]
-    slots = _shown_slots(shown)
+    slots = _reported_slots(shown, windows, changes)
     rows: list[list[str]] = []
     gate_lines: list[str] = []
     for group in shown:
@@ -3351,8 +3377,10 @@ def _round_table(
                 # a handoff or a re-seated chair caused it.
                 seat_roles = [cell.split()[0] for cell in cells]
                 moved = ", ".join(
-                    f"{SEAT_LABELS[slot]} → {role}"
-                    for slot, before, role in zip(slots, previous_roles, seat_roles)
+                    f"Agent {position} → {role}"
+                    for position, (_slot, before, role) in enumerate(
+                        zip(slots, previous_roles, seat_roles), start=1
+                    )
                     if role != before and role != "-"
                 )
                 previous_roles = seat_roles
@@ -3413,7 +3441,7 @@ def _delegate_note(
         if window["slot"] and window["status"] in ("running", "armed", "open")
     }
     lines: list[str] = []
-    for slot in slots:
+    for position, slot in enumerate(slots, start=1):
         agent, said = live.get(slot), activity.get(slot)
         if agent is None and said is None:
             continue
@@ -3426,7 +3454,7 @@ def _delegate_note(
             age = _compact_duration(max(int(now - said["at"]), 0))
             detail = f"{age} ago \u00b7 {_board_phrase(said)}"
         lines.append(
-            f"- **{SEAT_LABELS[slot]}** ({slot}){f' {agent}' if agent else ''} \u00b7 {detail}"
+            f"- **Agent {position}** ({slot}){f' {agent}' if agent else ''} \u00b7 {detail}"
         )
     return lines
 
@@ -3514,8 +3542,8 @@ def _render_table(
 
 def _arrival_label(arrival_epoch: float, now: float) -> str:
     """A point in time named the way a person would say it aloud on `now`'s day."""
-    arrival = datetime.fromtimestamp(arrival_epoch)
-    days = (arrival.date() - datetime.fromtimestamp(now).date()).days
+    arrival = datetime.fromtimestamp(arrival_epoch, _process_timezone())
+    days = (arrival.date() - datetime.fromtimestamp(now, _process_timezone()).date()).days
     if days == 0:
         return f"today {arrival:%H:%M}"
     if days == 1:

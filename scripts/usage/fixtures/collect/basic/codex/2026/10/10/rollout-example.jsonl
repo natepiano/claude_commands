@@ -1,0 +1,14 @@
+{"timestamp":"2026-10-10T21:34:57Z","type":"session_meta","payload":{"id":"a1b2c3d4-2222-4222-8222-222222222222","cwd":"/invented/worktree"}}
+{"timestamp":"2026-10-10T21:34:58Z","type":"turn_context","payload":{"model":"gpt-5.6-sol","effort":"medium"}}
+{"timestamp":"2026-10-10T21:34:58Z","type":"response_item","payload":{"type":"message","content":[{"type":"output_text","text":"π is a small fixture"}]}}
+{"timestamp":"2026-10-10T21:34:58Z","type":"response_item","payload":{"type":"custom_tool_call","name":"functions.exec","input":"const example = 'tools.apply_patch(sample)'"}}
+{"timestamp":"2026-10-10T21:34:59Z","type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":30,"cached_input_tokens":10,"output_tokens":2},"total_token_usage":{"input_tokens":3000,"cached_input_tokens":1000,"output_tokens":200}}}}
+{"timestamp":"2026-10-10T21:34:59Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":3000,"cached_input_tokens":1000,"output_tokens":200}}}}
+{"timestamp":"2026-10-10T21:35:00Z","type":"turn_context","payload":{"model":"gpt-6.1-sol","effort":"high"}}
+{"timestamp":"2026-10-10T21:35:00Z","type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":40,"cached_input_tokens":15,"output_tokens":3}}}}
+{"timestamp":"2026-10-10T21:35:01Z","type":"response_item","payload":{"type":"custom_tool_call","name":"apply_patch","input":"*** Begin Patch\n*** Add File: invented.py\n+value = 1\n*** End Patch"}}
+{"timestamp":"2026-10-10T21:35:02Z","type":"turn_context","payload":{"model":"gpt-6.1-sol","effort":"low"}}
+{"timestamp":"2026-10-10T21:35:03Z","type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":50,"cached_input_tokens":20,"output_tokens":4}}}}
+{"timestamp":"2026-10-10T21:35:04Z","type":"compacted","payload":{}}
+{"timestamp":"2026-10-10T21:35:05Z","type":"turn_context","payload":{"model":"unknown-future-model"}}
+{"timestamp":"2026-10-10T21:35:06Z","type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":7,"cached_input_tokens":2,"output_tokens":1}}}}

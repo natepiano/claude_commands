@@ -6,6 +6,7 @@ import base64
 import io
 import json
 import os
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -19,6 +20,8 @@ import account
 
 
 STATUS_LINE = Path(__file__).parents[1] / "statusline" / "statusline.jq"
+EXAMPLE_FIRST_LINE = "natedev | claude_commands | 182,340 | Opus 5.5 high"
+ACCOUNT_FIRST_LINE = "natedev | claude 2 | claude_commands | 182,340 | Opus 5.5 high"
 
 
 class AccountTests(unittest.TestCase):
@@ -115,6 +118,68 @@ class AccountTests(unittest.TestCase):
             label = account.label_for("claude", "unlisted@example.com")
 
         self.assertEqual(label, "unlisted@example.com")
+
+    def test_named_claude_account_resolves_label_and_login(self) -> None:
+        self.write_note("claude 2.md", "person@example.com")
+        with patch.dict(os.environ, {"AGENT_NOTES_DIR": str(self.notes)}):
+            by_label = account.named_claude_account("CLAUDE 2")
+            by_login = account.named_claude_account("other@example.com")
+
+        self.assertEqual(
+            by_label,
+            account.Account("claude", "person@example.com", "claude 2"),
+        )
+        self.assertEqual(
+            by_login,
+            account.Account("claude", "other@example.com", "other@example.com"),
+        )
+
+    def test_named_claude_account_rejects_unknown_name(self) -> None:
+        with (
+            patch.dict(os.environ, {"AGENT_NOTES_DIR": str(self.notes)}),
+            self.assertRaisesRegex(
+                account.UnknownAccountName,
+                "unknown account claude2: give a note label such as claude 2, or a login",
+            ),
+        ):
+            _ = account.named_claude_account("claude2")
+
+    def test_named_claude_account_rejects_path_containing_at_sign(self) -> None:
+        with (
+            patch.dict(os.environ, {"AGENT_NOTES_DIR": str(self.notes)}),
+            self.assertRaises(account.UnknownAccountName),
+        ):
+            _ = account.named_claude_account("/tmp/x@example.com")
+
+    def test_own_claude_account_raises_when_login_is_unreadable(self) -> None:
+        config_dir = self.root / "empty-config"
+        config_dir.mkdir()
+        with (
+            patch.object(account, "claude_config_dir", return_value=config_dir),
+            self.assertRaisesRegex(
+                account.UnreadableAccount,
+                "this process's Claude account is unreadable",
+            ),
+        ):
+            _ = account.own_claude_account()
+
+    def test_named_account_start_points_memory_at_the_default_directory(self) -> None:
+        home = self.root / "home with 'quotes'"
+        config_dir = home / ".claude3"
+        with patch.dict(os.environ, {"HOME": str(home)}):
+            environment = account.named_account_environment(config_dir)
+            prefix = account.named_account_prefix(config_dir)
+
+        self.assertEqual(environment, {
+            "CLAUDE_CONFIG_DIR": str(config_dir),
+            "CLAUDE_CODE_REMOTE_MEMORY_DIR": str(home / ".claude"),
+        })
+        self.assertEqual(tuple(environment), account.NAMED_ACCOUNT_VARIABLES)
+        self.assertEqual(
+            prefix,
+            f"CLAUDE_CONFIG_DIR={shlex.quote(str(config_dir))} "
+            + f"CLAUDE_CODE_REMOTE_MEMORY_DIR={shlex.quote(str(home / '.claude'))} ",
+        )
 
     def test_process_config_dir_reads_set_variable_from_linux_process_environment(self) -> None:
         environ = b"USER=test\0CLAUDE_CONFIG_DIR=/tmp/claude-two\0PATH=/usr/bin\0"
@@ -365,38 +430,172 @@ class AccountTests(unittest.TestCase):
 
         self.assertEqual(status, 1)
 
-    def render_status_line(self, label: str | None) -> str:
+    def status_line_input(self) -> dict[str, object]:
+        return {
+            "workspace": {"current_dir": "/tmp/claude_commands"},
+            "context_window": {"total_input_tokens": 182_340},
+            "model": {"display_name": "Opus 5.5"},
+            "effort": {"level": "high"},
+        }
+
+    def render_status_line(
+        self,
+        document: object,
+        label: str | None = None,
+        home: str = "/home/someone",
+    ) -> str:
         arguments = [
             "jq",
             "-r",
-            "-f",
-            str(STATUS_LINE),
             "--arg",
             "pwd",
-            "/tmp/fixed/worktree",
+            "/tmp/fixed/fallback",
         ]
         if label is not None:
             arguments.extend(("--arg", "account", label))
+        arguments.extend(("-f", str(STATUS_LINE)))
         result = subprocess.run(
             arguments,
             capture_output=True,
             check=True,
-            input=json.dumps({}),
+            env=dict(os.environ) | {"HOME": home},
+            input=json.dumps(document),
             text=True,
         )
-        return result.stdout.removesuffix("\n")
+        return result.stdout
 
-    def test_status_line_appends_a_nonempty_account_label(self) -> None:
+    def test_status_line_prints_account_first_and_both_remaining_windows_second(self) -> None:
+        document = self.status_line_input() | {
+            "rate_limits": {
+                "five_hour": {"used_percentage": 26.4, "resets_at": 1_800_000_000},
+                "seven_day": {"used_percentage": 58.2, "resets_at": 1_800_000_000},
+            }
+        }
+
         self.assertEqual(
-            self.render_status_line("claude 2"),
-            "worktree | 0 |  | claude 2",
+            self.render_status_line(document, "claude 2"),
+            ACCOUNT_FIRST_LINE + "\n5-hour 73% left | weekly 41% left\n",
         )
 
-    def test_status_line_omits_an_empty_account_label(self) -> None:
-        self.assertEqual(self.render_status_line(""), "worktree | 0 | ")
+    def test_status_line_floors_and_clamps_remaining_percentage(self) -> None:
+        cases = (
+            (0, "100"),
+            (100, "0"),
+            (104, "0"),
+        )
+        for used_percentage, remaining_percentage in cases:
+            with self.subTest(used_percentage=used_percentage):
+                document = self.status_line_input() | {
+                    "rate_limits": {
+                        "five_hour": {"used_percentage": used_percentage}
+                    }
+                }
+                self.assertEqual(
+                    self.render_status_line(document),
+                    EXAMPLE_FIRST_LINE
+                    + f"\n5-hour {remaining_percentage}% left\n",
+                )
 
-    def test_status_line_omits_account_field_when_argument_is_absent(self) -> None:
-        self.assertEqual(self.render_status_line(None), "worktree | 0 | ")
+    def test_status_line_is_one_line_with_the_account_when_limits_are_absent(self) -> None:
+        self.assertEqual(
+            self.render_status_line(self.status_line_input(), "claude 2"),
+            ACCOUNT_FIRST_LINE + "\n",
+        )
+
+    def test_status_line_names_the_machine_by_home_directory(self) -> None:
+        cases = (
+            ("/home/someone", "natedev"),
+            ("/Users/someone", "mac"),
+        )
+        for home, machine in cases:
+            with self.subTest(home=home):
+                self.assertEqual(
+                    self.render_status_line(self.status_line_input(), home=home),
+                    f"{machine} | claude_commands | 182,340 | Opus 5.5 high\n",
+                )
+
+    def test_status_line_prints_windows_without_an_account_argument(self) -> None:
+        document = self.status_line_input() | {
+            "rate_limits": {
+                "five_hour": {"used_percentage": 25},
+                "seven_day": {"used_percentage": 60},
+            }
+        }
+
+        self.assertEqual(
+            self.render_status_line(document),
+            EXAMPLE_FIRST_LINE + "\n5-hour 75% left | weekly 40% left\n",
+        )
+
+    def test_status_line_omits_a_null_or_missing_window(self) -> None:
+        cases: tuple[tuple[dict[str, object], str], ...] = (
+            (
+                {
+                    "five_hour": None,
+                    "seven_day": {"used_percentage": 60},
+                },
+                "weekly 40% left",
+            ),
+            (
+                {
+                    "five_hour": {"used_percentage": 25},
+                    "seven_day": None,
+                },
+                "5-hour 75% left",
+            ),
+            ({"seven_day": {"used_percentage": 60}}, "weekly 40% left"),
+            ({"five_hour": {"used_percentage": 25}}, "5-hour 75% left"),
+        )
+        for rate_limits, expected_second_line in cases:
+            with self.subTest(rate_limits=rate_limits):
+                document = self.status_line_input() | {"rate_limits": rate_limits}
+                self.assertEqual(
+                    self.render_status_line(document),
+                    EXAMPLE_FIRST_LINE + f"\n{expected_second_line}\n",
+                )
+
+    def test_status_line_omits_a_window_without_used_percentage(self) -> None:
+        cases: tuple[tuple[dict[str, object], str], ...] = (
+            (
+                {
+                    "five_hour": {"resets_at": 1_800_000_000},
+                    "seven_day": {"used_percentage": 60},
+                },
+                "weekly 40% left",
+            ),
+            (
+                {
+                    "five_hour": {"used_percentage": 25},
+                    "seven_day": {"resets_at": 1_800_000_000},
+                },
+                "5-hour 75% left",
+            ),
+        )
+        for rate_limits, expected_second_line in cases:
+            with self.subTest(rate_limits=rate_limits):
+                document = self.status_line_input() | {"rate_limits": rate_limits}
+                self.assertEqual(
+                    self.render_status_line(document),
+                    EXAMPLE_FIRST_LINE + f"\n{expected_second_line}\n",
+                )
+
+    def test_status_line_has_no_empty_second_line_without_any_parts(self) -> None:
+        documents = (
+            self.status_line_input(),
+            self.status_line_input() | {"rate_limits": None},
+        )
+        for document in documents:
+            with self.subTest(document=document):
+                self.assertEqual(
+                    self.render_status_line(document),
+                    EXAMPLE_FIRST_LINE + "\n",
+                )
+
+    def test_status_line_omits_an_empty_account_label(self) -> None:
+        self.assertEqual(
+            self.render_status_line(self.status_line_input(), ""),
+            EXAMPLE_FIRST_LINE + "\n",
+        )
 
 
 if __name__ == "__main__":

@@ -151,10 +151,11 @@ subagent produces no readable liveness signal — its only output is a full
 transcript too large to read — which leaves the user with an unexplained
 multi-minute silence at the same point in every phase.
 
-Write the prompt to `${SESSION_DIR}/architect_prompt_<phase>.md`, then:
+Write the prompt to `${SESSION_DIR}/architect_prompt_<phase>.md`. In a delegate
+run, select an open seat per `/unit:direct`'s `<RunPhaseReview/>`, then:
 
 ```
-bash ~/.claude/scripts/delegate/review.sh \
+bash ~/.claude/scripts/delegate/review.sh --to "<full-seat-name>" \
   "${SESSION_DIR}" "${WORKING_DIR}" \
   "${SESSION_DIR}/architect_prompt_<phase>.md" \
   review \
@@ -163,6 +164,10 @@ architect review of the remaining phases against what phase <phase> actually shi
   "reviewing the remaining phases against what just shipped" \
   <pass_index>
 ```
+
+If every open seat is busy, use the same call with `--slot review` in place of
+`--to "<full-seat-name>"`; that seat stays open. Only a phase review outside a
+delegate run calls `review.sh` with neither option.
 
 - `review` is the subtask name; it resolves through `[delegate.<family>]` in
   `~/.claude/config/agents.conf` like every other delegate subtask. There is no
@@ -188,6 +193,8 @@ The prompt must include:
   for retrospective or review prose.
 - The complete contents of `~/.claude/docs/type_design.md`, under a `Type Design
   Contract` heading.
+- The inline sentence: "We believe in three gods, Simple, Fast and Beautiful,
+  with correctness as the floor beneath them."
 - The review questions:
   1. Are any remaining phases now redundant, partially redundant, or already satisfied by what was just built?
   2. Do any remaining phases need re-scoping (smaller, larger, split, merged, reordered) given the implications surfaced in the retrospective?

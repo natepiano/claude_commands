@@ -20,6 +20,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import cast
 from unittest import mock
+from zoneinfo import ZoneInfo
 
 import sweep
 
@@ -55,6 +56,14 @@ def unit(tree: Path, directory: str, name: str, digest: str, used: float, size: 
     os.utime(record, (used, used))
     os.utime(fingerprint, (used, used))
     return write(tree / directory / f"{name}-{digest}", size)
+
+
+PACIFIC = ZoneInfo("America/Los_Angeles")
+
+
+def setUpModule() -> None:
+    """The times these tests expect are Pacific; the user's zone setting must not change them."""
+    unittest.enterModuleContext(mock.patch.dict(os.environ, {"USER_ZONE": "America/Los_Angeles"}))
 
 
 class Target:
@@ -593,7 +602,8 @@ raise SystemExit(int(os.environ[variable]))
         errors = io.StringIO()
         expected_commands = [
             [sys.executable, str(sender), "--to", "natedev", "--from", "disk_floor", "--timeout", "30"],
-            [sys.executable, str(sender), "--to", "user", "--need", "note", "--summary",
+            [sys.executable, str(sender), "--to", "user", "--need", "note", "--action",
+             "Free disk space outside build caches on natedev.", "--summary",
              "natedev: disk under its floor", "--text", "disk notice"],
         ]
         real_run = subprocess.run
@@ -785,8 +795,8 @@ if sys.argv[sys.argv.index("--to") + 1] == "user":
     def test_snapshot_growth_above_fall_covers_all_without_negative_remainder(self) -> None:
         now = time.time()
         measurement = sweep.AvailableDiskMeasurement(
-            datetime.fromtimestamp(now - 60, sweep.PACIFIC),
-            sweep.EarlierDiskMeasurement(datetime.fromtimestamp(now - 660, sweep.PACIFIC)),
+            datetime.fromtimestamp(now - 60, PACIFIC),
+            sweep.EarlierDiskMeasurement(datetime.fromtimestamp(now - 660, PACIFIC)),
             [], 30 * GIB,
         )
         previous = sweep.FloorRecord(now - 120, 30 * GIB, 0, sweep.NoDeliveredAlert(), sweep.NoDeliveredAlert())
@@ -800,10 +810,10 @@ if sys.argv[sys.argv.index("--to") + 1] == "user":
 
     def test_measurement_within_fall_places_remainder_after_its_time(self) -> None:
         now = time.time()
-        measured = datetime.fromtimestamp(now - 30, sweep.PACIFIC)
+        measured = datetime.fromtimestamp(now - 30, PACIFIC)
         measurement = sweep.AvailableDiskMeasurement(
             measured,
-            sweep.EarlierDiskMeasurement(datetime.fromtimestamp(now - 600, sweep.PACIFIC)),
+            sweep.EarlierDiskMeasurement(datetime.fromtimestamp(now - 600, PACIFIC)),
             [], 2 * GIB,
         )
         previous = sweep.FloorRecord(now - 120, 30 * GIB, 0, sweep.NoDeliveredAlert(),
@@ -815,8 +825,8 @@ if sys.argv[sys.argv.index("--to") + 1] == "user":
     def test_no_prior_floor_sweep_omits_explained_fall(self) -> None:
         now = time.time()
         measurement = sweep.AvailableDiskMeasurement(
-            datetime.fromtimestamp(now, sweep.PACIFIC),
-            sweep.EarlierDiskMeasurement(datetime.fromtimestamp(now - 600, sweep.PACIFIC)),
+            datetime.fromtimestamp(now, PACIFIC),
+            sweep.EarlierDiskMeasurement(datetime.fromtimestamp(now - 600, PACIFIC)),
             [], 30 * GIB,
         )
         message = sweep.floor_alert_text(now, 35 * GIB, sweep.NoFloorRecord(), 0, 0,
@@ -843,8 +853,8 @@ if sys.argv[sys.argv.index("--to") + 1] == "user":
             ) for index in range(3)
         ]
         measurement = sweep.AvailableDiskMeasurement(
-            datetime.fromtimestamp(now, sweep.PACIFIC),
-            sweep.EarlierDiskMeasurement(datetime.fromtimestamp(now - 600, sweep.PACIFIC)),
+            datetime.fromtimestamp(now, PACIFIC),
+            sweep.EarlierDiskMeasurement(datetime.fromtimestamp(now - 600, PACIFIC)),
             directories, 30 * GIB,
         )
         previous = sweep.FloorRecord(now - 60, 30 * GIB, 0, sweep.NoDeliveredAlert(), sweep.NoDeliveredAlert())

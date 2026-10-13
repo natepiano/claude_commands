@@ -15,6 +15,7 @@ import sys
 import tempfile
 import time
 import unittest
+from unittest import mock
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import cast, override
@@ -34,6 +35,9 @@ NEXTEST = ["cargo", "nextest", "run", "--workspace", "--retries", "2"]
 AMBIENT = (
     "BUILDLOG_CALLER",
     "BUILDLOG_CALL_ID",
+    "BUILDLOG_LOCAL_REASON",
+    "BUILDLOG_TARGET",
+    "BUILDLOG_HOLD_WAIT_S",
     "LINT_OUTPUT_DIR",
     "VALIDATE_TARGET_DIR",
     "CLAUDECODE",
@@ -66,6 +70,11 @@ def ledger_line(**fields: object) -> str:
     return json.dumps(event)
 
 
+def setUpModule() -> None:
+    """The times these tests expect are Pacific; the user's zone setting must not change them."""
+    unittest.enterModuleContext(mock.patch.dict(os.environ, {"USER_ZONE": "America/Los_Angeles"}))
+
+
 class RecordTests(unittest.TestCase):
     base: Path  # pyright: ignore[reportUninitializedInstanceVariable]
     root: Path  # pyright: ignore[reportUninitializedInstanceVariable]
@@ -88,6 +97,14 @@ class RecordTests(unittest.TestCase):
             if name not in AMBIENT and not name.startswith("PLAN_DELEGATE_")
         }
         environment["BUILDLOG_DIR"] = str(self.root)
+        environment["BUILD_HOLD_DIR"] = str(self.base / "holders")
+        environment["BUILD_HOLD_RELEASE_DIR"] = str(self.base / "release")
+        environment["PLAN_DELEGATE_ACTIVE_DIR"] = str(self.base / "active")
+        environment["BUILDLOG_CALL_ID"] = environment["BUILDLOG_CALLER"] = ""
+        environment["BUILDLOG_HOLD_WAIT_FILE"] = environment["BUILDLOG_HOLD_ADMISSION_FILE"] = ""
+        environment["BUILDLOG_HOLD_STARTED_FILE"] = environment["BUILDLOG_HOLD_WAITER_FILE"] = ""
+        environment["BUILDLOG_HOLD_REGISTRATION_FILE"] = str(self.base / "registration")
+        environment["MAC_TEST_STATE_DIR"] = str(self.base / "mac-state")
         # No signing, hooks or identity from the user's own git config.
         environment["GIT_CONFIG_GLOBAL"] = os.devnull
         environment["GIT_CONFIG_NOSYSTEM"] = "1"
@@ -598,13 +615,15 @@ class RecordTests(unittest.TestCase):
                 self.assertEqual(len(records), before + 1)
                 self.assertEqual(records[-1]["token_wait_s"], 0)
 
-    def test_call_records_mac_result(self) -> None:
+    def test_call_records_mac_result_and_local_reason(self) -> None:
+        local_reason = 'needs Linux path handling with a "quoted" mount'
         result = self.record(
             "call", "ran", "0", "0", "9", "1", "", "0", "10", "test", "hana",
             extra={
                 "BUILDLOG_MAC": "passed",
                 "BUILDLOG_MAC_REASON": "",
                 "BUILDLOG_MAC_S": "12.5",
+                "BUILDLOG_LOCAL_REASON": local_reason,
             },
         )
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -612,6 +631,41 @@ class RecordTests(unittest.TestCase):
         self.assertEqual(call_record["mac"], "passed")
         self.assertEqual(call_record["mac_reason"], "")
         self.assertEqual(call_record["mac_s"], 12.5)
+        self.assertEqual(call_record["local_reason"], local_reason)
+
+    def test_call_local_reason_defaults_to_empty(self) -> None:
+        result = self.record(
+            "call", "ran", "0", "0", "9", "1", "", "0", "10", "test", "hana"
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.records()[-1]["local_reason"], "")
+
+    def test_call_records_target_and_fractional_hold_wait(self) -> None:
+        for target in ("mac", "natedev", ""):
+            with self.subTest(target=target):
+                result = self.record(
+                    "call", "ran", "0", "0", "9", "1", "", "0", "10", "test", "hana",
+                    extra={"BUILDLOG_TARGET": target, "BUILDLOG_HOLD_WAIT_S": "0.4"},
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(self.records()[-1]["target"], target)
+                self.assertEqual(self.records()[-1]["hold_wait_s"], 0.4)
+
+    def test_call_records_null_hold_wait_for_invalid_numbers(self) -> None:
+        for value in ("", "abc", "-0.4", "nan", "inf"):
+            with self.subTest(value=value):
+                result = self.record(
+                    "call", "ran", "0", "0", "9", "1", "", "0", "10", "test", "hana",
+                    extra={"BUILDLOG_HOLD_WAIT_S": value},
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIsNone(self.records()[-1]["hold_wait_s"])
+
+    def test_call_records_empty_target_and_null_hold_wait_when_unset(self) -> None:
+        result = self.record("call", "ran", "0", "0", "9", "1", "", "0", "10", "test", "hana")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.records()[-1]["target"], "")
+        self.assertIsNone(self.records()[-1]["hold_wait_s"])
 
     def test_call_records_null_mac_seconds_when_value_is_unusable(self) -> None:
         for value in ("", "abc", "-1"):

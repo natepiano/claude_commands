@@ -1,0 +1,1 @@
+{"event_type":"run_started","timestamp":"2026-10-10T21:35:00Z","run_started_at":1791668100,"run_id":"invented-run","working_dir":"/invented/worktree","worktree":"/invented/worktree","main_agent":{"family":"claude","session_id":"a1b2c3d4-1111-4111-8111-111111111111","model":"claude-opus-4-6","effort":"high"}}

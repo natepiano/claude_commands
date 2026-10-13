@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -14,7 +15,7 @@ from pathlib import Path
 from typing import Literal, TypedDict, cast
 
 from agent_accounts import claude_config_dir, claude_on_disk, codex_email_on_disk, codex_home
-from agent_notes import AGENTS_DIR, read_note
+import note_file
 
 
 @dataclass(frozen=True)
@@ -22,6 +23,14 @@ class Account:
     tool: Literal["claude", "codex"]
     login: str
     label: str
+
+
+class UnreadableAccount(Exception):
+    """The current process has no readable Claude login."""
+
+
+class UnknownAccountName(ValueError):
+    """Text does not identify a Claude note label or login."""
 
 
 class AccountIdentity(TypedDict):
@@ -42,13 +51,13 @@ class CommandLine(argparse.Namespace):
 
 def label_for(tool: str, login: str) -> str:
     """The matching hanadocs note stem, or the login when no note matches."""
-    notes_dir = Path(os.environ.get("AGENT_NOTES_DIR", str(AGENTS_DIR)))
+    notes_dir = Path(os.environ.get("AGENT_NOTES_DIR", str(note_file.AGENTS_DIR)))
     folded_tool = tool.casefold()
     folded_login = login.casefold()
     for path in sorted(notes_dir.glob("*.md")):
         if not path.stem.casefold().startswith(folded_tool):
             continue
-        note = read_note(path)
+        note = note_file.read_note(path)
         if note is not None and (note.get("login") or "").casefold() == folded_login:
             return path.stem
     return login
@@ -62,6 +71,39 @@ def claude_account(config_dir: Path) -> Account | None:
     return Account("claude", report.email, label_for("claude", report.email))
 
 
+def own_claude_account() -> Account:
+    """Return this process's Claude account or explain why it cannot be used."""
+    resolved = claude_account(claude_config_dir())
+    if resolved is None:
+        raise UnreadableAccount("this process's Claude account is unreadable")
+    return resolved
+
+
+def named_claude_account(text: str) -> Account:
+    """Resolve a Claude note label or accept an explicit login."""
+    notes_dir = Path(os.environ.get("AGENT_NOTES_DIR", str(note_file.AGENTS_DIR)))
+    folded = text.casefold()
+    for path in sorted(notes_dir.glob("*.md")):
+        stem = path.stem.casefold()
+        if not stem.startswith("claude") or stem != folded:
+            continue
+        note = note_file.read_note(path)
+        login = None if note is None else note.get("login")
+        if isinstance(login, str) and login:
+            return Account("claude", login, path.stem)
+    if (
+        "@" in text
+        and "/" not in text
+        and "\0" not in text
+        and not any(character.isspace() for character in text)
+        and not text.startswith(".")
+    ):
+        return Account("claude", text, label_for("claude", text))
+    raise UnknownAccountName(
+        f"unknown account {text}: give a note label such as claude 2, or a login"
+    )
+
+
 def codex_account(home: Path) -> Account | None:
     """The Codex login stored in one Codex home."""
     login = codex_email_on_disk(home)
@@ -72,6 +114,29 @@ def codex_account(home: Path) -> Account | None:
 
 def _default_claude_config_dir() -> Path:
     return Path.home() / ".claude"
+
+
+# Claude Code saves a memory file without asking only when no link sits in the
+# file's path. A named account's `projects` is a link into the default
+# directory, so its sessions are pointed at the memory under that directory.
+MEMORY_BASE_VARIABLE = "CLAUDE_CODE_REMOTE_MEMORY_DIR"
+NAMED_ACCOUNT_VARIABLES = ("CLAUDE_CONFIG_DIR", MEMORY_BASE_VARIABLE)
+
+
+def named_account_environment(config_dir: Path) -> dict[str, str]:
+    """The variables that start Claude Code on a named account's directory."""
+    return {
+        "CLAUDE_CONFIG_DIR": str(config_dir),
+        MEMORY_BASE_VARIABLE: str(_default_claude_config_dir()),
+    }
+
+
+def named_account_prefix(config_dir: Path) -> str:
+    """The same variables as shell assignments placed before a command."""
+    return "".join(
+        f"{name}={shlex.quote(value)} "
+        for name, value in named_account_environment(config_dir).items()
+    )
 
 
 def parse_darwin_config_dir(output: str, expected_uid: int) -> Path | None:

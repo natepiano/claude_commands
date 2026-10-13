@@ -30,10 +30,11 @@ from urllib.parse import quote
 
 import store
 
-SCHEMA_VERSION = 10
+SCHEMA_VERSION = 13
 LOCK_NAME = "index.lock"
 MARK_BYTES = 256
 BUSY_TIMEOUT_MS = 30_000
+COUNTED_FAILURE = "status != 0 AND NOT (caller IS 'verify-mac' AND step IS 'nextest' AND status = 4)"
 
 Column = tuple[str, str, str]
 
@@ -135,7 +136,14 @@ CALL_COLUMNS: list[Column] = [
     ("token_wait_s", "INTEGER", "seconds spent acquiring the cargo token, a wait that timed out included; 0 when verify.sh sought none"),
     ("mac", "TEXT", "passed, passed_filter, failed, lost or declined when Mac offload ran or was considered"),
     ("mac_reason", "TEXT", "why Mac offload declined or had no usable result"),
+    (
+        "local_reason",
+        "TEXT",
+        "verify.sh test --local: why the test must run on Linux; empty otherwise",
+    ),
     ("mac_s", "REAL", "seconds spent deciding or running on the Mac"),
+    ("target", "TEXT", "where the call was when it ended: mac, natedev, or empty"),
+    ("hold_wait_s", "REAL", "seconds waited on a held target, each declined Mac retry included; memory waits are not counted"),
     ("wall_s", "INTEGER", "seconds the run took"),
     ("build_s", "INTEGER", "cargo's own build seconds, NULL when unmeasured"),
     ("saved_s", "INTEGER", "seconds a reused or replayed record saved"),
@@ -256,8 +264,8 @@ TABLES: dict[str, tuple[list[Column], str, str]] = {
 VIEWS: dict[str, tuple[str, str]] = {
     "step_days": (
         "per local day, host, repo, step and caller: runs, failed, total_s, avg_s, max_s, avg_build_s, max_peak_gib",
-        """SELECT date(started_at, 'localtime') AS day, host, repo, step, caller,
-       count(*) AS runs, sum(status != 0) AS failed,
+        f"""SELECT date(started_at, 'localtime') AS day, host, repo, step, caller,
+       count(*) AS runs, sum({COUNTED_FAILURE}) AS failed,
        round(sum(duration_s), 1) AS total_s, round(avg(duration_s), 1) AS avg_s,
        round(max(duration_s), 1) AS max_s, round(avg(finished_s), 1) AS avg_build_s,
        round(max(peak_mem_bytes) / 1073741824.0, 2) AS max_peak_gib
@@ -285,11 +293,11 @@ HAVING retried > 0 OR (passed > 0 AND failed > 0)""",
     ),
     "failures": (
         "failed steps, newest last: local time, where, step, caller, status, errors, tests_failed, log (absolute), argv",
-        """SELECT datetime(started_at, 'localtime') AS at, host, repo, worktree_name, branch, step, caller,
+        f"""SELECT datetime(started_at, 'localtime') AS at, host, repo, worktree_name, branch, step, caller,
        status, errors, tests_failed,
        CASE WHEN log IS NULL THEN NULL ELSE (SELECT value FROM meta WHERE key = 'root') || '/' || log END AS log,
        argv, id
-FROM steps WHERE status != 0""",
+FROM steps WHERE {COUNTED_FAILURE}""",
     ),
     "ci_job_days": (
         "CI jobs per local day, workflow and job name: jobs, failed, avg_s, max_s, avg_queue_s, max_queue_s",
@@ -334,6 +342,7 @@ def create_schema(connection: sqlite3.Connection) -> None:
     statements.append("CREATE INDEX steps_started ON steps (started_at)")
     statements.append("CREATE INDEX steps_host_started ON steps (host, started_at)")
     statements.append("CREATE INDEX steps_tree ON steps (worktree, step, tree_key)")
+    statements.append("CREATE INDEX steps_call ON steps (call_id)")
     statements.append("CREATE INDEX tests_step ON tests (step_id)")
     statements.append("CREATE INDEX calls_started ON calls (started_at)")
     statements.append("CREATE INDEX ci_jobs_run ON ci_jobs (run_id, attempt)")

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import copy
 import io
 import json
@@ -130,6 +131,11 @@ def phases_writer(data: PhaseReport) -> Callable[..., PhaseReport]:
         _ = (state_dir / "phases.json").write_text(json.dumps(data), encoding="utf-8")
         return data
     return write
+
+
+def setUpModule() -> None:
+    """The times these tests expect are Pacific; the user's zone setting must not change them."""
+    unittest.enterModuleContext(patch.dict(os.environ, {"USER_ZONE": "America/Los_Angeles"}))
 
 
 class CarryForwardTests(unittest.TestCase):

@@ -198,10 +198,33 @@ buildlog_finish_memory() {
 
 run_once() {
     printf '+ %s\n' "$*"
-    buildlog_begin "$@" || true
-    local sampler_pid="" parent_pid=$BASHPID status=0
     if buildlog_step_compiles "$@"; then
-        buildlog_wait_for_memory "$@"
+        build_hold_wait_local || return $?
+    fi
+    buildlog_begin "$@" || true
+    local sampler_pid="" parent_pid=$BASHPID status=0 memory_wait=0
+    if buildlog_step_compiles "$@"; then
+        build_hold_step_started
+        while :; do
+            buildlog_wait_for_memory "$@"
+            memory_wait=$(( memory_wait + BUILDLOG_MEM_WAIT_S ))
+            if build_hold_check_admission; then
+                break
+            else
+                status=$?
+            fi
+            buildlog_release_memory 0
+            if [[ "$status" != 10 ]]; then
+                BUILDLOG_MEM_WAIT_S=$memory_wait
+                return "$status"
+            fi
+            build_hold_wait_local || {
+                status=$?
+                BUILDLOG_MEM_WAIT_S=$memory_wait
+                return "$status"
+            }
+        done
+        BUILDLOG_MEM_WAIT_S=$memory_wait
         build_hold_mark MemoryGateReturned "$BUILDLOG_MEM_OUTCOME"
     fi
     if [[ -n "${BUILDLOG_MEM_RESERVATION:-}" && -n "${BUILDLOG_PEAK:-}" ]]; then
@@ -354,6 +377,7 @@ nextest_width_arm() {
 
 run_nextest() {
     require_nextest
+    build_hold_wait_local || return $?
 
     local arg arm="" width=""
     if [[ "${NEXTEST_TEST_THREADS+x}" != x ]]; then

@@ -17,58 +17,59 @@ from __future__ import annotations
 
 import asyncio
 import json
+import math
 import os
-import re
 import subprocess
 import sys
 import tempfile
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import cast
+from typing import NotRequired, TypedDict, cast
 
 import codex_pacer
 import five_hour
-from agent_accounts import EASTERN, Report, live_reports
-from quota_alert import AgentNote, alert, blocked, current_session, refresh
+import note_file
+from note_file import FIELD, Note
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from scripts.whoami.agent_accounts import KnownCodexAccount, UnknownCodexAccount
+from agent_accounts import (ClaudeAccountSelection, ClaudeDirectorySource, CodexHomeSource, EASTERN, Report,
+                            codex_home_display, codex_homes,
+                            codex_report_in_use, live_reports, seats_home as resolve_seats_home)
+from quota_alert import (AgentNote, alert, blocked, current_session, refresh, CodexAlertPassReadings,
+                         codex_alert_pass)
 from run_out import READINGS_LOG
+import usage_store
 
-AGENTS_DIR = Path.home() / "rust" / "hanadocs" / "agents"
 RESET_FORMAT = "%Y-%m-%dT%H:%M:%S"
-FIELD = re.compile(r"^([A-Za-z_][\w-]*):[ \t]*(.*?)[ \t]*$")
 
 
-@dataclass
-class Note:
-    path: Path
-    tool: str
-    text: str
-    start: int
-    end: int
-
-    def lines(self) -> list[str]:
-        return self.text[self.start:self.end].split("\n")
-
-    def get(self, key: str) -> str | None:
-        for line in self.lines():
-            match = FIELD.match(line)
-            if match and match.group(1) == key:
-                return match.group(2).strip("\"'")
-        return None
+class StoredReading(TypedDict):
+    account: str
+    at: str
+    remaining: float
+    credits: NotRequired[float]
 
 
-def read_note(path: Path) -> Note | None:
-    """A note with its frontmatter body located, or None if it has none."""
-    try:
-        text = path.read_text(encoding="utf-8")
-    except OSError:
-        return None
-    if not text.startswith("---\n"):
-        return None
-    close = text.find("\n---", 3)
-    if close == -1:
-        return None
-    return Note(path, path.stem.split(" ")[0].lower(), text, 4, close)
+@dataclass(frozen=True)
+class ObservedAccountActivity:
+    """The observed login alone is active, as in the single-account updater."""
+
+
+@dataclass(frozen=True)
+class RoleAccountActivity:
+    """The logins serving a tool's launch roles are active together."""
+
+    logins: frozenset[str]
+
+
+@dataclass(frozen=True)
+class UnknownAccountActivity:
+    """The role login cannot be read; preserve each note's current activity."""
+
+
+AccountActivity = ObservedAccountActivity | RoleAccountActivity | UnknownAccountActivity
+OBSERVED_ACCOUNT_ACTIVITY = ObservedAccountActivity()
 
 
 def local_reset(value: datetime) -> str:
@@ -126,11 +127,11 @@ def still_ahead(value: str | None) -> bool:
         return False
 
 
-def append_readings(readings: list[dict[str, object]], checked_at: datetime) -> None:
+def append_readings(readings: list[StoredReading], checked_at: datetime) -> None:
     """Keep the recent readings and replace the log in one write."""
     READINGS_LOG.parent.mkdir(parents=True, exist_ok=True)
     cutoff = checked_at.astimezone(timezone.utc) - timedelta(days=8)
-    kept: list[dict[str, object]] = []
+    kept: list[StoredReading] = []
     try:
         with READINGS_LOG.open(encoding="utf-8") as existing:
             for line in existing:
@@ -138,12 +139,27 @@ def append_readings(readings: list[dict[str, object]], checked_at: datetime) -> 
                     entry = cast(object, json.loads(line))
                     if not isinstance(entry, dict):
                         continue
-                    record = cast(dict[str, object], entry)
-                    at_text = record.get("at")
-                    if not isinstance(at_text, str):
+                    values = cast(dict[str, object], cast(object, entry))
+                    account = values.get("account")
+                    at_text = values.get("at")
+                    remaining = values.get("remaining")
+                    if (
+                        not isinstance(account, str)
+                        or not isinstance(at_text, str)
+                        or isinstance(remaining, bool)
+                        or not isinstance(remaining, (int, float))
+                    ):
                         continue
                     at = datetime.fromisoformat(at_text)
                     if at.tzinfo is not None and at.astimezone(timezone.utc) >= cutoff:
+                        record: StoredReading = {
+                            "account": account,
+                            "at": at_text,
+                            "remaining": float(remaining),
+                        }
+                        credits = values.get("credits")
+                        if not isinstance(credits, bool) and isinstance(credits, (int, float)):
+                            record["credits"] = float(credits)
                         kept.append(record)
                 except (ValueError, TypeError, KeyError):
                     continue
@@ -162,24 +178,31 @@ def append_readings(readings: list[dict[str, object]], checked_at: datetime) -> 
             os.unlink(temporary)
 
 
-def apply(notes: list[Note], account: Report, checked_at: datetime) -> list[str]:
-    """Write only the matching account's live quota; retain dated inactive readings."""
+def apply(
+    notes: list[Note], account: Report, checked_at: datetime,
+    activity: AccountActivity = OBSERVED_ACCOUNT_ACTIVITY,
+    *, multiple_codex_homes: bool = False,
+) -> list[str]:
+    """Write the matching login's quota independently of its launch-role activity."""
     messages: list[str] = []
     stamp = {"date_modified": f'"[[{checked_at.astimezone().strftime("%Y-%m-%d")}]]"'}
     reset = account.weekly_reset
     fresh = reset if reset is not None and reset > checked_at else None
     remaining = account.weekly_remaining if fresh is not None else None
     matched = False
-    readings: list[dict[str, object]] = []
+    readings: list[StoredReading] = []
     for note in notes:
         if note.tool != account.tool.lower():
             continue
         updates: dict[str, str] = {}
-        active = bool(account.email) and (note.get("login") or "").lower() == account.email.lower()
-        if account.email:
-            updates["state"] = "active" if active else "inactive"
-        matched = matched or active
-        if active:
+        login = (note.get("login") or "").casefold()
+        matching = bool(account.email) and login == account.email.casefold()
+        if isinstance(activity, RoleAccountActivity):
+            updates["state"] = "active" if login in activity.logins else "inactive"
+        elif isinstance(activity, ObservedAccountActivity) and account.email:
+            updates["state"] = "active" if matching else "inactive"
+        matched = matched or matching
+        if matching:
             if account.tool.lower() == "codex" and account.limit_reset_count is not None:
                 updates["limit_reset_count"] = str(account.limit_reset_count)
                 # Preserve the earliest known expiration, including its Eastern offset.
@@ -198,8 +221,21 @@ def apply(notes: list[Note], account: Report, checked_at: datetime) -> list[str]
             updates["weekly_usage_checked_at"] = "null"
         if set_fields(note, updates, stamp):
             messages.append(f"{note.path.name}: " + ", ".join(f"{k}={v}" for k, v in updates.items()))
-            if active and remaining is not None:
-                readings.append({"account": note.path.stem, "at": checked_at.astimezone(timezone.utc).isoformat(timespec="seconds"), "remaining": remaining})
+            if matching and remaining is not None:
+                reading: StoredReading = {
+                    "account": note.path.stem,
+                    "at": checked_at.astimezone(timezone.utc).isoformat(timespec="seconds"),
+                    "remaining": remaining,
+                }
+                if account.tool.lower() == "codex" and (balance := note.get("credit_balance")) is not None:
+                    try:
+                        credits = float(balance)
+                    except ValueError:
+                        pass
+                    else:
+                        if math.isfinite(credits) and credits >= 0:
+                            reading["credits"] = credits
+                readings.append(reading)
     if readings:
         try:
             append_readings(readings, checked_at)
@@ -208,52 +244,116 @@ def apply(notes: list[Note], account: Report, checked_at: datetime) -> list[str]
     if account.email and not matched:
         messages.append(f"{account.tool}: no note has login {account.email}")
     if account.problem or account.quota_problem:
-        messages.append(f"{account.tool}: {account.problem or account.quota_problem}")
+        tool = account.tool
+        if (tool.lower() == "codex" and multiple_codex_homes
+                and (account.problem or account.email is None)
+                and isinstance(account.source, CodexHomeSource)):
+            tool += f" ({codex_home_display(account.source.home)})"
+        messages.append(f"{tool}: {account.problem or account.quota_problem}")
     return messages
-
-
-def read_notes() -> list[Note]:
-    return [note for path in sorted(AGENTS_DIR.glob("*.md")) if (note := read_note(path))]
 
 
 def update() -> list[str]:
-    notes = read_notes()
-    if not notes:
-        return [f"no agent notes in {AGENTS_DIR}"]
-    reports = asyncio.run(live_reports())
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+    from scripts.accounts import accounts
+
+    seats_home = resolve_seats_home()
+    return update_for_selection(accounts.claude_account_selection(), seats_home)
+
+
+def update_for_selection(selection: ClaudeAccountSelection, seats_home: Path) -> list[str]:
+    """Update notes and watch using one live pass."""
+    return list(update_alert_pass(selection, seats_home).messages)
+
+
+@dataclass(frozen=True)
+class UpdatedAgentNotes:
+    messages: tuple[str, ...]
+    codex_readings: CodexAlertPassReadings
+
+
+def update_alert_pass(selection: ClaudeAccountSelection, seats_home: Path) -> UpdatedAgentNotes:
+    """Build the alert readings before writing any note."""
+    notes = note_file.read_notes()
+    multiple_codex_homes = len(codex_homes(seats_home)) > 1
+    reports = asyncio.run(live_reports(selection, seats_home))
     checked_at = datetime.now(timezone.utc)
+    codex_readings = codex_alert_pass(seats_home, reports, checked_at)
     messages: list[str] = []
-    for account in reports:
-        messages += apply(notes, account, checked_at)
+    if not notes:
+        messages.append(f"no agent notes in {note_file.AGENTS_DIR}")
     try:
-        messages += five_hour.watch(reports)
+        usage_store.save(reports, checked_at)
+    except (OSError, ValueError) as error:
+        # The saved readings must never cost the notes or the alerts.
+        messages.append(f"usage store: {error}")
+    activity: AccountActivity = ObservedAccountActivity()
+    if selection.multiple_accounts:
+        activity = RoleAccountActivity(frozenset(
+            login.casefold() for note in notes
+            if note.tool == "claude" and (login := note.get("login"))
+            and selection.roles_for_login(login)
+        ))
+    selected_account = codex_readings.selected_account
+    in_use_login = selected_account.login if isinstance(selected_account, KnownCodexAccount) else None
+    codex_activity: AccountActivity = (RoleAccountActivity(frozenset({in_use_login.casefold()}))
+                                      if in_use_login else UnknownAccountActivity())
+    for account in reports:
+        messages += apply(
+            notes, account, checked_at,
+            activity if account.tool.lower() == "claude" else codex_activity,
+            multiple_codex_homes=multiple_codex_homes,
+        )
+    try:
+        # Keep the default Claude input; Codex ownership comes from the frozen pass.
+        watch_reports = [report for report in reports
+                         if (report.tool.lower() != "codex" or codex_report_in_use(report, seats_home))
+                         and (report.tool.lower() != "claude" or not selection.multiple_accounts
+                              or (report.source.directory == Path.home() / ".claude"
+                                  if isinstance(report.source, ClaudeDirectorySource)
+                                  else selection.is_default_login(report.email or "")))]
+        messages += five_hour.watch(watch_reports, codex_readings=codex_readings)
     except (OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError) as error:
         # The 5-hour watch must never cost the notes or the weekly alerts.
         messages.append(f"5-hour watch did not run: {error!r}")
-    return messages
+    return UpdatedAgentNotes(tuple(messages), codex_readings)
 
 
 def mark_tier(plan: codex_pacer.Plan) -> None:
     """Show on the active Codex note the tier codex launches carry right now."""
     called = codex_pacer.launch_tier(codex_pacer.registry_tier(), plan["tier"])
     stamp = {"date_modified": f'"[[{datetime.now().strftime("%Y-%m-%d")}]]"'}
-    for note in read_notes():
+    for note in note_file.read_notes():
         if note.tool == "codex":
             active = note.get("state") == "active"
             _ = set_fields(note, {"tier": ("fast" if called == "fast" else "regular") if active else "null"}, stamp)
 
 
 def main() -> None:
-    if sys.argv[1:] == ["blocked"]:
-        for line in blocked(list(read_notes())):
+    if sys.argv[1:2] == ["blocked"]:
+        arguments = sys.argv[2:]
+        if len(arguments) == 3:
+            identity = KnownCodexAccount(Path(arguments[0]), arguments[1], arguments[2])
+        elif len(arguments) == 2:
+            identity = UnknownCodexAccount(Path(arguments[0]), arguments[1])
+        else:
+            sys.exit("usage: agent_notes.py blocked HOME LOGIN LABEL | blocked HOME REASON")
+        for line in blocked(list(note_file.read_notes()), identity):
             print(line)
         return
     if sys.argv[1:] not in ([], ["refresh"]):
         sys.exit("usage: agent_notes.py [refresh|blocked]")
-    for line in update():
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+    from scripts.accounts import accounts
+
+    selection = accounts.claude_account_selection()
+    seats_home = resolve_seats_home()
+    updated = update_alert_pass(selection, seats_home)
+    for line in updated.messages:
         print(line)
-    notes: list[AgentNote] = list(read_notes())
-    for line in refresh(notes, current_session()) if sys.argv[1:] else alert(notes):
+    notes: list[AgentNote] = list(note_file.read_notes())
+    for line in (refresh(notes, current_session(), selection=selection, codex_readings=updated.codex_readings) if sys.argv[1:]
+                 else alert(notes, selection=selection, codex_readings=updated.codex_readings)):
         print(line)
     try:
         mark_tier(codex_pacer.tick(notes))

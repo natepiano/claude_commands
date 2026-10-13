@@ -188,7 +188,7 @@ verdict: a finding reopened `MAX_REOPENS` times after being accepted; a finding
 that failed to close after `MAX_FIX_ATTEMPTS` repair attempts; `STALLED_ROUNDS`
 consecutive rounds with no decrease in the gating-open count;
 `MAX_CONSECUTIVE_SAME_KIND_PASSES` passes of one kind in a row; more than
-`MAX_REVIEW_CANCELLATIONS` blind-review cancellations; a spent repair budget; the
+`MAX_REVIEW_CANCELLATIONS` review cancellations; a spent repair budget; the
 `RUNAWAY_ROUNDS` backstop.
 
 Each of these used to stop the phase and hand it to the user. They stopped too
@@ -243,7 +243,7 @@ neither the command's output nor its exit status. Plans without a
 `> **Production:` line skip the subprocess. [Phase tables](phase-tables.md)
 covers the note, the table built from these events and the hook's limits.
 
-`eta` reads its times in the process `TZ`, requires an active phase, appends
+`eta` reads its times in the process `TZ` (unset: the user's zone setting), requires an active phase, appends
 one `eta_stated` event, and prints `ETA recorded: <HH:MM zone>`. It exits 2 on
 a malformed or past time, a time the local clock skips, a range that does not
 enclose the target, one range end alone, a blank basis, or no active phase.
@@ -256,7 +256,10 @@ rejects an unowned call, because a hand-written pass forges one that never ran
 and `findings.py gate` counts passes to decide whether a phase is converging.
 The single exception is a launcher the unit director killed, whose pass stays
 open: `finish-pass --status canceled --orphaned-launcher` closes it, and only
-that status, and only while a pass is open.
+that status, and only while a pass is open. A review with lens `ux` records
+no pass: the unit director's `UX review` activity carries that time. A pooled
+review records its pass under the slot `pool_<reviewer>`
+(`docs/as-built/review-pool.md`).
 
 `progress` writes the event and prints two tables under a line naming the
 worktree, and the branch when it differs. The line carries no position: how
@@ -268,10 +271,13 @@ row and a phase row carrying the reported percentage, elapsed, ETA, unchanged,
 the best and worst arrival the percentage still allows.
 
 The second is the round table, under the phase heading: one row per round,
-oldest first, led by `Stage`, `Start` and `Elapsed`, then a column for each of
-the two slots — `Agent 1` and `Agent 2`, the `impl` and `test` slots in that
-order, numbered so the header carries no role word the cell
-beneath could contradict — and closed by the finding result. The first column is
+oldest first, led by `Stage`, `Start` and `Elapsed`, then a column for each
+seat — `Agent 1` and `Agent 2`, the `impl` and `test` slots in that order, then
+one `Agent N` per extra seat (`review`, `review2`, `fix2`, …) in the order seats
+first appear, numbered so the header carries no role word the cell beneath
+could contradict — and closed by the finding result. An extra seat appears when
+it records a pass or receives a board `handoff`; the original `review` seat
+shows only while a displayed stage seats it. The first column is
 `Stage` rather than `Round` because a row is not always a round: a verification,
 a smoke run, or a lone reviewer each own one. A round is nonetheless the unit
 that advances: it is dispatched, it lands, and the ledger stamps its number
@@ -366,11 +372,11 @@ carries both identities per pass for anyone reconstructing a run after the fact.
 
 Windows that sit in no round keep a row apiece, named as they always were: a
 unit-director activity, which holds no seat, and every pass that records none — a
-solo run's, and the closure reviewer `review.sh` launches between rounds. A
-broad review's two lens reviewers do record seats and join the round they
-read, one row below the writers. Such a seatless pass is drawn in the seat its
+solo run's, and a lens-less review `review.sh` runs with neither `--to` nor
+`--slot`. A review on an open seat records under that seat, and a broad
+review's lens reviewers join the round they read, one row below the writers. Such a seatless pass is drawn in the seat its
 kind names — `review 9m` under
-Agent 2, `impl 3m` under Agent 1 — so a reader finds the closure review in a
+Agent 2, `impl 3m` under Agent 1 — so a reader finds a seatless review in a
 seat's column rather than a row of dashes; an activity
 names no seat and keeps them. These rows keep the per-window finding attribution — the interval
 running to whatever opened next — which is wrong for concurrent seats and
@@ -378,9 +384,10 @@ exactly right for the sequential windows that still reach it. An early-armed rev
 one, and otherwise keeps its own row beside the writer.
 
 A round splits into a further row wherever a seat is occupied a second time,
-because that is a move no `handoff` marks: the writers' sessions have
-exited and the reviewers that take their chairs are fresh read-only ones that
-post no movement. The whole wave takes one boundary rather than one per launch,
+as when a writer's open seat takes a review after its writing pass closes: a
+new pass is a move whether or not the seat posted a `handoff` for it. An extra
+seat outside `impl` and `test` opens such a row when its first occupancy
+begins, so it does not appear to have worked from the writers' start. The whole wave takes one boundary rather than one per launch,
 and each cell reports the occupancy that stretch falls in — so a phase reads
 `impl / test / impl` on one row and `review / review / review` on the next,
 with the round's result on the row that closes it. A later occupancy reports the
@@ -492,7 +499,7 @@ restart that fails, the recorder falls
 back to a still-future deadline in `${SESSION_DIR}/progress_timer`, then to now
 plus `PLAN_DELEGATE_PROGRESS_INTERVAL_SECONDS` in `delegate.conf`. That key sets
 the Codex poll timeout and the default interval of a Claude unit's notifier
-instance; `/unit:interval` changes one run's interval. An unusable interval
+instance; `/unit:report_interval` changes one run's interval. An unusable interval
 drops the clause instead of stopping the header.
 
 `aggregate` calibrates phase estimates by

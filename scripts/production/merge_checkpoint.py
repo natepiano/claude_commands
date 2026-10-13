@@ -749,8 +749,8 @@ def record(request: MergeRequest, merge_head: str, tests_green: str) -> None:
         script = tool("review_regime.py", Path.home() / ".claude/scripts/production/review_regime.py",
                       "MERGE_CHECKPOINT_REVIEW_REGIME")
         review_command = [script] if os.access(script, os.X_OK) else [sys.executable, script]
-        command = [*review_command, "add", "--unit", request.unit.name, "--phase", request.phase,
-                   "--regime", request.regime, "--started", request.started, "--merged", merged,
+        command = [*review_command, "add", "--unit", request.unit.name, "--plan", request.unit.plan.as_posix(),
+                   "--phase", request.phase, "--regime", request.regime, "--started", request.started, "--merged", merged,
                    "--holds", str(request.holds), "--merge-defects", str(request.merge_defects),
                    "--ux-findings", numbers.ux_findings, "--code-findings", numbers.code_findings,
                    "--review-minutes", numbers.review_minutes, "--ux-check-minutes", numbers.ux_check_minutes,

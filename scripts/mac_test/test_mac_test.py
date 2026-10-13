@@ -13,6 +13,7 @@ import time
 import unittest
 from pathlib import Path
 from typing import NotRequired, TypedDict, cast, final, override
+from unittest import mock
 from zoneinfo import ZoneInfo
 
 import mac_test
@@ -21,7 +22,6 @@ import mac_test
 SCRIPT = Path(__file__).with_name("mac_test.py")
 LOCAL_ZONE = ZoneInfo("America/New_York")
 CI_JOB = "macOS: Compile and Test"
-CI_GATE_JOB = "macOS: Runner Availability"
 SKIPPED_REPORT_RUNS = 200
 # An unblock that reports this many runs starts the stand-in gh once for the
 # switch, once for the list and once for each run, one after another. A start
@@ -36,6 +36,7 @@ class RunState(TypedDict):
     what: str
     worktree: str
     since: str
+    remote_host: NotRequired[str]
 
 
 class WaitingState(TypedDict):
@@ -283,6 +284,10 @@ class MacTestCommandTests(unittest.TestCase):
             "MAC_TEST_STUB_DIR": str(self.stub_directory),
             "MAC_TEST_WATCH_INTERVAL_S": "0.05",
             "TZ": "America/New_York",
+            "BUILD_HOLD_DIR": str(self.root / "holders"),
+            "BUILD_HOLD_RELEASE_DIR": str(self.root / "release"),
+            "PLAN_DELEGATE_ACTIVE_DIR": str(self.root / "active"),
+            "BUILDLOG_CALL_ID": "", "BUILDLOG_CALLER": "",
         }
         self.children = []
 
@@ -301,7 +306,6 @@ class MacTestCommandTests(unittest.TestCase):
             "ci_variable": "MACOS_CI",
             "ci_workflow": "ci.yml",
             "ci_job": CI_JOB,
-            "ci_gate_job": CI_GATE_JOB,
             "gh_timeout_s": "2",
             "block_hours": "4",
             "block_max_hours": "48",
@@ -606,6 +610,110 @@ class MacTestCommandTests(unittest.TestCase):
         self.assertEqual(self.logged_arguments("send"), [])
         self.assertFalse((self.state_directory / "run.json").exists())
 
+    def kept_claim(self, host: str = "previous-mac") -> RunState:
+        owner = self.start_child()
+        claimed = self.command("claim", "--pid", str(owner.pid), "--what", "older tests",
+                               "--worktree", str(self.root / "older"), "--remote", host)
+        self.assert_command(claimed, 0, "claimed\n")
+        record = self.run_state()
+        self.assertEqual(record.get("remote_host"), host)
+        self.stop_child(owner)
+        return record
+
+    def test_remote_claim_outlives_its_owner_and_remains_live_to_state_readers(self) -> None:
+        record = self.kept_claim()
+        paths = mac_test.StatePaths(self.state_directory)
+        with mock.patch("subprocess.run", side_effect=AssertionError("State reads stay local")), \
+             mock.patch("subprocess.Popen", side_effect=AssertionError("State reads stay local")):
+            decoded = mac_test.read_run(paths.run)
+            self.assertNotIsInstance(decoded, mac_test.NoRun)
+            if not isinstance(decoded, mac_test.NoRun):
+                self.assertTrue(mac_test.run_is_live(decoded))
+                self.assertEqual(decoded["what"], record["what"])
+                self.assertEqual(decoded["since"], record["since"])
+            self.assertNotIsInstance(mac_test.live_run(paths), mac_test.NoRun)
+        self.assertEqual(self.run_state(), record)
+
+    def test_process_claim_lapses_after_its_owner_ends(self) -> None:
+        owner = self.start_child()
+        self.claim(owner)
+        self.assertNotIn("remote_host", self.run_state())
+        self.stop_child(owner)
+        self.write_config(ci_repo="")
+        self.assert_command(self.command("status"), 0, "free\nno block\nCI's Mac switch: not configured\n")
+        self.assertFalse((self.state_directory / "run.json").exists())
+
+    def test_remote_takeover_preserves_job_fields_and_refuses_a_second_live_taker(self) -> None:
+        previous = self.kept_claim()
+        taker, other = self.start_child(), self.start_child()
+        taken = self.command("claim", "--pid", str(taker.pid), "--what", "new tests",
+                             "--worktree", str(self.root / "new"), "--remote", "new-mac")
+        self.assertEqual(taken.returncode, 13, taken.stdout + taken.stderr)
+        self.assertEqual(taken.stdout + taken.stderr, "leftovers: previous-mac\n")
+        after = self.run_state()
+        self.assertEqual(after["pid"], taker.pid)
+        self.assertEqual(after["proc_start"], mac_test.process_start_time(taker.pid))
+        self.assertEqual({key: value for key, value in after.items() if key not in ("pid", "proc_start")},
+                         {key: value for key, value in previous.items() if key not in ("pid", "proc_start")})
+        refused = self.command("claim", "--pid", str(other.pid), "--what", "third tests", "--remote", "third-mac")
+        self.assertEqual(refused.returncode, 11, refused.stdout + refused.stderr)
+        self.assertTrue(refused.stdout.startswith("busy: older tests since "), refused.stdout)
+        self.assertEqual(self.run_state(), after)
+
+    def test_process_claim_waits_for_kept_remote_claim_and_reports_leftovers(self) -> None:
+        record = self.kept_claim()
+        since = datetime.fromisoformat(record["since"]).astimezone(LOCAL_ZONE).strftime("%H:%M")
+        self.assert_command(self.command("claim", "--pid", str(os.getpid()), "--what", "local tests", "--wait", "0.05"),
+                            11, f"busy: leftovers of older tests on previous-mac since {since}\n")
+        self.assertEqual(self.run_state(), record)
+
+    def test_status_names_kept_claim_and_matching_release_ends_it(self) -> None:
+        record = self.kept_claim()
+        self.write_config(ci_repo="")
+        status = self.command("status")
+        self.assertEqual(status.returncode, 0, status.stdout + status.stderr)
+        self.assertIn(f"running: leftovers of older tests on previous-mac since {self.local_time(record['since'])}, "
+                      + f"kept under pid {record['pid']}\n", status.stdout)
+        self.assert_command(self.command("release", "--pid", str(os.getpid())), 0, "")
+        self.assertEqual(self.run_state(), record)
+        self.assert_command(self.command("release", "--pid", str(record["pid"])), 0, "")
+        self.assertFalse((self.state_directory / "run.json").exists())
+
+    def test_pending_block_waits_for_kept_claim_and_takeover_precedes_block_refusal(self) -> None:
+        record = self.kept_claim()
+        block = self.command("block", "--holder", "alice", "--for", "render work")
+        self.assertEqual(block.returncode, 0, block.stdout + block.stderr)
+        self.assertIn("Block pending for alice: older tests is running on the Mac.", block.stdout)
+        self.assertEqual(self.block_state()["state"], "pending")
+        status = self.command("status")
+        self.assertEqual(status.returncode, 0, status.stdout + status.stderr)
+        self.assertEqual(self.block_state()["state"], "pending")
+        self.assertEqual(self.run_state(), record)
+        taker = self.start_child()
+        taken = self.command("claim", "--pid", str(taker.pid), "--what", "new tests", "--remote", "new-mac")
+        self.assertEqual(taken.returncode, 13, taken.stdout + taken.stderr)
+        self.assertEqual(taken.stdout + taken.stderr, "leftovers: previous-mac\n")
+        self.assertEqual(self.block_state()["state"], "pending")
+        self.assertEqual(self.run_state()["pid"], taker.pid)
+
+    def test_run_record_without_remote_host_still_decodes_with_mapping_access(self) -> None:
+        started = mac_test.process_start_time(os.getpid())
+        self.assertIsNotNone(started)
+        assert started is not None
+        record: RunState = {"pid": os.getpid(), "proc_start": started, "what": "legacy tests",
+                            "worktree": str(self.root), "since": datetime.now(timezone.utc).isoformat()}
+        self.state_directory.mkdir()
+        path = self.state_directory / "run.json"
+        _ = path.write_text(json.dumps(record))
+        before = path.read_bytes()
+        decoded = mac_test.read_run(path)
+        self.assertNotIsInstance(decoded, mac_test.NoRun)
+        if not isinstance(decoded, mac_test.NoRun):
+            self.assertTrue(mac_test.run_is_live(decoded))
+            for key in ("pid", "proc_start", "what", "worktree", "since"):
+                self.assertEqual(decoded[key], record[key])
+        self.assertEqual(path.read_bytes(), before)
+
     def test_claim_reports_damaged_block_state(self) -> None:
         self.state_directory.mkdir()
         block_path = self.state_directory / "block.json"
@@ -701,72 +809,45 @@ class MacTestCommandTests(unittest.TestCase):
         self.assertFalse((self.state_directory / "block.json").exists())
         self.assertEqual(self.logged_arguments("gh"), [])
 
-    def test_in_progress_ci_gate_job_keeps_block_pending(self) -> None:
-        self.gh["queued"] = [{"databaseId": 40}]
-        self.gh["jobs"] = {
-            "40": [
-                {"name": CI_GATE_JOB, "status": "in_progress", "conclusion": ""}
-            ]
-        }
-        self.sync_gh()
-        result = self.command("block", "--holder", "alice", "--for", "rendering")
-        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertIn("CI's Mac job is running", result.stdout)
-        self.assertEqual(self.block_state()["waiting_on"], {"kind": "ci_job"})
-
-    def test_completed_ci_gate_and_mac_jobs_do_not_keep_block_pending(self) -> None:
-        completed_job_sets: list[list[GhJob]] = [
-            [
-                {"name": CI_GATE_JOB, "status": "completed", "conclusion": "success"},
-                {"name": CI_JOB, "status": "completed", "conclusion": "skipped"},
-            ],
-            [
-                {"name": CI_GATE_JOB, "status": "completed", "conclusion": "success"}
-            ],
-        ]
-        for jobs in completed_job_sets:
-            with self.subTest(jobs=jobs):
+    def test_queued_or_in_progress_run_without_mac_job_is_busy(self) -> None:
+        active_runs: tuple[tuple[str, list[GhRun], list[GhRun], int], ...] = (
+            ("queued", [{"databaseId": 40}], [], 40),
+            ("in_progress", [], [{"databaseId": 41}], 41),
+        )
+        for status, queued, in_progress, run_id in active_runs:
+            with self.subTest(status=status):
                 (self.state_directory / "block.json").unlink(missing_ok=True)
                 self.gh["variable"] = "true"
-                self.gh["queued"] = [{"databaseId": 42}]
-                self.gh["jobs"] = {"42": jobs}
+                self.gh["queued"] = queued
+                self.gh["in_progress"] = in_progress
+                self.gh["jobs"] = {str(run_id): []}
                 self.sync_gh()
+
                 result = self.command(
                     "block", "--holder", "alice", "--for", "rendering"
                 )
+
                 self.assertEqual(
                     result.returncode, 0, result.stdout + result.stderr
                 )
-                self.assertEqual(self.block_state()["state"], "active")
+                self.assertIn("a CI run may still use the Mac", result.stdout)
+                block = self.block_state()
+                self.assertEqual(block["state"], "pending")
+                self.assertEqual(block["waiting_on"], {"kind": "ci_job"})
 
-    def test_empty_ci_gate_job_only_counts_the_mac_job(self) -> None:
-        self.write_config(ci_gate_job="")
-        self.gh["queued"] = [{"databaseId": 43}]
+    def test_completed_skipped_mac_job_is_idle(self) -> None:
+        self.gh["queued"] = [{"databaseId": 42}]
         self.gh["jobs"] = {
-            "43": [
-                {"name": CI_GATE_JOB, "status": "in_progress", "conclusion": ""}
+            "42": [
+                {"name": CI_JOB, "status": "completed", "conclusion": "skipped"}
             ]
         }
         self.sync_gh()
-        gate_only = self.command(
-            "block", "--holder", "alice", "--for", "rendering"
-        )
-        self.assertEqual(
-            gate_only.returncode, 0, gate_only.stdout + gate_only.stderr
-        )
-        self.assertEqual(self.block_state()["state"], "active")
 
-        (self.state_directory / "block.json").unlink()
-        self.gh["variable"] = "true"
-        self.gh["jobs"] = {
-            "43": [{"name": CI_JOB, "status": "in_progress", "conclusion": ""}]
-        }
-        self.sync_gh()
-        mac_job = self.command(
-            "block", "--holder", "alice", "--for", "rendering"
-        )
-        self.assertEqual(mac_job.returncode, 0, mac_job.stdout + mac_job.stderr)
-        self.assertEqual(self.block_state()["waiting_on"], {"kind": "ci_job"})
+        result = self.command("block", "--holder", "alice", "--for", "rendering")
+
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(self.block_state()["state"], "active")
 
     def test_busy_ci_keeps_block_pending_until_watch_sends_once(self) -> None:
         self.gh["queued"] = [{"databaseId": 41}]
@@ -779,8 +860,8 @@ class MacTestCommandTests(unittest.TestCase):
         self.assert_command(
             pending,
             0,
-            "Block pending for alice: CI's Mac job is running. Nothing new starts "
-            + "there, and you get a message when it ends.\n"
+            "Block pending for alice: a CI run may still use the Mac. Nothing new "
+            + "starts there, and you get a message when CI no longer needs the Mac.\n"
             + self.expiry_line(block),
         )
         self.assertEqual(block["state"], "pending")
@@ -797,7 +878,7 @@ class MacTestCommandTests(unittest.TestCase):
         self.assertEqual(active["state"], "active")
         deliveries = self.logged_arguments("send-delivered")
         self.assertEqual(len(deliveries), 1)
-        self.assertIn("CI's Mac job ended", deliveries[0][-1])
+        self.assertIn("CI's hold on the Mac ended", deliveries[0][-1])
 
         unblocked = self.command("unblock", "--holder", "alice")
         self.assertEqual(unblocked.returncode, 0, unblocked.stdout + unblocked.stderr)
@@ -911,6 +992,231 @@ class MacTestCommandTests(unittest.TestCase):
             self.assertIn("--repeat-minutes", delivery)
             self.assertEqual(delivery[delivery.index("--repeat-minutes") + 1], "60")
         self.assertEqual(len(self.logged_arguments("systemd-run")), 1)
+
+    def test_active_expired_block_with_failed_switch_back_status_names_stuck_lift(
+        self,
+    ) -> None:
+        now = datetime.now(timezone.utc)
+        block = self.write_block(
+            since=now - timedelta(hours=2),
+            expires=now - timedelta(minutes=1),
+            free_message={"kind": "not_needed"},
+        )
+        self.gh["failures"] = [
+            {"match": "variable set", "line": "gpg-agent is cold", "status": 1}
+        ]
+        self.sync_gh()
+
+        status = self.command("status")
+
+        self.assert_command(
+            status,
+            0,
+            "free\n"
+            + f"blocked by alice since {self.local_time(cast(str, block['since']), include_day=True)}, "
+            + f"lifts {self.local_time(cast(str, block['expires']), include_day=True)}: release work\n"
+            + "CI's Mac switch: off (this block)\n"
+            + "The block is past its time limit but could not lift: CI's Mac switch "
+            + "could not be turned back on (gpg-agent is cold). Run github-warmup, "
+            + "then unblock.\n",
+        )
+
+    def test_pending_expired_block_with_failed_switch_back_status_names_stuck_lift(
+        self,
+    ) -> None:
+        now = datetime.now(timezone.utc)
+        block = self.write_block(
+            since=now - timedelta(hours=2),
+            expires=now - timedelta(minutes=1),
+            state="pending",
+            waiting_on={"kind": "ci_job"},
+        )
+        self.gh["failures"] = [
+            {"match": "variable set", "line": "gpg-agent is cold", "status": 1}
+        ]
+        self.sync_gh()
+
+        status = self.command("status")
+
+        self.assert_command(
+            status,
+            0,
+            "free\n"
+            + "block pending for alice (a CI run may still use the Mac), "
+            + f"lifts {self.local_time(cast(str, block['expires']), include_day=True)}: release work\n"
+            + "CI's Mac switch: off (this block)\n"
+            + "The block is past its time limit but could not lift: CI's Mac switch "
+            + "could not be turned back on (gpg-agent is cold). Run github-warmup, "
+            + "then unblock.\n",
+        )
+
+    def test_unexpired_block_status_has_no_stuck_lift_line(self) -> None:
+        now = datetime.now(timezone.utc)
+        block = self.write_block(
+            since=now - timedelta(hours=1),
+            expires=now + timedelta(hours=1),
+            free_message={"kind": "not_needed"},
+        )
+
+        status = self.command("status")
+
+        self.assert_command(
+            status,
+            0,
+            "free\n"
+            + f"blocked by alice since {self.local_time(cast(str, block['since']), include_day=True)}, "
+            + f"lifts {self.local_time(cast(str, block['expires']), include_day=True)}: release work\n"
+            + "CI's Mac switch: off (this block)\n",
+        )
+
+    def test_failed_switch_off_on_new_block_status_has_no_stuck_lift_line(
+        self,
+    ) -> None:
+        self.gh["failures"] = [
+            {"match": "variable set", "line": "request lost", "status": 1}
+        ]
+        self.sync_gh()
+        blocked = self.command("block", "--holder", "alice", "--for", "rendering")
+        self.assertEqual(blocked.returncode, 2, blocked.stdout + blocked.stderr)
+        block = self.block_state()
+
+        status = self.command("status")
+
+        self.assert_command(
+            status,
+            0,
+            "free\n"
+            + f"blocked by alice since {self.local_time(cast(str, block['since']), include_day=True)}, "
+            + f"lifts {self.local_time(cast(str, block['expires']), include_day=True)}: rendering\n"
+            + "CI's Mac switch: still on (request lost)\n",
+        )
+
+    def test_immediately_expired_renewal_reports_switch_restore_failure(
+        self,
+    ) -> None:
+        _ = self.write_block(
+            free_message={"kind": "not_needed"},
+            ci="off_unconfirmed",
+        )
+        self.gh["failures"] = [
+            {"match": "variable set", "line": "cold signing agent", "status": 1}
+        ]
+        self.sync_gh()
+
+        renewed = self.command(
+            "block",
+            "--holder",
+            "alice",
+            "--for",
+            "renewed work",
+            "--hours",
+            "0.0000000001",
+        )
+
+        self.assertEqual(renewed.returncode, 2, renewed.stdout + renewed.stderr)
+        self.assertIn(
+            "CI can still use the Mac: cold signing agent. "
+            + "Run github-warmup, then block again.\n",
+            renewed.stdout,
+        )
+        self.assertNotIn("unknown error", renewed.stdout)
+
+    def test_failed_expired_lift_keeps_block_until_next_status_recovers(self) -> None:
+        now = datetime.now(timezone.utc)
+        block = self.write_block(
+            since=now - timedelta(hours=2),
+            expires=now - timedelta(minutes=1),
+            free_message={"kind": "not_needed"},
+        )
+        self.gh["failures"] = [
+            {"match": "variable set", "line": "authentication required", "status": 1}
+        ]
+        self.sync_gh()
+        stuck = self.command("status")
+        self.assertIn(
+            "The block is past its time limit but could not lift:", stuck.stdout
+        )
+        self.assertEqual(self.block_state(), block)
+
+        self.gh["failures"] = []
+        self.sync_gh()
+        recovered = self.command("status")
+
+        self.assert_command(
+            recovered,
+            0,
+            "free\nno block\nCI's Mac switch: on\n",
+        )
+        self.assertFalse((self.state_directory / "block.json").exists())
+        self.assertNotIn("could not lift", recovered.stdout)
+
+    def test_claim_block_reader_keeps_expired_block_without_writes(self) -> None:
+        now = datetime.now(timezone.utc)
+        _ = self.write_block(
+            since=now - timedelta(hours=2),
+            expires=now - timedelta(minutes=1),
+            free_message={"kind": "not_needed"},
+        )
+        paths = mac_test.StatePaths(self.state_directory)
+        before = paths.block.read_bytes()
+        with mock.patch("subprocess.run", side_effect=AssertionError("State reading stays local")):
+            with mock.patch("subprocess.Popen", side_effect=AssertionError("State reading stays local")):
+                block = mac_test.read_claim_block(paths)
+        self.assertIsInstance(block, mac_test.ActiveMacBlock)
+        if isinstance(block, mac_test.ActiveMacBlock):
+            self.assertLess(block.expires, now)
+        self.assertEqual(paths.block.read_bytes(), before)
+        self.assertEqual(tuple(self.state_directory.iterdir()), (paths.block,))
+        paths.block.unlink()
+        self.assertIsInstance(mac_test.read_claim_block(paths), mac_test.NoMacBlock)
+        self.assertEqual(tuple(self.state_directory.iterdir()), ())
+
+    def test_invalid_claim_block_raises_native_state_read_error(self) -> None:
+        self.state_directory.mkdir()
+        paths = mac_test.StatePaths(self.state_directory)
+        _ = paths.block.write_text("{}", encoding="utf-8")
+        with self.assertRaisesRegex(mac_test.StateReadError, "invalid block record"):
+            _ = mac_test.read_claim_block(paths)
+
+    def test_invalid_claim_record_raises_native_state_read_error(self) -> None:
+        self.state_directory.mkdir()
+        paths = mac_test.StatePaths(self.state_directory)
+        _ = paths.run.write_text("{}", encoding="utf-8")
+        with self.assertRaisesRegex(mac_test.StateReadError, "invalid run record"):
+            _ = mac_test.read_run(paths.run)
+
+    def test_claim_refuses_expired_block_until_ci_restore_lifts_it(self) -> None:
+        now = datetime.now(timezone.utc)
+        block = self.write_block(
+            since=now - timedelta(hours=2),
+            expires=now - timedelta(minutes=1),
+            free_message={"kind": "not_needed"},
+        )
+        self.gh["failures"] = [
+            {"match": "variable set", "line": "authentication required", "status": 1}
+        ]
+        self.sync_gh()
+        stuck = self.command("status")
+        self.assertEqual(stuck.returncode, 0, stuck.stdout + stuck.stderr)
+        self.assertEqual(self.block_state(), block)
+        self.assert_command(
+            self.command("claim", "--pid", str(os.getpid()), "--what", "nextest hana"),
+            10,
+            "blocked by alice: release work\n",
+        )
+        self.assertEqual(self.block_state(), block)
+        self.assertFalse((self.state_directory / "run.json").exists())
+
+        self.gh["failures"] = []
+        self.sync_gh()
+        lifted = self.command("status")
+        self.assertEqual(lifted.returncode, 0, lifted.stdout + lifted.stderr)
+        self.assertFalse((self.state_directory / "block.json").exists())
+        self.assert_command(
+            self.command("claim", "--pid", str(os.getpid()), "--what", "nextest hana"),
+            0,
+            "claimed\n",
+        )
 
     def test_unblock_lifts_owned_switch_when_repository_is_removed(self) -> None:
         self.write_config(ci_repo="")
@@ -1447,7 +1753,7 @@ class MacTestCommandTests(unittest.TestCase):
         )
         busy = self.command("status")
         self.assertIn(
-            "block pending for alice (CI's Mac job is running), "
+            "block pending for alice (a CI run may still use the Mac), "
             + f"lifts {self.local_time(cast(str, block['expires']), include_day=True)}: "
             + "release work\n",
             busy.stdout,

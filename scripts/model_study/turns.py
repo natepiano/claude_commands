@@ -9,8 +9,10 @@ from pathlib import Path
 from typing import cast
 from zoneinfo import ZoneInfo
 
+# The roster's `switched_by_pdt` and `director_from_pdt` columns are Pacific wall times, as they were
+# recorded. This is the zone of that stored data, never the zone a time is shown in.
+RECORDED_ZONE = ZoneInfo("America/Los_Angeles")
 OVER_LIMIT_SECONDS = 1800
-PDT = ZoneInfo("America/Los_Angeles")
 # Newest first; transcripts from before the rename hold the old name.
 DIRECTOR_COMMANDS = ("/unit:direct", "/unit:delegate")
 
@@ -165,7 +167,7 @@ def user_content(record: Record) -> object:
 
 def director_boundary(records: list[Record], director_from: str | None, first_request: datetime) -> tuple[datetime, str | None, bool]:
     if director_from is not None:
-        at = datetime.fromisoformat(director_from).replace(tzinfo=PDT)
+        at = datetime.fromisoformat(director_from).replace(tzinfo=RECORDED_ZONE)
         return at, at.isoformat(), False
     for record in records:
         content = user_content(record)

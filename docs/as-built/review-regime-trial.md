@@ -32,4 +32,4 @@
 - `after` phases came later in mature plans.
 - Exclusions were judged from logs, not re-measured.
 
-**To re-run the comparison:** append rows with `review_regime.py add` and read `report`. The watch is acknowledged, so `watch` no longer alerts. From 2026-10-07 a row's code number is every code finding the phase's review raised, and `report` prints it as `code findings per phase (mean)`; the table above counts the code-quality reviewer's findings alone, so compare new rows with each other, not with that line of the table.
+**To re-run the comparison:** append rows with `review_regime.py add` and read `report`. From 2026-10-12 a row carries `plan`, the unit's plan path as its production doc names it, and `add` refuses a second row only for the same unit, plan and phase; a row written earlier has no `plan` and blocks nothing. The watch is acknowledged, so `watch` no longer alerts. From 2026-10-07 a row's code number is every code finding the phase's review raised, and `report` prints it as `code findings per phase (mean)`; the table above counts the code-quality reviewer's findings alone, so compare new rows with each other, not with that line of the table.

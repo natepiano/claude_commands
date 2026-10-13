@@ -6,22 +6,158 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+import sqlite3
+import sys
 import tempfile
 import time
 import unittest
+from collections.abc import Callable
 from contextlib import closing
+from dataclasses import FrozenInstanceError
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import override
+from typing import cast, override
 from unittest import mock
 
 import disk
 import ci
 import index
+import launches
+import mac_outcome
 import report
 import rust_release
 import sync
 from test_index import STAMP, Record, call, ci_job, ci_run, encode, local_day, point_root_at, sample, step
+
+
+def section_seconds(connection: sqlite3.Connection, day: str) -> dict[str, float]:
+    found = report.kinds(connection, day)
+    elapsed: dict[str, float] = {}
+    began = time.perf_counter()
+    calls = report.reported_mac_calls(connection, day)
+    elapsed["test calls"] = time.perf_counter() - began
+    began = time.perf_counter()
+    waits = report.daily_waits(connection, day)
+    elapsed["wait data"] = time.perf_counter() - began
+    sections: dict[str, Callable[[], object]] = {
+        "Waiting": lambda: report.waiting_lines(waits),
+        "Rebuilds": lambda: report.rebuilds_section(connection, day),
+        "step tables": lambda: [report.kind_section(connection, day, kind, 1) for kind in found],
+        "Memory pressure": lambda: report.memory_pressure_section(connection, day, 1),
+        "Agent calls": lambda: report.calls_section(connection, day),
+        "Test builds": lambda: report.test_builds_section(connection, day),
+        "Tests by target": lambda: report.tests_by_target_lines(calls),
+        "cargo-port": lambda: report.port_lint_section(connection, day),
+        "CI": lambda: report.ci_section(connection, day),
+        "Tests per edit": lambda: report.tests_per_edit_section(connection, day),
+        "call trees": lambda: report.call_trees(connection, day),
+        "Disk": report.disk_section,
+        "summaries": lambda: [report.summary(connection, day, found, which, with_failed)
+                              for _, which, with_failed in report.SUMMARIES],
+        "lead block": lambda: report.lead_block(connection, day, calls, waits),
+        "report body": lambda: report.report(connection, day),
+    }
+    for name, render in sections.items():
+        began = time.perf_counter()
+        _ = render()
+        elapsed[name] = time.perf_counter() - began
+    return elapsed
+
+
+def setUpModule() -> None:
+    """The times these tests expect are Pacific; the user's zone setting must not change them."""
+    unittest.enterModuleContext(mock.patch.dict(os.environ, {"USER_ZONE": "America/Los_Angeles"}))
+
+
+class ReportSpeedTests(unittest.TestCase):
+    def test_report_command_from_a_temporary_log_shows_lead_and_targets(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="buildlog-report-output-") as temporary:
+            root = Path(temporary) / "buildlog"
+            with mock.patch.dict(os.environ, {"BUILDLOG_DIR": str(root)}):
+                path = root / "natedev" / "example.jsonl"
+                path.parent.mkdir(parents=True)
+                stamp = datetime.now(UTC).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+                _ = path.write_bytes(b"".join(encode(record) for record in (
+                    call("passed", started_at=stamp, ended_at=stamp, mac="passed", mac_reason="",
+                         mac_s=12, target="natedev", hold_wait_s=0.4, wall_s=30),
+                    call("saved", started_at=stamp, outcome="reused", saved_s=120, hold_wait_s=0),
+                    call("blocked", started_at=stamp, mac="declined", mac_reason="blocked",
+                         mac_s=1, target="natedev", hold_wait_s=600, wall_s=40),
+                    step("confirmation", started_at=stamp, ended_at=stamp, call_id="passed",
+                         step="nextest", caller="verify", status=1, tests_flaky=2),
+                )))
+                _ = index.update()
+                result = subprocess.run(
+                    [sys.executable, "scripts/buildlog/cli.py", "report"],
+                    cwd=Path(__file__).resolve().parents[2],
+                    env={**os.environ, "TZ": "America/Los_Angeles", "USER_ZONE": "America/Los_Angeles",
+                         "BUILDLOG_TRANSCRIPTS": str(Path(temporary) / "transcripts")},
+                    capture_output=True, text=True, check=False,
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn("Mac when usable: 1 of 1", result.stdout)
+                self.assertIn("| Held target | 10.0 min", result.stdout)
+                self.assertIn("| Mac ran | Mac passed | Mac failed |", result.stdout)
+                print(result.stdout, flush=True)
+
+    def test_report_at_the_live_index_size_finishes_in_two_seconds(self) -> None:
+        self.addCleanup(time.tzset)
+        with tempfile.TemporaryDirectory(prefix="buildlog-report-") as temporary:
+            root = Path(temporary) / "buildlog"
+            transcripts = Path(temporary) / "transcripts"
+            environment = {**os.environ, "BUILDLOG_DIR": str(root),
+                           "BUILDLOG_TRANSCRIPTS": str(transcripts), "TZ": "America/Los_Angeles", "USER_ZONE": "America/Los_Angeles"}
+            with mock.patch.dict(os.environ, environment):
+                time.tzset()
+                day = datetime.now().date().isoformat()
+                midnight = datetime.combine(datetime.now().date(), datetime.min.time()).astimezone(UTC)
+                path = root / "natedev" / "timing.jsonl"
+                path.parent.mkdir(parents=True)
+                with path.open("wb") as output:
+                    for number in range(29_138):
+                        at = midnight + timedelta(seconds=number * 2)
+                        stamp = at.isoformat(timespec="milliseconds").replace("+00:00", "Z")
+                        record = call(f"call-{number}", started_at=stamp,
+                                      ended_at=(at + timedelta(seconds=1)).isoformat().replace("+00:00", "Z"),
+                                      wall_s=1, package=f"package-{number % 20}",
+                                      delegate_session=f"session-{number % 20}", seat="writer",
+                                      target="natedev", hold_wait_s=0.4 if number % 100 == 0 else 0,
+                                      token_wait_s=0, build_s=1)
+                        if number % 100 == 0:
+                            record.update(mac="passed", mac_reason="", mac_s=1)
+                        _ = output.write(encode(record))
+                    for number in range(36_462):
+                        call_number = number % 29_138
+                        at = midnight + timedelta(seconds=call_number * 2)
+                        _ = output.write(encode(step(
+                            f"step-{number}", call_id=f"call-{call_number}",
+                            started_at=at.isoformat(timespec="milliseconds").replace("+00:00", "Z"),
+                            ended_at=(at + timedelta(seconds=1)).isoformat().replace("+00:00", "Z"),
+                            caller="verify", step=report.KIND_ORDER[number % len(report.KIND_ORDER)],
+                            tree_key=f"tree-{call_number // 100}", duration_s=1, finished_s=0.5,
+                            crates_compiled=1, mem_wait_s=0, tests_flaky=0,
+                            mem_stall_some_s=0.2 if number % 100 == 0 else 0,
+                        )))
+                self.assertEqual(index.update(), 29_138 + 36_462)
+                began = time.perf_counter()
+                result = subprocess.run(
+                    [sys.executable, "scripts/buildlog/cli.py", "report"],
+                    cwd=Path(__file__).resolve().parents[2], env=environment,
+                    capture_output=True, text=True, check=False,
+                )
+                elapsed = time.perf_counter() - began
+                print(f"report: {elapsed:.3f} s (29,138 calls, 36,462 steps)", flush=True)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn("### Tests by target", result.stdout)
+                for name, job in (("launches.collect", launches.collect), ("index.update", index.update)):
+                    began = time.perf_counter()
+                    _ = job()
+                    print(f"report part {name}: {time.perf_counter() - began:.3f} s", flush=True)
+                with closing(index.read_only()) as connection:
+                    for name, duration in section_seconds(connection, day).items():
+                        print(f"report section {name}: {duration:.3f} s", flush=True)
+                self.assertLessEqual(elapsed, 2.0, result.stderr)
+        time.tzset()
 
 
 def local_clock(at: str) -> str:
@@ -75,7 +211,7 @@ class ReportTests(unittest.TestCase):
 
     def waiting_rows(self, day: str = "2026-10-02") -> dict[str, list[str]]:
         lines = self.render(day).splitlines()
-        self.assertEqual(lines[2], "### Waiting")
+        self.assertLess(lines.index("### Waiting"), lines.index("### Rebuilds"))
         start = lines.index("### Waiting")
         end = next(i for i in range(start + 1, len(lines)) if lines[i].startswith("### "))
         table_indexes = [i for i in range(start, end) if lines[i].startswith("|")]
@@ -94,6 +230,7 @@ class ReportTests(unittest.TestCase):
             [
                 "Build-folder turn, behind another seat",
                 "Build-folder turn, behind its own call",
+                "Held target",
                 "Memory admission",
                 "CI queue",
             ],
@@ -110,6 +247,255 @@ class ReportTests(unittest.TestCase):
         _ = index.update()
         with closing(index.read_only()) as connection:
             return report.mac_tests_section(connection, day)
+
+    def target_cells(self, package: str = "hana", day: str = "2026-10-02") -> dict[str, str]:
+        lines = self.mac_tests_lines(day)
+        heading = next(line for line in lines if line.startswith("| Package |"))
+        row = next(line for line in lines if line.startswith(f"| {package} |"))
+        return dict(zip(
+            [cell.strip() for cell in heading.strip("|").split("|")],
+            [cell.strip() for cell in row.strip("|").split("|")], strict=True,
+        ))
+
+    def test_held_target_waits_keep_fractional_seconds_and_unknown_rows(self) -> None:
+        self.write(
+            self.root / "natedev" / "2026-10.jsonl",
+            call("short", hold_wait_s=0.4, worktree="/r/short"),
+            call("long", hold_wait_s=600.0, worktree="/r/long"),
+            call("zero", hold_wait_s=0.0), call("old"),
+            call("other-day", started_at="2026-10-01T12:00:00Z", hold_wait_s=7200.0),
+        )
+        row = self.waiting_rows()["Held target"]
+        self.assertEqual(row, [
+            f"10.0 min (long, {local_clock(STAMP)})", "1",
+            "2 of 3 calls; not recorded for 1 call", "0.2 seat-hours",
+            "long 10.0 min, short 0.4 s",
+        ])
+
+    def test_held_target_waits_from_old_calls_are_not_zero(self) -> None:
+        self.write(self.root / "natedev" / "2026-10.jsonl", call("old"))
+        row = self.waiting_rows()["Held target"]
+        self.assertEqual(row[:4], ["not recorded"] * 4)
+
+    def test_only_local_package_and_missing_target_are_reported(self) -> None:
+        self.write(
+            self.root / "natedev" / "2026-10.jsonl",
+            call("local-only", package="local-only", wall_s=90),
+            self.nextest_step("local-step", "local-only"),
+        )
+        cells = self.target_cells("local-only")
+        self.assertEqual(cells["Mac ran"], "0")
+        self.assertEqual(cells["natedev ran"], "1")
+        self.assertEqual(cells["natedev p50"], "1.5 min")
+        self.assertEqual(cells["Did not reach the Mac"], "no Mac entry 1")
+        self.assertIn("Target not recorded for 1 call counted above.", self.mac_tests_lines())
+
+    def test_missing_targets_are_reported_below_the_table_without_changing_cells(self) -> None:
+        self.write(
+            self.root / "natedev" / "2026-10.jsonl",
+            call("old-pass", mac="passed", mac_reason="", mac_s=10),
+            call("old-busy", mac="declined", mac_reason="busy", mac_s=1),
+            call("empty-target", mac="passed", mac_reason="", mac_s=10, target=""),
+            call("hidden-off", package="hidden", mac="declined", mac_reason="off", mac_s=0),
+            call("cache", outcome="reused", mac="passed", mac_reason="", mac_s=10),
+            call("next-day", started_at="2026-10-03T12:00:00Z", mac="passed", mac_reason="", mac_s=10),
+        )
+        self.assertEqual(self.target_cells()["Did not reach the Mac"], "busy with our test 1")
+        section = self.mac_tests_lines()
+        note = "Target not recorded for 2 calls counted above."
+        self.assertIn(note, section)
+        last_row = max(number for number, line in enumerate(section) if line.startswith("|"))
+        self.assertEqual(section.index(note), last_row + 1)
+        self.assertFalse(any("not recorded" in line for line in section if line.startswith("|")))
+
+    def test_recorded_empty_target_needs_no_missing_target_note(self) -> None:
+        self.write(self.root / "natedev" / "2026-10.jsonl",
+                   call("passed", mac="passed", mac_reason="", mac_s=1, target=""))
+        self.assertFalse(any("not recorded" in line for line in self.mac_tests_lines()))
+
+    def test_unrecorded_local_duration_is_left_out_of_the_median(self) -> None:
+        self.write(
+            self.root / "natedev" / "2026-10.jsonl",
+            call("unknown", wall_s=None), call("known", wall_s=90),
+            self.nextest_step("unknown-step", "unknown"), self.nextest_step("known-step", "known"),
+        )
+        cells = self.target_cells()
+        self.assertEqual(cells["natedev ran"], "2")
+        self.assertEqual(cells["natedev p50"], "1.5 min")
+
+    def test_two_local_steps_for_one_call_count_one_execution(self) -> None:
+        self.write(
+            self.root / "natedev" / "2026-10.jsonl",
+            call("local", target="natedev"),
+            self.nextest_step("first", "local"), self.nextest_step("second", "local"),
+            self.nextest_step("mac", "local", caller="verify-mac", host="Mac"),
+        )
+        cells = self.target_cells()
+        self.assertEqual(cells["natedev ran"], "1")
+        self.assertEqual(cells["Mac ran"], "0")
+
+    def test_target_alone_counts_no_execution_or_decline(self) -> None:
+        self.write(
+            self.root / "natedev" / "2026-10.jsonl",
+            call("interrupted", outcome="interrupted", status=130, target="mac", mac="", mac_s=30),
+        )
+        self.assertEqual(self.mac_tests_lines(), [])
+
+    def test_interrupted_retry_keeps_decline_and_has_no_mac_time(self) -> None:
+        for reason in ("busy", "blocked"):
+            with self.subTest(reason=reason):
+                self.write(
+                    self.root / "natedev" / "2026-10.jsonl",
+                    call("retry", outcome="interrupted", status=130, target="mac",
+                         mac="declined", mac_reason=reason, mac_s=0.4),
+                )
+                cells = self.target_cells()
+                self.assertEqual(cells["Mac ran"], "0")
+                self.assertEqual(cells["natedev ran"], "0")
+                self.assertEqual(cells["Mac p50"], "")
+                self.assertIn(f"{report.DECLINE_LABELS[cast(mac_outcome.OffloadDeclineReason, reason)]} 1", cells["Did not reach the Mac"])
+
+    def test_mac_pass_counts_when_local_confirmation_is_interrupted(self) -> None:
+        self.write(
+            self.root / "natedev" / "2026-10.jsonl",
+            call("confirmed", outcome="interrupted", status=130, target="natedev",
+                 mac="passed", mac_reason="", mac_s=10, wall_s=60),
+            self.nextest_step("confirmation", "confirmed", status=130),
+        )
+        cells = self.target_cells()
+        self.assertEqual(cells["Mac ran"], "1")
+        self.assertEqual(cells["Mac passed"], "1")
+        self.assertEqual(cells["Mac failed"], "0")
+        self.assertEqual(cells["natedev ran"], "1")
+
+    def test_reused_call_counts_no_execution_even_with_a_target(self) -> None:
+        self.write(
+            self.root / "natedev" / "2026-10.jsonl",
+            call("cached", outcome="reused", target="natedev"),
+            self.nextest_step("cached-step", "cached"),
+        )
+        self.assertEqual(self.mac_tests_lines(), [])
+
+    def test_repository_and_linux_declines_need_no_mac_seconds(self) -> None:
+        for reason in ("repo", "linux_only"):
+            with self.subTest(reason=reason):
+                self.assertEqual(
+                    mac_outcome.offload_record("declined", reason, reason, None),
+                    mac_outcome.OffloadDeclined(cast(mac_outcome.OffloadDeclineReason, reason), 0.0),
+                )
+
+    def test_day_ranges_match_sqlite_on_each_side_of_local_midnight(self) -> None:
+        self.addCleanup(time.tzset)
+        with mock.patch.dict(os.environ, {"TZ": "America/Los_Angeles", "USER_ZONE": "America/Los_Angeles"}):
+            time.tzset()
+            before = "2026-10-03T06:59:59.999Z"
+            after = "2026-10-03T07:00:00.000Z"
+            self.write(
+                self.root / "natedev" / "2026-10.jsonl",
+                call("before", started_at=before, mac="passed", mac_reason="", mac_s=1),
+                call("after", started_at=after, mac="passed", mac_reason="", mac_s=1),
+                self.nextest_step("before-step", "before", started_at=after),
+                self.nextest_step("after-step", "after", started_at=after),
+            )
+            _ = index.update()
+            with closing(index.read_only()) as connection:
+                for day in ("2026-10-02", "2026-10-03"):
+                    expected = report.fetch(connection,
+                        "SELECT id FROM calls WHERE date(started_at, 'localtime') = ? ORDER BY id", day)
+                    selected = report.reported_mac_calls(connection, day)
+                    self.assertEqual(sorted(call.call_id for call in selected if call.on_report_day), [row[0] for row in expected])
+                    self.assertTrue(all(call.ran_on_natedev for call in selected))
+        time.tzset()
+
+    def test_lead_block_has_all_five_facts_before_waiting(self) -> None:
+        self.write(
+            self.root / "natedev" / "2026-10.jsonl",
+            call("passed", mac="passed", mac_reason="", mac_s=10, hold_wait_s=600),
+            call("saved", outcome="reused", saved_s=120),
+            call("blocked", started_at="2026-10-02T12:10:00Z", mac="declined", mac_reason="blocked", mac_s=1),
+            self.nextest_step("failed-step", "passed", status=1, tests_flaky=2),
+        )
+        lines = self.render().splitlines()
+        lead = [line for line in lines[2:lines.index("### Waiting")] if line]
+        self.assertEqual(lead, [
+            "Mac when usable: 1 of 1 candidates finished there (100%).",
+            "Longest wait: 10.0 min for Held target.",
+            "Failed steps: 1; flaky tests: 2.", "Pass records saved: 2.0 min.",
+            f"Mac blocked as of {local_clock('2026-10-02T12:10:00Z').split()[0]}",
+        ])
+
+    def test_lead_block_uses_latest_candidate_and_groups_backoff_with_unreachable(self) -> None:
+        for reason in ("backoff", "unreachable"):
+            with self.subTest(reason=reason):
+                self.write(
+                    self.root / "natedev" / "2026-10.jsonl",
+                    call("declined", mac="declined", mac_reason=reason, mac_s=1),
+                    call("local", started_at="2026-10-02T12:10:00Z", mac="declined", mac_reason="local_flag"),
+                    call("linux", started_at="2026-10-02T12:20:00Z", mac="declined", mac_reason="linux_only"),
+                )
+                self.assertIn(f"Mac unreachable as of {local_clock(STAMP).split()[0]}", self.render())
+        self.write(
+            self.root / "natedev" / "2026-10.jsonl",
+            call("blocked", mac="declined", mac_reason="blocked", mac_s=1),
+            call("passed", started_at="2026-10-02T12:10:00Z", mac="passed", mac_reason="", mac_s=1),
+        )
+        self.assertNotIn("Mac blocked as of", self.render())
+
+    def test_lead_block_uses_the_waiting_rows_names_and_durations(self) -> None:
+        cases = ((900, 600, False, "Memory admission", 900),
+                 (100, 600, False, "Build-folder turn, behind another seat", 600),
+                 (100, 600, True, "Build-folder turn, behind another seat", 300))
+        for memory_wait, token_wait, shares_own_turn, name, longest in cases:
+            with self.subTest(name=name, longest=longest):
+                records = [
+                    call("waiter", started_at="2026-10-02T12:00:00Z", token_wait_s=token_wait,
+                         wait_s=600, delegate_session="group" if shares_own_turn else None, seat="writer"),
+                    step("memory", mem_wait_s=memory_wait),
+                ]
+                if shares_own_turn:
+                    records.append(token_holder("holder", "2026-10-02T12:00:00Z",
+                                                "2026-10-02T12:05:00Z", "writer", "group"))
+                self.write(self.root / "natedev" / "2026-10.jsonl", *records)
+                self.assertIn(f"Longest wait: {report.seconds(longest)} for {name}.", self.render())
+                self.assertTrue(self.waiting_rows()[name][0].startswith(report.seconds(longest) + " ("))
+
+    def test_lead_block_names_a_wait_behind_its_own_call(self) -> None:
+        self.write(
+            self.root / "natedev" / "2026-10.jsonl",
+            call("waiter", started_at=STAMP, token_wait_s=600, wait_s=600,
+                 delegate_session="group", seat="writer"),
+            token_holder("holder", STAMP, "2026-10-02T12:10:00Z", "writer", "group"),
+        )
+        name = "Build-folder turn, behind its own call"
+        self.assertIn(f"Longest wait: 10.0 min for {name}.", self.render())
+        self.assertTrue(self.waiting_rows()[name][0].startswith("10.0 min ("))
+
+    def test_lead_block_omits_longest_wait_when_no_row_waited(self) -> None:
+        self.write(self.root / "natedev" / "2026-10.jsonl", call("no-wait", hold_wait_s=0))
+        self.assertNotIn("Longest wait:", self.render())
+
+    def test_lead_block_includes_the_ci_queue_when_it_is_the_longest_row(self) -> None:
+        self.write(
+            self.root / "ci" / "2026-10.jsonl",
+            ci_run(1, 1, [ci_job(11, "Test", "success", (
+                STAMP, "2026-10-02T12:10:00Z", "2026-10-02T12:11:00Z",
+            ))]),
+        )
+        self.assertIn("Longest wait: 10.0 min for CI queue.", self.render())
+        self.assertTrue(self.waiting_rows()["CI queue"][0].startswith("10.0 min ("))
+
+    def test_tree_history_uses_step_time_and_id_when_records_arrive_out_of_order(self) -> None:
+        self.write(
+            self.root / "natedev" / "2026-10.jsonl",
+            call("history"),
+            step("last", call_id="history", tree_key="last-tree", started_at="2026-10-02T12:10:00Z"),
+            step("b", call_id="history", tree_key="second-tree", started_at=STAMP),
+            step("a", call_id="history", tree_key="first-tree", started_at=STAMP),
+        )
+        _ = index.update()
+        with closing(index.read_only()) as connection:
+            trees = report.call_trees(connection, "2026-10-02")
+        self.assertEqual(trees["history"], report.KnownCallTrees("first-tree", "last-tree"))
 
     def nextest_step(
         self,
@@ -173,7 +559,7 @@ class ReportTests(unittest.TestCase):
         rows = self.waiting_rows()
         self.assertEqual(rows, {name: ["none", "", "", "", ""] for name in
                                 ("Build-folder turn, behind another seat", "Build-folder turn, behind its own call",
-                                 "Memory admission", "CI queue")})
+                                 "Held target", "Memory admission", "CI queue")})
 
     def test_build_folder_wait_fully_behind_own_call_from_previous_day(self) -> None:
         at = "2026-10-02T12:00:00Z"
@@ -557,7 +943,7 @@ class ReportTests(unittest.TestCase):
         lines = self.render().splitlines()
         section = lines[
             lines.index("### Agent calls (verify.sh)") : lines.index(
-                "### Tests on the Mac"
+                "### Tests by target"
             )
         ]
         self.assertIn("| reused | 1 |  | 1.0 min |", section)
@@ -566,51 +952,100 @@ class ReportTests(unittest.TestCase):
 
     def test_offload_columns_become_domain_values(self) -> None:
         self.assertIsInstance(
-            report.offload_record(None, None, None), report.NoOffloadRecord
+            mac_outcome.offload_record(
+                mac=None, reason=None, seconds_value=None, local_reason=None
+            ),
+            mac_outcome.NoOffloadRecord,
         )
         self.assertIsInstance(
-            report.offload_record("", "", None), report.NoOffloadRecord
+            mac_outcome.offload_record(
+                mac="", reason="", seconds_value=None, local_reason=""
+            ),
+            mac_outcome.NoOffloadRecord,
         )
-        self.assertIsInstance(
-            report.offload_record("declined", "local_flag", None),
-            report.LocalRunRequested,
+        requested = mac_outcome.offload_record(
+            mac="declined",
+            reason="local_flag",
+            seconds_value=None,
+            local_reason="needs Linux filesystem semantics",
         )
+        self.assertEqual(
+            requested,
+            mac_outcome.LocalRunRequested("needs Linux filesystem semantics"),
+        )
+        with self.assertRaises(FrozenInstanceError):
+            setattr(requested, "reason", "changed")
+        old_requested = mac_outcome.offload_record(
+            mac="declined",
+            reason="local_flag",
+            seconds_value=None,
+            local_reason=None,
+        )
+        self.assertEqual(old_requested, mac_outcome.LocalRunRequested(mac_outcome.LOCAL_REASON_NOT_RECORDED))
         self.assertIsInstance(
-            report.offload_record("declined", "runner", None),
-            report.RunnerResultUnavailable,
+            mac_outcome.offload_record(
+                mac="declined",
+                reason="runner",
+                seconds_value=None,
+                local_reason="",
+            ),
+            mac_outcome.RunnerResultUnavailable,
         )
 
-        decline = report.offload_record("declined", "busy", 2.5)
-        self.assertIsInstance(decline, report.OffloadDeclined)
-        if isinstance(decline, report.OffloadDeclined):
+        decline = mac_outcome.offload_record(
+            mac="declined",
+            reason="busy",
+            seconds_value=2.5,
+            local_reason="",
+        )
+        self.assertIsInstance(decline, mac_outcome.OffloadDeclined)
+        if isinstance(decline, mac_outcome.OffloadDeclined):
             self.assertEqual(decline.reason, "busy")
             self.assertEqual(decline.seconds, 2.5)
 
-        completed = report.offload_record("passed_filter", "", 3.5)
-        self.assertIsInstance(completed, report.MacRunCompleted)
-        if isinstance(completed, report.MacRunCompleted):
+        completed = mac_outcome.offload_record(
+            mac="passed_filter", reason="", seconds_value=3.5, local_reason=""
+        )
+        self.assertIsInstance(completed, mac_outcome.MacRunCompleted)
+        if isinstance(completed, mac_outcome.MacRunCompleted):
             self.assertEqual(completed.outcome, "passed_filter")
             self.assertEqual(completed.seconds, 3.5)
 
-        lost = report.offload_record("lost", "", 4.5)
-        self.assertIsInstance(lost, report.MacRunLost)
-        if isinstance(lost, report.MacRunLost):
+        lost = mac_outcome.offload_record(
+            mac="lost", reason="", seconds_value=4.5, local_reason=""
+        )
+        self.assertIsInstance(lost, mac_outcome.MacRunLost)
+        if isinstance(lost, mac_outcome.MacRunLost):
             self.assertEqual(lost.seconds, 4.5)
 
-        no_test = report.offload_record("declined", "no_tests", 5.5)
-        self.assertIsInstance(no_test, report.MacRunMatchedNoTest)
-        if isinstance(no_test, report.MacRunMatchedNoTest):
+        no_test = mac_outcome.offload_record(
+            mac="declined",
+            reason="no_tests",
+            seconds_value=5.5,
+            local_reason="",
+        )
+        self.assertIsInstance(no_test, mac_outcome.MacRunMatchedNoTest)
+        if isinstance(no_test, mac_outcome.MacRunMatchedNoTest):
             self.assertEqual(no_test.seconds, 5.5)
 
     def test_invalid_offload_records_become_unrecognized(self) -> None:
         values = (
-            report.offload_record("declined", "new_reason", 1.0),
-            report.offload_record("passed", "", None),
-            report.offload_record("new_word", "", 1.0),
+            mac_outcome.offload_record(
+                mac="declined",
+                reason="new_reason",
+                seconds_value=1.0,
+                local_reason="",
+            ),
+            mac_outcome.offload_record(
+                mac="passed", reason="", seconds_value=None, local_reason=""
+            ),
+            mac_outcome.offload_record(
+                mac="new_word", reason="", seconds_value=1.0, local_reason=""
+            ),
         )
         for value in values:
             with self.subTest(value=value):
-                self.assertIsInstance(value, report.UnrecognizedOffloadRecord)
+                self.assertIsInstance(value, mac_outcome.UnrecognizedOffloadRecord)
 
     def test_mac_section_omits_empty_records_and_ignores_unrecognized_ones(self) -> None:
         self.write(
@@ -619,7 +1054,7 @@ class ReportTests(unittest.TestCase):
             call("empty", mac="", mac_reason="", mac_s=None),
         )
         self.assertEqual(self.mac_tests_lines(), [])
-        self.assertNotIn("### Tests on the Mac", self.render())
+        self.assertNotIn("### Tests by target", self.render())
 
         self.write(
             self.root / "natedev" / "2026-10.jsonl",
@@ -627,57 +1062,52 @@ class ReportTests(unittest.TestCase):
             call("missing-seconds", mac="passed", mac_reason="", mac_s=None),
         )
         self.assertEqual(self.mac_tests_lines(), [])
-        self.assertNotIn("### Tests on the Mac", self.render())
+        self.assertNotIn("### Tests by target", self.render())
 
-    def test_disabled_unenrolled_local_and_runner_results_create_no_mac_section(
-        self,
-    ) -> None:
-        self.write(
-            self.root / "natedev" / "2026-10.jsonl",
+    def test_calls_that_did_not_reach_the_mac_still_have_a_package_row(self) -> None:
+        records = [
             call("disabled", mac="declined", mac_reason="off", mac_s=0.0),
-            call("unenrolled", mac="declined", mac_reason="repo", mac_s=0.0),
-            call(
-                "local",
-                mac="declined",
-                mac_reason="local_flag",
-                mac_s=None,
-            ),
-            call(
-                "runner",
-                mac="declined",
-                mac_reason="runner",
-                mac_s=None,
-            ),
-        )
-
-        self.assertEqual(self.mac_tests_lines(), [])
-        self.assertNotIn("### Tests on the Mac", self.render())
+            call("unenrolled", mac="declined", mac_reason="repo", mac_s=None),
+            call("linux", mac="declined", mac_reason="linux_only", mac_s=None),
+            call("local", mac="declined", mac_reason="local_flag", mac_s=None),
+            call("runner", mac="declined", mac_reason="runner", mac_s=None),
+        ]
+        self.write(self.root / "natedev" / "2026-10.jsonl", *records)
+        row = next(line for line in self.mac_tests_lines() if line.startswith("| hana |"))
+        for text in ('Linux-only 1', '--local 1', 'runner 1'):
+            self.assertIn(text, row)
+        self.assertNotIn('off 1', row)
+        self.assertNotIn('repository 1', row)
 
     def test_disabled_counts_are_absent_from_reported_declines(self) -> None:
-        calls = [
-            call(
-                f"blocked-{number}",
-                mac="declined",
-                mac_reason="blocked",
-                mac_s=1.0,
-            )
-            for number in range(2)
-        ]
-        calls += [
-            call(
-                f"disabled-{number}",
-                mac="declined",
-                mac_reason="off",
-                mac_s=0.0,
-            )
-            for number in range(5)
-        ]
-        self.write(self.root / "natedev" / "2026-10.jsonl", *calls)
+        self.write(
+            self.root / "natedev" / "2026-10.jsonl",
+            *[call(f"blocked-{number}", mac="declined", mac_reason="blocked", mac_s=1.0) for number in range(2)],
+            *[call(f"disabled-{number}", mac="declined", mac_reason="off", mac_s=0.0) for number in range(5)],
+        )
+        row = next(line for line in self.mac_tests_lines() if line.startswith("| hana |"))
+        self.assertIn('blocked 2', row)
+        self.assertNotIn('off 5', row)
 
-        section = self.mac_tests_lines()
-        row = next(line for line in section if line.startswith("| hana |"))
-        self.assertIn("blocked 2", row)
-        self.assertNotIn("off 5", row)
+    def test_disabled_and_repository_declines_alone_have_no_package_row(self) -> None:
+        self.write(
+            self.root / "natedev" / "2026-10.jsonl",
+            call("disabled", package="disabled", mac="declined", mac_reason="off", mac_s=0),
+            call("repository", package="repository", mac="declined", mac_reason="repo", mac_s=None),
+        )
+        self.assertEqual(self.mac_tests_lines(), [])
+
+    def test_hidden_declines_keep_a_package_row_when_natedev_ran(self) -> None:
+        for reason in ("off", "repo"):
+            with self.subTest(reason=reason):
+                self.write(
+                    self.root / "natedev" / "2026-10.jsonl",
+                    call("local", mac="declined", mac_reason=reason, mac_s=0),
+                    self.nextest_step("local-step", "local"),
+                )
+                cells = self.target_cells()
+                self.assertEqual(cells["natedev ran"], "1")
+                self.assertEqual(cells["Did not reach the Mac"], "")
 
     def test_no_test_match_is_tried_not_failed_or_stayed_local(self) -> None:
         self.write(
@@ -699,11 +1129,52 @@ class ReportTests(unittest.TestCase):
         names = [cell.strip() for cell in heading.strip("|").split("|")]
         values = [cell.strip() for cell in row.strip("|").split("|")]
         cells = dict(zip(names, values, strict=True))
-        self.assertEqual(cells["Tried"], "1")
-        self.assertEqual(cells["Failed on the Mac"], "0")
-        self.assertEqual(cells["Passed there"], "0")
-        self.assertEqual(cells["Stayed local"], "")
+        self.assertEqual(cells["Mac ran"], "1")
+        self.assertEqual(cells["Mac failed"], "0")
+        self.assertEqual(cells["Mac passed"], "0")
+        self.assertEqual(cells["Did not reach the Mac"], "")
         self.assertIn("No test matched on the Mac: 1 (hana)", section)
+
+    def test_no_test_match_finishes_on_the_mac_in_the_lead_share(self) -> None:
+        self.write(
+            self.root / "natedev" / "2026-10.jsonl",
+            call("no-test", mac="declined", mac_reason="no_tests", mac_s=15, target="mac"),
+            call("busy", mac="declined", mac_reason="busy", mac_s=1, target="natedev"),
+        )
+        cells = self.target_cells()
+        self.assertEqual(cells["Mac ran"], "1")
+        self.assertEqual(cells["Mac passed"], "0")
+        self.assertEqual(cells["Mac failed"], "0")
+        self.assertEqual(cells["Did not reach the Mac"], "busy with our test 1")
+        self.assertIn("Mac when usable: 1 of 2 candidates finished there (50%).", self.render())
+
+    def test_disabled_offload_is_set_aside_in_the_lead_share(self) -> None:
+        self.write(
+            self.root / "natedev" / "2026-10.jsonl",
+            call("passed", mac="passed", mac_reason="", mac_s=1, target="mac"),
+            call("off", mac="declined", mac_reason="off", mac_s=0, target="natedev"),
+            call("state", mac="declined", mac_reason="state", mac_s=1, target="natedev"),
+            call("copy", mac="declined", mac_reason="copy", mac_s=1, target="natedev"),
+        )
+        self.assertIn("Mac when usable: 1 of 3 candidates finished there (33%).", self.render())
+        self.assertNotIn("off 1", self.target_cells()["Did not reach the Mac"])
+
+    def test_a_day_with_only_disabled_offload_has_no_lead_share(self) -> None:
+        self.write(self.root / "natedev" / "2026-10.jsonl",
+                   call("off", mac="declined", mac_reason="off", mac_s=0, target="natedev"))
+        self.assertNotIn("Mac when usable:", self.render())
+        self.assertEqual(self.mac_tests_lines(), [])
+
+    def test_cached_mac_pass_is_left_out_of_the_lead_share(self) -> None:
+        self.write(
+            self.root / "natedev" / "2026-10.jsonl",
+            call("cached", outcome="reused", mac="passed", mac_reason="", mac_s=1),
+            call("no-test", mac="declined", mac_reason="no_tests", mac_s=1),
+            self.nextest_step("cached-step", "cached"),
+        )
+        self.assertIn("Mac when usable: 1 of 1 candidates finished there (100%).", self.render())
+        self.assertEqual(self.target_cells()["Mac ran"], "1")
+        self.assertEqual(self.target_cells()["natedev ran"], "0")
 
     def test_mac_section_reports_outcomes_estimates_and_pairing(self) -> None:
         at = "2026-10-02T12:00:00Z"
@@ -764,7 +1235,7 @@ class ReportTests(unittest.TestCase):
         self.write(self.root / "Mac" / "2026-10.jsonl", *mac_steps)
 
         lines = self.render().splitlines()
-        start = lines.index("### Tests on the Mac")
+        start = lines.index("### Tests by target")
         end = next(
             index
             for index in range(start + 1, len(lines))
@@ -776,12 +1247,13 @@ class ReportTests(unittest.TestCase):
         names = [cell.strip() for cell in heading.strip("|").split("|")]
         values = [cell.strip() for cell in row.strip("|").split("|")]
         cells = dict(zip(names, values, strict=True))
-        self.assertEqual(cells["Tried"], "6")
-        self.assertEqual(cells["Failed on the Mac"], "2")
-        self.assertEqual(cells["Passed there"], "2")
+        self.assertEqual(cells["Mac ran"], "6")
+        self.assertEqual(cells["Mac failed"], "2")
+        self.assertEqual(cells["Mac passed"], "2")
         self.assertEqual(cells["Mac p50"], "20.0 s")
         self.assertEqual(cells["natedev p50"], "2.0 min")
-        self.assertEqual(cells["Stayed local"], "blocked 3, Mac busy 2")
+        self.assertEqual(cells["Did not reach the Mac"], "blocked 3, Mac busy 2, --local 1")
+        self.assertEqual(cells["natedev ran"], "8")
         self.assertEqual(
             sum(line.startswith("Source:") for line in section), 1
         )
@@ -797,7 +1269,8 @@ class ReportTests(unittest.TestCase):
         self.assertLess(lines.index("### Test builds (temporary)"), start)
         self.assertLess(start, lines.index("### Tests per edit"))
 
-    def test_local_pass_pairs_only_the_nearest_matching_failure(self) -> None:
+    def test_local_pass_pairs_only_nearest_failure_and_reports_its_reason(self) -> None:
+        reason = "uses Linux filesystem semantics"
         self.write(
             self.root / "natedev" / "2026-10.jsonl",
             call("first", started_at="2026-10-02T12:00:00Z", mac="failed", mac_reason="", mac_s=10.0,
@@ -805,16 +1278,37 @@ class ReportTests(unittest.TestCase):
             call("nearest", started_at="2026-10-02T12:05:00Z", mac="failed", mac_reason="", mac_s=10.0,
                  status=1, outcome="failed"),
             call("local", started_at="2026-10-02T12:10:00Z", mac="declined", mac_reason="local_flag",
-                 mac_s=None, status=0),
+                 local_reason=reason, mac_s=None, status=0),
             self.nextest_step("local-step", "local"),
         )
         section = self.mac_tests_lines()
-        self.assertIn(
-            "Failed on the Mac, then passed on natedev with --local: 1 (hana)",
-            section,
+        paired = next(
+            line
+            for line in section
+            if line.startswith("Failed on the Mac, then passed on natedev with --local")
         )
+        quoted_reason = f'"{reason}"'
+        self.assertIn(quoted_reason, paired)
+        self.assertLess(paired.index("--local"), paired.index(quoted_reason))
+        self.assertIn("1 (hana)", paired)
         avoided = next(line for line in section if line.startswith("natedev runs avoided:"))
         self.assertIn("natedev runs avoided: 1", avoided)
+
+    def test_local_pass_reason_with_double_quotes_is_escaped(self) -> None:
+        self.write(
+            self.root / "natedev" / "2026-10.jsonl",
+            call("failed", started_at="2026-10-02T12:05:00Z", mac="failed", mac_reason="", mac_s=10.0,
+                 status=1, outcome="failed"),
+            call("local", started_at="2026-10-02T12:10:00Z", mac="declined", mac_reason="local_flag",
+                 local_reason='needs a "quoted" mount', mac_s=None, status=0),
+            self.nextest_step("local-step", "local"),
+        )
+        paired = next(
+            line
+            for line in self.mac_tests_lines()
+            if line.startswith("Failed on the Mac, then passed on natedev with --local")
+        )
+        self.assertIn('--local "needs a \\"quoted\\" mount": 1 (hana)', paired)
 
     def test_next_day_local_pass_pairs_with_late_mac_failure(self) -> None:
         failed_at = datetime(2026, 10, 2, 23, 50).astimezone().isoformat()
@@ -936,7 +1430,7 @@ class ReportTests(unittest.TestCase):
 
         lines = self.render().splitlines()
         section = lines[
-            lines.index("### Test builds (temporary)") : lines.index("### Tests on the Mac")
+            lines.index("### Test builds (temporary)") : lines.index("### Tests by target")
         ]
         self.assertIn(
             "| 2026-10-02 | whole-package | 3.0 min | 2.0 min |",
@@ -1023,7 +1517,7 @@ class ReportTests(unittest.TestCase):
         self.assertNotIn("### fmt", lines)
 
         builds = lines[
-            lines.index("### Test builds (temporary)") : lines.index("### Tests on the Mac")
+            lines.index("### Test builds (temporary)") : lines.index("### Tests by target")
         ]
         self.assertIn(
             "| 2026-10-02 | whole-package | 1.0 min | 1.0 min |",
@@ -1400,7 +1894,7 @@ class ReportTests(unittest.TestCase):
 
     def test_memory_pressure_counts_counter_rise_across_midnight_when_samples_are_close(self) -> None:
         self.addCleanup(time.tzset)
-        with mock.patch.dict(os.environ, {"TZ": "UTC"}):
+        with mock.patch.dict(os.environ, {"TZ": "UTC", "USER_ZONE": "UTC"}):
             time.tzset()
             self.write(
                 self.root / "natedev" / "samples-2026-10.jsonl",
@@ -1719,7 +2213,7 @@ class ReportTests(unittest.TestCase):
 
     def test_sync_time_names_its_zone_and_an_earlier_day(self) -> None:
         self.addCleanup(time.tzset)
-        with mock.patch.dict(os.environ, {"TZ": "America/New_York"}):
+        with mock.patch.dict(os.environ, {"TZ": "America/New_York", "USER_ZONE": "America/New_York"}):
             time.tzset()
             now = datetime.fromisoformat("2026-10-03T15:00:00-04:00")
             self.assertEqual(sync.sync_time("2026-10-03T16:14:00+00:00", now), "12:14 EDT")

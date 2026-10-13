@@ -41,6 +41,9 @@ State:
 - `OUTSTANDING` — `~/.local/state/showrunner/outstanding/<slug>.json`, written
   by `update_registration.py footer --state` when `SHOWRUNNER_STATE` includes
   `open_for_user`. Omitting that key leaves the durable list unchanged.
+- `LOG` backups — `~/.local/state/showrunner/<slug>/log-backups/log-<YYYYmmddTHHMM>.md`,
+  one copy per update tick, the newest 48 kept (`log_backup.py`). To restore
+  `LOG`, copy the wanted file back over it.
 
 `<DecisionEconomy/>` is defined by this import:
 
@@ -92,13 +95,106 @@ State:
 - **As-built close-out** is the unit director's: it decides, reports what moved,
   and never asks (user, 2026-10-06). A scope change to the main plan is a
   product choice, not an as-built one.
+- **Nested showrunners.** A showrunner may report to another
+  (`/showrunner:attach`). `showrunners.py parent|children|root <slug>` and
+  `showrunners.py tree` say where a production sits; look it up each time, as
+  an attachment can change. The top of a tree is its root, the user's one
+  place to see everything below it: its count, its list and its footer cover
+  every item that needs the user. The user may still work with any showrunner
+  directly, and one below a root answers them in its own pane as a root does.
+  User, 2026-10-09: "showrunners manage showrunners - ad hoc depth"; and
+  2026-10-12: "have them available for direct interaction from me but also
+  have a natural home under an L1".
+  - **A child showrunner is never a unit.** It has no Units row, and you never
+    merge its branch, type into its pane or type into its units' panes.
+  - **A broadcast** (a build hold, a quota alert, an announcement) already
+    reaches every showrunner. Pass it to your own unit directors only, never
+    to a child showrunner.
+  - **The user's words for a production below you** go to your child that
+    holds it, by SendMessage, beginning `From the user (via <your name>): `.
+    That child relays them to its unit or to its own child. One level at a
+    time.
+  - **An item for the user**, when you are not the root, is asked in your own
+    reply as always and also goes to the root, so the root shows it once:
+    `showrunners.py root <your slug>`, then `showrunners.py address <root>`,
+    and SendMessage beginning `From the showrunner of <your slug>, for the
+    user: `. Set it in your own `open_for_user` as always: the root's count
+    covers it from there. Clear it the moment it is answered or no longer
+    needed, wherever the answer came from, the user typing in your own pane
+    included. The root's count drops by itself: send the root nothing to drop
+    it. A phone alert for it (<Notify/>) is still yours to send, as before. If
+    the root is not running, keep it there and say so at your next footer.
+  - **A question between productions** (a Mac window, the order of two
+    promotions) goes to your parent, not to the root.
+  - **As a root or a parent**, show the user each item a child sends in the
+    child's words, and relay the answer back to that child.
+  - **As a root**, never copy a lower showrunner's item into your own
+    `open_for_user`. It stays in its owner's list; your count and your
+    footer's `nothing needed` already cover every list below you. When its
+    owner clears it, your count drops with no message to you and nothing for
+    you to remove (live check, 2026-10-12: an item answered in the lower
+    showrunner's own pane had to be dropped at the root by hand).
+  - **Two footer bullets come from the tree.** Under a root, your footer
+    carries `reports to <root>`. As a root, `<slug>: needs-user list
+    unreadable` means that production's list could not be counted: tell its
+    showrunner to store it again.
+  - **Your dailies show each production directly below you as one row**, from
+    the report it last saved: its units, how many have a checkpoint not
+    merged, its latest ETA, `as of HH:MM` when that report is old, and how
+    many open questions it holds. Gather nothing for it. `/showrunner:dailies
+    expand <child|all>` adds its own rows. A row that reads `no report yet`
+    fills in at that showrunner's next dailies.
+  - **Start a lower showrunner only with `/showrunner:add_showrunner
+    <production doc>`**, never in your own pane and never as a unit. It gets
+    its own tmux session on the showrunner account and is attached to you
+    once it runs. User, 2026-10-12: "top level (L1) showrunners should make
+    sure to use tmux to start lower level showrunners".
 - **What reaches the user:**
-  - a unit director's `— decision:` for the user, shown in the unit director's
-    words, with the answer relayed back;
+  - a unit director's `— decision:` that only the user can settle (**Designs
+    and add-ons** below), shown in the unit director's words, with the answer
+    relayed back;
   - product and scope choices;
   - anything that cannot be undone;
+  - a block that waits on the user, and a step only they can run;
+  - a fault they would see;
   - a quota alert (<QuotaAlert/>);
   - the discussion agenda (<Agenda/>).
+
+  Nothing else does. Handle unit messages (checkpoints, merges, ETAs, plans,
+  promotions, routine fixes) without telling the user; they wait for the next
+  dailies (user, 2026-10-12).
+- **Designs and add-ons.** A unit's design choices and add-ons are yours to
+  settle, not the user's. User, 2026-10-12: "when it comes to designs you
+  absolutely should be able to tell units what to do and change. I do not have
+  to be the one to approve".
+  - When a unit director brings a design choice, a Pending decision about how
+    something is built, or its add-ons, answer it yourself. Pick by
+    `<DecisionEconomy/>`, tell the unit in one message and log it (**Log**).
+    For add-ons, give each number `current`, `next` or `drop`: build it in
+    this run, save it for later, or drop it. An add-on that fixes a wrong
+    result is `current`.
+  - Tell a unit what to do and change in its design without being asked, when
+    you see a better answer.
+  - Your answer goes as your own message. Never begin it `From the user (via
+    the showrunner):`; those words are only for what the user said.
+  - Two kinds still go to the user: an action that cannot be undone, and a
+    choice only the user knows the answer to (what the product should do,
+    their priorities, what they intend, and their taste where the guide is
+    silent, <DesignAuthority/>). Never bring them a choice you can settle.
+- **Open questions.** Ask the user each question once, in full, in the reply
+  where it first comes up: what is asked, why, and the answer choices. Set it
+  in `open_for_user` in that turn (**Footer** below). After that turn no reply
+  restates the question or its choices. The Waiting on block says only
+  `There are {n} open questions for you.` (`There is 1 open question for you.`
+  for one), where n counts every `OUTSTANDING` item now due: everything that
+  waits on the user, a step only they can run included. A root's n also counts
+  every due item of every production below it (**Nested showrunners** above).
+  List the questions in full only when the user asks what they are: run
+  `python3 ~/.claude/scripts/production/update_registration.py open
+  --production PRODUCTION_DOC` and show its list, oldest first, each item led
+  by the production that owns it. A dailies report still lists what needs the user in full, because
+  it is a report the user asked for. User, 2026-10-12, replacing the
+  2026-10-06 rule that restated the user's items in every Waiting on block.
 - **Long commands** run in the background. The task notification is the wait;
   never poll.
 - **Helpers.** Stop each named helper agent once its report is read.
@@ -113,7 +209,7 @@ State:
   director answered without a time, message it yourself, because
   the command will not repeat the request. Report `none measured - requested`
   until it answers.
-- **Waiting on block.** When footers are on, after the footer leave two empty lines, write `Waiting on:`, leave one empty line, then write one `* ` bullet per item. The user's items come first. Every other item leads with its ETA from measured runs, without the zone, soonest first: `19:45 (18:20–23:55) - startup Phase 16`; items with none follow, led by `no ETA measured - `. Name each item by what it is and what it is doing, never by a task, agent or session id. The footer hook checks the shape and item order. User, 2026-10-06.
+- **Waiting on block.** When footers are on, after the footer leave two empty lines, write `Waiting on:`, leave one empty line, then write one `* ` bullet per item. What waits on the user shows only as its count (**Open questions** above): while any item is due, the first bullet is `There are {n} open questions for you.`, and no bullet restates one. A held quota alert comes next, led by `quota: ` (<QuotaAlert/>). Every other item leads with its ETA from measured runs, without the zone, soonest first: `19:45 (18:20–23:55) - startup Phase 16`; items with none follow, led by `no ETA measured - `. Name each item by what it is and what it is doing, never by a task, agent or session id. The footer hook checks the block's form, the count and the item order. User, 2026-10-06; count rule 2026-10-12.
 - **Footer.** Run `python3 ~/.claude/scripts/production/update_registration.py
   footer --production PRODUCTION_DOC` for the footer, adding
   `--state SHOWRUNNER_STATE` once that file exists. Paste the rendered footer
@@ -123,9 +219,12 @@ State:
   `SHOWRUNNER_STATE` to the complete new list, starting from `OUTSTANDING`'s
   current items; `[]` clears it.
   When the footer switch is off, the command says `footers off`; omit both the
-  footer and the Waiting on block. The command reads the switch, the notifier's
+  footer and the Waiting on block. It still stores `open_for_user`, so the
+  dailies count it, and with questions open the reply ends with the count line
+  alone (**Open questions** above). The command reads the switch, the notifier's
   next due time, and open-for-the-user items from `OUTSTANDING`. Keep each
-  item specific enough to recall what, where and why without memory. Remove
+  item complete enough to stand alone when the user asks for the list: what
+  is asked, where, why and the choices. Remove
   an item only when the user addresses it and tells you; defer an item with
   `after` when the user asks. Build holds come from holder files in
   `~/.local/state/build-hold/`, and a dailies input marks each held unit. A
@@ -133,8 +232,9 @@ State:
 
   `scripts/hooks/stop-showrunner-footer.py` checks each reply in the session
   targeted by `UPDATES`. When footers are on, a missing or outdated footer or
-  Waiting on block blocks the reply with the exact footer lines and Waiting on
-  shape. End the reply with those lines and the Waiting on block. The hook
+  Waiting on block blocks the reply with the exact footer lines and the Waiting on
+  block's form. A block that restates a user item, or whose count differs from the
+  `OUTSTANDING` items now due, blocks it with the count line to write. End the reply with those lines and the Waiting on block. The hook
   passes a reply after any Stop-hook block and passes on errors.
 
   `/showrunner:footer off` and `/showrunner:footer on` pause and resume the
@@ -165,18 +265,20 @@ State:
   ```text
 
   ---
-  11:37 PDT update:
+  11:37 EDT update:
 
-  * build hold: <holder> since 11:34 PDT, for the frame-time lane's breakdown of what each added tool costs - release eta: 11:40 PDT (3 minutes)
-  * Mac block: <holder> since 11:35 PDT, for the Mac-only test run - lifts Wed 12:35 PDT
+  * build hold: <holder> holds builds since 11:34 EDT for the frame-time lane's breakdown of what each added tool costs; expected to release 11:40 EDT (in 3 minutes)
+  * Mac block: <holder> since 11:35 EDT, for the Mac-only test run - lifts Wed 12:35 EDT
   * claude 1: …
-  * next dailies: 11:53 PDT - nothing needed
+  * next dailies: 11:53 EDT - nothing needed
 
 
   Waiting on:
 
   * <item>
   ```
+  With two questions open, the last footer bullet drops ` - nothing needed`
+  and the block's first bullet is `* There are 2 open questions for you.`.
   A dailies report ends with the same footer.
 </Throughout>
 
@@ -221,6 +323,19 @@ after a failed step; it resumes at the first unfinished step.
 ---
 
 <LaunchUnits>
+When the production doc has a **Review pool** line, prepare the review plan
+on `MERGE_BRANCH` before launching. It has the Production header from
+`docs/production_format.md` and the one standing phase in
+`commands/review/direct.md` → <ReviewPoolStart/>. Commit a new or changed
+plan there; `add_unit.py` reads the committed merge-branch tree in preflight.
+Then launch `review-unit` first:
+`$HOME/.claude/scripts/lib/py $HOME/.claude/scripts/production/add_unit.py --production PRODUCTION_DOC review --plan <review plan> --owns "—"`.
+It has an ordinary Units row, worktree and branch; its opening runs
+`/review:direct <absolute production doc path>`. Its standing phase stays
+`todo` and has no final checkpoint. Ask it for <ReviewPoolDailies/> at each
+dailies (`commands/review/direct.md`) and carry its tables and source warnings
+with the report.
+
 For each unit without a live unit director, run
 `$HOME/.claude/scripts/lib/py $HOME/.claude/scripts/production/add_unit.py --production PRODUCTION_DOC <name> --plan <unit plan>`.
 `<name>` is the Units row's Unit value without `-unit`; the existing row is adopted.
@@ -231,8 +346,10 @@ When a unit director is blocked on a full context, first capture its pane to
 confirm the block remains and no compaction is running. Type `/compact` into its pane with
 `tmux send-keys -t <pane> -l`, then send `Enter` separately.
 
-**Resume.** To bring back a unit director whose session ended, use
-   `claude --resume <session-id> <flags> --remote-control <session> -n <session>`, which keeps its link and its place in the list.
+**Resume.** To bring back a unit director whose session ended, first run
+   `~/.claude/scripts/lib/py ~/.claude/scripts/accounts/accounts.py env unit`. If it exits nonzero, do not resume and tell the user its line. Its output (empty for the default account) is `<account>`; put it verbatim before both commands below.
+   Use `<account>claude --resume <session-id> <flags> --remote-control <session> -n <session>`, which keeps its link and its place in the list.
+   First run `<account>$HOME/.claude/scripts/lib/py $HOME/.claude/scripts/shutdown/shutdown.py launch-blocked --restart-of <session-id>`. Continue only when it exits 1. On any other exit, do not resume and tell the user its line; exit 0 means the account is held by a shutdown, and `/shutdown restart` brings the unit back.
    Get `<flags>` first, from `bash -c 'source ~/.claude/scripts/agents/agents_config.sh && agents_resolve production.director || exit 1; [[ "$AGENT_FAMILY" == claude ]] || { echo "unit directors launch only on claude; production.director resolves to $AGENT_FAMILY ($AGENT_MODEL)" >&2; exit 1; }; agents_claude_args'`, which prints `--model <model> [--effort <effort>]`. If it exits nonzero, stop and tell the user its line; never run `claude --resume` without the flags.
 </LaunchUnits>
 
@@ -258,6 +375,10 @@ The command writes `PROMPT_FILE`,
 retargets `UPDATES` with `NOTIFIER new` without moving its clock, creates
 stall-watch and tmux-names only when absent, and prints `next_due`. Use the
 reported next tick and log it. `CLAUDE_CODE_SESSION_ID` must be set.
+When the doc's Updates line reads `on demand`, it makes `UPDATES` at the
+default 15 minutes and stops it, prints `on demand: no scheduled dailies`,
+and no scheduled update comes: a dailies runs only when the user asks for one.
+The stopped instance stays, because it is the showrunner's only record.
 
 The prompt:
 
@@ -297,7 +418,8 @@ compacting on every tick doubled the compaction rate and saved no tokens,
 because a unit director re-reads its files at
 once and passes 150K again within 12-20 minutes.)
 
-**Every scheduled update is a `/showrunner:dailies gantt` report**, never a
+**Every scheduled update is a `/showrunner:dailies gantt` report** (none come
+when the Updates line reads `on demand`), never a
 one-unit note: every unit is checked on every tick and has its row in the chart.
 Above the chart a `gantt` dailies prints only what needs the user and one line for
 each thing that changed; the user asks for `simple` to see every unit's section.
@@ -305,7 +427,7 @@ each thing that changed; the user asks for `simple` to see every unit's section.
 A `/showrunner:dailies` the user runs takes the next tick's slot: it runs the
 script, and then runs `NOTIFIER restart UPDATES` so the next tick comes N minutes after
 that report (`/showrunner:dailies` → Status check and clock).
-`/showrunner:interval <minutes>` changes N.
+`/showrunner:report_interval <minutes>` changes N.
 
 Log `UPDATES` and its `next_due`. Read the quota alert protocol (<QuotaAlert/>).
 
@@ -331,9 +453,17 @@ whatever arrived:
 | the user's words for a unit director | relay them (<Throughout/>) |
 | a unit waiting on another unit | <Dependencies/> |
 | a unit blocked on the showrunner | <ClearGate/>, <LandingCall/>, or answer it |
-| a unit director's decision for the user | show it to the user; relay the answer |
+| a unit director's design choice, Pending decision or add-ons | settle it and tell the unit (<Throughout/> → Designs and add-ons) |
+| a unit director's decision only the user can settle | show it to the user; relay the answer |
 | a quota alert | <QuotaAlert/> |
 | the user asks for a status | `/showrunner:dailies`, `gantt` unless they name a length |
+| the user asks which phase or task each unit is on | `/showrunner:units` |
+| the user asks which proposals are open | `/showrunner:proposals` |
+| the user asks for the nightly improvement list | `/showrunner:nightly` |
+| the user asks to put a showrunner under another, or asks for the tree | `/showrunner:attach` |
+| the user asks what the open questions are | run `update_registration.py open --production PRODUCTION_DOC` and show its list: every item now due in full, oldest first, each led by its production; a deferred item with its time; a list it could not read (<Throughout/> → Open questions) |
+| a child showrunner's item for the user | show it in the child's words; relay the answer to that child (<Throughout/> → Nested showrunners) |
+| the user's words for a production below this one | relay them to the child that holds it (<Throughout/> → Nested showrunners) |
 
 A unit repairing failing tests that split by file runs parallel repair seats
 (`/unit:direct` → <FixDispatch/>); one that runs a lone seat on them gets
@@ -375,7 +505,7 @@ notice to the unit director before any merge command runs:
    line (`production_format.md` → <ProductionUnit/> item 3). The unit runs the
    check before sending; you do not repeat it.
    - **Fresh pass:** the line says `pass`, or names a follow-up phase for each
-     defect, from a fresh helper on exactly the notice's shots, built from the
+     defect, from a fresh check on exactly the notice's shots, built from the
      notice's hash. Merge.
    - **Missing or stale:** no line, other shots than the notice sends, or a
      build from before a later change to what users see. Run <DesignCheck/>
@@ -411,6 +541,30 @@ notice to the unit director before any merge command runs:
    first `held` or `failed` line stops the run. Send its final `send <unit>:`
    message to the unit director.
 
+<ChangeReviewFeatureLog>
+Run only when the production repository is `~/rust/hana` or
+`~/rust/hana_catalyst`, after `merge_checkpoint.py` accepts the merge.
+
+For each distinct user-visible result:
+
+1. Check the Hana live log for entries it replaces.
+2. Add the next `A<n>` or `C<n>` row under `## To review` in
+   `~/rust/hanadocs/change-review.md`: change, merge date, passing Mac build
+   when available, and a visual or behavioral check.
+3. Run `~/.claude/scripts/lib/py
+   ~/.claude/scripts/feature_log/feature_log.py propose --review <row>` with
+   `--project hana`, every owning crate, kind, title, summary, current behavior,
+   check, merge SHA as `--link`, `--evidence "Showrunner merge <merge-sha>,
+   from checkpoint <checkpoint-sha>."`, `--production <slug>`, every source
+   `--unit`, and one `--old` per replaced live entry. When the merge has
+   several results, pass `--separate-result` for every row.
+
+Several results get several rows. Internal-only work gets none; write
+`feature log: none — <reason>` to the production log. The merge is not complete
+until every row has a valid proposal or that reason is logged. Report no entry
+message.
+</ChangeReviewFeatureLog>
+
 5. **Report where it landed.** Include every `into:` line from the script in
    the user update. Each names the checkout, why it received the merge and
    what gate it unblocks. If the showrunner then merges the merge branch into
@@ -427,10 +581,38 @@ notice to the unit director before any merge command runs:
    --state-dir DAILIES_STATE_DIR` after each code checkpoint. Give the user its
    table on the first alert. A shrink adds no review-ledger row or CI count. While the
    watch exits 3, the dailies `Review watch` topic needs the user, and every
-   build report (`/builds`, every 4 hours) carries it and pushes again. Run
+   build report (`/build:report`, every 4 hours) carries it and pushes again. Run
    `review_regime.py ack` only on the user's own acknowledgment. Pass `--no-ci`
    to `due` when the production rules say CI does not apply.
+   When the production doc has a **Review pool** line, send `review-unit`
+   one line per merged code checkpoint:
+   `review merge: unit <unit>; phase <phase>; session dir <path>; design check: <verdict>`.
+   Find the unit's newest run in the local history root (`PLAN_DELEGATE_HISTORY_DIR`
+   or `~/.local/state/plan-delegate`), else the Mac's over ssh at
+   `collect.MAC_HOST` from `scripts/usage/collect.py`: read `runs/<run id>.jsonl`
+   whose `run_started` event's `working_dir` matches the unit's Worktree cell,
+   choose the greatest `run_started_at`, and use `<run id>` as the session
+   dir's name in the merge line. Take the verdict from step 3;
+   use `not applicable` when nothing users see changed. Append the same line
+   to `LOG`. A shrink sends no memory line.
 </MergeCheckpoint>
+
+---
+
+<CloseChangeReview>
+When the user gives a change-review verdict:
+
+- A verdict beginning `works` or `fine` lands the row with `add --review
+  <row>`, or `supersede --review <row>` when its proposal has `--old`. Propose
+  a missing row first; correct wrong meaning by rerunning `propose` while it is
+  open.
+- Any other verdict runs `drop --review <row> --verdict "<verdict>"`. A fixing
+  merge gets a new row and proposal.
+
+A script failure leaves the row open. After success, move it to `## Reviewed`
+with verdict and date; a landed Change cell may use the printed note link.
+Report no separate feature-log message.
+</CloseChangeReview>
 
 ---
 
@@ -688,7 +870,9 @@ it needs. Every other wait is yours to clear, and fast.
    wait (Rules: parallel by default); else work inside its current phase: its
    fix built in a scratch copy, tests, docs or research.
 5. **Two things still go to the user:** a wait that clears only by changing what
-   ships, and approvals that belong in a unit director's own session.
+   ships, and an approval only the user can give in a unit director's own
+   session (a permission prompt, an action that cannot be undone). A unit's
+   design choices and add-ons are yours (<Throughout/> → Designs and add-ons).
 6. **A block on the user is still yours** (user, 2026-10-03, after trunk sat
    13 hours overnight on one refused command). The user may be asleep or away,
    and units must keep working without them. On the first tick that shows a
@@ -729,11 +913,15 @@ Phone alerts use the one message path, which reaches the phone through
 Pushover (user's pick, 2026-10-03), because the user often ignores ordinary
 push notifications:
 
-`python3 ~/.claude/scripts/message/send.py --to user --need note|decision|blocked --summary "Hana: <unit or topic>" --text "<message>"`
+`python3 ~/.claude/scripts/message/send.py --to user --need note|decision|blocked (--action "<what the user does>" | --no-action) --summary "Hana: <unit or topic>" --text "<message>"`
 
 On the Mac, add `--machine natedev`; the keys exist only on natedev. The
-message is the one action or fact, under 200 characters. Exit 0 means sent. On
-`FAILED` (exit 3), fall back to PushNotification and say so in the log. Never
+message is the one action or fact, under 200 characters. Every message says
+what the user does with `--action`, or says nothing is needed with
+`--no-action`. Emergency (`--need blocked`) is only for an action the user must
+take now. Exit 0 means sent. On `FAILED` (exit 3), fall back to PushNotification
+with the same `Action: <what the user does>` or `No action needed.` first line,
+and say so in the log. Never
 read or print `~/.config/pushover/env`. Every attempt is logged in
 `~/.local/state/message/log.jsonl`.
 
@@ -846,7 +1034,11 @@ This session is on the quota alert list because <StartUpdates/> adds it.
 reaches them only as your relay (<Throughout/>). Run `python3
 ~/.claude/scripts/production/waiting.py quota --production PRODUCTION_DOC
 --state-dir DAILIES_STATE_DIR --notice "<full notice>"`. It relays
-to every unit director and prints one `send <unit>:` receipt each:
+to every unit director and prints one `send <unit>:` receipt each. With more
+than one Claude account in use, a Claude `Quota alert:` names its account and
+roles (`claude 3 (unit directors) at …`). It reaches only the unit directors
+running on that account, prints `skip <unit>: it runs on <other account>` for
+the rest, and reports a unit whose account cannot be read as not told:
 - `Quota alert:` — the command picks the instruction from the notice. A Codex
   notice that says nothing was switched: unit directors keep delegating on Codex,
   whose account may keep working on its credits, and tell you at once if Codex
@@ -854,11 +1046,13 @@ to every unit director and prints one `send <unit>:` receipt each:
   function moved: delegation continues on Claude. A Claude notice, or a Codex one
   whose switch failed: start no new delegate work on that tool; running seats
   finish and the unit director does the rest itself. Hold the alert as one
-  item per account, listed first in every Waiting on block with the percent left
-  and the reset time, until it is acknowledged or restored.
+  line per account, led by `quota: ` and listed first in every Waiting on block
+  after the open-questions count, with the percent left and the reset time,
+  until it is acknowledged or restored. It is a status, not a question: keep it
+  out of `open_for_user`.
 - `Quota alert acknowledged:` — drop the held item. Paused work stays paused.
-- `Quota restored:` — tell every unit director delegation on that tool can
-  resume, and drop the held item.
+- `Quota restored:` — tell every unit director that delegation on that tool,
+  or work on that Claude account, can resume, and drop the held item.
 
 What to do about the quota itself is the user's call; relay their decision to
 every unit director.
@@ -868,6 +1062,9 @@ every unit director.
 
 <Wrap>
 When every unit's final-gate and as-built checkpoints are merged:
+
+With a **Review pool** line, exclude `review-unit`'s standing phase from
+that condition.
 
 1. Run a final <CIPoint/> and all <PromoteMain/> checks on its exact sha:
    local validation, smoke launch and GitHub CI verdict, then the promotion
@@ -879,13 +1076,20 @@ When every unit's final-gate and as-built checkpoints are merged:
    - any other item that cannot be undone gets the user's OK first;
    - back up user data before migrating it.
    Finish each item before passing its exact text as `--close-out-done "<item>"`.
+   With a **Review pool** line, tell `review-unit` to end and wait for its
+   acknowledgment that no more primes will run. Then run
+   `~/.claude/scripts/lib/py ~/.claude/scripts/delegate/review_pool.py stop --production <slug>`.
+   On failure, report its reason and run `stop` again; do not finish wrap
+   until it succeeds. `<slug>` is the production doc's file name without
+   `-production.md`.
 3. Run `python3 ~/.claude/scripts/production/production_lifecycle.py wrap
    --production PRODUCTION_DOC --ci-green <sha> --smoke-passed <sha>
    --close-out-done "<item>"` (repeat the last flag for every item), or pass
    `--no-ci` when CI does not apply. The command holds on an unfinished close-out item,
    a dirty worktree, or an unmerged branch. It promotes main, retires the unit
-   worktrees and branches, removes the update instance, wraps and pushes the
-   doc, and prints the final report. Leave tmux sessions for the user to close.
+   worktrees and branches, removes the update instance, archives the production's
+   phase notes in the vault, wraps and pushes the doc, and prints the final report.
+   Leave tmux sessions for the user to close.
 </Wrap>
 
 ---

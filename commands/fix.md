@@ -241,7 +241,8 @@ Every Monitor event arriving in chat is a single line from the log. For each:
   - `ERROR: hana (codex exited immediately with no output)` → `hana failed style-fix: codex exited immediately with no output.`
   - `=== Done: 5 created, 2 failed, 0 skipped out of 7 ===` → `Style-fix run complete: 5 ok, 2 failed.`
 - Maintain a running tally of OK/FAILED counts across notifications when the user benefits from it (e.g. style-fix has a known 7-project denominator).
-- Treat `ERROR:`, `FAILED:`, `TIMEOUT:`, and `=== Done:` with non-zero failures as user-actionable — send one alert for each with `python3 ~/.claude/scripts/message/send.py --to user --need note --summary "<project>: <outcome>" --text "<the cause, under 200 characters>"`. On the Mac, add `--machine natedev`. On `FAILED` (exit 3), fall back to PushNotification. Routine `OK:` and `Launched:` lines do not need a push.
+- Treat `ERROR:`, `FAILED:`, `TIMEOUT:`, and `=== Done:` with non-zero failures as user-actionable — send one alert for each with `python3 ~/.claude/scripts/message/send.py --to user --need note --action "<what the user does about the failure>" --summary "<project>: <outcome>" --text "<the cause, under 200 characters>"`. On the Mac, add `--machine natedev`. On `FAILED` (exit 3), fall back to PushNotification with the same `Action: <what the user does about the failure>` first line. Routine `OK:` and `Launched:` lines do not need a push.
+- Every phone message says what the user does with `--action`, or says nothing is needed with `--no-action`. Emergency (`--need blocked`) is only for an action the user must take now.
 - When `=== Fix complete` lands, or `=== Done:` for the standalone phase the user kicked off, tell the user the run is finished and stop the monitor with TaskStop using the task id you stored.
 
 ### <StyleFixManualEvents/>

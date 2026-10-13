@@ -1,38 +1,22 @@
 #!/usr/bin/env python3
-"""Print each other top-level Claude session's name and messaging address.
+"""Print each other top-level Claude session's name and messaging socket.
 
-Top level is every live session except this session and the unit directors a showrunner
-launched. A unit director runs in a tmux session carrying UNIT_MARK (set by
-/showrunner:produce at launch); its showrunner passes messages on to it.
-
-Sessions are the live entries of ~/.claude/sessions/<pid>.json: the pid exists
-and its start time still matches procStart, so a reused pid is not counted.
+The roster selects Claude sessions that are neither workers nor unit directors
+under a showrunner. Session records provide the socket that SendMessage needs.
 """
 
 from __future__ import annotations
 
-import json
 import os
 import subprocess
 import sys
-from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TypedDict, cast
 
-SESSIONS_DIR = Path.home() / ".claude" / "sessions"
-UNIT_MARK = "SHOWRUNNER_UNIT"
+import roster
+import sessions
+
 USAGE = "usage: top_level.py"
-
-
-class Session(TypedDict, total=False):
-    pid: int
-    procStart: str
-    name: str
-    tmux: str
-    sessionId: str
-    messagingSocketPath: str
-    updatedAt: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -51,71 +35,46 @@ class UnaddressableSession:
 ForwardedSession = AddressableSession | UnaddressableSession
 
 
-def proc_start(pid: int) -> str | None:
-    """Field 22 of /proc/<pid>/stat, the start time in clock ticks; None when the pid is gone."""
-    try:
-        stat = Path(f"/proc/{pid}/stat").read_text()
-    except OSError:
-        return None
-    # The command name (field 2) may hold spaces; fields after it start past the last ")".
-    return stat.rpartition(")")[2].split()[19]
-
-
-def is_unit(tmux_target: str) -> bool:
-    pane = tmux_target.rpartition(".")[2]
-    if not pane:
-        return False
-    result = subprocess.run(["tmux", "show-environment", "-t", pane, UNIT_MARK], capture_output=True,
-                            text=True)
-    return result.returncode == 0 and result.stdout.startswith(f"{UNIT_MARK}=")
-
-
-def forwarded_sessions(sessions_dir: Path = SESSIONS_DIR, unit: Callable[[str], bool] = is_unit) -> list[ForwardedSession]:
-    # Two live processes can hold one conversation, as when it is resumed in a terminal while the
-    # desktop app still has it open. It is listed once, from the record updated last.
-    newest: dict[str, tuple[int, ForwardedSession]] = {}
-    own_id = os.environ.get("CLAUDE_CODE_SESSION_ID", "")
-    for path in sorted(sessions_dir.glob("*.json")):
-        try:
-            session = cast(Session, json.loads(path.read_text()))
-        except (OSError, json.JSONDecodeError):
+def forwarded_sessions() -> list[ForwardedSession]:
+    identity = roster.sender_identity(os.environ)
+    result = roster.roster(os.environ, roster.ThisMachine())
+    for problem in result.problems:
+        print(f"top_level: roster: {problem}", file=sys.stderr)
+    # Select the newest running record before checking its socket, as the
+    # roster does, so an older reachable process never replaces it.
+    records: dict[str, sessions.SessionRecord] = {}
+    for record in sessions.running_sessions():
+        _ = records.setdefault(record["sessionId"], record)
+    forwarded: dict[str, ForwardedSession] = {}
+    for entry in result.entries:
+        if not roster.is_top_level(entry) or roster.is_sender(entry, identity):
             continue
-        name, pid = session.get("name", ""), session.get("pid")
-        session_id = session.get("sessionId", "")
-        if not name or not session_id or session_id == own_id or pid is None or proc_start(pid) != session.get("procStart"):
+        if not isinstance(entry.session, roster.ClaudeSession):
             continue
-        tmux = session.get("tmux")
-        if tmux and unit(tmux):
-            continue
-        updated = session.get("updatedAt", 0)
-        if session_id in newest and newest[session_id][0] > updated:
-            continue
-        socket_path = session.get("messagingSocketPath")
-        if isinstance(socket_path, str) and socket_path:
-            newest[session_id] = updated, AddressableSession(name, session_id, f"uds:{socket_path}")
-        else:
-            newest[session_id] = updated, UnaddressableSession(name, session_id)
-    return sorted(
-        (session for _, session in newest.values()),
-        key=lambda session: (
-            session.name,
-            session.address if isinstance(session, AddressableSession) else "",
-            session.session_id,
-        ),
-    )
+        session_id = entry.session.session_id
+        record = records.get(session_id)
+        socket_path = (
+            record["messagingSocketPath"]
+            if record is not None and sessions.messaging_socket_exists(record) else ""
+        )
+        forwarded[session_id] = (
+            AddressableSession(entry.name, session_id, f"uds:{socket_path}")
+            if socket_path else UnaddressableSession(entry.name, session_id)
+        )
+    return sorted(forwarded.values(), key=lambda session: (
+        session.name,
+        session.address if isinstance(session, AddressableSession) else "",
+        session.session_id,
+    ))
 
 
 def main(argv: list[str]) -> int:
     if argv:
         print(USAGE, file=sys.stderr)
         return 2
-    if not os.environ.get("CLAUDE_CODE_SESSION_ID"):
-        print("top_level: CLAUDE_CODE_SESSION_ID is unset, so this session cannot be left out", file=sys.stderr)
-        return 2
-    sessions_dir = Path(os.environ.get("NOTIFIER_SESSIONS_DIR", str(Path.home() / ".claude" / "sessions")))
-    sessions = forwarded_sessions(sessions_dir)
-    recipients = [session for session in sessions if isinstance(session, AddressableSession)]
-    for session in sessions:
+    forwarded = forwarded_sessions()
+    recipients = [session for session in forwarded if isinstance(session, AddressableSession)]
+    for session in forwarded:
         if isinstance(session, UnaddressableSession):
             print(f"not reachable: {session.name} [{session.session_id}] has no messaging socket", file=sys.stderr)
     hold_script = Path(__file__).resolve().parent.parent / "build_hold" / "build_hold.py"
