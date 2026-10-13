@@ -128,6 +128,19 @@ State:
     the root is not running, keep it there and say so at your next footer.
   - **A question between productions** (a Mac window, the order of two
     promotions) goes to your parent, not to the root.
+  - **Who decides a shared resource:**
+    - a contested Mac window or build hold: the lowest showrunner whose
+      subtree holds every production that wants it. Two of your own units
+      are yours to settle; your unit and a sibling production's go to your
+      parent;
+    - the order of promotions to a shared destination: the parent of the
+      productions promoting;
+    - disk room and quota: the root, always.
+  - **Your wrap holds while a lower showrunner still runs** and reports to
+    you: its showrunner wraps first, or you detach it
+    (`showrunners.py detach <child>`). Once it runs, wrap removes your link
+    to your parent and every link to you, and tells your parent and each
+    production below you, which is a root from then on.
   - **As a root or a parent**, show the user each item a child sends in the
     child's words, and relay the answer back to that child.
   - **As a root**, never copy a lower showrunner's item into your own
@@ -1091,8 +1104,10 @@ that condition.
    --production PRODUCTION_DOC --ci-green <sha> --smoke-passed <sha>
    --close-out-done "<item>"` (repeat the last flag for every item), or pass
    `--no-ci` when CI does not apply. The command holds on an unfinished close-out item,
-   a dirty worktree, or an unmerged branch. It promotes main, retires the unit
-   worktrees and branches, removes the update instance, archives the production's
+   a dirty worktree, an unmerged branch, or a lower showrunner that still runs
+   and reports to this one (**Nested showrunners** above). It promotes main, retires the unit
+   worktrees and branches, removes the update instance, removes the
+   production's links in the showrunner tree, archives the production's
    phase notes in the vault, wraps and pushes the doc, and prints the final report.
    Leave tmux sessions for the user to close.
 </Wrap>

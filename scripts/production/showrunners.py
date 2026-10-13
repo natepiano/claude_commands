@@ -418,6 +418,33 @@ def detach(child: str) -> str:
     return parent
 
 
+class Released(NamedTuple):
+    """The edges a wrapped production left: each one's parent file is gone."""
+
+    # The production it reported to. Empty when it had none.
+    parent: str
+    # The productions that reported to it, each a root now.
+    orphans: list[str]
+
+
+def stored_children(slug: str) -> list[str]:
+    """Every production whose parent file names `slug`, whether or not that edge counts."""
+    return sorted(path.parent.name for path in SHOWRUNNER_STATE_DIR.glob(f"*/{PARENT_FILE}")
+                  if path.parent.name != slug and _stored_parent(path.parent.name) == slug)
+
+
+def release_edges(slug: str) -> Released:
+    """Remove `slug`'s parent file and every parent file that names it, so a wrap leaves no edge behind.
+
+    An edge to a wrapped production already counts for nothing; its file would come back to life if a
+    production of the same slug ran again.
+    """
+    released = Released(_stored_parent(slug), stored_children(slug))
+    for child in ([slug] if released.parent else []) + released.orphans:
+        (SHOWRUNNER_STATE_DIR / child / PARENT_FILE).unlink(missing_ok=True)
+    return released
+
+
 def tell(slug: str, key: str, text: str) -> str:
     """Send one line to the production's showrunner, and say in a few words whether it got there."""
     address = current_address(slug)
