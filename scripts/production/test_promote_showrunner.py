@@ -127,8 +127,8 @@ class PromoteShowrunnerTests(unittest.TestCase):
         self.assertEqual(pid, PID)
         return self.alive.pop(0) if len(self.alive) > 1 else self.alive[0]
 
-    def child_checked(self, _child: Production, caller: str, ending: str = "") -> str:
-        self.events.append(f"check child for {caller}, ending {ending}")
+    def child_checked(self, _child: Production, caller: str, ending: str = "", start_in: Path | None = None) -> str:
+        self.events.append(f"check child for {caller}, ending {ending}, starting in {start_in}")
         if self.child_refusal:
             raise Refusal(f"{self.child_refusal} (ending {ending})")
         return "tmux"
@@ -266,11 +266,28 @@ class PromoteShowrunnerTests(unittest.TestCase):
         child = read_production(self.child_doc)
         with (mock.patch.object(add_showrunner, "running", mock.Mock(return_value=False)),
               mock.patch.object(add_showrunner, "tmux_live", mock.Mock(return_value=True)),
+              mock.patch.object(add_showrunner, "trusted", mock.Mock(return_value=True)),
               mock.patch.object(showrunners, "descendants_of", mock.Mock(return_value=[])),
               mock.patch.object(unit_lookup, "tmux_binary", mock.Mock(return_value="tmux"))):
             self.assertEqual(ORIGINAL_CHECKED(child, "parent", ending="child"), "tmux")
             with self.assertRaisesRegex(Refusal, "a tmux session named child is already live"):
                 _ = ORIGINAL_CHECKED(child, "parent")
+
+    def test_the_childs_check_is_for_the_units_worktree_which_must_be_trusted(self) -> None:
+        code, _out, err = self.run_main("--check")
+        self.assertEqual(code, 0, err)
+        self.assertIn(f"check child for parent, ending demo, starting in {self.worktree}", self.events)
+        config = self.root / "claude.json"
+        _ = config.write_text(json.dumps({"projects": {str(self.root.resolve()): {"hasTrustDialogAccepted": True}}}))
+        child = read_production(self.child_doc)
+        with (mock.patch.dict(os.environ, {"ADD_SHOWRUNNER_CLAUDE_JSON": str(config)}),
+              mock.patch.object(add_showrunner, "running", mock.Mock(return_value=False)),
+              mock.patch.object(add_showrunner, "tmux_live", mock.Mock(return_value=False)),
+              mock.patch.object(showrunners, "descendants_of", mock.Mock(return_value=[])),
+              mock.patch.object(unit_lookup, "tmux_binary", mock.Mock(return_value="tmux"))):
+            with self.assertRaisesRegex(Refusal, f"Claude is not trusted in {self.worktree.resolve()} on the "
+                                        + "showrunner account"):
+                _ = ORIGINAL_CHECKED(child, "parent", ending="demo", start_in=self.worktree)
 
 
 if __name__ == "__main__":

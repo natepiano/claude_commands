@@ -38,7 +38,9 @@ What it does:
   login, whatever account your units use. It carries no unit mark, so it is
   never relayed to as one of your units.
 - It waits up to three minutes for the new showrunner to register its update
-  timer, then attaches it to your production and tells it so. A resumed
+  timer, then attaches it to your production and tells it so. Session records
+  that cannot be read for a moment are read again until the three minutes
+  end. A resumed
   showrunner that already reports to you is left as it is.
 - `check` runs every refusal below and starts nothing.
 
@@ -51,7 +53,13 @@ It refuses, and starts nothing, when:
 - the production is your own, or one you report to, directly or through
   others;
 - this session runs no production;
-- there is no tmux, or the session records cannot be read.
+- there is no tmux, or the session records cannot be read;
+- Claude is not trusted, on the showrunner account, in the folder the session
+  starts in: the doc's checkout, or the folder `resume` names. A trusted
+  parent folder does not count; the folder, its repository, or the main
+  checkout of a worktree must be trusted. The user trusts it first, by
+  running `claude` there once and accepting. A showrunner never answers a
+  trust prompt (live check, 2026-10-13: a child sat on it for the whole wait).
 
 If the session starts and no showrunner appears in time, the command says so,
 exits 1 and leaves the session running. Look at it with `tmux attach -t
