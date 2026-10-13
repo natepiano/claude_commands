@@ -229,7 +229,7 @@ The user, 2026-10-12: "Let's trial post master to see if it works". Scope is sec
 
 **Ruled out:** running the live start-up in this phase (the session loads the mod from `~/.claude/mods/postmaster` on main, so it waits for this checkpoint there).
 
-### Phase 8 — Restart finds a session's tmux pane and tmux session after a rename  · status: todo
+### Phase 8 — Restart finds a session's tmux pane and tmux session after a rename  · status: done
 
 #### Work Order
 
