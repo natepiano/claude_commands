@@ -630,7 +630,7 @@ After a seat launch's own turn has ended, a move to the selected seats home that
 
 **Ruled out:** refusing a launch when no reading exists (a missing reading is not a refusal); a minimum room threshold (1% left is room); picking on a showrunner resume (a resume keeps its account); any role tying a kind of session to an account.
 
-### Phase 15 — Codex seats move on a refusal  · status: todo
+### Phase 15 — Codex seats move on a refusal  · status: done
 
 #### Work Order
 

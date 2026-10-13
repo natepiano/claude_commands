@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import io
+import base64
 import json
 import os
 import subprocess
@@ -120,6 +121,10 @@ class QuotaAlertTests(unittest.TestCase):
         del environment_context
         (self.root / ".claude").mkdir()
         _ = (self.root / ".claude.json").write_text(json.dumps({"oauthAccount": {"emailAddress": "someone@example.com"}}))
+        codex_home = self.root / ".codex"
+        codex_home.mkdir()
+        claims = base64.urlsafe_b64encode(json.dumps({"email": "someone@example.com"}).encode()).decode().rstrip("=")
+        _ = (codex_home / "auth.json").write_text(json.dumps({"tokens": {"id_token": f"header.{claims}.signature"}}))
         _ = self.enterContext(mock.patch.object(note_file, "AGENTS_DIR", self.root))
         _ = self.enterContext(mock.patch.object(agent_notes, "READINGS_LOG", self.root / "readings.jsonl"))
         config = self.root / "showrunners.json"
@@ -474,7 +479,7 @@ class QuotaAlertTests(unittest.TestCase):
         roles = accounts.claude_account_selection()
         with mock.patch.object(accounts, "claude_account_selection", side_effect=AssertionError("roles resolved twice")):
             lines = self.block([note], self.now, selection=roles)
-        self.assertEqual(lines[0], "switched to claude for codex 1: delegate, fix")
+        self.assertIn("switched to claude for codex 1: delegate, fix", lines)
         self.assertEqual((len(self.sent), len(self.pushed)), (2, 1))
 
     def test_claude_recovery_names_only_the_recovered_account(self) -> None:
@@ -921,7 +926,8 @@ class QuotaAlertTests(unittest.TestCase):
 
     def refuse(self) -> str:
         """Codex refused work for quota while codex 1 is out of its week; the first log line."""
-        return self.block([self.note("codex 1.md", "active", "0")], self.now)[0]
+        return next(line for line in self.block([self.note("codex 1.md", "active", "0")], self.now)
+                    if line.startswith(("switched to claude", "switch to claude")))
 
     def test_codex_reaching_the_threshold_switches_nothing_and_says_to_keep_delegating(self) -> None:
         log = self.alert([self.note("codex 1.md", "active", "0")], self.now)
@@ -959,7 +965,7 @@ class QuotaAlertTests(unittest.TestCase):
         self.pushed.clear()
         later = self.now + timedelta(minutes=5)
         log = self.block(notes, later)
-        self.assertEqual(log, ["switched to claude for codex 1: delegate, fix",
+        self.assertEqual([line for line in log if not line.startswith("no codex account has room")], ["switched to claude for codex 1: delegate, fix",
                                "quota refusal codex 1 -> natedev: sent", "quota refusal codex 1 -> boss of bosses: sent",
                                "quota refusal codex 1 -> user: sent"])
         self.assertEqual([recipient for recipient, _ in self.sent], ["natedev", "boss of bosses"])
@@ -968,7 +974,8 @@ class QuotaAlertTests(unittest.TestCase):
         self.assertIn("No credit balance is reported for codex 1.", self.pushed[0][1])
         self.assertIn("The automatic switch moved work from Codex to Claude", self.pushed[0][1])
         self.sent.clear()
-        self.assertEqual(self.block(notes, later + timedelta(minutes=1)),
+        self.assertEqual([line for line in self.block(notes, later + timedelta(minutes=1))
+                          if not line.startswith("no codex account has room")],
                          ["codex 1 refused work for quota; assignments already use Claude"])
         self.assertEqual(self.sent, [])
         self.assertEqual(len(self.pushed), 1)
@@ -998,7 +1005,7 @@ class QuotaAlertTests(unittest.TestCase):
                              "switched to claude for codex 1: delegate, fix")
 
         log = self.block([note], self.now + timedelta(minutes=1))
-        self.assertEqual(log, ["codex 1 refused work for quota; assignments already use Claude",
+        self.assertEqual([line for line in log if not line.startswith("no codex account has room")], ["codex 1 refused work for quota; assignments already use Claude",
                                "quota refusal codex 1 -> natedev: sent", "quota refusal codex 1 -> boss of bosses: sent",
                                "quota refusal codex 1 -> user: sent"])
         self.assertIn("The automatic switch had already moved work from Codex to Claude", self.pushed[0][1])
@@ -1011,25 +1018,23 @@ class QuotaAlertTests(unittest.TestCase):
         _ = self.alert(notes, self.now)
         self.pushed.clear()
         log = self.block(notes, self.now + timedelta(minutes=1))
-        self.assertEqual(log, ["switch to claude for codex 1: nothing was on codex",
+        self.assertEqual([line for line in log if not line.startswith("no codex account has room")], ["switch to claude for codex 1: nothing was on codex",
                                "quota refusal codex 1 -> natedev: sent", "quota refusal codex 1 -> boss of bosses: sent",
                                "quota refusal codex 1 -> user: sent"])
         self.assertIn("Nothing was on Codex, so the automatic switch moved nothing", self.pushed[0][1])
 
-    def test_a_refusal_above_the_threshold_moves_nothing(self) -> None:
+    def test_a_refusal_above_weekly_threshold_still_uses_fallback_when_no_codex_has_room(self) -> None:
         log = self.block([self.note("codex 1.md", "active", "24")], self.now)
-        self.assertEqual(len(log), 1)
-        self.assertIn("nothing switched", log[0])
-        self.assertEqual(self.assignments()["delegate"], "codex")
-        self.assertEqual(self.sent, [])
-        self.assertEqual(self.pushed, [])
+        self.assertTrue(any("switched to claude" in line for line in log), log)
+        self.assertEqual(self.assignments()["delegate"], "claude")
+        self.assertEqual(len(self.sent), 2)
+        self.assertEqual(len(self.pushed), 1)
         with quota_alert.state_file() as state:
             self.assertEqual(state["episodes"], {})
-        self.assertIsNone(quota_alert.notice(lambda: "natedev"))
 
     def test_a_refusal_before_the_first_alert_or_after_an_acknowledgement_still_switches(self) -> None:
         notes: Notes = [self.note("codex 1.md", "active", "0")]
-        self.assertEqual(self.block(notes, self.now)[0], "switched to claude for codex 1: delegate, fix")
+        self.assertIn("switched to claude for codex 1: delegate, fix", self.block(notes, self.now))
         self.assertEqual(len(self.sent), 2)
         _ = self.alert([self.note("codex 1.md", "active", "100")], self.now + timedelta(minutes=2))
         self.assertEqual(self.assignments()["delegate"], "codex")
@@ -1037,7 +1042,7 @@ class QuotaAlertTests(unittest.TestCase):
         _ = quota_alert.acknowledge("", "natedev", self.now + timedelta(minutes=5))
         self.sent.clear()
         log = self.block(notes, self.now + timedelta(minutes=6))
-        self.assertEqual(log[0], "switched to claude for codex 1: delegate, fix")
+        self.assertIn("switched to claude for codex 1: delegate, fix", log)
         self.assertEqual([recipient for recipient, _ in self.sent], ["natedev", "boss of bosses"])
 
     def test_a_codex_alert_shows_the_credit_balance_or_says_none_is_reported(self) -> None:
@@ -1081,7 +1086,7 @@ class QuotaAlertTests(unittest.TestCase):
         _ = self.alert(notes, self.now)
         self.pushed.clear()
         log = self.block(notes, self.now)
-        self.assertTrue(log[0].startswith("switch to claude for codex 1 failed: ERROR: [delegate.impl] effort 'ultra'"))
+        self.assertTrue(any(line.startswith("switch to claude for codex 1 failed: ERROR: [delegate.impl] effort 'ultra'") for line in log))
         self.assertIn("quota refusal codex 1 -> user: sent", log)
         self.assertEqual(self.pushed[0][0::2], ("Codex work needs usage or credits", quota_alert.Ask("decision", REFUSAL_ACTION)))
         self.assertIn("The automatic switch to Claude failed: ERROR: [delegate.impl] effort 'ultra'", self.pushed[0][1])

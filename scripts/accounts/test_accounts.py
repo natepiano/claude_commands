@@ -2561,14 +2561,14 @@ class PickerTests(unittest.TestCase):
         self.assert_picked("claude 3")
 
     def test_stored_reading_adapter_returns_fresh_stale_and_missing_states(self) -> None:
-        self.assertIsInstance(accounts.stored_reading("claude", "third@example.invalid", self.now), accounts.FreshReading)
-        self.assertIsInstance(accounts.stored_reading("claude", "unknown@example.invalid", self.now), accounts.NoReading)
+        self.assertIsInstance(refusals.stored_reading("claude", "third@example.invalid", self.now), accounts.FreshReading)
+        self.assertIsInstance(refusals.stored_reading("claude", "unknown@example.invalid", self.now), accounts.NoReading)
         self.reading("Claude", "third@example.invalid", 1, 2, age=timedelta(minutes=11))
-        self.assertIsInstance(accounts.stored_reading("claude", "third@example.invalid", self.now), accounts.StaleReading)
+        self.assertIsInstance(refusals.stored_reading("claude", "third@example.invalid", self.now), accounts.StaleReading)
 
     def test_stored_reading_adapter_represents_missing_reset_by_name(self) -> None:
         self.reading("Claude", "third@example.invalid", 1, 2, reset=False, five=False)
-        reading = accounts.stored_reading("claude", "third@example.invalid", self.now)
+        reading = refusals.stored_reading("claude", "third@example.invalid", self.now)
         self.assertIsInstance(reading, accounts.FreshReading)
         assert isinstance(reading, accounts.FreshReading)
         self.assertIsInstance(reading.weekly.reset, refusals.NoResetKnown)

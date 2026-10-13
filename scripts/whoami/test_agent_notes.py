@@ -30,7 +30,7 @@ from agent_accounts import (ClaudeDirectorySource, CodexHomeSource, CodexRateLim
                             codex_credits, reset_credits)
 from agent_notes import apply, local_reset
 from note_file import Note, read_note
-from scripts.accounts import accounts
+from scripts.accounts import accounts, refusals
 
 
 class AgentNotesTests(unittest.TestCase):
@@ -141,6 +141,17 @@ class AgentNotesTests(unittest.TestCase):
             self.assertEqual(passes[0].seats.home, default)
             self.assertEqual([reading.home for reading in passes[0].checked_homes], [default, spare])
             self.assertTrue(all(reading.observed_at.tzinfo is not None for reading in passes[0].checked_homes))
+
+    def test_blocked_cli_passes_explicit_window_and_aware_refusal_time(self) -> None:
+        refused_at = self.now - timedelta(seconds=3)
+        with (patch.object(sys, "argv", ["agent_notes.py", "blocked", str(self.root / ".codex"),
+                  "seats@example.invalid", "codex 1", "--window", "five_hour", "--refused-at", refused_at.isoformat()]),
+              patch.object(agent_notes, "blocked", return_value=[]) as blocked,
+              patch.object(note_file, "read_notes", return_value=[])):
+            agent_notes.main()
+        blocked.assert_called_once()
+        self.assertEqual(blocked.call_args.kwargs["window"], refusals.KnownWindow("five_hour"))
+        self.assertEqual(blocked.call_args.kwargs["refused_at"], refused_at)
 
     def test_update_writes_each_codex_home_and_keeps_only_the_seats_note_active(self) -> None:
         default = self.root / ".codex"

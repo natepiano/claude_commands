@@ -1202,32 +1202,6 @@ class NoAccountWithRoom:
     reasons: tuple[PickReason, ...]
 
 
-def _reading_window(window: usage_store.StoredWindow) -> ReadingWindow:
-    at = datetime.fromisoformat(window["at"])
-    if at.tzinfo is None or not math.isfinite(window["left"]):
-        raise ValueError("invalid usage reading")
-    reset = NoResetKnown() if not window["resets"] else KnownReset(datetime.fromisoformat(window["resets"]))
-    if isinstance(reset, KnownReset) and reset.at.tzinfo is None:
-        raise ValueError("reset time needs an offset")
-    return ReadingWindow(window["left"], reset, at)
-
-
-def stored_reading(tool: Literal["claude", "codex"], login: str, now: datetime) -> FreshReading | StaleReading | NoReading:
-    """Convert optional saved windows at the boundary into named reading states."""
-    held = usage_store.load().get(usage_store.key(tool.capitalize(), login))
-    if held is None or "weekly" not in held:
-        return NoReading()
-    try:
-        weekly = _reading_window(held["weekly"])
-        five = _reading_window(held["five_hour"]) if "five_hour" in held else NoWindow()
-        if now - weekly.at > timedelta(minutes=10) or weekly.at > now:
-            return StaleReading(weekly, five)
-        credits = held["credits"]["balance"] if "credits" in held else ""
-        return FreshReading(weekly, five, credits)
-    except (ValueError, TypeError):
-        return NoReading()
-
-
 def _codex_reading_can_work(reading: FreshReading, now: datetime) -> bool:
     """Use Codex's shared allowance and credit rule through its report boundary."""
     def quota(window: ReadingWindow, label: str) -> agent_accounts.Quota:
@@ -1278,7 +1252,7 @@ def pick(tool: Literal["claude", "codex"], now: datetime, *, exclude: frozenset[
         if label in exclude or login.casefold() in seen:
             continue
         seen.add(login.casefold())
-        reading = stored_reading(tool, login, now)
+        reading = refusals.stored_reading(tool, login, now)
         any_fresh = any_fresh or isinstance(reading, FreshReading)
         weekly: ReadingWindow | NoWindow = reading.weekly if isinstance(reading, (FreshReading, StaleReading)) else NoWindow()
         five: ReadingWindow | NoWindow = reading.five_hour if isinstance(reading, (FreshReading, StaleReading)) else NoWindow()

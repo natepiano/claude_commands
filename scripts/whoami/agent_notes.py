@@ -15,6 +15,7 @@ as the timer left them and hands them to quota_alert.blocked().
 
 from __future__ import annotations
 
+import argparse
 import asyncio
 import json
 import math
@@ -32,6 +33,7 @@ import five_hour
 import note_file
 from note_file import FIELD, Note, reset_time
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from scripts.accounts import refusals
 from scripts.whoami.agent_accounts import KnownCodexAccount, UnknownCodexAccount
 from agent_accounts import (ClaudeAccountsInUse, ClaudeDirectorySource, CodexHomeSource, EASTERN, Report,
                             codex_home_display, codex_homes,
@@ -330,16 +332,37 @@ def mark_tier(plan: codex_pacer.Plan) -> None:
             _ = set_fields(note, {"tier": ("fast" if called == "fast" else "regular") if active else "null"}, stamp)
 
 
+class RefusalCommandLine(argparse.Namespace):
+    identity: list[str] = []
+    window: str = "unknown"
+    refused_at: str = ""
+
+
 def main() -> None:
     if sys.argv[1:2] == ["blocked"]:
-        arguments = sys.argv[2:]
+        parser = argparse.ArgumentParser(prog="agent_notes.py blocked")
+        _ = parser.add_argument("identity", nargs="+", metavar="HOME LOGIN LABEL | HOME REASON")
+        _ = parser.add_argument("--window", choices=("weekly", "five_hour", "unknown"), default="unknown")
+        _ = parser.add_argument("--refused-at", default="", metavar="AWARE_ISO_TIME")
+        parsed = parser.parse_args(sys.argv[2:], namespace=RefusalCommandLine())
+        arguments = parsed.identity
         if len(arguments) == 3:
             identity = KnownCodexAccount(Path(arguments[0]), arguments[1], arguments[2])
         elif len(arguments) == 2:
             identity = UnknownCodexAccount(Path(arguments[0]), arguments[1])
         else:
-            sys.exit("usage: agent_notes.py blocked HOME LOGIN LABEL | blocked HOME REASON")
-        for line in blocked(list(note_file.read_notes()), identity):
+            parser.error("expected HOME LOGIN LABEL or HOME REASON")
+        refused_at = None
+        if parsed.refused_at:
+            try:
+                refused_at = datetime.fromisoformat(parsed.refused_at)
+            except ValueError:
+                parser.error("--refused-at needs an aware ISO time")
+            if refused_at.tzinfo is None:
+                parser.error("--refused-at needs an aware ISO time")
+        window = (refusals.KnownWindow("weekly") if parsed.window == "weekly" else
+                  refusals.KnownWindow("five_hour") if parsed.window == "five_hour" else refusals.UnknownWindow())
+        for line in blocked(list(note_file.read_notes()), identity, window=window, refused_at=refused_at):
             print(line)
         return
     if sys.argv[1:] not in ([], ["refresh"]):
