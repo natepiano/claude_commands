@@ -16,6 +16,7 @@ from datetime import UTC, date, datetime, timedelta
 from typing import cast
 
 import ci
+import holds
 import disk
 import memory
 import sync
@@ -1447,7 +1448,7 @@ def lead_block(connection: sqlite3.Connection, day: str, calls: Sequence[Reporte
     """The day's routing, waits, failures and saved work, before the tables."""
     start, end = day_range(day)
     share = usable_share(connection, start, end)
-    lines: list[str] = []
+    lines = holds.now_lines(holds.read_current_holds())
     if share.candidates:
         lines.append(f"Mac when usable: {share.finished} of {share.candidates} candidates finished there ({share.finished / share.candidates:.0%}).")
     measured_rows = [(row.measurements.longest.seconds, row.name) for row in waits.rows
@@ -1474,9 +1475,10 @@ def lead_block(connection: sqlite3.Connection, day: str, calls: Sequence[Reporte
     candidates = [call for call in calls if call.on_report_day and call.candidate]
     if candidates:
         latest = candidates[-1]
-        if isinstance(latest.offload, OffloadDeclined) and latest.offload.reason in ('blocked', 'backoff', 'unreachable'):
-            state = 'blocked' if latest.offload.reason == 'blocked' else 'unreachable'
-            lines.append(f"Mac {state} as of {latest.started_at.astimezone(user_zone()).strftime('%H:%M')}")
+        if isinstance(latest.offload, OffloadDeclined) and latest.offload.reason in ('backoff', 'unreachable'):
+            instant = latest.started_at.astimezone(user_zone())
+            shown = instant.strftime('%H:%M' if day == datetime.now(user_zone()).date().isoformat() else '%Y-%m-%d %H:%M %Z')
+            lines.append(f"Mac unreachable as of {shown}")
     return [*lines, ""] if lines else []
 
 

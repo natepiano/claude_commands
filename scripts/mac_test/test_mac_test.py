@@ -5,11 +5,14 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 import json
+import fcntl
+import socket
 import os
 import subprocess
 import sys
 import tempfile
 import time
+import threading
 import unittest
 from pathlib import Path
 from typing import NotRequired, TypedDict, cast, final, override
@@ -231,6 +234,16 @@ print(root / "session.sock")
 '''
 
 
+class HoldEventRecord(TypedDict):
+    target: str
+    event: str
+    hold_key: str
+    holder: str
+    reason: str
+    at: str
+    until: str
+
+
 @final
 class MacTestCommandTests(unittest.TestCase):
     def __init__(self, methodName: str = "runTest") -> None:
@@ -284,6 +297,9 @@ class MacTestCommandTests(unittest.TestCase):
             "MAC_TEST_STUB_DIR": str(self.stub_directory),
             "MAC_TEST_WATCH_INTERVAL_S": "0.05",
             "TZ": "America/New_York",
+            "USER_ZONE": "America/New_York",
+            "BUILDLOG_DIR": str(self.root / "buildlog"),
+            "NOTIFIER_SESSIONS_DIR": str(self.root / "sessions"),
             "BUILD_HOLD_DIR": str(self.root / "holders"),
             "BUILD_HOLD_RELEASE_DIR": str(self.root / "release"),
             "PLAN_DELEGATE_ACTIVE_DIR": str(self.root / "active"),
@@ -732,6 +748,145 @@ class MacTestCommandTests(unittest.TestCase):
         self.assert_command(result, 12, f"state unreadable: {block_path}\n")
         self.assertFalse((self.state_directory / "run.json").exists())
 
+    def hold_events(self, expected: int = 1) -> list[HoldEventRecord]:
+        deadline = time.monotonic() + 5
+        while True:
+            rows = [cast(HoldEventRecord, json.loads(line))
+                    for path in (self.root / "buildlog").rglob("*.jsonl")
+                    for line in path.read_text().splitlines()]
+            if len(rows) >= expected or time.monotonic() >= deadline:
+                return sorted(rows, key=lambda row: (row["at"], row["event"] != "began"))
+            time.sleep(0.01)
+
+    def test_locked_log_does_not_delay_block_or_keep_coordination_locks(self) -> None:
+        self.write_config(ci_repo="")
+        log = self.root / "buildlog" / socket.gethostname().split(".")[0] / f"{datetime.now(timezone.utc):%Y-%m}.jsonl"
+        log.parent.mkdir(parents=True)
+        with log.open("a+") as held_log:
+            fcntl.flock(held_log, fcntl.LOCK_EX)
+            try:
+                result = self.command("block", "--holder", "alice", "--for", "rendering", timeout=1.5)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                block = self.block_state()
+                for name in ("state.lock", "control.lock"):
+                    with (self.state_directory / name).open("a+") as coordination:
+                        fcntl.flock(coordination, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                        fcntl.flock(coordination, fcntl.LOCK_UN)
+                self.assertEqual(log.read_text(), "")
+            finally:
+                fcntl.flock(held_log, fcntl.LOCK_UN)
+        self.assertEqual([(row["event"], row["hold_key"]) for row in self.hold_events()],
+                         [("began", block["since"])])
+
+    def test_recorder_waits_for_both_locks_to_close_and_reaps_finished_child(self) -> None:
+        _ = self.write_block(free_message={"kind": "not_needed"})
+        paths = mac_test.StatePaths(self.state_directory)
+        block = mac_test.read_claim_block(paths)
+        assert not isinstance(block, mac_test.NoMacBlock)
+        launched: list[subprocess.Popen[bytes]] = []
+        real_popen = subprocess.Popen
+
+        def launch(command: list[str], *, stdin: int, stdout: int, stderr: int,
+                   start_new_session: bool, close_fds: bool) -> subprocess.Popen[bytes]:
+            for path in (paths.lock, paths.control_lock):
+                with path.open("a+") as lock:
+                    fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    fcntl.flock(lock, fcntl.LOCK_UN)
+            self.assertTrue(start_new_session)
+            self.assertTrue(close_fds)
+            process = real_popen(command, stdin=stdin, stdout=stdout, stderr=stderr,
+                                 start_new_session=start_new_session, close_fds=close_fds)
+            launched.append(process)
+            return process
+
+        with mock.patch.dict(os.environ, self.environment), mock.patch.object(subprocess, "Popen", side_effect=launch):
+            with mac_test.locked(paths.control_lock):
+                with mac_test.locked(paths.lock):
+                    mac_test.record_hold_event("began", block, datetime.now(timezone.utc))
+                    self.assertEqual(launched, [])
+                self.assertEqual(launched, [])
+            for thread in threading.enumerate():
+                if thread.name == "hold-event-recorder":
+                    thread.join(timeout=5)
+                    self.assertFalse(thread.is_alive())
+        self.assertEqual(len(launched), 1)
+        self.assertEqual(launched[0].returncode, 0)
+        with self.assertRaises(ChildProcessError):
+            _ = os.waitpid(launched[0].pid, os.WNOHANG)
+        self.assertEqual(len(self.hold_events()), 1)
+
+    def test_blocks_within_one_second_have_distinct_since_keys_and_ordered_events(self) -> None:
+        self.write_config(ci_repo="")
+        source = """
+import sys
+from datetime import datetime, timedelta, timezone
+sys.path.insert(0, sys.argv[1])
+import mac_test
+
+class Clock(datetime):
+    tick: int = 0
+
+    @classmethod
+    def now(cls, tz: object = None) -> datetime:
+        cls.tick += 1
+        return datetime(2026, 10, 13, 12, tzinfo=timezone.utc) + timedelta(microseconds=cls.tick)
+
+mac_test.datetime = Clock
+for arguments in (
+    ["block", "--holder", "alice", "--for", "first block"],
+    ["unblock", "--holder", "alice"],
+    ["block", "--holder", "alice", "--for", "second block"],
+):
+    sys.argv = ["mac_test.py", *arguments]
+    assert mac_test.main() == 0
+"""
+        result = subprocess.run([sys.executable, "-c", source, str(SCRIPT.parent)],
+                                env=self.environment, capture_output=True, text=True, timeout=5, check=False)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        rows = self.hold_events(3)
+        self.assertEqual([row["event"] for row in rows], ["began", "ended", "began"])
+        self.assertEqual(rows[0]["hold_key"], rows[1]["hold_key"])
+        self.assertNotEqual(rows[0]["hold_key"], rows[2]["hold_key"])
+        self.assertEqual(rows[2]["hold_key"], self.block_state()["since"])
+        self.assertLess(rows[1]["at"], rows[2]["at"])
+        self.assertEqual(rows[0]["at"][:19], rows[2]["at"][:19])
+
+
+    def test_repeated_block_records_one_begin_and_unblock_records_one_end_with_since_key(self) -> None:
+        first = self.command("block", "--holder", "alice", "--for", "rendering")
+        self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
+        initial = self.block_state()
+        renewed = self.command("block", "--holder", "alice", "--for", "more rendering", "--hours", "5")
+        self.assertEqual(renewed.returncode, 0, renewed.stdout + renewed.stderr)
+        self.assertEqual(len(self.hold_events()), 1)
+        self.assertEqual(self.block_state()["since"], initial["since"])
+        result = self.command("unblock", "--holder", "alice")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        rows = self.hold_events(2)
+        self.assertEqual([(row["event"], row["target"], row["hold_key"]) for row in rows],
+                         [("began", "mac", initial["since"]), ("ended", "mac", initial["since"])])
+        self.assertEqual(rows[0]["reason"], "rendering")
+        self.assertEqual(rows[0]["until"], initial["expires"])
+        self.assertEqual(rows[1]["reason"], "more rendering")
+        self.assertFalse((self.state_directory / "block.json").exists())
+        self.assertTrue(all(datetime.fromisoformat(row["at"].replace("Z", "+00:00")).utcoffset() == timedelta(0)
+                            for row in rows))
+        _ = self.command("unblock", "--holder", "alice")
+        self.assertEqual(len(self.hold_events(2)), 2)
+
+    def test_pending_block_records_begin_before_it_becomes_active(self) -> None:
+        result = self.command("claim", "--pid", str(os.getpid()), "--what", "local tests", "--worktree", str(self.root))
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        blocked = self.command("block", "--holder", "alice", "--for", "rendering")
+        self.assertEqual(blocked.returncode, 0, blocked.stdout + blocked.stderr)
+        block = self.block_state()
+        self.assertEqual(block["state"], "pending")
+        self.assertEqual([(row["event"], row["hold_key"]) for row in self.hold_events()], [("began", block["since"])])
+        _ = self.command("release", "--pid", str(os.getpid()))
+        _ = self.command("status")
+        self.assertEqual(self.block_state()["state"], "active")
+        self.assertEqual(len(self.hold_events()), 1)
+
     def test_block_records_state_and_turns_the_switch_off(self) -> None:
         environment = {**self.environment, "CLAUDE_CODE_SESSION_ID": "session-123"}
         result = self.command(
@@ -943,6 +1098,7 @@ class MacTestCommandTests(unittest.TestCase):
             + "(permission denied). Run github-warmup, then unblock again.\n",
         )
         self.assertEqual(self.block_state(), block)
+        self.assertEqual([(row["event"], row["hold_key"]) for row in self.hold_events()], [("began", block["since"])])
 
     def test_expired_block_restores_switch_and_messages_both_recipients(self) -> None:
         now = datetime.now(timezone.utc)
@@ -958,6 +1114,7 @@ class MacTestCommandTests(unittest.TestCase):
         result = self.command("status")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertFalse((self.state_directory / "block.json").exists())
+        self.assertEqual([(row["event"], row["hold_key"]) for row in self.hold_events()], [("ended", block["since"])])
         self.assertEqual(self.gh_calls("variable set"), 1)
         deliveries = self.logged_arguments("send-delivered")
         self.assertEqual(len(deliveries), 2)
@@ -985,6 +1142,7 @@ class MacTestCommandTests(unittest.TestCase):
         result = self.command("status")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual(self.block_state(), block)
+        self.assertEqual(self.hold_events(0), [])
         deliveries = self.logged_arguments("send-delivered")
         self.assertEqual([call[1] for call in deliveries], ["alice", "showrunner-one"])
         for delivery in deliveries:

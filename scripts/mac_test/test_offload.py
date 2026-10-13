@@ -75,6 +75,7 @@ class WireResult(TypedDict):
     mac: str
     reason: str
     seconds: str
+    holder: NotRequired[str]
 
 
 class RemoteClaimRecord(TypedDict):
@@ -436,6 +437,32 @@ class OffloadSettingsTests(unittest.TestCase):
 
 
 @final
+class BusyHolderTests(unittest.TestCase):
+    def test_busy_claim_line_keeps_the_job_and_kept_claim_description(self) -> None:
+        for what in ("cargo nextest -p hana", "leftovers of cargo test on prior-mac", "job since last week"):
+            with self.subTest(what=what):
+                self.assertEqual(offload.claim_holder(f"busy: {what} since 13:05\n"), offload.KnownMacJob(what))
+
+    def test_busy_claim_without_the_expected_line_has_unreadable_holder(self) -> None:
+        for line in ("", "busy", "busy: task", "busy: task since yesterday", "busy: task since 13:05\nextra"):
+            with self.subTest(line=line):
+                self.assertIsInstance(offload.claim_holder(line), offload.UnreadableMacHolder)
+
+    def test_only_busy_results_write_the_holder_line(self) -> None:
+        with tempfile.TemporaryDirectory() as scratch:
+            path = Path(scratch) / "result"
+            for holder, expected in ((offload.KnownMacJob("render checks"), "render checks"),
+                                     (offload.LostRunLeftovers(), "leftovers"),
+                                     (offload.UnreadableMacHolder(), "unreadable")):
+                with self.subTest(holder=expected), redirect_stdout(io.StringIO()):
+                    self.assertEqual(offload.write_result(offload.BusyMacDecline(holder, 0.25), offload.ResultFile(path)), 75)
+                    self.assertIn(f"holder={expected}\n", path.read_text())
+            with redirect_stdout(io.StringIO()):
+                _ = offload.write_result(offload.PassedOnMac(0.5), offload.ResultFile(path))
+            self.assertNotIn("holder=", path.read_text())
+
+
+@final
 class OffloadCommandTests(unittest.TestCase):
     def __init__(self, methodName: str = "runTest") -> None:
         super().__init__(methodName)
@@ -547,6 +574,8 @@ class OffloadCommandTests(unittest.TestCase):
             "MAC_TEST_STUB_DIR": str(self.stub_directory),
             "MAC_TEST_REAL_STATE": str(STATE_SCRIPT),
             "BUILD_HOLD_DIR": str(self.root / "holders"),
+            "BUILDLOG_DIR": str(self.root / "buildlog"),
+            "NOTIFIER_SESSIONS_DIR": str(self.root / "sessions"),
             "BUILD_HOLD_RELEASE_DIR": str(self.root / "release"),
             "PLAN_DELEGATE_ACTIVE_DIR": str(self.root / "active"),
             "BUILDLOG_CALL_ID": "", "BUILDLOG_CALLER": "",
@@ -693,15 +722,14 @@ class OffloadCommandTests(unittest.TestCase):
 
     def wire_result(self) -> WireResult:
         lines = self.result_path.read_text(encoding="utf-8").splitlines()
-        self.assertEqual(len(lines), 3)
         values = dict(line.split("=", 1) for line in lines)
-        self.assertEqual(set(values), {"mac", "reason", "seconds"})
+        expected = {"mac", "reason", "seconds"}
+        if values["mac"] == "declined" and values["reason"] == "busy":
+            expected.add("holder")
+        self.assertEqual(set(values), expected)
+        self.assertEqual(len(lines), len(expected))
         _ = float(values["seconds"])
-        return {
-            "mac": values["mac"],
-            "reason": values["reason"],
-            "seconds": values["seconds"],
-        }
+        return cast(WireResult, cast(object, values))
 
     def assert_wire(self, mac: str, reason: str) -> None:
         values = self.wire_result()
@@ -984,6 +1012,7 @@ class OffloadCommandTests(unittest.TestCase):
         self.assertTrue(busy.stdout.endswith("mac_test: not running on the Mac (busy)\n"), busy.stdout)
         self.assertIn("busy", busy.stdout)
         self.assert_wire("declined", "busy")
+        self.assertEqual(self.wire_result().get("holder"), "other tests")
         self.assertTrue((self.state_directory / "run.json").exists())
         self.assertEqual(self.events(), [])
         released = self.state_command("release", "--pid", str(os.getpid()))
@@ -1028,6 +1057,7 @@ class OffloadCommandTests(unittest.TestCase):
         self.assertEqual(repeated.returncode, first.returncode)
         self.assertEqual(self.wire_result()["mac"], first_wire["mac"])
         self.assertEqual(self.wire_result()["reason"], first_wire["reason"])
+        self.assertEqual(self.wire_result().get("holder"), "other tests")
         self.assertEqual(self.events(), [])
         self.assertTrue((self.state_directory / "run.json").exists())
 
@@ -1536,6 +1566,7 @@ class OffloadCommandTests(unittest.TestCase):
         self.assertEqual(result.returncode, 75, result.stdout + result.stderr)
         self.assertEqual(result.stdout, "mac_test: not running on the Mac (busy)\n")
         self.assert_wire("declined", "busy")
+        self.assertEqual(self.wire_result().get("holder"), "leftovers")
         self.assert_leftover_diagnostic(result.stderr, "remaining")
         self.assert_claim_is_kept("previous-mac")
         self.assertEqual(self.remote_claim()["what"], old["what"])
@@ -1554,6 +1585,7 @@ class OffloadCommandTests(unittest.TestCase):
                 _ = process.communicate(timeout=5)
         self.assertEqual(process.returncode, 75, output)
         self.assert_wire("declined", "busy")
+        self.assertEqual(self.wire_result().get("holder"), "leftovers")
         self.assertTrue((self.state_directory / "run.json").exists())
         self.assertEqual((self.stub_directory / "state-events").read_text().splitlines(), ["claim", "release", "claim"])
         self.assertEqual(len(self.events()), 1)

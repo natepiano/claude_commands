@@ -16,9 +16,9 @@ every message follows are /message (~/.claude/commands/message.md).
   send.py retire --to ADDRESS --from SENDER --key KEY
                           remove obsolete queued messages for ADDRESS
 
-Delivery. The session-to-session channel is a tool, not a command, so a Claude
-recipient is reached through a headless `claude -p` relay whose one job is a
-SendMessage call. It runs sonnet in auto mode (haiku cannot run in auto mode),
+Delivery. A Claude recipient is tried through the postmaster outbox first when
+its heartbeat is fresh. Every path without confirmed delivery falls back to a
+headless `claude -p` relay whose one job is a SendMessage call. It runs sonnet in auto mode (haiku cannot run in auto mode),
 with hooks, MCP and slash commands off and the caller's CLAUDE_* variables
 removed, so it never passes for the session that ran this. It is named --from,
 which is the sender name the recipient sees. Delivery is read from the
@@ -67,6 +67,7 @@ import signal
 import socket
 import subprocess
 import sys
+import time
 from collections.abc import Generator
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -77,6 +78,7 @@ from typing import Literal, NamedTuple, NoReturn, NotRequired, TypedDict, cast
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "notify"))
 import sessions  # noqa: E402
+import postmaster  # noqa: E402
 import codex_daemon  # noqa: E402
 import roster  # noqa: E402
 from user_action import (FIX, REFUSED_BEFORE_SENDING, ActionRefused, ActionRequired, ActionUnstated,
@@ -102,7 +104,10 @@ CHANNEL_PRIORITY: dict[Need, str] = {"note": "0", "decision": "1", "blocked": "2
 EXIT: dict[Outcome, int] = {"sent": 0, "skipped": 0, "queued": 1, "failed": 3, "refused": 2}
 
 LogEntry = TypedDict("LogEntry", {"time": str, "machine": str, "from": str, "to": str, "key": str | None,
-                                  "summary": str, "text": str, "outcome": Outcome, "detail": str})
+                                  "summary": str, "text": str, "outcome": Outcome, "detail": str,
+                                  "via": NotRequired[Literal["postmaster", "relay", "queue"]],
+                                  "postmaster": NotRequired[Literal["delivered", "unresolved"] | postmaster.PostmasterMiss],
+                                  "seconds": NotRequired[float]})
 KeyedMessage = TypedDict(
     "KeyedMessage",
     {
@@ -152,6 +157,22 @@ class Message(NamedTuple):
 class Result(NamedTuple):
     outcome: Outcome
     detail: str
+
+
+@dataclass(frozen=True)
+class NoClaudeRoute:
+    pass
+
+
+@dataclass(frozen=True)
+class ClaudeRoute:
+    via: Literal["postmaster", "relay", "queue"]
+    postmaster: Literal["delivered", "unresolved"] | postmaster.PostmasterMiss
+    seconds: float
+
+
+Route = NoClaudeRoute | ClaudeRoute
+NO_CLAUDE_ROUTE = NoClaudeRoute()
 
 
 class RelayAttempt(NamedTuple):
@@ -447,10 +468,14 @@ def retire(to: str, sender: str, key: str) -> int:
     return removed
 
 
-def log(message: Message, result: Result, at: datetime) -> None:
+def log(message: Message, result: Result, at: datetime, route: Route = NO_CLAUDE_ROUTE) -> None:
     entry: LogEntry = {"time": at.isoformat(), "machine": machine(), "from": message.sender, "to": message.to,
                        "key": message.key, "summary": message.text.strip().splitlines()[0] if message.text.strip()
                        else "", "text": message.text, "outcome": result.outcome, "detail": result.detail}
+    if isinstance(route, ClaudeRoute):
+        entry["via"] = route.via
+        entry["postmaster"] = route.postmaster
+        entry["seconds"] = round(route.seconds, 3)
     STATE.mkdir(parents=True, exist_ok=True)
     with locked(), open(STATE / "log.jsonl", "a", encoding="utf-8") as handle:
         _ = handle.write(json.dumps(entry) + "\n")
@@ -980,6 +1005,10 @@ def body_text(options: Options) -> str:
     return sys.stdin.read()
 
 
+def delivered_text(message: Message, entry_id: str) -> str:
+    return f"Message from {message.sender} via postmaster: {message.summary} [{entry_id[:8]}]\n\n{message.text}"
+
+
 def send(options: Options) -> Result:
     text = body_text(options).rstrip("\n")
     if not text.strip():
@@ -1001,6 +1030,7 @@ def send(options: Options) -> Result:
     started = now()
     window = None if options.repeat_minutes is None else timedelta(minutes=options.repeat_minutes)
     skip = claim(message, window, started)
+    log_route: Route = NO_CLAUDE_ROUTE
     if skip is not None:
         result = Result("skipped", skip)
     elif isinstance(route, RecipientLookupFailed):
@@ -1023,6 +1053,16 @@ def send(options: Options) -> Result:
     elif isinstance(route, CodexSessionRecipient):
         result = codex_session(message, route, options.timeout)
     else:
+        claude_started = time.monotonic()
+        def relay_and_queue(relay_message: Message, timeout: float) -> Result:
+            relayed_result = relay(relay_message, timeout)
+            if relayed_result.outcome == "queued":
+                enqueue(message, relayed_result.detail, started)
+                if sessions.addressed(message.to, sessions.live_sessions()) is None:
+                    return Result("queued", f"{relayed_result.detail}; no live session answers to {message.to},"
+                                  + " so it is kept under that name")
+            return relayed_result
+
         plan = relay_plan(message)
         if isinstance(plan, SessionIdWithoutLiveRecipient):
             result = Result(
@@ -1030,17 +1070,32 @@ def send(options: Options) -> Result:
                 f"no live session answers to {plan.address}, so it is kept under that name",
             )
             enqueue(message, result.detail, started)
+            log_route = ClaudeRoute("queue", "unresolved", time.monotonic() - claude_started)
         else:
-            result = relay(plan.message, options.timeout)
-            if result.outcome == "queued":
-                enqueue(message, result.detail, started)
-                if sessions.addressed(message.to, sessions.live_sessions()) is None:
-                    result = Result("queued", f"{result.detail}; no live session answers to {message.to},"
-                                    + " so it is kept under that name")
+            live = sessions.live_sessions()
+            registered = sessions.addressed(plan.message.to, live)
+            postmaster_recipient: postmaster.PostmasterRecipient = (
+                postmaster.RecipientNotInRegistry() if registered is None
+                else postmaster.RegisteredClaudeRecipient(registered)
+            )
+            if isinstance(postmaster_recipient, postmaster.RegisteredClaudeRecipient):
+                entry_id = postmaster.new_entry_id()
+                delivery = postmaster.attempt(STATE, postmaster_recipient.session, message.sender, entry_id,
+                                              delivered_text(message, entry_id), live)
+                if isinstance(delivery, postmaster.Delivered):
+                    result = Result("sent", f"postmaster; {'verbatim' if delivery.verbatim else 'NOT VERBATIM'}; "
+                                    + f"session:{postmaster_recipient.session['sessionId']}")
+                    log_route = ClaudeRoute("postmaster", "delivered", time.monotonic() - claude_started)
+                else:
+                    result = relay_and_queue(plan.message, max(1.0, options.timeout - delivery.seconds))
+                    log_route = ClaudeRoute("relay", delivery.reason, time.monotonic() - claude_started)
+            else:
+                result = relay_and_queue(plan.message, options.timeout)
+                log_route = ClaudeRoute("relay", "unresolved", time.monotonic() - claude_started)
     if result.outcome == "sent" and message.key is not None:
         for recipient in dict.fromkeys((message.to, options.to)):
             _ = remove_queued_key(recipient, message.key)
-    log(message, result, started)
+    log(message, result, started, log_route)
     return result
 
 

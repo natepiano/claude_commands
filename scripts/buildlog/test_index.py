@@ -14,6 +14,7 @@ from contextlib import closing
 from datetime import datetime
 from pathlib import Path
 from typing import cast, override
+from unittest import mock
 
 import index
 import parse
@@ -26,9 +27,16 @@ _TEST_LOG = tempfile.TemporaryDirectory(prefix="buildlog-tests-")
 _TEST_ROOT = Path(_TEST_LOG.name) / "buildlog"
 
 
+COORDINATION_VARIABLES = (
+    "BUILD_HOLD_DIR", "BUILD_HOLD_RELEASE_DIR", "PLAN_DELEGATE_ACTIVE_DIR",
+    "MAC_TEST_STATE_DIR", "NOTIFIER_SESSIONS_DIR",
+)
+
+
 def use_test_log() -> None:
     os.environ["BUILDLOG_DIR"] = str(_TEST_ROOT)
     os.environ["BUILDLOG_TRANSCRIPTS"] = str(Path(_TEST_LOG.name) / "transcripts")
+    os.environ.update({name: str(_TEST_ROOT / name) for name in COORDINATION_VARIABLES})
 
 
 use_test_log()
@@ -157,6 +165,7 @@ def point_root_at(test: unittest.TestCase, root: Path) -> None:
     """Override the suite's temporary log root for this test only."""
     previous = os.environ.get("BUILDLOG_DIR")
     os.environ["BUILDLOG_DIR"] = str(root)
+    _ = cast(object, test.enterContext(mock.patch.dict(os.environ, {name: str(root / name) for name in COORDINATION_VARIABLES})))
 
     def restore() -> None:
         if previous is None:
@@ -534,17 +543,17 @@ class IndexTests(unittest.TestCase):
                 ("old", None, None, None, None),
             ],
         )
-        self.assertEqual(index.SCHEMA_VERSION, 13)
+        self.assertEqual(index.SCHEMA_VERSION, 14)
 
-    def test_schema_twelve_rebuilds_call_fields_from_json_lines(self) -> None:
+    def test_schema_thirteen_rebuilds_call_fields_from_json_lines(self) -> None:
         self.write(self.host_file, call("recorded", target="mac", hold_wait_s=0.4))
         _ = index.update()
         with closing(sqlite3.connect(index.index_path())) as connection:
-            _ = connection.execute("PRAGMA user_version = 12")
+            _ = connection.execute("PRAGMA user_version = 13")
             _ = connection.execute("UPDATE calls SET target = 'natedev', hold_wait_s = 99")
             connection.commit()
         self.assertEqual(index.update(), 1)
-        self.assertEqual(self.rows("PRAGMA user_version"), [(13,)])
+        self.assertEqual(self.rows("PRAGMA user_version"), [(14,)])
         self.assertEqual(self.rows("SELECT target, hold_wait_s FROM calls"), [("mac", 0.4)])
 
     def test_old_calls_have_null_target_and_hold_wait_but_new_empty_target_is_preserved(self) -> None:
@@ -560,6 +569,20 @@ class IndexTests(unittest.TestCase):
         _ = index.update()
         self.assertEqual(self.rows("PRAGMA index_info(steps_call)"), [(0, 23, "call_id")])
         self.assertIn("steps_call", str(self.rows("EXPLAIN QUERY PLAN SELECT id FROM steps WHERE call_id = ?", "call")))
+
+    def test_mac_holder_and_hold_event_schema_keep_source_and_identity_indexes(self) -> None:
+        self.write(self.host_file, call("busy", mac="declined", mac_reason="busy", mac_holder="hana nextest"), call("old"))
+        _ = index.update()
+        self.assertEqual(self.rows("SELECT id, mac_holder FROM calls ORDER BY id"), [("busy", "hana nextest"), ("old", None)])
+        self.assertEqual([row[2] for row in self.rows("PRAGMA index_info(hold_events_key_at)")],
+                         ["host", "target", "hold_key", "at", "event"])
+        self.assertEqual([row[2] for row in self.rows("PRAGMA index_info(hold_events_target_at)")], ["target", "at"])
+        self.assertEqual([row[2] for row in self.rows("PRAGMA index_info(hold_events_src)")], ["src"])
+        result = subprocess.run([sys.executable, str(CLI), "schema"], capture_output=True, text=True, check=False)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("TABLE hold_events", result.stdout)
+        self.assertIn("one row per began or ended event", result.stdout)
+        self.assertIn("no row proves a hold is in force now", result.stdout)
 
     def test_schema_describes_target_and_hold_wait(self) -> None:
         result = subprocess.run(
