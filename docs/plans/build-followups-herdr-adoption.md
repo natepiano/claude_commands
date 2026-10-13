@@ -124,7 +124,7 @@ Moved to `docs/plans/build-followups-herdr-trust.md` (unit `herdr-trust-unit`), 
 
 Moved to `docs/plans/build-followups-herdr-panes.md` (unit `herdr-panes-unit`), run in parallel with Phase 5. Phase 6 waits for it.
 
-### Phase 5 — Shutdown and restart for herdr sessions  · status: todo
+### Phase 5 — Shutdown and restart for herdr sessions  · status: done
 
 **User sees:** before — `/shutdown` lists a herdr session but leaves it running and prints a manual restart line; after — `/shutdown` stops herdr sessions safely and `restart` brings each back in its own herdr session with its conversation, tmux sessions as before.
 
@@ -208,6 +208,7 @@ Do not install the integration. Our own records already resume every session, an
 3. `add_showrunner.py` `launch`: the same herdr start with no marks and no account variables (the showrunner account); `tmux_live` becomes a check for a running herdr session of that name; printed lines and `later` text name `herdr session attach <slug>`.
 4. `promote_showrunner.py`: no launch code of its own; its printed lines name `herdr session attach`.
 5. `restart.py`: a `tmux` host whose session is a showrunner is relaunched through `_herdr_launch` into a herdr session of the same name, so a restart moves it; other tmux hosts respawn as before.
+   - A unit whose `session_host` is `herdr` restarts through `add_unit.py --host-session <session_name>` like a tmux unit; remove the manual-restart guard Phase 5 keeps for it (before this phase `add_unit.py` launches only tmux, so routing a herdr unit there would move it into tmux).
 6. Docs: `commands/showrunner/add_showrunner.md` restates the user's 2026-10-12 rule ("top level (L1) showrunners should make sure to use tmux to start lower level showrunners") as: an L1 showrunner starts lower showrunners with `add_showrunner.py`, which now opens each in its own herdr session; keep the quote and say the host changed with the user's 2026-10-13 move to herdr. Also `commands/showrunner/add_unit.md`, `promote_unit.md`, `units.md` (`gone` means no tmux or herdr session carries the mark), `produce.md` (lines 169–171, 325, 363, 1119), `commands/producer/to_production.md:104`, `docs/production_format.md:36,126`, and `production_lifecycle.py` line 482 (`close herdr or tmux sessions`).
 7. Live check (not a test): `add_unit.py` for a throwaway standby unit of a scratch production in a trusted scratch repository; it starts in herdr, `/remote-control is active` is read, `production_lifecycle.py load` lists it live, the roster files it under the scratch showrunner, `herdr session attach <name>` opens it, `/shutdown --only <name> --restart` brings it back. Remove the scratch unit and session afterwards.
 
@@ -234,7 +235,7 @@ Do not install the integration. Our own records already resume every session, an
 - `impl` — `add_unit.py`, `test_add_unit.py`, `production_lifecycle.py`, `test_production_lifecycle.py`; hub: `scripts/production/add_unit.py` (`launch_environment` and `Refusal` are imported by `add_showrunner.py`).
 - `test` (opens as impl) — `add_showrunner.py`, `promote_showrunner.py`, `restart.py` and their tests, and the seven docs.
 
-**Constraints from prior phases:** trust is checked in `preflight` and `add_showrunner.checked` through `herdr.claude_trust`; `session_pane.py` and `read_place` read either host; `MarkedUnit.place` replaced `pane`; `restart.py` has `_herdr_launch` and passes `--host-session`, which `add_unit.py` accepts beside `--tmux-session`; `herdr.py` `start_server`, `open_pane`, `start_agent`, `stop_session`, `live_sessions`.
+**Constraints from prior phases:** trust is checked in `preflight` and `add_showrunner.checked` through `herdr.claude_trust`; `session_pane.py` and `read_place` read either host; `MarkedUnit.place` replaced `pane`; `restart.py` has `_herdr_launch` and passes `--host-session`, which `add_unit.py` accepts beside `--tmux-session`; a herdr unit's restart is still a manual resume line until Spec 5 here; `herdr.py` `start_server`, `open_pane`, `start_agent`, `stop_session`, `live_sessions`.
 
 **Acceptance gate:** `python3 -m unittest discover` for `scripts/production`, `scripts/shutdown` and `scripts/herdr` green; `basedpyright scripts/production scripts/shutdown scripts/herdr` prints `0 errors, 0 warnings`. Tests show the herdr argv carries no prompt, the opening prompt goes once through `agent prompt`, the pane environment holds both marks and the account variables and no `CLAUDE_*` from the caller, and `AgentNotReady` sends nothing. The live check in Spec 7 passes.
 

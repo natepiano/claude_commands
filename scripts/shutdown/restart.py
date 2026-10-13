@@ -24,18 +24,19 @@ from pathlib import Path
 from typing import Literal, Protocol, TypedDict, cast
 
 SCRIPTS = Path(__file__).resolve().parents[1]
-for dependency in ("whoami", "message", "notify", "production", "hooks", "lib"):
+for dependency in ("whoami", "message", "notify", "production", "hooks", "lib", "herdr"):
     sys.path.insert(0, str(SCRIPTS / dependency))
 
 from account import (  # noqa: E402
     Account,
     UnknownAccountName,
     UnreadableAccount,
-    named_account_prefix,
+    named_account_environment,
     named_claude_account,
     own_claude_account,
 )
 import add_unit  # noqa: E402
+import herdr  # noqa: E402
 import conversation_pause  # noqa: E402
 from inventory import (  # noqa: E402
     PaneNotRecorded,
@@ -469,16 +470,43 @@ def restart_note(
     )
 
 
-def _resume_command(session: Session, prompt: str, target: str = "") -> str:
+@dataclass(frozen=True)
+class RetainResumeAccount:
+    """Resume with the conversation's recorded Claude config directory."""
+
+    config_dir: Path
+
+
+@dataclass(frozen=True)
+class MoveResumeAccount:
+    """The accounts launcher must validate and select this target account."""
+
+    target: str
+
+
+@dataclass(frozen=True)
+class ResumeParts:
+    """A conversation launch before any host-specific command rendering."""
+
+    cwd: str
+    environment: dict[str, str]
+    claude_arguments: tuple[str, ...]
+    opening_prompt: str
+    account: RetainResumeAccount | MoveResumeAccount
+
+
+def _resume_parts(session: Session, prompt: str, target: str = "") -> ResumeParts:
     default_dir = str(Path.home() / ".claude")
     config_dir = session.get("config_dir", default_dir)
-    prefix = (
-        named_account_prefix(Path(config_dir))
-        if config_dir != default_dir
-        else ""
+    account: RetainResumeAccount | MoveResumeAccount = (
+        MoveResumeAccount(target) if target else RetainResumeAccount(Path(config_dir))
     )
+    environment = (
+        named_account_environment(Path(config_dir))
+        if config_dir != default_dir and not target else {}
+    )
+    environment["ENABLE_TOOL_SEARCH"] = "true"
     argv = [
-        "claude",
         "--resume",
         session["session_id"],
         "-n",
@@ -486,17 +514,27 @@ def _resume_command(session: Session, prompt: str, target: str = "") -> str:
         "--remote-control",
         session["name"],
     ]
-    if target:
-        prefix = ""
-        argv = [sys.executable, str(SCRIPTS / "accounts" / "accounts.py"), "exec", target, *argv[1:]]
     model = session["model"]
     if model["kind"] == "model":
         argv.extend(("--model", model["name"]))
-    argv.extend(("--settings", '{"disableAgentView": true}', prompt))
+    argv.extend(("--settings", '{"disableAgentView": true}'))
+    return ResumeParts(session["cwd"], environment, tuple(argv), prompt, account)
+
+
+def _resume_shell(parts: ResumeParts) -> str:
+    argv = ["claude", *parts.claude_arguments, parts.opening_prompt]
+    if isinstance(parts.account, MoveResumeAccount):
+        argv = [sys.executable, str(SCRIPTS / "accounts" / "accounts.py"),
+                "exec", parts.account.target, *argv[1:]]
+    prefix = "".join(f"{key}={shlex.quote(value)} " for key, value in parts.environment.items())
     return (
-        f"cd {shlex.quote(session['cwd'])} && {prefix}ENABLE_TOOL_SEARCH=true command "
+        f"cd {shlex.quote(parts.cwd)} && {prefix}command "
         f"{shlex.join(argv)}; exec zsh"
     )
+
+
+def _resume_command(session: Session, prompt: str, target: str = "") -> str:
+    return _resume_shell(_resume_parts(session, prompt, target))
 
 
 def account_move_note(session: Session, target: str, source_label: str, why: str = "") -> str:
@@ -613,7 +651,7 @@ def _unit_argv(
         session["cwd"],
         "--session-name",
         session["name"],
-        "--tmux-session",
+        "--host-session",
         host["session_name"],
         "--restart-note",
         str(note_path),
@@ -909,6 +947,44 @@ def _tmux_launch(command: str, session: Session, *, dry_run: bool) -> None:
         )
 
 
+def _herdr_launch(parts: ResumeParts, session: Session, *, dry_run: bool) -> None:
+    """Resume Claude with its own arguments and one separate opening prompt."""
+    host = session["host"]
+    if host["kind"] != "herdr":
+        raise ValueError("herdr launch needs a herdr host")
+    if isinstance(parts.account, MoveResumeAccount):
+        raise OSError(
+            f"herdr account move to {parts.account.target} is not supported: "
+            + "pane environment assignments cannot perform accounts exec credential "
+            + "removal and readiness checks; resume manually with accounts.py exec"
+        )
+    environment = {**named_account_environment(parts.account.config_dir), **parts.environment}
+    name = host["herdr_session"]
+    pane = host["pane_id"]
+    if dry_run:
+        print(f"herdr {name}: resume {session['session_id']} in {pane}")
+        return
+    _record_scheduled_restart_prompt(session["session_id"], parts.opening_prompt, dry_run=False)
+    try:
+        config_dir = Path(environment["CLAUDE_CONFIG_DIR"])
+        claude_json = (Path.home() / ".claude.json" if config_dir == Path.home() / ".claude"
+                       else config_dir / ".claude.json")
+        trust = herdr.trusted_by_claude(Path(parts.cwd), claude_json)
+        if not trust.accepted:
+            raise OSError(f"{trust.project_key}: Claude has not trusted this folder")
+        herdr.start_server(name, 90_000)
+        client = herdr.Herdr(name)
+        agents = client.agents()
+        if any(row["pane_id"] == pane and row.get("agent")
+               and row["agent_status"] not in {"exited", "stopped", "dead"} for row in agents):
+            raise OSError(f"herdr {name}:{pane}: pane still holds a live agent")
+        pane = herdr.open_pane(name, name, parts.cwd, environment)
+        client.start_agent(session["name"], pane, kind="claude", argv=list(parts.claude_arguments),
+                           opening_prompt=parts.opening_prompt, timeout_ms=90_000)
+    except herdr.HerdrFailure as error:
+        raise OSError(str(error)) from error
+
+
 def _launch_session(
     record: SessionShutdown,
     note: str,
@@ -923,9 +999,7 @@ def _launch_session(
         if host["kind"] != "unit":
             raise ValueError("unit session has no unit host")
         if host["session_host"] == "herdr":
-            command = (resume_command(session, record["target"], record.get("source_label", record["label"]), record.get("why", ""))
-                       if "target" in record else _resume_command(session, note))
-            return ManualRestartRequired(command)
+            return ManualRestartRequired(_resume_command(session, note, record.get("target", "")))
         if host["plan"]["kind"] == "no run record":
             _write_note(_note_path(record, session["session_id"]), note, dry_run)
             return ManualRestartRequired(
@@ -943,13 +1017,14 @@ def _launch_session(
     prompt = _showrunner_prompt(session) if session["kind"] == "showrunner" else note
     if session["kind"] == "showrunner" and "target" in record:
         prompt += " " + note
-    command = (_resume_command(session, prompt, record["target"]) if "target" in record
-               else _resume_command(session, prompt))
+    parts = _resume_parts(session, prompt, record.get("target", ""))
+    if host["kind"] == "herdr":
+        _herdr_launch(parts, session, dry_run=dry_run)
+        return SessionLaunched()
+    command = _resume_shell(parts)
     if host["kind"] == "unknown":
         if "target" in record:
             command = resume_command(session, record["target"], record.get("source_label", record["label"]), record.get("why", ""))
-        return ManualRestartRequired(command)
-    if host["kind"] == "herdr":
         return ManualRestartRequired(command)
     _record_scheduled_restart_prompt(
         session["session_id"], prompt, dry_run=dry_run
@@ -1476,7 +1551,7 @@ def relaunch_session(
 
 def _unfinished_cleanup(record: SessionShutdown) -> bool:
     return any(
-        (issue["kind"] == "codex server left running" or issue["kind"] == "unit tmux session left running")
+        (issue["kind"] == "codex server left running" or issue["kind"] == "unit session left running")
         and issue["cause"] == "stop not confirmed"
         for issue in record["stop_issues"]
     )
