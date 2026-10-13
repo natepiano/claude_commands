@@ -259,6 +259,8 @@ class ClaudeAuthStatus(TypedDict, total=False):
 
 class ClaudeOauth(TypedDict, total=False):
     accessToken: str
+    # Epoch milliseconds.
+    expiresAt: int
 
 
 class ClaudeCredentials(TypedDict, total=False):
@@ -565,9 +567,16 @@ def claude_live(config_dir: Path | None = None) -> Report:
         report.quota_problem = "Weekly quota: unavailable for this authentication method"
         return report
     try:
-        token = ((os.environ.get("CLAUDE_CODE_OAUTH_TOKEN") if config_dir is None else None)
-                 or (claude_credentials() if config_dir is None else claude_credentials(config_dir))
-                 .get("claudeAiOauth", {}).get("accessToken"))
+        token = os.environ.get("CLAUDE_CODE_OAUTH_TOKEN") if config_dir is None else None
+        if not token:
+            oauth = (claude_credentials() if config_dir is None else claude_credentials(config_dir)).get("claudeAiOauth", {})
+            token = oauth.get("accessToken")
+            expires = oauth.get("expiresAt")
+            # Only a Claude session refreshes a stored token, so an idle account's goes stale.
+            # The service answers a stale one with 429 or 401; asking with it only adds refused calls.
+            if token and isinstance(expires, int) and expires / 1000 <= time.time():
+                report.quota_problem = "Weekly quota: not read (stale token; a Claude session on this account refreshes it)"
+                return report
         if not token:
             raise RuntimeError("usage credentials unavailable")
         request = urllib.request.Request(
