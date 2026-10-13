@@ -78,23 +78,28 @@ trap 'stop_mac_run 129' HUP
 sha=$(git -C $repo rev-parse --verify "$sha^{commit}") || exit 2
 
 # The Mac cannot fetch from GitHub over ssh, so the commits go as a bundle.
+# When the clone already holds the commit, nothing is sent and the clone checks it out.
 on_mac "test -d $clone/.git || git clone -q ~/rust/hana $clone" || exit 4
 base=$(ssh $host "git -C $clone rev-parse HEAD")
-ref=refs/mac-run/tip
-bundle=$(mktemp --suffix=.bundle)
-git -C $repo update-ref $ref $sha
-if git -C $repo cat-file -e "$base^{commit}" 2>/dev/null && [[ $base != $sha ]]; then
-  git -C $repo bundle create -q $bundle $ref "^$base"
+if git -C $repo merge-base --is-ancestor $sha $base 2>/dev/null; then
+  ssh $host "git -C $clone checkout -q --detach $sha"
 else
-  git -C $repo bundle create -q $bundle $ref
-fi
-bundle_exit=$?
-git -C $repo update-ref -d $ref
-(( bundle_exit == 0 )) || { rm -f $bundle; exit 4 }
-scp -q $bundle $host:/tmp/mac_run.bundle || { rm -f $bundle; exit 4 }
-rm -f $bundle
+  ref=refs/mac-run/tip
+  bundle=$(mktemp --suffix=.bundle)
+  git -C $repo update-ref $ref $sha
+  if git -C $repo cat-file -e "$base^{commit}" 2>/dev/null && [[ $base != $sha ]]; then
+    git -C $repo bundle create -q $bundle $ref "^$base"
+  else
+    git -C $repo bundle create -q $bundle $ref
+  fi
+  bundle_exit=$?
+  git -C $repo update-ref -d $ref
+  (( bundle_exit == 0 )) || { rm -f $bundle; exit 4 }
+  scp -q $bundle $host:/tmp/mac_run.bundle || { rm -f $bundle; exit 4 }
+  rm -f $bundle
 
-ssh $host "git -C $clone fetch -q /tmp/mac_run.bundle $ref && git -C $clone checkout -q --detach FETCH_HEAD; rm -f /tmp/mac_run.bundle"
+  ssh $host "git -C $clone fetch -q /tmp/mac_run.bundle $ref && git -C $clone checkout -q --detach FETCH_HEAD; rm -f /tmp/mac_run.bundle"
+fi
 head=$(ssh $host "git -C $clone rev-parse HEAD")
 print "HEAD=$head"
 [[ $head == $sha ]] || { print "wrong tree: wanted $sha"; exit 5 }

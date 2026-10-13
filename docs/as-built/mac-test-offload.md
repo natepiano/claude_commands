@@ -42,7 +42,7 @@ A pending or active block is one footer item after the build-hold lines: `Mac bl
 
 ### The showrunner's Mac build — `scripts/production/mac_run.sh`
 
-It claims the Mac after its reach probe (`mac_test.py claim --pid $$ --what "mac run <sha9>" --wait 600`); claim exit 10, 11 or 12 prints the claim's line and exits 9. `INT`, `TERM` and `HUP` run `stop_mac_run` (one ssh call that ends the clone's builds and test processes and removes its temp files), release, and exit 128 plus the signal.
+It claims the Mac after its reach probe (`mac_test.py claim --pid $$ --what "mac run <sha9>" --wait 600`); claim exit 10, 11 or 12 prints the claim's line and exits 9. When the clone already holds the commit, nothing is sent and the clone checks it out. `INT`, `TERM` and `HUP` run `stop_mac_run` (one ssh call that ends the clone's builds and test processes and removes its temp files), release, and exit 128 plus the signal.
 
 ### Which packages belong on the Mac — `scripts/mac_test/audit.py`
 
