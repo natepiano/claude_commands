@@ -47,9 +47,9 @@ The build log records how long each build step waited on memory. A machine-wide 
 
 The section always has its heading `### Memory pressure`, then `Source: 60 s machine samples and step cgroup stall counters.`, then the memory-waits line and the sccache, unsliced-step and memory-kill lines (`docs/as-built/build-memory-admission.md`), then:
   - **Stall table**, shown only when a step stalled: `| Caller | Kind | Stall | At once |`.
-    - Rows are the five steps with the largest `mem_stall_some_s > 0`, largest first. `full` is recorded but not shown.
-    - Caller is `caller_label()`, which appends the host when more than one host built that day. A step whose cwd is under a temp folder shows as `scratch (temp folders)` instead.
-    - "At once" counts the steps on the same host for which `started_at <= s.started_at < ended_at`. The count includes the step itself, every caller and scratch steps. Steps on another host never count. `steps_host_started` serves this subquery. It compares ISO strings, which works because `store.utc_iso` writes one fixed-width UTC format.
+    - Rows are natedev's five steps (`host = 'natedev'`) with the largest `mem_stall_some_s > 0`, largest first. `full` is recorded but not shown.
+    - Caller is `caller_label()`. The section counts natedev alone, so no host is appended. A step whose cwd is under a temp folder shows as `scratch (temp folders)` instead.
+    - "At once" counts the steps on the same host for which `started_at <= s.started_at < ended_at`. The count includes the step itself, every caller and scratch steps. Only natedev's steps count. `steps_host_started` serves this subquery. It compares ISO strings, which works because `store.utc_iso` writes one fixed-width UTC format.
   - **The sample line**, after the stall table's blank line (or after the instrument lines when there is no table), either:
     - `60 s samples: peak used memory X GiB, peak swap Y GiB; peak builds B GiB, peak CI C GiB (process memory); machine stall: some A, full B.` Each slice peak is the day's highest `builds_anon_bytes` or `ci_anon_bytes`, or `unavailable` when no sample has it., or
     - `60 s samples: none; machine stall: unavailable.` when there are no samples.
@@ -94,7 +94,7 @@ The section always has its heading `### Memory pressure`, then `Source: 60 s mac
 - **Unmeasured stall is null, never zero.** Inside Python it is `sample.Unmeasured.VALUE`; in JSON it is `null` and in SQLite `NULL`. Zero means measured with no stall. The report's `> 0` filter drops null rows, and SQL `avg()` skips them.
 - **The scope string must not change the step's outcome.** It keeps the step's exit status, prints nothing, and writes the marker before the step runs. Callers run under `set -euo pipefail`, and a missing marker means the scope never started the step, so `buildlog_exec` runs it without the scope.
 - **`peak_and_stall` never raises.** An empty path, an unreadable file, a peak-only file and malformed lines all give `Unmeasured`, because a recorder never fails its caller. Peak-only files still arrive from long-lived shells that sourced an older `invoke.sh`.
-- **A machine sample is all or nothing.** `parse_pressure`'s default is `require_both=True`, typed by its overload to return `MemoryStallTotals`, which has plain ints. A sample row with a missing counter would break the per-host delta chain.
+- **A machine sample is all or nothing.** `parse_pressure`'s default is `require_both=True`, typed by its overload to return `MemoryStallTotals`, whose counters are `int`, never `Unmeasured`. A sample row with a missing counter would break the per-host delta chain.
 - **Units differ by table, deliberately.** `steps` stores stall in seconds (`REAL`, the scope's own total). `samples` stores the raw counters since boot in microseconds (`INTEGER`).
 - **Any column change bumps `SCHEMA_VERSION`.** `open_for_update` deletes an index at another version and rebuilds it from the JSON lines.
 - **`sample.py` stays cheap to import and has no side effects.** `record.py` imports it after every step for `parse_pressure` and `Unmeasured`.
