@@ -161,10 +161,21 @@ printf "MemAvailable: 67108864 kB\n" > "$BUILDLOG_MEMINFO"
         self.assertEqual(self.entry()["state"], "AwaitingRelease")
         self.assertNotIn("outcome", self.entry())
 
-    def test_missing_session_id_is_denied_without_memory_wait_or_mark(self) -> None:
+    def test_missing_session_id_before_release_is_denied_without_memory_wait_or_mark(self) -> None:
         self.environment["CLAUDE_CODE_SESSION_ID"] = "unit-seat"
+        cycle = cast(dict[str, object], json.loads(self.cycle_file.read_text()))
+        cycle["release_started_at"] = ""
+        _ = self.cycle_file.write_text(json.dumps(cycle))
         before = self.cycle_file.read_bytes()
         self.assert_denied(self.run_hook(include_session=False), "natedev is held by holder for the test; launch after the release.")
+        self.assertEqual(self.cycle_file.read_bytes(), before)
+
+    def test_missing_session_id_during_release_is_admitted_without_a_mark(self) -> None:
+        self.environment["CLAUDE_CODE_SESSION_ID"] = "unit-seat"
+        before = self.cycle_file.read_bytes()
+        result = self.run_hook(include_session=False)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, "")
         self.assertEqual(self.cycle_file.read_bytes(), before)
 
     def test_unheld_launch_passes_through(self) -> None:
@@ -209,16 +220,23 @@ printf "MemAvailable: 67108864 kB\n" > "$BUILDLOG_MEMINFO"
         self.assertNotIn("waiting for memory", result.stderr)
         self.assertEqual(self.cycle_file.read_bytes(), before)
 
-    def test_seat_call_turn_does_not_release_its_owners_launch(self) -> None:
+    def test_seat_call_turn_admits_its_owners_launch_without_marking_the_call(self) -> None:
         cycle = cast(dict[str, object], json.loads(self.cycle_file.read_text()))
         entries = cast(list[dict[str, object]], cycle["entries"])
+        cycle["holder_generation"] = 1
         entries[0].update({
-            "calls": [{"call_id": "seat-call", "pid": os.getpid(), "proc_start": Path(f"/proc/{os.getpid()}/stat").read_text().rsplit(")", 1)[1].split()[19], "started": False, "admitted_generation": 0}],
-            "active_call_id": "seat-call", "session_pending": True,
-            "session_admitted_generation": 0,
+            "calls": [{"call_id": "seat-call", "pid": os.getpid(), "proc_start": Path(f"/proc/{os.getpid()}/stat").read_text().rsplit(")", 1)[1].split()[19], "started": False, "admitted_generation": 1}],
+            "active_call_id": "seat-call", "session_pending": False,
+            "session_admitted_generation": 1,
+            "active_released_at": entries[0]["released_at"],
+            "delivery": {"generation": 1, "outcome": "Delivered"},
         })
         _ = self.cycle_file.write_text(json.dumps(cycle))
-        self.assert_denied(self.run_hook(), "natedev is held by holder for the test; launch after the release.")
+        before = self.cycle_file.read_bytes()
+        result = self.run_hook()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, "")
+        self.assertEqual(self.cycle_file.read_bytes(), before)
         self.assertEqual(self.entry()["state"], "ReleasedAwaitingAdmission")
         self.assertEqual(self.entry()["active_call_id"], "seat-call")
         self.assertNotIn("outcome", self.entry())

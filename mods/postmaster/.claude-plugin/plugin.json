@@ -1,0 +1,6 @@
+{
+  "name": "postmaster",
+  "version": "0.1.0",
+  "description": "File-driven trial of session messaging and mod runtime APIs.",
+  "author": { "name": "Nate" }
+}
