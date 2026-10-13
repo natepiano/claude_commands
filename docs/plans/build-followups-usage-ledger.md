@@ -474,28 +474,28 @@ The store is at `PRAGMA user_version` 6 (`STORE_VERSION`) and holds what the wor
 
 ### Phase 15 — The compaction replay's refusals are tested · status: done
 
-#### Work Order
+#### As-built
 
-**Goal:** A change that turns one of the replay's refusals into a table, a traceback or a different exit status fails a test.
-
-**Spec:**
-- `python3 -m scripts.usage.compaction_replay` refuses in two ways. Refused arguments exit 2: `--since` not earlier than `--until`, and a `--follow-up-prompt` that is negative, `nan` or `inf`. A store it cannot use exits 1: a store stamped with an older version, a file that is not a SQLite store, and a store path that does not exist. Each refusal prints one line on stderr that begins `compaction_replay: `, prints nothing on stdout, and leaves the store file's bytes unchanged.
-- `scripts/usage/test_compaction_replay.py` gains one test per refusal named above. Each test builds its store in a temporary directory, runs the replay as the existing tests do, and pins the exit status, that stderr is that one line with its text, and that stdout is empty. The store tests also pin that the store file's bytes are the same after the run and that a path that did not exist still does not exist.
-- The existing `replay` helper requires exit 0 and an empty stderr. A refused run gets its own helper or a parameter; no existing test is weakened.
-- `scripts/usage/compaction_replay.py` changes only where a refusal does not behave as this Spec says. A refusal that already behaves so is left as it is.
-- Done when the tests below pass.
+- `python3 -m scripts.usage.compaction_replay` refuses in two ways, and each refusal prints one stderr line `compaction_replay: <reason>`, prints nothing on stdout, and leaves the store file's bytes unchanged. `main` raises `usage_report.ReportRefused` for refused arguments (exit 2) and catches `OSError`, `sqlite3.Error` and `usage_report.StoreVersionMismatch` for a store it cannot use (exit 1). `usage_report.open_read_store` opens the store with `?mode=ro`, so a missing path stays missing.
+- Exit 2, `invalid bounds; accepted: --since earlier than --until (inclusive start, exclusive end)`: `test_equal_bounds_are_refused_without_changing_the_store` and `test_reversed_bounds_are_refused_without_changing_the_store`.
+- Exit 2, `follow-up prompt must be a finite nonnegative token count`: `test_negative_follow_up_prompt_is_refused_without_changing_the_store` (`-1`), `test_nan_follow_up_prompt_is_refused_without_changing_the_store` and `test_infinite_follow_up_prompt_is_refused_without_changing_the_store`.
+- Exit 1, `store version 7 is older than report version 8; run the collector once`, built from `collect.STORE_VERSION`: `test_older_store_is_refused_without_changing_its_bytes`.
+- Exit 1, `file is not a database`: `test_non_sqlite_file_is_refused_without_changing_its_bytes`. Exit 1, `unable to open database file`: `test_missing_store_is_refused_without_creating_a_file`, which also pins that no file exists at the path after the run.
+- `run_replay` runs the replay with `--db` and a temporary `HOME` and `USAGE_STATE_DIR`, and returns the result. `replay` calls it and requires exit 0 and an empty stderr. `assert_replay_refused` pins the exit status, an empty stdout, and stderr equal to `compaction_replay: <reason>` plus one newline, one line only. `assert_store_preserved_on_refusal` calls it and pins that the store file's bytes are the same after the run; every refusal test but the missing-store test uses it.
+- `scripts/usage/compaction_replay.py` did not change in this phase: every refusal already behaved so.
 
 **Files:**
-- `scripts/usage/test_compaction_replay.py` — the refusal tests.
-- `scripts/usage/compaction_replay.py` — only where a refusal is wrong.
+- `scripts/usage/test_compaction_replay.py` — 17 tests, eight of them new, and the four helpers.
 
-**Seats:** `1 writer + 1 tester`.
-- `impl` — `scripts/usage/compaction_replay.py`. It reads each refusal path against this Spec first, edits only what is wrong, and tells `test` by message what it found.
-- `test` — `scripts/usage/test_compaction_replay.py`, from this Spec alone. The tests pin:
-  - exit 2, one stderr line and an empty stdout for `--since` equal to `--until`, for `--since` after `--until`, and for a `--follow-up-prompt` of `-1`, `nan` and `inf`;
-  - exit 1, one stderr line and an empty stdout for a store with an older version stamp, for a file that is not a SQLite store, and for a path that does not exist;
-  - the store file's bytes unchanged after each store refusal, and no file created at a path that did not exist.
+**State and consequence:** none. The phase adds tests; no state, exit status or message changes.
 
-**Constraints from prior phases:** Work only in the worktree `/home/natepiano/worktrees/claude-build-followups-model-study`, branch `build-followups-model-study`. The replay's `main` catches `usage_report.ReportRefused` (exit 2) and `OSError`, `sqlite3.Error` and `usage_report.StoreVersionMismatch` (exit 1), and prints `compaction_replay: ` followed by the error's text on one line. It opens the store with `usage_report.open_read_store` and checks it with `usage_report.check_store_version`; the store version is 8. `scripts/usage/test_compaction_replay.py` has 9 tests on stores each test builds, and its `replay` helper asserts exit 0 and an empty stderr. Tests never write to the real `~/.local/state/usage-model/`: they use a temporary directory with `--db` and `USAGE_STATE_DIR`. No seat runs the replay against the real store.
+**Deviations:** none.
 
-**Acceptance gate:** `python3 -m unittest scripts.usage.test_compaction_replay scripts.usage.test_usage_report` green; basedpyright 0 errors, 0 warnings, 0 notes on `scripts/usage`.
+**Binds later work:** a change to a refusal's exit status or text changes its test in the same commit. A new refusal gets its own test.
+
+**Gotchas:**
+- `file is not a database` and `unable to open database file` are SQLite's own error texts, so a SQLite release that rewords them fails those two tests.
+- A refused replay over a store in WAL mode leaves SQLite's `-wal` and `-shm` files beside it. The tests compare the store file only.
+- The older-store reason says `run the collector once`, while the collector refuses a store older than version 8 and tells the user to delete it and run the collector again to rebuild it.
+
+**Ruled out:** a change to the replay (every refusal already behaved as specified).
