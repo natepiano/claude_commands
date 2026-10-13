@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import io
+import fcntl
 import os
 import re
 import socket
@@ -14,13 +15,14 @@ import time
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from dataclasses import FrozenInstanceError
-from datetime import datetime, timedelta, tzinfo
+from datetime import datetime, timedelta, timezone, tzinfo
 from pathlib import Path
 from typing import TypedDict, cast, override
 from unittest import mock
 from zoneinfo import ZoneInfo
 
 import build_hold
+from user_zone import user_zone
 
 
 SCRIPT = Path(__file__).with_name("build_hold.py")
@@ -33,6 +35,16 @@ def write_holder(folder: Path, name: str, since: str, purpose: str, release: str
     return path
 
 
+def recorded_hold_events(root: Path, expected: int) -> list[HoldEventRecord]:
+    deadline = time.monotonic() + 5
+    while True:
+        rows = [cast(HoldEventRecord, json.loads(line))
+                for path in root.rglob("*.jsonl") for line in path.read_text().splitlines()]
+        if len(rows) >= expected or time.monotonic() >= deadline:
+            return sorted(rows, key=lambda row: (row["at"], row["event"] != "began"))
+        time.sleep(0.01)
+
+
 class IsolatedBuildHoldTest(unittest.TestCase):
     scratch: Path = Path()
 
@@ -43,6 +55,7 @@ class IsolatedBuildHoldTest(unittest.TestCase):
         _ = meminfo.write_text("MemAvailable: 67108864 kB\n")
         self.enterContext(mock.patch.dict(os.environ, {
             "HOME": str(self.scratch),
+            "BUILDLOG_DIR": str(self.scratch / "buildlog"),
             "BUILD_HOLD_DIR": str(self.scratch / "holders"),
             "BUILD_HOLD_RELEASE_DIR": str(self.scratch / "release"),
             "BUILDLOG_HOLD_REGISTRATION_FILE": str(self.scratch / "registration"),
@@ -58,6 +71,13 @@ class IsolatedBuildHoldTest(unittest.TestCase):
             "PLAN_DELEGATE_BOARD_DIR": "",
             "PLAN_DELEGATE_SESSION_DIR": "",
         }))
+        self.addCleanup(self.reap_recorders)
+
+    def reap_recorders(self) -> None:
+        for thread in threading.enumerate():
+            if thread.name == "hold-event-recorder":
+                thread.join(timeout=5)
+                self.assertFalse(thread.is_alive())
 
 
 class ImportTests(IsolatedBuildHoldTest):
@@ -369,7 +389,7 @@ class HolderTests(IsolatedBuildHoldTest):
                 return read_holder(path)
 
             with mock.patch.object(build_hold, "read_holder", read_or_release):
-                notice = build_hold.release_hold(folder, "first")
+                notice = build_hold.release_hold(folder, build_hold.read_holder(build_hold.holder_path(folder, "first")))
             self.assertEqual(notice, "released; still held by remaining (for remaining work, release eta unknown)")
 
 
@@ -547,9 +567,21 @@ class CommandTests(IsolatedBuildHoldTest):
             "messagingSocketPath": str(path), "updatedAt": 1}))
 
     def hold(self, folder: Path, given: str | None) -> str:
-        key, label = build_hold.holder_of(given)
-        return build_hold.write_hold(folder, key, "one test", build_hold.release_request(None, None),
-                                     datetime.now().astimezone(), label)
+        identity = build_hold.holder_of(given)
+        return build_hold.write_hold(folder, identity, "one test", build_hold.release_request(None, None),
+                                     datetime.now().astimezone())
+
+    def test_session_rename_keeps_begin_and_end_events_under_the_session_id(self) -> None:
+        folder = self.scratch / "holders"
+        self.session("id-1", "old-name")
+        _ = build_hold.start_hold(folder, build_hold.holder_of("old-name"), "render checks",
+                                  build_hold.NoReleaseEta(), datetime.now(timezone.utc))
+        self.session("id-1", "new-name", "old-name")
+        (self.scratch / "release" / "current").unlink()
+        _ = build_hold.release_cycle(folder, build_hold.held_key(folder, "new-name"))
+        rows = recorded_hold_events(self.scratch / "buildlog", 2)
+        self.assertEqual([(row["event"], row["hold_key"], row["holder"]) for row in rows],
+                         [("began", "id-1", "old-name"), ("ended", "id-1", "new-name")])
 
     def test_a_hold_is_kept_by_session_id_so_a_rename_between_hold_and_release_loses_nothing(self) -> None:
         folder = self.scratch / "holders"
@@ -568,7 +600,7 @@ class CommandTests(IsolatedBuildHoldTest):
         self.assertEqual(build_hold.held_key(folder, "new-name"), "id-1")
         with mock.patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": "id-1"}):
             self.assertEqual(build_hold.held_key(folder, None), "id-1")
-        self.assertEqual(build_hold.release_hold(folder, "id-1"), "released, builds may resume.")
+        self.assertEqual(build_hold.release_hold(folder, build_hold.read_holder(build_hold.holder_path(folder, "id-1"))), "released, builds may resume.")
 
     def test_a_hold_taken_under_a_name_before_is_released_by_the_session_that_had_the_name(self) -> None:
         folder = self.scratch / "holders"
@@ -909,7 +941,7 @@ class CommandTests(IsolatedBuildHoldTest):
             folder = Path(scratch)
             now = datetime.fromisoformat("2026-11-01T00:30:00-07:00")
             request = build_hold.release_request("02:30", "America/Los_Angeles")
-            _ = build_hold.write_hold(folder, "slot", "clock change", request, now)
+            _ = build_hold.write_hold(folder, build_hold.HolderIdentity("slot", "slot"), "clock change", request, now)
             fields = cast(dict[str, object], json.loads((folder / "slot").read_text()))
             self.assertEqual(fields["release_eta"], "2026-11-01T02:30:00-08:00")
 
@@ -925,7 +957,7 @@ class CommandTests(IsolatedBuildHoldTest):
             output = io.StringIO()
             errors = io.StringIO()
             try:
-                with mock.patch.dict(os.environ, {"TZ": "America/New_York", "BUILD_HOLD_DIR": str(folder)}):
+                with mock.patch.dict(os.environ, {"TZ": "America/New_York", "USER_ZONE": "America/New_York", "BUILD_HOLD_DIR": str(folder)}):
                     time.tzset()
                     with mock.patch.object(build_hold, "datetime", FixedDatetime), redirect_stdout(output), redirect_stderr(errors):
                         result = build_hold.main(["hold", "--holder", "slot", "--for", "the test", "--release-eta", "22:00", "--zone", "America/Los_Angeles"])
@@ -956,7 +988,7 @@ class CommandTests(IsolatedBuildHoldTest):
 class ReleaseStateTests(IsolatedBuildHoldTest):
     def begin(self, *session_ids: str, recipients: tuple[tuple[str, str], ...] = ()) -> datetime:
         now = datetime.now().astimezone()
-        _ = build_hold.start_hold(self.scratch / "holders", "holder", "the test", build_hold.NoReleaseEta(), now)
+        _ = build_hold.start_hold(self.scratch / "holders", build_hold.HolderIdentity("holder", "holder"), "the test", build_hold.NoReleaseEta(), now)
         build_hold.record_recipients([("shared name", session_id) for session_id in session_ids])
         for session_id in session_ids:
             self.assertIn("registered", build_hold.register_wait(session_id))
@@ -1250,7 +1282,7 @@ class ReleaseStateTests(IsolatedBuildHoldTest):
         cycle["entries"][0].update({"state": "ReleasedAwaitingAdmission", "released_at": "broken"})
         build_hold.save_cycle(cycle)
         (self.scratch / "holders" / "holder").unlink()
-        notice = build_hold.start_hold(self.scratch / "holders", "new-holder", "new test",
+        notice = build_hold.start_hold(self.scratch / "holders", build_hold.HolderIdentity("new-holder", "new-holder"), "new test",
                                        build_hold.NoReleaseEta(), datetime.now().astimezone())
         self.assertIn("new-holder", notice)
         current = build_hold.read_cycle()
@@ -1268,7 +1300,7 @@ class ReleaseStateTests(IsolatedBuildHoldTest):
         build_hold.save_cycle(cycle)
         output = io.StringIO()
         with redirect_stdout(output):
-            notice = build_hold.start_hold(self.scratch / "holders", "new-holder", "new test",
+            notice = build_hold.start_hold(self.scratch / "holders", build_hold.HolderIdentity("new-holder", "new-holder"), "new test",
                                            build_hold.NoReleaseEta(), datetime.now().astimezone())
         self.assertIn("new-holder", notice)
         self.assertIn("this hold now releases every session at once", output.getvalue() + notice)
@@ -1297,7 +1329,7 @@ class ReleaseStateTests(IsolatedBuildHoldTest):
         old_cycle = build_hold.read_cycle()
         assert old_cycle is not None
         (self.scratch / "holders" / "holder").unlink()
-        _ = build_hold.start_hold(self.scratch / "holders", "new-holder", "new test",
+        _ = build_hold.start_hold(self.scratch / "holders", build_hold.HolderIdentity("new-holder", "new-holder"), "new test",
                                   build_hold.NoReleaseEta(), datetime.now().astimezone())
         current = build_hold.read_cycle()
         assert current is not None
@@ -1359,8 +1391,8 @@ class ReleaseStateTests(IsolatedBuildHoldTest):
         now = datetime.now().astimezone()
         first_since = now - timedelta(minutes=10)
         second_since = now - timedelta(minutes=5)
-        _ = build_hold.start_hold(folder, "first", "first test", build_hold.NoReleaseEta(), first_since)
-        _ = build_hold.start_hold(folder, "second", "second test", build_hold.NoReleaseEta(), second_since)
+        _ = build_hold.start_hold(folder, build_hold.HolderIdentity("first", "first"), "first test", build_hold.NoReleaseEta(), first_since)
+        _ = build_hold.start_hold(folder, build_hold.HolderIdentity("second", "second"), "second test", build_hold.NoReleaseEta(), second_since)
         partial = build_hold.release_cycle(folder, "first")
         self.assertIn("still held by second", partial)
         cycle = build_hold.read_cycle()
@@ -1523,7 +1555,7 @@ class ClosedQueueTests(IsolatedBuildHoldTest):
 
     def begin(self, *keys: str, calls: tuple[tuple[str, str], ...] = (), release: bool = True) -> None:
         (self.scratch / "holders" / "holder").unlink(missing_ok=True)
-        _ = build_hold.start_hold(self.scratch / "holders", "holder", "closed queue test",
+        _ = build_hold.start_hold(self.scratch / "holders", build_hold.HolderIdentity("holder", "holder"), "closed queue test",
                                   build_hold.NoReleaseEta(), self.now)
         build_hold.record_recipients([(key, key) for key in keys])
         for key in keys:
@@ -1744,7 +1776,7 @@ class ClosedQueueTests(IsolatedBuildHoldTest):
     def test_holder_joining_during_a_release_reopens_the_queue(self) -> None:
         self.begin("owner")
         generation = self.cycle().get("holder_generation", 1)
-        _ = build_hold.start_hold(self.scratch / "holders", "new-holder", "new hold",
+        _ = build_hold.start_hold(self.scratch / "holders", build_hold.HolderIdentity("new-holder", "new-holder"), "new hold",
                                   build_hold.NoReleaseEta(), self.now + timedelta(seconds=1))
         self.assertEqual(self.cycle()["release_started_at"], "")
         self.assertGreater(self.cycle().get("holder_generation", 1), generation)
@@ -1917,7 +1949,7 @@ class ClosedQueueTests(IsolatedBuildHoldTest):
         self.assertEqual(self.entry("owner")["state"], "NoAdmissionAck")
         self.assertIsInstance(build_hold.read_admission("owner"), build_hold.AdmittedTurn)
         self.now += timedelta(seconds=1)
-        _ = build_hold.start_hold(self.scratch / "holders", "new-holder", "another hold",
+        _ = build_hold.start_hold(self.scratch / "holders", build_hold.HolderIdentity("new-holder", "new-holder"), "another hold",
                                   build_hold.NoReleaseEta(), self.now)
         self.assertIsInstance(build_hold.read_admission("owner"), build_hold.AwaitingTurn)
         _ = build_hold.register_wait("owner")
@@ -1929,6 +1961,619 @@ class ClosedQueueTests(IsolatedBuildHoldTest):
         _ = build_hold.answer_nothing_to_build("owner")
         _ = self.advance()
         self.assertEqual(self.sent().count("owner"), 2)
+
+
+HolderFileContent = TypedDict("HolderFileContent", {"holder": str, "since": str, "for": str, "release_eta": str})
+
+
+class ReleaseDriverTests(IsolatedBuildHoldTest):
+    now: datetime = datetime.min
+    replaced_at: datetime = datetime.min
+    sent: list[str] = []
+
+    @override
+    def setUp(self) -> None:
+        super().setUp()
+        self.now = datetime.now().astimezone() - timedelta(hours=1)
+        self.sent = []
+        _ = self.enterContext(mock.patch.object(build_hold, "socket_for", return_value=build_hold.RecipientLive("/test/socket")))
+        _ = self.enterContext(mock.patch.object(build_hold, "send_release", side_effect=self.deliver))
+        clock = cast(mock.Mock, self.enterContext(mock.patch.object(build_hold, "datetime", wraps=datetime)))
+        cast(mock.Mock, clock.now).side_effect = self.clock_now
+
+    def clock_now(self, *zones: tzinfo) -> datetime:
+        return self.now.astimezone(zones[0]) if zones else self.now
+
+    def deliver(self, entry: build_hold.ReleaseEntry, _socket: str) -> build_hold.ReleaseDelivered:
+        self.sent.append(entry["session_id"])
+        return build_hold.ReleaseDelivered()
+
+    def cycle(self) -> build_hold.HoldCycle:
+        cycle = build_hold.read_cycle()
+        assert cycle is not None
+        return cycle
+
+    def begin(self, name: str = "holder") -> Path:
+        folder = self.scratch / "holders"
+        _ = build_hold.start_hold(folder, build_hold.HolderIdentity(name, name), "first hold", build_hold.NoReleaseEta(), self.now)
+        build_hold.record_recipients([("first", "first"), ("second", "second"), ("third", "third")])
+        _ = build_hold.register_wait("first", call_id="first-call")
+        return folder
+
+    def finish_turn(self, _seconds: float) -> None:
+        self.now += timedelta(seconds=build_hold.RELEASE_POLL_S)
+        for entry in self.cycle()["entries"]:
+            if entry["state"] in ("ReleasedAwaitingAdmission", "DeliveryQueued"):
+                _ = build_hold.answer_nothing_to_build(entry["session_id"])
+
+    def test_driver_stops_when_its_holder_places_a_new_hold(self) -> None:
+        folder = self.begin()
+        replaced = False
+
+        def sleep(seconds: float) -> None:
+            nonlocal replaced
+            if not replaced:
+                self.now += timedelta(seconds=seconds)
+                self.replaced_at = self.now
+                _ = build_hold.start_hold(folder, build_hold.HolderIdentity("holder", "holder"), "new hold", build_hold.NoReleaseEta(), self.now)
+                replaced = True
+            else:
+                self.finish_turn(seconds)
+
+        with mock.patch.object(time, "sleep", side_effect=sleep), redirect_stdout(io.StringIO()):
+            line = build_hold.release_cycle(folder, "holder")
+        self.assertEqual(line, self.stop_line())
+        self.assertEqual(self.sent, ["first"])
+        holder = build_hold.read_holder(folder / "holder")
+        self.assertEqual(holder.since, self.replaced_at)
+        cycle = self.cycle()
+        self.assertEqual(cycle["holders"]["holder"]["released_at"], "")
+        self.assertEqual(cycle["release_started_at"], "")
+        self.assertTrue(all(entry["state"] == "AwaitingRelease" for entry in cycle["entries"]))
+
+    def test_status_and_driver_stop_use_user_zone_when_machine_zone_differs(self) -> None:
+        with mock.patch.dict(os.environ, {"TZ": "UTC", "USER_ZONE": "America/New_York"}):
+            try:
+                time.tzset()
+                self.test_driver_stops_when_its_holder_places_a_new_hold()
+                self.assertIn(self.replaced_at.astimezone(user_zone()).strftime("%H:%M %Z"), self.stop_line())
+            finally:
+                time.tzset()
+
+    def stop_line(self, name: str = "holder") -> str:
+        return (f"release stopped: {name} placed a new hold at {self.replaced_at.astimezone(user_zone()):%H:%M %Z}; "
+                "that hold's release serves the sessions still waiting.")
+
+    def record_path(self) -> Path:
+        return self.scratch / "release" / self.cycle()["id"] / "cycle.json"
+
+    def resume_error(self, folder: Path) -> str:
+        state = build_hold.read_holders(folder)
+        assert isinstance(state, build_hold.ActiveHolders)
+        return ("a hold is in force (" + "; ".join(build_hold.holder_text(holder) for holder in state.holders)
+                + "); --resume only continues a release already begun. Release that hold without --resume.")
+
+    def replace_during_sleep(self, folder: Path, *, another: bool = False, release_new: bool = False) -> str:
+        replaced = False
+        saved: list[bytes] = []
+
+        def sleep(seconds: float) -> None:
+            nonlocal replaced
+            if replaced:
+                self.finish_turn(seconds)
+                return
+            replaced = True
+            self.now += timedelta(seconds=seconds)
+            self.replaced_at = self.now
+            _ = build_hold.start_hold(folder, build_hold.HolderIdentity("holder", "holder"), "new hold", build_hold.NoReleaseEta(), self.now)
+            if another:
+                _ = build_hold.start_hold(folder, build_hold.HolderIdentity("other", "other"), "other hold", build_hold.NoReleaseEta(), self.now)
+            if release_new:
+                with mock.patch.object(time, "sleep", side_effect=RuntimeError("Driver paused at its poll")):
+                    with self.assertRaisesRegex(RuntimeError, "Driver paused at its poll"):
+                        _ = build_hold.release_cycle(folder, "holder")
+            saved.append(self.record_path().read_bytes())
+
+        with mock.patch.object(time, "sleep", side_effect=sleep), redirect_stdout(io.StringIO()):
+            line = build_hold.release_cycle(folder, "holder")
+        self.assertEqual(line, self.stop_line())
+        self.assertEqual(self.record_path().read_bytes(), saved[0])
+        self.assertTrue((folder / "holder").is_file())
+        return line
+
+    def test_sessions_left_waiting_get_one_message_from_the_new_holds_release(self) -> None:
+        folder = self.begin()
+        _ = self.replace_during_sleep(folder)
+        expected_error = self.resume_error(folder)
+        before = self.record_path().read_bytes()
+        output, errors = io.StringIO(), io.StringIO()
+        with redirect_stdout(output), redirect_stderr(errors):
+            self.assertEqual(build_hold.main(["release", "--resume"]), 1)
+        self.assertEqual(errors.getvalue(), f"build_hold: {expected_error}\n")
+        self.assertEqual(self.record_path().read_bytes(), before)
+        with mock.patch.object(time, "sleep", side_effect=self.finish_turn), redirect_stdout(io.StringIO()):
+            line = build_hold.release_cycle(folder, "holder")
+        self.assertTrue(line.startswith("released, builds may resume."))
+        self.assertEqual(self.sent, ["first", "first", "second", "third"])
+        self.assertFalse((folder / "holder").exists())
+
+    def test_resume_refuses_a_new_hold_whose_name_uses_a_released_holds_file(self) -> None:
+        folder = self.begin("night run")
+        with mock.patch.object(time, "sleep", side_effect=RuntimeError("Driver paused at its poll")), \
+             redirect_stdout(io.StringIO()):
+            with self.assertRaisesRegex(RuntimeError, "Driver paused at its poll"):
+                _ = build_hold.release_cycle(folder, "night run")
+        self.now += timedelta(seconds=build_hold.RELEASE_POLL_S)
+        self.replaced_at = self.now
+        _ = build_hold.start_hold(folder, build_hold.HolderIdentity("night-run", "night-run"), "new hold", build_hold.NoReleaseEta(), self.now)
+        self.assertEqual([holder.name for holder in build_hold.live_holds(self.cycle(), folder)], ["night-run"])
+        before = self.record_path().read_bytes()
+        for arguments in (["release", "--resume"], ["release", "--resume", "--holder", "night run"],
+                          ["release", "--resume", "--holder", "night-run"]):
+            with self.subTest(arguments=arguments):
+                output, errors = io.StringIO(), io.StringIO()
+                with mock.patch.object(time, "sleep", side_effect=self.finish_turn), \
+                     redirect_stdout(output), redirect_stderr(errors):
+                    self.assertEqual(build_hold.main(arguments), 1)
+                self.assertEqual(output.getvalue(), "")
+                self.assertEqual(errors.getvalue(), f"build_hold: {self.resume_error(folder)}\n")
+                self.assertEqual(self.record_path().read_bytes(), before)
+                self.assertEqual(build_hold.read_holder(folder / "night-run").since, self.replaced_at)
+                self.assertEqual(self.sent, ["first"])
+
+    def test_release_command_stops_when_another_name_replaces_its_hold_file(self) -> None:
+        folder = self.begin("night run")
+        replaced = False
+        saved: list[bytes] = []
+
+        def sleep(seconds: float) -> None:
+            nonlocal replaced
+            if replaced:
+                self.finish_turn(seconds)
+                return
+            replaced = True
+            self.now += timedelta(seconds=seconds)
+            self.replaced_at = self.now
+            _ = build_hold.start_hold(folder, build_hold.HolderIdentity("night-run", "night-run"), "new hold", build_hold.NoReleaseEta(), self.now)
+            saved.append(self.record_path().read_bytes())
+
+        output, errors = io.StringIO(), io.StringIO()
+        with mock.patch.object(time, "sleep", side_effect=sleep), redirect_stdout(output), redirect_stderr(errors):
+            self.assertEqual(build_hold.main(["release", "--holder", "night run"]), 0)
+        self.assertEqual(output.getvalue().splitlines()[-1], self.stop_line("night-run"))
+        self.assertEqual(errors.getvalue(), "")
+        self.assertEqual(self.sent, ["first"])
+        self.assertEqual(build_hold.read_holder(folder / "night-run").since, self.replaced_at)
+        self.assertEqual(self.record_path().read_bytes(), saved[0])
+
+    def test_driver_stops_when_the_new_hold_was_released_within_one_poll(self) -> None:
+        folder = self.begin()
+        _ = self.replace_during_sleep(folder, release_new=True)
+        self.assertTrue(self.cycle()["holders"]["holder"]["released_at"])
+        self.assertTrue(self.cycle()["release_started_at"])
+        self.assertEqual(self.sent, ["first", "first"])
+
+    def pause_release(self, folder: Path, name: str) -> None:
+        with mock.patch.object(time, "sleep", side_effect=RuntimeError("Driver paused at its poll")), \
+             redirect_stdout(io.StringIO()):
+            with self.assertRaisesRegex(RuntimeError, "Driver paused at its poll"):
+                _ = build_hold.release_cycle(folder, name)
+
+    def test_release_with_a_holder_since_that_is_not_a_time_ends_the_hold(self) -> None:
+        for arguments in (["release", "--holder", "holder"], ["release", "--resume"],
+                          ["release", "--resume", "--holder", "holder"]):
+            with self.subTest(arguments=arguments):
+                folder = self.begin()
+                path = self.record_path()
+                cycle = self.cycle()
+                cycle["holders"]["holder"]["since"] = "not a time"
+                build_hold.save_cycle(cycle)
+                before = path.read_bytes()
+                output, errors = io.StringIO(), io.StringIO()
+                with redirect_stdout(output), redirect_stderr(errors):
+                    self.assertEqual(build_hold.main(arguments), 0, errors.getvalue())
+                self.assertEqual(errors.getvalue(), "")
+                self.assertEqual(output.getvalue().splitlines()[-1],
+                                 "released, builds may resume. No hold cycle: broadcast this release to every session.")
+                self.assertFalse((folder / "holder").exists())
+                copies = list(path.parent.glob("cycle.json.damaged-*"))
+                self.assertEqual(len(copies), 1)
+                self.assertEqual(copies[0].read_bytes(), before)
+                self.assertFalse((self.scratch / "release" / "current").exists())
+                self.assertEqual(self.sent, [])
+
+    def test_resume_for_a_missing_holder_refuses_other_holds_before_held_nothing(self) -> None:
+        folder = self.begin()
+        path = self.record_path()
+        before = path.read_bytes()
+        with self.assertRaises(ValueError) as refused:
+            _ = build_hold.release_cycle(folder, "missing", build_hold.ResumedRelease())
+        self.assertEqual(str(refused.exception), self.resume_error(folder))
+        self.assertEqual(path.read_bytes(), before)
+        self.assertTrue((folder / "holder").is_file())
+        self.assertEqual(self.sent, [])
+        (folder / "holder").unlink()
+        with self.assertRaises(ValueError) as absent:
+            _ = build_hold.release_cycle(folder, "missing", build_hold.ResumedRelease())
+        self.assertEqual(str(absent.exception), "missing held nothing")
+        self.assertEqual(path.read_bytes(), before)
+        self.assertEqual(self.sent, [])
+
+    def test_resume_under_another_name_keeps_the_recorded_release_time(self) -> None:
+        folder = self.begin("night run")
+        self.pause_release(folder, "night run")
+        released_at = self.cycle()["holders"]["night run"]["released_at"].encode()
+        self.assertTrue(released_at)
+        self.now += timedelta(seconds=build_hold.RELEASE_POLL_S)
+        output, errors = io.StringIO(), io.StringIO()
+        with mock.patch.object(time, "sleep", side_effect=self.finish_turn), \
+             redirect_stdout(output), redirect_stderr(errors):
+            self.assertEqual(build_hold.main(["release", "--resume", "--holder", "night-run"]), 0)
+        self.assertEqual(self.cycle()["holders"]["night run"]["released_at"].encode(), released_at)
+        self.assertTrue(output.getvalue().splitlines()[-1].startswith("released, builds may resume."))
+        self.assertEqual(errors.getvalue(), "")
+        self.assertEqual(self.sent, ["first", "second", "third"])
+        self.assertFalse((folder / "night-run").exists())
+
+    def test_plain_release_under_the_old_name_releases_the_current_hold_instance(self) -> None:
+        folder = self.begin("night run")
+        self.pause_release(folder, "night run")
+        self.now += timedelta(seconds=build_hold.RELEASE_POLL_S)
+        _ = build_hold.start_hold(folder, build_hold.HolderIdentity("night-run", "night-run"), "new hold", build_hold.NoReleaseEta(), self.now)
+        self.pause_release(folder, "night run")
+        holder = build_hold.read_holder(folder / "night-run")
+        matching = [instants for key, instants in self.cycle()["holders"].items()
+                    if build_hold.holder_path(folder, key).name == holder.key
+                    and build_hold.aware_instant(instants["since"]) == holder.since]
+        self.assertTrue(any(instants["released_at"] for instants in matching),
+                        "The current hold instance must have a recorded release")
+        self.assertEqual(build_hold.live_holds(self.cycle(), folder), ())
+
+    def test_release_records_the_files_since_when_its_holder_entry_is_missing(self) -> None:
+        folder = self.begin()
+        holder = build_hold.read_holder(folder / "holder")
+        cycle = self.cycle()
+        del cycle["holders"]["holder"]
+        build_hold.save_cycle(cycle)
+        self.now += timedelta(seconds=build_hold.RELEASE_POLL_S)
+        self.pause_release(folder, "holder")
+        recorded = self.cycle()["holders"]["holder"]
+        self.assertEqual(build_hold.aware_instant(recorded["since"]), holder.since)
+        self.assertTrue(recorded["released_at"])
+        self.assertEqual(build_hold.live_holds(self.cycle(), folder), ())
+
+    def test_resume_lookup_selects_the_released_instance_in_the_holder_file(self) -> None:
+        folder = self.begin("night run")
+        self.pause_release(folder, "night run")
+        self.now += timedelta(seconds=build_hold.RELEASE_POLL_S)
+        _ = build_hold.start_hold(folder, build_hold.HolderIdentity("night-run", "night-run"), "new hold", build_hold.NoReleaseEta(), self.now)
+        self.pause_release(folder, "night-run")
+        since = build_hold.read_holder(folder / "night-run").since
+        release = build_hold.release_cycle
+        selected: list[str] = []
+
+        def resume(directory: Path, name: str, start: build_hold.FirstRelease | build_hold.ResumedRelease) -> str:
+            selected.append(name)
+            self.assertEqual(build_hold.aware_instant(self.cycle()["holders"][name]["since"]), since)
+            return release(directory, name, start)
+
+        with mock.patch.object(build_hold, "release_cycle", side_effect=resume), \
+             mock.patch.object(time, "sleep", side_effect=self.finish_turn), \
+             redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+            self.assertEqual(build_hold.main(["release", "--resume"]), 0)
+        self.assertEqual(selected, ["night-run"])
+        self.assertFalse((folder / "night-run").exists())
+
+    def test_replaced_hold_keeps_its_file_when_another_holder_joined(self) -> None:
+        folder = self.begin()
+        _ = self.replace_during_sleep(folder, another=True)
+        self.assertTrue((folder / "other").is_file())
+        self.assertEqual(self.sent, ["first"])
+        self.assertEqual(self.cycle()["holders"]["holder"]["released_at"], "")
+
+    def test_another_holder_joining_ends_the_driver_as_before(self) -> None:
+        folder = self.begin()
+
+        def sleep(seconds: float) -> None:
+            self.now += timedelta(seconds=seconds)
+            _ = build_hold.start_hold(folder, build_hold.HolderIdentity("other", "other"), "other hold", build_hold.NoReleaseEta(), self.now)
+
+        with mock.patch.object(time, "sleep", side_effect=sleep), redirect_stdout(io.StringIO()):
+            line = build_hold.release_cycle(folder, "holder")
+        self.assertEqual(line, "released; still held by " + build_hold.holder_text(build_hold.read_holder(folder / "other")))
+        self.assertFalse((folder / "holder").exists())
+        self.assertTrue((folder / "other").exists())
+        self.assertEqual(self.sent, ["first"])
+
+    def test_release_under_a_name_with_a_space_lists_only_the_other_holder(self) -> None:
+        folder = self.begin("night run")
+        _ = build_hold.start_hold(folder, build_hold.HolderIdentity("other", "other"), "other hold", build_hold.NoReleaseEta(), self.now)
+        expected = "released; still held by " + build_hold.holder_text(build_hold.read_holder(folder / "other"))
+        output, errors = io.StringIO(), io.StringIO()
+        with redirect_stdout(output), redirect_stderr(errors):
+            self.assertEqual(build_hold.main(["release", "--holder", "night run"]), 0)
+        self.assertEqual(output.getvalue(), expected + "\n")
+        self.assertEqual(errors.getvalue(), "")
+        self.assertFalse((folder / "night-run").exists())
+        self.assertTrue((folder / "other").is_file())
+        self.assertEqual(self.sent, [])
+
+    def test_driver_ends_when_another_release_finished_the_queue(self) -> None:
+        folder = self.begin()
+        finished = False
+
+        def sleep(_seconds: float) -> None:
+            nonlocal finished
+            self.assertFalse(finished, "The old driver must end on its next pass")
+            finished = True
+            with mock.patch.object(time, "sleep", side_effect=self.finish_turn):
+                _ = build_hold.release_cycle(folder, "holder")
+
+        with mock.patch.object(time, "sleep", side_effect=sleep), redirect_stdout(io.StringIO()):
+            try:
+                line = build_hold.release_cycle(folder, "holder")
+            except ValueError as error:
+                self.fail(f"A completed release must end with a line, not {error}")
+        self.assertEqual(line, "release ended: another release command finished it; builds may resume.")
+        self.assertFalse((folder / "holder").exists())
+        self.assertEqual(self.sent, ["first", "second", "third"])
+
+    def test_resume_refuses_a_hold_placed_after_its_lookup(self) -> None:
+        folder = self.begin()
+        cycle = self.cycle()
+        cycle["holders"]["holder"]["released_at"] = self.now.isoformat()
+        cycle["release_started_at"] = self.now.isoformat()
+        build_hold.save_cycle(cycle)
+        self.now += timedelta(seconds=1)
+        _ = build_hold.start_hold(folder, build_hold.HolderIdentity("holder", "holder"), "new hold after lookup", build_hold.NoReleaseEta(), self.now)
+        before = self.record_path().read_bytes()
+        with self.assertRaises(ValueError) as refused:
+            _ = build_hold.release_cycle(folder, "holder", build_hold.ResumedRelease())
+        self.assertEqual(str(refused.exception), self.resume_error(folder))
+        self.assertEqual(self.record_path().read_bytes(), before)
+        self.assertTrue((folder / "holder").is_file())
+        self.assertEqual(self.sent, [])
+
+    def test_release_command_ends_and_names_every_remaining_holder(self) -> None:
+        folder = self.begin()
+        finished = False
+
+        def sleep(seconds: float) -> None:
+            nonlocal finished
+            self.assertFalse(finished, "The old driver must end on its next pass")
+            finished = True
+            self.now += timedelta(seconds=seconds)
+            _ = build_hold.start_hold(folder, build_hold.HolderIdentity("other", "other"), "other hold", build_hold.NoReleaseEta(), self.now)
+            _ = build_hold.start_hold(folder, build_hold.HolderIdentity("third-holder", "third-holder"), "third hold", build_hold.NoReleaseEta(), self.now)
+            _ = build_hold.release_cycle(folder, "holder")
+
+        output, errors = io.StringIO(), io.StringIO()
+        with mock.patch.object(time, "sleep", side_effect=sleep), redirect_stdout(output), redirect_stderr(errors):
+            self.assertEqual(build_hold.main(["release", "--holder", "holder"]), 0)
+        state = build_hold.read_holders(folder)
+        assert isinstance(state, build_hold.ActiveHolders)
+        expected = ("release ended: another release command finished it; still held by "
+                    + "; ".join(build_hold.holder_text(holder) for holder in state.holders))
+        self.assertEqual(output.getvalue().splitlines()[-1], expected)
+        self.assertNotIn("builds may resume", output.getvalue())
+        self.assertEqual(errors.getvalue(), "")
+        self.assertEqual([holder.name for holder in state.holders], ["other", "third-holder"])
+        self.assertEqual(self.sent, ["first"])
+
+    def test_release_command_ends_with_exit_zero_when_no_holder_remains(self) -> None:
+        folder = self.begin()
+        finished = False
+
+        def sleep(_seconds: float) -> None:
+            nonlocal finished
+            self.assertFalse(finished, "The old driver must end on its next pass")
+            finished = True
+            with mock.patch.object(time, "sleep", side_effect=self.finish_turn):
+                _ = build_hold.release_cycle(folder, "holder")
+
+        output, errors = io.StringIO(), io.StringIO()
+        with mock.patch.object(time, "sleep", side_effect=sleep), redirect_stdout(output), redirect_stderr(errors):
+            self.assertEqual(build_hold.main(["release", "--holder", "holder"]), 0)
+        self.assertEqual(output.getvalue().splitlines()[-1],
+                         "release ended: another release command finished it; builds may resume.")
+        self.assertEqual(errors.getvalue(), "")
+        self.assertFalse((folder / "holder").exists())
+        self.assertEqual(self.sent, ["first", "second", "third"])
+
+    def test_replacement_hold_stops_the_driver_before_it_reads_a_damaged_record(self) -> None:
+        folder = self.begin()
+        path = self.record_path()
+        current = self.scratch / "release" / "current"
+        cycle_id = self.cycle()["id"]
+        replaced = False
+        files: list[str] = []
+
+        def sleep(seconds: float) -> None:
+            nonlocal replaced
+            self.assertFalse(replaced, "A replacement must stop the next pass")
+            replaced = True
+            self.now += timedelta(seconds=seconds)
+            self.replaced_at = self.now
+            _ = path.write_text("{broken")
+            _ = build_hold.start_hold(folder, build_hold.HolderIdentity("holder", "holder"), "new hold", build_hold.NoReleaseEta(), self.now)
+            _ = path.write_text("{still broken")
+            _ = current.write_text(cycle_id + "\n")
+            files.extend(sorted(file.name for file in path.parent.iterdir()))
+
+        with mock.patch.object(time, "sleep", side_effect=sleep), redirect_stdout(io.StringIO()):
+            line = build_hold.release_cycle(folder, "holder")
+        self.assertEqual(line, self.stop_line())
+        self.assertEqual(build_hold.read_holder(folder / "holder").since, self.replaced_at)
+        self.assertEqual(self.sent, ["first"])
+        self.assertEqual(path.read_text(), "{still broken")
+        self.assertEqual(sorted(file.name for file in path.parent.iterdir()), files)
+        self.assertEqual(current.read_text(), cycle_id + "\n")
+
+    def test_unchanged_hold_with_a_damaged_record_at_a_later_pass_is_released(self) -> None:
+        folder = self.begin()
+        path = self.record_path()
+        original = build_hold.read_holder(folder / "holder").since
+
+        def sleep(_seconds: float) -> None:
+            self.assertEqual(build_hold.read_holder(folder / "holder").since, original)
+            _ = path.write_text("{broken")
+
+        with mock.patch.object(time, "sleep", side_effect=sleep), redirect_stdout(io.StringIO()):
+            line = build_hold.release_cycle(folder, "holder")
+        self.assertEqual(line, "released, builds may resume. No hold cycle: broadcast this release to every session.")
+        self.assertFalse((folder / "holder").exists())
+        copies = list(path.parent.glob("cycle.json.damaged-*"))
+        self.assertEqual(len(copies), 1)
+        self.assertEqual(copies[0].read_text(), "{broken")
+        self.assertEqual(self.sent, ["first"])
+
+    def test_removed_holder_ends_the_driver_without_reading_a_damaged_record(self) -> None:
+        folder = self.begin()
+        path = self.record_path()
+        files: list[str] = []
+
+        def sleep(_seconds: float) -> None:
+            with mock.patch.object(time, "sleep", side_effect=self.finish_turn):
+                _ = build_hold.release_cycle(folder, "holder")
+            _ = path.write_text("{broken")
+            files.extend(sorted(file.name for file in path.parent.iterdir()))
+
+        output, errors = io.StringIO(), io.StringIO()
+        with mock.patch.object(time, "sleep", side_effect=sleep), redirect_stdout(output), redirect_stderr(errors):
+            self.assertEqual(build_hold.main(["release", "--holder", "holder"]), 0)
+        self.assertEqual(output.getvalue().splitlines()[-1],
+                         "release ended: another release command finished it; builds may resume.")
+        self.assertEqual(errors.getvalue(), "")
+        self.assertEqual(path.read_text(), "{broken")
+        self.assertEqual(sorted(file.name for file in path.parent.iterdir()), files)
+        self.assertEqual(self.sent, ["first", "second", "third"])
+
+    def test_hold_under_a_name_with_a_space_is_in_force_until_released(self) -> None:
+        folder = self.begin("night run")
+        self.assertEqual([holder.name for holder in build_hold.live_holds(self.cycle(), folder)], ["night run"])
+        seen: list[tuple[build_hold.Holder, ...]] = []
+
+        def sleep(seconds: float) -> None:
+            seen.append(build_hold.live_holds(self.cycle(), folder))
+            self.finish_turn(seconds)
+
+        with mock.patch.object(time, "sleep", side_effect=sleep), redirect_stdout(io.StringIO()):
+            _ = build_hold.release_cycle(folder, "night run")
+        self.assertTrue(seen)
+        self.assertTrue(all(not holders for holders in seen))
+        self.assertEqual(build_hold.live_holds(self.cycle(), folder), ())
+        self.assertFalse(build_hold.holder_path(folder, "night run").exists())
+
+    def test_resume_refuses_while_a_hold_is_in_force(self) -> None:
+        folder = self.begin()
+        for arguments in (["release", "--resume"], ["release", "--resume", "--holder", "holder"]):
+            with self.subTest(arguments=arguments):
+                before = self.record_path().read_bytes()
+                expected = self.resume_error(folder)
+                output, errors = io.StringIO(), io.StringIO()
+                with mock.patch.object(time, "sleep", side_effect=self.finish_turn), redirect_stdout(output), redirect_stderr(errors):
+                    code = build_hold.main(arguments)
+                self.assertEqual(code, 1, output.getvalue())
+                self.assertEqual(errors.getvalue(), f"build_hold: {expected}\n")
+                self.assertEqual(output.getvalue(), "")
+                self.assertEqual(self.record_path().read_bytes(), before)
+                self.assertTrue((folder / "holder").is_file())
+
+    def test_resume_continues_a_release_with_no_hold_in_force(self) -> None:
+        folder = self.begin()
+        cycle = self.cycle()
+        cycle["holders"]["holder"]["released_at"] = self.now.isoformat()
+        cycle["release_started_at"] = self.now.isoformat()
+        build_hold.save_cycle(cycle)
+        output, errors = io.StringIO(), io.StringIO()
+        with mock.patch.object(time, "sleep", side_effect=self.finish_turn), redirect_stdout(output), redirect_stderr(errors):
+            self.assertEqual(build_hold.main(["release", "--resume"]), 0)
+        self.assertEqual(errors.getvalue(), "")
+        self.assertTrue(output.getvalue().splitlines()[-1].startswith("released, builds may resume."))
+        self.assertFalse((folder / "holder").exists())
+        self.assertEqual(self.sent, ["first", "second", "third"])
+
+    def test_cycle_record_is_whole_at_the_moment_it_is_renamed(self) -> None:
+        for existing in (False, True):
+            with self.subTest(existing=existing):
+                cycle = build_hold.open_cycle(self.now)
+                path = self.record_path()
+                old = path.read_bytes() if existing else b""
+                if not existing:
+                    path.unlink()
+                cycle["release_started_at"] = self.now.isoformat()
+                whole = (json.dumps(cycle, ensure_ascii=False) + "\n").encode()
+                replace = os.replace
+                seen: list[Path] = []
+
+                def rename(source: Path, destination: Path) -> None:
+                    self.assertEqual(destination, path)
+                    self.assertEqual(path.read_bytes() if path.exists() else b"", old)
+                    self.assertEqual(source.read_bytes(), whole)
+                    seen.append(source)
+                    replace(source, destination)
+
+                with mock.patch.object(os, "replace", side_effect=rename):
+                    build_hold.save_cycle(cycle)
+                self.assertEqual(seen, [path.with_suffix(".tmp")])
+                self.assertEqual(path.read_bytes(), whole)
+
+    def test_current_is_whole_at_the_moment_it_is_renamed(self) -> None:
+        for existing in (False, True):
+            with self.subTest(existing=existing):
+                path = self.scratch / "release" / "current"
+                if existing:
+                    _ = build_hold.open_cycle(self.now)
+                else:
+                    path.unlink(missing_ok=True)
+                old = path.read_bytes() if path.exists() else b""
+                replace = os.replace
+                seen: list[bytes] = []
+
+                def rename(source: Path, destination: Path) -> None:
+                    if destination == path:
+                        self.assertEqual(path.read_bytes() if path.exists() else b"", old)
+                        new = source.read_bytes()
+                        self.assertRegex(new.decode(), r"^[0-9a-f]{32}\n$")
+                        self.assertEqual(source, path.with_name("current.tmp"))
+                        self.assertTrue((path.parent / new.decode().strip() / "cycle.json").is_file())
+                        seen.append(new)
+                    replace(source, destination)
+
+                with mock.patch.object(os, "replace", side_effect=rename):
+                    cycle = build_hold.open_cycle(self.now)
+                self.assertEqual(seen, [(cycle["id"] + "\n").encode()])
+                self.assertEqual(path.read_bytes(), seen[0])
+
+    def test_holder_file_is_whole_at_the_moment_it_is_renamed(self) -> None:
+        folder = self.scratch / "holders"
+        for existing in (False, True):
+            with self.subTest(existing=existing):
+                path = build_hold.holder_path(folder, "holder")
+                if existing:
+                    _ = build_hold.write_hold(folder, build_hold.HolderIdentity("holder", "holder"), "old purpose", build_hold.NoReleaseEta(), self.now)
+                else:
+                    path.unlink(missing_ok=True)
+                old = path.read_bytes() if path.exists() else b""
+                old_files = list(folder.iterdir()) if folder.exists() else []
+                replace = os.replace
+                seen: list[Path] = []
+
+                def rename(source: Path, destination: Path) -> None:
+                    self.assertEqual(destination, path)
+                    self.assertEqual(path.read_bytes() if path.exists() else b"", old)
+                    self.assertEqual(list(folder.iterdir()), old_files)
+                    self.assertEqual(source, folder.parent / f"{folder.name}.{path.name}.tmp")
+                    content = cast(object, json.loads(source.read_text()))
+                    expected: HolderFileContent = {"holder": "holder", "since": self.now.isoformat(), "for": "new purpose", "release_eta": "unknown"}
+                    self.assertEqual(content, expected)
+                    seen.append(source)
+                    replace(source, destination)
+
+                with mock.patch.object(os, "replace", side_effect=rename):
+                    _ = build_hold.write_hold(folder, build_hold.HolderIdentity("holder", "holder"), "new purpose", build_hold.NoReleaseEta(), self.now)
+                self.assertEqual(seen, [folder.parent / f"{folder.name}.{path.name}.tmp"])
+                self.assertEqual(build_hold.read_holder(path).purpose, "new purpose")
 
 
 class ToldSessionReleaseTests(IsolatedBuildHoldTest):
@@ -1950,7 +2595,7 @@ class ToldSessionReleaseTests(IsolatedBuildHoldTest):
               started_calls: tuple[tuple[str, str], ...] = ()) -> None:
         folder = self.scratch / "holders"
         (folder / "holder").unlink(missing_ok=True)
-        _ = build_hold.start_hold(folder, "holder", "release coverage", build_hold.NoReleaseEta(), self.now)
+        _ = build_hold.start_hold(folder, build_hold.HolderIdentity("holder", "holder"), "release coverage", build_hold.NoReleaseEta(), self.now)
         build_hold.record_recipients([(f"name {key}", key) for key in recipients])
         for key in registered:
             _ = build_hold.register_wait(key)
@@ -2501,7 +3146,7 @@ class ToldSessionReleaseTests(IsolatedBuildHoldTest):
                 with self.subTest(state=state, current_generation=current_generation):
                     self.begin("owner", "peer")
                     self.now += timedelta(seconds=1)
-                    _ = build_hold.start_hold(self.scratch / "holders", "holder", "renewed hold",
+                    _ = build_hold.start_hold(self.scratch / "holders", build_hold.HolderIdentity("holder", "holder"), "renewed hold",
                                               build_hold.NoReleaseEta(), self.now)
                     cycle = self.cycle()
                     cycle["release_started_at"] = self.now.isoformat()
@@ -2563,7 +3208,7 @@ class ToldSessionReleaseTests(IsolatedBuildHoldTest):
         _ = self.advance()
         self.now = self.returned("owner", "call-a") + timedelta(seconds=build_hold.RELEASE_SETTLE_S)
         prior = self.entry("owner")["delivery"]["generation"]
-        _ = build_hold.start_hold(self.scratch / "holders", "second-holder", "new hold", build_hold.NoReleaseEta(), self.now)
+        _ = build_hold.start_hold(self.scratch / "holders", build_hold.HolderIdentity("second-holder", "second-holder"), "new hold", build_hold.NoReleaseEta(), self.now)
         cycle = self.cycle()
         cycle["release_started_at"] = self.now.isoformat()
         build_hold.save_cycle(cycle)
@@ -2662,7 +3307,7 @@ class CallAdmissionTests(IsolatedBuildHoldTest):
     def setUp(self) -> None:
         super().setUp()
         self.now = datetime.now().astimezone()
-        _ = build_hold.start_hold(self.scratch / "holders", "holder", "the test", build_hold.NoReleaseEta(), self.now)
+        _ = build_hold.start_hold(self.scratch / "holders", build_hold.HolderIdentity("holder", "holder"), "the test", build_hold.NoReleaseEta(), self.now)
         _ = self.enterContext(mock.patch.object(build_hold, "process_start_time", return_value="test-process"))
         _ = self.enterContext(mock.patch.object(build_hold, "socket_for", return_value=build_hold.RecipientLive("/test/socket")))
         _ = self.enterContext(mock.patch.object(build_hold, "send_release", return_value=build_hold.ReleaseDelivered()))
@@ -2752,7 +3397,7 @@ class CallAdmissionTests(IsolatedBuildHoldTest):
         self.assertIsInstance(build_hold.read_admission("owner", "seat-call"), build_hold.AdmittedTurn)
 
     def test_call_after_completed_turn_is_admitted_without_record_change(self) -> None:
-        _ = build_hold.start_hold(self.scratch / "holders", "second", "another test", build_hold.NoReleaseEta(), self.now)
+        _ = build_hold.start_hold(self.scratch / "holders", build_hold.HolderIdentity("second", "second"), "another test", build_hold.NoReleaseEta(), self.now)
         self.register("owner", "call-a")
         self.advance()
         self.complete("owner", "call-a")
@@ -2887,7 +3532,7 @@ class CallAdmissionTests(IsolatedBuildHoldTest):
         self.advance()
         self.complete("owner-a", "started")
         cycle_id = self.cycle()["id"]
-        _ = build_hold.start_hold(self.scratch / "holders", "second", "another test", build_hold.NoReleaseEta(), self.now)
+        _ = build_hold.start_hold(self.scratch / "holders", build_hold.HolderIdentity("second", "second"), "another test", build_hold.NoReleaseEta(), self.now)
         self.assertEqual(self.cycle()["id"], cycle_id)
         self.assertIsInstance(build_hold.read_admission("owner-a", "started"), build_hold.AwaitingTurn)
         self.register("owner-b", "pending")
@@ -2904,7 +3549,7 @@ class CallAdmissionTests(IsolatedBuildHoldTest):
 
     def test_new_holder_invalidates_legacy_completed_session_admission(self) -> None:
         cycle_id = self.write_legacy_completed_session()
-        _ = build_hold.start_hold(self.scratch / "holders", "second", "another test",
+        _ = build_hold.start_hold(self.scratch / "holders", build_hold.HolderIdentity("second", "second"), "another test",
                                   build_hold.NoReleaseEta(), self.now + timedelta(seconds=1))
         self.assertEqual(build_hold.read_admission("owner"), build_hold.AwaitingTurn(cycle_id, 2))
         _ = build_hold.register_wait("owner")
@@ -2964,14 +3609,14 @@ class CallAdmissionTests(IsolatedBuildHoldTest):
         self.register("owner", "started")
         self.advance()
         self.complete("owner", "started")
-        _ = build_hold.start_hold(self.scratch / "holders", "second", "another test", build_hold.NoReleaseEta(), self.now)
+        _ = build_hold.start_hold(self.scratch / "holders", build_hold.HolderIdentity("second", "second"), "another test", build_hold.NoReleaseEta(), self.now)
         self.register("owner", "pending")
         self.advance()
         self.assertIsInstance(build_hold.read_admission("owner", "started"), build_hold.AdmittedTurn)
         self.assertIsInstance(build_hold.read_admission("owner", "pending"), build_hold.AwaitingTurn)
 
     def test_hold_notice_preserves_the_existing_session_instructions(self) -> None:
-        notice = build_hold.start_hold(self.scratch / "holders", "second", "another test", build_hold.NoReleaseEta(), self.now)
+        notice = build_hold.start_hold(self.scratch / "holders", build_hold.HolderIdentity("second", "second"), "another test", build_hold.NoReleaseEta(), self.now)
         self.assertEqual(notice, "/build_hold from second: stop any cargo or verify.sh you are running and start none until I release. No release after 2 h: ask me. For: another test Run python3 ~/.claude/scripts/build_hold/build_hold.py wait now in this session.")
 
 
@@ -2992,13 +3637,161 @@ class CallAdmissionTests(IsolatedBuildHoldTest):
         before = self.cycle()
         generation = before.get("holder_generation", 1)
         _ = build_hold.mark_gate("owner", "WaitingForMemory", call_id="call-a", cycle_id=before["id"], generation=generation)
-        _ = build_hold.start_hold(self.scratch / "holders", "second", "another test", build_hold.NoReleaseEta(), self.now)
+        _ = build_hold.start_hold(self.scratch / "holders", build_hold.HolderIdentity("second", "second"), "another test", build_hold.NoReleaseEta(), self.now)
         self.advance()
         current = self.cycle()
         self.assertNotEqual(current.get("holder_generation", 1), generation)
         _ = build_hold.mark_gate("owner", "MemoryGateReturned", "Granted", call_id="call-a", cycle_id=before["id"], generation=generation)
         self.assertEqual(self.cycle(), current)
 
+
+
+class HoldEventRecord(TypedDict):
+    target: str
+    event: str
+    hold_key: str
+    holder: str
+    reason: str
+    at: str
+    until: str
+
+
+class HoldRecordingTests(IsolatedBuildHoldTest):
+    def events(self, expected: int = 1) -> list[HoldEventRecord]:
+        return recorded_hold_events(self.scratch / "buildlog", expected)
+
+    def begin(self, key: str = "session-id", name: str = "old name") -> Path:
+        folder = self.scratch / "holders"
+        _ = build_hold.start_hold(folder, build_hold.HolderIdentity(key, name), "render checks",
+                                  build_hold.NoReleaseEta(), datetime.now(timezone.utc))
+        return folder
+
+    def test_locked_log_does_not_delay_hold_or_keep_the_release_lock(self) -> None:
+        log = self.scratch / "buildlog" / socket.gethostname().split(".")[0] / f"{datetime.now(timezone.utc):%Y-%m}.jsonl"
+        log.parent.mkdir(parents=True)
+        with log.open("a+") as held_log:
+            fcntl.flock(held_log, fcntl.LOCK_EX)
+            try:
+                result = subprocess.run(
+                    ["python3", str(SCRIPT), "hold", "--holder", "alice", "--for", "render checks"],
+                    env=dict(os.environ), capture_output=True, text=True, timeout=1.5, check=False)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertIn("/build_hold from alice:", result.stdout)
+                self.assertTrue((self.scratch / "holders" / "alice").is_file())
+                with (self.scratch / "release" / "release.lock").open("a+") as coordination:
+                    fcntl.flock(coordination, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    fcntl.flock(coordination, fcntl.LOCK_UN)
+                self.assertEqual(log.read_text(), "")
+            finally:
+                fcntl.flock(held_log, fcntl.LOCK_UN)
+        self.assertEqual([(row["event"], row["hold_key"]) for row in self.events()],
+                         [("began", "alice")])
+
+    def test_recorder_starts_after_release_lock_closes_and_finished_children_are_reaped(self) -> None:
+        launched: list[subprocess.Popen[bytes]] = []
+        real_popen = subprocess.Popen
+
+        def launch(command: list[str], *, stdin: int, stdout: int, stderr: int,
+                   start_new_session: bool, close_fds: bool) -> subprocess.Popen[bytes]:
+            with (self.scratch / "release" / "release.lock").open("a+") as lock:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                fcntl.flock(lock, fcntl.LOCK_UN)
+            process = real_popen(command, stdin=stdin, stdout=stdout,
+                                 stderr=stderr, start_new_session=start_new_session, close_fds=close_fds)
+            launched.append(process)
+            self.assertTrue(start_new_session)
+            self.assertTrue(close_fds)
+            return process
+
+        with mock.patch.object(subprocess, "Popen", side_effect=launch):
+            _ = self.begin()
+        self.reap_recorders()
+        self.assertEqual(len(launched), 1)
+        self.assertEqual(launched[0].returncode, 0)
+        with self.assertRaises(ChildProcessError):
+            _ = os.waitpid(launched[0].pid, os.WNOHANG)
+
+    def test_no_holder_files_skip_a_damaged_current_record(self) -> None:
+        release = self.scratch / "release"
+        release.mkdir()
+        _ = (release / "current").write_text("damaged")
+        with mock.patch.object(build_hold, "read_cycle", side_effect=AssertionError("no files need no cycle")):
+            self.assertEqual(build_hold.natedev_holds(self.scratch / "holders"), build_hold.NatedevHolds((), ()))
+
+    def test_holder_file_without_a_cycle_is_in_force(self) -> None:
+        folder = self.scratch / "holders"
+        folder.mkdir()
+        _ = write_holder(folder, "session-id", "2026-10-12T10:00:00+00:00", "render checks")
+        result = build_hold.natedev_holds(folder)
+        self.assertEqual([holder.key for holder in result.in_force], ["session-id"])
+        self.assertEqual(result.releasing, ())
+
+    def test_released_at_with_matching_since_puts_file_in_releasing_and_reads_holders_once(self) -> None:
+        folder = self.begin()
+        cycle = build_hold.read_cycle()
+        assert cycle is not None
+        cycle["holders"]["session-id"]["released_at"] = datetime.now(timezone.utc).isoformat()
+        build_hold.save_cycle(cycle)
+        with mock.patch.object(build_hold, "read_holders", wraps=build_hold.read_holders) as read:
+            result = build_hold.natedev_holds(folder)
+        self.assertEqual(read.call_count, 1)
+        self.assertEqual(result.in_force, ())
+        self.assertEqual([holder.key for holder in result.releasing], ["session-id"])
+
+    def test_present_holder_and_damaged_cycle_raise_release_record_read_error(self) -> None:
+        folder = self.begin()
+        _ = (self.scratch / "release" / "current").write_text("damaged")
+        with self.assertRaises(build_hold.ReleaseRecordReadError):
+            _ = build_hold.natedev_holds(folder)
+
+    def test_repeated_hold_and_renamed_release_keep_one_begin_and_the_file_key(self) -> None:
+        folder = self.begin("unsafe name", "old name")
+        _ = build_hold.start_hold(folder, build_hold.HolderIdentity("unsafe name", "new name"), "new work",
+                                  build_hold.NoReleaseEta(), datetime.now(timezone.utc))
+        self.assertEqual(len(self.events()), 1)
+        _ = (self.scratch / "release" / "current").unlink()
+        _ = build_hold.release_cycle(folder, "unsafe name")
+        records = self.events(2)
+        self.assertEqual([(row["event"], row["target"], row["hold_key"]) for row in records],
+                         [("began", "natedev", "unsafe-name"), ("ended", "natedev", "unsafe-name")])
+        self.assertEqual([(row["holder"], row["reason"]) for row in records],
+                         [("old name", "render checks"), ("new name", "new work")])
+        self.assertTrue(all(datetime.fromisoformat(row["at"].replace("Z", "+00:00")).utcoffset() == timedelta(0)
+                            for row in records))
+        self.assertFalse((folder / "unsafe-name").exists())
+
+    def test_partial_and_final_release_write_end_events_only_after_file_removal(self) -> None:
+        folder = self.begin()
+        _ = build_hold.start_hold(folder, build_hold.HolderIdentity("other", "other"), "other work",
+                                  build_hold.NoReleaseEta(), datetime.now(timezone.utc))
+        _ = build_hold.release_cycle(folder, "session-id")
+        self.assertFalse((folder / "session-id").exists())
+        cycle = build_hold.read_cycle()
+        assert cycle is not None
+        cycle["release_started_at"] = (datetime.now(timezone.utc) - timedelta(minutes=2)).isoformat()
+        build_hold.save_cycle(cycle)
+        _ = build_hold.release_cycle(folder, "other")
+        self.assertFalse((folder / "other").exists())
+        self.assertEqual([(row["event"], row["hold_key"]) for row in self.events(4)],
+                         [("began", "session-id"), ("began", "other"), ("ended", "session-id"), ("ended", "other")])
+
+    def test_status_shows_holder_since_and_release_eta_in_user_zone(self) -> None:
+        folder = self.scratch / "holders"
+        folder.mkdir()
+        _ = write_holder(folder, "holder", "2026-10-12T16:00:00+00:00", "render checks", "2026-10-12T17:00:00+00:00")
+        output = io.StringIO()
+        with mock.patch.dict(os.environ, {"TZ": "UTC", "USER_ZONE": "America/New_York"}), redirect_stdout(output):
+            try:
+                time.tzset()
+                self.assertEqual(build_hold.main(["status"]), 0)
+            finally:
+                time.tzset()
+        self.assertIn("holder since 12:00 EDT, for render checks - release eta: 13:00 EDT", output.getvalue())
+
+    def test_event_write_failure_keeps_the_hold_notice_and_file(self) -> None:
+        with mock.patch.object(subprocess, "Popen", side_effect=OSError("cannot start recorder")):
+            folder = self.begin()
+        self.assertTrue((folder / "session-id").exists())
 
 if __name__ == "__main__":
     _ = unittest.main()

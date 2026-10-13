@@ -1191,7 +1191,8 @@ instructions name; with none, skip and say so in one line.
 2. Open an activity; the
    label is exact, because `review-trial` counts it:
    `progress_history.py start-activity --session-dir "${SESSION_DIR}" --label "UX review" --activity "<what the shots show>"`
-3. Run one design check with this prompt, so the shots never enter your context:
+3. Run one design check, so the shots never enter your context. Use this
+   prompt for the Claude helper:
 
    > Read `~/.claude/commands/ux_eval.md` and follow it for these shots:
    > <paths>. Guide: <path>. Scale: <shot pixels per logical pixel>. Context:
@@ -1200,6 +1201,15 @@ instructions name; with none, skip and say so in one line.
    > (`<ThreeGods/>` in `~/.claude/docs/decision_criteria.md`) and these
    > production rules: <the production doc's rules that concern looks>. You
    > only review: edit nothing. Return only the verdict and the table.
+
+   For the pool, use this separate prompt:
+
+   > Judge these shots by your standing instructions, which hold the rules
+   > and the report format: <paths>. Scale: <shot pixels per logical pixel>.
+   > Context: <unit> phase <N> — <what changed, every state the shots must
+   > show, and each shot's window size in logical pixels>. Production rules:
+   > <the production doc's rules that concern looks>. You only review: edit
+   > nothing. Return only the verdict and the table.
 
    Without `ui` in the production's `**Review pool:**` line, spawn a fresh
    Claude Agent helper in the background; read its verdict once and stop it
@@ -1211,12 +1221,15 @@ instructions name; with none, skip and say so in one line.
      resume from the largest saved `ux_<phase>_<k>_*` name plus one.
    - Write one full shot path per line to
      `${SESSION_DIR}/ux_shots_${PASS_INDEX}.txt`, using the next unused UX
-     pass index in this session. Write the same prompt to a file, then launch
-     `review.sh --pool ui --lease <slug>/<unit>/<phase> "${SESSION_DIR}" <worktree> <prompt-file> review "UI design check" "judging the shots" "${PASS_INDEX}" ux`
+     pass index in this session. Write the helper prompt to
+     `${SESSION_DIR}/ux_prompt_${PASS_INDEX}_helper.md` and the pool prompt to
+     `${SESSION_DIR}/ux_prompt_${PASS_INDEX}_pool.md`, then launch
+     `review.sh --pool ui --lease <slug>/<unit>/<phase> "${SESSION_DIR}" <worktree> "${SESSION_DIR}/ux_prompt_${PASS_INDEX}_pool.md" review "UI design check" "judging the shots" "${PASS_INDEX}" ux`
      in the background. The launcher resets the reviewer before each turn
      and sends the unit's memory and every listed image.
    - Test `~/.local/state/review-pool/<slug>/ui_adopted`. While it is absent,
-     also start the fresh Claude helper with that prompt and those shots;
+     also start the fresh Claude helper with the prompt from its helper file
+     and those shots;
      use only its verdict, defects and canonical candidates. Wait for both
      results; stop the helper with TaskStop. When the marker exists, run no
      helper and use only the pool's result.

@@ -243,6 +243,36 @@ class NotifierTests(unittest.TestCase):
             _ = self.successful("interval", "example", "60")
             self.assertEqual(next_due("align", "example", "on", now=at(kolkata, 10, 5)), at(kolkata, 11, 0) - 30)
 
+    def test_unpause_restarts_only_a_timer_the_pause_stopped_and_nobody_stopped_since(self) -> None:
+        _ = self.new()
+        _ = self.successful("pause", "example")
+        self.assertEqual((self.state()["ENABLED"], self.state()["PAUSED"]), ("0", "1"))
+        self.assertIn("next_due=", self.successful("unpause", "example"))
+        self.assertEqual(self.state()["ENABLED"], "1")
+        self.assertNotIn("PAUSED", self.state())
+        # Stopped during the pause: the stop clears the mark, so unpause leaves it stopped.
+        _ = self.successful("pause", "example")
+        _ = self.successful("stop", "example")
+        self.assertEqual(self.successful("unpause", "example"), "")
+        self.assertEqual(self.state()["ENABLED"], "0")
+        # Stopped before the pause: the pause has nothing to stop and leaves no mark.
+        _ = self.successful("pause", "example")
+        self.assertNotIn("PAUSED", self.state())
+        self.assertEqual(self.successful("unpause", "example"), "")
+        self.assertEqual(self.state()["ENABLED"], "0")
+        # Started again during the pause: the start clears the mark, and the timer keeps running.
+        _ = self.successful("start", "example")
+        _ = self.successful("pause", "example")
+        _ = self.successful("resume", "example")
+        self.assertNotIn("PAUSED", self.state())
+        _ = self.successful("stop", "example")
+        self.assertEqual(self.successful("unpause", "example"), "")
+        # A tick keeps the mark of a paused timer.
+        _ = self.successful("start", "example")
+        _ = self.successful("pause", "example")
+        _ = self.successful("tick", now=NOW + 600)
+        self.assertEqual(self.state()["PAUSED"], "1")
+
     def test_due_tick_send_arguments_and_log_format(self) -> None:
         _ = self.new("--from", "sender", "--timeout", "7")
         _ = self.successful("tick", now=MINUTE + 120)

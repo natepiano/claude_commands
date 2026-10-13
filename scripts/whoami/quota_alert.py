@@ -73,6 +73,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.lib.user_zone import user_zone
 from scripts.whoami import agent_accounts
 
+from note_file import reset_time
 from agent_accounts import (ClaudeAccountSelection, ClaudeRole, CodexHomeSource, Report,
                             codex_can_work, CodexWorkAvailable, codex_email_on_disk,
                             codex_homes, codex_live, seats_home)
@@ -445,11 +446,9 @@ def state_file() -> Generator[State]:
 
 
 def ahead(resets: str | None) -> bool:
-    """Whether a note's local-time reset is still to come."""
-    try:
-        return resets is not None and datetime.fromisoformat(resets) > datetime.now()
-    except ValueError:
-        return False
+    """Whether a note's reset is still to come."""
+    reset = reset_time(resets)
+    return reset is not None and reset > datetime.now(timezone.utc)
 
 
 def remaining(note: AgentNote) -> float | None:
@@ -501,20 +500,16 @@ def recovered(name: str, notes: list[AgentNote], threshold: float,
                 value, reset = report.weekly_remaining, report.weekly_reset
                 if value is not None and reset is not None and reset > now and value > threshold:
                     return True
-        try:
-            return datetime.fromisoformat(note.get("resets") or "").astimezone() <= now
-        except ValueError:
-            return False
+        reset = reset_time(note.get("resets"))
+        return reset is not None and reset <= now
     if selection.multiple_accounts and name.startswith("claude "):
         if note is None:
             return False
         value = remaining(note)
         if value is not None and math.isfinite(value) and value > threshold:
             return True
-        try:
-            return datetime.fromisoformat(note.get("resets") or "").astimezone() <= now
-        except ValueError:
-            return False
+        reset = reset_time(note.get("resets"))
+        return reset is not None and reset <= now
     if note is None or note.get("state") == "inactive":
         return True
     value = remaining(note)

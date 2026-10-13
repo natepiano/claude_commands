@@ -43,8 +43,11 @@ def running(slug: str) -> bool:
     return bool(showrunners.current_address(slug))
 
 
-def checked(child: Production, caller: str) -> str:
-    """The tmux to start `child`'s showrunner with. Raises Refusal naming what is in the way."""
+def checked(child: Production, caller: str, ending: str = "") -> str:
+    """The tmux to start `child`'s showrunner with. Raises Refusal naming what is in the way.
+
+    `ending` names a tmux session the caller ends before the start, so it is not in the way.
+    """
     if not caller:
         raise Refusal(f"this session runs no production, so it has nothing to attach {child.slug} to")
     if child.slug == caller:
@@ -61,7 +64,7 @@ def checked(child: Production, caller: str) -> str:
         tmux = unit_lookup.tmux_binary()
     except (OSError, subprocess.CalledProcessError) as error:
         raise Refusal(f"no tmux to start the session in: {error}") from error
-    if tmux_live(tmux, child.slug):
+    if child.slug != ending and tmux_live(tmux, child.slug):
         raise Refusal(f"a tmux session named {child.slug} is already live")
     return tmux
 

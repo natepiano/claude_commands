@@ -9,7 +9,10 @@
 > `pool_<reviewer>`; turn records live under the history root's
 > `review_turns/`; the report is `review_pool_report.py`, not
 > `seat_usage.py --reviews`; the review unit has a worktree; `agent_exec.sh`
-> and `sweep` did not change. Sections 6 to 8 (risks, the trial verdict rule
+> and `sweep` did not change; the UI reviewer's standing prompt holds its
+> whole judging procedure, every rule's full text and the production
+> repository's design decisions, so a pooled design check reads no rule or
+> command file; merge holds count as escapes by unit, phase and plan. Sections 6 to 8 (risks, the trial verdict rule
 > and the directors' input) are stated nowhere else. The proposal as written:
 > A production starts one review
 > unit. Its reviewers are long-lived Codex threads in two pools, code and UI.

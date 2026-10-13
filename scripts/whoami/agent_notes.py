@@ -30,7 +30,7 @@ from typing import NotRequired, TypedDict, cast
 import codex_pacer
 import five_hour
 import note_file
-from note_file import FIELD, Note
+from note_file import FIELD, Note, reset_time
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.whoami.agent_accounts import KnownCodexAccount, UnknownCodexAccount
 from agent_accounts import (ClaudeAccountSelection, ClaudeDirectorySource, CodexHomeSource, EASTERN, Report,
@@ -41,7 +41,6 @@ from quota_alert import (AgentNote, alert, blocked, current_session, refresh, Co
 from run_out import READINGS_LOG
 import usage_store
 
-RESET_FORMAT = "%Y-%m-%dT%H:%M:%S"
 
 
 class StoredReading(TypedDict):
@@ -73,10 +72,11 @@ OBSERVED_ACCOUNT_ACTIVITY = ObservedAccountActivity()
 
 
 def local_reset(value: datetime) -> str:
-    """Local wall time rounded to the minute: the APIs jitter by fractions of a second."""
+    """Local wall time rounded to the minute, with its offset: the APIs jitter by fractions of a
+    second, and the note travels to machines in other zones."""
     local = value.astimezone()
     rounded = (local + timedelta(seconds=30)).replace(second=0, microsecond=0)
-    return rounded.strftime(RESET_FORMAT)
+    return rounded.isoformat(timespec="seconds")
 
 
 def set_fields(note: Note, updates: dict[str, str], stamp: dict[str, str]) -> bool:
@@ -119,12 +119,8 @@ def _rewrite(lines: list[str], updates: dict[str, str]) -> bool:
 
 
 def still_ahead(value: str | None) -> bool:
-    if not value:
-        return False
-    try:
-        return datetime.strptime(value, RESET_FORMAT) > datetime.now()
-    except ValueError:
-        return False
+    reset = reset_time(value)
+    return reset is not None and reset > datetime.now(timezone.utc)
 
 
 def append_readings(readings: list[StoredReading], checked_at: datetime) -> None:

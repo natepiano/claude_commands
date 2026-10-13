@@ -1606,6 +1606,33 @@ class RestartTests(ShutdownTestCase):
         alert.assert_not_called()
         summary.assert_not_called()
 
+    def test_selected_usage_limit_held_refusal_has_no_restart_or_failure_count(self) -> None:
+        saved = entry(top_level("held", name="Held"), state=record.SessionHeldByUsageLimit(kind="held by usage limit", at=RESTARTED))
+        self.create([saved])
+        output = io.StringIO()
+        with patch.object(restart, "_print_result") as summary, patch.object(restart, "_launch_session") as launch, redirect_stdout(output):
+            result = restart._up(LOGIN, False, ["held"])  # pyright: ignore[reportPrivateUsage]
+        self.assertEqual((result.restarted, result.seats, result.manual, result.failed), (0, 0, 0, 0))
+        self.assertEqual(result.failed_sessions, ())
+        self.assertEqual(output.getvalue(), "Held is held by usage limit, not stopped; nothing to restart\n")
+        summary.assert_not_called()
+        launch.assert_not_called()
+        self.assertEqual(record.find_session(LOGIN, "held"), saved)
+        with redirect_stdout(io.StringIO()):
+            self.assertEqual(restart.up(LOGIN, only=["held"]), 1)
+
+    def test_peer_usage_limit_held_refusal_parses_and_exits_one_without_alert(self) -> None:
+        refusal = restart.RestartNotStopped(kind="not stopped", session_id="peer-id", name="Peer", progress="held by usage limit")
+        line = "Peer is held by usage limit, not stopped; nothing to restart"
+        response = peer_json(lines=[line], refused=[refusal])
+        parsed = restart.parse_peer_result(response)
+        self.assertEqual(parsed["refused"], [refusal])
+        with patch.object(restart, "named_claude_account", return_value=self.account), patch.object(settle, "inventory", return_value=inventory.Inventory(machine="natedev", login=LOGIN, label=LABEL, sessions=[], unattributed=[])), patch.object(restart, "run_remote", return_value=(1, response)), patch.object(settle, "alert_user") as alert, patch.object(restart, "_print_result") as summary, redirect_stdout(io.StringIO()) as output:
+            self.assertEqual(restart.restart(restart.AccountNamed(LABEL), only=["peer-id"], dry_run=False, alerts=restart.AlertWhenNotBack()), 1)
+        self.assertEqual(output.getvalue(), line + "\n")
+        alert.assert_not_called()
+        summary.assert_not_called()
+
     def test_selected_peer_silent_restart_failure_ignores_untouched_local_alert_policy(self) -> None:
         sibling = entry(top_level("sibling"))
         self.create([sibling])

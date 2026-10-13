@@ -185,6 +185,14 @@ def cell_value(value: str) -> str:
     return quoted.group(1) if quoted else value.split(" — ", 1)[0].strip()
 
 
+def is_review_unit(unit: str, lines: list[str]) -> bool:
+    """Whether `unit` is the review unit of the production doc whose lines these are.
+
+    The review unit runs `/review:direct` and is idle by design between reviews.
+    """
+    return unit == "review-unit" and any(line.startswith("- **Review pool:** ") for line in lines)
+
+
 def production_field(lines: list[str], field: str) -> str:
     """Read a Production Context field without interpreting its commentary."""
     prefix = f"- **{field}:** "
@@ -667,10 +675,7 @@ def prompt_for(request: UnitLaunch) -> str:
                 f"{showrunner}, on standby. Work only in your worktree "
                 f"{request.worktree}, branch {request.branch}. Do nothing until the showrunner sends you work.")
     plan = request.plan_path.as_posix()
-    review_unit = request.identity.unit == "review-unit" and any(
-        line.startswith("- **Review pool:** ")
-        for line in production.doc.read_text(encoding="utf-8").splitlines()
-    )
+    review_unit = is_review_unit(request.identity.unit, production.doc.read_text(encoding="utf-8").splitlines())
     if isinstance(request.session, ResumedSession):
         plan = str(request.worktree / request.plan_path)
         identity = (f"You are now {request.identity.unit} in production {production.slug} (doc {doc}), under "

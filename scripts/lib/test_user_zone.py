@@ -29,14 +29,13 @@ MACHINE_ZONE = re.compile(r"\.astimezone\(\)")
 # The scripts that may use the machine's zone, each because the time there is stored or compared, never shown.
 USES_THE_MACHINE_ZONE = {
     "agents/codex_mesh.py": "log stamps written with their offset",
-    "build_hold/build_hold.py": "its displays move in the build hold's own phase",
     "hooks/banned_words_lib.py": "a log stamp written with its offset",
     "notify/pushover.py": "a log stamp written with its offset",
     "production/dailies_render.py": "reads reset times stored with no offset, in the machine's zone",
     "production/review_regime.py": "a stamp written with its offset",
-    "whoami/agent_notes.py": "reset times stored with no offset, and the note's date as the vault's linter writes it",
+    "whoami/agent_notes.py": "reset times written with their offset, and the note's date as the vault's linter writes it",
     "whoami/codex_pacer.py": "Codex names its session folders by the machine's date",
-    "whoami/quota_alert.py": "compares two times and shows neither",
+    "whoami/note_file.py": "reads a reset time stored before the offset was, in the machine's zone",
 }
 SKIPPED_DIRS = {"__pycache__", "fixtures", "tests", "testdata", "node_modules"}
 

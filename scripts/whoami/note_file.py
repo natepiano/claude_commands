@@ -4,10 +4,26 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 
 AGENTS_DIR = Path.home() / "rust" / "hanadocs" / "agents"
 FIELD = re.compile(r"^([A-Za-z_][\w-]*):[ \t]*(.*?)[ \t]*$")
+
+
+def reset_time(value: str | None) -> datetime | None:
+    """A note's `resets` time, aware; None when absent or unreadable.
+
+    Notes travel between machines in the vault. A reset written with its offset reads the same on
+    every machine; one written before the offset was recorded is read in this machine's zone.
+    """
+    if not value or value == "null":
+        return None
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo is not None else parsed.astimezone()
 
 
 @dataclass

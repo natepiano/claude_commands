@@ -21,6 +21,8 @@ port_lint.py writes its own call records through write_call() here.
       record; WAIT, WALL, BUILD and SAVED are whole seconds, ELAPSED the
       script's $SECONDS at the end. STATUS and BUILD may be empty (unknown).
       BUILDLOG_TOKEN_WAIT_S is the time spent acquiring the cargo token.
+  record.py hold-event <began|ended> <target> <hold key> <holder> <reason> <at> [<until>]
+      AT is an ISO 8601 UTC instant with offset. UNTIL is empty when no end was planned.
   record.py backfill-verify [LEDGER]
       Copy verify.sh's old call ledger (~/.local/state/verify/events.jsonl)
       into call records, once: each line gets an id from its own hash, so a
@@ -342,6 +344,7 @@ def call(args: list[str]) -> None:
         "token_wait_s": optional_int(os.environ.get("BUILDLOG_TOKEN_WAIT_S", "0")) or 0,
         "mac": os.environ.get("BUILDLOG_MAC", ""),
         "mac_reason": os.environ.get("BUILDLOG_MAC_REASON", ""),
+        "mac_holder": os.environ.get("BUILDLOG_MAC_HOLDER", ""),
         "local_reason": os.environ.get("BUILDLOG_LOCAL_REASON", ""),
         "mac_s": optional_nonnegative_number(os.environ.get("BUILDLOG_MAC_S", "")),
         "target": os.environ.get("BUILDLOG_TARGET", ""),
@@ -353,6 +356,39 @@ def call(args: list[str]) -> None:
         "mem_kill_stopped": os.environ.get("BUILDLOG_MEM_KILL_STOPPED") == "1",
     }
     write_call(time.time() - float(elapsed or 0), fields, os.environ.get("BUILDLOG_CALL_ID"))
+
+
+class HoldEventRecord(TypedDict):
+    kind: str
+    v: int
+    at: str
+    host: str
+    target: str
+    event: str
+    hold_key: str
+    holder: str
+    reason: str
+    until: str
+
+
+def hold_event(args: list[str]) -> None:
+    event, target, key, holder, reason, at = args[:6]
+    if event not in ("began", "ended") or target not in ("mac", "natedev") or len(args) not in (6, 7):
+        raise ValueError("invalid hold-event arguments")
+    instant = datetime.fromisoformat(at)
+    if instant.utcoffset() is None:
+        raise ValueError("hold-event at needs an offset")
+    until = args[6] if len(args) == 7 else ""
+    if until and datetime.fromisoformat(until).utcoffset() is None:
+        raise ValueError("hold-event until needs an offset")
+    host = store.host_name()
+    record: HoldEventRecord = {
+        "kind": "hold_event", "v": RECORD_VERSION,
+        "at": instant.astimezone(UTC).isoformat(timespec="microseconds").replace("+00:00", "Z"),
+        "host": host, "target": target, "event": event, "hold_key": key,
+        "holder": holder, "reason": reason, "until": until,
+    }
+    store.append_line(store.host_file(host, instant.timestamp()), record)
 
 
 def backfilled_ids() -> set[str]:
@@ -445,6 +481,8 @@ def main(argv: list[str]) -> int:
             found = treekey.tree_key(git_directory(rest, os.getcwd()))
             if found:
                 print(found)
+        elif command == "hold-event":
+            hold_event(rest)
         elif command == "call":
             call(rest)
         else:
