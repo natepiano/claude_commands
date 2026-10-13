@@ -68,9 +68,13 @@ elif verb == 'compact':
         sys.exit(3)
     before = roster[name].get('context_tokens', 0)
     after = int(os.environ.get('STUB_COMPACT_AFTER', '12000'))
-    roster[name]['context_tokens'] = after
+    roster[name]['context_tokens'] = ('not_measured_since_compaction'
+                                    if (session / 'compact_reports_zero').exists() else after)
     roster_path.write_text(json.dumps(roster))
-    print(f'compacted {name}: {before} -> {after} tokens')
+    if (session / 'compact_reports_zero').exists():
+        print(f'compacted {name}: {before} tokens, size not measured until its next turn')
+    else:
+        print(f'compacted {name}: {before} -> {after} tokens')
 elif verb == 'can-follow':
     name = option('--to')
     entry = roster.get(name, {})
@@ -288,6 +292,7 @@ class ImplementLauncherSeatTests(unittest.TestCase):
         # The wrapper reaches python3 through ../lib/py, resolved from its own
         # location, so the copy needs the interpreter shim beside it too.
         _ = shutil.copy2(DELEGATE_DIR.parent / "lib" / "py", lib / "py")
+        _ = shutil.copy2(DELEGATE_DIR.parent / "lib" / "user_zone.py", lib / "user_zone.py")
         home_lib = self.root / ".claude" / "scripts" / "lib"
         home_lib.mkdir(parents=True, exist_ok=True)
         _ = shutil.copy2(DELEGATE_DIR.parent / "lib" / "py", home_lib / "py")
@@ -767,6 +772,42 @@ if len(_probe_sys.argv) > 1 and _probe_sys.argv[1] in {commands!r}:
             f"launcher: compacted {name}: 100001 -> 12000 tokens",
             board,
         )
+
+    def test_follow_up_to_an_unmeasured_seat_does_not_compact_again(self) -> None:
+        session_dir = self.start_phase("unmeasured-follow")
+        first = self.mesh_launch(session_dir)
+        self.assertEqual(first.returncode, 0, first.stderr)
+        path = session_dir / "mesh_roster.json"
+        roster = cast(dict[str, dict[str, object]], json.loads(path.read_text(encoding="utf-8")))
+        name = next(iter(roster))
+        roster[name]["context_tokens"] = "not_measured_since_compaction"
+        _ = path.write_text(json.dumps(roster), encoding="utf-8")
+
+        result = self.mesh_launch(session_dir, to=name)
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual((session_dir / "mesh_events.txt").read_text(encoding="utf-8").splitlines(),
+                         ["can-follow", "follow"])
+        stored = cast(dict[str, dict[str, object]], json.loads(path.read_text(encoding="utf-8")))
+        self.assertEqual(stored[name]["context_tokens"], "not_measured_since_compaction")
+
+    def test_follow_up_posts_the_unmeasured_compaction_line_unchanged(self) -> None:
+        session_dir = self.start_phase("compact-unmeasured-line")
+        first = self.mesh_launch(session_dir)
+        self.assertEqual(first.returncode, 0, first.stderr)
+        roster = cast(dict[str, object], json.loads(
+            (session_dir / "mesh_roster.json").read_text(encoding="utf-8")))
+        name = next(iter(roster))
+        self.set_mesh_context(session_dir, name, 100001)
+        (session_dir / "compact_reports_zero").touch()
+
+        result = self.mesh_launch(session_dir, to=name)
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual((session_dir / "mesh_events.txt").read_text(encoding="utf-8").splitlines(),
+                         ["compact", "can-follow", "follow"])
+        board = (session_dir / "board.log").read_text(encoding="utf-8")
+        self.assertIn(f"launcher: compacted {name}: 100001 tokens, size not measured until its next turn", board)
 
     def test_start_and_follow_write_the_current_kind_as_the_roster_role(self) -> None:
         session_dir = self.start_phase("roster-role")

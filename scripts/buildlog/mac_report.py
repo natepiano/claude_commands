@@ -22,6 +22,10 @@ from mac_outcome import (
     UsableShare, is_mac_candidate, is_mac_step, offload_record, share_of_records,
 )
 
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
+from user_zone import user_zone  # noqa: E402
+
 LOCAL_MAC_UNAVAILABLE_PATTERNS = (
     r"\bmac\b.*\b(?:unavailable|busy|blocked|unreachable|offline|not available|not reachable)\b",
     r"\b(?:unavailable|busy|blocked|unreachable|offline)\b.*\bmac\b",
@@ -282,11 +286,11 @@ def report_windows(now: datetime, hours: float) -> list[ReportWindow]:
     windows = [ReportWindow(
         f"Last {hours:g} hours", store.utc_iso(now.timestamp() - hours * 3600), end,
     )]
-    today = now.astimezone().date()
+    today = now.astimezone(user_zone()).date()
     for days_ago in range(3):
         day = today - timedelta(days=days_ago)
-        midnight = datetime.combine(day, time()).astimezone()
-        following = datetime.combine(day + timedelta(days=1), time()).astimezone()
+        midnight = datetime.combine(day, time(), user_zone())
+        following = datetime.combine(day + timedelta(days=1), time(), user_zone())
         windows.append(ReportWindow(
             day.isoformat(), store.utc_iso(midnight.timestamp()), min(store.utc_iso(following.timestamp()), end),
         ))
@@ -372,7 +376,7 @@ def mac_report(connection: sqlite3.Connection, now: datetime, hours: float = 24)
     steps_start = store.utc_iso((datetime.fromisoformat(earliest_start) - TEST_TREE_LOOKBACK).timestamp())
     evidence = read_test_tree_evidence(connection, steps_start, end)
     clusters = decline_clusters(calls)
-    lines = ["# Mac test report", "", f"Times in the caller's TZ; through {now.astimezone():%Y-%m-%d %H:%M %Z}.", ""]
+    lines = ["# Mac test report", "", f"Times in the user's zone; through {now.astimezone(user_zone()):%Y-%m-%d %H:%M %Z}.", ""]
     lines.extend(window_lines(windows[0], calls_in_window(calls, windows[0]), evidence))
     lines += [
         "## Last three local days", "",

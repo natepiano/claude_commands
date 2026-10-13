@@ -97,10 +97,16 @@ later implementation, repair, and follow-up work with `implement.sh --to
 seat in the same role when the next assignment fits; otherwise move it, even
 mid-phase, under <RoleReassignment/>. A finished turn leaves its thread open.
 
+When the production doc names a review pool and <ProductionUnit/>'s `arm`
+prints `pool`, send code reviews with
+`review.sh --pool code --lease <slug>/<unit>/<phase>` instead of `--to`.
+
 Compaction can erase earlier prompt text. Every opening, later-phase, repair,
 review, and follow-up prompt repeats the Three Gods sentence and carries the
 Type Design Contract verbatim or by its allowed pointer under
 <WritePromptContract/>.
+For the pool arm of a production whose doc names a review pool, review
+prompts use <ReviewPromptContract/>'s standing-instructions line.
 
 Before follow-up work, the launcher attempts to compact a seat whose recorded
 context is over `PLAN_DELEGATE_COMPACT_ABOVE_TOKENS` (default `100000` in
@@ -151,12 +157,16 @@ Phase cleanup leaves Codex seats open;
 When the plan header carries a `> **Production:**` line, this run is a unit of
 that production. Read `~/.claude/docs/production_format.md` → <ProductionUnit/>
 in full at <PrepareSession/> and after every compaction, and apply it
-throughout. It changes four things in this command:
+throughout. It changes five things in this command:
 - it adds one commit kind to <CoreContract/>: merging the production's merge
   branch into this branch;
 - it replaces <PeriodicCI/> and <CICleanup/>, because the showrunner runs CI;
 - it sends checkpoint and shrink notices at <PhaseEnd/>'s points;
-- it adds a landing rule to the repair rounds in <FixDispatch/>.
+- it adds a landing rule to the repair rounds in <FixDispatch/>;
+- it sends design choices, Pending decisions about how something is built and
+  add-ons to the showrunner, whose answer settles them (item 2). Only an
+  action that cannot be undone, or a choice only the user knows the answer
+  to, still reaches the user.
 </ProductionUnit>
 
 <TurnEndGate>
@@ -258,6 +268,10 @@ Applies to every implementation, test, fix, and review launcher.
 </DispatchContract>
 
 <DelegateLaunchFailure>
+When the production doc names a review pool, on a pool review's `error` export
+`REVIEW_LEASE=<slug>/<unit>/<phase>` and retry with
+`review.sh --to <full-seat-name>` for that review.
+
 A dispatch that dies in seconds never reached the provider, and a provider
 message it prints is a message some earlier call received. Seats launched
 together that fail within seconds of each other carrying **byte-identical text,
@@ -892,10 +906,16 @@ At an eligible tick, in that same tick:
 3. Apply <ReviewDiffContract/> to the current partial tree. The delegate has
    named no created files yet, so that check is vacuous; the snapshot is
    expected to be incomplete.
-4. Select its seat under <TeamReview/> and save the slot as
-   `${EARLY_REVIEW_SLOT}`. Apply <RoleReassignment/> when the open seat's role
-   changes; when every open seat is busy, name a new `review` seat and keep it
-   after the turn. Write the applicable early-form prompt — the `adversary`
+4. When the production doc names a review pool and the phase's arm is `pool`,
+   select no seat. Otherwise select its seat under <TeamReview/>, save the
+   slot as `${EARLY_REVIEW_SLOT}`, and apply <RoleReassignment/> when the open
+   seat's role changes; when every open seat is busy, name a new `review` seat
+   and keep it after the turn. On the pool arm, read `${EARLY_REVIEW_SLOT}`
+   when a cancel call needs it:
+   the one line in `${SESSION_DIR}/review_slot_adversary` for pass 1, or
+   `${SESSION_DIR}/review_slot` for a closure. A missing file means the launcher
+   opened no pass, so record nothing.
+   Write the applicable early-form prompt — the `adversary`
    lens of
    <BroadReviewPrompt/> for pass 1, <ClosureReview/> for a fix — including the
    completion estimate, the partial diff, and the exact final-diff and
@@ -903,7 +923,9 @@ At an eligible tick, in that same tick:
    that gains most from the extra time, and arming both against a partial
    tree would double the exposure to the void verdict below; `contract`
    launches at completion under <DualReview/> step 3.
-5. Launch `review.sh` exactly as <DualReview/> step 3 does — with `--to` for an
+5. Launch `review.sh` exactly as <DualReview/> step 3 does — with
+   `--pool code --lease <slug>/<unit>/<phase>` when the production doc names
+   a review pool and the phase's arm is `pool`; otherwise with `--to` for an
    open seat or `--slot "${EARLY_REVIEW_SLOT}"` for the new seat, and
    `adversary` as its lens for pass 1 — appending one extra final argument:
    `${SESSION_DIR}/final_diff_${REVIEW_PASS}.ready`. Save the
@@ -933,7 +955,7 @@ always may — early launch is opportunistic, never required.
 | Event | Required action |
 | --- | --- |
 | Primary completes | After <LaunchImplementation/> step 7, write the final diff to `${SESSION_DIR}/final_diff_${REVIEW_PASS}.diff` — a closure review stays limited to its paths per <ClosureReview/> — then create `${SESSION_DIR}/final_diff_${REVIEW_PASS}.ready`. **Never create the sentinel before the diff is fully written.** |
-| Primary errors, or the run stops | Kill the early reviewer. If the sentinel exists, close its pass with `PLAN_DELEGATE_TEAM_ROLE=${EARLY_REVIEW_SLOT} … finish-pass --status canceled --orphaned-launcher` per <PassOwnership/>; before the sentinel no pass was recorded, so record nothing — a pre-sentinel kill counts toward no advisory, including the blind-review cancellation one. |
+| Primary errors, or the run stops | Kill the early reviewer. If the sentinel exists, close its pass with `PLAN_DELEGATE_TEAM_ROLE=${EARLY_REVIEW_SLOT} … finish-pass --status canceled --orphaned-launcher` per <PassOwnership/>; on the pool arm, read the slot per step 4 and skip this call if the file is missing. Before the sentinel no pass was recorded, so record nothing — a pre-sentinel kill counts toward no advisory, including the blind-review cancellation one. |
 | Reviewer errors before delivery | Report it in one line, clear `${REVIEW_DISPATCH_HANDLE}` and `${EARLY_REVIEW_SLOT}`, set `EARLY_REVIEW=none`, and leave the numbered artifacts. The primary continues and is reviewed synchronously at completion under the next `${REVIEW_PASS}` index. |
 | A verdict arrives before delivery | **It is void.** The reviewer cannot have read a diff that does not exist yet, so discard its findings entirely rather than reading them as evidence: open nothing in the ledger, preempt nothing, route no blocker into a fix dispatch. Say in one line that it is discarded and why, then follow the reviewer-error row. A void verdict is often fluent and specific — a stale diff supports confident claims about missing work — so the check is the timing, never how convincing the text reads. |
 
@@ -1077,6 +1099,9 @@ question, never on a path. Select its open seat under <TeamReview/>, post the
 <RoleReassignment/> handoff when its role changes, and launch it with
 `review.sh --to`; when every open seat is busy, open and retain a role-named
 review seat with `review.sh --slot review` instead.
+When the production doc names a review pool and the phase's arm is `pool`,
+use `review.sh --pool code --lease <slug>/<unit>/<phase>` instead of selecting
+an open seat.
 
 On completion, `implemented` continues as above; `error` applies
 <DelegateLaunchFailure/>, and then, if the error survives it,
@@ -1166,8 +1191,7 @@ instructions name; with none, skip and say so in one line.
 2. Open an activity; the
    label is exact, because `review-trial` counts it:
    `progress_history.py start-activity --session-dir "${SESSION_DIR}" --label "UX review" --activity "<what the shots show>"`
-3. Spawn a fresh Claude Agent helper in the background with the showrunner's
-   design-check prompt, so the shots never enter your context:
+3. Run one design check with this prompt, so the shots never enter your context:
 
    > Read `~/.claude/commands/ux_eval.md` and follow it for these shots:
    > <paths>. Guide: <path>. Scale: <shot pixels per logical pixel>. Context:
@@ -1177,7 +1201,39 @@ instructions name; with none, skip and say so in one line.
    > production rules: <the production doc's rules that concern looks>. You
    > only review: edit nothing. Return only the verdict and the table.
 
-   Read its verdict once, then stop it with TaskStop. Save each canonical
+   Without `ui` in the production's `**Review pool:**` line, spawn a fresh
+   Claude Agent helper in the background; read its verdict once and stop it
+   with TaskStop. With `ui` listed, use this procedure on every check:
+
+   - Let `<slug>` be the production doc's filename without `-production.md`.
+     Use the pool regardless of the phase's code-review arm. Count design
+     checks within the phase from `k=1`, including repairs and notice checks;
+     resume from the largest saved `ux_<phase>_<k>_*` name plus one.
+   - Write one full shot path per line to
+     `${SESSION_DIR}/ux_shots_${PASS_INDEX}.txt`, using the next unused UX
+     pass index in this session. Write the same prompt to a file, then launch
+     `review.sh --pool ui --lease <slug>/<unit>/<phase> "${SESSION_DIR}" <worktree> <prompt-file> review "UI design check" "judging the shots" "${PASS_INDEX}" ux`
+     in the background. The launcher resets the reviewer before each turn
+     and sends the unit's memory and every listed image.
+   - Test `~/.local/state/review-pool/<slug>/ui_adopted`. While it is absent,
+     also start the fresh Claude helper with that prompt and those shots;
+     use only its verdict, defects and canonical candidates. Wait for both
+     results; stop the helper with TaskStop. When the marker exists, run no
+     helper and use only the pool's result.
+   - Save the full helper verdict, when run, and the successful pool verdict
+     from `${SESSION_DIR}/review_findings_${PASS_INDEX}_ux.txt` beside the turn
+     records in `${PLAN_DELEGATE_HISTORY_DIR:-$HOME/.local/state/plan-delegate}/review_turns/<session dir name>/`,
+     as `ux_<phase>_<k>_helper.txt` and `ux_<phase>_<k>_pool.txt`. Preserve each
+     pair. A failed shadow pool check leaves its pool file missing and gets
+     an error note; the helper's verdict still governs. An adopted pool
+     failure holds the design check until a successful retry.
+
+   Never create `ui_adopted` in this workflow. After ten shadow checks, the
+   user decides from `review_pool_report.py --shadow --root <history root>`
+   whether to create it by hand. Missing markers, new productions and pools
+   after `review_pool.py stop` use shadow.
+
+   Save each canonical
    candidate it lists, without viewing it, into a slot still empty:
    `mkdir -p <guide>/examples/<stem> && magick <shot> -crop <crop> +repage <guide>/examples/<stem>/<slot>.png`.
    Saving it approves it for use now. Add one line to
@@ -1192,13 +1248,15 @@ instructions name; with none, skip and say so in one line.
    repair round under <FixDispatch/>, except that `converged` continues to
    <PhaseEnd/> in loop or verbose, or <RunPhaseReview/> in `single`.
 5. Re-entered after a `ux` repair that changed the screen, this step replaces
-   1–4: re-shoot and re-judge only the rows raised — a fresh helper, under its
-   own `UX review` activity, given just those rows and their shots — and record
+   1–4: re-shoot and re-judge only the rows raised, under its own `UX review`
+   activity, given just those rows and their shots. Run step 3's design-check
+   procedure, including the pool, verdict selection and a new pair index;
+   then close the activity and record
    each with `findings.py verdict`. A `still_open` row returns to step 4's
    gate. Then continue to <PhaseEnd/> in loop or verbose, or
    <RunPhaseReview/> in `single`.
 6. **The notice's verdict.** In a production unit, the checkpoint notice's
-   `design check:` line (<ProductionUnit/> item 3) is one fresh helper's
+   `design check:` line (<ProductionUnit/> item 3) uses step 3's selected
    verdict on exactly the shots the notice sends, from a build of the
    checkpoint's code. Step 5's partial re-judge does not count, nor does a
    verdict from before any later change to what users see (a repair, a merge

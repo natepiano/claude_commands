@@ -9,15 +9,18 @@ from datetime import datetime
 from pathlib import Path
 
 from account import label_for
-from agent_accounts import (ClaudeAccountSelection, CodexHomeSource, EASTERN, Quota, Report,
-                            codex_home_display, codex_homes, codex_report_in_use, live_reports)
+from agent_accounts import (ClaudeAccountSelection, CodexHomeSource, Quota, Report,
+                            codex_home_display, codex_homes, codex_report_in_use, live_reports,
+                            seats_home as resolve_seats_home)
 import note_file
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
+from user_zone import user_zone  # noqa: E402
 
 
 def reset_time(value: datetime | None) -> str:
     if value is None:
         return "unavailable"
-    return value.astimezone().strftime("%a %Y-%m-%d %H:%M %Z")
+    return value.astimezone(user_zone()).strftime("%a %Y-%m-%d %H:%M %Z")
 
 
 def quota_line(quota: Quota) -> str:
@@ -26,9 +29,9 @@ def quota_line(quota: Quota) -> str:
     return f"  {quota.label}: {remaining}; resets {reset_time(quota.resets_at)}"
 
 
-def render(report: Report, selection: ClaudeAccountSelection) -> list[str]:
-    multiple_codex_homes = report.tool == "Codex" and len(codex_homes()) > 1
-    codex_seats = multiple_codex_homes and codex_report_in_use(report)
+def render(report: Report, selection: ClaudeAccountSelection, seats_home: Path) -> list[str]:
+    multiple_codex_homes = report.tool == "Codex" and len(codex_homes(seats_home)) > 1
+    codex_seats = multiple_codex_homes and codex_report_in_use(report, seats_home)
     header = report.tool
     if (multiple_codex_homes and (report.problem or report.email is None)
             and isinstance(report.source, CodexHomeSource)):
@@ -57,7 +60,7 @@ def render(report: Report, selection: ClaudeAccountSelection) -> list[str]:
         count = report.limit_reset_count
         lines.append(f"  Limit resets available: {count if count is not None else 'unavailable'}")
         for expires in report.limit_reset_expirations:
-            lines.append(f"  Limit reset expires: {expires.astimezone(EASTERN).strftime('%a %Y-%m-%d %H:%M %Z')}")
+            lines.append(f"  Limit reset expires: {expires.astimezone(user_zone()).strftime('%a %Y-%m-%d %H:%M %Z')}")
         if count and len(report.limit_reset_expirations) < count:
             lines.append("  Some reset expiration dates are unavailable")
     elif report.tool == "Claude" and report.email:
@@ -79,12 +82,13 @@ async def main() -> None:
     from scripts.accounts import accounts
 
     selection = accounts.claude_account_selection()
-    reports = await live_reports(selection)
+    seats_home = resolve_seats_home()
+    reports = await live_reports(selection, seats_home)
     if selection.multiple_accounts:
         reports = [report for report in reports
                    if report.tool != "Claude" or report.email is None
                    or selection.roles_for_login(report.email)]
-    print("\n\n".join("\n".join(render(report, selection)) for report in reports))
+    print("\n\n".join("\n".join(render(report, selection, seats_home)) for report in reports))
 
 
 if __name__ == "__main__":

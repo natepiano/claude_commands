@@ -35,7 +35,7 @@ Evidence, outside the repository, read-only: `~/.local/state/mul-add-hook/reach-
 - `diags.json` — the 207 warnings (step, time, seat, path, line, source lines, clippy's suggestion). `extract.py` rebuilds it from the buildlog index.
 - `hana_main/` — the lint-clean hana checkout (183 MB, no `.git`).
 - `proto.py` — the prototype shape finder; `measure2.py` holds its vector-word rule.
-- `gate.py` — the gate measurement: `python3 ~/.local/state/mul-add-hook/reach-2026-10-12/gate.py scripts/hooks` from the worktree root. It calls `mul_add_lib.mul_add_findings` (or `float_mul_add_findings` while that is the name) on each distinct warning placed in a stub function, and on every file of `hana_main`. Today it prints `recall: 7 of 168`, `replay: 83 of 88 … 8.18 per 100`, `false alarms: 0`, in about 10 s.
+- `gate.py` — the gate measurement: `python3 ~/.local/state/mul-add-hook/reach-2026-10-12/gate.py scripts/hooks` from the worktree root. It calls `mul_add_lib.mul_add_findings` (or `float_mul_add_findings` while that is the name) on each distinct warning placed in a stub function, and on every file of `hana_main`. Before Phase 2 it printed `recall: 7 of 168`, `replay: 83 of 88 … 8.18 per 100`, `false alarms: 0`, in about 10 s; on Phase 2's checkpoint it prints `recall: 160 of 168`, `replay: 7 of 88 … 0.69 per 100`, `false alarms: 122 reports in 36 files`, in about 11 s.
 - `remeasure/` — the first run's re-measure scripts (`clippy_fail_lints.py`, `cost.py`, `loop.py`, `totals.py`, `derive.py`).
 
 ## Decisions (unit director, 2026-10-12, under the decision criteria)
@@ -52,7 +52,7 @@ Evidence, outside the repository, read-only: `~/.local/state/mul-add-hook/reach-
 - **Stack:** Python 3.13, standard library only.
 - **Layout:**
   - `scripts/hooks/fn_length_lib.py` — shared by the function-length and multiply-add hooks: the edit parser (`Replacement`, `AppliedRustEdits`, `IgnoredEdit`, `applied_patch_rust_files`, `applied_rust_edits`, `written_lines`, lines 66–222), the Rust scanner (`tokenize_rust`, `pair_delimiters`), the Cargo lint reader
-  - `scripts/hooks/mul_add_lib.py` — the detector: lint scope (`suboptimal_flops_scope`), `_visible`, `_functions`, `_atom`, `_find_in_body` (lines 290–448), the finding type (line 46) and `float_mul_add_findings` with its written-line filter (lines 451–502)
+  - `scripts/hooks/mul_add_lib.py` — the detector: lint scope (`suboptimal_flops_scope`), `_visible`, `_functions`, the lexed sum (`ArithmeticTokens`, line 223), name evidence (`NameArithmeticEvidence`, `BareNameEvidence`, lines 312–359), the text builders (`_compact`, `_receiver`, `_negated`), `_find_in_body` (lines 438–536), the finding type `MulAddFinding` (line 50) and `mul_add_findings` with its written-line filter (lines 539–600)
   - `scripts/hooks/post-tool-use-mul-add.py` — the hook entry for Claude `Edit|MultiEdit|Write` and Codex `apply_patch` payloads; builds the block and appends `blocks.jsonl`
   - `scripts/hooks/test_mul_add.py` — its tests (`MulAddHookTests`: a temporary workspace that denies `nursery`, `write_source`, `run_hook`, `decision`, `edit_payload`, `assert_passes`, `patch`)
   - `scripts/hooks/post-tool-use-fn-length.py`, `scripts/hooks/test_fn_length.py` — the function-length hook and its tests; they share the edit parser
@@ -80,7 +80,7 @@ Evidence, outside the repository, read-only: `~/.local/state/mul-add-hook/reach-
 | Gate | Waiting | Waits on | Clears when |
 | --- | --- | --- | --- |
 | G1 | Phase 3 | Phase 2's checkpoint in the live configuration | `git -C ~/.claude merge-base --is-ancestor <Phase 2 checkpoint> HEAD` succeeds |
-| G2 | Phase 4 | 96 hours after T_reach (Phase 3's As-built) | the clock |
+| G2 | Phase 4 | 96 hours after T_reach (2026-10-12 11:13:42 PDT) | the clock reads 2026-10-16 11:13:42 PDT or later |
 
 ## Phases
 
@@ -109,112 +109,74 @@ def float_mul_add_findings(rs_file, written: frozenset[int] | None = None)  # No
 
 **Ruled out:** comparing `old` and `new` by characters (an added line shares its indentation with its neighbour, which then counts as written); a per-character newline index of the whole file (43 ms on a large file before the cheap text check).
 
-### Phase 2 — Report every likely multiply-add  · status: todo
+### Phase 2 — Report every likely multiply-add  · status: done
 
-#### Work Order
+#### As-built
 
-**Goal:** On the lines an edit wrote, the hook reports the multiply-add shapes hana's clippy steps fail on, with a conditional message, and stays quiet for integer and vector arithmetic it can recognize.
+The detector reports what looks like a multiply-add unless the text disproves it. `mul_add_findings` scans each function body `_functions` returns, with comments and strings blanked, as an `ArithmeticTokens` lexed sum. A candidate is a product chain that is a direct operand of binary `+` or `-`, or the whole right side of `+=` or `-=`; in a run of `*`, `/`, `%` at one nesting depth the last operator is `*`. A product in its own parentheses is the same candidate. One finding per sum: when both sides are products, the left one is the receiver. Sums inside macro invocation arguments are candidates; `macro_rules!` definitions are not.
 
-**Spec:**
+Evidence is read from the text of the whole sum:
 
-Work in the worktree `/home/natepiano/worktrees/claude-build-followups-mul-add`, branch `build-followups-mul-add`.
+- **Float:** a float literal token (`1e-3` is one literal) or a match of `_FLOAT_EVIDENCE`. It keeps a sum that also holds integer evidence.
+- **Integer**, which skips a sum with no float evidence: an integer literal that is a factor or a term, outside `[...]`, call arguments and tuple fields; a match of `_INTEGER_EVIDENCE` (an integer cast, `.len()`, `.count()`); or the sum being the whole content of an index.
+- **Vector**, which skips the sum whatever else it holds: a match of `VECTOR`, or a bare name that `BareNameEvidence.disproves`. A dotted `VECTOR` match followed by `()` and a scalar member (`_SCALAR_RESULT`: `.x`, `.y`, `.z`, `.w`, `.width`, `.height`, `.depth`, `.length`, `.0`, `.1`) is not evidence.
 
-The detector changes from "report what is proved float" to "report what looks like a multiply-add unless something disproves it". `~/.local/state/mul-add-hook/reach-2026-10-12/proto.py` is the measured prototype of items 1 and 2; read it, then build the rule into `scripts/hooks/mul_add_lib.py` on the shared scanner. Do not import the prototype.
+`BareNameEvidence` gives a bare name the evidence of its last `let` before the sum in the same function, an unannotated `let` included; with no such `let`, its parameter annotation; with neither, a file `const` or `static` typed other than `f32` or `f64`. A `let` inside a nested function never counts for its parent. `UNKNOWN` and `FLOAT` disprove nothing; `NONFLOAT` and `VECTOR` skip the sum.
 
-1. **Shape.** Scan each function body `_functions` returns, with comments and strings blanked. A candidate is a product chain that is a direct operand of binary `+` or `-`, or the whole right side of `+=` or `-=`. In a run of `*`, `/`, `%` at one nesting depth the last operator must be `*`. An operand may be a literal, a name, a path (`a::B`), a field chain, a call, a method chain, an index, a cast (`index as f32`), a `?`, a parenthesized group, or any of these under unary `-`, `&` or `*`. Expressions inside macro invocation arguments (`assert!(…)`, `debug_assert!(…)`, `vec![…]`) are candidates; `macro_rules!` definitions are not. One finding per sum: when both sides of one `+` or `-` are products, the left product is the receiver side, as clippy chooses.
+Kept exemptions: lint scope and the no_std root check, `allow`/`expect` attributes, const items, `const fn`, const blocks, static initializers (`static mut` and block-valued ones too), a sum that is a `.sqrt()` receiver, and an unsuffixed literal receiver. A `'static` lifetime exempts nothing. The same-file field proof and the pattern-binding, destructuring and let-else exclusions are gone, so a name of unknown type no longer silences a report.
 
-2. **Disproved, so skipped.** Evidence is read from the text of the whole sum.
-   - Float evidence: a float literal token, or a match of
-     `\bas\s+f(?:32|64)\b|\bf(?:32|64)::|\.to_f(?:32|64)\s*\(|\.(?:sin|cos|tan|sqrt|powi|powf|to_radians|to_degrees|sin_cos|atan2|exp|ln|hypot|recip|fract|signum|lerp)\s*\(|\b(?:PI|TAU|FRAC_PI_\d|EPSILON)\b`.
-   - Integer evidence: an integer literal that is a factor of the product or a term of the sum (not inside `[...]` or call arguments, and not a tuple field such as `.0`), or a match of `\bas\s+(?:usize|isize|[iu](?:8|16|32|64|128))\b|\.(?:len|count)\s*\(\s*\)`. A sum with integer evidence and no float evidence is skipped.
-   - Vector evidence, which skips the sum whatever else it holds: a match of the `VECTOR` pattern in `measure2.py` (copy it verbatim); or a factor or term that is a bare name whose annotation in the function (a parameter or `let name: T`) is a type other than `f32` or `f64`; or a bare name bound by `let` from a vector constructor (today's `_VECTOR_BINDING` with `_VECTOR_VALUE`); or a bare name that is a file `const` or `static` typed other than `f32` or `f64` (today's `_FILE_VALUE`). A name with no annotation disproves nothing.
-   - The `VECTOR` pattern is a starting rule. Narrow it to the end of an operand, or widen it, when the gates below hold or improve; name each change in the report.
+```python
+class MulAddFinding:  # .line, .expr, .rewrite; built from (line, a, b, c, expr, rewrite)
+class NameArithmeticEvidence(Enum):  # UNKNOWN, FLOAT, NONFLOAT, VECTOR
+class BareNameEvidence:
+    def disproves(self, name: str, at: int) -> bool
+def mul_add_findings(
+    rs_file: os.PathLike[str] | str, written: frozenset[int] | None = None,
+) -> tuple[SuboptimalFlopsLintScope, list[MulAddFinding]]  # written=None keeps every line
+```
 
-3. **Kept exemptions**, as today: lint scope and the no_std root check, `allow`/`expect` attributes, const items, `const fn`, const blocks, static initializers, a sum that is a `.sqrt()` receiver, and today's rule for an unsuffixed literal receiver.
+`rewrite` is clippy's form: `a.mul_add(b, c)`; `c - a * b` gives `a.mul_add(-b, c)`; `a * b - c` gives `a.mul_add(b, -c)`; `x += a * b` gives `x = a.mul_add(b, x)`; `a * b * c + d` gives `(a * b).mul_add(c, d)`. `_receiver` parenthesizes a cast, a unary or a binary receiver and keeps a grouped chain as written (`((a + b) * (c + d)).mul_add(e, f)`); `_negated` parenthesizes anything but a single name, literal, call or field chain. A call with generic arguments keeps its callee whole. `expr` and `rewrite` pass through `_compact`: each run of whitespace outside string and char literals becomes one space, and comments are left out.
 
-4. **Removed:** the same-file field proof (`_NAMED_FIELDS`, `_SCALAR_TYPE`, the `scalar_fields` and `nonfloat_fields` sets), `_float_atom`, `_literal_compatible`, and the pattern-binding, destructuring and let-else exclusions (`_PATTERN_BINDING`, `_DESTRUCTURED_PATTERN`, `_LET_ELSE`, `_COMPOUND_PATTERN`, `_has_let_else`), with every test that pins them. A name of unknown type no longer silences a report.
+The hook entry prints one description per finding:
 
-5. **Names.** The result no longer claims float: `FloatMulAddFinding` becomes `MulAddFinding` and `float_mul_add_findings` becomes `mul_add_findings`, with the same parameters and fields. Their only callers are the hook entry and the tests.
+`<shown>:<line>: if <expr> is f32 or f64 arithmetic, write <rewrite> (clippy::suboptimal_flops)`
 
-6. **Rewrite text**, clippy's form: `a.mul_add(b, c)`; `c - a * b` gives `a.mul_add(-b, c)`; `a * b - c` gives `a.mul_add(b, -c)`; `x += a * b` gives `x = a.mul_add(b, x)`. The receiver is the product's left side: a chain `a * b * c + d` gives `(a * b).mul_add(c, d)`. Parenthesize a receiver that is a cast, a unary or a binary expression, and a negated operand that is not a single name, literal, call or field chain. `expr` and `rewrite` are source text with each run of whitespace collapsed to one space.
+`reason` joins the descriptions with `"; "` and ends `". Leave integer and vector arithmetic as it is. The edit was applied."`; `additionalContext` joins them with newlines; `systemMessage` is `mul_add: <file> has <N> possible multiply-add expression(s)`, or `mul_add: <N> possible multiply-add expression(s) in <files>` for several files.
 
-7. **Message** (`scripts/hooks/post-tool-use-mul-add.py`). One description per finding:
-
-   `<shown>:<line>: if <expr> is f32 or f64 arithmetic, write <rewrite> (clippy::suboptimal_flops)`
-
-   `reason` is the descriptions joined by `"; "`, then `". Leave integer and vector arithmetic as it is. The edit was applied."`. `additionalContext` is the descriptions joined by newlines. `systemMessage` is `mul_add: <file> has <N> possible multiply-add expression(s)`, or `mul_add: <N> possible multiply-add expression(s) in <files>` for several files. `decision`, `continue`, the one-block-per-call rule and the log record are unchanged. The module docstring says "likely" where it said "provable".
-
-8. **Tests** (`scripts/hooks/test_mul_add.py`). Replace the proof tests with:
-   - one case per rejected class in the plan's "Measured cause" table, using its example, each reported with the expected rewrite;
-   - integer evidence skipped (`i * 3 + 1`, `rows.len() * width + pad` with no float evidence); an index literal or a tuple field is not integer evidence (`row.0 + GAP * scale` is reported);
-   - vector evidence skipped: a `Vec3` path in the sum, a bare name annotated `Vec2`, a name bound from `Vec3::new`, a file `const` typed `Vec2`;
-   - a name bound by `for`, `if let`, a closure parameter, a `match` arm and a `let … else` whose first part holds a `;` are each reported;
-   - both products in `a * 2.0 + b * 2.0` give one finding;
-   - a sum inside `assert!` is reported; one inside `macro_rules!` is not;
-   - every kept exemption still passes;
-   - the exact `reason`, `additionalContext` and `systemMessage` for one finding and for two files;
-   - the Phase 1 written-line cases still pass with the new shapes;
-   - a sum that spans two lines is reported when the edit wrote only its second line, and passes when the edit wrote neither.
-
-   Each test is named for the behavior it pins.
+Measured with `python3 ~/.local/state/mul-add-hook/reach-2026-10-12/gate.py scripts/hooks`: 160 of 168 recorded warnings reported, 7 of 88 failed clippy steps left (0.69 per 100), 122 reports in 36 files of lint-clean hana main, in about 11 s.
 
 **Files:**
-- `scripts/hooks/mul_add_lib.py` — the shape finder, the evidence rules, the rewrite text, the renames; the proof code removed
-- `scripts/hooks/post-tool-use-mul-add.py` — the conditional message and the renamed call
-- `scripts/hooks/test_mul_add.py` — the tests in Spec item 8
+- `scripts/hooks/mul_add_lib.py` — the lexed sum (`ArithmeticTokens`), the evidence patterns, `NameArithmeticEvidence` and `BareNameEvidence`, the text builders (`_compact`, `_receiver`, `_negated`), `_find_in_body`, `MulAddFinding`, and `mul_add_findings` with the written-line filter
+- `scripts/hooks/post-tool-use-mul-add.py` — the conditional message and the block log record
+- `scripts/hooks/test_mul_add.py` — 130 tests: one per rejected class in "Measured cause", the evidence rules, the kept exemptions, the exact message fields, the written-line cases, and ten regression cases
 
-**Seats:** 1 writer + 1 tester — the code and its tests are separate files.
-- `impl` — `scripts/hooks/mul_add_lib.py`, `scripts/hooks/post-tool-use-mul-add.py`
-- `test` — `scripts/hooks/test_mul_add.py`: the cases in Spec item 8, written from items 1–7
+**Binds later work:** the live check expects the description text above, word for word. The re-measure reads `expression` in `blocks.jsonl`, which holds the collapsed `expr` from this phase on, and compares a recorded warning through `mul_add_findings` on its stub, as `gate.py` does. The eight recorded warnings still unreported are all skipped by `VECTOR`: a `.min(` or `.max(` call with an argument (three), a `.left` member (three), a `.size()` call (one), a `Transform` type token inside a generic callee (one).
 
-**Constraints from prior phases:** Phase 1 added `AppliedRustEdits.replacements` and `written_lines(source, replacements)` in `scripts/hooks/fn_length_lib.py`, the `written: frozenset[int] | None = None` parameter of the findings function, and the `Write` default in the tests' `run_hook`. Keep all four; this phase does not edit `fn_length_lib.py`. `written_lines` compares `old` and `new` line by line and ends a line at `"\n"` alone. The hook entry runs its `*` and `+` or `-` text check first, then `written_lines`, and imports the detector only when a line was written; keep that order. The line filter keeps a finding when any line from the first to the last line of its expression is in `written`, and today it counts those lines as `finding.expr.count("\n")`, because `expr` is the raw source slice. Item 6 collapses whitespace in `expr`, so take the last line from the expression's source span before collapsing; a sum that spans lines stays reported when the edit wrote any one of them.
+**Gotchas:** block scopes inside one function are not modelled: a name's evidence is its last `let` before the sum anywhere in that function. The line filter takes an expression's last line from its source span, because `expr` no longer holds the newlines. Keeping a generic callee whole exposes its type tokens to `VECTOR`. The reports left on lint-clean code are sums the text cannot disprove: vectors, points, offsets and colors held in bare names with no annotation or constructor; integer arithmetic with no integer literal or cast in the sum; sums over references and scalar accessors such as waveform samples and layout or font metrics.
 
-**Acceptance gate:**
-- the three Test commands pass;
-- `basedpyright` on each changed file ends `0 errors, 0 warnings, 0 notes`;
-- `python3 ~/.local/state/mul-add-hook/reach-2026-10-12/gate.py scripts/hooks` from the worktree root prints:
-  - `recall:` at least 152 of 168 (the prototype: 156);
-  - `replay:` at most 15 of 88 failed steps (the prototype: 12; 20 is the 1.979 limit);
-  - `false alarms:` at most 200 (the prototype: 191); aim for 120 or fewer;
-  - and finishes within 20 s on natedev (today: about 10 s);
-- the report lists each unreported real warning with the rule that skipped it, and the classes of the remaining false alarms;
-- `test_many_findings_scan_scales_with_file_length` passes.
+**Ruled out:** narrowing `VECTOR` for `.min(`, `.max(`, `.left` and `.size()` now (the gates pass; the re-measure decides whether it is needed); importing the measured prototype (the rule is built on the shared scanner).
 
-### Phase 3 — Live check  · status: todo
+### Phase 3 — Live check  · status: done
 
-**Blocked by:** G1 — Phase 2's checkpoint is in `~/.claude` on natedev.
+#### As-built
 
-#### Work Order
+The wider detector is confirmed live on natedev for both agents. T_reach, the time it reached the live hooks, is 2026-10-12 11:13:42 PDT (2026-10-12T18:13:42Z): the committer time of the merge that brought the every-likely-multiply-add checkpoint into `~/.claude`.
 
-**Goal:** A real Claude edit and a real Codex `apply_patch` on natedev each receive the conditional block, and an edit that leaves such a line untouched receives none.
-
-**Spec:**
-
-Work in the worktree `/home/natepiano/worktrees/claude-build-followups-mul-add`, branch `build-followups-mul-add`. The scratch crate lives in the seat's scratch folder, outside every repository.
-
-1. Make a scratch workspace: `Cargo.toml` with `[workspace] members = ["crate"]` and `[workspace.lints.clippy] nursery = "deny"`; `crate/Cargo.toml` with `[lints] workspace = true`; `crate/src/lib.rs` with one function holding `let top = 1.0_f32;`.
-2. Codex: with `apply_patch`, add the line `let centre_row = top + metrics.button.height * 0.5;`. The seat receives one block whose text holds `if top + metrics.button.height * 0.5 is f32 or f64 arithmetic, write metrics.button.height.mul_add(0.5, top) (clippy::suboptimal_flops)`.
-3. Codex: with a second `apply_patch`, change the `let top` line only. No block arrives.
-4. Claude: the unit director repeats steps 2 and 3 in its own scratch crate with `Edit`, and records what it received.
-5. `python3 scripts/hooks/codex_hooks.py check` exits 0.
-6. `~/.local/state/mul-add-hook/blocks.jsonl` gained one record per block, with `agent` `codex` and `claude`.
-7. Record T_reach: the committer time, in PDT, of the commit that brought Phase 2's checkpoint into `~/.claude` (`git -C ~/.claude log -1 --format=%cI <that commit>`).
-8. Write the result under "Measured outcome" in `docs/as-built/build-followups-mul-add.md`: a short "Detector reach, live check" paragraph with T_reach, both agents' block text and the two no-block results.
+- In a scratch workspace that denies `nursery`, a Codex `apply_patch` and a Claude `Edit` that each add `let centre_row = top + metrics.button.height * 0.5;` receive one block reading `<file>:3: if top + metrics.button.height * 0.5 is f32 or f64 arithmetic, write metrics.button.height.mul_add(0.5, top) (clippy::suboptimal_flops). Leave integer and vector arithmetic as it is. The edit was applied.`
+- A second edit that changes only the `let top` line receives no block, for both agents.
+- `python3 scripts/hooks/codex_hooks.py check` exits 0 and reports both Codex handlers trusted.
+- The live `~/.local/state/mul-add-hook/blocks.jsonl` holds one record per block: `agent` `claude`, `tool` `Edit`, at 2026-10-12T18:18:04Z; `agent` `codex`, `tool` `apply_patch`, at 2026-10-12T18:21:28Z; both with `line` 3 and `expression` `top + metrics.button.height * 0.5`.
 
 **Files:**
-- `docs/as-built/build-followups-mul-add.md` — the "Detector reach, live check" paragraph
+- `docs/as-built/build-followups-mul-add.md` — the "Detector reach, live check" paragraph, first under "Measured outcome"
 
-**Seats:** 1 writer — one doc paragraph and one live check; nothing splits.
-- `impl` — `docs/as-built/build-followups-mul-add.md`, and the Codex half of the live check
-- `test` — opens as impl; no file
+**Binds later work:** the re-measure's window runs from T_reach to 2026-10-16 11:13:42 PDT. The two records above sit inside it and come from scratch crates (`file` under `live_check_claude/` and `live_check_codex/`), so they are no part of any block count. The re-measure's table and paragraph follow the live-check paragraph.
 
-**Constraints from prior phases:** Phase 2 renamed the entry to `mul_add_findings` and set the message text in Spec step 2 above. Phase 1 made the hook report only on written lines, which step 3 checks.
-
-**Acceptance gate:** steps 2–6 observed and recorded; the doc paragraph holds T_reach with its zone.
+**Gotchas:** the hook reads text and never compiles, so the scratch function need not build. The block log writes one record per reported expression, each with its own `at`; the records of one hook response share no id.
 
 ### Phase 4 — Re-measure  · status: todo
 
-**Blocked by:** G2 — 96 hours after T_reach.
+**Blocked by:** G2 — 96 hours after T_reach: 2026-10-16 11:13:42 PDT.
 
 #### Work Order
 
@@ -224,13 +186,13 @@ Work in the worktree `/home/natepiano/worktrees/claude-build-followups-mul-add`,
 
 Work in the worktree `/home/natepiano/worktrees/claude-build-followups-mul-add`, branch `build-followups-mul-add`. Read-only measurement; saved output stays under a few MB.
 
-1. Window: T_reach to T_reach + 96 h. Source: the buildlog index `~/.local/state/buildlog/index.sqlite` (table `steps`) and its gzip logs. Method and scripts: the "Measured outcome" section of `docs/as-built/build-followups-mul-add.md`, with `~/.local/state/mul-add-hook/reach-2026-10-12/remeasure/` (`clippy_fail_lints.py`, `cost.py`, `loop.py`, `totals.py`, `derive.py`) and `extract.py` beside it. Copy the scripts to scratch before changing a window constant; never edit the evidence folder.
+1. Window: T_reach to T_reach + 96 h, with both ends applied to every query (compare `datetime(started_at)` in UTC). Source: the buildlog index `~/.local/state/buildlog/index.sqlite` (table `steps`) and its gzip logs. Method: the "Measured outcome" section of `docs/as-built/build-followups-mul-add.md`. The first re-measure's scripts in `~/.local/state/mul-add-hook/reach-2026-10-12/remeasure/` (`clippy_fail_lints.py`, `cost.py`, `loop.py`, `totals.py`, `derive.py`, `scan_residuals.py`) and `extract.py` beside that folder are a reference for the log parsing and the cost definitions, not a ready pipeline: `extract.py` has a start time and no end; `clippy_fail_lints.py`, `cost.py` and `loop.py` look back a number of days from now; `totals.py` holds its own window; `derive.py` reads `totals.json` and `residuals_scanned.json`; `scan_residuals.py`, which writes the second, imports `float_mul_add_findings`, now `mul_add_findings`. Copy what is needed to scratch, give every copy the same two bounds, trace each input file to the script that writes it before running anything, and never edit the evidence folder.
 2. Report, for `clippy::suboptimal_flops`:
    - failed steps per 100 hana clippy steps: limit 1.979 (baseline 7.916; first re-measure 8.126; since go-live 8.67);
    - sole-cause seat-hours per day: limit 0.100 (baseline 0.402; first re-measure 0.576);
-   - of the window's warnings, how many had an earlier block for the same file and expression in `~/.local/state/mul-add-hook/blocks.jsonl`, how many had none, and for those with none, which rule skipped them (run the detector on a stub, as `gate.py` does);
-   - blocks in the window: total, by agent, and how many were followed by a `mul_add` on that line in the next commit touching the file (a sample of 30 is enough).
-3. Each limit gets PASS or FAIL. A FAIL names its largest remaining cause with counts.
+   - of the window's warnings, how many had an earlier record for the same file and expression in `~/.local/state/mul-add-hook/blocks.jsonl`, and how many had none. Split those with none in two by running the detector on a stub, as `gate.py` does: the stub is reported, so today's detector sees the shape and the hook stayed silent for a cause the log cannot name (the line was not written by the edit, the edit came from outside the hooks, or the log write failed), counted as unknown; or the stub is not reported, counted under the rule that skips it on the stub;
+   - blocks in the window, where one block is one record in `blocks.jsonl`, that is one reported expression (a hook response that reports several expressions writes several records, each with its own `at` and no shared id): total, by agent, and how many were followed by a `mul_add` on that line in the next commit touching the file (a sample of 30 is enough).
+3. Each limit gets PASS or FAIL. A FAIL names its largest remaining cause with counts. A window with no sole-cause failure, or with failures and no later lint call, still gives its sums and a verdict: write the median and the percentile as unavailable, never computed from an empty sample (`cost.py` and `loop.py` compute them unconditionally).
 4. Write the result as a "Detector reach, re-measure" table and paragraph under "Measured outcome" in `docs/as-built/build-followups-mul-add.md`.
 
 **Files:**
@@ -240,7 +202,7 @@ Work in the worktree `/home/natepiano/worktrees/claude-build-followups-mul-add`,
 - `impl` — `docs/as-built/build-followups-mul-add.md`
 - `test` — opens as impl; no file
 
-**Constraints from prior phases:** T_reach is in Phase 3's As-built. Phase 2 changed the block's wording, so match blocks to warnings by `file` and `expression` in `blocks.jsonl`, never by message text.
+**Constraints from prior phases:** T_reach is 2026-10-12 11:13:42 PDT (2026-10-12T18:13:42Z), the committer time of the merge that brought Phase 2's checkpoint into `~/.claude`; the window ends 2026-10-16 11:13:42 PDT (2026-10-16T18:13:42Z). Phase 3's live check wrote two records into `blocks.jsonl` inside the window, at 2026-10-12T18:18:04Z (`agent` `claude`) and 2026-10-12T18:21:28Z (`agent` `codex`), both with `expression` `top + metrics.button.height * 0.5` and a `file` under `live_check_claude/` or `live_check_codex/`; they come from scratch crates, so leave them out of every block count and say so beside the counts. "Measured outcome" in the as-built doc opens with Phase 3's "Detector reach, live check" paragraph; put the re-measure's table and paragraph directly after it. Phase 2 changed the block's wording, so match blocks to warnings by `file` and `expression` in `blocks.jsonl`, never by message text. From Phase 2 on, `expression` is the detector's `expr`: the sum's source text with each run of whitespace outside string and char literals collapsed to one space and comments left out; a record from before T_reach holds the raw source slice. To compare a clippy warning with a record, run `mul_add_lib.mul_add_findings(path)` on the warning's stub as `gate.py` does (it returns the lint scope and a list of findings with `line`, `expr` and `rewrite`) and compare `expr`. On Phase 2's checkpoint `gate.py` reports 160 of the 168 recorded warnings; the `VECTOR` pattern in `mul_add_lib.py` skips the other eight (a `.min(` or `.max(` call with an argument, three; a `.left` member, three; a `.size()` call, one; a `Transform` type token, one).
 
 **Acceptance gate:** both limits reported with PASS or FAIL from the 96-hour window; every number traces to a query the report names.
 

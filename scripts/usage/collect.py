@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import fcntl
 import json
 import os
 import re
@@ -26,10 +27,13 @@ if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from scripts.usage.agents_log import Assignment, Lens, Role, RoleLog, assignments, role_at, state_dir
-from scripts.whoami.seat_usage import (
-    MAC_HOST, KnownThreadOpening, ThreadRolloutBuilder, decode_rollout, is_compaction,
+from scripts.usage.rollouts import (
+    KnownThreadOpening, ThreadRolloutBuilder, decode_rollout, is_compaction,
     is_edit, parse_timestamp, token_usage,
 )
+
+
+MAC_HOST = "natemccoy@mac"
 
 
 @dataclass(frozen=True)
@@ -54,9 +58,10 @@ class CodexThread:
 Agent = ClaudeSession | ClaudeSubagent | CodexThread
 Family = Literal["claude", "codex"]
 LogFamily = Literal["claude", "codex", "history"]
-SourceFamily = Literal["claude", "codex", "history", "checkpoints", "readings", "account_roles"]
+SourceFamily = Literal["claude", "codex", "history", "checkpoints", "readings", "baseline_readings", "account_roles"]
 LOG_FAMILIES: tuple[LogFamily, ...] = ("claude", "codex", "history")
-STORE_VERSION = 6
+FILE_NAMED_CODEX_KEYS_VERSION = 8
+STORE_VERSION = FILE_NAMED_CODEX_KEYS_VERSION
 MAX_SQLITE_INTEGER = (1 << 63) - 1
 
 
@@ -179,11 +184,17 @@ class Edit:
 
 
 @dataclass(frozen=True)
+class Folder:
+    agent: Agent
+    folder: str
+
+
+@dataclass(frozen=True)
 class NoMeasurement:
     pass
 
 
-ThreadMeasurement = Turn | Compaction | Opening | Edit
+ThreadMeasurement = Turn | Compaction | Opening | Edit | Folder
 Measurement = ThreadMeasurement | NoMeasurement
 
 
@@ -247,6 +258,7 @@ class ThreadNotIdentified:
 @dataclass
 class CodexContext:
     machine: str
+    file_name: str
     agent: CodexThread | ThreadNotIdentified = field(default_factory=ThreadNotIdentified)
     model: Model = field(default_factory=ModelNotReported)
     effort: Effort = field(default_factory=EffortNotReported)
@@ -274,13 +286,15 @@ class CodexContext:
         if not isinstance(self.agent, CodexThread):
             return ()
         values: list[ThreadMeasurement] = []
+        if record.get("type") == "session_meta" and isinstance(payload.get("cwd"), str):
+            values.append(Folder(self.agent, cast(str, payload["cwd"])))
         opening = self.lifecycle.opening
         if isinstance(opening, KnownThreadOpening) and opening != previous_opening:
             values.append(Opening(self.agent, opening.at))
         if at is None:
             return tuple(values)
         if edited:
-            values.append(Edit(self.agent, str(offset), at))
+            values.append(Edit(self.agent, codex_key(self.file_name, offset), at))
         if is_compaction(record):
             values.append(Compaction(self.agent, at))
         usage = token_usage(record)
@@ -288,11 +302,15 @@ class CodexContext:
             return tuple(values)
         # Validate the reported input total before its cached portion is removed.
         _ = token_count(usage.uncached_input + usage.cached_input)
-        values.append(Turn(self.agent, str(offset), at, self.model, self.effort,
+        values.append(Turn(self.agent, codex_key(self.file_name, offset), at, self.model, self.effort,
                            RawTokens(token_count(usage.uncached_input), 0, 0,
                                      token_count(usage.cached_input), token_count(usage.output)),
                            not self.edit_seen))
         return tuple(values)
+
+
+def codex_key(file_name: str, offset: int) -> str:
+    return f"{file_name}:{offset}"
 
 
 def object_fields(value: object) -> dict[str, object]:
@@ -380,6 +398,8 @@ CREATE TABLE IF NOT EXISTS turns (
 );
 CREATE UNIQUE INDEX IF NOT EXISTS claude_message ON turns (machine, turn_key)
     WHERE family = 'claude';
+CREATE INDEX IF NOT EXISTS turns_at ON turns (at);
+CREATE INDEX IF NOT EXISTS turns_agent_at ON turns (machine, family, parent_id, agent_id, at);
 CREATE TABLE IF NOT EXISTS compactions (
     machine TEXT NOT NULL, family TEXT NOT NULL, parent_id TEXT NOT NULL,
     agent_id TEXT NOT NULL, at TEXT NOT NULL,
@@ -400,6 +420,11 @@ CREATE TABLE IF NOT EXISTS turn_sources (
 CREATE TABLE IF NOT EXISTS openings (
     machine TEXT NOT NULL, family TEXT NOT NULL, parent_id TEXT NOT NULL,
     agent_id TEXT NOT NULL, at TEXT NOT NULL,
+    PRIMARY KEY (machine, family, parent_id, agent_id)
+);
+CREATE TABLE IF NOT EXISTS folders (
+    machine TEXT NOT NULL, family TEXT NOT NULL, parent_id TEXT NOT NULL,
+    agent_id TEXT NOT NULL, folder TEXT NOT NULL,
     PRIMARY KEY (machine, family, parent_id, agent_id)
 );
 CREATE TABLE IF NOT EXISTS edits (
@@ -451,8 +476,21 @@ CREATE TABLE IF NOT EXISTS account_role_changes (
 """
 
 
-def migrate_store(db: sqlite3.Connection) -> None:
+class StorePredatesFileNamedCodexKeys(Exception):
+    def __init__(self, version: int) -> None:
+        super().__init__(f"store version {version} predates file-named Codex keys")
+        self.version: int = version
+
+
+def check_store_key_version(db: sqlite3.Connection) -> int:
     version = cast(int, db.execute("PRAGMA user_version").fetchone()[0])
+    if 0 < version < FILE_NAMED_CODEX_KEYS_VERSION:
+        raise StorePredatesFileNamedCodexKeys(version)
+    return version
+
+
+def migrate_store(db: sqlite3.Connection) -> None:
+    version = check_store_key_version(db)
     if version < STORE_VERSION:
         with db:
             _ = db.execute("DELETE FROM cursors")
@@ -536,6 +574,12 @@ def save_measurement(db: sqlite3.Connection, value: Measurement, resolver: RoleR
     if isinstance(value, NoMeasurement):
         return 0
     machine, family, kind, parent_id, agent_id = identity_columns(value.agent)
+    if isinstance(value, Folder):
+        _ = db.execute("INSERT INTO folders VALUES (?, ?, ?, ?, ?) " +
+                       "ON CONFLICT(machine, family, parent_id, agent_id) DO UPDATE SET folder = excluded.folder " +
+                       "WHERE folders.family = 'codex' AND folders.folder != excluded.folder",
+                       (machine, family, parent_id, agent_id, value.folder))
+        return 0
     if isinstance(value, Opening):
         # Codex metadata can revise its opening; Claude keeps its first timestamp.
         _ = db.execute("INSERT INTO openings VALUES (?, ?, ?, ?, ?) " +
@@ -616,10 +660,11 @@ def read_file(machine: str, path: Path, family: Family,
         return
     if previous > size:
         previous = 0
-    context = CodexContext(machine)
+    context = CodexContext(machine, path.name)
     agent = claude_identity(machine, path)
     edit_seen = False
     opening_seen = False
+    folder_seen = False
     completed = 0
     with path.open("rb") as source:
         # Changed files replay their prefix to recover context and the first edit.
@@ -629,6 +674,10 @@ def read_file(machine: str, path: Path, family: Family,
             try:
                 if family == "claude":
                     record = json_fields(line)
+                    cwd = record.get("cwd")
+                    if not folder_seen and isinstance(cwd, str):
+                        values.append(Folder(agent, cwd))
+                        folder_seen = True
                     edited = claude_edit(record)
                     edit_seen = edit_seen or edited
                     at = parse_timestamp(record.get("timestamp"))
@@ -936,7 +985,7 @@ def collect_local(db: sqlite3.Connection, args: CommandLine) -> None:
 REMOTE_BOOTSTRAP = """
 import json, sys, types
 request = json.load(sys.stdin)
-for name in ('scripts', 'scripts.usage', 'scripts.whoami'):
+for name in ('scripts', 'scripts.usage'):
     package = types.ModuleType(name)
     package.__path__ = []
     sys.modules[name] = package
@@ -978,6 +1027,9 @@ def agent_record(agent: Agent) -> dict[str, object]:
 
 
 def measurement_record(value: ThreadMeasurement) -> dict[str, object]:
+    if isinstance(value, Folder):
+        return {"type": "measurement", "kind": "folder", "agent": agent_record(value.agent),
+                "folder": value.folder}
     kind = ("turn" if isinstance(value, Turn) else "compaction" if isinstance(value, Compaction)
             else "opening" if isinstance(value, Opening) else "edit")
     record: dict[str, object] = {
@@ -985,7 +1037,7 @@ def measurement_record(value: ThreadMeasurement) -> dict[str, object]:
         "agent": agent_record(value.agent), "at": value.at.isoformat(),
     }
     if isinstance(value, Edit):
-        record["key"] = token_count(int(value.key)) if isinstance(value.agent, CodexThread) else value.key
+        record["key"] = value.key
     if isinstance(value, Turn):
         tokens = value.tokens
         record.update(key=value.key,
@@ -1140,16 +1192,21 @@ def remote_measurement(record: dict[str, object], machine: str, family: Family) 
     if (family == "claude" and isinstance(agent, CodexThread)
             or family == "codex" and not isinstance(agent, CodexThread)):
         raise RemoteReadFailed("invalid remote agent kind")
+    measurement_kind = remote_string(record, "kind")
+    if measurement_kind == "folder":
+        folder = record.get("folder")
+        if not isinstance(folder, str):
+            raise RemoteReadFailed("remote folder missing or invalid")
+        return Folder(agent, folder)
     at = parse_timestamp(remote_string(record, "at"))
     if at is None:
         raise RemoteReadFailed("invalid remote measurement time")
-    measurement_kind = remote_string(record, "kind")
     if measurement_kind == "compaction":
         return Compaction(agent, at)
     if measurement_kind == "opening":
         return Opening(agent, at)
     if measurement_kind == "edit":
-        key = str(remote_integer(record, "key")) if isinstance(agent, CodexThread) else remote_string(record, "key")
+        key = remote_string(record, "key")
         return Edit(agent, key, at)
     if measurement_kind != "turn":
         raise RemoteReadFailed("unknown remote measurement kind")
@@ -1335,7 +1392,7 @@ def reader_payload(offsets: dict[str, int]) -> str:
     root = Path(__file__).resolve().parents[2]
     modules = {name: (root / relative).read_text(encoding="utf-8") for name, relative in (
         ("scripts.usage.agents_log", "scripts/usage/agents_log.py"),
-        ("scripts.whoami.seat_usage", "scripts/whoami/seat_usage.py"),
+        ("scripts.usage.rollouts", "scripts/usage/rollouts.py"),
         ("scripts.usage.collect", "scripts/usage/collect.py"),
     )}
     return json.dumps({"modules": modules, "cursors": offsets}, separators=(",", ":"))
@@ -1349,9 +1406,10 @@ def collect_mac(db: sqlite3.Connection) -> None:
                for row in cast(Iterable[sqlite3.Row], cursor_rows)}
     command = shlex.join(("python3", "-c", REMOTE_BOOTSTRAP)) + '; printf "\\nrc=%s\\n" "$?"'
     detail = ""
+    ssh_detail = ""
     try:
         payload = reader_payload(offsets)
-        with tempfile.TemporaryDirectory(prefix="usage-mac-") as directory, tempfile.TemporaryFile(mode="w+") as errors:
+        with tempfile.TemporaryDirectory(prefix="usage-mac-") as directory, tempfile.TemporaryFile(mode="w+", encoding="utf-8", errors="replace") as errors:
             process: subprocess.Popen[str] = subprocess.Popen(
                 ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5",
                  "-o", "ServerAliveInterval=5", "-o", "ServerAliveCountMax=1", MAC_HOST, command],
@@ -1375,10 +1433,12 @@ def collect_mac(db: sqlite3.Connection) -> None:
                 if process.poll() is None:
                     process.terminate()
                     _ = process.wait()
+                _ = errors.seek(0)
+                ssh_detail = next((line.strip() for line in errors if line.strip()), "")
     except (OSError, UnicodeError, RemoteReadFailed) as error:
         state = SourceState.PARTIAL if progress.completed_files else SourceState.UNREACHABLE
         progress.states = {family: state for family in LOG_FAMILIES}
-        detail = " (" + " ".join(str(error).splitlines()) + ")"
+        detail = " (" + (ssh_detail or " ".join(str(error).splitlines())) + ")"
         if isinstance(progress.role_snapshot, RoleSnapshotPending):
             with db:
                 # Keep the previous problem count until a new snapshot commits.
@@ -1397,6 +1457,10 @@ def collect_mac(db: sqlite3.Connection) -> None:
         source_line(machine, "agents", 0, SourceState.UNREACHABLE, detail)
 
 
+def store_path() -> Path:
+    return state_dir() / "usage.db"
+
+
 class CommandLine(argparse.Namespace):
     db: Path
     machine: str
@@ -1405,19 +1469,21 @@ class CommandLine(argparse.Namespace):
     agents_log: Path
     no_mac: bool
     readings: Path
+    baseline_readings: Path
     account_roles: Path
     claude_repo: Path
     production_docs: Path
 
-    def __init__(self, readings: Path, account_roles: Path, claude_repo: Path, production_docs: Path) -> None:
+    def __init__(self, readings: Path, baseline_readings: Path, account_roles: Path, claude_repo: Path, production_docs: Path) -> None:
         super().__init__()
-        self.db = state_dir() / "usage.db"
+        self.db = store_path()
         self.machine = "natedev"
         self.claude_root = Path.home() / ".claude/projects"
         self.codex_root = Path.home() / ".codex/sessions"
         self.agents_log = state_dir() / "agents.jsonl"
         self.no_mac = False
         self.readings = readings
+        self.baseline_readings = baseline_readings
         self.account_roles = account_roles
         self.claude_repo = claude_repo
         self.production_docs = production_docs
@@ -1435,45 +1501,67 @@ def main(argv: Sequence[str] = ()) -> int:
     _ = parser.add_argument("--agents-log", type=Path)
     _ = parser.add_argument("--no-mac", action="store_true")
     _ = parser.add_argument("--readings", type=Path)
+    _ = parser.add_argument("--baseline-readings", type=Path)
     _ = parser.add_argument("--account-roles", type=Path)
     _ = parser.add_argument("--claude-repo", type=Path)
     _ = parser.add_argument("--production-docs", type=Path)
     defaults = outcomes.default_paths()
-    args = parser.parse_args(argv, namespace=CommandLine(defaults.readings, defaults.account_roles,
+    args = parser.parse_args(argv, namespace=CommandLine(defaults.readings, defaults.baseline_readings, defaults.account_roles,
                                                        defaults.claude_repo, defaults.production_docs))
     try:
         args.db.parent.mkdir(parents=True, exist_ok=True)
-        db = sqlite3.connect(args.db)
+        lock = Path(str(args.db) + ".lock").open("a")
         try:
-            db.row_factory = sqlite3.Row
-            _ = db.executescript(SCHEMA)
-            migrate_store(db)
-            collect_local(db, args)
-            if args.no_mac:
-                with db:
-                    for family in LOG_FAMILIES:
-                        save_turn_source(db, "mac", family, SourceState.SKIPPED)
-                for source in (*LOG_FAMILIES, "agents"):
-                    source_line("mac", source, 0, SourceState.SKIPPED)
-            else:
-                collect_mac(db)
-            reader = outcomes.IncrementalLogReader(complete_lines, json_fields, cursor_at,
-                                                  lambda ledger, machine, path, offset:
-                                                  save_cursor(ledger, machine, path, FileCursor(offset)))
-            for result in outcomes.collect(db, args.readings, args.account_roles,
-                                           args.claude_repo, args.production_docs, reader):
-                state = (SourceState.READY if isinstance(result.state, outcomes.CompleteSourceRead)
-                         else SourceState.MISSING if isinstance(result.state, outcomes.MissingSource)
-                         else SourceState.UNREADABLE if isinstance(result.state, outcomes.UnreadableSource)
-                         else SourceState.PARTIAL)
-                with db:
-                    save_turn_source(db, "natedev", result.family, state)
-                source_line("natedev", result.family, result.added, state)
+            fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            lock.close()
+            print("usage collect: another pass is running")
+            return 0
+        try:
+            return collect_pass(args)
         finally:
-            db.close()
+            lock.close()
+    except StorePredatesFileNamedCodexKeys as error:
+        print(f"collect: store version {error.version} predates file-named Codex keys; "
+              + f"delete {args.db} and run the collector again to rebuild it", file=sys.stderr)
+        return 1
     except (OSError, sqlite3.Error) as error:
         print("collect: database write failed: " + " ".join(str(error).splitlines()), file=sys.stderr)
         return 1
+
+
+def collect_pass(args: CommandLine) -> int:
+    from scripts.usage import outcomes
+    db = sqlite3.connect(args.db)
+    try:
+        db.row_factory = sqlite3.Row
+        _ = check_store_key_version(db)
+        _ = db.execute("PRAGMA journal_mode=WAL")
+        _ = db.executescript(SCHEMA)
+        migrate_store(db)
+        collect_local(db, args)
+        if args.no_mac:
+            with db:
+                for family in LOG_FAMILIES:
+                    save_turn_source(db, "mac", family, SourceState.SKIPPED)
+            for source in (*LOG_FAMILIES, "agents"):
+                source_line("mac", source, 0, SourceState.SKIPPED)
+        else:
+            collect_mac(db)
+        reader = outcomes.IncrementalLogReader(complete_lines, json_fields, cursor_at,
+                                              lambda ledger, machine, path, offset:
+                                              save_cursor(ledger, machine, path, FileCursor(offset)))
+        for result in outcomes.collect(db, args.readings, args.baseline_readings, args.account_roles,
+                                       args.claude_repo, args.production_docs, reader):
+            state = (SourceState.READY if isinstance(result.state, outcomes.CompleteSourceRead)
+                     else SourceState.MISSING if isinstance(result.state, outcomes.MissingSource)
+                     else SourceState.UNREADABLE if isinstance(result.state, outcomes.UnreadableSource)
+                     else SourceState.PARTIAL)
+            with db:
+                save_turn_source(db, "natedev", result.family, state)
+            source_line("natedev", result.family, result.added, state)
+    finally:
+        db.close()
     return 0
 
 

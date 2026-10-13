@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Persistent records for account-scoped shutdown and restart work."""
+"""Persist per-session shutdown requests and account launch holds."""
 
 from __future__ import annotations
 
@@ -8,9 +8,12 @@ import json
 import os
 import re
 import stat
+import sys
 import tempfile
+import time
 from collections.abc import Callable, Generator
 from contextlib import contextmanager
+from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Literal, NotRequired, TypedDict, cast
@@ -18,17 +21,41 @@ from typing import Literal, NotRequired, TypedDict, cast
 from inventory import Session, parse_session
 from launch_permission import launch_barrier, shutdown_state_root
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
+from user_zone import user_zone  # noqa: E402
 
-class AllAccountSessions(TypedDict):
+CLAIM_STALE_SECONDS = 120
+CONDUCTOR_LOCK_RETRY_DELAYS = (0.05,) * 5
+
+
+class NoRemoteControl(TypedDict):
+    session_id: str
+    name: str
+    alerts: Literal["user", "none"]
+
+
+class ReadinessClear(TypedDict):
+    kind: Literal["clear"]
+
+
+class ReadinessBlocked(TypedDict):
+    kind: Literal["blocked"]
+    reason: str
+
+
+ReadinessCheck = ReadinessClear | ReadinessBlocked
+
+
+class _LegacyAllAccountSessions(TypedDict):
     kind: Literal["all account sessions"]
 
 
-class SelectedSessions(TypedDict):
+class _LegacySelectedSessions(TypedDict):
     kind: Literal["selected"]
     session_ids: list[str]
 
 
-ShutdownScope = AllAccountSessions | SelectedSessions
+_LegacyScope = _LegacyAllAccountSessions | _LegacySelectedSessions
 
 
 class FromSession(TypedDict):
@@ -43,21 +70,21 @@ class FromTerminal(TypedDict):
 RequestOrigin = FromSession | FromTerminal
 
 
-class SystemdConductor(TypedDict):
+class _LegacySystemdConductor(TypedDict):
     kind: Literal["systemd"]
     unit: str
 
 
-class LaunchdConductor(TypedDict):
+class _LegacyLaunchdConductor(TypedDict):
     kind: Literal["launchd"]
     label: str
 
 
-class ConductorNotStarted(TypedDict):
+class _LegacyConductorNotStarted(TypedDict):
     kind: Literal["not started"]
 
 
-Conductor = SystemdConductor | LaunchdConductor | ConductorNotStarted
+_LegacyConductor = _LegacySystemdConductor | _LegacyLaunchdConductor | _LegacyConductorNotStarted
 StopTiming = Literal["wait for ready", "now"]
 StopLeftRunningCause = Literal["stop not confirmed", "owner identity lost"]
 
@@ -80,7 +107,7 @@ class AccountUnreadableAtStop(TypedDict):
     at: str
 
 
-class SeatStillLive(TypedDict):
+class _LegacySeatStillLive(TypedDict):
     kind: Literal["seat still live"]
     at: str
 
@@ -103,28 +130,27 @@ SessionStopIssue = (
     NotReadyToStop
     | StillRunningAfterStop
     | AccountUnreadableAtStop
-    | SeatStillLive
     | CodexServerLeftRunning
     | UnitTmuxLeftRunning
 )
 
 
-class StopClaimFailed(TypedDict):
+class _LegacyStopClaimFailed(TypedDict):
     kind: Literal["stop claim failed"]
     at: str
     machine: str
     reason: str
 
 
-class MachineStopFailed(TypedDict):
+class _LegacyMachineStopFailed(TypedDict):
     kind: Literal["machine stop failed"]
     at: str
     machine: str
     reason: str
 
 
-OrchestrationStopIssue = StopClaimFailed | MachineStopFailed
-StopIssue = SessionStopIssue | OrchestrationStopIssue
+_LegacyOrchestrationIssue = _LegacyStopClaimFailed | _LegacyMachineStopFailed
+_LegacyStopIssue = SessionStopIssue | _LegacySeatStillLive | _LegacyOrchestrationIssue
 
 
 class ShowrunnerFooter(TypedDict):
@@ -182,13 +208,18 @@ class SessionReadyToStop(TypedDict):
     at: str
 
 
-class PassiveSeatReadyToStop(TypedDict):
+class _LegacyPassiveSeatReady(TypedDict):
     kind: Literal["passive seat ready"]
     at: str
 
 
 class SessionStopped(TypedDict):
     kind: Literal["stopped"]
+    at: str
+
+
+class SessionStopping(TypedDict):
+    kind: Literal["stopping"]
     at: str
 
 
@@ -216,6 +247,7 @@ class SessionRestarted(TypedDict):
 class SessionRestarting(TypedDict):
     kind: Literal["restarting"]
     at: str
+    prior: SessionRestartPrior
 
 
 class PendingTimer(TypedDict):
@@ -229,7 +261,7 @@ class SessionRestoredTimersPending(TypedDict):
     timers: list[PendingTimer]
 
 
-class SeatAvailableOnDemand(TypedDict):
+class _LegacySeatAvailable(TypedDict):
     kind: Literal["seat available on demand"]
     at: str
 
@@ -245,33 +277,33 @@ class SessionNeedsManualRestart(TypedDict):
     command: str
 
 
-SessionProgress = (
+SessionRestartPrior = (
     SessionWaiting
     | SessionReadyToStop
-    | PassiveSeatReadyToStop
     | SessionStopped
+    | SessionStopping
     | SessionAlreadyGone
     | ProcessIdentityLost
     | SessionStopFailed
     | SessionRestarted
-    | SessionRestarting
     | SessionRestoredTimersPending
-    | SeatAvailableOnDemand
     | SessionRestartFailed
     | SessionNeedsManualRestart
 )
 
+SessionProgress = SessionRestartPrior | SessionRestarting
 
-class ShutdownSessionEntry(TypedDict):
+
+class _LegacySessionEntry(TypedDict):
     session: Session
     timers: list[TimerRestore]
     settle_message: SettleMessage
     where: Where
-    progress: SessionProgress
-    stop_issues: list[SessionStopIssue]
+    progress: SessionProgress | _LegacyPassiveSeatReady | _LegacySeatAvailable
+    stop_issues: list[SessionStopIssue | _LegacySeatStillLive]
 
 
-ShutdownState = Literal[
+_LegacyState = Literal[
     "settling",
     "stopping",
     "down",
@@ -286,19 +318,19 @@ ShutdownState = Literal[
 ShutdownContinuation = Literal["stop", "restart"]
 
 
-class ShutdownRecord(TypedDict):
+class _LegacyShutdownRecord(TypedDict):
     login: str
     label: str
     machine: str
-    state: ShutdownState
+    state: _LegacyState
     requested_at: str
     requested_by: RequestOrigin
-    scope: ShutdownScope
-    conductor: Conductor
+    scope: _LegacyScope
+    conductor: _LegacyConductor
     force: StopTiming
     then: NotRequired[ShutdownContinuation]
-    entries: list[ShutdownSessionEntry]
-    stop_issues: list[OrchestrationStopIssue]
+    entries: list[_LegacySessionEntry]
+    stop_issues: list[_LegacyOrchestrationIssue]
 
 
 class SessionShutdown(TypedDict):
@@ -306,6 +338,7 @@ class SessionShutdown(TypedDict):
     label: str
     machine: str
     requested_at: str
+    request_id: str
     requested_by: RequestOrigin
     hold: Literal["account", "session"]
     then: ShutdownContinuation
@@ -326,32 +359,22 @@ class AccountHold(TypedDict):
     label: str
     machine: str
     requested_at: str
+    request_id: str
     requested_by: RequestOrigin
     then: ShutdownContinuation
 
 
-def continuation(record: ShutdownRecord) -> ShutdownContinuation:
+def stop_incomplete(saved: SessionShutdown) -> bool:
+    """Report a failed stop or owner resources left after a terminal stop."""
+    progress = saved["progress"]["kind"]
+    return progress == "stop failed" or bool(saved["stop_issues"] and progress in {
+        "stopped", "already gone", "process identity lost",
+    })
+
+
+def _legacy_continuation(record: _LegacyShutdownRecord) -> ShutdownContinuation:
     """Legacy records stop; an explicit restart survives conductor launches."""
     return record.get("then", "stop")
-
-
-class LiveShutdownRecord(TypedDict):
-    kind: Literal["live"]
-    record: ShutdownRecord
-
-
-class NoShutdown(TypedDict):
-    kind: Literal["no shutdown"]
-
-
-class ShutdownInProgress(Exception):
-    """Raised when an account already has a live shutdown record."""
-
-    live: ShutdownRecord
-
-    def __init__(self, live: ShutdownRecord) -> None:
-        self.live = live
-        super().__init__(f"shutdown already in progress for {live['label']}")
 
 
 class NoLiveRecord(LookupError):
@@ -379,6 +402,7 @@ _PROGRESS_WITH_TIME = frozenset(
         "ready",
         "passive seat ready",
         "stopped",
+        "stopping",
         "already gone",
         "process identity lost",
         "stop failed",
@@ -406,30 +430,28 @@ def _account_directory(login: str) -> Path:
 
 
 @contextmanager
+def _directory_lock(directory: Path) -> Generator[None, None, None]:
+    descriptor = os.open(directory, os.O_RDONLY)
+    try:
+        fcntl.flock(descriptor, fcntl.LOCK_EX)
+        yield
+    finally:
+        os.close(descriptor)
+
+
+@contextmanager
 def _account_lock(login: str, *, create_directory: bool) -> Generator[Path, None, None]:
     directory = _account_directory(login)
     if create_directory:
         directory.mkdir(parents=True, exist_ok=True)
-    lock_path = directory / "lock"
-    with lock_path.open("a+", encoding="utf-8") as lock_file:
-        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
-        try:
-            yield directory
-        finally:
-            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
-
-
-@contextmanager
-def stop_lock(login: str) -> Generator[None, None, None]:
-    """Serialize complete stop attempts without blocking ordinary record reads."""
-    directory = _account_directory(login)
-    directory.mkdir(parents=True, exist_ok=True)
-    with (directory / "stop.lock").open("a+", encoding="utf-8") as lock_file:
-        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
-        try:
-            yield
-        finally:
-            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+    with _directory_lock(directory):
+        lock_path = directory / "lock"
+        with lock_path.open("a+", encoding="utf-8") as lock_file:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+            try:
+                yield directory
+            finally:
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
 
 
 def _mapping(value: object, place: str) -> dict[str, object]:
@@ -491,14 +513,14 @@ def _utc_time(value: object, place: str) -> str:
     return text
 
 
-def _scope(value: object, place: str) -> ShutdownScope:
+def _scope(value: object, place: str) -> _LegacyScope:
     values = _mapping(value, place)
     kind = _kind(values, place, frozenset({"all account sessions", "selected"}))
     if kind == "selected":
         _ = _strings(
             _required(values, "session_ids", place), f"{place}.session_ids"
         )
-    return cast(ShutdownScope, cast(object, values))
+    return cast(_LegacyScope, cast(object, values))
 
 
 def _request_origin(value: object, place: str) -> RequestOrigin:
@@ -511,14 +533,14 @@ def _request_origin(value: object, place: str) -> RequestOrigin:
     return cast(RequestOrigin, cast(object, values))
 
 
-def _conductor(value: object, place: str) -> Conductor:
+def _conductor(value: object, place: str) -> _LegacyConductor:
     values = _mapping(value, place)
     kind = _kind(values, place, frozenset({"systemd", "launchd", "not started"}))
     if kind == "systemd":
         _ = _string(_required(values, "unit", place), f"{place}.unit")
     elif kind == "launchd":
         _ = _string(_required(values, "label", place), f"{place}.label")
-    return cast(Conductor, cast(object, values))
+    return cast(_LegacyConductor, cast(object, values))
 
 
 def _footer(value: object, place: str) -> ShowrunnerFooter | NoFooter:
@@ -560,7 +582,7 @@ def _where(value: object, place: str) -> Where:
     return cast(Where, cast(object, values))
 
 
-def _progress(value: object, place: str) -> SessionProgress:
+def _progress(value: object, place: str, *, legacy: bool = False) -> SessionProgress | _LegacyPassiveSeatReady | _LegacySeatAvailable:
     values = _mapping(value, place)
     kind = _kind(
         values,
@@ -569,6 +591,13 @@ def _progress(value: object, place: str) -> SessionProgress:
     )
     if kind in _PROGRESS_WITH_TIME:
         _ = _utc_time(_required(values, "at", place), f"{place}.at")
+    if kind in {"passive seat ready", "seat available on demand"} and not legacy:
+        raise InvalidRecord(f"{place}.kind is invalid")
+    if kind == "restarting":
+        prior = _progress(_required(values, "prior", place), f"{place}.prior")
+        if prior["kind"] == "restarting":
+            raise InvalidRecord(f"{place}.prior must not be a restart claim")
+        values["prior"] = prior
     if kind in {"stop failed", "restart failed"}:
         _ = _string(_required(values, "reason", place), f"{place}.reason")
     elif kind == "timers pending":
@@ -600,7 +629,7 @@ def _stop_issue_fields(
     return values, kind
 
 
-def _session_stop_issue(value: object, place: str) -> SessionStopIssue:
+def _session_stop_issue(value: object, place: str, *, legacy: bool = False) -> SessionStopIssue | _LegacySeatStillLive:
     values, kind = _stop_issue_fields(
         value,
         place,
@@ -615,6 +644,8 @@ def _session_stop_issue(value: object, place: str) -> SessionStopIssue:
             }
         ),
     )
+    if kind == "seat still live" and not legacy:
+        raise InvalidRecord(f"{place}.kind is invalid")
     if kind == "not ready to stop":
         _ = _string(_required(values, "status", place), f"{place}.status")
         progress = _string(
@@ -641,7 +672,7 @@ def _session_stop_issue(value: object, place: str) -> SessionStopIssue:
 
 def _orchestration_stop_issue(
     value: object, place: str
-) -> OrchestrationStopIssue:
+) -> _LegacyOrchestrationIssue:
     values, _ = _stop_issue_fields(
         value,
         place,
@@ -649,10 +680,10 @@ def _orchestration_stop_issue(
     )
     _ = _string(_required(values, "machine", place), f"{place}.machine")
     _ = _string(_required(values, "reason", place), f"{place}.reason")
-    return cast(OrchestrationStopIssue, cast(object, values))
+    return cast(_LegacyOrchestrationIssue, cast(object, values))
 
 
-def _entry(value: object, place: str) -> ShutdownSessionEntry:
+def _entry(value: object, place: str) -> _LegacySessionEntry:
     values = _mapping(value, place)
     # Earlier records duplicated this session field on the entry.
     _ = values.pop("config_dir", None)
@@ -674,17 +705,17 @@ def _entry(value: object, place: str) -> ShutdownSessionEntry:
         _required(values, "where", place), f"{place}.where"
     )
     values["progress"] = _progress(
-        _required(values, "progress", place), f"{place}.progress"
+        _required(values, "progress", place), f"{place}.progress", legacy=True
     )
     stop_issue_values = _items(values.get("stop_issues", []), f"{place}.stop_issues")
     values["stop_issues"] = [
-        _session_stop_issue(issue, f"{place}.stop_issues[{index}]")
+        _session_stop_issue(issue, f"{place}.stop_issues[{index}]", legacy=True)
         for index, issue in enumerate(stop_issue_values)
     ]
-    return cast(ShutdownSessionEntry, cast(object, values))
+    return cast(_LegacySessionEntry, cast(object, values))
 
 
-def _record(value: object, place: str) -> ShutdownRecord:
+def _record(value: object, place: str) -> _LegacyShutdownRecord:
     values = _mapping(value, place)
     login = _string(_required(values, "login", place), f"{place}.login")
     try:
@@ -723,20 +754,10 @@ def _record(value: object, place: str) -> ShutdownRecord:
         _orchestration_stop_issue(issue, f"{place}.stop_issues[{index}]")
         for index, issue in enumerate(stop_issue_values)
     ]
-    return cast(ShutdownRecord, cast(object, values))
+    return cast(_LegacyShutdownRecord, cast(object, values))
 
 
-def parse_records(text: str) -> list[ShutdownRecord]:
-    """Decode and validate a JSON list of shutdown records."""
-    try:
-        value = cast(object, json.loads(text))
-    except (ValueError, TypeError) as error:
-        raise InvalidRecord("records is not valid JSON") from error
-    values = _items(value, "records")
-    return [_record(item, f"records[{index}]") for index, item in enumerate(values)]
-
-
-def _read_record(path: Path) -> ShutdownRecord:
+def _read_record(path: Path) -> _LegacyShutdownRecord:
     try:
         text = path.read_text(encoding="utf-8")
     except (OSError, UnicodeError) as error:
@@ -775,7 +796,7 @@ def _lstat(path: Path) -> os.stat_result | None:
         raise InvalidRecord(f"{path} cannot be inspected: {error}") from error
 
 
-def _write_record(path: Path, record: ShutdownRecord | SessionShutdown | AccountHold) -> None:
+def _write_record(path: Path, record: _LegacyShutdownRecord | SessionShutdown | AccountHold) -> None:
     descriptor, temporary_name = tempfile.mkstemp(
         prefix=".record.", suffix=".tmp", dir=path.parent
     )
@@ -807,7 +828,8 @@ def _existing_account_directory(login: str) -> Path | None:
 @contextmanager
 def _reading_lock(login: str, directory: Path) -> Generator[None, None, None]:
     """Hold the account lock for a read; a lock that cannot be taken is an unreadable record."""
-    account_lock = _account_lock(login, create_directory=False)
+    del login
+    account_lock = _directory_lock(directory)
     try:
         _ = account_lock.__enter__()
     except OSError as error:
@@ -816,12 +838,28 @@ def _reading_lock(login: str, directory: Path) -> Generator[None, None, None]:
             f"{lock_path} cannot be opened or locked: {error}"
         ) from error
     try:
-        yield
+        lock_path = directory / "lock"
+        if not _regular_record(lock_path):
+            yield
+        else:
+            try:
+                lock_file = lock_path.open("r+", encoding="utf-8")
+            except OSError as error:
+                raise InvalidRecord(f"{lock_path} cannot be opened or locked: {error}") from error
+            with lock_file:
+                try:
+                    fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+                except OSError as error:
+                    raise InvalidRecord(f"{lock_path} cannot be opened or locked: {error}") from error
+                try:
+                    yield
+                finally:
+                    fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
     finally:
         _ = account_lock.__exit__(None, None, None)
 
 
-def _slot_record(directory: Path) -> ShutdownRecord | None:
+def _slot_record(directory: Path) -> _LegacyShutdownRecord | None:
     path = directory / "record.json"
     record_status = _lstat(path)
     if record_status is None:
@@ -833,17 +871,17 @@ def _slot_record(directory: Path) -> ShutdownRecord | None:
     return _read_record(path)
 
 
-def _parked_records(directory: Path) -> list[ShutdownRecord]:
-    parked_directory = directory / "partial"
-    parked_status = _lstat(parked_directory)
-    if parked_status is None:
+def _legacy_partial_records(directory: Path) -> list[_LegacyShutdownRecord]:
+    partial_directory = directory / "partial"
+    partial_status = _lstat(partial_directory)
+    if partial_status is None:
         return []
-    if not stat.S_ISDIR(parked_status.st_mode):
+    if not stat.S_ISDIR(partial_status.st_mode):
         raise InvalidRecord(
-            f"{parked_directory} must be a directory; found {_entry_kind(parked_status.st_mode)}"
+            f"{partial_directory} must be a directory; found {_entry_kind(partial_status.st_mode)}"
         )
-    records: list[ShutdownRecord] = []
-    for path in parked_directory.glob("*.json"):
+    records: list[_LegacyShutdownRecord] = []
+    for path in partial_directory.glob("*.json"):
         path_status = _lstat(path)
         if path_status is None:
             continue
@@ -855,152 +893,6 @@ def _parked_records(directory: Path) -> list[ShutdownRecord]:
     return sorted(records, key=lambda record: record["requested_at"])
 
 
-def find_live(login: str) -> LiveShutdownRecord | NoShutdown:
-    """Return the account's slot record, if one exists; parked records are not in the slot."""
-    directory = _existing_account_directory(login)
-    if directory is None:
-        return NoShutdown(kind="no shutdown")
-    with _reading_lock(login, directory):
-        found = _slot_record(directory)
-    if found is None:
-        return NoShutdown(kind="no shutdown")
-    return LiveShutdownRecord(kind="live", record=found)
-
-
-def _slot_and_parked(directory: Path) -> list[ShutdownRecord]:
-    slot = _slot_record(directory)
-    return [*([] if slot is None else [slot]), *_parked_records(directory)]
-
-
-def parked(login: str) -> list[ShutdownRecord]:
-    """Return the account's parked `restart partial` records, oldest first."""
-    directory = _existing_account_directory(login)
-    if directory is None:
-        return []
-    with _reading_lock(login, directory):
-        return _parked_records(directory)
-
-
-def account_records(login: str) -> list[ShutdownRecord]:
-    """Return the account's slot record, then its parked records oldest first."""
-    directory = _existing_account_directory(login)
-    if directory is None:
-        return []
-    with _reading_lock(login, directory):
-        return _slot_and_parked(directory)
-
-
-def create(record: ShutdownRecord) -> None:
-    """Create the account's slot record; parked records never block it."""
-    checked = _record(record, "record")
-    with launch_barrier():
-        with _account_lock(checked["login"], create_directory=True) as directory:
-            path = directory / "record.json"
-            if path.exists():
-                raise ShutdownInProgress(_read_record(path))
-            _write_record(path, checked)
-
-
-def update(login: str, change: Callable[[ShutdownRecord], None]) -> ShutdownRecord:
-    """Change and atomically replace one live record while holding its lock."""
-    directory = _account_directory(login)
-    if not directory.is_dir():
-        raise NoLiveRecord(f"no live shutdown for {login}")
-    with _account_lock(login, create_directory=False):
-        path = directory / "record.json"
-        if not path.exists():
-            raise NoLiveRecord(f"no live shutdown for {login}")
-        record = _read_record(path)
-        original_login = record["login"]
-        original_machine = record["machine"]
-        change(record)
-        if (
-            record.get("login") != original_login
-            or record.get("machine") != original_machine
-        ):
-            raise ValueError("a record update cannot change its login or machine")
-        checked = _record(record, "record")
-        _write_record(path, checked)
-        return checked
-
-
-def archive(login: str) -> None:
-    """Move a completed or cancelled live record into account history."""
-    directory = _account_directory(login)
-    if not directory.is_dir():
-        raise NoLiveRecord(f"no live shutdown for {login}")
-    with _account_lock(login, create_directory=False):
-        path = directory / "record.json"
-        if not path.exists():
-            raise NoLiveRecord(f"no live shutdown for {login}")
-        record = _read_record(path)
-        if record["state"] not in {"cancelled", "up"}:
-            raise ValueError("a shutdown can be archived only after it is cancelled or up")
-        history = directory / "history"
-        history.mkdir(exist_ok=True)
-        os.replace(path, history / f"{record['requested_at']}.json")
-
-
-def park(login: str) -> ShutdownRecord:
-    """Move a `restart partial` slot record to `partial/<requested_at>.json`, freeing the slot."""
-    directory = _account_directory(login)
-    if not directory.is_dir():
-        raise NoLiveRecord(f"no live shutdown for {login}")
-    with _account_lock(login, create_directory=False):
-        found = _slot_record(directory)
-        if found is None:
-            raise NoLiveRecord(f"no live shutdown for {login}")
-        if found["state"] != "restart partial":
-            raise ValueError(
-                f"only a restart partial record can be parked; this one is {found['state']}"
-            )
-        parked_directory = directory / "partial"
-        parked_directory.mkdir(exist_ok=True)
-        target = parked_directory / f"{found['requested_at']}.json"
-        if _lstat(target) is not None:
-            raise ValueError(f"{target} is already parked")
-        os.replace(directory / "record.json", target)
-        return found
-
-
-def unpark(login: str, requested_at: str) -> None:
-    """Return one parked record to the empty slot."""
-    _ = _utc_time(requested_at, "requested_at")
-    directory = _account_directory(login)
-    if not directory.is_dir():
-        raise NoLiveRecord(f"no parked shutdown for {login}")
-    with _account_lock(login, create_directory=False):
-        occupant = _slot_record(directory)
-        if occupant is not None:
-            raise ShutdownInProgress(occupant)
-        source = directory / "partial" / f"{requested_at}.json"
-        source_status = _lstat(source)
-        if source_status is None:
-            raise NoLiveRecord(f"no parked shutdown of {login} from {requested_at}")
-        if not stat.S_ISREG(source_status.st_mode):
-            raise InvalidRecord(
-                f"{source} must be a regular file; found {_entry_kind(source_status.st_mode)}"
-            )
-        os.replace(source, directory / "record.json")
-
-
-def live_records() -> list[ShutdownRecord]:
-    """Return every account's records on this machine in login order.
-
-    Each account lists its slot record, then its parked ones oldest first.
-    """
-    root = _state_root()
-    if not root.is_dir():
-        return []
-    records: list[ShutdownRecord] = []
-    for directory in sorted(root.iterdir()):
-        if not directory.is_dir():
-            continue
-        with _account_lock(directory.name, create_directory=False):
-            records.extend(_slot_and_parked(directory))
-    return records
-
-
 def _shutdown_request_fields(values: dict[str, object], place: str) -> None:
     login = _string(_required(values, "login", place), f"{place}.login")
     try:
@@ -1010,6 +902,9 @@ def _shutdown_request_fields(values: dict[str, object], place: str) -> None:
     for field in ("label", "machine"):
         _ = _string(_required(values, field, place), f"{place}.{field}")
     _ = _utc_time(_required(values, "requested_at", place), f"{place}.requested_at")
+    request_id = _string(_required(values, "request_id", place), f"{place}.request_id")
+    if not request_id:
+        raise InvalidRecord(f"{place}.request_id must not be empty")
     values["requested_by"] = _request_origin(
         _required(values, "requested_by", place), f"{place}.requested_by"
     )
@@ -1031,6 +926,8 @@ def _session_shutdown(value: object, place: str) -> SessionShutdown:
             raise InvalidRecord(f"{place}.{field} is invalid")
     _ = _required(values, "stop_issues", place)
     fields = _entry(values, place)
+    values["progress"] = _progress(values["progress"], f"{place}.progress")
+    values["stop_issues"] = [_session_stop_issue(issue, f"{place}.stop_issues") for issue in fields["stop_issues"]]
     if fields["session"]["kind"] == "seat":
         raise InvalidRecord(f"{place}.session must not be a seat")
     _ = _session_filename(fields["session"]["session_id"])
@@ -1103,16 +1000,20 @@ def _check_account(login: str, stored_login: str, path: Path) -> None:
 
 
 @contextmanager
-def _session_store_lock(login: str, *, create: bool = False) -> Generator[Path, None, None]:
+def _session_store_lock(login: str, *, create: bool = False, write: bool = False) -> Generator[Path, None, None]:
     directory = _account_directory(login)
     _ = _record_directory(directory, create=create)
     _ = _regular_record(directory / "lock")
-    with _reading_lock(login, directory):
-        yield directory
+    if create or write:
+        with _account_lock(login, create_directory=create):
+            yield directory
+    else:
+        with _reading_lock(login, directory):
+            yield directory
 
 
-def _legacy_account_records(directory: Path, login: str) -> list[ShutdownRecord]:
-    """Read the validated slot, then parked records newest first."""
+def _legacy_account_records(directory: Path, login: str) -> list[_LegacyShutdownRecord]:
+    """Read the validated active file, then partial files newest first."""
     partial = directory / "partial"
     if _record_directory(partial):
         try:
@@ -1120,16 +1021,18 @@ def _legacy_account_records(directory: Path, login: str) -> list[ShutdownRecord]
         except OSError as error:
             raise InvalidRecord(f"{partial} cannot be read: {error}") from error
     slot = _slot_record(directory)
-    records = [*([] if slot is None else [slot]), *reversed(_parked_records(directory))]
+    records = [*([] if slot is None else [slot]), *reversed(_legacy_partial_records(directory))]
     for record in records:
         _check_account(login, record["login"], directory)
     return records
 
 
-def _convert_session(record: ShutdownRecord, entry: ShutdownSessionEntry) -> SessionShutdown:
+def _convert_session(record: _LegacyShutdownRecord, entry: _LegacySessionEntry) -> SessionShutdown:
     session = entry["session"]
     progress = entry["progress"]
-    if record["state"] == "restarting" and progress["kind"] not in {"restarted", "seat available on demand"}:
+    if progress["kind"] == "passive seat ready" or progress["kind"] == "seat available on demand":
+        progress = SessionStopped(kind="stopped", at=progress["at"])
+    if record["state"] == "restarting" and progress["kind"] != "restarted":
         progress = SessionStopped(kind="stopped", at=progress.get("at", record["requested_at"]))
     seats: list[Session] = []
     for candidate in record["entries"]:
@@ -1140,11 +1043,12 @@ def _convert_session(record: ShutdownRecord, entry: ShutdownSessionEntry) -> Ses
     return SessionShutdown(
         login=record["login"], label=record["label"], machine=record["machine"],
         requested_at=record["requested_at"], requested_by=record["requested_by"],
+        request_id=f"legacy-{record['machine']}-{record['requested_at']}",
         hold="account" if record["scope"]["kind"] == "all account sessions" else "session",
-        then=continuation(record), force=record["force"], alerts="user",
+        then=_legacy_continuation(record), force=record["force"], alerts="user",
         session=session, seats=seats, timers=entry["timers"],
         settle_message=entry["settle_message"], where=entry["where"],
-        progress=progress, stop_issues=entry["stop_issues"],
+        progress=cast(SessionProgress, cast(object, progress)), stop_issues=[issue for issue in entry["stop_issues"] if issue["kind"] != "seat still live"],
     )
 
 
@@ -1230,7 +1134,7 @@ def update_session(
     """Update one new-format record without changing its identity."""
     if _existing_account_directory(login) is None:
         raise NoLiveRecord(f"no session shutdown for {login}/{session_id}")
-    with _session_store_lock(login) as directory:
+    with _session_store_lock(login, write=True) as directory:
         _ = _record_directory(directory / "sessions")
         path = directory / "sessions" / _session_filename(session_id)
         if not _regular_record(path):
@@ -1252,7 +1156,7 @@ def archive_session(login: str, session_id: str) -> None:
     """Move one session file into history under its request time and name."""
     if _existing_account_directory(login) is None:
         raise NoLiveRecord(f"no session shutdown for {login}/{session_id}")
-    with _session_store_lock(login) as directory:
+    with _session_store_lock(login, write=True) as directory:
         _ = _record_directory(directory / "sessions")
         path = directory / "sessions" / _session_filename(session_id)
         if not _regular_record(path):
@@ -1285,7 +1189,8 @@ def account_hold(login: str) -> AccountHold | None:
                 return AccountHold(
                     login=record["login"], label=record["label"], machine=record["machine"],
                     requested_at=record["requested_at"], requested_by=record["requested_by"],
-                    then=continuation(record),
+                    request_id=f"legacy-{record['machine']}-{record['requested_at']}",
+                    then=_legacy_continuation(record),
                 )
     return None
 
@@ -1326,7 +1231,7 @@ def clear_account_hold(login: str) -> None:
     """Clear the explicit hold; old slot records are unchanged."""
     if _existing_account_directory(login) is None:
         return
-    with _session_store_lock(login) as directory:
+    with _session_store_lock(login, write=True) as directory:
         path = directory / "hold.json"
         if _regular_record(path):
             hold = _account_hold(_read_json(path), str(path))
@@ -1356,3 +1261,241 @@ def parse_account_holds(text: str) -> list[AccountHold]:
         _account_hold(item, f"holds[{index}]")
         for index, item in enumerate(_items(value, "holds"))
     ]
+
+
+def migrate(login: str) -> list[str]:
+    """Convert validated old files into session records and preserve their hold."""
+    if _existing_account_directory(login) is None:
+        return []
+    with _session_store_lock(login, write=True) as directory:
+        converted = _session_records_in_directory(directory, login)
+        old = _legacy_account_records(directory, login)
+        paths = [directory / "record.json"]
+        partial = directory / "partial"
+        if _record_directory(partial):
+            paths.extend(sorted(partial.glob("*.json")))
+        sources = [(path, _read_record(path)) for path in paths if _regular_record(path)]
+        if not sources:
+            return []
+        hold_path = directory / "hold.json"
+        if _regular_record(hold_path):
+            hold = _account_hold(_read_json(hold_path), str(hold_path))
+            _check_account(login, hold["login"], hold_path)
+        history = directory / "history"
+        _ = _record_directory(history)
+        targets = [history / f"{saved['requested_at']}-{path.name}" for path, saved in sources]
+        if len(set(targets)) != len(targets):
+            raise InvalidRecord(f"{history} has conflicting legacy history names")
+        for target in targets:
+            if _lstat(target) is not None:
+                raise InvalidRecord(f"{target} already exists")
+        sessions = directory / "sessions"
+        new_records: list[SessionShutdown] = []
+        for saved in converted:
+            session_id = saved["session"]["session_id"]
+            path = sessions / _session_filename(session_id)
+            if not _regular_record(path):
+                new_records.append(saved)
+                continue
+            existing = _session_shutdown(_read_json(path), str(path))
+            existing_id = existing["session"]["session_id"]
+            if existing_id != session_id:
+                raise InvalidRecord(f"{path} has conflicting session ids {existing_id!r} and {session_id!r}")
+        names = [_session_filename(saved["session"]["session_id"]) for saved in new_records]
+        if len(set(names)) != len(names):
+            raise InvalidRecord(f"{sessions} has conflicting session names")
+        _ = _record_directory(history, create=True)
+        if new_records:
+            _ = _record_directory(sessions, create=True)
+            for saved in new_records:
+                _write_record(sessions / _session_filename(saved["session"]["session_id"]), saved)
+        if not _regular_record(hold_path):
+            held = next((saved for saved in sorted(old, key=lambda item: item["requested_at"])
+                         if saved["scope"]["kind"] == "all account sessions"
+                         and saved["state"] not in {"cancelled", "up"}), None)
+            if held is not None:
+                _write_record(hold_path, AccountHold(
+                    login=held["login"], label=held["label"], machine=held["machine"],
+                    requested_at=held["requested_at"], requested_by=held["requested_by"],
+                    request_id=f"legacy-{held['machine']}-{held['requested_at']}",
+                    then=_legacy_continuation(held),
+                ))
+        lines: list[str] = []
+        for (source, saved), target in zip(sources, targets):
+            os.replace(source, target)
+            when = datetime.fromisoformat(saved["requested_at"]).astimezone(
+                user_zone()
+            ).strftime("%Y-%m-%d %H:%M %Z")
+            lines.append(f"shutdown: converted the {saved['state']} record of {saved['label']} from {when}")
+        return lines
+
+
+@dataclass(frozen=True)
+class ShutdownFound:
+    record: SessionShutdown
+
+
+@dataclass(frozen=True)
+class NoShutdown:
+    """This session has no shutdown request."""
+
+
+@dataclass(frozen=True)
+class AccountHeld:
+    hold: AccountHold
+
+
+@dataclass(frozen=True)
+class AccountOpen:
+    """No account-wide launch hold is present."""
+
+
+def lookup_session(login: str, session_id: str) -> ShutdownFound | NoShutdown:
+    saved = find_session(login, session_id)
+    return NoShutdown() if saved is None else ShutdownFound(saved)
+
+
+def lookup_account_hold(login: str) -> AccountHeld | AccountOpen:
+    held = account_hold(login)
+    return AccountOpen() if held is None else AccountHeld(held)
+
+
+@dataclass(frozen=True)
+class SessionWithdrawn:
+    record: SessionShutdown
+
+
+@dataclass(frozen=True)
+class SessionRetained:
+    record: SessionShutdown
+
+
+def withdraw_session(
+    login: str, session_id: str, restore_and_notify: Callable[[SessionShutdown], None]
+) -> SessionWithdrawn | SessionRetained:
+    """Restore and notify under the lock before another request can send."""
+    return _withdraw_session(login, session_id, lambda saved: False, restore_and_notify)
+
+
+def withdraw_failed_stop(
+    login: str, session_id: str, identity_check: Callable[[SessionShutdown], bool],
+    restore_and_notify: Callable[[SessionShutdown], None],
+) -> SessionWithdrawn | SessionRetained:
+    """Withdraw a failed stop only when its original session is still live.
+
+    The identity check, resource restore, notification and archive share the
+    account lock, so a competing stop claim cannot advance between them.
+    """
+    return _withdraw_session(login, session_id, identity_check, restore_and_notify)
+
+
+def _withdraw_session(
+    login: str, session_id: str, identity_check: Callable[[SessionShutdown], bool],
+    restore_and_notify: Callable[[SessionShutdown], None],
+) -> SessionWithdrawn | SessionRetained:
+    with _session_store_lock(login, write=True) as directory:
+        path = directory / "sessions" / _session_filename(session_id)
+        if not _regular_record(path):
+            raise NoLiveRecord(f"no session shutdown for {login}/{session_id}")
+        saved = _session_shutdown(_read_json(path), str(path))
+        _check_account(login, saved["login"], path)
+        if saved["session"]["session_id"] != session_id:
+            raise InvalidRecord(f"{path} is used by a different session id")
+        progress = saved["progress"]["kind"]
+        if progress not in {"waiting", "ready"} and not (
+            progress == "stop failed" and identity_check(saved)
+        ):
+            return SessionRetained(saved)
+        history = directory / "history"
+        _ = _record_directory(history, create=True)
+        target = history / f"{saved['requested_at']}-{path.name}"
+        if _lstat(target) is not None:
+            raise InvalidRecord(f"{target} already exists")
+        restore_and_notify(saved)
+        os.replace(path, target)
+        return SessionWithdrawn(saved)
+
+
+@dataclass(frozen=True)
+class ConductorRunning:
+    """A process currently owns the machine's conductor lock."""
+
+
+@dataclass(frozen=True)
+class ConductorNotRunning:
+    """The lock is absent or available."""
+
+
+@dataclass(frozen=True)
+class ConductorUnavailable:
+    reason: str
+
+
+def clear_finished_account_hold(login: str, *, request_ids: tuple[str, ...] = ()) -> None:
+    """Clear the current hold only after its last session record leaves."""
+    if _existing_account_directory(login) is None:
+        return
+    with _session_store_lock(login, write=True) as directory:
+        path = directory / "hold.json"
+        if not _regular_record(path):
+            return
+        held = _account_hold(_read_json(path), str(path))
+        _check_account(login, held["login"], path)
+        if request_ids and held["request_id"] not in request_ids:
+            return
+        if not any(saved["request_id"] == held["request_id"]
+                   for saved in _session_records_in_directory(directory, login)):
+            path.unlink()
+
+
+def conductor_status(login: str) -> ConductorRunning | ConductorNotRunning | ConductorUnavailable:
+    """Observe ownership without creating a file or waiting for its owner."""
+    try:
+        directory = _existing_account_directory(login)
+        if directory is None:
+            return ConductorNotRunning()
+        path = directory / "conduct.lock"
+        if not _regular_record(path):
+            return ConductorNotRunning()
+        with path.open("r", encoding="utf-8") as lock:
+            try:
+                fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                return ConductorRunning()
+            fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+        return ConductorNotRunning()
+    except (InvalidRecord, OSError, ValueError) as error:
+        return ConductorUnavailable(str(error))
+
+
+@dataclass(frozen=True)
+class ConductorAcquired:
+    """This process owns the account's conducting loop."""
+
+
+@dataclass(frozen=True)
+class ConductorAlreadyRunning:
+    """Another process owns the account's conducting loop."""
+
+
+@contextmanager
+def conductor_lock(login: str) -> Generator[ConductorAcquired | ConductorAlreadyRunning, None, None]:
+    """Allow brief ownership probes to finish before refusing a duplicate."""
+    directory = _account_directory(login)
+    _ = _record_directory(directory, create=True)
+    path = directory / "conduct.lock"
+    _ = _regular_record(path)
+    with path.open("a+", encoding="utf-8") as lock:
+        for delay in (*CONDUCTOR_LOCK_RETRY_DELAYS, 0.0):
+            try:
+                fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if not delay:
+                    yield ConductorAlreadyRunning()
+                    return
+                time.sleep(delay)
+        try:
+            yield ConductorAcquired()
+        finally:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_UN)

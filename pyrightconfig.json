@@ -13,19 +13,22 @@
       "root": "scripts/accounts",
       "extraPaths": [
         ".",
-        "scripts/whoami"
+        "scripts/whoami",
+        "scripts/lib"
       ]
     },
     {
       "root": "scripts/feature_log",
       "extraPaths": [
-        "scripts/feature_log"
+        "scripts/feature_log",
+        "scripts/lib"
       ]
     },
     {
       "root": "scripts/model_study",
       "extraPaths": [
-        "scripts/model_study"
+        "scripts/model_study",
+        "scripts/lib"
       ]
     },
     {
@@ -33,13 +36,15 @@
       "extraPaths": [
         "scripts/hooks",
         "scripts/message",
-        "scripts/notify"
+        "scripts/notify",
+        "scripts/production"
       ]
     },
     {
       "root": "scripts/fix",
       "extraPaths": [
-        "scripts/fix"
+        "scripts/fix",
+        "scripts/lib"
       ]
     },
     {
@@ -48,7 +53,8 @@
         ".",
         "scripts/whoami",
         "scripts/message",
-        "scripts/notify"
+        "scripts/notify",
+        "scripts/lib"
       ]
     },
     {
@@ -57,7 +63,8 @@
         ".",
         "scripts/nightly_review",
         "scripts/shutdown",
-        "scripts/whoami"
+        "scripts/whoami",
+        "scripts/lib"
       ]
     },
     {
@@ -82,7 +89,8 @@
       "extraPaths": [
         "scripts/buildlog",
         "scripts/build_hold",
-        "scripts/lint"
+        "scripts/lint",
+        "scripts/lib"
       ]
     },
     {
@@ -90,7 +98,8 @@
       "extraPaths": [
         "scripts/mac_test",
         "scripts/build_hold",
-        "scripts/lint"
+        "scripts/lint",
+        "scripts/lib"
       ]
     },
     {
@@ -100,13 +109,15 @@
         "scripts/build_hold",
         "scripts/mac_test",
         "scripts/lint",
-        "scripts/message"
+        "scripts/message",
+        "scripts/lib"
       ]
     },
     {
       "root": "scripts/lint",
       "extraPaths": [
-        "scripts/lint"
+        "scripts/lint",
+        "scripts/lib"
       ]
     },
     {
@@ -127,7 +138,8 @@
         "scripts/message",
         "scripts/notify",
         "scripts/shutdown",
-        "scripts/whoami"
+        "scripts/whoami",
+        "scripts/lib"
       ]
     },
     {
@@ -146,7 +158,15 @@
         "scripts/message",
         "scripts/notify",
         "scripts/production",
-        "scripts/hooks"
+        "scripts/hooks",
+        "scripts/lib"
+      ]
+    },
+    {
+      "root": "scripts/bevy_upgrade",
+      "extraPaths": [
+        "scripts/bevy_upgrade",
+        "scripts/production"
       ]
     },
     {

@@ -153,8 +153,8 @@ start; read that record.
 
 4. **A single plan doc in conversation**, if the durable lookup found nothing.
 
-5. **Ask.** Never guess, and never shrink a doc the user did not name or that
-   the run record did not produce.
+5. **Ask.** Never pick a doc on your own, and never shrink a doc the user did
+   not name or that the run record did not produce.
 
 **Sanity-check whatever came back** before continuing: the path exists and its
 head carries a `## Delegation Context` section. A plan doc that fails this is not

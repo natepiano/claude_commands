@@ -28,7 +28,7 @@ The status line's second row shows this session's account label. To print it:
 | Credits left | Codex only: the credit balance, or `unlimited`. |
 | Read | When those numbers were read. |
 
-Each Codex account can stay signed in in its own home. Seats continue on `~/.codex` today. The table's `seats` role follows `CODEX_HOME`, or `~/.codex` when it is unset. Signed-in spares get usage readings too; their notes stay inactive and raise no quota alerts.
+Each Codex account can stay signed in in its own home. The table's `seats` role follows `seats` in `~/.claude/config/accounts.json`, defaulting to `~/.codex`. A caller's `CODEX_HOME` does not change the seats role. Signed-in spares get usage readings too; their notes stay inactive and raise no quota alerts. Freestanding Codex sessions keep their own process home.
 
 Times are in the running production's User zone, or this machine's zone when no production runs. The numbers are each account's last good reading: the usage service refuses many reads, so the two-minute updater saves each one it gets, and an account with none in the last 10 minutes is read once more. `unavailable` means no reading is held for a window that is still open. Lines under the table name anything wrong or unusual in a folder: a failed check, unclassified entries, MCP servers that differ from `~/.claude`.
 
@@ -127,11 +127,13 @@ The terminal equivalent is:
 ~/.claude/scripts/lib/py ~/.claude/scripts/accounts/accounts.py swap unit "claude 1"
 ```
 
-It shows shutdown's output unchanged, followed by `units come back on claude 1 when claude 3 is down`. This confirms acceptance; shutdown and restart may still be running. Watch `/shutdown status`, then check the resumed units' account labels. After a complete stop, the requester gets:
+It shows shutdown's output unchanged, followed by `units come back on claude 1 when claude 3 is down`. Shutdown prints one `<name>: added` line for each unit it will stop, then `shutdown of claude 3 started; /shutdown status to watch, /shutdown cancel to undo`. This confirms acceptance; the stops and restarts are still running. Each unit stops when it reaches a safe point and comes back on claude 1 by itself, without waiting for the others. Watch `/shutdown status "claude 3"`, then check the resumed units' account labels. When every unit is back, a session that ran the swap gets:
 
 ```text
-The sessions restart automatically: units on the unit account, other sessions on the account they ran on.
+claude 3 is back
 ```
+
+The message names the old account, because the request was a shutdown of claude 3; the units are on claude 1. A swap run from a terminal gets no message.
 
 Before changing the role, swap refuses and names the cause. Reported values replace the angle brackets below:
 
@@ -148,15 +150,15 @@ An unfit target reports its first `/showrunner:accounts` problem. Fix account re
 
 `unit account unchanged: still claude 3` means shutdown refused and the old role is back. Fix the printed refusal, then run the same swap again.
 
-If shutdown ends `stop partial`, the new role stays selected and nothing restarts. Use the alert's runnable retry to stop the rest and then resume the saved sessions. For this example:
+If a unit's stop fails, the result is `claude 3: stop partial`, and the alert names the unit. The new role stays selected. Units that stopped are already back on claude 1; the failed one is still on claude 3. Retry its stop, naming the old account and the unit from the alert:
 
 ```sh
-~/.claude/scripts/lib/py ~/.claude/scripts/shutdown/shutdown.py down 'claude 3' --restart
+~/.claude/scripts/lib/py ~/.claude/scripts/shutdown/shutdown.py now 'claude 3' --only '<unit name>'
 ```
 
-The retry prints `shutdown of claude 3 resumed; /shutdown status to watch`. It preserves the saved sessions, timers and scope. A different `--only` refuses with `shutdown: retry must keep the original --only scope`. A peer that is not ready refuses with `shutdown: peer is not ready to retry stopping; nothing was shut down`. The alert also keeps its manual `/shutdown restart` guidance for a session on the old account.
+It prints `<unit name>: stopping now`. The unit stops without waiting to be idle and comes back on claude 1. Without `--only`, `now` also stops every unit that is still finishing its work. Repeating `down` retries nothing: each unit prints `<name>: already in progress`.
 
-`claude 3: automatic restart skipped` means the peer record could not be read after a complete stop. Restore access, then run the alert's command:
+`claude 3 is not fully back` means a unit stopped and did not fully come back. Run the alert's command:
 
 ```sh
 ~/.claude/scripts/lib/py ~/.claude/scripts/shutdown/shutdown.py restart 'claude 3'
@@ -194,15 +196,35 @@ Setup creates `~/.codex1` with mode 0700 and links existing shared entries to `~
 
 Setup refuses without changing files or printing a sign-in command when another home already holds the account's login, because two homes on one login break token refresh.
 
+Before printing the command, setup waits for Codex to finish indexing the shared sessions and answer its startup request. An interrupted first start can block later starts for 15 minutes, followed by the remaining index work; setup retries servers that exit unanswered and waits up to 20 minutes. If the limit is reached, rerun setup. A table row saying Codex did not start names the same repair command.
+
 Run the printed command in a terminal and sign in as codex 1:
 
 ```sh
 CODEX_HOME=~/.codex1 codex login
 ```
 
-Then run `/showrunner:accounts`. The new home's row shows `spare` and its own numbers; `~/.codex` continues to show `seats`. To check the home directly, use `/showrunner:accounts check "codex 1"`. Problems under the table name missing, broken or replaced shared links, unclassified entries, the wrong login, or a login held by another home. Keep each login in one home: two homes on one login break token refresh.
+Keep `CODEX_HOME` on that command. Without it, `codex login` signs `~/.codex` out and in, leaving its seats unable to work until login finishes; seats use that default home unless their role names another.
+
+Then run `/showrunner:accounts`. The new home's row shows `spare` and its own numbers until selected for seats. To check the home directly, use `/showrunner:accounts check "codex 1"`. Problems under the table name missing, broken or replaced shared links, unclassified entries, the wrong login, or a login held by another home. Keep each login in one home: two homes on one login break token refresh.
 
 The repository's hook installer keeps a linked `hooks.json` and adds missing hooks to its target, so numbered homes continue to share the default home's hooks.
+
+## Swapping the Codex seats account
+
+One account serves every unit's Codex seats, including the `codex exec` fallback. The updater, 5-hour watcher, `/whoami` and account table follow that role. Read it with `/showrunner:accounts role seats`.
+
+```text
+/showrunner:accounts swap seats "codex 1" --dry-run
+/showrunner:accounts swap seats "codex 1"
+/showrunner:accounts swap seats default
+```
+
+A swap checks the target home, its sign-in, both usage windows and its credits before changing the role. It retires each run's current server and tells each affected unit director once. A working seat finishes its turn on the outgoing home; its next turn runs under the new one. Held messages move with it. The move confirms that the old server released the thread before the new server resumes it. If Codex refuses that resume, the seat starts a new thread and its board line names the replacement. An unreadable thread state or unconfirmed release starts no replacement turn.
+
+`--dry-run` prints the target account, its home and the runs that would move, with no role or history write. `set-role seats "codex N"` (or `default`) selects future turns directly, without the swap's usage check or notices. Each role write keeps the other role; `unit` and `seats` history share `~/.local/state/accounts/roles.jsonl`.
+
+Refusals leave both the role and history unchanged. A home-check failure names the file, link, login or duplicate sign-in to fix; rerun setup or correct that home's sign-in. An already-selected account needs no swap. An account used up with no credits needs a different target, credits or its reset. Unknown or expired usage needs a fresh reading before trying again. Selecting `default` requires a real, signed-in `~/.codex` whose login no other home holds; its shared entries remain real files and directories.
 
 ## Low-quota alerts
 

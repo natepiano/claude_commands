@@ -14,7 +14,7 @@ from unittest import mock
 
 import proposals_table
 import showrunners
-from proposals_table import ADD_ON_STATE, Row, Worktree
+from proposals_table import ADD_ON_STATE, REVIEW_STATE, Row, Worktree
 
 # Importable once proposals_table has put scripts/delegate on the path.
 import phase_table
@@ -60,9 +60,9 @@ class ProposalsTableTests(unittest.TestCase):
         _ = self.write("backlog/2026-10-11-dots.md", "# Dots\n\nProposed 2026-10-11 by a plan subagent from natedev, at the user's request.\n")
         _ = self.write("backlog/2026-10-10-overview.md", "# Overview\n\nNo proposer is named here.\n")
         self.assertEqual(proposals_table.backlog_rows(self.root / "backlog"), [
-            Row("a plan subagent from natedev", "Codex dots: recommend wait", "2026-10-11", "proposed"),
-            Row("plan backlog", "Config overview", "2026-10-10", "deferred"),
-            Row("plan backlog", "A plan with no file", "2026-10-08", "proposed"),
+            Row("a plan subagent from natedev", "Codex dots: recommend wait", "2026-10-11", REVIEW_STATE),
+            Row("plan backlog", "Config overview", "2026-10-10", "deferred until you ask for it"),
+            Row("plan backlog", "A plan with no file", "2026-10-08", REVIEW_STATE),
         ])
 
     def test_a_missing_backlog_gives_no_rows(self) -> None:
@@ -78,7 +78,7 @@ class ProposalsTableTests(unittest.TestCase):
         _ = self.write("unit/docs/plans/proposal-decided.md", "# Proposal: decided\n\n> **Status: ACCEPTED 2026-10-11.** Built.\n")
         _ = self.write("unit/docs/plans/other-plan.md", "# Not a proposal\n")
         self.assertEqual(proposals_table.doc_rows([Worktree("model-study-unit", self.root / "unit")]), [
-            Row("a model-study research agent", "a review unit with reviewer pools", "2026-10-10", "proposed"),
+            Row("a model-study research agent", "a review unit with reviewer pools", "2026-10-10", REVIEW_STATE),
         ])
 
     def test_a_doc_merged_into_the_trunk_is_one_row_under_its_unit(self) -> None:
@@ -88,7 +88,43 @@ class ProposalsTableTests(unittest.TestCase):
         for path in (unit, trunk):
             os.utime(path, (1_760_000_000, 1_760_000_000))
         rows = proposals_table.doc_rows([Worktree("trunk", self.root / "trunk"), Worktree("footer-unit", self.root / "unit")])
-        self.assertEqual(rows, [Row("footer-unit", "faster footers", proposals_table.file_date(unit), "proposed")])
+        self.assertEqual(rows, [Row("footer-unit", "faster footers", proposals_table.file_date(unit), REVIEW_STATE)])
+
+    def test_the_index_gives_every_row_whose_status_is_not_closed(self) -> None:
+        index = self.write("proposals/index.md", "\n".join([
+            "# Proposals",
+            "",
+            "Finished proposals waiting for your review.",
+            "",
+            "| Date | Proposal | Unit | Summary | Status |",
+            "| --- | --- | --- | --- | --- |",
+            "| 2026-10-09 | [Selection widgets toggle](selection-widgets-toggle.md) | trunk | One toggle hides the idle widgets; every operation in two steps | waiting for review |",
+            "| 2026-10-09 | [Camera jack panel trial](camera-jack-panel-trial.md) | organon | Camera jacks in outlined groups | approved 2026-10-10: build after the title bar |",
+            "| 2026-10-09 | [Shortcuts](shortcuts.md) | demo | Every shortcut by category; 8 inspectors become commands | in review |",
+            "| 2026-10-10 | [Rich text](rich-text.md) | research | One text box with styled runs | Done 2026-10-11 (widget) |",
+            "| 2026-10-10 | [Old pie](old-pie.md) | organon | A pie of 12 | superseded by selection-action-pie.md |",
+            "| 2026-10-11 | Plain title, a \\| in it | | | |",
+            "",
+            "| Unrelated | Table |",
+            "| --- | --- |",
+            "| 2026-10-12 | not a proposal |",
+        ]))
+        self.assertEqual(proposals_table.index_rows(index), [
+            Row("trunk", "Selection widgets toggle — One toggle hides the idle widgets", "2026-10-09", REVIEW_STATE),
+            Row("organon", "Camera jack panel trial — Camera jacks in outlined groups", "2026-10-09",
+                "approved 2026-10-10: build after the title bar"),
+            Row("demo", "Shortcuts — Every shortcut by category", "2026-10-09", "in review"),
+            Row("—", "Plain title, a \\| in it", "2026-10-11", REVIEW_STATE),
+        ])
+        self.assertEqual(proposals_table.index_rows(self.root / "absent/index.md"), [])
+
+    def test_the_index_is_in_the_folder_the_production_doc_names(self) -> None:
+        home = self.write("trunk/docs/plans/home-production.md", "## Production Context\n\n- **Proposals:** `~/notes/proposals` — one row each\n")
+        inside = self.write("trunk/docs/plans/inside-production.md", "- **Proposals:** docs/proposals\n")
+        none = self.write("trunk/docs/plans/none-production.md", "- **UX guide:** `~/notes/ux`\n")
+        self.assertEqual(proposals_table.proposals_index(home), Path.home() / "notes/proposals/index.md")
+        self.assertEqual(proposals_table.proposals_index(inside), self.root / "trunk/docs/proposals/index.md")
+        self.assertIsNone(proposals_table.proposals_index(none))
 
     def test_an_add_on_title_is_read_in_each_way_units_write_it(self) -> None:
         pending = self.write("run/next_items_pending.md", "\n".join([
@@ -104,6 +140,18 @@ class ProposalsTableTests(unittest.TestCase):
             "- add: Archive each run's roster",
             "- **add: Find why the hook misses failures** (gotcha): details",
             "- Add a retry to the fetch",
+            "- **add** — The startup word shows on a cold start",
+            "  - Why needed: on a cold start the word never showed.",
+            "- Action: add · Class: gate · Source: Phase 12",
+            "  Title: Selecting a new tool frames it the same way as the frame key",
+            "  Need: two callers still use their own framing.",
+            "- Action: change",
+            "  Target: `scripts/production/units_table.py`",
+            "  Proposed: The units table names the phase a unit waits on. It reads the plan.",
+            "- **remove**",
+            "  - Why: The old footer line repeats the new one! Nothing reads it.",
+            "- Action: add",
+            "  Class: gate",
         ]))
         os.utime(pending, (1_760_000_000, 1_760_000_000))
         date = proposals_table.file_date(pending)
@@ -115,6 +163,11 @@ class ProposalsTableTests(unittest.TestCase):
                 "Archive each run's roster",
                 "Find why the hook misses failures",
                 "Add a retry to the fetch",
+                "The startup word shows on a cold start",
+                "Selecting a new tool frames it the same way as the frame key",
+                "The units table names the phase a unit waits on",
+                "The old footer line repeats the new one!",
+                "an add-on with no description",
             )
         ])
 
@@ -134,13 +187,20 @@ class ProposalsTableTests(unittest.TestCase):
 
     def test_the_table_keeps_one_line_per_row_and_cuts_a_long_title(self) -> None:
         long_title = "word " * 40
-        text = proposals_table.table([Row("unit | one", "first\nsecond", "2026-10-12", "proposed"),
-                                      Row("unit", long_title, "2026-10-12", "deferred")])
+        text = proposals_table.table([Row("unit | one", "first\nsecond", "2026-10-12", REVIEW_STATE),
+                                      Row("unit", long_title, "2026-10-12", long_title)])
         lines = text.splitlines()
         self.assertEqual(lines[0], "| Proposed by | Proposal | Date | State |")
-        self.assertEqual(lines[2], "| unit \\| one | first second | 2026-10-12 | proposed |")
-        self.assertTrue(lines[3].split(" | ")[1].endswith("…"))
-        self.assertLessEqual(len(lines[3].split(" | ")[1]), proposals_table.TITLE_WIDTH)
+        self.assertEqual(lines[2], "| unit \\| one | first second | 2026-10-12 | waiting for your review |")
+        cells = lines[3].removesuffix(" |").split(" | ")
+        self.assertTrue(cells[1].endswith("…") and cells[3].endswith("…"))
+        self.assertLessEqual(len(cells[1]), proposals_table.TITLE_WIDTH)
+        self.assertLessEqual(len(cells[3]), proposals_table.STATE_WIDTH)
+
+    def test_no_state_asks_the_user_a_bare_next(self) -> None:
+        states = [ADD_ON_STATE, REVIEW_STATE, *proposals_table.BACKLOG_STATES.values()]
+        for state in states:
+            self.assertNotIn("next", state.split())
 
     def run_main(self, arguments: list[str]) -> tuple[int, str, str]:
         out, err = io.StringIO(), io.StringIO()
@@ -148,8 +208,13 @@ class ProposalsTableTests(unittest.TestCase):
             code = proposals_table.main(arguments)
         return code, out.getvalue(), err.getvalue()
 
-    def test_main_prints_the_three_sources_in_order(self) -> None:
-        doc = self.write("trunk/docs/plans/footers-production.md", "# Production\n")
+    def test_main_prints_the_four_sources_in_order(self) -> None:
+        doc = self.write("trunk/docs/plans/footers-production.md", "# Production\n\n- **Proposals:** `proposals`\n")
+        _ = self.write("trunk/proposals/index.md", "\n".join([
+            "| Date | Proposal | Unit | Summary | Status |",
+            "| --- | --- | --- | --- | --- |",
+            "| 2026-10-09 | [Footer colours](footer-colours.md) | footer | One colour per state | waiting for review |",
+        ]))
         plan = self.write("unit/docs/plans/footers.md", "# Plan\n")
         _ = self.write("backlog/ledger.md", "- 2026-10-11 Codex dots — proposed\n")
         _ = self.write("unit/docs/plans/proposal-pools.md", "# Proposal: reviewer pools\n\nWritten 2026-10-10 by a research agent.\n")
@@ -162,7 +227,9 @@ class ProposalsTableTests(unittest.TestCase):
             code, out, err = self.run_main(["--production", str(doc)])
         self.assertEqual((code, err), (0, ""))
         self.assertEqual([line.split(" | ")[1] for line in out.splitlines()[2:]],
-                         ["Codex dots", "reviewer pools", "Keep the old footer"])
+                         ["Footer colours — One colour per state", "Codex dots", "reviewer pools", "Keep the old footer"])
+        self.assertEqual([line.removesuffix(" |").split(" | ")[3] for line in out.splitlines()[2:]],
+                         [REVIEW_STATE, REVIEW_STATE, REVIEW_STATE, ADD_ON_STATE])
 
     def test_main_says_so_when_nothing_is_open(self) -> None:
         doc = self.write("trunk/docs/plans/footers-production.md", "# Production\n")

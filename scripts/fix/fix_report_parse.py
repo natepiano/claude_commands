@@ -24,6 +24,9 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TypedDict, cast
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
+from user_zone import user_zone  # noqa: E402
+
 LOG_DIR = Path.home() / ".local" / "logs" / "fix"
 RUST_DIR = Path.home() / "rust"
 CONF_FILE = Path.home() / ".claude" / "scripts" / "fix" / "fix.conf"
@@ -508,7 +511,7 @@ def pending_eval_produced_at(project: str) -> str | None:
             stamp = datetime.fromisoformat(raw.replace("Z", "+00:00"))
         except ValueError:
             continue
-        return stamp.astimezone().strftime("%a %b %-d %H:%M")
+        return stamp.astimezone(user_zone()).strftime("%a %b %-d %H:%M")
     return None
 
 
