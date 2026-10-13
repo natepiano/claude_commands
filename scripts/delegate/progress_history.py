@@ -102,6 +102,8 @@ PHASE_STATUS_PATTERN = re.compile(r"·[ \t]*status:[ \t]*(?P<status>todo|done)\b
 # section inside one. A real phase heading always names a title after an
 # em-dash separator.
 PHASE_TITLE_PATTERN = re.compile(r"^[ \t]*[—–-][ \t]*\S")
+DEPENDS_ON_PATTERN = re.compile(r"^\*\*Depends on:\*\*[ \t]*(?P<list>[^\n]*)$", re.MULTILINE)
+BLOCKED_BY_PATTERN = re.compile(r"^\*\*Blocked by:\*\*[ \t]*(?P<gate>G\d+)", re.MULTILINE)
 
 # A percentage is an estimate; a stage is a fact. These ceilings keep an
 # optimistic estimate from claiming a gate that has not run — the failure mode
@@ -195,6 +197,10 @@ class PlanPhase(TypedDict):
     id: str
     title: str
     done: bool
+    # The phases its `**Depends on:**` line names; None when the line is absent.
+    depends_on: list[str] | None
+    # The gate its `**Blocked by:**` line names; empty when none.
+    blocked_by: str
 
 
 class EtaBand(NamedTuple):
@@ -645,7 +651,8 @@ def _plan_phase_details(plan_path: Path) -> tuple[list[PlanPhase], list[str]]:
     phases: list[PlanPhase] = []
     seen: set[str] = set()
     duplicates: list[str] = []
-    for match in PHASE_HEADING_PATTERN.finditer(text):
+    headings = list(PHASE_HEADING_PATTERN.finditer(text))
+    for position, match in enumerate(headings):
         rest = match.group("rest")
         status_match = PHASE_STATUS_PATTERN.search(rest)
         # `### Phase 12 Review` and its like are sections, not phases.
@@ -666,11 +673,22 @@ def _plan_phase_details(plan_path: Path) -> tuple[list[PlanPhase], list[str]]:
         # No status marker means the phase was shrunk into its as-built record,
         # which only happens after the phase completed.
         done = status_match is None or status_match.group("status") == "done"
+        end = headings[position + 1].start() if position + 1 < len(headings) else len(text)
+        body = text[match.end() : end]
+        depends_match = DEPENDS_ON_PATTERN.search(body)
+        depends_on = (
+            None
+            if depends_match is None
+            else re.findall(r"\b\d+[a-z]?\b", depends_match.group("list"))
+        )
+        blocked_match = BLOCKED_BY_PATTERN.search(body)
         phases.append(
             PlanPhase(
                 id=identifier,
                 title=title,
                 done=done,
+                depends_on=depends_on,
+                blocked_by="" if blocked_match is None else blocked_match.group("gate"),
             )
         )
     return phases, duplicates

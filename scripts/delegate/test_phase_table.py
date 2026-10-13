@@ -1487,6 +1487,98 @@ class PhaseTableTests(unittest.TestCase):
         self.assertEqual(record.plan, self.plan.resolve())
         self.assertIsInstance(record.current, phase_table.NoOpenPhase)
 
+    def parallel_plan(self, *phases: str) -> None:
+        self.write_plan(plan_text("### Phase 1 — Base  · status: done", *phases))
+        _ = self.write_run(
+            "current",
+            900,
+            self.phase_event("phase_started", "2", "two", 1_000, phase_title="Parser"),
+            self.phase_event("phase_started", "3", "three", 1_050, phase_title="Notice"),
+        )
+        self.write_state(None)
+
+    def test_parallel_names_waiting_phases_whose_dependencies_are_done(self) -> None:
+        self.parallel_plan(
+            "### Phase 2 — Parser  · status: todo",
+            "**Depends on:** Phase 1",
+            "### Phase 3 — Notice  · status: todo",
+            "**Depends on:** none",
+            "### Phase 4 — Report  · status: todo",
+            "**Depends on:** Phase 2",
+            "### Phase 5 — Docs  · status: todo",
+            "**Depends on:** Phase 1",
+            "### Phase 6 — Gated  · status: todo",
+            "**Blocked by:** G2 — trunk phase 3 merged",
+            "**Depends on:** none",
+        )
+
+        check = self.build(1_100).parallel
+
+        self.assertEqual(check, phase_table.CouldStart(("5",)))
+        self.assertEqual(phase_table.parallel_line(check), "Parallel: Phase 5 could start")
+
+    def test_parallel_none_names_what_the_first_waiting_phase_needs(self) -> None:
+        self.parallel_plan(
+            "### Phase 2 — Parser  · status: todo",
+            "**Depends on:** Phase 1",
+            "### Phase 3 — Notice  · status: todo",
+            "**Depends on:** Phase 2",
+            "### Phase 4 — Report  · status: todo",
+            "**Depends on:** Phase 2, Phase 5",
+            "### Phase 5 — Docs  · status: todo",
+            "**Blocked by:** G1 — trunk phase 2 merged",
+            "**Depends on:** none",
+        )
+
+        line = phase_table.parallel_line(self.build(1_100).parallel)
+
+        self.assertEqual(line, "Parallel: none — Phase 4 needs Phase 2 (running), Phase 5 (todo)")
+
+    def test_parallel_is_unknown_while_a_waiting_phase_states_no_dependencies(self) -> None:
+        self.parallel_plan(
+            "### Phase 2 — Parser  · status: todo",
+            "### Phase 3 — Notice  · status: todo",
+            "### Phase 4 — Report  · status: todo",
+            "**Depends on:** Phase 1",
+            "### Phase 5 — Docs  · status: todo",
+        )
+
+        line = phase_table.parallel_line(self.build(1_100).parallel)
+
+        self.assertEqual(
+            line,
+            "Parallel: unknown — Phase 5 has no **Depends on:** line; "
+            + "add one under each phase heading and rerun",
+        )
+
+    def test_parallel_with_nothing_waiting(self) -> None:
+        self.parallel_plan("### Phase 2 — Parser  · status: todo")
+
+        line = phase_table.parallel_line(self.build(1_100).parallel)
+
+        self.assertEqual(line, "Parallel: none — no phase is waiting")
+
+    def test_production_json_carries_the_phases_that_could_start(self) -> None:
+        self.parallel_plan(
+            "### Phase 2 — Parser  · status: todo",
+            "### Phase 4 — Report  · status: todo",
+            "**Depends on:** Phase 1",
+        )
+
+        with patch.dict(
+            os.environ,
+            {
+                "PLAN_DELEGATE_HISTORY_DIR": str(self.history_dir),
+                "PLAN_DELEGATE_NOW_EPOCH": "1100",
+            },
+        ):
+            shown = cast(dict[str, object], json.loads(phase_table.show(self.session_dir, ZoneInfo("UTC"), True)))
+
+        self.assertEqual(
+            shown["parallel"],
+            {"could_start": ["4"], "line": "Parallel: Phase 4 could start"},
+        )
+
     def test_render_is_exact_and_orders_newest_phase_first(self) -> None:
         zone = ZoneInfo("America/Los_Angeles")
 
@@ -1799,7 +1891,7 @@ class PhaseTableTests(unittest.TestCase):
 
         self.assertEqual(
             set(parsed),
-            {"plan", "updated", "plan_finish", "current", "phases"},
+            {"plan", "updated", "plan_finish", "current", "phases", "parallel"},
         )
         self.assertTrue(cast(str, parsed["updated"]).endswith("-07:00"))
         self.assertTrue(cast(str, current["started"]).endswith("-07:00"))
