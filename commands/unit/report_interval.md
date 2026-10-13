@@ -25,5 +25,4 @@ argument-hint: "[minutes]"
 ## Answer
 
 Tell the user the current interval, or the changed interval and the next tick
-from the printed `next_due` line. Keep the displayed time in the machine's
-local zone.
+from the printed `next_due` line. Its time is in the user's zone.

@@ -337,6 +337,7 @@ while True:
         environment["PLAN_DELEGATE_CONFIG"] = str(self.config_file)
         environment["AGENTS_CONFIG_FILE"] = str(self.root / ".claude" / "config" / "agents.conf")
         environment["TZ"] = "UTC"
+        environment["USER_ZONE"] = "UTC"
         environment["REVIEW_POOL_STATE"] = str(self.root / "pool-state")
         _ = environment.pop("REVIEW_LEASE", None)
         _ = environment.pop("CODEX_THREAD_ID", None)

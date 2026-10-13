@@ -88,7 +88,6 @@ The production doc sits beside the source plan as `<source-stem>-production.md`.
 - **Merge branch:** `<branch>` — every unit merges here; only the showrunner pushes it
 - **Showrunner checkout:** <path, on the merge branch>
 - **Log:** <repo-relative path> — git-excluded; one line per event
-- **User zone:** <IANA zone> — every time the showrunner reports is in this zone plus UTC
 - **Updates:** every <N> minutes (default 15), or `on demand`; each update reports every
   unit in full; the update timer reads N from this line, `on demand` runs no timer and a
   dailies runs only when the user asks, and `/showrunner:report_interval` changes it
@@ -340,9 +339,10 @@ A run that stopped, failed, or waits on a decision has no finish in its record, 
     on the user never mentions the showrunner, so the showrunner's status script
     can tell the two apart.
 11. **Updates.** Each progress update is the full `/unit:report`, as outside a
-    production (user, 2026-10-06). Run its recorder calls under `TZ=<zone>`, the
-    production doc's **User zone**, so every time in it is in that zone (user,
-    2026-10-04). When the showrunner asks for `/unit:eta`, run it at once.
+    production (user, 2026-10-06). Every time in it is in the user's zone
+    (user, 2026-10-04): the recorder reads the zone setting itself, so pass
+    no `TZ=`. An older production doc may carry a **User zone** line; nothing
+    reads it. When the showrunner asks for `/unit:eta`, run it at once.
 12. **Visual choices go to the showrunner.** Wording, spacing, layout, and
     which of two working options looks better are the showrunner's calls, made
     from the **UX guide**. Ask the showrunner, never the user. The showrunner

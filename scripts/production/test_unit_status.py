@@ -8,6 +8,7 @@ import shutil
 import subprocess
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 from typing import NamedTuple
 
@@ -18,6 +19,11 @@ from unit_lookup import UnitState
 
 SCRIPT = Path(__file__).with_name("unit_status.sh")
 SESSION_ID = "test-session"
+
+
+def setUpModule() -> None:
+    """The times these tests expect are Pacific; the user's zone setting must not change them."""
+    unittest.enterModuleContext(mock.patch.dict(os.environ, {"USER_ZONE": "America/Los_Angeles"}))
 
 
 class RealTmux(NamedTuple):
@@ -135,6 +141,8 @@ exit 0
                 environment = real_tmux.environment(environment)
             for source_name in ("add_unit.py", "live_units.py", "showrunners.py", "unit_lookup.py"):
                 _ = shutil.copy2(SCRIPT.with_name(source_name), script.with_name(source_name))
+            # The copied scripts read the user's zone setting through the helper beside them.
+            _ = shutil.copy2(SCRIPT.parent.parent / "lib" / "user_zone.py", script.parent.parent / "lib" / "user_zone.py")
             (root / "sessions").mkdir()
             rows: list[str] = []
             for unit in units:

@@ -11,6 +11,7 @@ import sys
 import tempfile
 import time
 import unittest
+from unittest import mock
 from datetime import datetime
 from pathlib import Path
 from typing import cast, override
@@ -25,6 +26,11 @@ PANE = "— holding: waiting on a decision\n"
 def executable(path: Path, source: str) -> None:
     _ = path.write_text(source)
     path.chmod(0o755)
+
+
+def setUpModule() -> None:
+    """The times these tests expect are Pacific; the user's zone setting must not change them."""
+    unittest.enterModuleContext(mock.patch.dict(os.environ, {"USER_ZONE": "America/Los_Angeles"}))
 
 
 class StallWatchTests(unittest.TestCase):
