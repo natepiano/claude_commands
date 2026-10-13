@@ -209,7 +209,7 @@ class SettleTests(ShutdownTestCase):
         super().setUp()
         _ = self.enterContext(patch.object(sessions, "remote_control", return_value="active"))
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
-        context = cast(object, self.enterContext(patch.dict(os.environ, {"HOME": str(self.root), "SHUTDOWN_STATE_DIR": str(self.root / "state")})))
+        context = cast(object, self.enterContext(patch.dict(os.environ, {"HOME": str(self.root), "SHUTDOWN_STATE_DIR": str(self.root / "state"), "NOTIFIER_SESSIONS_DIR": str(self.root / "sessions")})))
         del context
         _ = self.enterContext(patch.object(settle, "now_utc", return_value=NOW_UTC))
         _ = self.enterContext(patch.object(settle, "merge_in_progress", return_value=False))
@@ -224,6 +224,242 @@ class SettleTests(ShutdownTestCase):
 
     def matching(self, saved: record.SessionShutdown) -> stop_work.FreshSession:
         return stop_work.MatchingSession(kind="matching session", session=saved["session"], seats=saved["seats"])
+
+    def write_owner_pane(self, owner: inventory.Session, tmux: str, *, identity: str = "") -> None:
+        directory = self.root / "sessions"
+        directory.mkdir(exist_ok=True)
+        saved = sessions.SessionRecord(pid=owner["pid"], sessionId=identity or owner["session_id"],
+            name=owner["name"], messagingSocketPath="", updatedAt=1, tmux=tmux, formerNames=[])
+        _ = (directory / f"{owner['pid']}.json").write_text(json.dumps(saved))
+
+    def test_usage_limit_patterns_match_only_the_last_fifteen_nonempty_lines(self) -> None:
+        patterns = ("hit your session limit", "hit your usage limit", "hit your weekly limit",
+                    "usage limit reached", "wait for limit to reset")
+        self.assertEqual(settle.USAGE_LIMIT_PATTERNS, patterns)
+        for pattern in patterns:
+            with self.subTest(pattern=pattern):
+                shown = settle.ScreenText(pattern.upper() + "\n\n" + "\n\n".join(["menu"] * 14))
+                old = settle.ScreenText(pattern + "\n" + "\n\n".join(["conversation"] * 15))
+                self.assertTrue(settle._held_by_usage_limit(shown))  # pyright: ignore[reportPrivateUsage]
+                self.assertFalse(settle._held_by_usage_limit(old))  # pyright: ignore[reportPrivateUsage]
+        self.assertFalse(settle._held_by_usage_limit(settle.ScreenText("ordinary prompt")))  # pyright: ignore[reportPrivateUsage]
+        self.assertFalse(settle._held_by_usage_limit(settle.ScreenUnreadable("capture failed")))  # pyright: ignore[reportPrivateUsage]
+
+    def test_screen_targets_owner_pane_when_other_pane_shows_usage_limit(self) -> None:
+        owner = showrunner("owner", "Owner")
+        owner["host"] = inventory.TmuxHost(kind="tmux", tmux_session="shared",
+            pane=inventory.PaneNotRecorded(kind="not recorded"))
+        self.write_owner_pane(owner, "shared:@2.%5")
+        other = showrunner("other", "Other")
+        other["host"] = owner["host"]
+        self.write_owner_pane(other, "shared:@2.%6")
+        saved = session_shutdown(owner)
+        self.save(saved)
+        captured: list[str] = []
+        def capture(arguments: list[str], **_keywords: object) -> subprocess.CompletedProcess[str]:
+            self.assertEqual(arguments[1:4], ["capture-pane", "-p", "-t"])
+            self.assertEqual(_keywords["timeout"], 5)
+            target = arguments[arguments.index("-t") + 1]
+            captured.append(target)
+            return subprocess.CompletedProcess(arguments, 0, "ordinary prompt" if target == "%5" else "hit your session limit", "")
+        def end_pass(_seconds: float) -> None:
+            raise PassObserved()
+        with patch.object(subprocess, "run", side_effect=capture):
+            self.assertEqual(settle._screen(other), settle.ScreenText("hit your session limit"))  # pyright: ignore[reportPrivateUsage]
+            captured.clear()
+            self.assertEqual(settle._screen(owner), settle.ScreenText("ordinary prompt"))  # pyright: ignore[reportPrivateUsage]
+            with patch.object(settle, "run_inventory", return_value=machine_inventory([owner])), patch.object(settle, "send_message", return_value=settle.MessageSent(kind="sent")) as send, patch.object(time, "sleep", side_effect=end_pass), self.assertRaises(PassObserved):
+                _ = settle.conduct(LOGIN)
+        self.assertTrue(captured)
+        self.assertEqual(set(captured), {"%5"})
+        send.assert_called_once()
+        latest = record.find_session(LOGIN, "owner")
+        assert latest is not None
+        self.assertEqual(latest["progress"], {"kind": "waiting"})
+
+    def test_unreadable_owner_screens_never_create_a_usage_limit_hold(self) -> None:
+        owner = showrunner("owner", "Owner")
+        for tmux, identity in (("", "owner"), ("shared:@2.%5", "another"), ("shared:@2", "owner"), ("shared:@2.%bad", "owner")):
+            with self.subTest(tmux=tmux, identity=identity):
+                self.write_owner_pane(owner, tmux, identity=identity)
+                with patch.object(subprocess, "run") as capture:
+                    screen = settle._screen(owner)  # pyright: ignore[reportPrivateUsage]
+                self.assertEqual(screen, settle.ScreenUnreadable("no pane id"))
+                self.assertFalse(settle._held_by_usage_limit(screen))  # pyright: ignore[reportPrivateUsage]
+                capture.assert_not_called()
+        (self.root / "sessions" / f"{owner['pid']}.json").unlink()
+        self.assertEqual(settle._screen(owner), settle.ScreenUnreadable("no pane id"))  # pyright: ignore[reportPrivateUsage]
+        self.write_owner_pane(owner, "shared:@2.%5")
+        for failure in (OSError("capture unavailable"), subprocess.TimeoutExpired("tmux", 5)):
+            with self.subTest(failure=type(failure).__name__), patch.object(subprocess, "run", side_effect=failure):
+                screen = settle._screen(owner)  # pyright: ignore[reportPrivateUsage]
+                self.assertEqual(screen, settle.ScreenUnreadable("capture failed"))
+                self.assertFalse(settle._held_by_usage_limit(screen))  # pyright: ignore[reportPrivateUsage]
+        with patch.object(subprocess, "run", return_value=subprocess.CompletedProcess([], 1, "hit your weekly limit", "")):
+            self.assertEqual(settle._screen(owner), settle.ScreenUnreadable("capture failed"))  # pyright: ignore[reportPrivateUsage]
+        owner["host"] = inventory.WindowHost(kind="ghostty", window_shell=123,
+            desktop=inventory.DesktopNotInSnapshot(kind="not in snapshot"))
+        with patch.object(subprocess, "run") as capture:
+            self.assertEqual(settle._screen(owner), settle.ScreenUnreadable("no tmux host"))  # pyright: ignore[reportPrivateUsage]
+            self.assertFalse(settle._usage_limit_shown(owner))  # pyright: ignore[reportPrivateUsage]
+        capture.assert_not_called()
+
+    def test_usage_limit_change_requires_matching_wait_for_ready_owner(self) -> None:
+        saved = session_shutdown(top_level("owner", "Owner"))
+        with patch.object(settle, "_screen", return_value=settle.ScreenText("hit your usage limit")) as screen:
+            for progress in (record.SessionWaiting(kind="waiting"), record.SessionReadyToStop(kind="ready", at=NOW)):
+                saved["progress"] = progress
+                self.assertIsInstance(settle._usage_limit_change(saved, self.matching(saved)), settle.EnterUsageLimitHold)  # pyright: ignore[reportPrivateUsage]
+            saved["session"]["status"] = "busy"
+            screen.reset_mock()
+            self.assertIsInstance(settle._usage_limit_change(saved, self.matching(saved)), settle.NoUsageLimitChange)  # pyright: ignore[reportPrivateUsage]
+            screen.assert_not_called()
+            saved["session"]["status"] = "idle"
+            saved["force"] = "now"
+            self.assertIsInstance(settle._usage_limit_change(saved, self.matching(saved)), settle.NoUsageLimitChange)  # pyright: ignore[reportPrivateUsage]
+            saved["force"] = "wait for ready"
+            for owner in (stop_work.SessionAbsent(kind="session absent"), stop_work.SessionIdentityLost(kind="session identity lost"), stop_work.SessionAccountUnreadable(kind="session account unreadable")):
+                self.assertIsInstance(settle._usage_limit_change(saved, owner), settle.NoUsageLimitChange)  # pyright: ignore[reportPrivateUsage]
+            saved["progress"] = {"kind": "stopping", "at": NOW}
+            self.assertIsInstance(settle._usage_limit_change(saved, self.matching(saved)), settle.NoUsageLimitChange)  # pyright: ignore[reportPrivateUsage]
+        saved["progress"] = record.SessionHeldByUsageLimit(kind="held by usage limit", at=NOW)
+        for shown in (settle.ScreenText("ordinary prompt"), settle.ScreenUnreadable("capture failed")):
+            with self.subTest(screen=shown), patch.object(settle, "_screen", return_value=shown):
+                self.assertIsInstance(settle._usage_limit_change(saved, self.matching(saved)), settle.LeaveUsageLimitHold)  # pyright: ignore[reportPrivateUsage]
+        saved["session"]["status"] = "busy"
+        with patch.object(settle, "_screen", return_value=settle.ScreenText("hit your session limit")):
+            self.assertIsInstance(settle._usage_limit_change(saved, self.matching(saved)), settle.LeaveUsageLimitHold)  # pyright: ignore[reportPrivateUsage]
+
+    def test_held_next_step_uses_idle_seats_and_readiness_without_the_limit_form(self) -> None:
+        saved = session_shutdown(top_level("owner", "Owner"), progress=record.SessionHeldByUsageLimit(kind="held by usage limit", at=NOW))
+        with patch.object(settle, "_showing_form", return_value=True) as form:
+            self.assertIsInstance(settle.next_step(saved, self.matching(saved), [], NOW_UTC), settle.StopSession)
+            saved["seats"] = [seat("worker", "Worker", owner="owner", status="busy")]
+            self.assertEqual(settle.next_step(saved, self.matching(saved), [], NOW_UTC), settle.Hold("Codex seat Worker is still running"))
+            saved["seats"] = []
+            saved["session"]["status"] = "busy"
+            self.assertIsInstance(settle.next_step(saved, self.matching(saved), [], NOW_UTC), settle.Hold)
+            saved["session"]["status"] = "idle"
+            saved["session"]["checkout"] = checkout(ahead=1)
+            self.assertIsInstance(settle.next_step(saved, self.matching(saved), [], NOW_UTC), settle.Hold)
+            form.assert_not_called()
+        for owner in (stop_work.SessionAbsent(kind="session absent"), stop_work.SessionIdentityLost(kind="session identity lost")):
+            with self.subTest(owner=owner):
+                self.assertIsInstance(settle.next_step(saved, owner, [], NOW_UTC), settle.StopSession)
+        self.assertEqual(settle.next_step(saved, stop_work.SessionAccountUnreadable(kind="session account unreadable"), [], NOW_UTC), settle.Hold("account unreadable"))
+        saved["force"] = "now"
+        saved["session"]["status"] = "busy"
+        self.assertIsInstance(settle.next_step(saved, self.matching(saved), [], NOW_UTC), settle.StopSession)
+
+    def test_one_conduct_pass_stops_limit_waiting_owner_and_ordinary_ready_owner(self) -> None:
+        held = session_shutdown(top_level("held", "Held"))
+        ordinary = session_shutdown(top_level("ordinary", "Ordinary"), progress={"kind": "ready", "at": NOW})
+        held["seats"] = [seat("held-seat", "Held seat", owner="held")]
+        ordinary["seats"] = [seat("ordinary-seat", "Ordinary seat", owner="ordinary")]
+        self.save(held)
+        self.save(ordinary)
+        seen: list[str] = []
+        def screen(owner: inventory.Session) -> settle.ScreenText:
+            return settle.ScreenText("hit your session limit" if owner["session_id"] == "held" else "ordinary prompt")
+        def stop(saved: record.SessionShutdown) -> record.SessionShutdown:
+            stored = record.find_session(LOGIN, saved["session"]["session_id"])
+            assert stored is not None
+            self.assertEqual(stored["progress"], saved["progress"])
+            self.assertEqual(saved["progress"]["kind"], "held by usage limit" if saved["session"]["session_id"] == "held" else "ready")
+            seen.append(saved["session"]["session_id"])
+            return self.fake_stop(saved)
+        report = machine_inventory([held["session"], ordinary["session"], *held["seats"], *ordinary["seats"]])
+        with patch.object(settle, "run_inventory", return_value=report) as observe, patch.object(settle, "_screen", side_effect=screen), patch.object(stop_work, "stop_session", side_effect=stop), patch.object(settle, "send_message") as sender, patch.object(settle, "report_stop"):
+            self.assertEqual(settle.conduct(LOGIN), 0)
+        self.assertCountEqual(seen, ["held", "ordinary"])
+        observe.assert_called_once()
+        sender.assert_not_called()
+
+    def test_conductor_returns_held_owner_to_waiting_and_sends_settle_message(self) -> None:
+        deliveries: list[record.SettleMessage] = [
+            {"kind": "not sent"},
+            {"kind": "queued", "at": NOW, "reason": "pending"},
+            {"kind": "sent", "at": NOW},
+        ]
+        for delivery in deliveries:
+            with self.subTest(delivery=delivery["kind"]):
+                owner = top_level("owner-" + delivery["kind"], "Owner")
+                saved = session_shutdown(owner, progress=record.SessionHeldByUsageLimit(kind="held by usage limit", at=NOW))
+                saved["settle_message"] = delivery
+                saved["alerts"] = "none"
+                self.save(saved)
+                def end_pass(_seconds: float) -> None:
+                    raise PassObserved()
+                with patch.object(settle, "now_utc", return_value=NOW_UTC), patch.object(settle, "run_inventory", return_value=machine_inventory([owner])), patch.object(settle, "_screen", return_value=settle.ScreenText("ordinary prompt")), patch.object(settle, "send_message", return_value=settle.MessageSent(kind="sent")) as sender, patch.object(stop_work, "stop_session") as stop, patch.object(time, "sleep", side_effect=end_pass), self.assertRaises(PassObserved):
+                    _ = settle.conduct(LOGIN)
+                sender.assert_called_once()
+                stop.assert_not_called()
+                latest = record.find_session(LOGIN, owner["session_id"])
+                assert latest is not None
+                self.assertEqual(latest["progress"], {"kind": "waiting"})
+                record.archive_session(LOGIN, owner["session_id"])
+
+    def test_usage_limit_write_refuses_cancel_replacement_and_stop_claim_in_conductor(self) -> None:
+        for index, mutation in enumerate(("cancel", "replace", "claim")):
+            with self.subTest(mutation=mutation):
+                saved = session_shutdown(top_level("owner", "Owner"))
+                sentinel = session_shutdown(top_level("sentinel", "Sentinel", status="busy"))
+                saved["requested_at"] = sentinel["requested_at"] = (NOW_UTC + timedelta(seconds=index)).isoformat()
+                self.save(saved)
+                self.save(sentinel)
+                apply = settle._apply_usage_limit_change  # pyright: ignore[reportPrivateUsage]
+                def interleave(current: record.SessionShutdown, change: settle.EnterUsageLimitHold | settle.LeaveUsageLimitHold | settle.NoUsageLimitChange) -> record.SessionShutdown | settle.UsageLimitChangeRefused:
+                    if current["session"]["session_id"] != "owner":
+                        return apply(current, change)
+                    if mutation == "cancel":
+                        _ = record.withdraw_session(LOGIN, "owner", lambda _saved: None)
+                    else:
+                        def replace(latest: record.SessionShutdown) -> None:
+                            if mutation == "replace":
+                                latest["request_id"] = "replacement"
+                            else:
+                                latest["progress"] = {"kind": "stopping", "at": NOW}
+                        _ = record.update_session(LOGIN, "owner", replace)
+                    before = record.find_session(LOGIN, "owner")
+                    result = apply(current, change)
+                    self.assertIsInstance(result, settle.UsageLimitChangeRefused)
+                    self.assertEqual(record.find_session(LOGIN, "owner"), before)
+                    return result
+                def screen(owner: inventory.Session) -> settle.ScreenText:
+                    return settle.ScreenText("usage limit reached" if owner["session_id"] == "owner" else "ordinary prompt")
+                def end_pass(_seconds: float) -> None:
+                    raise PassObserved()
+                with patch.object(settle, "run_inventory", return_value=machine_inventory([saved["session"], sentinel["session"]])), patch.object(settle, "_screen", side_effect=screen), patch.object(settle, "_apply_usage_limit_change", side_effect=interleave), patch.object(settle, "_send_settle_message"), patch.object(stop_work, "stop_session") as stop, patch.object(time, "sleep", side_effect=end_pass), self.assertRaises(PassObserved):
+                    _ = settle.conduct(LOGIN)
+                stop.assert_not_called()
+                for latest in record.session_records(LOGIN):
+                    record.archive_session(LOGIN, latest["session"]["session_id"])
+
+    def test_held_owner_has_no_holdout_alert_and_done_requires_stop_or_restart(self) -> None:
+        saved = session_shutdown(top_level("owner", "Owner"), progress=record.SessionHeldByUsageLimit(kind="held by usage limit", at=NOW))
+        saved["seats"] = [seat("worker", "Worker", owner="owner", status="busy")]
+        self.save(saved)
+        self.assertFalse(settle._done(saved))  # pyright: ignore[reportPrivateUsage]
+        at = NOW_UTC + settle.NOT_ANSWERING_AFTER + timedelta(seconds=1)
+        self.assertFalse(settle._reserve_holdout_alert(saved, at))  # pyright: ignore[reportPrivateUsage]
+        def end_pass(_seconds: float) -> None:
+            raise PassObserved()
+        with patch.object(settle, "now_utc", return_value=at), patch.object(settle, "_screen", return_value=settle.ScreenText("wait for limit to reset")), patch.object(settle, "run_inventory", return_value=machine_inventory([saved["session"], *saved["seats"]])), patch.object(settle, "alert_user") as alert, patch.object(settle, "send_message") as sender, patch.object(time, "sleep", side_effect=end_pass), self.assertRaises(PassObserved):
+            _ = settle.conduct(LOGIN)
+        alert.assert_not_called()
+        sender.assert_not_called()
+        for progress in (record.SessionStopped(kind="stopped", at=NOW), record.SessionRestarted(kind="restarted", at=NOW)):
+            saved["progress"] = progress
+            self.assertTrue(settle._done(saved))  # pyright: ignore[reportPrivateUsage]
+
+    def test_ready_accepts_owner_held_by_usage_limit(self) -> None:
+        saved = session_shutdown(top_level("owner", "Owner"), progress=record.SessionHeldByUsageLimit(kind="held by usage limit", at=NOW))
+        self.save(saved)
+        with patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": "owner"}), patch.object(settle, "run_inventory", return_value=machine_inventory([saved["session"]])):
+            self.assertEqual(settle.ready("limit reset"), 0)
+        latest = record.find_session(LOGIN, "owner")
+        assert latest is not None
+        self.assertEqual(latest["progress"], {"kind": "ready", "at": NOW})
 
     def test_next_step_covers_request_delivery_stop_restore_and_terminal_states(self) -> None:
         saved = session_shutdown(top_level("owner", "Owner"))

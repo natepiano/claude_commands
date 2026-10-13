@@ -40,7 +40,7 @@ PauseRecord(
 )
 ```
 
-`release(session_id) -> PauseRecord | NoPauseRecord` deletes a session's record under `record_lock()` and returns it without resuming anything; `/shutdown` calls it so the tick does not restore a stopped session's instances, and records what the pause had switched off itself.
+`release(session_id) -> PauseRecord | NoPauseRecord` deletes a session's record under `record_lock()` and returns it without resuming anything, naming only the timers and footers that still carry the pause's mark; `/shutdown` calls it so the tick does not restore a stopped session's instances, and records what the pause had switched off itself.
 
 `PausePhase` is `Replying | Quiet | QuestionPending | Asked | KeptOff | Returned`. `Asked` contains `QuestionNotRead | QuestionRead(replies_ended)`. The record lists only notifier instances and footers that this pause switched off.
 
@@ -66,7 +66,7 @@ TOMBSTONE_SECONDS = 300
 
 Fifteen minutes after a reply ends, `tick` sends the question as `conversation-pause`. Delivery changes `QuestionPending` to `Asked`. A typed `yes` runs the equivalent of `resume`; a typed `no` changes the record to `KeptOff`. Five unanswered minutes restore the recorded items. If no reply ever ends, the question becomes due after 30 minutes. While an `/adhoc_review` record is open, `tick` neither asks nor restores.
 
-`notifier.sh resume <instance>` re-enables an instance without changing `NEXT_DUE`; missed work runs on the next tick and future work keeps its former time. Resume failures leave only the unrestored items in the record for the next tick. The footer uses `showrunner_footer.set_footer_state(slug, FooterState.ON | OFF)`.
+The pause stops a timer with `notifier.sh pause <instance>`, which writes `PAUSED=1` into its state, and resumes it with `notifier.sh unpause <instance>`, which re-enables it without changing `NEXT_DUE` only while that mark is there; missed work runs on the next tick and future work keeps its former time. Any explicit `start`, `resume`, `stop` or `restart` clears the mark. The footer works the same way: the pause calls `showrunner_footer.pause_footer(slug)`, which writes `PAUSE_MARK` into the switch file, and the resume calls `unpause_footer(slug)`, which turns it back on only while the file holds the mark; `/showrunner:footer off` (`set_footer_state(slug, FooterState.OFF)`) writes the file empty. Resume failures leave only the unrestored items in the record for the next tick.
 
 ### Bare yes and no
 
@@ -117,8 +117,8 @@ The direct Python callers are `ci_points.review_watch` (`--need decision --actio
 
 - A pause affects only the session that received the prompt.
 - Typed input always pauses. Peer input pauses a unit director but not a showrunner. Scheduled prompts and automated notices never pause.
-- The record contains only items this pause switched off, and resume restores only those items.
-- `notifier.sh resume` never moves an instance's schedule.
+- The record contains only items this pause switched off, and resume restores only those items that nobody stopped, started or switched since.
+- `notifier.sh resume` and `unpause` never move an instance's schedule.
 - The pause question is recognized by sender identity, never by copied or relayed text.
 - A bare yes or no is consumed only while it can still answer the return question.
 - The answer window begins when the question reaches the session. A failed delivery still reaches automatic return five minutes after the question became due.
@@ -155,3 +155,5 @@ The direct Python callers are `ci_points.review_watch` (`--need decision --actio
 - Allowing stale as-built docs to be corrected keeps documentation aligned with shipped behavior wherever the contradiction is found.
 
 **On demand (2026-10-10).** Before a tick advances a pause, `_prune_unscheduled` drops each instance whose notifier folder is gone, and each footer whose `showrunner-<slug>` instance is gone, turning that footer back on. With nothing left it deletes the record and asks nothing, so a production switched to on demand is never asked "Return to automatic updates?". A pause that has already returned keeps its record for late answers.
+
+**Stopped on purpose stays stopped (2026-10-12).** A timer a showrunner stopped with `notifier.sh stop` while the user talked came back at resume: the record named it and resume ran `notifier.sh resume` on every name. Hana had five come back, and the showrunner three, after the user's "reports, dailies and footers off" order. Now the pause marks what it stops (`PAUSED=1` in the timer's state, `PAUSE_MARK` in the footer switch) and only a marked item comes back, by `conversation_pause.py resume`, a typed yes, the timeout return, the session ending or `/shutdown`'s restore through `release`. `_prune_unscheduled` also drops an unmarked item on the next tick, so the explicit stop takes it out of the record. A record written before the marks existed restarts nothing: its timers carry no mark and its footer switches are empty. That is the right result the night it shipped, because the user had turned reports off, and it needs no version field. Tests in `scripts/hooks/test_conversation_pause.py` cover a stop during the pause and one before it, for timers and footers, the timeout return, the prune, `release` and an old record; `test_unpause_restarts_only_a_timer_the_pause_stopped_and_nobody_stopped_since` in `scripts/message/test_notifier.py` covers the notifier verbs.

@@ -34,9 +34,9 @@ USES_THE_MACHINE_ZONE = {
     "notify/pushover.py": "a log stamp written with its offset",
     "production/dailies_render.py": "reads reset times stored with no offset, in the machine's zone",
     "production/review_regime.py": "a stamp written with its offset",
-    "whoami/agent_notes.py": "reset times stored with no offset, and the note's date as the vault's linter writes it",
+    "whoami/agent_notes.py": "reset times written with their offset, and the note's date as the vault's linter writes it",
     "whoami/codex_pacer.py": "Codex names its session folders by the machine's date",
-    "whoami/quota_alert.py": "compares two times and shows neither",
+    "whoami/note_file.py": "reads a reset time stored before the offset was, in the machine's zone",
 }
 SKIPPED_DIRS = {"__pycache__", "fixtures", "tests", "testdata", "node_modules"}
 
