@@ -206,11 +206,11 @@ The user, 2026-10-12: "Let's trial post master to see if it works". Scope is sec
 
 **Ruled out:** raising `quota_alert.py`'s timeout (the budget belongs in `send.py`); `enqueue` instead of a relay on `claimed-no-result` (a lost message is worse than a second copy).
 
-### Phase 7 — The live start-up, the log check, the receiving rule and the as-built  · status: todo
+### Phase 7 — The receiving rule, the as-built, and a worker id the live check can read  · status: done
 
 #### Work Order
 
-**Goal:** the postmaster session runs on natedev and delivers a throwaway message end to end; the log holds what step 2 reads; the documents say what shipped and how to start, check and stop it.
+**Goal:** the documents say what shipped and how to start, check and stop the postmaster; the heartbeat names the worker that wrote it, so the live check in Phase 9 can tell a replaced worker from one that kept running; the log never names a relay that did not run.
 
 **Spec:**
 
@@ -222,31 +222,27 @@ Worktree `/home/natepiano/worktrees/claude-build-followups-shutdown`, branch `bu
   - `### Postmaster mod (trial)`: what the mod is and where it lives; the state directory and its JSON formats (entry, claim, result, heartbeat, route file, reply log, error); the claim file and why a message is delivered once; the `claimed-no-result` path and the choice made there; reply handling; the measured API table from Phase 2; the start, check and stop procedure below; the log fields.
   - Key files, Invariants (the outbox rule; no settings change; the mod touches only `STATE/postmaster/`; tests never write the real outbox) and gotchas (the `tsc` command; the generated types folder; `--plugin-dir` hot-reloads the folder, so a pull on main reloads the running mod and the relay covers the pause; after a Claude Code update run `claude plugin validate --strict` and `claude plugin test`; a stopped postmaster session is started again by hand, and until then every message relays; `/home/natepiano/postmaster` is outside the repo and trusted per account, so a new account or a removed directory meets the folder-trust dialog; a refused send whose withdrawal write also fails leaves an `open` route on disk, and a worker replaced before the retry lands (a pull on main reloads the mod) restores it, so a message from that recipient inside 30 minutes is forwarded to that sender: accepted for the trial, since it needs a failed write and a reload within one 0.5 s poll, and `REPLY_WINDOW_MS` bounds it; `forwarded` holds only confirmed destination ids, so an empty list means an unroutable sender, a refused forward or a throwing forward, none of which is retried or written to `errors/`: read the logged body, find the intended sender and resend by hand).
   - Not verified, and written as such: whether `/shutdown restart` brings the postmaster session back with its `--plugin-dir` flag.
-- The live procedure, run by the unit director after both seats are idle and after this branch is on main, since the session loads `~/.claude/mods/postmaster`. It messages no real session.
-  1. Check: `postmaster.py status` prints `not running` and exits 1.
-  2. Start: in a new tmux session named `postmaster`, in `/home/natepiano/postmaster`, with every `CLAUDE*` variable removed, run a shell whose child is `command claude -n postmaster --plugin-dir /home/natepiano/.claude/mods/postmaster`. Confirm with `sessions.py id postmaster`. Pass: `postmaster.py status` exits 0 within 10 s.
-  3. Start one throwaway recipient, `command claude -n pm-check`, in a second window of a throwaway tmux session in the same directory.
-  4. Send three messages with the same summary and text, `send.py --here --to pm-check --from pm-trial --text …`. Pass: each prints `SENT: postmaster; verbatim; …` and exits 0; each returns in under 1.5 s; `pm-check`'s transcript shows three arrivals, each first line naming `pm-trial` with its own tag (equal texts would be dropped as repeats); `STATE/relay/` gained no file; `log.jsonl` has three lines with `via: postmaster`; `postmaster.py status` prints `errors: 0`.
-  5. Fallback: end the postmaster session's `claude` process with `SIGTERM` by its own pid, send one more message. Pass: it prints `SENT: mode auto; verbatim; …` through the relay, the log line says `via: relay`, `postmaster: stale` or `absent`, and `pm-check` shows it once.
-  6. Reply: start the postmaster again as in step 2, and a second throwaway session, `command claude -n pm-origin`, in a third window. Send `pm-check` a message `--from pm-origin` whose text asks it to answer the session named `postmaster`, and one `--from pm-trial` (no live session) asking the same. Wait at most five minutes for each. For an answer to `pm-origin`'s message the pass is: its `replies/` file lists `pm-origin` in `senders` and `pm-origin`'s session id in `forwarded`, `pm-origin`'s transcript shows the answer once, and the postmaster session's transcript shows no new turn. For an answer to `pm-trial`'s message: its `replies/` file has `forwarded: []` and the postmaster session shows no new turn. If no answer arrives, record that; reply handling then stands on Phase 5's tests and Phase 2's criterion (d). Either way `postmaster.py status` still prints `errors: 0`; a non-zero count fails the step, and each `errors/` file's text goes into the as-built.
-  7. Reload, receive first: with the postmaster idle, `touch` (mtime only) `/home/natepiano/.claude/mods/postmaster/hooks/register.ts` so `--plugin-dir` reloads the hooks, and read `postmaster.py status` 5 s later. Fresh: the reload ran `session.start`; record that receive-first is not reachable live. Stale: the new worker waits for its first hook; send `pm-check` (through the relay) a message asking it to answer `postmaster`, so its answer starts the worker through `session.receive`. Pass either way: within 10 s of the first hook `status` exits 0; 30 s later the heartbeat is still under 2 s old, so the poll timer outlives the handler that started it; one more `send.py --to pm-check` prints `SENT: postmaster; …`; `errors: 0`. Record which path ran, apart from ordinary start-up.
-  8. Leave the postmaster session running: this is the trial's start. End `pm-check`, `pm-origin` and their tmux session. Record the start time, in the user's zone after reading the clock, in the as-built.
+- The as-built writes the live procedure in full, as Phase 9 states it, with its Results marked pending until Phase 9 runs it.
+- Review repairs (Phase 7 review, 2026-10-13):
+  - The heartbeat names its worker: `heartbeat.json` = `{session_id, at_ms, version, run}`, where `run` is the worker's `<at_ms>-<uuid>`, the same value its claims carry. `postmaster.py` requires the field and `status` prints it: `running, heartbeat <age> s old, worker <run>`. Without it a reload that never replaced the worker passes the reload check.
+  - A `session:` address with no live session is queued without any send, and its log line says `via: queue`, `postmaster: unresolved`. `ClaudeRoute.via` is `postmaster | relay | queue`; `via: relay` means a relay ran. The step 2 relay count reads `via: relay` only.
+  - `commands/message.md`'s earlier "answer its wrapper's `from`" names the postmaster exception, so both rules pick the real sender.
 - Log fields step 2 reads, all in `STATE/log.jsonl`: `time`, `outcome`, `detail`, `via`, `postmaster`, `seconds`, `from`, `to`. From them: the share delivered by the mod, relays a day against the baseline of about 600, delivery time against the relay's 4.5 s median, `queued` and `failed` counts, and the count of `claimed-no-result`. The `replies/` directory gives replies consumed, and its `forwarded` lists give replies passed on. The as-built lists the one-line command for each number; nothing in this plan computes them.
-- The checkpoint notice to the showrunner states the trial's start time and that step 2's two-day window begins there.
 
 **Files:**
 - `commands/message.md` — the receiving rule and the sending line.
-- `docs/as-built/session-roster.md` — the amend and the mod's section, with the live results.
+- `docs/as-built/session-roster.md` — the amend and the mod's section, with the live procedure and its Results pending.
+- Review repairs: `mods/postmaster/hooks/protocol.ts`, `mods/postmaster/hooks/outbox.ts`, `mods/postmaster/tests/*.test.ts`, `scripts/message/postmaster.py`, `scripts/message/send.py`, `scripts/message/test_postmaster.py`, `scripts/message/test_send.py`.
 
-**Seats:** 2 writers — one document each; neither has a test lane.
-- `impl` — `commands/message.md`.
+**Seats:** 2 writers — one document each; the review repairs go to `impl` with their tests.
+- `impl` — `commands/message.md`, then the review repairs' code and tests.
 - `test` — opens as impl: `docs/as-built/session-roster.md`.
 
 **Constraints from prior phases:** Phase 1 wrote `### Postmaster mod (trial)` with the probe procedure; Phase 2 filled its measured table and recorded the `tsc` command; Phase 3 removed the probe and marked the procedure as the record of how the table was measured. Phases 3 and 5 built the mod: outbox, claim, result, heartbeat, reply handling, under `mods/postmaster/hooks/`. Phase 5 shipped the reply log as `replies/<at_ms>-<n>.json` = `{at_ms, socket, name, session_id, senders, body, forwarded}`: `senders` is a non-empty list of distinct, non-empty names in first-route order (not a `sender` string), and `forwarded` lists only the session ids a forward was confirmed to. Route files are `delivered/<at_ms>-<n>.json` = `{route: "open" | "withdrawn", socket, sender, reply_to_session_id, session_id, at_ms}`; the mod restores `open` routes younger than `REPLY_WINDOW_MS` (30 minutes) when a worker starts. A forwarded reply's first line is `Message from <name> (their answer to <sender | one of a, b>, passed on by postmaster) [<at_ms>-<n>]:`. Phase 6 built `scripts/message/postmaster.py` (`new_entry_id`, `attempt`, the miss reasons, `status` with its `errors:` and `replies:` counts), the `SENT: postmaster; …` line, `delivered_text` with its tag, the three log fields and `RELAY_ONLY_SENDERS`, and gives the relay after a miss `--timeout` less the attempt's `seconds` (at least 1 s), so a send keeps its caller's time limit; the as-built names the set, the reason, and that step 2's share is counted without those messages. Phase 2 measured that the recipient sees the postmaster session's name, so the receiving rule is added. Spell the CLI `command claude` in every command a seat or a script runs.
 
-**Acceptance gate:** the live procedure's eight steps passed and their results are in the as-built; `commands/message.md` names the rule; the as-built's `send.py` section, invariants and gotchas describe what shipped; the message suite green; `claude plugin validate --strict mods/postmaster` and `claude plugin test mods/postmaster` green on main.
+**Acceptance gate:** `commands/message.md` names the rule; the as-built's `send.py` section, invariants and gotchas describe what shipped, and it carries Phase 9's procedure with Results pending; the message suite green; `claude plugin validate --strict mods/postmaster`, `claude plugin test mods/postmaster` and the `tsc` check green.
 
-**Verification:** `cd scripts/message && HOME=<scratch home> python3 -m unittest test_postmaster test_send test_sessions test_roster` · `command claude plugin validate --strict /home/natepiano/.claude/mods/postmaster` · `command claude plugin test /home/natepiano/.claude/mods/postmaster` · `python3 scripts/message/postmaster.py status` exits 0 after the live procedure.
+**Verification:** `cd scripts/message && HOME=<scratch home> python3 -m unittest test_postmaster test_send test_sessions test_roster` · `command claude plugin validate --strict mods/postmaster` · `command claude plugin test mods/postmaster` · `nix shell nixpkgs#typescript --command tsc --noEmit -p mods/postmaster`.
 
 ### Phase 8 — Restart finds a session's tmux pane and tmux session after a rename  · status: todo
 
@@ -285,3 +281,38 @@ Worktree `/home/natepiano/worktrees/claude-build-followups-shutdown`, branch `bu
 **Acceptance gate:** the shutdown suite green with the named cases; basedpyright clean on the six Python files; a test shows a renamed tmux session with a free pane respawned in place, and one shows a closed pane in a renamed tmux session reopened as a window of that same tmux session; a record without `session_ref` still restarts.
 
 **Verification:** `cd scripts/shutdown && HOME=<scratch home> python3 -m unittest test_restart test_inventory test_record test_settle test_stop test_shutdown_cli test_shutdown_status test_remote test_send_guard` · `basedpyright scripts/shutdown/inventory.py scripts/shutdown/restart.py scripts/shutdown/test_restart.py scripts/shutdown/test_inventory.py scripts/shutdown/test_settle.py scripts/shutdown/test_stop.py`.
+
+### Phase 9 — The live start-up and its results  · status: todo
+
+#### Work Order
+
+**Goal:** the postmaster session runs on natedev and delivers a throwaway message end to end; the as-built holds every step's result and the trial's start time.
+
+**Blocked by:** Phase 7's checkpoint on main (`git merge-base --is-ancestor <Phase 7 checkpoint> main`).
+
+**Spec:**
+
+Worktree `/home/natepiano/worktrees/claude-build-followups-shutdown`, branch `build-followups-shutdown`.
+
+- The live procedure, run by the unit director once Phase 7's checkpoint is on main, since the session loads `~/.claude/mods/postmaster`. No seat runs. It messages no real session.
+  1. Check: `postmaster.py status` prints `not running` and exits 1.
+  2. Start: in a new tmux session named `postmaster`, in `/home/natepiano/postmaster`, with every `CLAUDE*` variable removed, run a shell whose child is `command claude -n postmaster --plugin-dir /home/natepiano/.claude/mods/postmaster`. Confirm with `sessions.py id postmaster`. Pass: `postmaster.py status` exits 0 within 10 s.
+  3. Start one throwaway recipient, `command claude -n pm-check`, in a second window of a throwaway tmux session in the same directory.
+  4. Send three messages with the same summary and text, `send.py --here --to pm-check --from pm-trial --text …`. Pass: each prints `SENT: postmaster; verbatim; …` and exits 0; each returns in under 1.5 s; `pm-check`'s transcript shows three arrivals, each first line naming `pm-trial` with its own tag (equal texts would be dropped as repeats); `STATE/relay/` gained no file; `log.jsonl` has three lines with `via: postmaster`; `postmaster.py status` prints `errors: 0`.
+  5. Fallback: end the postmaster session's `claude` process with `SIGTERM` by its own pid, then end the `postmaster` tmux session this procedure created (`tmux kill-session -t =postmaster`), so step 6 can create it again; send one more message. Pass: it prints `SENT: mode auto; verbatim; …` through the relay, the log line says `via: relay`, `postmaster: stale` or `absent`, and `pm-check` shows it once.
+  6. Reply: start the postmaster again as in step 2, and a second throwaway session, `command claude -n pm-origin`, in a third window. Send `pm-check` a message `--from pm-origin` whose text asks it to answer the session named `postmaster`. Start a third throwaway recipient, `command claude -n pm-check2`, in a fourth window, and send it one `--from pm-trial` (no live session) asking the same: a reply is forwarded to every session routed through its socket within 30 minutes, so `pm-trial`'s message goes to a socket that holds no other route. Wait at most five minutes for each. For an answer to `pm-origin`'s message the pass is: its `replies/` file lists `pm-origin` in `senders` and `pm-origin`'s session id in `forwarded`, `pm-origin`'s transcript shows the answer once, and the postmaster session's transcript shows no new turn. For `pm-check2`'s answer to `pm-trial`'s message: its `replies/` file lists `pm-trial` in `senders` and has `forwarded: []` and the postmaster session shows no new turn. If no answer arrives, record that; reply handling then stands on Phase 5's tests and Phase 2's criterion (d). Either way `postmaster.py status` still prints `errors: 0`; a non-zero count fails the step, and each `errors/` file's text goes into the as-built.
+  7. Reload, receive first: with the postmaster idle, record the `worker` that `postmaster.py status` prints, then `touch` (mtime only) `/home/natepiano/.claude/mods/postmaster/hooks/register.ts` so `--plugin-dir` reloads the hooks, and read `postmaster.py status` 5 s later. Fresh with a new `worker`: the reload ran `session.start`; record that receive-first is not reachable live. Fresh with the same `worker`: the touch replaced nothing; record it, and the step fails. Fresh with the `worker` alternating between reads: the old worker outlived the reload; record it, and the step fails. Stale: the new worker waits for its first hook; send `pm-check` (through the relay) a message asking it to answer `postmaster`, so its answer starts the worker through `session.receive`. Pass either way: within 10 s of the first hook `status` exits 0 naming a `worker` other than the one recorded before the touch; 30 s later the heartbeat is still under 2 s old, so the poll timer outlives the handler that started it; one more `send.py --to pm-check` prints `SENT: postmaster; …`; `errors: 0`. Record which path ran, apart from ordinary start-up.
+  8. Leave the postmaster session running: this is the trial's start. End `pm-check`, `pm-origin`, `pm-check2` and their tmux session. Record the start time, in the user's zone after reading the clock, in the as-built.
+- The as-built's Results paragraph records each step: send timings, tags and transcript arrivals, the relay and log checks, the routed and script-only replies or their absence, every `errors/` text, the worker before and after the reload and which hook started the new one, and the trial's start time in the user's zone.
+- The checkpoint notice to the showrunner states the trial's start time and that step 2's two-day window begins there.
+
+**Files:**
+- `docs/as-built/session-roster.md` — the Results paragraph.
+
+**Seats:** none — the unit director runs the procedure and writes the Results paragraph, a documentation change.
+
+**Constraints from prior phases:** Phase 7 wrote the procedure into the as-built and added the heartbeat's `run` and `status`'s `worker`; Phase 7's review moved this procedure here because the session loads the mod from main.
+
+**Acceptance gate:** the eight steps passed, or each failure is recorded with its evidence and routed to the showrunner; the Results paragraph is filled; `postmaster.py status` exits 0 after step 8.
+
+**Verification:** the eight steps themselves · `~/.claude/scripts/lib/py ~/.claude/scripts/message/postmaster.py status` exits 0 after step 8.

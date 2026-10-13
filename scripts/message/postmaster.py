@@ -57,6 +57,7 @@ class Heartbeat(TypedDict):
     session_id: str
     at_ms: int
     version: str
+    run: str
 
 
 @dataclass(frozen=True)
@@ -170,7 +171,8 @@ def is_outbox_result(value: object) -> TypeGuard[OutboxResult]:
 
 def is_heartbeat(value: object) -> TypeGuard[Heartbeat]:
     return (_record(value) and isinstance(value.get("session_id"), str) and value["session_id"] != ""
-            and _timestamp(value.get("at_ms")) and isinstance(value.get("version"), str) and value["version"] != "")
+            and _timestamp(value.get("at_ms")) and isinstance(value.get("version"), str) and value["version"] != ""
+            and isinstance(value.get("run"), str) and value["run"] != "")
 
 
 def new_entry_id() -> str:
@@ -374,7 +376,7 @@ def status(state: Path) -> int:
     _collect(root)
     _prune(root, "errors", 7 * 24 * 60 * 60)
     heartbeat = _heartbeat(root, sessions.live_sessions())
-    running = (f"running, heartbeat {heartbeat.age:.1f} s old"
+    running = (f"running, heartbeat {heartbeat.age:.1f} s old, worker {heartbeat.record['run']}"
                if isinstance(heartbeat, FreshHeartbeat) else "not running")
     print(f"postmaster: {running}; errors: {len(_files(root / 'errors'))}; replies: {len(_files(root / 'replies'))}")
     via, reasons = _today_counts(state)

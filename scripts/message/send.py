@@ -105,7 +105,7 @@ EXIT: dict[Outcome, int] = {"sent": 0, "skipped": 0, "queued": 1, "failed": 3, "
 
 LogEntry = TypedDict("LogEntry", {"time": str, "machine": str, "from": str, "to": str, "key": str | None,
                                   "summary": str, "text": str, "outcome": Outcome, "detail": str,
-                                  "via": NotRequired[Literal["postmaster", "relay"]],
+                                  "via": NotRequired[Literal["postmaster", "relay", "queue"]],
                                   "postmaster": NotRequired[Literal["delivered", "unresolved"] | postmaster.PostmasterMiss],
                                   "seconds": NotRequired[float]})
 KeyedMessage = TypedDict(
@@ -166,7 +166,7 @@ class NoClaudeRoute:
 
 @dataclass(frozen=True)
 class ClaudeRoute:
-    via: Literal["postmaster", "relay"]
+    via: Literal["postmaster", "relay", "queue"]
     postmaster: Literal["delivered", "unresolved"] | postmaster.PostmasterMiss
     seconds: float
 
@@ -1070,7 +1070,7 @@ def send(options: Options) -> Result:
                 f"no live session answers to {plan.address}, so it is kept under that name",
             )
             enqueue(message, result.detail, started)
-            log_route = ClaudeRoute("relay", "unresolved", time.monotonic() - claude_started)
+            log_route = ClaudeRoute("queue", "unresolved", time.monotonic() - claude_started)
         else:
             live = sessions.live_sessions()
             registered = sessions.addressed(plan.message.to, live)

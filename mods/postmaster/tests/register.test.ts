@@ -1,6 +1,7 @@
 import { describe, expect, mock, test } from "claude-code/testing";
 import type { On, FsEntry, SessionReceiveInput, SessionSendInput, SessionStartInput } from "claude-code";
 import type { DeliveryRouteFile } from "../hooks/protocol";
+import { isHeartbeat, isOutboxClaim } from "../hooks/protocol";
 
 const directory = "/test-state/message/postmaster";
 const socket = "uds:/test-sockets/recipient.sock";
@@ -41,6 +42,8 @@ function hookFiles(on: On) {
   files.set(`${directory}/delivered/${at_ms}-1.json`, JSON.stringify(saved));
   let signalHeartbeat: (value: boolean) => void = () => {};
   const heartbeat = new Promise<boolean>(resolve => { signalHeartbeat = resolve; });
+  let signalDelivery: (value: boolean) => void = () => {};
+  const delivery = new Promise<boolean>(resolve => { signalDelivery = resolve; });
   let signalListing: () => void = () => {};
   const listing = new Promise<void>(resolve => { signalListing = resolve; });
   let beforeList: (path: string) => Promise<void> = async () => {};
@@ -74,9 +77,10 @@ function hookFiles(on: On) {
     await beforeWrite(event.path);
     files.set(event.path, event.text);
     if (event.path === `${directory}/heartbeat.json`) signalHeartbeat(true);
+    if (event.path.startsWith(`${directory}/results/`)) signalDelivery(true);
     return { value: undefined };
   });
-  return { files, listed, received, started, sent, heartbeat, listing,
+  return { files, listed, received, started, sent, heartbeat, delivery, listing,
     onBeforeList: (action: typeof beforeList) => { beforeList = action; },
     onBeforeWrite: (action: typeof beforeWrite) => { beforeWrite = action; },
     routeLists: () => listed.filter(path => path === `${directory}/delivered`).length,
@@ -84,6 +88,22 @@ function hookFiles(on: On) {
 }
 
 describe("postmaster hook startup", () => {
+  test("heartbeat identifies the same worker as its delivery claim", async ($, on) => {
+    const fake = hookFiles(on);
+    const id = "0123456789abcdef0123456789abcdef";
+    fake.files.set(`${directory}/outbox/${id}.json`, JSON.stringify({
+      id, session_id: "recipient", socket, sender: "Original sender", reply_to_session_id: "original-session",
+      text: "hello", sha256: "a".repeat(64), deadline_ms: Date.now() + 10000,
+    }));
+    await $.session.start(start);
+    await withinHeartbeat(fake.delivery);
+    const heartbeat: unknown = JSON.parse(fake.files.get(`${directory}/heartbeat.json`) ?? "null");
+    const claim: unknown = JSON.parse(fake.files.get(`${directory}/claimed/${id}.json`) ?? "null");
+    if (!isHeartbeat(heartbeat) || !isOutboxClaim(claim)) throw new Error("Missing worker identity records");
+    expect(heartbeat.run).toMatch(/^\d+-[a-f0-9-]{36}$/);
+    expect(heartbeat.run).toBe(claim.run);
+  });
+
   test("receive before start restores reply routes consumes without next and starts the outbox", async ($, on) => {
     const fake = hookFiles(on);
     expect(await $.session.receive(answer)).toEqual({ consumed: "postmaster reply" });

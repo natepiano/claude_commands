@@ -48,7 +48,7 @@ export async function startOutbox(calls: PostmasterCalls, replies: Replies): Pro
 
   const path = (folder: string, id: string) => `${directory}/${folder}/${id}.json`;
   const heartbeat = async (): Promise<void> => {
-    const value: Heartbeat = { session_id, at_ms: calls.now(), version: VERSION };
+    const value: Heartbeat = { session_id, at_ms: calls.now(), version: VERSION, run };
     await calls.fs.write(`${directory}/${PATHS.heartbeat}`, JSON.stringify(value));
   };
   const readEntry = async (id: string): Promise<EntryRead> => {
