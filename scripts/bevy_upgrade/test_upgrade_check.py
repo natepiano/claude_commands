@@ -11,6 +11,7 @@ from urllib.parse import urlsplit
 import pins
 import upgrade_check
 import upgrade_record
+import upgrade_report
 import upstream
 
 if TYPE_CHECKING:
@@ -593,13 +594,114 @@ class CheckTests(unittest.TestCase):
         self.current["dependencies"] = {"adapter": current}
         self.github_crate()
         base, _, items = self.github_fixtures()
+        self.fetch.bodies[f"{base}/pulls/7"] = {"state": "open", "merged": False,
+                                              "head": {"ref": "port", "sha": "1234567890abcdef"}}
         self.fetch.bodies[items] = [{"number": 9, "title": "Track 0.20", "state": "open",
                                     "created_at": "2026-10-02T00:00:00Z", "updated_at": "new"}]
         result = self.run_pass()
-        self.assertEqual(self.fetch.urls, [f"{API}/adapter", f"{base}/commits/main", items])
+        self.assertEqual(self.fetch.urls, [f"{API}/adapter", f"{base}/commits/main", items, f"{base}/pulls/7"])
         self.assertEqual(sorted(current["items"], key=lambda item: item["number"]), [expected_stored,
             {"number": 9, "kind": "issue", "state": "open", "title": "Track 0.20", "updated": "new", "head": ""}])
         self.assertEqual((result.asked, result.failed), (1, 0))
+
+    def cached_github_entry(self, requirement: str = "^0.19") -> tuple[upgrade_record.Entry, str, str, str]:
+        self.released_target()
+        current = entry()
+        current["crates_io"] = read_fact()
+        current["branch"] = {"status": "read", "repository": "owner/adapter", "name": "main",
+                            "rev": "abcdef0123456789", "committed": "2026-10-01", "requirement": requirement}
+        self.current["dependencies"] = {"adapter": current}
+        self.github_crate()
+        base, manifest, items = self.github_fixtures()
+        return current, base, manifest, items
+
+    def test_unchanged_head_retries_empty_requirement_and_reuses_known_requirement(self) -> None:
+        for requirement in ("", "^0.19"):
+            with self.subTest(requirement=requirement):
+                self.fetch = CheckFetch()
+                current, base, manifest, items = self.cached_github_entry(requirement)
+                result = self.run_pass()
+                expected = [f"{API}/adapter", f"{base}/commits/main"]
+                if not requirement:
+                    expected.append(manifest)
+                self.assertEqual(self.fetch.urls, [*expected, items])
+                self.assertEqual((result.asked, result.failed), (1, 0))
+                branch = current["branch"]
+                assert branch["status"] == "read"
+                self.assertEqual(branch["requirement"], requirement or "^0.20")
+
+    def test_workspace_member_requirement_makes_unchanged_branch_git_ready(self) -> None:
+        current, base, manifest, items = self.cached_github_entry("")
+        tree = f"{base}/git/trees/abcdef0123456789?recursive=1"
+        member = manifest.removesuffix("Cargo.toml") + "crates/adapter/Cargo.toml"
+        self.fetch.bodies[manifest] = '[workspace]\nmembers = ["crates/*"]\n'
+        self.fetch.bodies[tree] = {"tree": [{"path": "crates/adapter/Cargo.toml", "type": "blob"}]}
+        self.fetch.bodies[member] = '[package]\nname = "adapter"\n[dependencies]\nbevy_ecs = "^0.20"\n'
+        result = self.run_pass()
+        self.assertEqual((result.asked, result.failed), (1, 0))
+        self.assertEqual(self.fetch.urls, [f"{API}/adapter", f"{base}/commits/main", manifest, tree, member, items])
+        self.assertEqual(upgrade_report.state(current, "0.20"), "git ready")
+
+    def test_failed_workspace_member_read_preserves_stored_entry_facts(self) -> None:
+        for body in ("[broken", upstream.FetchFailure("raw.githubusercontent.com: HTTP 500")):
+            with self.subTest(body=body):
+                self.fetch = CheckFetch()
+                current, base, manifest, items = self.cached_github_entry("")
+                tree = f"{base}/git/trees/abcdef0123456789?recursive=1"
+                member = manifest.removesuffix("Cargo.toml") + "crates/adapter/Cargo.toml"
+                self.fetch.bodies[manifest] = '[workspace]\nmembers = ["crates/*"]\n'
+                self.fetch.bodies[tree] = {"tree": [{"path": "crates/adapter/Cargo.toml", "type": "blob"}]}
+                self.fetch.bodies[member] = body
+                before = copy.deepcopy(current)
+                result = self.run_pass()
+                self.assertEqual((result.asked, result.failed), (1, 1))
+                self.assertTrue(current["error"].startswith("raw.githubusercontent.com: "))
+                before["error"] = current["error"]
+                self.assertEqual(current, before)
+                self.assertNotIn(items, self.fetch.urls)
+
+    def test_kept_open_pull_is_rechecked_and_updated_after_merge(self) -> None:
+        current, base, _, items = self.cached_github_entry()
+        current["items"] = [{"number": 7, "kind": "pr", "state": "open", "title": "Port 0.20",
+                             "updated": "old", "head": "port @ 1234567"}]
+        self.fetch.bodies[f"{base}/pulls/7"] = {"state": "closed", "merged": True,
+                                              "head": {"ref": "finished", "sha": "fedcba9876543210"}}
+        result = self.run_pass()
+        self.assertEqual((result.asked, result.failed), (1, 0))
+        self.assertEqual(self.fetch.urls, [f"{API}/adapter", f"{base}/commits/main", items, f"{base}/pulls/7"])
+        self.assertEqual(current["items"], [{"number": 7, "kind": "pr", "state": "merged", "title": "Port 0.20",
+                                             "updated": "old", "head": "finished @ fedcba9"}])
+        self.fetch.urls.clear()
+        _ = self.run_pass()
+        self.assertEqual(self.fetch.urls, [f"{API}/adapter", f"{base}/commits/main", items])
+
+    def test_kept_issue_closed_and_merged_pulls_cost_no_pull_request(self) -> None:
+        current, base, _, items = self.cached_github_entry()
+        current["items"] = [
+            {"number": 7, "kind": "issue", "state": "open", "title": "Track 0.20", "updated": "old", "head": ""},
+            {"number": 8, "kind": "pr", "state": "closed", "title": "Port 0.20", "updated": "old", "head": "p @ 1234567"},
+            {"number": 9, "kind": "pr", "state": "merged", "title": "Port 0.20", "updated": "old", "head": "p @ abcdef0"},
+        ]
+        before = copy.deepcopy(current["items"])
+        result = self.run_pass()
+        self.assertEqual((result.asked, result.failed), (1, 0))
+        self.assertEqual(self.fetch.urls, [f"{API}/adapter", f"{base}/commits/main", items])
+        self.assertEqual(current["items"], before)
+
+    def test_later_kept_pull_failure_rolls_back_earlier_pull_update(self) -> None:
+        current, base, _, _ = self.cached_github_entry()
+        current["items"] = [
+            {"number": number, "kind": "pr", "state": "open", "title": "Port 0.20",
+             "updated": "old", "head": "p @ 1234567"} for number in (7, 8)]
+        self.fetch.bodies[f"{base}/pulls/7"] = {"state": "closed", "merged": True,
+                                              "head": {"ref": "finished", "sha": "fedcba9876543210"}}
+        self.fetch.bodies[f"{base}/pulls/8"] = upstream.FetchFailure("api.github.com: HTTP 500")
+        before = copy.deepcopy(current)
+        result = self.run_pass()
+        before["error"] = "api.github.com: HTTP 500"
+        self.assertEqual(current, before)
+        self.assertEqual((result.asked, result.failed), (1, 1))
+        self.assertEqual(self.fetch.urls[-2:], [f"{base}/pulls/7", f"{base}/pulls/8"])
 
 
 if __name__ == "__main__":

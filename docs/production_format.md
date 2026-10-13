@@ -44,6 +44,8 @@ must not drift from it:
   work, and end at `end_session.sh`. Reviews run on the unit's seats, or on the
   production's review pool when its doc names one.
 - **Review pool** — a production's reusable reviewers, allocated by a script.
+- **Review unit** — the production's `/review:direct` run. It primes the pools
+  and curates review memory; it dispatches no review and owns no source files.
 - **Reviewer** — a read-only Codex thread in that pool, named `code1`, `ui2`, etc.
 - **Template** — a thread holding a type's standing prompt, forked into reviewers
   and never leased.
@@ -113,6 +115,10 @@ refuses a name that another session of the same account also has.
 | Unit | Plan | Worktree | Branch | Port | Owns |
 | --- | --- | --- | --- | --- | --- |
 | <name>-unit | <plan path> | <path> | <branch> | <app port or —> | <dirs/files> |
+
+With a **Review pool** line, include `review-unit` as an ordinary row with
+its own worktree, branch and plan path, Port `—` and Owns `—`. Its plan holds
+one standing phase that stays `todo`; `/review:direct` writes it when absent.
 
 The Unit value names the unit everywhere: in the log, the dailies, the waits and every
 tool's arguments. A unit's session name is written nowhere, because the user may rename
