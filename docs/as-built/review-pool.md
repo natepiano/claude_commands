@@ -111,7 +111,7 @@ Lens `ux` with no pool is accepted. From there the launcher:
 4. Runs `review_pool.py allocate --production <slug> --type <type> --unit <unit> --phase <phase> --pass <pass_index> [--lens L] [--fresh] --pid $$`; `--fresh` is passed for `ui` only. A failure prints `ERROR: pool allocation failed; see <log>.` and exits 1 with no turn.
 5. Takes `reviewer`, `mesh_dir`, `thread_id`, `lease_ordinal` and `prime_hash` from the allocation line. Its slot is `pool_<reviewer>`: exported as `PLAN_DELEGATE_TEAM_ROLE` and written as one line to the slot file, since the slot is known only after allocation and the unit director needs it to cancel.
 6. Prepends the unit's memory (`review_pool.py unit-memory`) for `code` when `lease_ordinal` is 1, and on every `ui` turn, which starts from a reset thread that holds nothing from an earlier turn. It writes `${SESSION_DIR}/review_message_<pass><suffix>.XXXXXX` (the memory, a blank line, the prompt), sends that file as the prompt and removes it at exit. With no memory the prompt goes unchanged. A failed `unit-memory` call ends the attempt as an `error`.
-7. Claims the reviewer in the pool's `mesh_dir` (`can-follow --claim-pid $$`), compacting it first when its recorded context is over `PLAN_DELEGATE_COMPACT_ABOVE_TOKENS` (100000 in `config/delegate.conf`). Roster, compaction, claim and claim release use the pool's `mesh_dir`; status file, findings, agent log, heartbeat, board and pass stay in the unit's `${SESSION_DIR}`.
+7. Claims the reviewer in the pool's `mesh_dir` (`can-follow --claim-pid $$`), compacting it first when its recorded context is an integer over `PLAN_DELEGATE_COMPACT_ABOVE_TOKENS` (100000 in `config/delegate.conf`). Roster, compaction, claim and claim release use the pool's `mesh_dir`; status file, findings, agent log, heartbeat, board and pass stay in the unit's `${SESSION_DIR}`.
 8. Records the review pass under its slot, except for lens `ux` (`record_pass_start` returns at once, with a pool and without one): the unit director's `UX review` activity already carries that time, and a pass would count it twice. An early launch defers the pass until its sentinel file appears, as on the seated path.
 9. Runs `codex_mesh.py follow --session-dir <mesh_dir> --to <reviewer> --claim-pid $$ --role review [--lens L] --cwd "${WORKING_DIR}" --read-only [--image …] --message-file … --summary-file <findings> --reply-file … --log-file … --model … --effort … --service-tier …` with the review model, effort and tier.
 10. After the turn, checks that the working tree is unchanged, counts the findings, writes `reviewed` or `error` to the status file and closes the pass (`finish-pass --status completed` or `error`).
@@ -251,7 +251,7 @@ A rule stated with its mechanism above is not repeated here.
 
 **Numbers**
 
-- The prompt cache is per thread. First request after a reset: 212 uncached / 23,552 cached / 9 output = 2,639 weighted tokens. First after a new fork: 12,372 / 11,392 / 8 = 13,575. A reset took 0.199 s, a fork 0.189 s. This is one measured pair (2026-10-12, Codex CLI 0.162.1, weights uncached 1, cached 0.1, output 8; the run is recorded in `docs/as-built/review-pool-probes.md`), not a standing guarantee of cache behavior.
+- The prompt cache is per thread. First request after a reset: 212 uncached / 23,552 cached / 9 output = 1,435 weighted tokens. First after a new fork: 12,372 / 11,392 / 8 = 12,982. A reset took 0.199 s, a fork 0.189 s. This is one measured pair (2026-10-12, Codex CLI 0.162.1, `gpt-6.1-sol` weights uncached 1, cached 0.05, output 5; the run is recorded in `docs/as-built/review-pool-probes.md`), not a standing guarantee of cache behavior.
 - `config/review_pool/code.md` stays under 7 KB and `ui.md` under 6 KB.
 - Repository memory: at most 4,000 tokens for `code` and 3,000 for `ui`, counted as UTF-8 bytes divided by four, rounded up; the least-cited entry is pruned at the cap.
 
@@ -280,7 +280,7 @@ A rule stated with its mechanism above is not repeated here.
 **Report**
 
 - The hourly `usage-collect` job on natedev builds the store for both machines; the Mac has no store of its own. The report runs on natedev, and its tables carry costs only once the store exists. An empty cost cell means unavailable, never zero.
-- The collector keys a Codex request by its byte offset inside one file and inserts with `INSERT OR IGNORE`, so two real files of one thread can lose a request at a shared offset. A `--fresh` reset starts a new rollout file each time, so a `ux` cost row can read low until the usage ledger keys by file.
+- The collector keys a Codex request by `<session file name>:<byte offset>` (`collect.codex_key`), so the new rollout file a `--fresh` reset or a revert starts keeps every request of its own. Two files of one thread with the same last path component would still share keys (`docs/as-built/usage-ledger.md`).
 - A live check of the UI pool belongs in a scratch `REVIEW_POOL_STATE` and a scratch `PLAN_DELEGATE_HISTORY_DIR`; the real pool state and history then hold no trial record of it.
 
 **Review director**

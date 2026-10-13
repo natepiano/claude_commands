@@ -37,17 +37,76 @@ class CompactionReplayTests(CollectorFixture):
             _ = db.execute("INSERT INTO compactions VALUES (?,?,?,?,?)",
                            ("natedev", "codex", "", thread, f"2026-10-{day:02d}T22:{minute:02d}:00+00:00"))
 
-    def replay(self, *arguments: str, script: str = "") -> subprocess.CompletedProcess[str]:
+    def run_replay(self, *arguments: str, script: str = "") -> subprocess.CompletedProcess[str]:
         environment = os.environ.copy()
         environment.update(HOME=str(self.root), USAGE_STATE_DIR=str(self.state), PYTHONDONTWRITEBYTECODE="1")
         command = ([sys.executable, "-c", script] if script else
                    [sys.executable, "-m", "scripts.usage.compaction_replay"])
-        result = subprocess.run([*command, "--db", str(self.db_path), *arguments],
-                                cwd=REPOSITORY, env=environment, capture_output=True,
-                                text=True, check=False, timeout=15)
+        return subprocess.run([*command, "--db", str(self.db_path), *arguments],
+                              cwd=REPOSITORY, env=environment, capture_output=True,
+                              text=True, check=False, timeout=15)
+
+    def replay(self, *arguments: str, script: str = "") -> subprocess.CompletedProcess[str]:
+        result = self.run_replay(*arguments, script=script)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stderr, "")
         return result
+
+    def assert_replay_refused(self, *arguments: str, exit_status: int, reason: str) -> None:
+        result = self.run_replay(*arguments)
+        self.assertEqual(result.returncode, exit_status, result.stderr)
+        self.assertEqual(result.stdout, "")
+        self.assertEqual(result.stderr, f"compaction_replay: {reason}\n")
+        self.assertEqual(len(result.stderr.splitlines()), 1)
+
+    def assert_store_preserved_on_refusal(self, *arguments: str, exit_status: int, reason: str) -> None:
+        before = self.db_path.read_bytes()
+        self.assert_replay_refused(*arguments, exit_status=exit_status, reason=reason)
+        self.assertEqual(self.db_path.read_bytes(), before)
+
+    def test_equal_bounds_are_refused_without_changing_the_store(self) -> None:
+        self.assert_store_preserved_on_refusal(
+            "--since", "2026-10-11", "--until", "2026-10-11", exit_status=2,
+            reason="invalid bounds; accepted: --since earlier than --until (inclusive start, exclusive end)")
+
+    def test_reversed_bounds_are_refused_without_changing_the_store(self) -> None:
+        self.assert_store_preserved_on_refusal(
+            "--since", "2026-10-12", "--until", "2026-10-11", exit_status=2,
+            reason="invalid bounds; accepted: --since earlier than --until (inclusive start, exclusive end)")
+
+    def test_negative_follow_up_prompt_is_refused_without_changing_the_store(self) -> None:
+        self.assert_store_preserved_on_refusal(
+            "--follow-up-prompt", "-1", exit_status=2,
+            reason="follow-up prompt must be a finite nonnegative token count")
+
+    def test_nan_follow_up_prompt_is_refused_without_changing_the_store(self) -> None:
+        self.assert_store_preserved_on_refusal(
+            "--follow-up-prompt", "nan", exit_status=2,
+            reason="follow-up prompt must be a finite nonnegative token count")
+
+    def test_infinite_follow_up_prompt_is_refused_without_changing_the_store(self) -> None:
+        self.assert_store_preserved_on_refusal(
+            "--follow-up-prompt", "inf", exit_status=2,
+            reason="follow-up prompt must be a finite nonnegative token count")
+
+    def test_older_store_is_refused_without_changing_its_bytes(self) -> None:
+        version = collect.STORE_VERSION - 1
+        with closing(sqlite3.connect(self.db_path)) as db:
+            _ = db.execute(f"PRAGMA user_version = {version}")
+        self.assert_store_preserved_on_refusal(
+            exit_status=1,
+            reason=f"store version {version} is older than report version {collect.STORE_VERSION}; "
+            + "run the collector once")
+
+    def test_non_sqlite_file_is_refused_without_changing_its_bytes(self) -> None:
+        _ = self.db_path.write_bytes(b"invented file, not a SQLite store\n")
+        self.assert_store_preserved_on_refusal(exit_status=1, reason="file is not a database")
+
+    def test_missing_store_is_refused_without_creating_a_file(self) -> None:
+        self.db_path.unlink()
+        self.assertFalse(self.db_path.exists())
+        self.assert_replay_refused(exit_status=1, reason="unable to open database file")
+        self.assertFalse(self.db_path.exists())
 
     def hand_thread(self, thread: str = "hand", *, day: int = 10) -> None:
         # At one timestamp, :100 precedes :20 as TEXT. Insert them in reverse order.
