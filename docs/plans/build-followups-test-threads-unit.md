@@ -174,30 +174,41 @@ Build holds inside W stay in the readout (they reach both arms): hana's on 2026-
 
 ### Phase 4 — The local lint covers what CI's Clippy job covers  · status: done
 
-#### Work Order
+#### As-built
 
-**Goal:** `verify.sh lint` runs clippy with the targets and features CI's Clippy job uses, so code behind a non-default feature, a bench and an example fail locally before CI, and the cost on hana is measured before and after.
+- `verify.sh lint` runs `invoke_clippy --workspace --all-targets --all-features` (`-- -D warnings`), the command of CI's `clippy` job and of `scripts/release/pre_release_checks.sh`. It takes no `FEATURE_FLAGS`; a trailing `--features` still reaches mend and rustdoc. CI's Windows-target pass stays CI's alone. `check`, `test`, `example`, `final`, mend, fmt and rustdoc keep their scope.
+- The `lint` arm also runs `taplo fmt --check` from the workspace root (`workspace_root` from `cargo metadata`), so taplo loads the workspace `taplo.toml`. An unformatted `.toml` fails lint, the output names the file, and the failure is cached like any lint failure.
+- `require_taplo` exits 2 with `taplo is required` when taplo is missing. A taplo panic (exit 101) exits 3 on macOS, with a message to re-run with the sandbox disabled, and exits 2 elsewhere. Tooling failures are never cached.
+- `scripts/lint/invoke.sh` admits taplo without the build-hold wait or the memory gate: `buildlog_step_compiles` returns 1 for `taplo`.
+- The header, usage and comments in `verify.sh` describe the CI-scope clippy and the taplo stage.
 
-**Spec:**
-- In the `lint` arm of `scripts/delegate/verify.sh`, the clippy stage becomes `invoke_clippy --workspace --all-targets --all-features`. It takes no `FEATURE_FLAGS`: `--all-features` covers a trailing `--features`, which still reaches mend and rustdoc.
-- This is CI's command. Job `clippy` in `~/rust/hana/.github/workflows/ci.yml` runs `cargo clippy --workspace --all-targets --all-features -- -D warnings`, the other repos' workflows hold the same line, and `scripts/release/pre_release_checks.sh` already runs it at the push gate, so the dev loop and the push gate share one all-features set of check artifacts. CI's second pass, for the Windows target, stays CI's alone.
-- The `lint` arm also runs `taplo fmt --check` from the workspace root, the check form of the step `scripts/validate_and_push/validate_ci.sh` runs (`run_autofix_step "taplo" taplo fmt`), so taplo loads the same workspace `taplo.toml`; an unformatted `.toml` fails lint and the output names the file. Source: the showrunner, 2026-10-12 (reported by the cargo-liner showrunner): a unit's `.toml` edits pass lint and are reformatted into a separate fix commit at merge, as 933ab2ce did to cargo-tile's theme files. Tests pin it like the clippy stage: a stand-in `taplo` records its argv and working directory, and a failing stand-in fails `lint`.
-- `check`, `test`, `example`, `final`, mend, fmt and rustdoc keep their scope. The `example` verb stays: one example, while iterating.
-- Comments and usage in `verify.sh` say what is true after the change: the header (the dev-loop target pinning, `Nothing below final uses --all-targets`, `with default features`), the `lint` and `--features` usage lines, the comment in `compose_nextest_args` on what the lint half compiles under clippy, and the `example` arm's `lint never sees an example`.
-- Tests run the real `verify.sh` with a stand-in `cargo` that answers `cargo metadata` from synthetic JSON and records each call's argv (the pattern in `scripts/delegate/test_verify_mac_offload.py`; `test_verify_release_ack.py` stubs the lint-config reader and silences skip notices, so it does not fit), and the real lint-config reader over a temporary `lint.conf`: `lint <pkg>` gives clippy exactly `--workspace --all-targets --all-features -- -D warnings`; `lint <pkg> --features a` gives clippy the same argv and gives mend and rustdoc the qualified `--features`; `example` argv is unchanged; with clippy off in `lint.conf` the skip line names the new command.
-- The unit director measures, after the seats finish; no seat runs this. In a detached scratch worktree of `~/rust/hana`, removed after:
-  - At hana's main tip, `verify.sh lint hana --no-cache` with `~/.claude` main's script (before) and with this branch's script (after); every measured run passes `--no-cache`, because touching a file leaves the content-based pass key unchanged and a cached pass replays without running clippy. For each: one run, then one more after touching one source file under `crates/hana` (the dev-loop case). The after script's first run also pays the one-time all-features dependency check; report it apart.
-  - At `af5958758eebabca33a6123bfbfb38809be0c29b` (hana `init/catalyst`, CI run 38306974911): the before script passes and the after script fails on the missing `#[must_use]` in hana_diegetic's `bench_support`.
-  - Per run: the `clippy` step's `duration_s`, `finished_s` and `mem_wait_s` from the build log, its anon peak from `anon_peaks.jsonl` by `call_id`, and the gate's reservation `memory_admit.expected_peak("hana", "clippy", "natedev", …)` before and after. The table goes in the As-built and the checkpoint notice.
-- A touched-file lint that takes more than twice as long, or an anon peak more than 2 GiB higher, goes to natedev with the table before the checkpoint, beside the narrower choice: the dev-loop lint unchanged and CI's clippy run once per checkpoint by the unit director (natedev confirmed the two limits and the scratch worktree, 2026-10-12).
+Measured on a scratch hana worktree, 2026-10-13 04:58–05:21 UTC, `verify.sh lint hana --no-cache`, clippy step (memory wait 0 in every run):
+
+| run | script | duration s | finished s | anon peak GiB | result |
+| --- | --- | --- | --- | --- | --- |
+| hana main, first | before | 127.8 | 127.0 | 4.00 | pass |
+| hana main, touched file | before | 15.2 | 14.9 | 2.84 | pass |
+| hana main, first (pays the all-features dependency check) | after | 159.2 | 158.0 | 3.98 | pass |
+| hana main, touched file | after | 52.8 | 52.5 | 2.77 | pass |
+| `af59587` | before | 148.7 | 148.0 | 4.72 | pass |
+| `af59587` | after | 261.5 | — | — | fails: missing `#[must_use]` in hana_diegetic's `bench_support` |
+
+`memory_admit.expected_peak("hana", "clippy", "natedev", …)`: 6457290752 B before (n=1179), 6451798016 B after (n=1191).
+
+The touched-file lint is 3.5× slower, past the plan's 2× limit; the anon peak is not higher. The showrunner kept CI's scope on 2026-10-13: one lint that fails where CI fails is simpler, and a CI round trip costs far more than 37 s per lint.
 
 **Files:**
-- `scripts/delegate/verify.sh` — the clippy stage, the comments and the usage text.
-- `scripts/delegate/test_verify_lint_scope.py` — the tests, a new file.
-- `docs/plans/build-followups-test-threads-unit.md` — the As-built.
+- `scripts/delegate/verify.sh` — the CI-scope clippy stage, the taplo stage with `require_taplo` and panic handling, the comments and usage.
+- `scripts/lint/invoke.sh` — `buildlog_step_compiles` excludes taplo from the build-hold wait and the memory gate.
+- `scripts/delegate/test_verify_lint_scope.py` — stand-in `cargo` and `taplo` over the real `verify.sh`: clippy argv, `--features` routing, `example` scope, the clippy-off skip line, taplo argv and working directory (including from a member directory), the failing file named, missing taplo and Linux/macOS panics not cached, unformatted TOML cached.
+- `scripts/delegate/test_verify_mac_offload.py` — its `cargo metadata` fixture carries `workspace_root` and a stand-in taplo.
+- `scripts/lint/test_invoke_scope.py` — `BuildAdmissionTests`: taplo never calls the hold or the memory gate.
 
-**Seats:** `1 writer + 1 tester` — `impl` owns `verify.sh`; `test` owns `test_verify_lint_scope.py`.
+**Gotchas:**
+- `verify.sh`'s pass key hashes content, so touching a file replays a cached pass; a measured run passes `--no-cache`.
+- Under `--all-features` hana pulls `bevy/hotpatching`, so the first lint after the change checks the bevy tree a second time.
+- Any `verify.sh` test fixture that runs `lint` needs `workspace_root` in its `cargo metadata` answer and a `taplo` on `PATH`.
 
-**Constraints from prior phases:** Source: natedev, 2026-10-12, from hana: CI run 38306974911 failed Clippy on code behind the non-default feature `bench_support`, which `lint`'s `--workspace --lib --bins --tests` with default features never compiles. Phase 3: merge `build-followups` into the branch first; build-report's phases 2, 3, 5 and 10 changed `verify.sh`. Phase 3's verdict was revert: `invoke.sh` runs nextest at `logical` width, the rollout phase is dropped, and the trial's hash freeze on `memory_admit.py` and `width_trial.py` ended with that readout. This phase edits neither: the clippy reservation key is unchanged, so the gate learns the wider peak from its own records. hana's features that reach dependencies under `--all-features`: `hana/hotpatching` (`bevy/hotpatching`), `tween` (`dep:bevy_tween`), `monitor-probe` (`dep:tracing`), `hana_video/test` (`zbus/bus-impl`, `zbus/p2p`); the first means a second check of the bevy tree. `verify.sh`'s pass key hashes these scripts, so every recorded lint pass misses once after the change. `verify.sh` waits out a natedev build hold by itself. Delegation Context's line numbers in `verify.sh` and `invoke.sh` predate build-report's changes and this plan's width code (`run_nextest` now picks the width before it calls nextest); find each place by name. The same gap outside this phase, sent to natedev: `scripts/lint/lint clippy` (`/clippy`, the fix pipeline) passes `--all-targets` with the caller's features, and `verify.sh test` runs default features where CI's nextest runs `--all-features`.
+**Ruled out:**
+- Keeping the dev-loop lint narrow and running CI's clippy once per checkpoint: two lints, one of which passes where CI fails.
 
-**Acceptance gate:** `python3 -m unittest discover -s scripts/delegate -p 'test_verify_lint_scope.py'` and `python3 -m unittest discover -s scripts/delegate -p 'test_*.py'` green; basedpyright clean on the new file; `bash -n scripts/delegate/verify.sh`; the after script passes on hana's main tip and fails on `af59587` as the Spec says; the As-built holds the before and after table.
