@@ -125,6 +125,8 @@ def showrunner(
         kind="showrunner",
         host=inventory.TmuxHost(
             kind="tmux",
+            server=inventory.TmuxServerNotRecorded(kind="not recorded"),
+            session_ref=inventory.TmuxSessionIdNotRecorded(kind="not recorded"),
             tmux_session=f"tmux-{session_id}",
             pane=inventory.PaneNotRecorded(kind="not recorded"),
         ),

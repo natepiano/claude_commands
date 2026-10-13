@@ -141,6 +141,8 @@ def showrunner(
         kind="showrunner",
         host=inventory.TmuxHost(
             kind="tmux",
+            server=inventory.TmuxServerNotRecorded(kind="not recorded"),
+            session_ref=inventory.TmuxSessionIdNotRecorded(kind="not recorded"),
             tmux_session=name,
             pane=inventory.PaneNotRecorded(kind="not recorded"),
         ),
@@ -248,6 +250,8 @@ class SettleTests(ShutdownTestCase):
     def test_screen_targets_owner_pane_when_other_pane_shows_usage_limit(self) -> None:
         owner = showrunner("owner", "Owner")
         owner["host"] = inventory.TmuxHost(kind="tmux", tmux_session="shared",
+            server=inventory.TmuxServerNotRecorded(kind="not recorded"),
+            session_ref=inventory.TmuxSessionIdNotRecorded(kind="not recorded"),
             pane=inventory.PaneNotRecorded(kind="not recorded"))
         self.write_owner_pane(owner, "shared:@2.%5")
         other = showrunner("other", "Other")
@@ -718,7 +722,12 @@ class SettleTests(ShutdownTestCase):
             self.assertRaises(PassObserved),
         ):
             _ = settle.conduct(LOGIN)
-        wait.assert_called_once_with(frozenset({"first", "second"}), restart_work.SESSION_WAIT_SECONDS)
+        confirmed: list[str] = []
+        for call in wait.call_args_list:
+            ids = cast(frozenset[str], call.args[0])
+            self.assertEqual(call.args[1], restart_work.SESSION_WAIT_SECONDS)
+            confirmed.extend(ids)
+        self.assertCountEqual(confirmed, ["first", "second"])
 
     def test_conductor_archives_restarted_without_launching_and_clears_only_its_hold(self) -> None:
         done = session_shutdown(top_level("done", "Done"), progress={"kind": "restarted", "at": NOW})

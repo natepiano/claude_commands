@@ -163,7 +163,7 @@ def send_release_text(title: str, message: str) -> bool:
         ["python3", str(sender), "--to", "user", "--need", "note",
          "--action", "Tell natedev to bump Rust or wait.",
          "--summary", title, "--text", message],
-        capture_output=True, text=True, timeout=30, stdin=subprocess.DEVNULL,
+        capture_output=True, text=True, timeout=60, stdin=subprocess.DEVNULL,
     )
     return result.returncode == 0
 

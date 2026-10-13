@@ -667,3 +667,22 @@ It drops the "any cargo, rustc or nextest running on the Mac" check. That check 
 **Gotchas:**
 - The test stand-in answers "not an ancestor" when the sha equals the clone head, where git answers "is an ancestor"; the older bundle-path cases depend on that.
 - Live checks of `mac_run.sh` use a commit on `origin/init/catalyst` until it merges into hana's `main`.
+
+### Phase 19 — A session that holds natedev can still launch its own apps  · status: done
+
+#### As-built
+
+- `holds_only_own(owner, directory) -> bool` in `build_targets.py` reads `build_hold.natedev_holds(directory)` and the caller's key `holder_path(directory, owner.session_id).name` inside one `try`; a `ValueError` from either answers False. It is True only when a hold is in force and every hold in force carries the caller's key. A hold file's name is its holder's Claude session id, so no field was added to the file.
+- `command_check_local()` returns 0 with no output and no write when the owning session `holds_only_own`, before `read_admission` and `register_wait`. Every other case keeps its old answer: another session's hold, a second session's hold beside the caller's, a hold placed under a name, holds already releasing (the `read_admission` path), and errors (exit 12). The launch hook is unchanged: it already passes the hook input's session id.
+
+**Files:**
+- `scripts/build_targets/build_targets.py` — `holds_only_own` and its call in `command_check_local`.
+- `scripts/build_targets/test_build_targets.py` — `check_launch(session_id)`; the holder admitted with records unchanged, another session refused, the holder refused beside another session's hold, a hold under a name refusing every session, and `test_holder_session_launch_is_refused_when_the_release_record_names_an_unusable_holder`.
+- `scripts/hooks/test_brp_launch_gate.py` — `prepare_hold_before_release()`; the holder's session passes with no deny answer, another session is denied with no memory wait or mark.
+- `docs/as-built/build-memory-admission.md` — one sentence in the BRP launches paragraph.
+
+**Gotchas:**
+- `holders_in_force` resolves every release-record holder key through `holder_path`, which raises `ValueError` on a key such as `.`; a new reader of `natedev_holds` catches it.
+- A hold placed under a name that is no live session keys its file by that name, so no session matches it and every launch waits for the release.
+
+**Ruled out:** a session-id field in the hold file (the file name already is the session id); admitting the holder while another session's hold is also in force (it would break that session's timing).
