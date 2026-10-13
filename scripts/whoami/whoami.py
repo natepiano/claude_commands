@@ -20,7 +20,7 @@ from user_zone import user_zone  # noqa: E402
 def reset_time(value: datetime | None) -> str:
     if value is None:
         return "unavailable"
-    return value.astimezone().strftime("%a %Y-%m-%d %H:%M %Z")
+    return value.astimezone(user_zone()).strftime("%a %Y-%m-%d %H:%M %Z")
 
 
 def quota_line(quota: Quota) -> str:

@@ -25,7 +25,7 @@ phase_table.py archive --production-doc <doc>
 progress_history.py eta --session-dir <dir> --time <YYYY-MM-DDTHH:MM> [--earliest <YYYY-MM-DDTHH:MM> --latest <YYYY-MM-DDTHH:MM>] --basis <text>
 ```
 
-`show` takes exactly one of `--session-dir` and `--production-doc`. With `--session-dir` it prints Markdown, or JSON under `--json`, in `--zone`; the default zone is `TZ`, then the machine's. With `--production-doc` it always prints JSON in the production doc's **User zone**. `NoState`, `NoPlan`, a `Refusal` or an unknown zone prints one line on stderr and exits 1.
+`show` takes exactly one of `--session-dir` and `--production-doc`. With `--session-dir` it prints Markdown, or JSON under `--json`, in `--zone`; the default zone is the user's zone setting (`scripts/lib/user_zone.py`). With `--production-doc` it always prints JSON in the production doc's **User zone**. `NoState`, `NoPlan`, a `Refusal` or an unknown zone prints one line on stderr and exits 1.
 
 ### The record
 
@@ -116,7 +116,7 @@ phases[]     {phase, title, status: "done" | "running" | "todo", start, finish, 
 
 ### Recorder side
 
-- **`eta`.** Reads its times in the process `TZ`, requires an active phase, appends one `eta_stated` event through `_append_event`, runs the hook, and prints `ETA recorded: <HH:MM zone>`. Beside the fields every event carries, the event holds `eta_at`, `basis` (stripped) and, with a range, `eta_earliest_at` and `eta_latest_at`, all times as epochs. It exits 2 with one stderr line for a malformed time, a time in the past, a time inside the hour the local clock skips, `--earliest` after `--time`, `--latest` before it, one range end alone, a blank `--basis`, or no active phase.
+- **`eta`.** Reads its times in the process `TZ`, or in the user's zone setting when `TZ` is unset, requires an active phase, appends one `eta_stated` event through `_append_event`, runs the hook, and prints `ETA recorded: <HH:MM zone>`. Beside the fields every event carries, the event holds `eta_at`, `basis` (stripped) and, with a range, `eta_earliest_at` and `eta_latest_at`, all times as epochs. It exits 2 with one stderr line for a malformed time, a time in the past, a time inside the hour the local clock skips, `--earliest` after `--time`, `--latest` before it, one range end alone, a blank `--basis`, or no active phase.
 - **Hook.** `_refresh_phase_table(session_dir)` is the last act of `_start_phase`, `_progress`, `_finish_phase` and `_finish_run`, and follows the append in `_eta`. It returns at once unless the state's plan file contains `> **Production:`. Otherwise it runs `phase_table.py refresh` beside it under `sys.executable`, with a 10 s timeout and stdout discarded. A non-zero exit, a timeout or an `OSError` prints one stderr line, `phase table not written: <reason>`.
 - **Public readers.** `plan_phases`, `plan_runs`, `eta_band_seconds(percent, elapsed, spread) -> EtaBand | EtaProjectionUnavailable` (`EtaBand`: `remaining`, `earliest`, `latest`, in seconds), `percent_spread`, `now_epoch` and `resolve_plan_path`.
 - **Command files.** `commands/unit/report.md` step 5 says the `progress` call rewrites the note and that a requested table is `phase_table.py show --session-dir "${SESSION_DIR}" --zone <User zone>`. `commands/unit/eta.md` records the ETA, range and basis before the answer is sent, as `TZ=<User zone> python3 ~/.claude/scripts/delegate/progress_history.py eta …`. `commands/unit/eta_breakdown.md` runs the same command, with the bullets' last end time and no range, when the breakdown moves the ETA.
@@ -155,7 +155,7 @@ record_eta_range(target, earliest, latest, source, rendered_time, now) -> Render
 - `PLAN_DELEGATE_HISTORY_DIR`: the recorder's history root (`_history_root`), default `~/.local/state/plan-delegate`; run files sit in its `runs/`. `PLAN_DELEGATE_NOW_EPOCH` replaces the clock (`now_epoch`).
 - `NOTIFIER_STATE_DIR`, `NOTIFIER_SESSIONS_DIR`: where `scripts/production/showrunners.py` finds a showrunner, defaults `~/.local/state/notifier` and `~/.claude/sessions`.
 - `DAILIES_PHASE_TABLE`: the table script the dailies builder calls (`phase_table_path`), default `scripts/delegate/phase_table.py`.
-- `TZ`: the zone of `eta`'s typed times, and `show`'s default zone.
+- `TZ`: the zone of `eta`'s typed times; unset, the user's zone setting. `show` no longer reads it.
 
 ## Invariants
 
@@ -185,7 +185,7 @@ record_eta_range(target, earliest, latest, source, rendered_time, now) -> Render
 - A unit that stated an ETA, ran past it and reported no percent has `current.eta` `null` with a first target present. The dailies read that as `EtaPassed`, which asks for a new ETA once; with no first target it is `EtaNone`.
 - A stated ETA with no progress report has `current.percent` `null` and stays record-backed. `basis` is never blank and may hold `|` or line breaks. A predicted row's JSON `status` is `todo`; only the Markdown says `predicted`.
 - `show --production-doc` reads neither `--zone` nor `--json`. It turns only an unreadable plan into `unavailable`; an unreadable production doc fails the whole call.
-- The machine's zone is Eastern and the User zone is Pacific: an `eta` call with no `TZ` reads a typed time three hours off. `eta.md` and `eta_breakdown.md` call the recorder installed under `~/.claude`, so a recorder change reaches them only once it is on main.
+- An `eta` call with no `TZ` reads a typed time in the user's zone setting, never the machine's zone (2026-10-12). `eta.md` and `eta_breakdown.md` call the recorder installed under `~/.claude`, so a recorder change reaches them only once it is on main.
 - `scripts/production/showrunners.py` reads its two directories once, at import. A test that runs `refresh` in a subprocess sets them in the child's environment; a test that calls `phase_table.main()` in process patches the module constants. `scripts/production/fake_showrunner.py` (`write_timer`, `write_session`) supplies the running showrunner a note needs.
 - `add_unit.py` imports its siblings by bare name, so `phase_table.py` puts `scripts/production` on `sys.path` before its `scripts.production` imports. The form type-checks with no ignore and runs from any working directory.
 - A vault on a file system without hard links refuses a note's first write with one line. A showrunner name of `.` or `..`, or one holding `/` or NUL, is refused.

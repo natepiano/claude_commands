@@ -43,7 +43,8 @@
     {
       "root": "scripts/fix",
       "extraPaths": [
-        "scripts/fix"
+        "scripts/fix",
+        "scripts/lib"
       ]
     },
     {
@@ -97,7 +98,8 @@
       "extraPaths": [
         "scripts/mac_test",
         "scripts/build_hold",
-        "scripts/lint"
+        "scripts/lint",
+        "scripts/lib"
       ]
     },
     {
@@ -107,7 +109,8 @@
         "scripts/build_hold",
         "scripts/mac_test",
         "scripts/lint",
-        "scripts/message"
+        "scripts/message",
+        "scripts/lib"
       ]
     },
     {

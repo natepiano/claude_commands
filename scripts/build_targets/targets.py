@@ -12,7 +12,7 @@ from typing import Literal
 
 
 SCRIPTS = Path(__file__).resolve().parent.parent
-for directory in ("build_hold", "mac_test", "lint"):
+for directory in ("build_hold", "mac_test", "lint", "lib"):
     sys.path.insert(0, str(SCRIPTS / directory))
 import build_hold
 import mac_test

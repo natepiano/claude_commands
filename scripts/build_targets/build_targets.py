@@ -39,6 +39,7 @@ from targets import (
 import offload
 import build_hold
 import override_guard
+from user_zone import user_zone
 
 
 
@@ -69,7 +70,7 @@ class CliArguments(argparse.Namespace):
 
 
 def local_time(instant: datetime) -> str:
-    return instant.astimezone().strftime("%H:%M %Z")
+    return instant.astimezone(user_zone()).strftime("%H:%M %Z")
 
 
 def display_field(value: str) -> str:

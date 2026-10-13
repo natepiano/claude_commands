@@ -756,7 +756,7 @@ def mib(size: int) -> str:
 
 
 def when(timestamp: float) -> str:
-    return datetime.fromtimestamp(timestamp).strftime("%Y-%m-%d %H:%M")
+    return datetime.fromtimestamp(timestamp, user_zone()).strftime("%Y-%m-%d %H:%M")
 
 
 def scan_roots(roots: list[str], trees: list[str]) -> Scan:
