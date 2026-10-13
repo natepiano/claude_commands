@@ -507,7 +507,7 @@ notice to the unit director before any merge command runs:
    line (`production_format.md` → <ProductionUnit/> item 3). The unit runs the
    check before sending; you do not repeat it.
    - **Fresh pass:** the line says `pass`, or names a follow-up phase for each
-     defect, from a fresh helper on exactly the notice's shots, built from the
+     defect, from a fresh check on exactly the notice's shots, built from the
      notice's hash. Merge.
    - **Missing or stale:** no line, other shots than the notice sends, or a
      build from before a later change to what users see. Run <DesignCheck/>

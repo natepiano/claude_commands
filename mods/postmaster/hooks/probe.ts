@@ -1,16 +1,11 @@
-export type SessionDestination = string | { sessionId: string };
+import type { EngineInterface, SessionSendAddress, SessionStartInput, SessionReceiveInput } from "claude-code";
+
 export type ProbeCalls = {
-  env: { get(name: string): Promise<unknown> };
-  fs: {
-    read(path: string): Promise<unknown>;
-    write(path: string, text: string): Promise<unknown>;
-    exists(path: string): Promise<unknown>;
-    list(path: string): Promise<unknown>;
+  env: Pick<EngineInterface["env"], "get">;
+  fs: Pick<EngineInterface["fs"], "write" | "exists" | "list"> & {
+    read(path: string): ReturnType<EngineInterface["fs"]["read"]>;
   };
-  session: {
-    id(): Promise<unknown>;
-    send(message: { to: SessionDestination; text: string }): Promise<unknown>;
-  };
+  session: Pick<EngineInterface["session"], "id" | "send">;
 };
 type EnvironmentSetting =
   | { status: "found"; value: string; source: string }
@@ -103,7 +98,7 @@ async function environment(api: ProbeCalls, name: string): Promise<EnvironmentRe
   return { setting, engine_answer };
 }
 
-async function sessionIdentity(api: ProbeCalls, event: unknown): Promise<SessionIdentity> {
+async function sessionIdentity(api: ProbeCalls, event: SessionStartInput): Promise<SessionIdentity> {
   let reason = "$.session.id() has no nonempty string value";
   try {
     const value = await api.session.id();
@@ -167,7 +162,7 @@ function request(value: unknown): ProbeRequest {
   return value as ProbeRequest;
 }
 
-async function send(probe: Probe, to: SessionDestination, text: string): Promise<StepResult> {
+async function send(probe: Probe, to: SessionSendAddress, text: string): Promise<StepResult> {
   const started_ms = Date.now();
   try {
     const answer = await probe.api.session.send({ to, text });
@@ -293,7 +288,7 @@ async function poll(probe: Probe): Promise<void> {
   await flush(probe);
 }
 
-export async function start(api: ProbeCalls, event: unknown): Promise<void> {
+export async function start(api: ProbeCalls, event: SessionStartInput): Promise<void> {
   if (lifecycle.status === "running") {
     const probe = lifecycle.probe;
     queue(probe, "start", "start", { ok: true, detail: { session_id: probe.session.status === "found" ? probe.session.value : null, already_running: true } });
@@ -343,7 +338,7 @@ export async function start(api: ProbeCalls, event: unknown): Promise<void> {
   await flush(probe);
 }
 
-export async function receive(event: unknown): Promise<ReceiveDisposition> {
+export async function receive(event: SessionReceiveInput): Promise<ReceiveDisposition> {
   if (lifecycle.status !== "running") return { status: "pass" };
   const probe = lifecycle.probe;
   const text = member(event, "text");

@@ -750,21 +750,29 @@ def _registered_productions() -> tuple[dict[str, ProductionSession], list[showru
 
 
 def _unit_sessions(runners: list[showrunners.Showrunner]) -> dict[str, UnitMarks]:
+    """Each running unit director of a registered production, by session id.
+
+    One read of every production's marks (`unit_lookup.every_marked_unit`) serves them all. A
+    production with no showrunner timer has no doc to restart its units from, so its units are not
+    counted here; a production whose marks are at fault is left out by the lookup.
+    """
+    try:
+        every = unit_lookup.every_marked_unit()
+    except OSError:
+        return {}
+    docs = {runner["slug"]: runner["doc"] for runner in runners}
     found: dict[str, UnitMarks] = {}
-    for runner in runners:
-        slug = runner["slug"]
-        try:
-            marked = unit_lookup.marked_units(slug)
-        except OSError:
+    for slug, units in every.units.items():
+        if slug not in docs:
             continue
-        for unit_id, marked_unit in marked.items():
+        for unit_id, marked_unit in units.items():
             claude = marked_unit.claude
             if not isinstance(claude, unit_lookup.LiveClaude):
                 continue
             found[claude.session_id] = UnitMarks(
                 production=slug,
                 unit=unit_id,
-                doc=runner["doc"],
+                doc=docs[slug],
                 tmux_session=marked_unit.label,
             )
     return found
