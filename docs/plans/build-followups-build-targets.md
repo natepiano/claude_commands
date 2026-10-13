@@ -651,3 +651,19 @@ It drops the "any cargo, rustc or nextest running on the Mac" check. That check 
 - On a machine that never held, the holder directory is missing, so steps keep starting Python until the first hold creates it.
 
 **Ruled out:** an end mark written by `release_cycle` for the shell to read — it changes `build_hold.py` and the record for no gain.
+
+### Phase 18 — The Mac run starts when the Mac's clone already holds the asked-for commit  · status: done
+
+#### As-built
+
+- `mac_run.sh` asks `git merge-base --is-ancestor <sha> <clone head>` right after reading the clone's head. When the clone already holds the commit (the sha equal to the head included), one ssh call runs `git -C <clone> checkout -q --detach <sha>`: no bundle, no `scp`, no fetch, and no temporary file or `refs/mac-run/tip` ref. Before, git refused to make an empty bundle and the run exited 4. A clone head natedev lacks, or any other answer, keeps the bundle path unchanged. The `HEAD=` line and the wrong-tree check follow either path.
+- Live check 2026-10-13: on `ce51498c`, an ancestor of the clone head, the ship step reached `HEAD=ce51498c` with nothing sent (hana at that commit then exits 1 on the Mac, a sampler limit fixed on `origin/init/catalyst`); on `46b8c87e`, equal to the clone head, the run exited 0.
+
+**Files:**
+- `scripts/production/mac_run.sh` — the ancestor check and the direct checkout in the ship step.
+- `scripts/production/test_mac_run.py` — `test_ancestor_of_the_clone_head_checks_out_without_a_bundle`; the command stand-in answers `merge-base` and refuses an empty bundle when `MAC_RUN_CLONE_DESCENDANT` is set.
+- `docs/as-built/mac-test-offload.md` — one sentence in the `mac_run.sh` section.
+
+**Gotchas:**
+- The test stand-in answers "not an ancestor" when the sha equals the clone head, where git answers "is an ancestor"; the older bundle-path cases depend on that.
+- Live checks of `mac_run.sh` use a commit on `origin/init/catalyst` until it merges into hana's `main`.
