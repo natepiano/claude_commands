@@ -10,11 +10,12 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from collections.abc import Iterator
 from contextlib import redirect_stderr, redirect_stdout
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import NotRequired, TypedDict, cast, override
+from typing import Callable, NotRequired, TypedDict, cast, override
 from unittest.mock import patch
 
 # The work order requires a bare sibling import for unittest discovery.
@@ -25,6 +26,7 @@ class CommandResponse(TypedDict):
     stdout: str
     code: int
     stderr: NotRequired[str]
+    write_files: NotRequired[dict[str, str]]
 
 
 class PaneDetails(TypedDict):
@@ -80,6 +82,23 @@ class AgentDetails(TypedDict):
     pane_id: str
     agent: str
     agent_status: str
+    interactive_ready: NotRequired[bool]
+
+
+class WorkerReadinessDetails(TypedDict):
+    pane_id: str
+    agent: str
+    agent_status: str
+    interactive_ready: bool
+
+
+class WorkerReadinessResult(TypedDict):
+    agent: WorkerReadinessDetails
+
+
+class WorkerReadinessResponse(TypedDict):
+    ok: bool
+    result: WorkerReadinessResult
 
 
 class AgentListResult(TypedDict):
@@ -108,6 +127,48 @@ class AgentErrorDetail(TypedDict):
 class AgentErrorResponse(TypedDict):
     ok: bool
     error: AgentErrorDetail
+
+
+class CodexDaemonIdentity(TypedDict):
+    pid: int
+    start_time: int
+
+
+class CodexDaemonBaselineResources(TypedDict):
+    systemd_units: list[str]
+    codex_daemons_before: list[CodexDaemonIdentity]
+
+
+class LaunchStartedResources(CodexDaemonBaselineResources):
+    codex_daemons_started: list[CodexDaemonIdentity]
+
+
+class WorkspaceListResult(TypedDict):
+    workspaces: list[CreatedWorkspace]
+
+
+class WorkspaceListResponse(TypedDict):
+    ok: bool
+    result: WorkspaceListResult
+
+
+class TabCreationResult(TypedDict):
+    tab: CreatedTab
+    root_pane: NewRootPane
+
+
+class TabCreationResponse(TypedDict):
+    ok: bool
+    result: TabCreationResult
+
+
+class PaneSplitResult(TypedDict):
+    pane: NewRootPane
+
+
+class PaneSplitResponse(TypedDict):
+    ok: bool
+    result: PaneSplitResult
 
 
 class StartedUnits(TypedDict):
@@ -197,6 +258,8 @@ class TrialTests(unittest.TestCase):
             "HERDR_BIN": str(self.fake),
             "HERDR_TRIAL_SYSTEMD_RUN": str(self.fake),
             "HERDR_TRIAL_SYSTEMCTL": str(self.fake),
+            "HERDR_TRIAL_KDOTOOL": str(self.fake),
+            "HERDR_TRIAL_TERMINAL": "/fixture/ghostty",
             "HERDR_TRIAL_GIT": GIT_BINARY,
             "HERDR_TRIAL_ROOT": str(self.scratch),
             "HERDR_TRIAL_START_TIMEOUT": "0.5",
@@ -214,6 +277,7 @@ class TrialTests(unittest.TestCase):
             # An omitted tool override must fail instead of reaching a real tool.
             "PATH": str(self.root / "no-external-programs"),
         }, clear=True)))
+        self.configure(["search", "--name", "^herdr-trial$"], "window-17\n")
 
     def configure(self, arguments: list[str], stdout: str = "", code: int = 0,
                   stderr: str = "") -> None:
@@ -275,6 +339,45 @@ class TrialTests(unittest.TestCase):
         self.configure(herdr_args("agent", "wait", pane_id, "--timeout", str(timeout)),
                        json.dumps(response))
 
+    def worker_state(self, pane_id: str, state: str = "idle", ready: bool = True) -> None:
+        response: WorkerReadinessResponse = {"ok": True, "result": {"agent": {
+            "pane_id": pane_id, "agent": "codex", "agent_status": state,
+            "interactive_ready": ready,
+        }}}
+        self.configure(herdr_args("agent", "get", pane_id), json.dumps(response))
+
+    def working_response(self, pane_id: str, timeout: int = 60000) -> None:
+        response: SettledAgentResponse = {"ok": True, "result": {"agent": {
+            "pane_id": pane_id, "agent": "codex", "agent_status": "working",
+        }}}
+        self.configure(herdr_args("agent", "wait", pane_id, "--until", "working",
+                                  "--timeout", str(timeout)), json.dumps(response))
+
+    def work_fixture(self) -> tuple[str, Path, Path]:
+        pane = "w38:p71"
+        work_order = self.root / "turn-order.md"
+        _ = work_order.write_text("tiny Work Order\n")
+        self.pane_list([{"pane_id": pane, "label": "slug-unit-impl"}])
+        return pane, work_order, Path(str(work_order) + ".done")
+
+    def turn_start_timeout_response(self, pane: str, milliseconds: int) -> list[str]:
+        response: AgentErrorResponse = {"ok": False, "error": {
+            "code": "timeout", "message": "agent wait timed out before working",
+        }}
+        arguments = herdr_args("agent", "wait", pane, "--until", "working",
+                               "--timeout", str(milliseconds))
+        self.configure(arguments, code=1, stderr=json.dumps(response))
+        return arguments
+
+    def single_issue(self, label: str) -> IssueRecord:
+        lines = (self.scratch / "issues.jsonl").read_text().splitlines()
+        self.assertEqual(len(lines), 1)
+        issue = cast(IssueRecord, json.loads(lines[0]))
+        self.assertEqual(set(issue), {"time", "session", "expected", "happened"})
+        self.assertEqual(issue["session"], label)
+        self.assertEqual(datetime.fromisoformat(issue["time"]).utcoffset(), timedelta(0))
+        return issue
+
     def assert_blocked_issue(self, result: InvocationResult, label: str) -> None:
         self.assertEqual(result.code, 2, result.stderr)
         self.assertEqual(len(result.stderr.splitlines()), 1, result.stderr)
@@ -324,6 +427,480 @@ class TrialTests(unittest.TestCase):
     def pane_list(self, panes: list[PaneDetails]) -> None:
         response: PaneListResponse = {"ok": True, "result": {"panes": panes}}
         self.configure(herdr_args("pane", "list"), json.dumps(response))
+        for pane in panes:
+            if pane["label"] in {
+                "slug-unit-impl", "slug-unit-review", "clamp-unit-impl",
+                "clamp-unit-review", "count-unit-impl", "count-unit-review",
+            }:
+                self.worker_state(pane["pane_id"])
+                self.working_response(pane["pane_id"])
+
+    def launch_fixture(self, impl_family: str = "codex", review_family: str = "codex") -> None:
+        self.assert_success(self.invoke("scaffold"))
+        self.log.unlink(missing_ok=True)
+        proc = self.root / "proc-fixture"
+        proc.mkdir()
+        os.environ.update({
+            "HERDR_TRIAL_PROC": str(proc),
+            "HERDR_TRIAL_RESOLVE": str(self.fake),
+            "HERDR_TRIAL_CLAUDE_CONFIG_DIR": str(self.claude),
+            "HERDR_TRIAL_CODEX_HOME": str(self.codex),
+            "HERDR_TRIAL_START_TIMEOUT": "1200",
+            "CLAUDE_CALLER_SECRET": "must not reach a pane or herdr",
+            "CLAUDE_CODE_SESSION_ID": "unrelated-caller-session",
+        })
+        self.trust_configs({str(self.scratch / "repo"): True},
+                           {str(self.scratch / "repo"): "trusted"})
+        self.configure(herdr_args("status", "server"), "status: running\n")
+        response: WorkspaceListResponse = {"ok": True, "result": {"workspaces": []}}
+        self.configure(herdr_args("workspace", "list"), json.dumps(response))
+        for task, family, model, effort in (
+            ("production.director", "claude", "fixture-director", "high"),
+            ("delegate.impl", impl_family, "fixture-implementer", "medium"),
+            ("delegate.review", review_family, "fixture-reviewer", "low"),
+        ):
+            self.configure([task], f"task={task} family={family} agent={model} effort={effort} tier=priority\n")
+        _ = (self.scratch / "started.json").write_text(
+            '{"systemd_units": ["herdr-trial-server", "herdr-trial-client"]}\n')
+
+    def launch_panes(self) -> dict[str, str]:
+        panes = {"showrunner": "w79:p401"}
+        for index, unit in enumerate(("slug-unit", "clamp-unit", "count-unit")):
+            for offset, suffix in enumerate(("", "-impl", "-review")):
+                panes[unit + suffix] = f"w79:p{510 + index * 13 + offset}"
+        return panes
+
+    def trial_rule(self) -> str:
+        text = (self.scratch / "repo/docs/plans/herdr-fake-production.md").read_text()
+        return next(paragraph.strip() for paragraph in text.split("\n\n")
+                    if paragraph.startswith("Trial production:"))
+
+    def opening_text(self, label: str) -> str:
+        if label.endswith(("-impl", "-review")):
+            unit, role = label.rsplit("-", 1)
+            return (f"You are the {role} worker of {unit} in the herdr trial. "
+                    "Wait; your unit director will send you Work Orders.")
+        if label == "showrunner":
+            plan = self.scratch / "repo/docs/plans/herdr-fake-production.md"
+            command = "/showrunner:produce"
+        else:
+            plan = self.scratch / "worktrees" / label / "docs/plans" / f"herdr-fake-{label.removesuffix('-unit')}.md"
+            command = "/unit:direct"
+        return f"{command} {plan}\n\n{self.trial_rule()}"
+
+    def proc_process(self, pid: int, start_time: int, arguments: list[str],
+                     home: str, executable: Path) -> None:
+        directory = self.root / "proc-fixture" / str(pid)
+        directory.mkdir()
+        _ = (directory / "cmdline").write_bytes("\0".join(arguments).encode() + b"\0")
+        _ = (directory / "environ").write_bytes(f"CODEX_HOME={home}\0OTHER=fixture\0".encode())
+        # comm may contain spaces and parentheses; starttime is stat field 22.
+        fields = ["S", *["0"] * 18, str(start_time), "0"]
+        _ = (directory / "stat").write_text(f"{pid} (codex worker (fixture)) " + " ".join(fields))
+        (directory / "exe").symlink_to(executable)
+
+    def invoke_launch(self, observe: Callable[[list[str]], None] = lambda _argv: None,
+                      failed_label: str = "", screen: str = "",
+                      blocked_prompt_label: str = "") -> InvocationResult:
+        original_run = subprocess.run
+        panes = self.launch_panes()
+        success: PaneCloseResponse = {"ok": True, "result": {"type": "ok"}}
+
+        def record_launch(argv: list[str], *, capture_output: bool, text: bool,
+                          check: bool, timeout: float,
+                          env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
+            if argv[1:3] == ["--session", "herdr-trial"]:
+                self.assertIsNotNone(env, "all launch herdr calls need an explicit clean environment")
+                if env is not None:
+                    self.assertFalse(any(key.startswith("CLAUDE_") for key in env), env)
+                command = argv[3:]
+                observe(command)
+                if command[:2] == ["workspace", "create"]:
+                    response: WorkspaceCreationResponse = {"ok": True, "result": {
+                        "workspace": {"workspace_id": "w79", "label": "herdr-fake"},
+                        "tab": {"tab_id": "w79:t88"},
+                        "root_pane": {"pane_id": panes["showrunner"]},
+                    }}
+                    self.configure(argv[1:], json.dumps(response))
+                elif command[:2] == ["tab", "create"]:
+                    unit = command[command.index("--label") + 1]
+                    tab: TabCreationResponse = {"ok": True, "result": {
+                        "tab": {"tab_id": f"w79:t{89 + ('slug-unit', 'clamp-unit', 'count-unit').index(unit)}"},
+                        "root_pane": {"pane_id": panes[unit]},
+                    }}
+                    self.configure(argv[1:], json.dumps(tab))
+                elif command[:2] == ["pane", "split"]:
+                    parent = command[2]
+                    unit = next(label for label, pane in panes.items() if pane == parent)
+                    child = unit + "-impl" if not unit.endswith("-impl") else unit.removesuffix("-impl") + "-review"
+                    split: PaneSplitResponse = {"ok": True, "result": {"pane": {"pane_id": panes[child]}}}
+                    self.configure(argv[1:], json.dumps(split))
+                elif command[:2] in (["pane", "rename"], ["tab", "rename"], ["agent", "start"]):
+                    if command[:2] == ["agent", "start"] and command[2] == failed_label:
+                        error: AgentErrorResponse = {"ok": False, "error": {
+                            "code": "agent_not_ready", "message": "fixture startup stopped at dialog",
+                        }}
+                        self.configure(argv[1:], code=1, stderr=json.dumps(error))
+                    elif command[:2] == ["agent", "start"]:
+                        ready: SettledAgentResponse = {"ok": True, "result": {"agent": {
+                            "pane_id": command[command.index("--pane") + 1],
+                            "agent": command[command.index("--kind") + 1], "agent_status": "idle",
+                        }}}
+                        self.configure(argv[1:], json.dumps(ready))
+                    else:
+                        self.configure(argv[1:], json.dumps(success))
+                elif command[:2] == ["agent", "read"]:
+                    self.configure(argv[1:], screen)
+                elif command[:2] == ["agent", "prompt"]:
+                    if command[2] == blocked_prompt_label:
+                        blocked: AgentErrorResponse = {"ok": False, "error": {
+                            "code": "agent_blocked", "message": "fixture opening prompt refused by dialog",
+                        }}
+                        self.configure(argv[1:], code=1, stderr=json.dumps(blocked))
+                    else:
+                        self.configure(argv[1:], json.dumps(success))
+                _ = self.response_file.write_text(json.dumps(self.responses))
+            return original_run(argv, capture_output=capture_output, text=text,
+                                check=check, timeout=timeout, env=env)
+
+        original_text = Path.read_text
+        original_bytes = Path.read_bytes
+        original_iterdir = Path.iterdir
+
+        def require_fixture(path: Path) -> None:
+            for forbidden in (Path("/proc"), Path("/home/natepiano/.claude1"), Path("/home/natepiano/.codex1")):
+                self.assertFalse(path == forbidden or forbidden in path.parents,
+                                 f"launch test attempted to read real process/account data: {path}")
+
+        def fixture_text(path: Path, encoding: str | None = None,
+                         errors: str | None = None) -> str:
+            require_fixture(path)
+            return original_text(path, encoding=encoding, errors=errors)
+
+        def fixture_bytes(path: Path) -> bytes:
+            require_fixture(path)
+            return original_bytes(path)
+
+        def fixture_entries(path: Path) -> Iterator[Path]:
+            require_fixture(path)
+            return original_iterdir(path)
+
+        with (patch.object(subprocess, "run", side_effect=record_launch),
+              patch.object(Path, "read_text", new=fixture_text),
+              patch.object(Path, "read_bytes", new=fixture_bytes),
+              patch.object(Path, "iterdir", new=fixture_entries)):
+            return self.invoke("launch")
+
+    def launch_calls(self, group: str, action: str) -> list[list[str]]:
+        return [argv[2:] for argv in self.calls()
+                if argv[:4] == ["--session", "herdr-trial", group, action]]
+
+    def pane_environment(self, command: list[str]) -> dict[str, str]:
+        assignments = [command[index + 1] for index, item in enumerate(command) if item == "--env"]
+        self.assertEqual(len(assignments), len(set(item.split("=", 1)[0] for item in assignments)))
+        return dict(item.split("=", 1) for item in assignments)
+
+    def test_launch_refuses_stopped_server_before_creating_any_pane(self) -> None:
+        self.launch_fixture()
+        self.configure(herdr_args("status", "server"), "status: not running\n")
+        before = (self.scratch / "started.json").read_bytes()
+        result = self.invoke_launch()
+        self.assert_refusal(result, "server herdr-trial not answering: run trial.py up")
+        self.assertEqual(self.calls(), [herdr_args("status", "server")])
+        self.assertEqual((self.scratch / "started.json").read_bytes(), before)
+
+    def test_launch_refuses_existing_workspace_before_trust_or_mutation(self) -> None:
+        self.launch_fixture()
+        response: WorkspaceListResponse = {"ok": True, "result": {"workspaces": [
+            {"workspace_id": "w5", "label": "other"},
+            {"workspace_id": "w19", "label": "herdr-fake"},
+        ]}}
+        self.configure(herdr_args("workspace", "list"), json.dumps(response))
+        (self.claude / ".claude.json").unlink()
+        before = (self.scratch / "started.json").read_bytes()
+        self.assert_refusal(self.invoke_launch(), "herdr-fake")
+        self.assertEqual(self.calls(), [herdr_args("status", "server"), herdr_args("workspace", "list")])
+        self.assertEqual((self.scratch / "started.json").read_bytes(), before)
+
+    def test_launch_checks_both_accounts_for_every_folder_before_first_pane(self) -> None:
+        self.launch_fixture()
+        folders = [self.scratch / "repo", *[self.scratch / "worktrees" / unit
+                    for unit in ("slug-unit", "clamp-unit", "count-unit")]]
+        # Independent repository keys allow each start-folder check to fail on
+        # its own; linked worktrees would all share the already-checked main key.
+        for folder in folders[1:]:
+            (folder / ".git").unlink()
+            _ = self.fixture_git(folder, "init", "--initial-branch=main")
+        before = (self.scratch / "started.json").read_bytes()
+        for account in ("claude", "codex"):
+            for missing in folders:
+                with self.subTest(folder=missing, account=account):
+                    self.log.unlink(missing_ok=True)
+                    self.trust_configs(
+                        {str(folder): not (folder == missing and account == "claude") for folder in folders},
+                        {str(folder): "untrusted" if folder == missing and account == "codex"
+                         else "trusted" for folder in folders},
+                    )
+                    self.assert_refusal(self.invoke_launch(), str(missing), account.title())
+                    self.assertEqual(self.calls(), [herdr_args("status", "server"), herdr_args("workspace", "list")])
+                    self.assertEqual((self.scratch / "started.json").read_bytes(), before)
+
+    def test_launch_creates_ten_labelled_panes_with_cwd_and_account_environment(self) -> None:
+        self.launch_fixture()
+        self.assert_success(self.invoke_launch())
+        workspace = self.launch_calls("workspace", "create")
+        self.assertEqual(len(workspace), 1)
+        self.assertEqual(workspace[0][2:6], ["--label", "herdr-fake", "--cwd", str(self.scratch / "repo")])
+        self.assertIn("--no-focus", workspace[0])
+        self.assertEqual(self.pane_environment(workspace[0]), {
+            "CLAUDE_CONFIG_DIR": str(self.claude), "ENABLE_TOOL_SEARCH": "true",
+        })
+        self.assertEqual(self.launch_calls("tab", "rename"), [["tab", "rename", "w79:t88", "showrunner"]])
+        tabs = self.launch_calls("tab", "create")
+        splits = self.launch_calls("pane", "split")
+        self.assertEqual(len(tabs), 3)
+        self.assertEqual(len(splits), 6)
+        panes = self.launch_panes()
+        for index, unit in enumerate(("slug-unit", "clamp-unit", "count-unit")):
+            directory = str(self.scratch / "worktrees" / unit)
+            tab = tabs[index]
+            self.assertEqual(tab[2:8], ["--workspace", "w79", "--label", unit, "--cwd", directory])
+            self.assertIn("--no-focus", tab)
+            self.assertEqual(self.pane_environment(tab), {
+                "SHOWRUNNER_UNIT": "herdr-fake", "SHOWRUNNER_UNIT_ID": unit,
+                "CLAUDE_CONFIG_DIR": str(self.claude), "ENABLE_TOOL_SEARCH": "true",
+            })
+            for split, parent, direction in (
+                (splits[index * 2], panes[unit], "right"),
+                (splits[index * 2 + 1], panes[unit + "-impl"], "down"),
+            ):
+                self.assertEqual(split[2:7], [parent, "--direction", direction, "--cwd", directory])
+                self.assertIn("--no-focus", split)
+                self.assertEqual(self.pane_environment(split), {
+                    "SHOWRUNNER_UNIT": "herdr-fake", "SHOWRUNNER_UNIT_ID": unit, "CODEX_HOME": str(self.codex),
+                })
+        self.assertEqual(self.launch_calls("pane", "rename"), [
+            ["pane", "rename", pane, label] for label, pane in panes.items()
+        ])
+        calls = self.calls()
+        first_start = next(index for index, call in enumerate(calls) if call[2:4] == ["agent", "start"])
+        self.assertEqual(sum(call[2:4] == ["pane", "rename"] for call in calls[:first_start]), 10)
+        self.assertFalse(any(call[2:4] == ["pane", "run"] for call in calls))
+
+    def test_launch_resolves_distinct_models_and_starts_workers_before_directors_and_showrunner(self) -> None:
+        self.launch_fixture()
+        result = self.invoke_launch()
+        self.assert_success(result)
+        self.assertEqual([call for call in self.calls() if call == ["production.director"] or (call and call[0].startswith("delegate."))],
+                         [["production.director"], ["delegate.impl"], ["delegate.review"]])
+        units = ("slug-unit", "clamp-unit", "count-unit")
+        labels = [f"{unit}-{role}" for unit in units for role in ("impl", "review")] + [*units, "showrunner"]
+        starts = self.launch_calls("agent", "start")
+        self.assertEqual([call[2] for call in starts], labels)
+        panes = self.launch_panes()
+        for label, call in zip(labels, starts, strict=True):
+            worker = label.endswith(("-impl", "-review"))
+            kind = "codex" if worker else "claude"
+            self.assertEqual(call[:10], ["agent", "start", label, "--kind", kind, "--pane", panes[label], "--timeout", "1200", "--"])
+            if worker:
+                role = label.rsplit("-", 1)[1]
+                model, effort = ("fixture-implementer", "medium") if role == "impl" else ("fixture-reviewer", "low")
+                self.assertEqual(call[10:], ["-m", model, "-c", f"model_reasoning_effort={effort}", "-s", "danger-full-access", "-a", "never"])
+            else:
+                name = "herdr-fake" if label == "showrunner" else "herdr-fake-" + label
+                self.assertEqual(call[10:], ["--model", "fixture-director", "--effort", "high", "--remote-control", name, "-n", name])
+        self.assertEqual(result.stdout.splitlines(), [
+            f"{label}\t{'codex' if label.endswith(('-impl', '-review')) else 'claude'}\t{panes[label]}" for label in labels
+        ])
+
+    def test_launch_starts_every_agent_without_an_opening_prompt_argument(self) -> None:
+        self.launch_fixture()
+        self.assert_success(self.invoke_launch())
+        starts = self.launch_calls("agent", "start")
+        self.assertEqual(len(starts), 10)
+        for call in starts:
+            with self.subTest(label=call[2]):
+                self.assertNotIn(self.opening_text(call[2]), call)
+                self.assertFalse(any("\n" in argument or "`" in argument for argument in call))
+                self.assertEqual(len(call[call.index("--") + 1:]), 8)
+
+    def test_launch_prompts_each_ready_agent_once_with_its_complete_opening_text(self) -> None:
+        self.launch_fixture()
+        self.assert_success(self.invoke_launch())
+        starts = self.launch_calls("agent", "start")
+        prompts = self.launch_calls("agent", "prompt")
+        self.assertEqual(prompts, [["agent", "prompt", call[2], self.opening_text(call[2])] for call in starts])
+        calls = self.calls()
+        for start, prompt in zip(starts, prompts, strict=True):
+            with self.subTest(label=start[2]):
+                self.assertLess(calls.index(herdr_args(*start)), calls.index(herdr_args(*prompt)))
+                self.assertEqual(calls.count(herdr_args(*prompt)), 1)
+                if start[2] == "showrunner" or start[2].endswith("-unit"):
+                    self.assertIn("\n\nTrial production:", prompt[3])
+                    self.assertIn("`trial.py issue`", prompt[3])
+
+    def test_launch_blocked_opening_prompt_logs_one_issue_and_stops_with_refusal(self) -> None:
+        self.launch_fixture()
+        labels = [f"{unit}-{role}" for unit in ("slug-unit", "clamp-unit", "count-unit")
+                  for role in ("impl", "review")] + ["slug-unit", "clamp-unit", "count-unit", "showrunner"]
+        for label in ("slug-unit-impl", "slug-unit", "showrunner"):
+            with self.subTest(label=label):
+                self.log.unlink(missing_ok=True)
+                issues = self.scratch / "issues.jsonl"
+                issues.unlink(missing_ok=True)
+                self.assert_refusal(self.invoke_launch(blocked_prompt_label=label), label)
+                expected = labels[:labels.index(label) + 1]
+                self.assertEqual([call[2] for call in self.launch_calls("agent", "start")], expected)
+                self.assertEqual(self.launch_calls("agent", "prompt"), [
+                    ["agent", "prompt", target, self.opening_text(target)] for target in expected
+                ])
+                lines = issues.read_text().splitlines()
+                self.assertEqual(len(lines), 1)
+                issue = cast(IssueRecord, json.loads(lines[0]))
+                self.assertEqual(issue["session"], label)
+                self.assertIn("fixture opening prompt refused by dialog", issue["happened"])
+                self.assertTrue(issue["expected"])
+                self.assertEqual(datetime.fromisoformat(issue["time"]).utcoffset(), timedelta(0))
+                self.assertFalse(any(call[2:4] in (["pane", "send-keys"], ["pane", "send-text"], ["agent", "send-keys"])
+                                     for call in self.calls()))
+
+    def test_launch_default_agent_timeout_allows_ninety_seconds_for_readiness(self) -> None:
+        self.launch_fixture()
+        _ = os.environ.pop("HERDR_TRIAL_START_TIMEOUT")
+        timeouts: list[float] = []
+        original_run = subprocess.run
+
+        def record_timeout(argv: list[str], *, capture_output: bool, text: bool,
+                           check: bool, timeout: float,
+                           env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
+            if argv[3:5] == ["agent", "start"]:
+                self.assertEqual(argv[argv.index("--timeout") + 1], "90000")
+                self.assertGreater(timeout, 90)
+                timeouts.append(timeout)
+            return original_run(argv, capture_output=capture_output, text=text,
+                                check=check, timeout=timeout, env=env)
+
+        with patch.object(subprocess, "run", side_effect=record_timeout):
+            self.assert_success(self.invoke_launch())
+        self.assertEqual(len(timeouts), 10)
+
+    def test_launch_claude_fallback_workers_use_role_models_and_names_without_remote_control(self) -> None:
+        self.launch_fixture(impl_family="claude", review_family="claude")
+        for impl_family, review_family in (("claude", "claude"), ("claude", "codex"), ("codex", "claude")):
+            with self.subTest(impl=impl_family, review=review_family):
+                self.log.unlink(missing_ok=True)
+                for task, family, model, effort in (
+                    ("delegate.impl", impl_family, "fixture-implementer", "medium"),
+                    ("delegate.review", review_family, "fixture-reviewer", "low"),
+                ):
+                    self.configure([task], f"task={task} family={family} agent={model} effort={effort} tier=priority\n")
+                self.assert_success(self.invoke_launch())
+                self.assertEqual(self.launch_calls("agent", "prompt"), [
+                    ["agent", "prompt", call[2], self.opening_text(call[2])]
+                    for call in self.launch_calls("agent", "start")
+                ])
+                for index, call in enumerate(self.launch_calls("pane", "split")):
+                    family = impl_family if index % 2 == 0 else review_family
+                    environment = self.pane_environment(call)
+                    if family == "claude":
+                        self.assertEqual(environment["CLAUDE_CONFIG_DIR"], str(self.claude))
+                        self.assertEqual(environment["ENABLE_TOOL_SEARCH"], "true")
+                        self.assertNotIn("CODEX_HOME", environment)
+                    else:
+                        self.assertEqual(environment["CODEX_HOME"], str(self.codex))
+                        self.assertNotIn("CLAUDE_CONFIG_DIR", environment)
+                for call in self.launch_calls("agent", "start")[:6]:
+                    label = call[2]
+                    role = label.rsplit("-", 1)[1]
+                    family = impl_family if role == "impl" else review_family
+                    self.assertEqual(call[4], family)
+                    if family == "claude":
+                        model, effort = ("fixture-implementer", "medium") if role == "impl" else ("fixture-reviewer", "low")
+                        self.assertEqual(call[10:], ["--model", model, "--effort", effort, "-n", "herdr-fake-" + label])
+
+    def test_launch_records_matching_daemon_baseline_before_panes_and_new_daemons_before_directors(self) -> None:
+        self.launch_fixture()
+        self.proc_process(31401, 9981, ["/outside/bin/codex", "app-server"], str(self.codex), Path("/outside/bin/codex"))
+        self.proc_process(31402, 9982, ["codex", "app-server"], "", self.codex / "bin/codex")
+        self.proc_process(31403, 9983, ["codex", "app-server"], str(self.root / "other-account"), Path("/outside/bin/codex"))
+        self.proc_process(31404, 9984, ["codex", "exec"], str(self.codex), self.codex / "bin/codex")
+        (self.root / "proc-fixture/31405").mkdir()  # process vanished mid-scan
+        baseline: list[CodexDaemonIdentity] = [{"pid": 31401, "start_time": 9981}, {"pid": 31402, "start_time": 9982}]
+        seen_before = False
+        seen_after = False
+
+        def observe(command: list[str]) -> None:
+            nonlocal seen_before, seen_after
+            if command[:2] == ["workspace", "create"]:
+                record = cast(CodexDaemonBaselineResources, json.loads((self.scratch / "started.json").read_text()))
+                self.assertCountEqual(record["codex_daemons_before"], baseline)
+                self.assertEqual(record["systemd_units"], ["herdr-trial-server", "herdr-trial-client"])
+                seen_before = True
+            if command[:3] == ["agent", "start", "count-unit-review"]:
+                self.proc_process(31409, 9999, ["codex", "app-server"], str(self.codex), Path("/outside/bin/codex"))
+            if command[:3] == ["agent", "start", "slug-unit"]:
+                record = cast(LaunchStartedResources, json.loads((self.scratch / "started.json").read_text()))
+                self.assertEqual(record["codex_daemons_started"], [{"pid": 31409, "start_time": 9999}])
+                seen_after = True
+
+        self.assert_success(self.invoke_launch(observe))
+        self.assertTrue(seen_before)
+        self.assertTrue(seen_after)
+        record = cast(LaunchStartedResources, json.loads((self.scratch / "started.json").read_text()))
+        self.assertCountEqual(record["codex_daemons_before"], baseline)
+        self.assertEqual(record["codex_daemons_started"], [{"pid": 31409, "start_time": 9999}])
+
+    def test_launch_retry_preserves_original_daemon_baseline_and_accumulates_owned_daemons(self) -> None:
+        self.launch_fixture()
+        baseline: CodexDaemonIdentity = {"pid": 31401, "start_time": 9981}
+        previously_started: CodexDaemonIdentity = {"pid": 31402, "start_time": 9982}
+        newly_seen: CodexDaemonIdentity = {"pid": 31403, "start_time": 9983}
+        resources: LaunchStartedResources = {
+            "systemd_units": ["herdr-trial-server", "herdr-trial-client"],
+            "codex_daemons_before": [baseline],
+            "codex_daemons_started": [previously_started],
+        }
+        tracking = self.scratch / "started.json"
+        _ = tracking.write_text(json.dumps(resources))
+        for daemon in (baseline, previously_started, newly_seen):
+            self.proc_process(daemon["pid"], daemon["start_time"], ["codex", "app-server"],
+                              str(self.codex), Path("/outside/bin/codex"))
+
+        self.assert_success(self.invoke_launch())
+
+        recorded = cast(LaunchStartedResources, json.loads(tracking.read_text()))
+        self.assertEqual(recorded["systemd_units"], resources["systemd_units"])
+        self.assertEqual(recorded["codex_daemons_before"], [baseline])
+        self.assertCountEqual(recorded["codex_daemons_started"], [previously_started, newly_seen])
+
+    def test_launch_not_ready_dialog_is_logged_and_left_untouched_without_further_starts(self) -> None:
+        self.launch_fixture()
+        for failed_label, screen in (
+            ("slug-unit-review", "Do you trust the files in this folder?\n1. Yes\n2. No"),
+            ("slug-unit", "Allow this command to run?\nPermission required"),
+        ):
+            with self.subTest(label=failed_label, screen=screen):
+                self.log.unlink(missing_ok=True)
+                (self.scratch / "issues.jsonl").unlink(missing_ok=True)
+                result = self.invoke_launch(failed_label=failed_label, screen=screen)
+                self.assert_refusal(result, failed_label)
+                expected_labels = ["slug-unit-impl", "slug-unit-review"] if failed_label.endswith("-review") else [
+                    f"{unit}-{role}" for unit in ("slug-unit", "clamp-unit", "count-unit")
+                    for role in ("impl", "review")
+                ] + ["slug-unit"]
+                self.assertEqual([call[2] for call in self.launch_calls("agent", "start")], expected_labels)
+                self.assertEqual(self.launch_calls("agent", "read"), [["agent", "read", failed_label, "--source", "visible"]])
+                lines = (self.scratch / "issues.jsonl").read_text().splitlines()
+                self.assertEqual(len(lines), 1)
+                issue = cast(IssueRecord, json.loads(lines[0]))
+                self.assertEqual(issue["session"], failed_label)
+                self.assertIn(screen, issue["happened"])
+                self.assertEqual(datetime.fromisoformat(issue["time"]).utcoffset(), timedelta(0))
+                self.assertTrue(issue["expected"])
+                self.assertEqual(self.launch_calls("agent", "prompt"), [
+                    ["agent", "prompt", label, self.opening_text(label)] for label in expected_labels[:-1]
+                ])
+                self.assertFalse(any(call[2:4] in (["pane", "send-keys"], ["pane", "send-text"], ["agent", "send-keys"]) for call in self.calls()))
 
     def test_scaffold_builds_bare_origin_committed_branches_and_three_worktrees(self) -> None:
         self.scratch.mkdir()
@@ -392,7 +969,7 @@ class TrialTests(unittest.TestCase):
                 self.assertIn(text, plan)
             self.assertNotIn("Phase 2", plan)
             self.assertIn(filename, self.fixture_git(repo, "ls-tree", "-r", "--name-only", "HEAD"))
-        self.trust_configs({str(self.root): True}, {str(self.root): "trusted"})
+        self.trust_configs({str(repo): True}, {str(repo): "trusted"})
         for checkout in (repo, *(self.scratch / "worktrees" / f"{name}-unit"
                                   for name in functions)):
             self.assert_success(self.invoke("trust-check", str(checkout)))
@@ -424,6 +1001,122 @@ class TrialTests(unittest.TestCase):
         result = self.production_parser(document, "print(production_name(lines))\n")
         self.assert_success(result)
         self.assertEqual(result.stdout, "herdr-fake\n")
+
+    def test_work_refuses_a_worker_not_interactively_ready_without_submitting_or_recording(self) -> None:
+        pane, work_order, report = self.work_fixture()
+        self.worker_state(pane, state="idle", ready=False)
+        _ = report.write_text("preserve the previous report\n")
+        result = self.invoke("work", "slug-unit", "impl", str(work_order))
+        self.assertEqual(result.code, 2, result.stderr)
+        self.assertEqual(len(result.stderr.splitlines()), 1)
+        self.assertFalse((self.scratch / "work" / "slug-unit-impl.json").exists())
+        self.assertEqual(report.read_text(), "preserve the previous report\n")
+        issue = self.single_issue("slug-unit-impl")
+        self.assertEqual(issue["expected"], "worker is ready for its Work Order")
+        self.assertIn("idle", issue["happened"])
+        self.assertIn("false", issue["happened"].casefold())
+        self.assertEqual(self.calls(), [
+            herdr_args("pane", "list"), herdr_args("agent", "get", pane),
+        ])
+
+    def test_work_refuses_a_blocked_worker_even_when_interactive_readiness_is_true(self) -> None:
+        pane, work_order, _ = self.work_fixture()
+        self.worker_state(pane, state="blocked", ready=True)
+        result = self.invoke("work", "slug-unit", "impl", str(work_order))
+        self.assertEqual(result.code, 2, result.stderr)
+        self.assertEqual(len(result.stderr.splitlines()), 1)
+        self.assertFalse((self.scratch / "work" / "slug-unit-impl.json").exists())
+        issue = self.single_issue("slug-unit-impl")
+        self.assertEqual(issue["expected"], "worker is ready for its Work Order")
+        self.assertIn("blocked", issue["happened"])
+        self.assertIn("true", issue["happened"].casefold())
+        self.assertEqual(self.calls(), [
+            herdr_args("pane", "list"), herdr_args("agent", "get", pane),
+        ])
+
+    def test_work_removes_assignment_and_logs_when_one_prompt_never_starts_a_turn(self) -> None:
+        pane, work_order, report = self.work_fixture()
+        milliseconds = 23
+        wait = self.turn_start_timeout_response(pane, milliseconds)
+        prompt = herdr_args("agent", "prompt", pane,
+                           f"Read and carry out {work_order}. When done, write your report to {report}.")
+        with patch.dict(os.environ, {"HERDR_TRIAL_TURN_START_TIMEOUT": str(milliseconds)}):
+            result = self.invoke("work", "slug-unit", "impl", str(work_order))
+        self.assert_refusal(result, "slug-unit-impl")
+        self.assertFalse(report.exists())
+        self.assertFalse((self.scratch / "work" / "slug-unit-impl.json").exists())
+        issue = self.single_issue("slug-unit-impl")
+        self.assertEqual(issue["expected"], "worker starts a turn on its Work Order")
+        self.assertEqual(issue["happened"], "prompt submitted, no turn started within 23 ms")
+        self.assertEqual(self.calls(), [
+            herdr_args("pane", "list"), herdr_args("agent", "get", pane), prompt, wait,
+        ])
+
+    def test_work_accepts_a_fast_report_when_working_was_missed_by_the_start_wait(self) -> None:
+        pane, work_order, report = self.work_fixture()
+        milliseconds = 31
+        wait = self.turn_start_timeout_response(pane, milliseconds)
+        prompt = herdr_args("agent", "prompt", pane,
+                           f"Read and carry out {work_order}. When done, write your report to {report}.")
+        # The recorder creates the report only after work removed any stale report.
+        response = cast(CommandResponse, self.responses[" ".join(wait)])
+        response["write_files"] = {str(report): "fast turn finished\n"}
+        with patch.dict(os.environ, {"HERDR_TRIAL_TURN_START_TIMEOUT": str(milliseconds)}):
+            result = self.invoke("work", "slug-unit", "impl", str(work_order))
+        self.assert_success(result)
+        self.assertTrue(report.is_file(), "working timeout must accept the newly written report")
+        self.assertEqual(report.read_text(), "fast turn finished\n")
+        self.assertEqual(self.assigned_files(), {"slug-unit-impl": str(work_order)})
+        self.assertFalse((self.scratch / "issues.jsonl").exists())
+        self.assertEqual(self.calls(), [
+            herdr_args("pane", "list"), herdr_args("agent", "get", pane), prompt, wait,
+        ])
+
+    def test_work_keeps_assignment_after_a_ready_worker_starts_working_with_one_prompt(self) -> None:
+        pane, work_order, _ = self.work_fixture()
+        for state in ("idle", "done"):
+            with self.subTest(state=state):
+                self.log.unlink(missing_ok=True)
+                self.worker_state(pane, state=state)
+                result = self.invoke("work", "slug-unit", "impl", str(work_order))
+                self.assert_success(result)
+                self.assertEqual(self.assigned_files(), {"slug-unit-impl": str(work_order)})
+                self.assertFalse((self.scratch / "issues.jsonl").exists())
+                calls = self.calls()
+                self.assertEqual(calls[:2], [
+                    herdr_args("pane", "list"), herdr_args("agent", "get", pane),
+                ])
+                self.assertEqual(sum(call[2:4] == ["agent", "prompt"] for call in calls), 1)
+                self.assertEqual(calls[-1], herdr_args("agent", "wait", pane, "--until", "working",
+                                                     "--timeout", "60000"))
+                self.assertEqual(len(calls), 4)
+
+    def test_work_rejects_an_invalid_turn_start_deadline_before_submitting_input(self) -> None:
+        _, work_order, _ = self.work_fixture()
+        for value in ("-1", "1.5", "not-a-number"):
+            with self.subTest(value=value):
+                self.log.unlink(missing_ok=True)
+                with patch.dict(os.environ, {"HERDR_TRIAL_TURN_START_TIMEOUT": value}):
+                    result = self.invoke("work", "slug-unit", "impl", str(work_order))
+                self.assertEqual(result.code, 2, result.stderr)
+                self.assertEqual(len(result.stderr.splitlines()), 1)
+                self.assertIn("HERDR_TRIAL_TURN_START_TIMEOUT", result.stderr)
+                self.assertFalse((self.scratch / "work" / "slug-unit-impl.json").exists())
+                self.assertFalse(any(call[2:4] == ["agent", "prompt"] for call in self.calls()))
+
+    def test_work_logs_a_blocked_turn_start_without_sending_additional_input(self) -> None:
+        pane, work_order, _ = self.work_fixture()
+        response: SettledAgentResponse = {"ok": True, "result": {"agent": {
+            "pane_id": pane, "agent": "codex", "agent_status": "blocked",
+        }}}
+        wait = herdr_args("agent", "wait", pane, "--until", "working", "--timeout", "60000")
+        self.configure(wait, json.dumps(response))
+        result = self.invoke("work", "slug-unit", "impl", str(work_order))
+        self.assert_blocked_issue(result, "slug-unit-impl")
+        calls = self.calls()
+        self.assertEqual(sum(call[2:4] == ["agent", "prompt"] for call in calls), 1)
+        self.assertEqual(calls[-1], wait)
+        self.assertFalse(any(call[3] in {"send-text", "send-keys", "run"} for call in calls))
 
     def test_concurrent_worker_dispatches_preserve_both_assignments_for_separate_waits(self) -> None:
         units = {"slug-unit": "w38:p71", "clamp-unit": "w38:p81"}
@@ -490,7 +1183,10 @@ class TrialTests(unittest.TestCase):
         self.assertEqual(self.assigned_files(), {
             "count-unit-review": str(other_file), label: str(work_order),
         })
-        self.assertEqual(self.calls(), [herdr_args("pane", "list"), expected])
+        self.assertEqual(self.calls(), [
+            herdr_args("pane", "list"), herdr_args("agent", "get", "w38:p71"), expected,
+            herdr_args("agent", "wait", "w38:p71", "--until", "working", "--timeout", "60000"),
+        ])
 
     def test_work_and_wait_use_role_labels_and_refuse_invalid_roles_without_input(self) -> None:
         for action in ("work", "wait"):
@@ -601,6 +1297,7 @@ class TrialTests(unittest.TestCase):
         self.pane_list([{"pane_id": "w38:p71", "label": "slug-unit-impl"}])
         self.assert_success(self.invoke("work", "slug-unit", "impl", str(work_order)))
         _ = Path(str(work_order) + ".done").write_text("long work finished\n")
+        dispatch_call_count = len(self.calls())
         original_run = subprocess.run
         deadlines: list[float] = []
 
@@ -625,7 +1322,7 @@ class TrialTests(unittest.TestCase):
         self.assertGreater(deadlines[0], 1800)
         self.assertGreater(deadlines[1], 25)
         self.assertEqual(sum(call[2:4] == ["agent", "prompt"] for call in self.calls()), 1)
-        self.assertFalse(any("--until" in call for call in self.calls()))
+        self.assertFalse(any("--until" in call for call in self.calls()[dispatch_call_count:]))
 
     def test_work_agent_blocked_refusal_logs_one_issue_without_raw_input(self) -> None:
         label = "slug-unit-review"
@@ -640,7 +1337,9 @@ class TrialTests(unittest.TestCase):
         arguments = herdr_args("agent", "prompt", "w38:p72", prompt)
         self.configure(arguments, code=1, stderr=json.dumps(response))
         self.assert_blocked_issue(self.invoke("work", "slug-unit", "review", str(work_order)), label)
-        self.assertEqual(self.calls(), [herdr_args("pane", "list"), arguments])
+        self.assertEqual(self.calls(), [
+            herdr_args("pane", "list"), herdr_args("agent", "get", "w38:p72"), arguments,
+        ])
 
     def test_wait_settled_blocked_logs_issue_even_when_a_report_exists(self) -> None:
         label = "count-unit-review"
@@ -928,23 +1627,27 @@ class TrialTests(unittest.TestCase):
         self.configure(["--user", "is-active", "herdr-trial-client"], "active\n")
         server_launch = ["--user", "--unit=herdr-trial-server", str(self.fake),
                          *herdr_args("server")]
-        client_launch = ["--user", "--unit=herdr-trial-client", "konsole", "-e",
+        client_launch = ["--user", "--unit=herdr-trial-client", "/fixture/ghostty",
+                         "--gtk-single-instance=false", "--title=herdr-trial", "-e",
                          str(self.fake), *herdr_args()]
-        self.assert_success(self.invoke("up"))
+        self.assert_success(self.invoke("up", "--desktop", "6"))
         first_calls = self.calls()
         self.assertEqual(first_calls.count(server_launch), 1)
         self.assertEqual(first_calls.count(client_launch), 1)
         self.assertLess(first_calls.index(server_launch), first_calls.index(client_launch))
         self.assertGreaterEqual(first_calls[:first_calls.index(client_launch)].count(status), 2)
+        self.assertIn(["set_desktop_for_window", "window-17", "6"], first_calls)
         self.assertEqual(self.started_units(), {
             "systemd_units": ["herdr-trial-server", "herdr-trial-client"],
         })
         before = (self.scratch / "started.json").read_bytes()
-        self.assert_success(self.invoke("up"))
+        self.assert_success(self.invoke("up", "--desktop", "6"))
         repeated_calls = self.calls()[len(first_calls):]
         self.assertNotIn(server_launch, repeated_calls)
         self.assertNotIn(client_launch, repeated_calls)
         self.assertIn(["--user", "is-active", "herdr-trial-client"], repeated_calls)
+        self.assertIn(["search", "--name", "^herdr-trial$"], repeated_calls)
+        self.assertIn(["set_desktop_for_window", "window-17", "6"], repeated_calls)
         self.assertEqual((self.scratch / "started.json").read_bytes(), before)
 
     def test_server_stop_timeout_still_stops_active_unit_and_reports_failure(self) -> None:
@@ -1031,12 +1734,13 @@ class TrialTests(unittest.TestCase):
             ["--user", "is-active", "herdr-trial-server"],
         ])
 
-    def test_client_open_launches_konsole_with_named_session_and_records_unit(self) -> None:
+    def test_client_open_launches_ghostty_with_named_session_and_records_visible_unit(self) -> None:
         self.assert_success(self.invoke("client", "open"))
         self.assertEqual(self.calls(), [[
-            "--user", "--unit=herdr-trial-client", "konsole", "-e", str(self.fake),
+            "--user", "--unit=herdr-trial-client", "/fixture/ghostty",
+            "--gtk-single-instance=false", "--title=herdr-trial", "-e", str(self.fake),
             *herdr_args(),
-        ]])
+        ], ["search", "--name", "^herdr-trial$"]])
         self.assertEqual(self.started_units(), {"systemd_units": ["herdr-trial-client"]})
 
     def test_client_open_adds_unit_once_and_preserves_existing_units(self) -> None:
@@ -1048,6 +1752,80 @@ class TrialTests(unittest.TestCase):
         self.assertEqual(self.started_units(), {
             "systemd_units": ["herdr-trial-server", "herdr-trial-client"],
         })
+
+    def test_client_open_waits_for_ghostty_window_and_moves_it_to_requested_desktop(self) -> None:
+        search = ["search", "--name", "^herdr-trial$"]
+        self.responses[" ".join(search)] = [
+            {"stdout": "", "code": 1},
+            {"stdout": "window-63\n", "code": 0},
+        ]
+        launch = ["--user", "--unit=herdr-trial-client", "/fixture/ghostty",
+                  "--gtk-single-instance=false", "--title=herdr-trial", "-e",
+                  str(self.fake), *herdr_args()]
+        move = ["set_desktop_for_window", "window-63", "6"]
+
+        self.assert_success(self.invoke("client", "open", "--desktop", "6"))
+
+        self.assertEqual(self.calls(), [launch, search, search, move])
+        self.assertEqual(self.started_units(), {"systemd_units": ["herdr-trial-client"]})
+
+    def test_client_open_defaults_to_ghostty_when_no_terminal_override_is_set(self) -> None:
+        del os.environ["HERDR_TRIAL_TERMINAL"]
+
+        self.assert_success(self.invoke("client", "open"))
+
+        self.assertEqual(self.calls()[0], [
+            "--user", "--unit=herdr-trial-client", "ghostty",
+            "--gtk-single-instance=false", "--title=herdr-trial", "-e",
+            str(self.fake), *herdr_args(),
+        ])
+
+    def test_client_open_refuses_when_window_cannot_be_moved_to_requested_desktop(self) -> None:
+        move = ["set_desktop_for_window", "window-17", "6"]
+        self.configure(move, "", 1, "desktop fixture refused")
+
+        self.assert_refusal(self.invoke("client", "open", "--desktop", "6"), "desktop")
+
+        self.assertEqual(self.calls().count(move), 1)
+
+    def test_client_open_stops_its_unit_when_no_window_appears_before_deadline(self) -> None:
+        os.environ["HERDR_TRIAL_START_TIMEOUT"] = "0.2"
+        search = ["search", "--name", "^herdr-trial$"]
+        self.configure(search, "", 1)
+        stop = ["--user", "stop", "herdr-trial-client"]
+
+        result = self.invoke("client", "open", "--desktop", "6")
+
+        self.assert_refusal(result, "herdr-trial", "window")
+        calls = self.calls()
+        launches = [call for call in calls if "--unit=herdr-trial-client" in call]
+        self.assertEqual(len(launches), 1, calls)
+        self.assertIn(search, calls)
+        self.assertEqual(calls.count(stop), 1, calls)
+        self.assertLess(calls.index(launches[0]), calls.index(stop))
+        self.assertFalse(any(call[0] == "set_desktop_for_window" for call in calls), calls)
+
+    def test_client_open_replaces_recorded_active_unit_that_has_no_window(self) -> None:
+        self.scratch.mkdir()
+        resources: StartedUnits = {"systemd_units": ["herdr-trial-server", "herdr-trial-client"]}
+        _ = (self.scratch / "started.json").write_text(json.dumps(resources))
+        active = ["--user", "is-active", "herdr-trial-client"]
+        search = ["search", "--name", "^herdr-trial$"]
+        stop = ["--user", "stop", "herdr-trial-client"]
+        launch = ["--user", "--unit=herdr-trial-client", "/fixture/ghostty",
+                  "--gtk-single-instance=false", "--title=herdr-trial", "-e",
+                  str(self.fake), *herdr_args()]
+        self.configure(active, "active\n")
+        self.responses[" ".join(search)] = [
+            {"stdout": "", "code": 1},
+            {"stdout": "replacement-42\n", "code": 0},
+        ]
+
+        self.assert_success(self.invoke("client", "open", "--desktop", "6"))
+
+        self.assertEqual(self.calls(), [active, search, stop, launch, search,
+                                       ["set_desktop_for_window", "replacement-42", "6"]])
+        self.assertEqual(self.started_units(), resources)
 
     def test_client_close_stops_only_client_unit(self) -> None:
         self.assert_success(self.invoke("client", "close"))
@@ -1084,10 +1862,70 @@ class TrialTests(unittest.TestCase):
         self.assertFalse(self.scratch.exists())
         self.assertEqual(self.calls(), [])
 
-    def test_trust_check_accepts_parents_independently(self) -> None:
-        self.trust_configs({str(self.project.parent): True}, {str(self.root): "trusted"})
-        self.assert_success(self.invoke("trust-check", str(self.project)))
+    def test_trust_check_outside_git_rejects_claude_ancestor_trust(self) -> None:
+        self.trust_configs({str(self.project.parent): True}, {str(self.project): "trusted"})
+        self.assert_refusal(self.invoke("trust-check", str(self.project)), "Claude", str(self.project))
         self.assertEqual(self.calls(), [])
+
+    def test_trust_check_rejects_linked_worktree_when_only_codex_ancestor_is_trusted(self) -> None:
+        self.assert_success(self.invoke("scaffold"))
+        repo = self.scratch / "repo"
+        checkout = self.scratch / "worktrees/slug-unit"
+        self.assertTrue((checkout / ".git").is_file())
+        self.trust_configs({str(repo): True}, {str(self.root): "trusted"})
+
+        self.assert_refusal(self.invoke("trust-check", str(checkout)), "Codex", str(repo))
+
+    def test_trust_check_accepts_linked_worktree_with_exact_codex_main_repository_entry(self) -> None:
+        self.assert_success(self.invoke("scaffold"))
+        repo = self.scratch / "repo"
+        checkout = self.scratch / "worktrees/slug-unit"
+        self.assertTrue((checkout / ".git").is_file())
+        self.trust_configs({str(repo): True}, {str(repo): "trusted"})
+        paths = [self.claude / ".claude.json", self.codex / "config.toml"]
+        before = [path.read_bytes() for path in paths]
+
+        self.assert_success(self.invoke("trust-check", str(checkout)))
+        self.assertEqual([path.read_bytes() for path in paths], before)
+
+    def test_trust_check_outside_git_requires_exact_codex_directory_entry(self) -> None:
+        probe = subprocess.run([GIT_BINARY, "-C", str(self.project), "rev-parse", "--git-common-dir"],
+                               capture_output=True, text=True, check=False, timeout=10)
+        self.assertNotEqual(probe.returncode, 0, "fixture must be outside any git repository")
+        self.trust_configs({str(self.project): True}, {str(self.root): "trusted"})
+        self.assert_refusal(self.invoke("trust-check", str(self.project)), "Codex", str(self.project))
+
+        self.trust_configs({str(self.project): True}, {str(self.project): "trusted"})
+        self.assert_success(self.invoke("trust-check", str(self.project)))
+
+    def test_trust_check_rejects_linked_worktree_with_only_claude_ancestor_trust(self) -> None:
+        self.assert_success(self.invoke("scaffold"))
+        repo = self.scratch / "repo"
+        checkout = self.scratch / "worktrees/slug-unit"
+        self.assertTrue((checkout / ".git").is_file())
+        common_directory = self.fixture_git(checkout, "rev-parse", "--path-format=absolute",
+                                            "--git-common-dir")
+        self.assertEqual(Path(common_directory).parent, repo)
+        self.trust_configs({str(self.scratch): True}, {str(repo): "trusted"})
+        paths = [self.claude / ".claude.json", self.codex / "config.toml"]
+        before = [path.read_bytes() for path in paths]
+
+        self.assert_refusal(self.invoke("trust-check", str(checkout)), "Claude", str(repo))
+
+        self.assertEqual([path.read_bytes() for path in paths], before)
+
+    def test_trust_check_accepts_linked_worktree_with_exact_claude_main_repository_trust(self) -> None:
+        self.assert_success(self.invoke("scaffold"))
+        repo = self.scratch / "repo"
+        checkout = self.scratch / "worktrees/slug-unit"
+        self.assertTrue((checkout / ".git").is_file())
+        self.trust_configs({str(repo): True}, {str(repo): "trusted"})
+        paths = [self.claude / ".claude.json", self.codex / "config.toml"]
+        before = [path.read_bytes() for path in paths]
+
+        self.assert_success(self.invoke("trust-check", str(checkout)))
+
+        self.assertEqual([path.read_bytes() for path in paths], before)
 
     def test_trust_check_requires_both_accounts(self) -> None:
         cases: tuple[tuple[dict[str, bool], dict[str, str], str], ...] = (
@@ -1117,6 +1955,9 @@ class TrialTests(unittest.TestCase):
 
     def test_usage_errors_are_single_lines_and_have_no_effects(self) -> None:
         for arguments in ([], ["unknown"], ["server"], ["client", "bad"],
+                          ["client", "open", "--desktop", "0"],
+                          ["client", "open", "--desktop", "-1"],
+                          ["up", "--desktop", "six"],
                           ["pane-id"], ["read"], ["type", "smoke"],
                           ["issue", "smoke", "expected"], ["trust-check"]):
             with self.subTest(arguments=arguments):

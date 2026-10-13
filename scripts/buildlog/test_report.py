@@ -51,6 +51,7 @@ def section_seconds(connection: sqlite3.Connection, day: str) -> dict[str, float
         "Agent calls": lambda: report.calls_section(connection, day),
         "Test builds": lambda: report.test_builds_section(connection, day),
         "Tests by target": lambda: report.tests_by_target_lines(calls),
+        "Mac": lambda: report.mac_section(connection, day),
         "cargo-port": lambda: report.port_lint_section(connection, day),
         "CI": lambda: report.ci_section(connection, day),
         "Tests per edit": lambda: report.tests_per_edit_section(connection, day),
@@ -267,6 +268,139 @@ class ReportTests(unittest.TestCase):
         _ = index.update()
         with closing(index.read_only()) as connection:
             return report.mac_tests_section(connection, day)
+
+    def section_lines(self, text: str, heading: str) -> list[str]:
+        lines = text.splitlines()
+        start = lines.index(heading)
+        end = next((i for i in range(start + 1, len(lines)) if lines[i].startswith("### ")), len(lines))
+        return lines[start:end]
+
+    def test_mac_rows_leave_natedev_sections_and_failed_steps_unchanged(self) -> None:
+        self.write(
+            self.root / "natedev" / "2026-10.jsonl",
+            call("local", target="natedev"),
+            self.nextest_step(
+                "local-pass", "local", duration_s=20, finished_s=10,
+                crates_compiled=1, mem_wait_s=5, mem_stall_some_s=2,
+                tests_flaky=1, peak_mem_bytes=2**30,
+            ),
+            self.nextest_step(
+                "local-failure", "local", duration_s=40, status=1, finished_s=20,
+                crates_compiled=2, mem_wait_s=10, mem_stall_some_s=4,
+                tests_flaky=2, peak_mem_bytes=2 * 2**30,
+            ),
+        )
+        before = self.render()
+        mac_host = "Nates-MacBook-Pro-2023"
+        self.write(
+            self.root / mac_host / "2026-10.jsonl",
+            step("offload", host=mac_host, caller="verify-mac", step="nextest",
+                 duration_s=100, status=1, finished_s=90, crates_compiled=50,
+                 mem_wait_s=600, mem_stall_some_s=900, tests_flaky=20, peak_mem_bytes=99 * 2**30,
+                 slice="fallback"),
+            step("direct", host=mac_host, caller="unknown", step="nextest",
+                 duration_s=200, status=1, finished_s=180, crates_compiled=50,
+                 mem_wait_s=900, mem_stall_some_s=1000, tests_flaky=30, peak_mem_bytes=100 * 2**30,
+                 slice="none"),
+            step("mac-kind", host=mac_host, caller="unknown", step="sweep", status=1),
+        )
+        after = self.render()
+        for heading in (
+            "### Waiting", "### Rebuilds", "### nextest", "### Memory pressure",
+            "### Summary: successes", "### Summary: failures", "### Summary: all",
+        ):
+            with self.subTest(heading=heading):
+                self.assertEqual(self.section_lines(after, heading), self.section_lines(before, heading))
+        self.assertIn("Failed steps: 1; flaky tests: 3.", after)
+        self.assertNotIn("### sweep", after)
+        self.assertNotIn("(natedev)", after)
+        mac = self.section_lines(after, "### Mac")
+        self.assertTrue(any(line.startswith("| verify.sh offload | nextest | 1 | 1 |") for line in mac))
+        self.assertTrue(any(line.startswith("| unknown | nextest | 1 | 1 |") for line in mac))
+        self.assertTrue(any(line.startswith("| unknown | sweep | 1 | 1 |") for line in mac))
+        _ = index.update()
+        with closing(index.read_only()) as connection:
+            self.assertEqual(report.kinds(connection, local_day(STAMP)), ["nextest"])
+
+    def test_mac_table_groups_callers_and_kinds_with_counts_times_and_nextest_facts(self) -> None:
+        self.write(
+            self.root / "natedev" / "2026-10.jsonl",
+            call("routed", mac="passed", mac_s=30, target="mac"),
+            step("local", step="nextest", caller="unknown", duration_s=900, tests_run=900),
+        )
+        mac_host = "Nates-MacBook-Pro-2023"
+        self.write(
+            self.root / mac_host / "2026-10.jsonl",
+            step("direct", host=mac_host, step="nextest", caller="unknown", duration_s=50,
+                 status=1, finished_s=25, tests_run=5, tests_failed=1),
+            step("sweep", host=mac_host, step="sweep", caller="verify-mac", duration_s=8),
+            step("pass", host=mac_host, step="nextest", caller="verify-mac", duration_s=10,
+                 finished_s=5, tests_run=0, tests_failed=0),
+            step("no-tests", host=mac_host, step="nextest", caller="verify-mac", duration_s=20,
+                 status=4, finished_s=5, tests_run=0, tests_failed=0),
+            step("failed", host=mac_host, step="nextest", caller="verify-mac", duration_s=30,
+                 status=1, finished_s=5, tests_run=0, tests_failed=0),
+            step("other-day", host=mac_host, step="nextest", caller="verify-mac", duration_s=900,
+                 started_at="2026-10-01T12:00:00Z"),
+        )
+        self.write(
+            self.root / "Mac" / "2026-10.jsonl",
+            step("other-mac", host="Mac", step="doc", caller="agent", duration_s=6),
+        )
+        text = self.render()
+        mac = self.section_lines(text, "### Mac")
+        self.assertIn("| Caller | Kind | Runs | Failed | Avg | p95 | Range | Build | Tests | Tests failed |", mac)
+        rows = [line for line in mac if line.startswith("| ")][1:]
+        self.assertEqual(len(rows), 4)
+        self.assertEqual(rows[0], "| verify.sh offload | nextest | 3 | 1 | 20.0 s | 30.0 s | 10.0 s – 30.0 s | 5.0 s | 0 | 0 |")
+        self.assertIn("| unknown | nextest | 1 | 1 | 50.0 s | 50.0 s | 50.0 s | 25.0 s | 5 | 1 |", rows)
+        self.assertIn("| verify.sh offload | sweep | 1 | 0 | 8.0 s | 8.0 s | 8.0 s | — | — | — |", rows)
+        self.assertIn("| agent (direct) | doc | 1 | 0 | 6.0 s | 6.0 s | 6.0 s | — | — | — |", rows)
+        self.assertIn("Mac total: 6 steps, 2.1 min; 2 failed.", mac)
+        self.assertIn(
+            "Source: steps recorded on the Mac; failed follows the build log's failure rule, so a Mac nextest that matched no tests is not a failure.",
+            mac,
+        )
+        lines = text.splitlines()
+        targets = self.section_lines(text, "### Tests by target")
+        self.assertEqual(lines[lines.index("### Tests by target") + len(targets)], "### Mac")
+        _ = index.update()
+        with closing(index.read_only()) as connection:
+            self.assertEqual(report.mac_section(connection, local_day(STAMP)), mac)
+            nextest_runs = cast(int, connection.execute(
+                "SELECT count(*) FROM steps WHERE host <> 'natedev' AND step = 'nextest'"
+                + " AND date(started_at, 'localtime') = ?", (local_day(STAMP),),
+            ).fetchone()[0])
+            self.assertEqual(sum(int(row.split("|")[3]) for row in rows if "| nextest |" in row), nextest_runs)
+
+    def test_mac_no_test_match_is_not_failed_but_other_callers_status_four_is(self) -> None:
+        self.write(
+            self.root / "Mac" / "2026-10.jsonl",
+            step("offload", host="Mac", caller="verify-mac", step="nextest", status=4, duration_s=1),
+            step("direct", host="Mac", caller="unknown", step="nextest", status=4, duration_s=1),
+            step("other-kind", host="Mac", caller="verify-mac", step="sweep", status=4, duration_s=1),
+        )
+        text = self.render()
+        mac = self.section_lines(text, "### Mac")
+        self.assertTrue(any(line.startswith("| verify.sh offload | nextest | 1 | 0 |") for line in mac))
+        self.assertTrue(any(line.startswith("| unknown | nextest | 1 | 1 |") for line in mac))
+        self.assertTrue(any(line.startswith("| verify.sh offload | sweep | 1 | 1 |") for line in mac))
+        self.assertIn("Mac total: 3 steps, 3.0 s; 2 failed.", mac)
+        self.assertIn("No build steps recorded.", text)
+        self.assertNotIn("Failed steps:", text)
+
+    def test_day_without_mac_steps_has_the_empty_mac_section(self) -> None:
+        self.write(
+            self.root / "natedev" / "2026-10.jsonl",
+            step("local", caller="verify-mac", step="nextest"),
+        )
+        self.write(
+            self.root / "Mac" / "2026-10.jsonl",
+            step("other-day", host="Mac", started_at="2026-10-01T12:00:00Z"),
+        )
+        text = self.render()
+        self.assertEqual(self.section_lines(text, "### Mac"), ["### Mac", "", "No steps recorded on the Mac.", ""])
+        self.assertIn("### nextest", text)
 
     def target_cells(self, package: str = "hana", day: str = "2026-10-02") -> dict[str, str]:
         lines = self.mac_tests_lines(day)
@@ -1599,7 +1733,7 @@ class ReportTests(unittest.TestCase):
             "| **All steps** | 1 | 20.0 s | 20.0 s | 20.0 s |  |",
             successes,
         )
-        self.assertFalse(any(line.startswith("| fmt |") for line in lines))
+        self.assertFalse(any(line.startswith("| fmt |") for line in successes))
 
     def test_verify_step_without_call_record_remains_in_reports(self) -> None:
         self.write(
@@ -1872,8 +2006,8 @@ class ReportTests(unittest.TestCase):
         )
         section = self.memory_section()
         self.assertIn("| Caller | Kind | Stall | At once |", section)
-        self.assertIn("| verify.sh (agents) (natedev) | clippy | 12.0 s | 1 |", section)
-        self.assertIn("| agent (direct) (natedev) | mend | 9.0 s | 2 |", section)
+        self.assertIn("| verify.sh (agents) | clippy | 12.0 s | 1 |", section)
+        self.assertIn("| agent (direct) | mend | 9.0 s | 2 |", section)
         self.assertTrue(any("| 8.0 s | 3 |" in line for line in section))
         self.assertTrue(any("| 7.0 s | 4 |" in line for line in section))
         self.assertTrue(any("| 6.0 s | 4 |" in line for line in section))
@@ -2001,7 +2135,7 @@ class ReportTests(unittest.TestCase):
         self.assertIn("| scratch (temp folders) | 1 | 0 | 1.0 s | 1.0 s | 1.0 s |  |  |  |  |", lines)
         self.assertNotIn("steps under a temp folder", text)
 
-    def test_launch_in_temp_folder_counts_host_for_caller_labels(self) -> None:
+    def test_mac_launch_in_temp_folder_leaves_natedev_caller_without_host(self) -> None:
         self.write(
             self.root / "natedev" / "2026-10.jsonl",
             step("local", host="natedev", caller="verify", step="check"),
@@ -2012,8 +2146,11 @@ class ReportTests(unittest.TestCase):
         )
 
         lines = self.render().splitlines()
-        self.assertTrue(any(line.startswith("| verify.sh (agents) (natedev) |") for line in lines))
-        self.assertTrue(any(line.startswith("| example launches (brp) (mac) |") for line in lines))
+        self.assertTrue(any(line.startswith("| verify.sh (agents) |") for line in lines))
+        self.assertFalse(any("(natedev)" in line for line in lines))
+        self.assertNotIn("### build", lines)
+        mac = self.section_lines(self.render(), "### Mac")
+        self.assertTrue(any(line.startswith("| example launches (brp) | build | 1 |") for line in mac))
 
     def test_ci_queue_summary_when_all_queue_times_are_known(self) -> None:
         self.write(
@@ -2109,16 +2246,18 @@ class ReportTests(unittest.TestCase):
 
         lines = self.render().splitlines()
         fmt = lines[lines.index("### fmt") : lines.index("### doc")]
-        self.assertIn("| scratch (temp folders) | 2 | 0 | 15.0 s | 20.0 s | 10.0 s – 20.0 s |", fmt)
+        self.assertIn("| scratch (temp folders) | 1 | 0 | 10.0 s | 10.0 s | 10.0 s |", fmt)
         self.assertEqual(1, sum(line.startswith("| scratch (temp folders) |") for line in fmt))
         doc = lines[lines.index("### doc") : lines.index("### Summary: successes")]
         self.assertIn("| scratch (temp folders) | 1 | 1 | 10.0 s | 10.0 s | 10.0 s |  |  |  |", doc)
         successes = lines[lines.index("### Summary: successes") : lines.index("### Summary: failures")]
-        self.assertIn("| fmt | 3 | 1.0 min | 20.0 s | 30.0 s | 2.0 GiB |", successes)
+        self.assertIn("| fmt | 2 | 40.0 s | 20.0 s | 30.0 s | 2.0 GiB |", successes)
         failures = lines[lines.index("### Summary: failures") : lines.index("### Summary: all")]
         self.assertIn("| doc | 1 | 10.0 s | 10.0 s | 10.0 s | 4.0 GiB |", failures)
         combined = lines[lines.index("### Summary: all") :]
-        self.assertIn("| **All steps** | 4 | 1 | 1.2 min | 17.5 s | 30.0 s | 4.0 GiB |", combined)
+        self.assertIn("| **All steps** | 3 | 1 | 50.0 s | 16.7 s | 30.0 s | 4.0 GiB |", combined)
+        mac = self.section_lines(self.render(), "### Mac")
+        self.assertTrue(any(line.startswith("| terminal | fmt | 1 | 0 | 20.0 s |") for line in mac))
 
     def test_port_lint_calls_have_their_own_section(self) -> None:
         self.write(
