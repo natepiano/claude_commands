@@ -152,7 +152,8 @@ class AddUnitTests(ShutdownTestCase):
         home = self.root / "home"
         (home / ".claude").mkdir(parents=True)
         _ = (home / ".claude.json").write_text(
-            json.dumps({"oauthAccount": {"emailAddress": "owner@example.com"}}),
+            json.dumps({"oauthAccount": {"emailAddress": "owner@example.com"},
+                        "projects": self.trusted_projects()}),
             encoding="utf-8",
         )
         notes = self.root / "notes"
@@ -201,13 +202,78 @@ class AddUnitTests(ShutdownTestCase):
             )
             return accounts.account_dir(label)
 
+    def trusted_projects(self) -> dict[str, dict[str, bool]]:
+        return {str(folder): {"hasTrustDialogAccepted": True}
+                for folder in (self.checkout, self.root / "prior-session", self.root / "prior session")}
+
+    def test_untrusted_new_worktree_refuses_before_stub_row_or_worktree(self) -> None:
+        config = Path(self.env["HOME"]) / ".claude.json"
+        _ = config.write_text(json.dumps({"oauthAccount": {"emailAddress": "owner@example.com"},
+                                         "projects": {str(self.root): {"hasTrustDialogAccepted": True}}}))
+        document = self.doc.read_text()
+        head = self.git("rev-parse", "HEAD")
+        for mode in ([], ["--check"]):
+            with self.subTest(mode=mode):
+                result = self.cli("alpha", "--brief", "Add a feature", *mode)
+                self.assertEqual(result.returncode, 2, (result.stdout, result.stderr))
+                folder = self.root / "project-alpha"
+                self.assertIn(f"alpha-unit: Claude is not trusted in {folder} on default account. Run: "
+                              + f"cd {shlex.quote(str(self.checkout))} && "
+                              + "env -u CLAUDE_CONFIG_DIR -u CLAUDE_CODE_REMOTE_MEMORY_DIR claude", result.stderr)
+                self.assert_no_launch_change(document, head)
+                self.assertFalse((self.checkout / "docs/plans/build-followups-alpha.md").exists())
+                self.assertNotIn("build-followups-alpha", self.git("branch", "--list"))
+
+    def test_trust_uses_launch_account_instead_of_callers_account(self) -> None:
+        directory = self.prepare_unit_account("claude 3")
+        _ = (directory / ".claude.json").write_text(json.dumps({
+            "oauthAccount": {"emailAddress": "claude-3@example.invalid"}, "projects": {}}))
+        self.env["CLAUDE_CONFIG_DIR"] = str(Path(self.env["HOME"]) / ".claude")
+        document = self.doc.read_text()
+        head = self.git("rev-parse", "HEAD")
+        result = self.cli("alpha", "--brief", "Add a feature")
+        self.assertEqual(result.returncode, 2, (result.stdout, result.stderr))
+        self.assertIn("on claude 3. Run:", result.stderr)
+        self.assertIn(f"CLAUDE_CONFIG_DIR={shlex.quote(str(directory))}", result.stderr)
+        self.assert_no_launch_change(document, head)
+
+    def test_unreadable_trust_file_names_the_unit_and_refuses_before_any_write(self) -> None:
+        config = Path(self.env["HOME"]) / ".claude.json"
+        _ = config.write_text('{"oauthAccount": "SECRET-EMAIL", ')
+        document = self.doc.read_text()
+        head = self.git("rev-parse", "HEAD")
+        output = io.StringIO()
+        errors = io.StringIO()
+        with (patch.dict(os.environ, self.env), redirect_stdout(output), redirect_stderr(errors),
+              patch.object(launch_permission, "launch_permission",
+                           return_value=launch_permission.AllowedByShutdownState())):
+            code = add_unit.main(["--production", str(self.doc), "alpha", "--brief", "Add a feature"])
+        self.assertEqual(code, 2, (output.getvalue(), errors.getvalue()))
+        self.assertEqual(errors.getvalue(), f"add_unit: alpha-unit: cannot read {config} "
+                         + "to check Claude trust (JSONDecodeError)\n")
+        self.assertNotIn("SECRET", output.getvalue() + errors.getvalue())
+        self.assert_no_launch_change(document, head)
+        self.assertFalse((self.checkout / "docs/plans/build-followups-alpha.md").exists())
+
+    def test_resume_checks_session_cwd_instead_of_worktree(self) -> None:
+        prior = self.root / "untrusted-session"
+        prior.mkdir()
+        document = self.doc.read_text()
+        head = self.git("rev-parse", "HEAD")
+        result = self.cli("alpha", "--plan", "docs/plans/given.md", "--resume", "session-123",
+                          "--cwd", str(prior), "--account", "default")
+        self.assertEqual(result.returncode, 2, (result.stdout, result.stderr))
+        self.assertIn(f"Claude is not trusted in {prior}", result.stderr)
+        self.assert_no_launch_change(document, head)
+
     def prepare_unit_account(self, label: str) -> Path:
         directory = self.select_unit_account(label)
         login = f"{label.replace(' ', '-')}@example.invalid"
         with patch.dict(os.environ, self.env):
             self.assertEqual(accounts.setup(label), [])
             _ = (directory / ".claude.json").write_text(
-                json.dumps({"oauthAccount": {"emailAddress": login}}),
+                json.dumps({"oauthAccount": {"emailAddress": login},
+                            "projects": self.trusted_projects()}),
                 encoding="utf-8",
             )
             _ = (Path(self.env["AGENT_NOTES_DIR"]) / f"{label}.md").write_text(
@@ -1393,7 +1459,8 @@ class AddUnitTests(ShutdownTestCase):
         directory = self.root / "external account with spaces"
         directory.mkdir()
         _ = (directory / ".claude.json").write_text(json.dumps({
-            "oauthAccount": {"emailAddress": "external@example.invalid"}}), encoding="utf-8")
+            "oauthAccount": {"emailAddress": "external@example.invalid"},
+            "projects": self.trusted_projects()}), encoding="utf-8")
         _ = self.prepare_unit_account("claude 3")
         prior = self.root / "prior-session"
         prior.mkdir()
@@ -2031,6 +2098,9 @@ class AddUnitTests(ShutdownTestCase):
         self.checkout = renamed
         self.doc = renamed / "docs/plans/build-followups-production.md"
         self.plan = renamed / "docs/plans/given.md"
+        _ = (Path(self.env["HOME"]) / ".claude.json").write_text(json.dumps({
+            "oauthAccount": {"emailAddress": "owner@example.com"},
+            "projects": self.trusted_projects()}), encoding="utf-8")
         _ = self.doc.write_text(self.production_doc(), encoding="utf-8")
         _ = self.git("add", "docs/plans/build-followups-production.md")
         _ = self.git("commit", "-m", "move checkout")

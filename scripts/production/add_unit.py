@@ -538,7 +538,10 @@ def director_agent(request: UnitLaunch) -> DirectorAgent:
     return DirectorAgent(model, Effort(effort) if effort else DefaultEffort())
 
 
-def preflight(request: RequestedUnitLaunch) -> ReadyToLaunch:
+def preflight(request: RequestedUnitLaunch, selected: UnitLaunchAccount) -> ReadyToLaunch:
+    from scripts.accounts.accounts import DefaultAccount, NamedAccount
+    from scripts.herdr.herdr import Untrusted, UnreadableTrustFile, claude_trust, repository_trust_key, trust_command
+
     production = request.production
     branch = git(production, "branch", "--show-current").stdout.strip()
     if branch != production.merge_branch:
@@ -567,6 +570,17 @@ def preflight(request: RequestedUnitLaunch) -> ReadyToLaunch:
         launch_kind=request.launch_kind,
         timeout=request.timeout,
     )
+    account = NamedAccount(str(selected.dir), selected.dir) if isinstance(selected, RetainedUnitAccount) else selected
+    account_file = Path.home() / ".claude.json" if isinstance(account, DefaultAccount) else account.dir / ".claude.json"
+    folder = request.session_cwd
+    check_folder = (repository_trust_key(production.checkout)
+                    if isinstance(request.session, NewSession) and not folder.exists() else folder)
+    trust = claude_trust(check_folder, account_file)
+    if isinstance(trust, UnreadableTrustFile):
+        raise Refusal(f"{request.unit}: {trust}")
+    if isinstance(trust, Untrusted):
+        label = "default account" if isinstance(account, DefaultAccount) else account.label
+        raise Refusal(f"{request.unit}: Claude is not trusted in {folder} on {label}. Run: {trust_command(check_folder, account)}")
     if restoring:
         # A restore adopts the row it matched and creates nothing: how the unit was first added, whether
         # its Plan cell still names a live plan rather than its as-built, and whether its worktree and
@@ -971,7 +985,7 @@ def main(argv: list[str]) -> int:
                     f"shutdown state unreadable: {permission.detail}"
                 )
 
-            ready = preflight(request)
+            ready = preflight(request, unit_account)
             request = ready.launch
             if cast(bool, args.check):
                 return 0

@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import json
 import os
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -322,8 +323,9 @@ class AddShowrunnerTests(unittest.TestCase):
         _ = self.doc("kid")
         self.trust(self.root, extra={"oauthAccount": {"emailAddress": "SECRET-EMAIL"}, "userID": "SECRET-ID"})
         result = self.run_command("kid", "--check")
-        self.refused(result, f"Claude is not trusted in {checkout.resolve()} on the showrunner account. The user "
-                     + "trusts it first, by running `claude` there once and accepting")
+        self.refused(result, f"kid: Claude is not trusted in {checkout.resolve()} on default account. "
+                     + f"Run: cd {shlex.quote(str(checkout.resolve()))} && "
+                     + "env -u CLAUDE_CONFIG_DIR -u CLAUDE_CODE_REMOTE_MEMORY_DIR claude")
         self.assertNotIn("SECRET", result.stdout + result.stderr)
 
     def test_trust_comes_from_the_repository_root_or_a_worktrees_main_checkout(self) -> None:
@@ -344,12 +346,12 @@ class AddShowrunnerTests(unittest.TestCase):
         _ = self.doc("kid")
         _ = subprocess.run(["git", "init", "-q", str(self.root / "kid-checkout")], check=True, capture_output=True)
         self.trust(self.root)
-        self.refused(self.run_command("kid", "--check"), "Claude is not trusted in")
+        self.refused(self.run_command("kid", "--check"), "kid: Claude is not trusted in")
 
     def test_an_unreadable_config_refuses_without_its_contents(self) -> None:
         _ = (self.root / "claude.json").write_text('{"oauthAccount": "SECRET-EMAIL", ', encoding="utf-8")
         result = self.run_command("kid", "--check")
-        self.refused(result, f"cannot read {self.root / 'claude.json'} to see whether")
+        self.refused(result, f"kid: cannot read {self.root / 'claude.json'} to check Claude trust (JSONDecodeError)")
         self.assertNotIn("SECRET", result.stderr)
 
     def test_a_session_that_runs_no_production_is_refused(self) -> None:

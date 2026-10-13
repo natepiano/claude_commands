@@ -18,7 +18,6 @@ and no showrunner appeared in WAIT_S seconds (the session is left running); 2 on
 from __future__ import annotations
 
 import argparse
-import json
 import os
 import re
 import shlex
@@ -50,48 +49,15 @@ def claude_json() -> Path:
     return Path(os.environ.get("ADD_SHOWRUNNER_CLAUDE_JSON") or Path.home() / ".claude.json")
 
 
-def _project_keys(folder: Path) -> set[str]:
-    """The paths Claude may keep the folder's trust under: the folder, its repository root, and for a
-    worktree its main checkout, whose trust it shares."""
-    keys = {str(folder)}
-    for flag in ("--show-toplevel", "--git-common-dir"):
-        found = subprocess.run(["git", "-C", str(folder), "rev-parse", "--path-format=absolute", flag],
-                               capture_output=True, text=True, check=False)
-        if found.returncode == 0 and found.stdout.strip():
-            path = Path(found.stdout.strip())
-            keys.add(str(path.parent if flag == "--git-common-dir" and path.name == ".git" else path))
-    return keys
-
-
-def trusted(folder: Path) -> bool:
-    """Whether Claude's folder-trust prompt was accepted for `folder` on the showrunner account.
-
-    Only `projects[<path>].hasTrustDialogAccepted` is read: the file also holds account details, and
-    no message ever carries any of it. A trusted parent folder does not cover a repository below it
-    (G1 live check, 2026-10-13: the child sat on the prompt). Raises Refusal when the file cannot be read.
-    """
-    path = claude_json()
-    try:
-        config = cast(object, json.loads(path.read_text(encoding="utf-8")))
-    except (OSError, UnicodeError, ValueError) as error:
-        raise Refusal(f"cannot read {path} to see whether {folder} is trusted ({type(error).__name__})") from error
-    projects = cast(dict[str, object], config).get("projects") if isinstance(config, dict) else None
-    if not isinstance(projects, dict):
-        return False
-    entries = cast(dict[str, object], projects)
-    for key in _project_keys(folder.resolve()):
-        entry = entries.get(key)
-        if isinstance(entry, dict) and cast(dict[str, object], entry).get("hasTrustDialogAccepted") is True:
-            return True
-    return False
-
-
 def checked(child: Production, caller: str, ending: str = "", start_in: Path | None = None) -> str:
     """The tmux to start `child`'s showrunner with. Raises Refusal naming what is in the way.
 
     `ending` names a tmux session the caller ends before the start, so it is not in the way.
     `start_in` is the folder the session starts in, the child's checkout unless given.
     """
+    from scripts.accounts.accounts import DefaultAccount
+    from scripts.herdr.herdr import Untrusted, UnreadableTrustFile, claude_trust, trust_command
+
     if not caller:
         raise Refusal(f"this session runs no production, so it has nothing to attach {child.slug} to")
     if child.slug == caller:
@@ -111,9 +77,12 @@ def checked(child: Production, caller: str, ending: str = "", start_in: Path | N
     if child.slug != ending and tmux_live(tmux, child.slug):
         raise Refusal(f"a tmux session named {child.slug} is already live")
     folder = start_in or child.checkout
-    if not trusted(folder):
-        raise Refusal(f"Claude is not trusted in {folder} on the showrunner account. The user trusts it first, "
-                      + "by running `claude` there once and accepting: a showrunner never answers a trust prompt")
+    trust = claude_trust(folder, claude_json())
+    if isinstance(trust, UnreadableTrustFile):
+        raise Refusal(f"{child.slug}: {trust}")
+    if isinstance(trust, Untrusted):
+        raise Refusal(f"{child.slug}: Claude is not trusted in {folder} on default account. "
+                      + f"Run: {trust_command(folder, DefaultAccount())}")
     return tmux
 
 

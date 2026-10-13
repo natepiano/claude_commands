@@ -12,6 +12,7 @@
     {
       "root": "scripts/herdr",
       "extraPaths": [
+        ".",
         "scripts/herdr",
         "scripts/message",
         "scripts/production",
@@ -72,6 +73,7 @@
       "extraPaths": [
         ".",
         "scripts/nightly_review",
+        "scripts/herdr",
         "scripts/shutdown",
         "scripts/whoami",
         "scripts/lib"

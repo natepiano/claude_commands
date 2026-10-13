@@ -264,9 +264,11 @@ class PromoteShowrunnerTests(unittest.TestCase):
 
     def test_the_childs_check_lets_the_units_own_session_carry_its_name(self) -> None:
         child = read_production(self.child_doc)
+        config = self.root / "claude.json"
+        _ = config.write_text(json.dumps({"projects": {str(child.checkout): {"hasTrustDialogAccepted": True}}}))
         with (mock.patch.object(add_showrunner, "running", mock.Mock(return_value=False)),
               mock.patch.object(add_showrunner, "tmux_live", mock.Mock(return_value=True)),
-              mock.patch.object(add_showrunner, "trusted", mock.Mock(return_value=True)),
+              mock.patch.object(add_showrunner, "claude_json", return_value=config),
               mock.patch.object(showrunners, "descendants_of", mock.Mock(return_value=[])),
               mock.patch.object(unit_lookup, "tmux_binary", mock.Mock(return_value="tmux"))):
             self.assertEqual(ORIGINAL_CHECKED(child, "parent", ending="child"), "tmux")
@@ -285,8 +287,8 @@ class PromoteShowrunnerTests(unittest.TestCase):
               mock.patch.object(add_showrunner, "tmux_live", mock.Mock(return_value=False)),
               mock.patch.object(showrunners, "descendants_of", mock.Mock(return_value=[])),
               mock.patch.object(unit_lookup, "tmux_binary", mock.Mock(return_value="tmux"))):
-            with self.assertRaisesRegex(Refusal, f"Claude is not trusted in {self.worktree.resolve()} on the "
-                                        + "showrunner account"):
+            with self.assertRaisesRegex(Refusal, f"child: Claude is not trusted in {self.worktree.resolve()} on "
+                                        + "default account. Run:"):
                 _ = ORIGINAL_CHECKED(child, "parent", ending="demo", start_in=self.worktree)
 
 
