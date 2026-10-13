@@ -146,6 +146,11 @@ State:
     many open questions it holds. Gather nothing for it. `/showrunner:dailies
     expand <child|all>` adds its own rows. A row that reads `no report yet`
     fills in at that showrunner's next dailies.
+  - **Turn a unit into a lower showrunner only with
+    `/showrunner:promote_showrunner <unit> <production doc>`**, once the unit
+    has committed the new production's doc. The unit keeps its conversation,
+    restarts on the showrunner account and reports to you, and its Units row
+    retires.
   - **Start a lower showrunner only with `/showrunner:add_showrunner
     <production doc>`**, never in your own pane and never as a unit. It gets
     its own tmux session on the showrunner account and is attached to you
