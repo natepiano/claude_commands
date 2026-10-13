@@ -4,7 +4,7 @@ Weighting: gpt-5.6-sol: 1 / 0.1 / 8; gpt-6.1-sol@2026-10-10T21:35Z: 1 / 0.05 / 5
 | Before | 2 | 220.0 | 83.3% | 1 (0.50) | 2 | 0.0 | 2.0 |
 | After, from 2026-10-10 18:17Z | 1 | 100.0 | 0.0% | 1 (0.50) | 1 | 51.2 | 21.9 |
 | After, from 2026-10-10 21:35Z | 1 | 150.0 | 0.0% | 1 (0.20) | 2 | 9.3 | 31.9 |
-Unweighted: gpt-6-sol: 1 turn
+Unweighted: invented-unweighted-model: 1 turn
 
 Sources
 

@@ -10,12 +10,12 @@ import subprocess
 import sys
 import unittest
 from contextlib import closing
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import TypedDict, cast, final, override
 from zoneinfo import ZoneInfo
 
-from scripts.usage import collect
+from scripts.usage import collect, weights
 from scripts.usage.test_collect import FIXTURES as COLLECT_FIXTURES, MacStreamReport, REPOSITORY, SNAPSHOT_COMMIT_SCRIPT, SshBehavior
 from scripts.usage.test_outcomes import OutcomeFixture
 
@@ -38,6 +38,38 @@ class EquivalentSideReport(TypedDict):
     by: str
     additive: str
     general: str
+
+
+class ModelWeightTests(unittest.TestCase):
+    def test_sol_and_astra_weights_cover_all_dates_and_token_kinds(self) -> None:
+        for model in ("gpt-6-sol", "gpt-6-astra"):
+            for at in (datetime.min.replace(tzinfo=timezone.utc), "1900-01-01T00:00:00Z",
+                       "2026-10-12T00:00:00Z", datetime.max.replace(tzinfo=timezone.utc)):
+                with self.subTest(model=model, at=at):
+                    entry = weights.weights_at(model, at)
+                    self.assertEqual(entry.model, model)
+                    self.assertEqual(entry.effective_from, datetime.min.replace(tzinfo=timezone.utc))
+                    self.assertEqual((entry.cached, entry.cache_write_5m, entry.cache_write_1h, entry.output),
+                                     (0.1, 1.25, 1.25, 5))
+                    row = {"model": model, "input": 20, "cache_read": 30,
+                           "cache_write_5m": 4, "cache_write_1h": 8, "output": 2}
+                    # 20 + 30*.1 + 4*1.25 + 8*1.25 + 2*5 = 48.
+                    self.assertEqual(weights.weighted(row, at), 48)
+
+    def test_sql_weights_agree_with_python_for_both_models_from_the_start_of_time(self) -> None:
+        relation = weights.sql_weights("t.model", "t.at")
+        query = ("WITH requests AS (SELECT ? AS model, ? AS at), weight_entries AS ("
+                 + relation.entries + ") SELECT w.cached, w.write_5m, w.write_1h, w.output, "
+                 + "20 + 30*w.cached + 4*w.write_5m + 8*w.write_1h + 2*w.output "
+                 + "FROM requests t LEFT JOIN weight_entries w ON w.weight_entry = " + relation.active_entry)
+        with closing(sqlite3.connect(":memory:")) as db:
+            for model in ("gpt-6-sol", "gpt-6-astra"):
+                for at in (datetime.min.replace(tzinfo=timezone.utc).isoformat(), "2026-10-12T00:00:00+00:00"):
+                    with self.subTest(model=model, at=at):
+                        entry = weights.weights_at(model, at)
+                        actual = cast(tuple[float, float, float, float, float], db.execute(query, (model, at)).fetchone())
+                        self.assertEqual(actual, (entry.cached, entry.cache_write_5m, entry.cache_write_1h,
+                                                  entry.output, 48))
 
 
 class ReportFixture(OutcomeFixture):
@@ -133,6 +165,21 @@ class ReportFixture(OutcomeFixture):
 
 @final
 class UsageReportTests(ReportFixture):
+    def test_new_model_turns_are_weighted_and_the_invented_model_stays_unweighted(self) -> None:
+        self.clear_metric_turns()
+        for model in ("gpt-6-sol", "gpt-6-astra", "invented-unweighted-model"):
+            self.metric_request(model, 0, 20, 30, model=model)
+        with closing(sqlite3.connect(self.db_path)) as db, db:
+            _ = db.execute("UPDATE turns SET cache_write_5m = 4, cache_write_1h = 8")
+        result = self.report("weighted", "--by", "model")
+        self.assertEqual((result.returncode, result.stderr), (0, ""))
+        # Each known model: 20 + 30*.1 + 4*1.25 + 8*1.25 + 10*5 = 88.
+        for model in ("gpt-6-sol", "gpt-6-astra"):
+            self.assertIn(f"| {model} | 88 | 1 | 88 |\n", result.stdout)
+        self.assertIn("| invented-unweighted-model | unweighted | 1 | unweighted |\n", result.stdout)
+        self.assertIn("Unweighted:\n\n| model | turns |\n| --- | --- |\n| invented-unweighted-model | 1 |\n",
+                      result.stdout)
+
     def metric_request(self, thread: str, minute: int, uncached: int, cached: int = 0, *,
                        key: str = "rollout-metric.jsonl:100", role: str = "impl",
                        model: str = "gpt-5.6-sol", parent: str = "", machine: str = "natedev") -> None:
