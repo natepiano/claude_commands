@@ -75,7 +75,8 @@
         "scripts/production",
         "scripts/delegate",
         "scripts/notify",
-        "scripts/shutdown"
+        "scripts/shutdown",
+        "scripts/lib"
       ]
     },
     {
