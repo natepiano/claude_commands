@@ -4,6 +4,12 @@ from dataclasses import dataclass
 from pathlib import Path
 
 TRIAL_SCRIPT = "/home/natepiano/worktrees/claude-build-followups-herdr-trial/scripts/herdr/trial.py"
+TRIAL_RULE = (
+    f"Trial production: units run in herdr session herdr-trial, launched by `{TRIAL_SCRIPT}` "
+    "(the worktree copy carries every later phase's changes before promotion); never launch, "
+    "restart or look up a unit through tmux or `add_unit.py`; log anything that assumes tmux "
+    "with `trial.py issue`; never promote or wrap; never answer a trust or permission prompt for the user."
+)
 
 
 @dataclass(frozen=True)
@@ -66,7 +72,7 @@ def production_plan(root: Path) -> str:
 
 ## Production rules
 
-Trial production: units run in herdr session herdr-trial, launched by `{TRIAL_SCRIPT}` (the worktree copy carries every later phase's changes before promotion); never launch, restart or look up a unit through tmux or `add_unit.py`; log anything that assumes tmux with `trial.py issue`; never promote or wrap; never answer a trust or permission prompt for the user.
+{TRIAL_RULE}
 """
 
 
