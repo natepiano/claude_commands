@@ -111,7 +111,7 @@ class RecordTests(unittest.TestCase):
             "slug": "demo", "production": str(self.production.doc), "checkout": str(self.production.checkout),
             "target": "0.20", "started": NOW.isoformat(), "closed": None,
             "bevy": ["0.19.1"], "pins_read": NOW.isoformat(),
-            "target_bevy": {"status": "unread"}, "target_error": "", "checked": None,
+            "target_bevy": {"status": "unread"}, "target_error": "", "checked": None, "announced": None,
             "dependencies": {name: {
                 "pin": {"source": "registry", "version": "1.0.0"}, "bevy": "0.19.1", "via": [],
                 "patched_bevy": False, "answer": None, "note": "",
@@ -502,6 +502,42 @@ class RecordTests(unittest.TestCase):
             _ = upgrade_record.record_path("demo").write_text(json.dumps(raw), encoding="utf-8")
             with self.assertRaises(upgrade_record.RecordFailure):
                 _ = upgrade_record.load("demo")
+
+
+    def test_load_adds_unannounced_baseline_to_previous_phase_record(self) -> None:
+        current = self.begin()
+        raw = cast(dict[str, object], json.loads(json.dumps(current)))
+        del raw["announced"]
+        with upgrade_record.locked("demo"):
+            _ = upgrade_record.record_path("demo").write_text(json.dumps(raw), encoding="utf-8")
+            self.assertEqual(upgrade_record.load("demo"), current)
+
+    def test_announced_round_trips_and_pin_refresh_keeps_what_was_told(self) -> None:
+        current = self.begin()
+        current["announced"] = {"alpha": {"state": "port in PR", "repository": "owner/adapter",
+                                            "items": {"7": "open", "8": "closed"}}}
+        with upgrade_record.locked("demo"):
+            upgrade_record.save(current)
+            self.assertEqual(upgrade_record.load("demo"), current)
+        merged = upgrade_record.apply_pins(current, self.current_pins, LATER)
+        self.assertEqual(merged["announced"], current["announced"])
+
+    def test_announced_present_fields_are_validated(self) -> None:
+        current = self.begin()
+        cases: tuple[object, ...] = (
+            [], 1, {"alpha": None}, {"alpha": {"state": "done", "items": {}}},
+            {"alpha": {"state": 1, "repository": "", "items": {}}},
+            {"alpha": {"state": "done", "repository": None, "items": {}}},
+            {"alpha": {"state": "done", "repository": "", "items": []}},
+            {"alpha": {"state": "done", "repository": "", "items": {"7": 1}}},
+        )
+        for invalid in cases:
+            with self.subTest(value=invalid), upgrade_record.locked("demo"):
+                raw = cast(dict[str, object], json.loads(json.dumps(current)))
+                raw["announced"] = invalid
+                _ = upgrade_record.record_path("demo").write_text(json.dumps(raw), encoding="utf-8")
+                with self.assertRaises(upgrade_record.RecordFailure):
+                    _ = upgrade_record.load("demo")
 
 
 if __name__ == "__main__":

@@ -11,11 +11,14 @@ import unittest
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import cast, override
+from unittest import mock
 from zoneinfo import ZoneInfo
 
-from dailies_input import (Activity, Block, ClaudeNotRunning, Decision, FormWaiting,
+from add_unit import read_production
+from dailies_render import LENGTHS
+from dailies_input import (Activity, BevyUpgradeUnavailable, Block, ClaudeNotRunning, Decision, FormWaiting,
                            Running, SessionGone, StillWaiting, TicksFailing, UnitRow,
-                           status_blocks)
+                           bevy_upgrade_watch, status_blocks)
 from unit_lookup import UnitState
 
 
@@ -104,6 +107,17 @@ if command == "prune":
     raise SystemExit(0)
 raise SystemExit(2)
 '''
+BEVY_UPGRADE_STUB = '''
+import json
+import os
+from pathlib import Path
+import sys
+
+Path(os.environ["DAILIES_BEVY_EVENTS"]).write_text(json.dumps(sys.argv[1:]), encoding="utf-8")
+print(os.environ.get("DAILIES_BEVY_STDERR", ""), file=sys.stderr, flush=True)
+print(os.environ.get("DAILIES_BEVY_OUTPUT", ""))
+raise SystemExit(int(os.environ.get("DAILIES_BEVY_EXIT", "0")))
+'''
 
 
 class DailiesInputTests(unittest.TestCase):
@@ -156,7 +170,13 @@ class DailiesInputTests(unittest.TestCase):
         self.phase_table.chmod(0o755)
         _ = self.phase_table_json.write_text("{}\n", encoding="utf-8")
         self.showrunner_state = self.root / "showrunner-state"
+        upgrade = self.root / "bevy upgrade stub.py"
+        _ = upgrade.write_text(BEVY_UPGRADE_STUB, encoding="utf-8")
         self.env = {**os.environ, "HOME": str(self.home), "BUILD_HOLD_DIR": str(self.holders),
+                    "DAILIES_BEVY_UPGRADE": str(upgrade),
+                    "DAILIES_BEVY_EVENTS": str(self.root / "bevy-events.json"),
+                    "DAILIES_BEVY_OUTPUT": "", "DAILIES_BEVY_STDERR": "",
+                    "DAILIES_BEVY_EXIT": "0",
                     "MAC_TEST_STATE_DIR": str(self.root / "mac-test"),
                     "DAILIES_TEST_EVENTS": str(self.events), "DAILIES_TEST_FAIL": str(self.notifier_failure),
                     "DAILIES_PHASE_TABLE": str(self.phase_table),
@@ -1137,13 +1157,36 @@ class DailiesInputTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         units = cast(list[dict[str, object]], self.report()["units"])
         self.assertFalse(units[0].get("build_hold", False))
+        self.assertTrue(units[0]["holds_builds"])
         self.assertTrue(units[1]["build_hold"])
+        self.assertNotIn("holds_builds", units[1])
 
-    def test_holder_with_no_other_unit_is_refused(self) -> None:
+    def test_a_holder_with_no_other_unit_renders_with_no_marker(self) -> None:
         _ = (self.holders / ALPHA).write_text(json.dumps({"holder": ALPHA,
             "since": "2026-10-06T09:55:00-07:00", "for": "the panel timing check",
             "release_eta": "unknown"}) + "\n", encoding="utf-8")
-        _ = self.assert_refused_without_output(mention="build_hold")
+        result = self.run_builder()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        units = cast(list[dict[str, object]], self.report()["units"])
+        self.assertNotIn("build_hold", units[0])
+        self.assertTrue(units[0]["holds_builds"])
+
+    def test_a_supplied_holder_mark_is_refused(self) -> None:
+        self.judgment_file(alpha={"holds_builds": True})
+        _ = self.assert_refused_without_output(mention="holds_builds: supplied by holder files")
+
+    def test_a_hold_with_every_unit_left_out_still_renders(self) -> None:
+        # Seen 2026-10-12: the only unit's run had finished while another session held the builds.
+        self.finished_run(self.root / "alpha")
+        _ = self.judgment.write_text(json.dumps({"units": [], "topics": []}) + "\n", encoding="utf-8")
+        _ = (self.holders / "elsewhere").write_text(json.dumps({"holder": "elsewhere",
+            "since": "2026-10-06T09:55:00-07:00", "for": "a frame timing check",
+            "release_eta": "unknown"}) + "\n", encoding="utf-8")
+        result = self.run_builder()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(self.report()["units"], [])
+        self.assertIn(f"left out, run finished and nothing waiting on the user: {ALPHA}", result.stdout)
+        self.assertIn("build hold: ok — 1 active holders checked", result.stdout)
 
     def test_build_hold_marker_without_holder_file_is_refused(self) -> None:
         self.judgment_file(alpha={"build_hold": True})
@@ -1277,6 +1320,134 @@ class DailiesInputTests(unittest.TestCase):
         self.assertEqual(acknowledged.returncode, 0, acknowledged.stdout + acknowledged.stderr)
         topics = cast(list[dict[str, object]], self.report()["topics"])
         self.assertFalse(any(item["title"] == "Review watch" for item in topics))
+
+    def test_bevy_upgrade_topic_uses_record_line_and_waiting_answer_flag(self) -> None:
+        for needs_user in (True, False):
+            with self.subTest(needs_user=needs_user):
+                waiting = " (1 waiting for your answer)" if needs_user else ""
+                update = f"Bevy 0.20 upgrade: 1 of 2 done, 1 git ready{waiting}; checked 10:00 PDT"
+                self.env["DAILIES_BEVY_OUTPUT"] = json.dumps({"update": update, "needs_user": needs_user})
+                result = self.run_builder()
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                topics = cast(list[dict[str, object]], self.report()["topics"])
+                self.assertEqual([item for item in topics if item["title"] == "Bevy upgrade"], [
+                    {"title": "Bevy upgrade", "update": update, "eta": "no ETA stated yet", "needs_user": needs_user}])
+                self.assertIn(f"bevy upgrade: ok — {update}\n", result.stdout)
+                self.assertLess(result.stdout.index("review watch: ok"), result.stdout.index("bevy upgrade: ok"))
+                self.assertLess(result.stdout.index("bevy upgrade: ok"), result.stdout.index("merge branch: ok"))
+                args = cast(list[str], json.loads((self.root / "bevy-events.json").read_text()))
+                self.assertEqual(args, ["--production", str(self.doc), "line", "--json"])
+
+    def test_bevy_upgrade_empty_output_adds_no_topic(self) -> None:
+        result = self.run_builder()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("bevy upgrade: ok — no open watch\n", result.stdout)
+        topics = cast(list[dict[str, object]], self.report()["topics"])
+        self.assertFalse(any(item["title"] == "Bevy upgrade" for item in topics))
+
+    def test_bevy_upgrade_long_sentence_is_bounded_and_report_is_written(self) -> None:
+        limit = min(limit for limit in LENGTHS.values() if limit is not None)
+        sentence = "Bevy 0.20 upgrade: " + "waiting " * limit
+        self.env["DAILIES_BEVY_OUTPUT"] = json.dumps({"update": sentence, "needs_user": True})
+        result = self.run_builder()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        topics = cast(list[dict[str, object]], self.report()["topics"])
+        topic = next(item for item in topics if item["title"] == "Bevy upgrade")
+        update = cast(str, topic["update"])
+        self.assertLessEqual(len(update), limit)
+        self.assertEqual(update, sentence[:limit - 1] + "…")
+        self.assertIs(topic["needs_user"], True)
+        self.assertIn(f"bevy upgrade: ok — {update}\n", result.stdout)
+        self.assertIn("input: ok", result.stdout)
+
+    def test_bevy_upgrade_long_failure_reason_is_bounded_and_report_is_written(self) -> None:
+        limit = min(limit for limit in LENGTHS.values() if limit is not None)
+        reason = "record unreadable " * limit
+        self.env.update({"DAILIES_BEVY_EXIT": "2", "DAILIES_BEVY_STDERR": reason + "\nmore detail"})
+        result = self.run_builder()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        topics = cast(list[dict[str, object]], self.report()["topics"])
+        topic = next(item for item in topics if item["title"] == "Bevy upgrade")
+        update = cast(str, topic["update"])
+        self.assertLessEqual(len(update), limit)
+        self.assertEqual(update, ("the record could not be read: " + reason)[:limit - 1] + "…")
+        self.assertIs(topic["needs_user"], False)
+        self.assertIn(f"bevy upgrade: unavailable — {update}\n", result.stdout)
+        self.assertIn("input: ok", result.stdout)
+
+    def test_bevy_upgrade_sentence_at_renderer_limit_is_unchanged(self) -> None:
+        limit = min(limit for limit in LENGTHS.values() if limit is not None)
+        sentence = "Bevy 0.20 upgrade: ".ljust(limit, "x")
+        self.env["DAILIES_BEVY_OUTPUT"] = json.dumps({"update": sentence, "needs_user": False})
+        result = self.run_builder()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        topics = cast(list[dict[str, object]], self.report()["topics"])
+        topic = next(item for item in topics if item["title"] == "Bevy upgrade")
+        self.assertEqual(topic["update"], sentence)
+        self.assertIn(f"bevy upgrade: ok — {sentence}\n", result.stdout)
+        self.assertIn("input: ok", result.stdout)
+
+    def assert_bevy_unavailable(self, result: subprocess.CompletedProcess[str], reason: str) -> None:
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        update = f"the record could not be read: {reason}"
+        self.assertIn(f"bevy upgrade: unavailable — {update}\n", result.stdout)
+        self.assertNotIn("bevy upgrade: failed", result.stdout)
+        self.assertIn("input: ok", result.stdout)
+        topics = cast(list[dict[str, object]], self.report()["topics"])
+        self.assertEqual([item for item in topics if item["title"] == "Bevy upgrade"], [
+            {"title": "Bevy upgrade", "update": update, "eta": "no ETA stated yet", "needs_user": False}])
+
+    def test_bevy_upgrade_nonzero_exit_keeps_report_with_first_stderr_line(self) -> None:
+        self.env.update({"DAILIES_BEVY_EXIT": "2", "DAILIES_BEVY_STDERR": "record is unreadable\nmore detail"})
+        self.assert_bevy_unavailable(self.run_builder(), "record is unreadable")
+        self.env["DAILIES_BEVY_STDERR"] = ""
+        self.assert_bevy_unavailable(self.run_builder(), "command exited 2")
+
+    def test_bevy_upgrade_wrong_json_shape_keeps_report_with_unavailable_topic(self) -> None:
+        cases: tuple[object, ...] = ([], None, {}, {"update": 1, "needs_user": False},
+                                   {"update": "Bevy upgrade", "needs_user": "false"},
+                                   {"update": "", "needs_user": False},
+                                   {"update": "Bevy upgrade\nextra line", "needs_user": False})
+        for value in cases:
+            with self.subTest(value=value):
+                self.env["DAILIES_BEVY_OUTPUT"] = json.dumps(value)
+                self.assert_bevy_unavailable(self.run_builder(),
+                                             "expected an object with update text and needs_user boolean")
+
+    def test_bevy_upgrade_invalid_json_prefers_first_stderr_line(self) -> None:
+        self.env.update({"DAILIES_BEVY_OUTPUT": "not JSON", "DAILIES_BEVY_STDERR": "bad record\nmore detail"})
+        self.assert_bevy_unavailable(self.run_builder(), "bad record")
+
+    def test_bevy_upgrade_invalid_json_without_stderr_keeps_report_with_parse_reason(self) -> None:
+        self.env["DAILIES_BEVY_OUTPUT"] = "not JSON"
+        self.assert_bevy_unavailable(self.run_builder(), "Expecting value: line 1 column 1 (char 0)")
+
+    def test_bevy_upgrade_missing_script_keeps_report_with_unavailable_topic(self) -> None:
+        script = Path(self.env["DAILIES_BEVY_UPGRADE"])
+        script.unlink()
+        result = self.run_builder()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        topics = cast(list[dict[str, object]], self.report()["topics"])
+        topic = next(item for item in topics if item["title"] == "Bevy upgrade")
+        self.assertIn("can't open file", str(topic["update"]))
+        self.assertFalse(topic["needs_user"])
+        self.assertIn("bevy upgrade: unavailable", result.stdout)
+        self.assertIn("input: ok", result.stdout)
+
+    def test_bevy_upgrade_timeout_returns_unavailable_without_waiting(self) -> None:
+        cases: tuple[tuple[str | bytes | None, str], ...] = (
+            (None, "timed out after 30 seconds"),
+            ("record locked\nmore detail", "record locked"),
+            (b"record locked\nmore detail", "record locked"),
+        )
+        production = read_production(self.doc)
+        command = [sys.executable, self.env["DAILIES_BEVY_UPGRADE"], "--production", str(self.doc), "line", "--json"]
+        for stderr, reason in cases:
+            with self.subTest(stderr=stderr), mock.patch.dict(os.environ, self.env), mock.patch(
+                "dailies_input.subprocess.run", side_effect=subprocess.TimeoutExpired(command, 30, stderr=stderr),
+            ) as run:
+                self.assertEqual(bevy_upgrade_watch(production), BevyUpgradeUnavailable(reason))
+                run.assert_called_once_with(command, capture_output=True, text=True, timeout=30, check=False)
 
     def test_dailies_first_review_alert_marks_topic_and_merge_watch_repeats(self) -> None:
         events = self.watch_stubs()

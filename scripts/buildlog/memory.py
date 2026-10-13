@@ -13,13 +13,13 @@ from datetime import UTC, datetime, timedelta
 from enum import Enum
 from pathlib import Path
 from typing import Literal, TypedDict, cast
-from zoneinfo import ZoneInfo
 
 import index
 import sample
 import store
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
+from user_zone import user_zone  # noqa: E402
 
-PACIFIC = ZoneInfo("America/Los_Angeles")
 GIB = 2**30
 SNAPSHOT_DISTANCE_S = 120
 EARLYOOM = re.compile(r'sending SIG(?:TERM|KILL) to process (\d+) uid \d+ "([^"]+)"')
@@ -164,7 +164,7 @@ def snapshot() -> MemorySnapshot:
 
 def local_time(value: datetime | str, *, with_date: bool = False) -> str:
     instant = datetime.fromisoformat(value) if isinstance(value, str) else value
-    return instant.astimezone(PACIFIC).strftime("%Y-%m-%d %H:%M %Z" if with_date else "%H:%M %Z")
+    return instant.astimezone(user_zone()).strftime("%Y-%m-%d %H:%M %Z" if with_date else "%H:%M %Z")
 
 
 def samples_line(rows: list[tuple[str, str, ServiceState]]) -> str:

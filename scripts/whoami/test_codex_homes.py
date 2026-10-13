@@ -63,18 +63,19 @@ class CodexHomesTests(unittest.TestCase):
     def live_fixture(self, home: Path) -> Report:
         return Report("Codex", email=f"{home.name}@example.invalid", source=CodexHomeSource(home))
 
-    def test_shared_user_zone_uses_production_or_machine_local_time(self) -> None:
+    def test_shared_user_zone_uses_production_or_the_users_zone_setting(self) -> None:
         runner = showrunners.Showrunner(session="fixture", socket="", slug="fixture", zone="Asia/Tokyo", doc="")
         with patch.object(showrunners, "registered_showrunners", return_value=[runner]):
             self.assertEqual(agent_accounts.user_zone(), ZoneInfo("Asia/Tokyo"))
-        with patch.object(showrunners, "registered_showrunners", return_value=[]):
-            self.assertIsNone(agent_accounts.user_zone())
-        with patch.object(showrunners, "registered_showrunners", side_effect=OSError("records unreadable")):
-            self.assertIsNone(agent_accounts.user_zone())
+        with patch.dict(os.environ, {"USER_ZONE": "Europe/Paris"}):
+            with patch.object(showrunners, "registered_showrunners", return_value=[]):
+                self.assertEqual(agent_accounts.user_zone(), ZoneInfo("Europe/Paris"))
+            with patch.object(showrunners, "registered_showrunners", side_effect=OSError("records unreadable")):
+                self.assertEqual(agent_accounts.user_zone(), ZoneInfo("Europe/Paris"))
 
-    def test_shared_user_zone_uses_machine_time_when_production_cannot_import(self) -> None:
-        with patch.dict("sys.modules", {"scripts.production": None}):
-            self.assertIsNone(agent_accounts.user_zone())
+    def test_shared_user_zone_uses_the_setting_when_production_cannot_import(self) -> None:
+        with patch.dict("sys.modules", {"scripts.production": None}), patch.dict(os.environ, {"USER_ZONE": "Europe/Paris"}):
+            self.assertEqual(agent_accounts.user_zone(), ZoneInfo("Europe/Paris"))
 
     def test_discovery_includes_default_even_when_no_codex_home_exists(self) -> None:
         self.assertEqual(agent_accounts.codex_homes(agent_accounts.seats_home()), [self.home / ".codex"])

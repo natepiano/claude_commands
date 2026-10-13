@@ -184,7 +184,7 @@ On the showrunner's go, the phases run in order in this worktree. Each ends with
 
 **Gotchas:** the file is local, like the tree, so both showrunners must be on one machine. A child's row reads `no report yet` until that child's builder has run once with this code.
 
-### Phase 4 — A showrunner starts a lower showrunner in tmux, on the showrunner account  · status: todo · live check gated by G1
+### Phase 4 — A showrunner starts a lower showrunner in tmux, on the showrunner account  · status: done · live check is the showrunner's to run after promotion
 
 #### Work Order
 
@@ -206,6 +206,22 @@ On the showrunner's go, the phases run in order in this worktree. Each ends with
 **Files:** `scripts/production/add_showrunner.py`, `test_add_showrunner.py`; `commands/showrunner/add_showrunner.md`; `commands/showrunner/produce.md`.
 
 **Acceptance gate:** the gate. Tests run against `fake_tmux.py`: the tmux command carries no unit mark and no account prefix, the environment holds no `CLAUDE_*`, each refusal starts nothing, and attach follows the timer. Live under G1: natedev starts the scratch production's showrunner; `showrunners.py tree` shows it under build-followups; `/showrunner:accounts` shows it on the showrunner account; the scratch production is wrapped afterwards.
+
+#### As-built
+
+Built as specified; the code-level account is `docs/as-built/showrunner-automation.md` → Nested showrunners → "A parent starts a child showrunner in tmux (phase 4)". Calls made while building:
+
+- **A running showrunner is an update timer whose session is live**, not a timer alone. A timer outlives a session that ended, and that ended session is what `--resume` restarts; counting the timer would have refused every resume. The wait after the launch is for the same thing.
+- **A resumed child that already reports to the caller is left as it is.** Its parent file is still stored from before, so the command prints `<child> already reports to <caller>` and sends nothing. A child that reports to another showrunner gets `attach`'s own refusal and exit 1, with its session left running.
+- **Two refusals beyond the five in the spec:** the caller runs no production, and the session records cannot be read (the command cannot tell whether the child runs).
+- **The ancestor check reads the tree downward** from the child: `caller in descendants_of(child)`.
+- **The wait is 180 s**, changed with `ADD_SHOWRUNNER_WAIT_S`. On a timeout the command names the two commands to finish by hand.
+- **Tests use their own recording stand-ins**, not `fake_tmux.py`, which answers neither `has-session` nor `new-session`. Nothing real starts and nothing real is sent.
+- **G1** was settled by the showrunner as its own call (a scratch showrunner started and wrapped can be undone); it runs the live check after promotion.
+
+**Binds later work:** Phase 5's stop finds a lower showrunner's tmux session by its slug, the name this launcher gives it. The session has no unit mark, so `unit_lookup` never lists it.
+
+**Gotchas:** the tmux session's name is the production's slug, so a unit whose session has that same name blocks the start (`a tmux session named <slug> is already live`). The launcher needs the parent's own `CLAUDE_CODE_SESSION_ID` to know which production it runs: run from a plain shell it refuses with "this session runs no production".
 
 ### Phase 5 — Promote a unit to a showrunner  · status: todo · live check gated by G2
 

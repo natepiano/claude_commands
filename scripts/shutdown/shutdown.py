@@ -11,10 +11,9 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Literal, TypedDict, cast
-from zoneinfo import ZoneInfo
 
 SCRIPTS = Path(__file__).resolve().parents[1]
-for dependency in ("whoami", "message", "production"):
+for dependency in ("whoami", "message", "production", "lib"):
     sys.path.insert(0, str(SCRIPTS / dependency))
 
 from account import (
@@ -59,6 +58,7 @@ from remote import other_machine, run_remote
 import settle
 import stop as stop_work
 import restart as restart_work
+from user_zone import user_zone
 
 
 class CommandLine(argparse.Namespace):
@@ -226,14 +226,14 @@ def _local_time(value: str) -> str:
         parsed = datetime.fromisoformat(value)
     except ValueError:
         return value
-    return parsed.astimezone(ZoneInfo("America/Los_Angeles")).strftime(
+    return parsed.astimezone(user_zone()).strftime(
         "%Y-%m-%d %H:%M:%S %Z"
     )
 
 
 def _shutdown_hold_time(value: str) -> str:
     return datetime.fromisoformat(value).astimezone(
-        ZoneInfo("America/Los_Angeles")
+        user_zone()
     ).strftime("%Y-%m-%d %H:%M %Z")
 
 
@@ -665,61 +665,65 @@ def main(arguments: list[str] | None = None) -> int:
             print("\n".join(lines))
         return 0
 
-    if options.command == "conduct":
-        return settle.conduct(options.account or "")
-
-    if options.command == "ready":
-        return settle.ready(options.where)
-
     try:
-        selected = _selected_account(options.account)
-    except (UnreadableAccount, UnknownAccountName) as error:
-        print(f"shutdown: {error}", file=sys.stderr)
-        return 2
-    ids: tuple[str, ...] = ()
-    if options.command in {"down", "now", "cancel"} and options.only is not None:
+        if options.command == "conduct":
+            return settle.conduct(options.account or "")
+
+        if options.command == "ready":
+            return settle.ready(options.where)
+
         try:
-            ids = tuple(resolve_sessions(selected.login, _only_ids(options.only), here=options.here))
-        except SessionSelectionError as error:
+            selected = _selected_account(options.account)
+        except (UnreadableAccount, UnknownAccountName) as error:
             print(f"shutdown: {error}", file=sys.stderr)
             return 2
-        except (InvalidRecord, InvalidInventory, OSError) as error:
-            print(f"shutdown: {error}", file=sys.stderr)
-            return 3
-    if options.command == "down":
-        return settle.down(
-            selected, options.here, ids,
-            then="restart" if options.restart else "stop",
-            alerts="none" if options.no_alert else "user",
-            requested_by=options.requested_by, request_id=options.request_id,
-        )
-    if options.command == "now":
-        return settle.now(selected, options.here, ids)
-    if options.command == "cancel":
-        return settle.cancel(selected, options.here, ids)
-    reports = _status(selected, options.here)
-    if options.as_json:
-        print(json.dumps(reports[0] if options.here else reports, sort_keys=True))
-    else:
-        print(f"{selected.label} · {selected.login}")
-        observations = tuple(report for report in reports if "sessions" in report)
-        for index, report in enumerate(reports):
-            if "sessions" in report:
-                print("\n".join(_inventory_lines(report)))
-            elif "unreachable" in report:
-                print(f"{report['machine']}: unreachable")
-            else:
-                print(f"{report['machine']}: unavailable (rc {report['rc']})")
-            outcome = (_local_shutdown_records(selected.login, report["machine"]) if index == 0
-                       else _remote_shutdown_records(selected.login))
-            record_lines = _shutdown_record_lines(outcome, observations, local_observation=index == 0)
-            if outcome["kind"] == "records":
-                waiting = any(saved["progress"]["kind"] in {"waiting", "ready"} for saved in outcome["records"])
-                ownership = (conductor_status(selected.login) if index == 0 else _remote_conductor_status(selected.login)) if waiting else ConductorNotRunning()
-                record_lines.extend(_status_actions(outcome["records"], ownership))
-            if record_lines:
-                print("\n".join(record_lines))
-    return 0
+        ids: tuple[str, ...] = ()
+        if options.command in {"down", "now", "cancel"} and options.only is not None:
+            try:
+                ids = tuple(resolve_sessions(selected.login, _only_ids(options.only), here=options.here))
+            except SessionSelectionError as error:
+                print(f"shutdown: {error}", file=sys.stderr)
+                return 2
+            except (InvalidRecord, InvalidInventory, OSError) as error:
+                print(f"shutdown: {error}", file=sys.stderr)
+                return 3
+        if options.command == "down":
+            return settle.down(
+                selected, options.here, ids,
+                then="restart" if options.restart else "stop",
+                alerts="none" if options.no_alert else "user",
+                requested_by=options.requested_by, request_id=options.request_id,
+            )
+        if options.command == "now":
+            return settle.now(selected, options.here, ids)
+        if options.command == "cancel":
+            return settle.cancel(selected, options.here, ids)
+        reports = _status(selected, options.here)
+        if options.as_json:
+            print(json.dumps(reports[0] if options.here else reports, sort_keys=True))
+        else:
+            print(f"{selected.label} · {selected.login}")
+            observations = tuple(report for report in reports if "sessions" in report)
+            for index, report in enumerate(reports):
+                if "sessions" in report:
+                    print("\n".join(_inventory_lines(report)))
+                elif "unreachable" in report:
+                    print(f"{report['machine']}: unreachable")
+                else:
+                    print(f"{report['machine']}: unavailable (rc {report['rc']})")
+                outcome = (_local_shutdown_records(selected.login, report["machine"]) if index == 0
+                           else _remote_shutdown_records(selected.login))
+                record_lines = _shutdown_record_lines(outcome, observations, local_observation=index == 0)
+                if outcome["kind"] == "records":
+                    waiting = any(saved["progress"]["kind"] in {"waiting", "ready"} for saved in outcome["records"])
+                    ownership = (conductor_status(selected.login) if index == 0 else _remote_conductor_status(selected.login)) if waiting else ConductorNotRunning()
+                    record_lines.extend(_status_actions(outcome["records"], ownership))
+                if record_lines:
+                    print("\n".join(record_lines))
+        return 0
+    except InvalidRecord as error:
+        print(f"shutdown: {error}", file=sys.stderr)
+        return 3
 
 
 if __name__ == "__main__":

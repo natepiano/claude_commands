@@ -116,6 +116,11 @@ def account_hold() -> record.AccountHold:
     )
 
 
+def setUpModule() -> None:
+    """The times these tests expect are Pacific; the user's zone setting must not change them."""
+    unittest.enterModuleContext(patch.dict(os.environ, {"USER_ZONE": "America/Los_Angeles"}))
+
+
 @final
 class ShutdownLaunchCliTests(ShutdownTestCase):
     root = Path()
@@ -198,6 +203,84 @@ class ShutdownLaunchCliTests(ShutdownTestCase):
             check=False,
             timeout=10,
         )
+
+    def conflicting_legacy_record(self, conflict: str) -> str:
+        self.clear_state()
+        old = shutdown_record("settling", session_id="id/one")
+        directory = self.state / LOGIN
+        if conflict == "session ids":
+            current = session_shutdown(record.SessionWaiting(kind="waiting"), "id-one")
+            self.assertTrue(record.create_session(current))
+        write_old(old)
+        (directory / "lock").touch()
+        if conflict == "history names":
+            partial = directory / "partial"
+            partial.mkdir()
+            _ = (partial / "record.json").write_text(json.dumps(old))
+            return f"{directory / 'history'} has conflicting legacy history names"
+        if conflict == "existing target":
+            history = directory / "history"
+            history.mkdir()
+            target = history / f"{OCTOBER}-record.json"
+            _ = target.write_text("retained history")
+            return f"{target} already exists"
+        if conflict == "session names":
+            other = shutdown_record("settling", session_id="id-one")
+            old["entries"].extend(other["entries"])
+            write_old(old)
+            return f"{directory / 'sessions'} has conflicting session names"
+        return f"{directory / 'sessions' / 'id-one.json'} has conflicting session ids 'id-one' and 'id/one'"
+
+    def store_contents(self) -> dict[Path, bytes]:
+        return {path.relative_to(self.state): path.read_bytes()
+                for path in self.state.rglob("*") if path.is_file()}
+
+    def test_migration_conflicts_print_one_error_and_leave_each_requested_verb_untouched(self) -> None:
+        for conflict in ("history names", "existing target", "session ids", "session names"):
+            for verb in ("down", "cancel", "now", "conduct"):
+                with self.subTest(conflict=conflict, verb=verb):
+                    diagnostic = self.conflicting_legacy_record(conflict)
+                    before = self.store_contents()
+                    directories = sorted(path.relative_to(self.state) for path in self.state.rglob("*") if path.is_dir())
+                    output, error = io.StringIO(), io.StringIO()
+                    with patch.object(settle, "_warm", return_value=True), patch.object(settle, "send_message") as sender, patch.object(settle, "_launch_conductor") as conductor, redirect_stdout(output), redirect_stderr(error):
+                        result = shutdown.main([verb, LOGIN, "--here"])
+                    self.assertEqual(result, 3)
+                    self.assertEqual(output.getvalue(), "")
+                    self.assertEqual(error.getvalue(), f"shutdown: {diagnostic}\n")
+                    self.assertNotIn("Traceback", error.getvalue())
+                    self.assertEqual(self.store_contents(), before)
+                    self.assertEqual(sorted(path.relative_to(self.state) for path in self.state.rglob("*") if path.is_dir()), directories)
+                    sender.assert_not_called()
+                    conductor.assert_not_called()
+
+    def test_ready_filename_conflict_prints_one_error_without_changing_records(self) -> None:
+        _ = self.conflicting_legacy_record("session ids")
+        before = self.store_contents()
+        report = inventory.Inventory(machine="natedev", login=LOGIN, label=LABEL,
+                                     sessions=[unit_session("id/one")], unattributed=[])
+        output, error = io.StringIO(), io.StringIO()
+        with patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": "id/one"}), patch.object(settle, "run_inventory", return_value=report), patch.object(settle, "blocker", return_value=record.ReadinessClear(kind="clear")), redirect_stdout(output), redirect_stderr(error):
+            result = shutdown.main(["ready", "--where", "waiting for the user"])
+        self.assertEqual(result, 3)
+        self.assertEqual(output.getvalue(), "")
+        self.assertEqual(error.getvalue(), f"shutdown: {self.state / LOGIN / 'sessions' / 'id-one.json'} is used by a different session id\n")
+        self.assertEqual(self.store_contents(), before)
+
+    def test_status_reads_filename_conflict_without_migrating_records(self) -> None:
+        _ = self.conflicting_legacy_record("session ids")
+        before = self.store_contents()
+        report = inventory.Inventory(machine="natedev", login=LOGIN, label=LABEL,
+                                     sessions=[], unattributed=[])
+        output, error = io.StringIO(), io.StringIO()
+        with patch.object(shutdown, "inventory", return_value=report), patch.object(shutdown, "conductor_status", return_value=record.ConductorNotRunning()), redirect_stdout(output), redirect_stderr(error):
+            result = shutdown.main(["status", LOGIN, "--here"])
+        self.assertEqual(result, 0)
+        self.assertEqual(error.getvalue(), "")
+        self.assertEqual(output.getvalue().count("  alpha: waiting"), 2)
+        self.assertIn(f"{LABEL} · {LOGIN}\n", output.getvalue())
+        self.assertNotIn("Traceback", output.getvalue())
+        self.assertEqual(self.store_contents(), before)
 
     def test_down_restart_passes_the_selected_scope_and_intent(self) -> None:
         selected = Account("claude", LOGIN, LABEL)

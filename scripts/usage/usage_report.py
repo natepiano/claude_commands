@@ -20,6 +20,7 @@ if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from scripts.usage import collect, outcomes, weights
+from scripts.lib.user_zone import user_zone_name
 from scripts.usage.rollouts import parse_timestamp
 
 
@@ -867,7 +868,7 @@ class ReportArguments(argparse.Namespace):
         self.by = DefaultGrouping()
         self.since = ""
         self.until = ""
-        self.zone = "America/Los_Angeles"
+        self.zone = user_zone_name()
         self.exact = False
 
 
@@ -891,7 +892,7 @@ def report_request(args: ReportArguments) -> ReportRequest:
     try:
         zone = ZoneInfo(zone_name)
     except (ZoneInfoNotFoundError, ValueError) as error:
-        raise ReportRefused(f"unknown zone {zone_name!r}; accepted: IANA zone names, such as America/Los_Angeles or UTC") from error
+        raise ReportRefused(f"unknown zone {zone_name!r}; accepted: IANA zone names, such as {user_zone_name()} or UTC") from error
     window = TimeWindow(parse_bound(args.since, zone), parse_bound(args.until, zone))
     if (isinstance(window.since, TimeBound) and isinstance(window.until, TimeBound)
             and window.since.at >= window.until.at):

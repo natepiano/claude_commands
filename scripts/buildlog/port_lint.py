@@ -53,6 +53,9 @@ import record
 import store
 import treekey
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
+from user_zone import user_zone  # noqa: E402
+
 DEFERRED = 75
 USAGE = 2
 COMMANDS = ("clippy", "mend", "sweep")
@@ -259,7 +262,7 @@ def reusable(command: str, cwd: str, worktree: str) -> Reusable | None:
 
 def replay(command: str, found: Reusable) -> None:
     who = f"{found.caller or 'unknown'} {found.seat}" if found.seat else found.caller or "unknown"
-    at = datetime.fromisoformat(found.started_at.replace("Z", "+00:00")).astimezone().strftime("%H:%M")
+    at = datetime.fromisoformat(found.started_at.replace("Z", "+00:00")).astimezone(user_zone()).strftime("%H:%M")
     word = "passed" if found.status == 0 else "failed"
     print(f"port-lint: {command} reused from {who} at {at}, tree unchanged ({word})", flush=True)
     if found.status == 0:

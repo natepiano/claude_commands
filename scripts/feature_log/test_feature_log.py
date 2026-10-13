@@ -97,6 +97,11 @@ Start builds in two sessions. Both draw from the same natedev build capacity.
 """
 
 
+def setUpModule() -> None:
+    """The times these tests expect are Pacific; the user's zone setting must not change them."""
+    unittest.enterModuleContext(patch.dict(os.environ, {"USER_ZONE": "America/Los_Angeles"}))
+
+
 class CliResult(NamedTuple):
     status: int
     stdout: str

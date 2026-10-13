@@ -153,8 +153,8 @@ start; read that record.
 
 4. **A single plan doc in conversation**, if the durable lookup found nothing.
 
-5. **Ask.** Never guess, and never shrink a doc the user did not name or that
-   the run record did not produce.
+5. **Ask.** Never pick a doc on your own, and never shrink a doc the user did
+   not name or that the run record did not produce.
 
 **Sanity-check whatever came back** before continuing: the path exists and its
 head carries a `## Delegation Context` section. A plan doc that fails this is not
@@ -417,7 +417,8 @@ for s in sorted(m["spans"], key=lambda s: s["start"], reverse=True):
     body = pathlib.Path(s["file"]).read_text().splitlines(keepends=True)
     assert body and body[0].rstrip("\n") == original.rstrip("\n"), \
         f"span {s['id']} replacement does not open with the original heading"
-    lines[start - 1 : end] = ["".join(body).rstrip("\n") + "\n\n"]
+    tail = "\n" if end >= len(lines) else "\n\n"
+    lines[start - 1 : end] = ["".join(body).rstrip("\n") + tail]
 
 plan.write_text("".join(lines))
 print(f"spliced {len(m['spans'])} phases")

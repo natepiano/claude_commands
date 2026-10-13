@@ -27,5 +27,8 @@
 !shared/**
 !templates/
 !templates/**
+!mods/
+!mods/**
+mods/**/.claude-plugin/types/
 # Python cache (inside allowed dirs)
 **/__pycache__/

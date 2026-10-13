@@ -60,7 +60,7 @@ def _crate_facts(fetch: upstream.Fetch, name: str, entry: Entry, target: str,
                         newest=info.versions[0], ready=ready, repository=info.repository)
 
 
-def _github_facts(fetch: upstream.Fetch, entry: Entry, record: Record, bevy_names: frozenset[str]) -> None:
+def _github_facts(fetch: upstream.Fetch, name: str, entry: Entry, record: Record, bevy_names: frozenset[str]) -> None:
     facts = entry["crates_io"]
     if facts["status"] == "unread" or not facts["repository"]:
         return
@@ -72,16 +72,17 @@ def _github_facts(fetch: upstream.Fetch, entry: Entry, record: Record, bevy_name
                 if branch["status"] == "read" and branch["repository"] == repository else {})
     if branch["status"] == "read" and branch["repository"] != repository:
         branch = BranchUnread(status="unread")
-    name = branch["name"] if branch["status"] == "read" else upstream.default_branch(fetch, repository)
+    branch_name = branch["name"] if branch["status"] == "read" else upstream.default_branch(fetch, repository)
     try:
-        head = upstream.branch_head(fetch, repository, name)
+        head = upstream.branch_head(fetch, repository, branch_name)
     except upstream.NotFound:
         if branch["status"] == "unread":
             raise
-        name = upstream.default_branch(fetch, repository)
-        head = upstream.branch_head(fetch, repository, name)
+        branch_name = upstream.default_branch(fetch, repository)
+        head = upstream.branch_head(fetch, repository, branch_name)
     requirement = (branch["requirement"] if branch["status"] == "read" and branch["rev"] == head.rev
-                   else upstream.manifest_requirement(fetch, repository, head.rev, bevy_names))
+                   and branch["requirement"]
+                   else upstream.manifest_requirement(fetch, repository, head.rev, name, bevy_names))
     target = record["target_bevy"]
     since = (target["since"] if target["status"] == "pre-release" or target["status"] == "released"
              else record["started"][:10])
@@ -95,8 +96,14 @@ def _github_facts(fetch: upstream.Fetch, entry: Entry, record: Record, bevy_name
         else:
             item["state"], item["head"] = upstream.pull_state(fetch, repository, item["number"])
     returned = {item["number"] for item in items}
-    items.extend(item for number, item in previous.items() if number not in returned)
-    entry["branch"] = BranchRead(status="read", repository=repository, name=name, rev=head.rev,
+    for number, old in previous.items():
+        if number in returned:
+            continue
+        item = old.copy()
+        if item["kind"] == "pr" and item["state"] == "open":
+            item["state"], item["head"] = upstream.pull_state(fetch, repository, number)
+        items.append(item)
+    entry["branch"] = BranchRead(status="read", repository=repository, name=branch_name, rev=head.rev,
                                   committed=head.committed, requirement=requirement)
     entry["items"] = items
 
@@ -135,7 +142,7 @@ def run_check(record: Record, pins: Pins, fetch: upstream.Fetch, clock: Clock) -
             try:
                 staged: Entry = entry.copy()
                 staged["crates_io"] = _crate_facts(entry_fetch, name, entry, record["target"], pins.bevy_names, checked)
-                _github_facts(entry_fetch, staged, record, pins.bevy_names)
+                _github_facts(entry_fetch, name, staged, record, pins.bevy_names)
             except upstream.FetchFailure as error:
                 entry["error"] = str(error)
                 failed += 1

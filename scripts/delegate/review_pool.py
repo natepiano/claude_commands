@@ -333,6 +333,18 @@ def command_prime(args: PoolArguments) -> int:
     return 0
 
 
+def command_unit_memory(args: PoolArguments) -> int:
+    if not args.unit or Path(args.unit).name != args.unit or args.unit in (".", ".."):
+        raise PoolError("unit must name one memory file")
+    path = _production(args.production).directory / "memory" / f"{args.unit}.md"
+    try:
+        content = path.read_bytes()
+    except FileNotFoundError:
+        return 0
+    _ = sys.stdout.buffer.write(content)
+    return 0
+
+
 def command_arm(args: PoolArguments) -> int:
     production = _production(str(args.production))
     with production.locked(write=False) as pool:
@@ -567,6 +579,10 @@ def command_status(args: PoolArguments) -> int:
 def command_stop(args: PoolArguments) -> int:
     production = _production(str(args.production))
     with production.locked() as pool:
+        adoption = production.directory / "ui_adopted"
+        if adoption.exists():
+            adoption.unlink()
+            print("review_pool: ui adoption cleared", file=sys.stderr)
         # Retry an interrupted stop against the same ended generation.
         if not pool.stopping:
             pool.generation += 1
@@ -590,13 +606,15 @@ def command_stop(args: PoolArguments) -> int:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     subparsers = parser.add_subparsers(dest="verb", required=True)
-    for verb in ("prime", "arm", "split", "allocate", "release", "end-lease", "status", "health", "stop"):
+    for verb in ("prime", "arm", "split", "allocate", "release", "end-lease", "status", "health", "stop", "unit-memory"):
         command = subparsers.add_parser(verb)
         _ = command.add_argument("--production", required=True)
         if verb in ("prime", "allocate"):
             _ = command.add_argument("--type", choices=("code", "ui"), required=True)
         if verb == "prime":
             _ = command.add_argument("--instructions-file", required=True)
+        if verb == "unit-memory":
+            _ = command.add_argument("--unit", required=True)
         if verb in ("arm", "allocate", "end-lease"):
             _ = command.add_argument("--unit", required=True)
             _ = command.add_argument("--phase", required=verb != "end-lease", default="")
@@ -618,6 +636,7 @@ def main() -> int:
         "prime": command_prime, "arm": command_arm, "split": command_split,
         "allocate": command_allocate, "release": command_release, "end-lease": command_end_lease,
         "status": command_status, "health": command_health, "stop": command_stop,
+        "unit-memory": command_unit_memory,
     }
     try:
         return handlers[str(args.verb)](args)

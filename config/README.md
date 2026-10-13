@@ -147,6 +147,28 @@ found`. A bad line leaves out the counts line, and the builder prints
 overrides the path. Today it holds build-followups' nightly review queue and
 plan backlog, and tool-based-ui's hanadocs proposals (user, 2026-10-10).
 
+## user_zone.conf
+
+The zone every time shown to the user is written in: `zone=<IANA zone name>`,
+such as `zone=America/New_York`. Reports, tables, alerts and the commands in
+skills read it through `scripts/lib/user_zone.py`, so changing the zone is this
+one line, and it applies to the next report with nothing to restart. The label
+beside a time (EDT, EST) comes from the zone. With no file, or no `zone=` line,
+the zone is America/New_York; a name that is not a zone is refused, with this
+file named.
+
+- Python imports `user_zone()`, `user_zone_name()` or `zone_label()` from the
+  script.
+- Shell and skill text run it for the name:
+  `TZ="$(~/.claude/scripts/lib/py ~/.claude/scripts/lib/user_zone.py)" date '+%H:%M %Z'`.
+- `USER_ZONE` in the environment wins over the file. Tests whose expected
+  output is in one zone pin it this way.
+
+A production keeps its own `User zone` line in its production doc, and the
+dailies read that. A time stored without an offset keeps the zone it was
+recorded in: `scripts/model_study/turns.py` names Pacific for the model study's
+roster.
+
 ## cargo-fmt-exclusions.json
 
 List of crate names to exclude from `cargo fmt` checks. Used when running formatting on external/third-party crates where we don't want to modify their style.

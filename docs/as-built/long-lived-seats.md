@@ -2,7 +2,7 @@
 
 ## What it is
 
-A `/unit:direct` run opens its Codex seats once and keeps them for the rest of the run. Every later phase, repair round, broad review lens, closure review and phase-review architect pass goes to a seat that is already open, with `--to <full-seat-name>`. A seat can change role between tasks: a writer becomes a tester, a tester becomes a reviewer, or a writer takes the adversary lens against its own code. Before an open seat gets new work, the launcher compacts its thread if the recorded context is over a threshold. A turn that fills the context window gets the follow-up "Continue where you stopped." When a phase finishes, its turns end but its threads stay open. The threads end only when `end_session.sh` stops the run's app-server. `scripts/whoami/seat_usage.py` checks whether this saves Codex usage. It compares weighted Codex usage per checkpointed phase before and after the go-live time, and reports account switches per week and credits used per day alongside.
+A `/unit:direct` run opens its Codex seats once and keeps them for the rest of the run. Every later phase, repair round, broad review lens, closure review and phase-review architect pass goes to a seat that is already open, with `--to <full-seat-name>`. The exception is a phase on the pool arm of a production with a review pool: its code reviews go to the production's pooled reviewers, which are not seats of the run (`docs/as-built/review-pool.md`). A seat can change role between tasks: a writer becomes a tester, a tester becomes a reviewer, or a writer takes the adversary lens against its own code. Before an open seat gets new work, the launcher compacts its thread if the recorded context is over a threshold. A turn that fills the context window gets the follow-up "Continue where you stopped." When a phase finishes, its turns end but its threads stay open. The threads end only when `end_session.sh` stops the run's app-server. `scripts/whoami/seat_usage.py` checks whether this saves Codex usage. It compares weighted Codex usage per checkpointed phase before and after the go-live time, and reports account switches per week and credits used per day alongside.
 
 ## How it works
 
@@ -13,7 +13,8 @@ Each run has one detached `codex app-server --listen ws://127.0.0.1:<port>`. Eac
 | Verb | Signature | Behavior |
 | --- | --- | --- |
 | `start` | `--session-dir --name [--role impl\|test\|fix\|review] --cwd --prompt-file --summary-file [--reply-file] --log-file [--model --effort --service-tier] [--sandbox danger-full-access] [--resident]` | Opens a thread and blocks until its turn ends. `--role` is optional, and roleless threads such as ask-a-friend friends leave it out. |
-| `follow` | `--session-dir --to --role (required) [--claim-pid] --message-file --summary-file [--reply-file] --log-file [--model --effort --service-tier]` | Runs one more turn on a finished thread. If the old server is gone, it resumes the thread on a new one. |
+| `follow` | `--session-dir --to --role (required) [--lens] [--claim-pid] --message-file --summary-file [--reply-file] --log-file [--model --effort --service-tier] [--cwd] [--read-only] [--image …]` | Runs one more turn on a finished thread. If the old server is gone, it resumes the thread on a new one. `--cwd`, `--read-only` and `--image` apply to that turn only and exist for the review pool; without them the request is the seat's usual one. |
+| `prime`, `fork`, `reset` | see `docs/as-built/review-pool.md` | Create a read-only reviewer template with standing instructions, fork a named reviewer from it, and remove every turn from an idle reviewer. Only the review pool calls them. |
 | `compact` | `--session-dir --to` | Refuses a seat that is running or busy, and a seat with no recorded context size. Otherwise it resumes the thread, waits up to 60 s (`COMPACT_IDLE_WAIT_SECS`) for a turn still live on it to end, exits 3 (`COMPACT_TURN_STILL_LIVE`) if one stays live, and calls `thread/compact/start`. It waits until the compaction turn has a `thread/compacted` notice or a `contextCompaction` item, a token-usage update and a `turn/completed`. It then writes the new size to the roster and prints `compacted <seat>: <before> -> <after> tokens`. A compaction that has not finished in 300 s (`CompactionTimedOut`) is interrupted with `turn/interrupt` and the thread is read until idle, up to the same 60 s: idle is exit 1 with `…; interrupted the compaction turn, the seat is idle and not compacted`, so a follow-up can still be sent; a turn still live is exit 3. Before 2026-10-11 the timed-out turn was left live, and every later follow-up and compaction of the seat was refused. |
 | `can-follow` | `--session-dir --to --role [--claim-pid]` | Refuses a seat that cannot take a follow-up. With `--claim-pid`, it claims the seat under the roster `flock`: it sets `status: starting`, `launcher_pid`, `previous_status`, the new `role`, and `previous_role` (the role the seat held before). |
 | `release-follow` | `--session-dir --to --claim-pid` | Releases a claim that never started a turn. It restores `previous_role`, or removes `role` if the seat had none, and returns the seat to its previous status. A follow that did run keeps the role it was claimed with, so after a completed review the seat's role stays `review`. |
@@ -32,6 +33,7 @@ Each run has one detached `codex app-server --listen ws://127.0.0.1:<port>`. Eac
 - `role`: `impl`, `test`, `fix` or `review`, or absent for a roleless thread.
 - `context_tokens`: `tokenUsage.last.inputTokens` from the turn's latest `thread/tokenUsage/updated`.
 - During a claim only: `previous_role` and `previous_status`.
+- For a pooled reviewer or its template only: `instructions_file`, whose text is sent again as `developerInstructions` on every resume and fork.
 
 The read-only roster reader `scripts/message/roster.py` (`docs/as-built/session-roster.md`) reads `thread_id`, `status`, `role`, `lens`, `launcher_pid` and `cwd`, and leaves `ended` seats out. A `review` seat with a `lens` field shows as `review (<lens>)`, but no launcher writes `lens` into the mesh roster. The lens is recorded in artifact names and in the progress and findings records.
 
@@ -57,11 +59,13 @@ The flag is cleared by any `item/completed` from the seat's own work, but not by
 - It reads the threshold from `config/delegate.conf` (`PLAN_DELEGATE_CONFIG` can override the path). A missing, non-numeric or non-positive value exits 2 with an error naming the key.
 - A seat assigned a different role keeps its slot as the 9th argument and changes only the task and pass-kind words.
 
-**`scripts/delegate/review.sh [--to <seat> | --slot <new-slot>] <session_dir> [working_dir] [prompt_file] [task] [role_description] [pass_activity] [pass_index] [lens] [early_ready_file]`**
+**`scripts/delegate/review.sh [--to <seat> | --slot <new-slot> | --pool code|ui --lease <slug>/<unit>/<phase>] <session_dir> [working_dir] [prompt_file] [task] [role_description] [pass_activity] [pass_index] [lens] [early_ready_file]`**
 
-`lens` must be one of `adversary`, `contract` or `craft`. Artifacts are keyed by pass and lens, never by seat: `review_findings_<N>[_<lens>].txt`, `review_status[_<lens>]`, `review_agent_<N>[_<lens>].log`.
+`lens` must be one of `adversary`, `contract`, `craft` or `ux`. Lens `ux` is the design check: it records no review pass, since the unit director's `UX review` activity carries that time. Artifacts are keyed by pass and lens, never by seat: `review_findings_<N>[_<lens>].txt`, `review_status[_<lens>]`, `review_agent_<N>[_<lens>].log`.
 
+- **`--pool code|ui --lease …`**: reviews on a pooled reviewer of the production, on a read-only turn. `docs/as-built/review-pool.md` describes this path.
 - **`--to <seat>`**: reviews on an open seat.
+  - It writes one turn record per attempt and marks it `canceled` on TERM, INT or HUP, exiting 143, 130 or 129 (`docs/as-built/review-pool.md`, Turn record). `REVIEW_LEASE=<slug>/<unit>/<phase>` in the environment names the unit and phase in that record.
   - The recorder slot is the seat name's last hyphen segment. It must match `^[A-Za-z0-9][A-Za-z0-9_-]{0,31}$`.
   - The family must be Codex with the mesh on.
   - Under `impl_seat_claim.lock`, it compacts above the threshold (best-effort, one board line), then claims with `can-follow --role review`.
@@ -74,7 +78,7 @@ The flag is cleared by any `item/completed` from the seat's own work, but not by
   - The seat stays open until `end_session.sh`.
 - **Neither flag**: runs the fresh blind reviewer through `agent_exec.sh … readonly`, with no address (`mesh=none`). The skills use this form only for a review outside a run.
 
-**Tree guard (seated reviews only).** Before the turn, `review.sh` records five things:
+**Tree guard (seated and pooled reviews).** Before the turn, `review.sh` records five things:
 
 - `git rev-parse HEAD`
 - `git status --porcelain`
@@ -158,7 +162,7 @@ The rules live in `commands/unit/direct.md` `<LongLivedSeats/>`, `docs/delegate/
 | --- | --- |
 | `scripts/agents/codex_mesh.py` | Seat threads, roster, compaction, overflow press-on, role claim and restore, sweep |
 | `scripts/delegate/implement.sh` | Writer, tester and repair dispatch; `--to` reuse with identity check, claim and compaction |
-| `scripts/delegate/review.sh` | Reviews: `--to` reuse, `--slot` new seat, tree guard, fresh read-only fallback |
+| `scripts/delegate/review.sh` | Reviews: `--to` reuse, `--slot` new seat, `--pool` pooled reviewer, tree guard, fresh read-only fallback |
 | `scripts/delegate/end_session.sh` | Ends the run's seats (`stop`) and sweeps |
 | `scripts/delegate/remove_seats.py` | Removes Claude seats at phase end; sweeps after a successful listing |
 | `scripts/delegate/progress_history.py` | Agent columns for extra seats |
@@ -178,7 +182,7 @@ The rules live in `commands/unit/direct.md` `<LongLivedSeats/>`, `docs/delegate/
 - Compaction, the seat claim and the identity check run under one lock (`impl_seat_claim.lock`). Compaction is best-effort: a failure posts one board line and never blocks the follow-up.
 - A seat's identity file is anchored to the implementation model, whichever launcher opened the seat.
 - A seated review claims its seat before writing any artifact, and fails if the working tree changed in any of HEAD, status, tracked diff or untracked content.
-- Review artifacts are keyed by pass and lens; the recorder pass is keyed by the slot that ran it.
+- Review artifacts are keyed by pass and lens; the recorder pass is keyed by the slot that ran it (`pool_<reviewer>` for a pooled review), and a review with lens `ux` records none.
 - Every prompt to a seat, follow-ups included, repeats the Three Gods sentence and the Type Design Contract, verbatim or by pointer.
 - Only the seat's own work items clear the overflow guard; `userMessage` and `contextCompaction` items never do.
 - `sweep` treats every doubt as in use, judges a second time under the owner's lock before stopping, and never touches the `unix://` daemon. A sweep failure never stops seat cleanup.
@@ -205,7 +209,7 @@ The rules live in `commands/unit/direct.md` `<LongLivedSeats/>`, `docs/delegate/
 - **Open once.** Before this design, each phase opened new `impl` and `test` threads and every review was a new thread, so every task paid a seat's startup cost. A seat that stays open pays that cost once per run.
 - **Compact between tasks.** Startup turned out to be a small share of usage. Over 1,437 natedev threads, usage before the first edit was 19% of uncached input, 4% of cached input and 10% of output: about 6% of weighted usage. Most usage is cached context that long threads read again on every call. A long-lived seat saves its startup but carries its context, so frequent compaction is what keeps the saving.
 - **Codex seats only.** The cost being addressed is Codex worker startup. Claude seats are the fallback family and keep their existing lifecycle.
-- **Reviews on open seats, without the read-only sandbox.** A review on an open seat runs on that thread's existing sandbox, and a seat may review its own work. The tree guard enforces "edits nothing" in place of the sandbox. The fresh read-only reviewer remains only for reviews outside a run.
+- **Reviews on open seats, without the read-only sandbox.** A review on an open seat runs on that thread's existing sandbox, and a seat may review its own work. The tree guard enforces "edits nothing" in place of the sandbox. A pooled reviewer is not a seat: its turn is read-only and the tree guard still runs after it. The fresh read-only reviewer remains only for reviews outside a run.
 - **Verdict per checkpointed phase.** The amount of work changes from day to day, so usage per day would not compare the two windows. Account switches are too rare for a verdict: the baseline had 2 in about five days, too few to show a change within a week. They are reported alongside the verdict.
 - **Hyphens refused in `--slot`.** `--to` derives the slot from the seat name, so refusing hyphens is simpler than resolving a hyphenated slot from its recorded identity.
 - **Second-overflow error kept.** It stops a seat that fills its context again and again without doing work, so press-on cannot loop forever.

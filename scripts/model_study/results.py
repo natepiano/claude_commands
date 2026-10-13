@@ -3,15 +3,16 @@
 from __future__ import annotations
 
 import json
+import sys
 from datetime import datetime
 from pathlib import Path
-from zoneinfo import ZoneInfo
 
 from compare import ComparisonReport
 from phases import PhaseReport
 import report
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
+from user_zone import user_zone  # noqa: E402
 
-PDT = ZoneInfo("America/Los_Angeles")
 MAX_JSON_BYTES = 300_000
 QUESTION = "Do Sonnet directors keep their turn time, tokens and work per phase against Opus?"
 METHOD = (
@@ -67,14 +68,14 @@ def learning(comparison: ComparisonReport, phases: PhaseReport) -> list[str]:
 
 def render(comparison: ComparisonReport, phases: PhaseReport, extracted: report.ExtractReport,
            now: datetime, history: report.FirstRun | report.FollowingRun) -> str:
-    clock = now.replace(tzinfo=PDT) if now.tzinfo is None else now.astimezone(PDT)
+    clock = now.replace(tzinfo=user_zone()) if now.tzinfo is None else now.astimezone(user_zone())
     gate, gate_lines = report.ready(comparison, now)
     clause = "four directors at 150" if sum(
         (report.continuation(row, "sonnet") or {"n": 0})["n"] >= 150
         for row in comparison["directors"] if row["status"] == "switched"
     ) >= 4 else "deadline" if gate else "neither clause yet"
     drops = sum(sum(session["dropped"].values()) for session in extracted["sessions"])
-    lines = [f"Sample as of {clock:%Y-%m-%d %H:%M PDT}", "", "## Question", "", QUESTION, "",
+    lines = [f"Sample as of {clock:%Y-%m-%d %H:%M %Z}", "", "## Question", "", QUESTION, "",
              "## Data", "", f"Roster: {len(extracted['sessions'])} directors; {len(comparison['directors'])} with measured requests.",
              f"Filters: xhigh, standard speed; {drops} extract drops; Opus baseline last {comparison['baseline_requests']} filtered requests per director.",
              f"Counts: {history.current['pooled']['opus_n']} pooled Opus continuation requests; {history.current['pooled']['sonnet_n']} pooled Sonnet continuation requests.",

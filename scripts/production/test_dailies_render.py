@@ -274,6 +274,20 @@ class ReportFooterTests(unittest.TestCase):
         self.refused(render(report(True)), "remove the stale unit marker")
         self.refused(render(report(False), holders=[holder()]), "mark the held unit")
 
+    def test_a_report_whose_only_units_hold_the_builds_needs_no_marker(self) -> None:
+        # A holder's own unit is never marked, so with no other unit there is none to mark.
+        by_name = render({**report(False), "units": [{**unit(False), "unit": "frame-time"}]}, holders=[holder()])
+        # A holder is named by its session; the builder says which unit that session directs.
+        by_session = render({**report(False), "units": [{**unit(False), "holds_builds": True}]}, holders=[holder()])
+        for result in (by_name, by_session):
+            self.assertEqual(result.code, 0, result.error)
+            self.assertEqual([line for line in timeline(result.lines) if "build hold" in line], [])
+            self.assertEqual(len([line for line in result.lines if line.startswith("* build hold: frame-time ")]), 1)
+        both = [{**unit(False), "holds_builds": True}, {**unit(False), "unit": "other", "label": "other"}]
+        self.refused(render({**report(False), "units": both}, holders=[holder()]), "mark the held unit")
+        marked = render({**report(False), "units": [{**unit(True), "holds_builds": True}]}, holders=[holder()])
+        self.refused(marked, "holds the build hold itself")
+
     def test_top_level_hold_is_refused(self) -> None:
         self.refused(render({**report(False), "build_hold": {"since": "10:56"}}), "holds are read from the holder files")
 
@@ -1001,6 +1015,25 @@ class LowerProductionTests(unittest.TestCase):
         result = render({**report(False), "children": list(children)})
         self.assertEqual(result.code, 2)
         self.assertIn(message, result.error)
+
+    def test_no_units_and_nothing_below_renders_one_line_and_no_chart(self) -> None:
+        # Seen 2026-10-12: every unit's run had finished, so the builder left them all out.
+        result = render({**report(False), "units": []})
+        self.assertEqual(result.code, 0, result.error)
+        self.assertEqual(result.lines[:4], ["**Dailies (Simple)**, 11:00 PDT", "",
+                                            "No unit is working: every run has finished.", ""])
+        self.assertNotIn("```", result.lines)
+        self.assertIn("* next dailies: 11:30 PDT - nothing needed", result.lines)
+
+    def test_no_units_still_charts_the_productions_below(self) -> None:
+        below = child("tool-based-ui", saved("2026-10-04T10:40", *self.ROWS, units=3, held=1))
+        result = render({**report(False), "units": [], "children": [below]})
+        self.assertEqual(result.code, 0, result.error)
+        self.assertNotIn("No unit is working: every run has finished.", result.lines)
+        rows = timeline(result.lines)[1:]
+        self.assertEqual(len(rows), 1)
+        self.assertTrue(rows[0].startswith("tool-based-ui "), rows[0])
+        self.assertTrue(rows[0].endswith("  3 units, 1 held"), rows[0])
 
     def test_a_production_with_nothing_below_it_renders_as_before(self) -> None:
         plain = render(report(False))

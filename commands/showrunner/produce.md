@@ -144,6 +144,11 @@ State:
     many open questions it holds. Gather nothing for it. `/showrunner:dailies
     expand <child|all>` adds its own rows. A row that reads `no report yet`
     fills in at that showrunner's next dailies.
+  - **Start a lower showrunner only with `/showrunner:add_showrunner
+    <production doc>`**, never in your own pane and never as a unit. It gets
+    its own tmux session on the showrunner account and is attached to you
+    once it runs. User, 2026-10-12: "top level (L1) showrunners should make
+    sure to use tmux to start lower level showrunners".
 - **What reaches the user:**
   - a unit director's `— decision:` that only the user can settle (**Designs
     and add-ons** below), shown in the unit director's words, with the answer
@@ -260,12 +265,12 @@ State:
   ```text
 
   ---
-  11:37 PDT update:
+  11:37 EDT update:
 
-  * build hold: <holder> holds builds since 11:34 PDT for the frame-time lane's breakdown of what each added tool costs; expected to release 11:40 PDT (in 3 minutes)
-  * Mac block: <holder> since 11:35 PDT, for the Mac-only test run - lifts Wed 12:35 PDT
+  * build hold: <holder> holds builds since 11:34 EDT for the frame-time lane's breakdown of what each added tool costs; expected to release 11:40 EDT (in 3 minutes)
+  * Mac block: <holder> since 11:35 EDT, for the Mac-only test run - lifts Wed 12:35 EDT
   * claude 1: …
-  * next dailies: 11:53 PDT - nothing needed
+  * next dailies: 11:53 EDT - nothing needed
 
 
   Waiting on:
@@ -318,6 +323,19 @@ after a failed step; it resumes at the first unfinished step.
 ---
 
 <LaunchUnits>
+When the production doc has a **Review pool** line, prepare the review plan
+on `MERGE_BRANCH` before launching. It has the Production header from
+`docs/production_format.md` and the one standing phase in
+`commands/review/direct.md` → <ReviewPoolStart/>. Commit a new or changed
+plan there; `add_unit.py` reads the committed merge-branch tree in preflight.
+Then launch `review-unit` first:
+`$HOME/.claude/scripts/lib/py $HOME/.claude/scripts/production/add_unit.py --production PRODUCTION_DOC review --plan <review plan> --owns "—"`.
+It has an ordinary Units row, worktree and branch; its opening runs
+`/review:direct <absolute production doc path>`. Its standing phase stays
+`todo` and has no final checkpoint. Ask it for <ReviewPoolDailies/> at each
+dailies (`commands/review/direct.md`) and carry its tables and source warnings
+with the report.
+
 For each unit without a live unit director, run
 `$HOME/.claude/scripts/lib/py $HOME/.claude/scripts/production/add_unit.py --production PRODUCTION_DOC <name> --plan <unit plan>`.
 `<name>` is the Units row's Unit value without `-unit`; the existing row is adopted.
@@ -487,7 +505,7 @@ notice to the unit director before any merge command runs:
    line (`production_format.md` → <ProductionUnit/> item 3). The unit runs the
    check before sending; you do not repeat it.
    - **Fresh pass:** the line says `pass`, or names a follow-up phase for each
-     defect, from a fresh helper on exactly the notice's shots, built from the
+     defect, from a fresh check on exactly the notice's shots, built from the
      notice's hash. Merge.
    - **Missing or stale:** no line, other shots than the notice sends, or a
      build from before a later change to what users see. Run <DesignCheck/>
@@ -566,6 +584,17 @@ message.
    build report (`/build:report`, every 4 hours) carries it and pushes again. Run
    `review_regime.py ack` only on the user's own acknowledgment. Pass `--no-ci`
    to `due` when the production rules say CI does not apply.
+   When the production doc has a **Review pool** line, send `review-unit`
+   one line per merged code checkpoint:
+   `review merge: unit <unit>; phase <phase>; session dir <path>; design check: <verdict>`.
+   Find the unit's newest run in the local history root (`PLAN_DELEGATE_HISTORY_DIR`
+   or `~/.local/state/plan-delegate`), else the Mac's over ssh at
+   `collect.MAC_HOST` from `scripts/usage/collect.py`: read `runs/<run id>.jsonl`
+   whose `run_started` event's `working_dir` matches the unit's Worktree cell,
+   choose the greatest `run_started_at`, and use `<run id>` as the session
+   dir's name in the merge line. Take the verdict from step 3;
+   use `not applicable` when nothing users see changed. Append the same line
+   to `LOG`. A shrink sends no memory line.
 </MergeCheckpoint>
 
 ---
@@ -1034,6 +1063,9 @@ every unit director.
 <Wrap>
 When every unit's final-gate and as-built checkpoints are merged:
 
+With a **Review pool** line, exclude `review-unit`'s standing phase from
+that condition.
+
 1. Run a final <CIPoint/> and all <PromoteMain/> checks on its exact sha:
    local validation, smoke launch and GitHub CI verdict, then the promotion
    call. Pass `ci collect`'s `--ci-green <sha>` and the smoke launch's
@@ -1044,6 +1076,12 @@ When every unit's final-gate and as-built checkpoints are merged:
    - any other item that cannot be undone gets the user's OK first;
    - back up user data before migrating it.
    Finish each item before passing its exact text as `--close-out-done "<item>"`.
+   With a **Review pool** line, tell `review-unit` to end and wait for its
+   acknowledgment that no more primes will run. Then run
+   `~/.claude/scripts/lib/py ~/.claude/scripts/delegate/review_pool.py stop --production <slug>`.
+   On failure, report its reason and run `stop` again; do not finish wrap
+   until it succeeds. `<slug>` is the production doc's file name without
+   `-production.md`.
 3. Run `python3 ~/.claude/scripts/production/production_lifecycle.py wrap
    --production PRODUCTION_DOC --ci-green <sha> --smoke-passed <sha>
    --close-out-done "<item>"` (repeat the last flag for every item), or pass

@@ -31,7 +31,7 @@ REAL_CALL_IS_LIVE = build_hold.call_is_live
 @contextmanager
 def pacific_zone() -> Generator[None, None, None]:
     try:
-        with mock.patch.dict(os.environ, {"TZ": "America/Los_Angeles"}):
+        with mock.patch.dict(os.environ, {"TZ": "America/Los_Angeles", "USER_ZONE": "America/Los_Angeles"}):
             time.tzset()
             yield
     finally:
@@ -333,6 +333,52 @@ class WaitLocalTests(IsolatedTargetTest):
         with redirect_stdout(output), redirect_stderr(errors):
             code = build_targets.command_wait_local("call-a", pid=12345)
         return code, output.getvalue(), errors.getvalue()
+
+    def test_check_local_admits_a_launch_after_the_release_began(self) -> None:
+        self.begin_hold()
+        build_hold.record_recipients([("owner name", "owner")])
+        _ = build_hold.register_wait("owner")
+        cycle = build_hold.read_cycle()
+        assert cycle is not None
+        cycle["release_started_at"] = NOW.isoformat()
+        build_hold.save_cycle(cycle)
+        with mock.patch.object(build_hold, "send_release", return_value=build_hold.ReleaseDelivered()) as send:
+            _ = build_hold.advance_release(cycle, NOW, clock=lambda: NOW)
+            later = NOW + timedelta(seconds=build_hold.NO_ADMISSION_ACK_S)
+            cycle = build_hold.read_cycle()
+            assert cycle is not None
+            self.assertTrue(build_hold.advance_release(cycle, later, clock=lambda: later)[0])
+            path = self.root / "release" / cycle["id"] / "cycle.json"
+            before = path.read_bytes()
+            current = build_hold.read_cycle()
+            assert current is not None
+            self.assertEqual(current["entries"][0]["state"], "NoAdmissionAck")
+            output, errors = io.StringIO(), io.StringIO()
+            with mock.patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": "owner"}), \
+                 redirect_stdout(output), redirect_stderr(errors):
+                self.assertEqual(build_targets.command_check_local(), 0)
+            self.assertEqual(output.getvalue(), "")
+            self.assertEqual(errors.getvalue(), "")
+            self.assertEqual(path.read_bytes(), before)
+            send.assert_called_once()
+            entry = cast(build_hold.ReleaseEntry, send.call_args.args[0])
+            self.assertEqual(entry["session_id"], "owner")
+
+    def test_wait_local_returns_at_once_for_a_call_that_arrives_during_a_release(self) -> None:
+        self.begin_hold()
+        cycle = build_hold.read_cycle()
+        assert cycle is not None
+        cycle["release_started_at"] = NOW.isoformat()
+        build_hold.save_cycle(cycle)
+        path = self.root / "release" / cycle["id"] / "cycle.json"
+        before = path.read_bytes()
+        with mock.patch.object(build_targets, "wait_sleep", side_effect=AssertionError("Late calls never poll")):
+            self.assertEqual(self.wait(), (0, "", ""))
+        self.assertEqual(path.read_bytes(), before)
+        self.assertFalse((self.root / "registration").exists())
+        self.assertFalse((self.root / "waiter").exists())
+        self.assertEqual((self.root / "admission").read_text().strip(),
+                         f"{cycle['id']} {cycle.get('holder_generation', 1)}")
 
     def test_unheld_call_returns_without_polling_or_creating_cycle(self) -> None:
         with mock.patch.object(build_targets, "wait_sleep", side_effect=AssertionError("No hold needs no poll")):
