@@ -366,11 +366,10 @@ When a unit director is blocked on a full context, first capture its pane to
 confirm the block remains and no compaction is running. Type `/compact` into its pane with
 `tmux send-keys -t <pane> -l`, then send `Enter` separately.
 
-**Resume.** To bring back a unit director whose session ended, first run
-   `~/.claude/scripts/lib/py ~/.claude/scripts/accounts/accounts.py env unit`. If it exits nonzero, do not resume and tell the user its line. Its output (empty for the default account) is `<account>`; put it verbatim before both commands below.
-   Use `<account>claude --resume <session-id> <flags> --remote-control <session> -n <session>`, which keeps its link and its place in the list.
-   First run `<account>$HOME/.claude/scripts/lib/py $HOME/.claude/scripts/shutdown/shutdown.py launch-blocked --restart-of <session-id>`. Continue only when it exits 1. On any other exit, do not resume and tell the user its line; exit 0 means the account is held by a shutdown, and `/shutdown restart` brings the unit back.
-   Get `<flags>` first, from `bash -c 'source ~/.claude/scripts/agents/agents_config.sh && agents_resolve production.director || exit 1; [[ "$AGENT_FAMILY" == claude ]] || { echo "unit directors launch only on claude; production.director resolves to $AGENT_FAMILY ($AGENT_MODEL)" >&2; exit 1; }; agents_claude_args'`, which prints `--model <model> [--effort <effort>]`. If it exits nonzero, stop and tell the user its line; never run `claude --resume` without the flags.
+**Resume.** To bring back a unit director whose session ended, use
+   `$HOME/.claude/scripts/lib/py $HOME/.claude/scripts/production/add_unit.py --production PRODUCTION_DOC <name> --plan <unit plan> --resume <session-id> --cwd <recorded cwd>`.
+   The launcher keeps the unit's recorded account and model, checks shutdown holds, and preserves its name and Remote Control link.
+   If it reports no recorded account, stop and tell the user its line; give `--account "claude N"|default` only when the user chooses the account.
 </LaunchUnits>
 
 ---

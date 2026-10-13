@@ -26,7 +26,16 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
 from user_zone import user_zone  # noqa: E402
 
 if TYPE_CHECKING:
-    from scripts.accounts.accounts import AccountSelection
+    from scripts.accounts.accounts import ClaudeLaunchAccount
+
+
+class RetainedUnitAccount(NamedTuple):
+    """The existing config directory saved for this unit's previous launch."""
+    dir: Path
+
+
+if TYPE_CHECKING:
+    UnitLaunchAccount = ClaudeLaunchAccount | RetainedUnitAccount
 
 
 class Production(NamedTuple):
@@ -671,9 +680,12 @@ def prompt_for(request: UnitLaunch) -> str:
                   f"~/.claude/scripts/production/showrunners.py address {production.slug}` prints (look it up "
                   "before each message: it changes when the showrunner restarts)")
     if isinstance(request.plan, Standby):
-        return (f"You are {request.identity.unit} in production {production.slug} (doc {doc}), under "
-                f"{showrunner}, on standby. Work only in your worktree "
-                f"{request.worktree}, branch {request.branch}. Do nothing until the showrunner sends you work.")
+        prompt = (f"You are {request.identity.unit} in production {production.slug} (doc {doc}), under "
+                  f"{showrunner}, on standby. Work only in your worktree "
+                  f"{request.worktree}, branch {request.branch}. Do nothing until the showrunner sends you work.")
+        if isinstance(request.launch_kind, UnitRestoreLaunch):
+            prompt += " " + request.launch_kind.note.read_text(encoding="utf-8").rstrip("\n")
+        return prompt
     plan = request.plan_path.as_posix()
     review_unit = is_review_unit(request.identity.unit, production.doc.read_text(encoding="utf-8").splitlines())
     if isinstance(request.session, ResumedSession):
@@ -703,16 +715,21 @@ def launch_session(
     tmux: str,
     director: DirectorAgent,
     prompt: str,
-    selected: AccountSelection,
+    selected: UnitLaunchAccount,
+    *,
+    target: str = "",
+    model: str = "",
 ) -> None:
     """Start the unit's session in a tmux session marked as this unit of this production.
 
     The marks are what finds the unit afterwards; its name is only what it is called at launch.
     """
-    from scripts.accounts.accounts import account_prefix
+    from scripts.accounts.accounts import DefaultAccount, account_prefix, main_config_dir
+    from scripts.whoami.account import named_account_prefix
 
     marks = {unit_lookup.PRODUCTION_MARK: request.production.slug, unit_lookup.UNIT_MARK: request.identity.unit}
-    argv = ["claude", "--model", director.model]
+    launch_model = model or director.model
+    argv = ["claude", "--model", launch_model]
     if isinstance(director.effort, Effort):
         argv.extend(["--effort", director.effort.value])
     if isinstance(request.session, ResumedSession):
@@ -725,7 +742,11 @@ def launch_session(
                     else request.identity.session)
     argv.extend(["--remote-control", session_name, "-n", session_name,
                  "--settings", '{"disableAgentView": true}', prompt])
-    command = account_prefix(selected) + "ENABLE_TOOL_SEARCH=true command " + shlex.join(argv) + "; exec zsh"
+    prefix = named_account_prefix(selected.dir) if isinstance(selected, RetainedUnitAccount) else account_prefix(selected)
+    if target:
+        argv = [sys.executable, str(SCRIPTS / "accounts" / "accounts.py"), "exec", target, *argv[1:]]
+        prefix = ""
+    command = prefix + "ENABLE_TOOL_SEARCH=true command " + shlex.join(argv) + "; exec zsh"
     environment = launch_environment()
     scope_name = re.sub(r"[^A-Za-z0-9_.-]", "-", tmux_session)
     scope = f"--unit={scope_name}-{int(time.time())}"
@@ -734,6 +755,10 @@ def launch_session(
                         *(argument for name, value in marks.items() for argument in ("-e", f"{name}={value}")),
                         "zsh", "-ic", command],
                        env=environment, text=True, capture_output=True, check=True)
+    directory = main_config_dir() if isinstance(selected, DefaultAccount) else selected.dir
+    for option, value in (("@claude_config_dir", str(directory)), ("@claude_model", launch_model)):
+        _ = subprocess.run([tmux, "set-option", "-t", f"={tmux_session}", option, value],
+                           env=environment, text=True, capture_output=True, check=True)
 
 
 def launch_environment() -> dict[str, str]:
@@ -759,10 +784,10 @@ def record_scheduled_restore_prompt(session_id: str, prompt: str) -> None:
         raise RuntimeError(f"restart prompt not recorded: {reason}") from error
 
 
-def launched_unit(request: UnitLaunch) -> MarkedUnitFound | NoMarkedUnit:
+def launched_unit(request: UnitLaunch | RequestedUnitLaunch) -> MarkedUnitFound | NoMarkedUnit:
     """The unit's tmux session, found by its mark."""
     unit = unit_lookup.marked_units(request.production.slug).get(
-        request.identity.unit
+        request.unit if isinstance(request, RequestedUnitLaunch) else request.identity.unit
     )
     return NoMarkedUnit() if unit is None else MarkedUnitFound(unit)
 
@@ -797,6 +822,86 @@ def record(request: UnitLaunch) -> None:
         _ = log.write(f"- {stamp}: {log_line}\n")
 
 
+def account_for_launch(request: RequestedUnitLaunch, target: str = "", config_dir: str = "") -> UnitLaunchAccount:
+    """A role chooses new work; a resume uses its explicit or last recorded account."""
+    from scripts.accounts import accounts
+    from scripts.whoami import agent_accounts
+
+    if isinstance(request.session, NewSession):
+        if target or config_dir:
+            raise Refusal("--account and --config-dir require --resume")
+        return accounts.role_account("unit")
+    if target:
+        if config_dir:
+            raise Refusal("give only one of --account and --config-dir")
+        if target == "default":
+            problems = accounts.check(target)
+            if problems:
+                raise Refusal(problems[0])
+            return accounts.DefaultAccount()
+        directory = accounts.account_dir(target)
+        default = accounts.account_identity(accounts.main_config_dir())
+        identity = accounts.account_identity(directory)
+        if isinstance(default, agent_accounts.KnownClaudeAccount) and (
+            target.casefold() == default.label.casefold() or
+            isinstance(identity, agent_accounts.KnownClaudeAccount) and
+            identity.login.casefold() == default.login.casefold()
+        ):
+            raise Refusal(f"{target} is the default account; use default")
+        return accounts.NamedAccount(target, directory)
+    if not config_dir:
+        import record as shutdown_record
+        try:
+            saved = [item for item in shutdown_record.all_session_records()
+                     if item["session"]["session_id"] == request.session.session_id]
+        except (shutdown_record.InvalidRecord, OSError) as error:
+            raise Refusal(f"shutdown state unreadable: {error}") from error
+        if len(saved) == 1:
+            config_dir = saved[0]["session"].get("config_dir", str(accounts.main_config_dir()))
+        else:
+            found = launched_unit(request)
+            if isinstance(found, MarkedUnitFound):
+                result = subprocess.run([unit_lookup.tmux_binary(), "show-options", "-v", "-t",
+                                         f"={found.unit.label}", "@claude_config_dir"],
+                                        capture_output=True, text=True, check=False)
+                if result.returncode == 0:
+                    config_dir = result.stdout.strip()
+            if not config_dir:
+                raise Refusal("no account recorded for this unit; resume with --account <claude N|default>")
+    directory = Path(config_dir).expanduser()
+    if not directory.is_dir():
+        raise Refusal(f"recorded resume account directory {directory} is missing")
+    if directory == accounts.main_config_dir():
+        return accounts.DefaultAccount()
+    return RetainedUnitAccount(directory)
+
+
+def model_for_resume(request: RequestedUnitLaunch, explicit: str = "") -> str:
+    """Use the recorded model when available, with --model as the restore boundary."""
+    if isinstance(request.session, NewSession):
+        if explicit:
+            raise Refusal("--model requires --resume")
+        return ""
+    if explicit:
+        return explicit
+    import record as shutdown_record
+    try:
+        saved = [item for item in shutdown_record.all_session_records()
+                 if item["session"]["session_id"] == request.session.session_id]
+    except (shutdown_record.InvalidRecord, OSError) as error:
+        raise Refusal(f"shutdown state unreadable: {error}") from error
+    if len(saved) == 1 and saved[0]["session"]["model"]["kind"] == "model":
+        return saved[0]["session"]["model"]["name"]
+    found = launched_unit(request)
+    if isinstance(found, MarkedUnitFound):
+        result = subprocess.run([unit_lookup.tmux_binary(), "show-options", "-v", "-t",
+                                 f"={found.unit.label}", "@claude_model"],
+                                capture_output=True, text=True, check=False)
+        if result.returncode == 0:
+            return result.stdout.strip()
+    return ""
+
+
 def main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser()
     _ = parser.add_argument("--production", required=True)
@@ -808,6 +913,9 @@ def main(argv: list[str]) -> int:
     _ = parser.add_argument("--owns")
     _ = parser.add_argument("--timeout", type=float, default=90.0)
     _ = parser.add_argument("--resume")
+    _ = parser.add_argument("--account", default="")
+    _ = parser.add_argument("--model", default="")
+    _ = parser.add_argument("--config-dir", default="", help=argparse.SUPPRESS)
     _ = parser.add_argument("--cwd")
     _ = parser.add_argument("--restart-note")
     _ = parser.add_argument("--session-name")
@@ -819,13 +927,14 @@ def main(argv: list[str]) -> int:
         # Table readers import this module from copied trees without accounts.
         from scripts.accounts import accounts
 
-        unit_account = accounts.role_account("unit")
+        unit_account = account_for_launch(request, cast(str, args.account), cast(str, args.config_dir))
         if isinstance(unit_account, accounts.NamedAccount):
             problems = accounts.check(unit_account.label)
             if problems:
                 raise Refusal(
                     f"unit account {unit_account.label}: {problems[0]}; /showrunner:accounts"
                 )
+        resume_model = model_for_resume(request, cast(str, args.model))
         # Imported only on the launch path: table readers import add_unit from
         # copied trees that do not include scripts/shutdown.
         import launch_permission
@@ -846,7 +955,7 @@ def main(argv: list[str]) -> int:
                 else launch_permission.NewWorkLaunchPurpose()
             )
             permission_environment = launch_environment()
-            if isinstance(unit_account, accounts.NamedAccount):
+            if isinstance(unit_account, (accounts.NamedAccount, RetainedUnitAccount)):
                 permission_environment["CLAUDE_CONFIG_DIR"] = str(unit_account.dir)
             permission = launch_permission.launch_permission(
                 permission_environment, purpose
@@ -869,7 +978,7 @@ def main(argv: list[str]) -> int:
             tmux = unit_lookup.tmux_binary()
             marked_unit = launched_unit(request)
             if (
-                isinstance(request.launch_kind, UnitRestoreLaunch)
+                isinstance(request.session, ResumedSession)
                 and isinstance(marked_unit, MarkedUnitFound)
             ):
                 unit = marked_unit.unit
@@ -910,7 +1019,7 @@ def main(argv: list[str]) -> int:
                     record_scheduled_restore_prompt(
                         request.launch_kind.session_id, prompt
                     )
-                launch_session(request, tmux, ready.director, prompt, unit_account)
+                launch_session(request, tmux, ready.director, prompt, unit_account, target=cast(str, args.account), model=resume_model)
         finally:
             _ = barrier.__exit__(None, None, None)
         if isinstance(request.launch_kind, UnitRestoreLaunch):

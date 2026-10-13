@@ -358,6 +358,10 @@ class SessionShutdown(TypedDict):
     progress: SessionProgress
     stop_issues: list[SessionStopIssue]
     alerted_at: NotRequired[str]
+    # Absent means resume on session.config_dir, never on a changed role.
+    target: NotRequired[str]
+    source_label: NotRequired[str]
+    why: NotRequired[str]
 
 
 class AccountHold(TypedDict):
@@ -923,6 +927,13 @@ def _shutdown_request_fields(values: dict[str, object], place: str) -> None:
 def _session_shutdown(value: object, place: str) -> SessionShutdown:
     values = _mapping(value, place)
     _shutdown_request_fields(values, place)
+    if "target" in values:
+        target = _string(values["target"], f"{place}.target")
+        if target != "default" and not re.fullmatch(r"claude [1-9][0-9]*", target):
+            raise InvalidRecord(f"{place}.target must be default or claude N")
+    for field in ("source_label", "why"):
+        if field in values:
+            _ = _string(values[field], f"{place}.{field}")
     for field, allowed in (
         ("hold", {"account", "session"}),
         ("force", {"wait for ready", "now"}),

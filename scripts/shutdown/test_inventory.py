@@ -243,6 +243,7 @@ elif "comm=" in joined:
         )
         os.environ["SHUTDOWN_TEST_PARENT_ROWS"] = json.dumps(parent_rows)
         self.write_executable("agent-sessions-snapshot", "raise SystemExit(0)\n")
+        self.write_executable("kdotool", "raise SystemExit(1)\n")
 
     def write_session(
         self,

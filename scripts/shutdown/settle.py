@@ -570,6 +570,7 @@ def begin(
     login: str, requested_by: str | None = None, only: Iterable[str] = (), *,
     then: ShutdownContinuation = "stop", alerts: Literal["user", "none"] = "user",
     request_id: str,
+    target: str = "", why: str = "",
 ) -> list[SessionShutdown]:
     """Add independent owners, leaving every existing request intact."""
     for line in store.migrate(login):
@@ -596,6 +597,10 @@ def begin(
             settle_message={"kind": "not sent"}, where={"kind": "not said"},
             progress={"kind": "waiting"}, stop_issues=[],
         )
+        if target:
+            saved["target"] = target
+            saved["source_label"] = report["label"]
+            saved["why"] = why or f"{report['label']} is out of usage"
         if not store.create_session(saved):
             print(f"{session['name']}: already in progress")
             continue
@@ -928,7 +933,7 @@ def _launch_conductor(login: str, label: str) -> None:
 
 def down(account: Account, here: bool = False, only: Iterable[str] = (), *,
          then: ShutdownContinuation = "stop", alerts: Literal["user", "none"] = "user",
-         requested_by: str | None = None, request_id: str = "") -> int:
+         requested_by: str | None = None, request_id: str = "", target: str = "", why: str = "") -> int:
     """Start local work immediately and ask the peer to conduct its own owners."""
     if not _warm():
         print(f"GitHub keys are cold: run `github-warmup` in a terminal on {_machine()}, then `/shutdown` again", file=sys.stderr)
@@ -938,7 +943,7 @@ def down(account: Account, here: bool = False, only: Iterable[str] = (), *,
     identity = request_id or str(uuid4())
     local_ids: set[str] = ({saved["session"]["session_id"] for saved in store.session_records(account.login)}
                  | {session["session_id"] for session in inventory(account.login, frozenset(ids))["sessions"]}) if ids else set()
-    _ = begin(account.login, origin, ids, then=then, alerts=alerts, request_id=identity)
+    _ = begin(account.login, origin, ids, then=then, alerts=alerts, request_id=identity, target=target, why=why)
     _launch_conductor(account.login, account.label)
     peer_ids = [session_id for session_id in ids if session_id not in local_ids]
     if not here and (not ids or peer_ids):
@@ -949,6 +954,8 @@ def down(account: Account, here: bool = False, only: Iterable[str] = (), *,
             arguments.extend(("--only", ",".join(peer_ids)))
         if then == "restart":
             arguments.append("--restart")
+        if target:
+            arguments.extend(("--to", target, "--why", why or f"{account.label} is out of usage"))
         if alerts == "none":
             arguments.append("--no-alert")
         status, output = run_remote(arguments)
