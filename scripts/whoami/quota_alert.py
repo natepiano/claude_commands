@@ -705,16 +705,10 @@ def run_out_push(note: AgentNote, selection: ClaudeAccountSelection) -> UserPush
     first = f"The {display_name} account has {percent(note)} weekly usage left. It refills {user_time(note.get('resets'))}."
     if note.tool == "codex":
         return UserPush(name, summary, f"{first} Codex keeps working on its credits. {credit_line(note)}", None)
-    count = note.get("limit_reset_count")
-    resets = f" ({count} available)" if count is not None and count != "null" else ""
-    reset_choice = (f"Reset: redeem one of the {count} limit resets to refill this account now."
-                    if count is not None and count.isdecimal() and int(count) > 0 else
-                    "Reset, if available: redeem a limit reset to refill this account now.")
+    # Nothing reads a Claude limit-reset count live, so the push offers no redeem it cannot back.
     text = (first + " Its work may stop until then.\n\n"
-            + "Sign in (recommended): switch to an account with usage left so work continues.\n\n"
-            + reset_choice)
-    return UserPush(name, summary, text,
-                    Ask("decision", f"In a Claude session on natedev, sign in to another account or redeem a limit reset{resets}."))
+            + "Sign in: switch to an account with usage left so work continues.")
+    return UserPush(name, summary, text, Ask("decision", "In a Claude session on natedev, sign in to another account."))
 
 
 def short_reason(reason: str) -> str:
@@ -782,9 +776,10 @@ def message(note: AgentNote, notes: list[AgentNote], config: Config, switch: Cod
         swap_line = codex_swap_line(readings, now or datetime.now(timezone.utc))
         if swap_line:
             lines.append(swap_line)
-    count = note.get("limit_reset_count")
-    if count and count != "null":
-        lines.append(f"Limit resets available on {name}: {count}, earliest expiring {note.get('limit_reset')}.")
+        # Only a Codex count is read live; a Claude note's count is never stated.
+        count = note.get("limit_reset_count")
+        if count and count != "null":
+            lines.append(f"Limit resets available on {name}: {count}, earliest expiring {note.get('limit_reset')}.")
     for other in notes:
         if other.tool == note.tool and other.path != note.path:
             lines.append(f"{other.path.stem}: {other.get('state')}, {percent(other)} weekly usage left, "

@@ -759,11 +759,18 @@ class AgentNotesTests(unittest.TestCase):
             {"account": "codex 2", "at": self.now.isoformat(timespec="seconds"), "remaining": 60},
         ])
 
-    def test_claude_manual_reset_fields_are_preserved(self):
-        note = self.note("claude 1.md", "a@example.com", "limit_reset: 2026-10-22\nlimit_reset_count: 1\n")
+    def test_a_refresh_clears_a_stale_claude_reset_count_on_every_claude_note(self):
+        signed_in = self.note("claude 1.md", "a@example.com", "limit_reset: 2026-10-22T12:34:00\nlimit_reset_count: 1\n")
+        other = self.note("claude 2.md", "b@example.com", "limit_reset: null\nlimit_reset_count: 0\n")
+        _ = apply([signed_in, other], Report("Claude", email="a@example.com"), self.now)
+        for note in (signed_in, other):
+            self.assertEqual((note.get("limit_reset_count"), note.get("limit_reset")), ("null", "null"))
+
+    def test_a_claude_note_with_no_reset_count_gains_none(self):
+        note = self.note("claude 1.md", "a@example.com")
         _ = apply([note], Report("Claude", email="a@example.com"), self.now)
-        self.assertEqual(note.get("limit_reset"), "2026-10-22")
-        self.assertEqual(note.get("limit_reset_count"), "1")
+        self.assertIsNone(note.get("limit_reset_count"))
+        self.assertIsNone(note.get("limit_reset"))
 
     def test_reading_for_each_active_value_and_none_for_null_or_inactive(self):
         checked = datetime(2026, 10, 5, 19, 45, tzinfo=timezone.utc)
