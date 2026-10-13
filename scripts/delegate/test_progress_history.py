@@ -5213,10 +5213,34 @@ class PublicPhaseHelperTests(unittest.TestCase):
         self.assertEqual(
             progress_history.plan_phases(plan),
             [
-                {"id": "1", "title": "Archived delivery", "done": True},
-                {"id": "2", "title": "Finished delivery", "done": True},
-                {"id": "3", "title": "Live delivery", "done": False},
+                {"id": "1", "title": "Archived delivery", "done": True, "depends_on": None, "blocked_by": ""},
+                {"id": "2", "title": "Finished delivery", "done": True, "depends_on": None, "blocked_by": ""},
+                {"id": "3", "title": "Live delivery", "done": False, "depends_on": None, "blocked_by": ""},
             ],
+        )
+
+    def test_plan_phases_read_each_phase_dependencies_and_gate(self) -> None:
+        plan = self.root / "plan.md"
+        _ = plan.write_text(
+            "\n".join(
+                (
+                    "### Phase 1 — Base  · status: todo",
+                    "**Depends on:** none",
+                    "### Phase 2 — Report  · status: todo",
+                    "**Blocked by:** G3 — trunk phase 4 merged",
+                    "**Depends on:** Phase 1, Phase 4",
+                    "### Phase 3 — Docs  · status: todo",
+                    "",
+                )
+            ),
+            encoding="utf-8",
+        )
+
+        phases = progress_history.plan_phases(plan)
+
+        self.assertEqual(
+            [(phase["depends_on"], phase["blocked_by"]) for phase in phases],
+            [([], ""), (["1", "4"], "G3"), (None, "")],
         )
 
     def test_plan_phases_preserves_descriptive_parentheticals(self) -> None:

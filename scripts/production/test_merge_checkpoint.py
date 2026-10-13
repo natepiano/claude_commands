@@ -17,7 +17,7 @@ from pathlib import Path
 from typing import NamedTuple, cast, final, override
 
 from merge_checkpoint import (CodeCheckpoint, LastMerged, NoMerge, ShrinkCommit,
-                              merge_branch_history, merge_history, promote, request_from)
+                              check_parallel, merge_branch_history, merge_history, promote, request_from)
 
 
 SCRIPT = Path(__file__).with_name("merge_checkpoint.py")
@@ -42,6 +42,7 @@ REAL_MERGE_TESTS = ("- **Merge tests:** `python3 -m unittest discover -s scripts
                     "and `basedpyright scripts/buildlog` (pass is its `0 errors, 0 warnings` line: it exits 3 "
                     "because pyrightconfig names a `.venv` no checkout has), run in the showrunner checkout")
 DELIVERS = "Delivers checkpoint merge behavior."
+PARALLEL = "Parallel: none — no phase is waiting"
 STUB = '''#!/usr/bin/env python3
 import json
 import os
@@ -234,13 +235,15 @@ class MergeCheckpointTests(unittest.TestCase):
 
     def run_checkpoint(self, sha: str, *extra: str, phase: str = "2",
                        review: bool = True, trial: str = TRIAL,
-                       delivers: str | None = DELIVERS) -> MergeResult:
+                       delivers: str | None = DELIVERS, parallel: str | None = PARALLEL) -> MergeResult:
         before = self.git("rev-parse", "HEAD")
         arguments = ["--production", str(self.doc), "alpha-unit", phase, sha,
                      "--started", STARTED, "--scratch", str(self.root / "scratch"),
                      "--trailer", "Co-authored-by: Test <test@example.invalid>"]
         if review:
             arguments.extend(("--review-trial", trial))
+        if parallel is not None and "--shrink" not in extra and "--as-built" not in extra:
+            arguments.extend(("--parallel", parallel))
         if delivers is not None and "--shrink" not in extra and "--as-built" not in extra:
             arguments.extend(("--delivers", delivers))
         arguments.extend(extra)
@@ -393,6 +396,21 @@ class MergeCheckpointTests(unittest.TestCase):
         self.assertIn("--review-trial", result.process.stdout)
         self.assertEqual(self.git("rev-parse", "HEAD"), result.before)
         self.assertEqual(self.events("checkpoint-test"), [])
+
+    def test_code_checkpoint_requires_a_known_parallel_line(self) -> None:
+        sha = self.checkpoint()
+        for parallel, expected in (
+            (None, "requires --parallel"),
+            ("Parallel: unknown — Phase 5 has no **Depends on:** line; add one under each phase heading and rerun",
+             "adds a **Depends on:** line"),
+            ("Parallel: maybe later", "--parallel must read"),
+        ):
+            result = self.run_checkpoint(sha, parallel=parallel)
+            self.assertEqual(result.process.returncode, 1)
+            self.assert_stopped_before_merge(result, "failed", expected)
+        for parallel in ("Parallel: none — Phase 4 needs Phase 3 (running)", "Parallel: Phase 4, Phase 6 could start"):
+            with self.subTest(parallel=parallel):
+                check_parallel(parallel)
 
     def test_alternate_review_trial_is_refused_and_canonical_numbers_reach_record(self) -> None:
         sha = self.checkpoint()
@@ -669,7 +687,7 @@ class MergeCheckpointTests(unittest.TestCase):
         _ = self.git("push", "--force", "origin", f"{base}:refs/heads/production")
         request = request_from(argparse.Namespace(
             production=str(self.doc), unit="alpha-unit", phase="2", hash=sha,
-            also=[], shrink=False, as_built=False, trailer=[], review_trial=TRIAL, delivers=DELIVERS,
+            also=[], shrink=False, as_built=False, trailer=[], review_trial=TRIAL, delivers=DELIVERS, parallel=PARALLEL,
             cancel_prior=False, started=STARTED, regime="after", holds=0,
             merge_defects=0, excluded=None, scratch=str(self.root / "scratch"),
         ))
@@ -959,7 +977,7 @@ class MergeCheckpointTests(unittest.TestCase):
         self.assertIsInstance(last_code.kind, CodeCheckpoint)
         request = request_from(argparse.Namespace(
             production=str(self.doc), unit="alpha-unit", phase="2", hash=code,
-            also=[], shrink=False, as_built=False, trailer=[], review_trial=TRIAL, delivers=DELIVERS,
+            also=[], shrink=False, as_built=False, trailer=[], review_trial=TRIAL, delivers=DELIVERS, parallel=PARALLEL,
             cancel_prior=False, started=STARTED, regime="after", holds=0,
             merge_defects=0, excluded=None, scratch=str(self.root / "scratch"),
         ))

@@ -302,6 +302,8 @@ def request_from(args: argparse.Namespace) -> MergeRequest:
     if isinstance(kind, CodeCheckpoint) and not trial:
         raise Refusal("code checkpoint requires --review-trial")
     review_trial: ReviewTrial | NoReviewTrial = review_numbers(trial) if trial else NoReviewTrial()
+    if isinstance(kind, CodeCheckpoint):
+        check_parallel(cast(str | None, args.parallel))
     delivers = cast(str | None, args.delivers)
     if isinstance(kind, CodeCheckpoint) and (not delivers or not delivers.strip()):
         raise Refusal("code checkpoint requires --delivers")
@@ -759,6 +761,19 @@ def review_numbers(line: str) -> ReviewTrial:
     return ReviewTrial(*match.groups())
 
 
+def check_parallel(line: str | None) -> None:
+    """Refuse a code checkpoint whose notice lacks a usable `Parallel:` line."""
+    if not line:
+        raise Refusal("code checkpoint requires --parallel: the notice's line from phase_table.py parallel")
+    text = line.strip()
+    if text.startswith("Parallel: unknown"):
+        raise Refusal("--parallel is unknown: the unit adds a **Depends on:** line under each waiting phase "
+                      + "heading of its plan, reruns phase_table.py parallel and resends the notice")
+    if re.fullmatch(r"Parallel: (Phase \S+(, Phase \S+)* could start|none — .+)", text) is None:
+        raise Refusal("--parallel must read: Parallel: Phase <N>[, Phase <M>] could start, "
+                      + "or Parallel: none — <what the next phase waits on>")
+
+
 def record(request: MergeRequest, merge_head: str, tests_green: str) -> None:
     recorded = (f"{request.unit.name} phase {request.phase} ({request.commit}) merged as {merge_head}; ")
     if request.production.log.exists() and recorded in request.production.log.read_text(encoding="utf-8"):
@@ -855,6 +870,7 @@ def main() -> int:
     _ = parser.add_argument("--as-built", action="store_true")
     _ = parser.add_argument("--trailer", action="append", default=[])
     _ = parser.add_argument("--review-trial")
+    _ = parser.add_argument("--parallel")
     _ = parser.add_argument("--delivers")
     _ = parser.add_argument("--cancel-prior", action="store_true")
     _ = parser.add_argument("--started", required=True)
