@@ -82,11 +82,28 @@ Report a failed prime or timer registration to the showrunner with its reason.
 </ReviewPoolStart>
 
 <PrimeReviewMemory>
-For type `<type>`, concatenate `~/.claude/config/review_pool/<type>.md`
-and that type's section of `${POOL_DIR}/memory/repository.md` into
-`${POOL_DIR}/standing/<type>.md`; create the directories when absent.
+For type `<type>`, build `${POOL_DIR}/standing/<type>.md`; create the
+directories when absent. For `code`, concatenate
+`~/.claude/config/review_pool/code.md` and the `code` section of
+`${POOL_DIR}/memory/repository.md`.
+For `ui`, use the production doc's **UX guide**; with none, do not prime `ui`
+and tell the showrunner in one line: `UI pool not primed: production has no UX guide`.
+With a guide, concatenate in this order:
+
+1. `~/.claude/config/review_pool/ui.md`.
+2. `## Rules`, then `UX guide: <absolute guide path>`, then each rule file
+   in file-name order as `### <file name>` and its text. A rule is a `.md`
+   file in the guide root with a non-empty frontmatter `test:`, as in
+   `scripts/ux_style/load-ux-style.sh`; skip README and notes without it.
+3. `docs/design-decisions.md` of the repository that holds the production
+   doc, when present, under `## Design decisions`: the file the helper reads
+   from a unit's worktree.
+4. The `ui` section of `${POOL_DIR}/memory/repository.md`.
+
 An absent memory section contributes no text. A missing base prompt is a
-failure to report, never another type's prompt.
+failure to report, never another type's prompt. An unreadable guide or rule
+is a failure to report; do not prime an incomplete UI prompt. Rebuild at
+start and on resume; a changed rule's text changes the prompt hash.
 
 Run `~/.claude/scripts/lib/py ~/.claude/scripts/delegate/review_pool.py prime
 --production <slug> --type <type> --instructions-file <absolute standing file>`.
@@ -127,7 +144,8 @@ fits.
 Store rules and defect classes, never diffs, code, shots or complete review
 output.
 After each repository section changes, apply <PrimeReviewMemory/> for that
-type. The launcher sends the unit file only at lease ordinal 1, through
+type. The launcher sends the unit file at lease ordinal 1 for `code` and on
+every `ui` turn, through
 `~/.claude/scripts/lib/py ~/.claude/scripts/delegate/review_pool.py unit-memory
 --production <slug> --unit <unit>`; that prints the file, or nothing when absent.
 </ReviewMemory>
