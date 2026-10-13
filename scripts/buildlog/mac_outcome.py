@@ -25,7 +25,6 @@ COUNTED_AGAINST_SHARE: tuple[ShareMissReason, ...] = (
     "busy", "mac_busy", "lost", "runner", "state", "copy",
 )
 MAC_STEP_CALLER = "verify-mac"
-OFFLOADED_STEP = "({step}.caller IS '" + MAC_STEP_CALLER + "')"
 
 
 class NoOffloadRecord:
@@ -182,4 +181,4 @@ def is_mac_step(caller: object) -> bool:
 
 
 def natedev_step_predicate(step: str = "steps") -> str:
-    return f"NOT {OFFLOADED_STEP.format(step=step)}"
+    return f"{step}.host = 'natedev'"
