@@ -44,38 +44,22 @@ The four items of `docs/plans/build-followups-review-pool-next.md`, each placed 
 
 ### Phase 1 — The trial report matches merge holds by plan and names its machine  · status: done
 
-#### Work Order
+#### As-built
 
-**Goal:** A merge hold counts as an escape only for a review of the same unit, phase and plan, and the side-by-side report of design checks says which machine's checks it counted.
-
-**Spec:**
-
-*Merge holds by plan.* Today `quality_lines` counts a ledger row's holds for every reviewed phase with the row's unit and phase. Since 2026-10-12 a ledger row carries `plan`: a string, the first token of the unit's Plan cell as the production doc writes it, for example `docs/plans/alpha.md`. A row written earlier has no `plan` key. A unit's second plan has its own phase 1, so the old match sums one plan's holds into the other's phase.
-
-- A review's plan comes from its recorded `history_file`: the `run_started` event carries `plan_doc` (as the run was invoked, often relative to the worktree) and `working_dir` (absolute). Neither the turn record nor `ReviewRecord` carries a plan, and neither gains one.
-- Add `PlanKnown(path: str)` and `PlanUnavailable(reason: str)` as the two results of one function that reads a review's plan from its history events. `PlanUnavailable` covers a missing history file, no `run_started` event, and a `run_started` with no `plan_doc`.
-- Two plan paths are the same plan when they are equal after this normalization: a path that is absolute and lies under the run's `working_dir` becomes relative to it; then `os.path.normpath`. The ledger's value is normalized the same way with no `working_dir`. `docs/plans/alpha.md`, `./docs/plans/alpha.md` and `<working_dir>/docs/plans/alpha.md` are one plan.
-- Read the ledger's raw JSON rows, as the report already does through `read_events`; do not call `review_regime.read_rows()`. A row with no `plan` key, or a `plan` that is not a string, is a row without a plan.
-- Matching, per ledger row:
-  - without a plan: unit and phase, as today;
-  - with a plan, and the review's plan is `PlanKnown`: unit, phase and the normalized plan;
-  - with a plan, and the review's plan is `PlanUnavailable`: the row's holds are left out for that review, and the report prints one line per affected phase: `source warning: merge holds unmatched: <unit> phase <phase>: review plan unavailable (<reason>)`.
-- The Mac's ledger rows and history events arrive through `mac_sources`; the same rule applies to them with no second code path.
-- No table column changes.
-
-*The machine line.* `render_shadow` reads verdict pairs under the local history root only. After its `Comparison:` line it prints `Machine: <name> (pairs saved on another machine are not counted)`, where `<name>` is this machine's short host name, `socket.gethostname().split(".")[0]` (`natedev` on natedev). The report's other output keeps calling this machine `local`. Reading a second machine's pairs stays out (the showrunner, 2026-10-12: reopen when a unit on the Mac runs design checks).
+- `PlanKnown(path: str)` and `PlanUnavailable(reason: str)` are frozen dataclasses returned by `review_plan(record: ReviewRecord, sources: ReportSources) -> PlanKnown | PlanUnavailable`, which reads `plan_doc` and `working_dir` from the first `run_started` event of the review's `history_file`. Neither the turn record nor `ReviewRecord` carries a plan.
+- `normalize_plan(path: str, working_dir: str = "") -> str` makes an absolute path under `working_dir` relative to it, then applies `os.path.normpath`; the ledger's `plan` is normalized with no `working_dir`, so `docs/plans/alpha.md`, `./docs/plans/alpha.md` and `<working_dir>/docs/plans/alpha.md` are one plan.
+- `quality_lines` reads the ledger's raw JSON rows through `read_events` (not `review_regime.read_rows()`) and matches each row: no string `plan` → unit and phase; a plan with `PlanKnown` → unit, phase and normalized plan; a plan with `PlanUnavailable` → the row's holds are left out and one `source warning: merge holds unmatched: <unit> phase <phase>: review plan unavailable (<reason>)` line prints per affected phase. Mac rows and histories from `mac_sources` take the same path. No table column changed.
+- `render_shadow` prints `Machine: <short host name> (pairs saved on another machine are not counted)` directly after its `Comparison:` line, the name being `socket.gethostname().split(".")[0]`; the rest of the report still calls this machine `local`. Only local verdict pairs are read.
 
 **Files:**
-- `scripts/delegate/review_pool_report.py` — the plan lookup, the normalization, the three-way match in `quality_lines`, the warning, the machine line in `render_shadow`
-- `scripts/delegate/test_review_pool_report.py` — the tests below
+- `scripts/delegate/review_pool_report.py` — plan lookup, normalization, the three-way match and warning in `quality_lines`, the `Machine:` line in `render_shadow`
+- `scripts/delegate/test_review_pool_report.py` — tests for each match case, the warning, Mac sources and the `Machine:` line
 
-**Seats:** `1 writer + 1 tester` — one code file and one test file.
-- `impl` — `scripts/delegate/review_pool_report.py`
-- `test` — `scripts/delegate/test_review_pool_report.py`, from the Spec alone: two plans with the same unit and phase, each with its own hold (each phase gets only its own); a ledger row without `plan` (unit-and-phase match kept); a relative and an absolute spelling of one plan (matched); a review whose history has no `run_started` or no `plan_doc`, with a plan-bearing row (holds left out, the warning printed once per phase); a Mac row and Mac history under the same rule; the `Machine:` line present in `--shadow` output and absent from the other report.
+**Binds later work:** the `Machine:` line in `--shadow` output keeps its text and its place after `Comparison:`.
 
-**Constraints from prior phases:** none. Before dispatch the unit director merges `build-followups` into this branch (it holds the ledger change `b2c983f0`; `git merge-base --is-ancestor b2c983f0 build-followups` succeeds as of 2026-10-12).
+**Gotchas:** `PlanUnavailable` reasons are exactly `history file unavailable`, `no run_started event` and `run_started has no plan_doc`. `read_events` returns `[]` for a missing file, so `local_sources` stores a history only when `is_file()` holds; an absent entry in `sources.histories` is what tells a missing history apart from an empty one. Symlinks in plan paths are not resolved.
 
-**Acceptance gate:** `scripts/lib/py -m unittest discover -s scripts/delegate -p 'test_review_pool_report.py'` green with the tests above; `basedpyright scripts/delegate/review_pool_report.py scripts/delegate/test_review_pool_report.py` prints `0 errors, 0 warnings`; `scripts/lib/py scripts/delegate/review_pool_report.py --shadow` on natedev prints the `Machine:` line.
+**Ruled out:** reading a second machine's verdict pairs in `render_shadow` — reopen when a unit on the Mac runs design checks.
 
 ### Phase 2 — One command gives the showrunner a unit's review history location  · status: todo
 
