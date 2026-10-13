@@ -29,7 +29,7 @@ import urllib.request
 from collections.abc import Callable
 from datetime import datetime
 from pathlib import Path
-from typing import TypedDict, cast
+from typing import NotRequired, TypedDict, cast
 
 import review
 from user_action import (FIX, REFUSED_BEFORE_SENDING, ActionAllowed, ActionRefused, ActionRequired,
@@ -58,6 +58,11 @@ class Reply(TypedDict, total=False):
     request: str
     receipt: str
     errors: list[str]
+
+
+class ReviewedPushRecord(review.MessageRecord):
+    held_source: NotRequired[str]
+    held_identity: NotRequired[str]
 
 
 class PushLogRecord(TypedDict):
@@ -237,6 +242,7 @@ def send(argv: list[str], keys_file: Path = KEYS_FILE, post: Post = http_post) -
             if not claimed:
                 print("pushover: held for review: this source's push is being sent", file=sys.stderr)
                 return 4
+            found = review.held_for(source)
     except OSError as error:
         found = review.UnreadableHold(review.held_path(source), str(error))
     detail = ""
@@ -264,6 +270,11 @@ def send(argv: list[str], keys_file: Path = KEYS_FILE, post: Post = http_post) -
                     return 4
             else:
                 detail = "rewritten, script text failed: " + ", ".join(outcome.failed_rules)
+    record: ReviewedPushRecord = {**review.message_record(version)}
+    if claimed and isinstance(found, review.LiveHold):
+        record["held_source"] = source
+        record["held_identity"] = review.hold_identity(found.hold)
+    print("pushover: reviewed JSON: " + json.dumps(record), flush=True)
     try:
         code = deliver(version, keys_file, post, detail=detail)
     except OSError:

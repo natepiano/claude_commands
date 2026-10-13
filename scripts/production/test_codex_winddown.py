@@ -36,6 +36,21 @@ with open(os.environ["LOG"], "a") as log:
 
 
 class CountTests(unittest.TestCase):
+    def test_reset_push_explains_why_work_is_safe_and_how_it_resumes(self) -> None:
+        """F013: a reset is safe once stopped; the clear command resumes new work."""
+        directory = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        with (mock.patch.object(codex_winddown, "STATE", directory),
+              mock.patch.object(codex_winddown, "instances", return_value=["production"]),
+              mock.patch.object(socket, "gethostname", return_value="natedev"),
+              mock.patch.object(broadcast, "send") as send):
+            codex_winddown.announce_quiet(0)
+        body = cast(str, send.call_args.args[2])
+        self.assertIn("will not interrupt their work", body)
+        self.assertIn("New Codex work stays paused", body)
+        self.assertIn("clear command", body)
+        argv = cast(tuple[str, ...], send.call_args.args)
+        self.assertIn("/codex_winddown clear", argv[argv.index("--action") + 1])
+
     def test_announcement_uses_showrunner_and_unit_director_groups(self) -> None:
         root = Path(self.enterContext(tempfile.TemporaryDirectory()))
         with (
@@ -347,9 +362,10 @@ class MessageTests(unittest.TestCase):
         for _ in range(2):
             _ = self.run_script("count", "hana")
         log = (self.root / "log").read_text(encoding="utf-8")
-        self.assertEqual(log.count("send --to user --from codex-winddown --summary Codex wind-down --need decision"
-                                   + " --action Reset Codex, then run /codex_winddown clear."
-                                   + " --text No Codex agent is running on"), 1)
+        self.assertEqual(log.count("send --to user --from codex-winddown --summary Codex is ready for your reset --need decision"
+                                   + " --action Reset Codex, then run /codex_winddown clear in a Claude session on"), 1)
+        self.assertIn("--text All Codex agents on", log)
+        self.assertIn("New Codex work stays paused until you run the clear command", log)
         self.set_processes(*agent)
         _ = self.run_script("count", "hana")
         self.set_processes()

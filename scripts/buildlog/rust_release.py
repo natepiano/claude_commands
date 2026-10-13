@@ -160,8 +160,8 @@ def cargo_building() -> bool:
 def send_release_text(title: str, message: str) -> bool:
     sender = Path(__file__).resolve().parents[1] / "message/send.py"
     result = subprocess.run(
-        ["python3", str(sender), "--to", "user", "--need", "note",
-         "--action", "Tell natedev to bump Rust or wait.",
+        ["python3", str(sender), "--to", "user", "--from", "rust_release", "--need", "decision",
+         "--action", "In the natedev Claude session, reply upgrade or wait.",
          "--summary", title, "--text", message],
         capture_output=True, text=True, timeout=60, stdin=subprocess.DEVNULL,
     )
@@ -406,6 +406,37 @@ def trial_text(trial: TrialOutcome) -> str:
     return ", ".join(parts)
 
 
+def release_push_text(version: str, pin: str, trial: TrialOutcome) -> str:
+    intro = f"Rust {version} is out. Hana, the editor project, builds with {pin}. "
+    if trial["status"] == "waiting":
+        result = f"The test of Hana on {version} has not finished."
+        recommendation = f"Wait (recommended): Hana stays on {pin} until tested, so it avoids an untested compiler."
+    elif trial["status"] == "failed":
+        step = "Rust's code checker" if trial["step"] == "clippy" else trial["step"]
+        result = f"A test of Hana on {version} failed. {step}: {trial['reason'][:100]}."
+        recommendation = f"Wait (recommended): Hana stays on {pin}, so its builds do not move to a version that failed testing."
+    else:
+        errors = f"{trial['errors']} error" + ("" if trial["errors"] == 1 else "s")
+        result = (f"Compiler compatibility checks: Hana's code check found {errors} and {trial['warnings']} new warnings on {version}. "
+                  + f"A tool for repairing Rust builds {'compiled' if trial['mend_builds'] else 'failed to compile'} with {version}.")
+        recommendation = (f"Upgrade (recommended): Hana moves to {version}. Both checks passed, so nothing blocks the move."
+                          if not trial["errors"] and trial["mend_builds"] else
+                          f"Wait (recommended): Hana stays on {pin}, so the failed check does not affect its builds.")
+    other = (f"Wait: Hana stays on {pin}." if recommendation.startswith("Upgrade") else
+             f"Upgrade: Hana moves to {version} now. Its builds may fail.")
+    return f"{intro}{result}\n\n{recommendation}\n\n{other}"
+
+
+def release_push_title(trial: TrialOutcome) -> str:
+    if trial["status"] == "waiting":
+        return "Rust upgrade waits on an untested build"
+    if trial["status"] == "failed":
+        return "Rust upgrade failed its test"
+    if trial["errors"] or not trial["mend_builds"]:
+        return "Rust upgrade failed a code check"
+    return "Hana can use the new Rust compiler"
+
+
 def report_line() -> list[str]:
     state = read_state()
     if state is None or state["pin"] is None or not newer_than_pin(state["stable_version"], state["pin"]):
@@ -473,9 +504,9 @@ def check_release(
         state["trial"] = {"status": "waiting", "version": state["stable_version"], "reason": reason} if reason else trial_release(state["stable_version"], run_command, held, trial_parent())
     write_state(state)
     if 2 <= today.hour < 5 and not state["text_sent"]:
-        message = f"Rust {state['stable_version']} out: {trial_text(state['trial'])}. Tell natedev bump or wait."
+        message = release_push_text(state["stable_version"], pin, state["trial"])
         try:
-            sent = send_text(f"Rust {state['stable_version']} out", message)
+            sent = send_text(release_push_title(state["trial"]), message)
         except (OSError, subprocess.SubprocessError) as error:
             store.note_error(f"rust release text: {error}")
             return 1

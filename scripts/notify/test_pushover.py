@@ -280,6 +280,40 @@ class PushoverTests(unittest.TestCase):
         self.assertEqual(self.reviews()[0]["verdict"], "rewrite")
         self.assertEqual(cast(dict[str, object], self.reviews()[0]["sent"])["body"], version.body)
 
+    def test_failed_delivery_prints_the_exact_reviewed_fallback(self) -> None:
+        draft = self.draft()
+        version = replace(draft, title="Build needs your decision", action=ActionRequired("Choose retry.\nUse natedev."),
+                          body="The build stopped.\nChoose retry or stop.")
+        for failure in ("post", "keys", "timeout"):
+            with (self.subTest(failure=failure), mock.patch.object(review, "review", return_value=review.Rewritten(version, [])),
+                  redirect_stdout(io.StringIO()) as printed, redirect_stderr(io.StringIO())):
+                if failure == "keys":
+                    code = pushover.send(self.arguments(), self.keys.parent / "missing", lambda _u, _d: (200, b'{"status":1}'))
+                elif failure == "timeout":
+                    def post(_url: str, _data: bytes) -> tuple[int, bytes]:
+                        raise TimeoutError("post timed out")
+                    code = pushover.send(self.arguments(), self.keys, post)
+                else:
+                    code, _ = self.run_send(self.arguments(), status=500, body=b'{"status":0}')
+            self.assertIn(code, (1, 2))
+            text = printed.getvalue()
+            self.assertIn("pushover: reviewed JSON: " + json.dumps(review.message_record(version)) + "\n", text)
+            self.assertIn(version.body.replace("\n", "\\n"), text)
+
+    def test_failed_revision_prints_its_restored_hold_source(self) -> None:
+        """F004: send.py needs the held source before posting can fail."""
+        draft = self.draft(answerable=True)
+        held = review.Held(draft.source, 1000, draft, draft, ["Which build stopped?"])
+        review.hold(held)
+        with redirect_stdout(io.StringIO()) as output:
+            code, _ = self.run_send(self.arguments(answerable=True), status=500, body=b'{"status":0}')
+        self.assertEqual(code, 1)
+        line = output.getvalue().splitlines()[0]
+        record = cast(dict[str, object], json.loads(line.removeprefix("pushover: reviewed JSON: ")))
+        self.assertEqual(record["held_source"], draft.source)
+        self.assertEqual(record["held_identity"], review.hold_identity(held))
+        self.assertIsInstance(review.held_for(draft.source), review.LiveHold)
+
     def test_answerable_ask_holds_without_reading_keys_or_posting(self) -> None:
         draft = self.draft(answerable=True)
         questions = review.Questions(draft, ["Which build stopped?", "Which terminal?"], ["reader-starts-cold"])

@@ -1360,6 +1360,27 @@ class SettleTests(ShutdownTestCase):
             self.assertEqual(settle.conduct(LOGIN), 0)
         self.assertEqual(report.call_args.args[0], [])
 
+    def test_shutdown_pushes_name_the_session_cause_and_recovery_effect(self) -> None:
+        """F015: failed shutdown and restore pushes carry their recorded cause."""
+        cases: list[record.SessionProgress] = [
+            {"kind": "stop failed", "at": NOW, "reason": "process did not exit"},
+            {"kind": "restart failed", "at": NOW, "reason": "window failed to open"},
+        ]
+        for progress in cases:
+            with self.subTest(kind=progress["kind"]):
+                saved = session_shutdown(top_level("owner", "Owner"), progress=progress)
+                saved["hold"] = "account"
+                with (patch.object(settle, "run_remote", return_value=(0, "[]")),
+                      patch.object(settle, "send_message"), patch.object(settle, "alert_user") as alert):
+                    settle.report_stop([saved])
+                title, body, action = cast(tuple[str, str, ActionRequired], alert.call_args.args)
+                self.assertIn("session named Owner", body)
+                self.assertIn("Claude account", body)
+                self.assertIn("process did not exit" if progress["kind"] == "stop failed" else "window failed to open", body)
+                self.assertIn("tries to", body)
+                self.assertIn("natedev", action.text)
+                self.assertLess(len(title), 45)
+
     def test_report_stop_treats_owner_resource_issues_as_a_partial_stop(self) -> None:
         for kind in ("stopped", "already gone", "process identity lost"):
             for alerts in ("user", "none"):
@@ -1582,13 +1603,15 @@ class SettleTests(ShutdownTestCase):
         summary = cast(str, cast(object, alert.call_args.args[0]))
         text = cast(str, cast(object, alert.call_args.args[1]))
         action = cast(ActionRequired, cast(object, alert.call_args.args[2]))
-        self.assertIn("form is not answering the shutdown of " + LABEL, summary)
-        self.assertIn("requester is not answering", summary)
+        self.assertEqual(summary, "Shutdown waits on a session showing a form")
         self.assertIn("showing a form", text)
-        self.assertIn("/shutdown cancel --only form", action.text)
-        self.assertIn("/shutdown now --only requester", action.text)
+        self.assertIn("choose cancel or stop now", action.text)
+        self.assertIn("natedev", action.text)
+        self.assertIn("recommended", text)
+        self.assertLess(len("Action: " + action.text + "\n" + text), 500)
         sender.assert_called_once()
-        self.assertEqual(sender.call_args.args[2], text)
+        self.assertIn("/shutdown cancel --only form", cast(str, sender.call_args.args[2]))
+        self.assertIn("/shutdown now --only requester", cast(str, sender.call_args.args[2]))
         for identity in ("form", "requester"):
             saved = record.find_session(LOGIN, identity)
             assert saved is not None and "alerted_at" in saved
@@ -1709,7 +1732,8 @@ class SettleTests(ShutdownTestCase):
         with patch.object(settle, "local_machine", return_value="Mac"), patch.object(settle, "alert_user") as alert, patch.object(settle, "send_message", return_value=settle.MessageSent(kind="sent")) as sender:
             settle._send_holdout_alert([(saved, "busy")])  # pyright: ignore[reportPrivateUsage]
         self.assertEqual(alert.call_args.kwargs, {"machine": "natedev"})
-        self.assertEqual(sender.call_args.args[2], cast(str, cast(object, alert.call_args.args[1])))
+        self.assertIn("session named Held on Mac", cast(str, cast(object, alert.call_args.args[1])))
+        self.assertIn("/shutdown cancel --only Held", cast(str, sender.call_args.args[2]))
 
 
 

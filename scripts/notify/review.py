@@ -562,6 +562,24 @@ def release(source: str) -> None:
         held_path(source).unlink(missing_ok=True)
 
 
+def hold_identity(held: Held) -> str:
+    record: HeldRecord = {"source": held.source, "priority": held.draft.priority,
+                          "created": float(held.created), "draft": draft_record(held.draft),
+                          "best_version": draft_record(held.best_version), "questions": held.questions}
+    return hashlib.sha256(json.dumps(record, sort_keys=True).encode()).hexdigest()
+
+
+def release_if_matches(source: str, identity: str) -> bool:
+    """Remove only the restored hold named by a failed revision's fallback."""
+    with locked():
+        path = held_path(source)
+        found = _read_hold(path)
+        if isinstance(found, LiveHold) and hold_identity(found.hold) == identity:
+            path.unlink()
+            return True
+        return False
+
+
 def restore(source: str) -> None:
     with locked():
         path = held_path(source)
@@ -705,6 +723,9 @@ def main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
     _ = commands.add_parser("due")
+    release_parser = commands.add_parser("release")
+    _ = release_parser.add_argument("--identity", required=True)
+    _ = release_parser.add_argument("source")
     replay_parser = commands.add_parser("replay")
     _ = replay_parser.add_argument("--limit", type=int, default=0)
     switch_parser = commands.add_parser("switch")
@@ -718,6 +739,9 @@ def main(argv: list[str]) -> int:
     _ = check.add_argument("--priority", choices=("0", "1", "2"), default="0")
     arguments = parser.parse_args(argv)
     command = cast(str, arguments.command)
+    if command == "release":
+        _ = release_if_matches(cast(str, arguments.source), cast(str, arguments.identity))
+        return 0
     if command == "due":
         return due()
     if command == "replay":
