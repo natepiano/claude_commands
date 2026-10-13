@@ -670,34 +670,19 @@ It drops the "any cargo, rustc or nextest running on the Mac" check. That check 
 
 ### Phase 19 — A session that holds natedev can still launch its own apps  · status: done
 
-#### Work Order
+#### As-built
 
-**Goal:** While natedev is held, a BRP app launch from the session that placed the hold starts; a launch from any other session is refused exactly as now.
-
-**Spec:**
-- Today `command_check_local()` (`scripts/build_targets/build_targets.py`, about lines 343-365) answers exit 10 with `natedev is held by <holder> for <reason>; launch after the release.` for every launching session, the holder's own included. A hold placed for timing runs therefore blocks the timing runs (hana held natedev for fps's Open timing; research hit it too).
-- A hold file's name is already its holder's Claude session id: `holder_of()` builds `HolderIdentity(session["sessionId"], session["name"])` and `write_hold` writes to `holder_path(directory, identity.key)`; `read_holder` sets `Holder.key` to the file name. A hold taken under a name that is no live session keeps that name as its key. No new field is written to the hold file.
-- New rule in `command_check_local()`, after `state` is `Held` and `owner = build_hold.owning_session()` is resolved, and before `read_admission`: when `owner` is an `OwningSession`, read `holds = build_hold.natedev_holds(build_hold.holder_directory())`. When `holds.in_force` is non-empty and every holder in it has `holder.key == build_hold.holder_path(directory, owner.session_id).name`, return 0: no output, no `register_wait`, no write to the release record or the hold directory.
-- Every other case keeps today's path unchanged: no owning session; a hold in force that belongs to another session, also when the caller holds one too (that other session's timing stays protected); every hold already releasing (the existing `read_admission` path admits after release began); a session id that `holder_path` rejects (`ValueError`) counts as not the owner.
-- Errors keep their current answer: `ConfigError`, `OSError` and `build_hold.ReleaseRecordReadError` from the new read print `wait_diagnostic(...)` and exit 12, as the existing `except` does.
-- The hook `scripts/hooks/pre-tool-use-brp-launch-gate.sh` stays unchanged: it already exports `CLAUDE_CODE_SESSION_ID` from the hook input before running `check-local`, and on exit 0 it runs the memory gate, whose `MemoryGateReturned` mark touches only cycle entries carrying that session id.
-- Name new private helpers for what they answer (for example `holds_only_own(owner, directory) -> bool`); no public surface is added.
-- `docs/as-built/build-memory-admission.md`, the paragraph on `pre-tool-use-brp-launch-gate.sh`: add one sentence saying a launch from the session whose hold file is the only hold in force is admitted.
+- `holds_only_own(owner, directory) -> bool` in `build_targets.py` reads `build_hold.natedev_holds(directory)` and the caller's key `holder_path(directory, owner.session_id).name` inside one `try`; a `ValueError` from either answers False. It is True only when a hold is in force and every hold in force carries the caller's key. A hold file's name is its holder's Claude session id, so no field was added to the file.
+- `command_check_local()` returns 0 with no output and no write when the owning session `holds_only_own`, before `read_admission` and `register_wait`. Every other case keeps its old answer: another session's hold, a second session's hold beside the caller's, a hold placed under a name, holds already releasing (the `read_admission` path), and errors (exit 12). The launch hook is unchanged: it already passes the hook input's session id.
 
 **Files:**
-- `scripts/build_targets/build_targets.py` — the owner rule in `command_check_local()`.
-- `docs/as-built/build-memory-admission.md` — one sentence in the BRP launch gate paragraph.
-- `scripts/build_targets/test_build_targets.py` — check-local cases for each side.
-- `scripts/hooks/test_brp_launch_gate.py` — hook cases for each side.
+- `scripts/build_targets/build_targets.py` — `holds_only_own` and its call in `command_check_local`.
+- `scripts/build_targets/test_build_targets.py` — `check_launch(session_id)`; the holder admitted with records unchanged, another session refused, the holder refused beside another session's hold, a hold under a name refusing every session, and `test_holder_session_launch_is_refused_when_the_release_record_names_an_unusable_holder`.
+- `scripts/hooks/test_brp_launch_gate.py` — `prepare_hold_before_release()`; the holder's session passes with no deny answer, another session is denied with no memory wait or mark.
+- `docs/as-built/build-memory-admission.md` — one sentence in the BRP launches paragraph.
 
-**Seats:** 1 writer + 1 tester; the tests are written from this Spec alone.
-- `impl` — `scripts/build_targets/build_targets.py`, `docs/as-built/build-memory-admission.md`.
-- `test` — `scripts/build_targets/test_build_targets.py`: the holder's own session (hold started with `HolderIdentity("<session id>", "<name>")`, `CLAUDE_CODE_SESSION_ID` set to that id) gets 0 with empty stdout and stderr and an unchanged release record; another session gets 10 with the held message; the owner gets 10 when a second session's hold is also in force; a hold taken under a name with no session refuses every session. `scripts/hooks/test_brp_launch_gate.py`: the holder's own session id in the hook input passes through with no deny answer; another session id is denied with the held reason and no memory wait or mark.
+**Gotchas:**
+- `holders_in_force` resolves every release-record holder key through `holder_path`, which raises `ValueError` on a key such as `.`; a new reader of `natedev_holds` catches it.
+- A hold placed under a name that is no live session keys its file by that name, so no session matches it and every launch waits for the release.
 
-**Acceptance gate:** `python3 -m unittest discover -s scripts/build_targets -p 'test_*.py'` and `python3 -m unittest discover -s scripts/hooks -p 'test_brp_launch_gate.py'` green, with the new cases named for the behavior they pin; `basedpyright` on the changed Python files reports 0 errors and 0 warnings.
-
-**Constraints from prior phases:**
-- `check-local` exit codes are 0 admit, 10 held, 12 unreadable state; the hook turns any non-zero exit into a deny answer carrying stdout (verify.sh and app launches wait out a natedev hold by themselves).
-- A launch that arrives after its release began is admitted by `read_admission` without a second release message; that path and its test `test_check_local_admits_a_launch_after_the_release_began` stay as they are.
-- Holds are kept by session id with a fallback to names held before that change (`held_key`); the owner rule reads keys only and never renames or rewrites a hold file.
-- Tests set `BUILD_HOLD_DIR` and the release state root to temporary directories and never touch `~/.local/state/build-hold` or `~/.local/state/build-hold-release`.
+**Ruled out:** a session-id field in the hold file (the file name already is the session id); admitting the holder while another session's hold is also in force (it would break that session's timing).
