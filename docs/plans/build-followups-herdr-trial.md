@@ -154,18 +154,17 @@ Showrunner's brief and approval, 2026-10-13 10:3x–10:4x EDT (not the user's wo
 - `merge_checkpoint.py` has no as-built mode and fails at its promote step under `Promote: none` after pushing, so the merge record is written by hand.
 - A Codex worker can show `Working` with a frozen timer for minutes on a one-line task; `trial.py wait` times out as designed and `esc` recovers it.
 
-### Phase 5 — Remove everything and write the findings  · status: todo
+### Phase 5 — Write teardown and the findings  · status: done
 
 #### Work Order
 
-**Goal:** Nothing from the trial is left running or on disk, and the findings are written for the decision on herdr.
+**Goal:** Teardown and its leftovers check are ready to run, and the findings are written for the decision on herdr.
 
 **Spec:**
-- Teardown waits for the user: the user said 2026-10-13, "don't close it when you're finished - i may want to try some things". Write `teardown` and `leftovers` and the as-built, then run `teardown` only after the user says they are done; until then report what stays running.
+- Teardown waits for the user: the user said 2026-10-13, "don't close it when you're finished - i may want to try some things". This phase writes `teardown`, `leftovers` and the as-built; phase 6 runs `teardown` once the user says they are done.
 - `trial.py teardown`: close the workspaces, `server stop`, `client close`, stop each systemd unit in `started.json`, remove the notifier instances and `~/.local/state/showrunner/herdr-fake/` the fake showrunner registered (by exact name), remove herdr's recorded trial state only (`~/.config/herdr/sessions/herdr-trial/`, `sessions/herdr-devcheck/`, `.plugins.lock`, `release-notes.json`), then `sessions/` and `~/.config/herdr/` only if empty; stop a `codex app-server` daemon only when it is in `codex_daemons_started` and not in `codex_daemons_before` and no Codex process outside the trial's panes uses the seats account, otherwise leave it and report it as shared; remove `/home/natepiano/rust/herdr-trial-scratch/` by that exact path after copying `issues.jsonl` into the notice.
 - `trial.py leftovers`: exit 0 only when no process, systemd unit, timer, state folder or scratch path from the trial remains; prints each one that does, and prints a surviving Codex daemon as `trial-started` or `shared`.
 - `docs/as-built/herdr-trial.md`: what ran, what the user saw, the issues ranked by what a real herdr migration would have to change (session identity, unit lookup, launcher, trust, earlyoom, resume), Codex workers in panes against app-server threads, and what worked as the research said.
-- Once teardown and leftovers verification pass, delete `scripts/herdr/` unless the as-built names a reason to keep it; record the call (see the retain rule under Constraints).
 
 **Files:**
 - `scripts/herdr/trial.py` — `teardown`, `leftovers`
@@ -192,3 +191,24 @@ Showrunner's brief and approval, 2026-10-13 10:3x–10:4x EDT (not the user's wo
 - A Claude pane started in herdr turns on Remote Control by itself (claude 1 settings), so each Claude session registers a claude.ai session; `--remote-control <name>` only names it.
 - Interactive Codex on `~/.codex1` starts a managed `codex app-server` daemon under `systemd --user` that outlives its pane; typed `/quit` did not exit Codex, `pane close` did.
 - herdr state the trial created: all of `~/.config/herdr/` (absent before 10:44 EDT 2026-10-13): `.plugins.lock`, `release-notes.json`, `sessions/herdr-trial/` (`herdr.sock`, `herdr-client.sock`, `herdr-server.log`) and `sessions/herdr-devcheck/` (log from phase 1's syntax check). Codex's managed app-server daemon on `~/.codex1` may outlive the panes: `leftovers` reports it, and `teardown` stops it only if no Codex client outside the trial uses that account.
+
+### Phase 6 — Tear down the trial and close the findings  · status: todo
+
+#### Work Order
+
+**Goal:** Nothing from the trial is left running or on disk, and the as-built records how it ended.
+
+**Spec:**
+- Starts only when the user says they are done with the trial; until then the herdr session, its window, the 10 agents and the scratch production stay up.
+- The unit director runs `trial.py teardown`, then `trial.py leftovers` until it exits 0, from the complete worktree.
+- Fill the `docs/as-built/herdr-trial.md` Status with the teardown result, the leftovers output and the retained grants; include the archived `issues.jsonl` path in the checkpoint notice, then delete `~/.local/state/herdr-trial/`.
+- Delete `scripts/herdr/` unless the as-built names a reason to keep it; record the call in the as-built.
+
+**Files:**
+- `docs/as-built/herdr-trial.md` — Status filled
+- `scripts/herdr/trial.py`, `scripts/herdr/test_trial.py`, `scripts/herdr/fake_herdr.py` — deleted unless the as-built keeps them
+
+**Seats:** none — the unit director runs it.
+
+**Constraints from prior phases:**
+- Phase 5's teardown stops only a managed Codex daemon (`--managed-daemon`) it recorded as started; the live `started.json` lists five delegate mesh servers as started, which teardown retains and never signals. Two minor edges remain (one outside-client scan before all stops; any `app-server` argv token hides an outside client); neither can stop anything in this trial.
