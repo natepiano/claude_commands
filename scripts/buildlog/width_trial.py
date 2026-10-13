@@ -356,6 +356,8 @@ def _uses_memory_gate(step_name: object, raw_argv: object) -> bool:
     argv = _argv(raw_argv)
     if step_name == "sweep" and any(argument.endswith("/sweep.py") for argument in argv):
         return False
+    if argv and argv[0] == "taplo":
+        return False
     if not argv or argv[0] != "cargo":
         return True
     subcommand = 1
