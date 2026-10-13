@@ -114,8 +114,8 @@ When the builder prints `<step>: failed — <reason>`, give that exact line to
 the user as the failure message. Correct the named input before reporting.
 When it prints `phase tables: unavailable — <reason>`, continue. Only a unit
 whose records could not be read takes its ETA from the saved status capture
-and needs `started` in its judgment; a failed archive of retired notes changes
-nothing else.
+and needs `started` in its judgment. A dailies archives no notes: the
+agent-sessions snapshot timer prunes retired units' notes every 2 minutes.
 When it prints `bevy upgrade: unavailable — <reason>`, continue; the report
 carries the topic with that reason.
 

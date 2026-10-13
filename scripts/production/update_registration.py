@@ -16,10 +16,10 @@ from add_unit import Production, Refusal, cell_value, read_production, unit_tabl
 from merge_checkpoint import NoMerge, merge_branch_history, report
 
 if TYPE_CHECKING:
-    from ..hooks.showrunner_footer import FooterState, footer_state
+    from ..hooks.showrunner_footer import FooterState, footer_state, set_footer_state
 else:
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "hooks"))
-    from showrunner_footer import FooterState, footer_state
+    from showrunner_footer import FooterState, footer_state, set_footer_state
 import showrunners
 from dailies_render import UNREADABLE_LIST, InputError, footer_main, read_outstanding
 
@@ -106,15 +106,16 @@ DEFAULT_MINUTES = 15
 
 
 class UpdatesOnDemand(NamedTuple):
-    """The doc's Updates line reads `on demand`: a dailies runs only when the user asks for one."""
+    """The doc's Updates line reads `on demand`, or there is none: a dailies runs only when the user asks for one."""
 
 
 def update_schedule(lines: list[str]) -> ScheduledUpdates | UpdatesOnDemand:
     line = next((line for line in lines if line.startswith("- **Updates:**")), "")
-    if re.search(r"\bon demand\b", line):
-        return UpdatesOnDemand()
     match = re.search(r"every (\d+) minutes", line)
-    minutes = int(match.group(1)) if match else DEFAULT_MINUTES
+    # Quiet by default (user, 2026-10-13): only a line asking for a schedule makes one.
+    if match is None or re.search(r"\bon demand\b", line):
+        return UpdatesOnDemand()
+    minutes = int(match.group(1))
     if minutes <= 0:
         raise RegistrationFailure("prompt", "Updates interval must be positive")
     return ScheduledUpdates(minutes, "on the hour" in line)
@@ -161,11 +162,17 @@ def register(production: Production) -> None:
     if not prompt_file.exists() or prompt_file.read_text(encoding="utf-8") != prompt:
         _ = prompt_file.write_text(prompt, encoding="utf-8")
     check = f"zsh {Path.home()}/.claude/scripts/production/production_check.sh {production.doc}"
+    # No instance yet means a new production, which starts with its footer off (user, 2026-10-13). A
+    # restart finds its instance, so an existing production keeps the footer it has.
+    new_production = isinstance(instance(updates), InstanceAbsent)
     _ = notifier(["new", updates, "--to", f"session:{session_id}", "--every", str(minutes),
               "--prompt-file", str(prompt_file), "--from", f"showrunner-timer-{production.slug}",
               "--check", check, *(["--aligned"] if aligned else [])])
     if isinstance(schedule, UpdatesOnDemand):
         _ = notifier(["stop", updates])
+    if new_production:
+        set_footer_state(production.slug, FooterState.OFF)
+        report("footer", "ok", "off — new production; /showrunner:footer on turns it on")
     for name, script in (("stall-watch", "stall_watch.py"), ("tmux-names", "tmux_names.py")):
         if isinstance(instance(name), InstanceAbsent):
             run = f"{Path.home()}/.claude/scripts/lib/py {Path.home()}/.claude/scripts/production/{script}"

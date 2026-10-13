@@ -42,6 +42,10 @@ from inventory import (  # noqa: E402
     Session,
     TmuxHost,
     TmuxPane,
+    TmuxServer,
+    TmuxServerNotRecorded,
+    TmuxSessionId,
+    TmuxSessionIdNotRecorded,
     WindowHost,
 )
 from record import (  # noqa: E402
@@ -683,35 +687,37 @@ def _recorded_pane(host: TmuxHost) -> TmuxPane | PaneNotRecorded:
     return host["pane"]
 
 
+@dataclass(frozen=True)
+class ReusableTmuxPane:
+    pass
+
+
+@dataclass(frozen=True)
+class OccupiedTmuxPane:
+    session_ref: TmuxSessionId | TmuxSessionIdNotRecorded
+
+
+@dataclass(frozen=True)
+class TmuxPaneUnavailable:
+    pass
+
+
+TmuxPaneState = ReusableTmuxPane | OccupiedTmuxPane | TmuxPaneUnavailable
+
+
 def _pane_is_reusable(
-    tmux: str,
-    host: TmuxHost,
     pane: TmuxPane,
+    pane_pid_text: str,
+    pane_dead: str,
     *,
     dry_run: bool,
 ) -> bool:
-    pane_probe = _probe(
-        [
-            tmux,
-            "display",
-            "-p",
-            "-t",
-            pane["pane_id"],
-            "#{session_name}\t#{pane_pid}\t#{pane_dead}",
-        ],
-        dry_run=dry_run,
-    )
-    if pane_probe.returncode != 0:
-        return False
-    fields = pane_probe.stdout.rstrip("\r\n").split("\t")
-    if len(fields) != 3 or fields[0] != host["tmux_session"]:
-        return False
-    if fields[2] == "1":
+    if pane_dead == "1":
         return True
-    if fields[2] != "0":
+    if pane_dead != "0":
         return False
     try:
-        pane_pid = int(fields[1])
+        pane_pid = int(pane_pid_text)
     except ValueError:
         return False
     if pane_pid != pane["pane_pid"]:
@@ -719,6 +725,47 @@ def _pane_is_reusable(
 
     children = _probe(["pgrep", "-P", str(pane_pid)], dry_run=dry_run)
     return children.returncode == 1
+
+
+def _tmux_server_matches(
+    server: TmuxServer | TmuxServerNotRecorded, started_at_text: str, pid_text: str,
+) -> bool:
+    if server["kind"] == "not recorded":
+        return False
+    try:
+        return int(started_at_text) == server["started_at"] and int(pid_text) == server["pid"]
+    except ValueError:
+        return False
+
+
+def _tmux_pane_state(
+    tmux: str, pane: TmuxPane | PaneNotRecorded,
+    server: TmuxServer | TmuxServerNotRecorded, *, dry_run: bool,
+) -> TmuxPaneState:
+    if pane["kind"] == "not recorded" or server["kind"] == "not recorded":
+        return TmuxPaneUnavailable()
+    pane_probe = _probe(
+        [
+            tmux,
+            "display",
+            "-p",
+            "-t",
+            pane["pane_id"],
+            "#{session_id}\t#{pane_pid}\t#{pane_dead}\t#{start_time}\t#{pid}",
+        ],
+        dry_run=dry_run,
+    )
+    if pane_probe.returncode != 0:
+        return TmuxPaneUnavailable()
+    fields = pane_probe.stdout.rstrip("\r\n").split("\t")
+    if len(fields) != 5 or not _tmux_server_matches(server, fields[3], fields[4]):
+        return TmuxPaneUnavailable()
+    if _pane_is_reusable(pane, fields[1], fields[2], dry_run=dry_run):
+        return ReusableTmuxPane()
+    session_ref: TmuxSessionId | TmuxSessionIdNotRecorded = {"kind": "not recorded"}
+    if re.fullmatch(r"\$[0-9]+", fields[0]) is not None:
+        session_ref = {"kind": "session id", "session_id": fields[0]}
+    return OccupiedTmuxPane(session_ref)
 
 
 def _respawn_pane_argv(
@@ -738,12 +785,12 @@ def _respawn_pane_argv(
     ]
 
 
-def _new_window_argv(tmux: str, tmux_session: str, cwd: str, command: str) -> list[str]:
+def _new_window_argv(tmux: str, target: str, cwd: str, command: str) -> list[str]:
     return [
         tmux,
         "new-window",
         "-t",
-        f"={tmux_session}:",
+        target,
         "-c",
         cwd,
         "zsh",
@@ -758,24 +805,45 @@ def _tmux_launch(command: str, session: Session, *, dry_run: bool) -> None:
         raise ValueError("tmux launch needs a tmux host")
     tmux = os.environ.get("SHUTDOWN_TMUX", "tmux")
     pane = _recorded_pane(host)
-    reusable_pane = pane["kind"] == "pane" and _pane_is_reusable(
-        tmux, host, pane, dry_run=dry_run
-    )
-    if pane["kind"] == "pane" and reusable_pane and not dry_run:
+    server = host["server"]
+    pane_state = _tmux_pane_state(tmux, pane, server, dry_run=dry_run)
+    if pane["kind"] == "pane" and isinstance(pane_state, ReusableTmuxPane):
         _ = _run(
             _respawn_pane_argv(tmux, pane, session, command),
-            dry_run=False,
+            dry_run=dry_run,
         )
         return
 
+    if isinstance(pane_state, OccupiedTmuxPane) and pane_state.session_ref["kind"] == "session id":
+        _ = _run(
+            _new_window_argv(
+                tmux, f"{pane_state.session_ref['session_id']}:", session["cwd"], command,
+            ),
+            dry_run=dry_run,
+        )
+        return
+    session_ref = host["session_ref"]
+    if server["kind"] == "server" and session_ref["kind"] == "session id":
+        session_probe = _probe(
+            [tmux, "display", "-p", "-t", session_ref["session_id"], "#{start_time}\t#{pid}"],
+            dry_run=dry_run,
+        )
+        server_fields = session_probe.stdout.rstrip("\r\n").split("\t")
+        if (
+            session_probe.returncode == 0
+            and len(server_fields) == 2
+            and _tmux_server_matches(server, server_fields[0], server_fields[1])
+        ):
+            _ = _run(
+                _new_window_argv(tmux, f"{session_ref['session_id']}:", session["cwd"], command),
+                dry_run=dry_run,
+            )
+            return
     probe_argv = [tmux, "has-session", "-t", f"={host['tmux_session']}"]
     probe = _probe(probe_argv, dry_run=dry_run)
-    if pane["kind"] == "pane" and reusable_pane:
-        _ = _run(_respawn_pane_argv(tmux, pane, session, command), dry_run=dry_run)
-        return
     if probe.returncode == 0:
         _ = _run(
-            _new_window_argv(tmux, host["tmux_session"], session["cwd"], command),
+            _new_window_argv(tmux, f"={host['tmux_session']}:", session["cwd"], command),
             dry_run=dry_run,
         )
         return
@@ -799,7 +867,7 @@ def _tmux_launch(command: str, session: Session, *, dry_run: bool) -> None:
         if dry_run or _probe(probe_argv, dry_run=False).returncode != 0:
             raise
         _ = _run(
-            _new_window_argv(tmux, host["tmux_session"], session["cwd"], command),
+            _new_window_argv(tmux, f"={host['tmux_session']}:", session["cwd"], command),
             dry_run=False,
         )
 

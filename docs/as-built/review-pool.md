@@ -332,6 +332,149 @@ A reason given beside its mechanism above is not repeated here.
 - **The pooled UI reviewer's standing prompt holds the rule texts.** A `ui` turn starts from a reset thread, so a prompt that names `commands/ux_eval.md` and the rule files has them read again on every turn; with the texts standing, the turn reads none and cost about 22% fewer weighted tokens (Numbers).
 - **Design decisions come from the production's repository, never from the guide.** It is the file the helper's `ux_eval.md` reads; taking it from the guide would make the helper and the pool judge against different exceptions.
 
+## Risks
+
+From the proposal (`docs/plans/proposal-review-unit.md`, 2026-10-10, removed 2026-10-13 once built), as weighed then.
+
+| Risk | What contains it |
+| --- | --- |
+| **The cost of standing context per request** (the largest risk) | Prefix tokens are re-billed on every request, so a pool that keeps growing context loses to fresh reviewers without anyone seeing it. Standing prompts are capped (7k code, 6k UI) and leases revert. The trial (Trial design below) ends the pool if the per-review number does not drop. |
+| One unit's details in another unit's review | A lease is one unit's. A revert removes the whole lease before the reviewer serves anyone else. Per-unit memory is sent only in that unit's lease. The repository memory holds classes and rulings, never diffs; its writer is the director, who applies that rule. |
+| Stale context | The prompt says to re-read the tree each review. A lease never outlives its phase. Memory entries carry a date and source and are pruned when a ruling changes. A changed guide hash retires reviewers at lease end. |
+| One point of failure | The request path is the unit's own `review.sh` plus one app-server. A dead server is restarted on the next call, and its threads resume (existing `follow` behavior). If the pool cannot open a thread at all, `review.sh --pool` exits `error`, and the unit director runs today's fresh path, as <DelegateLaunchFailure/> already directs. This applies on failure, not on load. |
+| Sandbox reads of every worktree | Codex `readOnly` reads the whole filesystem, so it needs no grant per worktree. It also cannot stop a reviewer reading a sibling unit's tree. All trees are the user's own, so this is a correctness risk, not a privacy one. The prompt names the worktree and head hash. The reviewer's first command is `git -C <worktree> rev-parse HEAD`, and a mismatch reports `error`. |
+| Writer independence | An improvement on own-seat review, where a writer can review its own code: a pool reviewer never wrote what it reads. |
+| UI reviewer on Codex | Today's design check runs on a Claude helper. Phase D runs the Codex UI reviewer in shadow first and adopts it only if it misses nothing the Claude helper found. |
+
+## Trial design
+
+The proposal's build order and the measurement the trial report implements. Phase A's first probe was settled by measurement: a lease ends with `reset` (Why).
+
+**Phase A — probes (one session, no skill text).** On a scratch app-server:
+1. Does the first request after `thread/revert` read the standing prompt as
+   cached input? Compare with the first request after `thread/fork`. The answer
+   decides revert or fork for lease end; the measurement for each is the
+   `cached_input_tokens` of that request.
+2. Do `developerInstructions` survive `thread/compact/start`?
+3. Do per-turn `cwd`, `readOnly` and `outputSchema` work?
+4. Can one app-server serve two clients' turns at once?
+
+Also drop `--ephemeral` for reviews, so the baseline starts collecting rollouts.
+
+**Phase B — code pool on build-followups.** `review_pool.py`, the mesh verbs,
+`review.sh --pool code`, the `direct.md` and `dual_review.md` text. Trial
+assignment: `allocate` sends a phase's reviews to the pool or to the unit's own
+seats (`--to`) by a hash of unit and phase. That gives an even mix in
+the same window. This is an assignment for comparison, not a fallback.
+
+**Phase C — review unit director, memory, Hana.** `/review:direct`, memory
+curation, the production doc, the `produce.md` changes. Roll out to the Hana
+production with the same assignment by hash.
+
+**Phase D — UI pool.** Shadow first: for ten design checks, the Codex UI
+reviewer judges the same shots as the Claude helper. Its verdict is recorded
+but not used. Adopt when it found every defect the helper found.
+
+**Measuring tokens per review.** `seat_usage.py --reviews --since <date>` reads
+every `review_turn_*.json` under `/tmp/claude/delegate/` on natedev and the
+Mac. It sums the rollout's token counts for that turn id, and prints weighted
+tokens per review by arm (fresh, own seat, pool) and kind (broad lens, closure,
+ux):
+- median and mean;
+- the share from cached input, which shows standing-context cost directly;
+- for the pool, the lease ordinal, so the warm-closure saving shows apart from
+  the startup saving.
+
+Fresh reviews are measured from their rollouts once `--ephemeral` is gone.
+`codex exec`'s `tokens used` total does not split cached from uncached input.
+
+**Measuring whether context build-up improves reviews.** Per review, from the
+records each unit already keeps:
+- **raised:** numbered items in its findings file;
+- **confirmed:** ledger rows opened with its lens in that pass;
+- **precision:** confirmed ÷ raised;
+- **escapes:** defects in the same phase the review should have caught. These
+  are rows opened `--caught-by main` only, new defects found by a later closure
+  in code the broad review read, merge holds and merge design-check defects
+  (`review_regime.py`, regime `pool`), and red CI traced to the phase.
+
+`seat_usage.py --reviews --quality` plots precision and escapes per review
+against two measures:
+- the memory entry count when the review ran (memory version, stored with the
+  turn record);
+- the reviewer's review count.
+
+It does the same for the own-seat and fresh arms over the same window.
+
+**Verdict, after 60 pool reviews or 3 weeks, whichever is later:**
+- **Keep the pool** when its weighted tokens per review are at most 85% of the
+  own-seat arm's, and its escapes per phase are no higher.
+- **Keep the memory** when precision or escapes improve with memory version
+  (a falling trend across at least four memory versions). Otherwise cut memory
+  to the guides and contracts alone. It then costs fewer prefix tokens and buys
+  no measured quality.
+- **Remove the pool** when it misses the 85% line. Own-seat reviews
+  stay. The user decides with the report in hand.
+
+The likely sources of a saving, to check against the report:
+- a pooled reviewer's first request is cached, saving most of the 19k–26k
+  preamble that a fresh reviewer pays uncached, about 18k weighted per review;
+- a closure on a warm lease reads less code. Closures are two thirds of reviews.
+
+The likely loss: a pool reviewer is cold on the unit's code, where an own
+seat is warm. The trial exists to find which effect is larger.
+
+## What the showrunner and directors said
+
+Asked 2026-10-10. All four answered; replies are paraphrased by the coordinator
+and attributed by session name.
+
+- **hana** (showrunner): send a request file with "worktree path, base and head
+  hashes, files, the Work Order and the guide set". The reviewer writes
+  findings.py-schema JSON into a file the unit owns, and "the director keeps
+  triage". Keep "the guides, the type-design contract, recurring defect
+  classes, per-crate idioms". Forget "each diff, each unit's plan, earlier
+  verdicts on a file", and compact between reviews. Worried because
+  "checkpoints bunch up after build holds"; wanted a wait limit with a fallback
+  to the unit's own seat, and no single pool that can block everyone. UX: a
+  fresh helper per checkpoint; a long-lived UI reviewer "may keep the UX rule
+  list, but reads each shot fresh".
+- **organon** (geometry-material-unit): hand over "base and tip, Work Order
+  path, lens list, session dir". The pass goes in organon's progress table
+  "with the reviewer's id". Keep "Hana's codebase map, the unit's standing
+  rules (never-edit files, ownership, the 9 px floor)" with the style guide and
+  type contract. Forget "earlier verdicts on its code, and other units' diffs".
+  Fall back to its own seat after about 10 minutes. UX: fresh at each
+  checkpoint.
+- **widget** (widget-unit): send "base..HEAD plus uncommitted paths", the plan
+  heading, the lens and the session dir. Get back "findings.py-ready JSON
+  lines" plus one board post. Keep the crate's settled rulings "and its past
+  findings with how each closed". Forget "any belief about the tree's current
+  state; re-read every time". Warned that "a reviewer warm on another unit is
+  cold on this one". Wanted a 15-minute limit and a readable queue position.
+  UX: fresh, because "a long-lived eye gets used to the look".
+- **trunk** (trunk-unit): the pass shows under slot `review`. Either the review
+  unit writes trunk's history, "or sends two lines for trunk to record". Keep
+  "crate layout, style and type rulings already made, recurring defect
+  classes". Closure reviews "must come first, never behind another unit's
+  broad review". Opens its own seat after about 10 minutes of waiting. UX: "a
+  fresh verdict on exactly the shots in the notice". A long-lived UI reviewer
+  "may hold the guide for repair rounds".
+
+**How the proposal answers them.**
+- Queueing, their shared first worry, is gone by the user's rule. Allocation
+  creates a reviewer rather than waiting, so wait limits, queue positions and
+  closure priority have nothing to act on.
+- Findings land in each unit's own files, and triage stays with its director
+  (all four).
+- The pass is recorded by the unit's own launcher (organon, trunk).
+- What to keep became the review memory, and what to forget is removed by the
+  lease revert (all four).
+- Widget's "warm on another unit is cold on this one" is the reason leases are
+  per unit and the trial compares against warm own seats.
+- UX verdicts are given from a reverted UI reviewer, which is the fresh eye the
+  four asked for. The rule list and rulings persist, as the user asked.
+
 ## Tests
 
 - `scripts/delegate/test_review_pool.py` (61 tests) runs the pool CLI as subprocesses against a stub mesh named by `REVIEW_POOL_MESH`: primes and old-hash retirement, the arm split, allocation, name issue, `--fresh`, `release --thread-id`, `end-lease`, `health`, dead reservations, `stop` and its recovery, a stop that lands during a prime, fork or reset, `unit-memory` and the adoption marker. `UIStandingPromptTests` pins `ui.md`'s verdict line, its table header and `measure_text.py`, and the absence of the old instructions to follow `ux_eval.md` and read a rule's full text.

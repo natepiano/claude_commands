@@ -258,7 +258,7 @@ State:
   passes a reply after any Stop-hook block and passes on errors.
 
   `/showrunner:footer off` and `/showrunner:footer on` pause and resume the
-  footer for this showrunner. Run them when the user says "footers off" or
+  footer for this showrunner. A new production starts with it off. Run them when the user says "footers off" or
   "footers on" as well as when they type the command. While `/showrunner:footer`
   reports off, omit both the footer and the Waiting on block. Run
   `/showrunner:footer` after every compaction and session resume: its switch
@@ -395,10 +395,15 @@ The command writes `PROMPT_FILE`,
 retargets `UPDATES` with `NOTIFIER new` without moving its clock, creates
 stall-watch and tmux-names only when absent, and prints `next_due`. Use the
 reported next tick and log it. `CLAUDE_CODE_SESSION_ID` must be set.
-When the doc's Updates line reads `on demand`, it makes `UPDATES` at the
-default 15 minutes and stops it, prints `on demand: no scheduled dailies`,
-and no scheduled update comes: a dailies runs only when the user asks for one.
-The stopped instance stays, because it is the showrunner's only record.
+When the doc's Updates line reads `on demand`, or there is none, it makes
+`UPDATES` at the default 15 minutes and stops it, prints `on demand: no
+scheduled dailies`, and no scheduled update comes: a dailies runs only when
+the user asks for one. The stopped instance stays, because it is the
+showrunner's only record. On a new production, one with no `UPDATES` yet, it
+also turns the footer off and prints `footer: ok — off — new production`; a
+restart keeps the footer as it was. New productions are quiet until the user
+asks (user, 2026-10-13): `/showrunner:report_interval <minutes>` schedules
+updates and `/showrunner:footer on` turns the footer on.
 
 The prompt:
 

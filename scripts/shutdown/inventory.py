@@ -57,9 +57,30 @@ class PaneNotRecorded(TypedDict):
     kind: Literal["not recorded"]
 
 
+class TmuxSessionId(TypedDict):
+    kind: Literal["session id"]
+    session_id: str
+
+
+class TmuxSessionIdNotRecorded(TypedDict):
+    kind: Literal["not recorded"]
+
+
+class TmuxServer(TypedDict):
+    kind: Literal["server"]
+    pid: int
+    started_at: int
+
+
+class TmuxServerNotRecorded(TypedDict):
+    kind: Literal["not recorded"]
+
+
 class TmuxHost(TypedDict):
     kind: Literal["tmux"]
     tmux_session: str
+    session_ref: TmuxSessionId | TmuxSessionIdNotRecorded
+    server: TmuxServer | TmuxServerNotRecorded
     pane: TmuxPane | PaneNotRecorded
 
 
@@ -353,6 +374,43 @@ def _parse_tmux_pane(value: object, place: str) -> TmuxPane | PaneNotRecorded:
     raise InvalidInventory(f"{place}.kind is invalid")
 
 
+def _parse_tmux_session_ref(
+    value: object, place: str,
+) -> TmuxSessionId | TmuxSessionIdNotRecorded:
+    data = _wire_object(value, place)
+    kind = _wire_kind(data, place)
+    if kind == "session id":
+        session_id = _wire_string(
+            _wire_required(data, "session_id", place), f"{place}.session_id"
+        )
+        if re.fullmatch(r"\$[0-9]+", session_id) is None:
+            raise InvalidInventory(f"{place}.session_id is invalid")
+        return {"kind": "session id", "session_id": session_id}
+    if kind == "not recorded":
+        return {"kind": "not recorded"}
+    raise InvalidInventory(f"{place}.kind is invalid")
+
+
+def _parse_tmux_server(
+    value: object, place: str,
+) -> TmuxServer | TmuxServerNotRecorded:
+    data = _wire_object(value, place)
+    kind = _wire_kind(data, place)
+    if kind == "server":
+        if "pid" not in data:
+            return {"kind": "not recorded"}
+        return {
+            "kind": "server",
+            "pid": _wire_integer(data["pid"], f"{place}.pid"),
+            "started_at": _wire_integer(
+                _wire_required(data, "started_at", place), f"{place}.started_at"
+            ),
+        }
+    if kind == "not recorded":
+        return {"kind": "not recorded"}
+    raise InvalidInventory(f"{place}.kind is invalid")
+
+
 def _parse_host(value: object, place: str, allow_unit: bool) -> Host:
     data = _wire_object(value, place)
     kind = _wire_kind(data, place)
@@ -387,6 +445,16 @@ def _parse_host(value: object, place: str, allow_unit: bool) -> Host:
                 f"{place}.tmux_session",
             ),
             "pane": pane,
+            "session_ref": (
+                _parse_tmux_session_ref(data["session_ref"], f"{place}.session_ref")
+                if "session_ref" in data
+                else {"kind": "not recorded"}
+            ),
+            "server": (
+                _parse_tmux_server(data["server"], f"{place}.server")
+                if "server" in data
+                else {"kind": "not recorded"}
+            ),
         }
     if kind in {"ghostty", "zed"}:
         window = {
@@ -869,10 +937,15 @@ def _process_environment(pid: int) -> dict[str, str]:
     return {name: value for name, value in entries}
 
 
-def _tmux_session(pane: str) -> tuple[str, TmuxPane | PaneNotRecorded]:
+def _tmux_session(pane: str) -> tuple[
+    str, TmuxSessionId | TmuxSessionIdNotRecorded,
+    TmuxServer | TmuxServerNotRecorded, TmuxPane | PaneNotRecorded,
+]:
     not_recorded: PaneNotRecorded = {"kind": "not recorded"}
+    no_session_id: TmuxSessionIdNotRecorded = {"kind": "not recorded"}
+    no_server: TmuxServerNotRecorded = {"kind": "not recorded"}
     if not pane:
-        return "", not_recorded
+        return "", no_session_id, no_server, not_recorded
     try:
         result = subprocess.run(
             (
@@ -881,7 +954,7 @@ def _tmux_session(pane: str) -> tuple[str, TmuxPane | PaneNotRecorded]:
                 "-p",
                 "-t",
                 pane,
-                "#{session_name}\t#{pane_pid}",
+                "#{session_name}\t#{session_id}\t#{pane_pid}\t#{start_time}\t#{pid}",
             ),
             capture_output=True,
             text=True,
@@ -889,21 +962,33 @@ def _tmux_session(pane: str) -> tuple[str, TmuxPane | PaneNotRecorded]:
             check=False,
         )
     except (OSError, subprocess.TimeoutExpired, subprocess.CalledProcessError):
-        return "", not_recorded
+        return "", no_session_id, no_server, not_recorded
     if result.returncode != 0:
-        return "", not_recorded
-    session_name, separator, pane_pid_text = result.stdout.rstrip("\r\n").partition("\t")
+        return "", no_session_id, no_server, not_recorded
+    fields = result.stdout.rstrip("\r\n").split("\t")
+    session_name = fields[0]
     if not session_name:
-        return "", not_recorded
-    if not separator:
-        return session_name, not_recorded
+        return "", no_session_id, no_server, not_recorded
+    if len(fields) < 3:
+        return session_name, no_session_id, no_server, not_recorded
+    session_ref: TmuxSessionId | TmuxSessionIdNotRecorded = no_session_id
+    if re.fullmatch(r"\$[0-9]+", fields[1]) is not None:
+        session_ref = {"kind": "session id", "session_id": fields[1]}
+    server: TmuxServer | TmuxServerNotRecorded = no_server
+    if len(fields) == 5:
+        try:
+            server = {"kind": "server", "pid": int(fields[4]), "started_at": int(fields[3])}
+        except ValueError:
+            pass
     try:
-        pane_pid = int(pane_pid_text)
+        pane_pid = int(fields[2])
     except ValueError:
-        return session_name, not_recorded
+        return session_name, session_ref, server, not_recorded
     if pane_pid <= 0:
-        return session_name, not_recorded
-    return session_name, {"kind": "pane", "pane_id": pane, "pane_pid": pane_pid}
+        return session_name, session_ref, server, not_recorded
+    return session_name, session_ref, server, {
+        "kind": "pane", "pane_id": pane, "pane_pid": pane_pid,
+    }
 
 
 def terminal_kind(command: str) -> Literal["ghostty", "zed", "terminal", "unknown"]:
@@ -1039,13 +1124,15 @@ def _host(
 
     environment = _process_environment(session.get("pid", 0))
     pane = environment.get("TMUX_PANE", "")
-    tmux_session, tmux_pane = _tmux_session(pane)
+    tmux_session, session_ref, server, tmux_pane = _tmux_session(pane)
     if pane:
         return (
             {
                 "kind": "tmux",
                 "tmux_session": tmux_session,
                 "pane": tmux_pane,
+                "session_ref": session_ref,
+                "server": server,
             }
             if tmux_session
             else {"kind": "unknown"}

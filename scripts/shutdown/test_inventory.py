@@ -14,6 +14,7 @@ from typing import cast, final, override
 from unittest.mock import patch
 
 from test_support import ShutdownTestCase
+from test_restart import pane_display
 import inventory
 import account
 import fake_tmux
@@ -559,16 +560,16 @@ elif "comm=" in joined:
 
         def tmux_details(
             pane: str,
-        ) -> tuple[str, inventory.TmuxPane | inventory.PaneNotRecorded]:
+        ) -> tuple[str, inventory.TmuxSessionId | inventory.TmuxSessionIdNotRecorded, inventory.TmuxServer | inventory.TmuxServerNotRecorded, inventory.TmuxPane | inventory.PaneNotRecorded]:
             if pane == "%8":
-                return "production work", {
+                return "production work", inventory.TmuxSessionId(kind="session id", session_id="$8"), inventory.TmuxServer(kind="server", pid=34500, started_at=1700000000), {
                     "kind": "pane",
                     "pane_id": "%8",
                     "pane_pid": 62_008,
                 }
             if pane == "%9":
-                return "writing", {"kind": "not recorded"}
-            return "", {"kind": "not recorded"}
+                return "writing", inventory.TmuxSessionIdNotRecorded(kind="not recorded"), inventory.TmuxServerNotRecorded(kind="not recorded"), {"kind": "not recorded"}
+            return "", inventory.TmuxSessionIdNotRecorded(kind="not recorded"), inventory.TmuxServerNotRecorded(kind="not recorded"), {"kind": "not recorded"}
 
         with (
             patch("inventory._process_environment", side_effect=process_environment),
@@ -582,6 +583,8 @@ elif "comm=" in joined:
             {
                 "kind": "tmux",
                 "tmux_session": "production work",
+                "session_ref": {"kind": "session id", "session_id": "$8"},
+                "server": {"kind": "server", "pid": 34500, "started_at": 1700000000},
                 "pane": {"kind": "pane", "pane_id": "%8", "pane_pid": 62_008},
             },
         )
@@ -590,62 +593,70 @@ elif "comm=" in joined:
             {
                 "kind": "tmux",
                 "tmux_session": "writing",
+                "session_ref": {"kind": "not recorded"},
+                "server": {"kind": "not recorded"},
                 "pane": {"kind": "not recorded"},
             },
         )
 
-    def test_tmux_discovery_reads_session_and_pane_pid_in_one_call(self) -> None:
-        completed = subprocess.CompletedProcess(
-            args=(), returncode=0, stdout="production work\t62008\n"
-        )
-        with (
-            patch.object(unit_lookup, "tmux_binary", return_value="/test/tmux"),
-            patch("inventory.subprocess.run", return_value=completed) as run,
-        ):
+    def discover_tmux(
+        self, name: str, session_id: str, pid: str, started_at: str = "1700000000",
+        *, include_start: bool = True, server_pid: str = "34500", include_pid: bool = True,
+    ) -> tuple[str, inventory.TmuxSessionId | inventory.TmuxSessionIdNotRecorded,
+               inventory.TmuxServer | inventory.TmuxServerNotRecorded, inventory.TmuxPane | inventory.PaneNotRecorded]:
+        calls: list[tuple[str, ...]] = []
+        def probe(argv: tuple[str, ...], *, capture_output: bool, text: bool, timeout: int, check: bool) -> subprocess.CompletedProcess[str]:
+            del capture_output, text, timeout, check
+            calls.append(argv)
+            self.assertEqual(argv[:5], ("/test/tmux", "display", "-p", "-t", "%8"))
+            self.assertCountEqual(argv[-1].split("\t"), ["#{session_name}", "#{session_id}", "#{pane_pid}", "#{start_time}", "#{pid}"])
+            format_text = argv[-1]
+            if not include_start:
+                format_text = "\t".join(field for field in format_text.split("\t") if field != "#{start_time}")
+            if not include_pid:
+                format_text = "\t".join(field for field in format_text.split("\t") if field != "#{pid}")
+            return subprocess.CompletedProcess(argv, 0,
+                pane_display(format_text, name, session_id, pid, "", started_at, server_pid), "")
+        with patch.object(unit_lookup, "tmux_binary", return_value="/test/tmux"), patch("inventory.subprocess.run", probe):
             found = inventory._tmux_session("%8")  # pyright: ignore[reportPrivateUsage]
+        self.assertEqual(len(calls), 1)
+        return found
 
-        self.assertEqual(
-            found,
-            (
-                "production work",
-                {"kind": "pane", "pane_id": "%8", "pane_pid": 62_008},
-            ),
-        )
-        self.assertEqual(
-            run.call_args.args[0],
-            (
-                "/test/tmux",
-                "display",
-                "-p",
-                "-t",
-                "%8",
-                "#{session_name}\t#{pane_pid}",
-            ),
-        )
+    def test_tmux_discovery_reads_session_and_pane_pid_in_one_call(self) -> None:
+        self.assertEqual(self.discover_tmux("production work", "$8", "62008"),
+            ("production work", {"kind": "session id", "session_id": "$8"},
+             {"kind": "server", "pid": 34500, "started_at": 1700000000},
+             {"kind": "pane", "pane_id": "%8", "pane_pid": 62008}))
 
     def test_tmux_discovery_preserves_spaces_in_session_name(self) -> None:
-        completed = subprocess.CompletedProcess(
-            args=(), returncode=0, stdout=" work \t62008\n"
-        )
-        with patch("inventory.subprocess.run", return_value=completed):
-            found = inventory._tmux_session("%8")  # pyright: ignore[reportPrivateUsage]
-
-        self.assertEqual(
-            found,
-            (
-                " work ",
-                {"kind": "pane", "pane_id": "%8", "pane_pid": 62_008},
-            ),
-        )
+        self.assertEqual(self.discover_tmux(" work ", "$8", "62008"),
+            (" work ", {"kind": "session id", "session_id": "$8"},
+             {"kind": "server", "pid": 34500, "started_at": 1700000000},
+             {"kind": "pane", "pane_id": "%8", "pane_pid": 62008}))
 
     def test_tmux_discovery_keeps_session_when_pane_pid_is_unusable(self) -> None:
-        completed = subprocess.CompletedProcess(
-            args=(), returncode=0, stdout="writing\tnot-a-pid\n"
-        )
-        with patch("inventory.subprocess.run", return_value=completed):
-            found = inventory._tmux_session("%9")  # pyright: ignore[reportPrivateUsage]
+        self.assertEqual(self.discover_tmux("writing", "$9", "not-a-pid"),
+            ("writing", {"kind": "session id", "session_id": "$9"},
+             {"kind": "server", "pid": 34500, "started_at": 1700000000}, {"kind": "not recorded"}))
 
-        self.assertEqual(found, ("writing", {"kind": "not recorded"}))
+    def test_tmux_discovery_records_missing_session_id_without_losing_pane(self) -> None:
+        self.assertEqual(self.discover_tmux("writing", "", "62009"),
+            ("writing", {"kind": "not recorded"}, {"kind": "server", "pid": 34500, "started_at": 1700000000},
+             {"kind": "pane", "pane_id": "%8", "pane_pid": 62009}))
+
+    def test_tmux_discovery_records_missing_or_invalid_server_without_losing_ids(self) -> None:
+        for started_at, include_start in (("1700000000", False), ("", True), ("not-an-integer", True)):
+            with self.subTest(started_at=started_at, include_start=include_start):
+                self.assertEqual(self.discover_tmux("writing", "$9", "62009", started_at, include_start=include_start),
+                    ("writing", {"kind": "session id", "session_id": "$9"}, {"kind": "not recorded"},
+                     {"kind": "pane", "pane_id": "%8", "pane_pid": 62009}))
+
+    def test_tmux_discovery_records_missing_or_invalid_server_pid_without_losing_ids(self) -> None:
+        for server_pid, include_pid in (("34500", False), ("", True), ("not-an-integer", True)):
+            with self.subTest(server_pid=server_pid, include_pid=include_pid):
+                self.assertEqual(self.discover_tmux("writing", "$9", "62009", server_pid=server_pid, include_pid=include_pid),
+                    ("writing", {"kind": "session id", "session_id": "$9"}, {"kind": "not recorded"},
+                     {"kind": "pane", "pane_id": "%8", "pane_pid": 62009}))
 
     def test_ghostty_host_carries_window_shell_between_terminal_and_claude(self) -> None:
         found = inventory.inventory(TARGET_LOGIN)
@@ -848,9 +859,33 @@ elif "comm=" in joined:
             {
                 "kind": "tmux",
                 "tmux_session": "legacy",
+                "session_ref": {"kind": "not recorded"},
+                "server": {"kind": "not recorded"},
                 "pane": {"kind": "not recorded"},
             },
         )
+
+    def test_parse_inventory_restores_session_reference_and_preserves_legacy_pane(self) -> None:
+        found = inventory.inventory(TARGET_LOGIN, only=frozenset({DESKTOP_ID}))
+        document = cast(dict[str, object], cast(object, json.loads(json.dumps(found))))
+        session_values = cast(list[object], document["sessions"])
+        owner = cast(dict[str, object], session_values[0])
+        host: dict[str, object] = {"kind": "tmux", "tmux_session": "old name",
+            "pane": {"kind": "pane", "pane_id": "%8", "pane_pid": 700},
+            "session_ref": {"kind": "session id", "session_id": "$4"},
+            "server": {"kind": "server", "pid": 34500, "started_at": 1700000000}}
+        owner["host"] = host
+        parsed = inventory.parse_inventory(json.dumps(document))["sessions"][0]["host"]
+        self.assertEqual(parsed, host)
+        host["server"] = {"kind": "server", "started_at": 1700000000}
+        parsed = inventory.parse_inventory(json.dumps(document))["sessions"][0]["host"]
+        self.assertEqual(parsed, {**host, "server": {"kind": "not recorded"}})
+        del host["server"]
+        parsed = inventory.parse_inventory(json.dumps(document))["sessions"][0]["host"]
+        self.assertEqual(parsed, {**host, "server": {"kind": "not recorded"}})
+        del host["session_ref"]
+        parsed = inventory.parse_inventory(json.dumps(document))["sessions"][0]["host"]
+        self.assertEqual(parsed, {**host, "session_ref": {"kind": "not recorded"}, "server": {"kind": "not recorded"}})
 
     def test_parse_inventory_validates_a_recorded_tmux_pane(self) -> None:
         found = inventory.inventory(TARGET_LOGIN)
