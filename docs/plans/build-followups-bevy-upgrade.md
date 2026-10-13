@@ -277,33 +277,44 @@ def bounded_bevy_update(text: str) -> str: ...
 
 ### Phase 6 — The migration plan's dependency check sees crates that depend only on Bevy's sub-crates  · status: done
 
-#### Work Order
+#### As-built
 
-**Goal:** `/bevy_migration_plan`'s dependency check lists and classifies a crate that depends on Bevy only through Bevy's own crates, such as `bevy_app` or `bevy_ecs`, as it does one that depends on `bevy`.
+`/bevy_migration_plan`'s dependency check lists and classifies a crate that depends on Bevy only through one of Bevy's own crates, such as `bevy_app` or `bevy_ecs`, as it does one that depends on `bevy`. A crates.io lookup that gets no answer keeps the crate in the report for manual verification.
 
-**Spec:**
-Work only in the worktree and branch the Delegation Context names. The user approved this phase on 2026-10-12, through the showrunner. The file belongs to no unit of this production; name it in the checkpoint notice as `also touches`.
+```python
+# bevy_migration_dependency_check.py — every class is a frozen dataclass
+class BevyRequirement: requirement: str
+class NoBevyDependency: ...
+class RequirementLookupFailed: reason: str
+RequirementLookup = BevyRequirement | NoBevyDependency | RequirementLookupFailed
+class DiscoveredDependency: name: str; version: str; lookup: BevyRequirement | RequirementLookupFailed
+class CompatibleVersion: version: str
+class NoCompatibleVersion: ...
+class CompatibilityUnknown: reason: str
+class BevyCheckoutRead: names: frozenset[str]
+class BevyCheckoutMissing: path: Path
+BevyCheckout = BevyCheckoutRead | BevyCheckoutMissing
+def get_bevy_internal_crates(bevy_version: str) -> BevyCheckout: ...
+def bevy_requirement_names(bevy_checkout: BevyCheckout) -> frozenset[str]: ...
+def get_bevy_dependency_requirement(crate_name: str, version: str, bevy_names: frozenset[str]) -> RequirementLookup: ...
+def get_all_direct_dependencies(codebase: Path, bevy_checkout: BevyCheckout) -> list[tuple[str, str]]: ...
+def get_bevy_dependencies(codebase: Path, bevy_checkout: BevyCheckout) -> list[DiscoveredDependency]: ...
+def find_bevy_compatible_version(crate_name: str, all_versions: list[str], target_bevy_version: str, bevy_checkout: BevyCheckout) -> CompatibleVersion | NoCompatibleVersion | CompatibilityUnknown: ...
+```
 
-`scripts/bevy_migration_plan/bevy_migration_dependency_check.py` today reads a release's Bevy requirement only from the dependency whose `crate_id` is `bevy` (`get_bevy_dependency_requirement`). A crate that depends only on `bevy_app` or `bevy_ecs` (moonshine-save does) has no such dependency, so `has_bevy_dependency` drops it from the report, and one with `bevy` in its name gets no compatible version and reads as a blocker.
-
-- `get_bevy_dependency_requirement(crate_name, version, bevy_names) -> RequirementLookup` takes the set of Bevy's own crate names. `RequirementLookup` is `BevyRequirement | NoBevyDependency | RequirementLookupFailed`, three frozen dataclasses. `BevyRequirement(requirement: str)` holds the `req` of the dependency named `bevy` when one of kind other than `dev` exists, else the `req` of the first such dependency, by sorted name, whose `crate_id` is in `bevy_names`. `NoBevyDependency()` says the release names none. `RequirementLookupFailed(reason: str)` says crates.io gave no answer, so nothing is known. Today the last two are both `None`, which drops a crate from the report, or calls it a blocker, when a request fails. A name outside the set is never read as Bevy: `bevy_egui` is a third-party crate. `DependencyItem` gains `kind` when it lacks it.
-- A failed lookup reaches the report's existing `CHECK_NEEDED` class. `has_bevy_dependency` goes; `get_bevy_dependencies` matches on the lookup and keeps a crate for `BevyRequirement` and for `RequirementLookupFailed`, leaving it out only for `NoBevyDependency`. `find_bevy_compatible_version(...) -> CompatibleVersion | NoCompatibleVersion | CompatibilityUnknown` returns `CompatibleVersion(version: str)` for the newest of the 20 most recent versions whose requirement fits; `CompatibilityUnknown(reason: str)`, with the first failure's reason, when none fits and at least one lookup failed; else `NoCompatibleVersion()`. In `main`, `CompatibilityUnknown` gives a `CHECK_NEEDED` entry with the reason `Could not read every release's dependencies from crates.io (<reason>) - manual verification needed`; the other two go to `classify_dependency` as a version or `None`, as today. `DependencyInfo` and `classify_dependency` stay as they are.
-- `get_bevy_internal_crates(bevy_version) -> BevyCheckoutRead | BevyCheckoutMissing` is called once, in `main`, and its result is passed down through `get_bevy_dependencies`, `get_all_direct_dependencies` (which calls it itself today) and `find_bevy_compatible_version`. `BevyCheckoutRead(names: frozenset[str])` holds every crate name under `~/rust/bevy-<version>/crates`, plus `bevy` and `bevy_internal`. `BevyCheckoutMissing(path: Path)` says that directory is not there; today that case is an empty set.
-- The two uses read the result differently. The names a requirement may come from are `names` for a read checkout and only `bevy` for a missing one. The names `get_all_direct_dependencies` leaves out of its list are `names` for a read checkout and none for a missing one, which is its present behavior.
-- With a missing checkout a crate that depends only on a sub-crate cannot be seen. The script then prints `Warning: <path> not found; crates that depend only on a Bevy sub-crate are not detected` on stderr once, and the report carries the same sentence under its title, so an incomplete list never reads as a complete one.
-- Nothing else in the report changes: the classifications, their wording and the `--output` file stay as they are.
+- **Bevy's own crate names.** `get_bevy_internal_crates` runs once, in `main`, and its result is passed down. A read checkout holds every crate name under `~/rust/bevy-<version>/crates`, plus `bevy` and `bevy_internal`: a requirement may come from any of them, and `get_all_direct_dependencies` leaves them out of its list. A missing checkout allows only `bevy` and leaves nothing out.
+- **The requirement rule.** Among a release's dependencies whose kind is not `dev`: the `req` of the one named `bevy`, else of the first by sorted name whose `crate_id` is in `bevy_names`. A crates.io request that fails is `RequirementLookupFailed`, never `NoBevyDependency`, and `get_bevy_dependencies` leaves a crate out only for `NoBevyDependency`.
+- **Compatible version.** The newest of the 20 most recent versions whose requirement fits; `CompatibilityUnknown`, with the first failure's reason, when none fits and at least one lookup failed.
+- **Report.** A failed discovery lookup or `CompatibilityUnknown` gives a `CHECK_NEEDED` entry with the reason, under "Verification Needed", unless one of the crate's releases fits the target. Nothing else in the report changed.
+- **Missing checkout.** `Warning: <path> not found; crates that depend only on a Bevy sub-crate are not detected` is printed once on stderr and stands under the report's title, on an empty report too.
 
 **Files:**
-- `scripts/bevy_migration_plan/bevy_migration_dependency_check.py` — the requirement rule and its three outcomes, the crate names read once and passed down, the missing-checkout warning.
-- `scripts/bevy_migration_plan/test_bevy_migration_dependency_check.py` — new: the rule and the warning, with `urlopen` replaced.
+- `scripts/bevy_migration_plan/bevy_migration_dependency_check.py` — the dependency check behind `/bevy_migration_plan` (owned by no unit of this production).
+- `scripts/bevy_migration_plan/test_bevy_migration_dependency_check.py` — its tests, with canned crates.io bodies, a temporary home directory and no cargo.
 
-**Seats:** 1 writer + 1 tester — one script and its first test file.
-- `impl` — `scripts/bevy_migration_plan/bevy_migration_dependency_check.py`.
-- `test` — `scripts/bevy_migration_plan/test_bevy_migration_dependency_check.py`, from the Spec. Each test replaces `urllib.request.urlopen` with canned response bodies and reaches no network; the Bevy checkout is a temporary directory with two `crates/<name>/Cargo.toml` files, found through a patched `Path.home`.
+**Gotchas:** The script runs `cargo tree` on the codebase, so a live run counts as a build on that project. `/bevy_migration_plan` clones `~/rust/bevy-<version>` itself; a machine that has only `~/rust/bevy` reports the missing checkout. A direct dependency that is not on crates.io fails its lookup and is listed under "Verification Needed". The script reads the codebase's direct dependencies only.
 
-**Constraints from prior phases:** the crates.io phase states the same rule for `upstream.release_requirement` in `scripts/bevy_upgrade/`; the two scripts keep separate code, because this one runs alone from `commands/bevy_migration_plan.md` and prints its own warnings. Today `get_bevy_internal_crates` returns an empty set for a missing checkout (line 77), `get_bevy_dependency_requirement` (line 273) returns `None` both for no `bevy` dependency and for a failed request, and `main` (line 472) builds a `CHECK_NEEDED` entry only when `query_crates_io` fails. This script has no test file and no `pyrightconfig.json` entry today; `basedpyright` on it prints `0 errors, 0 warnings, 0 notes` (checked 2026-10-12).
-
-**Acceptance gate:** `python3 -m unittest discover -s scripts/bevy_migration_plan -p 'test_*.py'` passes, and `basedpyright scripts/bevy_migration_plan/bevy_migration_dependency_check.py scripts/bevy_migration_plan/test_bevy_migration_dependency_check.py` prints `0 errors, 0 warnings, 0 notes`. The tests cover: a requirement read from `bevy`; one read from `bevy_app` when `bevy` is absent; a crate with only a `bevy_egui` dependency giving `NoBevyDependency`; a `dev` dependency on `bevy` giving `NoBevyDependency`; a failed request giving `RequirementLookupFailed`; `get_bevy_dependencies` keeping a crate without `bevy` in its name that depends only on `bevy_ecs`, and one whose lookup failed; `find_bevy_compatible_version` finding a version for such a crate, and `CompatibilityUnknown` when no version fits and one lookup failed; `main` writing `CHECK_NEEDED` for that crate; `get_bevy_internal_crates` called once in a run of `main`; a missing checkout leaving a `bevy_*` direct dependency in the list; and the warning on stderr and in the report when the checkout is missing. Run once by hand against the real network with `~/rust/bevy-<version>` in place and paste the dependency list in the handoff: `python3 scripts/bevy_migration_plan/bevy_migration_dependency_check.py --bevy-version <version> --codebase /home/natepiano/rust/hana_catalyst` lists `moonshine-save`.
+**Ruled out:** Sharing the requirement rule's code with `scripts/bevy_upgrade/upstream.release_requirement`: this script runs alone and prints its own warnings.
 
 ### Phase 7 — The check reads a workspace member's Bevy requirement and asks again about a kept open pull request  · status: todo
 
@@ -322,13 +333,18 @@ def manifest_requirement(fetch: Fetch, repository: str, rev: str, crate: str, be
 ```
 
 - `member_manifest_paths` asks `https://api.github.com/repos/<repository>/git/trees/<rev>?recursive=1` once and returns, sorted, every `path` of `type` `blob` that ends with `/Cargo.toml`. A response that is not that object is a `FetchFailure`.
-- `manifest_requirement` reads the root manifest as today. Only when the root names no requirement and has a `[workspace]` table does it call `member_manifest_paths` and read member manifests until one's `[package] name` is `crate`: first the paths whose directory name is the crate's name, with `-` and `_` read as the same character, then the others in sorted order, at most 5 manifests. That member's `[dependencies]` are read by the root's rule, and an entry with `workspace = true` takes its requirement from the root's `[workspace.dependencies]`. No such member within 5 reads gives `""`. A member manifest that is not there is skipped.
+- `manifest_requirement` reads the root manifest as today. Only when the root names no requirement and has a `[workspace]` table does it call `member_manifest_paths` and read member manifests until one's `[package] name` is `crate`: first the paths whose directory name is the crate's name, with `-` and `_` read as the same character, then the others in sorted order, at most 5 manifests. That member's `[dependencies]` are read by the root's rule, with the root's `[workspace.dependencies]` as the table an entry with `workspace = true` inherits from. The root's rule has already read that table, so a member is reached only when it names no Bevy version: an inherited entry then gives `""` for its name, and a version the member names itself is the answer. No such member within 5 reads gives `""`, and so does a tree with no member manifest. A manifest with no `[package]` table is not the crate's and is passed over. A member manifest that is not there (`NotFound`) is skipped and counts as one of the 5 reads. Every other failure is a `FetchFailure`, as it is for the root: a request that fails, text that is not valid TOML, a table of the wrong type. `run_check` then keeps the entry's stored facts and sets its error, so a member that could not be read is never recorded as `""`. `[workspace] members` and `exclude` are not read: the member is found by its `[package] name`, which crates.io keeps unique, so a glob that matches nothing changes nothing.
 
 `upgrade_check.py`:
 
 - `_github_facts(fetch, name, entry, record, bevy_names)` takes the crate's name and passes it on.
 - A stored requirement is reused only when the stored `rev` is the head's and the requirement is not `""`. A stored `""` is read again, so a record written before this phase gets its answer at the next check.
 - Each stored item the issues answer lacks is kept, as today. One that is a pull request with state `open` is asked again with `pull_state`, and its `state` and `head` are replaced; a kept issue and a kept closed or merged pull request cost no request.
+
+`commands/bevy_migration_plan.md` (an add-on the showrunner placed in this phase on 2026-10-12; the file belongs to no unit of this production, so the checkpoint notice names it as `also touches`):
+
+- Under `**The script will:**`, the first bullet says the script discovers Bevy-dependent crates "(direct and indirect)". `scripts/bevy_migration_plan/bevy_migration_dependency_check.py` reads the codebase's direct dependencies only. Rewrite that bullet to say so, and to say that a crate depending only on one of Bevy's own crates, such as `bevy_app` or `bevy_ecs`, is included.
+- Rewrite the `CHECK_NEEDED` bullet to give both reasons a crate lands there: its compatibility is unclear, or crates.io did not answer a lookup. Change nothing else in the file.
 
 Nothing in the record's types or the report changes: `""` still prints `requirement unknown`.
 
@@ -338,14 +354,15 @@ Nothing in the record's types or the report changes: `""` still prints `requirem
 - `scripts/bevy_upgrade/test_upstream.py` — the tree request and the member read.
 - `scripts/bevy_upgrade/test_upgrade_check.py` — the `""` rule and the kept open pull request.
 - `scripts/bevy_upgrade/test_cli.py` — only if a fixture needs an added answer; its root manifest names a requirement, so no tree request is expected.
+- `commands/bevy_migration_plan.md` — the two bullets under `**The script will:**`.
 
 **Seats:** 1 writer + 1 tester — two production modules and their test modules, the split phase 3 ran with.
-- `impl` — `upstream.py`, `upgrade_check.py`.
+- `impl` — `upstream.py`, `upgrade_check.py`, `commands/bevy_migration_plan.md`.
 - `test` — `test_upstream.py`, `test_upgrade_check.py`, `test_cli.py`, from the Spec.
 
 **Constraints from prior phases:** `manifest_requirement(fetch, repository, rev, bevy_names)` reads only the root `Cargo.toml` (its `[workspace.dependencies]` and `[dependencies]`) from `https://raw.githubusercontent.com/<repository>/<rev>/Cargo.toml` and returns `""` when that manifest is not there (`NotFound`). `_github_facts` keeps the stored requirement when the stored `rev` equals the head's, and keeps a stored item whose number the one-page issues answer lacks. `pull_state(fetch, repository, number)` returns `(state, head)`. `fixture_fetch` answers `NotFound` for a `null` body and serves a string body raw. `run_check` stages an entry's facts and discards them all when a request fails or the 180 s budget is spent. GitHub allows 60 requests an hour without a token: a first read of one repository costs 4 requests plus one per pull request, and this phase adds at most 6 for a workspace repository.
 
-**Acceptance gate:** the Delegation Context **Test** and **Lint** commands pass. The tests cover: a workspace root and a member named like the crate giving the member's requirement in three requests (root, tree, member); a member entry with `workspace = true` resolved from the root; a crate name with `-` matched to a directory with `_`; no matching member giving `""` after 5 member reads; a root that names a requirement making no tree request; a stored `""` at an unchanged `rev` read again, and a stored requirement that is not `""` making no manifest request; a kept open pull request that merged reading `merged` after the check; a kept issue and a kept closed pull request making no request.
+**Acceptance gate:** the Delegation Context **Test** and **Lint** commands pass. The tests cover: a workspace root and a member named like the crate giving the member's requirement in three requests (root, tree, member); a member whose Bevy entry is `workspace = true`, under a root whose `[workspace.dependencies]` entry names no version, giving `""`; a member with no Bevy entry giving `""`; a member manifest that is not valid TOML raising `FetchFailure`, and a member request that fails raising it too; a member manifest that is `NotFound` skipped and the next one read; a workspace root whose tree has no member manifest giving `""` in two requests; a crate name with `-` matched to a directory with `_`; no matching member giving `""` after 5 member reads; a root that names a requirement making no tree request; a stored `""` at an unchanged `rev` read again, and a stored requirement that is not `""` making no manifest request; a kept open pull request that merged reading `merged` after the check; a kept issue and a kept closed pull request making no request. `commands/bevy_migration_plan.md` says direct dependencies, names the sub-crate case and gives both `CHECK_NEEDED` reasons.
 
 ## Close-out for the showrunner
 
