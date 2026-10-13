@@ -178,7 +178,7 @@ Showrunner's brief and approval, 2026-10-13 10:3x–10:4x EDT (not the user's wo
 
 **Ruled out:** removing the trust grants automatically; counting any `codex app-server` (rather than `--managed-daemon`) as trial-started; treating unreadable processes of other users as Codex clients.
 
-### Phase 6 — Tear down the trial and close the findings  · status: todo
+### Phase 6 — Tear down the trial and close the findings  · status: done
 
 #### Work Order
 
