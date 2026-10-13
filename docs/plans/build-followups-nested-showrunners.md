@@ -223,7 +223,7 @@ Built as specified; the code-level account is `docs/as-built/showrunner-automati
 
 **Gotchas:** the tmux session's name is the production's slug, so a unit whose session has that same name blocks the start (`a tmux session named <slug> is already live`). The launcher needs the parent's own `CLAUDE_CODE_SESSION_ID` to know which production it runs: run from a plain shell it refuses with "this session runs no production".
 
-### Phase 5 — Promote a unit to a showrunner  · status: todo · live check gated by G2
+### Phase 5 — Promote a unit to a showrunner  · status: done · live check is the showrunner's under G2, on a unit whose run is done
 
 #### Work Order
 
