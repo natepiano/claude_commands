@@ -9,7 +9,8 @@ checkout with `/showrunner:produce <doc>`, or `/showrunner:produce <doc> resume`
 carries no unit mark and no account prefix, and its environment holds no CLAUDE_* variable, so at
 any depth it takes the showrunner account's login. Once the child's showrunner runs, with an update
 timer addressed to a live session, the child is attached to the caller's production. --check runs
-every refusal and starts nothing.
+every refusal and starts nothing. The session must start in a folder the showrunner account's login
+already trusts, since a showrunner never answers Claude's folder-trust prompt.
 
 Exit 0 when the child is attached, or --check found nothing in the way; 1 when the session started
 and no showrunner appeared in WAIT_S seconds (the session is left running); 2 on a refusal.
@@ -17,6 +18,7 @@ and no showrunner appeared in WAIT_S seconds (the session is left running); 2 on
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import re
 import shlex
@@ -43,10 +45,52 @@ def running(slug: str) -> bool:
     return bool(showrunners.current_address(slug))
 
 
-def checked(child: Production, caller: str, ending: str = "") -> str:
+def claude_json() -> Path:
+    """The showrunner account's global config: no CLAUDE_CONFIG_DIR, so the login's `~/.claude.json`."""
+    return Path(os.environ.get("ADD_SHOWRUNNER_CLAUDE_JSON") or Path.home() / ".claude.json")
+
+
+def _project_keys(folder: Path) -> set[str]:
+    """The paths Claude may keep the folder's trust under: the folder, its repository root, and for a
+    worktree its main checkout, whose trust it shares."""
+    keys = {str(folder)}
+    for flag in ("--show-toplevel", "--git-common-dir"):
+        found = subprocess.run(["git", "-C", str(folder), "rev-parse", "--path-format=absolute", flag],
+                               capture_output=True, text=True, check=False)
+        if found.returncode == 0 and found.stdout.strip():
+            path = Path(found.stdout.strip())
+            keys.add(str(path.parent if flag == "--git-common-dir" and path.name == ".git" else path))
+    return keys
+
+
+def trusted(folder: Path) -> bool:
+    """Whether Claude's folder-trust prompt was accepted for `folder` on the showrunner account.
+
+    Only `projects[<path>].hasTrustDialogAccepted` is read: the file also holds account details, and
+    no message ever carries any of it. A trusted parent folder does not cover a repository below it
+    (G1 live check, 2026-10-13: the child sat on the prompt). Raises Refusal when the file cannot be read.
+    """
+    path = claude_json()
+    try:
+        config = cast(object, json.loads(path.read_text(encoding="utf-8")))
+    except (OSError, UnicodeError, ValueError) as error:
+        raise Refusal(f"cannot read {path} to see whether {folder} is trusted ({type(error).__name__})") from error
+    projects = cast(dict[str, object], config).get("projects") if isinstance(config, dict) else None
+    if not isinstance(projects, dict):
+        return False
+    entries = cast(dict[str, object], projects)
+    for key in _project_keys(folder.resolve()):
+        entry = entries.get(key)
+        if isinstance(entry, dict) and cast(dict[str, object], entry).get("hasTrustDialogAccepted") is True:
+            return True
+    return False
+
+
+def checked(child: Production, caller: str, ending: str = "", start_in: Path | None = None) -> str:
     """The tmux to start `child`'s showrunner with. Raises Refusal naming what is in the way.
 
     `ending` names a tmux session the caller ends before the start, so it is not in the way.
+    `start_in` is the folder the session starts in, the child's checkout unless given.
     """
     if not caller:
         raise Refusal(f"this session runs no production, so it has nothing to attach {child.slug} to")
@@ -66,6 +110,10 @@ def checked(child: Production, caller: str, ending: str = "") -> str:
         raise Refusal(f"no tmux to start the session in: {error}") from error
     if child.slug != ending and tmux_live(tmux, child.slug):
         raise Refusal(f"a tmux session named {child.slug} is already live")
+    folder = start_in or child.checkout
+    if not trusted(folder):
+        raise Refusal(f"Claude is not trusted in {folder} on the showrunner account. The user trusts it first, "
+                      + "by running `claude` there once and accepting: a showrunner never answers a trust prompt")
     return tmux
 
 
@@ -84,12 +132,23 @@ def launch(child: Production, tmux: str, model: str, effort: str, resume: str | 
 
 
 def showrunner_appeared(slug: str) -> bool:
-    """Wait for the started session to run the production. Raises OSError when the session records cannot say."""
+    """Wait for the started session to run the production.
+
+    A session record being written as it is read makes one look unreadable, so an unreadable registry is
+    tried again until the deadline (G1 live check, 2026-10-13: the wait gave up while the child opened).
+    Raises OSError when the last look, at the deadline, still cannot say.
+    """
     deadline = time.monotonic() + WAIT_S
     while True:
-        if running(slug):
-            return True
+        unreadable: OSError | None = None
+        try:
+            if running(slug):
+                return True
+        except OSError as error:
+            unreadable = error
         if time.monotonic() >= deadline:
+            if unreadable is not None:
+                raise unreadable
             return False
         time.sleep(POLL_S)
 
@@ -110,7 +169,7 @@ def main(argv: list[str]) -> int:
     caller = showrunners.own_slug()
     try:
         child = read_production(cast(Path, args.production))
-        tmux = checked(child, caller)
+        tmux = checked(child, caller, start_in=cwd)
     except Refusal as refusal:
         print(f"add_showrunner: {refusal}", file=sys.stderr)
         return 2

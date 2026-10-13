@@ -3,7 +3,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from datetime import datetime, timedelta, timezone
 import json
 import os
@@ -25,6 +25,7 @@ from unittest import mock
 
 import offload
 import mac_test
+import treekey
 
 
 SCRIPT = Path(__file__).with_name("offload.py")
@@ -75,6 +76,7 @@ class WireResult(TypedDict):
     mac: str
     reason: str
     seconds: str
+    holder: NotRequired[str]
 
 
 class RemoteClaimRecord(TypedDict):
@@ -436,6 +438,32 @@ class OffloadSettingsTests(unittest.TestCase):
 
 
 @final
+class BusyHolderTests(unittest.TestCase):
+    def test_busy_claim_line_keeps_the_job_and_kept_claim_description(self) -> None:
+        for what in ("cargo nextest -p hana", "leftovers of cargo test on prior-mac", "job since last week"):
+            with self.subTest(what=what):
+                self.assertEqual(offload.claim_holder(f"busy: {what} since 13:05\n"), offload.KnownMacJob(what))
+
+    def test_busy_claim_without_the_expected_line_has_unreadable_holder(self) -> None:
+        for line in ("", "busy", "busy: task", "busy: task since yesterday", "busy: task since 13:05\nextra"):
+            with self.subTest(line=line):
+                self.assertIsInstance(offload.claim_holder(line), offload.UnreadableMacHolder)
+
+    def test_only_busy_results_write_the_holder_line(self) -> None:
+        with tempfile.TemporaryDirectory() as scratch:
+            path = Path(scratch) / "result"
+            for holder, expected in ((offload.KnownMacJob("render checks"), "render checks"),
+                                     (offload.LostRunLeftovers(), "leftovers"),
+                                     (offload.UnreadableMacHolder(), "unreadable")):
+                with self.subTest(holder=expected), redirect_stdout(io.StringIO()):
+                    self.assertEqual(offload.write_result(offload.BusyMacDecline(holder, 0.25), offload.ResultFile(path)), 75)
+                    self.assertIn(f"holder={expected}\n", path.read_text())
+            with redirect_stdout(io.StringIO()):
+                _ = offload.write_result(offload.PassedOnMac(0.5), offload.ResultFile(path))
+            self.assertNotIn("holder=", path.read_text())
+
+
+@final
 class OffloadCommandTests(unittest.TestCase):
     def __init__(self, methodName: str = "runTest") -> None:
         super().__init__(methodName)
@@ -547,6 +575,8 @@ class OffloadCommandTests(unittest.TestCase):
             "MAC_TEST_STUB_DIR": str(self.stub_directory),
             "MAC_TEST_REAL_STATE": str(STATE_SCRIPT),
             "BUILD_HOLD_DIR": str(self.root / "holders"),
+            "BUILDLOG_DIR": str(self.root / "buildlog"),
+            "NOTIFIER_SESSIONS_DIR": str(self.root / "sessions"),
             "BUILD_HOLD_RELEASE_DIR": str(self.root / "release"),
             "PLAN_DELEGATE_ACTIVE_DIR": str(self.root / "active"),
             "BUILDLOG_CALL_ID": "", "BUILDLOG_CALLER": "",
@@ -663,6 +693,9 @@ class OffloadCommandTests(unittest.TestCase):
             SCRIPT.parent.parent / "lint", target_is_directory=True
         )
         (scripts_directory / "build_hold").symlink_to(SCRIPT.parent.parent / "build_hold", target_is_directory=True)
+        (scripts_directory / "buildlog").symlink_to(
+            SCRIPT.parent.parent / "buildlog", target_is_directory=True
+        )
         return runner
 
     def state_command(self, *arguments: str) -> subprocess.CompletedProcess[str]:
@@ -693,15 +726,14 @@ class OffloadCommandTests(unittest.TestCase):
 
     def wire_result(self) -> WireResult:
         lines = self.result_path.read_text(encoding="utf-8").splitlines()
-        self.assertEqual(len(lines), 3)
         values = dict(line.split("=", 1) for line in lines)
-        self.assertEqual(set(values), {"mac", "reason", "seconds"})
+        expected = {"mac", "reason", "seconds"}
+        if values["mac"] == "declined" and values["reason"] == "busy":
+            expected.add("holder")
+        self.assertEqual(set(values), expected)
+        self.assertEqual(len(lines), len(expected))
         _ = float(values["seconds"])
-        return {
-            "mac": values["mac"],
-            "reason": values["reason"],
-            "seconds": values["seconds"],
-        }
+        return cast(WireResult, cast(object, values))
 
     def assert_wire(self, mac: str, reason: str) -> None:
         values = self.wire_result()
@@ -984,6 +1016,7 @@ class OffloadCommandTests(unittest.TestCase):
         self.assertTrue(busy.stdout.endswith("mac_test: not running on the Mac (busy)\n"), busy.stdout)
         self.assertIn("busy", busy.stdout)
         self.assert_wire("declined", "busy")
+        self.assertEqual(self.wire_result().get("holder"), "other tests")
         self.assertTrue((self.state_directory / "run.json").exists())
         self.assertEqual(self.events(), [])
         released = self.state_command("release", "--pid", str(os.getpid()))
@@ -1028,6 +1061,7 @@ class OffloadCommandTests(unittest.TestCase):
         self.assertEqual(repeated.returncode, first.returncode)
         self.assertEqual(self.wire_result()["mac"], first_wire["mac"])
         self.assertEqual(self.wire_result()["reason"], first_wire["reason"])
+        self.assertEqual(self.wire_result().get("holder"), "other tests")
         self.assertEqual(self.events(), [])
         self.assertTrue((self.state_directory / "run.json").exists())
 
@@ -1203,6 +1237,111 @@ class OffloadCommandTests(unittest.TestCase):
         self.assertEqual(len(self.events_for("ssh")), 1)
         self.assertEqual(len(self.events_for("rsync")), 1)
         self.assert_claimed_commands()
+
+    def commit_sent_tree(self) -> str:
+        environment = {
+            **self.environment,
+            "GIT_CONFIG_GLOBAL": os.devnull,
+            "GIT_CONFIG_NOSYSTEM": "1",
+            "GIT_AUTHOR_NAME": "test", "GIT_COMMITTER_NAME": "test",
+            "GIT_AUTHOR_EMAIL": "test@example.com", "GIT_COMMITTER_EMAIL": "test@example.com",
+        }
+        result = subprocess.run(
+            ["git", "commit", "-q", "--allow-empty", "-m", "sent tree"],
+            cwd=self.repository, env=environment, capture_output=True, text=True, check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        key = treekey.tree_key(str(self.repository))
+        self.assertIsInstance(key, str)
+        assert isinstance(key, str)
+        return key
+
+    def run_with_copy_change(self, change: Callable[[], None]) -> None:
+        self.fixture["hold_copy"] = True
+        self.sync_fixture()
+        process = self.start_command()
+        try:
+            self.wait_for_path(self.stub_directory / "copy-started")
+            change()
+            _ = (self.stub_directory / "continue-copy").write_text("continue\n")
+            output, _ = process.communicate(timeout=10)
+            self.assertEqual(process.returncode, 0, output)
+            self.assert_wire("passed", "")
+        finally:
+            if process.poll() is None:
+                process.kill()
+                _ = process.communicate(timeout=5)
+
+    def sent_command_words(self) -> list[str]:
+        self.assertEqual(len(self.events_for("rsync")), 1)
+        remote = self.events_for("ssh")[-1]["args"][-1]
+        self.assertIn("lint nextest", remote)
+        return shlex.split(remote.rpartition("; echo mac_exit=$?")[0])
+
+    def assert_stable_copy_sends_key(self) -> None:
+        # A later stable copy must send its key after the earlier copy omitted it.
+        self.clear_events()
+        self.fixture["hold_copy"] = False
+        self.sync_fixture()
+        key = self.commit_sent_tree()
+        result = self.command()
+        self.assertEqual(result.returncode, 0, result.stdout)
+        self.assertIn(f"BUILDLOG_SENT_TREE_KEY={key}", self.sent_command_words())
+
+    def test_unchanged_copy_sends_its_known_tree_key_beside_the_call_id(self) -> None:
+        key = self.commit_sent_tree()
+        result = self.command()
+        self.assertEqual(result.returncode, 0, result.stdout)
+        self.assertEqual(treekey.tree_key(str(self.repository)), key)
+        words = self.sent_command_words()
+        call_index = words.index("BUILDLOG_CALL_ID=call-17")
+        self.assertEqual(words[call_index + 1], f"BUILDLOG_SENT_TREE_KEY={key}")
+
+    def test_copy_with_different_before_and_after_tree_keys_sends_no_key(self) -> None:
+        before = self.commit_sent_tree()
+
+        def change() -> None:
+            _ = (self.repository / "during-copy.rs").write_text("changed during copy\n")
+
+        self.run_with_copy_change(change)
+        after = treekey.tree_key(str(self.repository))
+        self.assertIsInstance(after, str)
+        self.assertNotEqual(before, after)
+        self.assertFalse(any(word.startswith("BUILDLOG_SENT_TREE_KEY=") for word in self.sent_command_words()))
+        self.assert_stable_copy_sends_key()
+
+    def test_copy_with_unavailable_before_key_and_known_after_key_sends_no_key(self) -> None:
+        self.assertIsNone(treekey.tree_key(str(self.repository)))
+
+        def change() -> None:
+            _ = self.commit_sent_tree()
+
+        self.run_with_copy_change(change)
+        self.assertIsInstance(treekey.tree_key(str(self.repository)), str)
+        self.assertFalse(any(word.startswith("BUILDLOG_SENT_TREE_KEY=") for word in self.sent_command_words()))
+        self.assert_stable_copy_sends_key()
+
+    def test_copy_with_known_before_key_and_unavailable_after_key_sends_no_key(self) -> None:
+        _ = self.commit_sent_tree()
+        head_path = self.repository / ".git" / "HEAD"
+        head = head_path.read_text()
+
+        def change() -> None:
+            (self.repository / ".git" / "HEAD").unlink()
+
+        self.run_with_copy_change(change)
+        self.assertIsNone(treekey.tree_key(str(self.repository)))
+        self.assertFalse(any(word.startswith("BUILDLOG_SENT_TREE_KEY=") for word in self.sent_command_words()))
+        _ = head_path.write_text(head)
+        self.assert_stable_copy_sends_key()
+
+    def test_copy_with_both_tree_keys_unavailable_sends_no_key(self) -> None:
+        self.assertIsNone(treekey.tree_key(str(self.repository)))
+        result = self.command()
+        self.assertEqual(result.returncode, 0, result.stdout)
+        self.assertIsNone(treekey.tree_key(str(self.repository)))
+        self.assertFalse(any(word.startswith("BUILDLOG_SENT_TREE_KEY=") for word in self.sent_command_words()))
+        self.assert_stable_copy_sends_key()
 
     def test_remote_test_command_sets_development_deployment_target_before_nextest(self) -> None:
         words = ("--no-fail-fast", "unit_case")
@@ -1536,6 +1675,7 @@ class OffloadCommandTests(unittest.TestCase):
         self.assertEqual(result.returncode, 75, result.stdout + result.stderr)
         self.assertEqual(result.stdout, "mac_test: not running on the Mac (busy)\n")
         self.assert_wire("declined", "busy")
+        self.assertEqual(self.wire_result().get("holder"), "leftovers")
         self.assert_leftover_diagnostic(result.stderr, "remaining")
         self.assert_claim_is_kept("previous-mac")
         self.assertEqual(self.remote_claim()["what"], old["what"])
@@ -1554,6 +1694,7 @@ class OffloadCommandTests(unittest.TestCase):
                 _ = process.communicate(timeout=5)
         self.assertEqual(process.returncode, 75, output)
         self.assert_wire("declined", "busy")
+        self.assertEqual(self.wire_result().get("holder"), "leftovers")
         self.assertTrue((self.state_directory / "run.json").exists())
         self.assertEqual((self.stub_directory / "state-events").read_text().splitlines(), ["claim", "release", "claim"])
         self.assertEqual(len(self.events()), 1)

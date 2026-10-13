@@ -13,7 +13,9 @@ from enum import Enum, auto
 from typing import Literal, TypeVar, cast
 
 import index
+import holds
 import store
+from offload import KnownMacJob, LostRunLeftovers, MacHolder, UnreadableMacHolder
 from mac_outcome import (
     COUNTED_AGAINST_SHARE, NOT_USABLE_REASONS, CacheReuse, LocalReasonNotRecorded,
     LocalRunRequested, MacRunCompleted, MacRunLost, MacRunMatchedNoTest,
@@ -34,7 +36,6 @@ LOCAL_MAC_UNAVAILABLE_PATTERNS = (
     r"\b(?:ssh|connection)\b.*\b(?:failed|refused|timed out)\b",
     r"\b(?:cannot|could not)\s+(?:reach|connect to)\s+(?:the\s+)?mac\b",
 )
-NOT_RECORDED_YET = "Not recorded yet: who held the Mac on a busy decline, and when a block or a hold began and ended."
 TEST_TREE_LOOKBACK = timedelta(hours=24)
 
 
@@ -47,6 +48,33 @@ class RecordedTarget:
     name: str
 
 
+class MacHolderNotRecorded(Enum):
+    VALUE = "holder not recorded"
+
+
+RecordedBusyHolder = MacHolder | MacHolderNotRecorded
+
+
+def recorded_busy_holder(value: object) -> RecordedBusyHolder:
+    if not isinstance(value, str) or not value:
+        return MacHolderNotRecorded.VALUE
+    if value == "leftovers":
+        return LostRunLeftovers()
+    if value == "unreadable":
+        return UnreadableMacHolder()
+    return KnownMacJob(value)
+
+
+def holder_text(holder: RecordedBusyHolder) -> str:
+    if isinstance(holder, KnownMacJob):
+        return holder.what
+    if isinstance(holder, LostRunLeftovers):
+        return "lost-run leftovers"
+    if isinstance(holder, UnreadableMacHolder):
+        return "holder unreadable"
+    return holder.value
+
+
 @dataclass(frozen=True)
 class MacTestCall:
     call_id: str
@@ -54,6 +82,7 @@ class MacTestCall:
     decision: OffloadRecord
     target: RecordedTarget | NotRecorded
     hold_wait_s: float | NotRecorded
+    holder: RecordedBusyHolder
 
 
 def nonnegative_seconds(value: object) -> float | NotRecorded:
@@ -66,7 +95,7 @@ def nonnegative_seconds(value: object) -> float | NotRecorded:
 
 def read_test_calls(connection: sqlite3.Connection, start: str, end: str) -> list[MacTestCall]:
     rows = cast(list[tuple[object, ...]], connection.execute(
-        "SELECT id, started_at, outcome, mac, mac_reason, local_reason, mac_s, target, hold_wait_s"
+        "SELECT id, started_at, outcome, mac, mac_reason, local_reason, mac_s, target, hold_wait_s, mac_holder"
         + " FROM calls WHERE started_at >= ? AND started_at < ?"
         + " AND tool = 'verify.sh' AND verb = 'test' ORDER BY started_at, id",
         (start, end),
@@ -77,8 +106,9 @@ def read_test_calls(connection: sqlite3.Connection, start: str, end: str) -> lis
             offload_record(mac, reason, local_reason, mac_s, outcome),
             RecordedTarget(target) if isinstance(target, str) else NotRecorded.VALUE,
             nonnegative_seconds(hold_wait_s),
+            recorded_busy_holder(holder),
         )
-        for call_id, started_at, outcome, mac, reason, local_reason, mac_s, target, hold_wait_s in rows
+        for call_id, started_at, outcome, mac, reason, local_reason, mac_s, target, hold_wait_s, holder in rows
     ]
 
 
@@ -168,6 +198,7 @@ class WindowSummary:
     local_mac_unavailable: int
     share: UsableShare
     causes: Counter[ShareMissReason]
+    busy_holders: Counter[RecordedBusyHolder]
     target_not_recorded: int
     hold_wait_not_recorded: int
 
@@ -210,6 +241,10 @@ def summarize_window(calls: list[MacTestCall]) -> WindowSummary:
             linux_only += 1
         else:
             declined[result.reason] += 1
+    busy_holders: Counter[RecordedBusyHolder] = Counter()
+    for call in calls:
+        if isinstance(call.decision, OffloadDeclined) and call.decision.reason == "busy":
+            busy_holders[call.holder] += 1
     causes: Counter[ShareMissReason] = Counter()
     for reason in COUNTED_AGAINST_SHARE:
         if reason in NOT_USABLE_REASONS:
@@ -220,7 +255,7 @@ def summarize_window(calls: list[MacTestCall]) -> WindowSummary:
     return WindowSummary(
         candidates, passed, failed, lost, no_tests, declined,
         ExcludedCalls(cache_reuses, local_flag, repo, linux_only, no_mac_entry, unreadable),
-        local_reasons, unavailable, share_of_records(call.decision for call in calls), causes,
+        local_reasons, unavailable, share_of_records(call.decision for call in calls), causes, busy_holders,
         sum(isinstance(call.target, NotRecorded) for call in calls),
         sum(isinstance(call.hold_wait_s, NotRecorded) for call in calls),
     )
@@ -344,6 +379,10 @@ def window_lines(window: ReportWindow, calls: list[MacTestCall], evidence: TestT
         f"Local-flag runs: {excluded.local_flag}; text says the Mac was unavailable: {summary.local_mac_unavailable}.",
         "Most repeated local reasons:",
     ]
+    if summary.busy_holders:
+        position = lines.index(f"Largest causes of a usable Mac going unused: {count_text(summary.causes)}.") + 1
+        holders = sorted(summary.busy_holders.items(), key=lambda item: (-item[1], holder_text(item[0])))
+        lines[position:position] = ["busy:", *(f"- {holder_text(holder)}: {count}" for holder, count in holders)]
     reasons = sorted(summary.local_reasons.items(), key=lambda item: (-item[1], item[0] if isinstance(item[0], str) else "(not recorded)"))
     for reason, count in reasons[:10]:
         text = " ".join(reason.split()) if isinstance(reason, str) else "(not recorded)"
@@ -376,27 +415,36 @@ def mac_report(connection: sqlite3.Connection, now: datetime, hours: float = 24)
     steps_start = store.utc_iso((datetime.fromisoformat(earliest_start) - TEST_TREE_LOOKBACK).timestamp())
     evidence = read_test_tree_evidence(connection, steps_start, end)
     clusters = decline_clusters(calls)
+    current = holds.read_current_holds()
+    history = holds.read_hold_history(connection, current, now)
     lines = ["# Mac test report", "", f"Times in the user's zone; through {now.astimezone(user_zone()):%Y-%m-%d %H:%M %Z}.", ""]
+    lines += holds.now_lines(current)
+    lines.append("")
     lines.extend(window_lines(windows[0], calls_in_window(calls, windows[0]), evidence))
     lines += [
         "## Last three local days", "",
-        "| Day | Candidates | Finished (passed, failed, matched no tests) | Lost | Declined by reason | Usable share | Cache reuses | Local flag | Ineligible (repo, linux_only) | Blocked | Unreachable and backoff |",
-        "|---|---:|---:|---:|---|---:|---:|---:|---:|---|---|",
+        "| Day | Candidates | Finished (passed, failed, matched no tests) | Lost | Declined by reason | Usable share | Cache reuses | Local flag | Ineligible (repo, linux_only) | Blocked | natedev held | Unreachable and backoff |",
+        "|---|---:|---:|---:|---|---:|---:|---:|---:|---|---|---|",
     ]
     for window in windows[1:]:
         daily_calls = calls_in_window(calls, window)
         summary = summarize_window(daily_calls)
         stretches = decline_stretches(clusters, window.start, window.end)
         excluded = summary.excluded
+        mac_since = history.recorded_since["mac"]
+        blocked = lower_bound(stretches.blocked_s) if isinstance(mac_since, holds.NoHoldEventRecorded) or datetime.fromisoformat(window.end) <= mac_since.at else holds.duration_text(holds.hold_duration(history, "mac", window.start, window.end))
+        natedev_since = history.recorded_since["natedev"]
+        held = "not recorded" if isinstance(natedev_since, holds.NoHoldEventRecorded) or datetime.fromisoformat(window.end) <= natedev_since.at else holds.duration_text(holds.hold_duration(history, "natedev", window.start, window.end))
         cells = [
             window.label, str(summary.candidates), f"{summary.passed}, {summary.failed}, {summary.matched_no_tests}", str(summary.lost),
             count_text(summary.declined), f"{summary.share.finished} of {summary.share.candidates}",
             str(excluded.cache_reuses), str(excluded.local_flag),
             f"{excluded.repo}, {excluded.linux_only}",
-            lower_bound(stretches.blocked_s), lower_bound(stretches.unreachable_s),
+            blocked, held, lower_bound(stretches.unreachable_s),
         ]
         lines.append("| " + " | ".join(cells) + " |")
-    lines += ["", NOT_RECORDED_YET]
+    intervals = holds.interval_lines(history, earliest_start, end)
+    lines += ["", "## Hold intervals", "", *(intervals or ["none"]), "", *holds.coverage_lines(history)]
     return "\n".join(lines)
 
 

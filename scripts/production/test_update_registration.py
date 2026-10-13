@@ -133,7 +133,7 @@ class RegistrationTests(unittest.TestCase):
     def copied_command(self) -> Path:
         tree = Path(tempfile.mkdtemp(prefix="command-copy-", dir=self.root))
         _ = shutil.copytree(SCRIPT.parent, tree / "scripts/production")
-        for name in ("build_hold", "lib", "lint", "mac_test", "message", "usage", "whoami"):
+        for name in ("build_hold", "build_targets", "lib", "lint", "mac_test", "message", "usage", "whoami"):
             _ = shutil.copytree(SCRIPT.parent.parent / name, tree / "scripts" / name)
         hooks = tree / "scripts/hooks"
         hooks.mkdir(parents=True)
@@ -236,8 +236,56 @@ with patch.object(agents_log, 'append', side_effect=RuntimeError('recording fail
         self.assertEqual(again.returncode, 0, again.stdout + again.stderr)
         # A re-register retargets the timer and stops it again, so it stays stopped.
         self.assertEqual([call[0] for call in self.notifier_calls()[before + len(calls):]],
-                         ["new", "stop", "status", "status"])
+                         ["status", "new", "stop", "status", "status"])
         self.assertEqual((self.state / "instance-showrunner-example").read_text(encoding="utf-8"), "stopped")
+
+    def without_updates_line(self) -> None:
+        doc = self.doc.read_text(encoding="utf-8")
+        _ = self.doc.write_text(doc.replace("- **Updates:** every 15 minutes\n", ""), encoding="utf-8")
+        _ = self.git("commit", "-qam", "no Updates line")
+
+    def test_a_new_production_with_no_updates_line_starts_quiet(self) -> None:
+        self.without_updates_line()
+        switch = self.state / "showrunner/footers-off/example"
+
+        first = self.run_command("register")
+
+        self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
+        self.assertIn("register: ok — showrunner-example on demand: no scheduled dailies", first.stdout)
+        self.assertIn("footer: ok — off — new production; /showrunner:footer on turns it on", first.stdout)
+        self.assertEqual((self.state / "instance-showrunner-example").read_text(encoding="utf-8"), "stopped")
+        # Off on purpose: an empty switch, which a conversation pause's resume leaves off.
+        self.assertEqual(switch.read_text(encoding="utf-8"), "")
+
+    def test_a_restart_keeps_the_footer_it_has_on_or_off(self) -> None:
+        switch = self.state / "showrunner/footers-off/example"
+        first = self.run_command("register")
+        self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
+        self.assertTrue(switch.exists())
+        switch.unlink()
+
+        turned_on = self.run_command("register")
+
+        self.assertEqual(turned_on.returncode, 0, turned_on.stdout + turned_on.stderr)
+        self.assertNotIn("footer:", turned_on.stdout)
+        self.assertFalse(switch.exists())
+        _ = switch.write_text("", encoding="utf-8")
+        kept_off = self.run_command("register")
+        self.assertEqual(kept_off.returncode, 0, kept_off.stdout + kept_off.stderr)
+        self.assertEqual(switch.read_text(encoding="utf-8"), "")
+
+    def test_a_line_asking_for_a_schedule_still_schedules(self) -> None:
+        doc = self.doc.read_text(encoding="utf-8")
+        _ = self.doc.write_text(doc.replace("every 15 minutes", "every 20 minutes"), encoding="utf-8")
+        _ = self.git("commit", "-qam", "every 20 minutes")
+
+        result = self.run_command("register")
+
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        updates = next(call for call in self.notifier_calls() if call[:2] == ["new", "showrunner-example"])
+        self.assertEqual(updates[updates.index("--every") + 1], "20")
+        self.assertNotIn(["stop", "showrunner-example"], self.notifier_calls())
+        self.assertIn("next_due", result.stdout)
 
     def test_register_requires_the_environment_session_id(self) -> None:
         without_id = {key: value for key, value in self.env.items() if key != "CLAUDE_CODE_SESSION_ID"}

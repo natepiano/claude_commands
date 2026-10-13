@@ -22,6 +22,7 @@ from typing import cast, override
 
 import record as recorder
 import sample
+import store
 from test_index import point_root_at
 
 SCRIPT = Path(__file__).with_name("record.py")
@@ -36,6 +37,7 @@ AMBIENT = (
     "BUILDLOG_CALLER",
     "BUILDLOG_CALL_ID",
     "BUILDLOG_LOCAL_REASON",
+    "BUILDLOG_MAC_HOLDER",
     "BUILDLOG_TARGET",
     "BUILDLOG_HOLD_WAIT_S",
     "LINT_OUTPUT_DIR",
@@ -45,6 +47,7 @@ AMBIENT = (
     "CLAUDE_CODE_SESSION_ID",
     "MANIFEST_PATH",
     "BUILDLOG_TREE_START",
+    "BUILDLOG_SENT_TREE_KEY",
     "BUILDLOG_MEM_WAIT_S",
 )
 Record = dict[str, object]
@@ -72,7 +75,9 @@ def ledger_line(**fields: object) -> str:
 
 def setUpModule() -> None:
     """The times these tests expect are Pacific; the user's zone setting must not change them."""
-    unittest.enterModuleContext(mock.patch.dict(os.environ, {"USER_ZONE": "America/Los_Angeles"}))
+    unittest.addModuleCleanup(time.tzset)
+    unittest.enterModuleContext(mock.patch.dict(os.environ, {"TZ": "America/Los_Angeles", "USER_ZONE": "America/Los_Angeles"}))
+    time.tzset()
 
 
 class RecordTests(unittest.TestCase):
@@ -105,6 +110,7 @@ class RecordTests(unittest.TestCase):
         environment["BUILDLOG_HOLD_STARTED_FILE"] = environment["BUILDLOG_HOLD_WAITER_FILE"] = ""
         environment["BUILDLOG_HOLD_REGISTRATION_FILE"] = str(self.base / "registration")
         environment["MAC_TEST_STATE_DIR"] = str(self.base / "mac-state")
+        environment["NOTIFIER_SESSIONS_DIR"] = str(self.base / "sessions")
         # No signing, hooks or identity from the user's own git config.
         environment["GIT_CONFIG_GLOBAL"] = os.devnull
         environment["GIT_CONFIG_NOSYSTEM"] = "1"
@@ -528,6 +534,79 @@ class RecordTests(unittest.TestCase):
         _ = (self.repo / "new.rs").write_text("\n")
         self.assertNotEqual(self.key(*NEXTEST), key)
 
+    def test_verify_mac_step_without_git_records_the_sent_tree_key_and_call_id(self) -> None:
+        mirror = self.base / "mirror"
+        mirror.mkdir()
+        sent_key = "a" * 64
+        result = self.record(
+            "step", "1", str(START), str(START + 1), "0", "", "", *NEXTEST,
+            cwd=mirror,
+            extra={"BUILDLOG_CALLER": "verify-mac", "BUILDLOG_CALL_ID": CALL_ID,
+                   "BUILDLOG_SENT_TREE_KEY": sent_key},
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        row = self.records()[-1]
+        self.assertEqual((row["caller"], row["call_id"], row["step"]), ("verify-mac", CALL_ID, "nextest"))
+        self.assertEqual((row["tree_key"], row["tree_changed"]), (sent_key, None))
+
+    def assert_unverified_mac_step_uses_sent_key(self) -> None:
+        # The fallback must work where the preceding step's guard does not apply.
+        mirror = self.base / "mirror-control"
+        mirror.mkdir()
+        sent_key = "a" * 64
+        result = self.record(
+            "step", "1", str(START + 20), str(START + 21), "0", "", "", *NEXTEST,
+            cwd=mirror, extra={"BUILDLOG_CALLER": "verify-mac", "BUILDLOG_SENT_TREE_KEY": sent_key},
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        row = self.records()[-1]
+        self.assertEqual((row["tree_key"], row["tree_changed"]), (sent_key, None))
+
+    def test_local_step_with_changed_tree_does_not_use_the_sent_tree_key(self) -> None:
+        end_key = self.key(*NEXTEST)
+        start_key = "0" * 64
+        self.assertNotEqual(start_key, end_key)
+        row = self.step(0, "0", "", "", NEXTEST, {
+            "BUILDLOG_CALLER": "verify", "BUILDLOG_TREE_START": start_key,
+            "BUILDLOG_SENT_TREE_KEY": "a" * 64,
+        })
+        self.assertEqual((row["tree_key"], row["tree_changed"]), (None, True))
+        self.assert_unverified_mac_step_uses_sent_key()
+
+    def test_verify_mac_step_with_changed_tree_does_not_use_the_sent_tree_key(self) -> None:
+        end_key = self.key(*NEXTEST)
+        start_key = "0" * 64
+        self.assertNotEqual(start_key, end_key)
+        row = self.step(1, "0", "", "", NEXTEST, {
+            "BUILDLOG_CALLER": "verify-mac", "BUILDLOG_TREE_START": start_key,
+            "BUILDLOG_SENT_TREE_KEY": "a" * 64,
+        })
+        self.assertEqual((row["tree_key"], row["tree_changed"]), (None, True))
+        self.assert_unverified_mac_step_uses_sent_key()
+
+    def test_verify_mac_step_keeps_its_own_verified_key_over_a_different_sent_key(self) -> None:
+        own_key = self.key(*NEXTEST)
+        sent_key = "a" * 64
+        self.assertNotEqual(own_key, sent_key)
+        row = self.step(1, "0", "", "", NEXTEST, {
+            "BUILDLOG_CALLER": "verify-mac", "BUILDLOG_TREE_START": own_key,
+            "BUILDLOG_SENT_TREE_KEY": sent_key,
+        })
+        self.assertEqual((row["tree_key"], row["tree_changed"]), (own_key, False))
+        self.assert_unverified_mac_step_uses_sent_key()
+
+    def test_local_step_without_git_does_not_use_the_sent_tree_key(self) -> None:
+        mirror = self.base / "local-without-git"
+        mirror.mkdir()
+        result = self.record(
+            "step", "0", str(START), str(START + 1), "0", "", "", *NEXTEST,
+            cwd=mirror, extra={"BUILDLOG_CALLER": "verify", "BUILDLOG_SENT_TREE_KEY": "a" * 64},
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        row = self.records()[-1]
+        self.assertEqual((row["tree_key"], row["tree_changed"]), (None, None))
+        self.assert_unverified_mac_step_uses_sent_key()
+
     def test_key_follows_the_manifest_and_is_empty_outside_git(self) -> None:
         elsewhere = self.base / "elsewhere"
         elsewhere.mkdir()
@@ -614,6 +693,52 @@ class RecordTests(unittest.TestCase):
                 records = self.records()
                 self.assertEqual(len(records), before + 1)
                 self.assertEqual(records[-1]["token_wait_s"], 0)
+
+    def test_busy_call_stores_the_claim_what_as_mac_holder(self) -> None:
+        result = self.record(
+            "call", "ran", "0", "1", "0", "1", "1", "0", "1", "test", "hana",
+            extra={"BUILDLOG_MAC": "declined", "BUILDLOG_MAC_REASON": "busy",
+                   "BUILDLOG_MAC_S": "1", "BUILDLOG_MAC_HOLDER": "hana nextest"},
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.records()[-1]["mac_holder"], "hana nextest")
+
+    def test_hold_event_keeps_the_key_and_the_locked_utc_time(self) -> None:
+        result = self.record("hold-event", "began", "mac", "block-key", "hana", "render",
+                             "2026-10-12T12:00:00.123456+00:00", "2026-10-12T14:00:00+00:00")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        row = self.records()[-1]
+        self.assertEqual(row, {
+            "kind": "hold_event", "v": recorder.RECORD_VERSION,
+            "at": "2026-10-12T12:00:00.123456Z", "host": socket.gethostname().split(".")[0],
+            "target": "mac", "event": "began", "hold_key": "block-key", "holder": "hana",
+            "reason": "render", "until": "2026-10-12T14:00:00+00:00",
+        })
+        result = self.record("hold-event", "ended", "mac", "block-key", "hana", "render",
+                             "2026-10-12T14:00:00+00:00")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.records()[-1]["until"], "")
+
+    def test_hold_event_write_failure_returns_zero_and_adds_no_event(self) -> None:
+        with mock.patch.object(store, "append_line", side_effect=OSError("write failed")):
+            self.assertEqual(recorder.main(["hold-event", "began", "natedev", "key", "hana", "render",
+                                            "2026-10-12T12:00:00+00:00"]), 0)
+        self.assertEqual(self.records(), [])
+        self.assertIn("write failed", (self.root / "errors.log").read_text())
+
+    def test_hold_event_refuses_invalid_or_naive_planned_ends_without_failing_its_caller(self) -> None:
+        for until in ("later", "2026-10-12T14:00:00"):
+            with self.subTest(until=until):
+                result = self.record("hold-event", "began", "mac", "block-key", "hana", "render",
+                                     "2026-10-12T12:00:00Z", until)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(self.records(), [])
+
+    def test_hold_event_accepts_an_empty_planned_end(self) -> None:
+        result = self.record("hold-event", "began", "mac", "block-key", "hana", "render",
+                             "2026-10-12T12:00:00Z", "")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.records()[-1]["until"], "")
 
     def test_call_records_mac_result_and_local_reason(self) -> None:
         local_reason = 'needs Linux path handling with a "quoted" mount'

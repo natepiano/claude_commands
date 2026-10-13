@@ -217,6 +217,7 @@ OWNER = "natedev"
 # send.py stops a relay at --timeout and kills it KILL_GRACE seconds later.
 RELAY_TIMEOUT = 40
 KILL_GRACE = 10
+USER_SEND_TIMEOUT = 60
 # The whole switch took 2 s of wall time when measured idle and 8 s at load average 87; each entry
 # switched back, 0.4 s idle.
 EDIT_TIMEOUT = 30
@@ -826,9 +827,10 @@ def tell_user(summary: str, text: str, ask: Ask | None) -> str | None:
     """Deliver text directly to the user, as a note when `ask` is None; None when it arrived, otherwise why not."""
     asked = ["--no-action"] if ask is None else ["--need", ask.need, "--action", ask.action]
     command = [sys.executable, str(SEND), "--to", "user", "--from", "quota_alert", "--summary", summary, *asked,
-               "--timeout", str(RELAY_TIMEOUT - KILL_GRACE)]
+               "--timeout", str(USER_SEND_TIMEOUT)]
     try:
-        done = subprocess.run(command, input=text, capture_output=True, text=True, timeout=RELAY_TIMEOUT + 5,
+        done = subprocess.run(command, input=text, capture_output=True, text=True,
+                              timeout=USER_SEND_TIMEOUT + KILL_GRACE + 5,
                               check=False)
     except (subprocess.TimeoutExpired, OSError) as error:
         return str(error)

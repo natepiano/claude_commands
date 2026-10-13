@@ -36,7 +36,10 @@ What it does:
    - it has a `/unit:delegate` run open, which keeps its seats, so the run finishes first;
    - it has uncommitted work, so it checkpoints first;
    - the doc is missing, uncommitted or not a production doc;
-   - the new production already has a showrunner.
+   - the new production already has a showrunner;
+   - Claude is not trusted in the unit's worktree on the showrunner account,
+     where the session resumes (`/showrunner:add_showrunner` names what
+     counts as trusted).
 2. **Stops** the unit: it types `/exit` into the unit's pane and waits until its
    Claude is gone, then ends its tmux session. Two processes on one session
    corrupt it, so nothing restarts while the old one runs.

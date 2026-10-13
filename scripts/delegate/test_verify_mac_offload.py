@@ -13,7 +13,7 @@ import time
 import unittest
 from contextlib import contextmanager
 from collections.abc import Generator
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import TypedDict, cast, final, override
 from unittest import mock
@@ -57,8 +57,17 @@ class CallRecord(TypedDict):
     token_wait_s: int
     mac: str
     mac_reason: str
+    mac_holder: str
     local_reason: str
     mac_s: float | None
+
+
+class BusyClaimRecord(TypedDict):
+    pid: int
+    proc_start: str
+    what: str
+    worktree: str
+    since: str
 
 
 class CargoTargetMetadata(TypedDict):
@@ -77,6 +86,7 @@ class CargoPackageMetadata(TypedDict):
 
 
 class CargoMetadata(TypedDict):
+    workspace_root: str
     workspace_members: list[str]
     packages: list[CargoPackageMetadata]
 
@@ -178,7 +188,8 @@ attempt = len((root / "runner-events.jsonl").read_text().splitlines())
 last_decline = arguments[arguments.index("--last-decline") + 1] if "--last-decline" in arguments else ""
 
 def decline(reason: str, seconds: str) -> None:
-    result.write_text("mac=declined\nreason=" + reason + "\nseconds=" + seconds + "\n")
+    holder = "holder=" + os.environ.get("TEST_RUNNER_HOLDER", "other tests") + "\n" if reason == "busy" else ""
+    result.write_text("mac=declined\nreason=" + reason + "\nseconds=" + seconds + "\n" + holder)
     if reason not in ("busy", "blocked") or reason != last_decline:
         print("claim diagnostic: " + reason, file=sys.stderr, flush=True)
         print("mac_test: not running on the Mac (" + reason + ")", flush=True)
@@ -339,6 +350,7 @@ class VerifyMacOffloadTests(unittest.TestCase):
         self.write_executable(self.bin_directory / "cargo", CARGO_STUB)
         self.write_executable(self.bin_directory / "git", GIT_STUB)
         self.write_executable(self.bin_directory / "rustc", RUSTC_STUB)
+        self.write_executable(self.bin_directory / "taplo", "raise SystemExit(0)\n")
         self.write_executable(self.runner, RUNNER_STUB)
         blocker = "#!/bin/sh\nexit 99\n"
         for name in ("ssh", "rsync", "scp", "gh", "systemd-run"):
@@ -375,6 +387,7 @@ class VerifyMacOffloadTests(unittest.TestCase):
         _ = config.write_text("targets=mac,natedev\nkind.mac=ssh\nplatform.mac=macos\n"
                               + f"settings.mac={settings.name}\nkind.natedev=local\nplatform.natedev=linux\n")
         metadata: CargoMetadata = {
+            "workspace_root": str(self.root),
             "workspace_members": ["sample-id"],
             "packages": [
                 {
@@ -543,7 +556,7 @@ class VerifyMacOffloadTests(unittest.TestCase):
                                  "TEST_REAL_TARGETS": str(VERIFY.parent.parent / "build_targets" / "build_targets.py")})
         with self.hold_environment():
             holders = Path(self.environment["BUILD_HOLD_DIR"])
-            _ = build_hold.start_hold(holders, "hana", "render checks", build_hold.NoReleaseEta(), datetime.now().astimezone())
+            _ = build_hold.start_hold(holders, build_hold.HolderIdentity("hana", "hana"), "render checks", build_hold.NoReleaseEta(), datetime.now().astimezone())
             cycle = build_hold.read_cycle()
             assert cycle is not None
             return self.root / "release" / cycle["id"] / "cycle.json"
@@ -551,7 +564,8 @@ class VerifyMacOffloadTests(unittest.TestCase):
     @contextmanager
     def hold_environment(self) -> Generator[None, None, None]:
         with mock.patch.dict(os.environ, {name: self.environment[name] for name in (
-            "BUILD_HOLD_DIR", "BUILD_HOLD_RELEASE_DIR", "PLAN_DELEGATE_ACTIVE_DIR")}), \
+            "BUILD_HOLD_DIR", "BUILD_HOLD_RELEASE_DIR", "PLAN_DELEGATE_ACTIVE_DIR",
+            "BUILDLOG_DIR", "MAC_TEST_STATE_DIR", "NOTIFIER_SESSIONS_DIR")}), \
              mock.patch.dict(os.environ, {"PLAN_DELEGATE_BOARD_DIR": "", "PLAN_DELEGATE_SESSION_DIR": "",
                                           "BUILDLOG_CALL_ID": "", "BUILDLOG_CALLER": ""}), \
              mock.patch.object(build_hold, "socket_for", return_value=build_hold.RecipientLive("/test/socket")), \
@@ -709,7 +723,7 @@ class VerifyMacOffloadTests(unittest.TestCase):
         process = self.start_routing(step_sleep=True)
         with self.hold_environment():
             holders = Path(self.environment["BUILD_HOLD_DIR"])
-            _ = build_hold.start_hold(holders, "julian", "restore CI", build_hold.NoReleaseEta(), datetime.now().astimezone())
+            _ = build_hold.start_hold(holders, build_hold.HolderIdentity("julian", "julian"), "restore CI", build_hold.NoReleaseEta(), datetime.now().astimezone())
             (holders / "hana").unlink()
         self.resume_routing_sleep(1)
         self.resume_routing_sleep(2)
@@ -745,6 +759,31 @@ class VerifyMacOffloadTests(unittest.TestCase):
         self.assertLess(self.routing_record()["hold_wait_s"], 6.5)
         self.assertEqual(self.last_call()["mac_s"], 20)
 
+    def test_busy_retry_to_blocked_or_malformed_answer_clears_call_holder(self) -> None:
+        for mode, reason, expected in (("declined", "blocked", "blocked"), ("none", "", "runner")):
+            fixture = VerifyMacOffloadTests("runTest")
+            try:
+                fixture.setUp()
+                _ = fixture.routing_fixture()
+                process = fixture.start_routing(pause_retry=True)
+                # start_routing sets a successful final answer; select this case's answer here.
+                fixture.write_executable(fixture.runner, RUNNER_STUB.replace(
+                    'mode = os.environ.get("TEST_RUNNER_MAC", "declined")', f'mode = "{mode}"').replace(
+                    'os.environ.get("TEST_RUNNER_REASON", "")', f'"{reason}"'))
+                _ = (fixture.runner_state / "mac-free").write_text("free\n")
+                _ = (fixture.runner_state / "continue-sleep").write_text("continue\n")
+                fixture.wait_for_path(fixture.runner_state / "retry-running")
+                with fixture.hold_environment():
+                    build_hold.holder_path(build_hold.holder_directory(), "hana").unlink()
+                _ = (fixture.runner_state / "continue-retry").write_text("continue\n")
+                _ = (fixture.runner_state / "continue-sleep-2").write_text("continue\n")
+                output, errors = process.communicate(timeout=15)
+                self.assertEqual(process.returncode, 0, output + errors)
+                self.assertEqual(fixture.last_call()["mac_reason"], expected)
+                self.assertEqual(fixture.last_call()["mac_holder"], "")
+            finally:
+                fixture.doCleanups()
+
     def test_busy_mac_and_held_local_wait_then_use_first_free_mac(self) -> None:
         cycle = self.routing_fixture()
         process = self.start_routing()
@@ -764,6 +803,7 @@ class VerifyMacOffloadTests(unittest.TestCase):
         self.assertTrue(all(event["pid"] == process.pid for event in registrations))
         self.assertEqual(self.routing_record()["target"], "mac")
         self.assertGreater(self.routing_record()["hold_wait_s"], 0)
+        self.assertEqual(self.last_call()["mac_holder"], "")
 
     def test_local_release_or_admission_wins_before_another_mac_attempt(self) -> None:
         for held_file_remains in (False, True):
@@ -836,6 +876,7 @@ class VerifyMacOffloadTests(unittest.TestCase):
         records = [event for event in self.routing_events() if event["command"] == "register-local"]
         self.assertLess(record["hold_wait_s"], remote_started - records[0]["at"] + 0.15)
         self.assertEqual(self.last_call()["outcome"], "interrupted")
+        self.assertEqual(self.last_call()["mac_holder"], "other tests")
 
     def test_routing_wait_and_local_wait_are_summed_without_test_runtime(self) -> None:
         _ = self.routing_fixture()
@@ -927,8 +968,23 @@ class VerifyMacOffloadTests(unittest.TestCase):
         record = self.last_call()
         self.assertEqual(record["mac"], "declined")
         self.assertEqual(record["mac_reason"], "busy")
+        self.assertEqual(record["mac_holder"], "other tests")
         self.assertEqual(record["mac_s"], 3.25)
         self.assertNotIn("--no-cache", record["command"])
+
+    def test_busy_claim_what_reaches_call_holder_through_the_real_offload_result(self) -> None:
+        state = Path(self.environment["MAC_TEST_STATE_DIR"])
+        state.mkdir()
+        record: BusyClaimRecord = {"pid": os.getpid(), "proc_start": build_hold.process_start_time(os.getpid()),
+                  "what": "render checks", "worktree": str(self.root),
+                  "since": datetime.now(timezone.utc).isoformat()}
+        _ = (state / "run.json").write_text(json.dumps(record))
+        result = self.verify("test", "sample", "--filter", "alpha", "--no-cache", extra={
+            "VERIFY_MAC_RUNNER": str(VERIFY.parent.parent / "mac_test" / "offload.py")})
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("busy: render checks since", result.stderr)
+        self.assertEqual(self.last_call()["mac_holder"], "render checks")
+        self.assertEqual(self.last_call()["mac_reason"], "busy")
 
     def test_no_test_match_runs_locally_and_reaches_call_record(self) -> None:
         result = self.verify(

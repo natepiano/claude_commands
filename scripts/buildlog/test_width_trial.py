@@ -408,6 +408,15 @@ class WidthTrialTests(unittest.TestCase):
 
         self.assertRegex(self.metric_line(output, "memory wait per gated"), r"10\.0\s+20\.0$")
 
+    def test_taplo_step_does_not_change_gated_wait_mean(self) -> None:
+        """invoke.sh admits taplo without the memory gate, so its wait is not a gated wait."""
+        self.populate_balanced()
+        self.insert_step("taplo", BASE + 1_500, 1_000, "lint", ["taplo", "fmt", "--check"])
+
+        output = self.report()
+
+        self.assertRegex(self.metric_line(output, "memory wait per gated"), r"10\.0\s+20\.0$")
+
     def test_unknown_hana_wait_is_not_averaged_as_zero(self) -> None:
         """F004: a NULL wait counts as a run but not as a wait observation."""
         self.insert_whole_hana("known", BASE + 1_000, 16, 100, 100, False, 5 * GIB)

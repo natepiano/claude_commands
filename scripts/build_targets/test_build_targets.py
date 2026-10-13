@@ -318,7 +318,7 @@ class WaitLocalTests(IsolatedTargetTest):
         _ = self.enterContext(mock.patch.object(build_targets, "wait_clock", return_value=NOW))
 
     def begin_hold(self) -> None:
-        _ = build_hold.start_hold(self.holders, "hana", "render checks", build_hold.NoReleaseEta(), NOW)
+        _ = build_hold.start_hold(self.holders, build_hold.HolderIdentity("hana", "hana"), "render checks", build_hold.NoReleaseEta(), NOW)
 
     def release_turn(self, _seconds: float) -> None:
         self.sleeps += 1
@@ -334,6 +334,23 @@ class WaitLocalTests(IsolatedTargetTest):
         with redirect_stdout(output), redirect_stderr(errors):
             code = build_targets.command_wait_local("call-a", pid=12345)
         return code, output.getvalue(), errors.getvalue()
+
+    def test_wait_local_with_holder_file_does_not_read_an_invalid_user_zone(self) -> None:
+        self.write_holder()
+        release = self.root / "release"
+        release.mkdir()
+        _ = (release / "current").write_text("damaged")
+        for zone in ("America/New_York", "NoSuchZone"):
+            environment = {**os.environ, "TZ": "UTC", "USER_ZONE": zone}
+            with self.subTest(zone=zone), \
+                 mock.patch.object(subprocess, "run", wraps=REAL_SUBPROCESS_RUN), \
+                 mock.patch.object(subprocess, "Popen", wraps=REAL_SUBPROCESS_POPEN):
+                result = subprocess.run([sys.executable, build_targets.__file__, "wait-local", "--call-id", "call-a",
+                                         "--pid", str(os.getpid())], env=environment,
+                                        capture_output=True, text=True, timeout=5)
+            self.assertEqual(result.returncode, 12, result.stdout + result.stderr)
+            self.assertNotIn("Traceback", result.stderr)
+            self.assertIn("release record could not be read", result.stderr)
 
     def test_check_local_admits_a_launch_after_the_release_began(self) -> None:
         self.begin_hold()
@@ -567,6 +584,65 @@ class WaitLocalTests(IsolatedTargetTest):
         assert cycle is not None
         self.assertFalse(any(entry["state"] == "MemoryGateReturned" for entry in cycle["entries"]))
 
+    def check_launch(self, session_id: str) -> tuple[int, str, str]:
+        output, errors = io.StringIO(), io.StringIO()
+        with mock.patch.dict(os.environ, {"HOME": str(self.root), "CLAUDE_CODE_SESSION_ID": session_id}), \
+             redirect_stdout(output), redirect_stderr(errors):
+            code = build_targets.command_check_local()
+        return code, output.getvalue(), errors.getvalue()
+
+    def test_holder_session_launch_is_admitted_without_changing_hold_or_release(self) -> None:
+        _ = build_hold.start_hold(self.holders, build_hold.HolderIdentity("holder-session", "hana"),
+                                  "render checks", build_hold.NoReleaseEta(), NOW)
+        cycle = build_hold.read_cycle()
+        assert cycle is not None
+        cycle_file = self.root / "release" / cycle["id"] / "cycle.json"
+        current = self.root / "release" / "current"
+        holder_file = build_hold.holder_path(self.holders, "holder-session")
+        before = (cycle_file.read_bytes(), current.read_bytes(), holder_file.read_bytes())
+        with mock.patch.object(build_hold, "register_wait", wraps=build_hold.register_wait) as register, \
+             mock.patch.object(build_hold, "read_admission", wraps=build_hold.read_admission) as admission:
+            self.assertEqual(self.check_launch("holder-session"), (0, "", ""))
+        register.assert_not_called()
+        admission.assert_not_called()
+        self.assertEqual((cycle_file.read_bytes(), current.read_bytes(), holder_file.read_bytes()), before)
+        self.assertEqual([path.name for path in self.holders.iterdir()], ["holder-session"])
+
+    def test_another_session_launch_is_refused_by_the_session_hold(self) -> None:
+        _ = build_hold.start_hold(self.holders, build_hold.HolderIdentity("holder-session", "hana"),
+                                  "render checks", build_hold.NoReleaseEta(), NOW)
+        self.assertEqual(self.check_launch("other-session"), (
+            10, "natedev is held by hana for render checks; launch after the release.\n", "",
+        ))
+
+    def test_holder_session_launch_is_refused_when_another_hold_is_in_force(self) -> None:
+        _ = build_hold.start_hold(self.holders, build_hold.HolderIdentity("holder-session", "hana"),
+                                  "render checks", build_hold.NoReleaseEta(), NOW)
+        _ = build_hold.start_hold(self.holders, build_hold.HolderIdentity("other-session", "research"),
+                                  "timing", build_hold.NoReleaseEta(), NOW + timedelta(seconds=1))
+        self.assertEqual(self.check_launch("holder-session"), (
+            10, "natedev is held by hana for render checks; launch after the release.\n", "",
+        ))
+
+    def test_holder_session_launch_is_refused_when_the_release_record_names_an_unusable_holder(self) -> None:
+        _ = build_hold.start_hold(self.holders, build_hold.HolderIdentity("holder-session", "hana"),
+                                  "render checks", build_hold.NoReleaseEta(), NOW)
+        cycle = build_hold.read_cycle()
+        assert cycle is not None
+        cycle["holders"]["."] = {"since": NOW.isoformat(), "released_at": ""}
+        build_hold.save_cycle(cycle)
+        self.assertEqual(self.check_launch("holder-session"), (
+            10, "natedev is held by hana for render checks; launch after the release.\n", "",
+        ))
+
+    def test_hold_under_a_name_refuses_every_launching_session(self) -> None:
+        self.begin_hold()
+        for session_id in ("holder-session", "other-session", ""):
+            with self.subTest(session_id=session_id):
+                self.assertEqual(self.check_launch(session_id), (
+                    10, "natedev is held by hana for render checks; launch after the release.\n", "",
+                ))
+
     def test_register_local_is_nonblocking_repeatable_and_uses_given_pid(self) -> None:
         self.begin_hold()
         with mock.patch.object(build_targets, "wait_sleep", side_effect=AssertionError("Registration must return")):
@@ -593,7 +669,7 @@ class WaitLocalTests(IsolatedTargetTest):
         self.assertEqual(second["entries"][0]["calls"][0]["call_id"], "call-a")
         self.release_turn(0)
         self.assertEqual(build_targets.command_register_local("call-a", pid=12345), 0)
-        _ = build_hold.start_hold(self.holders, "another", "new hold", build_hold.NoReleaseEta(), NOW + timedelta(seconds=2))
+        _ = build_hold.start_hold(self.holders, build_hold.HolderIdentity("another", "another"), "new hold", build_hold.NoReleaseEta(), NOW + timedelta(seconds=2))
         self.assertEqual(build_targets.command_register_local("call-a", pid=12345), 10)
         renewed = build_hold.read_cycle()
         assert renewed is not None

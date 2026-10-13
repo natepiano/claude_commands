@@ -568,6 +568,16 @@ class QuotaAlertTests(unittest.TestCase):
         self.assertEqual(self.user_sends(lambda: quota_alert.tell_user("title", "text", ask)),
                          {"title": ("blocked", ActionRequired(ask.action))})
 
+    def test_user_send_allows_review_and_post_without_shortening_agent_relays(self) -> None:
+        done = subprocess.CompletedProcess(["send.py"], 0, "SENT: to the user", "")
+        with mock.patch.object(subprocess, "run", return_value=done) as run:
+            self.assertIsNone(REAL_TELL_USER("title", "body", None))
+            command = cast(list[str], run.call_args.args[0])
+            self.assertEqual(command[command.index("--timeout") + 1], "60")
+            self.assertEqual(run.call_args.kwargs["timeout"], 75)
+            self.assertEqual(run.call_args.kwargs["input"], "body")
+        self.assertEqual(quota_alert.RELAY_TIMEOUT, 40)
+
     def test_failed_delivery_retries_on_the_same_cadence(self) -> None:
         notes: Notes = [self.note("codex 1.md", "active", "1")]
         self.failing.add("boss of bosses")
