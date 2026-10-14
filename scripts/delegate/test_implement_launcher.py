@@ -480,7 +480,8 @@ class ImplementLauncherWorkerTests(unittest.TestCase):
         mesh = self.root / "scripts/agents/codex_mesh.py"
         _ = mesh.write_text("blocked fixture")
         try:
-            wait_until(ready.exists, self.root, processes=(process,))
+            # write_text creates the file before it writes the pid, so wait for the pid.
+            wait_until(lambda: ready.exists() and ready.read_text() != "", self.root, processes=(process,))
             descriptor = os.pidfd_open(int(ready.read_text()))
             try:
                 with self.assertRaises(subprocess.TimeoutExpired):
