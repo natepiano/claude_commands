@@ -527,7 +527,7 @@ class AddUnitTests(ShutdownTestCase):
         _ = note.write_text("Resume this unit.", encoding="utf-8")
         return self.cli(name, "--plan", "docs/plans/given.md", "--resume", "session-123", "--cwd", str(cwd),
                         "--restart-note", str(note), "--session-name", "recorded-name",
-                        "--tmux-session", "recorded-tmux", "--config-dir", str(Path(self.env["HOME"]) / ".claude"))
+                        "--host-session", "recorded-tmux", "--config-dir", str(Path(self.env["HOME"]) / ".claude"))
 
     def repository_state(self) -> tuple[str, str, str]:
         """The production doc, every branch with its commit, and every worktree with its branch."""
@@ -738,7 +738,7 @@ class AddUnitTests(ShutdownTestCase):
             str(note),
             "--session-name",
             "recorded-name",
-            "--tmux-session",
+            "--host-session",
             "recorded-tmux",
         )
 
@@ -801,7 +801,7 @@ class AddUnitTests(ShutdownTestCase):
             str(note),
             "--session-name",
             "recorded-name",
-            "--tmux-session",
+            "--host-session",
             "recorded-tmux",
         )
 
@@ -821,7 +821,7 @@ class AddUnitTests(ShutdownTestCase):
             "alpha", "--plan", "docs/plans/given.md",
             "--resume", "session-123", "--cwd", str(prior),
             "--restart-note", str(note),
-            "--session-name", "recorded-name", "--tmux-session", "recorded-tmux",
+            "--session-name", "recorded-name", "--host-session", "recorded-tmux",
          "--config-dir", str(Path(self.env["HOME"]) / ".claude"))
 
         self.assertEqual(result.returncode, 2, (result.stdout, result.stderr))
@@ -905,7 +905,7 @@ class AddUnitTests(ShutdownTestCase):
             str(note),
             "--session-name",
             "recorded-name",
-            "--tmux-session",
+            "--host-session",
             "recorded-tmux",
          "--config-dir", str(Path(self.env["HOME"]) / ".claude"))
 
@@ -935,7 +935,7 @@ class AddUnitTests(ShutdownTestCase):
             str(note),
             "--session-name",
             "recorded-name",
-            "--tmux-session",
+            "--host-session",
             "recorded-tmux",
          "--config-dir", str(Path(self.env["HOME"]) / ".claude"))
 
@@ -965,7 +965,7 @@ class AddUnitTests(ShutdownTestCase):
             str(note),
             "--session-name",
             "recorded-name",
-            "--tmux-session",
+            "--host-session",
             "recorded-tmux",
         )
 
@@ -1193,7 +1193,7 @@ class AddUnitTests(ShutdownTestCase):
         result = self.successful(
             "alpha", "--standby", "--resume", "session-123", "--cwd", str(prior),
             "--restart-note", str(note), "--session-name", "recorded-name",
-            "--tmux-session", "recorded-tmux", "--account", "claude 3",
+            "--host-session", "recorded-tmux", "--account", "claude 3",
         )
 
         self.assertIn("alpha-unit restore launched", result.stdout)
@@ -1512,7 +1512,7 @@ class AddUnitTests(ShutdownTestCase):
             "alpha", "--plan", "docs/plans/given.md",
             "--resume", "session-123", "--cwd", str(prior),
             "--restart-note", str(note),
-            "--session-name", "recorded-name", "--tmux-session", "recorded-tmux",
+            "--session-name", "recorded-name", "--host-session", "recorded-tmux",
         )
 
         self.assertTrue(self.launch_command().startswith(
@@ -1932,7 +1932,7 @@ class AddUnitTests(ShutdownTestCase):
             cwd=str(self.root / "prior-session"),
             restart_note=str(note),
             session_name="recorded name",
-            tmux_session="recorded tmux",
+            host_session="recorded tmux",
         ))
         ordinary_resume = add_unit.launch_request(argparse.Namespace(
             **common,
@@ -1940,7 +1940,7 @@ class AddUnitTests(ShutdownTestCase):
             cwd=str(self.root / "prior-session"),
             restart_note=None,
             session_name=None,
-            tmux_session=None,
+            host_session=None,
         ))
         new_work = add_unit.launch_request(argparse.Namespace(
             **common,
@@ -1948,7 +1948,7 @@ class AddUnitTests(ShutdownTestCase):
             cwd=None,
             restart_note=None,
             session_name=None,
-            tmux_session=None,
+            host_session=None,
         ))
 
         self.assertEqual(
@@ -1965,7 +1965,7 @@ class AddUnitTests(ShutdownTestCase):
             launched = add_unit.launch_request(argparse.Namespace(
                 production=str(self.doc), name=name, plan="docs/plans/given.md", brief=None,
                 standby=False, port=None, owns=None, timeout=90.0, check=False, resume=None,
-                cwd=None, restart_note=None, session_name=None, tmux_session=None,
+                cwd=None, restart_note=None, session_name=None, host_session=None,
             ))
             return launched.unit, launched.branch, launched.worktree, launched.requested_name
 
@@ -1981,11 +1981,11 @@ class AddUnitTests(ShutdownTestCase):
         for flags in (
             ("--restart-note", str(note)),
             ("--session-name", "recorded-name"),
-            ("--tmux-session", "recorded-tmux"),
+            ("--host-session", "recorded-tmux"),
             (
                 "--restart-note", str(note),
                 "--session-name", "recorded-name",
-                "--tmux-session", "recorded-tmux",
+                "--host-session", "recorded-tmux",
             ),
         ):
             with self.subTest(flags=flags):
@@ -2015,7 +2015,7 @@ class AddUnitTests(ShutdownTestCase):
             "--cwd", str(prior),
             "--restart-note", str(note),
             "--session-name", recorded_session,
-            "--tmux-session", recorded_tmux,
+            "--host-session", recorded_tmux,
          "--config-dir", str(Path(self.env["HOME"]) / ".claude"))
 
         tmux = self.new_sessions()[0]
@@ -2068,7 +2068,7 @@ class AddUnitTests(ShutdownTestCase):
             "--cwd", str(prior),
             "--restart-note", str(note),
             "--session-name", "recorded-name",
-            "--tmux-session", "recorded-tmux",
+            "--host-session", "recorded-tmux",
          "--config-dir", str(Path(self.env["HOME"]) / ".claude"))
 
         self.assertEqual(result.returncode, 1, (result.stdout, result.stderr))

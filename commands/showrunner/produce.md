@@ -1063,6 +1063,12 @@ at once, in the turn it arrives:
 The session is resumed with that line, on the account the message names; continue
 from it. A unit of yours that vanished during a move is the mover's to bring back:
 do not restore it while its move is in progress.
+
+Before the mover stops one of your units, you get one line from `shutdown`:
+`<unit> is stopping: <why>; it comes back on <account> within minutes`, or that
+it stays stopped until the user restarts it. One more line follows:
+`<unit> is back on <account>`, or `<unit> did not come back: <reason>`. The user
+is told of a failure; you hold the unit's work until it is back.
 </PauseForMove>
 
 <QuotaAlert>

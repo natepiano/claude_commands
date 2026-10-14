@@ -79,7 +79,8 @@ class UnitRestoreLaunch(NamedTuple):
     session_id: str
     note: Path
     session_name: str
-    tmux_session: str
+    # The unit's tmux or herdr session it is restored into.
+    host_session: str
 
 
 class DefaultEffort(NamedTuple):
@@ -288,13 +289,13 @@ def launch_request(args: argparse.Namespace) -> RequestedUnitLaunch:
     cwd = cast(str | None, args.cwd)
     restart_note = cast(str | None, args.restart_note)
     session_name = cast(str | None, args.session_name)
-    tmux_session = cast(str | None, args.tmux_session)
-    restart_values = (restart_note, session_name, tmux_session)
+    host_session = cast(str | None, args.host_session)
+    restart_values = (restart_note, session_name, host_session)
     if any(value is not None for value in restart_values) and not all(
         value is not None for value in restart_values
     ):
         raise Refusal(
-            "--restart-note, --session-name and --tmux-session must be given together"
+            "--restart-note, --session-name and --host-session must be given together"
         )
     if restart_note is not None and resumed is None:
         raise Refusal("restart launch flags require --resume")
@@ -309,13 +310,13 @@ def launch_request(args: argparse.Namespace) -> RequestedUnitLaunch:
         resumed is not None
         and restart_note is not None
         and session_name is not None
-        and tmux_session is not None
+        and host_session is not None
     ):
         launch_kind = UnitRestoreLaunch(
             resumed,
             Path(restart_note).expanduser(),
             session_name,
-            tmux_session,
+            host_session,
         )
     else:
         launch_kind = NewWorkLaunch()
@@ -753,7 +754,7 @@ def launch_session(
     session_name = (request.launch_kind.session_name
                     if isinstance(request.launch_kind, UnitRestoreLaunch)
                     else request.identity.session)
-    tmux_session = (request.launch_kind.tmux_session
+    tmux_session = (request.launch_kind.host_session
                     if isinstance(request.launch_kind, UnitRestoreLaunch)
                     else request.identity.session)
     argv.extend(["--remote-control", session_name, "-n", session_name,
@@ -938,7 +939,7 @@ def main(argv: list[str]) -> int:
     _ = parser.add_argument("--cwd")
     _ = parser.add_argument("--restart-note")
     _ = parser.add_argument("--session-name")
-    _ = parser.add_argument("--host-session", "--tmux-session", dest="tmux_session")
+    _ = parser.add_argument("--host-session")
     _ = parser.add_argument("--check", action="store_true")
     args = parser.parse_args(argv)
     try:
@@ -1015,7 +1016,7 @@ def main(argv: list[str]) -> int:
                     )
                     marked_unit = NoMarkedUnit()
             tmux_session = (
-                request.launch_kind.tmux_session
+                request.launch_kind.host_session
                 if isinstance(request.launch_kind, UnitRestoreLaunch)
                 else request.identity.session
             )
@@ -1046,7 +1047,7 @@ def main(argv: list[str]) -> int:
             restored_tmux_session = (
                 marked_unit.unit.label
                 if isinstance(marked_unit, MarkedUnitFound)
-                else request.launch_kind.tmux_session
+                else request.launch_kind.host_session
             )
             print(
                 f"{request.identity.unit} restore launched: tmux attach -t {restored_tmux_session}"

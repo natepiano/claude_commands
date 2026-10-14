@@ -17,7 +17,7 @@ from collections.abc import Callable, Generator
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, TypedDict, cast, final, override
-from unittest.mock import call, patch
+from unittest.mock import Mock, call, patch
 
 from test_support import registry_confirmation, ShutdownSendLeaf, ShutdownTestCase
 import inventory
@@ -31,6 +31,8 @@ if TYPE_CHECKING:
 else:
     import review
 import stop as stop_work
+# The module settle imports by its own path entry: a separate object from the package import below.
+import showrunners as settle_showrunners
 from scripts.accounts import moves
 from scripts.production import showrunners
 from account import Account
@@ -45,6 +47,7 @@ NOW_UTC = datetime(2026, 10, 9, 21, 49, 10, tzinfo=timezone.utc)
 def setUpModule() -> None:
     root = Path(unittest.enterModuleContext(tempfile.TemporaryDirectory()))
     _ = unittest.enterModuleContext(patch.object(showrunners, "NOTIFIER_STATE_DIR", root))
+    _ = unittest.enterModuleContext(patch.object(settle_showrunners, "NOTIFIER_STATE_DIR", root))
 
 
 class SentCall(TypedDict):
@@ -208,6 +211,10 @@ def session_shutdown(session: inventory.Session, *, progress: record.SessionProg
         seats=[], timers=[], settle_message={"kind": "not sent"}, where={"kind": "not said"},
         progress=progress or {"kind": "waiting"}, stop_issues=[],
     )
+
+
+def unchanged(saved: record.SessionShutdown) -> record.SessionShutdown:
+    return saved
 
 
 class PassObserved(Exception):
@@ -665,6 +672,66 @@ class SettleTests(ShutdownTestCase):
         step = settle.next_step(saved, busy, [saved], NOW_UTC + timedelta(hours=1))
         self.assertNotIsInstance(step, settle.SendSettleMessage)
         self.assertNotIsInstance(step, settle.StopSession)
+
+    def unit_for_showrunner(self, then: record.ShutdownContinuation = "restart") -> record.SessionShutdown:
+        owner = unit("unit", "Unit")
+        owner["host"]["doc"] = "/tmp/demo-production.md"
+        saved = session_shutdown(owner, progress={"kind": "ready", "at": NOW}, then=then)
+        saved["target"] = "claude 3"
+        saved["why"] = "claude 2 is out of usage"
+        self.save(saved)
+        return saved
+
+    @staticmethod
+    def sent(send: Mock) -> tuple[str, str, str]:
+        return cast(tuple[str, str, str], send.call_args.args)
+
+    def test_unit_showrunner_is_told_once_before_the_stop_and_once_when_back(self) -> None:
+        saved = self.unit_for_showrunner()
+        with (
+            patch.object(settle_showrunners, "current_name", return_value="runner") as named,
+            patch.object(settle, "send_message", return_value={"kind": "sent"}) as send,
+            patch.object(stop_work, "stop_session", side_effect=unchanged),
+        ):
+            _ = settle._stop_after_telling(saved)  # pyright: ignore[reportPrivateUsage]
+            _ = settle._stop_after_telling(record.session_records(LOGIN)[0])  # pyright: ignore[reportPrivateUsage]
+            self.assertEqual(send.call_count, 1)
+            self.assertEqual(cast(tuple[str], named.call_args.args), ("demo",))
+            self.assertEqual(self.sent(send)[:2], ("runner", "Unit is stopping: claude 2 is out of usage"))
+            self.assertIn("it comes back on claude 3 within minutes", self.sent(send)[2])
+            back = record.session_records(LOGIN)[0]
+            back["progress"] = {"kind": "restarted", "at": NOW}
+            settle.tell_showrunners_outcome([back])
+            self.assertEqual(send.call_count, 2)
+            self.assertEqual(self.sent(send)[:2], ("runner", "Unit is back on claude 3"))
+
+    def test_unit_showrunner_is_told_once_per_new_failure_and_a_stop_says_it_stays_stopped(self) -> None:
+        saved = self.unit_for_showrunner(then="stop")
+        with (
+            patch.object(settle_showrunners, "current_name", return_value="runner"),
+            patch.object(settle, "send_message", return_value={"kind": "sent"}) as send,
+        ):
+            settle.tell_showrunner_stopping(saved)
+            self.assertIn("it stays stopped until the user restarts it", self.sent(send)[2])
+            def fail(current: record.SessionShutdown) -> None:
+                current["progress"] = {"kind": "restart failed", "at": NOW, "reason": "launch timed out"}
+            settle.tell_showrunners_outcome([record.update_session(LOGIN, "unit", fail)])
+            settle.tell_showrunners_outcome([record.session_records(LOGIN)[0]])
+            self.assertEqual(send.call_count, 2)
+            self.assertEqual(self.sent(send)[1], "Unit did not come back: launch timed out")
+
+    def test_only_a_unit_with_a_running_showrunner_is_announced(self) -> None:
+        other = session_shutdown(top_level("other", "Other"))
+        self.save(other)
+        saved = self.unit_for_showrunner()
+        with (
+            patch.object(settle_showrunners, "current_name", return_value=""),
+            patch.object(settle, "send_message", return_value={"kind": "sent"}) as send,
+        ):
+            settle.tell_showrunner_stopping(other)
+            settle.tell_showrunner_stopping(saved)
+        send.assert_not_called()
+        self.assertFalse(any("showrunner_told" in current for current in record.session_records(LOGIN)))
 
     def test_now_stops_a_busy_requester_without_waiting_for_its_request(self) -> None:
         requester = session_shutdown(top_level("requester", "Requester"), requester="requester", then="restart")

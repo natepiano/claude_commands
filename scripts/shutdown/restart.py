@@ -114,6 +114,7 @@ class ShutdownServices(Protocol):
     def alert_user(
         self, summary: str, text: str, action: ActionRequired, *, machine: str = "",
     ) -> None: ...
+    def tell_showrunners_outcome(self, records: list[SessionShutdown]) -> None: ...
 
 
 settle = cast(ShutdownServices, cast(object, import_module("settle")))
@@ -138,6 +139,10 @@ class RestartAccountNotDetermined(Exception):
 
 class ScheduledRestartPromptNotRecorded(Exception):
     """The launched restart prompt could not be marked as scheduled."""
+
+
+class NoUnitPlan(Exception):
+    """Neither the unit's Units row nor a run record says what it resumes with."""
 
 
 @dataclass(frozen=True)
@@ -620,26 +625,23 @@ def _units_row_plan(doc: str, unit: str) -> str | None:
     return add_unit.cell_value(rows[0]["Plan"])
 
 
-def _unit_argv(
-    record: SessionShutdown,
-    *,
-    missing_plan: bool = False,
-) -> list[str]:
+def _unit_argv(record: SessionShutdown) -> list[str]:
     session = record["session"]
     host = session["host"]
     if session["kind"] != "unit" or host["kind"] != "unit":
         raise ValueError("unit launch needs a unit host")
     recorded_plan = host["plan"]
+    # The Units row first: a brief unit's row names its stub plan before any run record exists.
     row_plan = _units_row_plan(host["doc"], host["unit"])
     plan_arguments: list[str]
     if row_plan == "standby":
         plan_arguments = ["--standby"]
-    elif missing_plan:
-        plan_arguments = ["--plan", "<plan>"]
+    elif row_plan:
+        plan_arguments = ["--plan", row_plan]
     elif recorded_plan["kind"] == "plan":
-        plan_arguments = ["--plan", row_plan or recorded_plan["path"]]
+        plan_arguments = ["--plan", recorded_plan["path"]]
     else:
-        raise ValueError("unit launch has no run record")
+        raise NoUnitPlan(f"{host['unit']} has no Plan in the Units table of {host['doc']} and no run record")
     note_path = _note_path(record, session["session_id"])
     argv = [
         *_add_unit_command(),
@@ -1013,16 +1015,11 @@ def _launch_session(
             raise ValueError("unit session has no unit host")
         if host["session_host"] == "herdr":
             return ManualRestartRequired(_resume_command(session, note, record.get("target", "")))
-        # A standby unit never ran a plan, so it has no run record and needs none.
-        if host["plan"]["kind"] == "no run record" and _units_row_plan(host["doc"], host["unit"]) != "standby":
-            _write_note(_note_path(record, session["session_id"]), note, dry_run)
-            return ManualRestartRequired(
-                shlex.join(_unit_argv(record, missing_plan=True))
-            )
+        argv = _unit_argv(record)
         note_path = _note_path(record, session["session_id"])
         _write_note(note_path, note, dry_run)
         try:
-            _ = _run(_unit_argv(record), dry_run=dry_run)
+            _ = _run(argv, dry_run=dry_run)
         finally:
             if not dry_run:
                 note_path.unlink(missing_ok=True)
@@ -1460,6 +1457,12 @@ def launch_entry(
                 f"restart prompt not recorded: {_error_reason(error)}",
             )
         return EntrySettled()
+    except NoUnitPlan as error:
+        if dry_run:
+            print(f"cannot restart {session['name']}: {error}")
+        else:
+            mark_restart_failed(record, str(error))
+        return EntrySettled()
     except (OSError, subprocess.CalledProcessError, subprocess.SubprocessError) as error:
         if dry_run or not _launch_failure_left_session_live(record, error):
             return EntrySettled()
@@ -1712,10 +1715,11 @@ def _up(login: str, dry_run: bool, only: Iterable[str] = ()) -> MachineRestartRe
     all_records = session_records(login)
     hold_outcome = lookup_account_hold(login)
     records = [saved for saved in all_records if not ids or saved["session"]["session_id"] in ids]
+    finished: list[SessionShutdown] = []
     if not dry_run:
         checked = clear_running_on_target(records)
-        records = checked.remaining
-        for record in checked.finished:
+        records, finished = checked.remaining, checked.finished
+        for record in finished:
             print(f"{record['machine']}: {record['session']['name']} is already running on {record.get('target') or record['label']}")
     refused: list[RestartRefusal] = []
     local_ids = {saved["session"]["session_id"] for saved in all_records}
@@ -1794,6 +1798,7 @@ def _up(login: str, dry_run: bool, only: Iterable[str] = ()) -> MachineRestartRe
                 continue
             missing_control.extend(_confirm_entries([current]))
             attempted.append(current)
+        settle.tell_showrunners_outcome([*finished, *attempted])
         remaining = session_records(login)
         if isinstance(hold_outcome, AccountHeld) and not any(item["request_id"] == hold_outcome.hold["request_id"] for item in remaining):
             finished_requests = tuple(item["request_id"] for item in attempted if item["progress"]["kind"] == "restarted")

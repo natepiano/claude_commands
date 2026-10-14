@@ -373,6 +373,8 @@ class SessionShutdown(TypedDict):
     reasked_at: NotRequired[str]
     # The not-back failure last pushed to the user, so an unchanged one is not pushed again.
     restore_alerted: NotRequired[str]
+    # The last line a unit's showrunner was sent about this stop: "stopping", "back", or the not-back failure.
+    showrunner_told: NotRequired[str]
     # Absent means resume on session.config_dir, never on a changed role.
     target: NotRequired[str]
     source_label: NotRequired[str]
@@ -995,8 +997,9 @@ def _session_shutdown(value: object, place: str) -> SessionShutdown:
     for field in ("alerted_at", "form_alerted_at", "reasked_at"):
         if field in values:
             _ = _utc_time(values[field], f"{place}.{field}")
-    if "restore_alerted" in values:
-        _ = _string(values["restore_alerted"], f"{place}.restore_alerted")
+    for field in ("restore_alerted", "showrunner_told"):
+        if field in values:
+            _ = _string(values[field], f"{place}.{field}")
     return cast(SessionShutdown, cast(object, values))
 
 

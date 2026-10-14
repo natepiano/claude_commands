@@ -31,6 +31,8 @@ from fake_herdr import CommandResponse
 import conversation_pause
 import settle
 import showrunner_footer
+# The module settle imports by its own path entry: a separate object from the package import below.
+import showrunners as settle_showrunners
 import shutdown
 import account as account_reader
 from scripts.accounts import moves
@@ -243,6 +245,7 @@ def setUpModule() -> None:
     unittest.enterModuleContext(patch.dict(os.environ, {"USER_ZONE": "America/Los_Angeles"}))
     root = Path(unittest.enterModuleContext(tempfile.TemporaryDirectory()))
     _ = unittest.enterModuleContext(patch.object(showrunners, "NOTIFIER_STATE_DIR", root))
+    _ = unittest.enterModuleContext(patch.object(settle_showrunners, "NOTIFIER_STATE_DIR", root))
 
 
 @final
@@ -1140,6 +1143,32 @@ class RestartTests(ShutdownTestCase):
         argv = next((shlex.split(line) for line in output.getvalue().splitlines() if 'add_unit.py' in line))
         self.assertIn('--standby', argv)
         self.assertNotIn('--plan', argv)
+
+    def test_brief_unit_without_a_run_record_resumes_with_its_stub_plan(self) -> None:
+        doc = self.root / 'production.md'
+        _ = doc.write_text('\n'.join(['# Demo', '', '## Units', '', '| Unit | Plan | Worktree | Branch | Port | Owns |', '| --- | --- | --- | --- | --- | --- |', '| notes-unit | docs/plans/demo-notes.md | /w/notes | demo-notes | — | — |', '']), encoding='utf-8')
+        moved = entry(unit('notes', doc=str(doc), plan=inventory.NoRunRecord(kind='no run record')))
+        self.create(records_for_test([moved]))
+        output = io.StringIO()
+        with patch.object(restart, '_live_session_ids', return_value=frozenset()), patch.object(settle, 'record_time', return_value=RESTARTED), redirect_stdout(output):
+            self.assertEqual(restart.up(LOGIN, dry_run=True), 0)
+        self.assertNotIn('manual restart', output.getvalue())
+        argv = next((shlex.split(line) for line in output.getvalue().splitlines() if 'add_unit.py' in line))
+        self.assertEqual(argv[argv.index('--plan') + 1], 'docs/plans/demo-notes.md')
+        self.assertNotIn('<plan>', argv)
+
+    def test_unit_with_no_row_plan_and_no_run_record_is_refused_with_its_reason(self) -> None:
+        doc = self.root / 'production.md'
+        _ = doc.write_text('# Demo\n\n## Units\n', encoding='utf-8')
+        moved = entry(unit('lost', doc=str(doc), plan=inventory.NoRunRecord(kind='no run record')))
+        with self.assertRaisesRegex(restart.NoUnitPlan, 'no Plan in the Units table'):
+            _ = restart._unit_argv(moved)  # pyright: ignore[reportPrivateUsage]
+        self.create(records_for_test([moved]))
+        output = io.StringIO()
+        with patch.object(restart, '_live_session_ids', return_value=frozenset()), patch.object(settle, 'record_time', return_value=RESTARTED), redirect_stdout(output):
+            _ = restart.up(LOGIN, dry_run=True)
+        self.assertIn('cannot restart', output.getvalue())
+        self.assertNotIn('add_unit.py', output.getvalue())
 
     def test_dry_run_without_target_keeps_recorded_dir_for_every_host(self) -> None:
         config_dir = str(self.root / "account with 'quotes' and $()")
