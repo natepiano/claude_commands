@@ -616,7 +616,7 @@ def quota(production: Production, notice: str, state_dir: Path) -> None:
             action = (f"keep delegating on {tool}: its weekly allowance is used up and credits may be carrying the "
                       + f"work; tell the showrunner at once if {tool} refuses work for quota")
         else:
-            action = f"start no new delegate work on {tool}; running seats finish"
+            action = f"start no new delegate work on {tool}; running workers finish"
     elif kind == "Quota alert acknowledged:":
         named = re.search(r"the user silenced (.+?) (?:in session|outside any session)", line)
         accounts = [item.strip() for item in named.group(1).split(",")] if named else [line.removeprefix(kind).strip()]

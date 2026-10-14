@@ -99,8 +99,17 @@ def repositories(claude_repo: Path, production_docs: Path) -> tuple[Path, ...]:
 def default_sources() -> ReportSources:
     home = Path.home()
     claude = home / ".claude"
+    state = home / ".local" / "state" / "usage-model"
+    baseline = state / "workers-baseline"
+    previous = state / "seats-baseline"
+    if not baseline.exists() and previous.exists():
+        try:
+            _ = previous.rename(baseline)
+        except FileNotFoundError:
+            if not baseline.is_dir():
+                raise
     return ReportSources(
-        home / ".local" / "state" / "usage-model" / "seats-baseline" / "readings-2026-10-10.jsonl",
+        baseline / "readings-2026-10-10.jsonl",
         claude,
         claude / "docs" / "plans",
     )

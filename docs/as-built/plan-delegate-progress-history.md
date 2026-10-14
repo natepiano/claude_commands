@@ -293,32 +293,32 @@ the best and worst arrival the percentage still allows.
 
 The second is the round table, under the phase heading: one row per round,
 oldest first, led by `Stage`, `Start` and `Elapsed`, then a column for each
-seat — `Agent 1` and `Agent 2`, the `impl` and `test` slots in that order, then
-one `Agent N` per extra seat (`review`, `review2`, `fix2`, …) in the order seats
+worker — `Agent 1` and `Agent 2`, the `impl` and `test` slots in that order, then
+one `Agent N` per extra worker (`review`, `review2`, `fix2`, …) in the order workers
 first appear, numbered so the header carries no role word the cell beneath
-could contradict — and closed by the finding result. An extra seat appears when
-it records a pass or receives a board `handoff`; the original `review` seat
-shows only while a displayed stage seats it. The first column is
+could contradict — and closed by the finding result. An extra worker appears when
+it records a pass or receives a board `handoff`; the original `review` worker
+shows only while a displayed stage assigns it. The first column is
 `Stage` rather than `Round` because a row is not always a round: a verification,
 a smoke run, or a lone reviewer each own one. A round is nonetheless the unit
 that advances: it is dispatched, it lands, and the ledger stamps its number
 on every finding it produces, so it is the only row key whose start, elapsed and
-result all describe the same thing. The seats working it read across as
-columns, each cell naming the role that seat held, how long it held it, and what
+result all describe the same thing. The workers working it read across as
+columns, each cell naming the role that worker held, how long it held it, and what
 it is doing at the end of the row's stretch — `fix 11m running`,
 `review 13m waiting`. Under the table sits the running round's activity
 sentence, which no fixed-width column can carry, and then the wall clock.
 
-The four seat states answer the question a duration cannot: an open window and a
+The four worker states answer the question a duration cannot: an open window and a
 closed one both render a number, and a number that stopped growing looks exactly
 like one still growing. `done` is every stretch already over, which is every row
-but the last of a live round. Within that last row, `idle` is a seat whose
+but the last of a live round. Within that last row, `idle` is a worker whose
 window closed while its round did not — free for more work rather than finished
-with the phase — and an open window is `running` unless the seat's own last
+with the phase — and an open window is `running` unless the worker's own last
 board line says it is held up, which is `waiting`. Only the board can supply
-that last one: a seat blocked on a peer's edit, on the cargo token, or on a gate
+that last one: a worker blocked on a peer's edit, on the cargo token, or on a gate
 has a live process and an open window, so the pass record cannot tell it from
-work, and both seats reading `running` while one sits on the other is the
+work, and both workers reading `running` while one sits on the other is the
 picture the word exists to correct.
 
 The table draws the last three stages only. A stage is one labelled unit of the
@@ -335,39 +335,39 @@ above the table, `*Earlier: 21 stages not shown - Impl through Fix 9.*`, so a
 phase eleven hours deep cannot read as one that has barely started; `timeline`
 still renders the full history on demand.
 
-A row per *pass* cannot do this once a phase team exists. The seats launch
-within the same second, so a per-pass table repeats one Start per seat and
+A row per *pass* cannot do this once a phase team exists. The workers launch
+within the same second, so a per-pass table repeats one Start per worker and
 learns nothing from it; worse, attributing findings by the interval from one row
-to the next gives the first seat a window under a second wide and hands the
+to the next gives the first worker a window under a second wide and hands the
 whole phase to whichever registered last. Grouping by round settles attribution
 rather than narrowing it: `findings.py` already writes `round` on
 every event, so the Result cell is counted, not inferred from timestamps. What a
-round table cannot show — which model ran which seat, and a review overlapping
+round table cannot show — which model ran which worker, and a review overlapping
 the writer as a window of its own — is `timeline`'s question, and `timeline`
 still renders one row per window.
 
 A round is not one shape held to the end, so it is split again at every moment
-its seats changed role: each stretch over which no seat moved is a row. A phase
+its workers changed role: each stretch over which no worker moved is a row. A phase
 opening `impl / test`, its writer finishing early and taking a slice of the
 tests as `test / test`, and converging on `review / review` renders as three
 rows under one round label. The label is printed once and the
 continuations leave it blank — repeating it would read as three rounds rather
 than one team moving — and the round's result sits on the row that closes it,
 since a round is the granularity the ledger stamps. Each cell carries that
-seat's own time within the stretch, so a seat that finished early shows less
+worker's own time within the stretch, so a worker that finished early shows less
 than the row's elapsed rather than being backdated to it.
 
 Roles come from `board.log`, not from the launch arguments, because they move
 during a phase. `board.sh role` stamps a `role=<name>` field on each `handoff`
 line, and the launcher stamps the same field on its `register` line — the pass
-kind it was launched with, which is the opening role the Work Order's Seats
-field chose for that seat — so a seat reports a role from second zero.
+kind it was launched with, which is the opening role the Work Order's Workers
+field chose for that worker — so a worker reports a role from second zero.
 `board.sh post` refuses a `handoff` that does not lead with `role=`, so a move
 narrated in prose is rejected rather than lost. The whole history is read rather than the
 latest entry: collapsing to the current answer would report the last shape as
-though it had held all along. A role a seat never posted is a shape the run
+though it had held all along. A role a worker never posted is a shape the run
 never shows, which is why the verb's contract says to call it the moment the
-work changes. A seat whose board never spoke falls back to the kind its pass
+work changes. A worker whose board never spoke falls back to the kind its pass
 recorded; one that has registered without opening a pass shows the role alone,
 with no duration — the board knows what it is doing and nothing yet knows for
 how long.
@@ -378,36 +378,36 @@ events, `board.sh` and the recorder read the same clock: both honour
 outside a ledger stamped from an override and drop every role change out of
 every round.
 
-Under the table sits one line per seat — `- **Agent 1** (impl) <model> <effort> · 3m ago ·
+Under the table sits one line per worker — `- **Agent 1** (impl) <model> <effort> · 3m ago ·
 rerunning the scoped test` — naming the delegate in it for the round in flight
-and the last thing that seat said on the board, with its age. It is one answer
+and the last thing that worker said on the board, with its age. It is one answer
 per phase rather than per row, so a column repeating the same values down every
-row would crowd out the roles for nothing. The words are the seat's own: the
-launcher prefixes its exit posts `launcher:`, and the note keeps the seat's
+row would crowd out the roles for nothing. The words are the worker's own: the
+launcher prefixes its exit posts `launcher:`, and the note keeps the worker's
 latest unprefixed line behind the launcher's kind — `done: hana_catalyst tests
-240 passed` rather than the launcher's `done:` line on every seat. A seat that never
+240 passed` rather than the launcher's `done:` line on every worker. A worker that never
 narrated shows the launcher's words; one that has registered and said nothing
 shows `no board line yet`; a fresh `register` clears the previous occupant's
 words. The unit director is omitted: the reader is the unit director, and `timeline`
 carries both identities per pass for anyone reconstructing a run after the fact.
 
 Windows that sit in no round keep a row apiece, named as they always were: a
-unit-director activity, which holds no seat, and every pass that records none — a
+unit-director activity, which holds no worker, and every pass that records none — a
 solo run's, and a lens-less review `review.sh` runs with neither `--to` nor
-`--slot`. A review on an open seat records under that seat, and a broad
-review's lens reviewers join the round they read, one row below the writers. Such a seatless pass is drawn in the seat its
+`--slot`. A review on an open worker records under that worker, and a broad
+review's lens reviewers join the round they read, one row below the writers. Such a workerless pass is drawn in the worker its
 kind names — `review 9m` under
-Agent 2, `impl 3m` under Agent 1 — so a reader finds a seatless review in a
-seat's column rather than a row of dashes; an activity
-names no seat and keeps them. These rows keep the per-window finding attribution — the interval
-running to whatever opened next — which is wrong for concurrent seats and
+Agent 2, `impl 3m` under Agent 1 — so a reader finds a workerless review in a
+worker's column rather than a row of dashes; an activity
+names no worker and keeps them. These rows keep the per-window finding attribution — the interval
+running to whatever opened next — which is wrong for concurrent workers and
 exactly right for the sequential windows that still reach it. An early-armed reviewer joins the round it reads when there is
 one, and otherwise keeps its own row beside the writer.
 
-A round splits into a further row wherever a seat is occupied a second time,
-as when a writer's open seat takes a review after its writing pass closes: a
-new pass is a move whether or not the seat posted a `handoff` for it. An extra
-seat outside `impl` and `test` opens such a row when its first occupancy
+A round splits into a further row wherever a worker is occupied a second time,
+as when a writer's open worker takes a review after its writing pass closes: a
+new pass is a move whether or not the worker posted a `handoff` for it. An extra
+worker outside `impl` and `test` opens such a row when its first occupancy
 begins, so it does not appear to have worked from the writers' start. The whole wave takes one boundary rather than one per launch,
 and each cell reports the occupancy that stretch falls in — so a phase reads
 `impl / test / impl` on one row and `review / review / review` on the next,

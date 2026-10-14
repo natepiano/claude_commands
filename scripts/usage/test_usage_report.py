@@ -191,7 +191,7 @@ class UsageReportTests(ReportFixture):
                        model: str = "gpt-5.6-sol", parent: str = "", machine: str = "natedev") -> None:
         with closing(sqlite3.connect(self.db_path)) as db, db:
             _ = db.execute("INSERT INTO turns VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                           (machine, "codex", "seat", parent, thread, key,
+                           (machine, "codex", "worker", parent, thread, key,
                             f"2026-10-11T12:{minute:02d}:00+00:00", model, "medium",
                             uncached, 0, 0, cached, 10, 1, role, None, "recorded", "not_applicable"))
 
@@ -216,18 +216,18 @@ class UsageReportTests(ReportFixture):
 
     def test_compaction_reread_sums_only_first_positive_requests_in_text_key_order(self) -> None:
         self.clear_metric_turns()
-        self.metric_compaction("seat", 0)
-        self.metric_request("seat", 0, 999, key="rollout-metric.jsonl:0")  # Equal at is not after.
-        self.metric_request("seat", 1, 0, key="rollout-metric.jsonl:1")
+        self.metric_compaction("worker", 0)
+        self.metric_request("worker", 0, 999, key="rollout-metric.jsonl:0")  # Equal at is not after.
+        self.metric_request("worker", 1, 0, key="rollout-metric.jsonl:1")
         # :100 sorts before :20; insert the wrong candidate first.
-        self.metric_request("seat", 2, 70, 30, key="rollout-metric.jsonl:20")
-        self.metric_request("seat", 2, 20, 10, key="rollout-metric.jsonl:100")
-        self.metric_compaction("seat", 3)
-        self.metric_request("seat", 4, 40, 20, key="rollout-metric.jsonl:200")
-        self.metric_compaction("seat", 5)  # No later request.
+        self.metric_request("worker", 2, 70, 30, key="rollout-metric.jsonl:20")
+        self.metric_request("worker", 2, 20, 10, key="rollout-metric.jsonl:100")
+        self.metric_compaction("worker", 3)
+        self.metric_request("worker", 4, 40, 20, key="rollout-metric.jsonl:200")
+        self.metric_compaction("worker", 5)  # No later request.
         # Same id on another machine or under a parent must never become its successor.
-        self.metric_request("seat", 1, 500, key="rollout-metric.jsonl:foreign", machine="mac")
-        self.metric_request("seat", 1, 600, key="rollout-metric.jsonl:child", parent="parent")
+        self.metric_request("worker", 1, 500, key="rollout-metric.jsonl:foreign", machine="mac")
+        self.metric_request("worker", 1, 600, key="rollout-metric.jsonl:child", parent="parent")
         cells = self.metric_cells()[("impl", "gpt-5.6-sol")]
         # Numerator 20+40=60, no cached input or output. Denominator includes every turn.
         denominator = 1079 + 80 + 153 + 101 + 122 + 580 + 680
@@ -235,21 +235,21 @@ class UsageReportTests(ReportFixture):
 
     def test_compaction_reread_window_and_dimensions_come_from_the_request(self) -> None:
         self.clear_metric_turns()
-        self.metric_request("seat", 0, 100, role="impl", key="rollout-metric.jsonl:0")
-        self.metric_compaction("seat", 1)
-        self.metric_request("seat", 2, 25, 100, role="review", model="gpt-6.1-sol",
+        self.metric_request("worker", 0, 100, role="impl", key="rollout-metric.jsonl:0")
+        self.metric_compaction("worker", 1)
+        self.metric_request("worker", 2, 25, 100, role="review", model="gpt-6.1-sol",
                             key="rollout-metric.jsonl:1")
-        self.metric_compaction("seat", 3)
-        self.metric_request("seat", 5, 400, role="impl", key="rollout-metric.jsonl:2")
+        self.metric_compaction("worker", 3)
+        self.metric_request("worker", 5, 400, role="impl", key="rollout-metric.jsonl:2")
         cells = self.metric_cells("--since", "2026-10-11T12:02:00Z",
                                   "--until", "2026-10-11T12:05:00Z", "--zone", "UTC")
         self.assertEqual(cells, {("review", "gpt-6.1-sol"): ["25", "80", "31.2%"]})
 
     def test_unweighted_first_request_is_counted_and_not_replaced_by_a_later_weighted_one(self) -> None:
         self.clear_metric_turns()
-        self.metric_compaction("seat", 0)
-        self.metric_request("seat", 1, 30, model="invented-no-weight", key="rollout-metric.jsonl:1")
-        self.metric_request("seat", 2, 50, key="rollout-metric.jsonl:2")
+        self.metric_compaction("worker", 0)
+        self.metric_request("worker", 1, 30, model="invented-no-weight", key="rollout-metric.jsonl:1")
+        self.metric_request("worker", 2, 50, key="rollout-metric.jsonl:2")
         result = self.report("compaction_reread_share")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("| invented-no-weight | 1 |", result.stdout)
@@ -261,9 +261,9 @@ class UsageReportTests(ReportFixture):
         for attribution in ("estimated", "unassigned"):
             with self.subTest(attribution=attribution):
                 self.clear_metric_turns()
-                self.metric_compaction("seat", 0)
-                self.metric_request("seat", 1, 100, key="rollout-metric.jsonl:1")
-                self.metric_request("seat", 2, 1, key="rollout-metric.jsonl:2")
+                self.metric_compaction("worker", 0)
+                self.metric_request("worker", 1, 100, key="rollout-metric.jsonl:1")
+                self.metric_request("worker", 2, 1, key="rollout-metric.jsonl:2")
                 with closing(sqlite3.connect(self.db_path)) as db, db:
                     _ = db.execute("UPDATE turns SET attribution = ? WHERE turn_key = ?",
                                    (attribution, "rollout-metric.jsonl:1"))
@@ -275,9 +275,9 @@ class UsageReportTests(ReportFixture):
 
     def test_unknown_unit_reread_coverage_counts_rows_while_the_metric_sums_tokens(self) -> None:
         self.clear_metric_turns()
-        self.metric_compaction("unmapped-seat", 0)
-        self.metric_request("unmapped-seat", 1, 1000)
-        self.assertEqual(self.rows("SELECT * FROM folders WHERE agent_id = 'unmapped-seat'"), [])
+        self.metric_compaction("unmapped-worker", 0)
+        self.metric_request("unmapped-worker", 1, 1000)
+        self.assertEqual(self.rows("SELECT * FROM folders WHERE agent_id = 'unmapped-worker'"), [])
         result = self.report("compaction_reread_share")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stderr, "")
@@ -286,7 +286,7 @@ class UsageReportTests(ReportFixture):
 
     def test_reread_counts_a_shared_successor_once_per_request_across_threads(self) -> None:
         self.clear_metric_turns()
-        for thread in ("first-seat", "second-seat"):
+        for thread in ("first-worker", "second-worker"):
             self.metric_compaction(thread, 0)
             self.metric_compaction(thread, 1)
             self.metric_request(thread, 2, 100, 20)

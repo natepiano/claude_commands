@@ -12,13 +12,17 @@ import subprocess
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Literal, NotRequired, TypedDict, cast
+from typing import TYPE_CHECKING, Literal, NotRequired, TypedDict, cast
 
 SCRIPTS = Path(__file__).resolve().parents[1]
-for dependency in ("whoami", "message", "production", "herdr"):
+for dependency in ("whoami", "message", "production", "herdr", "delegate"):
     sys.path.insert(0, str(SCRIPTS / dependency))
 
 import account
+if TYPE_CHECKING:
+    from ..delegate.worker_state import worker_ledger
+else:
+    from worker_state import worker_ledger
 import herdr
 import sessions
 from sessions import process_start as _process_start
@@ -183,7 +187,7 @@ class NoDirector(TypedDict):
     kind: Literal["no director"]
 
 
-SeatOwner = DirectorOwner | NoDirector
+WorkerOwner = DirectorOwner | NoDirector
 
 
 class CodexServer(TypedDict):
@@ -191,7 +195,7 @@ class CodexServer(TypedDict):
 
     run_dir: str
     pid: int
-    busy_seats: list[str]
+    busy_workers: list[str]
 
 
 class SessionFields(TypedDict):
@@ -225,7 +229,7 @@ class UnitSession(SessionFields):
 class SeatSession(SessionFields):
     kind: Literal["seat"]
     host: SessionHost
-    owner: SeatOwner
+    owner: WorkerOwner
 
 
 class TopLevelSession(SessionFields):
@@ -234,6 +238,22 @@ class TopLevelSession(SessionFields):
 
 
 Session = ShowrunnerSession | UnitSession | SeatSession | TopLevelSession
+
+
+@dataclass(frozen=True)
+class ListedSession:
+    """A live, attributed session without its worktree or restart resources."""
+
+    session_id: str
+    pid: int
+    proc_start: str
+    name: str
+    kind: Literal["showrunner", "unit", "seat", "top-level"]
+    config_dir: Path
+    login: str
+    # Empty for sessions outside a registered production.
+    production: str
+    doc: str
 
 
 class UnattributedSession(TypedDict):
@@ -573,7 +593,7 @@ def _parse_model(value: object, place: str) -> LastModel:
     raise InvalidInventory(f"{place}.kind is invalid")
 
 
-def _parse_owner(value: object, place: str) -> SeatOwner:
+def _parse_owner(value: object, place: str) -> WorkerOwner:
     data = _wire_object(value, place)
     kind = _wire_kind(data, place)
     if kind == "director":
@@ -595,8 +615,8 @@ def _parse_codex_server(value: object, place: str) -> CodexServer:
             _wire_required(data, "run_dir", place), f"{place}.run_dir"
         ),
         "pid": _wire_integer(_wire_required(data, "pid", place), f"{place}.pid"),
-        "busy_seats": _wire_strings(
-            _wire_required(data, "busy_seats", place), f"{place}.busy_seats"
+        "busy_workers": _wire_strings(
+            _wire_required(data, "busy_workers", place), f"{place}.busy_workers"
         ),
     }
 
@@ -903,20 +923,20 @@ def _active_run_directories() -> dict[str, list[Path]]:
     return found
 
 
-def _seat_owners(run_directories: dict[str, list[Path]], session_ids: set[str]) -> dict[str, str]:
+def _worker_owners(run_directories: dict[str, list[Path]], session_ids: set[str]) -> dict[str, str]:
     short_to_session = {session_id[:8].casefold(): session_id for session_id in session_ids}
     owners: dict[str, str] = {}
     for owner, directories in run_directories.items():
         for directory in directories:
             try:
-                lines = (directory / "seats").read_text(encoding="utf-8").splitlines()
+                lines = worker_ledger(directory).read_text(encoding="utf-8").splitlines()
             except (OSError, UnicodeError):
                 continue
             for line in lines:
                 daemon_short = line.split("\t", 1)[0].strip().casefold()
-                seat = short_to_session.get(daemon_short)
-                if seat is not None:
-                    owners[seat] = owner
+                worker = short_to_session.get(daemon_short)
+                if worker is not None:
+                    owners[worker] = owner
     return owners
 
 
@@ -1261,33 +1281,58 @@ def _checkout(cwd: str) -> CheckoutState:
     }
 
 
-def _model(session_id: str) -> LastModel:
-    project_root = Path.home() / ".claude/projects"
+def transcript_path(config_dir: Path, session_id: str) -> Path | None:
+    """Find the newest main transcript, without visiting subagent directories."""
+    newest: Path | None = None
+    modified = float("-inf")
     try:
-        matches = list(project_root.rglob(f"{session_id}.jsonl"))
+        for path in (config_dir / "projects").glob(f"*/{session_id}.jsonl"):
+            try:
+                at = path.stat().st_mtime
+            except OSError:
+                continue
+            if at > modified:
+                newest, modified = path, at
     except OSError:
-        return {"kind": "no reply yet"}
-    if not matches:
-        return {"kind": "no reply yet"}
+        pass
+    return newest
+
+
+def last_model(path: Path) -> str | None:
+    """Read complete transcript lines newest first, stopping at a real model."""
     try:
-        transcript = max(matches, key=lambda path: path.stat().st_mtime)
-        lines = transcript.read_text(encoding="utf-8", errors="replace").splitlines()
+        with path.open("rb") as transcript:
+            position = transcript.seek(0, os.SEEK_END)
+            pending = b""
+            while position:
+                size = min(position, 64 * 1024)
+                position -= size
+                _ = transcript.seek(position)
+                lines = (transcript.read(size) + pending).split(b"\n")
+                pending = lines[0] if position else b""
+                complete = lines[1:] if position else lines
+                for line in reversed(complete):
+                    try:
+                        value = cast(object, json.loads(line))
+                    except (ValueError, TypeError, UnicodeError):
+                        continue
+                    if not isinstance(value, dict):
+                        continue
+                    entry = cast(dict[str, object], value)
+                    message = entry.get("message")
+                    if entry.get("type") != "assistant" or not isinstance(message, dict):
+                        continue
+                    candidate = cast(dict[str, object], message).get("model")
+                    if isinstance(candidate, str) and candidate != "<synthetic>":
+                        return candidate
     except OSError:
-        return {"kind": "no reply yet"}
-    model: str | None = None
-    for line in lines:
-        try:
-            value = cast(object, json.loads(line))
-        except (ValueError, TypeError):
-            continue
-        if not isinstance(value, dict):
-            continue
-        entry = cast(dict[str, object], value)
-        if entry.get("type") != "assistant" or not isinstance(entry.get("message"), dict):
-            continue
-        candidate = cast(dict[str, object], entry["message"]).get("model")
-        if isinstance(candidate, str) and candidate != "<synthetic>":
-            model = candidate
+        pass
+    return None
+
+
+def _model(session_id: str, config_dir: Path) -> LastModel:
+    transcript = transcript_path(config_dir, session_id)
+    model = last_model(transcript) if transcript is not None else None
     return (
         {"kind": "model", "name": model}
         if model is not None
@@ -1314,7 +1359,7 @@ def _codex_servers(run_directories: list[Path]) -> list[CodexServer]:
             )
             if status in {"running", "starting"} and launcher_is_live:
                 busy.append(name)
-        servers.append({"run_dir": str(directory), "pid": pid, "busy_seats": busy})
+        servers.append({"run_dir": str(directory), "pid": pid, "busy_workers": busy})
     return servers
 
 
@@ -1332,13 +1377,66 @@ def _machine() -> str:
     return name or ("mac" if sys.platform == "darwin" else "natedev")
 
 
+def _listed_session(
+    record: SessionFile,
+    productions: dict[str, ProductionSession],
+    units: dict[str, UnitMarks],
+) -> ListedSession | UnattributedSession:
+    pid = record.get("pid", 0)
+    name = _string(record.get("name"))
+    if not _record_matches_process(record):
+        return {"pid": pid, "name": name, "reason": "process start mismatch"}
+    attributed = _configuration_for_session(pid)
+    if isinstance(attributed, UnreadableSessionConfiguration):
+        return {"pid": pid, "name": name, "reason": "account unreadable"}
+    session_id = _string(record.get("sessionId"))
+    production = productions.get(session_id)
+    unit = units.get(session_id)
+    if production is not None:
+        kind: Literal["showrunner", "unit", "seat", "top-level"] = "showrunner"
+        slug, doc = production.slug, production.doc
+    elif unit is not None:
+        kind = "unit"
+        slug, doc = unit.production, unit.doc
+    else:
+        kind = "seat" if record.get("kind") == "bg" else "top-level"
+        slug, doc = "", ""
+    return ListedSession(
+        session_id=session_id,
+        pid=pid,
+        proc_start=_string(record.get("procStart")),
+        name=name,
+        kind=kind,
+        config_dir=attributed.config_dir,
+        login=attributed.account.login,
+        production=slug,
+        doc=doc,
+    )
+
+
+def listing(login: str | None = None) -> list[ListedSession]:
+    """List membership without inspecting transcripts, worktrees or host resources."""
+    productions, runners = _registered_productions()
+    units = _unit_sessions(runners)
+    found: list[ListedSession] = []
+    for record in sessions.live_sessions():
+        entry = _listed_session(_session_file(record), productions, units)
+        if isinstance(entry, ListedSession) and (
+            login is None or entry.login.casefold() == login.casefold()
+        ):
+            found.append(entry)
+    return found
+
+
 def inventory(
     login: str,
     only: frozenset[str] = frozenset(),  # pyright: ignore[reportCallInDefaultInitializer]
     *, refresh_desktops: bool = True,
 ) -> Inventory:
-    """Return the live sessions safely attributable to ``login`` on this machine."""
+    """Return account sessions in ``only`` and their workers, or all when empty."""
     records = [_session_file(record) for record in sessions.live_sessions()]
+    productions, runners = _registered_productions()
+    units = _unit_sessions(runners)
     session_ids = {
         session_id
         for record in records
@@ -1346,72 +1444,60 @@ def inventory(
         if session_id
     }
     run_directories = _active_run_directories()
-    seat_owners = _seat_owners(run_directories, session_ids)
-    productions, runners = _registered_productions()
-    units = _unit_sessions(runners)
-    plans = _newest_unit_plans()
-    desktops = _snapshot_desktops() if refresh_desktops else _snapshot_desktops(refresh=False)
+    worker_owners = _worker_owners(run_directories, session_ids)
     wanted_login = login.casefold()
+    candidates = [
+        (record, _listed_session(record, productions, units))
+        for record in records
+        if not only or _string(record.get("sessionId")) in only
+        or worker_owners.get(_string(record.get("sessionId"))) in only
+    ]
+    has_sessions = any(
+        isinstance(entry, ListedSession) and entry.login.casefold() == wanted_login
+        for _, entry in candidates
+    )
+    plans = _newest_unit_plans() if has_sessions else {}
+    desktops = (
+        (_snapshot_desktops() if refresh_desktops else _snapshot_desktops(refresh=False))
+        if has_sessions else {}
+    )
     found: list[Session] = []
     unattributed: list[UnattributedSession] = []
 
-    for record in records:
-        pid = record.get("pid", 0)
-        session_id = _string(record.get("sessionId"))
-        name = _string(record.get("name"))
-        owner = seat_owners.get(session_id)
-        selected = not only or session_id in only or owner in only
-        if not selected:
+    for record, entry in candidates:
+        if not isinstance(entry, ListedSession):
+            unattributed.append(entry)
             continue
-        if not _record_matches_process(record):
-            unattributed.append(
-                {"pid": pid, "name": name, "reason": "process start mismatch"}
-            )
-            continue
-        attributed = _configuration_for_session(pid)
-        if isinstance(attributed, UnreadableSessionConfiguration):
-            unattributed.append(
-                {"pid": pid, "name": name, "reason": "account unreadable"}
-            )
-            continue
-        if attributed.account.login.casefold() != wanted_login:
+        if entry.login.casefold() != wanted_login:
             continue
 
-        production = productions.get(session_id)
+        session_id = entry.session_id
+        owner = worker_owners.get(session_id)
         unit = units.get(session_id)
-        raw_kind = _string(record.get("kind"))
-        if production is not None:
-            kind: Literal["showrunner", "unit", "seat", "top-level"] = "showrunner"
-        elif unit is not None:
-            kind = "unit"
-        elif raw_kind == "bg":
-            kind = "seat"
-        else:
-            kind = "top-level"
+        kind = entry.kind
         directories = run_directories.get(session_id, [])
         cwd = _string(record.get("cwd"))
         common: dict[str, object] = {
             "session_id": session_id,
-            "pid": pid,
-            "proc_start": _string(record.get("procStart")),
-            "name": name,
+            "pid": entry.pid,
+            "proc_start": entry.proc_start,
+            "name": entry.name,
             "cwd": cwd,
-            "config_dir": str(attributed.config_dir),
+            "config_dir": str(entry.config_dir),
             "status": _string(record.get("status"), "unknown"),
-            "model": _model(session_id),
+            "model": _model(session_id, entry.config_dir),
             "checkout": _checkout(cwd),
             "run_dirs": [str(directory) for directory in directories],
             "codex_servers": _codex_servers(directories),
             "timers": _timers(session_id),
         }
         if kind == "showrunner":
-            assert production is not None
             value = {
                 **common,
                 "kind": "showrunner",
                 "host": _host(record, None, plans, desktops),
-                "production": production.slug,
-                "doc": production.doc,
+                "production": entry.production,
+                "doc": entry.doc,
             }
         elif kind == "unit":
             assert unit is not None

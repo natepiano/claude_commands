@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Tests for remove_seats.py against a stub `claude` binary."""
+"""Tests for remove_workers.py against a stub `claude` binary."""
 
 from __future__ import annotations
 
@@ -14,9 +14,9 @@ from pathlib import Path
 from typing import cast, override
 from unittest.mock import patch
 
-from scripts.delegate import remove_seats
+from scripts.delegate import remove_workers
 
-SCRIPT = Path(__file__).parent / "remove_seats.py"
+SCRIPT = Path(__file__).parent / "remove_workers.py"
 
 # `agents --json` prints the rows file; `rm <id>` records the id. A missing
 # rows file makes the listing fail, the way an unreachable daemon would.
@@ -36,11 +36,11 @@ LEGACY_DEAD = "c1596298-9325-4c8b-961a-ba976e73a3f5"
 LEGACY_LIVE = "d2222222-2222-2222-2222-222222222222"
 
 
-def row(seat_id: str, name: str, kind: str = "background") -> dict[str, str]:
-    return {"id": seat_id, "sessionId": f"{seat_id}-full", "kind": kind, "name": name}
+def row(worker_id: str, name: str, kind: str = "background") -> dict[str, str]:
+    return {"id": worker_id, "sessionId": f"{worker_id}-full", "kind": kind, "name": name}
 
 
-class RemoveSeatsTest(unittest.TestCase):
+class RemoveWorkersTest(unittest.TestCase):
     temporary: tempfile.TemporaryDirectory[str]  # pyright: ignore[reportUninitializedInstanceVariable]
     root: Path  # pyright: ignore[reportUninitializedInstanceVariable]
     removed: Path  # pyright: ignore[reportUninitializedInstanceVariable]
@@ -73,11 +73,11 @@ class RemoveSeatsTest(unittest.TestCase):
     def tearDown(self) -> None:
         self.temporary.cleanup()
 
-    def run_dir(self, name: str, seats: list[str], orchestrator: str | None = None) -> Path:
+    def run_dir(self, name: str, workers: list[str], orchestrator: str | None = None) -> Path:
         run = self.root / name
         run.mkdir()
-        _ = (run / "seats").write_text(
-            "".join(f"{seat}\tproject-{seat}\n" for seat in seats), encoding="utf-8"
+        _ = (run / "workers").write_text(
+            "".join(f"{worker}\tproject-{worker}\n" for worker in workers), encoding="utf-8"
         )
         if orchestrator is not None:
             _ = (self.root / "active" / orchestrator).write_text(f"{run}\n", encoding="utf-8")
@@ -128,7 +128,7 @@ class RemoveSeatsTest(unittest.TestCase):
             json.dumps(record), encoding="utf-8"
         )
 
-    def run_remove_seats(
+    def run_remove_workers(
         self, session_dir: Path | None = None, caller: str = ""
     ) -> tuple[subprocess.CompletedProcess[str], list[str]]:
         environment = os.environ.copy()
@@ -153,8 +153,8 @@ class RemoveSeatsTest(unittest.TestCase):
         )
         return result, sorted(removed)
 
-    def remove_seats(self, session_dir: Path | None = None, caller: str = "") -> tuple[int, list[str]]:
-        result, removed = self.run_remove_seats(session_dir, caller)
+    def remove_workers(self, session_dir: Path | None = None, caller: str = "") -> tuple[int, list[str]]:
+        result, removed = self.run_remove_workers(session_dir, caller)
         return result.returncode, sorted(removed)
 
     def test_named_owner_config_dir_is_inherited_by_listing_and_removal(self) -> None:
@@ -163,7 +163,7 @@ class RemoveSeatsTest(unittest.TestCase):
         self.list_rows([row("own1", "p-impl")])
         config_dir = str(Path.home() / "account with 'quotes' and $()")
         with patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": config_dir}):
-            self.assertEqual(self.remove_seats(own), (0, ["own1"]))
+            self.assertEqual(self.remove_workers(own), (0, ["own1"]))
         self.assertEqual(
             self.account_log.read_text(encoding="utf-8").splitlines(),
             [f"agents\t{config_dir}", f"rm\t{config_dir}"],
@@ -173,23 +173,31 @@ class RemoveSeatsTest(unittest.TestCase):
         """F006: a default owner passes no account-directory assignment."""
         own = self.run_dir("own", ["own1"], orchestrator=ORCHESTRATOR)
         self.list_rows([row("own1", "p-impl")])
-        self.assertEqual(self.remove_seats(own), (0, ["own1"]))
+        self.assertEqual(self.remove_workers(own), (0, ["own1"]))
         self.assertEqual(
             self.account_log.read_text(encoding="utf-8").splitlines(),
             ["agents\t<unset>", "rm\t<unset>"],
         )
 
+    def test_cleanup_reads_an_old_run_ledger_and_keeps_its_shared_link(self) -> None:
+        own = self.run_dir("old-run", ["old-worker"], orchestrator=ORCHESTRATOR)
+        _ = (own / "workers").rename(own / "seats")
+        self.list_rows([row("old-worker", "p-impl")])
+        self.assertEqual(self.remove_workers(own), (0, ["old-worker"]))
+        self.assertTrue((own / "seats").samefile(own / "workers"))
+        self.assertEqual((own / "workers").read_text(), "old-worker\tproject-old-worker\n")
+
     def test_own_run_goes_even_while_live(self) -> None:
         own = self.run_dir("own", ["own1", "own2"], orchestrator=ORCHESTRATOR)
         self.list_rows([row("own1", "p-impl"), row("own2", "p-test")])
-        self.assertEqual(self.remove_seats(own), (0, ["own1", "own2"]))
+        self.assertEqual(self.remove_workers(own), (0, ["own1", "own2"]))
 
     def test_live_run_is_kept_and_dead_runs_are_swept(self) -> None:
         _ = self.run_dir("live", ["live1"], orchestrator=ORCHESTRATOR)
         _ = self.run_dir("orphaned", ["orph1"], orchestrator=GONE_ORCHESTRATOR)
         _ = self.run_dir("ended", ["end1"])
         self.list_rows([row("live1", "a-impl"), row("orph1", "b-impl"), row("end1", "c-test")])
-        self.assertEqual(self.remove_seats(), (0, ["end1", "orph1"]))
+        self.assertEqual(self.remove_workers(), (0, ["end1", "orph1"]))
 
     def test_fresh_heartbeat_keeps_a_run_without_a_marker(self) -> None:
         fresh = self.run_dir("fresh", ["fresh1"])
@@ -199,7 +207,7 @@ class RemoveSeatsTest(unittest.TestCase):
         hour_ago = time.time() - 3600
         os.utime(stale / "heartbeat.log", (hour_ago, hour_ago))
         self.list_rows([row("fresh1", "a-impl"), row("stale1", "b-impl")])
-        self.assertEqual(self.remove_seats(), (0, ["stale1"]))
+        self.assertEqual(self.remove_workers(), (0, ["stale1"]))
 
     def test_legacy_names_follow_their_run(self) -> None:
         _ = self.run_dir(LEGACY_LIVE, [], orchestrator=ORCHESTRATOR)
@@ -208,21 +216,21 @@ class RemoveSeatsTest(unittest.TestCase):
             row("old2", f"{LEGACY_DEAD}-impl"),
             row("kept", f"{LEGACY_LIVE}-impl"),
         ])
-        self.assertEqual(self.remove_seats(), (0, ["old1", "old2"]))
+        self.assertEqual(self.remove_workers(), (0, ["old1", "old2"]))
 
-    def test_only_listed_background_seats_go(self) -> None:
+    def test_only_listed_background_workers_go(self) -> None:
         _ = self.run_dir("ended", ["gone1", "inter1"])
         self.list_rows([row("inter1", "someone", kind="interactive"), row("friend", "a-friend")])
-        self.assertEqual(self.remove_seats(), (0, []))
+        self.assertEqual(self.remove_workers(), (0, []))
 
     def test_never_removes_the_calling_session(self) -> None:
-        _ = self.run_dir("ended", ["self", "seat"])
-        self.list_rows([row("self", "orchestrator"), row("seat", "p-impl")])
-        self.assertEqual(self.remove_seats(caller="self-full"), (0, ["seat"]))
+        _ = self.run_dir("ended", ["self", "worker"])
+        self.list_rows([row("self", "orchestrator"), row("worker", "p-impl")])
+        self.assertEqual(self.remove_workers(caller="self-full"), (0, ["worker"]))
 
     def test_failed_listing_removes_nothing(self) -> None:
         _ = self.run_dir("ended", ["end1"])
-        self.assertEqual(self.remove_seats(), (1, []))
+        self.assertEqual(self.remove_workers(), (1, []))
 
     def test_failed_session_listing_never_runs_the_destructive_server_sweep(self) -> None:
         own = self.root / "own"
@@ -234,11 +242,11 @@ class RemoveSeatsTest(unittest.TestCase):
             os.fspath(self.root),
         ]
         with patch.object(sys, "argv", arguments), \
-                patch.object(remove_seats, "DEFAULT_ROOT", self.root), \
-                patch.object(remove_seats, "claude_bin", return_value=os.fspath(self.claude)), \
-                patch.object(remove_seats, "list_sessions", return_value=None), \
-                patch.object(remove_seats, "sweep_app_servers") as sweep:
-            result = remove_seats.main()
+                patch.object(remove_workers, "DEFAULT_ROOT", self.root), \
+                patch.object(remove_workers, "claude_bin", return_value=os.fspath(self.claude)), \
+                patch.object(remove_workers, "list_sessions", return_value=None), \
+                patch.object(remove_workers, "sweep_app_servers") as sweep:
+            result = remove_workers.main()
 
         self.assertEqual(result, 1)
         sweep.assert_not_called()
@@ -248,7 +256,7 @@ class RemoveSeatsTest(unittest.TestCase):
             ["shutdown", "held-sessions"], 0, "first\n\nsecond\n", ""
         )
         with patch.object(subprocess, "run", return_value=completed):
-            result = remove_seats.shutdown_held_sessions()
+            result = remove_workers.shutdown_held_sessions()
 
         self.assertEqual(
             result,
@@ -260,7 +268,7 @@ class RemoveSeatsTest(unittest.TestCase):
             ["shutdown", "held-sessions"], 2, "", "bad state\n"
         )
         with patch.object(subprocess, "run", return_value=completed):
-            result = remove_seats.shutdown_held_sessions()
+            result = remove_workers.shutdown_held_sessions()
 
         self.assertEqual(
             result,
@@ -272,12 +280,12 @@ class RemoveSeatsTest(unittest.TestCase):
 
     def test_environment_cannot_replace_shutdown_command(self) -> None:
         with patch.dict(
-            os.environ, {"REMOVE_SEATS_SHUTDOWN_COMMAND": "/tmp/not-shutdown"}
+            os.environ, {"REMOVE_WORKERS_SHUTDOWN_COMMAND": "/tmp/not-shutdown"}
         ):
-            command = remove_seats.shutdown_command()
+            command = remove_workers.shutdown_command()
 
         self.assertEqual(
-            command, [sys.executable, str(remove_seats.SHUTDOWN)]
+            command, [sys.executable, str(remove_workers.SHUTDOWN)]
         )
 
     def test_down_shutdown_record_keeps_its_directors_run(self) -> None:
@@ -285,14 +293,14 @@ class RemoveSeatsTest(unittest.TestCase):
         self.write_shutdown_record(GONE_ORCHESTRATOR, "down")
         self.list_rows([row("held1", "held-test")])
 
-        self.assertEqual(self.remove_seats(), (0, []))
+        self.assertEqual(self.remove_workers(), (0, []))
 
     def test_restarting_shutdown_record_keeps_its_directors_run(self) -> None:
         _ = self.run_dir("held", ["held1"], orchestrator=GONE_ORCHESTRATOR)
         self.write_shutdown_record(GONE_ORCHESTRATOR, "restarting")
         self.list_rows([row("held1", "held-test")])
 
-        self.assertEqual(self.remove_seats(), (0, []))
+        self.assertEqual(self.remove_workers(), (0, []))
 
     def test_unreadable_shutdown_state_keeps_every_active_run(self) -> None:
         _ = self.run_dir("first", ["first1"], orchestrator=GONE_ORCHESTRATOR)
@@ -304,7 +312,7 @@ class RemoveSeatsTest(unittest.TestCase):
             [row("first1", "first-test"), row("second1", "second-test")]
         )
 
-        result, removed = self.run_remove_seats()
+        result, removed = self.run_remove_workers()
 
         self.assertEqual(result.returncode, 0)
         self.assertEqual(removed, [])

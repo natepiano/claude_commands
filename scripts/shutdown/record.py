@@ -93,7 +93,7 @@ class NotReadyToStop(TypedDict):
     kind: Literal["not ready to stop"]
     at: str
     status: str
-    progress: Literal["waiting", "ready", "held by usage limit", "passive seat ready"]
+    progress: Literal["waiting", "ready", "held by usage limit", "passive worker ready"]
 
 
 class StillRunningAfterStop(TypedDict):
@@ -107,8 +107,8 @@ class AccountUnreadableAtStop(TypedDict):
     at: str
 
 
-class _LegacySeatStillLive(TypedDict):
-    kind: Literal["seat still live"]
+class _LegacyWorkerStillLive(TypedDict):
+    kind: Literal["worker still live"]
     at: str
 
 
@@ -159,7 +159,7 @@ class _LegacyMachineStopFailed(TypedDict):
 
 
 _LegacyOrchestrationIssue = _LegacyStopClaimFailed | _LegacyMachineStopFailed
-_LegacyStopIssue = SessionStopIssue | _LegacySeatStillLive | _LegacyOrchestrationIssue
+_LegacyStopIssue = SessionStopIssue | _LegacyWorkerStillLive | _LegacyOrchestrationIssue
 
 
 class ShowrunnerFooter(TypedDict):
@@ -222,8 +222,8 @@ class SessionHeldByUsageLimit(TypedDict):
     at: str
 
 
-class _LegacyPassiveSeatReady(TypedDict):
-    kind: Literal["passive seat ready"]
+class _LegacyPassiveWorkerReady(TypedDict):
+    kind: Literal["passive worker ready"]
     at: str
 
 
@@ -275,8 +275,8 @@ class SessionRestoredTimersPending(TypedDict):
     timers: list[PendingTimer]
 
 
-class _LegacySeatAvailable(TypedDict):
-    kind: Literal["seat available on demand"]
+class _LegacyWorkerAvailable(TypedDict):
+    kind: Literal["worker available on demand"]
     at: str
 
 
@@ -314,8 +314,8 @@ class _LegacySessionEntry(TypedDict):
     timers: list[TimerRestore]
     settle_message: SettleMessage
     where: Where
-    progress: SessionProgress | _LegacyPassiveSeatReady | _LegacySeatAvailable
-    stop_issues: list[SessionStopIssue | _LegacySeatStillLive]
+    progress: SessionProgress | _LegacyPassiveWorkerReady | _LegacyWorkerAvailable
+    stop_issues: list[SessionStopIssue | _LegacyWorkerStillLive]
 
 
 _LegacyState = Literal[
@@ -428,7 +428,7 @@ _PROGRESS_WITH_TIME = frozenset(
     {
         "ready",
         "held by usage limit",
-        "passive seat ready",
+        "passive worker ready",
         "stopped",
         "stopping",
         "already gone",
@@ -437,7 +437,7 @@ _PROGRESS_WITH_TIME = frozenset(
         "restarted",
         "restarting",
         "timers pending",
-        "seat available on demand",
+        "worker available on demand",
         "restart failed",
     }
 )
@@ -610,7 +610,7 @@ def _where(value: object, place: str) -> Where:
     return cast(Where, cast(object, values))
 
 
-def _progress(value: object, place: str, *, legacy: bool = False) -> SessionProgress | _LegacyPassiveSeatReady | _LegacySeatAvailable:
+def _progress(value: object, place: str, *, legacy: bool = False) -> SessionProgress | _LegacyPassiveWorkerReady | _LegacyWorkerAvailable:
     values = _mapping(value, place)
     kind = _kind(
         values,
@@ -619,7 +619,7 @@ def _progress(value: object, place: str, *, legacy: bool = False) -> SessionProg
     )
     if kind in _PROGRESS_WITH_TIME:
         _ = _utc_time(_required(values, "at", place), f"{place}.at")
-    if kind in {"passive seat ready", "seat available on demand"} and not legacy:
+    if kind in {"passive worker ready", "worker available on demand"} and not legacy:
         raise InvalidRecord(f"{place}.kind is invalid")
     if kind == "restarting":
         prior = _progress(_required(values, "prior", place), f"{place}.prior")
@@ -657,7 +657,7 @@ def _stop_issue_fields(
     return values, kind
 
 
-def _session_stop_issue(value: object, place: str, *, legacy: bool = False) -> SessionStopIssue | _LegacySeatStillLive:
+def _session_stop_issue(value: object, place: str, *, legacy: bool = False) -> SessionStopIssue | _LegacyWorkerStillLive:
     values, kind = _stop_issue_fields(
         value,
         place,
@@ -666,21 +666,21 @@ def _session_stop_issue(value: object, place: str, *, legacy: bool = False) -> S
                 "not ready to stop",
                 "still running",
                 "account unreadable",
-                "seat still live",
+                "worker still live",
                 "codex server left running",
                 "unit tmux session left running",
                 "unit session left running",
             }
         ),
     )
-    if kind == "seat still live" and not legacy:
+    if kind == "worker still live" and not legacy:
         raise InvalidRecord(f"{place}.kind is invalid")
     if kind == "not ready to stop":
         _ = _string(_required(values, "status", place), f"{place}.status")
         progress = _string(
             _required(values, "progress", place), f"{place}.progress"
         )
-        if progress not in {"waiting", "ready", "held by usage limit", "passive seat ready"}:
+        if progress not in {"waiting", "ready", "held by usage limit", "passive worker ready"}:
             raise InvalidRecord(f"{place}.progress is invalid")
     elif kind == "still running":
         _ = _string(_required(values, "reason", place), f"{place}.reason")
@@ -807,7 +807,11 @@ def _read_record(path: Path) -> _LegacyShutdownRecord:
         value = cast(object, json.loads(text))
     except (ValueError, TypeError) as error:
         raise InvalidRecord(f"{path} is not valid JSON") from error
-    return _record(value, str(path))
+    changed = _worker_record_names(value)
+    checked = _record(value, str(path))
+    if changed:
+        _write_record(path, checked)
+    return checked
 
 
 def _entry_kind(mode: int) -> str:
@@ -837,7 +841,7 @@ def _lstat(path: Path) -> os.stat_result | None:
         raise InvalidRecord(f"{path} cannot be inspected: {error}") from error
 
 
-def _write_record(path: Path, record: _LegacyShutdownRecord | SessionShutdown | AccountHold) -> None:
+def _write_record(path: Path, record: object) -> None:
     descriptor, temporary_name = tempfile.mkstemp(
         prefix=".record.", suffix=".tmp", dir=path.parent
     )
@@ -977,23 +981,23 @@ def _session_shutdown(value: object, place: str) -> SessionShutdown:
     values["progress"] = _progress(values["progress"], f"{place}.progress")
     values["stop_issues"] = [_session_stop_issue(issue, f"{place}.stop_issues") for issue in fields["stop_issues"]]
     if fields["session"]["kind"] == "seat":
-        raise InvalidRecord(f"{place}.session must not be a seat")
+        raise InvalidRecord(f"{place}.session must not be a worker")
     _ = _session_filename(fields["session"]["session_id"])
-    seats = _items(_required(values, "seats", place), f"{place}.seats")
-    parsed_seats: list[Session] = []
-    for index, seat in enumerate(seats):
-        seat_place = f"{place}.seats[{index}]"
+    workers = _items(_required(values, "seats", place), f"{place}.seats")
+    parsed_workers: list[Session] = []
+    for index, worker in enumerate(workers):
+        worker_place = f"{place}.seats[{index}]"
         try:
-            parsed = parse_session(seat, seat_place)
+            parsed = parse_session(worker, worker_place)
         except ValueError as error:
             raise InvalidRecord(str(error)) from error
         if parsed["kind"] != "seat":
-            raise InvalidRecord(f"{seat_place} must be a seat")
+            raise InvalidRecord(f"{worker_place} must be a worker")
         owner = parsed["owner"]
         if owner["kind"] != "director" or owner["session_id"] != fields["session"]["session_id"]:
-            raise InvalidRecord(f"{seat_place}.owner must identify this session")
-        parsed_seats.append(parsed)
-    values["seats"] = parsed_seats
+            raise InvalidRecord(f"{worker_place}.owner must identify this session")
+        parsed_workers.append(parsed)
+    values["seats"] = parsed_workers
     for field in ("alerted_at", "form_alerted_at", "reasked_at"):
         if field in values:
             _ = _utc_time(values[field], f"{place}.{field}")
@@ -1039,9 +1043,39 @@ def _record_directory(path: Path, *, create: bool = False) -> bool:
     return True
 
 
+def _worker_record_names(value: object) -> bool:
+    """Convert names owned by shutdown; account session kinds remain unchanged."""
+    changed = False
+    if isinstance(value, dict):
+        fields = cast(dict[str, object], value)
+        for old, new in (("busy_seats", "busy_workers"),):
+            if old in fields:
+                if new not in fields:
+                    fields[new] = fields[old]
+                del fields[old]
+                changed = True
+        labels = {"passive seat ready": "passive worker ready",
+                  "seat available on demand": "worker available on demand",
+                  "seat still live": "worker still live"}
+        for name in ("kind", "progress"):
+            label = fields.get(name)
+            if isinstance(label, str) and label in labels:
+                fields[name] = labels[label]
+                changed = True
+        for item in fields.values():
+            changed = _worker_record_names(item) or changed
+    elif isinstance(value, list):
+        for item in cast(list[object], value):
+            changed = _worker_record_names(item) or changed
+    return changed
+
+
 def _read_json(path: Path) -> object:
     try:
-        return cast(object, json.loads(path.read_text(encoding="utf-8")))
+        value = cast(object, json.loads(path.read_text(encoding="utf-8")))
+        if _worker_record_names(value):
+            _write_record(path, value)
+        return value
     except (OSError, UnicodeError, ValueError) as error:
         raise InvalidRecord(f"{path} cannot be read: {error}") from error
 
@@ -1082,25 +1116,25 @@ def _legacy_account_records(directory: Path, login: str) -> list[_LegacyShutdown
 def _convert_session(record: _LegacyShutdownRecord, entry: _LegacySessionEntry) -> SessionShutdown:
     session = entry["session"]
     progress = entry["progress"]
-    if progress["kind"] == "passive seat ready" or progress["kind"] == "seat available on demand":
+    if progress["kind"] == "passive worker ready" or progress["kind"] == "worker available on demand":
         progress = SessionStopped(kind="stopped", at=progress["at"])
     if record["state"] == "restarting" and progress["kind"] != "restarted":
         progress = SessionStopped(kind="stopped", at=progress.get("at", record["requested_at"]))
-    seats: list[Session] = []
+    workers: list[Session] = []
     for candidate in record["entries"]:
-        seat = candidate["session"]
-        if seat["kind"] == "seat" and seat["owner"]["kind"] == "director":
-            if seat["owner"]["session_id"] == session["session_id"]:
-                seats.append(seat)
+        worker = candidate["session"]
+        if worker["kind"] == "seat" and worker["owner"]["kind"] == "director":
+            if worker["owner"]["session_id"] == session["session_id"]:
+                workers.append(worker)
     return SessionShutdown(
         login=record["login"], label=record["label"], machine=record["machine"],
         requested_at=record["requested_at"], requested_by=record["requested_by"],
         request_id=f"legacy-{record['machine']}-{record['requested_at']}",
         hold="account" if record["scope"]["kind"] == "all account sessions" else "session",
         then=_legacy_continuation(record), force=record["force"], alerts="user",
-        session=session, seats=seats, timers=entry["timers"],
+        session=session, seats=workers, timers=entry["timers"],
         settle_message=entry["settle_message"], where=entry["where"],
-        progress=cast(SessionProgress, cast(object, progress)), stop_issues=[issue for issue in entry["stop_issues"] if issue["kind"] != "seat still live"],
+        progress=cast(SessionProgress, cast(object, progress)), stop_issues=[issue for issue in entry["stop_issues"] if issue["kind"] != "worker still live"],
     )
 
 

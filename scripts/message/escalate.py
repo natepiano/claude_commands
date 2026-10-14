@@ -470,7 +470,7 @@ def due(now: float) -> list[Settled]:
         try:
             identity = codex_account(seats_home())
         except (OSError, ValueError):
-            identity = UnknownCodexAccount(Path.home() / ".codex", "seats identity cannot be read")
+            identity = UnknownCodexAccount(Path.home() / ".codex", "workers identity cannot be read")
         if isinstance(identity, KnownCodexAccount):
             _cancel_outgoing_codex_holds(identity.home, identity.login)
         seen = typed_at()

@@ -13,11 +13,52 @@ import tempfile
 from contextlib import closing
 from pathlib import Path
 from typing import Protocol, cast, final, override
+from unittest.mock import patch
 
 from scripts.usage import outcomes
 from scripts.usage.test_collect import (
     CollectorFixture, FIXTURES as COLLECT_FIXTURES, MacRun, MacStreamReport, SshBehavior,
 )
+
+
+class DefaultSourcesTests(unittest.TestCase):
+    def test_first_read_accepts_a_concurrent_baseline_conversion(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            state = home / ".local/state/usage-model"
+            previous = state / "seats-baseline"
+            previous.mkdir(parents=True)
+            _ = (previous / "readings-2026-10-10.jsonl").write_text("old reading\n")
+            rename = Path.rename
+
+            def convert_before_rename(path: Path, target: str | Path) -> Path:
+                _ = rename(path, target)
+                return rename(path, target)
+
+            with (patch.object(Path, "home", return_value=home),
+                  patch.object(Path, "rename", convert_before_rename)):
+                sources = outcomes.default_sources()
+                self.assertEqual(sources.baseline_readings.read_text(), "old reading\n")
+                self.assertEqual(sources.baseline_readings.parent, state / "workers-baseline")
+                self.assertFalse(previous.exists())
+                self.assertEqual(outcomes.default_sources(), sources)
+
+    def test_first_read_moves_the_old_baseline_and_later_reads_use_only_workers(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            state = home / ".local/state/usage-model"
+            previous = state / "seats-baseline"
+            previous.mkdir(parents=True)
+            _ = (previous / "readings-2026-10-10.jsonl").write_text("old reading\n")
+            with patch.object(Path, "home", return_value=home):
+                sources = outcomes.default_sources()
+                self.assertEqual(sources.baseline_readings.read_text(), "old reading\n")
+                self.assertEqual(sources.baseline_readings.parent, state / "workers-baseline")
+                self.assertFalse(previous.exists())
+                previous.mkdir()
+                _ = (previous / "readings-2026-10-10.jsonl").write_text("later old reading\n")
+                self.assertEqual(outcomes.default_sources(), sources)
+                self.assertEqual(sources.baseline_readings.read_text(), "old reading\n")
 
 
 FIXTURES = Path(__file__).with_name("fixtures") / "outcomes"
