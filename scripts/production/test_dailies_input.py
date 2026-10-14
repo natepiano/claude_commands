@@ -22,6 +22,7 @@ from dailies_input import (Activity, BevyUpgradeUnavailable, Block, ClaudeNotRun
 from unit_lookup import UnitState
 
 
+# Script completion deadlines only bound hangs; startup can be slow under load.
 SCRIPT = Path(__file__).with_name("dailies_input.py")
 RENDERER = SCRIPT.with_name("dailies_render.py")
 CI_POINTS = SCRIPT.with_name("ci_points.py")
@@ -379,13 +380,13 @@ class DailiesInputTests(unittest.TestCase):
     def run_merge_watch(self) -> subprocess.CompletedProcess[str]:
         return subprocess.run([sys.executable, str(CI_POINTS), "watch", "--production", str(self.doc),
                                "--state-dir", str(self.state)], cwd=self.checkout, env=self.env,
-                              capture_output=True, text=True, check=False, timeout=25)
+                              capture_output=True, text=True, check=False, timeout=300)
 
     def run_eta_request(self, phase: str = "Phase 2 of 3: panel labels stay clear") -> subprocess.CompletedProcess[str]:
         return subprocess.run([sys.executable, str(WAITING), "eta-request", ALPHA,
                                "--phase", phase, "--production", str(self.doc),
                                "--state-dir", str(self.state)], cwd=self.checkout, env=self.env,
-                              capture_output=True, text=True, check=False, timeout=25)
+                              capture_output=True, text=True, check=False, timeout=300)
 
     def rename_unit(self, name: str) -> None:
         for path in (self.doc, self.status, self.judgment):

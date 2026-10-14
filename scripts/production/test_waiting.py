@@ -7,6 +7,7 @@ import io
 import json
 import os
 import re
+import select
 import shlex
 import shutil
 import socket
@@ -37,6 +38,7 @@ import quota_alert
 from scripts.accounts.accounts import CodexSeatsAccount
 
 
+# Script completion deadlines only bound hangs; startup can be slow under load.
 SCRIPT = Path(__file__).with_name("waiting.py")
 CI_POINTS = SCRIPT.with_name("ci_points.py")
 ALPHA = "alpha-unit"
@@ -287,7 +289,7 @@ class WaitingTests(unittest.TestCase):
     def run_waiting(self, action: str, *args: str) -> subprocess.CompletedProcess[str]:
         return subprocess.run([sys.executable, str(SCRIPT), action, *args,
                                "--production", str(self.doc)], cwd=self.checkout, env=self.env,
-                              capture_output=True, text=True, check=False, timeout=25)
+                              capture_output=True, text=True, check=False, timeout=300)
 
     def commit(self, worktree: Path, relative: str, content: str) -> str:
         self.write(worktree / relative, content)
@@ -655,7 +657,7 @@ os.execv(os.environ["WAITING_TEST_REAL_GIT"], [os.environ["WAITING_TEST_REAL_GIT
     def test_parallel_eta_requests_for_different_phases_keep_every_record(self) -> None:
         phases = [f"Phase {number}: parallel record" for number in range(1, 13)]
         processes = [self.eta_request_process(phase) for phase in phases]
-        outputs = [process.communicate(timeout=25) for process in processes]
+        outputs = [process.communicate(timeout=300) for process in processes]
         for process, (stdout, stderr) in zip(processes, outputs):
             self.assertEqual(process.returncode, 0, stdout + stderr)
         seen = cast(dict[str, object], json.loads((self.state / "eta_seen.json").read_text()))
@@ -664,7 +666,7 @@ os.execv(os.environ["WAITING_TEST_REAL_GIT"], [os.environ["WAITING_TEST_REAL_GIT
 
     def test_parallel_eta_requests_for_one_phase_print_once(self) -> None:
         processes = [self.eta_request_process(PHASE) for _ in range(12)]
-        outputs = [process.communicate(timeout=25) for process in processes]
+        outputs = [process.communicate(timeout=300) for process in processes]
         for process, (stdout, stderr) in zip(processes, outputs):
             self.assertEqual(process.returncode, 0, stdout + stderr)
         self.assertEqual(sum(stdout.count(f"request /unit:eta: {ALPHA}")
@@ -673,14 +675,56 @@ os.execv(os.environ["WAITING_TEST_REAL_GIT"], [os.environ["WAITING_TEST_REAL_GIT
         self.assertEqual(seen, {f"{ALPHA}|{PHASE}": {"requested": True}})
 
     def test_eta_request_waits_for_its_state_lock(self) -> None:
+        # The child proves it reached the held lock, rather than racing startup
+        # against a short wait(). Keep the real blocking flock after the signal.
+        program = """import fcntl, os, runpy, sys
+ready = int(sys.argv.pop(1))
+sys.argv.pop(0)
+original = fcntl.flock
+def observed_lock(fd, operation):
+    if operation == fcntl.LOCK_EX:
+        try:
+            original(fd, operation | fcntl.LOCK_NB)
+        except BlockingIOError:
+            os.write(ready, b'blocked')
+        else:
+            raise RuntimeError('expected the parent to hold the state lock')
+    return original(fd, operation)
+fcntl.flock = observed_lock
+sys.path.insert(0, os.path.dirname(sys.argv[0]))
+runpy.run_path(sys.argv[0], run_name='__main__')
+"""
         lock_path = self.state / "eta_seen.json.lock"
-        with lock_path.open("a+") as lock:
-            fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
-            process = self.eta_request_process(PHASE)
-            with self.assertRaises(subprocess.TimeoutExpired):
-                _ = process.wait(timeout=0.5)
-            fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
-            stdout, stderr = process.communicate(timeout=25)
+        read_ready, write_ready = os.pipe()
+        try:
+            with lock_path.open("a+") as lock:
+                fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+                process = subprocess.Popen(
+                    [sys.executable, "-c", program, str(write_ready), str(SCRIPT),
+                     "eta-request", ALPHA, "--phase", PHASE,
+                     "--production", str(self.doc), "--state-dir", str(self.state)],
+                    cwd=self.checkout, env=self.env, pass_fds=(write_ready,),
+                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                )
+                os.close(write_ready)
+                write_ready = -1
+                try:
+                    readable, _, _ = select.select([read_ready], [], [], 300)
+                    self.assertEqual(readable, [read_ready], "child never reached the held lock")
+                    if os.read(read_ready, 7) != b"blocked":
+                        stdout, stderr = process.communicate(timeout=300)
+                        self.fail("child exited before observing the state lock: " + stdout + stderr)
+                    self.assertIsNone(process.poll())
+                    fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+                    stdout, stderr = process.communicate(timeout=300)
+                finally:
+                    if process.poll() is None:
+                        process.kill()
+                    _ = process.communicate(timeout=300)
+        finally:
+            os.close(read_ready)
+            if write_ready != -1:
+                os.close(write_ready)
         self.assertEqual(process.returncode, 0, stdout + stderr)
         self.assertIn(f"request /unit:eta: {ALPHA}", stdout)
 

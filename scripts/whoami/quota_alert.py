@@ -257,12 +257,7 @@ def _selection(value: ClaudeAccountsInUse | ReadCurrentClaudeSelection) -> Claud
     return value
 
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-# Direct script execution and unittest discovery import this as a top-level module.
-if __package__ in (None, ""):
-    __package__ = "scripts.whoami"
-
-from ..production.showrunners import (
+from scripts.production.showrunners import (
     CONFIG as CONFIG,
     Showrunner as Showrunner,
     ShowrunnerSettings as ShowrunnerSettings,

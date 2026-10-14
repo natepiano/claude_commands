@@ -90,7 +90,7 @@ A test that pins a behaviour a user or another script depends on is not trivial,
 
 **Gotchas:** a suite started in the background of a non-interactive shell inherits SIGINT ignored, and bash cannot forward a signal it ignores; any test that sends a signal to a child restores `SIG_DFL` before exec.
 
-### Phase 2 — One committed gate command runs the suites in parallel  · status: todo
+### Phase 2 — One committed gate command runs the suites in parallel  · status: done
 
 **Depends on:** Phase 1
 

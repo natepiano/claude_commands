@@ -12,6 +12,9 @@ from pathlib import Path
 from typing import cast, override
 from unittest import mock
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "herdr"))
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "message"))
+
 import fake_tmux
 import herdr
 import session_pane

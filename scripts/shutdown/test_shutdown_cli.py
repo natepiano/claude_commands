@@ -160,6 +160,26 @@ class ShutdownLaunchCliTests(ShutdownTestCase):
         if self.state.exists():
             shutil.rmtree(self.state)
 
+    def test_quota_notice_and_import_modes_preserve_module_package_metadata(self) -> None:
+        quota = Path(__file__).resolve().parents[1] / "whoami/quota_alert.py"
+        for mode in ("script", "quota_alert", "scripts.whoami.quota_alert"):
+            with self.subTest(mode=mode):
+                command = [sys.executable, "-Wdefault"]
+                if mode == "script":
+                    command.extend((str(quota), "notice"))
+                else:
+                    command.extend(("-c", "import importlib, sys; "
+                        + f"sys.path.insert(0, {str(quota.parent)!r}); "
+                        + f"sys.path.insert(0, {str(quota.parents[2])!r}); "
+                        + f"module = importlib.import_module({mode!r}); "
+                        + "assert module.__package__ == module.__spec__.parent"))
+                result = subprocess.run(command, capture_output=True, text=True, check=False,
+                    timeout=10, cwd=self.root,
+                    env={**self.environment, "XDG_STATE_HOME": str(self.root / "state")})
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertEqual(result.stderr, "")
+                self.assertEqual(result.stdout, "")
+
     def run_cli(self, *arguments: str) -> tuple[int, str, str]:
         output = io.StringIO()
         error = io.StringIO()
