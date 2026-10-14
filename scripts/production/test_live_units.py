@@ -117,7 +117,7 @@ class LiveUnitsTests(unittest.TestCase):
         self.claude("native-claude", "")
         result = self.run_script()
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(result.stdout, "alpha-unit\t\tlive\tnative-claude\n")
+        self.assertEqual(result.stdout, "alpha-unit\therdr:native:w1:p1\tlive\tnative-claude\n")
 
     def test_a_doc_that_still_has_the_session_column_lists_the_same_units(self) -> None:
         self.write_doc(OLD_HEADER,

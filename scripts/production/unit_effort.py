@@ -3,9 +3,9 @@
 
 Usage: unit_effort.py <level> [--check]
 
-Every unit director on this machine, whatever its production, is found by the marks on its tmux
-session (`unit_lookup.every_marked_unit`, the enumeration the account swap reads too). Each gets
-`/effort <level>` typed into its pane and Enter as a separate call, never C-c or Escape; typing
+Every unit director on this machine, whatever its production, is found by its host's marks
+(`unit_lookup.every_marked_unit`, the enumeration the account swap reads too). Each gets
+`/effort <level>` through the host's typing interface, never C-c or Escape; typing
 while it is mid-turn is fine. A pane showing a form, prompt or menu, or a draft in its input line,
 is skipped and reported. The registry's `production.director` row keeps its model and takes the
 level, through agent_admin.sh, before anything is typed. `--check` sends nothing and changes nothing.
@@ -19,6 +19,7 @@ from pathlib import Path
 from typing import NamedTuple
 
 import unit_lookup
+from session_pane import HerdrFailure, read_place, type_place
 
 AGENTS = Path(__file__).resolve().parents[1] / "agents"
 ROW = "production.director"
@@ -75,14 +76,6 @@ def set_row(model: str, level: str) -> str:
         return ""
     errors = [line for line in done.stderr.splitlines() if line.startswith("ERROR:")]
     return errors[0] if errors else f"agent_admin.sh exit {done.returncode}"
-
-
-def _tmux(*arguments: str) -> subprocess.CompletedProcess[str]:
-    try:
-        binary = unit_lookup.tmux_binary()
-    except subprocess.CalledProcessError as error:
-        raise OSError(f"no tmux to run: {error}") from error
-    return subprocess.run([binary, *arguments], capture_output=True, text=True, check=False)
 
 
 def _sgr(parameters: str, dim: bool, inverse: bool) -> tuple[bool, bool]:
@@ -154,12 +147,12 @@ def verdict(capture: str) -> Ready | Skipped:
     return Ready()
 
 
-def send(pane: str, level: str) -> str:
+def send(place: unit_lookup.Place, level: str) -> str:
     """Type `/effort <level>` into the pane, then Enter; the empty string when both took, else why not."""
-    for keys in (("-l", f"/effort {level}"), ("Enter",)):
-        done = _tmux("send-keys", "-t", pane, *keys)
-        if done.returncode != 0:
-            return done.stderr.strip() or f"tmux exit {done.returncode}"
+    try:
+        type_place(place, f"/effort {level}")
+    except (OSError, HerdrFailure) as error:
+        return str(error)
     return ""
 
 
@@ -168,15 +161,16 @@ def _director_line(marked: unit_lookup.MarkedUnit, level: str, check: bool) -> s
     if isinstance(claude, unit_lookup.ClaudeUnknown):
         return f"{marked.unit}: skipped — cannot tell whether Claude runs: {claude.reason}"
     name = claude.name if isinstance(claude, unit_lookup.LiveClaude) and claude.name else marked.unit
-    captured = _tmux("capture-pane", "-p", "-e", "-t", marked.pane)
-    if captured.returncode != 0:
-        return f"{name}: skipped — its pane could not be read: {captured.stderr.strip()}"
-    judged = verdict(captured.stdout)
+    try:
+        captured = read_place(marked.place, ansi=True)
+    except (OSError, HerdrFailure) as error:
+        return f"{name}: skipped — its pane could not be read: {error}"
+    judged = verdict(captured)
     if isinstance(judged, Skipped):
         return f"{name}: skipped — {judged.reason}"
     if check:
         return f"{name}: would send"
-    problem = send(marked.pane, level)
+    problem = send(marked.place, level)
     return f"{name}: NOT sent — {problem}" if problem else f"{name}: sent"
 
 

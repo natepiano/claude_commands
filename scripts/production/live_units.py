@@ -95,7 +95,8 @@ def main(arguments: list[str]) -> int:
         claude = unit.session.claude if unit.session is not None else None
         running = ("gone" if unit.session is None else "live" if isinstance(claude, unit_lookup.LiveClaude)
                    else "unknown" if isinstance(claude, unit_lookup.ClaudeUnknown) else "stopped")
-        print("\t".join((unit.unit, unit.session.pane if unit.session is not None else "", running, unit.name)))
+        print("\t".join((unit.unit, unit_lookup.place_text(unit.session.place) if unit.session is not None else "",
+                         running, unit.name)))
     return 0
 
 
