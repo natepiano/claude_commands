@@ -72,9 +72,28 @@ opening in <ReviewPromptContract/>.
    reply. A repair seat per <FixDispatch/> has no peer: its `## Team` carries
    its file set, the other repair seats' files as read only, and the token
    prohibition.
+
 5. `## Project Context`.
 6. `## Work Specification`.
    For seats writing tests, carry: "Do not write trivial tests that cannot fail for a real defect: assertions of a constant, literal or default against itself, implementation repetition, tests of the standard library or a mock they configure, name-existence or import-only checks, or duplicates of another test; a test that pins behaviour a user or another script depends on is not trivial."
+
+   Every repair prompt's Work Specification also carries these fixing rules inline:
+
+   - Remove dead code; do not mark it as dead to silence a warning.
+   - Remove an unused binding; do not prefix its name with `_`.
+   - Before a rename or signature change, use LSP `findReferences` to find
+     every reference and update each affected reference. Reread the changed
+     body afterwards.
+   - Before fixing a clippy lint, find its governing style rule with:
+
+     ```bash
+     grep -l "^lint:.*\b<lint>\b" ~/rust/nate_style/rust/*.md docs/style/*.md
+     ```
+
+     Read each matching rule, apply it, and cite its file in the fix summary.
+     If none matches, report that no style-guide rule governs the lint and
+     choose the fix from the finding and surrounding code.
+   - On a `cargo mend --fix` rollback, stop and keep the tree for inspection.
 7. `## Type Design Contract` per <TypeDesignContract/>. Copy it verbatim in an
    opening prompt. A follow-up may instead say: `Read
    ~/.claude/docs/type_design.md in full and apply its Type Design Contract to
