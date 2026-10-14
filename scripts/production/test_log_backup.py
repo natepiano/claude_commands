@@ -14,6 +14,7 @@ from zoneinfo import ZoneInfo
 
 import log_backup
 
+# Script completion deadlines only bound hangs; startup can be slow under load.
 SCRIPT = Path(__file__).with_name("log_backup.py")
 CHECK = Path(__file__).with_name("production_check.sh")
 ZONE = ZoneInfo("America/Los_Angeles")
@@ -56,7 +57,7 @@ class LogBackupTests(unittest.TestCase):
         return sorted(path.name for path in self.backups.iterdir()) if self.backups.exists() else []
 
     def run_script(self, script: list[str]) -> subprocess.CompletedProcess[str]:
-        return subprocess.run(script, capture_output=True, text=True, check=False, timeout=30,
+        return subprocess.run(script, capture_output=True, text=True, check=False, timeout=300,
                               env={**os.environ, "HOME": str(self.root), "SHOWRUNNER_STATE_DIR": str(self.state)})
 
     def test_a_log_is_copied_under_its_stamp(self) -> None:

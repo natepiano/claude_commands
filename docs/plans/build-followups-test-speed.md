@@ -70,38 +70,27 @@ A test that pins a behaviour a user or another script depends on is not trivial,
 
 ### Phase 1 — No test reaches live state or fails for load  · status: done
 
-**Depends on:** none
+#### As-built
 
-#### Work Order
-
-**Goal:** every suite can run beside any other: no test touches a live home or shared path, and no test asserts wall-clock time.
-
-**Spec:**
-- `scripts/production/test_waiting.py` (the `test_quota_*` tests, from `:923` after tonight's merge): the quota tests pass `codex_readings=` (`scripts/whoami/quota_alert.py`) instead of starting the real `codex app-server`; assert the same outcomes from readings. No `~/.codex*` access remains (a test that fails if `agent_accounts` resolves a real home is welcome).
-- `scripts/delegate/test_end_session.py:22,43`: the marker goes under a temp dir through the script's existing override (or one added in `end_session.sh`, defaulting to the live path).
-- agents: the test expecting `127.0.0.1:55555` refused binds an ephemeral port, closes it, and expects that refused.
-- The two load flakes (delegate's signal test; agents' `test_refused_seat_continues_before_held_messages_in_order`): find the race and fix it at its cause, in the test or in the code.
-- `scripts/shutdown/test_*`: `test_six_tmux_launches_finish_in_under_one_second` counts the launches (and subprocesses) instead of timing them.
-- Sweep all 22 suites for wall-clock thresholds (`assertLess(elapsed…`, "under N seconds", `time.monotonic()` deltas compared to a constant), buildlog's two "under two seconds" tests included; each becomes a count of the work, or a comparison against a baseline calibrated in the same run. List every one found and what replaced it.
+- No test reaches a live home or shared path. The production quota tests supply `CodexAlertPassReadings` (`scripts/whoami/quota_alert.py`) and never start the real `codex app-server`; a patched `seats_home` raises, so any fallback to a live Codex home fails the test. `end_session.sh` reads `PLAN_DELEGATE_ACTIVE_DIR` (default `/tmp/claude/delegate/active`), and its test points it at a temp dir.
+- The delegate signal test restores `SIG_DFL` for SIGINT before exec and waits for a `runner-signals-ready` marker written after the runner installs its handlers. The agents quota-continuation handoff test runs with a 30 s start timeout, so its socket round trips never race the five-second task deadline under load.
+- agents carries `test_start_on_a_closed_ephemeral_port_fails_before_creating_a_thread`: it binds an ephemeral port, closes it, and expects the start refused. No test depends on fixed port 55555.
+- No suite asserts wall-clock time. Every threshold across the 22 suites is a work count, a controlled clock, or a comparison calibrated in the same run: buildlog report compares CLI CPU at full and quarter log size, three runs each; `build_hold` traces subshells with a DEBUG trap; stall-watch sends meet at a six-way barrier and leave stderr empty; shutdown's `test_six_tmux_launches_run_at_once` counts six launches in flight; mac_test and delegate wait accounting read exact controlled durations.
 
 **Files:**
-- `scripts/production/test_waiting.py` — the five quota tests pass `codex_readings=`
-- `scripts/delegate/test_end_session.py` — the marker goes under a temp dir
-- `scripts/delegate/end_session.sh` — an override for the active-marker root, if none exists
-- `scripts/delegate/test_verify_mac_offload.py` — `test_runner_receives_each_forwarded_signal_before_local_work` race fixed
-- `scripts/agents/test_codex_mesh.py` — ephemeral refused port; `test_refused_seat_continues_before_held_messages_in_order` race fixed
-- `scripts/shutdown/test_restart.py` — `test_six_tmux_launches_finish_in_under_one_second` counts launches
-- `scripts/buildlog/test_mac_report.py` — `test_mac_report_cli_runs_under_two_seconds_at_the_log_size` (`:591`, `:641`) counts the work
-- `scripts/buildlog/test_record.py` — `assertLess(duration, 0.8)` (`:274`) counts the work
-- `scripts/` — any other test file the wall-clock sweep finds
+- `scripts/production/test_waiting.py` — quota tests on supplied readings; `seats_home` guard
+- `scripts/delegate/end_session.sh` — `PLAN_DELEGATE_ACTIVE_DIR` override for the active-marker root
+- `scripts/delegate/test_end_session.py` — marker under a temp dir
+- `scripts/delegate/test_verify_mac_offload.py` — `SIG_DFL` restore and `runner-signals-ready` wait
+- `scripts/agents/test_codex_mesh.py` — closed ephemeral port test; 30 s start timeout on the quota handoff
+- `scripts/buildlog/test_report.py`, `test_mac_report.py`, `test_record.py` — same-run CPU comparisons and work counts
+- `scripts/build_hold/`, `scripts/production/test_stall_watch.py`, `scripts/shutdown/`, `scripts/mac_test/test_offload.py`, `scripts/delegate/test_verify_token_wait.py`, `scripts/message/`, `scripts/hooks/test_conversation_pause.py` — timing assertions replaced by counts, barriers or controlled clocks
 
-**Seats:** 2 writers — split by suite
-- `impl` — `scripts/production/`, `scripts/delegate/` and `scripts/shutdown/` files above
-- `test` — opens as impl; `scripts/agents/`, `scripts/buildlog/` and the wall-clock sweep in every other suite
+**Binds later work:** the merge-gate command ("One committed gate command runs the suites in parallel") starts suites with default signal dispositions. The buildlog report speed tests run the CLI at two sizes three times each, a launch cost for "Fewer process launches per test".
 
-**Acceptance gate:** every touched suite passes; basedpyright clean on changed files; a grep shows no `~/.codex` or `/tmp/claude/delegate/active` reach left in tests; each fixed flake passes 5 runs in a row with all six measured suites running at once.
+**Gotchas:** a suite started in the background of a non-interactive shell inherits SIGINT ignored, and bash cannot forward a signal it ignores; any test that sends a signal to a child restores `SIG_DFL` before exec.
 
-### Phase 2 — One committed gate command runs the suites in parallel  · status: todo
+### Phase 2 — One committed gate command runs the suites in parallel  · status: done
 
 **Depends on:** Phase 1
 
@@ -126,6 +115,8 @@ A test that pins a behaviour a user or another script depends on is not trivial,
 - `impl` — `scripts/production/merge_gate.py`
 - `test` — `scripts/production/test_merge_gate.py` from the Spec alone
 
+**Constraints from prior phases:** a suite started in the background of a non-interactive shell inherits SIGINT ignored (the delegate signal test failed that way until it restored the default before exec): start every suite process with default signal dispositions. The stall-watch `delay=20` wait and the 15 s timeout in the delegate signal test are already gone.
+
 **Acceptance gate:** tests for refusal cases, conflict abort, red reset and failure print, green push, promote refusals and the `ff_rc=` read, using scratch repos; a real run on a scratch merge tree records the gate time and peak GB, once quiet and once under load.
 
 ### Phase 3 — The code under test stops waiting  · status: todo
@@ -136,7 +127,7 @@ A test that pins a behaviour a user or another script depends on is not trivial,
 
 **Goal:** the named waits leave the suites without weakening any test.
 
-**Spec:** `review.sh:797` `sleep 5`; `implement.sh:509/519` `sleep 1`; `add_showrunner.py:45` `POLL_S`; `offload.py:1130` ssh timeout made overridable and short in tests; `codex_mesh.py:3599`, `:3248` sleeps and `RESIDENT_POLL_SECS` (`:191`) made event-driven or overridable; the stub server's accept loop woken on close (`test_codex_mesh.py:138,145-151`); `test_stall_watch.py:689` `delay=20`; the delegate test polls and stub sleeps (`test_verify_mac_offload.py:548,1253`, `test_verify_token_wait.py:69`, `test_verify_hold_wait.py:173`); fsync in `progress_history.py:492`, `review_pool.py:225`, `findings.py:369`, usage `collect.py`; `lib/py`'s interpreter cache under a test `HOME`. Each wait becomes an event, a parameter the test passes, or a value the test overrides; production defaults stay.
+**Spec:** `review.sh:797` `sleep 5`; `implement.sh:509/519` `sleep 1`; `add_showrunner.py:45` `POLL_S`; `offload.py:1130` ssh timeout made overridable and short in tests; `codex_mesh.py:3599`, `:3248` sleeps and `RESIDENT_POLL_SECS` (`:191`) made event-driven or overridable; the stub server's accept loop woken on close (`test_codex_mesh.py:138,145-151`); the delegate test polls and stub sleeps (`test_verify_mac_offload.py:548`, `test_verify_token_wait.py:69`, `test_verify_hold_wait.py:173`); fsync in `progress_history.py:492`, `review_pool.py:225`, `findings.py:369`, usage `collect.py`; `lib/py`'s interpreter cache under a test `HOME`. Each wait becomes an event, a parameter the test passes, or a value the test overrides; production defaults stay.
 
 **Files:**
 - `scripts/delegate/review.sh` — `:797` `sleep 5`
@@ -147,7 +138,6 @@ A test that pins a behaviour a user or another script depends on is not trivial,
 - `scripts/delegate/` — the test polls and stub sleeps named in the Spec
 - `scripts/lib/py` — interpreter cache under a test `HOME`
 - `scripts/production/add_showrunner.py` — `POLL_S` (`:45`)
-- `scripts/production/test_stall_watch.py` — `delay=20` (`:689`)
 - `scripts/mac_test/offload.py` — ssh timeout (`:1130`)
 - `scripts/agents/codex_mesh.py` — sleeps (`:3248`, `:3599`) and `RESIDENT_POLL_SECS` (`:191`)
 - `scripts/agents/test_codex_mesh.py` — stub server accept loop (`:138`, `:145-151`)

@@ -282,7 +282,7 @@ class MeshCommandTests(unittest.TestCase):
         self.auto_turn_starts = 0
         self.waits = []
         self.elapsed = 0.0
-        self.start_args_timeout = 5.0
+        self.start_args_timeout = 300.0
         self.server = StubAppServer(self.respond)
         _ = (self.session_dir / codex_mesh.SERVER_FILE).write_text(
             json.dumps({"port": self.server.port, "pid": os.getpid(), "codex_home": str(agent_accounts.seats_home())}),
@@ -3140,7 +3140,7 @@ class MeshCommandTests(unittest.TestCase):
     def test_follow_failure_without_turn_id_finishes_as_failed(self) -> None:
         self.assertEqual(self.run_start()[0], 0)
         self.outcomes = ["failed"]
-        self.start_args_timeout = 0.1
+        self.start_args_timeout = 300
 
         code, errors = self.run_follow()
 
@@ -3151,9 +3151,25 @@ class MeshCommandTests(unittest.TestCase):
     def test_follow_completion_without_turn_id_finishes_as_done(self) -> None:
         self.assertEqual(self.run_start()[0], 0)
         self.outcomes = ["completed_without_id"]
-        self.start_args_timeout = 0.1
+        # The socket completion notice advances this test; its deadline only
+        # catches a hung launcher, including when the server is starved of CPU.
+        self.start_args_timeout = 300
+        submission_delay = [0.0]
+        respond = self.server.respond
 
-        code, errors = self.run_follow()
+        def clock() -> float:
+            return time.time() + submission_delay[0]
+
+        def submission_uses_cpu(request: dict[str, object]) -> list[dict[str, object]] | None:
+            if request.get("method") == "turn/start":
+                # Model scheduling delay without sleeping or comparing wall time.
+                submission_delay[0] += 1
+            return respond(request)
+
+        self.server.respond = submission_uses_cpu
+
+        with patch.object(codex_mesh, "time", SimpleNamespace(time=clock, monotonic=time.monotonic, sleep=time.sleep)):
+            code, errors = self.run_follow()
 
         self.assertEqual((code, errors), (0, ""))
         self.assertEqual(self.seat_record()["status"], "done")

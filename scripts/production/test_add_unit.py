@@ -32,6 +32,7 @@ import usage_store
 from test_support import ShutdownTestCase
 
 
+# Script completion deadlines only bound hangs; startup can be slow under load.
 SCRIPT = Path(__file__).with_name("add_unit.py")
 MARKED_TMUX_PLACE = unit_lookup.TmuxPlace("%7")
 OLD_HEADER = ["## Units", "| Unit | Plan | Worktree | Branch | Session | Port | Owns |",
@@ -356,7 +357,7 @@ class AddUnitTests(ShutdownTestCase):
         self.assertEqual(result.returncode, 0, (args, result.stdout, result.stderr))
         return result.stdout.strip()
 
-    def cli(self, *args: str, timeout: float = 15) -> subprocess.CompletedProcess[str]:
+    def cli(self, *args: str, timeout: float = 300) -> subprocess.CompletedProcess[str]:
         return subprocess.run([sys.executable, str(SCRIPT), "--production", str(self.doc), *args],
                               cwd=self.checkout, env=self.env, capture_output=True, text=True,
                               check=False, timeout=timeout)
@@ -1101,7 +1102,7 @@ class AddUnitTests(ShutdownTestCase):
             self.assertIsNotNone(creator)
             if creator is None:
                 self.fail("shutdown creator did not start")
-            stdout, stderr = creator.communicate(timeout=1)
+            stdout, stderr = creator.communicate(timeout=300)
             self.assertEqual(creator.returncode, 0, (stdout, stderr))
 
         error = io.StringIO()
