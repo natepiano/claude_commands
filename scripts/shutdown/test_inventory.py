@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import socket
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -15,7 +16,7 @@ from typing import cast, final, override
 from unittest.mock import patch
 
 from test_support import ShutdownTestCase
-from test_restart import pane_display
+from test_restart import pane_display, top_level
 import inventory
 import account
 import fake_tmux
@@ -23,6 +24,7 @@ import herdr
 import sessions
 import showrunners
 import unit_lookup
+import restart
 import shutdown
 import stop
 from fake_tmux import FakeSession
@@ -49,6 +51,42 @@ FAKE_TMUX = Path(__file__).parents[1] / "production" / "fake_tmux.py"
 
 @final
 class InventoryTests(ShutdownTestCase):
+    def test_cached_desktop_snapshot_never_invokes_the_snapshot_updater(self) -> None:
+        with (patch.object(shutil, "which", return_value="/fixture/agent-sessions-snapshot"),
+              patch.object(subprocess, "run") as updater):
+            desktops = inventory._snapshot_desktops(refresh=False)  # pyright: ignore[reportPrivateUsage]
+        updater.assert_not_called()
+        self.assertEqual(desktops[DESKTOP_ID], "Writing")
+
+    def test_nested_shutdown_inventory_reads_existing_snapshot_without_updating_notes(self) -> None:
+        with (patch.dict(os.environ, {"REFUSAL_WATCH_INVENTORY": "read existing"}),
+              patch.object(shutil, "which", return_value="/fixture/agent-sessions-snapshot"),
+              patch.object(subprocess, "run") as updater):
+            desktops = inventory._snapshot_desktops()  # pyright: ignore[reportPrivateUsage]
+        updater.assert_not_called()
+        self.assertEqual(desktops[DIRECTOR_ID], "Production")
+
+    def test_refusal_synthetic_model_keeps_the_last_real_reply_model(self) -> None:
+        transcript = self.home / ".claude/projects/model-fixture/refused.jsonl"
+        transcript.parent.mkdir(parents=True)
+        entries = [
+            {"type": "assistant", "message": {"model": "claude-opus-real"}},
+            {"type": "assistant", "isApiErrorMessage": True, "error": "rate_limit",
+             "message": {"model": "<synthetic>", "content": [{"type": "text", "text": "weekly limit"}]}},
+        ]
+        _ = transcript.write_text("\n".join(json.dumps(entry) for entry in entries) + "\n")
+        model = inventory._model("refused")  # pyright: ignore[reportPrivateUsage]
+        self.assertEqual(model, inventory.ModelName(kind="model", name="claude-opus-real"))
+        owner = top_level("refused", model=model)
+        self.assertIn("--model claude-opus-real", restart.resume_command(owner, "claude 3"))
+        self.assertNotIn("<synthetic>", restart.resume_command(owner, "claude 3"))
+
+    def test_only_synthetic_refusal_has_no_real_reply_model(self) -> None:
+        transcript = self.home / ".claude/projects/model-fixture/refused.jsonl"
+        transcript.parent.mkdir(parents=True)
+        _ = transcript.write_text(json.dumps({"type": "assistant", "message": {"model": "<synthetic>"}}) + "\n")
+        self.assertEqual(inventory._model("refused"), inventory.NoReplyYet(kind="no reply yet"))  # pyright: ignore[reportPrivateUsage]
+
     def __init__(self, methodName: str = "runTest") -> None:
         super().__init__(methodName)
         self.root = Path()

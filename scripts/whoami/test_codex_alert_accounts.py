@@ -3,11 +3,14 @@
 from __future__ import annotations
 
 import base64
+import io
 import json
 import os
 import sys
 import tempfile
 import unittest
+from contextlib import contextmanager, redirect_stderr
+from collections.abc import Generator
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import cast, override
@@ -18,8 +21,11 @@ import quota_alert
 import agent_accounts as sibling_agent_accounts
 from scripts.whoami import agent_accounts
 from agent_accounts import CodexHomeSource, Quota, Report
-from scripts.accounts import accounts
+from scripts.accounts import accounts, moves, refusals
+import usage_store
 from test_quota_alert import REGISTRY
+
+CURRENT_READING_AGE = timedelta()
 
 
 class CodexAccountAlertTests(unittest.TestCase):
@@ -52,6 +58,13 @@ class CodexAccountAlertTests(unittest.TestCase):
         _ = self.enterContext(patch.object(quota_alert, "not_live", return_value=[]))
         _ = self.enterContext(patch.object(quota_alert, "relay", side_effect=self.relay))
         _ = self.enterContext(patch.object(quota_alert, "tell_user", side_effect=self.push))
+        _ = self.enterContext(patch.object(accounts, "_retire_seats_servers", return_value=[]))
+        _ = self.enterContext(patch.object(accounts, "_codex_live", side_effect=self.live_for_swap))
+
+    def live_for_swap(self, home: Path) -> Report:
+        identity = agent_accounts.codex_account(home)
+        assert isinstance(identity, agent_accounts.KnownCodexAccount)
+        return self.report(identity, 80)
 
     def relay(self, recipient: str, text: str, key: str | None) -> None:
         del recipient, key
@@ -100,6 +113,336 @@ class CodexAccountAlertTests(unittest.TestCase):
                   for report in reports if isinstance(report.source, CodexHomeSource)),
         )
 
+    def save_room(self, identity: agent_accounts.KnownCodexAccount, left: float, *,
+                  age: timedelta = CURRENT_READING_AGE, reset: datetime | None = None) -> None:
+        saved = usage_store.load()
+        saved[usage_store.key("Codex", identity.login)] = usage_store.StoredUsage(
+            weekly=usage_store.StoredWindow(left=left, at=(self.now - age).isoformat(),
+                resets=(reset or self.now + timedelta(days=2)).isoformat()),
+            five_hour=usage_store.StoredWindow(left=50, at=(self.now - age).isoformat(),
+                resets=(self.now + timedelta(hours=3)).isoformat()),
+            credits=usage_store.StoredCredits(balance="0", at=self.now.isoformat()))
+        path = usage_store.store_file()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        _ = path.write_text(json.dumps(saved))
+
+    def test_outgoing_refusal_cannot_move_seats_after_selection_changes_at_transition_lock(self) -> None:
+        old, current, target = self.account(1), self.account(2), self.account(3)
+        lock = quota_alert.state_file
+        for action in ("move", "wait", "fallback"):
+            with self.subTest(action=action):
+                room = 0 if action == "fallback" else 1
+                self.save_room(old, 0)
+                self.save_room(current, room)
+                self.save_room(target, room)
+                report = self.report(old, 0)
+                window = refusals.KnownWindow("weekly")
+                if action == "wait":
+                    report.five_hour = Quota("5-hour", 100, self.now + timedelta(minutes=19))
+                    window = refusals.KnownWindow("five_hour")
+                readings = self.readings(old, report, self.report(current, room), self.report(target, room))
+                changed = False
+                @contextmanager
+                def change_before_lock() -> Generator[quota_alert.State]:
+                    nonlocal changed
+                    if not changed:
+                        changed = True
+                        accounts.set_role("seats", current.label)
+                    with lock() as state:
+                        yield state
+                with (patch.object(quota_alert, "state_file", side_effect=change_before_lock),
+                      patch.object(accounts, "swap", wraps=accounts.swap) as swap,
+                      patch.object(quota_alert, "switch_to_claude") as fallback):
+                    _ = quota_alert.blocked([self.note(1, "active", 0)], old, self.now,
+                        codex_readings=readings, window=window)
+                swap.assert_not_called()
+                fallback.assert_not_called()
+                self.assertEqual(agent_accounts.seats_home(), current.home)
+                self.assertEqual(moves.read_moves(), [])
+                self.assertIn("delegate=codex", quota_alert.REGISTRY.read_text())
+
+    def test_usage_store_write_failure_does_not_prevent_low_quota_alert(self) -> None:
+        old, target = self.account(1), self.account(2)
+        readings = self.readings(old, self.report(old, 0), self.report(target))
+        errors = io.StringIO()
+        with patch.object(usage_store, "write", side_effect=PermissionError("read-only store")), redirect_stderr(errors):
+            _ = quota_alert.alert([self.note(1, "active", 0)], self.now, codex_readings=readings)
+        self.assertTrue(any(text.startswith("Quota alert:") for text in self.sent), self.sent)
+        self.assertIn("read-only store", errors.getvalue())
+
+    def test_swap_advice_does_not_write_usage_store(self) -> None:
+        old, target = self.account(1), self.account(2)
+        readings = self.readings(old, self.report(old), self.report(target))
+        self.save_room(old, 1)
+        self.save_room(target, 1)
+        with patch.object(usage_store, "write") as write:
+            self.assertEqual(quota_alert.codex_swap_line(readings, self.now), "seats move to codex 2 when refused")
+        write.assert_not_called()
+
+    def test_each_alert_refresh_and_blocked_pass_saves_usage_once(self) -> None:
+        old, target = self.account(1), self.account(2)
+        readings = self.readings(old, self.report(old), self.report(target))
+        notes = [self.note(1, "active", 1)]
+        with patch.object(usage_store, "write", wraps=usage_store.write) as write:
+            _ = quota_alert.alert(notes, self.now, codex_readings=readings)
+            self.assertEqual(write.call_count, 1)
+        with patch.object(usage_store, "write", wraps=usage_store.write) as write:
+            _ = quota_alert.refresh(notes, None, self.now, codex_readings=readings)
+            self.assertEqual(write.call_count, 1)
+        with patch.object(usage_store, "write", wraps=usage_store.write) as write:
+            _ = quota_alert.blocked(notes, old, self.now, codex_readings=readings)
+            self.assertEqual(write.call_count, 1)
+
+    def test_unknown_refusal_ignores_environment_window_and_time(self) -> None:
+        old, target = self.account(1), self.account(2)
+        report = self.report(old, 80, five_left=0)
+        report.five_hour = Quota("5-hour", 100, self.now + timedelta(minutes=19))
+        readings = self.readings(old, report, self.report(target))
+        with patch.dict(os.environ, {"ACCOUNT_REFUSAL_WINDOW": "five_hour",
+                "ACCOUNT_REFUSAL_AT": (self.now - timedelta(seconds=1)).isoformat()}):
+            _ = quota_alert.blocked([self.note(1, "active", 80)], old, self.now,
+                codex_readings=readings, window=refusals.UnknownWindow())
+        refusal = refusals.load()[refusals.key("codex", old.login)]
+        self.assertEqual(refusal.window, refusals.UnknownWindow())
+        self.assertEqual(refusal.at, self.now)
+        self.assertEqual(agent_accounts.seats_home(), target.home)
+        request = moves.read_moves()[0]
+        self.assertEqual(request["kind"], "requested")
+        self.assertNotIn("reset", request)
+
+    def test_post_refusal_window_inference_keeps_subsecond_observation_time(self) -> None:
+        old, target = self.account(1), self.account(2)
+        observed_at = self.now + timedelta(microseconds=2)
+        report = self.report(old, 80, five_left=0)
+        report.five_hour = Quota("5-hour", 100, self.now + timedelta(minutes=19))
+        initial = self.readings(old, report, self.report(target))
+        readings = quota_alert.CodexAlertPassReadings(initial.seats, old, tuple(
+            quota_alert.CodexHomeReading(item.home, item.report, observed_at) for item in initial.checked_homes))
+        _ = quota_alert.blocked([self.note(1, "active", 80)], old, observed_at,
+            codex_readings=readings, refused_at=quota_alert.RefusedAt(self.now + timedelta(microseconds=1)))
+        self.assertEqual(refusals.load()[refusals.key("codex", old.login)].window, refusals.KnownWindow("five_hour"))
+        self.assertEqual([entry["kind"] for entry in moves.read_moves()], ["waited"])
+
+    def test_failed_account_swap_opens_claude_fallback_and_keeps_failed_request(self) -> None:
+        old, target = self.account(1), self.account(2)
+        self.save_room(old, 0)
+        self.save_room(target, 1)
+        readings = self.readings(old, self.report(old, 0), self.report(target))
+        with patch.object(accounts, "swap", side_effect=accounts.AccountsError("destination unavailable")):
+            _ = quota_alert.blocked([self.note(1, "active", 0)], old, self.now, codex_readings=readings)
+        self.assertEqual(agent_accounts.seats_home(), old.home)
+        self.assertIn("delegate=claude", quota_alert.REGISTRY.read_text())
+        self.assertTrue(any("seats could not move" in text and "destination unavailable" in text for text in self.sent))
+        entries = moves.read_moves()
+        self.assertEqual([entry["kind"] for entry in entries], ["requested", "failed"])
+        self.assertEqual(entries[0]["move_id"], entries[1]["move_id"])
+
+    def test_weekly_refusal_moves_seats_to_picked_home_and_records_request_not_confirmation(self) -> None:
+        old, target = self.account(1), self.account(2)
+        self.save_room(old, 0)
+        self.save_room(target, 1)
+        readings = self.readings(old, self.report(old, 0), self.report(target, 1))
+        with (patch.object(quota_alert, "switch_to_claude") as fallback,
+              patch.object(accounts, "swap", wraps=accounts.swap) as swap):
+            _ = quota_alert.blocked([self.note(1, "active", 0)], old, self.now,
+                codex_readings=readings, window=refusals.KnownWindow("weekly"))
+        fallback.assert_not_called()
+        swap.assert_called_once()
+        self.assertEqual(swap.call_args.args[:2], ("seats", "codex 2"))
+        self.assertEqual(agent_accounts.seats_home(), target.home)
+        self.assertIn("delegate=codex", quota_alert.REGISTRY.read_text())
+        self.assertEqual(sum(text.startswith("seats moved from codex 1 to codex 2:")
+                             for text in self.sent), 1)
+        held = refusals.load()[refusals.key("codex", old.login)]
+        self.assertEqual(held.window, refusals.KnownWindow("weekly"))
+        entries = moves.read_moves()
+        self.assertEqual([entry["kind"] for entry in entries], ["requested"])
+        self.assertEqual(entries[0]["subject"], "seats")
+        self.assertTrue(entries[0]["move_id"])
+        requested = entries[0]
+        assert requested["kind"] == "requested"
+        self.assertEqual((requested["from"], requested["to"], requested["window"]),
+                         ("codex 1", "codex 2", "weekly"))
+        assert "reset" in requested
+        self.assertEqual(requested["reset"], (self.now + timedelta(days=2)).isoformat())
+
+    def test_stale_one_percent_weekly_with_unknown_refusal_moves_instead_of_waiting(self) -> None:
+        old, target = self.account(1), self.account(2)
+        self.save_room(old, 1, age=timedelta(minutes=11))
+        self.save_room(target, 1)
+        readings = self.readings(old, self.report(old, 1), self.report(target, 1))
+        readings = quota_alert.CodexAlertPassReadings(readings.seats, old, tuple(
+            quota_alert.CodexHomeReading(item.home, item.report,
+                self.now - timedelta(minutes=11) if item.home == old.home else self.now)
+            for item in readings.checked_homes))
+        _ = quota_alert.blocked([self.note(1, "active", 1)], old, self.now,
+            codex_readings=readings, window=refusals.UnknownWindow())
+        self.assertEqual(agent_accounts.seats_home(), target.home)
+        self.assertEqual(refusals.load()[refusals.key("codex", old.login)].window,
+                         refusals.UnknownWindow())
+        self.assertEqual([entry["kind"] for entry in moves.read_moves()], ["requested"])
+
+    def test_five_hour_reset_nineteen_minutes_away_waits_once_then_logs_wait_ended(self) -> None:
+        old, target = self.account(1), self.account(2)
+        self.save_room(old, 80)
+        self.save_room(target, 1)
+        report = self.report(old, 80, five_left=0)
+        reset = self.now + timedelta(minutes=19)
+        report.five_hour = Quota("5-hour", 100, reset)
+        readings = self.readings(old, report, self.report(target, 1))
+        for _attempt in range(2):
+            _ = quota_alert.blocked([self.note(1, "active", 80)], old, self.now,
+                codex_readings=readings, window=refusals.KnownWindow("five_hour"))
+        self.assertEqual(agent_accounts.seats_home(), old.home)
+        self.assertIn("delegate=codex", quota_alert.REGISTRY.read_text())
+        self.assertEqual(sum(text.startswith("seats wait for codex 1's 5-hour reset at ")
+                             for text in self.sent), 1)
+        self.assertEqual([entry["kind"] for entry in moves.read_moves()], ["waited"])
+        renewed = self.report(old, 80)
+        later_readings = quota_alert.CodexAlertPassReadings(readings.seats, old,
+            (quota_alert.CodexHomeReading(old.home, renewed, reset),))
+        _ = quota_alert.alert([self.note(1, "active", 80)], reset, codex_readings=later_readings)
+        entries = moves.read_moves()
+        self.assertEqual([entry["kind"] for entry in entries], ["waited", "wait ended"])
+        self.assertEqual(entries[0]["move_id"], entries[1]["move_id"])
+
+    def test_exactly_twenty_minutes_and_past_five_hour_resets_move(self) -> None:
+        old, target = self.account(1), self.account(2)
+        for offset in (timedelta(minutes=20), timedelta(seconds=-1)):
+            with self.subTest(offset=offset):
+                self.sent.clear()
+                quota_alert.STATE.unlink(missing_ok=True)
+                self.save_room(old, 80)
+                self.save_room(target, 1)
+                report = self.report(old, 80, five_left=0)
+                report.five_hour = Quota("5-hour", 100, self.now + offset)
+                readings = self.readings(old, report, self.report(target, 1))
+                _ = quota_alert.blocked([self.note(1, "active", 80)], old, self.now,
+                    codex_readings=readings, window=refusals.KnownWindow("five_hour"))
+                self.assertEqual(agent_accounts.seats_home(), target.home)
+                self.assertFalse(any(text.startswith("seats wait") for text in self.sent))
+
+    def test_unknown_five_hour_reset_moves_instead_of_waiting(self) -> None:
+        old, target = self.account(1), self.account(2)
+        self.save_room(old, 80)
+        self.save_room(target, 1)
+        report = self.report(old, 80, five_left=0)
+        report.five_hour = Quota("5-hour", 100, None)
+        readings = self.readings(old, report, self.report(target, 1))
+        _ = quota_alert.blocked([self.note(1, "active", 80)], old, self.now,
+            codex_readings=readings, window=refusals.KnownWindow("five_hour"))
+        self.assertEqual(agent_accounts.seats_home(), target.home)
+        self.assertIsInstance(refusals.load()[refusals.key("codex", old.login)].reset, refusals.NoResetKnown)
+
+    def test_unknown_refusal_infers_only_one_zero_window_observed_after_refusal(self) -> None:
+        old, target = self.account(1), self.account(2)
+        self.save_room(target, 1)
+        report = self.report(old, 80, five_left=0)
+        reset = self.now + timedelta(minutes=19)
+        report.five_hour = Quota("5-hour", 100, reset)
+        readings = self.readings(old, report, self.report(target, 1))
+        _ = quota_alert.blocked([self.note(1, "active", 80)], old, self.now,
+            codex_readings=readings, window=refusals.UnknownWindow(), refused_at=quota_alert.RefusedAt(self.now - timedelta(seconds=1)))
+        held = refusals.load()[refusals.key("codex", old.login)]
+        self.assertEqual(held.window, refusals.KnownWindow("five_hour"))
+        self.assertEqual(held.reset, refusals.KnownReset(reset))
+        self.assertEqual(agent_accounts.seats_home(), old.home)
+        self.assertEqual([entry["kind"] for entry in moves.read_moves()], ["waited"])
+
+    def test_unknown_refusal_never_infers_a_window_from_pre_refusal_or_ambiguous_readings(self) -> None:
+        old, target = self.account(1), self.account(2)
+        for weekly, five, observed_at in ((80, 0, self.now - timedelta(seconds=1)),
+                                         (0, 0, self.now + timedelta(seconds=1))):
+            with self.subTest(weekly=weekly, observed_at=observed_at):
+                self.save_room(target, 1)
+                reports = self.readings(old, self.report(old, weekly, five_left=five), self.report(target, 1))
+                readings = quota_alert.CodexAlertPassReadings(reports.seats, old, tuple(
+                    quota_alert.CodexHomeReading(item.home, item.report,
+                        observed_at if item.home == old.home else self.now)
+                    for item in reports.checked_homes))
+                now = max(self.now, observed_at)
+                _ = quota_alert.blocked([self.note(1, "active", weekly)], old, now,
+                    codex_readings=readings, window=refusals.UnknownWindow(), refused_at=quota_alert.RefusedAt(self.now))
+                self.assertEqual(refusals.load()[refusals.key("codex", old.login)].window,
+                                 refusals.UnknownWindow())
+                self.assertEqual(agent_accounts.seats_home(), target.home)
+
+    def test_no_room_falls_back_and_positive_allowance_cannot_restore_unresolved_refusal(self) -> None:
+        old, target = self.account(1), self.account(2)
+        self.save_room(old, 0)
+        self.save_room(target, 0)
+        readings = self.readings(old, self.report(old, 0), self.report(target, 0))
+        _ = quota_alert.blocked([self.note(1, "active", 0)], old, self.now,
+            codex_readings=readings, window=refusals.KnownWindow("weekly"))
+        self.assertIn("delegate=claude", quota_alert.REGISTRY.read_text())
+        self.assertTrue(any("earliest reset" in text for text in self.sent), self.sent)
+        self.assertEqual([entry["kind"] for entry in moves.read_moves()], ["no room"])
+        later = self.now + timedelta(minutes=1)
+        same_reset = quota_alert.CodexAlertPassReadings(readings.seats, old,
+            (quota_alert.CodexHomeReading(old.home, self.report(old, 80), later),))
+        _ = quota_alert.alert([self.note(1, "active", 80)], later, codex_readings=same_reset)
+        self.assertIn("delegate=claude", quota_alert.REGISTRY.read_text())
+        renewed = self.report(old, 80)
+        renewed.quotas = [Quota("Weekly", 20, self.now + timedelta(days=9))]
+        recovered = quota_alert.CodexAlertPassReadings(readings.seats, old,
+            (quota_alert.CodexHomeReading(old.home, renewed, later + timedelta(seconds=1)),))
+        _ = quota_alert.alert([self.note(1, "active", 80)], later + timedelta(seconds=1), codex_readings=recovered)
+        self.assertTrue(refusals.resolved(refusals.load()[refusals.key("codex", old.login)],
+            refusals.stored_reading("codex", old.login, later + timedelta(seconds=1)), later + timedelta(seconds=1)))
+        self.assertIn("delegate=codex", quota_alert.REGISTRY.read_text())
+        self.assertEqual([entry["kind"] for entry in moves.read_moves()], ["no room", "room again"])
+
+    def test_low_reading_never_moves_seats_or_writes_a_move_transition(self) -> None:
+        old, target = self.account(1), self.account(2)
+        self.save_room(old, 0)
+        self.save_room(target, 1)
+        readings = self.readings(old, self.report(old, 0), self.report(target, 1))
+        with patch.object(accounts, "swap", wraps=accounts.swap) as swap:
+            _ = quota_alert.alert([self.note(1, "active", 0)], self.now, codex_readings=readings)
+        swap.assert_not_called()
+        self.assertEqual(agent_accounts.seats_home(), old.home)
+        self.assertIn("delegate=codex", quota_alert.REGISTRY.read_text())
+        self.assertEqual(moves.read_moves(), [])
+
+    def test_failed_seats_swap_records_failure_with_request_id_and_never_confirms(self) -> None:
+        old, target = self.account(1), self.account(2)
+        self.save_room(old, 0)
+        self.save_room(target, 1)
+        readings = self.readings(old, self.report(old, 0), self.report(target, 1))
+        with patch.object(accounts, "_codex_live", return_value=Report("Codex", problem="target unavailable")):
+            _ = quota_alert.blocked([self.note(1, "active", 0)], old, self.now,
+                codex_readings=readings, window=refusals.KnownWindow("weekly"))
+        self.assertEqual(agent_accounts.seats_home(), old.home)
+        entries = moves.read_moves()
+        self.assertEqual([entry["kind"] for entry in entries], ["requested", "failed"])
+        self.assertEqual(entries[0]["move_id"], entries[1]["move_id"])
+        failed = entries[1]
+        assert failed["kind"] == "failed"
+        self.assertIn("target unavailable", failed["reason"])
+        self.assertIn("delegate=claude", quota_alert.REGISTRY.read_text())
+
+    def test_no_room_fallback_restores_on_another_account_when_it_regains_room(self) -> None:
+        old, target = self.account(1), self.account(2)
+        self.save_room(old, 0)
+        self.save_room(target, 0)
+        readings = self.readings(old, self.report(old, 0), self.report(target, 0))
+        _ = quota_alert.blocked([self.note(1, "active", 0)], old, self.now,
+            codex_readings=readings, window=refusals.KnownWindow("weekly"))
+        self.assertIn("delegate=claude", quota_alert.REGISTRY.read_text())
+        later = self.now + timedelta(minutes=1)
+        recovered = quota_alert.CodexAlertPassReadings(readings.seats, old,
+            (quota_alert.CodexHomeReading(old.home, self.report(old, 0), later),
+             quota_alert.CodexHomeReading(target.home, self.report(target, 1), later)))
+        _ = quota_alert.alert([self.note(1, "active", 0), self.note(2, "inactive", 1)], later,
+                              codex_readings=recovered)
+        self.assertIn("delegate=codex", quota_alert.REGISTRY.read_text())
+        self.assertEqual(agent_accounts.seats_home(), target.home)
+        entries = moves.read_moves()
+        recovered_entries = [entry for entry in entries if entry["kind"] == "room again"]
+        self.assertEqual(len(recovered_entries), 1)
+        self.assertEqual(recovered_entries[0]["label"], "codex 2")
+        self.assertEqual(entries[0]["move_id"], recovered_entries[0]["move_id"])
+
     def test_acknowledged_account_stays_quiet_after_swap_away_and_back(self) -> None:
         a, b = self.account(1), self.account(2)
         a_pass = self.readings(a, self.report(a), self.report(b, 70))
@@ -147,17 +490,17 @@ class CodexAccountAlertTests(unittest.TestCase):
         _ = quota_alert.alert([self.note(1, "active", 1), self.note(2, "inactive", 1)],
                               self.now, codex_readings=readings)
         text = "\n".join(self.sent)
-        self.assertIn("swap seats default", text)
+        self.assertIn("seats move to", text)
+        self.assertNotIn("swap seats", text)
         self.assertIn("codex 2", text)
-        self.assertIn("1%", text)
-        self.assertIn("17", text)
+        self.assertEqual(agent_accounts.seats_home(), a.home)
 
     def test_spare_with_used_up_window_and_no_credits_is_not_recommended(self) -> None:
         a, b = self.account(1), self.account(2)
         readings = self.readings(a, self.report(a), self.report(b, 80, "0", five_left=0))
         _ = quota_alert.alert([self.note(1, "active", 1), self.note(2, "inactive", 80)],
                               self.now, codex_readings=readings)
-        self.assertNotIn('swap seats "codex 2"', "\n".join(self.sent))
+        self.assertNotIn("seats move to codex 2 when refused", "\n".join(self.sent))
 
     def test_failed_or_expired_spare_read_never_uses_saved_credits_for_advice(self) -> None:
         a, b = self.account(1), self.account(2)
@@ -168,7 +511,7 @@ class CodexAccountAlertTests(unittest.TestCase):
                 readings = self.readings(a, self.report(a), report)
                 _ = quota_alert.alert([self.note(1, "active", 1), self.note(2, "inactive", 90, "999")],
                                       self.now, codex_readings=readings)
-                self.assertNotIn('swap seats "codex 2"', "\n".join(self.sent))
+                self.assertNotIn("seats move to codex 2 when refused", "\n".join(self.sent))
 
     def test_unchecked_target_is_not_recommended_even_with_live_allowance(self) -> None:
         a, b = self.account(1), self.account(2)
@@ -176,7 +519,7 @@ class CodexAccountAlertTests(unittest.TestCase):
         readings = self.readings(a, self.report(a), self.report(b, 90))
         _ = quota_alert.alert([self.note(1, "active", 1), self.note(2, "inactive", 90)],
                               self.now, codex_readings=readings)
-        self.assertNotIn('swap seats "codex 2"', "\n".join(self.sent))
+        self.assertNotIn("seats move to codex 2 when refused", "\n".join(self.sent))
 
     def test_unknown_selected_identity_does_not_alert_old_active_notes(self) -> None:
         a = self.account(1)
@@ -199,16 +542,17 @@ class CodexAccountAlertTests(unittest.TestCase):
                     self.assertIsInstance(state["fallback"], quota_alert.NoCodexQuotaFallback)
                 self.assertIn("delegate=codex", quota_alert.REGISTRY.read_text())
 
-    def test_selected_refusal_owns_fallback_and_credits_restore_owed_assignments(self) -> None:
+    def test_selected_refusal_owns_fallback_and_credits_restore_only_after_refusal_reset(self) -> None:
         a = self.account(1)
         readings = self.readings(a, self.report(a, 0))
-        _ = quota_alert.blocked([self.note(1, "active", 0)], a, self.now, codex_readings=readings)
+        _ = quota_alert.blocked([self.note(1, "active", 0)], a, self.now, codex_readings=readings, window=refusals.KnownWindow("weekly"))
         with quota_alert.state_file() as state:
             fallback = state["fallback"]
             self.assertIsInstance(fallback, quota_alert.AccountCodexQuotaFallback)
             assert isinstance(fallback, quota_alert.AccountCodexQuotaFallback)
             self.assertEqual(fallback.owner, a)
         self.assertIsNone(quota_alert.edit_registry("agents_set_assignment", "fix", "codex"))
+        self.now += timedelta(days=3)
         funded = self.readings(a, self.report(a, 0, "19", five_left=0))
         _ = quota_alert.alert([self.note(1, "active", 0, "19")],
                               self.now + timedelta(minutes=1), codex_readings=funded)
@@ -242,13 +586,15 @@ class CodexAccountAlertTests(unittest.TestCase):
 
     def test_selected_and_spare_readings_share_the_ten_minute_limit(self) -> None:
         a, b = self.account(1), self.account(2)
+        self.save_room(a, 1)
+        self.save_room(b, 80)
         readings = self.readings(a, self.report(a), self.report(b, 80))
         at_limit = self.now + timedelta(minutes=10)
         self.assertIsNone(quota_alert.selected_codex_report(readings, at_limit).problem)
-        self.assertIn('swap seats "codex 2"', quota_alert.codex_swap_line(readings, at_limit))
+        self.assertIn("seats move to codex 2 when refused", quota_alert.codex_swap_line(readings, at_limit))
         after_limit = at_limit + timedelta(microseconds=1)
         self.assertIsNotNone(quota_alert.selected_codex_report(readings, after_limit).problem)
-        self.assertEqual(quota_alert.codex_swap_line(readings, after_limit), "")
+        self.assertIn("no other Codex account has room until", quota_alert.codex_swap_line(readings, after_limit))
 
     def test_standalone_refusal_uses_readings_collected_after_the_call_starts(self) -> None:
         a, b = self.account(1), self.account(2)
@@ -257,8 +603,9 @@ class CodexAccountAlertTests(unittest.TestCase):
             return self.report(a if home == a.home else b, 0 if home == a.home else 80)
         with patch.object(quota_alert, "codex_live", side_effect=live), patch.object(quota_alert, "tell_user", wraps=self.push) as push:
             _ = quota_alert.blocked([self.note(1, "active", 0)], a)
-        self.assertIn('swap seats "codex 2"', "\n".join(self.sent))
-        self.assertIn('swap seats "codex 2"', cast(str, push.call_args.args[1]))
+        self.assertIn("seats moved from codex 1 to codex 2", "\n".join(self.sent))
+        self.assertEqual(agent_accounts.seats_home(), b.home)
+        push.assert_not_called()
 
     def test_standalone_alert_message_and_refresh_accept_their_new_readings(self) -> None:
         a, b = self.account(1), self.account(2)
@@ -268,13 +615,13 @@ class CodexAccountAlertTests(unittest.TestCase):
             return self.report(a if home == a.home else b, 1 if home == a.home else 80)
         with patch.object(quota_alert, "codex_live", side_effect=live):
             _ = quota_alert.alert([note])
-            self.assertIn('swap seats "codex 2"', "\n".join(self.sent))
+            self.assertIn("seats move to codex 2 when refused", "\n".join(self.sent))
             text = quota_alert.message(note, [note], quota_alert.load_config())
-            self.assertIn('swap seats "codex 2"', text)
+            self.assertIn("seats move to codex 2 when refused", text)
             quota_alert.STATE.unlink(missing_ok=True)
             self.sent.clear()
             _ = quota_alert.refresh([note], None)
-            self.assertIn('swap seats "codex 2"', "\n".join(self.sent))
+            self.assertIn("seats move to codex 2 when refused", "\n".join(self.sent))
 
     def test_refusals_create_no_weekly_episodes_or_false_recovery_notices(self) -> None:
         a, b = self.account(1), self.account(2)
@@ -322,6 +669,7 @@ class CodexAccountAlertTests(unittest.TestCase):
         a = self.account(1)
         _ = quota_alert.blocked([self.note(1, "active", 0)], a, self.now,
             codex_readings=self.readings(a, self.report(a, 0)))
+        self.now += timedelta(seconds=1)
         funded = self.readings(a, self.report(a, 90))
         self.sent.clear()
         with patch.object(quota_alert, "edit_registry", return_value="editor refused") as edit:
@@ -356,14 +704,15 @@ class CodexAccountAlertTests(unittest.TestCase):
         note = self.note(1, "active", 0)
         low = self.readings(a, self.report(a, 0))
         _ = quota_alert.alert([note], self.now, codex_readings=low)
-        _ = quota_alert.blocked([note], a, self.now, codex_readings=low)
+        _ = quota_alert.blocked([note], a, self.now, codex_readings=low, window=refusals.KnownWindow("weekly"))
+        self.now += timedelta(days=3)
         funded = self.readings(a, self.report(a, 0, "19", five_left=0))
         _ = quota_alert.alert([note], self.now, codex_readings=funded)
         with quota_alert.state_file() as state:
-            self.assertIn("refusal_push", state["episodes"][a.label])
             self.assertIsInstance(state["fallback"], quota_alert.NoCodexQuotaFallback)
         self.assertIn("delegate=codex", quota_alert.REGISTRY.read_text())
         self.sent.clear()
+        low = self.readings(a, self.report(a, 0))
         with patch.object(quota_alert, "relay", wraps=self.relay) as relay, patch.object(
                 quota_alert, "tell_user", wraps=self.push) as push:
             _ = quota_alert.blocked([note], a, self.now, codex_readings=low)
@@ -391,10 +740,11 @@ class CodexAccountAlertTests(unittest.TestCase):
                 quota_alert, "tell_user", wraps=self.push) as push:
             _ = quota_alert.blocked([note], a, self.now, codex_readings=selected)
             relay.assert_called_once()
-            push.assert_called_once()
+            push.assert_not_called()
             self.assertIn("moved", cast(str, relay.call_args.args[1]))
-            self.assertIn("moved", cast(str, push.call_args.args[1]))
-        self.assertIn("delegate=claude", quota_alert.REGISTRY.read_text())
+            self.assertIn("seats moved", cast(str, relay.call_args.args[1]))
+        self.assertIn("delegate=codex", quota_alert.REGISTRY.read_text())
+        self.assertEqual(agent_accounts.seats_home(), b.home)
 
     def test_switch_failure_messages_repeat_only_when_the_failure_changes(self) -> None:
         a = self.account(1)

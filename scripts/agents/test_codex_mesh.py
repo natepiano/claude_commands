@@ -29,7 +29,7 @@ import threading
 import time
 import unittest
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 from types import SimpleNamespace
 from typing import Callable, TextIO, cast, final, override
@@ -37,7 +37,7 @@ from unittest.mock import MagicMock, patch
 
 from scripts.agents import codex_mesh
 from scripts.usage import agents_log
-from scripts.accounts import accounts
+from scripts.accounts import accounts, moves, refusals
 from scripts.whoami import agent_accounts
 
 
@@ -2734,6 +2734,190 @@ class MeshCommandTests(unittest.TestCase):
         self.assertEqual(record["port"], new.port)
         self.assertEqual(agent_accounts.seats_home(), target)
 
+    def assert_quota_continuation_after_move(self, held: tuple[str, ...]) -> None:
+        target, new = self.prepare_seats_move()
+        respond = self.server.respond
+        def refuse(request: dict[str, object]) -> list[dict[str, object]] | None:
+            if request.get("method") == "turn/start":
+                return self.quota_completion(request)
+            return respond(request)
+        self.server.respond = refuse
+        def move_on_refusal(*_arguments: object, **_options: object) -> None:
+            requested: moves.RequestedMove = {
+                "kind": "requested", "at": "2026-10-13T12:00:00+00:00", "tool": "codex",
+                "subject": "seats", "move_id": "refused-turn-move", "from": "default",
+                "to": "codex 1", "why": "quota refusal", "window": "unknown",
+            }
+            moves.append_move(requested)
+            self.assertEqual(accounts.main(["set-role", "seats", "codex 1"]), 0)
+            if held:
+                _ = (self.session_dir / "seat.pending.json").write_text(json.dumps({
+                    "thread_id": THREAD_ID, "messages": list(held), "accepting_messages": True,
+                }))
+        args = self.start_args()
+        with patch.object(codex_mesh, "_report_quota_refusal", side_effect=move_on_refusal) as report:
+            outcome = codex_mesh._run_delegate(args, self.server.port, started_here=True)  # pyright: ignore[reportPrivateUsage]
+        self.assertIsInstance(outcome, codex_mesh.RunCompleted)
+        report.assert_called_once()
+        starts = [request for request in new.requests if request.get("method") == "turn/start"]
+        self.assertEqual(len(self.methods("turn/start")), 1)
+        self.assertEqual(len(starts), 1)
+        params = cast(dict[str, object], starts[0]["params"])
+        inputs = cast(list[dict[str, object]], params["input"])
+        self.assertEqual([item["text"] for item in inputs], ["Continue where you stopped.", *held])
+        self.assertEqual(agent_accounts.seats_home(), target)
+        confirmed = [entry for entry in moves.read_moves() if entry["kind"] == "confirmed"]
+        self.assertEqual(len(confirmed), 1)
+        self.assertEqual(confirmed[0]["move_id"], "refused-turn-move")
+        self.assertEqual(confirmed[0]["subject"], "seats")
+        assert "seat" in confirmed[0] and "home" in confirmed[0] and "run" in confirmed[0]
+        self.assertEqual(confirmed[0]["seat"], "seat")
+        self.assertEqual(confirmed[0]["run"], str(self.session_dir))
+        self.assertEqual(confirmed[0]["home"], str(target))
+
+    def request_seats_move(self, source: str, target: str, move_id: str) -> None:
+        request: moves.RequestedMove = {
+            "kind": "requested", "at": datetime.now(timezone.utc).isoformat(), "tool": "codex",
+            "subject": "seats", "move_id": move_id, "from": source, "to": target,
+            "why": "quota refusal", "window": "unknown",
+        }
+        moves.append_move(request)
+
+    def assert_destination_refusal_continues(self, *, initial_submission_refused: bool) -> None:
+        # Real socket servers, two moves and two one-second retry waits need more than the default deadline.
+        self.start_args_timeout = 30.0
+        target, rejected = self.prepare_seats_move()
+        final_home = target.parent / ".codex2"
+        final_home.mkdir()
+        recovered = StubAppServer(self.respond)
+        _ = self.patches.callback(recovered.close)
+        respond = self.server.respond
+        def refuse_initial(request: dict[str, object]) -> list[dict[str, object]] | None:
+            if request.get("method") == "turn/start":
+                if initial_submission_refused:
+                    return [{"id": request["id"], "error": {"message": USAGE_LIMIT}}]
+                return self.quota_completion(request)
+            return respond(request)
+        self.server.respond = refuse_initial
+        destination_respond = rejected.respond
+        def refuse_submission(request: dict[str, object]) -> list[dict[str, object]] | None:
+            if request.get("method") == "turn/start":
+                return [{"id": request["id"], "error": {"message": USAGE_LIMIT}}]
+            return destination_respond(request)
+        rejected.respond = refuse_submission
+        def start(session_dir: str, home: Path) -> int:
+            server = rejected if home == target else recovered
+            _ = (Path(session_dir) / codex_mesh.SERVER_FILE).write_text(json.dumps({
+                "port": server.port, "pid": os.getpid(), "codex_home": str(home),
+            }))
+            return server.port
+        def move_on_refusal(_name: str, serving: codex_mesh.CodexServingState, _detail: str) -> None:
+            next_label = "codex 1" if serving.home != target else "codex 2"
+            self.request_seats_move(agent_accounts.codex_home_role_label(serving.home), next_label,
+                                   "move-to-" + next_label)
+            # The role file is the temporary boundary; provider and account checks belong to blocked's tests.
+            config = accounts.accounts_config_file()
+            config.parent.mkdir(parents=True, exist_ok=True)
+            _ = config.write_text(json.dumps({"seats": next_label}))
+        with (patch.object(codex_mesh, "_start_server", side_effect=start),
+              patch.object(codex_mesh, "_report_quota_refusal", side_effect=move_on_refusal) as report):
+            outcome = codex_mesh._run_delegate(self.start_args(), self.server.port, started_here=True)  # pyright: ignore[reportPrivateUsage]
+        self.assertIsInstance(outcome, codex_mesh.RunCompleted)
+        self.assertEqual(report.call_count, 2)
+        final_starts = [request for request in recovered.requests if request.get("method") == "turn/start"]
+        self.assertEqual(len(final_starts), 1)
+        inputs = cast(list[dict[str, object]], cast(dict[str, object], final_starts[0]["params"])["input"])
+        self.assertEqual([item["text"] for item in inputs], ["Continue where you stopped."])
+        self.assertFalse(self.seat_record().get("continuation_owed"))
+        self.assertEqual(agent_accounts.seats_home(), final_home)
+
+    def test_destination_submission_refusal_continues_once_after_the_following_move(self) -> None:
+        self.assert_destination_refusal_continues(initial_submission_refused=False)
+
+    def test_initial_submission_refusal_and_destination_refusal_continue_once_on_final_home(self) -> None:
+        self.assert_destination_refusal_continues(initial_submission_refused=True)
+
+    def test_new_seat_on_requested_destination_does_not_confirm_another_seats_move(self) -> None:
+        _target, new = self.prepare_seats_move()
+        self.request_seats_move("default", "codex 1", "another-seat-move")
+        self.assertEqual(accounts.main(["set-role", "seats", "codex 1"]), 0)
+        self.assertEqual(self.run_start()[0], 0)
+        self.assertTrue(any(request.get("method") == "turn/start" for request in new.requests))
+        self.assertEqual([entry for entry in moves.read_moves() if entry["kind"] == "confirmed"], [])
+
+    def test_resumed_seat_confirms_only_a_request_from_its_actual_source_home(self) -> None:
+        _target, new = self.prepare_seats_move()
+        self.request_seats_move("codex 2", "codex 1", "different-source-move")
+        self.assertEqual(accounts.main(["set-role", "seats", "codex 1"]), 0)
+        self.write_pool_roster({"seat": {"thread_id": THREAD_ID, "status": "done"}})
+        client = codex_mesh.Client(self.server.port, "seat")
+        try:
+            result = codex_mesh._move_resident(self.start_args(), str(self.session_dir), "seat", THREAD_ID, client)  # pyright: ignore[reportPrivateUsage]
+            self.assertIsInstance(result, codex_mesh.MovedSeat)
+            assert isinstance(result, codex_mesh.MovedSeat)
+            result.client.close()
+        finally:
+            client.close()
+        self.assertTrue(any(request.get("method") == "thread/resume" for request in new.requests))
+        self.assertEqual([entry for entry in moves.read_moves() if entry["kind"] == "confirmed"], [])
+
+    def test_seat_resume_failure_records_the_current_move_request_and_reason(self) -> None:
+        _target, new = self.prepare_seats_move()
+        self.request_seats_move("default", "codex 1", "resume-failure-move")
+        self.assertEqual(accounts.main(["set-role", "seats", "codex 1"]), 0)
+        self.write_pool_roster({"seat": {"thread_id": THREAD_ID, "status": "done"}})
+        respond = new.respond
+        def failed_resume(request: dict[str, object]) -> list[dict[str, object]] | None:
+            if request.get("method") == "thread/start":
+                self.request_seats_move("codex 1", "codex 2", "later-request")
+            if request.get("method") in ("thread/resume", "thread/start"):
+                return [{"id": request["id"], "error": {"message": "destination cannot restore thread"}}]
+            return respond(request)
+        new.respond = failed_resume
+        client = codex_mesh.Client(self.server.port, "seat")
+        try:
+            result = codex_mesh._move_resident(self.start_args(), str(self.session_dir), "seat", THREAD_ID, client)  # pyright: ignore[reportPrivateUsage]
+        finally:
+            client.close()
+        self.assertIsInstance(result, codex_mesh.SeatThreadStateUnknown)
+        failures = [entry for entry in moves.read_moves() if entry["kind"] == "failed"]
+        self.assertEqual(len(failures), 1)
+        self.assertEqual(failures[0]["move_id"], "resume-failure-move")
+        self.assertIn("destination cannot restore thread", failures[0]["reason"])
+
+    def test_refused_seat_without_queued_messages_continues_once_on_new_home(self) -> None:
+        self.assert_quota_continuation_after_move(())
+
+    def test_refused_seat_continues_before_held_messages_in_order(self) -> None:
+        self.assert_quota_continuation_after_move(("first held message", "second held message"))
+
+    def test_refused_seat_without_messages_continues_once_after_wait_reset_passes(self) -> None:
+        identity = self.prepare_refusing_account()
+        respond = self.server.respond
+        refused = [False]
+        def refuse_once(request: dict[str, object]) -> list[dict[str, object]] | None:
+            if request.get("method") == "turn/start" and not refused[0]:
+                refused[0] = True
+                return self.quota_completion(request)
+            return respond(request)
+        self.server.respond = refuse_once
+        def expired_wait(*_arguments: object, **_options: object) -> None:
+            now = datetime.now(timezone.utc)
+            reset = now - timedelta(seconds=1)
+            refusals.write_refusal(refusals.AccountRefusal("codex", identity.login,
+                refusals.KnownWindow("five_hour"), refusals.KnownReset(reset), reset - timedelta(minutes=19)))
+            moves.append_move(moves.WaitedMove(kind="waited", at=(reset - timedelta(minutes=19)).isoformat(),
+                tool="codex", subject="seats", move_id="refused-turn-wait", window="five_hour", reset=reset.isoformat()))
+        with patch.object(codex_mesh, "_report_quota_refusal", side_effect=expired_wait) as report:
+            code, _errors = self.run_start()
+        self.assertEqual(code, 0)
+        report.assert_called_once()
+        self.assertEqual(len(self.methods("turn/start")), 2)
+        self.assertEqual(self.turn_inputs, ["Continue where you stopped."])
+        entries = moves.read_moves()
+        self.assertEqual([entry["kind"] for entry in entries], ["waited", "wait ended"])
+        self.assertEqual({entry["move_id"] for entry in entries}, {"refused-turn-wait"})
+
     def test_capacity_retry_after_a_role_change_starts_once_on_the_new_home(self) -> None:
         _, new = self.prepare_seats_move()
         def wait(seconds: float) -> None:
@@ -4408,6 +4592,23 @@ class QuotaRefusalTests(unittest.TestCase):
         self.assertFalse(self.refused(codex_mesh.RunCompleted(), tested=True))
         self.assertFalse(self.refused(codex_mesh.CapacityRetriesExhausted(THREAD_ID, 3, 20), tested=True))
 
+    def test_refusal_handoff_preserves_named_window_or_unknown_and_observation_time(self) -> None:
+        identity = agent_accounts.KnownCodexAccount(Path.home() / ".codex", "serving@example.invalid", "codex 1")
+        serving = codex_mesh.ServingCodexServer(4001, 99, identity.home, identity)
+        for detail, window in ((USAGE_LIMIT + " Weekly limit reached", "weekly"),
+                               (USAGE_LIMIT + " 5-hour limit reached", "five_hour"),
+                               (USAGE_LIMIT, "unknown")):
+            with self.subTest(window=window), patch.object(subprocess, "run",
+                    return_value=subprocess.CompletedProcess([], 0, "", "")) as run:
+                codex_mesh._report_quota_refusal("seat", serving, detail)  # pyright: ignore[reportPrivateUsage]
+                run.assert_called_once()
+                self.assertNotIn("env", run.call_args.kwargs)
+                command = cast(list[str], run.call_args.args[0])
+                self.assertEqual(command[2:6], ["blocked", str(identity.home), identity.login, identity.label])
+                self.assertEqual(command[6:9], ["--window", window, "--refused-at"])
+                self.assertIsNotNone(datetime.fromisoformat(command[9]).tzinfo)
+
+
     def test_the_report_runs_the_blocked_verb_and_survives_its_failure(self) -> None:
         identity = agent_accounts.KnownCodexAccount(Path.home() / ".codex", "serving@example.invalid", "codex 1")
         serving = codex_mesh.ServingCodexServer(4001, 99, identity.home, identity)
@@ -4416,7 +4617,7 @@ class QuotaRefusalTests(unittest.TestCase):
                 contextlib.redirect_stderr(io.StringIO()) as errors:
             codex_mesh._report_quota_refusal("seat", serving)  # pyright: ignore[reportPrivateUsage]
         command = cast("list[str]", run.call_args.args[0])
-        self.assertEqual(command[1:], [str(codex_mesh.QUOTA_REPORT), "blocked", str(identity.home), identity.login, identity.label])
+        self.assertEqual(command[1:6], [str(codex_mesh.QUOTA_REPORT), "blocked", str(identity.home), identity.login, identity.label])
         self.assertTrue(codex_mesh.QUOTA_REPORT.is_file())
         self.assertIn("codex_mesh: seat: quota: switched to claude for codex 1: delegate", errors.getvalue())
         with patch.object(subprocess, "run", side_effect=OSError("no interpreter")), \

@@ -3,12 +3,17 @@ from __future__ import annotations
 
 import fcntl
 import json
+import math
 import os
+import sys
 import tempfile
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Literal, TypedDict, cast
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "whoami"))
+import usage_store  # noqa: E402
 
 @dataclass(frozen=True)
 class KnownReset:
@@ -48,6 +53,32 @@ class StaleReading:
 @dataclass(frozen=True)
 class NoReading:
     pass
+
+
+def _reading_window(window: usage_store.StoredWindow) -> ReadingWindow:
+    at = datetime.fromisoformat(window["at"])
+    if at.tzinfo is None or not math.isfinite(window["left"]):
+        raise ValueError("invalid usage reading")
+    reset = NoResetKnown() if not window["resets"] else KnownReset(datetime.fromisoformat(window["resets"]))
+    if isinstance(reset, KnownReset) and reset.at.tzinfo is None:
+        raise ValueError("reset time needs an offset")
+    return ReadingWindow(window["left"], reset, at)
+
+
+def stored_reading(tool: Literal["claude", "codex"], login: str, now: datetime) -> FreshReading | StaleReading | NoReading:
+    """Convert optional saved windows at the boundary into named reading states."""
+    held = usage_store.load().get(usage_store.key(tool.capitalize(), login))
+    if held is None or "weekly" not in held:
+        return NoReading()
+    try:
+        weekly = _reading_window(held["weekly"])
+        five = _reading_window(held["five_hour"]) if "five_hour" in held else NoWindow()
+        if now - weekly.at > timedelta(minutes=10) or weekly.at > now:
+            return StaleReading(weekly, five)
+        credits = held["credits"]["balance"] if "credits" in held else ""
+        return FreshReading(weekly, five, credits)
+    except (ValueError, TypeError):
+        return NoReading()
 
 
 @dataclass(frozen=True)
