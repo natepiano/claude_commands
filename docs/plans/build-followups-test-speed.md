@@ -92,32 +92,25 @@ A test that pins a behaviour a user or another script depends on is not trivial,
 
 ### Phase 2 — One committed gate command runs the suites in parallel  · status: done
 
-**Depends on:** Phase 1
+#### As-built
 
-#### Work Order
-
-**Goal:** `scripts/production/merge_gate.py` replaces the showrunner's scratch gate; the full test list runs in about 2 minutes within a stated peak memory.
-
-**Spec:** (the showrunner's steps, 2026-10-14, to read and replace `/tmp/claude-1000/-etc-nixos/96b016bf-87cf-4a19-af7a-77425852c2e2/scratchpad/gate_mergeonly.zsh` and the first 18 lines of `chain_next12.zsh` in that folder)
-- Takes a merge branch, a unit branch, the checkpoint and its previous checkpoint (plus unit and phase for the subject). Refuse unless the merge-branch checkout is clean and HEAD equals `origin/<merge branch>`; the checkpoint is on `origin/<unit branch>`; the previous checkpoint is an ancestor of it.
-- Merge `--no-ff` with the subject `Merge <unit> <phase> (<hash>) into <merge branch>` and a short body; on a conflict, abort and exit naming the files.
-- basedpyright on the named dirs, then the suites; on red, reset to origin, print each red suite's failures, exit 1. On green, push the merge branch.
-- `--promote`: fast-forward `~/.claude` main to the merge branch and push; refuse while a build-hold release is running; then fast-forward the Mac over ssh and read the printed `ff_rc=` (ssh's own exit status is always 0 there). Keep the scratch script's settings.json filter check.
-- The test list comes from one place in the repo (a constant or file the command reads), not the caller.
-- Suites run one process per test module, in parallel, bounded by a worker count derived from a stated peak-memory cap (measured: about 3 GB for all modules at once); `TMPDIR` on tmpfs for the run. Print per-suite wall time and the run's peak memory.
-- The red-suite rerun rule stays the showrunner's, outside the command.
+- `scripts/production/merge_gate.py --merge-branch --unit-branch --checkpoint --previous-checkpoint --unit --phase` refuses unless the merge checkout is clean (untracked files included) and at `origin/<merge branch>`, the checkpoint is on `origin/<unit branch>` (fetched by explicit refspec), and the previous checkpoint is its ancestor. It merges `--no-ff` with the subject `Merge <unit> <phase> (<hash>) into <merge branch>`; on a conflict it aborts and names the files. On red it resets to origin, prints each red suite's failures and exits 1; SIGTERM and SIGHUP roll back the same way; on green it pushes.
+- The gate runs basedpyright alongside all 163 test modules of the 22 suites (`TEST_SUITES` in the script is the one list), one process group per module, `TMPDIR` on `/dev/shm`. Modules start longest first by the previous run's times. Admission is on sampled RSS under a 4096 MiB cap (`--memory-cap-mib`): each running module holds a reservation of max(its RSS, largest module peak seen, initially 96 MiB) until it uses it, one module may always run, and an observed overshoot makes the run red. Every module's process group is killed on exit. It prints per-suite wall time, peak memory and the largest module.
+- `--promote` fast-forwards `~/.claude` main (ff-only decides; no clean check) and pushes, refuses while a build-hold release runs (the process match covers relative and absolute invocations), keeps the settings.json filter check, then fast-forwards the Mac over ssh and reads the printed `ff_rc=`, since ssh's own status is always 0 there. A Mac failure after promotion reports `main promoted to <hash>; Mac fast-forward failed`. `--tests-only` runs the suites with no git operations. Callers' PYTHONPATH is unchanged.
+- Measured: 75.17 s and 2.30 GiB peak at load 6–22; 112.69 s at load 31–72, all green; the sequential gate took about 30 minutes.
+- Load reds the parallel run exposed are fixed at their source: `quota_alert.py` imports absolutely (no forged `__package__`); the usage `fake_ssh` writer drains; delegate tests advance on events; `verify.sh` and `build_targets` local waits wake on release through `scripts/delegate/local_release_wait.py`; production script-launch deadlines are 300 s hang guards, with lock tests advancing on pipe events; the mac_test gh-timeout test injects `TimeoutExpired`; codex_mesh follow tests use hang guards.
 
 **Files:**
-- `scripts/production/merge_gate.py` — the gate command and the one test list
-- `scripts/production/test_merge_gate.py` — its tests on scratch repos
+- `scripts/production/merge_gate.py` — the gate, the suite list, admission and promotion
+- `scripts/production/test_merge_gate.py` — 44 tests on scratch repos
+- `scripts/delegate/local_release_wait.py` — inotify wake on hold release, interval fallback
+- `scripts/delegate/verify.sh`, `scripts/build_targets/build_targets.py` — local waits through it
+- `scripts/whoami/quota_alert.py`, `scripts/usage/fixtures/collect/mac/fake_ssh.py` — load fixes
+- `scripts/production/test_*.py`, `scripts/delegate/test_verify_*.py`, `scripts/mac_test/test_mac_test.py`, `scripts/agents/test_codex_mesh.py`, `scripts/usage/test_collect.py`, `scripts/shutdown/test_shutdown_cli.py` — event-driven waits, hang guards and regression tests
 
-**Seats:** 1 writer + 1 tester
-- `impl` — `scripts/production/merge_gate.py`
-- `test` — `scripts/production/test_merge_gate.py` from the Spec alone
+**Binds later work:** the gate's ordering cache is `${MERGE_GATE_STATE_DIR:-~/.local/state/merge-gate}/module_seconds.json`. `build_targets.py` imports `scripts.delegate.local_release_wait` by putting the repo root on `sys.path`.
 
-**Constraints from prior phases:** a suite started in the background of a non-interactive shell inherits SIGINT ignored (the delegate signal test failed that way until it restored the default before exec): start every suite process with default signal dispositions. The stall-watch `delay=20` wait and the 15 s timeout in the delegate signal test are already gone.
-
-**Acceptance gate:** tests for refusal cases, conflict abort, red reset and failure print, green push, promote refusals and the `ff_rc=` read, using scratch repos; a real run on a scratch merge tree records the gate time and peak GB, once quiet and once under load.
+**Gotchas:** admission works on RSS samples at least 0.25 s apart, not an OS limit; a module that grows suddenly can still pass the cap, which turns the run red. `local_release_wait` falls back to polling where inotify is absent (macOS). The red-suite rerun rule stays with the showrunner, outside the command.
 
 ### Phase 3 — The code under test stops waiting  · status: todo
 
@@ -127,7 +120,7 @@ A test that pins a behaviour a user or another script depends on is not trivial,
 
 **Goal:** the named waits leave the suites without weakening any test.
 
-**Spec:** `review.sh:797` `sleep 5`; `implement.sh:509/519` `sleep 1`; `add_showrunner.py:45` `POLL_S`; `offload.py:1130` ssh timeout made overridable and short in tests; `codex_mesh.py:3599`, `:3248` sleeps and `RESIDENT_POLL_SECS` (`:191`) made event-driven or overridable; the stub server's accept loop woken on close (`test_codex_mesh.py:138,145-151`); the delegate test polls and stub sleeps (`test_verify_mac_offload.py:548`, `test_verify_token_wait.py:69`, `test_verify_hold_wait.py:173`); fsync in `progress_history.py:492`, `review_pool.py:225`, `findings.py:369`, usage `collect.py`; `lib/py`'s interpreter cache under a test `HOME`. Each wait becomes an event, a parameter the test passes, or a value the test overrides; production defaults stay.
+**Spec:** `review.sh:797` `sleep 5`; `implement.sh:509/519` `sleep 1`; `add_showrunner.py:45` `POLL_S`; `offload.py:1130` ssh timeout made overridable and short in tests; `codex_mesh.py:3599`, `:3248` sleeps and `RESIDENT_POLL_SECS` (`:191`) made event-driven or overridable; the stub server's accept loop woken on close (`test_codex_mesh.py:138,145-151`); the delegate test polls and stub sleeps (`test_verify_token_wait.py:69`; Phase 2 already made `test_verify_mac_offload.py` and `test_verify_hold_wait.py` advance on events and `verify.sh` routing wake on release through `local_release_wait.py`); fsync in `progress_history.py:492`, `review_pool.py:225`, `findings.py:369`, usage `collect.py`; `lib/py`'s interpreter cache under a test `HOME`. Each wait becomes an event, a parameter the test passes, or a value the test overrides; production defaults stay.
 
 **Files:**
 - `scripts/delegate/review.sh` — `:797` `sleep 5`
@@ -147,7 +140,7 @@ A test that pins a behaviour a user or another script depends on is not trivial,
 - `impl` — `scripts/delegate/` and `scripts/lib/py`
 - `test` — opens as impl; `scripts/agents/`, `scripts/mac_test/`, `scripts/usage/`, `scripts/production/`
 
-**Acceptance gate:** touched suites green; basedpyright clean; the gate command's time recorded before and after.
+**Acceptance gate:** touched suites green; basedpyright clean; the gate command's time recorded before and after (`python3 scripts/production/merge_gate.py --tests-only --repo <worktree> </dev/null`; before: 75 s, peak 2.3 GiB at load 6–22).
 
 ### Phase 4 — Trivial tests are gone  · status: todo
 
