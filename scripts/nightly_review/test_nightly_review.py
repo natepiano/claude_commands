@@ -21,7 +21,7 @@ import account
 import launch_permission
 import agent_notes
 import note_file
-from scripts.accounts import accounts
+from scripts.accounts import accounts, refusals
 from scripts.herdr import herdr
 import usage_store
 from scripts.production import showrunners
@@ -110,6 +110,9 @@ class NightlyReviewTests(unittest.TestCase):
         _ = os.environ.pop("CLAUDE_CONFIG_DIR", None)
         _ = self.enterContext(mock.patch.object(herdr, "run_program", return_value=done(code=1)))
         self.quota_reading("owner@example.com", 80, 7)
+        path = accounts.groups_file()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        _ = path.write_text(json.dumps({"units": "default"}))
         for name, value in (("ROOT", self.root), ("tmux", self.tmux)):
             patcher = mock.patch.object(nightly_review, name, value)
             _ = patcher.start()
@@ -129,12 +132,14 @@ class NightlyReviewTests(unittest.TestCase):
         self.assertEqual(self.launched(self.account_notes("1", "90")), STARTED)
         self.assertTrue(self.calls)
 
-    def test_nightly_refuses_when_no_account_has_room(self) -> None:
-        self.quota_reading("owner@example.com", 0, 7)
-        lines = self.launched(self.account_notes("0", "90"))
+    def test_nightly_refuses_unconfigured_units_without_fallback_or_group_write(self) -> None:
+        """F004: nightly launch requires the same configured units account."""
+        accounts.groups_file().unlink()
+        lines = self.launched(self.account_notes("80", "90"))
         self.assertEqual(len(lines), 1)
-        self.assertIn("no claude account has room", lines[0])
+        self.assertIn("accounts.py move units <claude N>", lines[0])
         self.assertEqual(self.calls, [])
+        self.assertFalse(accounts.groups_file().exists())
 
     def tmux(self, *args: str) -> subprocess.CompletedProcess[str]:
         verb, name = args[0], args[-1].removeprefix("=").removesuffix(":")
@@ -180,11 +185,9 @@ class NightlyReviewTests(unittest.TestCase):
         return directory
 
     def unit_role(self, label: str) -> Path:
-        config = accounts.accounts_config_file()
-        config.parent.mkdir(parents=True, exist_ok=True)
-        _ = config.write_text(
-            json.dumps(accounts.AccountsConfiguration(unit=label)), encoding="utf-8",
-        )
+        path = accounts.groups_file()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        _ = path.write_text(json.dumps({"units": label}))
         return accounts.account_dir(label)
 
     def write_shutdown_record(self, value: dict[str, object]) -> None:
@@ -359,6 +362,15 @@ class NightlyReviewTests(unittest.TestCase):
         self.assertEqual(nightly_review.live_message_counts(path, since),
                          nightly_review.LiveMessageCounts(4, 2, 1, (("reader-starts-cold", 2),)))
 
+    def test_failed_and_withheld_live_pushes_count_and_registry_failures_are_attributed(self) -> None:
+        since = datetime(2026, 10, 13, tzinfo=timezone.utc)
+        path = self.root / "review.jsonl"
+        records: list[dict[str, object]] = [{"time": since.isoformat(), "verdict": verdict, "failed_rules": ["reader-starts-cold"],
+                    "text_id": "quota", "detail": "sent despite failed review: reader-starts-cold", "sent": {"body": "original"}} for verdict in ("failed", "withhold")]
+        records.append({"time": since.isoformat(), "verdict": "failed", "failed_rules": ["reader-starts-cold"], "text_id": "quota", "dry": True})
+        _ = path.write_text("\n".join(json.dumps(record) for record in records))
+        self.assertEqual(nightly_review.live_message_counts(path, since), nightly_review.LiveMessageCounts(2, 2, 0, (("reader-starts-cold", 2),), (("quota", 2),)))
+
     def test_messages_mode_runs_only_the_dry_sample_cli_with_a_derived_wait(self) -> None:
         since = datetime(2026, 10, 13, tzinfo=timezone.utc)
         paths = [self.root / "one.jsonl", self.root / "two.jsonl"]
@@ -502,10 +514,14 @@ class NightlyReviewTests(unittest.TestCase):
         self.assertEqual(self.launched(self.account_notes("4", "90")), STARTED)
         self.assertTrue(self.calls)
 
-    def test_quota_permission_uses_zero_room_instead_of_a_ten_percent_floor(self) -> None:
+    def test_quota_permission_allows_zero_reading_until_account_refuses(self) -> None:
         self.quota_reading("owner@example.com", 1, 7)
         self.assertIsInstance(nightly_review.quota_permission(), nightly_review.QuotaClear)
         self.quota_reading("owner@example.com", 0, 7)
+        self.assertIsInstance(nightly_review.quota_permission(), nightly_review.QuotaClear)
+        now = datetime.now(timezone.utc)
+        refusals.write_refusal(refusals.AccountRefusal("claude", "owner@example.com",
+            refusals.KnownWindow("weekly"), refusals.KnownReset(now + timedelta(days=7)), now))
         refused = nightly_review.quota_permission()
         self.assertIsInstance(refused, nightly_review.ReviewAccountUnavailable)
         assert isinstance(refused, nightly_review.ReviewAccountUnavailable)
@@ -545,10 +561,12 @@ class NightlyReviewTests(unittest.TestCase):
             self.assertEqual(self.launched(notes), STARTED)
         resolve.assert_called_once_with()
 
-    def test_nightly_ignores_legacy_unit_assignment_for_an_unread_account(self) -> None:
+    def test_nightly_refuses_unread_configured_account_without_fallback(self) -> None:
+        """F004: launch configuration cannot be replaced by another readable account."""
         _ = self.unit_role("claude 3")
-        self.assertEqual(self.launched(self.account_notes("80", "0")), STARTED)
-        self.assertNotIn(str(accounts.account_dir("claude 3")), self.calls[-1][-1])
+        lines = self.launched(self.account_notes("80", "0"))
+        self.assertNotEqual(lines, STARTED)
+        self.assertEqual(self.calls, [])
 
     def test_named_caller_and_tmux_server_cannot_select_the_nightly_account(self) -> None:
         """With no unit role, the guard and launched Claude both use the default account."""
@@ -591,10 +609,12 @@ class NightlyReviewTests(unittest.TestCase):
         self.assertEqual(launched["CLAUDE_CODE_REMOTE_MEMORY_DIR"], str(Path.home() / ".claude"))
         self.assertNotIn("CLAUDE_CODE_OAUTH_TOKEN", launched)
 
-    def test_nightly_skips_unfit_named_account_and_uses_default_with_room(self) -> None:
+    def test_nightly_refuses_unfit_configured_account_without_using_default(self) -> None:
+        """F004: an unfit configured directory is a refusal, not a selection hint."""
         _ = self.unit_role("claude 3")
-        self.assertEqual(self.launched([]), STARTED)
-        self.assertNotIn(str(accounts.account_dir("claude 3")), self.calls[-1][-1])
+        lines = self.launched([])
+        self.assertNotEqual(lines, STARTED)
+        self.assertEqual(self.calls, [])
 
     def test_picked_default_nightly_launch_drops_inherited_claude_variables(self) -> None:
         with (mock.patch.dict(os.environ, {"CLAUDE_TEST_MARKER": "fixture"}),

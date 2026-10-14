@@ -57,7 +57,7 @@ USAGE = ("usage: escalate.py hold KEY --summary TITLE --text TEXT (--action TEXT
          + "[--minutes N] [--need note|decision|blocked]"
          + " | close KEY | typed | due | list")
 
-Outcome = Literal["waiting", "sent", "answered"]
+Outcome = Literal["waiting", "sent", "answered", "review_held"]
 
 
 class _StoredActionRequired(TypedDict):
@@ -96,6 +96,35 @@ class HeldRelay(TypedDict):
     key: str
 
 
+@dataclass(frozen=True)
+class SessionQuestionOrigin:
+    session_id: str
+
+
+@dataclass(frozen=True)
+class UnknownQuestionOrigin:
+    """An old hold or a caller outside a recorded Claude session."""
+
+
+QuestionOrigin = SessionQuestionOrigin | UnknownQuestionOrigin
+UNKNOWN_QUESTION_ORIGIN = UnknownQuestionOrigin()
+
+
+def current_question_origin() -> QuestionOrigin:
+    pid = os.environ.get("CLAUDE_PID", "")
+    if not pid.isdigit():
+        return UNKNOWN_QUESTION_ORIGIN
+    try:
+        value = cast(object, json.loads((Path.home() / ".claude/sessions" / f"{pid}.json").read_text()))
+        if isinstance(value, dict):
+            session_id = cast(dict[str, object], value).get("sessionId")
+            if isinstance(session_id, str) and session_id and Path(session_id).name == session_id:
+                return SessionQuestionOrigin(session_id)
+    except (OSError, ValueError):
+        pass
+    return UNKNOWN_QUESTION_ORIGIN
+
+
 class StoredHeldMessage(TypedDict):
     summary: str
     text: str
@@ -104,21 +133,44 @@ class StoredHeldMessage(TypedDict):
     minutes: int
     outcome: Outcome
     action: _StoredUserAction
+    origin_session: NotRequired[str]
     codex_owner: NotRequired[StoredCodexAccount]
     relays: NotRequired[list[HeldRelay]]
 
 
 @dataclass(frozen=True)
-class HeldMessage:
+class SessionPush:
     summary: str
     text: str
-    need: Need
+    action: UserAction
+    need: Need = "decision"
+
+
+@dataclass(frozen=True)
+class HeldMessage:
+    push: SessionPush
     held_at: float
     minutes: int
     outcome: Outcome
-    action: UserAction
     owner: HoldOwner = field(default_factory=UnownedHold)
     relays: tuple[HeldRelay, ...] = ()
+    origin: QuestionOrigin = UNKNOWN_QUESTION_ORIGIN
+
+    @property
+    def summary(self) -> str:
+        return self.push.summary
+
+    @property
+    def text(self) -> str:
+        return self.push.text
+
+    @property
+    def need(self) -> Need:
+        return self.push.need
+
+    @property
+    def action(self) -> UserAction:
+        return self.push.action
 
 
 @dataclass(frozen=True)
@@ -127,11 +179,24 @@ class UnreadableHeld:
 
 
 @dataclass(frozen=True)
+class RetiredScriptHold:
+    """An on-disk script hold from before script warnings left this queue."""
+    text_id: str
+
+
+class RetiredHoldRecord(TypedDict):
+    time: float
+    key: str
+    text_id: str
+    reason: str
+
+
+@dataclass(frozen=True)
 class NoHeld:
     pass
 
 
-ReadHeld = HeldMessage | LegacyHeld | UnreadableHeld | NoHeld
+ReadHeld = HeldMessage | LegacyHeld | UnreadableHeld | RetiredScriptHold | NoHeld
 
 
 class Settled(NamedTuple):
@@ -162,7 +227,7 @@ def _legacy_held(value: object) -> LegacyHeld | None:
         return None
     if not isinstance(record.get("held_at"), (int, float)) or not isinstance(record.get("minutes"), int):
         return None
-    if record.get("outcome") not in ("waiting", "sent", "answered"):
+    if record.get("outcome") not in ("waiting", "sent", "answered", "review_held"):
         return None
     return LegacyHeld(
         summary=cast(str, record["summary"]),
@@ -194,9 +259,12 @@ def read(path: Path) -> ReadHeld:
     except (OSError, ValueError):
         return UnreadableHeld()
     legacy = _legacy_held(value)
+    record = cast(dict[str, object], value) if isinstance(value, dict) else {}
+    if "text_id" in record or "values" in record:
+        text_id = record.get("text_id")
+        return RetiredScriptHold(text_id if isinstance(text_id, str) else "unknown")
     if legacy is None:
         return UnreadableHeld()
-    record = cast(dict[str, object], value)
     if "action" not in record:
         return legacy
     action = _read_user_action(record["action"])
@@ -205,17 +273,11 @@ def read(path: Path) -> ReadHeld:
     owner = _read_owner(record.get("codex_owner"))
     if isinstance(owner, UnreadableHeld):
         return owner
-    return HeldMessage(
-        summary=legacy.summary,
-        text=legacy.text,
-        need=legacy.need,
-        held_at=legacy.held_at,
-        minutes=legacy.minutes,
-        outcome=legacy.outcome,
-        action=action,
-        owner=owner,
-        relays=_read_relays(record.get("relays")),
-    )
+    origin = record.get("origin_session")
+    origin = SessionQuestionOrigin(origin) if isinstance(origin, str) and origin else UNKNOWN_QUESTION_ORIGIN
+    push = SessionPush(legacy.summary, legacy.text, action, legacy.need)
+    return HeldMessage(push, legacy.held_at, legacy.minutes, legacy.outcome,
+                       owner, _read_relays(record.get("relays")), origin)
 
 
 def _read_relays(value: object) -> tuple[HeldRelay, ...]:
@@ -254,6 +316,8 @@ def write(path: Path, held: HeldMessage) -> None:
         "outcome": held.outcome,
         "action": _stored_action(held.action),
     }
+    if isinstance(held.origin, SessionQuestionOrigin):
+        record["origin_session"] = held.origin.session_id
     if held.relays:
         record["relays"] = list(held.relays)
     if isinstance(held.owner, KnownCodexAccount):
@@ -288,27 +352,45 @@ def _stored_action(action: UserAction) -> _StoredUserAction:
     return {"kind": "none"}
 
 
-def hold(key: str, summary: str, text: str, action: UserAction, minutes: int = 15,
-         need: Need = "decision", *, owner: HoldOwner = UNOWNED_HOLD,
-         relays: tuple[HeldRelay, ...] = ()) -> bool:
+def hold(key: str, push: SessionPush, minutes: int = 15,
+         *, owner: HoldOwner = UNOWNED_HOLD,
+         relays: tuple[HeldRelay, ...] = (), origin: QuestionOrigin = UNKNOWN_QUESTION_ORIGIN) -> bool:
     """Start KEY's wait; false when KEY is already held."""
-    if isinstance(action, NoActionRequired) and need != "note":
-        raise ValueError(f"need {need} requires an action")
+    if isinstance(push.action, NoActionRequired) and push.need != "note":
+        raise ValueError(f"need {push.need} requires an action")
     with locked():
         path = held_path(key)
         existing = read(path)
+        if isinstance(existing, RetiredScriptHold):
+            _ = discard_script_hold(path, existing)
         if isinstance(existing, (HeldMessage, UnreadableHeld)):
             return False
         schedule()
-        write(path, HeldMessage(summary, text, need, time.time(), minutes, "waiting", action, owner, relays))
+        write(path, HeldMessage(push, time.time(), minutes, "waiting", owner, relays, origin))
     return True
+
+
+def discard_script_hold(path: Path, held: RetiredScriptHold) -> Settled:
+    """Under the state lock, log an obsolete script hold once and close it."""
+    reason = "script warnings no longer escalate to the phone"
+    record: RetiredHoldRecord = {"time": time.time(), "key": path.stem,
+                                "text_id": held.text_id, "reason": reason}
+    with (STATE / "log.jsonl").open("a", encoding="utf-8") as output:
+        _ = output.write(json.dumps(record) + "\n")
+    path.unlink()
+    return Settled(f"{path.stem}: closed script hold {held.text_id}: {reason}", False)
 
 
 def close(key: str) -> bool:
     """Forget KEY; false when it was not held."""
     with locked():
+        path = held_path(key)
+        held = read(path)
+        if isinstance(held, RetiredScriptHold):
+            _ = discard_script_hold(path, held)
+            return True
         try:
-            held_path(key).unlink()
+            path.unlink()
         except FileNotFoundError:
             return False
     return True
@@ -317,6 +399,9 @@ def close(key: str) -> bool:
 def _cancel_outgoing_codex_holds(home: Path, login: str) -> None:
     for path in (STATE / "held").glob("*.json"):
         held = read(path)
+        if isinstance(held, RetiredScriptHold):
+            _ = discard_script_hold(path, held)
+            continue
         if path.stem == "five-hour-codex" or (isinstance(held, HeldMessage)
                 and isinstance(held.owner, KnownCodexAccount)
                 and (held.owner.home != home or held.owner.login.casefold() != login.casefold())):
@@ -343,17 +428,45 @@ def reconcile_codex_holds(home: Path, login: str) -> None:
 
 def deliver(held: HeldMessage) -> str:
     """Send one held message to the user; the empty string when sent, else send.py's own line."""
+    import review
+
     action_args = ["--action", held.action.text] if isinstance(held.action, ActionRequired) else ["--no-action"]
-    done = subprocess.run([sys.executable, str(SEND), "--to", "user", "--from", JOB, "--summary", held.summary,
-                           "--need", held.need, *action_args, "--text", held.text],
-                          capture_output=True, text=True, check=False)
+    command = [sys.executable, str(SEND), "--to", "user", "--from", JOB, "--summary", held.summary,
+               "--need", held.need, *action_args, "--text", held.text]
+    done = subprocess.run(command, capture_output=True, text=True, check=False,
+                          timeout=review.user_send_seconds() + 15)
     return "" if done.returncode == 0 else " ".join((done.stdout or done.stderr).split()) or f"exit {done.returncode}"
+
+
+def forward_review_hold(held: HeldMessage, reason: str, entry_key: str) -> list[str]:
+    """Tell the sessions whose question was relayed; the user push is terminal."""
+    errors: list[str] = []
+    relays = list(held.relays)
+    if isinstance(held.origin, SessionQuestionOrigin):
+        recipient = "session:" + held.origin.session_id
+        if all(relay["recipient"] != recipient for relay in relays):
+            relays.append(HeldRelay(recipient=recipient, key="review-held-" + entry_key))
+    for relay in relays:
+        try:
+            done = subprocess.run([sys.executable, str(SEND), "--to", relay["recipient"], "--from", JOB,
+                                   "--key", relay["key"], "--summary", "Relayed push needs revision",
+                                   "--text", f"Your relayed push {held.summary!r} was not sent. {reason} Revise and resend it."],
+                                  capture_output=True, text=True, check=False, timeout=40)
+            if done.returncode not in (0, 1):
+                errors.append(f"{relay['recipient']}: {done.stdout.strip() or done.stderr.strip() or f'exit {done.returncode}'}")
+        except (OSError, subprocess.TimeoutExpired) as error:
+            errors.append(f"{relay['recipient']}: {error}")
+    return errors
 
 
 def due(now: float) -> list[Settled]:
     """Settle each waiting message: answered when the user typed since it was held, sent once its time is up."""
     settled: list[Settled] = []
     with locked():
+        for path in sorted((STATE / "held").glob("*.json")):
+            held = read(path)
+            if isinstance(held, RetiredScriptHold):
+                settled.append(discard_script_hold(path, held))
         try:
             identity = codex_account(seats_home())
         except (OSError, ValueError):
@@ -373,7 +486,14 @@ def due(now: float) -> list[Settled]:
             elif now < held.held_at + held.minutes * 60:
                 continue
             elif problem := deliver(held):
-                settled.append(Settled(f"{path.stem}: NOT sent: {problem}", True))
+                if not problem.startswith("HELD:"):
+                    settled.append(Settled(f"{path.stem}: NOT sent: {problem}", True))
+                    continue
+                held = replace(held, outcome="review_held")
+                write(path, held)
+                errors = forward_review_hold(held, problem, path.stem)
+                settled.append(Settled(f"{path.stem}: {problem}", False))
+                settled.extend(Settled(f"{path.stem}: held result relay failed: {error}", True) for error in errors)
                 continue
             else:
                 held = replace(held, outcome="sent")
@@ -387,6 +507,9 @@ def listing(now: float) -> list[str]:
     lines: list[str] = []
     for path in sorted((STATE / "held").glob("*.json")):
         held = read(path)
+        if isinstance(held, RetiredScriptHold):
+            lines.append(f"{path.stem} - obsolete script hold {held.text_id}; closes on the next tick")
+            continue
         if isinstance(held, LegacyHeld) and not isinstance(held, HeldMessage):
             lines.append(f"{path.stem} - waiting for a hold that states its action")
             continue
@@ -444,8 +567,8 @@ def main(arguments: list[str]) -> int:
                 print(USAGE, file=sys.stderr)
                 return 2
             try:
-                started = hold(key, options["--summary"], options["--text"], action, int(options["--minutes"]),
-                               options["--need"])
+                started = hold(key, SessionPush(options["--summary"], options["--text"], action, options["--need"]),
+                               int(options["--minutes"]), origin=current_question_origin())
             except ValueError as error:
                 print(f"escalate.py: {error}. {FIX}", file=sys.stderr)
                 return 2

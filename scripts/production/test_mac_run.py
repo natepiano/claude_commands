@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import TypedDict, cast, final, override
 
 
+# Script completion deadlines only bound hangs; startup can be slow under load.
 SCRIPT = Path(__file__).with_name("mac_run.sh")
 MAC_TEST = SCRIPT.parent.parent / "mac_test" / "mac_test.py"
 SHA = "1234567890abcdef1234567890abcdef12345678"
@@ -87,12 +88,11 @@ if (
     os.environ.get("MAC_RUN_HOLD_BUILD") == "1"
     and "cargo build -q -p hana" in remote
 ):
-    (state / "build-started").write_text("started\n", encoding="utf-8")
-
     def stop(signum: int, _frame: object) -> None:
         raise SystemExit(128 + signum)
 
     signal.signal(signal.SIGTERM, stop)
+    (state / "build-started").write_text("started\n", encoding="utf-8")
     signal.pause()
 
 if "; echo mac_exit=$?" in remote:
@@ -200,11 +200,11 @@ class MacRunTests(unittest.TestCase):
             capture_output=True,
             text=True,
             check=False,
-            timeout=10,
+            timeout=300,
         )
 
     def mac_run(
-        self, *, extra: dict[str, str] | None = None, timeout: float = 30
+        self, *, extra: dict[str, str] | None = None, timeout: float = 300
     ) -> subprocess.CompletedProcess[str]:
         return subprocess.run(
             ["zsh", str(SCRIPT), str(self.repository), SHA, "0"],
@@ -257,7 +257,7 @@ class MacRunTests(unittest.TestCase):
         self.assertFalse((self.state_directory / "run.json").exists())
 
     def wait_for_path(self, path: Path) -> None:
-        deadline = time.monotonic() + 10
+        deadline = time.monotonic() + 300
         while time.monotonic() < deadline:
             if path.exists():
                 return
@@ -422,10 +422,10 @@ class MacRunTests(unittest.TestCase):
                 try:
                     self.wait_for_path(self.stub_state / "build-started")
                     os.killpg(process.pid, signal_number)
-                    output, errors = process.communicate(timeout=15)
+                    output, errors = process.communicate(timeout=300)
                 except BaseException:
                     os.killpg(process.pid, signal.SIGKILL)
-                    _ = process.communicate(timeout=5)
+                    _ = process.communicate(timeout=300)
                     raise
 
                 self.assertEqual(

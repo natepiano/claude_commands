@@ -5,10 +5,10 @@
 It starts `/nightly_review config rust messages` in one named, detached tmux session with Remote Control under
 the same name, replacing the previous night's unless the user is attached to it. A session under that
 name that no nightly review started is left running, and the review skips the night. The session runs
-on the account with room whose weekly allowance resets soonest.
+on the configured units account.
 It does the modes in order; for each it writes NIGHT/<mode>.md and messages natedev, which distills
 the proposals into NIGHT/digest.md and the ledger (/watcher). The night is skipped while that account
-is shut down, is not fit to launch, or no account has room.
+is shut down, is not fit to launch, or the units group is not configured.
 
 Nothing offers the proposals: the ledger's queue grows until the user asks for /nightly_next
 (user, 2026-10-10).
@@ -84,6 +84,7 @@ class LiveMessageCounts:
     failures: int
     unreviewed: int
     rules: tuple[tuple[str, int], ...]
+    template_failures: tuple[tuple[str, int], ...] = ()
 
 
 def json_record(line: str) -> dict[str, object]:
@@ -165,6 +166,7 @@ def showrunner_transcripts(since: datetime) -> list[Path]:
 def live_message_counts(path: Path, since: datetime) -> LiveMessageCounts:
     messages = failures = unreviewed = 0
     rules: dict[str, int] = {}
+    templates: dict[str, int] = {}
     if not path.exists():
         return LiveMessageCounts(0, 0, 0, ())
     for line in path.read_text(encoding="utf-8").splitlines():
@@ -180,16 +182,20 @@ def live_message_counts(path: Path, since: datetime) -> LiveMessageCounts:
             if record_time(record["time"]) < since:
                 continue
             verdict = record["verdict"]
+            text_id = data.get("text_id")
+            detail = data.get("detail", "")
+            if isinstance(text_id, str) and text_id and isinstance(detail, str) and detail.startswith("sent despite failed review") and data.get("sent") is not None:
+                templates[text_id] = templates.get(text_id, 0) + 1
             messages += 1
             if verdict.startswith("unreviewed:") or verdict == "review: off":
                 unreviewed += 1
-            elif verdict in ("rewrite", "ask"):
+            elif verdict in ("rewrite", "ask", "failed", "withhold"):
                 failures += 1
                 for rule in set(record["failed_rules"]):
                     rules[rule] = rules.get(rule, 0) + 1
         except (ValueError, TypeError):
             continue
-    return LiveMessageCounts(messages, failures, unreviewed, tuple(sorted(rules.items())))
+    return LiveMessageCounts(messages, failures, unreviewed, tuple(sorted(rules.items())), tuple(sorted(templates.items())))
 
 
 def messages(since: datetime) -> list[str]:
@@ -202,6 +208,7 @@ def messages(since: datetime) -> list[str]:
     counts = live_message_counts(review.state_path() / "review.jsonl", since)
     lines = [f"Live messages: {counts.messages}; failures: {counts.failures}; Unreviewed: {counts.unreviewed}."]
     lines.extend(f"Live rule {rule}: {count}" for rule, count in counts.rules)
+    lines.extend(f"Template {text_id} sent despite failed review: {count}" for text_id, count in counts.template_failures)
     transcripts = showrunner_transcripts(since)
     if not transcripts:
         return [*lines, "No showrunner replies in this interval."]
@@ -322,7 +329,7 @@ def launch_environment(_selection: ClaudeAccountsInUse) -> dict[str, str]:
 
 
 def tonight(selection: ClaudeAccountsInUse) -> list[str]:
-    """Start the review on the picked account, or give the one line that says why not."""
+    """Start the review on the configured units account, or report the refusal."""
     from scripts.accounts import accounts
     from scripts.herdr.herdr import Untrusted, UnreadableTrustFile, claude_trust, trust_command
 
@@ -345,9 +352,6 @@ def tonight(selection: ClaudeAccountsInUse) -> list[str]:
         return [f"skipped: shutdown state unreadable: {permission.detail}"]
     folder = Path.home() / "rust"
     trust_account = selected
-    inherited_config = environment.get("CLAUDE_CONFIG_DIR", "")
-    if isinstance(selected, accounts.DefaultAccount) and inherited_config:
-        trust_account = accounts.NamedAccount(inherited_config, Path(inherited_config))
     account_file = (trust_account.dir / ".claude.json" if isinstance(trust_account, accounts.NamedAccount)
                     else Path.home() / ".claude.json")
     trust = claude_trust(folder, account_file)

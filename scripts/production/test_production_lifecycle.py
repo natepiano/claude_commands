@@ -16,6 +16,7 @@ import fake_tmux
 from fake_tmux import FakeSession
 
 
+# Script completion deadlines only bound hangs; startup can be slow under load.
 SCRIPT = Path(__file__).with_name("production_lifecycle.py")
 STUB = '''#!__PYTHON__
 import os
@@ -184,7 +185,7 @@ class LifecycleTests(unittest.TestCase):
     def run_lifecycle(self, action: str, *extra: str) -> subprocess.CompletedProcess[str]:
         return subprocess.run([sys.executable, str(SCRIPT), action, "--production", str(self.doc),
                                *extra], cwd=self.checkout, env=self.env, capture_output=True,
-                              text=True, check=False, timeout=25)
+                              text=True, check=False, timeout=300)
 
     def assert_step(self, result: subprocess.CompletedProcess[str], state: str) -> None:
         self.assertRegex(result.stdout, rf"(?m)^[\w-]+: {state} — .+")

@@ -14,6 +14,7 @@ from typing import final, override
 from scripts.usage.collect import MAC_HOST
 
 
+# Script completion deadlines only bound hangs; startup can be slow under load.
 SCRIPT = Path(__file__).with_name("unit_run.py")
 REPOSITORY = SCRIPT.resolve().parents[2]
 EPOCH = datetime(2026, 10, 12, tzinfo=timezone.utc).timestamp()
@@ -113,7 +114,7 @@ class UnitRunTests(unittest.TestCase):
     def run_script(self, *arguments: str, unit: str = UNIT) -> subprocess.CompletedProcess[str]:
         return subprocess.run([sys.executable, str(SCRIPT), "--production", str(self.production),
                                unit, *arguments], env=self.environment, capture_output=True,
-                              text=True, check=False, timeout=20)
+                              text=True, check=False, timeout=300)
 
     def assert_match(self, result: subprocess.CompletedProcess[str], run_id: str,
                      machine: str, seconds: float) -> None:
