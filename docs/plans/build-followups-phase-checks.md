@@ -51,38 +51,30 @@ Fence (showrunner): Phase 2 edits `commands/unit/direct.md` and `scripts/delegat
 
 ### Phase 1 — The step is written, and its rules reach the seats  · status: done
 
-Unfenced. Touches neither `direct.md` nor `verify.sh`, deletes nothing `direct.md` still reads, and wires nothing new into a phase, so a run promoted with only this phase behaves as today and never runs the style review twice.
+**Depends on:** none
 
-- New `docs/delegate/phase_checks.md` defining `<PhaseChecks/>` as above.
-- `commands/unit/style_review.md`: a new `<StyleReview/>` section holds the review itself (moved from `clippy.md`: diff with untracked files, style-guide loader, rule table, banned-words `--diff` scan), over a range its caller names — the phase baseline from a run, or the working tree when the user runs `/unit:style_review` by hand. `<ResolveStyleDiffBase/>` and `<RunProjectStyleReview/>` stay until Phase 2, since `direct.md` still reads them.
-- `docs/delegate/write_prompt_contract.md`: the fixing rules above, in every repair prompt.
-- Tests: none; this phase only edits prompts. The gate is a reread of each edited contract against the table above.
+#### As-built
 
-#### Work Order
-
-**Goal:** `<PhaseChecks/>` exists as one named definition, `/unit:style_review` holds the style review itself, and every repair prompt carries `/clippy`'s fixing rules — with nothing yet wired into a phase.
-
-**Spec:**
-1. New `docs/delegate/phase_checks.md`, headed like its siblings ("Read at the point of use from `/unit:direct`. Defines `<PhaseChecks/>` in full."), holding `<PhaseChecks>…</PhaseChecks>` with: the six-row table from **The step** above (check, runs in, over); the `config/lint.conf` rule (an off check is reported `Off`, never clean); the rule that every finding is opened in the phase's findings ledger and goes to the phase's workers through `<FixDispatch/>` repair rounds, a repair's seat runs `lint` once more, and `lint` never reruns on an unchanged tree; and the `cargo mend --fix` rollback hard stop. State plainly that nothing after the last phase repeats these checks.
-2. `commands/unit/style_review.md`: add a `<StyleReview>` section holding the review moved from `commands/clippy.md`'s `<StyleReview/>`: building the diff (untracked files included), loading the guide with `zsh ~/.claude/scripts/rust_style/load-rust-style.sh`, the rule-by-rule table, and `python3 ~/.claude/scripts/hooks/banned_words_lib.py --diff`. It reviews the range its caller names: a run passes the phase baseline; a run by hand with no range reviews the working tree against `HEAD`. A violation is opened in the caller's findings ledger when there is one, else reported in the table. Leave `<ResolveStyleDiffBase/>`, `<RunProjectStyleReview/>` and the `clippy.md` read in place; `direct.md` still reads them until Phase 2. Do not edit `commands/clippy.md`.
-3. `docs/delegate/write_prompt_contract.md`: add the fixing rules to what every repair prompt carries — remove dead code rather than marking it; remove an unused binding rather than prefixing `_`; before a rename or signature change, find every reference with LSP `findReferences` and reread the changed body afterwards; look up a clippy lint's governing style rule with `grep -l "^lint:.*\b<lint>\b" ~/rust/nate_style/rust/*.md docs/style/*.md` before fixing it; on a `cargo mend --fix` rollback, stop and keep the tree. Place them beside the existing repair-prompt items; do not add a new numbered contract if an existing repair item can hold them.
+- `<PhaseChecks/>` lists the six checks run once per phase: mend `--fix`, fmt, taplo `--check`, clippy and rustdoc in the seats' last `verify.sh lint`, and the style review in the unit director's main review. An off check reports `Off`; findings go through `<FixDispatch/>`; `lint` reruns only on a changed tree; a mend rollback is a hard stop. A phase with no Rust change has no lint run, and its style review runs only the banned-words scan with the checklist marked `Skip (no Rust change)`. Nothing after the last phase repeats them.
+- `<StyleReview/>` reviews the range its caller names (`since <ref>`, default `HEAD`) in a directory its caller names or a fresh `mktemp -d` under `/tmp/claude`. It verifies the baseline with `git rev-parse --verify` and stops when the baseline or the tracked diff fails. It appends untracked files, walks the guide's checklist in a table, and runs `banned_words_lib.py --diff`. `<ResolveStyleDiffBase/>`, `<RunProjectStyleReview/>` and the `clippy.md` read are still present; `/unit:direct` reads them.
+- Every repair prompt's Work Specification (`write_prompt_contract.md` item 6) carries the fixing rules: remove dead code and unused bindings rather than marking or `_`-prefixing them; run LSP `findReferences` before a rename or signature change and reread the body; find a lint's style rule by its `lint:` property; stop on a mend rollback.
 
 **Files:**
-- `docs/delegate/phase_checks.md` — new; defines `<PhaseChecks/>`
-- `commands/unit/style_review.md` — new `<StyleReview/>` section
-- `docs/delegate/write_prompt_contract.md` — fixing rules in repair prompts
+- `docs/delegate/phase_checks.md` — `<PhaseChecks/>`
+- `commands/unit/style_review.md` — `<StyleReview/>`, plus the end-of-run sections Phase 2 removes
+- `docs/delegate/write_prompt_contract.md` — the fixing rules under item 6
 
-**Seats:** 1 writer, no tester — prompt docs only, no code and no test lane
-- `impl` — all three files
+**Binds later work:** the phase review passes the phase baseline and the run's session directory to `<StyleReview/>`; seats never load the style guide.
 
-**Constraints from prior phases:** none.
-
-**Acceptance gate:** each edited file reread against **The step**'s table and rules; `rg -n 'PhaseChecks' docs/delegate/phase_checks.md` defines the tag once; no forbidden word in any added line; `git diff --stat` touches only the three files.
+**Gotchas:** the style review's diff directory is per invocation; a fixed shared path lets concurrent units scan each other's diffs.
 
 ### Phase 2 — Unit directors run the step, and /clippy is gone  · status: todo (fenced)
 
-- `docs/delegate/dual_review.md`: the main review runs `<PhaseChecks/>`'s style review by reading `commands/unit/style_review.md` → `<StyleReview/>` over the phase diff, and records its table.
-- `commands/unit/style_review.md`: remove `<ResolveStyleDiffBase/>`, `<RunProjectStyleReview/>` and its `clippy.md` read (line 97).
+**Depends on:** Phase 1
+
+- `docs/delegate/dual_review.md`: the main review runs `<PhaseChecks/>`'s style review by reading `commands/unit/style_review.md` → `<StyleReview/>` with the phase baseline as its range and `${SESSION_DIR}` as its directory (it writes its diff there, never a shared path), opens each violation in the phase's findings ledger, and records its table. A phase with no Rust change runs only the banned-words scan.
+- `docs/delegate/write_prompt_contract.md` item 2: the `rust_style` line's reason ("this run's one style audit happens at the end") becomes the per-phase review: the unit director runs the style review in its main review, so seats still never load the guide.
+- `commands/unit/style_review.md`: remove `<ResolveStyleDiffBase/>`, `<RunProjectStyleReview/>` and its `clippy.md` read, and the intro's "`/unit:direct` reads this file twice" paragraph. `<StyleReview/>` already takes `since <ref>` and a caller directory, checks the baseline, and reports `Off` from `LINT_OP_STYLE_REVIEW`.
 - `commands/unit/direct.md`: name `<PhaseChecks/>` in the TagReferenceContract table and at the phase's review point. `<FinalGate/>` loses its `clippy.md` step and its `<RunProjectStyleReview/>` step, so `final` runs once with no cleanup rerun. Remove `<ResolveStyleDiffBase/>`, `STYLE_GATE_CONFIG`, `STYLE_REVIEW_DONE`, `STYLE_DIFF_BASE` and their handoff fields, the `/clippy` load rule (line 87) and the "full `clippy` skill" phase rule.
 - `scripts/delegate/verify.sh`: `final` drops fmt `--check`, which repeats the phases' fmt. It keeps `cargo check --workspace --all-targets` and the full tests, which no phase runs. Its comment naming `/clippy` is reworded.
 - Delete `commands/clippy.md` and `scripts/delegate/style_branch.sh`. Delete `scripts/lint/scan.sh`, `scripts/lint/clippy_config.sh` and `config/clippy.conf` only after confirming nothing else calls them — hooks, the nightly review, cargo-port's lint mirror, any script or settings entry; a file that has another caller stays. `scripts/delegate/progress_timer.sh` stays; the unit notifier uses it.
