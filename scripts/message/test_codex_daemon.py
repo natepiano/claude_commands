@@ -281,7 +281,7 @@ class CodexDaemonTests(unittest.TestCase):
     def test_default_daemon_stays_reachable_when_workers_select_a_numbered_home(self) -> None:
         notes = self.root / "notes"
         notes.mkdir()
-        _ = (notes / "codex 1.md").write_text("---\nlogin: workers@example.invalid\n---\n")
+        _ = (notes / "codex1.md").write_text("---\nlogin: workers@example.invalid\n---\n")
         home = self.root / ".codex1"
         home.mkdir()
         claims = base64.urlsafe_b64encode(json.dumps({"email": "workers@example.invalid"}).encode()).decode().rstrip("=")

@@ -144,7 +144,7 @@ class AccountHoldTests(unittest.TestCase):
         login = f"a{number}@example.invalid"
         claims = base64.urlsafe_b64encode(json.dumps({"email": login}).encode()).decode().rstrip("=")
         _ = (home / "auth.json").write_text(json.dumps({"tokens": {"id_token": f"x.{claims}.y"}}))
-        _ = (self.root / f"codex {number}.md").write_text(f"---\nlogin: {login}\n---\n")
+        _ = (self.root / f"codex{number}.md").write_text(f"---\nlogin: {login}\n---\n")
         self.assertEqual(accounts.main(["set-role", "seats", f"codex {number}"]), 0)
         identity = KnownCodexAccount(home, f"a{number}@example.invalid", f"codex {number}")
         live = Report("Codex", email=identity.login, source=CodexHomeSource(home),

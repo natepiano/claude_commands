@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from scripts.whoami.note_file import note_name
+
 import io
 import json
 import os
@@ -144,8 +146,8 @@ class ShutdownLaunchCliTests(ShutdownTestCase):
         )
         notes = self.root / "notes"
         notes.mkdir()
-        _ = (notes / f"{LABEL}.md").write_text(
-            f"---\nlogin: {LOGIN}\nstate: active\n---\n",
+        _ = (notes / note_name(LABEL)).write_text(
+            f"---\nlogin: {LOGIN}\nsessions: 1\n---\n",
             encoding="utf-8",
         )
         self.environment = {

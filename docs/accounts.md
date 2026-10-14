@@ -2,7 +2,7 @@
 
 ## Which account am I on?
 
-The status line's second row shows this session's account label. To print it:
+The status line's first row shows this session's account label, after its role. To print it:
 
 ```sh
 ~/.claude/scripts/lib/py ~/.claude/scripts/whoami/account.py
@@ -163,7 +163,7 @@ Then start `claude3` in a terminal, run `/login` as claude 3, and check `/showru
 
 ## Setting up a Codex home
 
-Create an account note with its login first (`~/rust/hanadocs/agents/codex N.md`). For codex 1:
+Create an account note with its login first (`~/rust/hanadocs/agents/codexN.md`). For codex 1:
 
 ```text
 /showrunner:accounts setup "codex 1"
@@ -246,3 +246,5 @@ Run `/showrunner:accounts`, fix what it names (most often the account's alias an
 `codex N` names the login in its account note, rather than a folder number. Selecting `codex 2` finds the existing home holding that note's login; it may be `~/.codex`. A home with no named note is shown by its folder. `default` remains accepted as input for `~/.codex`; account output uses its note number. Setup still creates `~/.codexN` when no home holds that account.
 
 Set `use_credits: on` or `use_credits: off` in each Codex note. Missing values mean on. With off, an exhausted weekly or 5-hour window makes the account unavailable even with credits. At weekly 0%, on keeps workers on paid credits with one phone and showrunner notice and hourly forecasts; off prefers an account with weekly usage left, then an account using its own credits. When neither is available or the move fails, Codex assignments move to Claude until the earliest refill. Only the first forecast goes to the phone. See `docs/quota_alerts.md` for delivery retries and unknown forecasts.
+
+Account notes use numbered filenames such as `claude1.md` and `codex2.md`; their labels remain `claude 1` and `codex 2`. The updater renames old filenames on its first pass, preserving bodies and modes. If both names exist it reports them and reads the numbered file. Each note carries a `role` list, a `sessions` count and a `## Live sessions` table from the roster on both machines. An unreachable or older peer keeps its last rows.
