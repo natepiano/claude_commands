@@ -35,7 +35,7 @@ Message the user with `send.py --to user --summary "<title>" --text "<message>" 
 - `send.py: <name> cannot take messages (no messaging socket); wait for it to open its messaging socket, then read the roster again and send again` (exit 2): that Claude session has not opened its messaging socket yet; follow the line.
 - `send.py: <name> matches <N> sessions:` (exit 2) lists their addresses; send again with one listed address.
 - `send.py: no roster session has address <address>` (exit 2): the address is stale or its seat is between turns; read the roster again.
-- `FAILED: <why>` (exit 3): for a send to the user, fall back to PushNotification with the `fallback text:` that `send.py` printed. Between sessions, including a Codex queue failure or timeout: no fallback; report the failure.
+- `FAILED: <why>` (exit 3): for a send to the user, use PushNotification only with the printed `fallback text:` (reviewed, or `--need blocked`). If the line says the push was never reviewed, bring it to the user in your reply or resend once the failure is fixed. Between sessions: no fallback; report the failure.
 - `send.py: absence of <name> here is not proven; use an address or --machine` (exit 2): this machine's roster had problems, so the other machine was not asked and nothing was sent; send again with an address or `--machine HOST`.
 - With `--machine HOST`, recipient refusals and ambiguous-name errors there return as `FAILED: ssh <host>: <reason>` (exit 3); recover from the reason as for that refusal here.
 - `broadcast: <unit> matches more than one unit director:` (exit 2) lists addresses, including matches across machines; nothing was delivered. Send again with `--of <one listed address>` before `--workers`.
