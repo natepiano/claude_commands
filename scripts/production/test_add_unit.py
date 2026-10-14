@@ -205,6 +205,7 @@ class AddUnitTests(ShutdownTestCase):
                     "CODEX_CATALOG_SYNC_STATE_FILE": str(sync_state)}
         _ = self.env.pop("CLAUDE_CONFIG_DIR", None)
         self.quota_reading("owner@example.com", 80, 7)
+        _ = self.select_unit_account("default")
 
     def quota_reading(self, login: str, left: float, reset_days: float) -> None:
         file = Path(self.env["HOME"]) / ".local/state/agent-notes/usage.json"
@@ -217,13 +218,10 @@ class AddUnitTests(ShutdownTestCase):
 
     def select_unit_account(self, label: str) -> Path:
         with patch.dict(os.environ, self.env):
-            config = accounts.accounts_config_file()
-            config.parent.mkdir(parents=True, exist_ok=True)
-            _ = config.write_text(
-                json.dumps(accounts.AccountsConfiguration(unit=label)),
-                encoding="utf-8",
-            )
-            return accounts.account_dir(label)
+            path = accounts.groups_file()
+            path.parent.mkdir(parents=True, exist_ok=True)
+            _ = path.write_text(json.dumps({"units": label, "showrunners": "default"}))
+            return accounts.main_config_dir() if label == "default" else accounts.account_dir(label)
 
     def trusted_projects(self) -> dict[str, dict[str, bool]]:
         return {str(folder): {"hasTrustDialogAccepted": True}
@@ -446,7 +444,7 @@ class AddUnitTests(ShutdownTestCase):
 
     def assert_director_flags(self, model: str, effort: str | None) -> None:
         command = self.launch_command()
-        flags = f"claude --model {model}"
+        flags = f"--model {model}"
         if effort is not None:
             flags += f" --effort {effort}"
         self.assertIn(flags + " ", command)
@@ -607,10 +605,10 @@ class AddUnitTests(ShutdownTestCase):
             _tmux: str,
             _director: add_unit.DirectorAgent,
             prompt: str,
-            _selected: add_unit.UnitLaunchAccount,
+            _selected: accounts.ClaudeLaunchAccount,
             *, target: str = "", model: str = "",
         ) -> None:
-            self.assertEqual(target, "")
+            self.assertEqual(target, "default" if isinstance(_request.session, add_unit.ResumedSession) else "")
             self.assertEqual(model, "")
             if isinstance(launch_kind, add_unit.UnitRestoreLaunch):
                 recorded = self.recorded_prompts(launch_kind.session_id)
@@ -1082,10 +1080,10 @@ class AddUnitTests(ShutdownTestCase):
             _tmux: str,
             _director: add_unit.DirectorAgent,
             _prompt: str,
-            _selected: add_unit.UnitLaunchAccount,
+            _selected: accounts.ClaudeLaunchAccount,
             *, target: str = "", model: str = "",
         ) -> None:
-            self.assertEqual(target, "")
+            self.assertEqual(target, "default" if isinstance(_request.session, add_unit.ResumedSession) else "")
             self.assertEqual(model, "")
             self.assertIsNotNone(creator)
             if creator is None:
@@ -1438,8 +1436,8 @@ class AddUnitTests(ShutdownTestCase):
             expected, launch_permission.NewWorkLaunchPurpose()
         )
 
-    def test_candidate_change_after_readiness_keeps_the_picked_launch_account(self) -> None:
-        """F003: a role change after checking cannot select an unchecked account."""
+    def test_better_candidate_after_readiness_keeps_the_stored_group_account(self) -> None:
+        """Better readings neither replace the stored group nor the checked launch account."""
         directory = self.prepare_unit_account("claude 3")
         ensure_worktree = add_unit.ensure_worktree
 
@@ -1447,6 +1445,7 @@ class AddUnitTests(ShutdownTestCase):
             ensure_worktree(request)
             _ = self.prepare_unit_account("claude 1")
             self.quota_reading("claude-1@example.invalid", 1, 1)
+            _ = self.select_unit_account("claude 3")
 
         with (
             patch.dict(os.environ, self.env),
@@ -1468,7 +1467,7 @@ class AddUnitTests(ShutdownTestCase):
         with patch.dict(os.environ, self.env):
             self.assertEqual(
                 accounts.role_account("unit"),
-                accounts.NamedAccount("claude 1", directory.parent / ".claude1"),
+                accounts.NamedAccount("claude 3", directory),
             )
 
     def test_new_unit_launch_records_default_account_for_a_later_resume(self) -> None:
@@ -1500,23 +1499,25 @@ class AddUnitTests(ShutdownTestCase):
         self.assertEqual(arguments[arguments.index("--model") + 1], "opus")
         self.assertEqual(self.recorded_unit_options("alpha")["@claude_model"], "opus")
 
-    def test_unit_resume_without_account_keeps_default_despite_named_unit_role(self) -> None:
-        directory = self.prepare_unit_account("claude 3")
-        self.env["CLAUDE_CONFIG_DIR"] = str(directory)
-        self.persist_unit_account(Path(self.env["HOME"]) / ".claude", session="alpha")
+    def test_unit_resume_uses_configured_account_instead_of_recorded_account(self) -> None:
+        """F004: the configured units account decides resumes too."""
+        old = self.prepare_unit_account("claude 2")
+        caller = self.prepare_unit_account("claude 3")
+        directory = self.prepare_unit_account("claude 1")
+        self.env["CLAUDE_CONFIG_DIR"] = str(caller)
+        self.persist_unit_account(old, session="alpha")
         prior = self.root / "prior-session"
         prior.mkdir()
-
-        _ = self.successful(
-            "alpha", "--plan", "docs/plans/given.md",
-            "--resume", "session-123", "--cwd", str(prior),
-        )
-
-        self.assertTrue(self.launch_command().startswith("unset CLAUDE_CONFIG_DIR CLAUDE_CODE_REMOTE_MEMORY_DIR CLAUDE_CODE_OAUTH_TOKEN; ENABLE_TOOL_SEARCH=true command claude "))
-        self.assertNotIn(str(directory), self.launch_command())
+        with (patch.dict(os.environ, self.env),
+              patch.object(accounts, "prepared_account", wraps=accounts.prepared_account) as prepared):
+            code = add_unit.main(["--production", str(self.doc), "alpha", "--plan", "docs/plans/given.md",
+                "--resume", "session-123", "--cwd", str(prior)])
+        self.assertEqual(code, 0)
+        prepared.assert_any_call("claude 1", resume=True)
+        self.assertEqual(self.recorded_unit_options("alpha")["@claude_config_dir"], str(directory))
         self.assertIn("--resume session-123", self.launch_command())
 
-    def test_unit_resume_without_account_keeps_its_own_named_account(self) -> None:
+    def test_unit_resume_uses_configured_account_instead_of_old_named_account(self) -> None:
         self.commit_prepared_row(self.unit_row())
         directory = self.prepare_unit_account("claude 1")
         other_directory = self.prepare_unit_account("claude 3")
@@ -1534,40 +1535,35 @@ class AddUnitTests(ShutdownTestCase):
             "--session-name", "recorded-name", "--host-session", "recorded-tmux",
         )
 
-        self.assertTrue(self.launch_command().startswith(
-            self.named_prefix(directory) + "ENABLE_TOOL_SEARCH=true command claude "
-        ))
+        self.assertEqual(self.recorded_unit_options("recorded-tmux")["@claude_config_dir"], str(other_directory))
+        self.assertIn("exec 'claude 3'", self.launch_command())
         self.assertIn("--resume session-123", self.launch_command())
-        self.assertNotIn(str(other_directory), self.launch_command())
+        self.assertNotIn(str(directory), self.launch_command())
 
-    def test_unit_resume_without_recorded_account_refuses_instead_of_using_callers_account(self) -> None:
-        self.env["CLAUDE_CONFIG_DIR"] = str(self.prepare_unit_account("claude 3"))
-        prior = self.root / "prior-session"
-        prior.mkdir()
-        before = self.repository_state()
-        result = self.cli("alpha", "--plan", "docs/plans/given.md",
-            "--resume", "unrecorded-session", "--cwd", str(prior))
-        self.assertNotEqual(result.returncode, 0)
-        self.assertEqual(len(result.stderr.splitlines()), 1)
-        self.assertIn("--account", result.stderr)
-        self.assertEqual(self.repository_state(), before)
-        self.assertEqual(self.events("systemd-run"), [])
-
-    def test_unit_resume_accepts_its_recorded_directory_outside_the_account_farm(self) -> None:
-        directory = self.root / "external account with spaces"
-        directory.mkdir()
-        _ = (directory / ".claude.json").write_text(json.dumps({
-            "oauthAccount": {"emailAddress": "external@example.invalid"},
-            "projects": self.trusted_projects()}), encoding="utf-8")
-        _ = self.prepare_unit_account("claude 3")
+    def test_unit_resume_without_recorded_account_uses_configured_units(self) -> None:
+        """F004: no retained account is needed once the group is configured."""
+        directory = self.prepare_unit_account("claude 1")
         prior = self.root / "prior-session"
         prior.mkdir()
         _ = self.successful("alpha", "--plan", "docs/plans/given.md",
-            "--resume", "session-123", "--cwd", str(prior), "--config-dir", str(directory))
-        self.assertTrue(self.launch_command().startswith(self.named_prefix(directory)))
-        self.assertIn("--resume session-123", self.launch_command())
+            "--resume", "unrecorded-session", "--cwd", str(prior))
+        self.assertEqual(self.recorded_unit_options("alpha")["@claude_config_dir"], str(directory))
 
-    def test_unit_resume_refuses_a_missing_recorded_directory_and_names_it(self) -> None:
+    def test_unit_resume_refuses_config_directory_outside_configured_account(self) -> None:
+        """F004: an explicit directory cannot replace the units account."""
+        directory = self.root / "external account with spaces"
+        directory.mkdir()
+        _ = self.prepare_unit_account("claude 1")
+        before = self.repository_state()
+        result = self.cli("alpha", "--plan", "docs/plans/given.md",
+            "--resume", "session-123", "--cwd", str(self.checkout), "--config-dir", str(directory))
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("claude 1", result.stderr)
+        self.assertEqual(self.repository_state(), before)
+        self.assertEqual(self.events("systemd-run"), [])
+
+    def test_unit_resume_refuses_missing_directory_that_differs_from_configured_default(self) -> None:
+        """F004: an override mismatch names configuration, not a missing former account."""
         directory = self.root / "gone-account"
         prior = self.root / "prior-session"
         prior.mkdir()
@@ -1576,8 +1572,8 @@ class AddUnitTests(ShutdownTestCase):
             "--resume", "session-123", "--cwd", str(prior), "--config-dir", str(directory))
         self.assertNotEqual(result.returncode, 0)
         self.assertEqual(len(result.stderr.splitlines()), 1)
-        self.assertIn(str(directory), result.stderr)
-        self.assertIn("is missing", result.stderr)
+        self.assertIn("units account is default", result.stderr)
+        self.assertIn("--account and --config-dir must name default", result.stderr)
         self.assertEqual(self.repository_state(), before)
         self.assertEqual(self.events("systemd-run"), [])
 
@@ -1592,42 +1588,69 @@ class AddUnitTests(ShutdownTestCase):
         self.assertEqual(arguments[arguments.index("--model") + 1], "opus")
         self.assertNotIn(str(directory), self.launch_command())
 
-    def test_unit_resume_explicit_account_overrides_its_old_account_and_role(self) -> None:
-        old_directory = self.prepare_unit_account("claude 1")
-        self.env["CLAUDE_CONFIG_DIR"] = str(old_directory)
-        target = self.prepare_unit_account("claude 3")
-        _ = self.select_unit_account("claude 1")
-        prior = self.root / "prior-session"
-        prior.mkdir()
-        _ = self.successful("alpha", "--plan", "docs/plans/given.md",
-            "--resume", "session-123", "--cwd", str(prior), "--account", "claude 3")
-        command = self.launch_command()
-        arguments = shlex.split(command.removesuffix("; exec zsh"))
-        script = next(argument for argument in arguments if argument.endswith("/accounts.py"))
-        self.assertEqual(arguments[arguments.index(script) + 1:arguments.index(script) + 3], ["exec", "claude 3"])
-        self.assertNotIn(str(target), command)
-        self.assertNotIn(str(old_directory), command)
-        self.assertIn("--resume session-123", command)
+    def test_unit_resume_refuses_account_that_differs_from_configured_units(self) -> None:
+        """F004: --account must agree with the configured group."""
+        _ = self.prepare_unit_account("claude 2")
+        _ = self.prepare_unit_account("claude 1")
+        before = self.repository_state()
+        result = self.cli("alpha", "--plan", "docs/plans/given.md",
+            "--resume", "session-123", "--cwd", str(self.checkout), "--account", "claude 2")
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("claude 1", result.stderr)
+        self.assertEqual(self.repository_state(), before)
+        self.assertEqual(self.events("systemd-run"), [])
 
-    def test_no_account_with_room_refuses_new_unit_before_launch_permission_or_table_changes(self) -> None:
-        self.quota_reading("owner@example.com", 0, 7)
-        document = self.doc.read_text(encoding="utf-8")
+    def test_unconfigured_units_refuse_new_standby_and_resume_without_writes(self) -> None:
+        """F004: every unit launch mode requires explicit configuration."""
+        with patch.dict(os.environ, self.env):
+            accounts.groups_file().unlink()
+        document = self.doc.read_text()
         head = self.git("rev-parse", "HEAD")
-        for mode in ([], ["--check"]):
+        for mode in (("--plan", "docs/plans/given.md"), ("--standby",),
+                     ("--plan", "docs/plans/given.md", "--resume", "session-123", "--cwd", str(self.checkout))):
             with self.subTest(mode=mode):
-                result = self.cli("alpha", "--plan", "docs/plans/given.md", *mode)
+                result = self.cli("alpha", *mode)
                 self.assertEqual(result.returncode, 2, result.stderr)
-                self.assertEqual(len(result.stderr.splitlines()), 1)
-                self.assertIn("no claude account has room", result.stderr)
+                self.assertIn("accounts.py move units <claude N>", result.stderr)
                 self.assert_no_launch_change(document, head)
-                self.assertFalse(Path(self.env["SHUTDOWN_STATE_DIR"]).exists())
+                self.assertFalse((Path(self.env["HOME"]) / ".local/state/accounts/groups.json").exists())
 
-    def test_new_unit_ignores_unfit_legacy_assignment_and_launches_on_picked_default(self) -> None:
+    def test_new_unit_refuses_unfit_configured_account_without_default_fallback(self) -> None:
+        """F004: a configured account cannot silently fall back to default."""
         directory = self.select_unit_account("claude 3")
         directory.mkdir()
+        before = self.repository_state()
+        result = self.cli("alpha", "--plan", "docs/plans/given.md")
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("claude3", result.stderr)
+        self.assertEqual(self.repository_state(), before)
+        self.assertEqual(self.events("systemd-run"), [])
+
+    def test_new_unit_and_standby_use_configured_units_despite_showrunner_caller(self) -> None:
+        """F004: caller identity does not decide either new unit launch mode."""
+        caller = self.prepare_unit_account("claude 3")
+        directory = self.prepare_unit_account("claude 1")
+        self.env["CLAUDE_CONFIG_DIR"] = str(caller)
+        path = Path(self.env["HOME"]) / ".local/state/accounts/groups.json"
+        _ = path.write_text(json.dumps({"units": "claude 1", "showrunners": "claude 3"}))
+        for name, mode in (("alpha", ("--plan", "docs/plans/given.md")), ("beta", ("--standby",))):
+            with self.subTest(mode=mode):
+                _ = self.successful(name, *mode)
+                self.assertEqual(self.recorded_unit_options(name)["@claude_config_dir"], str(directory))
+
+    def test_unit_accepts_explicit_account_matching_configured_units(self) -> None:
+        """F004: matching --account selects no alternative account."""
+        directory = self.prepare_unit_account("claude 1")
+        _ = self.successful("alpha", "--plan", "docs/plans/given.md", "--account", "claude 1")
+        self.assertEqual(self.recorded_unit_options("alpha")["@claude_config_dir"], str(directory))
+
+    def test_units_and_showrunners_may_share_the_launch_account(self) -> None:
+        """F004: sharing one account is valid configuration."""
+        directory = self.prepare_unit_account("claude 1")
+        path = Path(self.env["HOME"]) / ".local/state/accounts/groups.json"
+        _ = path.write_text(json.dumps({"units": "claude 1", "showrunners": "claude 1"}))
         _ = self.successful("alpha", "--plan", "docs/plans/given.md")
-        self.assertNotIn(str(directory), self.launch_command())
-        self.assertTrue(self.launch_command().startswith("unset CLAUDE_CONFIG_DIR CLAUDE_CODE_REMOTE_MEMORY_DIR CLAUDE_CODE_OAUTH_TOKEN; ENABLE_TOOL_SEARCH=true command claude "))
+        self.assertEqual(self.recorded_unit_options("alpha")["@claude_config_dir"], str(directory))
 
     def test_ready_unit_account_passes_check_without_launch_changes(self) -> None:
         _ = self.prepare_unit_account("claude 3")
@@ -1922,9 +1945,10 @@ class AddUnitTests(ShutdownTestCase):
         args = cast(list[str], tmux["args"])
         self.assertEqual(args[args.index("-c") + 1], str(prior))
         command = args[-1]
-        self.assertTrue(command.startswith("unset CLAUDE_CONFIG_DIR CLAUDE_CODE_REMOTE_MEMORY_DIR CLAUDE_CODE_OAUTH_TOKEN; ENABLE_TOOL_SEARCH=true command claude "))
+        self.assertTrue(command.startswith("unset CLAUDE_CONFIG_DIR CLAUDE_CODE_REMOTE_MEMORY_DIR CLAUDE_CODE_OAUTH_TOKEN; ENABLE_TOOL_SEARCH=true command "))
+        self.assertIn("accounts.py exec default", command)
         self.assertNotIn("CLAUDE_CONFIG_DIR=", command)
-        self.assertIn("claude --model opus --effort xhigh --resume session-123 --remote-control alpha -n alpha", command)
+        self.assertIn("--model opus --effort xhigh --resume session-123 --remote-control alpha -n alpha", command)
         self.assert_director_flags("opus", "xhigh")
         self.assertIn("You are now alpha-unit in production build-followups", command)
         promoted_plan = self.root / "project-alpha/docs/plans/given.md"
@@ -2046,7 +2070,8 @@ class AddUnitTests(ShutdownTestCase):
         self.assertEqual(set(has_targets), {f"={recorded_tmux}"})
 
         command = tmux[-1]
-        self.assertTrue(command.startswith("unset CLAUDE_CONFIG_DIR CLAUDE_CODE_REMOTE_MEMORY_DIR CLAUDE_CODE_OAUTH_TOKEN; ENABLE_TOOL_SEARCH=true command claude "))
+        self.assertTrue(command.startswith("unset CLAUDE_CONFIG_DIR CLAUDE_CODE_REMOTE_MEMORY_DIR CLAUDE_CODE_OAUTH_TOKEN; ENABLE_TOOL_SEARCH=true command "))
+        self.assertIn("accounts.py exec default", command)
         self.assertNotIn("CLAUDE_CONFIG_DIR=", command)
         encoded = command.split(" command ", 1)[1].rsplit("; exec zsh", 1)[0]
         claude = shlex.split(encoded)
@@ -2249,10 +2274,11 @@ class UnitLaunchProtocolTests(ShutdownTestCase):
         self.assertNotIn("env unit", instructions)
         self.assertNotIn("claude --resume", instructions)
 
-    def test_manual_unit_resume_requires_explicit_account_when_prior_account_is_unknown(self) -> None:
+    def test_manual_unit_resume_uses_configured_units_account_and_names_missing_configuration_command(self) -> None:
         instructions = self.resume_instructions()
-        self.assertIn("--account", instructions)
-        self.assertIn("recorded", instructions.casefold())
+        self.assertIn("starts it on the configured units account", instructions)
+        self.assertIn("units account is not configured", instructions)
+        self.assertIn("accounts.py move units", instructions)
 
     def test_production_import_paths_resolve_the_accounts_package(self) -> None:
         """F005: production's configured import search can find scripts.accounts."""

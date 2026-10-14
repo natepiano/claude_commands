@@ -5,10 +5,10 @@
 It starts `/nightly_review config rust messages` in one named, detached tmux session with Remote Control under
 the same name, replacing the previous night's unless the user is attached to it. A session under that
 name that no nightly review started is left running, and the review skips the night. The session runs
-on the account with room whose weekly allowance resets soonest.
+on the configured units account.
 It does the modes in order; for each it writes NIGHT/<mode>.md and messages natedev, which distills
 the proposals into NIGHT/digest.md and the ledger (/watcher). The night is skipped while that account
-is shut down, is not fit to launch, or no account has room.
+is shut down, is not fit to launch, or the units group is not configured.
 
 Nothing offers the proposals: the ledger's queue grows until the user asks for /nightly_next
 (user, 2026-10-10).
@@ -329,7 +329,7 @@ def launch_environment(_selection: ClaudeAccountsInUse) -> dict[str, str]:
 
 
 def tonight(selection: ClaudeAccountsInUse) -> list[str]:
-    """Start the review on the picked account, or give the one line that says why not."""
+    """Start the review on the configured units account, or report the refusal."""
     from scripts.accounts import accounts
     from scripts.herdr.herdr import Untrusted, UnreadableTrustFile, claude_trust, trust_command
 
@@ -352,9 +352,6 @@ def tonight(selection: ClaudeAccountsInUse) -> list[str]:
         return [f"skipped: shutdown state unreadable: {permission.detail}"]
     folder = Path.home() / "rust"
     trust_account = selected
-    inherited_config = environment.get("CLAUDE_CONFIG_DIR", "")
-    if isinstance(selected, accounts.DefaultAccount) and inherited_config:
-        trust_account = accounts.NamedAccount(inherited_config, Path(inherited_config))
     account_file = (trust_account.dir / ".claude.json" if isinstance(trust_account, accounts.NamedAccount)
                     else Path.home() / ".claude.json")
     trust = claude_trust(folder, account_file)
