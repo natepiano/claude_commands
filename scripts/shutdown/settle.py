@@ -707,7 +707,8 @@ def next_step(saved: SessionShutdown, owner: stop_work.FreshSession,
         return Finished()
     if progress in {"stopped", "already gone", "process identity lost"} and saved["then"] == "stop" and not _stop_retry_pending(saved):
         return Finished()
-    if _is_requester(saved) and any(
+    # `now` stops the requester too, without waiting for the rest of its request.
+    if saved["force"] != "now" and _is_requester(saved) and any(
         item["request_id"] == saved["request_id"]
         and item["session"]["session_id"] != saved["session"]["session_id"]
         and not _done(item) for item in others

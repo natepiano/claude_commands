@@ -641,6 +641,12 @@ class SettleTests(ShutdownTestCase):
         director = session_shutdown(unit("unit", "Unit"))
         self.assertIsInstance(settle.next_step(runner, self.matching(runner), [runner, director], NOW_UTC), settle.StopSession)
 
+    def test_now_stops_a_busy_requester_without_waiting_for_its_request(self) -> None:
+        requester = session_shutdown(top_level("requester", "Requester"), requester="requester", then="restart")
+        requester["force"] = "now"
+        other = session_shutdown(top_level("other", "Other"), requester="requester", then="restart")
+        self.assertIsInstance(settle.next_step(requester, self.matching(requester), [other], NOW_UTC), settle.StopSession)
+
     def test_requester_waits_for_its_own_request_through_restore_confirmation(self) -> None:
         requester = session_shutdown(top_level("requester", "Requester"), progress={"kind": "ready", "at": NOW}, requester="requester", then="restart")
         other = session_shutdown(top_level("other", "Other"), progress={"kind": "stopped", "at": NOW}, requester="requester", then="restart")
