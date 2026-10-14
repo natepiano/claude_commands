@@ -69,6 +69,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "build_hold"))
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "mac_test"))
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "whoami"))
 import run_out
+import note_file
 from run_out import READINGS_LOG, Reading
 from build_hold import NO_ADMISSION_ACK_S, ActiveHolders, DeliveryFailed, HoldCycle, HoldState, KnownReleaseEta, MemoryGateReturned, NoAdmissionAck, NoHolders, Holder, NothingToBuild, RecipientGone, ReleaseEntry, ReleaseRecordReadError, holder_directory, read_cycle, read_holders, read_release_state, release_record_error_line
 from mac_test import ActiveMacBlock, NoMacBlock, PendingMacBlock, ci_may_still_be_on, read_block, state_paths
@@ -123,7 +124,6 @@ DOT_RANGED = "●━"
 # The chart mode every showrunner's dailies use, kept in one file so no
 # session has to remember it (user, 2026-10-03). `--chart` sets it.
 CHART_CONF = Path.home() / ".local/state/showrunner/dailies.conf"
-AGENTS_DIR = Path.home() / "rust" / "hanadocs" / "agents"
 CHART_KEY = "chart"
 NOW_MARK = "▼ "
 # A unit under a /build:hold carries this marker on its timeline row; no
@@ -1410,24 +1410,6 @@ def agent_number(value: str | None) -> float | None:
     return number if math.isfinite(number) else None
 
 
-def agent_fields(path: Path) -> dict[str, str]:
-    try:
-        lines = path.read_text(encoding="utf-8").splitlines()
-    except (OSError, UnicodeError):
-        return {}
-    if not lines or lines[0] != "---":
-        return {}
-    if "---" not in lines[1:]:
-        return {}
-    fields: dict[str, str] = {}
-    for line in lines[1:]:
-        if line == "---":
-            break
-        if (match := re.fullmatch(r"([A-Za-z_][\w-]*):\s*(.*?)\s*", line)) is not None:
-            fields[match.group(1)] = match.group(2).strip("\"'")
-    return fields
-
-
 def agent_refill(reset: datetime, now: datetime, zone: ZoneInfo) -> str:
     local = reset.astimezone(zone)
     return f"{local:%H:%M} today" if local.date() == now.date() else f"{local:%a %H:%M}"
@@ -1486,10 +1468,12 @@ def agent_section(now: datetime, zone: ZoneInfo, *, at: str | None = None) -> li
     if stamped is not None and stamped.tzinfo is None:
         stamped = stamped.replace(tzinfo=zone)
     minute_end = stamped.timestamp() + 60 if stamped is not None else None
-    for path in sorted(AGENTS_DIR.glob("*.md")):
-        fields = agent_fields(path)
-        if fields.get("state") == "active":
-            account_readings = readings.get(path.stem, [])
+    for note in note_file.read_notes():
+        fields = {key: value for key in ("limit_reset_count", "limit_reset", "resets",
+                                        "weekly_usage_checked_at", "weekly_remaining_usage")
+                  if (value := note.get(key)) is not None}
+        if note_file.in_use(note):
+            account_readings = readings.get(note.label, [])
             if minute_end is not None:
                 account_readings = [reading for reading in account_readings if reading.at.timestamp() < minute_end]
                 checked_at = agent_time(fields.get("weekly_usage_checked_at"))
@@ -1497,7 +1481,7 @@ def agent_section(now: datetime, zone: ZoneInfo, *, at: str | None = None) -> li
                     latest = account_readings[-1]
                     fields["weekly_usage_checked_at"] = latest.at.isoformat()
                     fields["weekly_remaining_usage"] = str(100 - latest.used_percent)
-            lines.append(agent_line(path.stem, fields, account_readings, now, zone))
+            lines.append(agent_line(note.label, fields, account_readings, now, zone))
     if len(lines) == 1:
         lines.append("- none active")
     lines.append("")

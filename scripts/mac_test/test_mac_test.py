@@ -691,7 +691,7 @@ class MacTestCommandTests(unittest.TestCase):
                 self.assertTrue(mac_test.run_is_live(decoded))
                 self.assertEqual(decoded["what"], record["what"])
                 self.assertEqual(decoded["since"], record["since"])
-            self.assertNotIsInstance(mac_test.live_run(paths), mac_test.NoRun)
+            self.assertEqual([claim.record for claim in mac_test.live_claims(paths)], [decoded])
         self.assertEqual(self.run_state(), record)
 
     def test_claim_records_holder_session_and_starts_checkout_watcher(self) -> None:
@@ -913,6 +913,155 @@ class MacTestCommandTests(unittest.TestCase):
 
         self.assert_command(result, 12, f"state unreadable: {block_path}\n")
         self.assertFalse((self.state_directory / "run.json").exists())
+
+    def repository(self, name: str) -> Path:
+        """A folder that sweep.repo_name reads as the named repository."""
+        directory = self.root / "repositories" / name
+        (directory / ".git").mkdir(parents=True)
+        return directory
+
+    def repository_claim(self, name: str) -> RunState:
+        return cast(RunState, json.loads((self.state_directory / "claims" / f"{name}.json").read_text(encoding="utf-8")))
+
+    def claim_in(self, owner: int, what: str, worktree: Path) -> subprocess.CompletedProcess[str]:
+        return self.command("claim", "--pid", str(owner), "--what", what, "--worktree", str(worktree))
+
+    def busy_line(self, record: RunState) -> str:
+        since = datetime.fromisoformat(record["since"]).astimezone(LOCAL_ZONE).strftime("%H:%M")
+        return f"busy: {record['what']} since {since}\n"
+
+    def claim_names(self) -> list[str]:
+        claims = self.state_directory / "claims"
+        return sorted(path.name for path in claims.iterdir()) if claims.exists() else []
+
+    def test_two_repositories_claim_the_mac_at_once(self) -> None:
+        hana, liner = self.repository("hana"), self.repository("cargo-liner")
+        first, second = self.start_child(), self.start_child()
+        self.assert_command(self.claim_in(first.pid, "hana tests", hana), 0, "claimed\n")
+        self.assert_command(self.claim_in(second.pid, "liner tests", liner), 0, "claimed\n")
+        self.assertEqual(self.claim_names(), ["cargo-liner.json", "hana.json"])
+        self.assertFalse((self.state_directory / "run.json").exists())
+        self.assertEqual((self.repository_claim("hana")["pid"], self.repository_claim("hana")["worktree"]),
+                         (first.pid, str(hana)))
+        self.assertEqual((self.repository_claim("cargo-liner")["pid"], self.repository_claim("cargo-liner")["worktree"]),
+                         (second.pid, str(liner)))
+        self.write_config(ci_repo="")
+        status = self.command("status")
+        self.assertEqual(status.returncode, 0, status.stdout + status.stderr)
+        lines = status.stdout.splitlines()
+        self.assertEqual(lines[0], f"running: hana tests ({hana}) since {self.local_time(self.repository_claim('hana')['since'])}")
+        self.assertEqual(lines[1], f"running: liner tests ({liner}) since "
+                         + self.local_time(self.repository_claim("cargo-liner")["since"]))
+        self.assertEqual(lines[2:], ["no block", "CI's Mac switch: not configured"])
+
+    def test_second_claim_for_one_repository_is_busy(self) -> None:
+        hana = self.repository("hana")
+        (hana / "crates").mkdir()
+        first, second = self.start_child(), self.start_child()
+        self.assert_command(self.claim_in(first.pid, "hana tests", hana), 0, "claimed\n")
+        held = self.repository_claim("hana")
+        self.assert_command(self.claim_in(second.pid, "more hana tests", hana / "crates"), 11, self.busy_line(held))
+        self.assertEqual(self.repository_claim("hana"), held)
+        self.assertEqual(self.claim_names(), ["hana.json"])
+
+    def test_dead_repository_claim_frees_itself(self) -> None:
+        hana = self.repository("hana")
+        owner = self.start_child()
+        self.assert_command(self.claim_in(owner.pid, "hana tests", hana), 0, "claimed\n")
+        self.stop_child(owner)
+        taker = self.start_child()
+        self.assert_command(self.claim_in(taker.pid, "new hana tests", hana), 0, "claimed\n")
+        after = self.repository_claim("hana")
+        self.assertEqual((after["pid"], after["what"]), (taker.pid, "new hana tests"))
+
+    def test_block_declines_every_repository_and_whole_mac_claim(self) -> None:
+        hana, liner = self.repository("hana"), self.repository("cargo-liner")
+        _ = self.write_block(free_message={"kind": "not_needed"})
+        owner = self.start_child()
+        for worktree in (hana, liner, self.root / "elsewhere"):
+            with self.subTest(worktree=worktree.name):
+                self.assert_command(self.claim_in(owner.pid, "tests", worktree), 10, "blocked by alice: release work\n")
+        self.assertEqual(self.claim_names(), [])
+        self.assertFalse((self.state_directory / "run.json").exists())
+
+    def test_free_now_answers_for_the_named_repository(self) -> None:
+        hana, liner = self.repository("hana"), self.repository("cargo-liner")
+        (hana / "crates").mkdir()
+        self.write_config(offload="on")
+        owner = self.start_child()
+        self.assert_command(self.claim_in(owner.pid, "hana tests", hana), 0, "claimed\n")
+        self.assert_command(self.command("free-now", "--repo-root", str(liner)), 0, "free\n")
+        self.assert_command(self.command("free-now", "--repo-root", str(hana)), 1, "busy\n")
+        self.assert_command(self.command("free-now", "--repo-root", str(hana / "crates")), 1, "busy\n")
+        self.assert_command(self.command("free-now"), 1, "busy\n")
+        _ = self.write_block(free_message={"kind": "not_needed"})
+        self.assert_command(self.command("free-now", "--repo-root", str(liner)), 1, "blocked\n")
+        self.assertEqual(self.logged_arguments("gh"), [])
+
+    def write_machine_wide_record(self, owner: int, worktree: Path) -> RunState:
+        started = mac_test.process_start_time(owner)
+        assert started is not None
+        record: RunState = {"pid": owner, "proc_start": started, "what": "older tests",
+                            "worktree": str(worktree), "since": datetime.now(timezone.utc).isoformat()}
+        self.state_directory.mkdir(exist_ok=True)
+        _ = (self.state_directory / "run.json").write_text(json.dumps(record), encoding="utf-8")
+        return record
+
+    def test_machine_wide_record_holds_the_repository_its_worktree_is_in(self) -> None:
+        hana, liner = self.repository("hana"), self.repository("cargo-liner")
+        self.write_config(offload="on")
+        owner, other = self.start_child(), self.start_child()
+        record = self.write_machine_wide_record(owner.pid, hana)
+        legacy = self.state_directory / "run.json"
+        before = legacy.read_bytes()
+        self.assert_command(self.claim_in(other.pid, "hana tests", hana), 11, self.busy_line(record))
+        self.assert_command(self.command("free-now", "--repo-root", str(hana)), 1, "busy\n")
+        self.assert_command(self.command("free-now", "--repo-root", str(liner)), 0, "free\n")
+        self.assert_command(self.claim_in(other.pid, "liner tests", liner), 0, "claimed\n")
+        self.assertEqual(legacy.read_bytes(), before)
+        self.assert_command(self.command("release", "--pid", str(owner.pid)), 0, "")
+        self.assertFalse(legacy.exists())
+        self.assertEqual(self.claim_names(), ["cargo-liner.json"])
+        self.assert_command(self.claim_in(owner.pid, "hana tests", hana), 0, "claimed\n")
+
+    def test_machine_wide_record_outside_any_repository_holds_every_repository(self) -> None:
+        hana, liner = self.repository("hana"), self.repository("cargo-liner")
+        self.write_config(offload="on")
+        owner, other = self.start_child(), self.start_child()
+        record = self.write_machine_wide_record(owner.pid, self.root / "elsewhere")
+        legacy = self.state_directory / "run.json"
+        before = legacy.read_bytes()
+        for worktree in (hana, liner):
+            with self.subTest(worktree=worktree.name):
+                self.assert_command(self.claim_in(other.pid, "tests", worktree), 11, self.busy_line(record))
+                self.assert_command(self.command("free-now", "--repo-root", str(worktree)), 1, "busy\n")
+        self.assertEqual(legacy.read_bytes(), before)
+        self.assertEqual(self.claim_names(), [])
+        self.assert_command(self.command("release", "--pid", str(owner.pid)), 0, "")
+        self.assertFalse(legacy.exists())
+
+    def test_whole_mac_claim_waits_for_any_repository_claim(self) -> None:
+        hana, liner = self.repository("hana"), self.repository("cargo-liner")
+        owner, other = self.start_child(), self.start_child()
+        self.assert_command(self.claim_in(owner.pid, "hana tests", hana), 0, "claimed\n")
+        held = self.repository_claim("hana")
+        self.assert_command(self.command("claim", "--pid", str(other.pid), "--what", "mac tests"), 11, self.busy_line(held))
+        self.assertFalse((self.state_directory / "run.json").exists())
+        self.assert_command(self.command("release", "--pid", str(owner.pid)), 0, "")
+        self.assert_command(self.command("claim", "--pid", str(other.pid), "--what", "mac tests"), 0, "claimed\n")
+        whole = self.run_state()
+        self.assertEqual(whole["worktree"], str(self.root))
+        self.assert_command(self.claim_in(owner.pid, "liner tests", liner), 11, self.busy_line(whole))
+
+    def test_release_removes_the_owner_claims_past_a_damaged_claim_file(self) -> None:
+        hana = self.repository("hana")
+        owner = self.start_child()
+        self.assert_command(self.claim_in(owner.pid, "hana tests", hana), 0, "claimed\n")
+        damaged = self.state_directory / "claims" / "cargo-liner.json"
+        _ = damaged.write_text("damaged\n", encoding="utf-8")
+        self.assert_command(self.command("release", "--pid", str(owner.pid)), 0, "")
+        self.assertEqual(self.claim_names(), ["cargo-liner.json"])
+        self.assert_command(self.claim_in(owner.pid, "hana tests", hana), 12, f"state unreadable: {damaged}\n")
 
     def hold_events(self, expected: int = 1) -> list[HoldEventRecord]:
         deadline = time.monotonic() + 5
@@ -2383,7 +2532,8 @@ class ClaimWatchTests(unittest.TestCase):
         text = (
             'Your Mac claim "alpha tests" (since 08:00) was released at 08:30: nothing ran on the Mac for 15 minutes, '
             + "so tests waiting for it can run. Claim it again before your next Mac command: "
-            + "python3 ~/.claude/scripts/mac_test/mac_test.py claim --pid $$ --what 'alpha tests' --remote 'claim-mac' (see /build:mac)."
+            + "python3 ~/.claude/scripts/mac_test/mac_test.py claim --pid $$ --what 'alpha tests' "
+            + f"--worktree '{self.root}' --remote 'claim-mac' (see /build:mac)."
         )
         self.assertEqual(send.call_args.args[4], text)
         self.assertIn("released", output)
@@ -2404,11 +2554,12 @@ class ClaimWatchTests(unittest.TestCase):
         self.assertEqual(send.call_args.args[4], (
             'Your Mac claim "alpha tests" (since 08:00) was released at 08:30: nothing ran on the Mac for 15 minutes, '
             + "so tests waiting for it can run. Claim it again before your next Mac command: "
-            + "python3 ~/.claude/scripts/mac_test/mac_test.py claim --pid $$ --what 'alpha tests' (see /build:mac)."
+            + f"python3 ~/.claude/scripts/mac_test/mac_test.py claim --pid $$ --what 'alpha tests' --worktree '{self.root}' "
+            + "(see /build:mac)."
         ))
 
     def test_remote_claim_release_command_quotes_host_and_job(self) -> None:
-        _ = self.write_claim(what="alpha's tests", remote_host="host's name",
+        _ = self.write_claim(what="alpha's tests", remote_host="host's name", worktree="/work/alpha's tree",
                              idle_since=mac_test.timestamp(self.now - timedelta(minutes=15)))
         with mock.patch.object(mac_test, "check_mac_activity", return_value=mac_test.MacIdle()), \
              mock.patch.object(mac_test, "send_message", return_value=True) as send:
@@ -2418,8 +2569,52 @@ class ClaimWatchTests(unittest.TestCase):
             'Your Mac claim "alpha\'s tests" (since 08:00) was released at 08:30: nothing ran on the Mac for 15 minutes, '
             + "so tests waiting for it can run. Claim it again before your next Mac command: "
             + "python3 ~/.claude/scripts/mac_test/mac_test.py claim --pid $$ "
-            + "--what 'alpha'\"'\"'s tests' --remote 'host'\"'\"'s name' (see /build:mac)."
+            + "--what 'alpha'\"'\"'s tests' --worktree '/work/alpha'\"'\"'s tree' --remote 'host'\"'\"'s name' "
+            + "(see /build:mac)."
         ))
+
+    def write_repository_claims(self, **hana_changes: object) -> dict[str, dict[str, object]]:
+        self.paths.claims.mkdir()
+        records: dict[str, dict[str, object]] = {}
+        for name in ("hana", "cargo-liner"):
+            record: dict[str, object] = {
+                "pid": os.getpid(), "proc_start": "owner-start", "what": f"{name} tests",
+                "worktree": f"/work/{name}", "since": "2026-10-13T12:00:00+00:00",
+                "remote_host": "claim-mac", "holder_session": "holder-session",
+            }
+            if name == "hana":
+                record.update(hana_changes)
+            _ = (self.paths.claims / f"{name}.json").write_text(json.dumps(record))
+            records[name] = record
+        return records
+
+    def read_repository_claim(self, name: str) -> dict[str, object]:
+        return cast(dict[str, object], json.loads((self.paths.claims / f"{name}.json").read_text()))
+
+    def test_one_activity_check_per_host_serves_every_repository_claim(self) -> None:
+        records = self.write_repository_claims()
+        with mock.patch.object(mac_test, "check_mac_activity", return_value=mac_test.MacIdle()) as activity, \
+             mock.patch.object(mac_test, "send_message") as send:
+            _ = self.watch_once()
+        activity.assert_called_once()
+        self.assertEqual(activity.call_args.args[1], "claim-mac")
+        send.assert_not_called()
+        for name, record in records.items():
+            with self.subTest(name=name):
+                self.assertEqual(self.read_repository_claim(name), {**record, "idle_since": mac_test.timestamp(self.now)})
+
+    def test_idle_release_removes_only_that_repository_claim(self) -> None:
+        records = self.write_repository_claims(idle_since=mac_test.timestamp(self.now - timedelta(minutes=15)))
+        with mock.patch.object(mac_test, "check_mac_activity", return_value=mac_test.MacIdle()) as activity, \
+             mock.patch.object(mac_test, "send_message", return_value=True) as send:
+            _ = self.watch_once()
+        activity.assert_called_once()
+        self.assertFalse((self.paths.claims / "hana.json").exists())
+        self.assertEqual(self.read_repository_claim("cargo-liner"),
+                         {**records["cargo-liner"], "idle_since": mac_test.timestamp(self.now)})
+        send.assert_called_once()
+        self.assertTrue(cast(str, send.call_args.args[4]).endswith(
+            "claim --pid $$ --what 'hana tests' --worktree '/work/hana' --remote 'claim-mac' (see /build:mac)."))
 
     def test_idle_release_without_holder_session_prints_and_sends_nothing(self) -> None:
         record = self.write_claim(idle_since=mac_test.timestamp(self.now - timedelta(minutes=20)))

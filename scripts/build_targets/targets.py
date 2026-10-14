@@ -79,9 +79,35 @@ class Free:
 
 
 @dataclass(frozen=True)
-class Running:
+class IdleSince:
+    """The claim watcher has seen the Mac idle since this time."""
+
+    when: datetime
+
+
+@dataclass(frozen=True)
+class NotSeenIdle:
+    """The claim watcher has not seen the Mac idle during this claim."""
+
+
+ClaimIdle = IdleSince | NotSeenIdle
+NOT_SEEN_IDLE = NotSeenIdle()
+
+
+@dataclass(frozen=True)
+class RunningJob:
+    """One live Mac claim: a job for one repository, or for the whole Mac."""
+
     what: str
     since: datetime
+    idle: ClaimIdle
+
+
+@dataclass(frozen=True)
+class Running:
+    """Every live Mac claim, oldest first."""
+
+    jobs: tuple[RunningJob, ...]
 
 
 @dataclass(frozen=True)
@@ -134,6 +160,15 @@ def utc_now() -> datetime:
     return datetime.now(timezone.utc)
 
 
+def running_job(claim: mac_test.HeldClaim) -> RunningJob:
+    record = claim.record
+    since = mac_test.aware_timestamp(record["since"], claim.path, "since")
+    if "idle_since" not in record:
+        return RunningJob(record["what"], since, NOT_SEEN_IDLE)
+    idle = mac_test.aware_timestamp(record["idle_since"], claim.path, "idle_since")
+    return RunningJob(record["what"], since, IdleSince(idle))
+
+
 def target_state(target: Target) -> TargetState:
     """Read state without probing a host or changing coordination files."""
     try:
@@ -149,7 +184,7 @@ def target_state(target: Target) -> TargetState:
             )
             return Held(holder.name, holder.purpose, holder.since, end)
         paths = mac_test.state_paths()
-        run = mac_test.read_run(paths.run)
+        claims = mac_test.read_claims(paths)
         block = mac_test.read_claim_block(paths)
         if not isinstance(block, mac_test.NoMacBlock):
             block_end = (
@@ -158,9 +193,7 @@ def target_state(target: Target) -> TargetState:
                 else AwaitingBlockRemoval()
             )
             return Held(block.holder, block.reason, block.since, block_end)
-        if isinstance(run, mac_test.NoRun) or not mac_test.run_is_live(run):
-            return Free()
-        since = mac_test.aware_timestamp(run["since"], paths.run, "since")
-        return Running(run["what"], since)
+        jobs = tuple(running_job(claim) for claim in claims if mac_test.run_is_live(claim.record))
+        return Running(jobs) if jobs else Free()
     except (OSError, UnicodeError, mac_test.StateReadError) as error:
         return StateUnreadable(str(error))

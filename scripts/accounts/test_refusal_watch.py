@@ -1,6 +1,8 @@
 """A provider refusal moves only its live owner, once, through safe shutdown."""
 from __future__ import annotations
 
+from scripts.whoami.note_file import note_name
+
 import io
 import json
 import os
@@ -73,8 +75,8 @@ class RefusalWatchTests(unittest.TestCase):
         for label, login in (("claude 1", SOURCE_LOGIN), ("claude 3", TARGET_LOGIN)):
             self.assertEqual(accounts.setup(label), [])
             _ = (accounts.account_dir(label) / ".claude.json").write_text(json.dumps({"oauthAccount": {"emailAddress": login}}))
-            _ = (self.home / "notes" / f"{label}.md").write_text(f"---\nlogin: {login}\n---\n")
-        _ = (self.home / "notes/claude 2.md").write_text("---\nlogin: main@example.invalid\n---\n")
+            _ = (self.home / "notes" / note_name(label)).write_text(f"---\nlogin: {login}\n---\n")
+        _ = (self.home / "notes/claude2.md").write_text("---\nlogin: main@example.invalid\n---\n")
         self.owners = []
         self.live = []
         WatchTime.at = NOW

@@ -12,10 +12,11 @@ import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import override
+from typing import cast, override
 from unittest.mock import patch
 
 import dailies_render
+from scripts.whoami import note_file
 
 
 AT = "2026-10-05T12:45"
@@ -46,7 +47,7 @@ class DailiesAgentsTests(unittest.TestCase):
         os.environ["BUILD_HOLD_DIR"] = str(self.holders)
         os.environ["MAC_TEST_STATE_DIR"] = str(self.root / "mac-test")
         time.tzset()
-        _ = self.enterContext(patch.object(dailies_render, "AGENTS_DIR", self.agents, create=True))
+        _ = cast(object, self.enterContext(patch.dict(os.environ, {"HOME": str(self.root), "AGENT_NOTES_DIR": str(self.agents)})))
         _ = self.enterContext(patch.object(dailies_render, "READINGS_LOG", self.readings, create=True))
         _ = self.enterContext(patch.object(dailies_render, "CHART_CONF", self.root / "chart.conf"))
 
@@ -75,9 +76,9 @@ class DailiesAgentsTests(unittest.TestCase):
         checked: str = "2026-10-05T19:45:00+00:00",
         count: str | None = "1",
         limit: str | None = "2026-10-22T12:00:00",
-        state: str = "active",
+        in_use: bool = True,
     ) -> None:
-        fields = [f"state: {state}", f"weekly_usage_checked_at: {checked}"]
+        fields = ["role: unit" if in_use else "role: []", "sessions: 0", f"weekly_usage_checked_at: {checked}"]
         if resets is not None:
             fields.append(f"resets: {resets}")
         if usage is not None:
@@ -86,7 +87,7 @@ class DailiesAgentsTests(unittest.TestCase):
             fields.append(f"limit_reset_count: {count}")
         if limit is not None:
             fields.append(f"limit_reset: {limit}")
-        _ = (self.agents / f"{name}.md").write_text("---\n" + "\n".join(fields) + "\n---\nBody.\n")
+        _ = (self.agents / note_file.note_name(name)).write_text("---\n" + "\n".join(fields) + "\n---\nBody.\n")
 
     def log(self, *readings: tuple[str, str, float]) -> None:
         _ = self.readings.write_text("".join(
@@ -137,6 +138,18 @@ class DailiesAgentsTests(unittest.TestCase):
         self.assertEqual(code, 0, errors.getvalue())
         return output.getvalue()
 
+    def test_agents_include_role_only_and_session_only_accounts_by_spaced_label(self) -> None:
+        self.note("claude 1", count=None, limit=None)
+        self.note("codex 2", count=None, limit=None, in_use=False)
+        path = self.agents / "codex2.md"
+        _ = path.write_text(path.read_text().replace("sessions: 0", "sessions: 1"))
+        self.note("claude 3", in_use=False)
+        lines = self.agent_lines(self.run_report())
+        self.assertTrue(any(line.startswith("* claude 1:") for line in lines))
+        self.assertTrue(any(line.startswith("* codex 2:") for line in lines))
+        self.assertFalse(any("claude 3" in line for line in lines))
+        self.assertFalse(any("codex2:" in line for line in lines))
+
     def test_pace_before_a_reset_still_counts(self) -> None:
         """The 57 points before the reset slow the pace; the 19 since it alone would say Wed 02:49."""
         self.note("claude 1", usage="81", checked="2026-10-06T17:11:00+00:00")
@@ -176,7 +189,7 @@ class DailiesAgentsTests(unittest.TestCase):
         self.note("claude 1", usage="60", checked="2026-10-05T08:10:00+00:00")
         self.note("codex 2", usage="22", resets="2026-10-11T02:25:00",
                   count="1", limit="2026-10-29T03:00:00-04:00")
-        self.note("codex 3", state="inactive")
+        self.note("codex 3", in_use=False)
         self.log(
             *self.climb("claude 1", "2026-10-05T06:10:00+00:00", "2026-10-05T08:10:00+00:00", 64, 60),
             *self.climb("codex 2", "2026-10-05T15:45:00+00:00", "2026-10-05T19:45:00+00:00", 33, 22),
@@ -320,8 +333,8 @@ class DailiesAgentsTests(unittest.TestCase):
             "* claude 1: week's usage unknown; refills Sun 23:00; resets unknown",
             "* codex 1: week's usage unknown; refill time unknown; no resets available",
         ])
-        (self.agents / "claude 1.md").unlink()
-        (self.agents / "codex 1.md").unlink()
+        (self.agents / "claude1.md").unlink()
+        (self.agents / "codex1.md").unlink()
         self.assertEqual(self.agent_lines(self.run_report()), ["* none active"])
 
     def test_exhausted_and_missing_usage(self) -> None:

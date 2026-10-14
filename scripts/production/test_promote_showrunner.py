@@ -118,7 +118,7 @@ class PromoteShowrunnerTests(unittest.TestCase):
         notes = self.root / "notes"
         notes.mkdir(exist_ok=True)
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {"AGENT_NOTES_DIR": str(notes)})))
-        _ = (notes / "claude 3.md").write_text("---\nlogin: showrunner@example.invalid\n---\n")
+        _ = (notes / "claude3.md").write_text("---\nlogin: showrunner@example.invalid\n---\n")
         self.assertEqual(accounts.setup("claude 3"), [])
         directory = accounts.account_dir("claude 3")
         _ = (directory / ".claude.json").write_text(json.dumps({"oauthAccount": {"emailAddress": "showrunner@example.invalid"}}))
