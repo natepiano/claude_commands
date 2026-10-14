@@ -1738,12 +1738,21 @@ class SettleTests(ShutdownTestCase):
         self.assertLess(len(posted), 500)
         self.assertLess(len(cast(str, alert.call_args.args[0])), 45)
 
+    def test_unit_session_issue_text_identifies_the_host_name_and_cause(self) -> None:
+        for host in ("tmux", "herdr"):
+            for cause in ("stop not confirmed", "owner identity lost"):
+                with self.subTest(host=host, cause=cause):
+                    issue = record.UnitSessionLeftRunning(kind="unit session left running", at=NOW,
+                        host=host, session_name="named-unit", cause=cause)
+                    self.assertEqual(settle.stop_issue_text(issue),
+                        f"{host} session named-unit left running: {cause}")
+
     def test_report_stop_treats_owner_resource_issues_as_a_partial_stop(self) -> None:
         for kind in ("stopped", "already gone", "process identity lost"):
             for alerts in ("user", "none"):
                 saved = session_shutdown(top_level("owner", "Owner"), progress=cast(record.SessionProgress, cast(object, {"kind": kind, "at": NOW})), requester="requester")
                 saved["hold"], saved["alerts"] = "account", alerts
-                saved["stop_issues"] = [record.UnitTmuxLeftRunning(kind="unit tmux session left running", at=NOW, tmux_session="unit", cause="stop not confirmed")]
+                saved["stop_issues"] = [record.UnitSessionLeftRunning(kind="unit session left running", at=NOW, host="tmux", session_name="unit", cause="stop not confirmed")]
                 with patch.object(settle, "run_remote", return_value=(0, "[]")), patch.object(settle, "send_message", return_value={"kind": "sent"}) as send, patch.object(settle, "alert_user") as alert:
                     settle.report_stop([saved])
                 self.assertEqual(send.call_args.args[1], f"{LABEL}: stop partial")
@@ -1777,7 +1786,7 @@ class SettleTests(ShutdownTestCase):
 
     def test_now_reports_a_persistent_cleanup_failure_after_one_owned_retry(self) -> None:
         saved = session_shutdown(top_level("owner", "Owner"), progress={"kind": "already gone", "at": NOW})
-        saved["stop_issues"] = [record.UnitTmuxLeftRunning(kind="unit tmux session left running", at=NOW, tmux_session="unit", cause="stop not confirmed")]
+        saved["stop_issues"] = [record.UnitSessionLeftRunning(kind="unit session left running", at=NOW, host="tmux", session_name="unit", cause="stop not confirmed")]
         self.save(saved)
         def failed_cleanup(current: record.SessionShutdown) -> record.SessionShutdown:
             return current
