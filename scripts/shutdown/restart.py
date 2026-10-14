@@ -81,7 +81,7 @@ from remote import other_machine, run_remote  # noqa: E402
 import sessions  # noqa: E402
 import showrunner_footer  # noqa: E402
 import stop as stop_work  # noqa: E402
-from user_action import ActionRequired  # noqa: E402
+from push_texts import RenderedPush, render  # noqa: E402
 from user_zone import user_zone  # noqa: E402
 
 
@@ -102,6 +102,7 @@ class ShutdownServices(Protocol):
 
     def record_time(self) -> str: ...
     def local_machine(self) -> str: ...
+    def stopped_sessions_text(self, count: int) -> str: ...
     def retire_command(self, login: str, session_id: str) -> list[str]: ...
     def run_notifier(self, verb: str, instance: str) -> None: ...
     def send_message(
@@ -112,7 +113,7 @@ class ShutdownServices(Protocol):
         self, login: str, ids: tuple[str, ...], records: list[SessionShutdown],
     ) -> dict[str, str]: ...
     def alert_user(
-        self, summary: str, text: str, action: ActionRequired, *, machine: str = "",
+        self, push: RenderedPush, *, machine: str = "",
     ) -> None: ...
     def tell_showrunners_outcome(self, records: list[SessionShutdown]) -> None: ...
 
@@ -2003,28 +2004,12 @@ def _restart_alerts_enabled(login: str, only: Iterable[str] = (), *, peer: PeerR
     return (not records and not ids) or any(saved["alerts"] == "user" for saved in _eligible_records(records))
 
 
-def restart_push(label: str, lines: list[str], *, failed: bool, phone_access: bool) -> tuple[str, str, ActionRequired]:
-    account = json.dumps(label)
-    diagnostics = sorted(lines, key=lambda line: not any(word in line.lower() for word in ("failed", "not reached", "no remote control")))
-    details = "\n".join(diagnostics)
-    details = details if len(details) <= 130 else details[:127].rsplit(" ", 1)[0] + "…"
-    if failed:
-        title = "Some Claude sessions did not restart"
-        body = f"Sessions on Claude account {account} did not restart. Failure details: {details}\n\n"
-        body += f"The status command shows what failed. Fix the cause. Then run /shutdown restart {account} in the same Claude session on natedev to try again."
-        failures = [match for line in diagnostics if (match := re.match(r"[^:]+: ([^:]+) restart failed: (.*)", line)) is not None]
-        if failures:
-            name, reason = failures[0].groups()
-            reason = reason if len(reason) <= 130 else reason[:127].rsplit(" ", 1)[0] + "…"
-            title = f"Session {name} did not restart" if len(name) <= 15 else title
-            body = f"Session {name} on Claude account {account} did not restart: {reason}.\n\n" + body.split("\n\n", 1)[1]
-    else:
-        title = "Restarted sessions lack phone access"
-        names = ", ".join(line.partition(":")[0] for line in diagnostics)
-        body = f"Sessions on Claude account {account} restarted. Remote Control is off, so you cannot reach them from your phone. Affected sessions: {names}.\n\n"
-    if phone_access:
-        body += "The status command shows each session's machine. On that machine, run /remote-control in its terminal to turn phone access back on."
-    return title, body, ActionRequired(f"In a Claude session on natedev, run /shutdown status {account}.")
+def restart_push(label: str, names: list[str], *, machine: str) -> RenderedPush:
+    """Render known failed sessions, or the unconfirmed machine when names are unavailable."""
+    if names:
+        return render("shutdown.restart_failed", account=json.dumps(label),
+                      stopped=settle.stopped_sessions_text(len(names)), machine=machine)
+    return render("shutdown.restart_incomplete", account=json.dumps(label), machine=machine)
 
 
 def restart(
@@ -2097,21 +2082,33 @@ def restart(
         incomplete = (f"restart incomplete: {other_machine()} not reached — run /shutdown "
             "restart again when it is back")
         print(incomplete)
-    missing = [item for item in (*local.no_remote_control, *peer["no_remote_control"]) if item["alerts"] == "user"]
     bring_back = local.status == "partial" or peer["outcome"] == "partial" or not_reached
     if notify:
         failure_alert = bring_back and _restart_alerts_enabled(selected.login, ids, peer=peer_availability)
-        if failure_alert or missing:
-            lines = _result_lines(local) if failure_alert else []
+        try:
             if failure_alert:
-                excluded = {refusal_line(item) for item in peer["refused"]}
-                excluded.update(f"{item['name']}: running, no Remote Control" for item in peer["no_remote_control"])
-                lines.extend(line for line in peer["lines"] if line not in excluded)
-                if incomplete:
-                    lines.append(incomplete)
-            lines.extend(f"{item['name']}: running, no Remote Control" for item in missing)
-            try:
-                settle.alert_user(*restart_push(selected.label, lines, failed=failure_alert, phone_access=bool(missing)))
-            except (OSError, RuntimeError, ValueError):
-                pass
+                names = [item.name for item in local.failed_sessions]
+                names.extend(match.group(1) for line in peer["lines"]
+                             if (match := re.match(r"[^:]+: (.+) restart failed:", line)) is not None)
+                machines = [local.machine] if local.status == "partial" else []
+                if peer["outcome"] == "partial" or not_reached:
+                    machines.append(peer["machine"])
+                # Pending scheduled jobs are reported in the command output; they need no user step.
+                peer_requires_retry = peer["outcome"] == "partial" and not (peer["lines"] and all(
+                    re.match(r"[^:]+: (timer .+ not started:|manual restart |[0-9]+ restarted|restarted [0-9]+)", line)
+                    for line in peer["lines"]))
+                if names or not_reached or local.failed or peer_requires_retry:
+                    settle.alert_user(restart_push(selected.label, names, machine=" and ".join(machines)))
+                for item in local.manual_sessions:
+                    settle.alert_user(render("shutdown.manual_restart", session=item.name, machine=local.machine))
+                for line in peer["lines"]:
+                    if match := re.match(r"[^:]+: manual restart (.+?):", line):
+                        settle.alert_user(render("shutdown.manual_restart", session=match.group(1), machine=peer["machine"]))
+            for machine, items in ((local.machine, local.no_remote_control),
+                                   (peer["machine"], peer["no_remote_control"])):
+                for item in items:
+                    if item["alerts"] == "user":
+                        settle.alert_user(render("shutdown.remote_control", session=item["name"], machine=machine))
+        except (OSError, RuntimeError, ValueError):
+            pass
     return 0 if local.exit_status == 0 and peer["outcome"] != "partial" and not peer["refused"] else 1

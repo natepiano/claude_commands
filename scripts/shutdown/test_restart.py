@@ -25,6 +25,7 @@ import inventory
 import record
 import sessions
 from user_action import ActionRequired
+from push_texts import RenderedPush
 import restart
 import herdr
 from fake_herdr import CommandResponse
@@ -429,7 +430,9 @@ class RestartTests(ShutdownTestCase):
             _ = record.update_session(LOGIN, saved["session"]["session_id"], lambda current: current.update(progress=progress))
             settle.report_stop([self.stored_record()])
         self.assertEqual(alert.call_count, 2)
-        self.assertIn("window failed to open", cast(str, alert.call_args.args[1]))
+        push = cast(RenderedPush, alert.call_args.args[0])
+        self.assertEqual(push.id, "shutdown.restart_failed")
+        self.assertEqual(push.values["stopped"], "One session")
 
     def test_default_target_process_confirms_main_directory_and_removes_assumption(self) -> None:
         saved = entry(top_level("default-target", host=tmux_host("default-target")))
@@ -1672,28 +1675,55 @@ class RestartTests(ShutdownTestCase):
         self.assertIn(failure, output.getvalue())
         self.assertEqual(len(sent), 1)
         args, body = sent[0]
-        action_index = args.index('--action')
-        self.assertEqual(args[action_index + 1], f'In a Claude session on natedev, run /shutdown status {json.dumps(LABEL)}.')
-        self.assertIn('Some Claude sessions did not restart', args)
-        self.assertIn(failure, body)
-        self.assertLess(len('Action: ' + args[action_index + 1] + '\n' + body), 500)
+        self.assertEqual(args[args.index("--text-id") + 1], "shutdown.restart_incomplete")
+        self.assertIn('account="claude 2"', args)
+        self.assertIn("machine=Mac", args)
+        self.assertEqual(body, "")
+        self.assertNotIn("--action", args)
 
-    def test_restart_push_names_failed_sessions_and_phone_access_effect(self) -> None:
-        """F014: recovery explains the named session's failure or missing phone access."""
-        result = restart.MachineRestartResult("natedev", "claude 2", "partial", failed=1,
-            failed_sessions=(restart.FailedSessionRestart("Beta", "window failed to open"),))
-        title, body, action = restart.restart_push("claude 2", restart._result_lines(result),  # pyright: ignore[reportPrivateUsage]
-            failed=True, phone_access=False)
-        self.assertIn("Beta", title)
-        self.assertIn('Session Beta on Claude account "claude 2"', body)
-        self.assertIn("window failed to open", body)
-        self.assertIn('/shutdown restart "claude 2"', body)
-        self.assertIn("Claude session on natedev", action.text)
-        _, phone, _ = restart.restart_push("claude 2", ["Owner: running, no Remote Control"],
-            failed=False, phone_access=True)
-        self.assertIn("cannot reach them from your phone", phone)
-        self.assertIn("Affected sessions: Owner.", phone)
-        self.assertIn("/remote-control", phone)
+    def test_restart_failure_push_uses_only_account_count_and_machine_facts(self) -> None:
+        push = restart.restart_push("claude 2", ["Beta"], machine="natedev")
+        self.assertEqual(push.id, "shutdown.restart_failed")
+        self.assertEqual(push.values, {"account": '"claude 2"', "stopped": "One session", "machine": "natedev"})
+        self.assertIn('/shutdown restart "claude 2"', cast(ActionRequired, push.action).text)
+        unknown = restart.restart_push("claude 2", [], machine="Mac")
+        self.assertEqual(unknown.id, "shutdown.restart_incomplete")
+        self.assertEqual(unknown.values, {"account": '"claude 2"', "machine": "Mac"})
+
+    def test_large_restart_failure_group_keeps_count_without_exceeding_phone_limit(self) -> None:
+        names = ["Session" + str(index) + "x" * 80 for index in range(100)]
+        push = restart.restart_push(LABEL, names, machine="Mac")
+        self.assertNotIn("sessions", push.values)
+        self.assertEqual(push.values["stopped"], "100 sessions")
+        self.assertLess(len("Action: " + cast(ActionRequired, push.action).text + "\n" + push.body), 1024)
+
+    def test_restart_keeps_pending_job_status_off_phone_and_names_manual_restore(self) -> None:
+        pending = restart.MachineRestartResult("natedev", LABEL, "partial", restarted=1,
+            timers_not_started=(restart.TimerNotStarted("Owner", "job", "unavailable"),))
+        manual = restart.MachineRestartResult("natedev", LABEL, "partial", manual=1,
+            manual_sessions=(restart.ManualSessionRestart("Owner", "private resume command"),))
+        for result in (pending, manual):
+            with (self.subTest(manual=result.manual),
+                  patch.object(restart, "named_claude_account", return_value=self.account),
+                  patch.object(restart, "_up", return_value=result),
+                  patch.object(restart, "_restart_alerts_enabled", return_value=True),
+                  patch.object(settle, "alert_user") as alert, redirect_stdout(io.StringIO())):
+                self.assertEqual(restart.restart(restart.AccountNamed(LABEL), dry_run=False,
+                    alerts=restart.AlertWhenNotBack(), here=True), 1)
+            self.assertEqual(alert.call_count, result.manual)
+            if alert.called:
+                push = cast(RenderedPush, alert.call_args.args[0])
+                self.assertEqual(push.id, "shutdown.manual_restart")
+                self.assertEqual(push.values, {"session": "Owner", "machine": "natedev"})
+
+    def test_restart_with_no_failed_sessions_returns_success_without_a_retry_push(self) -> None:
+        completed = restart.MachineRestartResult("natedev", LABEL, "done", restarted=1)
+        with (patch.object(restart, "named_claude_account", return_value=self.account),
+              patch.object(restart, "_up", return_value=completed),
+              patch.object(settle, "alert_user") as alert, redirect_stdout(io.StringIO())):
+            self.assertEqual(restart.restart(restart.AccountNamed(LABEL), dry_run=False,
+                alerts=restart.AlertWhenNotBack(), here=True), 0)
+        alert.assert_not_called()
 
     def test_restart_cli_builds_a_never_alert_policy(self) -> None:
         received: list[tuple[restart.AccountNamed | restart.AccountNotNamed, bool, restart.AlertWhenNotBack | restart.NeverAlert]] = []
@@ -2655,10 +2685,10 @@ class RestartTests(ShutdownTestCase):
                     self.assertEqual(cast(dict[str, object], json.loads(history[-1].read_text()))["progress"], {"kind": "restarted", "at": RESTARTED})
                     self.assertEqual(alert.call_count, int(policy == "user" and isinstance(command_alerts, restart.AlertWhenNotBack)))
                     if alert.called:
-                        self.assertIn("Owner", cast(str, cast(object, alert.call_args.args[1])))
-                        self.assertIn("/remote-control", cast(str, cast(object, alert.call_args.args[1])))
-                        self.assertIn("Claude session on natedev", cast(ActionRequired, cast(object, alert.call_args.args[2])).text)
-                        self.assertNotIn("run /shutdown restart again", cast(str, cast(object, alert.call_args.args[1])))
+                        self.assertIn("Owner", cast(RenderedPush, alert.call_args.args[0]).body)
+                        self.assertIn("/remote-control", cast(ActionRequired, cast(RenderedPush, alert.call_args.args[0]).action).text)
+                        self.assertEqual(cast(RenderedPush, alert.call_args.args[0]).id, "shutdown.remote_control")
+                        self.assertNotIn("run /shutdown restart again", cast(RenderedPush, alert.call_args.args[0]).body)
 
     def test_remote_control_active_restart_sends_no_alert(self) -> None:
         saved = entry(top_level("owner", name="Owner", host=tmux_host("owner")))
@@ -2679,9 +2709,9 @@ class RestartTests(ShutdownTestCase):
                 self.assertIn(diagnostic, output.getvalue())
                 self.assertEqual(alert.call_count, int(policy == "user"))
                 if alert.called:
-                    self.assertIn("Remote", cast(str, cast(object, alert.call_args.args[1])))
-                    self.assertIn("/remote-control", cast(str, cast(object, alert.call_args.args[1])))
-                    self.assertIn("Claude session on natedev", cast(ActionRequired, cast(object, alert.call_args.args[2])).text)
+                    self.assertIn("Remote", cast(RenderedPush, alert.call_args.args[0]).body)
+                    self.assertIn("/remote-control", cast(ActionRequired, cast(RenderedPush, alert.call_args.args[0]).action).text)
+                    self.assertEqual(cast(RenderedPush, alert.call_args.args[0]).values["machine"], "Mac")
 
     def test_peer_no_shutdown_refusal_keeps_line_without_alert(self) -> None:
         refusal = restart.RestartNoShutdown(kind="no shutdown", session_id="peer", name="Remote")
@@ -2698,8 +2728,8 @@ class RestartTests(ShutdownTestCase):
         with patch.object(restart, "named_claude_account", return_value=self.account), patch.object(restart, "run_remote", side_effect=remote), patch.object(settle, "alert_user") as alert, redirect_stdout(io.StringIO()):
             self.assertEqual(restart.restart(restart.AccountNamed(LOGIN), dry_run=False, alerts=restart.AlertWhenNotBack()), 1)
         alert.assert_called_once()
-        self.assertIn("Failed", cast(str, cast(object, alert.call_args.args[1])))
-        self.assertNotIn("Waiting", cast(str, cast(object, alert.call_args.args[1])))
+        self.assertEqual(cast(RenderedPush, alert.call_args.args[0]).values["stopped"], "One session")
+        self.assertNotIn("Waiting", cast(RenderedPush, alert.call_args.args[0]).body)
 
     def test_peer_result_refuses_old_output_and_invalid_nested_fields(self) -> None:
         valid = cast(dict[str, object], json.loads(peer_json()))

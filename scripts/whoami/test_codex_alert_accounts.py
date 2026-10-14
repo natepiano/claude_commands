@@ -23,6 +23,7 @@ from scripts.whoami import agent_accounts
 from agent_accounts import CodexHomeSource, Quota, Report
 from scripts.accounts import accounts, moves, refusals
 import usage_store
+from push_texts import RenderedPush
 from test_quota_alert import REGISTRY
 
 CURRENT_READING_AGE = timedelta()
@@ -70,9 +71,9 @@ class CodexAccountAlertTests(unittest.TestCase):
         del recipient, key
         self.sent.append(text)
 
-    def push(self, summary: str, text: str, ask: quota_alert.Ask | None) -> None:
-        del summary, ask
-        self.sent.append(text)
+    def push(self, push: RenderedPush) -> quota_alert.PushDelivery:
+        self.sent.append(push.body)
+        return quota_alert.PushSent()
 
     def account(self, number: int, *, default: bool = False) -> agent_accounts.KnownCodexAccount:
         home = self.root / (".codex" if default else f".codex{number}")
@@ -699,7 +700,7 @@ class CodexAccountAlertTests(unittest.TestCase):
         with quota_alert.state_file() as state:
             self.assertEqual(state["episodes"], {})
 
-    def test_refusal_after_credit_recovery_announces_the_new_move(self) -> None:
+    def test_refusal_after_credit_recovery_relays_the_new_move_without_a_phone_push(self) -> None:
         a = self.account(1)
         note = self.note(1, "active", 0)
         low = self.readings(a, self.report(a, 0))
@@ -717,12 +718,11 @@ class CodexAccountAlertTests(unittest.TestCase):
                 quota_alert, "tell_user", wraps=self.push) as push:
             _ = quota_alert.blocked([note], a, self.now, codex_readings=low)
             relay.assert_called_once()
-            push.assert_called_once()
+            push.assert_not_called()
             self.assertIn("moved", cast(str, relay.call_args.args[1]))
-            self.assertIn("moved", cast(str, push.call_args.args[1]))
             _ = quota_alert.blocked([note], a, self.now, codex_readings=low)
             relay.assert_called_once()
-            push.assert_called_once()
+            push.assert_not_called()
         self.assertIn("delegate=claude", quota_alert.REGISTRY.read_text())
 
     def test_outgoing_refusal_does_not_silence_a_later_selected_move(self) -> None:
@@ -760,7 +760,9 @@ class CodexAccountAlertTests(unittest.TestCase):
                 _ = quota_alert.blocked([note], a, self.now, codex_readings=readings)
                 self.assertEqual(relay.call_count, count)
                 self.assertEqual(push.call_count, count)
-                self.assertIn(sent_failure, cast(str, push.call_args.args[1]))
+                self.assertEqual(cast(RenderedPush, push.call_args.args[0]).id, "quota.codex_refused")
+                self.assertIn("the work is paused", cast(RenderedPush, push.call_args.args[0]).body)
+                self.assertNotIn(sent_failure, cast(RenderedPush, push.call_args.args[0]).body)
                 self.assertIn(sent_failure, cast(str, relay.call_args.args[1]))
         self.assertIn("delegate=codex", quota_alert.REGISTRY.read_text())
 

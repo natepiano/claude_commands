@@ -25,6 +25,7 @@ import override_guard
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "notify"))
 if TYPE_CHECKING:
     from ..notify import review
+    from ..notify.push_texts import RenderedPush
 else:
     import review
 
@@ -162,14 +163,16 @@ def cargo_building() -> bool:
     return bool(result.stdout.strip()) or result.returncode not in (0, 1)
 
 
-def send_release_text(title: str, message: str) -> bool:
-    sender = Path(__file__).resolve().parents[1] / "message/send.py"
-    result = subprocess.run(
-        ["python3", str(sender), "--to", "user", "--from", "rust_release", "--need", "decision",
-         "--action", "In the natedev Claude session, reply upgrade or wait.",
-         "--summary", title, "--text", message],
-        capture_output=True, text=True, timeout=review.user_send_seconds(), stdin=subprocess.DEVNULL,
-    )
+def send_release_text(push: RenderedPush) -> bool:
+    if TYPE_CHECKING:
+        from ..notify.push_texts import user_send_argv
+    else:
+        from push_texts import user_send_argv
+
+    command = user_send_argv(push)
+    command[1] = str(Path(__file__).resolve().parents[1] / "message/send.py")
+    result = subprocess.run(command, capture_output=True, text=True,
+                            timeout=review.user_send_seconds() + 15, stdin=subprocess.DEVNULL)
     return result.returncode == 0
 
 
@@ -411,37 +414,21 @@ def trial_text(trial: TrialOutcome) -> str:
     return ", ".join(parts)
 
 
-def release_push_text(version: str, pin: str, trial: TrialOutcome) -> str:
-    intro = f"Rust {version} is out. Hana, the editor project, builds with {pin}. "
-    if trial["status"] == "waiting":
-        result = f"The test of Hana on {version} has not finished."
-        recommendation = f"Wait (recommended): Hana stays on {pin} until tested, so it avoids an untested compiler."
-    elif trial["status"] == "failed":
-        step = "Rust's code checker" if trial["step"] == "clippy" else trial["step"]
-        result = f"Hana's test on {version} failed. Check: {step}. Cause: {trial['reason'][:100]}."
-        recommendation = f"Wait (recommended): Hana stays on {pin}, so its builds do not move to a version that failed testing."
+def release_push(version: str, pin: str, trial: TrialOutcome) -> RenderedPush:
+    if TYPE_CHECKING:
+        from ..notify.push_texts import render
     else:
-        errors = f"{trial['errors']} error" + ("" if trial["errors"] == 1 else "s")
-        result = (f"Hana's code check found {errors} and {trial['warnings']} new warnings on {version}. "
-                  + f"The tool that repairs Rust build errors {'compiled' if trial['mend_builds'] else 'failed to compile'} with {version}.")
-        if not trial["errors"] and trial["mend_builds"]:
-            result = f"Hana's compiler check passed on {version}: no errors, {trial['warnings']} new warnings."
-        recommendation = (f"Upgrade (recommended because the check passed): Hana builds with {version} from now on."
-                          if not trial["errors"] and trial["mend_builds"] else
-                          f"Wait (recommended): Hana stays on {pin}, so the failed check does not affect its builds.")
-    other = (f"Wait: keep building Hana with {pin}." if recommendation.startswith("Upgrade") else
-             f"Upgrade: Hana moves to {version} now. Its builds may fail.")
-    return f"{intro}{result}\n\n{recommendation}\n\n{other}"
+        from push_texts import render
 
-
-def release_push_title(trial: TrialOutcome) -> str:
-    if trial["status"] == "waiting":
-        return "Rust upgrade waits on an untested build"
-    if trial["status"] == "failed":
-        return "Rust upgrade failed its test"
-    if trial["errors"] or not trial["mend_builds"]:
-        return "Rust upgrade failed a code check"
-    return "Hana can use the new Rust compiler"
+    if trial["status"] != "finished":
+        raise ValueError("incomplete compiler trials are log notes, not user pushes")
+    if trial["errors"]:
+        return render("rust.errors", version=version, pin=pin, errors=str(trial["errors"]), warnings=str(trial["warnings"]))
+    if not trial["mend_builds"]:
+        return render("rust.repair_failed", version=version, pin=pin)
+    if trial["warnings"]:
+        return render("rust.warnings", version=version, pin=pin, warnings=str(trial["warnings"]))
+    return render("rust.passed", version=version, pin=pin)
 
 
 def report_line() -> list[str]:
@@ -468,7 +455,7 @@ def check_release(
     free_gib: Callable[[], float] = free_space_gib,
     held: Callable[[], bool] = build_hold_active,
     building: Callable[[], bool] = cargo_building,
-    send_text: Callable[[str, str], bool] = send_release_text,
+    send_text: Callable[[RenderedPush], bool] = send_release_text,
     trial_parent: Callable[[], Path] = default_trial_parent,
 ) -> int:
     pin = read_pin()
@@ -510,10 +497,14 @@ def check_release(
         reason = waiting_reason(held, building, free_gib)
         state["trial"] = {"status": "waiting", "version": state["stable_version"], "reason": reason} if reason else trial_release(state["stable_version"], run_command, held, trial_parent())
     write_state(state)
-    if 2 <= today.hour < 5 and not state["text_sent"]:
-        message = release_push_text(state["stable_version"], pin, state["trial"])
+    if 2 <= today.hour < 5 and state["trial"]["status"] == "waiting":
+        print(f"Rust {state['stable_version']} trial is waiting: {state['trial']['reason']}")
+    elif 2 <= today.hour < 5 and state["trial"]["status"] == "failed":
+        print(f"Rust {state['stable_version']} trial could not complete: {state['trial']['reason']}")
+    elif 2 <= today.hour < 5 and not state["text_sent"]:
+        push = release_push(state["stable_version"], pin, state["trial"])
         try:
-            sent = send_text(release_push_title(state["trial"]), message)
+            sent = send_text(push)
         except (OSError, subprocess.SubprocessError) as error:
             store.note_error(f"rust release text: {error}")
             return 1

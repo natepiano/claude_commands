@@ -1467,7 +1467,7 @@ class DailiesInputTests(unittest.TestCase):
                 self.assertEqual(bevy_upgrade_watch(production), BevyUpgradeUnavailable(reason))
                 run.assert_called_once_with(command, capture_output=True, text=True, timeout=30, check=False)
 
-    def test_dailies_first_review_alert_marks_topic_and_merge_watch_repeats(self) -> None:
+    def test_dailies_first_review_alert_logs_once_without_a_phone_push(self) -> None:
         events = self.watch_stubs()
         result = self.run_builder()
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
@@ -1481,20 +1481,11 @@ class DailiesInputTests(unittest.TestCase):
         self.assertNotIn("| phases merged |", later.stdout)
         calls = self.watch_events(events)
         self.assertEqual(sum(row[0] == "review_regime.py" and row[1] == "report" for row in calls), 1)
-        self.assertEqual([row for row in calls if row[0] == "send.py"], [[
-            "send.py", "--to", "user", "--from", "ci_points", "--need", "decision", "--action",
-            "On natedev, read the report. Choose acknowledge or discuss.",
-            "--summary", "Reviewer removal lacks comparison data", "--text",
-            "An extra code reviewer was removed from merge review. "
-            + "The report has no comparable defect counts, so the removal's effect is unknown.\n\n"
-            + "In a terminal on natedev, read:\npython3 ~/.claude/scripts/production/review_regime.py report\n"
-            + "Acknowledge (recommended; work continues either way): "
-            + "rerun with ack instead of report to stop these report notices.\n\n"
-            + "Discuss: raise concerns in the natedev Claude session.",
-        ]])
+        self.assertEqual([row for row in calls if row[0] == "send.py"], [])
+        self.assertIn("| phases merged | 12 |", (self.checkout / "production.log").read_text())
         self.assertEqual((self.checkout / "production.log").read_text().count("review watch"), 1)
 
-    def test_merge_first_review_alert_is_not_repeated_by_dailies(self) -> None:
+    def test_merge_first_review_alert_logs_once_without_a_dailies_phone_push(self) -> None:
         events = self.watch_stubs()
         first = self.run_merge_watch()
         self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
@@ -1506,17 +1497,8 @@ class DailiesInputTests(unittest.TestCase):
         self.assertTrue(watch["needs_user"])
         calls = self.watch_events(events)
         self.assertEqual(sum(row[0] == "review_regime.py" and row[1] == "report" for row in calls), 1)
-        self.assertEqual([row for row in calls if row[0] == "send.py"], [[
-            "send.py", "--to", "user", "--from", "ci_points", "--need", "decision", "--action",
-            "On natedev, read the report. Choose acknowledge or discuss.",
-            "--summary", "Reviewer removal lacks comparison data", "--text",
-            "An extra code reviewer was removed from merge review. "
-            + "The report has no comparable defect counts, so the removal's effect is unknown.\n\n"
-            + "In a terminal on natedev, read:\npython3 ~/.claude/scripts/production/review_regime.py report\n"
-            + "Acknowledge (recommended; work continues either way): "
-            + "rerun with ack instead of report to stop these report notices.\n\n"
-            + "Discuss: raise concerns in the natedev Claude session.",
-        ]])
+        self.assertEqual([row for row in calls if row[0] == "send.py"], [])
+        self.assertIn("| phases merged | 12 |", (self.checkout / "production.log").read_text())
         self.assertEqual((self.checkout / "production.log").read_text().count("review watch"), 1)
 
     def test_judgment_held_and_testing_keep_merge_topic_even_when_pushed(self) -> None:
