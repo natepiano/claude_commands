@@ -140,7 +140,7 @@
 
 **Ruled out:** reclassifying Mac windows as `ghostty`, since the fallback would then go through the Linux window launcher.
 
-### Phase 4 — The shutdown says what is happening and where to act  · status: todo
+### Phase 4 — The shutdown says what is happening and where to act  · status: done
 
 **Depends on:** Phase 2, Phase 3
 
