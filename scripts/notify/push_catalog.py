@@ -1,5 +1,5 @@
 """Script phone texts and named cases reviewed before delivery."""
-from push_texts import ActionTemplate, PushExample, PushText
+from push_texts import ActionTemplate, NoActionNeeded, PushExample, PushText
 
 # Codex usage destination: https://learn.chatgpt.com/docs/pricing (read 2026-10-14).
 # Real quota case: notify/review.jsonl, 2026-10-13T22:30:22.569264-04:00.
@@ -55,6 +55,37 @@ ENTRIES = (
         (PushExample("typical", {"account": "claude 3", "remaining": "2%", "reset": "2026-10-17 09:00 EDT", "target": "claude 2", "target_remaining": "60%"}),
          PushExample("exhausted", {"account": "claude 999", "remaining": "0%", "reset": "2026-10-19 23:59 EDT", "target": "claude 2", "target_remaining": "60%"}),
          PushExample("long_target", {"account": "claude 3", "remaining": "0%", "reset": "2026-10-19 23:59 EDT", "target": "claude-team-build-followups-12", "target_remaining": "40%"}))),
+    PushText('quota.codex_on_credits', "quota_alert", "note", 'Codex workers now spend paid credits',
+        ActionTemplate('{credit_action}, set use_credits: off in ~/rust/hanadocs/agents/{file} on {machine}.'),
+        '{opening}\n\n{turn_off}\n\n{leave_on}\n{clarification}',
+        (PushExample('codex_one', {'file': 'codex 1.md', 'machine': 'natedev', 'turn_off': 'Turn off (recommended): no paid spend. Within minutes, new work moves to the other account, codex 2 (97% of its weekly allowance left).', 'leave_on': 'Leave on: codex 1 spends its credits, then work moves to codex 2.', 'credit_action': 'To stop paid credit use', 'opening': 'Codex account codex 1 is now spending paid credits until its weekly refill on Tue 2026-10-20 00:58 EDT. Its 6,370 credits last until about Fri 2026-10-16 13:05 EDT.', 'clarification': ''}),
+         PushExample('codex_two', {'file': 'codex 2.md', 'machine': 'natedev', 'turn_off': "Turn off: within minutes, new work spends the other Codex account's (codex 1) paid credits instead.", 'leave_on': "Leave on (recommended): new work spends codex 2's paid credits first, then codex 1's.", 'credit_action': 'To move paid credit use to codex 1', 'opening': 'Codex account codex 2 now spends paid credits. Weekly refill: Thu 2026-10-22 07:00 EDT. Its 2,114 credits last until about Fri 2026-10-16 12:51 EDT.', 'clarification': 'Either way, new work spends paid credits.'}),
+         PushExample('unlimited', {'file': 'codex 1.md', 'machine': 'natedev', 'turn_off': 'Turn off (recommended): no paid spend. Within minutes, new work moves to the other account, codex 2 (97% of its weekly allowance left).', 'leave_on': "Leave on: keep spending codex 1's paid credits without a limit.", 'credit_action': 'To stop paid credit use', 'opening': 'Codex account codex 1 is now spending paid credits until its weekly refill on Tue 2026-10-20 00:58 EDT. There is no limit on paid credits.', 'clarification': ''}),
+         PushExample('unknown', {'file': 'codex 1.md', 'machine': 'natedev', 'turn_off': 'Turn off (recommended): paid spending stops. Within minutes, new work moves to the second account, codex 2, which has 97% of its weekly limit left.', 'leave_on': 'Leave on: codex 1 spends its credits, then new work moves to codex 2.', 'credit_action': 'To stop paid credit use', 'opening': 'Codex account codex 1 is now spending paid credits until its weekly refill on Tue 2026-10-20 00:58 EDT. The credit balance is unknown.', 'clarification': ''}))),
+    PushText('quota.codex_on_credits_last', "quota_alert", "note", 'Codex workers now spend paid credits',
+        ActionTemplate('To stop paid credit use, set use_credits: off in ~/rust/hanadocs/agents/{file} on {machine}.'),
+        'Codex account {account} now uses paid credits. Its weekly refill is {reset}. {credits}\n{turn_off}\n{leave_on}',
+        (PushExample('codex_one', {'account': 'codex 1', 'file': 'codex 1.md', 'machine': 'natedev', 'reset': 'Tue 2026-10-20 00:58 EDT', 'credits': 'Its 6,370 credits last until about Fri 2026-10-16 13:05 EDT.', 'leave_on': 'Leave on: new work spends these credits, then uses Claude when they run out.', 'turn_off': 'Turn off (recommended, so no paid credits are spent): within minutes, new work uses Claude, the other coding assistant, until Sat 2026-10-17 07:00 EDT.'}),
+         PushExample('codex_two', {'account': 'codex 2', 'file': 'codex 2.md', 'machine': 'natedev', 'reset': 'Thu 2026-10-22 07:00 EDT', 'credits': 'Its 2,114 credits last until about Fri 2026-10-16 12:51 EDT.', 'leave_on': 'Leave on: new work spends these credits, then uses Claude when they run out.', 'turn_off': 'Turn off (recommended, so no paid credits are spent): within minutes, new work uses Claude, the other coding assistant, until Tue 2026-10-20 00:58 EDT.'}))),
+    PushText('quota.codex_workers_moved', "quota_alert", "note", '{account}: {transition}',
+        NoActionNeeded(),
+        'Codex account {account} has exhausted its included weekly usage until {reset}. Credits are off, so new work moves to the other Codex account, {target}, using {funding}. Jobs already running finish their current turn first.',
+        (PushExample('codex_one', {'account': 'codex 1', 'reset': 'Tue 2026-10-20 00:58 EDT', 'target': 'codex 2', 'funding': '97% weekly usage left', 'transition': 'workers use codex 2'}),
+         PushExample('codex_two', {'account': 'codex 2', 'reset': 'Thu 2026-10-22 07:00 EDT', 'target': 'codex 1', 'funding': 'its own paid credits', 'transition': 'workers spend codex 1 credits'}))),
+    PushText('quota.codex_workers_stay', "quota_alert", "note", '{account} {outcome}',
+        NoActionNeeded(),
+        'Codex account {account} has exhausted its included weekly usage until {reset}. Credits are off. {reason} {fallback}',
+        (PushExample('no_room', {'account': 'codex 1', 'reset': 'Tue 2026-10-20 00:58 EDT', 'reason': 'No other Codex account has room.', 'outcome': 'work moves to Claude', 'fallback': 'New coding work uses Claude, the other coding assistant, until the earliest Codex refill at Sat 2026-10-17 07:00 EDT. Current turns finish first.'}),
+         PushExample('failed_move', {'account': 'codex 2', 'reset': 'Thu 2026-10-22 07:00 EDT', 'reason': 'Workers could not move to codex 1 because its usage reading is unavailable.', 'outcome': 'work moves to Claude', 'fallback': 'New coding work uses Claude, the other coding assistant, until the earliest Codex refill at Tue 2026-10-20 00:58 EDT. Current turns finish first.'}))),
+    PushText('quota.codex_credits_forecast', "quota_alert", "note", '{account}: paid credits {horizon}',
+        NoActionNeeded(),
+        '{forecast} {destination}',
+        (PushExample('codex_one', {'account': 'codex 1', 'forecast': 'Workers on Codex account codex 1 used 120 paid credits in the last hour; its 6,370 credits last until about Fri 2026-10-16 13:05 EDT.', 'destination': 'When credits run out, workers move to codex 2 (97% weekly usage left).', 'horizon': 'until Fri 13:05 EDT'}),
+         PushExample('codex_two', {'account': 'codex 2', 'forecast': 'Workers on Codex account codex 2 used 40 paid credits in the last hour; its 2,114 credits last until about Fri 2026-10-16 12:51 EDT.', 'destination': 'When credits run out, workers move to codex 1 and spend its own paid credits.', 'horizon': 'until Fri 12:51 EDT'}),
+         PushExample('zero_use', {'account': 'codex 1', 'forecast': 'Workers on Codex account codex 1 used no credits in the last hour; 6,370 paid credits left.', 'destination': 'When credits run out, workers move to codex 2 (97% weekly usage left).', 'horizon': 'use is zero'}),
+         PushExample('unlimited', {'account': 'codex 1', 'forecast': 'Codex account codex 1 has unlimited paid credits; its coding workers remain on paid usage with no credit limit.', 'destination': '', 'horizon': 'have no limit'}),
+         PushExample('unknown_balance', {'account': 'codex 1', 'forecast': 'Codex account codex 1 reports no credit balance; its coding workers remain on paid usage, but the run-out time is unknown.', 'destination': 'When credits run out, workers move to codex 2 (97% weekly usage left).', 'horizon': 'run-out unknown'}),
+         PushExample('unknown_use', {'account': 'codex 2', 'forecast': 'Coding workers on Codex account codex 2 remain on paid usage. Their hourly use is unknown because credit observations cover less than 30 minutes of the hour; 2,114 credits left.', 'destination': 'When they run out, Codex work moves to Claude, the other coding assistant, until Tue 2026-10-20 00:58 EDT.', 'horizon': 'run-out unknown'}))),
     PushText("quota.codex_refused", "quota_alert", "decision", "Codex work stopped for lack of usage",
         ActionTemplate("At chatgpt.com/codex/settings/usage, add credits for account {account}."),
         "Codex hit its usage limit on account {account} and stopped accepting coding jobs. "

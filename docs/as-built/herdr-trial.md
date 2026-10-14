@@ -35,7 +35,7 @@ On 2026-10-13 a fake production ran inside one herdr 0.9.0 session on natedev. I
    - confirms the turn started within `HERDR_TRIAL_TURN_START_TIMEOUT`.
 
    A real launcher needs both checks.
-3. **Trust.** Interactive Codex asks for folder trust, keyed on the repository root, and then for hooks trust. Headless seats (`codex app-server`) ask for neither. A herdr production has to settle both before launch, or every new repository puts a prompt in front of the user (issues 1, 3, 9).
+3. **Trust.** Interactive Codex asks for folder trust, keyed on the repository root, and then for hooks trust. Headless workers (`codex app-server`) ask for neither. A herdr production has to settle both before launch, or every new repository puts a prompt in front of the user (issues 1, 3, 9).
 4. **Launcher.** herdr refuses multi-line start arguments (issue 2), so opening prompts go through `agent prompt` once the agent is ready. Konsole showed no window, and ghostty did (issue 4).
 5. **The showrunner's view of its units.**
    - The fake showrunner reported workers as running because it read its directors' holding lines; the workers had never started (issue 14). Inside herdr it could read worker states directly, but no rule tells it to.
@@ -48,7 +48,7 @@ The showrunner's first lookup at 13:24 said "not running", one minute after laun
 
 ## Codex workers in panes compared with app-server threads
 
-| | Interactive Codex in a herdr pane | Headless seat (`codex app-server` thread) |
+| | Interactive Codex in a herdr pane | Headless worker (`codex app-server` thread) |
 | --- | --- | --- |
 | Start | `codex -m gpt-6.1-sol -c model_reasoning_effort=high -s danger-full-access -a never` | thread on a per-session `codex app-server --listen ws://…` |
 | Prompts on first use | folder trust, then hooks trust | none |

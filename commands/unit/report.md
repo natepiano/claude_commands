@@ -87,10 +87,10 @@ Everything below is the contract.
    `as of` line, and a `No pass or activity is open.` line under them. Paste it
    like any other tick; there is no report without tables, and "No progress
    table this time" is never written. A closed pass does not mean the dispatch
-   finished: a live run has shown two seats carrying a closed pass while both
+   finished: a live run has shown two workers carrying a closed pass while both
    were posting to the board, and treating that as completion routes a healthy
    round through <FixDispatch/>'s abandon path.
-   Check the seats: `impl_status_<slot>`, board posts since the last cursor,
+   Check the workers: `impl_status_<slot>`, board posts since the last cursor,
    and whether the launcher has exited. Alive means say so in prose and keep the
    run going; terminal means step 1's completion handling. Never open an
    activity to make the tables render — that records unit-director work that
@@ -109,38 +109,38 @@ Everything below is the contract.
    and the wall clock. Never reorder, edit, or omit
    any part of those: the recorder owns every column, duration format, and ETA
    band. The one exception is the `- **Agent N**` lines under the round table:
-   they are the seats talking to each other, not to the user, so they are
+   they are the workers talking to each other, not to the user, so they are
    step 7's input and are never pasted. When step 4 has armed an early
    reviewer, say below the tables that the writer and the reviewer are working
    at once.
-6. Read the round table as seats. It leads with `Stage`, `Start`, and `Elapsed`
+6. Read the round table as workers. It leads with `Stage`, `Start`, and `Elapsed`
    — `Stage` rather than `Round` because a row is not always a round: a
-   verification, a smoke run, or a lone reviewer each own one. Its seat
+   verification, a smoke run, or a lone reviewer each own one. Its worker
    columns are `Agent 1` and `Agent 2` — the slots `impl` and `test` in that
    order — plus `Agent 3`, slot `review` (the craft reviewer), only when a
-   shown stage seated it. Slots are identities that never change, numbered so
+   shown stage workered it. Slots are identities that never change, numbered so
    the header carries no role word the cell beneath could contradict. Each cell
-   is the role that seat held over the row's stretch, how long it held it, and
-   what the seat is doing at the end of it:
+   is the role that worker held over the row's stretch, how long it held it, and
+   what the worker is doing at the end of it:
 
    - `running` — its window is open and its last board line is work.
-   - `waiting` — open, but the seat says it is held up: on a peer's edit, on the
-     cargo token, on a gate. Both seats reading `running` while one sits on the
+   - `waiting` — open, but the worker says it is held up: on a peer's edit, on the
+     cargo token, on a gate. Both workers reading `running` while one sits on the
      other is what this word exists to correct, and no clock shows it — a
-     waiting seat's elapsed grows exactly like a working one's.
-   - `idle` — its window has closed while the round has not, so the seat is free
+     waiting worker's elapsed grows exactly like a working one's.
+   - `idle` — its window has closed while the round has not, so the worker is free
      for more work rather than finished with the phase.
    - `done` — the stretch is over. Every row but the last of a live round.
 
-   A cell with a role and no time or state is a seat that recorded no pass; the
+   A cell with a role and no time or state is a worker that recorded no pass; the
    board knew its role, the ledger never saw it. A further row opens whenever
    the team actually moves, and its `Result` cell names the movement —
    `Agent 2 → impl` — so the reader watches `impl / test` become
    `review / review` without diffing cells. The first row of a round
    is its opening. The lines under the table lead with the same label and the
    slot in parentheses — `- **Agent 2** (test) …` — then the agent sitting in
-   that seat and the last thing it said: the seat's own words, never the
-   launcher's. That narration is addressed to the other seat, which is why
+   that worker and the last thing it said: the worker's own words, never the
+   launcher's. That narration is addressed to the other worker, which is why
    step 7 rewrites it before it reaches the user. A lone reviewer between
    rounds sits in the `Agent 2` column on a row of its own.
 
@@ -149,18 +149,18 @@ Everything below is the contract.
    there, not at the table's first row — never describe a phase as newly opened
    because its earlier rounds are off the table. When the user asks about work
    that line covers, answer from `timeline`, which still renders every pass.
-7. Write the seat table yourself: one row per seat the recorder listed, columns
+7. Write the worker table yourself: one row per worker the recorder listed, columns
    `#`, `Role`, `Model`, `Effort`, `Details`. Take the number and the slot from
-   the seat's label, the model and effort from the recorder when it names them
-   and `-` when it does not. `Details` is a sentence of yours, not the seat's,
-   answering two things: what the seat is doing in the phase's own terms, and
-   whether it is moving, waiting, or done. Build it from the seat's board lines
+   the worker's label, the model and effort from the recorder when it names them
+   and `-` when it does not. `Details` is a sentence of yours, not the worker's,
+   answering two things: what the worker is doing in the phase's own terms, and
+   whether it is moving, waiting, or done. Build it from the worker's board lines
    since the last cursor plus the Work Order, and hold these rules:
 
-   - Track the opening phase of the current Codex thread, not the seat name. If
+   - Track the opening phase of the current Codex thread, not the worker name. If
      that phase is older, begin `Details` with `Opened in phase <id>;`; omit it
      when the thread opened in the current phase. A replacement thread under
-     the same seat name starts fresh and holds only its own opening prompt, so
+     the same worker name starts fresh and holds only its own opening prompt, so
      the dispatch that creates it is an opening prompt, not a follow-up.
    - Read the full board line, never the recorder's 72-character cut. A line
      ending in `…` has lost its information and must never reach the user.
@@ -170,10 +170,10 @@ Everything below is the contract.
      nothing outside the session.
    - Coordination mechanics are not news. Claims, tokens, role announcements,
      handoffs, "no-more-edits", gate reruns — report the state they imply and
-     name the mechanism only when a seat is stuck on it, with how long.
+     name the mechanism only when a worker is stuck on it, with how long.
    - A finding is named by the defect it describes, not by its ID or the
      reviewer's phrasing.
-   - Give an age only when it is news — a seat silent long enough to look
+   - Give an age only when it is news — a worker silent long enough to look
      stalled, or finished and how long ago. "1s ago" tells the reader nothing.
    - One table per report, from this tick's recorder output only. Never carry a
      previous tick's rows forward or print two tables.
@@ -199,8 +199,8 @@ Everything below is the contract.
    with what this phase gives the person using the tool, then its movement and
    what remains. One topic per sentence, no more than two clauses; when a topic
    holds more than two items, give the count and what they have in common.
-   When the opening is not the default, or a seat is doing something other than
-   its name, say so in those words: "the test seat is writing the catalyst
+   When the opening is not the default, or a worker is doing something other than
+   its name, say so in those words: "the test worker is writing the catalyst
    side".
 
    Not this:

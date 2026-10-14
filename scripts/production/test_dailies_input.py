@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import json
+import dailies_input
+import dailies_render
+from cli_fixture import ImmutableGitSeed, invoke_cli
 import os
 import subprocess
 import sys
@@ -10,7 +13,7 @@ import tempfile
 import unittest
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import cast, override
+from typing import ClassVar, cast, override
 from unittest import mock
 from zoneinfo import ZoneInfo
 
@@ -125,6 +128,15 @@ def setUpModule() -> None:
 
 
 class DailiesInputTests(unittest.TestCase):
+    seed: ClassVar[ImmutableGitSeed]
+
+    @classmethod
+    @override
+    def setUpClass(cls) -> None:
+        super().setUpClass()
+        root = Path(cls.enterClassContext(tempfile.TemporaryDirectory(prefix="DailiesInputTests-seed-")))
+        cls.seed = ImmutableGitSeed.create(root, 'production', 'Dailies Test', 'dailies@example.invalid', {'README.md': 'base\n'})
+
     root: Path = Path()
     home: Path = Path()
     origin: Path = Path()
@@ -150,10 +162,8 @@ class DailiesInputTests(unittest.TestCase):
         self.home = self.root / "home"
         self.home.mkdir()
         self.origin = self.root / "origin.git"
-        _ = subprocess.run(["git", "init", "--bare", str(self.origin)],
-                           check=True, capture_output=True, text=True)
         self.checkout = self.root / "merge"
-        self.checkout.mkdir()
+        self.seed.copy_to(self.checkout, self.origin)
         self.doc = self.root / "example-production.md"
         self.status = self.root / "status.txt"
         self.judgment = self.root / "judgment.json"
@@ -191,19 +201,10 @@ class DailiesInputTests(unittest.TestCase):
                     "NOTIFIER_STATE_DIR": str(self.root / "notifier-state"),
                     "SHOWRUNNER_STATE_DIR": str(self.showrunner_state),
                     # Unit sessions are looked up in this stand-in; with no state file it has no sessions.
-                    "UNIT_LOOKUP_TMUX": str(Path(__file__).with_name("fake_tmux.py")),
+                    "UNIT_LOOKUP_TMUX": str(Path(__file__).with_name("fake_tmux.sh")),
                     "FAKE_TMUX_STATE": str(self.root / "tmux.json"),
                     "NOTIFIER_SESSIONS_DIR": str(self.root / "sessions")}
         (self.root / "sessions").mkdir()
-        _ = subprocess.run(["git", "init", "-b", "production", str(self.checkout)],
-                           check=True, capture_output=True, text=True)
-        _ = self.git("config", "user.name", "Dailies Test")
-        _ = self.git("config", "user.email", "dailies@example.invalid")
-        _ = self.git("remote", "add", "origin", str(self.origin))
-        _ = (self.checkout / "README.md").write_text("base\n", encoding="utf-8")
-        _ = self.git("add", "README.md")
-        _ = self.git("commit", "-m", "initial")
-        _ = self.git("push", "-u", "origin", "production")
         self.production_doc()
         self.status_lines(f"== {ALPHA}", "● Checking panel labels", "ETA 23:40")
         self.judgment_file()
@@ -266,30 +267,29 @@ class DailiesInputTests(unittest.TestCase):
             })
         _ = self.judgment.write_text(json.dumps({"units": units, "topics": []}) + "\n", encoding="utf-8")
 
-    def run_builder(self, *extra: str, include_render_state: bool = True) -> subprocess.CompletedProcess[str]:
+    def run_builder(self, *extra: str, include_render_state: bool = True, subprocess_cli: bool = False) -> subprocess.CompletedProcess[str]:
         state_args = (
             ("--render-state", str(self.root / "render-state.json"))
             if include_render_state and "--render-state" not in extra else ()
         )
-        return subprocess.run(
-            [sys.executable, str(SCRIPT), "--production", str(self.doc),
+        arguments = ["--production", str(self.doc),
              "--status", str(self.status), "--judgment", str(self.judgment),
              "--state-dir", str(self.state), "--out", str(self.output),
              "--holders", str(self.holders), "--notifier", str(self.notifier),
-             "--at", AT, *state_args, *extra],
-            cwd=self.checkout, env=self.env, capture_output=True, text=True, check=False,
-        )
+             "--at", AT, *state_args, *extra]
+        if subprocess_cli:
+            return subprocess.run([sys.executable, str(SCRIPT), *arguments], cwd=self.checkout,
+                                  env=self.env, capture_output=True, text=True, check=False, timeout=300)
+        return invoke_cli(dailies_input, dailies_input.main, arguments, self.env, self.checkout, production_state=True)
 
     def report(self) -> dict[str, object]:
         return cast(dict[str, object], json.loads(self.output.read_text(encoding="utf-8")))
 
     def run_renderer(self, at: str) -> subprocess.CompletedProcess[str]:
-        return subprocess.run(
-            [sys.executable, str(RENDERER), str(self.output), "--at", at,
-             "--state", str(self.root / "render-state.json"),
-             "--log", str(self.root / "dailies.log")],
-            cwd=self.checkout, env=self.env, capture_output=True, text=True, check=False,
-        )
+        arguments = [str(self.output), "--at", at, "--state", str(self.root / "render-state.json"),
+                     "--log", str(self.root / "dailies.log")]
+        return invoke_cli(dailies_render, lambda: dailies_render.main(arguments), arguments,
+                          self.env, self.checkout, production_state=True)
 
     def unit(self) -> dict[str, object]:
         return cast(dict[str, object], cast(list[object], self.report()["units"])[0])
@@ -453,7 +453,7 @@ class DailiesInputTests(unittest.TestCase):
     def test_each_length_produces_input_the_renderer_accepts(self) -> None:
         for length in ("gantt", "simple", "page", "elaborate"):
             with self.subTest(length=length):
-                result = self.run_builder("--length", length)
+                result = self.run_builder("--length", length, subprocess_cli=length == "gantt")
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
                 report = self.report()
                 self.assertEqual(report["length"], length)
@@ -1054,7 +1054,7 @@ class DailiesInputTests(unittest.TestCase):
 
     def test_render_state_is_required_before_notifier_or_output(self) -> None:
         _ = self.output.write_text("sentinel\n", encoding="utf-8")
-        result = self.run_builder(include_render_state=False)
+        result = self.run_builder(include_render_state=False, subprocess_cli=True)
         self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
         self.assertIn("usage:", result.stderr)
         self.assertIn("--render-state", result.stderr)

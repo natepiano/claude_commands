@@ -9,7 +9,7 @@ The configured delegate agent writes implementation code.
 
 The unit director believes in the three gods (<ThreeGods/> in
 `~/.claude/docs/decision_criteria.md`) and serves them in every work order,
-review, gate and report. Every prompt sent to a seat carries them inline per
+review, gate and report. Every prompt sent to a worker carries them inline per
 <WritePromptContract/> item 9.
 
 **Usage:** `/unit:direct [plan-doc-path] [phase N] [single|verbose] [auto next N phases|auto through phase X] [free-text instructions]`
@@ -90,11 +90,11 @@ after each compaction for the rest of the session; a file loaded by Read is not.
 A call site's arguments are what that file calls `$ARGUMENTS`.
 </TagReferenceContract>
 
-<LongLivedSeats>
-Codex seats are run-scoped in every role. Open `impl` and `test` once, then send
+<LongLivedWorkers>
+Codex workers are run-scoped in every role. Open `impl` and `test` once, then send
 later implementation, repair, and follow-up work with `implement.sh --to
-<full-seat-name>` and reviews with `review.sh --to <full-seat-name>`. Keep a
-seat in the same role when the next assignment fits; otherwise move it, even
+<full-worker-name>` and reviews with `review.sh --to <full-worker-name>`. Keep a
+worker in the same role when the next assignment fits; otherwise move it, even
 mid-phase, under <RoleReassignment/>. A finished turn leaves its thread open.
 
 When the production doc names a review pool and <ProductionUnit/>'s `arm`
@@ -108,24 +108,24 @@ Type Design Contract verbatim or by its allowed pointer under
 For the pool arm of a production whose doc names a review pool, review
 prompts use <ReviewPromptContract/>'s standing-instructions line.
 
-Before follow-up work, the launcher attempts to compact a seat whose recorded
+Before follow-up work, the launcher attempts to compact a worker whose recorded
 context is over `PLAN_DELEGATE_COMPACT_ABOVE_TOKENS` (default `100000` in
 `config/delegate.conf`). Success posts one board line with the before and after
 sizes. Failure posts one board line and the follow-up still runs; it costs
-tokens, not correctness, because the seat compacts itself when its context
+tokens, not correctness, because the worker compacts itself when its context
 fills. The launcher then sends `Continue where you stopped.` and posts one board
 line per overflow.
 
-Open a new seat only when no open seat can take the work: the assignment needs
-more seats, every open seat is busy, or a reusable thread is gone. Name an extra
+Open a new worker only when no open worker can take the work: the assignment needs
+more workers, every open worker is busy, or a reusable thread is gone. Name an extra
 slot for its role (`review`, `fix2`), never with a bare number, and keep it for
-reuse; an idle seat costs no context. A replacement under the same seat name
+reuse; an idle worker costs no context. A replacement under the same worker name
 starts fresh and receives an opening prompt. `review.sh --slot <role-name>`
-opens a new role-named seat; a call with neither `--to` nor `--slot` is only for
+opens a new role-named worker; a call with neither `--to` nor `--slot` is only for
 a review outside a run.
-Phase cleanup leaves Codex seats open;
+Phase cleanup leaves Codex workers open;
 `end_session.sh` ends them.
-</LongLivedSeats>
+</LongLivedWorkers>
 
 <CoreContract>
 - Never create a worktree or modify unrelated files. The only branch the run may
@@ -139,7 +139,7 @@ Phase cleanup leaves Codex seats open;
   <FinalGateCommit/> that closes verification and the one <AsBuiltCommit/> that
   carries the run's documentation. <PeriodicCI/> may add `ci(<plan-slug>): …`
   commits for validation fixes and CI repairs. No other commit is allowed.
-  Only <ShrinkCommit/> runs while seats edit, and it commits only the plan doc
+  Only <ShrinkCommit/> runs while workers edit, and it commits only the plan doc
   and an approved `${NEXT_ITEMS_PATH}` change.
 - Every commit the run makes is pushed by <PushCheckpoint/>, fast-forward only,
   to the working branch's own name on origin, never to the default branch.
@@ -183,7 +183,7 @@ The closed list:
 
 - **waiting** — a background dispatch, verification, smoke run, or style pass is
   live and nothing synchronous remains. Name each thing by what it is and what
-  it is doing, in plain words: `— holding: waiting on the Codex seats writing
+  it is doing, in plain words: `— holding: waiting on the Codex workers writing
   phase 2 (implementation and tests)`, `— holding: waiting on the blind code
   reviewer for phase 3`, `— holding: waiting on the final test suites`. Never
   a task id, agent id, session id or shell handle: a reader cannot tell what
@@ -242,7 +242,7 @@ under that directory. This avoids half-applied durable-state writes.
   by deleting only the shortfall, least recently used build output first, never
   from a target a build holds; build trial merges in your own worktree as usual.
   Ask natedev for room before a run that
-  must keep more. Put this rule in every seat and helper prompt that saves
+  must keep more. Put this rule in every worker and helper prompt that saves
   output. User, 2026-10-04: 300 GB of traces cost 235 GiB of caches.
 </ToolingContract>
 
@@ -260,22 +260,22 @@ Applies to every implementation, test, fix, and review launcher.
    independently; process the first without waiting for the other.
 5. Codex: apply <CodexDispatchWait/>. Never end the turn while the launcher is
    active; its terminal result drives the next workflow step.
-6. A new-seat or follow-up launcher killed at its time limit leaves its Codex
-   seat running with no one watching. Arm a Monitor on
-   `${SESSION_DIR}/board.log` until that seat
+6. A new-worker or follow-up launcher killed at its time limit leaves its Codex
+   worker running with no one watching. Arm a Monitor on
+   `${SESSION_DIR}/board.log` until that worker
    posts its own `done`, not a `launcher:` line. Once it has, and its last lint
    and test passed after its last edit, leave its thread open under
-   <LongLivedSeats/> and record the outcome the launcher would have; for a
+   <LongLivedWorkers/> and record the outcome the launcher would have; for a
    repair, that is <FixDispatch/>'s third outcome.
 </DispatchContract>
 
 <DelegateLaunchFailure>
 When the production doc names a review pool, on a pool review's `error` export
 `REVIEW_LEASE=<slug>/<unit>/<phase>` and retry with
-`review.sh --to <full-seat-name>` for that review.
+`review.sh --to <full-worker-name>` for that review.
 
 A dispatch that dies in seconds never reached the provider, and a provider
-message it prints is a message some earlier call received. Seats launched
+message it prints is a message some earlier call received. Workers launched
 together that fail within seconds of each other carrying **byte-identical text,
 the same retry-at timestamp included, are a local fault**: separate API calls do
 not produce identical text. Confirm it against
@@ -292,16 +292,16 @@ not evidence delegates are back. The only valid probe is the dispatch itself.
 
 The launcher already tried. On a fast failure with no work done, or a stale Codex
 sign-in (`access token could not be refreshed`) even after the thread exists, `codex_mesh.py`
-abandons the inherited server, starts one of its own and runs the seat again,
-printing `retrying on a new app-server` to the seat's log. So an error that
+abandons the inherited server, starts one of its own and runs the worker again,
+printing `retrying on a new app-server` to the worker's log. So an error that
 reaches you has usually already been tested against a clean server and is real.
 Read the log for that line before doing anything by hand: present, the retry
-happened and the failure survived it; absent, the launcher held back — the seat
+happened and the failure survived it; absent, the launcher held back — the worker
 had already done work, or the failure took too long to be local — and the
 paragraphs above are yours to apply.
 
 A new Codex sign-in moves the run by itself. A message from `codex-sign-in` names
-the server it retired; the next dispatch starts on a new one, a seat mid-turn
+the server it retired; the next dispatch starts on a new one, a worker mid-turn
 finishes first, and nothing is owed in reply.
 
 Recovering by hand, in that case only. Check that no peer run claims the
@@ -360,7 +360,7 @@ at once, in the turn it arrives; it never waits for a better moment:
 1. Stop mid-step. Do not finish the step, dispatch, review or gate in progress,
    and start nothing new. Leave uncommitted work in place.
 2. Stop any build you started outside `verify.sh`, or name it in the line below.
-   Leave Codex seats running: the mover ends them with this session.
+   Leave Codex workers running: the mover ends them with this session.
 3. Run the `shutdown.py ready --where "<phase N: the step you stopped in and what
    comes next>"` command the message gives.
 4. End the turn with `— blocked: shutdown requested by the user`.
@@ -370,7 +370,7 @@ from it. A forced stop without this message is a separate command the user gives
 </PauseForMove>
 
 <CompactionContract>
-- Apply <LongLivedSeats/> to Codex seat compaction and overflow continuation;
+- Apply <LongLivedWorkers/> to Codex worker compaction and overflow continuation;
   the rules below govern the unit director's own context.
 - Do not maintain a handoff before the context hook requests one.
 - When requested, write it in the repository and include the hook's fields plus
@@ -453,8 +453,8 @@ Rules:
 - `check` and `test --filter` are feedback while iterating, never a gate.
   Run `check` after each batch of edits, and `test --filter` once per finished
   change, naming all its tests in one call (repeat `--filter`). Never re-run
-  either on a tree that has not changed. User, 2026-10-04: seats ran a
-  `--filter` after every edit, 619 test runs in six hours. After the seat's last edit, run
+  either on a tree that has not changed. User, 2026-10-04: workers ran a
+  `--filter` after every edit, 619 test runs in six hours. After the worker's last edit, run
   `lint` once, naming any one modified package, then `test` for every modified
   package. Lint is never per crate: one run covers the whole workspace (mend
   and clippy across it, format and rustdoc for every changed member). A failed
@@ -550,7 +550,7 @@ preemption. Close that slot's open pass with `finish-pass --status canceled
 --orphaned-launcher`, which the recorder accepts only for `canceled` and only
 while a pass is open. The slot comes from `PLAN_DELEGATE_TEAM_ROLE` on the call
 and never from the record — a launcher closes its own pass and nothing else, so
-the unit director standing in for one names the seat it is standing in for, once
+the unit director standing in for one names the worker it is standing in for, once
 per killed launcher. A killed fix dispatch leaves its findings
 `repair_in_flight` for the same reason, so `findings.py abandon` per
 <FindingsLedger/> belongs beside this call.
@@ -927,9 +927,9 @@ At an eligible tick, in that same tick:
    named no created files yet, so that check is vacuous; the snapshot is
    expected to be incomplete.
 4. When the production doc names a review pool and the phase's arm is `pool`,
-   select no seat. Otherwise select its seat under <TeamReview/>, save the
+   select no worker. Otherwise select its worker under <TeamReview/>, save the
    slot as `${EARLY_REVIEW_SLOT}`, and apply <RoleReassignment/> when the open
-   seat's role changes; when every open seat is busy, name a new `review` seat
+   worker's role changes; when every open worker is busy, name a new `review` worker
    and keep it after the turn. On the pool arm, read `${EARLY_REVIEW_SLOT}`
    when a cancel call needs it:
    the one line in `${SESSION_DIR}/review_slot_adversary` for pass 1, or
@@ -946,7 +946,7 @@ At an eligible tick, in that same tick:
 5. Launch `review.sh` exactly as <DualReview/> step 3 does — with
    `--pool code --lease <slug>/<unit>/<phase>` when the production doc names
    a review pool and the phase's arm is `pool`; otherwise with `--to` for an
-   open seat or `--slot "${EARLY_REVIEW_SLOT}"` for the new seat, and
+   open worker or `--slot "${EARLY_REVIEW_SLOT}"` for the new worker, and
    `adversary` as its lens for pass 1 — appending one extra final argument:
    `${SESSION_DIR}/final_diff_${REVIEW_PASS}.ready`. Save the
    handle as `${REVIEW_DISPATCH_HANDLE}` and set `EARLY_REVIEW=launched`. Leave
@@ -1035,7 +1035,7 @@ tables rather than stalling the turn.
 </DelegationResultFormat>
 
 <FixDispatch>
-Apply <LongLivedSeats/>.
+Apply <LongLivedWorkers/>.
 
 For a `dispatch` batch, set `${FIX_ROUND}` from the gate's `round` and create
 `${SESSION_DIR}/fix_prompt_${FIX_ROUND}.md` under
@@ -1044,32 +1044,32 @@ file/line findings and intended behavior. Verification contains only implicated
 `verify.sh` lines—usually check and test, adding lint only for lint-related
 repairs.
 
-A repair runs **one seat per file set no other seat touches**: when the failing
-tests or findings split that way, always run as many seats as you can reasonably
+A repair runs **one worker per file set no other worker touches**: when the failing
+tests or findings split that way, always run as many workers as you can reasonably
 manage; otherwise one. User, 2026-10-04. Use the open `impl` and `test` slots
-first, preferring the seat that owns the files and reassigning another open seat
+first, preferring the worker that owns the files and reassigning another open worker
 under <RoleReassignment/> when needed. Only then open `fix2`, `fix3`… when no
-open seat can take another file set. Each seat's task and kind are `fix`, its
+open worker can take another file set. Each worker's task and kind are `fix`, its
 ninth argument remains its slot, and it gets its own
-`fix_prompt_${FIX_ROUND}[_<slot>].md`. Each seat makes its repair and writes, for each testable finding, the regression test that would
+`fix_prompt_${FIX_ROUND}[_<slot>].md`. Each worker makes its repair and writes, for each testable finding, the regression test that would
 have caught it — one that fails without the repair. A finding about what is
 drawn gets a test that renders and reads the pixels back, or a live pixel check
 the prompt names; a test of components, constants or hand-written pointer hits
 does not count. It names each test for the behavior it pins and puts the
 finding id only in its summary; an id in code outlives the review that defined
-it. <ClosureReview/> is the cold read, so no seat is spent
-on one here. A seat's file set is its findings' files plus their test targets;
-its prompt names every other seat's files as read only.
+it. <ClosureReview/> is the cold read, so no worker is spent
+on one here. A worker's file set is its findings' files plus their test targets;
+its prompt names every other worker's files as read only.
 
-Dispatch every open seat with `implement.sh --to <full-seat-name>` before the
+Dispatch every open worker with `implement.sh --to <full-worker-name>` before the
 usual positional arguments; the prompt file is the follow-up message. Omit
-`--to` only for a new seat allowed by <LongLivedSeats/>. Messages without the
+`--to` only for a new worker allowed by <LongLivedWorkers/>. Messages without the
 launcher are for questions only.
 
 Run `findings.py dispatch --covers <all batch ids>` before launching, then:
 
 ```sh
-PLAN_DELEGATE_RESOLVES_ROUND=1 implement.sh --to "<full-seat-name>" \
+PLAN_DELEGATE_RESOLVES_ROUND=1 implement.sh --to "<full-worker-name>" \
   "${SESSION_DIR}" "${WORKING_DIR}" \
   "${SESSION_DIR}/fix_prompt_${FIX_ROUND}.md" fix \
   "<responsibility>" fix "<activity>" "${FIX_ROUND}" <slot>
@@ -1077,8 +1077,8 @@ PLAN_DELEGATE_RESOLVES_ROUND=1 implement.sh --to "<full-seat-name>" \
 
 **`PLAN_DELEGATE_RESOLVES_ROUND=1` is what lets the launcher resolve the round**:
 only the launcher watches the worker exit, so only it can say a repair landed.
-Each further seat runs the same call with `PLAN_DELEGATE_RESOLVES_ROUND=0`, its
-own prompt and its slot; the round is done only once every seat has exited.
+Each further worker runs the same call with `PLAN_DELEGATE_RESOLVES_ROUND=0`, its
+own prompt and its slot; the round is done only once every worker has exited.
 
 Apply <DispatchContract/>; set `EARLY_REVIEW=none` and clear
 `${EARLY_REVIEW_SLOT}` at dispatch, and close the
@@ -1111,23 +1111,23 @@ the measured cause.
 Dispatch the normal <DualReview/> closure review only when the diff cannot
 answer the question: a public API or signature change with a caller outside
 the diff, a registration, transition, or invariant reaching past the batch, an
-id whose verdict reads unclear, a claim the seat says it could not verify and
+id whose verdict reads unclear, a claim the worker says it could not verify and
 the main read cannot verify either, or a new defect the repair introduced.
 Uncertainty routes to the reviewer; a hunk fully read and fully understood
 does not. A closure review costs a stage of the phase, so it is spent on a
-question, never on a path. Select its open seat under <TeamReview/>, post the
+question, never on a path. Select its open worker under <TeamReview/>, post the
 <RoleReassignment/> handoff when its role changes, and launch it with
-`review.sh --to`; when every open seat is busy, open and retain a role-named
-review seat with `review.sh --slot review` instead.
+`review.sh --to`; when every open worker is busy, open and retain a role-named
+review worker with `review.sh --slot review` instead.
 When the production doc names a review pool and the phase's arm is `pool`,
 use `review.sh --pool code --lease <slug>/<unit>/<phase>` instead of selecting
-an open seat.
+an open worker.
 
 On completion, `implemented` continues as above; `error` applies
 <DelegateLaunchFailure/>, and then, if the error survives it,
 <RetainDelegatedPhaseReservation/>, reports the fix log, records an error
 outcome, clears the session marker, and stops. Both outcomes resolve the round
-in the ledger through the launcher. Any third outcome — a new-seat or follow-up dispatch stopped,
+in the ledger through the launcher. Any third outcome — a new-worker or follow-up dispatch stopped,
 killed, or gone without `impl_status` reaching either — is the unit director's to
 resolve with `findings.py abandon` per <FindingsLedger/>, then apply
 <RetainDelegatedPhaseReservation/> before reviewing, re-dispatching, or
@@ -1363,10 +1363,10 @@ plan-doc edit acquires that phase's reservation in an enrolled repository.
 <PhaseCleanup>
 In `single`, run both halves under <ExecutionSteps/> step 11.
 At <PhaseEnd/>'s worker cleanup point, run
-`python3 ~/.claude/scripts/delegate/remove_seats.py --session-dir "${SESSION_DIR}"`.
-It removes the completed phase's Claude seats and any seat a dead run left
+`python3 ~/.claude/scripts/delegate/remove_workers.py --session-dir "${SESSION_DIR}"`.
+It removes the completed phase's Claude workers and any worker a dead run left
 alive; a failure is one line in the report, never a stop. Under
-<LongLivedSeats/>, do not end this run's Codex seats: their turns finish, their
+<LongLivedWorkers/>, do not end this run's Codex workers: their turns finish, their
 threads stay open, and `end_session.sh` ends them with the run. TaskStop each
 Claude Agent helper, end finished launchers, and shut down every Hana or
 example app this phase launched. Never touch what another session started.

@@ -33,8 +33,8 @@ rather than enforced:
   * the gating open count failed to decrease across `STALLED_ROUNDS` rounds
   * the phase spent its repair budget, which is the first round's gating count
     times `REPAIR_ROUNDS_PER_FINDING`, never below `MIN_REPAIR_BUDGET`
-  * one seat ran `MAX_CONSECUTIVE_SAME_KIND_PASSES` passes of one kind in a row
-  * one seat had a review canceled more than `MAX_REVIEW_CANCELLATIONS` times
+  * one worker ran `MAX_CONSECUTIVE_SAME_KIND_PASSES` passes of one kind in a row
+  * one worker had a review canceled more than `MAX_REVIEW_CANCELLATIONS` times
   * a runaway backstop at `RUNAWAY_ROUNDS` rounds
 
 Every one of those limits is set in `~/.claude/config/delegate.conf`, which is
@@ -366,7 +366,9 @@ def _append_event(session_dir: Path, state: dict[str, object], event: dict[str, 
         fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
         _ = handle.write(line)
         handle.flush()
-        os.fsync(handle.fileno())
+        # Disposable fixtures may omit disk durability; production syncs by default.
+        if os.environ.get("PLAN_DELEGATE_SYNC_WRITES", "1") != "0":
+            os.fsync(handle.fileno())
         fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
 
@@ -453,10 +455,10 @@ def _history_root() -> Path:
 
 
 class PhasePass(TypedDict):
-    """One pass a phase ran: what work it was, which seat ran it, how it ended.
+    """One pass a phase ran: what work it was, which worker ran it, how it ended.
 
     `kind` stays semantic -- impl, test, fix, review -- and says nothing about
-    who ran it. `slot` is the seat: a stable worker identity for the length of
+    who ran it. `slot` is the worker: a stable worker identity for the length of
     one launcher, not the role that worker is performing, which changes during a
     phase and lives on the coordination board.
     """
@@ -467,11 +469,11 @@ class PhasePass(TypedDict):
 
 
 def _event_slot(event: dict[str, object]) -> str:
-    """The seat a pass event was stamped with, under whichever key wrote it.
+    """The worker a pass event was stamped with, under whichever key wrote it.
 
     The field was `team_role` for a day, before the value was understood to
-    name a seat. Reading both keeps a phase that spans the rename to one bucket
-    per seat instead of splitting each seat in two.
+    name a worker. Reading both keeps a phase that spans the rename to one bucket
+    per worker instead of splitting each worker in two.
     """
     if "team_slot" in event:
         return _string(event.get("team_slot"))
@@ -482,7 +484,7 @@ def _phase_passes(session_dir: Path, instance_id: str) -> list[PhasePass]:
     """Every pass this phase instance has run, in the order they opened.
 
     Read from the durable event stream rather than the session cache: the cache
-    holds one pass per seat and what the gate needs is the whole phase.
+    holds one pass per worker and what the gate needs is the whole phase.
     `finished` carries the outcome; a pass still running contributes its
     `started` row with an empty status.
     """
@@ -524,11 +526,11 @@ def _phase_passes(session_dir: Path, instance_id: str) -> list[PhasePass]:
 
 
 def _passes_by_slot(passes: list[PhasePass]) -> dict[str, list[PhasePass]]:
-    """The phase's passes split into one sequence per seat, order preserved.
+    """The phase's passes split into one sequence per worker, order preserved.
 
-    Passes with no seat land in one bucket together, which is every pass the
+    Passes with no worker land in one bucket together, which is every pass the
     back corpus recorded and every pass of a phase run by a single launcher --
-    the sequence those see is the flat one, exactly as before seats existed.
+    the sequence those see is the flat one, exactly as before workers existed.
     """
     by_slot: dict[str, list[PhasePass]] = {}
     for entry in passes:
@@ -537,22 +539,22 @@ def _passes_by_slot(passes: list[PhasePass]) -> dict[str, list[PhasePass]]:
 
 
 def _consecutive_same_kind(passes: list[PhasePass]) -> tuple[str, int]:
-    """The longest run of one kind ending at some seat's most recent pass.
+    """The longest run of one kind ending at some worker's most recent pass.
 
-    Counted within a seat, never across seats. A phase team runs its launchers
+    Counted within a worker, never across workers. A phase team runs its launchers
     at once, so two impl passes in the event stream are one round with two
-    workers; what this limit guards against is one seat being handed the same
+    workers; what this limit guards against is one worker being handed the same
     kind of work over and over while the phase fails to advance, and only that
-    seat's own sequence shows it.
+    worker's own sequence shows it.
     """
     longest_kind = ""
     longest_run = 0
     by_slot = _passes_by_slot(passes)
     for slot in sorted(by_slot):
-        seat_passes = by_slot[slot]
-        kind = seat_passes[-1]["kind"]
+        worker_passes = by_slot[slot]
+        kind = worker_passes[-1]["kind"]
         run = 0
-        for entry in reversed(seat_passes):
+        for entry in reversed(worker_passes):
             if entry["kind"] != kind:
                 break
             run += 1
@@ -562,10 +564,10 @@ def _consecutive_same_kind(passes: list[PhasePass]) -> tuple[str, int]:
 
 
 def _review_cancellations(passes: list[PhasePass]) -> int:
-    """The most times any one seat had a review pass canceled.
+    """The most times any one worker had a review pass canceled.
 
-    Per seat for the same reason the kind run is: the limit asks whether a
-    reviewer is never completing, and one cancellation each across two seats
+    Per worker for the same reason the kind run is: the limit asks whether a
+    reviewer is never completing, and one cancellation each across two workers
     is two reviewers interrupted once, not one that cannot finish.
     """
     per_slot: dict[str, int] = {}

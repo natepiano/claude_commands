@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import cast, override
 from unittest.mock import patch
 
-from scripts.delegate import remove_seats
+from scripts.delegate import remove_workers
 
 
 END_SESSION = Path(__file__).with_name("end_session.sh")
@@ -54,7 +54,7 @@ class EndSessionTests(unittest.TestCase):
         message.mkdir()
         self.script = delegate / "end_session.sh"
         _ = shutil.copy2(END_SESSION, self.script)
-        _ = (delegate / "remove_seats.py").write_text("", encoding="utf-8")
+        _ = (delegate / "remove_workers.py").write_text("", encoding="utf-8")
         _ = (agents / "codex_mesh.py").write_text("", encoding="utf-8")
         notifier = message / "notifier.sh"
         _ = notifier.write_text("#!/usr/bin/env zsh\nexit 0\n", encoding="utf-8")
@@ -97,7 +97,7 @@ class EndSessionTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         calls = self.calls.read_text(encoding="utf-8").splitlines()
         self.assertEqual(len(calls), 3)
-        self.assertIn("remove_seats.py --session-dir", calls[0])
+        self.assertIn("remove_workers.py --session-dir", calls[0])
         self.assertIn("codex_mesh.py stop --session-dir", calls[1])
         self.assertIn(str(self.session_dir), calls[1])
         self.assertIn("codex_mesh.py sweep --root", calls[2])
@@ -108,21 +108,21 @@ class EndSessionTests(unittest.TestCase):
         failed = subprocess.CompletedProcess[str](["codex_mesh.py"], 2, "", "")
         with patch.object(subprocess, "run", return_value=failed) as run, \
                 contextlib.redirect_stderr(io.StringIO()) as errors:
-            remove_seats.sweep_app_servers(self.root)
+            remove_workers.sweep_app_servers(self.root)
 
         command = cast("list[str]", run.call_args.args[0])
         self.assertEqual(
             command,
             [
                 sys.executable,
-                os.fspath(remove_seats.CODEX_MESH),
+                os.fspath(remove_workers.CODEX_MESH),
                 "sweep",
                 "--root",
                 os.fspath(self.root),
                 "--stop",
             ],
         )
-        self.assertIn("seat cleanup continues", errors.getvalue())
+        self.assertIn("worker cleanup continues", errors.getvalue())
 
 
 if __name__ == "__main__":

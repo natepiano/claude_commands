@@ -112,72 +112,96 @@ A test that pins a behaviour a user or another script depends on is not trivial,
 
 **Gotchas:** admission works on RSS samples at least 0.25 s apart, not an OS limit; a module that grows suddenly can still pass the cap, which turns the run red. `local_release_wait` falls back to polling where inotify is absent (macOS). The red-suite rerun rule stays with the showrunner, outside the command.
 
-### Phase 3 — The code under test stops waiting  · status: todo
+### Phase 3 — The code under test stops waiting  · status: done
 
-**Depends on:** Phase 2
+#### As-built
+
+- Every fixed wait the tests sat through is an override the test sets, with production defaults unchanged and each default pinned by a test: `review.sh` early-delivery poll `PLAN_DELEGATE_EARLY_POLL_SECS` (5); `implement.sh` seat and turn probes `PLAN_DELEGATE_SEAT_POLL_SECS` (1) and `PLAN_DELEGATE_SEAT_WAIT_ATTEMPTS` (30); `add_showrunner.py` `ADD_SHOWRUNNER_POLL_S` (2.0); `OffloadConfig.leftover_timeout_s` in `offload.py` (10, from the settings file); `codex_mesh.py` `RESIDENT_POLL_SECS` (1.0), `REAP_WAIT_SECS` (5.0) and `REAP_POLL_SECS` (0.2), patched as module attributes in tests.
+- `verify.sh` reads its token-wait clock from `PLAN_DELEGATE_TOKEN_CLOCK_FILE` when set, else `$SECONDS`, so the token-wait test advances a file instead of sleeping.
+- Disposable fixtures skip disk sync: `PLAN_DELEGATE_SYNC_WRITES=0` skips fsync in `progress_history.py`, `findings.py` and `review_pool.py`; `collect.py --durability off` (`LedgerDurability`, default `full`) sets `PRAGMA synchronous=OFF`.
+- The interpreter-cache miss is fixed in the delegate fixtures, not in `lib/py`: each temporary `HOME` gets `XDG_CACHE_HOME` with a seeded `claude/python3-<version>` cache.
+- `scripts/delegate/wait_for_test_state.py` (`wait_until`, `wait_for_file`) waits on directory events and child pidfds through `local_release_wait`, polling where inotify or pidfd is absent. The stub app-server's accept loop blocks in `select` on the listener and a socketpair that `close()` writes, so closing wakes it at once.
+- `merge_gate.py` refuses a `--type-dirs` path absent from the merge checkout before any suite starts.
+- Measured: gate green at 183 s and 2.33 GiB peak at load 88–123; 151.6 s and 2.41 GiB on the merged tree at load 92–121. Matched-load A/B: `test_review_launcher` 69→36 s, `test_implement_launcher` 37→33 s, `test_progress_history` unchanged at 78 s.
+
+**Files:**
+- `scripts/delegate/review.sh`, `implement.sh`, `verify.sh` — poll, probe and token-clock overrides
+- `scripts/delegate/progress_history.py`, `findings.py`, `review_pool.py` — `PLAN_DELEGATE_SYNC_WRITES`
+- `scripts/delegate/wait_for_test_state.py` — event-driven fixture waits
+- `scripts/production/add_showrunner.py`, `scripts/mac_test/offload.py`, `scripts/agents/codex_mesh.py`, `scripts/usage/collect.py` — poll, timeout, reap and sync overrides
+- `scripts/agents/test_codex_mesh.py`, `scripts/delegate/test_*.py`, `scripts/mac_test/test_offload.py`, `scripts/production/test_add_showrunner.py`, `scripts/usage/test_collect.py` — fixtures on the overrides and regressions pinning each default
+
+**Binds later work:** "Trivial tests are gone" keeps this phase's regressions (sync default, interpreter cache, wait helper, reap, stub close); each was mutation-proved. "Fewer process launches per test" starts from the gate's slowest modules at load 88–123: `delegate/test_verify_mac_offload` 181 s, `delegate/test_review_launcher` 165 s, `production/test_dailies_input` 163 s, `delegate/test_progress_history` 161 s, `mac_test/test_offload` 134 s, `production/test_add_unit` 132 s; the gate's wall time is its slowest module.
+
+**Gotchas:** fsync was already cheap on tmpfs; `test_progress_history`'s cost is about 750 launches of `progress_history.py`. A pidfd stays readable after exit, so `wait_until` observes each one once and drops it.
+
+### Phase 4 — Trivial tests are gone  · status: done
+
+#### As-built
+
+- All 5,713 tests in the 22 gate suites are audited against "Trivial tests: the criteria": 7 candidates, 21 unsure tests kept.
+- Five tests are deleted, 1.37 s of test time (1.365 s of it the add_unit duplicate): criterion-5 duplicates in `production/test_add_unit.py` (survivor `test_restart_restore_is_allowed_for_its_restarting_unit`), `production/test_review_pause.py` (survivor `test_pause_and_resume_both`) and `buildlog/test_treekey.py` (survivor `test_symlink_read_error_leaves_tree_key_unavailable`); the `build_hold` import-name check; the `shutdown` standard-library `StrEnum` lookup check. No duplicates are merged; each survivor is unchanged.
+- The two fixture guards that block real phone sends stay, renamed with a docstring: `whoami/test_quota_alert.py::test_setup_blocks_real_phone_sends` and `lint/test_sweep.py::test_base_blocks_real_phone_sends`.
+- `docs/delegate/write_prompt_contract.md` section 6 (`## Work Specification`) carries one line with the five criteria, which prompt authors copy into every seat prompt that writes tests.
+- Gate after: all 22 suites green, 193.8 s, 2.44 GiB peak at load 64–101 (183 s at load 88–123 after "The code under test stops waiting"; loads differ, so not comparable).
+
+**Files:**
+- `docs/delegate/write_prompt_contract.md` — section 6 carries the trivial-test criteria
+- `scripts/production/test_add_unit.py`, `scripts/production/test_review_pause.py`, `scripts/buildlog/test_treekey.py`, `scripts/build_hold/test_build_hold.py`, `scripts/shutdown/test_send_guard.py` — one test deleted from each
+- `scripts/whoami/test_quota_alert.py`, `scripts/lint/test_sweep.py` — phone-send guards renamed
+
+**Binds later work:** "Fewer process launches per test" receives the criteria through `write_prompt_contract.md` section 6: a moved test replaces its subprocess form, never sits beside it with the same inputs and assertion; a default-pinning test runs the real script with the override unset and observes the default through behavior, never by reading the literal from source. The add_unit restore case lives only in `test_restart_restore_is_allowed_for_its_restarting_unit`. The unsure tests kept in its target modules (`test_progress_history.py::test_recorder_helpers_use_public_names_without_private_aliases`, `test_offload.py::test_activity_and_leftover_texts_use_the_shared_mirror_selector`) stay.
+
+**Gotchas:** the suites hold almost no trivial tests, so this phase does not move gate time. The shell overrides `PLAN_DELEGATE_SEAT_POLL_SECS`, `PLAN_DELEGATE_SEAT_WAIT_ATTEMPTS`, `PLAN_DELEGATE_EARLY_POLL_SECS` and `PLAN_DELEGATE_TOKEN_CLOCK_FILE` have no test that runs with them unset; "each default pinned by a test" holds for the Python overrides only.
+
+**Ruled out:** deleting the two phone-send guards — they pin the fixture patch that stops real sends.
+
+### Phase 5 — Fewer process launches per test  · status: done
+
+#### As-built
+
+- `scripts/production/cli_fixture.py` `invoke_cli(module, main, arguments, environment, cwd, *, combined_output=False, production_state=False) -> subprocess.CompletedProcess[str]` runs a script's real parser, handlers and child commands in-process, and after each case restores environment, cwd, argv, `sys.path`, the SIGINT/SIGTERM/SIGHUP/SIGQUIT handlers and the module's global bindings. With `production_state` it imports `dailies_render` and `showrunners` in the caller's environment first, then patches their import-time paths (`CHART_CONF`, `AGENTS_DIR`, `READINGS_LOG`; `CONFIG`, `NOTIFIER_STATE_DIR`, `SESSIONS_DIR`, `SHOWRUNNER_STATE_DIR`, `SESSIONS`, `SEND`) under the fixture HOME. Each converted script keeps one subprocess test for CLI parsing, exit status and the launch contract (`subprocess_cli=True`).
+- `ImmutableGitSeed.create(root, branch, author, email, files)` builds one checkout and bare origin per test class; `copy_to(checkout, origin)` gives each case private refs, config, index and origin by copying both and repointing the remote.
+- `scripts/production/fake_tmux.sh` (bash + jq) reads the same JSON state as `fake_tmux.py` and replaces it on the hot path (`UNIT_LOOKUP_TMUX`). It rejects malformed calls with exit 2; a missing session or pane exits 1 with a diagnostic naming the target and leaves the state unchanged. The `ci_points` fake `gh` is a shell + jq stub.
+- `send.py` imports `roster` only when a send needs local session discovery; acknowledgements, explicit sockets and named-machine sends skip it, with routes and output unchanged.
+- `scripts/delegate/` is untouched; its share of the work is the phase "The delegate tests start fewer processes". `build_targets` is unchanged, already at 4 launches per module run.
+- Measured launches across the targeted modules: 11682 → 8764. `test_dailies_input` 3569 → 1387 (422 → 126 s), `test_dailies_render` 143 → 3 (83 → 6 s), `test_add_unit` 3773 → 3205 (393 → 318 s); `test_waiting`, `test_send`, `test_ci_points` and `mac_test/test_offload` roughly flat. Gate: 100.87 s, 2.54 GiB peak at load 30–58 (193.8 s at load 64–101 after "Trivial tests are gone").
+
+**Files:**
+- `scripts/production/cli_fixture.py` — `invoke_cli` and `ImmutableGitSeed`
+- `scripts/production/fake_tmux.sh` — shell fake tmux over the `fake_tmux.py` JSON state
+- `scripts/production/test_dailies_input.py`, `test_dailies_render.py`, `test_add_unit.py`, `test_waiting.py`, `test_ci_points.py` — in-process CLI cases, per-class git seeds, shell fakes
+- `scripts/mac_test/test_offload.py` — in-process offload CLI cases; imports `cli_fixture` through a `sys.path` insertion
+- `scripts/message/send.py`, `scripts/message/test_send.py` — deferred session discovery and its tests
+
+**Binds later work:** "The delegate tests start fewer processes" reuses `invoke_cli` with `production_state` off through a thin delegate wrapper for its own preloads, path rebinding and cache reset. The gate's slowest remaining modules are delegate's.
+
+**Gotchas:** a module first imported inside the fixture computes its import-time paths from the fixture HOME, and restoring bindings then restores those fixture paths; preload such modules before swapping the environment (pinned by `test_dailies_render.py::ReportFooterTests::test_cold_imported_production_paths_return_to_the_callers_home_after_each_case`). `invoke_cli` restores module bindings, not mutable containers held in module globals, so it suits synchronous cases only. `fake_tmux.sh` signals a missing target through jq `halt_error(1)`; jq's own failure exit is 5 (pinned by `test_waiting.py::WaitingTests::test_shell_tmux_names_missing_targets_and_preserves_state_on_every_targeted_call`). The gate's wall time is its slowest module.
+
+**Ruled out:** a delegate-local copy of the CLI fixture — one restore implementation is simpler.
+
+### Phase 6 — The delegate tests start fewer processes  · status: todo
+
+**Depends on:** Phase 5
+
+Split from Phase 5 on 2026-10-14 (packaging): `scripts/delegate/` was released to message-clarity for its seat→worker rename, so this phase starts once that rename has merged into build-followups; merge it into this branch first.
 
 #### Work Order
 
-**Goal:** the named waits leave the suites without weakening any test.
+**Goal:** the delegate suite starts far fewer processes.
 
-**Spec:** `review.sh:797` `sleep 5`; `implement.sh:509/519` `sleep 1`; `add_showrunner.py:45` `POLL_S`; `offload.py:1130` ssh timeout made overridable and short in tests; `codex_mesh.py:3599`, `:3248` sleeps and `RESIDENT_POLL_SECS` (`:191`) made event-driven or overridable; the stub server's accept loop woken on close (`test_codex_mesh.py:138,145-151`); the delegate test polls and stub sleeps (`test_verify_token_wait.py:69`; Phase 2 already made `test_verify_mac_offload.py` and `test_verify_hold_wait.py` advance on events and `verify.sh` routing wake on release through `local_release_wait.py`); fsync in `progress_history.py:492`, `review_pool.py:225`, `findings.py:369`, usage `collect.py`; `lib/py`'s interpreter cache under a test `HOME`. Each wait becomes an event, a parameter the test passes, or a value the test overrides; production defaults stay.
-
-**Files:**
-- `scripts/delegate/review.sh` — `:797` `sleep 5`
-- `scripts/delegate/implement.sh` — `:509`, `:519` `sleep 1`
-- `scripts/delegate/progress_history.py` — fsync (`:492`)
-- `scripts/delegate/review_pool.py` — fsync (`:225`)
-- `scripts/delegate/findings.py` — fsync (`:369`)
-- `scripts/delegate/` — the test polls and stub sleeps named in the Spec
-- `scripts/lib/py` — interpreter cache under a test `HOME`
-- `scripts/production/add_showrunner.py` — `POLL_S` (`:45`)
-- `scripts/mac_test/offload.py` — ssh timeout (`:1130`)
-- `scripts/agents/codex_mesh.py` — sleeps (`:3248`, `:3599`) and `RESIDENT_POLL_SECS` (`:191`)
-- `scripts/agents/test_codex_mesh.py` — stub server accept loop (`:138`, `:145-151`)
-- `scripts/usage/collect.py` — sqlite fsync
-
-**Seats:** 2 writers — split by suite
-- `impl` — `scripts/delegate/` and `scripts/lib/py`
-- `test` — opens as impl; `scripts/agents/`, `scripts/mac_test/`, `scripts/usage/`, `scripts/production/`
-
-**Acceptance gate:** touched suites green; basedpyright clean; the gate command's time recorded before and after (`python3 scripts/production/merge_gate.py --tests-only --repo <worktree> </dev/null`; before: 75 s, peak 2.3 GiB at load 6–22).
-
-### Phase 4 — Trivial tests are gone  · status: todo
-
-**Depends on:** Phase 3
-
-#### Work Order
-
-**Goal:** no test in the 22 suites meets the criteria in "Trivial tests: the criteria"; agents are told the criteria before they write tests.
-
-**Spec:** audit all 22 suites against the criteria; report per-suite counts (and the unsure list) to the showrunner before deleting. Delete trivial tests outright; merge true duplicates into one; never weaken a non-trivial test. Report the tests and seconds removed separately from the speed fixes. Add one line naming the criteria to the one source agents read before writing tests (find it: the unit and seat instructions that govern test writing).
+**Spec:** start from the slowest delegate modules (learned timings at load 88–123: test_verify_mac_offload 181 s, test_review_launcher 165 s, test_progress_history 161 s); after the prerequisite merge and before editing, re-time the delegate modules to confirm that order. Record each targeted module's launch count and matched-load duration before and after: `strace -f -qq -e trace=execve -e signal=none -o <scratch file> python3 -m unittest discover -s scripts/delegate -p '<module>' </dev/null`, count successful `execve` lines (ending `= 0`), record the duration and `/proc/loadavg`, and delete the trace once read; measure after the final edit at comparable load or with old and new scratch copies running concurrently, and report recorder launches apart from total execs. `test_progress_history.py` launches `progress_history.py` about 750 times at run time through `run_command` (`:146`), `run_failing_command` (`:181`) and `run_unowned_command` (`:1830`); `invoke_handler` (`:209`) runs four cases in-process but skips the recorder lock (`progress_history.py:4895`) and mocks every child process, so it is not the model for the conversion. Keep each test's assertions. Phase 5's in-process rules hold here (restore environment, cwd, import-time configuration, module globals and signal state after each case; keep at least one subprocess test per script for CLI parsing, exit status and the launch contract). Add tests that run `review.sh`, `implement.sh` and `verify.sh` with the Phase 3 overrides absent (`PLAN_DELEGATE_SEAT_POLL_SECS`/`_WAIT_ATTEMPTS`, `PLAN_DELEGATE_EARLY_POLL_SECS`, `PLAN_DELEGATE_TOKEN_CLOCK_FILE`) and pin the production defaults. If recorder identity paths (`_main_identity_from_codex`/`_claude`, `AgentIdentity | None`) become an in-process API, return a semantic result (known / unavailable) instead of a bare optional, keeping the fallback in `_detect_main_identity()`.
 
 **Files:**
-- `scripts/` — test files across the 22 suites
-- `docs/delegate/write_prompt_contract.md` — one line naming the criteria (or the one source agents read before writing tests, if another)
+- `scripts/delegate/` — targeted tests and fakes, the delegate CLI wrapper, `wait_for_test_state.py`, and `progress_history.py` where invocation isolation or semantic identity results need changes
 
-**Seats:** 2 writers — split by suite
-- `impl` — production, delegate, mac_test, usage, agents, buildlog, hooks
-- `test` — opens as impl; the other fifteen suites and the instruction line
+**Seats:** 1 writer
+- `test` — opens as impl; `scripts/delegate/` (sole owner of `wait_for_test_state.py`)
 
-**Acceptance gate:** every suite green; the counts report sent before deletion; the instruction line in place.
+**Constraints from prior phases:** the trivial-test criteria in `docs/delegate/write_prompt_contract.md` section 6 bind every test this phase moves or adds: a test moved in-process replaces its subprocess form, and each new default-pinning test runs the real script with the override unset and observes the default through behavior (a `sleep` stub on `PATH` recording its argument, an attempt count), never by reading the literal from the script source. Review and implement fixtures set their poll overrides (`test_review_launcher.py:471`, `test_implement_launcher.py:342`); ordinary verify cases already run with `PLAN_DELEGATE_TOKEN_CLOCK_FILE` unset but pin no wait; no test removes the overrides and pins the defaults (`review.sh:797` sleep 5; `implement.sh:505,511,515,521` 30 attempts of sleep 1 in both probe loops; `verify.sh:1172` `$SECONDS`). Remove the variables from each test environment explicitly; a `sleep` stub on `PATH` records its argument and returns at once (5 for review; 1 and 30 exhausted attempts for both implement loops, the agent alive and readiness absent); for verify, a stub board `acquire` that blocks just over one second shows a recorded wait of at least 1 with the clock file absent, a lower bound that load cannot fail, and no upper wall-time bound or real default wait.
 
-### Phase 5 — Fewer process launches per test  · status: todo
+"Fewer process launches per test" built `scripts/production/cli_fixture.py`: `invoke_cli` runs a script's real parser and handlers in-process and restores environment, cwd, argv, `sys.path`, signal handlers and module bindings after each case. Reuse it (`from scripts.production.cli_fixture import invoke_cli`, the package form these tests already use; no `sys.path` insertion) with `production_state` off, and keep delegate-only work in a delegate wrapper: import, before the environment swap, every module the recorder imports lazily (a module first imported under a fixture `HOME` keeps fixture paths after restore); rebind import-time paths derived from `HOME`/XDG with patches computed from the fixture environment, the recorder's default configuration paths included; clear `progress_history._config_digest`'s cache (`progress_history.py:262`, cached per process) before each invocation; raise `CalledProcessError` where `run_command` checks. Convert `run_command`, `run_failing_command` and `run_unowned_command` through the real recorder `main()`, keeping its lock and real child integrations, with output, exit status and errors unchanged. Add a cold-interpreter regression: two fixture homes, then caller paths restored. Keep `PLAN_DELEGATE_SYNC_WRITES=0` fixture-scoped, the durable-default and changed-configuration (`test_progress_history.py:1938`) regressions, the event waits and the per-`HOME` interpreter-cache seeding.
 
-**Depends on:** Phase 4
+`scripts/delegate/` is renamed seat→worker by the prerequisite merge: after merging, re-read the launchers, recorder and fixture helpers and use the names they hold (environment variables, functions, files, vocabulary); names in this Work Order describe the tree before the rename and never authorize restoring old ones.
 
-#### Work Order
-
-**Goal:** the heaviest suites start far fewer processes.
-
-**Spec:** run the heaviest scripts in-process or trim their import chains (`dailies_input`, `dailies_render`, `send`, `build_targets`, `waiting`); write the fake tmux and gh tools as shell instead of Python; share git fixtures where a test only reads them (e.g. `merge_checkpoint`). Keep each test's assertions.
-
-**Files:**
-- `scripts/production/` — tests, fake tmux and gh, and the named scripts
-- `scripts/delegate/` — tests and fakes
-
-**Seats:** 2 writers — split by suite
-- `impl` — `scripts/production/`
-- `test` — opens as impl; `scripts/delegate/`
-
-**Acceptance gate:** suites green; exec counts and gate time recorded before and after.
+**Acceptance gate:** delegate suite green, each targeted module also alone; per-module launch counts and matched-load durations, and gate time, recorded before and after.

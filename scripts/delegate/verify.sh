@@ -52,11 +52,11 @@
 # `test --filter` key holds its names sorted, each once, so one set of names
 # finds one record whatever order a call gives them in. The same call on the
 # same tree then prints that record and its log and exits 0 without the cargo
-# token: seats re-ran unchanged trees 416 times in the week to 2026-10-01. A
+# token: workers re-ran unchanged trees 416 times in the week to 2026-10-01. A
 # `test --filter` reuse prints one line instead, since iteration feedback needs
 # only the verdict. A failed `lint` is recorded the same way
 # and replayed with its full output and exit status, since lint on an
-# unchanged tree fails the same way (one seat ran 12 in a row on 2026-10-01).
+# unchanged tree fails the same way (one worker ran 12 in a row on 2026-10-01).
 # A failed `test` is never recorded (tests flake), nor a run cut short by a
 # usage error, the sandbox or a kill. A `test` that changed the tree records
 # nothing, and a run outside a delegate session is never cached.
@@ -1163,8 +1163,18 @@ BOARD_HELPER="${HOME}/.claude/scripts/delegate/board.sh"
 BOARD_DIR="${PLAN_DELEGATE_BOARD_DIR:-}"
 BOARD_SLOT="${PLAN_DELEGATE_TEAM_ROLE:-}"
 TOKEN_HELD=0
+token_wait_clock() {
+    # Tests can advance a disposable clock while acquisition still blocks on
+    # the real board. Normal calls retain Bash's elapsed-seconds clock.
+    if [[ -n "${PLAN_DELEGATE_TOKEN_CLOCK_FILE:-}" ]]; then
+        read -r TOKEN_CLOCK_NOW < "$PLAN_DELEGATE_TOKEN_CLOCK_FILE"
+    else
+        TOKEN_CLOCK_NOW=$SECONDS
+    fi
+}
 if [[ -n "${BOARD_DIR}" && -n "${BOARD_SLOT}" && -f "${BOARD_HELPER}" ]]; then
-    TOKEN_WAIT_STARTED=$SECONDS
+    token_wait_clock
+    TOKEN_WAIT_STARTED=$TOKEN_CLOCK_NOW
     if bash "${BOARD_HELPER}" acquire "${BOARD_DIR}" "${BOARD_SLOT}" cargo \
         --pid $$ --hold 3600 --wait 1800 >/dev/null 2>&1; then
         TOKEN_HELD=1
@@ -1172,7 +1182,8 @@ if [[ -n "${BOARD_DIR}" && -n "${BOARD_SLOT}" && -f "${BOARD_HELPER}" ]]; then
         echo "verify.sh: waited for the cargo token and did not get it." >&2
         exit 1
     fi
-    TOKEN_WAIT_S=$(( SECONDS - TOKEN_WAIT_STARTED ))
+    token_wait_clock
+    TOKEN_WAIT_S=$(( TOKEN_CLOCK_NOW - TOKEN_WAIT_STARTED ))
 fi
 
 # Fork before starting each step. The child creates its own session, records

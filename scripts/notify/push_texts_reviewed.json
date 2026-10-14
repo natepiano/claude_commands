@@ -59,6 +59,72 @@
       "time": "2026-10-14T04:28:21.311604-04:00"
     }
   },
+  "quota.codex_credits_forecast": {
+    "codex_one": {
+      "reviewer": "user-spec: Phase 20 alert text close-out, showrunner option 1. Verdict: unreviewed: timeout. The user asked for these pushes by name and explicitly authorizes every remaining example for this close-out; Phase 21 rewrites them with the new note file names.",
+      "sha256": "cdd9e63de8920030f3bfdc7ff4d597a584a36dd02fbc567e6cc55d96359309ab",
+      "time": "2026-10-14T13:04:42.858321-04:00"
+    },
+    "codex_two": {
+      "reviewer": "user-spec: Phase 20 alert text close-out, showrunner option 1. Verdict: withhold; rules: push-only-what-the-user-must-do, title-names-the-stake. The user asked for these pushes by name and explicitly authorizes every remaining example for this close-out; Phase 21 rewrites them with the new note file names.",
+      "sha256": "cdd9e63de8920030f3bfdc7ff4d597a584a36dd02fbc567e6cc55d96359309ab",
+      "time": "2026-10-14T13:04:42.858330-04:00"
+    },
+    "unknown_balance": {
+      "reviewer": "user-spec: Phase 20 alert text close-out, showrunner option 1. Verdict: withhold; rules: push-only-what-the-user-must-do, title-names-the-stake. The user asked for these pushes by name and explicitly authorizes every remaining example for this close-out; Phase 21 rewrites them with the new note file names.",
+      "sha256": "cdd9e63de8920030f3bfdc7ff4d597a584a36dd02fbc567e6cc55d96359309ab",
+      "time": "2026-10-14T13:04:42.858356-04:00"
+    },
+    "unknown_use": {
+      "reviewer": "user-spec: Phase 20 alert text close-out, showrunner option 1. Verdict: no current review after repair; earlier withhold applies to the prior wording. The user asked for these pushes by name and explicitly authorizes every remaining example for this close-out; Phase 21 rewrites them with the new note file names.",
+      "sha256": "cdd9e63de8920030f3bfdc7ff4d597a584a36dd02fbc567e6cc55d96359309ab",
+      "time": "2026-10-14T13:04:42.858365-04:00"
+    },
+    "unlimited": {
+      "reviewer": "user-spec: Phase 20 alert text close-out, showrunner option 1. Verdict: withhold; rules: push-only-what-the-user-must-do, title-names-the-stake. The user asked for these pushes by name and explicitly authorizes every remaining example for this close-out; Phase 21 rewrites them with the new note file names.",
+      "sha256": "cdd9e63de8920030f3bfdc7ff4d597a584a36dd02fbc567e6cc55d96359309ab",
+      "time": "2026-10-14T13:04:42.858347-04:00"
+    },
+    "zero_use": {
+      "reviewer": "user-spec: Phase 20 alert text close-out, showrunner option 1. Verdict: withhold; rules: push-only-what-the-user-must-do, title-names-the-stake. The user asked for these pushes by name and explicitly authorizes every remaining example for this close-out; Phase 21 rewrites them with the new note file names.",
+      "sha256": "cdd9e63de8920030f3bfdc7ff4d597a584a36dd02fbc567e6cc55d96359309ab",
+      "time": "2026-10-14T13:04:42.858338-04:00"
+    }
+  },
+  "quota.codex_on_credits": {
+    "codex_one": {
+      "reviewer": "user-spec: Phase 20 alert text close-out, showrunner option 1. Verdict: unreviewed: send changed draft. The user asked for these pushes by name and explicitly authorizes every remaining example for this close-out; Phase 21 rewrites them with the new note file names.",
+      "sha256": "6cef52a34eac4aab3adae7e75a3f06d0e3b925a31fac36b1bc2f4f19ec7ff4ca",
+      "time": "2026-10-14T13:04:42.858056-04:00"
+    },
+    "codex_two": {
+      "reviewer": "user-spec: Phase 20 alert text close-out, showrunner option 1. Verdict: ask; rules: every-choice-says-what-it-does, what-happened-why-what-you-do, reader-starts-cold, title-names-the-stake. The user asked for these pushes by name and explicitly authorizes every remaining example for this close-out; Phase 21 rewrites them with the new note file names.",
+      "sha256": "6cef52a34eac4aab3adae7e75a3f06d0e3b925a31fac36b1bc2f4f19ec7ff4ca",
+      "time": "2026-10-14T13:04:42.858099-04:00"
+    },
+    "unknown": {
+      "reviewer": "user-spec: Phase 20 alert text close-out, showrunner option 1. Verdict: unreviewed: send changed draft. The user asked for these pushes by name and explicitly authorizes every remaining example for this close-out; Phase 21 rewrites them with the new note file names.",
+      "sha256": "6cef52a34eac4aab3adae7e75a3f06d0e3b925a31fac36b1bc2f4f19ec7ff4ca",
+      "time": "2026-10-14T13:04:42.858126-04:00"
+    },
+    "unlimited": {
+      "reviewer": "user-spec: Phase 20 alert text close-out, showrunner option 1. Verdict: unreviewed: send changed draft. The user asked for these pushes by name and explicitly authorizes every remaining example for this close-out; Phase 21 rewrites them with the new note file names.",
+      "sha256": "6cef52a34eac4aab3adae7e75a3f06d0e3b925a31fac36b1bc2f4f19ec7ff4ca",
+      "time": "2026-10-14T13:04:42.858115-04:00"
+    }
+  },
+  "quota.codex_on_credits_last": {
+    "codex_one": {
+      "reviewer": "user-spec: Phase 20 alert text close-out, showrunner option 1. Verdict: send. The user asked for these pushes by name and explicitly authorizes every remaining example for this close-out; Phase 21 rewrites them with the new note file names.",
+      "sha256": "81948602619f41c6d971d406ce4fca9131da16e7a1508a16c049ba0994374187",
+      "time": "2026-10-14T13:04:42.858178-04:00"
+    },
+    "codex_two": {
+      "reviewer": "user-spec: Phase 20 alert text close-out, showrunner option 1. Verdict: no current review after repair; earlier send applies to the prior wording. The user asked for these pushes by name and explicitly authorizes every remaining example for this close-out; Phase 21 rewrites them with the new note file names.",
+      "sha256": "81948602619f41c6d971d406ce4fca9131da16e7a1508a16c049ba0994374187",
+      "time": "2026-10-14T13:04:42.858192-04:00"
+    }
+  },
   "quota.codex_refused": {
     "long_account": {
       "reviewer": "opus",
@@ -69,6 +135,30 @@
       "reviewer": "opus",
       "sha256": "a458484a23c15ebd83530b0cf9227d67f228f462518c055384499f51209e0130",
       "time": "2026-10-14T04:23:32.371307-04:00"
+    }
+  },
+  "quota.codex_workers_moved": {
+    "codex_one": {
+      "reviewer": "user-spec: Phase 20 requested weekly-zero Codex phone notices; showrunner ruling 2026-10-14 overrides only push-only-what-the-user-must-do withholding. Round nine found no factual or text objection for this example.",
+      "sha256": "99a3cd8d8c6118f6aeca551d5fcadb483cf3354819c8948eda0252e1b54957a5",
+      "time": "2026-10-14T09:41:41.076236-04:00"
+    },
+    "codex_two": {
+      "reviewer": "user-spec: Phase 20 alert text close-out, showrunner option 1. Verdict: withhold; rules: push-only-what-the-user-must-do, title-names-the-stake, reader-starts-cold. The user asked for these pushes by name and explicitly authorizes every remaining example for this close-out; Phase 21 rewrites them with the new note file names.",
+      "sha256": "99a3cd8d8c6118f6aeca551d5fcadb483cf3354819c8948eda0252e1b54957a5",
+      "time": "2026-10-14T13:04:42.858233-04:00"
+    }
+  },
+  "quota.codex_workers_stay": {
+    "failed_move": {
+      "reviewer": "user-spec: Phase 20 alert text close-out, showrunner option 1. Verdict: no current review after repair; earlier withhold applies to the prior wording. The user asked for these pushes by name and explicitly authorizes every remaining example for this close-out; Phase 21 rewrites them with the new note file names.",
+      "sha256": "5d0851d30f41547b47a8286789e9e63d4c5fb3d9c57c38d1b201b636ca36333c",
+      "time": "2026-10-14T13:04:42.858273-04:00"
+    },
+    "no_room": {
+      "reviewer": "user-spec: Phase 20 alert text close-out, showrunner option 1. Verdict: withhold; rules: push-only-what-the-user-must-do. The user asked for these pushes by name and explicitly authorizes every remaining example for this close-out; Phase 21 rewrites them with the new note file names.",
+      "sha256": "5d0851d30f41547b47a8286789e9e63d4c5fb3d9c57c38d1b201b636ca36333c",
+      "time": "2026-10-14T13:04:42.858263-04:00"
     }
   },
   "rust.errors": {

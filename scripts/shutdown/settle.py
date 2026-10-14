@@ -389,10 +389,10 @@ def blocker(session: Session) -> ReadinessCheck:
         branch = head["name"] if head["kind"] == "branch" else head["commit"]
         return {"kind": "blocked", "reason": f"push {branch} first"}
     for server in session["codex_servers"]:
-        if server["busy_seats"]:
+        if server["busy_workers"]:
             return {
                 "kind": "blocked",
-                "reason": f"Codex seat {server['busy_seats'][0]} is still running",
+                "reason": f"Codex worker {server['busy_workers'][0]} is still running",
             }
     if merge_in_progress(session):
         return {"kind": "blocked", "reason": "finish the merge in progress first"}
@@ -538,7 +538,7 @@ def _settle_text(record: SessionShutdown, session: Session) -> str:
     )
     if session["kind"] == "unit":
         where = '"<phase N: the step you stopped in and what comes next>"'
-        started = "stop or end any seat or build you started, or name it in that line"
+        started = "stop or end any worker or build you started, or name it in that line"
         ending = " and end your turn with `— blocked: shutdown requested by the user`"
     elif session["kind"] == "showrunner":
         where = '"<one line>"'
@@ -601,11 +601,11 @@ def status_record_lines(record: SessionShutdown, owner: stop_work.FreshSession |
 
 
 def run_inventory(login: str, only: Iterable[str] = ()) -> Inventory:
-    """Observe the account once, including each owner's current seats."""
+    """Observe the account once, including each owner's current workers."""
     return inventory(login, frozenset(only))
 
 
-def _owned_seats(report: Inventory, session_id: str) -> list[Session]:
+def _owned_workers(report: Inventory, session_id: str) -> list[Session]:
     return [item for item in report["sessions"] if item["kind"] == "seat"
             and item["owner"]["kind"] == "director"
             and item["owner"]["session_id"] == session_id]
@@ -638,7 +638,7 @@ def begin(
             login=login, label=report["label"], machine=report["machine"], requested_at=at,
             request_id=request_id, requested_by=origin, hold="session" if ids else "account",
             then=then, force="wait for ready", alerts=alerts, session=session,
-            seats=_owned_seats(report, session["session_id"]), timers=[],
+            seats=_owned_workers(report, session["session_id"]), timers=[],
             settle_message={"kind": "not sent"}, where={"kind": "not said"},
             progress={"kind": "waiting"}, stop_issues=[],
         )
@@ -688,7 +688,7 @@ def _hold_details(owner: stop_work.FreshSession, progress: str, *, local_observa
     details: list[str] = []
     if session["status"] != "idle":
         details.append(session["status"])
-    if session["status"] != "busy" and any(server["busy_seats"] for server in session["codex_servers"]):
+    if session["status"] != "busy" and any(server["busy_workers"] for server in session["codex_servers"]):
         details.append("busy")
     if local_observation and progress != "held by usage limit" and _showing_form(session):
         details.append(SHOWING_FORM)
@@ -702,9 +702,9 @@ def _hold_details(owner: stop_work.FreshSession, progress: str, *, local_observa
     if local_observation and merge_in_progress(session):
         details.append("merge in progress")
     for server in session["codex_servers"]:
-        details.extend(f"Codex seat {name} is still running" for name in server["busy_seats"])
-    details.extend(f"Codex seat {seat['name']} is still running" for seat in owner["seats"]
-                   if seat["status"] != "idle")
+        details.extend(f"Codex worker {name} is still running" for name in server["busy_workers"])
+    details.extend(f"Codex worker {worker['name']} is still running" for worker in owner["seats"]
+                   if worker["status"] != "idle")
     return details
 
 
@@ -743,7 +743,7 @@ def next_step(saved: SessionShutdown, owner: stop_work.FreshSession,
             if saved["force"] == "now":
                 return StopSession()
             if progress in {"ready", "held by usage limit"} and owner["session"]["status"] == "idle" and all(
-                seat["status"] == "idle" for seat in owner["seats"]
+                worker["status"] == "idle" for worker in owner["seats"]
             ) and blocker(owner["session"])["kind"] == "clear" and (progress == "held by usage limit" or not _showing_form(owner["session"])):
                 return StopSession()
         if progress == "waiting" and not _is_requester(saved):

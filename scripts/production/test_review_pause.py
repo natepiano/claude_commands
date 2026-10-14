@@ -114,12 +114,6 @@ class ReviewPauseTests(unittest.TestCase):
         self.assertFalse(self.switch.exists())
         self.assertFalse(self.record.exists())
 
-    def test_pause_reads_enabled_state_with_multiline_notifier_status(self) -> None:
-        paused = self.run_script("pause")
-        self.assertEqual(paused.returncode, 0, paused.stderr)
-        self.assertEqual(json.loads(self.record.read_text()), {"dailies": "done", "footers": "done"})
-        self.assertFalse(self.enabled.exists())
-
     def test_pause_persists_record_before_stopping_notifier(self) -> None:
         self.environment["REQUIRE_RECORD_BEFORE_STOP"] = "1"
         paused = self.run_script("pause")

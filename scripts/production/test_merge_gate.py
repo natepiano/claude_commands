@@ -291,6 +291,15 @@ class MergeGateTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual((self.checkout / "docs" / "plans" / "build-followups-log.md").read_text(), "log\n")
 
+    def test_missing_type_dir_is_refused_before_any_suite_runs(self) -> None:
+        result = self.run_gate("--type-dirs", "accounts")
+        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("type dirs not found", result.stderr)
+        self.assertIn("accounts", result.stderr)
+        self.assertEqual(self.module_events(), [])
+        self.assert_not_pushed()
+        self.assertEqual(self.git(self.checkout, "rev-parse", "HEAD"), self.base)
+
     def test_merge_checkout_ahead_of_origin_is_refused(self) -> None:
         self.write(self.checkout / "local.txt", "local\n")
         local = self.commit(self.checkout, "unpublished merge work")

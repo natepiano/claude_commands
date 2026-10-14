@@ -20,7 +20,7 @@ from datetime import datetime, timezone
 from enum import Enum
 from fnmatch import fnmatchcase
 from pathlib import Path
-from typing import BinaryIO, Literal, cast
+from typing import BinaryIO, Literal, cast, override
 
 # Direct execution from any directory uses this checkout's modules.
 if __package__ in (None, ""):
@@ -34,6 +34,17 @@ from scripts.usage.rollouts import (
 
 
 MAC_HOST = "natemccoy@mac"
+
+
+class LedgerDurability(Enum):
+    """Durable production commits or disposable ledgers that need no disk sync."""
+
+    DURABLE = "full"
+    DISPOSABLE = "off"
+
+    @override
+    def __str__(self) -> str:
+        return self.value
 
 
 @dataclass(frozen=True)
@@ -1473,6 +1484,7 @@ class CommandLine(argparse.Namespace):
     account_roles: Path
     claude_repo: Path
     production_docs: Path
+    durability: LedgerDurability
 
     def __init__(self, readings: Path, baseline_readings: Path, account_roles: Path, claude_repo: Path, production_docs: Path) -> None:
         super().__init__()
@@ -1487,6 +1499,7 @@ class CommandLine(argparse.Namespace):
         self.account_roles = account_roles
         self.claude_repo = claude_repo
         self.production_docs = production_docs
+        self.durability = LedgerDurability.DURABLE
 
 
 def main(argv: Sequence[str] = ()) -> int:
@@ -1505,6 +1518,8 @@ def main(argv: Sequence[str] = ()) -> int:
     _ = parser.add_argument("--account-roles", type=Path)
     _ = parser.add_argument("--claude-repo", type=Path)
     _ = parser.add_argument("--production-docs", type=Path)
+    _ = parser.add_argument("--durability", type=LedgerDurability, choices=list(LedgerDurability),
+                            help="full (default) syncs commits; off is for disposable ledgers")
     defaults = outcomes.default_paths()
     args = parser.parse_args(argv, namespace=CommandLine(defaults.readings, defaults.baseline_readings, defaults.account_roles,
                                                        defaults.claude_repo, defaults.production_docs))
@@ -1536,6 +1551,7 @@ def collect_pass(args: CommandLine) -> int:
     try:
         db.row_factory = sqlite3.Row
         _ = check_store_key_version(db)
+        _ = db.execute(f"PRAGMA synchronous={args.durability.value.upper()}")
         _ = db.execute("PRAGMA journal_mode=WAL")
         _ = db.executescript(SCHEMA)
         migrate_store(db)

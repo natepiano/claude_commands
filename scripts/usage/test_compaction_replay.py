@@ -28,7 +28,7 @@ class CompactionReplayTests(CollectorFixture):
         at = f"2026-10-{day:02d}T22:{minute:02d}:00+00:00"
         with closing(sqlite3.connect(self.db_path)) as db, db:
             _ = db.execute("INSERT INTO turns VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                           ("natedev", "codex", "seat", "", thread, key, at, model, "medium",
+                           ("natedev", "codex", "worker", "", thread, key, at, model, "medium",
                             size - cached, 0, 0, cached, output, 1, "impl", None,
                             "recorded", "not_applicable"))
 
@@ -129,16 +129,16 @@ class CompactionReplayTests(CollectorFixture):
                 if (cells := [cell.strip() for cell in line.strip("|").split("|")])}
 
     def assert_rule(self, rows: dict[str, list[str]], rule: str, compactions: int,
-                    seats: int, tokens: float, over: int) -> None:
+                    workers: int, tokens: float, over: int) -> None:
         self.assertIn(rule, rows)
         cells = rows[rule]
         self.assertEqual(len(cells), 5)
         self.assertEqual(int(cells[0].replace(",", "")), compactions)
-        self.assertEqual(int(cells[1].replace(",", "")), seats)
+        self.assertEqual(int(cells[1].replace(",", "")), workers)
         self.assertAlmostEqual(float(cells[2].replace(",", "")), tokens, delta=0.5)
         self.assertEqual(int(cells[4].replace(",", "")), over)
 
-    def test_rules_match_hand_arithmetic_and_count_cache_floor_and_new_seats(self) -> None:
+    def test_rules_match_hand_arithmetic_and_count_cache_floor_and_new_workers(self) -> None:
         self.hand_thread()
         output = self.replay().stdout
         rows = self.table(output)
@@ -161,9 +161,9 @@ class CompactionReplayTests(CollectorFixture):
         self.assert_rule(rows, "limit 100,000", 2, 0, baseline, 2)
         self.assert_rule(rows, "limit 200,000", 1, 0, higher, 2)
         self.assert_rule(rows, "never", 0, 0, never, 3)
-        self.assert_rule(rows, "new seat when kept is over 90,000 (estimate)", 0, 2, estimate, 0)
+        self.assert_rule(rows, "new worker when kept is over 90,000 (estimate)", 0, 2, estimate, 0)
         self.assertEqual(list(rows), ["limit 100,000", "limit 150,000", "limit 200,000",
-                                     "limit 250,000", "never", "new seat when kept is over 90,000 (estimate)"])
+                                     "limit 250,000", "never", "new worker when kept is over 90,000 (estimate)"])
         self.assertAlmostEqual(float(rows["limit 200,000"][3].rstrip("%").replace(",", "")),
                                (higher / baseline - 1) * 100, delta=0.05)
         self.assertAlmostEqual(float(rows["never"][3].rstrip("%").replace(",", "")),

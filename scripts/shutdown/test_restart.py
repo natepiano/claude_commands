@@ -181,13 +181,13 @@ def unit(
     )
 
 
-def seat(
+def worker_session(
     session_id: str,
     *,
     owner: str | None,
     run_dirs: list[str] | None = None,
 ) -> inventory.SeatSession:
-    seat_owner: inventory.SeatOwner = (
+    worker_owner: inventory.WorkerOwner = (
         inventory.DirectorOwner(kind="director", session_id=owner)
         if owner is not None
         else inventory.NoDirector(kind="no director")
@@ -196,7 +196,7 @@ def seat(
         **common_session(session_id, run_dirs=run_dirs),
         kind="seat",
         host=inventory.UnknownHost(kind="unknown"),
-        owner=seat_owner,
+        owner=worker_owner,
     )
 
 
@@ -1379,6 +1379,18 @@ class RestartTests(ShutdownTestCase):
         argv = next((shlex.split(line) for line in output.getvalue().splitlines() if 'add_unit.py' in line))
         self.assertIn('--standby', argv)
         self.assertNotIn('--plan', argv)
+
+    def test_permanent_unit_without_a_run_record_resumes_as_permanent(self) -> None:
+        doc = self.root / 'production.md'
+        _ = doc.write_text('\n'.join(['# Demo', '', '## Units', '', '| Unit | Plan | Worktree | Branch | Port | Owns |', '| --- | --- | --- | --- | --- | --- |', '| nightly-review-unit | permanent | /w/nightly | demo-nightly-review | — | — |', '']), encoding='utf-8')
+        moved = entry(unit('nightly-review', doc=str(doc), plan=inventory.NoRunRecord(kind='no run record')))
+        self.create(records_for_test([moved]))
+        output = io.StringIO()
+        with patch.object(restart, '_live_session_ids', return_value=frozenset()), patch.object(settle, 'record_time', return_value=RESTARTED), redirect_stdout(output):
+            self.assertEqual(restart.up(LOGIN, dry_run=True), 0)
+        argv = next((shlex.split(line) for line in output.getvalue().splitlines() if 'add_unit.py' in line))
+        self.assertIn('--permanent', argv)
+        self.assertNotIn('--standby', argv)
 
     def test_brief_unit_without_a_run_record_resumes_with_its_stub_plan(self) -> None:
         doc = self.root / 'production.md'
@@ -2850,7 +2862,7 @@ class RestartTests(ShutdownTestCase):
         output = io.StringIO()
         with patch.object(restart, "_print_result") as summary, redirect_stdout(output):
             result = restart._up(LOGIN, False, ["waiting"])  # pyright: ignore[reportPrivateUsage]
-        self.assertEqual((result.restarted, result.seats, result.manual, result.failed), (0, 0, 0, 0))
+        self.assertEqual((result.restarted, result.workers, result.manual, result.failed), (0, 0, 0, 0))
         self.assertEqual(result.failed_sessions, ())
         self.assertEqual(output.getvalue(), "Waiting is waiting, not stopped; nothing to restart\n")
         summary.assert_not_called()
@@ -2873,7 +2885,7 @@ class RestartTests(ShutdownTestCase):
         output = io.StringIO()
         with patch.object(restart, "_print_result") as summary, patch.object(restart, "_launch_session") as launch, redirect_stdout(output):
             result = restart._up(LOGIN, False, ["held"])  # pyright: ignore[reportPrivateUsage]
-        self.assertEqual((result.restarted, result.seats, result.manual, result.failed), (0, 0, 0, 0))
+        self.assertEqual((result.restarted, result.workers, result.manual, result.failed), (0, 0, 0, 0))
         self.assertEqual(result.failed_sessions, ())
         self.assertEqual(output.getvalue(), "Held is held by usage limit, not stopped; nothing to restart\n")
         summary.assert_not_called()
