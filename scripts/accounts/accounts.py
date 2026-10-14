@@ -996,21 +996,31 @@ def _check_default_codex_home(seats_home: Path) -> list[str]:
     ]
 
 
-def _drop_named_account(environment: dict[str, str]) -> None:
-    for name in account.NAMED_ACCOUNT_VARIABLES:
-        _ = environment.pop(name, None)
+@dataclass(frozen=True)
+class PreparedAccount:
+    """Account launch variables to apply to a caller's own environment."""
+    variables: dict[str, str]
+    remove: frozenset[str]
 
 
-def exec_account(label: str, arguments: list[str]) -> None:
-    """Replace this process with Claude on the selected, safe directory."""
-    if label == "unit":
-        selected = role_account("unit")
-    elif label == "default":
-        selected = DefaultAccount()
-    else:
-        selected = NamedAccount(label, account_dir(label))
-    environment = dict(os.environ)
-    _ = environment.pop("CLAUDE_CODE_OAUTH_TOKEN", None)
+@dataclass(frozen=True)
+class AccountRefused:
+    """The selected account cannot safely prepare this launch."""
+    reason: str
+
+
+def prepared_account(label: str, *, resume: bool) -> PreparedAccount | AccountRefused:
+    """Prepare an account for any launcher without inheriting its environment."""
+    try:
+        if label == "unit":
+            selected = role_account("unit")
+        elif label == "default":
+            selected = DefaultAccount()
+        else:
+            selected = NamedAccount(label, account_dir(label))
+    except AccountsError as error:
+        return AccountRefused(str(error))
+    remove = frozenset({"CLAUDE_CODE_OAUTH_TOKEN"})
     if isinstance(selected, NamedAccount):
         default = _directory_identity(main_config_dir()) if label != "unit" else ClaudeDirectoryLoggedOut()
         expected = _account_note(selected.label)
@@ -1018,22 +1028,31 @@ def exec_account(label: str, arguments: list[str]) -> None:
         if not default_login:
             readiness = _inspect_account_directory(selected, expected)
             if isinstance(readiness, AccountDirectoryNotSetUp):
-                raise AccountsError(
+                return AccountRefused(
                     f'accounts: ~/.claude{selected.label.removeprefix("claude ")} is not set up; /showrunner:accounts setup "{selected.label}" first'
                 )
             if not isinstance(readiness, (AccountDirectoryReady, AccountDirectoryLoggedOut)) or (
-                "--resume" in arguments and isinstance(readiness, AccountDirectoryLoggedOut)
+                resume and isinstance(readiness, AccountDirectoryLoggedOut)
             ):
-                raise AccountsError(readiness.problems[0])
-            environment.update(account.named_account_environment(selected.dir))
-        else:
-            _drop_named_account(environment)
+                return AccountRefused(readiness.problems[0])
+            return PreparedAccount(account.named_account_environment(selected.dir), remove)
     else:
-        if "--resume" in arguments:
+        if resume:
             problems = check("default")
             if problems:
-                raise AccountsError(problems[0])
-        _drop_named_account(environment)
+                return AccountRefused(problems[0])
+    return PreparedAccount({}, remove | frozenset(account.NAMED_ACCOUNT_VARIABLES))
+
+
+def exec_account(label: str, arguments: list[str]) -> None:
+    """Replace this process with Claude on the selected, safe directory."""
+    prepared = prepared_account(label, resume="--resume" in arguments)
+    if isinstance(prepared, AccountRefused):
+        raise AccountsError(prepared.reason)
+    environment = dict(os.environ)
+    for name in prepared.remove:
+        _ = environment.pop(name, None)
+    environment.update(prepared.variables)
     try:
         os.execvpe("claude", ["claude", *arguments], environment)
     except OSError as error:
