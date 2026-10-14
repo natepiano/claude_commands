@@ -544,6 +544,7 @@ class RestartTests(ShutdownTestCase):
         _ = (config / ".claude.json").write_text(json.dumps({
             "projects": {str(cwd): {"hasTrustDialogAccepted": True}},
         }), encoding="utf-8")
+        self.assertIsInstance(herdr.claude_trust(cwd, config / ".claude.json"), herdr.Trusted)
         owner = top_level("resume-id", name="kept name", cwd=str(cwd),
             model=inventory.ModelName(kind="model", name="opus"),
             host=inventory.HerdrHost(kind="herdr", herdr_session="writing", pane_id="w1:p1"))
@@ -704,9 +705,51 @@ class RestartTests(ShutdownTestCase):
 
     def test_herdr_restart_refuses_an_untrusted_folder_before_server_start(self) -> None:
         owner, _, log = self.herdr_restart_fixture()
-        _ = (Path(owner.get("config_dir", "")) / ".claude.json").write_text('{"projects": {}}')
-        with self.assertRaisesRegex(OSError, "has not trusted this folder"):
+        config_dir = Path(owner.get("config_dir", ""))
+        _ = (config_dir / ".claude.json").write_text('{"projects": {}}')
+        self.assertIsInstance(herdr.claude_trust(Path(owner["cwd"]), config_dir / ".claude.json"), herdr.Untrusted)
+        with self.assertRaisesRegex(OSError, "has not trusted this folder") as refused:
             _ = restart._launch_session(entry(owner), "restart", self.desktop_state, dry_run=False)  # pyright: ignore[reportPrivateUsage]
+        command = f"cd {shlex.quote(owner['cwd'])} && {named_prefix(str(config_dir))}claude"
+        self.assertIn(f"Run: {command}", str(refused.exception))
+        self.assertFalse(log.exists())
+
+    def test_herdr_restart_refuses_an_unreadable_trust_file_with_its_account_command(self) -> None:
+        owner, _, log = self.herdr_restart_fixture()
+        config_dir = Path(owner.get("config_dir", ""))
+        _ = (config_dir / ".claude.json").write_text('{"private": "do not disclose"')
+        self.assertIsInstance(herdr.claude_trust(Path(owner["cwd"]), config_dir / ".claude.json"), herdr.UnreadableTrustFile)
+        with self.assertRaisesRegex(OSError, "cannot read .* to check Claude trust") as refused:
+            _ = restart._launch_session(entry(owner), "restart", self.desktop_state, dry_run=False)  # pyright: ignore[reportPrivateUsage]
+        command = f"cd {shlex.quote(owner['cwd'])} && {named_prefix(str(config_dir))}claude"
+        self.assertIn(f"Run: {command}", str(refused.exception))
+        self.assertNotIn("do not disclose", str(refused.exception))
+        self.assertFalse(log.exists())
+
+    def test_herdr_restart_default_account_trust_refusals_clear_named_account_variables(self) -> None:
+        owner, _, log = self.herdr_restart_fixture()
+        owner["config_dir"] = str(self.root / ".claude")
+        for content, trust_type in (("{\"projects\": {}}", herdr.Untrusted), ("{", herdr.UnreadableTrustFile)):
+            with self.subTest(trust_type=trust_type):
+                _ = (self.root / ".claude.json").write_text(content)
+                self.assertIsInstance(herdr.claude_trust(Path(owner["cwd"]), self.root / ".claude.json"), trust_type)
+                with self.assertRaises(OSError) as refused:
+                    _ = restart._launch_session(entry(owner), "restart", self.desktop_state, dry_run=False)  # pyright: ignore[reportPrivateUsage]
+                command = (f"cd {shlex.quote(owner['cwd'])} && env -u CLAUDE_CONFIG_DIR "
+                           "-u CLAUDE_CODE_REMOTE_MEMORY_DIR claude")
+                self.assertIn(f"Run: {command}", str(refused.exception))
+                self.assertFalse(log.exists())
+
+    def test_herdr_restart_does_not_accept_trust_from_an_ancestor_folder(self) -> None:
+        owner, _, log = self.herdr_restart_fixture()
+        config_dir = Path(owner.get("config_dir", ""))
+        _ = (config_dir / ".claude.json").write_text(json.dumps({
+            "projects": {str(self.root): {"hasTrustDialogAccepted": True}},
+        }))
+        with self.assertRaisesRegex(OSError, "has not trusted this folder") as refused:
+            _ = restart._launch_session(entry(owner), "restart", self.desktop_state, dry_run=False)  # pyright: ignore[reportPrivateUsage]
+        command = f"cd {shlex.quote(owner['cwd'])} && {named_prefix(str(config_dir))}claude"
+        self.assertIn(f"Run: {command}", str(refused.exception))
         self.assertFalse(log.exists())
 
     def test_herdr_unit_with_a_plan_requires_manual_resume_without_add_unit_or_tmux(self) -> None:
@@ -1585,23 +1628,22 @@ class RestartTests(ShutdownTestCase):
             result = restart.up(LOGIN)
         return result, launches
 
-    def test_six_tmux_launches_finish_in_under_one_second(self) -> None:
+    def test_six_tmux_launches_run_at_once(self) -> None:
         saved = [entry(top_level(str(index), host=tmux_host(str(index)))) for index in range(6)]
         self.create(saved)
         threads: set[int] = set()
         lock = threading.Lock()
+        launches_in_flight = threading.Barrier(6, timeout=10)
 
         def launch(_record: SessionShutdown, _note: str, _state: restart.DesktopLaunchState, *, dry_run: bool) -> restart.SessionLaunched:
             self.assertFalse(dry_run)
             with lock:
                 threads.add(threading.get_ident())
-            time.sleep(0.2)
+            _ = launches_in_flight.wait()
             return restart.SessionLaunched()
 
         with patch.object(restart, "_retire"), patch.object(restart, "_live_session_ids", return_value=frozenset()), patch.object(restart, "_launch_session", launch), patch.object(restart, "wait_for_confirmation", side_effect=self.all_sessions_live), redirect_stdout(io.StringIO()):
-            start = time.monotonic()
             self.assertEqual(restart.up(LOGIN), 0)
-            self.assertLess(time.monotonic() - start, 1.0)
         self.assertEqual(restart.RESTART_LAUNCH_WORKERS, 6)
         self.assertEqual(len(threads), 6)
         self.assertNotIn(threading.get_ident(), threads)

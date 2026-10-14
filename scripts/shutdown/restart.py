@@ -968,12 +968,20 @@ def _herdr_launch(parts: ResumeParts, session: Session, *, dry_run: bool) -> Non
         return
     _record_scheduled_restart_prompt(session["session_id"], parts.opening_prompt, dry_run=False)
     try:
+        from scripts.accounts.accounts import ClaudeLaunchAccount, DefaultAccount, NamedAccount
+
         config_dir = Path(environment["CLAUDE_CONFIG_DIR"])
         claude_json = (Path.home() / ".claude.json" if config_dir == Path.home() / ".claude"
                        else config_dir / ".claude.json")
-        trust = herdr.trusted_by_claude(Path(parts.cwd), claude_json)
-        if not trust.accepted:
-            raise OSError(f"{trust.project_key}: Claude has not trusted this folder")
+        trust = herdr.claude_trust(Path(parts.cwd), claude_json)
+        if isinstance(trust, (herdr.Untrusted, herdr.UnreadableTrustFile)):
+            account: ClaudeLaunchAccount = (
+                DefaultAccount() if config_dir == Path.home() / ".claude"
+                else NamedAccount(str(config_dir), config_dir)
+            )
+            reason = (str(trust) if isinstance(trust, herdr.UnreadableTrustFile)
+                      else f"{parts.cwd}: Claude has not trusted this folder")
+            raise OSError(f"{reason}. Run: {herdr.trust_command(Path(parts.cwd), account)}")
         herdr.start_server(name, 90_000)
         client = herdr.Herdr(name)
         agents = client.agents()
@@ -981,7 +989,7 @@ def _herdr_launch(parts: ResumeParts, session: Session, *, dry_run: bool) -> Non
                and row["agent_status"] not in {"exited", "stopped", "dead"} for row in agents):
             raise OSError(f"herdr {name}:{pane}: pane still holds a live agent")
         pane = herdr.open_pane(name, name, parts.cwd, environment)
-        client.start_agent(session["name"], pane, kind="claude", argv=list(parts.claude_arguments),
+        client.start_agent(session["name"], pane, kind="claude", agent_arguments=list(parts.claude_arguments),
                            opening_prompt=parts.opening_prompt, timeout_ms=90_000)
     except herdr.HerdrFailure as error:
         raise OSError(str(error)) from error
