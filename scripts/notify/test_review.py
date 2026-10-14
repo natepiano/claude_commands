@@ -6,6 +6,7 @@ import hashlib
 import io
 import json
 import os
+import shutil
 import subprocess
 import tempfile
 import time
@@ -84,7 +85,7 @@ class FakeReviewer:
         if argv[0] == "bash":
             return subprocess.CompletedProcess(argv, 0 if self.assignment_ok else 1,
                                                "task=message_review.reviewer agent=sonnet effort=high", "")
-        if argv[0] != "claude":
+        if Path(argv[0]).name != "claude":
             raise AssertionError(f"unexpected process: {argv}")
         if self.failure == "timeout":
             raise subprocess.TimeoutExpired(argv, timeout)
@@ -133,6 +134,63 @@ class LocalReviewTests(unittest.TestCase):
         config = self.root / "notify.conf"
         _ = config.write_text("REVIEW_TIMEOUT_SECONDS=60\n")
         _ = self.enterContext(mock.patch.object(review, "NOTIFY_CONFIG", config))
+        binary = self.root / "bin/claude"
+        binary.parent.mkdir()
+        _ = binary.write_text("fake reviewer\n")
+        binary.chmod(0o700)
+        _ = self.enterContext(mock.patch.object(shutil, "which", return_value=str(binary)))
+
+    def test_reviewer_without_claude_on_path_uses_an_executable_fallback_and_logs_it(self) -> None:
+        binary = self.root / ".local/bin/claude"
+        binary.parent.mkdir(parents=True)
+        _ = binary.write_text("fake reviewer\n")
+        binary.chmod(0o700)
+        runner = FakeReviewer(verdict(self.draft))
+        with (mock.patch.object(shutil, "which", return_value=None) as which,
+              mock.patch.object(Path, "home", return_value=self.root)):
+            outcome = review.review(self.draft, False, runner=runner)
+        which.assert_called_once_with("claude")
+        self.assertIsInstance(outcome, review.Approved)
+        command = next(call.argv for call in runner.calls if Path(call.argv[0]).name == "claude")
+        self.assertEqual(command[0], str(binary))
+        review.log_review(self.draft, outcome)
+        self.assertEqual(self.entries()[0]["binary"], str(binary))
+
+    def test_missing_reviewer_reports_paths_tried_without_starting_a_process(self) -> None:
+        binary = self.root / ".local/bin/claude"
+        binary.parent.mkdir(parents=True)
+        _ = binary.write_text("not executable\n")
+        binary.chmod(0o600)
+        runner = FakeReviewer(verdict(self.draft))
+        with (mock.patch.object(shutil, "which", return_value=None) as which,
+              mock.patch.object(Path, "home", return_value=self.root),
+              mock.patch.dict(os.environ, {"USER": "review-test"}),
+              mock.patch.object(os, "access", return_value=False)):
+            outcome = review.review(self.draft, False, runner=runner)
+        which.assert_called_once_with("claude")
+        self.assertIsInstance(outcome, review.Unreviewed)
+        assert isinstance(outcome, review.Unreviewed)
+        self.assertEqual(outcome.why, "no claude binary: PATH: claude, " + str(binary)
+                         + ", /etc/profiles/per-user/review-test/bin/claude, /run/current-system/sw/bin/claude")
+        self.assertEqual(runner.calls, [])
+        review.log_review(self.draft, outcome)
+        self.assertEqual(self.entries()[0]["verdict"], "unreviewed: " + outcome.why)
+
+    def test_reviewer_uses_the_first_executable_fallback_in_order(self) -> None:
+        candidates = (self.root / ".local/bin/claude",
+                      Path("/etc/profiles/per-user/review-test/bin/claude"),
+                      Path("/run/current-system/sw/bin/claude"))
+        for index, expected in enumerate(candidates):
+            def executable(path: Path, _mode: int) -> bool:
+                return path in candidates[index:]
+            with (self.subTest(expected=expected),
+                  mock.patch.object(shutil, "which", return_value=None),
+                  mock.patch.object(Path, "home", return_value=self.root),
+                  mock.patch.dict(os.environ, {"USER": "review-test"}),
+                  mock.patch.object(Path, "is_file", return_value=True),
+                  mock.patch.object(os, "access", side_effect=executable) as access):
+                self.assertEqual(review.reviewer_binary(), review.ResolvedReviewerBinary(expected))
+                self.assertEqual([call.args[0] for call in access.call_args_list], list(candidates[:index + 1]))
 
     def test_review_config_accepts_positive_finite_seconds_and_logs_fallbacks(self) -> None:
         for contents, expected in (("# local limit\nREVIEW_TIMEOUT_SECONDS=90 # seconds\n", 90),
@@ -642,15 +700,18 @@ class LocalReviewTests(unittest.TestCase):
             self.assertIsInstance(result, review.Unreviewed)
             assert isinstance(result, review.Unreviewed)
             self.assertEqual(result.why, "no guide")
-            self.assertFalse(any(call.argv[0] == "claude" for call in runner.calls))
+            self.assertFalse(any(Path(call.argv[0]).name == "claude" for call in runner.calls))
 
     def test_cli_loads_push_rules_once_and_disables_tools_and_settings(self) -> None:
         runner = FakeReviewer(verdict(self.draft))
-        _ = review.review(self.draft, False, runner=runner)
+        with mock.patch.object(shutil, "which", return_value=str(self.root / "bin/claude")) as which:
+            _ = review.review(self.draft, False, runner=runner)
+        which.assert_called_once_with("claude")
         guide_calls = [call for call in runner.calls if call.argv[0] == "zsh"]
         self.assertEqual(len(guide_calls), 1)
         self.assertEqual(guide_calls[0].argv[-2:], ["--tags", "push,all"])
-        command = next(call.argv for call in runner.calls if call.argv[0] == "claude")
+        command = next(call.argv for call in runner.calls if Path(call.argv[0]).name == "claude")
+        self.assertEqual(command[0], str(self.root / "bin/claude"))
         for flag, value in (("--model", "sonnet"), ("--effort", "high"), ("--output-format", "json"),
                             ("--tools", ""), ("--setting-sources", "")):
             self.assertEqual(command[command.index(flag) + 1], value)
@@ -669,7 +730,7 @@ class LocalReviewTests(unittest.TestCase):
     def test_unresolved_registry_uses_opus_medium(self) -> None:
         runner = FakeReviewer(verdict(self.draft), assignment_ok=False)
         _ = review.review(self.draft, False, runner=runner)
-        command = next(call.argv for call in runner.calls if call.argv[0] == "claude")
+        command = next(call.argv for call in runner.calls if Path(call.argv[0]).name == "claude")
         self.assertEqual(command[command.index("--model") + 1], "opus")
         self.assertEqual(command[command.index("--effort") + 1], "medium")
 

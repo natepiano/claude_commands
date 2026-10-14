@@ -122,7 +122,7 @@ def account_for_launch(child: Production, resume: str | None, target: str = "", 
 
 
 def recorded_account_directory(child: Production) -> Path:
-    found = subprocess.run([unit_lookup.tmux_binary(), "show-options", "-v", "-t", f"={child.slug}", "@claude_config_dir"],
+    found = subprocess.run([unit_lookup.tmux_binary(), "show-options", "-v", "-t", f"={child.slug}:", "@claude_config_dir"],
                            capture_output=True, text=True, check=False)
     if found.returncode != 0 or not found.stdout.strip():
         raise Refusal("no account recorded for this showrunner; resume with --account <claude N|default>")
@@ -145,7 +145,7 @@ def launch(child: Production, tmux: str, model: str, effort: str, resume: str | 
                         "-c", str(cwd), "zsh", "-ic", command],
                        env=launch_environment(), text=True, capture_output=True, check=True)
     for option, value in (("@claude_config_dir", str(account_directory(selected))), ("@claude_model", model)):
-        _ = subprocess.run([tmux, "set-option", "-t", f"={child.slug}", option, value],
+        _ = subprocess.run([tmux, "set-option", "-t", f"={child.slug}:", option, value],
                            env=launch_environment(), text=True, capture_output=True, check=True)
 
 

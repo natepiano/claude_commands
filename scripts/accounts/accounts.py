@@ -2122,10 +2122,14 @@ def move_showrunners(source: str, target: str, *, dry_run: bool = False, why: st
         if destination.login.casefold() == current.login.casefold():
             return MoveRefused(f"{source} is already on {destination.label}")
         owners = [item for item in inventory.inventory(current.login, refresh_desktops=False)["sessions"] if item["kind"] == "showrunner"]
+        unregistered = tuple(
+            f"{runner['slug']}: no session runs under the id its update timer names; a showrunner running "
+            + f"under another id is not moved until it runs `update_registration.py register --production {runner['doc']}`"
+            for runner in inventory.unregistered_showrunners())
         if not owners:
-            return MoveRefused(f"no showrunner on {source} on this machine")
+            return MoveRefused("\n".join((f"no showrunner on {source} on this machine", *unregistered)))
         open_ids = {saved["session"]["session_id"] for saved in record.all_session_records()}
-        skipped = tuple(f"{owner['name']} already has a shutdown in progress" for owner in owners if owner["session_id"] in open_ids)
+        skipped = (*unregistered, *(f"{owner['name']} already has a shutdown in progress" for owner in owners if owner["session_id"] in open_ids))
         selected = [owner for owner in owners if owner["session_id"] not in open_ids]
         ids = tuple(owner["session_id"] for owner in selected)
         if not ids:

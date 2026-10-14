@@ -1127,7 +1127,7 @@ class SendTests(ShutdownTestCase):
         with mock.patch.object(send, "run", return_value=(2, "", keys_missing)), redirect_stdout(output):
             code = send.main(arguments)
         self.assertEqual(code, 3)
-        self.assertEqual(output.getvalue(), f"FAILED: the user was not reached: {keys_missing} fallback text:\nnews — No action needed.\n")
+        self.assertEqual(output.getvalue(), f"FAILED: the user was not reached: {keys_missing} {send.UNREVIEWED_FALLBACK}\n")
         self.assertEqual(send.pending("user"), "")
         self.assertEqual(self.log()[0]["outcome"], "failed")
 
@@ -1193,20 +1193,23 @@ class SendTests(ShutdownTestCase):
         stdout = "pushover: reviewed JSON: " + json.dumps(reviewed) + "\n"
         expected_message = "Action: Choose retry.\nUse natedev.\nThe build stopped.\nChoose retry or stop."
         for code in (1, 2, None):
-            with self.subTest(code=code), mock.patch.object(send, "run", return_value=(code, stdout, "post unavailable")):
+            with self.subTest(code=code), mock.patch.object(send, "run", return_value=(code, stdout, "post unavailable")), mock.patch.object(time, "time", return_value=1234567890.0):
                 result = send.send(local_options(self.user_arguments()))
             self.assertEqual(result.outcome, "failed")
             self.assertTrue(result.detail.endswith("fallback text:\nRetry needs your choice — Action: Choose retry. Use natedev."))
             self.assertEqual(send.as_dict(send.loads(self.failure_marker().read_text()))["fallback"],
                              "Retry needs your choice — Action: Choose retry. Use natedev.")
             marker = send.as_dict(send.loads(self.failure_marker().read_text()))
+            self.assertIs(marker["reviewed"], True)
+            self.assertEqual(marker["need"], "note")
             self.assertEqual((marker["title"], marker["action"], marker["body"], marker["message"]),
                              (reviewed["title"], reviewed["action"], reviewed["body"], expected_message))
-            self.assertLess(abs(time.time() - cast(float, marker["time"])), 2)
+            self.assertEqual(marker["time"], 1234567890.0)
             self.failure_marker().unlink()
         with mock.patch.object(send, "run", return_value=(None, "", "")):
             result = send.send(local_options(self.user_arguments()))
-        self.assertTrue(result.detail.endswith("fallback text:\nBuild stopped — Action: Choose in natedev terminal."))
+        self.assertTrue(result.detail.endswith(send.UNREVIEWED_FALLBACK))
+        self.assertIs(send.as_dict(send.loads(self.failure_marker().read_text()))["reviewed"], False)
 
     def test_refusals_and_non_session_failures_write_no_marker(self) -> None:
         self.writer_session()
@@ -1217,6 +1220,74 @@ class SendTests(ShutdownTestCase):
             self.assertEqual(send.send(local_options(self.user_arguments())).outcome, "failed")
         self.assertFalse(self.failure_marker().exists())
 
+    def test_unreviewed_failures_offer_fallback_only_for_blocked_locally_and_remotely(self) -> None:
+        self.writer_session()
+        for remote in (False, True):
+            for need in ("note", "decision", "blocked"):
+                for code in (1, None):
+                    extra = ["--need", need, *(["--machine", "natedev"] if remote else ["--here"])]
+                    with (self.subTest(remote=remote, need=need, code=code),
+                          mock.patch.object(send, "run", return_value=(code, "", "delivery unavailable")),
+                          redirect_stdout(io.StringIO()) as output, redirect_stderr(io.StringIO()) as errors):
+                        self.assertEqual(send.main(self.user_arguments(*extra)), 3)
+                    marker = send.as_dict(send.loads(self.failure_marker().read_text()))
+                    self.assertIs(marker["reviewed"], False)
+                    self.assertEqual(marker["need"], need)
+                    self.assertEqual("fallback text:" in output.getvalue(), need == "blocked")
+                    self.assertEqual(send.UNREVIEWED_FALLBACK in output.getvalue(), need != "blocked")
+                    transport = send.as_dict(send.loads(errors.getvalue().split("send.py: failed push JSON: ")[1]))
+                    self.assertIs(transport["reviewed"], False)
+                    self.assertEqual(transport["need"], need)
+
+    def test_remote_failure_preserves_review_status_instead_of_assuming_json_means_reviewed(self) -> None:
+        self.writer_session()
+        for reviewed in (False, True):
+            record: send.FailedPushTransportRecord = {"title": "Reviewed choice", "action": "Choose retry.",
+                "body": "The build stopped.", "reviewed": reviewed, "need": "decision"}
+            with (self.subTest(reviewed=reviewed),
+                  mock.patch.object(send, "run", return_value=(3, "FAILED: post failed\n",
+                    "send.py: failed push JSON: " + json.dumps(record))),
+                  redirect_stdout(io.StringIO()) as output, redirect_stderr(io.StringIO()) as errors):
+                self.assertEqual(send.main(self.user_arguments("--machine", "natedev", "--need", "decision")), 3)
+            marker = send.as_dict(send.loads(self.failure_marker().read_text()))
+            self.assertIs(marker["reviewed"], reviewed)
+            self.assertEqual(marker["need"], "decision")
+            self.assertEqual("fallback text:" in output.getvalue(), reviewed)
+            transport = send.as_dict(send.loads(errors.getvalue().split("send.py: failed push JSON: ")[1]))
+            self.assertIs(transport["reviewed"], reviewed)
+
+    def test_remote_reviewed_failure_retains_metadata_when_stdout_header_is_lost(self) -> None:
+        self.writer_session()
+        for need in ("note", "decision", "blocked"):
+            record: send.FailedPushTransportRecord = {"title": "Reviewed choice", "action": "Choose retry.",
+                "body": "The reviewed build stopped.", "reviewed": True, "need": need,
+                "held_source": "writer source", "held_identity": "original-hold-hash"}
+            with (self.subTest(need=need), mock.patch.object(send, "run", return_value=(255, "",
+                  "send.py: failed push JSON: " + json.dumps(record))),
+                  redirect_stdout(io.StringIO()) as output, redirect_stderr(io.StringIO()) as errors):
+                self.assertEqual(send.main(self.user_arguments("--machine", "natedev", "--need", "decision")), 3)
+            marker = send.as_dict(send.loads(self.failure_marker().read_text()))
+            self.assertIs(marker["reviewed"], True)
+            self.assertEqual(marker["need"], need)
+            self.assertEqual((marker["title"], marker["action"], marker["body"]),
+                             (record["title"], record["action"], record["body"]))
+            self.assertEqual((marker["held_source"], marker["held_identity"], marker["held_machine"]),
+                             ("writer source", "original-hold-hash", "natedev"))
+            self.assertIn("fallback text:\nReviewed choice — Action: Choose retry.", output.getvalue())
+            self.assertNotIn(send.UNREVIEWED_FALLBACK, output.getvalue())
+            transport = send.as_dict(send.loads(errors.getvalue().split("send.py: failed push JSON: ")[1]))
+            self.assertIs(transport["reviewed"], True)
+            self.assertEqual(transport["need"], need)
+
+    def test_invalid_review_record_does_not_authorize_original_text_as_reviewed(self) -> None:
+        self.writer_session()
+        for record in ("invalid JSON", '{"title":3,"body":"text"}'):
+            with (self.subTest(record=record), mock.patch.object(send, "run", return_value=(1,
+                  "pushover: reviewed JSON: " + record, "post failed"))):
+                result = send.send(local_options(self.user_arguments()))
+            self.assertTrue(result.detail.endswith(send.UNREVIEWED_FALLBACK))
+            self.assertIs(send.as_dict(send.loads(self.failure_marker().read_text()))["reviewed"], False)
+
     def test_remote_outcomes_keep_payload_and_forward_answerability(self) -> None:
         self.writer_session()
         for header, payload, code in (
@@ -1226,7 +1297,10 @@ class SendTests(ShutdownTestCase):
         ):
             with self.subTest(header=header), mock.patch.object(send, "run", return_value=(code, "remote banner\n" + header + "\n" + payload + "\n", "")) as run:
                 result = send.send(send.parse(self.user_arguments("--machine", "natedev")))
-            self.assertEqual(result.detail, "on natedev: " + header.partition(": ")[2] + "\n" + payload)
+            if code == 3:
+                self.assertEqual(result.detail, "on natedev: post failed " + send.UNREVIEWED_FALLBACK)
+            else:
+                self.assertEqual(result.detail, "on natedev: " + header.partition(": ")[2] + "\n" + payload)
             self.assertIn("--answerable", cast(list[str], run.call_args.args[0])[-1])
             self.assertTrue(cast(list[str], run.call_args.args[0])[-1].startswith("CLAUDE_PID= "))
             if code == 3:
@@ -1234,12 +1308,12 @@ class SendTests(ShutdownTestCase):
                 self.assertEqual(marker["fallback"], payload)
         with mock.patch.object(send, "run", return_value=(255, "", "ssh unavailable")):
             result = send.send(send.parse(self.user_arguments("--machine", "natedev")))
-        self.assertIn("fallback text:\nBuild stopped", result.detail)
+        self.assertIn(send.UNREVIEWED_FALLBACK, result.detail)
         self.assertTrue(self.failure_marker().exists())
 
     def test_remote_failure_retains_multiline_action_metadata(self) -> None:
         self.writer_session()
-        record: send.ReviewedPushRecord = {"title": "Build choice", "action": "Choose retry.\nUse natedev.",
+        record: send.FailedPushTransportRecord = {"reviewed": True, "need": "note", "title": "Build choice", "action": "Choose retry.\nUse natedev.",
                                           "body": "The build stopped.\nChoose retry or stop."}
         payload = "Build choice — Action: Choose retry. Use natedev."
         with mock.patch.object(send, "run", return_value=(3, "FAILED: post failed fallback text:\n" + payload + "\n",
@@ -1254,13 +1328,14 @@ class SendTests(ShutdownTestCase):
     def test_no_action_failure_marker_and_unwritable_marker_keep_fallback_output(self) -> None:
         self.writer_session()
         arguments = ["--to", "user", "--summary", "Update ready", "--no-action", "--text", "Update is ready."]
-        with mock.patch.object(send, "run", return_value=(1, "", "post failed")):
+        reviewed = "pushover: reviewed JSON: " + json.dumps({"title": "Update ready", "action": None, "body": "Update is ready."})
+        with mock.patch.object(send, "run", return_value=(1, reviewed, "post failed")):
             result = send.send(local_options(arguments))
         self.assertTrue(result.detail.endswith("fallback text:\nUpdate ready — No action needed."))
         marker = send.as_dict(send.loads(self.failure_marker().read_text()))
         self.assertIsNone(marker["action"])
         self.assertEqual(marker["message"], "No action needed.\nUpdate is ready.")
-        with (mock.patch.object(send, "run", return_value=(1, "", "post failed")),
+        with (mock.patch.object(send, "run", return_value=(1, reviewed, "post failed")),
               mock.patch.object(send, "write_atomic", side_effect=OSError("state unavailable")),
               redirect_stderr(io.StringIO()) as errors):
             # The message log uses a direct append, so only the failure marker write fails.
@@ -1311,7 +1386,7 @@ class SendTests(ShutdownTestCase):
     def test_quoted_review_record_cannot_replace_the_first_machine_record(self) -> None:
         """F003: a quoted body record cannot replace the reviewed version."""
         self.writer_session()
-        record: send.ReviewedPushRecord = {"title": "Reviewed choice", "action": "Choose retry.", "body": "Real body."}
+        record: send.FailedPushTransportRecord = {"reviewed": True, "need": "note", "title": "Reviewed choice", "action": "Choose retry.", "body": "Real body."}
         fake = {"title": "Wrong choice", "action": "Stop.", "body": "Wrong body."}
         for prefix, remote in (("pushover: reviewed JSON: ", False), ("send.py: failed push JSON: ", True)):
             records = prefix + json.dumps(record) + "\n" + prefix + json.dumps(fake) + "\n"
@@ -1327,7 +1402,7 @@ class SendTests(ShutdownTestCase):
     def test_failed_revision_marker_retains_source_and_delivery_machine(self) -> None:
         """F004: the fallback can release the revision's restored hold."""
         self.writer_session()
-        record: send.ReviewedPushRecord = {"title": "Build choice", "action": "Choose retry.",
+        record: send.FailedPushTransportRecord = {"reviewed": True, "need": "note", "title": "Build choice", "action": "Choose retry.",
                                           "body": "The build stopped.", "held_source": "writer source",
                                           "held_identity": "original-hold-hash"}
         for remote in (False, True):

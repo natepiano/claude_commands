@@ -14,13 +14,16 @@ from unittest import mock
 import fake_tmux
 import unit_effort
 import unit_lookup
+import herdr
+from fake_herdr import CommandResponse
+from test_session_pane import tmux_adapter
 from fake_tmux import FakeSession
 from unit_effort import Ready, Skipped
 
 FAKE = str(Path(__file__).with_name("fake_tmux.py"))
 RULE_TOP = "──── review-pool ──────────"
 RULE = "───────────────────────────"
-STATUS = "  natedev | claude 3 | review-pool | 189,709 | Opus 5.5 xhigh"
+STATUS = "  natedev | claude3 | review-pool | 189,709 | Opus 5.5 xhigh"
 EMPTY = f"{RULE_TOP}\n\x1b[39m❯ \n{RULE}\n{STATUS}"
 
 
@@ -72,10 +75,16 @@ class UnitEffortTests(unittest.TestCase):
         _ = self.registry.write_text(
             "[assignments]\nproduction=claude\n\n[production.claude]\ndirector=opus:xhigh\n\n"
             + "[claude.agents]\nopus=low,medium,high,xhigh,max\n", encoding="utf-8")
+        _ = (self.root / "herdr-responses.json").write_text(json.dumps({"default": {"code": 0, "stdout": '{"sessions": []}'}}))
         synced = self.root / "catalog-sync-success"
         synced.touch()
         self.enterContext(mock.patch.dict(os.environ, {
-            "FAKE_TMUX_STATE": str(self.state), "UNIT_LOOKUP_TMUX": FAKE,
+            "FAKE_TMUX_STATE": str(self.state), "UNIT_LOOKUP_TMUX": tmux_adapter(self.root),
+            "FAKE_PANE_LOG": str(self.root / "pane.log"),
+            "HERDR_BIN": str(Path(__file__).parents[1] / "herdr/fake_herdr.py"),
+            "HERDR_PROC": str(self.root / "proc"),
+            "FAKE_HERDR_LOG": str(self.root / "herdr.log"),
+            "FAKE_HERDR_RESPONSES": str(self.root / "herdr-responses.json"),
             "NOTIFIER_SESSIONS_DIR": str(self.records), "AGENTS_CONFIG_FILE": str(self.registry),
             "CODEX_CONFIG_FILE": str(self.root / "codex.toml"),
             "CODEX_MODELS_CACHE_FILE": str(self.root / "models.json"),
@@ -140,6 +149,36 @@ class UnitEffortTests(unittest.TestCase):
         self.assertEqual(self.sent(), [])
         self.assertEqual(self.director_row(), "director=opus:xhigh")
         self.assertEqual(self.run_main("--check")[0], 2)
+
+    def test_a_herdr_director_reads_ansi_and_receives_effort_once(self) -> None:
+        place = herdr.HerdrPlace("native", "w1:p1")
+        marked = unit_lookup.MarkedUnit("native-unit", "native", unit_lookup.LiveClaude("native", "id", "/sock", 1), place)
+        responses = self.root / "herdr-responses.json"
+        replies: dict[str, CommandResponse] = {
+            "--session native pane read w1:p1 --source recent --lines 60 --format ansi": {
+                "code": 0, "stdout": screen("❯ \x1b[2mtry this\x1b[22m")},
+            "default": {"code": 0, "stdout": ""},
+        }
+        _ = responses.write_text(json.dumps(replies))
+        with mock.patch.object(unit_lookup, "every_marked_unit", return_value=unit_lookup.MarkedProductions(
+                {"show": {"native-unit": marked}}, {})):
+            code, out, err = self.run_main("high")
+        self.assertEqual(code, 0, err)
+        self.assertIn("native: sent", out)
+        self.assertEqual((self.root / "herdr.log").read_text().splitlines(), [
+            json.dumps(["--session", "native", "pane", "read", "w1:p1", "--source", "recent", "--lines", "60",
+                        "--format", "ansi"]),
+            json.dumps(["--session", "native", "agent", "prompt", "w1:p1", "/effort high"]),
+        ])
+        self.assertEqual(self.sent(), [])
+
+    def test_a_herdr_prompt_refusal_sends_no_enter(self) -> None:
+        refusal: herdr.HerdrRefusal = {"error": {"code": "agent_blocked", "message": "blocked at a prompt"}}
+        _ = (self.root / "herdr-responses.json").write_text(json.dumps({"default": {
+            "code": 1, "stdout": json.dumps(refusal)}}))
+        problem = unit_effort.send(herdr.HerdrPlace("native", "w1:p1"), "high")
+        self.assertIn("agent_blocked", problem)
+        self.assertEqual(len((self.root / "herdr.log").read_text().splitlines()), 1)
 
 
 if __name__ == "__main__":

@@ -26,11 +26,15 @@ import dailies_render
 import merge_checkpoint
 import update_registration
 import waiting
+import unit_lookup
+import herdr
+from fake_herdr import CommandResponse
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "whoami"))
 import account
 import agent_accounts
 import quota_alert
+from scripts.accounts.accounts import CodexSeatsAccount
 
 
 SCRIPT = Path(__file__).with_name("waiting.py")
@@ -152,11 +156,22 @@ class WaitingTests(unittest.TestCase):
         self.write(self.root / "showrunners.json", json.dumps({
             "threshold_percent": 2, "repeat_minutes": 30, "stall_minutes": 5, "faults_to": "natedev",
             "always": []}))
+        self.write(self.root / "herdr-responses.json", json.dumps({
+            "default": CommandResponse(stdout="", code=1),
+        }))
         self.enterContext(mock.patch.dict(os.environ, {
+            "HOME": str(home),
+            "CODEX_HOME": str(home / "codex-fixture"),
             "UNIT_LOOKUP_TMUX": str(Path(__file__).with_name("fake_tmux.py")),
             "FAKE_TMUX_STATE": str(self.root / "tmux.json"),
             "NOTIFIER_SESSIONS_DIR": str(self.root / "sessions"),
+            "HERDR_BIN": str(SCRIPT.parents[1] / "herdr/fake_herdr.py"),
+            "HERDR_PROC": str(self.root / "proc"),
+            "FAKE_HERDR_LOG": str(self.root / "herdr.jsonl"),
+            "FAKE_HERDR_RESPONSES": str(self.root / "herdr-responses.json"),
             "SHOWRUNNERS_CONFIG": str(self.root / "showrunners.json")}))
+        _ = self.enterContext(mock.patch.object(quota_alert, "seats_home", side_effect=AssertionError(
+            "quota tests must supply Codex readings instead of resolving a live home")))
         self.write(self.root / "tmux.json", json.dumps({
             f"${index}": {"label": "any-label", "panes": [f"%{index}"],
                           "env": {"SHOWRUNNER_UNIT": "example", "SHOWRUNNER_UNIT_ID": unit}}
@@ -444,7 +459,13 @@ class WaitingTests(unittest.TestCase):
             "faults_to": "showrunner-example",
             "always": [],
         }
-        return quota_alert.message(note, [], config, selection=selection)
+        home = self.root / "codex-fixture"
+        readings = quota_alert.CodexAlertPassReadings(
+            CodexSeatsAccount("default", home),
+            agent_accounts.KnownCodexAccount(home, "codex@example.invalid", note.path.stem),
+            (),
+        )
+        return quota_alert.message(note, [], config, selection=selection, codex_readings=readings)
 
     def acknowledgement_message(self, account: str) -> str:
         state_path = self.root / "quota-alert-state.json"
@@ -888,7 +909,7 @@ os.execv(os.environ["WAITING_TEST_REAL_GIT"], [os.environ["WAITING_TEST_REAL_GIT
         self.assertEqual(waiting.eta_moment(eta_text, report_at), waiting.EtaOnLog(eta))
 
     def test_log_timeline_spans_two_midnights_for_waits_and_first_phase(self) -> None:
-        now = datetime.now(ZoneInfo("America/Los_Angeles"))
+        now = datetime.now(ZoneInfo("America/Los_Angeles")).replace(second=0, microsecond=0)
         moments = [now - timedelta(hours=hours) for hours in (50, 40, 26, 14, 2)]
         start = moments[0]
         lines = [
@@ -900,12 +921,14 @@ os.execv(os.environ["WAITING_TEST_REAL_GIT"], [os.environ["WAITING_TEST_REAL_GIT
             "",
         ]
         self.write(self.log, "\n".join(lines))
-        waits = self.run_waiting("waits")
-        self.assertEqual(waits.returncode, 0, waits.stdout + waits.stderr)
-        found = re.search(r"open (\d+) minutes", waits.stdout)
-        self.assertIsNotNone(found, waits.stdout)
+        output = io.StringIO()
+        clock = mock.Mock(wraps=datetime, now=mock.Mock(return_value=now))
+        with mock.patch.dict(os.environ, self.env), mock.patch.object(waiting, "datetime", clock), redirect_stdout(output):
+            waiting.waits(add_unit.read_production(self.doc))
+        found = re.search(r"open (\d+) minutes", output.getvalue())
+        self.assertIsNotNone(found, output.getvalue())
         age = int(found.group(1)) if found else 0
-        self.assertLessEqual(abs(age - 3000), 2)
+        self.assertEqual(age, 3000)
         agenda = self.run_waiting("agenda", "--state-dir", str(self.state))
         self.assertEqual(agenda.returncode, 0, agenda.stdout + agenda.stderr)
         self.assertIn(f"{ALPHA}|{PHASE_IDENTITY}", agenda.stdout)
@@ -960,6 +983,58 @@ os.execv(os.environ["WAITING_TEST_REAL_GIT"], [os.environ["WAITING_TEST_REAL_GIT
                                   "--state-dir", str(self.state))
         self.assertEqual(claude.returncode, 0, claude.stdout + claude.stderr)
         self.assertIn(f"send {ALPHA}: From the showrunner: start no new delegate work on Claude;", claude.stdout)
+
+    def test_quota_reaches_a_live_herdr_unit_by_its_claude_name(self) -> None:
+        native_name = "native-director"
+        tmux = cast(dict[str, object], json.loads((self.root / "tmux.json").read_text()))
+        del tmux["$1"]
+        self.write(self.root / "tmux.json", json.dumps(tmux))
+        self.write(self.root / "herdr-responses.json", json.dumps({
+            "--session default session list --json": CommandResponse(
+                code=0,
+                stdout=json.dumps(herdr.SessionListResult(sessions=[herdr.SessionEntry(
+                    name="native", running=True, default=False,
+                    session_dir="/fixture", socket_path="/fixture/socket",
+                )])),
+            ),
+        }))
+
+        def process(pid: int, parent: int, argv: list[str], **environment: str) -> None:
+            directory = self.root / "proc" / str(pid)
+            directory.mkdir(parents=True)
+            _ = (directory / "stat").write_text(f"{pid} (fixture) S {parent} 0 0")
+            _ = (directory / "cmdline").write_bytes(("\0".join(argv) + "\0").encode())
+            _ = (directory / "environ").write_bytes(
+                ("\0".join(f"{key}={value}" for key, value in environment.items()) + "\0").encode()
+            )
+            (directory / "cwd").symlink_to(self.alpha)
+
+        process(991000, 0, ["herdr", "--session", "native", "server"])
+        process(os.getpid(), 991000, ["claude"], HERDR_PANE_ID="w1:p1",
+                SHOWRUNNER_UNIT="example", SHOWRUNNER_UNIT_ID=ALPHA)
+        path = self.root / "sessions/1.json"
+        record = cast(dict[str, object], json.loads(path.read_text()))
+        record.update(name=native_name, tmux="")
+        self.write(path, json.dumps(record))
+        with mock.patch.dict(os.environ, self.env):
+            marked = unit_lookup.marked_units("example")[ALPHA]
+        self.assertEqual(marked.place, herdr.HerdrPlace("native", "w1:p1"))
+        place = subprocess.run(
+            [sys.executable, str(SCRIPT.with_name("unit_lookup.py")), "pane", "example", ALPHA],
+            env=self.env, capture_output=True, text=True, check=False,
+        )
+        self.assertEqual((place.returncode, place.stdout), (0, "herdr:native:w1:p1\n"), place.stderr)
+
+        notice = self.quota_message(self.quota_note("codex 1"))
+        result = self.run_waiting("quota", "--notice", notice, "--state-dir", str(self.state))
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        calls = [cast(list[str], json.loads(line)) for line in self.sends.read_text().splitlines()]
+        self.assertEqual([call[call.index("--to") + 1] for call in calls], [native_name, BETA])
+        self.assertIn(f"send {native_name}: From the showrunner: keep delegating on Codex:", result.stdout)
+        native_call = calls[0]
+        text = native_call[native_call.index("--text") + 1]
+        self.assertTrue(text.startswith("From the showrunner: keep delegating on Codex:"), text)
+        self.assertIn("tell the showrunner at once if Codex refuses work for quota", text)
 
     def test_quota_tells_only_units_on_a_low_claude_account_when_several_are_in_use(self) -> None:
         self.add_gamma()

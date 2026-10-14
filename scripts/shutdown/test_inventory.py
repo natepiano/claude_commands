@@ -820,6 +820,17 @@ elif "comm=" in joined:
         )
         self.assertNotIn("orphaned-start", director["codex_servers"][0]["busy_seats"])
 
+    def test_a_showrunner_timer_naming_a_session_not_running_is_unregistered(self) -> None:
+        before = {runner["slug"] for runner in inventory.unregistered_showrunners()}
+        stale = self.notifier / "showrunner-stale"
+        stale.mkdir()
+        stale_doc = self.root / "stale-production.md"
+        _ = stale_doc.write_text("- **User zone:** America/Los_Angeles\n", encoding="utf-8")
+        _ = (stale / "conf").write_text(
+            f"TARGET=session:00000000-0000-4000-8000-000000000000\nCHECK=zsh /opt/production_check.sh {stale_doc}\n",
+            encoding="utf-8")
+        self.assertEqual({runner["slug"] for runner in inventory.unregistered_showrunners()} - before, {"stale"})
+
     def test_incomplete_showrunner_timer_leaves_session_top_level(self) -> None:
         invalid_showrunner = self.notifier / "showrunner-incomplete"
         invalid_showrunner.mkdir()
@@ -1076,6 +1087,79 @@ elif "comm=" in joined:
             r"inventory\.sessions\[0\]\.host\.window_shell is missing",
         ):
             _ = inventory.parse_inventory(json.dumps(document))
+
+
+class ProcessEnvironmentTests(unittest.TestCase):
+    def test_darwin_environment_excludes_assignments_in_arguments(self) -> None:
+        arguments = 'claude --resume conversation "TMUX_PANE=%41 CLAUDE_CONFIG_DIR=/x"'
+        with patch.object(sys, "platform", "darwin"), patch.object(subprocess, "run", side_effect=[
+            subprocess.CompletedProcess[str]([], 0, f"  {arguments}\n", ""),
+            subprocess.CompletedProcess[str]([], 0, f"  {arguments} HERDR_PANE_ID=w1:p1 REAL_ENTRY=value=with=equals\n", ""),
+            subprocess.CompletedProcess[str]([], 0, f"  {arguments}\n", ""),
+        ]) as probe:
+            environment = inventory._process_environment(42)  # pyright: ignore[reportPrivateUsage]
+        self.assertEqual(environment, {"HERDR_PANE_ID": "w1:p1", "REAL_ENTRY": "value=with=equals"})
+        self.assertEqual(probe.call_args_list[0].args[0], ("ps", "-o", "command=", "-p", "42"))
+        self.assertEqual(probe.call_args_list[1].args[0], ("ps", "eww", "-o", "command=", "-p", "42"))
+        self.assertEqual(probe.call_args_list[2].args[0], ("ps", "-o", "command=", "-p", "42"))
+        self.assertEqual(probe.call_count, 3)
+
+    def test_darwin_environment_refuses_arguments_added_between_reads(self) -> None:
+        arguments = "claude --resume conversation"
+        extended_arguments = arguments + " TMUX_PANE=%41 CLAUDE_CONFIG_DIR=/x"
+        with patch.object(sys, "platform", "darwin"), patch.object(subprocess, "run", side_effect=[
+            subprocess.CompletedProcess[str]([], 0, arguments + "\n", ""),
+            subprocess.CompletedProcess[str]([], 0, extended_arguments + "\n", ""),
+            subprocess.CompletedProcess[str]([], 0, extended_arguments + "\n", ""),
+        ]) as probe:
+            self.assertEqual(inventory._process_environment(42), {})  # pyright: ignore[reportPrivateUsage]
+        self.assertEqual(probe.call_count, 3)
+
+    def test_darwin_environment_refuses_changed_or_empty_command(self) -> None:
+        for arguments, expanded in (
+            ("claude --resume old", "claude --resume new TMUX_PANE=%41"),
+            ("claude", "claude-other TMUX_PANE=%41"),
+            ("", "TMUX_PANE=%41"),
+        ):
+            with self.subTest(arguments=arguments, expanded=expanded):
+                with patch.object(sys, "platform", "darwin"), patch.object(subprocess, "run", side_effect=[
+                    subprocess.CompletedProcess[str]([], 0, arguments + "\n", ""),
+                    subprocess.CompletedProcess[str]([], 0, expanded + "\n", ""),
+                    subprocess.CompletedProcess[str]([], 0, arguments + "\n", ""),
+                ]):
+                    self.assertEqual(inventory._process_environment(42), {})  # pyright: ignore[reportPrivateUsage]
+
+    def test_darwin_environment_is_empty_when_any_ps_call_fails(self) -> None:
+        for failed_call in (0, 1, 2):
+            for failure in (
+                subprocess.CompletedProcess[str]([], 1, "claude TMUX_PANE=%41", "gone"),
+                OSError("process vanished"),
+                subprocess.TimeoutExpired("ps", 5),
+            ):
+                with self.subTest(failed_call=failed_call, failure=failure):
+                    answers = [subprocess.CompletedProcess[str]([], 0, "claude\n", "")] * failed_call + [failure]
+                    with patch.object(sys, "platform", "darwin"), patch.object(subprocess, "run", side_effect=answers) as probe:
+                        self.assertEqual(inventory._process_environment(42), {})  # pyright: ignore[reportPrivateUsage]
+                    self.assertEqual(probe.call_count, failed_call + 1)
+
+    def test_darwin_command_without_environment_contributes_no_assignments(self) -> None:
+        arguments = "claude TMUX_PANE=%41 CLAUDE_CONFIG_DIR=/x"
+        with patch.object(sys, "platform", "darwin"), patch.object(subprocess, "run", side_effect=[
+            subprocess.CompletedProcess[str]([], 0, arguments + "\n", ""),
+            subprocess.CompletedProcess[str]([], 0, arguments + "\n", ""),
+            subprocess.CompletedProcess[str]([], 0, arguments + "\n", ""),
+        ]):
+            self.assertEqual(inventory._process_environment(42), {})  # pyright: ignore[reportPrivateUsage]
+
+    def test_linux_environment_still_reads_null_delimited_proc_entries(self) -> None:
+        with patch.object(sys, "platform", "linux"), patch.object(Path, "read_bytes", return_value=(
+            b"TMUX_PANE=%41\0CLAUDE_CONFIG_DIR=/real account\0INVALID\0VALUE=a=b\0"
+        )) as read_environment, patch.object(subprocess, "run") as probe:
+            self.assertEqual(inventory._process_environment(42), {  # pyright: ignore[reportPrivateUsage]
+                "TMUX_PANE": "%41", "CLAUDE_CONFIG_DIR": "/real account", "VALUE": "a=b",
+            })
+        read_environment.assert_called_once_with()
+        probe.assert_not_called()
 
 
 if __name__ == "__main__":

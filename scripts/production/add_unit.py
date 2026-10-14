@@ -79,7 +79,8 @@ class UnitRestoreLaunch(NamedTuple):
     session_id: str
     note: Path
     session_name: str
-    tmux_session: str
+    # The unit's tmux or herdr session it is restored into.
+    host_session: str
 
 
 class DefaultEffort(NamedTuple):
@@ -288,20 +289,20 @@ def launch_request(args: argparse.Namespace) -> RequestedUnitLaunch:
     cwd = cast(str | None, args.cwd)
     restart_note = cast(str | None, args.restart_note)
     session_name = cast(str | None, args.session_name)
-    tmux_session = cast(str | None, args.tmux_session)
-    restart_values = (restart_note, session_name, tmux_session)
+    host_session = cast(str | None, args.host_session)
+    restart_values = (restart_note, session_name, host_session)
     if any(value is not None for value in restart_values) and not all(
         value is not None for value in restart_values
     ):
         raise Refusal(
-            "--restart-note, --session-name and --tmux-session must be given together"
+            "--restart-note, --session-name and --host-session must be given together"
         )
     if restart_note is not None and resumed is None:
         raise Refusal("restart launch flags require --resume")
     if (resumed is None) != (cwd is None):
         raise Refusal("--resume and --cwd must be given together")
-    if resumed is not None and not isinstance(plan, PlanGiven):
-        raise Refusal("--resume requires --plan")
+    if resumed is not None and isinstance(plan, BriefGiven):
+        raise Refusal("--resume requires --plan or --standby")
     session: NewSession | ResumedSession = (ResumedSession(resumed, Path(cwd).expanduser().resolve())
                                             if resumed is not None and cwd is not None else NewSession())
     launch_kind: NewWorkLaunch | UnitRestoreLaunch
@@ -309,13 +310,13 @@ def launch_request(args: argparse.Namespace) -> RequestedUnitLaunch:
         resumed is not None
         and restart_note is not None
         and session_name is not None
-        and tmux_session is not None
+        and host_session is not None
     ):
         launch_kind = UnitRestoreLaunch(
             resumed,
             Path(restart_note).expanduser(),
             session_name,
-            tmux_session,
+            host_session,
         )
     else:
         launch_kind = NewWorkLaunch()
@@ -753,7 +754,7 @@ def launch_session(
     session_name = (request.launch_kind.session_name
                     if isinstance(request.launch_kind, UnitRestoreLaunch)
                     else request.identity.session)
-    tmux_session = (request.launch_kind.tmux_session
+    tmux_session = (request.launch_kind.host_session
                     if isinstance(request.launch_kind, UnitRestoreLaunch)
                     else request.identity.session)
     argv.extend(["--remote-control", session_name, "-n", session_name,
@@ -773,7 +774,7 @@ def launch_session(
                        env=environment, text=True, capture_output=True, check=True)
     directory = main_config_dir() if isinstance(selected, DefaultAccount) else selected.dir
     for option, value in (("@claude_config_dir", str(directory)), ("@claude_model", launch_model)):
-        _ = subprocess.run([tmux, "set-option", "-t", f"={tmux_session}", option, value],
+        _ = subprocess.run([tmux, "set-option", "-t", f"={tmux_session}:", option, value],
                            env=environment, text=True, capture_output=True, check=True)
 
 
@@ -809,16 +810,21 @@ def launched_unit(request: UnitLaunch | RequestedUnitLaunch) -> MarkedUnitFound 
 
 
 def wait_for_remote_control(request: UnitLaunch, tmux: str) -> unit_lookup.MarkedUnit:
+    from session_pane import HerdrFailure, read_place
+
+    # Keep the launch caller's argument; the pane library now resolves the host.
+    del tmux
     found = launched_unit(request)
     if isinstance(found, NoMarkedUnit):
-        raise RuntimeError(f"{request.identity.unit}: no tmux session carries its mark")
+        raise RuntimeError(f"{request.identity.unit}: no session carries its mark")
     launched = found.unit
     deadline = time.monotonic() + request.timeout
     pane = ""
     while True:
-        result = subprocess.run([tmux, "capture-pane", "-p", "-t", launched.pane],
-                                text=True, capture_output=True, check=False)
-        pane = result.stdout if result.returncode == 0 else result.stderr
+        try:
+            pane = read_place(launched.place)
+        except (OSError, HerdrFailure) as error:
+            pane = str(error)
         if "/remote-control is active" in pane:
             return launched
         remaining = deadline - time.monotonic()
@@ -867,7 +873,7 @@ def model_for_resume(request: RequestedUnitLaunch, explicit: str = "") -> str:
     found = launched_unit(request)
     if isinstance(found, MarkedUnitFound):
         result = subprocess.run([unit_lookup.tmux_binary(), "show-options", "-v", "-t",
-                                 f"={found.unit.label}", "@claude_model"],
+                                 f"={found.unit.label}:", "@claude_model"],
                                 capture_output=True, text=True, check=False)
         if result.returncode == 0:
             return result.stdout.strip()
@@ -891,7 +897,7 @@ def main(argv: list[str]) -> int:
     _ = parser.add_argument("--cwd")
     _ = parser.add_argument("--restart-note")
     _ = parser.add_argument("--session-name")
-    _ = parser.add_argument("--tmux-session")
+    _ = parser.add_argument("--host-session")
     _ = parser.add_argument("--check", action="store_true")
     args = parser.parse_args(argv)
     try:
@@ -956,19 +962,27 @@ def main(argv: list[str]) -> int:
                 unit = marked_unit.unit
                 if isinstance(unit.claude, unit_lookup.ClaudeUnknown):
                     raise Refusal(
-                        f"cannot tell whether Claude runs in tmux session {unit.label}: "
+                        f"cannot tell whether Claude runs in session {unit.label}: "
                         + unit.claude.reason
                     )
                 if isinstance(unit.claude, unit_lookup.ClaudeNotRunning):
-                    _ = subprocess.run(
-                        [tmux, "kill-session", "-t", unit.pane],
-                        capture_output=True,
-                        text=True,
-                        check=True,
-                    )
+                    if isinstance(unit.place, unit_lookup.TmuxPlace):
+                        _ = subprocess.run(
+                            [tmux, "kill-session", "-t", unit.place.pane],
+                            capture_output=True,
+                            text=True,
+                            check=True,
+                        )
+                    else:
+                        import herdr
+
+                        try:
+                            herdr.stop_session(unit.label)
+                        except herdr.HerdrFailure as error:
+                            raise Refusal(f"cannot end session {unit.label}: {error}") from error
                     marked_unit = NoMarkedUnit()
             tmux_session = (
-                request.launch_kind.tmux_session
+                request.launch_kind.host_session
                 if isinstance(request.launch_kind, UnitRestoreLaunch)
                 else request.identity.session
             )
@@ -1001,7 +1015,7 @@ def main(argv: list[str]) -> int:
             restored_tmux_session = (
                 marked_unit.unit.label
                 if isinstance(marked_unit, MarkedUnitFound)
-                else request.launch_kind.tmux_session
+                else request.launch_kind.host_session
             )
             print(
                 f"{request.identity.unit} restore launched: tmux attach -t {restored_tmux_session}"

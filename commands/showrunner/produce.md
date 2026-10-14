@@ -69,12 +69,12 @@ State:
 - **Unit worktrees.** Never `cd` into one; use `git -C`. Never commit, reset or
   edit files there.
 - **A unit's pane** is looked up each time it is needed, never remembered:
-  `$HOME/.claude/scripts/lib/py $HOME/.claude/scripts/production/unit_lookup.py pane <slug> <unit>`
-  prints it (`<unit>` is the Units row's Unit value). No tool finds a pane by a
+  `~/.claude/scripts/lib/py ~/.claude/scripts/production/session_pane.py where unit <slug> <unit>`
+  prints its host and pane (`<unit>` is the Units row's Unit value). No tool finds a pane by a
   session name; the user may rename a session at any time.
 - **The user's words for a unit director** go into its terminal. Send
-  `tmux send-keys -t <pane> -l "From the user (via the showrunner): <words>"`,
-  then `tmux send-keys -t <pane> Enter` as a separate call:
+  `~/.claude/scripts/lib/py ~/.claude/scripts/production/session_pane.py type unit <slug> <unit> "From the user (via the showrunner): <words>"`.
+  On exit 4, tell the user the unit is at a prompt and nothing was typed.
   - Relay only words the user gave.
   - Never send C-c or Escape; typing replaces a prompt suggestion.
   - Text after a unit director's `❯` in a pane capture may be a prompt
@@ -362,9 +362,10 @@ For each unit without a live unit director, run
 Use `--standby` for a unit waiting for an assignment. Tell the user one line
 per unit director: its session name and `tmux attach -t <session>`.
 
-When a unit director is blocked on a full context, first capture its pane to
-confirm the block remains and no compaction is running. Type `/compact` into its pane with
-`tmux send-keys -t <pane> -l`, then send `Enter` separately.
+When a unit director is blocked on a full context, first read its pane with
+`~/.claude/scripts/lib/py ~/.claude/scripts/production/session_pane.py read unit <slug> <unit> --ansi`
+to confirm the block remains and no compaction is running. Type `/compact` with
+`~/.claude/scripts/lib/py ~/.claude/scripts/production/session_pane.py type unit <slug> <unit> /compact`.
 
 **Resume.** To bring back a unit director whose session ended, use
    `$HOME/.claude/scripts/lib/py $HOME/.claude/scripts/production/add_unit.py --production PRODUCTION_DOC <name> --plan <unit plan> --resume <session-id> --cwd <recorded cwd>`.
@@ -429,10 +430,11 @@ is the update tick, not a peer's message. Do not reply to it.
 **Compact after a checkpoint.** At most once per phase: on the first tick or
 dailies after a unit director checkpoints a phase, read its context size from its pane
 footer (`<session> | 157,352 | <model>`). When it is at 150,000 tokens or more
-and idle, type `/compact` into it: `tmux send-keys -t <pane> -l
-"/compact"`, then `Enter` as a separate call. Idle means no spinner line
-(`✶ Doing… (12s …)`), nothing after `❯` except a ghost suggestion (dim:
-`tmux capture-pane -e` shows `\e[2m` before it), and no form, permission
+and idle, type `/compact` with
+`~/.claude/scripts/lib/py ~/.claude/scripts/production/session_pane.py type unit <slug> <unit> /compact`.
+Check idle with `~/.claude/scripts/lib/py ~/.claude/scripts/production/session_pane.py read unit <slug> <unit> --ansi`:
+no spinner line (`✶ Doing… (12s …)`), nothing after `❯` except a ghost
+suggestion (dim: `\e[2m` before it on both hosts), and no form, permission
 prompt or menu on screen. A unit director whose background seats are still
 running counts as idle, because it is only waiting on them. Never compact a unit
 director that is mid-turn or showing a form. Between checkpoints, leave it to
@@ -909,8 +911,9 @@ it needs. Every other wait is yours to clear, and fast.
       another route, and never do it for the unit (user, 2026-10-05: trunk
       sat 3 h on a refused plan read, and my "use the Read tool" was refused too).
       One exception: a read-only command on files our sessions wrote (its
-      plan, its handoff). Type the go-ahead the unit asks for into its tmux
-      pane yourself and tell the user in one line (user, 2026-10-05).
+      plan, its handoff). Type the go-ahead with
+      `~/.claude/scripts/lib/py ~/.claude/scripts/production/session_pane.py type unit <slug> <unit> "<go-ahead>"`
+      and tell the user in one line (user, 2026-10-05).
       Anything that writes, deletes, pushes or reaches outside our files
       waits for the user.
    2. **Restart everything that does not need that action.** Phase work from
@@ -923,7 +926,9 @@ it needs. Every other wait is yours to clear, and fast.
       a phone: the session, the exact words to type or the exact allow rule
       to add, and why the check refused it, in a few words. Put it in
       `needed:` and send it as a <Notify/> `blocked` alert.
-   4. **Rule 4's limit holds.** Read the pane again each hour, and repeat 1–3.
+   4. **Rule 4's limit holds.** Each hour, run
+      `~/.claude/scripts/lib/py ~/.claude/scripts/production/session_pane.py read unit <slug> <unit>`
+      and repeat 1–3.
       A `needed:` line never repeats unchanged from tick to tick.
    5. **Prevent the next one.** When a routine action for the unit is refused
       (reading its own plan, a plain `git push`), find which command file
@@ -1047,6 +1052,29 @@ land a phase sooner. Each design check covers every view of the change at once
 </CrossUnitChange>
 
 ---
+
+<PauseForMove>
+A message whose first line starts `Pause for move:` or `Pause for stop:` is the
+shutdown mover asking this session to stop so it can move or stop it. Act on it
+at once, in the turn it arrives:
+
+1. Stop mid-step and start nothing new: no merge, gate or launch that has not
+   begun. Leave uncommitted work in place.
+2. Append a `### STATE` block to your LOG, and stop any build you started or name
+   it in the line below.
+3. Run the `shutdown.py ready --where "<one line>"` command the message gives.
+4. End the turn.
+
+The session is resumed with that line, on the account the message names; continue
+from it. A unit of yours that vanished during a move is the mover's to bring back:
+do not restore it while its move is in progress.
+
+Before the mover stops one of your units, you get one line from `shutdown`:
+`<unit> is stopping: <why>; it comes back on <account> within minutes`, or that
+it stays stopped until the user restarts it. One more line follows:
+`<unit> is back on <account>`, or `<unit> did not come back: <reason>`. The user
+is told of a failure; you hold the unit's work until it is back.
+</PauseForMove>
 
 <QuotaAlert>
 Unit directors' seats run on accounts with a weekly usage limit. The notices about

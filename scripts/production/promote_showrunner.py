@@ -4,7 +4,7 @@
 Usage: promote_showrunner.py <unit> --production <child production doc> --model <id> --effort <level> [--check]
 
 The parent showrunner runs it, once the unit has written the child's production doc and committed it.
-The unit gets `/exit`; once its Claude is gone its tmux session is ended, and add_showrunner.py resumes
+The unit gets `/exit`; once its Claude is gone its host session is ended, and add_showrunner.py resumes
 the same conversation as the child's showrunner: in tmux, with no unit mark, on its retained account,
 attached to this showrunner's production. The unit's Units row is then retired and committed in this
 showrunner's checkout. --check runs every refusal and stops nothing.
@@ -25,12 +25,17 @@ from datetime import datetime
 from pathlib import Path
 from typing import NamedTuple, cast
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "whoami"))
+
 import add_showrunner
 import showrunners
 import unit_effort
 import unit_lookup
+import herdr
+from session_pane import HerdrFailure, read_place, type_place, where_place
 from add_unit import (Production, Refusal, cell_value, commit_paths, plan_cell_is_retired, read_production,
                       unit_headings, unit_rows, unit_table)
+from scripts.whoami import account
 
 STOP_WAIT_S = float(os.environ.get("PROMOTE_STOP_WAIT_S") or 60)
 POLL_S = 0.5
@@ -83,10 +88,11 @@ def _quiet(unit: str, marked: unit_lookup.MarkedUnit, claude: unit_lookup.LiveCl
     """Refuse a unit mid-turn or with a form, prompt or draft on screen: `/exit` would land in it."""
     if _session_status(claude.pid) == "busy":
         raise Refusal(f"{unit} is mid-turn; promote it once its turn ends")
-    shown = _tmux("capture-pane", "-p", "-e", "-t", marked.pane)
-    if shown.returncode != 0:
-        raise Refusal(f"cannot read {unit}'s pane: {shown.stderr.strip() or f'exit {shown.returncode}'}")
-    verdict = unit_effort.verdict(shown.stdout)
+    try:
+        shown = read_place(marked.place, ansi=True)
+    except (OSError, HerdrFailure) as error:
+        raise Refusal(f"cannot read {unit}'s pane: {error}") from error
+    verdict = unit_effort.verdict(shown)
     if isinstance(verdict, unit_effort.Skipped):
         raise Refusal(f"{unit}'s pane: {verdict.reason}")
 
@@ -128,9 +134,10 @@ def checked(name: str, child_doc: Path) -> Promotion:
     _settled(unit, claude, worktree)
     child = read_production(child_doc)
     _committed(child.doc)
-    # The unit's own tmux session may carry the child's name; the stop ends it before the restart.
+    # Only the unit's tmux session is exempt from the destination's tmux name collision.
     directory = showrunner_account_directory()
-    _ = add_showrunner.checked(child, parent.slug, ending=marked.label, start_in=worktree, config_dir=directory)
+    ending = marked.label if isinstance(marked.place, unit_lookup.TmuxPlace) else ""
+    _ = add_showrunner.checked(child, parent.slug, ending=ending, start_in=worktree, config_dir=directory)
     return Promotion(unit, parent, child, marked, claude, worktree, cell_value(cells.get("Plan", "")))
 
 
@@ -145,28 +152,44 @@ def _alive(pid: int) -> bool:
 
 
 def stop(promotion: Promotion) -> bool:
-    """Type `/exit` and end the tmux session once its Claude is gone; False when it outlived STOP_WAIT_S.
+    """Type `/exit` and end its host session once Claude is gone; False when it outlived STOP_WAIT_S.
 
     Two processes on one session corrupt it, so nothing may resume it while this one runs.
     """
-    for keys in (("-l", "/exit"), ("Enter",)):
-        sent = _tmux("send-keys", "-t", promotion.marked.pane, *keys)
-        if sent.returncode != 0:
-            raise Refusal(f"cannot type /exit into {promotion.unit}'s pane: {sent.stderr.strip()}")
+    place = promotion.marked.place
+    try:
+        type_place(place, "/exit")
+    except (OSError, HerdrFailure) as error:
+        raise Refusal(f"cannot type /exit into {promotion.unit}'s pane: {error}") from error
     deadline = time.monotonic() + STOP_WAIT_S
     while _alive(promotion.claude.pid):
         if time.monotonic() >= deadline:
             return False
         time.sleep(POLL_S)
-    _ = _tmux("kill-session", "-t", promotion.marked.pane)
+    if isinstance(place, unit_lookup.TmuxPlace):
+        ended = _tmux("kill-session", "-t", place.pane)
+        if ended.returncode:
+            raise Refusal(f"cannot end {promotion.unit}'s session: {ended.stderr.strip()}")
+    else:
+        try:
+            herdr.stop_session(promotion.marked.label)
+        except HerdrFailure as error:
+            raise Refusal(f"cannot end {promotion.unit}'s session: {error}") from error
     return True
 
 
 def recorded_account_directory(marked: unit_lookup.MarkedUnit) -> Path:
-    held = _tmux("show-options", "-v", "-t", f"={marked.label}", "@claude_config_dir")
-    if held.returncode != 0 or not held.stdout.strip():
-        raise Refusal("no account recorded for this unit; resume with --account before promoting")
-    directory = Path(held.stdout.strip()).expanduser()
+    if isinstance(marked.place, unit_lookup.TmuxPlace):
+        held = _tmux("show-options", "-v", "-t", f"={marked.label}:", "@claude_config_dir")
+        if held.returncode != 0 or not held.stdout.strip():
+            raise Refusal("no account recorded for this unit; resume with --account before promoting")
+        directory = Path(held.stdout.strip()).expanduser()
+    else:
+        if not isinstance(marked.claude, unit_lookup.LiveClaude):
+            raise Refusal(f"{marked.unit}: no live Claude to read its account")
+        directory = account.process_config_dir(marked.claude.pid)
+        if directory is None:
+            raise Refusal(f"{marked.unit}: cannot read its live Claude's account environment")
     if not directory.is_dir():
         raise Refusal(f"recorded resume account directory {directory} is missing")
     return directory
@@ -232,7 +255,8 @@ def main(argv: list[str]) -> int:
         return 2
     unit, slug = promotion.unit, promotion.child.slug
     if cast(bool, args.check):
-        print(f"check: ok — would stop {unit} (tmux {promotion.marked.label}), resume it as the showrunner of "
+        host = "tmux" if isinstance(promotion.marked.place, unit_lookup.TmuxPlace) else "herdr"
+        print(f"check: ok — would stop {unit} ({host} {promotion.marked.label}), resume it as the showrunner of "
               + f"{slug} in {promotion.worktree} under {promotion.parent.slug}, and retire its row; {moved}")
         return 0
     try:
@@ -242,7 +266,8 @@ def main(argv: list[str]) -> int:
         return 2
     if not stopped:
         print(f"{unit}'s Claude (pid {promotion.claude.pid}) still runs {STOP_WAIT_S:g} s after /exit, so nothing "
-              + f"was restarted. Look at it with `tmux attach -t {promotion.marked.label}`.")
+              + f"was restarted. Its pane is {where_place(promotion.marked.place)}; read it with "
+              + f"`~/.claude/scripts/lib/py ~/.claude/scripts/production/session_pane.py read session {promotion.claude.session_id}`.")
         return 1
     started = add_showrunner.main(["--production", str(promotion.child.doc), "--model", cast(str, args.model),
                                    "--effort", cast(str, args.effort), "--resume", promotion.claude.session_id,

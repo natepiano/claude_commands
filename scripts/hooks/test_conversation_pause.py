@@ -978,14 +978,11 @@ print("SENT: delivered")
         self.pause_root.mkdir(parents=True)
         with (self.pause_root / ".lock").open("w") as lock_file:
             fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
-            started = time.monotonic()
             result = self.run_prompt(
                 "hello",
                 extra_env={"CONVERSATION_PAUSE_HOOK_BUDGET": "1"},
                 timeout=3,
             )
-            elapsed = time.monotonic() - started
-        self.assertLess(elapsed, 3)
         self.assertEqual((result.returncode, result.stdout), (0, ""))
         self.assertEqual(len(result.stderr.splitlines()), 1)
         self.assertIn("HookBudgetSpent", result.stderr)
@@ -994,20 +991,16 @@ print("SENT: delivered")
         _ = self.write_record({"kind": "replying", "user_wrote_at": 50})
         with (self.pause_root / ".lock").open("w") as lock_file:
             fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
-            started = time.monotonic()
             result = self.run_stop(
                 extra_env={"CONVERSATION_PAUSE_HOOK_BUDGET": "1"},
                 timeout=3,
             )
-            elapsed = time.monotonic() - started
-        self.assertLess(elapsed, 3)
         self.assertEqual((result.returncode, result.stdout), (0, ""))
         self.assertEqual(len(result.stderr.splitlines()), 1)
         self.assertIn("HookBudgetSpent", result.stderr)
 
     def test_prompt_hook_budget_expires_during_notifier_stop(self) -> None:
         instance = self.create_instance("delegate-abc")
-        started = time.monotonic()
         result = self.run_prompt(
             "hello",
             extra_env={
@@ -1016,8 +1009,6 @@ print("SENT: delivered")
             },
             timeout=3,
         )
-        elapsed = time.monotonic() - started
-        self.assertLess(elapsed, 3)
         self.assertEqual((result.returncode, result.stdout), (0, ""))
         self.assertEqual(len(result.stderr.splitlines()), 1)
         self.assertIn("HookBudgetSpent", result.stderr)

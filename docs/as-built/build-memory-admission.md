@@ -72,7 +72,7 @@ In `invoke.sh`, `run_once` checks natedev holds before memory admission, runs th
 
 ### Build log: records and schema
 
-Index `SCHEMA_VERSION = 14` (`scripts/buildlog/index.py`; `open_for_update` rebuilds on a mismatch). Memory and coordination columns:
+Index `SCHEMA_VERSION = 15` (`scripts/buildlog/index.py`; `open_for_update` rebuilds on a mismatch). Memory and coordination columns:
 
 | Table | Column | Meaning |
 | --- | --- | --- |
@@ -121,7 +121,7 @@ zram: X GiB stored in Y GiB (R:1) | zram: unavailable
 
 Slice lines use the snapshots nearest each edge within `SNAPSHOT_DISTANCE_S` (120 s), else `<slice>: no snapshot within 2 min of <time>`. A journal error or nonzero exit prints `journal unavailable`, never zero kills. A peak that did not rise in the window reads `at most X GiB (no new high in the window)`. A counter that falls in the window is a reset: `<slice>: reset in the window; since the reset ...`. Edges round up to the next millisecond (`stored_bound`) to match stored records.
 
-**Daily report** (`buildlog report [day]`, `scripts/buildlog/report.py`). Every step-based section counts natedev's steps only (`host = 'natedev'`); `### Mac` holds the Mac's (`docs/as-built/mac-test-offload.md`). Order: `## Builds, <day>`; `### Waiting`; `### Rebuilds` (where compile time goes; `docs/as-built/build-followups.md`, Rebuilds section); one section per kind; `### Memory pressure`; agent calls; test builds; Tests by target; `### Mac`; port-lint; `### CI`; `### Tests per edit`; Disk; summaries; one-line totals and notes.
+**Daily report** (`buildlog report [day]`, `scripts/buildlog/report.py`). Every step-based section counts natedev's steps only (`host = 'natedev'`); `### Mac` holds the Mac's (`docs/as-built/mac-test-offload.md`). Order: `## Builds, <day>`; `### Waiting`; `### Rebuilds` (where compile time goes; `docs/as-built/build-followups.md`, Rebuilds section); one section per kind; `### Memory pressure`; agent calls; test builds; `### Power profile` (`docs/as-built/build-targets.md`); Tests by target; `### Mac`; port-lint; `### CI`; `### Tests per edit`; Disk; summaries; one-line totals and notes.
 
 - `### Waiting`: a `Wait | Longest | Over 5 min | Waited | Total | Worst` table, always present, in this order: `Build-folder turn, behind another seat`, `Build-folder turn, behind its own call`, `Held target`, `Memory admission`, `CI queue`. Held-target seconds come from `calls.hold_wait_s`; memory seconds from `steps.mem_wait_s`. `Longest` names who and its time; `Over 5 min` counts above 300 s; `Waited` is the count out of the day's population; `Total` is seat-hours or job-hours; `Worst` gives the top three. Each row uses `wait_row`; an empty kind reads `none`.
   - **Build-folder split.** `build_folder_waits(connection, day) -> (another_waits, own_waits)` returns two `ReportedWait` lists (`tuple[float, str, str, str]`: duration, owner, name, started_at), one entry per call in each, with the call's part of the wait as the duration and the worktree as owner and name. It reads the day's `tool = 'verify.sh'` calls and the token holders: verify.sh calls with a `delegate_session` and an `ended_at` on the day or later. `token_holders()` turns each into `TokenHolder(call_id, delegate_session, seat, starts_at, ends_at)` over `[started_at + wait_s, ended_at]`, grouped by session so each call scans only its own session's holders.

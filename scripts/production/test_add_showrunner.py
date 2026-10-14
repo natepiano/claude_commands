@@ -38,6 +38,11 @@ if name == "tmux":
     target = args[args.index("-t") + 1] if "-t" in args else ""
     if args[:1] == ["has-session"] and not (state / f"live-{target.removeprefix('=')}").exists():
         raise SystemExit(1)
+    # Like tmux 3.6, an option command takes a pane target: a bare `=name` names no session.
+    if args[:1] in (["show-options"], ["set-option"]) and target.startswith("=") and not target.endswith(":"):
+        print(f"no such session: {target}", file=sys.stderr)
+        raise SystemExit(1)
+    target = target.removesuffix(":")
     if args[:1] == ["show-options"]:
         option = state / (target.removeprefix('=') + args[-1])
         if not option.exists():
@@ -396,7 +401,7 @@ class AddShowrunnerTests(unittest.TestCase):
                                   "--config-dir", ".claude3", cwd=home)
         self.assertEqual(result.returncode, 0, result.stderr)
         options = [cast(list[str], event["args"]) for event in self.events("tmux")]
-        self.assertIn(["set-option", "-t", "=kid", "@claude_config_dir", str(directory)], options)
+        self.assertIn(["set-option", "-t", "=kid:", "@claude_config_dir", str(directory)], options)
 
     def test_showrunner_config_directory_requires_resume_and_excludes_account(self) -> None:
         directory = Path(self.env["HOME"]) / "retained"
@@ -443,8 +448,8 @@ class AddShowrunnerTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         options = [cast(list[str], event["args"]) for event in self.events("tmux")
                    if cast(list[str], event["args"])[:1] == ["set-option"]]
-        self.assertIn(["set-option", "-t", "=kid", "@claude_config_dir", str(Path(self.env["HOME"]) / ".claude")], options)
-        self.assertIn(["set-option", "-t", "=kid", "@claude_model", "opus"], options)
+        self.assertIn(["set-option", "-t", "=kid:", "@claude_config_dir", str(Path(self.env["HOME"]) / ".claude")], options)
+        self.assertIn(["set-option", "-t", "=kid:", "@claude_model", "opus"], options)
 
     def test_new_showrunner_zero_reading_without_refusal_can_launch(self) -> None:
         file = Path(self.env["HOME"]) / ".local/state/agent-notes/usage.json"

@@ -130,6 +130,11 @@ class StoredReadingTests(unittest.TestCase):
         line = status_lines(self.live, account="someone@example.invalid")[0]
         self.assertNotIn("@", line)
 
+    def test_a_numbered_claude_label_reaches_the_line_without_its_space(self) -> None:
+        line = status_lines(self.live, account="claude 3")[0]
+        self.assertIn("| claude3 |", line)
+        self.assertNotIn("claude 3", line)
+
 
 if __name__ == "__main__":
     _ = unittest.main()

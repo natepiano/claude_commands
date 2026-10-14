@@ -289,7 +289,7 @@ def _local_shutdown_records(
     login: str, machine: str
 ) -> LocalShutdownRecordOutcome:
     try:
-        return {"kind": "records", "records": session_records(login)}
+        return {"kind": "records", "records": restart_work.clear_running_on_target(session_records(login)).remaining}
     except InvalidRecord as error:
         return {"kind": "unreadable", "machine": machine, "reason": str(error)}
 
@@ -474,7 +474,7 @@ def _only_ids(value: str | None) -> tuple[str, ...]:
 
 
 def _records(here: bool) -> tuple[list[MachineRecordReport], list[str]]:
-    local = all_session_records()
+    local = restart_work.clear_running_on_target(all_session_records()).remaining
     reports: list[MachineRecordReport] = list(local)
     lines = [_record_line(item) for item in local]
     if here:

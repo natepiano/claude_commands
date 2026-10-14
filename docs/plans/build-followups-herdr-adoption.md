@@ -21,8 +21,8 @@ Evidence: `docs/as-built/herdr-trial.md` (findings 1–8, gotchas, reusable and 
 3. **tmux keeps working through the transition.** `unit_lookup.py` gains a herdr source beside tmux, so running productions are not disturbed. Launchers switch to herdr only after lookup, typing, reading, shutdown and restart all handle herdr. tmux code goes in the last Linux phase, after every live session has moved. Risk: two hosts in the code for some weeks.
 4. **Phase order.** The brief put launchers before typing and shutdown. I moved typing/reading and shutdown/restart ahead of the launcher switch, so no herdr unit ever exists that a relay, `/compact`, an effort change or a shutdown cannot reach. The finished result is the same. Risk: the user waits two more phases before the first herdr unit.
 5. **Quota alerts: no change.** A Claude in a herdr pane is an ordinary session, so alerts reaching it are correct (trial finding 7). `waiting.py quota` finds herdr units through the lookup. Risk: none known.
-6. **Trust is checked, never answered.** Every launcher refuses to start in a folder whose Claude trust is missing on the account that will run it, and prints the one command the user runs to grant it. `add_unit.py` has no trust check today; `add_showrunner.py` has one (`trusted`, `_project_keys`), which moves into the shared check. Risk: a launch the user expected now refuses until they trust the folder once.
-7. **Which trust keys count is measured first.** `docs/plans/build-followups-two-accounts.md:151` says worktrees inherit trust from `/home/natepiano`; the G1 live check (`docs/as-built/showrunner-automation.md`, nested showrunners phase 4) and the herdr trial ("Ruled out") say a trusted ancestor folder does not count. The trust phase surveys the account files read-only before it writes the rule. Risk: the survey may show the main-checkout rule is wrong too; the phase then stops and reports.
+6. **Trust is checked, never answered.** Every launcher refuses to start in a folder whose Claude trust is missing on the account that will run it, and prints the one command the user runs to grant it. The shared check is `herdr.claude_trust`, with `herdr.trust_command` for that command; `add_unit.py` calls both in `preflight`, `add_showrunner.py` in `checked`. Risk: a launch the user expected now refuses until they trust the folder once.
+7. **Which trust keys count is settled.** Only exact keys count: the folder, its `git rev-parse --show-toplevel` and its main checkout. An ancestor folder never counts. herdr-trust Phase 1 settled it with a read-only survey of the account files. Risk: none known.
 8. **Linux first; Mac last.** The Mac has no tmux and no systemd; its phase uses launchd and may move to its own plan. Risk: Mac standalones stay outside herdr until then.
 9. **earlyoom.** Each herdr server must be in earlyoom's `--avoid` list (`/etc/nixos/modules/linux/memory.nix`, the regex with `tmux: server`). That file is in the nixos repo, so the launcher phase names the edit for the user and is blocked until the rebuild. Risk: until then a herdr server is an ordinary earlyoom target.
 10. **No client window from launchers.** Launchers start only the herdr server, as a systemd user unit. The user attaches from any terminal, as with `tmux attach`. The trial's ghostty and kdotool client stays out. Risk: none; a window opener can be added later.
@@ -37,12 +37,12 @@ Evidence: `docs/as-built/herdr-trial.md` (findings 1–8, gotchas, reusable and 
 - **Stack:** Python 3 standard library, checked by basedpyright; zsh scripts; Markdown commands and docs; herdr 0.9.0 (`herdr --help`, `herdr --skill`); tmux; systemd user units.
 - **Layout:** `scripts/herdr/` (new library `herdr.py`, CLI `herdr_sessions.py`, test double `fake_herdr.py`) · `scripts/production/` (unit lookup, launchers, relays, status) · `scripts/message/roster.py` · `scripts/shutdown/` (inventory, stop, record, restart, settle) · `scripts/nightly_review/nightly_review.py` · `commands/showrunner/`, `commands/shutdown.md`, `commands/producer/to_production.md` · `docs/production_format.md` · `docs/as-built/`.
 - **Key files:**
-  - `scripts/herdr/herdr.py` — the library (Phase 1): `Herdr(session)` (`run` raises `HerdrFailure` on a non-zero exit or a 10 s timeout, `agent_blocked` as `AgentBlocked`; `panes`, `lookup`, `open_pane`, `start_agent`, `readiness`, `prompt`, `wait_until`, `read`, `send_keys`, `close_pane`, `agents`), module `live_sessions`, `server_unit`, `start_server`, `stop_session`, `open_pane`, `start_agent`, `herdr_place_of`, `herdr_processes`, `repository_trust_key` (runs git with `GIT_*` stripped), `trusted_by_claude`. `herdr_sessions.py` — `list`, `attach`. The trial driver is deleted; `git show a35b0312:scripts/herdr/trial.py` has it (`trusted_by_codex` 853, `pane_environment` 978, `native_arguments` 990).
+  - `scripts/herdr/herdr.py` — the library (Phase 1): `Herdr(session)` (`run` raises `HerdrFailure` on a non-zero exit or a 10 s timeout, `agent_blocked` as `AgentBlocked`; `panes`, `lookup`, `open_pane`, `start_agent`, `readiness`, `prompt`, `wait_until`, `read`, `send_keys`, `close_pane`, `agents`), module `live_sessions`, `server_unit`, `start_server`, `stop_session`, `open_pane`, `start_agent`, `herdr_place_of`, `herdr_processes`, `repository_trust_key` and `repository_root` (run git with `GIT_*` stripped), `claude_trust`, `trust_command`. `herdr_sessions.py` — `list`, `attach`. The trial driver is deleted; `git show a35b0312:scripts/herdr/trial.py` has it (`trusted_by_codex` 853, `pane_environment` 978, `native_arguments` 990).
   - `scripts/herdr/fake_herdr.py` — records argv to `FAKE_HERDR_LOG` as JSON lines, answers from `FAKE_HERDR_RESPONSES` keyed by space-joined argv (else `"default"`); fields `stdout`, `code`, `stderr`, `write_files`, `require_paths`, `remove_paths`; a list replays in order.
   - `scripts/production/unit_lookup.py` — `MarkedUnit(unit, pane, label, claude)` 59, `tmux_binary` 126, `tmux_sessions` 145, `_marks` 160, `_claudes` 169 (joins a Claude to a pane through the session record's `tmux` field), `_marked_sessions` 191, `every_marked_unit` 207, `marked_units` 225, `mark` 237, CLI `list|pane|mark` 245. Marks are `SHOWRUNNER_UNIT` (production slug) and `SHOWRUNNER_UNIT_ID` (unit).
   - `scripts/message/sessions.py` — `SessionRecord` 17 (`tmux` is empty outside tmux; `pid`, `sessionId`, `name`, `messagingSocketPath`, `updatedAt`), `read_session`, `live_session`.
   - `scripts/production/add_unit.py` — `tmux_live` 507, `preflight` 532, `prompt_for` 665, `launch_session` 701 (systemd-run scope + `tmux new-session -d -e` marks, `claude --model --effort [--resume] --remote-control <name> -n <name> --settings '{"disableAgentView": true}' <prompt>` with `account_prefix(selected)`), `launch_environment` 739, `launched_unit` 762, `wait_for_remote_control` 770 (polls `capture-pane` for `/remote-control is active`), `main` 800 (restore and kill-session 869–899, prints `tmux attach -t` 924, 929). `--tmux-session` is the restore flag `restart.py` passes.
-  - `scripts/production/add_showrunner.py` — `_project_keys` 53, `trusted` 66, `checked` 87, `launch` 120, `main` 160.
+  - `scripts/production/add_showrunner.py` — `claude_json` 57, `checked` 62, `account_for_launch` 113, `launch` 148, `main` 190.
   - `scripts/production/promote_showrunner.py` — capture 86, stop via send-keys and kill-session 147–160, messages 220–230.
   - `scripts/production/unit_effort.py` — `_tmux` 80, `verdict` 142, `send` 157, capture 171.
   - `scripts/production/stall_watch.py` — `TMUX` 28, capture of the last 400 joined lines 211.
@@ -85,7 +85,7 @@ Evidence: `docs/as-built/herdr-trial.md` (findings 1–8, gotchas, reusable and 
 - Session functions: `live_sessions() -> list[SessionEntry]` (running only); `server_unit(name)` is `herdr-<name>` with characters outside `[A-Za-z0-9_.-]` replaced by `-`; `start_server(name, timeout_ms)` returns when `status server` prints `status: running`, else starts `systemd-run --user --unit=<server_unit> --collect <herdr> --session <name> server` and polls to the deadline; `stop_session(name)` runs `server stop`, then `systemctl --user stop <server_unit>` when still active. `SYSTEMD_RUN` and `SYSTEMCTL` name those programs.
 - Module `open_pane(name, label, cwd, environment)` and `start_agent(name, pane, kind, argv, opening_prompt, timeout_ms)` mirror the `Herdr` methods; module `start_agent` uses the pane's label as the agent name.
 - `herdr_place_of(pid) -> HerdrPlace | NotInHerdr` reads `HERDR_PANE_ID` from the process environment and walks ancestors under `HERDR_PROC` (default `/proc`) to the herdr server. `herdr_processes() -> list[HerdrProcess]` lists the user's processes holding `HERDR_PANE_ID`, each with `pid`, `place`, `marks` (`SHOWRUNNER_UNIT`, `SHOWRUNNER_UNIT_ID` only), `command`, `cwd`; unreadable or vanished processes are skipped.
-- Trust lives here for every launcher: `repository_trust_key(directory)` and `trusted_by_claude(directory, claude_json)`.
+- Trust lives here for every launcher: `claude_trust(folder, claude_json) -> Trusted | Untrusted | UnreadableTrustFile`, `trust_command(folder, account: ClaudeLaunchAccount)`, `repository_root(directory)` and `repository_trust_key(directory)` (herdr-trust Phase 1 replaced `trusted_by_claude`).
 - Every timeout is integer milliseconds passed as an argument; the library reads no `HERDR_TRIAL_*` and no account variable — callers pass the pane environment.
 - `scripts/herdr/herdr_sessions.py`: `list` prints `<name>\t<role>\t<claude name>` per running session (role `unit <slug>/<unit>`, `showrunner` or `standalone`; claude name is the newest live session record `herdr_place_of` puts there); `attach <name>` execs `herdr session attach <name>` and refuses a name not running, listing the running ones. Exit 0 done, 1 not found, 2 usage, 3 herdr unreadable.
 
@@ -118,72 +118,63 @@ Evidence: `docs/as-built/herdr-trial.md` (findings 1–8, gotchas, reusable and 
 
 ### Phase 3 — Trust checked before every launch  · status: moved
 
-Moved to `docs/plans/build-followups-herdr-trust.md` (unit `herdr-trust-unit`), run in parallel with Phase 5. Phase 6 waits for it.
+Moved to unit `herdr-trust-unit`, run in parallel with Phase 5; shipped as `docs/as-built/herdr-adoption.md` → "Claude trust before every launch". Phase 7 waits for it.
 
 ### Phase 4 — Typing into and reading sessions on either host  · status: moved
 
-Moved to `docs/plans/build-followups-herdr-panes.md` (unit `herdr-panes-unit`), run in parallel with Phase 5. Phase 6 waits for it.
+Moved to unit `herdr-panes-unit`, run in parallel with Phase 5; shipped as `docs/as-built/herdr-adoption.md` → "Typing into and reading sessions on either host". Phase 7 waits for it.
 
-### Phase 5 — Shutdown and restart for herdr sessions  · status: todo
+### Phase 5 — Shutdown and restart for herdr sessions  · status: done
 
-**User sees:** before — `/shutdown` lists a herdr session but leaves it running and prints a manual restart line; after — `/shutdown` stops herdr sessions safely and `restart` brings each back in its own herdr session with its conversation, tmux sessions as before.
+#### As-built
 
-#### Work Order
-
-**Goal:** the shutdown conductor stops and restarts sessions hosted in herdr, units and others, with the same safety as tmux.
-
-**Spec:**
-
-1. `stop.py`: a unit in a herdr session is stopped as a tmux unit is (Claude exits first through the usual stop), then `herdr.stop_session(<session_name>)`; a session still running afterwards is the issue `unit session left running` with `host: "tmux" | "herdr"` and `session_name`. `record.py` parses the old kind `unit tmux session left running` with `tmux_session` as `host: "tmux"`.
-2. `restart.py`:
-   - A unit restart passes `--host-session <session_name>` to `add_unit.py` (`--tmux-session` is still accepted by `add_unit.py` until the tmux removal phase).
-   - New `_herdr_launch(command, session, *, dry_run)` for a `herdr` host: `start_server(name)`; when the recorded pane is gone or holds no agent, `open_pane(name, name, cwd, environment)` with the session's config dir variables; then `start_agent(..., kind="claude", argv=<resume argv without the prompt>, opening_prompt=<restart prompt>)`. A pane still holding a live agent is a refusal, as an occupied tmux pane is today.
-   - `case "herdr"` in the host dispatch calls it; the Phase 2 manual-restart stand-in is removed.
-3. `settle.py` issue text and `shutdown.py` host text cover the herdr forms. `commands/shutdown.md` line 33 names herdr sessions beside tmux sessions.
-4. Live check (not a test): a throwaway Claude in herdr session `herdr-stopcheck` in a trusted scratch folder; `shutdown.py down <account> --here --only herdr-stopcheck --restart`; it stops, comes back in `herdr-stopcheck` and answers a question about its earlier turn. Then stop the herdr server by hand (`herdr --session herdr-stopcheck server stop`), and confirm `claude --resume <id>` in a new herdr session restores the conversation without herdr's Claude integration. Stop and delete the session.
-5. Carried from Phase 2, once the showrunner says two-accounts Phase 14 landed (merge `origin/build-followups` first): `scripts/production/test_waiting.py` proves `waiting.py quota` reaches a herdr unit; `waiting.py` itself is not changed.
-
-**Decided by the showrunner, 2026-10-13: no herdr Claude integration.** Resume by session id works, and the install would write `~/.claude` settings and hooks. The record below keeps the reasoning.
-
-Actual problem:
-herdr offers `herdr integration install` for Claude, which would let herdr itself resume Claude after a server loss. It writes into `~/.claude/hooks/` and `settings.json`, which every session on the machine loads.
-
-What exists now:
-- Shutdown records keep each session's id, cwd, account and host; `restart.py` resumes from them.
-- The nixos agent-sessions snapshot keeps session ids for a reboot.
-- The integration is not installed (herdr trial finding 8).
-
-What should change:
-- Nothing installed. This phase's live check proves resume by session id after a server stop; if it fails, this decision comes back with the failure.
-
-Recommendation:
-Do not install the integration. Our own records already resume every session, and the install changes hooks and settings for every session on the machine.
+- `scripts/shutdown/stop.py`: `_stop_unit_session` branches on `session_host`. A tmux unit goes through `_stop_unit_tmux`; a herdr unit's session is stopped with `herdr.stop_session(<session_name>)` after its Claude exits, and judged stopped only when `herdr.live_sessions()` no longer lists it. A session still running is the issue `unit session left running {host: "tmux" | "herdr", session_name, cause}`; `now --only` retries its cleanup.
+- `scripts/shutdown/record.py`: `UnitSessionLeftRunning` holds that issue. The old kind `unit tmux session left running` with `tmux_session` (`UnitTmuxLeftRunning`) still parses and is read as `host: "tmux"`.
+- `scripts/shutdown/settle.py`: issue text `<host> session <name> left running: <cause>`.
+- `scripts/shutdown/restart.py`: `_resume_parts` returns `ResumeParts(cwd, environment, claude_arguments, opening_prompt, account)`, with `account` a `RetainResumeAccount(config_dir)` or `MoveResumeAccount(target)`; `claude_arguments` holds Claude's arguments only, never the `claude` binary or the prompt. `_resume_shell` renders the tmux and desktop shell string unchanged. `_herdr_launch(parts: ResumeParts, session: Session, *, dry_run: bool)` restarts a standalone herdr host: it checks trust with `herdr.trusted_by_claude`, starts the server, refuses a recorded pane that still holds a live agent, opens a pane with the account's config dir variables, and starts Claude with one opening prompt. It refuses a `MoveResumeAccount`. A herdr unit still restarts as a manual resume line (`ManualRestartRequired`); a unit restart passes `--host-session <session_name>` to `add_unit.py`.
+- `scripts/production/add_unit.py`: `--host-session`, with `--tmux-session` kept as its alias.
+- `commands/shutdown.md` names a herdr session left running; `docs/as-built/shutdown-and-restart.md` covers resume parts and the herdr resume.
+- No herdr Claude integration is installed: resume uses the session ids in shutdown records and the agent-sessions snapshot.
 
 **Files:**
-- `scripts/production/test_waiting.py` — quota reaches a herdr unit (carried from Phase 2).
-- `scripts/shutdown/stop.py` — herdr unit stop.
-- `scripts/shutdown/record.py` — generalized issue kind, old form parsed.
-- `scripts/shutdown/restart.py` — `_herdr_launch`, `--host-session`.
-- `scripts/shutdown/settle.py` — issue text.
-- `scripts/shutdown/shutdown.py` — host text.
-- `scripts/shutdown/test_stop.py` — herdr unit stop and leftover.
-- `scripts/shutdown/test_record.py` — old and new issue forms.
-- `scripts/shutdown/test_restart.py` — herdr host restart, occupied pane refused.
-- `scripts/shutdown/test_settle.py` — issue text.
-- `scripts/production/add_unit.py` — accept `--host-session` beside `--tmux-session`.
-- `scripts/production/test_add_unit.py` — the new flag.
-- `commands/shutdown.md` — herdr sessions named.
-- `docs/as-built/shutdown-and-restart.md` — herdr host.
+- `scripts/shutdown/stop.py`, `record.py`, `settle.py`, `restart.py` — herdr stop, issue kind, issue text, herdr restart; `test_stop.py`, `test_record.py`, `test_settle.py`, `test_restart.py`, `test_shutdown_status.py` — their tests.
+- `scripts/production/add_unit.py`, `test_add_unit.py` — `--host-session`.
+- `commands/shutdown.md`, `docs/as-built/shutdown-and-restart.md`.
 
-**Seats:** 2 writers (no test lane; `test` opens as impl); split stop and record against restart.
-- `impl` — `restart.py`, `add_unit.py` and their tests, `shutdown-and-restart.md`; hub: `scripts/shutdown/restart.py`.
-- `test` (opens as impl) — `stop.py`, `record.py`, `settle.py`, `shutdown.py`, `commands/shutdown.md` and their tests.
+**Binds later work:** `_herdr_launch` checks trust through `herdr.trusted_by_claude`, which herdr-trust replaced; the follow-up phase moves it to `claude_trust` and `trust_command`. The herdr unit manual-restart guard stays until `add_unit.py` launches herdr ("Units and child showrunners launch in herdr" removes it). Every herdr launcher builds from structured parts like `ResumeParts`, never a shell string. The stop and restart live check (`herdr-stopcheck`) is not yet run; it runs after the nixos rebuild, in "Units and child showrunners launch in herdr".
 
-**Constraints from prior phases:** `HerdrHost {kind: "herdr", herdr_session, pane_id}`; `UnitHost.session_name` (old key `tmux_session` still parsed) and `UnitHost.session_host: "tmux" | "herdr"` (absent in old records, read as `"tmux"`) — branch on `session_host`, never on the name; today a herdr unit's stop sends no tmux command and records no tmux issue, and its restart is a manual resume, both of which this phase replaces. `session_pane.py` and the `settle._screen` herdr read come from herdr-panes-unit (`docs/plans/build-followups-herdr-panes.md`), which lands before this phase's checkpoint: merge `origin/build-followups` before relying on them. `herdr.py` `start_server`, `open_pane`, `start_agent`, `stop_session`, `AgentNotReady`; `session_pane.py` reads and types on either host; `settle._screen` reads herdr hosts.
+**Gotchas:**
+- `herdr agent start --kind claude` adds the binary itself and treats everything after `--` as Claude's arguments: never pass an executable or a wrapper there.
+- A failed `herdr server stop` does not mean the session still runs; read `live_sessions()`.
+- An account move cannot enter herdr: `accounts.py exec` removes credentials and checks readiness, which pane environment variables cannot do.
 
-**Acceptance gate:** `python3 -m unittest discover` for `scripts/shutdown`, `scripts/production` and `scripts/herdr` green; `basedpyright scripts/shutdown scripts/production scripts/herdr` prints `0 errors, 0 warnings`. Tests cover a herdr unit stopped and its session stopped, a herdr session left running reported, restart into a gone pane and refusal on an occupied one, and old shutdown records parsing. The live check in Spec 4 passes.
+**Ruled out:** routing a herdr unit through `add_unit.py` before it can launch herdr — it would move the unit into tmux; installing herdr's Claude integration — it writes `~/.claude` hooks and settings that every session loads.
 
-### Phase 6 — Units and child showrunners launch in herdr  · status: todo
+### Phase 6 — Phase 5 follow-ups: quota reaches herdr units, real environment on the Mac, restart trust and timing  · status: done
+
+#### As-built
+
+- `scripts/herdr/herdr.py`: `Herdr.start_agent(name, pane, kind, agent_arguments, opening_prompt, timeout_ms)` and module `start_agent(name, pane, kind, agent_arguments, opening_prompt, timeout_ms)` take the agent's extra arguments only. `herdr agent start --kind <kind>` adds the binary itself, so both refuse with `ValueError` an `agent_arguments` whose first element equals the kind (`_check_agent_arguments`), before any herdr call or pane lookup.
+- `scripts/shutdown/inventory.py` `_process_environment` on Darwin reads the argv with `ps -o command= -p <pid>`, then `ps eww -o command= -p <pid>`, then the argv again. It parses only the `eww` text after the argv prefix, so argument text such as `TMUX_PANE=%41` in a prompt never counts as environment. A failed call, an argv that changed between the reads, an empty argv, `eww` output that does not start with the argv, or no whitespace after the prefix returns `{}`. Linux `/proc/<pid>/environ` is unchanged.
+- `scripts/shutdown/restart.py` `_herdr_launch` checks trust only through `herdr.claude_trust(folder, claude_json)`: `Untrusted` and `UnreadableTrustFile` raise `OSError` before `start_server` and any herdr call, with the reason followed by `Run: <herdr.trust_command(folder, account)>`. The account is `DefaultAccount()` when `CLAUDE_CONFIG_DIR` is `~/.claude` (trust file `~/.claude.json`), else `NamedAccount(str(config_dir), config_dir)`. An ancestor folder's trust never counts. It passes `agent_arguments=list(parts.claude_arguments)` to `start_agent`.
+- `scripts/production/waiting.py` is unchanged: `quota` reaches a herdr-marked unit with a live Claude record through `unit_lookup.marked_units` and `send.py --to <claude name>`.
+- `test_restart.py` `test_six_tmux_launches_run_at_once`: the fake launches meet at one `threading.Barrier(6, timeout=10)`, with no wall-clock bound; a broken barrier fails the test.
+
+**Files:**
+- `scripts/herdr/herdr.py`, `test_herdr.py` — `agent_arguments`, binary refused; one `claude` in the launched command.
+- `scripts/shutdown/inventory.py`, `test_inventory.py` — Darwin environment after the argv prefix.
+- `scripts/shutdown/restart.py`, `test_restart.py` — trust through `claude_trust` and `trust_command`, unreadable-file and ancestor-folder cases; six launches overlap.
+- `scripts/production/test_waiting.py` — `test_quota_reaches_a_live_herdr_unit_by_its_claude_name`.
+
+**Binds later work:** every herdr launcher passes `start_agent` Claude's arguments only, never the `claude` binary ("Units and child showrunners launch in herdr"); "Standalone sessions and the nightly review in herdr" replaces `opening_prompt` with `OpeningPrompt | NoOpeningPrompt` on this signature. "herdr on the Mac" moves the Darwin after-the-argv environment parse into `herdr.py`, with `inventory._process_environment` calling it.
+
+**Gotchas:**
+- herdr adds the agent binary itself; an `agent_arguments` starting with it would reach Claude as a stray first prompt.
+- A wall-clock bound on concurrent launches fails under machine load; prove overlap with a barrier.
+
+### Phase 7 — Units and child showrunners launch in herdr  · status: todo
+
+**Depends on:** Phase 6; the herdr-trust and herdr-panes units' phases landed on the production's merge branch (`docs/plans/build-followups-herdr-trust.md`, `docs/as-built/herdr-adoption.md` → "Typing into and reading sessions on either host"); two-accounts-unit's `prepared_account` (Spec 7) and its Phase 17 landed before Spec 6
 
 **Blocked by:** the user's nixos rebuild with herdr installed on natedev and herdr servers in earlyoom's `--avoid` list (Spec 1).
 
@@ -200,16 +191,26 @@ Do not install the integration. Our own records already resume every session, an
    - `/etc/nixos/modules/linux/memory.nix`: add the herdr server's process name to the `--avoid` regex beside `tmux: server`. Measure the name first with `ps -o comm= -p <server pid>` on a running herdr server.
    - Then `nixos-rebuild switch`. The phase starts when `command -v herdr` answers.
    - These `/etc/nixos` edits are the showrunner's. When Phase 5 checkpoints, the unit sends it the exact `--avoid` regex and the package attribute, and the showrunner has them ready for the user's rebuild before this phase starts.
-2. `add_unit.py` `launch_session` becomes herdr-only for new launches: `start_server(<session name>)`; `open_pane(<session name>, <session name>, session_cwd, environment)` where environment is the marks, `ENABLE_TOOL_SEARCH=true`, and `named_account_environment(dir)` for a named account (none for the default); `start_agent(..., kind="claude", argv=["--model", m, "--effort", e?, "--resume", id?, "--remote-control", name, "-n", name, "--settings", '{"disableAgentView": true}'], opening_prompt=prompt_for(request))`. `AgentNotReady` exits 1 with the screen text and sends nothing. The caller's `CLAUDE_*` variables never reach the pane (`launch_environment`).
+2. **Phase 5's live check, after the rebuild and before Specs 3–7 are installed** (not a test; it runs against the installed Phase 5 and 6 code):
+   - A throwaway Claude in herdr session `herdr-stopcheck` in a trusted scratch folder; `shutdown.py down <account> --here --only herdr-stopcheck --restart`; it stops, comes back in `herdr-stopcheck` and answers a question about its earlier turn. Stop the herdr server by hand (`herdr --session herdr-stopcheck server stop`) and confirm `claude --resume <id>` in a new herdr session restores the conversation without herdr's Claude integration.
+   - A scratch unit's Claude in its own herdr session (opened with `herdr.open_pane` carrying both marks, then `herdr.start_agent`): `shutdown.py down <account> --here --only <name> --restart` stops its session and prints the manual resume line with its session id, cwd and account.
+   - Stop and delete both sessions. A failure stops the phase and goes to the showrunner.
+3. `add_unit.py` `launch_session` becomes herdr-only for new launches: `start_server(<session name>)`; `open_pane(<session name>, <session name>, session_cwd, environment)` where environment is the marks, `ENABLE_TOOL_SEARCH=true`, and `named_account_environment(dir)` for a named account (none for the default); `start_agent(..., kind="claude", agent_arguments=["--model", m, "--effort", e?, "--resume", id?, "--remote-control", name, "-n", name, "--settings", '{"disableAgentView": true}'], opening_prompt=prompt_for(request))`. `agent_arguments` holds Claude arguments only; herdr adds the `claude` binary itself (Phase 6). `AgentNotReady` exits 1 with the screen text and sends nothing. The caller's `CLAUDE_*` variables never reach the pane (`launch_environment`).
    - Refusals: a running herdr session of that name not marked as this unit (as `tmux_live` today).
    - Restore of a marked unit with no live Claude: a herdr place is ended with `stop_session`, a tmux place with `kill-session` (existing), then relaunched in herdr under `--host-session`.
    - `wait_for_remote_control` keeps reading the pane through `read_place` for `/remote-control is active`.
    - Printed lines: `<unit> started: herdr session attach <name>` and `<unit> restore launched: herdr session attach <name>`.
-3. `add_showrunner.py` `launch`: the same herdr start with no marks and no account variables (the showrunner account); `tmux_live` becomes a check for a running herdr session of that name; printed lines and `later` text name `herdr session attach <slug>`.
-4. `promote_showrunner.py`: no launch code of its own; its printed lines name `herdr session attach`.
-5. `restart.py`: a `tmux` host whose session is a showrunner is relaunched through `_herdr_launch` into a herdr session of the same name, so a restart moves it; other tmux hosts respawn as before.
-6. Docs: `commands/showrunner/add_showrunner.md` restates the user's 2026-10-12 rule ("top level (L1) showrunners should make sure to use tmux to start lower level showrunners") as: an L1 showrunner starts lower showrunners with `add_showrunner.py`, which now opens each in its own herdr session; keep the quote and say the host changed with the user's 2026-10-13 move to herdr. Also `commands/showrunner/add_unit.md`, `promote_unit.md`, `units.md` (`gone` means no tmux or herdr session carries the mark), `produce.md` (lines 169–171, 325, 363, 1119), `commands/producer/to_production.md:104`, `docs/production_format.md:36,126`, and `production_lifecycle.py` line 482 (`close herdr or tmux sessions`).
-7. Live check (not a test): `add_unit.py` for a throwaway standby unit of a scratch production in a trusted scratch repository; it starts in herdr, `/remote-control is active` is read, `production_lifecycle.py load` lists it live, the roster files it under the scratch showrunner, `herdr session attach <name>` opens it, `/shutdown --only <name> --restart` brings it back. Remove the scratch unit and session afterwards.
+4. `add_showrunner.py` `launch`: the same herdr start with no marks; the selected account's variables (`named_account_environment(dir)` for a named or retained account, none for the default) and never the caller's `CLAUDE_*`; `tmux_live` becomes a check for a running herdr session of that name; printed lines and `later` text name `herdr session attach <slug>`.
+   - **Recorded account and model for a herdr place** (showrunner, 2026-10-13): store nothing new. A resume without `--account` of a herdr place asks `accounts.py` for its role's account (`role_account("showrunner")` for a showrunner, `role_account("unit")` for a unit; the group account once two-accounts' group phase lands). The model is read from the session's transcript (the model on its last assistant message), falling back to the director config's model. The tmux `@claude_config_dir`/`@claude_model` readers stay as they are for tmux places.
+5. `promote_showrunner.py`: no launch code of its own; its printed lines name `herdr session attach`.
+6. `restart.py`:
+   - `_herdr_launch(parts, destination, session, *, dry_run)` takes `destination: NewHerdrSession(name) | RecordedHerdrPane(name, pane_id)` (frozen dataclasses) in place of reading `session["host"]`. A `HerdrHost` maps to `RecordedHerdrPane` (today's path: a pane holding a live agent is a refusal, a gone or agentless pane is replaced). `NewHerdrSession` starts the server and opens a pane; a running herdr session of that name holding a live agent is a refusal before any pane opens or agent starts. No empty pane id and no `None` stands for a new session.
+   - A `tmux` host whose session is a showrunner restarts through `_herdr_launch(parts, NewHerdrSession(<tmux session name>), ...)`, so a restart moves it into herdr; the record keeps its `TmuxHost`, so the cleanup of the old tmux session works from the original host. Other tmux hosts respawn as before.
+   - A unit whose `session_host` is `herdr` restarts through `add_unit.py --host-session <session_name>` like a tmux unit; remove the manual-restart guard (1003; before this phase `add_unit.py` launches only tmux, so routing a herdr unit there would move it into tmux).
+   - An account move into a herdr host: remove the `MoveResumeAccount` refusal (957). `_herdr_launch` takes the pane environment from `accounts.prepared_account(target, resume=True)` (Spec 7); `AccountRefused` raises `OSError` with its reason before `start_server`; the Claude argv stays Claude arguments only (no `accounts.py exec` wrapper).
+7. **Moved to two-accounts-unit** (showrunner, 2026-10-13: `accounts.py` is that unit's file and API). It builds `accounts.prepared_account(label, *, resume: bool) -> PreparedAccount | AccountRefused` beside its Phase 17, with `exec_account` behavior unchanged. `PreparedAccount` holds the variables to set and the names to remove (`CLAUDE_CODE_OAUTH_TOKEN` always; the named-account variables for the default and the default-login alias); `AccountRefused` carries exec_account's refusal text. Spec 6 consumes it once it lands. The herdr path sets the variables through `open_pane`'s environment and never passes a removed name: the server runs under the systemd user manager (`systemd-run --user`), which receives no caller environment.
+8. Docs: `commands/showrunner/add_showrunner.md` restates the user's 2026-10-12 rule ("top level (L1) showrunners should make sure to use tmux to start lower level showrunners") as: an L1 showrunner starts lower showrunners with `add_showrunner.py`, which now opens each in its own herdr session; keep the quote and say the host changed with the user's 2026-10-13 move to herdr. Also `commands/showrunner/add_unit.md`, `promote_unit.md`, `units.md` (`gone` means no tmux or herdr session carries the mark), `produce.md` (lines 169–171, 325, 363, 1119), `commands/producer/to_production.md:104`, `docs/production_format.md:36,126`, and `production_lifecycle.py` line 482 (`close herdr or tmux sessions`).
+9. Live check (not a test): `add_unit.py` for a throwaway standby unit of a scratch production in a trusted scratch repository; it starts in herdr, `/remote-control is active` is read, `production_lifecycle.py load` lists it live, the roster files it under the scratch showrunner, `herdr session attach <name>` opens it, `/shutdown --only <name> --restart` brings it back. Remove the scratch unit and session afterwards.
 
 **Files:**
 - `scripts/production/add_unit.py` — herdr launch and restore.
@@ -220,8 +221,8 @@ Do not install the integration. Our own records already resume every session, an
 - `scripts/production/test_promote_showrunner.py` — printed lines.
 - `scripts/production/production_lifecycle.py` — wrap text.
 - `scripts/production/test_production_lifecycle.py` — wrap text.
-- `scripts/shutdown/restart.py` — tmux showrunner restarts into herdr.
-- `scripts/shutdown/test_restart.py` — that case.
+- `scripts/shutdown/restart.py` — destination types, tmux showrunner migration, herdr unit through `add_unit.py`, account move into herdr.
+- `scripts/shutdown/test_restart.py` — those cases.
 - `commands/showrunner/add_showrunner.md` — herdr, with the user's rule restated.
 - `commands/showrunner/add_unit.md` — herdr attach line.
 - `commands/showrunner/promote_unit.md` — herdr attach line.
@@ -230,15 +231,15 @@ Do not install the integration. Our own records already resume every session, an
 - `commands/producer/to_production.md` — line 104.
 - `docs/production_format.md` — lines 36 and 126.
 
-**Seats:** 2 writers (no test lane; `test` opens as impl); split unit launch against showrunner launch, restart and docs.
-- `impl` — `add_unit.py`, `test_add_unit.py`, `production_lifecycle.py`, `test_production_lifecycle.py`; hub: `scripts/production/add_unit.py` (`launch_environment` and `Refusal` are imported by `add_showrunner.py`).
-- `test` (opens as impl) — `add_showrunner.py`, `promote_showrunner.py`, `restart.py` and their tests, and the seven docs.
+**Seats:** 2 writers (no test lane; `test` opens as impl). Early start (showrunner, 2026-10-13), before herdr-panes, two-accounts Phase 17 and the rebuild land: `impl` — `production_lifecycle.py` and its test, and the docs outside herdr-panes' files (`add_showrunner.md`, `add_unit.md`, `units.md`, `to_production.md`, `production_format.md`); `test` — `add_showrunner.py` and its test (Spec 4). After those land: `impl` — `add_unit.py`, `test_add_unit.py`, `produce.md`, `promote_unit.md` (Spec 3 and the rest of Spec 8; hub: `add_unit.py`, whose `launch_environment` and `Refusal` `add_showrunner.py` imports); `test` — `promote_showrunner.py`, `restart.py` and their tests (Specs 5 and 6).
 
-**Constraints from prior phases:** trust is checked in `preflight` and `add_showrunner.checked` through `herdr.claude_trust`; `session_pane.py` and `read_place` read either host; `MarkedUnit.place` replaced `pane`; `restart.py` has `_herdr_launch` and passes `--host-session`, which `add_unit.py` accepts beside `--tmux-session`; `herdr.py` `start_server`, `open_pane`, `start_agent`, `stop_session`, `live_sessions`.
+**Constraints from prior phases:** trust is checked in `preflight` and `add_showrunner.checked` through `herdr.claude_trust(folder, claude_json) -> Trusted | Untrusted | UnreadableTrustFile` and `herdr.trust_command(folder, account: ClaudeLaunchAccount)`; `session_pane.py` and `read_place` read either host; `MarkedUnit.place` replaced `pane`; `restart.py` passes `--host-session`, which `add_unit.py` accepts beside `--tmux-session`. `restart.py`: `_herdr_launch(parts: ResumeParts, session: Session, *, dry_run: bool)` (952) takes `ResumeParts(cwd, environment, claude_arguments, opening_prompt, account: RetainResumeAccount | MoveResumeAccount)` (474–521), never a shell string, and raises `ValueError` for any host but a `HerdrHost`; it refuses `MoveResumeAccount` (957) and checks trust through `claude_trust` before `start_server` (Phase 6); a herdr unit's restart is a manual resume line (1003) until Spec 6 here. `herdr.start_agent(name, pane, kind, agent_arguments, opening_prompt, timeout_ms)` takes the agent's extra arguments only and refuses the binary as first element (Phase 6). `accounts.exec_account` (1003) pops `CLAUDE_CODE_OAUTH_TOKEN` and handles readiness and the default-login alias. `herdr.py` `start_server`, `open_pane`, `start_agent`, `stop_session`, `live_sessions`.
 
-**Acceptance gate:** `python3 -m unittest discover` for `scripts/production`, `scripts/shutdown` and `scripts/herdr` green; `basedpyright scripts/production scripts/shutdown scripts/herdr` prints `0 errors, 0 warnings`. Tests show the herdr argv carries no prompt, the opening prompt goes once through `agent prompt`, the pane environment holds both marks and the account variables and no `CLAUDE_*` from the caller, and `AgentNotReady` sends nothing. The live check in Spec 7 passes.
+**Acceptance gate:** `python3 -m unittest discover` for `scripts/production`, `scripts/shutdown` and `scripts/herdr` green; `basedpyright scripts/production scripts/shutdown scripts/herdr` prints `0 errors, 0 warnings`. Tests show the herdr argv carries no prompt, the opening prompt goes once through `agent prompt`, the pane environment holds both marks and the account variables and no `CLAUDE_*` from the caller, and `AgentNotReady` sends nothing; a tmux showrunner migrates into a new herdr session with its `TmuxHost` kept, and an occupied destination is refused before any agent starts; an account move into herdr carries the target's variables and no `CLAUDE_CODE_OAUTH_TOKEN`, drops the named variables for a default-login alias, and refuses an account not set up or logged out before `start_server`, with Claude-only argv. The live checks in Specs 2 and 9 pass.
 
-### Phase 7 — Standalone sessions and the nightly review in herdr  · status: todo
+### Phase 8 — Standalone sessions and the nightly review in herdr  · status: todo
+
+**Depends on:** Phase 7
 
 **User sees:** before — a standalone `claude` runs straight in a ghostty window, and the nightly review runs in tmux; after — `herdr-claude [name]` opens a standalone Claude in its own herdr session in the current terminal, `continue` does the same with `--continue`, a restart brings a ghostty standalone back in herdr in a ghostty window attached to it, and the nightly review runs in herdr session `nightly-review`.
 
@@ -248,37 +249,54 @@ Do not install the integration. Our own records already resume every session, an
 
 **Spec:**
 
-1. `herdr_sessions.py` gains:
-   - `start [--name N] [--cwd D] [-- <claude args>]`: name defaults to the cwd's basename plus a short suffix when taken; refuses an untrusted folder (`claude_trust`, the account from `CLAUDE_CONFIG_DIR` or the default); `start_server`, `open_pane`, `start_agent(kind="claude", argv=[*claude args, "-n", name])` with no opening prompt (the user types); then execs `herdr session attach <name>`.
-   - `resume <name> --session-id <id> --cwd <dir> [--config-dir <dir>]`: the same with `--resume <id>`, for the agent-sessions restore and by hand; no attach unless `--attach`.
-2. `restart.py`: a `ghostty`, `zed` or `terminal` host restarts through `herdr_sessions.py resume <name> ...` and then opens one ghostty window running `herdr session attach <name>` on the recorded desktop (the existing window opener with the new command).
-3. `nightly_review.py`: the session runs in herdr session `nightly-review` (`start_server`, `open_pane`, `start_agent` with the `/nightly_review config rust` opening prompt); its has-session, attached-client and kill checks use `live_sessions()`, `agents()` and `stop_session`. Printed lines name `herdr session attach nightly-review`. `commands/nightly_review.md` names the same.
-4. **Outside this repo (the showrunner's, in `/etc/nixos`):** `nightly-review.nix` drops tmux from its path; `agent-sessions-snapshot.py` and `agent-sessions-restore.py` drop their tmux branches. **The tmux package stays installed, and `tmux: server` stays in earlyoom's `--avoid`:** this phase removes tmux only from our scripts and launches, and the user may still use tmux by hand.
+1. `herdr.py`:
+   - `start_agent` (method and module; `agent_arguments` from Phase 6) takes `opening: OpeningPrompt | NoOpeningPrompt` (frozen dataclasses; `OpeningPrompt(text)`) in place of `opening_prompt: str`. `NoOpeningPrompt` sends no `agent prompt` and no keys; today the method calls `self.prompt(pane, opening_prompt)` unconditionally (307). Every caller passes one: `add_unit.py`, `add_showrunner.py`, `restart.py` `_herdr_launch` pass `OpeningPrompt`.
+   - Session names map one-to-one to systemd units: today `server_unit` (417) maps every character outside `[A-Za-z0-9_.-]` to `-`, so `a b` and `a-b` share `herdr-a-b`. `server_unit`, `start_server` and `stop_session` refuse a name outside `[A-Za-z0-9_.-]+` with `ValueError` naming the allowed set; `server_unit` is then `herdr-<name>`.
+   - `attached_clients(name) -> ClientsAttached(count) | NoClientAttached | ClientsUnreadable(detail)`: the user's processes under `HERDR_PROC` whose argv is a herdr client of that session (`herdr session attach <name>`, or herdr global options with `--session <name>` and no trailing `server`). An unreadable `/proc` is `ClientsUnreadable`.
+   - `herdr_processes()` marks gain `NIGHTLY_REVIEW` beside `SHOWRUNNER_UNIT` and `SHOWRUNNER_UNIT_ID` (552).
+2. `herdr_sessions.py` gains:
+   - `start [--name N] [--cwd D] [-- <claude args>]`: name defaults to the cwd's basename with each character outside `[A-Za-z0-9_.-]` replaced by `-`, plus a short suffix when taken; an explicit name outside that set is refused. Refuses an untrusted folder (`claude_trust`, printing `trust_command`; the account from `CLAUDE_CONFIG_DIR` or the default). Admission as Spec 3, as new work. `start_server`, `open_pane`, `start_agent(kind="claude", agent_arguments=[*claude args, "-n", name], opening=NoOpeningPrompt())` (the user types); then execs `herdr session attach <name>`.
+   - `resume <name> --session-id <id> --cwd <dir> [--config-dir <dir>] [--restore] [--prompt-file <path>] [--attach] [-- <claude args>]`: the same with `--resume <id>` and the passed Claude arguments (model, settings, Remote Control), for the agent-sessions restore and by hand. `--prompt-file` is read once and sent as `OpeningPrompt` (multiline text goes through `agent prompt`, never the start argv); without it, `NoOpeningPrompt`. `--restore` makes the admission a restore of that recorded session. No attach unless `--attach`.
+3. Admission for `start` and `resume`, before any server starts, as unit and nightly launchers do: hold `launch_barrier()` and ask `launch_permission(environment, purpose)` (`scripts/shutdown/launch_permission.py`) with the selected account's environment. New work passes `NewWorkLaunchPurpose()`; `resume --restore` passes `ShutdownUnitRestoreLaunchPurpose(<session id>)` (`shutdown.py launch_blocked` 246 permits the restore of any stopped recorded session while the account is held). `BlockedByShutdown` and `ShutdownStateUnreadable` exit 1 with the reason; a barrier `OSError` is unreadable state.
+4. `restart.py`:
+   - A `ghostty` or `zed` host restarts into herdr in-process: `_herdr_launch(parts, NewHerdrSession(<herdr name>), ...)` with the full `ResumeParts` (recorded model, settings, Remote Control arguments, account), its opening prompt as `OpeningPrompt`, delivered once, and `_record_scheduled_restart_prompt` called once. The herdr name is the Claude session name with each character outside `[A-Za-z0-9_.-]` replaced by `-`; a running herdr session of that name is an occupied destination and a refusal. Then one ghostty window runs `herdr session attach <name>` on the recorded desktop (the existing window opener with the new command).
+   - A `herdr` host (a standalone started by `start`) reopens a window when it had one: `HerdrHost` gains `presentation: "attached window" | "detached"`, recorded at inventory time from `attached_clients` (`ClientsUnreadable` and old records read as `"detached"`). On restart an `"attached window"` host gets one ghostty window running `herdr session attach <name>`; a `"detached"` host prints `herdr session attach <name>`. Today the herdr branch (1023–1025) returns without a window.
+   - The Mac `terminal` host is unchanged in this phase and the next; it moves in the Mac phase.
+5. `nightly_review.py`: the session runs in herdr session `nightly-review` (`start_server`, `open_pane` with the mark `NIGHTLY_REVIEW=1`, `start_agent` with `OpeningPrompt(PROMPT)`; `PROMPT` stays `/nightly_review config rust messages`). `retire` keeps both protections through explicit observations: `attached_clients(name)` (`ClientsAttached` leaves it running with the attached text) and ownership (a process in that session carries `NIGHTLY_REVIEW`, from `herdr_processes()`; none leaves it running with the foreign text). Any unreadable observation (`ClientsUnreadable`, `HerdrFailure`) leaves the session running with a line naming the failure. Only then `stop_session`. Admission (`launch_barrier`, `launch_permission`) is unchanged. `running` uses `live_sessions()`. Printed lines name `herdr session attach nightly-review`. `commands/nightly_review.md` names the same.
+6. **Outside this repo (the showrunner's, in `/etc/nixos`; no seat makes these):**
    - `/etc/nixos/modules/common/shell.nix`: `herdr-claude() { ~/.claude/scripts/lib/py ~/.claude/scripts/herdr/herdr_sessions.py start "$@"; }` and `alias continue='herdr-claude -- --continue'` inside the existing `CLAUDECODE` guard.
    - `/etc/nixos/modules/linux/nightly-review.nix`: herdr in the path beside tmux, comments naming `herdr session attach nightly-review`.
-   - `/etc/nixos/modules/linux/agent-sessions-snapshot.py` and `agent-sessions-restore.py`: a Claude whose ancestry ends at a herdr server is recorded with its herdr session name, and restored with `herdr_sessions.py resume <name> --session-id <id> --cwd <dir> [--config-dir <dir>]` plus a ghostty window running `herdr session attach <name>`.
+   - `/etc/nixos/modules/linux/agent-sessions-snapshot.py` and `agent-sessions-restore.py`: keep their tmux branches (live tmux sessions remain until the tmux removal phase); add a herdr branch: a Claude whose ancestry ends at a herdr server is recorded with its herdr session name, and restored with `herdr_sessions.py resume <name> --session-id <id> --cwd <dir> [--config-dir <dir>] --restore` plus a ghostty window running `herdr session attach <name>`.
 
 **Files:**
-- `scripts/herdr/herdr_sessions.py` — `start`, `resume`.
-- `scripts/herdr/test_herdr_sessions.py` — both verbs, trust refusal, name collision.
-- `scripts/shutdown/restart.py` — window hosts restart into herdr.
-- `scripts/shutdown/test_restart.py` — window host case.
+- `scripts/herdr/herdr.py` — `OpeningPrompt | NoOpeningPrompt`, name validation, `attached_clients`, `NIGHTLY_REVIEW` mark.
+- `scripts/herdr/test_herdr.py` — promptless start logs no prompt or keys; `a b` refused, starting or stopping `a-b` touches only `herdr-a-b`; client observation.
+- `scripts/herdr/herdr_sessions.py` — `start`, `resume`, admission.
+- `scripts/herdr/test_herdr_sessions.py` — both verbs, trust refusal, name collision and invalid names, held account, unreadable shutdown state, permitted restore, all before any server starts; multiline `--prompt-file` sent once.
+- `scripts/production/add_unit.py` — passes `OpeningPrompt`.
+- `scripts/production/add_showrunner.py` — passes `OpeningPrompt`.
+- `scripts/shutdown/restart.py` — window hosts restart into herdr; herdr host presentation.
+- `scripts/shutdown/test_restart.py` — window host with a recorded model and a multiline prompt; attached and detached herdr hosts.
+- `scripts/shutdown/inventory.py` — `HerdrHost.presentation`.
+- `scripts/shutdown/test_inventory.py` — presentation recorded and old records parsed.
 - `scripts/nightly_review/nightly_review.py` — herdr session.
-- `scripts/nightly_review/test_nightly_review.py` — herdr cases.
+- `scripts/nightly_review/test_nightly_review.py` — herdr cases, attached, foreign and unreadable observations.
 - `commands/nightly_review.md` — attach line.
-- `docs/as-built/shutdown-and-restart.md` — window hosts restart into herdr.
+- `docs/as-built/shutdown-and-restart.md` — window and herdr hosts restart into herdr.
 
-**Seats:** 2 writers (no test lane; `test` opens as impl); split standalone and restart against the nightly review.
-- `impl` — `herdr_sessions.py`, `restart.py`, their tests and `shutdown-and-restart.md`; hub: `scripts/herdr/herdr_sessions.py`.
-- `test` (opens as impl) — `nightly_review.py`, its test, `commands/nightly_review.md`.
+**Seats:** 2 writers (no test lane; `test` opens as impl); split the library, standalone CLI and nightly review against restart and inventory.
+- `impl` — `herdr.py`, `test_herdr.py`, `herdr_sessions.py`, `test_herdr_sessions.py`, the `add_unit.py` and `add_showrunner.py` call sites, `nightly_review.py`, `test_nightly_review.py`, `commands/nightly_review.md`; hub: `scripts/herdr/herdr.py` (every caller imports the new types).
+- `test` (opens as impl) — `restart.py`, `test_restart.py`, `inventory.py`, `test_inventory.py`, `shutdown-and-restart.md`.
 
-**Constraints from prior phases:** herdr is on PATH on natedev; launchers start in herdr; `restart.py` has `_herdr_launch`; `herdr.claude_trust` and `trust_command`; `herdr_sessions.py list` and `attach` exist.
+**Constraints from prior phases:** herdr is on PATH on natedev; launchers start in herdr; `restart.py` `_herdr_launch(parts, destination: NewHerdrSession | RecordedHerdrPane, session, *, dry_run)` with `ResumeParts(cwd, environment, claude_arguments, opening_prompt, account)`; trust through `herdr.claude_trust` and `trust_command`; `herdr_sessions.py list` and `attach` exist. `launch_permission.py`: `launch_barrier`, `launch_permission`, `NewWorkLaunchPurpose`, `ShutdownUnitRestoreLaunchPurpose(session_id)`, outcomes `AllowedByShutdownState | BlockedByShutdown | ShutdownStateUnreadable`. `nightly_review.retire` (276) today leaves a session running when a client is attached or no `/nightly_review` started it.
 
-**Acceptance gate:** `python3 -m unittest discover` for `scripts/herdr`, `scripts/shutdown` and `scripts/nightly_review` green; `basedpyright scripts/herdr scripts/shutdown scripts/nightly_review` prints `0 errors, 0 warnings`. Live (not a test): `herdr_sessions.py start --name herdr-standalone-check` in a trusted folder opens an attached Claude; `/shutdown --only herdr-standalone-check --restart` brings it back in a ghostty window attached to its herdr session; `nightly_review.py launch --dry-run` (or its check mode) names the herdr session. Remove the check session afterwards.
+**Acceptance gate:** `python3 -m unittest discover` for `scripts/herdr`, `scripts/production`, `scripts/shutdown` and `scripts/nightly_review` green; `basedpyright scripts/herdr scripts/production scripts/shutdown scripts/nightly_review` prints `0 errors, 0 warnings`. Live (not a test): `herdr_sessions.py start --name herdr-standalone-check` in a trusted folder opens an attached Claude; `/shutdown --only herdr-standalone-check --restart` brings it back in a ghostty window attached to its herdr session; `nightly_review.py launch --dry-run` (or its check mode) names the herdr session. Remove the check session afterwards.
 
-### Phase 8 — Remove tmux from productions and sessions on Linux  · status: todo
+### Phase 9 — Remove tmux from productions and sessions on Linux  · status: todo
 
-**Blocked by:** no live session on natedev runs in tmux (`unit_lookup.py` and the shutdown inventory find no tmux host).
+**Depends on:** Phase 7, Phase 8
+
+**Blocked by:** `shutdown.py tmux-free` (Spec 1) exits 0 on natedev: tmux answers and lists no session, every herdr source answers, and every account's inventory is complete with no session on a tmux or unknown host. `unit_lookup.every_marked_unit` alone is no proof: it returns partial results when one host answers (253–272).
 
 **User sees:** before — some sessions may still run in tmux and every tool carries two hosts; after — every showrunner, unit, standalone and the nightly review runs in herdr, `tmux` appears in no production command, and the docs name only herdr.
 
@@ -288,10 +306,12 @@ Do not install the integration. Our own records already resume every session, an
 
 **Spec:**
 
-1. Remove: `unit_lookup.py` tmux source (`tmux_binary`, `_tmux`, `tmux_sessions`, `_marks`, `mark`, the CLI `mark`, `TmuxPlace`); `tmux_names.py` and its test, its registration in `update_registration.py` and its sender name in `conversation_pause.py`; `adopt.py` and its test; `fake_tmux.py`; tmux branches in `session_pane.py`, `add_unit.py` (`tmux_live`, `kill-session`, `--tmux-session`), `add_showrunner.py`, `promote_showrunner.py`, `unit_effort.py`, `stall_watch.py`, `settle.py`, `stop.py`, `restart.py` (`_tmux_launch`, pane state, `TmuxHost` restart), `inventory.py` (`TmuxHost` and its types), `record.py`, `shutdown.py`, `roster.py`. `record.py` keeps reading an old record with a tmux host as a manual restart.
-2. A `notifier.sh remove tmux-names` for each production registered with it is printed for the showrunners in the phase report; nothing removes another production's instance from a seat.
-3. Docs: remove every remaining tmux line from `commands/showrunner/*.md`, `commands/shutdown.md`, `docs/production_format.md`; update as-builts `showrunner-automation`, `session-roster`, `shutdown-and-restart`, `session-notifier`, `agent-registry`, `build-followups-fn-length-hook` where they describe tmux hosts.
-4. **Outside this repo (the showrunner's, in `/etc/nixos`):** `nightly-review.nix` drops tmux from its path; `agent-sessions-snapshot.py` and `agent-sessions-restore.py` drop their tmux branches. **The tmux package stays installed, and `tmux: server` stays in earlyoom's `--avoid`:** this phase removes tmux only from our scripts and launches, and the user may still use tmux by hand. `/etc/nixos/modules/linux/memory.nix` drops `tmux: server` from `--avoid`; `nightly-review.nix` drops tmux from its path; `agent-sessions-snapshot.py` and `agent-sessions-restore.py` drop their tmux branches. Whether tmux stays installed for the user's own use is the user's choice.
+1. Removal gate, built first: `shutdown.py tmux-free` exits 0 only when each observation is positively readable and empty: `tmux list-sessions` exits 0 with no rows, or reports no server running; `herdr.live_sessions()` answers; the inventory of every configured Claude account answers in full, with no session whose host is `tmux` or `unknown` (an unattributed session). Any unreadable source, tmux session or unattributed session exits 1 and prints it. Run it on natedev before Spec 3; a non-zero exit stops the phase with its output. The phase report quotes its passing output. It goes with the rest of the tmux code in Spec 3.
+2. Legacy records, before removal: `UnitHost` records with no `session_host` (read as tmux) and `TmuxHost` hosts parse into `LegacyTmuxHost {kind: "legacy tmux", session_name}`; `UnitSessionLeftRunning(host="tmux")` and the old `unit tmux session left running` kind parse into `LegacyTmuxSessionLeftRunning {session_name, cause}`. Neither name is ever used as a herdr destination. `status` and `now` show both with the manual command (`tmux kill-session -t =<name>` for a leftover, the resume command for a host). Restart turns a `LegacyTmuxHost` entry into `ManualRestartRequired` with its resume command; a leftover whose cause is `stop not confirmed` stays in the record as unresolved cleanup (`_unfinished_cleanup`, `restart.py` 1561, reports it and does not clear it), so the entry becomes a manual restart naming both commands.
+3. Remove: `unit_lookup.py` tmux source (`tmux_binary`, `_tmux`, `tmux_sessions`, `_marks`, `mark`, the CLI `mark`, `TmuxPlace`); `tmux_names.py` and its test, its registration in `update_registration.py` and its sender name in `conversation_pause.py`; `adopt.py` and its test; `fake_tmux.py`; tmux branches in `session_pane.py`, `add_unit.py` (`tmux_live`, `kill-session`, `--tmux-session`), `add_showrunner.py`, `promote_showrunner.py`, `unit_effort.py`, `stall_watch.py`, `settle.py`, `stop.py`, `restart.py` (`_tmux_launch`, pane state, `TmuxHost` restart), `inventory.py` (`TmuxHost` and its types), `record.py`, `shutdown.py` (with `tmux-free`), `roster.py`.
+4. A `notifier.sh remove tmux-names` for each production registered with it is printed for the showrunners in the phase report; nothing removes another production's instance from a seat.
+5. Docs: remove every remaining tmux line from `commands/showrunner/*.md`, `commands/shutdown.md`, `docs/production_format.md`; update as-builts `showrunner-automation`, `session-roster`, `shutdown-and-restart`, `session-notifier`, `agent-registry`, `build-followups-fn-length-hook` where they describe tmux hosts.
+6. **Outside this repo (the showrunner's, in `/etc/nixos`; no seat makes these):** `nightly-review.nix` drops tmux from its path; `agent-sessions-snapshot.py` and `agent-sessions-restore.py` drop their tmux branches. The tmux package stays installed and `tmux: server` stays in earlyoom's `--avoid` (the showrunner's call): this phase removes tmux only from our scripts and launches, and the user may still use tmux by hand.
 
 **Decided by the showrunner, 2026-10-13: move the running tmux sessions at their next idle point, showrunners first.** The showrunner tells each owning showrunner before its sessions move. The record below keeps the reasoning.
 
@@ -299,7 +319,7 @@ Actual problem:
 This phase cannot start while any session runs in tmux. Some units are long-running (for example screenshot-unit) and might keep tmux alive for weeks.
 
 What exists now:
-- After Phase 6, `/shutdown down <account> --only <names> --restart` stops a session safely and brings it back in herdr with its conversation (units through `add_unit.py`, showrunners through `_herdr_launch`).
+- After Phase 7, `/shutdown down <account> --only <names> --restart` stops a session safely and brings it back in herdr with its conversation (units through `add_unit.py`, showrunners through `_herdr_launch`).
 - Each such restart interrupts that session for about a minute.
 
 What should change:
@@ -338,17 +358,19 @@ Move them at their next idle points rather than waiting for productions to end, 
 - `scripts/production/test_waiting.py` — follows.
 - `scripts/production/test_production_lifecycle.py` — follows.
 - `scripts/production/test_unit_status.py` — follows.
-- `scripts/shutdown/inventory.py` — `TmuxHost` removed.
+- `scripts/shutdown/inventory.py` — `TmuxHost` removed; `LegacyTmuxHost` parsed.
 - `scripts/shutdown/stop.py` — herdr only.
-- `scripts/shutdown/record.py` — old tmux records read as manual restart.
-- `scripts/shutdown/restart.py` — `_tmux_launch` removed.
+- `scripts/shutdown/record.py` — legacy hosts and leftovers parsed into manual-recovery states.
+- `scripts/shutdown/restart.py` — `_tmux_launch` removed; legacy entries become manual restarts.
 - `scripts/shutdown/settle.py` — herdr only.
-- `scripts/shutdown/shutdown.py` — host text.
+- `scripts/shutdown/shutdown.py` — `tmux-free`, then host text; legacy states in `status` and `now`.
 - `scripts/shutdown/test_inventory.py` — follows.
 - `scripts/shutdown/test_stop.py` — follows.
-- `scripts/shutdown/test_record.py` — follows.
-- `scripts/shutdown/test_restart.py` — follows.
+- `scripts/shutdown/test_record.py` — legacy parsing.
+- `scripts/shutdown/test_restart.py` — legacy restart.
 - `scripts/shutdown/test_settle.py` — follows.
+- `scripts/shutdown/test_shutdown_cli.py` — `tmux-free` blocks on an unreadable source and an unattributed session.
+- `scripts/shutdown/test_shutdown_status.py` — legacy states in `status` and `now`.
 - `scripts/message/roster.py` — herdr only.
 - `scripts/message/test_roster.py` — follows.
 - `scripts/message/test_top_level.py` — follows.
@@ -367,17 +389,19 @@ Move them at their next idle points rather than waiting for productions to end, 
 
 **Seats:** 2 writers (no test lane; `test` opens as impl); split `scripts/production` and `scripts/hooks` against `scripts/shutdown`, `scripts/message`, `scripts/nightly_review` and the docs.
 - `impl` — every `scripts/production/` and `scripts/hooks/` file above; hub: `scripts/production/unit_lookup.py`.
-- `test` (opens as impl) — every `scripts/shutdown/`, `scripts/message/`, `scripts/nightly_review/` file, the commands and the docs.
+- `test` (opens as impl) — every `scripts/shutdown/`, `scripts/message/`, `scripts/nightly_review/` file, the commands and the docs; hub: `scripts/shutdown/record.py` (the legacy types every shutdown file reads).
 
-**Constraints from prior phases:** every launcher starts in herdr; `session_pane.py`, `stop.py`, `restart.py` and `settle.py` handle `HerdrHost`; `restart.py` moves tmux showrunners and window standalones into herdr; `herdr_sessions.py` has `list`, `attach`, `start`, `resume`.
+**Constraints from prior phases:** every launcher starts in herdr; `session_pane.py`, `stop.py`, `restart.py` and `settle.py` handle `HerdrHost`; `restart.py` moves tmux showrunners and ghostty and zed standalones into herdr; `herdr_sessions.py` has `list`, `attach`, `start`, `resume`. `UnitHost.session_host` is absent in old records and read as `"tmux"`; `record.py` normalizes the old `unit tmux session left running` kind to `UnitSessionLeftRunning(host="tmux")` (123–131, 684–690); `restart._unfinished_cleanup` (1561) holds an entry whose leftover cause is `stop not confirmed`. Snapshot and restore in `/etc/nixos` carry both tmux and herdr branches until Spec 6.
 
-**Acceptance gate:** `python3 -m unittest discover` for `scripts/production`, `scripts/shutdown`, `scripts/message`, `scripts/hooks`, `scripts/nightly_review` and `scripts/herdr` green; `basedpyright scripts/production scripts/shutdown scripts/message scripts/hooks scripts/nightly_review scripts/herdr` prints `0 errors, 0 warnings`; `grep -rln tmux scripts/production scripts/shutdown scripts/message commands/showrunner` names only lines kept on purpose (old-record parsing), each listed in the phase report.
+**Acceptance gate:** `python3 -m unittest discover` for `scripts/production`, `scripts/shutdown`, `scripts/message`, `scripts/hooks`, `scripts/nightly_review` and `scripts/herdr` green; `basedpyright scripts/production scripts/shutdown scripts/message scripts/hooks scripts/nightly_review scripts/herdr` prints `0 errors, 0 warnings`; `grep -rln tmux scripts/production scripts/shutdown scripts/message commands/showrunner` names only lines kept on purpose (legacy-record parsing and its manual commands), each listed in the phase report. Tests cover legacy hosts and leftovers through parsing, `status`, `now` and restart, never as herdr names and never cleared silently. The phase report quotes `tmux-free`'s passing output from before Spec 3.
 
-### Phase 9 — herdr on the Mac  · status: todo
+### Phase 10 — herdr on the Mac  · status: todo
+
+**Depends on:** Phase 9
 
 **Packaging (showrunner, 2026-10-13):** when this phase is reached, split it into its own plan if it is more than one phase of work.
 
-**Blocked by:** Phase 8 done on natedev; the showrunner may move this phase to its own plan.
+**Blocked by:** Phase 9 done on natedev; the showrunner may move this phase to its own plan.
 
 **User sees:** before — Mac standalones run straight in Ghostty windows, and Mac sessions have no herdr; after — `herdr-claude` on the Mac opens a standalone in its own herdr session, and a Mac restart brings sessions back in herdr in a Ghostty window attached to them.
 
@@ -388,21 +412,27 @@ Move them at their next idle points rather than waiting for productions to end, 
 **Spec:**
 
 1. `herdr.py` `start_server` and `stop_session` on Darwin use `launchctl submit -l <server_unit> -- <herdr> --session <name> server` and `launchctl remove <server_unit>`; Linux keeps systemd. The platform is chosen once by `sys.platform`; tests cover both with fake programs (`LAUNCHCTL` env names the program).
-2. `herdr_place_of` and `herdr_processes` on Darwin read process ancestry, argv and environment through `ps -E -o pid=,ppid=,command=` (the Mac has no `/proc`); `HERDR_PS` names the program for tests.
-3. `restart.py` `terminal` host on the Mac restarts through `herdr_sessions.py resume` and opens `Ghostty.app` with `-e herdr session attach <name>`.
-4. **Outside this repo (the showrunner's, in `/etc/nixos`):** `nightly-review.nix` drops tmux from its path; `agent-sessions-snapshot.py` and `agent-sessions-restore.py` drop their tmux branches. **The tmux package stays installed, and `tmux: server` stays in earlyoom's `--avoid`:** this phase removes tmux only from our scripts and launches, and the user may still use tmux by hand. `~/nixos` (nix-darwin): herdr in the Mac's packages, and `herdr-claude` and the `continue` alias in `modules/common/shell.nix` (shared with natedev, already added in Phase 7).
+2. `herdr_place_of`, `herdr_processes` and `attached_clients` on Darwin read processes through `ps` (`HERDR_PS` names the program for tests; the Mac has no `/proc`):
+   - Only the current user's processes (`ps -U <uid> -o pid=,ppid=,uid=,command=`), each row's uid checked again.
+   - Environment through Phase 6's rule: the `ps eww` text after the process's own `ps -o command=` argv, so argument text such as `HERDR_PANE_ID=w1:p1` in a prompt never counts. `herdr.py` holds that parse; `inventory._process_environment`'s Darwin branch calls it, so the rule lives once.
+   - `cwd` per process from `lsof -a -p <pid> -d cwd -Fn` (`HERDR_LSOF` names it).
+   - A process that vanishes between calls, or whose call fails, is skipped.
+3. `restart.py` `terminal` host on the Mac restarts into herdr in-process (`_herdr_launch` with `NewHerdrSession` and the full `ResumeParts`, as Linux window hosts do) and opens `Ghostty.app` with `-e herdr session attach <name>`.
+4. **Outside this repo (the showrunner's, in `~/nixos`, nix-darwin only; no seat makes these):** herdr in the Mac's packages; `herdr-claude` and the `continue` alias already sit in `modules/common/shell.nix` (shared with natedev, added in Phase 8).
 5. Live check on the Mac (needs the user at the Mac for the Ghostty window): `herdr-claude --name herdr-mac-check`, `/shutdown --only herdr-mac-check --restart`, the conversation comes back attached. Remove the check session afterwards.
 
 **Files:**
-- `scripts/herdr/herdr.py` — launchd and `ps` paths.
-- `scripts/herdr/test_herdr.py` — Darwin cases.
+- `scripts/herdr/herdr.py` — launchd, `ps` and `lsof` paths, Darwin environment parse.
+- `scripts/herdr/test_herdr.py` — Darwin cases: UID filtering, cwd, vanished processes, argument text with fake environment assignments.
+- `scripts/shutdown/inventory.py` — Darwin environment through `herdr.py`.
+- `scripts/shutdown/test_inventory.py` — follows.
 - `scripts/shutdown/restart.py` — Mac terminal host into herdr.
 - `scripts/shutdown/test_restart.py` — that case.
 
-**Seats:** 2 writers (no test lane; `test` opens as impl); split the library against restart.
-- `impl` — `herdr.py`, `test_herdr.py`; hub: `scripts/herdr/herdr.py`.
+**Seats:** 2 writers (no test lane; `test` opens as impl); split the library and inventory against restart.
+- `impl` — `herdr.py`, `test_herdr.py`, `inventory.py`, `test_inventory.py`; hub: `scripts/herdr/herdr.py`.
 - `test` (opens as impl) — `restart.py`, `test_restart.py`.
 
-**Constraints from prior phases:** `herdr.py` runs servers as systemd user units on Linux and finds places through `/proc`; `herdr_sessions.py start|resume|list|attach`; `restart.py` restarts window hosts into herdr on Linux; tmux is gone from the session tools.
+**Constraints from prior phases:** `herdr.py` runs servers as systemd user units on Linux and finds places and clients through `/proc`; session names are `[A-Za-z0-9_.-]+` and `server_unit` is `herdr-<name>`; `start_agent` takes `OpeningPrompt | NoOpeningPrompt`; `herdr_sessions.py start|resume|list|attach`; `restart.py` restarts ghostty and zed hosts into herdr on Linux through `_herdr_launch(parts, NewHerdrSession(name), ...)` and leaves `terminal` unchanged; `inventory._process_environment` parses Darwin environment after the argv prefix (Phase 6); tmux is gone from the session tools.
 
 **Acceptance gate:** `python3 -m unittest discover` for `scripts/herdr` and `scripts/shutdown` green on natedev and on the Mac; `basedpyright scripts/herdr scripts/shutdown` prints `0 errors, 0 warnings`. The live check in Spec 5 passes.

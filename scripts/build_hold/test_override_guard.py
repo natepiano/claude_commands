@@ -9,7 +9,6 @@ import pwd
 import subprocess
 import sys
 import tempfile
-import time
 import unittest
 from collections.abc import Mapping, Sequence
 from contextlib import redirect_stderr, redirect_stdout
@@ -405,19 +404,19 @@ class OverrideGuardShellTests(unittest.TestCase):
         empty_path = root / "empty_path"
         empty_path.mkdir()
         environment = child_environment({"PATH": str(empty_path)})
+        forks = root / "subshells"
         program = (
             'set -e; source "$1"; '
+            'exec 3>"$4"; set -T; '
+            'trap \'if (( BASH_SUBSHELL > 0 )); then printf "%s\\n" "$BASH_SUBSHELL" >&3; fi\' DEBUG; '
             'for ((call_number=0; call_number<2000; call_number++)); do '
-            'build_override_refusal "$2" "$3"; done'
+            'build_override_refusal "$2" "$3"; done; [[ "$call_number" -eq 2000 ]]'
         )
-        began = time.perf_counter()
-        result = run_shell(program, [str(CHECKOUT_SCRIPT), PYTHON_RELATIVE], environment)
-        elapsed = time.perf_counter() - began
-        print(f"override guard: 2000 shell calls in {elapsed:.3f} s", flush=True)
+        result = run_shell(program, [str(CHECKOUT_SCRIPT), PYTHON_RELATIVE, str(forks)], environment)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout, "")
         self.assertEqual(result.stderr, "")
-        self.assertLess(elapsed, 2.0)
+        self.assertEqual(forks.read_text(), "", "the override guard must not fork subshells")
 
 
 def first_function_statement(source: str, function_name: str) -> ast.stmt:

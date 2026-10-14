@@ -9,14 +9,15 @@ import socket
 import subprocess
 import sys
 import tempfile
-import time
 import unittest
 from unittest import mock
 from datetime import datetime
 from pathlib import Path
-from typing import cast, override
+from typing import TYPE_CHECKING, cast, override
 from zoneinfo import ZoneInfo
 
+if TYPE_CHECKING:
+    from herdr import SessionListResult
 
 SCRIPT = Path(__file__).with_name("stall_watch.py")
 START = int(datetime(2026, 10, 6, 12, 0, tzinfo=ZoneInfo("America/Los_Angeles")).timestamp())
@@ -129,7 +130,12 @@ line = (json.dumps(record) + '\\n').encode()
 fd = os.open(os.environ['STALL_TEST_SEND_LOG'], os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
 os.write(fd, line)
 os.close(fd)
-time.sleep(float(os.environ.get('STALL_TEST_SEND_DELAY', '0')))
+expected = int(os.environ.get('STALL_TEST_SEND_TOGETHER', '0'))
+deadline = time.monotonic() + 30
+while expected and len(open(os.environ['STALL_TEST_SEND_LOG']).readlines()) < expected:
+    if time.monotonic() >= deadline:
+        raise SystemExit('send barrier did not receive every concurrent delivery')
+    time.sleep(0.01)
 fail = json.load(open(os.environ['STALL_TEST_FAIL_FILE']))
 raise SystemExit(1 if record['to'] in fail else 0)
 """)
@@ -153,7 +159,13 @@ raise SystemExit(1 if record['to'] in fail else 0)
             "STALL_TEST_PS_FILE": str(self.ps_file),
             "STALL_TEST_SEND_LOG": str(self.send_log),
             "STALL_TEST_FAIL_FILE": str(self.fail_file),
+            "HERDR_BIN": str(SCRIPT.parents[1] / "herdr/fake_herdr.py"),
+            "HERDR_PROC": str(self.root / "proc"),
+            "FAKE_HERDR_LOG": str(self.root / "herdr.log"),
+            "FAKE_HERDR_RESPONSES": str(self.root / "herdr-responses.json"),
         }
+        _ = (self.root / "herdr-responses.json").write_text(json.dumps({
+            "default": {"code": 0, "stdout": '{"sessions": []}'}}))
         _ = self.record_session(os.getpid(), "show-id", "showrunner")
         _ = self.record_session(os.getpid() + 1_000_000, "fault-id", "natedev")
         _ = self.unit("unit-one")
@@ -236,7 +248,7 @@ raise SystemExit(1 if record['to'] in fail else 0)
         os.utime(transcript, (START - 3600, START - 3600))
         return child.pid, socket_path
 
-    def tick(self, at: int, *, delay: int = 0) -> subprocess.CompletedProcess[str]:
+    def tick(self, at: int, *, together: int = 0) -> subprocess.CompletedProcess[str]:
         _ = self.ps_file.write_text("\n".join(self.process_rows) + "\n")
         _ = self.tmux_file.write_text(json.dumps({
             name: dict(pane) for name, pane in self.panes.items()}))
@@ -255,7 +267,7 @@ raise SystemExit(1 if record['to'] in fail else 0)
             _ = (runs / f"{name}.jsonl").write_text("".join(json.dumps(event) + "\n" for event in events))
         return subprocess.run(
             [sys.executable, str(SCRIPT)],
-            env={**self.environment, "STALL_WATCH_NOW_EPOCH": str(at), "STALL_TEST_SEND_DELAY": str(delay)},
+            env={**self.environment, "STALL_WATCH_NOW_EPOCH": str(at), "STALL_TEST_SEND_TOGETHER": str(together)},
             capture_output=True, text=True, check=False,
         )
 
@@ -263,6 +275,41 @@ raise SystemExit(1 if record['to'] in fail else 0)
         if not self.send_log.exists():
             return []
         return [json.loads(line) for line in self.send_log.read_text().splitlines()]
+
+    def test_a_herdr_unit_is_watched_through_a_joined_400_line_read(self) -> None:
+        pid = self.children[0].pid
+        record_path = self.sessions / f"{pid}.json"
+        record = cast(dict[str, object], json.loads(record_path.read_text()))
+        _ = record_path.write_text(json.dumps({**record, "tmux": ""}))
+        # Keep the fixture's unit for its run record, but remove its tmux mark from this production.
+        self.panes["unit-one"]["slug"] = "other"
+        for process_pid, parent, argv, environment in (
+            (991000, 0, ["herdr", "--session", "native", "server"], {}),
+            (pid, 991000, ["claude"], {"HERDR_PANE_ID": "w1:p1", "SHOWRUNNER_UNIT": "showrunner",
+                                      "SHOWRUNNER_UNIT_ID": "unit-one"}),
+        ):
+            path = self.root / "proc" / str(process_pid)
+            path.mkdir(parents=True)
+            _ = (path / "stat").write_text(f"{process_pid} (fixture) S {parent} 0 0")
+            _ = (path / "cmdline").write_bytes("\0".join(argv).encode())
+            _ = (path / "environ").write_bytes("\0".join(f"{key}={value}" for key, value in environment.items()).encode())
+            (path / "cwd").symlink_to(self.root)
+        sessions: SessionListResult = {"sessions": [{
+            "name": "native", "running": True, "default": False,
+            "session_dir": "/fixture", "socket_path": "/fixture/socket"}]}
+        _ = (self.root / "herdr-responses.json").write_text(json.dumps({
+            "--session default session list --json": {"code": 0, "stdout": json.dumps(sessions)},
+            "--session native pane read w1:p1 --source recent-unwrapped --lines 400": {
+                "code": 0, "stdout": PANE},
+            "default": {"code": 1, "stdout": "unexpected herdr command"},
+        }))
+        first = self.tick(START)
+        second = self.tick(START + 300)
+        self.assertEqual((first.returncode, second.returncode), (0, 0), first.stderr + second.stderr)
+        self.assertEqual(len(self.sent()), 2)
+        calls = (self.root / "herdr.log").read_text().splitlines()
+        self.assertIn(json.dumps(["--session", "native", "pane", "read", "w1:p1", "--source",
+                                  "recent-unwrapped", "--lines", "400"]), calls)
 
     def test_reported_unit_is_not_bumped_again_after_its_session_is_renamed(self) -> None:
         self.assertEqual(self.tick(START).returncode, 0)
@@ -685,12 +732,10 @@ raise SystemExit(1 if record['to'] in fail else 0)
         _ = self.unit("unit-three")
         self.configure({"showrunner": ["unit-one", "unit-two", "unit-three"]})
         _ = self.tick(START)
-        started = time.monotonic()
-        result = self.tick(START + 300, delay=20)
-        elapsed = time.monotonic() - started
+        result = self.tick(START + 300, together=6)
         self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stderr, "", "every sender must complete the concurrency barrier")
         self.assertEqual(len(self.sent()), 6)
-        self.assertLess(elapsed, 35)
 
 
 if __name__ == "__main__":

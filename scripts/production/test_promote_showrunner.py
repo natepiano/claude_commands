@@ -19,8 +19,14 @@ import promote_showrunner
 import showrunners
 import unit_effort
 import unit_lookup
+import session_pane
+import herdr
 from add_unit import Production, Refusal, plan_cell_is_retired, read_production, unit_table
 from scripts.accounts import accounts
+from scripts.herdr import herdr as trust_reader
+from scripts.whoami import account
+
+CHILD_PREFLIGHT = add_showrunner.checked
 
 SESSION = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
 PID = 4242
@@ -93,7 +99,7 @@ class PromoteShowrunnerTests(unittest.TestCase):
         _ = (sessions / f"{PID}.json").write_text(json.dumps({"status": "idle"}))
         self.events, self.alive, self.started = [], [True, True, False], 0
         self.marked = {"demo-unit": unit_lookup.MarkedUnit(
-            "demo-unit", PANE, "demo", unit_lookup.LiveClaude("demo", SESSION, "/sock", PID))}
+            "demo-unit", "demo", unit_lookup.LiveClaude("demo", SESSION, "/sock", PID), unit_lookup.TmuxPlace(PANE))}
         self.unit_account = accounts.DefaultAccount()
         (self.root / ".claude").mkdir()
         _ = (self.root / ".claude.json").write_text(json.dumps({"oauthAccount": {"emailAddress": "default@example.invalid"}}))
@@ -102,7 +108,7 @@ class PromoteShowrunnerTests(unittest.TestCase):
             "HOME": str(self.root), "NOTIFIER_SESSIONS_DIR": str(sessions), "PLAN_DELEGATE_ACTIVE_DIR": str(self.root / "active")}))
         for module, name, stand_in in (
                 (showrunners, "production_of", self.production_of), (unit_lookup, "marked_units", self.marked_units),
-                (promote_showrunner, "_tmux", self.tmux), (promote_showrunner, "_alive", self.is_alive),
+                (promote_showrunner, "_tmux", self.tmux), (session_pane, "_tmux", self.pane_tmux), (promote_showrunner, "_alive", self.is_alive),
                 (promote_showrunner, "POLL_S", 0), (add_showrunner, "checked", self.child_checked),
                 (add_showrunner, "main", self.start), (accounts, "role_account", self.role_account),
                 (unit_effort, "verdict", self.verdict)):
@@ -132,10 +138,18 @@ class PromoteShowrunnerTests(unittest.TestCase):
 
     def tmux(self, *arguments: str) -> subprocess.CompletedProcess[str]:
         self.events.append(" ".join(("tmux", *arguments)))
+        if arguments[0] in {"show-options", "set-option"}:
+            # Like tmux 3.6, an option command takes a pane target: a bare `=name` names no session.
+            target = arguments[arguments.index("-t") + 1]
+            if target.startswith("=") and not target.endswith(":"):
+                return subprocess.CompletedProcess(["tmux", *arguments], 1, "", f"no such session: {target}")
         shown = "╭───╮\n│ > │\n╰───╯\n" if arguments[0] == "capture-pane" else ""
         if arguments[0] == "show-options" and arguments[-1] == "@claude_config_dir":
             shown = str(self.root / ".claude" if isinstance(self.unit_account, accounts.DefaultAccount) else self.unit_account.dir) + "\n"
         return subprocess.CompletedProcess(["tmux", *arguments], 0, shown, "")
+
+    def pane_tmux(self, *arguments: str) -> str:
+        return self.tmux(*arguments).stdout
 
     def is_alive(self, pid: int) -> bool:
         self.assertEqual(pid, PID)
@@ -351,6 +365,102 @@ class PromoteShowrunnerTests(unittest.TestCase):
         self.assertNotIn(f"tmux kill-session -t {PANE}", self.events)
         self.assertFalse(any(event.startswith("start") for event in self.events))
         self.assertFalse(plan_cell_is_retired(self.demo_row()["Plan"]))
+
+    def native_unit(self) -> None:
+        self.marked["demo-unit"] = unit_lookup.MarkedUnit(
+            "demo-unit", "native", unit_lookup.LiveClaude("demo", SESSION, "/sock", PID),
+            herdr.HerdrPlace("native", "w1:p1"))
+        _ = (self.root / "herdr-responses.json").write_text(json.dumps({"default": {"code": 0, "stdout": ""}}))
+        _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {
+            "HERDR_BIN": str(Path(__file__).parents[1] / "herdr/fake_herdr.py"),
+            "FAKE_HERDR_RESPONSES": str(self.root / "herdr-responses.json"),
+            "FAKE_HERDR_LOG": str(self.root / "herdr.log"),
+        })))
+        _ = cast(object, self.enterContext(mock.patch.object(
+            account, "process_config_dir", return_value=accounts.main_config_dir())))
+
+    def test_herdr_promotion_starts_on_the_showrunners_account_without_tmux_calls(self) -> None:
+        self.native_unit()
+        selected = self.ready_showrunner_account()
+        self.unit_account = selected
+        with mock.patch.object(herdr, "stop_session") as stopped:
+            code, _out, err = self.run_main()
+        self.assertEqual(code, 0, err)
+        stopped.assert_called_once_with("native")
+        start = next(event for event in self.events if event.startswith("start"))
+        self.assertIn(str(selected.dir), start)
+        self.assertFalse(any(event.startswith("tmux") for event in self.events))
+
+    def test_herdr_promotion_refuses_unconfigured_showrunners_without_stopping(self) -> None:
+        self.native_unit()
+        with mock.patch.object(accounts, "role_account", side_effect=accounts.AccountsError(
+                "showrunners: not configured — accounts.py move showrunners <claude N>")), \
+                mock.patch.object(herdr, "stop_session") as stopped:
+            code, _out, err = self.run_main()
+        self.assertEqual(code, 2, err)
+        self.assertIn("accounts.py move showrunners <claude N>", err)
+        stopped.assert_not_called()
+        self.assert_nothing_stopped()
+        self.assertFalse(any(event.startswith("tmux") for event in self.events))
+
+    def test_a_herdr_unit_exits_before_its_named_session_stops_and_restarts(self) -> None:
+        self.native_unit()
+
+        def stop_session(label: str) -> None:
+            self.assertEqual(self.alive, [False])
+            self.events.append(f"stop herdr {label}")
+
+        with mock.patch.object(herdr, "stop_session", side_effect=stop_session) as stopped:
+            code, _out, err = self.run_main()
+        self.assertEqual(code, 0, err)
+        stopped.assert_called_once_with("native")
+        calls = (self.root / "herdr.log").read_text().splitlines()
+        self.assertEqual(calls, [
+            json.dumps(["--session", "native", "pane", "read", "w1:p1", "--source", "recent", "--lines", "60",
+                        "--format", "ansi"]),
+            json.dumps(["--session", "native", "agent", "prompt", "w1:p1", "/exit"]),
+        ])
+        start_at = next(index for index, event in enumerate(self.events) if event.startswith("start"))
+        self.assertLess(self.events.index("stop herdr native"), start_at)
+        self.assertFalse(any(event.startswith("tmux") for event in self.events))
+
+    def test_herdr_name_does_not_exempt_an_unrelated_tmux_destination(self) -> None:
+        self.native_unit()
+        self.marked["demo-unit"] = unit_lookup.MarkedUnit(
+            "demo-unit", "child", unit_lookup.LiveClaude("demo", SESSION, "/sock", PID),
+            herdr.HerdrPlace("child", "w1:p1"))
+        with mock.patch.object(add_showrunner, "checked", CHILD_PREFLIGHT), \
+                mock.patch.object(showrunners, "descendants_of", return_value=[]), \
+                mock.patch.object(add_showrunner, "running", return_value=False), \
+                mock.patch.object(unit_lookup, "tmux_binary", return_value="fake-tmux"), \
+                mock.patch.object(add_showrunner, "tmux_live", return_value=True) as live, \
+                mock.patch.object(trust_reader, "claude_trust", return_value=trust_reader.Trusted(
+                    self.worktree, self.root / ".claude.json", self.worktree)), \
+                mock.patch.object(herdr, "stop_session") as stopped:
+            code, _out, err = self.run_main()
+        self.assertEqual(code, 2, err)
+        self.assertIn("a tmux session named child is already live", err)
+        live.assert_called_once_with("fake-tmux", "child")
+        stopped.assert_not_called()
+        self.assert_nothing_stopped()
+        calls = [cast(list[str], json.loads(line)) for line in (self.root / "herdr.log").read_text().splitlines()]
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0][2:4], ["pane", "read"])
+
+    def test_a_blocked_herdr_unit_is_never_stopped_or_restarted(self) -> None:
+        self.native_unit()
+        refusal: herdr.HerdrRefusal = {"error": {"code": "agent_blocked", "message": "blocked"}}
+        _ = (self.root / "herdr-responses.json").write_text(json.dumps({
+            "--session native agent prompt w1:p1 /exit": {
+                "code": 1, "stdout": json.dumps(refusal)},
+            "default": {"code": 0, "stdout": ""},
+        }))
+        with mock.patch.object(herdr, "stop_session") as stopped:
+            code, _out, err = self.run_main()
+        self.assertEqual(code, 2, err)
+        self.assertIn("agent_blocked", err)
+        stopped.assert_not_called()
+        self.assert_nothing_stopped()
 
     def test_a_failed_restart_prints_the_way_back_and_leaves_the_row(self) -> None:
         self.started = 2
