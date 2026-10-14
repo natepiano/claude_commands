@@ -528,7 +528,7 @@ class InventoryTests(unittest.TestCase):
     def test_existing_ledger_keeps_review_states_without_reading_the_repository(self) -> None:
         _ = self.collect()
         identifiers = self.list_ids(self.cli(["next", "--project", "cargo-liner", "--pool", "structured", "--claim", "alpha", "--limit", "1"]))
-        marked = self.cli(["mark", identifiers[0], "--seat", "alpha", "--as", "internal", "--reason", "Reviewed implementation work"])
+        marked = self.cli(["mark", identifiers[0], "--worker", "alpha", "--as", "internal", "--reason", "Reviewed implementation work"])
         self.assertEqual(marked.status, 0, marked.stderr)
         original = self.ledger_path().read_bytes()
         _ = self.repo.path.rename(self.root / "unavailable-repo")
@@ -668,12 +668,12 @@ class InventoryTests(unittest.TestCase):
         self.assertEqual(len(self.list_ids(self.cli(arguments))), 25)
         self.assertEqual(len(self.list_ids(self.cli(arguments + ["--limit", "0"]))), 31)
 
-    def test_next_claim_hides_another_seat_and_keeps_same_seat(self) -> None:
+    def test_next_claim_hides_another_worker_and_keeps_same_worker(self) -> None:
         _ = self.collect()
         arguments = ["next", "--project", "cargo-liner", "--pool", "commits", "--kind", "commit"]
         listed = self.list_ids(self.cli(arguments + ["--claim", "alpha", "--limit", "1"]))
         self.assertEqual(listed, ["cargo-liner:commit:" + self.base_sha])
-        self.assertEqual(self.record_after(listed[0])["claim"], {"state": "claimed", "seat": "alpha"})
+        self.assertEqual(self.record_after(listed[0])["claim"], {"state": "claimed", "worker": "alpha"})
         other = self.list_ids(self.cli(arguments + ["--claim", "beta", "--limit", "0"]))
         self.assertEqual(len(other), 3)
         self.assertNotIn(listed[0], other)
@@ -766,7 +766,7 @@ class InventoryTests(unittest.TestCase):
         self.note("Another project's result", project="hana")
         self.assert_refusal(["mark", identifier, "--as", "combined", "--note", "Another project's result"], "Another project's result")
         _ = self.list_ids(self.cli(["next", "--project", "cargo-liner", "--pool", "structured", "--kind", "phase", "--claim", "alpha", "--limit", "0"]))
-        self.assert_refusal(["mark", identifier, "--seat", "beta", "--as", "internal", "--reason", "Internal implementation"], "alpha")
+        self.assert_refusal(["mark", identifier, "--worker", "beta", "--as", "internal", "--reason", "Internal implementation"], "alpha")
         self.assert_refusal(["mark", identifier, "--as", "internal", "--reason", "Internal implementation"], "alpha")
 
     def test_mark_requires_the_argument_matching_its_outcome(self) -> None:
@@ -781,16 +781,33 @@ class InventoryTests(unittest.TestCase):
                 self.assert_refusal(["mark", identifier, "--as", disposition, "--note", "Keyboard navigation"], "reason")
         self.assert_refusal(["mark", identifier, "--as", "represented", "--note", "Keyboard navigation", "--reason", "Both fields"])
 
-    def test_mark_claimed_record_accepts_the_owning_seat(self) -> None:
+    def test_read_migrates_an_old_claim_once_and_only_the_worker_flag_can_complete_it(self) -> None:
+        _ = self.collect()
+        rows = self.records()
+        selected = rows[0]["id"]
+        old_rows = [cast(dict[str, object], cast(object, row)) for row in rows]
+        old_rows[0]["claim"] = {"state": "claimed", "seat": "alpha"}
+        path = self.ledger_path()
+        _ = path.write_text("".join(json.dumps(row) + "\n" for row in old_rows))
+        self.assertEqual(self.cli(["next", "--project", "cargo-liner", "--pool", "structured", "--limit", "0"]).status, 0)
+        self.assertEqual(self.record_after(selected)["claim"], {"state": "claimed", "worker": "alpha"})
+        self.assertNotIn('"seat"', path.read_text())
+        modified = path.stat().st_mtime_ns
+        self.assertEqual(self.cli(["next", "--project", "cargo-liner", "--pool", "structured", "--limit", "0"]).status, 0)
+        self.assertEqual(path.stat().st_mtime_ns, modified)
+        self.assertEqual(self.cli(["mark", selected, "--seat", "alpha", "--as", "internal", "--reason", "Internal work"]).status, 2)
+        self.assertEqual(self.cli(["mark", selected, "--worker", "alpha", "--as", "internal", "--reason", "Internal work"]).status, 0)
+
+    def test_mark_claimed_record_accepts_the_owning_worker(self) -> None:
         _ = self.collect()
         identifiers = self.list_ids(self.cli(["next", "--project", "cargo-liner", "--pool", "structured", "--kind", "asbuilt", "--claim", "alpha", "--limit", "0"]))
         self.assertEqual(len(identifiers), 1)
         self.note("Keyboard navigation")
-        result = self.cli(["mark", identifiers[0], "--seat", "alpha", "--as", "represented", "--note", "Keyboard navigation"])
+        result = self.cli(["mark", identifiers[0], "--worker", "alpha", "--as", "represented", "--note", "Keyboard navigation"])
         self.assertEqual(result.status, 0, result.stderr)
         record = self.record_after(identifiers[0])
         self.assertEqual(record["outcome"], {"state": "represented", "note": "Keyboard navigation"})
-        self.assertEqual(record["claim"], {"state": "claimed", "seat": "alpha"})
+        self.assertEqual(record["claim"], {"state": "claimed", "worker": "alpha"})
 
     def test_mark_reads_ids_from_a_file_with_and_without_positional_ids(self) -> None:
         _ = self.collect()
@@ -901,7 +918,7 @@ class InventoryTests(unittest.TestCase):
         identifiers = self.list_ids(self.cli(["next", "--project", "cargo-liner", "--pool", "structured", "--claim", "alpha", "--limit", "0"]))
         shown = self.cli(["show", identifiers[0]])
         self.assertEqual(shown.status, 0, shown.stderr)
-        marked = self.cli(["mark", *identifiers, "--seat", "alpha", "--as", "internal", "--reason", "Reviewed implementation work"])
+        marked = self.cli(["mark", *identifiers, "--worker", "alpha", "--as", "internal", "--reason", "Reviewed implementation work"])
         self.assertEqual(marked.status, 0, marked.stderr)
         self.assertEqual(self.cli(["status", "--project", "cargo-liner"]).status, 1)
         after = {path.relative_to(self.repo.path).as_posix(): path.read_bytes() for path in self.repo.path.rglob("*") if path.is_file()}

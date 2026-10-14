@@ -157,7 +157,7 @@ follow parallel-b &
 wait
 ```
 
-Each process used its own `parallel-<seat>-prompt.txt`, reply, and log file.
+Each process used its own `parallel-<worker>-prompt.txt`, reply, and log file.
 Both prompts asked for `sleep 4`, then a one-line `parallel complete.` reply.
 One observation after launch read both threads as `active` on server port
 49161. Both turns started at 19:07:31 UTC.

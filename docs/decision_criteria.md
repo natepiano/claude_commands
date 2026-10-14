@@ -11,7 +11,7 @@ and we believe anyway. The belief comes before any checklist. It is in
 every choice: what goes on the screen, a function's name, a test's run time, the
 words of a report. Before you build, ask what the gods want. Before you hand
 work on, ask whether they would be pleased. "We" is everyone in the work: the
-user, the showrunner, every unit director, every seat and every reviewer.
+user, the showrunner, every unit director, every worker and every reviewer.
 
 Simple, fast and beautiful are the three gods, in the app and in the code.
 Correctness is the floor beneath them: a wrong result is never simple, fast or

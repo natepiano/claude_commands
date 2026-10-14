@@ -86,7 +86,7 @@ elif verb == 'compact':
         print(f'compacted {name}: {before} -> 12000 tokens')
 elif verb == 'can-follow':
     if entry.get('status') not in ('done', 'failed'):
-        print(f'codex_mesh: {name}: seat is busy or not followable; follow refused',
+        print(f'codex_mesh: {name}: worker is busy or not followable; follow refused',
               file=sys.stderr)
         sys.exit(2)
     entry['previous_status'] = entry['status']
@@ -367,7 +367,7 @@ class ReviewLauncherPassTests(unittest.TestCase):
         _ = shutil.copy2(DELEGATE_DIR.parent / "lib" / "user_zone.py", lib / "user_zone.py")
         for name in (
             "review.sh", "implement.sh", "progress_history.py", "findings.py",
-            "board.sh", "seat_name.sh",
+            "board.sh", "worker_name.sh", "worker_state.py",
         ):
             _ = shutil.copy2(DELEGATE_DIR / name, delegate / name)
         for name in ("agents_config.sh", "heartbeat.sh"):
@@ -469,8 +469,8 @@ else:
         _ = cache.write_text(sys.executable + "\n")
         _ = environment.pop("CLAUDE_PYTHON", None)
         environment["PLAN_DELEGATE_EARLY_POLL_SECS"] = "0.01"
-        environment["PLAN_DELEGATE_SEAT_POLL_SECS"] = "0.01"
-        environment["PLAN_DELEGATE_SEAT_WAIT_ATTEMPTS"] = "30000"
+        environment["PLAN_DELEGATE_WORKER_POLL_SECS"] = "0.01"
+        environment["PLAN_DELEGATE_WORKER_WAIT_ATTEMPTS"] = "30000"
         environment["PLAN_DELEGATE_SYNC_WRITES"] = "0"
         environment["TEST_WAIT_HELPER_DIR"] = str(DELEGATE_DIR.resolve())
         environment["PLAN_DELEGATE_HISTORY_DIR"] = str(self.history_dir)
@@ -544,10 +544,10 @@ else:
             timeout=300,
         )
 
-    def run_seated_review(
+    def run_assigned_review(
         self,
         session_dir: Path,
-        seat: str,
+        worker: str,
         *,
         edit_path: str = "",
         commit_change: bool = False,
@@ -559,7 +559,7 @@ else:
         if commit_change:
             environment["STUB_REVIEW_COMMIT"] = "1"
         return subprocess.run(
-            self.review_command(session_dir, "", "", seat),
+            self.review_command(session_dir, "", "", worker),
             check=False,
             capture_output=True,
             text=True,
@@ -572,7 +572,7 @@ else:
             "finish-pass", "--session-dir", str(session_dir), "--status", "completed"
         )
 
-    def open_seat(
+    def open_worker(
         self, session_dir: Path, *, status: str = "done", context_tokens: int = 0
     ) -> str:
         name = "fixture-impl"
@@ -782,9 +782,9 @@ os.execv(sys.executable, [sys.executable, str(Path(__file__).with_name("progress
         self.assertEqual(failed.returncode, 1, failed.stderr)
         self.assertEqual((session / "review_status_contract").read_text().strip(), "error")
         self.assertEqual([call["verb"] for call in self.call_records("pool-calls.jsonl")], ["allocate"])
-        seat = self.open_seat(session)
+        worker = self.open_worker(session)
         environment["REVIEW_LEASE"] = "production/unit/3"
-        retry = subprocess.run(self.review_command(session, "contract", "", seat), env=environment,
+        retry = subprocess.run(self.review_command(session, "contract", "", worker), env=environment,
                                capture_output=True, text=True, check=False, timeout=300)
         self.assertEqual(retry.returncode, 0, retry.stderr)
         records = {str(record["arm"]): record for record in self.turn_records(session)}
@@ -797,13 +797,13 @@ os.execv(sys.executable, [sys.executable, str(Path(__file__).with_name("progress
     def test_own_turn_records_survive_two_phases_in_the_same_session(self) -> None:
         session = self.start_implementation("two-phases")
         self.finish_implementation(session)
-        seat = self.open_seat(session)
-        first = self.run_seated_review(session, seat)
+        worker = self.open_worker(session)
+        first = self.run_assigned_review(session, worker)
         self.assertEqual(first.returncode, 0, first.stderr)
         first_record, = self.turn_records(session)
         self.recorder("finish-phase", "--session-dir", str(session), "--status", "completed")
         self.recorder("start-phase", "--session-dir", str(session), "--phase-id", "4", "--phase-title", 'Next "phase"')
-        second = self.run_seated_review(session, seat)
+        second = self.run_assigned_review(session, worker)
         self.assertEqual(second.returncode, 0, second.stderr)
         records = self.turn_records(session)
         self.assertEqual(len(records), 2)
@@ -814,10 +814,10 @@ os.execv(sys.executable, [sys.executable, str(Path(__file__).with_name("progress
     def test_own_ux_lens_records_ux_kind_without_pass_calls(self) -> None:
         session = self.start_implementation("own-ux")
         self.finish_implementation(session)
-        seat = self.open_seat(session)
+        worker = self.open_worker(session)
         environment = self.environment()
         self.trace_pass_recorder(environment)
-        result = subprocess.run(self.review_command(session, "ux", "", seat), env=environment,
+        result = subprocess.run(self.review_command(session, "ux", "", worker), env=environment,
                                 capture_output=True, text=True, check=False, timeout=300)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(self.turn_records(session)[0]["kind"], "ux")
@@ -1066,7 +1066,7 @@ os.execv(sys.executable, [sys.executable, str(Path(__file__).with_name("progress
         result = subprocess.run(self.pool_command(session), env=environment, capture_output=True,
                                 text=True, check=False, timeout=300)
         self.assertEqual(result.returncode, 2, result.stderr)
-        self.assertIn("seat is busy or not followable", result.stderr)
+        self.assertIn("worker is busy or not followable", result.stderr)
         self.assertEqual(self.call_records("pool-calls.jsonl")[-1]["verb"], "release")
         self.assertEqual(self.turn_records(session)[0]["status"], "error")
 
@@ -1169,7 +1169,7 @@ os.execv(sys.executable, [sys.executable, str(Path(__file__).with_name("progress
                     command = self.pool_command(session, early=str(ready))
                 else:
                     environment = self.environment()
-                    command = self.review_command(session, "contract", str(ready), self.open_seat(session))
+                    command = self.review_command(session, "contract", str(ready), self.open_worker(session))
                 environment["STUB_FINDINGS"] = "1. A void finding\n"
                 result = subprocess.run(command, env=environment, capture_output=True,
                                         text=True, check=False, timeout=300)
@@ -1183,7 +1183,7 @@ os.execv(sys.executable, [sys.executable, str(Path(__file__).with_name("progress
     def test_own_term_records_canceled_instead_of_successful_exit_trap(self) -> None:
         session = self.start_implementation("own-signal")
         self.finish_implementation(session)
-        seat = self.open_seat(session)
+        worker = self.open_worker(session)
         environment = self.environment()
         finish = self.root / "finish"
         done = self.root / "done"
@@ -1192,7 +1192,7 @@ os.execv(sys.executable, [sys.executable, str(Path(__file__).with_name("progress
         # The own arm retains its existing child behavior. Files keep the
         # child's inherited output pipes from hiding the launcher's exit.
         with (self.root / "signal-output.txt").open("w+") as output:
-            process = subprocess.Popen(self.review_command(session, "", "", seat), env=environment,
+            process = subprocess.Popen(self.review_command(session, "", "", worker), env=environment,
                                        stdout=output, stderr=output, text=True)
             try:
                 wait_until(lambda: (session / "follow_message.txt").exists() or process.poll() is not None, session, processes=(process,))
@@ -1221,7 +1221,7 @@ os.execv(sys.executable, [sys.executable, str(Path(__file__).with_name("progress
                     command = self.pool_command(session)
                 else:
                     environment = self.environment()
-                    command = self.review_command(session, "", "", self.open_seat(session))
+                    command = self.review_command(session, "", "", self.open_worker(session))
                 environment["STUB_REPLACEMENT_THREAD"] = "thread-replacement"
                 result = subprocess.run(command, env=environment, capture_output=True,
                                         text=True, check=False, timeout=300)
@@ -1242,12 +1242,12 @@ os.execv(sys.executable, [sys.executable, str(Path(__file__).with_name("progress
     def test_own_failed_closure_turn_records_lease_and_findings_count(self) -> None:
         session = self.start_implementation("own-failed")
         self.finish_implementation(session)
-        seat = self.open_seat(session)
+        worker = self.open_worker(session)
         environment = self.environment()
         environment["REVIEW_LEASE"] = "production/unit/3"
         environment["STUB_TURN_FAILURE"] = "1"
         environment["STUB_FINDINGS"] = "1. Partial finding\n"
-        command = self.review_command(session, "", "", seat)
+        command = self.review_command(session, "", "", worker)
         command[-3] = "2"
         result = subprocess.run(command, env=environment, capture_output=True,
                                 text=True, check=False, timeout=300)
@@ -1308,12 +1308,12 @@ os.execv(sys.executable, [sys.executable, str(Path(__file__).with_name("progress
             ],
         )
 
-    def test_a_named_open_seat_receives_the_review_and_writes_findings(self) -> None:
-        session_dir = self.start_implementation("seated")
+    def test_a_named_open_worker_receives_the_review_and_writes_findings(self) -> None:
+        session_dir = self.start_implementation("assigned")
         self.finish_implementation(session_dir)
-        seat = self.open_seat(session_dir)
+        worker = self.open_worker(session_dir)
 
-        result = self.run_seated_review(session_dir, seat)
+        result = self.run_assigned_review(session_dir, worker)
 
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(
@@ -1332,9 +1332,9 @@ os.execv(sys.executable, [sys.executable, str(Path(__file__).with_name("progress
             "dict[str, dict[str, object]]",
             json.loads((session_dir / "mesh_roster.json").read_text(encoding="utf-8")),
         )
-        self.assertEqual(roster[seat]["role"], "review")
+        self.assertEqual(roster[worker]["role"], "review")
         reviews = [
-            event for event in self.pass_events("seated")
+            event for event in self.pass_events("assigned")
             if event.get("pass_kind") == "review"
         ]
         self.assertEqual(
@@ -1342,8 +1342,8 @@ os.execv(sys.executable, [sys.executable, str(Path(__file__).with_name("progress
             [("pass_started", "impl"), ("pass_finished", "impl")],
         )
 
-    def test_a_review_opened_seat_has_durable_identity_for_an_implementation_claim(self) -> None:
-        session_dir = self.start_implementation("new-seat")
+    def test_a_review_opened_worker_has_durable_identity_for_an_implementation_claim(self) -> None:
+        session_dir = self.start_implementation("new-worker")
         self.finish_implementation(session_dir)
 
         result = subprocess.run(
@@ -1364,15 +1364,15 @@ os.execv(sys.executable, [sys.executable, str(Path(__file__).with_name("progress
             "dict[str, dict[str, object]]",
             json.loads((session_dir / "mesh_roster.json").read_text(encoding="utf-8")),
         )
-        seat = "project-review2"
-        self.assertEqual(roster[seat]["status"], "done")
-        self.assertEqual(roster[seat]["role"], "review")
+        worker = "project-review2"
+        self.assertEqual(roster[worker]["status"], "done")
+        self.assertEqual(roster[worker]["role"], "review")
         self.assertEqual(
             (session_dir / "review_findings_1.txt").read_text(encoding="utf-8"),
             "No findings.\n",
         )
         reviews = [
-            event for event in self.pass_events("new-seat")
+            event for event in self.pass_events("new-worker")
             if event.get("pass_kind") == "review"
         ]
         self.assertEqual(
@@ -1381,20 +1381,20 @@ os.execv(sys.executable, [sys.executable, str(Path(__file__).with_name("progress
         )
         identity = cast(
             "dict[str, object]",
-            json.loads((session_dir / "impl_seat_review2.json").read_text()),
+            json.loads((session_dir / "impl_worker_review2.json").read_text()),
         )
         self.assertEqual(identity, {
-            "name": seat,
+            "name": worker,
             "slot": "review2",
             "family": "codex",
             "model": "gpt-called",
-            "seat_id": f"thread-{seat}",
+            "worker_id": f"thread-{worker}",
         })
 
         implementation = subprocess.run(
             [
                 "bash", str(self.review_script.with_name("implement.sh")),
-                "--to", seat, str(session_dir), str(self.working_dir),
+                "--to", worker, str(session_dir), str(self.working_dir),
                 str(self.prompt_file), "implementation", "write the repair",
                 "impl", "writing the repair", "0", "review2",
             ],
@@ -1427,15 +1427,15 @@ os.execv(sys.executable, [sys.executable, str(Path(__file__).with_name("progress
         self.assertIn("alphanumeric/_ characters", result.stderr)
         self.assertFalse((session_dir / "mesh_roster.json").exists())
 
-    def test_an_early_seated_review_baselines_after_the_writers_final_edit(self) -> None:
+    def test_an_early_assigned_review_baselines_after_the_writers_final_edit(self) -> None:
         session_dir = self.start_implementation("early-writer-edit")
-        seat = self.open_seat(session_dir)
+        worker = self.open_worker(session_dir)
         ready = session_dir / "final_diff_1.ready"
         finish_review = session_dir / "finish_review"
         environment = self.environment()
         environment["STUB_REVIEW_FINISH_FILE"] = str(finish_review)
         process = subprocess.Popen(
-            self.review_command(session_dir, "adversary", str(ready), seat),
+            self.review_command(session_dir, "adversary", str(ready), worker),
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
@@ -1465,13 +1465,13 @@ os.execv(sys.executable, [sys.executable, str(Path(__file__).with_name("progress
             "reviewed\n",
         )
 
-    def test_a_seated_early_review_before_delivery_records_no_pass(self) -> None:
-        session_dir = self.start_implementation("seated-early")
-        seat = self.open_seat(session_dir)
+    def test_a_assigned_early_review_before_delivery_records_no_pass(self) -> None:
+        session_dir = self.start_implementation("assigned-early")
+        worker = self.open_worker(session_dir)
         ready = session_dir / "final_diff_1.ready"
 
         result = subprocess.run(
-            self.review_command(session_dir, "adversary", str(ready), seat),
+            self.review_command(session_dir, "adversary", str(ready), worker),
             check=False,
             capture_output=True,
             text=True,
@@ -1484,7 +1484,7 @@ os.execv(sys.executable, [sys.executable, str(Path(__file__).with_name("progress
             (session_dir / "review_status_adversary").read_text(encoding="utf-8"),
             "reviewed\n",
         )
-        recorded = self.pass_events("seated-early")
+        recorded = self.pass_events("assigned-early")
         self.assertEqual(
             [(event["event_type"], event.get("pass_kind")) for event in recorded],
             [("pass_started", "impl")],
@@ -1492,16 +1492,16 @@ os.execv(sys.executable, [sys.executable, str(Path(__file__).with_name("progress
         heartbeat = (session_dir / "heartbeat.log").read_text(encoding="utf-8")
         self.assertIn("finished before delivery", heartbeat)
 
-    def test_a_seated_reviewer_that_edits_fails_and_names_the_seat_and_path(self) -> None:
+    def test_a_assigned_reviewer_that_edits_fails_and_names_the_worker_and_path(self) -> None:
         session_dir = self.start_implementation("edited")
         self.finish_implementation(session_dir)
-        seat = self.open_seat(session_dir)
+        worker = self.open_worker(session_dir)
         edited = self.working_dir / "reviewed.txt"
 
-        result = self.run_seated_review(session_dir, seat, edit_path=str(edited))
+        result = self.run_assigned_review(session_dir, worker, edit_path=str(edited))
 
         self.assertEqual(result.returncode, 1, result.stderr)
-        self.assertIn(seat, result.stderr)
+        self.assertIn(worker, result.stderr)
         self.assertIn("reviewed.txt", result.stderr)
         self.assertEqual(
             (session_dir / "review_status").read_text(encoding="utf-8"), "error\n"
@@ -1519,17 +1519,17 @@ os.execv(sys.executable, [sys.executable, str(Path(__file__).with_name("progress
     def test_a_reviewer_commit_is_detected_and_names_its_changed_path(self) -> None:
         session_dir = self.start_implementation("committed-edit")
         self.finish_implementation(session_dir)
-        seat = self.open_seat(session_dir)
+        worker = self.open_worker(session_dir)
 
-        result = self.run_seated_review(
+        result = self.run_assigned_review(
             session_dir,
-            seat,
+            worker,
             edit_path=str(self.working_dir / "reviewed.txt"),
             commit_change=True,
         )
 
         self.assertEqual(result.returncode, 1, result.stderr)
-        self.assertIn(seat, result.stderr)
+        self.assertIn(worker, result.stderr)
         self.assertIn("reviewed.txt", result.stderr)
         self.assertEqual(
             (session_dir / "review_status").read_text(encoding="utf-8"), "error\n"
@@ -1538,22 +1538,22 @@ os.execv(sys.executable, [sys.executable, str(Path(__file__).with_name("progress
     def test_a_change_to_an_existing_untracked_file_is_detected(self) -> None:
         session_dir = self.start_implementation("untracked-edit")
         self.finish_implementation(session_dir)
-        seat = self.open_seat(session_dir)
+        worker = self.open_worker(session_dir)
         untracked = self.working_dir / "notes.txt"
         _ = untracked.write_text("before review\n", encoding="utf-8")
 
-        result = self.run_seated_review(
-            session_dir, seat, edit_path=str(untracked)
+        result = self.run_assigned_review(
+            session_dir, worker, edit_path=str(untracked)
         )
 
         self.assertEqual(result.returncode, 1, result.stderr)
-        self.assertIn(seat, result.stderr)
+        self.assertIn(worker, result.stderr)
         self.assertIn("notes.txt", result.stderr)
         self.assertEqual(
             (session_dir / "review_status").read_text(encoding="utf-8"), "error\n"
         )
 
-    def test_without_a_named_seat_the_fresh_read_only_path_is_unchanged(self) -> None:
+    def test_without_a_named_worker_the_fresh_read_only_path_is_unchanged(self) -> None:
         session_dir = self.start_implementation("fresh")
         self.finish_implementation(session_dir)
 
@@ -1576,24 +1576,24 @@ os.execv(sys.executable, [sys.executable, str(Path(__file__).with_name("progress
             (session_dir / "review_status").read_text(encoding="utf-8"), "reviewed\n"
         )
 
-    def test_a_busy_named_seat_is_refused_before_review_artifacts_change(self) -> None:
+    def test_a_busy_named_worker_is_refused_before_review_artifacts_change(self) -> None:
         session_dir = self.start_implementation("busy")
         self.finish_implementation(session_dir)
-        seat = self.open_seat(session_dir, status="running")
+        worker = self.open_worker(session_dir, status="running")
 
-        result = self.run_seated_review(session_dir, seat)
+        result = self.run_assigned_review(session_dir, worker)
 
         self.assertEqual(result.returncode, 2, result.stderr)
-        self.assertIn(f"codex_mesh: {seat}: seat is busy or not followable", result.stderr)
+        self.assertIn(f"codex_mesh: {worker}: worker is busy or not followable", result.stderr)
         self.assertFalse((session_dir / "review_status").exists())
         self.assertFalse((session_dir / "review_findings_1.txt").exists())
 
-    def test_a_large_named_seat_is_compacted_before_the_review_claim(self) -> None:
+    def test_a_large_named_worker_is_compacted_before_the_review_claim(self) -> None:
         session_dir = self.start_implementation("compact")
         self.finish_implementation(session_dir)
-        seat = self.open_seat(session_dir, context_tokens=100001)
+        worker = self.open_worker(session_dir, context_tokens=100001)
 
-        result = self.run_seated_review(session_dir, seat)
+        result = self.run_assigned_review(session_dir, worker)
 
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(
@@ -1601,49 +1601,49 @@ os.execv(sys.executable, [sys.executable, str(Path(__file__).with_name("progress
             ["compact", "can-follow", "follow"],
         )
         board = (session_dir / "board.log").read_text(encoding="utf-8")
-        self.assertIn(f"compacted {seat}: 100001 -> 12000 tokens", board)
+        self.assertIn(f"compacted {worker}: 100001 -> 12000 tokens", board)
 
-    def test_review_of_an_unmeasured_seat_does_not_compact_again(self) -> None:
+    def test_review_of_an_unmeasured_worker_does_not_compact_again(self) -> None:
         session_dir = self.start_implementation("unmeasured-review")
         self.finish_implementation(session_dir)
-        seat = self.open_seat(session_dir)
+        worker = self.open_worker(session_dir)
         path = session_dir / "mesh_roster.json"
         roster = cast(dict[str, dict[str, object]], json.loads(path.read_text(encoding="utf-8")))
-        roster[seat]["context_tokens"] = "not_measured_since_compaction"
+        roster[worker]["context_tokens"] = "not_measured_since_compaction"
         _ = path.write_text(json.dumps(roster), encoding="utf-8")
 
-        result = self.run_seated_review(session_dir, seat)
+        result = self.run_assigned_review(session_dir, worker)
 
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual((session_dir / "mesh_events.txt").read_text(encoding="utf-8").splitlines(),
                          ["can-follow", "follow"])
         stored = cast(dict[str, dict[str, object]], json.loads(path.read_text(encoding="utf-8")))
-        self.assertEqual(stored[seat]["context_tokens"], "not_measured_since_compaction")
+        self.assertEqual(stored[worker]["context_tokens"], "not_measured_since_compaction")
 
     def test_review_posts_the_unmeasured_compaction_line_unchanged(self) -> None:
         session_dir = self.start_implementation("compact-unmeasured-line")
         self.finish_implementation(session_dir)
-        seat = self.open_seat(session_dir, context_tokens=100001)
+        worker = self.open_worker(session_dir, context_tokens=100001)
         (session_dir / "compact_reports_zero").touch()
 
-        result = self.run_seated_review(session_dir, seat)
+        result = self.run_assigned_review(session_dir, worker)
 
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual((session_dir / "mesh_events.txt").read_text(encoding="utf-8").splitlines(),
                          ["compact", "can-follow", "follow"])
         board = (session_dir / "board.log").read_text(encoding="utf-8")
-        self.assertIn(f"launcher: compacted {seat}: 100001 tokens, size not measured until its next turn", board)
+        self.assertIn(f"launcher: compacted {worker}: 100001 tokens, size not measured until its next turn", board)
 
-    def test_a_seat_left_with_a_live_turn_by_compaction_gets_no_review_follow_up(self) -> None:
+    def test_a_worker_left_with_a_live_turn_by_compaction_gets_no_review_follow_up(self) -> None:
         session_dir = self.start_implementation("compact-still-live")
         self.finish_implementation(session_dir)
-        seat = self.open_seat(session_dir, context_tokens=100001)
+        worker = self.open_worker(session_dir, context_tokens=100001)
         (session_dir / "compact_still_live").touch()
 
-        result = self.run_seated_review(session_dir, seat)
+        result = self.run_assigned_review(session_dir, worker)
 
         self.assertEqual(result.returncode, 2, result.stderr)
-        self.assertIn("still has a live turn after compaction; end the seat", result.stderr)
+        self.assertIn("still has a live turn after compaction; end the worker", result.stderr)
         self.assertEqual(
             (session_dir / "mesh_events.txt").read_text(encoding="utf-8").splitlines(),
             ["compact"],
@@ -1710,15 +1710,15 @@ os.execv(sys.executable, [sys.executable, str(Path(__file__).with_name("progress
         for slot in ("impl", "test"):
             self.assertIn(f"[{slot}] register:", board)
 
-    def test_three_lenses_run_at_once_each_in_a_seat_of_its_own(self) -> None:
-        """The craft lens joins the other two in the `review` seat.
+    def test_three_lenses_run_at_once_each_in_a_worker_of_its_own(self) -> None:
+        """The craft lens joins the other two in the `review` worker.
 
         No writer sits there, so its pass is a third record beside the two
         lenses' and closes neither of them.
         """
         session_dir = self.start_implementation("three-lenses")
         self.recorder("finish-pass", "--session-dir", str(session_dir), "--status", "completed")
-        seats = {"adversary": "test", "contract": "impl", "craft": "review"}
+        workers = {"adversary": "test", "contract": "impl", "craft": "review"}
 
         running = [
             subprocess.Popen(
@@ -1728,13 +1728,13 @@ os.execv(sys.executable, [sys.executable, str(Path(__file__).with_name("progress
                 text=True,
                 env=self.environment(),
             )
-            for lens in seats
+            for lens in workers
         ]
         for process in running:
             _, errors = process.communicate(timeout=300)
             self.assertEqual(process.returncode, 0, errors)
 
-        for lens in seats:
+        for lens in workers:
             self.assertEqual(
                 (session_dir / f"review_status_{lens}").read_text().strip(), "reviewed"
             )
@@ -1748,7 +1748,7 @@ os.execv(sys.executable, [sys.executable, str(Path(__file__).with_name("progress
             sorted(
                 (event_type, slot)
                 for event_type in ("pass_started", "pass_finished")
-                for slot in seats.values()
+                for slot in workers.values()
             ),
         )
         self.assertNotIn(
@@ -1757,7 +1757,7 @@ os.execv(sys.executable, [sys.executable, str(Path(__file__).with_name("progress
         )
 
         board = (session_dir / "board.log").read_text(encoding="utf-8")
-        for lens, slot in seats.items():
+        for lens, slot in workers.items():
             self.assertIn(f"[{slot}] register: {lens} review up", board)
 
     def test_an_unknown_lens_is_refused_before_anything_runs(self) -> None:

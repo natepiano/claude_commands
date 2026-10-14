@@ -34,14 +34,14 @@ must not drift from it:
   branch, phases, checkpoints and ETA are the unit's.
 - **Unit director** — the Claude session that runs a unit: the `/unit:direct`
   session the showrunner launches in tmux. It receives messages, decides, writes
-  Work Orders, dispatches seats, runs gates, checkpoints and reports. It writes
+  Work Orders, dispatches workers, runs gates, checkpoints and reports. It writes
   no implementation code.
-- **Seat** — a Codex worker thread the unit director dispatches. Implementation
-  seats open once per run, continue across phases and repairs in whatever role
+- **Worker** — a Codex worker thread the unit director dispatches. Implementation
+  workers open once per run, continue across phases and repairs in whatever role
   is needed, attempt compaction above `PLAN_DELEGATE_COMPACT_ABOVE_TOKENS` but
   continue after a failed attempt, press on after context overflow with
-  `Continue where you stopped.`, open anew only when no open seat can take the
-  work, and end at `end_session.sh`. Reviews run on the unit's seats, or on the
+  `Continue where you stopped.`, open anew only when no open worker can take the
+  work, and end at `end_session.sh`. Reviews run on the unit's workers, or on the
   production's review pool when its doc names one.
 - **Review pool** — a production's reusable reviewers, allocated by a script.
 - **Review unit** — the production's `/review:direct` run. It primes the pools
@@ -211,7 +211,7 @@ A run that stopped, failed, or waits on a decision has no finish in its record, 
 
    ```
    From <unit>: phase <N> checkpoint <hash> — <title>. Shots: <paths | none, no visible change>. Phase <next> ETA: <HH:MM zone>
-   review trial: ux <N> findings, code <N> findings, review-seat minutes <M>, ux check minutes <U>, ux repair minutes <R>
+   review trial: ux <N> findings, code <N> findings, review-worker minutes <M>, ux check minutes <U>, ux repair minutes <R>
    Parallel: <Phase N, Phase M could start | none — <what the next phase waits on>>
    design check: <pass | N defects, each moved to <phase>> — fresh check on exactly these shots, built from <hash>
    ```
@@ -312,7 +312,7 @@ A run that stopped, failed, or waits on a decision has no finish in its record, 
      defect, fix it, then look again.
    - **A fix that fails twice** (2026-10-01, measured: one bar-fit finding
      failed four times before the fifth attempt held). When the same finding
-     is still open after two fixes, send no third seat pass with the same
+     is still open after two fixes, send no third worker pass with the same
      approach. First find why the fixes did not hold, write it in the
      attempts log, then dispatch once with an approach that addresses that
      cause.
@@ -371,9 +371,9 @@ A run that stopped, failed, or waits on a decision has no finish in its record, 
     about 75 minutes). Lint covers the whole workspace. When it fails, fix
     the error it names, wherever it is in the workspace, then lint once.
     Never re-run lint on a tree that has not changed. A Work Order runs lint
-    once after the seat's edits, never once per crate; per crate is right
+    once after the worker's edits, never once per crate; per crate is right
     only for test (`/unit:direct`). Fix a file you do not
-    own through item 9, and name it in your checkpoint notice. Tell your seats
+    own through item 9, and name it in your checkpoint notice. Tell your workers
     this in every Work Order that runs lint.
 14. **When others wait on you** (user, 2026-09-29). When your checkpoint turns
     the merge branch red, in CI or lint, send a small fix checkpoint at once,

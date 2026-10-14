@@ -48,7 +48,7 @@ class ProcessTableTests(unittest.TestCase):
             process_table.Process(1, 0, "codex", "codex exec --json"),
         ))
 
-    def test_servers_wrappers_and_claude_seats_are_not_agents(self) -> None:
+    def test_servers_wrappers_and_claude_workers_are_not_agents(self) -> None:
         for command, arguments in (
             ("codex", "codex app-server --listen ws://127.0.0.1:1"),
             ("zsh", f"zsh -c {MESH} start --name a"),

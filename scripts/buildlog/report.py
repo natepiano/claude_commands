@@ -272,14 +272,14 @@ class PackageRebuilds:
 class TokenHolder:
     call_id: str
     delegate_session: str
-    seat: str
+    worker: str
     starts_at: datetime
     ends_at: datetime
 
 
 @dataclass(frozen=True)
 class TokenWaitAttribution:
-    behind_another_seat_s: float
+    behind_another_worker_s: float
     behind_own_call_s: float
 
 
@@ -321,7 +321,7 @@ class WaitingRow:
 
 @dataclass(frozen=True)
 class DailyWaits:
-    another_seat: WaitMeasurements
+    another_worker: WaitMeasurements
     own_call: WaitMeasurements
     memory: WaitMeasurements
     ci_queue: WaitMeasurements
@@ -331,7 +331,7 @@ class DailyWaits:
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "rows", (
-            WaitingRow("Build-folder turn, behind another seat", self.another_seat, "calls"),
+            WaitingRow("Build-folder turn, behind another worker", self.another_worker, "calls"),
             WaitingRow("Build-folder turn, behind its own call", self.own_call, "calls"),
             WaitingRow("Held target", self.held_target, "calls"),
             WaitingRow("Memory admission", self.memory, "steps"),
@@ -401,7 +401,7 @@ def caller_label(caller: object, host: object, hosts: int) -> str:
 
 
 def wait_row(row: WaitingRow) -> list[str]:
-    """Summarize measured waits, keeping parallel seats as separate time."""
+    """Summarize measured waits, keeping parallel workers as separate time."""
     label, measurements, unit = row.name, row.measurements, row.unit
     if not measurements.recorded:
         return [label, "none", "", "", "", ""]
@@ -409,7 +409,7 @@ def wait_row(row: WaitingRow) -> list[str]:
     waited = f"{len(positive)} of {measurements.recorded} {unit}"
     longest = measurements.longest
     if isinstance(longest, NoWait):
-        return [label, "none", "0", waited, f"0.0 {'job' if unit == 'jobs' else 'seat'}-hours", ""]
+        return [label, "none", "0", waited, f"0.0 {'job' if unit == 'jobs' else 'worker'}-hours", ""]
     when = memory.local_time(call_time(longest.started_at))
     totals: dict[str, float] = {}
     for duration, owner, _, _ in positive:
@@ -417,7 +417,7 @@ def wait_row(row: WaitingRow) -> list[str]:
     worst = ", ".join(
         f"{owner} {seconds(duration)}" for owner, duration in sorted(totals.items(), key=lambda item: (-item[1], item[0]))[:3]
     )
-    hours = f"{sum(duration for duration, _, _, _ in positive) / 3600:.1f} {'job' if unit == 'jobs' else 'seat'}-hours"
+    hours = f"{sum(duration for duration, _, _, _ in positive) / 3600:.1f} {'job' if unit == 'jobs' else 'worker'}-hours"
     return [label, f"{seconds(longest.seconds)} ({longest.name}, {when})", str(sum(duration > 300 for duration, _, _, _ in positive)), waited, hours, worst]
 
 
@@ -431,18 +431,18 @@ def call_time(value: object) -> datetime:
 
 def token_holders(rows: list[Row]) -> list[TokenHolder]:
     holders: list[TokenHolder] = []
-    for call_id, started_at, wait_s, ended_at, seat, delegate_session in rows:
+    for call_id, started_at, wait_s, ended_at, worker, delegate_session in rows:
         starts_at = call_time(started_at) + timedelta(seconds=wait_seconds(wait_s))
         ends_at = call_time(ended_at)
         if starts_at < ends_at:
-            holders.append(TokenHolder(str(call_id), str(delegate_session), str(seat), starts_at, ends_at))
+            holders.append(TokenHolder(str(call_id), str(delegate_session), str(worker), starts_at, ends_at))
     return holders
 
 
 def attribute_token_wait(
     call_id: str,
     delegate_session: str,
-    seat: str,
+    worker: str,
     starts_at: datetime,
     wait_s: float,
     token_wait_s: float,
@@ -461,7 +461,7 @@ def attribute_token_wait(
         if left < wait_starts_at or right > wait_ends_at:
             continue
         covering = [holder for holder in overlapping if holder.starts_at < right and holder.ends_at > left]
-        if covering and all(holder.seat == seat for holder in covering):
+        if covering and all(holder.worker == worker for holder in covering):
             own_s += (right - left).total_seconds()
     own_s = min(token_wait_s, own_s)
     return TokenWaitAttribution(token_wait_s - own_s, own_s)
@@ -477,14 +477,14 @@ def build_folder_waits(connection: sqlite3.Connection, day: str) -> tuple[WaitMe
     calls = fetch(
         connection,
         "SELECT id, token_wait_s, coalesce(worktree_name, '(unknown worktree)'), started_at,"
-        + " coalesce(wait_s, 0), coalesce(seat, '(unknown seat)'), delegate_session FROM calls"
+        + " coalesce(wait_s, 0), coalesce(worker, '(unknown worker)'), delegate_session FROM calls"
         + " WHERE tool = 'verify.sh' AND started_at >= ? AND started_at < ? AND token_wait_s > 0"
         + f" AND {natedev_call_predicate()}",
         start, end,
     )
     holder_rows = fetch(
         connection,
-        "SELECT id, started_at, coalesce(wait_s, 0), ended_at, coalesce(seat, '(unknown seat)'), delegate_session"
+        "SELECT id, started_at, coalesce(wait_s, 0), ended_at, coalesce(worker, '(unknown worker)'), delegate_session"
         + " FROM calls WHERE tool = 'verify.sh' AND ended_at IS NOT NULL AND delegate_session IS NOT NULL"
         + " AND ended_at >= ?"
         + f" AND {natedev_call_predicate()}",
@@ -495,14 +495,14 @@ def build_folder_waits(connection: sqlite3.Connection, day: str) -> tuple[WaitMe
         holders_by_session.setdefault(holder.delegate_session, []).append(holder)
     another_waits: list[ReportedWait] = []
     own_waits: list[ReportedWait] = []
-    for call_id, duration, tree, started_at, wait_s, seat, delegate_session in calls:
+    for call_id, duration, tree, started_at, wait_s, worker, delegate_session in calls:
         token_wait_s = wait_seconds(duration)
         attribution = TokenWaitAttribution(token_wait_s, 0.0) if token_wait_s <= 0 or not isinstance(delegate_session, str) else attribute_token_wait(
-            str(call_id), delegate_session, str(seat), call_time(started_at), wait_seconds(wait_s), token_wait_s,
+            str(call_id), delegate_session, str(worker), call_time(started_at), wait_seconds(wait_s), token_wait_s,
             holders_by_session.get(delegate_session, []),
         )
         identity = (str(tree), str(tree), str(started_at))
-        another_waits.append((attribution.behind_another_seat_s, *identity))
+        another_waits.append((attribution.behind_another_worker_s, *identity))
         own_waits.append((attribution.behind_own_call_s, *identity))
     return WaitMeasurements(recorded, another_waits), WaitMeasurements(recorded, own_waits)
 
@@ -512,7 +512,7 @@ def daily_waits(connection: sqlite3.Connection, day: str) -> DailyWaits:
     start, end = day_range(day)
     steps = fetch(
         connection,
-        "SELECT mem_wait_s, coalesce(worktree_name, '(unknown worktree)'), seat, started_at FROM steps"
+        "SELECT mem_wait_s, coalesce(worktree_name, '(unknown worktree)'), worker, started_at FROM steps"
         + " WHERE started_at >= ? AND started_at < ? AND mem_wait_s > 0"
         + f" AND {natedev_step_predicate()}",
         start, end,
@@ -532,8 +532,8 @@ def daily_waits(connection: sqlite3.Connection, day: str) -> DailyWaits:
     )[0][0])
     return DailyWaits(
         another_waits, own_waits,
-        WaitMeasurements(memory_recorded, [(wait_seconds(duration), str(tree), f"{tree} {seat}" if seat else str(tree), str(at))
-         for duration, tree, seat, at in steps]),
+        WaitMeasurements(memory_recorded, [(wait_seconds(duration), str(tree), f"{tree} {worker}" if worker else str(tree), str(at))
+         for duration, tree, worker, at in steps]),
         WaitMeasurements(len(jobs), [(wait_seconds(duration), f"{workflow} / {name}", f"{workflow} / {name}", str(at))
          for duration, workflow, name, at in jobs]), held_waits, unrecorded,
     )
@@ -552,7 +552,7 @@ def waiting_lines(waits: DailyWaits) -> list[str]:
             held_row[1:5] = ["not recorded"] * 4
         else:
             held_row[3] += f"; not recorded for {unrecorded} {'call' if unrecorded == 1 else 'calls'}"
-    source = "Source: verify.sh calls, memory-gated steps and CI jobs; a seat's own calls run one at a time, so waiting behind its own call adds no delay, behind another seat does."
+    source = "Source: verify.sh calls, memory-gated steps and CI jobs; a worker's own calls run one at a time, so waiting behind its own call adds no delay, behind another worker does."
     return ["### Waiting", "", *table(["Wait", "Longest", "Over 5 min", "Waited", "Total", "Worst"], rows), source, ""]
 
 
@@ -1414,7 +1414,7 @@ def failure_bin(edits: int) -> int:
 
 
 def tests_per_edit_data(connection: sqlite3.Connection, end_day: str) -> TestsPerEditWindow:
-    """Track each seat through the query's last day, including calls before the displayed window."""
+    """Track each worker through the query's last day, including calls before the displayed window."""
     rows = fetch(
         connection,
         " ".join(
@@ -1437,21 +1437,21 @@ def tests_per_edit_data(connection: sqlite3.Connection, end_day: str) -> TestsPe
     edits_since_green: dict[str, int] = {}
     waiting_for_green: dict[str, list[tuple[int, datetime]]] = {}
 
-    for call_id, started_at, ended_at, call_day, seat_value, verb, status, outcome in rows:
-        if seat_value is None:
+    for call_id, started_at, ended_at, call_day, worker_value, verb, status, outcome in rows:
+        if worker_value is None:
             continue
-        seat = cast(str, seat_value)
+        worker = cast(str, worker_value)
         day = cast(str, call_day)
         in_window = day >= first_day
         activity = daily.setdefault(day, DailyTestsPerEdit()) if in_window else None
         span = trees.get(cast(str, call_id))
         if span is not None:
-            previous = last_tree.get(seat)
+            previous = last_tree.get(worker)
             if previous is not None and previous != span.first:
-                edits_since_green[seat] = edits_since_green.get(seat, 0) + 1
+                edits_since_green[worker] = edits_since_green.get(worker, 0) + 1
                 if activity is not None:
                     activity.edits += 1
-            last_tree[seat] = span.last
+            last_tree[worker] = span.last
 
         if verb != "test":
             continue
@@ -1459,18 +1459,18 @@ def tests_per_edit_data(connection: sqlite3.Connection, end_day: str) -> TestsPe
             activity.tests += 1
         finished_at = datetime.fromisoformat(cast(str, ended_at or started_at))
         if status == 0 and outcome in ("ran", "reused"):
-            for bin_index, failed_at in waiting_for_green.pop(seat, []):
+            for bin_index, failed_at in waiting_for_green.pop(worker, []):
                 recovery = bins[bin_index]
                 recovery.recovered += 1
                 minutes = max(0.0, (finished_at - failed_at).total_seconds() / 60)
                 recovery.minutes_to_green += minutes
                 recovery.recovery_minutes.append(minutes)
-            edits_since_green[seat] = 0
+            edits_since_green[worker] = 0
         elif outcome != "interrupted" and (outcome == "failed" or status is not None and status != 0) and in_window:
-            edits = edits_since_green.get(seat, 0)
+            edits = edits_since_green.get(worker, 0)
             bin_index = failure_bin(edits)
             bins[bin_index].failures += 1
-            waiting_for_green.setdefault(seat, []).append((bin_index, finished_at))
+            waiting_for_green.setdefault(worker, []).append((bin_index, finished_at))
     return TestsPerEditWindow(first_day, daily, bins)
 
 

@@ -33,7 +33,7 @@
 #               `post` refuses a handoff that does not lead with that field
 #   done      — this agent's assignment is complete. The launcher's own exit
 #               posts (`done`, `blocked`) carry a `launcher:` prefix so the
-#               progress report can tell them from the seat's words
+#               progress report can tell them from the worker's words
 #
 # There is no `ask` and no `answer`: a question to a peer is a message.
 #

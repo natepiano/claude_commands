@@ -50,7 +50,7 @@ to rediscover after a context compaction lives in the doc.
 - **Layout:** <only the dirs/files phases touch, as a short map>
 - **Key files:** <path — role> for each file a phase reads or modifies
 - **Test lanes:** <for each crate a phase touches, its `tests/` directory or
-  `none` — what a Work Order's **Seats** opens the `test` seat against>
+  `none` — what a Work Order's **Workers** opens the `test` worker against>
 - **Build:** <for Rust always `bash ~/.claude/scripts/delegate/verify.sh check <pkg>`;
   otherwise the project's exact build command>
 - **Test:** <for Rust always `bash ~/.claude/scripts/delegate/verify.sh test <pkg>`;
@@ -100,12 +100,12 @@ This is the meat — do not paraphrase a resolved design down to a summary.>
 - `<path>` — <what changes here>
 - ...
 
-**Seats:** <opening line: `1 writer + 1 tester` or `2 writers` — then the split
+**Workers:** <opening line: `1 writer + 1 tester` or `2 writers` — then the split
 (by crate, module, or file group) or why nothing splits>
 - `impl` — <files it owns>; hub: `<path>` (<why every writer needs it>)
 - `test` — <what it writes from the Spec alone, and where under `tests/`>
 <!-- A slot is an identity; the role it opens in is what its line says. A line
-     without `opens as` opens in its own name. A `test` seat with no test lane
+     without `opens as` opens in its own name. A `test` worker with no test lane
      reads `opens as impl`. Writers hold disjoint files; every hub file has
      exactly one owner. Rule 7. -->
 
@@ -229,8 +229,8 @@ Rules:
    a defect gets fixed where it lives, and an authored boundary that hides that is
    how a workaround gets built on purpose. See `~/.claude/docs/decision_criteria.md`
    → "Where a fix goes".
-7. **Seats decides the opening.** Every `todo` Work Order carries **Seats**;
-   `/unit:direct` opens its two seats from it and partitions files by it
+7. **Workers decides the opening.** Every `todo` Work Order carries **Workers**;
+   `/unit:direct` opens its two workers from it and partitions files by it
    instead of deciding at launch. `impl` always opens as `impl`. `test` opens
    as `test` wherever the phase has a **test lane** — a `tests/` directory in a
    touched crate (Delegation Context → **Test lanes**) and a Spec concrete
@@ -240,8 +240,8 @@ Rules:
    re-exports, `Cargo.toml`, plugin registration, a shared types file — sits
    on exactly one writer's line as `hub:`; the other writer messages that owner
    for the line it needs. A tester's line names what the Spec alone lets it
-   write; a Spec too thin for that is a reason to open the seat as a writer.
+   write; a Spec too thin for that is a reason to open the worker as a writer.
    When nothing splits, the opening line says so and `impl` takes every file.
-   A repair runs one seat whatever Seats says. An older three-seat field maps
+   A repair runs one worker whatever Workers says. An older three-worker field maps
    down per `/unit:direct` → `<PhaseTeam/>`.
 

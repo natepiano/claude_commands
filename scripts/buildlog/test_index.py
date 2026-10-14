@@ -226,6 +226,21 @@ class IndexTests(unittest.TestCase):
     def ids(self) -> list[object]:
         return [row[0] for row in self.rows("SELECT id FROM steps ORDER BY id")]
 
+    def test_first_index_read_migrates_worker_fields_and_preserves_incomplete_appends(self) -> None:
+        partial = encode(step("pending", worker="next"))[:20]
+        self.write(self.host_file, step("old-step", seat="impl"), call("old-call", seat="test"))
+        with self.host_file.open("ab") as output:
+            _ = output.write(partial)
+        self.assertEqual(index.update(), 2)
+        self.assertEqual(self.rows("SELECT worker FROM steps"), [("impl",)])
+        self.assertEqual(self.rows("SELECT worker FROM calls"), [("test",)])
+        rewritten = self.host_file.read_bytes()
+        self.assertNotIn(b'"seat"', rewritten)
+        self.assertTrue(rewritten.endswith(partial))
+        modified = self.host_file.stat().st_mtime_ns
+        self.assertEqual(index.update(), 0)
+        self.assertEqual(self.host_file.stat().st_mtime_ns, modified)
+
     def test_reads_only_new_complete_lines(self) -> None:
         first, second, third = (encode(step(f"s{number}")) for number in range(3))
         _ = self.host_file.write_bytes(first + second + third[:20])
@@ -367,7 +382,7 @@ class IndexTests(unittest.TestCase):
             _ = connection.execute("UPDATE samples SET power_profile = NULL, power_profile_since = NULL")
             connection.commit()
         self.assertEqual(index.update(), 1)
-        self.assertEqual(self.rows("PRAGMA user_version"), [(15,)])
+        self.assertEqual(self.rows("PRAGMA user_version"), [(16,)])
         self.assertEqual(self.rows("SELECT power_profile, power_profile_since FROM samples"), [("power-saver", STAMP)])
 
     def test_reindex_reads_everything_again(self) -> None:
@@ -573,7 +588,7 @@ class IndexTests(unittest.TestCase):
                 ("old", None, None, None, None),
             ],
         )
-        self.assertEqual(index.SCHEMA_VERSION, 15)
+        self.assertEqual(index.SCHEMA_VERSION, 16)
 
     def test_schema_thirteen_rebuilds_call_fields_from_json_lines(self) -> None:
         self.write(self.host_file, call("recorded", target="mac", hold_wait_s=0.4))

@@ -63,9 +63,9 @@ If the conversation does not make the phase obvious, ask the user one clarifying
    Drop empty fields. Keep bullets short and concrete. This file is input to the
    remaining-phase review and closeout shrink; it never enters the repository.
    Read **Split observed** from `${SESSION_DIR}/board.log` — the `register`
-   and `handoff` posts say which seat held which role, and when — and from the
+   and `handoff` posts say which worker held which role, and when — and from the
    two `impl_summary_<slot>.txt`; never reconstruct it from memory. It is what
-   `<MaintainWorkOrders/>` re-seats the remaining Work Orders from.
+   `<MaintainWorkOrders/>` assigns workers to the remaining Work Orders from.
 
 <StateAndConsequenceAudit>
 Always perform this audit, including when the caller passes `skip-architect`.
@@ -130,7 +130,7 @@ and determined this phase produced nothing for an architect to find. Write
 `not run — phase matched its plan` into the final update's architect row and go
 straight to Step 5; the temporary retrospective's implications still get folded into the
 remaining Work Orders exactly as written there, and its **Split observed**
-still re-seats them per `<MaintainWorkOrders/>`. Do not override the token or
+still assigns workers to them per `<MaintainWorkOrders/>`. Do not override the token or
 re-derive the trigger test — the caller has the review results and the ledger,
 this command does not.
 
@@ -152,10 +152,10 @@ transcript too large to read — which leaves the user with an unexplained
 multi-minute silence at the same point in every phase.
 
 Write the prompt to `${SESSION_DIR}/architect_prompt_<phase>.md`. In a delegate
-run, select an open seat per `/unit:direct`'s `<RunPhaseReview/>`, then:
+run, select an open worker per `/unit:direct`'s `<RunPhaseReview/>`, then:
 
 ```
-bash ~/.claude/scripts/delegate/review.sh --to "<full-seat-name>" \
+bash ~/.claude/scripts/delegate/review.sh --to "<full-worker-name>" \
   "${SESSION_DIR}" "${WORKING_DIR}" \
   "${SESSION_DIR}/architect_prompt_<phase>.md" \
   review \
@@ -165,8 +165,8 @@ architect review of the remaining phases against what phase <phase> actually shi
   <pass_index>
 ```
 
-If every open seat is busy, use the same call with `--slot review` in place of
-`--to "<full-seat-name>"`; that seat stays open. Only a phase review outside a
+If every open worker is busy, use the same call with `--slot review` in place of
+`--to "<full-worker-name>"`; that worker stays open. Only a phase review outside a
 delegate run calls `review.sh` with neither option.
 
 - `review` is the subtask name; it resolves through `[delegate.<family>]` in
@@ -216,7 +216,7 @@ The prompt must include:
      make any item inaccurate, redundant, already satisfied, or aimed at the
      wrong target? Quote the current item and propose its exact replacement or
      removal with concrete evidence. Do not propose optional polish.
-  9. (Delegate-ready plans only) For each remaining phase, does its **Seats**
+  9. (Delegate-ready plans only) For each remaining phase, does its **Workers**
      still describe a real partition against the code that now exists —
      disjoint owner sets, one owner per hub file, a test lane that exists? Name
      a better opening where one is visible, in the field's own words
@@ -302,11 +302,11 @@ byte-identical.
    (`~/.claude/docs/delegate_plan_format.md` → "Forward-propagation") for the facts
    the just-shipped phase produced. This is the single most important maintenance
    step: it is what lets the next `/unit:direct` assemble without research.
-2. **Re-seat.** For each remaining Work Order that shares files or crates with
-   the shipped phase, revise its **Seats** from the retrospective's **Split
+2. **Reassign workers.** For each remaining Work Order that shares files or crates with
+   the shipped phase, revise its **Workers** from the retrospective's **Split
    observed** and any Q9 finding: owner sets that turned out independent, the
    hub file every writer needed, a test lane that was or was not real. Add
-   **Seats** to any remaining Work Order that lacks one (format doc rule 7).
+   **Workers** to any remaining Work Order that lacks one (format doc rule 7).
    Mechanical, no gate.
 3. **Apply each Q6 finding** by editing the named Work Order in place — add the
    missing constraint, fix the drifted file/line ref, adjust the **Spec** or
@@ -330,11 +330,11 @@ byte-identical.
    ```
 
    This shared tagged contract validates Goal, Spec, and Files together, and a
-   non-empty Seats wherever the field is present. After any Files edit or newly
+   non-empty Workers wherever the field is present. After any Files edit or newly
    named implementation path, rerun this command; failure blocks Step 6.
 
 Mechanical Work Order edits (added constraints, corrected refs, gate tweaks, a
-re-seated opening) need no user gate — they go straight in. A finding that changes a remaining phase's
+reassigned worker opening) need no user gate — they go straight in. A finding that changes a remaining phase's
 *intent, scope, or ordering* is a significant finding: route it through
 `<SignificantFindings/>` below, and once resolved, write the outcome into the
 affected Work Order, not a prose review note.
