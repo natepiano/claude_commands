@@ -943,7 +943,7 @@ def _launch_session(
         prompt += " " + note
     command = (_resume_command(session, prompt, record["target"]) if "target" in record
                else _resume_command(session, prompt))
-    if host["kind"] == "unknown":
+    if host["kind"] == "unknown" or (host["kind"] == "terminal" and sys.platform == "linux"):
         if "target" in record:
             command = resume_command(session, record["target"], record.get("source_label", record["label"]), record.get("why", ""))
         return ManualRestartRequired(command)
@@ -1103,13 +1103,46 @@ def _set_entry_progress(record: SessionShutdown, progress: SessionProgress) -> b
         return False
     if written:
         record["progress"] = progress
+        if record.get("target") and progress["kind"] in {"restart failed", "manual restart"}:
+            _journal_move_failure(record, progress["reason"] if progress["kind"] == "restart failed" else "manual restart")
     return written
+
+
+def _journal_move_failure(record: SessionShutdown, reason: str) -> None:
+    from scripts.accounts import moves
+    session = record["session"]
+    moves.append_move(moves.FailedMove(kind="failed", at=settle.record_time(), tool="claude",
+        subject=session["session_id"] + ": " + session["name"], move_id=record["request_id"], reason=reason))
+
+
+def _prove_move(record: SessionShutdown) -> bool:
+    """A registry entry alone does not prove that the session adopted the target."""
+    target_label = record.get("target", "")
+    if not target_label:
+        return True
+    from scripts.accounts import accounts, moves
+    from scripts.accounts.refusal_watch import clear_assumed
+    import account
+    target = accounts.main_config_dir() if target_label == "default" else accounts.account_dir(target_label)
+    live = next((item for item in sessions.live_sessions() if item["sessionId"] == record["session"]["session_id"]), None)
+    directory = account.process_config_dir(live["pid"]) if live is not None else None
+    if directory is None or directory.resolve() != target.resolve():
+        reason = "still on " + record.get("source_label", record["label"]) if directory is not None else "resumed account unreadable"
+        mark_restart_failed(record, reason)
+        return False
+    session = record["session"]
+    moves.append_move(moves.ConfirmedMove(kind="confirmed", at=settle.record_time(), tool="claude",
+        subject=session["session_id"] + ": " + session["name"], move_id=record["request_id"], config_dir=str(target)))
+    clear_assumed(session["session_id"])
+    return True
 
 
 def _record_timer_restore_progress(
     record: SessionShutdown,
     failures: tuple[PendingTimer, ...],
 ) -> None:
+    from scripts.accounts.refusal_watch import clear_assumed
+    clear_assumed(record["session"]["session_id"])
     if failures:
         _record_pending_timers(record, failures)
         return
@@ -1144,7 +1177,7 @@ def _dry_run_entry_order(record: SessionShutdown) -> tuple[int, str]:
     return _entry_order(record)
 
 
-def _mark_restart_failed(
+def mark_restart_failed(
     record: SessionShutdown,
     reason: str,
 ) -> None:
@@ -1169,7 +1202,7 @@ def _launch_failure_left_session_live(
             print(f"{record['machine']}: {name} is live; its launch reported: {reason}")
             return True
         case SessionNotLive():
-            _mark_restart_failed(record, reason)
+            mark_restart_failed(record, reason)
         case SessionLivenessUnknown(reason=unknown):
             print(f"{record['machine']}: {name} restart unfinished: {reason}; {unknown}")
             _restore_prior(record)
@@ -1186,7 +1219,7 @@ def _restart_note_delivered(
         delivery = _send_restart_note(record, note, dry_run=dry_run)
     except (OSError, RuntimeError, ValueError, subprocess.SubprocessError) as error:
         if not dry_run:
-            _mark_restart_failed(
+            mark_restart_failed(
                 record,
                 f"restart note not delivered: {_error_reason(error)}",
             )
@@ -1194,7 +1227,7 @@ def _restart_note_delivered(
     if delivery["kind"] == "sent":
         return True
     if not dry_run:
-        _mark_restart_failed(
+        mark_restart_failed(
             record,
             "restart note not delivered: "
             + _first_line(delivery["reason"], "queued"),
@@ -1219,6 +1252,8 @@ def launch_entry(
         relaunching_pending_timers = True
         match _session_liveness(session_id):
             case SessionLive():
+                if not dry_run and not _prove_move(record):
+                    return EntrySettled()
                 timers = _pending_timer_restores(record, progress["timers"])
                 failures = _restore_timers(timers, dry_run=dry_run)
                 if not dry_run:
@@ -1234,7 +1269,7 @@ def launch_entry(
         _retire(record, dry_run=dry_run)
     except (OSError, RuntimeError, ValueError, subprocess.SubprocessError) as error:
         if not dry_run:
-            _mark_restart_failed(
+            mark_restart_failed(
                 record,
                 f"queued shutdown messages not retired: {_error_reason(error)}",
             )
@@ -1242,6 +1277,8 @@ def launch_entry(
     was_live = session_id in _live_session_ids()
     note = restart_note(record, restarted_at)
     if was_live:
+        if not dry_run and not _prove_move(record):
+            return EntrySettled()
         if progress["kind"] != "manual restart" and not _restart_note_delivered(
             record, note, dry_run=dry_run
         ):
@@ -1264,7 +1301,7 @@ def launch_entry(
         )
     except ScheduledRestartPromptNotRecorded as error:
         if not dry_run:
-            _mark_restart_failed(
+            mark_restart_failed(
                 record,
                 f"restart prompt not recorded: {_error_reason(error)}",
             )
@@ -1303,10 +1340,12 @@ def confirm_entry(
     elif current["progress"]["kind"] in {"restarting", "stopping"}:
         return
     if not live:
-        _mark_restart_failed(
+        mark_restart_failed(
             record,
             f"session not live after {SESSION_WAIT_SECONDS:g} seconds",
         )
+        return
+    if not _prove_move(record):
         return
     if record["session"]["kind"] == "showrunner":
         note = restart_note(record, restarted_at)
@@ -1415,7 +1454,7 @@ def _launch_entry_safely(
     try:
         return launch_entry(record, restarted_at, desktop_state, dry_run=False)
     except Exception as error:
-        _mark_restart_failed(record, _error_reason(error))
+        mark_restart_failed(record, _error_reason(error))
         return EntrySettled()
 
 
@@ -1433,7 +1472,7 @@ def relaunch_session(
         try:
             cleaned = stop_work.stop_session(record)
         except Exception as error:
-            _mark_restart_failed(record, _error_reason(error))
+            mark_restart_failed(record, _error_reason(error))
             return record
         if cleaned["request_id"] != record["request_id"]:
             return record
@@ -1441,7 +1480,7 @@ def relaunch_session(
         if record["progress"]["kind"] == "stopping":
             return record
         if _unfinished_cleanup(record):
-            _mark_restart_failed(record, "owner cleanup not confirmed; run /shutdown restart again")
+            mark_restart_failed(record, "owner cleanup not confirmed; run /shutdown restart again")
             return record
     try:
         current, claimed = _claim_relaunch(record)

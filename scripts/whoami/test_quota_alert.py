@@ -28,7 +28,8 @@ import note_file
 import account
 from agent_notes import local_reset
 from note_file import read_note
-from scripts.accounts import accounts
+from scripts.accounts import accounts, refusals
+from scripts.production import showrunners
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "message"))
 import send
@@ -97,6 +98,8 @@ def configured_recipients(config: quota_alert.Config, here: str | None = None) -
 def setUpModule() -> None:
     """The times these tests expect are Pacific; the user's zone setting must not change them."""
     unittest.enterModuleContext(mock.patch.dict(os.environ, {"USER_ZONE": "America/Los_Angeles"}))
+    root = Path(unittest.enterModuleContext(tempfile.TemporaryDirectory()))
+    _ = unittest.enterModuleContext(mock.patch.object(showrunners, "NOTIFIER_STATE_DIR", root))
 
 
 class QuotaAlertTests(unittest.TestCase):
@@ -928,6 +931,26 @@ class QuotaAlertTests(unittest.TestCase):
         """Codex refused work for quota while codex 1 is out of its week; the first log line."""
         return next(line for line in self.block([self.note("codex 1.md", "active", "0")], self.now)
                     if line.startswith(("switched to claude", "switch to claude")))
+
+    def test_explicit_refusal_time_is_recorded_without_replacing_it_with_pass_time(self) -> None:
+        notes = [self.note("codex 1.md", "active", "0")]
+        readings = self.alert_readings(notes, self.now)
+        identity = readings.selected_account
+        assert isinstance(identity, agent_accounts.KnownCodexAccount)
+        earlier = self.now - timedelta(minutes=1)
+        _ = quota_alert.blocked(notes, identity, self.now, codex_readings=readings,
+            refused_at=quota_alert.RefusedAt(earlier), window=refusals.KnownWindow("weekly"))
+        self.assertEqual(refusals.load()[refusals.key("codex", identity.login)].at, earlier)
+
+    def test_unknown_refusal_time_uses_pass_time_and_ignores_inherited_handoff_environment(self) -> None:
+        notes = [self.note("codex 1.md", "active", "0")]
+        readings = self.alert_readings(notes, self.now)
+        identity = readings.selected_account
+        assert isinstance(identity, agent_accounts.KnownCodexAccount)
+        with mock.patch.dict(os.environ, {"ACCOUNT_REFUSAL_AT": (self.now - timedelta(days=1)).isoformat()}):
+            _ = quota_alert.blocked(notes, identity, self.now, codex_readings=readings,
+                refused_at=quota_alert.RefusalTimeUnknown(), window=refusals.KnownWindow("weekly"))
+        self.assertEqual(refusals.load()[refusals.key("codex", identity.login)].at, self.now)
 
     def test_codex_reaching_the_threshold_switches_nothing_and_says_to_keep_delegating(self) -> None:
         log = self.alert([self.note("codex 1.md", "active", "0")], self.now)

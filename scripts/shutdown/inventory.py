@@ -1054,10 +1054,11 @@ def _terminal_host(pid: int, desktop: Desktop) -> SessionHost:
     return {"kind": "unknown"}
 
 
-def _snapshot_desktops() -> dict[str, str]:
+def _snapshot_desktops(*, refresh: bool = True) -> dict[str, str]:
     if sys.platform == "darwin":
         return {}
-    snapshotter = shutil.which("agent-sessions-snapshot")
+    snapshotter = (shutil.which("agent-sessions-snapshot")
+                   if refresh and os.environ.get("REFUSAL_WATCH_INVENTORY") != "read existing" else None)
     if snapshotter is not None:
         try:
             _ = subprocess.run(
@@ -1219,7 +1220,7 @@ def _model(session_id: str) -> LastModel:
         if entry.get("type") != "assistant" or not isinstance(entry.get("message"), dict):
             continue
         candidate = cast(dict[str, object], entry["message"]).get("model")
-        if isinstance(candidate, str):
+        if isinstance(candidate, str) and candidate != "<synthetic>":
             model = candidate
     return (
         {"kind": "model", "name": model}
@@ -1268,6 +1269,7 @@ def _machine() -> str:
 def inventory(
     login: str,
     only: frozenset[str] = frozenset(),  # pyright: ignore[reportCallInDefaultInitializer]
+    *, refresh_desktops: bool = True,
 ) -> Inventory:
     """Return the live sessions safely attributable to ``login`` on this machine."""
     records = [_session_file(record) for record in sessions.live_sessions()]
@@ -1282,7 +1284,7 @@ def inventory(
     productions, runners = _registered_productions()
     units = _unit_sessions(runners)
     plans = _newest_unit_plans()
-    desktops = _snapshot_desktops()
+    desktops = _snapshot_desktops() if refresh_desktops else _snapshot_desktops(refresh=False)
     wanted_login = login.casefold()
     found: list[Session] = []
     unattributed: list[UnattributedSession] = []

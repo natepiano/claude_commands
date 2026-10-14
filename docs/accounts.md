@@ -215,6 +215,18 @@ A provider quota refusal moves seats to the picked Codex account with room; low 
 
 When no Codex account has room, assignments fall back to Claude and the notice names the earliest reset. A failed move to the picked home also falls back to Claude, with the failed move and cause in the notice. They return only when the selected Codex account can work and its refusal is resolved. Recorded refusals override saved percentages. The moves journal at `~/.local/state/accounts/moves.jsonl` separates a requested role change from each seat's confirmed resume, and records waits, failures and renewed room.
 
+## Automatic Claude moves
+
+Watcher inventories read the existing desktop snapshot. They never invoke the snapshot updater, which itself runs the notes timer. The same policy reaches their shutdown conductor, preventing a recursive notes update and keeping `--dry-run` read-only.
+
+The argument-free notes timer checks local top-level sessions' last transcript entries for provider quota refusals. Showrunners, unit directors and terminal, tmux, Ghostty and zed owners on the same refusing account share one selected shutdown and restart on the picked account. An open shutdown request stays with its conductor. The Mac has no timer.
+
+A known 5-hour reset in less than 20 minutes waits once per session and reset. Other refusals move; no room sends one account notice until a usage reading changes. Shutdown waits for an idle owner, idle seats, no merge and nothing ahead of upstream. Its status line keeps the target and refusal reason visible while blocked. Cancellation records a failed move, removes the assumption and suppresses the unchanged transcript refusal.
+
+`scripts/accounts/refusal_watch.py --dry-run` reports decisions without changing anything. For a live proof, `--assume-refused '<session id or name>' weekly|five-hour [--reset-in <minutes>]` writes a refusal for that owner only and runs once. The optional reset affects its wait decision, not stored account usage. A confirmed restart or cancellation deletes the assumption. A process still on the source is a failed move; a target process with pending timers is confirmed while those timers stay visible.
+
+Account status shows live sessions' accounts, the Codex seats account and its destination on refusal, seats still owing a continuation, and the last ten move entries with outcomes. Claude's `next` remains the account for a new Claude launch.
+
 ## Low-quota alerts
 
 Acknowledging an account's low-quota alert keeps it quiet across swaps. Made spare and then selected again, it stays quiet until its own quota recovers or resets.

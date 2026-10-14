@@ -39,7 +39,7 @@ from agent_accounts import (ClaudeAccountsInUse, ClaudeDirectorySource, CodexHom
                             codex_home_display, codex_homes,
                             codex_report_in_use, live_reports, seats_home as resolve_seats_home)
 from quota_alert import (AgentNote, alert, blocked, current_session, refresh, CodexAlertPassReadings,
-                         codex_alert_pass)
+                         codex_alert_pass, RefusedAt, RefusalTimeUnknown)
 from run_out import READINGS_LOG
 import usage_store
 
@@ -352,14 +352,15 @@ def main() -> None:
             identity = UnknownCodexAccount(Path(arguments[0]), arguments[1])
         else:
             parser.error("expected HOME LOGIN LABEL or HOME REASON")
-        refused_at = None
+        refused_at: RefusedAt | RefusalTimeUnknown = RefusalTimeUnknown()
         if parsed.refused_at:
             try:
-                refused_at = datetime.fromisoformat(parsed.refused_at)
+                parsed_time = datetime.fromisoformat(parsed.refused_at)
             except ValueError:
                 parser.error("--refused-at needs an aware ISO time")
-            if refused_at.tzinfo is None:
+            if parsed_time.tzinfo is None:
                 parser.error("--refused-at needs an aware ISO time")
+            refused_at = RefusedAt(parsed_time)
         window = (refusals.KnownWindow("weekly") if parsed.window == "weekly" else
                   refusals.KnownWindow("five_hour") if parsed.window == "five_hour" else refusals.UnknownWindow())
         for line in blocked(list(note_file.read_notes()), identity, window=window, refused_at=refused_at):
@@ -385,6 +386,14 @@ def main() -> None:
         # The pacer must never cost the notes or the alerts; launches fall back to
         # default once its decision is ten minutes old.
         print(f"codex pacer did not run: {error!r}")
+    if not sys.argv[1:]:
+        try:
+            from scripts.accounts import refusal_watch
+            for line in refusal_watch.run():
+                print(line)
+        except Exception as error:
+            reason = str(error).splitlines()[0] if str(error) else type(error).__name__
+            print(f"refusal watcher: {reason}", file=sys.stderr)
 
 
 if __name__ == "__main__":

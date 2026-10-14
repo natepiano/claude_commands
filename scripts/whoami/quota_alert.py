@@ -1124,6 +1124,19 @@ class SeatsTransitionDelivery:
 
 
 @dataclass(frozen=True)
+class RefusedAt:
+    at: datetime
+
+
+@dataclass(frozen=True)
+class RefusalTimeUnknown:
+    """Use the alert pass's observation time when no refusal time was handed in."""
+
+
+REFUSAL_TIME_UNKNOWN = RefusalTimeUnknown()
+
+
+@dataclass(frozen=True)
 class FallbackRefusalDelivery:
     lines: list[str]
     text: str
@@ -1137,13 +1150,13 @@ def blocked(notes: list[AgentNote], refusing_account: agent_accounts.RefusingCod
             selection: ClaudeAccountsInUse | ReadCurrentClaudeSelection = READ_CURRENT_CLAUDE_SELECTION,
             codex_readings: CodexAlertPassReadings | ReadCurrentCodexReadings = READ_CURRENT_CODEX_READINGS,
             window: refusals.KnownWindow | refusals.UnknownWindow = UNKNOWN_REFUSAL_WINDOW,
-            refused_at: datetime | None = None) -> list[str]:
+            refused_at: RefusedAt | RefusalTimeUnknown = REFUSAL_TIME_UNKNOWN) -> list[str]:
     """A provider refusal waits briefly, moves seats, or opens the Claude fallback."""
     from scripts.accounts import accounts
     selection = _selection(selection)
     readings = resolve_codex_readings(codex_readings)
     now = now or datetime.now(timezone.utc)
-    refused_at = refused_at or now
+    refusal_time = refused_at.at if isinstance(refused_at, RefusedAt) else now
     _save_codex_readings(readings, now)
     _finish_seats_transitions(now)
     stamp = now.isoformat(timespec="seconds")
@@ -1162,13 +1175,13 @@ def blocked(notes: list[AgentNote], refusing_account: agent_accounts.RefusingCod
             [Job("", recipient, text, "refusal") for recipient in recipients(config)], stamp)]
     name = refusing_account.label
     reading = refusals.stored_reading("codex", refusing_account.login, now)
-    window = _refusal_window(window, _reading_for_account(readings, refusing_account, now), refused_at)
+    window = _refusal_window(window, _reading_for_account(readings, refusing_account, now), refusal_time)
     reset: refusals.KnownReset | refusals.NoResetKnown = refusals.NoResetKnown()
     if isinstance(window, refusals.KnownWindow) and isinstance(reading, (refusals.FreshReading, refusals.StaleReading)):
         held_window = reading.weekly if window.name == "weekly" else reading.five_hour
         if isinstance(held_window, refusals.ReadingWindow):
             reset = held_window.reset
-    refusals.write_refusal(refusals.AccountRefusal("codex", refusing_account.login, window, reset, refused_at))
+    refusals.write_refusal(refusals.AccountRefusal("codex", refusing_account.login, window, reset, refusal_time))
     note = next((note for note in notes if note.tool == "codex"
                  and (note.get("login") or "").casefold() == refusing_account.login.casefold()),
                 RefusingAccountNote(Path(name + ".md"), {}))

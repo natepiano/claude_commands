@@ -654,7 +654,7 @@ After a seat launch's own turn has ended, a move to the selected seats home that
 
 **Ruled out:** environment-variable handoff of the refusal window; `stored_reading` in `accounts.py`.
 
-### Phase 16 — Claude sessions move on a refusal  · status: todo
+### Phase 16 — Claude sessions move on a refusal  · status: done
 
 **Depends on:** Phase 14, Phase 15
 

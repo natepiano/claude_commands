@@ -219,7 +219,7 @@ class CodexAccountAlertTests(unittest.TestCase):
         readings = quota_alert.CodexAlertPassReadings(initial.seats, old, tuple(
             quota_alert.CodexHomeReading(item.home, item.report, observed_at) for item in initial.checked_homes))
         _ = quota_alert.blocked([self.note(1, "active", 80)], old, observed_at,
-            codex_readings=readings, refused_at=self.now + timedelta(microseconds=1))
+            codex_readings=readings, refused_at=quota_alert.RefusedAt(self.now + timedelta(microseconds=1)))
         self.assertEqual(refusals.load()[refusals.key("codex", old.login)].window, refusals.KnownWindow("five_hour"))
         self.assertEqual([entry["kind"] for entry in moves.read_moves()], ["waited"])
 
@@ -342,7 +342,7 @@ class CodexAccountAlertTests(unittest.TestCase):
         report.five_hour = Quota("5-hour", 100, reset)
         readings = self.readings(old, report, self.report(target, 1))
         _ = quota_alert.blocked([self.note(1, "active", 80)], old, self.now,
-            codex_readings=readings, window=refusals.UnknownWindow(), refused_at=self.now - timedelta(seconds=1))
+            codex_readings=readings, window=refusals.UnknownWindow(), refused_at=quota_alert.RefusedAt(self.now - timedelta(seconds=1)))
         held = refusals.load()[refusals.key("codex", old.login)]
         self.assertEqual(held.window, refusals.KnownWindow("five_hour"))
         self.assertEqual(held.reset, refusals.KnownReset(reset))
@@ -362,7 +362,7 @@ class CodexAccountAlertTests(unittest.TestCase):
                     for item in reports.checked_homes))
                 now = max(self.now, observed_at)
                 _ = quota_alert.blocked([self.note(1, "active", weekly)], old, now,
-                    codex_readings=readings, window=refusals.UnknownWindow(), refused_at=self.now)
+                    codex_readings=readings, window=refusals.UnknownWindow(), refused_at=quota_alert.RefusedAt(self.now))
                 self.assertEqual(refusals.load()[refusals.key("codex", old.login)].window,
                                  refusals.UnknownWindow())
                 self.assertEqual(agent_accounts.seats_home(), target.home)

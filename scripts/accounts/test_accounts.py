@@ -24,6 +24,7 @@ from zoneinfo import ZoneInfo
 from scripts.accounts import accounts, refusals
 from scripts.production import showrunners
 from scripts.agents import codex_mesh
+from scripts.accounts import moves
 import account
 import agent_accounts
 import usage_store
@@ -35,6 +36,12 @@ def named_environment(config_dir: Path) -> dict[str, str]:
         "CLAUDE_CONFIG_DIR": str(config_dir),
         "CLAUDE_CODE_REMOTE_MEMORY_DIR": str(Path.home() / ".claude"),
     }
+
+
+def setUpModule() -> None:
+    root = Path(unittest.enterModuleContext(tempfile.TemporaryDirectory()))
+    _ = unittest.enterModuleContext(patch.object(showrunners, "NOTIFIER_STATE_DIR", root))
+    _ = unittest.enterModuleContext(patch.object(accounts, "SEATS_RUN_ROOT", root / "seat-runs"))
 
 
 def named_prefix(config_dir: Path) -> str:
@@ -135,6 +142,8 @@ class AccountsTests(unittest.TestCase):
         self.codex_reads = cast(AsyncMock, self.enterContext(patch.object(
             agent_accounts, "codex_live", return_value=agent_accounts.Report("Codex", problem="Not logged in"),
         )))
+        _ = self.enterContext(patch.object(accounts, "SEATS_RUN_ROOT", self.root / "seat-runs"))
+        _ = self.enterContext(patch.object(showrunners, "NOTIFIER_STATE_DIR", self.root / "notifier"))
         _ = self.enterContext(patch.object(agent_accounts, "prepare_codex_home",
             return_value=agent_accounts.CodexHomePrepared()))
         _ = self.enterContext(patch.object(codex_mesh, "retire_seats_servers", return_value=[]))
@@ -146,6 +155,109 @@ class AccountsTests(unittest.TestCase):
         return self.live.get(config_dir, agent_accounts.Report(
             "Claude", problem="Account unavailable (claude auth status failed)",
         ))
+
+    def test_status_names_live_account_and_codex_refusal_destination_separately(self) -> None:
+        from scripts.message import sessions
+        self.login_directory("claude 2", "main@example.invalid", default=True)
+        owner = sessions.SessionRecord(pid=12345, sessionId="live-identity", name="Live director",
+            messagingSocketPath="/fixture.sock", updatedAt=1, tmux="", formerNames=[])
+        now = datetime.now(timezone.utc)
+        def chosen(tool: str, _now: datetime, **_options: object) -> accounts.PickedAccount:
+            return accounts.PickedAccount("default" if tool == "claude" else "codex 3",
+                self.main_dir if tool == "claude" else self.home / ".codex3", 1,
+                accounts.KnownReset(now + timedelta(days=1)))
+        with (patch.object(sessions, "live_sessions", return_value=[owner]),
+              patch.object(account, "process_config_dir", return_value=self.main_dir),
+              patch.object(accounts, "pick", side_effect=chosen),
+              patch.object(accounts, "role_account", return_value=accounts.CodexSeatsAccount("codex 1", self.home / ".codex1"))):
+            code, output, error = self.run_cli("status")
+        self.assertEqual((code, error), (0, ""))
+        self.assertIn("live-identity", output)
+        self.assertIn("Live director", output)
+        self.assertIn("claude 2", output)
+        self.assertIn("Codex seats: codex 1", output)
+        self.assertIn("on refusal: codex 3", output)
+        self.assertIn("next", output.split("\n\n")[0])
+
+    def test_status_shows_each_owed_continuation_and_its_hold_reason(self) -> None:
+        run = self.root / "seat-runs/run-one"
+        run.mkdir(parents=True)
+        _ = (run / "mesh_server.json").write_text(json.dumps({"pid": os.getpid()}))
+        _ = (run / "mesh_roster.json").write_text(json.dumps({
+            "blocked": {"status": "starting", "continuation_owed": True,
+                "continuation_reason": "destination account refused again"},
+            "capacity": {"status": "waiting_capacity", "continuation_owed": True},
+            "done": {"status": "idle", "continuation_owed": False},
+        }))
+        _, output, _ = self.run_cli("status")
+        self.assertIn("run-one/blocked: continuation owed", output)
+        self.assertIn("destination account refused again", output)
+        self.assertIn("run-one/capacity: continuation owed", output)
+        self.assertIn("waiting for capacity", output)
+        self.assertNotIn("run-one/done", output)
+
+    def test_status_omits_owed_continuations_from_runs_without_a_live_mesh_server(self) -> None:
+        for name, server in (("live", {"pid": 901}), ("dead", {"pid": 902}),
+                             ("missing", None), ("malformed", {"pid": "901"}),
+                             ("invalid-pid", {"pid": True})):
+            run = self.root / "seat-runs" / name
+            run.mkdir(parents=True)
+            _ = (run / "mesh_roster.json").write_text(json.dumps({
+                "worker": {"continuation_owed": True, "status": "waiting_capacity"}}))
+            if server is not None:
+                _ = (run / "mesh_server.json").write_text(json.dumps(server))
+        def check(pid: int, signal: int) -> None:
+            self.assertEqual(signal, 0)
+            if pid != 901:
+                raise ProcessLookupError("mesh server gone")
+        with patch.object(os, "kill", side_effect=check):
+            _, output, _ = self.run_cli("status")
+        self.assertIn("live/worker: continuation owed", output)
+        for name in ("dead", "missing", "malformed", "invalid-pid"):
+            self.assertNotIn(name + "/worker", output)
+
+    def test_status_renders_requested_pending_confirmed_per_seat_and_failed_reason(self) -> None:
+        common = moves.MoveCommon(at="2026-10-14T12:00:00+00:00", tool="codex", subject="seats", move_id="move-one")
+        request: moves.RequestedMove = {**common, "kind": "requested", "from": "codex 1", "to": "codex 3",
+            "why": "weekly refusal", "window": "weekly", "reset": "2026-10-16T12:00:00+00:00"}
+        moves.append_move(request)
+        moves.append_move(moves.ConfirmedMove(**common, kind="confirmed", home=str(self.home / ".codex3"), seat="worker-a", run="run-one"))
+        moves.append_move(moves.ConfirmedMove(**common, kind="confirmed", home=str(self.home / ".codex3"), seat="worker-b", run="run-one"))
+        failed: moves.RequestedMove = {**request, "move_id": "failed-move", "subject": "claude-session: Director", "tool": "claude"}
+        moves.append_move(failed)
+        moves.append_move(moves.FailedMove(at=common["at"], move_id="failed-move", subject="claude-session: Director", tool="claude",
+            kind="failed", reason="still on claude 1"))
+        moves.append_move({**request, "move_id": "pending-move", "subject": "waiting-session: Waiting"})
+        _, output, _ = self.run_cli("status")
+        self.assertIn("confirmed", output)
+        self.assertIn("worker-a", output)
+        self.assertIn("worker-b", output)
+        self.assertIn("still on claude 1", output)
+        self.assertIn("pending", output)
+        self.assertIn("2026-10-14 05:00", output)
+
+    def test_status_limits_move_readout_to_last_ten_entries(self) -> None:
+        for index in range(12):
+            moves.append_move(moves.FailedMove(at="2026-10-14T12:00:00+00:00", tool="claude",
+                subject=f"session-{index}", move_id=f"move-{index}", kind="failed", reason=f"failure-{index}"))
+        _, output, _ = self.run_cli("status")
+        self.assertNotIn("session-0:", output)
+        self.assertNotIn("session-1:", output)
+        for index in range(2, 12):
+            self.assertIn(f"session-{index}", output)
+
+    def test_status_renders_wait_end_no_room_and_room_again_in_user_zone(self) -> None:
+        common = moves.MoveCommon(at="2026-10-14T12:00:00+00:00", tool="claude", subject="director: Director", move_id="wait-one")
+        moves.append_move(moves.WaitedMove(**common, kind="waited", window="five_hour", reset="2026-10-14T12:19:00+00:00"))
+        moves.append_move(moves.WaitEndedMove(**common, kind="wait ended"))
+        room: moves.MoveCommon = {**common, "move_id": "room-one"}
+        moves.append_move(moves.NoRoomMove(**room, kind="no room", earliest_reset="2026-10-15T12:00:00+00:00"))
+        moves.append_move(moves.RoomAgainMove(**room, kind="room again", label="claude 3"))
+        _, output, _ = self.run_cli("status")
+        self.assertIn("waited until 2026-10-14T05:19", output)
+        self.assertIn("wait ended", output)
+        self.assertIn("no room until 2026-10-15T05:00", output)
+        self.assertIn("room again: claude 3", output)
 
     def status_rows(self) -> list[tuple[str, ...]]:
         """The status table's rows after its heading, each a tuple of its cells, then nothing else."""
@@ -1357,7 +1469,7 @@ class AccountsTests(unittest.TestCase):
         result, stdout, stderr = self.run_cli("status")
 
         self.assertEqual((result, stderr), (0, ""))
-        lines = stdout.splitlines()
+        lines = stdout.split("\n\n")[0].splitlines()
         # The heading, the rule, the default folder, and the Codex home.
         self.assertEqual(len(lines), 4)
         self.assertEqual(len({len(line) for line in lines}), 1)
@@ -1774,7 +1886,7 @@ class AccountsTests(unittest.TestCase):
         self.login_directory("claude 2", "main@example.invalid", default=True)
         self.write_note("codex 1", "spare@example.invalid")
         self.codex_login("spare@example.invalid", self.home / ".codex1")
-        self.assertNotIn("\n\n", self.run_cli("status")[1].rstrip())
+        self.assertNotIn("unclassified:", self.run_cli("status")[1])
         _ = (self.home / ".codex1" / "unclassified-item").write_text("own")
 
         result, stdout, stderr = self.run_cli("status")
