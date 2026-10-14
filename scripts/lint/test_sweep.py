@@ -326,7 +326,8 @@ class FloorTests(SweepCase):
             sweep, "send_floor_alert", side_effect=AssertionError("unexpected floor alert send")))
         return base
 
-    def test_base_blocks_unexpected_alert_send(self) -> None:
+    def test_base_blocks_real_phone_sends(self) -> None:
+        """Guard the fixture patch that prevents real phone sends."""
         _ = self.base()
         self.assertIsInstance(sweep.send_floor_alert, mock.Mock)
         with self.assertRaisesRegex(AssertionError, "unexpected floor alert send"):

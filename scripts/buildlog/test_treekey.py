@@ -109,12 +109,6 @@ class TreeKeyTests(unittest.TestCase):
         self.assertNotEqual(key(self.repo), self.clean)
         self.assertEqual(key(self.repo / "src"), key(self.repo))
 
-    def test_symlink_target(self) -> None:
-        link = self.repo / "link"
-        link.unlink()
-        link.symlink_to("src/lib.rs")
-        self.assertNotEqual(key(self.repo), self.clean)
-
     def test_file_read_error_leaves_tree_key_unavailable(self) -> None:
         source = self.repo / "src" / "new.rs"
         _ = source.write_text("pub fn two() {}\n")

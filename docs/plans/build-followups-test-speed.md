@@ -135,7 +135,7 @@ A test that pins a behaviour a user or another script depends on is not trivial,
 
 **Gotchas:** fsync was already cheap on tmpfs; `test_progress_history`'s cost is about 750 launches of `progress_history.py`. A pidfd stays readable after exit, so `wait_until` observes each one once and drops it.
 
-### Phase 4 — Trivial tests are gone  · status: todo
+### Phase 4 — Trivial tests are gone  · status: done
 
 **Depends on:** Phase 3
 
