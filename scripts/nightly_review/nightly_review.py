@@ -286,7 +286,7 @@ def retire(name: str, attached: str, foreign: str) -> LeftRunning | NameFree:
     return NameFree()
 
 
-def start(selection: ClaudeAccountsInUse, prefix: str) -> list[str]:
+def start(_selection: ClaudeAccountsInUse, prefix: str, environment: dict[str, str]) -> list[str]:
     """Replace last night's session with tonight's; `prefix` selects a named account."""
     lines = [
         left.line for name in LEGACY_SESSIONS
@@ -311,7 +311,7 @@ def start(selection: ClaudeAccountsInUse, prefix: str) -> list[str]:
     command = f"unset {' '.join(NAMED_ACCOUNT_VARIABLES)} CLAUDE_CODE_OAUTH_TOKEN; " + command
     spawn = ["systemd-run", "--user", "--scope", "--quiet", "--collect", "tmux", "new-session", "-d", "-s", SESSION,
              "-c", str(home / "rust"), "zsh", "-ic", command]
-    started = subprocess.run(spawn, capture_output=True, text=True, check=False, env=launch_environment(selection))
+    started = subprocess.run(spawn, capture_output=True, text=True, check=False, env=environment)
     outcome = "started" if started.returncode == 0 else f"failed to start: {started.stderr.strip()}"
     return [*lines, f"{SESSION}: {outcome}"]
 
@@ -324,24 +324,39 @@ def launch_environment(_selection: ClaudeAccountsInUse) -> dict[str, str]:
 def tonight(selection: ClaudeAccountsInUse) -> list[str]:
     """Start the review on the picked account, or give the one line that says why not."""
     from scripts.accounts import accounts
+    from scripts.herdr.herdr import Untrusted, UnreadableTrustFile, claude_trust, trust_command
 
     try:
         selected = accounts.role_account("unit")
     except accounts.AccountsError as error:
         return [str(error)]
     environment = launch_environment(selection)
+    permission_environment = dict(environment)
     if isinstance(selected, accounts.NamedAccount):
         problems = accounts.check(selected.label)
         if problems:
             return [f"skipped: unit account {selected.label}: {problems[0]}"]
         # The shutdown check reads the account the review will run on.
-        environment["CLAUDE_CONFIG_DIR"] = str(selected.dir)
-    permission = launch_permission(environment, NewWorkLaunchPurpose())
+        permission_environment["CLAUDE_CONFIG_DIR"] = str(selected.dir)
+    permission = launch_permission(permission_environment, NewWorkLaunchPurpose())
     if isinstance(permission, BlockedByShutdown):
         return [f"skipped: {permission.reason}"]
     if isinstance(permission, ShutdownStateUnreadable):
         return [f"skipped: shutdown state unreadable: {permission.detail}"]
-    return start(selection, accounts.account_prefix(selected))
+    folder = Path.home() / "rust"
+    trust_account = selected
+    inherited_config = environment.get("CLAUDE_CONFIG_DIR", "")
+    if isinstance(selected, accounts.DefaultAccount) and inherited_config:
+        trust_account = accounts.NamedAccount(inherited_config, Path(inherited_config))
+    account_file = (trust_account.dir / ".claude.json" if isinstance(trust_account, accounts.NamedAccount)
+                    else Path.home() / ".claude.json")
+    trust = claude_trust(folder, account_file)
+    if isinstance(trust, UnreadableTrustFile):
+        return [f"{SESSION}: {trust}"]
+    if isinstance(trust, Untrusted):
+        label = trust_account.label if isinstance(trust_account, accounts.NamedAccount) else "default account"
+        return [f"{SESSION}: Claude is not trusted in {folder} on {label}. Run: {trust_command(folder, trust_account)}"]
+    return start(selection, accounts.account_prefix(selected), environment)
 
 
 def launch(today: date) -> list[str]:

@@ -14,12 +14,16 @@ from __future__ import annotations
 import json
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import NotRequired, TypedDict, cast
+from typing import TYPE_CHECKING, NotRequired, TypedDict, cast, override
+
+if TYPE_CHECKING:
+    from scripts.accounts.accounts import ClaudeLaunchAccount
 
 
 class HerdrFailure(Exception):
@@ -77,9 +81,42 @@ class HerdrProcess:
 
 
 @dataclass(frozen=True)
-class ProjectTrust:
+class Trusted:
+    """This account accepted one of the folder's exact repository trust keys."""
+
+    folder: Path
+    account_file: Path
     project_key: Path
-    accepted: bool
+
+
+@dataclass(frozen=True)
+class Untrusted:
+    """None of the folder's own, repository-root or main-checkout keys is accepted."""
+
+    folder: Path
+    account_file: Path
+    keys_tried: tuple[Path, ...]
+
+
+@dataclass(frozen=True)
+class UnreadableTrustFile:
+    """Trust cannot be established from this account file; its contents stay private."""
+
+    folder: Path
+    account_file: Path
+    error_class: str
+
+    @override
+    def __str__(self) -> str:
+        return f"cannot read {self.account_file} to check Claude trust ({self.error_class})"
+
+
+class ClaudeTrustEntry(TypedDict):
+    hasTrustDialogAccepted: bool
+
+
+class ClaudeTrustConfiguration(TypedDict):
+    projects: dict[str, ClaudeTrustEntry]
 
 
 @dataclass(frozen=True)
@@ -366,30 +403,68 @@ class Herdr:
         return agents
 
 
-def trusted_by_claude(directory: Path, claude_json: Path) -> ProjectTrust:
-    project_key = repository_trust_key(directory)
+def claude_trust(folder: Path, claude_json: Path) -> Trusted | Untrusted | UnreadableTrustFile:
+    """Check exact folder, repository-root and main-checkout keys, never ancestors.
+
+    Before creating a worktree, callers check repository_trust_key(checkout)
+    instead of the missing folder, so only the main checkout can authorize it.
+    """
+    folder = folder.resolve()
     try:
-        data = decode_object(claude_json.read_text(), str(claude_json))
-        projects = json_object(data.get("projects", {}), f"{claude_json} projects")
-        entry = json_object(projects.get(str(project_key), {}), f"{claude_json} project {project_key}")
-    except (OSError, ValueError, HerdrFailure) as error:
-        raise HerdrFailure(f"Claude project {project_key}: {error}") from error
-    return ProjectTrust(project_key, entry.get("hasTrustDialogAccepted") is True)
+        raw = cast(object, json.loads(claude_json.read_text(encoding="utf-8")))
+        if not isinstance(raw, dict):
+            raise ValueError()
+        projects = cast(dict[str, object], raw).get("projects", {})
+        if not isinstance(projects, dict):
+            raise ValueError()
+        configuration: ClaudeTrustConfiguration = {"projects": {
+            key: {"hasTrustDialogAccepted": isinstance(entry, dict)
+                  and cast(dict[str, object], entry).get("hasTrustDialogAccepted") is True}
+            for key, entry in cast(dict[str, object], projects).items()
+        }}
+    except (OSError, UnicodeError, ValueError) as error:
+        return UnreadableTrustFile(folder, claude_json, type(error).__name__)
+    keys = tuple(dict.fromkeys((folder, repository_root(folder), repository_trust_key(folder))))
+    for key in keys:
+        if configuration["projects"].get(str(key), {"hasTrustDialogAccepted": False})["hasTrustDialogAccepted"]:
+            return Trusted(folder, claude_json, key)
+    return Untrusted(folder, claude_json, keys)
+
+
+def trust_command(folder: Path, account: ClaudeLaunchAccount) -> str:
+    """The command the user runs to accept trust, then type /exit in Claude."""
+    from scripts.accounts.accounts import DefaultAccount, account_prefix
+    from scripts.whoami.account import NAMED_ACCOUNT_VARIABLES
+
+    if isinstance(account, DefaultAccount):
+        prefix = "env " + " ".join(f"-u {shlex.quote(name)}" for name in NAMED_ACCOUNT_VARIABLES)
+    else:
+        prefix = account_prefix(account).strip()
+    return f"cd {shlex.quote(str(folder))} && {prefix} claude"
+
+
+def repository_root(directory: Path) -> Path:
+    return _repository_key(directory, "--show-toplevel")
 
 
 def repository_trust_key(directory: Path) -> Path:
+    return _repository_key(directory, "--git-common-dir")
+
+
+def _repository_key(directory: Path, flag: str) -> Path:
     # Trust belongs to the requested directory, independent of inherited Git
     # repository overrides and the caller's global or system configuration.
     environment = {key: value for key, value in os.environ.items() if not key.startswith("GIT_")}
     environment.update({"GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1"})
-    result = run_program(["git", "-C", str(directory), "rev-parse", "--path-format=absolute", "--git-common-dir"],
+    result = run_program(["git", "-C", str(directory), "rev-parse", "--path-format=absolute", flag],
                          environment=environment)
     if result.returncode != 0:
         return directory
-    common_directory = result.stdout.strip()
-    if not common_directory or not Path(common_directory).is_absolute():
-        raise HerdrFailure(f"{directory}: git returned no absolute common directory for project trust")
-    return Path(common_directory).parent
+    found = result.stdout.strip()
+    if not found or not Path(found).is_absolute():
+        raise HerdrFailure(f"{directory}: git returned no absolute {flag} path for project trust")
+    path = Path(found)
+    return path.parent if flag == "--git-common-dir" else path
 
 
 

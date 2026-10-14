@@ -5,10 +5,10 @@ from __future__ import annotations
 
 import json
 import os
+import shlex
 import subprocess
 import sys
 import tempfile
-import shlex
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -260,6 +260,7 @@ class AddShowrunnerTests(unittest.TestCase):
 
     def test_new_showrunner_picks_named_account_with_sooner_reset_and_one_percent_room(self) -> None:
         directory = self.named_account()
+        _ = self.env.pop("ADD_SHOWRUNNER_CLAUDE_JSON")
         file = Path(self.env["HOME"]) / ".local/state/agent-notes/usage.json"
         saved = cast(dict[str, usage_store.StoredUsage], json.loads(file.read_text()))
         now = datetime.now(timezone.utc)
@@ -272,6 +273,35 @@ class AddShowrunnerTests(unittest.TestCase):
         command = cast(list[str], self.started()["args"])[-1]
         self.assertIn("CLAUDE_CONFIG_DIR=", command)
         self.assertIn(str(directory), command)
+
+    def test_picked_named_account_refuses_untrusted_folder_despite_default_trust(self) -> None:
+        directory = self.named_account()
+        _ = self.env.pop("ADD_SHOWRUNNER_CLAUDE_JSON")
+        home = Path(self.env["HOME"])
+        _ = (home / ".claude.json").write_text(json.dumps({
+            "oauthAccount": {"emailAddress": "main@example.invalid"},
+            "projects": {str(self.root / "kid-checkout"): {"hasTrustDialogAccepted": True}}}))
+        _ = (directory / ".claude.json").write_text(json.dumps({
+            "oauthAccount": {"emailAddress": "target@example.invalid"}, "projects": {}}))
+        file = home / ".local/state/agent-notes/usage.json"
+        saved = cast(dict[str, usage_store.StoredUsage], json.loads(file.read_text()))
+        now = datetime.now(timezone.utc)
+        saved["target@example.invalid"] = {"weekly": {"left": 1, "at": now.isoformat(),
+            "resets": (now + timedelta(days=1)).isoformat()}}
+        _ = file.write_text(json.dumps(saved))
+        result = self.run_command("kid")
+        self.refused(result, f"kid: Claude is not trusted in {self.root / 'kid-checkout'} on claude 3. Run:")
+        self.assertIn(f"CLAUDE_CONFIG_DIR={shlex.quote(str(directory))}", result.stderr)
+
+    def test_retained_account_unreadable_trust_refuses_before_spawning(self) -> None:
+        directory = Path(self.env["HOME"]) / "retained account"
+        directory.mkdir()
+        _ = (directory / ".claude.json").write_text("SECRET malformed account contents")
+        _ = self.env.pop("ADD_SHOWRUNNER_CLAUDE_JSON")
+        result = self.run_command("kid", "--resume", "abc-123", "--cwd", str(self.root),
+                                  "--config-dir", str(directory))
+        self.refused(result, f"kid: cannot read {directory / '.claude.json'} to check Claude trust (JSONDecodeError)")
+        self.assertNotIn("SECRET", result.stderr)
 
     def test_resume_refuses_an_unrelated_tmux_name_collision_without_killing_it(self) -> None:
         (self.state / "live-kid").touch()
@@ -287,6 +317,9 @@ class AddShowrunnerTests(unittest.TestCase):
     def test_showrunner_resume_accepts_retained_directory_outside_account_farm(self) -> None:
         directory = Path(self.env["HOME"]) / "retained account"
         directory.mkdir()
+        _ = (directory / ".claude.json").write_text(json.dumps({
+            "projects": {str(self.root): {"hasTrustDialogAccepted": True}}}))
+        _ = self.env.pop("ADD_SHOWRUNNER_CLAUDE_JSON")
         self.starts("abc-123", registers="kid")
         result = self.run_command("kid", "--resume", "abc-123", "--cwd", str(self.root),
                                   "--config-dir", str(directory))
@@ -299,6 +332,9 @@ class AddShowrunnerTests(unittest.TestCase):
         home = Path(self.env["HOME"])
         directory = home / "retained account"
         directory.mkdir()
+        _ = (directory / ".claude.json").write_text(json.dumps({
+            "projects": {str(self.root): {"hasTrustDialogAccepted": True}}}))
+        _ = self.env.pop("ADD_SHOWRUNNER_CLAUDE_JSON")
         self.starts("abc-123", registers="kid")
         result = self.run_command("kid", "--resume", "abc-123", "--cwd", str(self.root),
                                   "--config-dir", "retained account", cwd=home)
@@ -462,8 +498,9 @@ class AddShowrunnerTests(unittest.TestCase):
         _ = self.doc("kid")
         self.trust(self.root, extra={"oauthAccount": {"emailAddress": "SECRET-EMAIL"}, "userID": "SECRET-ID"})
         result = self.run_command("kid", "--check")
-        self.refused(result, f"Claude is not trusted in {checkout.resolve()} on the showrunner account. The user "
-                     + "trusts it first, by running `claude` there once and accepting")
+        self.refused(result, f"kid: Claude is not trusted in {checkout.resolve()} on default account. "
+                     + f"Run: cd {shlex.quote(str(checkout.resolve()))} && "
+                     + "env -u CLAUDE_CONFIG_DIR -u CLAUDE_CODE_REMOTE_MEMORY_DIR claude")
         self.assertNotIn("SECRET", result.stdout + result.stderr)
 
     def test_trust_comes_from_the_repository_root_or_a_worktrees_main_checkout(self) -> None:
@@ -484,12 +521,12 @@ class AddShowrunnerTests(unittest.TestCase):
         _ = self.doc("kid")
         _ = subprocess.run(["git", "init", "-q", str(self.root / "kid-checkout")], check=True, capture_output=True)
         self.trust(self.root)
-        self.refused(self.run_command("kid", "--check"), "Claude is not trusted in")
+        self.refused(self.run_command("kid", "--check"), "kid: Claude is not trusted in")
 
     def test_an_unreadable_config_refuses_without_its_contents(self) -> None:
         _ = (self.root / "claude.json").write_text('{"oauthAccount": "SECRET-EMAIL", ', encoding="utf-8")
         result = self.run_command("kid", "--check")
-        self.refused(result, f"cannot read {self.root / 'claude.json'} to see whether")
+        self.refused(result, f"kid: cannot read {self.root / 'claude.json'} to check Claude trust (JSONDecodeError)")
         self.assertNotIn("SECRET", result.stderr)
 
     def test_a_session_that_runs_no_production_is_refused(self) -> None:

@@ -20,6 +20,10 @@ A name may be given with or without its `-unit` ending; `feature-log` and
 `feature-log-unit` both make unit `feature-log-unit`.
 An existing Units row is adopted; its Port and Owns values stand when omitted.
 Add `--check` to run preflight without launching or writing anything.
+An untrusted session folder refuses before any stub, Units row, or worktree is
+written. Show the refusal's `Run:` command; the user runs it on the launch
+account (in the main checkout for a new worktree), accepts the trust prompt,
+types `/exit`, then retries this command.
 The unit director launch takes its model and effort from `/agent production.director`.
 For a standby unit, send its work when assigned, set the Units row's Plan cell
 to the plan path, and commit that doc on the merge branch without pushing it (it
