@@ -182,7 +182,8 @@ State:
 
   Nothing else does. Handle unit messages (checkpoints, merges, ETAs, plans,
   promotions, routine fixes) without telling the user; they wait for the next
-  dailies (user, 2026-10-12).
+  dailies (user, 2026-10-12). A turn with nothing for the user replies with
+  just "—": never "No update for you." or the like (user, 2026-10-14).
 - **Designs and add-ons.** A unit's design choices and add-ons are yours to
   settle, not the user's. User, 2026-10-12: "when it comes to designs you
   absolutely should be able to tell units what to do and change. I do not have
@@ -577,9 +578,13 @@ Run only when the production repository is `~/rust/hana` or
 For each distinct user-visible result:
 
 1. Check the Hana live log for entries it replaces.
-2. Add the next `A<n>` or `C<n>` row under `## To review` in
-   `~/rust/hanadocs/change-review.md`: change, merge date, passing Mac build
-   when available, and a visual or behavioral check.
+2. Take the rows `merge_checkpoint.py` added: its `change review: ok` line
+   names each `C<n>` row it wrote under `## To review` in the list the
+   production doc's **Change review** line names, one per `Change-Review:`
+   line in the unit's checkpoint commits. The script holds a checkpoint whose
+   commit lacks the line before it merges. On a `change review: failed` line,
+   add the rows by hand; a `change review: drift` line names an earlier merge
+   whose rows are missing, which you add the same way.
 3. Run `~/.claude/scripts/lib/py
    ~/.claude/scripts/feature_log/feature_log.py propose --review <row>` with
    `--project hana`, every owning crate, kind, title, summary, current behavior,

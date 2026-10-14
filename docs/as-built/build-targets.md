@@ -60,7 +60,7 @@ Every command decides "held" through `target_state` and reads admission through 
 
 ### Where a job runs: `scripts/delegate/verify.sh`
 
-- check, clippy, lint, doc, `example` and `final` run on natedev only. Only `test` routes.
+- `check`, `lint`, `example` and `final` run on natedev only. Only `test` routes.
 - `route_test` runs after the per-call wait files and cleanup trap exist, and before the per-call `wait-local` and the cargo token. It reads the `eligible` table and records an excluded Mac at once (`BUILDLOG_MAC=declined`, and its reason in `BUILDLOG_MAC_REASON` and `BUILDLOG_LOCAL_REASON` unless `--local` was given), also when `offload.py` is never called. It then visits the eligible targets in config order:
   - natedev: `build_hold_check_admission`. Exit 0 sends the test to natedev with no further routing. Exit 10 or 12 goes on to the next target, so a filtered test can still pass on the Mac when natedev's hold state cannot be read.
   - an `ssh` target: `try_mac_test <settings>` runs `offload.py run --settings <path>`. A `busy` or `blocked` decline puts the target on the retry list. A full pass prints `verify.sh: passed on the Mac (macOS); now confirming on natedev, which is the gate.` and falls through to natedev. A failure exits with the Mac's status. A filtered pass records `passed_filter` and exits 0. A lost run or any other decline ends the Mac tries and the test waits for natedev.
@@ -130,7 +130,7 @@ Each command shows its script's output unchanged; each script answers in about a
 
 ## Invariants
 
-- Linux stays the gate. A full `verify.sh test` that passed on the Mac still confirms on natedev, and that confirmation waits out a natedev hold. check, clippy, lint, doc, example and final never leave natedev.
+- Linux stays the gate. A full `verify.sh test` that passed on the Mac still confirms on natedev, and that confirmation waits out a natedev hold. `check`, `lint`, `example` and `final` never leave natedev.
 - natedev's own limits are unchanged: the memory gate, the cargo token, build-folder turns.
 - A job never runs on a held target and never falls back to one. When every eligible target is held or full it waits and says what it is waiting on.
 - Code that picks a target counts `StateUnreadable` and `Held(end=AwaitingBlockRemoval)` as not free, and every reader of `TargetState` handles all five cases.

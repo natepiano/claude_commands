@@ -10,6 +10,10 @@ Samples are at least 0.25 seconds apart. One job is always allowed to progress;
 an observed overshoot makes the run red. This is admission on samples, not an
 OS allocation limit; unexpected job growth can still exceed the cap.
 --tests-only runs the same suite runner without performing any git operations.
+A unit checkpoint commit without its Change-Review line is refused before the merge. After the
+push, each visible change becomes a row in the change-review list that --change-review names, or
+that --production's `- **Change review:**` line names; the gate writes that file and never
+commits it.
 """
 from __future__ import annotations
 
@@ -29,6 +33,9 @@ import sys
 import tempfile
 import time
 from typing import TextIO, cast
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from scripts.production import change_review  # noqa: E402
 
 TEST_SUITES = (
     "lib", "hooks", "message", "accounts", "whoami", "agents", "build_hold",
@@ -58,6 +65,8 @@ class GateArguments(argparse.Namespace):
     unit_branch: str = ""
     checkpoint: str = ""
     previous_checkpoint: str = ""
+    change_review: str = ""
+    production: str = ""
     unit: str = ""
     phase: str = ""
     body: str = ""
@@ -465,6 +474,13 @@ def merge_checkpoint(args: GateArguments) -> int:
         raise GateRefused("checkpoint is not on origin unit branch")
     if git(repo, "merge-base", "--is-ancestor", previous, checkpoint).returncode:
         raise GateRefused("previous checkpoint is not an ancestor of checkpoint")
+    review_list = change_review_list(args)
+    try:
+        commits = change_review.unit_commits(repo, checkpoint, previous, str(args.merge_branch))
+    except change_review.ChangeReviewError as error:
+        raise GateRefused(str(error)) from error
+    if refused := change_review.missing(commits):
+        raise GateRefused("checkpoint commits without a Change-Review line: " + "; ".join(refused))
     subject = f"Merge {args.unit} {args.phase} ({args.checkpoint}) into {args.merge_branch}"
     try:
         result = git(repo, "merge", "--no-ff", "-m", f"{subject}\n\n{args.body}", checkpoint)
@@ -485,9 +501,37 @@ def merge_checkpoint(args: GateArguments) -> int:
         raise GateRefused(f"{error or type(error).__name__}; merge undone, not pushed") from error
     _ = checked_git(repo, "push", "origin", str(args.merge_branch))
     print(f"Pushed {args.merge_branch}: {checked_git(repo, 'rev-parse', '--short', 'HEAD')}", flush=True)
+    if review_list is not None:
+        record_changes(repo, review_list, commits, str(args.merge_branch))
     if args.promote:
         promote(args)
     return 0
+
+
+def change_review_list(args: GateArguments) -> Path | None:
+    """The list the merge adds rows to: --change-review, else the production doc's header, else none."""
+    if args.change_review:
+        return Path(str(args.change_review)).expanduser()
+    if not args.production:
+        return None
+    try:
+        return change_review.list_path(Path(str(args.production)).expanduser())
+    except OSError as error:
+        raise GateRefused(f"production doc unreadable: {error}") from error
+
+
+def record_changes(repo: Path, review_list: Path, commits: list[change_review.Commit], merge_branch: str) -> None:
+    """Add a row per visible change to the list, then name any landed merge still missing its rows."""
+    merged = checked_git(repo, "rev-parse", f"--short={change_review.SHORT}", "HEAD")
+    try:
+        rows = change_review.append_rows(review_list, change_review.visible(commits), change_review.today(), merged)
+        drifted = change_review.drift(repo, merge_branch, review_list.read_text(encoding="utf-8"), change_review.LANDED)
+    except (change_review.ChangeReviewError, OSError) as error:
+        raise GateRefused(f"pushed {merged}; change review list {review_list} not written: {error}") from error
+    for row in rows:
+        print(f"Change review: {row}", flush=True)
+    for line in drifted:
+        print(f"Change review drift: {line}", file=sys.stderr, flush=True)
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -496,6 +540,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     for name in ("merge-branch", "unit-branch", "checkpoint", "previous-checkpoint", "unit", "phase"):
         _ = parser.add_argument(f"--{name}", default="")
     _ = parser.add_argument("--body", default="Checkpoint verified by the complete merge gate.")
+    _ = parser.add_argument("--change-review", default="", help="the change-review list to add rows to")
+    _ = parser.add_argument("--production", default="", help="the production doc whose header names the list")
     _ = parser.add_argument("--type-dirs", "--type-dir", nargs="+", default=["scripts"])
     _ = parser.add_argument("--promote", action="store_true")
     _ = parser.add_argument("--main-repo", "--main-checkout", default="~/.claude")
