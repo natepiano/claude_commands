@@ -81,7 +81,8 @@ Read the current state, not memory, and check what you state the way
    you and its footer. Supply the phase, started time, current update, and ETA
    numbers from the unit's plan and reports. Text after `❯` may be a prompt
    suggestion, not the user's draft:
-   `capture-pane -e` shows a suggestion dimmed (`ESC[2m`).
+   `~/.claude/scripts/lib/py ~/.claude/scripts/production/session_pane.py read unit <slug> <unit> --ansi`
+   shows a suggestion dimmed (`\e[2m`) on both hosts.
 4. **Merge branch.** The input builder reads the last merge and whether the
    branch is pushed. Supply anything held or testing in the judgment file.
 5. **Open topics.** Everything in `LOG` not yet closed: held quota alerts, CI,

@@ -21,6 +21,7 @@ from unittest.mock import call, patch
 
 from test_support import registry_confirmation, ShutdownSendLeaf, ShutdownTestCase
 import inventory
+from fake_herdr import CommandResponse
 import record
 import sessions
 from user_action import ActionRequired
@@ -258,7 +259,7 @@ class SettleTests(ShutdownTestCase):
             desktop=inventory.DesktopNotInSnapshot(kind="not in snapshot"))
         self.write_refusal_transcript(owner["session_id"])
         saved = session_shutdown(owner)
-        with patch.object(settle, "_screen", return_value=settle.ScreenUnreadable("no tmux host")):
+        with patch.object(settle, "_screen", return_value=settle.ScreenUnreadable("no pane host")):
             self.assertIsInstance(settle._usage_limit_change(saved, self.matching(saved)),  # pyright: ignore[reportPrivateUsage]
                 settle.EnterUsageLimitHold)
             owner["status"] = "busy"
@@ -275,7 +276,7 @@ class SettleTests(ShutdownTestCase):
             "window": "weekly", "reset": ""}))
         saved = session_shutdown(owner)
         other = session_shutdown(top_level("unrelated-owner", "Unrelated owner"))
-        with patch.object(settle, "_screen", return_value=settle.ScreenUnreadable("no tmux host")):
+        with patch.object(settle, "_screen", return_value=settle.ScreenUnreadable("no pane host")):
             self.assertIsInstance(settle._usage_limit_change(saved, self.matching(saved)),  # pyright: ignore[reportPrivateUsage]
                 settle.EnterUsageLimitHold)
             self.assertIsInstance(settle._usage_limit_change(other, self.matching(other)),  # pyright: ignore[reportPrivateUsage]
@@ -413,6 +414,39 @@ class SettleTests(ShutdownTestCase):
         assert latest is not None
         self.assertEqual(latest["progress"], {"kind": "waiting"})
 
+    def test_herdr_owner_screen_reads_its_named_pane_and_usage_limit(self) -> None:
+        owner = top_level("native", "Native")
+        owner["host"] = inventory.HerdrHost(kind="herdr", herdr_session="native-host", pane_id="w1:p2")
+        responses = self.root / "herdr-responses.json"
+        log = self.root / "herdr.jsonl"
+        command = ["--session", "native-host", "pane", "read", "w1:p2", "--source", "recent", "--lines", "60"]
+        response = CommandResponse(code=0, stdout="hit your usage limit\nEsc to cancel\n")
+        _ = responses.write_text(json.dumps({" ".join(command): response}))
+        with patch.dict(os.environ, {
+            "HERDR_BIN": str(Path(__file__).resolve().parents[1] / "herdr" / "fake_herdr.py"),
+            "FAKE_HERDR_LOG": str(log), "FAKE_HERDR_RESPONSES": str(responses),
+        }):
+            screen = settle._screen(owner)  # pyright: ignore[reportPrivateUsage]
+        self.assertEqual(screen, settle.ScreenText("hit your usage limit\nEsc to cancel\n"))
+        self.assertTrue(settle._held_by_usage_limit(screen))  # pyright: ignore[reportPrivateUsage]
+        self.assertEqual([json.loads(line) for line in log.read_text().splitlines()], [command])
+
+    def test_herdr_screen_failure_never_creates_a_usage_limit_hold(self) -> None:
+        owner = top_level("native", "Native")
+        owner["host"] = inventory.HerdrHost(kind="herdr", herdr_session="native-host", pane_id="w1:p2")
+        responses = self.root / "herdr-responses.json"
+        log = self.root / "herdr.jsonl"
+        response = CommandResponse(code=1, stdout="hit your weekly limit", stderr="pane unavailable")
+        _ = responses.write_text(json.dumps({"default": response}))
+        for binary in (Path(__file__).resolve().parents[1] / "herdr" / "fake_herdr.py", self.root / "absent-herdr"):
+            with self.subTest(binary=binary), patch.dict(os.environ, {
+                "HERDR_BIN": str(binary), "FAKE_HERDR_LOG": str(log),
+                "FAKE_HERDR_RESPONSES": str(responses),
+            }):
+                screen = settle._screen(owner)  # pyright: ignore[reportPrivateUsage]
+                self.assertEqual(screen, settle.ScreenUnreadable("capture failed"))
+                self.assertFalse(settle._held_by_usage_limit(screen))  # pyright: ignore[reportPrivateUsage]
+
     def test_unreadable_owner_screens_never_create_a_usage_limit_hold(self) -> None:
         owner = showrunner("owner", "Owner")
         for tmux, identity in (("", "owner"), ("shared:@2.%5", "another"), ("shared:@2", "owner"), ("shared:@2.%bad", "owner")):
@@ -436,7 +470,7 @@ class SettleTests(ShutdownTestCase):
         owner["host"] = inventory.WindowHost(kind="ghostty", window_shell=123,
             desktop=inventory.DesktopNotInSnapshot(kind="not in snapshot"))
         with patch.object(subprocess, "run") as capture:
-            self.assertEqual(settle._screen(owner), settle.ScreenUnreadable("no tmux host"))  # pyright: ignore[reportPrivateUsage]
+            self.assertEqual(settle._screen(owner), settle.ScreenUnreadable("no pane host"))  # pyright: ignore[reportPrivateUsage]
             self.assertFalse(settle._usage_limit_shown(owner))  # pyright: ignore[reportPrivateUsage]
         capture.assert_not_called()
 
@@ -1707,12 +1741,21 @@ class SettleTests(ShutdownTestCase):
         self.assertLess(len(posted), 500)
         self.assertLess(len(cast(str, alert.call_args.args[0])), 45)
 
+    def test_unit_session_issue_text_identifies_the_host_name_and_cause(self) -> None:
+        for host in ("tmux", "herdr"):
+            for cause in ("stop not confirmed", "owner identity lost"):
+                with self.subTest(host=host, cause=cause):
+                    issue = record.UnitSessionLeftRunning(kind="unit session left running", at=NOW,
+                        host=host, session_name="named-unit", cause=cause)
+                    self.assertEqual(settle.stop_issue_text(issue),
+                        f"{host} session named-unit left running: {cause}")
+
     def test_report_stop_treats_owner_resource_issues_as_a_partial_stop(self) -> None:
         for kind in ("stopped", "already gone", "process identity lost"):
             for alerts in ("user", "none"):
                 saved = session_shutdown(top_level("owner", "Owner"), progress=cast(record.SessionProgress, cast(object, {"kind": kind, "at": NOW})), requester="requester")
                 saved["hold"], saved["alerts"] = "account", alerts
-                saved["stop_issues"] = [record.UnitTmuxLeftRunning(kind="unit tmux session left running", at=NOW, tmux_session="unit", cause="stop not confirmed")]
+                saved["stop_issues"] = [record.UnitSessionLeftRunning(kind="unit session left running", at=NOW, host="tmux", session_name="unit", cause="stop not confirmed")]
                 with patch.object(settle, "run_remote", return_value=(0, "[]")), patch.object(settle, "send_message", return_value={"kind": "sent"}) as send, patch.object(settle, "alert_user") as alert:
                     settle.report_stop([saved])
                 self.assertEqual(send.call_args.args[1], f"{LABEL}: stop partial")
@@ -1746,7 +1789,7 @@ class SettleTests(ShutdownTestCase):
 
     def test_now_reports_a_persistent_cleanup_failure_after_one_owned_retry(self) -> None:
         saved = session_shutdown(top_level("owner", "Owner"), progress={"kind": "already gone", "at": NOW})
-        saved["stop_issues"] = [record.UnitTmuxLeftRunning(kind="unit tmux session left running", at=NOW, tmux_session="unit", cause="stop not confirmed")]
+        saved["stop_issues"] = [record.UnitSessionLeftRunning(kind="unit session left running", at=NOW, host="tmux", session_name="unit", cause="stop not confirmed")]
         self.save(saved)
         def failed_cleanup(current: record.SessionShutdown) -> record.SessionShutdown:
             return current

@@ -157,6 +157,53 @@ class HerdrTests(unittest.TestCase):
             ["--session", "fixture", "agent", "prompt", "pane-1", "opening\nprompt"],
         ])
 
+    def test_claude_start_passes_only_extra_arguments_after_separator(self) -> None:
+        self.herdr.start_agent(
+            "worker", "pane-1", kind="claude",
+            agent_arguments=["--resume", "conversation", "--model", "fixture-model"],
+            opening_prompt="continue", timeout_ms=10_000,
+        )
+        start, prompt = self.commands()
+        self.assertEqual(start, [
+            "--session", "fixture", "agent", "start", "worker", "--kind", "claude",
+            "--pane", "pane-1", "--timeout", "10000", "--", "--resume", "conversation",
+            "--model", "fixture-model",
+        ])
+        self.assertEqual(start.count("claude"), 1)
+        self.assertEqual(start[start.index("--") + 1:], ["--resume", "conversation", "--model", "fixture-model"])
+        self.assertEqual(prompt, ["--session", "fixture", "agent", "prompt", "pane-1", "continue"])
+
+    def test_agent_executable_argument_is_refused_before_any_herdr_call(self) -> None:
+        for kind in ("claude", "codex"):
+            with self.subTest(kind=kind):
+                with self.assertRaisesRegex(ValueError, "agent_arguments must omit"):
+                    self.herdr.start_agent(
+                        "worker", "pane-1", kind=kind, agent_arguments=[kind, "--resume", "conversation"],
+                        opening_prompt="continue", timeout_ms=10_000,
+                    )
+        self.assertEqual(self.commands(), [])
+
+    def test_module_start_refuses_executable_before_pane_lookup(self) -> None:
+        with self.assertRaisesRegex(ValueError, "agent_arguments must omit"):
+            herdr.start_agent(
+                "fixture", "pane-1", kind="claude", agent_arguments=["claude", "--resume", "conversation"],
+                opening_prompt="continue", timeout_ms=10_000,
+            )
+        self.assertEqual(self.commands(), [])
+
+    def test_module_start_passes_extra_arguments_and_uses_pane_label(self) -> None:
+        self.configure_herdr(["pane", "list"], json.dumps({"result": {"panes": [{"pane_id": "pane-1", "label": "worker"}]}}))
+        herdr.start_agent(
+            "fixture", "pane-1", kind="claude", agent_arguments=["--resume", "conversation"],
+            opening_prompt="continue", timeout_ms=10_000,
+        )
+        self.assertEqual(self.commands(), [
+            ["--session", "fixture", "pane", "list"],
+            ["--session", "fixture", "agent", "start", "worker", "--kind", "claude", "--pane", "pane-1",
+             "--timeout", "10000", "--", "--resume", "conversation"],
+            ["--session", "fixture", "agent", "prompt", "pane-1", "continue"],
+        ])
+
     def test_prompt_refusal_raises_blocked_without_retry(self) -> None:
         self.configure_herdr(["agent", "prompt", "pane-1", "work"], code=1, stderr=json.dumps({"error": {"code": "agent_blocked", "message": "permission dialog"}}))
         with self.assertRaises(herdr.AgentBlocked):

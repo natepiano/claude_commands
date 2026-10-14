@@ -69,17 +69,10 @@ Place = TmuxPlace | HerdrPlace
 @dataclass(frozen=True)
 class MarkedUnit:
     unit: str
-    # Tmux pane id, empty for herdr; removed once every consumer reads place.
-    pane: str
     # The tmux session label or herdr session name.
     label: str
     claude: Claude
-    place: Place = TmuxPlace("")
-
-    def __post_init__(self) -> None:
-        # Existing callers construct tmux units with four arguments.
-        if isinstance(self.place, TmuxPlace) and not self.place.pane:
-            object.__setattr__(self, "place", TmuxPlace(self.pane))
+    place: Place
 
 
 def place_text(place: Place) -> str:
@@ -231,7 +224,7 @@ def _marked_sessions(claudes: dict[str, LiveClaude], unread: str) -> Iterable[tu
         live = [pane for pane in panes if pane in claudes]
         claude: Claude = (claudes[live[0]] if live else ClaudeUnknown(unread) if unread else ClaudeNotRunning())
         pane = live[0] if live else panes[0]
-        yield slug, MarkedUnit(unit, pane, label, claude, TmuxPlace(pane))
+        yield slug, MarkedUnit(unit, label, claude, TmuxPlace(pane))
 
 
 def _herdr_marked(claudes: dict[HerdrPlace, LiveClaude], unread: str) -> Iterable[tuple[str, MarkedUnit]]:
@@ -247,7 +240,7 @@ def _herdr_marked(claudes: dict[HerdrPlace, LiveClaude], unread: str) -> Iterabl
             continue
         seen.add(place)
         claude: Claude = claudes.get(place, ClaudeUnknown(unread) if unread else ClaudeNotRunning())
-        yield slug, MarkedUnit(unit, "", place.session, claude, place)
+        yield slug, MarkedUnit(unit, place.session, claude, place)
 
 
 def every_marked_unit(*, include_tmux: bool = True) -> MarkedProductions:

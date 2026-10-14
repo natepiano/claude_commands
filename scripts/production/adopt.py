@@ -83,7 +83,10 @@ def unit_rows(production: add_unit.Production, lines: list[str], gone: set[str])
         found = ({owner[pane] for pane in claudes.get(old_name, ()) if pane in owner}
                  | {session for session, (label, _) in tmux.items() if label == old_name})
         if unit in marked:
-            rows.append(UnitRow(unit, old_name, Marked(marked[unit].pane)))
+            place = marked[unit].place
+            if not isinstance(place, unit_lookup.TmuxPlace):
+                raise add_unit.Refusal(f"{unit}: adoption requires a tmux session")
+            rows.append(UnitRow(unit, old_name, Marked(place.pane)))
         elif len(found) == 1:
             target = next(iter(found))
             rows.append(UnitRow(unit, old_name, ToMark(target, tmux[target][0])))

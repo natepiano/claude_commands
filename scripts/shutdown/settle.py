@@ -61,7 +61,7 @@ class ScreenText:
 
 @dataclass(frozen=True)
 class ScreenUnreadable:
-    reason: Literal["no tmux host", "no pane id", "capture failed"]
+    reason: Literal["no pane host", "no pane id", "capture failed"]
 
 
 @dataclass(frozen=True)
@@ -398,8 +398,16 @@ def blocker(session: Session) -> ReadinessCheck:
 
 def _screen(session: Session) -> ScreenText | ScreenUnreadable:
     host = session["host"]
+    if host["kind"] == "herdr":
+        from session_pane import read_place
+        from herdr import HerdrFailure, HerdrPlace
+
+        try:
+            return ScreenText(read_place(HerdrPlace(host["herdr_session"], host["pane_id"]), 60))
+        except HerdrFailure:
+            return ScreenUnreadable("capture failed")
     if host["kind"] != "tmux" and host["kind"] != "unit":
-        return ScreenUnreadable("no tmux host")
+        return ScreenUnreadable("no pane host")
     entry = sessions.read_session(sessions.sessions_dir() / f"{session['pid']}.json")
     if isinstance(entry, sessions.UnreadableSessionRecord) or entry["sessionId"] != session["session_id"]:
         return ScreenUnreadable("no pane id")
@@ -803,8 +811,8 @@ def stop_issue_text(issue: SessionStopIssue) -> str:
             return "not stopped: account unreadable"
         case "codex server left running":
             return f"Codex server {issue['run_dir']} left running: {issue['cause']}"
-        case "unit tmux session left running":
-            return f"tmux session {issue['tmux_session']} left running: {issue['cause']}"
+        case "unit session left running":
+            return f"{issue['host']} session {issue['session_name']} left running: {issue['cause']}"
 
 
 def _restore_record(saved: SessionShutdown) -> None:
