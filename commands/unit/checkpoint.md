@@ -83,8 +83,15 @@ Loop/verbose only:
 
    <what the phase built>
 
+   Change-Review: <what you see change> | <how to check it>
    Claude-Session: <session url>
    ```
+
+   Every `checkpoint(...)` commit that changes more than Markdown carries
+   `Change-Review: <what you see change> | <how to check it>`, one line per
+   visible change, or `Change-Review: none — <why nothing visible changes>`.
+   A hook refuses the commit without it and the merge refuses the checkpoint;
+   the merge turns each visible line into a row on the change-review list.
 
    A failed commit is an unsuccessful ending: do not invoke release, leave
    `Active` untouched, and apply <RetainDelegatedPhaseReservation/>. After a

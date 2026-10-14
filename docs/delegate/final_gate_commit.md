@@ -26,11 +26,13 @@ synthetic-final repairs — so the run leaves no uncommitted work behind.
 
    <what the style pass and any final repairs changed>
 
+   Change-Review: none — <why nothing visible changes>, or one `<change> | <how to check>` line each
    Claude-Session: <session url>
    ```
 
    Keep the `checkpoint(<plan-slug>)` subject: <ResolveStyleDiffBase/> reads it
-   to place a later run's diff base.
+   to place a later run's diff base. Its `Change-Review:` lines follow
+   <CheckpointCommit/> (`commands/unit/checkpoint.md`) step 6.
 5. This commit holds no phase reservation, so it invokes no drift check and no
    release. Run <PushCheckpoint/> (`commands/unit/checkpoint.md`), then
    report `Final gate <short hash> — style review and closing repairs.` with its

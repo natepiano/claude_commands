@@ -98,6 +98,10 @@ The production doc sits beside the source plan as `<source-stem>-production.md`.
 - **Capacity:** <cores and memory read by /producer:greenlight, and the unit count it allows>
 - **UX guide:** <path to the project's UX rules, e.g. `~/rust/hanadocs/ux`>; omit when
   nothing users see changes
+- **Change review:** <path to the user's change-review list, e.g.
+  `~/rust/hanadocs/change-review.md`>; `merge_checkpoint.py` adds a row per
+  `Change-Review:` line a merged checkpoint names. Omit when the production keeps none; its
+  checkpoints still carry the lines
 - **Review pool:** code (or `code, ui`); omit when the production has none
 - **Proposals:** <folder for finished proposals, e.g. `~/rust/hanadocs/proposals`>; its
   `index.md` holds one row for each, `| Date | Proposal | Unit | Summary | Status |`,

@@ -15,6 +15,7 @@ import time
 from typing import TypedDict, cast, final, override
 import unittest
 from contextlib import redirect_stdout
+from datetime import date
 from unittest import mock
 
 from scripts.production import merge_gate
@@ -347,6 +348,50 @@ class MergeGateTests(unittest.TestCase):
         self.assertIn("subject.txt", result.stdout + result.stderr)
         self.assertEqual(self.git(self.checkout, "status", "--porcelain"), "")
         self.assertFalse((self.checkout / ".git" / "MERGE_HEAD").exists())
+
+    def checkpoint_commit(self, message: str) -> str:
+        """A checkpoint(...) commit on the unit branch, dated after the Change-Review rule landed."""
+        self.write(self.unit / "visible.txt", message)
+        _ = self.git(self.unit, "add", ".")
+        self.environment["GIT_COMMITTER_DATE"] = "2026-10-15T12:00:00-04:00"
+        try:
+            _ = self.git(self.unit, "commit", "-m", message)
+        finally:
+            del self.environment["GIT_COMMITTER_DATE"]
+        _ = self.git(self.unit, "push", "origin", "unit-phase")
+        return self.git(self.unit, "rev-parse", "HEAD")
+
+    def test_a_checkpoint_without_a_change_review_line_is_refused_before_the_merge(self) -> None:
+        checkpoint = self.checkpoint_commit("checkpoint(fixture): grid fades")
+        result = self.run_gate(checkpoint=checkpoint)
+        self.assert_refused_before_gate(result)
+        self.assertIn("checkpoint(fixture): grid fades: no Change-Review line", result.stderr)
+
+    def test_a_green_merge_adds_one_row_per_visible_change_to_the_named_list(self) -> None:
+        review = self.root / "change-review.md"
+        self.write(review, "## To review\n\n| # | Change | Merged | On the Mac build | How to check |\n"
+                   + "| --- | --- | --- | --- | --- |\n| C7 | old | 2026-10-14 | yes | - |\n")
+        doc = self.root / "production.md"
+        self.write(doc, f"# p\n\n## Production Context\n\n- **Change review:** `{review}`\n")
+        checkpoint = self.checkpoint_commit("checkpoint(fixture): grid fades\n\n"
+                                            + "Change-Review: The grid fades gently | Look across the floor\n"
+                                            + "Change-Review: none — the gate script")
+        result = self.run_gate("--production", str(doc), checkpoint=checkpoint)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        merged = self.git(self.checkout, "rev-parse", "--short=8", "HEAD")
+        row = f"| C8 | The grid fades gently | {date.today().isoformat()} · {merged} | not yet | Look across the floor |"
+        self.assertEqual(review.read_text(encoding="utf-8").splitlines()[-1], row)
+        self.assertIn(f"Change review: {row}", result.stdout)
+        self.assertNotIn("drift", result.stderr)
+        self.assertEqual(self.git(self.checkout, "status", "--porcelain"), "")
+
+    def test_a_production_without_a_list_still_merges_a_checkpoint_with_its_line(self) -> None:
+        doc = self.root / "production.md"
+        self.write(doc, "# p\n")
+        checkpoint = self.checkpoint_commit("checkpoint(fixture): grid fades\n\nChange-Review: none — the gate script")
+        result = self.run_gate("--production", str(doc), checkpoint=checkpoint)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertNotIn("Change review:", result.stdout)
 
     def test_green_gate_pushes_no_ff_merge_with_subject_body_and_all_modules(self) -> None:
         self.write(self.state / "types-barrier", "overlap")
