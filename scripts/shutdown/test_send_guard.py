@@ -25,7 +25,7 @@ from push_texts import render, user_send_argv
 
 
 LOGIN = "owner@example.com"
-LABEL = "claude 2"
+LABEL = "claude2"
 NOW = "2026-10-10T21:00:00+00:00"
 
 
@@ -95,14 +95,14 @@ class SendGuardTests(ShutdownTestCase):
         return script, log
 
     def assert_recorded_alert(self, log: Path) -> None:
-        push = render("shutdown.restart_incomplete", account='"claude 2"', machine="Mac")
+        push = render("shutdown.restart_incomplete", account='"claude2"', machine="Mac")
         self.assertEqual(log.read_text(encoding="utf-8").splitlines(), [*user_send_argv(push)[2:], ""])
 
     def test_account_alert_without_a_fake_fails(self) -> None:
         class UnfakedAlert(ShutdownTestCase):
             def test_alert(self) -> None:
                 settle.alert_user(
-                    render("shutdown.restart_incomplete", account='"claude 2"', machine="Mac"),
+                    render("shutdown.restart_incomplete", account='"claude2"', machine="Mac"),
                 )
 
         self.assert_blocked(
@@ -114,7 +114,7 @@ class SendGuardTests(ShutdownTestCase):
             def test_alert(self) -> None:
                 try:
                     settle.alert_user(
-                            render("shutdown.restart_incomplete", account='"claude 2"', machine="Mac"),
+                            render("shutdown.restart_incomplete", account='"claude2"', machine="Mac"),
                     )
                 except Exception:
                     pass
@@ -235,7 +235,7 @@ class SendGuardTests(ShutdownTestCase):
             def test_alert(self) -> None:
                 self.allow_leaf(ShutdownSendLeaf.DELIVER_MESSAGE)
                 settle.alert_user(
-                    render("shutdown.restart_incomplete", account='"claude 2"', machine="Mac"),
+                    render("shutdown.restart_incomplete", account='"claude2"', machine="Mac"),
                 )
 
         result = unittest.TestResult()
@@ -255,7 +255,7 @@ class SendGuardTests(ShutdownTestCase):
 
             def test_alert(self) -> None:
                 settle.alert_user(
-                    render("shutdown.restart_incomplete", account='"claude 2"', machine="Mac"),
+                    render("shutdown.restart_incomplete", account='"claude2"', machine="Mac"),
                 )
 
         result = unittest.TestResult()
@@ -277,7 +277,7 @@ class SendGuardTests(ShutdownTestCase):
             def test_alert(self) -> None:
                 with patch.object(settle, "_deliver_message", new=fake_delivery):
                     settle.alert_user(
-                            render("shutdown.restart_incomplete", account='"claude 2"', machine="Mac"),
+                            render("shutdown.restart_incomplete", account='"claude2"', machine="Mac"),
                     )
 
         result = self.run_without_subprocesses(PatchedDelivery("test_alert"))

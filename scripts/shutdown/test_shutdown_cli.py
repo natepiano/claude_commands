@@ -34,7 +34,7 @@ from account import Account, UnreadableAccount
 
 
 LOGIN = "owner@example.com"
-LABEL = "claude 2"
+LABEL = "claude2"
 OCTOBER = "2026-10-09T21:49:10+00:00"
 JANUARY = "2026-01-15T17:30:00+00:00"
 PERMISSION_SCRIPT = Path(__file__).with_name("launch_permission.py")
@@ -186,6 +186,7 @@ class ShutdownLaunchCliTests(ShutdownTestCase):
     def test_follow_prints_each_new_step_once_and_waits_for_pending_restart(self) -> None:
         saved = session_shutdown(record.SessionWaiting(kind="waiting"))
         saved["session"]["name"] = "Alpha"
+        # Legacy-spelled stored targets must print as canonical labels.
         saved["target"] = "claude 3"
         saved["trail"] = [{"at": OCTOBER, "kind": "waiting", "detail": "pause sent"}]
         self.assertTrue(record.create_session(saved))
@@ -224,7 +225,7 @@ class ShutdownLaunchCliTests(ShutdownTestCase):
         for kind in ("waiting", "ready", "stopped", "already gone", "restarting", "restarted"):
             self.assertEqual(output.count(f"Alpha: {kind}"), 1, output)
         self.assertNotIn("unrelated", output)
-        self.assertTrue(output.rstrip().endswith("all 1 back on claude 3"), output)
+        self.assertTrue(output.rstrip().endswith("all 1 back on claude3"), output)
 
     def test_follow_waits_for_every_session_and_reports_total_back_on_target(self) -> None:
         first = session_shutdown(record.SessionRestarted(kind="restarted", at=OCTOBER), "first")
@@ -245,7 +246,7 @@ class ShutdownLaunchCliTests(ShutdownTestCase):
         self.assertEqual(polls.call_count, 1)
         self.assertEqual(output.count("first: restarted"), 1)
         self.assertEqual(output.count("second: restarted"), 1)
-        self.assertTrue(output.rstrip().endswith("all 2 back on claude 3"), output)
+        self.assertTrue(output.rstrip().endswith("all 2 back on claude3"), output)
 
     def test_follow_finds_completed_request_in_history_before_starting(self) -> None:
         for kind in ("stopped", "already gone", "restarted"):
@@ -312,7 +313,7 @@ class ShutdownLaunchCliTests(ShutdownTestCase):
             status, text = self.follow_request(output)
         self.assertEqual(status, 0)
         self.assertEqual(text.count("Removed: taken out"), 1)
-        self.assertTrue(text.rstrip().endswith("all 2 done: 1 back on claude 3, 1 taken out"), text)
+        self.assertTrue(text.rstrip().endswith("all 2 done: 1 back on claude3, 1 taken out"), text)
 
     def test_follow_finishes_when_every_session_was_taken_out_before_start(self) -> None:
         progress: list[record.SessionProgress] = [
@@ -576,9 +577,9 @@ class ShutdownLaunchCliTests(ShutdownTestCase):
             patch.object(shutdown, "resolve_sessions", return_value=shutdown.ResolvedSessions(("move-id",), report)),
         ):
             self.assertEqual(shutdown.main(["down", LABEL, "--here", "--only", "move-id",
-                "--restart", "--to", "claude 3"]), 0)
+                "--restart", "--to", "claude3"]), 0)
         down.assert_called_once_with(selected, True, ("move-id",), then="restart", alerts="user",
-            requested_by=None, request_id="", target="claude 3", why="", report=report)
+            requested_by=None, request_id="", target="claude3", why="", report=report)
 
     def test_down_to_passes_custom_move_reason_through_the_cli_to_settle(self) -> None:
         selected = Account("claude", LOGIN, LABEL)
@@ -590,9 +591,9 @@ class ShutdownLaunchCliTests(ShutdownTestCase):
             patch.object(shutdown, "resolve_sessions", return_value=shutdown.ResolvedSessions(("move-id",), report)),
         ):
             self.assertEqual(shutdown.main(["down", LABEL, "--here", "--only", "move-id",
-                "--restart", "--to", "claude 3", "--why", "weekly limit reached"]), 0)
+                "--restart", "--to", "claude3", "--why", "weekly limit reached"]), 0)
         down.assert_called_once_with(selected, True, ("move-id",), then="restart", alerts="user",
-            requested_by=None, request_id="", target="claude 3", why="weekly limit reached", report=report)
+            requested_by=None, request_id="", target="claude3", why="weekly limit reached", report=report)
 
     def test_down_restart_passes_the_selected_scope_and_intent(self) -> None:
         selected = Account("claude", LOGIN, LABEL)
@@ -1024,7 +1025,7 @@ class ShutdownLaunchCliTests(ShutdownTestCase):
         self.assertEqual(blocked.returncode, 0)
         self.assertEqual(
             blocked.stdout,
-            "test-job: skipped: claude 2 is held by a shutdown "
+            "test-job: skipped: claude2 is held by a shutdown "
             + "(since 2026-10-09 14:49 PDT)\n",
         )
         self.assertEqual(blocked.stderr, "")

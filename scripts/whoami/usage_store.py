@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import TypedDict, cast
 
 from agent_accounts import Quota, Report
+from note_file import canonical_label
 
 
 class StoredWindow(TypedDict):
@@ -191,7 +192,7 @@ def by_label(stored: dict[str, StoredUsage], logins: dict[str, str]) -> dict[str
         if "weekly" in usage and (weekly := _label_window(usage["weekly"])) is not None:
             entry["weekly"] = weekly
         if entry:
-            labelled[label] = entry
+            labelled[canonical_label(label)] = entry
     return labelled
 
 

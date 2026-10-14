@@ -176,7 +176,7 @@ class NightlyReviewTests(unittest.TestCase):
         denied = settings["permissions"]["deny"]
 
         self.assertIn("Edit(~/.claude/**)", denied)
-        for label in ("claude 1", "claude 2", "claude 3"):
+        for label in ("claude1", "claude2", "claude3"):
             self.assertIn(f"Edit(~/{accounts.account_dir(label).name}/**)", denied)
 
 
@@ -207,8 +207,8 @@ class TonightTests(NightlyReviewTests):
         self.assertEqual(calls[1][calls[1].index("--to") + 1], f"uds:{UNIT.socket}")
 
     def test_a_refused_start_names_add_units_reason_and_sends_nothing(self) -> None:
-        lines, calls = self.tonight([None], [done(code=1, stderr="claude 3 is shut down")])
-        self.assertEqual(lines, [f"{SESSION}: not started: claude 3 is shut down"])
+        lines, calls = self.tonight([None], [done(code=1, stderr="claude3 is shut down")])
+        self.assertEqual(lines, [f"{SESSION}: not started: claude3 is shut down"])
         self.assertEqual(len(calls), 1)
 
     def test_a_night_with_no_production_holding_the_unit_is_skipped(self) -> None:

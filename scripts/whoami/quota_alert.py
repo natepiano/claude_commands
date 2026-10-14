@@ -377,7 +377,7 @@ class CodexZeroEpisode(TypedDict):
 
 
 class State(TypedDict):
-    # Note name ("codex 1") -> its open episode.
+    # Account label ("codex1") -> its open episode.
     episodes: dict[str, Episode]
     codex_zero: NotRequired[dict[str, CodexZeroEpisode]]
     refusal_notices: NotRequired[dict[str, RefusalNotice]]
@@ -420,7 +420,7 @@ def _read_fallback(value: object) -> CodexQuotaFallback:
                 parsed = datetime.fromisoformat(until)
                 if parsed.tzinfo is not None:
                     hold = CreditsOffHold(parsed)
-            return AccountCodexQuotaFallback(agent_accounts.KnownCodexAccount(Path(home), login, label), at, entries, hold)
+            return AccountCodexQuotaFallback(agent_accounts.KnownCodexAccount(Path(home), login, note_file.canonical_label(label)), at, entries, hold)
     return UnknownOwnerCodexQuotaFallback(at, entries)
 
 
@@ -562,6 +562,11 @@ def recipients(config: Config, here: str | None = None) -> list[str]:
     return list(dict.fromkeys(name for name in names if name != here))
 
 
+def _normalize_notice_text(notice: ZeroEpisodeNotice) -> None:
+    notice["values"] = {key: note_file.canonical_label_text(value)
+                        for key, value in notice["values"].items()}
+
+
 @contextmanager
 def state_file() -> Generator[State]:
     """The state under an exclusive lock, written back on exit.
@@ -576,11 +581,18 @@ def state_file() -> Generator[State]:
         state: State
         try:
             saved = cast(StoredState, json.loads(STATE.read_text(encoding="utf-8")))
-            state = State(episodes=saved.get("episodes", {}), fallback=_read_fallback(saved.get("switch")))
+            state = State(episodes={note_file.canonical_label(label): episode for label, episode in saved.get("episodes", {}).items()}, fallback=_read_fallback(saved.get("switch")))
             if "codex_zero" in saved:
-                state["codex_zero"] = saved["codex_zero"]
+                state["codex_zero"] = {note_file.canonical_label(label): episode for label, episode in saved["codex_zero"].items()}
+                for episode in state["codex_zero"].values():
+                    _normalize_notice_text(episode["notice"])
+                    if "forecast_notice" in episode:
+                        _normalize_notice_text(episode["forecast_notice"])
             if "refusal_notices" in saved:
-                state["refusal_notices"] = saved["refusal_notices"]
+                state["refusal_notices"] = {note_file.canonical_label(label): notice for label, notice in saved["refusal_notices"].items()}
+                for notice in state["refusal_notices"].values():
+                    if notice["kind"] == "known":
+                        notice["label"] = note_file.canonical_label(notice["label"])
             if "unseen" in saved:
                 state["unseen"] = saved["unseen"]
         except (OSError, ValueError):
@@ -596,7 +608,7 @@ def state_file() -> Generator[State]:
 def ahead(resets: str | None) -> bool:
     """Whether a note's reset is still to come."""
     reset = reset_time(resets)
-    return reset is not None and reset > datetime.now(timezone.utc)
+    return isinstance(reset, note_file.KnownReset) and reset.value > datetime.now(timezone.utc)
 
 
 def remaining(note: AgentNote) -> float | None:
@@ -630,7 +642,8 @@ def recovered(name: str, notes: list[AgentNote], threshold: float,
               episode: Episode) -> bool:
     """Known to be out of the low state. An unknown reading is not a recovery."""
     note = next((note for note in notes if note.label == name), None)
-    if name.startswith("codex "):
+    parsed_label = note_file.parse_account_label(name)
+    if isinstance(parsed_label, note_file.NumberedAccountLabel) and parsed_label.tool == "codex":
         reset_at = episode.get("weekly_reset")
         if reset_at:
             try:
@@ -649,15 +662,15 @@ def recovered(name: str, notes: list[AgentNote], threshold: float,
                 if value is not None and reset is not None and reset > now and value > threshold:
                     return True
         reset = reset_time(note.get("resets"))
-        return reset is not None and reset <= now
-    if selection.multiple_accounts and name.startswith("claude "):
+        return isinstance(reset, note_file.KnownReset) and reset.value <= now
+    if selection.multiple_accounts and isinstance(parsed_label, note_file.NumberedAccountLabel) and parsed_label.tool == "claude":
         if note is None:
             return False
         value = remaining(note)
         if value is not None and math.isfinite(value) and value > threshold:
             return True
         reset = reset_time(note.get("resets"))
-        return reset is not None and reset <= now
+        return isinstance(reset, note_file.KnownReset) and reset.value <= now
     if note is None or not note_file.in_use(note):
         return True
     value = remaining(note)
@@ -1284,7 +1297,7 @@ def _zero_open_notice(label: str, report: Report, credits: agent_accounts.CodexC
             values["reason"] = f"Workers could not move to {chosen.label} because {_worker_move_failure_cause(str(error))}."
         else:
             values["target"] = chosen.label
-            values["transition"] = (f"workers use {chosen.label}" if not accounts.codex_destination_uses_credits(chosen, now) else f"workers spend {chosen.label} credits")
+            values["transition"] = (f"Codex work now uses {chosen.label}" if not accounts.codex_destination_uses_credits(chosen, now) else "Codex work now spends paid credits")
             values["funding"] = (f"{chosen.weekly_left:g}% weekly usage left"
                                  if not accounts.codex_destination_uses_credits(chosen, now) else "its own paid credits")
             return ZeroEpisodeNotice(id="quota.codex_workers_moved", values=values)
@@ -1507,7 +1520,8 @@ def _alert_for_saved_readings(notes: list[AgentNote], now: datetime, selection: 
                                     threshold, back, selection=selection)
             jobs += [Job(identity.label, recipient, text, "restored") for recipient in recipients(config)]
     for name in closed:
-        tool = name.split(" ")[0]
+        parsed_label = note_file.parse_account_label(name)
+        tool = parsed_label.tool if isinstance(parsed_label, note_file.NumberedAccountLabel) else name
         accounts = [note for note in usable(notes, threshold) if note.tool == tool]
         if tool == "codex" or tool == "claude" and selection.multiple_accounts:
             accounts = [note for note in notes if note.label == name]
@@ -1813,6 +1827,7 @@ def tell_others(text: str, here: str | None) -> list[str]:
 
 def acknowledge(name: str = "", here: str | None = None, now: datetime | None = None) -> list[str]:
     """Silence the open episode named, or every open one, until its account recovers."""
+    name = note_file.canonical_label(name)
     stamp = (now or datetime.now(timezone.utc)).isoformat(timespec="seconds")
     silenced: list[str] = []
     lines: list[str] = []

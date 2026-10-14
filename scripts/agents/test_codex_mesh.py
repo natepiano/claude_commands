@@ -1139,7 +1139,7 @@ class MeshCommandTests(unittest.TestCase):
 
     def test_prime_uses_the_numbered_worker_home_despite_the_process_home(self) -> None:
         target, new = self.prepare_workers_move()
-        self.assertEqual(accounts.main(["set-role", "seats", "codex 1"]), 0)
+        self.assertEqual(accounts.main(["set-role", "seats", "codex1"]), 0)
         self.assertNotEqual(agent_accounts.codex_home(), target)
 
         with patch.object(codex_mesh, "_stop_unused_with_lock_held", return_value=False):
@@ -1155,7 +1155,7 @@ class MeshCommandTests(unittest.TestCase):
         path = self.standing_instructions()
         self.seed_instruction_thread(path)
         _target, new = self.prepare_workers_move()
-        self.assertEqual(accounts.main(["set-role", "seats", "codex 1"]), 0)
+        self.assertEqual(accounts.main(["set-role", "seats", "codex1"]), 0)
         client = codex_mesh.Client(self.server.port, "worker")
         try:
             with patch.object(codex_mesh, "_stop_unused_with_lock_held", return_value=False):
@@ -1177,7 +1177,7 @@ class MeshCommandTests(unittest.TestCase):
         path = self.standing_instructions()
         self.seed_instruction_thread(path)
         _target, new = self.prepare_workers_move()
-        self.assertEqual(accounts.main(["set-role", "seats", "codex 1"]), 0)
+        self.assertEqual(accounts.main(["set-role", "seats", "codex1"]), 0)
         replacement = "replacement-review-thread"
         respond = new.respond
         def refuse_resume(request: dict[str, object]) -> list[dict[str, object]] | None:
@@ -1211,7 +1211,7 @@ class MeshCommandTests(unittest.TestCase):
     def test_reset_and_fork_refuse_a_thread_held_by_a_retired_live_turn(self) -> None:
         path = self.standing_instructions()
         _target, new = self.prepare_workers_move()
-        self.assertEqual(accounts.main(["set-role", "seats", "codex 1"]), 0)
+        self.assertEqual(accounts.main(["set-role", "seats", "codex1"]), 0)
         respond = self.server.respond
         def held_thread(request: dict[str, object]) -> list[dict[str, object]] | None:
             if request.get("method") == "thread/loaded/list":
@@ -1242,7 +1242,7 @@ class MeshCommandTests(unittest.TestCase):
     def test_reset_and_fork_stop_unused_retired_writer_before_reopening(self) -> None:
         path = self.standing_instructions()
         _target, new = self.prepare_workers_move()
-        self.assertEqual(accounts.main(["set-role", "seats", "codex 1"]), 0)
+        self.assertEqual(accounts.main(["set-role", "seats", "codex1"]), 0)
         stopped: list[int] = []
         respond = new.respond
         def reopen_after_stop(request: dict[str, object]) -> list[dict[str, object]] | None:
@@ -1268,7 +1268,7 @@ class MeshCommandTests(unittest.TestCase):
     def test_reset_and_fork_confirm_retired_thread_release_before_reopening(self) -> None:
         path = self.standing_instructions()
         _target, new = self.prepare_workers_move()
-        self.assertEqual(accounts.main(["set-role", "seats", "codex 1"]), 0)
+        self.assertEqual(accounts.main(["set-role", "seats", "codex1"]), 0)
         released = [False]
         respond = self.server.respond
         def release_thread(request: dict[str, object]) -> list[dict[str, object]] | None:
@@ -1301,7 +1301,7 @@ class MeshCommandTests(unittest.TestCase):
         sent: list[int] = []
         def send_after_turn(_client: codex_mesh.Client, _thread_id: str, _deadline: float) -> bool:
             if not sent:
-                self.assertEqual(accounts.main(["set-role", "seats", "codex 1"]), 0)
+                self.assertEqual(accounts.main(["set-role", "seats", "codex1"]), 0)
                 sent.append(codex_mesh.command_send(argparse.Namespace(
                     session_dir=str(self.session_dir), to="worker", message="review again", message_file="")))
             return False
@@ -2465,7 +2465,7 @@ class MeshCommandTests(unittest.TestCase):
             "port": self.server.port, "pid": os.getpid(), "codex_home": str(selected),
         }))
         _ = self.patches.enter_context(patch.object(codex_mesh, "ensure_server", return_value=(self.server.port, True)))
-        return agent_accounts.KnownCodexAccount(selected, login, "codex 2")
+        return agent_accounts.KnownCodexAccount(selected, login, "codex2")
 
     def quota_completion(self, request: dict[str, object]) -> list[dict[str, object]]:
         params = cast(dict[str, object], request["params"])
@@ -2555,7 +2555,7 @@ class MeshCommandTests(unittest.TestCase):
         original = self.respond
         def respond(request: dict[str, object]) -> list[dict[str, object]] | None:
             if request.get("method") == "turn/start":
-                self.assertEqual(accounts.main(["set-role", "seats", "codex 1"]), 0)
+                self.assertEqual(accounts.main(["set-role", "seats", "codex1"]), 0)
                 _ = (self.session_dir / codex_mesh.SERVER_FILE).write_text(json.dumps({
                     "port": self.server.port, "pid": os.getpid() + 1, "codex_home": str(next_home),
                 }))
@@ -2679,7 +2679,7 @@ class MeshCommandTests(unittest.TestCase):
         new.respond = respond
         def wait(seconds: float) -> None:
             self.wait(seconds)
-            self.assertEqual(accounts.main(["set-role", "seats", "codex 1"]), 0)
+            self.assertEqual(accounts.main(["set-role", "seats", "codex1"]), 0)
             self.next_thread_id = "replacement-thread"
         self.outcomes = ["capacity"]
         with patch.object(codex_mesh, "_capacity_sleep", side_effect=wait), \
@@ -2690,14 +2690,14 @@ class MeshCommandTests(unittest.TestCase):
         self.assertEqual(serving.home, target)
         self.assertIsInstance(serving.account, agent_accounts.KnownCodexAccount)
         assert isinstance(serving.account, agent_accounts.KnownCodexAccount)
-        self.assertEqual(serving.account.label, "codex 1")
+        self.assertEqual(serving.account.label, "codex1")
         target_starts = [request for request in new.requests if request.get("method") == "turn/start"]
         self.assertEqual(len(target_starts), 1)
         self.assertIn("replacement-thread", str(target_starts[0]))
 
     def test_release_refusal_does_not_report_a_provider_turn_refusal(self) -> None:
         _target, new = self.prepare_workers_move()
-        self.assertEqual(accounts.main(["set-role", "seats", "codex 1"]), 0)
+        self.assertEqual(accounts.main(["set-role", "seats", "codex1"]), 0)
         _ = (self.session_dir / codex_mesh.ROSTER_FILE).write_text(json.dumps({
             "worker": {"thread_id": THREAD_ID, "port": self.server.port, "status": "running"},
         }))
@@ -2751,7 +2751,7 @@ class MeshCommandTests(unittest.TestCase):
         def respond(request: dict[str, object]) -> list[dict[str, object]] | None:
             frames = old_response(request)
             if request.get("method") == "turn/start":
-                self.assertEqual(accounts.main(["set-role", "seats", "codex 1"]), 0)
+                self.assertEqual(accounts.main(["set-role", "seats", "codex1"]), 0)
             return frames
         self.server.respond = respond
         self.outcomes = ["overflow", "completed"]
@@ -2780,10 +2780,10 @@ class MeshCommandTests(unittest.TestCase):
             requested: moves.RequestedMove = {
                 "kind": "requested", "at": "2026-10-13T12:00:00+00:00", "tool": "codex",
                 "subject": "seats", "move_id": "refused-turn-move", "from": "default",
-                "to": "codex 1", "why": "quota refusal", "window": "unknown",
+                "to": "codex1", "why": "quota refusal", "window": "unknown",
             }
             moves.append_move(requested)
-            self.assertEqual(accounts.main(["set-role", "seats", "codex 1"]), 0)
+            self.assertEqual(accounts.main(["set-role", "seats", "codex1"]), 0)
             if held:
                 _ = (self.session_dir / "worker.pending.json").write_text(json.dumps({
                     "thread_id": THREAD_ID, "messages": list(held), "accepting_messages": True,
@@ -2846,7 +2846,7 @@ class MeshCommandTests(unittest.TestCase):
             }))
             return server.port
         def move_on_refusal(_name: str, serving: codex_mesh.CodexServingState, _detail: str) -> None:
-            next_label = "codex 1" if serving.home != target else "codex 2"
+            next_label = "codex1" if serving.home != target else "codex2"
             self.request_workers_move(agent_accounts.codex_home_role_label(serving.home), next_label,
                                    "move-to-" + next_label)
             # The role file is the temporary boundary; provider and account checks belong to blocked's tests.
@@ -2873,16 +2873,16 @@ class MeshCommandTests(unittest.TestCase):
 
     def test_new_worker_on_requested_destination_does_not_confirm_another_workers_move(self) -> None:
         _target, new = self.prepare_workers_move()
-        self.request_workers_move("default", "codex 1", "another-worker-move")
-        self.assertEqual(accounts.main(["set-role", "seats", "codex 1"]), 0)
+        self.request_workers_move("default", "codex1", "another-worker-move")
+        self.assertEqual(accounts.main(["set-role", "seats", "codex1"]), 0)
         self.assertEqual(self.run_start()[0], 0)
         self.assertTrue(any(request.get("method") == "turn/start" for request in new.requests))
         self.assertEqual([entry for entry in moves.read_moves() if entry["kind"] == "confirmed"], [])
 
     def test_resumed_worker_confirms_only_a_request_from_its_actual_source_home(self) -> None:
         _target, new = self.prepare_workers_move()
-        self.request_workers_move("codex 2", "codex 1", "different-source-move")
-        self.assertEqual(accounts.main(["set-role", "seats", "codex 1"]), 0)
+        self.request_workers_move("codex2", "codex1", "different-source-move")
+        self.assertEqual(accounts.main(["set-role", "seats", "codex1"]), 0)
         self.write_pool_roster({"worker": {"thread_id": THREAD_ID, "status": "done"}})
         client = codex_mesh.Client(self.server.port, "worker")
         try:
@@ -2895,6 +2895,35 @@ class MeshCommandTests(unittest.TestCase):
         self.assertTrue(any(request.get("method") == "thread/resume" for request in new.requests))
         self.assertEqual([entry for entry in moves.read_moves() if entry["kind"] == "confirmed"], [])
 
+    def test_resumed_worker_confirms_a_pending_spaced_label_request(self) -> None:
+        target, new = self.prepare_workers_move()
+        source = target.parent / ".codex"
+        source.mkdir(exist_ok=True)
+        login = "source@example.invalid"
+        claims = base64.urlsafe_b64encode(json.dumps({"email": login}).encode()).decode().rstrip("=")
+        _ = (source / "auth.json").write_text(json.dumps({"tokens": {"id_token": f"header.{claims}.signature"}}))
+        _ = (target.parent / "codex2.md").write_text(f"---\nlogin: {login}\n---\n")
+        self.request_workers_move("codex 2", "codex 1", "spaced-pending-move")
+        journal = moves.store_file()
+        legacy = journal.read_bytes().replace(b"codex2", b"codex 2").replace(b"codex1", b"codex 1")
+        _ = journal.write_bytes(legacy)
+        self.assertEqual(accounts.main(["set-role", "seats", "codex1"]), 0)
+        self.write_pool_roster({"worker": {"thread_id": THREAD_ID, "status": "done"}})
+        client = codex_mesh.Client(self.server.port, "worker")
+        try:
+            result = codex_mesh._move_resident(self.start_args(), str(self.session_dir), "worker", THREAD_ID, client)  # pyright: ignore[reportPrivateUsage]
+            self.assertIsInstance(result, codex_mesh.MovedWorker)
+            assert isinstance(result, codex_mesh.MovedWorker)
+            result.client.close()
+        finally:
+            client.close()
+        self.assertTrue(any(request.get("method") == "thread/resume" for request in new.requests))
+        confirmations = [entry for entry in moves.read_moves() if entry["kind"] == "confirmed"]
+        self.assertEqual(len(confirmations), 1)
+        self.assertEqual(confirmations[0]["move_id"], "spaced-pending-move")
+        self.assertEqual(confirmations[0].get("home"), str(target))
+        self.assertEqual(journal.read_bytes()[:len(legacy)], legacy)
+
     def assert_legacy_default_move_confirmed(self, *, default_destination: bool) -> None:
         numbered, new = self.prepare_workers_move()
         default = numbered.parent / ".codex"
@@ -2904,7 +2933,7 @@ class MeshCommandTests(unittest.TestCase):
         _ = (default / "auth.json").write_text(json.dumps({"tokens": {"id_token": f"header.{claims}.signature"}}))
         _ = (numbered.parent / "codex2.md").write_text(f"---\nlogin: {login}\n---\n")
         source, destination = (numbered, default) if default_destination else (default, numbered)
-        source_label, destination_label = ("codex 1", "default") if default_destination else ("default", "codex 1")
+        source_label, destination_label = ("codex1", "default") if default_destination else ("default", "codex1")
         _ = (self.session_dir / codex_mesh.SERVER_FILE).write_text(json.dumps({
             "port": self.server.port, "pid": os.getpid(), "codex_home": str(source),
         }))
@@ -2939,13 +2968,13 @@ class MeshCommandTests(unittest.TestCase):
 
     def test_worker_resume_failure_records_the_current_move_request_and_reason(self) -> None:
         _target, new = self.prepare_workers_move()
-        self.request_workers_move("default", "codex 1", "resume-failure-move")
-        self.assertEqual(accounts.main(["set-role", "seats", "codex 1"]), 0)
+        self.request_workers_move("default", "codex1", "resume-failure-move")
+        self.assertEqual(accounts.main(["set-role", "seats", "codex1"]), 0)
         self.write_pool_roster({"worker": {"thread_id": THREAD_ID, "status": "done"}})
         respond = new.respond
         def failed_resume(request: dict[str, object]) -> list[dict[str, object]] | None:
             if request.get("method") == "thread/start":
-                self.request_workers_move("codex 1", "codex 2", "later-request")
+                self.request_workers_move("codex1", "codex2", "later-request")
             if request.get("method") in ("thread/resume", "thread/start"):
                 return [{"id": request["id"], "error": {"message": "destination cannot restore thread"}}]
             return respond(request)
@@ -3008,7 +3037,7 @@ class MeshCommandTests(unittest.TestCase):
         _, new = self.prepare_workers_move()
         def wait(seconds: float) -> None:
             self.wait(seconds)
-            self.assertEqual(accounts.main(["set-role", "seats", "codex 1"]), 0)
+            self.assertEqual(accounts.main(["set-role", "seats", "codex1"]), 0)
         self.outcomes = ["capacity", "completed"]
         with patch.object(codex_mesh, "_capacity_sleep", side_effect=wait):
             code, errors = self.run_start()
@@ -3051,7 +3080,7 @@ class MeshCommandTests(unittest.TestCase):
             "launcher_pid": os.getpid(), "port": self.server.port,
         }}))
         self.live_turn = "live-turn"
-        self.assertEqual(accounts.main(["set-role", "seats", "codex 1"]), 0)
+        self.assertEqual(accounts.main(["set-role", "seats", "codex1"]), 0)
         args = argparse.Namespace(session_dir=str(self.session_dir), to="worker", message="peer message", message_file="")
         with contextlib.redirect_stdout(io.StringIO()):
             self.assertEqual(codex_mesh.command_send(args), 0)
@@ -4032,7 +4061,7 @@ class MeshCommandTests(unittest.TestCase):
         self.context_sizes = [150000]
         self.assertEqual(self.run_start()[0], 0)
         _target, new = self.prepare_workers_move()
-        self.assertEqual(accounts.main(["set-role", "seats", "codex 1"]), 0)
+        self.assertEqual(accounts.main(["set-role", "seats", "codex1"]), 0)
         calls: list[tuple[str, str]] = []
         loaded = [True]
         old_respond = self.server.respond
@@ -4058,7 +4087,7 @@ class MeshCommandTests(unittest.TestCase):
     def test_swap_stops_unused_old_writer_and_next_follow_resumes_on_target(self) -> None:
         self.assertEqual(self.run_start()[0], 0)
         target, new = self.prepare_workers_move()
-        self.assertEqual(accounts.main(["set-role", "seats", "codex 1"]), 0)
+        self.assertEqual(accounts.main(["set-role", "seats", "codex1"]), 0)
         _ = (self.session_dir / codex_mesh.SERVER_FILE).write_text(json.dumps({
             "pid": 123456, "port": self.server.port, "codex_home": str(target.parent / ".codex"),
         }))
@@ -4070,7 +4099,7 @@ class MeshCommandTests(unittest.TestCase):
             alive[0] = False
             return True
         with patch.object(codex_mesh, "SWEEP_ROOT", self.session_dir.parent), patch.object(codex_mesh, "_pid_alive", side_effect=running), patch.object(codex_mesh, "_stop_unused", side_effect=stop) as stopped, contextlib.redirect_stdout(io.StringIO()):
-            _ = codex_mesh.retire_seats_servers(target, "codex 1")
+            _ = codex_mesh.retire_seats_servers(target, "codex1")
             code, errors = self.run_follow()
         self.assertEqual((code, errors), (0, ""))
         stopped.assert_called_once()
@@ -4080,7 +4109,7 @@ class MeshCommandTests(unittest.TestCase):
         self.context_sizes = [150000]
         self.assertEqual(self.run_start()[0], 0)
         _target, new = self.prepare_workers_move()
-        self.assertEqual(accounts.main(["set-role", "seats", "codex 1"]), 0)
+        self.assertEqual(accounts.main(["set-role", "seats", "codex1"]), 0)
         with patch.object(codex_mesh, "_release_other_worker_writers", return_value=codex_mesh.WorkerThreadStateUnknown("release not confirmed")), patch.object(codex_mesh, "_post_board_status") as board, contextlib.redirect_stderr(io.StringIO()) as errors:
             code = codex_mesh.command_compact(argparse.Namespace(session_dir=str(self.session_dir), to="worker"))
         self.assertEqual(code, 2)
@@ -4153,7 +4182,7 @@ class MeshCommandTests(unittest.TestCase):
     def test_lost_new_server_turn_reply_cleans_up_that_server_and_thread(self) -> None:
         self.assertEqual(self.run_start()[0], 0)
         target, new = self.prepare_workers_move()
-        self.assertEqual(accounts.main(["set-role", "seats", "codex 1"]), 0)
+        self.assertEqual(accounts.main(["set-role", "seats", "codex1"]), 0)
         args = self.start_args()
         _ = (self.session_dir / "worker.pending.json").write_text(json.dumps({"thread_id": THREAD_ID, "messages": ["held message"]}))
         with patch.object(codex_mesh.Client, "call", autospec=True) as call, patch.object(codex_mesh, "_end_unwatched_turn", return_value=codex_mesh.RelaunchAllowed()) as cleanup:
@@ -4194,7 +4223,7 @@ class MeshCommandTests(unittest.TestCase):
             frame = read(client, deadline)
             if frame is None:
                 if not resumes:
-                    self.assertEqual(accounts.main(["set-role", "seats", "codex 1"]), 0)
+                    self.assertEqual(accounts.main(["set-role", "seats", "codex1"]), 0)
                 elif client.port == new.port:
                     _ = (self.session_dir / "worker.end").write_text("end")
             return frame
@@ -4562,7 +4591,7 @@ class MeshCommandTests(unittest.TestCase):
     def test_move_failure_after_thread_replacement_retains_target_cleanup(self) -> None:
         self.assertEqual(self.run_start()[0], 0)
         _target, new = self.prepare_workers_move()
-        self.assertEqual(accounts.main(["set-role", "seats", "codex 1"]), 0)
+        self.assertEqual(accounts.main(["set-role", "seats", "codex1"]), 0)
         replacement = "replacement-thread"
         def rpc(_client: codex_mesh.Client, method: str, _params: dict[str, object], **_options: object) -> codex_mesh.RpcMessage:
             if method == "thread/read":
@@ -4709,7 +4738,7 @@ class QuotaRefusalTests(unittest.TestCase):
         self.assertFalse(self.refused(codex_mesh.CapacityRetriesExhausted(THREAD_ID, 3, 20), tested=True))
 
     def test_refusal_handoff_preserves_named_window_or_unknown_and_observation_time(self) -> None:
-        identity = agent_accounts.KnownCodexAccount(Path.home() / ".codex", "serving@example.invalid", "codex 1")
+        identity = agent_accounts.KnownCodexAccount(Path.home() / ".codex", "serving@example.invalid", "codex1")
         serving = codex_mesh.ServingCodexServer(4001, 99, identity.home, identity)
         for detail, window in ((USAGE_LIMIT + " Weekly limit reached", "weekly"),
                                (USAGE_LIMIT + " 5-hour limit reached", "five_hour"),
@@ -4726,16 +4755,16 @@ class QuotaRefusalTests(unittest.TestCase):
 
 
     def test_the_report_runs_the_blocked_verb_and_survives_its_failure(self) -> None:
-        identity = agent_accounts.KnownCodexAccount(Path.home() / ".codex", "serving@example.invalid", "codex 1")
+        identity = agent_accounts.KnownCodexAccount(Path.home() / ".codex", "serving@example.invalid", "codex1")
         serving = codex_mesh.ServingCodexServer(4001, 99, identity.home, identity)
-        done = subprocess.CompletedProcess([], 0, "switched to claude for codex 1: delegate\n", "")
+        done = subprocess.CompletedProcess([], 0, "switched to claude for codex1: delegate\n", "")
         with patch.object(subprocess, "run", return_value=done) as run, \
                 contextlib.redirect_stderr(io.StringIO()) as errors:
             codex_mesh._report_quota_refusal("worker", serving)  # pyright: ignore[reportPrivateUsage]
         command = cast("list[str]", run.call_args.args[0])
         self.assertEqual(command[1:6], [str(codex_mesh.QUOTA_REPORT), "blocked", str(identity.home), identity.login, identity.label])
         self.assertTrue(codex_mesh.QUOTA_REPORT.is_file())
-        self.assertIn("codex_mesh: worker: quota: switched to claude for codex 1: delegate", errors.getvalue())
+        self.assertIn("codex_mesh: worker: quota: switched to claude for codex1: delegate", errors.getvalue())
         with patch.object(subprocess, "run", side_effect=OSError("no interpreter")), \
                 contextlib.redirect_stderr(io.StringIO()) as errors:
             codex_mesh._report_quota_refusal("worker", serving)  # pyright: ignore[reportPrivateUsage]
@@ -5788,8 +5817,8 @@ class WorkersHomeTests(unittest.TestCase):
         self.session_dir.mkdir()
         _ = cast(object, self.enterContext(patch.dict(os.environ, {"HOME": str(self.home), "AGENT_NOTES_DIR": str(self.home)}, clear=True)))
 
-    def select(self, label: str = "codex 1") -> Path:
-        home = self.home / f".codex{label.removeprefix('codex ')}"
+    def select(self, label: str = "codex1") -> Path:
+        home = self.home / ("." + note_name(label).removesuffix(".md"))
         home.mkdir(exist_ok=True)
         login = f"{label.replace(' ', '-')}@example.invalid"
         claims = base64.urlsafe_b64encode(json.dumps({"email": login}).encode()).decode().rstrip("=")
@@ -5878,9 +5907,9 @@ class WorkersHomeTests(unittest.TestCase):
         home = self.select()
         _ = (self.session_dir / codex_mesh.SERVER_FILE).write_text(json.dumps({"port": 4001, "pid": os.getpid()}))
         with patch.object(codex_mesh, "SWEEP_ROOT", self.session_dir.parent), patch.object(codex_mesh, "_stop_unused", return_value=True):
-            lines = codex_mesh.retire_seats_servers(home, "codex 1")
+            lines = codex_mesh.retire_seats_servers(home, "codex1")
         self.assertIn("move from ~/.codex at their next turn", "\n".join(lines))
-        self.assertIn("codex 1 (~/.codex1)", "\n".join(lines))
+        self.assertIn("codex1 (~/.codex1)", "\n".join(lines))
 
     def test_unsubscribe_not_loaded_proves_release_without_another_state_read(self) -> None:
         class UnloadedClient:
@@ -5941,19 +5970,19 @@ class WorkersHomeTests(unittest.TestCase):
         _ = (root / "active" / "director-one").write_text(str(self.session_dir) + "\n")
         _ = (root / "active" / "director-two").write_text(str(other_run) + "\n")
         with patch.object(codex_mesh, "SWEEP_ROOT", root), patch.object(codex_mesh, "_stop_unused", return_value=False), patch.object(codex_mesh, "_start_watcher"), patch.object(codex_mesh, "_notify_holder") as notify:
-            _ = codex_mesh.retire_seats_servers(home, "codex 1")
+            _ = codex_mesh.retire_seats_servers(home, "codex1")
         self.assertFalse((self.session_dir / codex_mesh.SERVER_FILE).exists())
         self.assertFalse((other_run / codex_mesh.SERVER_FILE).exists())
         self.assertCountEqual([entry.args[0] for entry in notify.call_args_list], ["director-one", "director-two"])
         for entry in notify.call_args_list:
-            self.assertIn("codex 1", str(cast(object, entry.args[1])))
+            self.assertIn("codex1", str(cast(object, entry.args[1])))
             self.assertIn("~/.codex1", str(cast(object, entry.args[1])))
 
     def test_swap_stops_unused_old_server_immediately_without_starting_a_watcher(self) -> None:
         home = self.select()
         self.record(self.home / ".codex")
         with patch.object(codex_mesh, "SWEEP_ROOT", self.session_dir.parent), patch.object(codex_mesh, "_stop_unused", return_value=True) as stop, patch.object(codex_mesh, "_start_watcher") as watch, patch.object(codex_mesh, "_notify_holder"):
-            _ = codex_mesh.retire_seats_servers(home, "codex 1")
+            _ = codex_mesh.retire_seats_servers(home, "codex1")
         stop.assert_called_once_with(None, os.getpid(), 4001, codex_mesh.RetiredRunServer(self.session_dir))
         watch.assert_not_called()
 
@@ -6096,7 +6125,7 @@ class WorkersHomeTests(unittest.TestCase):
                 self.assertIn(datetime.fromtimestamp(2000).astimezone(zone).strftime("%H:%M %Z"), output.getvalue())
                 self.record(self.home / ".codex")
                 with patch.object(codex_mesh, "SWEEP_ROOT", root), patch.object(codex_mesh, "user_zone", return_value=zone), patch.object(codex_mesh, "_stop_unused", return_value=True):
-                    lines = codex_mesh.retire_seats_servers(home, "codex 1")
+                    lines = codex_mesh.retire_seats_servers(home, "codex1")
                 self.assertIn(datetime.now().astimezone(zone).strftime("%H:%M %Z"), "\n".join(lines))
 
     def test_swap_dry_run_lists_runs_without_retiring_or_notifying(self) -> None:
@@ -6104,11 +6133,11 @@ class WorkersHomeTests(unittest.TestCase):
         self.record(self.home / ".codex")
         before = (self.session_dir / codex_mesh.SERVER_FILE).read_bytes()
         with patch.object(codex_mesh, "SWEEP_ROOT", self.session_dir.parent), patch.object(codex_mesh, "_start_watcher") as watch, patch.object(codex_mesh, "_notify_holder") as notify:
-            lines = codex_mesh.retire_seats_servers(home, "codex 1", dry_run=True)
+            lines = codex_mesh.retire_seats_servers(home, "codex1", dry_run=True)
         self.assertEqual((self.session_dir / codex_mesh.SERVER_FILE).read_bytes(), before)
         self.assertFalse((self.session_dir / codex_mesh.RETIRED_FILE).exists())
         self.assertTrue(lines)
-        self.assertIn("codex 1", "\n".join(lines))
+        self.assertIn("codex1", "\n".join(lines))
         self.assertIn("~/.codex1", "\n".join(lines))
         watch.assert_not_called()
         notify.assert_not_called()

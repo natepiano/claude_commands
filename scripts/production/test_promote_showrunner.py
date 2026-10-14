@@ -119,10 +119,10 @@ class PromoteShowrunnerTests(unittest.TestCase):
         notes.mkdir(exist_ok=True)
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {"AGENT_NOTES_DIR": str(notes)})))
         _ = (notes / "claude3.md").write_text("---\nlogin: showrunner@example.invalid\n---\n")
-        self.assertEqual(accounts.setup("claude 3"), [])
-        directory = accounts.account_dir("claude 3")
+        self.assertEqual(accounts.setup("claude3"), [])
+        directory = accounts.account_dir("claude3")
         _ = (directory / ".claude.json").write_text(json.dumps({"oauthAccount": {"emailAddress": "showrunner@example.invalid"}}))
-        return accounts.NamedAccount("claude 3", directory)
+        return accounts.NamedAccount("claude3", directory)
 
     def production_of(self, _session: str) -> Path | None:
         return self.parent_doc if self.runs_production else None
@@ -269,10 +269,10 @@ class PromoteShowrunnerTests(unittest.TestCase):
     def test_promotion_refuses_unconfigured_showrunners_before_stopping_unit(self) -> None:
         """F004: promotion does not inherit the unit's previous account."""
         with mock.patch.object(accounts, "role_account", side_effect=accounts.AccountsError(
-                "showrunners: not configured — accounts.py move showrunners <claude N>")):
+                "showrunners: not configured — accounts.py move showrunners <claudeN>")):
             code, _, error = self.run_main()
         self.assertEqual(code, 2)
-        self.assertIn("accounts.py move showrunners <claude N>", error)
+        self.assertIn("accounts.py move showrunners <claudeN>", error)
         self.assert_nothing_stopped()
         self.assertFalse(accounts.groups_file().exists())
 
@@ -394,11 +394,11 @@ class PromoteShowrunnerTests(unittest.TestCase):
     def test_herdr_promotion_refuses_unconfigured_showrunners_without_stopping(self) -> None:
         self.native_unit()
         with mock.patch.object(accounts, "role_account", side_effect=accounts.AccountsError(
-                "showrunners: not configured — accounts.py move showrunners <claude N>")), \
+                "showrunners: not configured — accounts.py move showrunners <claudeN>")), \
                 mock.patch.object(herdr, "stop_session") as stopped:
             code, _out, err = self.run_main()
         self.assertEqual(code, 2, err)
-        self.assertIn("accounts.py move showrunners <claude N>", err)
+        self.assertIn("accounts.py move showrunners <claudeN>", err)
         stopped.assert_not_called()
         self.assert_nothing_stopped()
         self.assertFalse(any(event.startswith("tmux") for event in self.events))
