@@ -277,6 +277,10 @@ class PhaseTableTests(unittest.TestCase):
             env=self.environment(),
         )
 
+    def production_file_line(self, production: str = "show") -> str:
+        doc = (self.working_dir / "docs" / f"{production}-production.md").resolve()
+        return f'production_file: "{doc.as_uri()}"'
+
     def write_phase_note(
         self,
         folder: str,
@@ -2255,7 +2259,7 @@ class PhaseTableTests(unittest.TestCase):
                     "---",
                     "phase_table: true",
                     "showrunner: showrunner",
-                    "production: show",
+                    self.production_file_line(),
                     "unit: table-unit",
                     'now: "Phase 1 of 1 — Current delivery"',
                     "---",
@@ -2379,7 +2383,7 @@ class PhaseTableTests(unittest.TestCase):
                 "---",
                 "phase_table: true",
                 "showrunner: showrunner",
-                "production: show",
+                self.production_file_line(),
                 "unit: table-unit",
                 'now: "Phase 1 of 1 — Current delivery"',
                 "---",
@@ -2913,7 +2917,7 @@ class PhaseTableTests(unittest.TestCase):
             (0, "", ""),
         )
         refreshed_text = refreshed.read_text(encoding="utf-8")
-        self.assertIn("production: other\n", refreshed_text)
+        self.assertIn(f"{self.production_file_line('other')}\n", refreshed_text)
         self.assertIn("unit: table-unit\n", refreshed_text)
         self.assertEqual(archived.read_bytes(), source_bytes)
 
@@ -3110,6 +3114,103 @@ class PhaseTableTests(unittest.TestCase):
 
         self.assertEqual(result.returncode, 0)
         self.assertIn("--session-dir", result.stdout)
+
+
+class ProductionFileLinkTests(unittest.TestCase):
+    """The `production_file` link names the doc's main-branch copy."""
+
+    temporary: tempfile.TemporaryDirectory[str]  # pyright: ignore[reportUninitializedInstanceVariable]
+    root: Path  # pyright: ignore[reportUninitializedInstanceVariable]
+    vault: Path  # pyright: ignore[reportUninitializedInstanceVariable]
+
+    @override
+    def setUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.root = Path(self.temporary.name).resolve()
+        self.vault = self.root / "vault"
+        self.vault.mkdir()
+
+    def make_checkout(self, path: Path, remote: str) -> None:
+        path.mkdir(parents=True)
+        for arguments in (
+            ("init", "--quiet", "--initial-branch=main"),
+            ("remote", "add", "origin", remote),
+        ):
+            _ = subprocess.run(["git", "-C", str(path), *arguments], check=True)
+
+    def write_doc(self, checkout: Path, relative: str, promote: str) -> Path:
+        doc = checkout / relative
+        doc.parent.mkdir(parents=True, exist_ok=True)
+        _ = doc.write_text(f"# Production\n\n- **Promote:** {promote}\n", encoding="utf-8")
+        return doc
+
+    def test_doc_promoted_into_the_vault_is_a_wiki_link(self) -> None:
+        trunk = self.root / "trunk"
+        self.make_checkout(trunk, "git@github.com:someone/vault.git")
+        doc = self.write_doc(trunk, "productions/notes-production.md", str(self.vault))
+
+        link = phase_table._production_file_link(doc, self.vault)  # pyright: ignore[reportPrivateUsage]
+
+        self.assertEqual(link, "[[productions/notes-production]]")
+
+    def test_doc_promoted_outside_the_vault_is_its_github_page(self) -> None:
+        main = self.root / "main"
+        self.make_checkout(main, "git@github.com:someone/tools.git")
+        _ = subprocess.run(
+            ["git", "-C", str(main), "symbolic-ref", "HEAD", "refs/heads/trunk-line"],
+            check=True,
+        )
+        trunk = self.root / "trunk"
+        self.make_checkout(trunk, "git@github.com:someone/tools.git")
+        doc = self.write_doc(trunk, "docs/plans/tools-production.md", f"{main}, mac ~/tools")
+
+        link = phase_table._production_file_link(doc, self.vault)  # pyright: ignore[reportPrivateUsage]
+
+        self.assertEqual(
+            link,
+            "https://github.com/someone/tools/blob/trunk-line/docs/plans/tools-production.md",
+        )
+
+    def test_doc_off_github_is_a_file_uri_of_the_main_copy(self) -> None:
+        main = self.root / "main"
+        self.make_checkout(main, str(self.root / "bare.git"))
+        trunk = self.root / "trunk"
+        self.make_checkout(trunk, str(self.root / "bare.git"))
+        doc = self.write_doc(trunk, "docs/tools-production.md", str(main))
+
+        link = phase_table._production_file_link(doc, self.vault)  # pyright: ignore[reportPrivateUsage]
+
+        self.assertEqual(link, (main / "docs" / "tools-production.md").as_uri())
+
+    def test_slug_is_read_from_each_link_form(self) -> None:
+        cases = {
+            '"[[productions/notes-production]]"': "notes",
+            '"https://github.com/someone/tools/blob/main/docs/tools-production.md"': "tools",
+            '"file:///home/someone/docs/tools-production.md"': "tools",
+            '"[[productions/notes]]"': "",
+            "": "",
+        }
+        for link, slug in cases.items():
+            with self.subTest(link=link):
+                self.assertEqual(
+                    phase_table._production_slug_from_link(link),  # pyright: ignore[reportPrivateUsage]
+                    slug,
+                )
+
+    def test_note_with_only_production_file_is_owned(self) -> None:
+        note = self.root / "note.md"
+        _ = note.write_text(
+            "---\nphase_table: true\nshowrunner: natedev\n"
+            + 'production_file: "[[productions/notes-production]]"\n'
+            + "unit: alpha-unit\n---\n",
+            encoding="utf-8",
+        )
+
+        self.assertEqual(
+            phase_table._note_ownership(note),  # pyright: ignore[reportPrivateUsage]
+            phase_table.NoteOwnership(production="notes", unit="alpha-unit"),
+        )
 
 
 if __name__ == "__main__":
