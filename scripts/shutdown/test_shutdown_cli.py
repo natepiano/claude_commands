@@ -10,6 +10,7 @@ import os
 import shutil
 import subprocess
 import sys
+import time
 import tempfile
 import unittest
 from collections.abc import Iterable
@@ -162,6 +163,257 @@ class ShutdownLaunchCliTests(ShutdownTestCase):
     def clear_state(self) -> None:
         if self.state.exists():
             shutil.rmtree(self.state)
+
+    def follow_request(self, output: io.StringIO | None = None) -> tuple[int, str]:
+        output = output if output is not None else io.StringIO()
+        with (
+            patch.object(shutdown, "named_claude_account", return_value=Account("claude", LOGIN, LABEL)),
+            patch.object(shutdown, "inventory", side_effect=AssertionError("follow inventories live sessions")),
+            patch.object(shutdown, "run_remote", side_effect=AssertionError("follow reads the peer")),
+            redirect_stdout(output),
+        ):
+            result = shutdown.main(["follow", LOGIN, "--request", "request-one"])
+        return result, output.getvalue()
+
+    def test_follow_prints_each_new_step_once_and_waits_for_pending_restart(self) -> None:
+        saved = session_shutdown(record.SessionWaiting(kind="waiting"))
+        saved["session"]["name"] = "Alpha"
+        saved["target"] = "claude 3"
+        saved["trail"] = [{"at": OCTOBER, "kind": "waiting", "detail": "pause sent"}]
+        self.assertTrue(record.create_session(saved))
+        unrelated = session_shutdown(record.SessionStopFailed(kind="stop failed", at=OCTOBER, reason="other request"), "unrelated")
+        unrelated["request_id"] = "another-request"
+        self.assertTrue(record.create_session(unrelated))
+        stages: list[record.SessionProgress] = [
+            record.SessionReadyToStop(kind="ready", at=OCTOBER),
+            record.SessionStopped(kind="stopped", at=OCTOBER),
+            record.SessionAlreadyGone(kind="already gone", at=OCTOBER),
+            record.SessionRestarting(kind="restarting", at=OCTOBER,
+                prior=record.SessionStopped(kind="stopped", at=OCTOBER)),
+            record.SessionRestarted(kind="restarted", at=OCTOBER),
+        ]
+        polls: list[float] = []
+        live_output = io.StringIO()
+        observed_kinds = ["waiting"]
+        def advance(seconds: float) -> None:
+            polls.append(seconds)
+            for kind in observed_kinds:
+                self.assertEqual(live_output.getvalue().count(f"Alpha: {kind}"), 1,
+                    "follow must print new steps before sleeping and keep old steps once")
+            if len(polls) == 1:
+                return  # An unchanged file on the next poll must not repeat the pause.
+            self.assertTrue(stages, "follow never finishes after the restart")
+            progress = stages.pop(0)
+            observed_kinds.append(progress["kind"])
+            def change(current: record.SessionShutdown) -> None:
+                current["progress"] = progress
+            _ = record.update_session(LOGIN, saved["session"]["session_id"], change)
+        with patch.object(time, "sleep", side_effect=advance):
+            status, output = self.follow_request(live_output)
+        self.assertEqual(status, 0)
+        self.assertEqual(polls, [1, 1, 1, 1, 1, 1])
+        self.assertIn("14:49:10 Alpha: waiting pause sent", output)
+        for kind in ("waiting", "ready", "stopped", "already gone", "restarting", "restarted"):
+            self.assertEqual(output.count(f"Alpha: {kind}"), 1, output)
+        self.assertNotIn("unrelated", output)
+        self.assertTrue(output.rstrip().endswith("all 1 back on claude 3"), output)
+
+    def test_follow_waits_for_every_session_and_reports_total_back_on_target(self) -> None:
+        first = session_shutdown(record.SessionRestarted(kind="restarted", at=OCTOBER), "first")
+        second = session_shutdown(record.SessionWaiting(kind="waiting"), "second")
+        for saved in (first, second):
+            saved["target"] = "claude 3"
+            saved["session"]["name"] = saved["session"]["session_id"]
+            self.assertTrue(record.create_session(saved))
+        record.archive_session(LOGIN, "first")
+        def complete(_seconds: float) -> None:
+            def restarted(current: record.SessionShutdown) -> None:
+                current["progress"] = record.SessionRestarted(kind="restarted", at=OCTOBER)
+            _ = record.update_session(LOGIN, "second", restarted)
+            record.archive_session(LOGIN, "second")
+        with patch.object(time, "sleep", side_effect=complete) as polls:
+            status, output = self.follow_request()
+        self.assertEqual(status, 0)
+        self.assertEqual(polls.call_count, 1)
+        self.assertEqual(output.count("first: restarted"), 1)
+        self.assertEqual(output.count("second: restarted"), 1)
+        self.assertTrue(output.rstrip().endswith("all 2 back on claude 3"), output)
+
+    def test_follow_finds_completed_request_in_history_before_starting(self) -> None:
+        for kind in ("stopped", "already gone", "restarted"):
+            with self.subTest(kind=kind):
+                self.clear_state()
+                progress: record.SessionProgress
+                if kind == "restarted":
+                    progress = record.SessionRestarted(kind="restarted", at=OCTOBER)
+                elif kind == "already gone":
+                    progress = record.SessionAlreadyGone(kind="already gone", at=OCTOBER)
+                else:
+                    progress = record.SessionStopped(kind="stopped", at=OCTOBER)
+                saved = session_shutdown(progress)
+                saved["then"] = "restart" if kind == "restarted" else "stop"
+                self.assertTrue(record.create_session(saved))
+                record.archive_session(LOGIN, saved["session"]["session_id"])
+                with patch.object(time, "sleep", side_effect=AssertionError("completed request waits")):
+                    status, output = self.follow_request()
+                self.assertEqual(status, 0)
+                self.assertIn(f"alpha: {kind}", output)
+                self.assertIn("all 1 back on" if kind == "restarted" else "all 1 stopped", output)
+
+    def test_follow_keeps_trail_when_record_is_archived_between_polls(self) -> None:
+        saved = session_shutdown(record.SessionWaiting(kind="waiting"))
+        saved["then"] = "stop"
+        self.assertTrue(record.create_session(saved))
+        def finish(_seconds: float) -> None:
+            def stopped(current: record.SessionShutdown) -> None:
+                current["progress"] = record.SessionStopped(kind="stopped", at=OCTOBER)
+            _ = record.update_session(LOGIN, saved["session"]["session_id"], stopped)
+            record.archive_session(LOGIN, saved["session"]["session_id"])
+        with patch.object(time, "sleep", side_effect=finish) as polls:
+            status, output = self.follow_request()
+        self.assertEqual(status, 0)
+        self.assertEqual(polls.call_count, 1)
+        self.assertEqual(output.count("alpha: waiting"), 1)
+        self.assertEqual(output.count("alpha: stopped"), 1)
+        self.assertTrue(output.rstrip().endswith("all 1 stopped"))
+
+    def test_follow_counts_taken_out_sessions_while_waiting_for_restart(self) -> None:
+        removed = session_shutdown(record.SessionWaiting(kind="waiting"), "removed")
+        removed["session"]["name"] = "Removed"
+        remaining = session_shutdown(record.SessionWaiting(kind="waiting"), "remaining")
+        remaining["target"] = "claude 3"
+        for saved in (removed, remaining):
+            self.assertTrue(record.create_session(saved))
+        polls = 0
+        output = io.StringIO()
+        def advance(_seconds: float) -> None:
+            nonlocal polls
+            polls += 1
+            if polls == 1:
+                _ = record.withdraw_session(LOGIN, "removed", lambda saved: None)
+            elif polls == 2:
+                self.assertEqual(output.getvalue().count("Removed: taken out"), 1)
+            elif polls == 3:
+                def restarted(current: record.SessionShutdown) -> None:
+                    current["progress"] = record.SessionRestarted(kind="restarted", at=OCTOBER)
+                _ = record.update_session(LOGIN, "remaining", restarted)
+                record.archive_session(LOGIN, "remaining")
+            else:
+                self.fail("follow did not finish after withdrawal and restart")
+        with patch.object(time, "sleep", side_effect=advance):
+            status, text = self.follow_request(output)
+        self.assertEqual(status, 0)
+        self.assertEqual(text.count("Removed: taken out"), 1)
+        self.assertTrue(text.rstrip().endswith("all 2 done: 1 back on claude 3, 1 taken out"), text)
+
+    def test_follow_finishes_when_every_session_was_taken_out_before_start(self) -> None:
+        progress: list[record.SessionProgress] = [
+            record.SessionWaiting(kind="waiting"),
+            record.SessionReadyToStop(kind="ready", at=OCTOBER),
+            record.SessionHeldByUsageLimit(kind="held by usage limit", at=OCTOBER),
+            record.SessionReaping(kind="reaping", at=OCTOBER, because="account out of usage", detail="weekly limit"),
+            record.SessionStopFailed(kind="stop failed", at=OCTOBER, reason="still live"),
+        ]
+        for index, state in enumerate(progress):
+            identity = f"removed-{index}"
+            saved = session_shutdown(state, identity)
+            saved["session"]["name"] = identity
+            self.assertTrue(record.create_session(saved))
+            if state["kind"] == "stop failed":
+                _ = record.withdraw_failed_stop(LOGIN, identity, lambda saved: True, lambda saved: None)
+            else:
+                _ = record.withdraw_session(LOGIN, identity, lambda saved: None)
+        with patch.object(time, "sleep", side_effect=AssertionError("taken out request waits")):
+            status, text = self.follow_request()
+        self.assertEqual(status, 0)
+        for index in range(len(progress)):
+            self.assertEqual(text.count(f"removed-{index}: taken out"), 1)
+        self.assertTrue(text.rstrip().endswith("all 5 done: 5 taken out"), text)
+
+    def test_follow_reads_each_history_file_once_across_polls(self) -> None:
+        unrelated = session_shutdown(record.SessionWaiting(kind="waiting"), "unrelated")
+        unrelated["request_id"] = "another-request"
+        self.assertTrue(record.create_session(unrelated))
+        record.archive_session(LOGIN, "unrelated")
+        archived = next((self.state / LOGIN / "history").glob("*.json"))
+        self.assertTrue(record.create_session(session_shutdown(record.SessionWaiting(kind="waiting"))))
+        read_text = Path.read_text
+        history_reads = 0
+        def read(path: Path, encoding: str | None = None, errors: str | None = None) -> str:
+            nonlocal history_reads
+            if path == archived:
+                history_reads += 1
+                if history_reads > 1:
+                    raise PermissionError("immutable history must not be read twice")
+            return read_text(path, encoding=encoding, errors=errors)
+        polls = 0
+        def advance(_seconds: float) -> None:
+            nonlocal polls
+            polls += 1
+            if polls == 3:
+                def stopped(current: record.SessionShutdown) -> None:
+                    current["then"] = "stop"
+                    current["progress"] = record.SessionStopped(kind="stopped", at=OCTOBER)
+                _ = record.update_session(LOGIN, "session-123", stopped)
+                record.archive_session(LOGIN, "session-123")
+            elif polls > 3:
+                self.fail("follow did not read the newly archived result")
+        with patch.object(Path, "read_text", read), patch.object(time, "sleep", side_effect=advance):
+            status, text = self.follow_request()
+        self.assertEqual(status, 0)
+        self.assertEqual(history_reads, 1)
+        self.assertTrue(text.rstrip().endswith("all 1 stopped"), text)
+
+    def test_follow_needing_user_names_account_session_and_terminal(self) -> None:
+        for progress in (
+            record.SessionStopFailed(kind="stop failed", at=OCTOBER, reason="still alive"),
+            record.SessionRestartFailed(kind="restart failed", at=OCTOBER, reason="launch refused"),
+            record.ProcessIdentityLost(kind="process identity lost", at=OCTOBER),
+        ):
+            with self.subTest(kind=progress["kind"]):
+                self.clear_state()
+                self.assertTrue(record.create_session(session_shutdown(progress)))
+                sibling = session_shutdown(record.SessionReadyToStop(kind="ready", at=OCTOBER), "z-sibling")
+                sibling["session"]["name"] = "Sibling"
+                sibling["trail"] = [
+                    {"at": OCTOBER, "kind": "waiting", "detail": "pause sent"},
+                    {"at": OCTOBER, "kind": "ready", "detail": "checkpoint saved"},
+                ]
+                self.assertTrue(record.create_session(sibling))
+                with patch.object(time, "sleep", side_effect=AssertionError("user action waits")):
+                    status, output = self.follow_request()
+                self.assertEqual(status, 1)
+                self.assertEqual(output.count("14:49:10 Sibling: waiting pause sent"), 1)
+                self.assertEqual(output.count("14:49:10 Sibling: ready checkpoint saved"), 1)
+                self.assertLess(output.index("Sibling: ready"), output.index("in a terminal on natedev"))
+                self.assertIn(progress["kind"], output)
+                self.assertIn("in a terminal on natedev", output)
+                self.assertIn("~/.claude/scripts/lib/py ~/.claude/scripts/shutdown/shutdown.py", output)
+                self.assertIn(LOGIN, output)
+                self.assertIn("--only session-123", output)
+
+    def test_follow_detach_leaves_shutdown_running_and_prints_resume_command(self) -> None:
+        self.assertTrue(record.create_session(session_shutdown(record.SessionWaiting(kind="waiting"))))
+        before = record.session_records(LOGIN)
+        with patch.object(time, "sleep", side_effect=KeyboardInterrupt):
+            status, output = self.follow_request()
+        self.assertEqual(status, 130)
+        self.assertEqual(record.session_records(LOGIN), before)
+        self.assertIn("the shutdown keeps running", output)
+        self.assertIn("in this terminal: ~/.claude/scripts/lib/py ~/.claude/scripts/shutdown/shutdown.py follow", output)
+        self.assertIn(LOGIN, output)
+        self.assertIn("--request request-one", output)
+
+    def test_follow_alerted_holdout_shows_stop_action_and_exits_one(self) -> None:
+        saved = session_shutdown(record.SessionWaiting(kind="waiting"))
+        saved["alerted_at"] = OCTOBER
+        self.assertTrue(record.create_session(saved))
+        with patch.object(time, "sleep", side_effect=AssertionError("alerted holdout waits")):
+            status, output = self.follow_request()
+        self.assertEqual(status, 1)
+        self.assertIn("has not answered the pause", output)
+        self.assertIn("in a terminal on natedev", output)
+        self.assertIn(f"now {LOGIN} --here --only session-123", output)
 
     def test_quota_notice_and_import_modes_preserve_module_package_metadata(self) -> None:
         quota = Path(__file__).resolve().parents[1] / "whoami/quota_alert.py"
@@ -995,7 +1247,7 @@ class OnlySessionCliTests(ShutdownTestCase):
         _ = self.save_three({"kind": "stopping", "at": OCTOBER})
         status, output, error = self.action("cancel", "Beta")
         self.assertEqual((status, error), (1, ""))
-        self.assertEqual(output, "Beta was not cancelled: stopping; /shutdown restart --only Beta brings it back\n")
+        self.assertEqual(output, f"Beta was not cancelled: stopping; in a terminal on natedev: ~/.claude/scripts/lib/py ~/.claude/scripts/shutdown/shutdown.py restart {LOGIN} --here --only beta-id brings it back\n")
 
     def test_only_down_resumes_existing_record_without_replacing_request_fields(self) -> None:
         before = self.save_three({"kind": "waiting"})
@@ -1195,7 +1447,7 @@ class OnlySessionCliTests(ShutdownTestCase):
         output = io.StringIO()
         with redirect_stdout(output):
             self.assertEqual(shutdown.main(["status", LOGIN, "--here"]), 0)
-        self.assertIn("  stop now: /shutdown now --only <name> · Alpha, Beta, Gamma\n", output.getvalue())
+        self.assertIn(f"  stop now: in a terminal on natedev: ~/.claude/scripts/lib/py ~/.claude/scripts/shutdown/shutdown.py now {LOGIN} --here --only alpha-id,beta-id,gamma-id · Alpha, Beta, Gamma\n", output.getvalue())
         with patch.object(settle, "_launch_conductor") as conductor:
             self.assertEqual(self.action("now", "Beta"), (0, "Beta: stopping now\n", ""))
         conductor.assert_called_once_with(LOGIN, LABEL)
@@ -1218,8 +1470,8 @@ class OnlySessionCliTests(ShutdownTestCase):
         output = io.StringIO()
         with patch.object(settle, "_showing_form", return_value=True), patch.object(settle, "merge_in_progress", return_value=False), redirect_stdout(output):
             self.assertEqual(shutdown.main(["status", LOGIN, "--here"]), 0)
-        self.assertIn("  take out: /shutdown cancel --only <name> · Alpha, Beta, Gamma\n", output.getvalue())
-        self.assertIn("  stop now: /shutdown now --only <name> · Alpha, Beta, Gamma\n", output.getvalue())
+        self.assertIn(f"  take out: in a terminal on natedev: ~/.claude/scripts/lib/py ~/.claude/scripts/shutdown/shutdown.py cancel {LOGIN} --here --only alpha-id,beta-id,gamma-id · Alpha, Beta, Gamma\n", output.getvalue())
+        self.assertIn(f"  stop now: in a terminal on natedev: ~/.claude/scripts/lib/py ~/.claude/scripts/shutdown/shutdown.py now {LOGIN} --here --only alpha-id,beta-id,gamma-id · Alpha, Beta, Gamma\n", output.getvalue())
 
     def test_selected_restart_fresh_claim_names_existing_worker_without_launch_or_alert(self) -> None:
         _ = self.save_three({"kind": "stopped", "at": OCTOBER})

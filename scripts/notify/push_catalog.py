@@ -8,6 +8,15 @@ from push_texts import ActionTemplate, NoActionNeeded, PushExample, PushText
 
 
 ENTRIES = (
+    PushText("shutdown.holdout", "shutdown", "decision", "{operation} stuck waiting on {session} session",
+        ActionTemplate("In a terminal on {machine}, run the command below to stop {session}."),
+        "A {request} asked the {session} session ({host}) to pause at a safe point and say ready. "
+        + "No reply in {elapsed}, so the {request} is stuck.\n\n"
+        + "Stop now (recommended): ends {session} mid-step so the {request} goes on. Uncommitted work stays; {after_stop}\n\n"
+        + "Do nothing: the {request} keeps waiting.\n\nCommand: {command}",
+        (PushExample("typical", {"session": "Owner", "machine": "natedev", "host": "Ghostty window, Production desktop",
+            "elapsed": "4 minutes", "operation": "Restart", "request": "restart", "after_stop": "the restart brings it back.",
+            "command": "~/.claude/scripts/lib/py ~/.claude/scripts/shutdown/shutdown.py now 'claude 2' --here --only owner"}),)),
     # Shutdown examples use test_settle.py and test_restart.py facts.
     # The failing shutdown deliveries are recorded in notify/review.jsonl, 2026-10-14T02:05Z.
     PushText("shutdown.stop_failed", "shutdown", "decision", "Claude account shutdown is incomplete",
@@ -33,13 +42,6 @@ ENTRIES = (
         ActionTemplate('In the Claude session named natedev on the natedev computer, send: "Resume the stopped Claude session named {session} on {machine} from its shutdown record."'),
         "A Claude coding session on {machine} stopped during your shutdown. Its work is paused. "
         + "Its terminal cannot restart on its own. Its shutdown record holds the command to resume it.",
-        (PushExample("typical", {"machine": "natedev", "session": "Owner"}),
-         PushExample("long_session", {"machine": "Mac", "session": "build-followups-message-clarity-unit-director-session-12"}))),
-    PushText("shutdown.form", "shutdown", "decision", "Shutdown waits on a session showing a form",
-        ActionTemplate("On {machine}, answer the open form in the terminal for Claude session {session}."),
-        "Your shutdown is waiting on Claude session {session} on {machine}. "
-        + "That session is asking you a question and is paused until you answer. "
-        + "It cannot stop until then, so the shutdown cannot finish.",
         (PushExample("typical", {"machine": "natedev", "session": "Owner"}),
          PushExample("long_session", {"machine": "Mac", "session": "build-followups-message-clarity-unit-director-session-12"}))),
     PushText("shutdown.remote_control", "shutdown", "decision", "Claude session lacks phone access",

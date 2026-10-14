@@ -2848,6 +2848,54 @@ class RestartTests(ShutdownTestCase):
         launch.assert_not_called()
         timers.assert_not_called()
         self.assertEqual(current["progress"]["kind"], "restart failed")
+        stored = self.stored_record()
+        progress = stored["progress"]
+        assert progress["kind"] == "restart failed"
+        expected = (f"in a terminal on natedev: ~/.claude/scripts/lib/py "
+            f"~/.claude/scripts/shutdown/shutdown.py restart {LOGIN} --here --only owner")
+        self.assertIn(expected, progress["reason"])
+        status_lines = settle.status_record_lines(stored)
+        output = io.StringIO()
+        with (
+            patch.object(settle, "run_remote", return_value=(0, "[]")),
+            patch.object(restart, "_live_session_ids", return_value=frozenset()),
+            patch.object(settle, "alert_user"),
+            redirect_stdout(output),
+        ):
+            settle.report_stop([stored])
+        command_lines = [line for line in [*status_lines, *output.getvalue().splitlines()]
+            if "shutdown.py" in line or "/shutdown" in line]
+        self.assertTrue(command_lines)
+        for line in command_lines:
+            self.assertIn("in a terminal on natedev", line)
+            self.assertIn(LOGIN, line)
+            self.assertIn("--only owner", line)
+            self.assertIn("~/.claude/scripts/lib/py ~/.claude/scripts/shutdown/shutdown.py", line)
+
+    def test_unreachable_peer_restart_prints_scoped_retry_in_peer_terminal(self) -> None:
+        cases = (
+            ((), ["restart", LOGIN, "--here", "--no-alert"]),
+            (("local", "peer-one", "peer-two"),
+                ["restart", LOGIN, "--here", "--only", "peer-one,peer-two", "--no-alert"]),
+        )
+        local = restart.MachineRestartResult("natedev", LABEL, "nothing",
+            local_session_ids=frozenset({"local"}))
+        for ids, expected in cases:
+            with self.subTest(ids=ids):
+                output = io.StringIO()
+                with (
+                    patch.object(restart, "named_claude_account", return_value=self.account),
+                    patch.object(restart, "_up", return_value=local),
+                    patch.object(restart, "run_remote", return_value=(255, "")),
+                    patch.object(restart, "other_machine", return_value="Mac"),
+                    redirect_stdout(output),
+                ):
+                    _ = restart.restart(restart.AccountNamed(LOGIN), dry_run=False,
+                        alerts=restart.NeverAlert(), only=ids)
+                line = next(line for line in output.getvalue().splitlines() if "restart incomplete" in line)
+                command = line.split("in a terminal on Mac: ", 1)[1]
+                self.assertEqual(shlex.split(command), ["~/.claude/scripts/lib/py",
+                    "~/.claude/scripts/shutdown/shutdown.py", *expected])
 
     def test_cleanup_exception_does_not_prevent_other_sessions_from_returning(self) -> None:
         saved = entry(unit("broken"))

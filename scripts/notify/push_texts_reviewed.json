@@ -209,16 +209,11 @@
       "time": "2026-10-14T04:24:37.910956-04:00"
     }
   },
-  "shutdown.form": {
-    "long_session": {
-      "reviewer": "opus",
-      "sha256": "96a8e98849ad2c98dde1c44243467b110e578a574e1378e62a1dfd4aa971386a",
-      "time": "2026-10-14T04:29:42.985807-04:00"
-    },
+  "shutdown.holdout": {
     "typical": {
       "reviewer": "opus",
-      "sha256": "96a8e98849ad2c98dde1c44243467b110e578a574e1378e62a1dfd4aa971386a",
-      "time": "2026-10-14T04:29:36.857207-04:00"
+      "sha256": "a632bc0ecd4f69288bbc3e3777e5c9ec8c97f9db8d9739d42b5f78c5facd8b84",
+      "time": "2026-10-14T16:56:04.693522-04:00"
     }
   },
   "shutdown.manual_restart": {

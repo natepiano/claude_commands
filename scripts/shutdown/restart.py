@@ -106,6 +106,7 @@ class ShutdownServices(Protocol):
     def record_time(self) -> str: ...
     def local_machine(self) -> str: ...
     def stopped_sessions_text(self, count: int) -> str: ...
+    def shutdown_command(self, *arguments: str) -> str: ...
     def retire_command(self, login: str, session_id: str) -> list[str]: ...
     def run_notifier(self, verb: str, instance: str) -> None: ...
     def send_message(
@@ -1704,7 +1705,8 @@ def relaunch_session(
         if record["progress"]["kind"] == "stopping":
             return record
         if _unfinished_cleanup(record):
-            mark_restart_failed(record, "owner cleanup not confirmed; run /shutdown restart again")
+            command = settle.shutdown_command("restart", record["login"], "--here", "--only", record["session"]["session_id"])
+            mark_restart_failed(record, f"owner cleanup not confirmed; in a terminal on {record['machine']}: {command}")
             return record
     try:
         current, claimed = _claim_relaunch(record)
@@ -2143,11 +2145,16 @@ def restart(
     not_reached = peer_availability is PeerRestartAvailability.NOT_REACHED
     for line in peer["lines"]:
         print(line)
-    incomplete = ""
     if not_reached:
-        incomplete = (f"restart incomplete: {other_machine()} not reached — run /shutdown "
-            "restart again when it is back")
-        print(incomplete)
+        retry = ["restart", selected.login, "--here"]
+        if peer_ids:
+            retry.extend(("--only", ",".join(peer_ids)))
+        if dry_run:
+            retry.append("--dry-run")
+        if isinstance(alerts, NeverAlert):
+            retry.append("--no-alert")
+        print(f"restart incomplete: {other_machine()} not reached; when it is back, "
+            + f"in a terminal on {other_machine()}: {settle.shutdown_command(*retry)}")
     bring_back = local.status == "partial" or peer["outcome"] == "partial" or not_reached
     if notify:
         failure_alert = bring_back and _restart_alerts_enabled(selected.login, ids, peer=peer_availability)
