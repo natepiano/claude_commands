@@ -275,6 +275,15 @@ class ReportTests(unittest.TestCase):
         end = next((i for i in range(start + 1, len(lines)) if lines[i].startswith("### ")), len(lines))
         return lines[start:end]
 
+    def test_power_profile_section_follows_test_builds_in_full_report(self) -> None:
+        self.write(self.root / "natedev" / "samples-2026-10.jsonl",
+                   sample(STAMP, power_profile="performance", power_profile_since=STAMP))
+        self.write(self.root / "natedev" / "2026-10.jsonl", call("measured", build_s=90))
+        lines = self.render().splitlines()
+        start = lines.index("### Test builds (temporary)")
+        next_section = next(line for line in lines[start + 1:] if line.startswith("### "))
+        self.assertEqual(next_section, "### Power profile")
+
     def test_mac_rows_leave_natedev_sections_and_failed_steps_unchanged(self) -> None:
         self.write(
             self.root / "natedev" / "2026-10.jsonl",
@@ -2523,6 +2532,233 @@ class ReportTests(unittest.TestCase):
         row = [cell.strip() for cell in lines[start + 4].strip("|").split("|")]
         self.assertEqual(head[head.index("Avg") + 1], "p95")
         self.assertEqual(row[head.index("p95")], "20.0 s")
+
+
+class PowerProfileTests(unittest.TestCase):
+    root: Path  # pyright: ignore[reportUninitializedInstanceVariable]
+
+    @override
+    def setUp(self) -> None:
+        self.root = Path(self.enterContext(tempfile.TemporaryDirectory())) / "buildlog"
+        point_root_at(self, self.root)
+        self.addCleanup(time.tzset)
+        _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {"TZ": "UTC", "USER_ZONE": "UTC"})))
+        time.tzset()
+
+    def write(self, *records: Record) -> None:
+        path = self.root / "natedev" / "profiles.jsonl"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        _ = path.write_bytes(b"".join(encode(record) for record in records))
+
+    def changes(self) -> list[report.ProfileChange]:
+        _ = index.update()
+        with closing(index.read_only()) as connection:
+            return report.profile_changes(connection)
+
+    def section(self, day: str = "2026-10-13") -> list[str]:
+        _ = index.update()
+        with closing(index.read_only()) as connection:
+            return report.power_profile_section(connection, day)
+
+    def rows(self, lines: list[str]) -> list[list[str]]:
+        return [[cell.strip() for cell in line.strip("|").split("|")]
+                for line in lines if line.startswith("| ") and not line.startswith("| Kind |")]
+
+    def profiled(self, at: str, profile: str = "performance", since: str | None = None) -> Record:
+        return sample(at, power_profile=profile, power_profile_since=since)
+
+    def runs(self, prefix: str, at: str, count: int, duration: float) -> list[Record]:
+        return [step(f"{prefix}-{number}", started_at=at, ended_at=at, duration_s=duration,
+                     step="nextest", caller="verify", crates_compiled=1)
+                for number in range(count)]
+
+    def test_first_profile_uses_since_after_null_samples_in_time_order(self) -> None:
+        since = "2026-10-13T12:29:56.000Z"
+        self.write(
+            self.profiled("2026-10-13T12:31:00.000Z", since=since),
+            sample("2026-10-13T12:28:00.000Z"),
+            sample("2026-10-13T12:29:00.000Z", power_profile=None, power_profile_since=None),
+            self.profiled("2026-10-13T12:30:00.000Z", since=since),
+            sample("2026-10-13T12:27:00.000Z", host="macbook", power_profile="balanced"),
+        )
+        self.assertEqual(self.changes(), [report.ProfileChange(since, "performance")])
+
+    def test_same_profile_rewrite_keeps_original_change_time(self) -> None:
+        self.write(
+            self.profiled("2026-10-12T12:01:00.000Z", since="2026-10-12T12:00:00.000Z"),
+            self.profiled("2026-10-13T12:01:00.000Z", since="2026-10-13T12:00:00.000Z"),
+        )
+        self.assertEqual(self.changes(), [report.ProfileChange("2026-10-12T12:00:00.000Z", "performance")])
+
+    def test_each_profile_transition_is_recorded_with_sample_time_fallback(self) -> None:
+        self.write(
+            self.profiled("2026-10-11T12:01:00.000Z", since="2026-10-11T12:00:00.000Z"),
+            self.profiled("2026-10-12T12:00:00.000Z", "balanced"),
+            self.profiled("2026-10-13T12:01:00.000Z", since="2026-10-13T12:00:00.000Z"),
+        )
+        self.assertEqual(self.changes(), [
+            report.ProfileChange("2026-10-11T12:00:00.000Z", "performance"),
+            report.ProfileChange("2026-10-12T12:00:00.000Z", "balanced"),
+            report.ProfileChange("2026-10-13T12:00:00.000Z", "performance"),
+        ])
+
+    def test_rows_match_kind_caller_and_rebuild_class_with_counts_and_busiest_first(self) -> None:
+        before = "2026-10-12T12:00:00.000Z"
+        after = "2026-10-13T12:00:00.000Z"
+        records = [self.profiled(after)]
+        groups = (
+            ("nextest", "verify", 1, 10, 12),
+            ("nextest", "verify", 4, 2, 3),
+            ("nextest", "alias", 1, 1, 2),
+            ("clippy", "verify", 1, 2, 1),
+            ("nextest", "verify", None, 1, 4),
+        )
+        for group, (kind, caller, crates, before_count, after_count) in enumerate(groups):
+            for side, at, count, duration in (("before", before, before_count, 120),
+                                             ("after", after, after_count, 90)):
+                records.extend(step(f"{group}-{side}-{number}", started_at=at, ended_at=at,
+                                    step=kind, caller=caller, crates_compiled=crates, duration_s=duration)
+                               for number in range(count))
+        # Different crate counts in the same rebuild class belong in one row.
+        records[2]["crates_compiled"] = 3
+        records.extend((step("only-before", started_at=before, step="fmt"),
+                        step("only-after", started_at=after, step="doc")))
+        self.write(*records)
+        lines = self.section()
+        rows = self.rows(lines)
+        self.assertEqual(rows, [
+            ["nextest", "verify.sh (agents)", "edited crate (1–3 crates)", "10", "2.0 min", "12", "1.5 min", "−25%"],
+            ["nextest", "verify.sh (agents)", "—", "1", "2.0 min", "4", "1.5 min", "—"],
+            ["nextest", "verify.sh (agents)", "cascade (4–49 crates)", "2", "2.0 min", "3", "1.5 min", "—"],
+            ["nextest", "terminal", "edited crate (1–3 crates)", "1", "2.0 min", "2", "1.5 min", "—"],
+            ["clippy", "verify.sh (agents)", "edited crate (1–3 crates)", "2", "2.0 min", "1", "1.5 min", "—"],
+        ])
+        self.assertIn("Before 2026-10-13 12:00:00 UTC (profile not recorded) vs after (performance):", lines)
+        self.assertIn("| Kind | Caller | Rebuild | Before runs | Before p50 | After runs | After p50 | Change |", lines)
+        self.assertIn("Source: natedev steps that passed, the 7 days before the change against the time since, up to the next change; p50 is the nearest rank; Change is shown only with at least 10 runs on each side. Load and time of day are not matched.", lines)
+
+    def test_change_requires_ten_runs_on_each_side_and_prints_signed_percent(self) -> None:
+        self.assertEqual(report.MIN_PROFILE_RUNS, 10)
+        for before_count, after_count, expected in ((9, 10, "—"), (10, 9, "—"),
+                                                    (10, 10, "+25%")):
+            with self.subTest(before=before_count, after=after_count):
+                self.write(self.profiled("2026-10-13T12:00:00.000Z"),
+                           *self.runs("before", "2026-10-12T12:00:00.000Z", before_count, 40),
+                           *self.runs("after", "2026-10-13T12:00:00.000Z", after_count, 50))
+                row = self.rows(self.section())[0]
+                self.assertEqual(row[3], str(before_count))
+                self.assertEqual(row[5], str(after_count))
+                self.assertEqual(row[7], expected)
+
+    def test_unmatched_step_groups_explain_comparison_without_table_or_source(self) -> None:
+        self.write(
+            self.profiled("2026-10-13T12:00:00.000Z"),
+            step("before", started_at="2026-10-12T12:00:00.000Z", step="clippy",
+                 caller="verify", crates_compiled=1),
+            step("after", started_at="2026-10-13T12:00:00.000Z", step="nextest",
+                 caller="verify", crates_compiled=1),
+        )
+        lines = self.section()
+        self.assertEqual([line for line in lines if line], [
+            "### Power profile",
+            "Profile now: performance, since 2026-10-13 12:00:00 UTC.",
+            "Before 2026-10-13 12:00:00 UTC (profile not recorded) vs after (performance):",
+            "No step ran with the same kind, caller and rebuild class on both sides.",
+        ])
+
+    def test_p50_uses_nearest_rank_rather_than_interpolated_median(self) -> None:
+        records = [self.profiled("2026-10-13T12:00:00.000Z")]
+        for side, at, durations in (("before", "2026-10-12T12:00:00.000Z", (200, 10, 100, 20)),
+                                    ("after", "2026-10-13T12:00:00.000Z", (2000, 50, 1000, 40))):
+            records.extend(step(f"{side}-{number}", started_at=at, duration_s=duration,
+                                step="clippy", caller="verify", crates_compiled=1)
+                           for number, duration in enumerate(durations))
+        self.write(*records)
+        self.assertEqual(self.rows(self.section())[0][3:], ["4", "20.0 s", "4", "50.0 s", "—"])
+
+    def test_mac_failed_and_sweep_steps_do_not_enter_comparisons(self) -> None:
+        records = [self.profiled("2026-10-13T12:00:00.000Z")]
+        for side, at in (("before", "2026-10-12T12:00:00.000Z"), ("after", "2026-10-13T12:00:00.000Z")):
+            records.extend(self.runs(side, at, 1, 20))
+            records.extend((step(f"mac-{side}", started_at=at, host="macbook", step="nextest",
+                                 caller="verify", crates_compiled=1, duration_s=500),
+                            step(f"failed-{side}", started_at=at, status=1, step="nextest",
+                                 caller="verify", crates_compiled=1, duration_s=500),
+                            step(f"sweep-{side}", started_at=at, step="sweep", duration_s=500)))
+        self.write(*records)
+        self.assertEqual(self.rows(self.section()), [["nextest", "verify.sh (agents)",
+                         "edited crate (1–3 crates)", "1", "20.0 s", "1", "20.0 s", "—"]])
+
+    def test_previous_and_next_changes_bound_windows_and_newest_is_first(self) -> None:
+        self.write(
+            self.profiled("2026-10-10T12:00:00.000Z", "power-saver"),
+            self.profiled("2026-10-12T12:00:00.000Z", "balanced"),
+            self.profiled("2026-10-13T12:00:00.000Z"),
+            *self.runs("unknown", "2026-10-09T12:00:00.000Z", 1, 80),
+            *self.runs("saver", "2026-10-10T12:00:00.000Z", 2, 60),
+            *self.runs("balanced", "2026-10-12T12:00:00.000Z", 3, 40),
+            *self.runs("performance", "2026-10-13T12:00:00.000Z", 4, 20),
+        )
+        lines = self.section()
+        rows = self.rows(lines)
+        self.assertEqual([row[3:] for row in rows], [
+            ["3", "40.0 s", "4", "20.0 s", "—"],
+            ["2", "1.0 min", "3", "40.0 s", "—"],
+            ["1", "1.3 min", "2", "1.0 min", "—"],
+        ])
+        comparisons = [line for line in lines if line.startswith("Before ")]
+        self.assertEqual(len(comparisons), 3)
+        self.assertIn("2026-10-13 12:00:00 UTC", comparisons[0])
+        self.assertIn("(balanced) vs after (performance)", comparisons[0])
+        self.assertIn("2026-10-12 12:00:00 UTC", comparisons[1])
+        self.assertIn("(power-saver) vs after (balanced)", comparisons[1])
+        self.assertIn("(profile not recorded)", comparisons[2])
+
+    def test_before_window_is_seven_days_and_after_ends_at_report_day_end(self) -> None:
+        self.write(
+            self.profiled("2026-10-13T12:00:00.000Z"),
+            *self.runs("too-old", "2026-10-06T11:59:59.999Z", 1, 500),
+            *self.runs("before-edge", "2026-10-06T12:00:00.000Z", 1, 20),
+            *self.runs("after-edge", "2026-10-13T12:00:00.000Z", 1, 30),
+            *self.runs("before-end", "2026-10-13T23:59:59.999Z", 1, 30),
+            *self.runs("at-end", "2026-10-14T00:00:00.000Z", 1, 500),
+        )
+        self.assertEqual(self.rows(self.section())[0][3:], ["1", "20.0 s", "2", "30.0 s", "—"])
+
+    def test_change_older_than_seven_days_only_shows_current_profile(self) -> None:
+        since = "2026-10-06T00:00:00.000Z"
+        self.write(self.profiled("2026-10-06T00:01:00.000Z", since=since),
+                   self.profiled("2026-10-13T12:00:00.000Z", since="2026-10-13T11:00:00.000Z"))
+        lines = self.section()
+        self.assertEqual([line for line in lines if line], [
+            "### Power profile", "Profile now: performance, since 2026-10-06 00:00:00 UTC.",
+        ])
+
+    def test_no_profiled_natedev_sample_omits_section(self) -> None:
+        self.write(sample(STAMP), sample("2026-10-13T12:00:00.000Z", host="macbook", power_profile="balanced"))
+        self.assertEqual(self.changes(), [])
+        self.assertEqual(self.section(), [])
+
+    def test_report_window_includes_start_and_excludes_change_at_day_end(self) -> None:
+        self.write(
+            self.profiled("2026-10-07T00:00:00.000Z", "balanced"),
+            self.profiled("2026-10-14T00:00:00.000Z"),
+            *self.runs("before", "2026-10-06T12:00:00.000Z", 1, 20),
+            *self.runs("after", "2026-10-13T12:00:00.000Z", 1, 30),
+        )
+        lines = self.section()
+        self.assertIn("Profile now: balanced, since 2026-10-07 00:00:00 UTC.", lines)
+        self.assertEqual(sum(line.startswith("Before ") for line in lines), 1)
+        self.assertNotIn("performance", "\n".join(lines))
+        self.assertEqual(self.rows(lines)[0][3:], ["1", "20.0 s", "1", "30.0 s", "—"])
+
+    def test_profile_labels_use_user_zone_with_seconds(self) -> None:
+        self.write(self.profiled("2026-10-14T02:30:00.000Z", since="2026-10-14T02:29:56.000Z"))
+        with mock.patch.dict(os.environ, {"TZ": "America/New_York", "USER_ZONE": "America/New_York"}):
+            time.tzset()
+            lines = self.section()
+        self.assertIn("Profile now: performance, since 2026-10-13 22:29:56 EDT.", lines)
+        self.assertIn("Before 2026-10-13 22:29:56 EDT (profile not recorded) vs after (performance):", lines)
 
 
 if __name__ == "__main__":

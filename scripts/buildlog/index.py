@@ -30,7 +30,7 @@ from urllib.parse import quote
 
 import store
 
-SCHEMA_VERSION = 14
+SCHEMA_VERSION = 15
 LOCK_NAME = "index.lock"
 MARK_BYTES = 256
 BUSY_TIMEOUT_MS = 30_000
@@ -233,6 +233,8 @@ SAMPLE_COLUMNS: list[Column] = [
     ("ci_anon_bytes", "INTEGER", "anon memory in hana-ci.slice; process memory"),
     ("stall_some_us", "INTEGER", "machine memory some stall counter since boot, microseconds"),
     ("stall_full_us", "INTEGER", "machine memory full stall counter since boot, microseconds"),
+    ("power_profile", "TEXT", "power-profiles-daemon profile; NULL when not recorded"),
+    ("power_profile_since", "TEXT", "UTC ISO mtime of the daemon's state file: when the profile was set"),
 ]
 
 MEMORY_SNAPSHOT_COLUMNS: list[Column] = [

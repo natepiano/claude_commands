@@ -14,6 +14,7 @@ MEMINFO = Path("/proc/meminfo")
 PRESSURE = Path("/proc/pressure/memory")
 BOOT_ID = Path("/proc/sys/kernel/random/boot_id")
 CI_CGROUP = Path("/sys/fs/cgroup/hana.slice/hana-ci.slice")
+POWER_PROFILE_STATE = Path("/var/lib/power-profiles-daemon/state.ini")
 
 
 class MachineMemoryUse(NamedTuple):
@@ -23,6 +24,34 @@ class MachineMemoryUse(NamedTuple):
 
 class Unmeasured(Enum):
     VALUE = "unmeasured"
+
+
+class PowerProfile(NamedTuple):
+    name: str
+    since_epoch: float
+
+
+def read_power_profile(path: Path) -> PowerProfile | Unmeasured:
+    """Read the daemon's profile and last write time without contacting it."""
+    try:
+        with path.open() as handle:
+            state = os.fstat(handle.fileno())
+            if state.st_size >= 1024:
+                return Unmeasured.VALUE
+            text = handle.read()
+    except (OSError, UnicodeError):
+        return Unmeasured.VALUE
+    in_state = False
+    for line in text.splitlines():
+        line = line.strip()
+        if line.startswith("["):
+            in_state = line == "[State]"
+        elif in_state:
+            name, separator, value = line.partition("=")
+            if separator and name.strip() == "Profile":
+                profile = value.strip()
+                return PowerProfile(profile, state.st_mtime) if profile else Unmeasured.VALUE
+    return Unmeasured.VALUE
 
 
 class MemoryStallTotals(NamedTuple):
@@ -126,6 +155,7 @@ def sample() -> SampleTaken:
     builds = anon_bytes(builds_path)
     sccache = sccache_in_service(builds_path)
     ci = anon_bytes(Path(os.environ.get("BUILDLOG_CI_CGROUP", str(CI_CGROUP))))
+    profile = read_power_profile(POWER_PROFILE_STATE)
     record: dict[str, object] = {
         "kind": "sample",
         "host": host,
@@ -138,6 +168,8 @@ def sample() -> SampleTaken:
         "ci_anon_bytes": ci if isinstance(ci, int) else None,
         "stall_some_us": stalls.some_us,
         "stall_full_us": stalls.full_us,
+        "power_profile": profile.name if isinstance(profile, PowerProfile) else None,
+        "power_profile_since": store.utc_iso(profile.since_epoch) if isinstance(profile, PowerProfile) else None,
     }
     store.append_line(store.sample_file(host, at), record)
     return SampleTaken(at, host)
