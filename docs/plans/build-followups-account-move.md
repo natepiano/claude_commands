@@ -111,7 +111,7 @@
 
 **Ruled out:** a credits branch for Codex workers in this phase, since the inventory attributes no login to them.
 
-### Phase 3 — A ghostty session restarts in its own window  · status: todo
+### Phase 3 — A ghostty session restarts in its own window  · status: done
 
 **Depends on:** Phase 1
 
