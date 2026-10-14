@@ -90,8 +90,8 @@ class CodexAccountAlertTests(unittest.TestCase):
         return agent_accounts.KnownCodexAccount(home, login, f"codex {number}")
 
     def note(self, number: int, state: str, left: int, credits: str = "0") -> quota_alert.AgentNote:
-        path = self.root / f"codex {number}.md"
-        _ = path.write_text(f"---\nlogin: account{number}@example.invalid\nstate: {state}\n"
+        path = self.root / f"codex{number}.md"
+        _ = path.write_text(f"---\nlogin: account{number}@example.invalid\nrole: {'worker' if state == 'active' else '[]'}\nsessions: 0\n"
             + f"weekly_remaining_usage: {left}\ncredit_balance: {credits}\n"
             + f"resets: {(self.now + timedelta(days=2)).isoformat()}\n---\n")
         note = note_file.read_note(path)
@@ -636,13 +636,14 @@ class CodexAccountAlertTests(unittest.TestCase):
         _ = quota_alert.alert([self.note(1, "active", 90)], self.now, codex_readings=readings)
         self.assertIn("delegate=codex", quota_alert.REGISTRY.read_text())
 
-    def test_shared_account_identity_accepts_note_names_without_regard_to_case(self) -> None:
+    def test_shared_account_identity_matches_logins_without_regard_to_case(self) -> None:
         a = self.account(1)
-        _ = (self.root / "codex 1.md").rename(self.root / "Codex 1.md")
+        path = self.root / "codex1.md"
+        _ = path.write_text(path.read_text().replace(a.login, a.login.upper()))
         identity = agent_accounts.codex_account(a.home)
         self.assertIsInstance(identity, agent_accounts.KnownCodexAccount)
         assert isinstance(identity, agent_accounts.KnownCodexAccount)
-        self.assertEqual((identity.home, identity.login, identity.label), (a.home, a.login, "Codex 1"))
+        self.assertEqual((identity.home, identity.login, identity.label), (a.home, a.login, "codex 1"))
 
     def test_selected_and_spare_readings_share_the_ten_minute_limit(self) -> None:
         a, b = self.account(1), self.account(2)

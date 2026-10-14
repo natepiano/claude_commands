@@ -13,7 +13,7 @@ import shutil
 import subprocess
 import sys
 from types import ModuleType
-from typing import cast
+from typing import TYPE_CHECKING, cast
 from unittest.mock import patch
 
 
@@ -51,14 +51,19 @@ def invoke_cli(module: ModuleType, main: Callable[[], int], arguments: list[str]
                 # These imports only retrieve the caller-initialized modules.
                 import dailies_render
                 import showrunners
+                if TYPE_CHECKING:
+                    from ..whoami import note_file
+                else:
+                    import note_file
 
                 home = Path.home()
                 for name, value in {
                     "CHART_CONF": home / ".local/state/showrunner/dailies.conf",
-                    "AGENTS_DIR": home / "rust/hanadocs/agents",
                     "READINGS_LOG": home / ".local/state/agent-notes/readings.jsonl",
                 }.items():
                     _ = scope.enter_context(patch.object(dailies_render, name, value))
+                _ = scope.enter_context(patch.object(note_file, "AGENTS_DIR",
+                                                    home / "rust/hanadocs/agents"))
                 for name, value in {
                     "CONFIG": Path(environment.get("SHOWRUNNERS_CONFIG") or
                                    str(Path(showrunners.__file__).parents[2] / "config/showrunners.json")),

@@ -243,7 +243,7 @@ class EscalateTests(unittest.TestCase):
         login = f"account{number}@example.invalid"
         claims = base64.urlsafe_b64encode(json.dumps({"email": login}).encode()).decode().rstrip("=")
         _ = (home / "auth.json").write_text(json.dumps({"tokens": {"id_token": f"x.{claims}.y"}}))
-        _ = (self.root / f"codex {number}.md").write_text(f"---\nlogin: {login}\n---\n")
+        _ = (self.root / f"codex{number}.md").write_text(f"---\nlogin: {login}\n---\n")
         script = SCRIPT.parent.parent / "accounts" / "accounts.py"
 
         selected = subprocess.run([sys.executable, str(script), "set-role", "seats", f"codex {number}"],
@@ -284,7 +284,7 @@ class EscalateTests(unittest.TestCase):
             a = self.select_codex(1)
             _ = escalate.hold("a-window", escalate.SessionPush("codex 1", "A low", NoActionRequired(), "note"), minutes=0, owner=a)
             _ = escalate.hold("five-hour-codex", escalate.SessionPush("legacy Codex", "old low", NoActionRequired(), "note"), minutes=0)
-            _ = (self.root / "codex 1.md").unlink()
+            _ = (self.root / "codex1.md").unlink()
             before = {path.name: path.read_text() for path in (escalate.STATE / "held").glob("*.json")}
             _ = escalate.due(10**12)
             deliver.assert_not_called()
