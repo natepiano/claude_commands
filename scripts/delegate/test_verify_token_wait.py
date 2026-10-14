@@ -245,6 +245,29 @@ esac
         self.assertEqual((self.root / "metadata-calls").read_text().splitlines(), ["metadata"])
         self.assertTrue((self.root / "cargo-calls").read_text().startswith("check "))
 
+    def test_token_wait_uses_elapsed_seconds_when_no_clock_override_is_present(self) -> None:
+        # Copy the board boundary into a disposable HOME; acquire deliberately
+        # crosses a whole second, so scheduling can only increase the wait.
+        home = self.root / "clock-home"
+        delegate = home / ".claude/scripts/delegate"
+        delegate.mkdir(parents=True)
+        for source in VERIFY.parent.parent.iterdir():
+            if source.name != "delegate":
+                (delegate.parent / source.name).symlink_to(source, target_is_directory=source.is_dir())
+        board = delegate / "board.sh"
+        _ = board.write_text('#!/bin/bash\nif [[ "$1" == acquire ]]; then sleep 1.1; fi\n'
+                             + 'exec bash "$TEST_REAL_BOARD" "$@"\n')
+        environment = {**self.environment, "HOME": str(home),
+                       "PLAN_DELEGATE_BOARD_DIR": str(self.root / "clock-board"),
+                       "PLAN_DELEGATE_TEAM_ROLE": "clock", "TEST_REAL_BOARD": str(BOARD)}
+        for key in ("PLAN_DELEGATE_WORKER_POLL_SECS", "PLAN_DELEGATE_WORKER_WAIT_ATTEMPTS",
+                    "PLAN_DELEGATE_EARLY_POLL_SECS", "PLAN_DELEGATE_TOKEN_CLOCK_FILE"):
+            _ = environment.pop(key, None)
+        result = self.verify(environment)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(len(self.records()), 1)
+        self.assertGreaterEqual(cast(int, self.records()[0]["token_wait_s"]), 1)
+
     def test_step_group_is_recorded_before_cargo_starts(self) -> None:
         board = self.root / "board"
         environment = {**self.environment, "PLAN_DELEGATE_BOARD_DIR": str(board),

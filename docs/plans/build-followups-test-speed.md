@@ -180,7 +180,7 @@ A test that pins a behaviour a user or another script depends on is not trivial,
 
 **Ruled out:** a delegate-local copy of the CLI fixture — one restore implementation is simpler.
 
-### Phase 6 — The delegate tests start fewer processes  · status: todo
+### Phase 6 — The delegate tests start fewer processes  · status: done
 
 **Depends on:** Phase 5
 
