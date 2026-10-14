@@ -489,7 +489,9 @@ def _append_event(state: dict[str, object], event: dict[str, object]) -> None:
         fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
         _ = handle.write(line)
         handle.flush()
-        os.fsync(handle.fileno())
+        # Disposable fixtures may omit disk durability; production syncs by default.
+        if os.environ.get("PLAN_DELEGATE_SYNC_WRITES", "1") != "0":
+            os.fsync(handle.fileno())
         fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
 
