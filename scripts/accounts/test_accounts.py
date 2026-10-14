@@ -175,7 +175,7 @@ class AccountsTests(unittest.TestCase):
               patch.object(account, "process_config_dir", return_value=self.main_dir),
               patch.object(accounts, "pick", side_effect=chosen),
               patch.object(accounts, "role_account", return_value=accounts.CodexSeatsAccount("codex 1", self.home / ".codex1"))):
-            code, output, error = self.run_cli("status")
+            code, output, error = self.run_cli("--detail")
         self.assertEqual((code, error), (0, ""))
         self.assertIn("live-identity", output)
         self.assertIn("Live director", output)
@@ -194,7 +194,7 @@ class AccountsTests(unittest.TestCase):
             "capacity": {"status": "waiting_capacity", "continuation_owed": True},
             "done": {"status": "idle", "continuation_owed": False},
         }))
-        _, output, _ = self.run_cli("status")
+        _, output, _ = self.run_cli("--detail")
         self.assertIn("run-one/blocked: continuation owed", output)
         self.assertIn("destination account refused again", output)
         self.assertIn("run-one/capacity: continuation owed", output)
@@ -216,7 +216,7 @@ class AccountsTests(unittest.TestCase):
             if pid != 901:
                 raise ProcessLookupError("mesh server gone")
         with patch.object(os, "kill", side_effect=check):
-            _, output, _ = self.run_cli("status")
+            _, output, _ = self.run_cli("--detail")
         self.assertIn("live/worker: continuation owed", output)
         for name in ("dead", "missing", "malformed", "invalid-pid"):
             self.assertNotIn(name + "/worker", output)
@@ -233,7 +233,7 @@ class AccountsTests(unittest.TestCase):
         moves.append_move(moves.FailedMove(at=common["at"], move_id="failed-move", subject="claude-session: Director", tool="claude",
             kind="failed", reason="still on claude 1"))
         moves.append_move({**request, "move_id": "pending-move", "subject": "waiting-session: Waiting"})
-        _, output, _ = self.run_cli("status")
+        _, output, _ = self.run_cli("--detail")
         self.assertIn("confirmed", output)
         self.assertIn("worker-a", output)
         self.assertIn("worker-b", output)
@@ -245,7 +245,7 @@ class AccountsTests(unittest.TestCase):
         for index in range(12):
             moves.append_move(moves.FailedMove(at="2026-10-14T12:00:00+00:00", tool="claude",
                 subject=f"session-{index}", move_id=f"move-{index}", kind="failed", reason=f"failure-{index}"))
-        _, output, _ = self.run_cli("status")
+        _, output, _ = self.run_cli("--detail")
         self.assertNotIn("session-0:", output)
         self.assertNotIn("session-1:", output)
         for index in range(2, 12):
@@ -258,11 +258,30 @@ class AccountsTests(unittest.TestCase):
         room: moves.MoveCommon = {**common, "move_id": "room-one"}
         moves.append_move(moves.NoRoomMove(**room, kind="no room", earliest_reset="2026-10-15T12:00:00+00:00"))
         moves.append_move(moves.RoomAgainMove(**room, kind="room again", label="claude 3"))
-        _, output, _ = self.run_cli("status")
+        _, output, _ = self.run_cli("--detail")
         self.assertIn("waited until 2026-10-14T05:19", output)
         self.assertIn("wait ended", output)
         self.assertIn("no room until 2026-10-15T05:00", output)
         self.assertIn("room again: claude 3", output)
+
+    def test_status_shows_sessions_seats_and_moves_only_with_detail(self) -> None:
+        from scripts.message import sessions
+        self.login_directory("claude 2", "main@example.invalid", default=True)
+        owner = sessions.SessionRecord(pid=12345, sessionId="live-identity", name="Live director",
+            messagingSocketPath="/fixture.sock", updatedAt=1, tmux="", formerNames=[])
+        moves.append_move(moves.FailedMove(at="2026-10-14T12:00:00+00:00", tool="claude",
+            subject="moved-session", move_id="move-one", kind="failed", reason="still on claude 1"))
+        with (patch.object(sessions, "live_sessions", return_value=[owner]),
+              patch.object(import_module("sessions"), "live_sessions", return_value=[owner]),
+              patch.object(account, "process_config_dir", return_value=self.main_dir)):
+            summary = self.run_cli()
+            detail = self.run_cli("--detail")
+        self.assertEqual((summary[0], summary[2], detail[0], detail[2]), (0, "", 0, ""))
+        for line in ("session live-identity (Live director)", "Codex seats:", "moved-session: failed"):
+            self.assertNotIn(line, summary[1])
+            self.assertIn(line, detail[1])
+        self.assertEqual(detail[1].splitlines()[:len(summary[1].splitlines())], summary[1].splitlines())
+        self.assertEqual(self.run_cli("--detail", "pick", "claude"), (1, "", "--detail goes only with no action\n"))
 
     def status_rows(self) -> list[tuple[str, ...]]:
         """The status table's rows after its heading, each a tuple of its cells, then nothing else."""
@@ -1025,6 +1044,7 @@ class AccountsTests(unittest.TestCase):
     def test_showrunner_group_move_names_every_unregistered_timer_even_without_live_members(self) -> None:
         self.login_directory("claude 2", "main@example.invalid", default=True)
         self.login_directory("claude 3", "other@example.invalid")
+        sys.path.insert(0, str(accounts.SCRIPTS / "shutdown"))
         inventory = import_module("inventory")
         stale = [showrunners.Showrunner(session="", socket="", slug=slug, zone="America/New_York",
                                        doc=f"/w/{slug}-production.md") for slug in ("first", "second")]
@@ -1043,6 +1063,7 @@ class AccountsTests(unittest.TestCase):
     def test_showrunner_group_preview_names_unregistered_timers_without_configuring_or_requesting(self) -> None:
         self.login_directory("claude 2", "main@example.invalid", default=True)
         self.login_directory("claude 3", "other@example.invalid")
+        sys.path.insert(0, str(accounts.SCRIPTS / "shutdown"))
         inventory = import_module("inventory")
         stale = showrunners.Showrunner(session="", socket="", slug="missing", zone="America/New_York",
                                        doc="/w/missing-production.md")

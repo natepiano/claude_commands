@@ -2,7 +2,7 @@
 
 ## Which account am I on?
 
-The status line's second row shows this session's account label. To print it:
+The status line's first row shows this session's account label, after its role. To print it:
 
 ```sh
 ~/.claude/scripts/lib/py ~/.claude/scripts/whoami/account.py
@@ -221,7 +221,7 @@ A known 5-hour reset in less than 20 minutes waits once per session and reset. O
 
 `scripts/accounts/refusal_watch.py --dry-run` reports decisions without changing anything. For a live proof, `--assume-refused '<session id or name>' weekly|five-hour [--reset-in <minutes>]` writes a refusal for that owner only and runs once. The optional reset affects its wait decision, not stored account usage. A confirmed restart or cancellation deletes the assumption. A process still on the source is a failed move; a target process with pending timers is confirmed while those timers stay visible.
 
-Account status shows live sessions' accounts, the Codex workers account and its destination on refusal, workers still owing a continuation, and the last ten move entries with outcomes. The first line names both groups; table role cells show their selected accounts. A member still on its old account shows as `moving`.
+Account status with `--detail` also shows live sessions' accounts, the Codex workers account and its destination on refusal, workers still owing a continuation, and the last ten move entries with outcomes. The first line names both groups; table role cells show their selected accounts. A member still on its old account shows as `moving`.
 
 ## Low-quota alerts
 

@@ -18,8 +18,8 @@ is the third reader:
 | `adversary` | the failing case — the input that violates a stated invariant, the caller that was not updated, the state the new code cannot reach, the test that passes for the wrong reason |
 | `contract` | what the Work Order says, including every part no test covers, and anything built that it never asked for; then what the change reaches without naming — callers, consumers, public API, traits, registration, plugin wiring, invariants and transitions |
 
-The `craft` lens is off since 2026-10-04 (user: review trial ended); the run's
-style review still audits style.
+The `craft` lens is off since 2026-10-04 (user: review trial ended); the unit
+director's main review audits style each phase.
 
 When the production doc names a review pool and the phase's arm is `pool`,
 the launcher allocates each lens's reviewer; the worker choice and role
@@ -230,13 +230,22 @@ of reviewing the partial diff.
 4. While they run, perform the main review. Pass 1 reads changed code in risk
    order: Work Order paths, public API/traits/registration/plugin wiring, then
    remaining hunks. Verify spec, extras, codebase fit, <TypeDesignContract/>, and
-   `${IMPL_SUMMARY}` claims without loading or auditing the style guide. The
-   summaries' self-reports per <WritePromptContract/> — what a slot was unsure
+   `${IMPL_SUMMARY}` claims. On pass 1 only, run the style review named by
+   <PhaseChecks/>: read `~/.claude/commands/unit/style_review.md` in full and
+   apply <StyleReview/> with `since <commit from ${SESSION_DIR}/phase_baseline>`
+   and `${SESSION_DIR}` as its directory; supply the phase's findings ledger.
+   A missing or invalid baseline stops the review. Save its table and result to
+   `${SESSION_DIR}/phase_style_review_<phase-id>.md`, including `Off` or an
+   error. For its ledger writes use `findings.py open --caught-by main` with
+   each violation's severity, title, file and line; retain the returned ids
+   for <Synthesize/> without opening them again. A phase with no Rust change runs only the
+   banned-words scan under <StyleReview/>. Blind reviewers never audit style.
+   The summaries' self-reports per <WritePromptContract/> — what a slot was unsure
    about, what it could not verify, what it touched outside its file set — are
    this read's alone: no lens receives a summary, so a stated doubt is a place
    only the main review can go looking. Say where this read did not reach. Later
    passes read only repair paths and affected callers, consumers, transitions,
-   or invariants.
+   or invariants; do not repeat the checklist walk.
 5. If this main pass confirms a substantial, unambiguous spec-defined defect
    while blind reviewers remain active, read each log once, cancel them all, and
    close each one's own pass with

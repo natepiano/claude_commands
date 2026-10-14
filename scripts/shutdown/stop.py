@@ -18,12 +18,13 @@ from pathlib import Path
 from typing import Literal, Protocol, TypedDict, cast
 
 SCRIPTS = Path(__file__).resolve().parents[1]
-for dependency in ("message", "production", "herdr"):
+for dependency in ("message", "production", "herdr", "lib"):
     sys.path.insert(0, str(SCRIPTS / dependency))
 
 import sessions
 import herdr
-from inventory import Inventory, Session, terminal_kind
+import relaunch
+from inventory import Inventory, Session, terminal_kind, live_supervisor
 from record import (
     CLAIM_STALE_SECONDS,
     NoLiveRecord,
@@ -446,8 +447,10 @@ def _stop_owner_resources(
     tmux: CommandRunner,
     clock: Clock,
     claim: StopClaim,
+    retain_window: bool = False,
 ) -> list[SessionStopIssue]:
-    _close_ghostty_window(session, kill=kill, is_alive=is_alive, claim=claim)
+    if not retain_window:
+        _close_ghostty_window(session, kill=kill, is_alive=is_alive, claim=claim)
     issues = _stop_codex_servers(
         session, codex_mesh=codex_mesh, is_alive=is_alive, clock=clock, claim=claim
     )
@@ -517,6 +520,20 @@ def _retry_owner_cleanup(
     _ = _replace_stop_issues(claim, issues)
 
 
+def _hold_supervised_window(entry: SessionShutdown, claim: StopClaim) -> bool:
+    """Write a restart's hold before Claude exits, so its supervisor keeps the window."""
+    host = entry["session"]["host"]
+    if entry["then"] != "restart" or not (host["kind"] == "ghostty" or (
+            host["kind"] == "terminal" and sys.platform == "darwin")):
+        return False
+    supervisor = live_supervisor(host)
+    if supervisor["kind"] != "supervisor":
+        return False
+    claim.check()
+    relaunch.write_hold(supervisor["pid"])
+    return True
+
+
 def _stop_owner(
     claim: StopClaim,
     entry: SessionShutdown,
@@ -533,6 +550,7 @@ def _stop_owner(
     sleep: Sleeper,
 ) -> None:
     stored = entry["session"]
+    retain_window = False
     report = fresh_inventory(claim.login, frozenset({stored["session_id"]}))
     match = fresh_session(stored, report)
     if match["kind"] == "session identity lost":
@@ -551,6 +569,11 @@ def _stop_owner(
         )
         return
     if match["kind"] == "session absent":
+        try:
+            retain_window = _hold_supervised_window(entry, claim)
+        except OSError as error:
+            _ = _set_stop_outcome(claim, "stop failed", clock, [], str(error))
+            return
         issues = _stop_owner_resources(
             stored,
             kill=kill,
@@ -559,6 +582,7 @@ def _stop_owner(
             tmux=tmux,
             clock=clock,
             claim=claim,
+            retain_window=retain_window,
         )
         _ = _set_stop_outcome(
             claim, "already gone", clock, issues
@@ -586,6 +610,11 @@ def _stop_owner(
     if force_now:
         _end_busy_codex_workers(current, codex_mesh, claim)
     try:
+        retain_window = _hold_supervised_window(entry, claim)
+    except OSError as error:
+        _ = _set_stop_outcome(claim, "stop failed", clock, [], str(error))
+        return
+    try:
         claim.check()
         kill(stored["pid"], signal.SIGTERM)
     except ProcessLookupError:
@@ -597,6 +626,7 @@ def _stop_owner(
             tmux=tmux,
             clock=clock,
             claim=claim,
+            retain_window=retain_window,
         )
         _ = _set_stop_outcome(
             claim, "already gone", clock, issues
@@ -705,6 +735,7 @@ def _stop_owner(
         tmux=tmux,
         clock=clock,
         claim=claim,
+        retain_window=retain_window,
     )
     _ = _set_stop_outcome(
         claim, stopped_progress, clock, issues
