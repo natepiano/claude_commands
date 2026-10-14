@@ -182,7 +182,8 @@ State:
 
   Nothing else does. Handle unit messages (checkpoints, merges, ETAs, plans,
   promotions, routine fixes) without telling the user; they wait for the next
-  dailies (user, 2026-10-12).
+  dailies (user, 2026-10-12). A turn with nothing for the user replies with
+  just "—": never "No update for you." or the like (user, 2026-10-14).
 - **Designs and add-ons.** A unit's design choices and add-ons are yours to
   settle, not the user's. User, 2026-10-12: "when it comes to designs you
   absolutely should be able to tell units what to do and change. I do not have
