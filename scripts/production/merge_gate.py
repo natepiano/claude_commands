@@ -270,6 +270,9 @@ def one_minute_load() -> float:
 def run_suites(repo: Path, memory_cap_mib: int = DEFAULT_MEMORY_CAP_MIB, type_dirs: Sequence[str] = ()) -> GateRun:
     if memory_cap_mib <= 0:
         raise GateRefused("memory cap must be positive")
+    absent = [name for name in type_dirs if not (repo / name).exists()]
+    if absent:
+        raise GateRefused(f"type dirs not found under {repo}: {', '.join(absent)}")
     modules = [(suite, path) for suite in TEST_SUITES
                for path in sorted((repo / "scripts" / suite).glob("test_*.py"))]
     missing = [suite for suite in TEST_SUITES if not any(name == suite for name, _ in modules)]
