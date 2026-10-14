@@ -2,7 +2,7 @@
 # Unit status for /showrunner:produce's update schedule.
 # Usage: unit_status.sh <state-dir> <user-zone> --production <production doc>
 # The units are the live rows of the showrunner's production doc. Each is found by the mark on
-# its tmux session, so a block is headed by the unit id, which no rename changes.
+# its host session, so a block is headed by the unit id, which no rename changes.
 # Each call checks every unit director: that its session and Claude are running, tick
 # health for every unit with an active run, any form or decision waiting on the user,
 # and its latest step, gate and ETA.
@@ -19,7 +19,7 @@ fi
 DIR=$1
 ZONE=$2
 REPO=${0:A:h:h:h}
-# One line per unit: its id, its pane now, whether Claude runs there, its session name now.
+# One line per unit: its id, its place now, whether Claude runs there, its session name now.
 unit_lines=$("$REPO/scripts/lib/py" "$REPO/scripts/production/live_units.py" "${production[@]}") || exit 1
 [[ -n $unit_lines ]] && units=("${(@f)unit_lines}") || units=()
 # What a gate line may call a peer: its unit id, or its session name now.
@@ -28,11 +28,16 @@ for line in $units; do
   fields=("${(@ps:\t:)line}")
   names+=($fields[1] $fields[4])
 done
-# `^out` alone: `nixpkgs#tmux` without it also prints the man output's path.
-TM=$(command -v tmux) || TM=$(nix build --no-link --print-out-paths 'nixpkgs#tmux^out')/bin/tmux
-REPO=${0:A:h:h:h}
 PY=$REPO/scripts/lib/py
-SESSIONS=$REPO/scripts/message/sessions.py
+slug=$("$PY" - "$REPO/scripts/production" "${production[@]}" <<'PYTHON'
+import sys
+sys.path.insert(0, sys.argv[1])
+from showrunners import named, production_slug
+arguments = sys.argv[2:]
+print(production_slug(arguments[1]) if arguments[0] == "--production" else named(arguments[0])["slug"])
+PYTHON
+) || exit 1
+marked_lines=$("$PY" "$REPO/scripts/production/unit_lookup.py" list "$slug") || exit 1
 NOTIFIER=$REPO/scripts/message/notifier.sh
 ACTIVE_DIR=${PLAN_DELEGATE_ACTIVE_DIR:-/tmp/claude/delegate/active}
 mkdir -p "$DIR"
@@ -106,58 +111,30 @@ waiting_on_user() {
   print -r -- "$key" >> "$SEEN"
 }
 
-# The pane's Claude may have a different remote-control name from its tmux session.
-# Search descendants in process-tree order, closest to the pane first.
-pane_claude_pid() {
-  print -r -- "$processes" | awk -v root="$1" '
-    {
-      child[NR] = $1
-      parent[NR] = $2
-      command[NR] = $0
-      sub(/^[[:space:]]*[0-9]+[[:space:]]+[0-9]+[[:space:]]*/, "", command[NR])
-    }
-    END {
-      queue[1] = root
-      end = 1
-      for (head = 1; head <= end; head++) {
-        for (i = 1; i <= NR; i++) {
-          if (parent[i] != queue[head]) continue
-          if (command[i] ~ /^claude([[:space:]]|$)/) {
-            print child[i]
-            exit
-          }
-          queue[++end] = child[i]
-        }
-      }
-    }'
-}
-
 echo "at $(TZ=$ZONE date '+%H:%M %Z') / $(date -u +%H:%M) UTC"
-processes=$(ps -eo pid=,ppid=,args=)
 for line in $units; do
   fields=("${(@ps:\t:)line}")
   u=$fields[1]
   target=$fields[2]
   echo "== $u"
   if [[ -z $target ]]; then echo 'SESSION GONE'; continue; fi
-  pane_pid=$($TM display-message -p -t "$target" '#{pane_pid}')
-  pid=$(pane_claude_pid "$pane_pid")
-  [[ -z $pid ]] && echo 'CLAUDE NOT RUNNING'
-  if [[ -n $pid ]]; then
-    # No 2>/dev/null: the lookup is silent when the pid has no session and says why when the
-    # session records cannot be read.
-    session_id=$("$PY" "$SESSIONS" id "$pid")
-    if [[ -n $session_id && -f $ACTIVE_DIR/$session_id ]]; then
-      session_dir=$(< "$ACTIVE_DIR/$session_id")
-      if [[ -n $session_dir ]]; then
-        health=$(zsh "$NOTIFIER" health "delegate-${session_dir:t}" 2>&1)
-        if (( $? == 1 )); then
-          print -r -- "TICKS FAILING (${health#failing: })"
-        fi
+  # Lookup columns: unit, place, label, state, Claude name, session id, socket.
+  claude_state=$(print -r -- "$marked_lines" | awk -F'\t' -v u="$u" '$1 == u { print $4 }')
+  session_id=$(print -r -- "$marked_lines" | awk -F'\t' -v u="$u" '$1 == u { print $6 }')
+  case $claude_state in
+    unknown) echo 'CLAUDE STATE UNKNOWN' ;;
+    stopped) echo 'CLAUDE NOT RUNNING' ;;
+  esac
+  if [[ -n $session_id && -f $ACTIVE_DIR/$session_id ]]; then
+    session_dir=$(< "$ACTIVE_DIR/$session_id")
+    if [[ -n $session_dir ]]; then
+      health=$(zsh "$NOTIFIER" health "delegate-${session_dir:t}" 2>&1)
+      if (( $? == 1 )); then
+        print -r -- "TICKS FAILING (${health#failing: })"
       fi
     fi
   fi
-  p=$($TM capture-pane -p -J -S -400 -t "$target")
+  p=$("$PY" "$REPO/scripts/production/session_pane.py" read unit "$slug" "$u" --lines 400 --joined)
   waiting_on_user "$u" "$p"
   pane=$(print -r -- "$p" | tail -150)
   print -r -- "$pane" | grep -E '^● ' | grep -vE 'says:|^● (Bash|Read|Write|Edit|Skill|Update|Search)\(' | tail -2 | cut -c1-220
