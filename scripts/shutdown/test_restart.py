@@ -1634,16 +1634,28 @@ class RestartTests(ShutdownTestCase):
         threads: set[int] = set()
         lock = threading.Lock()
         launches_in_flight = threading.Barrier(6, timeout=10)
+        launches: list[str] = []
 
-        def launch(_record: SessionShutdown, _note: str, _state: restart.DesktopLaunchState, *, dry_run: bool) -> restart.SessionLaunched:
+        def run(argv: list[str], *, dry_run: bool, check: bool = True) -> subprocess.CompletedProcess[str]:
+            del check
             self.assertFalse(dry_run)
+            self.assertEqual(argv[:2], ["tmux", "new-session"])
             with lock:
                 threads.add(threading.get_ident())
+                launches.append(argv[argv.index("-s") + 1])
             _ = launches_in_flight.wait()
-            return restart.SessionLaunched()
+            return subprocess.CompletedProcess(argv, 0, "", "")
 
-        with patch.object(restart, "_retire"), patch.object(restart, "_live_session_ids", return_value=frozenset()), patch.object(restart, "_launch_session", launch), patch.object(restart, "wait_for_confirmation", side_effect=self.all_sessions_live), redirect_stdout(io.StringIO()):
+        def confirm(ids: frozenset[str], timeout: float) -> restart.RegistryConfirmation:
+            self.assertCountEqual(launches, [str(index) for index in range(6)])
+            return self.all_sessions_live(ids, timeout)
+
+        missing = subprocess.CompletedProcess(["tmux"], 1, "", "")
+        with patch.object(restart, "_retire"), patch.object(restart, "_live_session_ids", return_value=frozenset()), patch.object(restart, "_run", run), patch.object(restart, "_probe", return_value=missing) as probing, patch.object(restart, "_record_scheduled_restart_prompt"), patch.object(restart, "wait_for_confirmation", side_effect=confirm), patch.object(time, "sleep") as sleeping, redirect_stdout(io.StringIO()):
             self.assertEqual(restart.up(LOGIN), 0)
+        self.assertEqual(probing.call_count, 6)
+        sleeping.assert_not_called()
+        self.assertCountEqual(launches, [str(index) for index in range(6)])
         self.assertEqual(restart.RESTART_LAUNCH_WORKERS, 6)
         self.assertEqual(len(threads), 6)
         self.assertNotIn(threading.get_ident(), threads)

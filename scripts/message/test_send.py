@@ -1193,7 +1193,7 @@ class SendTests(ShutdownTestCase):
         stdout = "pushover: reviewed JSON: " + json.dumps(reviewed) + "\n"
         expected_message = "Action: Choose retry.\nUse natedev.\nThe build stopped.\nChoose retry or stop."
         for code in (1, 2, None):
-            with self.subTest(code=code), mock.patch.object(send, "run", return_value=(code, stdout, "post unavailable")):
+            with self.subTest(code=code), mock.patch.object(send, "run", return_value=(code, stdout, "post unavailable")), mock.patch.object(time, "time", return_value=1234567890.0):
                 result = send.send(local_options(self.user_arguments()))
             self.assertEqual(result.outcome, "failed")
             self.assertTrue(result.detail.endswith("fallback text:\nRetry needs your choice — Action: Choose retry. Use natedev."))
@@ -1202,7 +1202,7 @@ class SendTests(ShutdownTestCase):
             marker = send.as_dict(send.loads(self.failure_marker().read_text()))
             self.assertEqual((marker["title"], marker["action"], marker["body"], marker["message"]),
                              (reviewed["title"], reviewed["action"], reviewed["body"], expected_message))
-            self.assertLess(abs(time.time() - cast(float, marker["time"])), 2)
+            self.assertEqual(marker["time"], 1234567890.0)
             self.failure_marker().unlink()
         with mock.patch.object(send, "run", return_value=(None, "", "")):
             result = send.send(local_options(self.user_arguments()))

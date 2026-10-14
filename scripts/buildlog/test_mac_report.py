@@ -22,6 +22,7 @@ import mac_outcome
 import store
 from test_holds import hold_event, timed_hold_events, write_mac_block
 from test_index import Record, call, encode, point_root_at, step
+from test_report import MeasuredCliRun, measure_cli_work
 from user_zone import user_zone
 
 CLI = Path(__file__).with_name("cli.py")
@@ -588,7 +589,7 @@ class MacReportTests(unittest.TestCase):
         self.assertIn("Now: Mac blocked by hana for render since 2026-10-08 00:00 PDT", output)
         self.assertNotIn("Not recorded yet:", output)
 
-    def test_mac_report_cli_runs_under_two_seconds_at_the_log_size(self) -> None:
+    def test_mac_report_cli_work_grows_near_linearly_at_the_log_size(self) -> None:
         now = datetime.now(UTC)
         began = (now - timedelta(hours=20)).replace(minute=0, second=0, microsecond=0)
         with self.log.open("wb") as handle:
@@ -614,13 +615,26 @@ class MacReportTests(unittest.TestCase):
             for hold_row in hold_rows:
                 _ = handle.write(encode(hold_row))
         self.assertEqual(index.update(), 65_600 + len(hold_rows))
-        measured = time.perf_counter()
-        result = subprocess.run(
-            [sys.executable, str(CLI), "mac-report"], env={**os.environ, "BUILDLOG_DIR": str(self.root), "TZ": "America/Los_Angeles", "USER_ZONE": "America/Los_Angeles"},
-            capture_output=True, text=True, check=False, timeout=30,
-        )
-        elapsed = time.perf_counter() - measured
-        print(f"mac-report timed fixture: {elapsed:.3f} s")
+        full_rows = self.log.read_bytes().splitlines(keepends=True)
+        quarter_rows = full_rows[:29_138:4] + full_rows[29_138:65_600:4] + full_rows[65_600:]
+        environment = {**os.environ, "BUILDLOG_DIR": str(self.root), "TZ": "America/Los_Angeles", "USER_ZONE": "America/Los_Angeles"}
+        runs: list[list[MeasuredCliRun]] = []
+        for rows in (quarter_rows, full_rows):
+            _ = self.log.write_bytes(b"".join(rows))
+            _ = index.reindex()
+            runs.append([measure_cli_work("mac-report", environment, len(rows)) for _ in range(3)])
+        for measured in [*runs[0], *runs[1]]:
+            self.assertEqual(measured.result.returncode, 0, measured.result.stderr)
+            self.assertEqual(measured.work["index_updates"], 1)
+            self.assertEqual(measured.work["launch_collections"], 0)
+            self.assertLessEqual(measured.work["statements"], 4)
+            self.assertEqual(measured.work["step_reads"], 1)
+        baseline = min(run.work["cpu_seconds"] for run in runs[0])
+        full = min(run.work["cpu_seconds"] for run in runs[1])
+        self.assertLessEqual(full, baseline * 8, f"CLI CPU grew from {baseline} to {full} for four times the rows")
+        baseline_instructions = min(run.work["instructions"] for run in runs[0])
+        self.assertLessEqual(min(run.work["instructions"] for run in runs[1]), baseline_instructions * 8)
+        result = runs[1][-1].result
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("Usable share:", result.stdout)
         self.assertIn("Set aside as not usable: blocked, backoff, unreachable, battery, disk, off", result.stdout)
@@ -638,7 +652,7 @@ class MacReportTests(unittest.TestCase):
             duration = cell.removeprefix("at least ")
             hours, minutes = duration.split(":")
             self.assertGreater(int(hours) * 60 + int(minutes), 0, day_line)
-        self.assertLessEqual(elapsed, 2.0, result.stdout)
+
 
 
 if __name__ == "__main__":
