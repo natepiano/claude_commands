@@ -1125,26 +1125,87 @@ def _journal_move_failure(record: SessionShutdown, reason: str) -> None:
         subject=session["session_id"] + ": " + session["name"], move_id=record["request_id"], reason=reason))
 
 
-def _prove_move(record: SessionShutdown) -> bool:
-    """A registry entry alone does not prove that the session adopted the target."""
+def _target_config_dir(record: SessionShutdown) -> Path | None:
+    """The config directory a restored session belongs on: its move target, else the one it left, if recorded."""
     target_label = record.get("target", "")
     if not target_label:
-        return True
-    from scripts.accounts import accounts, moves
-    from scripts.accounts.refusal_watch import clear_assumed
+        session = record["session"]
+        return Path(session["config_dir"]) if "config_dir" in session else None
+    from scripts.accounts import accounts
+    return accounts.main_config_dir() if target_label == "default" else accounts.account_dir(target_label)
+
+
+def _live_config_dir(record: SessionShutdown) -> Path | None:
     import account
-    target = accounts.main_config_dir() if target_label == "default" else accounts.account_dir(target_label)
     live = next((item for item in sessions.live_sessions() if item["sessionId"] == record["session"]["session_id"]), None)
-    directory = account.process_config_dir(live["pid"]) if live is not None else None
-    if directory is None or directory.resolve() != target.resolve():
+    return account.process_config_dir(live["pid"]) if live is not None else None
+
+
+def _confirm_move(record: SessionShutdown) -> None:
+    from scripts.accounts import moves
+    from scripts.accounts.refusal_watch import clear_assumed
+    session = record["session"]
+    moves.append_move(moves.ConfirmedMove(kind="confirmed", at=settle.record_time(), tool="claude",
+        subject=session["session_id"] + ": " + session["name"], move_id=record["request_id"],
+        config_dir=str(_target_config_dir(record) or "")))
+    clear_assumed(session["session_id"])
+
+
+def _prove_move(record: SessionShutdown) -> bool:
+    """A registry entry alone does not prove that the session adopted the target."""
+    if not record.get("target", ""):
+        return True
+    directory, target = _live_config_dir(record), _target_config_dir(record)
+    if directory is None or target is None or directory.resolve() != target.resolve():
         reason = "still on " + record.get("source_label", record["label"]) if directory is not None else "resumed account unreadable"
         mark_restart_failed(record, reason)
         return False
-    session = record["session"]
-    moves.append_move(moves.ConfirmedMove(kind="confirmed", at=settle.record_time(), tool="claude",
-        subject=session["session_id"] + ": " + session["name"], move_id=record["request_id"], config_dir=str(target)))
-    clear_assumed(session["session_id"])
+    _confirm_move(record)
     return True
+
+
+NOT_BACK_PROGRESS = frozenset({"manual restart", "restart failed"})
+
+
+@dataclass(frozen=True)
+class TargetCheck:
+    remaining: list[SessionShutdown]
+    finished: list[SessionShutdown]
+
+
+def clear_running_on_target(records: list[SessionShutdown]) -> TargetCheck:
+    """Finish the records of sessions already running on their target, as a relaunch by hand leaves them.
+
+    `remaining` holds every other record as last written, and `finished` the archived ones as
+    restarted: a session that is back is never reported as needing a restart, and `restart`
+    never starts a second process on it.
+    """
+    remaining: list[SessionShutdown] = []
+    finished: list[SessionShutdown] = []
+    for record in records:
+        if record["progress"]["kind"] not in NOT_BACK_PROGRESS or record["machine"].casefold() != settle.local_machine().casefold():
+            remaining.append(record)
+            continue
+        directory, target = _live_config_dir(record), _target_config_dir(record)
+        if directory is None or target is None or directory.resolve() != target.resolve():
+            remaining.append(record)
+            continue
+        if record.get("target", ""):
+            _confirm_move(record)
+        failures = _restore_timers(record["timers"], dry_run=False)
+        progress: SessionProgress = (SessionRestoredTimersPending(kind="timers pending", at=settle.record_time(), timers=list(failures))
+            if failures else SessionRestarted(kind="restarted", at=settle.record_time()))
+        if not _set_entry_progress(record, progress):
+            found = lookup_session(record["login"], record["session"]["session_id"])
+            if isinstance(found, ShutdownFound):
+                remaining.append(found.record)
+            continue
+        if failures:
+            remaining.append({**record, "progress": progress})
+            continue
+        archive_session(record["login"], record["session"]["session_id"])
+        finished.append({**record, "progress": progress})
+    return TargetCheck(remaining, finished)
 
 
 def _record_timer_restore_progress(
@@ -1568,6 +1629,11 @@ def _up(login: str, dry_run: bool, only: Iterable[str] = ()) -> MachineRestartRe
     all_records = session_records(login)
     hold_outcome = lookup_account_hold(login)
     records = [saved for saved in all_records if not ids or saved["session"]["session_id"] in ids]
+    if not dry_run:
+        checked = clear_running_on_target(records)
+        records = checked.remaining
+        for record in checked.finished:
+            print(f"{record['machine']}: {record['session']['name']} is already running on {record.get('target') or record['label']}")
     refused: list[RestartRefusal] = []
     local_ids = {saved["session"]["session_id"] for saved in all_records}
     for identity, name in settle.unrecorded_local_sessions(login, ids, all_records).items():

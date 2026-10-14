@@ -44,7 +44,7 @@ SEND = SCRIPTS / "message" / "send.py"
 SETTLE_INTERVAL_SECONDS = 15
 SETTLE_RETRY_SECONDS = 300
 NOT_ANSWERING_AFTER = timedelta(minutes=5)
-REPEAT_HOLDOUT_ALERT = timedelta(minutes=60)
+SHOWING_FORM = "showing a form"
 USAGE_LIMIT_PATTERNS = (
     "hit your session limit",
     "hit your usage limit",
@@ -673,7 +673,7 @@ def _hold_details(owner: stop_work.FreshSession, progress: str, *, local_observa
     if session["status"] != "busy" and any(server["busy_seats"] for server in session["codex_servers"]):
         details.append("busy")
     if local_observation and progress != "held by usage limit" and _showing_form(session):
-        details.append("showing a form")
+        details.append(SHOWING_FORM)
     checkout = session["checkout"]
     if checkout["kind"] == "git" and checkout["upstream"]["kind"] == "tracking":
         ahead = checkout["upstream"]["ahead"]
@@ -1064,6 +1064,9 @@ def report_stop(records: list[SessionShutdown]) -> None:
     """Report local outcomes alongside one current observation of the peer."""
     if not records:
         return
+    import restart as restart_work
+    checked = restart_work.clear_running_on_target(records)
+    records = checked.remaining + checked.finished
     first = records[0]
     status, output = run_remote(["records", "--json", "--here"])
     lines = [f"{saved['machine']} {saved['session']['name']}: {saved['progress']['kind']}" for saved in records]
@@ -1117,15 +1120,40 @@ def report_stop(records: list[SessionShutdown]) -> None:
                        + "\n\nThe status command lists what failed. The now command tries to stop them again.",
                        ActionRequired(f"In a Claude session on natedev, read /shutdown status {account}, then retry with /shutdown now {account}."),
                        machine="natedev" if local_machine().casefold() == "mac" else "")
-        elif any(saved["alerts"] == "user" for saved in restore_failed):
+        elif unpushed := [saved for saved in restore_failed
+                          if saved["alerts"] == "user" and saved.get("restore_alerted") != _not_back_text(saved)]:
             alert_user(f"{first['label'] if len(first['label']) <= 16 else 'Claude'} sessions did not come back",
-                       f"Sessions on Claude account {account} did not return after shutdown. " + failure_details(restore_failed, "could not return")
+                       f"Sessions on Claude account {account} did not return after shutdown. " + failure_details(unpushed, "could not return")
                        + "\n\nThe status command lists what failed. The restart command tries to bring the sessions back.",
                        ActionRequired(f"In a Claude session on natedev, read /shutdown status {account}, then /shutdown restart {account} to retry."),
                        machine="natedev" if local_machine().casefold() == "mac" else "")
+            for saved in unpushed:
+                _mark_not_back_pushed(saved)
     finally:
         for origin in sorted(origins):
             _ = send_message(f"session:{origin}", summary, text, key=f"shutdown-result-{first['login']}")
+
+
+def _not_back_text(saved: SessionShutdown) -> str:
+    """What a not-back push says about this record; an unchanged one is not pushed again."""
+    progress = saved["progress"]
+    if progress["kind"] == "restart failed":
+        return f"{saved['request_id']} restart failed: {progress['reason']}"
+    if progress["kind"] == "manual restart":
+        return f"{saved['request_id']} manual restart: {progress['command']}"
+    if progress["kind"] == "timers pending":
+        return f"{saved['request_id']} timers pending: " + ", ".join(timer["instance"] for timer in progress["timers"])
+    return f"{saved['request_id']} {progress['kind']}"
+
+
+def _mark_not_back_pushed(saved: SessionShutdown) -> None:
+    def mark(current: SessionShutdown) -> None:
+        if current["request_id"] == saved["request_id"] and current["progress"] == saved["progress"]:
+            current["restore_alerted"] = _not_back_text(saved)
+    try:
+        _ = store.update_session(saved["login"], saved["session"]["session_id"], mark)
+    except store.NoLiveRecord:
+        pass
 
 
 @dataclass(frozen=True)
@@ -1184,20 +1212,27 @@ def _remote_control_alert(records: list[SessionShutdown], missing: tuple[NoRemot
         machine="natedev" if local_machine().casefold() == "mac" else "")
 
 
-def _holdout_due(saved: SessionShutdown, at: datetime) -> bool:
+def _shows_form(reason: str) -> bool:
+    return SHOWING_FORM in reason.split(", ")
+
+
+def _holdout_due(saved: SessionShutdown, at: datetime, *, form: bool = False) -> bool:
+    """A holdout is told once to its requester, and pushed once more only when a form opens in its pane."""
     message = saved["settle_message"]
     since = message["at"] if message["kind"] == "sent" else saved["requested_at"]
     return (saved["alerts"] == "user" and at - datetime.fromisoformat(since) >= NOT_ANSWERING_AFTER
-        and ("alerted_at" not in saved or at - datetime.fromisoformat(saved["alerted_at"]) >= REPEAT_HOLDOUT_ALERT))
+        and ("alerted_at" not in saved or (form and "form_alerted_at" not in saved)))
 
 
-def _reserve_holdout_alert(saved: SessionShutdown, at: datetime) -> bool:
+def _reserve_holdout_alert(saved: SessionShutdown, at: datetime, *, form: bool = False) -> bool:
     accepted = False
     def mark(current: SessionShutdown) -> None:
         nonlocal accepted
         if (current["request_id"] == saved["request_id"] and current["progress"]["kind"] in {"waiting", "ready"}
-            and _holdout_due(current, at)):
+            and _holdout_due(current, at, form=form)):
             current["alerted_at"] = record_time()
+            if form:
+                current["form_alerted_at"] = current["alerted_at"]
             accepted = True
     try:
         _ = store.update_session(saved["login"], saved["session"]["session_id"], mark)
@@ -1206,16 +1241,21 @@ def _reserve_holdout_alert(saved: SessionShutdown, at: datetime) -> bool:
     return accepted
 
 
-def _send_holdout_alert(due: list[tuple[SessionShutdown, str]]) -> None:
-    first = due[0][0]
-    summaries = [f"{saved['session']['name']} is not answering the shutdown of {saved['label']}" for saved, _ in due]
+def _send_holdout_alert(held: list[tuple[SessionShutdown, str]]) -> None:
+    """Tell the requester about every holdout; push to the phone only a form the user must answer."""
+    first = held[0][0]
+    summaries = [f"{saved['session']['name']} is not answering the shutdown of {saved['label']}" for saved, _ in held]
     lines: list[str] = []
-    for saved, reason in due:
+    for saved, reason in held:
         name = saved["session"]["name"]
         action = f"/shutdown cancel --only {name} (take it out; it carries on), /shutdown now --only {name} (stop it anyway)"
         lines.append(f"{saved['machine']} {name}: {reason}; {action}")
     text = "\n".join(lines)
     summary = "; ".join(summaries)
+    due = [(saved, reason) for saved, reason in held if _shows_form(reason)]
+    if not due:
+        _tell_holdout_requesters(held, summary, text)
+        return
     waiting = [f"Its session named {saved['session']['name']} on {saved['machine']} is {reason}, so it has not stopped." for saved, reason in due]
     account = json.dumps(first["label"])
     names = ",".join(saved["session"]["name"] for saved, _ in due)
@@ -1247,15 +1287,19 @@ def _send_holdout_alert(due: list[tuple[SessionShutdown, str]]) -> None:
         if len(omitted + " " + reason_sentence) <= budget:
             omitted += " " + reason_sentence
     phone_text = opening + " ".join([*included, *([omitted] if omitted else [])]) + form_instruction + choices
-    title = "Shutdown waits on a session showing a form" if any("form" in reason for _, reason in due) else "Shutdown waits on running Claude sessions"
+    title = "Shutdown waits on a session showing a form"
     try:
         alert_user(title, phone_text,
             ActionRequired(action_text),
             machine="natedev" if local_machine().casefold() == "mac" else "")
     finally:
-        origins = {saved["requested_by"]["session_id"] for saved, _ in due if saved["requested_by"]["kind"] == "session"}
-        for origin in sorted(origins):
-            _ = send_message(f"session:{origin}", summary, text, key=f"shutdown-holdout-{first['login']}")
+        _tell_holdout_requesters(held, summary, text)
+
+
+def _tell_holdout_requesters(held: list[tuple[SessionShutdown, str]], summary: str, text: str) -> None:
+    origins = {saved["requested_by"]["session_id"] for saved, _ in held if saved["requested_by"]["kind"] == "session"}
+    for origin in sorted(origins):
+        _ = send_message(f"session:{origin}", summary, text, key=f"shutdown-holdout-{held[0][0]['login']}")
 
 
 def _archive_finished(saved: SessionShutdown) -> bool:
@@ -1420,8 +1464,10 @@ def _conduct_owned(login: str, archived: dict[str, SessionShutdown]) -> None:
                         step = next_step(saved, owner, records, now_utc())
                         if (due and saved["progress"]["kind"] in {"waiting", "ready"}
                             and (saved["progress"]["kind"] == "waiting" or isinstance(step, Hold))
-                            and _holdout_due(saved, now_utc()) and _reserve_holdout_alert(saved, now_utc())):
-                            holdouts.append((saved, hold_reason(saved, owner)))
+                            and _holdout_due(saved, now_utc(), form=True)):
+                            reason = hold_reason(saved, owner)
+                            if _reserve_holdout_alert(saved, now_utc(), form=_shows_form(reason)):
+                                holdouts.append((saved, reason))
                         if (session_id, type(step)) in attempted:
                             continue
                         if isinstance(step, SendSettleMessage):

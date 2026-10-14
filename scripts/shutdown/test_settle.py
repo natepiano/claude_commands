@@ -1893,7 +1893,7 @@ class SettleTests(ShutdownTestCase):
             self.assertEqual(settle.now(Account("claude", LOGIN, LABEL), only=["peer-id"]), 1)
         self.assertEqual((output.getvalue(), error.getvalue()), (line + "\n", ""))
         peer.assert_called_once_with(["now", LOGIN, "--here", "--only", "peer-id"])
-    def test_holdout_alert_uses_delivery_time_or_request_time_and_repeats_hourly(self) -> None:
+    def test_holdout_alert_uses_delivery_time_or_request_time_and_is_told_once(self) -> None:
         deliveries: list[record.SettleMessage] = [{"kind": "not sent"}, {"kind": "queued", "at": NOW, "reason": "pending"}, {"kind": "sent", "at": (NOW_UTC + timedelta(minutes=2)).isoformat()}]
         for delivery in deliveries:
             saved = session_shutdown(top_level("owner", "Owner"))
@@ -1902,10 +1902,37 @@ class SettleTests(ShutdownTestCase):
             self.assertFalse(settle._holdout_due(saved, baseline + timedelta(minutes=5) - timedelta(seconds=1)))  # pyright: ignore[reportPrivateUsage]
             self.assertTrue(settle._holdout_due(saved, baseline + timedelta(minutes=5)))  # pyright: ignore[reportPrivateUsage]
             saved["alerted_at"] = (baseline + timedelta(minutes=5)).isoformat()
-            self.assertFalse(settle._holdout_due(saved, baseline + timedelta(minutes=65) - timedelta(seconds=1)))  # pyright: ignore[reportPrivateUsage]
-            self.assertTrue(settle._holdout_due(saved, baseline + timedelta(minutes=65)))  # pyright: ignore[reportPrivateUsage]
+            self.assertFalse(settle._holdout_due(saved, baseline + timedelta(hours=3)))  # pyright: ignore[reportPrivateUsage]
+            self.assertTrue(settle._holdout_due(saved, baseline + timedelta(hours=3), form=True))  # pyright: ignore[reportPrivateUsage]
+            saved["form_alerted_at"] = saved["alerted_at"]
+            self.assertFalse(settle._holdout_due(saved, baseline + timedelta(hours=3), form=True))  # pyright: ignore[reportPrivateUsage]
+            del saved["form_alerted_at"]
             saved["alerts"] = "none"
-            self.assertFalse(settle._holdout_due(saved, baseline + timedelta(minutes=65)))  # pyright: ignore[reportPrivateUsage]
+            self.assertFalse(settle._holdout_due(saved, baseline + timedelta(hours=3), form=True))  # pyright: ignore[reportPrivateUsage]
+
+    def test_plain_wait_reaches_the_requester_but_never_the_phone(self) -> None:
+        for reason in ("waiting", "busy", "ahead 2 on main"):
+            with self.subTest(reason=reason):
+                saved = session_shutdown(top_level("owner", "Owner"), requester="requester")
+                with patch.object(settle, "alert_user") as alert, patch.object(settle, "send_message", return_value=settle.MessageSent(kind="sent")) as sender:
+                    settle._send_holdout_alert([(saved, reason)])  # pyright: ignore[reportPrivateUsage]
+                alert.assert_not_called()
+                self.assertIn(f"natedev Owner: {reason};", cast(str, sender.call_args.args[2]))
+
+    def test_holdout_pushes_once_when_a_form_opens_after_the_wait_was_told(self) -> None:
+        owner = top_level("owner", "Owner")
+        self.save(session_shutdown(owner, requester="requester"))
+        at = NOW_UTC + timedelta(minutes=5)
+        shown = [False]
+        def form(_owner: inventory.Session) -> bool:
+            return shown[0]
+        def end(_seconds: float) -> None:
+            raise PassObserved()
+        for showing, pushes in ((False, 0), (True, 1), (True, 0)):
+            shown[0] = showing
+            with patch.object(settle, "now_utc", return_value=at), patch.object(settle, "run_inventory", return_value=machine_inventory([owner])), patch.object(settle, "_showing_form", side_effect=form), patch.object(settle, "_send_settle_message"), patch.object(settle, "alert_user") as alert, patch.object(settle, "send_message", return_value=settle.MessageSent(kind="sent")), patch.object(time, "sleep", side_effect=end), self.assertRaises(PassObserved):
+                _ = settle.conduct(LOGIN)
+            self.assertEqual(alert.call_count, pushes)
 
     def test_holdout_alert_groups_form_and_waiting_requester_while_two_sessions_return(self) -> None:
         owners: list[inventory.Session] = [top_level(name, name) for name in ("form", "first", "second", "requester")]
@@ -1934,7 +1961,8 @@ class SettleTests(ShutdownTestCase):
         self.assertIn("choose cancel or stop now", action.text)
         self.assertIn("natedev", action.text)
         self.assertIn("recommended", text)
-        self.assertIn("--only form,requester", text)
+        self.assertIn("--only form.", text)
+        self.assertNotIn("requester", text)
         self.assertLess(len("Action: " + action.text + "\n" + text), 500)
         sender.assert_called_once()
         self.assertIn("/shutdown cancel --only form", cast(str, sender.call_args.args[2]))
@@ -1971,7 +1999,9 @@ class SettleTests(ShutdownTestCase):
                 def end(_seconds: float) -> None:
                     if stopped.is_set():
                         raise PassObserved()
-                with patch.object(settle, "now_utc", return_value=NOW_UTC + timedelta(minutes=5)), patch.object(settle, "run_inventory", return_value=machine_inventory([owner, ready])), patch.object(settle, "SETTLE_INTERVAL_SECONDS", 0.001), patch.object(stop_work, "stop_session", side_effect=stop), patch.object(settle, "alert_user", side_effect=pause if paused == "phone" else None), patch.object(settle, "send_message", side_effect=pause if paused == "requester" else None, return_value=settle.MessageSent(kind="sent")), patch.object(time, "sleep", side_effect=end), self.assertRaises(PassObserved):
+                def form(shown: inventory.Session) -> bool:
+                    return shown["session_id"] == owner["session_id"]
+                with patch.object(settle, "now_utc", return_value=NOW_UTC + timedelta(minutes=5)), patch.object(settle, "run_inventory", return_value=machine_inventory([owner, ready])), patch.object(settle, "SETTLE_INTERVAL_SECONDS", 0.001), patch.object(settle, "_showing_form", side_effect=form), patch.object(stop_work, "stop_session", side_effect=stop), patch.object(settle, "alert_user", side_effect=pause if paused == "phone" else None), patch.object(settle, "send_message", side_effect=pause if paused == "requester" else None, return_value=settle.MessageSent(kind="sent")), patch.object(time, "sleep", side_effect=end), self.assertRaises(PassObserved):
                     _ = settle.conduct(LOGIN)
                 record.archive_session(LOGIN, owner["session_id"])
                 record.archive_session(LOGIN, ready["session_id"])
@@ -2079,7 +2109,7 @@ class SettleTests(ShutdownTestCase):
         saved = session_shutdown(top_level("held", "Held"), requester="requester")
         saved["machine"] = "Mac"
         with patch.object(settle, "local_machine", return_value="Mac"), patch.object(settle, "alert_user") as alert, patch.object(settle, "send_message", return_value=settle.MessageSent(kind="sent")) as sender:
-            settle._send_holdout_alert([(saved, "busy")])  # pyright: ignore[reportPrivateUsage]
+            settle._send_holdout_alert([(saved, "showing a form")])  # pyright: ignore[reportPrivateUsage]
         self.assertEqual(alert.call_args.kwargs, {"machine": "natedev"})
         self.assertIn("session named Held on Mac", cast(str, cast(object, alert.call_args.args[1])))
         self.assertIn("/shutdown cancel --only Held", cast(str, sender.call_args.args[2]))
