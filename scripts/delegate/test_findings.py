@@ -161,6 +161,16 @@ class FindingsLedgerTests(unittest.TestCase):
         for finding_id in covers:
             _ = self.run_command("verdict", "--id", finding_id, "--state", verdict)
 
+    def test_an_older_open_phase_finds_its_ledger_when_it_is_current_again(self) -> None:
+        self.write_progress_state("phase-six", "6")
+        self.assertEqual(self.open_finding("blocker", "six's finding"), "F001")
+        self.write_progress_state("phase-eighteen", "18")
+        self.assertEqual(self.open_finding("minor", "eighteen's finding"), "F001")
+        self.write_progress_state("phase-six", "6")
+
+        findings = cast(list[dict[str, object]], self.status()["findings"])
+        self.assertEqual([finding["title"] for finding in findings], ["six's finding"])
+
     def test_ids_are_stable_across_rounds(self) -> None:
         self.assertEqual(self.open_finding("blocker", "first"), "F001")
         self.assertEqual(self.open_finding("minor", "second"), "F002")

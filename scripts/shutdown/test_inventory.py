@@ -5,22 +5,28 @@ from __future__ import annotations
 import json
 import os
 import socket
+import shutil
 import subprocess
 import sys
 import tempfile
 import unittest
+from datetime import datetime
 from pathlib import Path
 from typing import cast, final, override
 from unittest.mock import patch
 
 from test_support import ShutdownTestCase
-from test_restart import pane_display
+from test_restart import pane_display, top_level
 import inventory
 import account
 import fake_tmux
+import herdr
 import sessions
 import showrunners
 import unit_lookup
+import restart
+import shutdown
+import stop
 from fake_tmux import FakeSession
 
 
@@ -45,6 +51,42 @@ FAKE_TMUX = Path(__file__).parents[1] / "production" / "fake_tmux.py"
 
 @final
 class InventoryTests(ShutdownTestCase):
+    def test_cached_desktop_snapshot_never_invokes_the_snapshot_updater(self) -> None:
+        with (patch.object(shutil, "which", return_value="/fixture/agent-sessions-snapshot"),
+              patch.object(subprocess, "run") as updater):
+            desktops = inventory._snapshot_desktops(refresh=False)  # pyright: ignore[reportPrivateUsage]
+        updater.assert_not_called()
+        self.assertEqual(desktops[DESKTOP_ID], "Writing")
+
+    def test_nested_shutdown_inventory_reads_existing_snapshot_without_updating_notes(self) -> None:
+        with (patch.dict(os.environ, {"REFUSAL_WATCH_INVENTORY": "read existing"}),
+              patch.object(shutil, "which", return_value="/fixture/agent-sessions-snapshot"),
+              patch.object(subprocess, "run") as updater):
+            desktops = inventory._snapshot_desktops()  # pyright: ignore[reportPrivateUsage]
+        updater.assert_not_called()
+        self.assertEqual(desktops[DIRECTOR_ID], "Production")
+
+    def test_refusal_synthetic_model_keeps_the_last_real_reply_model(self) -> None:
+        transcript = self.home / ".claude/projects/model-fixture/refused.jsonl"
+        transcript.parent.mkdir(parents=True)
+        entries = [
+            {"type": "assistant", "message": {"model": "claude-opus-real"}},
+            {"type": "assistant", "isApiErrorMessage": True, "error": "rate_limit",
+             "message": {"model": "<synthetic>", "content": [{"type": "text", "text": "weekly limit"}]}},
+        ]
+        _ = transcript.write_text("\n".join(json.dumps(entry) for entry in entries) + "\n")
+        model = inventory._model("refused")  # pyright: ignore[reportPrivateUsage]
+        self.assertEqual(model, inventory.ModelName(kind="model", name="claude-opus-real"))
+        owner = top_level("refused", model=model)
+        self.assertIn("--model claude-opus-real", restart.resume_command(owner, "claude 3"))
+        self.assertNotIn("<synthetic>", restart.resume_command(owner, "claude 3"))
+
+    def test_only_synthetic_refusal_has_no_real_reply_model(self) -> None:
+        transcript = self.home / ".claude/projects/model-fixture/refused.jsonl"
+        transcript.parent.mkdir(parents=True)
+        _ = transcript.write_text(json.dumps({"type": "assistant", "message": {"model": "<synthetic>"}}) + "\n")
+        self.assertEqual(inventory._model("refused"), inventory.NoReplyYet(kind="no reply yet"))  # pyright: ignore[reportPrivateUsage]
+
     def __init__(self, methodName: str = "runTest") -> None:
         super().__init__(methodName)
         self.root = Path()
@@ -58,6 +100,8 @@ class InventoryTests(ShutdownTestCase):
         self.origin = Path()
         self.bin = Path()
         self.tmux_state = Path()
+        self.proc = Path()
+        self.herdr_log = Path()
         self.target_config = Path()
         self.other_config = Path()
         self.director_pid = 0
@@ -78,6 +122,10 @@ class InventoryTests(ShutdownTestCase):
         self.origin = self.root / "origin.git"
         self.bin = self.root / "bin"
         self.tmux_state = self.root / "tmux.json"
+        self.proc = self.root / "proc"
+        self.herdr_log = self.root / "herdr.jsonl"
+        responses = self.root / "herdr-responses.json"
+        self.herdr_sessions([])
         self.target_config = self.root / "claude-owner"
         self.other_config = self.root / "claude-other"
         for directory in (
@@ -91,6 +139,7 @@ class InventoryTests(ShutdownTestCase):
             self.checkout,
             self.target_config,
             self.other_config,
+            self.proc,
         ):
             directory.mkdir(parents=True)
 
@@ -104,6 +153,10 @@ class InventoryTests(ShutdownTestCase):
             "SHUTDOWN_DELEGATE_ROOT": str(self.delegate),
             "UNIT_LOOKUP_TMUX": str(FAKE_TMUX),
             "FAKE_TMUX_STATE": str(self.tmux_state),
+            "HERDR_BIN": str(Path(__file__).parents[1] / "herdr" / "fake_herdr.py"),
+            "HERDR_PROC": str(self.proc),
+            "FAKE_HERDR_LOG": str(self.herdr_log),
+            "FAKE_HERDR_RESPONSES": str(responses),
             "PATH": str(self.bin) + os.pathsep + os.environ.get("PATH", ""),
         }
         patch_dict_context: object = cast(
@@ -177,6 +230,22 @@ class InventoryTests(ShutdownTestCase):
             json.dumps({"oauthAccount": {"emailAddress": login}}),
             encoding="utf-8",
         )
+
+    def herdr_process(self, pid: int, parent: int, arguments: list[str], environment: dict[str, str]) -> None:
+        process = self.proc / str(pid)
+        process.mkdir()
+        _ = (process / "stat").write_text(f"{pid} (fixture) S {parent} 0 0\n")
+        _ = (process / "cmdline").write_bytes(("\0".join(arguments) + "\0").encode())
+        _ = (process / "environ").write_bytes(
+            ("\0".join(f"{key}={value}" for key, value in environment.items()) + "\0").encode()
+        )
+        (process / "cwd").symlink_to(self.checkout)
+
+    def herdr_sessions(self, names: list[str]) -> None:
+        entries = [herdr.SessionEntry(name=name, running=True, default=False,
+                                    session_dir=str(self.root / name), socket_path="fake-socket") for name in names]
+        response = {"stdout": json.dumps(herdr.SessionListResult(sessions=entries)), "code": 0}
+        _ = (self.root / "herdr-responses.json").write_text(json.dumps({"default": response}))
 
     def git(self, *arguments: str, cwd: Path | None = None) -> str:
         result = subprocess.run(
@@ -498,7 +567,8 @@ elif "comm=" in joined:
                 "unit": "shutdown-unit",
                 "doc": str(self.root / "build-followups-production.md"),
                 "plan": {"kind": "plan", "path": "docs/shutdown-plan.md"},
-                "tmux_session": "unit-renamed",
+                "session_name": "unit-renamed",
+                "session_host": "tmux",
             },
         )
         self.assertEqual(
@@ -549,7 +619,78 @@ elif "comm=" in joined:
         found = inventory.inventory(TARGET_LOGIN)
         unit = next(session for session in found["sessions"] if session["session_id"] == UNIT_ID)
 
-        self.assertEqual(unit["host"].get("tmux_session"), "unit-renamed")
+        self.assertEqual(unit["host"].get("session_name"), "unit-renamed")
+        self.assertEqual(unit["host"].get("session_host"), "tmux")
+        self.assertEqual(shutdown._host_text(unit["host"]), "unit build-followups/shutdown-unit")  # pyright: ignore[reportPrivateUsage]
+
+    def test_empty_herdr_unit_name_does_not_fall_back_to_a_tmux_record(self) -> None:
+        session = inventory.SessionFile(sessionId="unit", tmux="unrelated:0.0")
+        for host in ("tmux", "herdr"):
+            marks = inventory.UnitMarks(production="build", unit="one", doc="/tmp/build.md",
+                                        session_name="", session_host=host)
+            recorded = inventory._host(session, marks, {}, {})  # pyright: ignore[reportPrivateUsage]
+            self.assertEqual(recorded.get("session_name"), "unrelated" if host == "tmux" else "")
+
+    def test_herdr_host_comes_from_the_process_server_ancestor(self) -> None:
+        self.herdr_process(71_001, 1, ["/fixture/herdr", "--session", "writing", "server"], {})
+        self.herdr_process(DESKTOP_PID, 71_001, ["/bin/claude"],
+                           {"HERDR_PANE_ID": "w1:p1", "HERDR_SESSION": "inherited-other-name"})
+        self.assertEqual(herdr.herdr_place_of(DESKTOP_PID), herdr.HerdrPlace("writing", "w1:p1"))
+        found = inventory.inventory(TARGET_LOGIN)
+        desktop = next(session for session in found["sessions"] if session["session_id"] == DESKTOP_ID)
+        self.assertEqual(desktop["host"], {"kind": "herdr", "herdr_session": "writing", "pane_id": "w1:p1"})
+        self.assertEqual(inventory.parse_inventory(json.dumps(found)), found)
+        self.assertEqual(shutdown._host_text(desktop["host"]), "herdr writing")  # pyright: ignore[reportPrivateUsage]
+
+    def test_herdr_unit_records_its_host_and_live_session_name(self) -> None:
+        self.herdr_sessions(["unit-herdr"])
+        fake_tmux.write(self.tmux_state, {})
+        path = self.records / f"{UNIT_PID}.json"
+        record = cast(dict[str, object], json.loads(path.read_text()))
+        record["tmux"] = ""
+        _ = path.write_text(json.dumps(record))
+        self.herdr_process(71_001, 1, ["/fixture/herdr", "--session", "unit-herdr", "server"], {})
+        self.herdr_process(UNIT_PID, 71_001, ["/bin/claude"], {
+            "HERDR_PANE_ID": "w1:p1", "SHOWRUNNER_UNIT": "build-followups",
+            "SHOWRUNNER_UNIT_ID": "shutdown-unit",
+        })
+        found = inventory.inventory(TARGET_LOGIN)
+        unit = next(session for session in found["sessions"] if session["session_id"] == UNIT_ID)
+        self.assertEqual(unit["kind"], "unit")
+        self.assertEqual(unit["host"].get("session_name"), "unit-herdr")
+        self.assertEqual(unit["host"].get("session_host"), "herdr")
+        self.assertEqual(inventory.parse_inventory(json.dumps(found)), found)
+        self.assertEqual(shutdown._host_text(unit["host"]), "unit build-followups/shutdown-unit (herdr unit-herdr)")  # pyright: ignore[reportPrivateUsage]
+        self.assertEqual(unit["host"].get("plan"), {"kind": "plan", "path": "docs/shutdown-plan.md"})
+
+    def test_herdr_host_cleanup_leaves_its_pane_and_server_running(self) -> None:
+        session = cast(inventory.TopLevelSession, next(
+            item for item in inventory.inventory(TARGET_LOGIN)["sessions"] if item["session_id"] == DESKTOP_ID
+        ))
+        session["host"] = inventory.HerdrHost(kind="herdr", herdr_session="writing", pane_id="w1:p1")
+        with patch.object(stop, "_stop_unit_tmux") as tmux_cleanup, patch.object(stop, "_close_ghostty_window"):
+            issues = stop._stop_owner_resources(  # pyright: ignore[reportPrivateUsage]
+                session, kill=lambda _pid, _signal: self.fail("unexpected kill"), is_alive=lambda _pid: False,
+                codex_mesh=lambda _argv: self.fail("unexpected Codex stop"),
+                tmux=lambda _argv: self.fail("unexpected tmux call"), clock=datetime.now,
+                claim=stop.StopClaim(TARGET_LOGIN, DESKTOP_ID, "fixture", "fixture"),
+            )
+        self.assertEqual(issues, [])
+        tmux_cleanup.assert_not_called()
+
+    def test_tmux_host_takes_precedence_over_inherited_herdr_environment(self) -> None:
+        self.herdr_process(71_001, 1, ["/fixture/herdr", "--session", "outer", "server"], {})
+        self.herdr_process(DESKTOP_PID, 71_001, ["/bin/claude"], {"HERDR_PANE_ID": "w1:p1"})
+        with patch("inventory._process_environment", return_value={"TMUX_PANE": "%9"}), patch(
+            "inventory._tmux_session", return_value=(
+                "inner", inventory.TmuxSessionIdNotRecorded(kind="not recorded"),
+                inventory.TmuxServerNotRecorded(kind="not recorded"), inventory.PaneNotRecorded(kind="not recorded"),
+            ),
+        ):
+            found = inventory.inventory(TARGET_LOGIN)
+        desktop = next(session for session in found["sessions"] if session["session_id"] == DESKTOP_ID)
+        self.assertEqual(desktop["host"]["kind"], "tmux")
+        self.assertEqual(desktop["host"].get("tmux_session"), "inner")
 
     def test_tmux_hosts_record_the_pane_or_an_explicit_absence(self) -> None:
         def process_environment(pid: int) -> dict[str, str]:

@@ -9,7 +9,7 @@ from datetime import datetime
 from pathlib import Path
 
 from account import label_for
-from agent_accounts import (ClaudeAccountSelection, CodexHomeSource, Quota, Report,
+from agent_accounts import (ClaudeAccountsInUse, CodexHomeSource, Quota, Report,
                             codex_home_display, codex_homes, codex_report_in_use, live_reports,
                             seats_home as resolve_seats_home)
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
@@ -28,7 +28,7 @@ def quota_line(quota: Quota) -> str:
     return f"  {quota.label}: {remaining}; resets {reset_time(quota.resets_at)}"
 
 
-def render(report: Report, selection: ClaudeAccountSelection, seats_home: Path) -> list[str]:
+def render(report: Report, selection: ClaudeAccountsInUse, seats_home: Path) -> list[str]:
     multiple_codex_homes = report.tool == "Codex" and len(codex_homes(seats_home)) > 1
     codex_seats = multiple_codex_homes and codex_report_in_use(report, seats_home)
     header = report.tool
@@ -46,7 +46,7 @@ def render(report: Report, selection: ClaudeAccountSelection, seats_home: Path) 
         label = label_for(report.tool, email)
         roles: tuple[str, ...] = ()
         if report.tool == "Claude" and selection.multiple_accounts:
-            roles = selection.roles_for_login(email)
+            roles = ("in use",) if selection.is_in_use(email) else ()
         elif codex_seats:
             roles = ("seats",)
         role = f" ({', '.join(roles)})" if roles else ""
@@ -72,10 +72,8 @@ async def main() -> None:
     selection = accounts.claude_account_selection()
     seats_home = resolve_seats_home()
     reports = await live_reports(selection, seats_home)
-    if selection.multiple_accounts:
-        reports = [report for report in reports
-                   if report.tool != "Claude" or report.email is None
-                   or selection.roles_for_login(report.email)]
+    reports = [report for report in reports
+               if report.tool != "Claude" or report.email is None or selection.is_in_use(report.email)]
     print("\n\n".join("\n".join(render(report, selection, seats_home)) for report in reports))
 
 

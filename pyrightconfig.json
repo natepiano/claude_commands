@@ -10,6 +10,16 @@
   ],
   "executionEnvironments": [
     {
+      "root": "scripts/herdr",
+      "extraPaths": [
+        ".",
+        "scripts/herdr",
+        "scripts/message",
+        "scripts/production",
+        "scripts/lib"
+      ]
+    },
+    {
       "root": "scripts/accounts",
       "extraPaths": [
         ".",
@@ -63,6 +73,7 @@
       "extraPaths": [
         ".",
         "scripts/nightly_review",
+        "scripts/herdr",
         "scripts/shutdown",
         "scripts/whoami",
         "scripts/lib"
@@ -76,7 +87,8 @@
         "scripts/delegate",
         "scripts/notify",
         "scripts/shutdown",
-        "scripts/lib"
+        "scripts/lib",
+        "scripts/herdr"
       ]
     },
     {
@@ -144,7 +156,8 @@
         "scripts/notify",
         "scripts/shutdown",
         "scripts/whoami",
-        "scripts/lib"
+        "scripts/lib",
+        "scripts/herdr"
       ]
     },
     {
@@ -168,7 +181,8 @@
         "scripts/notify",
         "scripts/production",
         "scripts/hooks",
-        "scripts/lib"
+        "scripts/lib",
+        "scripts/herdr"
       ]
     },
     {

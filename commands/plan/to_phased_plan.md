@@ -78,6 +78,12 @@ is baked into its checkpoint commit message, which cannot be rewritten. Renumber
 a `done` phase silently severs the doc from `git log`. If an edit genuinely must
 renumber one, add an old→new mapping note to the doc so history stays traceable,
 and say so in `<Report/>`.
+
+**Every todo phase states its dependencies** on the line after its heading:
+`**Depends on:** Phase 2, Phase 4` (the plan phases that must be done before it
+starts), or `**Depends on:** none`. Phase ids only. A `**Blocked by:**` gate
+stays its own line. `phase_table.py parallel` reads these lines; renumbering
+fixes them like any other reference.
 </PhaseNumbering>
 
 ---

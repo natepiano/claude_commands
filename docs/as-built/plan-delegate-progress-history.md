@@ -157,8 +157,11 @@ whether the calibration helped and continue tuning that original estimate.
 was a fresh blind review of a now-larger diff, with no memory of what had already
 been accepted, so it always returned something.
 
-State lives in `findings_state.json` beside the progress state and resets itself
-when the progress state's active `phase.instance_id` changes. Findings get stable
+State lives in `findings_state.json` beside the progress state and holds the
+ledger of the progress state's current `phase.instance_id`. When the current
+phase changes, the ledger it displaces is copied to
+`findings_state-<instance_id>.json` and read back when that phase is current
+again; a phase with no ledger yet starts fresh. Findings get stable
 ids (`F001…`) that survive across rounds, so "the same finding came back" is a
 fact the script can check rather than a judgment the unit director has to make.
 Each finding is `open`, `fixed_pending_review`, or `accepted`.
@@ -220,7 +223,7 @@ findings.py status --session-dir <dir>
 
 ```text
 progress_history.py start-run --session-dir <dir> --working-dir <dir> [--plan-doc <path>]
-progress_history.py start-phase --session-dir <dir> --phase-id <id> --phase-title <title> [--work-order-file <path>]
+progress_history.py start-phase --session-dir <dir> --phase-id <id> --phase-title <title> [--work-order-file <path>] [--started-at <ISO with zone>]
 progress_history.py start-pass ...        # launcher only
 progress_history.py finish-pass ...       # launcher only, or --orphaned-launcher --status canceled
 progress_history.py start-activity --session-dir <dir> --label <label> --activity <text>
@@ -228,12 +231,30 @@ progress_history.py finish-activity --session-dir <dir> [--status completed|erro
 progress_history.py calibrate --session-dir <dir> --candidate-percent <N>
 progress_history.py progress --session-dir <dir> --project-raw-percent <N> --project-percent <N> --phase-raw-percent <N> --phase-percent <N> --cap-stage <stage> --activity <text> [--phase-override-reason <evidence>]
 progress_history.py eta --session-dir <dir> --time <YYYY-MM-DDTHH:MM> [--earliest <YYYY-MM-DDTHH:MM> --latest <YYYY-MM-DDTHH:MM>] --basis <text>
-progress_history.py finish-phase ...
+progress_history.py finish-phase --session-dir <dir> --status completed|stopped|error [--phase-id <id>] [--finished-at <ISO with zone>]
 progress_history.py finish-run ...
+progress_history.py review-trial --session-dir <dir> [--phase-id <id>]
 progress_history.py timeline --session-dir <dir> [--phase <id>]
 progress_history.py phase-count --plan-doc <path> [--phase-percent <N>]
 progress_history.py aggregate [--percent <N>]
 ```
+
+Phases can be open together. State holds the most recently started open phase
+under `phase` (what `progress`, `eta`, `start-pass`, `arm-review` and
+`findings.py` use) and the older open ones under `open_phases`, each carrying
+its own percent, calibration and early-review state under `parked`.
+`start-phase` for an id already open does nothing; for any other id it leaves
+every open phase open. A phase closes only by its own `finish-phase`:
+`--phase-id` names it, and without it the current one closes. Only that phase's
+passes close with it (each pass carries the phase it was opened in, under
+`phase`), and when the current phase closes, the newest older open phase is
+current again. `finish-run` closes every open phase, newest first. A back-fill
+is `start-phase --started-at` then `finish-phase --phase-id <id>
+--finished-at`; both events carry `backfilled: true` and `recorded_at`, neither
+time may be in the future or the finish before the start, and the phase table's
+gap samples skip them. Findings recorded between the two calls go to the
+back-filled phase. A launcher names no phase, so a pass it starts belongs to
+the current phase.
 
 For production plans, `start-phase`, every `progress` report, `finish-phase`,
 and `finish-run` end by asking `phase_table.py refresh` to rewrite the unit's

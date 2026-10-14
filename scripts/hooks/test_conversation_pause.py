@@ -26,6 +26,10 @@ STOP_HOOK = Path(__file__).with_name("stop-conversation-pause.py")
 SETTINGS = LIBRARY.parent.parent.parent / "settings.json"
 SESSION = "session-1"
 NOW = 10_000
+# The hooks' real 5 s budget trips on a loaded machine; tests of the budget
+# itself set it to 1. The wall stays above the budget.
+TEST_HOOK_BUDGET = 60
+TEST_WALL = 90
 QUESTION = (
     "conversation-pause: the user has been quiet here for 15 minutes. Ask them this, "
     "word for word, and nothing else: Return to automatic updates? (yes / no) They "
@@ -262,6 +266,7 @@ print("SENT: delivered")
             "CONVERSATION_PAUSE_SESSIONS": str(self.sessions_stub),
             "CONVERSATION_PAUSE_SEND": str(self.send_stub),
             "CONVERSATION_PAUSE_NOW_EPOCH": str(NOW),
+            "CONVERSATION_PAUSE_HOOK_BUDGET": str(TEST_HOOK_BUDGET),
             "NOTIFIER_LOG": str(self.notifier_log),
             "SESSIONS_LOG": str(self.sessions_log),
             "SEND_LOG": str(self.send_log),
@@ -367,7 +372,7 @@ print("SENT: delivered")
         now: int = NOW,
         extra: dict[str, object] | None = None,
         extra_env: dict[str, str] | None = None,
-        timeout: float = 10,
+        timeout: float = TEST_WALL,
     ) -> subprocess.CompletedProcess[str]:
         payload: dict[str, object] = {"session_id": SESSION, "prompt": prompt}
         if extra is not None:
@@ -394,7 +399,7 @@ print("SENT: delivered")
         now: int = NOW,
         extra: dict[str, object] | None = None,
         extra_env: dict[str, str] | None = None,
-        timeout: float = 10,
+        timeout: float = TEST_WALL,
     ) -> subprocess.CompletedProcess[str]:
         payload: dict[str, object] = {"session_id": SESSION}
         if extra is not None:
@@ -435,7 +440,7 @@ print("SENT: delivered")
             text=True,
             check=False,
             env=environment,
-            timeout=10,
+            timeout=TEST_WALL,
         )
 
     def run_tick_with_prompt_during_send(
@@ -961,7 +966,7 @@ print("SENT: delivered")
             text=True,
             check=False,
             env=self.environment,
-            timeout=10,
+            timeout=TEST_WALL,
         )
         self.assertEqual(result.returncode, 0)
         self.assertEqual(result.stdout, "")
@@ -1054,7 +1059,7 @@ print("SENT: delivered")
                 fcntl.flock(
                     lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB
                 )
-            _, stderr = process.communicate(timeout=10)
+            _, stderr = process.communicate(timeout=TEST_WALL)
         finally:
             if process.poll() is None:
                 process.kill()
@@ -1593,7 +1598,7 @@ print("SENT: delivered")
             self.assertEqual(
                 (typed.returncode, typed.stdout, typed.stderr), (0, "", "")
             )
-            _, stderr = process.communicate(timeout=10)
+            _, stderr = process.communicate(timeout=TEST_WALL)
         finally:
             if process.poll() is None:
                 process.kill()
@@ -2271,7 +2276,7 @@ print("SENT: delivered")
             text=True,
             check=False,
             env=environment,
-            timeout=10,
+            timeout=TEST_WALL,
         )
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(

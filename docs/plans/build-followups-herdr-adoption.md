@@ -33,10 +33,11 @@ Evidence: `docs/as-built/herdr-trial.md` (findings 1–8, gotchas, reusable and 
 ## Delegation Context
 
 - **Project:** `~/.claude` config repo. Worktree `/home/natepiano/worktrees/claude-build-followups-herdr-trial`, branch `build-followups-herdr-trial` (unit `herdr-trial-unit` unless the showrunner assigns another); name both in every dispatch.
+- **Project started:** 2026-10-13T19:45:42.848+00:00
 - **Stack:** Python 3 standard library, checked by basedpyright; zsh scripts; Markdown commands and docs; herdr 0.9.0 (`herdr --help`, `herdr --skill`); tmux; systemd user units.
 - **Layout:** `scripts/herdr/` (new library `herdr.py`, CLI `herdr_sessions.py`, test double `fake_herdr.py`) · `scripts/production/` (unit lookup, launchers, relays, status) · `scripts/message/roster.py` · `scripts/shutdown/` (inventory, stop, record, restart, settle) · `scripts/nightly_review/nightly_review.py` · `commands/showrunner/`, `commands/shutdown.md`, `commands/producer/to_production.md` · `docs/production_format.md` · `docs/as-built/`.
 - **Key files:**
-  - `scripts/herdr/trial.py` — source of the library: `Herdr` class 372 (binary, `--session`, `run`, `result`, `panes`, `lookup`, `read`, `type_text`, `open`, `close`, `agents`), herdr JSON `TypedDict`s 34–110, `launch_unit` 517, `server_answering` 593, `server_start` 597, `server_stop` 617, `worker_readiness` 728, `work` 738, `timeout_milliseconds` 765, `wait_for_agent` 779, `wait` 803, `trusted_by_claude` 832, `repository_trust_key` 843, `trusted_by_codex` 853, `pane_environment` 978, `native_arguments` 990, `start_agent` 1044.
+  - `scripts/herdr/herdr.py` — the library (Phase 1): `Herdr(session)` (`run` raises `HerdrFailure` on a non-zero exit or a 10 s timeout, `agent_blocked` as `AgentBlocked`; `panes`, `lookup`, `open_pane`, `start_agent`, `readiness`, `prompt`, `wait_until`, `read`, `send_keys`, `close_pane`, `agents`), module `live_sessions`, `server_unit`, `start_server`, `stop_session`, `open_pane`, `start_agent`, `herdr_place_of`, `herdr_processes`, `repository_trust_key` (runs git with `GIT_*` stripped), `trusted_by_claude`. `herdr_sessions.py` — `list`, `attach`. The trial driver is deleted; `git show a35b0312:scripts/herdr/trial.py` has it (`trusted_by_codex` 853, `pane_environment` 978, `native_arguments` 990).
   - `scripts/herdr/fake_herdr.py` — records argv to `FAKE_HERDR_LOG` as JSON lines, answers from `FAKE_HERDR_RESPONSES` keyed by space-joined argv (else `"default"`); fields `stdout`, `code`, `stderr`, `write_files`, `require_paths`, `remove_paths`; a list replays in order.
   - `scripts/production/unit_lookup.py` — `MarkedUnit(unit, pane, label, claude)` 59, `tmux_binary` 126, `tmux_sessions` 145, `_marks` 160, `_claudes` 169 (joins a Claude to a pane through the session record's `tmux` field), `_marked_sessions` 191, `every_marked_unit` 207, `marked_units` 225, `mark` 237, CLI `list|pane|mark` 245. Marks are `SHOWRUNNER_UNIT` (production slug) and `SHOWRUNNER_UNIT_ID` (unit).
   - `scripts/message/sessions.py` — `SessionRecord` 17 (`tmux` is empty outside tmux; `pid`, `sessionId`, `name`, `messagingSocketPath`, `updatedAt`), `read_session`, `live_session`.
@@ -76,206 +77,52 @@ Evidence: `docs/as-built/herdr-trial.md` (findings 1–8, gotchas, reusable and 
 
 ## Phases
 
-### Phase 1 — The herdr library and session commands  · status: todo
+### Phase 1 — The herdr library and session commands  · status: done
 
-**User sees:** before — herdr exists only as the torn-down trial's driver; after — still nothing in daily work changes; `herdr_sessions.py list` prints the herdr sessions on the machine (none yet).
+#### As-built
 
-#### Work Order
-
-**Goal:** one tested library runs named herdr sessions (server, agents, prompts, reads, keys, stop) and finds which herdr session and pane any process runs in; the trial driver is gone.
-
-**Spec:**
-
-1. New `scripts/herdr/herdr.py`, extracted from `trial.py` with every trial-only part left out:
-   - `herdr_binary() -> str`: `HERDR_BIN`, else `shutil.which("herdr")`, else raise `HerdrMissing("herdr is not installed")`. No store-path fallback (a garbage-collected path fails late).
-   - `class Herdr(session: str)`: `argv(*args)` is `[binary, "--session", session, *args]`; `run`, `result` and the JSON helpers as in trial.py; a non-zero exit raises `HerdrFailure` with herdr's `error.code` and `error.message` when present. Keep every herdr JSON `TypedDict` the kept calls use (`PaneIdentity`, `PaneListResult`, `AgentOccupant`, `AgentListResult`, `CreatedWorkspace`, `WorkspaceIdentity`, `TabIdentity`, `AgentLifecycle`, `WorkerReadiness`, `AgentGetResult`, `HerdrError`, `HerdrRefusal`) and add `SessionEntry {name, running, default, session_dir, socket_path}` and `SessionListResult {sessions}` for `herdr session list --json`.
-   - Sessions: `live_sessions() -> list[SessionEntry]` (running only); `server_unit(name)` is `herdr-<name>` with every character outside `[A-Za-z0-9_.-]` replaced by `-`; `start_server(name, timeout_ms)` returns at once when `status server` prints the line `status: running`, else runs `systemd-run --user --unit=<server_unit> --collect <herdr> --session <name> server` and polls until running or the deadline (`HerdrFailure: server <name> not answering after N ms`); `stop_session(name)` runs `server stop`, then `systemctl --user stop <server_unit>` when still active. `SYSTEMD_RUN` and `SYSTEMCTL` env variables name the programs (tests point them at the fake).
-   - Agents: `open_pane(name, label, cwd, environment: dict[str, str]) -> str` creates one workspace (`workspace create --label <label> --cwd <cwd> --env K=V ... --no-focus`), renames its root pane to the label, returns the pane id. `start_agent(name, pane, kind, argv, opening_prompt, timeout_ms)`: `agent start <label> --kind <kind> --pane <pane> --timeout <ms> -- <argv>`; on `agent_not_ready` it reads the visible screen and raises `AgentNotReady(screen)` with no key sent; else `agent prompt <pane> <opening_prompt>` once. `readiness(pane) -> WorkerReadiness` (from `worker_readiness`). `prompt(pane, text)` raises `AgentBlocked` on herdr's `agent_blocked` refusal, never retries. `wait_until(pane, state, timeout_ms) -> ObservedAgentState | WaitTimedOut` (from `wait_for_agent`). `read(pane, lines, *, joined, ansi) -> str` is `pane read <pane> --source recent|recent-unwrapped --lines N [--format ansi]`. `send_keys(pane, *keys)`, `agents() -> list[AgentOccupant]`, `close_pane(pane)`.
-   - Places: `herdr_place_of(pid) -> HerdrPlace | NotInHerdr`. It walks the process's ancestors under `HERDR_PROC` (default `/proc`) to the first process whose argv holds `--session <name>` and `server` (no `--session` means session `default`); the pane id is `HERDR_PANE_ID` from the process environment, which herdr sets in every pane (`herdr --skill`). `HerdrPlace(session, pane)` is a frozen dataclass. `herdr_processes() -> list[HerdrProcess]` lists the current user's processes that have `HERDR_PANE_ID`, each with `pid`, `place`, `marks: dict[str, str]` (only `SHOWRUNNER_UNIT`, `SHOWRUNNER_UNIT_ID`), `command` (argv[0] basename) and `cwd`; unreadable or vanished processes are skipped.
-   - Trust (moved here so every launcher shares it): `repository_trust_key(directory)` and `trusted_by_claude(directory, claude_json)` from trial.py; the key rule itself is settled in Phase 3.
-   - Timeouts: every timeout is integer milliseconds, passed as an argument; the library reads no `HERDR_TRIAL_*` variable. This clears the trial gotcha where `HERDR_TRIAL_START_TIMEOUT` meant seconds in one place and milliseconds in another.
-   - Accounts: the library reads no account variable. Callers pass the pane environment. This clears the trial gotcha where `trust-check` and `launch` read different variables.
-2. New `scripts/herdr/herdr_sessions.py`, a CLI over the library: `list` prints one line per running herdr session, `<name>\t<role>\t<claude name>`, where role is `unit <slug>/<unit>`, `showrunner` (a Claude whose name is a registered showrunner's session) or `standalone`, and claude name is the newest live session record whose pid `herdr_place_of` puts in that session (empty when none); `attach <name>` execs `herdr session attach <name>`, and refuses a name that is not running, listing the running ones. Exit 0 done, 1 not found, 2 usage, 3 herdr unreadable.
-3. Delete `scripts/herdr/trial.py`, `scripts/herdr/scaffold_files.py`, `scripts/herdr/test_trial.py`. Keep `fake_herdr.py`; add a `stdout_from_file` response field only if a test needs it.
-4. `docs/as-built/herdr-trial.md`: "How `scripts/herdr/` works" gets one opening line saying the trial driver was removed when `herdr.py` replaced it, and pointing at `docs/plans/build-followups-herdr-adoption.md`.
-5. Live check after the tests pass (not a test): with `HERDR_BIN=/nix/store/pyqm5522kvk30b9vgb1ab976pjnjwn51-herdr-0.9.0/bin/herdr`, start session `herdr-libcheck`, open a pane running `sleep 600`, confirm `herdr_place_of(<sleep pid>)` returns `HerdrPlace("herdr-libcheck", <pane>)`, run `read` with and without `ansi`, then `stop_session` and `herdr session delete herdr-libcheck`. Record in the library's docstring which `HERDR_*` variables herdr 0.9.0 set in the pane.
+- `scripts/herdr/herdr.py` runs named herdr sessions and locates processes in them. `herdr_binary()` is `HERDR_BIN`, else `shutil.which("herdr")`, else `HerdrMissing`. `Herdr(session)` targets one session (`argv` is `[binary, "--session", session, *args]`) with `run`, `result`, `panes`, `lookup`, `pane_id`, `open_pane`, `start_agent`, `readiness`, `prompt`, `wait_until -> ObservedAgentState | WaitTimedOut`, `read(pane, lines, *, joined, ansi)`, `send_keys`, `close_pane`, `agents`. A non-zero exit raises `HerdrFailure` carrying herdr's `error.code`/`error.message`; `AgentBlocked` (from `prompt`, never retried) and `AgentNotReady(screen)` (from `start_agent`, no key sent) subclass it.
+- Session functions: `live_sessions() -> list[SessionEntry]` (running only); `server_unit(name)` is `herdr-<name>` with characters outside `[A-Za-z0-9_.-]` replaced by `-`; `start_server(name, timeout_ms)` returns when `status server` prints `status: running`, else starts `systemd-run --user --unit=<server_unit> --collect <herdr> --session <name> server` and polls to the deadline; `stop_session(name)` runs `server stop`, then `systemctl --user stop <server_unit>` when still active. `SYSTEMD_RUN` and `SYSTEMCTL` name those programs.
+- Module `open_pane(name, label, cwd, environment)` and `start_agent(name, pane, kind, argv, opening_prompt, timeout_ms)` mirror the `Herdr` methods; module `start_agent` uses the pane's label as the agent name.
+- `herdr_place_of(pid) -> HerdrPlace | NotInHerdr` reads `HERDR_PANE_ID` from the process environment and walks ancestors under `HERDR_PROC` (default `/proc`) to the herdr server. `herdr_processes() -> list[HerdrProcess]` lists the user's processes holding `HERDR_PANE_ID`, each with `pid`, `place`, `marks` (`SHOWRUNNER_UNIT`, `SHOWRUNNER_UNIT_ID` only), `command`, `cwd`; unreadable or vanished processes are skipped.
+- Trust lives here for every launcher: `repository_trust_key(directory)` and `trusted_by_claude(directory, claude_json)`.
+- Every timeout is integer milliseconds passed as an argument; the library reads no `HERDR_TRIAL_*` and no account variable — callers pass the pane environment.
+- `scripts/herdr/herdr_sessions.py`: `list` prints `<name>\t<role>\t<claude name>` per running session (role `unit <slug>/<unit>`, `showrunner` or `standalone`; claude name is the newest live session record `herdr_place_of` puts there); `attach <name>` execs `herdr session attach <name>` and refuses a name not running, listing the running ones. Exit 0 done, 1 not found, 2 usage, 3 herdr unreadable.
 
 **Files:**
-- `scripts/herdr/herdr.py` — new library.
-- `scripts/herdr/herdr_sessions.py` — new CLI.
-- `scripts/herdr/test_herdr.py` — new tests.
-- `scripts/herdr/test_herdr_sessions.py` — new tests.
-- `scripts/herdr/fake_herdr.py` — response fields only as needed.
-- `scripts/herdr/trial.py` — deleted.
-- `scripts/herdr/scaffold_files.py` — deleted.
-- `scripts/herdr/test_trial.py` — deleted.
-- `docs/as-built/herdr-trial.md` — one line on the removed driver.
+- `scripts/herdr/herdr.py`, `scripts/herdr/herdr_sessions.py` — library and CLI; `test_herdr.py`, `test_herdr_sessions.py` — their tests; `fake_herdr.py` — the fake herdr.
+- `scripts/herdr/trial.py`, `scaffold_files.py`, `test_trial.py` — deleted.
+- `docs/as-built/herdr-trial.md` — notes the removed trial driver.
+- `pyrightconfig.json` — a `scripts/herdr` execution environment (extra paths `scripts/herdr`, `scripts/message`, `scripts/production`, `scripts/lib`).
 
-**Seats:** 2 writers (no test lane; `test` opens as impl); split by module.
-- `impl` — `herdr.py`, `test_herdr.py`, `fake_herdr.py`, the three deletions; hub: `scripts/herdr/herdr.py` (the other writer imports it).
-- `test` (opens as impl) — `herdr_sessions.py`, `test_herdr_sessions.py`, the `herdr-trial.md` line.
+**Binds later work:** herdr 0.9.0 sets these pane variables: `HERDR_PANE_ID`, `HERDR_SESSION`, `HERDR_SOCKET_PATH`, `HERDR_TAB_ID`, `HERDR_WORKSPACE_ID`, `HERDR_BIN_PATH`, `HERDR_ENV=1`. Callers map `HerdrFailure` to their "herdr unreadable" exit.
 
-**Constraints from prior phases:** none.
+**Gotchas:**
+- The session comes from the ancestor server's argv — a `herdr` argv whose global options (`--session`, `--remote`, `--remote-keybindings`) are followed by exactly `server`; no `--session` means `default`. Never `HERDR_SESSION`: it is inherited. A "server" substring test misfiles herdr clients.
+- `repository_trust_key` strips inherited `GIT_*` variables and runs git with `GIT_CONFIG_GLOBAL=/dev/null`, `GIT_CONFIG_NOSYSTEM=1`.
+- `Herdr.run` turns a subprocess timeout into `HerdrFailure`.
+- `fake_herdr.py` is a Python script whose startup can pass 100 ms under load: tests that bound a herdr call need ≥10 000 ms.
 
-**Acceptance gate:** `python3 -m unittest discover -s scripts/herdr -p 'test_*.py'` green; `basedpyright scripts/herdr` prints `0 errors, 0 warnings`. Tests cover: `start_server` skipping a running server and the deadline failure; `start_agent` never sending a key on `agent_not_ready` and sending exactly one `agent prompt` otherwise; `prompt` raising `AgentBlocked`; `herdr_place_of` on a fake `/proc` tree with and without `--session`; `herdr_processes` skipping an unreadable process; `herdr_sessions.py list` roles and `attach` refusal. No test log line holds `send-text`, `send-keys` or `prompt` unless the test asked for it. The live check in Spec 5 passes.
+**Ruled out:** a store-path fallback in `herdr_binary` — a garbage-collected path fails late.
 
-### Phase 2 — Unit lookup, roster and shutdown inventory see herdr sessions  · status: todo
+### Phase 2 — Unit lookup, roster and shutdown inventory see herdr sessions  · status: done
 
-**User sees:** before — a Claude unit in herdr reads `session: gone` in `production_lifecycle.py load`, `freestanding` in the roster, is missed by `waiting.py quota`, and shows as an unknown host in `/shutdown`; after — all four list herdr-hosted units and sessions correctly, while tmux units read as before.
+#### As-built
 
-#### Work Order
+- `scripts/production/unit_lookup.py`: `TmuxPlace(pane)` and `HerdrPlace` make `Place`; `MarkedUnit` is a frozen dataclass with `place` (`pane` is the tmux pane id, empty for herdr, until every consumer reads `place`). `_claudes()` returns live Claudes by tmux pane and by `HerdrPlace` (records with an empty `tmux` go through `herdr_place_of`). `_herdr_marked` yields marked herdr panes once per place from `herdr_processes()` in running sessions. `every_marked_unit(*, include_tmux=True)` reads both sources and raises `OSError` only when every included source fails; a unit marked in both hosts is a production fault. CLI `pane`/`list` print a tmux unit as the bare pane id (`%41`, unchanged, so `tmux send-keys -t` keeps working) and a herdr unit as `herdr:<session>:<pane>` (`place_text`).
+- `scripts/message/roster.py`: keeps its tmux-binary check and passes it as `include_tmux`, so a machine without tmux never builds one through nix; a socketless director is matched by tmux pane or `herdr_place_of(pid)`; the worktree fallback reuses the read marks (`_ProductionUnitMarks`). `_herdr_codex_panes` lists interactive Codex panes as freestanding rows that cannot receive messages; a herdr failure is a problem line.
+- `scripts/shutdown/inventory.py`: `HerdrHost {kind, herdr_session, pane_id}` joins `Host` and `SessionHost` (from `herdr_place_of(pid)` after `TMUX_PANE`). `UnitHost` has `session_name` (old key `tmux_session` parsed) and `session_host: "tmux" | "herdr"` from the mark's place (absent in old records, read as `"tmux"`; anything else is refused).
+- Stop sends no tmux command and records no tmux issue for a herdr unit or host; restart makes a herdr unit or host a manual resume (prints the command, launches nothing, schedules no prompt); a tmux unit keeps `--tmux-session`. Shutdown text: `herdr <session>`, and `unit <production>/<unit> (herdr <session>)` for a herdr unit.
+- `pyrightconfig.json`: `scripts/herdr` in the production, message and shutdown environments; the copied-script fixtures in `test_unit_status.py` and `test_update_registration.py` copy `scripts/herdr`.
+- The `test_waiting.py` quota case moved to Phase 5 (held by two-accounts Phase 14). Tests need no `HERDR_BIN` override on a machine with real herdr.
 
-**Goal:** every tool that finds units or sessions through `unit_lookup`, the roster or the shutdown inventory finds them in herdr as well as in tmux.
+### Phase 3 — Trust checked before every launch  · status: moved
 
-**Spec:**
+Moved to unit `herdr-trust-unit`, run in parallel with Phase 5; shipped as `docs/as-built/herdr-adoption.md` → "Claude trust before every launch". Phase 6 waits for it.
 
-1. `unit_lookup.py`:
-   - New frozen dataclasses `TmuxPlace(pane: str)` and `HerdrPlace` (imported from `herdr.py`); `Place = TmuxPlace | HerdrPlace`. `MarkedUnit` gains `place: Place`. `pane` stays for this phase as the tmux pane id, `""` for a herdr place (Phase 4 moves every consumer to `place` and removes `pane`). `label` is the tmux session label or the herdr session name.
-   - `_claudes()` returns two maps: by tmux pane (as now) and by `HerdrPlace`, filled through `herdr.herdr_place_of(record["pid"])` for each live record whose `tmux` is empty.
-   - New `_herdr_marked()` yields `(slug, MarkedUnit)` for each herdr pane whose process marks carry both `SHOWRUNNER_UNIT` and `SHOWRUNNER_UNIT_ID` (`herdr.herdr_processes()`; one entry per place, the pane's shell or its Claude). Its Claude is the live record at that place, else `ClaudeUnknown`/`ClaudeNotRunning` as for tmux.
-   - `every_marked_unit()` reads both sources. No tmux binary, or no tmux server, is not an error once herdr answered; it raises `OSError` only when neither source can say. A unit marked in both hosts is a fault like two tmux sessions with one mark (`tmux session X and herdr session Y both carry the mark of U`).
-   - CLI `list` prints the place as `tmux:%41` or `herdr:<session>:<pane>` in column 2; `pane` prints the same form. `mark` stays tmux-only (herdr marks are set at launch).
-2. `scripts/message/roster.py` `_production_places`: drop the `has_tmux` gate (the lookup decides); a socketless director is matched by its tmux pane or by `herdr_place_of(record["pid"]) == place`. New `_herdr_codex_panes(machine)`: for each `herdr.live_sessions()` entry, `Herdr(name).agents()` rows with `agent == "codex"` become `RosterEntry(kind="codex", role="freestanding", name=f"herdr {session}:{pane}", status=agent_status, reach=CannotReceiveMessages("interactive Codex in a herdr pane"), cwd=<process cwd or "">, showrunner=NoShowrunner(), director=NoDirector(), assignment=NotAWorker())`; `_local_roster` appends them. A herdr failure adds a problem line, never fails the roster.
-3. `scripts/shutdown/inventory.py`:
-   - New `HerdrHost(TypedDict)`: `kind: Literal["herdr"]`, `herdr_session: str`, `pane_id: str`. Add it to `Host` and `SessionHost`.
-   - `UnitHost.tmux_session` is renamed `session_name`; `UnitMarks.tmux_session` likewise. The wire parser accepts the old key `tmux_session` for records written before this phase.
-   - `_host`: after the unit branch, `TMUX_PANE` as now; else `herdr.herdr_place_of(pid)` gives a `HerdrHost`; else the window and terminal branches as now.
-   - `_unit_sessions` uses `marked_unit.label` for `session_name` for both hosts.
-4. `scripts/shutdown/record.py` and `scripts/shutdown/shutdown.py`: parse and print `HerdrHost` (`herdr <session>`); `restart.py` and `stop.py` treat a `herdr` host as a manual restart with its printed command until Phase 5 (one `case "herdr"` each).
-5. `scripts/production/waiting.py` is not changed; a test proves `quota` reaches a herdr unit.
-6. `pyrightconfig.json`: add `scripts/herdr` to `extraPaths` of the `scripts/production`, `scripts/message` and `scripts/shutdown` environments. Each importer inserts `scripts/herdr` on `sys.path` as `unit_lookup.py` does for `scripts/message`.
+### Phase 4 — Typing into and reading sessions on either host  · status: moved
 
-**Files:**
-- `scripts/production/unit_lookup.py` — herdr source, `place`, CLI place form.
-- `scripts/production/test_unit_lookup.py` — herdr and mixed-host cases.
-- `scripts/production/test_waiting.py` — quota reaches a herdr unit.
-- `scripts/production/test_live_units.py` — a herdr unit listed.
-- `scripts/message/roster.py` — places through herdr, Codex panes.
-- `scripts/message/test_roster.py` — herdr director placed, Codex pane row, herdr failure is a problem line.
-- `scripts/shutdown/inventory.py` — `HerdrHost`, `session_name`.
-- `scripts/shutdown/record.py` — parse `HerdrHost` and the old key.
-- `scripts/shutdown/shutdown.py` — host text.
-- `scripts/shutdown/restart.py` — `herdr` host is a manual restart for now.
-- `scripts/shutdown/stop.py` — `herdr` host stop leaves the session, as an unknown host does.
-- `scripts/shutdown/test_inventory.py` — herdr host and unit.
-- `scripts/shutdown/test_record.py` — old and new keys.
-- `pyrightconfig.json` — `scripts/herdr` in three environments.
-
-**Seats:** 2 writers (no test lane; `test` opens as impl); split production/message against shutdown.
-- `impl` — `unit_lookup.py`, `roster.py`, `pyrightconfig.json` and their tests (`test_unit_lookup.py`, `test_waiting.py`, `test_live_units.py`, `test_roster.py`); hub: `scripts/production/unit_lookup.py` (`MarkedUnit` and `Place` are what the other writer reads).
-- `test` (opens as impl) — `inventory.py`, `record.py`, `shutdown.py`, `restart.py`, `stop.py`, `test_inventory.py`, `test_record.py`.
-
-**Constraints from prior phases:** `scripts/herdr/herdr.py` gives `Herdr(session)`, `live_sessions()`, `herdr_place_of(pid) -> HerdrPlace | NotInHerdr`, `herdr_processes() -> list[HerdrProcess]` (`pid`, `place`, `marks`, `command`, `cwd`), `HerdrPlace(session, pane)`, `HerdrFailure`, `HerdrMissing`; `HERDR_BIN` and `HERDR_PROC` point tests at `fake_herdr.py` and a fake `/proc`.
-
-**Acceptance gate:** `python3 -m unittest discover -s scripts/production -p 'test_*.py'`, `-s scripts/message`, `-s scripts/shutdown` and `-s scripts/herdr` green; `basedpyright scripts/production scripts/message scripts/shutdown scripts/herdr` prints `0 errors, 0 warnings`. Tests cover a herdr unit found with a live Claude and with none, a tmux-only machine unchanged, no tmux binary with herdr units found, a unit marked in both hosts as a fault, the roster placing a herdr director, `HerdrHost` from a process with a herdr ancestor, and an old record with `tmux_session` parsing.
-
-### Phase 3 — Trust checked before every launch  · status: todo
-
-**User sees:** before — a new unit can open on Claude's folder-trust prompt and sit there until someone notices; after — a launch in an untrusted folder stops at once with one line naming the folder, the account and the command to run, and a trusted folder launches as before.
-
-#### Work Order
-
-**Goal:** `add_unit.py`, `add_showrunner.py`, `promote_showrunner.py` and `nightly_review.py` refuse an untrusted start folder through one shared check, with the rule for which keys count measured first.
-
-**Spec:**
-
-1. **Measure first (read-only).** New `scripts/herdr/trust_survey.py`: for each account file (`~/.claude.json` and `<dir>/.claude.json` for every `~/.claude[0-9]` dir) and each project key it holds, print `<account>\t<key>\t<accepted>\t<kind>`, where kind is `main checkout`, `worktree of <main>`, `plain folder` or `ancestor of <n> repos`. Then for every directory under `~/worktrees` print whether its own key, its `--show-toplevel` key or its main checkout's key is accepted on each account. It writes nothing and prints no other field of the file. Run it once and put the counts in the phase report.
-2. **The rule.** From the survey: a folder is trusted on an account when `projects[k].hasTrustDialogAccepted is True` for k in {the folder, its `--show-toplevel`, its main checkout (parent of `--git-common-dir`)}, the rule `add_showrunner._project_keys` uses today. An ancestor folder never counts (G1 live check 2026-10-13; herdr trial). If the survey finds a worktree that ran unprompted with none of those keys accepted, stop and report to the showrunner before step 3: the rule is then wrong.
-3. `herdr.py` gains `claude_trust(folder, claude_json) -> Trusted | Untrusted(folder, account_file, keys_tried)` with that rule, and `trust_command(folder, account: AccountSelection) -> str`, the one line the user runs: `cd <folder> && <account prefix>claude`, then accept the prompt and type `/exit`. An unreadable file refuses with its path and the error's class name only.
-4. Callers, each reading the account file of the account that will run the session (`<CLAUDE_CONFIG_DIR>/.claude.json` for a named account, `~/.claude.json` for the default):
-   - `add_unit.py` `preflight`: refuse (exit 2) with `<unit>: Claude is not trusted in <folder> on <account label>. Run: <trust_command>`; the folder is the session cwd (`request.session_cwd`), checked after the worktree path is known and before anything is written or launched. A new worktree is checked by its main checkout's key, since the worktree folder does not exist yet.
-   - `add_showrunner.py`: `trusted` and `_project_keys` are removed; `checked` calls `claude_trust` with the default account file (`ADD_SHOWRUNNER_CLAUDE_JSON` still overrides it for tests) and prints the same refusal line.
-   - `promote_showrunner.py`: no change in code (it goes through `add_showrunner.checked`); its test gains an untrusted-worktree case if none exists.
-   - `nightly_review.py`: refuse a launch in an untrusted folder with the same line, on the account it launches with.
-5. Codex trust is not checked: no launcher starts interactive Codex (Call 1).
-6. Correct `docs/plans/build-followups-two-accounts.md:151` to the measured rule (owner two-accounts-unit; the showrunner clears the edit).
-
-**Files:**
-- `scripts/herdr/trust_survey.py` — new read-only survey.
-- `scripts/herdr/herdr.py` — `claude_trust`, `trust_command`.
-- `scripts/herdr/test_herdr.py` — trust rule cases.
-- `scripts/production/add_unit.py` — trust refusal in `preflight`.
-- `scripts/production/test_add_unit.py` — refusal before any write.
-- `scripts/production/add_showrunner.py` — shared check.
-- `scripts/production/test_add_showrunner.py` — refusal text.
-- `scripts/production/test_promote_showrunner.py` — untrusted worktree.
-- `scripts/nightly_review/nightly_review.py` — trust refusal.
-- `scripts/nightly_review/test_nightly_review.py` — refusal case.
-- `pyrightconfig.json` — `scripts/herdr` in the `scripts/nightly_review` environment.
-- `docs/plans/build-followups-two-accounts.md` — line 151.
-- `commands/showrunner/add_unit.md` — the refusal and what the user runs.
-
-**Seats:** 2 writers (no test lane; `test` opens as impl); split library against callers.
-- `impl` — `trust_survey.py`, `herdr.py`, `test_herdr.py`, the two-accounts line; hub: `scripts/herdr/herdr.py`.
-- `test` (opens as impl) — `add_unit.py`, `add_showrunner.py`, `nightly_review.py`, `pyrightconfig.json`, `add_unit.md` and their tests.
-
-**Constraints from prior phases:** `herdr.py` already holds `repository_trust_key` and `trusted_by_claude` (exact main-checkout key only); this phase replaces `trusted_by_claude` with `claude_trust`. `pyrightconfig.json` already lists `scripts/herdr` for production, message and shutdown.
-
-**Acceptance gate:** `python3 -m unittest discover` for `scripts/herdr`, `scripts/production` and `scripts/nightly_review` green; `basedpyright scripts/herdr scripts/production scripts/nightly_review` prints `0 errors, 0 warnings`. Tests cover each of the three keys accepted, an ancestor-only entry refused, an unreadable file refused without its contents, and `add_unit.py` refusing before it writes a stub, a row or a worktree. The survey ran and its counts are in the phase report.
-
-### Phase 4 — Typing into and reading sessions on either host  · status: todo
-
-**User sees:** before — relays, `/compact`, effort changes, stall watch, `/unit:report` and the shutdown screen check work only for tmux sessions; after — they work the same for tmux and herdr sessions, and a relay to a unit blocked at a prompt is refused with a line saying so, not typed into the prompt.
-
-#### Work Order
-
-**Goal:** one host-neutral command types into, sends keys to and reads any unit or session, and every relay, compact, effort, stall, status and settle path uses it.
-
-**Spec:**
-
-1. New `scripts/production/session_pane.py`:
-   - Targets: `unit <slug> <unit>` (through `unit_lookup.marked_units`) or `session <session id>` (the live record's pid: `TMUX_PANE` from its environment, else `herdr.herdr_place_of`).
-   - `read <target> [--lines N] [--joined] [--ansi]`: tmux `capture-pane -p [-J] [-e] -S -N -t <pane>`; herdr `Herdr(session).read(pane, N, joined=..., ansi=...)`. Default 60 lines.
-   - `type <target> <text>`: tmux `send-keys -t <pane> -l <text>` then `send-keys -t <pane> Enter` as two calls; herdr `prompt(pane, text)`. An `AgentBlocked` refusal exits 4 with `<target>: blocked at a prompt; nothing typed`.
-   - `keys <target> <key>...`: tmux `send-keys -t <pane> <keys>`; herdr `send_keys(pane, *keys)`.
-   - `where <target>` prints `tmux:<pane>` or `herdr:<session>:<pane>`.
-   - Exit 0 done, 1 no such target, 2 usage, 3 host unreadable, 4 blocked. Library functions `read_place`, `type_place`, `keys_place` take a `Place` for Python callers.
-2. Python callers move from `.pane` to `place` and these functions:
-   - `unit_effort.py`: capture and `send` through `read_place(..., ansi=True)` and `type_place`; `verdict` unchanged.
-   - `stall_watch.py`: the 400-line joined capture through `read_place(place, 400, joined=True)`; drop `TMUX`.
-   - `promote_showrunner.py`: capture and `/exit` through `session_pane`; the tmux `kill-session` stays for a tmux place, and a herdr place is ended with `herdr.stop_session(label)` after Claude is gone.
-   - `add_unit.py` `wait_for_remote_control`: reads through `read_place`.
-   - `live_units.py` prints the place form.
-   - `scripts/shutdown/settle.py` `_screen`: a `tmux` or `unit` host reads as now; a `herdr` host reads through `read_place(HerdrPlace(...), 60)`; the reason literal `"no tmux host"` becomes `"no pane host"`.
-   - Remove `MarkedUnit.pane` (every consumer now reads `place`).
-3. `unit_status.sh`: per unit, text from `session_pane.py read unit <slug> <unit> --lines 400 --joined` and the Claude session id from `unit_lookup.py list` (column 5); `pane_claude_pid`, `display-message` and the tmux binary lookup go.
-4. Docs, each tmux command line replaced by the `session_pane.py` line:
-   - `commands/showrunner/produce.md`: the relay (`type unit <slug> <unit> "From the user (via the showrunner): <words>"`, and on exit 4 tell the user the unit is at a prompt), `/compact` with its idle check (`read --ansi`: a suggestion after `❯` is dimmed, `\e[2m`, in both hosts), the go-ahead typing, and the hourly pane read.
-   - `commands/showrunner/dailies.md` (`read --ansi` for the dimmed suggestion), `commands/showrunner/promote_unit.md` (stop through `session_pane.py type session <id> /exit`).
-5. Live check (not a test): with `HERDR_BIN` set, a throwaway herdr session `herdr-iocheck` running `claude` in a trusted scratch folder: `read --ansi` shows `\e[2m` before a prompt suggestion; `type` delivers text; while a permission prompt is up, `type` exits 4. Stop and delete the session afterwards.
-
-**Files:**
-- `scripts/production/session_pane.py` — new.
-- `scripts/production/test_session_pane.py` — new.
-- `scripts/production/unit_lookup.py` — remove `pane`.
-- `scripts/production/test_unit_lookup.py` — follow the field removal.
-- `scripts/production/unit_effort.py` — host-neutral reads and typing.
-- `scripts/production/test_unit_effort.py` — herdr unit case.
-- `scripts/production/stall_watch.py` — host-neutral read.
-- `scripts/production/test_stall_watch.py` — herdr unit case.
-- `scripts/production/promote_showrunner.py` — host-neutral stop.
-- `scripts/production/test_promote_showrunner.py` — herdr unit case.
-- `scripts/production/add_unit.py` — `wait_for_remote_control` read.
-- `scripts/production/test_add_unit.py` — follow the read change.
-- `scripts/production/live_units.py` — place form.
-- `scripts/production/test_live_units.py` — place form.
-- `scripts/production/unit_status.sh` — reads through `session_pane.py`.
-- `scripts/production/test_unit_status.py` — herdr unit case.
-- `scripts/production/adopt.py` — read `place` (tmux only).
-- `scripts/production/tmux_names.py` — follow the field removal (tmux only).
-- `scripts/shutdown/settle.py` — herdr screen read.
-- `scripts/shutdown/test_settle.py` — herdr screen case.
-- `commands/showrunner/produce.md` — relay, compact, go-ahead, pane reads.
-- `commands/showrunner/dailies.md` — dimmed suggestion read.
-- `commands/showrunner/promote_unit.md` — stop step.
-
-**Seats:** 2 writers (no test lane; `test` opens as impl); split the new command and its Python callers against status, settle and docs.
-- `impl` — `session_pane.py`, `unit_lookup.py`, `unit_effort.py`, `stall_watch.py`, `promote_showrunner.py`, `add_unit.py`, `live_units.py`, `adopt.py`, `tmux_names.py` and their tests; hub: `scripts/production/session_pane.py`.
-- `test` (opens as impl) — `unit_status.sh`, `test_unit_status.py`, `settle.py`, `test_settle.py`, `produce.md`, `dailies.md`, `promote_unit.md`.
-
-**Constraints from prior phases:** `MarkedUnit.place: TmuxPlace | HerdrPlace` exists and `pane` is `""` for herdr; `unit_lookup.py list|pane` print `tmux:<pane>` or `herdr:<session>:<pane>`; `HerdrHost {kind, herdr_session, pane_id}` exists in `inventory.py`; `herdr.py` gives `read(pane, lines, joined=, ansi=)`, `prompt` (raises `AgentBlocked`), `send_keys`, `herdr_place_of`, `stop_session`.
-
-**Acceptance gate:** `python3 -m unittest discover` for `scripts/production`, `scripts/shutdown` and `scripts/herdr` green; `basedpyright scripts/production scripts/shutdown scripts/herdr` prints `0 errors, 0 warnings`. Tests cover each verb on each host through the two fakes, exit 4 on `agent_blocked` with nothing else sent, and `unit_status.sh` output for one tmux and one herdr unit. `grep -n "tmux send-keys\|capture-pane" commands/showrunner/*.md` prints nothing. The live check in Spec 5 passes.
+Moved to `docs/plans/build-followups-herdr-panes.md` (unit `herdr-panes-unit`), run in parallel with Phase 5. Phase 6 waits for it.
 
 ### Phase 5 — Shutdown and restart for herdr sessions  · status: todo
 
@@ -294,6 +141,7 @@ Evidence: `docs/as-built/herdr-trial.md` (findings 1–8, gotchas, reusable and 
    - `case "herdr"` in the host dispatch calls it; the Phase 2 manual-restart stand-in is removed.
 3. `settle.py` issue text and `shutdown.py` host text cover the herdr forms. `commands/shutdown.md` line 33 names herdr sessions beside tmux sessions.
 4. Live check (not a test): a throwaway Claude in herdr session `herdr-stopcheck` in a trusted scratch folder; `shutdown.py down <account> --here --only herdr-stopcheck --restart`; it stops, comes back in `herdr-stopcheck` and answers a question about its earlier turn. Then stop the herdr server by hand (`herdr --session herdr-stopcheck server stop`), and confirm `claude --resume <id>` in a new herdr session restores the conversation without herdr's Claude integration. Stop and delete the session.
+5. Carried from Phase 2, once the showrunner says two-accounts Phase 14 landed (merge `origin/build-followups` first): `scripts/production/test_waiting.py` proves `waiting.py quota` reaches a herdr unit; `waiting.py` itself is not changed.
 
 **Decided by the showrunner, 2026-10-13: no herdr Claude integration.** Resume by session id works, and the install would write `~/.claude` settings and hooks. The record below keeps the reasoning.
 
@@ -312,6 +160,7 @@ Recommendation:
 Do not install the integration. Our own records already resume every session, and the install changes hooks and settings for every session on the machine.
 
 **Files:**
+- `scripts/production/test_waiting.py` — quota reaches a herdr unit (carried from Phase 2).
 - `scripts/shutdown/stop.py` — herdr unit stop.
 - `scripts/shutdown/record.py` — generalized issue kind, old form parsed.
 - `scripts/shutdown/restart.py` — `_herdr_launch`, `--host-session`.
@@ -330,7 +179,7 @@ Do not install the integration. Our own records already resume every session, an
 - `impl` — `restart.py`, `add_unit.py` and their tests, `shutdown-and-restart.md`; hub: `scripts/shutdown/restart.py`.
 - `test` (opens as impl) — `stop.py`, `record.py`, `settle.py`, `shutdown.py`, `commands/shutdown.md` and their tests.
 
-**Constraints from prior phases:** `HerdrHost {kind: "herdr", herdr_session, pane_id}`; `UnitHost.session_name` (old key `tmux_session` still parsed); `herdr.py` `start_server`, `open_pane`, `start_agent`, `stop_session`, `AgentNotReady`; `session_pane.py` reads and types on either host; `settle._screen` reads herdr hosts.
+**Constraints from prior phases:** `HerdrHost {kind: "herdr", herdr_session, pane_id}`; `UnitHost.session_name` (old key `tmux_session` still parsed) and `UnitHost.session_host: "tmux" | "herdr"` (absent in old records, read as `"tmux"`) — branch on `session_host`, never on the name; today a herdr unit's stop sends no tmux command and records no tmux issue, and its restart is a manual resume, both of which this phase replaces. `session_pane.py` and the `settle._screen` herdr read come from herdr-panes-unit (`docs/plans/build-followups-herdr-panes.md`), which lands before this phase's checkpoint: merge `origin/build-followups` before relying on them. `herdr.py` `start_server`, `open_pane`, `start_agent`, `stop_session`, `AgentNotReady`; `session_pane.py` reads and types on either host; `settle._screen` reads herdr hosts.
 
 **Acceptance gate:** `python3 -m unittest discover` for `scripts/shutdown`, `scripts/production` and `scripts/herdr` green; `basedpyright scripts/shutdown scripts/production scripts/herdr` prints `0 errors, 0 warnings`. Tests cover a herdr unit stopped and its session stopped, a herdr session left running reported, restart into a gone pane and refusal on an occupied one, and old shutdown records parsing. The live check in Spec 4 passes.
 

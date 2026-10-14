@@ -912,6 +912,22 @@ class DailiesInputTests(unittest.TestCase):
                 self.assertIn(f"flags first: {ALPHA}: {marker}", built.stdout)
                 self.assertEqual(cast(dict[str, object], self.unit()["eta"])["time"], "17:40")
 
+    def test_phases_that_could_start_are_printed_for_the_showrunner(self) -> None:
+        self.open_phase_record()
+        payload = cast(dict[str, dict[str, object]], json.loads(self.phase_table_json.read_text()))
+        payload[ALPHA]["parallel"] = {"could_start": ["3", "4"], "line": "Parallel: Phase 3, Phase 4 could start"}
+        _ = self.phase_table_json.write_text(json.dumps(payload), encoding="utf-8")
+        built = self.run_builder()
+        self.assertEqual(built.returncode, 0, built.stdout + built.stderr)
+        self.assertIn(f"parallel check: {ALPHA}: Phase 3 could start\n"
+                      + f"parallel check: {ALPHA}: Phase 4 could start", built.stdout)
+
+        payload[ALPHA]["parallel"] = {"could_start": [], "line": "Parallel: none — no phase is waiting"}
+        _ = self.phase_table_json.write_text(json.dumps(payload), encoding="utf-8")
+        quiet = self.run_builder()
+        self.assertEqual(quiet.returncode, 0, quiet.stdout + quiet.stderr)
+        self.assertNotIn("parallel check:", quiet.stdout)
+
     def test_phase_table_failures_continue_from_the_status_capture(self) -> None:
         self.env["DAILIES_PHASE_TABLE_FAIL"] = "show"
         built = self.run_builder()

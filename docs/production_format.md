@@ -212,13 +212,18 @@ A run that stopped, failed, or waits on a decision has no finish in its record, 
    ```
    From <unit>: phase <N> checkpoint <hash> — <title>. Shots: <paths | none, no visible change>. Phase <next> ETA: <HH:MM zone>
    review trial: ux <N> findings, code <N> findings, review-seat minutes <M>, ux check minutes <U>, ux repair minutes <R>
+   Parallel: <Phase N, Phase M could start | none — <what the next phase waits on>>
    design check: <pass | N defects, each moved to <phase>> — fresh check on exactly these shots, built from <hash>
    ```
 
    A phase checkpoint's notice carries the second line:
    `progress_history.py review-trial`'s output, verbatim
    (`/unit:checkpoint` step 9). `Phase <next> ETA` counts from the code
-   checkpoint commit.
+   checkpoint commit. The `Parallel:` line is
+   `phase_table.py parallel --session-dir <SESSION_DIR>`'s output, verbatim.
+   `merge_checkpoint.py` refuses `Parallel: unknown`: add the plan's missing
+   `**Depends on:**` lines (`/plan:to_phased_plan` → <PhaseNumbering/>) and
+   rerun.
 
    The shrink notice has this form:
 
@@ -254,8 +259,11 @@ A run that stopped, failed, or waits on a decision has no finish in its record, 
    a fresh verdict, and 3 holds were caught after the unit had moved on, 187
    minutes in 2.6 days; with a fresh pass the merge followed in 1–2 minutes.
 
-   Under <PhaseEnd/> step 6, start each next phase that can run under berth,
-   with its own checkpoint (`/showrunner:produce` → Rules, parallel by default).
+   At plan start and at each <PhaseEnd/>, map which phases depend on which.
+   Run each independent phase beside the current one under berth, with its own
+   checkpoint (`/showrunner:produce` → Rules, parallel by default). A phase
+   better run as its own unit goes to the showrunner as a proposed split
+   (phases, files, shared files, merge order), never to the user.
 4. **The merge branch is the showrunner's.** Never merge into it or push it.
    Push only your own branch; <PushCheckpoint/> does it at each checkpoint.
    <PeriodicCI/> and <CICleanup/> do not run in a unit; the showrunner runs CI

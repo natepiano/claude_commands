@@ -117,30 +117,21 @@ class CheckedNamedClaudeAccount:
 
 
 @dataclass(frozen=True)
-class ClaudeAccountSelection:
-    """One run's role identities and fit named directories, fixed across role changes."""
+class ClaudeAccountsInUse:
+    """One run's readable accounts and local sessions' logins."""
 
     default_account: KnownClaudeAccount | UnreadableClaudeAccount
-    unit_account: KnownClaudeAccount | UnreadableClaudeAccount
     multiple_accounts: bool
     named_accounts: tuple[CheckedNamedClaudeAccount, ...]
+    live_logins: frozenset[str]
+    live_directories: tuple[Path, ...] = ()
 
     def is_default_login(self, login: str) -> bool:
-        return (
-            isinstance(self.default_account, KnownClaudeAccount)
-            and login.casefold() == self.default_account.login.casefold()
-        )
+        return (isinstance(self.default_account, KnownClaudeAccount)
+                and login.casefold() == self.default_account.login.casefold())
 
-    def roles_for_login(self, login: str) -> tuple[ClaudeRole, ...]:
-        roles: list[ClaudeRole] = []
-        if self.is_default_login(login):
-            roles.append("showrunners")
-        if (
-            isinstance(self.unit_account, KnownClaudeAccount)
-            and login.casefold() == self.unit_account.login.casefold()
-        ):
-            roles.append("unit directors")
-        return tuple(roles)
+    def is_in_use(self, login: str) -> bool:
+        return self.is_default_login(login) or login.casefold() in self.live_logins
 
 
 WEEK_MINUTES = 7 * 24 * 60
@@ -259,6 +250,8 @@ class ClaudeAuthStatus(TypedDict, total=False):
 
 class ClaudeOauth(TypedDict, total=False):
     accessToken: str
+    # Epoch milliseconds.
+    expiresAt: int
 
 
 class ClaudeCredentials(TypedDict, total=False):
@@ -565,9 +558,16 @@ def claude_live(config_dir: Path | None = None) -> Report:
         report.quota_problem = "Weekly quota: unavailable for this authentication method"
         return report
     try:
-        token = ((os.environ.get("CLAUDE_CODE_OAUTH_TOKEN") if config_dir is None else None)
-                 or (claude_credentials() if config_dir is None else claude_credentials(config_dir))
-                 .get("claudeAiOauth", {}).get("accessToken"))
+        token = os.environ.get("CLAUDE_CODE_OAUTH_TOKEN") if config_dir is None else None
+        if not token:
+            oauth = (claude_credentials() if config_dir is None else claude_credentials(config_dir)).get("claudeAiOauth", {})
+            token = oauth.get("accessToken")
+            expires = oauth.get("expiresAt")
+            # Only a Claude session refreshes a stored token, so an idle account's goes stale.
+            # The service answers a stale one with 429 or 401; asking with it only adds refused calls.
+            if token and isinstance(expires, int) and expires / 1000 <= time.time():
+                report.quota_problem = "Weekly quota: not read (stale token; a Claude session on this account refreshes it)"
+                return report
         if not token:
             raise RuntimeError("usage credentials unavailable")
         request = urllib.request.Request(
@@ -899,14 +899,13 @@ def reset_credits(report: Report, summary: object) -> None:
     report.limit_reset_expirations.sort()
 
 
-async def live_reports(selection: ClaudeAccountSelection, seats_home: Path) -> list[Report]:
+async def live_reports(selection: ClaudeAccountsInUse, seats_home: Path) -> list[Report]:
     """Live Claude directories and every Codex home, fetched concurrently."""
     homes = codex_homes(seats_home)
-    if not selection.multiple_accounts:
-        return list(await asyncio.gather(
-            asyncio.to_thread(claude_live), *(codex_live(home) for home in homes),
-        ))
-    directories = [Path.home() / ".claude", *(named.directory for named in selection.named_accounts)]
+    directories = list(dict.fromkeys([
+        Path.home() / ".claude", *(named.directory for named in selection.named_accounts),
+        *selection.live_directories,
+    ]))
     return list(await asyncio.gather(
         *(asyncio.to_thread(claude_live, directory) for directory in directories),
         *(codex_live(home) for home in homes),

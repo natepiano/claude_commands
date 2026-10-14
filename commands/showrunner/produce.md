@@ -546,6 +546,7 @@ notice to the unit director before any merge command runs:
    `$HOME/.claude/scripts/lib/py $HOME/.claude/scripts/production/merge_checkpoint.py --production
    <PRODUCTION_DOC> <unit> <phase> <hash> --started <ISO>
    --review-trial "<the complete review trial: line>"
+   --parallel "<the notice's Parallel: line>"
    --delivers "<one line of what the phase delivers>"`.
    Add one `--also <path>` per approved outside path, one `--trailer <line>`
    per attribution line this session requires, `--regime trial` if the broad
@@ -558,7 +559,7 @@ notice to the unit director before any merge command runs:
    <SCRATCH>` to keep its merge message and test log there. For a phase shrink
    notice, add `--shrink`; for a unit's closing as-built commit (its as-built
    docs and the plan's deletion, after its last phase merged), add
-   `--as-built`; with either, omit `--review-trial` and `--delivers`. Add
+   `--as-built`; with either, omit `--review-trial`, `--parallel` and `--delivers`. Add
    `--cancel-prior` only with `Push: validate_and_push` when this push supersedes
    an older queued or running CI run on the merge branch and no CI point is
    watching its result or diagnosing a red run. The script checks ancestry,
@@ -1143,6 +1144,12 @@ that condition.
 - **Parallel by default.** Plan for parallelism; the user never has to find it.
   Every phase that can run safely runs now. At each ETA, notice or new item, ask
   which waiting work could start, and start it unasked:
+  - When a plan is approved, and when a unit starts one, map which phases
+    depend on which and start every independent phase now: beside the current
+    phase in the same unit, or as its own unit (`/showrunner:add_unit`) when
+    its files can be fenced. Packaging is yours, never the user's. User,
+    2026-10-13. Each dailies build prints `parallel check: <unit>: Phase N
+    could start` for these; start them.
   - A unit's later phase runs beside its current one, with its own seats, berth
     reservation and checkpoint. A checkpoint commits only its own phase's paths.
     Where files overlap, it claims after the earlier phase and builds on its tree.

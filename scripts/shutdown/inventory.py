@@ -15,10 +15,11 @@ from pathlib import Path
 from typing import Literal, NotRequired, TypedDict, cast
 
 SCRIPTS = Path(__file__).resolve().parents[1]
-for dependency in ("whoami", "message", "production"):
+for dependency in ("whoami", "message", "production", "herdr"):
     sys.path.insert(0, str(SCRIPTS / dependency))
 
 import account
+import herdr
 import sessions
 from sessions import process_start as _process_start
 import showrunners
@@ -43,7 +44,8 @@ class UnitHost(TypedDict):
     production: str
     unit: str
     doc: str
-    tmux_session: str
+    session_name: str
+    session_host: Literal["tmux", "herdr"]
     plan: UnitPlan
 
 
@@ -84,6 +86,12 @@ class TmuxHost(TypedDict):
     pane: TmuxPane | PaneNotRecorded
 
 
+class HerdrHost(TypedDict):
+    kind: Literal["herdr"]
+    herdr_session: str
+    pane_id: str
+
+
 class NamedDesktop(TypedDict):
     kind: Literal["named"]
     name: str
@@ -110,8 +118,8 @@ class UnknownHost(TypedDict):
     kind: Literal["unknown"]
 
 
-Host = UnitHost | TmuxHost | WindowHost | TerminalHost | UnknownHost
-SessionHost = TmuxHost | WindowHost | TerminalHost | UnknownHost
+Host = UnitHost | TmuxHost | HerdrHost | WindowHost | TerminalHost | UnknownHost
+SessionHost = TmuxHost | HerdrHost | WindowHost | TerminalHost | UnknownHost
 
 
 class OnBranch(TypedDict):
@@ -275,7 +283,8 @@ class UnitMarks:
     production: str
     unit: str
     doc: str
-    tmux_session: str
+    session_name: str
+    session_host: Literal["tmux", "herdr"]
 
 
 DESKTOP_HEADING = re.compile(r"^##\s+desktop:\s*(.+?)\s*$")
@@ -415,6 +424,10 @@ def _parse_host(value: object, place: str, allow_unit: bool) -> Host:
     data = _wire_object(value, place)
     kind = _wire_kind(data, place)
     if kind == "unit" and allow_unit:
+        name_key = "tmux_session" if "tmux_session" in data and "session_name" not in data else "session_name"
+        session_host = data.get("session_host", "tmux")
+        if session_host not in ("tmux", "herdr"):
+            raise InvalidInventory(f"{place}.session_host is invalid")
         return {
             "kind": "unit",
             "production": _wire_string(
@@ -424,12 +437,23 @@ def _parse_host(value: object, place: str, allow_unit: bool) -> Host:
                 _wire_required(data, "unit", place), f"{place}.unit"
             ),
             "doc": _wire_string(_wire_required(data, "doc", place), f"{place}.doc"),
-            "tmux_session": _wire_string(
-                _wire_required(data, "tmux_session", place),
-                f"{place}.tmux_session",
+            "session_name": _wire_string(
+                _wire_required(data, name_key, place),
+                f"{place}.{name_key}",
             ),
+            "session_host": session_host,
             "plan": _parse_unit_plan(
                 _wire_required(data, "plan", place), f"{place}.plan"
+            ),
+        }
+    if kind == "herdr":
+        return {
+            "kind": "herdr",
+            "herdr_session": _wire_string(
+                _wire_required(data, "herdr_session", place), f"{place}.herdr_session"
+            ),
+            "pane_id": _wire_string(
+                _wire_required(data, "pane_id", place), f"{place}.pane_id"
             ),
         }
     if kind == "tmux":
@@ -841,7 +865,8 @@ def _unit_sessions(runners: list[showrunners.Showrunner]) -> dict[str, UnitMarks
                 production=slug,
                 unit=unit_id,
                 doc=docs[slug],
-                tmux_session=marked_unit.label,
+                session_name=marked_unit.label,
+                session_host="tmux" if isinstance(marked_unit.place, unit_lookup.TmuxPlace) else "herdr",
             )
     return found
 
@@ -1054,10 +1079,11 @@ def _terminal_host(pid: int, desktop: Desktop) -> SessionHost:
     return {"kind": "unknown"}
 
 
-def _snapshot_desktops() -> dict[str, str]:
+def _snapshot_desktops(*, refresh: bool = True) -> dict[str, str]:
     if sys.platform == "darwin":
         return {}
-    snapshotter = shutil.which("agent-sessions-snapshot")
+    snapshotter = (shutil.which("agent-sessions-snapshot")
+                   if refresh and os.environ.get("REFUSAL_WATCH_INVENTORY") != "read existing" else None)
     if snapshotter is not None:
         try:
             _ = subprocess.run(
@@ -1111,10 +1137,11 @@ def _host(
             "production": unit.production,
             "unit": unit.unit,
             "doc": unit.doc,
-            "tmux_session": (
-                unit.tmux_session
-                or _string(session.get("tmux")).partition(":")[0]
+            "session_name": (
+                unit.session_name
+                or (_string(session.get("tmux")).partition(":")[0] if unit.session_host == "tmux" else "")
             ),
+            "session_host": unit.session_host,
             "plan": (
                 {"kind": "plan", "path": plan}
                 if plan is not None
@@ -1137,6 +1164,9 @@ def _host(
             if tmux_session
             else {"kind": "unknown"}
         )
+    place = herdr.herdr_place_of(session.get("pid", 0))
+    if isinstance(place, herdr.HerdrPlace):
+        return {"kind": "herdr", "herdr_session": place.session, "pane_id": place.pane}
     desktop_name = desktops.get(session_id)
     desktop: Desktop = (
         {"kind": "named", "name": desktop_name}
@@ -1219,7 +1249,7 @@ def _model(session_id: str) -> LastModel:
         if entry.get("type") != "assistant" or not isinstance(entry.get("message"), dict):
             continue
         candidate = cast(dict[str, object], entry["message"]).get("model")
-        if isinstance(candidate, str):
+        if isinstance(candidate, str) and candidate != "<synthetic>":
             model = candidate
     return (
         {"kind": "model", "name": model}
@@ -1268,6 +1298,7 @@ def _machine() -> str:
 def inventory(
     login: str,
     only: frozenset[str] = frozenset(),  # pyright: ignore[reportCallInDefaultInitializer]
+    *, refresh_desktops: bool = True,
 ) -> Inventory:
     """Return the live sessions safely attributable to ``login`` on this machine."""
     records = [_session_file(record) for record in sessions.live_sessions()]
@@ -1282,7 +1313,7 @@ def inventory(
     productions, runners = _registered_productions()
     units = _unit_sessions(runners)
     plans = _newest_unit_plans()
-    desktops = _snapshot_desktops()
+    desktops = _snapshot_desktops() if refresh_desktops else _snapshot_desktops(refresh=False)
     wanted_login = login.casefold()
     found: list[Session] = []
     unattributed: list[UnattributedSession] = []

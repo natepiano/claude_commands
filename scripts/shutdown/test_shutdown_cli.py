@@ -54,7 +54,8 @@ def unit_session(session_id: str) -> inventory.UnitSession:
             production="demo",
             unit="alpha-unit",
             doc="/tmp/production.md",
-            tmux_session="alpha",
+            session_name="alpha",
+            session_host="tmux",
             plan=inventory.PlanFromRunRecord(kind="plan", path="/tmp/alpha.md"),
         ),
     )
