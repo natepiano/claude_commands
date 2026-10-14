@@ -20,8 +20,8 @@ import account
 
 
 STATUS_LINE = Path(__file__).parents[1] / "statusline" / "statusline.jq"
-EXAMPLE_FIRST_LINE = "natedev | claude_commands | 182,340 | Opus 5.5 high"
-ACCOUNT_FIRST_LINE = "natedev | claude2 | claude_commands | 182,340 | Opus 5.5 high"
+EXAMPLE_FIRST_LINE = "unassigned | claude_commands | 182,340 | Opus 5.5 high"
+ACCOUNT_FIRST_LINE = "unassigned | claude2 | claude_commands | 182,340 | Opus 5.5 high"
 
 
 class AccountTests(unittest.TestCase):
@@ -442,7 +442,6 @@ class AccountTests(unittest.TestCase):
         self,
         document: object,
         label: str | None = None,
-        home: str = "/home/someone",
     ) -> str:
         arguments = [
             "jq",
@@ -458,7 +457,7 @@ class AccountTests(unittest.TestCase):
             arguments,
             capture_output=True,
             check=True,
-            env=dict(os.environ) | {"HOME": home},
+            env={"PATH": os.environ["PATH"]},
             input=json.dumps(document),
             text=True,
         )
@@ -515,18 +514,6 @@ class AccountTests(unittest.TestCase):
             self.render_status_line(self.status_line_input(), "claude 2"),
             ACCOUNT_FIRST_LINE + "\n",
         )
-
-    def test_status_line_names_the_machine_by_home_directory(self) -> None:
-        cases = (
-            ("/home/someone", "natedev"),
-            ("/Users/someone", "mac"),
-        )
-        for home, machine in cases:
-            with self.subTest(home=home):
-                self.assertEqual(
-                    self.render_status_line(self.status_line_input(), home=home),
-                    f"{machine} | claude_commands | 182,340 | Opus 5.5 high\n",
-                )
 
     def test_status_line_prints_windows_without_an_account_argument(self) -> None:
         document = self.status_line_input() | {
