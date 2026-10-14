@@ -18,7 +18,7 @@ Agents' test builds linked far more than the tests they ran, and the daily build
 | `scripts/lint/sweep.py` | `directory_blocks(directory, seen=None)`, `config_values`, `floor_bytes`, shared with the lint sweep. |
 | `scripts/buildlog/test_index.py` | `use_test_log`, `point_root_at`, `LogIsolationTests`, and the record builders other tests import. |
 | `scripts/buildlog/test_report.py`, `test_disk.py`, `scripts/lint/test_sweep.py` | Report sections; the walk on fake trees; a hard link across two `directory_blocks` calls sharing `seen`. |
-| `commands/unit/direct.md` | The seats' command table; its `--filter` row reads `--filter <name> [--filter <name> …]`. |
+| `commands/unit/direct.md` | The workers' command table; its `--filter` row reads `--filter <name> [--filter <name> …]`. |
 | `pyrightconfig.json` | `scripts/lint` on the `scripts/buildlog` environment's `extraPaths`, for `import sweep`. |
 | `/etc/nixos`, `nate.jobs.buildlog-disk` | The 10-minute timer that runs `buildlog disk` on natedev. Not in this repo. |
 
@@ -27,7 +27,7 @@ Agents' test builds linked far more than the tests they ran, and the daily build
 `report(connection, day)` emits, in order. Every step-based number counts natedev's steps only (`host = 'natedev'`, `mac_outcome.natedev_step_predicate`); the Mac's steps appear only in `### Mac`.
 
 1. `## Builds, <Weekday YYYY-MM-DD>`
-2. `### Waiting` (build-folder turns behind another seat and behind its own call, memory admission, CI queue; see `docs/as-built/build-memory-admission.md`)
+2. `### Waiting` (build-folder turns behind another worker and behind its own call, memory admission, CI queue; see `docs/as-built/build-memory-admission.md`)
 3. `### Rebuilds`, always present: compile and other time by rebuild bin (none, edited crate, cascade, cold), nextest's compile against test time, and edited-crate nextest rebuilds by package (Rebuilds section below)
 4. `### <kind>` for each kind seen that day (`KIND_ORDER` first), one row per caller by run count, the scratch row among them
 5. `### Memory pressure`, always present: memory waits, the sccache, unsliced-step and memory-kill lines, the stall table and the sample line (`docs/as-built/buildlog-memory-stalls.md`, `docs/as-built/build-memory-admission.md`)

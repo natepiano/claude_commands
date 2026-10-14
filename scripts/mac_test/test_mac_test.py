@@ -709,17 +709,17 @@ class MacTestCommandTests(unittest.TestCase):
         self.assertIn(f"MAC_TEST_STATE_DIR={self.state_directory}", arguments)
         self.assertIn(f"MAC_TEST_CONFIG={self.config_path}", arguments)
 
-    def test_claim_records_seat_owning_session_and_omits_unknown_holder(self) -> None:
+    def test_claim_records_worker_owning_session_and_omits_unknown_holder(self) -> None:
         owner = self.start_child()
         active = self.root / "active"
         active.mkdir()
         board = str(self.root / "delegate")
-        _ = (active / "seat-owner").write_text(board)
+        _ = (active / "worker-owner").write_text(board)
         environment = {**self.environment, "CLAUDE_CODE_SESSION_ID": "",
                        "PLAN_DELEGATE_BOARD_DIR": board, "PLAN_DELEGATE_SESSION_DIR": ""}
-        self.assert_command(self.command("claim", "--pid", str(owner.pid), "--what", "seat tests",
+        self.assert_command(self.command("claim", "--pid", str(owner.pid), "--what", "worker tests",
                                          environment=environment), 0, "claimed\n")
-        self.assertEqual(self.run_state().get("holder_session"), "seat-owner")
+        self.assertEqual(self.run_state().get("holder_session"), "worker-owner")
         self.assert_command(self.command("release", "--pid", str(owner.pid)), 0, "")
         environment = {**self.environment, "CLAUDE_CODE_SESSION_ID": "",
                        "PLAN_DELEGATE_BOARD_DIR": "", "PLAN_DELEGATE_SESSION_DIR": ""}

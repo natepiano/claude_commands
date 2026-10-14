@@ -24,7 +24,7 @@ sys.path.insert(0, str(SCRIPTS / "delegate"))
 
 import codex_daemon
 import process_table
-import remove_seats
+import remove_workers
 import roster
 import herdr
 from fake_herdr import CommandResponse
@@ -134,7 +134,7 @@ class RosterTests(unittest.TestCase):
             showrunners, "SESSIONS", Path(__file__).with_name("sessions.py"),
         ))
         _ = self.enterContext(mock.patch.object(
-            remove_seats, "shutdown_held_sessions",
+            remove_workers, "shutdown_held_sessions",
             return_value={"kind": "held sessions", "session_ids": set()},
         ))
         _ = self.enterContext(mock.patch.object(
@@ -244,7 +244,7 @@ class RosterTests(unittest.TestCase):
         _ = (self.delegate / "active" / "sid-director").write_text(
             str(self.director_run) + "\n", encoding="utf-8",
         )
-        _ = (self.director_run / "seats").write_text(
+        _ = (self.director_run / "workers").write_text(
             "12345678\talpha-test\n", encoding="utf-8",
         )
         self._write_mesh(self.director_run, {
@@ -445,7 +445,7 @@ class RosterTests(unittest.TestCase):
                     "alpha", "runner", "session:sid-runner",
                 ))
                 expected_reach: roster.MessageReach = (
-                    roster.Messageable(f"seat:director-run/{name}")
+                    roster.Messageable(f"worker:director-run/{name}")
                     if name in ("alpha-impl", "alpha-wait")
                     else roster.CannotReceiveMessages(
                         "between turns; its unit director resumes it"
@@ -569,6 +569,32 @@ class RosterTests(unittest.TestCase):
                 if arguments:
                     self.assertIn("(context)", runners[0])
 
+    def test_roster_reads_shared_worker_ledger_and_later_old_path_appends(self) -> None:
+        current = self.director_run / "workers"
+        previous = self.director_run / "seats"
+        _ = current.replace(previous)
+        old_time = 1_700_000_000
+        os.utime(previous, (old_time, old_time))
+        worker = self._entries()["claude-worker"]
+        self.assertEqual(worker.assignment, roster.WorkerAssignment("test", str(self.director_run)))
+        self.assertTrue(previous.samefile(current))
+        self.assertEqual(current.stat().st_mtime, old_time)
+        modified = current.stat().st_mtime_ns
+        self.assertEqual(self._entries()["claude-worker"].assignment, worker.assignment)
+        self.assertEqual(current.stat().st_mtime_ns, modified)
+        self._write_session("late-worker", "late-worker", "late-worker-id", self.home / "late-project")
+        self.assertEqual(self._entries()["late-worker"].role, "freestanding")
+        with previous.open("a", encoding="utf-8") as ledger:
+            _ = ledger.write("late-worker-id\talpha-impl\n")
+        self.assertIn("late-worker-id", current.read_text(encoding="utf-8"))
+        modified = current.stat().st_mtime_ns
+        late_worker = self._entries()["late-worker"]
+        self.assertEqual(late_worker.role, "worker")
+        self.assertEqual(late_worker.assignment, roster.WorkerAssignment("impl", str(self.director_run)))
+        self.assertEqual(late_worker.director, worker.director)
+        self.assertTrue(previous.samefile(current))
+        self.assertEqual(current.stat().st_mtime_ns, modified)
+
     def test_background_id_prefix_places_claude_worker_in_its_run(self) -> None:
         worker = self._entries()["claude-worker"]
         self.assertTrue(WORKER_SESSION_ID.startswith("12345678"))
@@ -638,7 +664,7 @@ class RosterTests(unittest.TestCase):
             ("unit-one", "", ""),
         )
 
-    def test_seat_between_turns_cannot_receive_messages(self) -> None:
+    def test_worker_between_turns_cannot_receive_messages(self) -> None:
         entry = self._entries()["alpha-fix"]
 
         self.assertEqual(entry.status, "idle")
@@ -656,7 +682,7 @@ class RosterTests(unittest.TestCase):
         by_name = {cast(str, row["name"]): row for row in rows}
         self.assertEqual(by_name["alpha-fix"]["address"], "")
 
-    def test_seat_between_turns_without_running_director_says_so(self) -> None:
+    def test_worker_between_turns_without_running_director_says_so(self) -> None:
         entry = self._entries()["orphan-fix"]
 
         self.assertEqual(entry.status, "idle")
@@ -675,7 +701,7 @@ class RosterTests(unittest.TestCase):
         by_name = {cast(str, row["name"]): row for row in rows}
         self.assertEqual(by_name["orphan-fix"]["address"], "")
 
-    def test_same_seat_name_in_two_live_runs_has_two_unique_addresses(self) -> None:
+    def test_same_worker_name_in_two_live_runs_has_two_unique_addresses(self) -> None:
         second_run = self.delegate / "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
         self._write_mesh(second_run, {
             "alpha-impl": {
@@ -688,14 +714,14 @@ class RosterTests(unittest.TestCase):
         with mock.patch.object(codex_daemon, "loaded_sessions", return_value=[]):
             found = roster.roster(os.environ, roster.ThisMachine())
 
-        duplicate_seats = [entry for entry in found.entries if entry.name == "alpha-impl"]
-        self.assertEqual(len(duplicate_seats), 2)
+        duplicate_workers = [entry for entry in found.entries if entry.name == "alpha-impl"]
+        self.assertEqual(len(duplicate_workers), 2)
         self.assertEqual(
-            {entry.reach for entry in duplicate_seats},
+            {entry.reach for entry in duplicate_workers},
             {
-                roster.Messageable("seat:director-run/alpha-impl"),
+                roster.Messageable("worker:director-run/alpha-impl"),
                 roster.Messageable(
-                    "seat:aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee/alpha-impl"
+                    "worker:aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee/alpha-impl"
                 ),
             },
         )
@@ -891,7 +917,7 @@ class RosterTests(unittest.TestCase):
         with self.assertRaises(FrozenInstanceError):
             result_value.entries = []  # pyright: ignore[reportAttributeAccessIssue]
 
-    def test_seat_and_daemon_threads_are_domain_states_and_json_ids(self) -> None:
+    def test_worker_and_daemon_threads_are_domain_states_and_json_ids(self) -> None:
         entries = self._entries()
         self.assertEqual(entries["alpha-impl"].thread, roster.CodexThread("thread-shared"))
         self.assertEqual(entries["Codex window"].thread, roster.CodexThread("thread-window"))
@@ -907,7 +933,7 @@ class RosterTests(unittest.TestCase):
         for name in ("runner", "claude-worker", "alpha-no-thread"):
             self.assertIsNone(by_name[name]["thread"])
 
-    def test_codex_seat_identity_marks_the_seat_and_not_its_inherited_director(self) -> None:
+    def test_codex_worker_identity_marks_the_worker_and_not_its_inherited_director(self) -> None:
         with mock.patch.dict(os.environ, {
             "CODEX_THREAD_ID": "thread-shared", "CLAUDE_CODE_SESSION_ID": "sid-director",
         }):
@@ -1152,7 +1178,7 @@ class RosterTests(unittest.TestCase):
 
     def test_recent_heartbeat_is_live_but_an_old_one_is_not(self) -> None:
         orphan = self.delegate / "orphan-run" / "heartbeat.log"
-        old = time.time() - remove_seats.LIVE_HEARTBEAT_SECS - 5
+        old = time.time() - remove_workers.LIVE_HEARTBEAT_SECS - 5
         os.utime(orphan, (old, old))
         entries = self._entries()
         self.assertNotIn("orphan-impl", entries)
@@ -1216,7 +1242,7 @@ class RosterTests(unittest.TestCase):
             replace(base, showrunner=roster.UnderShowrunner("show", "runner", "session:runner"),
                     director=roster.DirectsUnit("unit"), reach=roster.CannotReceiveMessages("no messaging socket")),
             replace(base, kind="codex", role="worker", session=roster.NoClaudeSession(),
-                    thread=roster.CodexThread("seat-thread"), reach=roster.Messageable("seat:run/impl"),
+                    thread=roster.CodexThread("worker-thread"), reach=roster.Messageable("worker:run/impl"),
                     showrunner=roster.ProductionWithoutRunningShowrunner("gone"),
                     director=roster.UnderDirector("unit", "base", "session:base"),
                     assignment=roster.WorkerAssignment("impl", "/remote/run")),

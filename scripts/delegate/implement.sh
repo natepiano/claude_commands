@@ -6,8 +6,8 @@
 #                     <team_role> [mesh_prefix]
 #   role_description — 1-2 lines describing this dispatch's responsibility,
 #   written as a header block into the shared heartbeat log
-#   pass_kind — required; impl, test, fix, or review. Every seat carries one.
-#   It is the seat's opening role, stamped on its board register line
+#   pass_kind — required; impl, test, fix, or review. Every worker carries one.
+#   It is the worker's opening role, stamped on its board register line
 #   pass_activity — short user-facing description for the progress header
 #   fix_pass — required pass count when pass_kind is fix
 #   team_role — required; which member of the phase team this is (impl, test,
@@ -16,8 +16,8 @@
 #   artifact layout rather than a solo one and a team one. Several launchers
 #   run at once against one session directory, so every artifact below is
 #   written per role, and every member records its own progress pass: the
-#   recorder keys passes by seat and closes only that seat's stale pass, so
-#   concurrent passes describe their own seats rather than whichever
+#   recorder keys passes by worker and closes only that worker's stale pass, so
+#   concurrent passes describe their own workers rather than whichever
 #   happened to finish last.
 #
 # Produces:
@@ -36,9 +36,9 @@
 #                                     can resume it. Absent on the codex path,
 #                                     whose address is a thread id in
 #                                     <session_dir>/mesh_roster.json instead.
-#   <session_dir>/seats             — every background session this run launched,
+#   <session_dir>/workers             — every background session this run launched,
 #                                     `<id>\t<name>`, appended at launch;
-#                                     remove_seats.py removes them at phase end
+#                                     remove_workers.py removes them at phase end
 #   <session_dir>/board.log         — shared coordination board; this launcher
 #                                     posts each member's start and end so peers
 #                                     learn of them without the unit director,
@@ -57,7 +57,7 @@ set -euo pipefail
 
 FOLLOW_TO=""
 if [[ "${1:-}" == "--to" ]]; then
-  FOLLOW_TO="${2:?Usage: implement.sh --to <seat> <session_dir> ...}"
+  FOLLOW_TO="${2:?Usage: implement.sh --to <worker> <session_dir> ...}"
   shift 2
 fi
 
@@ -71,9 +71,9 @@ PASS_ACTIVITY="${7:-${ROLE_DESC%%$'\n'*}}"
 FIX_PASS="${8:-0}"
 TEAM_ROLE="${9:?Usage: implement.sh needs a team_role (impl, test, review) as its 9th argument}"
 
-# Every seat carries a kind, so an empty one is a dropped argument rather than a
+# Every worker carries a kind, so an empty one is a dropped argument rather than a
 # choice. It used to be tolerated: the launcher skipped start-pass, ran the agent
-# normally, and left the seat's previous pass standing. A repair round dispatched
+# normally, and left the worker's previous pass standing. A repair round dispatched
 # with the kind on `impl` alone then produced a phase whose ledger held one live
 # window and two records closed `error` an hour earlier -- and when that one
 # window closed, the recorder refused every progress call for having none open
@@ -85,14 +85,14 @@ case "${PASS_KIND}" in
   impl|test|fix|review) ;;
   *)
     echo "ERROR: pass_kind must be impl, test, fix, or review; got '${PASS_KIND}'." >&2
-    echo "It is the 6th argument and the seat's opening role. A team dispatch gives one to every seat." >&2
+    echo "It is the 6th argument and the worker's opening role. A team dispatch gives one to every worker." >&2
     exit 2
     ;;
 esac
 
 # Resolving a repair round is an explicit assignment, never a property of the
-# pass kind. Keying it off `fix` is what forced seats to misreport their work:
-# every repairing seat should record `fix`, but a second one doing so
+# pass kind. Keying it off `fix` is what forced workers to misreport their work:
+# every repairing worker should record `fix`, but a second one doing so
 # would mark one round landed several times over and hand the next review defects
 # pre-labelled as repaired. So the unit director names exactly one resolver, and
 # the kind goes back to being only a name for the work.
@@ -100,7 +100,7 @@ if [[ -n "${PLAN_DELEGATE_RESOLVES_ROUND+set}" ]]; then
   RESOLVES_ROUND="${PLAN_DELEGATE_RESOLVES_ROUND}"
 elif [[ "${PASS_KIND}" == "fix" && "${TEAM_ROLE}" == "impl" ]]; then
   # A session that loaded the prompt text before this change sets no signal, and
-  # under that text only the impl seat ever carried `fix`. This keeps a run that
+  # under that text only the impl worker ever carried `fix`. This keeps a run that
   # is already in flight resolving its rounds instead of stalling silently.
   # Remove once no session predating the change can still be running.
   RESOLVES_ROUND=1
@@ -127,12 +127,12 @@ export PLAN_DELEGATE_TEAM_ROLE="${TEAM_ROLE}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # The address peers type to reach this member: `<project>-<slot>`, or
-# `<project>-fix` for a repair seat. seat_name.sh owns the rule, because the
+# `<project>-fix` for a repair worker. worker_name.sh owns the rule, because the
 # unit director writes the same name into each peer's prompt before this runs.
 # A run whose unit director loaded the earlier rule tells its peers
-# `<session dir basename>-<slot>`, and its board already registers a seat under
+# `<session dir basename>-<slot>`, and its board already registers a worker under
 # that prefix, so it keeps the prefix for the rest of the run. Remove once no
-# run predating seat_name.sh can still be running.
+# run predating worker_name.sh can still be running.
 MESH_PREFIX="${10:-}"
 LEGACY_PREFIX="$(basename "${SESSION_DIR}")"
 if [[ -z "${MESH_PREFIX}" ]] && grep -qF "mesh=${LEGACY_PREFIX}-" "${SESSION_DIR}/board.log" 2>/dev/null; then
@@ -141,16 +141,17 @@ fi
 if [[ -n "${FOLLOW_TO}" ]]; then
   MESH_NAME="${FOLLOW_TO}"
 else
-  MESH_NAME="$(bash "${SCRIPT_DIR}/seat_name.sh" "${WORKING_DIR}" "${TEAM_ROLE}" "${PASS_KIND}" "${MESH_PREFIX}")"
+  MESH_NAME="$(bash "${SCRIPT_DIR}/worker_name.sh" "${WORKING_DIR}" "${TEAM_ROLE}" "${PASS_KIND}" "${MESH_PREFIX}")"
 fi
 
 # python3 goes through the repo shim, which picks an interpreter by VERSION
 # rather than by path: the python3 on PATH is Apple 3.9 on the Mac, and this
 # repo needs >= 3.10.
 PY="${SCRIPT_DIR}/../lib/py"
+"$PY" "${SCRIPT_DIR}/worker_state.py" "${SESSION_DIR}"
 SUMMARY_FILE="${SESSION_DIR}/impl_summary${SLOT}.txt"
 # Truncate at launch: the "done" post below names this path unconditionally, so a
-# seat that reports on the board without writing a summary would otherwise leave
+# worker that reports on the board without writing a summary would otherwise leave
 # the previous round's file sitting at exactly the path the board line points to.
 REPLY_FILE="${SESSION_DIR}/impl_reply${SLOT}.txt"
 STATUS_FILE="${SESSION_DIR}/impl_status${SLOT}"
@@ -202,9 +203,9 @@ else
 fi
 
 # One lock covers identity, live-state validation, and the claim. The identity
-# written at the original launch is independent of the short-id seats ledger
+# written at the original launch is independent of the short-id workers ledger
 # and of impl_agent_<slot>, which this launcher rewrites for every pass.
-seat_record() {
+worker_record() {
   "$PY" - "${1}" "${SESSION_DIR}" "${TEAM_ROLE}" "${MESH_NAME}" \
   "${AGENT_FAMILY}" "${AGENT_MODEL}" "${BG_ID_FILE}" \
   "${USE_CODEX_MESH}" "${SCRIPT_DIR}/../agents/codex_mesh.py" \
@@ -222,9 +223,10 @@ from pathlib import Path
 ) = sys.argv[1:]
 root = Path(root_text)
 compact_above = int(compact_above_text)
-identity_file = root / f"impl_seat_{slot}.json"
+identity_file = root / f"impl_worker_{slot}.json"
 claim_file = root / f"impl_claim_{slot}.json"
-lock_file = root / "impl_seat_claim.lock"
+sys.path.insert(0, str(Path(mesh_script).parent.parent / "delegate"))
+from worker_state import worker_claim_lock, worker_ledger
 
 def fail(message):
     print(f"implement.sh: {message}", file=sys.stderr)
@@ -251,27 +253,27 @@ def claude_session(short_id):
                 return data.get("sessionId", "")
     return ""
 
-with lock_file.open("a+") as lock:
-    fcntl.flock(lock, fcntl.LOCK_EX)
+with worker_claim_lock(root):
     roster = read(root / "mesh_roster.json")
     entry = roster.get(name, {}) if isinstance(roster, dict) else {}
-    ledger = (root / "seats").read_text().splitlines() if (root / "seats").exists() else []
+    ledger_path = worker_ledger(root)
+    ledger = ledger_path.read_text().splitlines() if ledger_path.exists() else []
     short_id = next((line.split("\t", 1)[0] for line in ledger if line.split("\t", 1)[-1] == name), "")
     if family == "codex" and isinstance(entry, dict) and entry.get("thread_id"):
-        seat_id = entry["thread_id"]
+        worker_id = entry["thread_id"]
     elif family == "claude" and short_id:
-        seat_id = claude_session(short_id)
+        worker_id = claude_session(short_id)
     else:
-        seat_id = ""
+        worker_id = ""
     if action == "record":
-        if not seat_id:
+        if not worker_id:
             raise SystemExit(1)
-        identity = {"name": name, "slot": slot, "family": family, "model": model, "seat_id": seat_id}
+        identity = {"name": name, "slot": slot, "family": family, "model": model, "worker_id": worker_id}
         identity_file.write_text(json.dumps(identity))
     elif action == "claim":
         identity = read(identity_file)
-        if not identity or identity != {"name": name, "slot": slot, "family": family, "model": model, "seat_id": seat_id}:
-            fail(f"{name} has no matching durable seat identity for slot {slot}")
+        if not identity or identity != {"name": name, "slot": slot, "family": family, "model": model, "worker_id": worker_id}:
+            fail(f"{name} has no matching durable worker identity for slot {slot}")
         status_path = root / f"impl_status_{slot}"
         claim = read(claim_file)
         pid = claim.get("pid", 0)
@@ -301,11 +303,11 @@ with lock_file.open("a+") as lock:
                 else:
                     detail = (compact.stderr.strip() or compact.stdout.strip()
                               or f"exit {compact.returncode}").splitlines()[-1]
-                    # Exit 3: a turn is still live on the seat's thread, so a follow-up would be refused.
+                    # Exit 3: a turn is still live on the worker's thread, so a follow-up would be refused.
                     if compact.returncode == 3:
                         post(f"launcher: {name} still has a live turn after compaction: {detail}; "
                              "follow-up not sent")
-                        fail(f"{name} still has a live turn after compaction; end the seat "
+                        fail(f"{name} still has a live turn after compaction; end the worker "
                              f"(codex_mesh.py end --to {name}) and start a fresh one")
                     post(f"launcher: compaction failed for {name}: {detail}; continuing follow-up")
             check = subprocess.run(
@@ -329,7 +331,7 @@ with lock_file.open("a+") as lock:
             row = next((row for row in rows if row.get("id") == short_id), None)
             if row is None or row.get("status") != "idle":
                 fail(f"{name} is busy or gone")
-        claim_file.write_text(json.dumps({"pid": int(os.environ["FOLLOW_LAUNCHER_PID"]), "seat": name, "turn_id": ""}))
+        claim_file.write_text(json.dumps({"pid": int(os.environ["FOLLOW_LAUNCHER_PID"]), "worker": name, "turn_id": ""}))
     elif action == "release":
         claim = read(claim_file)
         if claim.get("pid") == int(os.environ.get("FOLLOW_LAUNCHER_PID", "0")):
@@ -356,8 +358,8 @@ PY
 
 if [[ -n "${FOLLOW_TO}" ]]; then
   export FOLLOW_LAUNCHER_PID="$$"
-  seat_record claim
-  trap 'seat_record release' EXIT
+  worker_record claim
+  trap 'worker_record release' EXIT
 fi
 
 : > "${SUMMARY_FILE}"
@@ -411,16 +413,16 @@ else
 fi
 # The opening role is stamped here so the progress table has a real answer from
 # second zero, instead of a dash until some agent remembers to call `board.sh
-# role`. The opening role is the kind: the unit director picks each seat's kind
-# from the Work Order's Seats field, so a `review` seat launched to write opens
-# as `impl`, and a `test` seat in a crate with no test lane opens as whatever
-# it was given. Nothing here reads the seat name -- the seat name is an
+# role`. The opening role is the kind: the unit director picks each worker's kind
+# from the Work Order's Workers field, so a `review` worker launched to write opens
+# as `impl`, and a `test` worker in a crate with no test lane opens as whatever
+# it was given. Nothing here reads the worker name -- the worker name is an
 # identity and says nothing about the work.
 #
 # The stamp is the opening only. Every later `board.sh role` handoff overrides
 # it and the recorder reads the whole board history, so stamping the kind here
 # freezes nothing. What must stay out is the reverse: reading PASS_KIND *later*
-# as the role, which would report every seat in its launch role for the whole
+# as the role, which would report every worker in its launch role for the whole
 # phase and lose the one movement the table exists to show.
 # The kind is one of the four words by the time this runs, so the field is
 # always present -- which is what makes a dispatch that lost it legible from
@@ -469,7 +471,7 @@ if [[ -n "${FOLLOW_TO}" ]]; then
     exit 2
   fi
 elif [[ "${AGENT_FAMILY}" == "claude" ]]; then
-  AGENT_BG_EFFORT="${AGENT_EFFORT:-}" AGENT_BG_LEDGER="${SESSION_DIR}/seats" bash "${SCRIPT_DIR}/../agents/agent_bg.sh" \
+  AGENT_BG_EFFORT="${AGENT_EFFORT:-}" AGENT_BG_LEDGER="${SESSION_DIR}/workers" bash "${SCRIPT_DIR}/../agents/agent_bg.sh" \
     "${MESH_NAME}" "${WORKING_DIR}" "${PROMPT_FILE}" "${SUMMARY_FILE}" \
     "${LOG_FILE}" "${BG_ID_FILE}" "${AGENT_MODEL}" &
 elif [[ "${USE_CODEX_MESH}" == "1" ]]; then
@@ -501,7 +503,7 @@ AGENT_PID=$!
 if [[ -n "${FOLLOW_TO}" ]]; then
   if [[ "${AGENT_FAMILY}" == "codex" ]]; then
     for ((turn_wait=0; turn_wait<30; turn_wait++)); do
-      if [[ -n "$(seat_record turn 2>/dev/null || true)" ]]; then
+      if [[ -n "$(worker_record turn 2>/dev/null || true)" ]]; then
         break
       fi
       kill -0 "${AGENT_PID}" 2>/dev/null || break
@@ -510,8 +512,8 @@ if [[ -n "${FOLLOW_TO}" ]]; then
     done
   fi
 elif [[ "${AGENT_FAMILY}" == "claude" || "${USE_CODEX_MESH}" == "1" ]]; then
-  for ((seat_wait=0; seat_wait<30; seat_wait++)); do
-    if seat_record record 2>/dev/null; then
+  for ((worker_wait=0; worker_wait<30; worker_wait++)); do
+    if worker_record record 2>/dev/null; then
       break
     fi
     kill -0 "${AGENT_PID}" 2>/dev/null || break
@@ -532,11 +534,11 @@ AGENT_CODE=0
 wait "${AGENT_PID}" || AGENT_CODE=$?
 if [[ -n "${FOLLOW_TO}" ]]; then
   if [[ "${AGENT_FAMILY}" == "codex" ]]; then
-    seat_record turn >/dev/null || true
+    worker_record turn >/dev/null || true
   fi
   rm -f "${FOLLOW_MESSAGE}"
 elif [[ "${AGENT_FAMILY}" == "claude" || "${USE_CODEX_MESH}" == "1" ]]; then
-  seat_record record 2>/dev/null || true
+  worker_record record 2>/dev/null || true
 fi
 
 kill "${HEARTBEAT_LOOP_PID}" 2>/dev/null || true
@@ -582,7 +584,7 @@ if [[ "${AGENT_CODE}" -eq 0 ]]; then
   # A member that ends without saying so on the board leaves its peers waiting
   # on work already finished, so the launcher posts it rather than trusting the
   # agent to have posted before it exited. The `launcher:` prefix marks the
-  # line as the launcher's: it lands after the seat's own last narration, and
+  # line as the launcher's: it lands after the worker's own last narration, and
   # the progress report keeps showing those words rather than this boilerplate.
   bash "${BOARD_HELPER}" post "${SESSION_DIR}" "${BOARD_AGENT}" done \
     "launcher: ${SUBTASK} finished; summary at impl_summary${SLOT}.txt" || true
@@ -608,7 +610,7 @@ else
   # would otherwise hold the cargo token until its hold expired, stalling every
   # peer behind a lock whose owner is already gone.
   bash "${BOARD_HELPER}" post "${SESSION_DIR}" "${BOARD_AGENT}" blocked \
-    "launcher: ${SUBTASK} exited with code ${AGENT_CODE}; this seat is down; ledger_error=${LEDGER_CODE}" || true
+    "launcher: ${SUBTASK} exited with code ${AGENT_CODE}; this worker is down; ledger_error=${LEDGER_CODE}" || true
   bash "${BOARD_HELPER}" release "${SESSION_DIR}" "${BOARD_AGENT}" cargo >/dev/null 2>&1 || true
   exit "${AGENT_CODE}"
 fi

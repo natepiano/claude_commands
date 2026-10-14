@@ -90,9 +90,9 @@ AT_ZERO = (
 )
 TRIAGE = (
     "Codex wind-down, from the user (/codex_winddown triage in {sender}, {time}): \"you need to tell"
-    " all of the other seats to figure out which ones can be stopped now and added to a resume list vs"
+    " all of the other workers to figure out which ones can be stopped now and added to a resume list vs"
     " which really should finish right now\". Sort the Codex agents running under you: stop each one"
-    " that can stop, keep what it wrote, and put it on a resume list (the seat, its work order, what is"
+    " that can stop, keep what it wrote, and put it on a resume list (the worker, its work order, what is"
     " left); let the rest finish. With none running, there is nothing to do."
 )
 ALL_CLEAR = (

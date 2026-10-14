@@ -571,11 +571,11 @@ class ShutdownLaunchCliTests(ShutdownTestCase):
                 record.set_account_hold(account_hold())
                 self.assertEqual(self.run_cli(LOGIN, "--restart-of", "session-123"), expected)
 
-    def test_held_sessions_includes_owners_and_seats_sorted_once(self) -> None:
+    def test_held_sessions_includes_owners_and_workers_sorted_once(self) -> None:
         saved = session_shutdown(record.SessionWaiting(kind="waiting"), "z-owner")
         owner = saved["session"]
         saved["seats"] = [inventory.SeatSession(
-            session_id="a-seat", pid=23456, proc_start="seat-start", name="worker",
+            session_id="a-worker", pid=23456, proc_start="worker-start", name="worker",
             cwd=owner["cwd"], status="idle", model=owner["model"], checkout=owner["checkout"],
             run_dirs=["/tmp/run"], codex_servers=[], timers=[], kind="seat",
             host=inventory.UnknownHost(kind="unknown"),
@@ -586,7 +586,7 @@ class ShutdownLaunchCliTests(ShutdownTestCase):
         output = io.StringIO()
         with redirect_stdout(output):
             self.assertEqual(shutdown.main(["held-sessions"]), 0)
-        self.assertEqual(output.getvalue(), "a-seat\nm-owner\nz-owner\n")
+        self.assertEqual(output.getvalue(), "a-worker\nm-owner\nz-owner\n")
 
     def test_launch_permission_maps_exit_statuses(self) -> None:
         with patch.object(

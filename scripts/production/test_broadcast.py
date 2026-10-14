@@ -119,10 +119,10 @@ class BroadcastTests(unittest.TestCase):
                   showrunner=roster.UnderShowrunner("show", "hana", "session:id-hana"),
                   director=roster.DirectsUnit("trunk-unit")),
             entry("ups", "session:id-ups"),
-            entry("fps-impl", "seat:run-a/fps-impl", role="worker", kind="codex",
+            entry("fps-impl", "worker:run-a/fps-impl", role="worker", kind="codex",
                   showrunner=roster.UnderShowrunner("show", "hana", "session:id-hana"),
                   director=roster.UnderDirector("trunk-unit", "trunk", "session:id-trunk"),
-                  thread=roster.CodexThread("thread-seat")),
+                  thread=roster.CodexThread("thread-worker")),
             entry("Codex window", "codex:thread-window", kind="codex",
                   thread=roster.CodexThread("thread-window")),
         ]
@@ -183,7 +183,7 @@ class BroadcastTests(unittest.TestCase):
         self.assertEqual((result, errors), (0, ""), output)
         self.assertEqual(set(self.sent_texts()), {
             "session:id-hana", "session:id-trunk", "session:id-ups",
-            "seat:run-a/fps-impl", "codex:thread-window",
+            "worker:run-a/fps-impl", "codex:thread-window",
         })
         self.assertRegex(output.splitlines()[-2], r"^5 sent in \d+ s$")
         for text in self.sent_texts().values():
@@ -276,7 +276,7 @@ class BroadcastTests(unittest.TestCase):
         texts = self.sent_texts()
         for address in ("session:id-hana", "session:id-trunk"):
             self.assertTrue(texts[address].startswith("Codex is back\n\n"))
-        for address in ("session:id-ups", "seat:run-a/fps-impl", "codex:thread-window"):
+        for address in ("session:id-ups", "worker:run-a/fps-impl", "codex:thread-window"):
             self.assertTrue(texts[address].startswith("carry on\n\n"))
 
     def test_one_role_alone_is_told_the_other_was_not_sent_it(self) -> None:
@@ -310,20 +310,20 @@ class BroadcastTests(unittest.TestCase):
                 self.assertIn("usage: broadcast.py", errors)
         self.assertEqual(self.sends(), [])
 
-    def test_codex_seat_identity_wins_over_its_inherited_director_session(self) -> None:
+    def test_codex_worker_identity_wins_over_its_inherited_director_session(self) -> None:
         result, output, errors = self.run_main(
-            "--all", "stop", CODEX_THREAD_ID="thread-seat", CLAUDE_CODE_SESSION_ID="id-trunk",
+            "--all", "stop", CODEX_THREAD_ID="thread-worker", CLAUDE_CODE_SESSION_ID="id-trunk",
         )
         self.assertEqual((result, errors), (0, ""), output)
         texts = self.sent_texts()
-        self.assertNotIn("seat:run-a/fps-impl", texts)
+        self.assertNotIn("worker:run-a/fps-impl", texts)
         self.assertIn("session:id-trunk", texts)
         self.assertEqual(len(texts), 5)
 
     def test_daemon_codex_sender_is_left_out(self) -> None:
         result, output, errors = self.run_main("--agents", "stop", CODEX_THREAD_ID="thread-window")
         self.assertEqual((result, errors), (0, ""), output)
-        self.assertEqual(set(self.sent_texts()), {"session:id-ups", "seat:run-a/fps-impl"})
+        self.assertEqual(set(self.sent_texts()), {"session:id-ups", "worker:run-a/fps-impl"})
 
     def test_plain_shell_leaves_nobody_out_even_when_from_matches_a_name(self) -> None:
         result, output, errors = self.run_main("--all", "stop", CLAUDE_CODE_SESSION_ID="", CODEX_THREAD_ID="")
@@ -342,22 +342,22 @@ class BroadcastTests(unittest.TestCase):
         self.rows.extend([
             entry("claude-worker", "session:worker", role="worker",
                   director=roster.UnderDirector("trunk-unit", "trunk", "session:id-trunk")),
-            entry("orphan", "seat:orphan/impl", role="worker", kind="codex"),
+            entry("orphan", "worker:orphan/impl", role="worker", kind="codex"),
         ])
         result, output, errors = self.run_main("--workers", "finish")
         self.assertEqual((result, errors), (0, ""), output)
-        self.assertEqual(set(self.sent_texts()), {"session:worker", "seat:orphan/impl", "seat:run-a/fps-impl"})
+        self.assertEqual(set(self.sent_texts()), {"session:worker", "worker:orphan/impl", "worker:run-a/fps-impl"})
         self.assertTrue(all("worker" in text.split("\n\n")[-1] for text in self.sent_texts().values()))
 
     def test_same_named_workers_are_selected_by_their_director_address(self) -> None:
         self.rows = [
             entry("director", "session:director-a", role="unit director", director=roster.DirectsUnit("unit-a")),
             entry("director", "session:director-b", role="unit director", director=roster.DirectsUnit("unit-b")),
-            entry("impl", "seat:run-a/impl", role="worker", kind="codex",
+            entry("impl", "worker:run-a/impl", role="worker", kind="codex",
                   director=roster.UnderDirector("unit-a", "director", "session:director-a")),
-            entry("impl", "seat:run-b/impl", role="worker", kind="codex",
+            entry("impl", "worker:run-b/impl", role="worker", kind="codex",
                   director=roster.UnderDirector("unit-b", "director", "session:director-b")),
-            entry("orphan", "seat:orphan/impl", role="worker", kind="codex"),
+            entry("orphan", "worker:orphan/impl", role="worker", kind="codex"),
             entry("runner", "session:runner", role="showrunner", showrunner=roster.RunsProduction("production")),
             entry("unhosted director", "session:unhosted", role="unit director",
                   showrunner=roster.ProductionWithoutRunningShowrunner("gone"),
@@ -367,24 +367,24 @@ class BroadcastTests(unittest.TestCase):
                                                "--of", "session:director-b", "--workers", "finish B")
         self.assertEqual((result, errors), (0, ""), output)
         texts = self.sent_texts()
-        self.assertEqual(set(texts), {"seat:run-a/impl", "seat:run-b/impl"})
-        self.assertTrue(texts["seat:run-a/impl"].startswith("finish A\n\n"))
-        self.assertTrue(texts["seat:run-b/impl"].startswith("finish B\n\n"))
-        self.assertIn("workers of unit-a", texts["seat:run-a/impl"])
+        self.assertEqual(set(texts), {"worker:run-a/impl", "worker:run-b/impl"})
+        self.assertTrue(texts["worker:run-a/impl"].startswith("finish A\n\n"))
+        self.assertTrue(texts["worker:run-b/impl"].startswith("finish B\n\n"))
+        self.assertIn("workers of unit-a", texts["worker:run-a/impl"])
 
     def test_of_accepts_a_unique_director_name(self) -> None:
         result, output, errors = self.run_main("--of", "trunk", "--workers", "finish")
         self.assertEqual((result, errors), (0, ""), output)
-        self.assertEqual(set(self.sent_texts()), {"seat:run-a/fps-impl"})
+        self.assertEqual(set(self.sent_texts()), {"worker:run-a/fps-impl"})
 
     def test_socketless_directors_workers_are_selected_by_session_identity(self) -> None:
         self.rows = [replace(row, reach=roster.CannotReceiveMessages("no messaging socket"))
                      if row.role == "unit director" else row for row in self.rows]
         result, output, errors = self.run_main("--of", "session:id-trunk", "--workers", "finish")
         self.assertEqual((result, errors), (0, ""), output)
-        self.assertEqual(set(self.sent_texts()), {"seat:run-a/fps-impl"})
-        self.assertTrue(self.sent_texts()["seat:run-a/fps-impl"].startswith("finish\n\n"))
-        self.assertIn("workers of trunk-unit", self.sent_texts()["seat:run-a/fps-impl"])
+        self.assertEqual(set(self.sent_texts()), {"worker:run-a/fps-impl"})
+        self.assertTrue(self.sent_texts()["worker:run-a/fps-impl"].startswith("finish\n\n"))
+        self.assertIn("workers of trunk-unit", self.sent_texts()["worker:run-a/fps-impl"])
 
     def test_socketless_directors_workers_are_selected_by_name_and_unit(self) -> None:
         self.rows = [replace(row, reach=roster.CannotReceiveMessages("no messaging socket"))
@@ -394,7 +394,7 @@ class BroadcastTests(unittest.TestCase):
                 result, output, errors = self.run_main("--of", target, "--workers", target)
                 self.assertEqual((result, errors), (0, ""), output)
                 commands = self.sends()
-                self.assertTrue(all(command[1] == "seat:run-a/fps-impl" for command in commands))
+                self.assertTrue(all(command[1] == "worker:run-a/fps-impl" for command in commands))
                 self.assertEqual(sum(command[6].startswith(target + "\n\n") for command in commands), 1)
         self.assertEqual(len(self.sends()), 2)
 
@@ -444,12 +444,12 @@ class BroadcastTests(unittest.TestCase):
             ))
         result, output, errors = self.run_main("--workers", "finish")
         self.assertEqual((result, errors), (0, ""), output)
-        self.assertEqual(set(self.sent_texts()), {"seat:run-a/fps-impl"})
+        self.assertEqual(set(self.sent_texts()), {"worker:run-a/fps-impl"})
         self.assertIn("reviewer cannot take messages (blind reviewer); contact its unit director trunk or wait", output)
         self.assertIn("orphan reviewer cannot take messages (blind reviewer)", output)
         self.assertRegex(output.splitlines()[-2], r"^1 sent in \d+ s$")
 
-    def test_between_turns_seat_is_reported_without_a_send_or_failure(self) -> None:
+    def test_between_turns_worker_is_reported_without_a_send_or_failure(self) -> None:
         self.rows.append(replace(
             entry("waiting", "", role="worker", kind="codex",
                   director=roster.UnderDirector("trunk-unit", "trunk", "session:id-trunk")),
@@ -482,7 +482,7 @@ class BroadcastTests(unittest.TestCase):
         self.assertEqual(len(texts), 5)
         self.assertTrue(texts["session:id-hana"].startswith("runners\n\n"))
         self.assertTrue(texts["session:id-ups"].startswith("top\n\n"))
-        for address in ("session:id-trunk", "seat:run-a/fps-impl", "codex:thread-window"):
+        for address in ("session:id-trunk", "worker:run-a/fps-impl", "codex:thread-window"):
             self.assertTrue(texts[address].startswith("everyone\n\n"))
 
 
@@ -499,11 +499,11 @@ class BroadcastTests(unittest.TestCase):
                           director=roster.DirectsUnit("unit-a")), machine="mac"),
             replace(entry("director B", "session:director-b", role="unit director",
                           director=roster.DirectsUnit("unit-b")), machine="mac"),
-            replace(entry("impl", "seat:run-a/impl", role="worker", kind="codex",
+            replace(entry("impl", "worker:run-a/impl", role="worker", kind="codex",
                           director=roster.UnderDirector("unit-a", "director A", "session:director-a")), machine="mac"),
-            replace(entry("impl", "seat:run-b/impl", role="worker", kind="codex",
+            replace(entry("impl", "worker:run-b/impl", role="worker", kind="codex",
                           director=roster.UnderDirector("unit-b", "director B", "session:director-b")), machine="mac"),
-            replace(entry("orphan", "seat:orphan/impl", role="worker", kind="codex"), machine="mac"),
+            replace(entry("orphan", "worker:orphan/impl", role="worker", kind="codex"), machine="mac"),
         ]
         return (broadcast.WorkersOfUnit("session:director-a", "unit-a", "mac"),
                 broadcast.WorkersOfUnit("session:director-b", "unit-b", "mac"))
@@ -534,23 +534,23 @@ class BroadcastTests(unittest.TestCase):
         unit_a, _unit_b = self.peer_worker_groups()
         self.assert_peer_worker_texts(
             {unit_a: "unit text", broadcast.Workers(): "all workers text"},
-            {"seat:run-a/impl": "all workers text", "seat:run-b/impl": "all workers text",
-             "seat:orphan/impl": "all workers text"},
+            {"worker:run-a/impl": "all workers text", "worker:run-b/impl": "all workers text",
+             "worker:orphan/impl": "all workers text"},
         )
 
     def test_peer_unit_scope_after_all_workers_overrides_only_its_own_workers(self) -> None:
         unit_a, _unit_b = self.peer_worker_groups()
         self.assert_peer_worker_texts(
             {broadcast.Workers(): "all workers text", unit_a: "unit text"},
-            {"seat:run-a/impl": "unit text", "seat:run-b/impl": "all workers text",
-             "seat:orphan/impl": "all workers text"},
+            {"worker:run-a/impl": "unit text", "worker:run-b/impl": "all workers text",
+             "worker:orphan/impl": "all workers text"},
         )
 
     def test_peer_two_unit_scopes_keep_each_units_workers_and_text_separate(self) -> None:
         unit_a, unit_b = self.peer_worker_groups()
         self.assert_peer_worker_texts(
             {unit_a: "A text", unit_b: "B text"},
-            {"seat:run-a/impl": "A text", "seat:run-b/impl": "B text"},
+            {"worker:run-a/impl": "A text", "worker:run-b/impl": "B text"},
         )
 
     def test_here_never_runs_ssh_and_every_recipient_send_stays_here(self) -> None:
@@ -576,10 +576,10 @@ class BroadcastTests(unittest.TestCase):
 
     def test_remote_run_clears_sender_identities_and_leaves_every_peer_row_in(self) -> None:
         self.peer_rows = [replace(entry("same id", "session:id-natedev"), machine="mac"),
-                          replace(entry("same thread", "codex:thread-seat", kind="codex",
-                                        thread=roster.CodexThread("thread-seat")), machine="mac")]
+                          replace(entry("same thread", "codex:thread-worker", kind="codex",
+                                        thread=roster.CodexThread("thread-worker")), machine="mac")]
         result, output, errors = self.run_main("--all", "all", here=False,
-                                              CODEX_THREAD_ID="thread-seat", CLAUDE_CODE_SESSION_ID="id-natedev")
+                                              CODEX_THREAD_ID="thread-worker", CLAUDE_CODE_SESSION_ID="id-natedev")
         self.assertEqual((result, errors), (0, ""), output)
         self.assertEqual(len(self.peer_sends()), 2)
         command = self.ssh_calls()[0][-1]
@@ -618,7 +618,7 @@ class BroadcastTests(unittest.TestCase):
     def test_of_a_local_director_is_resolved_before_delivery_and_never_replayed_on_peer(self) -> None:
         result, output, errors = self.run_main("--of", "trunk", "--workers", "finish", here=False)
         self.assertEqual((result, errors), (0, ""), output)
-        self.assertEqual(set(self.sent_texts()), {"seat:run-a/fps-impl"})
+        self.assertEqual(set(self.sent_texts()), {"worker:run-a/fps-impl"})
         self.assertEqual(self.peer_sends(), [])
         self.assertTrue(self.ssh_calls())
         self.assertTrue(all("roster.py" in call[-1] for call in self.ssh_calls()))
@@ -627,13 +627,13 @@ class BroadcastTests(unittest.TestCase):
         director = replace(entry("peer director", "session:peer-director", role="unit director",
                                  director=roster.DirectsUnit("peer-unit")), machine="mac",
                            reach=roster.CannotReceiveMessages("no messaging socket"))
-        worker = replace(entry("impl", "seat:peer/impl", kind="codex", role="worker",
+        worker = replace(entry("impl", "worker:peer/impl", kind="codex", role="worker",
                                director=roster.UnderDirector("peer-unit", "peer director", "session:peer-director")), machine="mac")
         self.peer_rows = [director, worker]
         result, output, errors = self.run_main("--of", "peer director", "--workers", "finish", here=False)
         self.assertEqual((result, errors), (0, ""), output)
         self.assertEqual(self.sends(), [])
-        self.assertEqual([command[1] for command in self.peer_sends()], ["seat:peer/impl"])
+        self.assertEqual([command[1] for command in self.peer_sends()], ["worker:peer/impl"])
         forwarded = next(shlex.split(call[-1]) for call in self.ssh_calls() if "broadcast.py" in call[-1])
         self.assertEqual(forwarded[forwarded.index("--of") + 1], "session:peer-director")
         self.assertIn("--here", forwarded)

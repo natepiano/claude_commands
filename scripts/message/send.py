@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""Send one message to a Claude session, a Codex seat, or the user: the one way scripts do it.
+"""Send one message to a Claude session, a Codex worker, or the user: the one way scripts do it.
 
 Agents holding the SendMessage tool call it directly; scripts call this. The rules
 every message follows are /message (~/.claude/commands/message.md).
 
-  send.py --to NAME|uds:<path>|session:<id>|seat:<run>/<seat>|codex:<thread>
+  send.py --to NAME|uds:<path>|session:<id>|worker:<run>/<worker>|codex:<thread>
           [--from NAME] [--summary TEXT] [--key KEY [--repeat-minutes N]]
           [--here | --machine HOST] [--codex --session-dir DIR] [--timeout SECONDS]
           (--text TEXT | --file PATH | stdin)
@@ -24,7 +24,7 @@ removed, so it never passes for the session that ran this. It is named --from,
 which is the sender name the recipient sees. Delivery is read from the
 SendMessage tool result in the relay's stream, never from what the model says;
 the last stream per recipient stays in STATE/relay/<to>.jsonl.
-`seat:` addresses queue through codex_mesh.py; `codex:` addresses queue through
+`worker:` addresses queue through codex_mesh.py; `codex:` addresses queue through
 the shared Codex daemon. A unique roster name resolves to either. `--codex`
 with `--session-dir` still selects codex_mesh.py directly. Names and addresses
 resolve here first, then on the peer. `--here` keeps resolution here; `--machine`
@@ -298,7 +298,7 @@ class ClaudeRecipient:
 
 
 @dataclass(frozen=True)
-class CodexSeatRecipient:
+class CodexWorkerRecipient:
     address: str
     name: str
     session_dir: str
@@ -311,7 +311,7 @@ class CodexSessionRecipient:
     name: str
 
 
-SessionRecipient = ClaudeRecipient | CodexSeatRecipient | CodexSessionRecipient
+SessionRecipient = ClaudeRecipient | CodexWorkerRecipient | CodexSessionRecipient
 
 
 @dataclass(frozen=True)
@@ -358,12 +358,12 @@ class RosterLookup:
 
 
 @dataclass(frozen=True)
-class MeshSeat:
+class MeshWorker:
     session_dir: str
-    seat: str
+    worker: str
 
 
-RecipientSelection = RosterLookup | MeshSeat
+RecipientSelection = RosterLookup | MeshWorker
 
 
 class Options(NamedTuple):
@@ -384,7 +384,7 @@ class Options(NamedTuple):
 
     @property
     def to(self) -> str:
-        return self.selection.to if isinstance(self.selection, RosterLookup) else self.selection.seat
+        return self.selection.to if isinstance(self.selection, RosterLookup) else self.selection.worker
 
 
 # ---------------------------------------------------------------------------
@@ -665,10 +665,10 @@ def _messageable_recipient(entry: roster.RosterEntry) -> SessionRecipient:
     if not isinstance(entry.reach, roster.Messageable):
         raise AssertionError("a messageable recipient needs an address")
     address = entry.reach.address
-    if address.startswith("seat:"):
+    if address.startswith("worker:"):
         if not isinstance(entry.assignment, roster.WorkerAssignment):
-            usage_error(f"{address} is not assigned to a Codex seat")
-        return CodexSeatRecipient(address, entry.name, entry.assignment.session_dir)
+            usage_error(f"{address} is not assigned to a Codex worker")
+        return CodexWorkerRecipient(address, entry.name, entry.assignment.session_dir)
     if address.startswith("codex:"):
         return CodexSessionRecipient(
             address,
@@ -695,7 +695,7 @@ def _ambiguous_name(name: str, entries: list[roster.RosterEntry]) -> NoReturn:
 
 
 def _recipient_matches(to: str, entries: list[roster.RosterEntry]) -> list[roster.RosterEntry]:
-    if to.startswith(("session:", "seat:", "codex:")):
+    if to.startswith(("session:", "worker:", "codex:")):
         return [entry for entry in entries
                 if isinstance(entry.reach, roster.Messageable) and entry.reach.address == to]
     return [entry for entry in entries if entry.name == to]
@@ -727,7 +727,7 @@ def resolve_recipient(
     matches = _recipient_matches(to, result.entries)
     if matches:
         return _matched_recipient(to, matches)
-    addressed = to.startswith(("session:", "seat:", "codex:"))
+    addressed = to.startswith(("session:", "worker:", "codex:"))
     if isinstance(scope, LocalThenPeer):
         if result.problems and not addressed:
             usage_error(f"absence of {to} here is not proven; use an address or --machine")
@@ -739,7 +739,7 @@ def resolve_recipient(
             return RemoteDelivery(roster.remote.other_machine(), recipient.address)
         if peer.problems:
             return RecipientLookupFailed("; ".join(peer.problems))
-    if to.startswith("seat:"):
+    if to.startswith("worker:"):
         usage_error(f"no roster session has address {to}")
     if to.startswith("codex:"):
         return CodexSessionRecipient(to, to.removeprefix("codex:"), to.removeprefix("codex:"))
@@ -1070,7 +1070,7 @@ def remote(message: Message, host: str, options: Options) -> Result:
         if isinstance(options.action, NoUserRecipient):
             raise AssertionError("a user message must state its action")
         forwarded += action_arguments(options.action)
-    if isinstance(options.selection, MeshSeat):
+    if isinstance(options.selection, MeshWorker):
         forwarded += ["--codex", "--session-dir", options.selection.session_dir]
     if options.repeat_minutes is not None:
         forwarded += ["--repeat-minutes", f"{options.repeat_minutes:g}"]
@@ -1158,7 +1158,7 @@ def parse(argv: list[str]) -> Options:
     parser = argparse.ArgumentParser(prog="send.py",
                                      description=(
                                          "Send one message to a roster name, uds:<path>, "
-                                         "session:<id>, seat:<run id>/<seat name>, "
+                                         "session:<id>, worker:<run id>/<worker name>, "
                                          "codex:<thread id>, or user."
                                      ),
                                      epilog="Also: send.py ack KEY | reopen KEY | pending [NAME]")
@@ -1167,7 +1167,7 @@ def parse(argv: list[str]) -> Options:
         required=True,
         help=(
             "a roster name, uds:<path>, session:<id>, "
-            "seat:<run id>/<seat name>, codex:<thread id>, or user"
+            "worker:<run id>/<worker name>, codex:<thread id>, or user"
         ),
     )
     _ = parser.add_argument("--text-id", default="", help="registered script push")
@@ -1238,7 +1238,7 @@ def parse(argv: list[str]) -> Options:
     is_codex = attr(args, "codex") is True
     if is_codex != (session_dir is not None):
         parser.error("--codex and --session-dir go together")
-    selection: RecipientSelection = MeshSeat(session_dir, to) if session_dir is not None else RosterLookup(to)
+    selection: RecipientSelection = MeshWorker(session_dir, to) if session_dir is not None else RosterLookup(to)
     host = optional_str(attr(args, "machine"))
     scope: RecipientResolutionScope = (
         NamedMachine(host) if host is not None else
@@ -1250,7 +1250,7 @@ def parse(argv: list[str]) -> Options:
                       scope=scope, timeout=optional_float(get["timeout"]) or TIMEOUT,
                       need=cast(Need, get["need"]), action=action, text=optional_str(get["text"]),
                       file=optional_str(get["file"]), answerable=get["answerable"] is True, text_id=text_id, values=tuple(raw_values))
-    if options.to == USER and (options.summary is None or isinstance(options.selection, MeshSeat)):
+    if options.to == USER and (options.summary is None or isinstance(options.selection, MeshWorker)):
         parser.error("--to user needs --summary, its title, and takes no --codex")
     if options.to != USER and options.need != "note":
         parser.error("--need goes with --to user")
@@ -1310,10 +1310,10 @@ def send(options: Options) -> Result:
         usage_error("the message is empty")
     first = text.strip().splitlines()[0]
     summary = options.summary or (first if len(first) <= 60 else first[:59] + "…")
-    if isinstance(options.selection, MeshSeat):
+    if isinstance(options.selection, MeshWorker):
         route: DeliveryRoute = (
             RemoteDelivery(options.scope.host, options.to) if isinstance(options.scope, NamedMachine)
-            else CodexSeatRecipient(options.to, options.to, options.selection.session_dir)
+            else CodexWorkerRecipient(options.to, options.to, options.selection.session_dir)
         )
     elif options.to == USER:
         route = (RemoteDelivery(options.scope.host, USER) if isinstance(options.scope, NamedMachine)
@@ -1339,7 +1339,7 @@ def send(options: Options) -> Result:
         if isinstance(options.action, NoUserRecipient):
             raise AssertionError("a user message must state its action")
         result = user(message, options.need, options.action, options.timeout, answerable=options.answerable, text_id=options.text_id, values=options.values)
-    elif isinstance(route, CodexSeatRecipient):
+    elif isinstance(route, CodexWorkerRecipient):
         transport = Message(
             route.name,
             message.sender,

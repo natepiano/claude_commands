@@ -12,13 +12,17 @@ import subprocess
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Literal, NotRequired, TypedDict, cast
+from typing import TYPE_CHECKING, Literal, NotRequired, TypedDict, cast
 
 SCRIPTS = Path(__file__).resolve().parents[1]
-for dependency in ("whoami", "message", "production", "herdr"):
+for dependency in ("whoami", "message", "production", "herdr", "delegate"):
     sys.path.insert(0, str(SCRIPTS / dependency))
 
 import account
+if TYPE_CHECKING:
+    from ..delegate.worker_state import worker_ledger
+else:
+    from worker_state import worker_ledger
 import herdr
 import sessions
 from sessions import process_start as _process_start
@@ -183,7 +187,7 @@ class NoDirector(TypedDict):
     kind: Literal["no director"]
 
 
-SeatOwner = DirectorOwner | NoDirector
+WorkerOwner = DirectorOwner | NoDirector
 
 
 class CodexServer(TypedDict):
@@ -191,7 +195,7 @@ class CodexServer(TypedDict):
 
     run_dir: str
     pid: int
-    busy_seats: list[str]
+    busy_workers: list[str]
 
 
 class SessionFields(TypedDict):
@@ -225,7 +229,7 @@ class UnitSession(SessionFields):
 class SeatSession(SessionFields):
     kind: Literal["seat"]
     host: SessionHost
-    owner: SeatOwner
+    owner: WorkerOwner
 
 
 class TopLevelSession(SessionFields):
@@ -573,7 +577,7 @@ def _parse_model(value: object, place: str) -> LastModel:
     raise InvalidInventory(f"{place}.kind is invalid")
 
 
-def _parse_owner(value: object, place: str) -> SeatOwner:
+def _parse_owner(value: object, place: str) -> WorkerOwner:
     data = _wire_object(value, place)
     kind = _wire_kind(data, place)
     if kind == "director":
@@ -595,8 +599,8 @@ def _parse_codex_server(value: object, place: str) -> CodexServer:
             _wire_required(data, "run_dir", place), f"{place}.run_dir"
         ),
         "pid": _wire_integer(_wire_required(data, "pid", place), f"{place}.pid"),
-        "busy_seats": _wire_strings(
-            _wire_required(data, "busy_seats", place), f"{place}.busy_seats"
+        "busy_workers": _wire_strings(
+            _wire_required(data, "busy_workers", place), f"{place}.busy_workers"
         ),
     }
 
@@ -903,20 +907,20 @@ def _active_run_directories() -> dict[str, list[Path]]:
     return found
 
 
-def _seat_owners(run_directories: dict[str, list[Path]], session_ids: set[str]) -> dict[str, str]:
+def _worker_owners(run_directories: dict[str, list[Path]], session_ids: set[str]) -> dict[str, str]:
     short_to_session = {session_id[:8].casefold(): session_id for session_id in session_ids}
     owners: dict[str, str] = {}
     for owner, directories in run_directories.items():
         for directory in directories:
             try:
-                lines = (directory / "seats").read_text(encoding="utf-8").splitlines()
+                lines = worker_ledger(directory).read_text(encoding="utf-8").splitlines()
             except (OSError, UnicodeError):
                 continue
             for line in lines:
                 daemon_short = line.split("\t", 1)[0].strip().casefold()
-                seat = short_to_session.get(daemon_short)
-                if seat is not None:
-                    owners[seat] = owner
+                worker = short_to_session.get(daemon_short)
+                if worker is not None:
+                    owners[worker] = owner
     return owners
 
 
@@ -1314,7 +1318,7 @@ def _codex_servers(run_directories: list[Path]) -> list[CodexServer]:
             )
             if status in {"running", "starting"} and launcher_is_live:
                 busy.append(name)
-        servers.append({"run_dir": str(directory), "pid": pid, "busy_seats": busy})
+        servers.append({"run_dir": str(directory), "pid": pid, "busy_workers": busy})
     return servers
 
 
@@ -1346,7 +1350,7 @@ def inventory(
         if session_id
     }
     run_directories = _active_run_directories()
-    seat_owners = _seat_owners(run_directories, session_ids)
+    worker_owners = _worker_owners(run_directories, session_ids)
     productions, runners = _registered_productions()
     units = _unit_sessions(runners)
     plans = _newest_unit_plans()
@@ -1359,7 +1363,7 @@ def inventory(
         pid = record.get("pid", 0)
         session_id = _string(record.get("sessionId"))
         name = _string(record.get("name"))
-        owner = seat_owners.get(session_id)
+        owner = worker_owners.get(session_id)
         selected = not only or session_id in only or owner in only
         if not selected:
             continue

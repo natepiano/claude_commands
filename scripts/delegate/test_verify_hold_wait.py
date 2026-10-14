@@ -267,7 +267,7 @@ os.execv(os.environ["TEST_REAL_PYTHON"], [os.environ["TEST_REAL_PYTHON"], *sys.a
         self.assertEqual(len(self.fixture.local_runs()), 1)
         self.assertTrue((Path(self.fixture.environment["BUILD_HOLD_DIR"]) / "hana").exists())
 
-    def test_seat_registers_and_marks_the_marker_owner(self) -> None:
+    def test_worker_registers_and_marks_the_marker_owner(self) -> None:
         self.hold()
         active = self.fixture.root / "active"
         active.mkdir()

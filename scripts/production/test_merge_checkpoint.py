@@ -22,7 +22,7 @@ from merge_checkpoint import (CodeCheckpoint, LastMerged, NoMerge, ShrinkCommit,
 
 SCRIPT = Path(__file__).with_name("merge_checkpoint.py")
 STARTED = "2026-10-06T12:00:00-07:00"
-TRIAL = ("review trial: ux 2 findings, code 3 findings, review-seat minutes 14, "
+TRIAL = ("review trial: ux 2 findings, code 3 findings, review-worker minutes 14, "
          "ux check minutes 4, ux repair minutes 1")
 SIMPLE_OWNS = "`src/alpha.txt`, `crates/alpha/`, `docs/plans/alpha.md`, `docs/plans/alpha-next.md`"
 REAL_OWNS = ("`docs/plans/build-followups-enh-showrunner.md`; `scripts/production/add_unit.py`, "

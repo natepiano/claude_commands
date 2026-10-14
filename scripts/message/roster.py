@@ -26,7 +26,8 @@ for _directory in (SCRIPTS / "production", SCRIPTS / "delegate", SCRIPTS / "shut
         sys.path.insert(0, str(_directory))
 
 import add_unit  # noqa: E402
-import remove_seats  # noqa: E402
+import remove_workers  # noqa: E402
+from worker_state import worker_ledger  # noqa: E402
 import showrunners  # noqa: E402
 import unit_lookup  # noqa: E402
 import herdr  # noqa: E402
@@ -38,7 +39,7 @@ from sessions import SessionRecord, messaging_socket_exists, running_sessions  #
 Kind = Literal["claude", "codex"]
 Role = Literal["showrunner", "unit director", "worker", "freestanding"]
 KNOWN_SLOT_ROLES = frozenset(("impl", "test", "fix", "review"))
-MESSAGEABLE_SEAT_STATUSES = frozenset(("running", "waiting_capacity"))
+MESSAGEABLE_WORKER_STATUSES = frozenset(("running", "waiting_capacity"))
 
 
 @dataclass(frozen=True)
@@ -163,7 +164,7 @@ class WorkerAssignment:
 
 @dataclass(frozen=True)
 class NotAWorker:
-    """This session is not assigned to a delegate worker seat."""
+    """This session is not assigned to a delegate worker."""
 
 
 Assignment = WorkerAssignment | NotAWorker
@@ -463,7 +464,7 @@ class _ClaudeDetails:
 @dataclass(frozen=True)
 class _WorkerPlace:
     run: _LiveRun
-    seat_name: str
+    worker_name: str
 
 
 @dataclass(frozen=True)
@@ -487,7 +488,7 @@ class _ReviewerProcessNotFound:
 _ReviewerProcessState = _ReviewerProcess | _ReviewerProcessNotFound
 
 
-class _MeshSeat(TypedDict, total=False):
+class _MeshWorker(TypedDict, total=False):
     thread_id: str
     status: str
     launcher_pid: int
@@ -721,14 +722,14 @@ def _live_runs(
             except (OSError, UnicodeError) as error:
                 _problem(problems, f"delegate marker {marker}", error)
     try:
-        heartbeats = list(root.glob(f"*/{remove_seats.HEARTBEAT}"))
+        heartbeats = list(root.glob(f"*/{remove_workers.HEARTBEAT}"))
     except OSError as error:
         _problem(problems, f"delegate runs in {root}", error)
         heartbeats = []
     now = time.time()
     for heartbeat in heartbeats:
         try:
-            if now - heartbeat.stat().st_mtime < remove_seats.LIVE_HEARTBEAT_SECS:
+            if now - heartbeat.stat().st_mtime < remove_workers.LIVE_HEARTBEAT_SECS:
                 _ = by_path.setdefault(heartbeat.parent.resolve(), _NoRunningDirector())
         except OSError as error:
             _problem(problems, f"delegate heartbeat {heartbeat}", error)
@@ -738,21 +739,22 @@ def _live_runs(
     ]
 
 
-def _seat_ledger(run: _LiveRun, problems: list[str]) -> list[tuple[str, str]]:
-    path = run.path / remove_seats.LEDGER
-    if not path.exists():
-        return []
+def _worker_ledger(run: _LiveRun, problems: list[str]) -> list[tuple[str, str]]:
+    path = run.path / remove_workers.LEDGER
     try:
+        path = worker_ledger(run.path)
+        if not path.exists():
+            return []
         lines = path.read_text(encoding="utf-8").splitlines()
     except (OSError, UnicodeError) as error:
-        _problem(problems, f"seat ledger {path}", error)
+        _problem(problems, f"worker ledger {path}", error)
         return []
-    seats: list[tuple[str, str]] = []
+    workers: list[tuple[str, str]] = []
     for line in lines:
         session_id, separator, name = line.partition("\t")
         if session_id.strip():
-            seats.append((session_id.strip(), name.strip() if separator else ""))
-    return seats
+            workers.append((session_id.strip(), name.strip() if separator else ""))
+    return workers
 
 
 def _slot_role(name: str) -> str:
@@ -760,7 +762,7 @@ def _slot_role(name: str) -> str:
     return candidate if candidate in KNOWN_SLOT_ROLES else "role unknown"
 
 
-def _codex_slot_role(record: _MeshSeat) -> str:
+def _codex_slot_role(record: _MeshWorker) -> str:
     role = _as_string(record.get("role"))
     if not role:
         return "no role"
@@ -810,7 +812,7 @@ def _between_turns_reason(director: DirectorRelationship) -> str:
             return "between turns; no unit director is running"
 
 
-def _mesh_records(run: _LiveRun, problems: list[str]) -> dict[str, _MeshSeat]:
+def _mesh_records(run: _LiveRun, problems: list[str]) -> dict[str, _MeshWorker]:
     path = run.path / "mesh_roster.json"
     if not path.exists():
         return {}
@@ -819,10 +821,10 @@ def _mesh_records(run: _LiveRun, problems: list[str]) -> dict[str, _MeshSeat]:
     except (OSError, UnicodeError, ValueError, json.JSONDecodeError) as error:
         _problem(problems, f"Codex roster {path}", error)
         return {}
-    records: dict[str, _MeshSeat] = {}
+    records: dict[str, _MeshWorker] = {}
     for name, value in stored.items():
         if isinstance(value, dict):
-            records[name] = cast("_MeshSeat", cast("object", value))
+            records[name] = cast("_MeshWorker", cast("object", value))
     return records
 
 
@@ -867,11 +869,11 @@ def _ledger_workers(
     workers: dict[str, _WorkerPlace] = {}
     records_list = list(records)
     for run in runs:
-        for ledger_id, seat_name in _seat_ledger(run, problems):
+        for ledger_id, worker_name in _worker_ledger(run, problems):
             for record in records_list:
                 session_id = record["sessionId"]
                 if session_id == ledger_id or session_id.startswith(ledger_id):
-                    _ = workers.setdefault(session_id, _WorkerPlace(run, seat_name))
+                    _ = workers.setdefault(session_id, _WorkerPlace(run, worker_name))
     return workers
 
 
@@ -907,7 +909,7 @@ def _claude_entries(
             role = "worker"
             worker = workers[session_id]
             assignment = WorkerAssignment(
-                _slot_role(worker.seat_name or record["name"]),
+                _slot_role(worker.worker_name or record["name"]),
                 str(worker.run.path),
             )
             run_director = worker.run.director
@@ -1092,8 +1094,8 @@ def _delegate_workers(
                 name=name,
                 status=_worker_status(status),
                 reach=(
-                    Messageable(f"seat:{run.path.name}/{name}")
-                    if status in MESSAGEABLE_SEAT_STATUSES
+                    Messageable(f"worker:{run.path.name}/{name}")
+                    if status in MESSAGEABLE_WORKER_STATUSES
                     else CannotReceiveMessages(_between_turns_reason(place.director))
                 ),
                 cwd=cwd,

@@ -199,9 +199,75 @@ The design is `~/.local/state/plan-backlog/2026-10-13-user-message-clarity.md`, 
 
 **Ruled out:** provenance tracking of example values against real sends — the logs hold no real sends for those senders; the catalog says where its examples come from.
 
+### Phase 10 — Workers, not seats: one word for a delegate agent everywhere  · status: done
+
+**Depends on:** Phase 9
+
+#### Work Order
+
+**Goal:** Every text a user or agent reads, every CLI name and every code identifier, file and test under `~/.claude` says "worker" where it said "seat", with no old name left as an alias.
+
+**Spec:**
+- The user's request (2026-10-14, via the showrunner): stop calling delegate workers "seats"; call them workers. One way to do a thing: no old CLI alias, no old identifier kept beside the new one.
+- Scope: every tracked file that says seat in any form (`seat`, `seats`, `Seat`, `seat_`, `_seat`, `SeatX` identifiers; 169 files, about 3,400 matches at 2026-10-14 07:43 EDT): scripts, tests, fixtures, commands, skills, `docs/` (format docs, `production_format.md`, `delegate_plan_format.md`, `decision_criteria.md`), as-built docs, `config/delegate.conf`, `codex/AGENTS-messaging.md`, and this plan's own todo phases. Grammar follows the word: "a seat" → "a worker", "seat's" → "worker's", "re-seat" → "reassign workers"; the `**Seats:**` Work Order field becomes `**Workers:**` in the format docs, `berth.work_order` and every remaining todo Work Order in this repository's plans that the unit may edit.
+- CLI: `accounts.py swap seats` / `set-role seats` / `role seats` become `workers`; every subcommand, flag and option naming a seat is renamed with no alias, and every caller (commands, skills, scripts, docs) uses the new name.
+- Files renamed with `git mv`, every reference updated: `scripts/delegate/remove_seats.py` → `remove_workers.py` (+ its test), `scripts/delegate/seat_name.sh` → `worker_name.sh`, `scripts/whoami/seat_usage.py` → `worker_usage.py` (+ its test), `scripts/usage/fixtures/day1_seats/` → `day1_workers/`, `docs/as-built/long-lived-seats.md` → `long-lived-workers.md` (links repointed, including the production doc's link if it names it).
+- Persisted state: names of files and JSON keys that live runs write (session dirs under `/tmp/claude/delegate/*/`, `~/.local/state/**`) are renamed too. A reader that finds only the old file name or key renames it once to the new name on first read, so a run started before the merge keeps working; nothing reads both names afterwards. Test: a session dir holding old-name files works with the new code and holds only new names after one read.
+- Out of scope: other units' live plan docs (`docs/plans/build-followups-*.md` other than this one) — list each one with its seat count in the checkpoint notice for the showrunner to route; memory files under `~/.claude/projects` — the showrunner edits them from a list of seat → worker changes this phase sends it (each old name with its new name).
+- Held directories (showrunner 2026-10-14 07:50 EDT; `scripts/delegate/` released into this phase 07:53 EDT): `scripts/accounts/` and `scripts/whoami/` (two-accounts, through its Phase 20 and the account-notes phase) are not edited in this phase. Names those two directories define or read keep their current spelling everywhere for now — `seat_usage.py`, the `accounts.py` `seats` subcommands, the `scripts/usage/fixtures/day1_seats/` fixture `test_seat_usage.py` reads, and any identifier, flag, JSON key or state file name read or written by code in them — so nothing breaks across the boundary; the follow-up phase renames them with their references. Text that only describes workers in prose is renamed here. `scripts/delegate/` is renamed in this phase as a follow-up dispatch once the first pass lands: `remove_seats.py` → `remove_workers.py` (+ test), `seat_name.sh` → `worker_name.sh`, session-dir file names and roster keys (migrating once on first read), with every reference.
+- Files other units hold: check the berth board before the first edit; the showrunner named builder-report (`scripts/delegate/`) and two-accounts (`scripts/accounts/`, `scripts/whoami/`). Take a held file only after its holder releases it; never edit around it.
+- Afterwards `git grep -i seat` finds nothing outside this plan's done phases, other units' plan docs and the git history; the notice lists anything left and why.
+
+**Files:**
+- `scripts/delegate/` — remove_workers.py, worker_name.sh, launchers, mesh, review/implement, findings, progress history and their tests
+- `scripts/accounts/` — accounts.py CLI and tests
+- `scripts/whoami/` — worker_usage.py and tests
+- `scripts/usage/` — fixtures day1_workers and tests
+- `scripts/shutdown/`, `scripts/production/`, `scripts/message/`, `scripts/buildlog/`, `scripts/agents/`, `scripts/hooks/`, `scripts/feature_log/`, `scripts/berth/`, `scripts/mac_test/`, `scripts/build_hold/` — words and identifiers
+- `commands/` — unit, showrunner, plan, message, history, hana_shot commands and skills
+- `docs/` — delegate docs, format docs, as-built docs, accounts and quota docs
+- `config/delegate.conf`, `codex/AGENTS-messaging.md`
+- `docs/plans/build-followups-message-clarity.md` — this plan's todo phases
+
+**Workers:** 2 writers (no test lane)
+- `impl` — `scripts/delegate/`, `scripts/agents/`, `scripts/usage/`, `scripts/berth/`, `commands/`, `docs/`, `config/`, `codex/`; does every `git mv` first and posts the old → new path list on the board before `test` edits references
+- `test` (opens as impl) — `scripts/accounts/`, `scripts/whoami/`, `scripts/shutdown/`, `scripts/production/`, `scripts/message/`, `scripts/buildlog/`, `scripts/hooks/`, `scripts/feature_log/`, `scripts/mac_test/`, `scripts/build_hold/`
+
+**Constraints from prior phases:** The lib suite (`scripts/lib`, `test_user_zone`) and `scripts/notify/test_push_texts.py` scan every script; run every script suite before checkpoint (dirs holding `test_*.py`; `tests/` subdirs run with `-s <dir>` and `PYTHONPATH=$PWD:$PWD/scripts`). A catalog text that changes wording invalidates its approval: rerun `review.py texts --id <id>` three times and `--approve` for each changed `push_catalog.py` entry. Live runs on other units use these scripts from `~/.claude` the moment the merge lands, so the persisted-name migration must hold for a run mid-phase.
+
+**Acceptance gate:** every script suite green; basedpyright 0/0 on changed Python; `git grep -i seat` reports only the allowed remainder; the CLI rename tested (`accounts.py swap workers` works, `swap seats` is an unknown command); the old-name state migration tested.
+
+### Phase 11 — Workers, not seats, in the accounts and whoami scripts  · status: todo
+
+**Depends on:** Phase 10
+
+#### Work Order
+
+**Goal:** The two directories still held during the rename and every name they define say "worker", with no alias, and `git grep -i seat` finds nothing outside the allowed remainder.
+
+**Spec:**
+- Runs once the showrunner says two-accounts has released `scripts/accounts/` and `scripts/whoami/` (`scripts/delegate/` moved into the phase before when builder-report released it).
+- Applies the rename Spec of the phase before it to `scripts/accounts/` and `scripts/whoami/`, and renames every name they define or read together with each reference elsewhere: `seat_usage.py` → `worker_usage.py` (+ test), `accounts.py swap|set-role|role seats` → `workers` (no alias), `scripts/usage/fixtures/day1_seats/` → `day1_workers/`, identifiers, flags, JSON keys and state file names. Persisted names migrate once on first read, as in the phase before.
+- Merge origin/build-followups first: two-accounts' work in these directories lands before this phase.
+
+**Files:**
+- `scripts/accounts/` — CLI and words
+- `scripts/whoami/` — worker_usage.py and words
+- `scripts/usage/` — the day1 fixture
+- `commands/` — references to the renamed names
+- `docs/` — references to the renamed names
+
+**Workers:** 2 writers (no test lane)
+- `impl` — `scripts/usage/`, `commands/`, `docs/`, `scripts/delegate/` (references only)
+- `test` (opens as impl) — `scripts/accounts/`, `scripts/whoami/`
+
+**Constraints from prior phases:** Run every script suite before checkpoint, the lib suite and `scripts/notify/test_push_texts.py` included. A changed `push_catalog.py` text needs `review.py texts --id <id>` three times and `--approve`.
+
+**Acceptance gate:** every script suite green; basedpyright 0/0; `accounts.py swap workers` works and `swap seats` is unknown; `git grep -i seat` reports only the allowed remainder; old-name state migration tested.
+
 ### Phase 5 — Questions in showrunner replies  · status: todo
 
-**Depends on:** Phase 4, Phase 6, Phase 9
+**Depends on:** Phase 4, Phase 6, Phase 9, Phase 10
 
 #### Work Order
 
@@ -218,7 +284,7 @@ The design is `~/.local/state/plan-backlog/2026-10-13-user-message-clarity.md`, 
 - Registration writes `pending_reviewed.json` in the showrunner's instance directory (shape under Pending identity); `block_reason` checks the reply against it and deletes it when the reply passes. Later replies carry only the open-question count, as the guide's ask-once rule says.
 - The reviewed-text check runs before the footers-off return in `block_reason` and before `stop-showrunner-footer.py`'s `stop_hook_active` skip; test with footers off and on the retry after a block.
 - A new question is an `open_for_user` object item whose `text` is not in the outstanding list. Registration refuses a new item without `question` ("a new question needs its full text in `question`"); string items and items already outstanding stay reminders. A question never registered is outside this check; the nightly messages pass counts those.
-- Question identity (unit director's call after Phase 3's phase review): a question hold is keyed by `sha256(slug + item text)[:16]`, never by slug alone, so two held questions from one showrunner revise independently; test that case. `judgment_state(path, step)` stays a parser (it is also called for logging, `update_registration.py:334`); the question review runs once, in `update_registration.py footer --state` (the state-writing operation; `register()` schedules jobs and takes no state), after parsing. `review.py` publishes its question-mode API before either seat starts: a `QuestionKey` built from the slug and the item's summary `text`, and `review_question(key: QuestionKey, question: str, revision) -> QuestionOutcome`, guide tags `question,all`, its own `questions/` store, revision found by key, so rewording `question` keeps its revision. It adds a question variant to the existing `PushReview | ReplyContext` review engine rather than a second engine. Tests: a full multi-line question is judged by `question,all` rules with no phone length limits; a reworded question keeps its revision.
+- Question identity (unit director's call after Phase 3's phase review): a question hold is keyed by `sha256(slug + item text)[:16]`, never by slug alone, so two held questions from one showrunner revise independently; test that case. `judgment_state(path, step)` stays a parser (it is also called for logging, `update_registration.py:334`); the question review runs once, in `update_registration.py footer --state` (the state-writing operation; `register()` schedules jobs and takes no state), after parsing. `review.py` publishes its question-mode API before either worker starts: a `QuestionKey` built from the slug and the item's summary `text`, and `review_question(key: QuestionKey, question: str, revision) -> QuestionOutcome`, guide tags `question,all`, its own `questions/` store, revision found by key, so rewording `question` keeps its revision. It adds a question variant to the existing `PushReview | ReplyContext` review engine rather than a second engine. Tests: a full multi-line question is judged by `question,all` rules with no phone length limits; a reworded question keeps its revision.
 - Pending identity (unit director's call after Phase 6's phase review: no turn id exists that registration and the Stop hook share): `pending_reviewed.json` lives in the showrunner's instance directory `showrunner-<slug>/`. Registration finds it by slug; the Stop hook finds it through the instances whose `conf` targets its `session_id` (`showrunner_footer.targeted_instances`). It holds `{items: [{text, reviewed}]}` with no session or turn field. A second registration before a passing reply adds to it; a held question in a batch fails the whole registration and writes nothing (outstanding, pending and history files unchanged); the file is deleted only once the whole Stop-hook check passes, so a retry after a block, a later turn or a replacement session targeting the same instance must still carry the text. The `impl` slot publishes this record shape before the `test` slot writes its reader. Tests use the real Stop-hook payload shape: repeated registration, a partly held batch, an unrelated footer rejection keeping the pending record, a later turn, a replacement session.
 - Types: reminders, questions awaiting facts and reviewed questions are separate record types, converted from JSON at the boundary; `Outstanding` gains no further bare optional fields. A question accepted after review and one accepted because review was unavailable (`Unreviewed`) are distinct states, so a reviewed record never claims a review that did not complete. Replace `Outstanding.after: datetime | None` (`dailies_render.py:265`; absence means due now) with explicit due-now and deferred-until states, converting the optional JSON `after` at the boundary in `read_outstanding()`.
 - Full-question recall: `update_registration.open_items()` (`update_registration.py:290`; `produce.md` names it for a user asking to see the questions in full) prints each item's stored full `question`, multi-line, and `text` for a reminder; routine footers keep the count only. Test a multi-line recall.
@@ -235,7 +301,7 @@ The design is `~/.local/state/plan-backlog/2026-10-13-user-message-clarity.md`, 
 - `scripts/production/test_dailies_render.py` — those fields
 - `scripts/hooks/stop-showrunner-footer.py` — the check runs before the `stop_hook_active` skip
 
-**Seats:** 2 writers (no test lane; `test` opens as impl)
+**Workers:** 2 writers (no test lane; `test` opens as impl)
 - `impl` — `update_registration.py`, `review.py` and their tests; hub: `scripts/notify/review.py`
 - `test` (opens as impl) — `showrunner_footer.py`, `stop-showrunner-footer.py`, `dailies_render.py` and their tests, produce.md sentence; publishes the `Outstanding` due-now/deferred types before `impl` changes `open_items()`
 
@@ -289,7 +355,7 @@ The design is `~/.local/state/plan-backlog/2026-10-13-user-message-clarity.md`, 
 - `scripts/notify/review.py` — recipient filter in `reply_questions` (only when built)
 - `scripts/notify/test_review.py` — its cases (only when built)
 
-**Seats:** 1 writer
+**Workers:** 1 writer
 - `impl` — the measurement script (session directory) and, when built, `review.py` and its tests; hub: `scripts/notify/review.py`
 
 **Constraints from prior phases:** Phase 6: `review.py sample` counts a reply as holding an unregistered question when a question or request sentence from `reply_questions` (`ReplyAsks`; fenced code, inline code and `>` quotes excluded) matches no text from `registered_questions(since)` (current outstanding plus 48 h of `outstanding/<slug>.history.jsonl`), and a reply with only `(recommended` choice lines when no registered text appears in it. Phase 5 records the reviewed question text in that history too, and its footer hook reuses `reply_questions` for the choice-line check, so a filter change must keep that check's behavior; run `scripts/hooks` tests as well when the filter is built. Dry checks use the worktree's `review.py`; nothing reaches the phone.
