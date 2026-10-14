@@ -26,6 +26,7 @@ from typing import Literal, cast
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.accounts import accounts  # noqa: E402
+from scripts.lib.user_zone import user_zone  # noqa: E402
 import agent_accounts  # noqa: E402
 import note_file  # noqa: E402
 
@@ -91,7 +92,7 @@ def note_step(account: NewAccount, login: str | None) -> Step:
         held = note.get("login") if note is not None else None
         if held is not None and held.casefold() == login.casefold():
             return Step(False, f"{other.name} already holds that login; one login, one account")
-    today = datetime.now().astimezone().strftime("%Y-%m-%d")
+    today = datetime.now(user_zone()).strftime("%Y-%m-%d")
     text = "\n".join((
         "---", f'date_created: "[[{today}]]"', f'date_modified: "[[{today}]]"', f"login: {login}",
         "return:", '  - "[[agents.base]]"', "state: inactive",
