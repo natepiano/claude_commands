@@ -18,7 +18,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from importlib import import_module
 from dataclasses import dataclass, field, replace
-from datetime import datetime
+from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
 from typing import Literal, Protocol, TypedDict, cast
@@ -34,10 +34,12 @@ from account import (  # noqa: E402
     named_account_environment,
     named_claude_account,
     own_claude_account,
+    NAMED_ACCOUNT_VARIABLES,
 )
 import add_unit  # noqa: E402
 import herdr  # noqa: E402
 import conversation_pause  # noqa: E402
+import relaunch  # noqa: E402
 from inventory import (  # noqa: E402
     PaneNotRecorded,
     Session,
@@ -48,6 +50,7 @@ from inventory import (  # noqa: E402
     TmuxSessionId,
     TmuxSessionIdNotRecorded,
     WindowHost,
+    live_supervisor,
 )
 from record import (  # noqa: E402
     CLAIM_STALE_SECONDS,
@@ -103,6 +106,7 @@ class ShutdownServices(Protocol):
     def record_time(self) -> str: ...
     def local_machine(self) -> str: ...
     def stopped_sessions_text(self, count: int) -> str: ...
+    def shutdown_command(self, *arguments: str) -> str: ...
     def retire_command(self, login: str, session_id: str) -> list[str]: ...
     def run_notifier(self, verb: str, instance: str) -> None: ...
     def send_message(
@@ -232,7 +236,7 @@ class RestartNotStopped(TypedDict):
     kind: Literal["not stopped"]
     session_id: str
     name: str
-    progress: Literal["waiting", "ready", "held by usage limit", "stopping"]
+    progress: Literal["waiting", "ready", "held by usage limit", "reaping", "stopping"]
 
 
 class RestartNoShutdown(TypedDict):
@@ -545,15 +549,41 @@ def _resume_parts(session: Session, prompt: str, target: str = "") -> ResumePart
     return ResumeParts(session["cwd"], environment, tuple(argv), prompt, account)
 
 
-def _resume_shell(parts: ResumeParts) -> str:
+def _resume_shell(parts: ResumeParts, *, supervised: bool = False) -> str:
     argv = ["claude", *parts.claude_arguments, parts.opening_prompt]
     if isinstance(parts.account, MoveResumeAccount):
         argv = [sys.executable, str(SCRIPTS / "accounts" / "accounts.py"),
                 "exec", parts.account.target, *argv[1:]]
+    if supervised:
+        argv = [str(SCRIPTS / "lib" / "py"), str(SCRIPTS / "lib" / "relaunch.py"),
+                "run", "--", *argv]
     prefix = "".join(f"{key}={shlex.quote(value)} " for key, value in parts.environment.items())
     return (
         f"cd {shlex.quote(parts.cwd)} && {prefix}command "
         f"{shlex.join(argv)}; exec zsh"
+    )
+
+
+def _relaunch_request(parts: ResumeParts, note: str) -> relaunch.RelaunchRequest:
+    environment = dict(parts.environment)
+    unset = {"CLAUDE_CODE_OAUTH_TOKEN"}
+    if isinstance(parts.account, MoveResumeAccount):
+        from scripts.accounts import accounts
+
+        prepared = accounts.prepared_account(parts.account.target, resume=True)
+        if isinstance(prepared, accounts.AccountRefused):
+            raise accounts.AccountsError(prepared.reason)
+        environment.update(prepared.variables)
+        unset.update(prepared.remove)
+    elif parts.account.config_dir == Path.home() / ".claude":
+        unset.update(NAMED_ACCOUNT_VARIABLES)
+    return relaunch.RelaunchRequest(
+        argv=["claude", *parts.claude_arguments, parts.opening_prompt],
+        cwd=parts.cwd,
+        environment=environment,
+        unset=sorted(unset),
+        written_at=datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        note=note,
     )
 
 
@@ -1052,12 +1082,24 @@ def _launch_session(
                 session, f"{_showrunner_prompt(session)} {note}", record.get("target", "")))
         _herdr_launch(parts, session, dry_run=dry_run)
         return SessionLaunched()
-    command = _resume_shell(parts)
+    window_launch = host["kind"] in {"ghostty", "zed"} or (
+        host["kind"] == "terminal" and sys.platform == "darwin"
+    )
+    command = _resume_shell(parts, supervised=True) if window_launch else _resume_shell(parts)
     if host["kind"] == "unknown" or (host["kind"] == "terminal" and sys.platform == "linux"):
         return ManualRestartRequired(command)
     _record_scheduled_restart_prompt(
         session["session_id"], prompt, dry_run=dry_run
     )
+    if host["kind"] == "ghostty" or (host["kind"] == "terminal" and sys.platform == "darwin"):
+        supervisor = live_supervisor(host)
+        if supervisor["kind"] == "supervisor":
+            request = _relaunch_request(parts, note)
+            if dry_run:
+                print(f"restart in window via supervisor {supervisor['pid']}: {shlex.join(request['argv'])}")
+            else:
+                relaunch.write_request(supervisor["pid"], request)
+            return SessionLaunched()
     match host["kind"]:
         case "ghostty" | "zed":
             _window_launch(command, session, desktop_state, dry_run=dry_run)
@@ -1663,7 +1705,8 @@ def relaunch_session(
         if record["progress"]["kind"] == "stopping":
             return record
         if _unfinished_cleanup(record):
-            mark_restart_failed(record, "owner cleanup not confirmed; run /shutdown restart again")
+            command = settle.shutdown_command("restart", record["login"], "--here", "--only", record["session"]["session_id"])
+            mark_restart_failed(record, f"owner cleanup not confirmed; in a terminal on {record['machine']}: {command}")
             return record
     try:
         current, claimed = _claim_relaunch(record)
@@ -1756,9 +1799,9 @@ def _up(login: str, dry_run: bool, only: Iterable[str] = ()) -> MachineRestartRe
         print(refusal_line(refusal))
     at = datetime.fromisoformat(settle.record_time())
     for saved in records:
-        if ids and saved["progress"]["kind"] in {"waiting", "ready", "held by usage limit", "stopping"}:
+        if ids and saved["progress"]["kind"] in {"waiting", "ready", "held by usage limit", "reaping", "stopping"}:
             refusal = RestartNotStopped(kind="not stopped", session_id=saved["session"]["session_id"],
-                name=saved["session"]["name"], progress=cast(Literal["waiting", "ready", "held by usage limit", "stopping"], saved["progress"]["kind"]))
+                name=saved["session"]["name"], progress=cast(Literal["waiting", "ready", "held by usage limit", "reaping", "stopping"], saved["progress"]["kind"]))
             refused.append(refusal)
             print(refusal_line(refusal))
         elif ids and saved["progress"]["kind"] == "restarting" and (
@@ -1898,9 +1941,9 @@ def parse_peer_result(text: str) -> PeerRestartResult:
                 missing.append(NoRemoteControl(session_id=identity, name=name, alerts=cast(Literal["user", "none"], item["alerts"])))
             elif item.get("kind") == "no shutdown":
                 refusals.append(RestartNoShutdown(kind="no shutdown", session_id=identity, name=name))
-            elif item.get("kind") == "not stopped" and item.get("progress") in ("waiting", "ready", "held by usage limit", "stopping"):
+            elif item.get("kind") == "not stopped" and item.get("progress") in ("waiting", "ready", "held by usage limit", "reaping", "stopping"):
                 refusals.append(RestartNotStopped(kind="not stopped", session_id=identity, name=name,
-                    progress=cast(Literal["waiting", "ready", "held by usage limit", "stopping"], item["progress"])))
+                    progress=cast(Literal["waiting", "ready", "held by usage limit", "reaping", "stopping"], item["progress"])))
             else:
                 raise ValueError("invalid peer restart refusal")
     return PeerRestartResult(machine=cast(str, fields["machine"]), label=cast(str, fields["label"]),
@@ -2102,11 +2145,16 @@ def restart(
     not_reached = peer_availability is PeerRestartAvailability.NOT_REACHED
     for line in peer["lines"]:
         print(line)
-    incomplete = ""
     if not_reached:
-        incomplete = (f"restart incomplete: {other_machine()} not reached — run /shutdown "
-            "restart again when it is back")
-        print(incomplete)
+        retry = ["restart", selected.login, "--here"]
+        if peer_ids:
+            retry.extend(("--only", ",".join(peer_ids)))
+        if dry_run:
+            retry.append("--dry-run")
+        if isinstance(alerts, NeverAlert):
+            retry.append("--no-alert")
+        print(f"restart incomplete: {other_machine()} not reached; when it is back, "
+            + f"in a terminal on {other_machine()}: {settle.shutdown_command(*retry)}")
     bring_back = local.status == "partial" or peer["outcome"] == "partial" or not_reached
     if notify:
         failure_alert = bring_back and _restart_alerts_enabled(selected.login, ids, peer=peer_availability)

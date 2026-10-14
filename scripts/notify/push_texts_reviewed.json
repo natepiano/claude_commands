@@ -93,36 +93,36 @@
   },
   "quota.codex_on_credits": {
     "codex_one": {
-      "reviewer": "user-spec: Phase 20 alert text close-out, showrunner option 1. Verdict: unreviewed: send changed draft. The user asked for these pushes by name and explicitly authorizes every remaining example for this close-out; Phase 21 rewrites them with the new note file names.",
-      "sha256": "6cef52a34eac4aab3adae7e75a3f06d0e3b925a31fac36b1bc2f4f19ec7ff4ca",
-      "time": "2026-10-14T13:04:42.858056-04:00"
+      "reviewer": "opus",
+      "sha256": "87f1d651ed26f8055ca76293bc1dbfa0cf67a242d846ffc11c391fcbec5ae3c3",
+      "time": "2026-10-14T13:49:53.490615-04:00"
     },
     "codex_two": {
-      "reviewer": "user-spec: Phase 20 alert text close-out, showrunner option 1. Verdict: ask; rules: every-choice-says-what-it-does, what-happened-why-what-you-do, reader-starts-cold, title-names-the-stake. The user asked for these pushes by name and explicitly authorizes every remaining example for this close-out; Phase 21 rewrites them with the new note file names.",
-      "sha256": "6cef52a34eac4aab3adae7e75a3f06d0e3b925a31fac36b1bc2f4f19ec7ff4ca",
-      "time": "2026-10-14T13:04:42.858099-04:00"
+      "reviewer": "opus",
+      "sha256": "87f1d651ed26f8055ca76293bc1dbfa0cf67a242d846ffc11c391fcbec5ae3c3",
+      "time": "2026-10-14T13:50:02.938058-04:00"
     },
     "unknown": {
-      "reviewer": "user-spec: Phase 20 alert text close-out, showrunner option 1. Verdict: unreviewed: send changed draft. The user asked for these pushes by name and explicitly authorizes every remaining example for this close-out; Phase 21 rewrites them with the new note file names.",
-      "sha256": "6cef52a34eac4aab3adae7e75a3f06d0e3b925a31fac36b1bc2f4f19ec7ff4ca",
-      "time": "2026-10-14T13:04:42.858126-04:00"
+      "reviewer": "opus",
+      "sha256": "87f1d651ed26f8055ca76293bc1dbfa0cf67a242d846ffc11c391fcbec5ae3c3",
+      "time": "2026-10-14T13:50:21.066225-04:00"
     },
     "unlimited": {
-      "reviewer": "user-spec: Phase 20 alert text close-out, showrunner option 1. Verdict: unreviewed: send changed draft. The user asked for these pushes by name and explicitly authorizes every remaining example for this close-out; Phase 21 rewrites them with the new note file names.",
-      "sha256": "6cef52a34eac4aab3adae7e75a3f06d0e3b925a31fac36b1bc2f4f19ec7ff4ca",
-      "time": "2026-10-14T13:04:42.858115-04:00"
+      "reviewer": "opus",
+      "sha256": "87f1d651ed26f8055ca76293bc1dbfa0cf67a242d846ffc11c391fcbec5ae3c3",
+      "time": "2026-10-14T13:50:11.999022-04:00"
     }
   },
   "quota.codex_on_credits_last": {
     "codex_one": {
-      "reviewer": "user-spec: Phase 20 alert text close-out, showrunner option 1. Verdict: send. The user asked for these pushes by name and explicitly authorizes every remaining example for this close-out; Phase 21 rewrites them with the new note file names.",
-      "sha256": "81948602619f41c6d971d406ce4fca9131da16e7a1508a16c049ba0994374187",
-      "time": "2026-10-14T13:04:42.858178-04:00"
+      "reviewer": "opus",
+      "sha256": "9cbe9e8840761faa3ba320cb0a28fe993303e2490a271cd8660c7e244386ad89",
+      "time": "2026-10-14T13:48:42.931541-04:00"
     },
     "codex_two": {
-      "reviewer": "user-spec: Phase 20 alert text close-out, showrunner option 1. Verdict: no current review after repair; earlier send applies to the prior wording. The user asked for these pushes by name and explicitly authorizes every remaining example for this close-out; Phase 21 rewrites them with the new note file names.",
-      "sha256": "81948602619f41c6d971d406ce4fca9131da16e7a1508a16c049ba0994374187",
-      "time": "2026-10-14T13:04:42.858192-04:00"
+      "reviewer": "opus",
+      "sha256": "9cbe9e8840761faa3ba320cb0a28fe993303e2490a271cd8660c7e244386ad89",
+      "time": "2026-10-14T13:48:54.141528-04:00"
     }
   },
   "quota.codex_refused": {
@@ -209,16 +209,11 @@
       "time": "2026-10-14T04:24:37.910956-04:00"
     }
   },
-  "shutdown.form": {
-    "long_session": {
-      "reviewer": "opus",
-      "sha256": "96a8e98849ad2c98dde1c44243467b110e578a574e1378e62a1dfd4aa971386a",
-      "time": "2026-10-14T04:29:42.985807-04:00"
-    },
+  "shutdown.holdout": {
     "typical": {
       "reviewer": "opus",
-      "sha256": "96a8e98849ad2c98dde1c44243467b110e578a574e1378e62a1dfd4aa971386a",
-      "time": "2026-10-14T04:29:36.857207-04:00"
+      "sha256": "a632bc0ecd4f69288bbc3e3777e5c9ec8c97f9db8d9739d42b5f78c5facd8b84",
+      "time": "2026-10-14T16:56:04.693522-04:00"
     }
   },
   "shutdown.manual_restart": {

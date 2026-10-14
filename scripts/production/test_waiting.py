@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from scripts.whoami.note_file import AccountStem, account_stem, note_name
+
 import fcntl
 import io
 import json
@@ -102,14 +104,22 @@ class QuotaNote:
     path: Path
     tool: str
     values: dict[str, str]
+    label: str
 
     def __init__(self, path: Path, tool: str, values: dict[str, str]) -> None:
         self.path = path
         self.tool = tool
+        parsed = account_stem(path.stem)
+        assert isinstance(parsed, AccountStem)
+        self.label = parsed.label
         self.values = values
 
     def get(self, key: str) -> str | None:
         return self.values.get(key)
+
+    def get_list(self, key: str) -> tuple[str, ...]:
+        value = self.get(key)
+        return (value,) if value and value != "[]" else ()
 
 
 @final
@@ -490,8 +500,8 @@ class WaitingTests(unittest.TestCase):
         return dailies_render.log_line(report, resolved, moment, moment.tzname() or "PDT")
 
     def quota_note(self, name: str, tool: str = "codex", login: str = "") -> QuotaNote:
-        return QuotaNote(self.root / f"{name}.md", tool, {
-            "state": "active",
+        return QuotaNote(self.root / note_name(name), tool, {
+            "role": "worker" if tool == "codex" else "unit", "sessions": "0",
             "weekly_remaining_usage": "4",
             "resets": "2026-10-12 09:00 PDT",
             "weekly_usage_checked_at": "2026-10-07 02:00 PDT",
@@ -510,7 +520,7 @@ class WaitingTests(unittest.TestCase):
         home = self.root / "codex-fixture"
         readings = quota_alert.CodexAlertPassReadings(
             CodexSeatsAccount("default", home),
-            agent_accounts.KnownCodexAccount(home, "codex@example.invalid", note.path.stem),
+            agent_accounts.KnownCodexAccount(home, "codex@example.invalid", note.label),
             (),
         )
         return quota_alert.message(note, [], config, selection=selection, codex_readings=readings)
@@ -775,7 +785,7 @@ runpy.run_path(sys.argv[0], run_name='__main__')
         self.assertIn(f"request /unit:eta: {ALPHA}", stdout)
 
     def test_waits_accepts_unconfigured_berth_and_still_reports_log_waits(self) -> None:
-        now = datetime.now(ZoneInfo("America/Los_Angeles"))
+        now = datetime(2026, 10, 14, 12, 0, tzinfo=ZoneInfo("America/Los_Angeles"))
         opened = now - timedelta(minutes=72)
         cleared = now - timedelta(minutes=50)
         self.write(self.log, "\n".join((
@@ -785,12 +795,18 @@ runpy.run_path(sys.argv[0], run_name='__main__')
             f"- {(cleared + timedelta(minutes=5)):%H:%M %Z}: block cleared: {BETA} on {ALPHA}", "",
         )))
         self.unconfigured_board()
-        result = self.run_waiting("waits")
-        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertIn("waits: ok — 1 open; berth not configured", result.stdout)
-        self.assertIn(f"{ALPHA} on {BETA}", result.stdout)
-        self.assertRegex(result.stdout, r"open 7[12] minutes")
-        self.assertNotIn(f"{BETA} on {ALPHA}: open", result.stdout)
+        output = io.StringIO()
+        clock = mock.Mock(wraps=datetime, now=mock.Mock(return_value=now))
+        with mock.patch.dict(os.environ, self.env), \
+             mock.patch.object(waiting, "datetime", clock), \
+             mock.patch.object(sys, "argv", [str(SCRIPT), "waits", "--production", str(self.doc)]), \
+             redirect_stdout(output):
+            code = waiting.main()
+        self.assertEqual(code, 0, output.getvalue())
+        self.assertIn("waits: ok — 1 open; berth not configured", output.getvalue())
+        self.assertIn(f"{ALPHA} on {BETA}", output.getvalue())
+        self.assertIn("open 72 minutes", output.getvalue())
+        self.assertNotIn(f"{BETA} on {ALPHA}: open", output.getvalue())
 
     def test_waits_hide_retired_waiting_unit_but_keep_live_wait_on_it(self) -> None:
         content = self.doc.read_text(encoding="utf-8")
@@ -1130,7 +1146,7 @@ runpy.run_path(sys.argv[0], run_name='__main__')
         self.add_gamma()
         note = self.quota_note("claude 3", "claude", login=UNIT_CLAUDE.login)
         notice = self.quota_message(note, TWO_CLAUDE_ACCOUNTS)
-        self.assertTrue(notice.startswith("Quota alert: claude 3 (in use) at 4%"), notice)
+        self.assertTrue(notice.startswith("Quota alert: claude 3 (unit) at 4%"), notice)
         production = add_unit.read_production(self.doc)
         with mock.patch.dict(os.environ, self.env):
             units = waiting.units_from_doc(production)

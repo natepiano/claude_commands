@@ -160,38 +160,65 @@ def _watch_lock() -> Generator[None]:
         yield
 
 
-def _last_transcript_entry(path: Path) -> str:
-    """Read the last complete nonempty line without loading a session's history."""
-    with path.open("rb") as source:
-        _ = source.seek(0, os.SEEK_END)
-        position = source.tell()
-        tail = b""
-        while position:
-            size = min(position, 4096)
-            position -= size
-            _ = source.seek(position)
-            tail = source.read(size) + tail
-            lines = tail.splitlines()
-            complete = lines if position == 0 else lines[1:]
-            last = next((line for line in reversed(complete) if line.strip()), b"")
-            if last:
-                return last.decode("utf-8", errors="replace")
-    return ""
+class TranscriptEntry(TypedDict, total=False):
+    type: str
+    isApiErrorMessage: bool
+    error: str
+    uuid: str
+    timestamp: str
+    message: object
+    quotaLimits: object
 
 
-def transcript_refusal(session_id: str) -> TranscriptRefusal | NoSessionRefusal:
-    paths = list((Path.home() / ".claude" / "projects").glob("*/" + session_id + ".jsonl"))
-    if not paths:
-        return NoSessionRefusal()
-    transcript = max(paths, key=lambda path: path.stat().st_mtime)
-    last = _last_transcript_entry(transcript)
+@dataclass(frozen=True)
+class NewestExchange:
+    entry: TranscriptEntry
+
+
+@dataclass(frozen=True)
+class NoExchange:
+    """No readable user or assistant entry is present in the transcript."""
+
+
+def _newest_exchange(path: Path) -> NewestExchange | NoExchange:
+    """Read the newest user or assistant turn, ignoring trailing bookkeeping."""
     try:
-        value = cast(object, json.loads(last))
-    except ValueError:
+        with path.open("rb") as source:
+            position = source.seek(0, os.SEEK_END)
+            pending = b""
+            while position:
+                size = min(position, 64 * 1024)
+                position -= size
+                _ = source.seek(position)
+                lines = (source.read(size) + pending).split(b"\n")
+                pending = lines[0] if position else b""
+                for line in reversed(lines[1:] if position else lines):
+                    try:
+                        value = cast(object, json.loads(line))
+                    except (ValueError, TypeError, UnicodeError):
+                        continue
+                    if isinstance(value, dict):
+                        entry = cast(dict[str, object], value)
+                        if entry.get("type") in ("user", "assistant"):
+                            return NewestExchange(cast(TranscriptEntry, cast(object, entry)))
+    except OSError:
+        pass
+    return NoExchange()
+
+
+def transcript_refusal(session_id: str, *, config_dir: Path | None = None) -> TranscriptRefusal | NoSessionRefusal:
+    root = config_dir if config_dir is not None else Path.home() / ".claude"
+    try:
+        paths = list((root / "projects").glob("*/" + session_id + ".jsonl"))
+        if not paths:
+            return NoSessionRefusal()
+        transcript = max(paths, key=lambda path: path.stat().st_mtime)
+    except OSError:
         return NoSessionRefusal()
-    if not isinstance(value, dict):
+    latest = _newest_exchange(transcript)
+    if isinstance(latest, NoExchange):
         return NoSessionRefusal()
-    entry = cast(dict[str, object], value)
+    entry = latest.entry
     if entry.get("type") != "assistant" or entry.get("isApiErrorMessage") is not True or entry.get("error") != "rate_limit":
         return NoSessionRefusal()
     entry_id, timestamp = entry.get("uuid"), entry.get("timestamp")
@@ -213,9 +240,29 @@ def transcript_refusal(session_id: str) -> TranscriptRefusal | NoSessionRefusal:
     else:
         text = ""
     folded = text.casefold()
-    window = (refusals.KnownWindow("weekly") if "weekly limit" in folded else
-              refusals.KnownWindow("five_hour") if "hit your session limit" in folded else refusals.UnknownWindow())
-    return TranscriptRefusal(entry_id, RefusedAt(at), window, text)
+    window: refusals.KnownWindow | refusals.UnknownWindow = (
+        refusals.KnownWindow("weekly") if "weekly limit" in folded else
+        refusals.KnownWindow("five_hour") if "hit your session limit" in folded else refusals.UnknownWindow())
+    reset: refusals.KnownReset | refusals.NoResetKnown = refusals.NoResetKnown()
+    quota = entry.get("quotaLimits")
+    if isinstance(quota, dict):
+        limits = cast(dict[str, object], quota)
+        rate_type = limits.get("rateLimitType")
+        if rate_type in ("seven_day", "weekly", "seven_day_opus", "seven_day_sonnet"):
+            window = refusals.KnownWindow("weekly")
+        elif rate_type == "five_hour":
+            window = refusals.KnownWindow("five_hour")
+        raw_reset = limits.get("resetsAt")
+        try:
+            if isinstance(raw_reset, (int, float)) and not isinstance(raw_reset, bool):
+                reset = refusals.KnownReset(datetime.fromtimestamp(raw_reset, timezone.utc))
+            elif isinstance(raw_reset, str):
+                parsed = datetime.fromisoformat(raw_reset)
+                if parsed.tzinfo is not None:
+                    reset = refusals.KnownReset(parsed)
+        except (ValueError, OverflowError, OSError):
+            pass
+    return TranscriptRefusal(entry_id, RefusedAt(at), window, text, reset)
 
 
 def assumed_refusal(session_id: str) -> TranscriptRefusal | NoSessionRefusal:

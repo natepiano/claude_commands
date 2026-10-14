@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from scripts.whoami.note_file import note_name
+
 import io
 import json
 import os
@@ -58,7 +60,7 @@ class AccountMoveTests(ShutdownTestCase):
         _ = self.enterContext(patch.object(inventory, "inventory", side_effect=self.current_inventory))
 
     def note(self, label: str, login: str) -> None:
-        _ = (self.root / "notes" / f"{label}.md").write_text(
+        _ = (self.root / "notes" / note_name(label)).write_text(
             f"---\nlogin: {login}\n---\n", encoding="utf-8")
 
     def named_account(self, label: str, login: str) -> None:
@@ -371,6 +373,12 @@ class AccountMoveTests(ShutdownTestCase):
               patch.object(account, "account_of", return_value=account.Account("claude", report["login"], report["label"])),
               patch.object(inventory, "inventory", return_value=report),
               patch.object(shutdown, "inventory", return_value=report),
+              patch.object(shutdown, "listing", return_value=[inventory.ListedSession(
+                  session_id=director["session_id"], pid=director["pid"],
+                  proc_start=director["proc_start"], name=director["name"], kind="unit",
+                  config_dir=Path(director["config_dir"]), login=report["login"],
+                  production=director["host"]["production"], doc=director["host"]["doc"],
+              )]),
               patch.object(settle, "inventory", return_value=report),
               patch.object(settle, "run_inventory", return_value=report),
               patch.object(settle, "_warm", return_value=True),

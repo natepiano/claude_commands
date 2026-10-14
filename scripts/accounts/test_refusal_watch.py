@@ -1,6 +1,8 @@
 """A provider refusal moves only its live owner, once, through safe shutdown."""
 from __future__ import annotations
 
+from scripts.whoami.note_file import note_name
+
 import io
 import json
 import os
@@ -12,7 +14,7 @@ from collections.abc import Mapping
 from datetime import datetime, timedelta, timezone, tzinfo
 from pathlib import Path
 from importlib import import_module
-from typing import TYPE_CHECKING, Self, cast, final, override
+from typing import TYPE_CHECKING, Literal, Self, cast, final, override
 from unittest.mock import patch
 
 from scripts.accounts import accounts, moves, refusal_watch, refusals
@@ -73,8 +75,8 @@ class RefusalWatchTests(unittest.TestCase):
         for label, login in (("claude 1", SOURCE_LOGIN), ("claude 3", TARGET_LOGIN)):
             self.assertEqual(accounts.setup(label), [])
             _ = (accounts.account_dir(label) / ".claude.json").write_text(json.dumps({"oauthAccount": {"emailAddress": login}}))
-            _ = (self.home / "notes" / f"{label}.md").write_text(f"---\nlogin: {login}\n---\n")
-        _ = (self.home / "notes/claude 2.md").write_text("---\nlogin: main@example.invalid\n---\n")
+            _ = (self.home / "notes" / note_name(label)).write_text(f"---\nlogin: {login}\n---\n")
+        _ = (self.home / "notes/claude2.md").write_text("---\nlogin: main@example.invalid\n---\n")
         self.owners = []
         self.live = []
         WatchTime.at = NOW
@@ -195,7 +197,7 @@ class RefusalWatchTests(unittest.TestCase):
                 requested_by=record.FromTerminal(kind="terminal"), hold="session", then="restart",
                 force="wait for ready", alerts="user", session=owner, seats=[], timers=[],
                 settle_message=record.SettleMessageNotSent(kind="not sent"), where=record.WhereNotSaid(kind="not said"),
-                progress=record.SessionWaiting(kind="waiting"), stop_issues=[], target=target,
+                progress=record.SessionWaiting(kind="waiting"), trail=[], stop_issues=[], target=target,
                 source_label=source.label, why=why)
             self.assertTrue(record.create_session(saved))
         return subprocess.CompletedProcess(command, 0, "added\n", "")
@@ -608,7 +610,7 @@ class RefusalWatchTests(unittest.TestCase):
         output, error = io.StringIO(), io.StringIO()
         from scripts.message import sessions as status_sessions
         with patch.object(status_sessions, "live_sessions", return_value=self.live), redirect_stdout(output), redirect_stderr(error):
-            code = accounts.main(["status"])
+            code = accounts.main(["--detail"])
         self.assertEqual((code, error.getvalue()), (0, ""))
         line = next(line for line in output.getvalue().splitlines() if "owner unit" in line)
         self.assertIn("moving", line)
@@ -642,6 +644,59 @@ class RefusalWatchTests(unittest.TestCase):
         _, output, _ = self.cli("--dry-run")
         for owner in self.owners:
             self.assertNotIn(owner["session_id"], output)
+
+    def test_refusal_survives_metadata_after_the_newest_exchange(self) -> None:
+        path = self.transcript("metadata-refusal")
+        with path.open("a") as stream:
+            for kind in ("system", "bridge-session", "cost-state", "last-prompt",
+                         "queue-operation", "history-suppression", "file-history-snapshot"):
+                _ = stream.write(json.dumps({"type": kind, "subtype": "turn_duration"}) + "\n")
+            _ = stream.write("invalid-json\n\n")
+        found = refusal_watch.transcript_refusal("metadata-refusal")
+        self.assertIsInstance(found, refusal_watch.TranscriptRefusal)
+        if isinstance(found, refusal_watch.TranscriptRefusal):
+            self.assertEqual(found.entry_id, "refusal-one")
+            self.assertEqual(found.window, refusals.KnownWindow("weekly"))
+            self.assertEqual(found.refused_at.at, REFUSAL_AT)
+
+    def test_new_user_exchange_clears_refusal_until_another_refusal_arrives(self) -> None:
+        path = self.transcript("continue-refusal")
+        refusal_line = path.read_text().splitlines()[-1]
+        with path.open("a") as stream:
+            _ = stream.write(json.dumps({"type": "user", "message": {"content": "continue"}}) + "\n")
+            _ = stream.write('{"type":"last-prompt"}\n')
+        self.assertIsInstance(refusal_watch.transcript_refusal("continue-refusal"), refusal_watch.NoSessionRefusal)
+        with path.open("a") as stream:
+            _ = stream.write(refusal_line + '\n{"type":"cost-state"}\n')
+        self.assertIsInstance(refusal_watch.transcript_refusal("continue-refusal"), refusal_watch.TranscriptRefusal)
+        with path.open("a") as stream:
+            _ = stream.write('{"type":"assistant","message":{"content":"done"}}\n{"type":"system"}\n')
+        self.assertIsInstance(refusal_watch.transcript_refusal("continue-refusal"), refusal_watch.NoSessionRefusal)
+
+    def test_refusal_quota_limits_override_text_window_and_supply_reset(self) -> None:
+        for name, window, reset in (("seven_day", "weekly", WEEKLY_RESET),
+                                    ("five_hour", "five_hour", FIVE_HOUR_RESET)):
+            with self.subTest(rate_limit_type=name):
+                path = self.transcript(name, "hit your session limit" if window == "weekly" else "weekly limit")
+                entries = [cast(dict[str, object], json.loads(line)) for line in path.read_text().splitlines()]
+                entries[-1]["quotaLimits"] = {"rateLimitType": name, "resetsAt": int(reset.timestamp())}
+                _ = path.write_text("\n".join(json.dumps(entry) for entry in entries) + '\n{"type":"system"}\n')
+                found = refusal_watch.transcript_refusal(name)
+                self.assertIsInstance(found, refusal_watch.TranscriptRefusal)
+                if isinstance(found, refusal_watch.TranscriptRefusal):
+                    self.assertEqual(found.window, refusals.KnownWindow(cast(Literal["weekly", "five_hour"], window)))
+                    self.assertEqual(found.reset, refusals.KnownReset(reset))
+
+    def test_newest_exchange_reassembles_large_utf8_lines_and_skips_long_metadata(self) -> None:
+        path = self.transcript("split-refusal", "weekly limit " + "é" * 70_000)
+        entries = [cast(dict[str, object], json.loads(line)) for line in path.read_text().splitlines()]
+        _ = path.write_text("\n".join(json.dumps(entry, ensure_ascii=False) for entry in entries) + "\n", encoding="utf-8")
+        with path.open("a") as stream:
+            _ = stream.write(json.dumps({"type": "cost-state", "padding": "x" * 70_000}) + "\n")
+        found = refusal_watch.transcript_refusal("split-refusal")
+        self.assertIsInstance(found, refusal_watch.TranscriptRefusal)
+        if isinstance(found, refusal_watch.TranscriptRefusal):
+            self.assertIn("é" * 70_000, found.text)
 
     def test_healthy_live_owners_never_invoke_inventory_or_start_a_move(self) -> None:
         for host in ("tmux", "unit", "ghostty", "zed", "terminal"):

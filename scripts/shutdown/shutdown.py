@@ -6,8 +6,9 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+import time
 from collections.abc import Iterable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Literal, TypedDict, cast
@@ -30,12 +31,14 @@ from inventory import (
     Inventory,
     Session,
     inventory,
+    listing,
     parse_inventory,
 )
 from launch_permission import (
     LaunchPurpose,
     NewWorkLaunchPurpose,
     ShutdownUnitRestoreLaunchPurpose,
+    shutdown_state_root,
 )
 from record import (
     InvalidRecord,
@@ -352,23 +355,29 @@ class _SelectableSession:
     machine: str
 
 
+@dataclass(frozen=True)
+class ResolvedSessions:
+    session_ids: tuple[str, ...]
+    report: Inventory
+
+
 class SessionSelectionError(ValueError):
     """The requested items do not identify exactly one account session."""
 
 
-def resolve_sessions(login: str, items: Iterable[str], *, here: bool = False) -> list[str]:
-    """Resolve exact names and ids, counting inventory and records once."""
+def resolve_sessions(login: str, items: Iterable[str], *, here: bool = False) -> ResolvedSessions:
+    """Resolve names from membership, then build one filtered inventory."""
     requested = list(dict.fromkeys(items))
     if not requested or any(not item for item in requested):
         raise SessionSelectionError("--only needs a session id or exact name")
-    local_report = inventory(login)
+    local_machine = settle.local_machine()
     local: dict[str, _SelectableSession] = {}
     for saved in session_records(login):
         owner = saved["session"]
         local[owner["session_id"]] = _SelectableSession(owner["session_id"], owner["name"], saved["machine"])
-    for owner in local_report["sessions"]:
-        if owner["kind"] != "seat":
-            local[owner["session_id"]] = _SelectableSession(owner["session_id"], owner["name"], local_report["machine"])
+    for owner in listing(login):
+        if owner.kind != "seat":
+            local[owner.session_id] = _SelectableSession(owner.session_id, owner.name, local_machine)
     candidates = dict(local)
     peer_unavailable = False
     needs_peer = not here and any(item not in local for item in requested)
@@ -395,7 +404,7 @@ def resolve_sessions(login: str, items: Iterable[str], *, here: bool = False) ->
                         if owner["kind"] != "seat":
                             _ = candidates.setdefault(owner["session_id"], _SelectableSession(owner["session_id"], owner["name"], report["machine"]))
         if peer_unavailable:
-            print(f"{other_machine()}: not reached; names checked on {local_report['machine']} only", file=sys.stderr)
+            print(f"{other_machine()}: not reached; names checked on {local_machine} only", file=sys.stderr)
     result: list[str] = []
     for item in requested:
         if item in local:
@@ -413,7 +422,7 @@ def resolve_sessions(login: str, items: Iterable[str], *, here: bool = False) ->
             raise SessionSelectionError("\n".join(lines))
         if matches[0].session_id not in result:
             result.append(matches[0].session_id)
-    return result
+    return ResolvedSessions(tuple(result), inventory(login, only=frozenset(result)))
 
 
 def _remote_conductor_status(login: str) -> ConductorRunning | ConductorNotRunning | ConductorUnavailable:
@@ -438,33 +447,152 @@ def _remote_conductor_status(login: str) -> ConductorRunning | ConductorNotRunni
 
 def _status_actions(records: list[SessionShutdown], ownership: ConductorRunning | ConductorNotRunning | ConductorUnavailable) -> list[str]:
     lines: list[str] = []
-    take_out: list[str] = []
-    stop_now: list[str] = []
-    bring_back: list[str] = []
-    waiting = any(saved["progress"]["kind"] in {"waiting", "ready", "held by usage limit"} for saved in records)
+    take_out: list[SessionShutdown] = []
+    stop_now: list[SessionShutdown] = []
+    bring_back: list[SessionShutdown] = []
+    waiting = any(saved["progress"]["kind"] in {"waiting", "ready", "held by usage limit", "reaping"} for saved in records)
     if waiting:
         if isinstance(ownership, ConductorNotRunning):
-            lines.append("  no conductor running; /shutdown --only <name> resumes one, /shutdown cancel --only <name> takes it out")
+            pending = [saved for saved in records if saved["progress"]["kind"] in {"waiting", "ready", "held by usage limit", "reaping"}]
+            first = pending[0]
+            command = settle.shutdown_command("down", first["login"], "--here", "--only", ",".join(saved["session"]["session_id"] for saved in pending))
+            lines.append(f"  no conductor running; in a terminal on {first['machine']}: {command}")
         elif isinstance(ownership, ConductorUnavailable):
             lines.append(f"  conductor ownership unavailable: {ownership.reason}")
     for saved in records:
-        name = saved["session"]["name"]
         progress = saved["progress"]["kind"]
-        if progress in {"waiting", "ready", "held by usage limit"}:
-            take_out.append(name)
-            stop_now.append(name)
+        if progress in {"waiting", "ready", "held by usage limit", "reaping"}:
+            take_out.append(saved)
+            stop_now.append(saved)
         elif progress == "stop failed":
-            take_out.append(name)
-            stop_now.append(name)
-            bring_back.append(name)
+            take_out.append(saved)
+            stop_now.append(saved)
+            bring_back.append(saved)
         elif progress in {"stopped", "already gone", "process identity lost", "restart failed", "manual restart", "timers pending", "restarting"}:
             if saved["stop_issues"] and progress in {"stopped", "already gone", "process identity lost"}:
-                stop_now.append(name)
-            bring_back.append(name)
+                stop_now.append(saved)
+            bring_back.append(saved)
     for label, verb, names in (("take out", "cancel", take_out), ("stop now", "now", stop_now), ("bring back", "restart", bring_back)):
         if names:
-            lines.append(f"  {label}: /shutdown {verb} --only <name> · {', '.join(names)}")
+            for machine in sorted({saved["machine"] for saved in names}):
+                group = [saved for saved in names if saved["machine"] == machine]
+                command = settle.shutdown_command(verb, group[0]["login"], "--here", "--only", ",".join(saved["session"]["session_id"] for saved in group))
+                lines.append(f"  {label}: in a terminal on {machine}: {command} · {', '.join(saved['session']['name'] for saved in group)}")
     return lines
+
+
+@dataclass
+class RequestHistory:
+    read_paths: set[Path] = field(default_factory=set)
+    records: list[SessionShutdown] = field(default_factory=list)
+    taken_out: set[str] = field(default_factory=set)
+
+
+def _request_records(login: str, request_id: str, history: RequestHistory) -> list[SessionShutdown]:
+    # Read active files first: an archive between these reads is present in at
+    # least one source. Deduplication prefers the finished copy in history.
+    records = session_records(login)
+    directory = shutdown_state_root() / login.casefold() / "history"
+    for path in sorted(directory.glob("*.json")):
+        if path in history.read_paths:
+            continue
+        try:
+            text = path.read_text(encoding="utf-8")
+            value = cast(object, json.loads(text))
+        except FileNotFoundError:
+            continue
+        except (OSError, UnicodeError, ValueError) as error:
+            raise InvalidRecord(f"{path} cannot be read: {error}") from error
+        if not isinstance(value, dict):
+            history.read_paths.add(path)
+            continue
+        fields = cast(dict[str, object], value)
+        if fields.get("request_id") == request_id:
+            archived = parse_session_records("[" + text + "]")
+            for saved in archived:
+                if saved["login"].casefold() == login.casefold():
+                    history.records.append(saved)
+                    if saved["progress"]["kind"] not in {"restarted", "stopped", "already gone"}:
+                        history.taken_out.add(saved["session"]["session_id"])
+        history.read_paths.add(path)
+    records.extend(history.records)
+    return [saved for saved in records if saved["login"].casefold() == login.casefold() and saved["request_id"] == request_id]
+
+
+def _follow_action(saved: SessionShutdown) -> str:
+    progress = saved["progress"]
+    kind = progress["kind"]
+    place = f"in a terminal on {saved['machine']}"
+    if progress["kind"] == "manual restart":
+        return f"{saved['session']['name']}: {place}: {progress['command']}"
+    verb = "now" if kind in {"stop failed", "waiting", "stopped", "already gone"} else "restart"
+    command = settle.shutdown_command(verb, saved["login"], "--here", "--only", saved["session"]["session_id"])
+    if kind == "process identity lost":
+        return f"{saved['session']['name']}: process identity lost; inspect its window before restarting; {place}: {command}"
+    if kind == "waiting":
+        return settle.holdout_line(saved)
+    return f"{saved['session']['name']}: {kind}; {place}: {command}"
+
+
+def follow(login: str, request_id: str) -> int:
+    """Follow one local request through its active records and archived outcomes."""
+    known: dict[str, SessionShutdown] = {}
+    printed: dict[str, int] = {}
+    history = RequestHistory()
+    reported_taken_out: set[str] = set()
+    command = settle.shutdown_command("follow", login, "--request", request_id)
+    try:
+        while True:
+            for saved in _request_records(login, request_id, history):
+                identity = saved["session"]["session_id"]
+                known[identity] = saved
+            if not known:
+                print(f"no shutdown records for request {request_id}; in this terminal: {command}", flush=True)
+                return 1
+            for identity, saved in known.items():
+                trail = saved.get("trail", [])
+                for step in trail[printed.get(identity, 0):]:
+                    at = datetime.fromisoformat(step["at"]).astimezone(user_zone()).strftime("%H:%M:%S")
+                    detail = settle.located_detail(saved, step["detail"])
+                    print(f"{at} {saved['session']['name']}: {step['kind']} {detail}".rstrip(), flush=True)
+                printed[identity] = len(trail)
+                if identity in history.taken_out and identity not in reported_taken_out:
+                    at = datetime.now(user_zone()).strftime("%H:%M:%S")
+                    print(f"{at} {saved['session']['name']}: taken out", flush=True)
+                    reported_taken_out.add(identity)
+            for identity, saved in known.items():
+                if identity in history.taken_out:
+                    continue
+                kind = saved["progress"]["kind"]
+                if kind in {"process identity lost", "stop failed", "restart failed", "manual restart", "timers pending"} or (kind == "waiting" and "alerted_at" in saved) or (kind in {"stopped", "already gone"} and saved["stop_issues"]):
+                    print(_follow_action(saved), flush=True)
+                    return 1
+            if all(identity in history.taken_out or saved["progress"]["kind"] == "restarted" or (
+                saved["then"] == "stop" and saved["progress"]["kind"] in {"stopped", "already gone"}
+            ) for identity, saved in known.items()):
+                destinations = {saved.get("target") or saved["label"] for saved in known.values() if saved["progress"]["kind"] == "restarted"}
+                if history.taken_out:
+                    outcomes: list[str] = []
+                    for destination in sorted(destinations):
+                        count = sum(saved["progress"]["kind"] == "restarted" and (saved.get("target") or saved["label"]) == destination for saved in known.values())
+                        outcomes.append(f"{count} back on {destination}")
+                    stopped = sum(identity not in history.taken_out and saved["progress"]["kind"] in {"stopped", "already gone"} for identity, saved in known.items())
+                    if stopped:
+                        outcomes.append(f"{stopped} stopped")
+                    outcomes.append(f"{len(history.taken_out)} taken out")
+                    summary = f"all {len(known)} done: {', '.join(outcomes)}"
+                elif all(saved["progress"]["kind"] == "restarted" for saved in known.values()):
+                    summary = f"all {len(known)} back on {', '.join(sorted(destinations))}"
+                elif not destinations:
+                    summary = f"all {len(known)} stopped"
+                else:
+                    summary = f"all {len(known)} done: stopped or back on {', '.join(sorted(destinations))}"
+                print(summary, flush=True)
+                return 0
+            time.sleep(1)
+    except KeyboardInterrupt:
+        print(f"the shutdown keeps running; to follow it again, in this terminal: {command}", flush=True)
+        return 130
 
 
 def _only_ids(value: str | None) -> tuple[str, ...]:
@@ -513,11 +641,15 @@ def held_session_ids() -> list[str]:
 
 
 def main(arguments: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description=__doc__)
+    parser = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter,
+        usage="in this terminal: ~/.claude/scripts/lib/py ~/.claude/scripts/shutdown/shutdown.py <verb> <account> [options]",
+        epilog="Run in this terminal: ~/.claude/scripts/lib/py ~/.claude/scripts/shutdown/shutdown.py <verb> <account> [--only ID[,ID...]].\nFollow in this terminal: ~/.claude/scripts/lib/py ~/.claude/scripts/shutdown/shutdown.py follow <account> --request <request-id>.",
+    )
     commands = parser.add_subparsers(
         dest="command",
         required=True,
-        metavar="{down,status,now,cancel,restart,launch-blocked}",
+        metavar="{down,status,follow,now,cancel,restart,launch-blocked}",
     )
     down = commands.add_parser("down", help="start a safe account shutdown")
     _ = down.add_argument("account", nargs="?")
@@ -533,6 +665,9 @@ def main(arguments: list[str] | None = None) -> int:
     _ = status.add_argument("account", nargs="?")
     _ = status.add_argument("--json", action="store_true", dest="as_json")
     _ = status.add_argument("--here", action="store_true")
+    follow_command = commands.add_parser("follow", help="follow one local shutdown request")
+    _ = follow_command.add_argument("account")
+    _ = follow_command.add_argument("--request", dest="request_id", required=True)
     records = commands.add_parser("records")
     _ = records.add_argument("--json", action="store_true", dest="as_json")
     _ = records.add_argument("--here", action="store_true")
@@ -544,7 +679,7 @@ def main(arguments: list[str] | None = None) -> int:
     _ = conduct.add_argument("--here", action="store_true")
     ready = commands.add_parser("ready")
     _ = ready.add_argument("--where", required=True)
-    cancel = commands.add_parser("cancel", help="undo a settling shutdown")
+    cancel = commands.add_parser("cancel", help="take sessions not yet stopped out of a shutdown")
     _ = cancel.add_argument("account", nargs="?")
     _ = cancel.add_argument("--here", action="store_true")
     _ = cancel.add_argument("--only", metavar="NAME[,NAME...]", help="session ids or exact names, separated by commas")
@@ -643,7 +778,7 @@ def main(arguments: list[str] | None = None) -> int:
                 print(f"shutdown: {error}", file=sys.stderr)
                 return 1
             try:
-                restart_ids = resolve_sessions(selected.login, _only_ids(options.only), here=options.here)
+                restart_ids = list(resolve_sessions(selected.login, _only_ids(options.only), here=options.here).session_ids)
             except SessionSelectionError as error:
                 print(f"shutdown: {error}", file=sys.stderr)
                 return 2
@@ -685,10 +820,14 @@ def main(arguments: list[str] | None = None) -> int:
         except (UnreadableAccount, UnknownAccountName) as error:
             print(f"shutdown: {error}", file=sys.stderr)
             return 2
+        if options.command == "follow":
+            return follow(selected.login, options.request_id)
         ids: tuple[str, ...] = ()
+        down_report: Inventory | settle.InventoryNeeded = settle.InventoryNeeded()
         if options.command in {"down", "now", "cancel"} and options.only is not None:
             try:
-                ids = tuple(resolve_sessions(selected.login, _only_ids(options.only), here=options.here))
+                resolved = resolve_sessions(selected.login, _only_ids(options.only), here=options.here)
+                ids, down_report = resolved.session_ids, resolved.report
             except SessionSelectionError as error:
                 print(f"shutdown: {error}", file=sys.stderr)
                 return 2
@@ -696,12 +835,14 @@ def main(arguments: list[str] | None = None) -> int:
                 print(f"shutdown: {error}", file=sys.stderr)
                 return 3
         if options.command == "down":
+            if isinstance(down_report, settle.InventoryNeeded):
+                down_report = inventory(selected.login)
             return settle.down(
                 selected, options.here, ids,
                 then="restart" if options.restart else "stop",
                 alerts="none" if options.no_alert else "user",
                 requested_by=options.requested_by, request_id=options.request_id,
-                target=options.target, why=options.why,
+                target=options.target, why=options.why, report=down_report,
             )
         if options.command == "now":
             return settle.now(selected, options.here, ids)
@@ -724,7 +865,7 @@ def main(arguments: list[str] | None = None) -> int:
                            else _remote_shutdown_records(selected.login))
                 record_lines = _shutdown_record_lines(outcome, observations, local_observation=index == 0)
                 if outcome["kind"] == "records":
-                    waiting = any(saved["progress"]["kind"] in {"waiting", "ready", "held by usage limit"} for saved in outcome["records"])
+                    waiting = any(saved["progress"]["kind"] in {"waiting", "ready", "held by usage limit", "reaping"} for saved in outcome["records"])
                     ownership = (conductor_status(selected.login) if index == 0 else _remote_conductor_status(selected.login)) if waiting else ConductorNotRunning()
                     record_lines.extend(_status_actions(outcome["records"], ownership))
                 if record_lines:

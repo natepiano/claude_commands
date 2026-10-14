@@ -60,7 +60,9 @@ class StatusTests(IsolatedTargetTest):
     def test_running_line_uses_local_zone(self) -> None:
         since = datetime(2026, 10, 11, 20, 20, tzinfo=timezone.utc)
         self.assertEqual(
-            build_targets.format_state("mac", targets.Running("nextest hana", since)),
+            build_targets.format_state(
+                "mac", targets.Running((targets.RunningJob("nextest hana", since, targets.NOT_SEEN_IDLE),)),
+            ),
             "mac: running nextest hana since 13:20 PDT",
         )
 
@@ -79,6 +81,28 @@ class StatusTests(IsolatedTargetTest):
             code, output, errors = self.capture_status()
         self.assertEqual((code, errors), (0, ""))
         self.assertEqual(output, "mac: running nextest hana since 13:05 PDT, idle since 13:20\nnatedev: free\n")
+
+    def test_mac_running_status_lists_every_repository_claim(self) -> None:
+        later = SINCE + timedelta(minutes=10)
+        self.write_claim("claims/cargo-liner.json", "nextest cargo-liner", later)
+        liner = self.mac_state / "claims" / "cargo-liner.json"
+        record = cast(dict[str, object], json.loads(liner.read_text()))
+        record["idle_since"] = "2026-10-11T20:20:00+00:00"
+        _ = liner.write_text(json.dumps(record))
+        self.write_claim("claims/hana.json")
+        config = self.write_config(
+            "targets=mac,natedev\nkind.mac=ssh\nplatform.mac=macos\nsettings.mac=mac_test.conf\n"
+            + "kind.natedev=local\nplatform.natedev=linux\n",
+        )
+        with mock.patch.dict(os.environ, {"BUILD_TARGETS_CONFIG": str(config)}), \
+             mock.patch.object(mac_test, "process_start_time", return_value="test-run-start"):
+            code, output, errors = self.capture_status()
+        self.assertEqual((code, errors), (0, ""))
+        self.assertEqual(
+            output,
+            "mac: running nextest hana since 13:05 PDT; "
+            + "running nextest cargo-liner since 13:15 PDT, idle since 13:20\nnatedev: free\n",
+        )
 
     def test_mac_running_status_without_idle_time_keeps_existing_line(self) -> None:
         self.write_claim()
@@ -134,7 +158,9 @@ class StatusTests(IsolatedTargetTest):
 
     def test_run_description_whitespace_collapses_to_one_line(self) -> None:
         self.assertEqual(
-            build_targets.format_state("mac", targets.Running("  nextest\n\t hana\r\nrun  ", SINCE)),
+            build_targets.format_state(
+                "mac", targets.Running((targets.RunningJob("  nextest\n\t hana\r\nrun  ", SINCE, targets.NOT_SEEN_IDLE),)),
+            ),
             "mac: running nextest hana run since 13:05 PDT",
         )
 

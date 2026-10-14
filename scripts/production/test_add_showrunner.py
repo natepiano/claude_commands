@@ -120,7 +120,7 @@ class AddShowrunnerTests(unittest.TestCase):
         notes = home / "notes"
         notes.mkdir()
         self.env["AGENT_NOTES_DIR"] = str(notes)
-        _ = (notes / "claude 2.md").write_text("---\nlogin: main@example.invalid\n---\n")
+        _ = (notes / "claude2.md").write_text("---\nlogin: main@example.invalid\n---\n")
         now = datetime.now(timezone.utc)
         file = home / ".local/state/agent-notes/usage.json"
         file.parent.mkdir(parents=True)
@@ -262,7 +262,7 @@ class AddShowrunnerTests(unittest.TestCase):
     def named_account(self) -> Path:
         with patch.dict(os.environ, self.env, clear=True):
             notes = Path(self.env["AGENT_NOTES_DIR"])
-            _ = (notes / "claude 3.md").write_text("---\nlogin: target@example.invalid\n---\n")
+            _ = (notes / "claude3.md").write_text("---\nlogin: target@example.invalid\n---\n")
             self.assertEqual(accounts.setup("claude 3"), [])
             directory = accounts.account_dir("claude 3")
             _ = (directory / ".claude.json").write_text(json.dumps({"oauthAccount": {"emailAddress": "target@example.invalid"}}))

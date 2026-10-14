@@ -17,7 +17,8 @@ from typing import cast, final, override
 from unittest.mock import patch
 
 from test_support import ShutdownTestCase
-from test_restart import pane_display, top_level
+from test_restart import entry, pane_display, top_level
+import record
 import inventory
 import account
 import fake_tmux
@@ -347,8 +348,8 @@ class InventoryTests(ShutdownTestCase):
         self.addCleanup(self.live_socket.close)
         self.write_account(self.target_config, TARGET_LOGIN)
         self.write_account(self.other_config, OTHER_LOGIN)
-        _ = (self.notes / "claude 2.md").write_text(
-            f"---\nlogin: {TARGET_LOGIN.upper()}\nstate: active\n---\n",
+        _ = (self.notes / "claude2.md").write_text(
+            f"---\nlogin: {TARGET_LOGIN.upper()}\nsessions: 1\n---\n",
             encoding="utf-8",
         )
         config_by_pid: dict[int, Path | None] = {
@@ -748,6 +749,7 @@ elif "comm=" in joined:
                 "kind": "ghostty",
                 "desktop": {"kind": "named", "name": "Writing"},
                 "window_shell": DESKTOP_SHELL_PID,
+                "supervisor": {"kind": "no supervisor"},
             },
         )
 
@@ -961,6 +963,80 @@ elif "comm=" in joined:
         )
 
         self.assertEqual(director["host"].get("window_shell"), DIRECTOR_SHELL_PID)
+
+    def test_ghostty_supervisor_identity_is_discovered_with_cached_desktops(self) -> None:
+        supervisor_pid = 99_999_999
+        rows = cast(dict[str, list[object]], json.loads(os.environ["SHUTDOWN_TEST_PARENT_ROWS"]))
+        rows[str(self.director_pid)] = [supervisor_pid, "claude"]
+        rows[str(supervisor_pid)] = [DIRECTOR_SHELL_PID, "python3"]
+        def cmdline(path: Path) -> bytes:
+            if path == Path(f"/proc/{supervisor_pid}/cmdline"):
+                return b"python3\0/tmp/relaunch.py\0run\0--\0claude\0"
+            raise FileNotFoundError(path)
+        for refresh in (True, False):
+            with (
+                self.subTest(refresh=refresh),
+                patch.dict(os.environ, {"SHUTDOWN_TEST_PARENT_ROWS": json.dumps(rows)}),
+                patch.object(Path, "read_bytes", autospec=True, side_effect=cmdline),
+            ):
+                found = inventory.inventory(TARGET_LOGIN, only=frozenset({DIRECTOR_ID}),
+                    refresh_desktops=refresh)
+                owner = next(item for item in found["sessions"] if item["session_id"] == DIRECTOR_ID)
+                host = owner["host"]
+                assert host["kind"] == "ghostty"
+                self.assertEqual(host["window_shell"], DIRECTOR_SHELL_PID)
+                self.assertEqual(host.get("supervisor"), {"kind": "supervisor", "pid": supervisor_pid,
+                    "proc_start": CURRENT_PROCESS_START})
+
+    def test_mac_ghostty_inventory_preserves_supervisor_and_legacy_terminal_host(self) -> None:
+        rows = {
+            101: "902 claude", 902: "901 python3", 901: "900 zsh",
+            900: "1 /Applications/Ghostty.app/Contents/MacOS/ghostty",
+        }
+        def process(argv: tuple[str, ...], **_kwargs: object) -> subprocess.CompletedProcess[str]:
+            pid = int(argv[-1])
+            output = ("python3 /tmp/relaunch.py run -- claude" if argv[2] == "args="
+                      else rows[pid])
+            return subprocess.CompletedProcess(argv, 0, output, "")
+        with (patch.object(sys, "platform", "darwin"),
+              patch.object(Path, "read_bytes", side_effect=FileNotFoundError),
+              patch.object(subprocess, "run", side_effect=process),
+              patch.object(inventory, "_process_start", return_value="supervisor-start")):
+            host = inventory._terminal_host(101, inventory.DesktopNotInSnapshot(kind="not in snapshot"))  # pyright: ignore[reportPrivateUsage]
+            self.assertEqual(host, {"kind": "terminal", "supervisor": {
+                "kind": "supervisor", "pid": 902, "proc_start": "supervisor-start"}})
+            owner = top_level("mac-supervised", host=host)
+            saved = entry(owner)
+            parsed = record.parse_session_records(json.dumps([saved]))[0]
+            self.assertEqual(parsed["session"]["host"], host)
+            rows[101] = "901 claude"
+            with patch.object(inventory, "_supervisor_process", return_value=inventory.NoSupervisor(kind="no supervisor")):
+                legacy = inventory._terminal_host(101, inventory.DesktopNotInSnapshot(kind="not in snapshot"))  # pyright: ignore[reportPrivateUsage]
+            self.assertEqual(legacy, {"kind": "terminal"})
+
+    def test_ghostty_shell_parent_is_not_a_supervisor(self) -> None:
+        with patch.object(Path, "read_bytes", side_effect=FileNotFoundError):
+            found = inventory.inventory(TARGET_LOGIN, only=frozenset({DIRECTOR_ID}),
+                refresh_desktops=False)
+        owner = next(item for item in found["sessions"] if item["session_id"] == DIRECTOR_ID)
+        host = owner["host"]
+        assert host["kind"] == "ghostty"
+        self.assertEqual(host.get("supervisor"), {"kind": "no supervisor"})
+
+    def test_pre_supervisor_window_inventory_and_record_read_as_no_supervisor(self) -> None:
+        found = inventory.inventory(TARGET_LOGIN, only=frozenset({DESKTOP_ID}))
+        owner = found["sessions"][0]
+        host = owner["host"]
+        assert host["kind"] == "ghostty"
+        _ = host.pop("supervisor", None)
+        decoded = inventory.parse_inventory(json.dumps(found))["sessions"][0]["host"]
+        assert decoded["kind"] == "ghostty"
+        self.assertEqual(decoded.get("supervisor"), {"kind": "no supervisor"})
+        saved = entry(owner)
+        parsed = record.parse_session_records(json.dumps([saved]))[0]
+        legacy_host = parsed["session"]["host"]
+        assert legacy_host["kind"] == "ghostty"
+        self.assertEqual(legacy_host.get("supervisor"), {"kind": "no supervisor"})
 
     def test_running_codex_worker_without_launcher_is_busy_but_dead_launcher_is_not(self) -> None:
         found = inventory.inventory(TARGET_LOGIN)

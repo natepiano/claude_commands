@@ -33,10 +33,10 @@
 # the whole workspace.
 #
 # The lint stages — mend, fmt, clippy, doc — are gated by config/lint.conf (edit
-# it with /lint_config), so one switch silences a check across /clippy, the fix
-# pipeline, and every delegate phase. `lint` also always runs taplo fmt --check
-# at the workspace root, using its taplo.toml. A phase runs all five; only the
-# branch-wide style review is left to the plan-final gate. A gated-off check
+# it with /lint_config), so one switch silences a check across the fix pipeline
+# and every delegate phase. `lint` also always runs taplo fmt --check at the
+# workspace root, using its taplo.toml. A phase runs all five; its unit director
+# runs the style review in the main review. A gated-off check
 # prints a SKIPPED line and the command still exits 0. Scope is never
 # configurable: the target pinning and the single package selection above are
 # correctness and cache constraints, not preferences. cargo check and cargo
@@ -109,8 +109,6 @@
 #                                          failed) on this tree, a flake hunt;
 #                                          the result replaces the record
 #   verify.sh test <package> --local "<why>"   run on natedev; only for a test that must run on Linux
-#   verify.sh fmt <package>               format only (checkpoint-commit backstop)
-#                                          — gated by config/lint.conf
 #   verify.sh example <package> <name>     clippy one example (only when the
 #                                          phase changed that example)
 #   verify.sh final                        full workspace gate; refuse examples
@@ -755,8 +753,14 @@ note_event() {
 }
 
 MAC_RUNNER="${VERIFY_MAC_RUNNER:-$HOME/.claude/scripts/mac_test/offload.py}"
+MAC_TEST_SCRIPT="${VERIFY_MAC_TEST_SCRIPT:-$HOME/.claude/scripts/mac_test/mac_test.py}"
 MAC_RESULT_FILE=""
 MAC_RUNNER_PID=""
+# The Mac settings a local test may still leave for (run_local_test): a Mac
+# that declined busy or blocked. MAC_LEAVE_REASON is that decline, passed back
+# as --last-decline.
+MAC_LEAVE_SETTINGS=""
+MAC_LEAVE_REASON=""
 
 forward_mac_runner_signal() {
     local signal_name=$1 exit_status=$2
@@ -777,6 +781,8 @@ forward_mac_runner_signal() {
 }
 
 try_mac_test() {
+    local caller_traps
+    caller_traps="$(trap -p INT TERM HUP)"
     trap 'forward_mac_runner_signal INT 130' INT
     trap 'forward_mac_runner_signal TERM 143' TERM
     trap 'forward_mac_runner_signal HUP 129' HUP
@@ -802,9 +808,8 @@ try_mac_test() {
     else
         runner_status=$?
     fi
-    trap 'hold_interrupted INT 130' INT
-    trap 'hold_interrupted TERM 143' TERM
-    trap 'hold_interrupted HUP 129' HUP
+    trap - INT TERM HUP
+    eval "$caller_traps"
     MAC_RUNNER_PID=""
 
     if [[ -f "$MAC_RESULT_FILE" && -r "$MAC_RESULT_FILE" \
@@ -859,6 +864,8 @@ try_mac_test() {
             ;;
         passed)
             if [[ "$FILTER_RUN" -eq 1 ]]; then
+                # A pass on the Mac is never natedev's pass record.
+                RUN_KEY=""
                 BUILDLOG_MAC=passed_filter
                 echo "verify.sh: PASS on the Mac (macOS). A filtered run is feedback, so nothing ran on natedev."
                 note_event ran "${SECONDS}" 0 "" 0 0
@@ -892,6 +899,12 @@ register_routing_demand() {
         cp "$HOLD_WAIT_DIR/routing-diagnostic" "$HOLD_WAIT_DIR/last-routing-diagnostic"
     fi
     return "$admission"
+}
+
+# Status 0 when mac_test.py says a claim for this repository made now could
+# start a run on the Mac these settings name: local records only, no SSH.
+mac_free_now() {
+    "$PY" "$MAC_TEST_SCRIPT" free-now --settings "$1" --repo-root "$(git rev-parse --show-toplevel)" >/dev/null 2>&1
 }
 
 route_test() {
@@ -931,9 +944,13 @@ route_test() {
         if [[ "$BUILDLOG_MAC" == declined && ( "$BUILDLOG_MAC_REASON" == busy || "$BUILDLOG_MAC_REASON" == blocked ) ]]; then
             retry_settings+=("$settings")
             retry_reasons+=("$BUILDLOG_MAC_REASON")
+            if [[ -z "$MAC_LEAVE_SETTINGS" ]]; then
+                MAC_LEAVE_SETTINGS="$settings" MAC_LEAVE_REASON="$BUILDLOG_MAC_REASON"
+            fi
         else
             # A full Mac pass needs the local gate; a lost attempt or another
             # decline needs the existing local wait, without more Mac tries.
+            MAC_LEAVE_SETTINGS="" MAC_LEAVE_REASON=""
             return 0
         fi
     done <<< "$table"
@@ -951,37 +968,70 @@ route_test() {
             echo "verify.sh: waiting for the Mac ($BUILDLOG_MAC_REASON) or natedev's release." >&2
             announced_reason="$BUILDLOG_MAC_REASON"
         fi
-        ROUTING_WAIT_STARTED="$("$PY" -c 'import time; print(time.monotonic())')"
+        if [[ -z "$ROUTING_WAIT_STARTED" ]]; then
+            ROUTING_WAIT_STARTED="$("$PY" -c 'import time; print(time.monotonic())')"
+        fi
         "$PY" "$LOCAL_RELEASE_WAIT_SCRIPT" "${BUILD_TARGETS_POLL_S:-15}" "$BUILDLOG_CALL_ID" &
         HOLD_WAITER_PID=$!
         wait "$HOLD_WAITER_PID"
         HOLD_WAITER_PID=""
 
-        # A release can admit this call while the holder file remains. Renew
-        # demand each pass and use the admission decision before another try.
-        admission=0
-        register_routing_demand || admission=$?
-        case "$admission" in
-            0) collect_routing_wait; return 0 ;;
-            10) ;;
-            *) exit "$admission" ;;
-        esac
-        collect_routing_wait
-        withdraw_local_demand
+        # A Mac that freed wins over a release turn: try it before renewing
+        # demand, which a release may already have admitted. The demand is
+        # withdrawn before a Mac attempt (see withdraw_local_demand), so
+        # free-now gates the attempt: a busy Mac must not cost a held turn.
         for ((retry_index=0; retry_index<${#retry_settings[@]}; retry_index++)); do
+            mac_free_now "${retry_settings[$retry_index]}" || continue
+            collect_routing_wait
+            withdraw_local_demand
             try_mac_test "${retry_settings[$retry_index]}" "${retry_reasons[$retry_index]}"
             if [[ "$BUILDLOG_MAC" != declined || ( "$BUILDLOG_MAC_REASON" != busy && "$BUILDLOG_MAC_REASON" != blocked ) ]]; then
+                MAC_LEAVE_SETTINGS="" MAC_LEAVE_REASON=""
                 return 0
             fi
             # A declined claim is more hold wait; a runner that executes tests
             # returns or exits above, so its runtime is never added here.
             printf '%s\n' "${BUILDLOG_MAC_S:-0}" >> "$BUILDLOG_HOLD_WAIT_FILE"
             retry_reasons[$retry_index]="$BUILDLOG_MAC_REASON"
+            if [[ "${retry_settings[$retry_index]}" == "$MAC_LEAVE_SETTINGS" ]]; then
+                MAC_LEAVE_REASON="$BUILDLOG_MAC_REASON"
+            fi
             if [[ "$announced_reason" != "$BUILDLOG_MAC_REASON" ]]; then
                 echo "verify.sh: waiting for the Mac ($BUILDLOG_MAC_REASON) or natedev's release." >&2
                 announced_reason="$BUILDLOG_MAC_REASON"
             fi
         done
+    done
+}
+
+# Runs the tests on natedev. While MAC_LEAVE_SETTINGS names a Mac, a run held
+# in the memory wait leaves once mac_test.py free-now says that Mac is free,
+# and its Mac result counts as one from route_test: a failure or a filtered
+# pass ends the call; busy or blocked waits here again, still free to leave; a
+# full pass, a lost run or another decline runs here with no way out.
+run_local_test() {
+    local status hook
+    while true; do
+        hook=""
+        if [[ -n "$MAC_LEAVE_SETTINGS" ]]; then
+            hook="$(printf '%q ' "$PY" "$MAC_TEST_SCRIPT" free-now --settings "$MAC_LEAVE_SETTINGS" \
+                --repo-root "$(git rev-parse --show-toplevel)")"
+        fi
+        export BUILDLOG_TARGET=natedev
+        echo "verify.sh: running on natedev"
+        status=0
+        LINT_QUEUE_LEAVE_HOOK="$hook" run_nextest "${NEXTEST_ARGS[@]}" || status=$?
+        if [[ -z "$hook" || "$status" -ne "$LINT_LEFT_QUEUE_STATUS" ]]; then
+            return "$status"
+        fi
+        # The step never started; its hold turn goes to the next session.
+        withdraw_local_demand
+        try_mac_test "$MAC_LEAVE_SETTINGS" "$MAC_LEAVE_REASON"
+        if [[ "$BUILDLOG_MAC" == declined && ( "$BUILDLOG_MAC_REASON" == busy || "$BUILDLOG_MAC_REASON" == blocked ) ]]; then
+            MAC_LEAVE_REASON="$BUILDLOG_MAC_REASON"
+        else
+            MAC_LEAVE_SETTINGS="" MAC_LEAVE_REASON=""
+        fi
     done
 }
 
@@ -1363,9 +1413,7 @@ case "$CMD" in
         run cargo check --workspace --lib --bins "${FEATURE_FLAGS[@]}"
         ;;
     test)
-        export BUILDLOG_TARGET=natedev
-        echo "verify.sh: running on natedev"
-        run_nextest "${NEXTEST_ARGS[@]}"
+        run_local_test
         ;;
     lint)
         PKG="${1:?verify.sh lint <package>}"
@@ -1456,10 +1504,6 @@ case "$CMD" in
             echo "verify.sh: no workspace member differs from HEAD; rustdoc skipped"
         fi
         ;;
-    fmt)
-        PKG="${1:?verify.sh fmt <package>}"
-        fmt_cargo -p "$PKG"
-        ;;
     example)
         PKG="${1:?verify.sh example <package> <name>}"
         NAME="${2:?verify.sh example <package> <name>}"
@@ -1478,7 +1522,6 @@ case "$CMD" in
         fi
         ;;
     final)
-        fmt_cargo --check
         run cargo check --workspace --all-targets
         run_nextest --workspace
         ;;

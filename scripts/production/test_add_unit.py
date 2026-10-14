@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from scripts.whoami.note_file import note_name
+
 import argparse
 import fcntl
 import io
@@ -177,8 +179,8 @@ class AddUnitTests(ShutdownTestCase):
         )
         notes = self.root / "notes"
         notes.mkdir()
-        _ = (notes / "claude 2.md").write_text(
-            "---\nlogin: owner@example.com\nstate: active\n---\n",
+        _ = (notes / "claude2.md").write_text(
+            "---\nlogin: owner@example.com\nsessions: 1\n---\n",
             encoding="utf-8",
         )
         self.state = self.root / "stub-state"
@@ -306,8 +308,8 @@ class AddUnitTests(ShutdownTestCase):
                             "projects": self.trusted_projects()}),
                 encoding="utf-8",
             )
-            _ = (Path(self.env["AGENT_NOTES_DIR"]) / f"{label}.md").write_text(
-                f"---\nlogin: {login}\nstate: active\n---\n", encoding="utf-8"
+            _ = (Path(self.env["AGENT_NOTES_DIR"]) / note_name(label)).write_text(
+                f"---\nlogin: {login}\nsessions: 1\n---\n", encoding="utf-8"
             )
         self.quota_reading(login, 1, 2)
         return directory

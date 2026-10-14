@@ -408,6 +408,7 @@ class CommandLine(argparse.Namespace):
     keep: str = ""
     explain: bool = False
     why: str = ""
+    detail: bool = False
 
 
 @dataclass(frozen=True)
@@ -769,12 +770,11 @@ def _directory_identity(config_dir: Path) -> ClaudeDirectoryIdentity:
     return UnreadableClaudeDirectoryIdentity(f"accounts: {path} has an invalid oauthAccount identity")
 
 
-def _account_notes_directory() -> Path:
-    return Path(os.environ.get("AGENT_NOTES_DIR", str(accounts_home() / "rust" / "hanadocs" / "agents")))
+_account_notes_directory = note_file.notes_dir
 
 
 def _account_note(label: str) -> AccountNote:
-    path = _account_notes_directory() / f"{label}.md"
+    path = note_file.note_path(label)
     try:
         text = path.read_text(encoding="utf-8")
     except FileNotFoundError:
@@ -783,7 +783,7 @@ def _account_note(label: str) -> AccountNote:
         return UnreadableAccountNote(f"accounts: could not read {path}: {error}")
     close = text.find("\n---", 3)
     if text.startswith("---\n") and close != -1:
-        login = note_file.Note(path, label.partition(" ")[0], text, 4, close).get("login")
+        login = note_file.Note(path, label.partition(" ")[0], text, 4, close, label).get("login")
         if isinstance(login, str) and login.strip() and login not in {"null", "~"}:
             return ExpectedAccountLogin(login)
     return UnreadableAccountNote(f"accounts: {path} has no readable login in its frontmatter")
@@ -1612,6 +1612,24 @@ def _save_groups(groups: GroupAccounts, previous: GroupAccounts, why: str, now: 
         raise AccountsError(f"accounts: could not write group selection: {error}") from error
 
 
+
+def group_note_labels() -> dict[ClaudeGroup, str]:
+    """The note labels serving each configured Claude launch group."""
+    groups = group_accounts()
+    labels: dict[ClaudeGroup, str] = {}
+    for group in CLAUDE_GROUPS:
+        selected = group_label(groups, group)
+        if isinstance(selected, GroupNotConfigured):
+            continue
+        if selected == "default":
+            identity = account_identity(main_config_dir())
+            if isinstance(identity, agent_accounts.KnownClaudeAccount):
+                labels[group] = identity.label
+        else:
+            labels[group] = selected
+    return labels
+
+
 def group_accounts() -> GroupAccounts:
     """Read only explicit group selections; an absent key stays unconfigured."""
     return _stored_groups()
@@ -2419,8 +2437,7 @@ def _label_number(label: str) -> int:
 def _noted_labels() -> set[str]:
     """Every `claude N` label that has an account note, with or without a folder."""
     return {
-        path.stem for path in _account_notes_directory().glob("claude *.md")
-        if LABEL_PATTERN.fullmatch(path.stem)
+        note.label for note in note_file.read_notes() if note.tool == "claude"
     }
 
 
@@ -2484,7 +2501,7 @@ def codex_statuses(seats_home: Path) -> list[CodexStatus]:
         ))
     held_logins = {status.login.casefold() for status in statuses if status.login}
     noted = sorted(
-        (path.stem for path in _account_notes_directory().glob("codex *.md") if CODEX_LABEL_PATTERN.fullmatch(path.stem)),
+        (note.label for note in note_file.read_notes() if note.tool == "codex"),
         key=lambda stem: int(stem.removeprefix("codex ")),
     )
     for label in noted:
@@ -2678,8 +2695,11 @@ def _status_notes(status: AccountStatus) -> list[str]:
     return notes
 
 
-def status_report() -> str:
-    """One table row per account folder, then one line for each thing wrong in a folder."""
+def status_report(*, detail: bool = False) -> str:
+    """One table row per account folder, then one line for each thing wrong in a folder.
+
+    With `detail`, also each live session, the Codex seats and the recent moves.
+    """
     statuses = account_statuses()
     selected_seats = role_account("seats")
     seats_home = selected_seats.home
@@ -2698,7 +2718,10 @@ def status_report() -> str:
     ])
     notes = [*(note for status in statuses for note in _status_notes(status)),
              *(problem for status in codex for problem in status.problems)]
-    return "\n".join([group_status_line(groups), table, "", *notes,
+    summary = [group_status_line(groups), table, "", *notes]
+    if not detail:
+        return "\n".join(summary)
+    return "\n".join([*summary,
         *_live_status_lines(groups), *_seats_status_lines(now, selected_seats), *_move_status_lines(moves.read_moves(), zone)])
 
 
@@ -2811,6 +2834,7 @@ def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="action")
     parser.set_defaults(action="status")
+    _ = parser.add_argument("--detail", action="store_true")
     for action in ("setup", "check"):
         command = commands.add_parser(action)
         _ = command.add_argument("label")
@@ -2851,6 +2875,8 @@ def _parser() -> argparse.ArgumentParser:
 def main(argv: list[str]) -> int:
     options = cast(CommandLine, _parser().parse_args(argv))
     try:
+        if options.detail and options.action != "status":
+            raise AccountsError("--detail goes only with no action")
         if options.action == "placement":
             print(placement_report())
             return 0
@@ -2903,7 +2929,7 @@ def main(argv: list[str]) -> int:
                 print(problem)
             return 1 if problems else 0
         if options.action == "status":
-            print(status_report())
+            print(status_report(detail=options.detail))
             return 0
         if options.action == "role":
             selected = role_account(options.role)

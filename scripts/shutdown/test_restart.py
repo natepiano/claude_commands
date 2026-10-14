@@ -6,6 +6,7 @@ from __future__ import annotations
 import copy
 import io
 import json
+from datetime import datetime, tzinfo
 import os
 import shlex
 import subprocess
@@ -46,6 +47,14 @@ LABEL = "claude 2"
 STOPPED = "2026-10-09T21:49:10+00:00"
 RESTARTED = "2026-10-10T01:02:03+00:00"
 EMPTY_SESSION_IDS: frozenset[str] = frozenset()
+
+
+class RestartAttemptTime(datetime):
+    @classmethod
+    @override
+    def now(cls, tz: tzinfo | None = None) -> "RestartAttemptTime":
+        return cls.fromisoformat(RESTARTED).astimezone(tz)
+
 
 def named_prefix(config_dir: str) -> str:
     """The assignments a session resumed on a named account's directory starts with."""
@@ -211,7 +220,7 @@ def entry(
         session=session, seats=[], timers=list(timers or []),
         settle_message=record.SettleMessageNotSent(kind="not sent"),
         where=where or record.WhereSaid(kind="said", text=f"working on {session['name']}", at=STOPPED),
-        progress=state or record.SessionStopped(kind="stopped", at=STOPPED), stop_issues=[],
+        progress=state or record.SessionStopped(kind="stopped", at=STOPPED), stop_issues=[], trail=[],
     )
 
 
@@ -292,8 +301,8 @@ class RestartTests(ShutdownTestCase):
         (self.root / ".claude").mkdir()
         (self.root / "notes").mkdir()
         _ = (self.root / ".claude.json").write_text(json.dumps({"oauthAccount": {"emailAddress": LOGIN}}))
-        _ = (self.root / "notes/claude 2.md").write_text(f"---\nlogin: {LOGIN}\n---\n")
-        _ = (self.root / "notes/claude 3.md").write_text("---\nlogin: third@example.invalid\n---\n")
+        _ = (self.root / "notes/claude2.md").write_text(f"---\nlogin: {LOGIN}\n---\n")
+        _ = (self.root / "notes/claude3.md").write_text("---\nlogin: third@example.invalid\n---\n")
         self.assertEqual(accounts.setup("claude 3"), [])
         _ = (self.root / ".claude3/.claude.json").write_text(json.dumps({"oauthAccount": {"emailAddress": "third@example.invalid"}}))
         self.configure_groups()
@@ -677,6 +686,150 @@ class RestartTests(ShutdownTestCase):
         commands, _ = self.moved_restart(owner)
         launch = next(argv for argv in commands if "ghostty" in argv)
         self.assert_move_resume(launch[-1], owner)
+
+    def test_supervised_ghostty_move_publishes_complete_atomic_account_request(self) -> None:
+        owner = top_level("supervised-move", name="kept window", cwd=str(self.root / "workspace"),
+            model=inventory.ModelName(kind="model", name="opus"),
+            host=inventory.WindowHost(kind="ghostty", window_shell=901,
+                desktop=inventory.NamedDesktop(kind="named", name="Production"),
+                supervisor=inventory.SupervisorIdentity(kind="supervisor", pid=902,
+                    proc_start="supervisor-start")))
+        saved = entry(owner)
+        saved["target"] = "claude 3"
+        destination = self.state_root / "relaunch/902.json"
+        published: list[dict[str, object]] = []
+        replace = os.replace
+        def publish(source: str | Path, target: str | Path) -> None:
+            if Path(target) != destination:
+                replace(source, target)
+                return
+            self.assertEqual(Path(source).parent, destination.parent)
+            self.assertNotEqual(Path(source), destination)
+            self.assertFalse(destination.exists(), "reader can see only the complete request")
+            value = cast(dict[str, object], json.loads(Path(source).read_text()))
+            self.assertEqual(value["cwd"], owner["cwd"])
+            published.append(value)
+            replace(source, target)
+        with (patch.object(inventory, "_process_start", return_value="supervisor-start"),
+              patch.object(os, "replace", side_effect=publish),
+              patch.object(restart, "_run", side_effect=AssertionError("in-place restart launches a window"))):
+            launched = restart._launch_session(saved, "resume this work", self.desktop_state, dry_run=False)  # pyright: ignore[reportPrivateUsage]
+        self.assertIsInstance(launched, restart.SessionLaunched)
+        self.assertEqual(len(published), 1)
+        request = cast(dict[str, object], json.loads(destination.read_text()))
+        self.assertEqual(request, published[0])
+        argv = cast(list[str], request["argv"])
+        self.assertEqual(argv[0], "claude")
+        self.assertEqual(argv[argv.index("--resume") + 1], owner["session_id"])
+        self.assertEqual(argv[argv.index("-n") + 1], owner["name"])
+        self.assertEqual(argv[argv.index("--model") + 1], "opus")
+        self.assertEqual(argv[-1], "resume this work")
+        environment = cast(dict[str, str], request["environment"])
+        self.assertEqual(environment["CLAUDE_CONFIG_DIR"], str(self.root / ".claude3"))
+        self.assertEqual(environment["CLAUDE_CODE_REMOTE_MEMORY_DIR"], str(self.root / ".claude"))
+        self.assertEqual(environment["ENABLE_TOOL_SEARCH"], "true")
+        self.assertIn("CLAUDE_CODE_OAUTH_TOKEN", cast(list[str], request["unset"]))
+        self.assertEqual(request["note"], "resume this work")
+        timestamp = datetime.fromisoformat(cast(str, request["written_at"]))
+        self.assertEqual(timestamp.utcoffset(), datetime.fromisoformat(STOPPED).utcoffset())
+        self.assertEqual(timestamp.microsecond, 0)
+        self.assertEqual(list(destination.parent.iterdir()), [destination])
+
+    def test_mac_supervised_terminal_restart_requests_in_place_and_lost_supervisor_opens_window(self) -> None:
+        owner = top_level("mac-supervised", host=inventory.TerminalHost(
+            kind="terminal", supervisor=inventory.SupervisorIdentity(
+                kind="supervisor", pid=902, proc_start="supervisor-start")))
+        destination = self.state_root / "relaunch/902.json"
+        with (patch.object(sys, "platform", "darwin"),
+              patch.object(inventory, "_process_start", return_value="supervisor-start"),
+              patch.object(restart, "_run", side_effect=AssertionError("in-place restart opens a window"))):
+            launched = restart._launch_session(entry(owner), "resume on Mac", self.desktop_state, dry_run=False)  # pyright: ignore[reportPrivateUsage]
+        self.assertIsInstance(launched, restart.SessionLaunched)
+        request = cast(dict[str, object], json.loads(destination.read_text()))
+        argv = cast(list[str], request["argv"])
+        self.assertEqual(argv[argv.index("--resume") + 1], owner["session_id"])
+        self.assertEqual(argv[-1], "resume on Mac")
+        self.assertEqual(self.desktop_state.started_windows, 0)
+        destination.unlink()
+        commands = CommandRecorder()
+        with (patch.object(sys, "platform", "darwin"),
+              patch.object(inventory, "_process_start", return_value="reused-pid"),
+              patch.object(restart, "_run", commands)):
+            launched = restart._launch_session(entry(owner), "resume on Mac", self.desktop_state, dry_run=False)  # pyright: ignore[reportPrivateUsage]
+        self.assertIsInstance(launched, restart.SessionLaunched)
+        self.assertEqual(commands.calls[0][:3], ["open", "-na", "/Applications/Nix Apps/Ghostty.app"])
+        self.assertEqual(self.desktop_state.started_windows, 1)
+        self.assertFalse(destination.exists())
+
+    def test_missing_or_reused_supervisor_opens_window_on_recorded_desktop(self) -> None:
+        for actual_start in ("", "reused-pid"):
+            with self.subTest(actual_start=actual_start):
+                state = restart.DesktopLaunchState(starting_desktop="2")
+                owner = top_level("lost-supervisor", host=inventory.WindowHost(kind="ghostty", window_shell=901,
+                    desktop=inventory.NamedDesktop(kind="named", name="Production"),
+                    supervisor=inventory.SupervisorIdentity(kind="supervisor", pid=902,
+                        proc_start="supervisor-start")))
+                commands = CommandRecorder()
+                with (patch.object(inventory, "_process_start", return_value=actual_start),
+                      patch.object(restart, "_desktop_numbers", return_value={"Production": 4}),
+                      patch.object(restart, "_run", commands)):
+                    launched = restart._launch_session(entry(owner), "resume", state, dry_run=False)  # pyright: ignore[reportPrivateUsage]
+                    state.restore(dry_run=False)
+                self.assertIsInstance(launched, restart.SessionLaunched)
+                self.assertEqual(commands.calls[0], ["kdotool", "set_desktop", "4"])
+                self.assertIn("ghostty", commands.calls[1])
+                self.assertEqual(commands.calls[-1], ["kdotool", "set_desktop", "2"])
+                self.assertFalse((self.state_root / "relaunch/902.json").exists())
+
+    def test_supervised_default_account_request_removes_inherited_named_account(self) -> None:
+        owner = top_level("default-supervisor", host=inventory.WindowHost(kind="ghostty", window_shell=901,
+            desktop=inventory.DesktopNotInSnapshot(kind="not in snapshot"),
+            supervisor=inventory.SupervisorIdentity(kind="supervisor", pid=902,
+                proc_start="supervisor-start")))
+        with (patch.object(inventory, "_process_start", return_value="supervisor-start"),
+              patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": str(self.root / ".claude3"),
+                  "CLAUDE_CODE_OAUTH_TOKEN": "fixture-only-token"}),
+              patch.object(restart, "_run", side_effect=AssertionError("in-place restart launches a window"))):
+            _ = restart._launch_session(entry(owner), "resume default", self.desktop_state, dry_run=False)  # pyright: ignore[reportPrivateUsage]
+        request = cast(dict[str, object], json.loads((self.state_root / "relaunch/902.json").read_text()))
+        environment = cast(dict[str, str], request["environment"])
+        self.assertNotIn("CLAUDE_CONFIG_DIR", environment)
+        self.assertNotIn("CLAUDE_CODE_OAUTH_TOKEN", environment)
+        unset = cast(list[str], request["unset"])
+        self.assertIn("CLAUDE_CONFIG_DIR", unset)
+        self.assertIn("CLAUDE_CODE_REMOTE_MEMORY_DIR", unset)
+        self.assertIn("CLAUDE_CODE_OAUTH_TOKEN", unset)
+
+    def test_supervised_restart_preview_creates_no_request_or_window(self) -> None:
+        owner = top_level("preview-supervisor", host=inventory.WindowHost(kind="ghostty", window_shell=901,
+            desktop=inventory.DesktopNotInSnapshot(kind="not in snapshot"),
+            supervisor=inventory.SupervisorIdentity(kind="supervisor", pid=902,
+                proc_start="supervisor-start")))
+        output = io.StringIO()
+        with (patch.object(inventory, "_process_start", return_value="supervisor-start"),
+              patch.object(restart, "_run", side_effect=AssertionError("preview launches a window")),
+              redirect_stdout(output)):
+            _ = restart._launch_session(entry(owner), "preview resume", self.desktop_state, dry_run=True)  # pyright: ignore[reportPrivateUsage]
+        self.assertFalse((self.state_root / "relaunch").exists())
+        self.assertIn("preview-supervisor", output.getvalue())
+        self.assertIn("902", output.getvalue())
+
+    def test_new_ghostty_window_runs_resume_argv_through_supervisor(self) -> None:
+        owner = top_level("new-supervisor", name="quoted window", cwd="/tmp/quoted workspace",
+            host=inventory.WindowHost(kind="ghostty", window_shell=901,
+                desktop=inventory.DesktopNotInSnapshot(kind="not in snapshot")))
+        commands, _ = self.moved_restart(owner)
+        launch = next(argv for argv in commands if "ghostty" in argv)
+        arguments = shlex.split(launch[-1].removesuffix("; exec zsh"))
+        runner = str(Path(__file__).parents[1] / "lib/relaunch.py")
+        # The installed command path is part of the terminal launch contract.
+        index = arguments.index(runner)
+        self.assertEqual(arguments[index - 1], str(Path(runner).with_name("py")))
+        self.assertEqual(arguments[index:index + 3], [runner, "run", "--"])
+        self.assertEqual(arguments[arguments.index("--resume") + 1], owner["session_id"])
+        self.assertEqual(arguments[arguments.index("-n") + 1], owner["name"])
+        self.assertEqual(arguments[:3], ["cd", owner["cwd"], "&&"])
+        self.assertTrue(launch[-1].endswith("; exec zsh"))
 
     def test_move_target_reopens_zed_session_through_accounts_exec(self) -> None:
         owner = top_level("move-zed", host=inventory.WindowHost(kind="zed", window_shell=10,
@@ -1436,7 +1589,11 @@ class RestartTests(ShutdownTestCase):
                 self.assertIn("accounts.py exec default", command)
                 self.assertNotIn(config_dir, command)
             else:
-                self.assertIn(f'&& {named_prefix(config_dir)}ENABLE_TOOL_SEARCH=true command claude', command)
+                launcher = "claude"
+                if "--resume named-window " in command:
+                    launcher = shlex.join([str(Path(__file__).parents[1] / "lib/py"),
+                        str(Path(__file__).parents[1] / "lib/relaunch.py"), "run", "--", "claude"])
+                self.assertIn(f'&& {named_prefix(config_dir)}ENABLE_TOOL_SEARCH=true command {launcher}', command)
         self.assertIn(f'{named_prefix(config_dir)}ENABLE_TOOL_SEARCH=true command claude', output.getvalue().split('manual restart named-manual:', 1)[1])
         unit_argv = next((argv for argv in commands.calls if any((part.endswith('add_unit.py') for part in argv))))
         self.assertNotIn("--config-dir", unit_argv)
@@ -2192,8 +2349,16 @@ class RestartTests(ShutdownTestCase):
     def test_manual_session_not_live_keeps_its_resume_command(self) -> None:
         saved = entry(top_level("manual"), state=record.SessionNeedsManualRestart(kind="manual restart", command="resume"))
         self.create([saved])
-        self.assertEqual(self.run_restarts(), (1, []))
-        self.assertEqual(record.find_session(LOGIN, "manual"), saved)
+        saved["trail"] = [record.ProgressStep(at=STOPPED, kind="manual restart", detail="resume")]
+        with patch.object(record, "datetime", RestartAttemptTime):
+            self.assertEqual(self.run_restarts(), (1, []))
+        self.assertEqual(record.find_session(LOGIN, "manual"), {
+            **saved, "trail": [
+                *saved["trail"],
+                record.ProgressStep(at=RESTARTED, kind="restarting", detail=""),
+                record.ProgressStep(at=RESTARTED, kind="manual restart", detail="resume"),
+            ],
+        })
 
     def test_pending_timers_only_retry_the_failed_timer_when_live(self) -> None:
         saved = entry(top_level("owner"), state=record.SessionRestoredTimersPending(
@@ -2210,17 +2375,38 @@ class RestartTests(ShutdownTestCase):
     def test_unreadable_registry_preserves_pending_timer_progress(self) -> None:
         saved = entry(top_level("owner"), state=record.SessionRestoredTimersPending(kind="timers pending", at=STOPPED, timers=[record.PendingTimer(instance="pending", reason="failed")]))
         self.create([saved])
+        saved["trail"] = [record.ProgressStep(at=STOPPED, kind="timers pending", detail="pending: failed")]
+        _ = self.enterContext(patch.object(record, "datetime", RestartAttemptTime))
         with patch.object(restart, "_session_liveness", return_value=restart.SessionLivenessUnknown("unreadable")), patch.object(settle, "run_notifier") as timers:
             self.assertEqual(self.run_restarts(), (1, []))
         timers.assert_not_called()
-        self.assertEqual(record.find_session(LOGIN, "owner"), saved)
+        self.assertEqual(record.find_session(LOGIN, "owner"), {
+            **saved, "trail": [
+                *saved["trail"],
+                record.ProgressStep(at=RESTARTED, kind="restarting", detail=""),
+                record.ProgressStep(at=RESTARTED, kind="timers pending", detail="pending: failed"),
+            ],
+        })
 
     def test_failed_launcher_with_unknown_registry_preserves_prior_progress(self) -> None:
         saved = entry(top_level("owner", host=tmux_host("owner")))
         self.create([saved])
+        saved["trail"] = [record.ProgressStep(at=STOPPED, kind="stopped", detail="")]
+        _ = self.enterContext(patch.object(record, "datetime", RestartAttemptTime))
         with patch.object(restart, "_retire"), patch.object(restart, "_live_session_ids", return_value=frozenset()), patch.object(restart, "_launch_session", side_effect=OSError("failed")), patch.object(restart, "_session_liveness", return_value=restart.SessionLivenessUnknown("unreadable")), redirect_stdout(io.StringIO()):
-            self.assertEqual(restart.relaunch_session(saved, dry_run=False, desktop_state=self.desktop_state), saved)
-        self.assertEqual(record.find_session(LOGIN, "owner"), saved)
+            self.assertEqual(restart.relaunch_session(saved, dry_run=False, desktop_state=self.desktop_state), {
+                **saved, "trail": [
+                    *saved["trail"],
+                    record.ProgressStep(at=RESTARTED, kind="restarting", detail=""),
+                ],
+            })
+        self.assertEqual(record.find_session(LOGIN, "owner"), {
+            **saved, "trail": [
+                *saved["trail"],
+                record.ProgressStep(at=RESTARTED, kind="restarting", detail=""),
+                record.ProgressStep(at=RESTARTED, kind="stopped", detail=""),
+            ],
+        })
 
     def test_failed_launcher_with_live_registry_is_confirmed(self) -> None:
         saved = entry(top_level("owner", host=tmux_host("owner")))
@@ -2662,6 +2848,54 @@ class RestartTests(ShutdownTestCase):
         launch.assert_not_called()
         timers.assert_not_called()
         self.assertEqual(current["progress"]["kind"], "restart failed")
+        stored = self.stored_record()
+        progress = stored["progress"]
+        assert progress["kind"] == "restart failed"
+        expected = (f"in a terminal on natedev: ~/.claude/scripts/lib/py "
+            f"~/.claude/scripts/shutdown/shutdown.py restart {LOGIN} --here --only owner")
+        self.assertIn(expected, progress["reason"])
+        status_lines = settle.status_record_lines(stored)
+        output = io.StringIO()
+        with (
+            patch.object(settle, "run_remote", return_value=(0, "[]")),
+            patch.object(restart, "_live_session_ids", return_value=frozenset()),
+            patch.object(settle, "alert_user"),
+            redirect_stdout(output),
+        ):
+            settle.report_stop([stored])
+        command_lines = [line for line in [*status_lines, *output.getvalue().splitlines()]
+            if "shutdown.py" in line or "/shutdown" in line]
+        self.assertTrue(command_lines)
+        for line in command_lines:
+            self.assertIn("in a terminal on natedev", line)
+            self.assertIn(LOGIN, line)
+            self.assertIn("--only owner", line)
+            self.assertIn("~/.claude/scripts/lib/py ~/.claude/scripts/shutdown/shutdown.py", line)
+
+    def test_unreachable_peer_restart_prints_scoped_retry_in_peer_terminal(self) -> None:
+        cases = (
+            ((), ["restart", LOGIN, "--here", "--no-alert"]),
+            (("local", "peer-one", "peer-two"),
+                ["restart", LOGIN, "--here", "--only", "peer-one,peer-two", "--no-alert"]),
+        )
+        local = restart.MachineRestartResult("natedev", LABEL, "nothing",
+            local_session_ids=frozenset({"local"}))
+        for ids, expected in cases:
+            with self.subTest(ids=ids):
+                output = io.StringIO()
+                with (
+                    patch.object(restart, "named_claude_account", return_value=self.account),
+                    patch.object(restart, "_up", return_value=local),
+                    patch.object(restart, "run_remote", return_value=(255, "")),
+                    patch.object(restart, "other_machine", return_value="Mac"),
+                    redirect_stdout(output),
+                ):
+                    _ = restart.restart(restart.AccountNamed(LOGIN), dry_run=False,
+                        alerts=restart.NeverAlert(), only=ids)
+                line = next(line for line in output.getvalue().splitlines() if "restart incomplete" in line)
+                command = line.split("in a terminal on Mac: ", 1)[1]
+                self.assertEqual(shlex.split(command), ["~/.claude/scripts/lib/py",
+                    "~/.claude/scripts/shutdown/shutdown.py", *expected])
 
     def test_cleanup_exception_does_not_prevent_other_sessions_from_returning(self) -> None:
         saved = entry(unit("broken"))
@@ -2903,6 +3137,37 @@ class RestartTests(ShutdownTestCase):
         with patch.object(restart, "named_claude_account", return_value=self.account), patch.object(settle, "inventory", return_value=inventory.Inventory(machine="natedev", login=LOGIN, label=LABEL, sessions=[], unattributed=[])), patch.object(restart, "run_remote", return_value=(1, response)), patch.object(settle, "alert_user") as alert, patch.object(restart, "_print_result") as summary, redirect_stdout(io.StringIO()) as output:
             self.assertEqual(restart.restart(restart.AccountNamed(LABEL), only=["peer-id"], dry_run=False, alerts=restart.AlertWhenNotBack()), 1)
         self.assertEqual(output.getvalue(), line + "\n")
+        alert.assert_not_called()
+        summary.assert_not_called()
+
+    def test_selected_reaping_session_is_refused_without_launch_or_record_change(self) -> None:
+        saved = entry(top_level("reaping", name="Reaping owner"), state=record.SessionReaping(
+            kind="reaping", at=RESTARTED, because="account out of usage", detail="weekly limit"))
+        self.create([saved])
+        before = {path.relative_to(self.state_root): path.read_bytes()
+                  for path in self.state_root.rglob("*") if path.is_file()}
+        for dry_run in (False, True):
+            with self.subTest(dry_run=dry_run), patch.object(restart, "_launch_session") as launch, redirect_stdout(io.StringIO()) as output:
+                result = restart._up(LOGIN, dry_run, ["reaping"])  # pyright: ignore[reportPrivateUsage]
+            self.assertEqual(result.exit_status, 1)
+            self.assertEqual(result.refused, [
+                {"kind": "not stopped", "session_id": "reaping", "name": "Reaping owner", "progress": "reaping"},
+            ])
+            self.assertEqual((result.restarted, result.failed), (0, 0))
+            self.assertEqual(output.getvalue(), "Reaping owner is reaping, not stopped; nothing to restart\n")
+            launch.assert_not_called()
+            self.assertEqual({path.relative_to(self.state_root): path.read_bytes()
+                              for path in self.state_root.rglob("*") if path.is_file()}, before)
+
+    def test_peer_reaping_refusal_parses_and_exits_one_without_alert(self) -> None:
+        refusal = restart.RestartNotStopped(kind="not stopped", session_id="peer-id", name="Peer", progress="reaping")
+        line = "Peer is reaping, not stopped; nothing to restart"
+        response = peer_json(outcome="nothing", lines=[line], refused=[refusal])
+        self.assertEqual(restart.parse_peer_result(response)["refused"], [refusal])
+        with patch.object(restart, "named_claude_account", return_value=self.account), patch.object(restart, "run_remote", return_value=(1, response)) as peer, patch.object(settle, "alert_user") as alert, patch.object(restart, "_print_result") as summary, redirect_stdout(io.StringIO()) as output:
+            self.assertEqual(restart.restart(restart.AccountNamed(LABEL), only=["peer-id"], dry_run=False, alerts=restart.AlertWhenNotBack()), 1)
+        self.assertEqual(output.getvalue(), line + "\n")
+        peer.assert_called_once_with(["up", LOGIN, "--here", "--json", "--only", "peer-id"], limit={"kind": "while link alive"})
         alert.assert_not_called()
         summary.assert_not_called()
 

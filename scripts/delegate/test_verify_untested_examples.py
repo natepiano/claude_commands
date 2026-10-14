@@ -40,7 +40,7 @@ if [ "$1" = metadata ]; then
 fi
 printf "%s\n" "$*" >> "$CARGO_CALLS"
 case "$1 $2" in
-    "nextest --version"|"nextest run"|"+nightly fmt") exit 0 ;;
+    "nextest --version"|"nextest run"|"+nightly fmt"|"check --workspace") exit 0 ;;
     *) exit 97 ;;
 esac
 ''')
@@ -288,7 +288,7 @@ esac
         self.assertEqual(self.calls_made(), first_calls)
         self.assertEqual(self.metadata_count(), 2)
 
-    def test_final_checks_every_workspace_member_before_format(self) -> None:
+    def test_final_checks_every_workspace_member_before_workspace_gate(self) -> None:
         _ = (self.root / "Cargo.toml").write_text('[workspace]\nmembers = ["alpha", "beta"]\nresolver = "2"\n')
         alpha_root = self.root / "alpha"
         beta_root = self.root / "beta"
@@ -309,6 +309,19 @@ esac
         )
         self.assertEqual(self.calls_made(), [])
         self.assertEqual(self.metadata_count(), 1)
+
+    def test_final_runs_workspace_check_and_tests_without_format(self) -> None:
+        _ = self.package()
+        self.environment["NEXTEST_TEST_THREADS"] = "2"
+
+        result = self.verify("final")
+
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(self.calls_made(), [
+            "check --workspace --all-targets",
+            "nextest --version",
+            "nextest run --workspace",
+        ])
 
     def test_removed_example_test_runs_no_cargo(self) -> None:
         _ = self.package()

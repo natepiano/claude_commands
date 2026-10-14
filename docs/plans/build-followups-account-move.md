@@ -17,7 +17,7 @@
 - **Stack:** Python 3.13 standard library (`python3`; `~/.claude/scripts/lib/py` is the same binary and the form installed commands use), checked by basedpyright. Launch strings are zsh. No `Any`, a `TypedDict` per JSON shape, no file-level ignores.
 - **Layout:** `scripts/shutdown/` (inventory, settle, stop, restart, record, the `shutdown.py` CLI, tests beside them) · `scripts/accounts/` (accounts, refusals, refusal_watch, moves) · `scripts/lib/` (new `relaunch.py`) · `scripts/whoami/usage_store.py` (read only) · `scripts/notify/` (push) · `commands/shutdown.md`, `commands/showrunner/accounts.md`, `commands/showrunner/move.md` · `docs/accounts.md`, `docs/as-built/shutdown-and-restart.md`. No `__init__.py`; modules put sibling dirs on `sys.path` at import (inventory.py:17–19 adds whoami/message/production/herdr; accounts.py:32–33 adds the repo root and whoami).
 - **Key files:**
-  - `scripts/shutdown/inventory.py` — per-login live session inventory. `WindowHost` 107 (`kind` ghostty|zed, `window_shell`, `desktop`); `terminal_kind` 1056; `_terminal_host` 1077–1116 (walks ppid up from the claude pid; the first ghostty ancestor ends the walk, `window_shell` is its direct child zsh); `_model` 1264–1295 (`Path.home()/".claude/projects"`.rglob(`<id>.jsonl`), newest by mtime, reads the whole file, keeps the last `type=="assistant"` `message.model` that is not `<synthetic>`; every `~/.claudeN/projects` is a symlink to that one tree, 19 GB, 124 dirs, `subagents/` included); `inventory()` 1335–1448 (calls `_model` at 1401); `unregistered_showrunners` 844.
+  - `scripts/shutdown/inventory.py` — per-login live session inventory. `WindowHost` (`kind` ghostty|zed, `window_shell`, `desktop`); `terminal_kind`; `_terminal_host` (walks ppid up from the claude pid; the first ghostty ancestor ends the walk, `window_shell` is its direct child zsh); `transcript_path(config_dir, session_id) -> Path | None` (one-level `config_dir/projects/*/<id>.jsonl`, newest by mtime); `last_model(path)` (backward 64 KiB blocks); `_model(session_id, config_dir: Path)` (config_dir required); `inventory(login, only: frozenset[str] = frozenset(), *, refresh_desktops=True)` (those ids plus the workers they own, every session when empty; full records only for the selection); `listing(login | None) -> list[ListedSession]` (frozen: `session_id, pid, proc_start, name, kind, config_dir: Path, login, production, doc`; no git, transcripts, timers or hosts); `unregistered_showrunners`. Since Phase 1 (8066673c); line numbers moved, find by name.
   - `scripts/accounts/refusal_watch.py` — refusal watcher. `_last_transcript_entry` 163–179 (last nonempty line only); `transcript_refusal` 182–218 (finds `glob("*/<id>.jsonl")` one level, a test at test_refusal_watch.py:889 pins that; checks `type`/`isApiErrorMessage`/`error` at 195; window parsed from the text at 216); `assumed_refusal` 221; `session_refusal` 236; state root `~/.local/state/accounts` (107).
   - `scripts/accounts/refusals.py` — `stored_reading` 68–82 (a reading is fresh when its weekly part is ≤10 min old), `_reading_window` 58, `load` 133, `resolved` 189.
   - `scripts/whoami/usage_store.py` — `store_file()` 66 (`~/.local/state/agent-notes/usage.json`, rewritten about every 2 min by `agent_notes.py`), `key` 43 (Claude by login; Codex `codex:<login>`), `load` 99. A Claude entry holds `five_hour` and `weekly` (`left` percent, `at`, `resets`); a Codex entry also holds `credits` (`balance`). Claude credits are recorded nowhere on this machine.
@@ -41,7 +41,7 @@
 - **Test lanes:** `scripts/shutdown/` → `test_*.py` beside the code, importing siblings by bare name (`import inventory`, `from test_support import ShutdownTestCase`). `scripts/accounts/` → `test_*.py` importing `from scripts.accounts import accounts, refusal_watch, refusals, moves` (repo root from cwd) plus bare `account`, `agent_accounts`, `usage_store`. `scripts/lib/` → `test_*.py` beside the code.
 - **Build:** none; Python is interpreted.
 - **Test:** from the worktree root, `python3 -m unittest discover -s scripts/shutdown -p 'test_*.py' </dev/null` and `python3 -m unittest discover -s scripts/accounts -p 'test_*.py' </dev/null`; for `scripts/lib/relaunch.py`, `python3 -m unittest discover -s scripts/lib -p 'test_relaunch.py' </dev/null`. Each test sets its own temp `HOME` and state. Also run `scripts/whoami`, `scripts/production` and `scripts/nightly_review` the same way when a shared module changes. A phase's gate passes under the temp HOME the tests set, and again with the real HOME in the environment.
-- **Lint:** `basedpyright <changed .py files>`; a pass is the last line `0 errors, 0 warnings, 0 notes` (the exit code is 3 everywhere because of the missing `.venv`; read the line). Lint once after the seat's edits; on failure fix what it names, then lint once.
+- **Lint:** `basedpyright <changed .py files>`; a pass is the last line `0 errors, 0 warnings, 0 notes` (the exit code is 3 everywhere because of the missing `.venv`; read the line). Lint once after the worker's edits; on failure fix what it names, then lint once.
 - **Invariants:**
   - Tests start no real session, send no message or push, and never touch `~/.claude*`, `~/.claude.json` or live state; cases derive from `ShutdownTestCase` with fake send, notifier, process, tmux and host commands. A test reaching `user_zone()` patches `showrunners.NOTIFIER_STATE_DIR`.
   - Account isolation: a command for account A never stops or messages a session on B. An unreadable account means unattributed, never the default. Absent `CLAUDE_CONFIG_DIR` means `~/.claude`.
@@ -52,159 +52,124 @@
   - A changed push text is re-approved with `scripts/notify/review.py texts --id … --approve`.
   - Account labels are spelled as two-accounts' "Accounts named by number only" leaves them on `build-followups` (it moves them to `claude1`/`codex1`); this plan never spells a label itself in code, it uses the label functions, and tests build labels through them.
   - Every user-facing line that names a command or skill also names where to run it: `in this terminal`, `in a terminal on <machine>`, or `in any Claude session on <machine>`, and gives the account and the `--only` ids the command needs. A script path is written in full (`~/.claude/scripts/lib/py ~/.claude/scripts/…`).
-  - Live steps belong to the unit director, never to a seat, and run only on throwaway sessions; a dry-run of the real group is allowed (it writes nothing).
+  - Live steps belong to the unit director, never to a worker, and run only on throwaway sessions; a dry-run of the real group is allowed (it writes nothing).
   - Saved run output stays under a few GB; read each run and delete it before the next.
 
 ## Phases
 
 ### Phase 1 — Inventory reads only what it needs  · status: done
 
-**Depends on:** none
+#### As-built
 
-#### Work Order
-
-**Goal:** an inventory of every live session on natedev, and a members-only listing, cost under half a second for the model and the listing; `_model` no longer reads whole transcripts.
-
-**Spec:**
-
-1. **`_model` reads the transcript tail.** Root cause (measured 2026-10-14): `_model` (inventory.py 1264–1295) runs `rglob("<id>.jsonl")` over the 19 GB projects tree for every session and reads every transcript whole (hana's 842 MB, natedev's 261 MB): 91 of the dry-run's 93 s. New behavior:
-   - Locate: `transcript_path(config_dir: Path, session_id: str) -> Path | None` looks in `config_dir/"projects"/*/<id>.jsonl` (one level, `glob`, like `refusal_watch.transcript_refusal`), newest by mtime, never descending into `subagents/`. `config_dir` is the session's own (`SessionInventory` `config_dir`), so `~/.claudeN` resolves through its `projects` symlink.
-   - Read backward: `last_model(path: Path) -> str | None` reads 64 KiB blocks from the end, splits complete lines, parses each newest-first with `json.loads` inside `try`, and returns the first `type == "assistant"` entry's `message.model` that is not `<synthetic>`. Stops at the first hit. A file with no hit returns `None` after reading it whole (rare; a session with no assistant turn yet).
-   - `_model` keeps its return type and the "unknown" result it gives today when nothing is found.
-2. **A session filter.** `inventory(login, only: frozenset[str] = frozenset())` keeps its existing one selection parameter and its meaning, which callers rely on today: those session ids and the seats they own, every session when empty. Full records (model, checkout, timers, host) are built only for the selected sessions. Membership tests that need the rest of the live set (e.g. which unit a seat belongs to) read it from the light listing below, not from full records.
-3. **A light listing.** `listing(login: str | None = None) -> list[ListedSession]` returns, for every live Claude session (all logins when `None`), a frozen dataclass `ListedSession(session_id, pid, proc_start, name, kind, config_dir, login, production, doc)` from the same sources `inventory()` uses for those fields (session registry, production registry, unit marks, `/proc/<pid>/environ` for `CLAUDE_CONFIG_DIR`). It runs no `git`, reads no transcript, reads no timers, builds no host. `kind` uses the same values and the same decision `inventory()` makes (a test asserts `listing()` and `inventory()` agree on kind for every fixture session).
-4. **Cost proof.** A test builds 40 fixture sessions, one with a 50 MB transcript whose model line is near the end, and asserts `last_model` reads under 1 MB of it (count bytes through a wrapper on the file object, never time).
+- `inventory(login, only: frozenset[str] = frozenset(), *, refresh_desktops=True)` keeps its single selection parameter: the given ids plus the workers they own, every session when empty. Full records (model, transcript) are built only for the selected sessions.
+- `transcript_path(config_dir: Path, session_id: str) -> Path | None` does a one-level glob of `config_dir/projects/*/<id>.jsonl`, newest match wins, no recursive walk.
+- `last_model(path: Path) -> str | None` reads the transcript backward in 64 KiB blocks and stops at the newest model line. `_model(session_id, config_dir: Path)` requires `config_dir`.
+- `listing(login: str | None = None) -> list[ListedSession]` is the cheap per-session listing. `ListedSession` is frozen with `session_id, pid, proc_start, name, kind, config_dir: Path, login, production, doc`; it is built per call and never persisted.
+- On natedev, listing 40 sessions takes 0.25 s, `_model` over all of them 0.02 s, and a one-session inventory 0.38 s (was 91 s).
 
 **Files:**
-- `scripts/shutdown/inventory.py` — `transcript_path`, `last_model`, `_model`, `inventory(only=…)`, `listing`, `ListedSession`.
-- `scripts/shutdown/test_inventory.py` — the tail read, the filter, the listing, kind agreement, the byte bound.
+- `scripts/shutdown/inventory.py` — session listing, selection, transcript lookup and backward model read.
+- `scripts/shutdown/test_inventory.py` — selection semantics, transcript lookup, backward read and listing tests.
 
-**Seats:** 1 writer + 1 tester — one production file, so nothing splits among writers.
-- `impl` — `scripts/shutdown/inventory.py`.
-- `test` — `scripts/shutdown/test_inventory.py`: `last_model` on a transcript whose last lines are `system`/`cost-state`/`last-prompt` after an assistant entry; a `<synthetic>` refusal after a real model line returns the real one; a `subagents/` copy is never chosen; `inventory(only=…)` returns those ids and the seats they own; `listing()` kinds equal `inventory()` kinds; the 50 MB byte bound.
+**Binds later work:** `ListedSession` is consumed by the move command's member listing via `listing(login)`. Callers that need one session or a named set call `inventory(login, only=frozenset(ids))`, which includes the workers the ids own; `down --only <director>` therefore includes that director's workers.
 
-**Constraints from prior phases:** none.
+**Gotchas:**
+- Any caller that wants one session must pass `only`; filtering after a full inventory reads every transcript. The old 91 s came from unfiltered callers plus a recursive glob over a 19 GB projects tree and whole-file reads.
+- `_model` reports "no reply yet" for a session whose transcript lives under another account's projects dir; harmless while every config dir's `projects` is the same tree by symlink.
 
-**Acceptance gate:** the shutdown suite (Delegation Context **Test**) passes, also with the real HOME in the environment; `basedpyright scripts/shutdown/inventory.py scripts/shutdown/test_inventory.py` 0/0/0. The unit director measures on natedev: `python3 -c` timing `inventory.listing()` over all live sessions, and `_model` over every live session, each under 0.5 s.
+**Ruled out:** a second selection parameter with exact-id semantics beside `only`, because settle, stop, accounts and refusal_watch rely on the worker-expanding one.
 
-### Phase 2 — A session's state decides its path  · status: todo
-
-**Depends on:** none
-
-#### Work Order
-
-**Goal:** before pausing anyone, a shutdown checks each session: a session whose account has room, or credits, gets the pause and is moved after `ready`; a session that has stopped taking prompts is reaped at once and restarted, on every host; the record keeps every step with its time; the `down` path inventories once.
-
-**Spec:**
-
-1. **The transcript refusal check works.** Root cause: `refusal_watch._last_transcript_entry` (163–179) reads only the last line, and Claude Code always writes after a refusal `system` (`subtype: "turn_duration"`), `bridge-session`, `cost-state`, `last-prompt`, `cost-state`, optionally `queue-operation`, `history-suppression`, `file-history-snapshot`; so `transcript_refusal` can never match (hana and cargo-liner sat 13 minutes on this). New: `_newest_exchange(path) -> TranscriptEntry | None` reads backward (64 KiB blocks, as Phase 1's `last_model`) and returns the newest entry whose `type` is `user` or `assistant`, skipping every other line. `transcript_refusal` matches when that entry is `type == "assistant"`, `isApiErrorMessage` true and `error == "rate_limit"`; it reads the window and reset from `quotaLimits` (`rateLimitType`, `resetsAt`) when present, else from the text as today. A user prompt after a refusal (the pause message, a typed "continue") followed by another refusal still matches; a successful assistant turn after one clears it. Keep `glob("*/<id>.jsonl")` one level (test at 889).
-2. **A typed per-session state, decided at `begin`.** In `settle.py`:
-   ```python
-   @dataclass(frozen=True)
-   class TakesPrompts:            # pause, wait for ready, then stop
-       because: Literal["room", "credits", "no fresh reading"]
-   @dataclass(frozen=True)
-   class StoppedTakingPrompts:    # reap now, no pause
-       because: Literal["refused in its transcript", "account out of usage"]
-       detail: str                # e.g. "weekly limit, resets Thu 9:00 AM" in the user's zone
-   SessionPromptState = TakesPrompts | StoppedTakingPrompts
-   def prompt_state(session: SessionInventory, now: datetime) -> SessionPromptState
-   ```
-   Order: a transcript refusal as the newest exchange → `StoppedTakingPrompts("refused in its transcript")`. Else the account's reading (`refusals.stored_reading("claude", login, now)`; Codex seats use `codex:<login>` and its `credits`): fresh and both windows above 0 → `TakesPrompts("room")`; fresh, a window at 0, and credits above 0 (Codex; Claude has no recorded credits) → `TakesPrompts("credits")`; fresh, a window at 0, no credits → `StoppedTakingPrompts("account out of usage")`; no fresh reading → `TakesPrompts("no fresh reading")`.
-3. **Reap.** A `StoppedTakingPrompts` session gets no pause message and no wait: its record starts at the new progress kind `reaping` (with `because`/`detail`), and `next_step` returns `StopSession` for it on the first tick (identity checked, SIGTERM, as every stop). With `then: restart` it is restarted on the target at once, on the host it is on (tmux pane respawned; ghostty as restart.py does it — Phase 3 changes that to the same window). `force` stays `wait for ready` for the others.
-4. **A refusal during the wait.** On each conductor tick, for every `waiting` session on every host (not only tmux panes, which `_usage_limit_shown` covers), `transcript_refusal` newer than the pause message's send time moves it to `reaping` with `because: "refused in its transcript"`. This replaces nothing that works: the tmux screen check stays as a second detector. The re-ask is not sent to a session that refused.
-5. **A trail on every record.** `SessionShutdown` gains `trail: list[ProgressStep]` where `ProgressStep = TypedDict("ProgressStep", {"at": str, "kind": str, "detail": str})`; every progress change appends one step (`update_session` is the one writer); `progress` stays the newest. A record without `trail` reads as an empty list. `archive_session` keeps the trail in the history file, so the history shows why each session stopped (hanadocs's `held by usage limit` step was overwritten on 2026-10-14). `status_record_lines` prints each session's steps as `<HH:MM:SS> <kind> <detail>` in the user's zone.
-6. **The `down` path inventories once.** Root cause of the real run's 26 s before the records existed: `shutdown.resolve_sessions` (~364) runs a full unfiltered inventory of the account, `down` runs a second (~1018), `begin` a third (~624). New: `resolve_sessions` with `--only` calls `inventory.inventory(login, only=ids)` (Phase 1's filter; until Phase 1 lands on this branch, take it from Phase 1's tree, Constraints below), and passes its result down to `down` and `begin` as a parameter; neither runs its own. Without `--only` it inventories once and passes it down the same way.
-
-**Files:**
-- `scripts/accounts/refusal_watch.py` — `_newest_exchange`, `transcript_refusal` (berth: held by two-accounts until its "Accounts named by number only" phase; claim with the showrunner's overlap answer; the change is limited to 163–218).
-- `scripts/accounts/test_refusal_watch.py` — refusal followed by the trailing lines; quotaLimits window and reset.
-- `scripts/shutdown/settle.py` — `SessionPromptState`, `prompt_state`, reap at `begin`, refusal during the wait, inventory passed down.
-- `scripts/shutdown/shutdown.py` — `resolve_sessions` filters and passes its inventory down.
-- `scripts/shutdown/record.py` — `reaping` kind, `trail`, `ProgressStep`, reading a record without `trail`.
-- `scripts/shutdown/test_settle.py`, `scripts/shutdown/test_record.py`, `scripts/shutdown/test_shutdown_cli.py` — the cases below.
-
-**Seats:** 1 writer + 1 tester — the record kinds, the refusal check and the settle path change together (the reap needs the `reaping` kind and the working check), so one writer holds them.
-- `impl` — `scripts/shutdown/settle.py`, `scripts/shutdown/shutdown.py`, `scripts/shutdown/record.py`, `scripts/accounts/refusal_watch.py`; hub: `scripts/shutdown/record.py` (`ProgressStep`, `reaping`).
-- `test` — `test_settle.py`, `test_record.py`, `test_shutdown_cli.py`, `test_refusal_watch.py`: each `prompt_state` branch (refusal, room, credits on a Codex seat, spent, stale reading); a spent-account session gets no pause message and is stopped on the first tick, then restarted; a ghostty session that refuses the pause moves to `reaping` within one tick with no reask; a session with room is paused and waits for `ready`; the trail lists every step in order and survives `archive_session`; a pre-trail record loads; `down --only` runs `inventory.inventory` once with `only=` those ids (count calls).
-
-**Constraints from prior phases:** Phase 1 (runs beside this one) keeps `inventory.inventory(login, only: frozenset[str] = frozenset())` as its one selection (those ids plus the seats they own; every session when empty) and builds full records only for the selection and `last_model`'s backward block reader in `scripts/shutdown/inventory.py`. This phase calls `inventory(only=…)` and reuses the same backward-reading approach in `refusal_watch.py` (its own copy there, since `refusal_watch.py` must not import `scripts/shutdown` internals beyond what it already imports). If Phase 1 is not yet on this branch when the seats start, claim after it and build on its tree.
-
-**Acceptance gate:** the shutdown and accounts suites pass, also with the real HOME; `basedpyright` 0/0/0 on the changed files. The unit director runs `refusal_watch.transcript_refusal` read-only against the four 2026-10-14 showrunner transcripts' state at 16:57:50Z (their files today, cut at that time into a scratch copy) and sees all four refused.
-
-### Phase 3 — A ghostty session restarts in its own window  · status: todo
+### Phase 2 — A session's state decides its path  · status: done
 
 **Depends on:** Phase 1
 
-#### Work Order
+#### As-built
 
-**Goal:** stopping and restarting a session in a ghostty window keeps the window and its scroll history; the new claude starts in the same terminal; a window started before this phase still gets a new window on its own desktop.
-
-**Spec:**
-
-1. **Root cause.** Ghostty has no in-place path: `stop._close_ghostty_window` (420–437) SIGHUPs the window shell, and `restart._window_launch` (712–758) opens a new window with `systemd-run ghostty -e zsh -ic …`. A terminal cannot be given a new command from outside, and nothing may type into it. So the window must already hold a process that can start the next claude: a supervisor between the shell and claude.
-2. **`scripts/lib/relaunch.py` — the supervisor.** `python3 relaunch.py run -- <argv…>`:
-   - Runs `<argv>` as a child in the same process group and terminal, ignoring SIGINT, SIGQUIT and SIGTSTP in itself while the child runs (Ctrl-C reaches claude only), and forwarding SIGTERM and SIGHUP to the child.
-   - When the child exits: if `STATE/relaunch/<own pid>.json` exists (`STATE` = `$SHUTDOWN_STATE_DIR` or `~/.local/state/shutdown`), it reads `RelaunchRequest = TypedDict(argv: list[str], cwd: str, environment: dict[str, str], unset: list[str], written_at: str, note: str)`, deletes it, prints `note` as one line (e.g. `restarting natedev on claude1`), and `os.execvpe`s `relaunch.py run -- <argv>` with that cwd and environment, so the pid stays the same and the next stop can use it again.
-   - Else, if `STATE/relaunch/<own pid>.hold` exists and is under `HOLD_SECONDS` (300) old: prints `claude stopped for a restart; waiting for it here` once and checks for the request every 0.5 s until it arrives (then as above) or the hold expires (then deletes the hold, prints `no restart came; this window is free`, exits with the child's code).
-   - Else exits with the child's exit code.
-   - Imports only the standard library and `scripts/lib` siblings.
-3. **Every ghostty launch goes through it.** `restart._resume_shell` / `_window_launch` build `zsh -ic "<cd …> && ~/.claude/scripts/lib/py ~/.claude/scripts/lib/relaunch.py run -- <resume argv>; exec zsh"`. (`accounts.py exec`, which the `claude1..3` aliases run, goes through it in "The move command"; until then a session started by an alias has no supervisor.)
-4. **Inventory knows the supervisor.** `_terminal_host`, walking up from the claude pid, records `supervisor: int | None` on `WindowHost`: the claude process's parent when its cmdline runs `relaunch.py run` and it is a descendant of the window shell. `supervisor_start` (proc start) is recorded beside it for the identity check.
-5. **Stop holds the window.** For a ghostty session with a live supervisor (pid and proc start match) and `then: restart`: `stop` writes `<supervisor>.hold`, SIGTERMs claude only (identity checked), and never SIGHUPs the window shell. With `then: stop`, or with no supervisor, stop behaves as today.
-6. **Restart in place.** `_launch_session` for a ghostty session whose record has a live supervisor writes `STATE/relaunch/<supervisor>.json` (atomic write: temp file + rename) with the resume argv, cwd, environment (the account variables `prepared_account` would set, and the ones it removes in `unset`) and the note, instead of opening a window. Confirmation is unchanged: the registry shows the new process (same supervisor pid as its parent). If the supervisor is gone by then, fall back to `_window_launch` on the session's desktop.
-7. A window without a supervisor (started before this phase or by hand outside `accounts.py exec`) keeps today's path: SIGHUP after ownership check, a new window on its named desktop, the old desktop restored.
+- `refusal_watch.transcript_refusal(session_id, *, config_dir: Path | None = None) -> TranscriptRefusal | NoSessionRefusal` matches when the newest exchange is an assistant entry with `isApiErrorMessage` and `error == "rate_limit"`. `_newest_exchange(path) -> NewestExchange | NoExchange` reads backward in 64 KiB blocks and skips every line whose `type` is not `user` or `assistant`, so the bookkeeping lines Claude Code writes after a refusal no longer hide it. Window and reset come from `quotaLimits` (`rateLimitType`, `resetsAt`) when present, else from the text; `TranscriptRefusal` carries the reset.
+- `settle.prompt_state(PromptSubject(session_id, login, config_dir), now) -> SessionPromptState`, where `SessionPromptState = TakesPrompts | StoppedTakingPrompts`. Order: a transcript refusal → `StoppedTakingPrompts("refused in its transcript")`; a fresh reading with a window at 0 → `StoppedTakingPrompts("account out of usage")`; a fresh reading with both windows → `TakesPrompts("room")`; otherwise `TakesPrompts("no fresh reading")`. `detail` reads like `weekly limit, resets Thu 9:00 AM` in the user's zone. Claude sessions only: `TakesPrompts("credits")` exists in the type but no session produces it, since Codex workers have no attributed login.
+- `begin` records a `StoppedTakingPrompts` session at progress `reaping` (`SessionReaping`: `because`, `detail`) with no pause message; `next_step` returns `StopSession` for it on the first tick, and `then: restart` relaunches it through the normal restart path. A `waiting` session whose transcript shows a refusal newer than the pause message's send time moves to `reaping` on the next tick, on every host, and gets no re-ask; the tmux screen check remains a second detector.
+- Every record carries `trail: list[ProgressStep]` (`at`, `kind`, `detail`); `store.update_session` appends a step stamped at write time whenever progress changes, `create_session` writes the first step, `progress` stays the newest, a record without `trail` reads as an empty list, and `archive_session` keeps the trail in the history file. `status` prints each step as `<HH:MM:SS> <kind> <detail>` in the user's zone.
+- `shutdown.resolve_sessions(login, items, *, here=False) -> ResolvedSessions(session_ids, report)` resolves exact names and ids from `inventory.listing(login)` and the records, then runs one `inventory(login, only=…)`; `down` passes that report to `settle.down` and `begin` (`report: Inventory | InventoryNeeded`), which inventory only when called without one. Without `--only`, `down` inventories once and passes it the same way.
+- Each conductor tick calls `run_inventory(login, <live record ids>, refresh_desktops=False)`, and `stop._fresh_inventory` passes `refresh_desktops=False`, so neither runs the desktop snapshot.
+- `stop.py`: a `reaping` owner skips the readiness and idle checks but keeps the pid and proc-start identity check before SIGTERM. `now` and `cancel` accept `reaping`; `restart --only` refuses a `reaping` record.
 
 **Files:**
-- `scripts/lib/relaunch.py` — new: the supervisor.
-- `scripts/lib/test_relaunch.py` — new.
-- `scripts/shutdown/inventory.py` — `WindowHost.supervisor`, `supervisor_start`, `_terminal_host`.
-- `scripts/shutdown/stop.py` — the hold and claude-only stop for a supervised window.
-- `scripts/shutdown/restart.py` — launches through the supervisor; the relaunch request for a supervised session.
-- `scripts/shutdown/test_stop.py`, `scripts/shutdown/test_restart.py`, `scripts/shutdown/test_inventory.py` — the cases below.
+- `scripts/accounts/refusal_watch.py` — `_newest_exchange`, `transcript_refusal` with `config_dir` and `quotaLimits`.
+- `scripts/shutdown/settle.py` — `PromptSubject`, `SessionPromptState`, `prompt_state`, reaping at `begin`, refusal scan during the wait, filtered conductor tick, trail lines in status.
+- `scripts/shutdown/record.py` — `SessionReaping`, `ProgressStep`, `trail` and its writer in `update_session`.
+- `scripts/shutdown/shutdown.py` — `ResolvedSessions`, name resolution from `listing`, one inventory passed down.
+- `scripts/shutdown/stop.py` — reaping stop without readiness; identity reads without the desktop snapshot.
+- `scripts/shutdown/restart.py` — `reaping` among the not-stopped progress kinds `restart --only` refuses.
+- `scripts/shutdown/test_{settle,record,shutdown_cli,stop,restart}.py`, `scripts/accounts/test_refusal_watch.py` — each `prompt_state` branch, reaping through the real stop path, trail order and archive, name resolution, inventory call counts.
 
-**Seats:** 1 writer + 1 tester — the supervisor's request format and the shutdown wiring are one contract, so one writer holds both.
-- `impl` — `scripts/lib/relaunch.py`, `scripts/shutdown/inventory.py`, `scripts/shutdown/stop.py`, `scripts/shutdown/restart.py`; hub: `scripts/lib/relaunch.py` (`RelaunchRequest`, the state paths, `HOLD_SECONDS`).
-- `test` — `scripts/lib/test_relaunch.py` (runs the supervisor as a subprocess over a fake child `python3 -c …`: exits with the child's code with no request; runs a staged request with the same pid; waits under a hold and runs a request that arrives late; gives up after a shortened hold; ignores SIGINT itself), `test_stop.py` (supervised + restart: hold written, SIGTERM to claude only, no SIGHUP; supervised + stop and unsupervised: today's path), `test_restart.py` (supervised: request file written, no ghostty launch, argv/env right; supervisor gone: new window on the named desktop), `test_inventory.py` (supervisor found in the ppid walk; absent when the parent is the shell).
+**Binds later work:** a reaped session restarts through `_launch_session`, so a reaped ghostty session follows whatever path "A ghostty session restarts in its own window" gives that function. The supervisor fields must be filled on the `refresh_desktops=False` path, which skips only the desktop snapshot; a relaunch is placed on the desktop stored in the record at request time. "The shutdown says what is happening and where to act" reads `trail` for `follow` and sends no holdout push for `reaping`. "The move command" builds its preview from `prompt_state(PromptSubject(...), now)`.
 
-**Constraints from prior phases:** "Inventory reads only what it needs" changed `scripts/shutdown/inventory.py` (`_model`, `inventory(only=…)`, `listing`); build on that tree. "A session's state decides its path" restarts a reaped session through `_launch_session`, so a reaped ghostty session gets this phase's in-place path for free.
+**Gotchas:**
+- A record withdrawn while the conductor scans for refusals raises `store.NoLiveRecord`; the tick skips that record instead of ending.
+- `transcript_refusal` defaults to `~/.claude/projects`; pass the session's `config_dir` for any other account.
+- Running the full inventory each tick, desktop snapshot included (up to 60 s and a vault page rewrite), is what stretched one live run's ready-to-restart gap to 13 minutes; keep conductor reads filtered.
 
-**Acceptance gate:** the shutdown suite and `scripts/lib/test_relaunch.py` pass, also with the real HOME; `basedpyright` 0/0/0 on the changed files. The live check of a real window is in "Live check of the move".
+**Ruled out:** a credits branch for Codex workers in this phase, since the inventory attributes no login to them.
 
-### Phase 4 — The shutdown says what is happening and where to act  · status: todo
+### Phase 3 — A ghostty session restarts in its own window  · status: done
 
-**Depends on:** Phase 2
+**Depends on:** Phase 1
 
-#### Work Order
+#### As-built
 
-**Goal:** every line the shutdown path shows names where to run any command it gives; a terminal requester can follow each session's steps live; a session that holds out reaches the user as a push; the conductor's output appears as it happens.
-
-**Spec:**
-
-1. **Root causes.** `down` ends with `shutdown of <label> started; /shutdown status to watch, /shutdown cancel to undo` (settle.py:1061): a skill named with no account, no `--only` and no place, so typed in a session on another account it acts on that account. The conductor's later lines (`report_stop` 1161, `_tell_holdout_requesters` 1365–1370) print to the systemd unit's journal, block-buffered until the conductor exits, for a terminal requester; `_send_holdout_alert` pushes only when the pane shows a form, and a ghostty pane is never read. The 2026-10-14 user saw `<name>: added` four times, the closing line, then nothing for 13 minutes.
-2. **`shutdown.py follow <account> --request <request id>`.** Prints one line per new trail step (Phase 2's `trail`) of every record in that request, as `<HH:MM:SS> <name>: <kind> <detail>` in the user's zone, reading the records every second (a local file read, no inventory). It ends when every record is final (`restarted`, `stopped`, `already gone`) with a summary line (`all 4 back on claude1` / `all 4 stopped`), or when one needs the user, with the line that says what to do and where. Ctrl-C ends the follow only and prints `the shutdown keeps running; to follow it again, in this terminal: <full follow command>`. Exit codes: 0 all done, 1 one needs the user, 130 detached.
-3. **`down` from a terminal follows.** When `requested_by` is the terminal and stdout is a tty, `down` runs `follow` after starting the conductor, instead of the closing line. Otherwise (a session requester, or no tty) the closing line becomes: `shutdown of <label> started for <n> sessions. To follow it, in a terminal on <machine>: <full follow command>. To stop the ones not yet stopped, in a terminal on <machine>: <full cancel command with --only>.` A move's `down` (`--to`) says `stop the move of the ones not yet stopped`, and never says `undo`.
-4. **Every next-step line names its place.** Sites, each rewritten to name `in this terminal`, `in a terminal on <machine>` or `in any Claude session on <machine>`, the account and the `--only` ids, with full script paths: settle.py 1014 (cold key: names `github-warm-status`/`github-warmup` and where), 1058 (peer unreachable), 1061 (above), the holdout lines (`waiting; /shutdown cancel --only …`), `_status_actions` (shutdown.py 439), the shutdown.py usage text (~527). A sweep test renders each of these with fixture records and asserts every line containing `/shutdown`, `shutdown.py`, `accounts.py` or `github-warm` also contains one of the three place phrases.
-5. **A holdout reaches the user.** At `NOT_ANSWERING_AFTER`, a session still `waiting` (not reaping, not refused) gets one push through `alert_user` (settle.py 274) for every requester kind, not only for a pane showing a form: title `<name> has not answered the pause`, body naming the session, its window or pane, how long, and the exact command and place to stop it now (`shutdown.py now … --only <id>`). The push text gets a catalog entry and is approved with `scripts/notify/review.py texts --id … --approve` (unit director). A terminal requester following live also sees it as a follow line.
-6. **The conductor's output is live.** `_launch_conductor` runs python with `-u` (and `PYTHONUNBUFFERED=1`), so journal lines appear as they happen.
-7. **Docs.** `commands/shutdown.md` — the follow verb, the place phrases, reap vs pause (from Phase 2). `docs/as-built/shutdown-and-restart.md` — the prompt state, reaping, the trail, follow, the supervisor (Phase 3), holdout push.
+- `scripts/lib/relaunch.py run -- <argv>` is the window supervisor. It runs `<argv>` as a child on the same terminal, ignores SIGINT, SIGQUIT and SIGTSTP itself (caught handlers, so the child still gets them), and forwards SIGTERM and SIGHUP to the child. After the child exits it reads `STATE/relaunch/<own pid>.json` (`STATE` = `$SHUTDOWN_STATE_DIR` or `~/.local/state/shutdown`) as `RelaunchRequest(argv, cwd, environment, unset, written_at, note)`, deletes it and the hold, prints `note` as one line, and `os.execvpe`s itself with `run -- <argv>` in that cwd and environment, so the pid stays the same. Without a request, a `STATE/relaunch/<pid>.hold` younger than `HOLD_SECONDS` (300; `SHUTDOWN_RELAUNCH_HOLD_SECONDS` overrides) makes it print `claude stopped for a restart; waiting for it here` once and check every 0.5 s; on expiry it deletes the hold, prints `no restart came; this window is free` and exits with the child's code. A malformed request prints `could not restart here: <error>` and exits with the child's code. `write_hold(pid)` and `write_request(pid, request)` (temp file + fsync + rename) are the writers; standard library only.
+- The supervisor sets no environment marker in its child; a process under it learns that only from its parent's argv.
+- Inventory: `SupervisorIdentity(kind="supervisor", pid, proc_start) | NoSupervisor(kind="no supervisor")` sits as `supervisor: NotRequired[...]` on both `WindowHost` and `TerminalHost`. `_terminal_host` sets it from `_supervisor_process(parent)`, which matches the claude parent's argv for `relaunch.py run --` (`/proc/<pid>/cmdline`, `ps -o args=` fallback on the Mac); a supervisor that is the window shell itself reads as `NoSupervisor`. The field is filled on the `refresh_desktops=False` path too. `supervisor_identity(host)` reads a host from before this phase as `NoSupervisor`; `live_supervisor(host)` also rechecks pid + proc start.
+- Supervised hosts are `ghostty` on Linux and `terminal` on darwin, where `terminal_kind` maps ghostty to `terminal`.
+- Stop: `stop._hold_supervised_window(entry, claim) -> bool` writes the hold before SIGTERM when `then: restart` and the host has a live supervisor, on the live and already-absent paths alike; the stop then signals claude only and skips `_close_ghostty_window` (`retain_window`). A failed hold write ends the stop as `stop failed` with no signal sent. `then: stop`, or no supervisor, keeps the SIGHUP-after-ownership path.
+- Restart: every window launch (`ghostty`, `zed`, darwin `terminal`) builds `_resume_shell(parts, supervised=True)`, which wraps the resume argv in `~/.claude/scripts/lib/py ~/.claude/scripts/lib/relaunch.py run -- …`. For a supervised host with a live supervisor, `_launch_session` writes `_relaunch_request(parts, note)` to `<supervisor>.json` instead of opening a window and returns `SessionLaunched()`; confirmation is the registry as before. `_relaunch_request` takes its environment from `accounts.prepared_account(target, resume=True)` on a move (its `remove` list into `unset`) and unsets `NAMED_ACCOUNT_VARIABLES` for the default account; `CLAUDE_CODE_OAUTH_TOKEN` is always unset. A gone or reused supervisor falls back to `_window_launch` on the session's named desktop (Linux) or the Mac open command.
 
 **Files:**
-- `scripts/shutdown/settle.py` — closing lines, holdout push, `-u`, place phrases.
-- `scripts/shutdown/shutdown.py` — `follow`, status actions, usage text.
-- `scripts/notify/push_catalog.py` — the holdout push text (`PushText("shutdown.holdout", "shutdown", …)`, beside `shutdown.stop_failed`; its example facts from `test_settle.py`).
-- `scripts/notify/push_texts_reviewed.json` — the approval `review.py texts --approve` writes (unit director).
-- `scripts/shutdown/test_settle.py`, `scripts/shutdown/test_shutdown_cli.py`, `scripts/shutdown/test_shutdown_status.py` — the cases below, the sweep test.
-- `commands/shutdown.md` — follow, place phrases, reap vs pause.
-- `docs/as-built/shutdown-and-restart.md` — this plan's shutdown changes.
+- `scripts/lib/relaunch.py` — the supervisor, `RelaunchRequest`, state paths, `HOLD_SECONDS`, hold and request writers.
+- `scripts/lib/test_relaunch.py` — the supervisor run as a subprocess over a fake child: exit code passthrough, same-pid request, late request under a hold, hold expiry, SIGINT ignored.
+- `scripts/shutdown/inventory.py` — `SupervisorIdentity`, `NoSupervisor`, `_supervisor_process`, `supervisor_identity`, `live_supervisor`, wire parse of `supervisor`.
+- `scripts/shutdown/stop.py` — `_hold_supervised_window` and the claude-only stop.
+- `scripts/shutdown/restart.py` — supervised `_resume_shell`, `_relaunch_request`, the in-place branch of `_launch_session`.
+- `scripts/shutdown/test_{inventory,stop,restart}.py` — supervisor discovery, hold and no-SIGHUP stop, unwritable hold, request written with no window, fallback window.
 
-**Seats:** 1 writer + 1 tester — settle.py and shutdown.py share the follow and line formats, so one writer holds both; the docs go to the writer after the code.
-- `impl` — every production file and doc above; hub: `scripts/shutdown/shutdown.py` (`follow`).
-- `test` — `follow` over fixture records advancing step by step (prints each step once, ends with the summary, exit 0; one needing the user → exit 1 with its line); detach prints the follow command; `down` from a tty runs follow, from a non-tty prints the new closing line with account, `--only` and place; a move's line never says `undo`; the holdout push is sent once for a ghostty session with no form and not for a reaping one; the conductor argv carries `-u`; the sweep test.
+**Binds later work:** the supervisor runs on ghostty and darwin Terminal hosts, read through `supervisor_identity(host)` / `live_supervisor(host)`; the as-built doc covers the hold, both window lines and the new-window fallback, on both host kinds. `relaunch.py` sets no `RELAUNCH_SUPERVISED` yet; "The move command" adds it so `accounts.py exec` under `restart._resume_shell(parts, supervised=True)` does not nest a second supervisor. A move's request environment comes from `accounts.prepared_account(target, resume=True)`.
 
-**Constraints from prior phases:** "A session's state decides its path" adds `trail: list[ProgressStep]` (`at`, `kind`, `detail`) to every record, the `reaping` kind with `because`/`detail`, and `SessionPromptState`; `follow` reads the trail and a reaping session never gets the holdout push. "A ghostty session restarts in its own window" adds the supervisor; the as-built describes it.
+**Gotchas:**
+- On darwin a ghostty window reads as `terminal`; its supervisor lives on `TerminalHost`, not `WindowHost`.
+- A window started before this phase, or by hand outside a supervised launch, has no supervisor and still gets a new window.
 
-**Acceptance gate:** the shutdown suite passes, also with the real HOME; `basedpyright` 0/0/0 on the changed files; the push text approved.
+**Ruled out:** reclassifying Mac windows as `ghostty`, since the fallback would then go through the Linux window launcher.
+
+### Phase 4 — The shutdown says what is happening and where to act  · status: done
+
+**Depends on:** Phase 2, Phase 3
+
+#### As-built
+
+- `shutdown.py follow <account> --request <request id>` (`shutdown.follow(login, request_id) -> int`) prints each new trail step of every record in the request as `<HH:MM:SS> <name>: <kind> <detail>` in the user's zone, polling once a second with file reads only. `_request_records(login, request_id, history: RequestHistory)` reads the active records first, then each history file not yet read (`RequestHistory`: `read_paths`, `records`, `taken_out`), so a record archived between polls is still seen and each history file is parsed once.
+- Follow ends 0 when every session is `restarted`, `stopped`/`already gone` under `then: stop`, or taken out; under `then: restart` a stop is intermediate and completion waits for the restart. Summaries: `all N back on <target>`, `all N stopped`, `all N done: K back on <target>, J stopped, M taken out`. A session in `process identity lost`, `stop failed`, `restart failed`, `manual restart` or `timers pending`, a `waiting` one with `alerted_at`, or a stopped one with `stop_issues` prints `_follow_action(saved)` (its state and the scoped command with its place) and ends 1. Ctrl-C prints `the shutdown keeps running; to follow it again, in this terminal: <follow command>` and ends 130. A request with no records ends 1.
+- An archived record whose progress is not `restarted`, `stopped` or `already gone` was withdrawn by `cancel`; follow prints `<name>: taken out` once and counts it as done.
+- `settle.down` snapshots the selected records by request id before launching the conductor. With no session requester (`requested_by` empty and no `CLAUDE_CODE_SESSION_ID`) and a tty on stdout, it runs `follow` for each local request (`import_module("shutdown")` cast to `settle.RequestFollower`) and returns its code. Otherwise it prints, per request, `shutdown of <label> started for <n> sessions. To follow it, in a terminal on <machine>: <follow command>. To stop the ones not yet stopped, in a terminal on <machine>: <cancel --here --only <ids>>.`; a request with a `target` says `stop the move of the ones not yet stopped`. No local selection prints `shutdown of <label>: no local sessions selected`.
+- Every next-step line names `in this terminal`, `in a terminal on <machine>` or `in any Claude session on <machine>` and a full command from `settle.shutdown_command(*arguments)` (`~/.claude/scripts/lib/py ~/.claude/scripts/shutdown/shutdown.py <shlex-joined args>`), scoped by login, `--here` and `--only <session ids>`: the cold-key line (`github-warm-status; github-warmup`, then the `down` retry keeping `--here`, `--only`, `--restart`, `--to`/`--why` and `--no-alert`), peer-not-reached in `down`, `now` and `cancel`, `report_stop`, `tell_showrunners_outcome`, `cancel`'s not-cancelled line, a manual restart's progress, `_status_actions` (one line per verb per machine, ids comma-joined), the pause message (`in this terminal run …`), the `shutdown.py` usage and epilog, and restart.py's owner-cleanup and peer-not-reached retries (the latter keeping `--only`, `--dry-run`, `--no-alert`). `settle.located_detail(record, detail)` prefixes `in a terminal on <machine>: ` to a stored detail that holds a command but no place phrase; `status` and `follow` print trail steps through it.
+- Holdout: `_holdout_due(saved, at)` holds once per record when `alerts == "user"`, progress is `waiting` (never `ready` or `reaping`) and `NOT_ANSWERING_AFTER` has passed since the pause message, or the request when none was sent; `_reserve_holdout_alert` sets `alerted_at`. `_send_holdout_alert` pushes `shutdown.holdout` through `alert_user` for every such session, whatever its host or pane shows, then tells requesters with `holdout_line(saved)`. The push names the session, machine, `_holdout_host(saved)` (tmux session and pane, unit, `Ghostty window, <name> desktop`, Zed window), minutes elapsed, and `shutdown.py now <login> --here --only <id>`.
+- `_launch_conductor` runs `env PYTHONUNBUFFERED=1 <python> -u shutdown.py conduct <login>`, so journal lines appear as written.
+
+**Files:**
+- `scripts/shutdown/shutdown.py` — `follow`, `RequestHistory`, `_request_records`, `_follow_action`, scoped `_status_actions`, usage and epilog.
+- `scripts/shutdown/settle.py` — `shutdown_command`, `located_detail`, `RequestFollower`, closing lines and follow in `down`, cold-key retry, holdout due/reserve/push, `holdout_line`, `_holdout_host`, unbuffered conductor.
+- `scripts/shutdown/restart.py` — scoped owner-cleanup and peer-not-reached retry lines; `ShutdownServices.shutdown_command`.
+- `scripts/notify/push_catalog.py` — `shutdown.holdout`; `scripts/notify/push_texts_reviewed.json` — its approval.
+- `scripts/shutdown/test_{shutdown_cli,settle,restart,shutdown_status}.py` — follow steps, archive between polls, stop before a pending restart, taken out, detach; tty and non-tty `down`; holdout push for a ghostty session and none for reaping; `-u` in the conductor argv; the place-phrase sweep.
+- `commands/shutdown.md`, `docs/as-built/shutdown-and-restart.md` — follow, place phrases, reap vs pause, the trail, the supervisor, the holdout push.
+
+**Binds later work:** `shutdown.py follow <account> --request <id>`: exit 0 done, 1 needs the user, 130 detached; a session taken out by a canceled request counts as done and the summary reads `all N done: …, K taken out`. "The move command" runs follow for each source login's request and ends on its summary, and builds its lines from `settle.shutdown_command` with the place phrases.
+
+**Gotchas:**
+- Follow reads the local machine's records only; a peer's sessions in the same request are not followed.
+- `down` takes its request snapshot before the conductor starts because the conductor archives a finished record at once; follow tells a taken-out session from a finished one only by its archived progress kind.
+- A terminal opened from inside a Claude session carries `CLAUDE_CODE_SESSION_ID`, so its `down` prints the closing lines instead of following.
+
+**Ruled out:** a form-only holdout push (`shutdown.form` is removed; the holdout push covers every waiting session); an account name in the holdout push text.
 
 ### Phase 5 — The move command  · status: todo
 
@@ -221,24 +186,27 @@
 2. **The target must have room.** Before anything is written, `move_group` and `move` read the target's `refusals.stored_reading`: fresh and a window at 0 with no credits → refuse: `accounts: <target> is out of usage (weekly 0% left, resets <time>); pick another: <full pick command> in this terminal`. No fresh reading → go on and say `no fresh usage reading for <target> (last <age> ago)` on the preview and the run.
 3. **The preview.** `move showrunners <target> --dry-run` prints, per member, its name, session id, and what will happen to it from Phase 2's `prompt_state`: `<name>: pause, then move (claude3 has room)` or `<name>: reap and restart now (claude3 out of usage: weekly limit, resets Thu 9:00 AM)`. Writes nothing, as today. Under 0.5 s on natedev with every live session (gate).
 4. **The run follows itself.** After `down` starts, `move_group`/`move` run Phase 4's `follow` for each source login's request in this terminal and end with its summary; the closing lines are Phase 4's. The move-back line replaces `undo`: `to move them back, in this terminal: <full move command with the source account>`.
-5. **`accounts.py exec` supervises.** `exec_account` (1055–1067) runs `relaunch.py run -- claude <arguments>` (Phase 3) through `os.execvpe` of the python interpreter when stdin is a tty and it is not already under a supervisor (`RELAUNCH_SUPERVISED` set by the supervisor in its child's environment); otherwise it execs claude as today. The `claude1..3` aliases (`/etc/nixos/modules/linux/shell.nix:52–55`) need no change.
+5. **`accounts.py exec` supervises.** `exec_account` (1055–1067) runs `relaunch.py run -- claude <arguments>` (Phase 3) through `os.execvpe` of the python interpreter when stdin is a tty and it is not already under a supervisor (`RELAUNCH_SUPERVISED` in its environment); otherwise it execs claude as today. `relaunch.run` does not set that marker yet: this phase makes it start the child with `RELAUNCH_SUPERVISED=1` in the child's environment (`subprocess.Popen(argv, env=…)`), so the restart path's `relaunch.py run -- accounts.py exec …` (`restart._resume_shell(parts, supervised=True)`) does not nest a second supervisor. The `claude1..3` aliases (`/etc/nixos/modules/linux/shell.nix:52–55`) need no change.
 6. **Docs.** `docs/accounts.md`, `commands/showrunner/accounts.md`, `commands/showrunner/move.md`: the preview's per-session lines, the target check, reap vs pause, the live follow, the move back, same-window restart. `~/rust/hanadocs/agent login.md` (the user's request through the showrunner): rewrite "Move every showrunner off a spent account" and "Move a session by hand" to match — what the preview shows, that a spent session is restarted at once and the rest are paused, that the move stays in the terminal until all are back, that the window and its history are kept, and what to do on each line it can end with. The unit director hands that change to hanadocs to commit (the vault is not this repo); never commit there.
+- **Registrations and single previews.** Keep `inventory.unregistered_showrunners()` beside `listing()` for the unregistered-showrunner check (the listing has no registration whose target is absent); a test covers a registered production whose target id is absent, with no full inventory. `accounts.py move <session> <label> --dry-run` previews one ungrouped session (today `accounts.py` ~2873 rejects it), writing nothing; a no-write test pins it.
 
 **Files:**
 - `scripts/accounts/accounts.py` — `live_group_members`, `move_sessions`, `move_group`, `move`, `exec_account`, the preview, the target check, the follow.
+- `scripts/lib/relaunch.py` — `run` sets `RELAUNCH_SUPERVISED=1` in the child's environment.
+- `scripts/lib/test_relaunch.py` — the child sees the marker.
 - `scripts/accounts/test_accounts.py`, `scripts/shutdown/test_account_move.py` — the cases below.
 - `docs/accounts.md` — the move command.
 - `commands/showrunner/accounts.md` — the move command.
 - `commands/showrunner/move.md` — the move command.
 - `~/rust/hanadocs/agent login.md` — outside this repo; written by the unit director, handed to hanadocs.
 
-**Seats:** 1 writer + 1 tester — one production file.
-- `impl` — `scripts/accounts/accounts.py` and the three docs in this repo.
-- `test` — `test_account_move.py`: the preview calls `inventory.listing` and never `inventory.inventory` (assert), prints the per-session plan; the target-out-of-usage refusal writes nothing; the run hands one `down --only` per source login and then follows; the move-back line. `test_accounts.py`: `exec_account` under a tty and unsupervised execs the supervisor, supervised or no tty execs claude.
+**Workers:** 1 writer + 1 tester — one production file.
+- `impl` — `scripts/accounts/accounts.py`, `scripts/lib/relaunch.py` and the three docs in this repo.
+- `test` — `test_account_move.py`: the preview calls `inventory.listing` and never `inventory.inventory` (assert), prints the per-session plan; the target-out-of-usage refusal writes nothing; the run hands one `down --only` per source login and then follows; the move-back line. `test_accounts.py`: `exec_account` under a tty and unsupervised execs the supervisor, supervised or no tty execs claude. `scripts/lib/test_relaunch.py`: the supervised child's environment carries `RELAUNCH_SUPERVISED=1`.
 
-**Constraints from prior phases:** "Inventory reads only what it needs": `inventory.listing(login | None) -> list[ListedSession]` (`session_id, pid, proc_start, name, kind, config_dir, login, production, doc`), `inventory(login, only=…)` (those ids plus their seats). "A session's state decides its path": `settle.prompt_state(session, now) -> TakesPrompts | StoppedTakingPrompts`, the `reaping` kind, `trail`, `down --only` inventories once. "A ghostty session restarts in its own window": `scripts/lib/relaunch.py run -- <argv>`, `RELAUNCH_SUPERVISED` in the child's environment. "The shutdown says what is happening and where to act": `shutdown.py follow <account> --request <id>` (exit 0 done, 1 needs the user, 130 detached), the place phrases. Two-accounts' "Accounts named by number only" spells labels `claude1`/`codex1` and adds `claude_account_dir`; use its functions.
+**Constraints from prior phases:** "Inventory reads only what it needs": `inventory.listing(login | None) -> list[ListedSession]` (`session_id, pid, proc_start, name, kind, config_dir, login, production, doc`), `inventory(login, only=…)` (those ids plus their workers). "A session's state decides its path": `settle.prompt_state(PromptSubject(session_id, login, config_dir), now) -> TakesPrompts | StoppedTakingPrompts`, the `reaping` kind, `trail`, `down --only` inventories once. "A ghostty session restarts in its own window": `scripts/lib/relaunch.py run -- <argv>` (no environment marker yet; this phase adds `RELAUNCH_SUPERVISED`); restart's window launches already run `relaunch.py run -- <resume argv>`, where a move's argv is `accounts.py exec <target> …`; `restart._relaunch_request(parts, note)` builds the request environment from `accounts.prepared_account(target, resume=True)`. "The shutdown says what is happening and where to act": `shutdown.py follow <account> --request <id>` (exit 0 done, 1 needs the user, 130 detached; a session taken out by a canceled request counts as done and the summary reads `all N done: …, K taken out`), the place phrases. Two-accounts' "Accounts named by number only" spells labels `claude1`/`codex1` and adds `claude_account_dir`; use its functions.
 
-**Acceptance gate:** the accounts and shutdown suites pass, also with the real HOME; `basedpyright` 0/0/0 on the changed files. The unit director measures `accounts.py move showrunners <current account> --dry-run` on natedev under 0.5 s wall clock (`time`), and checks its output names no session wrongly.
+**Acceptance gate:** the accounts, shutdown and `scripts/lib` suites pass, also with the real HOME; `basedpyright` 0/0/0 on the changed files. The unit director measures `accounts.py move showrunners <current account> --dry-run` on natedev under 0.5 s wall clock (`time`), and checks its output names no session wrongly.
 
 ### Phase 6 — Live check of the move  · status: todo
 
@@ -260,9 +228,7 @@
 **Files:**
 - `docs/as-built/shutdown-and-restart.md` — the live results.
 
-**Seats:** 1 writer + 1 tester — none open: the unit director runs this phase itself.
-- `impl` — `docs/as-built/shutdown-and-restart.md` (the unit director).
-- `test` — opens as impl; nothing to write.
+**Workers:** unit director only; no workers open.
 
 **Constraints from prior phases:** the follow, the preview lines, the reap, the supervisor and the target check as built by "The move command" and the phases before it.
 

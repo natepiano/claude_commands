@@ -8,6 +8,15 @@ from push_texts import ActionTemplate, NoActionNeeded, PushExample, PushText
 
 
 ENTRIES = (
+    PushText("shutdown.holdout", "shutdown", "decision", "{operation} stuck waiting on {session} session",
+        ActionTemplate("In a terminal on {machine}, run the command below to stop {session}."),
+        "A {request} asked the {session} session ({host}) to pause at a safe point and say ready. "
+        + "No reply in {elapsed}, so the {request} is stuck.\n\n"
+        + "Stop now (recommended): ends {session} mid-step so the {request} goes on. Uncommitted work stays; {after_stop}\n\n"
+        + "Do nothing: the {request} keeps waiting.\n\nCommand: {command}",
+        (PushExample("typical", {"session": "Owner", "machine": "natedev", "host": "Ghostty window, Production desktop",
+            "elapsed": "4 minutes", "operation": "Restart", "request": "restart", "after_stop": "the restart brings it back.",
+            "command": "~/.claude/scripts/lib/py ~/.claude/scripts/shutdown/shutdown.py now 'claude 2' --here --only owner"}),)),
     # Shutdown examples use test_settle.py and test_restart.py facts.
     # The failing shutdown deliveries are recorded in notify/review.jsonl, 2026-10-14T02:05Z.
     PushText("shutdown.stop_failed", "shutdown", "decision", "Claude account shutdown is incomplete",
@@ -35,13 +44,6 @@ ENTRIES = (
         + "Its terminal cannot restart on its own. Its shutdown record holds the command to resume it.",
         (PushExample("typical", {"machine": "natedev", "session": "Owner"}),
          PushExample("long_session", {"machine": "Mac", "session": "build-followups-message-clarity-unit-director-session-12"}))),
-    PushText("shutdown.form", "shutdown", "decision", "Shutdown waits on a session showing a form",
-        ActionTemplate("On {machine}, answer the open form in the terminal for Claude session {session}."),
-        "Your shutdown is waiting on Claude session {session} on {machine}. "
-        + "That session is asking you a question and is paused until you answer. "
-        + "It cannot stop until then, so the shutdown cannot finish.",
-        (PushExample("typical", {"machine": "natedev", "session": "Owner"}),
-         PushExample("long_session", {"machine": "Mac", "session": "build-followups-message-clarity-unit-director-session-12"}))),
     PushText("shutdown.remote_control", "shutdown", "decision", "Claude session lacks phone access",
         ActionTemplate("In the terminal for Claude session {session} on {machine}, run /remote-control."),
         "Claude session {session} on {machine} restarted and is running. Remote Control is off, "
@@ -57,16 +59,16 @@ ENTRIES = (
          PushExample("long_target", {"account": "claude 3", "remaining": "0%", "reset": "2026-10-19 23:59 EDT", "target": "claude-team-build-followups-12", "target_remaining": "40%"}))),
     PushText('quota.codex_on_credits', "quota_alert", "note", 'Codex workers now spend paid credits',
         ActionTemplate('{credit_action}, set use_credits: off in ~/rust/hanadocs/agents/{file} on {machine}.'),
-        '{opening}\n\n{turn_off}\n\n{leave_on}\n{clarification}',
-        (PushExample('codex_one', {'file': 'codex 1.md', 'machine': 'natedev', 'turn_off': 'Turn off (recommended): no paid spend. Within minutes, new work moves to the other account, codex 2 (97% of its weekly allowance left).', 'leave_on': 'Leave on: codex 1 spends its credits, then work moves to codex 2.', 'credit_action': 'To stop paid credit use', 'opening': 'Codex account codex 1 is now spending paid credits until its weekly refill on Tue 2026-10-20 00:58 EDT. Its 6,370 credits last until about Fri 2026-10-16 13:05 EDT.', 'clarification': ''}),
-         PushExample('codex_two', {'file': 'codex 2.md', 'machine': 'natedev', 'turn_off': "Turn off: within minutes, new work spends the other Codex account's (codex 1) paid credits instead.", 'leave_on': "Leave on (recommended): new work spends codex 2's paid credits first, then codex 1's.", 'credit_action': 'To move paid credit use to codex 1', 'opening': 'Codex account codex 2 now spends paid credits. Weekly refill: Thu 2026-10-22 07:00 EDT. Its 2,114 credits last until about Fri 2026-10-16 12:51 EDT.', 'clarification': 'Either way, new work spends paid credits.'}),
-         PushExample('unlimited', {'file': 'codex 1.md', 'machine': 'natedev', 'turn_off': 'Turn off (recommended): no paid spend. Within minutes, new work moves to the other account, codex 2 (97% of its weekly allowance left).', 'leave_on': "Leave on: keep spending codex 1's paid credits without a limit.", 'credit_action': 'To stop paid credit use', 'opening': 'Codex account codex 1 is now spending paid credits until its weekly refill on Tue 2026-10-20 00:58 EDT. There is no limit on paid credits.', 'clarification': ''}),
-         PushExample('unknown', {'file': 'codex 1.md', 'machine': 'natedev', 'turn_off': 'Turn off (recommended): paid spending stops. Within minutes, new work moves to the second account, codex 2, which has 97% of its weekly limit left.', 'leave_on': 'Leave on: codex 1 spends its credits, then new work moves to codex 2.', 'credit_action': 'To stop paid credit use', 'opening': 'Codex account codex 1 is now spending paid credits until its weekly refill on Tue 2026-10-20 00:58 EDT. The credit balance is unknown.', 'clarification': ''}))),
+        '{opening}\n\n{turn_off}\n\n{leave_on}{clarification}',
+        (PushExample('codex_one', {'file': 'codex1.md', 'machine': 'natedev', 'turn_off': 'Turn off (recommended): no paid spend. Within minutes, new work moves to the other account, codex 2 (97% of its weekly allowance left).', 'leave_on': 'Leave on: codex 1 spends its credits, then work moves to codex 2.', 'credit_action': 'To stop paid credit use', 'opening': 'Codex account codex 1 is now spending paid credits until its weekly refill on Tue 2026-10-20 00:58 EDT. Its 6,370 credits last until about Fri 2026-10-16 13:05 EDT.', 'clarification': ''}),
+         PushExample('codex_two', {'file': 'codex2.md', 'machine': 'natedev', 'turn_off': "Turn off: within minutes, new work spends codex 1's paid credits instead.", 'leave_on': "Leave on (recommended, no edit needed): new work spends codex 2's credits, then codex 1's, then falls back to Claude.", 'credit_action': "Optional: to spend codex 1's credits first", 'opening': 'Codex account codex 2 now spends paid credits until its included usage refills Thu 2026-10-22 07:00 EDT. Its 2,114 credits last until about Fri 2026-10-16 12:51 EDT.', 'clarification': ''}),
+         PushExample('unlimited', {'file': 'codex1.md', 'machine': 'natedev', 'turn_off': 'Turn off (recommended): no paid spend. Within minutes, new work moves to the other account, codex 2 (97% of its weekly allowance left).', 'leave_on': "Leave on: keep spending codex 1's paid credits without a limit.", 'credit_action': 'To stop paid credit use', 'opening': 'Codex account codex 1 is now spending paid credits until its weekly refill on Tue 2026-10-20 00:58 EDT. There is no limit on paid credits.', 'clarification': ''}),
+         PushExample('unknown', {'file': 'codex1.md', 'machine': 'natedev', 'turn_off': 'Turn off (recommended): paid spending stops. Within minutes, new work moves to the second account, codex 2, which has 97% of its weekly limit left.', 'leave_on': 'Leave on: codex 1 spends its credits, then new work moves to codex 2.', 'credit_action': 'To stop paid credit use', 'opening': 'Codex account codex 1 is now spending paid credits until its weekly refill on Tue 2026-10-20 00:58 EDT. The credit balance is unknown.', 'clarification': ''}))),
     PushText('quota.codex_on_credits_last', "quota_alert", "note", 'Codex workers now spend paid credits',
         ActionTemplate('To stop paid credit use, set use_credits: off in ~/rust/hanadocs/agents/{file} on {machine}.'),
-        'Codex account {account} now uses paid credits. Its weekly refill is {reset}. {credits}\n{turn_off}\n{leave_on}',
-        (PushExample('codex_one', {'account': 'codex 1', 'file': 'codex 1.md', 'machine': 'natedev', 'reset': 'Tue 2026-10-20 00:58 EDT', 'credits': 'Its 6,370 credits last until about Fri 2026-10-16 13:05 EDT.', 'leave_on': 'Leave on: new work spends these credits, then uses Claude when they run out.', 'turn_off': 'Turn off (recommended, so no paid credits are spent): within minutes, new work uses Claude, the other coding assistant, until Sat 2026-10-17 07:00 EDT.'}),
-         PushExample('codex_two', {'account': 'codex 2', 'file': 'codex 2.md', 'machine': 'natedev', 'reset': 'Thu 2026-10-22 07:00 EDT', 'credits': 'Its 2,114 credits last until about Fri 2026-10-16 12:51 EDT.', 'leave_on': 'Leave on: new work spends these credits, then uses Claude when they run out.', 'turn_off': 'Turn off (recommended, so no paid credits are spent): within minutes, new work uses Claude, the other coding assistant, until Tue 2026-10-20 00:58 EDT.'}))),
+        'Codex account {account} now uses paid credits. It refills {reset}. {credits}\n{turn_off}\n{leave_on}',
+        (PushExample('codex_one', {'account': 'codex 1', 'file': 'codex1.md', 'machine': 'natedev', 'reset': 'Tue 2026-10-20 00:58 EDT', 'credits': 'Its 6,370 credits last until about Fri 2026-10-16 13:05 EDT.', 'leave_on': 'Leave on: spend these credits, then use Claude when they run out.', 'turn_off': 'Turn off (recommended, saves paid credits): within minutes, work uses Claude until Sat 2026-10-17 07:00 EDT, the next Codex reset, then returns to Codex if an account has room.'}),
+         PushExample('codex_two', {'account': 'codex 2', 'file': 'codex2.md', 'machine': 'natedev', 'reset': 'Thu 2026-10-22 07:00 EDT', 'credits': 'Its 2,114 credits last until about Fri 2026-10-16 12:51 EDT.', 'leave_on': 'Leave on: spend these credits, then use Claude when they run out.', 'turn_off': 'Turn off (recommended, saves paid credits): within minutes, work uses Claude until Tue 2026-10-20 00:58 EDT, the next Codex reset, then returns to Codex if an account has room.'}))),
     PushText('quota.codex_workers_moved', "quota_alert", "note", '{account}: {transition}',
         NoActionNeeded(),
         'Codex account {account} has exhausted its included weekly usage until {reset}. Credits are off, so new work moves to the other Codex account, {target}, using {funding}. Jobs already running finish their current turn first.',
