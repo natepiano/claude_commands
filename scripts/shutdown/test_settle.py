@@ -26,6 +26,7 @@ import inventory
 from fake_herdr import CommandResponse
 import record
 import sessions
+import remote_control
 from user_action import ActionRequired
 from push_texts import RenderedPush, render, catalog, render_entry
 import restart as restart_work
@@ -1668,8 +1669,7 @@ class SettleTests(ShutdownTestCase):
             patch.object(restart_work, "confirm_entry", side_effect=confirm),
             patch.object(restart_work, "wait_for_remote_control", return_value=frozenset({"present"})) as control,
         ):
-            completed = settle._confirm_relaunch_pass(batch)  # pyright: ignore[reportPrivateUsage]
-        self.assertEqual(completed.no_remote_control, ())
+            _ = settle._confirm_relaunch_pass(batch)  # pyright: ignore[reportPrivateUsage]
         checked = cast(tuple[sessions.SessionRecord, ...], cast(object, control.call_args.args[0]))
         self.assertEqual([item["sessionId"] for item in checked], ["present"])
         latest = record.find_session(LOGIN, "present")
@@ -2642,7 +2642,7 @@ class SettleTests(ShutdownTestCase):
                 record.archive_session(LOGIN, owner["session_id"])
                 record.archive_session(LOGIN, ready["session_id"])
 
-    def test_remote_control_conductor_check_and_alert_leave_other_records_moving(self) -> None:
+    def test_remote_control_conductor_check_and_fixer_leave_other_records_moving(self) -> None:
         for policy in ("user", "none"):
             with self.subTest(policy=policy):
                 restored = session_shutdown(top_level("restored-" + policy, "Restored"), progress={"kind": "stopped", "at": NOW}, then="restart")
@@ -2653,6 +2653,11 @@ class SettleTests(ShutdownTestCase):
                 self.save(other)
                 checking, stopped = threading.Event(), threading.Event()
                 main_thread = threading.get_ident()
+                def confirmed(ids: frozenset[str], _timeout: float) -> restart_work.RegistryConfirmation:
+                    return restart_work.RegistryConfirmation(tuple(sessions.SessionRecord(
+                        pid=912, sessionId=identity, name="Restored", procStart="resumed-start",
+                        messagingSocketPath="", updatedAt=1, tmux="", formerNames=[])
+                        for identity in sorted(ids)))
                 def check(_records: object, _timeout: float) -> frozenset[str]:
                     self.assertNotEqual(threading.get_ident(), main_thread)
                     checking.set()
@@ -2670,13 +2675,13 @@ class SettleTests(ShutdownTestCase):
                                 current["progress"] = {"kind": "ready", "at": NOW}
                         _ = record.update_session(LOGIN, other["session"]["session_id"], ready)
                     return machine_inventory([restored["session"], other["session"]])
-                with patch.object(settle, "run_inventory", side_effect=observe), patch.object(settle, "SETTLE_INTERVAL_SECONDS", 0.001), patch.object(restart_work, "relaunch_session", side_effect=self.fake_launch), patch.object(restart_work, "wait_for_confirmation", side_effect=self.all_live), patch.object(restart_work, "confirm_entry", side_effect=self.fake_confirm), patch.object(restart_work, "wait_for_remote_control", side_effect=check), patch.object(stop_work, "stop_session", side_effect=stop), patch.object(settle, "_send_settle_message"), patch.object(settle, "alert_user") as alert, patch.object(settle, "report_stop"), redirect_stdout(io.StringIO()) as output:
+                with patch.object(settle, "run_inventory", side_effect=observe), patch.object(settle, "SETTLE_INTERVAL_SECONDS", 0.001), patch.object(restart_work, "relaunch_session", side_effect=self.fake_launch), patch.object(restart_work, "wait_for_confirmation", side_effect=confirmed), patch.object(restart_work, "confirm_entry", side_effect=self.fake_confirm), patch.object(restart_work, "wait_for_remote_control", side_effect=check), patch.object(remote_control, "launch_fixer") as fixer, patch.object(stop_work, "stop_session", side_effect=stop), patch.object(settle, "_send_settle_message"), patch.object(settle, "alert_user") as alert, patch.object(settle, "report_stop"), redirect_stdout(io.StringIO()) as output:
                     self.assertEqual(settle.conduct(LOGIN), 0)
-                self.assertIn("Restored: running, no Remote Control", output.getvalue())
+                self.assertIn("Restored: Remote Control not on yet;", output.getvalue())
                 self.assertIsNone(record.find_session(LOGIN, restored["session"]["session_id"]))
-                self.assertEqual(alert.call_count, int(policy == "user"))
-                if alert.called:
-                    self.assertIn("/remote-control", cast(ActionRequired, cast(RenderedPush, alert.call_args.args[0]).action).text)
+                alert.assert_not_called()
+                fixer.assert_called_once_with("restored-" + policy, 912, "resumed-start", "Restored", policy)
+                self.assertIn("turning it on in the background", output.getvalue())
                 record.archive_session(LOGIN, other["session"]["session_id"])
 
     def test_user_alert_wait_covers_configured_review_and_remote_transport(self) -> None:
@@ -2716,14 +2721,14 @@ class SettleTests(ShutdownTestCase):
             self.assertEqual(sender.call_args.kwargs["timeout"], 100)
             self.assertIn("--to", cast(list[str], cast(object, sender.call_args.args[0])))
 
-    def test_remote_control_paused_alert_send_does_not_delay_later_ready_session(self) -> None:
+    def test_remote_control_paused_fixer_launch_does_not_delay_later_ready_session(self) -> None:
         restored = session_shutdown(top_level("restored", "Restored"), progress={"kind": "stopped", "at": NOW}, then="restart")
         other = session_shutdown(top_level("other", "Other"))
         self.save(restored)
         self.save(other)
         entered, stopped = threading.Event(), threading.Event()
         main_thread = threading.get_ident()
-        def phone(*_args: object, **_kwargs: object) -> None:
+        def launch_fixer(*_args: object, **_kwargs: object) -> None:
             self.assertNotEqual(threading.get_ident(), main_thread)
             entered.set()
             self.assertTrue(stopped.wait(2))
@@ -2739,9 +2744,10 @@ class SettleTests(ShutdownTestCase):
             result = self.fake_stop(saved)
             stopped.set()
             return result
-        with patch.object(settle, "run_inventory", side_effect=observe), patch.object(settle, "SETTLE_INTERVAL_SECONDS", 0.001), patch.object(restart_work, "relaunch_session", side_effect=self.fake_launch), patch.object(restart_work, "wait_for_confirmation", side_effect=self.all_live), patch.object(restart_work, "confirm_entry", side_effect=self.fake_confirm), patch.object(restart_work, "wait_for_remote_control", return_value=frozenset()), patch.object(stop_work, "stop_session", side_effect=stop), patch.object(settle, "_send_settle_message"), patch.object(settle, "alert_user", side_effect=phone) as alert, patch.object(settle, "report_stop"), redirect_stdout(io.StringIO()):
+        with patch.object(settle, "run_inventory", side_effect=observe), patch.object(settle, "SETTLE_INTERVAL_SECONDS", 0.001), patch.object(restart_work, "relaunch_session", side_effect=self.fake_launch), patch.object(restart_work, "wait_for_confirmation", side_effect=self.all_live), patch.object(restart_work, "confirm_entry", side_effect=self.fake_confirm), patch.object(restart_work, "wait_for_remote_control", return_value=frozenset()), patch.object(stop_work, "stop_session", side_effect=stop), patch.object(settle, "_send_settle_message"), patch.object(remote_control, "launch_fixer", side_effect=launch_fixer) as fixer, patch.object(settle, "alert_user") as alert, patch.object(settle, "report_stop"), redirect_stdout(io.StringIO()):
             self.assertEqual(settle.conduct(LOGIN), 0)
-        alert.assert_called_once()
+        fixer.assert_called_once()
+        alert.assert_not_called()
         self.assertTrue(stopped.is_set())
 
     def test_holdout_alert_from_mac_routes_phone_to_natedev_and_same_text_to_requester(self) -> None:

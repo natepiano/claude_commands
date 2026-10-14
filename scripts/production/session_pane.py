@@ -109,7 +109,11 @@ def session_place(session_id: str) -> Place:
         if unread:
             raise OSError("one or more session records could not be read")
         raise NoSuchTarget(session_id)
-    record = max(records, key=lambda record: record["updatedAt"])
+    return record_place(max(records, key=lambda record: record["updatedAt"]))
+
+
+def record_place(record: SessionRecord) -> Place:
+    """Resolve the pane owned by this specific registry process."""
     if sys.platform == "darwin":
         # ps combines argv and environment without a reliable boundary. The live
         # registry's pane id stays true when its recorded tmux session name changes.
@@ -122,7 +126,7 @@ def session_place(session_id: str) -> Place:
             return TmuxPlace(pane)
     place = herdr.herdr_place_of(record["pid"])
     if isinstance(place, herdr.NotInHerdr):
-        raise NoSuchTarget(session_id)
+        raise NoSuchTarget(record["sessionId"])
     return place
 
 

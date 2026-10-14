@@ -45,7 +45,7 @@
 - **Invariants:**
   - Tests start no real session, send no message or push, and never touch `~/.claude*`, `~/.claude.json` or live state; cases derive from `ShutdownTestCase` with fake send, notifier, process, tmux and host commands. A test reaching `user_zone()` patches `showrunners.NOTIFIER_STATE_DIR`.
   - Account isolation: a command for account A never stops or messages a session on B. An unreadable account means unattributed, never the default. Absent `CLAUDE_CONFIG_DIR` means `~/.claude`.
-  - A Claude process gets only SIGTERM, and identity (pid + proc start) is checked before any signal. A ghostty shell gets SIGHUP only after the ownership check. Nothing ever types into a pane.
+  - A Claude process gets only SIGTERM, and identity (pid + proc start) is checked before any signal. A ghostty shell gets SIGHUP only after the ownership check. Nothing types into a pane, except the Remote Control fixer typing `/remote-control` into a restarted session's own pane while the registry shows it idle.
   - A relaunch is proven by the registry (`sessions.live_sessions`), never by pane text. Only `AllowedByShutdownState` permits a launch.
   - Record times are UTC ISO at whole seconds; times shown to the user are in the user's zone (`scripts/lib/user_zone.py`).
   - `account.py`, `agent_accounts.py` and `note_file.py` never import `scripts.accounts`; a lazy import counts as a cycle. `scripts/lib/relaunch.py` imports nothing from `scripts/accounts` or `scripts/shutdown`.
@@ -171,7 +171,43 @@
 
 **Ruled out:** a form-only holdout push (`shutdown.form` is removed; the holdout push covers every waiting session); an account name in the holdout push text.
 
-### Phase 5 — The move command  · status: todo
+### Phase 5 — A restart turns Remote Control on itself  · status: done
+
+**Depends on:** Phase 4
+
+#### Work Order
+
+**Goal:** a restarted session whose `--remote-control` flag has not taken yet never sends the user a false alert; a detached fixer waits for it, turns Remote Control on by typing `/remote-control` into the session's own pane when the flag never takes, and pushes only when that fails.
+
+**Spec:**
+
+Cause (showrunner, 2026-10-14, false push 16:25 EDT for trunk): `restart.remote_control_missing` waits a fixed `REMOTE_CONTROL_WAIT_SECONDS` (10 s) from registry confirmation for the registry file's `bridgeSessionId`; trunk was confirmed at 16:25:04, its transcript logged `/remote-control is active` at 16:25:14.454 (after its SessionStart resume hook), and the push went at 16:25:23.
+
+1. **No push from the restart paths.** settle's relaunch pass (`_confirm_relaunch_pass` → `_remote_control_alert`, ~1440–1461, submitted ~1669) and `restart.py`'s alert loop (~2180–2184, local and peer `no_remote_control`) no longer call `alert_user` for Remote Control. For each local session still without Remote Control after the existing short wait, whatever its alert policy, they start one detached fixer on this machine, the way `_launch_conductor` (settle.py ~1110) starts the conductor: `systemd-run --user --collect --quiet --no-block --unit shutdown-remote-control-<session id prefix>-<pid>` on Linux, `launchctl submit -l <same>` on the Mac, running `env PYTHONUNBUFFERED=1 <python> -u shutdown.py remote-control <session id> --pid <pid> --proc-start <proc start> --who <who> --alerts <user|none>` (the saved policy, or `none` under command `--no-alert`; it only decides whether a failure pushes). A peer's sessions get their fixer from the peer's own restart run (it runs `restart.py` there); the local run no longer pushes for peer items. The diagnostic line becomes `<name>: Remote Control not on yet; turning it on in the background`; a fixer that cannot start prints `<name>: Remote Control is off; turn it on at its terminal with /remote-control` and pushes as a failure.
+2. **who.** `remote_control_who(saved: SessionShutdown) -> str`: a production unit (`session.host.kind == "unit"`) gives `<unit without its -unit suffix> unit` (`trunk unit`); a showrunner gives `<production> showrunner`; anything else the session name.
+3. **The fixer** (new `scripts/shutdown/remote_control.py`, `fix(session_id, pid, proc_start, who, *, clock) -> RemoteControlOutcome`, run by `shutdown.py remote-control`): identity is the pid plus proc start from the registry; when the session's process is gone or replaced, it ends silently (`SessionGone`). It polls `sessions.remote_control(record)` every 0.5 s for `FLAG_WAIT` (60 s) → `AlreadyOn`. Then, when `session_pane.record_place(record)` finds the confirmed pid's own tmux or herdr pane, it types `/remote-control` with `session_pane.type_place` only while the registry file's `status` is `idle` (`herdr`'s `AgentBlocked` counts as not idle), then waits `ATTEMPT_WAIT` (30 s) for the registry bridge id or `/remote-control is active` in `read_place` (add_unit's check, `add_unit.py:881`) → `TurnedOn`. It types at most `ATTEMPTS` (3) times and gives up at `DEADLINE` (15 min) from start → `Failed(reason)`. No pane (`NoSuchTarget`, a ghostty or Zed window) → `Failed("no pane to type into")` right after `FLAG_WAIT`. Every `Failed` first takes a fresh look (gone → `SessionGone`, active → on). Only `Failed` with `alerts == "user"` pushes, through the one `render("shutdown.remote_control", …)` call left in the tree (in `remote_control.py`), with today's fields; message-clarity's Phase 12 changes that call to `who=`/`session=`. Each outcome prints one journal line naming `who` (`trunk unit: Remote Control on after typing /remote-control`).
+4. **Docs.** `docs/as-built/shutdown-and-restart.md` (the fixer, its waits, when it types, when it pushes) and `commands/shutdown.md` (the background line). The Delegation Context invariant "Nothing ever types into a pane" gains its one exception: the fixer's `/remote-control` into the restarted session's own pane while the registry shows it idle.
+
+**Files:**
+- `scripts/shutdown/remote_control.py` — new: the fixer, `RemoteControlOutcome` (`SessionGone | AlreadyOn | TurnedOn | Failed`), `remote_control_who`, the launch helper.
+- `scripts/shutdown/settle.py` — the relaunch pass starts fixers; `_remote_control_alert` removed.
+- `scripts/shutdown/restart.py` — `remote_control_missing` line, fixers instead of pushes, no peer push.
+- `scripts/shutdown/shutdown.py` — the `remote-control` verb and usage.
+- `scripts/shutdown/test_support.py` — block the fixer's launch leaf like `_launch_conductor`.
+- `scripts/shutdown/test_remote_control.py` — new.
+- `scripts/shutdown/test_settle.py`, `scripts/shutdown/test_restart.py` — the changed paths.
+- `docs/as-built/shutdown-and-restart.md` — the fixer.
+- `commands/shutdown.md` — the background line.
+
+**Workers:** 1 writer + 1 tester.
+- `impl` — `remote_control.py`, `settle.py`, `restart.py`, `shutdown.py`, `test_support.py`, the docs.
+- `test` — `test_remote_control.py` with a fake clock, registry and pane: on within `FLAG_WAIT` (no typing); flag never takes, idle pane, typing turns it on (types once); busy then idle (types only after idle); never on (types 3 times, pushes once); no pane (pushes after `FLAG_WAIT`, types nothing); process replaced (no push, no typing); `who` for a unit, a showrunner and a plain session. `test_settle.py`/`test_restart.py`: a session without Remote Control starts one fixer with the right argv and pushes nothing; a peer's item starts nothing and pushes nothing locally.
+
+**Constraints from prior phases:** settle's relaunch pass and `restart.py` share `restart.wait_for_confirmation` / `wait_for_remote_control` / `RegistryConfirmation`; `NoRemoteControl` carries `session_id`, `name`, `alerts`. `session_pane.py` (`scripts/production/`) exports `session_place`, `type_place`, `read_place`, `NoSuchTarget`, `HerdrFailure`; herdr's `AgentBlocked`. `settle.alert_user(text, machine=…)` pushes (on the Mac through natedev). Place phrases and `settle.shutdown_command` from "The shutdown says what is happening and where to act". `push_catalog.py` and `push_texts_reviewed.json` are message-clarity's: no catalog edit in this phase.
+
+**Acceptance gate:** the shutdown, lib, production and notify suites pass; `basedpyright` 0/0/0 on the changed files. No call of `render("shutdown.remote_control"` remains outside `remote_control.py` (`grep`). The live check of the typed path (a throwaway session started without `--remote-control`) belongs to "Live check of the move".
+
+### Phase 6 — The move command  · status: todo
 
 **Depends on:** Phase 1, Phase 2, Phase 3, Phase 4
 **Blocked by:** two-accounts' "Accounts named by number only" checkpoint on `build-followups` (it holds `scripts/accounts/accounts.py` and spells the labels `claude1`/`codex1`); merge the merge branch first.
@@ -208,9 +244,9 @@
 
 **Acceptance gate:** the accounts, shutdown and `scripts/lib` suites pass, also with the real HOME; `basedpyright` 0/0/0 on the changed files. The unit director measures `accounts.py move showrunners <current account> --dry-run` on natedev under 0.5 s wall clock (`time`), and checks its output names no session wrongly.
 
-### Phase 6 — Live check of the move  · status: todo
+### Phase 7 — Live check of the move  · status: todo
 
-**Depends on:** Phase 5
+**Depends on:** Phase 5, Phase 6
 
 #### Work Order
 
@@ -218,7 +254,7 @@
 
 **Spec:**
 
-1. Unit director only, after install (`~/.claude` main carries Phases 1–5). Throwaway sessions only, moved with `accounts.py move <session> <target>` (the ungrouped move); never a real group, never a real session's messages.
+1. Unit director only, after install (`~/.claude` main carries Phases 1–6). Throwaway sessions only, moved with `accounts.py move <session> <target>` (the ungrouped move); never a real group, never a real session's messages.
 2. Start three throwaway Haiku sessions: `pm-move-tmux` in a tmux window, `pm-move-ghostty` in a ghostty window started through the `claude<N>` alias of an account with room, and `pm-move-spent` through the alias of an account whose fresh reading shows a window at 0 (on 2026-10-14 two accounts were at weekly 0). Give `pm-move-spent` one prompt so its transcript holds the refusal.
 3. Run the preview for each move; it shows `pause, then move` for the first two and `reap and restart now` for the third, in under 0.5 s.
 4. Move all three; the terminal follows each step live and ends with the summary. Check: `pm-move-spent` got no pause message and was back on the target within 30 s; the other two replied ready and came back; `pm-move-ghostty` is the same ghostty window (same window shell pid; its earlier output still in scroll history: the unit director reads it with the user or by a screenshot of that window); the history records carry the trail.
