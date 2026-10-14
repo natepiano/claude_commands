@@ -137,25 +137,24 @@ A test that pins a behaviour a user or another script depends on is not trivial,
 
 ### Phase 4 — Trivial tests are gone  · status: done
 
-**Depends on:** Phase 3
+#### As-built
 
-#### Work Order
-
-**Goal:** no test in the 22 suites meets the criteria in "Trivial tests: the criteria"; agents are told the criteria before they write tests.
-
-**Spec:** audit all 22 suites against the criteria; report per-suite counts (and the unsure list) to the showrunner before deleting. Delete trivial tests outright; merge true duplicates into one; never weaken a non-trivial test. Report the tests and seconds removed separately from the speed fixes. Add one line naming the criteria to the one source agents read before writing tests (find it: the unit and seat instructions that govern test writing).
+- All 5,713 tests in the 22 gate suites are audited against "Trivial tests: the criteria": 7 candidates, 21 unsure tests kept.
+- Five tests are deleted, 1.37 s of test time (1.365 s of it the add_unit duplicate): criterion-5 duplicates in `production/test_add_unit.py` (survivor `test_restart_restore_is_allowed_for_its_restarting_unit`), `production/test_review_pause.py` (survivor `test_pause_and_resume_both`) and `buildlog/test_treekey.py` (survivor `test_symlink_read_error_leaves_tree_key_unavailable`); the `build_hold` import-name check; the `shutdown` standard-library `StrEnum` lookup check. No duplicates are merged; each survivor is unchanged.
+- The two fixture guards that block real phone sends stay, renamed with a docstring: `whoami/test_quota_alert.py::test_setup_blocks_real_phone_sends` and `lint/test_sweep.py::test_base_blocks_real_phone_sends`.
+- `docs/delegate/write_prompt_contract.md` section 6 (`## Work Specification`) carries one line with the five criteria, which prompt authors copy into every seat prompt that writes tests.
+- Gate after: all 22 suites green, 193.8 s, 2.44 GiB peak at load 64–101 (183 s at load 88–123 after "The code under test stops waiting"; loads differ, so not comparable).
 
 **Files:**
-- `scripts/` — test files across the 22 suites
-- `docs/delegate/write_prompt_contract.md` — one line naming the criteria (or the one source agents read before writing tests, if another)
+- `docs/delegate/write_prompt_contract.md` — section 6 carries the trivial-test criteria
+- `scripts/production/test_add_unit.py`, `scripts/production/test_review_pause.py`, `scripts/buildlog/test_treekey.py`, `scripts/build_hold/test_build_hold.py`, `scripts/shutdown/test_send_guard.py` — one test deleted from each
+- `scripts/whoami/test_quota_alert.py`, `scripts/lint/test_sweep.py` — phone-send guards renamed
 
-**Seats:** 2 writers — split by suite
-- `impl` — production, delegate, mac_test, usage, agents, buildlog, hooks
-- `test` — opens as impl; the other fifteen suites and the instruction line
+**Binds later work:** "Fewer process launches per test" receives the criteria through `write_prompt_contract.md` section 6: a moved test replaces its subprocess form, never sits beside it with the same inputs and assertion; a default-pinning test runs the real script with the override unset and observes the default through behavior, never by reading the literal from source. The add_unit restore case lives only in `test_restart_restore_is_allowed_for_its_restarting_unit`. The unsure tests kept in its target modules (`test_progress_history.py::test_recorder_helpers_use_public_names_without_private_aliases`, `test_offload.py::test_activity_and_leftover_texts_use_the_shared_mirror_selector`) stay.
 
-**Acceptance gate:** every suite green; the counts report sent before deletion; the instruction line in place.
+**Gotchas:** the suites hold almost no trivial tests, so this phase does not move gate time. The shell overrides `PLAN_DELEGATE_SEAT_POLL_SECS`, `PLAN_DELEGATE_SEAT_WAIT_ATTEMPTS`, `PLAN_DELEGATE_EARLY_POLL_SECS` and `PLAN_DELEGATE_TOKEN_CLOCK_FILE` have no test that runs with them unset; "each default pinned by a test" holds for the Python overrides only.
 
-**Constraints from prior phases:** Phase 3's regressions were each mutation-proved and are not trivial: the fsync-by-default tests (`test_findings.py`, `test_progress_history.py`, `test_review_pool.py`), the interpreter-cache launch count (`test_review_launcher.py`), the `wait_for_test_state` child-exit and no-pidfd tests, codex_mesh reap and stub-close tests, `test_add_showrunner.py`'s `ADD_SHOWRUNNER_POLL_S` tests, `test_offload.py`'s `leftover_timeout_s` test and `test_collect.py`'s `--durability` tests. These pin settings a caller can set (`collect.py --durability` is in its help; `leftover_timeout_s` is offload configuration). Every proposed deletion names the behavior no test then checks (none) or the surviving test with identical inputs and outcome.
+**Ruled out:** deleting the two phone-send guards — they pin the fixture patch that stops real sends.
 
 ### Phase 5 — Fewer process launches per test  · status: todo
 
@@ -173,10 +172,13 @@ In-process rules: restore environment, cwd, import-time configuration (e.g. `add
 - `scripts/production/` — tests, fake tmux and gh, and the named scripts
 - `scripts/message/` — `send.py` and its tests
 - `scripts/build_targets/` — `build_targets.py` and its tests
+- `scripts/mac_test/` — `test_offload.py` and the code it launches
 - `scripts/delegate/` — tests and fakes, including `wait_for_test_state.py`
 
 **Seats:** 2 writers — split by suite
-- `impl` — `scripts/production/`, `scripts/message/send.py`, `scripts/build_targets/`
+- `impl` — `scripts/production/`, `scripts/message/send.py`, `scripts/build_targets/`, `scripts/mac_test/`
 - `test` — opens as impl; `scripts/delegate/` (sole owner of `wait_for_test_state.py`)
 
-**Acceptance gate:** production, delegate, message and build_targets suites green, each targeted module also alone; per-module launch counts and matched-load durations, and gate time, recorded before and after.
+**Constraints from prior phases:** "Trivial tests are gone" put the criteria in `docs/delegate/write_prompt_contract.md` section 6, so they bind every test this phase moves or adds: a test moved in-process replaces its subprocess form instead of repeating its inputs and assertion beside it, and each new default-pinning test runs the real script with the override unset and observes the default through behavior (a `sleep` stub on `PATH` recording its argument, an attempt count), never by reading the literal from the script source. No test yet runs `review.sh`, `implement.sh` or `verify.sh` with those overrides unset. In `production/test_add_unit.py` the restore case lives only in `test_restart_restore_is_allowed_for_its_restarting_unit` (its duplicate is deleted). Gate after that phase: 193.8 s, 2.44 GiB peak at load 64–101.
+
+**Acceptance gate:** production, delegate, message, build_targets and mac_test suites green, each targeted module also alone; per-module launch counts and matched-load durations, and gate time, recorded before and after.
