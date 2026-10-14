@@ -168,7 +168,7 @@ The design is `~/.local/state/plan-backlog/2026-10-13-user-message-clarity.md`, 
 
 **Ruled out:** holding a script or timer push at send time for a root-showrunner report — a timer has no session to report to, and holding loses the push.
 
-### Phase 9 — Script pushes are reviewed before they ship, and a push that fails review is not sent  · status: todo
+### Phase 9 — Script pushes are reviewed before they ship, and a push that fails review is not sent  · status: done
 
 **Depends on:** Phase 8
 

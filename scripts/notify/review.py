@@ -70,7 +70,7 @@ class DeliveryWaits:
 
 
 def delivery_waits() -> DeliveryWaits:
-    revision = review_timeout_seconds() + push_channel().TIMEOUT_S
+    revision = 2 * review_timeout_seconds() + push_channel().TIMEOUT_S
     return DeliveryWaits(revision, revision + 10, max(CLAIM_STALE_SECONDS, revision + 10),
                          min(110, revision + 5))
 
@@ -198,8 +198,28 @@ class Unreviewed:
     failures: tuple[RuleFailure, ...] = ()
 
 
-ReviewOutcome = Approved | Rewritten | Questions | Unreviewed
-Verdict = Approved | Rewritten | Questions
+@dataclass(frozen=True)
+class Failed:
+    best_version: Draft
+    failed_rules: list[str]
+    metadata: ReviewMetadata = ReviewMetadata()
+    failures: tuple[RuleFailure, ...] = ()
+
+
+@dataclass(frozen=True)
+class Withheld:
+    best_version: Draft
+    why: str
+    metadata: ReviewMetadata = ReviewMetadata()
+    failures: tuple[RuleFailure, ...] = ()
+
+    @property
+    def failed_rules(self) -> list[str]:
+        return [failure.rule for failure in self.failures] or ["push-only-what-the-user-must-do"]
+
+
+ReviewOutcome = Approved | Rewritten | Questions | Unreviewed | Failed | Withheld
+Verdict = Approved | Rewritten | Questions | Failed | Withheld
 
 
 @dataclass(frozen=True)
@@ -296,7 +316,7 @@ class RuleFailureRecord(TypedDict):
 
 
 class VerdictRecord(MessageRecord):
-    verdict: Literal["send", "rewrite", "ask"]
+    verdict: Literal["send", "rewrite", "ask", "withhold"]
     questions: list[str]
     failed_rules: list[RuleFailureRecord]
 
@@ -323,6 +343,7 @@ class ReviewRecord(TypedDict):
     transcript: NotRequired[str]
     reply_time: NotRequired[str]
     previous_reply: NotRequired[str]
+    text_id: NotRequired[str]
 
 
 class ItemSchema(TypedDict, total=False):
@@ -349,7 +370,7 @@ class VerdictSchema(TypedDict):
 SCHEMA: VerdictSchema = {
     "type": "object",
     "properties": {
-        "verdict": {"type": "string", "enum": ["send", "rewrite", "ask"]},
+        "verdict": {"type": "string", "enum": ["send", "rewrite", "ask", "withhold"]},
         "title": {"type": "string"}, "action": {"type": ["string", "null"]},
         "body": {"type": "string"},
         "questions": {"type": "array", "items": {"type": "string"}, "maxItems": 3},
@@ -474,7 +495,7 @@ def validate(value: object, draft: Draft, revision: bool,
     try:
         record = _object(value)
         verdict = _text(record, "verdict")
-        if verdict not in ("send", "rewrite", "ask"):
+        if verdict not in ("send", "rewrite", "ask", "withhold") or (reply and verdict == "withhold"):
             raise ValueError("verdict")
         title, body = _text(record, "title"), _text(record, "body")
         if reply and title:
@@ -500,18 +521,25 @@ def validate(value: object, draft: Draft, revision: bool,
         if verdict != "ask" and questions:
             raise ValueError("questions without ask")
         version = replace(draft, title=title, action=action, body=body)
+        if verdict == "withhold":
+            if not failed:
+                raise ValueError("withhold needs a supported failure")
+            return Withheld(draft, "; ".join(f"{failure.rule}: {failure.quote}" for failure in failures), metadata, tuple(failures))
         if verdict == "send":
             if message_record(version) != message_record(draft):
                 raise ValueError("send changed draft")
             if not failed:
                 return Approved(draft, metadata)
-            return Unreviewed("send failed rules: " + ", ".join(failed), metadata, tuple(failures))
+            return (Unreviewed("send failed rules: " + ", ".join(failed), metadata, tuple(failures)) if reply else Failed(draft, failed, metadata, tuple(failures)))
         if not failed:
             return Approved(draft, metadata)
         proposed_lengths = [] if reply else length_failures(version)
         if proposed_lengths:
-            raise ValueError("proposed text fails: " + ", ".join(proposed_lengths))
-        if verdict == "ask" and not revision:
+            if reply:
+                raise ValueError("proposed text fails: " + ", ".join(proposed_lengths))
+            failures.extend(RuleFailure(rule, version.title if rule == "push-title-under-45" else first_line(version.action) + "\n" + version.body) for rule in proposed_lengths)
+            return Failed(draft, list(dict.fromkeys([*failed, *proposed_lengths])), metadata, tuple(failures))
+        if verdict == "ask" and (not reply or not revision):
             if not questions or any(not question.strip() for question in questions):
                 raise ValueError("ask needs questions")
             return Questions(version, questions, failed, metadata, tuple(failures))
@@ -552,10 +580,10 @@ def reviewer_assignment(runner: ProcessRunner, environment: dict[str, str],
 
 
 def _review(draft: Draft, revision: bool, runner: ProcessRunner,
-            context: PushReview | ReplyContext = PUSH_REVIEW) -> ReviewOutcome:
+            context: PushReview | ReplyContext = PUSH_REVIEW, *, timeout_seconds: float) -> ReviewOutcome:
     started = time.monotonic()
     account, model = "default", "opus"
-    timeout = 60.0
+    timeout = timeout_seconds
     binary: ResolvedReviewerBinary | MissingReviewerBinary | ReviewerNotResolved = ReviewerNotResolved()
 
     def details() -> ReviewMetadata:
@@ -565,7 +593,6 @@ def _review(draft: Draft, revision: bool, runner: ProcessRunner,
         return max(0.001, timeout - (time.monotonic() - started))
 
     try:
-        timeout = review_timeout_seconds()
         if not GUIDE.is_dir():
             return Unreviewed("no guide", details())
         environment, account = reviewer_environment()
@@ -622,7 +649,21 @@ def _review(draft: Draft, revision: bool, runner: ProcessRunner,
 
 
 def review(draft: Draft, revision: bool, *, runner: ProcessRunner = run_process) -> ReviewOutcome:
-    return _review(draft, revision, runner)
+    timeout_seconds = review_timeout_seconds()
+    outcome = _review(draft, revision, runner, timeout_seconds=timeout_seconds)
+    if isinstance(outcome, Questions):
+        return Failed(outcome.best_version, outcome.failed_rules, outcome.metadata, outcome.failures)
+    if not isinstance(outcome, Rewritten):
+        return outcome
+    checked = _review(outcome.version, True, runner, timeout_seconds=timeout_seconds)
+    metadata = replace(checked.metadata, seconds=outcome.metadata.seconds + checked.metadata.seconds)
+    if isinstance(checked, Approved):
+        return replace(outcome, metadata=metadata)
+    if isinstance(checked, Unreviewed):
+        return replace(checked, metadata=metadata)
+    if isinstance(checked, Withheld):
+        return replace(checked, metadata=metadata)
+    return Failed(best_version(outcome.version, checked), checked.failed_rules, metadata, checked.failures)
 
 
 def _append(entry: ReviewRecord) -> None:
@@ -636,7 +677,7 @@ def _append(entry: ReviewRecord) -> None:
 
 def log_review(draft: Draft, outcome: ReviewOutcome, sent: Delivery = NOT_SENT, *,
                replay: bool = False, dry: bool = False, detail: str = "",
-               sample: PushReview | ReplyContext = PUSH_REVIEW) -> None:
+               sample: PushReview | ReplyContext = PUSH_REVIEW, text_id: str = "") -> None:
     verdict, failed, questions = "send", [], []
     if isinstance(outcome, Unreviewed):
         verdict = "review: off" if detail == "review: off" else "unreviewed: " + outcome.why
@@ -645,6 +686,10 @@ def log_review(draft: Draft, outcome: ReviewOutcome, sent: Delivery = NOT_SENT, 
         verdict, failed = "rewrite", outcome.failed_rules
     elif isinstance(outcome, Questions):
         verdict, failed, questions = "ask", outcome.failed_rules, outcome.questions
+    elif isinstance(outcome, Failed):
+        verdict, failed = "failed", outcome.failed_rules
+    elif isinstance(outcome, Withheld):
+        verdict, failed = "withhold", outcome.failed_rules
     metadata = outcome.metadata
     entry: ReviewRecord = {
         "time": datetime.now().astimezone().isoformat(), "source": draft.source,
@@ -655,7 +700,7 @@ def log_review(draft: Draft, outcome: ReviewOutcome, sent: Delivery = NOT_SENT, 
     }
     if isinstance(metadata.binary, ResolvedReviewerBinary):
         entry["binary"] = str(metadata.binary.path)
-    if isinstance(outcome, (Rewritten, Questions, Unreviewed)) and outcome.failures:
+    if isinstance(outcome, (Rewritten, Questions, Unreviewed, Failed, Withheld)) and outcome.failures:
         entry["failures"] = [{"rule": failure.rule, "quote": failure.quote} for failure in outcome.failures]
     if replay:
         entry["replay"] = True
@@ -664,6 +709,8 @@ def log_review(draft: Draft, outcome: ReviewOutcome, sent: Delivery = NOT_SENT, 
     if isinstance(sample, ReplyContext):
         entry.update(sample=True, kind="reply", transcript=str(sample.transcript),
                      reply_time=sample.date.isoformat(), previous_reply=sample.previous_reply)
+    if text_id:
+        entry["text_id"] = text_id
     if detail:
         entry["detail"] = detail
     _append(entry)
@@ -897,6 +944,19 @@ def post_claim(held: Held, send: Callable[[], int]) -> ClaimDelivery:
         return ClaimSent()
 
 
+def retire_claim(held: Held) -> None:
+    """Keep a rejected revision from reviving through stale-claim recovery."""
+    identity = hold_identity(held)
+    with locked():
+        path = held_path(held.source)
+        for candidate in (path.with_suffix(".sending"), path):
+            found = _read_hold(candidate)
+            if isinstance(found, LiveHold) and hold_identity(found.hold) == identity:
+                _ = path.with_suffix(".cancel").write_text(identity, encoding="utf-8")
+                candidate.unlink()
+        _ = path.with_suffix(".held").write_text(identity, encoding="utf-8")
+
+
 def restore(source: str) -> None:
     with locked():
         path = held_path(source)
@@ -966,7 +1026,7 @@ def best_version(draft: Draft, outcome: ReviewOutcome) -> Draft:
         return outcome.draft
     if isinstance(outcome, Rewritten):
         return outcome.version
-    if isinstance(outcome, Questions):
+    if isinstance(outcome, (Questions, Failed, Withheld)):
         return outcome.best_version
     return draft
 
@@ -981,12 +1041,16 @@ def print_review(draft: Draft, outcome: ReviewOutcome, stamp: str = "") -> None:
         verdict, failed = "rewrite", outcome.failed_rules
     elif isinstance(outcome, Questions):
         verdict, failed = "ask", outcome.failed_rules
+    elif isinstance(outcome, Failed):
+        verdict, failed = "failed", outcome.failed_rules
+    elif isinstance(outcome, Withheld):
+        verdict, failed = "withhold", outcome.failed_rules
     version = best_version(draft, outcome)
     print(f"{stamp + ' ' if stamp else ''}{verdict}; failed rules: {', '.join(failed) or 'none'}")
     print(version.title)
     print(first_line(version.action))
     print(version.body)
-    if isinstance(outcome, (Rewritten, Questions, Unreviewed)):
+    if isinstance(outcome, (Rewritten, Questions, Unreviewed, Failed, Withheld)):
         for failure in outcome.failures:
             print("failure: " + json.dumps({"rule": failure.rule, "quote": failure.quote}))
     if isinstance(outcome, Questions):
@@ -1165,9 +1229,10 @@ def sample(paths: list[Path], limit: int = 20, *, since: datetime | None = None,
     failed, unreviewed, passed = 0, 0, 0
     rules: dict[str, int] = {}
     selected = sorted(eligible, key=lambda reply: reply.context.date, reverse=True)[:limit]
+    timeout_seconds = review_timeout_seconds()
     for reply in selected:
         draft = Draft("review.sample", "0", "", NoActionRequired(), reply.text, False)
-        outcome = _review(draft, False, runner, reply.context)
+        outcome = _review(draft, False, runner, reply.context, timeout_seconds=timeout_seconds)
         print_review(draft, outcome, reply.context.date.isoformat())
         log_review(draft, outcome, sample=reply.context)
         if isinstance(outcome, Unreviewed):
@@ -1182,6 +1247,46 @@ def sample(paths: list[Path], limit: int = 20, *, since: datetime | None = None,
           + f"replies with unregistered questions: {unregistered}; unreadable transcripts: {unreadable}")
     print("sample failed rules: " + (", ".join(f"{rule}={count}" for rule, count in sorted(rules.items())) or "none"))
     return int(bool(unreadable))
+
+
+class TextApproval(TypedDict):
+    sha256: str
+    time: str
+    reviewer: str
+
+
+def texts(ids: list[str], approve: bool = False, *, runner: ProcessRunner = run_process) -> int:
+    import push_texts
+    entries = push_texts.catalog()
+    unknown = set(ids) - {entry.id for entry in entries}
+    if unknown:
+        raise ValueError("unknown push text ids: " + ", ".join(sorted(unknown)))
+    approvals: dict[str, dict[str, TextApproval]] = {}
+    if approve and push_texts.REVIEWED_FILE.exists():
+        approvals = cast(dict[str, dict[str, TextApproval]], json.loads(push_texts.REVIEWED_FILE.read_text(encoding="utf-8")))
+    failed = False
+    timeout_seconds = review_timeout_seconds()
+    for entry in entries:
+        if ids and entry.id not in ids:
+            continue
+        digest = push_texts.fingerprint(entry)
+        for example in entry.examples:
+            rendered = push_texts.render_entry(entry, example.values)
+            draft = Draft(rendered.sender, {"note": "0", "decision": "1", "blocked": "2"}[rendered.need],
+                          rendered.title, rendered.action, rendered.body, False)
+            outcome = _review(draft, False, runner, timeout_seconds=timeout_seconds)
+            print_review(draft, outcome, f"{entry.id}/{example.name}")
+            log_review(draft, outcome, dry=True, text_id=entry.id)
+            passed = isinstance(outcome, Approved) and outcome.draft == draft
+            failed |= not passed
+            if approve and passed:
+                approvals.setdefault(entry.id, {})[example.name] = TextApproval(
+                    sha256=digest, time=datetime.now().astimezone().isoformat(), reviewer=outcome.metadata.model)
+    if approve:
+        scratch = push_texts.REVIEWED_FILE.with_suffix(".tmp")
+        _ = scratch.write_text(json.dumps(approvals, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        _ = scratch.replace(push_texts.REVIEWED_FILE)
+    return int(failed)
 
 
 def switch(direction: str) -> int:
@@ -1199,6 +1304,9 @@ def main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
     _ = commands.add_parser("due")
+    text_parser = commands.add_parser("texts")
+    _ = text_parser.add_argument("--id", action="append", default=[])
+    _ = text_parser.add_argument("--approve", action="store_true")
     release_parser = commands.add_parser("release")
     _ = release_parser.add_argument("--identity", required=True)
     _ = release_parser.add_argument("source")
@@ -1219,6 +1327,8 @@ def main(argv: list[str]) -> int:
     _ = check.add_argument("--priority", choices=("0", "1", "2"), default="0")
     arguments = parser.parse_args(argv)
     command = cast(str, arguments.command)
+    if command == "texts":
+        return texts(cast(list[str], arguments.id), cast(bool, arguments.approve))
     if command == "release":
         print(release_if_matches(cast(str, arguments.source), cast(str, arguments.identity)).value)
         return 0

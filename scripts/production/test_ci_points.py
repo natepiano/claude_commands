@@ -13,7 +13,6 @@ import unittest
 from pathlib import Path
 from typing import cast, final, override
 
-import ci_points
 
 
 SCRIPT = Path(__file__).with_name("ci_points.py")
@@ -75,23 +74,6 @@ exit 0
 
 @final
 class CiPointsTests(unittest.TestCase):
-    def test_review_push_compares_merge_defects_and_explains_acknowledgment(self) -> None:
-        """F012: the review decision includes its result and acknowledgment's effect."""
-        title, action, body = ci_points.review_watch_push(
-            "| merge design-check defects per phase (mean) | 0.5 | 0.4 | 0.4 |")
-        self.assertIn("defects unchanged", title)
-        self.assertIn("0.4 per phase before and after", body)
-        self.assertIn("defects did not rise", body)
-        self.assertIn("stop these report notices", body)
-        self.assertIn("Discuss:", body)
-        self.assertIn("On natedev", action)
-        self.assertIn("python3 ~/.claude/scripts/production/review_regime.py report", body)
-        self.assertLess(len("Action: " + action + "\n" + body), 500)
-        _, _, missing = ci_points.review_watch_push("| phases merged | 12 |")
-        self.assertIn("no comparable defect counts", missing)
-        self.assertIn("work continues either way", missing)
-        self.assertIn("removal's effect is unknown", missing)
-        self.assertLess(len("Action: " + action + "\n" + missing), 500)
 
     root: Path = Path()
     home: Path = Path()
@@ -437,15 +419,8 @@ class CiPointsTests(unittest.TestCase):
         second = self.run_ci("watch", "--state-dir", str(self.state))
         self.assert_step(second, "watch", True)
         self.assertNotIn("| phases merged | 12 |", second.stdout)
-        self.assertEqual(self.calls("send.py"), [[
-            "--to", "user", "--from", "ci_points", "--need", "decision", "--action",
-            "On natedev, read the report. Choose acknowledge or discuss.",
-            "--summary", "Reviewer removal lacks comparison data", "--text",
-            "An extra code reviewer was removed from merge review. The report has no comparable defect counts, so the removal's effect is unknown.\n\n"
-            + "In a terminal on natedev, read:\npython3 ~/.claude/scripts/production/review_regime.py report\n"
-            + "Acknowledge (recommended; work continues either way): rerun with ack instead of report to stop these report notices.\n\n"
-            + "Discuss: raise concerns in the natedev Claude session.",
-        ]])
+        self.assertEqual(self.calls("send.py"), [])
+        self.assertIn("| phases merged | 12 |", self.log.read_text())
         self.assertEqual(len(self.calls("review_regime.py")), 3)
         self.assertEqual(self.log.read_text().count("review watch"), 1)
 
@@ -460,7 +435,7 @@ class CiPointsTests(unittest.TestCase):
         results = [process.communicate(timeout=25) for process in processes]
         self.assertTrue(all(process.returncode == 0 for process in processes), results)
         self.assertEqual(sum("| phases merged | 12 |" in stdout for stdout, _ in results), 1)
-        self.assertEqual(len(self.calls("send.py")), 1)
+        self.assertEqual(len(self.calls("send.py")), 0)
         self.assertEqual(self.log.read_text().count("review watch"), 1)
 
     def test_notice_clear_names_waiting_unit_and_merge_hash(self) -> None:

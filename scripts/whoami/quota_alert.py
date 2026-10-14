@@ -54,7 +54,6 @@ import copy
 import json
 import math
 import os
-import re
 import signal
 import subprocess
 import sys
@@ -82,6 +81,7 @@ from agent_accounts import (ClaudeAccountsInUse, CodexHomeSource, Report,
                             codex_homes, codex_live, seats_home)
 
 if TYPE_CHECKING:
+    from ..notify.push_texts import RenderedPush
     from scripts.accounts import accounts
     from scripts.accounts.accounts import CodexSeatsAccount
 
@@ -456,9 +456,22 @@ class Ask(NamedTuple):
 class UserPush(NamedTuple):
     """An actionable quota notice delivered to the user's phone."""
     name: str
-    summary: str
-    text: str
-    ask: Ask
+    rendered: RenderedPush
+
+    @property
+    def summary(self) -> str:
+        return self.rendered.title
+
+    @property
+    def text(self) -> str:
+        return self.rendered.body
+
+    @property
+    def ask(self) -> Ask:
+        from user_action import ActionRequired
+        assert isinstance(self.rendered.action, ActionRequired)
+        assert self.rendered.need in ("decision", "blocked")
+        return Ask(self.rendered.need, self.rendered.action.text)
 
 
 class QuotaStatusNote(NamedTuple):
@@ -816,49 +829,45 @@ def user_time(stamp: str | None) -> str:
         return "an unknown time"
 
 
-def run_out_push(note: AgentNote, selection: ClaudeAccountsInUse) -> QuotaNotice:
+def run_out_push(note: AgentNote, selection: ClaudeAccountsInUse, notes: list[AgentNote]) -> QuotaNotice:
     """The actionable push or log note when this account's episode opens."""
+    from push_texts import render
+
     name = note.path.stem
     roles = claude_roles(note, selection)
     display_name = f"{name}, used by live sessions," if roles else name
-    summary = "Claude work needs more usage" if note.tool == "claude" else "Codex weekly usage is low"
     first = f"The {display_name} account has {percent(note)} weekly usage left. It refills {user_time(note.get('resets'))}."
     if note.tool == "codex":
         return QuotaStatusNote(name, f"{first} Codex keeps working on its credits. {credit_line(note)}")
-    # Nothing reads a Claude limit-reset count live, so the push offers no redeem it cannot back.
-    text = (first + " Its work may stop until then.\n\n"
-            + "Sign in: switch to an account with usage left so work continues.")
-    return UserPush(name, summary, text, Ask("decision", "In a Claude session on natedev, sign in to another account."))
+    candidates = [(value, candidate) for candidate in notes
+                  if candidate.tool == "claude" and candidate.path != note.path
+                  and (candidate.get("login") or "").casefold() != (note.get("login") or "").casefold()
+                  and candidate.get("state") in ("active", "inactive")
+                  and (value := remaining(candidate)) is not None and math.isfinite(value) and value > 0]
+    if not candidates:
+        return QuotaStatusNote(name, first + " No other Claude account has weekly usage left; work waits for usage to reset.")
+    _, target = max(candidates, key=lambda candidate: (candidate[0], candidate[1].path.stem))
+    return UserPush(name, render("quota.claude", account=name, remaining=percent(note),
+                                 reset=user_time(note.get("resets")), target=target.path.stem,
+                                 target_remaining=percent(target)))
 
 
-def short_reason(reason: str) -> str:
-    """Keep complete words in a phone explanation of at most 60 characters."""
-    if len(reason) <= 60:
-        return reason
-    complete: list[str] = []
-    for word in reason.split():
-        if len(" ".join([*complete, word])) > 59:
-            break
-        complete.append(word)
-    return " ".join(complete) + "…"
-
-
-def refusal_push(note: AgentNote, switch: CodexQuotaFallback, failed: str | None, already: bool) -> UserPush:
+def refusal_push(note: AgentNote, switch: CodexQuotaFallback, failed: str | None, already: bool) -> QuotaNotice:
     """The one direct user message sent when Codex refuses this episode."""
+    from push_texts import render
+
     if not isinstance(switch, NoCodexQuotaFallback):
         verb = "had already moved" if already else "moved"
-        outcome = f"The automatic switch {verb} work from Codex to Claude"
+        outcome = f"New work {verb} to Claude, the other coding assistant"
     elif failed:
-        reason = re.sub(r"/\S+", "the account registry", failed)
-        outcome = f"The automatic switch to Claude failed: {short_reason(reason)}"
+        outcome = "New work could not move to Claude, the other coding assistant"
     else:
-        outcome = "Nothing was on Codex, so the automatic switch moved nothing"
+        outcome = "No delegated work needed to move to Claude, the other coding assistant"
     name = note.path.stem
-    text = (f"Codex refused work on the {name} account. {credit_line(note)} {outcome}.\n\n"
-            "Reset (recommended, if available): refill usage without buying credits.\n\n"
-            "Add credits: pay for more Codex usage.")
-    return UserPush(name, "Codex work needs usage or credits", text,
-                    Ask("decision", f"In a Claude session on natedev, redeem a limit reset or add credits to {name} to restore Codex work."))
+    credits = credit_line(note).replace(f" on {name}", "")
+    if not isinstance(switch, NoCodexQuotaFallback) or not failed:
+        return QuotaStatusNote(name, f"Codex refused work on {name}. {credits} {outcome}.")
+    return UserPush(name, render("quota.codex_refused", account=name))
 
 
 def instruction(tool: str, switch: CodexQuotaFallback, failed: str | None) -> str:
@@ -960,21 +969,35 @@ def relay(recipient: str, text: str, key: str | None) -> str | None:
     return " ".join((done.stdout.strip() or done.stderr.strip() or f"exit {done.returncode}").split())
 
 
-def tell_user(summary: str, text: str, ask: Ask) -> str | None:
-    """Deliver actionable text; return None when it arrived, otherwise why not."""
+@dataclass(frozen=True)
+class PushSent:
+    """The user delivery completed successfully."""
+
+
+@dataclass(frozen=True)
+class PushFailed:
+    why: str
+
+
+PushDelivery = PushSent | PushFailed
+
+
+def tell_user(push: RenderedPush) -> PushDelivery:
+    """Convert the sender process result into the user delivery state."""
+    from push_texts import user_send_argv
+
     user_send_timeout = review.user_send_seconds()
-    asked = ["--need", ask.need, "--action", ask.action]
-    command = [sys.executable, str(SEND), "--to", "user", "--from", "quota_alert", "--summary", summary, *asked,
-               "--timeout", str(user_send_timeout)]
+    command = user_send_argv(push, timeout=user_send_timeout)
+    command[1] = str(SEND)
     try:
-        done = subprocess.run(command, input=text, capture_output=True, text=True,
+        done = subprocess.run(command, capture_output=True, text=True,
                               timeout=user_send_timeout + KILL_GRACE + 5,
                               check=False)
     except (subprocess.TimeoutExpired, OSError) as error:
-        return str(error)
+        return PushFailed(str(error))
     if done.returncode == 0:
-        return None
-    return " ".join((done.stdout.strip() or done.stderr.strip() or f"exit {done.returncode}").split())
+        return PushSent()
+    return PushFailed(" ".join((done.stdout.strip() or done.stderr.strip() or f"exit {done.returncode}").split()))
 
 
 def deliver(jobs: list[Job]) -> list[str | None]:
@@ -1042,17 +1065,24 @@ def _alert_for_saved_readings(notes: list[AgentNote], now: datetime, selection: 
                     if reset is not None:
                         episodes[name]["weekly_reset"] = reset.isoformat()
             episode = episodes[name]
+            session_notes: list[str] = []
             if episode.get("push") == "due":
-                push = run_out_push(note, selection)
+                push = run_out_push(note, selection, notes)
                 if isinstance(push, QuotaStatusNote):
                     log.append(f"quota status {name}: {push.text}")
+                    if note.tool == "claude":
+                        session_notes.append(push.text)
                     episode["push"] = stamp
                 else:
                     pushes.append(push)
             if "acknowledged" in episode:
+                for text in session_notes:
+                    jobs += [Job(name, recipient, text, "alert") for recipient in recipients(config)]
                 continue
             switch = state["fallback"] if note.tool == "codex" else NoCodexQuotaFallback()
             text = message(note, notes, config, switch, episode.get("switch_failed"), selection=selection, codex_readings=codex_readings, now=now)
+            if session_notes:
+                text += "\n" + "\n".join(session_notes)
             for recipient in recipients(config):
                 last = episode["last"].get(recipient)
                 if last is None or now - datetime.fromisoformat(last) >= repeat:
@@ -1081,16 +1111,16 @@ def _alert_for_saved_readings(notes: list[AgentNote], now: datetime, selection: 
             jobs += [Job(name, recipient, text, "restored") for recipient in recipients(config)]
     with ThreadPoolExecutor() as pool:
         relay_future = pool.submit(deliver_and_record, jobs, stamp)
-        push_futures = [pool.submit(tell_user, push.summary, push.text, push.ask) for push in pushes]
-        push_errors = [future.result() for future in push_futures]
+        push_futures = [pool.submit(tell_user, push.rendered) for push in pushes]
+        push_deliveries = [future.result() for future in push_futures]
         relay_log = relay_future.result()
     if pushes:
         with state_file() as state:
-            for push, error in zip(pushes, push_errors):
+            for push, delivery in zip(pushes, push_deliveries):
                 episode = state["episodes"].get(push.name)
-                if error is None and episode is not None and episode.get("push") == "due":
+                if isinstance(delivery, PushSent) and episode is not None and episode.get("push") == "due":
                     episode["push"] = stamp
-                outcome = "sent" if error is None else f"not delivered: {error}"
+                outcome = "sent" if isinstance(delivery, PushSent) else f"not delivered: {delivery.why}"
                 log.append(f"quota push {push.name} -> user: {outcome}")
     return log + relay_log
 
@@ -1140,7 +1170,7 @@ REFUSAL_TIME_UNKNOWN = RefusalTimeUnknown()
 class FallbackRefusalDelivery:
     lines: list[str]
     text: str
-    push: UserPush
+    quota_notice: QuotaNotice
     notice: KnownRefusalNotice
     failures_to_stamp: tuple[str, ...]
 
@@ -1269,7 +1299,6 @@ def blocked(notes: list[AgentNote], refusing_account: agent_accounts.RefusingCod
                 text = message(note, notes, config, fallback, failed,
                                selection=selection, codex_readings=readings, now=now) + "\n" + no_room
                 push = refusal_push(note, fallback, failed, already)
-                push = UserPush(push.name, push.summary, push.text + "\n" + no_room, push.ask)
             else:
                 text = f"Codex refused work on {name}, {account_status}. Nothing switched to Claude."
                 status = QuotaStatusNote(name, text)
@@ -1279,7 +1308,7 @@ def blocked(notes: list[AgentNote], refusing_account: agent_accounts.RefusingCod
                 return log
             swap_line = codex_swap_line(readings, now)
             if swap_line:
-                push = UserPush(push.name, push.summary, push.text + "\n" + swap_line, push.ask)
+                text += "\n" + swap_line
             new_failure = owns_role and not already and failed is not None and failed not in notice.get("failure_pushes", [])
             if not moved and not new_failure and ("push" in notice or episode is not None and "refusal_push" in episode):
                 return log
@@ -1289,17 +1318,23 @@ def blocked(notes: list[AgentNote], refusing_account: agent_accounts.RefusingCod
             [Job(name, recipient, delivery.text, "refusal") for recipient in recipients(config)], stamp)]
     log = delivery.lines
     log += deliver_and_record([Job(name, recipient, delivery.text, "refusal") for recipient in recipients(config)], stamp)
-    error = tell_user(delivery.push.summary, delivery.push.text, delivery.push.ask)
-    if error is None:
-        with state_file() as state:
-            notices = state.setdefault("refusal_notices", {})
-            delivery.notice["push"] = stamp
-            if delivery.failures_to_stamp:
-                delivery.notice.setdefault("failure_pushes", []).extend(delivery.failures_to_stamp)
-            notices[home] = delivery.notice
-            if name in state["episodes"]:
-                state["episodes"][name]["refusal_push"] = stamp
-    log.append(f"quota refusal {name} -> user: " + ("sent" if error is None else f"not delivered: {error}"))
+    quota_notice = delivery.quota_notice
+    if isinstance(quota_notice, QuotaStatusNote):
+        log.append(f"quota status {quota_notice.name}: {quota_notice.text}")
+    else:
+        push_delivery = tell_user(quota_notice.rendered)
+        log.append(f"quota refusal {name} -> user: " + (
+            "sent" if isinstance(push_delivery, PushSent) else f"not delivered: {push_delivery.why}"))
+        if isinstance(push_delivery, PushFailed):
+            return log
+    with state_file() as state:
+        notices = state.setdefault("refusal_notices", {})
+        delivery.notice["push"] = stamp
+        if delivery.failures_to_stamp:
+            delivery.notice.setdefault("failure_pushes", []).extend(delivery.failures_to_stamp)
+        notices[home] = delivery.notice
+        if name in state["episodes"]:
+            state["episodes"][name]["refusal_push"] = stamp
     return log
 
 

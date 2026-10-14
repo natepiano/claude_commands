@@ -247,13 +247,22 @@ def announce_quiet(running: int) -> None:
     except FileExistsError:
         return
     machine = socket.gethostname()
-    text = (f"All Codex agents on {machine} have stopped, so a reset now will not interrupt their work. "
-            "New Codex work stays paused until you run the clear command.")
-    _ = broadcast.send(
-        "user", "codex-winddown", text,
-        "--summary", "Codex is ready for your reset", "--need", "decision",
-        "--action", f"Reset Codex, then run /codex_winddown clear in a Claude session on {machine}.",
-    )
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "notify"))
+    from push_texts import render, user_send_argv
+    import review
+
+    push = render("codex.reset_ready", machine=machine)
+    command = user_send_argv(push)
+    command[1] = str(broadcast.SEND)
+    try:
+        done = subprocess.run(command, capture_output=True, text=True, check=False,
+                              timeout=review.user_send_seconds() + 15)
+        if done.returncode:
+            (STATE / QUIET).unlink(missing_ok=True)
+            print(f"codex wind-down: reset alert failed: {done.stdout.strip() or done.stderr.strip()}", file=sys.stderr)
+    except (OSError, subprocess.TimeoutExpired) as error:
+        (STATE / QUIET).unlink(missing_ok=True)
+        print(f"codex wind-down: reset alert failed: {error}", file=sys.stderr)
 
 
 def count(session: str) -> int:
