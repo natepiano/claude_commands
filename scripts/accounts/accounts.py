@@ -996,21 +996,31 @@ def _check_default_codex_home(seats_home: Path) -> list[str]:
     ]
 
 
-def _drop_named_account(environment: dict[str, str]) -> None:
-    for name in account.NAMED_ACCOUNT_VARIABLES:
-        _ = environment.pop(name, None)
+@dataclass(frozen=True)
+class PreparedAccount:
+    """Account launch variables to apply to a caller's own environment."""
+    variables: dict[str, str]
+    remove: frozenset[str]
 
 
-def exec_account(label: str, arguments: list[str]) -> None:
-    """Replace this process with Claude on the selected, safe directory."""
-    if label == "unit":
-        selected = role_account("unit")
-    elif label == "default":
-        selected = DefaultAccount()
-    else:
-        selected = NamedAccount(label, account_dir(label))
-    environment = dict(os.environ)
-    _ = environment.pop("CLAUDE_CODE_OAUTH_TOKEN", None)
+@dataclass(frozen=True)
+class AccountRefused:
+    """The selected account cannot safely prepare this launch."""
+    reason: str
+
+
+def prepared_account(label: str, *, resume: bool) -> PreparedAccount | AccountRefused:
+    """Prepare an account for any launcher without inheriting its environment."""
+    try:
+        if label == "unit":
+            selected = role_account("unit")
+        elif label == "default":
+            selected = DefaultAccount()
+        else:
+            selected = NamedAccount(label, account_dir(label))
+    except AccountsError as error:
+        return AccountRefused(str(error))
+    remove = frozenset({"CLAUDE_CODE_OAUTH_TOKEN"})
     if isinstance(selected, NamedAccount):
         default = _directory_identity(main_config_dir()) if label != "unit" else ClaudeDirectoryLoggedOut()
         expected = _account_note(selected.label)
@@ -1018,22 +1028,31 @@ def exec_account(label: str, arguments: list[str]) -> None:
         if not default_login:
             readiness = _inspect_account_directory(selected, expected)
             if isinstance(readiness, AccountDirectoryNotSetUp):
-                raise AccountsError(
+                return AccountRefused(
                     f'accounts: ~/.claude{selected.label.removeprefix("claude ")} is not set up; /showrunner:accounts setup "{selected.label}" first'
                 )
             if not isinstance(readiness, (AccountDirectoryReady, AccountDirectoryLoggedOut)) or (
-                "--resume" in arguments and isinstance(readiness, AccountDirectoryLoggedOut)
+                resume and isinstance(readiness, AccountDirectoryLoggedOut)
             ):
-                raise AccountsError(readiness.problems[0])
-            environment.update(account.named_account_environment(selected.dir))
-        else:
-            _drop_named_account(environment)
+                return AccountRefused(readiness.problems[0])
+            return PreparedAccount(account.named_account_environment(selected.dir), remove)
     else:
-        if "--resume" in arguments:
+        if resume:
             problems = check("default")
             if problems:
-                raise AccountsError(problems[0])
-        _drop_named_account(environment)
+                return AccountRefused(problems[0])
+    return PreparedAccount({}, remove | frozenset(account.NAMED_ACCOUNT_VARIABLES))
+
+
+def exec_account(label: str, arguments: list[str]) -> None:
+    """Replace this process with Claude on the selected, safe directory."""
+    prepared = prepared_account(label, resume="--resume" in arguments)
+    if isinstance(prepared, AccountRefused):
+        raise AccountsError(prepared.reason)
+    environment = dict(os.environ)
+    for name in prepared.remove:
+        _ = environment.pop(name, None)
+    environment.update(prepared.variables)
     try:
         os.execvpe("claude", ["claude", *arguments], environment)
     except OSError as error:
@@ -1816,10 +1835,14 @@ def move_showrunners(source: str, target: str, *, dry_run: bool = False, why: st
         if destination.login.casefold() == current.login.casefold():
             return MoveRefused(f"{source} is already on {destination.label}")
         owners = [item for item in inventory.inventory(current.login, refresh_desktops=False)["sessions"] if item["kind"] == "showrunner"]
+        unregistered = tuple(
+            f"{runner['slug']}: no session runs under the id its update timer names; a showrunner running "
+            + f"under another id is not moved until it runs `update_registration.py register --production {runner['doc']}`"
+            for runner in inventory.unregistered_showrunners())
         if not owners:
-            return MoveRefused(f"no showrunner on {source} on this machine")
+            return MoveRefused("\n".join((f"no showrunner on {source} on this machine", *unregistered)))
         open_ids = {saved["session"]["session_id"] for saved in record.all_session_records()}
-        skipped = tuple(f"{owner['name']} already has a shutdown in progress" for owner in owners if owner["session_id"] in open_ids)
+        skipped = (*unregistered, *(f"{owner['name']} already has a shutdown in progress" for owner in owners if owner["session_id"] in open_ids))
         selected = [owner for owner in owners if owner["session_id"] not in open_ids]
         ids = tuple(owner["session_id"] for owner in selected)
         if not ids:

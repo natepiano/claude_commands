@@ -14,6 +14,7 @@ import tempfile
 import time
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
+from dataclasses import FrozenInstanceError
 from datetime import datetime, timedelta, timezone, tzinfo
 from pathlib import Path
 from collections.abc import Callable
@@ -404,6 +405,127 @@ class AccountsTests(unittest.TestCase):
         self.assertEqual(result, (2, "", 'accounts: ~/.claude3 is not set up; /showrunner:accounts setup "claude 3" first\n'))
         launch.assert_not_called()
         self.assertFalse(accounts.account_dir("claude 3").exists())
+
+    def test_prepared_account_named_ready_returns_only_launch_changes_without_exec(self) -> None:
+        self.login_directory("claude 2", "main@example.invalid", default=True)
+        self.login_directory("claude 3", "unit@example.invalid")
+        with (patch.dict(os.environ, {
+                "CLAUDE_CONFIG_DIR": "inherited", "CLAUDE_CODE_REMOTE_MEMORY_DIR": "inherited",
+                "CLAUDE_CODE_OAUTH_TOKEN": "fixture-token", "UNCHANGED": "caller-owned",
+              }), patch.object(os, "execvpe") as launch):
+            before = dict(os.environ)
+            result = accounts.prepared_account("claude 3", resume=True)
+            self.assertEqual(dict(os.environ), before)
+        self.assertIsInstance(result, accounts.PreparedAccount)
+        assert isinstance(result, accounts.PreparedAccount)
+        self.assertEqual(result.variables, named_environment(accounts.account_dir("claude 3")))
+        self.assertEqual(result.remove, frozenset({"CLAUDE_CODE_OAUTH_TOKEN"}))
+        self.assertNotIn("UNCHANGED", result.variables)
+        launch.assert_not_called()
+        with self.assertRaises(FrozenInstanceError):
+            setattr(result, "variables", {})
+
+    def test_prepared_account_default_login_alias_removes_named_variables_without_setup(self) -> None:
+        self.login_directory("claude 2", "main@example.invalid", default=True)
+        self.write_note("claude 3", "MAIN@example.invalid")
+        result = accounts.prepared_account("claude 3", resume=True)
+        self.assertIsInstance(result, accounts.PreparedAccount)
+        assert isinstance(result, accounts.PreparedAccount)
+        self.assertEqual(result.variables, {})
+        self.assertEqual(result.remove, frozenset({"CLAUDE_CODE_OAUTH_TOKEN", *account.NAMED_ACCOUNT_VARIABLES}))
+        self.assertFalse(accounts.account_dir("claude 3").exists())
+
+    def test_prepared_account_missing_named_directory_refuses_with_setup_instruction(self) -> None:
+        self.write_note("claude 3", "unit@example.invalid")
+        result = accounts.prepared_account("claude 3", resume=False)
+        self.assertIsInstance(result, accounts.AccountRefused)
+        assert isinstance(result, accounts.AccountRefused)
+        self.assertEqual(result.reason,
+            'accounts: ~/.claude3 is not set up; /showrunner:accounts setup "claude 3" first')
+        self.assertFalse(accounts.account_dir("claude 3").exists())
+        with self.assertRaises(FrozenInstanceError):
+            setattr(result, "reason", "changed")
+
+    def test_prepared_account_logged_out_named_resume_refuses(self) -> None:
+        self.login_directory("claude 2", "main@example.invalid", default=True)
+        self.login_directory("claude 3", "unit@example.invalid")
+        _ = (accounts.account_dir("claude 3") / ".claude.json").write_text("{}")
+        result = accounts.prepared_account("claude 3", resume=True)
+        self.assertIsInstance(result, accounts.AccountRefused)
+        assert isinstance(result, accounts.AccountRefused)
+        self.assertEqual(result.reason, f"accounts: {accounts.account_dir('claude 3')} is not logged in")
+
+    def test_prepared_account_logged_out_named_login_is_allowed(self) -> None:
+        self.login_directory("claude 2", "main@example.invalid", default=True)
+        self.login_directory("claude 3", "unit@example.invalid")
+        _ = (accounts.account_dir("claude 3") / ".claude.json").write_text("{}")
+        result = accounts.prepared_account("claude 3", resume=False)
+        self.assertIsInstance(result, accounts.PreparedAccount)
+        assert isinstance(result, accounts.PreparedAccount)
+        self.assertEqual(result.variables, named_environment(accounts.account_dir("claude 3")))
+        self.assertEqual(result.remove, frozenset({"CLAUDE_CODE_OAUTH_TOKEN"}))
+
+    def test_prepared_account_wrong_login_refuses_with_existing_diagnostic(self) -> None:
+        self.login_directory("claude 2", "main@example.invalid", default=True)
+        self.login_directory("claude 3", "expected@example.invalid")
+        self.write_identity("claude 3", "other@example.invalid")
+        result = accounts.prepared_account("claude 3", resume=False)
+        self.assertIsInstance(result, accounts.AccountRefused)
+        assert isinstance(result, accounts.AccountRefused)
+        self.assertEqual(result.reason,
+            "accounts: ~/.claude3 is logged in as other@example.invalid, not claude 3; see Log out and in in ~/.claude/docs/accounts.md")
+
+    def test_prepared_account_broken_links_refuse_even_when_logged_out(self) -> None:
+        self.login_directory("claude 2", "main@example.invalid", default=True)
+        self.login_directory("claude 3", "unit@example.invalid")
+        _ = (accounts.account_dir("claude 3") / ".claude.json").write_text("{}")
+        (self.main_dir / "projects").rmdir()
+        result = accounts.prepared_account("claude 3", resume=False)
+        self.assertIsInstance(result, accounts.AccountRefused)
+        assert isinstance(result, accounts.AccountRefused)
+        self.assertEqual(result.reason, f"accounts: {accounts.account_dir('claude 3') / 'projects'} is broken")
+
+    def test_prepared_account_default_resume_refuses_first_check_problem(self) -> None:
+        problems = ["accounts: default identity unavailable", "accounts: another problem"]
+        with patch.object(accounts, "check", return_value=problems) as checked:
+            result = accounts.prepared_account("default", resume=True)
+        checked.assert_called_once_with("default")
+        self.assertIsInstance(result, accounts.AccountRefused)
+        assert isinstance(result, accounts.AccountRefused)
+        self.assertEqual(result.reason, problems[0])
+
+    def test_prepared_account_default_without_resume_removes_named_variables_without_check(self) -> None:
+        with patch.object(accounts, "check") as checked:
+            result = accounts.prepared_account("default", resume=False)
+        checked.assert_not_called()
+        self.assertIsInstance(result, accounts.PreparedAccount)
+        assert isinstance(result, accounts.PreparedAccount)
+        self.assertEqual(result.variables, {})
+        self.assertEqual(result.remove, frozenset({"CLAUDE_CODE_OAUTH_TOKEN", *account.NAMED_ACCOUNT_VARIABLES}))
+
+    def test_prepared_account_default_resume_with_no_problems_is_allowed(self) -> None:
+        self.login_directory("claude 2", "main@example.invalid", default=True)
+        result = accounts.prepared_account("default", resume=True)
+        self.assertIsInstance(result, accounts.PreparedAccount)
+        assert isinstance(result, accounts.PreparedAccount)
+        self.assertEqual(result.variables, {})
+        self.assertEqual(result.remove, frozenset({"CLAUDE_CODE_OAUTH_TOKEN", *account.NAMED_ACCOUNT_VARIABLES}))
+
+    def test_prepared_account_unit_uses_resolved_launch_account(self) -> None:
+        self.login_directory("claude 2", "main@example.invalid", default=True)
+        self.login_directory("claude 3", "unit@example.invalid")
+        for selected in (accounts.DefaultAccount(), accounts.NamedAccount("claude 3", accounts.account_dir("claude 3"))):
+            with self.subTest(selected=selected), patch.object(accounts, "role_account", return_value=selected) as resolve:
+                result = accounts.prepared_account("unit", resume=True)
+                resolve.assert_called_once_with("unit")
+                self.assertIsInstance(result, accounts.PreparedAccount)
+                assert isinstance(result, accounts.PreparedAccount)
+                if isinstance(selected, accounts.NamedAccount):
+                    self.assertEqual(result.variables, named_environment(selected.dir))
+                    self.assertEqual(result.remove, frozenset({"CLAUDE_CODE_OAUTH_TOKEN"}))
+                else:
+                    self.assertEqual(result.variables, {})
+                    self.assertEqual(result.remove, frozenset({"CLAUDE_CODE_OAUTH_TOKEN", *account.NAMED_ACCOUNT_VARIABLES}))
 
     def test_exec_named_account_sets_its_config_directory_and_preserves_claude_arguments(self) -> None:
         self.login_directory("claude 2", "main@example.invalid", default=True)
@@ -858,6 +980,27 @@ class AccountsTests(unittest.TestCase):
                                        accounts.AccountRoleBurn("claude 3", ("unit directors",), 10, 1),
                                        accounts.AccountRoleBurn("claude 2", (), 10, 1),
                                        accounts.AccountRoleBurn("claude 3", (), 10, 1)])
+
+    def test_move_showrunners_names_a_timer_whose_session_is_not_running(self) -> None:
+        from importlib import import_module
+        # The modules move_showrunners imports by the paths it adds, as it finds them.
+        sys.path.insert(0, str(accounts.SCRIPTS / "shutdown"))
+        inventory = import_module("inventory")
+        stale = showrunners.Showrunner(session="", socket="", slug="remove-running-section", zone="America/New_York",
+                                       doc="/w/remove-running-section-production.md")
+        with (
+            patch.object(account, "named_claude_account", return_value=account.Account("claude", "main@example.invalid", "claude 2")),
+            patch.object(accounts, "_move_target", return_value=agent_accounts.KnownClaudeAccount("other@example.invalid", "claude 3")),
+            patch.object(inventory, "inventory", return_value={"machine": "natedev", "login": "main@example.invalid",
+                                                                 "label": "claude 2", "sessions": [], "unattributed": []}),
+            patch.object(inventory, "unregistered_showrunners", return_value=[stale]),
+        ):
+            refused = accounts.move_showrunners("claude 2", "claude 3")
+        self.assertIsInstance(refused, accounts.MoveRefused)
+        reason = cast(accounts.MoveRefused, refused).reason
+        self.assertEqual(reason.splitlines()[0], "no showrunner on claude 2 on this machine")
+        self.assertIn("remove-running-section: no session runs under the id its update timer names", reason)
+        self.assertIn("update_registration.py register --production /w/remove-running-section-production.md", reason)
 
     def test_burn_after_role_retirement_without_history_never_defaults_to_showrunners(self) -> None:
         self.login_directory("claude 2", "main@example.invalid", default=True)

@@ -120,9 +120,18 @@ class CodexServerLeftRunning(TypedDict):
 
 
 class UnitTmuxLeftRunning(TypedDict):
+    """Legacy wire form; readers normalize it to UnitSessionLeftRunning."""
     kind: Literal["unit tmux session left running"]
     at: str
     tmux_session: str
+    cause: StopLeftRunningCause
+
+
+class UnitSessionLeftRunning(TypedDict):
+    kind: Literal["unit session left running"]
+    at: str
+    host: Literal["tmux", "herdr"]
+    session_name: str
     cause: StopLeftRunningCause
 
 
@@ -131,7 +140,7 @@ SessionStopIssue = (
     | StillRunningAfterStop
     | AccountUnreadableAtStop
     | CodexServerLeftRunning
-    | UnitTmuxLeftRunning
+    | UnitSessionLeftRunning
 )
 
 
@@ -358,6 +367,14 @@ class SessionShutdown(TypedDict):
     progress: SessionProgress
     stop_issues: list[SessionStopIssue]
     alerted_at: NotRequired[str]
+    # The phone push for a form open in the session's pane; the user is told once.
+    form_alerted_at: NotRequired[str]
+    # The one repeat of the pause message when no ready mark came back.
+    reasked_at: NotRequired[str]
+    # The not-back failure last pushed to the user, so an unchanged one is not pushed again.
+    restore_alerted: NotRequired[str]
+    # The last line a unit's showrunner was sent about this stop: "stopping", "back", or the not-back failure.
+    showrunner_told: NotRequired[str]
     # Absent means resume on session.config_dir, never on a changed role.
     target: NotRequired[str]
     source_label: NotRequired[str]
@@ -652,6 +669,7 @@ def _session_stop_issue(value: object, place: str, *, legacy: bool = False) -> S
                 "seat still live",
                 "codex server left running",
                 "unit tmux session left running",
+                "unit session left running",
             }
         ),
     )
@@ -671,10 +689,22 @@ def _session_stop_issue(value: object, place: str, *, legacy: bool = False) -> S
         cause = _string(_required(values, "cause", place), f"{place}.cause")
         if cause not in {"stop not confirmed", "owner identity lost"}:
             raise InvalidRecord(f"{place}.cause is invalid")
-    elif kind == "unit tmux session left running":
-        _ = _string(
-            _required(values, "tmux_session", place), f"{place}.tmux_session"
-        )
+    elif kind in {"unit tmux session left running", "unit session left running"}:
+        if kind == "unit tmux session left running":
+            values = {
+                **values,
+                "kind": "unit session left running",
+                "host": "tmux",
+                "session_name": _string(
+                    _required(values, "tmux_session", place), f"{place}.tmux_session"
+                ),
+            }
+            del values["tmux_session"]
+        else:
+            _ = _string(_required(values, "session_name", place), f"{place}.session_name")
+            host = _string(_required(values, "host", place), f"{place}.host")
+            if host not in {"tmux", "herdr"}:
+                raise InvalidRecord(f"{place}.host is invalid")
         cause = _string(_required(values, "cause", place), f"{place}.cause")
         if cause not in {"stop not confirmed", "owner identity lost"}:
             raise InvalidRecord(f"{place}.cause is invalid")
@@ -964,8 +994,12 @@ def _session_shutdown(value: object, place: str) -> SessionShutdown:
             raise InvalidRecord(f"{seat_place}.owner must identify this session")
         parsed_seats.append(parsed)
     values["seats"] = parsed_seats
-    if "alerted_at" in values:
-        _ = _utc_time(values["alerted_at"], f"{place}.alerted_at")
+    for field in ("alerted_at", "form_alerted_at", "reasked_at"):
+        if field in values:
+            _ = _utc_time(values[field], f"{place}.{field}")
+    for field in ("restore_alerted", "showrunner_told"):
+        if field in values:
+            _ = _string(values[field], f"{place}.{field}")
     return cast(SessionShutdown, cast(object, values))
 
 

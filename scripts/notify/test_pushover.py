@@ -359,7 +359,7 @@ class PushoverTests(unittest.TestCase):
             code, form = self.run_send(self.arguments(answerable=True))
         self.assertEqual(code, 0)
         reviewer.assert_called_once_with(draft, revision=True)
-        command = next(call.argv for call in runner.calls if call.argv[0] == "claude")
+        command = next(call.argv for call in runner.calls if Path(call.argv[0]).name == "claude")
         self.assertIn("Revision: true", command[-1])
         self.assertEqual(form["message"], [first_line(draft.action) + "\n" + body])
         self.assertEqual(self.reviews()[0]["verdict"], "rewrite")
@@ -485,7 +485,7 @@ class PushoverTests(unittest.TestCase):
         elapsed = [0.0]
 
         def process(argv: list[str], *, timeout: float, env: dict[str, str]) -> subprocess.CompletedProcess[str]:
-            if argv[0] == "claude":
+            if Path(argv[0]).name == "claude":
                 self.assertLessEqual(timeout, 90)
                 elapsed[0] += timeout
                 raise subprocess.TimeoutExpired(argv, timeout)

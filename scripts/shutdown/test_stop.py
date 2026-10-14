@@ -21,6 +21,8 @@ from unittest.mock import patch
 from test_support import ShutdownTestCase
 from account import Account
 import inventory
+import herdr
+from fake_herdr import CommandResponse
 import record
 import settle
 import stop
@@ -235,8 +237,14 @@ class StopTests(ShutdownTestCase):
         environment = cast(object, self.enterContext(patch.dict(os.environ, {
             "HOME": str(self.root), "SHUTDOWN_STATE_DIR": str(self.root / "shutdown"),
             "NOTIFIER_SESSIONS_DIR": str(self.root / "sessions"),
+            "HERDR_BIN": str(Path(__file__).parents[1] / "herdr/fake_herdr.py"),
+            "SYSTEMCTL": str(Path(__file__).parents[1] / "herdr/fake_herdr.py"),
+            "HERDR_PROC": str(self.root / "proc"),
+            "FAKE_HERDR_LOG": str(self.root / "herdr.jsonl"),
+            "FAKE_HERDR_RESPONSES": str(self.root / "herdr-responses.json"),
         })))
         del environment
+        self.herdr_replies([])
         _ = self.enterContext(patch.object(settle, "record_time", return_value=NOW))
 
     def create(self, records: list[record.SessionShutdown]) -> None:
@@ -335,8 +343,8 @@ class StopTests(ShutdownTestCase):
         saved['progress'] = record.SessionStopped(kind='stopped', at=NOW)
         saved['stop_issues'] = [record.CodexServerLeftRunning(
             kind='codex server left running', at=NOW, run_dir=pending, cause='stop not confirmed',
-        ), record.UnitTmuxLeftRunning(
-            kind='unit tmux session left running', at=NOW, tmux_session='tmux-owner', cause='stop not confirmed',
+        ), record.UnitSessionLeftRunning(
+            kind='unit session left running', at=NOW, host="tmux", session_name='tmux-owner', cause='stop not confirmed',
         )]
         self.create([saved])
         codex: list[list[str]] = []
@@ -477,29 +485,184 @@ class StopTests(ShutdownTestCase):
         self.assertEqual(tmux_calls, [['kill-session', '-t', '=exact-unit-pane'], ['has-session', '-t', '=exact-unit-pane']])
         self.assertNotEqual(report['progress']['kind'], 'stopping')
 
-    def test_herdr_unit_stop_never_touches_tmux_or_records_a_tmux_issue(self) -> None:
-        for state in ("present", "absent", "identity lost"):
+    def herdr_replies(self, running: list[str], *, stop_error: bool = False) -> None:
+        entries = [herdr.SessionEntry(name=name, running=True, default=False,
+                    session_dir="/fixture", socket_path="/fixture/socket") for name in running]
+        responses: dict[str, CommandResponse] = {
+            "default": {"code": 0, "stdout": ""},
+            "--session default session list --json": {
+                "code": 0, "stdout": json.dumps(herdr.SessionListResult(sessions=entries)),
+            },
+        }
+        if stop_error:
+            responses["--session same-name-as-tmux server stop"] = CommandResponse(code=1, stdout="", stderr="fixture stop failed")
+        _ = (self.root / "herdr-responses.json").write_text(json.dumps(responses))
+
+    def herdr_commands(self) -> list[list[str]]:
+        path = self.root / "herdr.jsonl"
+        return [cast(list[str], json.loads(line)) for line in path.read_text().splitlines()] if path.exists() else []
+
+    def test_herdr_unit_stop_runs_after_claude_exits_and_never_touches_tmux(self) -> None:
+        for state in ("present", "absent"):
             with self.subTest(state=state):
+                log = self.root / "herdr.jsonl"
+                log.unlink(missing_ok=True)
                 owner = unit(f"herdr-{state}", 101, tmux_session="same-name-as-tmux", session_host="herdr")
-                self.create([entry(owner)])
-                current = (unit(owner["session_id"], 202, session_host="herdr")
-                           if state == "identity lost" else owner)
-                tmux_calls: list[list[str]] = []
-                saved = record.find_session(LOGIN, owner["session_id"])
-                self.assertIsNotNone(saved)
-                if saved is None:
-                    self.fail("herdr unit record was not created")
-                report = stop.stop_session(saved,
-                    kill=lambda _pid, _signal: None, is_alive=lambda _pid: state == "identity lost",
-                    fresh_inventory=lambda _login, _scope: machine_inventory([] if state == "absent" else [current]),
+                saved = entry(owner)
+                self.create([saved])
+                signals: list[int] = []
+
+                def kill(_pid: int, sent: int) -> None:
+                    self.assertEqual(self.herdr_commands(), [])
+                    signals.append(sent)
+
+                report = stop.stop_session(saved, kill=kill, is_alive=lambda _pid: False,
+                    fresh_inventory=lambda _login, _scope: machine_inventory([] if state == "absent" else [owner]),
                     clock=lambda: NOW_UTC, codex_mesh=lambda _args: 0,
-                    tmux=lambda arguments: tmux_calls.append(arguments) or 0,
+                    tmux=lambda _args: self.fail("herdr cleanup touched tmux"),
                     sleep=lambda _seconds: None, session_record_exists=lambda _pid: False)
-                self.assertEqual(tmux_calls, [])
+                self.assertEqual(signals, [signal.SIGTERM] if state == "present" else [])
+                self.assertEqual(self.herdr_commands(), [
+                    ["--session", "same-name-as-tmux", "server", "stop"],
+                    ["--user", "is-active", "herdr-same-name-as-tmux"],
+                    ["--user", "stop", "herdr-same-name-as-tmux"],
+                    ["--session", "default", "session", "list", "--json"],
+                ])
                 self.assertEqual(report["stop_issues"], [])
-                self.assertEqual(report["progress"]["kind"], {
-                    "present": "stopped", "absent": "already gone", "identity lost": "process identity lost",
-                }[state])
+                self.assertEqual(report["progress"]["kind"], "stopped" if state == "present" else "already gone")
+
+    def test_other_running_herdr_sessions_do_not_make_the_stopped_unit_a_leftover(self) -> None:
+        self.herdr_replies(["unrelated"])
+        saved = entry(unit("named-only", 101, tmux_session="same-name-as-tmux", session_host="herdr"))
+        self.create([saved])
+        report = self.perform(saved)
+        self.assertEqual(report["stop_issues"], [])
+        self.assertEqual(self.herdr_commands()[0], ["--session", "same-name-as-tmux", "server", "stop"])
+
+    def test_herdr_unit_leftover_or_unreadable_stop_records_its_host(self) -> None:
+        for failure in ("still running", "stop failed", "listing failed"):
+            with self.subTest(failure=failure):
+                self.herdr_replies(["same-name-as-tmux", "unrelated"], stop_error=failure == "stop failed")
+                if failure == "listing failed":
+                    path = self.root / "herdr-responses.json"
+                    replies = cast(dict[str, object], json.loads(path.read_text()))
+                    replies["--session default session list --json"] = {"code": 1, "stderr": "fixture unreadable"}
+                    _ = path.write_text(json.dumps(replies))
+                owner = unit(failure, 101, tmux_session="same-name-as-tmux", session_host="herdr")
+                saved = entry(owner)
+                self.create([saved])
+                report = self.perform(saved)
+                self.assertEqual(report["stop_issues"], [record.UnitSessionLeftRunning(
+                    kind="unit session left running", at=NOW, host="herdr",
+                    session_name="same-name-as-tmux", cause="stop not confirmed")])
+                self.assertEqual(report["progress"]["kind"], "stopped")
+
+    def test_herdr_unit_cleanup_retry_does_not_signal_the_stopped_owner(self) -> None:
+        saved = entry(unit("retry", 101, tmux_session="same-name-as-tmux", session_host="herdr"))
+        saved["progress"] = record.SessionStopped(kind="stopped", at=NOW)
+        saved["stop_issues"] = [record.UnitSessionLeftRunning(kind="unit session left running", at=NOW,
+            host="herdr", session_name="same-name-as-tmux", cause="stop not confirmed")]
+        self.create([saved])
+        report = stop.stop_session(saved,
+            kill=lambda _pid, _sent: self.fail("stopped owner signalled"),
+            is_alive=lambda _pid: False, clock=lambda: NOW_UTC,
+            codex_mesh=lambda _args: self.fail("unexpected Codex cleanup"),
+            tmux=lambda _args: self.fail("herdr retry touched tmux"))
+        self.assertEqual(report["stop_issues"], [])
+        self.assertEqual(self.herdr_commands()[0], ["--session", "same-name-as-tmux", "server", "stop"])
+
+    def test_failed_herdr_stop_with_no_running_session_clears_cleanup(self) -> None:
+        for error in (herdr.HerdrFailure("stop failed"), OSError("stop failed"),
+                      subprocess.TimeoutExpired("herdr", 10)):
+            with self.subTest(error=type(error).__name__):
+                saved = entry(unit(type(error).__name__, 101,
+                    tmux_session="same-name-as-tmux", session_host="herdr"))
+                saved["progress"] = record.SessionStopped(kind="stopped", at=NOW)
+                saved["stop_issues"] = [record.UnitSessionLeftRunning(
+                    kind="unit session left running", at=NOW, host="herdr",
+                    session_name="same-name-as-tmux", cause="stop not confirmed")]
+                self.create([saved])
+                with patch.object(herdr, "stop_session", side_effect=error) as stop_server, \
+                        patch.object(herdr, "live_sessions", return_value=[]) as list_sessions:
+                    report = self.perform(saved)
+                stop_server.assert_called_once_with("same-name-as-tmux")
+                list_sessions.assert_called_once_with()
+                self.assertEqual(report["stop_issues"], [])
+                self.assertEqual(report["progress"]["kind"], "stopped")
+
+    def test_failed_herdr_stop_with_a_running_session_keeps_cleanup_pending(self) -> None:
+        saved = entry(unit("still-running", 101,
+            tmux_session="same-name-as-tmux", session_host="herdr"))
+        self.create([saved])
+        running = [herdr.SessionEntry(name="same-name-as-tmux", running=True,
+            default=False, session_dir="/fixture", socket_path="/fixture/socket")]
+        with patch.object(herdr, "stop_session", side_effect=herdr.HerdrFailure("stop failed")), \
+                patch.object(herdr, "live_sessions", return_value=running) as list_sessions:
+            report = self.perform(saved)
+        list_sessions.assert_called_once_with()
+        self.assertEqual(report["stop_issues"], [record.UnitSessionLeftRunning(
+            kind="unit session left running", at=NOW, host="herdr",
+            session_name="same-name-as-tmux", cause="stop not confirmed")])
+
+    def test_failed_herdr_stop_with_unreadable_liveness_keeps_cleanup_pending(self) -> None:
+        for error in (herdr.HerdrFailure("list failed"), OSError("list failed"),
+                      subprocess.TimeoutExpired("herdr", 10)):
+            with self.subTest(error=type(error).__name__):
+                saved = entry(unit(type(error).__name__, 101,
+                    tmux_session="same-name-as-tmux", session_host="herdr"))
+                self.create([saved])
+                with patch.object(herdr, "stop_session", side_effect=herdr.HerdrFailure("stop failed")), \
+                        patch.object(herdr, "live_sessions", side_effect=error) as list_sessions:
+                    report = self.perform(saved)
+                list_sessions.assert_called_once_with()
+                self.assertEqual(report["stop_issues"], [record.UnitSessionLeftRunning(
+                    kind="unit session left running", at=NOW, host="herdr",
+                    session_name="same-name-as-tmux", cause="stop not confirmed")])
+
+    def test_herdr_unit_with_lost_identity_is_left_running_without_cleanup(self) -> None:
+        owner = unit("identity", 101, tmux_session="same-name-as-tmux", session_host="herdr")
+        saved = entry(owner)
+        self.create([saved])
+        changed = unit("identity", 202, tmux_session="same-name-as-tmux", session_host="herdr")
+        report = stop.stop_session(saved,
+            kill=lambda _pid, _sent: self.fail("changed owner signalled"),
+            fresh_inventory=lambda _login, _scope: machine_inventory([changed]), clock=lambda: NOW_UTC,
+            tmux=lambda _args: self.fail("changed owner tmux cleanup"))
+        self.assertEqual(self.herdr_commands(), [])
+        self.assertEqual(report["progress"]["kind"], "process identity lost")
+        self.assertEqual(report["stop_issues"], [record.UnitSessionLeftRunning(
+            kind="unit session left running", at=NOW, host="herdr",
+            session_name="same-name-as-tmux", cause="owner identity lost")])
+
+    def test_herdr_unit_cleanup_stops_when_another_request_takes_the_claim(self) -> None:
+        owner = unit("claim", 101, tmux_session="same-name-as-tmux", session_host="herdr")
+        saved = entry(owner)
+        self.create([saved])
+
+        def replace_request(_name: str) -> None:
+            def change(current: record.SessionShutdown) -> None:
+                current["request_id"] = "new-request"
+            _ = record.update_session(LOGIN, owner["session_id"], change)
+
+        with patch.object(herdr, "stop_session", side_effect=replace_request) as stop_server, \
+                patch.object(herdr, "live_sessions") as list_sessions:
+            report = self.perform(saved)
+        stop_server.assert_called_once_with("same-name-as-tmux")
+        list_sessions.assert_not_called()
+        self.assertEqual(report["request_id"], "new-request")
+        self.assertEqual(report["progress"]["kind"], "stopping")
+
+    def test_herdr_unit_with_an_unexited_claude_never_stops_its_server(self) -> None:
+        owner = unit("busy-owner", 101, tmux_session="same-name-as-tmux", session_host="herdr")
+        saved = entry(owner)
+        self.create([saved])
+        report = stop.stop_session(saved, kill=lambda _pid, _sent: None,
+            is_alive=lambda _pid: True, fresh_inventory=lambda _login, _scope: machine_inventory([owner]),
+            clock=lambda: NOW_UTC, codex_mesh=lambda _args: 0,
+            tmux=lambda _args: self.fail("herdr owner touched tmux"),
+            sleep=lambda _seconds: None, session_record_exists=lambda _pid: True)
+        self.assertEqual(self.herdr_commands(), [])
+        self.assertEqual(report["progress"]["kind"], "stop failed")
 
     def test_process_identity_changed_before_first_signal_is_left_running(self) -> None:
         run_dir = str(self.root / 'run')
@@ -512,7 +675,7 @@ class StopTests(ShutdownTestCase):
         self.assertEqual(killed, [])
         self.assertEqual(codex_calls, [])
         self.assertEqual(report['progress']['kind'], 'process identity lost')
-        self.assertEqual(report['stop_issues'], [record.CodexServerLeftRunning(kind='codex server left running', at=NOW, run_dir=run_dir, cause='owner identity lost'), record.UnitTmuxLeftRunning(kind='unit tmux session left running', at=NOW, tmux_session='reused-unit', cause='owner identity lost')])
+        self.assertEqual(report['stop_issues'], [record.CodexServerLeftRunning(kind='codex server left running', at=NOW, run_dir=run_dir, cause='owner identity lost'), record.UnitSessionLeftRunning(kind='unit session left running', at=NOW, host="tmux", session_name='reused-unit', cause='owner identity lost')])
         self.assertNotEqual(report['progress']['kind'], 'stopping')
 
     def test_process_identity_changed_before_second_signal_is_not_signalled_again(self) -> None:
@@ -582,7 +745,7 @@ class StopTests(ShutdownTestCase):
         self.create(records_for_test([entry(stored)]))
         report = stop.stop_session(self.stored_record(), kill=lambda _pid, _signal: None, is_alive=lambda _pid: False, fresh_inventory=lambda _login, _scope: machine_inventory([stored]), clock=lambda: NOW_UTC, codex_mesh=lambda _arguments: 1, tmux=lambda _arguments: 0, sleep=lambda _seconds: None, session_record_exists=lambda _pid: False)
         self.assertEqual(report['progress'], record.SessionStopped(kind='stopped', at=NOW))
-        self.assertEqual(report['stop_issues'], [record.CodexServerLeftRunning(kind='codex server left running', at=NOW, run_dir=run_dir, cause='stop not confirmed'), record.UnitTmuxLeftRunning(kind='unit tmux session left running', at=NOW, tmux_session='unit-exact', cause='stop not confirmed')])
+        self.assertEqual(report['stop_issues'], [record.CodexServerLeftRunning(kind='codex server left running', at=NOW, run_dir=run_dir, cause='stop not confirmed'), record.UnitSessionLeftRunning(kind='unit session left running', at=NOW, host="tmux", session_name='unit-exact', cause='stop not confirmed')])
 
     def test_second_stop_retries_only_the_cleanup_left_by_the_first_stop(self) -> None:
         runs = [str(self.root / name) for name in ("resolved", "pending")]
@@ -602,7 +765,7 @@ class StopTests(ShutdownTestCase):
         )
         expected_issues = [
             record.CodexServerLeftRunning(kind="codex server left running", at=NOW, run_dir=runs[1], cause="stop not confirmed"),
-            record.UnitTmuxLeftRunning(kind="unit tmux session left running", at=NOW, tmux_session="tmux-owner", cause="stop not confirmed"),
+            record.UnitSessionLeftRunning(kind="unit session left running", at=NOW, host="tmux", session_name="tmux-owner", cause="stop not confirmed"),
         ]
         self.assertEqual(first["progress"], record.SessionStopped(kind="stopped", at=NOW))
         self.assertEqual(first["stop_issues"], expected_issues)
@@ -646,7 +809,7 @@ class StopTests(ShutdownTestCase):
             raise OSError('tmux is not on PATH')
         report = stop.stop_session(self.stored_record(), kill=lambda _pid, _signal: self.fail('an absent unit was signalled'), is_alive=lambda _pid: False, fresh_inventory=lambda _login, _scope: machine_inventory([]), clock=lambda: NOW_UTC, codex_mesh=lambda _arguments: 0, tmux=unavailable_tmux, sleep=lambda _seconds: None, session_record_exists=lambda _pid: False)
         self.assertNotEqual(report['progress']['kind'], 'stopping')
-        self.assertEqual(report['stop_issues'], [record.UnitTmuxLeftRunning(kind='unit tmux session left running', at=NOW, tmux_session='unit-on-nix', cause='stop not confirmed')])
+        self.assertEqual(report['stop_issues'], [record.UnitSessionLeftRunning(kind='unit session left running', at=NOW, host="tmux", session_name='unit-on-nix', cause='stop not confirmed')])
 
     def test_ghostty_shell_with_a_different_parent_gets_no_sighup(self) -> None:
         host = inventory.WindowHost(kind='ghostty', window_shell=901, desktop=inventory.DesktopNotInSnapshot(kind='not in snapshot'))
@@ -904,7 +1067,7 @@ class StopTests(ShutdownTestCase):
             record.CodexServerLeftRunning(kind="codex server left running", at=NOW, run_dir=run, cause="stop not confirmed")
             for run in runs
         ]
-        issues.append(record.UnitTmuxLeftRunning(kind="unit tmux session left running", at=NOW, tmux_session="tmux-owner", cause="stop not confirmed"))
+        issues.append(record.UnitSessionLeftRunning(kind="unit session left running", at=NOW, host="tmux", session_name="tmux-owner", cause="stop not confirmed"))
         saved["stop_issues"] = issues
         self.create([saved])
         calls: list[list[str]] = []
@@ -1022,7 +1185,7 @@ class StopTests(ShutdownTestCase):
     def test_stop_cleanup_rechecks_ownership_after_the_tmux_command(self) -> None:
         saved = entry(unit("owner", 101))
         saved["progress"] = record.SessionStopped(kind="stopped", at=NOW)
-        saved["stop_issues"] = [record.UnitTmuxLeftRunning(kind="unit tmux session left running", at=NOW, tmux_session="tmux-owner", cause="stop not confirmed")]
+        saved["stop_issues"] = [record.UnitSessionLeftRunning(kind="unit session left running", at=NOW, host="tmux", session_name="tmux-owner", cause="stop not confirmed")]
         self.create([saved])
         replacement = record.SessionRestarting(kind="restarting", at=NOW, prior=record.SessionStopped(kind="stopped", at=NOW))
         calls: list[list[str]] = []

@@ -21,7 +21,7 @@ import account
 
 STATUS_LINE = Path(__file__).parents[1] / "statusline" / "statusline.jq"
 EXAMPLE_FIRST_LINE = "natedev | claude_commands | 182,340 | Opus 5.5 high"
-ACCOUNT_FIRST_LINE = "natedev | claude 2 | claude_commands | 182,340 | Opus 5.5 high"
+ACCOUNT_FIRST_LINE = "natedev | claude2 | claude_commands | 182,340 | Opus 5.5 high"
 
 
 class AccountTests(unittest.TestCase):

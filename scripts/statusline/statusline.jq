@@ -87,7 +87,9 @@ def usage($label; $window; $fmt):
 | ([
      machine,
      # A label is a note name; an address never reaches the line.
-     (if $account == "" or ($account | contains("@")) then empty else $account end),
+     (if $account == "" or ($account | contains("@")) then empty
+      elif ($account | test("^claude [0-9]+$")) then $account | sub(" "; "")
+      else $account end),
      $base,
      ((.context_window.total_input_tokens // 0) | commas),
      $m

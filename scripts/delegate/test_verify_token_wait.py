@@ -323,11 +323,24 @@ exec "$TEST_REAL_SLEEP" "$@"
         self.assertGreater(second_wait, first_wait)
 
     def test_killed_verify_holder_is_reclaimed_promptly(self) -> None:
+        sleep = self.root / "stubs" / "sleep"
+        _ = sleep.write_text('''#!/bin/sh
+if [ "$1" = 3 ]; then
+    printf '%s\\n' "$1" >> "$TEST_RECLAIM_POLLS"
+fi
+exec "$TEST_REAL_SLEEP" "$@"
+''')
+        sleep.chmod(0o755)
+        real_sleep = shutil.which("sleep")
+        assert real_sleep is not None
+        polls = self.root / "reclaim-polls"
         board = self.root / "board"
         first_environment = {**self.environment, "PLAN_DELEGATE_BOARD_DIR": str(board),
                              "PLAN_DELEGATE_TEAM_ROLE": "first", "TEST_BLOCK": "1"}
         second_environment = {**self.environment, "PLAN_DELEGATE_BOARD_DIR": str(board),
-                              "PLAN_DELEGATE_TEAM_ROLE": "second"}
+                              "PLAN_DELEGATE_TEAM_ROLE": "second", "TEST_RECLAIM_POLLS": str(polls),
+                              "TEST_REAL_SLEEP": real_sleep}
+        first_environment["TEST_REAL_SLEEP"] = real_sleep
         first = subprocess.Popen(["bash", str(VERIFY), "check", "sample"], cwd=self.root,
                                  env=first_environment, stdout=subprocess.PIPE,
                                  stderr=subprocess.PIPE, text=True, start_new_session=True)
@@ -352,7 +365,7 @@ exec "$TEST_REAL_SLEEP" "$@"
             self.assertEqual(second.returncode, 0, second.stdout + second.stderr)
             records = self.records()
             self.assertEqual(len(records), 1)
-            self.assertLess(cast(int, records[0]["token_wait_s"]), 3)
+            self.assertFalse(polls.exists(), "reclaimed holder must not require a token polling sleep")
             self.assertIn(f"token cargo reclaimed from first: holder pid {first.pid} is gone",
                           (board / "board.log").read_text())
         finally:

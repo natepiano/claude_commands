@@ -841,6 +841,18 @@ def _registered_productions() -> tuple[dict[str, ProductionSession], list[showru
     return found, runners
 
 
+def unregistered_showrunners() -> list[showrunners.Showrunner]:
+    """Each production whose update timer names a session that is not running.
+
+    A showrunner is known only by the session its timer names, so one running under another id
+    without registering reads as a plain session. Empty when the session records cannot be read.
+    """
+    try:
+        return [runner for runner in showrunners.registered_showrunners(_notifier_state_dir()) if not runner["session"]]
+    except OSError:
+        return []
+
+
 def _unit_sessions(runners: list[showrunners.Showrunner]) -> dict[str, UnitMarks]:
     """Each running unit director of a registered production, by session id.
 
@@ -940,6 +952,15 @@ def _newest_unit_plans() -> dict[str, str]:
 def _process_environment(pid: int) -> dict[str, str]:
     if sys.platform == "darwin":
         try:
+            command = subprocess.run(
+                ("ps", "-o", "command=", "-p", str(pid)),
+                capture_output=True,
+                text=True,
+                timeout=5,
+                check=False,
+            )
+            if command.returncode:
+                return {}
             result = subprocess.run(
                 ("ps", "eww", "-o", "command=", "-p", str(pid)),
                 capture_output=True,
@@ -947,11 +968,27 @@ def _process_environment(pid: int) -> dict[str, str]:
                 timeout=5,
                 check=False,
             )
+            if result.returncode:
+                return {}
+            confirmed_command = subprocess.run(
+                ("ps", "-o", "command=", "-p", str(pid)),
+                capture_output=True,
+                text=True,
+                timeout=5,
+                check=False,
+            )
         except (OSError, subprocess.TimeoutExpired):
             return {}
-        if result.returncode:
+        if confirmed_command.returncode or confirmed_command.stdout != command.stdout:
             return {}
-        tokens = result.stdout.split()
+        arguments = command.stdout.rstrip("\r\n").lstrip()
+        with_environment = result.stdout.rstrip("\r\n").lstrip()
+        if not arguments or not with_environment.startswith(arguments):
+            return {}
+        environment_text = with_environment[len(arguments):]
+        if environment_text and not environment_text[0].isspace():
+            return {}
+        tokens = environment_text.split()
         pairs = (token.split("=", 1) for token in tokens if "=" in token)
         return {name: value for name, value in pairs}
     try:

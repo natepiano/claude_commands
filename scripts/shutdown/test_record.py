@@ -197,6 +197,40 @@ class SessionRecordTests(ShutdownTestCase):
         self.assertEqual(record.parse_session_records(json.dumps([first, second])), [first, second])
         self.assertFalse((self.directory / "record.json").exists())
 
+    def test_unit_session_leftover_issues_round_trip_for_both_hosts(self) -> None:
+        for host in ("tmux", "herdr"):
+            with self.subTest(host=host):
+                saved = session_shutdown()
+                saved["stop_issues"] = [record.UnitSessionLeftRunning(
+                    kind="unit session left running", at=NOW, host=host,
+                    session_name="named-unit", cause="stop not confirmed")]
+                self.assertEqual(record.parse_session_records(json.dumps([saved])), [saved])
+
+    def test_old_tmux_leftover_issue_is_normalized_on_read_and_written_canonically(self) -> None:
+        saved = session_shutdown()
+        saved["stop_issues"] = [record.UnitSessionLeftRunning(
+            kind="unit session left running", at=NOW, host="tmux",
+            session_name="old-unit", cause="owner identity lost")]
+        wire = cast(dict[str, object], json.loads(json.dumps(saved)))
+        wire["stop_issues"] = [{"kind": "unit tmux session left running", "at": NOW,
+                               "tmux_session": "old-unit", "cause": "owner identity lost"}]
+        parsed = record.parse_session_records(json.dumps([wire]))[0]
+        self.assertEqual(parsed, saved)
+        self.assertTrue(record.create_session(parsed))
+        stored = cast(dict[str, object], json.loads((self.directory / "sessions/session-1.json").read_text()))
+        self.assertEqual(stored["stop_issues"], saved["stop_issues"])
+        self.assertEqual(record.find_session(saved["login"], "session-1"), saved)
+
+    def test_unit_session_leftover_issue_rejects_an_unknown_host_or_missing_name(self) -> None:
+        for fields in ({"host": "other", "session_name": "unit"}, {"host": "herdr"},
+                       {"host": "herdr", "session_name": 4}, {"session_name": "unit"}):
+            with self.subTest(fields=fields):
+                wire = cast(dict[str, object], json.loads(json.dumps(session_shutdown())))
+                wire["stop_issues"] = [{"kind": "unit session left running", "at": NOW,
+                                       "cause": "stop not confirmed", **fields}]
+                with self.assertRaises(record.InvalidRecord):
+                    _ = record.parse_session_records(json.dumps([wire]))
+
     def test_herdr_hosts_round_trip_for_owners_and_their_seats(self) -> None:
         saved = session_shutdown()
         owner = session()
@@ -880,9 +914,9 @@ class SessionRecordTests(ShutdownTestCase):
                         progress["reason"] = "still running"
                     saved["progress"] = cast(record.SessionProgress, cast(object, progress))
                     if issues:
-                        saved["stop_issues"] = [record.UnitTmuxLeftRunning(
-                            kind="unit tmux session left running", at=NOW,
-                            tmux_session="unit", cause="stop not confirmed")]
+                        saved["stop_issues"] = [record.UnitSessionLeftRunning(
+                            kind="unit session left running", at=NOW,
+                            host="tmux", session_name="unit", cause="stop not confirmed")]
                     self.assertEqual(record.stop_incomplete(saved), kind == "stop failed" or (
                         issues and kind in {"stopped", "already gone", "process identity lost"}))
 
@@ -1063,15 +1097,13 @@ class SessionRecordTests(ShutdownTestCase):
         self.assertEqual(len(outcomes), 1)
         self.assertIsInstance(outcomes[0], record.ConductorAcquired)
 
-    def test_conductor_start_rejects_a_persistent_owner_within_bounded_time(self) -> None:
+    def test_conductor_start_rejects_a_persistent_owner_after_bounded_retries(self) -> None:
         login = "owner@example.com"
         with record.conductor_lock(login):
-            started = time.monotonic()
-            with record.conductor_lock(login) as duplicate:
-                elapsed = time.monotonic() - started
+            with patch.object(time, "sleep") as sleep, record.conductor_lock(login) as duplicate:
                 self.assertIsInstance(duplicate, record.ConductorAlreadyRunning)
-        self.assertGreaterEqual(elapsed, 0.15)
-        self.assertLess(elapsed, 1.0)
+        self.assertEqual(sleep.call_count, 5)
+        self.assertEqual([call.args for call in sleep.call_args_list], [(0.05,)] * 5)
 
 
 if __name__ == "__main__":
