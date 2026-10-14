@@ -340,6 +340,25 @@ class MacRunTests(unittest.TestCase):
         )
         self.assert_claim_released()
 
+    def test_claim_names_the_repository_so_another_repository_runs_beside_it(self) -> None:
+        (self.repository / ".git").mkdir()
+        other = self.root / "other"
+        (other / ".git").mkdir(parents=True)
+        claimed = self.state_command("claim", "--pid", str(os.getpid()), "--what", "other tests",
+                                     "--worktree", str(other))
+        self.assertEqual(claimed.returncode, 0, claimed.stdout + claimed.stderr)
+        claims = self.state_directory / "claims"
+        before = (claims / "other.json").read_bytes()
+        self.clear_events()
+
+        result = self.mac_run()
+
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertGreater(len([event for event in self.events() if event["command"] in {"ssh", "scp"}]), 1)
+        self.assertEqual(sorted(path.name for path in claims.iterdir()), ["other.json"])
+        self.assertEqual((claims / "other.json").read_bytes(), before)
+        self.assert_claim_released()
+
     def test_success_releases_claim(self) -> None:
         result = self.mac_run()
 
