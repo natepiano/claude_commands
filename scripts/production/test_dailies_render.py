@@ -4,6 +4,10 @@
 from __future__ import annotations
 
 import json
+import sys
+import signal
+import dailies_render
+from cli_fixture import invoke_cli
 import os
 import subprocess
 import tempfile
@@ -97,7 +101,7 @@ def holder(release: str = "unknown", name: str = "frame-time", since: str = "202
     return {"holder": name, "since": since, "for": purpose, "release_eta": release}
 
 
-def run(arguments: list[str], scratch: str, holders: list[dict[str, str]] | None = None) -> Run:
+def run(arguments: list[str], scratch: str, holders: list[dict[str, str]] | None = None, *, subprocess_cli: bool = False) -> Run:
     # HOME puts the renderer's AGENTS_DIR and READINGS_LOG under this test directory.
     (Path(scratch) / "rust/hanadocs/agents").mkdir(parents=True, exist_ok=True)
     (Path(scratch) / ".local/state/agent-notes").mkdir(parents=True, exist_ok=True)
@@ -105,14 +109,15 @@ def run(arguments: list[str], scratch: str, holders: list[dict[str, str]] | None
     hold_dir.mkdir(exist_ok=True)
     for index, record in enumerate(holders or []):
         _ = (hold_dir / f"holder-{index}").write_text(json.dumps(record) + "\n")
-    result = subprocess.run(
-        ["python3", str(SCRIPT), *arguments],
-        capture_output=True,
-        text=True,
-        check=False,
-        env={**os.environ, "HOME": scratch, "BUILD_HOLD_DIR": str(hold_dir),
-             "MAC_TEST_STATE_DIR": str(Path(scratch) / "mac-test")},
-    )
+    environment = {**os.environ, "HOME": scratch, "BUILD_HOLD_DIR": str(hold_dir),
+                   "MAC_TEST_STATE_DIR": str(Path(scratch) / "mac-test")}
+    if subprocess_cli:
+        result = subprocess.run([sys.executable, str(SCRIPT), *arguments], env=environment,
+                                capture_output=True, text=True, check=False, timeout=300)
+    else:
+        result = invoke_cli(dailies_render, lambda: dailies_render.main(arguments), arguments,
+                            environment, Path(scratch), production_state=True)
+
     return Run(result.returncode, result.stdout.splitlines(), result.stderr)
 
 
@@ -150,6 +155,71 @@ class ReportFooterTests(unittest.TestCase):
 
     def tail(self, result: Run) -> list[str]:
         return after_timeline(self.lines(result))
+
+    def test_render_calls_keep_home_configuration_separate_and_restore_the_caller(self) -> None:
+        caller_environment = os.environ.copy()
+        caller_directory = Path.cwd()
+        caller_arguments = sys.argv.copy()
+        caller_path = sys.path.copy()
+        caller_chart = dailies_render.CHART_CONF
+        caller_signals = {sig: signal.getsignal(sig) for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)}
+        with tempfile.TemporaryDirectory() as first, tempfile.TemporaryDirectory() as second:
+            for home, chart in ((first, "ascii"), (second, "default")):
+                result = run(["--chart", chart], home)
+                self.assertEqual(result.code, 0, result.error)
+                self.assertIn(str(Path(home) / ".local/state/showrunner/dailies.conf"), result.error)
+            self.assertIn("ascii", (Path(first) / ".local/state/showrunner/dailies.conf").read_text())
+            self.assertIn("default", (Path(second) / ".local/state/showrunner/dailies.conf").read_text())
+        self.assertEqual(os.environ, caller_environment)
+        self.assertEqual(Path.cwd(), caller_directory)
+        self.assertEqual(sys.argv, caller_arguments)
+        self.assertEqual(sys.path, caller_path)
+        self.assertEqual(dailies_render.CHART_CONF, caller_chart)
+        self.assertEqual({sig: signal.getsignal(sig) for sig in caller_signals}, caller_signals)
+
+    def test_cold_imported_production_paths_return_to_the_callers_home_after_each_case(self) -> None:
+        with tempfile.TemporaryDirectory() as scratch:
+            caller = Path(scratch) / "caller"
+            caller.mkdir()
+            environment = {**os.environ, "HOME": str(caller)}
+            for name in ("SHOWRUNNERS_CONFIG", "NOTIFIER_STATE_DIR", "NOTIFIER_SESSIONS_DIR",
+                         "SHOWRUNNER_STATE_DIR", "SHOWRUNNERS_SESSIONS", "SHOWRUNNERS_SEND"):
+                _ = environment.pop(name, None)
+            program = '''import os, sys
+from pathlib import Path
+from types import ModuleType
+sys.path.insert(0, str(Path.cwd()))
+from cli_fixture import invoke_cli
+assert "showrunners" not in sys.modules
+assert "dailies_render" not in sys.modules
+caller = Path.home()
+caller_path = sys.path.copy()
+command = ModuleType("fixture_command")
+command.__file__ = "fixture_command.py"
+def paths(home):
+    import dailies_render, showrunners
+    assert dailies_render.CHART_CONF == home / ".local/state/showrunner/dailies.conf"
+    assert dailies_render.AGENTS_DIR == home / "rust/hanadocs/agents"
+    assert dailies_render.READINGS_LOG == home / ".local/state/agent-notes/readings.jsonl"
+    assert showrunners.NOTIFIER_STATE_DIR == home / ".local/state/notifier"
+    assert showrunners.SESSIONS_DIR == home / ".claude/sessions"
+    assert showrunners.SHOWRUNNER_STATE_DIR == home / ".local/state/showrunner"
+for name in ("first", "second"):
+    home = caller.parent / name
+    home.mkdir()
+    def main():
+        paths(home)
+        return 0
+    result = invoke_cli(command, main, [], {**os.environ, "HOME": str(home)}, home,
+                        production_state=True)
+    assert result.returncode == 0, result.stderr
+    assert Path.home() == caller
+    assert sys.path == caller_path
+    paths(caller)
+'''
+            result = subprocess.run([sys.executable, "-c", program], env=environment,
+                                    cwd=SCRIPT.parent, capture_output=True, text=True, timeout=300)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
     def test_counts_print_on_one_line_above_the_chart_in_every_length(self) -> None:
         counts = [{"label": "nightly queue", "count": 8}, {"label": "proposals", "not_found": True}]
@@ -494,7 +564,7 @@ class TimelineWindowTests(unittest.TestCase):
             _ = input_path.write_text(json.dumps(fields))
             for chart, marker in (("default", "🟦"), ("ascii", "● ")):
                 with self.subTest(chart=chart):
-                    result = run([str(input_path), "--at", AT, "--chart", chart], scratch)
+                    result = run([str(input_path), "--at", AT, "--chart", chart], scratch, subprocess_cli=True)
                     self.assertEqual(result.code, 0, result.error)
                     row = next(line for line in timeline(result.lines) if line.startswith("widget"))
                     self.assertIn(marker, row)
