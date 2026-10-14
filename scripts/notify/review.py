@@ -9,8 +9,10 @@ import importlib
 import json
 import math
 import os
+import pwd
 import re
 import shlex
+import shutil
 import subprocess
 import sys
 import time
@@ -121,10 +123,40 @@ class TranscriptReply:
 
 
 @dataclass(frozen=True)
+class ResolvedReviewerBinary:
+    path: Path
+
+
+@dataclass(frozen=True)
+class MissingReviewerBinary:
+    paths_tried: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class ReviewerNotResolved:
+    pass
+
+
+def reviewer_binary() -> ResolvedReviewerBinary | MissingReviewerBinary:
+    on_path = shutil.which("claude")
+    user = os.environ.get("USER") or pwd.getpwuid(os.getuid()).pw_name
+    candidates = ([Path(on_path)] if on_path else []) + [
+        Path.home() / ".local/bin/claude",
+        Path("/etc/profiles/per-user") / user / "bin/claude",
+        Path("/run/current-system/sw/bin/claude"),
+    ]
+    for path in candidates:
+        if path.is_file() and os.access(path, os.X_OK):
+            return ResolvedReviewerBinary(path.absolute())
+    return MissingReviewerBinary(("PATH: claude", *(str(path) for path in candidates)))
+
+
+@dataclass(frozen=True)
 class ReviewMetadata:
     seconds: float = 0.0
     account: str = "default"
     model: str = "opus"
+    binary: ResolvedReviewerBinary | MissingReviewerBinary | ReviewerNotResolved = ReviewerNotResolved()
 
 
 DEFAULT_METADATA = ReviewMetadata()
@@ -281,6 +313,7 @@ class ReviewRecord(TypedDict):
     seconds: float
     account: str
     model: str
+    binary: NotRequired[str]
     replay: NotRequired[bool]
     dry: NotRequired[bool]
     detail: NotRequired[str]
@@ -523,9 +556,10 @@ def _review(draft: Draft, revision: bool, runner: ProcessRunner,
     started = time.monotonic()
     account, model = "default", "opus"
     timeout = 60.0
+    binary: ResolvedReviewerBinary | MissingReviewerBinary | ReviewerNotResolved = ReviewerNotResolved()
 
     def details() -> ReviewMetadata:
-        return ReviewMetadata(time.monotonic() - started, account, model)
+        return ReviewMetadata(time.monotonic() - started, account, model, binary)
 
     def remaining() -> float:
         return max(0.001, timeout - (time.monotonic() - started))
@@ -535,6 +569,9 @@ def _review(draft: Draft, revision: bool, runner: ProcessRunner,
         if not GUIDE.is_dir():
             return Unreviewed("no guide", details())
         environment, account = reviewer_environment()
+        binary = reviewer_binary()
+        if isinstance(binary, MissingReviewerBinary):
+            return Unreviewed("no claude binary: " + ", ".join(binary.paths_tried), details())
         guide = runner(["zsh", str(LOADER), "--guide", str(GUIDE), "--tags", "reply,all" if isinstance(context, ReplyContext) else "push,all"],
                        timeout=remaining(), env=environment)
         if guide.returncode != 0 or not guide.stdout.strip():
@@ -555,7 +592,7 @@ def _review(draft: Draft, revision: bool, runner: ProcessRunner,
             draft_prompt = (f"Reply date: {context.date.isoformat()}\n"
                             f"Previous reply:\n{context.previous_reply or '(none)'}\n"
                             f"Current reply:\n{draft.body}")
-        command = ["claude", "-p", "--model", model, "--effort", effort,
+        command = [str(binary.path), "-p", "--model", model, "--effort", effort,
                    "--system-prompt", guide.stdout + "\n" + prompt,
                    "--json-schema", json.dumps(SCHEMA), "--output-format", "json",
                    "--tools", "", "--no-session-persistence", "--setting-sources", "", draft_prompt]
@@ -616,6 +653,8 @@ def log_review(draft: Draft, outcome: ReviewOutcome, sent: Delivery = NOT_SENT, 
         "sent": message_record(sent.draft) if isinstance(sent, Sent) else None,
         "seconds": metadata.seconds, "account": metadata.account, "model": metadata.model,
     }
+    if isinstance(metadata.binary, ResolvedReviewerBinary):
+        entry["binary"] = str(metadata.binary.path)
     if isinstance(outcome, (Rewritten, Questions, Unreviewed)) and outcome.failures:
         entry["failures"] = [{"rule": failure.rule, "quote": failure.quote} for failure in outcome.failures]
     if replay:
