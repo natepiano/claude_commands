@@ -1380,6 +1380,18 @@ class RestartTests(ShutdownTestCase):
         self.assertIn('--standby', argv)
         self.assertNotIn('--plan', argv)
 
+    def test_permanent_unit_without_a_run_record_resumes_as_permanent(self) -> None:
+        doc = self.root / 'production.md'
+        _ = doc.write_text('\n'.join(['# Demo', '', '## Units', '', '| Unit | Plan | Worktree | Branch | Port | Owns |', '| --- | --- | --- | --- | --- | --- |', '| nightly-review-unit | permanent | /w/nightly | demo-nightly-review | — | — |', '']), encoding='utf-8')
+        moved = entry(unit('nightly-review', doc=str(doc), plan=inventory.NoRunRecord(kind='no run record')))
+        self.create(records_for_test([moved]))
+        output = io.StringIO()
+        with patch.object(restart, '_live_session_ids', return_value=frozenset()), patch.object(settle, 'record_time', return_value=RESTARTED), redirect_stdout(output):
+            self.assertEqual(restart.up(LOGIN, dry_run=True), 0)
+        argv = next((shlex.split(line) for line in output.getvalue().splitlines() if 'add_unit.py' in line))
+        self.assertIn('--permanent', argv)
+        self.assertNotIn('--standby', argv)
+
     def test_brief_unit_without_a_run_record_resumes_with_its_stub_plan(self) -> None:
         doc = self.root / 'production.md'
         _ = doc.write_text('\n'.join(['# Demo', '', '## Units', '', '| Unit | Plan | Worktree | Branch | Port | Owns |', '| --- | --- | --- | --- | --- | --- |', '| notes-unit | docs/plans/demo-notes.md | /w/notes | demo-notes | — | — |', '']), encoding='utf-8')

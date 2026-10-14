@@ -1074,6 +1074,12 @@ Before the mover stops one of your units, you get one line from `shutdown`:
 it stays stopped until the user restarts it. One more line follows:
 `<unit> is back on <account>`, or `<unit> did not come back: <reason>`. The user
 is told of a failure; you hold the unit's work until it is back.
+
+To move a session yourself, or stop one to change its account, run
+`/showrunner:move`: it pauses the session first and proves the account it comes
+back on. Never send `/exit` into a pane, run `shutdown.py now`, kill a Claude
+process or resume `claude` with a `CLAUDE_CONFIG_DIR` by hand; a hook refuses
+each in your session.
 </PauseForMove>
 
 <QuotaAlert>
@@ -1118,7 +1124,8 @@ every unit director.
 When every unit's final-gate and as-built checkpoints are merged:
 
 With a **Review pool** line, exclude `review-unit`'s standing phase from
-that condition.
+that condition. A unit whose Plan cell is `permanent` (the nightly review) is
+outside it too: wrap neither waits on it nor retires its worktree or branch.
 
 1. Run a final <CIPoint/> and all <PromoteMain/> checks on its exact sha:
    local validation, smoke launch and GitHub CI verdict, then the promotion

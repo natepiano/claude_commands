@@ -108,6 +108,9 @@ def units(lines: list[str], production: Production) -> tuple[UnitRow, ...]:
         row = {heading: cell_value(cell) for heading, cell in cells.items()}
         if not all(heading in row for heading in ("Unit", "Plan", "Worktree", "Branch", "Port", "Owns")):
             raise LifecycleStop("input", "failed", f"invalid Units row: {cells}")
+        # A permanent unit outlives the production: wrap neither waits on it nor retires it.
+        if row["Plan"] == "permanent":
+            continue
         plan = Path(row["Plan"]).expanduser()
         parsed.append(UnitRow(row["Unit"], plan if plan.is_absolute() else production.checkout / plan,
                               Path(row["Worktree"]).expanduser(), row["Branch"]))

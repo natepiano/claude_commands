@@ -12,7 +12,7 @@ import time
 from dataclasses import dataclass, replace
 from datetime import datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, NamedTuple, cast
+from typing import TYPE_CHECKING, NamedTuple, cast, override
 from zoneinfo import ZoneInfo
 
 SCRIPTS = Path(__file__).resolve().parents[1]
@@ -48,7 +48,38 @@ class BriefGiven(NamedTuple):
 
 
 class Standby(NamedTuple):
+    # A permanent unit is a standby unit that wrap never retires.
+    permanent: bool = False
+
+
+class StandardLaunch(NamedTuple):
     pass
+
+
+class ProfiledLaunch(NamedTuple):
+    """A unit that runs outside its worktree, with flags of its own and one more line of duty."""
+
+    cwd: Path
+    flags: tuple[str, ...]
+    duty: str
+
+
+LaunchProfile = StandardLaunch | ProfiledLaunch
+NIGHTLY_REVIEW_UNIT = "nightly-review-unit"
+
+
+def launch_profile(unit: str) -> LaunchProfile:
+    """The nightly review reads every repository from ~/rust under its own read-only settings."""
+    if unit != NIGHTLY_REVIEW_UNIT:
+        return StandardLaunch()
+    home = Path.home()
+    return ProfiledLaunch(
+        home / "rust",
+        ("--add-dir", "/etc/nixos", "--add-dir", str(home / ".claude"),
+         "--settings", str(SCRIPTS / "nightly_review" / "settings.json")),
+        "You run read-only from ~/rust; your worktree holds no work. Each night the nightly timer sends you "
+        + "the night's review: follow ~/.claude/commands/nightly_review.md for the night and modes it names.",
+    )
 
 
 class NewSession(NamedTuple):
@@ -133,18 +164,32 @@ class UnitLaunchConfiguration:
 
     @property
     def plan_cell(self) -> str:
-        return "standby" if isinstance(self.plan, Standby) else self.plan_path.as_posix()
+        if isinstance(self.plan, Standby):
+            return "permanent" if self.plan.permanent else "standby"
+        return self.plan_path.as_posix()
 
     @property
     def mode_name(self) -> str:
         if isinstance(self.plan, PlanGiven):
             return "plan"
-        return "brief" if isinstance(self.plan, BriefGiven) else "standby"
+        return "brief" if isinstance(self.plan, BriefGiven) else self.plan_cell
+
+    @property
+    def profile(self) -> LaunchProfile:
+        return launch_profile(self.unit_id)
+
+    @property
+    def unit_id(self) -> str:
+        raise NotImplementedError
 
     @property
     def session_cwd(self) -> Path:
-        """Where the session runs: a resumed one where its transcript lives, a new one in the worktree."""
-        return self.session.cwd if isinstance(self.session, ResumedSession) else self.worktree
+        """Where the session runs: a resumed one where its transcript lives, a new one in the worktree
+        or where its launch profile names."""
+        if isinstance(self.session, ResumedSession):
+            return self.session.cwd
+        profile = self.profile
+        return profile.cwd if isinstance(profile, ProfiledLaunch) else self.worktree
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -152,10 +197,20 @@ class RequestedUnitLaunch(UnitLaunchConfiguration):
     requested_name: str
     unit: str
 
+    @property
+    @override
+    def unit_id(self) -> str:
+        return self.unit
+
 
 @dataclass(frozen=True, kw_only=True)
 class UnitLaunch(UnitLaunchConfiguration):
     identity: UnitIdentity
+
+    @property
+    @override
+    def unit_id(self) -> str:
+        return self.identity.unit
 
 
 class ReadyToLaunch(NamedTuple):
@@ -259,8 +314,9 @@ def launch_request(args: argparse.Namespace) -> RequestedUnitLaunch:
     given_plan = cast(str | None, args.plan)
     given_brief = cast(str | None, args.brief)
     standby = cast(bool, args.standby)
-    if sum((given_plan is not None, given_brief is not None, standby)) != 1:
-        raise Refusal("give exactly one of --plan, --brief, or --standby")
+    permanent = cast(bool, args.permanent)
+    if sum((given_plan is not None, given_brief is not None, standby, permanent)) != 1:
+        raise Refusal("give exactly one of --plan, --brief, --standby, or --permanent")
     kebab = name.replace("_", "-")
     # The slug names the branch, as it names the production's plans; the merge branch may differ.
     branch = f"{production.slug}-{kebab}"
@@ -273,7 +329,7 @@ def launch_request(args: argparse.Namespace) -> RequestedUnitLaunch:
         assert given_brief is not None
         plan = BriefGiven(given_brief, stub_plan(production, branch))
     else:
-        plan = Standby()
+        plan = Standby(permanent)
     resumed = cast(str | None, args.resume)
     cwd = cast(str | None, args.cwd)
     restart_note = cast(str | None, args.restart_note)
@@ -291,7 +347,10 @@ def launch_request(args: argparse.Namespace) -> RequestedUnitLaunch:
     if (resumed is None) != (cwd is None):
         raise Refusal("--resume and --cwd must be given together")
     if resumed is not None and isinstance(plan, BriefGiven):
-        raise Refusal("--resume requires --plan or --standby")
+        raise Refusal("--resume requires --plan, --standby, or --permanent")
+    adopt = cast(str | None, args.adopt)
+    if adopt is not None and (not isinstance(plan, Standby) or resumed is not None):
+        raise Refusal("--adopt takes --standby or --permanent and no --resume: a session it adopts is already running")
     session: NewSession | ResumedSession = (ResumedSession(resumed, Path(cwd).expanduser().resolve())
                                             if resumed is not None and cwd is not None else NewSession())
     launch_kind: NewWorkLaunch | UnitRestoreLaunch
@@ -472,10 +531,11 @@ def recorded_mode(request: UnitLaunch, row: ExistingUnitRow) -> str:
     subjects = git(request.production, "log", "--format=%s", "--", str(
         request.production.doc.relative_to(request.production.checkout))).stdout.splitlines()
     for subject in subjects:
-        if subject in (subject_prefix + "plan)", subject_prefix + "brief)", subject_prefix + "standby)"):
+        if subject in (subject_prefix + "plan)", subject_prefix + "brief)", subject_prefix + "standby)",
+                       subject_prefix + "permanent)"):
             return subject.removeprefix(subject_prefix).removesuffix(")")
-    if row.plan == "standby":
-        return "standby"
+    if row.plan in ("standby", "permanent"):
+        return row.plan
     stub = request.production.checkout / stub_plan(request.production, request.branch)
     if stub.exists() and request.plan_path == stub.relative_to(request.production.checkout):
         if "## Source\n\n" in stub.read_text(encoding="utf-8"):
@@ -686,9 +746,13 @@ def prompt_for(request: UnitLaunch) -> str:
                   f"~/.claude/scripts/production/showrunners.py address {production.slug}` prints (look it up "
                   "before each message: it changes when the showrunner restarts)")
     if isinstance(request.plan, Standby):
+        profile = request.profile
+        kept = " You are permanent: wrap never retires you." if request.plan.permanent else ""
+        place = (f" {profile.duty} Do nothing until it or the showrunner sends you work." if isinstance(profile, ProfiledLaunch)
+                 else f" Work only in your worktree {request.worktree}, branch {request.branch}. "
+                 + "Do nothing until the showrunner sends you work.")
         prompt = (f"You are {request.identity.unit} in production {production.slug} (doc {doc}), under "
-                  f"{showrunner}, on standby. Work only in your worktree "
-                  f"{request.worktree}, branch {request.branch}. Do nothing until the showrunner sends you work.")
+                  f"{showrunner}, on standby.{kept}{place}")
         if isinstance(request.launch_kind, UnitRestoreLaunch):
             prompt += " " + request.launch_kind.note.read_text(encoding="utf-8").rstrip("\n")
         return prompt
@@ -745,8 +809,9 @@ def launch_session(
     tmux_session = (request.launch_kind.host_session
                     if isinstance(request.launch_kind, UnitRestoreLaunch)
                     else request.identity.session)
-    argv.extend(["--remote-control", session_name, "-n", session_name,
-                 "--settings", '{"disableAgentView": true}', prompt])
+    profile = request.profile
+    flags = profile.flags if isinstance(profile, ProfiledLaunch) else ("--settings", '{"disableAgentView": true}')
+    argv.extend(["--remote-control", session_name, "-n", session_name, *flags, prompt])
     prefix = account_prefix(selected)
     if target:
         argv = [sys.executable, str(SCRIPTS / "accounts" / "accounts.py"), "exec", target, *argv[1:]]
@@ -868,6 +933,65 @@ def model_for_resume(request: RequestedUnitLaunch, explicit: str = "") -> str:
     return ""
 
 
+@dataclass(frozen=True)
+class Adoptable:
+    """A running session that becomes the unit where it is, on the account it runs on."""
+
+    label: str
+    claude: unit_lookup.LiveClaude
+    account: ClaudeLaunchAccount
+
+
+@dataclass(frozen=True)
+class AlreadyAdopted:
+    label: str
+
+
+def adoptable(request: RequestedUnitLaunch, label: str) -> Adoptable | AlreadyAdopted:
+    from scripts.accounts import accounts
+    from scripts.whoami.account import process_config_dir
+
+    found = launched_unit(request)
+    if isinstance(found, MarkedUnitFound):
+        if found.unit.label == label:
+            return AlreadyAdopted(label)
+        raise Refusal(f"{request.unit} already runs in {found.unit.label}")
+    taken = [f"{unit} of {slug}" for slug, units in unit_lookup.every_marked_unit().units.items()
+             for unit, marked in units.items() if marked.label == label]
+    if taken:
+        raise Refusal(f"tmux session {label} is already {taken[0]}")
+    claude = unit_lookup.tmux_claude(label)
+    if not isinstance(claude, unit_lookup.LiveClaude):
+        reason = claude.reason if isinstance(claude, unit_lookup.ClaudeUnknown) else "no Claude runs in it"
+        raise Refusal(f"tmux session {label} cannot be adopted: {reason}")
+    directory = process_config_dir(claude.pid)
+    if directory is None:
+        raise Refusal(f"tmux session {label} cannot be adopted: the account of pid {claude.pid} is unreadable")
+    if directory.resolve() == accounts.main_config_dir().resolve():
+        return Adoptable(label, claude, accounts.DefaultAccount())
+    named = next((item for item in accounts.checked_named_accounts() if item.dir.resolve() == directory.resolve()), None)
+    if named is None:
+        raise Refusal(f"tmux session {label} cannot be adopted: it runs on {directory}, which is no account fit to launch")
+    return Adoptable(label, claude, named)
+
+
+def adopt_session(request: UnitLaunch, adopted: Adoptable, tmux: str) -> None:
+    """Mark the running session as the unit, record its account, and tell it who it is now."""
+    from scripts.accounts.accounts import DefaultAccount, main_config_dir
+
+    unit_lookup.mark(adopted.label, request.production.slug, request.identity.unit)
+    directory = main_config_dir() if isinstance(adopted.account, DefaultAccount) else adopted.account.dir
+    _ = subprocess.run([tmux, "set-option", "-t", f"={adopted.label}:", "@claude_config_dir", str(directory)],
+                       text=True, capture_output=True, check=True)
+    prompt = prompt_for(request).replace("You are ", "You are now ", 1)
+    sent = subprocess.run([sys.executable, str(SCRIPTS / "message" / "send.py"), "--to", f"uds:{adopted.claude.socket}",
+                           "--from", "add_unit", "--key", f"adopt-{request.identity.unit}", "--text", prompt],
+                          text=True, capture_output=True, check=False)
+    if sent.returncode != 0:
+        raise RuntimeError(f"{adopted.label} is marked as {request.identity.unit}, but its identity was not sent: "
+                           + (sent.stderr.strip() or f"send.py exited {sent.returncode}"))
+
+
 def main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser()
     _ = parser.add_argument("--production", required=True)
@@ -875,6 +999,8 @@ def main(argv: list[str]) -> int:
     _ = parser.add_argument("--plan")
     _ = parser.add_argument("--brief")
     _ = parser.add_argument("--standby", action="store_true")
+    _ = parser.add_argument("--permanent", action="store_true")
+    _ = parser.add_argument("--adopt")
     _ = parser.add_argument("--port", type=int)
     _ = parser.add_argument("--owns")
     _ = parser.add_argument("--timeout", type=float, default=90.0)
@@ -893,7 +1019,13 @@ def main(argv: list[str]) -> int:
         # Table readers import this module from copied trees without accounts.
         from scripts.accounts import accounts
 
-        unit_account = account_for_launch(request, cast(str, args.account), cast(str, args.config_dir))
+        adopt = cast(str | None, args.adopt)
+        adopted = adoptable(request, adopt) if adopt is not None else None
+        if adopted is not None and isinstance(adopted, AlreadyAdopted):
+            print(f"{request.unit} already adopted: tmux attach -t {adopted.label}")
+            return 0
+        unit_account = (adopted.account if adopted is not None
+                        else account_for_launch(request, cast(str, args.account), cast(str, args.config_dir)))
         if isinstance(unit_account, accounts.NamedAccount):
             problems = accounts.check(unit_account.label)
             if problems:
@@ -974,7 +1106,7 @@ def main(argv: list[str]) -> int:
                 if isinstance(request.launch_kind, UnitRestoreLaunch)
                 else request.identity.session
             )
-            if isinstance(marked_unit, NoMarkedUnit) and tmux_live(
+            if adopted is None and isinstance(marked_unit, NoMarkedUnit) and tmux_live(
                 tmux, tmux_session
             ):
                 raise Refusal(
@@ -987,6 +1119,11 @@ def main(argv: list[str]) -> int:
             # A restore resumes in the recorded cwd and creates no worktree or branch.
             if not isinstance(request.launch_kind, UnitRestoreLaunch):
                 ensure_worktree(request)
+            if adopted is not None:
+                adopt_session(request, adopted, tmux)
+                record(request)
+                print(f"{request.identity.unit} adopted: tmux attach -t {adopted.label}")
+                return 0
             if isinstance(marked_unit, NoMarkedUnit):
                 prompt = prompt_for(request)
                 if isinstance(request.launch_kind, UnitRestoreLaunch):
