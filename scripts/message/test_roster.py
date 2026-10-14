@@ -61,6 +61,8 @@ class RosterTests(unittest.TestCase):
 
     @override
     def setUp(self) -> None:
+        # Fixture processes run as this test's own pid: never read the real account it runs on.
+        _ = self.enterContext(mock.patch.object(account, "process_config_dir", return_value=None))
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
         self.home = self.root / "home"
         self.sessions = self.root / "sessions"
