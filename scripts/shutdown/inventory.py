@@ -7,6 +7,7 @@ import json
 import os
 import re
 import shutil
+import shlex
 import socket
 import subprocess
 import sys
@@ -108,14 +109,39 @@ class DesktopNotInSnapshot(TypedDict):
 Desktop = NamedDesktop | DesktopNotInSnapshot
 
 
+class SupervisorIdentity(TypedDict):
+    kind: Literal["supervisor"]
+    pid: int
+    proc_start: str
+
+
+class NoSupervisor(TypedDict):
+    kind: Literal["no supervisor"]
+
+
 class WindowHost(TypedDict):
     kind: Literal["ghostty", "zed"]
     window_shell: int
     desktop: Desktop
+    supervisor: NotRequired[SupervisorIdentity | NoSupervisor]
+
+
+def supervisor_identity(host: WindowHost | TerminalHost) -> SupervisorIdentity | NoSupervisor:
+    """Older inventories and records predate the window supervisor."""
+    return host.get("supervisor", NoSupervisor(kind="no supervisor"))
+
+
+def live_supervisor(host: WindowHost | TerminalHost) -> SupervisorIdentity | NoSupervisor:
+    identity = supervisor_identity(host)
+    if (identity["kind"] == "supervisor" and identity["proc_start"]
+            and _process_start(identity["pid"]) == identity["proc_start"]):
+        return identity
+    return NoSupervisor(kind="no supervisor")
 
 
 class TerminalHost(TypedDict):
     kind: Literal["terminal"]
+    supervisor: NotRequired[SupervisorIdentity | NoSupervisor]
 
 
 class UnknownHost(TypedDict):
@@ -510,13 +536,33 @@ def _parse_host(value: object, place: str, allow_unit: bool) -> Host:
             "desktop": _parse_desktop(
                 _wire_required(data, "desktop", place), f"{place}.desktop"
             ),
+            "supervisor": _parse_supervisor(data.get("supervisor"), f"{place}.supervisor"),
         }
         return cast(WindowHost, cast(object, window))
     if kind == "terminal":
+        if "supervisor" in data:
+            return {"kind": "terminal", "supervisor": _parse_supervisor(
+                data["supervisor"], f"{place}.supervisor")}
         return {"kind": "terminal"}
     if kind == "unknown":
         return {"kind": "unknown"}
     raise InvalidInventory(f"{place}.kind is invalid")
+
+
+def _parse_supervisor(value: object, place: str) -> SupervisorIdentity | NoSupervisor:
+    if value is None:
+        return NoSupervisor(kind="no supervisor")
+    data = _wire_object(value, place)
+    kind = _wire_string(_wire_required(data, "kind", place), f"{place}.kind")
+    if kind == "no supervisor":
+        return NoSupervisor(kind="no supervisor")
+    if kind != "supervisor":
+        raise InvalidInventory(f"{place}.kind is invalid")
+    pid = _wire_integer(_wire_required(data, "pid", place), f"{place}.pid")
+    start = _wire_string(_wire_required(data, "proc_start", place), f"{place}.proc_start")
+    if pid <= 1 or not start:
+        raise InvalidInventory(f"{place} has no process identity")
+    return SupervisorIdentity(kind="supervisor", pid=pid, proc_start=start)
 
 
 def _parse_head(value: object, place: str) -> Head:
@@ -1094,10 +1140,29 @@ def terminal_kind(command: str) -> Literal["ghostty", "zed", "terminal", "unknow
     return "unknown"
 
 
+def _supervisor_process(pid: int) -> SupervisorIdentity | NoSupervisor:
+    try:
+        argv = Path(f"/proc/{pid}/cmdline").read_bytes().decode().rstrip("\0").split("\0")
+    except (OSError, UnicodeError):
+        try:
+            result = subprocess.run(("ps", "-o", "args=", "-p", str(pid)),
+                                    capture_output=True, text=True, timeout=5, check=False)
+            argv = shlex.split(result.stdout) if result.returncode == 0 else []
+        except (OSError, ValueError, subprocess.TimeoutExpired):
+            argv = []
+    if any(Path(argument).name == "relaunch.py" and argv[index + 1:index + 3] == ["run", "--"]
+           for index, argument in enumerate(argv)):
+        start = _process_start(pid)
+        if start:
+            return SupervisorIdentity(kind="supervisor", pid=pid, proc_start=start)
+    return NoSupervisor(kind="no supervisor")
+
+
 def _terminal_host(pid: int, desktop: Desktop) -> SessionHost:
     seen: set[int] = set()
     current = pid
     child = 0
+    supervisor: SupervisorIdentity | NoSupervisor = NoSupervisor(kind="no supervisor")
     for _ in range(64):
         if current <= 1 or current in seen:
             break
@@ -1119,6 +1184,8 @@ def _terminal_host(pid: int, desktop: Desktop) -> SessionHost:
             parent = int(fields[0])
         except ValueError:
             break
+        if current == pid:
+            supervisor = _supervisor_process(parent)
         terminal = terminal_kind(fields[1])
         if terminal != "unknown":
             if terminal in {"ghostty", "zed"} and child > 0:
@@ -1126,9 +1193,13 @@ def _terminal_host(pid: int, desktop: Desktop) -> SessionHost:
                     "kind": terminal,
                     "window_shell": child,
                     "desktop": desktop,
+                    "supervisor": (supervisor if supervisor.get("pid") != child
+                                   else NoSupervisor(kind="no supervisor")),
                 }
                 return cast(WindowHost, cast(object, window))
             if terminal == "terminal":
+                if child > 0 and supervisor["kind"] == "supervisor" and supervisor["pid"] != child:
+                    return {"kind": "terminal", "supervisor": supervisor}
                 return {"kind": "terminal"}
             return {"kind": "unknown"}
         child = current
