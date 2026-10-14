@@ -198,9 +198,10 @@ buildlog_finish_memory() {
 }
 
 # run() returns this when LINT_QUEUE_LEAVE_HOOK (memory_gate.sh) ended the
-# memory wait: the step never started, holds no reservation and leaves no build
-# log row, and BUILDLOG_MEM_WAIT_S keeps the time it waited. run_nextest
-# passes it through. 75 is EX_TEMPFAIL; neither cargo nor nextest exits with it.
+# memory wait: the step never started, holds no reservation, leaves no build
+# log row and takes back build_hold_step_started's mark, and BUILDLOG_MEM_WAIT_S
+# keeps the time it waited. run_nextest passes it through. 75 is EX_TEMPFAIL;
+# neither cargo nor nextest exits with it.
 LINT_LEFT_QUEUE_STATUS=75
 
 run_once() {
@@ -217,6 +218,7 @@ run_once() {
             memory_wait=$(( memory_wait + BUILDLOG_MEM_WAIT_S ))
             if [[ "$BUILDLOG_MEM_OUTCOME" == LeftQueue ]]; then
                 buildlog_release_memory 0
+                [[ -z "${BUILDLOG_HOLD_STARTED_FILE:-}" ]] || rm -f "$BUILDLOG_HOLD_STARTED_FILE"
                 BUILDLOG_MEM_WAIT_S=$memory_wait BUILDLOG_START="" BUILDLOG_TREE=""
                 return "$LINT_LEFT_QUEUE_STATUS"
             fi

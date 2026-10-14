@@ -617,14 +617,20 @@ class QueueLeaveTests(unittest.TestCase):
         return list((self.root / "log/admission").glob("*.reservation"))
 
     def test_hook_leaves_a_held_step_before_it_starts(self) -> None:
-        result = self.run_step("exit 0", ":;")
+        started = self.root / "started"
+        self.environment["BUILDLOG_HOLD_STARTED_FILE"] = str(started)
+        result = self.run_step(f'test -e "{started}"', ":;")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout.splitlines()[-1], "75|LeftQueue|")
         self.assertFalse(self.ran.exists())
+        # The hook saw the started mark; leaving takes it back.
         self.assertEqual(self.hook_calls(), 1)
+        self.assertFalse(started.exists())
         self.assertEqual(self.reservations(), [])
         self.assertEqual(self.recorder_actions(), ["key"])
-        self.assertIn("another machine is free after 0 min 0 s: leaving the memory wait\n", result.stderr)
+        # The wait is measured in whole seconds of SECONDS, so a loaded machine
+        # can cross a second between the first check and the leave.
+        self.assertRegex(result.stderr, r"another machine is free after \d+ min \d+ s: leaving the memory wait\n")
 
     def test_step_that_can_start_never_asks_the_hook(self) -> None:
         free = 'printf "MemAvailable: 67108864 kB\\n" > "$BUILDLOG_MEMINFO";'
