@@ -298,8 +298,8 @@ def launch_request(args: argparse.Namespace) -> RequestedUnitLaunch:
         raise Refusal("restart launch flags require --resume")
     if (resumed is None) != (cwd is None):
         raise Refusal("--resume and --cwd must be given together")
-    if resumed is not None and not isinstance(plan, PlanGiven):
-        raise Refusal("--resume requires --plan")
+    if resumed is not None and isinstance(plan, BriefGiven):
+        raise Refusal("--resume requires --plan or --standby")
     session: NewSession | ResumedSession = (ResumedSession(resumed, Path(cwd).expanduser().resolve())
                                             if resumed is not None and cwd is not None else NewSession())
     launch_kind: NewWorkLaunch | UnitRestoreLaunch

@@ -1069,6 +1069,32 @@ class AddUnitTests(ShutdownTestCase):
         self.assertEqual(launches, 0)
         self.assertEqual(writes, 1)
 
+    def test_restart_restore_of_a_standby_unit_moved_to_another_account(self) -> None:
+        directory = self.prepare_unit_account("claude 3")
+        self.commit_prepared_row(self.unit_row(plan="standby"))
+        self.write_shutdown_record(self.shutdown_record("restarting"))
+        prior = self.root / "prior-session"
+        prior.mkdir()
+        note = self.root / "restart-note.txt"
+        _ = note.write_text("Resume this unit.", encoding="utf-8")
+
+        result = self.successful(
+            "alpha", "--standby", "--resume", "session-123", "--cwd", str(prior),
+            "--restart-note", str(note), "--session-name", "recorded-name",
+            "--tmux-session", "recorded-tmux", "--account", "claude 3",
+        )
+
+        self.assertIn("alpha-unit restore launched", result.stdout)
+        self.assertEqual(len(self.events("systemd-run")), 1)
+        self.assertEqual(self.recorded_unit_options("recorded-tmux")["@claude_config_dir"], str(directory))
+        arguments = shlex.split(self.launch_command().removesuffix("; exec zsh"))
+        self.assertEqual(arguments[arguments.index("--resume") + 1], "session-123")
+
+    def test_resume_from_a_brief_is_refused(self) -> None:
+        result = self.cli("alpha", "--brief", "Do it.", "--resume", "session-123", "--cwd", str(self.root))
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("--resume requires --plan or --standby", result.stdout + result.stderr)
+
     def test_standby_launch_records_state_without_writing_a_plan(self) -> None:
         _ = self.successful("alpha", "--standby", "--port", "8123", "--owns", "src/alpha")
         worktree = self.root / "project-alpha"

@@ -592,10 +592,14 @@ def _unit_argv(
     if session["kind"] != "unit" or host["kind"] != "unit":
         raise ValueError("unit launch needs a unit host")
     recorded_plan = host["plan"]
-    if missing_plan:
-        plan = "<plan>"
+    row_plan = _units_row_plan(host["doc"], host["unit"])
+    plan_arguments: list[str]
+    if row_plan == "standby":
+        plan_arguments = ["--standby"]
+    elif missing_plan:
+        plan_arguments = ["--plan", "<plan>"]
     elif recorded_plan["kind"] == "plan":
-        plan = _units_row_plan(host["doc"], host["unit"]) or recorded_plan["path"]
+        plan_arguments = ["--plan", row_plan or recorded_plan["path"]]
     else:
         raise ValueError("unit launch has no run record")
     note_path = _note_path(record, session["session_id"])
@@ -605,8 +609,7 @@ def _unit_argv(
         host["doc"],
         # The recorded id, exactly: add_unit strips one "-unit" before adding its own.
         host["unit"],
-        "--plan",
-        plan,
+        *plan_arguments,
         "--resume",
         session["session_id"],
         "--cwd",
@@ -922,7 +925,8 @@ def _launch_session(
     if session["kind"] == "unit":
         if host["kind"] != "unit":
             raise ValueError("unit session has no unit host")
-        if host["plan"]["kind"] == "no run record":
+        # A standby unit never ran a plan, so it has no run record and needs none.
+        if host["plan"]["kind"] == "no run record" and _units_row_plan(host["doc"], host["unit"]) != "standby":
             _write_note(_note_path(record, session["session_id"]), note, dry_run)
             return ManualRestartRequired(
                 shlex.join(_unit_argv(record, missing_plan=True))

@@ -649,6 +649,19 @@ class RestartTests(ShutdownTestCase):
         argv = next((shlex.split(line) for line in output.getvalue().splitlines() if 'add_unit.py' in line))
         self.assertEqual(argv[argv.index('--plan') + 1], 'docs/as-built/tables.md')
 
+    def test_standby_unit_without_a_run_record_resumes_with_standby(self) -> None:
+        doc = self.root / 'production.md'
+        _ = doc.write_text('\n'.join(['# Demo', '', '## Units', '', '| Unit | Plan | Worktree | Branch | Port | Owns |', '| --- | --- | --- | --- | --- | --- |', '| gate-unit | standby | /w/gate | demo-gate | — | — |', '']), encoding='utf-8')
+        moved = entry(unit('gate', doc=str(doc), plan=inventory.NoRunRecord(kind='no run record')))
+        self.create(records_for_test([moved]))
+        output = io.StringIO()
+        with patch.object(restart, '_live_session_ids', return_value=frozenset()), patch.object(settle, 'record_time', return_value=RESTARTED), redirect_stdout(output):
+            self.assertEqual(restart.up(LOGIN, dry_run=True), 0)
+        self.assertNotIn('manual restart', output.getvalue())
+        argv = next((shlex.split(line) for line in output.getvalue().splitlines() if 'add_unit.py' in line))
+        self.assertIn('--standby', argv)
+        self.assertNotIn('--plan', argv)
+
     def test_dry_run_without_target_keeps_recorded_dir_for_every_host(self) -> None:
         config_dir = str(self.root / "account with 'quotes' and $()")
         restored_entries = [entry(showrunner('named-showrunner')), entry(top_level('named-tmux', host=tmux_host('named-tmux-host'))), entry(top_level('named-terminal', host=inventory.TerminalHost(kind='terminal'))), entry(top_level('named-window', host=inventory.WindowHost(kind='ghostty', window_shell=10, desktop=inventory.DesktopNotInSnapshot(kind='not in snapshot')))), entry(top_level('named-manual')), entry(unit('named-unit'))]
