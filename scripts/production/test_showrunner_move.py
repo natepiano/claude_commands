@@ -20,6 +20,7 @@ from scripts.shutdown.record import SessionShutdown
 UNIT = "aaaaaaaa-0000-0000-0000-000000000001"
 TARGET = Path("/home/someone/.claude1")
 SINCE = "2026-10-14T10:00:00+00:00"
+PROVEN = Proven(4242, TARGET)
 
 
 def confirmed(session_id: str, at: str = "2026-10-14T10:05:00+00:00") -> MoveEntry:
@@ -75,26 +76,50 @@ class SettleTest(unittest.TestCase):
             self.assertEqual(showrunner_move.settle(Started(UNIT, "me"), TARGET, SINCE, 0.0), MovesItself())
 
 
-class UnitsTest(unittest.TestCase):
-    def test_units_are_this_showrunners_live_units_on_the_source(self) -> None:
-        def claude(session_id: str, pid: int) -> showrunner_move.unit_lookup.MarkedUnit:
-            return showrunner_move.unit_lookup.MarkedUnit(session_id, "label", showrunner_move.unit_lookup.LiveClaude(
-                session_id, session_id, "/sock", pid), showrunner_move.unit_lookup.TmuxPlace("pane"))
-        marked = {"one": claude("on-three", 1), "two": claude("on-one", 2),
-                  "three": showrunner_move.unit_lookup.MarkedUnit("three", "label", showrunner_move.unit_lookup.ClaudeNotRunning(),
-                                                                  showrunner_move.unit_lookup.TmuxPlace("pane"))}
-        folders = {1: Path("/home/someone/.claude3"), 2: TARGET}
-        with patch("showrunner_move.showrunners.own_slug", return_value="build-followups"), \
-             patch("showrunner_move.unit_lookup.marked_units", return_value=marked) as units, \
-             patch("showrunner_move.accounts.account_dir", return_value=Path("/home/someone/.claude3")), \
-             patch("showrunner_move.account.process_config_dir", side_effect=folders.get):
-            self.assertEqual(showrunner_move.own_units("claude 3"), ["on-three"])
-            self.assertEqual(showrunner_move.own_units(""), ["on-three", "on-one"])
-        units.assert_called_with("build-followups")
+class GroupTest(unittest.TestCase):
+    def run_group(self, argv: list[str], moved: object, outcome: showrunner_move.Outcome = PROVEN) -> tuple[int, str]:
+        output = io.StringIO()
+        with patch("showrunner_move.accounts.move_group", return_value=moved) as move_group, \
+             patch("showrunner_move.accounts.account_dir", return_value=TARGET), \
+             patch("showrunner_move.sessions.live_sessions", return_value=live()), \
+             patch.object(showrunner_move, "settle", return_value=outcome) as settle, redirect_stdout(output):
+            code = showrunner_move.main(argv)
+        move_group.assert_called_once_with(argv[0], "claude 1", dry_run="--dry-run" in argv, why="")
+        if not isinstance(moved, accounts.GroupMoveStarted | accounts.GroupMoveStartFailed):
+            settle.assert_not_called()
+        return code, output.getvalue()
 
-    def test_a_session_running_no_production_has_no_units(self) -> None:
-        with patch("showrunner_move.showrunners.own_slug", return_value=""):
-            self.assertRaises(accounts.AccountsError, showrunner_move.own_units, "")
+    def test_each_moved_member_is_proven(self) -> None:
+        code, text = self.run_group(["units", "claude 1"], accounts.GroupMoveStarted((UNIT,), "claude 1", "", "", 0))
+        self.assertEqual((code, text), (0, f"nightly-review: on claude 1, proven (pid 4242 runs on {TARGET})\n"))
+
+    def test_a_group_already_on_its_account_is_a_note_and_exits_zero(self) -> None:
+        code, text = self.run_group(["units", "claude 1"],
+                                    accounts.GroupMoveStarted((), "claude 1", "units: no live session moves\n", "", 0))
+        self.assertEqual((code, text), (0, "units: no live session moves\n"))
+
+    def test_an_unregistered_showrunner_left_where_it_is_exits_one(self) -> None:
+        skipped = ("other: no session runs under the id its update timer names; a showrunner running under another id "
+                   + "is not moved until it runs `update_registration.py register --production /p.md`")
+        code, text = self.run_group(["showrunners", "claude 1"],
+                                    accounts.GroupMoveStarted((UNIT,), "claude 1", skipped + "\n", "", 0))
+        self.assertEqual(code, 1)
+        self.assertEqual(text.splitlines(), [skipped, f"nightly-review: on claude 1, proven (pid 4242 runs on {TARGET})"])
+
+    def test_a_refused_member_is_named_with_the_shutdown_reason(self) -> None:
+        code, text = self.run_group(["units", "claude 1"],
+                                    accounts.GroupMoveStartFailed((UNIT,), "claude 1", "", "a1b2: already has a shutdown in progress\n", 1))
+        self.assertEqual(code, 1)
+        self.assertEqual(text.splitlines()[0], "units: a1b2: already has a shutdown in progress")
+
+    def test_a_dry_run_prints_the_plan_and_moves_nothing(self) -> None:
+        code, text = self.run_group(["showrunners", "claude 1", "--dry-run"],
+                                    accounts.GroupMoveDryRun((UNIT,), ("showrunners: would select claude 1", f"nightly-review: {UNIT}")))
+        self.assertEqual((code, text), (0, f"showrunners: would select claude 1\nnightly-review: {UNIT}\n"))
+
+    def test_a_refused_group_exits_one_with_its_reason(self) -> None:
+        code, text = self.run_group(["units", "claude 1"], accounts.MoveRefused("claude 1 has no room"))
+        self.assertEqual((code, text), (1, "units: not moved: claude 1 has no room\n"))
 
 
 class MainTest(unittest.TestCase):

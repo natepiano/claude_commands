@@ -2,12 +2,12 @@
 """Move Claude sessions to another account the one way a showrunner does: pause first, then prove it.
 
     showrunner_move.py session <session id|name> "claude N"|default [--why <text>]
-    showrunner_move.py units "claude N"|default [--from "claude N"] [--why <text>]
-    showrunner_move.py showrunners --from "claude N" "claude N"|default [--why <text>]
+    showrunner_move.py units|showrunners "claude N"|default [--dry-run] [--why <text>]
 
-`units` moves this showrunner's own units. Each move goes through `accounts.py move`: the session is
-asked to pause, stopped at its ready mark and resumed on the target, and a unit's showrunner is told
-before it stops and when it is back. This script then waits for each move to end and checks the
+Units and showrunners are each one group on one account: `units` and `showrunners` select the
+group's account and move every live member that is not on it. Each move goes through
+`accounts.py move`: the session is asked to pause, stopped at its ready mark and resumed on the
+target, and a unit's showrunner is told before it stops and when it is back. This script then waits for each move to end and checks the
 resumed process itself: its CLAUDE_CONFIG_DIR must be the target's. It prints one line a session and
 exits 0 only when every session is proven on the target.
 """
@@ -35,19 +35,16 @@ if TYPE_CHECKING:
     from scripts.shutdown import record
     from scripts.message import sessions
     from scripts.whoami import account
-    from . import showrunners, unit_lookup
 else:
     import account
     import record
     import sessions
-    import showrunners
-    import unit_lookup
 
 WAIT_MINUTES = 20
 POLL_SECONDS = 10.0
 NOT_BACK = frozenset({"restart failed", "manual restart"})
-# The endings of the lines `accounts.move_showrunners` prints for a showrunner it leaves where it is.
-SKIPPED = ("already has a shutdown in progress", "--production", ".md`")
+# The line `accounts.move_group` prints for a showrunner it leaves where it is: one with no running session.
+UNREGISTERED = "update_registration.py register"
 
 
 @dataclass(frozen=True)
@@ -78,7 +75,7 @@ class Started:
 class CommandLine(argparse.Namespace):
     kind: Literal["session", "units", "showrunners"] = "session"
     rest: list[str] = []
-    source: str = ""
+    dry_run: bool = False
     why: str = ""
     wait_minutes: float = WAIT_MINUTES
 
@@ -92,47 +89,29 @@ def live_names() -> dict[str, tuple[str, int]]:
     return {item["sessionId"]: (item["name"], item["pid"]) for item in sessions.live_sessions()}
 
 
-def own_units(source: str) -> list[str]:
-    """The session ids of this showrunner's live units, only those on `source` when it is given."""
-    slug = showrunners.own_slug()
-    if not slug:
-        raise accounts.AccountsError("this session runs no production, so it has no units to move")
-    found = [marked.claude for marked in unit_lookup.marked_units(slug).values()
-             if isinstance(marked.claude, unit_lookup.LiveClaude)]
-    if source:
-        wanted = target_dir(source).resolve()
-        found = [claude for claude in found
-                 if (directory := account.process_config_dir(claude.pid)) is not None and directory.resolve() == wanted]
-    return [claude.session_id for claude in found]
-
-
-def start(options: CommandLine, target: str) -> tuple[list[Started], list[str]]:
-    """Ask for each move; the started sessions and one line for each move refused before it began."""
+def start(options: CommandLine, target: str) -> tuple[list[Started], list[str], list[str]]:
+    """Ask for each move: the started sessions, one line for each session not moved, and the notes."""
     live = live_names()
-    refused: list[str] = []
     if options.kind == "session":
         moved = accounts.move(options.rest[0], target, why=options.why)
         if isinstance(moved, accounts.MoveRefused):
-            return [], [f"{options.rest[0]}: not moved: {moved.reason}"]
+            return [], [f"{options.rest[0]}: not moved: {moved.reason}"], []
         if isinstance(moved, accounts.MoveStartFailed):
-            return [], [f"{options.rest[0]}: not moved: {(moved.stderr or moved.stdout).strip() or 'shutdown refused'}"]
-        ids = [moved.session_id]
-    elif options.kind == "units":
-        results = accounts.move_sessions(tuple(own_units(options.source)), target, why=options.why or "moved by its showrunner")
-        refused = [f"{live.get(item.session_id, (item.session_id, 0))[0]}: not moved: {item.reason}"
-                   for item in results if isinstance(item, accounts.SessionMoveRefused)]
-        ids = [item.session_id for item in results if isinstance(item, accounts.SessionMoveRequested)]
-    else:
-        moved_runners = accounts.move_showrunners(options.source, target, why=options.why)
-        if isinstance(moved_runners, accounts.MoveRefused):
-            return [], [f"showrunners: not moved: {moved_runners.reason}"]
-        if isinstance(moved_runners, accounts.ShowrunnersMoveDryRun):
-            return [], list(moved_runners.lines)
-        refused = [line for line in moved_runners.stdout.splitlines() if line.endswith(SKIPPED)]
-        if isinstance(moved_runners, accounts.ShowrunnersMoveStartFailed):
-            refused += [f"showrunners: {line}" for line in (moved_runners.stderr or moved_runners.stdout).strip().splitlines()]
-        ids = list(moved_runners.session_ids)
-    return [Started(session_id, live.get(session_id, (session_id, 0))[0]) for session_id in ids], refused
+            return [], [f"{options.rest[0]}: not moved: {(moved.stderr or moved.stdout).strip() or 'shutdown refused'}"], []
+        return [Started(moved.session_id, live.get(moved.session_id, (moved.session_id, 0))[0])], [], []
+    group = options.kind
+    moved_group = accounts.move_group(group, target, dry_run=options.dry_run, why=options.why)
+    if isinstance(moved_group, accounts.MoveRefused):
+        return [], [f"{group}: not moved: {moved_group.reason}"], []
+    if isinstance(moved_group, accounts.GroupMoveDryRun):
+        return [], [], list(moved_group.lines)
+    printed = moved_group.stdout.splitlines()
+    refused = [text for text in printed if UNREGISTERED in text]
+    notes = [text for text in printed if text == f"{group}: no live session moves"]
+    if isinstance(moved_group, accounts.GroupMoveStartFailed):
+        refused += [f"{group}: {text}" for text in (moved_group.stderr or moved_group.stdout).strip().splitlines()
+                    if UNREGISTERED not in text and text not in notes]
+    return [Started(session_id, live.get(session_id, (session_id, 0))[0]) for session_id in moved_group.session_ids], refused, notes
 
 
 def _confirmed(session_id: str, since: str) -> bool:
@@ -186,7 +165,7 @@ def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     _ = parser.add_argument("kind", choices=("session", "units", "showrunners"))
     _ = parser.add_argument("rest", nargs="+")
-    _ = parser.add_argument("--from", dest="source", default="")
+    _ = parser.add_argument("--dry-run", action="store_true")
     _ = parser.add_argument("--why", default="")
     _ = parser.add_argument("--wait-minutes", type=float, default=WAIT_MINUTES)
     return parser
@@ -198,25 +177,21 @@ def main(argv: list[str]) -> int:
     wanted_args = 2 if options.kind == "session" else 1
     if len(options.rest) != wanted_args:
         parser.error(f"{options.kind} takes " + ("<session> <target>" if wanted_args == 2 else "<target>"))
-    if options.kind == "showrunners" and not options.source:
-        parser.error("showrunners requires --from \"claude N\"")
-    if options.kind == "session" and options.source:
-        parser.error("--from applies to units and showrunners")
+    if options.kind == "session" and options.dry_run:
+        parser.error("--dry-run applies to units and showrunners")
     target = options.rest[-1]
     since = datetime.now(timezone.utc).isoformat()
     try:
         wanted = target_dir(target)
-        started, lines = start(options, target)
+        started, lines, notes = start(options, target)
         deadline = time.monotonic() + options.wait_minutes * 60
         outcomes = [(item, settle(item, wanted, since, deadline)) for item in started]
     except (accounts.AccountsError, record.InvalidRecord, OSError, ValueError) as error:
         print(f"not moved: {error}", file=sys.stderr)
         return 1
-    lines += [line(item, target, outcome) for item, outcome in outcomes]
-    if not lines:
-        lines = [f"nothing to move to {target}"]
-    print("\n".join(lines))
-    return 0 if outcomes and all(not isinstance(outcome, NotMoved) for _, outcome in outcomes) and len(lines) == len(outcomes) else 1
+    failed = bool(lines) or any(isinstance(outcome, NotMoved) for _, outcome in outcomes)
+    print("\n".join([*notes, *lines, *(line(item, target, outcome) for item, outcome in outcomes)]))
+    return 1 if failed else 0
 
 
 if __name__ == "__main__":
