@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import io
+import fcntl
 import hashlib
 import json
 import os
 import socket
+import subprocess
 import shlex
 import sys
 import tempfile
@@ -15,13 +17,14 @@ import unittest
 from contextlib import AbstractContextManager, redirect_stderr, redirect_stdout
 from datetime import timedelta
 from pathlib import Path
-from typing import cast, override
+from typing import TextIO, cast, override
 from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "shutdown"))
 import send
 import review
+import push_texts
 import postmaster
 from test_postmaster import FakeClock
 import codex_daemon
@@ -1077,17 +1080,136 @@ class SendTests(ShutdownTestCase):
         self.assertEqual(send.pending("user"), "")
         self.assertEqual([entry["to"] for entry in self.log()], ["user", "user"])
 
+    def test_registry_argv_preserves_values_and_blocked_need_across_remote_rendering(self) -> None:
+        rendered = push_texts.RenderedPush("test", "script", "note", "Build stopped", ActionRequired("Choose retry."), "The build stopped.", {"name": "builder=one two"})
+        with mock.patch.object(push_texts, "render", return_value=rendered):
+            options = send.parse(push_texts.user_send_argv(rendered, machine="mac", priority="2")[2:])
+            self.assertEqual(options.need, "blocked")
+            message = send.Message("user", "script", rendered.title, rendered.body, None)
+            with mock.patch.object(send, "run", return_value=(0, "SENT: to the user", "")) as run:
+                self.assertEqual(send.remote(message, "mac", options).outcome, "sent")
+            command = cast(list[str], run.call_args.args[0])[-1]
+            forwarded = shlex.split(command)[3:]
+            remote_options = send.parse(forwarded)
+        self.assertEqual(remote_options.need, "blocked")
+        self.assertEqual(remote_options.text_id, "test")
+        self.assertEqual(remote_options.values, ("name=builder=one two",))
+        self.assertEqual(remote_options.text, rendered.body)
+
+    def test_review_rejection_keeps_held_provenance_locally_and_after_remote_stdout_loss(self) -> None:
+        record = {"title": "Build choice", "action": "Choose retry.", "body": "The build stopped.", "held": True, "reviewed": True, "need": "decision"}
+        for remote in (False, True):
+            _ = (self.root / "sessions/900.json").write_text(json.dumps({"sessionId": "held-test"}))
+            arguments = ["--to", "user", "--from", "test", "--summary", "Build choice", "--need", "decision", "--action", "Choose retry.", "--text", "The build stopped."]
+            if remote:
+                arguments.extend(["--machine", "natedev"])
+            response = (6, "", "send.py: failed push JSON: " + json.dumps(record)) if remote else (6, "pushover: reviewed JSON: " + json.dumps(record), "pushover: not sent: reader-starts-cold")
+            with (mock.patch.dict(os.environ, {"CLAUDE_PID": "900"}), mock.patch.object(send, "run", return_value=response)):
+                result = send.send(local_options(arguments))
+            self.assertEqual(result.outcome, "held")
+            marker = cast(dict[str, object], json.loads((self.root / "notify/failed/held-test.json").read_text()))
+            self.assertIs(marker["held"], True)
+            self.assertIs(marker["reviewed"], True)
+            self.assertNotIn("fallback text:", result.detail)
+
+    def test_template_fix_notice_runs_once_per_id_per_day_without_delaying_the_push(self) -> None:
+        record: dict[str, object] = {"text_id": "quota", "title": "Choose an account", "action": "Choose retry.", "body": "The work stopped.", "failed_rules": ["reader-starts-cold"], "findings": [{"rule": "reader-starts-cold", "quote": "an account"}], "sent_despite_failed_review": True}
+        with mock.patch.object(subprocess, "Popen") as launch:
+            send.template_fix_notice(record)
+            send.template_fix_notice(record)
+            send.template_fix_notice(dict(record, text_id="disk"))
+            self.assertEqual(launch.call_count, 2)
+            command = cast(list[str], launch.call_args.args[0])
+            self.assertEqual(command[2:5], ["template-fix-deliver", "disk", "natedev"])
+            self.assertIn("reader-starts-cold", command[-1])
+            self.assertIn("The work stopped.", command[-1])
+        tomorrow = send.now() + timedelta(days=1)
+        with mock.patch.object(send, "now", return_value=tomorrow), mock.patch.object(subprocess, "Popen") as launch:
+            send.template_fix_notice(record)
+            launch.assert_called_once()
+
+    def test_template_fix_launch_failure_does_not_change_a_successful_registry_delivery(self) -> None:
+        record: dict[str, object] = {"text_id": "quota", "title": "Choose an account", "action": "Choose retry.", "body": "The work stopped.", "failed_rules": ["reader-starts-cold"], "sent_despite_failed_review": True}
+        message = send.Message("user", "script", "Choose an account", "The work stopped.", None)
+        with (mock.patch.object(send, "run", return_value=(0, "pushover: reviewed JSON: " + json.dumps(record), "")),
+              mock.patch.object(subprocess, "Popen", side_effect=OSError("session unavailable")), redirect_stderr(io.StringIO())):
+            result = send.user(message, "decision", ActionRequired("Choose retry."), 145, text_id="quota")
+        self.assertEqual(result.outcome, "sent")
+        self.assertIn("session unavailable", (self.root / "notify/template-fix-errors.jsonl").read_text())
+
+    def test_busy_notice_claim_does_not_wait_or_change_successful_push_delivery(self) -> None:
+        record: dict[str, object] = {"text_id": "quota", "sent_despite_failed_review": True}
+        directory = review.state_path() / "template-fixes"
+        directory.mkdir(parents=True)
+        message = send.Message("user", "script", "Choose an account", "The work stopped.", None)
+        lock_name = hashlib.sha256(b"quota").hexdigest() + ".lock"
+        with (directory / lock_name).open("a") as holder:
+            fcntl.flock(holder, fcntl.LOCK_EX)
+            real_flock = fcntl.flock
+            def require_nonblocking(fd: TextIO, operation: int) -> None:
+                self.assertTrue(operation & fcntl.LOCK_NB, "notice claim could block the delivered push")
+                real_flock(fd, operation)
+            with (mock.patch.object(fcntl, "flock", side_effect=require_nonblocking),
+                  mock.patch.object(send, "run", return_value=(0, "pushover: reviewed JSON: " + json.dumps(record), "")),
+                  mock.patch.object(subprocess, "Popen") as launch):
+                result = send.user(message, "decision", ActionRequired("Choose retry."), 145, text_id="quota")
+            launch.assert_not_called()
+        self.assertEqual(result.outcome, "sent")
+        self.assertEqual([path.name for path in directory.iterdir()], [lock_name])
+
+    def test_busy_template_claim_does_not_drop_a_different_templates_notice(self) -> None:
+        directory = review.state_path() / "template-fixes"
+        real_flock = fcntl.flock
+        contended = False
+        def compete_during_claim(fd: TextIO, operation: int) -> None:
+            nonlocal contended
+            self.assertTrue(operation & fcntl.LOCK_NB)
+            real_flock(fd, operation)
+            if not contended:
+                contended = True
+                send.template_fix_notice({"text_id": "disk"})
+                send.template_fix_notice({"text_id": "quota"})
+        with (mock.patch.object(fcntl, "flock", side_effect=compete_during_claim),
+              mock.patch.object(subprocess, "Popen") as launch):
+            send.template_fix_notice({"text_id": "quota"})
+            send.template_fix_notice({"text_id": "disk"})
+            send.template_fix_notice({"text_id": "quota"})
+            commands = [cast(list[str], call.args[0]) for call in launch.call_args_list]
+            self.assertEqual([command[2:5] for command in commands], [
+                ["template-fix-deliver", "disk", "natedev"],
+                ["template-fix-deliver", "quota", "natedev"],
+            ])
+        stamps = [path.read_text() for path in directory.iterdir() if path.suffix != ".lock"]
+        self.assertCountEqual(stamps, ["disk", "quota"])
+
+    def test_notice_recipient_refusals_are_recorded_with_the_template_id_once(self) -> None:
+        for reason in ("send.py: no roster session has address session:old", "send.py: natedev matches 2 sessions:"):
+            with self.subTest(reason=reason), mock.patch.object(send, "run", return_value=(2, "", reason)) as deliver:
+                self.assertEqual(send.main(["template-fix-deliver", "quota", "natedev", "Fix the quota push today."]), 0)
+                deliver.assert_called_once()
+        entries = [cast(send.TemplateFixErrorRecord, json.loads(line)) for line in (self.root / "notify/template-fix-errors.jsonl").read_text().splitlines()]
+        self.assertEqual([entry["text_id"] for entry in entries], ["quota", "quota"])
+        self.assertIn("no roster session", entries[0]["error"])
+        self.assertIn("matches 2 sessions", entries[1]["error"])
+
+    def test_notice_worker_records_transport_timeout_without_a_retry(self) -> None:
+        with mock.patch.object(send, "run", return_value=(None, "", "")) as deliver:
+            send.deliver_template_fix("quota", "natedev", "Fix the quota push today.")
+            deliver.assert_called_once()
+        entry = cast(send.TemplateFixErrorRecord, json.loads((self.root / "notify/template-fix-errors.jsonl").read_text()))
+        self.assertEqual((entry["text_id"], entry["error"]), ("quota", "timed out"))
+
     def test_user_delivery_wait_uses_the_review_limit_locally_and_across_machines(self) -> None:
         arguments = ["--to", "user", "--from", "script", "--summary", "Build choice",
                      "--action", "Choose retry.", "--text", "The build stopped."]
         with mock.patch.object(review, "review_timeout_seconds", return_value=90):
-            for extra, expected in (([], 115), (["--timeout", "5"], 115),
-                                    (["--timeout", "150"], 150), (["--machine", "natedev"], 155)):
+            for extra, expected in (([], 205), (["--timeout", "5"], 205),
+                                    (["--timeout", "250"], 250), (["--machine", "natedev"], 245)):
                 with self.subTest(extra=extra), mock.patch.object(send, "run", return_value=(0, "SENT: to the user\n", "")) as run:
                     self.assertEqual(send.send(local_options([*arguments, *extra])).outcome, "sent")
                 self.assertEqual(run.call_args.args[2], expected)
                 if "--machine" in extra:
-                    self.assertIn("--timeout 115", cast(list[str], run.call_args.args[0])[-1])
+                    self.assertIn("--timeout 205", cast(list[str], run.call_args.args[0])[-1])
             with mock.patch.object(send, "relay", return_value=send.Result("sent", "fake")) as relay:
                 _ = self.send("--text", "body")
             self.assertEqual(relay.call_args.args[1], 40)

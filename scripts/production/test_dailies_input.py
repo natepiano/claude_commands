@@ -22,6 +22,7 @@ from dailies_input import (Activity, BevyUpgradeUnavailable, Block, ClaudeNotRun
 from unit_lookup import UnitState
 
 
+# Script completion deadlines only bound hangs; startup can be slow under load.
 SCRIPT = Path(__file__).with_name("dailies_input.py")
 RENDERER = SCRIPT.with_name("dailies_render.py")
 CI_POINTS = SCRIPT.with_name("ci_points.py")
@@ -379,13 +380,13 @@ class DailiesInputTests(unittest.TestCase):
     def run_merge_watch(self) -> subprocess.CompletedProcess[str]:
         return subprocess.run([sys.executable, str(CI_POINTS), "watch", "--production", str(self.doc),
                                "--state-dir", str(self.state)], cwd=self.checkout, env=self.env,
-                              capture_output=True, text=True, check=False, timeout=25)
+                              capture_output=True, text=True, check=False, timeout=300)
 
     def run_eta_request(self, phase: str = "Phase 2 of 3: panel labels stay clear") -> subprocess.CompletedProcess[str]:
         return subprocess.run([sys.executable, str(WAITING), "eta-request", ALPHA,
                                "--phase", phase, "--production", str(self.doc),
                                "--state-dir", str(self.state)], cwd=self.checkout, env=self.env,
-                              capture_output=True, text=True, check=False, timeout=25)
+                              capture_output=True, text=True, check=False, timeout=300)
 
     def rename_unit(self, name: str) -> None:
         for path in (self.doc, self.status, self.judgment):
@@ -1466,7 +1467,7 @@ class DailiesInputTests(unittest.TestCase):
                 self.assertEqual(bevy_upgrade_watch(production), BevyUpgradeUnavailable(reason))
                 run.assert_called_once_with(command, capture_output=True, text=True, timeout=30, check=False)
 
-    def test_dailies_first_review_alert_marks_topic_and_merge_watch_repeats(self) -> None:
+    def test_dailies_first_review_alert_logs_once_without_a_phone_push(self) -> None:
         events = self.watch_stubs()
         result = self.run_builder()
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
@@ -1480,20 +1481,11 @@ class DailiesInputTests(unittest.TestCase):
         self.assertNotIn("| phases merged |", later.stdout)
         calls = self.watch_events(events)
         self.assertEqual(sum(row[0] == "review_regime.py" and row[1] == "report" for row in calls), 1)
-        self.assertEqual([row for row in calls if row[0] == "send.py"], [[
-            "send.py", "--to", "user", "--from", "ci_points", "--need", "decision", "--action",
-            "On natedev, read the report. Choose acknowledge or discuss.",
-            "--summary", "Reviewer removal lacks comparison data", "--text",
-            "An extra code reviewer was removed from merge review. "
-            + "The report has no comparable defect counts, so the removal's effect is unknown.\n\n"
-            + "In a terminal on natedev, read:\npython3 ~/.claude/scripts/production/review_regime.py report\n"
-            + "Acknowledge (recommended; work continues either way): "
-            + "rerun with ack instead of report to stop these report notices.\n\n"
-            + "Discuss: raise concerns in the natedev Claude session.",
-        ]])
+        self.assertEqual([row for row in calls if row[0] == "send.py"], [])
+        self.assertIn("| phases merged | 12 |", (self.checkout / "production.log").read_text())
         self.assertEqual((self.checkout / "production.log").read_text().count("review watch"), 1)
 
-    def test_merge_first_review_alert_is_not_repeated_by_dailies(self) -> None:
+    def test_merge_first_review_alert_logs_once_without_a_dailies_phone_push(self) -> None:
         events = self.watch_stubs()
         first = self.run_merge_watch()
         self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
@@ -1505,17 +1497,8 @@ class DailiesInputTests(unittest.TestCase):
         self.assertTrue(watch["needs_user"])
         calls = self.watch_events(events)
         self.assertEqual(sum(row[0] == "review_regime.py" and row[1] == "report" for row in calls), 1)
-        self.assertEqual([row for row in calls if row[0] == "send.py"], [[
-            "send.py", "--to", "user", "--from", "ci_points", "--need", "decision", "--action",
-            "On natedev, read the report. Choose acknowledge or discuss.",
-            "--summary", "Reviewer removal lacks comparison data", "--text",
-            "An extra code reviewer was removed from merge review. "
-            + "The report has no comparable defect counts, so the removal's effect is unknown.\n\n"
-            + "In a terminal on natedev, read:\npython3 ~/.claude/scripts/production/review_regime.py report\n"
-            + "Acknowledge (recommended; work continues either way): "
-            + "rerun with ack instead of report to stop these report notices.\n\n"
-            + "Discuss: raise concerns in the natedev Claude session.",
-        ]])
+        self.assertEqual([row for row in calls if row[0] == "send.py"], [])
+        self.assertIn("| phases merged | 12 |", (self.checkout / "production.log").read_text())
         self.assertEqual((self.checkout / "production.log").read_text().count("review watch"), 1)
 
     def test_judgment_held_and_testing_keep_merge_topic_even_when_pushed(self) -> None:

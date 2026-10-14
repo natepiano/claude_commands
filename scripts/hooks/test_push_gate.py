@@ -32,6 +32,7 @@ assert spec is not None and spec.loader is not None
 class PushGate(Protocol):
     DENIAL: str
     ALREADY_SENT: str
+    HELD_FALLBACK: str
     UNREVIEWED_FALLBACK: str
 
     def main(self, *, clock: Callable[[], float], sleep: Callable[[float], None]) -> None: ...
@@ -60,6 +61,7 @@ class Marker(TypedDict):
     body: str
     message: str
     fallback: str
+    held: NotRequired[bool]
     reviewed: NotRequired[bool]
     need: NotRequired[str]
     held_source: NotRequired[str]
@@ -136,6 +138,19 @@ class PushGateTests(unittest.TestCase):
                 self.assertEqual(response["hookSpecificOutput"]["permissionDecisionReason"], push_gate.UNREVIEWED_FALLBACK)
                 self.assertEqual(errors, "")
                 self.assertFalse(path.exists())
+
+    def test_held_reviewed_fallback_is_consumed_and_denied_without_releasing_other_holds(self) -> None:
+        for machine in ("", "natedev"):
+            path = self.marker()
+            marker = cast(Marker, json.loads(path.read_text()))
+            marker.update(held=True, reviewed=True, need="decision", held_source="writer", held_identity="a" * 64, held_machine=machine)
+            _ = path.write_text(json.dumps(marker))
+            with mock.patch.object(review, "release_if_matches", side_effect=AssertionError("held fallback released hold")):
+                output, errors = self.call()
+            response = cast(Response, json.loads(output))
+            self.assertEqual(response["hookSpecificOutput"]["permissionDecisionReason"], push_gate.HELD_FALLBACK)
+            self.assertEqual(errors, "")
+            self.assertFalse(path.exists())
 
     def test_reviewed_and_blocked_fallbacks_are_allowed_and_consumed(self) -> None:
         for reviewed, need in ((True, "note"), (True, "decision"), (False, "blocked")):

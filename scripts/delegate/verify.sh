@@ -144,6 +144,7 @@ PY="${HOME}/.claude/scripts/lib/py"
 # shellcheck source=/dev/null
 source "$HOME/.claude/scripts/lint/invoke.sh"
 BUILD_TARGETS_SCRIPT="${BUILD_TARGETS_SCRIPT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../build_targets" && pwd)/build_targets.py}"
+LOCAL_RELEASE_WAIT_SCRIPT="${VERIFY_LOCAL_RELEASE_WAIT_SCRIPT:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/local_release_wait.py}"
 
 # A failed step may be a process killed by earlyoom or the kernel. Keep the
 # journal query here so tests can put a journalctl stub first on PATH.
@@ -951,7 +952,7 @@ route_test() {
             announced_reason="$BUILDLOG_MAC_REASON"
         fi
         ROUTING_WAIT_STARTED="$("$PY" -c 'import time; print(time.monotonic())')"
-        sleep "${BUILD_TARGETS_POLL_S:-15}" &
+        "$PY" "$LOCAL_RELEASE_WAIT_SCRIPT" "${BUILD_TARGETS_POLL_S:-15}" "$BUILDLOG_CALL_ID" &
         HOLD_WAITER_PID=$!
         wait "$HOLD_WAITER_PID"
         HOLD_WAITER_PID=""

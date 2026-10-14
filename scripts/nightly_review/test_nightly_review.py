@@ -362,6 +362,15 @@ class NightlyReviewTests(unittest.TestCase):
         self.assertEqual(nightly_review.live_message_counts(path, since),
                          nightly_review.LiveMessageCounts(4, 2, 1, (("reader-starts-cold", 2),)))
 
+    def test_failed_and_withheld_live_pushes_count_and_registry_failures_are_attributed(self) -> None:
+        since = datetime(2026, 10, 13, tzinfo=timezone.utc)
+        path = self.root / "review.jsonl"
+        records: list[dict[str, object]] = [{"time": since.isoformat(), "verdict": verdict, "failed_rules": ["reader-starts-cold"],
+                    "text_id": "quota", "detail": "sent despite failed review: reader-starts-cold", "sent": {"body": "original"}} for verdict in ("failed", "withhold")]
+        records.append({"time": since.isoformat(), "verdict": "failed", "failed_rules": ["reader-starts-cold"], "text_id": "quota", "dry": True})
+        _ = path.write_text("\n".join(json.dumps(record) for record in records))
+        self.assertEqual(nightly_review.live_message_counts(path, since), nightly_review.LiveMessageCounts(2, 2, 0, (("reader-starts-cold", 2),), (("quota", 2),)))
+
     def test_messages_mode_runs_only_the_dry_sample_cli_with_a_derived_wait(self) -> None:
         since = datetime(2026, 10, 13, tzinfo=timezone.utc)
         paths = [self.root / "one.jsonl", self.root / "two.jsonl"]

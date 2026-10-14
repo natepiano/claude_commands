@@ -20,6 +20,7 @@ from merge_checkpoint import (CodeCheckpoint, LastMerged, NoMerge, ShrinkCommit,
                               check_parallel, merge_branch_history, merge_history, promote, request_from)
 
 
+# Script completion deadlines only bound hangs; startup can be slow under load.
 SCRIPT = Path(__file__).with_name("merge_checkpoint.py")
 STARTED = "2026-10-06T12:00:00-07:00"
 TRIAL = ("review trial: ux 2 findings, code 3 findings, review-seat minutes 14, "
@@ -248,7 +249,7 @@ class MergeCheckpointTests(unittest.TestCase):
             arguments.extend(("--delivers", delivers))
         arguments.extend(extra)
         process = subprocess.run([sys.executable, str(SCRIPT), *arguments], cwd=self.checkout,
-                                 env=self.env, capture_output=True, text=True, check=False, timeout=25)
+                                 env=self.env, capture_output=True, text=True, check=False, timeout=300)
         return MergeResult(process, before)
 
     def events(self, command: str) -> list[list[str]]:

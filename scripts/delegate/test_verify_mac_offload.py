@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import ctypes
 import json
 import os
 import signal
@@ -12,7 +13,7 @@ import tempfile
 import time
 import unittest
 from contextlib import contextmanager
-from collections.abc import Generator
+from collections.abc import Generator, Sequence
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import TypedDict, cast, final, override
@@ -22,6 +23,8 @@ from scripts.build_hold import build_hold
 
 
 VERIFY = Path(__file__).with_name("verify.sh")
+# Paths and process exits advance tests; this is only a hung-process guard.
+HANG_GUARD_S = 300
 
 
 def restore_sigint() -> None:
@@ -501,7 +504,7 @@ class VerifyMacOffloadTests(unittest.TestCase):
             capture_output=True,
             text=True,
             check=False,
-            timeout=30,
+            timeout=HANG_GUARD_S,
         )
 
     def start_verify(
@@ -564,11 +567,15 @@ class VerifyMacOffloadTests(unittest.TestCase):
         for name in ("runner-events.jsonl", "runner-started", "runner-signal", "runner-signals-ready"):
             (self.runner_state / name).unlink(missing_ok=True)
 
-    def wait_for_path(self, path: Path) -> None:
-        deadline = time.monotonic() + 10
+    def wait_for_path(self, path: Path, processes: Sequence[subprocess.Popen[str]] = ()) -> None:
+        deadline = time.monotonic() + HANG_GUARD_S
         while time.monotonic() < deadline:
             if path.exists():
                 return
+            for process in processes:
+                if process.poll() is not None:
+                    output, errors = process.communicate(timeout=HANG_GUARD_S)
+                    self.fail(f"verify exited {process.returncode} before {path}: {output + errors}")
             time.sleep(0.01)
         self.fail(f"timed out waiting for {path}")
 
@@ -576,7 +583,10 @@ class VerifyMacOffloadTests(unittest.TestCase):
         wrapper = self.root / "targets-wrapper.py"
         self.write_executable(wrapper, TARGETS_WRAPPER)
         self.write_executable(self.bin_directory / "sleep", SLEEP_STUB)
+        routing_wait = self.root / "routing-wait.py"
+        self.write_executable(routing_wait, SLEEP_STUB)
         self.environment.update({"BUILD_TARGETS_SCRIPT": str(wrapper),
+                                 "VERIFY_LOCAL_RELEASE_WAIT_SCRIPT": str(routing_wait),
                                  "TEST_REAL_TARGETS": str(VERIFY.parent.parent / "build_targets" / "build_targets.py")})
         with self.hold_environment():
             holders = Path(self.environment["BUILD_HOLD_DIR"])
@@ -625,9 +635,11 @@ class VerifyMacOffloadTests(unittest.TestCase):
         return cast(RoutingRecord, json.loads(records[-1]))
 
     def stop_verify(self, process: subprocess.Popen[str]) -> None:
-        if process.poll() is None:
+        try:
             os.killpg(process.pid, signal.SIGKILL)
-        _ = process.communicate(timeout=5)
+        except ProcessLookupError:
+            pass
+        _ = process.communicate(timeout=HANG_GUARD_S)
 
     def start_routing(self, reason: str = "busy", *, pause_retry: bool = False,
                       step_sleep: bool = False) -> subprocess.Popen[str]:
@@ -639,7 +651,7 @@ class VerifyMacOffloadTests(unittest.TestCase):
             "TEST_RUNNER_MAC": "passed", "TEST_RUNNER_STATUS": "0",
         })
         self.addCleanup(self.stop_verify, process)
-        self.wait_for_path(self.runner_state / "routing-sleep")
+        self.wait_for_path(self.runner_state / "routing-sleep", (process,))
         self.assertEqual(self.local_runs(), [])
         self.assertEqual(len(self.runner_events()), 1)
         self.assertIsNone(process.poll())
@@ -737,7 +749,7 @@ class VerifyMacOffloadTests(unittest.TestCase):
             self.resume_routing_sleep(step)
         _ = (self.runner_state / "mac-free").write_text("free\n")
         _ = (self.runner_state / "continue-sleep-4").write_text("continue\n")
-        output, errors = process.communicate(timeout=15)
+        output, errors = process.communicate(timeout=HANG_GUARD_S)
         self.assertEqual(process.returncode, 0, output + errors)
         self.assertEqual(errors.count("verify.sh: natedev is held by hana for render checks.\n"), 1)
         self.assertEqual(errors.count("verify.sh: natedev has been held for 2 h by hana; ask them.\n"), 1)
@@ -766,7 +778,7 @@ class VerifyMacOffloadTests(unittest.TestCase):
         self.resume_routing_sleep(4)
         _ = (self.runner_state / "mac-free").write_text("free\n")
         _ = (self.runner_state / "continue-sleep-5").write_text("continue\n")
-        output, errors = process.communicate(timeout=15)
+        output, errors = process.communicate(timeout=HANG_GUARD_S)
         self.assertEqual(process.returncode, 0, output + errors)
         for line in ("verify.sh: natedev is held by hana for render checks.\n",
                      "verify.sh: natedev is held by julian for restore CI.\n",
@@ -790,7 +802,7 @@ class VerifyMacOffloadTests(unittest.TestCase):
         _ = clock.write_text("105")
         _ = (self.runner_state / "mac-free").write_text("free\n")
         _ = (self.runner_state / "continue-sleep-2").write_text("continue\n")
-        output, errors = process.communicate(timeout=15)
+        output, errors = process.communicate(timeout=HANG_GUARD_S)
         self.assertEqual(process.returncode, 0, output + errors)
         self.assertEqual(len(self.runner_events()), 3)
         self.assertEqual(self.routing_record()["hold_wait_s"], 2 + 4.5 + 3)
@@ -814,7 +826,7 @@ class VerifyMacOffloadTests(unittest.TestCase):
                     build_hold.holder_path(build_hold.holder_directory(), "hana").unlink()
                 _ = (fixture.runner_state / "continue-retry").write_text("continue\n")
                 _ = (fixture.runner_state / "continue-sleep-2").write_text("continue\n")
-                output, errors = process.communicate(timeout=15)
+                output, errors = process.communicate(timeout=HANG_GUARD_S)
                 self.assertEqual(process.returncode, 0, output + errors)
                 self.assertEqual(fixture.last_call()["mac_reason"], expected)
                 self.assertEqual(fixture.last_call()["mac_holder"], "")
@@ -826,7 +838,7 @@ class VerifyMacOffloadTests(unittest.TestCase):
         process = self.start_routing()
         _ = (self.runner_state / "mac-free").write_text("free\n")
         _ = (self.runner_state / "continue-sleep").write_text("continue\n")
-        output, errors = process.communicate(timeout=15)
+        output, errors = process.communicate(timeout=HANG_GUARD_S)
         self.assertEqual(process.returncode, 0, output + errors)
         self.assertIn("waiting", errors)
         self.assertEqual(self.local_runs(), [])
@@ -856,7 +868,7 @@ class VerifyMacOffloadTests(unittest.TestCase):
                 else:
                     (Path(fixture.environment["BUILD_HOLD_DIR"]) / "hana").unlink()
                 _ = (fixture.runner_state / "continue-sleep").write_text("continue\n")
-                output, errors = process.communicate(timeout=15)
+                output, errors = process.communicate(timeout=HANG_GUARD_S)
                 self.assertEqual(process.returncode, 0, output + errors)
                 self.assertEqual(len(fixture.runner_events()), 1)
                 self.assertEqual(len(fixture.local_runs()), 1)
@@ -866,14 +878,64 @@ class VerifyMacOffloadTests(unittest.TestCase):
 
     def test_blocked_mac_and_held_local_wait_for_local_release(self) -> None:
         cycle = self.routing_fixture()
+        # Exercise the real event waiter. A retry cannot rescue a missed release:
+        # its interval is longer than the process hang guard, and a fixed sleep
+        # is an immediate fixture error instead of a wall-clock assertion.
+        self.environment["BUILD_TARGETS_POLL_S"] = "3600"
+        self.write_executable(self.bin_directory / "sleep", 'raise SystemExit("routing must wake on release, not sleep")\n')
+        self.write_executable(Path(self.environment["VERIFY_LOCAL_RELEASE_WAIT_SCRIPT"]), f'''
+import os
+from pathlib import Path
+import sys
+sys.path.insert(0, {str(VERIFY.parent)!r})
+import local_release_wait
+original_wait = local_release_wait.LocalReleaseEvents.wait
+def observe_wait(self, seconds):
+    (Path(os.environ["TEST_RUNNER_STATE"]) / "routing-sleep").write_text("watching\\n")
+    original_wait(self, seconds)
+local_release_wait.LocalReleaseEvents.wait = observe_wait
+local_release_wait.wait_for_local_release(float(sys.argv[1]), sys.argv[2])
+''')
         process = self.start_routing("blocked")
         self.release_local_turn()
-        _ = (self.runner_state / "continue-sleep").write_text("continue\n")
-        output, errors = process.communicate(timeout=15)
+        output, errors = process.communicate(timeout=HANG_GUARD_S)
         self.assertEqual(process.returncode, 0, output + errors)
         self.assertIn("blocked", errors)
         self.assertEqual(len(self.runner_events()), 1)
         self.assertEqual(len(self.local_runs()), 1)
+        self.assert_no_pending_calls(cycle)
+
+    def test_local_release_before_routing_watcher_starts_needs_no_retry_wait(self) -> None:
+        from scripts.delegate import local_release_wait
+
+        cycle = self.routing_fixture()
+        call_id = "already-released"
+        with mock.patch.dict(os.environ, self.environment), self.hold_environment():
+            _ = build_hold.register_wait(f"verify:{call_id}", call_id=call_id, pid=os.getpid())
+            self.release_local_turn()
+            with mock.patch.object(local_release_wait.LocalReleaseEvents, "wait",
+                                   side_effect=AssertionError("an admitted call must not wait for another event")):
+                local_release_wait.wait_for_local_release(3600, call_id)
+            build_hold.remove_call(f"verify:{call_id}", call_id)
+        self.assert_no_pending_calls(cycle)
+
+    def test_routing_without_inotify_polls_until_local_release(self) -> None:
+        from scripts.delegate import local_release_wait
+
+        cycle = self.routing_fixture()
+        call_id = "polling-routing"
+        def release_on_poll(_seconds: float) -> None:
+            self.release_local_turn()
+
+        with mock.patch.dict(os.environ, self.environment), self.hold_environment():
+            _ = build_hold.register_wait(f"verify:{call_id}", call_id=call_id, pid=os.getpid())
+            with mock.patch.object(ctypes, "CDLL", return_value=object()), \
+                 mock.patch.object(time, "monotonic", return_value=100), \
+                 mock.patch.object(time, "sleep", side_effect=release_on_poll) as polling:
+                local_release_wait.wait_for_local_release(15, call_id)
+            polling.assert_called_once_with(15)
+            self.assertIsInstance(build_hold.read_admission(f"verify:{call_id}", call_id), build_hold.AdmittedTurn)
+            build_hold.remove_call(f"verify:{call_id}", call_id)
         self.assert_no_pending_calls(cycle)
 
     def test_mac_run_withdraws_local_demand_before_another_waiter_is_released(self) -> None:
@@ -891,7 +953,7 @@ class VerifyMacOffloadTests(unittest.TestCase):
         self.assertIsNone(process.poll())
         self.assertFalse(self.runner_events()[-1]["registered"])
         _ = (self.runner_state / "continue-retry").write_text("continue\n")
-        output, errors = process.communicate(timeout=15)
+        output, errors = process.communicate(timeout=HANG_GUARD_S)
         self.assertEqual(process.returncode, 0, output + errors)
         self.assertEqual(self.local_runs(), [])
 
@@ -905,7 +967,7 @@ class VerifyMacOffloadTests(unittest.TestCase):
         self.wait_for_path(self.runner_state / "retry-running")
         _ = clock.write_text("500")
         process.send_signal(signal.SIGTERM)
-        output, errors = process.communicate(timeout=15)
+        output, errors = process.communicate(timeout=HANG_GUARD_S)
         self.assertEqual(process.returncode, 143, output + errors)
         self.assert_no_pending_calls(cycle_path)
         record = self.routing_record()
@@ -921,7 +983,7 @@ class VerifyMacOffloadTests(unittest.TestCase):
         _ = clock.write_text("103")
         self.release_local_turn()
         _ = (self.runner_state / "continue-sleep").write_text("continue\n")
-        output, errors = process.communicate(timeout=15)
+        output, errors = process.communicate(timeout=HANG_GUARD_S)
         self.assertEqual(process.returncode, 0, output + errors)
         record = self.routing_record()
         self.assertEqual(record["hold_wait_s"], 3 + 7.25)
@@ -934,7 +996,7 @@ class VerifyMacOffloadTests(unittest.TestCase):
         self.assertEqual((self.runner_state / "sleep-events").read_text().splitlines(), ["15"])
         self.release_local_turn()
         _ = (self.runner_state / "continue-sleep").write_text("continue\n")
-        output, errors = process.communicate(timeout=15)
+        output, errors = process.communicate(timeout=HANG_GUARD_S)
         self.assertEqual(process.returncode, 0, output + errors)
 
     def test_interrupted_routing_sleep_records_wait_and_cleans_pending_call(self) -> None:
@@ -942,7 +1004,7 @@ class VerifyMacOffloadTests(unittest.TestCase):
         process = self.start_routing()
         time.sleep(0.1)
         process.send_signal(signal.SIGTERM)
-        output, errors = process.communicate(timeout=15)
+        output, errors = process.communicate(timeout=HANG_GUARD_S)
         self.assertEqual(process.returncode, 143, output + errors)
         self.assert_no_pending_calls(cycle)
         self.assertGreater(self.routing_record()["hold_wait_s"], 0)
@@ -1285,10 +1347,10 @@ class VerifyMacOffloadTests(unittest.TestCase):
                 try:
                     self.wait_for_path(self.runner_state / "runner-signals-ready")
                     process.send_signal(signal_number)
-                    output, errors = process.communicate(timeout=15)
+                    output, errors = process.communicate(timeout=HANG_GUARD_S)
                 except BaseException:
                     os.killpg(process.pid, signal.SIGKILL)
-                    _ = process.communicate(timeout=5)
+                    _ = process.communicate(timeout=HANG_GUARD_S)
                     raise
                 self.assertEqual(
                     process.returncode, 128 + signal_number, output + errors
@@ -1335,10 +1397,10 @@ class VerifyMacOffloadTests(unittest.TestCase):
         try:
             self.wait_for_path(marker)
             process.send_signal(signal.SIGTERM)
-            output, errors = process.communicate(timeout=15)
+            output, errors = process.communicate(timeout=HANG_GUARD_S)
         except BaseException:
             os.killpg(process.pid, signal.SIGKILL)
-            _ = process.communicate(timeout=5)
+            _ = process.communicate(timeout=HANG_GUARD_S)
             raise
 
         self.assertEqual(

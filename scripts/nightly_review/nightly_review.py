@@ -84,6 +84,7 @@ class LiveMessageCounts:
     failures: int
     unreviewed: int
     rules: tuple[tuple[str, int], ...]
+    template_failures: tuple[tuple[str, int], ...] = ()
 
 
 def json_record(line: str) -> dict[str, object]:
@@ -165,6 +166,7 @@ def showrunner_transcripts(since: datetime) -> list[Path]:
 def live_message_counts(path: Path, since: datetime) -> LiveMessageCounts:
     messages = failures = unreviewed = 0
     rules: dict[str, int] = {}
+    templates: dict[str, int] = {}
     if not path.exists():
         return LiveMessageCounts(0, 0, 0, ())
     for line in path.read_text(encoding="utf-8").splitlines():
@@ -180,16 +182,20 @@ def live_message_counts(path: Path, since: datetime) -> LiveMessageCounts:
             if record_time(record["time"]) < since:
                 continue
             verdict = record["verdict"]
+            text_id = data.get("text_id")
+            detail = data.get("detail", "")
+            if isinstance(text_id, str) and text_id and isinstance(detail, str) and detail.startswith("sent despite failed review") and data.get("sent") is not None:
+                templates[text_id] = templates.get(text_id, 0) + 1
             messages += 1
             if verdict.startswith("unreviewed:") or verdict == "review: off":
                 unreviewed += 1
-            elif verdict in ("rewrite", "ask"):
+            elif verdict in ("rewrite", "ask", "failed", "withhold"):
                 failures += 1
                 for rule in set(record["failed_rules"]):
                     rules[rule] = rules.get(rule, 0) + 1
         except (ValueError, TypeError):
             continue
-    return LiveMessageCounts(messages, failures, unreviewed, tuple(sorted(rules.items())))
+    return LiveMessageCounts(messages, failures, unreviewed, tuple(sorted(rules.items())), tuple(sorted(templates.items())))
 
 
 def messages(since: datetime) -> list[str]:
@@ -202,6 +208,7 @@ def messages(since: datetime) -> list[str]:
     counts = live_message_counts(review.state_path() / "review.jsonl", since)
     lines = [f"Live messages: {counts.messages}; failures: {counts.failures}; Unreviewed: {counts.unreviewed}."]
     lines.extend(f"Live rule {rule}: {count}" for rule, count in counts.rules)
+    lines.extend(f"Template {text_id} sent despite failed review: {count}" for text_id, count in counts.template_failures)
     transcripts = showrunner_transcripts(since)
     if not transcripts:
         return [*lines, "No showrunner replies in this interval."]
