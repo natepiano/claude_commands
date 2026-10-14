@@ -25,6 +25,7 @@ from test_record import LegacyRecordFixture, LegacyEntryFixture, write_old
 import launch_permission
 import record
 import sessions
+import remote_control
 import shutdown
 import settle
 from push_texts import RenderedPush
@@ -163,6 +164,13 @@ class ShutdownLaunchCliTests(ShutdownTestCase):
     def clear_state(self) -> None:
         if self.state.exists():
             shutil.rmtree(self.state)
+
+    def test_remote_control_cli_passes_identity_and_failure_alert_policy_to_fixer(self) -> None:
+        for policy in ("user", "none"):
+            with self.subTest(policy=policy), patch.object(remote_control, "fix", return_value=remote_control.AlreadyOn()) as fix:
+                self.assertEqual(shutdown.main(["remote-control", "owner", "--pid", "321",
+                    "--proc-start", "original", "--who", "trunk unit", "--alerts", policy]), 0)
+            fix.assert_called_once_with("owner", 321, "original", "trunk unit", policy)
 
     def follow_request(self, output: io.StringIO | None = None) -> tuple[int, str]:
         output = output if output is not None else io.StringIO()
@@ -1373,7 +1381,7 @@ class OnlySessionCliTests(ShutdownTestCase):
                 with patch.object(shutdown, "own_claude_account", side_effect=UnreadableAccount("own account unreadable")), patch.object(restart_work, "own_claude_account", side_effect=UnreadableAccount("own account unreadable")), patch.object(restart_work, "run_remote", return_value=(0, "[]")), patch.object(restart_work, "_up", return_value=restart_work.MachineRestartResult("natedev", LABEL, "done")) as resume, redirect_stdout(output), redirect_stderr(error):
                     self.assertEqual(shutdown.main(["restart", "--only", "beta-id", "--here", "--no-alert"]), 0)
                 self.assertEqual(error.getvalue(), "")
-                resume.assert_called_once_with(LOGIN, False, ("beta-id",))
+                resume.assert_called_once_with(LOGIN, False, ("beta-id",), notify=False)
 
     def test_selected_restart_silent_failure_ignores_sibling_policy_and_never_reads_peer_here(self) -> None:
         before = self.save_three({"kind": "stopped", "at": OCTOBER})
@@ -1525,10 +1533,13 @@ class OnlySessionCliTests(ShutdownTestCase):
         def quiet(current: record.SessionShutdown) -> None:
             current["alerts"] = "none"
         _ = record.update_session(LOGIN, "beta-id", quiet)
-        with patch.object(restart_work, "wait_for_remote_control", return_value=frozenset()), redirect_stdout(output := io.StringIO()):
+        with patch.object(restart_work, "wait_for_remote_control", return_value=frozenset()), patch.object(remote_control, "launch_fixer") as fixer, redirect_stdout(output := io.StringIO()):
             self.assertEqual(shutdown.main(["up", LOGIN, "--here", "--json", "--only", "beta-id"]), 0)
         result = restart_work.parse_peer_result(output.getvalue())
-        self.assertIn("Beta: running, no Remote Control", result["lines"])
+        self.assertIn("Beta: Remote Control not on yet; turning it on in the background", result["lines"])
+        fixer.assert_called_once()
+        self.assertEqual(fixer.call_args.args[0], "beta-id")
+        self.assertEqual(fixer.call_args.args[-1], "none")
         self.assertEqual(result["no_remote_control"], [{"session_id": "beta-id", "name": "Beta", "alerts": "none"}])
         self.assertIsNone(record.find_session(LOGIN, "beta-id"))
 
