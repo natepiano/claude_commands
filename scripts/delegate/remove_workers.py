@@ -1,24 +1,24 @@
 #!/usr/bin/env python3
-"""Remove delegate seats that no later step will message.
+"""Remove delegate workers that no later step will message.
 
-A claude seat launches as a named background session (agents/agent_bg.sh) and
+A claude worker launches as a named background session (agents/agent_bg.sh) and
 is left alive when its turn ends, so a peer can still ask it a question. That
-leaves someone to remove it, and for a long time nothing did: seats from runs a
-week old were still listed by `claude agents`. A seat is named for its project,
+leaves someone to remove it, and for a long time nothing did: workers from runs a
+week old were still listed by `claude agents`. A worker is named for its project,
 so a stale `hana_catalyst-test` also shares its address with the next run's
 tester, and a message to that name stops working until the sender picks a row.
 
-The call is `claude rm`, never `claude stop`: stop answers "stopped" on a seat
+The call is `claude rm`, never `claude stop`: stop answers "stopped" on a worker
 whose process already exited and leaves it listed under its name. `rm` works on
 running and exited sessions alike, leaves the working directory alone, and
-keeps the transcript, so a seat removed in error comes back with
+keeps the transcript, so a worker removed in error comes back with
 `claude --resume <session id>`.
 
-Every launch appends `<id>\\t<name>` to its run's `seats` ledger. This removes:
+Every launch appends `<id>\\t<name>` to its run's `workers` ledger. This removes:
 
-  * every seat in `--session-dir`'s ledger -- the caller's own run, at the end
-    of a phase or of the run, when nothing will message those seats again;
-  * every seat of a run that is not live, from any ledger under the delegate
+  * every worker in `--session-dir`'s ledger -- the caller's own run, at the end
+    of a phase or of the run, when nothing will message those workers again;
+  * every worker of a run that is not live, from any ledger under the delegate
     root -- the sweep that catches a run whose unit director died before its
     own cleanup ran.
 
@@ -26,7 +26,7 @@ A run is live while a run-active marker names its session directory and the
 unit director that wrote the marker is still listed, or while its
 heartbeat log moved in the last `LIVE_HEARTBEAT_SECS`. The heartbeat test
 covers a run with no marker, which prepare_session.sh skips outside a Claude
-session: a seat still working beats every minute.
+session: a worker still working beats every minute.
 
 Only background sessions are ever removed, and never the session running this.
 After a successful Claude session listing, phase cleanup also asks codex_mesh to
@@ -46,10 +46,16 @@ import subprocess
 import sys
 import time
 from pathlib import Path
-from typing import Literal, TypedDict, cast
+from typing import TYPE_CHECKING, Literal, TypedDict, cast
+
+if TYPE_CHECKING:
+    from .worker_state import worker_ledger
+else:
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    from worker_state import worker_ledger
 
 DEFAULT_ROOT = Path("/tmp/claude/delegate")
-LEDGER = "seats"
+LEDGER = "workers"
 HEARTBEAT = "heartbeat.log"
 LIVE_HEARTBEAT_SECS = 600
 CLAUDE_TIMEOUT_SECS = 30
@@ -58,9 +64,9 @@ SHUTDOWN = Path(__file__).resolve().parents[1] / "shutdown" / "shutdown.py"
 CODEX_MESH = Path(__file__).resolve().parents[1] / "agents" / "codex_mesh.py"
 SWEEP_TIMEOUT_SECS = 120
 
-# Seats launched before the ledger were named `<session dir basename>-<slot>`,
+# Workers launched before the ledger were named `<session dir basename>-<slot>`,
 # and the basename was a uuid, so the name alone says which run owns them.
-# Remove once no seat launched before the ledger can still be alive.
+# Remove once no worker launched before the ledger can still be alive.
 LEGACY_NAME = re.compile(
     r"^([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})-(impl|test|review)$"
 )
@@ -151,7 +157,7 @@ def shutdown_command() -> list[str]:
 
 
 def sweep_app_servers(root: Path) -> None:
-    """Best-effort orphan cleanup after a phase releases its Claude seats."""
+    """Best-effort orphan cleanup after a phase releases its Claude workers."""
     try:
         result = subprocess.run(
             [sys.executable, str(CODEX_MESH), "sweep", "--root", str(root), "--stop"],
@@ -159,11 +165,11 @@ def sweep_app_servers(root: Path) -> None:
             check=False,
         )
     except (OSError, subprocess.TimeoutExpired) as error:
-        print(f"remove_seats: app-server sweep could not run: {error}", file=sys.stderr)
+        print(f"remove_workers: app-server sweep could not run: {error}", file=sys.stderr)
         return
     if result.returncode:
         print(
-            f"remove_seats: app-server sweep exited {result.returncode}; seat cleanup continues.",
+            f"remove_workers: app-server sweep exited {result.returncode}; worker cleanup continues.",
             file=sys.stderr,
         )
 
@@ -173,7 +179,7 @@ def live_runs(root: Path, listed_sessions: set[str]) -> set[Path]:
     shutdown_state = shutdown_held_sessions()
     if shutdown_state["kind"] == "shutdown state unreadable":
         print(
-            "remove_seats: shutdown state could not be read; keeping every active run.",
+            "remove_workers: shutdown state could not be read; keeping every active run.",
             file=sys.stderr,
         )
     active = root / "active"
@@ -196,31 +202,33 @@ def live_runs(root: Path, listed_sessions: set[str]) -> set[Path]:
 
 
 def ledger_ids(run: Path) -> list[str]:
-    ledger = run / LEDGER
+    ledger = worker_ledger(run)
     if not ledger.is_file():
         return []
     ids: list[str] = []
     for line in ledger.read_text(encoding="utf-8").splitlines():
-        seat_id = line.split("\t", 1)[0].strip()
-        if seat_id:
-            ids.append(seat_id)
+        worker_id = line.split("\t", 1)[0].strip()
+        if worker_id:
+            ids.append(worker_id)
     return ids
 
 
 def removal_targets(
     root: Path, own_run: Path | None, rows: list[AgentRow], live: set[Path]
 ) -> dict[str, str]:
-    """Seat id to the reason it is being removed."""
+    """Worker id to the reason it is being removed."""
     targets: dict[str, str] = {}
     if own_run is not None:
-        for seat_id in ledger_ids(own_run):
-            targets[seat_id] = "this run's phase is over"
-    for ledger in root.glob(f"*/{LEDGER}"):
-        run = ledger.parent.resolve()
+        for worker_id in ledger_ids(own_run):
+            targets[worker_id] = "this run's phase is over"
+    for directory in root.glob("*"):
+        if not directory.is_dir() or not worker_ledger(directory).is_file():
+            continue
+        run = directory.resolve()
         if run == own_run or run in live:
             continue
-        for seat_id in ledger_ids(run):
-            _ = targets.setdefault(seat_id, f"run {run.name} is not live")
+        for worker_id in ledger_ids(run):
+            _ = targets.setdefault(worker_id, f"run {run.name} is not live")
     for row in rows:
         match = LEGACY_NAME.match(row.get("name", ""))
         if match is None:
@@ -235,7 +243,7 @@ def removal_targets(
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__.split("\n", 1)[0] if __doc__ else None)
-    _ = parser.add_argument("--session-dir", help="the caller's own run; all its seats go")
+    _ = parser.add_argument("--session-dir", help="the caller's own run; all its workers go")
     _ = parser.add_argument("--delegate-root", default=str(DEFAULT_ROOT))
     args = parser.parse_args()
     session_dir = cast("str | None", args.session_dir)
@@ -245,7 +253,7 @@ def main() -> int:
     claude = claude_bin()
     rows = list_sessions(claude)
     if rows is None:
-        print("remove_seats: could not list sessions with `claude agents --json`; nothing removed.", file=sys.stderr)
+        print("remove_workers: could not list sessions with `claude agents --json`; nothing removed.", file=sys.stderr)
         return 1
 
     # --session-dir identifies phase cleanup. Restrict the automatic destructive
@@ -262,15 +270,15 @@ def main() -> int:
     removed = 0
     failed = 0
     for row in rows:
-        seat_id = row.get("id", "")
-        if row.get("kind") != "background" or seat_id not in targets:
+        worker_id = row.get("id", "")
+        if row.get("kind") != "background" or worker_id not in targets:
             continue
         if caller and row.get("sessionId") == caller:
             continue
         name = row.get("name", "?")
         try:
             result = subprocess.run(
-                [claude, "rm", seat_id],
+                [claude, "rm", worker_id],
                 capture_output=True,
                 text=True,
                 timeout=CLAUDE_TIMEOUT_SECS,
@@ -278,18 +286,18 @@ def main() -> int:
             )
         except (OSError, subprocess.TimeoutExpired) as error:
             failed += 1
-            print(f"remove_seats: could not remove {name} ({seat_id}): {error}", file=sys.stderr)
+            print(f"remove_workers: could not remove {name} ({worker_id}): {error}", file=sys.stderr)
             continue
         if result.returncode == 0:
             removed += 1
-            print(f"removed seat {name} ({seat_id}): {targets[seat_id]}")
+            print(f"removed worker {name} ({worker_id}): {targets[worker_id]}")
         else:
             failed += 1
             detail = (result.stderr or result.stdout).strip()
-            print(f"remove_seats: could not remove {name} ({seat_id}): {detail}", file=sys.stderr)
+            print(f"remove_workers: could not remove {name} ({worker_id}): {detail}", file=sys.stderr)
 
     if removed == 0 and failed == 0:
-        print("remove_seats: no seats to remove.")
+        print("remove_workers: no workers to remove.")
     return 1 if failed else 0
 
 

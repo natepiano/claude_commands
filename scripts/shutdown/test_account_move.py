@@ -24,7 +24,7 @@ import stop as stop_work
 from importlib import import_module
 import account
 from scripts.accounts import accounts
-from test_restart import entry, seat, showrunner, top_level, tmux_host, unit
+from test_restart import entry, worker_session, showrunner, top_level, tmux_host, unit
 from test_support import ShutdownTestCase
 
 
@@ -119,8 +119,8 @@ class AccountMoveTests(ShutdownTestCase):
         with patch.object(sessions, "live_sessions", return_value=[first, second]):
             self.refuses_without_change("move-id, second-id", session="kept name")
 
-    def test_move_refuses_a_seat_without_change(self) -> None:
-        self.owner = seat("move-id", owner="director")
+    def test_move_refuses_a_worker_without_change(self) -> None:
+        self.owner = worker_session("move-id", owner="director")
         self.refuses_without_change("seats move with their unit director")
 
     def test_move_refuses_the_targets_first_check_problem_without_change(self) -> None:
@@ -371,6 +371,12 @@ class AccountMoveTests(ShutdownTestCase):
               patch.object(account, "account_of", return_value=account.Account("claude", report["login"], report["label"])),
               patch.object(inventory, "inventory", return_value=report),
               patch.object(shutdown, "inventory", return_value=report),
+              patch.object(shutdown, "listing", return_value=[inventory.ListedSession(
+                  session_id=director["session_id"], pid=director["pid"],
+                  proc_start=director["proc_start"], name=director["name"], kind="unit",
+                  config_dir=Path(director["config_dir"]), login=report["login"],
+                  production=director["host"]["production"], doc=director["host"]["doc"],
+              )]),
               patch.object(settle, "inventory", return_value=report),
               patch.object(settle, "run_inventory", return_value=report),
               patch.object(settle, "_warm", return_value=True),

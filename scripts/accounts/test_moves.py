@@ -54,6 +54,28 @@ class MoveJournalTests(unittest.TestCase):
         moves.append_move(requested)
         self.assertEqual(moves.read_moves(), [requested])
 
+    def test_credits_off_cause_round_trips_and_legacy_requests_remain_refusals(self) -> None:
+        legacy = self.requested()
+        policy: moves.RequestedMove = {**legacy, "cause": "credits off", "move_id": "policy-1"}
+        moves.append_move(legacy)
+        moves.append_move(policy)
+        entries = moves.read_moves()
+        self.assertEqual(entries, [legacy, policy])
+        self.assertEqual([entry.get("cause", "refusal") for entry in entries if entry["kind"] == "requested"],
+                         ["refusal", "credits off"])
+
+    def test_invalid_move_cause_is_refused_by_writer_and_skipped_by_reader(self) -> None:
+        valid = self.requested()
+        moves.append_move(valid)
+        for cause in ("refusal", "credits on", "", None, 7, ["credits off"]):
+            with self.subTest(cause=cause):
+                malformed = {**valid, "cause": cause}
+                with self.assertRaisesRegex(ValueError, "invalid account move"):
+                    moves.append_move(cast(moves.RequestedMove, cast(object, malformed)))
+                with moves.store_file().open("a", encoding="utf-8") as output:
+                    _ = output.write(json.dumps(malformed) + "\n")
+        self.assertEqual(moves.read_moves(), [valid])
+
     def test_reader_skips_malformed_lines_and_keeps_later_valid_transitions(self) -> None:
         first = moves.WaitedMove(**self.common(), kind="waited", window="five_hour", reset="2026-10-13T12:19:00+00:00")
         last = moves.WaitEndedMove(**self.common(), kind="wait ended")

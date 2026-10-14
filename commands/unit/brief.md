@@ -59,7 +59,7 @@ Build only from Delegation Context, the Work Order, and command-line amendments:
 [modules, acceptance gate, meaningful checks]
 
 ### Opening
-[the Seats opening line verbatim, or "default — no Seats field"]
+[the Workers opening line verbatim, or "default — no Workers field"]
 ```
 
 Rows include only types the Work Order explicitly names as part of its change. Status

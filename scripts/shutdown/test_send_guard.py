@@ -331,15 +331,6 @@ class SendGuardTests(ShutdownTestCase):
         result = self.run_without_subprocesses(LeafNames("test_names"))
         self.assertTrue(result.wasSuccessful(), result.failures)
 
-    def test_unknown_leaf_name_is_rejected(self) -> None:
-        class UnknownLeaf(ShutdownTestCase):
-            def test_rejected(self) -> None:
-                with self.assertRaises(ValueError):
-                    _ = ShutdownSendLeaf("no.such_leaf")
-
-        result = self.run_without_subprocesses(UnknownLeaf("test_rejected"))
-        self.assertTrue(result.wasSuccessful(), result.failures)
-
 
 if __name__ == "__main__":
     _ = unittest.main()

@@ -709,7 +709,7 @@ class ReviewPoolReportTests(unittest.TestCase):
         _ = self.record("own", arm="own", thread="own-thread", phase_instance="own")
         _ = self.rollout("own-thread", usage(15, 200))
         text = self.report()
-        self.assertIn("pool is at 50.0% of own-seat tokens per review", text)
+        self.assertIn("pool is at 50.0% of own-worker tokens per review", text)
         self.assertNotIn("for the first reading", text)
 
     def test_above_twenty_compares_per_review_means_instead_of_totals(self) -> None:
@@ -722,7 +722,7 @@ class ReviewPoolReportTests(unittest.TestCase):
             _ = self.record(thread, arm="own", thread=thread, phase_instance=thread)
             _ = self.rollout(thread, usage(15, 400))
         text = self.report()
-        self.assertIn("pool is at 25.0% of own-seat tokens per review", text)
+        self.assertIn("pool is at 25.0% of own-worker tokens per review", text)
         self.assertNotIn("for the first reading", text)
 
     def test_surviving_earlier_rollout_without_a_request_in_review_window_is_incomplete(self) -> None:
@@ -863,7 +863,7 @@ class ReviewPoolReportTests(unittest.TestCase):
             _ = self.record(thread, arm=arm, thread=thread, kind="ux")
             _ = self.rollout(thread, usage(15, 100000))
         text = self.report()
-        self.assertIn("pool is at 50.0% of own-seat tokens per review", text)
+        self.assertIn("pool is at 50.0% of own-worker tokens per review", text)
         for arm in ("pool", "own"):
             self.cost_row(text, arm, "ux", 1, 100000, 100000)
 

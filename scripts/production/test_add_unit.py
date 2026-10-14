@@ -16,11 +16,12 @@ import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import TypedDict, cast, final, override
+from typing import ClassVar, TypedDict, cast, final, override
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import add_unit
+from cli_fixture import ImmutableGitSeed, invoke_cli
 import conversation_pause
 import launch_permission
 import unit_lookup
@@ -34,6 +35,7 @@ from test_support import ShutdownTestCase
 
 # Script completion deadlines only bound hangs; startup can be slow under load.
 SCRIPT = Path(__file__).with_name("add_unit.py")
+REAL_WORKTREE_IS_LINKED = add_unit.worktree_is_linked
 MARKED_TMUX_PLACE = unit_lookup.TmuxPlace("%7")
 OLD_HEADER = ["## Units", "| Unit | Plan | Worktree | Branch | Session | Port | Owns |",
               "| --- | --- | --- | --- | --- | --- | --- |"]
@@ -115,6 +117,15 @@ def setUpModule() -> None:
 
 @final
 class AddUnitTests(ShutdownTestCase):
+    seed: ClassVar[ImmutableGitSeed]
+
+    @classmethod
+    @override
+    def setUpClass(cls) -> None:
+        super().setUpClass()
+        root = Path(cls.enterClassContext(tempfile.TemporaryDirectory(prefix="AddUnitTests-seed-")))
+        cls.seed = ImmutableGitSeed.create(root, 'build-followups', 'Unit Test', 'unit@example.invalid', {})
+
     def __init__(self, methodName: str = "runTest") -> None:
         super().__init__(methodName)
         self.root = Path()
@@ -143,13 +154,8 @@ class AddUnitTests(ShutdownTestCase):
         ))
         del home_context
         self.checkout = self.root / "project-trunk"
-        self.checkout.mkdir()
         self.origin = self.root / "origin.git"
-        _ = self.git("init", "--bare", str(self.origin), cwd=self.root)
-        _ = self.git("init", "-b", "build-followups")
-        _ = self.git("config", "user.name", "Unit Test")
-        _ = self.git("config", "user.email", "unit@example.invalid")
-        _ = self.git("remote", "add", "origin", str(self.origin))
+        self.seed.copy_to(self.checkout, self.origin)
         self.doc = self.checkout / "docs/plans/build-followups-production.md"
         _ = self.doc.parent.mkdir(parents=True)
         _ = self.doc.write_text(self.production_doc(), encoding="utf-8")
@@ -355,13 +361,19 @@ class AddUnitTests(ShutdownTestCase):
         self.assertEqual(result.returncode, 0, (args, result.stdout, result.stderr))
         return result.stdout.strip()
 
-    def cli(self, *args: str, timeout: float = 300) -> subprocess.CompletedProcess[str]:
-        return subprocess.run([sys.executable, str(SCRIPT), "--production", str(self.doc), *args],
-                              cwd=self.checkout, env=self.env, capture_output=True, text=True,
-                              check=False, timeout=timeout)
+    def cli(self, *args: str, timeout: float = 300, subprocess_cli: bool = False) -> subprocess.CompletedProcess[str]:
+        arguments = ["--production", str(self.doc), *args]
+        if subprocess_cli:
+            return subprocess.run([sys.executable, str(SCRIPT), *arguments], cwd=self.checkout,
+                                  env=self.env, capture_output=True, text=True, check=False, timeout=timeout)
+        # The row-reader fixture patch never reached the old CLI child. Preserve
+        # the real worktree check on this command boundary too.
+        with patch.object(add_unit, "worktree_is_linked", REAL_WORKTREE_IS_LINKED):
+            return invoke_cli(add_unit, lambda: add_unit.main(arguments), arguments,
+                              self.env, self.checkout, production_state=True)
 
-    def successful(self, *args: str) -> subprocess.CompletedProcess[str]:
-        result = self.cli(*args)
+    def successful(self, *args: str, subprocess_cli: bool = False) -> subprocess.CompletedProcess[str]:
+        result = self.cli(*args, subprocess_cli=subprocess_cli)
         self.assertEqual(result.returncode, 0, (result.stdout, result.stderr))
         return result
 
@@ -736,34 +748,6 @@ class AddUnitTests(ShutdownTestCase):
         self.assert_no_launch_change(document, head)
 
     def test_restart_restore_is_allowed_for_its_restarting_unit(self) -> None:
-        self.commit_prepared_row(self.unit_row())
-        self.write_shutdown_record(self.shutdown_record("restarting"))
-        prior = self.root / "prior-session"
-        prior.mkdir()
-        note = self.root / "restart-note.txt"
-        _ = note.write_text("Resume this unit.", encoding="utf-8")
-
-        result = self.successful(
-            "alpha",
-            "--plan",
-            "docs/plans/given.md",
-            "--resume",
-            "session-123",
-            "--cwd",
-            str(prior),
-            "--restart-note",
-            str(note),
-            "--session-name",
-            "recorded-name",
-            "--host-session",
-            "recorded-tmux",
-        )
-
-        self.assertIn("alpha-unit restore launched", result.stdout)
-        self.assertEqual(len(self.events("systemd-run")), 1)
-        self.assertEqual(len(self.recorded_prompts("session-123")), 1)
-
-    def test_host_session_flag_restores_the_recorded_unit_session(self) -> None:
         self.commit_prepared_row(self.unit_row())
         self.write_shutdown_record(self.shutdown_record("restarting"))
         prior = self.root / "prior-session"
@@ -1225,7 +1209,7 @@ class AddUnitTests(ShutdownTestCase):
         self.assertIn("--resume requires --plan, --standby, or --permanent", result.stdout + result.stderr)
 
     def test_standby_launch_records_state_without_writing_a_plan(self) -> None:
-        _ = self.successful("alpha", "--standby", "--port", "8123", "--owns", "src/alpha")
+        _ = self.successful("alpha", "--standby", "--port", "8123", "--owns", "src/alpha", subprocess_cli=True)
         worktree = self.root / "project-alpha"
         self.assertIn(self.unit_row(plan="standby", port="8123", owns="src/alpha"),
                       self.doc.read_text())

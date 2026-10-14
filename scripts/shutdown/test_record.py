@@ -9,6 +9,7 @@ import tempfile
 import threading
 import time
 import unittest
+from datetime import datetime, tzinfo
 from pathlib import Path
 from typing import Literal, TypedDict, NotRequired, cast, final, override
 from collections.abc import Callable
@@ -22,6 +23,15 @@ from launch_permission import launch_barrier
 
 NOW = "2026-10-09T21:49:10+00:00"
 LATER = "2026-10-09T21:50:10+00:00"
+
+
+class ProgressWriteTime(datetime):
+    at: str = NOW
+
+    @classmethod
+    @override
+    def now(cls, tz: tzinfo | None = None) -> "ProgressWriteTime":
+        return cls.fromisoformat(cls.at).astimezone(tz)
 
 
 class LegacyEntryFixture(TypedDict):
@@ -149,7 +159,7 @@ def session_shutdown(
         hold=hold, then="stop", force="wait for ready", alerts="user",
         session=saved_entry["session"], seats=[], timers=saved_entry["timers"],
         settle_message=saved_entry["settle_message"], where=saved_entry["where"],
-        progress=cast(record.SessionProgress, saved_entry["progress"]), stop_issues=[],
+        progress=cast(record.SessionProgress, saved_entry["progress"]), trail=[], stop_issues=[],
     )
 
 
@@ -161,10 +171,10 @@ def account_hold(login: str = "owner@example.com") -> record.AccountHold:
     )
 
 
-def owned_seat(owner: str = "session-1") -> inventory.SeatSession:
+def owned_worker(owner: str = "session-1") -> inventory.SeatSession:
     return inventory.SeatSession(
-        kind="seat", session_id="seat-1", pid=20001, proc_start="seat-start",
-        name="worker", cwd="/tmp/seat", status="idle",
+        kind="seat", session_id="worker-1", pid=20001, proc_start="worker-start",
+        name="worker", cwd="/tmp/worker", status="idle",
         model=inventory.NoReplyYet(kind="no reply yet"),
         checkout=inventory.NotACheckout(kind="not a checkout"),
         run_dirs=[], codex_servers=[], timers=[], host=inventory.UnknownHost(kind="unknown"),
@@ -187,6 +197,71 @@ class SessionRecordTests(ShutdownTestCase):
         })))
         del context
 
+    def test_first_read_rewrites_busy_worker_fields_and_preserves_the_held_account_schema(self) -> None:
+        saved = session_shutdown()
+        worker = owned_worker()
+        worker["codex_servers"] = [inventory.CodexServer(run_dir="/tmp/run", pid=123,
+                                                        busy_workers=["writer"])]
+        saved["seats"] = [worker]
+        self.assertTrue(record.create_session(saved))
+        path = next((self.directory / "sessions").glob("*.json"))
+        old = path.read_text().replace('"busy_workers"', '"busy_seats"')
+        _ = path.write_text(old)
+        self.assertEqual(record.find_session(saved["login"], "session-1"), saved)
+        rewritten = path.read_text()
+        self.assertIn('"seats"', rewritten)
+        self.assertNotIn('"busy_seats"', rewritten)
+        self.assertIn('"kind": "seat"', rewritten)
+        modified = path.stat().st_mtime_ns
+        self.assertEqual(record.find_session(saved["login"], "session-1"), saved)
+        self.assertEqual(path.stat().st_mtime_ns, modified)
+
+    def test_first_read_rewrites_legacy_worker_progress_and_issues_once(self) -> None:
+        saved = shutdown_record()
+        saved["entries"][0]["progress"] = {"kind": "passive seat ready", "at": NOW}
+        saved["entries"][0]["stop_issues"] = [{"kind": "seat still live", "at": NOW}]
+        write_old(saved)
+        _ = record.session_records(saved["login"])
+        path = self.directory / "record.json"
+        rewritten = path.read_text()
+        self.assertIn('"passive worker ready"', rewritten)
+        self.assertIn('"worker still live"', rewritten)
+        modified = path.stat().st_mtime_ns
+        _ = record.session_records(saved["login"])
+        self.assertEqual(path.stat().st_mtime_ns, modified)
+
+    def test_first_read_converts_legacy_stop_issue_progress_and_preserves_the_issue(self) -> None:
+        saved = shutdown_record()
+        saved["entries"][0]["stop_issues"] = [{"kind": "not ready to stop", "at": NOW,
+                                               "status": "idle", "progress": "passive seat ready"}]
+        write_old(saved)
+        expected = record.NotReadyToStop(kind="not ready to stop", at=NOW,
+                                         status="idle", progress="passive worker ready")
+        loaded = record.session_records(saved["login"])
+        self.assertEqual(loaded[0]["stop_issues"], [expected])
+        path = self.directory / "record.json"
+        rewritten = path.read_text()
+        self.assertNotIn("passive seat ready", rewritten)
+        self.assertIn("passive worker ready", rewritten)
+        modified = path.stat().st_mtime_ns
+        self.assertEqual(record.session_records(saved["login"]), loaded)
+        self.assertEqual(path.stat().st_mtime_ns, modified)
+
+    def test_first_read_converts_session_stop_issue_progress_without_rewriting_it_again(self) -> None:
+        saved = session_shutdown()
+        saved["stop_issues"] = [record.NotReadyToStop(kind="not ready to stop", at=NOW,
+                                                    status="idle", progress="passive worker ready")]
+        self.assertTrue(record.create_session(saved))
+        path = self.directory / "sessions/session-1.json"
+        _ = path.write_text(path.read_text().replace("passive worker ready", "passive seat ready"))
+        self.assertEqual(record.find_session(saved["login"], "session-1"), saved)
+        rewritten = path.read_text()
+        self.assertNotIn("passive seat ready", rewritten)
+        self.assertIn("passive worker ready", rewritten)
+        modified = path.stat().st_mtime_ns
+        self.assertEqual(record.find_session(saved["login"], "session-1"), saved)
+        self.assertEqual(path.stat().st_mtime_ns, modified)
+
     def test_session_records_create_and_find_independent_sessions_in_one_account(self) -> None:
         first = session_shutdown(login="Owner@Example.com")
         second = session_shutdown(2, requested_at=LATER)
@@ -206,6 +281,76 @@ class SessionRecordTests(ShutdownTestCase):
                     session_name="named-unit", cause="stop not confirmed")]
                 self.assertEqual(record.parse_session_records(json.dumps([saved])), [saved])
 
+    def test_pre_trail_record_loads_without_inventing_history(self) -> None:
+        saved = session_shutdown()
+        document = cast(dict[str, object], json.loads(json.dumps(saved)))
+        _ = document.pop("trail", None)
+        path = self.directory / "sessions/session-1.json"
+        path.parent.mkdir(parents=True)
+        _ = path.write_text(json.dumps(document))
+        before = path.read_bytes()
+        found = record.find_session(saved["login"], "session-1")
+        assert found is not None
+        self.assertEqual(found["trail"], [])
+        self.assertEqual(found["progress"], {"kind": "waiting"})
+        self.assertEqual(path.read_bytes(), before)
+
+    def test_progress_trail_keeps_order_details_and_times_after_archival(self) -> None:
+        saved = session_shutdown()
+        self.assertTrue(record.create_session(saved))
+        baseline = list(record.session_records(saved["login"])[0]["trail"])
+        transitions: list[record.SessionProgress] = [
+            record.SessionReaping(kind="reaping", at=NOW,
+                because="account out of usage", detail="weekly limit, resets tomorrow"),
+            record.SessionStopping(kind="stopping", at=LATER),
+            record.SessionStopped(kind="stopped", at="2026-10-09T21:51:10+00:00"),
+            record.SessionRestarted(kind="restarted", at="2026-10-09T21:52:10+00:00"),
+        ]
+        for progress in transitions:
+            def change(current: record.SessionShutdown) -> None:
+                current["progress"] = progress
+            with patch.object(record, "datetime", ProgressWriteTime):
+                ProgressWriteTime.at = progress.get("at", NOW)
+                saved = record.update_session(saved["login"], "session-1", change)
+        appended = saved["trail"][len(baseline):]
+        self.assertEqual([step["kind"] for step in appended], ["reaping", "stopping", "stopped", "restarted"])
+        self.assertEqual([step["at"] for step in appended],
+            [NOW, LATER, "2026-10-09T21:51:10+00:00", "2026-10-09T21:52:10+00:00"])
+        self.assertIn("weekly limit, resets tomorrow", appended[0]["detail"])
+        self.assertIn("account out of usage", appended[0]["detail"])
+        def delivery_only(current: record.SessionShutdown) -> None:
+            current["settle_message"] = record.SettleMessageSent(kind="sent", at=LATER)
+        saved = record.update_session(saved["login"], "session-1", delivery_only)
+        self.assertEqual(saved["trail"][len(baseline):], appended)
+        record.archive_session(saved["login"], "session-1")
+        history = list((self.directory / "history").glob("*.json"))
+        self.assertEqual(len(history), 1)
+        archived = record.parse_session_records("[" + history[0].read_text() + "]")[0]
+        self.assertEqual(archived["trail"], saved["trail"])
+        self.assertEqual(archived["progress"], transitions[-1])
+
+    def test_progress_restoration_uses_write_time_and_preserves_original_progress(self) -> None:
+        saved = session_shutdown()
+        stopped = record.SessionStopped(kind="stopped", at=NOW)
+        saved["progress"] = stopped
+        self.assertTrue(record.create_session(saved))
+        restarting = record.SessionRestarting(kind="restarting", at=LATER, prior=stopped)
+        rollback_at = "2026-10-09T21:51:10+00:00"
+        with patch.object(record, "datetime", ProgressWriteTime):
+            ProgressWriteTime.at = LATER
+            _ = record.update_session(saved["login"], "session-1",
+                lambda current: current.update(progress=restarting))
+            ProgressWriteTime.at = rollback_at
+            restored = record.update_session(saved["login"], "session-1",
+                lambda current: current.update(progress=stopped))
+        self.assertEqual(restored["progress"], stopped)
+        self.assertEqual(restored["trail"], [
+            record.ProgressStep(at=NOW, kind="stopped", detail=""),
+            record.ProgressStep(at=LATER, kind="restarting", detail=""),
+            record.ProgressStep(at=rollback_at, kind="stopped", detail=""),
+        ])
+        self.assertEqual(record.find_session(saved["login"], "session-1"), restored)
+
     def test_old_tmux_leftover_issue_is_normalized_on_read_and_written_canonically(self) -> None:
         saved = session_shutdown()
         saved["stop_issues"] = [record.UnitSessionLeftRunning(
@@ -219,7 +364,7 @@ class SessionRecordTests(ShutdownTestCase):
         self.assertTrue(record.create_session(parsed))
         stored = cast(dict[str, object], json.loads((self.directory / "sessions/session-1.json").read_text()))
         self.assertEqual(stored["stop_issues"], saved["stop_issues"])
-        self.assertEqual(record.find_session(saved["login"], "session-1"), saved)
+        self.assertEqual(record.find_session(saved["login"], "session-1"), parsed)
 
     def test_unit_session_leftover_issue_rejects_an_unknown_host_or_missing_name(self) -> None:
         for fields in ({"host": "other", "session_name": "unit"}, {"host": "herdr"},
@@ -231,14 +376,14 @@ class SessionRecordTests(ShutdownTestCase):
                 with self.assertRaises(record.InvalidRecord):
                     _ = record.parse_session_records(json.dumps([wire]))
 
-    def test_herdr_hosts_round_trip_for_owners_and_their_seats(self) -> None:
+    def test_herdr_hosts_round_trip_for_owners_and_their_workers(self) -> None:
         saved = session_shutdown()
         owner = session()
         owner["host"] = inventory.HerdrHost(kind="herdr", herdr_session="director", pane_id="w1:p1")
         saved["session"] = owner
-        seat = owned_seat()
-        seat["host"] = inventory.HerdrHost(kind="herdr", herdr_session="director", pane_id="w1:p2")
-        saved["seats"] = [seat]
+        worker = owned_worker()
+        worker["host"] = inventory.HerdrHost(kind="herdr", herdr_session="director", pane_id="w1:p2")
+        saved["seats"] = [worker]
         self.assertTrue(record.create_session(saved))
         self.assertEqual(record.find_session(saved["login"], "session-1"), saved)
         self.assertEqual(record.parse_session_records(json.dumps([saved])), [saved])
@@ -625,14 +770,14 @@ class SessionRecordTests(ShutdownTestCase):
                     record.set_account_hold(account_hold())
                 self.assertEqual(path.read_text(), text)
 
-    def test_session_records_validate_seats_and_claim_timestamps(self) -> None:
+    def test_session_records_validate_workers_and_claim_timestamps(self) -> None:
         saved = session_shutdown(progress=record.SessionRestarting(kind="restarting", at=LATER, prior=record.SessionStopped(kind="stopped", at=NOW)))
-        saved["seats"] = [owned_seat()]
+        saved["seats"] = [owned_worker()]
         saved["alerted_at"] = NOW
         self.assertEqual(record.parse_session_records(json.dumps([saved])), [saved])
         for field, value in (
-            ("session", owned_seat()), ("seats", [session()]),
-            ("seats", [owned_seat("another")]), ("progress", {"kind": "restarting"}),
+            ("session", owned_worker()), ("seats", [session()]),
+            ("seats", [owned_worker("another")]), ("progress", {"kind": "restarting"}),
             ("alerted_at", "2026-10-09T21:49:10Z"), ("hold", "all"), ("alerts", "phone"),
         ):
             with self.subTest(field=field):
@@ -641,7 +786,7 @@ class SessionRecordTests(ShutdownTestCase):
                 with self.assertRaises(record.InvalidRecord):
                     _ = record.parse_session_records(json.dumps([malformed]))
 
-    def test_session_records_convert_old_states_and_attach_seats_without_writing(self) -> None:
+    def test_session_records_convert_old_states_and_attach_workers_without_writing(self) -> None:
         for state in ("settling", "down", "restarting"):
             with self.subTest(state=state):
                 login = f"{state}@example.com"
@@ -649,8 +794,8 @@ class SessionRecordTests(ShutdownTestCase):
                 old["then"] = "restart"
                 old["force"] = "now"
                 old["entries"][0]["progress"] = record.SessionStopped(kind="stopped", at=LATER) if state == "down" else record.SessionWaiting(kind="waiting")
-                worker = entry({"kind": "passive seat ready", "at": NOW}, number=9)
-                worker["session"] = owned_seat()
+                worker = entry({"kind": "passive worker ready", "at": NOW}, number=9)
+                worker["session"] = owned_worker()
                 old["entries"].append(worker)
                 write_old(old)
                 directory = self.directory.parent / login
@@ -700,15 +845,15 @@ class SessionRecordTests(ShutdownTestCase):
             progress=record.SessionNeedsManualRestart(kind="manual restart", command="resume old"),
         )
         partial_worker = entry(number=8)
-        partial_worker["session"] = owned_seat()
+        partial_worker["session"] = owned_worker()
         partial["entries"].append(partial_worker)
         write_old(partial)
         _ = move_old(partial["login"])
         slot = shutdown_record(progress=record.SessionWaiting(kind="waiting"))
         slot_worker = entry(number=9)
-        seat = owned_seat()
-        seat["session_id"] = "slot-seat"
-        slot_worker["session"] = seat
+        worker = owned_worker()
+        worker["session_id"] = "slot-worker"
+        slot_worker["session"] = worker
         slot["entries"].append(slot_worker)
         write_old(slot)
 
@@ -717,7 +862,7 @@ class SessionRecordTests(ShutdownTestCase):
         if found is None:
             self.fail("expected the slot's session record")
         self.assertEqual(found["progress"], slot["entries"][0]["progress"])
-        self.assertEqual(found["seats"], [seat])
+        self.assertEqual(found["seats"], [worker])
         self.assertEqual(record.session_records(slot["login"]), [found])
         self.assertEqual(record.all_session_records(), [found])
 
@@ -733,7 +878,7 @@ class SessionRecordTests(ShutdownTestCase):
             progress=record.SessionRestartFailed(kind="restart failed", at=LATER, reason="new failure"),
         )
         worker = entry(number=9)
-        worker["session"] = owned_seat()
+        worker["session"] = owned_worker()
         newer["entries"].append(worker)
         write_old(newer)
         _ = move_old(newer["login"])
@@ -838,8 +983,8 @@ class SessionRecordTests(ShutdownTestCase):
                 saved = shutdown_record(f"{state}@example.com", state=state)
                 saved["conductor"] = {"kind": "systemd", "unit": "old-service"}
                 saved["stop_issues"] = [{"kind": "machine stop failed", "at": NOW, "machine": "Mac", "reason": "not reached"}]
-                worker = entry({"kind": "passive seat ready", "at": NOW}, number=9)
-                worker["session"] = owned_seat()
+                worker = entry({"kind": "passive worker ready", "at": NOW}, number=9)
+                worker["session"] = owned_worker()
                 saved["entries"].append(worker)
                 write_old(saved)
                 before = record.session_records(saved["login"])

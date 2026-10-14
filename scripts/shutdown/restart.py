@@ -232,7 +232,7 @@ class RestartNotStopped(TypedDict):
     kind: Literal["not stopped"]
     session_id: str
     name: str
-    progress: Literal["waiting", "ready", "held by usage limit", "stopping"]
+    progress: Literal["waiting", "ready", "held by usage limit", "reaping", "stopping"]
 
 
 class RestartNoShutdown(TypedDict):
@@ -269,7 +269,7 @@ class MachineRestartResult:
     label: str
     status: Literal["done", "partial", "nothing"]
     restarted: int = 0
-    seats: int = 0
+    workers: int = 0
     manual: int = 0
     failed: int = 0
     failed_sessions: tuple[FailedSessionRestart, ...] = ()
@@ -1557,7 +1557,7 @@ def _machine_result(records: list[SessionShutdown], machine: str, label: str) ->
         machine, label, "partial" if failed or manual or pending or any(
             item["progress"]["kind"] != "restarted" for item in records
         ) else "done",
-        restarted=restarted, seats=sum(len(item["seats"]) for item in records if item["progress"]["kind"] == "restarted"),
+        restarted=restarted, workers=sum(len(item["seats"]) for item in records if item["progress"]["kind"] == "restarted"),
         failed=len(failed), manual=len(manual), failed_sessions=failed,
         manual_sessions=manual, timers_not_started=pending,
     )
@@ -1571,8 +1571,8 @@ def _result_lines(result: MachineRestartResult) -> list[str]:
     if result.status == "nothing":
         return []
     lines = [
-        "{}: {} restarted, {} seats available on demand".format(
-            result.machine, result.restarted, result.seats
+        "{}: {} restarted, {} workers available on demand".format(
+            result.machine, result.restarted, result.workers
         )
     ]
     lines.extend(
@@ -1756,9 +1756,9 @@ def _up(login: str, dry_run: bool, only: Iterable[str] = ()) -> MachineRestartRe
         print(refusal_line(refusal))
     at = datetime.fromisoformat(settle.record_time())
     for saved in records:
-        if ids and saved["progress"]["kind"] in {"waiting", "ready", "held by usage limit", "stopping"}:
+        if ids and saved["progress"]["kind"] in {"waiting", "ready", "held by usage limit", "reaping", "stopping"}:
             refusal = RestartNotStopped(kind="not stopped", session_id=saved["session"]["session_id"],
-                name=saved["session"]["name"], progress=cast(Literal["waiting", "ready", "held by usage limit", "stopping"], saved["progress"]["kind"]))
+                name=saved["session"]["name"], progress=cast(Literal["waiting", "ready", "held by usage limit", "reaping", "stopping"], saved["progress"]["kind"]))
             refused.append(refusal)
             print(refusal_line(refusal))
         elif ids and saved["progress"]["kind"] == "restarting" and (
@@ -1898,9 +1898,9 @@ def parse_peer_result(text: str) -> PeerRestartResult:
                 missing.append(NoRemoteControl(session_id=identity, name=name, alerts=cast(Literal["user", "none"], item["alerts"])))
             elif item.get("kind") == "no shutdown":
                 refusals.append(RestartNoShutdown(kind="no shutdown", session_id=identity, name=name))
-            elif item.get("kind") == "not stopped" and item.get("progress") in ("waiting", "ready", "held by usage limit", "stopping"):
+            elif item.get("kind") == "not stopped" and item.get("progress") in ("waiting", "ready", "held by usage limit", "reaping", "stopping"):
                 refusals.append(RestartNotStopped(kind="not stopped", session_id=identity, name=name,
-                    progress=cast(Literal["waiting", "ready", "held by usage limit", "stopping"], item["progress"])))
+                    progress=cast(Literal["waiting", "ready", "held by usage limit", "reaping", "stopping"], item["progress"])))
             else:
                 raise ValueError("invalid peer restart refusal")
     return PeerRestartResult(machine=cast(str, fields["machine"]), label=cast(str, fields["label"]),

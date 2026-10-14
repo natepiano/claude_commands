@@ -80,7 +80,7 @@ def daemon_socket(environment: Mapping[str, str]) -> Path:
 
 
 def _daemon_home(environment: Mapping[str, str]) -> Path:
-    """The freestanding daemon's home, never the seats role."""
+    """The freestanding daemon's home, independent of the `seats` account role."""
     configured = environment.get("CODEX_HOME")
     if configured:
         return Path(configured).expanduser()

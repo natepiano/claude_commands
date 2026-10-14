@@ -164,7 +164,7 @@ def _timestamp(clock: Clock) -> str:
 def _fresh_inventory(login: str, only: frozenset[str]) -> Inventory:
     from inventory import inventory
 
-    return inventory(login, only)
+    return inventory(login, only=only, refresh_desktops=False)
 
 
 def fresh_session(stored: Session, report: Inventory) -> FreshSession:
@@ -294,14 +294,14 @@ def _run_directories(session: Session) -> list[str]:
     )
 
 
-def _end_busy_codex_seats(
+def _end_busy_codex_workers(
     session: Session, codex_mesh: CommandRunner, claim: StopClaim
 ) -> None:
     for server in session["codex_servers"]:
-        for seat in server["busy_seats"]:
+        for worker in server["busy_workers"]:
             claim.check()
             _ = codex_mesh(
-                ["end", "--session-dir", server["run_dir"], "--to", seat]
+                ["end", "--session-dir", server["run_dir"], "--to", worker]
             )
 
 
@@ -566,10 +566,10 @@ def _stop_owner(
         return
 
     current = match["session"]
-    if not force_now and (
+    if not force_now and prior["kind"] != "reaping" and (
         prior["kind"] not in {"ready", "held by usage limit", "stopping", "stop failed"}
         or current["status"] != "idle"
-        or any(seat["status"] != "idle" for seat in match["seats"])
+        or any(worker["status"] != "idle" for worker in match["seats"])
         or settle.blocker(current)["kind"] != "clear"
     ):
         issue = NotReadyToStop(
@@ -580,11 +580,11 @@ def _stop_owner(
         )
         _ = _set_stop_outcome(
             claim, "stop failed", clock, [issue],
-            "session or seat is not idle and ready",
+            "session or worker is not idle and ready",
         )
         return
     if force_now:
-        _end_busy_codex_seats(current, codex_mesh, claim)
+        _end_busy_codex_workers(current, codex_mesh, claim)
     try:
         claim.check()
         kill(stored["pid"], signal.SIGTERM)
@@ -737,7 +737,7 @@ def stop_session(
             if age < CLAIM_STALE_SECONDS:
                 return
         elif progress["kind"] not in {
-            "waiting", "ready", "held by usage limit", "stop failed", "stopped", "already gone", "process identity lost", "restart failed",
+            "waiting", "ready", "held by usage limit", "reaping", "stop failed", "stopped", "already gone", "process identity lost", "restart failed",
         }:
             return
         prior = copy.deepcopy(progress)

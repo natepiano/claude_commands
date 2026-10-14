@@ -5,6 +5,7 @@ from __future__ import annotations
 import io
 import json
 import os
+import shutil
 import subprocess
 import tempfile
 import sys
@@ -36,6 +37,7 @@ import stop as stop_work
 # The module settle imports by its own path entry: a separate object from the package import below.
 import showrunners as settle_showrunners
 from scripts.accounts import moves
+import usage_store
 from scripts.production import showrunners
 from account import Account
 
@@ -74,7 +76,7 @@ def common_session(
     status: str = "idle",
     ahead: int = 0,
     timers: list[str] | None = None,
-    busy_seats: list[str] | None = None,
+    busy_workers: list[str] | None = None,
 ) -> inventory.SessionFields:
     return {
         "session_id": session_id,
@@ -91,10 +93,10 @@ def common_session(
                 inventory.CodexServer(
                     run_dir=f"/tmp/run-{session_id}",
                     pid=20_000,
-                    busy_seats=list(busy_seats or []),
+                    busy_workers=list(busy_workers or []),
                 )
             ]
-            if busy_seats
+            if busy_workers
             else []
         ),
         "timers": list(timers or []),
@@ -108,7 +110,7 @@ def top_level(
     status: str = "idle",
     ahead: int = 0,
     timers: list[str] | None = None,
-    busy_seats: list[str] | None = None,
+    busy_workers: list[str] | None = None,
 ) -> inventory.TopLevelSession:
     return inventory.TopLevelSession(
         **common_session(
@@ -117,7 +119,7 @@ def top_level(
             status=status,
             ahead=ahead,
             timers=timers,
-            busy_seats=busy_seats,
+            busy_workers=busy_workers,
         ),
         kind="top-level",
         host=inventory.UnknownHost(kind="unknown"),
@@ -168,14 +170,14 @@ def showrunner(
     )
 
 
-def seat(
+def worker_session(
     session_id: str,
     name: str,
     *,
     owner: str | None,
     status: str = "idle",
 ) -> inventory.SeatSession:
-    seat_owner: inventory.SeatOwner = (
+    worker_owner: inventory.WorkerOwner = (
         inventory.DirectorOwner(kind="director", session_id=owner)
         if owner is not None
         else inventory.NoDirector(kind="no director")
@@ -184,7 +186,7 @@ def seat(
         **common_session(session_id, name, status=status),
         kind="seat",
         host=inventory.UnknownHost(kind="unknown"),
-        owner=seat_owner,
+        owner=worker_owner,
     )
 
 
@@ -211,7 +213,7 @@ def session_shutdown(session: inventory.Session, *, progress: record.SessionProg
         requested_by={"kind": "session", "session_id": requester} if requester else {"kind": "terminal"},
         hold="session", then=then, force="wait for ready", alerts="user", session=session,
         seats=[], timers=[], settle_message={"kind": "not sent"}, where={"kind": "not said"},
-        progress=progress or {"kind": "waiting"}, stop_issues=[],
+        progress=progress or {"kind": "waiting"}, trail=[], stop_issues=[],
     )
 
 
@@ -247,6 +249,283 @@ class SettleTests(ShutdownTestCase):
         _ = path.write_text(json.dumps({"type": "assistant", "isApiErrorMessage": True,
             "error": "rate_limit", "timestamp": NOW, "uuid": "refusal-entry",
             "message": {"model": "<synthetic>", "content": [{"type": "text", "text": "weekly limit"}]}}) + "\n")
+
+    def write_usage(self, weekly: float, *, five: float = 50,
+                    at: datetime = NOW_UTC, login: str = LOGIN) -> None:
+        saved = usage_store.load()
+        saved[usage_store.key("Claude", login)] = usage_store.StoredUsage(
+            weekly=usage_store.StoredWindow(left=weekly, at=at.isoformat(),
+                resets=(NOW_UTC + timedelta(days=2)).isoformat()),
+            five_hour=usage_store.StoredWindow(left=five, at=at.isoformat(),
+                resets=(NOW_UTC + timedelta(hours=3)).isoformat()))
+        usage_store.write(saved)
+
+    def test_prompt_state_refusal_outweighs_room_and_uses_own_config(self) -> None:
+        self.write_usage(80)
+        self.write_refusal_transcript("own-refusal")
+        own_config = self.root / "own-config"
+        _ = (self.root / ".claude").rename(own_config)
+        subject = settle.PromptSubject("own-refusal", LOGIN, own_config)
+        state = settle.prompt_state(subject, NOW_UTC)
+        self.assertIsInstance(state, settle.StoppedTakingPrompts)
+        if isinstance(state, settle.StoppedTakingPrompts):
+            self.assertEqual(state.because, "refused in its transcript")
+            self.assertIn("weekly", state.detail)
+        other = settle.PromptSubject("own-refusal", LOGIN, self.root / ".claude")
+        self.assertEqual(settle.prompt_state(other, NOW_UTC), settle.TakesPrompts("room"))
+
+    def test_prompt_state_room_spent_and_stale_readings_are_account_scoped(self) -> None:
+        subject = settle.PromptSubject("usage-owner", LOGIN, self.root / ".claude")
+        self.assertEqual(settle.prompt_state(subject, NOW_UTC), settle.TakesPrompts("no fresh reading"))
+        self.write_usage(90, login="other@example.com")
+        for weekly, five in ((0, 70), (80, 0)):
+            with self.subTest(weekly=weekly, five=five):
+                self.write_usage(weekly, five=five)
+                state = settle.prompt_state(subject, NOW_UTC)
+                self.assertIsInstance(state, settle.StoppedTakingPrompts)
+                if isinstance(state, settle.StoppedTakingPrompts):
+                    self.assertEqual(state.because, "account out of usage")
+                    self.assertIn("weekly" if weekly == 0 else "5", state.detail)
+        self.write_usage(80, five=1)
+        self.assertEqual(settle.prompt_state(subject, NOW_UTC), settle.TakesPrompts("room"))
+        self.write_usage(0, five=0, at=NOW_UTC - timedelta(minutes=11))
+        self.assertEqual(settle.prompt_state(subject, NOW_UTC), settle.TakesPrompts("no fresh reading"))
+
+    def test_spent_account_reaps_without_pause_on_first_tick_then_restarts(self) -> None:
+        owner = top_level("spent-owner", "Spent owner", status="busy")
+        owner["config_dir"] = str(self.root / ".claude")
+        self.write_usage(0)
+        report = machine_inventory([owner])
+        with patch.object(settle, "run_inventory", return_value=report):
+            added = settle.begin(LOGIN, only=[owner["session_id"]], request_id="spent-request", then="restart")
+        self.assertEqual(len(added), 1)
+        self.assertEqual(added[0]["progress"]["kind"], "reaping")
+        self.assertEqual(added[0]["settle_message"], {"kind": "not sent"})
+        self.assertIsInstance(settle.next_step(added[0], self.matching(added[0]), [], NOW_UTC), settle.StopSession)
+        stops: list[str] = []
+        def stop_once(saved: record.SessionShutdown) -> record.SessionShutdown:
+            self.assertEqual(saved["progress"]["kind"], "reaping")
+            stops.append(saved["session"]["session_id"])
+            return self.fake_stop(saved)
+        with (patch.object(settle, "run_inventory", return_value=report),
+              patch.object(stop_work, "stop_session", side_effect=stop_once),
+              patch.object(restart_work, "relaunch_session", side_effect=self.fake_launch) as launch,
+              patch.object(restart_work, "wait_for_confirmation", side_effect=self.all_live),
+              patch.object(restart_work, "confirm_entry", side_effect=self.fake_confirm),
+              patch.object(settle, "send_message") as send,
+              patch.object(settle, "report_stop")):
+            self.assertEqual(settle.conduct(LOGIN), 0)
+        self.assertEqual(stops, [owner["session_id"]])
+        launch.assert_called_once()
+        send.assert_not_called()
+        history = list((self.root / "state" / LOGIN / "history").glob("*.json"))
+        self.assertEqual(len(history), 1)
+        archived = record.parse_session_records("[" + history[0].read_text() + "]")[0]
+        self.assertEqual(archived["progress"]["kind"], "restarted")
+
+    def test_account_with_room_sends_pause_and_waits_until_ready(self) -> None:
+        owner = top_level("room-owner", "Room owner")
+        owner["config_dir"] = str(self.root / ".claude")
+        self.write_usage(70)
+        report = machine_inventory([owner])
+        with patch.object(settle, "run_inventory", return_value=report):
+            saved = settle.begin(LOGIN, only=[owner["session_id"]], request_id="room-request")[0]
+        self.assertEqual(saved["force"], "wait for ready")
+        self.assertEqual(saved["progress"]["kind"], "waiting")
+        with patch.object(settle, "send_message", return_value=settle.MessageSent(kind="sent")) as send:
+            settle._send_settle_message(saved)  # pyright: ignore[reportPrivateUsage]
+        send.assert_called_once()
+        current = record.find_session(LOGIN, owner["session_id"])
+        assert current is not None
+        self.assertEqual(current["settle_message"]["kind"], "sent")
+        self.assertIsInstance(settle.next_step(current, self.matching(current), [], NOW_UTC), settle.Hold)
+        with patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": owner["session_id"]}), patch.object(settle, "run_inventory", return_value=report):
+            self.assertEqual(settle.ready("saved and pushed"), 0)
+        current = record.find_session(LOGIN, owner["session_id"])
+        assert current is not None
+        self.assertIsInstance(settle.next_step(current, self.matching(current), [], NOW_UTC), settle.StopSession)
+
+    def test_ghostty_refusal_after_pause_reaps_in_one_tick_without_reask(self) -> None:
+        owner = top_level("late-refusal", "Late refusal", status="busy")
+        owner["config_dir"] = str(self.root / ".claude")
+        owner["host"] = inventory.WindowHost(kind="ghostty", window_shell=123,
+            desktop=inventory.DesktopNotInSnapshot(kind="not in snapshot"))
+        self.write_refusal_transcript(owner["session_id"])
+        saved = session_shutdown(owner)
+        saved["settle_message"] = record.SettleMessageSent(kind="sent",
+            at=(NOW_UTC - timedelta(minutes=3)).isoformat())
+        self.save(saved)
+        observed: list[str] = []
+        def stop_refused(current: record.SessionShutdown) -> record.SessionShutdown:
+            self.assertEqual(current["progress"]["kind"], "reaping")
+            observed.append(current["session"]["session_id"])
+            return self.fake_stop(current)
+        with (patch.object(settle, "run_inventory", return_value=machine_inventory([owner])) as read,
+              patch.object(stop_work, "stop_session", side_effect=stop_refused),
+              patch.object(settle, "send_message") as send,
+              patch.object(settle, "report_stop")):
+            self.assertEqual(settle.conduct(LOGIN), 0)
+        read.assert_called_once()
+        self.assertEqual(observed, [owner["session_id"]])
+        send.assert_not_called()
+
+    def test_conductor_skips_owner_withdrawn_during_refusal_scan_and_stops_other_owner(self) -> None:
+        from scripts.accounts import refusal_watch
+
+        withdrawn = session_shutdown(top_level("withdrawn-owner", "A withdrawn owner", status="busy"))
+        withdrawn["session"]["config_dir"] = str(self.root / ".claude")
+        withdrawn["settle_message"] = record.SettleMessageSent(kind="sent",
+            at=(NOW_UTC - timedelta(seconds=1)).isoformat())
+        ready = session_shutdown(top_level("ready-owner", "Z ready owner"),
+            progress={"kind": "ready", "at": NOW})
+        self.save(withdrawn)
+        self.save(ready)
+        self.write_refusal_transcript(withdrawn["session"]["session_id"])
+        read_refusal = refusal_watch.transcript_refusal
+
+        def withdraw_after_read(identity: str, *, config_dir: Path | None = None) -> refusal_watch.TranscriptRefusal | refusal_watch.NoSessionRefusal:
+            refusal = read_refusal(identity, config_dir=config_dir)
+            self.assertIsInstance(refusal, refusal_watch.TranscriptRefusal)
+            _ = record.withdraw_session(LOGIN, identity, lambda _saved: None)
+            return refusal
+
+        with (patch.object(refusal_watch, "transcript_refusal", side_effect=withdraw_after_read) as scan,
+              patch.object(settle, "_usage_limit_shown", return_value=False),
+              patch.object(settle, "run_inventory", return_value=machine_inventory([withdrawn["session"], ready["session"]])),
+              patch.object(stop_work, "stop_session", side_effect=self.fake_stop) as stop,
+              patch.object(settle, "send_message") as send,
+              patch.object(settle, "report_stop") as report):
+            self.assertEqual(settle.conduct(LOGIN), 0)
+        scan.assert_called_once()
+        stop.assert_called_once()
+        self.assertEqual(stop.call_args.args[0]["session"]["session_id"], "ready-owner")
+        self.assertIsNone(record.find_session(LOGIN, "withdrawn-owner"))
+        current = record.find_session(LOGIN, "ready-owner")
+        assert current is not None
+        self.assertEqual(current["progress"]["kind"], "stopped")
+        reported = cast(list[record.SessionShutdown], report.call_args.args[0])
+        self.assertEqual([saved["session"]["session_id"] for saved in reported], ["ready-owner"])
+        send.assert_not_called()
+
+    def test_now_advances_reaping_owner_with_and_without_explicit_selection(self) -> None:
+        for ids in ((), ("reaping-owner",)):
+            with self.subTest(ids=ids):
+                identity = ids[0] if ids else "unfiltered-reaping-owner"
+                owner = top_level(identity, "Reaping owner", status="busy")
+                saved = session_shutdown(owner, progress=record.SessionReaping(kind="reaping", at=NOW,
+                    because="account out of usage", detail="weekly limit"))
+                self.save(saved)
+                with (patch.object(settle, "_launch_conductor", side_effect=self.run_conductor) as launch,
+                      patch.object(settle, "run_inventory", return_value=machine_inventory([owner])),
+                      patch.object(stop_work, "stop_session", side_effect=self.fake_stop) as stop,
+                      patch.object(settle, "send_message") as send,
+                      patch.object(settle, "report_stop"), redirect_stdout(io.StringIO())):
+                    self.assertEqual(settle.now(Account("claude", LOGIN, LABEL), here=True, only=ids), 0)
+                launch.assert_called_once_with(LOGIN, LABEL)
+                stop.assert_called_once()
+                self.assertEqual(stop.call_args.args[0]["progress"]["kind"], "reaping")
+                current = record.find_session(LOGIN, owner["session_id"])
+                assert current is not None
+                self.assertEqual(current["progress"]["kind"], "stopped")
+                send.assert_not_called()
+                record.archive_session(LOGIN, owner["session_id"])
+
+    def test_status_trail_prints_steps_in_user_zone_in_order(self) -> None:
+        saved = session_shutdown(top_level("trail-owner", "Trail owner"))
+        saved["trail"] = [record.ProgressStep(at=NOW, kind="waiting", detail="pause sent"),
+            record.ProgressStep(at="2026-10-09T21:50:10+00:00", kind="reaping", detail="weekly limit")]
+        with patch.dict(os.environ, {"USER_ZONE": "America/New_York"}):
+            lines = settle.status_record_lines(saved)
+        self.assertEqual([line.strip() for line in lines[1:]],
+            ["17:49:10 waiting pause sent", "17:50:10 reaping weekly limit"])
+
+    def test_conductor_tick_inventories_only_live_record_ids_without_desktop_refresh(self) -> None:
+        first = top_level("first-owner", "First owner", status="busy")
+        second = top_level("second-owner", "Second owner", status="busy")
+        worker = worker_session("owned-worker", "Owned worker", owner=first["session_id"])
+        for owner in (first, second):
+            saved = session_shutdown(owner)
+            saved["settle_message"] = record.SettleMessageSent(kind="sent", at=NOW)
+            if owner is first:
+                saved["seats"] = [worker]
+            self.save(saved)
+        with (
+            patch.object(settle, "inventory", return_value=machine_inventory([first, second, worker])) as read,
+            patch.object(stop_work, "stop_session") as stop,
+            patch.object(settle, "send_message") as send,
+            patch.object(time, "sleep", side_effect=PassObserved),
+            self.assertRaises(PassObserved),
+        ):
+            _ = settle.conduct(LOGIN)
+        read.assert_called_once_with(LOGIN,
+            only=frozenset({first["session_id"], second["session_id"]}), refresh_desktops=False)
+        stop.assert_not_called()
+        send.assert_not_called()
+
+    def test_conductor_tick_reads_cached_desktops_without_running_snapshot_updater(self) -> None:
+        owner = top_level("cached-owner", "Cached owner", status="busy")
+        saved = session_shutdown(owner)
+        saved["settle_message"] = record.SettleMessageSent(kind="sent", at=NOW)
+        self.save(saved)
+        registered = sessions.SessionRecord(pid=owner["pid"], sessionId=owner["session_id"],
+            name=owner["name"], procStart=owner["proc_start"], messagingSocketPath="",
+            updatedAt=1, tmux="", formerNames=[])
+        registry = self.root / "sessions"
+        registry.mkdir(parents=True, exist_ok=True)
+        _ = (registry / f"{owner['pid']}.json").write_text(json.dumps(
+            {**registered, "status": "busy", "cwd": str(self.root)}))
+        _ = self.enterContext(patch.object(inventory, "_registered_productions", return_value=({}, [])))
+        _ = self.enterContext(patch.object(inventory, "_unit_sessions", return_value={}))
+        _ = self.enterContext(patch.object(inventory, "_active_run_directories", return_value={}))
+        _ = self.enterContext(patch.object(inventory, "_newest_unit_plans", return_value={}))
+        with (
+            patch.object(Path, "home", return_value=self.root),
+            patch.object(sys, "platform", "linux"),
+            patch.dict(os.environ, {"REFUSAL_WATCH_INVENTORY": "refresh"}),
+            patch.object(sessions, "live_sessions", return_value=[registered]),
+            patch.object(inventory, "_record_matches_process", return_value=True),
+            patch.object(inventory, "_configuration_for_session", return_value=
+                inventory.AttributedSessionConfiguration(Account("claude", LOGIN, LABEL), self.root / ".claude")),
+            patch.object(inventory, "_checkout", return_value=owner["checkout"]),
+            patch.object(inventory, "_host", return_value=owner["host"]),
+            patch.object(inventory, "_timers", return_value=[]),
+            patch.object(inventory, "label_for", return_value=LABEL),
+            patch.object(inventory, "_snapshot_desktops", wraps=inventory._snapshot_desktops) as snapshot,  # pyright: ignore[reportPrivateUsage]
+            patch.object(shutil, "which", return_value="/fixture/agent-sessions-snapshot"),
+            patch.object(subprocess, "run", return_value=subprocess.CompletedProcess([], 0, "", "")) as command,
+            patch.object(settle, "send_message") as send,
+            patch.object(stop_work, "stop_session") as stop,
+            patch.object(time, "sleep", side_effect=PassObserved),
+            self.assertRaises(PassObserved),
+        ):
+            _ = settle.conduct(LOGIN)
+        snapshot.assert_called_once_with(refresh=False)
+        command.assert_not_called()
+        send.assert_not_called()
+        stop.assert_not_called()
+
+    def test_refusal_before_pause_does_not_reap_a_waiting_ghostty_owner(self) -> None:
+        owner = top_level("older-refusal", "Older refusal", status="busy")
+        owner["config_dir"] = str(self.root / ".claude")
+        owner["host"] = inventory.WindowHost(kind="ghostty", window_shell=123,
+            desktop=inventory.DesktopNotInSnapshot(kind="not in snapshot"))
+        self.write_refusal_transcript(owner["session_id"])
+        saved = session_shutdown(owner)
+        saved["settle_message"] = record.SettleMessageSent(kind="sent",
+            at=(NOW_UTC + timedelta(seconds=1)).isoformat())
+        self.save(saved)
+        with (patch.object(settle, "run_inventory", return_value=machine_inventory([owner])),
+              patch.object(stop_work, "stop_session") as stop,
+              patch.object(settle, "send_message") as send,
+              patch.object(settle, "report_stop"),
+              patch.object(time, "sleep", side_effect=PassObserved),
+              self.assertRaises(PassObserved)):
+            _ = settle.conduct(LOGIN)
+        current = record.find_session(LOGIN, owner["session_id"])
+        assert current is not None
+        self.assertEqual(current["progress"]["kind"], "waiting")
+        stop.assert_not_called()
+        send.assert_not_called()
 
     def test_conductor_service_preserves_read_existing_snapshot_policy(self) -> None:
         self.allow_leaf(ShutdownSendLeaf.LAUNCH_CONDUCTOR)
@@ -290,8 +569,8 @@ class SettleTests(ShutdownTestCase):
             self.assertIsInstance(settle._usage_limit_change(other, self.matching(other)),  # pyright: ignore[reportPrivateUsage]
                 settle.NoUsageLimitChange)
 
-    def test_transcript_refusal_hold_preserves_busy_seat_and_upstream_safety(self) -> None:
-        owner = top_level("refused-owner", "Refused owner", busy_seats=["Busy worker"])
+    def test_transcript_refusal_hold_preserves_busy_worker_and_upstream_safety(self) -> None:
+        owner = top_level("refused-owner", "Refused owner", busy_workers=["Busy worker"])
         self.write_refusal_transcript(owner["session_id"])
         saved = session_shutdown(owner, progress=record.SessionHeldByUsageLimit(kind="held by usage limit", at=NOW))
         saved["target"] = "claude 3"
@@ -508,12 +787,12 @@ class SettleTests(ShutdownTestCase):
         with patch.object(settle, "_screen", return_value=settle.ScreenText("hit your session limit")):
             self.assertIsInstance(settle._usage_limit_change(saved, self.matching(saved)), settle.LeaveUsageLimitHold)  # pyright: ignore[reportPrivateUsage]
 
-    def test_held_next_step_uses_idle_seats_and_readiness_without_the_limit_form(self) -> None:
+    def test_held_next_step_uses_idle_workers_and_readiness_without_the_limit_form(self) -> None:
         saved = session_shutdown(top_level("owner", "Owner"), progress=record.SessionHeldByUsageLimit(kind="held by usage limit", at=NOW))
         with patch.object(settle, "_showing_form", return_value=True) as form:
             self.assertIsInstance(settle.next_step(saved, self.matching(saved), [], NOW_UTC), settle.StopSession)
-            saved["seats"] = [seat("worker", "Worker", owner="owner", status="busy")]
-            self.assertEqual(settle.next_step(saved, self.matching(saved), [], NOW_UTC), settle.Hold("Codex seat Worker is still running"))
+            saved["seats"] = [worker_session("worker", "Worker", owner="owner", status="busy")]
+            self.assertEqual(settle.next_step(saved, self.matching(saved), [], NOW_UTC), settle.Hold("Codex worker Worker is still running"))
             saved["seats"] = []
             saved["session"]["status"] = "busy"
             self.assertIsInstance(settle.next_step(saved, self.matching(saved), [], NOW_UTC), settle.Hold)
@@ -532,8 +811,8 @@ class SettleTests(ShutdownTestCase):
     def test_one_conduct_pass_stops_limit_waiting_owner_and_ordinary_ready_owner(self) -> None:
         held = session_shutdown(top_level("held", "Held"))
         ordinary = session_shutdown(top_level("ordinary", "Ordinary"), progress={"kind": "ready", "at": NOW})
-        held["seats"] = [seat("held-seat", "Held seat", owner="held")]
-        ordinary["seats"] = [seat("ordinary-seat", "Ordinary seat", owner="ordinary")]
+        held["seats"] = [worker_session("held-worker", "Held worker", owner="held")]
+        ordinary["seats"] = [worker_session("ordinary-worker", "Ordinary worker", owner="ordinary")]
         self.save(held)
         self.save(ordinary)
         seen: list[str] = []
@@ -615,7 +894,7 @@ class SettleTests(ShutdownTestCase):
 
     def test_held_owner_has_no_holdout_alert_and_done_requires_stop_or_restart(self) -> None:
         saved = session_shutdown(top_level("owner", "Owner"), progress=record.SessionHeldByUsageLimit(kind="held by usage limit", at=NOW))
-        saved["seats"] = [seat("worker", "Worker", owner="owner", status="busy")]
+        saved["seats"] = [worker_session("worker", "Worker", owner="owner", status="busy")]
         self.save(saved)
         self.assertFalse(settle._done(saved))  # pyright: ignore[reportPrivateUsage]
         at = NOW_UTC + settle.NOT_ANSWERING_AFTER + timedelta(seconds=1)
@@ -670,11 +949,11 @@ class SettleTests(ShutdownTestCase):
         for owner in (stop_work.SessionAbsent(kind="session absent"), stop_work.SessionIdentityLost(kind="session identity lost")):
             self.assertIsInstance(settle.next_step(saved, owner, [], NOW_UTC), settle.StopSession)
 
-    def test_seat_becoming_idle_allows_the_owner_to_stop(self) -> None:
+    def test_worker_becoming_idle_allows_the_owner_to_stop(self) -> None:
         saved = session_shutdown(top_level("owner", "Owner"), progress={"kind": "ready", "at": NOW})
-        worker = seat("seat", "Seat", owner="owner", status="busy")
+        worker = worker_session("worker", "Worker", owner="owner", status="busy")
         observed = stop_work.fresh_session(saved["session"], machine_inventory([saved["session"], worker]))
-        self.assertEqual(settle.next_step(saved, observed, [], NOW_UTC), settle.Hold("Codex seat Seat is still running"))
+        self.assertEqual(settle.next_step(saved, observed, [], NOW_UTC), settle.Hold("Codex worker Worker is still running"))
         worker["status"] = "idle"
         self.assertIsInstance(settle.next_step(saved, stop_work.fresh_session(saved["session"], machine_inventory([saved["session"], worker])), [], NOW_UTC), settle.StopSession)
 
@@ -691,7 +970,7 @@ class SettleTests(ShutdownTestCase):
         self.assertIn("Stop now, without finishing the step you are in", body)
         self.assertIn("shutdown.py ready --where", body)
         self.assertIn("You will be resumed on claude 1 with that line", body)
-        self.assertNotIn("let any seat turn", body)
+        self.assertNotIn("let any worker turn", body)
         stopping = session_shutdown(top_level("owner", "Owner"))
         first, _ = settle._settle_text(stopping, stopping["session"]).split("\n\n", 1)  # pyright: ignore[reportPrivateUsage]
         self.assertTrue(first.startswith("Pause for stop: claude 2 (requested by the user, "), first)
@@ -905,10 +1184,10 @@ class SettleTests(ShutdownTestCase):
         self.assertEqual(record.session_records(LOGIN)[0]["requested_by"],
             record.FromSession(kind="session", session_id="self-id"))
 
-    def test_begin_attaches_owned_seats_and_second_request_adds_only_new_owner(self) -> None:
+    def test_begin_attaches_owned_workers_and_second_request_adds_only_new_owner(self) -> None:
         first, second = top_level("first", "First"), top_level("second", "Second")
-        worker = seat("worker", "Worker", owner="first")
-        orphan = seat("orphan", "Orphan", owner=None)
+        worker = worker_session("worker", "Worker", owner="first")
+        orphan = worker_session("orphan", "Orphan", owner=None)
         with patch.object(settle, "run_inventory", return_value=machine_inventory([first, worker, orphan])):
             added = settle.begin(LOGIN, only=["first"], request_id="one")
         self.assertEqual(len(added), 1)
@@ -1731,7 +2010,8 @@ class SettleTests(ShutdownTestCase):
     def test_conductor_drops_records_cancelled_before_its_result(self) -> None:
         saved = session_shutdown(top_level("owner", "Owner"), requester="requester")
         self.save(saved)
-        def cancelled(_login: str, _only: object = ()) -> inventory.Inventory:
+        def cancelled(_login: str, _only: object = (), *, refresh_desktops: bool = True) -> inventory.Inventory:
+            del refresh_desktops
             self.assertEqual(settle.cancel(Account("claude", LOGIN, LABEL), True), 0)
             return machine_inventory([])
         with patch.object(settle, "run_inventory", side_effect=cancelled), patch.object(settle, "_retire_shutdown_messages"), patch.object(stop_work, "stop_session", side_effect=record.NoLiveRecord("cancelled")), patch.object(settle, "report_stop") as report:
@@ -1741,7 +2021,8 @@ class SettleTests(ShutdownTestCase):
     def test_conductor_drops_records_archived_by_another_restore_caller(self) -> None:
         saved = session_shutdown(top_level("owner", "Owner"), progress={"kind": "stopped", "at": NOW}, then="restart")
         self.save(saved)
-        def resumed(_login: str, _only: object = ()) -> inventory.Inventory:
+        def resumed(_login: str, _only: object = (), *, refresh_desktops: bool = True) -> inventory.Inventory:
+            del refresh_desktops
             def complete(current: record.SessionShutdown) -> None:
                 current["progress"] = {"kind": "restarted", "at": NOW}
             _ = record.update_session(LOGIN, "owner", complete)
@@ -2183,7 +2464,8 @@ class SettleTests(ShutdownTestCase):
                     result = self.fake_stop(saved)
                     stopped.set()
                     return result
-                def observe(_login: str) -> inventory.Inventory:
+                def observe(_login: str, _only: object = (), *, refresh_desktops: bool = True) -> inventory.Inventory:
+                    del refresh_desktops
                     if checking.is_set():
                         def ready(current: record.SessionShutdown) -> None:
                             if current["progress"]["kind"] == "waiting":
@@ -2247,7 +2529,8 @@ class SettleTests(ShutdownTestCase):
             self.assertNotEqual(threading.get_ident(), main_thread)
             entered.set()
             self.assertTrue(stopped.wait(2))
-        def observe(_login: str) -> inventory.Inventory:
+        def observe(_login: str, _only: object = (), *, refresh_desktops: bool = True) -> inventory.Inventory:
+            del refresh_desktops
             if entered.is_set():
                 def ready(current: record.SessionShutdown) -> None:
                     if current["progress"]["kind"] == "waiting":

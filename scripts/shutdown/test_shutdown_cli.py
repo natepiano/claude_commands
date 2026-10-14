@@ -107,7 +107,7 @@ def session_shutdown(
         then="restart", force="wait for ready", alerts="user",
         session=item["session"], seats=[], timers=[],
         settle_message=item["settle_message"], where=item["where"],
-        progress=progress, stop_issues=[],
+        progress=progress, trail=[], stop_issues=[],
     )
 
 
@@ -306,40 +306,46 @@ class ShutdownLaunchCliTests(ShutdownTestCase):
 
     def test_down_to_passes_target_through_the_cli_to_settle(self) -> None:
         selected = Account("claude", LOGIN, LABEL)
+        report = inventory.Inventory(machine="natedev", login=LOGIN, label=LABEL,
+            sessions=[unit_session("move-id")], unattributed=[])
         with (
             patch.object(shutdown, "named_claude_account", return_value=selected),
             patch.object(settle, "down", return_value=0) as down,
-            patch.object(shutdown, "resolve_sessions", return_value=["move-id"]),
+            patch.object(shutdown, "resolve_sessions", return_value=shutdown.ResolvedSessions(("move-id",), report)),
         ):
             self.assertEqual(shutdown.main(["down", LABEL, "--here", "--only", "move-id",
                 "--restart", "--to", "claude 3"]), 0)
         down.assert_called_once_with(selected, True, ("move-id",), then="restart", alerts="user",
-            requested_by=None, request_id="", target="claude 3", why="")
+            requested_by=None, request_id="", target="claude 3", why="", report=report)
 
     def test_down_to_passes_custom_move_reason_through_the_cli_to_settle(self) -> None:
         selected = Account("claude", LOGIN, LABEL)
+        report = inventory.Inventory(machine="natedev", login=LOGIN, label=LABEL,
+            sessions=[unit_session("move-id")], unattributed=[])
         with (
             patch.object(shutdown, "named_claude_account", return_value=selected),
             patch.object(settle, "down", return_value=0) as down,
-            patch.object(shutdown, "resolve_sessions", return_value=["move-id"]),
+            patch.object(shutdown, "resolve_sessions", return_value=shutdown.ResolvedSessions(("move-id",), report)),
         ):
             self.assertEqual(shutdown.main(["down", LABEL, "--here", "--only", "move-id",
                 "--restart", "--to", "claude 3", "--why", "weekly limit reached"]), 0)
         down.assert_called_once_with(selected, True, ("move-id",), then="restart", alerts="user",
-            requested_by=None, request_id="", target="claude 3", why="weekly limit reached")
+            requested_by=None, request_id="", target="claude 3", why="weekly limit reached", report=report)
 
     def test_down_restart_passes_the_selected_scope_and_intent(self) -> None:
         selected = Account("claude", LOGIN, LABEL)
+        report = inventory.Inventory(machine="natedev", login=LOGIN, label=LABEL,
+            sessions=[unit_session("unit-a"), unit_session("unit-b")], unattributed=[])
         with (
             patch.object(shutdown, "named_claude_account", return_value=selected),
             patch.object(settle, "down", return_value=0) as down,
-            patch.object(shutdown, "resolve_sessions", return_value=["unit-a", "unit-b"]),
+            patch.object(shutdown, "resolve_sessions", return_value=shutdown.ResolvedSessions(("unit-a", "unit-b"), report)),
         ):
             self.assertEqual(shutdown.main([
                 "down", LABEL, "--restart", "--only", "unit-a,unit-b,unit-a", "--here",
             ]), 0)
         down.assert_called_once_with(
-            selected, True, ("unit-a", "unit-b"), then="restart", alerts="user", requested_by=None, request_id="", target="", why=""
+            selected, True, ("unit-a", "unit-b"), then="restart", alerts="user", requested_by=None, request_id="", target="", why="", report=report
         )
 
 
@@ -372,12 +378,14 @@ class ShutdownLaunchCliTests(ShutdownTestCase):
 
     def test_down_without_restart_keeps_the_existing_dispatch(self) -> None:
         selected = Account("claude", LOGIN, LABEL)
+        report = inventory.Inventory(machine="natedev", login=LOGIN, label=LABEL, sessions=[], unattributed=[])
         with (
             patch.object(shutdown, "named_claude_account", return_value=selected),
             patch.object(settle, "down", return_value=0) as down,
+            patch.object(shutdown, "inventory", return_value=report),
         ):
             self.assertEqual(shutdown.main(["down", LABEL]), 0)
-        down.assert_called_once_with(selected, False, (), then="stop", alerts="user", requested_by=None, request_id="", target="", why="")
+        down.assert_called_once_with(selected, False, (), then="stop", alerts="user", requested_by=None, request_id="", target="", why="", report=report)
 
 
 
@@ -591,11 +599,11 @@ class ShutdownLaunchCliTests(ShutdownTestCase):
                 record.set_account_hold(account_hold())
                 self.assertEqual(self.run_cli(LOGIN, "--restart-of", "session-123"), expected)
 
-    def test_held_sessions_includes_owners_and_seats_sorted_once(self) -> None:
+    def test_held_sessions_includes_owners_and_workers_sorted_once(self) -> None:
         saved = session_shutdown(record.SessionWaiting(kind="waiting"), "z-owner")
         owner = saved["session"]
         saved["seats"] = [inventory.SeatSession(
-            session_id="a-seat", pid=23456, proc_start="seat-start", name="worker",
+            session_id="a-worker", pid=23456, proc_start="worker-start", name="worker",
             cwd=owner["cwd"], status="idle", model=owner["model"], checkout=owner["checkout"],
             run_dirs=["/tmp/run"], codex_servers=[], timers=[], kind="seat",
             host=inventory.UnknownHost(kind="unknown"),
@@ -606,7 +614,7 @@ class ShutdownLaunchCliTests(ShutdownTestCase):
         output = io.StringIO()
         with redirect_stdout(output):
             self.assertEqual(shutdown.main(["held-sessions"]), 0)
-        self.assertEqual(output.getvalue(), "a-seat\nm-owner\nz-owner\n")
+        self.assertEqual(output.getvalue(), "a-worker\nm-owner\nz-owner\n")
 
     def test_launch_permission_maps_exit_statuses(self) -> None:
         with patch.object(
@@ -798,9 +806,10 @@ class ShutdownLaunchCliTests(ShutdownTestCase):
 
     def test_peer_down_receives_request_identity_origin_and_alert_policy(self) -> None:
         selected = Account("claude", LOGIN, LABEL)
-        with patch.object(shutdown, "named_claude_account", return_value=selected), patch.object(settle, "down", return_value=0) as down:
+        report = inventory.Inventory(machine="natedev", login=LOGIN, label=LABEL, sessions=[], unattributed=[])
+        with patch.object(shutdown, "named_claude_account", return_value=selected), patch.object(settle, "down", return_value=0) as down, patch.object(shutdown, "inventory", return_value=report):
             self.assertEqual(shutdown.main(["down", LOGIN, "--here", "--restart", "--no-alert", "--requested-by", "requester", "--request-id", "same-request"]), 0)
-        down.assert_called_once_with(selected, True, (), then="restart", alerts="none", requested_by="requester", request_id="same-request", target="", why="")
+        down.assert_called_once_with(selected, True, (), then="restart", alerts="none", requested_by="requester", request_id="same-request", target="", why="", report=report)
 
     def test_stopping_session_restore_is_held_by_name(self) -> None:
         self.assertTrue(record.create_session(session_shutdown(record.SessionStopping(kind="stopping", at=OCTOBER))))
@@ -834,11 +843,17 @@ class OnlySessionCliTests(ShutdownTestCase):
         _ = self.enterContext(patch.object(shutdown, "named_claude_account", return_value=selected))
         _ = self.enterContext(patch.object(restart_work, "named_claude_account", return_value=selected))
         report = inventory.Inventory(machine="natedev", login=LOGIN, label=LABEL, sessions=self.owners, unattributed=[])
-        _ = self.enterContext(patch.object(shutdown, "inventory", return_value=report))
+        def listed(_login: str) -> list[inventory.ListedSession]:
+            return [inventory.ListedSession(owner["session_id"], owner["pid"], owner["proc_start"],
+                owner["name"], owner["kind"], self.root / ".claude", LOGIN,
+                owner["host"]["production"] if owner["kind"] == "unit" else "", "")
+                for owner in self.owners]
+        _ = self.enterContext(patch.object(shutdown, "listing", side_effect=listed))
         def observed(login: str, only: Iterable[str] = ()) -> inventory.Inventory:
             self.assertEqual(login, LOGIN)
             ids = tuple(only)
             return {**report, "sessions": [owner for owner in self.owners if not ids or owner["session_id"] in ids]}
+        _ = self.enterContext(patch.object(shutdown, "inventory", side_effect=observed))
         _ = self.enterContext(patch.object(settle, "run_inventory", side_effect=observed))
         _ = self.enterContext(patch.object(settle, "inventory", side_effect=observed))
         _ = self.enterContext(patch.object(settle, "inventory", side_effect=observed))
@@ -902,6 +917,54 @@ class OnlySessionCliTests(ShutdownTestCase):
         self.assertIn("beta-id", diagnostic)
         self.assertEqual(record.session_records(LOGIN), sorted(before, key=lambda item: item["session"]["name"]))
 
+    def test_down_exact_name_builds_one_filtered_inventory_and_keeps_owned_workers(self) -> None:
+        worker = cast(inventory.SeatSession, cast(object, {
+            **unit_session("owned-seat"), "kind": "seat", "name": "Worker",
+            "host": inventory.UnknownHost(kind="unknown"),
+            "owner": inventory.DirectorOwner(kind="director", session_id="beta-id"),
+        }))
+        self.owners.append(worker)
+        def filtered(login: str, *, only: frozenset[str]) -> inventory.Inventory:
+            self.assertEqual(login, LOGIN)
+            self.assertEqual(only, frozenset({"beta-id"}))
+            return inventory.Inventory(machine="natedev", login=LOGIN, label=LABEL,
+                sessions=[self.owners[1], worker], unattributed=[])
+        with (patch.object(shutdown, "inventory", side_effect=filtered) as read,
+              patch.object(settle, "run_inventory", side_effect=AssertionError("down inventories twice")),
+              patch.object(settle, "inventory", side_effect=AssertionError("begin inventories twice"))):
+            status, _, error = self.action("down", "Beta")
+        self.assertEqual((status, error), (0, ""))
+        read.assert_called_once_with(LOGIN, only=frozenset({"beta-id"}))
+        saved = record.session_records(LOGIN)
+        self.assertEqual([item["session"]["session_id"] for item in saved], ["beta-id"])
+        self.assertEqual(saved[0]["seats"], [worker])
+
+    def test_down_ambiguous_name_builds_no_full_inventory_and_starts_nothing(self) -> None:
+        self.owners[0]["name"] = self.owners[1]["name"] = "Duplicate"
+        with (patch.object(shutdown, "inventory", side_effect=AssertionError("ambiguous name builds inventory")) as read,
+              patch.object(settle, "_launch_conductor") as launch):
+            status, output, error = self.action("down", "Duplicate")
+        self.assertEqual(status, 2)
+        self.assertIn("matches more than one session", output + error)
+        self.assertIn("alpha-id", output + error)
+        self.assertIn("beta-id", output + error)
+        read.assert_not_called()
+        launch.assert_not_called()
+        self.assertEqual(record.session_records(LOGIN), [])
+
+    def test_down_without_selection_reuses_one_full_inventory(self) -> None:
+        report = inventory.Inventory(machine="natedev", login=LOGIN, label=LABEL,
+            sessions=self.owners, unattributed=[])
+        with (patch.object(shutdown, "inventory", return_value=report) as read,
+              patch.object(settle, "run_inventory", side_effect=AssertionError("begin inventories twice")),
+              patch.object(settle, "inventory", side_effect=AssertionError("down inventories twice")),
+              redirect_stdout(io.StringIO())):
+            status = shutdown.main(["down", LOGIN, "--here"])
+        self.assertEqual(status, 0)
+        read.assert_called_once_with(LOGIN)
+        self.assertEqual({saved["session"]["session_id"] for saved in record.session_records(LOGIN)},
+            {owner["session_id"] for owner in self.owners})
+
     def test_only_unknown_item_exits_two_without_starting_work(self) -> None:
         before = self.save_three({"kind": "waiting"})
         with patch.object(settle, "_launch_conductor") as conductor:
@@ -953,13 +1016,13 @@ class OnlySessionCliTests(ShutdownTestCase):
     def test_resolve_sessions_here_deduplicates_record_and_inventory_without_peer(self) -> None:
         _ = self.save_three({"kind": "waiting"})
         with patch.object(shutdown, "run_remote") as peer:
-            self.assertEqual(shutdown.resolve_sessions(LOGIN, ["Beta", "beta-id", "Beta"], here=True), ["beta-id"])
+            self.assertEqual(shutdown.resolve_sessions(LOGIN, ["Beta", "beta-id", "Beta"], here=True).session_ids, ("beta-id",))
         peer.assert_not_called()
 
     def test_resolve_local_id_does_not_wait_for_the_peer(self) -> None:
         _ = self.save_three({"kind": "waiting"})
         with patch.object(shutdown, "run_remote") as peer:
-            self.assertEqual(shutdown.resolve_sessions(LOGIN, ["beta-id"]), ["beta-id"])
+            self.assertEqual(shutdown.resolve_sessions(LOGIN, ["beta-id"]).session_ids, ("beta-id",))
         peer.assert_not_called()
 
     def test_resolve_peer_name_counts_its_record_and_inventory_once(self) -> None:
@@ -974,13 +1037,13 @@ class OnlySessionCliTests(ShutdownTestCase):
             self.assertEqual(arguments, ["status", LOGIN, "--json", "--here"])
             return 0, json.dumps(remote_inventory)
         with patch.object(shutdown, "run_remote", side_effect=peer), patch.object(shutdown, "other_machine", return_value="Mac"):
-            self.assertEqual(shutdown.resolve_sessions(LOGIN, ["Remote"]), ["remote-id"])
+            self.assertEqual(shutdown.resolve_sessions(LOGIN, ["Remote"]).session_ids, ("remote-id",))
 
     def test_resolve_name_with_unreachable_peer_uses_local_and_warns(self) -> None:
         _ = self.save_three({"kind": "waiting"})
         error = io.StringIO()
         with patch.object(shutdown, "run_remote", return_value=(255, "")), patch.object(shutdown, "other_machine", return_value="Mac"), redirect_stderr(error):
-            self.assertEqual(shutdown.resolve_sessions(LOGIN, ["Beta"]), ["beta-id"])
+            self.assertEqual(shutdown.resolve_sessions(LOGIN, ["Beta"]).session_ids, ("beta-id",))
         self.assertIn("Mac: not reached; names checked on natedev only\n", error.getvalue())
 
     def test_only_missing_name_with_unreachable_peer_exits_two_and_names_peer(self) -> None:
@@ -1123,6 +1186,24 @@ class OnlySessionCliTests(ShutdownTestCase):
         self.assertEqual(record.find_session(LOGIN, "alpha-id"), before[0])
         self.assertEqual(record.find_session(LOGIN, "gamma-id"), before[2])
 
+    def test_status_stop_now_action_accepts_reaping_session_by_name(self) -> None:
+        progress = record.SessionReaping(kind="reaping", at=OCTOBER,
+            because="account out of usage", detail="weekly limit")
+        before = self.save_three(progress)
+        output = io.StringIO()
+        with redirect_stdout(output):
+            self.assertEqual(shutdown.main(["status", LOGIN, "--here"]), 0)
+        self.assertIn("  stop now: /shutdown now --only <name> · Alpha, Beta, Gamma\n", output.getvalue())
+        with patch.object(settle, "_launch_conductor") as conductor:
+            self.assertEqual(self.action("now", "Beta"), (0, "Beta: stopping now\n", ""))
+        conductor.assert_called_once_with(LOGIN, LABEL)
+        latest = record.find_session(LOGIN, "beta-id")
+        assert latest is not None
+        self.assertEqual(latest["force"], "now")
+        self.assertEqual(latest["progress"], progress)
+        self.assertEqual(record.find_session(LOGIN, "alpha-id"), before[0])
+        self.assertEqual(record.find_session(LOGIN, "gamma-id"), before[2])
+
     def test_selected_cancel_takes_usage_limit_held_session_out_and_names_it(self) -> None:
         before = self.save_three(record.SessionHeldByUsageLimit(kind="held by usage limit", at=OCTOBER))
         self.assertEqual(self.action("cancel", "beta-id"), (0, "Beta: taken out\n", ""))
@@ -1156,7 +1237,7 @@ class OnlySessionCliTests(ShutdownTestCase):
             return (0, json.dumps([saved])) if arguments[0] == "records" else (255, "")
         error = io.StringIO()
         with patch.object(shutdown, "run_remote", side_effect=peer), patch.object(shutdown, "other_machine", return_value="Mac"), redirect_stderr(error):
-            self.assertEqual(shutdown.resolve_sessions(LOGIN, ["remote-id"]), ["remote-id"])
+            self.assertEqual(shutdown.resolve_sessions(LOGIN, ["remote-id"]).session_ids, ("remote-id",))
         self.assertEqual(error.getvalue(), "Mac: not reached; names checked on natedev only\n")
 
     def test_selected_now_mixed_force_and_refusal_exits_one_and_only_forces_eligible_session(self) -> None:

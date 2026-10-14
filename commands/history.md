@@ -68,13 +68,13 @@ table|json|csv`. Beyond those:
   every total is smaller than an unfiltered read of the same corpus. Pass
   `--status all` to include them.
 - `--stage`, `--label`, `--agent` substring filters on `stages` and `runs`
-- `--group slot` — which seat of the phase team (`impl`, `impl2`, `test`,
+- `--group slot` — which worker of the phase team (`impl`, `impl2`, `test`,
   `review`) recorded the pass. **Empty on every pass before 2026-08-31**, and on
-  any recorder outside `implement.sh`, where it groups as `-`. A seat, not a
-  role: a seat's role changes within a run — all three implementing, then all
+  any recorder outside `implement.sh`, where it groups as `-`. A worker, not a
+  role: a worker's role changes within a run — all three implementing, then all
   three testing, any mix — so this names the chair, and `stage` names the work.
   It does not yet make a team phase visible. The recorder can now hold one open
-  pass per seat, but the unit director still hands `pass_kind` to a single
+  pass per worker, but the unit director still hands `pass_kind` to a single
   member, so `slot` names which member that was and the other two stay
   uncounted
 - `tests` — `--label`, `--agent`, `--raw` (it pins `stage=test` itself)
@@ -125,7 +125,7 @@ and its config section is `[delegate.codex]`, but neither `--skill direct` nor
   explains more of a timing difference than phase size does.
 - **The `test` stage holds two different things, so split it before reading a
   median.** Verification runs (activity labels `verify`, `smoke`) are machine time
-  with a 14s median; a test seat authoring tests is agent time in the tens of
+  with a 14s median; a test worker authoring tests is agent time in the tens of
   minutes. Both are testing, which is why both bucket to `test` — but one median
   over the pair describes neither. `--group stage,label` separates them: a pass row
   carries its kind as its label, an activity row carries its activity name.

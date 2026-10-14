@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import io
 import os
 import socket
 import shutil
@@ -34,12 +35,12 @@ TARGET_LOGIN = "owner@example.com"
 OTHER_LOGIN = "other@example.com"
 DIRECTOR_ID = "11111111-1111-1111-1111-111111111111"
 UNIT_ID = "22222222-2222-2222-2222-222222222222"
-SEAT_ID = "aaaaaaaa-3333-3333-3333-333333333333"
+WORKER_ID = "aaaaaaaa-3333-3333-3333-333333333333"
 DESKTOP_ID = "44444444-4444-4444-4444-444444444444"
 OTHER_ID = "55555555-5555-5555-5555-555555555555"
 UNKNOWN_ID = "66666666-6666-6666-6666-666666666666"
 UNIT_PID = 41_002
-SEAT_PID = 41_003
+WORKER_PID = 41_003
 DESKTOP_PID = 41_004
 OTHER_PID = 41_005
 UNKNOWN_PID = 41_006
@@ -49,8 +50,158 @@ CURRENT_PROCESS_START = "current-process-start"
 FAKE_TMUX = Path(__file__).parents[1] / "production" / "fake_tmux.py"
 
 
+class TranscriptReadCounter(io.BufferedReader):
+    """Count transcript bytes delivered to the reader, independent of elapsed time."""
+
+    def __init__(self, path: Path) -> None:
+        super().__init__(io.FileIO(path, "r"))
+        self.bytes_read: int = 0
+
+    @override
+    def read(self, size: int | None = -1) -> bytes:
+        value = super().read(size)
+        self.bytes_read += len(value)
+        return value
+
+    @override
+    def readline(self, size: int | None = -1) -> bytes:
+        value = super().readline(size)
+        self.bytes_read += len(value)
+        return value
+
+
 @final
 class InventoryTests(ShutdownTestCase):
+    def test_last_model_skips_trailing_metadata_and_invalid_json(self) -> None:
+        transcript = self.root / "metadata.jsonl"
+        entries: list[dict[str, object]] = [
+            {"type": "assistant", "message": {"model": "older-model"}},
+            {"type": "assistant", "message": {"model": "latest-model"}},
+            {"type": "system", "message": {"model": "system-model"}},
+            {"type": "cost-state", "model": "cost-model"},
+            {"type": "last-prompt", "message": {"model": "prompt-model"}},
+        ]
+        contents = "\n".join(json.dumps(entry) for entry in entries)
+        for ending in ("\n", ""):
+            with self.subTest(ending=repr(ending)):
+                _ = transcript.write_text(contents + "\nmalformed-json" + ending, encoding="utf-8")
+                self.assertEqual(inventory.last_model(transcript), "latest-model")
+
+    def test_last_model_reassembles_lines_across_tail_blocks(self) -> None:
+        transcript = self.root / "split-line.jsonl"
+        entries = [
+            {"type": "assistant", "message": {"model": "older-model"}},
+            {"type": "assistant", "message": {"model": "split-model", "content": "é" * 70_000}},
+            {"type": "system", "content": "tail"},
+        ]
+        _ = transcript.write_text(
+            "\n".join(json.dumps(entry, ensure_ascii=False) for entry in entries) + "\n",
+            encoding="utf-8",
+        )
+        self.assertEqual(inventory.last_model(transcript), "split-model")
+
+    def test_transcript_path_uses_newest_direct_project_and_excludes_subagents(self) -> None:
+        older = self.target_config / "projects/older/lookup.jsonl"
+        newer = self.target_config / "projects/newer/lookup.jsonl"
+        nested = self.target_config / "projects/newer/subagents/lookup.jsonl"
+        for timestamp, path in ((10, older), (20, newer), (30, nested)):
+            path.parent.mkdir(parents=True, exist_ok=True)
+            _ = path.write_text(json.dumps({"type": "assistant", "message": {"model": path.parent.name}}))
+            os.utime(path, (timestamp, timestamp))
+        self.assertEqual(inventory.transcript_path(self.target_config, "lookup"), newer)
+        older.unlink()
+        newer.unlink()
+        self.assertIsNone(inventory.transcript_path(self.target_config, "lookup"))
+
+    def test_inventory_models_come_from_each_sessions_config_directory(self) -> None:
+        (self.target_config / "projects").unlink()
+        transcript = self.target_config / "projects/own-tree" / f"{DESKTOP_ID}.jsonl"
+        transcript.parent.mkdir(parents=True)
+        _ = transcript.write_text(json.dumps({"type": "assistant", "message": {"model": "own-account-model"}}))
+        found = inventory.inventory(TARGET_LOGIN, only=frozenset({DESKTOP_ID}))
+        self.assertEqual(found["sessions"][0]["model"], {"kind": "model", "name": "own-account-model"})
+
+    def test_inventory_filter_includes_owned_workers_and_empty_selection_includes_all(self) -> None:
+        cases = (
+            (frozenset({DIRECTOR_ID}), {DIRECTOR_ID, WORKER_ID}),
+            (frozenset({WORKER_ID}), {WORKER_ID}),
+            (frozenset[str](), {DIRECTOR_ID, UNIT_ID, WORKER_ID, DESKTOP_ID}),
+        )
+        for selected, expected in cases:
+            for keyword in (True, False):
+                with self.subTest(selected=selected, keyword=keyword):
+                    found = (
+                        inventory.inventory(TARGET_LOGIN, only=selected)
+                        if keyword else inventory.inventory(TARGET_LOGIN, selected)
+                    )
+                    self.assertEqual({session["session_id"] for session in found["sessions"]}, expected)
+                    for session in found["sessions"]:
+                        if session["kind"] == "seat":
+                            self.assertEqual(session["owner"], {"kind": "director", "session_id": DIRECTOR_ID})
+
+    def test_inventory_only_builds_expensive_fields_for_selected_ids(self) -> None:
+        with patch.object(inventory, "_model", wraps=inventory._model) as read_model:  # pyright: ignore[reportPrivateUsage]
+            found = inventory.inventory(TARGET_LOGIN, only=frozenset({DESKTOP_ID, OTHER_ID}))
+        self.assertEqual([session["session_id"] for session in found["sessions"]], [DESKTOP_ID])
+        self.assertEqual(read_model.call_count, 1)
+        self.assertIn(DESKTOP_ID, read_model.call_args.args)
+
+    def test_listing_agrees_with_full_inventory_and_excludes_expensive_work(self) -> None:
+        full = inventory.inventory(TARGET_LOGIN)["sessions"] + inventory.inventory(OTHER_LOGIN)["sessions"]
+        with (
+            patch.object(inventory, "_model", side_effect=AssertionError("listing reads a transcript")),
+            patch.object(inventory, "_checkout", side_effect=AssertionError("listing inspects git")),
+            patch.object(inventory, "_git", side_effect=AssertionError("listing runs git")),
+            patch.object(inventory, "_timers", side_effect=AssertionError("listing reads timers")),
+            patch.object(inventory, "_host", side_effect=AssertionError("listing builds a host")),
+            patch.object(inventory, "_snapshot_desktops", side_effect=AssertionError("listing reads desktops")),
+            patch.object(inventory, "_newest_unit_plans", side_effect=AssertionError("listing reads plan history")),
+        ):
+            listed = inventory.listing()
+            owned = inventory.listing(TARGET_LOGIN)
+        by_id = {session.session_id: session for session in listed}
+        self.assertEqual(set(by_id), {DIRECTOR_ID, UNIT_ID, WORKER_ID, DESKTOP_ID, OTHER_ID})
+        self.assertEqual({session.session_id for session in owned}, {DIRECTOR_ID, UNIT_ID, WORKER_ID, DESKTOP_ID})
+        for session in full:
+            light = by_id[session["session_id"]]
+            with self.subTest(session=light.session_id):
+                self.assertEqual(light.kind, session["kind"])
+                self.assertEqual(light.pid, session["pid"])
+                self.assertEqual(light.proc_start, session["proc_start"])
+                self.assertEqual(light.name, session["name"])
+                self.assertEqual(str(light.config_dir), session.get("config_dir"))
+                self.assertEqual(light.login, OTHER_LOGIN if light.session_id == OTHER_ID else TARGET_LOGIN)
+                if session["kind"] == "showrunner":
+                    self.assertEqual(light.production, session["production"])
+                    self.assertEqual(light.doc, session["doc"])
+                elif session["kind"] == "unit":
+                    self.assertEqual(light.production, session["host"]["production"])
+                    self.assertEqual(light.doc, session["host"]["doc"])
+
+    def test_forty_session_listing_and_large_transcript_read_budget(self) -> None:
+        for path in self.records.glob("*.json"):
+            path.unlink()
+        identities = {f"fixture-{number:02}" for number in range(40)}
+        for number, identity in enumerate(sorted(identities)):
+            self.write_session(60_000 + number, identity, identity, self.root / "plain")
+        transcript = self.target_config / "projects/fixture/fixture-39.jsonl"
+        with transcript.open("wb") as stream:
+            padding = json.dumps({"type": "system", "content": "x" * 1024}).encode() + b"\n"
+            for _ in range((50 * 1024 * 1024 // len(padding)) + 1):
+                _ = stream.write(padding)
+            _ = stream.write(b'{"type":"assistant","message":{"model":"large-file-model"}}\n')
+            _ = stream.write(b'{"type":"last-prompt","content":"after the reply"}\n')
+        with patch.object(account, "process_config_dir", return_value=self.target_config):
+            listed = inventory.listing(TARGET_LOGIN)
+        self.assertEqual({session.session_id for session in listed}, identities)
+        self.assertGreaterEqual(transcript.stat().st_size, 50 * 1024 * 1024)
+        with TranscriptReadCounter(transcript) as stream:
+            with patch.object(Path, "open", return_value=stream):
+                model = inventory.last_model(transcript)
+            self.assertEqual(model, "large-file-model")
+            self.assertGreater(stream.bytes_read, 0)
+            self.assertLess(stream.bytes_read, 1024 * 1024)
+
     def test_cached_desktop_snapshot_never_invokes_the_snapshot_updater(self) -> None:
         with (patch.object(shutil, "which", return_value="/fixture/agent-sessions-snapshot"),
               patch.object(subprocess, "run") as updater):
@@ -75,7 +226,8 @@ class InventoryTests(ShutdownTestCase):
              "message": {"model": "<synthetic>", "content": [{"type": "text", "text": "weekly limit"}]}},
         ]
         _ = transcript.write_text("\n".join(json.dumps(entry) for entry in entries) + "\n")
-        model = inventory._model("refused")  # pyright: ignore[reportPrivateUsage]
+        model = inventory._model("refused", self.home / ".claude")  # pyright: ignore[reportPrivateUsage]
+        self.assertEqual(inventory.last_model(transcript), "claude-opus-real")
         self.assertEqual(model, inventory.ModelName(kind="model", name="claude-opus-real"))
         owner = top_level("refused", model=model)
         self.assertIn("--model claude-opus-real", restart.resume_command(owner, "claude 3"))
@@ -85,7 +237,7 @@ class InventoryTests(ShutdownTestCase):
         transcript = self.home / ".claude/projects/model-fixture/refused.jsonl"
         transcript.parent.mkdir(parents=True)
         _ = transcript.write_text(json.dumps({"type": "assistant", "message": {"model": "<synthetic>"}}) + "\n")
-        self.assertEqual(inventory._model("refused"), inventory.NoReplyYet(kind="no reply yet"))  # pyright: ignore[reportPrivateUsage]
+        self.assertEqual(inventory._model("refused", self.home / ".claude"), inventory.NoReplyYet(kind="no reply yet"))  # pyright: ignore[reportPrivateUsage]
 
     def __init__(self, methodName: str = "runTest") -> None:
         super().__init__(methodName)
@@ -202,7 +354,7 @@ class InventoryTests(ShutdownTestCase):
         config_by_pid: dict[int, Path | None] = {
             self.director_pid: self.target_config,
             UNIT_PID: self.target_config,
-            SEAT_PID: self.target_config,
+            WORKER_PID: self.target_config,
             DESKTOP_PID: self.target_config,
             OTHER_PID: self.other_config,
             UNKNOWN_PID: None,
@@ -221,6 +373,8 @@ class InventoryTests(ShutdownTestCase):
         self.make_git_checkout()
         self.make_command_stand_ins()
         self.make_sessions(socket_path)
+        for config_dir in (self.target_config, self.other_config):
+            (config_dir / "projects").symlink_to(self.home / ".claude/projects", target_is_directory=True)
         self.make_production_state()
         self.make_delegate_state()
         self.make_snapshot()
@@ -378,9 +532,9 @@ elif "comm=" in joined:
             model="unit-model",
         )
         self.write_session(
-            SEAT_PID,
-            SEAT_ID,
-            "review-seat",
+            WORKER_PID,
+            WORKER_ID,
+            "review-worker",
             plain,
             kind="bg",
             updated_at=40,
@@ -452,7 +606,7 @@ elif "comm=" in joined:
         _ = (self.delegate / "active" / DIRECTOR_ID).write_text(
             str(run_dir) + "\n", encoding="utf-8"
         )
-        _ = (run_dir / "seats").write_text("aaaaaaaa\treview-seat\n", encoding="utf-8")
+        _ = (run_dir / "workers").write_text("aaaaaaaa\treview-worker\n", encoding="utf-8")
         _ = (run_dir / "mesh_server.json").write_text(
             json.dumps({"port": 45_678, "pid": os.getpid()}), encoding="utf-8"
         )
@@ -509,7 +663,7 @@ elif "comm=" in joined:
         self.assertEqual(found["login"], TARGET_LOGIN)
         self.assertEqual(found["label"], "claude 2")
         by_id = {session["session_id"]: session for session in found["sessions"]}
-        self.assertEqual(set(by_id), {DIRECTOR_ID, UNIT_ID, SEAT_ID, DESKTOP_ID})
+        self.assertEqual(set(by_id), {DIRECTOR_ID, UNIT_ID, WORKER_ID, DESKTOP_ID})
         self.assertTrue(
             all(session.get("config_dir") == str(self.target_config) for session in by_id.values())
         )
@@ -548,7 +702,7 @@ elif "comm=" in joined:
                 {
                     "run_dir": str(self.delegate / "phase-two"),
                     "pid": os.getpid(),
-                    "busy_seats": ["busy-codex", "busy-without-launcher"],
+                    "busy_workers": ["busy-codex", "busy-without-launcher"],
                 }
             ],
         )
@@ -582,10 +736,10 @@ elif "comm=" in joined:
             },
         )
 
-        seat = cast(inventory.SeatSession, by_id[SEAT_ID])
-        self.assertEqual(seat["kind"], "seat")
+        worker = cast(inventory.SeatSession, by_id[WORKER_ID])
+        self.assertEqual(worker["kind"], "seat")
         self.assertEqual(
-            seat["owner"], {"kind": "director", "session_id": DIRECTOR_ID}
+            worker["owner"], {"kind": "director", "session_id": DIRECTOR_ID}
         )
         self.assertEqual(by_id[DESKTOP_ID]["kind"], "top-level")
         self.assertEqual(
@@ -600,7 +754,7 @@ elif "comm=" in joined:
         limited = inventory.inventory(TARGET_LOGIN, only=frozenset({DIRECTOR_ID}))
         self.assertEqual(
             {session["session_id"] for session in limited["sessions"]},
-            {DIRECTOR_ID, SEAT_ID},
+            {DIRECTOR_ID, WORKER_ID},
         )
 
     def test_truncated_wrapped_ghostty_name_keeps_snapshot_desktop(self) -> None:
@@ -808,17 +962,17 @@ elif "comm=" in joined:
 
         self.assertEqual(director["host"].get("window_shell"), DIRECTOR_SHELL_PID)
 
-    def test_running_codex_seat_without_launcher_is_busy_but_dead_launcher_is_not(self) -> None:
+    def test_running_codex_worker_without_launcher_is_busy_but_dead_launcher_is_not(self) -> None:
         found = inventory.inventory(TARGET_LOGIN)
         director = next(
             session for session in found["sessions"] if session["session_id"] == DIRECTOR_ID
         )
 
         self.assertEqual(
-            director["codex_servers"][0]["busy_seats"],
+            director["codex_servers"][0]["busy_workers"],
             ["busy-codex", "busy-without-launcher"],
         )
-        self.assertNotIn("orphaned-start", director["codex_servers"][0]["busy_seats"])
+        self.assertNotIn("orphaned-start", director["codex_servers"][0]["busy_workers"])
 
     def test_a_showrunner_timer_naming_a_session_not_running_is_unregistered(self) -> None:
         before = {runner["slug"] for runner in inventory.unregistered_showrunners()}
@@ -864,7 +1018,36 @@ elif "comm=" in joined:
             found["unattributed"],
         )
 
-    def test_live_seat_keeps_owner_after_director_exits(self) -> None:
+    def test_inventory_reads_shared_worker_ledger_and_later_old_path_appends(self) -> None:
+        self.write_session(DESKTOP_PID, DESKTOP_ID, "late-worker", self.root / "plain", kind="bg")
+        current = self.delegate / "phase-two" / "workers"
+        previous = current.with_name("seats")
+        modified = current.stat().st_mtime_ns
+        _ = current.replace(previous)
+        found = inventory.inventory(TARGET_LOGIN)
+        worker = next(session for session in found["sessions"] if session["session_id"] == WORKER_ID)
+        self.assertEqual(worker["kind"], "seat")
+        self.assertEqual(cast(inventory.SeatSession, worker)["owner"],
+                         {"kind": "director", "session_id": DIRECTOR_ID})
+        late_worker = next(session for session in found["sessions"] if session["session_id"] == DESKTOP_ID)
+        self.assertEqual(cast(inventory.SeatSession, late_worker)["owner"], {"kind": "no director"})
+        self.assertTrue(previous.samefile(current))
+        self.assertEqual(current.stat().st_mtime_ns, modified)
+        _ = inventory.inventory(TARGET_LOGIN)
+        self.assertEqual(current.stat().st_mtime_ns, modified)
+        with previous.open("a", encoding="utf-8") as ledger:
+            _ = ledger.write(f"{DESKTOP_ID[:8]}\tlate-worker\n")
+        self.assertIn("late-worker", current.read_text(encoding="utf-8"))
+        modified = current.stat().st_mtime_ns
+        found = inventory.inventory(TARGET_LOGIN)
+        late_worker = next(session for session in found["sessions"] if session["session_id"] == DESKTOP_ID)
+        self.assertEqual(late_worker["kind"], "seat")
+        self.assertEqual(cast(inventory.SeatSession, late_worker)["owner"],
+                         {"kind": "director", "session_id": DIRECTOR_ID})
+        self.assertTrue(previous.samefile(current))
+        self.assertEqual(current.stat().st_mtime_ns, modified)
+
+    def test_live_worker_keeps_owner_after_director_exits(self) -> None:
         (self.records / f"{self.director_pid}.json").unlink()
 
         found = inventory.inventory(TARGET_LOGIN, only=frozenset({DIRECTOR_ID}))
@@ -875,7 +1058,7 @@ elif "comm=" in joined:
                 for session in found["sessions"]
                 if session["kind"] == "seat"
             ],
-            [(SEAT_ID, {"kind": "director", "session_id": DIRECTOR_ID})],
+            [(WORKER_ID, {"kind": "director", "session_id": DIRECTOR_ID})],
         )
 
     def test_newest_unit_plan_is_selected_by_started_time_not_write_order(self) -> None:
@@ -890,7 +1073,7 @@ elif "comm=" in joined:
     def test_absent_values_are_explicit_variants(self) -> None:
         for path in (self.history / "runs").glob("*.jsonl"):
             path.unlink()
-        (self.delegate / "phase-two" / "seats").unlink()
+        (self.delegate / "phase-two" / "workers").unlink()
         transcript = (
             self.home / ".claude" / "projects" / "fixture" / f"{DESKTOP_ID}.jsonl"
         )
@@ -900,10 +1083,10 @@ elif "comm=" in joined:
         by_id = {session["session_id"]: session for session in found["sessions"]}
 
         unit = cast(inventory.UnitSession, by_id[UNIT_ID])
-        seat = cast(inventory.SeatSession, by_id[SEAT_ID])
+        worker = cast(inventory.SeatSession, by_id[WORKER_ID])
         self.assertEqual(unit["host"]["plan"], {"kind": "no run record"})
         self.assertEqual(by_id[DESKTOP_ID]["model"], {"kind": "no reply yet"})
-        self.assertEqual(seat["owner"], {"kind": "no director"})
+        self.assertEqual(worker["owner"], {"kind": "no director"})
         self.assertEqual(
             by_id[DIRECTOR_ID]["checkout"], {"kind": "not a checkout"}
         )
