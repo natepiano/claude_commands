@@ -5,7 +5,7 @@ Usage: promote_showrunner.py <unit> --production <child production doc> --model 
 
 The parent showrunner runs it, once the unit has written the child's production doc and committed it.
 The unit gets `/exit`; once its Claude is gone its host session is ended, and add_showrunner.py resumes
-the same conversation as the child's showrunner: in tmux, with no unit mark, on its retained account,
+the same conversation as the child's showrunner: in tmux, with no unit mark, on the configured showrunners account,
 attached to this showrunner's production. The unit's Units row is then retired and committed in this
 showrunner's checkout. --check runs every refusal and stops nothing.
 
@@ -35,7 +35,6 @@ import herdr
 from session_pane import HerdrFailure, read_place, type_place, where_place
 from add_unit import (Production, Refusal, cell_value, commit_paths, plan_cell_is_retired, read_production,
                       unit_headings, unit_rows, unit_table)
-from scripts.whoami import account
 
 STOP_WAIT_S = float(os.environ.get("PROMOTE_STOP_WAIT_S") or 60)
 POLL_S = 0.5
@@ -176,23 +175,6 @@ def stop(promotion: Promotion) -> bool:
         except HerdrFailure as error:
             raise Refusal(f"cannot end {promotion.unit}'s session: {error}") from error
     return True
-
-
-def recorded_account_directory(marked: unit_lookup.MarkedUnit) -> Path:
-    if isinstance(marked.place, unit_lookup.TmuxPlace):
-        held = _tmux("show-options", "-v", "-t", f"={marked.label}:", "@claude_config_dir")
-        if held.returncode != 0 or not held.stdout.strip():
-            raise Refusal("no account recorded for this unit; resume with --account before promoting")
-        directory = Path(held.stdout.strip()).expanduser()
-    else:
-        if not isinstance(marked.claude, unit_lookup.LiveClaude):
-            raise Refusal(f"{marked.unit}: no live Claude to read its account")
-        directory = account.process_config_dir(marked.claude.pid)
-        if directory is None:
-            raise Refusal(f"{marked.unit}: cannot read its live Claude's account environment")
-    if not directory.is_dir():
-        raise Refusal(f"recorded resume account directory {directory} is missing")
-    return directory
 
 
 def showrunner_account_directory() -> Path:

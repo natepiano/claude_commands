@@ -29,17 +29,6 @@ if TYPE_CHECKING:
     from scripts.accounts.accounts import ClaudeLaunchAccount
 
 
-class RetainedClaudeAccount(NamedTuple):
-    """The existing config directory saved for a previous Claude launch."""
-    dir: Path
-
-
-RetainedUnitAccount = RetainedClaudeAccount
-
-if TYPE_CHECKING:
-    UnitLaunchAccount = ClaudeLaunchAccount | RetainedClaudeAccount
-
-
 class Production(NamedTuple):
     doc: Path
     slug: str
@@ -541,8 +530,8 @@ def director_agent(request: UnitLaunch) -> DirectorAgent:
     return DirectorAgent(model, Effort(effort) if effort else DefaultEffort())
 
 
-def preflight(request: RequestedUnitLaunch, selected: UnitLaunchAccount) -> ReadyToLaunch:
-    from scripts.accounts.accounts import DefaultAccount, NamedAccount
+def preflight(request: RequestedUnitLaunch, selected: ClaudeLaunchAccount) -> ReadyToLaunch:
+    from scripts.accounts.accounts import DefaultAccount
     from scripts.herdr.herdr import Untrusted, UnreadableTrustFile, claude_trust, repository_trust_key, trust_command
 
     production = request.production
@@ -573,7 +562,7 @@ def preflight(request: RequestedUnitLaunch, selected: UnitLaunchAccount) -> Read
         launch_kind=request.launch_kind,
         timeout=request.timeout,
     )
-    account = NamedAccount(str(selected.dir), selected.dir) if isinstance(selected, RetainedUnitAccount) else selected
+    account = selected
     account_file = Path.home() / ".claude.json" if isinstance(account, DefaultAccount) else account.dir / ".claude.json"
     folder = request.session_cwd
     check_folder = (repository_trust_key(production.checkout)
@@ -732,7 +721,7 @@ def launch_session(
     tmux: str,
     director: DirectorAgent,
     prompt: str,
-    selected: UnitLaunchAccount,
+    selected: ClaudeLaunchAccount,
     *,
     target: str = "",
     model: str = "",
@@ -742,7 +731,6 @@ def launch_session(
     The marks are what finds the unit afterwards; its name is only what it is called at launch.
     """
     from scripts.accounts.accounts import DefaultAccount, account_prefix, main_config_dir
-    from scripts.whoami.account import named_account_prefix
 
     marks = {unit_lookup.PRODUCTION_MARK: request.production.slug, unit_lookup.UNIT_MARK: request.identity.unit}
     launch_model = model or director.model
@@ -759,7 +747,7 @@ def launch_session(
                     else request.identity.session)
     argv.extend(["--remote-control", session_name, "-n", session_name,
                  "--settings", '{"disableAgentView": true}', prompt])
-    prefix = named_account_prefix(selected.dir) if isinstance(selected, RetainedUnitAccount) else account_prefix(selected)
+    prefix = account_prefix(selected)
     if target:
         argv = [sys.executable, str(SCRIPTS / "accounts" / "accounts.py"), "exec", target, *argv[1:]]
         prefix = ""
@@ -933,7 +921,7 @@ def main(argv: list[str]) -> int:
                 else launch_permission.NewWorkLaunchPurpose()
             )
             permission_environment = launch_environment()
-            if isinstance(unit_account, (accounts.NamedAccount, RetainedUnitAccount)):
+            if isinstance(unit_account, accounts.NamedAccount):
                 permission_environment["CLAUDE_CONFIG_DIR"] = str(unit_account.dir)
             permission = launch_permission.launch_permission(
                 permission_environment, purpose

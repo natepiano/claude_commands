@@ -532,6 +532,9 @@ def _run(now: datetime, dry_run: bool) -> list[str]:
                 moves.append_move(moves.RoomAgainMove(kind="room again", at=now.isoformat(), tool="claude",
                     subject=session["session_id"] + ": " + session["name"], move_id=prior["move_id"], label=chosen.label))
         if dry_run:
+            if group_name != "ungrouped":
+                selected_groups[group_name] = chosen.label
+                moved_groups.add(group_name)
             continue
         first_refusal = group[0][2]
         window_name = first_refusal.window.name if isinstance(first_refusal.window, refusals.KnownWindow) else "unknown"

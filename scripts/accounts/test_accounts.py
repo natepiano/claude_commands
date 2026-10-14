@@ -1004,26 +1004,42 @@ class AccountsTests(unittest.TestCase):
                                        accounts.AccountRoleBurn("claude 2", (), 10, 1),
                                        accounts.AccountRoleBurn("claude 3", (), 10, 1)])
 
-    def test_move_showrunners_names_a_timer_whose_session_is_not_running(self) -> None:
-        from importlib import import_module
-        # The modules move_showrunners imports by the paths it adds, as it finds them.
-        sys.path.insert(0, str(accounts.SCRIPTS / "shutdown"))
+    def test_showrunner_group_move_names_every_unregistered_timer_even_without_live_members(self) -> None:
+        self.login_directory("claude 2", "main@example.invalid", default=True)
+        self.login_directory("claude 3", "other@example.invalid")
         inventory = import_module("inventory")
-        stale = showrunners.Showrunner(session="", socket="", slug="remove-running-section", zone="America/New_York",
-                                       doc="/w/remove-running-section-production.md")
-        with (
-            patch.object(account, "named_claude_account", return_value=account.Account("claude", "main@example.invalid", "claude 2")),
-            patch.object(accounts, "_move_target", return_value=agent_accounts.KnownClaudeAccount("other@example.invalid", "claude 3")),
-            patch.object(inventory, "inventory", return_value={"machine": "natedev", "login": "main@example.invalid",
-                                                                 "label": "claude 2", "sessions": [], "unattributed": []}),
-            patch.object(inventory, "unregistered_showrunners", return_value=[stale]),
-        ):
-            refused = accounts.move_showrunners("claude 2", "claude 3")
-        self.assertIsInstance(refused, accounts.MoveRefused)
-        reason = cast(accounts.MoveRefused, refused).reason
-        self.assertEqual(reason.splitlines()[0], "no showrunner on claude 2 on this machine")
-        self.assertIn("remove-running-section: no session runs under the id its update timer names", reason)
-        self.assertIn("update_registration.py register --production /w/remove-running-section-production.md", reason)
+        stale = [showrunners.Showrunner(session="", socket="", slug=slug, zone="America/New_York",
+                                       doc=f"/w/{slug}-production.md") for slug in ("first", "second")]
+        with (patch.object(accounts, "live_group_members", return_value={"units": [], "showrunners": []}),
+              patch.object(inventory, "unregistered_showrunners", return_value=stale),
+              patch.object(accounts, "move_sessions") as moved):
+            code, output, error = self.run_cli("move", "showrunners", "claude 3")
+        self.assertEqual((code, error), (0, ""))
+        self.assertEqual(accounts.group_accounts().get("showrunners"), "claude 3")
+        self.assertEqual(output.replace("`", "").splitlines(), ["showrunners: no live session moves", *(
+            f"{runner['slug']}: no session runs under the id its update timer names; "
+            + "a showrunner running under another id is not moved until it runs "
+            + f"update_registration.py register --production {runner['doc']}" for runner in stale)])
+        moved.assert_not_called()
+
+    def test_showrunner_group_preview_names_unregistered_timers_without_configuring_or_requesting(self) -> None:
+        self.login_directory("claude 2", "main@example.invalid", default=True)
+        self.login_directory("claude 3", "other@example.invalid")
+        inventory = import_module("inventory")
+        stale = showrunners.Showrunner(session="", socket="", slug="missing", zone="America/New_York",
+                                       doc="/w/missing-production.md")
+        with (patch.object(accounts, "live_group_members", return_value={"units": [], "showrunners": []}),
+              patch.object(inventory, "unregistered_showrunners", return_value=[stale]),
+              patch.object(accounts, "move_sessions") as moved):
+            code, output, error = self.run_cli("move", "showrunners", "claude 3", "--dry-run")
+        self.assertEqual((code, error), (0, ""))
+        self.assertEqual(output.replace("`", "").splitlines(), ["showrunners: would select claude 3",
+            "showrunners: no live session moves",
+            "missing: no session runs under the id its update timer names; a showrunner running under "
+            + "another id is not moved until it runs update_registration.py register --production /w/missing-production.md"])
+        self.assertFalse(accounts.groups_file().exists())
+        self.assertFalse(accounts.roles_history_file().exists())
+        moved.assert_not_called()
 
     def test_burn_after_role_retirement_without_history_never_defaults_to_showrunners(self) -> None:
         self.login_directory("claude 2", "main@example.invalid", default=True)

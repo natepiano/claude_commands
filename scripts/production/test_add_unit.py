@@ -604,7 +604,7 @@ class AddUnitTests(ShutdownTestCase):
             _tmux: str,
             _director: add_unit.DirectorAgent,
             prompt: str,
-            _selected: add_unit.UnitLaunchAccount,
+            _selected: accounts.ClaudeLaunchAccount,
             *, target: str = "", model: str = "",
         ) -> None:
             self.assertEqual(target, "default" if isinstance(_request.session, add_unit.ResumedSession) else "")
@@ -1079,7 +1079,7 @@ class AddUnitTests(ShutdownTestCase):
             _tmux: str,
             _director: add_unit.DirectorAgent,
             _prompt: str,
-            _selected: add_unit.UnitLaunchAccount,
+            _selected: accounts.ClaudeLaunchAccount,
             *, target: str = "", model: str = "",
         ) -> None:
             self.assertEqual(target, "default" if isinstance(_request.session, add_unit.ResumedSession) else "")

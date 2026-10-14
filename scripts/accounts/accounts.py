@@ -2066,7 +2066,7 @@ class MoveStartFailed:
 
 
 @dataclass(frozen=True)
-class ShowrunnersMoveStartFailed:
+class GroupMoveStartFailed:
     session_ids: tuple[str, ...]
     target: str
     stdout: str
@@ -2075,13 +2075,13 @@ class ShowrunnersMoveStartFailed:
 
 
 @dataclass(frozen=True)
-class ShowrunnersMoveDryRun:
+class GroupMoveDryRun:
     session_ids: tuple[str, ...]
     lines: tuple[str, ...]
 
 
 @dataclass(frozen=True)
-class ShowrunnersMoveStarted:
+class GroupMoveStarted:
     session_ids: tuple[str, ...]
     target: str
     stdout: str
@@ -2106,56 +2106,7 @@ def _move_target(target: str) -> agent_accounts.KnownClaudeAccount | MoveRefused
     return destination
 
 
-def move_showrunners(source: str, target: str, *, dry_run: bool = False, why: str = "") -> ShowrunnersMoveStarted | ShowrunnersMoveStartFailed | ShowrunnersMoveDryRun | MoveRefused:
-    """Move all local showrunners on one login through one selected shutdown."""
-    sys.path.insert(0, str(SCRIPTS / "shutdown"))
-    if TYPE_CHECKING:
-        from scripts.shutdown import inventory, record
-    else:
-        inventory = import_module("inventory")
-        record = import_module("record")
-    try:
-        current = account.named_claude_account(source)
-        destination = _move_target(target)
-        if isinstance(destination, MoveRefused):
-            return destination
-        if destination.login.casefold() == current.login.casefold():
-            return MoveRefused(f"{source} is already on {destination.label}")
-        owners = [item for item in inventory.inventory(current.login, refresh_desktops=False)["sessions"] if item["kind"] == "showrunner"]
-        unregistered = tuple(
-            f"{runner['slug']}: no session runs under the id its update timer names; a showrunner running "
-            + f"under another id is not moved until it runs `update_registration.py register --production {runner['doc']}`"
-            for runner in inventory.unregistered_showrunners())
-        if not owners:
-            return MoveRefused("\n".join((f"no showrunner on {source} on this machine", *unregistered)))
-        open_ids = {saved["session"]["session_id"] for saved in record.all_session_records()}
-        skipped = (*unregistered, *(f"{owner['name']} already has a shutdown in progress" for owner in owners if owner["session_id"] in open_ids))
-        selected = [owner for owner in owners if owner["session_id"] not in open_ids]
-        ids = tuple(owner["session_id"] for owner in selected)
-        if not ids:
-            return ShowrunnersMoveDryRun((), skipped) if dry_run else ShowrunnersMoveStarted((), target, "\n".join(skipped) + "\n", "", 0)
-        reason = why or f"{current.label} is out of usage"
-        command = _shutdown_argv("down", source, "--here", "--only", ",".join(ids), "--restart", "--to", target, "--why", reason)
-        restart = cast(ManualMoveResume, cast(object, import_module("restart")))
-        if dry_run:
-            return ShowrunnersMoveDryRun(ids, (*skipped, *(f"{owner['name']}: {owner['session_id']}" for owner in selected),
-                shlex.join(command), *(restart.resume_command(owner, target, current.label, why) for owner in selected)))
-        for owner in selected:
-            if owner["host"]["kind"] == "unknown":
-                print(f"run this once {owner['name']} has exited: {restart.resume_command(owner, target, current.label, why)}", flush=True)
-        results = move_sessions(ids, target, why=reason)
-        refused = [item for item in results if isinstance(item, SessionMoveRefused)]
-        requested = [item for item in results if isinstance(item, SessionMoveRequested)]
-        prefix = "\n".join(skipped) + "\n" if skipped else ""
-        outcome = ShowrunnersMoveStartFailed if refused or any(item.returncode for item in requested) else ShowrunnersMoveStarted
-        return outcome(ids, target, prefix + (results[0].stdout if results else ""),
-            (results[0].stderr if results and results[0].stderr else "\n".join(item.reason for item in refused)),
-            max((item.returncode for item in results), default=0))
-    except (AccountsError, account.UnknownAccountName, record.InvalidRecord, inventory.InvalidInventory, OSError, ValueError) as error:
-        return MoveRefused(str(error))
-
-
-def move_group(group: ClaudeGroup, target: str, *, dry_run: bool = False, why: str = "") -> ShowrunnersMoveStarted | ShowrunnersMoveStartFailed | ShowrunnersMoveDryRun | MoveRefused:
+def move_group(group: ClaudeGroup, target: str, *, dry_run: bool = False, why: str = "") -> GroupMoveStarted | GroupMoveStartFailed | GroupMoveDryRun | MoveRefused:
     """Select the group's account before requesting each off-target member's move."""
     if target != "default":
         try:
@@ -2174,17 +2125,28 @@ def move_group(group: ClaudeGroup, target: str, *, dry_run: bool = False, why: s
     selected = [session for session in members if not session_on_account(session, target)]
     ids = tuple(session["session_id"] for session in selected)
     reason = why or f"{group} moved by hand"
+    notices = (f"{group}: no live session moves",) if not ids else ()
+    if group == "showrunners":
+        if TYPE_CHECKING:
+            from scripts.shutdown import inventory
+        else:
+            inventory = import_module("inventory")
+        notices += tuple(
+            f"{runner['slug']}: no session runs under the id its update timer names; a showrunner running "
+            + f"under another id is not moved until it runs `update_registration.py register --production {runner['doc']}`"
+            for runner in inventory.unregistered_showrunners())
     if dry_run:
-        return ShowrunnersMoveDryRun(ids, (f"{group}: would select {target}", *(f"{item['name']}: {item['session_id']}" for item in selected)))
+        return GroupMoveDryRun(ids, (f"{group}: would select {target}",
+            *(f"{item['name']}: {item['session_id']}" for item in selected), *notices))
     set_group_account(group, target, why=reason)
     results = move_sessions(ids, target, why=reason) if ids else ()
-    stdout = "".join(dict.fromkeys(item.stdout for item in results))
+    stdout = ("\n".join(notices) + "\n" if notices else "") + "".join(dict.fromkeys(item.stdout for item in results))
     stderr = "".join(dict.fromkeys(item.stderr for item in results))
     refused = [item for item in results if isinstance(item, SessionMoveRefused)]
     if refused:
         stderr += "\n".join(item.reason for item in refused if not item.stderr) + "\n"
     code = max((item.returncode for item in results), default=0)
-    outcome = ShowrunnersMoveStartFailed if refused or code else ShowrunnersMoveStarted
+    outcome = GroupMoveStartFailed if refused or code else GroupMoveStarted
     return outcome(ids, target, stdout, stderr, code or (1 if refused else 0))
 
 
@@ -2868,7 +2830,7 @@ def main(argv: list[str]) -> int:
             if isinstance(moved, MoveRefused):
                 print(moved.reason, file=sys.stderr)
                 return 1
-            if isinstance(moved, ShowrunnersMoveDryRun):
+            if isinstance(moved, GroupMoveDryRun):
                 print("\n".join(moved.lines))
                 return 0
             _ = sys.stdout.write(moved.stdout)

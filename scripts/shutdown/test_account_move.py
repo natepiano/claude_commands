@@ -8,6 +8,7 @@ import os
 import shlex
 import subprocess
 import tempfile
+from datetime import datetime, timezone
 from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 from typing import cast, override
@@ -18,6 +19,9 @@ import record
 import restart
 import sessions
 import settle
+import shutdown
+import stop as stop_work
+from importlib import import_module
 import account
 from scripts.accounts import accounts
 from test_restart import entry, seat, showrunner, top_level, tmux_host, unit
@@ -210,7 +214,7 @@ class AccountMoveTests(ShutdownTestCase):
         arguments = shlex.split(command)
         self.assertEqual(arguments[arguments.index("exec") + 1], "claude 3")
         self.assertEqual(arguments[arguments.index("--resume") + 1], "move-id")
-        saved = entry(self.owner)
+        saved = entry(self.owner, where=record.WhereNotSaid(kind="not said"))
         saved["target"] = "claude 3"
         saved["source_label"] = "claude 1"
         saved["why"] = "claude 1 is out of usage"
@@ -327,6 +331,83 @@ class AccountMoveTests(ShutdownTestCase):
         process.assert_not_called()
         launch.assert_not_called()
 
+    def test_group_move_real_shutdown_record_pauses_until_ready_and_tells_unit_showrunner(self) -> None:
+        director = unit("director", doc="/tmp/demo-production.md")
+        director["config_dir"] = str(accounts.account_dir("claude 1"))
+        director["checkout"] = inventory.NotACheckout(kind="not a checkout")
+        director["status"] = "idle"
+        report = inventory.Inventory(machine="natedev", login="current@example.invalid", label="claude 1",
+                                     sessions=[director], unattributed=[])
+        commands: list[list[str]] = []
+        events: list[str] = []
+        runner_registry = import_module("showrunners")
+
+        def request(command: list[str], **_options: object) -> subprocess.CompletedProcess[str]:
+            commands.append(command)
+            output = io.StringIO()
+            with redirect_stdout(output):
+                code = shutdown.main(command[2:])
+            return subprocess.CompletedProcess(command, code, output.getvalue(), "")
+
+        def delivered(to: str, first: str, text: str, *, key: str = "") -> settle.MessageDelivery:
+            _ = key
+            events.append(first)
+            if to == "session:director":
+                self.assertTrue(first.startswith("Pause for move: claude 1 → claude 3 (checkpoint move, "))
+                self.assertIn("shutdown.py ready --where", text)
+            return {"kind": "sent"}
+
+        def stopped(saved: record.SessionShutdown) -> record.SessionShutdown:
+            events.append("stop")
+            self.assertEqual(saved["progress"]["kind"], "ready")
+            checkpoint = saved["where"]
+            self.assertEqual(checkpoint["kind"], "said")
+            assert checkpoint["kind"] == "said"
+            self.assertEqual(checkpoint["text"], "finish the checkpoint")
+            return saved
+
+        with (patch.object(accounts, "live_group_members", return_value={"units": [director], "showrunners": []}),
+              patch.object(sessions, "live_sessions", return_value=self.batch_registry(report)),
+              patch.object(account, "account_of", return_value=account.Account("claude", report["login"], report["label"])),
+              patch.object(inventory, "inventory", return_value=report),
+              patch.object(shutdown, "inventory", return_value=report),
+              patch.object(settle, "inventory", return_value=report),
+              patch.object(settle, "run_inventory", return_value=report),
+              patch.object(settle, "_warm", return_value=True),
+              patch.object(settle, "_launch_conductor"),
+              patch.object(settle, "_session_timer_snapshot", return_value=[]),
+              patch.object(settle, "_showing_form", return_value=False),
+              patch.object(settle, "merge_in_progress", return_value=False),
+              patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": "requester-outside-group"}),
+              patch.object(subprocess, "run", side_effect=request),
+              patch.object(settle, "send_message", side_effect=delivered),
+              patch.object(runner_registry, "current_name", return_value="parent-runner"),
+              patch.object(stop_work, "stop_session", side_effect=stopped) as stop):
+            result = accounts.move_group("units", "claude 3", why="checkpoint move")
+            self.assertIsInstance(result, accounts.GroupMoveStarted)
+            self.assertEqual(len(commands), 1)
+            self.assertEqual(tuple(commands[0][2:]), ("down", "claude 1", "--here", "--only", "director",
+                "--restart", "--to", "claude 3", "--why", "checkpoint move"))
+            saved = record.session_records(report["login"])[0]
+            self.assertEqual(saved["force"], "wait for ready")
+            observed = stop_work.fresh_session(saved["session"], report)
+            self.assertIsInstance(settle.next_step(saved, observed, [saved], datetime.now(timezone.utc)),
+                                  settle.SendSettleMessage)
+            settle._send_settle_message(saved)  # pyright: ignore[reportPrivateUsage]
+            saved = record.session_records(report["login"])[0]
+            self.assertNotIsInstance(settle.next_step(saved, observed, [saved], datetime.now(timezone.utc)),
+                                     settle.StopSession)
+            stop.assert_not_called()
+            with patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": "director"}):
+                self.assertEqual(shutdown.main(["ready", "--where", "finish the checkpoint"]), 0)
+            saved = record.session_records(report["login"])[0]
+            self.assertIsInstance(settle.next_step(saved, observed, [saved], datetime.now(timezone.utc)),
+                                  settle.StopSession)
+            _ = settle._stop_after_telling(saved)  # pyright: ignore[reportPrivateUsage]
+            stop.assert_called_once()
+        self.assertTrue(events[1].startswith(f"{director['name']} is stopping:"), events)
+        self.assertEqual(events[-1], "stop")
+
     def test_group_move_selects_classified_showrunners_and_uses_one_local_down(self) -> None:
         report = self.showrunner_inventory()
         with (
@@ -342,6 +423,7 @@ class AccountMoveTests(ShutdownTestCase):
         self.assertEqual(arguments[2:4], ("down", "claude 1"))
         self.assertIn("--here", arguments)
         self.assertIn("--restart", arguments)
+        self.assertNotIn("now", arguments)
         self.assertEqual(arguments[arguments.index("--to") + 1], "claude 3")
         self.assertEqual(set(arguments[arguments.index("--only") + 1].split(",")), {"sr-one", "sr-two"})
 
@@ -367,12 +449,12 @@ class AccountMoveTests(ShutdownTestCase):
             patch.object(subprocess, "run", return_value=subprocess.CompletedProcess([], 2,
                 "", "shutdown: keys are cold\n")),
         ):
-            outcome = accounts.move_showrunners("claude 1", "claude 3")
-        self.assertIsInstance(outcome, accounts.ShowrunnersMoveStartFailed)
-        if not isinstance(outcome, accounts.ShowrunnersMoveStartFailed):
+            outcome = accounts.move_group("showrunners", "claude 3")
+        self.assertIsInstance(outcome, accounts.GroupMoveStartFailed)
+        if not isinstance(outcome, accounts.GroupMoveStartFailed):
             self.fail("bulk shutdown start failed without a failed-start result")
         self.assertEqual(outcome.returncode, 2)
-        self.assertEqual(outcome.stderr, "shutdown: keys are cold\n")
+        self.assertEqual(outcome.stderr.strip(), "shutdown: keys are cold")
 
     def test_group_move_without_live_members_sets_next_launch_account(self) -> None:
         report = self.showrunner_inventory()

@@ -21,7 +21,7 @@ and print its output exactly as it comes, with nothing added.
 - `placement --explain`: room and each group's destination on refusal. Low or 0% is room until refused; healthy groups stay put.
 - Configuration decides every new and resumed launch: `claude-unit` and `role unit` use units; `role showrunner` uses showrunners. Set it with `accounts.py move <group> "claude N"`; an unconfigured group refuses with that command.
 - `move <session-id|name> "claude N"|default`: moves one local ad hoc session; grouped sessions must use the group command; `--why <text>` explains the move on resume; an unknown host prints the resume line to run after exit.
-- `move units|showrunners "claude N"|default [--dry-run]`: selects the group account and moves its local members; the timer retries members still off target without duplicating open shutdowns.
+- `move units|showrunners "claude N"|default [--dry-run]`: selects the group account and requests shutdown’s pause-for-move protocol; members record `ready --where` before stopping, except shutdown’s idle usage-held owners and requester rules. The timer retries members still off target without duplicating open shutdowns. A preview prints the target and each off-target name/id, or `no live session moves`, and writes nothing; missing showrunner registrations print their repair command. An empty group still selects its account.
 - `role seats` shows the selection; `set-role seats "codex N"|default` selects future turns.
 - `swap seats "codex N"|default [--dry-run]` checks usage and moves every run at its next turn;
   working seats finish first. `default` selects `~/.codex`.

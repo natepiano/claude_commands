@@ -451,8 +451,13 @@ def restart_note(
 ) -> str:
     """Build the exact first prompt given to a resumed session."""
     if "target" in record:
-        return account_move_note(record["session"], record["target"],
+        note = account_move_note(record["session"], record["target"],
                                  record.get("source_label", record["label"]), record.get("why", ""))
+        where = record["where"]
+        if where["kind"] == "said":
+            punctuation = "" if where["text"].endswith((".", "!", "?")) else "."
+            note += f" Before it you wrote: {where['text']}{punctuation}"
+        return note
     opening = (
         f"Restarted after /shutdown of {record['label']} "
         f"(stopped {_user_time(record['requested_at'])}, "
@@ -501,18 +506,26 @@ class ResumeParts:
 
 
 def _resume_parts(session: Session, prompt: str, target: str = "") -> ResumeParts:
-    if session["kind"] == "showrunner":
+    default_dir = Path.home() / ".claude"
+    config_dir = Path(session.get("config_dir", str(default_dir)))
+    if session["kind"] in ("unit", "showrunner"):
         from scripts.accounts import accounts
 
-        selected = accounts.account_for_group_launch("showrunner", resume=True, target=target)
-        target = "default" if isinstance(selected, accounts.DefaultAccount) else selected.label
-    default_dir = str(Path.home() / ".claude")
-    config_dir = session.get("config_dir", default_dir)
+        role = "unit" if session["kind"] == "unit" else "showrunner"
+        selected = accounts.account_for_group_launch(role, resume=True, target=target)
+        selected_dir = accounts.main_config_dir() if isinstance(selected, accounts.DefaultAccount) else selected.dir
+        host = session["host"]
+        herdr_host = host["kind"] == "herdr"
+        # Only native herdr resumes retain an already configured directory.
+        if target or not herdr_host or selected_dir.resolve() != config_dir.resolve():
+            target = "default" if isinstance(selected, accounts.DefaultAccount) else selected.label
+        else:
+            config_dir = selected_dir
     account: RetainResumeAccount | MoveResumeAccount = (
-        MoveResumeAccount(target) if target else RetainResumeAccount(Path(config_dir))
+        MoveResumeAccount(target) if target else RetainResumeAccount(config_dir)
     )
     environment = (
-        named_account_environment(Path(config_dir))
+        named_account_environment(config_dir)
         if config_dir != default_dir and not target else {}
     )
     environment["ENABLE_TOOL_SEARCH"] = "true"
@@ -978,7 +991,7 @@ def _herdr_launch(parts: ResumeParts, session: Session, *, dry_run: bool) -> Non
     try:
         from scripts.accounts.accounts import ClaudeLaunchAccount, DefaultAccount, NamedAccount
 
-        config_dir = Path(environment["CLAUDE_CONFIG_DIR"])
+        config_dir = parts.account.config_dir
         claude_json = (Path.home() / ".claude.json" if config_dir == Path.home() / ".claude"
                        else config_dir / ".claude.json")
         trust = herdr.claude_trust(Path(parts.cwd), claude_json)
@@ -1033,12 +1046,13 @@ def _launch_session(
         prompt += " " + note
     parts = _resume_parts(session, prompt, record.get("target", ""))
     if host["kind"] == "herdr":
+        if session["kind"] == "showrunner" and isinstance(parts.account, MoveResumeAccount):
+            return ManualRestartRequired(_resume_command(
+                session, f"{_showrunner_prompt(session)} {note}", record.get("target", "")))
         _herdr_launch(parts, session, dry_run=dry_run)
         return SessionLaunched()
     command = _resume_shell(parts)
     if host["kind"] == "unknown" or (host["kind"] == "terminal" and sys.platform == "linux"):
-        if "target" in record:
-            command = resume_command(session, record["target"], record.get("source_label", record["label"]), record.get("why", ""))
         return ManualRestartRequired(command)
     _record_scheduled_restart_prompt(
         session["session_id"], prompt, dry_run=dry_run

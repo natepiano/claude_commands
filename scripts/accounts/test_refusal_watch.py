@@ -204,6 +204,74 @@ class RefusalWatchTests(unittest.TestCase):
         _ = path.write_text(json.dumps({"units": units, "showrunners": showrunners}))
         return path
 
+    def test_units_group_preview_lists_exactly_off_target_members_without_writes(self) -> None:
+        off = self.owner("off-target", host="unit")
+        _ = self.owner("already-there", host="unit", label="claude 3")
+        _ = self.owner("other-group", host="tmux")
+        before = self.snapshot()
+        output, error = io.StringIO(), io.StringIO()
+        with redirect_stdout(output), redirect_stderr(error):
+            code = accounts.main(["move", "units", "claude 3", "--dry-run"])
+        self.assertEqual((code, error.getvalue()), (0, ""))
+        self.assertEqual(output.getvalue().splitlines(), ["units: would select claude 3",
+            f"{off['name']}: {off['session_id']}"])
+        self.assertEqual(self.snapshot(), before)
+        self.assertFalse(accounts.groups_file().exists())
+        self.assertFalse(accounts.roles_history_file().exists())
+        self.assertEqual(moves.read_moves(), [])
+        self.assertEqual(record.all_session_records(), [])
+        self.assertEqual(self.commands, [])
+
+    def test_units_group_preview_on_current_account_prints_no_live_session_moves(self) -> None:
+        _ = self.owner("already-there", host="unit")
+        before = self.snapshot()
+        result = accounts.move_group("units", "claude 1", dry_run=True)
+        self.assertIsInstance(result, accounts.GroupMoveDryRun)
+        assert isinstance(result, accounts.GroupMoveDryRun)
+        self.assertEqual(result.session_ids, ())
+        self.assertEqual(result.lines, ("units: would select claude 1", "units: no live session moves"))
+        self.assertEqual(self.snapshot(), before)
+        self.assertEqual(self.commands, [])
+
+    def test_units_group_move_returns_group_named_started_outcome(self) -> None:
+        _ = self.owner("off-target", host="unit")
+        _ = self.owner("already-there", host="unit", label="claude 3")
+        result = accounts.move_group("units", "claude 3", why="checkpoint move")
+        self.assertIsInstance(result, accounts.GroupMoveStarted)
+        assert isinstance(result, accounts.GroupMoveStarted)
+        self.assertEqual(result.session_ids, ("off-target",))
+        self.assertEqual(len(self.commands), 1)
+        self.assertEqual(tuple(self.commands[0][2:]), ("down", "claude 1", "--here", "--only", "off-target",
+            "--restart", "--to", "claude 3", "--why", "checkpoint move"))
+
+    def test_units_group_failed_request_returns_group_named_failure(self) -> None:
+        _ = self.owner("off-target", host="unit")
+        refused = accounts.SessionMoveRefused("off-target", "stop request failed", returncode=2,
+                                             stderr="stop request failed\n")
+        with patch.object(accounts, "move_sessions", return_value=(refused,)):
+            result = accounts.move_group("units", "claude 3")
+        self.assertIsInstance(result, accounts.GroupMoveStartFailed)
+        assert isinstance(result, accounts.GroupMoveStartFailed)
+        self.assertEqual(result.session_ids, ("off-target",))
+        self.assertEqual((result.returncode, result.stderr.strip()), (2, "stop request failed"))
+
+    def test_partially_moved_group_preview_uses_only_the_new_refusal_destination(self) -> None:
+        path = self.groups(units="claude 3")
+        _ = self.owner("refused", host="unit")
+        _ = self.owner("partial", host="unit")
+        _ = self.transcript("refused")
+        self.reading("main@example.invalid", 80, reset=NOW + timedelta(hours=1))
+        before = self.snapshot()
+        _, output, error = self.cli("--dry-run")
+        self.assertEqual(error, "")
+        self.assertIn("move from claude 1 to default", output)
+        self.assertIn("owner partial: refused group units; move to default", output)
+        self.assertNotIn("moving to claude 3", output)
+        self.assertNotIn("move to claude 3", output)
+        self.assertEqual(path.read_bytes(), before[str(path.relative_to(self.home))])
+        self.assertEqual(self.snapshot(), before)
+        self.assertEqual(self.commands, [])
+
     def test_example_groups_move_only_after_their_own_refusals(self) -> None:
         path = self.groups()
         unit = self.owner("unit", host="unit")
@@ -267,6 +335,10 @@ class RefusalWatchTests(unittest.TestCase):
         self.assertEqual(len(self.commands), 1)
         command = self.commands[0]
         self.assertEqual(set(command[command.index("--only") + 1].split(",")), {"refused-unit", "healthy-unit"})
+        self.assertEqual(tuple(command[2:4]), ("down", "claude 1"))
+        self.assertIn("--restart", command)
+        self.assertIn("--here", command)
+        self.assertNotIn("now", command)
         self.assertEqual(command[command.index("--to") + 1], "claude 3")
         self.assertEqual(json.loads(path.read_text()), {"units": "claude 3", "showrunners": "claude 3"})
 
@@ -990,8 +1062,8 @@ class RefusalWatchTests(unittest.TestCase):
         requested = (accounts.SessionMoveRequested("first", "batch-id", "claude 3"),
                      accounts.SessionMoveRequested("second", "batch-id", "claude 3"))
         with patch.object(accounts, "move_sessions", return_value=requested) as move:
-            result = accounts.move_showrunners("claude 1", "claude 3", why="weekly refusal")
-        self.assertIsInstance(result, accounts.ShowrunnersMoveStarted)
+            result = accounts.move_group("showrunners", "claude 3", why="weekly refusal")
+        self.assertIsInstance(result, accounts.GroupMoveStarted)
         move.assert_called_once_with(("first", "second"), "claude 3", why="weekly refusal")
 
     def test_named_window_without_known_reset_moves(self) -> None:

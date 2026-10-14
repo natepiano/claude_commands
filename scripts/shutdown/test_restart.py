@@ -946,34 +946,149 @@ class RestartTests(ShutdownTestCase):
         self.assertIn(f"Run: {command}", str(refused.exception))
         self.assertFalse(log.exists())
 
-    def test_herdr_unit_with_a_plan_requires_manual_resume_without_add_unit_or_tmux(self) -> None:
-        owner = unit("native", session_host="herdr", session_name="native session")
-        saved = entry(owner)
-        with patch.object(restart, "_run") as launch, patch.object(restart, "_probe") as probe:
-            result = restart._launch_session(saved, "restart", self.desktop_state, dry_run=False)  # pyright: ignore[reportPrivateUsage]
-        launch.assert_not_called()
-        probe.assert_not_called()
-        self.assertIsInstance(result, restart.ManualRestartRequired)
-        if isinstance(result, restart.ManualRestartRequired):
-            self.assertEqual(result.command, restart._resume_command(owner, "restart"))  # pyright: ignore[reportPrivateUsage]
-            self.assertIn("claude --resume native", result.command)
-            self.assertNotIn("add_unit", result.command)
-            self.assertNotIn("tmux", result.command)
-        self.assertFalse(restart._note_path(saved, "native").exists())  # pyright: ignore[reportPrivateUsage]
-        self.assertEqual(conversation_pause.read_scheduled_prompts("native"), ())
+    def test_herdr_unit_restart_and_move_require_manual_account_exec_without_pane_changes(self) -> None:
+        """F001/F002: unrestricted unit names never reach native herdr agent launch."""
+        template, _, log = self.herdr_restart_fixture()
+        checkpoint = "finish Parser Review; keep 'quotes' and $(literal)"
+        for label in ("default", "claude 3"):
+            self.configure_groups(units=label)
+            for moved in (False, True):
+                for already_on_group in (False, True):
+                    for dry_run in (False, True):
+                        with self.subTest(label=label, moved=moved,
+                                          already_on_group=already_on_group, dry_run=dry_run):
+                            owner = unit("parser-review", session_host="herdr", session_name="writing")
+                            owner["name"] = "Parser Review"
+                            owner["cwd"] = template["cwd"]
+                            directory = accounts.main_config_dir() if label == "default" else accounts.account_dir(label)
+                            old_directory = accounts.account_dir("claude 1")
+                            owner["config_dir"] = str(directory if already_on_group else old_directory)
+                            saved = entry(owner, where=record.WhereSaid(kind="said", text=checkpoint, at=STOPPED))
+                            if moved:
+                                saved["target"] = label
+                                saved["source_label"] = LABEL
+                                saved["why"] = "checkpoint move"
+                            note = restart.restart_note(saved, RESTARTED)
+                            with (patch.object(herdr, "open_pane") as opened,
+                                  patch.object(herdr.Herdr, "close_pane") as closed,
+                                  patch.object(herdr.Herdr, "start_agent") as started,
+                                  patch.object(restart, "_run") as other_host):
+                                result = restart._launch_session(saved, note, self.desktop_state, dry_run=dry_run)  # pyright: ignore[reportPrivateUsage]
+                            self.assertIsInstance(result, restart.ManualRestartRequired)
+                            assert isinstance(result, restart.ManualRestartRequired)
+                            arguments = shlex.split(result.command.removesuffix("; exec zsh"))
+                            self.assertIn(str(restart.SCRIPTS / "accounts" / "accounts.py"), arguments)
+                            self.assertEqual(arguments[arguments.index("exec") + 1], label)
+                            self.assertEqual(arguments[arguments.index("--resume") + 1], "parser-review")
+                            self.assertEqual(arguments[arguments.index("-n") + 1], "Parser Review")
+                            self.assertIn(checkpoint, arguments[-1])
+                            opened.assert_not_called()
+                            closed.assert_not_called()
+                            started.assert_not_called()
+                            other_host.assert_not_called()
+                            self.assertFalse(log.exists())
+                            self.assertEqual(conversation_pause.read_scheduled_prompts("parser-review"), ())
 
-    def test_herdr_unit_without_a_plan_still_prints_a_conversation_resume(self) -> None:
-        owner = unit("native", session_host="herdr", session_name="native session",
-                     plan=inventory.NoRunRecord(kind="no run record"))
-        saved = entry(owner)
-        saved["target"] = "claude 3"
-        with patch.object(restart, "_run") as launch:
-            result = restart._launch_session(saved, "account move", self.desktop_state, dry_run=False)  # pyright: ignore[reportPrivateUsage]
-        launch.assert_not_called()
-        self.assertIsInstance(result, restart.ManualRestartRequired)
-        if isinstance(result, restart.ManualRestartRequired):
-            self.assertIn("accounts.py exec 'claude 3' --resume native", result.command)
-            self.assertNotIn("add_unit", result.command)
+    def test_herdr_showrunner_off_account_restart_and_move_require_manual_account_exec(self) -> None:
+        """F001: account changes never rely on PATH inside a herdr shell."""
+        template, _, log = self.herdr_restart_fixture()
+        checkpoint = "continue the saved showrunner checkpoint"
+        for label in ("default", "claude 3"):
+            self.configure_groups(showrunners=label)
+            for moved in (False, True):
+                for dry_run in (False, True):
+                    with self.subTest(label=label, moved=moved, dry_run=dry_run):
+                        owner = showrunner("runner-resume", host=template["host"])
+                        owner["name"] = "Production Review"
+                        owner["cwd"] = template["cwd"]
+                        owner["config_dir"] = str(accounts.account_dir("claude 1"))
+                        saved = entry(owner, where=record.WhereSaid(kind="said", text=checkpoint, at=STOPPED))
+                        if moved:
+                            saved["target"] = label
+                            saved["source_label"] = LABEL
+                            saved["why"] = "checkpoint move"
+                        note = restart.restart_note(saved, RESTARTED)
+                        with (patch.object(herdr, "open_pane") as opened,
+                              patch.object(herdr.Herdr, "close_pane") as closed,
+                              patch.object(herdr.Herdr, "start_agent") as started,
+                              patch.object(restart, "_run") as other_host):
+                            result = restart._launch_session(saved, note, self.desktop_state, dry_run=dry_run)  # pyright: ignore[reportPrivateUsage]
+                        self.assertIsInstance(result, restart.ManualRestartRequired)
+                        assert isinstance(result, restart.ManualRestartRequired)
+                        arguments = shlex.split(result.command.removesuffix("; exec zsh"))
+                        self.assertIn(str(restart.SCRIPTS / "accounts" / "accounts.py"), arguments)
+                        self.assertEqual(arguments[arguments.index("exec") + 1], label)
+                        self.assertEqual(arguments[arguments.index("--resume") + 1], "runner-resume")
+                        self.assertIn(checkpoint, arguments[-1])
+                        opened.assert_not_called()
+                        closed.assert_not_called()
+                        started.assert_not_called()
+                        other_host.assert_not_called()
+                        self.assertFalse(log.exists())
+                        self.assertEqual(conversation_pause.read_scheduled_prompts("runner-resume"), ())
+
+    def test_herdr_showrunner_already_on_configured_account_retains_native_resume(self) -> None:
+        template, _, log = self.herdr_restart_fixture()
+        directory = accounts.account_dir("claude 3")
+        _ = (directory / ".claude.json").write_text(json.dumps({
+            "oauthAccount": {"emailAddress": "third@example.invalid"},
+            "projects": {template["cwd"]: {"hasTrustDialogAccepted": True}},
+        }))
+        self.configure_groups(showrunners="claude 3")
+        owner = showrunner("runner-resume", host=template["host"])
+        owner["name"] = "production-review"
+        owner["cwd"] = template["cwd"]
+        owner["config_dir"] = str(directory)
+        note = restart.restart_note(entry(owner), RESTARTED)
+        parts = restart._resume_parts(owner, note)  # pyright: ignore[reportPrivateUsage]
+        self.assertEqual(parts.account, restart.RetainResumeAccount(directory))
+        with patch.object(restart, "_run") as other_host:
+            result = restart._launch_session(entry(owner), note, self.desktop_state, dry_run=False)  # pyright: ignore[reportPrivateUsage]
+        self.assertIsInstance(result, restart.SessionLaunched)
+        other_host.assert_not_called()
+        calls = self.herdr_calls(log)
+        opened = next(row for row in calls if row[2:4] == ["workspace", "create"])
+        self.assertIn("CLAUDE_CONFIG_DIR=" + str(directory), opened)
+        self.assertIn("CLAUDE_CODE_REMOTE_MEMORY_DIR=" + str(self.root / ".claude"), opened)
+        self.assertFalse(any(value.startswith("SHOWRUNNER_UNIT") for value in opened))
+        started = next(row for row in calls if row[2:4] == ["agent", "start"])
+        self.assertEqual(started[started.index("--resume") + 1], "runner-resume")
+        self.assertNotIn("accounts.py", " ".join(started))
+        self.assertFalse(any(row[2:4] == ["pane", "close"] for row in calls))
+        prompts = [row[-1] for row in calls if row[2:4] == ["agent", "prompt"]]
+        self.assertEqual(len(prompts), 1)
+        self.assertTrue(prompts[0].startswith("/showrunner:produce "))
+        self.assertEqual(conversation_pause.read_scheduled_prompts("runner-resume"), tuple(prompts))
+
+    def test_targeted_unit_and_showrunner_resume_prompts_carry_the_ready_checkpoint(self) -> None:
+        checkpoint = "commit the partial parser; keep 'quotes' and $(literal)"
+        self.configure_groups(units="claude 3", showrunners="claude 3")
+        for owner in (unit("checkpoint-unit"), showrunner("checkpoint-runner")):
+            with self.subTest(kind=owner["kind"]):
+                saved = entry(owner, where=record.WhereSaid(kind="said", text=checkpoint, at=STOPPED))
+                saved["target"] = "claude 3"
+                saved["source_label"] = LABEL
+                saved["why"] = "weekly refusal"
+                note = restart.restart_note(saved, RESTARTED)
+                self.assertIn(checkpoint, note)
+                self.assertIn("moved from claude 2 to claude 3", note)
+                captured: list[str] = []
+
+                def launched(argv: list[str], *, dry_run: bool) -> subprocess.CompletedProcess[str]:
+                    _ = dry_run
+                    if owner["kind"] == "unit":
+                        captured.append(Path(argv[argv.index("--restart-note") + 1]).read_text())
+                    elif "-ic" in argv:
+                        captured.append(shlex.split(argv[-1].removesuffix("; exec zsh"))[-1])
+                    return subprocess.CompletedProcess(argv, 0, "", "")
+
+                with patch.object(restart, "_run", side_effect=launched):
+                    result = restart._launch_session(saved, note, self.desktop_state, dry_run=False)  # pyright: ignore[reportPrivateUsage]
+                self.assertIsInstance(result, restart.SessionLaunched)
+                self.assertEqual(len(captured), 1)
+                self.assertIn(checkpoint, captured[0])
+                if owner["kind"] == "showrunner":
+                    self.assertTrue(captured[0].startswith("/showrunner:produce "))
 
     def test_move_target_showrunner_resumes_its_production_conversation(self) -> None:
         owner = showrunner("move-showrunner")
@@ -1029,7 +1144,7 @@ class RestartTests(ShutdownTestCase):
         self.assertFalse(any("windowclose" in arguments or "getwindowname" in arguments for arguments in commands.calls))
 
     def test_live_unknown_host_move_reports_its_manual_resume_line_once(self) -> None:
-        saved = entry(top_level("manual-move", name="kept name"))
+        saved = entry(top_level("manual-move", name="kept name"), where=record.WhereNotSaid(kind="not said"))
         saved["target"] = "claude 3"
         self.create([saved])
         output = io.StringIO()
@@ -1045,7 +1160,7 @@ class RestartTests(ShutdownTestCase):
         self.assertEqual(record.session_records(LOGIN)[0]["progress"]["kind"], "manual restart")
 
     def test_live_restart_verb_reports_an_unknown_host_move_command_exactly_once(self) -> None:
-        saved = entry(top_level("manual-move", name="kept name"))
+        saved = entry(top_level("manual-move", name="kept name"), where=record.WhereNotSaid(kind="not said"))
         saved["target"] = "claude 3"
         self.create([saved])
         output = io.StringIO()
@@ -1086,7 +1201,7 @@ class RestartTests(ShutdownTestCase):
         )
         for owner in owners:
             with self.subTest(host=owner["host"]["kind"], kind=owner["kind"]):
-                saved = entry(owner)
+                saved = entry(owner, where=record.WhereNotSaid(kind="not said"))
                 saved["target"] = "default"
                 saved["source_label"] = "claude 3"
                 saved["why"] = "weekly limit reached"

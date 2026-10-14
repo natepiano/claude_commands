@@ -294,10 +294,10 @@ class QuotaAlertTests(unittest.TestCase):
         self.stored_room("showrunner@example.invalid", 80, 5)
         note = self.note("claude 3.md", "active", "1", login="unit@example.invalid")
         with (mock.patch.object(accounts, "move") as move,
-              mock.patch.object(accounts, "move_showrunners") as move_showrunners):
+              mock.patch.object(accounts, "move_group") as move_group):
             text = self.message(note, [note], quota_alert.load_config())
         move.assert_not_called()
-        move_showrunners.assert_not_called()
+        move_group.assert_not_called()
         self.assertIn("units: move to claude 1", text)
         self.assertIn("showrunners: move to default", text)
         self.assertIn("ungrouped sessions: move to claude 1", text)

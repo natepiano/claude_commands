@@ -731,7 +731,7 @@ After a seat launch's own turn has ended, a move to the selected seats home that
 
 **Ruled out:** inferring a launch account from live sessions, readings or the launcher's own account; moving a healthy group because another account reads better; a weekly-reading floor on room.
 
-### Phase 19 — Group moves pause first  · status: todo
+### Phase 19 — Group moves pause first  · status: done
 
 **Depends on:** Phase 18
 
