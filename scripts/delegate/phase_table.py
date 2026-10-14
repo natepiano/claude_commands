@@ -1339,6 +1339,7 @@ def _most_recent_owned_note(
 
 def _note_text(
     name: str,
+    showrunner: str,
     production: str,
     unit: str,
     record: PhaseRecord,
@@ -1348,6 +1349,7 @@ def _note_text(
         (
             "---",
             "phase_table: true",
+            f"showrunner: {showrunner}",
             f"production: {production}",
             f"unit: {unit}",
             f"now: {json.dumps(_heading_text(record), ensure_ascii=False)}",
@@ -1570,7 +1572,14 @@ def refresh(session_dir: Path) -> None:
     _ensure_showrunners_excluded(vault_root)
     _write_note(
         target,
-        _note_text(name, production.slug, reference.unit, record, production.zone),
+        _note_text(
+            name,
+            folder.name,
+            production.slug,
+            reference.unit,
+            record,
+            production.zone,
+        ),
         ownership,
     )
     _remove_stale_notes(vault_root, target, ownership)

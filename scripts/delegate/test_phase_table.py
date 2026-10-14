@@ -2254,6 +2254,7 @@ class PhaseTableTests(unittest.TestCase):
                 (
                     "---",
                     "phase_table: true",
+                    "showrunner: showrunner",
                     "production: show",
                     "unit: table-unit",
                     'now: "Phase 1 of 1 — Current delivery"',
@@ -2322,9 +2323,9 @@ class PhaseTableTests(unittest.TestCase):
 
         self.assertEqual((result.returncode, result.stdout, result.stderr), (0, "", ""))
         lines = (self.vault_root / "showrunner" / "table.md").read_text(encoding="utf-8").splitlines()
-        self.assertEqual(lines[4], 'now: "No phase running — 1 of 2 done"')
+        self.assertEqual(lines[5], 'now: "No phase running — 1 of 2 done"')
         heading = next(line for line in lines if line.startswith("**"))
-        self.assertEqual(json.loads(lines[4].removeprefix("now: ")), heading[2:-2])
+        self.assertEqual(json.loads(lines[5].removeprefix("now: ")), heading[2:-2])
 
     def test_refresh_escapes_title_in_now_and_replaces_owned_note(self) -> None:
         self.write_production_plan()
@@ -2348,7 +2349,7 @@ class PhaseTableTests(unittest.TestCase):
         note = self.vault_root / "showrunner" / "table.md"
         text = note.read_text(encoding="utf-8")
         self.assertEqual(
-            text.splitlines()[4],
+            text.splitlines()[5],
             'now: "Phase 1 of 1 — Delivery: \\"quoted\\" \\\\ path"',
         )
         self.assertIn(f"**Phase 1 of 1 — {title}**\n", text)
@@ -2373,10 +2374,11 @@ class PhaseTableTests(unittest.TestCase):
 
         self.assertEqual((result.returncode, result.stdout, result.stderr), (0, "", ""))
         self.assertEqual(
-            note.read_text(encoding="utf-8").splitlines()[:6],
+            note.read_text(encoding="utf-8").splitlines()[:7],
             [
                 "---",
                 "phase_table: true",
+                "showrunner: showrunner",
                 "production: show",
                 "unit: table-unit",
                 'now: "Phase 1 of 1 — Current delivery"',
@@ -2538,7 +2540,9 @@ class PhaseTableTests(unittest.TestCase):
         target = newer_folder / "after.md"
         self.assertEqual(result.returncode, 0)
         self.assertTrue(target.is_file())
-        self.assertIn("| Updated | 01-01 00:21 UTC |", target.read_text(encoding="utf-8"))
+        text = target.read_text(encoding="utf-8")
+        self.assertIn("| Updated | 01-01 00:21 UTC |", text)
+        self.assertIn("\nshowrunner: last-known-showrunner\n", text)
         self.assertEqual(
             [path.relative_to(self.vault_root) for path in self.vault_root.rglob("*.md")],
             [Path("last-known-showrunner/after.md")],
