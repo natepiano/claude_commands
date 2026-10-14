@@ -164,7 +164,7 @@ def _timestamp(clock: Clock) -> str:
 def _fresh_inventory(login: str, only: frozenset[str]) -> Inventory:
     from inventory import inventory
 
-    return inventory(login, only)
+    return inventory(login, only=only, refresh_desktops=False)
 
 
 def fresh_session(stored: Session, report: Inventory) -> FreshSession:
@@ -566,7 +566,7 @@ def _stop_owner(
         return
 
     current = match["session"]
-    if not force_now and (
+    if not force_now and prior["kind"] != "reaping" and (
         prior["kind"] not in {"ready", "held by usage limit", "stopping", "stop failed"}
         or current["status"] != "idle"
         or any(seat["status"] != "idle" for seat in match["seats"])
@@ -737,7 +737,7 @@ def stop_session(
             if age < CLAIM_STALE_SECONDS:
                 return
         elif progress["kind"] not in {
-            "waiting", "ready", "held by usage limit", "stop failed", "stopped", "already gone", "process identity lost", "restart failed",
+            "waiting", "ready", "held by usage limit", "reaping", "stop failed", "stopped", "already gone", "process identity lost", "restart failed",
         }:
             return
         prior = copy.deepcopy(progress)

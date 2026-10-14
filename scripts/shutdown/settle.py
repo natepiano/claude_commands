@@ -34,6 +34,7 @@ import showrunners
 import stop as stop_work
 from user_zone import user_zone
 if TYPE_CHECKING:
+    from ..accounts import refusals
     from ..notify import review
     from ..notify.push_texts import RenderedPush, render, user_send_argv
 else:
@@ -56,6 +57,64 @@ USAGE_LIMIT_PATTERNS = (
     "usage limit reached",
     "wait for limit to reset",
 )
+
+
+@dataclass(frozen=True)
+class PromptSubject:
+    session_id: str
+    login: str
+    config_dir: Path
+
+
+@dataclass(frozen=True)
+class TakesPrompts:
+    because: Literal["room", "credits", "no fresh reading"]
+
+
+@dataclass(frozen=True)
+class StoppedTakingPrompts:
+    because: Literal["refused in its transcript", "account out of usage"]
+    detail: str
+
+
+SessionPromptState = TakesPrompts | StoppedTakingPrompts
+
+
+@dataclass(frozen=True)
+class InventoryNeeded:
+    """A direct caller has not yet observed the account's live sessions."""
+
+
+_INVENTORY_NEEDED = InventoryNeeded()
+
+
+def _limit_detail(window: str, reset: refusals.KnownReset | refusals.NoResetKnown) -> str:
+    from scripts.accounts import refusals
+    detail = ("weekly" if window == "weekly" else "5-hour" if window == "five_hour" else "usage") + " limit"
+    if isinstance(reset, refusals.KnownReset):
+        detail += ", resets " + reset.at.astimezone(user_zone()).strftime("%a %-I:%M %p")
+    return detail
+
+
+def prompt_state(session: PromptSubject, now: datetime) -> SessionPromptState:
+    """Decide whether this Claude session can receive its shutdown pause."""
+    from scripts.accounts import refusal_watch, refusals
+    try:
+        refusal = refusal_watch.transcript_refusal(session.session_id, config_dir=session.config_dir)
+    except (OSError, ValueError):
+        refusal = refusal_watch.NoSessionRefusal()
+    if isinstance(refusal, refusal_watch.TranscriptRefusal):
+        window = refusal.window.name if isinstance(refusal.window, refusals.KnownWindow) else "unknown"
+        return StoppedTakingPrompts("refused in its transcript", _limit_detail(window, refusal.reset))
+    reading = refusals.stored_reading("claude", session.login, now)
+    if not isinstance(reading, refusals.FreshReading):
+        return TakesPrompts("no fresh reading")
+    for name, window in (("weekly", reading.weekly), ("five_hour", reading.five_hour)):
+        if isinstance(window, refusals.ReadingWindow) and window.left <= 0:
+            return StoppedTakingPrompts("account out of usage", _limit_detail(name, window.reset))
+    if isinstance(reading.five_hour, refusals.NoWindow):
+        return TakesPrompts("no fresh reading")
+    return TakesPrompts("room")
 
 
 @dataclass(frozen=True)
@@ -459,6 +518,32 @@ def _usage_limit_shown(session: Session) -> bool:
     return _held_by_usage_limit(_screen(session))
 
 
+def _reap_refusal_during_wait(saved: SessionShutdown) -> SessionShutdown:
+    if saved["progress"]["kind"] != "waiting" or saved["settle_message"]["kind"] != "sent":
+        return saved
+    from scripts.accounts import refusal_watch, refusals
+    try:
+        refusal = refusal_watch.transcript_refusal(
+            saved["session"]["session_id"], config_dir=Path(saved["session"].get("config_dir", str(Path.home() / ".claude"))),
+        )
+    except (OSError, ValueError):
+        return saved
+    if not isinstance(refusal, refusal_watch.TranscriptRefusal):
+        return saved
+    sent = saved["settle_message"]["at"]
+    if refusal.refused_at.at <= datetime.fromisoformat(sent):
+        return saved
+    window = refusal.window.name if isinstance(refusal.window, refusals.KnownWindow) else "unknown"
+    detail = _limit_detail(window, refusal.reset)
+
+    def reap(current: SessionShutdown) -> None:
+        if (current["request_id"] == saved["request_id"] and current["progress"]["kind"] == "waiting"
+                and current["settle_message"]["kind"] == "sent" and current["settle_message"]["at"] == sent):
+            current["progress"] = {"kind": "reaping", "at": record_time(),
+                                   "because": "refused in its transcript", "detail": detail}
+    return store.update_session(saved["login"], saved["session"]["session_id"], reap)
+
+
 def _usage_limit_change(
     saved: SessionShutdown, owner: stop_work.FreshSession,
 ) -> EnterUsageLimitHold | LeaveUsageLimitHold | NoUsageLimitChange:
@@ -563,6 +648,8 @@ def _progress_text(record: SessionShutdown) -> str:
         progress += f" — {where['text']}"
     if entry_progress["kind"] == "restart failed" or entry_progress["kind"] == "stop failed":
         progress += f" — {entry_progress['reason']}"
+    elif entry_progress["kind"] == "reaping":
+        progress += f" — {entry_progress['because']}: {entry_progress['detail']}"
     elif entry_progress["kind"] == "timers pending":
         timers = "; ".join(
             f"{timer['instance']}: {timer['reason']}"
@@ -596,13 +683,18 @@ def status_record_lines(record: SessionShutdown, owner: stop_work.FreshSession |
     else:
         message = ""
     lines = [f"  {record['session']['name']}: {progress}{message}"]
+    for step in record.get("trail", []):
+        at = datetime.fromisoformat(step["at"]).astimezone(user_zone()).strftime("%H:%M:%S")
+        lines.append(f"    {at} {step['kind']} {step['detail']}".rstrip())
     lines.extend(f"    {stop_issue_text(issue)}" for issue in record["stop_issues"])
     return lines
 
 
-def run_inventory(login: str, only: Iterable[str] = ()) -> Inventory:
+def run_inventory(
+    login: str, only: Iterable[str] = (), *, refresh_desktops: bool = True,
+) -> Inventory:
     """Observe the account once, including each owner's current seats."""
-    return inventory(login, frozenset(only))
+    return inventory(login, only=frozenset(only), refresh_desktops=refresh_desktops)
 
 
 def _owned_seats(report: Inventory, session_id: str) -> list[Session]:
@@ -616,12 +708,14 @@ def begin(
     then: ShutdownContinuation = "stop", alerts: Literal["user", "none"] = "user",
     request_id: str,
     target: str = "", why: str = "",
+    report: Inventory | InventoryNeeded = _INVENTORY_NEEDED,
 ) -> list[SessionShutdown]:
     """Add independent owners, leaving every existing request intact."""
     for line in store.migrate(login):
         print(line)
     ids = tuple(only)
-    report = run_inventory(login, ids)
+    if isinstance(report, InventoryNeeded):
+        report = run_inventory(login, ids)
     at = record_time()
     origin: store.RequestOrigin = ({"kind": "session", "session_id": requested_by}
                                    if requested_by else {"kind": "terminal"})
@@ -634,13 +728,18 @@ def begin(
     for session in report["sessions"]:
         if session["kind"] == "seat":
             continue
+        state = prompt_state(PromptSubject(session["session_id"], login, Path(session.get("config_dir", str(Path.home() / ".claude")))), now_utc())
+        progress: store.SessionProgress = (
+            store.SessionReaping(kind="reaping", at=at, because=state.because, detail=state.detail)
+            if isinstance(state, StoppedTakingPrompts) else store.SessionWaiting(kind="waiting")
+        )
         saved = SessionShutdown(
             login=login, label=report["label"], machine=report["machine"], requested_at=at,
             request_id=request_id, requested_by=origin, hold="session" if ids else "account",
             then=then, force="wait for ready", alerts=alerts, session=session,
             seats=_owned_seats(report, session["session_id"]), timers=[],
             settle_message={"kind": "not sent"}, where={"kind": "not said"},
-            progress={"kind": "waiting"}, stop_issues=[],
+            progress=progress, trail=[], stop_issues=[],
         )
         if target:
             saved["target"] = target
@@ -725,6 +824,8 @@ def next_step(saved: SessionShutdown, owner: stop_work.FreshSession,
         return Finished()
     if progress in {"stopped", "already gone", "process identity lost"} and saved["then"] == "stop" and not _stop_retry_pending(saved):
         return Finished()
+    if progress == "reaping":
+        return Hold("account unreadable") if owner["kind"] == "session account unreadable" else StopSession()
     # `now` stops the requester too, without waiting for the rest of its request.
     if saved["force"] != "now" and _is_requester(saved) and any(
         item["request_id"] == saved["request_id"]
@@ -884,7 +985,7 @@ def cancel(account: Account, here: bool = False, only: Iterable[str] = ()) -> in
             continue
         # Suppression takes the watcher lock before withdrawal takes the account lock.
         # The open record keeps concurrent watcher ticks from replacing this request.
-        if saved["progress"]["kind"] in {"waiting", "ready", "held by usage limit"} or (
+        if saved["progress"]["kind"] in {"waiting", "ready", "held by usage limit", "reaping"} or (
             ids and saved["progress"]["kind"] == "stop failed"
         ):
             from scripts.accounts.refusal_watch import cancelled
@@ -936,7 +1037,7 @@ def cancel(account: Account, here: bool = False, only: Iterable[str] = ()) -> in
 
 
 def now(account: Account, here: bool = False, only: Iterable[str] = ()) -> int:
-    """Force waiting owners and retry owners whose stop failed."""
+    """Force waiting or reaping owners and retry owners whose stop failed."""
     for line in store.migrate(account.login):
         print(line)
     changed = False
@@ -951,12 +1052,12 @@ def now(account: Account, here: bool = False, only: Iterable[str] = ()) -> int:
     for saved in records:
         if ids and saved["session"]["session_id"] not in ids:
             continue
-        if not ids and saved["progress"]["kind"] not in {"waiting", "ready", "held by usage limit"} and not store.stop_incomplete(saved):
+        if not ids and saved["progress"]["kind"] not in {"waiting", "ready", "held by usage limit", "reaping"} and not store.stop_incomplete(saved):
             continue
         forced = False
         def force(current: SessionShutdown) -> None:
             nonlocal forced
-            if current["progress"]["kind"] in {"waiting", "ready", "held by usage limit"} or store.stop_incomplete(current):
+            if current["progress"]["kind"] in {"waiting", "ready", "held by usage limit", "reaping"} or store.stop_incomplete(current):
                 current["force"] = "now"
                 forced = True
         try:
@@ -1008,7 +1109,8 @@ def _launch_conductor(login: str, label: str) -> None:
 
 def down(account: Account, here: bool = False, only: Iterable[str] = (), *,
          then: ShutdownContinuation = "stop", alerts: Literal["user", "none"] = "user",
-         requested_by: str | None = None, request_id: str = "", target: str = "", why: str = "") -> int:
+         requested_by: str | None = None, request_id: str = "", target: str = "", why: str = "",
+         report: Inventory | InventoryNeeded = _INVENTORY_NEEDED) -> int:
     """Start local work immediately and ask the peer to conduct its own owners."""
     if not _warm():
         print(f"GitHub keys are cold: run `github-warmup` in a terminal on {_machine()}, then `/shutdown` again", file=sys.stderr)
@@ -1016,9 +1118,11 @@ def down(account: Account, here: bool = False, only: Iterable[str] = (), *,
     ids = tuple(only)
     origin = requested_by or os.environ.get("CLAUDE_CODE_SESSION_ID", "")
     identity = request_id or str(uuid4())
+    if isinstance(report, InventoryNeeded):
+        report = run_inventory(account.login, ids)
     local_ids: set[str] = ({saved["session"]["session_id"] for saved in store.session_records(account.login)}
-                 | {session["session_id"] for session in inventory(account.login, frozenset(ids))["sessions"]}) if ids else set()
-    added = begin(account.login, origin, ids, then=then, alerts=alerts, request_id=identity, target=target, why=why)
+                 | {session["session_id"] for session in report["sessions"]}) if ids else set()
+    added = begin(account.login, origin, ids, then=then, alerts=alerts, request_id=identity, target=target, why=why, report=report)
     try:
         _launch_conductor(account.login, account.label)
     except (OSError, RuntimeError, subprocess.SubprocessError):
@@ -1518,8 +1622,9 @@ def _conduct_owned(login: str, archived: dict[str, SessionShutdown]) -> None:
                 current = time.monotonic()
                 due = current >= next_inventory_at
                 if due:
-                    report = run_inventory(login)
                     observed_ids = {saved["session"]["session_id"] for saved in records}
+                    if observed_ids:
+                        report = run_inventory(login, observed_ids, refresh_desktops=False)
                     attempted.clear()
                     next_inventory_at = current + SETTLE_INTERVAL_SECONDS
                 if due or changed:
@@ -1531,6 +1636,10 @@ def _conduct_owned(login: str, archived: dict[str, SessionShutdown]) -> None:
                         if session_id in pending or session_id in confirming_ids or session_id not in observed_ids:
                             continue
                         owner = stop_work.fresh_session(saved["session"], report)
+                        try:
+                            saved = _reap_refusal_during_wait(saved)
+                        except store.NoLiveRecord:
+                            continue
                         change = _usage_limit_change(saved, owner)
                         if not isinstance(change, NoUsageLimitChange):
                             updated = _apply_usage_limit_change(saved, change)

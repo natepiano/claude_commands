@@ -371,6 +371,12 @@ class AccountMoveTests(ShutdownTestCase):
               patch.object(account, "account_of", return_value=account.Account("claude", report["login"], report["label"])),
               patch.object(inventory, "inventory", return_value=report),
               patch.object(shutdown, "inventory", return_value=report),
+              patch.object(shutdown, "listing", return_value=[inventory.ListedSession(
+                  session_id=director["session_id"], pid=director["pid"],
+                  proc_start=director["proc_start"], name=director["name"], kind="unit",
+                  config_dir=Path(director["config_dir"]), login=report["login"],
+                  production=director["host"]["production"], doc=director["host"]["doc"],
+              )]),
               patch.object(settle, "inventory", return_value=report),
               patch.object(settle, "run_inventory", return_value=report),
               patch.object(settle, "_warm", return_value=True),

@@ -103,7 +103,7 @@ def session_shutdown(machine: str = "natedev", name: str = "shutdown") -> Sessio
         hold="account", then="stop", force=old["force"], alerts="user",
         session=item["session"], seats=[], timers=item["timers"],
         settle_message=item["settle_message"], where=item["where"],
-        progress=cast(record_store.SessionProgress, item["progress"]), stop_issues=[],
+        progress=cast(record_store.SessionProgress, item["progress"]), stop_issues=[], trail=[],
     )
 
 
@@ -676,9 +676,11 @@ else:
         local = session_shutdown(name="local")
         remote = session_shutdown(machine="Mac", name="remote")
         self.assertTrue(record_store.create_session(local))
+        local["trail"] = [record_store.ProgressStep(at=local["requested_at"], kind="waiting", detail="")]
+        remote_wire = {key: value for key, value in remote.items() if key != "trail"}
         output = io.StringIO()
         with (
-            patch.object(shutdown, "run_remote", return_value=(0, json.dumps([remote]))) as read_remote,
+            patch.object(shutdown, "run_remote", return_value=(0, json.dumps([remote_wire]))) as read_remote,
             redirect_stdout(output),
         ):
             self.assertEqual(shutdown.main(["records", "--json"]), 0)
@@ -915,9 +917,13 @@ else:
                 machine + ":",
                 "  no sessions on claude 2",
                 "  bevy: stopped",
+                *(["    14:49:10 stopped"] if machine == "natedev" else []),
                 "  failed: stop failed — still live",
+                *(["    14:49:10 stop failed still live"] if machine == "natedev" else []),
                 "  hana: waiting",
+                *(["    14:49:10 waiting"] if machine == "natedev" else []),
                 "  nixos: waiting",
+                *(["    14:49:10 waiting"] if machine == "natedev" else []),
                 "  no conductor running; /shutdown --only <name> resumes one, /shutdown cancel --only <name> takes it out",
                 "  take out: /shutdown cancel --only <name> · failed, hana, nixos",
                 "  stop now: /shutdown now --only <name> · failed, hana, nixos",
@@ -936,7 +942,9 @@ else:
             "natedev:",
             "  no sessions on claude 2",
             "  hana: waiting",
+            "    14:49:10 waiting",
             "  nixos: waiting",
+            "    14:49:10 waiting",
             "  conductor ownership unavailable: cannot read lock",
             "  take out: /shutdown cancel --only <name> · hana, nixos",
             "  stop now: /shutdown now --only <name> · hana, nixos",

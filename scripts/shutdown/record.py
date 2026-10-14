@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import copy
 import fcntl
 import json
 import os
@@ -14,7 +15,7 @@ import time
 from collections.abc import Callable, Generator
 from contextlib import contextmanager
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Literal, NotRequired, TypedDict, cast
 
@@ -212,6 +213,13 @@ class SessionWaiting(TypedDict):
     kind: Literal["waiting"]
 
 
+class SessionReaping(TypedDict):
+    kind: Literal["reaping"]
+    at: str
+    because: Literal["refused in its transcript", "account out of usage"]
+    detail: str
+
+
 class SessionReadyToStop(TypedDict):
     kind: Literal["ready"]
     at: str
@@ -293,6 +301,7 @@ class SessionNeedsManualRestart(TypedDict):
 
 SessionRestartPrior = (
     SessionWaiting
+    | SessionReaping
     | SessionReadyToStop
     | SessionHeldByUsageLimit
     | SessionStopped
@@ -348,6 +357,12 @@ class _LegacyShutdownRecord(TypedDict):
     stop_issues: list[_LegacyOrchestrationIssue]
 
 
+class ProgressStep(TypedDict):
+    at: str
+    kind: str
+    detail: str
+
+
 class SessionShutdown(TypedDict):
     login: str
     label: str
@@ -365,6 +380,7 @@ class SessionShutdown(TypedDict):
     settle_message: SettleMessage
     where: Where
     progress: SessionProgress
+    trail: list[ProgressStep]
     stop_issues: list[SessionStopIssue]
     alerted_at: NotRequired[str]
     # The phone push for a form open in the session's pane; the user is told once.
@@ -427,6 +443,7 @@ _RECORD_STATES = frozenset(
 _PROGRESS_WITH_TIME = frozenset(
     {
         "ready",
+        "reaping",
         "held by usage limit",
         "passive seat ready",
         "stopped",
@@ -621,6 +638,12 @@ def _progress(value: object, place: str, *, legacy: bool = False) -> SessionProg
         _ = _utc_time(_required(values, "at", place), f"{place}.at")
     if kind in {"passive seat ready", "seat available on demand"} and not legacy:
         raise InvalidRecord(f"{place}.kind is invalid")
+    if kind == "reaping":
+        _ = _kind(values, place, frozenset({"reaping"}))
+        because = _string(_required(values, "because", place), f"{place}.because")
+        if because not in {"refused in its transcript", "account out of usage"}:
+            raise InvalidRecord(f"{place}.because is invalid")
+        _ = _string(_required(values, "detail", place), f"{place}.detail")
     if kind == "restarting":
         prior = _progress(_required(values, "prior", place), f"{place}.prior")
         if prior["kind"] == "restarting":
@@ -975,6 +998,15 @@ def _session_shutdown(value: object, place: str) -> SessionShutdown:
     _ = _required(values, "stop_issues", place)
     fields = _entry(values, place)
     values["progress"] = _progress(values["progress"], f"{place}.progress")
+    trail: list[ProgressStep] = []
+    for index, step in enumerate(_items(values.get("trail", []), f"{place}.trail")):
+        step_place = f"{place}.trail[{index}]"
+        fields_step = _mapping(step, step_place)
+        at = _utc_time(_required(fields_step, "at", step_place), f"{step_place}.at")
+        kind = _string(_required(fields_step, "kind", step_place), f"{step_place}.kind")
+        detail = _string(_required(fields_step, "detail", step_place), f"{step_place}.detail")
+        trail.append(ProgressStep(at=at, kind=kind, detail=detail))
+    values["trail"] = trail
     values["stop_issues"] = [_session_stop_issue(issue, f"{place}.stop_issues") for issue in fields["stop_issues"]]
     if fields["session"]["kind"] == "seat":
         raise InvalidRecord(f"{place}.session must not be a seat")
@@ -1100,7 +1132,7 @@ def _convert_session(record: _LegacyShutdownRecord, entry: _LegacySessionEntry) 
         then=_legacy_continuation(record), force=record["force"], alerts="user",
         session=session, seats=seats, timers=entry["timers"],
         settle_message=entry["settle_message"], where=entry["where"],
-        progress=cast(SessionProgress, cast(object, progress)), stop_issues=[issue for issue in entry["stop_issues"] if issue["kind"] != "seat still live"],
+        progress=cast(SessionProgress, cast(object, progress)), trail=[], stop_issues=[issue for issue in entry["stop_issues"] if issue["kind"] != "seat still live"],
     )
 
 
@@ -1163,9 +1195,28 @@ def find_session(login: str, session_id: str) -> SessionShutdown | None:
     return next((item for item in session_records(login) if item["session"]["session_id"] == session_id), None)
 
 
+def _progress_step(record: SessionShutdown, at: str) -> ProgressStep:
+    progress = record["progress"]
+    detail = ""
+    if progress["kind"] == "reaping":
+        detail = progress["because"] + (": " + progress["detail"] if progress["detail"] else "")
+    elif progress["kind"] == "stop failed" or progress["kind"] == "restart failed":
+        detail = progress["reason"]
+    elif progress["kind"] == "manual restart":
+        detail = progress["command"]
+    elif progress["kind"] == "timers pending":
+        detail = "; ".join(timer["instance"] + ": " + timer["reason"] for timer in progress["timers"])
+    elif progress["kind"] == "ready" and record["where"]["kind"] == "said":
+        detail = record["where"]["text"]
+    return ProgressStep(at=at, kind=progress["kind"], detail=detail)
+
+
 def create_session(record: SessionShutdown) -> bool:
     """Create one session record while excluding competing launch decisions."""
     checked = _session_shutdown(record, "record")
+    if not checked["trail"]:
+        checked["trail"].append(_progress_step(
+            checked, checked["progress"].get("at", checked["requested_at"])))
     with launch_barrier():
         with _session_store_lock(checked["login"], create=True) as directory:
             existing = _session_records_in_directory(directory, checked["login"])
@@ -1196,7 +1247,13 @@ def update_session(
         if record["session"]["session_id"] != session_id:
             raise InvalidRecord(f"{path} is used by a different session id")
         identity = record["login"], record["machine"], record["session"]["session_id"]
+        prior_progress = copy.deepcopy(record["progress"])
+        trail = copy.deepcopy(record["trail"])
         change(record)
+        record["trail"] = trail
+        if record["progress"] != prior_progress:
+            at = datetime.now(timezone.utc).isoformat(timespec="seconds")
+            record["trail"].append(_progress_step(record, at))
         checked = _session_shutdown(record, str(path))
         if (checked["login"], checked["machine"], checked["session"]["session_id"]) != identity:
             raise ValueError("a session record update cannot change its login, machine or session id")
@@ -1454,7 +1511,7 @@ def _withdraw_session(
         if saved["session"]["session_id"] != session_id:
             raise InvalidRecord(f"{path} is used by a different session id")
         progress = saved["progress"]["kind"]
-        if progress not in {"waiting", "ready", "held by usage limit"} and not (
+        if progress not in {"waiting", "ready", "held by usage limit", "reaping"} and not (
             progress == "stop failed" and identity_check(saved)
         ):
             return SessionRetained(saved)

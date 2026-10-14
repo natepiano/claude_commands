@@ -6,6 +6,7 @@ from __future__ import annotations
 import copy
 import io
 import json
+from datetime import datetime, tzinfo
 import os
 import shlex
 import subprocess
@@ -46,6 +47,14 @@ LABEL = "claude 2"
 STOPPED = "2026-10-09T21:49:10+00:00"
 RESTARTED = "2026-10-10T01:02:03+00:00"
 EMPTY_SESSION_IDS: frozenset[str] = frozenset()
+
+
+class RestartAttemptTime(datetime):
+    @classmethod
+    @override
+    def now(cls, tz: tzinfo | None = None) -> "RestartAttemptTime":
+        return cls.fromisoformat(RESTARTED).astimezone(tz)
+
 
 def named_prefix(config_dir: str) -> str:
     """The assignments a session resumed on a named account's directory starts with."""
@@ -211,7 +220,7 @@ def entry(
         session=session, seats=[], timers=list(timers or []),
         settle_message=record.SettleMessageNotSent(kind="not sent"),
         where=where or record.WhereSaid(kind="said", text=f"working on {session['name']}", at=STOPPED),
-        progress=state or record.SessionStopped(kind="stopped", at=STOPPED), stop_issues=[],
+        progress=state or record.SessionStopped(kind="stopped", at=STOPPED), stop_issues=[], trail=[],
     )
 
 
@@ -2192,8 +2201,16 @@ class RestartTests(ShutdownTestCase):
     def test_manual_session_not_live_keeps_its_resume_command(self) -> None:
         saved = entry(top_level("manual"), state=record.SessionNeedsManualRestart(kind="manual restart", command="resume"))
         self.create([saved])
-        self.assertEqual(self.run_restarts(), (1, []))
-        self.assertEqual(record.find_session(LOGIN, "manual"), saved)
+        saved["trail"] = [record.ProgressStep(at=STOPPED, kind="manual restart", detail="resume")]
+        with patch.object(record, "datetime", RestartAttemptTime):
+            self.assertEqual(self.run_restarts(), (1, []))
+        self.assertEqual(record.find_session(LOGIN, "manual"), {
+            **saved, "trail": [
+                *saved["trail"],
+                record.ProgressStep(at=RESTARTED, kind="restarting", detail=""),
+                record.ProgressStep(at=RESTARTED, kind="manual restart", detail="resume"),
+            ],
+        })
 
     def test_pending_timers_only_retry_the_failed_timer_when_live(self) -> None:
         saved = entry(top_level("owner"), state=record.SessionRestoredTimersPending(
@@ -2210,17 +2227,38 @@ class RestartTests(ShutdownTestCase):
     def test_unreadable_registry_preserves_pending_timer_progress(self) -> None:
         saved = entry(top_level("owner"), state=record.SessionRestoredTimersPending(kind="timers pending", at=STOPPED, timers=[record.PendingTimer(instance="pending", reason="failed")]))
         self.create([saved])
+        saved["trail"] = [record.ProgressStep(at=STOPPED, kind="timers pending", detail="pending: failed")]
+        _ = self.enterContext(patch.object(record, "datetime", RestartAttemptTime))
         with patch.object(restart, "_session_liveness", return_value=restart.SessionLivenessUnknown("unreadable")), patch.object(settle, "run_notifier") as timers:
             self.assertEqual(self.run_restarts(), (1, []))
         timers.assert_not_called()
-        self.assertEqual(record.find_session(LOGIN, "owner"), saved)
+        self.assertEqual(record.find_session(LOGIN, "owner"), {
+            **saved, "trail": [
+                *saved["trail"],
+                record.ProgressStep(at=RESTARTED, kind="restarting", detail=""),
+                record.ProgressStep(at=RESTARTED, kind="timers pending", detail="pending: failed"),
+            ],
+        })
 
     def test_failed_launcher_with_unknown_registry_preserves_prior_progress(self) -> None:
         saved = entry(top_level("owner", host=tmux_host("owner")))
         self.create([saved])
+        saved["trail"] = [record.ProgressStep(at=STOPPED, kind="stopped", detail="")]
+        _ = self.enterContext(patch.object(record, "datetime", RestartAttemptTime))
         with patch.object(restart, "_retire"), patch.object(restart, "_live_session_ids", return_value=frozenset()), patch.object(restart, "_launch_session", side_effect=OSError("failed")), patch.object(restart, "_session_liveness", return_value=restart.SessionLivenessUnknown("unreadable")), redirect_stdout(io.StringIO()):
-            self.assertEqual(restart.relaunch_session(saved, dry_run=False, desktop_state=self.desktop_state), saved)
-        self.assertEqual(record.find_session(LOGIN, "owner"), saved)
+            self.assertEqual(restart.relaunch_session(saved, dry_run=False, desktop_state=self.desktop_state), {
+                **saved, "trail": [
+                    *saved["trail"],
+                    record.ProgressStep(at=RESTARTED, kind="restarting", detail=""),
+                ],
+            })
+        self.assertEqual(record.find_session(LOGIN, "owner"), {
+            **saved, "trail": [
+                *saved["trail"],
+                record.ProgressStep(at=RESTARTED, kind="restarting", detail=""),
+                record.ProgressStep(at=RESTARTED, kind="stopped", detail=""),
+            ],
+        })
 
     def test_failed_launcher_with_live_registry_is_confirmed(self) -> None:
         saved = entry(top_level("owner", host=tmux_host("owner")))
@@ -2903,6 +2941,37 @@ class RestartTests(ShutdownTestCase):
         with patch.object(restart, "named_claude_account", return_value=self.account), patch.object(settle, "inventory", return_value=inventory.Inventory(machine="natedev", login=LOGIN, label=LABEL, sessions=[], unattributed=[])), patch.object(restart, "run_remote", return_value=(1, response)), patch.object(settle, "alert_user") as alert, patch.object(restart, "_print_result") as summary, redirect_stdout(io.StringIO()) as output:
             self.assertEqual(restart.restart(restart.AccountNamed(LABEL), only=["peer-id"], dry_run=False, alerts=restart.AlertWhenNotBack()), 1)
         self.assertEqual(output.getvalue(), line + "\n")
+        alert.assert_not_called()
+        summary.assert_not_called()
+
+    def test_selected_reaping_session_is_refused_without_launch_or_record_change(self) -> None:
+        saved = entry(top_level("reaping", name="Reaping owner"), state=record.SessionReaping(
+            kind="reaping", at=RESTARTED, because="account out of usage", detail="weekly limit"))
+        self.create([saved])
+        before = {path.relative_to(self.state_root): path.read_bytes()
+                  for path in self.state_root.rglob("*") if path.is_file()}
+        for dry_run in (False, True):
+            with self.subTest(dry_run=dry_run), patch.object(restart, "_launch_session") as launch, redirect_stdout(io.StringIO()) as output:
+                result = restart._up(LOGIN, dry_run, ["reaping"])  # pyright: ignore[reportPrivateUsage]
+            self.assertEqual(result.exit_status, 1)
+            self.assertEqual(result.refused, [
+                {"kind": "not stopped", "session_id": "reaping", "name": "Reaping owner", "progress": "reaping"},
+            ])
+            self.assertEqual((result.restarted, result.failed), (0, 0))
+            self.assertEqual(output.getvalue(), "Reaping owner is reaping, not stopped; nothing to restart\n")
+            launch.assert_not_called()
+            self.assertEqual({path.relative_to(self.state_root): path.read_bytes()
+                              for path in self.state_root.rglob("*") if path.is_file()}, before)
+
+    def test_peer_reaping_refusal_parses_and_exits_one_without_alert(self) -> None:
+        refusal = restart.RestartNotStopped(kind="not stopped", session_id="peer-id", name="Peer", progress="reaping")
+        line = "Peer is reaping, not stopped; nothing to restart"
+        response = peer_json(outcome="nothing", lines=[line], refused=[refusal])
+        self.assertEqual(restart.parse_peer_result(response)["refused"], [refusal])
+        with patch.object(restart, "named_claude_account", return_value=self.account), patch.object(restart, "run_remote", return_value=(1, response)) as peer, patch.object(settle, "alert_user") as alert, patch.object(restart, "_print_result") as summary, redirect_stdout(io.StringIO()) as output:
+            self.assertEqual(restart.restart(restart.AccountNamed(LABEL), only=["peer-id"], dry_run=False, alerts=restart.AlertWhenNotBack()), 1)
+        self.assertEqual(output.getvalue(), line + "\n")
+        peer.assert_called_once_with(["up", LOGIN, "--here", "--json", "--only", "peer-id"], limit={"kind": "while link alive"})
         alert.assert_not_called()
         summary.assert_not_called()
 

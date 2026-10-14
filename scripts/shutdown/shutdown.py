@@ -30,6 +30,7 @@ from inventory import (
     Inventory,
     Session,
     inventory,
+    listing,
     parse_inventory,
 )
 from launch_permission import (
@@ -352,23 +353,29 @@ class _SelectableSession:
     machine: str
 
 
+@dataclass(frozen=True)
+class ResolvedSessions:
+    session_ids: tuple[str, ...]
+    report: Inventory
+
+
 class SessionSelectionError(ValueError):
     """The requested items do not identify exactly one account session."""
 
 
-def resolve_sessions(login: str, items: Iterable[str], *, here: bool = False) -> list[str]:
-    """Resolve exact names and ids, counting inventory and records once."""
+def resolve_sessions(login: str, items: Iterable[str], *, here: bool = False) -> ResolvedSessions:
+    """Resolve names from membership, then build one filtered inventory."""
     requested = list(dict.fromkeys(items))
     if not requested or any(not item for item in requested):
         raise SessionSelectionError("--only needs a session id or exact name")
-    local_report = inventory(login)
+    local_machine = settle.local_machine()
     local: dict[str, _SelectableSession] = {}
     for saved in session_records(login):
         owner = saved["session"]
         local[owner["session_id"]] = _SelectableSession(owner["session_id"], owner["name"], saved["machine"])
-    for owner in local_report["sessions"]:
-        if owner["kind"] != "seat":
-            local[owner["session_id"]] = _SelectableSession(owner["session_id"], owner["name"], local_report["machine"])
+    for owner in listing(login):
+        if owner.kind != "seat":
+            local[owner.session_id] = _SelectableSession(owner.session_id, owner.name, local_machine)
     candidates = dict(local)
     peer_unavailable = False
     needs_peer = not here and any(item not in local for item in requested)
@@ -395,7 +402,7 @@ def resolve_sessions(login: str, items: Iterable[str], *, here: bool = False) ->
                         if owner["kind"] != "seat":
                             _ = candidates.setdefault(owner["session_id"], _SelectableSession(owner["session_id"], owner["name"], report["machine"]))
         if peer_unavailable:
-            print(f"{other_machine()}: not reached; names checked on {local_report['machine']} only", file=sys.stderr)
+            print(f"{other_machine()}: not reached; names checked on {local_machine} only", file=sys.stderr)
     result: list[str] = []
     for item in requested:
         if item in local:
@@ -413,7 +420,7 @@ def resolve_sessions(login: str, items: Iterable[str], *, here: bool = False) ->
             raise SessionSelectionError("\n".join(lines))
         if matches[0].session_id not in result:
             result.append(matches[0].session_id)
-    return result
+    return ResolvedSessions(tuple(result), inventory(login, only=frozenset(result)))
 
 
 def _remote_conductor_status(login: str) -> ConductorRunning | ConductorNotRunning | ConductorUnavailable:
@@ -441,7 +448,7 @@ def _status_actions(records: list[SessionShutdown], ownership: ConductorRunning 
     take_out: list[str] = []
     stop_now: list[str] = []
     bring_back: list[str] = []
-    waiting = any(saved["progress"]["kind"] in {"waiting", "ready", "held by usage limit"} for saved in records)
+    waiting = any(saved["progress"]["kind"] in {"waiting", "ready", "held by usage limit", "reaping"} for saved in records)
     if waiting:
         if isinstance(ownership, ConductorNotRunning):
             lines.append("  no conductor running; /shutdown --only <name> resumes one, /shutdown cancel --only <name> takes it out")
@@ -450,7 +457,7 @@ def _status_actions(records: list[SessionShutdown], ownership: ConductorRunning 
     for saved in records:
         name = saved["session"]["name"]
         progress = saved["progress"]["kind"]
-        if progress in {"waiting", "ready", "held by usage limit"}:
+        if progress in {"waiting", "ready", "held by usage limit", "reaping"}:
             take_out.append(name)
             stop_now.append(name)
         elif progress == "stop failed":
@@ -643,7 +650,7 @@ def main(arguments: list[str] | None = None) -> int:
                 print(f"shutdown: {error}", file=sys.stderr)
                 return 1
             try:
-                restart_ids = resolve_sessions(selected.login, _only_ids(options.only), here=options.here)
+                restart_ids = list(resolve_sessions(selected.login, _only_ids(options.only), here=options.here).session_ids)
             except SessionSelectionError as error:
                 print(f"shutdown: {error}", file=sys.stderr)
                 return 2
@@ -686,9 +693,11 @@ def main(arguments: list[str] | None = None) -> int:
             print(f"shutdown: {error}", file=sys.stderr)
             return 2
         ids: tuple[str, ...] = ()
+        down_report: Inventory | settle.InventoryNeeded = settle.InventoryNeeded()
         if options.command in {"down", "now", "cancel"} and options.only is not None:
             try:
-                ids = tuple(resolve_sessions(selected.login, _only_ids(options.only), here=options.here))
+                resolved = resolve_sessions(selected.login, _only_ids(options.only), here=options.here)
+                ids, down_report = resolved.session_ids, resolved.report
             except SessionSelectionError as error:
                 print(f"shutdown: {error}", file=sys.stderr)
                 return 2
@@ -696,12 +705,14 @@ def main(arguments: list[str] | None = None) -> int:
                 print(f"shutdown: {error}", file=sys.stderr)
                 return 3
         if options.command == "down":
+            if isinstance(down_report, settle.InventoryNeeded):
+                down_report = inventory(selected.login)
             return settle.down(
                 selected, options.here, ids,
                 then="restart" if options.restart else "stop",
                 alerts="none" if options.no_alert else "user",
                 requested_by=options.requested_by, request_id=options.request_id,
-                target=options.target, why=options.why,
+                target=options.target, why=options.why, report=down_report,
             )
         if options.command == "now":
             return settle.now(selected, options.here, ids)
@@ -724,7 +735,7 @@ def main(arguments: list[str] | None = None) -> int:
                            else _remote_shutdown_records(selected.login))
                 record_lines = _shutdown_record_lines(outcome, observations, local_observation=index == 0)
                 if outcome["kind"] == "records":
-                    waiting = any(saved["progress"]["kind"] in {"waiting", "ready", "held by usage limit"} for saved in outcome["records"])
+                    waiting = any(saved["progress"]["kind"] in {"waiting", "ready", "held by usage limit", "reaping"} for saved in outcome["records"])
                     ownership = (conductor_status(selected.login) if index == 0 else _remote_conductor_status(selected.login)) if waiting else ConductorNotRunning()
                     record_lines.extend(_status_actions(outcome["records"], ownership))
                 if record_lines:
