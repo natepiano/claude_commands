@@ -112,7 +112,7 @@ A test that pins a behaviour a user or another script depends on is not trivial,
 
 **Gotchas:** admission works on RSS samples at least 0.25 s apart, not an OS limit; a module that grows suddenly can still pass the cap, which turns the run red. `local_release_wait` falls back to polling where inotify is absent (macOS). The red-suite rerun rule stays with the showrunner, outside the command.
 
-### Phase 3 — The code under test stops waiting  · status: todo
+### Phase 3 — The code under test stops waiting  · status: done
 
 **Depends on:** Phase 2
 

@@ -42,7 +42,8 @@ _DEFAULT_CONFIGURATION = DefaultClaudeConfiguration()
 
 
 WAIT_S = float(os.environ.get("ADD_SHOWRUNNER_WAIT_S") or 180)
-POLL_S = 2.0
+# The session registry has no notification interface; callers may choose its retry interval.
+POLL_S = float(os.environ.get("ADD_SHOWRUNNER_POLL_S") or 2.0)
 
 
 def running(slug: str) -> bool:

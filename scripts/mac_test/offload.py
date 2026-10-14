@@ -229,6 +229,11 @@ class OffloadConfig:
     default_target_budget_gib: str
     values: dict[str, str]
 
+    @property
+    def leftover_timeout_s(self) -> float:
+        """Bound the cleanup SSH call independently of the reachability probe."""
+        return positive_number(self.values, "leftover_timeout_s", 10.0)
+
 
 @dataclass(frozen=True)
 class OffloadRequest:
@@ -1127,12 +1132,12 @@ def check_leftovers(config: OffloadConfig, host: str) -> LeftoverCheckResult:
             stderr=subprocess.PIPE,
             text=True,
             check=False,
-            timeout=10,
+            timeout=config.leftover_timeout_s,
         )
     except subprocess.TimeoutExpired:
-        return LeftoverCheckFailed("SSH leftover check timed out after 10 s")
+        return LeftoverCheckFailed(f"SSH leftover check timed out after {config.leftover_timeout_s:g} s")
     except OSError:
-        return LeftoverCheckFailed("SSH leftover check could not start (time limit 10 s)")
+        return LeftoverCheckFailed(f"SSH leftover check could not start (time limit {config.leftover_timeout_s:g} s)")
     answer = parse_leftover_check(result.stdout)
     if isinstance(answer, LeftoverCheckFailed):
         reason = " ".join(result.stderr.split())

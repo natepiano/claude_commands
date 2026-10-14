@@ -110,7 +110,8 @@ class AddShowrunnerTests(unittest.TestCase):
                     "SHOWRUNNERS_SEND": str(self.root / "send.py"), "TEST_SENT": str(self.root / "sent.jsonl"),
                     # The parent runs the command, so its own session and account are in the caller's environment.
                     "CLAUDE_CODE_SESSION_ID": PARENT_SESSION, "CLAUDE_CONFIG_DIR": str(self.root / "unit-account"),
-                    "ADD_SHOWRUNNER_WAIT_S": "0", "ADD_SHOWRUNNER_CLAUDE_JSON": str(self.root / "claude.json")}
+                    "ADD_SHOWRUNNER_WAIT_S": "0", "ADD_SHOWRUNNER_POLL_S": "0.01",
+                    "ADD_SHOWRUNNER_CLAUDE_JSON": str(self.root / "claude.json")}
         # The folders these tests start sessions in are trusted; the trust tests change that.
         self.trust(self.root, self.root / "kid-checkout", self.root / "elsewhere")
         home = Path(self.env["HOME"])
@@ -456,6 +457,39 @@ class AddShowrunnerTests(unittest.TestCase):
         result = self.run_command("kid")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual(self.parent_of("kid"), "top")
+
+    def test_showrunner_wait_retries_with_the_configured_interval(self) -> None:
+        self.flaky_registry(1)
+        self.env["ADD_SHOWRUNNER_WAIT_S"] = "300"
+        self.starts("kid-session", registers="kid")
+        polls = self.root / "polls.jsonl"
+        program = f'''import json, sys, time
+from pathlib import Path
+from types import SimpleNamespace
+sys.path.insert(0, {str(SCRIPT.parent)!r})
+import add_showrunner
+polls = Path({str(polls)!r})
+def wait(seconds):
+    with polls.open("a") as output:
+        output.write(json.dumps(seconds) + "\\n")
+add_showrunner.time = SimpleNamespace(monotonic=time.monotonic, time=time.time, sleep=wait)
+raise SystemExit(add_showrunner.main(sys.argv[2:]))
+'''
+        result = subprocess.run(
+            [sys.executable, "-c", program, str(SCRIPT), "--production", str(self.doc("kid")),
+             "--model", "opus", "--effort", "high"],
+            env=self.env, capture_output=True, text=True, check=False, timeout=300,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(self.parent_of("kid"), "top")
+        self.assertEqual([json.loads(line) for line in polls.read_text().splitlines()], [0.01])
+
+    def test_showrunner_poll_default_remains_two_seconds(self) -> None:
+        environment = {key: value for key, value in self.env.items() if key != "ADD_SHOWRUNNER_POLL_S"}
+        program = f"import sys; sys.path.insert(0, {str(SCRIPT.parent)!r}); import add_showrunner; print(add_showrunner.POLL_S)"
+        result = subprocess.run([sys.executable, "-c", program], env=environment,
+                                capture_output=True, text=True, check=False, timeout=300)
+        self.assertEqual((result.returncode, result.stdout), (0, "2.0\n"), result.stderr)
 
     def test_a_registry_still_unreadable_at_the_deadline_leaves_the_child_unattached(self) -> None:
         self.flaky_registry(1000)

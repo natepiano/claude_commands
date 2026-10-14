@@ -439,6 +439,18 @@ class OffloadSettingsTests(unittest.TestCase):
         if isinstance(result, offload.LeftoverCheckFailed):
             self.assertEqual(result.reason, "connection refused by host")
 
+    def test_leftover_check_uses_configured_timeout_and_reports_it(self) -> None:
+        _ = self.settings.write_text("leftover_timeout_s=0.125\n")
+        config = offload.read_config(self.settings)
+        with mock.patch.object(subprocess, "run", side_effect=subprocess.TimeoutExpired("ssh", 0.125)) as run:
+            result = offload.check_leftovers(config, "kept-host")
+        self.assertEqual(run.call_args.kwargs["timeout"], 0.125)
+        self.assertEqual(result, offload.LeftoverCheckFailed("SSH leftover check timed out after 0.125 s"))
+        for value in ("bad", "0", "-1", "nan", "inf"):
+            with self.subTest(value=value):
+                _ = self.settings.write_text(f"leftover_timeout_s={value}\n")
+                self.assertEqual(offload.read_config(self.settings).leftover_timeout_s, 10)
+
     def test_probe_that_cannot_start_reports_its_limit_through_run(self) -> None:
         _ = self.settings.write_text("offload=on\nlinux_only.hana=\nprobe_timeout_s=2.5\n")
         destination = self.root / "result"
@@ -558,6 +570,7 @@ class OffloadCommandTests(unittest.TestCase):
             "host": "mac",
             "connect_timeout_s": "6",
             "probe_timeout_s": "1",
+            "leftover_timeout_s": "2",
             "unreachable_backoff_s": "300",
             "free_floor_gib": "60",
             "mac_budget_gib": "24",
@@ -882,12 +895,14 @@ raise SystemExit(offload.main())
         self.fixture["cleanup_status"] = 0
         self.fixture["cleanup_error"] = ""
         self.fixture["cleanup_delay_s"] = 0
+        self.fixture["hold_cleanup"] = False
         if outcome == "remaining":
             self.fixture["cleanup_lines"] = ["leftovers=3", "rc=0"]
         elif outcome == "missing_status":
             self.fixture["cleanup_lines"] = ["leftovers=0"]
         elif outcome == "timeout":
-            self.fixture["cleanup_delay_s"] = 12
+            # Remain blocked until the cleanup deadline, regardless of machine load.
+            self.fixture["hold_cleanup"] = True
         elif outcome == "ssh_error":
             self.fixture["cleanup_lines"] = []
             self.fixture["cleanup_status"] = 255
@@ -900,7 +915,7 @@ raise SystemExit(offload.main())
         else:
             self.assertRegex(output, r"mac_test: could not confirm that a lost run's leftovers ended: [^\n]+; the Mac stays busy\n")
             if outcome == "timeout":
-                self.assertRegex(output, r"timed out after 10(?:\.0)? s")
+                self.assertRegex(output, r"timed out after 2(?:\.0)? s")
             if outcome == "ssh_error":
                 self.assertIn("connection refused by host", output)
 

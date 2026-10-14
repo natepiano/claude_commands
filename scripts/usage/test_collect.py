@@ -151,7 +151,7 @@ class CollectorFixture(unittest.TestCase):
         environment["PATH"] = f"{self.root / 'bin'}:{environment.get('PATH', '')}"
         environment["PLAN_DELEGATE_HISTORY_DIR"] = (
             "" if history_override == "empty" else str(self.root / ".local/state/plan-delegate"))
-        command = [sys.executable, str(COLLECTOR), "--db", str(db),
+        command = [sys.executable, str(COLLECTOR), "--db", str(db), "--durability", "off",
                    "--machine", machine, "--claude-root", str(self.claude_root),
                    "--codex-root", str(self.codex_root), "--agents-log", str(self.agents_path),
                    "--readings", str(self.root / "readings.jsonl"),
@@ -182,6 +182,35 @@ class CollectorFixture(unittest.TestCase):
             timeout=30,
             check=False,
         )
+
+    def assert_cli_durability(self, selection: list[str], expected: str) -> None:
+        command, environment = self.collector_invocation(db=self.db_path)
+        # Remove the fixture's disposable default to exercise the actual CLI default too.
+        position = command.index("--durability")
+        del command[position:position + 2]
+        trace = self.root / "durability-sql.jsonl"
+        program = f'''import json, runpy, sqlite3, sys
+from pathlib import Path
+trace = Path({str(trace)!r})
+original_connect = sqlite3.connect
+def record(statement):
+    with trace.open("a") as output:
+        output.write(json.dumps(statement) + "\\n")
+def connect(*args, **kwargs):
+    database = original_connect(*args, **kwargs)
+    database.set_trace_callback(record)
+    return database
+sqlite3.connect = connect
+sys.argv.pop(0)
+runpy.run_path(sys.argv[0], run_name="__main__")
+'''
+        result = subprocess.run([sys.executable, "-c", program, *command[1:], *selection],
+                                env=environment, cwd=REPOSITORY, capture_output=True,
+                                text=True, check=False, timeout=300)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        statements = [cast(str, json.loads(line)) for line in trace.read_text().splitlines()]
+        self.assertEqual([sql for sql in statements if sql.startswith("PRAGMA synchronous=")], [expected])
+        self.assertGreater(len(self.rows("SELECT * FROM turns")), 0)
 
     def collect(self, *, machine: str = "natedev",
                 history_override: Literal["configured", "empty"] = "configured",
@@ -284,6 +313,12 @@ class CollectorFixture(unittest.TestCase):
 
 
 class CollectTests(CollectorFixture):
+    def test_collector_cli_keeps_durable_commits_by_default(self) -> None:
+        self.assert_cli_durability([], "PRAGMA synchronous=FULL")
+
+    def test_collector_cli_can_disable_sync_for_disposable_ledgers(self) -> None:
+        self.assert_cli_durability(["--durability", "off"], "PRAGMA synchronous=OFF")
+
     def two_codex_sessions(self) -> tuple[Path, Path, int, int]:
         shutil.rmtree(self.codex_root)
         first = self.codex_root / "2026/10/10/rollout-first.jsonl"
