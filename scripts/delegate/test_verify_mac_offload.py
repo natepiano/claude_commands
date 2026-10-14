@@ -299,6 +299,41 @@ else:
 '''
 
 
+# mac_test.py free-now as verify.sh asks it: busy while the runner stub's
+# TEST_RUNNER_BUSY_UNTIL file is missing, so both answer alike. With
+# TEST_FREE_NOW_ONCE, it answers free once, when that file exists, and busy
+# after; a call after that one free answer writes free-now-after-leave.
+# TEST_FREE_NOW_FREE=1 answers free always, so each routing pass tries a claim
+# that may still decline.
+FREE_NOW_STUB = r'''
+import os
+from pathlib import Path
+import sys
+
+root = Path(os.environ["TEST_RUNNER_STATE"])
+assert sys.argv[1:3] == ["free-now", "--settings"] and Path(sys.argv[3]).is_file(), sys.argv
+with (root / "free-now-events").open("a") as output:
+    output.write(sys.argv[3] + "\n")
+once = os.environ.get("TEST_FREE_NOW_ONCE", "")
+busy_until = os.environ.get("TEST_RUNNER_BUSY_UNTIL", "")
+if os.environ.get("TEST_FREE_NOW_FREE") == "1":
+    free = True
+elif once:
+    if Path(once).exists():
+        Path(once).unlink()
+        (root / "free-now-left").write_text("left\n")
+        free = True
+    else:
+        if (root / "free-now-left").exists():
+            (root / "free-now-after-leave").write_text("asked\n")
+        free = False
+else:
+    free = not busy_until or Path(busy_until).exists()
+print("free" if free else "busy")
+raise SystemExit(0 if free else 1)
+'''
+
+
 RECORD_WRAPPER = r'''
 import json
 import os
@@ -373,6 +408,7 @@ class VerifyMacOffloadTests(unittest.TestCase):
         self.write_executable(self.bin_directory / "rustc", RUSTC_STUB)
         self.write_executable(self.bin_directory / "taplo", "#!/bin/sh\nexit 0\n")
         self.write_executable(self.runner, RUNNER_STUB)
+        self.write_executable(self.root / "free-now.py", FREE_NOW_STUB)
         blocker = "#!/bin/sh\nexit 99\n"
         for name in ("ssh", "rsync", "scp", "gh", "systemd-run"):
             self.write_executable(self.bin_directory / name, blocker)
@@ -477,6 +513,7 @@ class VerifyMacOffloadTests(unittest.TestCase):
             "PLAN_DELEGATE_BOARD_DIR": str(self.board),
             "PLAN_DELEGATE_TEAM_ROLE": "test",
             "VERIFY_MAC_RUNNER": str(self.runner),
+            "VERIFY_MAC_TEST_SCRIPT": str(self.root / "free-now.py"),
             "TEST_RUNNER_STATE": str(self.runner_state),
             "TEST_CARGO_EVENTS": str(self.cargo_events_path),
             "TEST_TOKEN_RECORD": str(self.board / "locks" / "cargo.d" / "owned"),
@@ -782,8 +819,9 @@ signal.pause()
         _ = process.communicate(timeout=HANG_GUARD_S)
 
     def start_routing(self, reason: str = "busy", *, pause_retry: bool = False,
-                      step_sleep: bool = False) -> subprocess.Popen[str]:
+                      step_sleep: bool = False, once: Path | None = None) -> subprocess.Popen[str]:
         process = self.start_verify("test", "sample", "--filter", "alpha", "--no-cache", extra={
+            **({"TEST_FREE_NOW_ONCE": str(once)} if once else {}),
             "TEST_RUNNER_BUSY_UNTIL": str(self.runner_state / "mac-free"),
             "TEST_RUNNER_BUSY_REASON": reason, "TEST_PAUSE_ROUTING_SLEEP": "1",
             "TEST_RUNNER_PAUSE_RETRY": "1" if pause_retry else "0",
@@ -883,7 +921,7 @@ signal.pause()
 
     def test_repeated_routing_wait_shows_each_unchanged_diagnostic_once(self) -> None:
         _ = self.routing_fixture()
-        self.environment["BUILD_TARGETS_ESCALATE_S"] = "0"
+        self.environment.update({"BUILD_TARGETS_ESCALATE_S": "0", "TEST_FREE_NOW_FREE": "1"})
         process = self.start_routing(step_sleep=True)
         for step in range(1, 4):
             self.resume_routing_sleep(step)
@@ -906,6 +944,7 @@ signal.pause()
 
     def test_routing_wait_shows_changed_holder_and_decline_reason_once(self) -> None:
         _ = self.routing_fixture()
+        self.environment["TEST_FREE_NOW_FREE"] = "1"
         process = self.start_routing(step_sleep=True)
         with self.hold_environment():
             holders = Path(self.environment["BUILD_HOLD_DIR"])
@@ -934,7 +973,8 @@ signal.pause()
     def test_hold_wait_includes_declined_retry_seconds_and_excludes_running_retry(self) -> None:
         _ = self.routing_fixture()
         clock = self.control_routing_clock()
-        self.environment.update({"TEST_DECLINED_RETRY_SECONDS": "4.5", "TEST_RUNNER_SECONDS": "20"})
+        self.environment.update({"TEST_DECLINED_RETRY_SECONDS": "4.5", "TEST_RUNNER_SECONDS": "20",
+                                 "TEST_FREE_NOW_FREE": "1"})
         process = self.start_routing(step_sleep=True)
         _ = clock.write_text("102")
         self.resume_routing_sleep(1)
@@ -1151,6 +1191,115 @@ local_release_wait.wait_for_local_release(float(sys.argv[1]), sys.argv[2])
         self.assertEqual(self.local_runs(), [])
         self.assertEqual(self.last_call()["outcome"], "interrupted")
         self.assertEqual(list((self.root / "tmp").glob("verify-hold.*")), [])
+
+    def test_free_mac_wins_over_a_release_turn_granted_in_the_same_pass(self) -> None:
+        cycle = self.routing_fixture()
+        process = self.start_routing()
+        self.release_local_turn()
+        _ = (self.runner_state / "mac-free").write_text("free\n")
+        _ = (self.runner_state / "continue-sleep").write_text("continue\n")
+        output, errors = process.communicate(timeout=HANG_GUARD_S)
+        self.assertEqual(process.returncode, 0, output + errors)
+        self.assertEqual(self.local_runs(), [])
+        self.assertEqual(len(self.runner_events()), 2)
+        self.assertFalse(self.runner_events()[1]["registered"])
+        self.assert_no_pending_calls(cycle)
+        self.assertEqual(self.routing_record()["target"], "mac")
+        self.assertEqual(self.last_call()["mac"], "passed_filter")
+
+    def wait_until(self, condition: Callable[[], bool], what: str,
+                   processes: Sequence[subprocess.Popen[str]] = ()) -> None:
+        deadline = time.monotonic() + HANG_GUARD_S
+        while time.monotonic() < deadline:
+            if condition():
+                return
+            for process in processes:
+                if process.poll() is not None:
+                    output, errors = process.communicate(timeout=HANG_GUARD_S)
+                    self.fail(f"verify exited {process.returncode} before {what}: {output + errors}")
+            time.sleep(0.01)
+        self.fail(f"timed out waiting for {what}")
+
+    def hold_memory(self) -> Path:
+        """Keep natedev's memory gate holding until the returned meminfo is rewritten."""
+        meminfo = Path(self.environment["BUILDLOG_MEMINFO"])
+        _ = meminfo.write_text("MemAvailable: 0 kB\n", encoding="utf-8")
+        self.write_executable(self.bin_directory / "sleep", SLEEP_STUB)
+        return meminfo
+
+    def leave_once(self) -> dict[str, str]:
+        once = self.runner_state / "free-once"
+        _ = once.write_text("free\n")
+        return {"TEST_FREE_NOW_ONCE": str(once)}
+
+    def free_now_settings(self) -> list[str]:
+        path = self.runner_state / "free-now-events"
+        return path.read_text().splitlines() if path.exists() else []
+
+    def test_queued_local_test_leaves_for_a_freed_mac_and_ends_with_its_failure(self) -> None:
+        _ = self.hold_memory()
+        mac_free = self.runner_state / "mac-free"
+        process = self.start_verify("test", "sample", "--no-cache", extra={
+            "TEST_RUNNER_BUSY_UNTIL": str(mac_free),
+            "TEST_RUNNER_MAC": "failed", "TEST_RUNNER_STATUS": "42"})
+        self.addCleanup(self.stop_verify, process)
+        self.wait_for_path(self.runner_state / "free-now-events", (process,))
+        self.assertEqual(len(self.runner_events()), 1)
+        _ = mac_free.write_text("free\n")
+        output, errors = process.communicate(timeout=HANG_GUARD_S)
+        self.assertEqual(process.returncode, 42, output + errors)
+        self.assertIn("another machine is free after", output)
+        self.assertEqual(self.local_runs(), [])
+        runners = self.runner_events()
+        self.assertEqual(len(runners), 2)
+        arguments = runners[1]["args"]
+        self.assertEqual(arguments[arguments.index("--last-decline") + 1], "busy")
+        self.assertEqual(set(self.free_now_settings()), {self.environment["MAC_TEST_CONFIG"]})
+        self.assertEqual(self.routing_record()["target"], "mac")
+        record = self.last_call()
+        self.assertEqual((record["status"], record["mac"], record["mac_reason"], record["mac_s"]),
+                         (42, "failed", "", 3.25))
+
+    def test_mac_busy_again_after_leaving_returns_to_the_local_wait(self) -> None:
+        meminfo = self.hold_memory()
+        process = self.start_verify("test", "sample", "--no-cache", extra={
+            "TEST_RUNNER_BUSY_UNTIL": str(self.runner_state / "mac-free"), **self.leave_once()})
+        self.addCleanup(self.stop_verify, process)
+        # The Mac claim declined again; the local run waits with the hook still set.
+        self.wait_for_path(self.runner_state / "free-now-after-leave", (process,))
+        self.assertEqual(len(self.runner_events()), 2)
+        self.assertEqual(self.local_runs(), [])
+        _ = meminfo.write_text("MemAvailable: 67108864 kB\n", encoding="utf-8")
+        output, errors = process.communicate(timeout=HANG_GUARD_S)
+        self.assertEqual(process.returncode, 0, output + errors)
+        self.assertEqual(len(self.local_runs()), 1)
+        self.assertEqual(len(self.runner_events()), 2)
+        self.assertEqual(output.count("verify.sh: running on natedev"), 2)
+        self.assertEqual(self.routing_record()["target"], "natedev")
+        record = self.last_call()
+        self.assertEqual((record["mac"], record["mac_reason"]), ("declined", "busy"))
+
+    def test_leaving_gives_back_a_granted_hold_turn_before_the_mac_runs(self) -> None:
+        cycle = self.routing_fixture()
+        _ = self.hold_memory()
+        once = self.runner_state / "free-once"
+        process = self.start_routing(once=once)
+        self.release_local_turn()
+        _ = (self.runner_state / "continue-sleep").write_text("continue\n")
+        # Routing asks free-now once after its sleep; later calls are the hook's.
+        self.wait_until(lambda: len(self.free_now_settings()) >= 2, "the leave hook", (process,))
+        self.assertEqual(self.local_runs(), [])
+        _ = (self.runner_state / "mac-free").write_text("free\n")
+        _ = once.write_text("free\n")
+        output, errors = process.communicate(timeout=HANG_GUARD_S)
+        self.assertEqual(process.returncode, 0, output + errors)
+        self.assertEqual(self.local_runs(), [])
+        runners = self.runner_events()
+        self.assertEqual(len(runners), 2)
+        self.assertFalse(runners[1]["registered"])
+        self.assert_no_pending_calls(cycle)
+        self.assertEqual(self.routing_record()["target"], "mac")
+        self.assertEqual(self.last_call()["mac"], "passed_filter")
 
     def test_mac_state_and_probe_diagnostics_survive_local_fallback(self) -> None:
         for reason, diagnostic in (("state", "mac state cannot be read: invalid block"),

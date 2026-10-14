@@ -98,6 +98,10 @@ The production doc sits beside the source plan as `<source-stem>-production.md`.
 - **Capacity:** <cores and memory read by /producer:greenlight, and the unit count it allows>
 - **UX guide:** <path to the project's UX rules, e.g. `~/rust/hanadocs/ux`>; omit when
   nothing users see changes
+- **Change review:** <path to the user's change-review list, e.g.
+  `~/rust/hanadocs/change-review.md`>; `merge_checkpoint.py` adds a row per
+  `Change-Review:` line a merged checkpoint names. Omit when the production keeps none; its
+  checkpoints still carry the lines
 - **Review pool:** code (or `code, ui`); omit when the production has none
 - **Proposals:** <folder for finished proposals, e.g. `~/rust/hanadocs/proposals`>; its
   `index.md` holds one row for each, `| Date | Proposal | Unit | Summary | Status |`,
@@ -176,6 +180,9 @@ Applies to a `/unit:direct` run whose plan header carries a
 `> **Production:**` line. Read the production doc it names at the start of the
 run and after every compaction. Your row in its **Units** table gives your name,
 branch, port and the files you own.
+
+A turn with nothing for the user replies with just "—": never "No update for
+you." or the like (user, 2026-10-14).
 
 A unit's run state is written down nowhere and the unit sets nothing. Each reader takes it, when it needs it, from the records `/unit:direct` keeps of the runs in the unit's worktree: no run yet is standing by, a newest run with no finish is running, a newest run that finished is run-finished. A session stays live after its run ends, and its next run reads as running from that run's first record.
 A run that stopped, failed, or waits on a decision has no finish in its record, so it does not read as finished, and nothing asks for `run done` text in the Plan cell.

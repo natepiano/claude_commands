@@ -7,8 +7,10 @@ in full.
 completes.
 
 <LaunchImplementation>
-1. Once per phase, save `git status --short` to
-   `${SESSION_DIR}/progress_baseline_status`; fixes retain it.
+1. Once per phase, save `git rev-parse HEAD` to
+   `${SESSION_DIR}/phase_baseline` and `git status --short` to
+   `${SESSION_DIR}/progress_baseline_status` before dispatch. Stop if either
+   fails; fixes retain both baselines.
 2. Close the outgoing phase before opening this one, per <PassOwnership/>: when a
    phase record is still active, run `progress_history.py finish-phase
    --session-dir "${SESSION_DIR}" --status completed` first. Then run
