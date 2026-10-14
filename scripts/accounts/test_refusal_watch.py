@@ -79,6 +79,8 @@ class RefusalWatchTests(unittest.TestCase):
         self.live = []
         WatchTime.at = NOW
         _ = self.enterContext(patch.object(refusal_watch, "datetime", WatchTime))
+        # Readings are stored at NOW; status re-reads a login live once its reading is older than STALE_AFTER.
+        _ = self.enterContext(patch.object(accounts, "datetime", WatchTime))
         _ = self.enterContext(patch.object(sessions, "live_sessions", side_effect=lambda: self.live))
         _ = self.enterContext(patch.object(account, "process_config_dir", side_effect=self.process_dir))
         _ = self.enterContext(patch.object(account, "account_of", side_effect=self.process_account))
