@@ -990,7 +990,7 @@ def _herdr_launch(parts: ResumeParts, session: Session, *, dry_run: bool) -> Non
         return
     _record_scheduled_restart_prompt(session["session_id"], parts.opening_prompt, dry_run=False)
     try:
-        from scripts.accounts.accounts import ClaudeLaunchAccount, DefaultAccount, NamedAccount
+        from scripts.accounts.accounts import ClaudeLaunchAccount, DefaultAccount, NamedAccount, trust_command
 
         config_dir = parts.account.config_dir
         claude_json = (Path.home() / ".claude.json" if config_dir == Path.home() / ".claude"
@@ -1003,7 +1003,7 @@ def _herdr_launch(parts: ResumeParts, session: Session, *, dry_run: bool) -> Non
             )
             reason = (str(trust) if isinstance(trust, herdr.UnreadableTrustFile)
                       else f"{parts.cwd}: Claude has not trusted this folder")
-            raise OSError(f"{reason}. Run: {herdr.trust_command(Path(parts.cwd), account)}")
+            raise OSError(f"{reason}. Run: {trust_command(Path(parts.cwd), account)}")
         herdr.start_server(name, 90_000)
         client = herdr.Herdr(name)
         agents = client.agents()
