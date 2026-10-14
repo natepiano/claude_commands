@@ -2,7 +2,7 @@
 
 ## What it is
 
-Two additions to the build log. The first is a "Tests per edit" section in the daily `buildlog report`. It counts how many `verify.sh test` runs each agent seat makes per edit to its tree, compares that to a target of 0.5, and shows what testing too rarely costs: failures binned by edits since the last green test, with the average time back to green. It answers "are seats testing often enough?" without hiding the failures behind a single ratio. The second is a Rust release check on natedev's hourly build-log job. Once a day it reads the latest stable Rust and the toolchain hana pins. When a newer stable is out, it trial-builds hana with it at night, in a throwaway clone, while nothing else is building. It then texts the user once per version with the cost of adopting it: new clippy warnings, compiler errors, and whether cargo-mend still builds. The same result appears as one line in the daily report until hana's pin catches up.
+Two additions to the build log. The first is a "Tests per edit" section in the daily `buildlog report`. It counts how many `verify.sh test` runs each agent worker makes per edit to its tree, compares that to a target of 0.5, and shows what testing too rarely costs: failures binned by edits since the last green test, with the average time back to green. It answers "are workers testing often enough?" without hiding the failures behind a single ratio. The second is a Rust release check on natedev's hourly build-log job. Once a day it reads the latest stable Rust and the toolchain hana pins. When a newer stable is out, it trial-builds hana with it at night, in a throwaway clone, while nothing else is building. It then texts the user once per version with the cost of adopting it: new clippy warnings, compiler errors, and whether cargo-mend still builds. The same result appears as one line in the daily report until hana's pin catches up.
 
 ## How it works
 
@@ -19,22 +19,22 @@ Two additions to the build log. The first is a "Tests per edit" section in the d
 
 **Source.** `calls` rows with `tool = 'verify.sh'`, plus `steps.tree_key` joined through `steps.call_id`. `calls` has no tree key of its own.
 
-**Seats.** A seat is `coalesce(nullif(delegate_session,''), nullif(session,''))`. Several delegate seats can share one session, so the delegate session wins. A call with neither is skipped. `record.py` sets `session` from `CODEX_THREAD_ID` before `CLAUDE_CODE_SESSION_ID`, so a Codex seat keeps its own identity even when it inherits its director's Claude id; existing rows retain their recorded identities.
+**Workers.** A worker is `coalesce(nullif(delegate_session,''), nullif(session,''))`. Several delegate workers can share one session, so the delegate session wins. A call with neither is skipped. `record.py` sets `session` from `CODEX_THREAD_ID` before `CLAUDE_CODE_SESSION_ID`, so a Codex worker keeps its own identity even when it inherits its director's Claude id; existing rows retain their recorded identities.
 
 **Trees per call.** `call_trees(connection, end_day) -> dict[str, KnownCallTrees]` gives each verify call the first and last known `tree_key` among its steps, in step order. A call with no keyed step is absent from the map.
 
-**Edits.** `tests_per_edit_data(connection, end_day) -> TestsPerEditWindow` walks every verify call through the report day in `started_at` order. An edit is a change between the tree a seat's previous call ended on and the tree its next call started on. Any verb (check, lint, test) can reveal an edit. A lint call that rewrites the tree itself (formatting, mend fixes) changes it inside the call, so that rewrite is not counted. A call with no known tree is skipped and does not break the seat's chain.
+**Edits.** `tests_per_edit_data(connection, end_day) -> TestsPerEditWindow` walks every verify call through the report day in `started_at` order. An edit is a change between the tree a worker's previous call ended on and the tree its next call started on. Any verb (check, lint, test) can reveal an edit. A lint call that rewrites the tree itself (formatting, mend fixes) changes it inside the call, so that rewrite is not counted. A call with no known tree is skipped and does not break the worker's chain.
 
 **Window.** The chains run over the whole log through the report day, so the first call in the window is compared with the call before it. Tests, edits and failures are counted only inside the 7-day window, `day − 6` through `day`, by local date.
 
 **Tests, greens, failures.** Tests are `verb = 'test'` calls, whole-package and `--filter` alike.
-- Green: status 0 and outcome `ran` or `reused`. It resets the seat's edits since green and closes every open failure for that seat.
-- Failure: outcome not `interrupted`, and outcome `failed` or a non-null nonzero status. It goes into the bin for the seat's edits since green, and waits for the seat's next green.
+- Green: status 0 and outcome `ran` or `reused`. It resets the worker's edits since green and closes every open failure for that worker.
+- Failure: outcome not `interrupted`, and outcome `failed` or a non-null nonzero status. It goes into the bin for the worker's edits since green, and waits for the worker's next green.
 - An interrupted test counts as a test but is neither green nor failure.
 - Minutes to green run from the failing call's end to the green call's end (`ended_at`, else `started_at`).
 
 **Rendering.** `tests_per_edit_section(connection, day) -> list[str]` gives `### Tests per edit` and two tables, each with one source line:
-1. Trend: seven `DailyTestsPerEdit` rows, newest first, all seats summed. Columns Day, Tests, Edits, Tests/edit, Target. The ratio has two decimals, or `—` with no edits. `target_status()` gives `—`, `on target`, `above` or `below`, comparing ratio and target at two decimals. Line: `Source: verify.sh test calls and step tree keys, <first>–<day>; target 0.5 tests/edit; — means no observed edit.`
+1. Trend: seven `DailyTestsPerEdit` rows, newest first, all workers summed. Columns Day, Tests, Edits, Tests/edit, Target. The ratio has two decimals, or `—` with no edits. `target_status()` gives `—`, `on target`, `above` or `below`, comparing ratio and target at two decimals. Line: `Source: verify.sh test calls and step tree keys, <first>–<day>; target 0.5 tests/edit; — means no observed edit.`
 2. Bins: one `FailureRecoveryBin` (failures, recovered, minutes_to_green, recovery_minutes) per `EDIT_BINS = ("0", "1", "2–3", "4–7", "8+")`, picked by `failure_bin(edits)`. The `0` bin holds failures with no edit since the last green. Columns Edits since green, Failures, Avg to next green, p95 to next green (nearest rank over `recovery_minutes`). A failure with no later green counts in Failures but not in the average or the p95. Line: `Source: verify.sh failed test calls and step tree keys, <first>–<day>`, plus `; N without a later green` when there are any.
 
 `report()` places the section after CI and before the Disk section and the summaries.
@@ -112,7 +112,7 @@ The trial part is `waiting, <reason>` or `failed, <step>: <reason>` for the othe
 - A failed trial is not retried. Only a `waiting` trial runs, and a killed step leaves the trial `waiting`.
 - A trial never starts outside 02:00–05:00 local, during a build hold, while the user runs cargo, rustc or cargo-nextest, or below floor plus headroom.
 - The state file is written atomically. The check exits 1 only for a failed fetch or a failed text, and one hourly job raising never stops the others.
-- Tests-per-edit chains start before the window. Narrowing the query to the 7 days would miscount the first call of each seat.
+- Tests-per-edit chains start before the window. Narrowing the query to the 7 days would miscount the first call of each worker.
 - Nothing sits directly under a report table but its one `Source:` line, which carries any explanation of the table; both Tests per edit tables have that line (`docs/as-built/build-followups.md` lists the rest). `report.py` keeps one style: `table()`, `seconds()`, `count()`, `gib()`.
 - `cli.py report` and `cli.py query` run `index.update()`, which writes the live index. Code that only reads the real log uses `index.read_only()`.
 - Python: every signature annotated, no `Any` (a `TypedDict` for known keys), no file-level type ignores.
@@ -122,7 +122,7 @@ The trial part is `waiting, <reason>` or `failed, <step>: <reason>` for the othe
 - `TESTS_PER_EDIT_TARGET = 0.5`. From the 2026-10-01–04 log, average minutes to green were 12.54 after 1 edit, 16.09 after 2–3, 20.94 after 4–7 and 31.28 after 8+. One test per two edits keeps most gaps within 2–3, before the climb at 4–7. Ratio and target are compared at two decimals.
 - The window is 7 days and the bins are `0`, `1`, `2–3`, `4–7`, `8+`.
 - 137 backfilled test calls carry outcome `failed` with status NULL. That is why the failure test checks outcome as well as status.
-- A seat that has never had a green counts its edits since green from its first call in the log.
+- A worker that has never had a green counts its edits since green from its first call in the log.
 - Quiet hours are `2 <= hour < 5`, local time: at most three hourly runs a night can start a trial.
 - `TRIAL_HEADROOM_GIB = 50`. natedev's floor is `sweep_free_floor_gib.natedev=500`, so a trial needs 550 GiB free. natedev had about 517–528 GiB free on 2026-10-04, so a trial would wait on disk. No floor key means a floor of 0. An unparseable value also means 0 here, where the sweep fails instead.
 - Timeouts: channel fetch 30 s, pin read 30 s, pgrep 10 s, text 30 s; trial steps as in the table. The trial steps can run up to about 3 h 50 min.
@@ -143,7 +143,7 @@ The trial part is `waiting, <reason>` or `failed, <step>: <reason>` for the othe
 
 ## Why
 
-- **Edits come from tree keys at call boundaries.** A seat's edits are what changed between its calls. Comparing one call's last tree with the next call's first tree leaves out a lint call's own rewrite. `steps` already carries `tree_key`, so no schema change was needed in `index.py` or `record.py`.
+- **Edits come from tree keys at call boundaries.** A worker's edits are what changed between its calls. Comparing one call's last tree with the next call's first tree leaves out a lint call's own rewrite. `steps` already carries `tree_key`, so no schema change was needed in `index.py` or `record.py`.
 - **Failures sit beside the ratio.** A ratio alone could look fine while failures went unseen for many edits. The bins show what each gap length costs in time to green, and they are the data the target was set from. 0.5 is where recovery time stays low, not a ceiling, so `above` is not a fault.
 - **Interrupted runs are neither green nor failure.** They say nothing about the code.
 - **The trial uses CI's Linux clippy targets without `-D warnings`, with FMA enabled.** CI already holds hana at zero warnings under the pin, so every warning under the new release is new, and dropping `-D warnings` lets the build count all of them. The trial adds `-C target-cpu=x86-64-v3` alongside mold; `origin/main` CI still lacks that flag. CI's windows-gnu clippy is left out of the trial; the Linux run shows the cost.
@@ -161,3 +161,5 @@ The trial part is `waiting, <reason>` or `failed, <step>: <reason>` for the othe
 - **The check lives in the existing hourly job.** No new timer or unit. The cost is that sync and CI wait during a night-time trial.
 - **The text goes through `send.py --to user` as a subprocess.** The user channel owns phone delivery and its credentials, so this module never reads them.
 - **State sits in the build-log root.** `BUILDLOG_DIR` moves it with the log, which keeps tests off the real file.
+
+The worker-name change converts old step and call `seat` fields to `worker` once on the first index read, under the append lock. It preserves incomplete trailing lines. Schema version 16 rebuilds the derived index with the new column name.

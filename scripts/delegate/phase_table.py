@@ -33,6 +33,7 @@ from scripts.production.add_unit import (
     live_unit_table,
     read_production,
 )
+from scripts.production.merge_checkpoint import PromoteTo, promotion_from_doc
 
 
 class ProjectedEta(NamedTuple):
@@ -1017,6 +1018,9 @@ def _heading_text(record: PhaseRecord) -> str:
     if isinstance(current, NoOpenPhase):
         done = sum(isinstance(row, DonePhase) for row in record.phases)
         return f"No phase running — {done} of {len(record.phases)} done"
+    if not any(row is current for row in record.phases):
+        # A phase from another plan has no place in this plan's count.
+        return f"Phase {current.phase} — {current.title} · not in this plan"
     return f"Phase {current.phase} of {len(record.phases)} — {current.title}"
 
 
@@ -1310,11 +1314,68 @@ def _note_ownership(path: Path) -> NoteOwnership | NoteWithoutPhaseTableOwnershi
             fields[key.strip()] = value.strip()
     if not closed or fields.get("phase_table") != "true":
         return NoteWithoutPhaseTableOwnership()
-    production = fields.get("production", "")
+    production = _production_slug_from_link(fields.get("production_file", ""))
+    # Notes written before `production_file` carry the slug as `production`.
+    production = production or fields.get("production", "")
     unit = fields.get("unit", "")
     if not production or not unit:
         return NoteWithoutPhaseTableOwnership()
     return NoteOwnership(production=production, unit=unit)
+
+
+def _production_slug_from_link(link: str) -> str:
+    """Return the production slug named by a note's `production_file` link."""
+    if link.startswith('"'):
+        try:
+            decoded = cast(object, json.loads(link))
+        except json.JSONDecodeError:
+            return ""
+        link = decoded if isinstance(decoded, str) else ""
+    name = link.removeprefix("[[").removesuffix("]]").rsplit("/", 1)[-1]
+    slug = name.removesuffix(".md").removesuffix("-production")
+    return slug if slug and slug != name.removesuffix(".md") else ""
+
+
+def _github_blob_url(checkout: Path, relative: Path) -> str:
+    """Return the GitHub page of `relative` on `checkout`'s branch, or empty off GitHub."""
+    try:
+        remote = _git_output(checkout, "remote", "get-url", "origin")
+        branch = _git_output(checkout, "symbolic-ref", "--short", "HEAD")
+    except Refusal:
+        return ""
+    match = re.fullmatch(
+        r"(?:git@github\.com:|ssh://git@github\.com/|https://github\.com/)"
+        + r"(?P<repository>[^/]+/[^/]+?)(?:\.git)?/?",
+        remote,
+    )
+    if match is None:
+        return ""
+    return (
+        f"https://github.com/{match.group('repository')}/blob/{branch}/"
+        + relative.as_posix()
+    )
+
+
+def _production_file_link(document: Path, vault: Path) -> str:
+    """Link the production doc's main-branch copy, which outlives the production."""
+    try:
+        root = Path(_git_output(document.parent, "rev-parse", "--show-toplevel")).resolve()
+        relative = document.relative_to(root)
+        lines = document.read_text(encoding="utf-8").splitlines()
+    except (Refusal, ValueError, OSError, UnicodeError):
+        return document.as_uri()
+    promotion = promotion_from_doc(lines)
+    checkout = (
+        promotion.checkouts[0].resolve()
+        if isinstance(promotion, PromoteTo) and promotion.checkouts
+        else root
+    )
+    main_copy = checkout / relative
+    try:
+        in_vault = main_copy.relative_to(vault.resolve())
+    except ValueError:
+        return _github_blob_url(checkout, relative) or main_copy.as_uri()
+    return f"[[{in_vault.with_suffix('').as_posix()}]]"
 
 
 def _most_recent_owned_note(
@@ -1339,7 +1400,8 @@ def _most_recent_owned_note(
 
 def _note_text(
     name: str,
-    production: str,
+    showrunner: str,
+    production_file: str,
     unit: str,
     record: PhaseRecord,
     zone: ZoneInfo,
@@ -1348,7 +1410,8 @@ def _note_text(
         (
             "---",
             "phase_table: true",
-            f"production: {production}",
+            f"showrunner: {showrunner}",
+            f"production_file: {json.dumps(production_file, ensure_ascii=False)}",
             f"unit: {unit}",
             f"now: {json.dumps(_heading_text(record), ensure_ascii=False)}",
             "---",
@@ -1570,7 +1633,14 @@ def refresh(session_dir: Path) -> None:
     _ensure_showrunners_excluded(vault_root)
     _write_note(
         target,
-        _note_text(name, production.slug, reference.unit, record, production.zone),
+        _note_text(
+            name,
+            folder.name,
+            _production_file_link(production.doc, vault_root.parent),
+            reference.unit,
+            record,
+            production.zone,
+        ),
         ownership,
     )
     _remove_stale_notes(vault_root, target, ownership)

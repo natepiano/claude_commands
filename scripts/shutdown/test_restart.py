@@ -190,13 +190,13 @@ def unit(
     )
 
 
-def seat(
+def worker_session(
     session_id: str,
     *,
     owner: str | None,
     run_dirs: list[str] | None = None,
 ) -> inventory.SeatSession:
-    seat_owner: inventory.SeatOwner = (
+    worker_owner: inventory.WorkerOwner = (
         inventory.DirectorOwner(kind="director", session_id=owner)
         if owner is not None
         else inventory.NoDirector(kind="no director")
@@ -205,7 +205,7 @@ def seat(
         **common_session(session_id, run_dirs=run_dirs),
         kind="seat",
         host=inventory.UnknownHost(kind="unknown"),
-        owner=seat_owner,
+        owner=worker_owner,
     )
 
 
@@ -2900,7 +2900,7 @@ class RestartTests(ShutdownTestCase):
         output = io.StringIO()
         with patch.object(restart, "_print_result") as summary, redirect_stdout(output):
             result = restart._up(LOGIN, False, ["waiting"])  # pyright: ignore[reportPrivateUsage]
-        self.assertEqual((result.restarted, result.seats, result.manual, result.failed), (0, 0, 0, 0))
+        self.assertEqual((result.restarted, result.workers, result.manual, result.failed), (0, 0, 0, 0))
         self.assertEqual(result.failed_sessions, ())
         self.assertEqual(output.getvalue(), "Waiting is waiting, not stopped; nothing to restart\n")
         summary.assert_not_called()
@@ -2923,7 +2923,7 @@ class RestartTests(ShutdownTestCase):
         output = io.StringIO()
         with patch.object(restart, "_print_result") as summary, patch.object(restart, "_launch_session") as launch, redirect_stdout(output):
             result = restart._up(LOGIN, False, ["held"])  # pyright: ignore[reportPrivateUsage]
-        self.assertEqual((result.restarted, result.seats, result.manual, result.failed), (0, 0, 0, 0))
+        self.assertEqual((result.restarted, result.workers, result.manual, result.failed), (0, 0, 0, 0))
         self.assertEqual(result.failed_sessions, ())
         self.assertEqual(output.getvalue(), "Held is held by usage limit, not stopped; nothing to restart\n")
         summary.assert_not_called()

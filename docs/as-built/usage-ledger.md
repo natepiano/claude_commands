@@ -2,7 +2,7 @@
 
 ## What it is
 
-The usage ledger is one SQLite store, on natedev, of every model request made on both machines, Claude and Codex alike. Each row records the request's token counts by class, its model and effort, and the role the agent held when it ran: showrunner, unit director, worker (`impl`, `test`, `fix`, `worker`), reviewer by lens, subagent or interactive session. The same store holds what the work produced: runs, phases, review passes, findings, checkpoints, compactions, account readings and account role changes. Metrics are named SQL queries over that store, so token efficiency can be followed over time across every role and every model. The vendors' own reporting does not answer these questions, but the logs on disk do. Before the ledger, each question needed its own scratch script that read raw logs again and knew only one model's weights. The role an agent held was lost once its run ended: the unit director's marker is deleted at run end, a Codex seat's role sits in a per-run `mesh_roster.json` that changes with every dispatch, and `/tmp` does not last. The token counts last (Claude transcripts under `~/.claude/projects`, Codex rollouts under `~/.codex/sessions`); the link from a request to its role did not.
+The usage ledger is one SQLite store, on natedev, of every model request made on both machines, Claude and Codex alike. Each row records the request's token counts by class, its model and effort, and the role the agent held when it ran: showrunner, unit director, worker (`impl`, `test`, `fix`, `worker`), reviewer by lens, subagent or interactive session. The same store holds what the work produced: runs, phases, review passes, findings, checkpoints, compactions, account readings and account role changes. Metrics are named SQL queries over that store, so token efficiency can be followed over time across every role and every model. The vendors' own reporting does not answer these questions, but the logs on disk do. Before the ledger, each question needed its own scratch script that read raw logs again and knew only one model's weights. The role an agent held was lost once its run ended: the unit director's marker is deleted at run end, a Codex worker's role sits in a per-run `mesh_roster.json` that changes with every dispatch, and `/tmp` does not last. The token counts last (Claude transcripts under `~/.claude/projects`, Codex rollouts under `~/.codex/sessions`); the link from a request to its role did not.
 
 ## How it works
 
@@ -25,19 +25,19 @@ The code that assigns a role records it when it assigns it, in an append-only `<
 | `scripts/delegate/prepare_session.sh` | `director`, under `CLAUDE_CODE_SESSION_ID` |
 | `scripts/production/update_registration.py register` | `showrunner`, at every showrunner start and resume |
 | `scripts/agents/agent_bg.sh` | `worker`, under the 8-hex id |
-| `scripts/agents/codex_mesh.py` | the seat's role and `--lens` on a new thread and on a follow-up claim; the previous role again when a claim is released |
+| `scripts/agents/codex_mesh.py` | the worker's role and `--lens` on a new thread and on a follow-up claim; the previous role again when a claim is released |
 | `scripts/delegate/review.sh` | passes `--lens` to `codex_mesh.py` |
 | `scripts/hooks/session-start-agents-log.py` | `subagent` for a payload with a non-empty `agent_id`, else `interactive` for `session_id`, through `register_default` |
 
 The hook is registered twice in `settings.json`, with the command `"$HOME/.claude/scripts/lib/py" "$HOME/.claude/scripts/hooks/session-start-agents-log.py"`: in the `hooks.SessionStart` entry with no `matcher` (startup, resume, clear, compact) and in a `hooks.SubagentStart` entry with no `matcher`. `SubagentStart` delivers the parent `session_id` and the `agent_id` before the subagent's first request; `SessionStart` does not fire for a subagent. The lens lives only in `agents.jsonl`, never in `mesh_roster.json`.
 
-`backfill` reads each run directory's `mesh_roster.json` (`role`, and `previous_role` as an earlier line) and `seats` ledger (`worker`), stamped with the file's mtime and `approximate: true`. It skips any id that already has an exact line and never repeats an (id, role, lens) line. A review lens comes only from the newest `review_agent_[<N>_]<lens>.log` that names the seat.
+`backfill` reads each run directory's `mesh_roster.json` (`role`, and `previous_role` as an earlier line) and `workers` ledger (`worker`), stamped with the file's mtime and `approximate: true`. It skips any id that already has an exact line and never repeats an (id, role, lens) line. A review lens comes only from the newest `review_agent_[<N>_]<lens>.log` that names the worker.
 
 ### Collector: `scripts/usage/collect.py`
 
 `python3 scripts/usage/collect.py [--db PATH] [--machine NAME] [--claude-root DIR] [--codex-root DIR] [--agents-log FILE] [--no-mac] [--readings FILE] [--baseline-readings FILE] [--account-roles FILE] [--claude-repo DIR] [--production-docs DIR]`
 
-Defaults: `<state_dir()>/usage.db`, machine `natedev`, `~/.claude/projects`, `~/.codex/sessions`, `<state_dir()>/agents.jsonl`, the live readings log (`run_out.READINGS_LOG`), the baseline copy `~/.local/state/usage-model/seats-baseline/readings-2026-10-10.jsonl`, `accounts.roles_history_file()`, and the repository and production docs from `outcomes.default_sources()`. It prints one line per source, `<machine> <source>: <n> turns added; <state>` (or `outcomes added`), and exits 0 unless the store cannot be written or is refused.
+Defaults: `<state_dir()>/usage.db`, machine `natedev`, `~/.claude/projects`, `~/.codex/sessions`, `<state_dir()>/agents.jsonl`, the live readings log (`run_out.READINGS_LOG`), the baseline copy `~/.local/state/usage-model/workers-baseline/readings-2026-10-10.jsonl`, `accounts.roles_history_file()`, and the repository and production docs from `outcomes.default_sources()`. It prints one line per source, `<machine> <source>: <n> turns added; <state>` (or `outcomes added`), and exits 0 unless the store cannot be written or is refused.
 
 **A pass**, in order:
 
@@ -126,13 +126,13 @@ Weights are a dated table per model, applied when the store is read and never st
 | `gpt-6-astra` | the beginning | 0.1 | 1.25 | 1.25 | 5 |
 | `claude-*` | the beginning | 0.1 | 1.25 | 2 | 5 |
 
-"The beginning" is `datetime.min` in UTC. A model matches an entry by equal name, or `claude-*` by the prefix `claude-`; of the matching entries, the latest `effective_from` at or before the request's time applies. `weights_at(model, at)` raises `UnweightedModel` when none is in force; `weighted(row, at)` applies one entry in Python. `sql_weights(model, at) -> DatedWeightRelation(entries, active_entry)` gives the same choice as SQL, and is what every report and the seat readout use. `register(db)` defines the SQL function `weighted_tokens(...)`, which returns NULL for an unweighted model and is not used by any reader on the full store.
+"The beginning" is `datetime.min` in UTC. A model matches an entry by equal name, or `claude-*` by the prefix `claude-`; of the matching entries, the latest `effective_from` at or before the request's time applies. `weights_at(model, at)` raises `UnweightedModel` when none is in force; `weighted(row, at)` applies one entry in Python. `sql_weights(model, at) -> DatedWeightRelation(entries, active_entry)` gives the same choice as SQL, and is what every report and the worker readout use. `register(db)` defines the SQL function `weighted_tokens(...)`, which returns NULL for an unweighted model and is not used by any reader on the full store.
 
 ### Report: `scripts/usage/usage_report.py`
 
 `python3 scripts/usage/usage_report.py [--db PATH] [--production-docs DIR] list` prints each metric with its description. `… <metric> [--by DIM[,DIM…]] [--since WHEN] [--until WHEN] [--zone NAME] [--exact]` prints one Markdown report. The default grouping is `role,model` when the metric takes both, else every dimension it takes. The default zone is the user's zone from `config/user_zone.conf` through `scripts/lib/user_zone.py` (`USER_ZONE` in the environment wins). `WHEN` is an ISO date or datetime, read in the zone when it has no offset; `--since` is inclusive, `--until` exclusive. `--exact` keeps only `attribution = 'recorded'` turns. Every refusal is one `usage_report: <reason>` stderr line naming what is accepted, exit 2; a store it cannot open, or whose version is not `collect.STORE_VERSION` (`StoreVersionMismatch`), exits 1.
 
-`open_read_store(path)` opens `?mode=ro` with `sqlite3.Row` and begins one transaction, so a run reads one snapshot and a missing path stays missing. The report, the seat readout and the replay all open the store through it.
+`open_read_store(path)` opens `?mode=ro` with `sqlite3.Row` and begins one transaction, so a run reads one snapshot and a missing path stays missing. The report, the worker readout and the replay all open the store through it.
 
 **Three registries.**
 
@@ -166,9 +166,9 @@ A new metric, dimension or outcome is one registry entry. The report reads `turn
 
 **Output**, in order: `<metric> — <description>`; the bounds, the zone and, under `--exact`, `exact evidence only`; the table (dimension columns, numerator, denominator, value; a zero denominator gives `—`, a group with no weighted turn reads `unweighted`); `Coverage` (weighted usage and turns per attribution with shares; `Unweighted:` with each model lacking a weight entry and its turn count; review turns with lens `unrecorded`; outcome rows with unit `unknown`); `Sources` (one row per `turn_sources` and `role_log_sources` row, each source not `ready` first under `Not read in full:`, times in the zone or `never`). With no turn in range the report prints its headers, `No turns in range.` and `Sources`. `report_data`, `render_report` and `sources(db, zone)` are the pieces other readers call.
 
-### Seat readout: `scripts/whoami/seat_usage.py`
+### Worker readout: `scripts/whoami/seat_usage.py`
 
-`python3 scripts/whoami/seat_usage.py [--db PATH] (--daily [--t-live WHEN] | --before START END --after START END)` compares Codex usage per checkpointed phase before and after long-lived seats went live (`DEFAULT_T_LIVE` 2026-10-10T18:17Z). It is a view over the store: no rollout, ssh, git or readings file. Rows cover `family = 'codex'` threads on both machines (a thread is one `machine, parent_id, agent_id`). Columns: threads opened, weighted usage, before-first-edit share, compactions with compactions per active thread (a thread with any opening, turn, edit or compaction in the piece), checkpointed phases, account switches per week and credits per day.
+`python3 scripts/whoami/seat_usage.py [--db PATH] (--daily [--t-live WHEN] | --before START END --after START END)` compares Codex usage per checkpointed phase before and after long-lived workers went live (`DEFAULT_T_LIVE` 2026-10-10T18:17Z). It is a view over the store: no rollout, ssh, git or readings file. Rows cover `family = 'codex'` threads on both machines (a thread is one `machine, parent_id, agent_id`). Columns: threads opened, weighted usage, before-first-edit share, compactions with compactions per active thread (a thread with any opening, turn, edit or compaction in the piece), checkpointed phases, account switches per week and credits per day.
 
 - **Window pieces.** Each window is cut at every instant strictly inside it at which a dated weight entry starts for a model with Codex turns there; each piece is its own row, labelled with its UTC start (`After, from 2026-10-10 21:35Z`). Weights apply as grouped SQL: token classes are summed per weight entry and multiplied once. `Weighting:` names each weight version used; `Unweighted:` names each model with no entry and its turn count.
 - **Verdict.** `Weighted usage per checkpointed phase: before …; after …; <change>` compares the whole `Before` window with the last `After` piece, with notes for different weight versions, unweighted turns left out, and the Mac's freshness (`Mac as of <time>` or `Mac never read in full`). It is the last line, after the `Sources` block from `usage_report.sources(db, UTC)`.
@@ -179,24 +179,24 @@ A new metric, dimension or outcome is one registry entry. The report reads `turn
 `python3 -m scripts.usage.compaction_replay [--db PATH] [--since DAY] [--until DAY] [--follow-up-prompt TOKENS]` replays stored Codex threads under other compaction limits, to set `PLAN_DELEGATE_COMPACT_ABOVE_TOKENS`. Defaults: the collector's store, follow-up prompt 11,000 tokens. `--since` and `--until` are read in the user's zone and select whole threads by their first request.
 
 - Covered: `codex` threads with a compaction and a request, every request of which has a weight entry. A thread's requests, in `(at, turn_key)` order, are cut into segments at each compaction; a request at the same instant as a compaction stays in the earlier segment.
-- `RULES`: `LimitRule` at 100,000, 150,000, 200,000 and 250,000; `NeverRule()`; `NewSeatRule()` (limit 100,000, and a new seat when the kept size is over 90,000).
+- `RULES`: `LimitRule` at 100,000, 150,000, 200,000 and 250,000; `NeverRule()`; `NewWorkerRule()` (limit 100,000, and a new worker when the kept size is over 90,000).
 - `fit_segments(threads) -> FittedLine(intercept, slope) | FitUnavailable(reason)`: least squares of the next segment's first size on the previous segment's last size. `FittedLine.kept` is never under 0.
-- `boundary_outcome(rule, fit, end, first_size, prompt) -> CarriedOn | Compacted | NewSeat`. A carried segment's first request costs `end` at the cached weight, the prompt, and its stored output; a compacted or new-seat one costs its start size and that output. Each later request costs its stored weighted tokens plus `max(difference, -cache_read)` at the cached weight. A thread's first segment costs what is stored under every rule.
-- Output: covered counts, the fit line, the median first-request size, the exclusion line, the rule table (`simulated compactions`, `new seats`, `weighted tokens`, `change against limit 100,000`, `requests over 272,000`), stored weighted tokens, threads left out by reason, rows of size 0 skipped, and requests held at the cache-read floor per rule. With no fit it prints `fit unavailable: <reason>` and no table, exit 0.
+- `boundary_outcome(rule, fit, end, first_size, prompt) -> CarriedOn | Compacted | NewWorker`. A carried segment's first request costs `end` at the cached weight, the prompt, and its stored output; a compacted or new-worker one costs its start size and that output. Each later request costs its stored weighted tokens plus `max(difference, -cache_read)` at the cached weight. A thread's first segment costs what is stored under every rule.
+- Output: covered counts, the fit line, the median first-request size, the exclusion line, the rule table (`simulated compactions`, `new workers`, `weighted tokens`, `change against limit 100,000`, `requests over 272,000`), stored weighted tokens, threads left out by reason, rows of size 0 skipped, and requests held at the cache-read floor per rule. With no fit it prints `fit unavailable: <reason>` and no table, exit 0.
 - Refusals print one `compaction_replay: <reason>` line, nothing on stdout, and leave the store's bytes unchanged: exit 2 for bounds (`invalid bounds; …`) and a prompt that is negative, NaN or infinite; exit 1 for an older store, a non-database file and a missing path.
 
 ### Timer
 
 The hourly pass lives outside this repository, in `/etc/nixos/modules/linux/usage-collect.nix` (`nate.jobs.usage-collect`, `intervalSeconds = 3600`, `TimeoutStartSec = "45min"`): `exec python3 "$HOME/.claude/scripts/usage/collect.py"` with the user's PATH, one hour after the last pass ended and one hour after login. The collector sends no message; its output goes to the journal. It takes effect at a NixOS rebuild.
 
-### Seat roster guards in `scripts/agents/codex_mesh.py`
+### Worker roster guards in `scripts/agents/codex_mesh.py`
 
-The roster carries each seat's role and the context size that decides when a launcher compacts it. Its writes are guarded so that a command still at work for a seat's earlier thread, or a compaction that ends late, cannot replace a newer record. None of this enters the usage store.
+The roster carries each worker's role and the context size that decides when a launcher compacts it. Its writes are guarded so that a command still at work for a worker's earlier thread, or a compaction that ends late, cannot replace a newer record. None of this enters the usage store.
 
 - `_update_roster_if_expected(session_dir, name, record, expected) -> bool` compares and writes inside one `fcntl.flock` section. `ExpectedRoster = RosterOnThread(thread_id) | RosterAbsent() | RosterEndedOnThread(thread_id) | RosterUnchanged(thread_id, revision)`. `_write_roster_record` holds the storing rules for it and for `_update_roster`.
 - Every entry carries `revision` (`RosterRevision`), raised by one on each write inside the lock. An entry without one reads as `RosterRevision(0)`. A writer that changes an entry in place calls `_advance_roster_revision(entry)`.
 - `command_compact` reads the revision at its start and writes the new size under `RosterUnchanged`, so a turn that wrote in between keeps its record.
-- `context_tokens` is an integer or `"not_measured_since_compaction"` (`RecordedContextSize = KnownContextSize | NotMeasuredSinceCompaction | ContextSizeUnavailable`). A compaction turn that reports 0 stores the state and prints `compacted <name>: <before> tokens, size not measured until its next turn`. `implement.sh` and `review.sh` ignore a non-integer size, so such a seat gets its follow-up with no second compaction. `compact` of such a seat exits 2 with `size not measured since its last compaction; compact refused`.
+- `context_tokens` is an integer or `"not_measured_since_compaction"` (`RecordedContextSize = KnownContextSize | NotMeasuredSinceCompaction | ContextSizeUnavailable`). A compaction turn that reports 0 stores the state and prints `compacted <name>: <before> tokens, size not measured until its next turn`. `implement.sh` and `review.sh` ignore a non-integer size, so such a worker gets its follow-up with no second compaction. `compact` of such a worker exits 2 with `size not measured since its last compaction; compact refused`.
 - A fork or a follow-up whose name was taken meanwhile releases only its own thread and refuses (`name was taken while the fork ran; fork refused`, `name was taken while the follow-up ran; follow-up did not start`).
 
 ### Key files
@@ -212,9 +212,9 @@ The roster carries each seat's role and the context size that decides when a lau
 | `scripts/usage/weights.py` | `MODEL_WEIGHTS`, `weights_at`, `sql_weights`, `register` |
 | `scripts/usage/usage_report.py` | Metric, dimension and outcome registries; `open_read_store`, `check_store_version`, `sources` |
 | `scripts/usage/compaction_replay.py` | Compaction-limit replay |
-| `scripts/whoami/seat_usage.py` | Codex before/after seat readout over the store |
+| `scripts/whoami/seat_usage.py` | Codex before/after worker readout over the store |
 | `scripts/lib/user_zone.py`, `config/user_zone.conf` | The zone report bounds and times are read in |
-| `scripts/agents/codex_mesh.py` | Seat role and lens recording; roster revision and guarded writes |
+| `scripts/agents/codex_mesh.py` | Worker role and lens recording; roster revision and guarded writes |
 | `scripts/delegate/prepare_session.sh`, `scripts/agents/agent_bg.sh`, `scripts/production/update_registration.py`, `scripts/delegate/review.sh` | Role writers |
 | `/etc/nixos/modules/linux/usage-collect.nix` | Hourly timer |
 | `scripts/usage/test_*.py`, `scripts/whoami/test_seat_usage.py`, `scripts/usage/fixtures/` | Tests over invented logs; expected reports compared whole |
@@ -241,23 +241,23 @@ The roster carries each seat's role and the context size that decides when a lau
 
 ## Calibration / gotchas
 
-- **Store size and speed** (natedev, 2026-10-12): a full pass about 214 s, the next about 31 s, store about 600 MB. An additive report 2.3 to 2.8 s; a per-turn `TurnAggregate` metric 8 to 15 s; the seat readout about 2 s. A Python function called once per request costs minutes on 1.2 million requests.
+- **Store size and speed** (natedev, 2026-10-12): a full pass about 214 s, the next about 31 s, store about 600 MB. An additive report 2.3 to 2.8 s; a per-turn `TurnAggregate` metric 8 to 15 s; the worker readout about 2 s. A Python function called once per request costs minutes on 1.2 million requests.
 - **The Mac link** ran at 0.42 MB/s and at 6 MB/s on the same day. The Mac held 112 MB of Claude logs and 5.4 GB of Codex logs in 1,859 files (largest 754 MB): 5,522 Claude requests, 278,850 Codex requests, 1,660 compactions. A measurement is 477 bytes on the wire. A first full read took about 9 minutes at the slow speed; a pass with nothing new 8.8 s. A time limit on a pass must allow about 10 minutes for a first Mac read; the timer allows 45.
 - **The Mac has no `agents.jsonl` yet.** Its role log reads `missing`, and Mac roles come from run history only.
 - **Token counts** outside 0..`MAX_SQLITE_INTEGER` (2**63-1) are never measurements: locally the line is skipped and its cursor advances; on the wire one ends the pass as a failed read.
 - **Listing** uses `os.scandir`, because Python 3.13 `Path.glob` hides listing errors. A nested folder that cannot be listed makes the source `partial`.
 - **Codex key collisions**: the key holds the file's last path component only, so a moved file keeps its keys, and two files of one thread with the same name would share them. Codex names files `rollout-<date-time>-<id>.jsonl`.
 - **Hook order**: for a delegate worker the hook writes `interactive` under the full uuid before `agent_bg.sh` writes `worker` under the prefix; the prefix merge in `role_at` handles that. `register_default` reads the whole log at every session start. Sessions started before the hook reached a machine's `~/.claude` have no line and are `unassigned`.
-- **Backfill limits**: the delegate archive keeps no `mesh_roster.json` or `seats` ledger, so archived runs backfill nothing; older review logs do not name the seat, so their lens stays unrecorded; a review outside a run (`agent_exec.sh`) records nothing.
+- **Backfill limits**: the delegate archive keeps no `mesh_roster.json` or `workers` ledger, so archived runs backfill nothing; older review logs do not name the worker, so their lens stays unrecorded; a review outside a run (`agent_exec.sh`) records nothing.
 - **Role coverage is thin for old history.** At first import most Codex requests were `unassigned` (460,601 of about 496,500); Claude about half (191,755 of about 400,000).
 - **Checkpoints** are read on natedev only, so a commit made on the Mac counts once natedev's repository has it. A candidate repository path that no longer exists (a removed worktree; 4 of 18 at first read) is skipped. 6 of 637 real phase ids contain spaces.
 - **Weights above 272K input**: the `gpt-6-sol` and `gpt-6-astra` entries leave out the 2× input and cache and 1.5× output premium, so a weighted figure for such a request is under its cost. The only model left unweighted on natedev's store is `<synthetic>` (458 requests).
-- **Seat switch count**: two Codex accounts read at the same instants alternate labels row by row, so counting reading-label changes gave about 750 switches a week where the role history gave 0.0. natedev's role history held three `unit` rows and no `seats` row when read, so an `After` row moves only once a `seats` change is stored.
+- **Worker switch count**: two Codex accounts read at the same instants alternate labels row by row, so counting reading-label changes gave about 750 switches a week where the role history gave 0.0. natedev's role history held three `unit` rows and no `seats` row when read, so an `After` row moves only once a change to that role is stored.
 - **WAL**: a pass that switches an older store to write-ahead mode while a reader holds it fails once and succeeds on the next pass. A refused replay over a WAL store leaves `-wal` and `-shm` files beside it.
 - **Refusal texts disagree on remedy**: the report and replay tell the owner of an older store `run the collector once`; the collector then says to delete the store and rebuild. `file is not a database` and `unable to open database file` are SQLite's own texts, so a SQLite release that rewords them fails two tests.
 - **`main` takes the pass lock before the version check**, so `<db>.lock` is created beside a refused store.
 - **`scripts/whoami/` is not a package**: its tests import by full path (`from scripts.whoami import seat_usage`) and are loaded by discovery.
-- **Compaction size**: a Codex compaction turn reports 0 input tokens, which is why the size after a compaction is a named state; a kept size over the limit would compact the seat before every follow-up. `_update_roster_if_expected` without `RosterUnchanged` refuses only a name that moved to another thread.
+- **Compaction size**: a Codex compaction turn reports 0 input tokens, which is why the size after a compaction is a named state; a kept size over the limit would compact the worker before every follow-up. `_update_roster_if_expected` without `RosterUnchanged` refuses only a name that moved to another thread.
 - **Replay reference table** (natedev scratch store, version 8, 2026-10-12; 664 threads, 2,001 compactions, 355,236 requests; fit `kept = 83,899.84 - 0.170678 × before`; median first request 27,080). Later limit proposals compare against it.
 
   | rule | simulated compactions | weighted tokens | change against `limit 100,000` | requests over 272,000 |
@@ -268,14 +268,14 @@ The roster carries each seat's role and the context size that decides when a lau
   | `limit 250,000` | 683 | 8,066,593,866 | +39.6% | 111,029 |
   | `never` | 0 | 23,242,221,181 | +302.3% | 210,404 |
 
-  The new-seat row equals `limit 100,000` with 0 new seats: the fitted slope is negative, so the kept size never passes about 84,000. Stored weighted tokens of the same threads: 5,551,641,863; the replay's base is about 4% over it, because it does not cost the compaction request and does not simulate Codex compacting a full context. `PLAN_DELEGATE_COMPACT_ABOVE_TOKENS` stays 100000.
+  The new-worker row equals `limit 100,000` with 0 new workers: the fitted slope is negative, so the kept size never passes about 84,000. Stored weighted tokens of the same threads: 5,551,641,863; the replay's base is about 4% over it, because it does not cost the compaction request and does not simulate Codex compacting a full context. `PLAN_DELEGATE_COMPACT_ABOVE_TOKENS` stays 100000.
 - **Compaction reread share** by role and model: `gpt-6.1-sol` 4.4% (director) and 6.8% (unassigned); Claude director models 4.9% to 7.0%; `gpt-5.6-sol` 0.4% to 0.5%.
 
 ## Why
 
 - **SQLite, one store on natedev.** Metrics are joins of requests against roles and outcomes, and SQLite ships with Python. The store and the timer are on natedev because the Mac sleeps with its lid closed; a Mac that does not answer is caught up on the next hourly pass.
 - **Roles recorded at assignment.** The sources that knew a role (active markers, `mesh_roster.json`, `/tmp`) are deleted or overwritten when a run ends; inferring later loses it. Storing only id, role, lens and time follows the user's rule of 2026-10-08: store only what a script cannot look up.
-- **A lens recorded, never inferred from a seat name.** Any seat runs any lens, so the name says nothing.
+- **A lens recorded, never inferred from a worker name.** Any worker runs any lens, so the name says nothing.
 - **Every Claude session and subagent records itself by hook.** Delegate tooling covers only its own agents; the hook makes interactive sessions and subagents rows of their own, so a subagent's usage counts once, under the subagent.
 - **Claude requests deduplicated by (message id, request id), keeping the largest of each class.** Counting a message once per file or per agent double-counted 0.19% of all tokens; keeping the first copy of a repeated message lost 5.8% of output.
 - **Run-history directors dated from the first event naming them**, not from the run's start: dating from the start backdated a mid-run takeover.
@@ -285,7 +285,7 @@ The roster carries each seat's role and the context size that decides when a lau
 - **Weights dated per model, applied on read.** A window that crosses a model change splits by itself, a new entry reweights all history, and a model with no entry is visible as unweighted instead of silently given a default.
 - **Weights as SQL, not a registered function.** A Python callback per request costs minutes over a million requests; grouped SQL costs seconds.
 - **Every figure carries coverage and source states.** Old history is mostly `unassigned` or `estimated`, and the Mac is often unreachable; a figure without those is not readable.
-- **A seat switch is a change in the `seats` role history**, not a reading-label change: two accounts read at the same instants alternate labels and inflate the count about 750 times over.
+- **A worker switch is a change in the `seats` role history**, not a reading-label change: two accounts read at the same instants alternate labels and inflate the count about 750 times over.
 - **The compaction limit stays 100,000.** In the replay every higher limit used more weighted tokens and sent more requests over 272,000 input tokens; no rule came in at least 5% under the base.
 - **A roster revision, not a comparison of status, turn id and size.** A turn's ending write removes its turn id, so a newer turn that ends with the same status and size would pass a field comparison.
-- **The size after a compaction is a named state.** Codex reports 0 for the compaction turn; storing 0 hides the size, and keeping the size from before would compact the seat before every follow-up.
+- **The size after a compaction is a named state.** Codex reports 0 for the compaction turn; storing 0 hides the size, and keeping the size from before would compact the worker before every follow-up.

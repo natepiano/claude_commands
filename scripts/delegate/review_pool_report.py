@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Compare pooled and own-seat review costs and phase finding quality."""
+"""Compare pooled and own-worker review costs and phase finding quality."""
 from __future__ import annotations
 
 import argparse
@@ -584,7 +584,7 @@ def render_report(records: Sequence[ReviewRecord], costs: Mapping[RecordKey, Rev
             if values:
                 means[arm] = statistics.mean(values)
         if "pool" in means and means.get("own", 0) > 0:
-            lines.append(f"pool is at {means['pool'] / means['own'] * 100:.1f}% of own-seat tokens per review")
+            lines.append(f"pool is at {means['pool'] / means['own'] * 100:.1f}% of own-worker tokens per review")
         else:
             lines.append("pool tokens per review: no comparison yet (complete costs needed for both arms)")
     return "\n".join(lines)

@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Integration tests for implement.sh's seat arguments.
+"""Integration tests for implement.sh's worker arguments.
 
 The failure these exist for left no error anywhere. A repair round went out with
-the pass kind on one seat, the other two launchers ran their agents normally,
+the pass kind on one worker, the other two launchers ran their agents normally,
 and the ledger kept describing the round before it -- two records closed `error`
 an hour earlier -- until the one live window closed and the recorder began
 refusing every progress call while two agents were still working.
@@ -166,7 +166,7 @@ import sys
 root = pathlib.Path(os.environ['STUB_CLAUDE_ROOT'])
 if sys.argv[1] == '--bg':
     (root / 'launch_args.json').write_text(json.dumps(sys.argv[1:]))
-    (root / 'seat_state').write_text('busy')
+    (root / 'worker_state').write_text('busy')
     own_summary = root / 'own_summary.bin'
     if own_summary.exists():
         pathlib.Path(os.environ['STUB_SUMMARY']).write_bytes(own_summary.read_bytes())
@@ -178,9 +178,9 @@ elif sys.argv[1:3] == ['agents', '--json']:
         unreadable.unlink()
         print('not JSON')
         sys.exit(0)
-    status = (root / 'seat_state').read_text().strip()
+    status = (root / 'worker_state').read_text().strip()
     if status == 'busy':
-        (root / 'seat_state').write_text('idle')
+        (root / 'worker_state').write_text('idle')
     launch_args = root / 'launch_args.json'
     name = 'fixture-impl'
     if launch_args.exists():
@@ -212,7 +212,7 @@ with transcript.open('a') as output:
     output.write(json.dumps({'type': 'assistant', 'message': {'stop_reason': 'end_turn'}}) + '\\n')
 pathlib.Path(os.environ['STUB_SUMMARY']).write_text('Claude follow-up summary\\n')
 if behavior == 'gone':
-    (root / 'seat_state').write_text('gone\\n')
+    (root / 'worker_state').write_text('gone\\n')
 if behavior == 'unreadable_once':
     (root / 'unreadable_listing_once').write_text('yes\\n')
 print('DELIVERED')
@@ -243,8 +243,8 @@ gpt-blind=low,medium,high,xhigh,max
 """
 
 
-class ImplementLauncherSeatTests(unittest.TestCase):
-    """Every seat carries a kind, and the board line says which."""
+class ImplementLauncherWorkerTests(unittest.TestCase):
+    """Every worker carries a kind, and the board line says which."""
 
     temporary: tempfile.TemporaryDirectory[str]  # pyright: ignore[reportUninitializedInstanceVariable]
     root: Path  # pyright: ignore[reportUninitializedInstanceVariable]
@@ -262,7 +262,7 @@ class ImplementLauncherSeatTests(unittest.TestCase):
         self.working_dir = self.root / "project"
         self.working_dir.mkdir()
         _ = subprocess.run(
-            ["git", "init", "-b", "feature/seats"],
+            ["git", "init", "-b", "feature/workers"],
             cwd=self.working_dir,
             check=True,
             capture_output=True,
@@ -306,7 +306,7 @@ class ImplementLauncherSeatTests(unittest.TestCase):
         home_lib = self.root / ".claude" / "scripts" / "lib"
         home_lib.mkdir(parents=True, exist_ok=True)
         _ = shutil.copy2(DELEGATE_DIR.parent / "lib" / "py", home_lib / "py")
-        for name in ("implement.sh", "seat_name.sh", "progress_history.py", "findings.py", "board.sh"):
+        for name in ("implement.sh", "worker_name.sh", "worker_state.py", "progress_history.py", "findings.py", "board.sh"):
             _ = shutil.copy2(DELEGATE_DIR / name, delegate / name)
         launcher = delegate / "implement.sh"
         _ = launcher.write_text(
@@ -339,8 +339,8 @@ class ImplementLauncherSeatTests(unittest.TestCase):
         cache.parent.mkdir(parents=True, exist_ok=True)
         _ = cache.write_text(sys.executable + "\n")
         _ = environment.pop("CLAUDE_PYTHON", None)
-        environment["PLAN_DELEGATE_SEAT_POLL_SECS"] = "0.01"
-        environment["PLAN_DELEGATE_SEAT_WAIT_ATTEMPTS"] = "30000"
+        environment["PLAN_DELEGATE_WORKER_POLL_SECS"] = "0.01"
+        environment["PLAN_DELEGATE_WORKER_WAIT_ATTEMPTS"] = "30000"
         environment["PLAN_DELEGATE_SYNC_WRITES"] = "0"
         environment["TEST_WAIT_HELPER"] = str(DELEGATE_DIR.resolve() / "wait_for_test_state.py")
         environment["TEST_HEARTBEAT_READY"] = str(self.root / "heartbeat-ready")
@@ -493,7 +493,7 @@ if len(_probe_sys.argv) > 1 and _probe_sys.argv[1] in {commands!r}:
     def observed_status(self, session_dir: Path, command: str) -> str:
         return (session_dir / f"observed_{command}.txt").read_text(encoding="utf-8")
 
-    def claude_seat(self, session_dir: Path) -> Path:
+    def claude_worker(self, session_dir: Path) -> Path:
         registry = self.root / ".claude" / "config" / "agents.conf"
         _ = registry.write_text(CLAUDE_REGISTRY, encoding="utf-8")
         sessions = self.root / "sessions"
@@ -509,20 +509,20 @@ if len(_probe_sys.argv) > 1 and _probe_sys.argv[1] in {commands!r}:
             json.dumps({"type": "assistant", "message": {"stop_reason": "end_turn"}})
             + "\n", encoding="utf-8"
         )
-        _ = (session_dir / "seats").write_text(
+        _ = (session_dir / "workers").write_text(
             "abc12345\tfixture-impl\n", encoding="utf-8"
         )
         _ = (session_dir / "impl_bg_id_impl").write_text(
             "abc12345\n", encoding="utf-8"
         )
-        _ = (session_dir / "impl_seat_impl.json").write_text(json.dumps({
+        _ = (session_dir / "impl_worker_impl.json").write_text(json.dumps({
             "name": "fixture-impl", "slot": "impl", "family": "claude",
-            "model": "opus", "seat_id": session_id,
+            "model": "opus", "worker_id": session_id,
         }), encoding="utf-8")
         _ = (session_dir / "impl_status_impl").write_text(
             "implemented\n", encoding="utf-8"
         )
-        _ = (self.root / "seat_state").write_text("idle\n", encoding="utf-8")
+        _ = (self.root / "worker_state").write_text("idle\n", encoding="utf-8")
         for name, content in (("claude", STUB_CLAUDE), ("send", STUB_SEND)):
             script = self.root / name
             _ = script.write_text(content, encoding="utf-8")
@@ -556,7 +556,7 @@ if len(_probe_sys.argv) > 1 and _probe_sys.argv[1] in {commands!r}:
                 " ".join((
                     f"Claude follow timed out: transcript={transcript.read_text()!r},",
                     f"delivered={delivered.exists()},",
-                    f"seat_state={(self.root / 'seat_state').read_text()!r},",
+                    f"worker_state={(self.root / 'worker_state').read_text()!r},",
                     f"stdout={error.stdout!r}, stderr={error.stderr!r}",
                 ))
             ) from error
@@ -598,7 +598,7 @@ if len(_probe_sys.argv) > 1 and _probe_sys.argv[1] in {commands!r}:
         )
         return stored["pass"]
 
-    def test_new_claude_seat_uses_registry_effort(self) -> None:
+    def test_new_claude_worker_uses_registry_effort(self) -> None:
         for row, expected_effort in (("sonnet:low", "low"), ("sonnet", "")):
             with self.subTest(row=row):
                 session_dir = self.start_phase(f"effort-{row.replace(':', '-')}")
@@ -622,7 +622,7 @@ if len(_probe_sys.argv) > 1 and _probe_sys.argv[1] in {commands!r}:
                     "abc12345\n",
                 )
                 self.assertIn(
-                    "abc12345\t", (session_dir / "seats").read_text(encoding="utf-8")
+                    "abc12345\t", (session_dir / "workers").read_text(encoding="utf-8")
                 )
 
     def test_claude_pane_fallback_strips_controls_before_character_cut(self) -> None:
@@ -678,7 +678,7 @@ if len(_probe_sys.argv) > 1 and _probe_sys.argv[1] in {commands!r}:
 
     def test_claude_written_summary_is_preserved_byte_for_byte(self) -> None:
         session_dir = self.start_phase("own-summary")
-        original = b"Seat summary\r\n\x1b[31mcolour\x1b[0m\n"
+        original = b"Worker summary\r\n\x1b[31mcolour\x1b[0m\n"
         _ = (self.root / "own_summary.bin").write_bytes(original)
         _ = (self.root / "pane.bin").write_bytes(b"Other pane output\n")
 
@@ -688,7 +688,7 @@ if len(_probe_sys.argv) > 1 and _probe_sys.argv[1] in {commands!r}:
         self.assertEqual((session_dir / "impl_summary_impl.txt").read_bytes(), original)
 
     def test_a_dispatch_with_no_pass_kind_is_refused(self) -> None:
-        # What the incident actually looked like on the wire: a seat launched
+        # What the incident actually looked like on the wire: a worker launched
         # with the sixth argument dropped. It used to run the agent and record
         # nothing; now nothing runs at all.
         session_dir = self.start_phase("dropped")
@@ -706,7 +706,7 @@ if len(_probe_sys.argv) > 1 and _probe_sys.argv[1] in {commands!r}:
         )
         self.assertEqual(result.returncode, 2, result.stderr)
         self.assertIn("pass_kind must be impl, test, fix, or review", result.stderr)
-        # Refused before anything ran: no status file to be read as a live seat,
+        # Refused before anything ran: no status file to be read as a live worker,
         # and no register line for peers to answer.
         self.assertFalse((session_dir / "impl_status_test").exists())
         self.assertFalse((session_dir / "board.log").exists())
@@ -717,14 +717,14 @@ if len(_probe_sys.argv) > 1 and _probe_sys.argv[1] in {commands!r}:
         self.assertEqual(result.returncode, 2, result.stderr)
         self.assertIn("got 'implementation'", result.stderr)
 
-    def test_every_seat_records_its_own_pass_and_stamps_its_role(self) -> None:
+    def test_every_worker_records_its_own_pass_and_stamps_its_role(self) -> None:
         session_dir = self.start_phase("team")
         for kind, slot in (("impl", "impl"), ("impl", "test")):
             result = self.launch(session_dir, kind, slot)
             self.assertEqual(result.returncode, 0, result.stderr)
 
-        # Two records, keyed by seat rather than by what each is doing: the
-        # `test` seat opened as a second writer and is still slot `test`.
+        # Two records, keyed by worker rather than by what each is doing: the
+        # `test` worker opened as a second writer and is still slot `test`.
         passes = self.open_passes(session_dir)
         self.assertEqual(
             {slot: record["kind"] for slot, record in passes.items()},
@@ -794,7 +794,7 @@ if len(_probe_sys.argv) > 1 and _probe_sys.argv[1] in {commands!r}:
             board,
         )
 
-    def test_follow_up_to_an_unmeasured_seat_does_not_compact_again(self) -> None:
+    def test_follow_up_to_an_unmeasured_worker_does_not_compact_again(self) -> None:
         session_dir = self.start_phase("unmeasured-follow")
         first = self.mesh_launch(session_dir)
         self.assertEqual(first.returncode, 0, first.stderr)
@@ -905,7 +905,7 @@ if len(_probe_sys.argv) > 1 and _probe_sys.argv[1] in {commands!r}:
         self.assertIn("compaction failed", board)
         self.assertIn("continuing follow-up", board)
 
-    def test_a_seat_left_with_a_live_turn_by_compaction_gets_no_follow_up(self) -> None:
+    def test_a_worker_left_with_a_live_turn_by_compaction_gets_no_follow_up(self) -> None:
         session_dir = self.start_phase("compact-still-live")
         first = self.mesh_launch(session_dir)
         self.assertEqual(first.returncode, 0, first.stderr)
@@ -918,7 +918,7 @@ if len(_probe_sys.argv) > 1 and _probe_sys.argv[1] in {commands!r}:
         result = self.mesh_launch(session_dir, to=name, compact_still_live=True)
 
         self.assertEqual(result.returncode, 2, result.stderr)
-        self.assertIn("still has a live turn after compaction; end the seat", result.stderr)
+        self.assertIn("still has a live turn after compaction; end the worker", result.stderr)
         self.assertFalse((session_dir / "follow_message.txt").exists())
         board = (session_dir / "board.log").read_text(encoding="utf-8")
         self.assertIn("follow-up not sent", board)
@@ -1015,6 +1015,22 @@ if len(_probe_sys.argv) > 1 and _probe_sys.argv[1] in {commands!r}:
         board = (session_dir / "board.log").read_text(encoding="utf-8")
         self.assertIn("blocked:", board)
 
+    def test_follow_up_reads_an_old_identity_and_leaves_only_worker_names(self) -> None:
+        session_dir = self.start_phase("old-run-follow")
+        first = self.mesh_launch(session_dir)
+        self.assertEqual(first.returncode, 0, first.stderr)
+        path = session_dir / "impl_worker_impl.json"
+        identity = cast("dict[str, object]", json.loads(path.read_text()))
+        identity["seat_id"] = identity.pop("worker_id")
+        _ = (session_dir / "impl_seat_impl.json").write_text(json.dumps(identity))
+        path.unlink()
+        result = self.mesh_launch(session_dir, to=str(identity["name"]))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse((session_dir / "impl_seat_impl.json").exists())
+        converted = cast("dict[str, object]", json.loads(path.read_text()))
+        self.assertEqual(converted["worker_id"], identity["seat_id"])
+        self.assertNotIn("seat_id", converted)
+
     def test_peer_turn_after_claim_closes_follow_up_as_error(self) -> None:
         session_dir = self.start_phase("peer-after-claim")
         first = self.mesh_launch(session_dir)
@@ -1053,7 +1069,7 @@ if len(_probe_sys.argv) > 1 and _probe_sys.argv[1] in {commands!r}:
         status_file = session_dir / "impl_status_impl"
         _ = status_file.write_text("previous\n", encoding="utf-8")
         before = self.open_passes(session_dir)
-        unknown = self.mesh_launch(session_dir, to="missing-seat")
+        unknown = self.mesh_launch(session_dir, to="missing-worker")
         self.assertEqual(unknown.returncode, 2, unknown.stderr)
         self.assertEqual(status_file.read_text(encoding="utf-8"), "previous\n")
         self.assertEqual(self.open_passes(session_dir), before)
@@ -1098,7 +1114,7 @@ if len(_probe_sys.argv) > 1 and _probe_sys.argv[1] in {commands!r}:
         ))
         name = next(iter(roster))
         _ = (session_dir / "impl_claim_impl.json").write_text(json.dumps({
-            "pid": os.getpid(), "seat": name, "turn_id": "",
+            "pid": os.getpid(), "worker": name, "turn_id": "",
         }), encoding="utf-8")
         before = self.open_passes(session_dir)
 
@@ -1108,7 +1124,7 @@ if len(_probe_sys.argv) > 1 and _probe_sys.argv[1] in {commands!r}:
         self.assertEqual(self.open_passes(session_dir), before)
         self.assertEqual(
             (session_dir / "impl_claim_impl.json").read_text(encoding="utf-8"),
-            json.dumps({"pid": os.getpid(), "seat": name, "turn_id": ""}),
+            json.dumps({"pid": os.getpid(), "worker": name, "turn_id": ""}),
         )
 
     def test_failed_pass_write_posts_blocked_and_does_not_send(self) -> None:
@@ -1207,7 +1223,7 @@ if len(_probe_sys.argv) > 1 and _probe_sys.argv[1] in {commands!r}:
         self.assertEqual(self.open_passes(session_dir), passes)
         self.assertNotIn("follow-up to", (session_dir / "board.log").read_text())
 
-    def test_seat_and_turn_identity_are_recorded_before_the_heartbeat_watcher_starts(self) -> None:
+    def test_worker_and_turn_identity_are_recorded_before_the_heartbeat_watcher_starts(self) -> None:
         for follow in (False, True):
             with self.subTest(follow=follow):
                 session = self.start_phase(f"identity-before-heartbeat-{follow}")
@@ -1220,7 +1236,7 @@ if len(_probe_sys.argv) > 1 and _probe_sys.argv[1] in {commands!r}:
                 arguments.extend([str(session), str(self.working_dir), str(self.prompt_file),
                                   "impl", "the retry path", "impl", "writing the retry path", "0", "impl"])
                 witness = session / "watcher-identity"
-                source = session / ("impl_claim_impl.json" if follow else "impl_seat_impl.json")
+                source = session / ("impl_claim_impl.json" if follow else "impl_worker_impl.json")
                 watcher = self.root / "scripts" / "agents" / "heartbeat_watch.sh"
                 _ = watcher.write_text(
                     '#!/bin/bash\nif [ -f "$TEST_IDENTITY_SOURCE" ]; then\n'
@@ -1244,7 +1260,7 @@ if len(_probe_sys.argv) > 1 and _probe_sys.argv[1] in {commands!r}:
                         self.assertEqual(identity.get("turn_id"), "turn-2")
                         self.assertEqual(identity.get("pid"), process.pid)
                     else:
-                        self.assertTrue(identity.get("seat_id"), identity)
+                        self.assertTrue(identity.get("worker_id"), identity)
                 finally:
                     release.touch()
                     output, errors = process.communicate(timeout=300)
@@ -1269,7 +1285,7 @@ if len(_probe_sys.argv) > 1 and _probe_sys.argv[1] in {commands!r}:
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("heartbeat watcher output", result.stdout)
 
-    def test_failed_seat_with_live_turn_refuses_before_recording_a_pass(self) -> None:
+    def test_failed_worker_with_live_turn_refuses_before_recording_a_pass(self) -> None:
         session_dir = self.start_phase("failed-live-turn")
         first = self.mesh_launch(session_dir)
         self.assertEqual(first.returncode, 0, first.stderr)
@@ -1291,7 +1307,7 @@ if len(_probe_sys.argv) > 1 and _probe_sys.argv[1] in {commands!r}:
 
     def test_claude_follow_counts_turn_completed_before_first_poll(self) -> None:
         session_dir = self.start_phase("claude-short-turn")
-        transcript = self.claude_seat(session_dir)
+        transcript = self.claude_worker(session_dir)
 
         result = self.claude_follow(session_dir, transcript, "complete")
 
@@ -1304,7 +1320,7 @@ if len(_probe_sys.argv) > 1 and _probe_sys.argv[1] in {commands!r}:
 
     def test_claude_queued_send_is_a_worker_error(self) -> None:
         session_dir = self.start_phase("claude-queued")
-        transcript = self.claude_seat(session_dir)
+        transcript = self.claude_worker(session_dir)
 
         result = self.claude_follow(session_dir, transcript, "queued")
 
@@ -1315,9 +1331,9 @@ if len(_probe_sys.argv) > 1 and _probe_sys.argv[1] in {commands!r}:
             session_dir / "board.log"
         ).read_text(encoding="utf-8"))
 
-    def test_claude_seat_gone_after_delivery_is_a_worker_error(self) -> None:
+    def test_claude_worker_gone_after_delivery_is_a_worker_error(self) -> None:
         session_dir = self.start_phase("claude-gone")
-        transcript = self.claude_seat(session_dir)
+        transcript = self.claude_worker(session_dir)
 
         result = self.claude_follow(session_dir, transcript, "gone")
 
@@ -1326,7 +1342,7 @@ if len(_probe_sys.argv) > 1 and _probe_sys.argv[1] in {commands!r}:
 
     def test_claude_follow_retries_unreadable_agents_listing(self) -> None:
         session_dir = self.start_phase("claude-unreadable")
-        transcript = self.claude_seat(session_dir)
+        transcript = self.claude_worker(session_dir)
 
         result = self.claude_follow(session_dir, transcript, "unreadable_once")
 

@@ -178,11 +178,11 @@ Loop/verbose only:
 
 <ShrinkCommit>
 Loop/verbose only, after <RunPhaseShrink/> passes its structural check. The
-next phase's seats may be editing, but they never stage files.
+next phase's workers may be editing, but they never stage files.
 
 1. Stage only `${PLAN_DOC}` and an approved, changed `${NEXT_ITEMS_PATH}`.
    Inspect the staged path set. Refuse the commit if it contains any other
-   path; leave the seats running and repair the staged set before retrying.
+   path; leave the workers running and repair the staged set before retrying.
 2. Commit only the staged paths, once:
 
    ```

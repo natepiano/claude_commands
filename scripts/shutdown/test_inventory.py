@@ -35,12 +35,12 @@ TARGET_LOGIN = "owner@example.com"
 OTHER_LOGIN = "other@example.com"
 DIRECTOR_ID = "11111111-1111-1111-1111-111111111111"
 UNIT_ID = "22222222-2222-2222-2222-222222222222"
-SEAT_ID = "aaaaaaaa-3333-3333-3333-333333333333"
+WORKER_ID = "aaaaaaaa-3333-3333-3333-333333333333"
 DESKTOP_ID = "44444444-4444-4444-4444-444444444444"
 OTHER_ID = "55555555-5555-5555-5555-555555555555"
 UNKNOWN_ID = "66666666-6666-6666-6666-666666666666"
 UNIT_PID = 41_002
-SEAT_PID = 41_003
+WORKER_PID = 41_003
 DESKTOP_PID = 41_004
 OTHER_PID = 41_005
 UNKNOWN_PID = 41_006
@@ -121,11 +121,11 @@ class InventoryTests(ShutdownTestCase):
         found = inventory.inventory(TARGET_LOGIN, only=frozenset({DESKTOP_ID}))
         self.assertEqual(found["sessions"][0]["model"], {"kind": "model", "name": "own-account-model"})
 
-    def test_inventory_filter_includes_owned_seats_and_empty_selection_includes_all(self) -> None:
+    def test_inventory_filter_includes_owned_workers_and_empty_selection_includes_all(self) -> None:
         cases = (
-            (frozenset({DIRECTOR_ID}), {DIRECTOR_ID, SEAT_ID}),
-            (frozenset({SEAT_ID}), {SEAT_ID}),
-            (frozenset[str](), {DIRECTOR_ID, UNIT_ID, SEAT_ID, DESKTOP_ID}),
+            (frozenset({DIRECTOR_ID}), {DIRECTOR_ID, WORKER_ID}),
+            (frozenset({WORKER_ID}), {WORKER_ID}),
+            (frozenset[str](), {DIRECTOR_ID, UNIT_ID, WORKER_ID, DESKTOP_ID}),
         )
         for selected, expected in cases:
             for keyword in (True, False):
@@ -160,8 +160,8 @@ class InventoryTests(ShutdownTestCase):
             listed = inventory.listing()
             owned = inventory.listing(TARGET_LOGIN)
         by_id = {session.session_id: session for session in listed}
-        self.assertEqual(set(by_id), {DIRECTOR_ID, UNIT_ID, SEAT_ID, DESKTOP_ID, OTHER_ID})
-        self.assertEqual({session.session_id for session in owned}, {DIRECTOR_ID, UNIT_ID, SEAT_ID, DESKTOP_ID})
+        self.assertEqual(set(by_id), {DIRECTOR_ID, UNIT_ID, WORKER_ID, DESKTOP_ID, OTHER_ID})
+        self.assertEqual({session.session_id for session in owned}, {DIRECTOR_ID, UNIT_ID, WORKER_ID, DESKTOP_ID})
         for session in full:
             light = by_id[session["session_id"]]
             with self.subTest(session=light.session_id):
@@ -354,7 +354,7 @@ class InventoryTests(ShutdownTestCase):
         config_by_pid: dict[int, Path | None] = {
             self.director_pid: self.target_config,
             UNIT_PID: self.target_config,
-            SEAT_PID: self.target_config,
+            WORKER_PID: self.target_config,
             DESKTOP_PID: self.target_config,
             OTHER_PID: self.other_config,
             UNKNOWN_PID: None,
@@ -532,9 +532,9 @@ elif "comm=" in joined:
             model="unit-model",
         )
         self.write_session(
-            SEAT_PID,
-            SEAT_ID,
-            "review-seat",
+            WORKER_PID,
+            WORKER_ID,
+            "review-worker",
             plain,
             kind="bg",
             updated_at=40,
@@ -606,7 +606,7 @@ elif "comm=" in joined:
         _ = (self.delegate / "active" / DIRECTOR_ID).write_text(
             str(run_dir) + "\n", encoding="utf-8"
         )
-        _ = (run_dir / "seats").write_text("aaaaaaaa\treview-seat\n", encoding="utf-8")
+        _ = (run_dir / "workers").write_text("aaaaaaaa\treview-worker\n", encoding="utf-8")
         _ = (run_dir / "mesh_server.json").write_text(
             json.dumps({"port": 45_678, "pid": os.getpid()}), encoding="utf-8"
         )
@@ -663,7 +663,7 @@ elif "comm=" in joined:
         self.assertEqual(found["login"], TARGET_LOGIN)
         self.assertEqual(found["label"], "claude 2")
         by_id = {session["session_id"]: session for session in found["sessions"]}
-        self.assertEqual(set(by_id), {DIRECTOR_ID, UNIT_ID, SEAT_ID, DESKTOP_ID})
+        self.assertEqual(set(by_id), {DIRECTOR_ID, UNIT_ID, WORKER_ID, DESKTOP_ID})
         self.assertTrue(
             all(session.get("config_dir") == str(self.target_config) for session in by_id.values())
         )
@@ -702,7 +702,7 @@ elif "comm=" in joined:
                 {
                     "run_dir": str(self.delegate / "phase-two"),
                     "pid": os.getpid(),
-                    "busy_seats": ["busy-codex", "busy-without-launcher"],
+                    "busy_workers": ["busy-codex", "busy-without-launcher"],
                 }
             ],
         )
@@ -736,10 +736,10 @@ elif "comm=" in joined:
             },
         )
 
-        seat = cast(inventory.SeatSession, by_id[SEAT_ID])
-        self.assertEqual(seat["kind"], "seat")
+        worker = cast(inventory.SeatSession, by_id[WORKER_ID])
+        self.assertEqual(worker["kind"], "seat")
         self.assertEqual(
-            seat["owner"], {"kind": "director", "session_id": DIRECTOR_ID}
+            worker["owner"], {"kind": "director", "session_id": DIRECTOR_ID}
         )
         self.assertEqual(by_id[DESKTOP_ID]["kind"], "top-level")
         self.assertEqual(
@@ -754,7 +754,7 @@ elif "comm=" in joined:
         limited = inventory.inventory(TARGET_LOGIN, only=frozenset({DIRECTOR_ID}))
         self.assertEqual(
             {session["session_id"] for session in limited["sessions"]},
-            {DIRECTOR_ID, SEAT_ID},
+            {DIRECTOR_ID, WORKER_ID},
         )
 
     def test_truncated_wrapped_ghostty_name_keeps_snapshot_desktop(self) -> None:
@@ -962,17 +962,17 @@ elif "comm=" in joined:
 
         self.assertEqual(director["host"].get("window_shell"), DIRECTOR_SHELL_PID)
 
-    def test_running_codex_seat_without_launcher_is_busy_but_dead_launcher_is_not(self) -> None:
+    def test_running_codex_worker_without_launcher_is_busy_but_dead_launcher_is_not(self) -> None:
         found = inventory.inventory(TARGET_LOGIN)
         director = next(
             session for session in found["sessions"] if session["session_id"] == DIRECTOR_ID
         )
 
         self.assertEqual(
-            director["codex_servers"][0]["busy_seats"],
+            director["codex_servers"][0]["busy_workers"],
             ["busy-codex", "busy-without-launcher"],
         )
-        self.assertNotIn("orphaned-start", director["codex_servers"][0]["busy_seats"])
+        self.assertNotIn("orphaned-start", director["codex_servers"][0]["busy_workers"])
 
     def test_a_showrunner_timer_naming_a_session_not_running_is_unregistered(self) -> None:
         before = {runner["slug"] for runner in inventory.unregistered_showrunners()}
@@ -1018,7 +1018,36 @@ elif "comm=" in joined:
             found["unattributed"],
         )
 
-    def test_live_seat_keeps_owner_after_director_exits(self) -> None:
+    def test_inventory_reads_shared_worker_ledger_and_later_old_path_appends(self) -> None:
+        self.write_session(DESKTOP_PID, DESKTOP_ID, "late-worker", self.root / "plain", kind="bg")
+        current = self.delegate / "phase-two" / "workers"
+        previous = current.with_name("seats")
+        modified = current.stat().st_mtime_ns
+        _ = current.replace(previous)
+        found = inventory.inventory(TARGET_LOGIN)
+        worker = next(session for session in found["sessions"] if session["session_id"] == WORKER_ID)
+        self.assertEqual(worker["kind"], "seat")
+        self.assertEqual(cast(inventory.SeatSession, worker)["owner"],
+                         {"kind": "director", "session_id": DIRECTOR_ID})
+        late_worker = next(session for session in found["sessions"] if session["session_id"] == DESKTOP_ID)
+        self.assertEqual(cast(inventory.SeatSession, late_worker)["owner"], {"kind": "no director"})
+        self.assertTrue(previous.samefile(current))
+        self.assertEqual(current.stat().st_mtime_ns, modified)
+        _ = inventory.inventory(TARGET_LOGIN)
+        self.assertEqual(current.stat().st_mtime_ns, modified)
+        with previous.open("a", encoding="utf-8") as ledger:
+            _ = ledger.write(f"{DESKTOP_ID[:8]}\tlate-worker\n")
+        self.assertIn("late-worker", current.read_text(encoding="utf-8"))
+        modified = current.stat().st_mtime_ns
+        found = inventory.inventory(TARGET_LOGIN)
+        late_worker = next(session for session in found["sessions"] if session["session_id"] == DESKTOP_ID)
+        self.assertEqual(late_worker["kind"], "seat")
+        self.assertEqual(cast(inventory.SeatSession, late_worker)["owner"],
+                         {"kind": "director", "session_id": DIRECTOR_ID})
+        self.assertTrue(previous.samefile(current))
+        self.assertEqual(current.stat().st_mtime_ns, modified)
+
+    def test_live_worker_keeps_owner_after_director_exits(self) -> None:
         (self.records / f"{self.director_pid}.json").unlink()
 
         found = inventory.inventory(TARGET_LOGIN, only=frozenset({DIRECTOR_ID}))
@@ -1029,7 +1058,7 @@ elif "comm=" in joined:
                 for session in found["sessions"]
                 if session["kind"] == "seat"
             ],
-            [(SEAT_ID, {"kind": "director", "session_id": DIRECTOR_ID})],
+            [(WORKER_ID, {"kind": "director", "session_id": DIRECTOR_ID})],
         )
 
     def test_newest_unit_plan_is_selected_by_started_time_not_write_order(self) -> None:
@@ -1044,7 +1073,7 @@ elif "comm=" in joined:
     def test_absent_values_are_explicit_variants(self) -> None:
         for path in (self.history / "runs").glob("*.jsonl"):
             path.unlink()
-        (self.delegate / "phase-two" / "seats").unlink()
+        (self.delegate / "phase-two" / "workers").unlink()
         transcript = (
             self.home / ".claude" / "projects" / "fixture" / f"{DESKTOP_ID}.jsonl"
         )
@@ -1054,10 +1083,10 @@ elif "comm=" in joined:
         by_id = {session["session_id"]: session for session in found["sessions"]}
 
         unit = cast(inventory.UnitSession, by_id[UNIT_ID])
-        seat = cast(inventory.SeatSession, by_id[SEAT_ID])
+        worker = cast(inventory.SeatSession, by_id[WORKER_ID])
         self.assertEqual(unit["host"]["plan"], {"kind": "no run record"})
         self.assertEqual(by_id[DESKTOP_ID]["model"], {"kind": "no reply yet"})
-        self.assertEqual(seat["owner"], {"kind": "no director"})
+        self.assertEqual(worker["owner"], {"kind": "no director"})
         self.assertEqual(
             by_id[DIRECTOR_ID]["checkout"], {"kind": "not a checkout"}
         )

@@ -752,12 +752,12 @@ def promote(request: MergeRequest, tip: str) -> None:
 
 
 def review_numbers(line: str) -> ReviewTrial:
-    pattern = (r"review trial: ux (\d+) findings, code (\d+) findings, review-seat minutes ([\d.]+), "
+    pattern = (r"review trial: ux (\d+) findings, code (\d+) findings, review-worker minutes ([\d.]+), "
                r"ux check minutes ([\d.]+), ux repair minutes ([\d.]+)")
     match = re.fullmatch(pattern, line.strip())
     if match is None:
         raise Refusal("--review-trial must read: review trial: ux <N> findings, code <N> findings, "
-                      + "review-seat minutes <M>, ux check minutes <U>, ux repair minutes <R>")
+                      + "review-worker minutes <M>, ux check minutes <U>, ux repair minutes <R>")
     return ReviewTrial(*match.groups())
 
 

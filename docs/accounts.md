@@ -28,7 +28,7 @@ The status line's second row shows this session's account label. To print it:
 | Credits left | Codex only: the credit balance, or `unlimited`. |
 | Read | When those numbers were read. |
 
-Each Codex account can stay signed in in its own home. The table's `seats` role follows `seats` in `~/.claude/config/accounts.json`, defaulting to `~/.codex`. A caller's `CODEX_HOME` does not change the seats role. Signed-in spares get usage readings too; their notes stay inactive and raise no quota alerts. Freestanding Codex sessions keep their own process home.
+Each Codex account can stay signed in in its own home. The table's `seats` role follows `seats` in `~/.claude/config/accounts.json`, defaulting to `~/.codex`. A caller's `CODEX_HOME` does not change the `seats` role. Signed-in spares get usage readings too; their notes stay inactive and raise no quota alerts. Freestanding Codex sessions keep their own process home.
 
 Times are in the user's zone setting (`config/user_zone.conf`). The numbers are each account's last good reading: the usage service refuses many reads, so the two-minute updater saves each one it gets, and an account with none in the last 10 minutes is read once more. `unavailable` means no reading is held for a window that is still open. Lines under the table name anything wrong or unusual in a folder: a failed check, unclassified entries, MCP servers that differ from `~/.claude`.
 
@@ -124,7 +124,7 @@ Before changing anything, move refuses when:
 
 - No live session has that id or exact name here; move a session on the other machine from there.
 - Two live sessions share the name; their ids are listed so you can select one.
-- The session is a seat: `seats move with their unit director`.
+- The session is a worker: `seats move with their unit director`.
 - The target fails `check`; its first problem is printed.
 - Its login is already the target: `<name> is already on <label>`.
 - A target label names the default login, or its directory holds that login: `<label> is the default account; use default`.
@@ -147,7 +147,7 @@ Claude accounts have room until they have an unresolved provider refusal. Low an
 
 `~/.local/state/accounts/groups.json` stores explicitly selected group accounts. Only a manual group move or a move after a refusal writes it; selecting one group leaves the other unconfigured. Both groups may use the same account. Changes append `{at, group, label, why}` to `roles.jsonl`; historical burn skips these group entries. Launches, status, `accounts.py placement --explain` and the refusal watcher never initialize missing selections. Status and previews print `not configured`, and the watcher moves no member of an unconfigured group.
 
-`claude-unit`, `exec unit`, `env unit` and `role unit` use the units account; `role showrunner` and new showrunner launches use the showrunners account. The legacy `unit` configuration key is ignored; `set-role unit` and `swap unit` refuse. Codex seats retain their own role.
+`claude-unit`, `exec unit`, `env unit` and `role unit` use the units account; `role showrunner` and new showrunner launches use the showrunners account. The legacy `unit` configuration key is ignored; `set-role unit` and `swap unit` refuse. Codex workers retain their own role.
 
 New units and showrunners save `@claude_config_dir` and `@claude_model` on tmux. A resume uses its group's configured account, and accepts `--account` or `--config-dir` only when it names that account. Promoting a unit uses the configured showrunners account; recovery as a unit uses the configured units account.
 
@@ -181,15 +181,15 @@ Run the printed command in a terminal and sign in as codex 1:
 CODEX_HOME=~/.codex1 codex login
 ```
 
-Keep `CODEX_HOME` on that command. Without it, `codex login` signs `~/.codex` out and in, leaving its seats unable to work until login finishes; seats use that default home unless their role names another.
+Keep `CODEX_HOME` on that command. Without it, `codex login` signs `~/.codex` out and in, leaving its workers unable to work until login finishes; workers use that default home unless their role names another.
 
-Then run `/showrunner:accounts`. The new home's row shows `spare` and its own numbers until selected for seats. To check the home directly, use `/showrunner:accounts check "codex 1"`. Problems under the table name missing, broken or replaced shared links, unclassified entries, the wrong login, or a login held by another home. Keep each login in one home: two homes on one login break token refresh.
+Then run `/showrunner:accounts`. The new home's row shows `spare` and its own numbers until selected for workers. To check the home directly, use `/showrunner:accounts check "codex 1"`. Problems under the table name missing, broken or replaced shared links, unclassified entries, the wrong login, or a login held by another home. Keep each login in one home: two homes on one login break token refresh.
 
 The repository's hook installer keeps a linked `hooks.json` and adds missing hooks to its target, so numbered homes continue to share the default home's hooks.
 
-## Swapping the Codex seats account
+## Swapping the Codex workers account
 
-One account serves every unit's Codex seats, including the `codex exec` fallback. The updater, 5-hour watcher, `/whoami` and account table follow that role. Read it with `/showrunner:accounts role seats`.
+One account serves every unit's Codex workers, including the `codex exec` fallback. The updater, 5-hour watcher, `/whoami` and account table follow that role. Read it with `/showrunner:accounts role seats`.
 
 ```text
 /showrunner:accounts swap seats "codex 1" --dry-run
@@ -197,7 +197,7 @@ One account serves every unit's Codex seats, including the `codex exec` fallback
 /showrunner:accounts swap seats default
 ```
 
-A swap checks the target home, its sign-in, both usage windows and its credits before changing the role. It retires each run's current server and tells each affected unit director once. A working seat finishes its turn on the outgoing home; its next turn runs under the new one. Held messages move with it. The move confirms that the old server released the thread before the new server resumes it. If Codex refuses that resume, the seat starts a new thread and its board line names the replacement. An unreadable thread state or unconfirmed release starts no replacement turn.
+A swap checks the target home, its sign-in, both usage windows and its credits before changing the role. It retires each run's current server and tells each affected unit director once. A working worker finishes its turn on the outgoing home; its next turn runs under the new one. Held messages move with it. The move confirms that the old server released the thread before the new server resumes it. If Codex refuses that resume, the worker starts a new thread and its board line names the replacement. An unreadable thread state or unconfirmed release starts no replacement turn.
 
 `--dry-run` prints the target account, its home and the runs that would move, with no role or history write. `set-role seats "codex N"` (or `default`) selects future turns directly, without the swap's usage check or notices. Each role write keeps the other role; `unit` and `seats` history share `~/.local/state/accounts/roles.jsonl`.
 
@@ -205,9 +205,9 @@ Refusals leave both the role and history unchanged. A home-check failure names t
 
 ## Automatic Codex moves
 
-A provider quota refusal moves workers to the picked Codex account with room. Above zero, low quota alone changes nothing; weekly zero with `use_credits: off` also requests a move. A known 5-hour reset less than 20 minutes away waits once, with its reset time in the notice. An unknown window or reset, a passed reset, or exactly 20 minutes remaining moves instead. The picked home becomes the seats role through the seats-swap path; each seat moves after its live turn ends and continues the refused work before held messages.
+A provider quota refusal moves workers to the picked Codex account with room. Above zero, low quota alone changes nothing; weekly zero with `use_credits: off` also requests a move. A known 5-hour reset less than 20 minutes away waits once, with its reset time in the notice. An unknown window or reset, a passed reset, or exactly 20 minutes remaining moves instead. The picked home becomes the `seats` role through the `swap seats` path; each worker moves after its live turn ends and continues the refused work before held messages.
 
-When no Codex account has room, assignments fall back to Claude and the notice names the earliest reset. A failed move to the picked home also falls back to Claude, with the failed move and cause in the notice. They return only when the selected Codex account can work and its refusal is resolved. Recorded refusals override saved percentages. The moves journal at `~/.local/state/accounts/moves.jsonl` separates a requested role change from each seat's confirmed resume, and records waits, failures and renewed room.
+When no Codex account has room, assignments fall back to Claude and the notice names the earliest reset. A failed move to the picked home also falls back to Claude, with the failed move and cause in the notice. They return only when the selected Codex account can work and its refusal is resolved. Recorded refusals override saved percentages. The moves journal at `~/.local/state/accounts/moves.jsonl` separates a requested role change from each worker's confirmed resume, and records waits, failures and renewed room.
 
 ## Automatic Claude moves
 
@@ -217,11 +217,11 @@ The argument-free notes timer checks local top-level sessions' last transcript e
 
 Group membership comes from shutdown inventory's `unit` and `showrunner` classifications. An update timer is not required for a classified showrunner to move with its group.
 
-A known 5-hour reset in less than 20 minutes waits once per session and reset. Other refusals move; no room sends one account notice until a usage reading changes. Shutdown waits for an idle owner, idle seats, no merge and nothing ahead of upstream. Its status line keeps the target and refusal reason visible while blocked. Cancellation records a failed move, removes the assumption and suppresses the unchanged transcript refusal.
+A known 5-hour reset in less than 20 minutes waits once per session and reset. Other refusals move; no room sends one account notice until a usage reading changes. Shutdown waits for an idle owner, idle workers, no merge and nothing ahead of upstream. Its status line keeps the target and refusal reason visible while blocked. Cancellation records a failed move, removes the assumption and suppresses the unchanged transcript refusal.
 
 `scripts/accounts/refusal_watch.py --dry-run` reports decisions without changing anything. For a live proof, `--assume-refused '<session id or name>' weekly|five-hour [--reset-in <minutes>]` writes a refusal for that owner only and runs once. The optional reset affects its wait decision, not stored account usage. A confirmed restart or cancellation deletes the assumption. A process still on the source is a failed move; a target process with pending timers is confirmed while those timers stay visible.
 
-Account status shows live sessions' accounts, the Codex seats account and its destination on refusal, seats still owing a continuation, and the last ten move entries with outcomes. The first line names both groups; table role cells show their selected accounts. A member still on its old account shows as `moving`.
+Account status shows live sessions' accounts, the Codex workers account and its destination on refusal, workers still owing a continuation, and the last ten move entries with outcomes. The first line names both groups; table role cells show their selected accounts. A member still on its old account shows as `moving`.
 
 ## Low-quota alerts
 

@@ -2,7 +2,7 @@
 
 ## What it is
 
-Each production has its own pool of long-lived, read-only Codex reviewers. A unit that needs a review calls a script, which hands it a reviewer at once. A reviewer keeps its context for one unit's phase (a lease) and is reset when the phase ends, so the next lease starts from a warm prompt cache instead of a new thread. A trial compares weighted tokens per review on the pool against the same reviews on a unit's own seats, with phases divided between the two arms. A second reviewer type judges screenshots; it runs in shadow beside the Claude design-check helper until the user adopts it.
+Each production has its own pool of long-lived, read-only Codex reviewers. A unit that needs a review calls a script, which hands it a reviewer at once. A reviewer keeps its context for one unit's phase (a lease) and is reset when the phase ends, so the next lease starts from a warm prompt cache instead of a new thread. A trial compares weighted tokens per review on the pool against the same reviews on a unit's own workers, with phases divided between the two arms. A second reviewer type judges screenshots; it runs in shadow beside the Claude design-check helper until the user adopts it.
 
 ## How it works
 
@@ -112,14 +112,14 @@ Lens `ux` with no pool is accepted. From there the launcher:
 5. Takes `reviewer`, `mesh_dir`, `thread_id`, `lease_ordinal` and `prime_hash` from the allocation line. Its slot is `pool_<reviewer>`: exported as `PLAN_DELEGATE_TEAM_ROLE` and written as one line to the slot file, since the slot is known only after allocation and the unit director needs it to cancel.
 6. Prepends the unit's memory (`review_pool.py unit-memory`) for `code` when `lease_ordinal` is 1, and on every `ui` turn, which starts from a reset thread that holds nothing from an earlier turn. It writes `${SESSION_DIR}/review_message_<pass><suffix>.XXXXXX` (the memory, a blank line, the prompt), sends that file as the prompt and removes it at exit. With no memory the prompt goes unchanged. A failed `unit-memory` call ends the attempt as an `error`.
 7. Claims the reviewer in the pool's `mesh_dir` (`can-follow --claim-pid $$`), compacting it first when its recorded context is an integer over `PLAN_DELEGATE_COMPACT_ABOVE_TOKENS` (100000 in `config/delegate.conf`). Roster, compaction, claim and claim release use the pool's `mesh_dir`; status file, findings, agent log, heartbeat, board and pass stay in the unit's `${SESSION_DIR}`.
-8. Records the review pass under its slot, except for lens `ux` (`record_pass_start` returns at once, with a pool and without one): the unit director's `UX review` activity already carries that time, and a pass would count it twice. An early launch defers the pass until its sentinel file appears, as on the seated path.
+8. Records the review pass under its slot, except for lens `ux` (`record_pass_start` returns at once, with a pool and without one): the unit director's `UX review` activity already carries that time, and a pass would count it twice. An early launch defers the pass until its sentinel file appears, as on the assigned path.
 9. Runs `codex_mesh.py follow --session-dir <mesh_dir> --to <reviewer> --claim-pid $$ --role review [--lens L] --cwd "${WORKING_DIR}" --read-only [--image …] --message-file … --summary-file <findings> --reply-file … --log-file … --model … --effort … --service-tier …` with the review model, effort and tier.
 10. After the turn, checks that the working tree is unchanged, counts the findings, writes `reviewed` or `error` to the status file and closes the pass (`finish-pass --status completed` or `error`).
 11. On every exit: writes `error` to the status file when the exit code is not 0, reads the reviewer's thread id from the mesh roster, writes the turn record, releases the mesh claim, runs `review_pool.py release --production <slug> --reviewer R --pid $$ --thread-id <id>` and removes the temporary prompt file. A record that cannot be written prints `ERROR: unable to write review turn record.` and makes the exit 1.
 
 A pool launcher stopped by TERM, INT or HUP stops its child and its heartbeat watcher, marks the record `canceled` and exits 143, 130 or 129. It leaves its pass open. The unit director closes that pass with `finish-pass --status canceled --orphaned-launcher` under the slot it reads from the slot file (`review_slot_adversary` for a pass-1 early review, `review_slot_<lens>` for a lens, `review_slot` for a closure); a missing file means no pass to close. An own-arm launcher marks its record `canceled` on the same signals and exits with the same codes.
 
-A pool `error` falls back to `review.sh --to <seat>` for that review under <DelegateLaunchFailure/>, with `REVIEW_LEASE=<slug>/<unit>/<phase>` exported.
+A pool `error` falls back to `review.sh --to <worker>` for that review under <DelegateLaunchFailure/>, with `REVIEW_LEASE=<slug>/<unit>/<phase>` exported.
 
 ### Turn record
 
@@ -129,7 +129,7 @@ A `--pool` launch and a `--to` launch each write one new file per attempt, inclu
 | --- | --- |
 | `arm` | `pool` or `own` |
 | `pool` | The production slug on the pool arm, empty on the own arm |
-| `reviewer` | The reviewer or seat name |
+| `reviewer` | The reviewer or worker name |
 | `thread_id` | The roster's id after the turn, so it names the thread that ran it |
 | `unit`, `phase` | From `--lease`, or from `REVIEW_LEASE` on the own arm |
 | `phase_instance_id`, `history_file` | From the unit's progress recorder state |
@@ -150,7 +150,7 @@ A `--pool` launch and a `--to` launch each write one new file per attempt, inclu
 - `all` gives `pool`; `off`, a missing `pool.json` or no primed `code` template gives `own`;
 - `hash` gives `pool` when the first byte of `sha256("<unit>\n<phase>")` is even.
 
-On `pool` the unit sends that phase's code reviews with `--pool code --lease <slug>/<unit>/<phase>`. On `own` it exports `REVIEW_LEASE=<slug>/<unit>/<phase>` and reviews on its own seats with `--to`, so both arms leave records the report can compare. The UI pool is used on every design check regardless of the phase's code-review arm. At phase end the worker cleanup runs `review_pool.py end-lease --production <slug> --unit <unit> --phase <phase>`.
+On `pool` the unit sends that phase's code reviews with `--pool code --lease <slug>/<unit>/<phase>`. On `own` it exports `REVIEW_LEASE=<slug>/<unit>/<phase>` and reviews on its own workers with `--to`, so both arms leave records the report can compare. The UI pool is used on every design check regardless of the phase's code-review arm. At phase end the worker cleanup runs `review_pool.py end-lease --production <slug> --unit <unit> --phase <phase>`.
 
 ### Prompts
 
@@ -158,7 +158,7 @@ A reviewer's standing instructions come from its template and reach every turn o
 
 On every design check the unit director writes two prompts (<UXReview/> step 3): `${SESSION_DIR}/ux_prompt_<pass>_helper.md`, the Claude helper's prompt that points at `commands/ux_eval.md`, and `ux_prompt_<pass>_pool.md`, which opens "Judge these shots by your standing instructions, which hold the rules and the report format:" and carries the shots, scale, context and production rules. The pool is launched with the pool file, so a pooled UI turn reads no rule or command file; it may still read `measure_text.py`'s source for its flags.
 
-On the pool arm a code review prompt opens with the pooled-reviewer line (unit, phase, and `git -C <worktree> rev-parse HEAD` as the first command, reporting an error when it is not the expected head), and its Three Gods and Type Design Contract sections each hold `As in your standing instructions.` <TeamReview/>'s seat choice and role reassignment do not apply.
+On the pool arm a code review prompt opens with the pooled-reviewer line (unit, phase, and `git -C <worktree> rev-parse HEAD` as the first command, reporting an error when it is not the expected head), and its Three Gods and Type Design Contract sections each hold `As in your standing instructions.` <TeamReview/>'s worker choice and role reassignment do not apply.
 
 ### Review unit director and review memory
 
@@ -225,7 +225,7 @@ Mac rows and histories from `mac_sources` take the same path. The table closes w
 
 **Source warnings:** `usage store unavailable: <reason>`; `Mac usage source <state>; last complete read <time>` (the store's `turn_sources` row for the Mac is not `ready`); `merge holds unavailable: <reason>` (quality continues without holds); `merge holds unmatched: <unit> phase <phase>: review plan unavailable (<reason>)` (printed with the quality table, see Quality); `history unavailable: <path>: <reason>`; `Mac unavailable: <reason>`; `Mac file unavailable: <path>: <reason>`; `invalid Mac file: <reason>`.
 
-**Final line.** `pool reviews: N of 20 for the first reading` until 20, then `pool is at X% of own-seat tokens per review`, a ratio of mean complete costs. N and the comparison count `reviewed` records of kinds `broad` and `closure` only. At 20 with no complete costs on one arm: `pool tokens per review: no comparison yet (complete costs needed for both arms)`.
+**Final line.** `pool reviews: N of 20 for the first reading` until 20, then `pool is at X% of own-worker tokens per review`, a ratio of mean complete costs. N and the comparison count `reviewed` records of kinds `broad` and `closure` only. At 20 with no complete costs on one arm: `pool tokens per review: no comparison yet (complete costs needed for both arms)`.
 
 ### UI pool and adoption
 
@@ -343,7 +343,7 @@ From the proposal (`docs/plans/proposal-review-unit.md`, 2026-10-10, removed 202
 | Stale context | The prompt says to re-read the tree each review. A lease never outlives its phase. Memory entries carry a date and source and are pruned when a ruling changes. A changed guide hash retires reviewers at lease end. |
 | One point of failure | The request path is the unit's own `review.sh` plus one app-server. A dead server is restarted on the next call, and its threads resume (existing `follow` behavior). If the pool cannot open a thread at all, `review.sh --pool` exits `error`, and the unit director runs today's fresh path, as <DelegateLaunchFailure/> already directs. This applies on failure, not on load. |
 | Sandbox reads of every worktree | Codex `readOnly` reads the whole filesystem, so it needs no grant per worktree. It also cannot stop a reviewer reading a sibling unit's tree. All trees are the user's own, so this is a correctness risk, not a privacy one. The prompt names the worktree and head hash. The reviewer's first command is `git -C <worktree> rev-parse HEAD`, and a mismatch reports `error`. |
-| Writer independence | An improvement on own-seat review, where a writer can review its own code: a pool reviewer never wrote what it reads. |
+| Writer independence | An improvement on own-worker review, where a writer can review its own code: a pool reviewer never wrote what it reads. |
 | UI reviewer on Codex | Today's design check runs on a Claude helper. Phase D runs the Codex UI reviewer in shadow first and adopts it only if it misses nothing the Claude helper found. |
 
 ## Trial design
@@ -364,7 +364,7 @@ Also drop `--ephemeral` for reviews, so the baseline starts collecting rollouts.
 **Phase B — code pool on build-followups.** `review_pool.py`, the mesh verbs,
 `review.sh --pool code`, the `direct.md` and `dual_review.md` text. Trial
 assignment: `allocate` sends a phase's reviews to the pool or to the unit's own
-seats (`--to`) by a hash of unit and phase. That gives an even mix in
+workers (`--to`) by a hash of unit and phase. That gives an even mix in
 the same window. This is an assignment for comparison, not a fallback.
 
 **Phase C — review unit director, memory, Hana.** `/review:direct`, memory
@@ -378,7 +378,7 @@ but not used. Adopt when it found every defect the helper found.
 **Measuring tokens per review.** `seat_usage.py --reviews --since <date>` reads
 every `review_turn_*.json` under `/tmp/claude/delegate/` on natedev and the
 Mac. It sums the rollout's token counts for that turn id, and prints weighted
-tokens per review by arm (fresh, own seat, pool) and kind (broad lens, closure,
+tokens per review by arm (fresh, own worker, pool) and kind (broad lens, closure,
 ux):
 - median and mean;
 - the share from cached input, which shows standing-context cost directly;
@@ -404,16 +404,16 @@ against two measures:
   turn record);
 - the reviewer's review count.
 
-It does the same for the own-seat and fresh arms over the same window.
+It does the same for the own-worker and fresh arms over the same window.
 
 **Verdict, after 60 pool reviews or 3 weeks, whichever is later:**
 - **Keep the pool** when its weighted tokens per review are at most 85% of the
-  own-seat arm's, and its escapes per phase are no higher.
+  own-worker arm's, and its escapes per phase are no higher.
 - **Keep the memory** when precision or escapes improve with memory version
   (a falling trend across at least four memory versions). Otherwise cut memory
   to the guides and contracts alone. It then costs fewer prefix tokens and buys
   no measured quality.
-- **Remove the pool** when it misses the 85% line. Own-seat reviews
+- **Remove the pool** when it misses the 85% line. Own-worker reviews
   stay. The user decides with the report in hand.
 
 The likely sources of a saving, to check against the report:
@@ -422,7 +422,7 @@ The likely sources of a saving, to check against the report:
 - a closure on a warm lease reads less code. Closures are two thirds of reviews.
 
 The likely loss: a pool reviewer is cold on the unit's code, where an own
-seat is warm. The trial exists to find which effect is larger.
+worker is warm. The trial exists to find which effect is larger.
 
 ## What the showrunner and directors said
 
@@ -436,7 +436,7 @@ and attributed by session name.
   classes, per-crate idioms". Forget "each diff, each unit's plan, earlier
   verdicts on a file", and compact between reviews. Worried because
   "checkpoints bunch up after build holds"; wanted a wait limit with a fallback
-  to the unit's own seat, and no single pool that can block everyone. UX: a
+  to the unit's own worker, and no single pool that can block everyone. UX: a
   fresh helper per checkpoint; a long-lived UI reviewer "may keep the UX rule
   list, but reads each shot fresh".
 - **organon** (geometry-material-unit): hand over "base and tip, Work Order
@@ -444,7 +444,7 @@ and attributed by session name.
   "with the reviewer's id". Keep "Hana's codebase map, the unit's standing
   rules (never-edit files, ownership, the 9 px floor)" with the style guide and
   type contract. Forget "earlier verdicts on its code, and other units' diffs".
-  Fall back to its own seat after about 10 minutes. UX: fresh at each
+  Fall back to its own worker after about 10 minutes. UX: fresh at each
   checkpoint.
 - **widget** (widget-unit): send "base..HEAD plus uncommitted paths", the plan
   heading, the lens and the session dir. Get back "findings.py-ready JSON
@@ -457,7 +457,7 @@ and attributed by session name.
   unit writes trunk's history, "or sends two lines for trunk to record". Keep
   "crate layout, style and type rulings already made, recurring defect
   classes". Closure reviews "must come first, never behind another unit's
-  broad review". Opens its own seat after about 10 minutes of waiting. UX: "a
+  broad review". Opens its own worker after about 10 minutes of waiting. UX: "a
   fresh verdict on exactly the shots in the notice". A long-lived UI reviewer
   "may hold the guide for repair rounds".
 
@@ -471,14 +471,14 @@ and attributed by session name.
 - What to keep became the review memory, and what to forget is removed by the
   lease revert (all four).
 - Widget's "warm on another unit is cold on this one" is the reason leases are
-  per unit and the trial compares against warm own seats.
+  per unit and the trial compares against warm own workers.
 - UX verdicts are given from a reverted UI reviewer, which is the fresh eye the
   four asked for. The rule list and rulings persist, as the user asked.
 
 ## Tests
 
 - `scripts/delegate/test_review_pool.py` (61 tests) runs the pool CLI as subprocesses against a stub mesh named by `REVIEW_POOL_MESH`: primes and old-hash retirement, the arm split, allocation, name issue, `--fresh`, `release --thread-id`, `end-lease`, `health`, dead reservations, `stop` and its recovery, a stop that lands during a prime, fork or reset, `unit-memory` and the adoption marker. `UIStandingPromptTests` pins `ui.md`'s verdict line, its table header and `measure_text.py`, and the absence of the old instructions to follow `ux_eval.md` and read a rule's full text.
-- `scripts/delegate/test_review_launcher.py` (55 tests) covers `review.sh`: the pool path, unit memory, the slot file, turn records of both arms and all four statuses, signals, a replaced thread, the tree check, the argument refusals, shots for `ui`, the `ux` row count, no pass for lens `ux`, and the seated and fresh paths.
+- `scripts/delegate/test_review_launcher.py` (55 tests) covers `review.sh`: the pool path, unit memory, the slot file, turn records of both arms and all four statuses, signals, a replaced thread, the tree check, the argument refusals, shots for `ui`, the `ux` row count, no pass for lens `ux`, and the assigned and fresh paths.
 - `scripts/delegate/test_review_pool_report.py` (80 tests) runs the report as subprocesses. `populate_usage_store` collects fixture rollouts into a fixture store, and `USAGE_STATE_DIR` points the script at it. It covers request attribution, every incomplete reason, compaction counts, outcome lines, the quality table with merge holds and mixed phases, each merge-hold match case and the `merge holds unmatched` warning, plan normalization, Mac rows and histories, the final line on both sides of 20, an absent and an unreadable store, the Mac source warning, and `--shadow` with its `Machine:` line. These tests call the collector's `SCHEMA`, `migrate_store`, `read_file`, `save_measurement` and `RoleResolver`; a rename in `scripts/usage/collect.py` breaks them. The fixtures prefix the collector's request key with the file path.
 - `scripts/agents/test_codex_mesh.py`, with a fake app-server, covers `prime`, `fork` and `reset`, the three `follow` flags, and standing instructions restored on resume, fork, compact, reset and a replaced thread.
 - `scripts/production/test_add_unit.py` covers the review unit's opening message: `/review:direct` with a pool line, `/unit:direct` without one.

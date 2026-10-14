@@ -175,8 +175,8 @@ def _session_lines(session: Session) -> list[str]:
     lines = [summary]
     for server in session["codex_servers"]:
         activity = (
-            "busy: " + ", ".join(server["busy_seats"])
-            if server["busy_seats"]
+            "busy: " + ", ".join(server["busy_workers"])
+            if server["busy_workers"]
             else "idle"
         )
         lines.append(f"    Codex {server['run_dir']} · pid {server['pid']} · {activity}")

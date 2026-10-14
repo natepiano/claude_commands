@@ -32,7 +32,7 @@ CALL_ID = "natedev-20261002T120000-abcdef"
 SWEEP = ["/home/u/.claude/scripts/lib/py", "/home/u/.claude/scripts/lint/sweep.py"]
 NEXTEST = ["cargo", "nextest", "run", "--workspace", "--retries", "2"]
 # What the ambient session would otherwise stamp on every record: the caller,
-# the delegate seat, the session and the call id all come from these.
+# the delegate worker, the session and the call id all come from these.
 AMBIENT = (
     "BUILDLOG_CALLER",
     "BUILDLOG_CALL_ID",
@@ -656,7 +656,7 @@ class RecordTests(unittest.TestCase):
             "cwd": str(self.repo),
             "repo_path": str(self.repo),
             "branch": "main",
-            "seat": "impl2",
+            "worker": "impl2",
             "delegate_session": "run-7",
             "session": "session-1",
             "backfilled": False,

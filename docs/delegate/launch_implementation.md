@@ -18,47 +18,47 @@ completes.
    phased plan; pass the original prompt only. Both run before the dispatch in
    step 4, never after it.
 3. `~/.claude/config/agents.conf` owns delegate family/model/effort, one row
-   per kind. On a seat's first phase, its kind is its opening role from the Work
-   Order's `Seats:` field: `impl` for the `impl` slot, and for `test` whatever
-   its Seats line opens it as — `test` under the default opening. On later
-   phases, task and kind name the role assigned by that phase's Seats field.
+   per kind. On a worker's first phase, its kind is its opening role from the Work
+   Order's `Workers:` field: `impl` for the `impl` slot, and for `test` whatever
+   its Workers line opens it as — `test` under the default opening. On later
+   phases, task and kind name the role assigned by that phase's Workers field.
    State the assignment in the dispatch update in ordinary words: "opening 2
    writers: …" on the first phase, "continuing 2 writers: …" later.
-4. Take the partition and the opening from Seats and write one prompt per slot
+4. Take the partition and the opening from Workers and write one prompt per slot
    under <WritePromptContract/>: `${SESSION_DIR}/implementation_prompt.md` for
    `impl` and `test_prompt.md` for `test`. Only when the field is absent, partition per <TeamFilePartition/>
    yourself and say so in the dispatch update. Opening and follow-up prompts
    both carry the inline Three Gods sentence and the Type Design Contract or
    its allowed pointer.
-5. Apply <LongLivedSeats/>. For Codex, run
+5. Apply <LongLivedWorkers/>. For Codex, run
    `python3 ~/.claude/scripts/agents/codex_mesh.py list --session-dir
    "${SESSION_DIR}"`. Launch both in one message, `impl` first, each under
-   <ToolingContract/>. When the slot has an open seat, pass its full roster name
+   <ToolingContract/>. When the slot has an open worker, pass its full roster name
    with `--to`; the phase prompt is its follow-up message. Omit `--to` only for
    a slot with no reusable thread; the first use and any replacement after an
    end, overflow failure, or retirement therefore receive an opening prompt
    without `--to`. Later phases normally run:
 
    ```sh
-   implement.sh --to "<full impl seat name>" \
+   implement.sh --to "<full impl worker name>" \
      "${SESSION_DIR}" "${WORKING_DIR}" \
      "${SESSION_DIR}/implementation_prompt.md" impl \
      "<responsibility>" impl "<activity>" 0 impl
-   implement.sh --to "<full test seat name>" \
+   implement.sh --to "<full test worker name>" \
      "${SESSION_DIR}" "${WORKING_DIR}" \
      "${SESSION_DIR}/test_prompt.md" test \
      "<responsibility>" test "<activity>" 0 test
    ```
 
-   A seat assigned another role swaps both role words and nothing else — the
-   open `test` seat continuing as a writer is
-   `implement.sh --to "<full test seat name>" "${SESSION_DIR}" "${WORKING_DIR}" "${SESSION_DIR}/test_prompt.md" impl "<responsibility>" impl "<activity>" 0 test`.
-   Responsibility follows <ProgressContract/>. **Both seats carry a pass
+   A worker assigned another role swaps both role words and nothing else — the
+   open `test` worker continuing as a writer is
+   `implement.sh --to "<full test worker name>" "${SESSION_DIR}" "${WORKING_DIR}" "${SESSION_DIR}/test_prompt.md" impl "<responsibility>" impl "<activity>" 0 test`.
+   Responsibility follows <ProgressContract/>. **Both workers carry a pass
    kind**, so a team phase records two passes and stops being attributed to one
-   agent. The kind is the work the seat was assigned and nothing more — it names,
-   it never triggers, so a seat never misreports its work to avoid a side effect.
-   **Task and kind are the same word** on every seat: the fourth argument selects
-   the agent and the sixth records the pass, and both say what this seat is
+   agent. The kind is the work the worker was assigned and nothing more — it names,
+   it never triggers, so a worker never misreports its work to avoid a side effect.
+   **Task and kind are the same word** on every worker: the fourth argument selects
+   the agent and the sixth records the pass, and both say what this worker is
    doing. The vocabulary is `impl`, `test`, `fix`, `review` — nothing else
    resolves, in `agents.conf` or in the ledger.
 6. Announce prompt, board, and heartbeat paths, set `EARLY_REVIEW=none`, then
@@ -67,7 +67,7 @@ completes.
    done only when both are terminal. `implemented` on `impl` loads
    `impl_summary_impl.txt` into `${IMPL_SUMMARY}`; read `impl_summary_test.txt`
    for what it completed and for findings it posted. If `impl` errors, apply <DelegateLaunchFailure/>
-   first — a seat that died in seconds is resolved there, not reported. A
+   first — a worker that died in seconds is resolved there, not reported. A
    genuine error then cancels any early-launched
    reviewer per <EarlyReviewArm/>, applies <RetainDelegatedPhaseReservation/>,
    reports `impl_agent_impl.log`, records

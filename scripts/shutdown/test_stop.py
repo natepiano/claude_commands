@@ -168,13 +168,13 @@ def unit(
     )
 
 
-def seat(
+def worker_session(
     session_id: str,
     pid: int,
     *,
     owner: str | None,
 ) -> inventory.SeatSession:
-    seat_owner: inventory.SeatOwner = (
+    worker_owner: inventory.WorkerOwner = (
         inventory.DirectorOwner(kind="director", session_id=owner)
         if owner is not None
         else inventory.NoDirector(kind="no director")
@@ -183,15 +183,15 @@ def seat(
         **common_session(session_id, session_id, pid),
         kind="seat",
         host=inventory.UnknownHost(kind="unknown"),
-        owner=seat_owner,
+        owner=worker_owner,
     )
 
 
 def server(
-    run_dir: str, pid: int, *, busy_seats: list[str] | None = None
+    run_dir: str, pid: int, *, busy_workers: list[str] | None = None
 ) -> inventory.CodexServer:
     return inventory.CodexServer(
-        run_dir=run_dir, pid=pid, busy_seats=list(busy_seats or [])
+        run_dir=run_dir, pid=pid, busy_workers=list(busy_workers or [])
     )
 
 
@@ -396,18 +396,18 @@ class StopTests(ShutdownTestCase):
         self.assertEqual(finished["progress"]["kind"], "stopped")
         self.assertEqual(finished["force"], "wait for ready")
 
-    def test_usage_limit_held_owner_with_busy_seat_keeps_held_progress_in_issue(self) -> None:
+    def test_usage_limit_held_owner_with_busy_worker_keeps_held_progress_in_issue(self) -> None:
         saved = entry(top_level("owner", 101))
         saved["progress"] = record.SessionHeldByUsageLimit(kind="held by usage limit", at=NOW)
-        worker = seat("worker", 102, owner="owner")
+        worker = worker_session("worker", 102, owner="owner")
         worker["status"] = "busy"
         saved["seats"] = [worker]
         self.create([saved])
         finished = stop.stop_session(saved,
-            kill=lambda _pid, _sent: self.fail("busy seat owner received a signal"),
+            kill=lambda _pid, _sent: self.fail("busy worker owner received a signal"),
             fresh_inventory=lambda _login, _only: machine_inventory([saved["session"], worker]),
-            clock=lambda: NOW_UTC, codex_mesh=lambda _args: self.fail("busy seat was ended"),
-            tmux=lambda _args: self.fail("busy seat host was stopped"))
+            clock=lambda: NOW_UTC, codex_mesh=lambda _args: self.fail("busy worker was ended"),
+            tmux=lambda _args: self.fail("busy worker host was stopped"))
         self.assertEqual(finished["progress"]["kind"], "stop failed")
         self.assertEqual(finished["stop_issues"], [record.NotReadyToStop(kind="not ready to stop",
             at=NOW, status="idle", progress="held by usage limit")])
@@ -441,10 +441,10 @@ class StopTests(ShutdownTestCase):
         self.assertEqual(finished['stop_issues'], [])
         self.assertEqual(finished['progress'], saved['progress'])
 
-    def test_fresh_session_reports_owned_seats_and_preserves_the_recorded_identity(self) -> None:
+    def test_fresh_session_reports_owned_workers_and_preserves_the_recorded_identity(self) -> None:
         owner = top_level('owner', 101)
-        worker = seat('worker', 102, owner='owner')
-        unrelated = seat('other', 103, owner='elsewhere')
+        worker = worker_session('worker', 102, owner='owner')
+        unrelated = worker_session('other', 103, owner='elsewhere')
         observed = stop.fresh_session(owner, machine_inventory([owner, worker, unrelated]))
         self.assertEqual(observed, {'kind': 'matching session', 'session': owner, 'seats': [worker]})
         changed = copy.deepcopy(owner)
@@ -452,9 +452,9 @@ class StopTests(ShutdownTestCase):
         self.assertEqual(stop.fresh_session(owner, machine_inventory([changed])), {'kind': 'session identity lost'})
         self.assertEqual(owner['pid'], 101)
 
-    def test_busy_seat_holds_its_owner_until_it_is_idle_and_is_never_signalled(self) -> None:
+    def test_busy_worker_holds_its_owner_until_it_is_idle_and_is_never_signalled(self) -> None:
         saved = entry(top_level('owner', 101))
-        worker = seat('worker', 102, owner='owner')
+        worker = worker_session('worker', 102, owner='owner')
         worker['status'] = 'busy'
         saved['seats'] = [worker]
         self.create([saved])
@@ -524,9 +524,9 @@ class StopTests(ShutdownTestCase):
         self.assertEqual(report['stop_issues'], [record.AccountUnreadableAtStop(kind='account unreadable', at=NOW)])
         self.assertNotEqual(report['progress']['kind'], 'stopping')
 
-    def test_now_ends_busy_codex_seats_before_stopping_their_owner(self) -> None:
+    def test_now_ends_busy_codex_workers_before_stopping_their_owner(self) -> None:
         run_dir = str(self.root / 'run')
-        owned_server = server(run_dir, 900, busy_seats=['impl', 'test'])
+        owned_server = server(run_dir, 900, busy_workers=['impl', 'test'])
         stored = top_level('busy', 101, status='busy', run_dirs=[run_dir], codex_servers=[owned_server])
         self.create(records_for_test([entry(stored)], force='now'))
         events: list[str] = []
@@ -1217,9 +1217,9 @@ class StopTests(ShutdownTestCase):
         self.assertEqual(signals, [signal.SIGTERM])
         self.assertEqual(finished["progress"], replacement)
 
-    def test_stop_rechecks_ownership_between_forced_codex_seats(self) -> None:
+    def test_stop_rechecks_ownership_between_forced_codex_workers(self) -> None:
         run = str(self.root / "run")
-        saved = entry(unit("owner", 101, codex_servers=[server(run, 900, busy_seats=["one", "two"])]))
+        saved = entry(unit("owner", 101, codex_servers=[server(run, 900, busy_workers=["one", "two"])]))
         saved["force"] = "now"
         self.create([saved])
         replacement = record.SessionRestarting(kind="restarting", at=NOW, prior=record.SessionStopped(kind="stopped", at=NOW))
