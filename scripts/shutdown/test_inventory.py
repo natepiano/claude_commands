@@ -348,8 +348,8 @@ class InventoryTests(ShutdownTestCase):
         self.addCleanup(self.live_socket.close)
         self.write_account(self.target_config, TARGET_LOGIN)
         self.write_account(self.other_config, OTHER_LOGIN)
-        _ = (self.notes / "claude 2.md").write_text(
-            f"---\nlogin: {TARGET_LOGIN.upper()}\nstate: active\n---\n",
+        _ = (self.notes / "claude2.md").write_text(
+            f"---\nlogin: {TARGET_LOGIN.upper()}\nsessions: 1\n---\n",
             encoding="utf-8",
         )
         config_by_pid: dict[int, Path | None] = {

@@ -197,9 +197,9 @@ caller_path = sys.path.copy()
 command = ModuleType("fixture_command")
 command.__file__ = "fixture_command.py"
 def paths(home):
-    import dailies_render, showrunners
+    import dailies_render, showrunners, note_file
     assert dailies_render.CHART_CONF == home / ".local/state/showrunner/dailies.conf"
-    assert dailies_render.AGENTS_DIR == home / "rust/hanadocs/agents"
+    assert note_file.notes_dir() == home / "rust/hanadocs/agents"
     assert dailies_render.READINGS_LOG == home / ".local/state/agent-notes/readings.jsonl"
     assert showrunners.NOTIFIER_STATE_DIR == home / ".local/state/notifier"
     assert showrunners.SESSIONS_DIR == home / ".claude/sessions"

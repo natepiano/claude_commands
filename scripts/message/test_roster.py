@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import base64
 import io
 import json
 import os
@@ -15,7 +16,7 @@ import unittest
 from contextlib import AbstractContextManager, redirect_stderr, redirect_stdout
 from dataclasses import FrozenInstanceError, replace
 from pathlib import Path
-from typing import cast, override
+from typing import TYPE_CHECKING, cast, override
 from unittest import mock
 
 SCRIPTS = Path(__file__).parents[1]
@@ -31,6 +32,10 @@ from fake_herdr import CommandResponse
 import sessions
 import showrunners
 import unit_lookup
+if TYPE_CHECKING:
+    from ..whoami import account
+else:
+    account = roster.account
 
 
 ENTRY_FIELDS = {
@@ -56,6 +61,8 @@ class RosterTests(unittest.TestCase):
 
     @override
     def setUp(self) -> None:
+        # Fixture processes run as this test's own pid: never read the real account it runs on.
+        _ = self.enterContext(mock.patch.object(account, "process_config_dir", return_value=None))
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
         self.home = self.root / "home"
         self.sessions = self.root / "sessions"
@@ -402,6 +409,7 @@ class RosterTests(unittest.TestCase):
             director=roster.NoDirector(),
             assignment=roster.NotAWorker(),
             session=roster.ClaudeSession("sid-runner"),
+            account=roster.AccountUnread("process account could not be read"),
         ))
         self.assertEqual(entries["director"], roster.RosterEntry(
             machine=machine, kind="claude", role="unit director", name="director",
@@ -413,6 +421,7 @@ class RosterTests(unittest.TestCase):
             director=roster.DirectsUnit("unit-one"),
             assignment=roster.NotAWorker(),
             session=roster.ClaudeSession("sid-director"),
+            account=roster.AccountUnread("process account could not be read"),
         ))
         self.assertEqual(entries["claude-worker"].role, "worker")
         self.assertEqual(entries["claude-worker"].director, roster.UnderDirector(
@@ -1063,6 +1072,7 @@ class RosterTests(unittest.TestCase):
         self.assertEqual(director.reach, roster.CannotReceiveMessages("no messaging socket"))
 
     def test_interactive_codex_panes_are_appended_without_messaging_addresses(self) -> None:
+        old, current = self.account_note(1), self.account_note(2)
         responses = self._herdr_sessions()
         responses["--session native agent list"]["stdout"] = json.dumps({"ok": True, "result": {"agents": [
             {"pane_id": "w1:p1", "agent": "codex", "agent_status": "working"},
@@ -1072,15 +1082,25 @@ class RosterTests(unittest.TestCase):
         ]}})
         self._herdr_process(991000, 0, ["herdr", "--session", "native", "server"])
         self._herdr_process(991001, 991000, ["codex"], HERDR_PANE_ID="w1:p1")
+        self._herdr_process(991002, 991000, ["zsh"], HERDR_PANE_ID="w1:p1")
+        self._herdr_process(991003, 991000, ["zsh"], HERDR_PANE_ID="w1:p3")
+        def process_home(pid: int) -> account.ProcessCodexHome:
+            return account.ProcessCodexHome(old if pid == 991001 else current)
         binary = self._herdr_fixture(responses)
-        with mock.patch.object(herdr, "herdr_binary", return_value=binary):
+        with mock.patch.object(herdr, "herdr_binary", return_value=binary), \
+             mock.patch.object(account, "process_codex_home", side_effect=process_home) as read_home:
             entries = self._entries()
         pane = entries["herdr native:w1:p1"]
         self.assertEqual((pane.kind, pane.role, pane.status, pane.cwd), ("codex", "freestanding", "working", str(self.home)))
         self.assertEqual(pane.reach, roster.CannotReceiveMessages("interactive Codex in a herdr pane"))
         self.assertEqual((pane.showrunner, pane.director, pane.assignment),
                          (roster.NoShowrunner(), roster.NoDirector(), roster.NotAWorker()))
-        self.assertEqual(entries["herdr native:w1:p3"].cwd, "")
+        self.assertEqual(pane.account, roster.AccountLabel("codex 1"))
+        self.assertIsInstance(entries["herdr native:w1:p3"].account, roster.AccountUnread)
+        self.assertIn(mock.call(991001), read_home.call_args_list)
+        self.assertNotIn(mock.call(991002), read_home.call_args_list)
+        self.assertNotIn(mock.call(991003), read_home.call_args_list)
+        self.assertEqual(entries["herdr native:w1:p3"].cwd, str(self.home))
         self.assertNotIn("herdr native:w1:p2", entries)
 
     def test_a_herdr_failure_is_a_problem_and_keeps_the_other_roster_rows(self) -> None:
@@ -1192,6 +1212,96 @@ class RosterTests(unittest.TestCase):
     def peer_snapshot(self, result: roster.Roster, *, status: int = 0) -> None:
         os.environ["SSH_SNAPSHOT"] = roster.RosterSnapshot(result).encode()
         os.environ["SSH_STATUS"] = str(status)
+
+    def account_note(self, number: int, *, tool: str = "codex") -> Path:
+        notes = self.root / "agents"
+        notes.mkdir(exist_ok=True)
+        os.environ["AGENT_NOTES_DIR"] = str(notes)
+        self.environment["AGENT_NOTES_DIR"] = str(notes)
+        login = f"{tool}{number}@example.invalid"
+        _ = (notes / f"{tool}{number}.md").write_text(f"---\nlogin: {login}\n---\n")
+        home = self.home / (f".codex{number}" if tool == "codex" and number != 2 else ".codex" if tool == "codex" else f".claude{number}")
+        home.mkdir(exist_ok=True)
+        if tool == "codex":
+            claims = base64.urlsafe_b64encode(json.dumps({"email": login}).encode()).decode().rstrip("=")
+            _ = (home / "auth.json").write_text(json.dumps({"tokens": {"id_token": f"header.{claims}.signature"}}))
+        else:
+            _ = (home / ".claude.json").write_text(json.dumps({"oauthAccount": {"emailAddress": login}}))
+        return home
+
+    def test_claude_roster_account_comes_from_its_process_configuration(self) -> None:
+        directory = self.account_note(3, tool="claude")
+        with mock.patch.object(account, "process_config_dir", return_value=directory):
+            entry = self._entries()["runner"]
+        self.assertEqual(entry.account, roster.AccountLabel("claude 3"))
+
+    def test_working_workers_keep_their_serving_server_account_across_a_swap(self) -> None:
+        old, current = self.account_note(1), self.account_note(2)
+        _ = (self.director_run / "mesh_server.json").write_text(json.dumps({
+            "port": 45678, "pid": os.getpid(), "codex_home": str(current),
+        }))
+        _ = (self.director_run / "mesh_retired.json").write_text(json.dumps({"servers": [{
+            "port": 45677, "pid": os.getpid(), "codex_home": str(old),
+        }]}))
+        _ = (self.director_run / "mesh_roster.json").write_text(json.dumps({
+            "old-impl": {"thread_id": "old-thread", "status": "running", "port": 45677, "launcher_pid": os.getpid()},
+            "new-test": {"thread_id": "new-thread", "status": "running", "port": 45678, "launcher_pid": os.getpid()},
+            "between-turns": {"thread_id": "waiting-thread", "status": "done", "launcher_pid": os.getpid()},
+            "missing-server": {"thread_id": "lost-thread", "status": "running", "port": 49999, "launcher_pid": os.getpid()},
+        }))
+        entries = self._entries()
+        self.assertEqual(entries["old-impl"].account, roster.AccountLabel("codex 1"))
+        self.assertEqual(entries["new-test"].account, roster.AccountLabel("codex 2"))
+        self.assertEqual(entries["between-turns"].account, roster.AccountLabel("codex 2"))
+        self.assertIsInstance(entries["missing-server"].account, roster.AccountUnread)
+        _ = (self.director_run / "mesh_server.json").write_text(json.dumps({"port": 45678, "pid": os.getpid()}))
+        entries = self._entries()
+        self.assertIsInstance(entries["new-test"].account, roster.AccountUnread)
+        self.assertIsInstance(entries["between-turns"].account, roster.AccountUnread)
+        self.assertEqual(entries["old-impl"].account, roster.AccountLabel("codex 1"))
+
+    def test_daemon_rows_use_the_home_holding_the_socket(self) -> None:
+        home = self.account_note(1)
+        _ = self.account_note(2)
+        with mock.patch.object(codex_daemon, "daemon_socket", return_value=home / "app-server-control" / "daemon.sock"):
+            entry = self._entries()["Codex window"]
+        self.assertEqual(entry.account, roster.AccountLabel("codex 1"))
+
+    def test_reviewers_require_a_readable_environment_before_using_the_default_home(self) -> None:
+        _ = self.account_note(1)
+        _ = self.account_note(2)
+        with mock.patch.object(account, "process_codex_home", return_value=account.ProcessWithoutCodexHome()):
+            entries = self._entries()
+        self.assertEqual(entries["adversary reviewer"].account, roster.AccountLabel("codex 2"))
+        with mock.patch.object(process_table, "snapshot", return_value={}):
+            missing = self._entries()
+        self.assertIsInstance(missing["blind reviewer"].account, roster.AccountUnread)
+        with mock.patch.object(account, "process_codex_home", return_value=account.ProcessEnvironmentUnread("access denied")):
+            entries = self._entries()
+        self.assertIsInstance(entries["adversary reviewer"].account, roster.AccountUnread)
+        assert isinstance(entries["adversary reviewer"].account, roster.AccountUnread)
+        self.assertIn("access denied", entries["adversary reviewer"].account.reason)
+
+    def test_snapshot_without_account_decodes_as_peer_attribution_unavailable(self) -> None:
+        row = replace(self._entry("Mac director", "unit director", "session:mac-id"),
+                      machine="mac", account=roster.AccountLabel("claude 3"))
+        encoded = roster.RosterSnapshot(roster.Roster([row], [])).encode()
+        self.assertEqual(roster.RosterSnapshot.decode(encoded).result.entries[0].account,
+                         roster.AccountLabel("claude 3"))
+        old = cast(dict[str, object], json.loads(encoded))
+        entries = cast(list[dict[str, object]], old["entries"])
+        del entries[0]["account"]
+        decoded = roster.RosterSnapshot.decode(json.dumps(old)).result.entries[0]
+        self.assertEqual(decoded.name, "Mac director")
+        self.assertIsInstance(decoded.account, roster.AccountAttributionUnavailable)
+
+    def test_peer_snapshot_timeout_keeps_the_machine_and_failure_reason(self) -> None:
+        with mock.patch.object(subprocess, "run", side_effect=subprocess.TimeoutExpired("ssh", 20)):
+            peer = roster.peer_snapshot(os.environ)
+        self.assertIsInstance(peer, roster.PeerNotReached)
+        assert isinstance(peer, roster.PeerNotReached)
+        self.assertTrue(peer.host)
+        self.assertIn("timed out", peer.reason)
 
     def test_here_reads_only_this_machine_without_ssh(self) -> None:
         result, lines, errors = self._run_main("--json")
