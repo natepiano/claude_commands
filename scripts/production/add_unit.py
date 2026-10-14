@@ -809,16 +809,21 @@ def launched_unit(request: UnitLaunch | RequestedUnitLaunch) -> MarkedUnitFound 
 
 
 def wait_for_remote_control(request: UnitLaunch, tmux: str) -> unit_lookup.MarkedUnit:
+    from session_pane import HerdrFailure, read_place
+
+    # Keep the launch caller's argument; the pane library now resolves the host.
+    del tmux
     found = launched_unit(request)
     if isinstance(found, NoMarkedUnit):
-        raise RuntimeError(f"{request.identity.unit}: no tmux session carries its mark")
+        raise RuntimeError(f"{request.identity.unit}: no session carries its mark")
     launched = found.unit
     deadline = time.monotonic() + request.timeout
     pane = ""
     while True:
-        result = subprocess.run([tmux, "capture-pane", "-p", "-t", launched.pane],
-                                text=True, capture_output=True, check=False)
-        pane = result.stdout if result.returncode == 0 else result.stderr
+        try:
+            pane = read_place(launched.place)
+        except (OSError, HerdrFailure) as error:
+            pane = str(error)
         if "/remote-control is active" in pane:
             return launched
         remaining = deadline - time.monotonic()
@@ -1003,16 +1008,24 @@ def main(argv: list[str]) -> int:
                 unit = marked_unit.unit
                 if isinstance(unit.claude, unit_lookup.ClaudeUnknown):
                     raise Refusal(
-                        f"cannot tell whether Claude runs in tmux session {unit.label}: "
+                        f"cannot tell whether Claude runs in session {unit.label}: "
                         + unit.claude.reason
                     )
                 if isinstance(unit.claude, unit_lookup.ClaudeNotRunning):
-                    _ = subprocess.run(
-                        [tmux, "kill-session", "-t", unit.pane],
-                        capture_output=True,
-                        text=True,
-                        check=True,
-                    )
+                    if isinstance(unit.place, unit_lookup.TmuxPlace):
+                        _ = subprocess.run(
+                            [tmux, "kill-session", "-t", unit.place.pane],
+                            capture_output=True,
+                            text=True,
+                            check=True,
+                        )
+                    else:
+                        import herdr
+
+                        try:
+                            herdr.stop_session(unit.label)
+                        except herdr.HerdrFailure as error:
+                            raise Refusal(f"cannot end session {unit.label}: {error}") from error
                     marked_unit = NoMarkedUnit()
             tmux_session = (
                 request.launch_kind.tmux_session

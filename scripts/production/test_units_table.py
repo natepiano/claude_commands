@@ -23,7 +23,7 @@ import progress_history
 def unit(name: str, claude: unit_lookup.Claude | None) -> live_units.LiveUnit:
     if claude is None:
         return live_units.LiveUnit(name, None)
-    return live_units.LiveUnit(name, unit_lookup.MarkedUnit(name, "%1", f"label-of-{name}", claude))
+    return live_units.LiveUnit(name, unit_lookup.MarkedUnit(name, f"label-of-{name}", claude, unit_lookup.TmuxPlace("%1")))
 
 
 def live(name: str) -> unit_lookup.LiveClaude:
