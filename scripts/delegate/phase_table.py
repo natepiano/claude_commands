@@ -1018,6 +1018,9 @@ def _heading_text(record: PhaseRecord) -> str:
     if isinstance(current, NoOpenPhase):
         done = sum(isinstance(row, DonePhase) for row in record.phases)
         return f"No phase running — {done} of {len(record.phases)} done"
+    if not any(row is current for row in record.phases):
+        # A phase from another plan has no place in this plan's count.
+        return f"Phase {current.phase} — {current.title} · not in this plan"
     return f"Phase {current.phase} of {len(record.phases)} — {current.title}"
 
 
