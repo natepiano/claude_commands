@@ -146,6 +146,7 @@ from typing import TYPE_CHECKING, Literal, TypeGuard, TypedDict, cast
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
 from user_zone import user_zone  # noqa: E402
 if TYPE_CHECKING:
+    from ..notify.push_texts import RenderedPush
     from ..notify import review
 
 GIB = 1 << 30
@@ -1099,7 +1100,27 @@ def floor_out_of_reach_text(now: float, removed: int, free: int, floor: int,
     return message
 
 
-def send_floor_alert(message: str, channels: FloorAlertChannels) -> bool:
+@dataclass(frozen=True)
+class NoPhoneAlert:
+    """This cleanup report goes only to the machine's session."""
+
+
+NO_PHONE_ALERT = NoPhoneAlert()
+
+
+def disk_floor_push(removed: int, free: int, floor: int) -> RenderedPush:
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "notify"))
+    if TYPE_CHECKING:
+        from ..notify.push_texts import render
+    else:
+        from push_texts import render
+
+    return render("sweep.disk_floor", removed=gib(removed), free=gib(free), floor=gib(floor),
+                  shortfall=gib(max(0, floor - free)))
+
+
+def send_floor_alert(message: str, channels: FloorAlertChannels, *,
+                     phone: RenderedPush | NoPhoneAlert = NO_PHONE_ALERT) -> bool:
     scripts = Path(__file__).resolve().parents[1]
     if not TYPE_CHECKING:
         # Imported here, so modules that only read sweep's config never load the reviewer.
@@ -1109,13 +1130,16 @@ def send_floor_alert(message: str, channels: FloorAlertChannels) -> bool:
         ("message", [sys.executable, str(scripts / "message/send.py"), "--to", "natedev", "--from", "disk_floor", "--timeout", "30"]),
     ]
     if channels is FloorAlertChannels.NATEDEV_AND_PHONE:
-        commands.append(("phone", [
-            sys.executable, str(scripts / "message/send.py"),
-            "--to", "user", "--from", "sweep", "--need", "note",
-            "--action", (message.splitlines()[1] if len(message.splitlines()) > 1 else
-                         "In a terminal on natedev, free disk space outside build caches.") + " Builds need this space to run.",
-            "--summary", "Builds need more disk space", "--text", (message.splitlines() or [""])[0],
-        ]))
+        if TYPE_CHECKING:
+            from ..notify.push_texts import RenderedPush, user_send_argv
+        else:
+            from push_texts import RenderedPush, user_send_argv
+
+        if not isinstance(phone, RenderedPush):
+            raise ValueError("phone channel requires a rendered disk alert")
+        command = user_send_argv(phone)
+        command[1] = str(scripts / "message/send.py")
+        commands.append(("phone", command))
     delivered = False
     for channel, command in commands:
         try:
@@ -1218,7 +1242,8 @@ def hold_floor(
             if left > budget and after_free < floor and push_due:
                 message = floor_out_of_reach_text(now, removed, after_free, floor, len(busy),
                                                    held_bytes, ci_bytes, read_disk_measurement(), failures)
-                if send_floor_alert(message, FloorAlertChannels.NATEDEV_AND_PHONE):
+                if send_floor_alert(message, FloorAlertChannels.NATEDEV_AND_PHONE,
+                                    phone=disk_floor_push(removed, after_free, floor)):
                     push_history = DeliveredAlert(time.time())
             elif removed > 0 and (isinstance(history, NoDeliveredAlert) or now - history.at >= ALERT_INTERVAL_SECONDS):
                 free_fall = previous.free_bytes - free if isinstance(previous, FloorRecord) else 0

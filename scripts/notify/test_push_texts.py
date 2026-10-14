@@ -1,0 +1,193 @@
+"""Approval and delivery-path gates for fixed phone texts."""
+from __future__ import annotations
+
+import ast
+import importlib
+import json
+import tempfile
+import unittest
+from collections.abc import Iterator
+from dataclasses import replace
+from pathlib import Path
+from typing import cast
+from unittest import mock
+
+import push_texts
+from push_texts import ActionTemplate, PushExample, PushText
+from user_action import ActionRequired
+
+ROOT = Path(__file__).resolve().parents[2]
+EXEMPT = {"scripts/notify/push_texts.py", "scripts/notify/pushover.py", "scripts/message/send.py", "scripts/message/escalate.py"}
+
+
+def literal_path(node: ast.expr) -> str:
+    if isinstance(node, ast.Constant) and isinstance(node.value, str):
+        return node.value
+    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Div):
+        left, right = literal_path(node.left), literal_path(node.right)
+        return left.rstrip("/") + "/" + right if right else ""
+    if isinstance(node, ast.Call) and node.args and isinstance(node.func, (ast.Name, ast.Attribute)):
+        name = node.func.id if isinstance(node.func, ast.Name) else node.func.attr
+        if name in ("str", "Path"):
+            return literal_path(node.args[0])
+    return ""
+
+
+def literal_delivery_calls(source: str) -> list[int]:
+    """Report forbidden routing tokens at their source lines, without following values."""
+    tree = ast.parse(source)
+    broadcast_names = {"broadcast"}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            broadcast_names.update(alias.asname or alias.name for alias in node.names
+                                   if alias.name.rsplit(".", 1)[-1] == "broadcast")
+        elif isinstance(node, ast.ImportFrom):
+            broadcast_names.update(alias.asname or alias.name for alias in node.names
+                                   if alias.name == "broadcast" or (node.module or "").rsplit(".", 1)[-1] == "broadcast")
+    hits: set[int] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.List, ast.Tuple, ast.Call)):
+            arguments = node.args if isinstance(node, ast.Call) else node.elts
+            for left, right in zip(arguments, arguments[1:]):
+                if literal_path(left) == "--to" and literal_path(right) == "user":
+                    hits.add(left.lineno)
+        if isinstance(node, ast.Constant) and isinstance(node.value, str):
+            if node.value == "--to=user" or node.value.endswith("notify/pushover.py"):
+                hits.add(node.lineno)
+        if isinstance(node, (ast.BinOp, ast.Call)) and literal_path(node).endswith("/pushover.py"):
+            hits.add(node.lineno)
+        if (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                and isinstance(node.func.value, ast.Name) and node.func.value.id in broadcast_names
+                and node.func.attr == "send" and node.args and literal_path(node.args[0]) == "user"):
+            hits.add(node.lineno)
+        # Keep separately appended routing tokens visible without tracking list contents.
+        for _, field in cast(Iterator[tuple[str, object]], ast.iter_fields(node)):
+            if not isinstance(field, list):
+                continue
+            statements = cast(list[ast.AST], field)
+            for left, right in zip(statements, statements[1:]):
+                if not isinstance(left, ast.Expr) or not isinstance(right, ast.Expr):
+                    continue
+                a, b = left.value, right.value
+                if (isinstance(a, ast.Call) and isinstance(b, ast.Call)
+                        and isinstance(a.func, ast.Attribute) and isinstance(b.func, ast.Attribute)
+                        and a.func.attr == b.func.attr == "append"
+                        and ast.dump(a.func.value) == ast.dump(b.func.value)
+                        and len(a.args) == len(b.args) == 1
+                        and literal_path(a.args[0]) == "--to" and literal_path(b.args[0]) == "user"):
+                    hits.add(a.lineno)
+    return sorted(hits)
+
+
+def missing_approvals(entries: tuple[PushText, ...], path: Path) -> list[str]:
+    approvals = cast(dict[str, dict[str, dict[str, str]]], json.loads(path.read_text()) if path.exists() else {})
+    return [f"{entry.id}/{example.name}: run review.py texts --id {entry.id} --approve"
+            for entry in entries for example in entry.examples
+            if approvals.get(entry.id, {}).get(example.name, {}).get("sha256") != push_texts.fingerprint(entry)]
+
+
+class PushTextTests(unittest.TestCase):
+    def entry(self) -> PushText:
+        return PushText("test", "test", "decision", "Choose {version}", ActionTemplate("Reply upgrade or wait."),
+                        "The check passed on {version}.", (PushExample("typical", {"version": "1.2"}), PushExample("long", {"version": "1.2000"})))
+
+    def test_every_catalog_example_has_current_approval(self) -> None:
+        entries = push_texts.catalog()
+        self.assertTrue(entries, "push_catalog.ENTRIES must include script and nixos pushes")
+        self.assertEqual(missing_approvals(entries, push_texts.REVIEWED_FILE), [])
+
+    def test_every_catalog_example_fits_the_phone_title_and_body_limits(self) -> None:
+        for entry in push_texts.catalog():
+            for example in entry.examples:
+                with self.subTest(id=entry.id, example=example.name):
+                    push = push_texts.render_entry(entry, example.values)
+                    text = ("Action: " + push.action.text + "\n" + push.body
+                            if isinstance(push.action, ActionRequired) else push.body)
+                    self.assertLess(len(text), 500)
+                    self.assertLess(len(push.title), 45)
+
+    def test_template_change_with_same_example_output_invalidates_every_approval(self) -> None:
+        entry = self.entry()
+        changed = replace(entry, body="The check passed on {version:s}.")
+        self.assertEqual(push_texts.render_entry(entry, entry.examples[0].values).body,
+                         push_texts.render_entry(changed, changed.examples[0].values).body)
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "reviewed.json"
+            _ = path.write_text(json.dumps({entry.id: {example.name: {"sha256": push_texts.fingerprint(entry)} for example in entry.examples}}))
+            self.assertEqual(missing_approvals((entry,), path), [])
+            self.assertEqual(len(missing_approvals((changed,), path)), 2)
+
+    def test_render_rejects_unknown_missing_and_extra_values(self) -> None:
+        with mock.patch.object(push_texts, "catalog", return_value=(self.entry(),)):
+            for id, values in (("absent", {"version": "1"}), ("test", {}), ("test", {"version": "1", "other": "2"})):
+                with self.subTest(id=id, values=values), self.assertRaises(ValueError):
+                    _ = push_texts.render(id, **values)
+
+    def test_missing_catalog_fails_instead_of_appearing_empty_or_unknown(self) -> None:
+        with mock.patch.object(importlib, "import_module", side_effect=ModuleNotFoundError("catalog absent", name="push_catalog")):
+            with self.assertRaises(ModuleNotFoundError):
+                _ = push_texts.catalog()
+            with self.assertRaises(ModuleNotFoundError):
+                _ = push_texts.render("quota.claude")
+
+    def test_annotated_literal_argv_reports_the_routing_tokens(self) -> None:
+        self.assertEqual(literal_delivery_calls('command: list[str] = ["send.py", "--to", "user", "--text", "literal"]\nrun(command)'), [1])
+
+    def test_literal_user_argv_remains_checked_after_list_mutations(self) -> None:
+        for mutation in ('command += ["--summary", "title"]',
+                         'command.extend(["--summary", "title"])',
+                         'command.append("--summary")'):
+            with self.subTest(mutation=mutation):
+                source = 'command = ["send.py", "--to", "user", "--text", "fixed"]\n' + mutation + '\nsubprocess.run(command)'
+                self.assertEqual(literal_delivery_calls(source), [1])
+        self.assertEqual(literal_delivery_calls('command = ["send.py"]\ncommand.append("--to")\ncommand.append("user")\nsubprocess.run(command)'), [2])
+        self.assertEqual(literal_delivery_calls('command = ["send.py", "--to", "user"]\nalias = command\nalias += ["--summary", "title"]\nsubprocess.run(command)'), [1])
+        self.assertEqual(literal_delivery_calls('push = render("good")\npush += ["literal"]\nbroadcast.send("user", push)'), [3])
+
+    def test_literal_routing_tokens_are_found_after_an_alias_crosses_a_branch(self) -> None:
+        source = ('command = ["send.py"]\nalias = command\nif ready:\n    pass\n'
+                  'alias += ["--to", "user"]\nsubprocess.run(command)')
+        self.assertEqual(literal_delivery_calls(source), [5])
+
+    def test_token_gate_checks_call_arguments_equals_flags_paths_and_broadcast_imports(self) -> None:
+        for source in ('run("send.py", "--to", "user")',
+                       'command = ("send.py", "--to", "user")',
+                       'command = ["send.py", "--to=user"]',
+                       'path = ROOT / "notify" / "pushover.py"',
+                       'path = Path("scripts/notify/pushover.py")'):
+            with self.subTest(source=source):
+                self.assertEqual(literal_delivery_calls(source), [1])
+        for imported, call in (('import broadcast as notices', 'notices.send("user", push)'),
+                               ('from production import broadcast as notices', 'notices.send("user", push)'),
+                               ('from broadcast import transport as notices', 'notices.send("user", push)')):
+            with self.subTest(imported=imported):
+                self.assertEqual(literal_delivery_calls(imported + "\n" + call), [2])
+        self.assertEqual(literal_delivery_calls('run(user_send_argv(render("good")))'), [])
+        self.assertEqual(literal_delivery_calls('other.send("user", "text")'), [])
+
+    def test_rendered_binding_cannot_excuse_a_later_string_or_conditional_string(self) -> None:
+        self.assertEqual(literal_delivery_calls('push = render("good")\npush = "literal"\nbroadcast.send("user", "script", push)'), [3])
+        self.assertEqual(literal_delivery_calls('push = render_entry(entry, values)\nif condition:\n    push = "literal"\nbroadcast.send("user", "script", push)'), [4])
+        self.assertEqual(literal_delivery_calls('push = render("good")\ndef other():\n    push = "literal"\nbroadcast.send("user", push)'), [4])
+        self.assertEqual(literal_delivery_calls('push = "literal"\npush = render_entry(entry, values)\nbroadcast.send("user", push)'), [3])
+        self.assertEqual(literal_delivery_calls('push = "literal"\nfor item in items:\n    push = render("good")\nbroadcast.send("user", push)'), [4])
+        self.assertEqual(literal_delivery_calls('push = render("good")\nfor item in items:\n    broadcast.send("user", push)\n    push = "literal"'), [3])
+        self.assertEqual(literal_delivery_calls('push = "literal"\ntry:\n    push = render("good")\nexcept ValueError:\n    pass\nbroadcast.send("user", push)'), [6])
+
+    def test_render_call_does_not_excuse_another_literal_send_in_the_module(self) -> None:
+        source = 'push = render("good")\nrun(user_send_argv(push))\nrun(["send.py", "--to", "user", "--text", "literal"])'
+        self.assertEqual(literal_delivery_calls(source), [3])
+        self.assertEqual(literal_delivery_calls('broadcast.send("user", "literal")'), [1])
+        self.assertEqual(literal_delivery_calls('command = ["send.py", "--to", "user"]\nrun(command)\ncommand = user_send_argv(render("good"))\nrun(command)'), [1])
+        self.assertEqual(literal_delivery_calls('def deliver(push: RenderedPush):\n    broadcast.send("user", push)'), [2])
+        self.assertEqual(literal_delivery_calls('command = ["scripts/notify/pushover.py", "title", "body"]\nrun(command)'), [1])
+        self.assertEqual(literal_delivery_calls('run(["python3", str(ROOT / "notify" / "pushover.py"), "title", "body"])'), [1])
+
+    def test_each_script_delivery_uses_the_registry(self) -> None:
+        findings: list[str] = []
+        for path in (ROOT / "scripts").rglob("*.py"):
+            relative = path.relative_to(ROOT).as_posix()
+            if relative in EXEMPT or path.name.startswith("test_"):
+                continue
+            findings.extend(f"{relative}:{line}: literal phone send; use push_texts.user_send_argv" for line in literal_delivery_calls(path.read_text()))
+        self.assertEqual(findings, [])

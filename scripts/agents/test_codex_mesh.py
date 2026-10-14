@@ -282,7 +282,7 @@ class MeshCommandTests(unittest.TestCase):
         self.auto_turn_starts = 0
         self.waits = []
         self.elapsed = 0.0
-        self.start_args_timeout = 5.0
+        self.start_args_timeout = 300.0
         self.server = StubAppServer(self.respond)
         _ = (self.session_dir / codex_mesh.SERVER_FILE).write_text(
             json.dumps({"port": self.server.port, "pid": os.getpid(), "codex_home": str(agent_accounts.seats_home())}),
@@ -2735,6 +2735,9 @@ class MeshCommandTests(unittest.TestCase):
         self.assertEqual(agent_accounts.seats_home(), target)
 
     def assert_quota_continuation_after_move(self, held: tuple[str, ...]) -> None:
+        # This checks the handoff's ordering. Its many socket/file round trips must
+        # not race a five-second task deadline when the machine is busy.
+        self.start_args_timeout = 30.0
         target, new = self.prepare_seats_move()
         respond = self.server.respond
         def refuse(request: dict[str, object]) -> list[dict[str, object]] | None:
@@ -2884,6 +2887,16 @@ class MeshCommandTests(unittest.TestCase):
         self.assertEqual(len(failures), 1)
         self.assertEqual(failures[0]["move_id"], "resume-failure-move")
         self.assertIn("destination cannot restore thread", failures[0]["reason"])
+
+    def test_start_on_a_closed_ephemeral_port_fails_before_creating_a_thread(self) -> None:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
+            listener.bind(("127.0.0.1", 0))
+            port = cast(tuple[str, int], listener.getsockname())[1]
+        outcome = codex_mesh._run_delegate(self.start_args(), port)  # pyright: ignore[reportPrivateUsage]
+        self.assertIsInstance(outcome, codex_mesh.FailedBeforeThread)
+        assert isinstance(outcome, codex_mesh.FailedBeforeThread)
+        self.assertIn("refused", outcome.failure.lower())
+        self.assertEqual(self.methods("thread/start"), [])
 
     def test_refused_seat_without_queued_messages_continues_once_on_new_home(self) -> None:
         self.assert_quota_continuation_after_move(())
@@ -3127,7 +3140,7 @@ class MeshCommandTests(unittest.TestCase):
     def test_follow_failure_without_turn_id_finishes_as_failed(self) -> None:
         self.assertEqual(self.run_start()[0], 0)
         self.outcomes = ["failed"]
-        self.start_args_timeout = 0.1
+        self.start_args_timeout = 300
 
         code, errors = self.run_follow()
 
@@ -3138,9 +3151,25 @@ class MeshCommandTests(unittest.TestCase):
     def test_follow_completion_without_turn_id_finishes_as_done(self) -> None:
         self.assertEqual(self.run_start()[0], 0)
         self.outcomes = ["completed_without_id"]
-        self.start_args_timeout = 0.1
+        # The socket completion notice advances this test; its deadline only
+        # catches a hung launcher, including when the server is starved of CPU.
+        self.start_args_timeout = 300
+        submission_delay = [0.0]
+        respond = self.server.respond
 
-        code, errors = self.run_follow()
+        def clock() -> float:
+            return time.time() + submission_delay[0]
+
+        def submission_uses_cpu(request: dict[str, object]) -> list[dict[str, object]] | None:
+            if request.get("method") == "turn/start":
+                # Model scheduling delay without sleeping or comparing wall time.
+                submission_delay[0] += 1
+            return respond(request)
+
+        self.server.respond = submission_uses_cpu
+
+        with patch.object(codex_mesh, "time", SimpleNamespace(time=clock, monotonic=time.monotonic, sleep=time.sleep)):
+            code, errors = self.run_follow()
 
         self.assertEqual((code, errors), (0, ""))
         self.assertEqual(self.seat_record()["status"], "done")

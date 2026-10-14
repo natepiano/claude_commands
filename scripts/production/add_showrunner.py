@@ -6,7 +6,7 @@ Usage: add_showrunner.py --production <child production doc> --model <id> --effo
 
 The parent showrunner runs it. The session is named for the child's slug and starts in the child's
 checkout with `/showrunner:produce <doc>`, or `/showrunner:produce <doc> resume` with --resume. It
-carries no unit mark. New sessions pick an account with room; resumes keep their recorded account. Once the child's showrunner runs, with an update
+carries no unit mark. New and resumed sessions use the configured showrunners account. Once the child's showrunner runs, with an update
 timer addressed to a live session, the child is attached to the caller's production. --check runs
 every refusal and starts nothing. The session must start in a folder the selected account's login
 already trusts, since a showrunner never answers Claude's folder-trust prompt.
@@ -28,11 +28,10 @@ from typing import TYPE_CHECKING, NamedTuple, cast
 
 import showrunners
 import unit_lookup
-from add_unit import Production, Refusal, RetainedClaudeAccount, launch_environment, read_production, tmux_live
+from add_unit import Production, Refusal, launch_environment, read_production, tmux_live
 
 if TYPE_CHECKING:
     from scripts.accounts.accounts import ClaudeLaunchAccount
-    ShowrunnerLaunchAccount = ClaudeLaunchAccount | RetainedClaudeAccount
 
 class DefaultClaudeConfiguration(NamedTuple):
     """Trust comes from the default login's configuration."""
@@ -105,56 +104,31 @@ def checked(child: Production, caller: str, ending: str = "", start_in: Path | N
     return tmux
 
 
-def account_directory(selected: ShowrunnerLaunchAccount) -> Path:
+def account_directory(selected: ClaudeLaunchAccount) -> Path:
     from scripts.accounts import accounts
     return accounts.main_config_dir() if isinstance(selected, accounts.DefaultAccount) else selected.dir
 
 
-def account_for_launch(child: Production, resume: str | None, target: str = "", config_dir: str = "") -> ShowrunnerLaunchAccount:
-    """Pick new work; a resume retains the account saved on its tmux session."""
+def account_for_launch(child: Production, resume: str | None, target: str = "", config_dir: str = "") -> ClaudeLaunchAccount:
+    """Every launch uses the configured showrunners account, including resumes."""
+    _ = child
     from scripts.accounts import accounts
-
-    if not resume:
-        if target or config_dir:
-            raise Refusal("--account and --config-dir require --resume")
-        try:
-            return accounts.role_account("unit")
-        except accounts.AccountsError as error:
-            raise Refusal(str(error)) from error
-    if target:
-        if config_dir:
-            raise Refusal("give only one of --account and --config-dir")
-        problems = accounts.check(target)
-        if problems:
-            raise Refusal(problems[0])
-        return accounts.DefaultAccount() if target == "default" else accounts.NamedAccount(target, accounts.account_dir(target))
-    if config_dir:
-        directory = Path(os.path.abspath(Path(config_dir).expanduser()))
-    else:
-        directory = recorded_account_directory(child)
-    if not directory.is_dir():
-        raise Refusal(f"recorded resume account directory {directory} is missing; use --account or --config-dir")
-    return accounts.DefaultAccount() if directory == accounts.main_config_dir() else RetainedClaudeAccount(directory)
+    try:
+        return accounts.account_for_group_launch("showrunner", resume=bool(resume),
+                                                 target=target, config_dir=config_dir)
+    except accounts.AccountsError as error:
+        raise Refusal(str(error)) from error
 
 
-def recorded_account_directory(child: Production) -> Path:
-    found = subprocess.run([unit_lookup.tmux_binary(), "show-options", "-v", "-t", f"={child.slug}:", "@claude_config_dir"],
-                           capture_output=True, text=True, check=False)
-    if found.returncode != 0 or not found.stdout.strip():
-        raise Refusal("no account recorded for this showrunner; resume with --account <claude N|default>")
-    return Path(found.stdout.strip()).expanduser()
-
-
-def launch(child: Production, tmux: str, model: str, effort: str, resume: str | None, cwd: Path, selected: ShowrunnerLaunchAccount) -> None:
+def launch(child: Production, tmux: str, model: str, effort: str, resume: str | None, cwd: Path, selected: ClaudeLaunchAccount) -> None:
     """Launch and retain its account and model on the tmux session."""
     from scripts.accounts import accounts
-    from scripts.whoami import account
     prompt = f"/showrunner:produce {child.doc}" + (" resume" if resume else "")
     argv = ["claude", "--model", model, "--effort", effort]
     if resume:
         argv.extend(["--resume", resume])
     argv.extend(["--remote-control", child.slug, "-n", child.slug, "--settings", '{"disableAgentView": true}', prompt])
-    prefix = account.named_account_prefix(selected.dir) if isinstance(selected, RetainedClaudeAccount) else accounts.account_prefix(selected)
+    prefix = accounts.account_prefix(selected)
     command = "unset CLAUDE_CONFIG_DIR CLAUDE_CODE_REMOTE_MEMORY_DIR CLAUDE_CODE_OAUTH_TOKEN; " + prefix + "ENABLE_TOOL_SEARCH=true command " + shlex.join(argv) + "; exec zsh"
     scope = f"--unit={re.sub(r'[^A-Za-z0-9_.-]', '-', child.slug)}-{int(time.time())}"
     _ = subprocess.run(["systemd-run", "--user", "--scope", scope, tmux, "new-session", "-d", "-s", child.slug,

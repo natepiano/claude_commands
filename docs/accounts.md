@@ -22,7 +22,7 @@ The status line's second row shows this session's account label. To print it:
 | --- | --- |
 | Label | The account's label. A named Claude folder keeps its own label; a Codex home shows the label of its login's note. |
 | Login | The login, `not logged in`, or `not set up` for an account that has a note and is in no folder. |
-| Role | `next` for the Claude account a new launch would pick; `seats` for the Codex home in use, `spare` for the other Codex homes. |
+| Role | `units` and/or `showrunners` for the selected Claude groups; `seats` for the Codex home in use, `spare` for the other Codex homes. |
 | 5-hour left, Weekly left | Percent of each window left, each with its reset time. A dash when the account has no such window. |
 | On credits | Codex only: `yes` when a window is used up and the account's credits now pay for the work. |
 | Credits left | Codex only: the credit balance, or `unlimited`. |
@@ -39,7 +39,7 @@ Run these in a terminal:
 | Command | Account |
 | --- | --- |
 | `claude` | Default (`~/.claude`). |
-| `claude-unit` | The account with room whose weekly window resets soonest. |
+| `claude-unit` | The configured units account. |
 | `claude1` | claude 1 |
 | `claude2` | claude 2 |
 | `claude3` | claude 3 |
@@ -53,7 +53,7 @@ These aliases come from natedev's shell configuration after a rebuild; the Mac h
 
 Arguments after the label pass through to `claude`.
 
-New units, showrunners and nightly reviews pick an account with room. Resumes keep their recorded account unless given `--account`. Each unit launch saves its config directory and model on its tmux session for later resumes. If neither tmux nor shutdown has a recorded account, resume refuses and asks for `--account`. A named alias whose login matches the default runs on `~/.claude`, with `CLAUDE_CONFIG_DIR` and `CLAUDE_CODE_REMOTE_MEMORY_DIR` removed. Today that is `claude2`; other named aliases use their own `~/.claudeN` directory. `exec default` starts plain `claude`, removing those variables and any inherited OAuth token.
+Configuration decides the account every launch starts on: new, standby and resumed units and nightly reviews use the units account; new and resumed showrunners use the showrunners account. Set a group with `accounts.py move units|showrunners "claude N"`. An unconfigured group refuses with that command; an `--account` or `--config-dir` override must name its configured account. Each unit launch saves its config directory and model on tmux for observation; that directory no longer chooses a resume account. A named alias whose login matches the default runs on `~/.claude`, with `CLAUDE_CONFIG_DIR` and `CLAUDE_CODE_REMOTE_MEMORY_DIR` removed. `exec default` starts plain `claude`, removing those variables and any inherited OAuth token.
 
 A missing directory refuses without starting Claude, for example:
 
@@ -133,29 +133,23 @@ Before changing anything, move refuses when:
 
 Move runs `shutdown.py down '<current note label>' --here --only <id> --restart --to '<target>'`. A tmux session respawns its pane; a unit resumes through `add_unit.py --resume --account '<target>'`; Ghostty, Zed and Terminal reopen a window. Use `--why "<text>"` to explain the move; the default is `<old label> is out of usage`. Every resume says it was an account move, not a stop, and continues where it stopped; a unit director continues its `/unit:direct` run. An unknown host prints exactly one resume command with `run this once <name> has exited` before starting shutdown. Run it after exit; restart reports the same command as `manual restart <name>: <line>`.
 
-The target is checked again at launch. A moved launch uses `accounts.py exec '<target>'`, which drops inherited OAuth tokens. Moving changes no login or credentials and leaves other sessions in place. New launches pick independently of the session kind.
+The target is checked again at launch. A moved launch uses `accounts.py exec '<target>'`, which drops inherited OAuth tokens. Moving changes no login or credentials and leaves other sessions in place. Grouped sessions move with their group; ad hoc sessions can move alone.
 
-To move every showrunner off an expired account together:
+Move a whole group with `/showrunner:accounts move units "claude 3"` or `move showrunners "claude 3"`. The terminal command is `accounts.py move units|showrunners '<target>' [--dry-run] [--why '<text>']`. It checks the target, selects it for new launches, and requests each live member still off that account. An open shutdown record receives no second request; the notes timer completes remaining members on later ticks. Moving one grouped session refuses and names the group command. A dry run prints `<group>: would select <target>` and each off-target live name and session id, or `<group>: no live session moves`; it changes nothing. An empty group still selects its account for future launches. Showrunner moves and previews name productions whose update timer points at no live session and give the registration command.
 
-```text
-/showrunner:accounts move showrunners --from "claude 2" --to "claude 3"
-```
-
-The terminal command is `accounts.py move showrunners --from 'claude 2' --to 'claude 3' [--dry-run]`, through the same script path above. `--dry-run` prints each selected name and id, one `down` command and each resume command, without changing anything. No match refuses with `no showrunner on <label> on this machine`. An unfit target, a default-login alias or the same source login refuses the whole move. A showrunner already in shutdown prints `<name> already has a shutdown in progress` and is skipped; the others still move in one selected shutdown.
-
-Each returns to its own conversation, cwd, name, model and production resume prompt. Tmux respawns its existing pane and keeps the attached desktop window. For a direct Ghostty showrunner, shutdown closes its window as usual and restart opens a replacement on the recorded desktop. The batch command also accepts `--why "<text>"`; each resume carries the same account-move explanation.
+Group requests use shutdown’s pause-for-move path: each member receives `Pause for move`, writes its checkpoint with `shutdown.py ready --where`, and its unit showrunner is told before it stops. Shutdown’s existing exceptions apply: an idle owner held by a usage limit can stop without a mark; the requester sends its own ready mark. The restart prompt carries the checkpoint. Each returns to its own conversation, cwd, name, model and production resume prompt. Tmux respawns its existing pane and keeps the attached desktop window. For a direct Ghostty showrunner, shutdown closes its window as usual and restart opens a replacement on the recorded desktop. The batch command also accepts `--why "<text>"`; each resume carries the same account-move explanation.
 
 ## Picking an account
 
 `/showrunner:accounts pick claude --explain` shows each candidate's weekly and 5-hour readings, its reset, and why it was picked or skipped. Use `pick codex` for Codex, repeat `--exclude "<label>"` to omit accounts, or use `--keep "<label>"` to retain a session's account while it has room.
 
-The picker uses readings from the last 10 minutes. Claude needs more than 0% in both windows, or only the weekly window when no 5-hour window exists. Codex can also work on credits. There is no minimum: 1% is room. The soonest weekly reset wins, then the most weekly allowance left, then label order. Duplicate logins count once: default wins, then the lowest numbered directory.
+Claude accounts have room until they have an unresolved provider refusal. Low and zero percentages do not move a group or remove room. Readings rank accounts: units use the soonest weekly reset, breaking ties by most weekly left; showrunners use most weekly left. Only a refusal moves the group. If no destination has room, the group keeps its account and the existing no-room notice names the earliest reset. Codex still uses fresh allowance and credits.
 
-A recorded refusal overrides saved percentages until its reset passes or a later successful reading establishes renewed allowance. When fresh readings exist but no account has room, the picker prints `no claude account has room; the earliest reset is <time>` and refuses new work. When no candidate has a fresh reading, it keeps the requested account if eligible, otherwise uses default; unresolved refusals still exclude their accounts. `--explain` names this fallback. The Mac has no usage snapshot timer, so it normally uses this fallback.
+`~/.local/state/accounts/groups.json` stores explicitly selected group accounts. Only a manual group move or a move after a refusal writes it; selecting one group leaves the other unconfigured. Both groups may use the same account. Changes append `{at, group, label, why}` to `roles.jsonl`; historical burn skips these group entries. Launches, status, `accounts.py placement --explain` and the refusal watcher never initialize missing selections. Status and previews print `not configured`, and the watcher moves no member of an unconfigured group.
 
-`claude-unit`, `exec unit`, `env unit` and `role unit` resolve the picker without storing a role. A legacy `unit` configuration key is ignored; `set-role unit` and `swap unit` refuse. Move running sessions with `move`, or `move showrunners`; the Codex seats role remains unchanged.
+`claude-unit`, `exec unit`, `env unit` and `role unit` use the units account; `role showrunner` and new showrunner launches use the showrunners account. The legacy `unit` configuration key is ignored; `set-role unit` and `swap unit` refuse. Codex seats retain their own role.
 
-New units and showrunners save `@claude_config_dir` and `@claude_model` on tmux. A showrunner resume accepts `--account "<label>"`, `--account default` or `--config-dir <dir>` to retain an external directory; otherwise it retains that recorded directory and refuses with a line naming `--account` if none remains. Promoting a unit to showrunner retains its recorded account.
+New units and showrunners save `@claude_config_dir` and `@claude_model` on tmux. A resume uses its group's configured account, and accepts `--account` or `--config-dir` only when it names that account. Promoting a unit uses the configured showrunners account; recovery as a unit uses the configured units account.
 
 ## Setting up a new directory
 
@@ -219,15 +213,21 @@ When no Codex account has room, assignments fall back to Claude and the notice n
 
 Watcher inventories read the existing desktop snapshot. They never invoke the snapshot updater, which itself runs the notes timer. The same policy reaches their shutdown conductor, preventing a recursive notes update and keeping `--dry-run` read-only.
 
-The argument-free notes timer checks local top-level sessions' last transcript entries for provider quota refusals. Showrunners, unit directors and terminal, tmux, Ghostty and zed owners on the same refusing account share one selected shutdown and restart on the picked account. An open shutdown request stays with its conductor. The Mac has no timer.
+The argument-free notes timer checks local top-level sessions' last transcript entries for provider quota refusals. A refused unit or showrunner moves its whole group. Owners outside either group move alone through the selected shutdown and restart path, across terminal, tmux, Ghostty and zed hosts. An open shutdown request stays with its conductor. The Mac has no timer.
+
+Group membership comes from shutdown inventory's `unit` and `showrunner` classifications. An update timer is not required for a classified showrunner to move with its group.
 
 A known 5-hour reset in less than 20 minutes waits once per session and reset. Other refusals move; no room sends one account notice until a usage reading changes. Shutdown waits for an idle owner, idle seats, no merge and nothing ahead of upstream. Its status line keeps the target and refusal reason visible while blocked. Cancellation records a failed move, removes the assumption and suppresses the unchanged transcript refusal.
 
 `scripts/accounts/refusal_watch.py --dry-run` reports decisions without changing anything. For a live proof, `--assume-refused '<session id or name>' weekly|five-hour [--reset-in <minutes>]` writes a refusal for that owner only and runs once. The optional reset affects its wait decision, not stored account usage. A confirmed restart or cancellation deletes the assumption. A process still on the source is a failed move; a target process with pending timers is confirmed while those timers stay visible.
 
-Account status shows live sessions' accounts, the Codex seats account and its destination on refusal, seats still owing a continuation, and the last ten move entries with outcomes. Claude's `next` remains the account for a new Claude launch.
+Account status shows live sessions' accounts, the Codex seats account and its destination on refusal, seats still owing a continuation, and the last ten move entries with outcomes. The first line names both groups; table role cells show their selected accounts. A member still on its old account shows as `moving`.
 
 ## Low-quota alerts
+
+Claude alerts forecast destinations separately: units use the soonest weekly reset with room, showrunners use the most weekly allowance left, and ungrouped sessions use the Claude picker. A no-room forecast names the earliest reset. A low reading alone moves no group.
+
+Readings and refusals rank move destinations; they never replace a configured launch account. A launch with no configured group refuses without writing the group file.
 
 Acknowledging an account's low-quota alert keeps it quiet across swaps. Made spare and then selected again, it stays quiet until its own quota recovers or resets.
 

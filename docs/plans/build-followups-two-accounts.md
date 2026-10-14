@@ -97,7 +97,7 @@ Each step lists what changes live, what the user does, and how to undo it. Steps
 5. **Move any one session (Phase 8), when the user says go.**
    - `/showrunner:accounts move <session> "claude N"` moves one showrunner, unit director or top-level session to any account. It stops safely, as `/shutdown` does it, and resumes the same conversation on the target in its own tmux pane or window.
    - Undo: move it back.
-6. **Accounts by room (Phases 14–20).** No role ties a kind of session to an account. A new session launches on the account with room that resets soonest (`accounts.py pick`). When an account refuses a session or the Codex seats, they move to the picked account by themselves and continue; a 5-hour refusal whose reset is under 20 minutes away waits instead. Phase 18 replaces the picker with two groups (showrunners, units), each on one account and moved together. Phase 20 proves it live with the user.
+6. **Accounts by room (Phases 14–21).** No role ties a kind of session to an account. A new session launches on the account with room that resets soonest (`accounts.py pick`). When an account refuses a session or the Codex seats, they move to the picked account by themselves and continue; a 5-hour refusal whose reset is under 20 minutes away waits instead. Phase 18 replaces the picker with two groups (showrunners, units), each on one account and moved together. Phase 19 makes every group move pause first; Phase 21 proves it live with the user.
 7. **A week later (Phase 9).** A readout gives the moves, their causes, any time with no account having room, and points per account per day.
 
 ## Delegation Context
@@ -179,8 +179,8 @@ Each step lists what changes live, what the user does, and how to undo it. Steps
 | G0 | Phase 1 | the user | cleared 2026-10-10 for the code phases 1–5: "prepare everything but don't initiate" |
 | G1 | Phase 6 | the user | the user explicitly authorizes the first live proof. Phase 6 then creates `~/.claude3`, and the user completes its login (step 2) before any probe starts |
 | G2 | Phase 7 | the user | the user authorizes cutover at a chosen time and confirms the unit account. Phase 7 then sets up and logs in the remaining dirs, and every check passes before step 4 writes the role |
-| G3 | Phase 9 | the clock | 7 days after Phase 20's live proof |
-| G4 | Phase 20 | the user | the user is present for the live moves |
+| G3 | Phase 9 | the clock | 7 days after Phase 21's live proof |
+| G4 | Phase 21 | the user | the user is present for the live moves |
 
 ## Phases
 
@@ -454,24 +454,24 @@ Asked for by the user through the showrunner. Text above this section that names
 
 ### Phase 9 — Readout of the moves  · status: todo · gated by G3
 
-**Depends on:** Phase 20
+**Depends on:** Phase 21
 
 #### Work Order
 
 **Goal:** answer the user's question with a week of data: how often sessions and seats moved between accounts, why, and whether any time passed with no account having room.
 
-**Constraints from prior phases:** from "An account picked by room" on, no role ties a session to an account: a new Claude session launches on `accounts.py pick claude`, Codex seats move on a refusal ("Codex seats move on a refusal") and Claude sessions move on a refusal ("Claude sessions move on a refusal"). Every automatic transition is one line of `~/.local/state/accounts/moves.jsonl`, keyed by a stable `move_id`: `requested`, `confirmed`, `failed`, `waited`, `wait ended`, `no room`, `room again`. `requested` and `waited` carry the reset when it is known (`reset` is omitted when unknown); `no room` carries `earliest_reset`. A Codex request has one `confirmed` per seat (`run`, `seat`), and one seat may fail beside others confirming; a Claude batch shares one shutdown `request_id` across several session subjects. A targeted Claude move, automatic or by hand (`move`, `move showrunners`), is journalled: its `requested` carries `cause` (`refusal` or `by hand`; a missing `cause` is `refusal`) and, for a refusal, the window and reset of the refusal that started it ("Proof refusals stay with their session"); reconcile it with shutdown history by request id and session id and count it once. Codex hand swaps and `set-role` are not journalled: take them from `roles.jsonl`. A five-hour wait ends `wait ended` and the session continues on its own account; the continuation is not journalled. A Claude move is also a `SessionShutdown` record with `target`, `source_label` and `why` in `~/.local/state/shutdown/<login>/sessions/`, moved to `history/` there once the session is confirmed restarted; a `confirmed` proves the move even when its record stays in `sessions/` with `timers pending`; `failed` with `manual restart`, `cancelled`, `restart failed` or `still on <source>`, and a standalone `failed` with no `requested` (refused before any record existed), are not completed moves; a session that failed and later confirmed on a new request counts once, as confirmed. A `no room` means no eligible destination for that session (its refusing logins excluded), not that every account was at zero. Role history `~/.local/state/accounts/roles.jsonl` still records each seats-home write (`role: seats`). `agent_notes.py` keeps readings (`~/.local/state/agent-notes/readings.jsonl`) for eight days, so the readout runs at T0 + 7 d, T0 being the live proof. `accounts.py burn` reads a `--since` or `--until` time with no zone in the user's zone, so give both with an explicit UTC offset.
+**Constraints from prior phases:** from "Two account groups" on, unit directors and showrunners each sit on one stored account (`~/.local/state/accounts/groups.json`; each change is a `roles.jsonl` entry `{at, group, label, why}`), a new Claude session launches on its group's account, and a group moves whole on a refusal. Codex seats move on a refusal ("Codex seats move on a refusal") and Claude sessions move on a refusal ("Claude sessions move on a refusal"). Every automatic transition is one line of `~/.local/state/accounts/moves.jsonl`, keyed by a stable `move_id`: `requested`, `confirmed`, `failed`, `waited`, `wait ended`, `no room`, `room again`. `requested` and `waited` carry the reset when it is known (`reset` is omitted when unknown); `no room` carries `earliest_reset`. A Codex request has one `confirmed` per seat (`run`, `seat`), and one seat may fail beside others confirming; a Claude batch shares one shutdown `request_id` across several session subjects. A targeted Claude move, automatic or by hand (`move`, `move showrunners`), is journalled: its `requested` carries `cause` (`refusal` or `by hand`; a missing `cause` is `refusal`) and, for a refusal, the window and reset of the refusal that started it ("Proof refusals stay with their session"); reconcile it with shutdown history by request id and session id and count it once. Codex hand swaps and `set-role` are not journalled: take them from `roles.jsonl`. A five-hour wait ends `wait ended` and the session continues on its own account; the continuation is not journalled. A Claude move is also a `SessionShutdown` record with `target`, `source_label` and `why` in `~/.local/state/shutdown/<login>/sessions/`, moved to `history/` there once the session is confirmed restarted; a `confirmed` proves the move even when its record stays in `sessions/` with `timers pending`; `failed` with `manual restart`, `cancelled`, `restart failed` or `still on <source>`, and a standalone `failed` with no `requested` (refused before any record existed), are not completed moves; a session that failed and later confirmed on a new request counts once, as confirmed. A `no room` means no eligible destination for that session (its refusing logins excluded), not that every account was at zero. Role history `~/.local/state/accounts/roles.jsonl` still records each seats-home write (`role: seats`). `agent_notes.py` keeps readings (`~/.local/state/agent-notes/readings.jsonl`) for eight days, so the readout runs at T0 + 7 d, T0 being the live proof. `accounts.py burn` reads a `--since` or `--until` time with no zone in the user's zone, so give both with an explicit UTC offset.
 
 **Spec:** for the window T0 to T0 + 7 d, read `moves.jsonl`, the shutdown records and history, `roles.jsonl` and `readings.jsonl`, and run `accounts.py burn --since <T0> --until <T0 + 7 d>`. Report to the showrunner:
 
-- moves per tool (Claude session, Codex seats) and per cause (weekly refusal, 5-hour refusal, by hand), counted both per transition (one per `requested`, or per hand move) and per seat or session confirmed; a request with some seats confirmed and some failed is partial; each is confirmed against its record, and an unconfirmed or failed restart is marked, never counted as a move;
+- moves per tool (Claude session, Codex seats) and per cause (weekly refusal, 5-hour refusal, by hand), a group move counted once per group transition apart from its per-session requests and confirmed outcomes, counted both per transition (one per `requested`, or per hand move) and per seat or session confirmed; a request with some seats confirmed and some failed is partial; each is confirmed against its record, and an unconfirmed or failed restart is marked, never counted as a move;
 - the waits for a 5-hour reset under 20 minutes away, and how long each lasted (`waited` to `wait ended`; an unclosed one is an unknown interval, not a duration);
 - every interval with no account having room (`no room` to `room again`), with the earliest reset each named, and unknown intervals marked;
 - points per account per day, and observed-day coverage with gaps.
 
-Count transitions by (`tool`, `move_id`), Claude outcomes by session id and Codex confirmations by (`move_id`, `run`, `seat`); report standalone failures as refused attempts. Pair `no room` with `room again` by tool, `move_id` and session; report per-session intervals and their union separately, an unresolved end as unknown. Read with `moves.read_moves()` and shutdown's record readers (`scripts/shutdown/record.py`); status already shows sessions, seats and the last ten entries, so this phase aggregates and builds no surface.
+Count transitions by (`tool`, `move_id`); a Claude group move is one transition under its group `move_id` ("Proof refusals stay with their session" item 7), however many requests its members took; Claude outcomes by session id and Codex confirmations by (`move_id`, `run`, `seat`); report standalone failures as refused attempts. Pair `no room` with `room again` by tool, `move_id` and session; report per-session intervals and their union separately, an unresolved end as unknown. Read with `moves.read_moves()` and shutdown's record readers (`scripts/shutdown/record.py`); status already shows sessions, seats and the last ten entries, so this phase aggregates and builds no surface.
 
-Per group, compare its weekly burn from each move to that account's reset with the 10% room floor, and recommend whether the floor should be that burn.
+Readings measure accounts, not groups: report each account's weekly burn while each group sat on it, attributing it to a group only for intervals that group sat alone there and marking shared intervals as shared.
 
 Recommend whether more accounts are needed.
 
@@ -686,78 +686,90 @@ After a seat launch's own turn has ended, a move to the selected seats home that
 
 ### Phase 17 — An account prepared for any launcher  · status: done
 
-**Depends on:** Phase 16
+#### As-built
+
+- `accounts.prepared_account(label: str, *, resume: bool) -> PreparedAccount | AccountRefused` holds the account preparation for a launch on `label` without exec'ing. `unit` resolves through `role_account("unit")`, `default` to the default account, any other label to its named account.
+- `PreparedAccount` (frozen dataclass): `variables: dict[str, str]` to set and `remove: frozenset[str]` to unset. It never carries a copy of the caller's environment; the caller applies it to its own base.
+  - `remove` always holds `CLAUDE_CODE_OAUTH_TOKEN`.
+  - A named account whose expected login equals the default directory's login (default-login alias): `account.NAMED_ACCOUNT_VARIABLES` are removed and nothing is set.
+  - Any other named account: refused when not set up (`is not set up; /showrunner:accounts setup …`), when readiness is neither Ready nor LoggedOut, or when LoggedOut with `resume` (the readiness's first problem); otherwise `variables` is `account.named_account_environment(dir)`.
+  - The default account: with `resume`, a problem from `check("default")` refuses with its first problem; the named-account variables are removed.
+- `AccountRefused` (frozen dataclass): `reason: str`, the exact message `exec_account` raised before. A label resolution `AccountsError` (bad label, no room for `unit`) returns as `AccountRefused`, not an exception.
+- `exec_account(label, arguments)` calls `prepared_account(label, resume="--resume" in arguments)`, raises `AccountsError(reason)` on a refusal, and otherwise applies the prepared account to a copy of `os.environ` and execs — same errors, messages and environment as before. `_drop_named_account` no longer exists; `PreparedAccount.remove` does its job.
+
+**Files:**
+- `scripts/accounts/accounts.py` — `PreparedAccount`, `AccountRefused`, `prepared_account`, `exec_account`.
+- `scripts/accounts/test_accounts.py` — one `prepared_account` test per outcome beside the unchanged `exec_account` tests.
+
+**Binds later work:** herdr-trial's `restart.py` calls `prepared_account(target, resume=True)` and sets `variables` through its pane environment (the herdr server runs under `systemd-run --user`, so no caller environment reaches it). The account groups phase checks a group move's target with `prepared_account` before moving. `prepared_account("unit", …)` resolves through `role_account`, so it follows the units group with no further edit; `prepared_account` and `role_account` stay stable for herdr-trial.
+
+**Gotchas:** the default account removes every named-account variable as well as `CLAUDE_CODE_OAUTH_TOKEN`; a caller that skips `remove` leaks a named account into a default launch.
+
+### Phase 18 — Two account groups: showrunners and units  · status: done
+
+#### As-built
+
+- Claude sessions form two groups, `ClaudeGroup = Literal["units", "showrunners"]` (`CLAUDE_GROUPS`); `session_group(session)` classes a live session by its inventory kind, and `live_group_members() -> dict[ClaudeGroup, list[Session]]` lists each group's local live members. A session in no group (`"ungrouped"`) moves alone.
+- `~/.local/state/accounts/groups.json` (`groups_file()`) holds `GroupAccounts {units, showrunners}`. Only `set_group_account(group, label, *, why, now)` writes it, atomically under a lock, appending a `GroupAccountChange {at, group, label, why}` line to `roles.jsonl`; the role-history reader `burn` uses skips group lines. An absent key reads as `GroupNotConfigured` (prints `not configured`).
+- `role_account("unit")` / `role_account("showrunner")` return the configured group account as a `ClaudeLaunchAccount`, never inferred from live sessions, readings or the launcher's account; an unconfigured group raises `AccountsError` naming `accounts.py move <group> "claude N"`. `account_for_group_launch(role, *, resume, target="", config_dir="")` wraps it for every launcher (`add_unit.py` new, standby and `--resume`; `add_showrunner.py`; `promote_showrunner.py`; nightly review; `exec unit`; restart's showrunner resume): it refuses an `--account`/`--config-dir` naming any other account and runs `prepared_account`.
+- Room: an account has room unless it holds an unresolved refusal; readings only rank accounts with room, and 0% weekly with no refusal still has room. `placement(group, now, *, exclude) -> GroupPlacement {group, label, dir, reason, reasons}` picks units by soonest weekly reset (ties to most left, `UnitsResetSoonest`), showrunners by most weekly left (`ShowrunnersMostLeft`), or keeps the group in place with `GroupNoRoom`.
+- `move_group(group, target, *, dry_run, why)` checks `prepared_account(target, resume=True)`, calls `set_group_account`, then calls `move_sessions` once for the members where `session_on_account(session, target)` is false. `accounts.py move units|showrunners <claude N>` runs it; `move <session>` refuses a grouped session, naming the group command.
+- The refusal watcher moves a whole group, and only on a refusal of one of its live members: it checks the target with `prepared_account` (a refusal writes nothing and retries next tick), writes the group's account, then calls `move_sessions` for off-target members, recording the `group selected` watch state. Later ticks request any live member still off its group's account with no open shutdown record, so no session gets two requests. A group in a five-hour wait waits; an unconfigured or no-room group does not move.
+- `accounts.py placement --explain`, `/showrunner:accounts status` (opens `units: <label>, showrunners: <label>`; role cell names the groups; an off-target member shows `moving`) and `quota_alert.py`'s forecast report per group.
+
+**Files:**
+- `scripts/accounts/accounts.py` — groups, `groups.json`, `role_account`, `account_for_group_launch`, `placement`, `move_group`, status.
+- `scripts/accounts/refusal_watch.py` — group move on a refusal.
+- `scripts/production/add_unit.py`, `add_showrunner.py`, `promote_showrunner.py`, `scripts/nightly_review/nightly_review.py` — launch on the configured group account.
+- `scripts/shutdown/restart.py` — `launch_entry` catches `accounts.AccountsError` per entry.
+- `scripts/whoami/quota_alert.py` — forecast per group.
+- `docs/accounts.md`, `commands/showrunner/accounts.md`, `produce.md`, `add_showrunner.md` — the two groups and the group move.
+
+**Binds later work:** `move_group(group, target, *, dry_run, why)` is the one group move and calls `move_sessions` once; `live_group_members()`, `session_group`, `session_on_account` and `set_group_account` are the group primitives; the watcher writes the group account before `move_sessions` and keeps the `group selected` state; `placement(group, now, *, exclude) -> GroupPlacement`; `role_account("unit")` / `role_account("showrunner")` names and return types are stable, and herdr adoption resumes through them.
+
+**Gotchas:** every launch reads the configured group account, so an unconfigured group refuses until `accounts.py move units|showrunners "claude N"` runs (natedev's `groups.json` starts unconfigured). `restart.py` `launch_entry` must keep catching `AccountsError` per entry, or one unconfigured group aborts every other restart.
+
+**Ruled out:** inferring a launch account from live sessions, readings or the launcher's own account; moving a healthy group because another account reads better; a weekly-reading floor on room.
+
+### Phase 19 — Group moves pause first  · status: done
+
+**Depends on:** Phase 18
 
 #### Work Order
 
-**Goal:** any launcher can ask for a Claude account's environment without exec'ing: `exec_account`'s account preparation becomes the public `prepared_account`, which herdr-trial's restart into a herdr session calls, and `exec_account` behaves exactly as before.
+**Goal:** the showrunner's checkpoint requirements for "Two account groups" (2026-10-14): a group move's preview lists exactly the live sessions it would move, and every moved member goes through the shutdown's pause-for-move protocol, with one stop path.
 
 **Spec:**
 
-1. `accounts.prepared_account(label: str, *, resume: bool) -> PreparedAccount | AccountRefused` holds the preparation `exec_account` does today after it chooses `selected`: dropping `CLAUDE_CODE_OAUTH_TOKEN`, the default-login alias test, `_inspect_account_directory`'s readiness, `named_account_environment` and `_drop_named_account`, and the default account's resume check. `resume` replaces the `"--resume" in arguments` test. The labels `unit`, `default` and named labels resolve as `exec_account` resolves them today.
-2. `PreparedAccount` is a frozen dataclass: the variables to set (`dict[str, str]`) and the names to remove (a frozenset of str). It never carries a copy of the caller's environment; a caller applies it to its own base.
-   - `CLAUDE_CODE_OAUTH_TOKEN` is always among the names to remove.
-   - A named account whose expected login equals the default directory's login (the default-login alias): the named-account variables (`account.NAMED_ACCOUNT_VARIABLES`, what `_drop_named_account` removes) are removed and none are set.
-   - Any other named account: refuse one not set up (today's `is not set up; /showrunner:accounts setup …` text), refuse a readiness that is neither Ready nor LoggedOut, and refuse LoggedOut when `resume` is true (today's `problems[0]` text). Otherwise set `account.named_account_environment(dir)`.
-   - The default account: with `resume`, a problem from `check("default")` refuses with its first problem. The named-account variables are removed.
-3. `AccountRefused` is a frozen dataclass whose `reason` is the exact message `exec_account` raises today. `exec_account` calls `prepared_account(label, resume="--resume" in arguments)`, raises `AccountsError(reason)` on a refusal, and otherwise applies the prepared account to a copy of `os.environ` and execs: the same errors, messages and environment as today.
+1. **The preview lists the sessions.** `accounts.py move units|showrunners "claude N" --dry-run` prints `<group>: would select <target>`, then one `<name>: <session id>` line per live member not on the target, or `<group>: no live session moves` when every member is already there. It writes nothing: no `groups.json`, no `roles.jsonl` line, no `moves.jsonl` entry, no shutdown record, no stop request. Example (today on natedev: every unit on claude 1, every showrunner on claude 3): `move units "claude 1" --dry-run` prints `units: would select claude 1` and `units: no live session moves`; `move showrunners "claude 1" --dry-run` lists each running showrunner.
+2. **Every member pauses before it moves.** `accounts.move_sessions` is the one path a group move takes, by hand (`move_group`) and on a refusal (`refusal_watch.py`). It requests `shutdown.py down --here --only <ids> --restart --to <target> --why <why>`, never with `now` timing, so the shutdown's own settle step sends each member the `Pause for move: <label> → <target> (<why>, <time>)` message, stops it only after its ready mark (`shutdown.py ready --where`), and tells a unit's showrunner it is stopping (`settle.tell_showrunner_stopping`). No group-move code sends a message, waits for a mark or stops a session itself. The shutdown's existing exceptions stand: an idle owner held by a usage limit stops without a mark (`settle.py` ~746), and the requester gets no settle message and runs `ready --where` itself.
+3. **Unregistered showrunners are named.** The showrunners group move, and its preview, print one line per `inventory.unregistered_showrunners()` entry, as `move_showrunners` does since the pause-for-move merge: `<slug>: no session runs under the id its update timer names; a showrunner running under another id is not moved until it runs update_registration.py register --production <doc>`. With no live showrunner the move still sets the group's account, prints `showrunners: no live session moves` and those lines, and exits 0; only a bad destination or a failed request refuses.
+4. **One showrunners move.** `move_showrunners(source, target)` has no caller outside tests since "Two account groups" made `move showrunners <target>` the group move; remove it and move its tests that still describe current behavior onto `move_group("showrunners", …)`.
+5. **A resumed member keeps its checkpoint.** A targeted restart's account-move note (`restart.py` ~451) carries the record's `where` line from `ready --where`, for a unit and a showrunner, through the `ResumeParts` path.
+6. **A herdr-hosted member resumes on its group's account.** `restart.py` (~960) refuses every `MoveResumeAccount` for a herdr host, and since the configured showrunner lookup an untargeted showrunner restart yields one; a herdr-hosted unit or showrunner restarted or moved resumes on its group's configured account, and an untargeted restart already on that account takes the retain path.
+7. **From "Two account groups"' review.** `refusal_watch.py --dry-run` updates its in-memory group selection when it picks a new destination, so a partially moved group's preview names one destination, the one a real run would use. The group move's outcome types are named for the group move (today `move_group("units", …)` returns `ShowrunnersMoveStarted`, `ShowrunnersMoveStartFailed`, `ShowrunnersMoveDryRun`). `promote_showrunner.recorded_account_directory` and `add_showrunner.recorded_account_directory` have no caller since launches read the configured account; remove them, and `RetainedClaudeAccount`, `RetainedUnitAccount`, their launch unions and rendering branches when nothing produces them.
 
 **Files:**
 
-- `scripts/accounts/accounts.py` — `prepared_account`, `PreparedAccount`, `AccountRefused`; `exec_account` uses them.
-- `scripts/accounts/test_accounts.py` — one test per outcome.
+- `scripts/accounts/accounts.py`, `scripts/accounts/test_accounts.py` — the preview lines, the unregistered lines in the showrunners group move, `move_showrunners` removed, the outcome types renamed.
+- `scripts/accounts/refusal_watch.py`, `scripts/accounts/test_refusal_watch.py` — the dry run's group selection; a watcher move requests the pausing stop.
+- `scripts/shutdown/test_account_move.py` — the group move reaches the pause message through the real shutdown request.
+- `scripts/shutdown/restart.py`, `scripts/shutdown/test_restart.py` — the checkpoint in the move note; herdr-hosted resumes on the group's account.
+- `scripts/whoami/test_quota_alert.py` — its `move_showrunners` patch moves to the group move.
+- `scripts/production/add_showrunner.py`, `scripts/production/promote_showrunner.py` — the unused account directory helpers removed.
+- `docs/accounts.md`, `commands/showrunner/accounts.md` — the preview and the pause before a move.
 
 **Seats:** 1 writer + 1 tester.
-- `impl` — `scripts/accounts/accounts.py`.
-- `test` — `scripts/accounts/test_accounts.py`: one test per outcome (named ready, default-login alias, not set up, logged out with resume refused, logged out without resume allowed, default with resume problems refused, default without resume), each asserting the variables, the removed names or the refusal text. `exec_account`'s existing tests stay as they are and pass.
+- `impl` — every production file and doc above; hub: `scripts/accounts/accounts.py` (the group move outcome types).
+- `test` — the tests above: a preview with members off the target lists exactly those members and writes no group file, role line, move entry or shutdown record; a preview with every member on the target prints `no live session moves`; `move_group` and a refusal-watch group move each request `down … --restart --to <target>` without `now` for exactly the off-target members, and the record that request writes gets the `Pause for move` first line and no stop before its ready mark; a unit's record tells its showrunner; the showrunners move and preview print each unregistered showrunner's line, and with no live showrunner set the account and exit 0; a targeted restart's prompt carries the `where` line for a unit and a showrunner; a herdr-hosted configured restart and move resume on the group's account; a partially moved group's dry run names one destination; a units group move returns group-named outcomes.
 
-**Constraints from prior phases:** "Claude sessions move on a refusal" ships `move_sessions` and the refusal watcher in `accounts.py` and `refusal_watch.py`; neither changes here. `accounts.py` imports no Codex mesh or alert code at module level (lint fails on an import cycle). Every test module reaching `agent_accounts.user_zone()` points `showrunners.NOTIFIER_STATE_DIR` at an empty directory. herdr-trial's `restart.py` will call `prepared_account(target, resume=True)` and set `variables` through its pane environment; the herdr server runs under `systemd-run --user`, so no caller environment reaches it.
+**Constraints from prior phases:** "Two account groups" ships `move_group(group, target, *, dry_run, why)` (select the group's account, then `move_sessions` once for the off-target members), `live_group_members()` from the inventory kind, `session_on_account`, `set_group_account` (atomic `groups.json` plus a `roles.jsonl` line), and the refusal watcher writing the group's account before `move_sessions`. The pause-for-move protocol (merged at `45ea3a6b`) lives in `scripts/shutdown/settle.py`: `PAUSE_FOR_MOVE`, `_settle_text`, the `ready` verb, `REASK_AFTER`, `tell_showrunner_stopping`, `_stop_after_telling`; it is another unit's code and this phase does not edit it. No `move`, `set-role`, `swap` or `shutdown down` runs against the real home; previews only.
 
-**Acceptance gate:** the accounts suite and the scoped lint pass with no `Any`, and the accounts suite passes again under the real home; `exec_account`'s existing tests pass unchanged.
+**Acceptance gate:** the accounts, shutdown, production, whoami and nightly_review suites and the scoped lint pass, and pass again under the real home. On natedev, `accounts.py move units "claude 1" --dry-run` and `move showrunners "claude 3" --dry-run` list exactly the live sessions they would move and write nothing.
 
-### Phase 18 — Two account groups: showrunners and units  · status: todo
+### Phase 20 — Proof refusals stay with their session  · status: todo
 
-**Depends on:** Phase 17
-
-#### Work Order
-
-**Goal:** the user's rule of 2026-10-13, replacing "An account picked by room, not by role"'s soonest-reset picker for Claude (it put a new unit on claude 2 at 1%): showrunners share one Claude account and unit directors share one; each group launches on, and moves as, one account.
-
-**Spec:**
-
-1. **Room.** An account has room when its fresh weekly reading leaves more than `ROOM_FLOOR_PERCENT = 10`, its 5-hour window is not spent, and it holds no unresolved refusal. Readings, freshness and refusals are as `pick` reads them now.
-2. **Placement.** `accounts.placement(now) -> GroupPlacement` gives each group (`Literal["units", "showrunners"]`) an account with a typed reason:
-   - units: among accounts with room, the one whose weekly reset is soonest; ties go to the most left.
-   - showrunners: among accounts with room, the one with the most weekly left.
-   - No account with room: the group keeps its account, and the no-room alert fires as now.
-   - Showrunners leave an account that still has room only for one with at least 25 points more weekly left, so two close accounts never trade them back and forth. Units need no margin: an account's reset only moves later.
-   Example (today's readings: claude 2 1% Thu, claude 3 3% Sat, claude 1 53% Mon): both groups on claude 1. After claude 2 resets Thursday, showrunners move to claude 2 and units stay on claude 1.
-3. **One stored account per group.** `~/.local/state/accounts/groups.json` holds `{units, showrunners}`, written atomically; each change appends `{at, group, label, why}` to `roles.jsonl`. With no file, the first read writes the placement. New launches read it: `role_account("unit")` (`add_unit.py`, nightly review, `exec unit`) is the units account; `role_account("showrunner")` is the showrunners account, used by `add_showrunner.py` and `promote_showrunner.py`. Codex seats keep "Codex seats move on a refusal".
-4. **A group moves whole.** The refusal watcher, each tick:
-   - a refusal of any live session in a group (5-hour under 20 minutes away: the group waits, as now) moves every live session of that group, the refused account excluded;
-   - a placement that differs from a group's stored account moves the group there, through the same stop path, whose hold waits for each turn to end.
-   Either way it calls `move_sessions(<every live id of the group>, target, why=…)` once and then writes the group's account; a move that fails to start writes nothing, and the next tick tries again. A session in no group (a scratch probe, an ad hoc session) moves alone, as now.
-5. **By hand.** `accounts.py move units|showrunners <claude N>` moves a group and sets its account; `move <session>` refuses for a session in a group, naming the group command. `move showrunners <source> <target>` becomes `move showrunners <target>`.
-6. **Status.** `/showrunner:accounts status` opens with `units: <label>, showrunners: <label>`, and the table's role cell names the group(s) on each account instead of `next`. `accounts.py placement --explain` prints each account's room and each group's choice with its reason.
-
-**Files:**
-
-- `scripts/accounts/accounts.py`, `scripts/accounts/test_accounts.py` — room, placement, the group file, `role_account`, the group move commands, status.
-- `scripts/accounts/refusal_watch.py`, `scripts/accounts/test_refusal_watch.py` — group refusal and placement moves.
-- `scripts/production/add_showrunner.py`, `scripts/production/promote_showrunner.py`, `scripts/production/test_add_showrunner.py`, `scripts/production/test_promote_showrunner.py` — the showrunners account (also touches; owner enh-showrunner-unit).
-- `docs/accounts.md`, `commands/showrunner/accounts.md` — the two groups, the floor, the group move.
-
-**Seats:** 1 writer + 1 tester.
-- `impl` — every production file and doc above; hub: `scripts/accounts/accounts.py` (`placement`, `GroupPlacement`, the group file).
-- `test` — the tests above: the example's readings put both groups on claude 1, and after claude 2 resets, showrunners on claude 2 and units on claude 1; an account at the floor has no room; the 25-point margin holds showrunners on a close account; no account with room keeps each group where it is; a refusal of one unit moves every live unit; a placement change moves the group once and writes its account only when the move starts; a session in no group moves alone; `move <session>` refuses for a grouped session; launches read the group file; the status line.
-
-**Constraints from prior phases:** "An account prepared for any launcher" ships `prepared_account` (used by `exec_account`). "Claude sessions move on a refusal" ships the watcher, `move_sessions` and the shutdown hold. `inventory` classes each live session `unit` or `showrunner`. `accounts.py` imports no Codex mesh or alert code at module level. Every test module reaching `agent_accounts.user_zone()` points `showrunners.NOTIFIER_STATE_DIR` at an empty directory. `scripts/notify/review.py` is not changed before message-clarity Phase 4 merges; it reads `role_account("unit")`, which now returns the units account. herdr-trial's Phase 7 resumes a herdr session with no `--account` by calling `role_account("unit")` or `role_account("showrunner")` for the session's group: keep both names and their return types stable.
-
-**Acceptance gate:** the accounts, shutdown, whoami, production and nightly_review suites and the scoped lint pass, and pass again under the real home. `accounts.py placement --explain` and `refusal_watch.py --dry-run` on natedev report the groups and any move they would make; no move runs without the user present.
-
-### Phase 19 — Proof refusals stay with their session  · status: todo
-
-**Depends on:** Phase 16, Phase 17, Phase 18
+**Depends on:** Phase 16, Phase 17, Phase 18, Phase 19
 
 #### Work Order
 
@@ -768,29 +780,31 @@ After a seat launch's own turn has ended, a move to the selected seats home that
 1. **A typed origin.** `refusal_watch.session_refusal` returns `TranscriptRefusal` (the transcript's `rate_limit` entry), `ProofRefusal` (an `--assume-refused` file) or `NoSessionRefusal`. The on-disk file shape is `AssumedRefusalFile`. Every consumer (the watcher, `cancelled`, settle's usage-limit hold) matches on the type, never on a text field.
 2. **No account-wide write.** A `ProofRefusal` never calls `refusals.write_refusal`: the account's stored refusal and `refusals.resolved()` are unchanged by a proof, and `accounts.pick` for any other session gives the same answer before and after it. The probe's own move still excludes its source account through `pick(..., exclude=…)`. A `TranscriptRefusal` keeps writing the account refusal once per (session id, entry uuid), as now.
 3. **The proof file ends with the proof.** The assumed refusal file is deleted when the session's record restarts, when it is cancelled (both as now), and when the watcher delivers the continuation after a five-hour wait.
-4. **The move says its cause.** `RequestedMove` gains `cause: Literal["refusal", "by hand", "placement"]` (a group move by placement, from "Two account groups", is `placement`); a reader treats a missing `cause` as `refusal` (Codex entries, and Claude entries written before this phase). `shutdown.py down` takes `--refused <weekly|five_hour|unknown> [--reset <aware ISO>]`; `move_sessions(ids, target, *, why, refusal)` passes the watcher's refusal (window and reset, from the transcript or the proof) through it. With `--refused`, the `requested` entry is `cause: refusal` with that window and reset. Without it (`accounts.py move`, `move showrunners`) it is `cause: by hand`, `window: unknown`, no `reset`, and never inherits a stored account refusal; today `settle.down` reads `refusals.load()` for the window, which a hand move must not do.
+4. **The move says its cause.** `RequestedMove` gains `cause: Literal["refusal", "by hand"]`; a reader treats a missing `cause` as `refusal` (Codex entries, and Claude entries written before this phase). `move_sessions(ids, target, *, why, origin)` takes `MoveOrigin = RefusalOrigin(window, reset) | HandOrigin` and passes it to `shutdown.py down` as `--refused <weekly|five_hour|unknown> [--reset <aware ISO>]` or nothing. With `--refused`, the `requested` entry is `cause: refusal` with that window and reset. Without it (`accounts.py move`, the group move commands) is `cause: by hand`, `window: unknown`, no `reset`, and never inherits a stored account refusal; today `settle.down` reads `refusals.load()` for the window, which a hand move must not do.
 5. `/showrunner:accounts status` shows `by hand` beside a hand move's request in the last-10 list.
-6. `move_showrunners` returns every login group's output, not only the first group's. The watcher's fallback for a watch entry without its first observation goes: no such watch file exists outside tests.
+6. **A proof stays out of the groups.** `--assume-refused` takes only an ungrouped probe (inventory kind neither `unit` nor `showrunner`) and refuses a grouped session with that reason, since a grouped session relaunches only on its group's account. A `ProofRefusal` never changes a group's stored account and never joins the exclusions the tick uses for other sessions.
+7. **A group move is one counted transition.** A group move gets one `move_id` with its origin (cause, window, reset); the `roles.jsonl` group entry, every member's `requested` entry, and a later tick's reconciliation request for that group all carry it, so a partial move completes under the same id and cause. Both journal writers (`settle.down` and the fallback writer in `accounts.py` ~2025) write the cause. Phase 9 counts group transitions by that id.
+8. The watcher's fallback for a watch entry without its first observation goes: no such watch file exists outside tests.
 
 **Files:**
 
 - `scripts/accounts/refusal_watch.py`, `scripts/accounts/test_refusal_watch.py` — the typed origin, no account write for a proof, the file deleted on continuation.
 - `scripts/accounts/moves.py`, `scripts/accounts/test_moves.py` — `cause`.
-- `scripts/accounts/accounts.py`, `scripts/accounts/test_accounts.py` — `move_sessions` passes the refusal; status shows `by hand`.
+- `scripts/accounts/accounts.py`, `scripts/accounts/test_accounts.py` — `move_sessions` takes the move origin; status shows `by hand`.
 - `scripts/shutdown/settle.py`, `scripts/shutdown/shutdown.py`, `scripts/shutdown/test_settle.py` — `--refused`/`--reset`, the `requested` entry's cause, window and reset; the hold matches on the refusal type.
 - `docs/accounts.md`, `commands/showrunner/accounts.md` — a proof refusal stays with its session; the cause on a move.
 
 **Seats:** 1 writer + 1 tester.
 - `impl` — every production file and doc above; hub: `scripts/accounts/refusal_watch.py` (the refusal types).
-- `test` — the tests above: a proof refusal leaves `refusals.load()` and `pick` unchanged while its probe still moves; a transcript refusal still writes once; the proof file deleted on restart, cancel and continuation; a watcher move's `requested` has `cause: refusal` with the refusal's window and reset; a hand `move` with a stored account refusal present writes `cause: by hand`, `window: unknown`, no `reset`; a missing `cause` reads as `refusal`; the status line shows `by hand`; settle's hold entered from a `ProofRefusal`.
+- `test` — the tests above: a proof refusal leaves `refusals.load()` and `pick` unchanged while its probe still moves; a transcript refusal still writes once; the proof file deleted on restart, cancel and continuation; a watcher move's `requested` has `cause: refusal` with the refusal's window and reset; a hand `move` with a stored account refusal present writes `cause: by hand`, `window: unknown`, no `reset`; a missing `cause` reads as `refusal`; `--assume-refused` on a grouped session refuses and leaves both group accounts unchanged; a group move's `move_id` and cause appear on its `roles.jsonl` entry, every member's `requested` entry and a later tick's completion request, for a hand move and a refusal move; the status line shows `by hand`; settle's hold entered from a `ProofRefusal`.
 
-**Constraints from prior phases:** "Claude sessions move on a refusal" ships the watcher (`refusal_watch.py`, run at the end of `agent_notes.py`'s argument-free run), its watch state `~/.local/state/accounts/refusal_watch.json` (`WatchedSession` per session: `entry_id`, `state` in `requested|cancelled|continued|waited|no room|retry`, `move_id`, and the first observation `FirstRefusalObservation`), the assumed refusal files `~/.local/state/accounts/assumed_refusals/<session id>.json` (`uuid`, `timestamp`, `window`, `reset`), and `move_sessions` returning `SessionMoveRequested | SessionMoveRefused` per session (a refusal before any record writes a standalone `failed`). A five-hour wait ends with `wait ended`, then one `Continue where you stopped.` through `settle.send_message` and the entry marked `continued`. `settle.down` writes the `requested` entries after the records exist and withdraws them if the conductor launch fails; `refusal_watch.cancelled` runs before a cancelled record is withdrawn. `restart.mark_restart_failed` is the one path that sets `restart failed`/`manual restart` on a targeted record and journals `failed`. `accounts.py` imports no Codex mesh or alert code at module level (lint fails on an import cycle). Every test module reaching `agent_accounts.user_zone()` points `showrunners.NOTIFIER_STATE_DIR` at an empty directory. "An account prepared for any launcher" moves `exec_account`'s account preparation into `prepared_account`.
+**Constraints from prior phases:** "Claude sessions move on a refusal" ships the watcher (`refusal_watch.py`, run at the end of `agent_notes.py`'s argument-free run), its watch state `~/.local/state/accounts/refusal_watch.json` (`WatchedSession` per session: `entry_id`, `state` in `requested|cancelled|continued|waited|no room|retry`, `move_id`, and the first observation `FirstRefusalObservation`), the assumed refusal files `~/.local/state/accounts/assumed_refusals/<session id>.json` (`uuid`, `timestamp`, `window`, `reset`), and `move_sessions` returning `SessionMoveRequested | SessionMoveRefused` per session (a refusal before any record writes a standalone `failed`). A five-hour wait ends with `wait ended`, then one `Continue where you stopped.` through `settle.send_message` and the entry marked `continued`. `settle.down` writes the `requested` entries after the records exist and withdraws them if the conductor launch fails; `refusal_watch.cancelled` runs before a cancelled record is withdrawn. `restart.mark_restart_failed` is the one path that sets `restart failed`/`manual restart` on a targeted record and journals `failed`. `accounts.py` imports no Codex mesh or alert code at module level (lint fails on an import cycle). Every test module reaching `agent_accounts.user_zone()` points `showrunners.NOTIFIER_STATE_DIR` at an empty directory. "An account prepared for any launcher" moves `exec_account`'s account preparation into `prepared_account`. "Two account groups" adds the watch state `group selected`; the showrunner resume lookup sits in `restart._resume_parts`; `restart.launch_entry` catches `accounts.AccountsError` per entry so one refused member never stops the rest.
 
-**Acceptance gate:** the accounts, shutdown, whoami and nightly_review suites and the scoped lint pass, and pass again under the real home. `refusal_watch.py --dry-run` on natedev reports no refused session, or each one with its decision.
+**Acceptance gate:** the accounts, shutdown, production, whoami and nightly_review suites and the scoped lint pass, and pass again under the real home. `refusal_watch.py --dry-run` on natedev reports no refused session, or each one with its decision.
 
-### Phase 20 — Live proof of the moves  · status: todo · gated by G4
+### Phase 21 — Live proof of the moves  · status: todo · gated by G4
 
-**Depends on:** Phase 15, Phase 16, Phase 18, Phase 19
+**Depends on:** Phase 15, Phase 16, Phase 18, Phase 19, Phase 20
 
 #### Work Order
 
@@ -798,13 +812,13 @@ After a seat launch's own turn has ended, a move to the selected seats home that
 
 **Spec:**
 
-1. `accounts.py pick claude --explain` agrees with status's next Claude account, and `pick codex --exclude '<current seats label>' --explain` with status's account the seats would move to, on the same stored readings.
+1. `accounts.py placement --explain` agrees with status's `units:` and `showrunners:` accounts, and `pick codex --exclude '<current seats label>' --explain` with status's account the seats would move to, on the same stored readings.
 2. A scratch probe in tmux on a Claude account: `refusal_watch.py --assume-refused <probe> weekly` moves it to the picked account through the real stop path (the shutdown hold reads the assumed refusal). It resumes with the moved note, answers a question about its earlier turns, and `account.py --pid` shows the target. While it waits in the shutdown hold, `/shutdown status` shows its target, why and what holds it. Run once more with `five-hour --reset-in 15` and it waits: one `waited`; after the reset, one `wait ended`, one `Continue where you stopped.` delivered to the probe, the probe working on, `account.py --pid` unchanged, no `requested`, and the probe's assumed refusal file gone. Neither proof changes the account's stored refusal: `pick claude --explain` names the same account before and after each.
 3. A scratch probe in a Ghostty window: the same move, with the window back on its desktop.
 4. Codex, with the user present: `agent_notes.py blocked <seats home> <login> '<seats label>' --window weekly --refused-at <now, aware ISO>` moves the seats role to the picked Codex account: one `requested`, then one `confirmed` per seat as each resumes on the new home. The mesh's own path — a seat refused mid-turn resumes with exactly one "Continue where you stopped." before any held message — is proved by its tests and live by the first real Codex refusal (item 6). A Codex 5-hour wait is shown live only if a 5-hour reset under 20 minutes away occurs during the session; otherwise its tests stand.
+4a. **A scratch group moves whole** (showrunner, 2026-10-14; no user needed, nothing real moves). A scratch group holding only two probe sessions (a group of its own if the configuration accepts one, otherwise an isolated groups configuration in which only the probes match `units`) takes a refusal: both probes get the `Pause for move` message and answer `ready --where`, both resume on the target account with their conversations, and no real session receives any message.
 5. `moves.jsonl` holds, for each move above, its `requested` and then a `confirmed` per seat or session (or `failed` with its reason), and for each wait its `waited` and `wait ended`; `/showrunner:accounts status` lists them with their outcomes.
-6. The first real refusal after this phase, Claude or Codex, is reported to the showrunner with its entries when it happens. Phase 20 completes, and G3's clock starts, without waiting for it.
-7. `/showrunner:accounts status` names both group accounts and agrees with `accounts.py placement --explain` on the same stored readings.
+6. The first real refusal after this phase, Claude or Codex, is reported to the showrunner with its entries when it happens. Phase 21 completes, and G3's clock starts, without waiting for it.
 
 **Files:**
 

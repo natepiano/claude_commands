@@ -28,12 +28,19 @@ else:
 
 MARKER_MAX_AGE_SECONDS = 600
 ALREADY_SENT = "The held version of this push was already sent."
+UNREVIEWED_FALLBACK = ("This push was never reviewed, so it cannot go out as a fallback. "
+    "Bring it to the user in your reply, or resend it with send.py once the failure is fixed.")
+
+
+HELD_FALLBACK = "This push was not sent because it failed review. Revise it and resend it with send.py; no fallback is allowed."
 
 
 class GateOutcome(Enum):
     ALLOW = "allow"
     DENY = "deny"
     DELIVERED = "delivered"
+    UNREVIEWED = "unreviewed"
+    HELD = "held"
 
 DENIAL = ("PushNotification is only the fallback for a failed send. Send with "
           "~/.claude/scripts/message/send.py --to user (see /alert_user); it is reviewed for clarity first.")
@@ -57,6 +64,9 @@ class FailedPushRecord(TypedDict):
     body: str
     message: str
     fallback: str
+    held: NotRequired[bool]
+    reviewed: NotRequired[bool]
+    need: NotRequired[str]
     held_source: NotRequired[str]
     held_identity: NotRequired[str]
     held_machine: NotRequired[str]
@@ -134,6 +144,10 @@ def matches_failed_push(raw: str, *, clock: Callable[[], float] = time.monotonic
         if " ".join(message.split()) != " ".join(text(record, "fallback").split()):
             return GateOutcome.DENY
         marker.unlink()
+    if record.get("held") is True and record.get("need") != "blocked":
+        return GateOutcome.HELD
+    if record.get("reviewed", True) is not True and record.get("need") != "blocked":
+        return GateOutcome.UNREVIEWED
     source = record.get("held_source")
     identity = record.get("held_identity")
     if isinstance(source, str) and source and isinstance(identity, str) and identity:
@@ -163,8 +177,10 @@ def main(*, clock: Callable[[], float] = time.monotonic,
         print(f"push gate: {type(error).__name__}: {error}", file=sys.stderr)
         return
     if outcome is not GateOutcome.ALLOW:
+        reason = {GateOutcome.DENY: DENIAL, GateOutcome.DELIVERED: ALREADY_SENT,
+                  GateOutcome.UNREVIEWED: UNREVIEWED_FALLBACK, GateOutcome.HELD: HELD_FALLBACK}[outcome]
         response: HookResponse = {"hookSpecificOutput": {
-            "hookEventName": "PreToolUse", "permissionDecision": "deny", "permissionDecisionReason": ALREADY_SENT if outcome is GateOutcome.DELIVERED else DENIAL}}
+            "hookEventName": "PreToolUse", "permissionDecision": "deny", "permissionDecisionReason": reason}}
         print(json.dumps(response))
 
 

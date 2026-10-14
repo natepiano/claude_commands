@@ -230,7 +230,11 @@ class RecordTests(unittest.TestCase):
             systemd_run.chmod(0o755)
             command = (
                 'source "$1"; BUILDLOG_RECORD="$2"; sweep_after_step() { :; }; '
-                'run_once bash -c "printf step\\n"'
+                'buildlog_now() { '
+                'if [[ -e "$TEST_STEP_FINISHED" ]]; then BUILDLOG_NOW=1790942507; '
+                'elif [[ "$(< "$BUILDLOG_MEMINFO")" == "MemAvailable: 12582912 kB" ]]; '
+                'then BUILDLOG_NOW=1790942500; else BUILDLOG_NOW=1790942400; fi; }; '
+                "run_once bash -c 'printf \"step\\n\"; touch \"$TEST_STEP_FINISHED\"'"
             )
             process = subprocess.Popen(
                 ["bash", "-c", command, "bash", str(SCRIPT.parent.parent / "lint" / "invoke.sh"), str(SCRIPT)],
@@ -240,7 +244,7 @@ class RecordTests(unittest.TestCase):
                     XDG_RUNTIME_DIR=str(runtime.parent),
                     BUILDLOG_OFF="0", BUILDLOG_SCOPE="1",
                     BUILDLOG_MEMINFO=str(meminfo), BUILDLOG_MEM_POLL_S="1", BUILDLOG_MEM_WAIT_LIMIT_S="5",
-                    BUILDLOG_SYNC="1",
+                    BUILDLOG_SYNC="1", TEST_STEP_FINISHED=str(self.base / "step-finished"),
                 ),
                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
             )
@@ -251,7 +255,6 @@ class RecordTests(unittest.TestCase):
                 first_message = cast(str, process.stderr.readline())
                 self.assertIn("waiting for memory since ", first_message)
                 time.sleep(1.1)
-                released_at = time.time()
                 _ = meminfo.write_text("MemAvailable: 12582912 kB\n")
                 output, remaining_errors = process.communicate(timeout=8)
                 errors = first_message + remaining_errors
@@ -270,8 +273,8 @@ class RecordTests(unittest.TestCase):
         assert isinstance(wait, int)
         assert isinstance(duration, (int, float))
         self.assertGreaterEqual(wait, 1)
-        self.assertGreaterEqual(started, released_at - 0.01)
-        self.assertLess(duration, 0.8)
+        self.assertEqual(started, 1790942500)
+        self.assertEqual(duration, 7)
 
     def test_memory_admission_explains_limit_once(self) -> None:
         meminfo = self.base / "meminfo"

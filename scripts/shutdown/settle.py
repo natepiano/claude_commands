@@ -32,12 +32,13 @@ import showrunner_footer
 import sessions
 import showrunners
 import stop as stop_work
-from user_action import ActionRequired
 from user_zone import user_zone
 if TYPE_CHECKING:
     from ..notify import review
+    from ..notify.push_texts import RenderedPush, render, user_send_argv
 else:
     import review
+    from push_texts import RenderedPush, render, user_send_argv
 
 SHUTDOWN = Path(__file__).resolve().parent / "shutdown.py"
 NOTIFIER = SCRIPTS / "message" / "notifier.sh"
@@ -265,21 +266,19 @@ def send_message(
     return _deliver_message(command, recipient, text)
 
 
-def alert_user(summary: str, text: str, action: ActionRequired, *, machine: str = "") -> None:
-    """Send the user an action through the shutdown alert path."""
-    command = [*_send_command(), "--to", "user", "--from", "shutdown",
-               "--summary", summary, "--need", "decision", "--action", action.text]
-    if machine:
-        command.extend(("--machine", machine))
+def stopped_sessions_text(count: int) -> str:
+    """Name the number of sessions still waiting on a stop or restart."""
+    return "One session" if count == 1 else f"{count} sessions"
+
+
+def alert_user(push: RenderedPush, *, machine: str = "") -> None:
+    """Send a registry action through the shutdown alert path."""
+    command = [*_send_command(), *user_send_argv(push, machine=machine)[2:]]
     try:
-        _ = _deliver_message(command, "user", text)
+        _ = _deliver_message(command, "user", "")
     except RuntimeError as error:
         print(f"shutdown: user alert failed: {error}", file=sys.stderr)
 
-
-def alert_details(lines: list[str]) -> str:
-    details = "\n".join(lines)
-    return details if len(details) <= 180 else details[:177] + "..."
 
 def _notifier_enabled(instance: str) -> bool:
     root = Path(
@@ -1114,6 +1113,12 @@ def report_stop(records: list[SessionShutdown]) -> None:
         lines.append(f"{other_machine()}: not reached")
     for saved in records:
         lines.extend(f"  {saved['session']['name']}: {stop_issue_text(issue)}" for issue in saved["stop_issues"])
+    for saved in records:
+        progress = saved["progress"]
+        if progress["kind"] == "stop failed" or progress["kind"] == "restart failed":
+            lines.append(f"  {saved['session']['name']}: {progress['reason']}")
+        elif progress["kind"] == "manual restart":
+            lines.append(f"  {saved['session']['name']}: run {progress['command']}")
     failed = [saved for saved in records if store.stop_incomplete(saved)]
     restore_failed = [saved for saved in records if saved["progress"]["kind"] in {"restart failed", "manual restart", "timers pending"}]
     if failed:
@@ -1131,39 +1136,29 @@ def report_stop(records: list[SessionShutdown]) -> None:
     tell_showrunners_outcome([saved for saved in records if saved["machine"] == local_machine()])
     text = "\n".join(lines)
     origins = {saved["requested_by"]["session_id"] for saved in records if saved["requested_by"]["kind"] == "session"}
-    account = json.dumps(first["label"])
-    def failure_details(items: list[SessionShutdown], verb: str) -> str:
-        details: list[str] = []
-        for saved in items:
-            progress = saved["progress"]
-            if progress["kind"] == "stop failed" or progress["kind"] == "restart failed":
-                reason = progress["reason"]
-            elif progress["kind"] == "manual restart":
-                reason = "manual restart needed: " + progress["command"]
-            elif progress["kind"] == "timers pending":
-                reason = "session restarted; some scheduled jobs have not resumed"
-            else:
-                reason = progress["kind"]
-            details.append(f"The session named {saved['session']['name']} on {saved['machine']} {verb}: {reason}.")
-            details.extend(stop_issue_text(issue) for issue in saved["stop_issues"])
-        return alert_details(details)
+    route = "natedev" if local_machine().casefold() == "mac" else ""
+    stop_due = [saved for saved in failed if saved["hold"] == "account" and saved["alerts"] == "user"]
+    unpushed = [saved for saved in restore_failed
+                if saved["progress"]["kind"] != "timers pending" and saved["alerts"] == "user"
+                and saved.get("restore_alerted") != _not_back_text(saved)]
     try:
-        if any(saved["hold"] == "account" and saved["alerts"] == "user" for saved in failed):
-            alert_user("Claude account shutdown is incomplete",
-                       f"The shutdown you requested on Claude account {account} did not finish. " + failure_details(failed, "could not stop")
-                       + "\n\nThe status command lists what failed. The now command tries to stop them again.",
-                       ActionRequired(f"In a Claude session on natedev, read /shutdown status {account}, then retry with /shutdown now {account}."),
-                       machine="natedev" if local_machine().casefold() == "mac" else "")
-        elif unpushed := [saved for saved in restore_failed
-                          if saved["alerts"] == "user" and saved.get("restore_alerted") != _not_back_text(saved)]:
-            alert_user(f"{first['label'] if len(first['label']) <= 16 else 'Claude'} sessions did not come back",
-                       f"Sessions on Claude account {account} did not return after shutdown. " + failure_details(unpushed, "could not return")
-                       + "\n\nThe status command lists what failed. The restart command tries to bring the sessions back.",
-                       ActionRequired(f"In a Claude session on natedev, read /shutdown status {account}, then /shutdown restart {account} to retry."),
-                       machine="natedev" if local_machine().casefold() == "mac" else "")
+        due = stop_due or [saved for saved in unpushed if saved["progress"]["kind"] == "restart failed"]
+        text_id = "shutdown.stop_failed" if stop_due else "shutdown.restart_failed"
+        for machine in dict.fromkeys(saved["machine"] for saved in due):
+            items = [saved for saved in due if saved["machine"] == machine]
+            alert_user(render(text_id, account=json.dumps(first["label"]), machine=machine,
+                              stopped=stopped_sessions_text(len(items))), machine=route)
+            if not stop_due:
+                for saved in items:
+                    _mark_not_back_pushed(saved)
+        if not stop_due:
             for saved in unpushed:
-                _mark_not_back_pushed(saved)
+                if saved["progress"]["kind"] == "manual restart":
+                    alert_user(render("shutdown.manual_restart", session=saved["session"]["name"], machine=saved["machine"]), machine=route)
+                    _mark_not_back_pushed(saved)
     finally:
+        if not origins:
+            print(text)
         for origin in sorted(origins):
             _ = send_message(f"session:{origin}", summary, text, key=f"shutdown-result-{first['login']}")
 
@@ -1308,14 +1303,9 @@ def _remote_control_alert(records: list[SessionShutdown], missing: tuple[NoRemot
     due = [item for item in missing if item["alerts"] == "user"]
     if not due:
         return
-    names = ", ".join(item["name"] for item in due)
-    machine = records[0]["machine"]
-    instruction = f"In the {names} session's terminal on {machine}, run /remote-control." if len(due) == 1 else f"In each listed session's terminal on {machine}, run /remote-control."
-    text = (f"The Claude sessions on {machine} were restarted and are running again. "
-            f"Remote control is still off in {names}, so you cannot reach {'it' if len(due) == 1 else 'them'} from your phone until you turn it back on.")
-    title = f"{names} session unreachable from your phone" if len(due) == 1 and len(names) <= 5 else "Claude sessions unreachable from your phone"
-    alert_user(title, text, ActionRequired(instruction),
-        machine="natedev" if local_machine().casefold() == "mac" else "")
+    for item in due:
+        alert_user(render("shutdown.remote_control", session=item["name"], machine=records[0]["machine"]),
+                   machine="natedev" if local_machine().casefold() == "mac" else "")
 
 
 def _shows_form(reason: str) -> bool:
@@ -1349,7 +1339,6 @@ def _reserve_holdout_alert(saved: SessionShutdown, at: datetime, *, form: bool =
 
 def _send_holdout_alert(held: list[tuple[SessionShutdown, str]]) -> None:
     """Tell the requester about every holdout; push to the phone only a form the user must answer."""
-    first = held[0][0]
     summaries = [f"{saved['session']['name']} is not answering the shutdown of {saved['label']}" for saved, _ in held]
     lines: list[str] = []
     for saved, reason in held:
@@ -1362,48 +1351,21 @@ def _send_holdout_alert(held: list[tuple[SessionShutdown, str]]) -> None:
     if not due:
         _tell_holdout_requesters(held, summary, text)
         return
-    waiting = [f"Its session named {saved['session']['name']} on {saved['machine']} is {reason}, so it has not stopped." for saved, reason in due]
-    account = json.dumps(first["label"])
-    names = ",".join(saved["session"]["name"] for saved, _ in due)
-    subject = "it" if len(due) == 1 else "them"
-    possessive = "its" if len(due) == 1 else "their"
-    form_instruction = " Read any open form in that session's terminal before choosing." if len(due) == 1 else ""
-    opening = f"Shutdown of Claude account {account} is waiting for sessions to stop. "
-    action_text = "In the natedev Claude session, choose cancel or stop now."
-    choices = (f"\n\nCancel (recommended): /shutdown cancel {account} --only {names}. This keeps {subject} running so you can check {possessive} work.\n\n"
-               + f"Stop now: /shutdown now {account} --only {names}. This stops {subject} without waiting.")
-    omitted = f"{len(waiting)} more sessions are waiting."
-    fixed_length = len("Action: " + action_text + "\n" + opening + form_instruction)
-    account_wide = len(due) > 1 and fixed_length + len(choices) + len(omitted) >= 500
-    if account_wide:
-        choices = (f"\n\nCancel (recommended): /shutdown cancel {account}. This keeps every waiting session running so you can check their work.\n\n"
-                   + f"Stop now: /shutdown now {account}. This stops every waiting session without waiting for its work to finish.")
-    budget = min(120, 499 - fixed_length - len(choices))
-    included: list[str] = []
-    for index, sentence in enumerate(waiting):
-        remaining = len(waiting) - index - 1
-        suffix = f"{remaining} more {'session is' if remaining == 1 else 'sessions are'} waiting." if remaining else ""
-        if len(" ".join([*included, sentence, *([suffix] if suffix else [])])) > budget:
-            break
-        included.append(sentence)
-        omitted = suffix
-    if account_wide and not included:
-        omitted = f"{len(waiting)} sessions are waiting."
-        reason_sentence = f"One is {due[0][1]}, so it has not stopped."
-        if len(omitted + " " + reason_sentence) <= budget:
-            omitted += " " + reason_sentence
-    phone_text = opening + " ".join([*included, *([omitted] if omitted else [])]) + form_instruction + choices
-    title = "Shutdown waits on a session showing a form"
     try:
-        alert_user(title, phone_text,
-            ActionRequired(action_text),
-            machine="natedev" if local_machine().casefold() == "mac" else "")
+        for saved, _ in due:
+            host = saved["session"]["host"]
+            window = (host["tmux_session"] if host["kind"] == "tmux" else
+                      host["session_name"] if host["kind"] == "unit" else saved["session"]["name"])
+            alert_user(render("shutdown.form", session=window, machine=saved["machine"]),
+                       machine="natedev" if local_machine().casefold() == "mac" else "")
     finally:
         _tell_holdout_requesters(held, summary, text)
 
 
 def _tell_holdout_requesters(held: list[tuple[SessionShutdown, str]], summary: str, text: str) -> None:
     origins = {saved["requested_by"]["session_id"] for saved, _ in held if saved["requested_by"]["kind"] == "session"}
+    if not origins:
+        print(text)
     for origin in sorted(origins):
         _ = send_message(f"session:{origin}", summary, text, key=f"shutdown-holdout-{held[0][0]['login']}")
 

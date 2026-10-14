@@ -146,7 +146,62 @@ The design is `~/.local/state/plan-backlog/2026-10-13-user-message-clarity.md`, 
 
 **Ruled out:** a fixed reviewer constant (`TIMEOUT_S = 20`), too short and not configurable; storing the limit in `config/agents.conf`, which is pinned; letting the model judge length limits, which it flagged falsely on short bodies.
 
+### Phase 8 — Every push to the user goes through the review: no unreviewed path  · status: done
+
+#### As-built
+
+- `review.reviewer_binary()` resolves the reviewer once per review: `shutil.which("claude")`, then `~/.local/bin/claude`, `/etc/profiles/per-user/$USER/bin/claude`, `/run/current-system/sw/bin/claude`; the first executable wins. None found gives `Unreviewed("no claude binary: <paths tried>")`, and the push still goes out as written. The `review.jsonl` line records the resolved path or the paths tried.
+- `send.py`'s `FailedPush` and the fallback marker `failed/<session_id>.json` carry `reviewed: bool` (true only when the text came from a `pushover: reviewed JSON:` line, local or remote) and `need: "note" | "decision" | "blocked"`. A remote failure reads the stderr `send.py: failed push JSON:` record first, so both fields survive when an SSH drop loses the stdout outcome header.
+- `pre-tool-use-push-gate.py` allows a fallback only when the marker says `reviewed: true` or `need: "blocked"`; otherwise it consumes the marker and denies with `UNREVIEWED_FALLBACK` ("This push was never reviewed, so it cannot go out as a fallback. Bring it to the user in your reply, or resend it with send.py once the failure is fixed."). A marker without the fields is treated as reviewed. Any gate error still allows.
+- `send.py`'s `FAILED:` line carries the same denial when the fallback would be denied; `commands/message.md` states when `FAILED` permits a fallback.
+
+**Files:**
+- `scripts/notify/review.py` — `reviewer_binary()` and its log fields
+- `scripts/message/send.py` — `FailedPush.reviewed`/`need`, the marker fields, remote stderr record read first, the `FAILED:` line
+- `scripts/hooks/pre-tool-use-push-gate.py` — the unreviewed non-blocked fallback denial
+- `commands/message.md` — the `FAILED` fallback rule
+- `scripts/notify/test_review.py`, `scripts/message/test_send.py`, `scripts/hooks/test_push_gate.py`, `scripts/notify/test_pushover.py` — their cases
+
+**Binds later work:** the push-text registry's `Withheld`/`Failed` outcomes keep the marker's `reviewed` and `need` and the gate rule that an unreviewed non-blocked failure denies the fallback; a withheld push never reads as a permitted fallback, and its `held` marker field stays separate from `reviewed`. `Unreviewed` still sends.
+
+**Gotchas:** test fakes of the reviewer match the resolved binary by basename (`Path(argv[0]).name == "claude"`), since the resolved path is absolute; a bare `argv[0] == "claude"` fake never matches.
+
+**Ruled out:** holding a script or timer push at send time for a root-showrunner report — a timer has no session to report to, and holding loses the push.
+
+### Phase 9 — Script pushes are reviewed before they ship, and a push that fails review is not sent  · status: done
+
+#### As-built
+
+- `scripts/notify/push_texts.py` is the one way a script builds a phone push: `PushText` (templates `sender`, `need`, `title`, `action`, `body`; `action` is an `ActionTemplate` or no action, never `str | None`), `PushExample`, `ActionTemplate`, `render(id, **values)` (an unknown id or a missing or extra value raises), `render_entry`, `fingerprint`, `user_send_argv`, `REVIEWED_FILE`; `catalog()` loads `push_catalog.ENTRIES`. User-send wrappers take a rendered push, never a string.
+- `scripts/notify/push_catalog.py` holds every fixed phone text, script and nixos, each with realistic examples; the catalog says where its examples come from.
+- `review.py texts [--id X] [--approve]` dry-reviews every filled example with the live reviewer and posts nothing; `--approve` records an approval in `scripts/notify/push_texts_reviewed.json`, keyed by a template fingerprint over the templates and every example's values and filled text.
+- `test_push_texts.py` gates: every catalog example has a current approval; title < 45 and `"Action: …\n" + body` < 500; a literal phone send (`--to user`, `--to=user`, a `pushover.py` path, `broadcast.send("user", …)`) under `scripts/` outside `push_texts.py`, `pushover.py`, `send.py`, `escalate.py` fails. `pre-tool-use-push-gate.py` applies the same token rule.
+- At send time a rewrite is re-checked once; a second failure is `ReviewOutcome` `Failed`, and a push needing nothing from the user is `Withheld` (verdict `withhold`, push mode only). A push that fails review is not sent (pushover exit 6) and the sending session is told so it can revise and resend; registry and emergency (`--need blocked`) pushes still send, logged with the failed rules, and a failing registry text schedules a template-fix request. `Unreviewed` (reviewer down) still sends as written.
+- nixos senders call `pushover.py --text-id nixos.disk_low` (values `free`, `shortfall`), `nixos.ups_battery` (`charge`, `minutes`), `nixos.ups_shutdown` (no values).
+- Status-only pushes go to the log or the requesting session; the five-hour warning is not a phone push. `quota.claude` names the target account and its remaining usage (`target`, `target_remaining`). Shutdown stop/restart failures carry a counted `stopped` value ("One session" / "N sessions"); `shutdown.form` takes `machine` and `session`.
+
+**Files:**
+- `scripts/notify/push_texts.py` — render and approval API
+- `scripts/notify/push_catalog.py` — the text catalog
+- `scripts/notify/push_texts_reviewed.json` — approvals by fingerprint
+- `scripts/notify/test_push_texts.py` — approval, length and token gates
+- `scripts/notify/review.py` — `Failed`, `Withheld`, rewrite re-check, two-review budget, `texts`
+- `scripts/notify/pushover.py`, `scripts/message/send.py` — exit 6, `--text-id`/`--value`, sends despite failure for registry and blocked pushes
+- `scripts/hooks/pre-tool-use-push-gate.py` — the token rule
+
+**Binds later work:** a new script phone push is a catalog entry sent through `push_texts.user_send_argv`; `test_push_texts` fails a literal phone send anywhere under `scripts/`. Question review is not a push and needs no catalog entry. `review.py` holds the `texts` subcommand, so edits to it keep `test_push_texts` and `test_review` green.
+
+**Gotchas:**
+- Changing a template or an example value invalidates the approval; rerun `review.py texts --id <id>` and `--approve`.
+- The reviewer is not deterministic: approve only after three passing runs.
+- Example values decide the verdict as much as templates: unrealistic or contradictory names fail review.
+- `delivery_waits()` budgets two reviews wherever a rewrite is re-checked (sender waits and `claim_stale` included).
+
+**Ruled out:** provenance tracking of example values against real sends — the logs hold no real sends for those senders; the catalog says where its examples come from.
+
 ### Phase 5 — Questions in showrunner replies  · status: todo
+
+**Depends on:** Phase 4, Phase 6, Phase 9
 
 #### Work Order
 
@@ -184,7 +239,7 @@ The design is `~/.local/state/plan-backlog/2026-10-13-user-message-clarity.md`, 
 - `impl` — `update_registration.py`, `review.py` and their tests; hub: `scripts/notify/review.py`
 - `test` (opens as impl) — `showrunner_footer.py`, `stop-showrunner-footer.py`, `dailies_render.py` and their tests, produce.md sentence; publishes the `Outstanding` due-now/deferred types before `impl` changes `open_items()`
 
-**Constraints from prior phases:** `review.py` API from Phase 2 (`Draft`, `review(draft, revision)`, holds keyed by `source`, `Unreviewed` sends as written); guide tags `question`, `reply`, `all`. Phase 4: one review may take up to `review.review_timeout_seconds()` (`config/notify.conf` `REVIEW_TIMEOUT_SECONDS`, default 60 s); any wait around a review derives from `review.py`'s helpers, never a literal. `test_update_registration.py` copies the command tree into a temp directory without `scripts/notify/`, so import `review` inside the function that reviews, never at module level (a module-level import in `sweep.py` broke that test). Lengths are counted in code and each failure carries `{rule, quote}`. Phase 4: `send.py` reports a superseded push as `REPLACED`, exit 0, like `SKIPPED`. Phase 6: `footer()` appends each newly outstanding item's `text` to `outstanding/<slug>.history.jsonl` (`record_question_history`, kept 48 h), and `review.registered_questions(since)` matches reply question sentences against current outstanding texts plus those history lines for the nightly `review.py sample` count. Keep the history written when `footer()` changes, record the reviewed question (the text the reply carries) beside the item text, and have `registered_questions` read both; tests: a reviewed question counts as registered before and after its item closes, and a held batch writes no history line. `review.py` already holds `ReplyContext`, `PushReview`, `reply_questions` -> `ReplyAsks` (question and request sentences, `(recommended` choice lines; code and `>` quotes excluded) and `sample`; the footer hook's choice-line check reuses that detection, never a second detector. Dry clarity checks use the worktree's `scripts/notify/review.py`; the installed `~/.claude` copy can lag. Merge origin/build-followups before dispatch: other units' recent work touches `test_update_registration.py`.
+**Constraints from prior phases:** `review.py` API from Phase 2 (`Draft`, `review(draft, revision)`, holds keyed by `source`, `Unreviewed` sends as written); guide tags `question`, `reply`, `all`. Phase 4: one review may take up to `review.review_timeout_seconds()` (`config/notify.conf` `REVIEW_TIMEOUT_SECONDS`, default 60 s); any wait around a review derives from `review.py`'s helpers, never a literal. `test_update_registration.py` copies the command tree into a temp directory without `scripts/notify/`, so import `review` inside the function that reviews, never at module level (a module-level import in `sweep.py` broke that test). Lengths are counted in code and each failure carries `{rule, quote}`. Phase 4: `send.py` reports a superseded push as `REPLACED`, exit 0, like `SKIPPED`. Phase 6: `footer()` appends each newly outstanding item's `text` to `outstanding/<slug>.history.jsonl` (`record_question_history`, kept 48 h), and `review.registered_questions(since)` matches reply question sentences against current outstanding texts plus those history lines for the nightly `review.py sample` count. Keep the history written when `footer()` changes, record the reviewed question (the text the reply carries) beside the item text, and have `registered_questions` read both; tests: a reviewed question counts as registered before and after its item closes, and a held batch writes no history line. `review.py` already holds `ReplyContext`, `PushReview`, `reply_questions` -> `ReplyAsks` (question and request sentences, `(recommended` choice lines; code and `>` quotes excluded) and `sample`; the footer hook's choice-line check reuses that detection, never a second detector. Phase 8: the reviewer binary is resolved by `review.reviewer_binary()` (a timer's PATH may lack `claude`); test fakes match it by basename. Phase 9: `ReviewOutcome` adds `Failed(best_version, failed_rules)` and `Withheld(why)`; a `Rewritten` is re-checked once inside a two-review budget (`delivery_waits()`); the `withhold` verdict is push mode only, so question review never returns it, and a question whose rewrite fails its re-check is `Failed` — decide its footer handling the way an `ask` is handled today. Phase 9 also: every fixed phone text is a `scripts/notify/push_catalog.py` entry sent through `push_texts.user_send_argv` (or `pushover.py --text-id`), and `test_push_texts.py` fails a literal phone send (`--to user`, `--to=user`, a `pushover.py` path, `broadcast.send("user", …)`) anywhere under `scripts/` outside `push_texts.py`, `pushover.py`, `send.py` and `escalate.py`; a question review is not a push and needs no catalog entry. `review.py` also holds the `texts` subcommand and its approval file `push_texts_reviewed.json`; keep `test_push_texts.py` green when `review.py` changes. Dry clarity checks use the worktree's `scripts/notify/review.py`; the installed `~/.claude` copy can lag. Merge origin/build-followups before dispatch: other units' recent work touches `test_update_registration.py`.
 
 **Acceptance gate:** Test lines for `scripts/production`, `scripts/hooks`, `scripts/notify` green; basedpyright 0/0; tests cover a held question failing registration, its rerun accepted, a reply missing the reviewed text blocked, an unrecorded `(recommended` line blocked.
 
@@ -218,13 +273,15 @@ The design is `~/.local/state/plan-backlog/2026-10-13-user-message-clarity.md`, 
 
 ### Phase 7 — The nightly question count measures only questions put to the user  · status: todo
 
+**Depends on:** Phase 5, Phase 6
+
 #### Work Order
 
 **Goal:** The nightly count of replies holding an unregistered question is re-measured once the question history covers 48 hours, and it stops counting requests to units or sessions if those are still a large part of it.
 
 **Spec:**
-- Runs after Phase 5's checkpoint, and not before 48 h after the earliest `time` in any `~/.local/state/showrunner/outstanding/*.history.jsonl` line (showrunner's call 2026-10-13: the count is measured against a full history window first). Check at dispatch: `python3 -c` reading those files' first lines; no history file means the gate is shut.
-- Measure first, before any code change: a dry pass over the last 24 h of showrunner replies (`nightly_review.showrunner_transcripts(since)`, the worktree's `scripts/notify/review.py`: `transcript_replies`, `reply_questions`, `registered_questions`) that lists, for every reply counted as holding an unregistered question, each unregistered sentence. Classify each sentence as put to the user or addressed to a unit or session. Report total counted replies and the share whose unregistered sentences are all addressed to units or sessions. Measurement output goes in `SESSION_DIR`, never in the repository; it posts nothing.
+- Runs after Phase 5's checkpoint, and not before 48 h after question history began (showrunner's call 2026-10-13: the count is measured against a full history window first). `record_question_history` prunes lines older than 48 h on every write, so the earliest retained line never ages past 48 h and cannot be the clock: at Phase 5's PhaseEnd the unit director reads the earliest `time` in `~/.local/state/showrunner/outstanding/*.history.jsonl` (none existed at 2026-10-13 23:50 EDT) and writes it here as a fixed EDT time; the gate is that time plus 48 h. No history file at that point means the gate stays shut and the read repeats at the next check.
+- Measure first, before any code change: a dry pass over the last 24 h of showrunner replies (`nightly_review.showrunner_transcripts(since)`, the worktree's `scripts/notify/review.py`: `transcript_replies`, `reply_questions`, `registered_questions`) that lists, for every reply counted as holding an unregistered question, each unregistered sentence — and for a reply counted only for its `(recommended` choice lines (`sample`'s `asks.has_choices` branch), those lines. Classify each sentence or choice block as put to the user or addressed to a unit or session. Report total counted replies and the share whose unregistered sentences are all addressed to units or sessions. Measurement output goes in `SESSION_DIR`, never in the repository; it posts nothing.
 - Build the recipient filter only when that share is one in four or more (unit director's call: "a large part", per the showrunner). Then `reply_questions` stops counting a sentence addressed to a unit or session, by rules derived from the forms the measured peer sentences actually take (for example a sentence inside a message relayed to a session, or one naming a unit or session as its addressee), and keeps every sentence put to the user. Below one in four, the phase ships no code: its checkpoint is the plan doc and the notice.
 - The checkpoint notice carries the measured share (counted replies, peer-only replies, percentage) and whether the filter was built (showrunner's request).
 
@@ -237,4 +294,4 @@ The design is `~/.local/state/plan-backlog/2026-10-13-user-message-clarity.md`, 
 
 **Constraints from prior phases:** Phase 6: `review.py sample` counts a reply as holding an unregistered question when a question or request sentence from `reply_questions` (`ReplyAsks`; fenced code, inline code and `>` quotes excluded) matches no text from `registered_questions(since)` (current outstanding plus 48 h of `outstanding/<slug>.history.jsonl`), and a reply with only `(recommended` choice lines when no registered text appears in it. Phase 5 records the reviewed question text in that history too, and its footer hook reuses `reply_questions` for the choice-line check, so a filter change must keep that check's behavior; run `scripts/hooks` tests as well when the filter is built. Dry checks use the worktree's `review.py`; nothing reaches the phone.
 
-**Acceptance gate:** the measured share is recorded; when the filter is built: test lines for `scripts/notify` and `scripts/hooks` green, basedpyright 0/0, a test with one reply holding a user question and one holding a peer request counts 1, and a dry sample over the same 24 h prints its new count beside the measured one.
+**Acceptance gate:** the measured share is recorded; when the filter is built: test lines for `scripts/notify` and `scripts/hooks` green, basedpyright 0/0, a test with one reply holding a user question and one holding a peer request counts 1, a test with a user-directed and a peer-directed choice-only reply counts 1, and a dry sample over the same 24 h prints its new count beside the measured one.

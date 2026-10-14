@@ -5,7 +5,10 @@ from __future__ import annotations
 
 import argparse
 from collections.abc import Callable
+from contextlib import ExitStack
+from contextvars import ContextVar
 from datetime import datetime, timezone
+import importlib
 import json
 import os
 from pathlib import Path
@@ -13,7 +16,9 @@ import signal
 import sys
 import time
 from types import FrameType
-from typing import TypedDict, cast
+from typing import Protocol, TypedDict, cast, final
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 
 from targets import (
@@ -153,8 +158,35 @@ def wait_clock() -> datetime:
     return build_hold.aware_instant(supplied) if supplied else datetime.now(timezone.utc)
 
 
+@final
+class NoActiveLocalAdmissionWait:
+    """No wait owns a release-wait mechanism in this execution context."""
+
+    def wait(self, _seconds: float) -> None:
+        raise RuntimeError("local admission waiting requires an active wait")
+
+
+class LocalAdmissionWait(Protocol):
+    """An admission wait owns and closes its notification or polling mechanism."""
+
+    def arm(self) -> None: ...
+    def wait(self, seconds: float) -> None: ...
+    def __enter__(self) -> "LocalAdmissionWait": ...
+    def __exit__(self, *_arguments: object) -> None: ...
+
+
+# This CLI's import root excludes delegate; keep the runtime import at a typed
+# provider boundary rather than expanding the shared checker configuration.
+release_waiter = cast(Callable[[Path, Path], LocalAdmissionWait], getattr(
+    importlib.import_module("scripts.delegate.local_release_wait"), "local_release_waiter"))
+
+LOCAL_ADMISSION_WAIT: ContextVar[LocalAdmissionWait | NoActiveLocalAdmissionWait] = ContextVar(
+    "local_admission_wait", default=NoActiveLocalAdmissionWait())
+
+
 def wait_sleep(seconds: float) -> None:
-    time.sleep(seconds)
+    # Keep the existing wait boundary; its owner selects notifications or polling.
+    LOCAL_ADMISSION_WAIT.get().wait(seconds)
 
 
 def local_target() -> LocalTarget:
@@ -229,6 +261,7 @@ def command_wait_local(call_id: str, *, pid: int = 0) -> int:
     cancelled = False
     waiter_file = os.environ.get("BUILDLOG_HOLD_WAITER_FILE", "")
     previous_handlers: dict[int, Callable[[int, FrameType | None], object] | int | None] = {}
+    notifications = ExitStack()
 
     def interrupted(signum: int, _frame: object) -> None:
         nonlocal cancelled
@@ -245,9 +278,14 @@ def command_wait_local(call_id: str, *, pid: int = 0) -> int:
             _ = temporary.write_text(json.dumps(waiter))
             os.replace(temporary, waiter_file)
         target = local_target()
+        release_events = notifications.enter_context(release_waiter(
+            build_hold.holder_directory(), build_hold.release_directory()))
+        context = LOCAL_ADMISSION_WAIT.set(release_events)
+        _ = notifications.callback(LOCAL_ADMISSION_WAIT.reset, context)
         interval = max(0.001, float(os.environ.get("BUILD_TARGETS_POLL_S", "15")))
         escalation = float(os.environ.get("BUILD_TARGETS_ESCALATE_S", "7200"))
         while True:
+            release_events.arm()
             state = target_state(target)
             if isinstance(state, StateUnreadable):
                 print(wait_diagnostic(state.reason), file=sys.stderr, flush=True)
@@ -273,10 +311,10 @@ def command_wait_local(call_id: str, *, pid: int = 0) -> int:
                         registered = identity
                     continue
             if not announced:
+                announced = True
                 print(f"verify.sh: natedev is held by {display_field(state.holder)} for "
                       + f"{display_field(state.reason)}; waiting (tests that can run on the Mac keep running there).",
                       file=sys.stderr, flush=True)
-                announced = True
             if not escalated and (wait_clock() - state.since).total_seconds() >= escalation:
                 print(f"verify.sh: natedev has been held for 2 h by {display_field(state.holder)}; ask them.",
                       file=sys.stderr, flush=True)
@@ -286,6 +324,7 @@ def command_wait_local(call_id: str, *, pid: int = 0) -> int:
         print(wait_diagnostic(str(error)), file=sys.stderr, flush=True)
         return 12
     finally:
+        notifications.close()
         if cancelled and key:
             try:
                 build_hold.remove_call(key, call_id)

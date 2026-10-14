@@ -265,6 +265,12 @@ def main() -> int:
                         break
                 else:
                     return process.wait()
+                # Cut only the forwarded stream. Closing the pipe or killing the
+                # shell now can leave its Python writer raising BrokenPipeError
+                # on the inherited stderr, hiding the collector's cut diagnostic.
+                for _ in cast(Iterable[bytes], process.stdout):
+                    pass
+                _ = process.wait()
             finally:
                 if process.poll() is None:
                     process.terminate()

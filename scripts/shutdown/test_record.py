@@ -1097,15 +1097,13 @@ class SessionRecordTests(ShutdownTestCase):
         self.assertEqual(len(outcomes), 1)
         self.assertIsInstance(outcomes[0], record.ConductorAcquired)
 
-    def test_conductor_start_rejects_a_persistent_owner_within_bounded_time(self) -> None:
+    def test_conductor_start_rejects_a_persistent_owner_after_bounded_retries(self) -> None:
         login = "owner@example.com"
         with record.conductor_lock(login):
-            started = time.monotonic()
-            with record.conductor_lock(login) as duplicate:
-                elapsed = time.monotonic() - started
+            with patch.object(time, "sleep") as sleep, record.conductor_lock(login) as duplicate:
                 self.assertIsInstance(duplicate, record.ConductorAlreadyRunning)
-        self.assertGreaterEqual(elapsed, 0.15)
-        self.assertLess(elapsed, 1.0)
+        self.assertEqual(sleep.call_count, 5)
+        self.assertEqual([call.args for call in sleep.call_args_list], [(0.05,)] * 5)
 
 
 if __name__ == "__main__":

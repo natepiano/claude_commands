@@ -81,7 +81,7 @@ from remote import other_machine, run_remote  # noqa: E402
 import sessions  # noqa: E402
 import showrunner_footer  # noqa: E402
 import stop as stop_work  # noqa: E402
-from user_action import ActionRequired  # noqa: E402
+from push_texts import RenderedPush, render  # noqa: E402
 from user_zone import user_zone  # noqa: E402
 
 
@@ -102,6 +102,7 @@ class ShutdownServices(Protocol):
 
     def record_time(self) -> str: ...
     def local_machine(self) -> str: ...
+    def stopped_sessions_text(self, count: int) -> str: ...
     def retire_command(self, login: str, session_id: str) -> list[str]: ...
     def run_notifier(self, verb: str, instance: str) -> None: ...
     def send_message(
@@ -112,7 +113,7 @@ class ShutdownServices(Protocol):
         self, login: str, ids: tuple[str, ...], records: list[SessionShutdown],
     ) -> dict[str, str]: ...
     def alert_user(
-        self, summary: str, text: str, action: ActionRequired, *, machine: str = "",
+        self, push: RenderedPush, *, machine: str = "",
     ) -> None: ...
     def tell_showrunners_outcome(self, records: list[SessionShutdown]) -> None: ...
 
@@ -451,8 +452,13 @@ def restart_note(
 ) -> str:
     """Build the exact first prompt given to a resumed session."""
     if "target" in record:
-        return account_move_note(record["session"], record["target"],
+        note = account_move_note(record["session"], record["target"],
                                  record.get("source_label", record["label"]), record.get("why", ""))
+        where = record["where"]
+        if where["kind"] == "said":
+            punctuation = "" if where["text"].endswith((".", "!", "?")) else "."
+            note += f" Before it you wrote: {where['text']}{punctuation}"
+        return note
     opening = (
         f"Restarted after /shutdown of {record['label']} "
         f"(stopped {_user_time(record['requested_at'])}, "
@@ -501,13 +507,26 @@ class ResumeParts:
 
 
 def _resume_parts(session: Session, prompt: str, target: str = "") -> ResumeParts:
-    default_dir = str(Path.home() / ".claude")
-    config_dir = session.get("config_dir", default_dir)
+    default_dir = Path.home() / ".claude"
+    config_dir = Path(session.get("config_dir", str(default_dir)))
+    if session["kind"] in ("unit", "showrunner"):
+        from scripts.accounts import accounts
+
+        role = "unit" if session["kind"] == "unit" else "showrunner"
+        selected = accounts.account_for_group_launch(role, resume=True, target=target)
+        selected_dir = accounts.main_config_dir() if isinstance(selected, accounts.DefaultAccount) else selected.dir
+        host = session["host"]
+        herdr_host = host["kind"] == "herdr"
+        # Only native herdr resumes retain an already configured directory.
+        if target or not herdr_host or selected_dir.resolve() != config_dir.resolve():
+            target = "default" if isinstance(selected, accounts.DefaultAccount) else selected.label
+        else:
+            config_dir = selected_dir
     account: RetainResumeAccount | MoveResumeAccount = (
-        MoveResumeAccount(target) if target else RetainResumeAccount(Path(config_dir))
+        MoveResumeAccount(target) if target else RetainResumeAccount(config_dir)
     )
     environment = (
-        named_account_environment(Path(config_dir))
+        named_account_environment(config_dir)
         if config_dir != default_dir and not target else {}
     )
     environment["ENABLE_TOOL_SEARCH"] = "true"
@@ -666,8 +685,6 @@ def _unit_argv(record: SessionShutdown) -> list[str]:
         argv.extend(("--model", model["name"]))
     if "target" in record:
         argv.extend(("--account", record["target"]))
-    else:
-        argv.extend(("--config-dir", session.get("config_dir", str(Path.home() / ".claude"))))
     return argv
 
 
@@ -975,7 +992,7 @@ def _herdr_launch(parts: ResumeParts, session: Session, *, dry_run: bool) -> Non
     try:
         from scripts.accounts.accounts import ClaudeLaunchAccount, DefaultAccount, NamedAccount
 
-        config_dir = Path(environment["CLAUDE_CONFIG_DIR"])
+        config_dir = parts.account.config_dir
         claude_json = (Path.home() / ".claude.json" if config_dir == Path.home() / ".claude"
                        else config_dir / ".claude.json")
         trust = herdr.claude_trust(Path(parts.cwd), claude_json)
@@ -1030,12 +1047,13 @@ def _launch_session(
         prompt += " " + note
     parts = _resume_parts(session, prompt, record.get("target", ""))
     if host["kind"] == "herdr":
+        if session["kind"] == "showrunner" and isinstance(parts.account, MoveResumeAccount):
+            return ManualRestartRequired(_resume_command(
+                session, f"{_showrunner_prompt(session)} {note}", record.get("target", "")))
         _herdr_launch(parts, session, dry_run=dry_run)
         return SessionLaunched()
     command = _resume_shell(parts)
     if host["kind"] == "unknown" or (host["kind"] == "terminal" and sys.platform == "linux"):
-        if "target" in record:
-            command = resume_command(session, record["target"], record.get("source_label", record["label"]), record.get("why", ""))
         return ManualRestartRequired(command)
     _record_scheduled_restart_prompt(
         session["session_id"], prompt, dry_run=dry_run
@@ -1393,6 +1411,8 @@ def launch_entry(
     *,
     dry_run: bool,
 ) -> EntryLaunched | EntrySettled:
+    from scripts.accounts import accounts
+
     progress = _prior_progress(record)
     if progress["kind"] in COMPLETE_PROGRESS:
         return EntrySettled()
@@ -1462,6 +1482,12 @@ def launch_entry(
             print(f"cannot restart {session['name']}: {error}")
         else:
             mark_restart_failed(record, str(error))
+        return EntrySettled()
+    except accounts.AccountsError as error:
+        if dry_run:
+            print(f"{session['name']} restart failed: {_error_reason(error)}")
+        else:
+            mark_restart_failed(record, _error_reason(error))
         return EntrySettled()
     except (OSError, subprocess.CalledProcessError, subprocess.SubprocessError) as error:
         if dry_run or not _launch_failure_left_session_live(record, error):
@@ -2003,28 +2029,12 @@ def _restart_alerts_enabled(login: str, only: Iterable[str] = (), *, peer: PeerR
     return (not records and not ids) or any(saved["alerts"] == "user" for saved in _eligible_records(records))
 
 
-def restart_push(label: str, lines: list[str], *, failed: bool, phone_access: bool) -> tuple[str, str, ActionRequired]:
-    account = json.dumps(label)
-    diagnostics = sorted(lines, key=lambda line: not any(word in line.lower() for word in ("failed", "not reached", "no remote control")))
-    details = "\n".join(diagnostics)
-    details = details if len(details) <= 130 else details[:127].rsplit(" ", 1)[0] + "…"
-    if failed:
-        title = "Some Claude sessions did not restart"
-        body = f"Sessions on Claude account {account} did not restart. Failure details: {details}\n\n"
-        body += f"The status command shows what failed. Fix the cause. Then run /shutdown restart {account} in the same Claude session on natedev to try again."
-        failures = [match for line in diagnostics if (match := re.match(r"[^:]+: ([^:]+) restart failed: (.*)", line)) is not None]
-        if failures:
-            name, reason = failures[0].groups()
-            reason = reason if len(reason) <= 130 else reason[:127].rsplit(" ", 1)[0] + "…"
-            title = f"Session {name} did not restart" if len(name) <= 15 else title
-            body = f"Session {name} on Claude account {account} did not restart: {reason}.\n\n" + body.split("\n\n", 1)[1]
-    else:
-        title = "Restarted sessions lack phone access"
-        names = ", ".join(line.partition(":")[0] for line in diagnostics)
-        body = f"Sessions on Claude account {account} restarted. Remote Control is off, so you cannot reach them from your phone. Affected sessions: {names}.\n\n"
-    if phone_access:
-        body += "The status command shows each session's machine. On that machine, run /remote-control in its terminal to turn phone access back on."
-    return title, body, ActionRequired(f"In a Claude session on natedev, run /shutdown status {account}.")
+def restart_push(label: str, names: list[str], *, machine: str) -> RenderedPush:
+    """Render known failed sessions, or the unconfirmed machine when names are unavailable."""
+    if names:
+        return render("shutdown.restart_failed", account=json.dumps(label),
+                      stopped=settle.stopped_sessions_text(len(names)), machine=machine)
+    return render("shutdown.restart_incomplete", account=json.dumps(label), machine=machine)
 
 
 def restart(
@@ -2097,21 +2107,33 @@ def restart(
         incomplete = (f"restart incomplete: {other_machine()} not reached — run /shutdown "
             "restart again when it is back")
         print(incomplete)
-    missing = [item for item in (*local.no_remote_control, *peer["no_remote_control"]) if item["alerts"] == "user"]
     bring_back = local.status == "partial" or peer["outcome"] == "partial" or not_reached
     if notify:
         failure_alert = bring_back and _restart_alerts_enabled(selected.login, ids, peer=peer_availability)
-        if failure_alert or missing:
-            lines = _result_lines(local) if failure_alert else []
+        try:
             if failure_alert:
-                excluded = {refusal_line(item) for item in peer["refused"]}
-                excluded.update(f"{item['name']}: running, no Remote Control" for item in peer["no_remote_control"])
-                lines.extend(line for line in peer["lines"] if line not in excluded)
-                if incomplete:
-                    lines.append(incomplete)
-            lines.extend(f"{item['name']}: running, no Remote Control" for item in missing)
-            try:
-                settle.alert_user(*restart_push(selected.label, lines, failed=failure_alert, phone_access=bool(missing)))
-            except (OSError, RuntimeError, ValueError):
-                pass
+                names = [item.name for item in local.failed_sessions]
+                names.extend(match.group(1) for line in peer["lines"]
+                             if (match := re.match(r"[^:]+: (.+) restart failed:", line)) is not None)
+                machines = [local.machine] if local.status == "partial" else []
+                if peer["outcome"] == "partial" or not_reached:
+                    machines.append(peer["machine"])
+                # Pending scheduled jobs are reported in the command output; they need no user step.
+                peer_requires_retry = peer["outcome"] == "partial" and not (peer["lines"] and all(
+                    re.match(r"[^:]+: (timer .+ not started:|manual restart |[0-9]+ restarted|restarted [0-9]+)", line)
+                    for line in peer["lines"]))
+                if names or not_reached or local.failed or peer_requires_retry:
+                    settle.alert_user(restart_push(selected.label, names, machine=" and ".join(machines)))
+                for item in local.manual_sessions:
+                    settle.alert_user(render("shutdown.manual_restart", session=item.name, machine=local.machine))
+                for line in peer["lines"]:
+                    if match := re.match(r"[^:]+: manual restart (.+?):", line):
+                        settle.alert_user(render("shutdown.manual_restart", session=match.group(1), machine=peer["machine"]))
+            for machine, items in ((local.machine, local.no_remote_control),
+                                   (peer["machine"], peer["no_remote_control"])):
+                for item in items:
+                    if item["alerts"] == "user":
+                        settle.alert_user(render("shutdown.remote_control", session=item["name"], machine=machine))
+        except (OSError, RuntimeError, ValueError):
+            pass
     return 0 if local.exit_status == 0 and peer["outcome"] != "partial" and not peer["refused"] else 1

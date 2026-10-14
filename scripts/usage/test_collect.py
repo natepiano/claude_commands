@@ -5,6 +5,7 @@ from __future__ import annotations
 import importlib
 import json
 import os
+import shlex
 import shutil
 import sqlite3
 import stat
@@ -1744,6 +1745,35 @@ class MacCollectTests(CollectorFixture):
             lines = [line for line in run.output.splitlines() if line.startswith(f"mac {family}:")]
             self.assertRegex(lines[0], r"\bcut\b")
             self.assertNotIn("invalid remote stream", lines[0])
+
+    def test_cut_stream_drains_remote_writer_before_reaping_shell(self) -> None:
+        report = self.root / "ssh-report.json"
+        finished = self.root / "remote-writer-finished"
+        configuration = {"home": str(self.mac_home), "execution_directory": str(self.execution_directory),
+                         "report": str(report), "behavior": "cut_inside_record", "database": str(self.db_path),
+                         "previous_role_read_at": ""}
+        config = self.root / "ssh-configuration.json"
+        _ = config.write_text(json.dumps(configuration), encoding="utf-8")
+        records = ('{"type":"file","kind":"claude"}\n{"type":"cursor"}\n'
+                   '{"type":"file","kind":"claude"}\n{"type":"turn"}\n')
+        writer = (
+            "import sys; from pathlib import Path; "
+            f"sys.stdout.write({records!r}); sys.stdout.flush(); "
+            "sys.stdout.write('{}\\n' * 100000); sys.stdout.flush(); "
+            "Path(sys.argv[1]).write_text('finished')"
+        )
+        remote_command = shlex.join((sys.executable, "-c", writer, str(finished))) + '; printf "\\nrc=%s\\n" "$?"'
+        result = subprocess.run(
+            [str(self.root / "bin/ssh"), remote_command],
+            input=b"fixture request", capture_output=True, timeout=30, check=False,
+            env={**os.environ, "USAGE_TEST_SSH_CONFIG": str(config)},
+        )
+        self.assertEqual(result.stderr, b"", result.stderr.decode(errors="replace"))
+        self.assertEqual(result.returncode, 0)
+        self.assertTrue(finished.is_file(), "A cut fixture must reap the writer after it finishes")
+        lines = records.splitlines(keepends=True)
+        expected = "".join(lines[:-1]) + lines[-1][:len(lines[-1]) // 2]
+        self.assertEqual(result.stdout, expected.encode())
 
 
 if __name__ == "__main__":

@@ -148,20 +148,24 @@ printf '%s %s %s\\n' "$shortcut" "$wait_status" "$admission"
             with self.subTest(extra=extra):
                 self.assert_checks(shortcut=1, extra=extra, starts=False)
 
-    def test_nothing_held_uses_no_external_command(self) -> None:
+    def test_nothing_held_starts_no_process(self) -> None:
         empty_path = self.scratch / "empty-path"
         empty_path.mkdir()
-        started = time.perf_counter()
+        forks = self.scratch / "subshells"
         result = subprocess.run([BASH, "-c", '''set -euo pipefail
 source "$1"
 PATH="$2"
+# Trace inside command substitutions and (...) as well as function calls.
+exec 3>"$3"
+set -T
+trap 'if (( BASH_SUBSHELL > 0 )); then printf "%s\\n" "$BASH_SUBSHELL" >&3; fi' DEBUG
 for ((n=0; n<2000; n++)); do build_hold_nothing_held; done
-''', "bash", str(MEMORY_GATE), str(empty_path)], cwd=self.scratch,
-                                env=self.environment, capture_output=True, text=True, check=False, timeout=3)
-        elapsed = time.perf_counter() - started
+[[ "$n" -eq 2000 ]]
+''', "bash", str(MEMORY_GATE), str(empty_path), str(forks)], cwd=self.scratch,
+                                env=self.environment, capture_output=True, text=True, check=False, timeout=30)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stderr, "")
-        self.assertLess(elapsed, 2)
+        self.assertEqual(forks.read_text(), "", "the shortcut must not fork subshells")
 
     def test_holder_file_stays_until_the_release_completes(self) -> None:
         now = datetime.now(timezone.utc)

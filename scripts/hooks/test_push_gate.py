@@ -32,6 +32,8 @@ assert spec is not None and spec.loader is not None
 class PushGate(Protocol):
     DENIAL: str
     ALREADY_SENT: str
+    HELD_FALLBACK: str
+    UNREVIEWED_FALLBACK: str
 
     def main(self, *, clock: Callable[[], float], sleep: Callable[[float], None]) -> None: ...
 
@@ -59,6 +61,9 @@ class Marker(TypedDict):
     body: str
     message: str
     fallback: str
+    held: NotRequired[bool]
+    reviewed: NotRequired[bool]
+    need: NotRequired[str]
     held_source: NotRequired[str]
     held_identity: NotRequired[str]
     held_machine: NotRequired[str]
@@ -118,6 +123,52 @@ class PushGateTests(unittest.TestCase):
         output, errors = self.call()
         self.assert_denied(output)
         self.assertEqual(errors, "")
+
+    def test_unreviewed_non_blocked_fallback_is_denied_and_consumed_without_releasing_hold(self) -> None:
+        for need in ("note", "decision"):
+            with self.subTest(need=need):
+                path = self.marker()
+                marker = cast(Marker, json.loads(path.read_text()))
+                marker.update(reviewed=False, need=need, held_source="writer", held_identity="a" * 64)
+                _ = path.write_text(json.dumps(marker))
+                with mock.patch.object(review, "release_if_matches", side_effect=AssertionError("denied fallback released hold")):
+                    output, errors = self.call()
+                response = cast(Response, json.loads(output))
+                self.assertEqual(response["hookSpecificOutput"]["permissionDecision"], "deny")
+                self.assertEqual(response["hookSpecificOutput"]["permissionDecisionReason"], push_gate.UNREVIEWED_FALLBACK)
+                self.assertEqual(errors, "")
+                self.assertFalse(path.exists())
+
+    def test_held_reviewed_fallback_is_consumed_and_denied_without_releasing_other_holds(self) -> None:
+        for machine in ("", "natedev"):
+            path = self.marker()
+            marker = cast(Marker, json.loads(path.read_text()))
+            marker.update(held=True, reviewed=True, need="decision", held_source="writer", held_identity="a" * 64, held_machine=machine)
+            _ = path.write_text(json.dumps(marker))
+            with mock.patch.object(review, "release_if_matches", side_effect=AssertionError("held fallback released hold")):
+                output, errors = self.call()
+            response = cast(Response, json.loads(output))
+            self.assertEqual(response["hookSpecificOutput"]["permissionDecisionReason"], push_gate.HELD_FALLBACK)
+            self.assertEqual(errors, "")
+            self.assertFalse(path.exists())
+
+    def test_reviewed_and_blocked_fallbacks_are_allowed_and_consumed(self) -> None:
+        for reviewed, need in ((True, "note"), (True, "decision"), (False, "blocked")):
+            with self.subTest(reviewed=reviewed, need=need):
+                path = self.marker()
+                marker = cast(Marker, json.loads(path.read_text()))
+                marker.update(reviewed=reviewed, need=need)
+                _ = path.write_text(json.dumps(marker))
+                self.assertEqual(self.call(), ("", ""))
+                self.assertFalse(path.exists())
+
+    def test_legacy_marker_without_review_fields_still_allows_in_flight_fallback(self) -> None:
+        path = self.marker()
+        marker = cast(Marker, json.loads(path.read_text()))
+        self.assertNotIn("reviewed", marker)
+        self.assertNotIn("need", marker)
+        self.assertEqual(self.call(), ("", ""))
+        self.assertFalse(path.exists())
 
     def test_whitespace_changes_are_allowed_for_action_and_no_action(self) -> None:
         for action in ("Choose retry.", None):
