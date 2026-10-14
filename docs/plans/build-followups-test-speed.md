@@ -156,29 +156,49 @@ A test that pins a behaviour a user or another script depends on is not trivial,
 
 **Ruled out:** deleting the two phone-send guards — they pin the fixture patch that stops real sends.
 
-### Phase 5 — Fewer process launches per test  · status: todo
+### Phase 5 — Fewer process launches per test  · status: done
 
 **Depends on:** Phase 4
 
 #### Work Order
 
-**Goal:** the heaviest suites start far fewer processes.
+**Goal:** the production, message, build_targets and mac_test suites start far fewer processes.
 
 **Spec:** the gate's wall time is its slowest module, so start from the slowest modules (learned timings at load 88–123: delegate/test_verify_mac_offload 181 s, delegate/test_review_launcher 165 s, production/test_dailies_input 163 s, delegate/test_progress_history 161 s, mac_test/test_offload 134 s, production/test_add_unit 132 s), and record each targeted module's launch count and matched-load duration before and after. `test_progress_history.py` launches `progress_history.py` about 750 times (its existing `invoke_handler` already runs handlers in-process). Run the heaviest scripts in-process or trim their import chains (`dailies_input`, `dailies_render`, `send`, `build_targets`, `waiting`); write the fake tmux and gh tools as shell instead of Python; share git fixtures where a test only reads them (e.g. `merge_checkpoint`). Keep each test's assertions.
 
-In-process rules: restore environment, cwd, import-time configuration (e.g. `add_showrunner.POLL_S`), module globals and signal state after each case; keep at least one subprocess test per script for CLI parsing, exit status and the launch contract. Shared git fixtures: share only an immutable seed; each mutating case gets its own origin and worktrees, never shared refs, index, config or worktree metadata; modules pass in any order and alone. Add tests that run with the Phase 3 overrides absent (`PLAN_DELEGATE_SEAT_POLL_SECS`/`_WAIT_ATTEMPTS`, `PLAN_DELEGATE_EARLY_POLL_SECS`, `PLAN_DELEGATE_TOKEN_CLOCK_FILE`) and pin the production defaults. If recorder identity paths (`_main_identity_from_codex`/`_claude`, `AgentIdentity | None`) become an in-process API, return a semantic result (known / unavailable) instead of a bare optional, keeping the fallback in `_detect_main_identity()`.
+In-process rules: restore environment, cwd, import-time configuration (e.g. `add_showrunner.POLL_S`), module globals and signal state after each case; keep at least one subprocess test per script for CLI parsing, exit status and the launch contract. Shared git fixtures: share only an immutable seed; each mutating case gets its own origin and worktrees, never shared refs, index, config or worktree metadata; modules pass in any order and alone. The delegate suite's share moved to Phase 6.
 
 **Files:**
 - `scripts/production/` — tests, fake tmux and gh, and the named scripts
 - `scripts/message/` — `send.py` and its tests
 - `scripts/build_targets/` — `build_targets.py` and its tests
 - `scripts/mac_test/` — `test_offload.py` and the code it launches
+
+**Seats:** 1 writer
+- `impl` — `scripts/production/`, `scripts/message/send.py`, `scripts/build_targets/`, `scripts/mac_test/`
+
+**Constraints from prior phases:** "Trivial tests are gone" put the criteria in `docs/delegate/write_prompt_contract.md` section 6, so they bind every test this phase moves or adds: a test moved in-process replaces its subprocess form instead of repeating its inputs and assertion beside it. In `production/test_add_unit.py` the restore case lives only in `test_restart_restore_is_allowed_for_its_restarting_unit` (its duplicate is deleted). Gate after that phase: 193.8 s, 2.44 GiB peak at load 64–101.
+
+**Acceptance gate:** production, message, build_targets and mac_test suites green, each targeted module also alone; per-module launch counts and matched-load durations, and gate time, recorded before and after.
+
+### Phase 6 — The delegate tests start fewer processes  · status: todo
+
+**Depends on:** Phase 5
+
+Split from Phase 5 on 2026-10-14 (packaging): `scripts/delegate/` was released to message-clarity for its seat→worker rename, so this phase starts once that rename has merged into build-followups; merge it into this branch first.
+
+#### Work Order
+
+**Goal:** the delegate suite starts far fewer processes.
+
+**Spec:** start from the slowest delegate modules (learned timings at load 88–123: test_verify_mac_offload 181 s, test_review_launcher 165 s, test_progress_history 161 s), and record each targeted module's launch count and matched-load duration before and after. `test_progress_history.py` launches `progress_history.py` about 750 times (its existing `invoke_handler` already runs handlers in-process). Keep each test's assertions. Phase 5's in-process rules hold here (restore environment, cwd, import-time configuration, module globals and signal state after each case; keep at least one subprocess test per script for CLI parsing, exit status and the launch contract). Add tests that run `review.sh`, `implement.sh` and `verify.sh` with the Phase 3 overrides absent (`PLAN_DELEGATE_SEAT_POLL_SECS`/`_WAIT_ATTEMPTS`, `PLAN_DELEGATE_EARLY_POLL_SECS`, `PLAN_DELEGATE_TOKEN_CLOCK_FILE`) and pin the production defaults. If recorder identity paths (`_main_identity_from_codex`/`_claude`, `AgentIdentity | None`) become an in-process API, return a semantic result (known / unavailable) instead of a bare optional, keeping the fallback in `_detect_main_identity()`.
+
+**Files:**
 - `scripts/delegate/` — tests and fakes, including `wait_for_test_state.py`
 
-**Seats:** 2 writers — split by suite
-- `impl` — `scripts/production/`, `scripts/message/send.py`, `scripts/build_targets/`, `scripts/mac_test/`
+**Seats:** 1 writer
 - `test` — opens as impl; `scripts/delegate/` (sole owner of `wait_for_test_state.py`)
 
-**Constraints from prior phases:** "Trivial tests are gone" put the criteria in `docs/delegate/write_prompt_contract.md` section 6, so they bind every test this phase moves or adds: a test moved in-process replaces its subprocess form instead of repeating its inputs and assertion beside it, and each new default-pinning test runs the real script with the override unset and observes the default through behavior (a `sleep` stub on `PATH` recording its argument, an attempt count), never by reading the literal from the script source. No test yet runs `review.sh`, `implement.sh` or `verify.sh` with those overrides unset. In `production/test_add_unit.py` the restore case lives only in `test_restart_restore_is_allowed_for_its_restarting_unit` (its duplicate is deleted). Gate after that phase: 193.8 s, 2.44 GiB peak at load 64–101.
+**Constraints from prior phases:** the trivial-test criteria in `docs/delegate/write_prompt_contract.md` section 6 bind every test this phase moves or adds: a test moved in-process replaces its subprocess form, and each new default-pinning test runs the real script with the override unset and observes the default through behavior (a `sleep` stub on `PATH` recording its argument, an attempt count), never by reading the literal from the script source. No test yet runs `review.sh`, `implement.sh` or `verify.sh` with those overrides unset.
 
-**Acceptance gate:** production, delegate, message, build_targets and mac_test suites green, each targeted module also alone; per-module launch counts and matched-load durations, and gate time, recorded before and after.
+**Acceptance gate:** delegate suite green, each targeted module also alone; per-module launch counts and matched-load durations, and gate time, recorded before and after.

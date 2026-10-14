@@ -27,6 +27,7 @@ import dailies_render
 import merge_checkpoint
 import update_registration
 import waiting
+from cli_fixture import invoke_cli
 import unit_lookup
 import herdr
 from fake_herdr import CommandResponse
@@ -164,7 +165,7 @@ class WaitingTests(unittest.TestCase):
         self.enterContext(mock.patch.dict(os.environ, {
             "HOME": str(home),
             "CODEX_HOME": str(home / "codex-fixture"),
-            "UNIT_LOOKUP_TMUX": str(Path(__file__).with_name("fake_tmux.py")),
+            "UNIT_LOOKUP_TMUX": str(Path(__file__).with_name("fake_tmux.sh")),
             "FAKE_TMUX_STATE": str(self.root / "tmux.json"),
             "NOTIFIER_SESSIONS_DIR": str(self.root / "sessions"),
             "HERDR_BIN": str(SCRIPT.parents[1] / "herdr/fake_herdr.py"),
@@ -286,10 +287,55 @@ class WaitingTests(unittest.TestCase):
         """The user renamed alpha's session: only the live session record says so."""
         self.claude(session, "%1")
 
+    def test_shell_tmux_rejects_malformed_calls_without_changing_the_fixture(self) -> None:
+        path = self.root / "tmux.json"
+        before = path.read_text()
+        for arguments in (["list-panes"], ["capture-pane", "-p", "-t", "%1"],
+                          ["show-environment", "-t", "$1", "EXTRA"],
+                          ["set-environment", "-t", "$1", "MARK"]):
+            with self.subTest(arguments=arguments):
+                result = subprocess.run([self.env["UNIT_LOOKUP_TMUX"], *arguments], env=self.env,
+                                        capture_output=True, text=True, check=False, timeout=300)
+                self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+                self.assertIn("unexpected call", result.stderr)
+                self.assertEqual(path.read_text(), before)
+
+    def test_shell_tmux_names_missing_targets_and_preserves_state_on_every_targeted_call(self) -> None:
+        path = self.root / "tmux.json"
+        before = path.read_text()
+        for target in ("missing session", "%404", "=$missing; π"):
+            for arguments, kind in ((["show-environment", "-t", target], "session"),
+                                    (["set-environment", "-t", target, "MARK", "value"], "session"),
+                                    (["capture-pane", "-p", "-e", "-t", target], "pane"),
+                                    (["send-keys", "-t", target, "Enter"], "pane")):
+                with self.subTest(arguments=arguments):
+                    result = subprocess.run([self.env["UNIT_LOOKUP_TMUX"], *arguments], env=self.env,
+                                            capture_output=True, text=True, check=False, timeout=300)
+                    self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+                    self.assertEqual(result.stdout, "")
+                    self.assertEqual(result.stderr, f"can't find {kind}: {target}\n")
+                    self.assertEqual(path.read_text(), before)
+                    self.assertEqual(list(self.root.glob("tmux.json.*.tmp")), [])
+
+    def test_shell_tmux_preserves_session_marks_and_literal_key_arguments(self) -> None:
+        tool = self.env["UNIT_LOOKUP_TMUX"]
+        for arguments in (["set-environment", "-t", "$1", "TEST_MARK", "marked value"],
+                          ["send-keys", "-t", "%1", "-l", "echo '$HOME'; π"],
+                          ["send-keys", "-t", "%1", "Enter"]):
+            result = subprocess.run([tool, *arguments], env=self.env, capture_output=True,
+                                    text=True, check=False, timeout=300)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        result = subprocess.run([tool, "show-environment", "-t", "%1"], env=self.env,
+                                capture_output=True, text=True, check=False, timeout=300)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("TEST_MARK=marked value", result.stdout.splitlines())
+        sessions = cast(dict[str, dict[str, object]], json.loads((self.root / "tmux.json").read_text()))
+        self.assertEqual(sessions["$1"]["sent"], [["%1", "-l", "echo '$HOME'; π"], ["%1", "Enter"]])
+        self.assertNotIn("sent", sessions["$2"])
+
     def run_waiting(self, action: str, *args: str) -> subprocess.CompletedProcess[str]:
-        return subprocess.run([sys.executable, str(SCRIPT), action, *args,
-                               "--production", str(self.doc)], cwd=self.checkout, env=self.env,
-                              capture_output=True, text=True, check=False, timeout=300)
+        arguments = [action, *args, "--production", str(self.doc)]
+        return invoke_cli(waiting, waiting.main, arguments, self.env, self.checkout, production_state=True)
 
     def commit(self, worktree: Path, relative: str, content: str) -> str:
         self.write(worktree / relative, content)

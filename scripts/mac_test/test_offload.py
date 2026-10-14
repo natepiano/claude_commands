@@ -20,10 +20,15 @@ from contextlib import redirect_stderr, redirect_stdout
 from dataclasses import fields
 import io
 from pathlib import Path
-from typing import Literal, NotRequired, TypedDict, cast, final, override
+from typing import TYPE_CHECKING, Literal, NotRequired, TypedDict, cast, final, override
 from unittest import mock
 
 import offload
+if TYPE_CHECKING:
+    from ..production.cli_fixture import invoke_cli
+else:
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "production"))
+    from cli_fixture import invoke_cli
 import mac_test
 import treekey
 
@@ -155,7 +160,7 @@ if "select_leftovers()" in remote and "lsof" in remote:
             '[ "$(command -v ' + name + ')" = ' + shlex.quote(str(selectors / name)) + ' ] || exit 99'
             for name in ("pgrep", "lsof", "sleep")
         )
-        answer = subprocess.run([*shell, "-c", checks + "\n" + remote], env=environment, capture_output=True, text=True, timeout=3)
+        answer = subprocess.run([*shell, "-c", checks + "\n" + remote], env=environment, capture_output=True, text=True, timeout=300)
         print(answer.stdout, end="", flush=True)
         print(answer.stderr, end="", file=sys.stderr, flush=True)
         (root / "selector-answer").write_text(answer.stdout)
@@ -569,8 +574,8 @@ class OffloadCommandTests(unittest.TestCase):
             "offload": "on",
             "host": "mac",
             "connect_timeout_s": "6",
-            "probe_timeout_s": "1",
-            "leftover_timeout_s": "2",
+            "probe_timeout_s": "300",
+            "leftover_timeout_s": "300",
             "unreachable_backoff_s": "300",
             "free_floor_gib": "60",
             "mac_budget_gib": "24",
@@ -646,7 +651,8 @@ class OffloadCommandTests(unittest.TestCase):
         *nextest_arguments: str,
         repository: Path | None = None,
         filter_run: bool = False,
-        timeout: float = 10,
+        timeout: float = 300,
+        subprocess_cli: bool = False,
         settings: Path | offload.DefaultMacSettings = offload.DEFAULT_MAC_SETTINGS,
         last_decline: str = "",
         separate_stderr: bool = False,
@@ -671,16 +677,19 @@ class OffloadCommandTests(unittest.TestCase):
             arguments.extend(["--last-decline", last_decline])
         arguments.extend(["--result", str(self.result_path), "--"])
         arguments.extend(nextest_arguments)
-        return subprocess.run(
-            arguments,
-            cwd=self.root,
-            env=self.environment,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE if separate_stderr else subprocess.STDOUT,
-            text=True,
-            check=False,
-            timeout=timeout,
-        )
+        if subprocess_cli:
+            return subprocess.run(arguments, cwd=self.root, env=self.environment, stdout=subprocess.PIPE,
+                                  stderr=subprocess.PIPE if separate_stderr else subprocess.STDOUT,
+                                  text=True, check=False, timeout=timeout)
+        return invoke_cli(offload, offload.main, arguments[2:], self.environment, self.root,
+                          combined_output=not separate_stderr)
+
+    def process_command(self, *arguments: str, separate_stderr: bool = False,
+                        last_decline: str = "") -> subprocess.CompletedProcess[str]:
+        # These cases inspect a claim owned by an exited launcher. Its lifetime
+        # is part of the assertion, so use a real child rather than this process.
+        return self.command(*arguments, separate_stderr=separate_stderr,
+                            last_decline=last_decline, subprocess_cli=True)
 
     def command_with_cleanup_clock(self, *, separate_stderr: bool = False) -> subprocess.CompletedProcess[str]:
         # Keep elapsed_seconds real; advance its underlying clock at work boundaries.
@@ -891,6 +900,10 @@ raise SystemExit(offload.main())
             (self.stub_directory / name).unlink(missing_ok=True)
 
     def set_leftover_answer(self, outcome: str) -> None:
+        # Only deliberate timeout cases use a short deadline; ordinary fixture
+        # commands get a hang guard that does not race interpreter startup.
+        self.config["leftover_timeout_s"] = "2" if outcome == "timeout" else "300"
+        self.sync_config()
         self.fixture["cleanup_lines"] = ["leftovers=0", "rc=0"]
         self.fixture["cleanup_status"] = 0
         self.fixture["cleanup_error"] = ""
@@ -920,7 +933,7 @@ raise SystemExit(offload.main())
                 self.assertIn("connection refused by host", output)
 
     def wait_for_path(self, path: Path) -> None:
-        deadline = time.monotonic() + 5
+        deadline = time.monotonic() + 300
         while time.monotonic() < deadline:
             if path.exists():
                 return
@@ -935,7 +948,7 @@ raise SystemExit(offload.main())
             self.fail("runner output is unavailable")
         received = b""
         expected_bytes = expected.encode()
-        deadline = time.monotonic() + 5
+        deadline = time.monotonic() + 300
         while expected_bytes not in received:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
@@ -996,7 +1009,18 @@ raise SystemExit(offload.main())
         self.fixture["probe_delay_s"] = 3.0
         self.sync_config()
         self.sync_fixture()
-        result = self.command(timeout=5, separate_stderr=True)
+        original_launch = subprocess.Popen
+        original_communicate = cast(Callable[[subprocess.Popen[str], str | None, float | None], tuple[str, str]],
+                                    original_launch.communicate)
+
+        def communicate(process: subprocess.Popen[str], input: str | None = None,
+                        timeout: float | None = None) -> tuple[str, str]:
+            if timeout == 0.1:
+                self.wait_for_path(self.stub_directory / "probe-started")
+            return original_communicate(process, input, timeout)
+
+        with mock.patch.object(original_launch, "communicate", communicate):
+            result = self.command(separate_stderr=True)
         self.assert_declined(result, "unreachable")
         self.assertRegex(result.stderr, r"^mac_test: could not reach the Mac: .*0\.1.*\n$")
         self.assertRegex(result.stderr, r"(?i)tim(?:e|ed).*out|limit|finish")
@@ -1198,11 +1222,11 @@ raise SystemExit(offload.main())
             self.assertEqual([event["command"] for event in self.events()], ["ssh", "rsync"])
             self.assert_claimed_commands()
             _ = (self.stub_directory / "continue-copy").write_text("continue\n")
-            text, _ = process.communicate(timeout=10)
+            text, _ = process.communicate(timeout=300)
         finally:
             if process.poll() is None:
                 process.kill()
-                _ = process.communicate(timeout=5)
+                _ = process.communicate(timeout=300)
         self.assertEqual(process.returncode, 0, text)
         self.assertEqual(text.count("mac_test: running on the Mac (macOS, host Mac); tree copied in "), 1)
         self.assert_wire("passed", "")
@@ -1227,12 +1251,12 @@ raise SystemExit(offload.main())
                 process.send_signal(signal_number)
             self.wait_for_ignored_signals(process)
             _ = (self.stub_directory / "finish-claim").write_text("continue\n")
-            output, _ = process.communicate(timeout=15)
+            output, _ = process.communicate(timeout=300)
         finally:
             _ = (self.stub_directory / "finish-claim").write_text("continue\n")
             if process.poll() is None:
                 process.kill()
-                _ = process.communicate(timeout=5)
+                _ = process.communicate(timeout=300)
         self.assertEqual(process.returncode, 128 + signal_number, output)
         self.assertFalse(self.result_path.exists())
         self.assertFalse((self.state_directory / "unreachable_until").exists())
@@ -1240,7 +1264,7 @@ raise SystemExit(offload.main())
 
     def wait_for_ignored_signals(self, process: subprocess.Popen[str]) -> None:
         expected = sum(1 << (number - 1) for number in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP))
-        deadline = time.monotonic() + 5
+        deadline = time.monotonic() + 300
         while time.monotonic() < deadline:
             if process.poll() is not None:
                 return
@@ -1361,13 +1385,13 @@ raise SystemExit(offload.main())
             self.wait_for_path(self.stub_directory / "copy-started")
             change()
             _ = (self.stub_directory / "continue-copy").write_text("continue\n")
-            output, _ = process.communicate(timeout=10)
+            output, _ = process.communicate(timeout=300)
             self.assertEqual(process.returncode, 0, output)
             self.assert_wire("passed", "")
         finally:
             if process.poll() is None:
                 process.kill()
-                _ = process.communicate(timeout=5)
+                _ = process.communicate(timeout=300)
 
     def sent_command_words(self) -> list[str]:
         self.assertEqual(len(self.events_for("rsync")), 1)
@@ -1600,10 +1624,10 @@ raise SystemExit(offload.main())
             _ = (self.stub_directory / "continue-run").write_text(
                 "continue\n", encoding="utf-8"
             )
-            remaining_output, _ = process.communicate(timeout=15)
+            remaining_output, _ = process.communicate(timeout=300)
         except BaseException:
             process.send_signal(signal.SIGTERM)
-            _ = process.communicate(timeout=15)
+            _ = process.communicate(timeout=300)
             raise
         output = output_before_gate + remaining_output
         self.assertEqual(process.returncode, 0, output)
@@ -1725,7 +1749,7 @@ raise SystemExit(offload.main())
                     self.reset_leftover_case()
                     self.fixture["run_status_line"] = f"mac_exit={status}"
                     self.set_leftover_answer(outcome)
-                    result = self.command(separate_stderr=True)
+                    result = self.process_command(separate_stderr=True)
                     self.assertEqual(result.returncode, status, result.stdout + result.stderr)
                     self.assert_wire("passed" if status == 0 else "failed", "")
                     self.assertEqual(result.stdout.count("Mac build output cleanup unconfirmed\n"), 1)
@@ -1794,11 +1818,11 @@ raise SystemExit(offload.main())
                 try:
                     self.wait_for_path(self.stub_directory / "run-started")
                     process.send_signal(signal.SIGTERM)
-                    output, _ = process.communicate(timeout=20)
+                    output, _ = process.communicate(timeout=300)
                 finally:
                     if process.poll() is None:
                         process.kill()
-                        _ = process.communicate(timeout=5)
+                        _ = process.communicate(timeout=300)
                 self.assertEqual(process.returncode, 128 + signal.SIGTERM, output)
                 self.assert_leftover_diagnostic(output, outcome)
                 self.assert_claim_is_kept()
@@ -1816,11 +1840,11 @@ raise SystemExit(offload.main())
                 try:
                     self.wait_for_path(self.stub_directory / f"{stage}-started")
                     process.send_signal(signal.SIGTERM)
-                    output, _ = process.communicate(timeout=15)
+                    output, _ = process.communicate(timeout=300)
                 finally:
                     if process.poll() is None:
                         process.kill()
-                        _ = process.communicate(timeout=5)
+                        _ = process.communicate(timeout=300)
                 self.assertEqual(process.returncode, 128 + signal.SIGTERM, output)
                 self.assertFalse((self.state_directory / "run.json").exists())
                 self.assertEqual(self.leftover_events(), [])
@@ -1848,7 +1872,7 @@ raise SystemExit(offload.main())
     def test_takeover_with_remaining_leftovers_declines_busy_and_preserves_job(self) -> None:
         old = self.write_kept_claim()
         self.set_leftover_answer("remaining")
-        result = self.command(separate_stderr=True)
+        result = self.process_command(separate_stderr=True)
         self.assertEqual(result.returncode, 75, result.stdout + result.stderr)
         self.assertEqual(result.stdout, "mac_test: not running on the Mac (busy)\n")
         self.assert_wire("declined", "busy")
@@ -1864,11 +1888,11 @@ raise SystemExit(offload.main())
     def test_second_takeover_declines_busy_without_releasing_the_new_kept_claim(self) -> None:
         process = self.start_command(script=self.claim_stub_runner(), extra={"MAC_TEST_TAKEOVER_TWICE": "1"})
         try:
-            output, _ = process.communicate(timeout=15)
+            output, _ = process.communicate(timeout=300)
         finally:
             if process.poll() is None:
                 process.kill()
-                _ = process.communicate(timeout=5)
+                _ = process.communicate(timeout=300)
         self.assertEqual(process.returncode, 75, output)
         self.assert_wire("declined", "busy")
         self.assertEqual(self.wire_result().get("holder"), "leftovers")
@@ -1880,7 +1904,7 @@ raise SystemExit(offload.main())
     def test_takeover_check_failure_declines_unreachable_keeps_claim_and_sets_backoff(self) -> None:
         _ = self.write_kept_claim()
         self.set_leftover_answer("ssh_error")
-        result = self.command(separate_stderr=True)
+        result = self.process_command(separate_stderr=True)
         self.assertEqual(result.returncode, 75, result.stdout + result.stderr)
         self.assertEqual(result.stdout, "mac_test: not running on the Mac (unreachable)\n")
         self.assert_wire("declined", "unreachable")
@@ -1889,7 +1913,7 @@ raise SystemExit(offload.main())
         self.assertTrue((self.state_directory / "unreachable_until").exists())
         self.assertEqual(len(self.events()), 1)
         self.clear_events()
-        repeated = self.command()
+        repeated = self.process_command()
         self.assertEqual(repeated.returncode, 75, repeated.stdout)
         self.assert_wire("declined", "backoff")
         self.assertEqual(self.events(), [])
@@ -1922,7 +1946,7 @@ raise SystemExit(offload.main())
                 self.reset_leftover_case()
                 _ = self.write_kept_claim()
                 self.set_leftover_answer(outcome)
-                result = self.command(last_decline=previous_reason, separate_stderr=True)
+                result = self.process_command(last_decline=previous_reason, separate_stderr=True)
                 self.assertEqual(result.returncode, 75, result.stdout + result.stderr)
                 reason = "busy" if outcome == "remaining" else "unreachable"
                 self.assert_wire("declined", reason)
@@ -1938,6 +1962,8 @@ raise SystemExit(offload.main())
         for name in ("pgrep", "lsof", "sleep"):
             self.write_executable(selectors / name, SELECTOR_STUB)
         self.fixture["run_status_reported"] = False
+        self.config["leftover_timeout_s"] = "300"
+        self.sync_config()
         for shell in ("sh", "zsh"):
             for pgrep_status, lsof_status in ((1, 1), (1, 0), (2, 0)):
                 with self.subTest(shell=shell, pgrep_status=pgrep_status, lsof_status=lsof_status):
@@ -1946,7 +1972,7 @@ raise SystemExit(offload.main())
                     self.fixture["selector_pgrep_status"] = pgrep_status
                     self.fixture["selector_lsof_status"] = lsof_status
                     self.sync_fixture()
-                    result = self.command(separate_stderr=True)
+                    result = self.process_command(separate_stderr=True)
                     self.assertEqual(result.returncode, 75, result.stdout + result.stderr)
                     self.assert_wire("lost", "")
                     cleanup = self.leftover_events()
@@ -1985,10 +2011,10 @@ raise SystemExit(offload.main())
                 try:
                     self.wait_for_path(self.stub_directory / "run-started")
                     process.send_signal(signal_number)
-                    output, _ = process.communicate(timeout=15)
+                    output, _ = process.communicate(timeout=300)
                 except BaseException:
                     process.kill()
-                    _ = process.communicate(timeout=5)
+                    _ = process.communicate(timeout=300)
                     raise
                 self.assertEqual(process.returncode, 128 + signal_number, output)
                 self.assertTrue(
@@ -2029,13 +2055,13 @@ raise SystemExit(offload.main())
             _ = (self.stub_directory / "continue-cleanup").write_text(
                 "continue\n", encoding="utf-8"
             )
-            output, _ = process.communicate(timeout=15)
+            output, _ = process.communicate(timeout=300)
         except BaseException:
             process.kill()
             _ = (self.stub_directory / "continue-cleanup").write_text(
                 "continue\n", encoding="utf-8"
             )
-            _ = process.communicate(timeout=5)
+            _ = process.communicate(timeout=300)
             raise
 
         self.assertEqual(process.returncode, 128 + signal.SIGTERM, output)
@@ -2078,11 +2104,11 @@ raise SystemExit(offload.main())
         try:
             self.wait_for_path(marker)
             process.send_signal(signal.SIGINT)
-            output, _ = process.communicate(timeout=15)
+            output, _ = process.communicate(timeout=300)
         except BaseException:
             process.kill()
             _ = gate.write_text("continue\n", encoding="utf-8")
-            _ = process.communicate(timeout=5)
+            _ = process.communicate(timeout=300)
             raise
 
         self.assertEqual(process.returncode, -signal.SIGINT, output)
@@ -2336,7 +2362,7 @@ class MacActivityShellTests(unittest.TestCase):
             for name in ("pgrep", "lsof", "ps", "id")
         )
         text = "kill() { printf 'signal requested\\n' >&2; return 99; }\n" + checks + "\n" + mac_test.mac_activity_script()
-        return subprocess.run([*shell, "-c", text], env=environment, capture_output=True, text=True, timeout=3, check=False)
+        return subprocess.run([*shell, "-c", text], env=environment, capture_output=True, text=True, timeout=300, check=False)
 
     def test_activity_text_has_zero_for_only_shells_in_clones_under_sh_and_zsh(self) -> None:
         responses = {
