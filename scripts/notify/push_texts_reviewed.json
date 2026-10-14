@@ -211,9 +211,9 @@
   },
   "shutdown.holdout": {
     "typical": {
-      "reviewer": "opus",
-      "sha256": "a632bc0ecd4f69288bbc3e3777e5c9ec8c97f9db8d9739d42b5f78c5facd8b84",
-      "time": "2026-10-14T16:56:04.693522-04:00"
+      "reviewer": "user-spec: Phase 12, the user's four lines (2026-10-14 16:3x EDT, via the showrunner). Verdict: ask x3; rules: say-where-to-act, reader-starts-cold, every-choice-says-what-it-does, what-happened-why-what-you-do, short-plain-sentences, title-names-the-stake. Each objection targets the user's own title, Action or Reason words, which the user set as the template; recorded, not applied.",
+      "sha256": "acca2a1cb6d9479f5a937563988512c2a5d6b1650d6927abfb051e350f7b06ed",
+      "time": "2026-10-14T18:48:24.445038-04:00"
     }
   },
   "shutdown.manual_restart": {

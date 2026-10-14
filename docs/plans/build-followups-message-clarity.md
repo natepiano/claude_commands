@@ -251,6 +251,60 @@ Outside `scripts/accounts/` and `scripts/whoami/`, every delegate agent is a "wo
 
 **Acceptance gate:** every script suite green; basedpyright 0/0; `accounts.py swap workers` works and `swap seats` is unknown; `git grep -i seat` reports only the allowed remainder; tests load an old selected-account configuration through both accounts and whoami and keep the selected home; read old role history without changing burn figures; resume an old requested or waited move and deduplicate its confirmation after conversion; see a later old-format journal append; load old shutdown records with nested worker sessions keeping ownership, progress and issues; a second unchanged read rewrites nothing; Phase 10's shared-ledger and claim-lock tests stay green.
 
+### Phase 12 — Shutdown alerts in the user's four-line form; the forms command docs  · status: done
+
+**Depends on:** Phase 10; shutdown checkpoint 82ff14b8 merged to build-followups
+
+#### Work Order
+
+**Goal:** A shutdown alert reads Title / Session / Action / Reason in the user's own words, and no command doc asks for a form.
+
+**Spec:**
+- User, 2026-10-14 16:3x EDT (via the showrunner), on the pushes sent at 16:24 and 16:25 EDT (`~/.local/state/notify/pushover.jsonl`): store these as the templates for their type.
+  - `shutdown.remote_control` — Title `{who} remote-control is off`; Session `{session}`; Action `run /remote-control`; Reason `Remote control is off.` `{who}` is `<unit> unit` for a production unit (`trunk unit`), `<production> showrunner` for a showrunner, and the session name otherwise.
+  - `shutdown.holdout` (it replaced `shutdown.form` in shutdown's 82ff14b8). The showrunner, 2026-10-14, says the user's four lines lead and holdout's choice and command follow below them: Title `{session} {operation} is blocked`; Session `{session}`; Action `answer the open form, or run the command below to stop {session}`; Reason `{operation} is blocked because {session}'s claude session is not answering, and it can't proceed.` Then the existing Stop now / Do nothing choice and `Command: {command}`. Keep its render fields unchanged (`operation`, `request`, `session`, `host`, `machine`, `elapsed`, `after_stop`, `command`), so its settle.py call site does not change. If a value goes unused, drop it from the template and from that one call site.
+- `PushText` gains an optional session template. The delivered message reads `Session: …\nAction: …\nReason: …`, and every reader of the leading `Action: ` line (`notify/user_action.py`, `notify/review.py` parse and record, `send.py`) accepts a `Session: ` line above it. Entries without a session render exactly as today. Length rules count the Session line.
+- Both entries are the user's spec. Record their approvals under that spec (`review.py texts --id <id>` three times, then `--approve`). A reviewer objection to the user's words is recorded, never applied (the credits-alert precedent).
+- Split (showrunner and shutdown, 2026-10-14): the shutdown unit types `/remote-control` into the pane and pushes only on failure. Its checkpoint 0dcaadac moved the one `shutdown.remote_control` render call into `scripts/shutdown/remote_control.py` `alert_failed`, and whoever lands second changes that line. This phase lands first and leaves `shutdown.remote_control` untouched; Phase 13 changes the entry and its call together.
+- Forms. `commands/agent_send.md:44`, `commands/idle_timeout.md:24,45` and `commands/issue.md:58` ask in one plain-text line with a recommendation instead of AskUserQuestion. `issue.md`'s five-factor rating survey becomes one plain-text line the user answers with five star counts. Shutdown's form detection (`SHOWING_FORM`, check-form) stays as the backstop.
+
+**Files:**
+- `scripts/notify/push_texts.py`, `scripts/notify/push_catalog.py`, `scripts/notify/push_texts_reviewed.json`, `scripts/notify/user_action.py`, `scripts/notify/review.py`, `scripts/notify/pushover.py`, `scripts/notify/test_*.py` — the Session line and the two entries
+- `scripts/message/send.py`, `scripts/message/test_send.py` — passes the Session line through
+- `scripts/shutdown/settle.py`, `scripts/shutdown/test_settle.py` — the holdout render call, only to drop a value its template no longer uses
+- `commands/agent_send.md`, `commands/idle_timeout.md`, `commands/issue.md`
+
+**Workers:** 1 writer (no test lane)
+- `impl` — notify, message, the holdout call site and the commands above
+
+**Constraints from prior phases:** Every phone send goes through `push_texts.user_send_argv`, and no test or check reaches the phone. A changed `push_catalog.py` text needs `review.py texts --id <id>` three times and `--approve`. Run every script suite, the lib suite included.
+
+**Acceptance gate:** every script suite green; basedpyright 0/0; both entries lead with the four lines exactly, and the shutdown call sites pass the new values; `git grep -n AskUserQuestion -- commands` finds only the lines that forbid it.
+
+### Phase 13 — The remote-control alert in the user's four lines  · status: todo
+
+**Depends on:** Phase 12; shutdown checkpoint 0dcaadac merged to build-followups (it is, as 34e46574)
+
+#### Work Order
+
+**Goal:** The remote-control alert reads Title / Session / Action / Reason in the user's own words.
+
+**Spec:**
+- User, 2026-10-14 16:3x EDT (via the showrunner), on the push sent at 16:25 EDT: store this as the template for its type. `shutdown.remote_control` — Title `{who} remote-control is off`; Session `{session}`; Action `run /remote-control`; Reason `Remote control is off.` (the body opens with that `Reason: ` line, as `shutdown.holdout` does). `{who}` is `<unit> unit` for a production unit (`trunk unit`), `<production> showrunner` for a showrunner, and the session name otherwise; `remote_control.remote_control_who` already computes it.
+- The one render call, `alert_failed` in `scripts/shutdown/remote_control.py`, becomes `render("shutdown.remote_control", who=..., session=...)` with no `machine`. The session name reaches it through a new `--session` fixer argument: `restart.remote_control_missing` → `launch_fixer` → `fix` → `alert_failed`; `shutdown.py`'s remote-control verb parses the fixer's flags. The catalog entry and its call site land in one commit. Shutdown agreed (2026-10-14 18:29 EDT).
+- The entry is the user's spec: run `review.py texts --id shutdown.remote_control` three times, then record its approval; a reviewer objection to the user's words is recorded, never applied.
+
+**Files:**
+- `scripts/notify/push_catalog.py`, `scripts/notify/push_texts_reviewed.json`, `scripts/notify/test_push_texts.py` — the entry and its approval
+- `scripts/shutdown/remote_control.py`, `scripts/shutdown/restart.py`, `scripts/shutdown/shutdown.py`, `scripts/shutdown/test_remote_control.py`, `scripts/shutdown/test_restart.py` — the render call and the session name passed to it
+
+**Workers:** 1 writer (no test lane)
+- `impl` — everything above except `push_texts_reviewed.json` (the director writes approvals)
+
+**Constraints from prior phases:** No test or check reaches the phone. Run every script suite, the lib suite included.
+
+**Acceptance gate:** every script suite green; basedpyright 0/0; the rendered example leads with the four lines exactly; the fixer passes the session name to the alert.
+
 ### Phase 5 — Questions in showrunner replies  · status: todo
 
 **Depends on:** Phase 4, Phase 6, Phase 9, Phase 10

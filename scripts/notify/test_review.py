@@ -22,7 +22,7 @@ from unittest import mock
 import pushover
 import review
 import push_texts
-from user_action import ActionRequired, NoActionRequired, first_line
+from user_action import ActionRequired, NoActionRequired, SessionLine, first_line
 
 REAL_REVIEW = review.review
 
@@ -140,6 +140,58 @@ class LocalReviewTests(unittest.TestCase):
         _ = binary.write_text("fake reviewer\n")
         binary.chmod(0o700)
         _ = self.enterContext(mock.patch.object(shutil, "which", return_value=str(binary)))
+
+    def test_session_survives_review_hold_records_and_repeated_headers(self) -> None:
+        draft = replace(self.draft, session=SessionLine("Owner"))
+        record = review.message_record(draft)
+        self.assertEqual(record.get("session"), "Owner")
+        value = verdict(draft, body=first_line(draft.action, draft.session) + "\n" + draft.body)
+        self.assertEqual(review.validate(value, draft, False), review.Approved(draft))
+        held = review.Held(draft.source, time.time(), draft, draft, ["Stop Owner?"])
+        review.hold(held)
+        self.assertEqual(review.held_for(draft.source), review.LiveHold(held))
+        runner = FakeReviewer(verdict(draft))
+        self.assertIsInstance(review.review(draft, False, runner=runner), review.Approved)
+        self.assertIn("Session: Owner\nAction: ", runner.calls[-1].argv[-1])
+
+    def test_session_line_counts_toward_review_body_limit(self) -> None:
+        draft = replace(self.draft, action=ActionRequired("stop"), body="x" * 480)
+        self.assertEqual(review.length_failures(draft), [])
+        self.assertEqual(review.length_failures(replace(draft, session=SessionLine("Owner"))), ["push-body-under-500"])
+
+    def test_direct_check_keeps_session_above_action_in_review_and_record(self) -> None:
+        draft = review.Draft("review.check", "1", "Owner is blocked", ActionRequired("stop Owner"),
+                             "Reason: waiting.", False, SessionLine("Owner"))
+        message = first_line(draft.action, draft.session) + "\n" + draft.body
+        runner = FakeReviewer(verdict(draft, body=message))
+
+        def check(current: review.Draft, revision: bool) -> review.ReviewOutcome:
+            self.assertEqual(current, draft)
+            outcome = REAL_REVIEW(current, revision, runner=runner)
+            self.assertIsInstance(outcome, review.Approved)
+            return outcome
+
+        with mock.patch.object(review, "review", side_effect=check), redirect_stdout(io.StringIO()) as output:
+            self.assertEqual(review.main(["check", "--title", draft.title, "--action", "stop Owner",
+                                          "--priority", "1", "--text", "Session: Owner\n" + draft.body]), 0)
+        self.assertIn(message, output.getvalue())
+        self.assertIn("Session: Owner\nAction: stop Owner", runner.calls[-1].argv[-1])
+        self.assertEqual(self.entries()[0]["draft"], review.message_record(draft))
+
+    def test_replay_preserves_session_above_action(self) -> None:
+        message = "Session: Owner\nAction: stop Owner\nReason: waiting."
+        pushover.log("shutdown", "1", "Owner is blocked", message, "sent")
+        def approve(draft: review.Draft, _revision: bool) -> review.ReviewOutcome:
+            return review.Approved(draft)
+
+        with mock.patch.object(review, "review", side_effect=approve) as reviewer, redirect_stdout(io.StringIO()) as output:
+            self.assertEqual(review.replay(), 0)
+        draft = cast(review.Draft, reviewer.call_args.args[0])
+        self.assertEqual(draft.session, SessionLine("Owner"))
+        self.assertEqual(draft.action, ActionRequired("stop Owner"))
+        self.assertEqual(draft.body, "Reason: waiting.")
+        self.assertIn(message, output.getvalue())
+        self.assertEqual(cast(dict[str, object], self.entries()[0]["draft"])["session"], "Owner")
 
     def test_reviewer_without_claude_on_path_uses_an_executable_fallback_and_logs_it(self) -> None:
         binary = self.root / ".local/bin/claude"

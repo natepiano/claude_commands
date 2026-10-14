@@ -1,5 +1,5 @@
 """Script phone texts and named cases reviewed before delivery."""
-from push_texts import ActionTemplate, NoActionNeeded, PushExample, PushText
+from push_texts import ActionTemplate, NoActionNeeded, PushExample, PushText, SessionTemplate
 
 # Codex usage destination: https://learn.chatgpt.com/docs/pricing (read 2026-10-14).
 # Real quota case: notify/review.jsonl, 2026-10-13T22:30:22.569264-04:00.
@@ -8,15 +8,15 @@ from push_texts import ActionTemplate, NoActionNeeded, PushExample, PushText
 
 
 ENTRIES = (
-    PushText("shutdown.holdout", "shutdown", "decision", "{operation} stuck waiting on {session} session",
-        ActionTemplate("In a terminal on {machine}, run the command below to stop {session}."),
-        "A {request} asked the {session} session ({host}) to pause at a safe point and say ready. "
-        + "No reply in {elapsed}, so the {request} is stuck.\n\n"
+    PushText("shutdown.holdout", "shutdown", "decision", "{session} {operation} is blocked",
+        ActionTemplate("answer the open form, or run the command below to stop {session}"),
+        "Reason: {operation} is blocked because {session}'s claude session is not answering, and it can't proceed.\n\n"
         + "Stop now (recommended): ends {session} mid-step so the {request} goes on. Uncommitted work stays; {after_stop}\n\n"
-        + "Do nothing: the {request} keeps waiting.\n\nCommand: {command}",
-        (PushExample("typical", {"session": "Owner", "machine": "natedev", "host": "Ghostty window, Production desktop",
+        + "Do nothing: the {request} keeps waiting. It has waited {elapsed} so far.\n\nCommand: {command} (on {machine})",
+        (PushExample("typical", {"session": "Owner", "machine": "natedev",
             "elapsed": "4 minutes", "operation": "Restart", "request": "restart", "after_stop": "the restart brings it back.",
-            "command": "~/.claude/scripts/lib/py ~/.claude/scripts/shutdown/shutdown.py now 'claude 2' --here --only owner"}),)),
+            "command": "~/.claude/scripts/lib/py ~/.claude/scripts/shutdown/shutdown.py now 'claude 2' --here --only owner"}),),
+        session=SessionTemplate("{session}")),
     # Shutdown examples use test_settle.py and test_restart.py facts.
     # The failing shutdown deliveries are recorded in notify/review.jsonl, 2026-10-14T02:05Z.
     PushText("shutdown.stop_failed", "shutdown", "decision", "Claude account shutdown is incomplete",

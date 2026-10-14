@@ -24,7 +24,7 @@ import review
 import push_texts
 from test_review import FakeReviewer, verdict
 from user_action import (FIX, ActionAllowed, ActionRefused, ActionRequired, ActionUnstated,
-                         NoActionRequired, first_line, parse_user_action, refused_at)
+                         NoActionRequired, SessionLine, NO_SESSION_LINE, split_session, first_line, parse_user_action, refused_at)
 
 REAL_REVIEW = review.review
 
@@ -54,6 +54,27 @@ class UserActionTests(unittest.TestCase):
         self.assertIsInstance(refused_at(none, 2), ActionRefused)
         for priority in (0, 1, 2):
             self.assertEqual(refused_at(required, priority), ActionAllowed())
+
+    def test_session_header_is_parsed_and_kept_above_the_action(self) -> None:
+        self.assertEqual(split_session("Session: Owner\nReason: stopped"), (SessionLine("Owner"), "Reason: stopped"))
+        self.assertEqual(split_session("Reason: stopped"), (NO_SESSION_LINE, "Reason: stopped"))
+        self.assertEqual(first_line(ActionRequired("run it"), SessionLine("Owner")), "Session: Owner\nAction: run it")
+
+    def test_messages_without_session_share_the_explicit_absence_state(self) -> None:
+        entry = push_texts.PushText("test", "script", "note", "Done", push_texts.NoActionNeeded(),
+                                   "The check passed.", (push_texts.PushExample("typical", {}),))
+        rendered = push_texts.render_entry(entry, {})
+        draft = review.Draft("script", "0", rendered.title, rendered.action, rendered.body, False)
+        parsed = pushover.parse(["--no-action", rendered.title, rendered.body])
+        assert parsed is not None
+        self.assertIs(entry.session, NO_SESSION_LINE)
+        self.assertIs(rendered.session, NO_SESSION_LINE)
+        self.assertIs(push_texts.RenderedPush("test", "script", "note", rendered.title,
+                                            rendered.action, rendered.body, {}).session, NO_SESSION_LINE)
+        self.assertIs(draft.session, NO_SESSION_LINE)
+        self.assertIs(review._draft(dict(review.draft_record(draft))).session, NO_SESSION_LINE)  # pyright: ignore[reportPrivateUsage]
+        self.assertIs(parsed["session"], NO_SESSION_LINE)
+        self.assertIs(split_session(rendered.body)[0], NO_SESSION_LINE)
 
     def test_first_line_states_the_action(self) -> None:
         self.assertEqual(first_line(ActionRequired("choose a branch")), "Action: choose a branch")
@@ -95,6 +116,30 @@ class PushoverTests(unittest.TestCase):
 
         code = pushover.send(argv, self.keys, post)
         return code, urllib.parse.parse_qs(sent[0].decode()) if sent else {}
+
+    def test_catalog_session_reaches_the_post_and_review_record(self) -> None:
+        entry = push_texts.PushText("test", "shutdown", "decision", "Owner is blocked",
+            push_texts.ActionTemplate("stop Owner"), "Reason: waiting.",
+            (push_texts.PushExample("typical", {}),), session=push_texts.SessionTemplate("Owner"))
+        with mock.patch.object(push_texts, "catalog", return_value=(entry,)), redirect_stdout(io.StringIO()) as output:
+            code, form = self.run_send(["--text-id", "test"])
+        self.assertEqual(code, 0)
+        self.assertEqual(form["message"], ["Session: Owner\nAction: stop Owner\nReason: waiting."])
+        self.assertIn('"session": "Owner"', output.getvalue())
+
+    def test_session_header_counts_toward_the_post_limit_without_truncation(self) -> None:
+        code, form = self.run_send(["--action", "stop Owner", "Owner is blocked", "Session: Owner\n" + "x" * 1200])
+        self.assertEqual(code, 0)
+        message = form["message"][0]
+        self.assertEqual(len(message), pushover.MESSAGE_MAX)
+        self.assertTrue(message.startswith("Session: Owner\nAction: stop Owner\n"))
+
+    def test_session_cannot_push_the_action_past_the_message_limit(self) -> None:
+        with redirect_stderr(io.StringIO()):
+            code, form = self.run_send(["--action", "x" * pushover.ACTION_TEXT_MAX,
+                "Owner is blocked", "Session: Owner\nReason: waiting."])
+        self.assertEqual(code, 2)
+        self.assertEqual(form, {})
 
     def log_lines(self) -> list[dict[str, object]]:
         return [cast(dict[str, object], json.loads(line)) for line in pushover.LOG_FILE.read_text().splitlines()]

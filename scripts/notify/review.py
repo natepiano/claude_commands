@@ -25,7 +25,8 @@ from enum import Enum
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal, NotRequired, Protocol, TypedDict, cast
 
-from user_action import ActionRequired, NoActionRequired, UserAction, first_line, parse_user_action
+from user_action import (ActionRequired, NoActionRequired, UserAction, first_line, parse_user_action,
+                         NotificationSession, NO_SESSION_LINE, SessionLine, split_session)
 
 if TYPE_CHECKING:
     from ..accounts import accounts
@@ -99,6 +100,7 @@ class Draft:
     action: UserAction
     body: str
     answerable: bool
+    session: NotificationSession = NO_SESSION_LINE
 
 
 @dataclass(frozen=True)
@@ -290,6 +292,7 @@ ClaimDelivery = ClaimSent | ClaimCancelled | ClaimFailed
 
 
 class MessageRecord(TypedDict):
+    session: NotRequired[str]
     title: str
     action: str | None
     body: str
@@ -404,7 +407,10 @@ def switched_off() -> bool:
 
 def message_record(draft: Draft) -> MessageRecord:
     action = draft.action.text if isinstance(draft.action, ActionRequired) else None
-    return {"title": draft.title, "action": action, "body": draft.body}
+    record: MessageRecord = {"title": draft.title, "action": action, "body": draft.body}
+    if isinstance(draft.session, SessionLine):
+        record["session"] = draft.session.text
+    return record
 
 
 def draft_record(draft: Draft) -> DraftRecord:
@@ -448,6 +454,10 @@ def _action(record: dict[str, object]) -> UserAction:
     return action
 
 
+def _session(record: dict[str, object]) -> NotificationSession:
+    return SessionLine(_text(record, "session")) if "session" in record else NO_SESSION_LINE
+
+
 def _draft(value: object) -> Draft:
     record = _object(value)
     answerable = record.get("answerable")
@@ -457,14 +467,14 @@ def _draft(value: object) -> Draft:
     if priority not in ("0", "1", "2"):
         raise ValueError("priority")
     return Draft(_text(record, "source"), priority, _text(record, "title"),
-                 _action(record), _text(record, "body"), answerable)
+                 _action(record), _text(record, "body"), answerable, _session(record))
 
 
 def length_failures(draft: Draft) -> list[str]:
     failures: list[str] = []
     if len(draft.title) >= 45:
         failures.append("push-title-under-45")
-    if len(first_line(draft.action) + "\n" + draft.body) >= 500:
+    if len(first_line(draft.action, draft.session) + "\n" + draft.body) >= 500:
         failures.append("push-body-under-500")
     return failures
 
@@ -472,7 +482,7 @@ def length_failures(draft: Draft) -> list[str]:
 def supported_failures(value: object, draft: Draft, *, reply: bool = False) -> list[RuleFailure]:
     if not isinstance(value, list):
         raise ValueError("failed_rules")
-    original = [draft.body] if reply else [draft.title, first_line(draft.action) + "\n" + draft.body]
+    original = [draft.body] if reply else [draft.title, first_line(draft.action, draft.session) + "\n" + draft.body]
     if isinstance(draft.action, ActionRequired):
         original.append(draft.action.text)
     failures: list[RuleFailure] = []
@@ -484,7 +494,7 @@ def supported_failures(value: object, draft: Draft, *, reply: bool = False) -> l
         if rule and quote and any(quote in text for text in original) and all(item.rule != rule for item in failures):
             failures.append(RuleFailure(rule, quote))
     for rule in ([] if reply else length_failures(draft)):
-        quote = draft.title if rule == "push-title-under-45" else first_line(draft.action) + "\n" + draft.body
+        quote = draft.title if rule == "push-title-under-45" else first_line(draft.action, draft.session) + "\n" + draft.body
         failures.append(RuleFailure(rule, quote))
     return failures
 
@@ -506,12 +516,19 @@ def validate(value: object, draft: Draft, revision: bool,
         action = _action(record)
         if isinstance(action, ActionRequired) != isinstance(draft.action, ActionRequired):
             raise ValueError("action form changed")
-        body_first_line, _, remaining_body = body.partition("\n")
-        if not reply and body_first_line == first_line(action):
-            body = remaining_body.removeprefix("\n")
+        session = draft.session
+        if not reply:
+            body_session, remaining = split_session(body)
+            if isinstance(body_session, SessionLine):
+                if body_session != session:
+                    raise ValueError("session changed")
+                body = remaining
+            body_first_line, _, remaining_body = body.partition("\n")
+            if body_first_line == first_line(action):
+                body = remaining_body.removeprefix("\n")
         if not reply and len(title) > 250:
             raise ValueError("title exceeds 250")
-        if not reply and len(first_line(action) + "\n" + body) > 1024:
+        if not reply and len(first_line(action, session) + "\n" + body) > 1024:
             raise ValueError("message exceeds 1024")
         questions = _strings(record.get("questions"), "questions")
         failures = supported_failures(record.get("failed_rules"), draft, reply=reply)
@@ -537,7 +554,7 @@ def validate(value: object, draft: Draft, revision: bool,
         if proposed_lengths:
             if reply:
                 raise ValueError("proposed text fails: " + ", ".join(proposed_lengths))
-            failures.extend(RuleFailure(rule, version.title if rule == "push-title-under-45" else first_line(version.action) + "\n" + version.body) for rule in proposed_lengths)
+            failures.extend(RuleFailure(rule, version.title if rule == "push-title-under-45" else first_line(version.action, version.session) + "\n" + version.body) for rule in proposed_lengths)
             return Failed(draft, list(dict.fromkeys([*failed, *proposed_lengths])), metadata, tuple(failures))
         if verdict == "ask" and (not reply or not revision):
             if not questions or any(not question.strip() for question in questions):
@@ -610,7 +627,7 @@ def _review(draft: Draft, revision: bool, runner: ProcessRunner,
             "Each failed rule needs its stem and an exact quote from the current reply. Never add a fact. "
             "Keep title empty and action null. Questions are empty unless the verdict is ask. "
             "No phone length limits apply. The previous reply and date are context for ask-once and time-zone rules.")
-        action_line = first_line(draft.action) if isinstance(draft.action, ActionRequired) else "no action"
+        action_line = first_line(draft.action, draft.session) if isinstance(draft.action, ActionRequired) or isinstance(draft.session, SessionLine) else "no action"
         draft_prompt = (f"Title: {draft.title}\n{action_line}\n"
                         f"Body (text after the action line; never repeat it): {draft.body}\n"
                         f"Priority: {draft.priority}\nRevision: {str(revision).lower()}\n"
@@ -795,7 +812,7 @@ def _read_hold(path: Path) -> HoldLookup:
         if (isinstance(held.draft.action, ActionRequired)
                 != isinstance(held.best_version.action, ActionRequired)):
             raise ValueError("hold action form changed")
-        if len(held.best_version.title) > 250 or len(first_line(held.best_version.action) + "\n" + held.best_version.body) > 1024:
+        if len(held.best_version.title) > 250 or len(first_line(held.best_version.action, held.best_version.session) + "\n" + held.best_version.body) > 1024:
             raise ValueError("hold transport limits")
         if not 1 <= len(held.questions) <= 3 or any(not question.strip() for question in held.questions):
             raise ValueError("hold questions")
@@ -1048,7 +1065,7 @@ def print_review(draft: Draft, outcome: ReviewOutcome, stamp: str = "") -> None:
     version = best_version(draft, outcome)
     print(f"{stamp + ' ' if stamp else ''}{verdict}; failed rules: {', '.join(failed) or 'none'}")
     print(version.title)
-    print(first_line(version.action))
+    print(first_line(version.action, version.session))
     print(version.body)
     if isinstance(outcome, (Rewritten, Questions, Unreviewed, Failed, Withheld)):
         for failure in outcome.failures:
@@ -1072,15 +1089,16 @@ def replay(limit: int = 0) -> int:
             if not _text(record, "outcome").startswith("sent"):
                 continue
             message = _text(record, "message")
-            action_line, _, body = message.partition("\n")
+            session, message_body = split_session(message)
+            action_line, _, body = message_body.partition("\n")
             if action_line.startswith("Action: "):
                 action: UserAction = ActionRequired(action_line.removeprefix("Action: "))
             elif action_line == "No action needed.":
                 action = NoActionRequired()
             else:
-                action, body = NoActionRequired(), message
+                action, body = NoActionRequired(), message_body
             draft = Draft(_text(record, "source"), _text(record, "priority"),
-                          _text(record, "title"), action, body, False)
+                          _text(record, "title"), action, body, False, session)
             stamp = _text(record, "time")
         except ValueError:
             continue
@@ -1273,7 +1291,7 @@ def texts(ids: list[str], approve: bool = False, *, runner: ProcessRunner = run_
         for example in entry.examples:
             rendered = push_texts.render_entry(entry, example.values)
             draft = Draft(rendered.sender, {"note": "0", "decision": "1", "blocked": "2"}[rendered.need],
-                          rendered.title, rendered.action, rendered.body, False)
+                          rendered.title, rendered.action, rendered.body, False, rendered.session)
             outcome = _review(draft, False, runner, timeout_seconds=timeout_seconds)
             print_review(draft, outcome, f"{entry.id}/{example.name}")
             log_review(draft, outcome, dry=True, text_id=entry.id)
@@ -1358,8 +1376,9 @@ def main(argv: list[str]) -> int:
     chosen = parse_user_action(cast(str | None, arguments.action), cast(bool, arguments.no_action))
     if not isinstance(chosen, (ActionRequired, NoActionRequired)):
         parser.error("state a non-empty action")
+    session, body = split_session(cast(str, arguments.text))
     draft = Draft("review.check", cast(str, arguments.priority), cast(str, arguments.title),
-                  chosen, cast(str, arguments.text), False)
+                  chosen, body, False, session)
     outcome = review(draft, False)
     print_review(draft, outcome)
     log_review(draft, outcome, dry=True)
