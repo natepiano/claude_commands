@@ -186,6 +186,7 @@ class ShutdownLaunchCliTests(ShutdownTestCase):
     def test_follow_prints_each_new_step_once_and_waits_for_pending_restart(self) -> None:
         saved = session_shutdown(record.SessionWaiting(kind="waiting"))
         saved["session"]["name"] = "Alpha"
+        # Legacy-spelled stored targets must print as canonical labels.
         saved["target"] = "claude 3"
         saved["trail"] = [{"at": OCTOBER, "kind": "waiting", "detail": "pause sent"}]
         self.assertTrue(record.create_session(saved))
@@ -224,7 +225,7 @@ class ShutdownLaunchCliTests(ShutdownTestCase):
         for kind in ("waiting", "ready", "stopped", "already gone", "restarting", "restarted"):
             self.assertEqual(output.count(f"Alpha: {kind}"), 1, output)
         self.assertNotIn("unrelated", output)
-        self.assertTrue(output.rstrip().endswith("all 1 back on claude 3"), output)
+        self.assertTrue(output.rstrip().endswith("all 1 back on claude3"), output)
 
     def test_follow_waits_for_every_session_and_reports_total_back_on_target(self) -> None:
         first = session_shutdown(record.SessionRestarted(kind="restarted", at=OCTOBER), "first")
@@ -245,7 +246,7 @@ class ShutdownLaunchCliTests(ShutdownTestCase):
         self.assertEqual(polls.call_count, 1)
         self.assertEqual(output.count("first: restarted"), 1)
         self.assertEqual(output.count("second: restarted"), 1)
-        self.assertTrue(output.rstrip().endswith("all 2 back on claude 3"), output)
+        self.assertTrue(output.rstrip().endswith("all 2 back on claude3"), output)
 
     def test_follow_finds_completed_request_in_history_before_starting(self) -> None:
         for kind in ("stopped", "already gone", "restarted"):
@@ -312,7 +313,7 @@ class ShutdownLaunchCliTests(ShutdownTestCase):
             status, text = self.follow_request(output)
         self.assertEqual(status, 0)
         self.assertEqual(text.count("Removed: taken out"), 1)
-        self.assertTrue(text.rstrip().endswith("all 2 done: 1 back on claude 3, 1 taken out"), text)
+        self.assertTrue(text.rstrip().endswith("all 2 done: 1 back on claude3, 1 taken out"), text)
 
     def test_follow_finishes_when_every_session_was_taken_out_before_start(self) -> None:
         progress: list[record.SessionProgress] = [
