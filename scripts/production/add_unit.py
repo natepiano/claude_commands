@@ -757,7 +757,7 @@ def launch_session(
                        env=environment, text=True, capture_output=True, check=True)
     directory = main_config_dir() if isinstance(selected, DefaultAccount) else selected.dir
     for option, value in (("@claude_config_dir", str(directory)), ("@claude_model", launch_model)):
-        _ = subprocess.run([tmux, "set-option", "-t", f"={tmux_session}", option, value],
+        _ = subprocess.run([tmux, "set-option", "-t", f"={tmux_session}:", option, value],
                            env=environment, text=True, capture_output=True, check=True)
 
 
@@ -862,7 +862,7 @@ def account_for_launch(request: RequestedUnitLaunch, target: str = "", config_di
             found = launched_unit(request)
             if isinstance(found, MarkedUnitFound):
                 result = subprocess.run([unit_lookup.tmux_binary(), "show-options", "-v", "-t",
-                                         f"={found.unit.label}", "@claude_config_dir"],
+                                         f"={found.unit.label}:", "@claude_config_dir"],
                                         capture_output=True, text=True, check=False)
                 if result.returncode == 0:
                     config_dir = result.stdout.strip()
@@ -895,7 +895,7 @@ def model_for_resume(request: RequestedUnitLaunch, explicit: str = "") -> str:
     found = launched_unit(request)
     if isinstance(found, MarkedUnitFound):
         result = subprocess.run([unit_lookup.tmux_binary(), "show-options", "-v", "-t",
-                                 f"={found.unit.label}", "@claude_model"],
+                                 f"={found.unit.label}:", "@claude_model"],
                                 capture_output=True, text=True, check=False)
         if result.returncode == 0:
             return result.stdout.strip()

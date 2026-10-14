@@ -55,6 +55,12 @@ if name == "tmux":
         return None
 
     target = args[args.index("-t") + 1] if "-t" in args else ""
+    # Option commands take a pane target, where only `=name:` names a session.
+    if args[:1] in (["set-option"], ["show-options"]):
+        if target.startswith("=") and not target.endswith(":"):
+            print(f"no such session: {target}", file=sys.stderr)
+            raise SystemExit(1)
+        target = target.removesuffix(":")
     if args[:1] in (["has-session"], ["show-environment"], ["capture-pane"]) and named(target) is None:
         raise SystemExit(1)
     if args[:1] == ["list-panes"]:
