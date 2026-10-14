@@ -38,7 +38,7 @@ class SeatUsageTests(unittest.TestCase):
     def test_missing_or_single_switch_observation_is_unavailable(self) -> None:
         window = seat_usage.window_from(("2026-10-01", "2026-10-03"))
         only = seat_usage.AccountReading(
-            "codex 1", datetime(2026, 10, 2, tzinfo=timezone.utc), seat_usage.UnknownCreditBalance(),
+            "codex1", datetime(2026, 10, 2, tzinfo=timezone.utc), seat_usage.UnknownCreditBalance(),
         )
         self.assertEqual(seat_usage.switches_per_week((), window), seat_usage.SwitchHistoryUnavailable())
         self.assertEqual(seat_usage.switches_per_week((only,), window), seat_usage.SwitchHistoryUnavailable())
@@ -46,16 +46,16 @@ class SeatUsageTests(unittest.TestCase):
     def test_unknown_and_invalid_credit_balances_have_no_credit_history(self) -> None:
         start = datetime(2026, 10, 1, tzinfo=timezone.utc)
         readings = (
-            seat_usage.AccountReading("codex 1", start, seat_usage.credit_balance("unlimited")),
-            seat_usage.AccountReading("codex 1", start + timedelta(days=1), seat_usage.credit_balance("nan")),
-            seat_usage.AccountReading("codex 1", start + timedelta(days=2), seat_usage.credit_balance(-1)),
+            seat_usage.AccountReading("codex1", start, seat_usage.credit_balance("unlimited")),
+            seat_usage.AccountReading("codex1", start + timedelta(days=1), seat_usage.credit_balance("nan")),
+            seat_usage.AccountReading("codex1", start + timedelta(days=2), seat_usage.credit_balance(-1)),
         )
         window = seat_usage.Window(start, start + timedelta(days=3))
         self.assertEqual(seat_usage.credits_per_day(readings, window), seat_usage.NoCreditHistory())
 
     def test_one_credit_sample_is_insufficient_instead_of_absent_history(self) -> None:
         start = datetime(2026, 10, 1, tzinfo=timezone.utc)
-        reading = seat_usage.AccountReading("codex 1", start, seat_usage.KnownCreditBalance(100.0))
+        reading = seat_usage.AccountReading("codex1", start, seat_usage.KnownCreditBalance(100.0))
         window = seat_usage.Window(start, start + timedelta(days=1))
         self.assertEqual(seat_usage.credits_per_day((reading,), window), seat_usage.InsufficientCreditHistory())
         self.assertEqual(seat_usage.format_credits(seat_usage.InsufficientCreditHistory()),
@@ -424,90 +424,90 @@ class StoredSwitchTests(OutcomeFixture):
     def dual_readings(self) -> tuple[tuple[str, str, float], ...]:
         return tuple((f"2026-10-{day:02d}T00:00:00Z", account, balance)
                      for day, balances in ((4, (100.0, 200.0)), (5, (90.0, 170.0)), (6, (80.0, 140.0)))
-                     for account, balance in zip(("codex 1", "CODEX 2"), balances))
+                     for account, balance in zip(("codex1", "CODEX 2"), balances))
 
     def test_readings_without_role_history_keep_the_legacy_label_switches(self) -> None:
-        row = self.stored_row((("2026-10-04T00:00:00Z", "codex 1", 100),
-                               ("2026-10-05T00:00:00Z", "codex 2", 90),
-                               ("2026-10-06T00:00:00Z", "codex 1", 80)), ())
+        row = self.stored_row((("2026-10-04T00:00:00Z", "codex1", 100),
+                               ("2026-10-05T00:00:00Z", "codex2", 90),
+                               ("2026-10-06T00:00:00Z", "codex1", 80)), ())
         self.assertEqual(row[7], "7.0")
 
     def test_piece_wholly_before_role_history_keeps_the_legacy_label_switches(self) -> None:
-        row = self.stored_row((("2026-10-04T00:00:00Z", "codex 1", 100),
-                               ("2026-10-05T00:00:00Z", "codex 2", 90),
-                               ("2026-10-06T00:00:00Z", "codex 1", 80)),
-                              (("2026-10-08T00:00:00Z", "unit", "claude 1"),))
+        row = self.stored_row((("2026-10-04T00:00:00Z", "codex1", 100),
+                               ("2026-10-05T00:00:00Z", "codex2", 90),
+                               ("2026-10-06T00:00:00Z", "codex1", 80)),
+                              (("2026-10-08T00:00:00Z", "unit", "claude1"),))
         self.assertEqual(row[7], "7.0")
 
     def test_simultaneous_accounts_after_history_without_seats_changes_have_zero_switches(self) -> None:
-        row = self.stored_row(self.dual_readings(), (("2026-10-03T00:00:00Z", "unit", "claude 1"),))
+        row = self.stored_row(self.dual_readings(), (("2026-10-03T00:00:00Z", "unit", "claude1"),))
         self.assertEqual(row[7], "0.0")
 
     def test_seats_changes_use_the_prior_piece_and_ignore_first_repeated_and_unit_labels(self) -> None:
         row = self.stored_row(self.dual_readings(), (
-            ("2026-10-01T00:00:00Z", "unit", "claude 1"),
-            ("2026-10-02T00:00:00Z", "seats", "codex 1"),
-            ("2026-10-04T00:00:00Z", "seats", "codex 2"),
-            ("2026-10-05T00:00:00Z", "seats", "codex 2"),
-            ("2026-10-05T12:00:00Z", "unit", "claude 2"),
-            ("2026-10-06T00:00:00Z", "seats", "codex 1")))
+            ("2026-10-01T00:00:00Z", "unit", "claude1"),
+            ("2026-10-02T00:00:00Z", "seats", "codex1"),
+            ("2026-10-04T00:00:00Z", "seats", "codex2"),
+            ("2026-10-05T00:00:00Z", "seats", "codex2"),
+            ("2026-10-05T12:00:00Z", "unit", "claude2"),
+            ("2026-10-06T00:00:00Z", "seats", "codex1")))
         self.assertEqual(row[7], "7.0")
 
     def test_simultaneous_role_changes_are_ordered_by_timestamp_then_label(self) -> None:
         row = self.stored_row(self.dual_readings(), (
-            ("2026-10-01T00:00:00Z", "unit", "claude 1"),
-            ("2026-10-02T00:00:00Z", "seats", "codex 1"),
-            ("2026-10-05T00:00:00Z", "seats", "codex 2"),
-            ("2026-10-05T00:00:00Z", "seats", "codex 1")))
+            ("2026-10-01T00:00:00Z", "unit", "claude1"),
+            ("2026-10-02T00:00:00Z", "seats", "codex1"),
+            ("2026-10-05T00:00:00Z", "seats", "codex2"),
+            ("2026-10-05T00:00:00Z", "seats", "codex1")))
         self.assertEqual(row[7], "3.5")
 
     def test_first_seats_observation_counts_no_switch_and_never_compares_a_reading_label(self) -> None:
-        row = self.stored_row(self.dual_readings(), (("2026-10-03T00:00:00Z", "unit", "claude 1"),
+        row = self.stored_row(self.dual_readings(), (("2026-10-03T00:00:00Z", "unit", "claude1"),
                                                    ("2026-10-05T00:00:00Z", "seats", "codex other")))
         self.assertEqual(row[7], "0.0")
 
     def test_piece_across_history_counts_legacy_and_role_changes_without_crossing_the_boundary(self) -> None:
-        row = self.stored_row((("2026-10-03T00:00:00Z", "codex 1", 100),
-                               ("2026-10-04T00:00:00Z", "codex 2", 90),
-                               ("2026-10-05T00:00:00Z", "codex 1", 80),
-                               ("2026-10-05T12:00:00Z", "codex 2", 75),
-                               ("2026-10-06T00:00:00Z", "codex 2", 70)),
-                              (("2026-10-05T00:00:00Z", "unit", "claude 1"),
-                               ("2026-10-05T00:00:00Z", "seats", "codex 2"),
-                               ("2026-10-06T00:00:00Z", "seats", "codex 1")), start="2026-10-03")
+        row = self.stored_row((("2026-10-03T00:00:00Z", "codex1", 100),
+                               ("2026-10-04T00:00:00Z", "codex2", 90),
+                               ("2026-10-05T00:00:00Z", "codex1", 80),
+                               ("2026-10-05T12:00:00Z", "codex2", 75),
+                               ("2026-10-06T00:00:00Z", "codex2", 70)),
+                              (("2026-10-05T00:00:00Z", "unit", "claude1"),
+                               ("2026-10-05T00:00:00Z", "seats", "codex2"),
+                               ("2026-10-06T00:00:00Z", "seats", "codex1")), start="2026-10-03")
         self.assertEqual(row[7], "4.7")
 
     def test_role_changes_at_both_coverage_endpoints_count_and_outside_changes_do_not(self) -> None:
-        row = self.stored_row((("2026-10-04T06:00:00Z", "codex 1", 100),
-                               ("2026-10-06T06:00:00Z", "codex 1", 80)), (
-            ("2026-10-01T00:00:00Z", "seats", "codex 1"),
-            ("2026-10-04T05:00:00Z", "seats", "codex 2"),
-            ("2026-10-04T06:00:00Z", "seats", "codex 1"),
-            ("2026-10-06T06:00:00Z", "seats", "codex 2"),
-            ("2026-10-06T07:00:00Z", "seats", "codex 1")))
+        row = self.stored_row((("2026-10-04T06:00:00Z", "codex1", 100),
+                               ("2026-10-06T06:00:00Z", "codex1", 80)), (
+            ("2026-10-01T00:00:00Z", "seats", "codex1"),
+            ("2026-10-04T05:00:00Z", "seats", "codex2"),
+            ("2026-10-04T06:00:00Z", "seats", "codex1"),
+            ("2026-10-06T06:00:00Z", "seats", "codex2"),
+            ("2026-10-06T07:00:00Z", "seats", "codex1")))
         self.assertEqual(row[7], "7.0")
 
     def test_reading_before_the_piece_extends_coverage_to_its_start_for_a_role_switch(self) -> None:
-        row = self.stored_row((("2026-10-03T00:00:00Z", "codex 1", 100),
-                               ("2026-10-06T00:00:00Z", "codex 1", 80)), (
-            ("2026-10-02T00:00:00Z", "seats", "codex 1"),
-            ("2026-10-04T00:00:00Z", "seats", "codex 2")))
+        row = self.stored_row((("2026-10-03T00:00:00Z", "codex1", 100),
+                               ("2026-10-06T00:00:00Z", "codex1", 80)), (
+            ("2026-10-02T00:00:00Z", "seats", "codex1"),
+            ("2026-10-04T00:00:00Z", "seats", "codex2")))
         self.assertEqual(row[7], "3.5")
 
     def test_role_changes_without_positive_reading_coverage_still_have_an_unavailable_rate(self) -> None:
-        row = self.stored_row((("2026-10-05T00:00:00Z", "codex 1", 100),),
-                              (("2026-10-03T00:00:00Z", "seats", "codex 1"),
-                               ("2026-10-05T00:00:00Z", "seats", "codex 2")))
+        row = self.stored_row((("2026-10-05T00:00:00Z", "codex1", 100),),
+                              (("2026-10-03T00:00:00Z", "seats", "codex1"),
+                               ("2026-10-05T00:00:00Z", "seats", "codex2")))
         self.assertEqual(row[7], "—")
 
     def test_role_changes_without_any_reading_in_the_piece_have_an_unavailable_rate(self) -> None:
-        row = self.stored_row((("2026-10-03T00:00:00Z", "codex 1", 100),),
-                              (("2026-10-03T00:00:00Z", "seats", "codex 1"),
-                               ("2026-10-05T00:00:00Z", "seats", "codex 2")))
+        row = self.stored_row((("2026-10-03T00:00:00Z", "codex1", 100),),
+                              (("2026-10-03T00:00:00Z", "seats", "codex1"),
+                               ("2026-10-05T00:00:00Z", "seats", "codex2")))
         self.assertEqual(row[7], "—")
 
     def test_simultaneous_account_credits_sum_each_accounts_own_decrease(self) -> None:
-        row = self.stored_row(self.dual_readings(), (("2026-10-03T00:00:00Z", "unit", "claude 1"),))
+        row = self.stored_row(self.dual_readings(), (("2026-10-03T00:00:00Z", "unit", "claude1"),))
         self.assertEqual(row[8], "40.0")
 
 

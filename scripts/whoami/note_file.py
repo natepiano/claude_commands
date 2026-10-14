@@ -23,31 +23,31 @@ ACCOUNT_STEM = re.compile(r"(claude|codex) ?([1-9][0-9]*)")
 
 
 @dataclass(frozen=True)
-class AccountStem:
+class NumberedAccountLabel:
     tool: Literal["claude", "codex"]
     number: int
 
     @property
     def label(self) -> str:
-        return f"{self.tool} {self.number}"
+        return f"{self.tool}{self.number}"
 
 
 @dataclass(frozen=True)
-class NotAccountStem:
+class InvalidAccountLabel:
     stem: str
 
 
-def account_stem(stem: str) -> AccountStem | NotAccountStem:
+def parse_account_label(stem: str) -> NumberedAccountLabel | InvalidAccountLabel:
     match = ACCOUNT_STEM.fullmatch(stem)
     if match is None:
-        return NotAccountStem(stem)
+        return InvalidAccountLabel(stem)
     tool: Literal["claude", "codex"] = "claude" if match.group(1) == "claude" else "codex"
-    return AccountStem(tool, int(match.group(2)))
+    return NumberedAccountLabel(tool, int(match.group(2)))
 
 
 def note_name(label: str) -> str:
-    parsed = account_stem(label)
-    if not isinstance(parsed, AccountStem) or parsed.label != label:
+    parsed = parse_account_label(label)
+    if not isinstance(parsed, NumberedAccountLabel):
         raise ValueError(f"not an account label: {label}")
     return f"{parsed.tool}{parsed.number}.md"
 
@@ -60,7 +60,9 @@ def notes_dir() -> Path:
 
 def note_path(label: str) -> Path:
     numbered = notes_dir() / note_name(label)
-    legacy = notes_dir() / (label + ".md")
+    parsed = parse_account_label(label)
+    assert isinstance(parsed, NumberedAccountLabel)
+    legacy = notes_dir() / f"{parsed.tool} {parsed.number}.md"
     return legacy if not numbered.exists() and legacy.exists() else numbered
 
 
@@ -78,19 +80,34 @@ def in_use(note: FieldReader) -> bool:
         return False
 
 
-def reset_time(value: str | None) -> datetime | None:
-    """A note's `resets` time, aware; None when absent or unreadable.
+@dataclass(frozen=True)
+class KnownReset:
+    value: datetime
 
-    Notes travel between machines in the vault. A reset written with its offset reads the same on
-    every machine; one written before the offset was recorded is read in this machine's zone.
+
+@dataclass(frozen=True)
+class NoResetKnown:
+    """The note does not specify a reset."""
+
+
+@dataclass(frozen=True)
+class InvalidReset:
+    value: str
+
+
+def reset_time(value: str | None) -> KnownReset | NoResetKnown | InvalidReset:
+    """Read an aware reset time; legacy times without offsets use the local zone.
+
+    Notes travel between machines in the vault: a reset written with its offset
+    reads the same everywhere; one written without it reads in this machine zone.
     """
     if not value or value == "null":
-        return None
+        return NoResetKnown()
     try:
         parsed = datetime.fromisoformat(value)
     except ValueError:
-        return None
-    return parsed if parsed.tzinfo is not None else parsed.astimezone()
+        return InvalidReset(value)
+    return KnownReset(parsed if parsed.tzinfo is not None else parsed.astimezone())
 
 
 @dataclass
@@ -133,30 +150,61 @@ class Note:
         return ()
 
 
-def read_note(path: Path) -> Note | None:
-    """A note with its frontmatter located, or None if unavailable or absent."""
-    parsed = account_stem(path.stem)
-    if isinstance(parsed, NotAccountStem):
-        return None
+@dataclass(frozen=True)
+class NotAccountNote:
+    path: Path
+
+
+@dataclass(frozen=True)
+class UnreadableNote:
+    path: Path
+
+
+@dataclass(frozen=True)
+class MalformedNote:
+    path: Path
+
+
+def read_note(path: Path) -> Note | NotAccountNote | UnreadableNote | MalformedNote:
+    parsed = parse_account_label(path.stem)
+    if isinstance(parsed, InvalidAccountLabel):
+        return NotAccountNote(path)
     try:
         text = path.read_text(encoding="utf-8")
     except (OSError, UnicodeError):
-        return None
+        return UnreadableNote(path)
     if not text.startswith("---\n"):
-        return None
+        return MalformedNote(path)
     close = text.find("\n---", 3)
     if close == -1:
-        return None
+        return MalformedNote(path)
     return Note(path, parsed.tool, text, 4, close, parsed.label)
 
 
 def read_notes() -> list[Note]:
     selected: dict[str, Note] = {}
     for path in sorted(notes_dir().glob("*.md")):
-        parsed = account_stem(path.stem)
-        if isinstance(parsed, AccountStem) and path.stem == parsed.label and (path.parent / note_name(parsed.label)).exists():
+        parsed = parse_account_label(path.stem)
+        if not isinstance(parsed, NumberedAccountLabel):
+            continue
+        if path.stem == f"{parsed.tool} {parsed.number}" and (path.parent / note_name(parsed.label)).exists():
             continue
         note = read_note(path)
-        if note is not None and (note.label not in selected or path.name == note_name(note.label)):
+        if isinstance(note, Note) and (note.label not in selected or path.name == note_name(note.label)):
             selected[note.label] = note
-    return [selected[label] for label in sorted(selected)]
+    def order(note: Note) -> tuple[str, int]:
+        parsed = parse_account_label(note.label)
+        assert isinstance(parsed, NumberedAccountLabel)
+        return parsed.tool, parsed.number
+    return sorted(selected.values(), key=order)
+
+
+def canonical_label(text: str) -> str:
+    """Normalize a numbered label, preserving logins and default-home aliases."""
+    parsed = parse_account_label(text)
+    return parsed.label if isinstance(parsed, NumberedAccountLabel) else text
+
+
+def canonical_label_text(text: str) -> str:
+    """Normalize account mentions without changing surrounding notice text."""
+    return re.sub(rf"\b{ACCOUNT_STEM.pattern}\b", lambda match: canonical_label(match.group()), text)

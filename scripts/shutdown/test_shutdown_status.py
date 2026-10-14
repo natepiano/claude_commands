@@ -45,7 +45,7 @@ def empty_inventory(machine: str = "natedev") -> Inventory:
     return {
         "machine": machine,
         "login": LOGIN,
-        "label": "claude 2",
+        "label": "claude2",
         "sessions": [],
         "unattributed": [],
     }
@@ -82,7 +82,7 @@ def complete_record(machine: str = "natedev") -> LegacyRecordFixture:
             object,
             {
                 "login": LOGIN,
-                "label": "claude 2",
+                "label": "claude2",
                 "machine": machine,
                 "state": "settling",
                 "requested_at": "2026-10-09T21:49:10+00:00",
@@ -112,7 +112,7 @@ def session_shutdown(machine: str = "natedev", name: str = "shutdown") -> Sessio
     item["session"]["name"] = name
     item["session"]["session_id"] = name + "-id"
     return SessionShutdown(
-        login=LOGIN, label="claude 2", machine=machine,
+        login=LOGIN, label="claude2", machine=machine,
         requested_at=old["requested_at"], requested_by=old["requested_by"], request_id="request-one",
         hold="account", then="stop", force=old["force"], alerts="user",
         session=item["session"], seats=[], timers=item["timers"],
@@ -246,11 +246,11 @@ else:
             result = shutdown.main(["status", LOGIN, "--here"])
 
         self.assertEqual(result, 0)
-        self.assertIn("natedev:\n  no sessions on claude 2\n", standard_output.getvalue())
+        self.assertIn("natedev:\n  no sessions on claude2\n", standard_output.getvalue())
 
     def test_account_label_resolution_accepts_only_claude_notes(self) -> None:
-        self.write_note("claude 2", LOGIN)
-        self.write_note("codex 2", "codex@example.com")
+        self.write_note("claude2", LOGIN)
+        self.write_note("codex2", "codex@example.com")
 
         def inventory_for(login: str) -> Inventory:
             self.assertEqual(login, LOGIN)
@@ -260,7 +260,7 @@ else:
             patch.object(shutdown, "inventory", side_effect=inventory_for),
             redirect_stdout(io.StringIO()),
         ):
-            result = shutdown.main(["status", "claude 2", "--json", "--here"])
+            result = shutdown.main(["status", "claude2", "--json", "--here"])
         self.assertEqual(result, 0)
 
         errors = io.StringIO()
@@ -272,9 +272,9 @@ else:
                 side_effect=AssertionError("inventory must not run"),
             ),
         ):
-            result = shutdown.main(["status", "codex 2", "--here"])
+            result = shutdown.main(["status", "codex2", "--here"])
         self.assertEqual(result, 2)
-        self.assertIn("unknown account codex 2", errors.getvalue())
+        self.assertIn("unknown account codex2", errors.getvalue())
 
     def test_login_argument_is_accepted_without_a_note(self) -> None:
         def inventory_for(login: str) -> Inventory:
@@ -305,7 +305,7 @@ else:
         self.assertEqual(result, 2)
         self.assertEqual(
             errors.getvalue(),
-            "shutdown: unknown account claude2: give a note label such as claude 2, or a login\n",
+            "shutdown: unknown account claude2: give a note label such as claude2, or a login\n",
         )
 
     def test_unreadable_own_account_exits_two(self) -> None:
@@ -338,7 +338,7 @@ else:
             {
                 "machine": "Mac",
                 "login": LOGIN,
-                "label": "claude 2",
+                "label": "claude2",
                 "sessions": [],
             }
         )
@@ -363,7 +363,7 @@ else:
             {
                 "machine": "Mac",
                 "login": LOGIN,
-                "label": "claude 2",
+                "label": "claude2",
                 "sessions": [complete_session(host={"kind": 7})],
                 "unattributed": [],
             }
@@ -648,8 +648,8 @@ else:
         ]
         self.assertEqual([line for line in status_output.getvalue().splitlines() if line in expected], expected)
         self.assertEqual(records_output.getvalue(),
-            "natedev claude 2 failed launch: restart failed since 2026-10-09 14:49:10 PDT\n"
-            + "natedev claude 2 shutdown: waiting since 2026-10-09 18:02:03 PDT\n",
+            "natedev claude2 failed launch: restart failed since 2026-10-09 14:49:10 PDT\n"
+            + "natedev claude2 shutdown: waiting since 2026-10-09 18:02:03 PDT\n",
         )
 
     def test_status_filters_remote_records_to_the_selected_account(self) -> None:
@@ -690,7 +690,7 @@ else:
         self.assertEqual(result, 0)
         self.assertEqual(
             output.getvalue(),
-            "natedev claude 2 shutdown: waiting since 2026-10-09 14:49:10 PDT\n",
+            "natedev claude2 shutdown: waiting since 2026-10-09 14:49:10 PDT\n",
         )
 
     def test_records_json_here_prints_local_records(self) -> None:
@@ -948,7 +948,7 @@ else:
         for machine in ("natedev", "Mac"):
             expected.extend([
                 machine + ":",
-                "  no sessions on claude 2",
+                "  no sessions on claude2",
                 "  bevy: stopped",
                 *(["    14:49:10 stopped"] if machine == "natedev" else []),
                 "  failed: stop failed — still live",
@@ -973,7 +973,7 @@ else:
         self.assertEqual(output.getvalue().splitlines(), [
             LOGIN + " · " + LOGIN,
             "natedev:",
-            "  no sessions on claude 2",
+            "  no sessions on claude2",
             "  hana: waiting",
             "    14:49:10 waiting",
             "  nixos: waiting",

@@ -913,11 +913,11 @@ class LocalReviewTests(unittest.TestCase):
     def test_named_unit_account_replaces_the_callers_directory(self) -> None:
         runner = FakeReviewer(verdict(self.draft))
         directory = self.root / "unit account"
-        with (mock.patch.object(accounts, "role_account", return_value=accounts.NamedAccount("claude 2", directory)) as select,
+        with (mock.patch.object(accounts, "role_account", return_value=accounts.NamedAccount("claude2", directory)) as select,
               mock.patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": "writer config", "ANTHROPIC_API_KEY": "writer key"})):
             result = review.review(self.draft, False, runner=runner)
         select.assert_called_once_with("unit")
-        self.assertEqual(result.metadata.account, "claude 2")
+        self.assertEqual(result.metadata.account, "claude2")
         for call in runner.calls:
             self.assertEqual(call.environment["CLAUDE_CONFIG_DIR"], str(directory))
             self.assertNotIn("ANTHROPIC_API_KEY", call.environment)

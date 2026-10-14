@@ -7,7 +7,11 @@ import sys
 from collections.abc import Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Literal, NamedTuple
+
+from note_file import canonical_label
+from user_zone import user_zone
 
 if __name__ == "session_table":
     _ = sys.modules.setdefault("scripts.whoami.session_table", sys.modules[__name__])
@@ -27,6 +31,8 @@ class SessionRow(NamedTuple):
     machine: str
     folder: str
     session_id: str
+    last_seen: str = ""
+    observed_at: str = ""
 
 
 @dataclass(frozen=True)
@@ -46,6 +52,7 @@ KEEP_SECTIONS = KeepSections()
 class ReadSessions:
     rows_by_label: dict[str, tuple[SessionRow, ...]]
     rows_kept: frozenset[str]
+    unattributed: int = 0
 
 
 @dataclass(frozen=True)
@@ -57,15 +64,21 @@ def _short_folder(folder: str) -> str:
     return re.sub(r"^/(?:home|Users)/[^/]+(?=/|$)", "~", folder)
 
 
-def render_section(rows: Sequence[SessionRow]) -> str:
+def render_section(rows: Sequence[SessionRow], unattributed: int = 0) -> str:
     lines = [HEADING, ""]
-    if not rows:
+    if not rows and not unattributed:
         return "\n".join([*lines, "No live sessions.", ""])
-    lines += ["| Session | Role | Machine | Folder | Session id |",
-              "| --- | --- | --- | --- | --- |"]
+    if rows:
+        lines += ["| Session | Role | Machine | Folder | Session id |",
+                  "| --- | --- | --- | --- | --- |"]
     for row in sorted(rows, key=lambda item: (item.machine, ROLE_ORDER.index(item.role), item.name, item.session_id)):
-        cells = (row.name, row.role, row.machine, _short_folder(row.folder), row.session_id)
+        identity = row.session_id + (f" (last seen {row.last_seen})" if row.last_seen else "")
+        if row.observed_at:
+            identity += f" <!-- observed-at: {row.observed_at} -->"
+        cells = (row.name, row.role, row.machine, _short_folder(row.folder), identity)
         lines.append("| " + " | ".join(cell.replace("\n", " ").replace("|", r"\|") for cell in cells) + " |")
+    if unattributed:
+        lines += ["", f"{unattributed} live session(s) not attributed to an account"]
     return "\n".join([*lines, ""])
 
 
@@ -87,7 +100,11 @@ def section_rows(body: str) -> tuple[SessionRow, ...]:
         if len(cells) != 5 or cells[1] not in ROLE_ORDER:
             continue
         role: SessionRole = ROLE_ORDER[ROLE_ORDER.index(cells[1])]
-        rows.append(SessionRow(cells[0], role, cells[2], cells[3], cells[4]))
+        saved_identity, observation, observed_at = cells[4].partition(" <!-- observed-at: ")
+        identity, marker, seen = saved_identity.partition(" (last seen ")
+        rows.append(SessionRow(cells[0], role, cells[2], cells[3], identity,
+                               seen.removesuffix(")") if marker else "",
+                               observed_at.removesuffix(" -->") if observation else ""))
     return tuple(rows)
 
 
@@ -126,11 +143,24 @@ def live_sessions(environment: Mapping[str, str]) -> ReadSessions | SessionsUnre
     rows: dict[str, list[SessionRow]] = {}
     roles: dict[str, SessionRole] = {"showrunner": "showrunner", "unit director": "unit",
                                     "worker": "worker", "freestanding": "freestanding"}
+    unattributed = 0
     for entry in entries:
+        if isinstance(entry.account, roster.AccountUnread):
+            unattributed += 1
         if not isinstance(entry.account, roster.AccountLabel) or entry.role not in roles:
             continue
         session_id = (entry.session.session_id if isinstance(entry.session, roster.ClaudeSession)
                       else entry.thread.thread_id if isinstance(entry.thread, roster.CodexThread) else "—")
-        rows.setdefault(entry.account.label, []).append(
+        rows.setdefault(canonical_label(entry.account.label), []).append(
             SessionRow(entry.name, roles[entry.role], entry.machine, _short_folder(entry.cwd), session_id))
-    return ReadSessions({label: tuple(items) for label, items in rows.items()}, frozenset(kept))
+    return ReadSessions({label: tuple(items) for label, items in rows.items()}, frozenset(kept), unattributed)
+
+
+def observed(row: SessionRow, at: datetime) -> SessionRow:
+    """Save a successful observation for a later refresh that cannot reach this peer."""
+    return row._replace(last_seen="", observed_at=at.astimezone(user_zone()).isoformat(timespec="seconds"))
+
+
+def last_seen(row: SessionRow) -> SessionRow:
+    """Keep the last successful observation; older rows have no known observation time."""
+    return row._replace(last_seen=row.observed_at or "unknown")

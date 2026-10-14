@@ -90,8 +90,8 @@ def checked(child: Production, caller: str, ending: str = "", start_in: Path | N
     if isinstance(config_dir, Path) and config_dir != main_config_dir():
         label = str(config_dir)
         numbered = re.fullmatch(r"\.claude([0-9]+)", config_dir.name)
-        if numbered and config_dir == account_dir(f"claude {numbered.group(1)}"):
-            label = f"claude {numbered.group(1)}"
+        if numbered and config_dir == account_dir(f"claude{numbered.group(1)}"):
+            label = f"claude{numbered.group(1)}"
         selected = NamedAccount(label, config_dir)
     else:
         selected = DefaultAccount()

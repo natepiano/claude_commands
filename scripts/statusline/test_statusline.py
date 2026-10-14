@@ -18,7 +18,7 @@ COMMAND = f'statusline="{Path(__file__).parent}"; . "$statusline/statusline.sh"'
 USER_ZONE = ZoneInfo("America/New_York")
 
 
-def status_lines(*inputs: object, labels: Path | None = None, account: str = "claude 1") -> list[str]:
+def status_lines(*inputs: object, labels: Path | None = None, account: str = "claude1") -> list[str]:
     """Run statusline.jq once over every input and return its output lines.
 
     `labels` is the by-label readings file, passed as the settings command passes it.
@@ -103,30 +103,36 @@ class StoredReadingTests(unittest.TestCase):
         return {"weekly": {"left": left, "resets_at": resets_at, "at": at}}
 
     def test_a_fresh_reading_for_the_label_replaces_the_response_figure(self) -> None:
-        path = self.labels({"claude 1": self.weekly(2.0, self.now - 120, self.reset)})
+        path = self.labels({"claude1": self.weekly(2.0, self.now - 120, self.reset)})
         self.assertEqual(
             status_lines(self.live, labels=path)[1].split(" | ")[1],
             f"weekly 2% left until {user_time(self.reset, '%a %H:%M %Z')}",
         )
 
+    def test_legacy_and_canonical_account_caches_find_the_canonical_reading(self) -> None:
+        path = self.labels({"claude2": self.weekly(42, self.now - 60, self.reset)})
+        for label in ("claude 2", "claude2"):
+            with self.subTest(label=label):
+                self.assertIn("weekly 42% left", status_lines(self.live, labels=path, account=label)[1])
+
     def test_a_reading_older_than_ten_minutes_gives_the_response_figure(self) -> None:
-        path = self.labels({"claude 1": self.weekly(2.0, self.now - 601, self.reset)})
+        path = self.labels({"claude1": self.weekly(2.0, self.now - 601, self.reset)})
         self.assertTrue(status_lines(self.live, labels=path)[1].endswith("| weekly 3% left until "
                         + user_time(self.now + 86400, "%a %H:%M %Z")))
 
     def test_a_reading_whose_window_has_reset_gives_the_response_figure(self) -> None:
-        path = self.labels({"claude 1": self.weekly(2.0, self.now - 60, self.now - 1)})
+        path = self.labels({"claude1": self.weekly(2.0, self.now - 60, self.now - 1)})
         self.assertIn("weekly 3% left", status_lines(self.live, labels=path)[1])
 
     def test_another_label_s_reading_is_not_used(self) -> None:
-        path = self.labels({"claude 2": self.weekly(50.0, self.now - 60, self.reset)})
+        path = self.labels({"claude2": self.weekly(50.0, self.now - 60, self.reset)})
         self.assertIn("weekly 3% left", status_lines(self.live, labels=path)[1])
 
     def test_a_missing_file_given_as_dev_null_gives_the_response_figure(self) -> None:
         self.assertIn("weekly 3% left", status_lines(self.live, labels=Path("/dev/null"))[1])
 
     def test_a_none_open_five_hour_reading_shows_all_left_with_no_reset(self) -> None:
-        path = self.labels({"claude 1": {"five_hour": {"left": 100.0, "resets_at": None, "at": self.now - 60}}})
+        path = self.labels({"claude1": {"five_hour": {"left": 100.0, "resets_at": None, "at": self.now - 60}}})
         self.assertTrue(status_lines(self.live, labels=path)[1].startswith("5-hour 100% left | weekly"))
 
     def test_an_address_as_the_account_never_reaches_the_line(self) -> None:
@@ -214,7 +220,7 @@ class RoleTests(unittest.TestCase):
     def test_the_account_label_follows_the_role(self) -> None:
         config = self.home / "config"
         config.mkdir()
-        _ = (config / "account-label").write_text("claude 4\n", encoding="utf-8")
+        _ = (config / "account-label").write_text("claude4\n", encoding="utf-8")
         self.assertTrue(self.first_line(CLAUDE_CONFIG_DIR=str(config)).startswith("unassigned | claude4 | "))
 
 

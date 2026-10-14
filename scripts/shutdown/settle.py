@@ -27,7 +27,7 @@ from account import Account
 import conversation_pause
 from inventory import Inventory, Session, inventory
 import record as store
-from record import NoRemoteControl, SessionShutdown, SessionStopIssue, TimerRestore, ShowrunnerFooter, NoFooter, ShutdownContinuation, ReadinessCheck
+from record import SessionShutdown, SessionStopIssue, TimerRestore, ShowrunnerFooter, NoFooter, ShutdownContinuation, ReadinessCheck
 from remote import other_machine, run_remote
 import showrunner_footer
 import sessions
@@ -1420,7 +1420,6 @@ class PendingSessionAction:
 @dataclass(frozen=True)
 class ConfirmedRelaunchPass:
     records: list[SessionShutdown]
-    no_remote_control: tuple[NoRemoteControl, ...]
 
 
 @dataclass(frozen=True)
@@ -1448,17 +1447,8 @@ def _confirm_relaunch_pass(records: list[SessionShutdown]) -> ConfirmedRelaunchP
     confirmed_ids = {saved["session"]["session_id"] for saved in confirmed}
     control_records = restart_work.RegistryConfirmation(tuple(
         item for item in confirmation.records if item["sessionId"] in confirmed_ids))
-    missing = restart_work.remote_control_missing(confirmed, control_records)
-    return ConfirmedRelaunchPass(records, missing)
-
-
-def _remote_control_alert(records: list[SessionShutdown], missing: tuple[NoRemoteControl, ...]) -> None:
-    due = [item for item in missing if item["alerts"] == "user"]
-    if not due:
-        return
-    for item in due:
-        alert_user(render("shutdown.remote_control", session=item["name"], machine=records[0]["machine"]),
-                   machine="natedev" if local_machine().casefold() == "mac" else "")
+    _ = restart_work.remote_control_missing(confirmed, control_records)
+    return ConfirmedRelaunchPass(records)
 
 
 def _holdout_due(saved: SessionShutdown, at: datetime) -> bool:
@@ -1665,8 +1655,6 @@ def _conduct_owned(login: str, archived: dict[str, SessionShutdown]) -> None:
                         for saved in batch.records:
                             _action_failed(saved, error, stopping=False)
                         continue
-                    if completed.no_remote_control:
-                        sends.append(notifications.submit(_remote_control_alert, completed.records, completed.no_remote_control))
                     for saved in completed.records:
                         found = store.lookup_session(login, saved["session"]["session_id"])
                         if isinstance(found, store.ShutdownFound) and found.record["progress"]["kind"] == "restarted":

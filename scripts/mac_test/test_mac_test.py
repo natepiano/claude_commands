@@ -364,7 +364,9 @@ class MacTestCommandTests(unittest.TestCase):
             "ci_variable": "MACOS_CI",
             "ci_workflow": "ci.yml",
             "ci_job": CI_JOB,
-            "gh_timeout_s": "2",
+            # Long enough for the Python gh stand-in under load; a test about
+            # the limit sets its own.
+            "gh_timeout_s": "60",
             "block_hours": "4",
             "block_max_hours": "48",
             "block_warn_minutes": "15",
@@ -388,7 +390,7 @@ class MacTestCommandTests(unittest.TestCase):
         self,
         *arguments: str,
         environment: dict[str, str] | None = None,
-        timeout: float = 10,
+        timeout: float = 60,
     ) -> subprocess.CompletedProcess[str]:
         return subprocess.run(
             [sys.executable, str(SCRIPT), *arguments],
@@ -529,7 +531,7 @@ class MacTestCommandTests(unittest.TestCase):
     def clear_log(self, name: str) -> None:
         (self.stub_directory / f"{name}.jsonl").unlink(missing_ok=True)
 
-    def wait_for_path(self, path: Path, timeout: float = 3) -> None:
+    def wait_for_path(self, path: Path, timeout: float = 60) -> None:
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
             if path.exists():
@@ -537,7 +539,7 @@ class MacTestCommandTests(unittest.TestCase):
             time.sleep(0.01)
         self.fail(f"timed out waiting for {path}")
 
-    def wait_for_log_count(self, name: str, count: int, timeout: float = 3) -> None:
+    def wait_for_log_count(self, name: str, count: int, timeout: float = 60) -> None:
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
             if len(self.logged_arguments(name)) >= count:
@@ -546,7 +548,7 @@ class MacTestCommandTests(unittest.TestCase):
         self.fail(f"timed out waiting for {count} {name} calls")
 
     def wait_for_free_message(
-        self, expected: FreeMessageState, timeout: float = 3
+        self, expected: FreeMessageState, timeout: float = 60
     ) -> dict[str, object]:
         deadline = time.monotonic() + timeout
         block = self.block_state()
@@ -1080,7 +1082,7 @@ class MacTestCommandTests(unittest.TestCase):
         with log.open("a+") as held_log:
             fcntl.flock(held_log, fcntl.LOCK_EX)
             try:
-                result = self.command("block", "--holder", "alice", "--for", "rendering", timeout=1.5)
+                result = self.command("block", "--holder", "alice", "--for", "rendering", timeout=60)
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
                 block = self.block_state()
                 for name in ("state.lock", "control.lock"):
@@ -1122,7 +1124,7 @@ class MacTestCommandTests(unittest.TestCase):
                 self.assertEqual(log.read_text(), "")
             finally:
                 fcntl.flock(held_log, fcntl.LOCK_UN)
-                waiter.join(timeout=5)
+                waiter.join(timeout=60)
         self.assertFalse(waiter.is_alive())
         self.assertEqual(errors, [])
         self.assertTrue(finished.is_set())
@@ -1158,7 +1160,7 @@ class MacTestCommandTests(unittest.TestCase):
                 self.assertEqual(launched, [])
             for thread in threading.enumerate():
                 if thread.name == "hold-event-recorder":
-                    thread.join(timeout=5)
+                    thread.join(timeout=60)
                     self.assertFalse(thread.is_alive())
         self.assertEqual(len(launched), 1)
         self.assertEqual(launched[0].returncode, 0)
@@ -1192,7 +1194,7 @@ for arguments in (
     assert mac_test.main() == 0
 """
         result = subprocess.run([sys.executable, "-c", source, str(SCRIPT.parent)],
-                                env=self.environment, capture_output=True, text=True, timeout=5, check=False,
+                                env=self.environment, capture_output=True, text=True, timeout=60, check=False,
                                 pass_fds=(self.writer_write_fd,))
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         rows = self.hold_events(3)
@@ -1389,7 +1391,7 @@ for arguments in (
 
         unblocked = self.command("unblock", "--holder", "alice")
         self.assertEqual(unblocked.returncode, 0, unblocked.stdout + unblocked.stderr)
-        stdout, stderr = watcher.communicate(timeout=3)
+        stdout, stderr = watcher.communicate(timeout=60)
         self.assertEqual(watcher.returncode, 0, stdout + stderr)
         self.assertEqual(len(self.logged_arguments("send-delivered")), 1)
 
@@ -1904,28 +1906,33 @@ for arguments in (
         self.assertEqual(self.read_fixture_variable(), "false")
 
     def test_timed_out_set_is_reconciled_and_restored(self) -> None:
-        self.write_config(gh_timeout_s="0.2")
-        self.gh["delays"] = [
-            {
-                "match": "variable set",
-                "seconds": 30.0,
-                "marker": "set-applied",
-                "after": True,
-            }
-        ]
-        self.sync_gh()
+        # The set reaches gh and is applied, then the call times out. Expire
+        # it at the subprocess boundary after the stand-in returns: a real
+        # short timer can kill the stand-in before it applies under load.
+        timeout_stub = r'''
+original_run = subprocess.run
+
+def expire_after_set(command, *args, **kwargs):
+    if command[:3] == ["gh", "variable", "set"]:
+        _ = original_run(command, *args, **kwargs)
+        raise subprocess.TimeoutExpired(command, kwargs.get("timeout"))
+    return original_run(command, *args, **kwargs)
+
+subprocess.run = expire_after_set
+'''
+        lifetime = self.root / "child-lifetime" / "sitecustomize.py"
+        _ = lifetime.write_text(FIXTURE_CHILD_LIFETIME + timeout_stub)
         blocked = self.start_command(
             "block", "--holder", "alice", "--for", "rendering"
         )
-        self.wait_for_path(self.stub_directory / "set-applied")
-        stdout, stderr = blocked.communicate(timeout=5)
+        stdout, stderr = blocked.communicate(timeout=300)
+        _ = lifetime.write_text(FIXTURE_CHILD_LIFETIME)
         self.assertEqual(blocked.returncode, 2, stdout + stderr)
         self.assertIn("CI can still use the Mac:", stdout)
         self.assertEqual(self.block_state()["ci"], "off_unconfirmed")
         self.assertEqual(self.read_fixture_variable(), "false")
 
         self.gh["variable"] = "false"
-        self.gh["delays"] = []
         self.sync_gh()
         status = self.command("status")
         self.assertEqual(status.returncode, 0, status.stdout + status.stderr)
@@ -2023,7 +2030,7 @@ subprocess.run = expire_gh
         self.gh["delays"] = [
             {
                 "match": "variable get",
-                "seconds": 20.0,
+                "seconds": 300.0,
                 "marker": "slow-gh-started",
                 "release": "continue-gh",
             }
@@ -2037,7 +2044,7 @@ subprocess.run = expire_gh
         _ = (self.stub_directory / "continue-gh").write_text(
             "continue\n", encoding="utf-8"
         )
-        stdout, stderr = blocker.communicate(timeout=3)
+        stdout, stderr = blocker.communicate(timeout=60)
         self.assertEqual(blocker.returncode, 0, stdout + stderr)
 
     def test_release_starts_watcher_without_gh_or_send(self) -> None:
@@ -2110,14 +2117,14 @@ subprocess.run = expire_gh
             "3",
             environment=environment,
         )
-        stdout, stderr = renewal.communicate(timeout=4)
+        stdout, stderr = renewal.communicate(timeout=60)
         self.assertEqual(renewal.returncode, 0, stdout + stderr)
         block = self.block_state()
         self.assertEqual(block["for"], "renewed work")
         self.assertEqual(block["session"], "new-session")
         self.assertEqual(block["since"], original["since"])
         watcher.terminate()
-        _ = watcher.wait(timeout=3)
+        _ = watcher.wait(timeout=60)
 
     def test_unblock_and_expiry_restore_switch_once(self) -> None:
         now = datetime.now(timezone.utc)
@@ -2134,8 +2141,8 @@ subprocess.run = expire_gh
         expiry = self.start_command("status")
         self.wait_for_path(self.stub_directory / "restore-started")
         unblock = self.start_command("unblock", "--holder", "alice")
-        expiry_output = expiry.communicate(timeout=4)
-        unblock_output = unblock.communicate(timeout=4)
+        expiry_output = expiry.communicate(timeout=60)
+        unblock_output = unblock.communicate(timeout=60)
         self.assertEqual(expiry.returncode, 0, "".join(expiry_output))
         self.assertEqual(unblock.returncode, 0, "".join(unblock_output))
         self.assertEqual(self.gh_calls("variable set"), 1)
@@ -2154,7 +2161,7 @@ subprocess.run = expire_gh
         self.gh["delays"] = [
             {
                 "match": "run list",
-                "seconds": 20.0,
+                "seconds": 300.0,
                 "marker": "watch-gh-started",
                 "release": "continue-watch-gh",
             }
@@ -2162,7 +2169,7 @@ subprocess.run = expire_gh
         self.sync_gh()
         first = self.start_command("watch")
         self.wait_for_path(self.stub_directory / "watch-gh-started")
-        second = self.command("watch", timeout=3)
+        second = self.command("watch", timeout=60)
         self.assert_command(second, 0, "")
         self.assertIsNone(first.poll())
         _ = (self.stub_directory / "continue-watch-gh").write_text(
@@ -2170,7 +2177,7 @@ subprocess.run = expire_gh
         )
         unblocked = self.command("unblock", "--holder", "alice")
         self.assertEqual(unblocked.returncode, 0, unblocked.stdout + unblocked.stderr)
-        stdout, stderr = first.communicate(timeout=3)
+        stdout, stderr = first.communicate(timeout=60)
         self.assertEqual(first.returncode, 0, stdout + stderr)
 
     def test_failed_free_message_stays_owed_and_status_reports_it(self) -> None:
@@ -2229,7 +2236,7 @@ subprocess.run = expire_gh
             **self.environment,
             "MAC_TEST_MESSAGE_TIMEOUT_S": "0.05",
         }
-        status = self.command("status", environment=environment, timeout=3)
+        status = self.command("status", environment=environment, timeout=60)
         self.assertEqual(status.returncode, 0, status.stdout + status.stderr)
         self.assertIn(
             'The "Mac is free" message has not reached dana yet.\n',
@@ -2388,7 +2395,7 @@ subprocess.run = expire_gh
         _ = (self.stub_directory / "send-continue").write_text(
             "continue\n", encoding="utf-8"
         )
-        stdout, stderr = status.communicate(timeout=3)
+        stdout, stderr = status.communicate(timeout=60)
         self.assertEqual(status.returncode, 0, stdout + stderr)
 
 

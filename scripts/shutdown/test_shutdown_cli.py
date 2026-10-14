@@ -25,6 +25,7 @@ from test_record import LegacyRecordFixture, LegacyEntryFixture, write_old
 import launch_permission
 import record
 import sessions
+import remote_control
 import shutdown
 import settle
 from push_texts import RenderedPush
@@ -33,7 +34,7 @@ from account import Account, UnreadableAccount
 
 
 LOGIN = "owner@example.com"
-LABEL = "claude 2"
+LABEL = "claude2"
 OCTOBER = "2026-10-09T21:49:10+00:00"
 JANUARY = "2026-01-15T17:30:00+00:00"
 PERMISSION_SCRIPT = Path(__file__).with_name("launch_permission.py")
@@ -164,6 +165,13 @@ class ShutdownLaunchCliTests(ShutdownTestCase):
         if self.state.exists():
             shutil.rmtree(self.state)
 
+    def test_remote_control_cli_passes_identity_and_failure_alert_policy_to_fixer(self) -> None:
+        for policy in ("user", "none"):
+            with self.subTest(policy=policy), patch.object(remote_control, "fix", return_value=remote_control.AlreadyOn()) as fix:
+                self.assertEqual(shutdown.main(["remote-control", "owner", "--pid", "321",
+                    "--proc-start", "original", "--who", "trunk unit", "--alerts", policy]), 0)
+            fix.assert_called_once_with("owner", 321, "original", "trunk unit", policy)
+
     def follow_request(self, output: io.StringIO | None = None) -> tuple[int, str]:
         output = output if output is not None else io.StringIO()
         with (
@@ -178,6 +186,7 @@ class ShutdownLaunchCliTests(ShutdownTestCase):
     def test_follow_prints_each_new_step_once_and_waits_for_pending_restart(self) -> None:
         saved = session_shutdown(record.SessionWaiting(kind="waiting"))
         saved["session"]["name"] = "Alpha"
+        # Legacy-spelled stored targets must print as canonical labels.
         saved["target"] = "claude 3"
         saved["trail"] = [{"at": OCTOBER, "kind": "waiting", "detail": "pause sent"}]
         self.assertTrue(record.create_session(saved))
@@ -216,7 +225,7 @@ class ShutdownLaunchCliTests(ShutdownTestCase):
         for kind in ("waiting", "ready", "stopped", "already gone", "restarting", "restarted"):
             self.assertEqual(output.count(f"Alpha: {kind}"), 1, output)
         self.assertNotIn("unrelated", output)
-        self.assertTrue(output.rstrip().endswith("all 1 back on claude 3"), output)
+        self.assertTrue(output.rstrip().endswith("all 1 back on claude3"), output)
 
     def test_follow_waits_for_every_session_and_reports_total_back_on_target(self) -> None:
         first = session_shutdown(record.SessionRestarted(kind="restarted", at=OCTOBER), "first")
@@ -237,7 +246,7 @@ class ShutdownLaunchCliTests(ShutdownTestCase):
         self.assertEqual(polls.call_count, 1)
         self.assertEqual(output.count("first: restarted"), 1)
         self.assertEqual(output.count("second: restarted"), 1)
-        self.assertTrue(output.rstrip().endswith("all 2 back on claude 3"), output)
+        self.assertTrue(output.rstrip().endswith("all 2 back on claude3"), output)
 
     def test_follow_finds_completed_request_in_history_before_starting(self) -> None:
         for kind in ("stopped", "already gone", "restarted"):
@@ -304,7 +313,7 @@ class ShutdownLaunchCliTests(ShutdownTestCase):
             status, text = self.follow_request(output)
         self.assertEqual(status, 0)
         self.assertEqual(text.count("Removed: taken out"), 1)
-        self.assertTrue(text.rstrip().endswith("all 2 done: 1 back on claude 3, 1 taken out"), text)
+        self.assertTrue(text.rstrip().endswith("all 2 done: 1 back on claude3, 1 taken out"), text)
 
     def test_follow_finishes_when_every_session_was_taken_out_before_start(self) -> None:
         progress: list[record.SessionProgress] = [
@@ -568,9 +577,9 @@ class ShutdownLaunchCliTests(ShutdownTestCase):
             patch.object(shutdown, "resolve_sessions", return_value=shutdown.ResolvedSessions(("move-id",), report)),
         ):
             self.assertEqual(shutdown.main(["down", LABEL, "--here", "--only", "move-id",
-                "--restart", "--to", "claude 3"]), 0)
+                "--restart", "--to", "claude3"]), 0)
         down.assert_called_once_with(selected, True, ("move-id",), then="restart", alerts="user",
-            requested_by=None, request_id="", target="claude 3", why="", report=report)
+            requested_by=None, request_id="", target="claude3", why="", report=report)
 
     def test_down_to_passes_custom_move_reason_through_the_cli_to_settle(self) -> None:
         selected = Account("claude", LOGIN, LABEL)
@@ -582,9 +591,9 @@ class ShutdownLaunchCliTests(ShutdownTestCase):
             patch.object(shutdown, "resolve_sessions", return_value=shutdown.ResolvedSessions(("move-id",), report)),
         ):
             self.assertEqual(shutdown.main(["down", LABEL, "--here", "--only", "move-id",
-                "--restart", "--to", "claude 3", "--why", "weekly limit reached"]), 0)
+                "--restart", "--to", "claude3", "--why", "weekly limit reached"]), 0)
         down.assert_called_once_with(selected, True, ("move-id",), then="restart", alerts="user",
-            requested_by=None, request_id="", target="claude 3", why="weekly limit reached", report=report)
+            requested_by=None, request_id="", target="claude3", why="weekly limit reached", report=report)
 
     def test_down_restart_passes_the_selected_scope_and_intent(self) -> None:
         selected = Account("claude", LOGIN, LABEL)
@@ -1016,7 +1025,7 @@ class ShutdownLaunchCliTests(ShutdownTestCase):
         self.assertEqual(blocked.returncode, 0)
         self.assertEqual(
             blocked.stdout,
-            "test-job: skipped: claude 2 is held by a shutdown "
+            "test-job: skipped: claude2 is held by a shutdown "
             + "(since 2026-10-09 14:49 PDT)\n",
         )
         self.assertEqual(blocked.stderr, "")
@@ -1373,7 +1382,7 @@ class OnlySessionCliTests(ShutdownTestCase):
                 with patch.object(shutdown, "own_claude_account", side_effect=UnreadableAccount("own account unreadable")), patch.object(restart_work, "own_claude_account", side_effect=UnreadableAccount("own account unreadable")), patch.object(restart_work, "run_remote", return_value=(0, "[]")), patch.object(restart_work, "_up", return_value=restart_work.MachineRestartResult("natedev", LABEL, "done")) as resume, redirect_stdout(output), redirect_stderr(error):
                     self.assertEqual(shutdown.main(["restart", "--only", "beta-id", "--here", "--no-alert"]), 0)
                 self.assertEqual(error.getvalue(), "")
-                resume.assert_called_once_with(LOGIN, False, ("beta-id",))
+                resume.assert_called_once_with(LOGIN, False, ("beta-id",), notify=False)
 
     def test_selected_restart_silent_failure_ignores_sibling_policy_and_never_reads_peer_here(self) -> None:
         before = self.save_three({"kind": "stopped", "at": OCTOBER})
@@ -1525,10 +1534,13 @@ class OnlySessionCliTests(ShutdownTestCase):
         def quiet(current: record.SessionShutdown) -> None:
             current["alerts"] = "none"
         _ = record.update_session(LOGIN, "beta-id", quiet)
-        with patch.object(restart_work, "wait_for_remote_control", return_value=frozenset()), redirect_stdout(output := io.StringIO()):
+        with patch.object(restart_work, "wait_for_remote_control", return_value=frozenset()), patch.object(remote_control, "launch_fixer") as fixer, redirect_stdout(output := io.StringIO()):
             self.assertEqual(shutdown.main(["up", LOGIN, "--here", "--json", "--only", "beta-id"]), 0)
         result = restart_work.parse_peer_result(output.getvalue())
-        self.assertIn("Beta: running, no Remote Control", result["lines"])
+        self.assertIn("Beta: Remote Control not on yet; turning it on in the background", result["lines"])
+        fixer.assert_called_once()
+        self.assertEqual(fixer.call_args.args[0], "beta-id")
+        self.assertEqual(fixer.call_args.args[-1], "none")
         self.assertEqual(result["no_remote_control"], [{"session_id": "beta-id", "name": "Beta", "alerts": "none"}])
         self.assertIsNone(record.find_session(LOGIN, "beta-id"))
 
