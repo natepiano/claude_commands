@@ -222,7 +222,9 @@ class ProductionPool:
                         try:
                             json.dump(_encode(pool), output)
                             output.flush()
-                            os.fsync(output.fileno())
+                            # Disposable fixtures may omit disk durability; production syncs by default.
+                            if os.environ.get("PLAN_DELEGATE_SYNC_WRITES", "1") != "0":
+                                os.fsync(output.fileno())
                             os.replace(temporary, path)
                         finally:
                             temporary.unlink(missing_ok=True)
