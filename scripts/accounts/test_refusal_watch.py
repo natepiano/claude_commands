@@ -608,7 +608,7 @@ class RefusalWatchTests(unittest.TestCase):
         output, error = io.StringIO(), io.StringIO()
         from scripts.message import sessions as status_sessions
         with patch.object(status_sessions, "live_sessions", return_value=self.live), redirect_stdout(output), redirect_stderr(error):
-            code = accounts.main(["status"])
+            code = accounts.main(["--detail"])
         self.assertEqual((code, error.getvalue()), (0, ""))
         line = next(line for line in output.getvalue().splitlines() if "owner unit" in line)
         self.assertIn("moving", line)
