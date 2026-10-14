@@ -129,7 +129,7 @@ def checked(name: str, child_doc: Path) -> Promotion:
     child = read_production(child_doc)
     _committed(child.doc)
     # The unit's own tmux session may carry the child's name; the stop ends it before the restart.
-    directory = recorded_account_directory(marked)
+    directory = showrunner_account_directory()
     _ = add_showrunner.checked(child, parent.slug, ending=marked.label, start_in=worktree, config_dir=directory)
     return Promotion(unit, parent, child, marked, claude, worktree, cell_value(cells.get("Plan", "")))
 
@@ -172,8 +172,17 @@ def recorded_account_directory(marked: unit_lookup.MarkedUnit) -> Path:
     return directory
 
 
+def showrunner_account_directory() -> Path:
+    from scripts.accounts import accounts
+    try:
+        selected = accounts.account_for_group_launch("showrunner", resume=True)
+    except accounts.AccountsError as error:
+        raise Refusal(str(error)) from error
+    return accounts.main_config_dir() if isinstance(selected, accounts.DefaultAccount) else selected.dir
+
+
 def account_line() -> str:
-    return "same account, no move"
+    return "showrunners account"
 
 
 def retire(promotion: Promotion) -> None:
@@ -199,11 +208,11 @@ def retire(promotion: Promotion) -> None:
                  + f"promoted to showrunner of {promotion.child.slug}")
 
 
-def restore_line(promotion: Promotion, retained: Path) -> str:
+def restore_line(promotion: Promotion) -> str:
     """The command that resumes the stopped session as the unit it was."""
     return "~/.claude/scripts/lib/py ~/.claude/scripts/production/add_unit.py " + shlex.join([
         "--production", str(promotion.parent.doc), promotion.unit.removesuffix("-unit"), "--plan", promotion.plan,
-        "--resume", promotion.claude.session_id, "--cwd", str(promotion.worktree), "--config-dir", str(retained)])
+        "--resume", promotion.claude.session_id, "--cwd", str(promotion.worktree)])
 
 
 def main(argv: list[str]) -> int:
@@ -216,7 +225,7 @@ def main(argv: list[str]) -> int:
     args = parser.parse_args(argv)
     try:
         promotion = checked(cast(str, args.unit), cast(Path, args.production))
-        retained = recorded_account_directory(promotion.marked)
+        target_directory = showrunner_account_directory()
         moved = account_line()
     except Refusal as refusal:
         print(f"promote_showrunner: {refusal}", file=sys.stderr)
@@ -237,10 +246,10 @@ def main(argv: list[str]) -> int:
         return 1
     started = add_showrunner.main(["--production", str(promotion.child.doc), "--model", cast(str, args.model),
                                    "--effort", cast(str, args.effort), "--resume", promotion.claude.session_id,
-                                   "--cwd", str(promotion.worktree), "--config-dir", str(retained)])
+                                   "--cwd", str(promotion.worktree), "--config-dir", str(target_directory)])
     if started == 2:
         print(f"{unit} is stopped and did not start as a showrunner; its Units row is unchanged. "
-              + f"Bring it back as the unit it was with: {restore_line(promotion, retained)}")
+              + f"Bring it back as the unit it was with: {restore_line(promotion)}")
         return 1
     try:
         retire(promotion)

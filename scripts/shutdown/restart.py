@@ -470,6 +470,11 @@ def restart_note(
 
 
 def _resume_command(session: Session, prompt: str, target: str = "") -> str:
+    if session["kind"] == "showrunner":
+        from scripts.accounts import accounts
+
+        selected = accounts.account_for_group_launch("showrunner", resume=True, target=target)
+        target = "default" if isinstance(selected, accounts.DefaultAccount) else selected.label
     default_dir = str(Path.home() / ".claude")
     config_dir = session.get("config_dir", default_dir)
     prefix = (
@@ -623,8 +628,6 @@ def _unit_argv(
         argv.extend(("--model", model["name"]))
     if "target" in record:
         argv.extend(("--account", record["target"]))
-    else:
-        argv.extend(("--config-dir", session.get("config_dir", str(Path.home() / ".claude"))))
     return argv
 
 
@@ -1248,6 +1251,8 @@ def launch_entry(
     *,
     dry_run: bool,
 ) -> EntryLaunched | EntrySettled:
+    from scripts.accounts import accounts
+
     progress = _prior_progress(record)
     if progress["kind"] in COMPLETE_PROGRESS:
         return EntrySettled()
@@ -1311,6 +1316,12 @@ def launch_entry(
                 record,
                 f"restart prompt not recorded: {_error_reason(error)}",
             )
+        return EntrySettled()
+    except accounts.AccountsError as error:
+        if dry_run:
+            print(f"{session['name']} restart failed: {_error_reason(error)}")
+        else:
+            mark_restart_failed(record, _error_reason(error))
         return EntrySettled()
     except (OSError, subprocess.CalledProcessError, subprocess.SubprocessError) as error:
         if dry_run or not _launch_failure_left_session_live(record, error):

@@ -255,8 +255,8 @@ class AccountMoveTests(ShutdownTestCase):
             self.assertEqual(accounts.main(["swap", "unit", "claude 3"]), 1)
         self.assertEqual(output.getvalue(), "")
         self.assertEqual(error.getvalue(),
-            "the unit role is gone: new sessions pick the account with room "
-            + "(accounts.py pick claude); move one session with accounts.py move\n")
+            "unit launches use the configured units account; "
+            + "select and move the group with accounts.py move units <claude N>\n")
         process.assert_not_called()
         launch.assert_not_called()
         begin.assert_not_called()
@@ -301,10 +301,13 @@ class AccountMoveTests(ShutdownTestCase):
 
     def batch_cli(self, *, target: str = "claude 3", dry_run: bool = False) -> tuple[int, str, str]:
         output, error = io.StringIO(), io.StringIO()
-        arguments = ["move", "showrunners", "--from", "claude 1", "--to", target]
+        arguments = ["move", "showrunners", target]
         if dry_run:
             arguments.append("--dry-run")
-        with redirect_stdout(output), redirect_stderr(error):
+        report = inventory.inventory("current@example.invalid", frozenset())
+        with (patch.object(sessions, "live_sessions", return_value=self.batch_registry(report)),
+              patch.object(account, "account_of", return_value=account.Account("claude", report["login"], report["label"])),
+              redirect_stdout(output), redirect_stderr(error)):
             result = accounts.main(arguments)
         return result, output.getvalue(), error.getvalue()
 
@@ -324,7 +327,7 @@ class AccountMoveTests(ShutdownTestCase):
         process.assert_not_called()
         launch.assert_not_called()
 
-    def test_bulk_move_selects_only_source_accounts_showrunners_and_uses_one_local_down(self) -> None:
+    def test_group_move_selects_classified_showrunners_and_uses_one_local_down(self) -> None:
         report = self.showrunner_inventory()
         with (
             patch.object(inventory, "inventory", return_value=report) as read_inventory,
@@ -349,8 +352,9 @@ class AccountMoveTests(ShutdownTestCase):
             patch.object(sessions, "live_sessions", return_value=self.batch_registry(report)),
             patch.object(subprocess, "run", side_effect=self.start_batch) as process,
         ):
-            self.assertEqual(accounts.main(["move", "showrunners", "--from", "claude 1", "--to", "claude 3",
-                "--why", "weekly limit reached"]), 0)
+            with patch.object(account, "account_of", return_value=account.Account("claude", report["login"], report["label"])):
+                self.assertEqual(accounts.main(["move", "showrunners", "claude 3",
+                    "--why", "weekly limit reached"]), 0)
         arguments = cast(tuple[str, ...], process.call_args.args[0])
         self.assertEqual(arguments[arguments.index("--why") + 1], "weekly limit reached")
         process.assert_called_once()
@@ -370,33 +374,46 @@ class AccountMoveTests(ShutdownTestCase):
         self.assertEqual(outcome.returncode, 2)
         self.assertEqual(outcome.stderr, "shutdown: keys are cold\n")
 
-    def test_bulk_move_refuses_no_local_showrunners_on_source_without_change(self) -> None:
+    def test_group_move_without_live_members_sets_next_launch_account(self) -> None:
         report = self.showrunner_inventory()
         report["sessions"] = [unit("unit-id"), top_level("ordinary-id")]
-        before = self.disk_state()
         with patch.object(inventory, "inventory", return_value=report), patch.object(subprocess, "run") as process:
-            result, output, error = self.batch_cli()
-        self.assertNotEqual(result, 0)
-        self.assertEqual(output, "")
-        self.assertEqual(error, "no showrunner on claude 1 on this machine\n")
-        self.assertEqual(self.disk_state(), before)
+            result, _, error = self.batch_cli()
+        self.assertEqual((result, error), (0, ""))
+        self.assertEqual(accounts.group_accounts().get("showrunners"), "claude 3")
         process.assert_not_called()
 
-    def test_bulk_move_refuses_first_target_check_problem_for_every_showrunner_without_change(self) -> None:
-        with patch.object(accounts, "check", return_value=["accounts: target problem", "later problem"]):
+    def test_group_move_refuses_first_preparation_problem_without_change(self) -> None:
+        with patch.object(accounts, "prepared_account", return_value=accounts.AccountRefused("accounts: target problem")):
             self.batch_refuses_without_change("target problem")
 
-    def test_bulk_move_refuses_default_login_note_label_for_every_showrunner_without_change(self) -> None:
-        self.batch_refuses_without_change("claude 2 is the default account; use default", target="claude 2")
+    def assert_group_alias_moves_to_default(self, target: str) -> None:
+        report = self.showrunner_inventory()
+        with (patch.object(inventory, "inventory", return_value=report),
+              patch.object(subprocess, "run", side_effect=self.start_batch) as process):
+            result, _, error = self.batch_cli(target=target)
+        self.assertEqual((result, error), (0, ""))
+        self.assertEqual(accounts.group_accounts().get("showrunners"), "default")
+        process.assert_called_once()
+        arguments = cast(list[str], process.call_args.args[0])
+        self.assertEqual(arguments[arguments.index("--to") + 1], "default")
 
-    def test_bulk_move_refuses_default_login_named_dir_for_every_showrunner_without_change(self) -> None:
+    def test_group_move_default_login_note_alias_selects_default(self) -> None:
+        self.assert_group_alias_moves_to_default("claude 2")
+
+    def test_group_move_default_login_named_directory_selects_default(self) -> None:
         self.named_account("claude 4", "default@example.invalid")
-        self.batch_refuses_without_change("claude 4 is the default account; use default", target="claude 4")
+        self.assert_group_alias_moves_to_default("claude 4")
 
-    def test_bulk_move_refuses_its_source_login_as_target_without_change(self) -> None:
-        self.batch_refuses_without_change("already", target="claude 1")
+    def test_group_move_to_current_account_sets_group_without_shutdown(self) -> None:
+        with (patch.object(inventory, "inventory", return_value=self.showrunner_inventory()),
+              patch.object(subprocess, "run") as process):
+            result, _, error = self.batch_cli(target="claude 1")
+        self.assertEqual((result, error), (0, ""))
+        self.assertEqual(accounts.group_accounts().get("showrunners"), "claude 1")
+        process.assert_not_called()
 
-    def test_bulk_move_skips_open_shutdown_showrunner_and_moves_the_rest(self) -> None:
+    def test_group_move_preserves_open_shutdown_and_requests_remaining_member(self) -> None:
         report = self.showrunner_inventory()
         saved = entry(report["sessions"][0])
         saved["login"] = "current@example.invalid"
@@ -409,8 +426,9 @@ class AccountMoveTests(ShutdownTestCase):
             patch.object(subprocess, "run", side_effect=self.start_batch) as process,
         ):
             result, output, error = self.batch_cli()
-        self.assertEqual(result, 0)
-        self.assertIn("first showrunner already has a shutdown in progress", output + error)
+        self.assertEqual(result, 1)
+        self.assertIn("already has a shutdown in progress", output + error)
+        self.assertEqual(accounts.group_accounts().get("showrunners"), "claude 3")
         arguments = cast(tuple[str, ...], process.call_args.args[0])
         self.assertEqual(arguments[arguments.index("--only") + 1], "sr-two")
         self.assertEqual(record.find_session("current@example.invalid", "sr-one"), saved)
@@ -419,23 +437,17 @@ class AccountMoveTests(ShutdownTestCase):
         self.assertEqual(added["target"], "claude 3")
         self.assertNotEqual(self.disk_state(), before)
 
-    def test_bulk_move_dry_run_prints_selection_down_and_each_exact_resume_without_change(self) -> None:
+    def test_group_move_dry_run_prints_members_and_target_without_change(self) -> None:
         report = self.showrunner_inventory()
         before = self.disk_state()
         with patch.object(inventory, "inventory", return_value=report), patch.object(subprocess, "run") as process:
             result, output, error = self.batch_cli(dry_run=True)
         self.assertEqual((result, error), (0, ""))
-        self.assertIn("first showrunner", output)
-        self.assertIn("second showrunner", output)
-        lines = output.splitlines()
-        down = next(shlex.split(line) for line in lines if "shutdown.py" in line and "--only" in line)
-        self.assertEqual(down[down.index("--to") + 1], "claude 3")
-        self.assertEqual(set(down[down.index("--only") + 1].split(",")), {"sr-one", "sr-two"})
-        self.assertIn("--here", down)
-        resumes = [line for line in lines if "--resume" in line]
-        self.assertEqual(len(resumes), 2)
-        for owner in (report["sessions"][0], report["sessions"][2]):
-            self.assertIn(restart.resume_command(owner, "claude 3"), output)
+        self.assertIn("showrunners: would select claude 3", output)
+        self.assertIn("first showrunner: sr-one", output)
+        self.assertIn("second showrunner: sr-two", output)
+        self.assertNotIn("unit-id", output)
+        self.assertNotIn("ordinary-id", output)
         self.assertEqual(self.disk_state(), before)
         process.assert_not_called()
 
@@ -451,7 +463,7 @@ class AccountMoveTests(ShutdownTestCase):
         arguments = cast(tuple[str, ...], process.call_args.args[0])
         self.assertEqual(arguments[arguments.index("--to") + 1], "default")
 
-    def test_bulk_move_with_every_showrunner_already_shutting_down_starts_no_new_shutdown(self) -> None:
+    def test_group_move_with_all_members_shutting_down_commits_group_without_second_request(self) -> None:
         report = self.showrunner_inventory()
         for owner in (report["sessions"][0], report["sessions"][2]):
             saved = entry(owner)
@@ -460,8 +472,9 @@ class AccountMoveTests(ShutdownTestCase):
             self.assertTrue(record.create_session(saved))
         before = self.disk_state()
         with patch.object(inventory, "inventory", return_value=report), patch.object(subprocess, "run") as process:
-            _, output, error = self.batch_cli()
-        self.assertIn("first showrunner already has a shutdown in progress", output + error)
-        self.assertIn("second showrunner already has a shutdown in progress", output + error)
-        self.assertEqual(self.disk_state(), before)
+            result, output, error = self.batch_cli()
+        self.assertEqual(result, 1)
+        self.assertEqual((output + error).count("already has a shutdown in progress"), 2)
+        self.assertEqual(accounts.group_accounts().get("showrunners"), "claude 3")
+        self.assertNotEqual(self.disk_state(), before)
         process.assert_not_called()

@@ -31,7 +31,7 @@ import settle
 import showrunner_footer
 import shutdown
 import account as account_reader
-from scripts.accounts import moves
+from scripts.accounts import accounts, moves
 from scripts.production import showrunners
 from account import Account, UnknownAccountName, UnreadableAccount
 from record import SessionShutdown, SessionProgress, TimerRestore, Where
@@ -283,8 +283,21 @@ class RestartTests(ShutdownTestCase):
             "AGENT_NOTES_DIR": str(self.root / "notes"),
         })))
         del environment
+        (self.root / ".claude").mkdir()
+        (self.root / "notes").mkdir()
+        _ = (self.root / ".claude.json").write_text(json.dumps({"oauthAccount": {"emailAddress": LOGIN}}))
+        _ = (self.root / "notes/claude 2.md").write_text(f"---\nlogin: {LOGIN}\n---\n")
+        _ = (self.root / "notes/claude 3.md").write_text("---\nlogin: third@example.invalid\n---\n")
+        self.assertEqual(accounts.setup("claude 3"), [])
+        _ = (self.root / ".claude3/.claude.json").write_text(json.dumps({"oauthAccount": {"emailAddress": "third@example.invalid"}}))
+        self.configure_groups()
         _ = self.enterContext(patch.object(settle, "record_time", return_value=RESTARTED))
         _ = self.enterContext(patch.object(settle, "inventory", return_value=inventory.Inventory(machine="natedev", login=LOGIN, label=LABEL, sessions=[], unattributed=[])))
+
+    def configure_groups(self, *, units: str = "default", showrunners: str = "default") -> None:
+        path = accounts.groups_file()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        _ = path.write_text(json.dumps({"units": units, "showrunners": showrunners}))
 
     def create(self, records: list[SessionShutdown]) -> None:
         for item in records:
@@ -391,6 +404,8 @@ class RestartTests(ShutdownTestCase):
         return registry_confirmation(ids)
 
     def moved_restart(self, session: inventory.Session) -> tuple[list[list[str]], str]:
+        if session["kind"] == "showrunner":
+            self.configure_groups(showrunners="claude 3")
         saved = entry(session)
         saved["target"] = "claude 3"
         commands = CommandRecorder()
@@ -443,6 +458,7 @@ class RestartTests(ShutdownTestCase):
                 owner["config_dir"] = str(self.root / ".claude1")
                 saved = entry(owner)
                 saved["target"] = target
+                self.configure_groups(showrunners=target)
                 commands = CommandRecorder()
                 with (patch.object(restart, "_run", commands),
                       patch.object(restart, "_tmux_pane_state", return_value=restart.ReusableTmuxPane()),
@@ -458,12 +474,113 @@ class RestartTests(ShutdownTestCase):
                 self.assertEqual(len([argv for argv in commands.calls if argv[:2] == ["tmux", "respawn-pane"]]), 1)
 
     def test_move_target_relaunches_unit_with_explicit_account(self) -> None:
+        """F005: an account move preserves its explicit target override."""
         owner = unit("move-unit")
         commands, _ = self.moved_restart(owner)
         launch = next(argv for argv in commands if any(part.endswith("/add_unit.py") for part in argv))
         self.assertEqual(launch[launch.index("--account") + 1], "claude 3")
         self.assertEqual(launch[launch.index("--resume") + 1], "move-unit")
         self.assertEqual(launch[launch.index("--session-name") + 1], "move-unit")
+
+    def test_ordinary_unit_restart_defers_to_configured_units_instead_of_recorded_account(self) -> None:
+        """F005: an untargeted stopped unit carries no obsolete account override."""
+        self.configure_groups(units="claude 1")
+        owner = unit("stopped-unit")
+        owner["config_dir"] = str(self.root / ".claude2")
+        saved = entry(owner)
+        commands = CommandRecorder()
+        with (patch.object(restart, "_run", commands), patch.object(restart, "_retire"),
+              patch.object(restart, "_live_session_ids", return_value=frozenset()),
+              redirect_stdout(io.StringIO())):
+            _ = restart.relaunch_session(saved, dry_run=True, desktop_state=self.desktop_state)
+        argv = next(command for command in commands.calls if any(part.endswith("/add_unit.py") for part in command))
+        self.assertEqual(argv[argv.index("--resume") + 1], "stopped-unit")
+        self.assertNotIn("--config-dir", argv)
+        self.assertNotIn("--account", argv)
+
+    def test_stopped_showrunner_restart_uses_prepared_configured_showrunners_account(self) -> None:
+        """F005: showrunner restarts use their group's selection instead of the stop directory."""
+        self.configure_groups(showrunners="claude 3")
+        owner = showrunner("stopped-runner")
+        owner["config_dir"] = str(self.root / ".claude2")
+        saved = entry(owner)
+        commands = CommandRecorder()
+        with (patch.object(accounts, "prepared_account", wraps=accounts.prepared_account) as prepare,
+              patch.object(restart, "_run", commands), patch.object(restart, "_retire"),
+              patch.object(restart, "_live_session_ids", return_value=frozenset()),
+              redirect_stdout(io.StringIO())):
+            _ = restart.relaunch_session(saved, dry_run=True, desktop_state=self.desktop_state)
+        prepare.assert_any_call("claude 3", resume=True)
+        command = next(argv[-1] for argv in commands.calls if "-ic" in argv)
+        arguments = shlex.split(command.removesuffix("; exec zsh"))
+        self.assertEqual(arguments[arguments.index("exec") + 1], "claude 3")
+        self.assertEqual(arguments[arguments.index("--resume") + 1], owner["session_id"])
+        self.assertNotIn(str(self.root / ".claude2"), command)
+
+    def test_stopped_showrunner_without_configured_group_is_not_resumed_and_names_setup(self) -> None:
+        """F005: missing showrunners configuration refuses before any resume."""
+        _ = accounts.groups_file().write_text(json.dumps({"units": "default"}))
+        saved = entry(showrunner("unconfigured-runner"))
+        self.create([saved])
+        commands = CommandRecorder()
+        output = io.StringIO()
+        with (patch.object(restart, "_run", commands), patch.object(restart, "_retire"),
+              patch.object(restart, "_live_session_ids", return_value=frozenset()), redirect_stdout(output)):
+            _ = restart.relaunch_session(saved, dry_run=False, desktop_state=self.desktop_state)
+        current = record.find_session(LOGIN, "unconfigured-runner")
+        self.assertIsNotNone(current)
+        assert current is not None
+        self.assertEqual(current["progress"]["kind"], "restart failed")
+        progress = current["progress"]
+        assert progress["kind"] == "restart failed"
+        self.assertIn("accounts.py move showrunners", progress["reason"] + output.getvalue())
+        self.assertFalse(any("-ic" in command or "respawn-pane" in command for command in commands.calls))
+
+    def test_unconfigured_showrunner_refusal_does_not_abort_later_unit_restart(self) -> None:
+        """F005: a launch-account refusal settles one entry and the restart batch continues."""
+        _ = accounts.groups_file().write_text(json.dumps({"units": "default"}))
+        refused_id, unit_id = "unconfigured-runner", "later-unit"
+        self.create(records_for_test([
+            entry(showrunner(refused_id)), entry(unit(unit_id)),
+        ], requester=unit_id))
+        commands = CommandRecorder()
+        output = io.StringIO()
+        with (patch.object(restart, "_run", commands), patch.object(restart, "_retire"),
+              patch.object(restart, "_live_session_ids", return_value=frozenset()),
+              patch.object(restart, "wait_for_confirmation", side_effect=self.all_sessions_live) as confirm,
+              redirect_stdout(output)):
+            self.assertEqual(restart.up(LOGIN), 1)
+        refused = record.find_session(LOGIN, refused_id)
+        self.assertIsNotNone(refused)
+        assert refused is not None
+        progress = refused["progress"]
+        self.assertEqual(progress["kind"], "restart failed")
+        assert progress["kind"] == "restart failed"
+        self.assertIn("accounts.py move showrunners", progress["reason"])
+        self.assertIn("accounts.py move showrunners", output.getvalue())
+        self.assertIsNone(record.find_session(LOGIN, unit_id))
+        launch = next(command for command in commands.calls if any(part.endswith("/add_unit.py") for part in command))
+        self.assertEqual(launch[launch.index("--resume") + 1], unit_id)
+        self.assertFalse(any("-ic" in command or "respawn-pane" in command for command in commands.calls))
+        confirm.assert_called_once_with(frozenset({unit_id}), restart.SESSION_WAIT_SECONDS)
+
+    def test_unconfigured_showrunner_refusal_does_not_abort_later_unit_restart_preview(self) -> None:
+        """F005: a refused showrunner cannot abort subsequent restart previews."""
+        _ = accounts.groups_file().write_text(json.dumps({"units": "default"}))
+        self.create(records_for_test([
+            entry(showrunner("unconfigured-runner")), entry(unit("later-unit")),
+        ], requester="later-unit"))
+        before = {path: path.read_bytes() for path in self.state_root.rglob("*") if path.is_file()}
+        commands = CommandRecorder()
+        output = io.StringIO()
+        with (patch.object(restart, "_run", commands), patch.object(restart, "_retire"),
+              patch.object(restart, "_live_session_ids", return_value=frozenset()), redirect_stdout(output)):
+            _ = restart.up(LOGIN, dry_run=True)
+        self.assertIn("accounts.py move showrunners", output.getvalue())
+        launch = next(command for command in commands.calls if any(part.endswith("/add_unit.py") for part in command))
+        self.assertEqual(launch[launch.index("--resume") + 1], "later-unit")
+        self.assertFalse(any("-ic" in command or "respawn-pane" in command for command in commands.calls))
+        self.assertEqual({path: path.read_bytes() for path in self.state_root.rglob("*") if path.is_file()}, before)
 
     def test_moved_unit_passes_its_recorded_model_to_add_unit_resume(self) -> None:
         owner = unit("model-unit")
@@ -646,6 +763,7 @@ class RestartTests(ShutdownTestCase):
                 self.assertIn("moved from claude 2 to claude 3", arguments[-1])
 
     def test_moved_ghostty_showrunner_reopens_on_its_recorded_desktop_without_window_title_tracking(self) -> None:
+        self.configure_groups(showrunners="claude 3")
         owner = showrunner("hana-id", host=inventory.WindowHost(kind="ghostty", window_shell=123,
             desktop=inventory.NamedDesktop(kind="named", name="Production")))
         saved = entry(owner)
@@ -884,7 +1002,7 @@ class RestartTests(ShutdownTestCase):
         argv = next((shlex.split(line) for line in output.getvalue().splitlines() if 'add_unit.py' in line))
         self.assertEqual(argv[argv.index('--plan') + 1], 'docs/as-built/tables.md')
 
-    def test_dry_run_without_target_keeps_recorded_dir_for_every_host(self) -> None:
+    def test_dry_run_preserves_ad_hoc_directories_and_defers_group_accounts_to_configuration(self) -> None:
         config_dir = str(self.root / "account with 'quotes' and $()")
         restored_entries = [entry(showrunner('named-showrunner')), entry(top_level('named-tmux', host=tmux_host('named-tmux-host'))), entry(top_level('named-terminal', host=inventory.TerminalHost(kind='terminal'))), entry(top_level('named-window', host=inventory.WindowHost(kind='ghostty', window_shell=10, desktop=inventory.DesktopNotInSnapshot(kind='not in snapshot')))), entry(top_level('named-manual')), entry(unit('named-unit'))]
         for restored in restored_entries:
@@ -898,10 +1016,15 @@ class RestartTests(ShutdownTestCase):
         resume_commands = [argv[-1] for argv in commands.calls if '-ic' in argv]
         self.assertEqual(len(resume_commands), 3 if sys.platform == "linux" else 4)
         for command in resume_commands:
-            self.assertIn(f'&& {named_prefix(config_dir)}ENABLE_TOOL_SEARCH=true command claude', command)
+            if "--resume named-showrunner " in command:
+                self.assertIn("accounts.py exec default", command)
+                self.assertNotIn(config_dir, command)
+            else:
+                self.assertIn(f'&& {named_prefix(config_dir)}ENABLE_TOOL_SEARCH=true command claude', command)
         self.assertIn(f'{named_prefix(config_dir)}ENABLE_TOOL_SEARCH=true command claude', output.getvalue().split('manual restart named-manual:', 1)[1])
         unit_argv = next((argv for argv in commands.calls if any((part.endswith('add_unit.py') for part in argv))))
-        self.assertEqual(unit_argv[unit_argv.index("--config-dir") + 1], config_dir)
+        self.assertNotIn("--config-dir", unit_argv)
+        self.assertNotIn("--account", unit_argv)
         self.assertNotIn('CLAUDE_CONFIG_DIR', shlex.join(unit_argv))
         self.assertCountEqual(record.session_records(LOGIN), saved)
 

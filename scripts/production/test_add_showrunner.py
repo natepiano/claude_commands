@@ -120,8 +120,15 @@ class AddShowrunnerTests(unittest.TestCase):
         file.parent.mkdir(parents=True)
         _ = file.write_text(json.dumps({"main@example.invalid": {"weekly": {"left": 1,
             "at": now.isoformat(), "resets": (now + timedelta(days=2)).isoformat()}}}))
+        _ = self.configure_groups()
         self.timer("top", PARENT_SESSION)
         self.live(PARENT_SESSION)
+
+    def configure_groups(self, *, units: str = "default", showrunners: str = "default") -> Path:
+        path = Path(self.env["HOME"]) / ".local/state/accounts/groups.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        _ = path.write_text(json.dumps({"units": units, "showrunners": showrunners}))
+        return path
 
     def trust(self, *folders: Path, extra: dict[str, object] | None = None) -> None:
         """The showrunner account's config, trusting exactly `folders`, with `extra` fields beside them."""
@@ -205,7 +212,8 @@ class AddShowrunnerTests(unittest.TestCase):
 
     def refused(self, result: subprocess.CompletedProcess[str], cause: str) -> None:
         self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
-        self.assertIn(f"add_showrunner: {cause}", result.stderr)
+        self.assertIn("add_showrunner:", result.stderr)
+        self.assertIn(cause, result.stderr)
         self.assertEqual(self.events("systemd-run"), [])
 
     def test_new_showrunner_launches_on_picked_default_account_and_attaches_it(self) -> None:
@@ -256,23 +264,76 @@ class AddShowrunnerTests(unittest.TestCase):
             _ = (directory / ".claude.json").write_text(json.dumps({"oauthAccount": {"emailAddress": "target@example.invalid"},
                 "projects": {str(self.root): {"hasTrustDialogAccepted": True},
                              str(self.root / "kid-checkout"): {"hasTrustDialogAccepted": True}}}))
+        _ = self.configure_groups(showrunners="claude 3")
         return directory
 
-    def test_new_showrunner_picks_named_account_with_sooner_reset_and_one_percent_room(self) -> None:
+    def test_new_showrunner_reads_stored_showrunners_account_despite_better_unit_reading(self) -> None:
         directory = self.named_account()
         _ = self.env.pop("ADD_SHOWRUNNER_CLAUDE_JSON")
-        file = Path(self.env["HOME"]) / ".local/state/agent-notes/usage.json"
-        saved = cast(dict[str, usage_store.StoredUsage], json.loads(file.read_text()))
+        home = Path(self.env["HOME"])
+        path = home / ".local/state/accounts/groups.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        _ = path.write_text(json.dumps({"units": "claude 1", "showrunners": "claude 3"}))
+        with patch.dict(os.environ, self.env, clear=True):
+            self.assertEqual(accounts.setup("claude 1"), [])
+            caller = accounts.account_dir("claude 1")
+            _ = (caller / ".claude.json").write_text(json.dumps({"oauthAccount": {"emailAddress": "unit@example.invalid"}}))
+        self.env["CLAUDE_CONFIG_DIR"] = str(caller)
         now = datetime.now(timezone.utc)
-        saved["target@example.invalid"] = {"weekly": {"left": 1, "at": now.isoformat(),
-            "resets": (now + timedelta(days=1)).isoformat()}}
-        _ = file.write_text(json.dumps(saved))
+        saved = {"main@example.invalid": {"weekly": {"left": 99, "at": now.isoformat(),
+                  "resets": (now + timedelta(hours=1)).isoformat()}},
+                 "target@example.invalid": {"weekly": {"left": 0, "at": now.isoformat(),
+                  "resets": (now + timedelta(days=4)).isoformat()}}}
+        _ = (home / ".local/state/agent-notes/usage.json").write_text(json.dumps(saved))
         self.starts("kid-session", registers="kid")
+        before = path.read_bytes()
         result = self.run_command("kid")
         self.assertEqual(result.returncode, 0, result.stderr)
         command = cast(list[str], self.started()["args"])[-1]
         self.assertIn("CLAUDE_CONFIG_DIR=", command)
         self.assertIn(str(directory), command)
+        self.assertEqual(path.read_bytes(), before)
+
+    def test_unconfigured_showrunners_refuse_new_and_resume_without_group_write(self) -> None:
+        """F004: live parent identity and readings cannot supply missing configuration."""
+        path = self.configure_groups()
+        path.unlink()
+        for options in ((), ("--resume", "abc-123", "--cwd", str(self.root))):
+            with self.subTest(options=options):
+                result = self.run_command("kid", *options)
+                self.refused(result, "accounts.py move showrunners <claude N>")
+                self.assertFalse(path.exists())
+                self.assertEqual(self.events("systemd-run"), [])
+
+    def test_showrunner_launch_accepts_one_account_shared_with_units(self) -> None:
+        """F004: both launch groups may use the same configured account."""
+        directory = self.named_account()
+        _ = self.configure_groups(units="claude 3", showrunners="claude 3")
+        self.starts("kid-session", registers="kid")
+        result = self.run_command("kid")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(str(directory), cast(list[str], self.started()["args"])[-1])
+
+    def test_new_showrunner_refuses_configured_account_with_wrong_login(self) -> None:
+        """F006: a trusted directory cannot bypass the configured account's readiness."""
+        directory = self.named_account()
+        _ = (directory / ".claude.json").write_text(json.dumps({
+            "oauthAccount": {"emailAddress": "other@example.invalid"},
+            "projects": {str(self.root / "kid-checkout"): {"hasTrustDialogAccepted": True}}}))
+        path = Path(self.env["HOME"]) / ".local/state/accounts/groups.json"
+        before = path.read_bytes()
+        result = self.run_command("kid")
+        self.refused(result, "logged in as other@example.invalid, not claude 3")
+        self.assertEqual(path.read_bytes(), before)
+
+    def test_new_showrunner_refuses_configured_account_with_wrong_shared_link(self) -> None:
+        """F006: new work prepares the configured directory before launching."""
+        directory = self.named_account()
+        linked = directory / "projects"
+        linked.unlink()
+        linked.symlink_to(Path(self.env["HOME"]) / "missing-projects")
+        result = self.run_command("kid")
+        self.refused(result, f"{linked} points to {Path(self.env['HOME']) / 'missing-projects'}, not {Path(self.env['HOME']) / '.claude/projects'}")
 
     def test_picked_named_account_refuses_untrusted_folder_despite_default_trust(self) -> None:
         directory = self.named_account()
@@ -293,14 +354,14 @@ class AddShowrunnerTests(unittest.TestCase):
         self.refused(result, f"kid: Claude is not trusted in {self.root / 'kid-checkout'} on claude 3. Run:")
         self.assertIn(f"CLAUDE_CONFIG_DIR={shlex.quote(str(directory))}", result.stderr)
 
-    def test_retained_account_unreadable_trust_refuses_before_spawning(self) -> None:
+    def test_showrunner_resume_refuses_unconfigured_directory_before_reading_its_trust(self) -> None:
+        """F004: a retained directory cannot override group configuration."""
         directory = Path(self.env["HOME"]) / "retained account"
         directory.mkdir()
         _ = (directory / ".claude.json").write_text("SECRET malformed account contents")
-        _ = self.env.pop("ADD_SHOWRUNNER_CLAUDE_JSON")
         result = self.run_command("kid", "--resume", "abc-123", "--cwd", str(self.root),
                                   "--config-dir", str(directory))
-        self.refused(result, f"kid: cannot read {directory / '.claude.json'} to check Claude trust (JSONDecodeError)")
+        self.refused(result, "default")
         self.assertNotIn("SECRET", result.stderr)
 
     def test_resume_refuses_an_unrelated_tmux_name_collision_without_killing_it(self) -> None:
@@ -314,32 +375,26 @@ class AddShowrunnerTests(unittest.TestCase):
                              for event in self.events("tmux")))
         self.assertTrue((self.state / "live-kid").exists())
 
-    def test_showrunner_resume_accepts_retained_directory_outside_account_farm(self) -> None:
+    def test_showrunner_resume_refuses_directory_outside_configured_account(self) -> None:
+        """F004: a valid retained directory is still not the configured account."""
         directory = Path(self.env["HOME"]) / "retained account"
         directory.mkdir()
         _ = (directory / ".claude.json").write_text(json.dumps({
             "projects": {str(self.root): {"hasTrustDialogAccepted": True}}}))
-        _ = self.env.pop("ADD_SHOWRUNNER_CLAUDE_JSON")
-        self.starts("abc-123", registers="kid")
+        _ = self.named_account()
         result = self.run_command("kid", "--resume", "abc-123", "--cwd", str(self.root),
                                   "--config-dir", str(directory))
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn(shlex.quote(str(directory)), cast(list[str], self.started()["args"])[-1])
-        options = [cast(list[str], event["args"]) for event in self.events("tmux")]
-        self.assertIn(["set-option", "-t", "=kid", "@claude_config_dir", str(directory)], options)
+        self.refused(result, "claude 3")
+        self.assertEqual(self.events("systemd-run"), [])
 
-    def test_showrunner_resume_resolves_relative_config_directory_against_invoking_directory(self) -> None:
+    def test_showrunner_resume_accepts_relative_directory_of_configured_account(self) -> None:
+        """F004: explicit matching directories are accepted after path resolution."""
         home = Path(self.env["HOME"])
-        directory = home / "retained account"
-        directory.mkdir()
-        _ = (directory / ".claude.json").write_text(json.dumps({
-            "projects": {str(self.root): {"hasTrustDialogAccepted": True}}}))
-        _ = self.env.pop("ADD_SHOWRUNNER_CLAUDE_JSON")
+        directory = self.named_account()
         self.starts("abc-123", registers="kid")
         result = self.run_command("kid", "--resume", "abc-123", "--cwd", str(self.root),
-                                  "--config-dir", "retained account", cwd=home)
+                                  "--config-dir", ".claude3", cwd=home)
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn(shlex.quote(str(directory)), cast(list[str], self.started()["args"])[-1])
         options = [cast(list[str], event["args"]) for event in self.events("tmux")]
         self.assertIn(["set-option", "-t", "=kid", "@claude_config_dir", str(directory)], options)
 
@@ -355,27 +410,32 @@ class AddShowrunnerTests(unittest.TestCase):
                 self.assertIn("--config-dir", result.stderr)
                 self.assertEqual(self.events("systemd-run"), [])
 
-    def test_showrunner_resume_keeps_recorded_named_account_even_when_picker_prefers_default(self) -> None:
+    def test_showrunner_resume_uses_configured_account_instead_of_recorded_default(self) -> None:
+        """F004: resume selection ignores the previous tmux account."""
         directory = self.named_account()
-        _ = (self.state / "kid@claude_config_dir").write_text(str(directory))
+        _ = (self.state / "kid@claude_config_dir").write_text(str(Path(self.env["HOME"]) / ".claude"))
         self.starts("abc-123", registers="kid")
         result = self.run_command("kid", "--resume", "abc-123", "--cwd", str(self.root))
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn(str(directory), cast(list[str], self.started()["args"])[-1])
 
-    def test_showrunner_resume_explicit_default_overrides_recorded_named_account(self) -> None:
-        directory = self.named_account()
-        _ = (self.state / "kid@claude_config_dir").write_text(str(directory))
-        self.starts("abc-123", registers="kid")
-        result = self.run_command("kid", "--resume", "abc-123", "--cwd", str(self.root), "--account", "default")
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertNotIn(str(directory), cast(list[str], self.started()["args"])[-1])
+    def test_showrunner_refuses_explicit_account_different_from_configured_group(self) -> None:
+        """F004: an explicit account must agree with the showrunners account."""
+        _ = self.named_account()
+        for options in (("--account", "default"),
+                        ("--resume", "abc-123", "--cwd", str(self.root), "--account", "default")):
+            with self.subTest(options=options):
+                result = self.run_command("kid", *options)
+                self.refused(result, "claude 3")
+                self.assertEqual(self.events("systemd-run"), [])
 
-    def test_showrunner_resume_without_recorded_account_refuses_without_picking(self) -> None:
-        result = self.run_command("kid", "--resume", "abc-123", "--cwd", str(self.root))
-        self.refused(result, "no account recorded")
-        self.assertIn("--account", result.stderr)
-        self.assertEqual(len(result.stderr.splitlines()), 1)
+    def test_showrunner_resume_without_recorded_account_uses_configured_group(self) -> None:
+        """F004: configuration is sufficient for a resume with no retained account."""
+        directory = self.named_account()
+        self.starts("abc-123", registers="kid")
+        result = self.run_command("kid", "--resume", "abc-123", "--cwd", str(self.root), "--account", "claude 3")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(str(directory), cast(list[str], self.started()["args"])[-1])
 
     def test_showrunner_launch_records_config_directory_and_model_on_its_tmux_session(self) -> None:
         self.starts("kid-session", registers="kid")
@@ -386,15 +446,17 @@ class AddShowrunnerTests(unittest.TestCase):
         self.assertIn(["set-option", "-t", "=kid", "@claude_config_dir", str(Path(self.env["HOME"]) / ".claude")], options)
         self.assertIn(["set-option", "-t", "=kid", "@claude_model", "opus"], options)
 
-    def test_new_showrunner_refuses_when_no_account_has_room(self) -> None:
+    def test_new_showrunner_zero_reading_without_refusal_can_launch(self) -> None:
         file = Path(self.env["HOME"]) / ".local/state/agent-notes/usage.json"
         saved = cast(dict[str, usage_store.StoredUsage], json.loads(file.read_text()))
         held = saved["main@example.invalid"]
         assert "weekly" in held
         held["weekly"]["left"] = 0
         _ = file.write_text(json.dumps(saved))
+        self.starts("kid-session", registers="kid")
         result = self.run_command("kid")
-        self.refused(result, "no claude account has room")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("CLAUDE_CONFIG_DIR=", cast(list[str], self.started()["args"])[-1])
 
     def test_a_timer_left_by_an_ended_session_does_not_stand_in_the_way(self) -> None:
         # The child ran before under this parent; its session ended, and its timer and its edge are still stored.

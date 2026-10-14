@@ -298,14 +298,36 @@ class QuotaAlertTests(unittest.TestCase):
             text = self.message(note, [note], quota_alert.load_config())
         move.assert_not_called()
         move_showrunners.assert_not_called()
-        self.assertIn("claude 3 is low; sessions on it move to claude 1 when refused", text)
+        self.assertIn("units: move to claude 1", text)
+        self.assertIn("showrunners: move to default", text)
+        self.assertIn("ungrouped sessions: move to claude 1", text)
         self.assertNotIn("swap unit", text)
+
+    def test_low_account_advice_distinguishes_group_rankings_and_ungrouped_picker(self) -> None:
+        self.configure_claude_roles()
+        self.stored_room("unit@example.invalid", 1, 7)
+        self.stored_room("spare@example.invalid", 0, 2)
+        self.stored_room("showrunner@example.invalid", 80, 5)
+        note = self.note("claude 3.md", "active", "1", login="unit@example.invalid")
+        self.assertFalse(accounts.groups_file().exists())
+        with mock.patch.object(accounts, "move_sessions") as move:
+            text = quota_alert.unit_swap_line(note, [note], accounts.claude_account_selection())
+        self.assertIn("units: move to claude 1", text)
+        self.assertIn("showrunners: move to default", text)
+        self.assertIn("ungrouped sessions: move to claude 1", text)
+        self.assertNotIn("move to claude 3", text)
+        self.assertFalse(accounts.groups_file().exists())
+        move.assert_not_called()
 
     def test_low_account_advice_names_no_room_and_earliest_reset(self) -> None:
         self.configure_claude_roles()
         self.stored_room("unit@example.invalid", 1, 7)
         self.stored_room("spare@example.invalid", 0, 2)
         self.stored_room("showrunner@example.invalid", 0, 5)
+        now = datetime.now(timezone.utc)
+        for login, days in (("spare@example.invalid", 2), ("showrunner@example.invalid", 5)):
+            refusals.write_refusal(refusals.AccountRefusal("claude", login,
+                refusals.KnownWindow("weekly"), refusals.KnownReset(now + timedelta(days=days)), now))
         note = self.note("claude 3.md", "active", "1", login="unit@example.invalid")
         text = self.message(note, [note], quota_alert.load_config())
         self.assertIn("no other account has room until", text)

@@ -7,7 +7,6 @@ import io
 import json
 import os
 import subprocess
-import shlex
 import tempfile
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
@@ -108,6 +107,16 @@ class PromoteShowrunnerTests(unittest.TestCase):
                 (add_showrunner, "main", self.start), (accounts, "role_account", self.role_account),
                 (unit_effort, "verdict", self.verdict)):
             _ = self.enterContext(mock.patch.object(module, name, stand_in))
+
+    def ready_showrunner_account(self) -> accounts.NamedAccount:
+        notes = self.root / "notes"
+        notes.mkdir(exist_ok=True)
+        _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {"AGENT_NOTES_DIR": str(notes)})))
+        _ = (notes / "claude 3.md").write_text("---\nlogin: showrunner@example.invalid\n---\n")
+        self.assertEqual(accounts.setup("claude 3"), [])
+        directory = accounts.account_dir("claude 3")
+        _ = (directory / ".claude.json").write_text(json.dumps({"oauthAccount": {"emailAddress": "showrunner@example.invalid"}}))
+        return accounts.NamedAccount("claude 3", directory)
 
     def production_of(self, _session: str) -> Path | None:
         return self.parent_doc if self.runs_production else None
@@ -243,52 +252,95 @@ class PromoteShowrunnerTests(unittest.TestCase):
         self.assertEqual(subject, "production(parent): retire demo-unit, promoted to showrunner of child")
         self.assertIn("demo-unit is now the showrunner of child", out)
 
-    def test_promotion_reads_the_units_account_before_destroying_tmux_and_passes_it_to_resume(self) -> None:
-        notes = self.root / "notes"
-        notes.mkdir()
-        _ = (notes / "claude 3.md").write_text("---\nlogin: unit@example.invalid\n---\n")
-        _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {"AGENT_NOTES_DIR": str(notes)})))
-        self.assertEqual(accounts.setup("claude 3"), [])
-        directory = accounts.account_dir("claude 3")
-        _ = (directory / ".claude.json").write_text(json.dumps({"oauthAccount": {"emailAddress": "unit@example.invalid"}}))
-        self.unit_account = accounts.NamedAccount("claude 3", directory)
-        code, _, err = self.run_main()
-        self.assertEqual(code, 0, err)
-        read_at = next(index for index, event in enumerate(self.events)
-                       if "show-options" in event and "@claude_config_dir" in event)
+    def test_promotion_refuses_unconfigured_showrunners_before_stopping_unit(self) -> None:
+        """F004: promotion does not inherit the unit's previous account."""
+        with mock.patch.object(accounts, "role_account", side_effect=accounts.AccountsError(
+                "showrunners: not configured — accounts.py move showrunners <claude N>")):
+            code, _, error = self.run_main()
+        self.assertEqual(code, 2)
+        self.assertIn("accounts.py move showrunners <claude N>", error)
+        self.assert_nothing_stopped()
+        self.assertFalse(accounts.groups_file().exists())
+
+    def test_promotion_uses_showrunners_group_instead_of_retained_unit_account(self) -> None:
+        selected = self.ready_showrunner_account()
+        directory = selected.dir
+        def checked(_child: Production, _caller: str, ending: str = "", start_in: Path | None = None,
+                    *, config_dir: Path | None = None) -> str:
+            self.assertEqual(config_dir, directory)
+            self.assertEqual((ending, start_in), ("demo", self.worktree))
+            self.events.append("check showrunner account")
+            return "tmux"
+        def resolved(role: str) -> accounts.ClaudeLaunchAccount:
+            return selected if role == "showrunner" else accounts.DefaultAccount()
+        with (mock.patch.object(accounts, "role_account", side_effect=resolved) as resolve,
+              mock.patch.object(add_showrunner, "checked", side_effect=checked)):
+            code, _, error = self.run_main()
+        self.assertEqual((code, error), (0, ""))
+        self.assertTrue(resolve.call_args_list)
+        self.assertIn(mock.call("showrunner"), resolve.call_args_list)
+        self.assertNotIn(mock.call("unit"), resolve.call_args_list)
+        start = next(event for event in self.events if event.startswith("start"))
+        self.assertIn(str(directory), start)
+        self.assertNotIn("--config-dir " + str(self.root / ".claude") + " ", start)
+        self.assertLess(self.events.index("check showrunner account"),
+            next(index for index, event in enumerate(self.events) if "kill-session" in event))
+
+    def test_promotion_resolves_showrunners_account_before_stopping_and_passes_it_to_resume(self) -> None:
+        """F004: promotion uses group configuration before the stop begins."""
+        selected = self.ready_showrunner_account()
+        def resolved(role: str) -> accounts.ClaudeLaunchAccount:
+            self.events.append("resolve " + role)
+            return selected if role == "showrunner" else accounts.DefaultAccount()
+        def checked(_child: Production, _caller: str, ending: str = "", start_in: Path | None = None,
+                    *, config_dir: Path | None = None) -> str:
+            self.assertEqual(config_dir, selected.dir)
+            self.assertEqual((ending, start_in), ("demo", self.worktree))
+            return "tmux"
+        with (mock.patch.object(accounts, "role_account", side_effect=resolved),
+              mock.patch.object(add_showrunner, "checked", side_effect=checked)):
+            code, _, error = self.run_main()
+        self.assertEqual((code, error), (0, ""))
         kill_at = next(index for index, event in enumerate(self.events) if "kill-session" in event)
         start_at = next(index for index, event in enumerate(self.events) if event.startswith("start"))
-        self.assertLess(read_at, kill_at)
+        self.assertLess(self.events.index("resolve showrunner"), kill_at)
         self.assertLess(kill_at, start_at)
-        self.assertIn("--config-dir", self.events[start_at])
-        self.assertIn(str(directory), self.events[start_at])
-        self.assertNotIn("env unit", self.events[start_at])
+        self.assertIn("--config-dir " + str(selected.dir), self.events[start_at])
 
-    def test_promotion_retains_external_account_directory_and_restore_uses_same_directory(self) -> None:
-        directory = self.root / "external account"
-        directory.mkdir()
-        self.unit_account = accounts.NamedAccount("external", directory)
+    def test_failed_promotion_recovery_defers_account_to_units_configuration(self) -> None:
+        """F004: returning to unit work also obeys units configuration."""
+        selected = self.ready_showrunner_account()
         self.started = 2
-        code, out, err = self.run_main()
-        self.assertEqual((code, err), (1, ""))
+        def checked(_child: Production, _caller: str, ending: str = "", start_in: Path | None = None,
+                    *, config_dir: Path | None = None) -> str:
+            self.assertEqual(config_dir, selected.dir)
+            self.assertEqual((ending, start_in), ("demo", self.worktree))
+            return "tmux"
+        def resolved(role: str) -> accounts.ClaudeLaunchAccount:
+            return selected if role == "showrunner" else accounts.DefaultAccount()
+        with (mock.patch.object(accounts, "role_account", side_effect=resolved),
+              mock.patch.object(add_showrunner, "checked", side_effect=checked)):
+            code, output, error = self.run_main()
+        self.assertEqual((code, error), (1, ""))
         start = next(event for event in self.events if event.startswith("start"))
-        self.assertIn("--config-dir " + str(directory), start)
-        self.assertNotIn("--account", start)
-        self.assertIn("--config-dir " + shlex.quote(str(directory)), out)
+        self.assertIn("--config-dir " + str(selected.dir), start)
+        self.assertIn("add_unit.py", output)
+        self.assertIn("--resume " + SESSION, output)
+        self.assertNotIn("--config-dir", output)
+        self.assertNotIn("--account", output)
         self.assertFalse(plan_cell_is_retired(self.demo_row()["Plan"]))
 
-    def test_promotion_refuses_missing_retained_account_before_stopping_the_unit(self) -> None:
+    def test_promotion_needs_no_retained_account_when_groups_are_configured(self) -> None:
+        """F004: the old tmux account is not a launch selection source."""
         original = self.tmux
         def missing(*arguments: str) -> subprocess.CompletedProcess[str]:
             if arguments[0] == "show-options":
                 return subprocess.CompletedProcess(list(arguments), 1, "", "")
             return original(*arguments)
         with mock.patch.object(promote_showrunner, "_tmux", side_effect=missing):
-            code, _, err = self.run_main()
-        self.assertEqual(code, 2)
-        self.assertIn("--account", err)
-        self.assertEqual(len(err.splitlines()), 1)
-        self.assert_nothing_stopped()
+            code, _, error = self.run_main()
+        self.assertEqual((code, error), (0, ""))
+        self.assertTrue(any(event.startswith("start") for event in self.events))
 
     def test_a_unit_still_running_after_exit_is_not_restarted(self) -> None:
         self.alive = [True]

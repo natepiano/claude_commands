@@ -838,61 +838,14 @@ def record(request: UnitLaunch) -> None:
         _ = log.write(f"- {stamp}: {log_line}\n")
 
 
-def account_for_launch(request: RequestedUnitLaunch, target: str = "", config_dir: str = "") -> UnitLaunchAccount:
-    """A role chooses new work; a resume uses its explicit or last recorded account."""
+def account_for_launch(request: RequestedUnitLaunch, target: str = "", config_dir: str = "") -> ClaudeLaunchAccount:
+    """New, standby and resumed work all use the configured units account."""
     from scripts.accounts import accounts
-    from scripts.whoami import agent_accounts
-
-    if isinstance(request.session, NewSession):
-        if target or config_dir:
-            raise Refusal("--account and --config-dir require --resume")
-        try:
-            return accounts.role_account("unit")
-        except accounts.AccountsError as error:
-            raise Refusal(str(error)) from error
-    if target:
-        if config_dir:
-            raise Refusal("give only one of --account and --config-dir")
-        if target == "default":
-            problems = accounts.check(target)
-            if problems:
-                raise Refusal(problems[0])
-            return accounts.DefaultAccount()
-        directory = accounts.account_dir(target)
-        default = accounts.account_identity(accounts.main_config_dir())
-        identity = accounts.account_identity(directory)
-        if isinstance(default, agent_accounts.KnownClaudeAccount) and (
-            target.casefold() == default.label.casefold() or
-            isinstance(identity, agent_accounts.KnownClaudeAccount) and
-            identity.login.casefold() == default.login.casefold()
-        ):
-            raise Refusal(f"{target} is the default account; use default")
-        return accounts.NamedAccount(target, directory)
-    if not config_dir:
-        import record as shutdown_record
-        try:
-            saved = [item for item in shutdown_record.all_session_records()
-                     if item["session"]["session_id"] == request.session.session_id]
-        except (shutdown_record.InvalidRecord, OSError) as error:
-            raise Refusal(f"shutdown state unreadable: {error}") from error
-        if len(saved) == 1:
-            config_dir = saved[0]["session"].get("config_dir", str(accounts.main_config_dir()))
-        else:
-            found = launched_unit(request)
-            if isinstance(found, MarkedUnitFound):
-                result = subprocess.run([unit_lookup.tmux_binary(), "show-options", "-v", "-t",
-                                         f"={found.unit.label}", "@claude_config_dir"],
-                                        capture_output=True, text=True, check=False)
-                if result.returncode == 0:
-                    config_dir = result.stdout.strip()
-            if not config_dir:
-                raise Refusal("no account recorded for this unit; resume with --account <claude N|default>")
-    directory = Path(config_dir).expanduser()
-    if not directory.is_dir():
-        raise Refusal(f"recorded resume account directory {directory} is missing")
-    if directory == accounts.main_config_dir():
-        return accounts.DefaultAccount()
-    return RetainedUnitAccount(directory)
+    try:
+        return accounts.account_for_group_launch("unit", resume=isinstance(request.session, ResumedSession),
+                                                 target=target, config_dir=config_dir)
+    except accounts.AccountsError as error:
+        raise Refusal(str(error)) from error
 
 
 def model_for_resume(request: RequestedUnitLaunch, explicit: str = "") -> str:
@@ -1038,7 +991,9 @@ def main(argv: list[str]) -> int:
                     record_scheduled_restore_prompt(
                         request.launch_kind.session_id, prompt
                     )
-                launch_session(request, tmux, ready.director, prompt, unit_account, target=cast(str, args.account), model=resume_model)
+                launch_session(request, tmux, ready.director, prompt, unit_account,
+                               target=("default" if isinstance(unit_account, accounts.DefaultAccount) else unit_account.label)
+                               if isinstance(request.session, ResumedSession) else "", model=resume_model)
         finally:
             _ = barrier.__exit__(None, None, None)
         if isinstance(request.launch_kind, UnitRestoreLaunch):
