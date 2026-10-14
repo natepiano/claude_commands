@@ -424,7 +424,7 @@ def pending_line_bytes(text: str) -> int:
 
     A `prompt_snapshot` line is a transcript-only copy of the system prompt and
     tool list, already billed, so it contributes nothing. Counting it put a
-    seat at 135,812 tokens while its next request billed 86,392 (2026-10-06).
+    worker at 135,812 tokens while its next request billed 86,392 (2026-10-06).
     """
     if PROMPT_SNAPSHOT_MARKER in text:
         return 0

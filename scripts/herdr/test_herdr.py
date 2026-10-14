@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import json
 import os
-import shlex
 import subprocess
 import shutil
 import sys
@@ -19,8 +18,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 import herdr
 import trust_survey
 from fake_herdr import CommandResponse
-from scripts.accounts.accounts import DefaultAccount, NamedAccount
-from scripts.whoami.account import NAMED_ACCOUNT_VARIABLES
 
 GIT_BINARY = shutil.which("git") or "git"
 
@@ -419,39 +416,6 @@ class HerdrTests(unittest.TestCase):
             checked_folder = herdr.repository_trust_key(showrunner)
             self.assertEqual(checked_folder, main)
             self.assertEqual(herdr.claude_trust(checked_folder, config), herdr.Untrusted(main, config, (main,)))
-
-    def test_trust_command_default_and_named_accounts_quote_paths(self) -> None:
-        folder = self.root / "folder ' with $spaces"
-        clear_variables = " ".join(f"-u {name}" for name in NAMED_ACCOUNT_VARIABLES)
-        self.assertEqual(herdr.trust_command(folder, DefaultAccount()),
-                         f"cd {shlex.quote(str(folder))} && env {clear_variables} claude")
-        config_dir = self.root / "account ' directory"
-        expected = (f"cd {shlex.quote(str(folder))} && CLAUDE_CONFIG_DIR={shlex.quote(str(config_dir))} "
-                    + f"CLAUDE_CODE_REMOTE_MEMORY_DIR={shlex.quote(str(self.root / '.claude'))} claude")
-        with patch.object(Path, "home", return_value=self.root):
-            self.assertEqual(herdr.trust_command(folder, NamedAccount("fixture", config_dir)), expected)
-
-    def test_default_trust_command_clears_named_account_variables_only_in_child(self) -> None:
-        folder = self.root / "folder ' with $spaces"
-        folder.mkdir()
-        fake_claude = self.root / "claude"
-        _ = fake_claude.write_text(
-            f"#!{sys.executable}\nimport json, os\n"
-            + f"print(json.dumps({{name: os.environ.get(name) for name in {NAMED_ACCOUNT_VARIABLES!r}}}))\n")
-        fake_claude.chmod(0o755)
-        inherited = {name: "named account value" for name in NAMED_ACCOUNT_VARIABLES}
-        with patch.dict(os.environ, {**inherited, "PATH": f"{self.root}{os.pathsep}{os.defpath}"}):
-            result = subprocess.run(["/bin/sh", "-c", herdr.trust_command(folder, DefaultAccount())],
-                                    capture_output=True, text=True, check=True)
-            self.assertEqual(cast(object, json.loads(result.stdout)), {name: None for name in NAMED_ACCOUNT_VARIABLES})
-            self.assertEqual({name: os.environ[name] for name in NAMED_ACCOUNT_VARIABLES}, inherited)
-
-    def test_trust_command_preserves_the_library_import_path(self) -> None:
-        repository = str(Path(__file__).resolve().parents[2])
-        original_path = [entry for entry in sys.path if entry != repository]
-        with patch.object(sys, "path", original_path.copy()):
-            _ = herdr.trust_command(self.root, DefaultAccount())
-            self.assertEqual(sys.path, original_path)
 
     def test_survey_counts_nested_repositories_and_submodules_but_skips_generated_trees(self) -> None:
         checkout = self.root / "checkout"

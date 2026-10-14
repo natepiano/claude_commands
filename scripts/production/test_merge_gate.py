@@ -285,11 +285,20 @@ class MergeGateTests(unittest.TestCase):
         self.assertEqual((self.checkout / "subject.txt").read_text(), "uncommitted\n")
         self.assertEqual(self.git(self.checkout, "rev-parse", "HEAD"), self.base)
 
-    def test_untracked_merge_checkout_is_refused(self) -> None:
-        _ = self.git(self.checkout, "config", "status.showUntrackedFiles", "no")
-        self.write(self.checkout / "untracked.txt", "keep\n")
-        self.assert_refused_before_gate(self.run_gate())
-        self.assertTrue((self.checkout / "untracked.txt").exists())
+    def test_untracked_showrunner_log_does_not_block_the_gate(self) -> None:
+        self.write(self.checkout / "docs" / "plans" / "build-followups-log.md", "log\n")
+        result = self.run_gate()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual((self.checkout / "docs" / "plans" / "build-followups-log.md").read_text(), "log\n")
+
+    def test_missing_type_dir_is_refused_before_any_suite_runs(self) -> None:
+        result = self.run_gate("--type-dirs", "accounts")
+        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("type dirs not found", result.stderr)
+        self.assertIn("accounts", result.stderr)
+        self.assertEqual(self.module_events(), [])
+        self.assert_not_pushed()
+        self.assertEqual(self.git(self.checkout, "rev-parse", "HEAD"), self.base)
 
     def test_merge_checkout_ahead_of_origin_is_refused(self) -> None:
         self.write(self.checkout / "local.txt", "local\n")

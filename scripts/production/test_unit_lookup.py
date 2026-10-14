@@ -93,6 +93,21 @@ class UnitLookupTests(unittest.TestCase):
         assert isinstance(unit.claude, LiveClaude)
         self.assertEqual((unit.claude.name, unit.claude.session_id), ("renamed-since-launch", "id-renamed-since-launch"))
 
+    def test_the_claude_in_an_unmarked_session_is_found_by_its_name(self) -> None:
+        fake_tmux.write(self.state, {"$1": FakeSession(label="nightly-review", panes=["%6"], env={}),
+                                     "$2": FakeSession(label="empty", panes=["%7"], env={})})
+        self.claude("nightly-review", "%6")
+        claude = unit_lookup.tmux_claude("nightly-review")
+        assert isinstance(claude, LiveClaude)
+        self.assertEqual(claude.session_id, "id-nightly-review")
+        self.assertIsInstance(unit_lookup.tmux_claude("empty"), ClaudeNotRunning)
+        self.assertIsInstance(unit_lookup.tmux_claude("absent"), ClaudeNotRunning)
+
+    def test_unmark_removes_both_marks(self) -> None:
+        fake_tmux.write(self.state, {"$1": marked("trunk", "%4", "trunk-unit", OTHER="kept")})
+        unit_lookup.unmark("trunk")
+        self.assertEqual(fake_tmux.read(self.state)["$1"]["env"], {"OTHER": "kept"})
+
     def test_a_relaunch_in_the_same_pane_is_found_from_its_newest_record(self) -> None:
         fake_tmux.write(self.state, {"$1": marked("trunk", "%4", "trunk-unit")})
         self.claude("before", "%4", updated=1, session_id="old-id")

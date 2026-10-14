@@ -5,7 +5,7 @@ description: Run a production as its showrunner — launch each unit director (a
 # Produce
 
 The showrunner owns the merge branch, coordination between units, the design
-check, and all talk with the user. Unit directors run the seats that write the
+check, and all talk with the user. Unit directors run the workers that write the
 code. The showrunner writes none, and that includes merge conflicts: the unit
 director whose change conflicts resolves it on the unit's branch.
 
@@ -182,7 +182,8 @@ State:
 
   Nothing else does. Handle unit messages (checkpoints, merges, ETAs, plans,
   promotions, routine fixes) without telling the user; they wait for the next
-  dailies (user, 2026-10-12).
+  dailies (user, 2026-10-12). A turn with nothing for the user replies with
+  just "—": never "No update for you." or the like (user, 2026-10-14).
 - **Designs and add-ons.** A unit's design choices and add-ons are yours to
   settle, not the user's. User, 2026-10-12: "when it comes to designs you
   absolutely should be able to tell units what to do and change. I do not have
@@ -435,7 +436,7 @@ and idle, type `/compact` with
 Check idle with `~/.claude/scripts/lib/py ~/.claude/scripts/production/session_pane.py read unit <slug> <unit> --ansi`:
 no spinner line (`✶ Doing… (12s …)`), nothing after `❯` except a ghost
 suggestion (dim: `\e[2m` before it on both hosts), and no form, permission
-prompt or menu on screen. A unit director whose background seats are still
+prompt or menu on screen. A unit director whose background workers are still
 running counts as idle, because it is only waiting on them. Never compact a unit
 director that is mid-turn or showing a form. Between checkpoints, leave it to
 the unit director's own automatic compaction. Log each one, with the unit
@@ -491,8 +492,8 @@ whatever arrived:
 | a child showrunner's item for the user | show it in the child's words; relay the answer to that child (<Throughout/> → Nested showrunners) |
 | the user's words for a production below this one | relay them to the child that holds it (<Throughout/> → Nested showrunners) |
 
-A unit repairing failing tests that split by file runs parallel repair seats
-(`/unit:direct` → <FixDispatch/>); one that runs a lone seat on them gets
+A unit repairing failing tests that split by file runs parallel repair workers
+(`/unit:direct` → <FixDispatch/>); one that runs a lone worker on them gets
 told to split. User, 2026-10-04.
 
 Merge one checkpoint at a time. A notice that arrives while a merge is testing
@@ -518,7 +519,7 @@ notice to the unit director before any merge command runs:
    apply <CrossUnitChange/> step 2 before merging. If the overlap is only an
    edit to the same file, tell that unit director in one line which file
    changed under it, and to merge the merge branch at its next pause between
-   seat tasks, not at its own checkpoint, so conflicts are settled while small.
+   worker tasks, not at its own checkpoint, so conflicts are settled while small.
    User, 2026-10-05. Early merges must be clean: a notice whose `also touches`
    line lacks `tested against <owner tip>` or a fix owner the owner agreed to
    goes back (`production_format.md` → <ProductionUnit/> item 9). User,
@@ -1074,10 +1075,16 @@ Before the mover stops one of your units, you get one line from `shutdown`:
 it stays stopped until the user restarts it. One more line follows:
 `<unit> is back on <account>`, or `<unit> did not come back: <reason>`. The user
 is told of a failure; you hold the unit's work until it is back.
+
+To move a session yourself, or stop one to change its account, run
+`/showrunner:move`: it pauses the session first and proves the account it comes
+back on. Never send `/exit` into a pane, run `shutdown.py now`, kill a Claude
+process or resume `claude` with a `CLAUDE_CONFIG_DIR` by hand; a hook refuses
+each in your session.
 </PauseForMove>
 
 <QuotaAlert>
-Unit directors' seats run on accounts with a weekly usage limit. The notices about
+Unit directors' workers run on accounts with a weekly usage limit. The notices about
 them, how to tell the three kinds apart, and what a receiver does are in
 `~/.claude/docs/quota_alerts.md`. Read it at <StartUpdates/> and follow it; this
 section adds only what the showrunner role needs.
@@ -1098,7 +1105,7 @@ the rest, and reports a unit whose account cannot be read as not told:
   whose account may keep working on its credits, and tell you at once if Codex
   refuses work for quota; bring a refusal to the user. A notice that says every
   function moved: delegation continues on Claude. A Claude notice, or a Codex one
-  whose switch failed: start no new delegate work on that tool; running seats
+  whose switch failed: start no new delegate work on that tool; running workers
   finish and the unit director does the rest itself. Hold the alert as one
   line per account, led by `quota: ` and listed first in every Waiting on block
   after the open-questions count, with the percent left and the reset time,
@@ -1118,7 +1125,8 @@ every unit director.
 When every unit's final-gate and as-built checkpoints are merged:
 
 With a **Review pool** line, exclude `review-unit`'s standing phase from
-that condition.
+that condition. A unit whose Plan cell is `permanent` (the nightly review) is
+outside it too: wrap neither waits on it nor retires its worktree or branch.
 
 1. Run a final <CIPoint/> and all <PromoteMain/> checks on its exact sha:
    local validation, smoke launch and GitHub CI verdict, then the promotion
@@ -1178,7 +1186,7 @@ that condition.
     its files can be fenced. Packaging is yours, never the user's. User,
     2026-10-13. Each dailies build prints `parallel check: <unit>: Phase N
     could start` for these; start them.
-  - A unit's later phase runs beside its current one, with its own seats, berth
+  - A unit's later phase runs beside its current one, with its own workers, berth
     reservation and checkpoint. A checkpoint commits only its own phase's paths.
     Where files overlap, it claims after the earlier phase and builds on its tree.
   - Gates run side by side: review, live check, shots and design check run

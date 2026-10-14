@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import fcntl
+import ci_points
+from cli_fixture import invoke_cli
 import json
 import os
 import re
@@ -40,27 +42,31 @@ if name == "review_regime.py":
         print("| review | after |")
         print("| phases merged | 12 |")
         raise SystemExit(0)
-if name == "gh":
-    record = json.loads((state / "ci-result.json").read_text())
-    if args[:2] == ["repo", "view"]:
-        print(json.dumps({"nameWithOwner": "example/example"}))
-    elif args[:2] == ["run", "list"]:
-        print(json.dumps([{"databaseId": 123, "headSha": record["headSha"],
-                           "status": record["status"], "conclusion": record["conclusion"]}]))
-    elif args[:2] == ["run", "view"]:
-        print(json.dumps(record))
-    elif args[:2] == ["run", "watch"]:
-        hook = os.environ.get("CI_POINTS_TEST_WATCH_HOOK")
-        if hook:
-            import subprocess
-            subprocess.run([sys.executable, hook], check=True)
-        raise SystemExit(0 if record["conclusion"] == "success" else 1)
-    else:
-        raise SystemExit(99)
-    raise SystemExit(0)
 if name in ("send.py", "tmux", "claude", "systemd-run", "ssh", "nix", "cargo-berth", "notifier.sh", "showrunners.py", "py"):
     raise SystemExit(0)
 raise SystemExit(99)
+'''
+GH_STUB = r'''#!/bin/bash
+set -euo pipefail
+state=${CI_POINTS_TEST_STATE:?}
+reply=$(jq -cn --slurpfile result "$state/ci-result.json" --args '
+    $ARGS.positional as $args | {name:"gh", args:$args},
+    (if $args[0:2] == ["repo", "view"] then {nameWithOwner:"example/example"}
+     elif $args[0:2] == ["run", "list"] then [$result[0] | {databaseId:123, headSha, status, conclusion}]
+     elif $args[0:2] == ["run", "view"] then $result[0]
+     elif $args[0:2] == ["run", "watch"] then {code:(if $result[0].conclusion == "success" then 0 else 1 end)}
+     else {code:99} end)' -- "$@")
+printf '%s\n' "${reply%%$'\n'*}" >> "$state/calls.jsonl"
+answer=${reply#*$'\n'}
+if [[ ${1:-} == run && ${2:-} == watch && -n ${CI_POINTS_TEST_WATCH_HOOK:-} ]]; then
+    "${TEST_PYTHON:?}" "$CI_POINTS_TEST_WATCH_HOOK"
+fi
+case "$answer" in
+    '{"code":0}') exit 0 ;;
+    '{"code":1}') exit 1 ;;
+    '{"code":99}') exit 99 ;;
+    *) printf '%s\n' "$answer" ;;
+esac
 '''
 VALIDATE_STUB = '''#!/bin/sh
 printf '%s\\n' "$*" >> "$CI_POINTS_TEST_STATE/validate-calls"
@@ -113,7 +119,7 @@ class CiPointsTests(unittest.TestCase):
         for relative in (".claude/scripts/message/send.py", ".claude/scripts/message/notifier.sh",
                          ".claude/scripts/production/showrunners.py", ".claude/scripts/lib/py"):
             self.stub(self.home / relative)
-        self.env = {**os.environ, "HOME": str(self.home), "CI_POINTS_TEST_STATE": str(self.stub_state),
+        self.env = {**os.environ, "HOME": str(self.home), "CI_POINTS_TEST_STATE": str(self.stub_state), "TEST_PYTHON": sys.executable,
                     "PATH": str(self.bin) + os.pathsep + os.environ.get("PATH", ""),
                     "DAILIES_REVIEW_REGIME": str(self.bin / "review_regime.py"),
                     "CLAUDE_CODE_SESSION_ID": "test-showrunner",
@@ -138,7 +144,7 @@ class CiPointsTests(unittest.TestCase):
 
     def stub(self, path: Path) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
-        self.write(path, STUB.replace("__PYTHON__", sys.executable))
+        self.write(path, GH_STUB if path.name == "gh" else STUB.replace("__PYTHON__", sys.executable))
         path.chmod(0o755)
 
     def write(self, path: Path, text: str) -> None:
@@ -168,9 +174,8 @@ class CiPointsTests(unittest.TestCase):
         )))
 
     def run_ci(self, *args: str) -> subprocess.CompletedProcess[str]:
-        return subprocess.run([sys.executable, str(SCRIPT), *args, "--production", str(self.doc)],
-                              cwd=self.checkout, env=self.env, capture_output=True, text=True,
-                              check=False, timeout=300)
+        arguments = [*args, "--production", str(self.doc)]
+        return invoke_cli(ci_points, ci_points.main, arguments, self.env, self.checkout)
 
     def calls(self, name: str) -> list[list[str]]:
         path = self.stub_state / "calls.jsonl"

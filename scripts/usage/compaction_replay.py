@@ -1,4 +1,4 @@
-"""Compare seat compaction limits against stored requests in one read-only snapshot."""
+"""Compare worker compaction limits against stored requests in one read-only snapshot."""
 
 from __future__ import annotations
 
@@ -30,13 +30,13 @@ class NeverRule:
 
 
 @dataclass(frozen=True)
-class NewSeatRule:
+class NewWorkerRule:
     pass
 
 
-Rule = LimitRule | NeverRule | NewSeatRule
+Rule = LimitRule | NeverRule | NewWorkerRule
 RULES: tuple[Rule, ...] = (LimitRule(100_000), LimitRule(150_000), LimitRule(200_000),
-                          LimitRule(250_000), NeverRule(), NewSeatRule())
+                          LimitRule(250_000), NeverRule(), NewWorkerRule())
 
 
 @dataclass(frozen=True)
@@ -50,11 +50,11 @@ class CarriedOn:
 
 
 @dataclass(frozen=True)
-class NewSeat:
+class NewWorker:
     start: float
 
 
-BoundaryOutcome = Compacted | CarriedOn | NewSeat
+BoundaryOutcome = Compacted | CarriedOn | NewWorker
 
 
 @dataclass(frozen=True)
@@ -117,7 +117,7 @@ class ReplayInputs:
 class RuleResult:
     rule: Rule
     compactions: int
-    new_seats: int
+    new_workers: int
     weighted_tokens: float
     over_limit: int
     cache_floors: int
@@ -219,7 +219,7 @@ def rule_name(rule: Rule) -> str:
         return f"limit {rule.tokens:,}"
     if isinstance(rule, NeverRule):
         return "never"
-    return "new seat when kept is over 90,000 (estimate)"
+    return "new worker when kept is over 90,000 (estimate)"
 
 
 def boundary_outcome(rule: Rule, fit: FittedLine, end: float,
@@ -227,14 +227,14 @@ def boundary_outcome(rule: Rule, fit: FittedLine, end: float,
     if isinstance(rule, NeverRule) or end <= (rule.tokens if isinstance(rule, LimitRule) else 100_000):
         return CarriedOn(end + prompt)
     kept = fit.kept(end)
-    if isinstance(rule, NewSeatRule) and kept > 90_000:
-        return NewSeat(first_size)
+    if isinstance(rule, NewWorkerRule) and kept > 90_000:
+        return NewWorker(first_size)
     return Compacted(kept)
 
 
 def replay_rule(inputs: ReplayInputs, rule: Rule, fit: FittedLine,
                 first_size: float, prompt: float) -> RuleResult:
-    compacted = new_seats = over_limit = cache_floors = 0
+    compacted = new_workers = over_limit = cache_floors = 0
     costs: list[float] = []
     for thread in inputs.threads:
         end = difference = 0.0
@@ -250,13 +250,13 @@ def replay_rule(inputs: ReplayInputs, rule: Rule, fit: FittedLine,
                 else:
                     costs.append(outcome.start + first.output * first.output_weight)
                     compacted += isinstance(outcome, Compacted)
-                    new_seats += isinstance(outcome, NewSeat)
+                    new_workers += isinstance(outcome, NewWorker)
                 for sample in segment.requests[1:]:
                     cache_floors += difference < -sample.cache_read
                     costs.append(sample.weighted + max(difference, -sample.cache_read) * sample.cached_weight)
             over_limit += sum(max(0.0, sample.size + difference) > 272_000 for sample in segment.requests)
             end = max(0.0, segment.requests[-1].size + difference)
-    return RuleResult(rule, compacted, new_seats, math.fsum(costs), over_limit, cache_floors)
+    return RuleResult(rule, compacted, new_workers, math.fsum(costs), over_limit, cache_floors)
 
 
 def render_replay(db: sqlite3.Connection, window: usage_report.TimeWindow = UNBOUNDED,
@@ -280,9 +280,9 @@ def render_replay(db: sqlite3.Connection, window: usage_report.TimeWindow = UNBO
         results = tuple(replay_rule(inputs, rule, fit, first_size, follow_up_prompt) for rule in RULES)
         baseline = results[0].weighted_tokens
         lines.extend(usage_report.markdown_table(
-            ("rule", "simulated compactions", "new seats", "weighted tokens",
+            ("rule", "simulated compactions", "new workers", "weighted tokens",
              "change against limit 100,000", "requests over 272,000"),
-            ([rule_name(result.rule), str(result.compactions), str(result.new_seats),
+            ([rule_name(result.rule), str(result.compactions), str(result.new_workers),
               f"{result.weighted_tokens:,.0f}",
               f"{result.weighted_tokens / baseline - 1:+.1%}" if baseline else "—",
               str(result.over_limit)] for result in results)))

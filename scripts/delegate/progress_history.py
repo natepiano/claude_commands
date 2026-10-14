@@ -62,7 +62,7 @@ STATE_FILENAME = "progress_history_state.json"
 # events, so convergence never sees it.
 ARMED_REVIEW_KEY = "early_review"
 # A phase stays open until its own finish-phase, however many phases start after
-# it: a unit can run Phase 18 while Phase 6's seats are still working. State
+# it: a unit can run Phase 18 while Phase 6's workers are still working. State
 # holds the most recently started open phase under `phase`, which every reader
 # that needs "the open phase" uses, and the older open ones here, oldest first.
 OPEN_PHASES_KEY = "open_phases"
@@ -159,9 +159,9 @@ class StageWindow(TypedDict):
 
     Two tables read these. `timeline` renders one row apiece, which is the
     provenance view. The progress report groups them by `fix_round` and lays the
-    seats out as columns, which is why `slot` is carried here rather than
-    recovered later: a window with no seat is a unit-director activity, and it is
-    the absence of a seat that tells the two apart.
+    workers out as columns, which is why `slot` is carried here rather than
+    recovered later: a window with no worker is a unit-director activity, and it is
+    the absence of a worker that tells the two apart.
     """
 
     instance_id: str
@@ -171,7 +171,7 @@ class StageWindow(TypedDict):
     label: str
     # What the window actually ran, for an activity: the `--activity` text the
     # unit director opened it with ("test hana"). Empty for passes, whose work is
-    # described by kind and seat. The gate notes under the round table are the
+    # described by kind and worker. The gate notes under the round table are the
     # one reader of it -- the label alone renders a block of verification
     # commands as identical rows.
     text: str
@@ -489,7 +489,9 @@ def _append_event(state: dict[str, object], event: dict[str, object]) -> None:
         fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
         _ = handle.write(line)
         handle.flush()
-        os.fsync(handle.fileno())
+        # Disposable fixtures may omit disk durability; production syncs by default.
+        if os.environ.get("PLAN_DELEGATE_SYNC_WRITES", "1") != "0":
+            os.fsync(handle.fileno())
         fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
 
@@ -967,13 +969,13 @@ def _ensure_project_timing(
     return state
 
 
-# The seat this launcher occupies in its phase team, exported by implement.sh
+# The worker this launcher occupies in its phase team, exported by implement.sh
 # before it calls start-pass. A phase runs two launchers against one state
 # file and each records its own pass, so this is the key their windows are kept
 # apart under -- without it a team phase and a solo phase produce identical rows.
 #
-# The variable says role and its value is a seat: `impl` and `test` name the
-# two chairs, not the work done in them. Both seats can be implementing at one moment and reviewing at another; the role a seat holds
+# The variable says role and its value is a worker: `impl` and `test` name the
+# two chairs, not the work done in them. Both workers can be implementing at one moment and reviewing at another; the role a worker holds
 # right now lives on the coordination board, which records it as a `handoff` and
 # never writes it here. Reading the value as a role is the mistake this comment
 # exists to stop -- the variable is the half with the wrong name, and it stays
@@ -982,9 +984,9 @@ TEAM_SLOT_ENV = "PLAN_DELEGATE_TEAM_ROLE"
 
 
 def _team_slot() -> str:
-    """The recording member's seat, empty when nothing named one.
+    """The recording member's worker, empty when nothing named one.
 
-    Empty is a seat like any other rather than a missing value: passes predating
+    Empty is a worker like any other rather than a missing value: passes predating
     the field, and every recorder that does not run through implement.sh --
     review.sh included -- record under it, and must stay distinguishable from a
     launcher that really is sitting in `impl`.
@@ -993,11 +995,11 @@ def _team_slot() -> str:
 
 
 def _record_slot(record: dict[str, object]) -> str:
-    """The seat stamped on a pass record, under whichever key wrote it.
+    """The worker stamped on a pass record, under whichever key wrote it.
 
     The field was `team_role` for a day, until the value turned out to name the
-    seat rather than the work. A run in flight across that change holds the old
-    key on a pass it has already opened, and must not lose its seat halfway
+    worker rather than the work. A run in flight across that change holds the old
+    key on a pass it has already opened, and must not lose its worker halfway
     through.
     """
     if "team_slot" in record:
@@ -1010,7 +1012,7 @@ def _pass_slots(state: dict[str, object]) -> dict[str, dict[str, object]]:
 
     Returns the records state itself holds, so a caller that changes one changes
     state. State written before the phase team existed holds a single pass
-    object instead of a map; it reads as the entry for its own seat,
+    object instead of a map; it reads as the entry for its own worker,
     which is how a run already in flight keeps its open pass. Migration happens
     in memory and reaches disk only when something else writes state -- a run is
     never rewritten for the change alone.
@@ -1261,8 +1263,8 @@ def _close_slot_pass(
     event = _event(state, "pass_finished", now, current_pass)
     event["status"] = status
     # Taken from the pass, not from the environment. A stale pass is closed by
-    # whichever launcher starts the next one in that seat, and reading the
-    # environment here would stamp the closer's seat onto the opener's work.
+    # whichever launcher starts the next one in that worker, and reading the
+    # environment here would stamp the closer's worker onto the opener's work.
     event["team_slot"] = _record_slot(current_pass)
     event["pass_elapsed_seconds"] = max(
         0,
@@ -2286,18 +2288,18 @@ STAGE_HEADERS: tuple[str, ...] = (
     "Elapsed",
     "Result",
 )
-# The two slots a phase always runs, in the order they are reported: the seats
+# The two slots a phase always runs, in the order they are reported: the workers
 # that write. A slot is a fixed identity; the role it is doing is what the cell
 # shows, so a `test` slot opened as a writer reads "impl" under Agent 2.
 ROUND_SLOTS: tuple[str, ...] = ("impl", "test")
-# The seat the broad review's craft lens records under. No writer sits there,
-# so it is a third column only when a stage the table shows seated it, and a
+# The worker the broad review's craft lens records under. No writer sits there,
+# so it is a third column only when a stage the table shows assigned it, and a
 # table without one keeps the two columns it always had.
 REVIEW_SLOT = "review"
 # The statuses that mean a window is being worked right now. Narrower than the
 # set `_window_span` runs to the clock: a window left `open` is one whose finish
 # was never recorded, so its launcher is gone and its span is merely unbounded.
-# Reading that as work is the mistake the seat states exist to stop making.
+# Reading that as work is the mistake the worker states exist to stop making.
 LIVE_WINDOW_STATUSES: tuple[str, ...] = ("running", "armed")
 # A pass kind's display name, where the two differ. `arch` is deliberately
 # absent: it is retired rather than renamed, and the handful of back-corpus
@@ -2308,31 +2310,31 @@ SUMMARY_HEADERS: tuple[str, ...] = ("Scope", "%", "Elapsed", "ETA", "Unchanged")
 # so the alignment follows a column that moves. The two scope labels and the
 # phase tally read as words and stay left.
 RIGHT_ALIGNED_SUMMARY_COLUMNS = frozenset({"%", "Elapsed", "ETA", "ETA low", "ETA high"})
-# How much of a seat's last board line the note under the table carries. The
+# How much of a worker's last board line the note under the table carries. The
 # board caps a post far higher than a terminal line can hold, and a wrapped
 # narration costs the reader the three-line scan the note exists to give.
 BOARD_NOTE_CHARS = 72
 # What implement.sh puts in front of the `done` and `blocked` it posts on the
-# worker's exit, so the note can tell the launcher's line from the seat's own.
+# worker's exit, so the note can tell the launcher's line from the worker's own.
 LAUNCHER_PREFIX = "launcher:"
-# What a seat's own narration says when it is alive but not working: held up on
+# What a worker's own narration says when it is alive but not working: held up on
 # a peer's edit, on a token, on a gate. Nothing in the pass record separates that
 # from work -- the process is up and the window is open either way -- so the last
-# board line is the only source there is, and these are the words the seats use.
+# board line is the only source there is, and these are the words the workers use.
 WAITING_PHRASES: tuple[str, ...] = ("waiting", "wait for", "blocked on", "standing by")
-# Where a window that sits in no round is drawn when its kind names a seat. A
+# Where a window that sits in no round is drawn when its kind names a worker. A
 # lone reviewer between rounds -- the closure review, the broad review of a
 # solo run -- is doing review work and reads in the `test` column, where the
 # adversary lens sits; a row of dashes would hide it. A unit-director activity
-# names no seat and keeps them.
-LONE_SEATS: dict[str, str] = {"impl": "impl", "fix": "impl", "test": "test", "review": "test"}
+# names no worker and keeps them.
+LONE_WORKERS: dict[str, str] = {"impl": "impl", "fix": "impl", "test": "test", "review": "test"}
 # How many stages the round table draws. A long phase runs dozens -- ten repair
 # rounds and eleven verifications in the one that prompted the cap -- and a
 # table that tall is scrolled past rather than read. What a reader acts on is
 # the last few; the rest is history, and `timeline` still renders it in full.
 ROUND_TABLE_STAGES = 3
 # How close together two role movements are before they are one movement of the
-# team. Seats converge in sequence -- each seat's `board.sh role` call landing
+# team. Workers converge in sequence -- each worker's `board.sh role` call landing
 # a second or two apart -- and a boundary each would put a near-empty row on
 # every call. The cost is small: a movement inside the window describes its row
 # from the row's start, at most this many seconds early, which is invisible at
@@ -2400,9 +2402,9 @@ def _started_window(event: dict[str, object], event_type: str) -> StageWindow:
     main_model, main_effort = _agent_fields(event, "main_agent")
     return StageWindow(
         instance_id=instance_id,
-        # An activity is the unit director, which sits in no seat. Passes recorded
+        # An activity is the unit director, which sits in no worker. Passes recorded
         # before the field existed also read empty, and land in the same place:
-        # a row of their own rather than a seat's column.
+        # a row of their own rather than a worker's column.
         slot="" if event_type != "pass_started" else _record_slot(event),
         kind=kind,
         fix_round=_integer(event.get("fix_pass")),
@@ -2554,7 +2556,7 @@ def _armed_window(
     started_at = _number(armed.get("started_at"), now)
     return StageWindow(
         instance_id=_string(armed.get("instance_id")) or "armed",
-        # The early reviewer occupies the `test` seat before its pass exists --
+        # The early reviewer occupies the `test` worker before its pass exists --
         # where the adversary lens sits and where a lone closure reviewer reads
         # -- so it claims that column. Its round is left at zero and resolved
         # against the phase in `_round_windows`: the marker is written before
@@ -2755,16 +2757,16 @@ def _window_result(window: StageWindow, tally: FindingTally) -> str:
 
 
 class BoardActivity(TypedDict):
-    """The latest board line under a seat, and the seat's own last words."""
+    """The latest board line under a worker, and the worker's own last words."""
 
     at: float
     kind: str
     message: str
-    # The seat's latest line that the launcher did not write, empty when the
-    # seat has said nothing itself since it was launched. Carried beside
-    # `message` because the launcher's `done` lands after the seat's final
+    # The worker's latest line that the launcher did not write, empty when the
+    # worker has said nothing itself since it was launched. Carried beside
+    # `message` because the launcher's `done` lands after the worker's final
     # narration, and a note that read only the latest line reported every
-    # finished seat with the same boilerplate.
+    # finished worker with the same boilerplate.
     own: str
 
 
@@ -2831,35 +2833,35 @@ def _board_role_changes(session_dir: Path) -> list[RoleChange]:
 
 
 def _launcher_authored(kind: str, message: str) -> bool:
-    """Whether a board line came from implement.sh rather than from the seat.
+    """Whether a board line came from implement.sh rather than from the worker.
 
     The launcher writes two kinds of line: `register`, which is always its, and
     a `done` or `blocked` on exit, which it prefixes `launcher:` so the note can
-    tell it from a `done` the seat posted itself.
+    tell it from a `done` the worker posted itself.
     """
     return kind == "register" or message.startswith(LAUNCHER_PREFIX)
 
 
 def _board_activity(session_dir: Path) -> dict[str, BoardActivity]:
-    """The most recent line under each seat on the board, keyed by slot.
+    """The most recent line under each worker on the board, keyed by slot.
 
-    A seat that recorded no pass reaches the table with a role and no duration,
-    and a role on its own cannot tell a seat deep in its work from one that
+    A worker that recorded no pass reaches the table with a role and no duration,
+    and a role on its own cannot tell a worker deep in its work from one that
     stopped an hour ago. The board can. Every delegate posts what it is about to
     do before doing it, attributed to its slot, so the latest line and its age
-    answer the question a pass window alone cannot -- for a seat that has one as
-    much as for a seat that does not, since an open window says only that the
+    answer the question a pass window alone cannot -- for a worker that has one as
+    much as for a worker that does not, since an open window says only that the
     launcher is still waiting.
 
-    The latest line of any kind, not just `status`: a seat whose last act was a
-    handoff or a `blocked` is exactly the seat a reader needs to hear about, and
+    The latest line of any kind, not just `status`: a worker whose last act was a
+    handoff or a `blocked` is exactly the worker a reader needs to hear about, and
     filtering to narration would render it as silent.
 
-    Beside it, the seat's own last words. The launcher posts `done` when the
-    worker exits, which is after the seat's final narration, so the latest line
-    of every finished seat is the launcher's boilerplate and the narration the
+    Beside it, the worker's own last words. The launcher posts `done` when the
+    worker exits, which is after the worker's final narration, so the latest line
+    of every finished worker is the launcher's boilerplate and the narration the
     reader wanted sits one line up. A `register` clears them: it opens a new
-    occupancy of the seat, and words from the previous one do not describe it.
+    occupancy of the worker, and words from the previous one do not describe it.
     """
     activity: dict[str, BoardActivity] = {}
     try:
@@ -2884,15 +2886,15 @@ def _board_activity(session_dir: Path) -> dict[str, BoardActivity]:
 
 
 def _board_phrase(said: BoardActivity) -> str:
-    """One seat's last board line, cut to fit a terminal row.
+    """One worker's last board line, cut to fit a terminal row.
 
     A `status` is narration and reads as itself. Any other kind is named,
     because the kind is then the news -- `blocked` and `done` change what the
     reader should do next, where a bare message would look like more work in
-    progress. The words are the seat's own wherever it has any: the launcher's
-    `done` supplies the kind and the seat's last narration supplies what it was
+    progress. The words are the worker's own wherever it has any: the launcher's
+    `done` supplies the kind and the worker's last narration supplies what it was
     doing when it finished, which is what the reader asked. A leading `role=`
-    field is dropped: the role it announces is already in that seat's column,
+    field is dropped: the role it announces is already in that worker's column,
     and repeating it here spends the line.
     """
     message = said["own"] or said["message"].removeprefix(LAUNCHER_PREFIX)
@@ -2909,7 +2911,7 @@ def _roles_over(changes: list[RoleChange], upper: float) -> dict[str, str]:
 
     Any entry before the stretch ends describes it from the start. For a
     register that is the roll-call reasoning: the launchers land a second
-    or two apart, and reading them strictly would show a seat idle while the
+    or two apart, and reading them strictly would show a worker idle while the
     third works. For a handoff it holds because `_round_segments` opens a
     boundary at every movement wave: a handoff inside this stretch is either
     the movement that opened it or a member of that movement's wave, seconds
@@ -2925,7 +2927,7 @@ def _roles_over(changes: list[RoleChange], upper: float) -> dict[str, str]:
 def _role_movements(changes: list[RoleChange]) -> list[RoleChange]:
     """The handoffs that changed what their slot was doing.
 
-    Seats re-announce the role they already hold -- an opening `board.sh role`
+    Workers re-announce the role they already hold -- an opening `board.sh role`
     seconds after the launcher registered the same role, or narration routed
     through `role` because it is the command that takes a note. Neither moves
     the team, and a row split on one shows columns identical to the row
@@ -3049,12 +3051,12 @@ def _round_of(window: StageWindow, open_round: int) -> int:
 
 
 class RoundEntry(TypedDict):
-    """One row of the progress report: a round of seats, or a lone window."""
+    """One row of the progress report: a round of workers, or a lone window."""
 
     label: str
     started_at: float
-    # The round these seats worked, and None for a window that sits in no round:
-    # a unit-director activity, or a pass from a run that recorded no seat at all.
+    # The round these workers worked, and None for a window that sits in no round:
+    # a unit-director activity, or a pass from a run that recorded no worker at all.
     # The distinction picks the row's finding attribution, which is the whole
     # reason the two shapes stay separable rather than being forced into one.
     number: int | None
@@ -3066,9 +3068,9 @@ def _round_entries(windows: list[StageWindow], labels: list[str]) -> list[RoundE
 
     A round is the unit that advances -- it is dispatched, it lands, and the
     ledger stamps it on every finding it produces -- so it is the row, and the
-    seats working it read across as columns. Everything else keeps a row
-    of its own: verification is the unit director between rounds, in no seat and in
-    no round, and a solo run records no seat at all, so both render one window
+    workers working it read across as columns. Everything else keeps a row
+    of its own: verification is the unit director between rounds, in no worker and in
+    no round, and a solo run records no worker at all, so both render one window
     per row exactly as they did before the phase team existed.
     """
     rounds = {
@@ -3081,7 +3083,7 @@ def _round_entries(windows: list[StageWindow], labels: list[str]) -> list[RoundE
     entries: list[RoundEntry] = []
     for index, window in enumerate(windows):
         # An armed reviewer joins the round it reads only when a round exists to
-        # join. In a solo run it is the only seated window there is, and it
+        # join. In a solo run it is the only assigned window there is, and it
         # belongs beside the writer in a row of its own, as it always rendered.
         lone = not window["slot"] or (window["status"] == "armed" and not rounds)
         if lone:
@@ -3098,7 +3100,7 @@ def _round_entries(windows: list[StageWindow], labels: list[str]) -> list[RoundE
     for number, members in grouped.items():
         # Round zero is whatever the phase opened with -- an implementation, or a
         # review of work that arrived already written -- so it is named for the
-        # kind its seats actually ran. Every later round is a repair round, and
+        # kind its workers actually ran. Every later round is a repair round, and
         # carries the number convergence counts.
         if number:
             label = f"Fix {number}"
@@ -3163,13 +3165,13 @@ def _round_segments(
     changes: list[RoleChange],
     now: float,
 ) -> list[tuple[float, float, dict[str, str]]]:
-    """A round split at every moment its seats changed what they were doing.
+    """A round split at every moment its workers changed what they were doing.
 
-    A round is not one shape held to the end. Seats get recruited across as the
+    A round is not one shape held to the end. Workers get recruited across as the
     work moves -- one writing while the other tests, then both writing, then
     both converging on review -- and a single row would report whichever shape happened to be last
     as though it had held throughout. Each segment is a stretch over which no
-    seat changed role, so a row per segment tells the reader what the team was
+    worker changed role, so a row per segment tells the reader what the team was
     when, which is what the board records and nothing else preserves.
     """
     start = entry["started_at"]
@@ -3183,10 +3185,10 @@ def _round_segments(
     # splitting on either repeats the row above with a fresh clock. A movement
     # exactly at the round's start opens it rather than splitting it, and one
     # at or past its end belongs to the round that follows.
-    # A seat re-occupied is the other way a round moves on, and the one no
+    # A worker re-occupied is the other way a round moves on, and the one no
     # handoff marks: a blind reviewer is a fresh session that takes the chair
     # after the writer's has exited, so nothing posts a movement between them.
-    # One boundary per wave rather than per movement -- seats converge seconds
+    # One boundary per wave rather than per movement -- workers converge seconds
     # apart, and a boundary each would put a near-empty row on every one, so a
     # candidate within ROLE_WAVE_SECONDS of the boundary before it joins that
     # boundary's row instead of opening its own.
@@ -3200,13 +3202,13 @@ def _round_segments(
         )
         for index in range(1, depth)
     }
-    # A seat outside the phase's opening impl/test pair joins the round when its
-    # first occupancy begins. Treat that as a re-seating wave just like the
-    # original craft-review seat, so `review2` and `fix2` do not appear to have
+    # A worker outside the phase's opening impl/test pair joins the round when its
+    # first occupancy begins. Treat that as a reassigning workers wave just like the
+    # original craft-review worker, so `review2` and `fix2` do not appear to have
     # worked from the writers' start time.
-    for slot, seated in occupancies.items():
-        if slot not in ROUND_SLOTS and seated:
-            waves.add(seated[0]["started_at"])
+    for slot, assigned in occupancies.items():
+        if slot not in ROUND_SLOTS and assigned:
+            waves.add(assigned[0]["started_at"])
     candidates = sorted({change["at"] for change in _role_movements(changes)} | waves)
     boundaries = [start]
     for at in candidates:
@@ -3220,12 +3222,12 @@ def _round_segments(
 
 
 def _slot_occupancies(members: list[StageWindow]) -> dict[str, list[StageWindow]]:
-    """Each seat's windows in one round, oldest first.
+    """Each worker's windows in one round, oldest first.
 
-    A seat sits down more than once in a round wherever the round runs a stage
+    A worker sits down more than once in a round wherever the round runs a stage
     after the one it opened with: the writers finish, and the reviewers that
     read what they wrote take the same chairs. Keeping one
-    member per seat reported whichever occupancy happened to be last as though
+    member per worker reported whichever occupancy happened to be last as though
     it had held the round from the start.
     """
     occupancies: dict[str, list[StageWindow]] = defaultdict(list)
@@ -3236,10 +3238,10 @@ def _slot_occupancies(members: list[StageWindow]) -> dict[str, list[StageWindow]
     return occupancies
 
 
-def _seat_is_waiting(said: BoardActivity | None) -> bool:
-    """Whether a seat's last board line says it is held up rather than working."""
+def _worker_is_waiting(said: BoardActivity | None) -> bool:
+    """Whether a worker's last board line says it is held up rather than working."""
     if said is None or said["message"].startswith(LAUNCHER_PREFIX):
-        # A launcher writes one line only as its seat exits, and a seat that has
+        # A launcher writes one line only as its worker exits, and a worker that has
         # exited is not waiting on anything.
         return False
     if said["kind"] == "blocked":
@@ -3248,8 +3250,8 @@ def _seat_is_waiting(said: BoardActivity | None) -> bool:
     return any(phrase in text for phrase in WAITING_PHRASES)
 
 
-def _seat_state(member: StageWindow, live: bool, said: BoardActivity | None) -> str:
-    """What this seat is doing at the end of the stretch its cell covers.
+def _worker_state(member: StageWindow, live: bool, said: BoardActivity | None) -> str:
+    """What this worker is doing at the end of the stretch its cell covers.
 
     The duration cannot say it. An open window and a closed one both render a
     number, and a number that stopped growing looks exactly like one still
@@ -3257,19 +3259,19 @@ def _seat_state(member: StageWindow, live: bool, said: BoardActivity | None) -> 
     one the row could not answer.
 
     `done` is every stretch that is already over, which is every row but the
-    last of a live round. Inside that last row three answers separate. A seat
+    last of a live round. Inside that last row three answers separate. A worker
     whose window has closed is `idle`: finished with what it was given while the
-    round it belongs to is not, so it is a seat available for more work rather
-    than a phase that ended. A seat whose window is open is working, unless its
+    round it belongs to is not, so it is a worker available for more work rather
+    than a phase that ended. A worker whose window is open is working, unless its
     own narration says it is held up on a peer, a token, or a gate -- which the
-    records cannot see, and which is `waiting`. Both seats reading `running`
+    records cannot see, and which is `waiting`. Both workers reading `running`
     while one sits on the other is the picture this exists to correct.
     """
     if not live:
         return "done"
     if member["status"] not in LIVE_WINDOW_STATUSES:
         return "idle"
-    return "waiting" if _seat_is_waiting(said) else "running"
+    return "waiting" if _worker_is_waiting(said) else "running"
 
 
 def _round_cells(
@@ -3282,34 +3284,34 @@ def _round_cells(
     activity: dict[str, BoardActivity],
     slots: tuple[str, ...],
 ) -> list[str]:
-    """A cell per seat in `slots`: its role over this stretch, how long, and its state."""
+    """A cell per worker in `slots`: its role over this stretch, how long, and its state."""
     occupancies = _slot_occupancies(members)
     cells: list[str] = []
     for slot in slots:
         # The occupancy this stretch falls in: the last one that had begun by
         # the time the stretch ended.
-        seated = occupancies.get(slot, [])
+        assigned = occupancies.get(slot, [])
         member = next(
-            (window for window in reversed(seated) if window["started_at"] < upper),
+            (window for window in reversed(assigned) if window["started_at"] < upper),
             None,
         )
         if member is None:
-            # A seat that recorded no pass: it was launched without a pass
+            # A worker that recorded no pass: it was launched without a pass
             # kind, or it died before `start-pass`. The board still knows its
             # role, and knows it after the round closes -- the old reading gated
             # this on the round running, so a finished round rendered its other
-            # seats as "-" and read as a solo pass. The duration is what is
-            # genuinely unknown here; the seat is not.
+            # workers as "-" and read as a solo pass. The duration is what is
+            # genuinely unknown here; the worker is not.
             cells.append(roles.get(slot) or "-")
             continue
         # The board's role wins wherever it has one, for this stretch rather than
-        # for now: it is the only source that tracks a seat recruited across, and
+        # for now: it is the only source that tracks a worker recruited across, and
         # reading it per segment is what keeps an earlier row describing the team
-        # that was. A seat whose board never spoke reports the kind it recorded.
-        # Only for the seat's opening occupancy, though: a later one is a
+        # that was. A worker whose board never spoke reports the kind it recorded.
+        # Only for the worker's opening occupancy, though: a later one is a
         # different session in the same chair, and the role the last occupant
         # left behind describes work that is already over.
-        role = (roles.get(slot) or member["kind"]) if member is seated[0] else member["kind"]
+        role = (roles.get(slot) or member["kind"]) if member is assigned[0] else member["kind"]
         opened, closed = _window_span(member, now)
         overlap = int(min(closed, upper) - max(opened, lower))
         cells.append(
@@ -3318,7 +3320,7 @@ def _round_cells(
                 for word in (
                     role,
                     _compact_duration(overlap) if overlap > 0 else "",
-                    _seat_state(member, live, activity.get(slot)),
+                    _worker_state(member, live, activity.get(slot)),
                 )
                 if word
             )
@@ -3331,20 +3333,20 @@ def _lone_cells(
     activity: dict[str, BoardActivity],
     slots: tuple[str, ...],
 ) -> list[str]:
-    """The seat cells of a window in no round: its kind's seat filled, or none."""
+    """The worker cells of a window in no round: its kind's worker filled, or none."""
     cells = ["-"] * len(slots)
-    seat = LONE_SEATS.get(window["kind"])
-    if seat is not None:
+    worker = LONE_WORKERS.get(window["kind"])
+    if worker is not None:
         # One worker, so there is no round to outlive: it is either running or
-        # over, and `idle` -- a seat free while its round continues -- cannot
+        # over, and `idle` -- a worker free while its round continues -- cannot
         # arise here.
         live = window["status"] in LIVE_WINDOW_STATUSES
         said = activity.get(window["slot"]) if window["slot"] else None
-        cells[slots.index(seat)] = " ".join(
+        cells[slots.index(worker)] = " ".join(
             (
                 window["kind"],
                 _compact_duration(window["elapsed"]),
-                _seat_state(window, live, said),
+                _worker_state(window, live, said),
             )
         )
     return cells
@@ -3360,13 +3362,13 @@ class RoundTable(TypedDict):
     # block. Only the newest block's -- an earlier one keeps its row and its
     # tally, but its gate-by-gate story is history the reader is not acting on.
     gates: list[str]
-    # The seats the rows have cells for, in column order: ROUND_SLOTS, and the
-    # review seat after them when a shown stage seated it.
+    # The workers the rows have cells for, in column order: ROUND_SLOTS, and the
+    # review worker after them when a shown stage assigned it.
     slots: tuple[str, ...]
 
 
 def _round_headers(slots: tuple[str, ...]) -> list[str]:
-    """The round table's header, with a column for each seat in `slots`."""
+    """The round table's header, with a column for each worker in `slots`."""
     return [
         "Stage",
         "Start",
@@ -3381,16 +3383,16 @@ def _reported_slots(
     windows: list[StageWindow],
     changes: list[RoleChange],
 ) -> tuple[str, ...]:
-    """The seat columns this phase needs, in first-seen order after impl/test.
+    """The worker columns this phase needs, in first-seen order after impl/test.
 
     The writers' two always, so a phase without a craft review keeps the table
-    it always drew. The original `review` seat retains its prior visibility
-    rule when it only recorded a pass: it appears while a shown stage seats it,
-    keeping existing impl/test/review tables byte-identical. Every other seat
-    that recorded a phase pass, plus every seat with a board handoff, gets a
+    it always drew. The original `review` worker retains its prior visibility
+    rule when it only recorded a pass: it appears while a shown stage workers it,
+    keeping existing impl/test/review tables byte-identical. Every other worker
+    that recorded a phase pass, plus every worker with a board handoff, gets a
     column ordered by the first of those records.
     """
-    shown_seated = {
+    shown_assigned = {
         member["slot"]
         for group in shown
         for entry in group
@@ -3401,7 +3403,7 @@ def _reported_slots(
         slot = window["slot"]
         if not slot or slot in ROUND_SLOTS:
             continue
-        if slot == REVIEW_SLOT and REVIEW_SLOT not in shown_seated:
+        if slot == REVIEW_SLOT and REVIEW_SLOT not in shown_assigned:
             continue
         appearances.append((window["started_at"], slot))
     appearances.extend(
@@ -3424,18 +3426,18 @@ def _round_table(
     activity: dict[str, BoardActivity],
     now: float,
 ) -> RoundTable:
-    """The last ROUND_TABLE_STAGES stages, each split wherever its seats moved.
+    """The last ROUND_TABLE_STAGES stages, each split wherever its workers moved.
 
-    A stage keeps every row it owns: a repair round that recruited two seats
+    A stage keeps every row it owns: a repair round that recruited two workers
     across renders the two rows that say so. The cap counts stages rather than
     rows because a row is not a unit a reader asks for -- "what happened in the
     last few stages" is the question, and a stage answers it whole.
     """
     # A window with no round is attributed the way the stage table always did
     # it, by the interval running to whatever opened next. That slice is wrong
-    # for concurrent seats, which is why a round does not use it -- but it is
+    # for concurrent workers, which is why a round does not use it -- but it is
     # exactly right for the sequential windows that still reach this branch.
-    # Its seat cells come from its kind: a lone review sits under the test seat.
+    # Its worker cells come from its kind: a lone review sits under the test worker.
     uppers = {
         window["instance_id"]: (
             windows[index + 1]["started_at"]
@@ -3495,7 +3497,7 @@ def _round_table(
             for index, (lower, upper, roles) in enumerate(segments):
                 last = index + 1 == len(segments)
                 # Only the closing row of a live round is the present. Every
-                # earlier segment is a stretch that ended, whatever its seats
+                # earlier segment is a stretch that ended, whatever its workers
                 # are doing now.
                 cells = _round_cells(
                     members, roles, lower, upper, now, running and last, activity, slots
@@ -3505,16 +3507,16 @@ def _round_table(
                 # where. The row's result cell says so in the table's own
                 # column terms, from the rendered cells rather than the board
                 # -- what it reports is exactly what changed on screen, whether
-                # a handoff or a re-seated chair caused it.
-                seat_roles = [cell.split()[0] for cell in cells]
+                # a handoff or a reassigned chair caused it.
+                worker_roles = [cell.split()[0] for cell in cells]
                 moved = ", ".join(
                     f"Agent {position} → {role}"
                     for position, (_slot, before, role) in enumerate(
-                        zip(slots, previous_roles, seat_roles), start=1
+                        zip(slots, previous_roles, worker_roles), start=1
                     )
                     if role != before and role != "-"
                 )
-                previous_roles = seat_roles
+                previous_roles = worker_roles
                 # The result belongs to the round, which is the granularity the
                 # ledger stamps, so it sits on the row that closes it, after
                 # the movement that opened the row if one did.
@@ -3524,7 +3526,7 @@ def _round_table(
                     else ""
                 )
                 # The round label names the round once. A continuation row is
-                # the same round with its seats moved, and repeating the name
+                # the same round with its workers moved, and repeating the name
                 # there would read as a second round rather than as the team
                 # having moved.
                 rows.append(
@@ -3550,21 +3552,21 @@ def _delegate_note(
     now: float,
     slots: tuple[str, ...],
 ) -> list[str]:
-    """A line per seat the table has a column for: its agent, and its last words.
+    """A line per worker the table has a column for: its agent, and its last words.
 
-    Which model is sitting in which seat is the thing a reader cannot recover
-    from the table and asks about first when a seat runs long -- and it is not
+    Which model is sitting in which worker is the thing a reader cannot recover
+    from the table and asks about first when a worker runs long -- and it is not
     the only thing the table cannot say. A duration is the age of an open pass
-    window, which grows whether the seat is working or wedged, and a seat that
+    window, which grows whether the worker is working or wedged, and a worker that
     recorded no pass shows a role and nothing else. The board line closes both
-    gaps: what the seat said last, and how long ago, which is the difference
+    gaps: what the worker said last, and how long ago, which is the difference
     between working and stalled.
 
-    It goes under the table rather than into it -- one answer per seat, not per
+    It goes under the table rather than into it -- one answer per worker, not per
     row, and a column repeating it down every row would crowd out the roles. The
-    unit director is left out; the reader is the unit director. So is a seat the
-    table draws no column for: the review seat's board line outlives the phase
-    that seated it, and a line with no column above it names nothing on screen.
+    unit director is left out; the reader is the unit director. So is a worker the
+    table draws no column for: the review worker's board line outlives the phase
+    that assigned it, and a line with no column above it names nothing on screen.
     """
     live = {
         window["slot"]: window["delegate"]
@@ -3578,7 +3580,7 @@ def _delegate_note(
             continue
         if said is None:
             # Launched and yet to narrate. Naming that is the useful answer: a
-            # seat short of its first line is either still starting or gone
+            # worker short of its first line is either still starting or gone
             # before it began, and neither should read to the reader as work.
             detail = "no board line yet"
         else:
@@ -3878,7 +3880,7 @@ def _phase_count(args: argparse.Namespace) -> None:
 
 # What a report that describes no live window adds. The recorder knows what its
 # own records say and nothing about the processes behind them: a live run once
-# had two seats with passes recorded `error` while their workers were still
+# had two workers with passes recorded `error` while their workers were still
 # posting to the board, and reading the closed passes as a finished dispatch
 # would have routed a healthy round through the abandon path.
 WORKERS_UNSEEN = (
@@ -4022,10 +4024,10 @@ def _phase_section(
     """
     phase_instance_id = _string(phase.get("instance_id"))
     stage_windows, stage_labels, _ = _stage_table(events, state, phase_instance_id, now)
-    # One row per round, one column per seat. A round is what advances and
+    # One row per round, one column per worker. A round is what advances and
     # what the ledger stamps on its findings, so it is the row that can carry
     # a Start, an Elapsed, and a Result that all mean something; the
-    # seats working it read across. Per-pass provenance -- which model ran
+    # workers working it read across. Per-pass provenance -- which model ran
     # where, and a review overlapping the writer as its own row -- is the
     # `timeline` view, which still renders one row per window, and so is the
     # history behind the last few stages this table keeps.
@@ -4484,7 +4486,7 @@ def _finish_phase(args: argparse.Namespace) -> None:
     """Close one open phase: the one --phase-id names, else the current one.
 
     Only that phase's own passes close with it; another open phase keeps its
-    seats. When the current phase closes, the most recently started older open
+    workers. When the current phase closes, the most recently started older open
     phase becomes current again.
     """
     session_dir = _session_dir(args)
@@ -4588,8 +4590,8 @@ def _review_trial(args: argparse.Namespace) -> None:
     review_regime.py. The phase is the one --phase-id names -- an open one, else
     the latest this run started under that id -- or, without it, the one in
     state, active or just closed by finish-phase. Only events stamped with its
-    instance count. Review-seat
-    minutes are every seat's finished review passes, whatever their status, plus
+    instance count. Review-worker
+    minutes are every worker's finished review passes, whatever their status, plus
     the UX review activities. The screenshot check's own cost follows: its `UX
     review` activities alone, then every fix pass of a round whose dispatched
     batch covered a `ux` finding. All round to the nearest whole minute.
@@ -4664,7 +4666,7 @@ def _review_trial(args: argparse.Namespace) -> None:
     )
     print(
         f"review trial: ux {ux_findings} findings, code {code_findings} findings, "
-        + f"review-seat minutes {(review_seconds + 30) // 60}, "
+        + f"review-worker minutes {(review_seconds + 30) // 60}, "
         + f"ux check minutes {(ux_check_seconds + 30) // 60}, "
         + f"ux repair minutes {(ux_repair_seconds + 30) // 60}"
     )
@@ -4865,7 +4867,7 @@ def _build_parser() -> argparse.ArgumentParser:
     review_trial = subparsers.add_parser(
         "review-trial",
         help="one line for the checkpoint notice: the phase's ux and craft finding "
-        + "counts and its review-seat minutes",
+        + "counts and its review-worker minutes",
     )
     _ = review_trial.add_argument("--session-dir", required=True)
     _ = review_trial.add_argument("--phase-id", default="")

@@ -269,7 +269,7 @@ class MachineRestartResult:
     label: str
     status: Literal["done", "partial", "nothing"]
     restarted: int = 0
-    seats: int = 0
+    workers: int = 0
     manual: int = 0
     failed: int = 0
     failed_sessions: tuple[FailedSessionRestart, ...] = ()
@@ -653,8 +653,8 @@ def _unit_argv(record: SessionShutdown) -> list[str]:
     # The Units row first: a brief unit's row names its stub plan before any run record exists.
     row_plan = _units_row_plan(host["doc"], host["unit"])
     plan_arguments: list[str]
-    if row_plan == "standby":
-        plan_arguments = ["--standby"]
+    if row_plan in ("standby", "permanent"):
+        plan_arguments = ["--" + row_plan]
     elif row_plan:
         plan_arguments = ["--plan", row_plan]
     elif recorded_plan["kind"] == "plan":
@@ -990,7 +990,7 @@ def _herdr_launch(parts: ResumeParts, session: Session, *, dry_run: bool) -> Non
         return
     _record_scheduled_restart_prompt(session["session_id"], parts.opening_prompt, dry_run=False)
     try:
-        from scripts.accounts.accounts import ClaudeLaunchAccount, DefaultAccount, NamedAccount
+        from scripts.accounts.accounts import ClaudeLaunchAccount, DefaultAccount, NamedAccount, trust_command
 
         config_dir = parts.account.config_dir
         claude_json = (Path.home() / ".claude.json" if config_dir == Path.home() / ".claude"
@@ -1003,7 +1003,7 @@ def _herdr_launch(parts: ResumeParts, session: Session, *, dry_run: bool) -> Non
             )
             reason = (str(trust) if isinstance(trust, herdr.UnreadableTrustFile)
                       else f"{parts.cwd}: Claude has not trusted this folder")
-            raise OSError(f"{reason}. Run: {herdr.trust_command(Path(parts.cwd), account)}")
+            raise OSError(f"{reason}. Run: {trust_command(Path(parts.cwd), account)}")
         herdr.start_server(name, 90_000)
         client = herdr.Herdr(name)
         agents = client.agents()
@@ -1557,7 +1557,7 @@ def _machine_result(records: list[SessionShutdown], machine: str, label: str) ->
         machine, label, "partial" if failed or manual or pending or any(
             item["progress"]["kind"] != "restarted" for item in records
         ) else "done",
-        restarted=restarted, seats=sum(len(item["seats"]) for item in records if item["progress"]["kind"] == "restarted"),
+        restarted=restarted, workers=sum(len(item["seats"]) for item in records if item["progress"]["kind"] == "restarted"),
         failed=len(failed), manual=len(manual), failed_sessions=failed,
         manual_sessions=manual, timers_not_started=pending,
     )
@@ -1571,8 +1571,8 @@ def _result_lines(result: MachineRestartResult) -> list[str]:
     if result.status == "nothing":
         return []
     lines = [
-        "{}: {} restarted, {} seats available on demand".format(
-            result.machine, result.restarted, result.seats
+        "{}: {} restarted, {} workers available on demand".format(
+            result.machine, result.restarted, result.workers
         )
     ]
     lines.extend(

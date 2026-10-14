@@ -150,7 +150,7 @@ export AGENT_NOTES_DIR="$TEST_DIR/notes"
 
 CODEX_HOME="$TEST_DIR/caller" bash "$SCRIPT_DIR/agent_exec.sh" \
     codex_case.task write "$WORKING_DIR" "$PROMPT_FILE" "$OUTPUT_FILE" "$LOG_FILE"
-assert_equal "unassigned seats did not use the default home" "$HOME/.codex" "$(cat "$TEST_CODEX_HOME_FILE")"
+assert_equal "unassigned workers did not use the default home" "$HOME/.codex" "$(cat "$TEST_CODEX_HOME_FILE")"
 assert_equal "fallback lost its prompt" "test prompt" "$(cat "$TEST_CODEX_PROMPT_FILE")"
 
 python3 - "$HOME/.codex1/auth.json" "$AGENT_NOTES_DIR/codex 1.md" <<'PY'
@@ -158,7 +158,7 @@ import base64
 import json
 import sys
 from pathlib import Path
-login = "seats@example.invalid"
+login = "workers@example.invalid"
 claims = base64.urlsafe_b64encode(json.dumps({"email": login}).encode()).decode().rstrip("=")
 _ = Path(sys.argv[1]).write_text(json.dumps({"tokens": {"id_token": f"header.{claims}.signature"}}))
 _ = Path(sys.argv[2]).write_text(f"---\nlogin: {login}\n---\n")
@@ -166,6 +166,6 @@ PY
 python3 "$SCRIPT_DIR/../accounts/accounts.py" set-role seats "codex 1"
 CODEX_HOME="$TEST_DIR/caller" bash "$SCRIPT_DIR/agent_exec.sh" \
     codex_case.task write "$WORKING_DIR" "$PROMPT_FILE" "$OUTPUT_FILE" "$LOG_FILE"
-assert_equal "fallback followed its caller instead of the seats role" "$HOME/.codex1" "$(cat "$TEST_CODEX_HOME_FILE")"
+assert_equal "fallback followed its caller instead of the workers role" "$HOME/.codex1" "$(cat "$TEST_CODEX_HOME_FILE")"
 
 echo "agent_exec tests passed"

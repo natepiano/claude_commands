@@ -16,11 +16,12 @@ import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import TypedDict, cast, final, override
+from typing import ClassVar, TypedDict, cast, final, override
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import add_unit
+from cli_fixture import ImmutableGitSeed, invoke_cli
 import conversation_pause
 import launch_permission
 import unit_lookup
@@ -34,6 +35,7 @@ from test_support import ShutdownTestCase
 
 # Script completion deadlines only bound hangs; startup can be slow under load.
 SCRIPT = Path(__file__).with_name("add_unit.py")
+REAL_WORKTREE_IS_LINKED = add_unit.worktree_is_linked
 MARKED_TMUX_PLACE = unit_lookup.TmuxPlace("%7")
 OLD_HEADER = ["## Units", "| Unit | Plan | Worktree | Branch | Session | Port | Owns |",
               "| --- | --- | --- | --- | --- | --- | --- |"]
@@ -115,6 +117,15 @@ def setUpModule() -> None:
 
 @final
 class AddUnitTests(ShutdownTestCase):
+    seed: ClassVar[ImmutableGitSeed]
+
+    @classmethod
+    @override
+    def setUpClass(cls) -> None:
+        super().setUpClass()
+        root = Path(cls.enterClassContext(tempfile.TemporaryDirectory(prefix="AddUnitTests-seed-")))
+        cls.seed = ImmutableGitSeed.create(root, 'build-followups', 'Unit Test', 'unit@example.invalid', {})
+
     def __init__(self, methodName: str = "runTest") -> None:
         super().__init__(methodName)
         self.root = Path()
@@ -143,13 +154,8 @@ class AddUnitTests(ShutdownTestCase):
         ))
         del home_context
         self.checkout = self.root / "project-trunk"
-        self.checkout.mkdir()
         self.origin = self.root / "origin.git"
-        _ = self.git("init", "--bare", str(self.origin), cwd=self.root)
-        _ = self.git("init", "-b", "build-followups")
-        _ = self.git("config", "user.name", "Unit Test")
-        _ = self.git("config", "user.email", "unit@example.invalid")
-        _ = self.git("remote", "add", "origin", str(self.origin))
+        self.seed.copy_to(self.checkout, self.origin)
         self.doc = self.checkout / "docs/plans/build-followups-production.md"
         _ = self.doc.parent.mkdir(parents=True)
         _ = self.doc.write_text(self.production_doc(), encoding="utf-8")
@@ -355,13 +361,19 @@ class AddUnitTests(ShutdownTestCase):
         self.assertEqual(result.returncode, 0, (args, result.stdout, result.stderr))
         return result.stdout.strip()
 
-    def cli(self, *args: str, timeout: float = 300) -> subprocess.CompletedProcess[str]:
-        return subprocess.run([sys.executable, str(SCRIPT), "--production", str(self.doc), *args],
-                              cwd=self.checkout, env=self.env, capture_output=True, text=True,
-                              check=False, timeout=timeout)
+    def cli(self, *args: str, timeout: float = 300, subprocess_cli: bool = False) -> subprocess.CompletedProcess[str]:
+        arguments = ["--production", str(self.doc), *args]
+        if subprocess_cli:
+            return subprocess.run([sys.executable, str(SCRIPT), *arguments], cwd=self.checkout,
+                                  env=self.env, capture_output=True, text=True, check=False, timeout=timeout)
+        # The row-reader fixture patch never reached the old CLI child. Preserve
+        # the real worktree check on this command boundary too.
+        with patch.object(add_unit, "worktree_is_linked", REAL_WORKTREE_IS_LINKED):
+            return invoke_cli(add_unit, lambda: add_unit.main(arguments), arguments,
+                              self.env, self.checkout, production_state=True)
 
-    def successful(self, *args: str) -> subprocess.CompletedProcess[str]:
-        result = self.cli(*args)
+    def successful(self, *args: str, subprocess_cli: bool = False) -> subprocess.CompletedProcess[str]:
+        result = self.cli(*args, subprocess_cli=subprocess_cli)
         self.assertEqual(result.returncode, 0, (result.stdout, result.stderr))
         return result
 
@@ -736,34 +748,6 @@ class AddUnitTests(ShutdownTestCase):
         self.assert_no_launch_change(document, head)
 
     def test_restart_restore_is_allowed_for_its_restarting_unit(self) -> None:
-        self.commit_prepared_row(self.unit_row())
-        self.write_shutdown_record(self.shutdown_record("restarting"))
-        prior = self.root / "prior-session"
-        prior.mkdir()
-        note = self.root / "restart-note.txt"
-        _ = note.write_text("Resume this unit.", encoding="utf-8")
-
-        result = self.successful(
-            "alpha",
-            "--plan",
-            "docs/plans/given.md",
-            "--resume",
-            "session-123",
-            "--cwd",
-            str(prior),
-            "--restart-note",
-            str(note),
-            "--session-name",
-            "recorded-name",
-            "--host-session",
-            "recorded-tmux",
-        )
-
-        self.assertIn("alpha-unit restore launched", result.stdout)
-        self.assertEqual(len(self.events("systemd-run")), 1)
-        self.assertEqual(len(self.recorded_prompts("session-123")), 1)
-
-    def test_host_session_flag_restores_the_recorded_unit_session(self) -> None:
         self.commit_prepared_row(self.unit_row())
         self.write_shutdown_record(self.shutdown_record("restarting"))
         prior = self.root / "prior-session"
@@ -1222,10 +1206,10 @@ class AddUnitTests(ShutdownTestCase):
     def test_resume_from_a_brief_is_refused(self) -> None:
         result = self.cli("alpha", "--brief", "Do it.", "--resume", "session-123", "--cwd", str(self.root))
         self.assertNotEqual(result.returncode, 0)
-        self.assertIn("--resume requires --plan or --standby", result.stdout + result.stderr)
+        self.assertIn("--resume requires --plan, --standby, or --permanent", result.stdout + result.stderr)
 
     def test_standby_launch_records_state_without_writing_a_plan(self) -> None:
-        _ = self.successful("alpha", "--standby", "--port", "8123", "--owns", "src/alpha")
+        _ = self.successful("alpha", "--standby", "--port", "8123", "--owns", "src/alpha", subprocess_cli=True)
         worktree = self.root / "project-alpha"
         self.assertIn(self.unit_row(plan="standby", port="8123", owns="src/alpha"),
                       self.doc.read_text())
@@ -1251,6 +1235,33 @@ class AddUnitTests(ShutdownTestCase):
         self.assert_director_flags("opus", "xhigh")
         self.assertRegex(self.log.read_text(),
                          r"^- \d\d:\d\d PDT: added alpha-unit \(standby\), worktree ")
+
+    def test_permanent_launch_writes_a_permanent_row_and_says_wrap_keeps_it(self) -> None:
+        _ = self.successful("alpha", "--permanent")
+        self.assertIn(self.unit_row(plan="permanent"), self.doc.read_text())
+        self.assertEqual(self.git("log", "-1", "--format=%s"),
+                         "production(build-followups): add unit alpha-unit (permanent)")
+        tmux = next(record for record in self.events("tmux")
+                    if cast(list[str], record["args"])[:1] == ["new-session"])
+        self.assertIn("on standby. You are permanent: wrap never retires you. Work only in your worktree",
+                      cast(list[str], tmux["args"])[-1])
+
+    def test_the_nightly_review_unit_runs_from_rust_under_the_review_settings(self) -> None:
+        profile = add_unit.launch_profile("nightly-review-unit")
+        assert isinstance(profile, add_unit.ProfiledLaunch)
+        self.assertEqual(profile.cwd, Path.home() / "rust")
+        settings = profile.flags[profile.flags.index("--settings") + 1]
+        self.assertEqual(Path(settings), Path(add_unit.__file__).resolve().parents[1] / "nightly_review/settings.json")
+        self.assertIn("/etc/nixos", profile.flags)
+        self.assertIsInstance(add_unit.launch_profile("alpha-unit"), add_unit.StandardLaunch)
+
+    def test_adopt_refuses_a_plan_or_a_resume(self) -> None:
+        for args in (("--plan", "docs/plans/given.md", "--adopt", "nightly-review"),
+                     ("--standby", "--adopt", "nightly-review", "--resume", "session-123", "--cwd", str(self.root))):
+            with self.subTest(args=args):
+                result = self.cli("alpha", *args)
+                self.assertEqual(result.returncode, 2, (result.stdout, result.stderr))
+                self.assertIn("--adopt takes --standby or --permanent", result.stderr)
 
     def test_standby_rejects_other_modes_before_any_change(self) -> None:
         original = self.doc.read_text()
@@ -1964,6 +1975,8 @@ class AddUnitTests(ShutdownTestCase):
             "plan": "docs/plans/given.md",
             "brief": None,
             "standby": False,
+            "permanent": False,
+            "adopt": None,
             "port": None,
             "owns": None,
             "timeout": 90.0,
@@ -2007,8 +2020,8 @@ class AddUnitTests(ShutdownTestCase):
         def request(name: str) -> tuple[str, str, Path, str]:
             launched = add_unit.launch_request(argparse.Namespace(
                 production=str(self.doc), name=name, plan="docs/plans/given.md", brief=None,
-                standby=False, port=None, owns=None, timeout=90.0, check=False, resume=None,
-                cwd=None, restart_note=None, session_name=None, host_session=None,
+                standby=False, permanent=False, adopt=None, port=None, owns=None, timeout=90.0, check=False,
+                resume=None, cwd=None, restart_note=None, session_name=None, host_session=None,
             ))
             return launched.unit, launched.branch, launched.worktree, launched.requested_name
 
@@ -2364,6 +2377,34 @@ class RetiredRowTests(ShutdownTestCase):
         with patch.object(unit_lookup, "marked_units", return_value={}):
             self.assertEqual(retired_units(lines, "show"), {"marked-unit", "gone-unit"})
             self.assertEqual([cell_value(cells["Unit"]) for cells in live_unit_table(lines, "show")], ["parked-unit"])
+
+
+class AdoptAccountTests(unittest.TestCase):
+    """An adopted session keeps the account it runs on, named by its configured label."""
+
+    def adopted(self, folder: Path, named: list[accounts.NamedAccount]) -> add_unit.Adoptable | add_unit.AlreadyAdopted:
+        claude = unit_lookup.LiveClaude("nightly-review", "sid", "/sock", 4242)
+        with patch.object(add_unit, "launched_unit", return_value=None), \
+             patch.object(unit_lookup, "every_marked_unit", return_value=unit_lookup.MarkedProductions({}, {})), \
+             patch.object(unit_lookup, "tmux_claude", return_value=claude), \
+             patch("scripts.whoami.account.process_config_dir", return_value=folder), \
+             patch.object(accounts, "main_config_dir", return_value=Path("/home/someone/.claude")), \
+             patch.object(accounts, "checked_named_accounts", return_value=named):
+            return add_unit.adoptable(cast(add_unit.RequestedUnitLaunch, cast(object, None)), "nightly-review")
+
+    def test_a_session_on_a_named_account_is_adopted_on_that_account(self) -> None:
+        three = accounts.NamedAccount("claude 3", Path("/home/someone/.claude3"))
+        adopted = self.adopted(three.dir, [accounts.NamedAccount("claude 1", Path("/home/someone/.claude1")), three])
+        self.assertEqual(cast(add_unit.Adoptable, adopted).account, three)
+
+    def test_a_session_on_the_main_folder_is_adopted_on_the_default_account(self) -> None:
+        adopted = self.adopted(Path("/home/someone/.claude"), [])
+        self.assertEqual(cast(add_unit.Adoptable, adopted).account, accounts.DefaultAccount())
+
+    def test_a_session_on_no_fit_account_is_refused(self) -> None:
+        with self.assertRaises(add_unit.Refusal) as refused:
+            _ = self.adopted(Path("/home/someone/.claude9"), [])
+        self.assertIn("runs on /home/someone/.claude9, which is no account fit to launch", str(refused.exception))
 
 
 if __name__ == "__main__":

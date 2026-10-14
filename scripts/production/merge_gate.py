@@ -270,6 +270,9 @@ def one_minute_load() -> float:
 def run_suites(repo: Path, memory_cap_mib: int = DEFAULT_MEMORY_CAP_MIB, type_dirs: Sequence[str] = ()) -> GateRun:
     if memory_cap_mib <= 0:
         raise GateRefused("memory cap must be positive")
+    absent = [name for name in type_dirs if not (repo / name).exists()]
+    if absent:
+        raise GateRefused(f"type dirs not found under {repo}: {', '.join(absent)}")
     modules = [(suite, path) for suite in TEST_SUITES
                for path in sorted((repo / "scripts" / suite).glob("test_*.py"))]
     missing = [suite for suite in TEST_SUITES if not any(name == suite for name, _ in modules)]
@@ -446,8 +449,10 @@ def rollback_merge(repo: Path, baseline: str) -> None:
 
 def merge_checkpoint(args: GateArguments) -> int:
     repo = Path(str(args.repo)).resolve()
-    if checked_git(repo, "status", "--porcelain", "--untracked-files=all"):
-        raise GateRefused("merge checkout is not clean")
+    # Untracked files (each showrunner's LOG) never block; a merge that would
+    # overwrite one fails on its own and is aborted.
+    if checked_git(repo, "status", "--porcelain", "--untracked-files=no"):
+        raise GateRefused("merge checkout has uncommitted tracked changes")
     if checked_git(repo, "branch", "--show-current") != args.merge_branch:
         raise GateRefused("checkout is not on the merge branch")
     fetch_branches(repo, args.merge_branch, args.unit_branch)

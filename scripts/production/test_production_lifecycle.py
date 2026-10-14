@@ -818,3 +818,17 @@ class LifecycleTests(unittest.TestCase):
 
 if __name__ == "__main__":
     _ = unittest.main()
+
+
+class PermanentUnitTests(unittest.TestCase):
+    def test_wrap_neither_waits_on_nor_retires_a_permanent_unit(self) -> None:
+        sys.path.insert(0, str(SCRIPT.parent))
+        import production_lifecycle
+        from add_unit import Production
+        from zoneinfo import ZoneInfo
+
+        lines = ["## Units", "", "| Unit | Plan | Worktree | Branch | Port | Owns |", "| --- | --- | --- | --- | --- | --- |",
+                 "| alpha-unit | docs/plans/alpha.md | /w/alpha | demo-alpha | — | — |",
+                 "| nightly-review-unit | permanent | /w/nightly | demo-nightly-review | — | — |", ""]
+        production = Production(Path("/c/docs/demo-production.md"), "demo", "demo", Path("/c"), Path("/c/log.md"), ZoneInfo("UTC"))
+        self.assertEqual([row.name for row in production_lifecycle.units(lines, production)], ["alpha-unit"])

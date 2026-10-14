@@ -291,7 +291,7 @@ A call is off host when the verb is not `project-of`, the short host name is not
 ```python
 RecordKind = Literal["phase", "asbuilt", "changelog", "tag", "merge", "commit"]
 Pool = Literal["structured", "commits"]
-ClaimState = Unclaimed | ClaimedBy          # ClaimedBy carries `seat`
+ClaimState = Unclaimed | ClaimedBy          # ClaimedBy carries `worker`
 ReviewOutcome = Undisposed | NoteOutcome | NoNoteOutcome
 # NoteOutcome: "represented" | "combined", with `note`
 # NoNoteOutcome: "internal" | "not-current" | "unresolved", with `reason`
@@ -328,7 +328,7 @@ Hana reads documents at `~/rust/hana_catalyst` `init/catalyst`, every merge of `
 | `collect --project P` | With a ledger present: reads it and prints. Otherwise collects outside the lock and writes only if the ledger is still absent. Prints each pool and kind beside the design's figure, and one `ref: <repo> <sha>` line per frozen tip. |
 | `next --project P --pool POOL [--kind K] [--path PREFIX…] [--claim NAME] [--limit N]` | Undisposed records, unclaimed or claimed by NAME, oldest first, as `<id> \| <date> \| <kind> \| <title> \| <source>`. `--path` matches a prefix of the source path; a sha source matches none. `--claim` stores `ClaimedBy(NAME)`. `--limit` defaults to 25; `0` lists all. |
 | `show ID` | The record as one JSON line, then its source text at the frozen ref: the block, the bullet under its version heading, the whole file, or `git show --stat`. |
-| `mark ID… [--ids-from FILE] [--seat NAME] --as D (--note TITLE \| --reason TEXT)` | `represented` and `combined` need `--note` naming an existing note file; `internal`, `not-current` and `unresolved` need `--reason`. A record claimed by another name is refused. Every ID is checked before any write. Re-marking replaces the outcome. |
+| `mark ID… [--ids-from FILE] [--worker NAME] --as D (--note TITLE \| --reason TEXT)` | `represented` and `combined` need `--note` naming an existing note file; `internal`, `not-current` and `unresolved` need `--reason`. A record claimed by another name is refused. Every ID is checked before any write. Re-marking replaces the outcome. |
 | `status --project P [--pool POOL]` | Counts per outcome, then the notes the ledger names. |
 
 Exits: `0` success; `1` from `status` while any selected record is undisposed; `2` for every refusal, with `inventory: <reason>` on stderr.
@@ -491,3 +491,5 @@ Changelog comparison for the 13 published crates:
 | `bevy_brp_mcp` | `match` on 1 bullet at bevy_brp `49089a51` |
 
 The 217 entries stay pending until each crate's release stamps them.
+
+Old claim records convert `seat` to `worker` once on their first ledger read. The CLI accepts only `--worker` when marking a claimed record.

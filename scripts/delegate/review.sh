@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 # review.sh — Invoke the configured delegate agent for a review.
 #
-# Usage: review.sh [--to <seat> | --slot <new-slot> | --pool <type> --lease <slug>/<unit>/<phase>] <session_dir>
+# Usage: review.sh [--to <worker> | --slot <new-slot> | --pool <type> --lease <slug>/<unit>/<phase>] <session_dir>
 #                  [working_dir] [prompt_file] [task]
 #                  [role_description] [pass_activity] [pass_index] [lens]
 #                  [early_ready_file]
-#   --to reuses an open Codex seat. --slot opens a role-named Codex seat for
+#   --to reuses an open Codex worker. --slot opens a role-named Codex worker for
 #   this review and leaves its thread open for later `--to` dispatches.
 #   role_description — 1-2 lines describing this review's responsibility,
 #   written as a header block into the shared heartbeat log
@@ -16,9 +16,9 @@
 #   lens — which reading this reviewer is doing, when a phase's broad review
 #   runs its three lenses at once: adversary, contract, or craft (code quality
 #   by the style guide). It suffixes every artifact below, so concurrent
-#   reviewers never overwrite each other, and it selects the seat the pass
-#   records under. The seat assignment is fixed, not meaningful.
-#   Empty is the single-reviewer layout: unsuffixed names, no seat, which is
+#   reviewers never overwrite each other, and it selects the worker the pass
+#   records under. The worker assignment is fixed, not meaningful.
+#   Empty is the single-reviewer layout: unsuffixed names, no worker, which is
 #   what a closure review and a solo broad review still run.
 #   early_ready_file — early-launch mode: the reviewer starts while the
 #   implementer is still running, so its start-pass is deferred until this
@@ -42,7 +42,7 @@
 #                                        start + [wrapper] beats every 60s, each
 #                                        carrying an activity digest decoded from
 #                                        the reviewer's streamed log. Fresh
-#                                        reviewers are read-only; seated reviewers
+#                                        reviewers are read-only; assigned reviewers
 #                                        are checked for an unchanged tree after
 #                                        their turn.
 #   <session_dir>/review_awake         — seconds the beat loop has counted for
@@ -60,7 +60,7 @@ POOL_TYPE=""
 POOL_LEASE=""
 while [[ "${1:-}" == --* ]]; do
   case "$1" in
-    --to) FOLLOW_TO="${2:?--to requires a seat}" ;;
+    --to) FOLLOW_TO="${2:?--to requires a worker}" ;;
     --slot) NEW_SLOT="${2:?--slot requires a slot}" ;;
     --pool) POOL_TYPE="${2:?--pool requires a type}" ;;
     --lease) POOL_LEASE="${2:?--lease requires slug/unit/phase}" ;;
@@ -116,12 +116,12 @@ case "${PASS_INDEX}" in
 esac
 
 # A closed set, like the pass kinds: an unrecognized lens would suffix artifacts
-# nobody reads and record a pass under a seat no column renders, both silently.
+# nobody reads and record a pass under a worker no column renders, both silently.
 case "${LENS}" in
   '') LENS_SLOT='' ;;
   adversary) LENS_SLOT=test ;;
   contract) LENS_SLOT=impl ;;
-  # No writer sits in `review` since the three-seat team was folded into two,
+  # No writer sits in `review` since the three-worker team was folded into two,
   # so the third lens takes it and its pass never closes a writer's window.
   craft) LENS_SLOT=review ;;
   ux) LENS_SLOT=review ;;
@@ -140,13 +140,13 @@ if [[ "${POOL_TYPE}" == code && "${LENS}" == ux ]]; then
   exit 2
 fi
 
-# A seated pass belongs to the chair that actually ran it, not to the lens's
-# historical default chair. Seat names end in their semantic slot (`impl`,
+# A assigned pass belongs to the chair that actually ran it, not to the lens's
+# historical default chair. Worker names end in their semantic slot (`impl`,
 # `test`, `review`, `fix2`); solo reviewers retain the lens mapping above.
 if [[ -n "${FOLLOW_TO}" ]]; then
   TEAM_SLOT="${FOLLOW_TO##*-}"
   if [[ ! "${TEAM_SLOT}" =~ ^[A-Za-z0-9][A-Za-z0-9_-]{0,31}$ ]]; then
-    echo "ERROR: cannot derive a valid team slot from review seat '${FOLLOW_TO}'." >&2
+    echo "ERROR: cannot derive a valid team slot from review worker '${FOLLOW_TO}'." >&2
     exit 2
   fi
 elif [[ -n "${NEW_SLOT}" ]]; then
@@ -163,20 +163,20 @@ SUFFIX="${LENS:+_${LENS}}"
 # What the shared heartbeat log tags this reviewer's beats with. Three lenses
 # run at once against one log, and `review` on every line cannot be read.
 BEAT_TAG="${SUBTASK}${LENS:+:${LENS}}"
-# The seat this pass records under, so concurrent reviewers key separate pass
+# The worker this pass records under, so concurrent reviewers key separate pass
 # records instead of each closing the last as interrupted. Exported even when the
-# lens is absent and the seat with it: the lens decides this launcher's seat, and
+# lens is absent and the worker with it: the lens decides this launcher's worker, and
 # leaving the variable unset instead would let an inherited one decide it, which
-# is how a lone reviewer ends up closing a live seat's pass.
+# is how a lone reviewer ends up closing a live worker's pass.
 export PLAN_DELEGATE_TEAM_ROLE="${TEAM_SLOT}"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 if [[ -n "${FOLLOW_TO}" ]]; then
-  REVIEW_SEAT="${FOLLOW_TO}"
+  REVIEW_WORKER="${FOLLOW_TO}"
 elif [[ -n "${NEW_SLOT}" ]]; then
-  REVIEW_SEAT="$(bash "${SCRIPT_DIR}/seat_name.sh" "${WORKING_DIR}" "${NEW_SLOT}" review)"
+  REVIEW_WORKER="$(bash "${SCRIPT_DIR}/worker_name.sh" "${WORKING_DIR}" "${NEW_SLOT}" review)"
 else
-  REVIEW_SEAT=""
+  REVIEW_WORKER=""
 fi
 
 # python3 goes through the repo shim, which picks an interpreter by VERSION
@@ -220,7 +220,7 @@ initialize_review_artifacts() {
   ln -sfn "review_findings_${PASS_INDEX}${SUFFIX}.txt" "${SESSION_DIR}/review_findings${SUFFIX}.txt"
   ln -sfn "review_agent_${PASS_INDEX}${SUFFIX}.log" "${SESSION_DIR}/review_agent${SUFFIX}.log"
   rm -f "${AWAKE_FILE}" "${REPLY_FILE}"
-  if [[ -n "${REVIEW_SEAT}" ]]; then
+  if [[ -n "${REVIEW_WORKER}" ]]; then
     : > "${FINDINGS_FILE}"
     TURN_FINDINGS_READY=1
   fi
@@ -242,22 +242,22 @@ awake_seconds() {
   esac
 }
 
-# A seated reviewer opens a new occupancy of a chair a writer has just left.
+# A assigned reviewer opens a new occupancy of a chair a writer has just left.
 # Without a line of its own the note under the progress table keeps showing the
 # words of the delegate that sat there while the code was being written, aged by
 # however long the review has run -- a line describing the wrong agent, which
-# reads as a stalled one. A lone reviewer holds no seat and posts nothing.
+# reads as a stalled one. A lone reviewer holds no worker and posts nothing.
 # A fresh blind reviewer has no peers and no address, so its line says
-# `mesh=none`. A seated review names the reused mesh address instead.
+# `mesh=none`. A assigned review names the reused mesh address instead.
 board_post() {
   [[ -n "${TEAM_SLOT}" ]] || return 0
   bash "${BOARD_HELPER}" post "${SESSION_DIR}" "${TEAM_SLOT}" "$1" "$2" || true
 }
 
-# A solo review creates its artifacts before agent resolution. A seated review
-# claims first, so a busy-seat refusal cannot overwrite another review's status
+# A solo review creates its artifacts before agent resolution. A assigned review
+# claims first, so a busy-worker refusal cannot overwrite another review's status
 # or findings.
-if [[ -z "${REVIEW_SEAT}" && -z "${POOL_TYPE}" ]]; then
+if [[ -z "${REVIEW_WORKER}" && -z "${POOL_TYPE}" ]]; then
   initialize_review_artifacts
 fi
 
@@ -290,8 +290,10 @@ def post(message):
         text=True,
     )
 
-with (root / "impl_seat_claim.lock").open("a+") as lock:
-    fcntl.flock(lock, fcntl.LOCK_EX)
+sys.path.insert(0, str(Path(mesh_script).parent.parent / "delegate"))
+from worker_state import worker_claim_lock
+
+with worker_claim_lock(root):
     entry = read_roster().get(name, {})
     context_tokens = entry.get("context_tokens") if isinstance(entry, dict) else None
     if isinstance(context_tokens, int) and context_tokens > compact_above:
@@ -306,11 +308,11 @@ with (root / "impl_seat_claim.lock").open("a+") as lock:
         else:
             detail = (compact.stderr.strip() or compact.stdout.strip()
                       or f"exit {compact.returncode}").splitlines()[-1]
-            # Exit 3: a turn is still live on the seat's thread, so a follow-up would be refused.
+            # Exit 3: a turn is still live on the worker's thread, so a follow-up would be refused.
             if compact.returncode == 3:
                 post(f"launcher: {name} still has a live turn after compaction: {detail}; "
                      "follow-up not sent")
-                print(f"review.sh: {name} still has a live turn after compaction; end the seat "
+                print(f"review.sh: {name} still has a live turn after compaction; end the worker "
                       f"(codex_mesh.py end --to {name}) and start a fresh one", file=sys.stderr)
                 raise SystemExit(2)
             post(f"launcher: compaction failed for {name}: {detail}; continuing follow-up")
@@ -397,34 +399,35 @@ capture_tree_baseline() {
   TREE_BASELINE_READY=1
 }
 
-record_new_seat_identity() {
-  "$PY" - "${SESSION_DIR}" "${TEAM_SLOT}" "${REVIEW_SEAT}" \
-    "${AGENT_FAMILY}" "${DURABLE_SEAT_MODEL}" <<'PY'
+record_new_worker_identity() {
+  "$PY" - "${SESSION_DIR}" "${TEAM_SLOT}" "${REVIEW_WORKER}" \
+    "${AGENT_FAMILY}" "${DURABLE_WORKER_MODEL}" "${SCRIPT_DIR}" <<'PY'
 import fcntl
 import json
 import sys
 from pathlib import Path
 
-root_text, slot, name, family, model = sys.argv[1:]
+root_text, slot, name, family, model, helper_dir = sys.argv[1:]
+sys.path.insert(0, helper_dir)
+from worker_state import worker_claim_lock
 root = Path(root_text)
-with (root / "impl_seat_claim.lock").open("a+") as lock:
-    fcntl.flock(lock, fcntl.LOCK_EX)
+with worker_claim_lock(root):
     try:
         roster = json.loads((root / "mesh_roster.json").read_text())
     except (OSError, ValueError):
         roster = {}
     entry = roster.get(name, {}) if isinstance(roster, dict) else {}
-    seat_id = entry.get("thread_id", "") if isinstance(entry, dict) else ""
-    if not isinstance(seat_id, str) or not seat_id:
+    worker_id = entry.get("thread_id", "") if isinstance(entry, dict) else ""
+    if not isinstance(worker_id, str) or not worker_id:
         raise SystemExit(1)
     identity = {
         "name": name,
         "slot": slot,
         "family": family,
         "model": model,
-        "seat_id": seat_id,
+        "worker_id": worker_id,
     }
-    (root / f"impl_seat_{slot}.json").write_text(json.dumps(identity))
+    (root / f"impl_worker_{slot}.json").write_text(json.dumps(identity))
 PY
 }
 
@@ -463,7 +466,7 @@ PY
 }
 
 refresh_turn_thread_id() {
-  TURN_THREAD_ID="$("$PY" - "${MESH_SESSION_DIR}" "${REVIEW_SEAT}" \
+  TURN_THREAD_ID="$("$PY" - "${MESH_SESSION_DIR}" "${REVIEW_WORKER}" \
     "${TURN_THREAD_ID}" "${TURN_PROGRESS}" <<'PY'
 import json
 import sys
@@ -480,7 +483,7 @@ PY
 
 write_turn_record() {
   "$PY" - "${SESSION_DIR}" "${TURN_STARTED_AT}" "$$" "${TURN_RECORD_STATUS}" \
-    "${POOL_TYPE}" "${POOL_PRODUCTION}" "${REVIEW_SEAT}" "${TURN_THREAD_ID}" \
+    "${POOL_TYPE}" "${POOL_PRODUCTION}" "${REVIEW_WORKER}" "${TURN_THREAD_ID}" \
     "${TURN_LEASE}" "${TURN_PROGRESS}" "${LENS}" "${PASS_INDEX}" \
     "${LEASE_ORDINAL}" "${PRIME_HASH}" "${TURN_RAISED}" <<'PY'
 import json
@@ -532,7 +535,7 @@ finish_review_exit() {
   fi
   if [[ "${POOL_ALLOCATED}" -eq 1 ]]; then
     "$PY" "${POOL_HELPER}" release --production "${POOL_PRODUCTION}" \
-      --reviewer "${REVIEW_SEAT}" --pid "$$" --thread-id "${TURN_THREAD_ID}" >>"${LOG_FILE}" 2>&1
+      --reviewer "${REVIEW_WORKER}" --pid "$$" --thread-id "${TURN_THREAD_ID}" >>"${LOG_FILE}" 2>&1
   fi
   if [[ -n "${POOL_PROMPT_FILE}" ]]; then
     rm -f "${POOL_PROMPT_FILE}"
@@ -590,27 +593,27 @@ fi
 
 source "${SCRIPT_DIR}/../agents/agents_config.sh"
 if ! agents_resolve "${TASK}" 2>"${LOG_FILE}"; then
-  if [[ -z "${REVIEW_SEAT}" ]]; then
+  if [[ -z "${REVIEW_WORKER}" ]]; then
     echo "error" > "${STATUS_FILE}"
   fi
   exit 1
 fi
 
 # implement.sh anchors a durable Codex identity to the implementation model
-# configured when that seat first opens. A seat opened by review.sh must use
+# configured when that worker first opens. A worker opened by review.sh must use
 # the same anchor even though this turn runs the review model; otherwise the
 # first role switch back to implementation rejects its own retained thread.
-DURABLE_SEAT_MODEL="${AGENT_MODEL}"
+DURABLE_WORKER_MODEL="${AGENT_MODEL}"
 if [[ -n "${NEW_SLOT}" ]]; then
   IMPLEMENTATION_PAIR="$(_agents_registry_get "delegate.${AGENT_FAMILY}" implementation)"
   if [[ -z "${IMPLEMENTATION_PAIR}" ]]; then
     IMPLEMENTATION_PAIR="$(_agents_registry_get "delegate.${AGENT_FAMILY}" impl)"
   fi
   if [[ -z "${IMPLEMENTATION_PAIR}" ]]; then
-    echo "ERROR: cannot record review seat ${REVIEW_SEAT}: no implementation model is configured." >&2
+    echo "ERROR: cannot record review worker ${REVIEW_WORKER}: no implementation model is configured." >&2
     exit 2
   fi
-  DURABLE_SEAT_MODEL="${IMPLEMENTATION_PAIR%%:*}"
+  DURABLE_WORKER_MODEL="${IMPLEMENTATION_PAIR%%:*}"
 fi
 
 TREE_BASELINE_READY=0
@@ -656,14 +659,14 @@ if [[ -n "${POOL_TYPE}" ]]; then
     "$PY" -c 'import json, sys; print(json.loads(sys.argv[1])[sys.argv[2]])' \
       "${POOL_ALLOCATION}" "$1"
   }
-  REVIEW_SEAT="$(allocation_field reviewer)"
+  REVIEW_WORKER="$(allocation_field reviewer)"
   POOL_ALLOCATED=1
-  FOLLOW_TO="${REVIEW_SEAT}"
+  FOLLOW_TO="${REVIEW_WORKER}"
   MESH_SESSION_DIR="$(allocation_field mesh_dir)"
   TURN_THREAD_ID="$(allocation_field thread_id)"
   LEASE_ORDINAL="$(allocation_field lease_ordinal)"
   PRIME_HASH="$(allocation_field prime_hash)"
-  TEAM_SLOT="pool_${REVIEW_SEAT}"
+  TEAM_SLOT="pool_${REVIEW_WORKER}"
   printf '%s\n' "${TEAM_SLOT}" > "${SLOT_FILE}"
   export PLAN_DELEGATE_TEAM_ROLE="${TEAM_SLOT}"
   if [[ "${POOL_TYPE}" == ui || "${LEASE_ORDINAL}" -eq 1 ]]; then
@@ -681,10 +684,10 @@ if [[ -n "${POOL_TYPE}" ]]; then
   fi
 fi
 
-if [[ -n "${REVIEW_SEAT}" ]]; then
+if [[ -n "${REVIEW_WORKER}" ]]; then
   CODEX_MESH="${PLAN_DELEGATE_CODEX_MESH:-$(_agents_registry_get delegate.options codex_mesh)}"
   if [[ "${AGENT_FAMILY}" != "codex" || "${CODEX_MESH}" != "1" ]]; then
-    echo "ERROR: review seat ${REVIEW_SEAT} is not available through the Codex mesh." >&2
+    echo "ERROR: review worker ${REVIEW_WORKER} is not available through the Codex mesh." >&2
     exit 2
   fi
   if [[ -n "${FOLLOW_TO}" ]]; then
@@ -715,12 +718,12 @@ fi
 printf 'task=%s\nfamily=%s\nagent=%s\neffort=%s\n' \
   "${TASK}" "${AGENT_FAMILY}" "${AGENT_MODEL}" "${AGENT_EFFORT}" > "${AGENT_FILE}"
 
-if [[ -n "${REVIEW_SEAT}" ]]; then
-  MESH_FIELD="mesh=${REVIEW_SEAT}; reach=codex_mesh.py"
+if [[ -n "${REVIEW_WORKER}" ]]; then
+  MESH_FIELD="mesh=${REVIEW_WORKER}; reach=codex_mesh.py"
   if [[ -n "${FOLLOW_TO}" ]]; then
-    LAUNCH_NOTE="follow-up to ${REVIEW_SEAT}"
+    LAUNCH_NOTE="follow-up to ${REVIEW_WORKER}"
   else
-    LAUNCH_NOTE="new seat ${REVIEW_SEAT}"
+    LAUNCH_NOTE="new worker ${REVIEW_WORKER}"
   fi
 else
   MESH_FIELD="mesh=none"
@@ -771,7 +774,7 @@ if [[ -n "${FOLLOW_TO}" ]]; then
     --service-tier "${AGENT_SERVICE_TIER:-}" &
 elif [[ -n "${NEW_SLOT}" ]]; then
   "$PY" "${SCRIPT_DIR}/../agents/codex_mesh.py" start \
-    --session-dir "${SESSION_DIR}" --name "${REVIEW_SEAT}" --role review "${LENS_ARGS[@]}" \
+    --session-dir "${SESSION_DIR}" --name "${REVIEW_WORKER}" --role review "${LENS_ARGS[@]}" \
     --cwd "${WORKING_DIR}" --prompt-file "${PROMPT_FILE}" \
     --summary-file "${FINDINGS_FILE}" --reply-file "${REPLY_FILE}" \
     --log-file "${LOG_FILE}" --model "${AGENT_MODEL}" \
@@ -794,7 +797,7 @@ if [[ -n "${EARLY_READY_FILE}" ]]; then
   # The implementation pass is open until the sentinel appears; starting the
   # review pass before then would close it as interrupted.
   while kill -0 "${AGENT_PID}" 2>/dev/null && [[ ! -e "${EARLY_READY_FILE}" ]]; do
-    sleep 5
+    sleep "${PLAN_DELEGATE_EARLY_POLL_SECS:-5}"
   done
   if [[ -e "${EARLY_READY_FILE}" && "${TREE_BASELINE_READY}" -eq 0 ]]; then
     capture_tree_baseline
@@ -815,8 +818,8 @@ fi
 AGENT_CODE=0
 wait "${AGENT_PID}" || AGENT_CODE=$?
 
-if [[ -n "${NEW_SLOT}" ]] && ! record_new_seat_identity; then
-  echo "ERROR: review seat ${REVIEW_SEAT} has no durable seat identity." >&2
+if [[ -n "${NEW_SLOT}" ]] && ! record_new_worker_identity; then
+  echo "ERROR: review worker ${REVIEW_WORKER} has no durable worker identity." >&2
   AGENT_CODE=1
 fi
 
@@ -825,7 +828,7 @@ wait "${HEARTBEAT_LOOP_PID}" 2>/dev/null || true
 
 TREE_CHANGED=0
 CHANGED_PATHS=""
-if [[ -n "${REVIEW_SEAT}" && "${TREE_BASELINE_READY}" -eq 1 ]]; then
+if [[ -n "${REVIEW_WORKER}" && "${TREE_BASELINE_READY}" -eq 1 ]]; then
   TREE_HEAD_AFTER="$(tree_head)"
   TREE_STATUS_AFTER="$(tree_status)"
   TREE_DIFF_HASH_AFTER="$(tree_diff_hash)"
@@ -845,7 +848,7 @@ if [[ -n "${REVIEW_SEAT}" && "${TREE_BASELINE_READY}" -eq 1 ]]; then
       "${TREE_PATHS_BEFORE}" "${TREE_PATHS_AFTER}" "${HEAD_CHANGED_PATHS}" |
       sed '/^$/d' | LC_ALL=C sort -u | tr '\n' ' ' | sed 's/[[:space:]]*$//')"
     [[ -n "${CHANGED_PATHS}" ]] || CHANGED_PATHS="working tree state changed"
-    echo "ERROR: review seat ${REVIEW_SEAT} changed the working tree: ${CHANGED_PATHS}" >&2
+    echo "ERROR: review worker ${REVIEW_WORKER} changed the working tree: ${CHANGED_PATHS}" >&2
   fi
 fi
 
@@ -896,13 +899,13 @@ else
   fi
   if [[ "${TREE_CHANGED}" -eq 1 ]]; then
     bash "${HEARTBEAT_HELPER}" "${HEARTBEAT_FILE}" wrapper \
-      "${BEAT_TAG} review seat ${REVIEW_SEAT} changed the working tree: ${CHANGED_PATHS}" || true
+      "${BEAT_TAG} review worker ${REVIEW_WORKER} changed the working tree: ${CHANGED_PATHS}" || true
     board_post blocked \
-      "launcher: review seat ${REVIEW_SEAT} changed the working tree: ${CHANGED_PATHS}; findings kept in review_findings_${PASS_INDEX}${SUFFIX}.txt"
+      "launcher: review worker ${REVIEW_WORKER} changed the working tree: ${CHANGED_PATHS}; findings kept in review_findings_${PASS_INDEX}${SUFFIX}.txt"
     exit 1
   fi
   bash "${HEARTBEAT_HELPER}" "${HEARTBEAT_FILE}" wrapper "${BEAT_TAG} agent exited with code ${AGENT_CODE}" || true
   board_post blocked \
-    "launcher: ${LENS} review exited with code ${AGENT_CODE}; this seat is down"
+    "launcher: ${LENS} review exited with code ${AGENT_CODE}; this worker is down"
   exit "${AGENT_CODE}"
 fi

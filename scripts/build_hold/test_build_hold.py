@@ -82,11 +82,6 @@ class IsolatedBuildHoldTest(unittest.TestCase):
                 self.assertFalse(thread.is_alive())
 
 
-class ImportTests(IsolatedBuildHoldTest):
-    def test_helper_imports_from_its_sibling_directory(self) -> None:
-        self.assertEqual(build_hold.__name__, "build_hold")
-
-
 class OwningSessionTests(IsolatedBuildHoldTest):
     active: Path = Path()
     delegate_run: Path = Path()
@@ -315,12 +310,12 @@ class HolderTests(IsolatedBuildHoldTest):
             folder = Path(scratch) / "holders"
             self.assertIsInstance(build_hold.read_holders(folder), build_hold.NoHolders)
             folder.mkdir()
-            _ = (folder / "old-seat").write_text("old seat, 2026-10-04T10:56:00-07:00, the focused test\n")
+            _ = (folder / "old-worker").write_text("old worker, 2026-10-04T10:56:00-07:00, the focused test\n")
             state = build_hold.read_holders(folder)
             self.assertIsInstance(state, build_hold.ActiveHolders)
             assert isinstance(state, build_hold.ActiveHolders)
             self.assertEqual(len(state.holders), 1)
-            self.assertEqual(state.holders[0].name, "old-seat")
+            self.assertEqual(state.holders[0].name, "old-worker")
             self.assertEqual(state.holders[0].since, datetime.fromisoformat("2026-10-04T10:56:00-07:00"))
             self.assertIn("the focused test", state.holders[0].purpose)
             self.assertIsInstance(state.holders[0].release, build_hold.UnknownReleaseEta)
@@ -3565,19 +3560,19 @@ class CallAdmissionTests(IsolatedBuildHoldTest):
 
     def test_session_registration_and_call_share_release_and_mark_advances_to_peer(self) -> None:
         _ = build_hold.register_wait("owner")
-        self.register("owner", "seat-call")
+        self.register("owner", "worker-call")
         self.register("peer", "peer-call")
         with mock.patch.object(build_hold, "send_release", return_value=build_hold.ReleaseDelivered()) as notification:
             self.advance()
             self.assertEqual(notification.call_count, 1)
             notified = cast(build_hold.ReleaseEntry, notification.call_args.args[0])
             self.assertEqual(notified["session_id"], "owner")
-        self.assertIsInstance(build_hold.read_admission("owner", "seat-call"), build_hold.AdmittedTurn)
+        self.assertIsInstance(build_hold.read_admission("owner", "worker-call"), build_hold.AdmittedTurn)
         self.assertIsInstance(build_hold.read_admission("owner"), build_hold.AdmittedTurn)
         self.assertIsInstance(build_hold.read_admission("peer", "peer-call"), build_hold.AwaitingTurn)
         entry = self.cycle()["entries"][0]
-        self.assertEqual(entry["active_call_id"], "seat-call")
-        _ = build_hold.mark_gate("owner", "MemoryGateReturned", "Granted", call_id="seat-call", cycle_id=self.cycle()["id"])
+        self.assertEqual(entry["active_call_id"], "worker-call")
+        _ = build_hold.mark_gate("owner", "MemoryGateReturned", "Granted", call_id="worker-call", cycle_id=self.cycle()["id"])
         self.assertEqual(self.cycle()["entries"][0]["state"], "MemoryGateReturned")
         self.now = datetime.now().astimezone() + timedelta(seconds=build_hold.RELEASE_SETTLE_S + 1)
         self.advance()
@@ -3589,11 +3584,11 @@ class CallAdmissionTests(IsolatedBuildHoldTest):
         self.advance()
         self.assertIn("NothingToBuild", build_hold.answer_nothing_to_build("owner"))
         before = self.cycle()
-        self.register("owner", "seat-call")
+        self.register("owner", "worker-call")
         self.assertEqual(self.cycle(), before)
-        self.assertIsInstance(build_hold.read_admission("owner", "seat-call"), build_hold.AdmittedTurn)
+        self.assertIsInstance(build_hold.read_admission("owner", "worker-call"), build_hold.AdmittedTurn)
         self.advance()
-        self.assertIsInstance(build_hold.read_admission("owner", "seat-call"), build_hold.AdmittedTurn)
+        self.assertIsInstance(build_hold.read_admission("owner", "worker-call"), build_hold.AdmittedTurn)
 
     def test_call_after_completed_turn_is_admitted_without_record_change(self) -> None:
         _ = build_hold.start_hold(self.scratch / "holders", build_hold.HolderIdentity("second", "second"), "another test", build_hold.NoReleaseEta(), self.now)
@@ -3699,12 +3694,12 @@ class CallAdmissionTests(IsolatedBuildHoldTest):
             self.assertFalse(build_hold.call_is_live(call))
 
     def test_session_mark_and_nothing_to_build_do_not_complete_active_call(self) -> None:
-        self.register("owner", "seat-call")
+        self.register("owner", "worker-call")
         self.advance()
         _ = build_hold.mark_gate("owner", "MemoryGateReturned", "Granted")
         _ = build_hold.answer_nothing_to_build("owner")
         entry = self.cycle()["entries"][0]
-        self.assertEqual(entry["active_call_id"], "seat-call")
+        self.assertEqual(entry["active_call_id"], "worker-call")
         self.assertNotEqual(entry["state"], "MemoryGateReturned")
         self.assertIsInstance(build_hold.read_admission("owner"), build_hold.AdmittedTurn)
 

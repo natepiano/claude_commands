@@ -447,7 +447,7 @@ else:
             record_store.NotReadyToStop(kind="not ready to stop", at=at, status="busy", progress="ready"),
             record_store.StillRunningAfterStop(kind="still running", at=at, reason="alive after two SIGTERMs"),
             record_store.AccountUnreadableAtStop(kind="account unreadable", at=at),
-            {"kind": "seat still live", "at": at},
+            {"kind": "worker still live", "at": at},
         ]
         remote_record = session_shutdown(machine="Mac", name="remote")
         remote_record["stop_issues"] = [
@@ -522,13 +522,13 @@ else:
                 observed = inventory.parse_session({**saved["session"], "status": "busy",
                     "checkout": {"kind": "git", "path": "/tmp/checkout", "head": {"kind": "branch", "name": "work"},
                                  "upstream": {"kind": "tracking", "ahead": 2}, "dirty": []},
-                    "codex_servers": [{"run_dir": "/tmp/run", "pid": 5000, "busy_seats": ["worker"]}]}, "observed")
+                    "codex_servers": [{"run_dir": "/tmp/run", "pid": 5000, "busy_workers": ["worker"]}]}, "observed")
                 report = empty_inventory()
                 report["sessions"] = [observed]
                 output = io.StringIO()
                 with patch.object(shutdown, "inventory", return_value=report), patch.object(settle, "_showing_form", return_value=True), patch.object(settle, "merge_in_progress", return_value=True), redirect_stdout(output):
                     self.assertEqual(shutdown.main(["status", LOGIN, "--here"]), 0)
-                self.assertIn(f"  {kind}: {kind} — busy, showing a form, ahead 2 on work, merge in progress, Codex seat worker is still running", output.getvalue())
+                self.assertIn(f"  {kind}: {kind} — busy, showing a form, ahead 2 on work, merge in progress, Codex worker worker is still running", output.getvalue())
                 record_store.archive_session(LOGIN, saved["session"]["session_id"])
 
     def test_status_keeps_unobserved_sessions_without_a_readiness_detail(self) -> None:
@@ -539,7 +539,7 @@ else:
             self.assertEqual(shutdown.main(["status", LOGIN, "--here"]), 0)
         self.assertIn("  missing: waiting\n", output.getvalue())
 
-    def test_status_usage_limit_held_owner_shows_busy_seat_without_form_and_offers_actions(self) -> None:
+    def test_status_usage_limit_held_owner_shows_busy_worker_without_form_and_offers_actions(self) -> None:
         saved = session_shutdown(name="Held")
         saved["progress"] = record_store.SessionHeldByUsageLimit(kind="held by usage limit", at=saved["requested_at"])
         saved["session"]["status"] = "idle"
@@ -552,7 +552,7 @@ else:
         output = io.StringIO()
         with patch.object(shutdown, "inventory", return_value=report), patch.object(settle, "_showing_form", return_value=True) as form, patch.object(settle, "merge_in_progress", return_value=False), redirect_stdout(output):
             self.assertEqual(shutdown.main(["status", LOGIN, "--here"]), 0)
-        self.assertIn("  Held: held by usage limit — Codex seat worker is still running\n", output.getvalue())
+        self.assertIn("  Held: held by usage limit — Codex worker worker is still running\n", output.getvalue())
         self.assertNotIn("showing a form", output.getvalue())
         form.assert_not_called()
         self.assertIn("  no conductor running; /shutdown --only <name> resumes one, /shutdown cancel --only <name> takes it out\n", output.getvalue())
@@ -560,7 +560,7 @@ else:
         self.assertIn("  stop now: /shutdown now --only <name> · Held\n", output.getvalue())
         self.assertNotIn("  bring back:", output.getvalue())
 
-    def test_status_reports_owned_busy_seats_and_a_queued_message_once(self) -> None:
+    def test_status_reports_owned_busy_workers_and_a_queued_message_once(self) -> None:
         saved = session_shutdown(name="owner")
         saved["settle_message"] = {"kind": "queued", "at": saved["requested_at"], "reason": "delivery pending"}
         self.assertTrue(record_store.create_session(saved))
@@ -573,7 +573,7 @@ else:
         with patch.object(shutdown, "inventory", return_value=report), patch.object(settle, "_showing_form", return_value=False), patch.object(settle, "merge_in_progress", return_value=False), redirect_stdout(output):
             self.assertEqual(shutdown.main(["status", LOGIN, "--here"]), 0)
         line = next(line for line in output.getvalue().splitlines() if line.startswith("  owner: waiting"))
-        self.assertIn("Codex seat worker is still running", line)
+        self.assertIn("Codex worker worker is still running", line)
         self.assertEqual(line.count("message queued: delivery pending"), 1)
 
     def test_status_uses_reported_peer_activity_without_local_process_probes(self) -> None:

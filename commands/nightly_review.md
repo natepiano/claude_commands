@@ -3,7 +3,7 @@ description: Nightly read-only review with one proposal per mode. The timer runs
 argument-hint: config | rust | messages | config rust messages
 ---
 
-Modes: `$ARGUMENTS`, done one at a time in the order given. Finish a mode, its report written and its message sent, before starting the next; a mode that cannot finish says why in its report, and the next still runs. NIGHT is the local date when the session started, DIR is `~/.local/state/nightly-review/NIGHT`, LEDGER is `~/.local/state/nightly-review/ledger.md`.
+Modes: `$ARGUMENTS`, done one at a time in the order given. Finish a mode, its report written and its message sent, before starting the next; a mode that cannot finish says why in its report, and the next still runs. NIGHT is the date the night's job message names (`NIGHT=<date>`), or the local date today when the command is run by hand, DIR is `~/.local/state/nightly-review/NIGHT`, LEDGER is `~/.local/state/nightly-review/ledger.md`.
 
 <Rules>
 - Read-only: write nothing outside DIR except `review.jsonl` dry sample records. No edits, commits, pushes, rebuilds or installs. A worktree only when a measurement needs a build that must not touch a working copy; remove it after.

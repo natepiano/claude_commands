@@ -559,7 +559,8 @@ class QuotaAlertTests(unittest.TestCase):
         self.assertEqual(quota_alert.Config.__module__, "scripts.production.showrunners")
         self.assertEqual(quota_alert.load_settings_from.__module__, "scripts.production.showrunners")
 
-    def test_real_user_delivery_is_patched_out(self) -> None:
+    def test_setup_blocks_real_phone_sends(self) -> None:
+        """Guard the fixture patch that prevents real phone sends."""
         self.assertIsNot(quota_alert.tell_user, REAL_TELL_USER)
 
     def test_load_config_reads_the_named_object_layout_registry(self) -> None:

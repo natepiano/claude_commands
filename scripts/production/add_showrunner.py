@@ -41,7 +41,8 @@ _DEFAULT_CONFIGURATION = DefaultClaudeConfiguration()
 
 
 WAIT_S = float(os.environ.get("ADD_SHOWRUNNER_WAIT_S") or 180)
-POLL_S = 2.0
+# The session registry has no notification interface; callers may choose its retry interval.
+POLL_S = float(os.environ.get("ADD_SHOWRUNNER_POLL_S") or 2.0)
 
 
 def running(slug: str) -> bool:
@@ -64,8 +65,8 @@ def checked(child: Production, caller: str, ending: str = "", start_in: Path | N
     `ending` names a tmux session the caller ends before the start, so it is not in the way.
     `start_in` is the folder the session starts in, the child's checkout unless given.
     """
-    from scripts.accounts.accounts import DefaultAccount, NamedAccount, account_dir, main_config_dir
-    from scripts.herdr.herdr import Untrusted, UnreadableTrustFile, claude_trust, trust_command
+    from scripts.accounts.accounts import DefaultAccount, NamedAccount, account_dir, main_config_dir, trust_command
+    from scripts.herdr.herdr import Untrusted, UnreadableTrustFile, claude_trust
 
     if not caller:
         raise Refusal(f"this session runs no production, so it has nothing to attach {child.slug} to")
