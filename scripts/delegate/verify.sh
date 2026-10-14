@@ -901,10 +901,10 @@ register_routing_demand() {
     return "$admission"
 }
 
-# Status 0 when mac_test.py says a claim made now could start a run on the
-# Mac these settings name: local records only, no SSH.
+# Status 0 when mac_test.py says a claim for this repository made now could
+# start a run on the Mac these settings name: local records only, no SSH.
 mac_free_now() {
-    "$PY" "$MAC_TEST_SCRIPT" free-now --settings "$1" >/dev/null 2>&1
+    "$PY" "$MAC_TEST_SCRIPT" free-now --settings "$1" --repo-root "$(git rev-parse --show-toplevel)" >/dev/null 2>&1
 }
 
 route_test() {
@@ -1014,7 +1014,8 @@ run_local_test() {
     while true; do
         hook=""
         if [[ -n "$MAC_LEAVE_SETTINGS" ]]; then
-            hook="$(printf '%q ' "$PY" "$MAC_TEST_SCRIPT" free-now --settings "$MAC_LEAVE_SETTINGS")"
+            hook="$(printf '%q ' "$PY" "$MAC_TEST_SCRIPT" free-now --settings "$MAC_LEAVE_SETTINGS" \
+                --repo-root "$(git rev-parse --show-toplevel)")"
         fi
         export BUILDLOG_TARGET=natedev
         echo "verify.sh: running on natedev"

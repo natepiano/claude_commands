@@ -29,6 +29,18 @@ from test_record import LegacyRecordFixture, write_old, move_old
 LOGIN = "owner@example.com"
 
 
+def action_line(label: str, verb: str, names: str, machine: str = "natedev") -> str:
+    identities = ",".join(name + "-id" for name in names.split(", "))
+    return (f"  {label}: in a terminal on {machine}: ~/.claude/scripts/lib/py "
+        f"~/.claude/scripts/shutdown/shutdown.py {verb} {LOGIN} --here --only {identities} · {names}")
+
+
+def resume_conductor_line(name: str, machine: str = "natedev") -> str:
+    identities = ",".join(item + "-id" for item in name.split(", "))
+    return (f"  no conductor running; in a terminal on {machine}: ~/.claude/scripts/lib/py "
+        f"~/.claude/scripts/shutdown/shutdown.py down {LOGIN} --here --only {identities}")
+
+
 def empty_inventory(machine: str = "natedev") -> Inventory:
     return {
         "machine": machine,
@@ -174,6 +186,25 @@ else:
             f"---\nlogin: {login}\nsessions: 1\n---\n",
             encoding="utf-8",
         )
+
+    def test_status_actions_and_usage_lines_name_where_commands_run(self) -> None:
+        saved = session_shutdown(name="Place")
+        self.assertTrue(record_store.create_session(saved))
+        status_output, usage_output = io.StringIO(), io.StringIO()
+        with patch.object(shutdown, "inventory", return_value=empty_inventory()), redirect_stdout(status_output):
+            self.assertEqual(shutdown.main(["status", LOGIN, "--here"]), 0)
+        with redirect_stdout(usage_output), self.assertRaises(SystemExit) as exit_status:
+            _ = shutdown.main(["--help"])
+        self.assertEqual(exit_status.exception.code, 0)
+        command_lines = [line for text in (status_output.getvalue(), usage_output.getvalue())
+            for line in text.splitlines() if any(token in line for token in (
+                "/shutdown", "shutdown.py", "accounts.py", "github-warm"))]
+        self.assertGreaterEqual(len(command_lines), 4)
+        for line in command_lines:
+            with self.subTest(line=line):
+                self.assertTrue(any(phrase in line.casefold() for phrase in (
+                    "in this terminal", "in a terminal on ", "in any claude session on ")), line)
+        self.assertIn(f"now {LOGIN} --here --only Place-id", status_output.getvalue())
 
     def run_status(
         self, status: int, output: str, *, as_json: bool = True
@@ -506,7 +537,7 @@ else:
             self.assertEqual(shutdown.main(["status", LOGIN, "--here"]), 0)
         expected = [
             "  failed launch: restart failed — window did not open",
-            "  manual session: manual restart — run: claude --resume session-id",
+            "  manual session: manual restart — in a terminal on natedev: claude --resume session-id",
             "  pending timers: timers pending — showrunner-demo: notifier unavailable",
             "  ready session: ready — finish the launch tests · message sent",
             "  waiting session: waiting · message queued: no live session",
@@ -557,9 +588,9 @@ else:
         self.assertIn("  Held: held by usage limit — Codex worker worker is still running\n", output.getvalue())
         self.assertNotIn("showing a form", output.getvalue())
         form.assert_not_called()
-        self.assertIn("  no conductor running; /shutdown --only <name> resumes one, /shutdown cancel --only <name> takes it out\n", output.getvalue())
-        self.assertIn("  take out: /shutdown cancel --only <name> · Held\n", output.getvalue())
-        self.assertIn("  stop now: /shutdown now --only <name> · Held\n", output.getvalue())
+        self.assertIn(resume_conductor_line(saved["session"]["name"]) + "\n", output.getvalue())
+        self.assertIn(action_line("take out", "cancel", "Held") + "\n", output.getvalue())
+        self.assertIn(action_line("stop now", "now", "Held") + "\n", output.getvalue())
         self.assertNotIn("  bring back:", output.getvalue())
 
     def test_status_reports_owned_busy_workers_and_a_queued_message_once(self) -> None:
@@ -769,10 +800,10 @@ else:
         with patch.object(shutdown, "inventory", return_value=report), patch.object(settle, "_showing_form", return_value=False), patch.object(settle, "merge_in_progress", return_value=False), redirect_stdout(output):
             self.assertEqual(shutdown.main(["status", LOGIN, "--here"]), 0)
         self.assertIn("  Owner: waiting\n", output.getvalue())
-        self.assertIn("  no conductor running; /shutdown --only <name> resumes one, /shutdown cancel --only <name> takes it out\n", output.getvalue())
-        self.assertIn("  take out: /shutdown cancel --only <name> · Owner\n", output.getvalue())
-        self.assertIn("  stop now: /shutdown now --only <name> · Owner\n", output.getvalue())
-        self.assertNotIn("  bring back: /shutdown restart --only <name> · Owner\n", output.getvalue())
+        self.assertIn(resume_conductor_line(saved["session"]["name"]) + "\n", output.getvalue())
+        self.assertIn(action_line("take out", "cancel", "Owner") + "\n", output.getvalue())
+        self.assertIn(action_line("stop now", "now", "Owner") + "\n", output.getvalue())
+        self.assertNotIn(action_line("bring back", "restart", "Owner") + "\n", output.getvalue())
         self.assertFalse((self.state / LOGIN / "conduct.lock").exists())
 
     def test_status_running_conductor_has_actions_without_resume_warning(self) -> None:
@@ -783,8 +814,8 @@ else:
         with record_store.conductor_lock(LOGIN), patch.object(shutdown, "inventory", return_value=empty_inventory()), redirect_stdout(output):
             self.assertEqual(shutdown.main(["status", LOGIN, "--here"]), 0)
         self.assertNotIn("no conductor running", output.getvalue())
-        self.assertIn("  take out: /shutdown cancel --only <name> · Ready\n", output.getvalue())
-        self.assertIn("  stop now: /shutdown now --only <name> · Ready\n", output.getvalue())
+        self.assertIn(action_line("take out", "cancel", "Ready") + "\n", output.getvalue())
+        self.assertIn(action_line("stop now", "now", "Ready") + "\n", output.getvalue())
 
     def test_status_released_conductor_lock_is_not_a_running_conductor(self) -> None:
         saved = session_shutdown(name="Owner")
@@ -794,7 +825,7 @@ else:
         output = io.StringIO()
         with patch.object(shutdown, "inventory", return_value=empty_inventory()), redirect_stdout(output):
             self.assertEqual(shutdown.main(["status", LOGIN, "--here"]), 0)
-        self.assertIn("  no conductor running; /shutdown --only <name> resumes one", output.getvalue())
+        self.assertIn("  no conductor running; in a terminal on ", output.getvalue())
 
     def test_status_unreadable_conductor_lock_reports_unavailable_without_resume_claim(self) -> None:
         saved = session_shutdown(name="Owner")
@@ -816,10 +847,10 @@ else:
         output = io.StringIO()
         with patch.object(shutdown, "inventory", return_value=empty_inventory()), redirect_stdout(output):
             self.assertEqual(shutdown.main(["status", LOGIN, "--here"]), 0)
-        self.assertEqual([line for line in output.getvalue().splitlines() if ": /shutdown" in line], [
-            "  take out: /shutdown cancel --only <name> · Failed",
-            "  stop now: /shutdown now --only <name> · Failed",
-            "  bring back: /shutdown restart --only <name> · Failed, Stopped",
+        self.assertEqual([line for line in output.getvalue().splitlines() if any(label in line for label in ("  take out:", "  stop now:", "  bring back:"))], [
+            action_line("take out", "cancel", "Failed"),
+            action_line("stop now", "now", "Failed"),
+            action_line("bring back", "restart", "Failed, Stopped"),
         ])
 
     def test_status_peer_ownership_observes_held_released_absent_and_unreadable_locks(self) -> None:
@@ -847,9 +878,9 @@ else:
                 with patch.object(shutdown, "inventory", return_value=empty_inventory()), patch.object(shutdown, "run_remote", side_effect=remote), patch.object(shutdown, "other_machine", return_value="Mac"), redirect_stdout(output):
                     self.assertEqual(shutdown.main(["status", LOGIN]), 0)
                 lines = output.getvalue()
-                self.assertIn(f"  take out: /shutdown cancel --only <name> · Peer_{state}\n", lines)
+                self.assertIn(action_line("take out", "cancel", f"Peer_{state}", "Mac") + "\n", lines)
                 if state in {"absent", "released"}:
-                    self.assertIn("  no conductor running; /shutdown --only <name> resumes one", lines)
+                    self.assertIn("  no conductor running; in a terminal on ", lines)
                 else:
                     self.assertNotIn("no conductor running", lines)
                 if state == "unreadable":
@@ -887,8 +918,8 @@ else:
         with patch.object(shutdown, "inventory", return_value=empty_inventory()), patch.object(shutdown, "run_remote", side_effect=remote), patch.object(shutdown, "other_machine", return_value="Mac"), redirect_stdout(output):
             self.assertEqual(shutdown.main(["status", LOGIN]), 0)
         lines = output.getvalue().splitlines()
-        self.assertLess(lines.index("  stop now: /shutdown now --only <name> · Local"), lines.index("Mac:"))
-        self.assertGreater(lines.index("  stop now: /shutdown now --only <name> · Peer"), lines.index("Mac:"))
+        self.assertLess(lines.index(action_line("stop now", "now", "Local")), lines.index("Mac:"))
+        self.assertGreater(lines.index(action_line("stop now", "now", "Peer", "Mac")), lines.index("Mac:"))
 
     def test_status_whole_machine_blocks_group_actions_and_report_conductor_once(self) -> None:
         local: list[SessionShutdown] = []
@@ -926,10 +957,10 @@ else:
                 *(["    14:49:10 waiting"] if machine == "natedev" else []),
                 "  nixos: waiting",
                 *(["    14:49:10 waiting"] if machine == "natedev" else []),
-                "  no conductor running; /shutdown --only <name> resumes one, /shutdown cancel --only <name> takes it out",
-                "  take out: /shutdown cancel --only <name> · failed, hana, nixos",
-                "  stop now: /shutdown now --only <name> · failed, hana, nixos",
-                "  bring back: /shutdown restart --only <name> · bevy, failed",
+                resume_conductor_line("hana, nixos", machine),
+                action_line("take out", "cancel", "failed, hana, nixos", machine),
+                action_line("stop now", "now", "failed, hana, nixos", machine),
+                action_line("bring back", "restart", "bevy, failed", machine),
             ])
         self.assertEqual(output.getvalue().splitlines(), expected)
 
@@ -948,8 +979,8 @@ else:
             "  nixos: waiting",
             "    14:49:10 waiting",
             "  conductor ownership unavailable: cannot read lock",
-            "  take out: /shutdown cancel --only <name> · hana, nixos",
-            "  stop now: /shutdown now --only <name> · hana, nixos",
+            action_line("take out", "cancel", "hana, nixos"),
+            action_line("stop now", "now", "hana, nixos"),
         ])
 
 

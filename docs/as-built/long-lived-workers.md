@@ -57,6 +57,7 @@ The flag is cleared by any `item/completed` from the worker's own work, but not 
   3. If the roster's `context_tokens` is an integer greater than `PLAN_DELEGATE_COMPACT_ABOVE_TOKENS`, runs `codex_mesh.py compact`; a `not_measured_since_compaction` size skips this step, so the worker gets its follow-up with no second compaction. On success it posts `launcher: compacted …`. On exit 3 (a turn is still live on the thread) it posts `launcher: <worker> still has a live turn after compaction: <detail>; follow-up not sent` and exits 2, naming `codex_mesh.py end --to <worker>` and a fresh worker as the remedy; `review.sh` does the same. On any other failure it posts `launcher: compaction failed for <worker>: <detail>; continuing follow-up` and continues.
   4. Claims the worker with `can-follow --role <pass_kind>`.
 - On exit, it releases the claim.
+- After launch it waits for the worker's record (with `--to` on Codex, the turn record) for up to `PLAN_DELEGATE_WORKER_WAIT_ATTEMPTS` (30) checks `PLAN_DELEGATE_WORKER_POLL_SECS` (1 s) apart, stopping early when the launcher exits. Tests shorten the interval and raise the count.
 - It reads the threshold from `config/delegate.conf` (`PLAN_DELEGATE_CONFIG` can override the path). A missing, non-numeric or non-positive value exits 2 with an error naming the key.
 - A worker assigned a different role keeps its slot as the 9th argument and changes only the task and pass-kind words.
 

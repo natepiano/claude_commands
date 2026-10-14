@@ -35,42 +35,46 @@ class UnreadableSessionRecord(Enum):
 RegistryEntry = SessionRecord | UnreadableSessionRecord
 
 
+def parse_session(parsed: object) -> RegistryEntry:
+    """Validate one decoded registry write without reading its file again."""
+    if not isinstance(parsed, dict):
+        return UnreadableSessionRecord.FOUND
+    data = cast(dict[str, object], parsed)
+    pid = data.get("pid")
+    session_id = data.get("sessionId")
+    name = data.get("name")
+    socket_path = data.get("messagingSocketPath")
+    updated_at = data.get("updatedAt")
+    proc_start = data.get("procStart")
+    tmux = data.get("tmux")
+    former = data.get("formerNames")
+    if (
+        not isinstance(pid, int)
+        or isinstance(pid, bool)
+        or pid <= 0
+        or not isinstance(session_id, str)
+        or not isinstance(name, str)
+        or not isinstance(socket_path, str)
+        or not isinstance(updated_at, int)
+        or isinstance(updated_at, bool)
+    ):
+        return UnreadableSessionRecord.FOUND
+    return SessionRecord(
+        pid=pid,
+        sessionId=session_id,
+        name=name,
+        messagingSocketPath=socket_path,
+        updatedAt=updated_at,
+        procStart=proc_start if isinstance(proc_start, str) else "",
+        tmux=tmux if isinstance(tmux, str) else "",
+        formerNames=[name for name in cast(list[object], former) if isinstance(name, str)]
+        if isinstance(former, list) else [],
+    )
+
+
 def read_session(path: Path) -> RegistryEntry:
     try:
-        parsed = cast(object, json.loads(path.read_text()))
-        if not isinstance(parsed, dict):
-            return UnreadableSessionRecord.FOUND
-        data = cast(dict[str, object], parsed)
-        pid = data.get("pid")
-        session_id = data.get("sessionId")
-        name = data.get("name")
-        socket_path = data.get("messagingSocketPath")
-        updated_at = data.get("updatedAt")
-        proc_start = data.get("procStart")
-        tmux = data.get("tmux")
-        former = data.get("formerNames")
-        if (
-            not isinstance(pid, int)
-            or isinstance(pid, bool)
-            or pid <= 0
-            or not isinstance(session_id, str)
-            or not isinstance(name, str)
-            or not isinstance(socket_path, str)
-            or not isinstance(updated_at, int)
-            or isinstance(updated_at, bool)
-        ):
-            return UnreadableSessionRecord.FOUND
-        return SessionRecord(
-            pid=pid,
-            sessionId=session_id,
-            name=name,
-            messagingSocketPath=socket_path,
-            updatedAt=updated_at,
-            procStart=proc_start if isinstance(proc_start, str) else "",
-            tmux=tmux if isinstance(tmux, str) else "",
-            formerNames=[name for name in cast(list[object], former) if isinstance(name, str)]
-            if isinstance(former, list) else [],
-        )
+        return parse_session(cast(object, json.loads(path.read_text())))
     except (OSError, ValueError, TypeError, json.JSONDecodeError):
         return UnreadableSessionRecord.FOUND
 

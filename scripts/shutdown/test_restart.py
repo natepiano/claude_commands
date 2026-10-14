@@ -25,6 +25,7 @@ from test_support import registry_confirmation, ShutdownSendLeaf, ShutdownTestCa
 import inventory
 import record
 import sessions
+import remote_control
 from user_action import ActionRequired
 from push_texts import RenderedPush
 import restart
@@ -2506,7 +2507,7 @@ class RestartTests(ShutdownTestCase):
         record.set_account_hold(hold)
         with patch.object(restart, "own_claude_account", side_effect=UnreadableAccount("unreadable")), patch.object(restart, "run_remote", return_value=(0, "[]")), patch.object(restart, "_up", return_value=restart.MachineRestartResult("natedev", LABEL, "nothing")) as up, redirect_stdout(io.StringIO()):
             self.assertEqual(restart.restart(restart.AccountNotNamed(), dry_run=False, alerts=restart.NeverAlert()), 0)
-        up.assert_called_once_with(LOGIN, False, ())
+        up.assert_called_once_with(LOGIN, False, (), notify=False)
 
     def test_restart_account_choice_includes_a_peer_hold_without_sessions(self) -> None:
         hold = record.AccountHold(
@@ -2517,7 +2518,7 @@ class RestartTests(ShutdownTestCase):
             return (0, json.dumps([hold])) if args[0] == "holds" else (0, "[]") if args[0] == "records" else (0, "")
         with patch.object(restart, "own_claude_account", side_effect=UnreadableAccount("unreadable")), patch.object(restart, "run_remote", remote), patch.object(restart, "_up", return_value=restart.MachineRestartResult("natedev", LABEL, "nothing")) as up, redirect_stdout(io.StringIO()):
             self.assertEqual(restart.restart(restart.AccountNotNamed(), dry_run=False, alerts=restart.NeverAlert()), 0)
-        up.assert_called_once_with(LOGIN, False, ())
+        up.assert_called_once_with(LOGIN, False, (), notify=False)
 
     def test_window_hosts_launch_serially_on_the_calling_thread_with_spacing(self) -> None:
         saved = [
@@ -2776,7 +2777,8 @@ class RestartTests(ShutdownTestCase):
         incomplete["alerts"] = "none"
         self.create([complete, incomplete])
 
-        def up(_login: str, _dry_run: bool, _only: Iterable[str]) -> restart.MachineRestartResult:
+        def up(_login: str, _dry_run: bool, _only: Iterable[str], *, notify: bool) -> restart.MachineRestartResult:
+            del notify
             record.archive_session(LOGIN, "complete")
             return restart.MachineRestartResult("natedev", LABEL, "partial", failed=1)
 
@@ -2848,6 +2850,54 @@ class RestartTests(ShutdownTestCase):
         launch.assert_not_called()
         timers.assert_not_called()
         self.assertEqual(current["progress"]["kind"], "restart failed")
+        stored = self.stored_record()
+        progress = stored["progress"]
+        assert progress["kind"] == "restart failed"
+        expected = (f"in a terminal on natedev: ~/.claude/scripts/lib/py "
+            f"~/.claude/scripts/shutdown/shutdown.py restart {LOGIN} --here --only owner")
+        self.assertIn(expected, progress["reason"])
+        status_lines = settle.status_record_lines(stored)
+        output = io.StringIO()
+        with (
+            patch.object(settle, "run_remote", return_value=(0, "[]")),
+            patch.object(restart, "_live_session_ids", return_value=frozenset()),
+            patch.object(settle, "alert_user"),
+            redirect_stdout(output),
+        ):
+            settle.report_stop([stored])
+        command_lines = [line for line in [*status_lines, *output.getvalue().splitlines()]
+            if "shutdown.py" in line or "/shutdown" in line]
+        self.assertTrue(command_lines)
+        for line in command_lines:
+            self.assertIn("in a terminal on natedev", line)
+            self.assertIn(LOGIN, line)
+            self.assertIn("--only owner", line)
+            self.assertIn("~/.claude/scripts/lib/py ~/.claude/scripts/shutdown/shutdown.py", line)
+
+    def test_unreachable_peer_restart_prints_scoped_retry_in_peer_terminal(self) -> None:
+        cases = (
+            ((), ["restart", LOGIN, "--here", "--no-alert"]),
+            (("local", "peer-one", "peer-two"),
+                ["restart", LOGIN, "--here", "--only", "peer-one,peer-two", "--no-alert"]),
+        )
+        local = restart.MachineRestartResult("natedev", LABEL, "nothing",
+            local_session_ids=frozenset({"local"}))
+        for ids, expected in cases:
+            with self.subTest(ids=ids):
+                output = io.StringIO()
+                with (
+                    patch.object(restart, "named_claude_account", return_value=self.account),
+                    patch.object(restart, "_up", return_value=local),
+                    patch.object(restart, "run_remote", return_value=(255, "")),
+                    patch.object(restart, "other_machine", return_value="Mac"),
+                    redirect_stdout(output),
+                ):
+                    _ = restart.restart(restart.AccountNamed(LOGIN), dry_run=False,
+                        alerts=restart.NeverAlert(), only=ids)
+                line = next(line for line in output.getvalue().splitlines() if "restart incomplete" in line)
+                command = line.split("in a terminal on Mac: ", 1)[1]
+                self.assertEqual(shlex.split(command), ["~/.claude/scripts/lib/py",
+                    "~/.claude/scripts/shutdown/shutdown.py", *expected])
 
     def test_cleanup_exception_does_not_prevent_other_sessions_from_returning(self) -> None:
         saved = entry(unit("broken"))
@@ -3026,7 +3076,7 @@ class RestartTests(ShutdownTestCase):
         self.create([waiting])
         with patch.object(restart, "named_claude_account", return_value=self.account), patch.object(restart, "run_remote", return_value=(0, peer_json(lines=["Mac: restored Remote"]))) as peer, patch.object(restart, "_launch_session") as launch, patch.object(settle, "alert_user") as alert, redirect_stdout(io.StringIO()):
             self.assertEqual(restart.restart(restart.AccountNamed(LABEL), only=["remote-id"], dry_run=True, alerts=restart.NeverAlert()), 0)
-        peer.assert_called_once_with(["up", LOGIN, "--here", "--json", "--dry-run", "--only", "remote-id"], limit={"kind": "while link alive"})
+        peer.assert_called_once_with(["up", LOGIN, "--here", "--json", "--no-alert", "--dry-run", "--only", "remote-id"], limit={"kind": "while link alive"})
         launch.assert_not_called()
         alert.assert_not_called()
         self.assertEqual(record.find_session(LOGIN, "waiting"), waiting)
@@ -3134,7 +3184,7 @@ class RestartTests(ShutdownTestCase):
             self.assertEqual(restart.restart(restart.AccountNamed(LABEL), only=["peer"], dry_run=False, alerts=restart.AlertWhenNotBack()), 1)
         alert.assert_not_called()
         self.assertEqual(record.find_session(LOGIN, "sibling"), sibling)
-    def test_remote_control_missing_prints_diagnostic_archives_restart_and_alerts_action(self) -> None:
+    def test_remote_control_missing_archives_restart_and_launches_fixer_without_push(self) -> None:
         for policy in ("user", "none"):
             for command_alerts in (restart.AlertWhenNotBack(), restart.NeverAlert()):
                 with self.subTest(policy=policy, command_alerts=type(command_alerts).__name__):
@@ -3143,19 +3193,60 @@ class RestartTests(ShutdownTestCase):
                     saved["requested_at"] = "2026-10-09T21:49:" + str(10 + (2 if policy == "none" else 0) + int(isinstance(command_alerts, restart.NeverAlert))) + "+00:00"
                     self.create([saved])
                     output = io.StringIO()
-                    with patch.object(restart, "named_claude_account", return_value=self.account), patch.object(restart, "_retire"), patch.object(restart, "_launch_session", return_value=restart.SessionLaunched()), patch.object(restart, "_live_session_ids", return_value=frozenset()), patch.object(restart, "wait_for_confirmation", side_effect=self.all_sessions_live), patch.object(restart, "wait_for_remote_control", return_value=frozenset()) as check, patch.object(restart, "_send_restart_note", return_value=settle.MessageSent(kind="sent")), patch.object(settle, "alert_user") as alert, redirect_stdout(output):
+                    with patch.object(restart, "named_claude_account", return_value=self.account), patch.object(restart, "_retire"), patch.object(restart, "_launch_session", return_value=restart.SessionLaunched()), patch.object(restart, "_live_session_ids", return_value=frozenset()), patch.object(restart, "wait_for_confirmation", return_value=restart.RegistryConfirmation((sessions.SessionRecord(pid=912, sessionId="owner", name="Owner", procStart="resumed-start", messagingSocketPath="", updatedAt=1, tmux="", formerNames=[]),))), patch.object(remote_control, "launch_fixer") as fixer, patch.object(restart, "wait_for_remote_control", return_value=frozenset()) as check, patch.object(restart, "_send_restart_note", return_value=settle.MessageSent(kind="sent")), patch.object(settle, "alert_user") as alert, redirect_stdout(output):
                         self.assertEqual(restart.restart(restart.AccountNamed(LOGIN), dry_run=False, alerts=command_alerts, here=True), 0)
-                    self.assertIn("Owner: running, no Remote Control\n", output.getvalue())
+                    self.assertIn("Owner: Remote Control not on yet;", output.getvalue())
                     check.assert_called_once()
                     self.assertIsNone(record.find_session(LOGIN, "owner"))
                     history = list((self.state_root / LOGIN / "history").glob("*.json"))
                     self.assertEqual(cast(dict[str, object], json.loads(history[-1].read_text()))["progress"], {"kind": "restarted", "at": RESTARTED})
-                    self.assertEqual(alert.call_count, int(policy == "user" and isinstance(command_alerts, restart.AlertWhenNotBack)))
-                    if alert.called:
-                        self.assertIn("Owner", cast(RenderedPush, alert.call_args.args[0]).body)
-                        self.assertIn("/remote-control", cast(ActionRequired, cast(RenderedPush, alert.call_args.args[0]).action).text)
-                        self.assertEqual(cast(RenderedPush, alert.call_args.args[0]).id, "shutdown.remote_control")
-                        self.assertNotIn("run /shutdown restart again", cast(RenderedPush, alert.call_args.args[0]).body)
+                    alert.assert_not_called()
+                    fixer_policy = policy if isinstance(command_alerts, restart.AlertWhenNotBack) else "none"
+                    fixer.assert_called_once_with("owner", 912, "resumed-start", "Owner", fixer_policy)
+                    self.assertIn("turning it on in the background", output.getvalue())
+
+    def test_remote_control_fixer_argv_carries_effective_alert_policy(self) -> None:
+        self.allow_leaf(ShutdownSendLeaf.LAUNCH_REMOTE_CONTROL_FIXER)
+        saved = entry(top_level("owner", name="Owner"))
+        confirmed = restart.RegistryConfirmation((sessions.SessionRecord(pid=912,
+            sessionId="owner", name="Owner", procStart="resumed-start",
+            messagingSocketPath="", updatedAt=1, tmux="", formerNames=[]),))
+        cases: tuple[tuple[Literal["user", "none"], bool, str], ...] = (
+            ("user", True, "user"), ("none", True, "none"), ("user", False, "none"))
+        for policy, notify, expected in cases:
+            with self.subTest(policy=policy, notify=notify):
+                saved["alerts"] = policy
+                with (patch.object(restart, "wait_for_remote_control", return_value=frozenset()),
+                      patch.object(subprocess, "run", return_value=subprocess.CompletedProcess([], 0)) as launch,
+                      patch.object(settle, "alert_user") as alert, redirect_stdout(io.StringIO())):
+                    _ = restart.remote_control_missing([saved], confirmed, notify=notify)
+                launch.assert_called_once()
+                argv = cast(list[str], launch.call_args.args[0])
+                self.assertEqual(argv[argv.index("--alerts") + 1], expected)
+                self.assertEqual(argv[argv.index("--pid") + 1], "912")
+                self.assertEqual(argv[argv.index("--proc-start") + 1], "resumed-start")
+                alert.assert_not_called()
+
+    def test_remote_control_launch_failure_prints_manual_action_and_only_alerts_when_allowed(self) -> None:
+        saved = entry(top_level("owner", name="Owner"))
+        confirmed = restart.RegistryConfirmation((sessions.SessionRecord(pid=912,
+            sessionId="owner", name="Owner", procStart="resumed-start",
+            messagingSocketPath="", updatedAt=1, tmux="", formerNames=[]),))
+        for policy in ("user", "none"):
+            for notify in (True, False):
+                with self.subTest(policy=policy, notify=notify):
+                    saved["alerts"] = policy
+                    output = io.StringIO()
+                    with (patch.object(restart, "wait_for_remote_control", return_value=frozenset()),
+                          patch.object(remote_control, "launch_fixer", side_effect=OSError("service unavailable")) as launch,
+                          patch.object(remote_control, "alert_failed") as alert, redirect_stdout(output)):
+                        _ = restart.remote_control_missing([saved], confirmed, notify=notify)
+                    launch.assert_called_once_with("owner", 912, "resumed-start", "Owner", policy if notify else "none")
+                    self.assertEqual(output.getvalue(), "Owner: Remote Control is off; turn it on at its terminal with /remote-control\n")
+                    if policy == "user" and notify:
+                        alert.assert_called_once_with("Owner")
+                    else:
+                        alert.assert_not_called()
 
     def test_remote_control_active_restart_sends_no_alert(self) -> None:
         saved = entry(top_level("owner", name="Owner", host=tmux_host("owner")))
@@ -3166,19 +3257,16 @@ class RestartTests(ShutdownTestCase):
         self.assertIsNone(record.find_session(LOGIN, "owner"))
         alert.assert_not_called()
 
-    def test_remote_control_peer_policy_and_name_survive_archived_record(self) -> None:
+    def test_remote_control_peer_diagnostic_starts_no_local_fixer_or_push(self) -> None:
         for policy in ("user", "none"):
             with self.subTest(policy=policy):
-                diagnostic = "Remote: running, no Remote Control"
+                diagnostic = "Remote: Remote Control not on yet; turning it on in the background"
                 missing = record.NoRemoteControl(session_id="peer", name="Remote", alerts=policy)
-                with patch.object(restart, "named_claude_account", return_value=self.account), patch.object(restart, "run_remote", return_value=(0, peer_json(lines=[diagnostic], missing=[missing]))), patch.object(settle, "alert_user") as alert, redirect_stdout(io.StringIO()) as output:
+                with patch.object(restart, "named_claude_account", return_value=self.account), patch.object(restart, "run_remote", return_value=(0, peer_json(lines=[diagnostic], missing=[missing]))), patch.object(settle, "alert_user") as alert, patch.object(remote_control, "launch_fixer") as fixer, redirect_stdout(io.StringIO()) as output:
                     self.assertEqual(restart.restart(restart.AccountNamed(LOGIN), dry_run=False, alerts=restart.AlertWhenNotBack()), 0)
                 self.assertIn(diagnostic, output.getvalue())
-                self.assertEqual(alert.call_count, int(policy == "user"))
-                if alert.called:
-                    self.assertIn("Remote", cast(RenderedPush, alert.call_args.args[0]).body)
-                    self.assertIn("/remote-control", cast(ActionRequired, cast(RenderedPush, alert.call_args.args[0]).action).text)
-                    self.assertEqual(cast(RenderedPush, alert.call_args.args[0]).values["machine"], "Mac")
+                alert.assert_not_called()
+                fixer.assert_not_called()
 
     def test_peer_no_shutdown_refusal_keeps_line_without_alert(self) -> None:
         refusal = restart.RestartNoShutdown(kind="no shutdown", session_id="peer", name="Remote")

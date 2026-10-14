@@ -16,6 +16,7 @@ from unittest.mock import patch
 
 import record
 import remote
+import remote_control
 import restart
 import settle
 import shutdown
@@ -313,7 +314,14 @@ class SendGuardTests(ShutdownTestCase):
             self.assertEqual(command[0], "ssh")
             self.assertEqual(command[-2], remote.other_machine())
 
-    def test_leaf_enum_has_the_six_specified_dotted_names(self) -> None:
+    def test_remote_control_fixer_launch_is_blocked_with_its_alert_policy(self) -> None:
+        class UnfakedFixer(ShutdownTestCase):
+            def test_launch(self) -> None:
+                remote_control.launch_fixer("owner", 321, "original", "Owner", "none")
+        self.assert_blocked(UnfakedFixer("test_launch"),
+            ShutdownSendLeaf.LAUNCH_REMOTE_CONTROL_FIXER, "session:owner")
+
+    def test_leaf_enum_has_the_specified_dotted_names(self) -> None:
         class LeafNames(ShutdownTestCase):
             def test_names(self) -> None:
                 self.assertEqual(
@@ -324,6 +332,7 @@ class SendGuardTests(ShutdownTestCase):
                         "RESTART_RETIRE": "restart._retire",
                         "RUN_REMOTE": "remote.run_remote",
                         "LAUNCH_CONDUCTOR": "settle._launch_conductor",
+                        "LAUNCH_REMOTE_CONTROL_FIXER": "remote_control.launch_fixer",
                         "RUN_NOTIFIER": "settle.run_notifier",
                     },
                 )

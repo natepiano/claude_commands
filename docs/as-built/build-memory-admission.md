@@ -64,7 +64,7 @@ In `invoke.sh`, `run_once` checks natedev holds before memory admission, runs th
 
 `run()` wraps `run_once`. A failed step is a memory kill when its output shows `SIGKILL|SIGTERM|signal: (9|15)` and the journal shows, inside the step's window, earlyoom's `sending SIG(TERM|KILL) to process` (`journalctl -u earlyoom`) or the kernel's `Memory cgroup out of memory` / `Out of memory: Killed` (`journalctl -k`). The query lives in `memory_kill_in_journal` so tests can stub `journalctl`. A memory kill is never the tree's failure: the step re-runs once (`killed for memory: <step>; retrying once`), and a second kill exits 137 with `killed for memory twice: <step>`. Each kill appends a byte to `MEM_KILL_FILE`; the second creates `<file>.stopped`. `note_event` passes `BUILDLOG_MEM_KILLS` and `BUILDLOG_MEM_KILL_STOPPED` to `record.py call`.
 
-`verify.sh` also times the `cargo` board-token acquisition and passes it as `BUILDLOG_TOKEN_WAIT_S`. A wait that times out exits 1 before any call is recorded, so its time is in no row.
+`verify.sh` also times the `cargo` board-token acquisition and passes it as `BUILDLOG_TOKEN_WAIT_S`. The clock is Bash's `$SECONDS`, or the integer in `PLAN_DELEGATE_TOKEN_CLOCK_FILE` when set, so a test advances a file instead of sleeping. A wait that times out exits 1 before any call is recorded, so its time is in no row.
 
 ### Cargo token reclaim (`scripts/delegate/board.sh`)
 
