@@ -546,8 +546,11 @@ class MergeGateTests(unittest.TestCase):
     def test_signal_during_merge_aborts_pending_merge_and_its_hook(self) -> None:
         ready = self.state / "merge-hook-ready"
         hook = self.checkout / ".git" / "hooks" / "prepare-commit-msg"
+        # The pid is published by rename, so the test never reads a created but
+        # still empty file.
         self.write(hook, f"#!{sys.executable}\nimport os, time\nfrom pathlib import Path\n"
-                   + f"Path({str(ready)!r}).write_text(str(os.getpid()))\nwhile True: time.sleep(0.01)\n")
+                   + f"Path({str(ready) + '.tmp'!r}).write_text(str(os.getpid()))\n"
+                   + f"os.replace({str(ready) + '.tmp'!r}, {str(ready)!r})\nwhile True: time.sleep(0.01)\n")
         hook.chmod(0o755)
         process = subprocess.Popen(
             [sys.executable, str(SCRIPT), "--repo", str(self.checkout), "--merge-branch", "integration",
