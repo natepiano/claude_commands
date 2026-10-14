@@ -19,6 +19,7 @@ and print its output exactly as it comes, with nothing added.
   Keep `CODEX_HOME` on it: without it, `codex login` signs `~/.codex` out and in, stopping seats on the default role.
 - `pick claude|codex [--explain]`: picks room with the soonest weekly reset; `--keep <label>` keeps a working account, and repeated `--exclude <label>` skips accounts.
 - `claude-unit` and `role unit` use `pick claude`; new sessions have no unit role.
+- A showrunner moves sessions with `/showrunner:move`, which proves where each came back; `move` below starts a move and does not wait for it.
 - `move <session-id|name> "claude N"|default`: moves one local session, keeping its conversation and name; `--why <text>` explains the move on resume; an unknown host prints the resume line to run after exit.
 - `move showrunners --from "claude N" --to "claude N"|default [--dry-run]`: moves that account's local showrunners on their original desktops; skips sessions already in shutdown.
 - `role seats` shows the selection; `set-role seats "codex N"|default` selects future turns.

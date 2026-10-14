@@ -1074,6 +1074,12 @@ Before the mover stops one of your units, you get one line from `shutdown`:
 it stays stopped until the user restarts it. One more line follows:
 `<unit> is back on <account>`, or `<unit> did not come back: <reason>`. The user
 is told of a failure; you hold the unit's work until it is back.
+
+To move a session yourself, or stop one to change its account, run
+`/showrunner:move`: it pauses the session first and proves the account it comes
+back on. Never send `/exit` into a pane, run `shutdown.py now`, kill a Claude
+process or resume `claude` with a `CLAUDE_CONFIG_DIR` by hand; a hook refuses
+each in your session.
 </PauseForMove>
 
 <QuotaAlert>
