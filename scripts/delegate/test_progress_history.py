@@ -4832,11 +4832,12 @@ class ProgressHistoryTests(unittest.TestCase):
         note = vault_root / "example-showrunner" / "unit-a.md"
         self.assertTrue(note.is_file())
         self.assertEqual(
-            note.read_text(encoding="utf-8").splitlines()[:9],
+            note.read_text(encoding="utf-8").splitlines()[:10],
             [
                 "---",
                 "phase_table: true",
-                "production: example",
+                "showrunner: example-showrunner",
+                f'production_file: "{production_doc.resolve().as_uri()}"',
                 "unit: unit-a",
                 'now: "Phase 3 of 1 — Retry handling"',
                 "---",
