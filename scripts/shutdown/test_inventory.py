@@ -820,6 +820,17 @@ elif "comm=" in joined:
         )
         self.assertNotIn("orphaned-start", director["codex_servers"][0]["busy_seats"])
 
+    def test_a_showrunner_timer_naming_a_session_not_running_is_unregistered(self) -> None:
+        before = {runner["slug"] for runner in inventory.unregistered_showrunners()}
+        stale = self.notifier / "showrunner-stale"
+        stale.mkdir()
+        stale_doc = self.root / "stale-production.md"
+        _ = stale_doc.write_text("- **User zone:** America/Los_Angeles\n", encoding="utf-8")
+        _ = (stale / "conf").write_text(
+            f"TARGET=session:00000000-0000-4000-8000-000000000000\nCHECK=zsh /opt/production_check.sh {stale_doc}\n",
+            encoding="utf-8")
+        self.assertEqual({runner["slug"] for runner in inventory.unregistered_showrunners()} - before, {"stale"})
+
     def test_incomplete_showrunner_timer_leaves_session_top_level(self) -> None:
         invalid_showrunner = self.notifier / "showrunner-incomplete"
         invalid_showrunner.mkdir()
