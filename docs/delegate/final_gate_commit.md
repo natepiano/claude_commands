@@ -24,8 +24,12 @@ phase review, so the run leaves no uncommitted work behind.
 
    <what the closing repairs changed>
 
+   Change-Review: none — <why nothing visible changes>, or one `<change> | <how to check>` line each
    Claude-Session: <session url>
    ```
+
+   Its `Change-Review:` lines follow <CheckpointCommit/>
+   (`commands/unit/checkpoint.md`) step 6.
 
 5. This commit holds no phase reservation, so it invokes no drift check and no
    release. Run <PushCheckpoint/> (`commands/unit/checkpoint.md`), then
