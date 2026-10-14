@@ -86,9 +86,81 @@ def codex_account(home: Path) -> RefusingCodexAccount:
     return UnknownCodexAccount(home, "the signed-in account has no named note")
 
 
+@dataclass(frozen=True)
+class CreditsOn:
+    """This account may pay for work after its allowance is used."""
+    warning: str = ""
+
+
+@dataclass(frozen=True)
+class CreditsOff:
+    """Only this account's included allowance may pay for work."""
+
+
+CodexCreditsSetting = CreditsOn | CreditsOff
+
+
+def codex_credits_setting(label: str) -> CodexCreditsSetting:
+    from scripts.whoami.note_file import AGENTS_DIR, read_note
+
+    directory = Path(os.environ.get("AGENT_NOTES_DIR", str(AGENTS_DIR)))
+    note = read_note(directory / f"{label}.md")
+    value = note.get("use_credits") if note is not None else None
+    if value == "off":
+        return CreditsOff()
+    if value is None or value == "on":
+        return CreditsOn()
+    return CreditsOn(f"{label}: use_credits must be on or off; reading it as on")
+
+
+@dataclass(frozen=True)
+class CodexHomeHoldingLogin:
+    label: str
+    home: Path
+    login: str
+
+
+@dataclass(frozen=True)
+class CodexSetupHome:
+    """No existing home holds this account's login yet."""
+    label: str
+    home: Path
+
+
+def codex_account_home(label: str) -> CodexHomeHoldingLogin | CodexSetupHome:
+    from scripts.whoami.note_file import AGENTS_DIR, read_note
+
+    match = re.fullmatch(r"codex ([1-9][0-9]*)", label)
+    if match is None:
+        raise ValueError(f"accounts: {label} is not a codex N label")
+    directory = Path(os.environ.get("AGENT_NOTES_DIR", str(AGENTS_DIR)))
+    note = read_note(directory / f"{label}.md")
+    login = (note.get("login") or "") if note is not None else ""
+    if login:
+        for home in codex_homes(Path.home() / ".codex"):
+            if home.is_symlink() or (home / "auth.json").is_symlink():
+                continue
+            held = codex_email_on_disk(home)
+            if held and held.casefold() == login.casefold():
+                return CodexHomeHoldingLogin(label, home, held)
+    return CodexSetupHome(label, Path.home() / f".codex{match.group(1)}")
+
+
 def codex_home_role_label(home: Path) -> str:
-    """The seats command's label for a default or numbered home."""
-    return "default" if home == Path.home() / ".codex" else f"codex {home.name.removeprefix('.codex')}"
+    """A signed-in account's note number, or its folder when unnamed."""
+    identity = codex_account(home)
+    return identity.label if isinstance(identity, KnownCodexAccount) else codex_home_display(home)
+
+
+def codex_home_matches_label(home: Path, label: str) -> bool:
+    """Match a current account label or the legacy default-home alias."""
+    if label == "default":
+        return home == Path.home() / ".codex"
+    if label == codex_home_role_label(home):
+        return True
+    if re.fullmatch(r"codex ([1-9][0-9]*)", label):
+        return codex_account_home(label).home == home
+    return False
 
 
 ClaudeRole = Literal["showrunners", "unit directors"]
@@ -410,7 +482,7 @@ def seats_home() -> Path:
     label = values["seats"]
     if not isinstance(label, str) or re.fullmatch(r"codex [1-9][0-9]*", label) is None:
         raise ValueError(f"accounts: {path} has an invalid seats account")
-    return Path.home() / f".codex{label.removeprefix('codex ')}"
+    return codex_account_home(label).home
 
 
 def codex_home_display(home: Path) -> str:
@@ -467,18 +539,18 @@ class CodexWorkUnknown:
 CodexWorkReadiness = CodexWorkAvailable | CodexWorkExhausted | CodexWorkUnknown
 
 
-def codex_can_work(report: Report, now: datetime) -> CodexWorkReadiness:
+def codex_can_work(report: Report, now: datetime, credits: CodexCreditsSetting) -> CodexWorkReadiness:
     """Decide from this live reading; an expired window supplies no allowance."""
     if report.problem or report.tool.lower() != "codex":
         return CodexWorkUnknown(report.problem or "not a Codex reading")
-    credits = report.credit_balance
-    if credits == "unlimited":
+    balance_text = report.credit_balance
+    if isinstance(credits, CreditsOn) and balance_text == "unlimited":
         return CodexWorkAvailable()
     try:
-        balance = float(credits) if credits is not None else math.nan
+        balance = float(balance_text) if balance_text is not None else math.nan
     except ValueError:
         balance = math.nan
-    if math.isfinite(balance) and balance > 0:
+    if isinstance(credits, CreditsOn) and math.isfinite(balance) and balance > 0:
         return CodexWorkAvailable()
     weekly = next((quota for quota in report.quotas if quota.label == "Weekly"), None)
     windows = (report.five_hour, weekly)
@@ -488,7 +560,7 @@ def codex_can_work(report: Report, now: datetime) -> CodexWorkReadiness:
             return CodexWorkUnknown("current 5-hour and weekly usage is unavailable; refresh and try again")
     if all(window is not None and (window.remaining_percent or 0) > 0 for window in windows):
         return CodexWorkAvailable()
-    if credits == "null" or math.isfinite(balance) and balance == 0:
+    if isinstance(credits, CreditsOff) or balance_text == "null" or math.isfinite(balance) and balance == 0:
         return CodexWorkExhausted()
     return CodexWorkUnknown("credit balance is unavailable; refresh and try again")
 

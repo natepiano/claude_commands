@@ -103,7 +103,7 @@ class RoleWriteTime(datetime):
 
 
 # The Codex home's row when nothing is signed in to it.
-CODEX_HOME_ROW = ("~/.codex", "—", "not logged in", "seats", *("—",) * 7)
+CODEX_HOME_ROW = ("~/.codex", "~/.codex", "not logged in", "seats", *("—",) * 7)
 
 
 @final
@@ -1725,8 +1725,8 @@ class AccountsTests(unittest.TestCase):
         first = self.status_rows()[-1]
         second = self.status_rows()[-1]
 
-        # A login with no account note has no label.
-        self.assertEqual(first[:4], ("~/.codex", "—", "seats@example.invalid", "seats"))
+        # A login with no account note is identified by its home folder.
+        self.assertEqual(first[:4], ("~/.codex", "~/.codex", "seats@example.invalid", "seats"))
         self.assertEqual((first[6], first[8], first[9]), ("70%", "no", "5"))
         self.assertNotEqual(first[10], "—")
         self.assertEqual(second, first)
@@ -1951,8 +1951,8 @@ class AccountsTests(unittest.TestCase):
         self.assertEqual([row[:4] for row in rows], [
             ("~/.codex", "codex 1", "MAIN-CODEX@example.invalid", "seats"),
             ("~/.codex2", "codex 2", "spare@example.invalid", "spare"),
-            ("~/.codex4", "—", "unknown@example.invalid", "spare"),
-            ("~/.codex10", "codex 10", "not logged in", "spare"),
+            ("~/.codex4", "~/.codex4", "unknown@example.invalid", "spare"),
+            ("~/.codex10", "~/.codex10", "not logged in", "spare"),
             ("~/.codex3", "codex 3", "not set up", "—"),
         ])
 
@@ -1991,11 +1991,11 @@ class AccountsTests(unittest.TestCase):
         (self.home / ".codex1").mkdir(mode=0o700)
         rows = self.status_rows()
         row = next(row for row in rows if row[0] == "~/.codex1")
-        self.assertEqual(row[:4], ("~/.codex1", "codex 1", "not logged in", "spare"))
+        self.assertEqual(row[:4], ("~/.codex1", "~/.codex1", "not logged in", "spare"))
         report = self.run_cli("status")[1]
         self.assertIn("codex 1", report.split("\n\n", 1)[1])
         self.assertIn("sign in", report.split("\n\n", 1)[1].lower())
-        self.assertEqual(accounts.codex_home_label(self.home / ".codex1"), "codex 1")
+        self.assertEqual(accounts.codex_home_label(self.home / ".codex1"), "~/.codex1")
 
     def test_status_assigns_seats_to_the_selected_codex_home(self) -> None:
         self.login_directory("claude 2", "main@example.invalid", default=True)
@@ -2214,7 +2214,7 @@ class AccountsTests(unittest.TestCase):
 
     def test_seats_role_defaults_independently_of_the_callers_home(self) -> None:
         with patch.dict(os.environ, {"CODEX_HOME": str(self.root / "caller")}):
-            self.assertEqual(self.run_cli("role", "seats"), (0, "default\n", ""))
+            self.assertEqual(self.run_cli("role", "seats"), (0, "~/.codex\n", ""))
             self.assertEqual(agent_accounts.seats_home(), self.home / ".codex")
         self.assertEqual(self.role_files(), {})
 
@@ -2238,7 +2238,7 @@ class AccountsTests(unittest.TestCase):
             unit = accounts.role_account("unit")
             seats = accounts.role_account("seats")
             self.assertIsInstance(seats, accounts.CodexSeatsAccount)
-            self.assertEqual((seats.home, seats.label), (self.home / ".codex", "default"))
+            self.assertEqual((seats.home, seats.label), (self.home / ".codex", "~/.codex"))
             self.assertEqual(accounts.account_prefix(unit), "")
             self.assertEqual(shlex.split(accounts.account_prefix(seats)), [f"CODEX_HOME={self.home / '.codex'}"])
             self.assertEqual(accounts.launch_prefix("seats"), accounts.account_prefix(seats))
@@ -2338,6 +2338,42 @@ class AccountsTests(unittest.TestCase):
         self.assertEqual(self.role_files(), before)
         retire.assert_called_once_with(target, "codex 1", dry_run=True)
 
+    def test_numbered_seats_target_selects_the_login_in_the_home_directory(self) -> None:
+        default, _ = self.seats_fixture()
+        self.assertEqual(self.run_cli("set-role", "seats", "codex 1"), (0, "", ""))
+        report = cast(agent_accounts.Report, self.codex_reads.return_value)
+        report.email = "default@example.invalid"
+        report.source = agent_accounts.CodexHomeSource(default)
+        before = self.role_files()
+        with patch.object(codex_mesh, "retire_seats_servers", return_value=[]) as retire:
+            code, stdout, stderr = self.run_cli("swap", "seats", "codex 2", "--dry-run")
+        self.assertEqual((code, stderr), (0, ""))
+        self.assertIn("codex 2 (~/.codex)", stdout)
+        self.assertEqual(self.role_files(), before)
+        retire.assert_called_once_with(default, "codex 2", dry_run=True)
+        self.assertEqual(self.run_cli("set-role", "seats", "codex 2"), (0, "", ""))
+        self.assertEqual(agent_accounts.seats_home(), default)
+        self.assertEqual(self.run_cli("role", "seats"), (0, "codex 2\n", ""))
+        self.assertEqual(accounts.role_account("seats").home, default)
+        self.assertEqual(json.loads(accounts.accounts_config_file().read_text())["seats"], "codex 2")
+
+    def test_seats_swap_refuses_paid_credits_when_the_target_setting_is_off(self) -> None:
+        _, target = self.seats_fixture()
+        note = Path(os.environ["AGENT_NOTES_DIR"]) / "codex 1.md"
+        _ = note.write_text("---\nlogin: target@example.invalid\nuse_credits: off\n---\n")
+        report = cast(agent_accounts.Report, self.codex_reads.return_value)
+        report.quotas = [agent_accounts.Quota("Weekly", 100, datetime.now(timezone.utc) + timedelta(days=1))]
+        report.credit_balance = "6370"
+        before = self.role_files()
+        with patch.object(codex_mesh, "retire_seats_servers") as retire:
+            code, stdout, stderr = self.run_cli("swap", "seats", "codex 1")
+        self.assertNotEqual(code, 0)
+        self.assertIn("is used up and set not to use credits; choose another account or wait for reset", stdout + stderr)
+        self.assertIn("codex 1 (~/.codex1)", stdout + stderr)
+        self.assertEqual(self.role_files(), before)
+        self.assertEqual(target, self.home / ".codex1")
+        retire.assert_not_called()
+
     def test_seats_swap_writes_role_before_retiring_servers(self) -> None:
         _, target = self.seats_fixture()
         observed: list[Path] = []
@@ -2378,7 +2414,7 @@ class AccountsTests(unittest.TestCase):
             result, _, stderr = self.run_cli("swap", "seats", "default")
         self.assertEqual((result, stderr), (0, ""))
         retire.assert_called_once_with(default, "codex 2", dry_run=False)
-        self.assertEqual(self.run_cli("role", "seats"), (0, "default\n", ""))
+        self.assertEqual(self.run_cli("role", "seats"), (0, "codex 2\n", ""))
 
     def test_seats_swap_default_refuses_unreadable_or_duplicate_login_without_mutation(self) -> None:
         default, _ = self.seats_fixture()
@@ -2603,7 +2639,7 @@ _ = sys.stdin.read()
         config = accounts.accounts_config_file()
         config.parent.mkdir(parents=True, exist_ok=True)
         _ = config.write_text('{"unit": "claude 3"}')
-        self.assertEqual(self.run_cli("role", "seats"), (0, "default\n", ""))
+        self.assertEqual(self.run_cli("role", "seats"), (0, "~/.codex\n", ""))
         self.assertEqual(agent_accounts.seats_home(), self.home / ".codex")
 
 
@@ -2922,24 +2958,84 @@ class PickerTests(unittest.TestCase):
         self.reading("Codex", "second@example.invalid", 1, 2)
         self.assert_picked("codex 2", tool="codex")
 
-    def test_codex_picker_without_fresh_readings_keeps_candidate_or_uses_default(self) -> None:
+    def test_unnoted_home_pick_is_accepted_as_a_seats_swap_destination(self) -> None:
+        """F002: a picker destination must be usable by its swap consumer."""
+        self.codex("default", "unnamed@example.invalid")
+        self.codex("codex 2", "seats@example.invalid")
+        (self.home / "notes/codex 1.md").unlink()
+        self.assertEqual(accounts.main(["set-role", "seats", "codex 2"]), 0)
+        self.reading("Codex", "unnamed@example.invalid", 80, 1)
+        self.reading("Codex", "seats@example.invalid", 50, 3)
+        chosen = accounts.pick("codex", self.now)
+        self.assertIsInstance(chosen, accounts.PickedAccount)
+        assert isinstance(chosen, accounts.PickedAccount)
+        self.assertEqual((chosen.label, chosen.dir), ("default", self.home / ".codex"))
+        self.assertEqual(accounts.check_codex_target(chosen.label, agent_accounts.seats_home()).home, chosen.dir)
+        report = agent_accounts.Report("Codex", email="unnamed@example.invalid",
+            quotas=[agent_accounts.Quota("Weekly", 20, self.now + timedelta(days=1))],
+            five_hour=agent_accounts.Quota("5-hour", 50, self.now + timedelta(hours=3)))
+        with (patch.object(accounts, "_codex_live", return_value=report),
+              patch.object(accounts, "datetime", PickerTime),
+              patch.object(accounts, "_retire_seats_servers", return_value=[]) as retire):
+            result = accounts.swap("seats", chosen.label, dry_run=True)
+        self.assertIsInstance(result, accounts.SeatsSwapDryRun)
+        retire.assert_called_once_with(chosen.dir, "unnamed@example.invalid", dry_run=True)
+
+    def test_codex_exclude_default_excludes_the_numbered_home_account(self) -> None:
+        """F003: the legacy home alias excludes its current numbered login."""
+        self.codex("default", "main@example.invalid")
+        self.codex("codex 2", "spare@example.invalid")
+        self.reading("Codex", "main@example.invalid", 80, 1)
+        self.reading("Codex", "spare@example.invalid", 50, 3)
+        self.assert_picked("codex 2", "--exclude", "default", tool="codex")
+
+    def test_codex_keep_default_retains_the_numbered_home_account(self) -> None:
+        """F003: keeping the home alias outranks the spare's earlier reset."""
+        self.codex("default", "main@example.invalid")
+        self.codex("codex 2", "spare@example.invalid")
+        self.reading("Codex", "main@example.invalid", 80, 3)
+        self.reading("Codex", "spare@example.invalid", 50, 1)
+        self.assert_picked("codex 1", "--keep", "default", tool="codex")
+        self.assert_picked("codex 2", "--keep", "default", "--exclude", "codex 1", tool="codex")
+
+    def test_codex_exclude_default_cannot_reselect_a_duplicate_home_login(self) -> None:
+        """F002/F003: a duplicate folder cannot bypass exclusion of the canonical destination."""
+        self.codex("default", "main@example.invalid")
+        self.codex("codex 1", "original@example.invalid")
+        _ = (self.home / ".codex1/auth.json").write_text((self.home / ".codex/auth.json").read_text())
+        _ = (self.home / "notes/codex 1.md").write_text("---\nlogin: main@example.invalid\n---\n")
+        self.codex("codex 2", "spare@example.invalid")
+        self.reading("Codex", "main@example.invalid", 80, 1)
+        self.reading("Codex", "spare@example.invalid", 50, 3)
+        self.assert_picked("codex 2", "--exclude", "default", tool="codex")
+
+    def test_codex_picker_without_fresh_readings_keeps_candidate_or_uses_the_home_account(self) -> None:
         self.codex("default", "seats@example.invalid")
         self.codex("codex 2", "other@example.invalid")
-        self.assert_picked("default", tool="codex")
+        self.assert_picked("codex 1", tool="codex")
         self.assert_picked("codex 2", "--keep", "codex 2", tool="codex")
         refusals.write_refusal(refusals.AccountRefusal("codex", "other@example.invalid",
             refusals.UnknownWindow(), refusals.NoResetKnown(), self.now))
-        self.assert_picked("default", "--keep", "codex 2", tool="codex")
+        self.assert_picked("codex 1", "--keep", "codex 2", tool="codex")
 
     def test_picker_codex_credits_allow_work_after_both_windows_are_exhausted(self) -> None:
         self.codex("default", "seats@example.invalid")
         self.reading("Codex", "seats@example.invalid", 0, 2, five_left=0, credits="1")
-        self.assert_picked("default", tool="codex")
+        self.assert_picked("codex 1", tool="codex")
+
+    def test_picker_skips_paid_room_on_a_credits_off_account(self) -> None:
+        self.codex("default", "seats@example.invalid")
+        self.codex("codex 2", "spare@example.invalid")
+        note = self.home / "notes/codex 1.md"
+        _ = note.write_text("---\nlogin: seats@example.invalid\nuse_credits: off\n---\n")
+        self.reading("Codex", "seats@example.invalid", 0, 1, credits="6370")
+        self.reading("Codex", "spare@example.invalid", 1, 3)
+        self.assert_picked("codex 2", tool="codex")
 
     def test_picker_codex_unlimited_credits_allow_work(self) -> None:
         self.codex("default", "seats@example.invalid")
         self.reading("Codex", "seats@example.invalid", 0, 2, five_left=0, credits="unlimited")
-        self.assert_picked("default", tool="codex")
+        self.assert_picked("codex 1", tool="codex")
 
     def test_picker_codex_without_credits_requires_both_windows_with_room(self) -> None:
         self.codex("default", "seats@example.invalid")

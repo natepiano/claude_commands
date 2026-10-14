@@ -81,6 +81,7 @@ from scripts.usage import agents_log
 from scripts.whoami.agent_accounts import (
     seats_home, codex_home, codex_home_display, user_zone,
     KnownCodexAccount, UnknownCodexAccount, RefusingCodexAccount, codex_account, codex_home_role_label,
+    codex_home_matches_label,
 )
 
 
@@ -3084,9 +3085,12 @@ def _requested_seat_move(source: CodexServingState, destination: Path) -> Reques
         return NoRequestedSeatMove()
     requests = [entry for entry in moves.read_moves() if entry["kind"] == "requested"
                 and entry["tool"] == "codex" and entry["subject"] == "seats"]
-    if (requests and requests[-1]["from"] == codex_home_role_label(source.home)
-            and requests[-1]["to"] == codex_home_role_label(destination)):
-        return requests[-1]
+    if (requests and codex_home_matches_label(source.home, requests[-1]["from"])
+            and codex_home_matches_label(destination, requests[-1]["to"])):
+        # Confirmation consumes the current destination label; keep the legacy journal unchanged.
+        matched = requests[-1].copy()
+        matched["to"] = codex_home_role_label(destination)
+        return matched
     return NoRequestedSeatMove()
 
 

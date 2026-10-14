@@ -156,6 +156,41 @@ class AgentNotesTests(unittest.TestCase):
             "tokens": {"id_token": f"header.{claims}.signature"},
         }))
 
+    def test_two_minute_snapshots_preserve_the_user_credit_setting_line_in_place(self) -> None:
+        for setting in ("off", "on"):
+            with self.subTest(setting=setting):
+                path = self.root / "codex 2.md"
+                original = ("---\ncredit_balance: 2115\ndate_modified: old\nlimit_reset: null\n"
+                    + "limit_reset_count: 0\nlogin: snapshot@example.invalid\nresets: old\nstate: inactive\n"
+                    + f"# My credit policy\nuse_credits: {setting}\n# Keep the policy here\n"
+                    + "weekly_remaining_usage: 98\nweekly_usage_checked_at: old\n---\nBody stays.\n").encode()
+                _ = path.write_bytes(original)
+                policy = f"use_credits: {setting}\n".encode()
+                policy_index = original.splitlines(keepends=True).index(policy)
+                for minute, used, credits in ((0, 3, "2114"), (2, 4, "2113")):
+                    note = read_note(path)
+                    assert note is not None
+                    observed = self.now + timedelta(minutes=minute)
+                    report = Report("Codex", email="snapshot@example.invalid",
+                        source=CodexHomeSource(self.root / ".codex"),
+                        quotas=[Quota("Weekly", used, self.future)], credit_balance=credits,
+                        limit_reset_count=1)
+                    messages = apply([note], report, observed)
+                    self.assertTrue(messages, "the usage observation must actually rewrite the note")
+                    rewritten = path.read_bytes()
+                    lines = rewritten.splitlines(keepends=True)
+                    self.assertEqual(lines.count(policy), 1)
+                    self.assertEqual(lines[policy_index], policy)
+                    self.assertEqual(lines[policy_index - 1:policy_index + 2],
+                                     original.splitlines(keepends=True)[policy_index - 1:policy_index + 2])
+                    self.assertTrue(rewritten.endswith(b"---\nBody stays.\n"))
+                    updated = read_note(path)
+                    assert updated is not None
+                    self.assertEqual(updated.get("credit_balance"), credits)
+                    self.assertEqual(updated.get("weekly_remaining_usage"), str(100 - used))
+                    self.assertEqual(updated.get("weekly_usage_checked_at"), observed.isoformat(timespec="seconds"))
+                    self.assertEqual(updated.get("use_credits"), setting)
+
     def test_update_passes_one_frozen_codex_reading_to_watch_alert_and_refresh(self) -> None:
         default, spare = self.root / ".codex", self.root / ".codex2"
         self.codex_login(default, "seats@example.com")

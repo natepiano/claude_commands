@@ -46,6 +46,62 @@ class CodexHomesTests(unittest.TestCase):
         }, clear=True)))
         del environment_context
         _ = self.enterContext(patch.object(note_file, "AGENTS_DIR", self.home))
+        _ = self.enterContext(patch.object(showrunners, "NOTIFIER_STATE_DIR", self.home / "notifier"))
+
+    def test_home_role_label_uses_the_login_note_number_or_the_unnoted_folder(self) -> None:
+        home = self.select_seats("codex 2")
+        _ = home.rename(self.home / ".codex")
+        self.assertEqual(agent_accounts.codex_home_role_label(self.home / ".codex"), "codex 2")
+        (self.home / "codex 2.md").unlink()
+        self.assertEqual(agent_accounts.codex_home_role_label(self.home / ".codex"), "~/.codex")
+
+    def test_numbered_account_resolves_the_home_holding_its_login_and_a_setup_home_otherwise(self) -> None:
+        home = self.select_seats("codex 2")
+        _ = home.rename(self.home / ".codex")
+        resolved = agent_accounts.codex_account_home("codex 2")
+        self.assertIsInstance(resolved, agent_accounts.CodexHomeHoldingLogin)
+        assert isinstance(resolved, agent_accounts.CodexHomeHoldingLogin)
+        self.assertEqual((resolved.label, resolved.home, resolved.login),
+                         ("codex 2", self.home / ".codex", "selected@example.invalid"))
+        self.assertEqual(agent_accounts.seats_home(), self.home / ".codex")
+        _ = (self.home / "codex 1.md").write_text("---\nlogin: next@example.invalid\n---\n")
+        missing = agent_accounts.codex_account_home("codex 1")
+        self.assertIsInstance(missing, agent_accounts.CodexSetupHome)
+        self.assertEqual((missing.label, missing.home), ("codex 1", self.home / ".codex1"))
+
+    def test_home_matches_its_numbered_account_and_legacy_default_alias(self) -> None:
+        """F003/F004: aliases identify the same home without matching another login."""
+        home = self.select_seats("codex 2")
+        _ = home.rename(self.home / ".codex")
+        current = self.home / ".codex"
+        self.assertTrue(agent_accounts.codex_home_matches_label(current, "default"))
+        self.assertTrue(agent_accounts.codex_home_matches_label(current, "codex 2"))
+        other = self.select_seats("codex 1")
+        self.assertFalse(agent_accounts.codex_home_matches_label(other, "default"))
+        self.assertFalse(agent_accounts.codex_home_matches_label(other, "codex 2"))
+        self.assertFalse(agent_accounts.codex_home_matches_label(current, "codex 1"))
+
+    def test_credit_setting_reads_on_off_and_defaults_to_on(self) -> None:
+        path = self.home / "codex 1.md"
+        for field, expected in (("use_credits: off\n", agent_accounts.CreditsOff),
+                                ("use_credits: on\n", agent_accounts.CreditsOn),
+                                ("", agent_accounts.CreditsOn),
+                                ("use_credits: sometimes\n", agent_accounts.CreditsOn)):
+            with self.subTest(field=field):
+                _ = path.write_text("---\nlogin: next@example.invalid\n" + field + "---\n")
+                self.assertIsInstance(agent_accounts.codex_credits_setting("codex 1"), expected)
+
+    def test_credit_setting_off_disallows_paid_room_in_either_exhausted_window(self) -> None:
+        now = datetime.now(timezone.utc)
+        for weekly_used, five_used in ((100, 10), (10, 100), (100, 100)):
+            for balance in ("6370", "unlimited"):
+                with self.subTest(weekly=weekly_used, five=five_used, balance=balance):
+                    report = Report("Codex", quotas=[agent_accounts.Quota("Weekly", weekly_used, now + timedelta(days=1))],
+                        five_hour=agent_accounts.Quota("5-hour", five_used, now + timedelta(hours=1)), credit_balance=balance)
+                    self.assertIsInstance(agent_accounts.codex_can_work(report, now, agent_accounts.CreditsOff()),
+                                          agent_accounts.CodexWorkExhausted)
+                    self.assertIsInstance(agent_accounts.codex_can_work(report, now, agent_accounts.CreditsOn()),
+                                          agent_accounts.CodexWorkAvailable)
 
     def select_seats(self, label: str) -> Path:
         home = self.home / f".codex{label.removeprefix('codex ')}"
@@ -313,7 +369,7 @@ class CodexHomesTests(unittest.TestCase):
             with self.subTest(weekly=weekly, five_hour=five_hour, credits=credits):
                 report = Report("Codex", five_hour=agent_accounts.Quota("5-hour", five_hour, future),
                     quotas=[agent_accounts.Quota("Weekly", weekly, future)], credit_balance=credits)
-                self.assertIsInstance(agent_accounts.codex_can_work(report, now), expected)
+                self.assertIsInstance(agent_accounts.codex_can_work(report, now, agent_accounts.CreditsOn()), expected)
 
     def test_codex_work_readiness_does_not_use_expired_or_missing_allowance(self) -> None:
         now = datetime.now(timezone.utc)
@@ -327,7 +383,7 @@ class CodexHomesTests(unittest.TestCase):
             Report("Codex", problem="usage failed", credit_balance="0"),
         ):
             with self.subTest(report=report):
-                self.assertIsInstance(agent_accounts.codex_can_work(report, now), agent_accounts.CodexWorkUnknown)
+                self.assertIsInstance(agent_accounts.codex_can_work(report, now, agent_accounts.CreditsOn()), agent_accounts.CodexWorkUnknown)
 
     def test_home_preparation_restarts_an_unanswered_server_then_finishes_initialize(self) -> None:
         home = self.home / ".codex1"
