@@ -69,8 +69,6 @@ that builds the wrong thing.
 - Work Specification: Goal, Spec, Files, Workers verbatim, plus command-line
   amendments. Workers is what <LaunchImplementation/> partitions and opens from;
   when a plan predates the field, the launch step decides and says so.
-- Capture **Style** only as `${STYLE_GATE_CONFIG}` for
-  <RunProjectStyleReview/>.
 - Verification: translate Build/Test/Lint/Run/Smoke and Acceptance gate into
   <VerificationContract/> lines. Convert old raw Cargo/full-clippy entries to
   scoped `verify.sh`; the unit director retains live smoke ownership.
@@ -82,8 +80,7 @@ effect. Mark the dispatch as assembled from the Work Order without research.
 **Fallback:** research only enough to write the same prompt structure. Quote an
 applicable plan section verbatim, or compose a complete spec from the
 conversation with files, behavior, APIs, edges, and constraints. Point to files
-instead of copying their contents. Set `${STYLE_GATE_CONFIG}` to `rust` for Rust
-work, otherwise `none`; do not load style. Derive scoped verification per
+instead of copying their contents. Do not load style. Derive verification per
 <VerificationContract/>.
 
 If an initial verbose invocation contains a bounded-auto control, resolve

@@ -68,7 +68,7 @@ Fence (showrunner): Phase 2 edits `commands/unit/direct.md` and `scripts/delegat
 
 **Gotchas:** the style review's diff directory is per invocation; a fixed shared path lets concurrent units scan each other's diffs.
 
-### Phase 2 — Unit directors run the step, and /clippy is gone  · status: todo (fenced)
+### Phase 2 — Unit directors run the step, and /clippy is gone  · status: done
 
 **Depends on:** Phase 1
 
@@ -80,6 +80,36 @@ Fence (showrunner): Phase 2 edits `commands/unit/direct.md` and `scripts/delegat
 - Delete `commands/clippy.md` and `scripts/delegate/style_branch.sh`. Delete `scripts/lint/scan.sh`, `scripts/lint/clippy_config.sh` and `config/clippy.conf` only after confirming nothing else calls them — hooks, the nightly review, cargo-port's lint mirror, any script or settings entry; a file that has another caller stays. `scripts/delegate/progress_timer.sh` stays; the unit notifier uses it.
 - Reword every remaining reference: `commands/unit/checkpoint.md`, `commands/unit/ci.md`, `docs/delegate/compose_work_order.md`, `docs/delegate/final_gate_commit.md` (its report names "style review and closing repairs"), `docs/delegate_footprint_review.md`, `docs/delegate_plan_format.md` and `commands/plan/to_phased_plan.md` (the plan's **Style** field goes), `commands/commit_prep.md`, `commands/validate_and_push.md` (it states mend's rollback stop itself instead of pointing at `/clippy`), `commands/lint_config.md` and `scripts/lint/lint_config.sh` (consumer columns), `config/README.md` (the `clippy.conf` section goes), `scripts/lint/invoke.sh` and `scripts/hooks/banned_words_lib.py` (comments).
 - Gate: `scripts/lint` and `scripts/delegate` suites and basedpyright on the touched Python. Then `rg -n '/clippy\b|clippy\.md|style_branch|clippy_config|clippy\.conf|scan\.sh'` over this repository returns only as-built history, and the same search over `~/rust/*/CLAUDE.md`, `~/rust/*/docs`, `~/rust/nate_style` and `/etc/nixos` is reported to the showrunner hit by hit — those repositories are not this unit's to edit.
+
+#### Work Order
+
+**Goal:** every unit phase runs `<PhaseChecks/>` once — lint in the workers' last `verify.sh lint`, the style review in the unit director's main review — and nothing at the end of the plan repeats them; `/clippy` and its files are gone and nothing points at them.
+
+**Spec:** the bullets above under this phase heading are the Spec, with these facts:
+1. Vocabulary: production branch now says "workers", not "seats" (`docs/long-lived-workers.md`); every edit uses "workers".
+2. `commands/unit/direct.md` (current lines): description line 2; state `STYLE_GATE_CONFIG`, `STYLE_REVIEW_DONE`, `STYLE_DIFF_BASE` (45–49); TagReferenceContract row 73 becomes `<PhaseChecks/>` → `docs/delegate/phase_checks.md` and `<StyleReview/>` → `commands/unit/style_review.md` (`/unit:style_review`); the `/clippy` load rule 87 keeps only the `plan:` commands; CoreContract 132 (branch approved in `<ResolveStyleDiffBase/>` goes; the run creates only the remote branch `<PushCheckpoint/>` pushes) and 136 (the inline cleanup exception goes); CompactionContract 380 drops the two STYLE fields; VerificationContract 442–488 (the "full `clippy` skill" and "Workspace breadth belongs to <FinalGate/>" rules point at `<PhaseChecks/>`; the `style_review=off` line becomes: `LINT_OP_STYLE_REVIEW=off` makes the phase style review report `Off`); ExecutionSteps 3 and 10 go and the list renumbers; the `<ResolveStyleDiffBase>` (734–743) and `<RunProjectStyleReview>` (1303–1311) stubs go; 1437–1438 drop the style-state sentence; `<FinalGate/>` (about 1445–1475) keeps `verify.sh final` once and drops step 2 (`clippy.md auto-proceed no-style`) and step 4 (the style review and its rerun), renumbering; RunSummary 1499's **Style review** line reports each phase's style result. Name `<PhaseChecks/>` at the phase's review point (where `<DualReview/>` is called after implementation).
+3. `docs/delegate/dual_review.md` `<DualReview/>` step 4: on pass 1 only, the main review runs `<PhaseChecks/>`'s style review by reading `commands/unit/style_review.md` → `<StyleReview/>` with `since <phase baseline commit>` and `${SESSION_DIR}` as its directory; violations are opened in the ledger (`findings.py open --caught-by main`). Phase baseline = HEAD when the phase's implementation launched (record it in `${SESSION_DIR}/phase_baseline` at `<LaunchImplementation/>` step 1 in `docs/delegate/launch_implementation.md`). Remove the "style-guide conformance is out of scope" wording only if it now contradicts; the blind lenses still never audit style.
+4. `scripts/delegate/verify.sh` `final` (about line 1480): drop `fmt_cargo --check`; keep `cargo check --workspace --all-targets` and `run_nextest`; reword the comment at about line 36 naming `/clippy`. Update any test in `scripts/delegate/test_*.py` that pins the old `final` steps.
+5. Deletion caller check is done: nothing outside `commands/clippy.md`, `commands/lint_config.md`, `config/README.md` and the files themselves names `scripts/lint/scan.sh`, `scripts/lint/clippy_config.sh` or `config/clippy.conf` (no hook, settings entry, nightly review, cargo-port or `~/rust` file). Delete all three, plus `commands/clippy.md` and `scripts/delegate/style_branch.sh`.
+
+**Files:**
+- `commands/unit/direct.md` — as Spec 2
+- `docs/delegate/dual_review.md` — style review in the main review
+- `docs/delegate/launch_implementation.md` — record the phase baseline
+- `commands/unit/style_review.md` — remove the end-of-run sections, intro paragraph and `clippy.md` read
+- `docs/delegate/write_prompt_contract.md` — item 2's `rust_style` reason
+- `docs/delegate/phase_checks.md` — only if a wording must change
+- `scripts/delegate/verify.sh` — `final` without fmt, comment
+- `commands/clippy.md`, `scripts/delegate/style_branch.sh`, `scripts/lint/scan.sh`, `scripts/lint/clippy_config.sh`, `config/clippy.conf` — deleted
+- `commands/unit/checkpoint.md`, `commands/unit/ci.md`, `docs/delegate/compose_work_order.md`, `docs/delegate/final_gate_commit.md`, `docs/delegate_footprint_review.md`, `docs/delegate_plan_format.md`, `commands/plan/to_phased_plan.md`, `commands/commit_prep.md`, `commands/validate_and_push.md`, `commands/lint_config.md`, `scripts/lint/lint_config.sh`, `config/README.md`, `scripts/lint/invoke.sh`, `scripts/hooks/banned_words_lib.py` — reworded
+
+**Seats:** 2 writers — the run's contracts and the scripts they run, split from the reference cleanup
+- `impl` — `commands/unit/direct.md`, `docs/delegate/dual_review.md`, `docs/delegate/launch_implementation.md`, `commands/unit/style_review.md`, `docs/delegate/write_prompt_contract.md`, `docs/delegate/phase_checks.md`, `scripts/delegate/verify.sh` and its tests
+- `review` (opens as impl) — the five deletions and every reworded file in the last Files line
+
+**Constraints from prior phases:** `<StyleReview/>` takes `since <ref>` and a caller directory, verifies the baseline, and reports `Off` from `LINT_OP_STYLE_REVIEW`; the repair rules already sit under `write_prompt_contract.md` item 6.
+
+**Acceptance gate:** `scripts/delegate`, `scripts/lint` and `scripts/lib` suites green (explicit module names); basedpyright `0 errors, 0 warnings` on touched Python; `rg -n '/clippy\b|clippy\.md|style_branch|clippy_config|clippy\.conf|scan\.sh|ResolveStyleDiffBase|RunProjectStyleReview|STYLE_DIFF_BASE|STYLE_REVIEW_DONE|STYLE_GATE_CONFIG'` over the repository returns only `docs/as-built/` and `docs/plans/` lines; the same search over `~/rust/*/CLAUDE.md`, `~/rust/*/docs`, `~/rust/nate_style` and `/etc/nixos` is listed in the summary, not edited.
 
 As-built at run end: `docs/as-built/session-notifier.md` (its `/clippy launches progress_timer.sh` line), `docs/as-built/build-memory-admission.md`, and the as-built that describes `/unit:direct`'s gates.
 

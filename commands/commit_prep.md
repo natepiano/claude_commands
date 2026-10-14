@@ -18,14 +18,11 @@ the title on its own — the title and body are presented together, once.
 <ClippyPrecheck>
 **Clippy is opt-in, and the default is not to run it.** Skip this step
 silently unless explicitly asked: no clippy run, no question about running
-one, no mention of it in your output. Never ask "Run `/clippy` first?" — the
-answer is already no unless the token below is present.
+one, no mention of it in your output.
 
-If `$ARGUMENTS` contains the token `clippy` (case-insensitive, matched as a whole word — and not `noclippy`), invoke the `clippy` skill immediately without asking, then continue to the next step.
+If `$ARGUMENTS` contains the token `clippy` (case-insensitive, matched as a whole word — and not `noclippy`), run `bash ~/.claude/scripts/lint/lint clippy --all-features` without asking. Read its output; on failure, stop and report it. Report a disabled check as `Off`. Then continue to the next step.
 
 Strip both the `clippy` and `noclippy` tokens from `$ARGUMENTS` before any later step uses it, so neither is treated as part of the commit title. `noclippy` is accepted and ignored — it names what already happens by default.
-
-When the `clippy` skill runs (from here or otherwise), its `<StyleReview/>` step must be done inline, not delegated to a subagent — the user needs to track progress through the whole workflow, not wait on an unauditable subagent turn.
 </ClippyPrecheck>
 
 <AnalyzeChanges>

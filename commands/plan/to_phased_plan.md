@@ -164,17 +164,13 @@ block — nothing else. The prompt must include:
      Build = `bash ~/.claude/scripts/delegate/verify.sh check <pkg>`;
      Test = `bash ~/.claude/scripts/delegate/verify.sh test <pkg>`;
      Lint = `bash ~/.claude/scripts/delegate/verify.sh lint <pkg>`.
-     Workspace-wide breadth — `--all-targets`, all examples, the full `clippy`
-     skill — belongs to /unit:direct's <FinalGate/> after the last phase,
-     never to any phase. For non-Rust projects, record the exact commands the
-     project uses (read `package.json`/`justfile`/CI config; do not invent).
-  6. **Style** — for Rust, record `run-end /clippy style-only auto-proceed`.
-     /unit:direct keeps this line out of coding and fix prompts, then runs one
-     style review for the whole project at <FinalGate/>, diffing the branch so
-     it reaches work every phase already checkpointed; omit for non-Rust.
-  7. **Invariants** — project-wide rules every phase must preserve (from the plan
+     <PhaseChecks/> defines the lint scope and the phase's style review in
+     the unit director's main review; workers never load the guide. For
+     non-Rust projects, record the exact commands the project uses (read
+     `package.json`/`justfile`/CI config; do not invent).
+  6. **Invariants** — project-wide rules every phase must preserve (from the plan
      and from obvious code constraints).
-  8. **Test lanes** — for each crate a phase touches, its `tests/` directory
+  7. **Test lanes** — for each crate a phase touches, its `tests/` directory
      path or `none`. **Workers** (`<Restructure/>` step 2) is drafted from this
      line without opening the tree again.
 - Output format: the `## Delegation Context` bullet block from the format doc,

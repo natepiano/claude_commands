@@ -557,7 +557,7 @@ def _scan_diff(diff_text: str) -> int:
 
 
 def _main() -> int:
-    """CLI entry point for ad-hoc scans (e.g. /clippy style review, fix pipeline).
+    """CLI entry point for scans (e.g. /unit:style_review, fix pipeline).
 
     Usage:
         python3 banned_words_lib.py --analysis     # print local counter state
