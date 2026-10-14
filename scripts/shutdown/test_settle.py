@@ -641,6 +641,31 @@ class SettleTests(ShutdownTestCase):
         director = session_shutdown(unit("unit", "Unit"))
         self.assertIsInstance(settle.next_step(runner, self.matching(runner), [runner, director], NOW_UTC), settle.StopSession)
 
+    def test_pause_message_starts_with_a_fixed_line_and_asks_for_a_stop_at_once(self) -> None:
+        moving = session_shutdown(unit("unit", "Unit"))
+        moving["target"], moving["why"] = "claude 1", "out of usage"
+        first, body = settle._settle_text(moving, moving["session"]).split("\n\n", 1)  # pyright: ignore[reportPrivateUsage]
+        self.assertTrue(first.startswith("Pause for move: claude 2 → claude 1 (out of usage, "), first)
+        self.assertIn("Stop now, without finishing the step you are in", body)
+        self.assertIn("shutdown.py ready --where", body)
+        self.assertIn("You will be resumed on claude 1 with that line", body)
+        self.assertNotIn("let any seat turn", body)
+        stopping = session_shutdown(top_level("owner", "Owner"))
+        first, _ = settle._settle_text(stopping, stopping["session"]).split("\n\n", 1)  # pyright: ignore[reportPrivateUsage]
+        self.assertTrue(first.startswith("Pause for stop: claude 2 (requested by the user, "), first)
+
+    def test_busy_unit_is_asked_once_more_after_two_minutes_and_never_stopped_without_its_mark(self) -> None:
+        saved = session_shutdown(unit("unit", "Unit"), requester="requester")
+        sent = NOW_UTC - settle.REASK_AFTER
+        saved["settle_message"] = {"kind": "sent", "at": sent.isoformat()}
+        busy = self.matching(saved)
+        self.assertNotIsInstance(settle.next_step(saved, busy, [saved], sent + settle.REASK_AFTER - timedelta(seconds=1)), settle.SendSettleMessage)
+        self.assertIsInstance(settle.next_step(saved, busy, [saved], NOW_UTC), settle.SendSettleMessage)
+        saved["reasked_at"] = NOW
+        step = settle.next_step(saved, busy, [saved], NOW_UTC + timedelta(hours=1))
+        self.assertNotIsInstance(step, settle.SendSettleMessage)
+        self.assertNotIsInstance(step, settle.StopSession)
+
     def test_now_stops_a_busy_requester_without_waiting_for_its_request(self) -> None:
         requester = session_shutdown(top_level("requester", "Requester"), requester="requester", then="restart")
         requester["force"] = "now"
@@ -1905,9 +1930,9 @@ class SettleTests(ShutdownTestCase):
             saved = session_shutdown(top_level("owner", "Owner"))
             saved["settle_message"] = delivery
             baseline = NOW_UTC + (timedelta(minutes=2) if delivery["kind"] == "sent" else timedelta())
-            self.assertFalse(settle._holdout_due(saved, baseline + timedelta(minutes=5) - timedelta(seconds=1)))  # pyright: ignore[reportPrivateUsage]
-            self.assertTrue(settle._holdout_due(saved, baseline + timedelta(minutes=5)))  # pyright: ignore[reportPrivateUsage]
-            saved["alerted_at"] = (baseline + timedelta(minutes=5)).isoformat()
+            self.assertFalse(settle._holdout_due(saved, baseline + settle.NOT_ANSWERING_AFTER - timedelta(seconds=1)))  # pyright: ignore[reportPrivateUsage]
+            self.assertTrue(settle._holdout_due(saved, baseline + settle.NOT_ANSWERING_AFTER))  # pyright: ignore[reportPrivateUsage]
+            saved["alerted_at"] = (baseline + settle.NOT_ANSWERING_AFTER).isoformat()
             self.assertFalse(settle._holdout_due(saved, baseline + timedelta(hours=3)))  # pyright: ignore[reportPrivateUsage]
             self.assertTrue(settle._holdout_due(saved, baseline + timedelta(hours=3), form=True))  # pyright: ignore[reportPrivateUsage]
             saved["form_alerted_at"] = saved["alerted_at"]

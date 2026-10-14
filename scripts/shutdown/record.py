@@ -360,6 +360,8 @@ class SessionShutdown(TypedDict):
     alerted_at: NotRequired[str]
     # The phone push for a form open in the session's pane; the user is told once.
     form_alerted_at: NotRequired[str]
+    # The one repeat of the pause message when no ready mark came back.
+    reasked_at: NotRequired[str]
     # The not-back failure last pushed to the user, so an unchanged one is not pushed again.
     restore_alerted: NotRequired[str]
     # Absent means resume on session.config_dir, never on a changed role.
@@ -968,7 +970,7 @@ def _session_shutdown(value: object, place: str) -> SessionShutdown:
             raise InvalidRecord(f"{seat_place}.owner must identify this session")
         parsed_seats.append(parsed)
     values["seats"] = parsed_seats
-    for field in ("alerted_at", "form_alerted_at"):
+    for field in ("alerted_at", "form_alerted_at", "reasked_at"):
         if field in values:
             _ = _utc_time(values[field], f"{place}.{field}")
     if "restore_alerted" in values:

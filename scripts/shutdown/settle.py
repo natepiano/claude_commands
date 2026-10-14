@@ -43,7 +43,9 @@ NOTIFIER = SCRIPTS / "message" / "notifier.sh"
 SEND = SCRIPTS / "message" / "send.py"
 SETTLE_INTERVAL_SECONDS = 15
 SETTLE_RETRY_SECONDS = 300
-NOT_ANSWERING_AFTER = timedelta(minutes=5)
+# A unit in the middle of /unit:direct answered a pause message in about a minute (2026-10-13).
+REASK_AFTER = timedelta(minutes=2)
+NOT_ANSWERING_AFTER = 2 * REASK_AFTER
 SHOWING_FORM = "showing a form"
 USAGE_LIMIT_PATTERNS = (
     "hit your session limit",
@@ -507,35 +509,43 @@ def _warm() -> bool:
         return False
     return result.returncode == 0
 
+PAUSE_FOR_MOVE = "Pause for move"
+PAUSE_FOR_STOP = "Pause for stop"
+
+
 def _settle_text(record: SessionShutdown, session: Session) -> str:
-    opening = (
-        f"Shutdown of account {record['label']} requested by the user with /shutdown "
-        f"({_user_time(record['requested_at'])}). "
-    )
+    """The pause message: a fixed first line the launching skills react to, then what to do now.
+
+    The session stops at once, mid-step: it is never waited on to go idle by itself, and the
+    stop follows its ready mark.
+    """
+    why = record.get("why", "") or "requested by the user"
+    target = record.get("target", "")
+    asked = f"({why}, {_user_time(record['requested_at'])})"
+    first_line = (f"{PAUSE_FOR_MOVE}: {record['label']} → {target} {asked}" if target
+                  else f"{PAUSE_FOR_STOP}: {record['label']} {asked}")
     command = (
         "`~/.claude/scripts/lib/py ~/.claude/scripts/shutdown/shutdown.py "
         "ready --where "
     )
     if session["kind"] == "unit":
-        return opening + (
-            "Reach a safe stop: let any seat turn already running finish, dispatch "
-            "nothing new, commit nothing new, push your branch if it has unpushed "
-            f"commits, and leave uncommitted work in place. Then run {command}"
-            '"<phase N: the step you finished and the step that comes next>"` and '
-            "end your turn with `— blocked: shutdown requested by the user`. You "
-            "will be resumed with that line."
-        )
-    if session["kind"] == "showrunner":
-        return opening + (
-            "Merge any checkpoint already sent to you, push the merge branch and main "
-            "as your production rules say, append a `### STATE` block to your LOG, "
-            f'then run {command}"<one line>"` and end your turn.'
-        )
-    return opening + (
-        "Finish the turn you are in, start nothing new, push any commits you made "
-        "that are ahead of their upstream, then run "
-        f'{command}"<what you were doing and what comes next>"` and end your turn.'
+        where = '"<phase N: the step you stopped in and what comes next>"'
+        started = "stop or end any seat or build you started, or name it in that line"
+        ending = " and end your turn with `— blocked: shutdown requested by the user`"
+    elif session["kind"] == "showrunner":
+        where = '"<one line>"'
+        started = "append a `### STATE` block to your LOG, stop or name any build you started"
+        ending = " and end your turn"
+    else:
+        where = '"<what you were doing and what comes next>"'
+        started = "stop or name anything you started that keeps running"
+        ending = " and end your turn"
+    return first_line + "\n\n" + (
+        f"Stop now, without finishing the step you are in, and start nothing new. Leave uncommitted work in place, "
+        f"{started}, then run {command}{where}`{ending}. "
+        f"You will be resumed {'on ' + target + ' ' if target else ''}with that line and continue from it."
     )
+
 
 def _progress_text(record: SessionShutdown) -> str:
     entry_progress = record["progress"]
@@ -733,6 +743,10 @@ def next_step(saved: SessionShutdown, owner: stop_work.FreshSession,
             if message["kind"] == "not sent" or (message["kind"] == "queued" and
                 now - datetime.fromisoformat(message["at"]) >= timedelta(seconds=SETTLE_RETRY_SECONDS)):
                 return SendSettleMessage()
+            # One more ask when no ready mark came back; after that the requester is told.
+            if (message["kind"] == "sent" and "reasked_at" not in saved
+                    and now - datetime.fromisoformat(message["at"]) >= REASK_AFTER):
+                return SendSettleMessage()
     if progress in {"stopped", "already gone", "process identity lost"} and saved["then"] == "restart":
         return RelaunchSession()
     if progress in {"stopping", "restarting"}:
@@ -752,12 +766,15 @@ def _send_settle_message(saved: SessionShutdown) -> None:
     if (not isinstance(found, store.ShutdownFound) or found.record["request_id"] != saved["request_id"]
         or found.record["progress"]["kind"] != "waiting"):
         return
-    delivery = send_message(f"session:{session['session_id']}",
-        f"Shutdown of {saved['label']}: reach a safe stop", _settle_text(saved, session),
+    text = _settle_text(saved, session)
+    delivery = send_message(f"session:{session['session_id']}", text.split("\n", 1)[0], text,
         key=f"shutdown-{saved['login']}-{session['session_id']}")
     at = record_time()
     def save(current: SessionShutdown) -> None:
         if current["request_id"] != saved["request_id"] or current["progress"]["kind"] != "waiting":
+            return
+        if current["settle_message"]["kind"] == "sent":
+            current["reasked_at"] = at
             return
         current["settle_message"] = ({"kind": "sent", "at": at} if delivery["kind"] == "sent"
                                     else {"kind": "queued", "at": at, "reason": delivery["reason"]})
