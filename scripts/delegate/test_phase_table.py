@@ -2331,6 +2331,33 @@ class PhaseTableTests(unittest.TestCase):
         heading = next(line for line in lines if line.startswith("**"))
         self.assertEqual(json.loads(lines[5].removeprefix("now: ")), heading[2:-2])
 
+    def test_refresh_with_phase_outside_the_plan_drops_the_plan_count(self) -> None:
+        self.write_production_plan()
+        self.write_plan(
+            plan_text(
+                "# Delivery plan",
+                "",
+                "> **Production: show** — unit `table-unit`; production doc `docs/show-production.md`",
+                "",
+                "### Phase 1 — Prior delivery  · status: done",
+                "",
+                "### Phase 2 — Next delivery  · status: todo",
+            )
+        )
+        _ = self.write_run(
+            "current",
+            900,
+            self.phase_event("phase_started", "14", "other", 1_000, phase_title="Placement disk"),
+        )
+        self.mark_unit("table")
+
+        result = self.run_refresh()
+
+        self.assertEqual((result.returncode, result.stdout, result.stderr), (0, "", ""))
+        lines = (self.vault_root / "showrunner" / "table.md").read_text(encoding="utf-8").splitlines()
+        self.assertEqual(lines[5], 'now: "Phase 14 — Placement disk · not in this plan"')
+        self.assertIn("**Phase 14 — Placement disk · not in this plan**", lines)
+
     def test_refresh_escapes_title_in_now_and_replaces_owned_note(self) -> None:
         self.write_production_plan()
         title = 'Delivery: "quoted" \\ path'

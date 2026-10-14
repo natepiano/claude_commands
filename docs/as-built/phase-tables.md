@@ -89,7 +89,7 @@ Every state is a named `NamedTuple`. Times are aware `datetime`s, and `None` app
 | 1 | Archived delivery | done | — | — |
 ```
 
-Rows are in descending plan order. Times are `MM-DD HH:MM` in `zone`, the zone abbreviation appears once on `Updated`, and an unknown cell is `—`. `_heading_text(record)` gives the heading's words (`Phase <id> of <total> — <title>` for an open phase) and `render` wraps them in bold. With no open phase the heading is `**No phase running — <done> of <total> done**` and the `ETA` and `ETA from` rows are absent. A stated ETA shows `| ETA from | stated 09:50: <basis> |`, with the basis's whitespace collapsed and `|` escaped, and its `ETA` cell carries parentheses only when a range came with it.
+Rows are in descending plan order. Times are `MM-DD HH:MM` in `zone`, the zone abbreviation appears once on `Updated`, and an unknown cell is `—`. `_heading_text(record)` gives the heading's words (`Phase <id> of <total> — <title>` for an open phase that is one of the plan's rows; `Phase <id> — <title> · not in this plan` when the open phase was recorded against this plan but is not one of its phases, because its run names a different plan than the one the unit is working) and `render` wraps them in bold. With no open phase the heading is `**No phase running — <done> of <total> done**` and the `ETA` and `ETA from` rows are absent. A stated ETA shows `| ETA from | stated 09:50: <basis> |`, with the basis's whitespace collapsed and `|` escaped, and its `ETA` cell carries parentheses only when a range came with it.
 
 `show --json` prints `_json_record(record, zone)`, with ISO-8601 offset times and `null` for a key with no value:
 

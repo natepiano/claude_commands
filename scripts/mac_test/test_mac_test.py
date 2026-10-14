@@ -864,6 +864,38 @@ class MacTestCommandTests(unittest.TestCase):
                 self.assertEqual(decoded[key], record[key])
         self.assertEqual(path.read_bytes(), before)
 
+    def test_free_now_answers_from_local_state_alone(self) -> None:
+        self.assert_command(self.command("free-now"), 1, "off\n")
+        self.write_config(offload="on")
+        self.assert_command(self.command("free-now"), 0, "free\n")
+
+        owner = self.start_child()
+        self.assert_command(self.command("claim", "--pid", str(owner.pid), "--what", "alpha tests"), 0, "claimed\n")
+        self.assert_command(self.command("free-now"), 1, "busy\n")
+        self.assert_command(self.command("release", "--pid", str(owner.pid)), 0, "")
+        record = self.kept_claim()
+        self.assert_command(self.command("free-now"), 1, "busy\n")
+        self.assert_command(self.command("release", "--pid", str(record["pid"])), 0, "")
+        self.assert_command(self.command("free-now"), 0, "free\n")
+
+        backoff = self.state_directory / "unreachable_until"
+        _ = backoff.write_text(f"{time.time() + 300:.6f}\n", encoding="utf-8")
+        self.assert_command(self.command("free-now"), 1, "backoff\n")
+        _ = backoff.write_text(f"{time.time() - 1:.6f}\n", encoding="utf-8")
+        self.assert_command(self.command("free-now"), 0, "free\n")
+
+        _ = self.write_block(free_message={"kind": "not_needed"})
+        self.assert_command(self.command("free-now"), 1, "blocked\n")
+        _ = (self.state_directory / "block.json").write_text("damaged\n", encoding="utf-8")
+        self.assert_command(self.command("free-now"), 1, "state\n")
+        (self.state_directory / "block.json").unlink()
+
+        settings = self.root / "off.conf"
+        _ = settings.write_text("offload=off\n", encoding="utf-8")
+        self.assert_command(self.command("free-now", "--settings", str(settings)), 1, "off\n")
+        self.assert_command(self.command("free-now"), 0, "free\n")
+        self.assertEqual(self.logged_arguments("gh"), [])
+
     def test_claim_reports_damaged_block_state(self) -> None:
         self.state_directory.mkdir()
         block_path = self.state_directory / "block.json"

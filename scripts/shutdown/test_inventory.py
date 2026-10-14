@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import io
 import os
 import socket
 import shutil
@@ -49,8 +50,158 @@ CURRENT_PROCESS_START = "current-process-start"
 FAKE_TMUX = Path(__file__).parents[1] / "production" / "fake_tmux.py"
 
 
+class TranscriptReadCounter(io.BufferedReader):
+    """Count transcript bytes delivered to the reader, independent of elapsed time."""
+
+    def __init__(self, path: Path) -> None:
+        super().__init__(io.FileIO(path, "r"))
+        self.bytes_read: int = 0
+
+    @override
+    def read(self, size: int | None = -1) -> bytes:
+        value = super().read(size)
+        self.bytes_read += len(value)
+        return value
+
+    @override
+    def readline(self, size: int | None = -1) -> bytes:
+        value = super().readline(size)
+        self.bytes_read += len(value)
+        return value
+
+
 @final
 class InventoryTests(ShutdownTestCase):
+    def test_last_model_skips_trailing_metadata_and_invalid_json(self) -> None:
+        transcript = self.root / "metadata.jsonl"
+        entries: list[dict[str, object]] = [
+            {"type": "assistant", "message": {"model": "older-model"}},
+            {"type": "assistant", "message": {"model": "latest-model"}},
+            {"type": "system", "message": {"model": "system-model"}},
+            {"type": "cost-state", "model": "cost-model"},
+            {"type": "last-prompt", "message": {"model": "prompt-model"}},
+        ]
+        contents = "\n".join(json.dumps(entry) for entry in entries)
+        for ending in ("\n", ""):
+            with self.subTest(ending=repr(ending)):
+                _ = transcript.write_text(contents + "\nmalformed-json" + ending, encoding="utf-8")
+                self.assertEqual(inventory.last_model(transcript), "latest-model")
+
+    def test_last_model_reassembles_lines_across_tail_blocks(self) -> None:
+        transcript = self.root / "split-line.jsonl"
+        entries = [
+            {"type": "assistant", "message": {"model": "older-model"}},
+            {"type": "assistant", "message": {"model": "split-model", "content": "é" * 70_000}},
+            {"type": "system", "content": "tail"},
+        ]
+        _ = transcript.write_text(
+            "\n".join(json.dumps(entry, ensure_ascii=False) for entry in entries) + "\n",
+            encoding="utf-8",
+        )
+        self.assertEqual(inventory.last_model(transcript), "split-model")
+
+    def test_transcript_path_uses_newest_direct_project_and_excludes_subagents(self) -> None:
+        older = self.target_config / "projects/older/lookup.jsonl"
+        newer = self.target_config / "projects/newer/lookup.jsonl"
+        nested = self.target_config / "projects/newer/subagents/lookup.jsonl"
+        for timestamp, path in ((10, older), (20, newer), (30, nested)):
+            path.parent.mkdir(parents=True, exist_ok=True)
+            _ = path.write_text(json.dumps({"type": "assistant", "message": {"model": path.parent.name}}))
+            os.utime(path, (timestamp, timestamp))
+        self.assertEqual(inventory.transcript_path(self.target_config, "lookup"), newer)
+        older.unlink()
+        newer.unlink()
+        self.assertIsNone(inventory.transcript_path(self.target_config, "lookup"))
+
+    def test_inventory_models_come_from_each_sessions_config_directory(self) -> None:
+        (self.target_config / "projects").unlink()
+        transcript = self.target_config / "projects/own-tree" / f"{DESKTOP_ID}.jsonl"
+        transcript.parent.mkdir(parents=True)
+        _ = transcript.write_text(json.dumps({"type": "assistant", "message": {"model": "own-account-model"}}))
+        found = inventory.inventory(TARGET_LOGIN, only=frozenset({DESKTOP_ID}))
+        self.assertEqual(found["sessions"][0]["model"], {"kind": "model", "name": "own-account-model"})
+
+    def test_inventory_filter_includes_owned_workers_and_empty_selection_includes_all(self) -> None:
+        cases = (
+            (frozenset({DIRECTOR_ID}), {DIRECTOR_ID, WORKER_ID}),
+            (frozenset({WORKER_ID}), {WORKER_ID}),
+            (frozenset[str](), {DIRECTOR_ID, UNIT_ID, WORKER_ID, DESKTOP_ID}),
+        )
+        for selected, expected in cases:
+            for keyword in (True, False):
+                with self.subTest(selected=selected, keyword=keyword):
+                    found = (
+                        inventory.inventory(TARGET_LOGIN, only=selected)
+                        if keyword else inventory.inventory(TARGET_LOGIN, selected)
+                    )
+                    self.assertEqual({session["session_id"] for session in found["sessions"]}, expected)
+                    for session in found["sessions"]:
+                        if session["kind"] == "seat":
+                            self.assertEqual(session["owner"], {"kind": "director", "session_id": DIRECTOR_ID})
+
+    def test_inventory_only_builds_expensive_fields_for_selected_ids(self) -> None:
+        with patch.object(inventory, "_model", wraps=inventory._model) as read_model:  # pyright: ignore[reportPrivateUsage]
+            found = inventory.inventory(TARGET_LOGIN, only=frozenset({DESKTOP_ID, OTHER_ID}))
+        self.assertEqual([session["session_id"] for session in found["sessions"]], [DESKTOP_ID])
+        self.assertEqual(read_model.call_count, 1)
+        self.assertIn(DESKTOP_ID, read_model.call_args.args)
+
+    def test_listing_agrees_with_full_inventory_and_excludes_expensive_work(self) -> None:
+        full = inventory.inventory(TARGET_LOGIN)["sessions"] + inventory.inventory(OTHER_LOGIN)["sessions"]
+        with (
+            patch.object(inventory, "_model", side_effect=AssertionError("listing reads a transcript")),
+            patch.object(inventory, "_checkout", side_effect=AssertionError("listing inspects git")),
+            patch.object(inventory, "_git", side_effect=AssertionError("listing runs git")),
+            patch.object(inventory, "_timers", side_effect=AssertionError("listing reads timers")),
+            patch.object(inventory, "_host", side_effect=AssertionError("listing builds a host")),
+            patch.object(inventory, "_snapshot_desktops", side_effect=AssertionError("listing reads desktops")),
+            patch.object(inventory, "_newest_unit_plans", side_effect=AssertionError("listing reads plan history")),
+        ):
+            listed = inventory.listing()
+            owned = inventory.listing(TARGET_LOGIN)
+        by_id = {session.session_id: session for session in listed}
+        self.assertEqual(set(by_id), {DIRECTOR_ID, UNIT_ID, WORKER_ID, DESKTOP_ID, OTHER_ID})
+        self.assertEqual({session.session_id for session in owned}, {DIRECTOR_ID, UNIT_ID, WORKER_ID, DESKTOP_ID})
+        for session in full:
+            light = by_id[session["session_id"]]
+            with self.subTest(session=light.session_id):
+                self.assertEqual(light.kind, session["kind"])
+                self.assertEqual(light.pid, session["pid"])
+                self.assertEqual(light.proc_start, session["proc_start"])
+                self.assertEqual(light.name, session["name"])
+                self.assertEqual(str(light.config_dir), session.get("config_dir"))
+                self.assertEqual(light.login, OTHER_LOGIN if light.session_id == OTHER_ID else TARGET_LOGIN)
+                if session["kind"] == "showrunner":
+                    self.assertEqual(light.production, session["production"])
+                    self.assertEqual(light.doc, session["doc"])
+                elif session["kind"] == "unit":
+                    self.assertEqual(light.production, session["host"]["production"])
+                    self.assertEqual(light.doc, session["host"]["doc"])
+
+    def test_forty_session_listing_and_large_transcript_read_budget(self) -> None:
+        for path in self.records.glob("*.json"):
+            path.unlink()
+        identities = {f"fixture-{number:02}" for number in range(40)}
+        for number, identity in enumerate(sorted(identities)):
+            self.write_session(60_000 + number, identity, identity, self.root / "plain")
+        transcript = self.target_config / "projects/fixture/fixture-39.jsonl"
+        with transcript.open("wb") as stream:
+            padding = json.dumps({"type": "system", "content": "x" * 1024}).encode() + b"\n"
+            for _ in range((50 * 1024 * 1024 // len(padding)) + 1):
+                _ = stream.write(padding)
+            _ = stream.write(b'{"type":"assistant","message":{"model":"large-file-model"}}\n')
+            _ = stream.write(b'{"type":"last-prompt","content":"after the reply"}\n')
+        with patch.object(account, "process_config_dir", return_value=self.target_config):
+            listed = inventory.listing(TARGET_LOGIN)
+        self.assertEqual({session.session_id for session in listed}, identities)
+        self.assertGreaterEqual(transcript.stat().st_size, 50 * 1024 * 1024)
+        with TranscriptReadCounter(transcript) as stream:
+            with patch.object(Path, "open", return_value=stream):
+                model = inventory.last_model(transcript)
+            self.assertEqual(model, "large-file-model")
+            self.assertGreater(stream.bytes_read, 0)
+            self.assertLess(stream.bytes_read, 1024 * 1024)
+
     def test_cached_desktop_snapshot_never_invokes_the_snapshot_updater(self) -> None:
         with (patch.object(shutil, "which", return_value="/fixture/agent-sessions-snapshot"),
               patch.object(subprocess, "run") as updater):
@@ -75,7 +226,8 @@ class InventoryTests(ShutdownTestCase):
              "message": {"model": "<synthetic>", "content": [{"type": "text", "text": "weekly limit"}]}},
         ]
         _ = transcript.write_text("\n".join(json.dumps(entry) for entry in entries) + "\n")
-        model = inventory._model("refused")  # pyright: ignore[reportPrivateUsage]
+        model = inventory._model("refused", self.home / ".claude")  # pyright: ignore[reportPrivateUsage]
+        self.assertEqual(inventory.last_model(transcript), "claude-opus-real")
         self.assertEqual(model, inventory.ModelName(kind="model", name="claude-opus-real"))
         owner = top_level("refused", model=model)
         self.assertIn("--model claude-opus-real", restart.resume_command(owner, "claude 3"))
@@ -85,7 +237,7 @@ class InventoryTests(ShutdownTestCase):
         transcript = self.home / ".claude/projects/model-fixture/refused.jsonl"
         transcript.parent.mkdir(parents=True)
         _ = transcript.write_text(json.dumps({"type": "assistant", "message": {"model": "<synthetic>"}}) + "\n")
-        self.assertEqual(inventory._model("refused"), inventory.NoReplyYet(kind="no reply yet"))  # pyright: ignore[reportPrivateUsage]
+        self.assertEqual(inventory._model("refused", self.home / ".claude"), inventory.NoReplyYet(kind="no reply yet"))  # pyright: ignore[reportPrivateUsage]
 
     def __init__(self, methodName: str = "runTest") -> None:
         super().__init__(methodName)
@@ -221,6 +373,8 @@ class InventoryTests(ShutdownTestCase):
         self.make_git_checkout()
         self.make_command_stand_ins()
         self.make_sessions(socket_path)
+        for config_dir in (self.target_config, self.other_config):
+            (config_dir / "projects").symlink_to(self.home / ".claude/projects", target_is_directory=True)
         self.make_production_state()
         self.make_delegate_state()
         self.make_snapshot()

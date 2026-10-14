@@ -349,6 +349,7 @@ class InvalidBlockDuration:
 
 BlockDuration = ValidBlockDuration | InvalidBlockDuration
 INVALID_BLOCK_DURATION = InvalidBlockDuration()
+FreeNowAnswer = Literal["free", "off", "backoff", "blocked", "busy", "state"]
 
 
 class CliArguments(argparse.Namespace):
@@ -366,6 +367,7 @@ class CliArguments(argparse.Namespace):
         self.reason: str = ""
         self.hours: str = ""
         self.showrunner: str = ""
+        self.settings: str = ""
 
 
 class StatePaths:
@@ -1737,6 +1739,33 @@ def command_release(args: CliArguments, paths: StatePaths) -> int:
     return 0
 
 
+def free_now(paths: StatePaths, settings: Path | offload.DefaultMacSettings) -> FreeNowAnswer:
+    """Whether a claim made now could start a Mac run, from local records alone.
+
+    Cheap enough for LINT_QUEUE_LEAVE_HOOK, which runs it on every held memory
+    poll: no SSH, no gh and no lock. CI is not read, since a claim does not
+    consult it; the claim itself still decides under its lock.
+    """
+    if not offload.read_config(settings).enabled:
+        return "off"
+    if isinstance(offload.read_backoff(time.time()), offload.ActiveBackoff):
+        return "backoff"
+    try:
+        if not isinstance(read_claim_block(paths), NoMacBlock):
+            return "blocked"
+        run = read_run(paths.run)
+    except (OSError, StateReadError):
+        return "state"
+    return "free" if isinstance(run, NoRun) or not run_is_live(run) else "busy"
+
+
+def command_free_now(args: CliArguments, paths: StatePaths) -> int:
+    settings = Path(args.settings) if args.settings else offload.DEFAULT_MAC_SETTINGS
+    answer = free_now(paths, settings)
+    print(answer)
+    return 0 if answer == "free" else 1
+
+
 def block_state_line(
     block: PendingMacBlock | ActiveMacBlock,
     waiting_problem: Problem,
@@ -2078,6 +2107,9 @@ def parser() -> argparse.ArgumentParser:
     unblock = commands.add_parser("unblock")
     _ = unblock.add_argument("--holder", required=True)
 
+    free = commands.add_parser("free-now")
+    _ = free.add_argument("--settings", default="")
+
     _ = commands.add_parser("status")
     _ = commands.add_parser("watch")
     _ = commands.add_parser("watch-claim")
@@ -2092,6 +2124,8 @@ def main() -> int:
         return command_claim(args, paths)
     if args.command == "release":
         return command_release(args, paths)
+    if args.command == "free-now":
+        return command_free_now(args, paths)
     config = read_config()
     if args.command == "block":
         return command_block(args, paths, config)
