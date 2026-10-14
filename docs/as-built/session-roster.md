@@ -113,7 +113,7 @@ Routes (`resolve_recipient(to, scope) -> DeliveryRoute`):
 | bare name | roster rows with that `name`; one `Messageable` sends by its address |
 | `--codex --session-dir DIR` | `MeshWorker`: `codex_mesh.py send` directly, no roster read |
 
-Resolution for `session:`, `worker:`, `codex:` and bare names reads this machine's roster once (problems print as `send.py: roster: <problem>`). Address forms match `Messageable` addresses; names match any row.
+Resolution for `session:`, `worker:`, `codex:` and bare names reads this machine's roster once (problems print as `send.py: roster: <problem>`). Address forms match `Messageable` addresses; names match any row. `send.py` imports `roster` only on that path, so acknowledgements (`ack`, `reopen`, `pending`, `retire`), `uds:` sockets and `--machine` sends start without it.
 
 - A match here sends here; the other machine is not asked.
 - Several matching rows: exit 2, `<name> matches <N> sessions:` with each address (or its `cannot take messages` reason) and role.
