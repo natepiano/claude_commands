@@ -20,7 +20,7 @@ from unit_effort import Ready, Skipped
 FAKE = str(Path(__file__).with_name("fake_tmux.py"))
 RULE_TOP = "──── review-pool ──────────"
 RULE = "───────────────────────────"
-STATUS = "  natedev | claude 3 | review-pool | 189,709 | Opus 5.5 xhigh"
+STATUS = "  natedev | claude3 | review-pool | 189,709 | Opus 5.5 xhigh"
 EMPTY = f"{RULE_TOP}\n\x1b[39m❯ \n{RULE}\n{STATUS}"
 
 
