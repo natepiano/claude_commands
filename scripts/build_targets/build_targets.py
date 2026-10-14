@@ -28,10 +28,12 @@ from targets import (
     ExpiresAt,
     Free,
     Held,
+    IdleSince,
     LocalTarget,
     LocalRequired,
     ReleaseEstimated,
     Running,
+    RunningJob,
     Routing,
     SshTarget,
     StateUnreadable,
@@ -43,7 +45,6 @@ from targets import (
 )
 import offload
 import build_hold
-import mac_test
 import override_guard
 from user_zone import user_zone
 
@@ -83,12 +84,19 @@ def display_field(value: str) -> str:
     return " ".join(value.split())
 
 
+def running_job_text(job: RunningJob) -> str:
+    text = f"running {display_field(job.what)} since {local_time(job.since)}"
+    if isinstance(job.idle, IdleSince):
+        text += f", idle since {job.idle.when.astimezone(user_zone()).strftime('%H:%M')}"
+    return text
+
+
 def format_state(name: str, state: TargetState) -> str:
     name = display_field(name)
     if isinstance(state, Free):
         return f"{name}: free"
     if isinstance(state, Running):
-        return f"{name}: running {display_field(state.what)} since {local_time(state.since)}"
+        return f"{name}: " + "; ".join(running_job_text(job) for job in state.jobs)
     if isinstance(state, Unreachable):
         return f"{name}: unreachable — {display_field(state.reason)}"
     if isinstance(state, StateUnreadable):
@@ -122,16 +130,7 @@ def command_status(probe: bool = False) -> int:
             if probe and isinstance(target, SshTarget)
             else target_state(target)
         )
-        line = format_state(target.name, state)
-        if isinstance(target, SshTarget) and isinstance(state, Running):
-            try:
-                paths = mac_test.state_paths()
-                run = mac_test.read_run(paths.run)
-                if isinstance(run, dict) and datetime.fromisoformat(run["since"]) == state.since:
-                    line += mac_test.claim_idle_clause(run)
-            except (OSError, mac_test.StateReadError) as error:
-                line = format_state(target.name, StateUnreadable(str(error)))
-        print(line)
+        print(format_state(target.name, state))
     return 0
 
 

@@ -304,13 +304,16 @@ else:
 # TEST_FREE_NOW_ONCE, it answers free once, when that file exists, and busy
 # after; a call after that one free answer writes free-now-after-leave.
 # TEST_FREE_NOW_FREE=1 answers free always, so each routing pass tries a claim
-# that may still decline.
+# that may still decline. Each call's words after the settings path go to
+# free-now-roots.
 FREE_NOW_STUB = r'''
 import os
 from pathlib import Path
 import sys
 
 root = Path(os.environ["TEST_RUNNER_STATE"])
+with (root / "free-now-roots").open("a") as output:
+    output.write(" ".join(sys.argv[4:]) + "\n")
 assert sys.argv[1:3] == ["free-now", "--settings"] and Path(sys.argv[3]).is_file(), sys.argv
 with (root / "free-now-events").open("a") as output:
     output.write(sys.argv[3] + "\n")
@@ -1236,6 +1239,10 @@ local_release_wait.wait_for_local_release(float(sys.argv[1]), sys.argv[2])
         path = self.runner_state / "free-now-events"
         return path.read_text().splitlines() if path.exists() else []
 
+    def free_now_roots(self) -> list[str]:
+        path = self.runner_state / "free-now-roots"
+        return path.read_text().splitlines() if path.exists() else []
+
     def test_queued_local_test_leaves_for_a_freed_mac_and_ends_with_its_failure(self) -> None:
         _ = self.hold_memory()
         mac_free = self.runner_state / "mac-free"
@@ -1255,6 +1262,7 @@ local_release_wait.wait_for_local_release(float(sys.argv[1]), sys.argv[2])
         arguments = runners[1]["args"]
         self.assertEqual(arguments[arguments.index("--last-decline") + 1], "busy")
         self.assertEqual(set(self.free_now_settings()), {self.environment["MAC_TEST_CONFIG"]})
+        self.assertEqual(set(self.free_now_roots()), {f"--repo-root {self.root}"})
         self.assertEqual(self.routing_record()["target"], "mac")
         record = self.last_call()
         self.assertEqual((record["status"], record["mac"], record["mac_reason"], record["mac_s"]),

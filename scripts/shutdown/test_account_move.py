@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from scripts.whoami.note_file import note_name
+
 import io
 import json
 import os
@@ -58,7 +60,7 @@ class AccountMoveTests(ShutdownTestCase):
         _ = self.enterContext(patch.object(inventory, "inventory", side_effect=self.current_inventory))
 
     def note(self, label: str, login: str) -> None:
-        _ = (self.root / "notes" / f"{label}.md").write_text(
+        _ = (self.root / "notes" / note_name(label)).write_text(
             f"---\nlogin: {login}\n---\n", encoding="utf-8")
 
     def named_account(self, label: str, login: str) -> None:

@@ -12,6 +12,8 @@ file replaced by its last chat reply.
 
 from __future__ import annotations
 
+from scripts.whoami.note_file import note_name
+
 import argparse
 import base64
 import contextlib
@@ -2458,7 +2460,7 @@ class MeshCommandTests(unittest.TestCase):
         login = "serving@example.invalid"
         claims = base64.urlsafe_b64encode(json.dumps({"email": login}).encode()).decode().rstrip("=")
         _ = (selected / "auth.json").write_text(json.dumps({"tokens": {"id_token": f"header.{claims}.signature"}}))
-        _ = (notes / "codex 2.md").write_text(f"---\nlogin: {login}\n---\n")
+        _ = (notes / "codex2.md").write_text(f"---\nlogin: {login}\n---\n")
         _ = (self.session_dir / codex_mesh.SERVER_FILE).write_text(json.dumps({
             "port": self.server.port, "pid": os.getpid(), "codex_home": str(selected),
         }))
@@ -2549,7 +2551,7 @@ class MeshCommandTests(unittest.TestCase):
         login = "next@example.invalid"
         claims = base64.urlsafe_b64encode(json.dumps({"email": login}).encode()).decode().rstrip("=")
         _ = (next_home / "auth.json").write_text(json.dumps({"tokens": {"id_token": f"header.{claims}.signature"}}))
-        _ = (account.home.parent / "notes" / "codex 1.md").write_text(f"---\nlogin: {login}\n---\n")
+        _ = (account.home.parent / "notes" / "codex1.md").write_text(f"---\nlogin: {login}\n---\n")
         original = self.respond
         def respond(request: dict[str, object]) -> list[dict[str, object]] | None:
             if request.get("method") == "turn/start":
@@ -2727,7 +2729,7 @@ class MeshCommandTests(unittest.TestCase):
         login = "target@example.invalid"
         claims = base64.urlsafe_b64encode(json.dumps({"email": login}).encode()).decode().rstrip("=")
         _ = (target / "auth.json").write_text(json.dumps({"tokens": {"id_token": f"header.{claims}.signature"}}))
-        _ = (home / "codex 1.md").write_text(f"---\nlogin: {login}\n---\n")
+        _ = (home / "codex1.md").write_text(f"---\nlogin: {login}\n---\n")
         _ = (self.session_dir / codex_mesh.SERVER_FILE).write_text(json.dumps({
             "port": self.server.port, "pid": os.getpid(), "codex_home": str(home / ".codex"),
         }))
@@ -2900,7 +2902,7 @@ class MeshCommandTests(unittest.TestCase):
         login = "home@example.invalid"
         claims = base64.urlsafe_b64encode(json.dumps({"email": login}).encode()).decode().rstrip("=")
         _ = (default / "auth.json").write_text(json.dumps({"tokens": {"id_token": f"header.{claims}.signature"}}))
-        _ = (numbered.parent / "codex 2.md").write_text(f"---\nlogin: {login}\n---\n")
+        _ = (numbered.parent / "codex2.md").write_text(f"---\nlogin: {login}\n---\n")
         source, destination = (numbered, default) if default_destination else (default, numbered)
         source_label, destination_label = ("codex 1", "default") if default_destination else ("default", "codex 1")
         _ = (self.session_dir / codex_mesh.SERVER_FILE).write_text(json.dumps({
@@ -5792,7 +5794,7 @@ class WorkersHomeTests(unittest.TestCase):
         login = f"{label.replace(' ', '-')}@example.invalid"
         claims = base64.urlsafe_b64encode(json.dumps({"email": login}).encode()).decode().rstrip("=")
         _ = (home / "auth.json").write_text(json.dumps({"tokens": {"id_token": f"header.{claims}.signature"}}))
-        _ = (self.home / f"{label}.md").write_text(f"---\nlogin: {login}\n---\n")
+        _ = (self.home / note_name(label)).write_text(f"---\nlogin: {login}\n---\n")
         self.assertEqual(accounts.main(["set-role", "seats", label]), 0)
         return home
 
