@@ -49,7 +49,7 @@ on_mac() {
 ssh -o ConnectTimeout=6 -o BatchMode=yes $host true 2>/dev/null || { print "mac unreachable"; exit 3 }
 
 mac_test=$HOME/.claude/scripts/mac_test/mac_test.py
-claim_output=$(python3 $mac_test claim --pid $$ --what "mac run ${sha[1,9]}" --wait 600)
+claim_output=$(python3 $mac_test claim --pid $$ --what "mac run ${sha[1,9]}" --worktree $repo --wait 600)
 claim_status=$?
 if (( claim_status == 10 || claim_status == 11 || claim_status == 12 )); then
   print -r -- $claim_output
