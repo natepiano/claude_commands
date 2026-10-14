@@ -47,12 +47,12 @@ dispatches it every phase is visible as the drift it represents.
 
 Otherwise pass `skip-architect`. When dispatched, focus real-code checking on
 affected phases and next items, then give the rest a consistency pass. Choose
-an open seat that did not write the affected files when one exists; otherwise
+an open worker that did not write the affected files when one exists; otherwise
 have their writer read them cold and argue against its choices. Post the
 <RoleReassignment/> handoff when its role changes, open the prompt under
-<ReviewPromptContract/>, and use `review.sh --to <full-seat-name>`, this
+<ReviewPromptContract/>, and use `review.sh --to <full-worker-name>`, this
 session, and the next review index.
-If every open seat is busy, open and retain a role-named seat with `review.sh
+If every open worker is busy, open and retain a role-named worker with `review.sh
 --slot review`. Only a phase review outside a delegate run omits both `--to`
 and `--slot`. The prompt keeps the inline Three Gods sentence and Type Design
 Contract or its follow-up pointer. Ad hoc work skips this section.

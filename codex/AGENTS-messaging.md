@@ -2,7 +2,7 @@
 
 List sessions on both machines: `~/.claude/scripts/lib/py ~/.claude/scripts/message/roster.py`. It shows Claude sessions, Codex workers and Codex daemon sessions, with their unit directors and showrunners; `--json` gives `entries` and `problems`.
 
-Send one: `~/.claude/scripts/lib/py ~/.claude/scripts/message/send.py --to <address> --from "<your session name>" --text "<message>"`. Addresses are `session:<id>` (Claude), `seat:<run id>/<seat name>` (Codex worker), and `codex:<thread id>` (Codex daemon session); a unique roster name also works. Resolution tries this machine first, then the other; `--machine HOST` selects that host. A `uds:<path>` always refers to this machine's socket.
+Send one: `~/.claude/scripts/lib/py ~/.claude/scripts/message/send.py --to <address> --from "<your session name>" --text "<message>"`. Addresses are `session:<id>` (Claude), `worker:<run id>/<worker name>` (Codex worker), and `codex:<thread id>` (Codex daemon session); a unique roster name also works. Resolution tries this machine first, then the other; `--machine HOST` selects that host. A `uds:<path>` always refers to this machine's socket.
 
 Send groups: `~/.claude/scripts/lib/py ~/.claude/scripts/production/broadcast.py --from "<your session name>" --all "<message>"`. Groups are `--showrunners`, `--units` (unit directors), `--agents` (workers and freestanding Claude/Codex sessions), `--workers`, `--top-level` (Claude sessions except workers and unit directors under a showrunner), and `--all` (every role). Put `--of <unit, director name, or session: address>` before `--workers` for one unit. Each recipient gets the last selecting flag's text once. The sender is excluded by `CODEX_THREAD_ID`, else `CLAUDE_CODE_SESSION_ID`.
 
@@ -12,10 +12,10 @@ Message the user: `~/.claude/scripts/lib/py ~/.claude/scripts/message/send.py --
 
 - `SENT: <how>` (exit 0) means delivered; `SKIPPED: <why>` (exit 0) means acknowledged or inside the repeat window. `QUEUED: <why>` (exit 1) keeps a Claude message for later delivery; it has not arrived.
 - `REFUSED: <why>` (exit 2): fix the action flags as the line says and send again. No PushNotification fallback.
-- `send.py: <name> cannot take messages (<reason>); contact its unit director <director> or wait` (exit 2): a seat between turns is resumed only by its unit director; contact that director or wait. With no director running, the reason says so and has no contact tail.
+- `send.py: <name> cannot take messages (<reason>); contact its unit director <director> or wait` (exit 2): a worker between turns is resumed only by its unit director; contact that director or wait. With no director running, the reason says so and has no contact tail.
 - `send.py: <name> cannot take messages (no messaging socket); wait for it to open its messaging socket, then read the roster again and send again` (exit 2): that Claude session has not opened its messaging socket yet; follow the line.
 - `send.py: <name> matches <N> sessions:` (exit 2) lists their addresses; send again with one listed address.
-- `send.py: no roster session has address <address>` (exit 2): the address is stale or its seat is between turns; read the roster again.
+- `send.py: no roster session has address <address>` (exit 2): the address is stale or its worker is between turns; read the roster again.
 - `FAILED: <why>` (exit 3), including a Codex queue failure or timeout: no fallback; report the failure.
 - `send.py: absence of <name> here is not proven; use an address or --machine` (exit 2): this machine's roster had problems, so the other machine was not asked and nothing was sent; send again with an address or `--machine HOST`.
 - With `--machine HOST`, recipient refusals and ambiguous-name errors there return as `FAILED: ssh <host>: <reason>` (exit 3); recover from the reason as for that refusal here.

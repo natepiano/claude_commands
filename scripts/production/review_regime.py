@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Track whether the extra review seats pay for themselves.
+"""Track whether the extra review workers pay for themselves.
 
 Usage:
   review_regime.py add --unit <unit> --plan <plan path> --phase <N> --regime before|trial|after
@@ -19,7 +19,7 @@ a phase started after that is `after`. The showrunner adds one row per merged
 phase; `report` compares the phases before, under and after the trial:
 
 - better: fewer holds at merge and fewer defects found by the merge design check;
-- cost: longer phases (start to merge) and more review-seat minutes.
+- cost: longer phases (start to merge) and more review-worker minutes.
 
 From 2026-10-07, the code number is every code finding the phase's review
 raised; before that it was the code-quality reviewer's alone.
@@ -182,7 +182,7 @@ def report(since: str | None) -> None:
     line("merge design-check defects per phase (mean)", lambda group: mean_of([float(row.merge_defects) for row in group]))
     line("hours, start to merge (median)", lambda group: median_of([row.hours() for row in group]))
     line(
-        "review-seat minutes per phase (mean)",
+        "review-worker minutes per phase (mean)",
         lambda group: mean_of([row.review_minutes for row in group if row.review_minutes is not None]),
     )
     line(

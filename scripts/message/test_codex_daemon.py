@@ -278,13 +278,13 @@ class CodexDaemonTests(unittest.TestCase):
         self.assertEqual(codex_daemon.daemon_socket({"HOME": str(self.root), "CODEX_HOME": str(chosen),
             "ROSTER_CODEX_SOCKET": str(override)}), override)
 
-    def test_default_daemon_stays_reachable_when_seats_select_a_numbered_home(self) -> None:
+    def test_default_daemon_stays_reachable_when_workers_select_a_numbered_home(self) -> None:
         notes = self.root / "notes"
         notes.mkdir()
-        _ = (notes / "codex 1.md").write_text("---\nlogin: seats@example.invalid\n---\n")
+        _ = (notes / "codex 1.md").write_text("---\nlogin: workers@example.invalid\n---\n")
         home = self.root / ".codex1"
         home.mkdir()
-        claims = base64.urlsafe_b64encode(json.dumps({"email": "seats@example.invalid"}).encode()).decode().rstrip("=")
+        claims = base64.urlsafe_b64encode(json.dumps({"email": "workers@example.invalid"}).encode()).decode().rstrip("=")
         _ = (home / "auth.json").write_text(json.dumps({"tokens": {"id_token": f"header.{claims}.signature"}}))
         with mock.patch.dict(os.environ, {"AGENT_NOTES_DIR": str(notes)}):
             module = importlib.import_module("scripts.accounts.accounts")

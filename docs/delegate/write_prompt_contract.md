@@ -7,7 +7,7 @@ Read at the point of use from `/unit:direct`. Defines `<WritePromptContract/>`,
 **Read when:** writing any implementation, fix, or review prompt.
 
 <WritePromptContract>
-Every implementation or fix prompt sent to a seat contains sections 1–9.
+Every implementation or fix prompt sent to a worker contains sections 1–9.
 Compaction can replace earlier prompt text with a summary, so a follow-up or
 repair is complete on its own. Section 7 may use its follow-up pointer; section
 9 is always inline. Never abbreviate the new Project Context, Work
@@ -18,7 +18,7 @@ Every review prompt carries sections 7 and 9 the same way, plus the role-switch
 opening in <ReviewPromptContract/>.
 
 1. Role: write the requested code directly; do not ask questions. Name the
-   slot this prompt is for and the role assigned by the Work Order's **Seats**
+   slot this prompt is for and the role assigned by the Work Order's **Workers**
    field per <PhaseTeam/>. A new-phase continuation begins: `You are slot
    <slot>, continuing into phase <N> as <role>. Your earlier work is
    committed.` A replacement thread uses opening wording instead.
@@ -34,7 +34,7 @@ opening in <ReviewPromptContract/>.
    summary, so a doubt left unstated arrives at review as a line of code that
    looks deliberate. Carry verbatim: "Do not open the `rust_style` skill or run
    `load-rust-style.sh`; this run's one style audit happens at the end." That
-   audit is <RunProjectStyleReview/>; Codex lists `rust_style` to every seat,
+   audit is <RunProjectStyleReview/>; Codex lists `rust_style` to every worker,
    which loads it unless told not to.
 3. Narration: before each activity, run
    `bash ~/.claude/scripts/delegate/board.sh post <concrete SESSION_DIR> <slot> status "<activity>"`.
@@ -48,11 +48,11 @@ opening in <ReviewPromptContract/>.
 
    **The slot in every one of these commands is this prompt's slot.** Composing
    both prompts from one draft carries the first slot into both, and the board
-   then reads as one seat doing the whole round while the other sits silent —
+   then reads as one worker doing the whole round while the other sits silent —
    the attribution the required argument exists to keep. Nothing downstream can
    catch it, because each post is well-formed. Before dispatch, check that the
    two prompts name different slots.
-4. `## Team` — state the assignment from Seats (`1 writer + 1 tester` or
+4. `## Team` — state the assignment from Workers (`1 writer + 1 tester` or
    `2 writers`, and the role each slot takes), then name both slots and who
    holds which files, each hub file with its one owner. Copy
    the board commands from <CoordinationBoard/>, and say a `verify.sh` run may
@@ -69,12 +69,12 @@ opening in <ReviewPromptContract/>.
    command line with the concrete `--session-dir` already filled in, not a
    description of it. A slot whose register line says `mesh=none` has no peer
    channel at all: say so, and tell it to read the board rather than wait on a
-   reply. A repair seat per <FixDispatch/> has no peer: its `## Team` carries
-   its file set, the other repair seats' files as read only, and the token
+   reply. A repair worker per <FixDispatch/> has no peer: its `## Team` carries
+   its file set, the other repair workers' files as read only, and the token
    prohibition.
 5. `## Project Context`.
 6. `## Work Specification`.
-   For seats writing tests, carry: "Do not write trivial tests that cannot fail for a real defect: assertions of a constant, literal or default against itself, implementation repetition, tests of the standard library or a mock they configure, name-existence or import-only checks, or duplicates of another test; a test that pins behaviour a user or another script depends on is not trivial."
+   For workers writing tests, carry: "Do not write trivial tests that cannot fail for a real defect: assertions of a constant, literal or default against itself, implementation repetition, tests of the standard library or a mock they configure, name-existence or import-only checks, or duplicates of another test; a test that pins behaviour a user or another script depends on is not trivial."
 7. `## Type Design Contract` per <TypeDesignContract/>. Copy it verbatim in an
    opening prompt. A follow-up may instead say: `Read
    ~/.claude/docs/type_design.md in full and apply its Type Design Contract to
@@ -104,7 +104,7 @@ package's scoped `verify.sh test` and report it. Omit plan **Style** metadata.
 Every phase's implementation dispatch assigns **two delegates at once**; a
 repair assigns one per disjoint file set under <FixDispatch/>. They share
 `${SESSION_DIR}` and `${WORKING_DIR}`, and each occupies a fixed **slot** that
-names its artifacts and board identity. Under <LongLivedSeats/>, the first
+names its artifacts and board identity. Under <LongLivedWorkers/>, the first
 phase opens the Codex threads and later phases continue each thread that remains
 open; a replacement starts fresh with an opening prompt. The **default
 assignment**:
@@ -114,7 +114,7 @@ assignment**:
 | `impl` | the phase's implementation | the Work Order's production files |
 | `test` | tests for the same specification | test targets under `tests/` and new test files |
 
-**The Work Order's `Seats:` field sets the assignment and overrides this table.**
+**The Work Order's `Workers:` field sets the assignment and overrides this table.**
 Its first line names the assignment — `1 writer + 1 tester` is the table above,
 `2 writers` the other — and a line per slot names that slot's files and, where
 it differs from the table, its role. `impl` is `impl` by default. `test` is
@@ -122,10 +122,10 @@ it differs from the table, its role. `impl` is `impl` by default. `test` is
 directory in a touched crate and a Spec concrete enough to test before the
 implementation exists — and as a writer where it has none. A plan compiled
 without the field assigns the table's roles, with the partition decided at launch
-per <TeamFilePartition/>. **A legacy three-seat field** maps down: drop its
+per <TeamFilePartition/>. **A legacy three-worker field** maps down: drop its
 `review` line and fold that line's files into the surviving slot holding the
 same role (`impl` when both do), so `3 writers` becomes `2 writers` and either
-three-seat mix becomes `1 writer + 1 tester`.
+three-worker mix becomes `1 writer + 1 tester`.
 
 A slot is an identity and never changes. What a slot is *doing* is its **role**,
 and roles move during a phase per <RoleReassignment/>. Everything downstream —
@@ -133,8 +133,8 @@ the board, the progress table, every artifact name — reads the slot for identi
 and the role for activity, so keep the two distinct: `test` doing
 implementation work is still slot `test`. Its Codex thread stays open across
 phase boundaries. Keep its role when the next Work Order fits, otherwise move
-it under <RoleReassignment/>. Open another thread only when no open seat can
-take the assignment, including when every open seat is busy; name its slot for
+it under <RoleReassignment/>. Open another thread only when no open worker can
+take the assignment, including when every open worker is busy; name its slot for
 its work (`review`, `fix2`), keep it for reuse, and end it only with
 `end_session.sh`.
 
@@ -142,13 +142,13 @@ its work (`review`, `fix2`), keep it for reuse, and end it only with
 Order defines the behavior, so tests can be written before any of it exists;
 a tester that waits for `impl` has converted a parallel team back into a queue.
 
-**Every seat carries its own pass kind, which is its assigned role**, so a team
+**Every worker carries its own pass kind, which is its assigned role**, so a team
 phase records two passes. The recorder keys them by slot and closes only that slot's stale pass;
 <LaunchImplementation/> step 5 owns the argument positions.
 
 Launch both in **one message** so they run concurrently, each with its own
 prompt file and its slot as the ninth argument to `implement.sh`; continue an
-open Codex seat with `--to <full-seat-name>`, then apply
+open Codex worker with `--to <full-worker-name>`, then apply
 <DispatchContract/> once for the team: the run's one notifier instance covers
 the Claude phase; the Codex poll covers its phase. <LaunchImplementation/> owns
 the rest of the procedure.
@@ -206,9 +206,9 @@ unit director reaches any of them, and a claude member reaches the unit director
 mid-run, without waiting for a phase to end.
 
 - **Addresses** are `<project>-<slot>`, the project being the working tree's
-  directory name: `hana_catalyst-impl`, `-test`; a repair seat is `-fix`. The
-  slot, never the role: a `test` seat writing code is still `-test`. Get each
-  name from `bash ~/.claude/scripts/delegate/seat_name.sh "${WORKING_DIR}"
+  directory name: `hana_catalyst-impl`, `-test`; a repair worker is `-fix`. The
+  slot, never the role: a `test` worker writing code is still `-test`. Get each
+  name from `bash ~/.claude/scripts/delegate/worker_name.sh "${WORKING_DIR}"
   <slot> <kind>`, the launcher's own rule; never compose one. A member is told
   its peer's name in its prompt, and every `register` line on the board repeats
   the names in its `mesh=` field, so a member that missed the launch can still
@@ -236,10 +236,10 @@ mid-run, without waiting for a phase to end.
   implementer has reported done, and get an answer rather than silence. **A
   finished Codex turn refuses `send`, but its thread remains open.** Ask while
   it works or read its summary. Only the unit director starts its next turn —
-  a later phase, repair, or follow-up — through `implement.sh --to <seat>`;
+  a later phase, repair, or follow-up — through `implement.sh --to <worker>`;
   the launcher attempts compaction above
   `PLAN_DELEGATE_COMPACT_ABOVE_TOKENS`, continues after a failed attempt, and
-  presses on after overflow per <LongLivedSeats/>. A message without the
+  presses on after overflow per <LongLivedWorkers/>. A message without the
   launcher is for questions only.
 - **A codex member has no route to the unit director.** It reaches its peer with
   the calls above and reaches the unit director only through the board, which the
@@ -292,11 +292,11 @@ already been cleared.
 </BuildTokenContract>
 
 <TeamFilePartition>
-The slots edit **disjoint file sets**, decided in the Work Order's `Seats:`
+The slots edit **disjoint file sets**, decided in the Work Order's `Workers:`
 field — or at launch, when a plan predates it — and stated in every prompt. A
 **hub file** — a `lib.rs` or `mod.rs` re-export, `Cargo.toml`, plugin
 registration, a shared types file — has exactly one owner, named on that slot's
-Seats line; every other writer messages the owner for the line it needs.
+Workers line; every other writer messages the owner for the line it needs.
 
 This is enforced, not merely agreed: the cargo-berth pre-edit hook claims paths
 per session, each delegate is its own session, so an edit into a peer's claimed
@@ -313,26 +313,26 @@ prompts:
   route around a claim.
 
 Where the Work Order's own files cannot be split — everything lands in one or
-two files — the Seats opening line says so, `impl` gets the whole set, and
+two files — the Workers opening line says so, `impl` gets the whole set, and
 `test` opens on work that does not touch it. A partition that does
 not exist is not worth inventing; a partition that is wrong costs the phase.
 </TeamFilePartition>
 
 <RoleReassignment>
-Roles move; slots do not. Any open seat may take any role, mid-phase included,
-because every seat in a unit works in the same area. Before dispatch, post a
+Roles move; slots do not. Any open worker may take any role, mid-phase included,
+because every worker in a unit works in the same area. Before dispatch, post a
 board `handoff` naming the slot, the role it leaves, and the role it takes; the
-new prompt has that seat run `board.sh role` before its first tool call.
+new prompt has that worker run `board.sh role` before its first tool call.
 
-A busy turn does not reserve its seat's next role. Reassign it when that turn
-ends; when the new work must run concurrently and every open seat is busy, open
-an extra seat named for its work (`review`, `fix2`) and keep it for reuse. Never
-abandon unwritten tests: assign them to an open seat or open one.
+A busy turn does not reserve its worker's next role. Reassign it when that turn
+ends; when the new work must run concurrently and every open worker is busy, open
+an extra worker named for its work (`review`, `fix2`) and keep it for reuse. Never
+abandon unwritten tests: assign them to an open worker or open one.
 
 **Standing down means ending the turn, not waiting.** A slot with nothing left
 posts `done` with what it completed and finishes its turn; it never runs an idle
 poll loop. Its Codex thread stays open for the unit director's next
 launcher `--to` assignment and ends at `end_session.sh`. This is why a finished
-seat moves toward work that exists now rather than work a peer might hand over
+worker moves toward work that exists now rather than work a peer might hand over
 later in the same turn.
 </RoleReassignment>

@@ -6,7 +6,7 @@
 cargo-port runs it after a save, with its cwd in the project. In order:
 
 Defer, exit 75, when someone is at work in the worktree: a `cargo-handler
-probe` row that is busy, at a shell, or has a Codex seat at work (a thread
+probe` row that is busy, at a shell, or has a Codex worker at work (a thread
 child), whose folder is the worktree or inside it; or a process named cargo*
 other than cargo-handler and cargo-port, whose cwd is inside it. A lint then
 would compete with that work for the build lock and the CPU, and lint files
@@ -96,7 +96,7 @@ class Process:
 class Reusable:
     id: str
     caller: str | None
-    seat: str | None
+    worker: str | None
     started_at: str
     status: int
     log: str | None
@@ -120,7 +120,7 @@ def busy_row(rows: list[ProbeRow], worktree: str) -> tuple[str, str] | None:
         if row["status"] in BUSY:
             return f"agent {row['name']}", directory
         if any(child["kind"] == "thread" for child in row["children"]):
-            return f"a Codex seat of {row['name']}", directory
+            return f"a Codex worker of {row['name']}", directory
     return None
 
 
@@ -239,16 +239,16 @@ def find_reusable(command: str, host: str, worktree: str, key: str, rustc: str) 
         rows = cast(
             list[tuple[str, str | None, str | None, str, int, str | None, float, str, int | None]],
             connection.execute(
-                "SELECT id, caller, seat, started_at, status, log, duration_s, argv, mend_fixes FROM steps"
+                "SELECT id, caller, worker, started_at, status, log, duration_s, argv, mend_fixes FROM steps"
                 + " WHERE host = ? AND worktree = ? AND step = ? AND tree_key = ? AND rustc = ?"
                 # A signal, a usage error (2) or a sandbox failure (3) says nothing about the files.
                 + " AND status < 128 AND status NOT IN (2, 3) ORDER BY started_at DESC",
                 (host, worktree, command, key, rustc),
             ).fetchall(),
         )
-    for step_id, caller, seat, started_at, status, log, duration_s, argv, mend_fixes in rows:
+    for step_id, caller, worker, started_at, status, log, duration_s, argv, mend_fixes in rows:
         if stands_in(command, cast(list[str], json.loads(argv)), mend_fixes):
-            return Reusable(step_id, caller, seat, started_at, status, log, duration_s)
+            return Reusable(step_id, caller, worker, started_at, status, log, duration_s)
     return None
 
 
@@ -261,7 +261,7 @@ def reusable(command: str, cwd: str, worktree: str) -> Reusable | None:
 
 
 def replay(command: str, found: Reusable) -> None:
-    who = f"{found.caller or 'unknown'} {found.seat}" if found.seat else found.caller or "unknown"
+    who = f"{found.caller or 'unknown'} {found.worker}" if found.worker else found.caller or "unknown"
     at = datetime.fromisoformat(found.started_at.replace("Z", "+00:00")).astimezone(user_zone()).strftime("%H:%M")
     word = "passed" if found.status == 0 else "failed"
     print(f"port-lint: {command} reused from {who} at {at}, tree unchanged ({word})", flush=True)
