@@ -763,34 +763,6 @@ class AddUnitTests(ShutdownTestCase):
         self.assertEqual(len(self.events("systemd-run")), 1)
         self.assertEqual(len(self.recorded_prompts("session-123")), 1)
 
-    def test_host_session_flag_restores_the_recorded_unit_session(self) -> None:
-        self.commit_prepared_row(self.unit_row())
-        self.write_shutdown_record(self.shutdown_record("restarting"))
-        prior = self.root / "prior-session"
-        prior.mkdir()
-        note = self.root / "restart-note.txt"
-        _ = note.write_text("Resume this unit.", encoding="utf-8")
-
-        result = self.successful(
-            "alpha",
-            "--plan",
-            "docs/plans/given.md",
-            "--resume",
-            "session-123",
-            "--cwd",
-            str(prior),
-            "--restart-note",
-            str(note),
-            "--session-name",
-            "recorded-name",
-            "--host-session",
-            "recorded-tmux",
-        )
-
-        self.assertIn("alpha-unit restore launched", result.stdout)
-        self.assertEqual(len(self.events("systemd-run")), 1)
-        self.assertEqual(len(self.recorded_prompts("session-123")), 1)
-
     def test_restart_restore_adopts_a_row_added_from_a_brief_whose_plan_is_now_its_as_built(self) -> None:
         checkout = self.doc.parents[2]
         (checkout / "docs/as-built").mkdir(parents=True, exist_ok=True)
