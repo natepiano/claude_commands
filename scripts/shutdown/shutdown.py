@@ -136,9 +136,13 @@ def _selected_account(requested: str | None) -> Account:
 def _host_text(host: Host) -> str:
     match host["kind"]:
         case "unit":
+            if host["session_host"] == "herdr":
+                return f"unit {host['production']}/{host['unit']} (herdr {host['session_name']})"
             return f"unit {host['production']}/{host['unit']}"
         case "tmux":
             return f"tmux {host['tmux_session']}"
+        case "herdr":
+            return f"herdr {host['herdr_session']}"
         case "ghostty" | "zed":
             desktop = host["desktop"]
             return (

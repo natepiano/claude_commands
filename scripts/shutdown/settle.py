@@ -438,7 +438,15 @@ def _held_by_usage_limit(screen: ScreenText | ScreenUnreadable) -> bool:
 
 
 def _usage_limit_shown(session: Session) -> bool:
-    return session["status"] != "busy" and _held_by_usage_limit(_screen(session))
+    from scripts.accounts.refusal_watch import session_refusal, TranscriptRefusal
+    if session["status"] == "busy":
+        return False
+    try:
+        if isinstance(session_refusal(session["session_id"]), TranscriptRefusal):
+            return True
+    except (OSError, ValueError):
+        pass
+    return _held_by_usage_limit(_screen(session))
 
 
 def _usage_limit_change(
@@ -552,6 +560,9 @@ def status_record_lines(record: SessionShutdown, owner: stop_work.FreshSession |
                         *, local_observation: bool = True) -> list[str]:
     """Render progress, observed readiness details and issues for one owner."""
     progress = _progress_text(record)
+    target = record.get("target", "")
+    if target:
+        progress += f" · to {target}: {record.get('why', '')}"
     if record["progress"]["kind"] in {"waiting", "ready", "held by usage limit"} and not isinstance(owner, _StatusUnobserved) and owner["kind"] == "matching session":
         try:
             detail = ", ".join(_hold_details(owner, record["progress"]["kind"], local_observation=local_observation))
@@ -839,6 +850,13 @@ def cancel(account: Account, here: bool = False, only: Iterable[str] = ()) -> in
     for saved in records:
         if ids and saved["session"]["session_id"] not in ids:
             continue
+        # Suppression takes the watcher lock before withdrawal takes the account lock.
+        # The open record keeps concurrent watcher ticks from replacing this request.
+        if saved["progress"]["kind"] in {"waiting", "ready", "held by usage limit"} or (
+            ids and saved["progress"]["kind"] == "stop failed"
+        ):
+            from scripts.accounts.refusal_watch import cancelled
+            cancelled(saved["session"]["session_id"])
         try:
             outcome = (store.withdraw_failed_stop(account.login, saved["session"]["session_id"], still_live, _restore_record)
                        if ids else store.withdraw_session(account.login, saved["session"]["session_id"], _restore_record))
@@ -855,6 +873,12 @@ def cancel(account: Account, here: bool = False, only: Iterable[str] = ()) -> in
             print(f"{name} was not cancelled: {detail}; {action} brings it back")
         else:
             withdrawn_requests.append(outcome.record["request_id"])
+            session = outcome.record["session"]
+            if outcome.record.get("target"):
+                from scripts.accounts import moves
+                moves.append_move(moves.FailedMove(kind="failed", at=record_time(), tool="claude",
+                    subject=session["session_id"] + ": " + session["name"],
+                    move_id=outcome.record["request_id"], reason="cancelled"))
             if outcome.record["progress"]["kind"] == "stop failed":
                 print(f"{outcome.record['session']['name']}: taken out, still running")
             elif ids:
@@ -940,6 +964,9 @@ def _launch_conductor(login: str, label: str) -> None:
     slug = re.sub(r"[^a-z0-9]+", "-", label.casefold()).strip("-") or "account"
     service = f"shutdown-{slug}-{os.getpid()}"
     command = [sys.executable, str(SHUTDOWN), "conduct", login]
+    if os.environ.get("REFUSAL_WATCH_INVENTORY") == "read existing":
+        # Service managers do not inherit the caller's environment automatically.
+        command = ["env", "REFUSAL_WATCH_INVENTORY=read existing", *command]
     launch = (["launchctl", "submit", "-l", service, "--", *command] if sys.platform == "darwin"
               else ["systemd-run", "--user", "--collect", "--quiet", "--no-block", "--unit", service, *command])
     result = subprocess.run(launch, check=False, timeout=15)
@@ -959,8 +986,28 @@ def down(account: Account, here: bool = False, only: Iterable[str] = (), *,
     identity = request_id or str(uuid4())
     local_ids: set[str] = ({saved["session"]["session_id"] for saved in store.session_records(account.login)}
                  | {session["session_id"] for session in inventory(account.login, frozenset(ids))["sessions"]}) if ids else set()
-    _ = begin(account.login, origin, ids, then=then, alerts=alerts, request_id=identity, target=target, why=why)
-    _launch_conductor(account.login, account.label)
+    added = begin(account.login, origin, ids, then=then, alerts=alerts, request_id=identity, target=target, why=why)
+    try:
+        _launch_conductor(account.login, account.label)
+    except (OSError, RuntimeError, subprocess.SubprocessError):
+        if target:
+            for saved in added:
+                _ = store.withdraw_session(account.login, saved["session"]["session_id"], _restore_record)
+        raise
+    if target:
+        from scripts.accounts import moves, refusals
+        for saved in added:
+            session = saved["session"]
+            request: moves.RequestedMove = {"kind": "requested", "at": saved["requested_at"],
+                "tool": "claude", "subject": session["session_id"] + ": " + session["name"],
+                "move_id": saved["request_id"], "from": saved.get("source_label", account.label),
+                "to": target, "why": saved.get("why", why), "window": "unknown"}
+            refusal = refusals.load().get(refusals.key("claude", account.login))
+            if refusal is not None:
+                request["window"] = refusal.window.name if isinstance(refusal.window, refusals.KnownWindow) else "unknown"
+                if isinstance(refusal.reset, refusals.KnownReset):
+                    request["reset"] = refusal.reset.at.isoformat()
+            moves.append_move(request)
     peer_ids = [session_id for session_id in ids if session_id not in local_ids]
     if not here and (not ids or peer_ids):
         arguments = ["down", account.login, "--here", "--request-id", identity]
@@ -996,11 +1043,17 @@ def _done(saved: SessionShutdown) -> bool:
 
 def _action_failed(saved: SessionShutdown, error: Exception, *, stopping: bool) -> None:
     reason = str(error).splitlines()[0] if str(error).splitlines() else type(error).__name__
+    if not stopping:
+        import restart as restart_work
+        found = store.lookup_session(saved["login"], saved["session"]["session_id"])
+        if isinstance(found, store.ShutdownFound) and found.record["request_id"] == saved["request_id"]:
+            # A launch can raise after recording its claim but before returning it.
+            expected = saved if saved["progress"]["kind"] == "restarting" else found.record
+            restart_work.mark_restart_failed(expected, reason)
+        return
     def fail(current: SessionShutdown) -> None:
-        current["progress"] = ({"kind": "stop failed", "at": record_time(), "reason": reason}
-                               if stopping else {"kind": "restart failed", "at": record_time(), "reason": reason})
-        if stopping:
-            current["force"] = "wait for ready"
+        current["progress"] = {"kind": "stop failed", "at": record_time(), "reason": reason}
+        current["force"] = "wait for ready"
     try:
         _ = store.update_session(saved["login"], saved["session"]["session_id"], fail)
     except store.NoLiveRecord:
@@ -1163,20 +1216,41 @@ def _send_holdout_alert(due: list[tuple[SessionShutdown, str]]) -> None:
         lines.append(f"{saved['machine']} {name}: {reason}; {action}")
     text = "\n".join(lines)
     summary = "; ".join(summaries)
-    waiting = " ".join(f"Its session named {saved['session']['name']} on {saved['machine']} is {reason}." for saved, reason in due)
+    waiting = [f"Its session named {saved['session']['name']} on {saved['machine']} is {reason}, so it has not stopped." for saved, reason in due]
     account = json.dumps(first["label"])
     names = ",".join(saved["session"]["name"] for saved, _ in due)
     subject = "it" if len(due) == 1 else "them"
     possessive = "its" if len(due) == 1 else "their"
-    form_instruction = " Read any open form in that session's terminal before stopping it." if len(due) == 1 else ""
-    phone_text = (f"Shutdown of Claude account {account} is waiting. " + waiting[:120]
-                  + form_instruction + "\n\n"
-                  + f"Cancel (recommended): /shutdown cancel {account} --only {names} keeps {subject} running so you can check {possessive} work.\n\n"
-                  + f"Stop now: /shutdown now {account} --only {names} stops {subject} without waiting.")
+    form_instruction = " Read any open form in that session's terminal before choosing." if len(due) == 1 else ""
+    opening = f"Shutdown of Claude account {account} is waiting for sessions to stop. "
+    action_text = "In the natedev Claude session, choose cancel or stop now."
+    choices = (f"\n\nCancel (recommended): /shutdown cancel {account} --only {names}. This keeps {subject} running so you can check {possessive} work.\n\n"
+               + f"Stop now: /shutdown now {account} --only {names}. This stops {subject} without waiting.")
+    omitted = f"{len(waiting)} more sessions are waiting."
+    fixed_length = len("Action: " + action_text + "\n" + opening + form_instruction)
+    account_wide = len(due) > 1 and fixed_length + len(choices) + len(omitted) >= 500
+    if account_wide:
+        choices = (f"\n\nCancel (recommended): /shutdown cancel {account}. This keeps every waiting session running so you can check their work.\n\n"
+                   + f"Stop now: /shutdown now {account}. This stops every waiting session without waiting for its work to finish.")
+    budget = min(120, 499 - fixed_length - len(choices))
+    included: list[str] = []
+    for index, sentence in enumerate(waiting):
+        remaining = len(waiting) - index - 1
+        suffix = f"{remaining} more {'session is' if remaining == 1 else 'sessions are'} waiting." if remaining else ""
+        if len(" ".join([*included, sentence, *([suffix] if suffix else [])])) > budget:
+            break
+        included.append(sentence)
+        omitted = suffix
+    if account_wide and not included:
+        omitted = f"{len(waiting)} sessions are waiting."
+        reason_sentence = f"One is {due[0][1]}, so it has not stopped."
+        if len(omitted + " " + reason_sentence) <= budget:
+            omitted += " " + reason_sentence
+    phone_text = opening + " ".join([*included, *([omitted] if omitted else [])]) + form_instruction + choices
     title = "Shutdown waits on a session showing a form" if any("form" in reason for _, reason in due) else "Shutdown waits on running Claude sessions"
     try:
         alert_user(title, phone_text,
-            ActionRequired("In the natedev Claude session, choose cancel or stop now using the commands below."),
+            ActionRequired(action_text),
             machine="natedev" if local_machine().casefold() == "mac" else "")
     finally:
         origins = {saved["requested_by"]["session_id"] for saved, _ in due if saved["requested_by"]["kind"] == "session"}

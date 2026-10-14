@@ -332,9 +332,9 @@ def _stop_codex_servers(
 def _stop_unit_tmux(
     session: Session, tmux: CommandRunner, clock: Clock, claim: StopClaim
 ) -> list[SessionStopIssue]:
-    if session["kind"] != "unit":
+    if session["kind"] != "unit" or session["host"]["session_host"] != "tmux":
         return []
-    tmux_session = session["host"]["tmux_session"]
+    tmux_session = session["host"]["session_name"]
     target = f"={tmux_session}"
     issue: SessionStopIssue = {
         "kind": "unit tmux session left running",
@@ -418,6 +418,9 @@ def _stop_owner_resources(
     issues = _stop_codex_servers(
         session, codex_mesh=codex_mesh, is_alive=is_alive, clock=clock, claim=claim
     )
+    if session["host"]["kind"] == "herdr":
+        # Leave the pane and server running; herdr session cleanup is manual for now.
+        return issues
     issues.extend(_stop_unit_tmux(session, tmux, clock, claim))
     return issues
 
@@ -434,12 +437,12 @@ def _owner_identity_lost_issues(
         }
         for run_dir in _run_directories(session)
     ]
-    if session["kind"] == "unit":
+    if session["kind"] == "unit" and session["host"]["session_host"] == "tmux":
         issues.append(
             {
                 "kind": "unit tmux session left running",
                 "at": _timestamp(clock),
-                "tmux_session": session["host"]["tmux_session"],
+                "tmux_session": session["host"]["session_name"],
                 "cause": "owner identity lost",
             }
         )

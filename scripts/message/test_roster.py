@@ -26,8 +26,11 @@ import codex_daemon
 import process_table
 import remove_seats
 import roster
+import herdr
+from fake_herdr import CommandResponse
 import sessions
 import showrunners
+import unit_lookup
 
 
 ENTRY_FIELDS = {
@@ -137,6 +140,9 @@ class RosterTests(unittest.TestCase):
         _ = self.enterContext(mock.patch.object(
             process_table, "PS", ["ps", "-eo", "pid=,ppid=,comm=,args="],
         ))
+        _ = self.enterContext(mock.patch.object(herdr, "herdr_binary", side_effect=herdr.HerdrMissing("herdr is not installed")))
+        self.environment["HERDR_PROC"] = str(self.root / "herdr-proc")
+        os.environ["HERDR_PROC"] = self.environment["HERDR_PROC"]
         self._build_complete_roster()
 
     def _write_session(
@@ -984,6 +990,102 @@ class RosterTests(unittest.TestCase):
                 ))
         self.assertEqual(self.ssh_calls(), [])
 
+    def _herdr_fixture(self, responses: dict[str, CommandResponse]) -> str:
+        path = self.root / "herdr-responses.json"
+        _ = path.write_text(json.dumps(responses))
+        os.environ["FAKE_HERDR_RESPONSES"] = str(path)
+        os.environ["FAKE_HERDR_LOG"] = str(self.root / "herdr.jsonl")
+        return str(SCRIPTS / "herdr/fake_herdr.py")
+
+    def _herdr_process(self, pid: int, parent: int, argv: list[str], **environment: str) -> None:
+        path = Path(os.environ["HERDR_PROC"]) / str(pid)
+        path.mkdir(parents=True)
+        _ = (path / "stat").write_text(f"{pid} (fixture) S {parent} 0 0")
+        _ = (path / "cmdline").write_bytes("\0".join(argv).encode())
+        _ = (path / "environ").write_bytes("\0".join(f"{key}={value}" for key, value in environment.items()).encode())
+        (path / "cwd").symlink_to(self.home)
+
+    def _herdr_sessions(self) -> dict[str, CommandResponse]:
+        return {"--session default session list --json": {"code": 0, "stdout": json.dumps({
+            "sessions": [{"name": "native", "running": True, "default": False,
+                          "session_dir": "/fixture", "socket_path": "/fixture/socket"}]
+        })}, "--session native agent list": {"code": 0, "stdout": '{"ok": true, "result": {"agents": []}}'}}
+
+    def test_a_herdr_director_without_tmux_is_placed_without_resolving_tmux(self) -> None:
+        # A socketless live record is deliberately excluded from _claudes; the
+        # roster must join it by place rather than worktree ownership.
+        (self.sessions / "director.json").unlink()
+        self._write_session("director", "director", "sid-director", self.home / "elsewhere", with_socket=False, pid=991001, proc_start="fixture")
+        self._herdr_process(991000, 0, ["herdr", "--session", "native", "server"])
+        self._herdr_process(991001, 991000, ["claude"], HERDR_PANE_ID="w1:p1",
+                            SHOWRUNNER_UNIT="alpha", SHOWRUNNER_UNIT_ID="unit-one")
+        binary = self._herdr_fixture(self._herdr_sessions())
+        running_session = sessions.running_session
+
+        def running(record: sessions.SessionRecord) -> bool:
+            return record["pid"] == 991001 or running_session(record)
+
+        with mock.patch.object(herdr, "herdr_binary", return_value=binary), \
+                mock.patch.object(sessions, "running_session", side_effect=running), \
+                mock.patch.dict(os.environ, {"UNIT_LOOKUP_TMUX": str(self.root / "missing-tmux")}), \
+                mock.patch.object(unit_lookup, "tmux_binary", side_effect=AssertionError("tmux must be skipped")) as resolver:
+            director = self._entries()["director"]
+        resolver.assert_not_called()
+        self.assertEqual(director.role, "unit director")
+        self.assertEqual(director.director, roster.DirectsUnit("unit-one"))
+        self.assertEqual(director.showrunner, roster.UnderShowrunner("alpha", "runner", "session:sid-runner"))
+        self.assertEqual(director.reach, roster.CannotReceiveMessages("no messaging socket"))
+
+    def test_interactive_codex_panes_are_appended_without_messaging_addresses(self) -> None:
+        responses = self._herdr_sessions()
+        responses["--session native agent list"]["stdout"] = json.dumps({"ok": True, "result": {"agents": [
+            {"pane_id": "w1:p1", "agent": "codex", "agent_status": "working"},
+            {"pane_id": "w1:p2", "agent": "claude", "agent_status": "idle"},
+            {"pane_id": "w1:p3", "agent": "codex", "agent_status": "idle"},
+            {"pane_id": "w1:p4", "agent_status": "idle"},
+        ]}})
+        self._herdr_process(991000, 0, ["herdr", "--session", "native", "server"])
+        self._herdr_process(991001, 991000, ["codex"], HERDR_PANE_ID="w1:p1")
+        binary = self._herdr_fixture(responses)
+        with mock.patch.object(herdr, "herdr_binary", return_value=binary):
+            entries = self._entries()
+        pane = entries["herdr native:w1:p1"]
+        self.assertEqual((pane.kind, pane.role, pane.status, pane.cwd), ("codex", "freestanding", "working", str(self.home)))
+        self.assertEqual(pane.reach, roster.CannotReceiveMessages("interactive Codex in a herdr pane"))
+        self.assertEqual((pane.showrunner, pane.director, pane.assignment),
+                         (roster.NoShowrunner(), roster.NoDirector(), roster.NotAWorker()))
+        self.assertEqual(entries["herdr native:w1:p3"].cwd, "")
+        self.assertNotIn("herdr native:w1:p2", entries)
+
+    def test_a_herdr_failure_is_a_problem_and_keeps_the_other_roster_rows(self) -> None:
+        binary = self._herdr_fixture({"default": {"code": 1, "stdout": json.dumps({
+            "error": {"code": "closed", "message": "fixture herdr unavailable"}
+        })}})
+        with mock.patch.object(herdr, "herdr_binary", return_value=binary), \
+                mock.patch.object(codex_daemon, "loaded_sessions", return_value=[]):
+            found = roster.roster(os.environ, roster.ThisMachine())
+        self.assertTrue(any(entry.name == "director" for entry in found.entries))
+        self.assertEqual(len(found.problems), 1)
+        self.assertIn("herdr sessions", found.problems[0])
+        self.assertIn("fixture herdr unavailable", found.problems[0])
+
+    def test_an_unreadable_herdr_session_keeps_codex_rows_from_other_sessions(self) -> None:
+        responses = self._herdr_sessions()
+        sessions_response = {"sessions": [herdr.SessionEntry(name=name, running=True, default=False,
+                            session_dir="/fixture", socket_path="/fixture/socket") for name in ("broken", "native")]}
+        responses["--session default session list --json"]["stdout"] = json.dumps(sessions_response)
+        responses["--session broken agent list"] = {"code": 1, "stdout": "", "stderr": "fixture broken"}
+        responses["--session native agent list"]["stdout"] = json.dumps({"ok": True, "result": {"agents": [
+            {"pane_id": "w1:p1", "agent": "codex", "agent_status": "idle"}
+        ]}})
+        binary = self._herdr_fixture(responses)
+        with mock.patch.object(herdr, "herdr_binary", return_value=binary), \
+                mock.patch.object(codex_daemon, "loaded_sessions", return_value=[]):
+            found = roster.roster(os.environ, roster.ThisMachine())
+        self.assertEqual([entry.name for entry in found.entries if entry.name.startswith("herdr ")], ["herdr native:w1:p1"])
+        self.assertEqual(len(found.problems), 1)
+        self.assertIn("herdr session broken", found.problems[0])
+
     def test_unreadable_tmux_keeps_worktree_directors_and_reports_the_problem(self) -> None:
         broken_tmux = self.root / "bin" / "broken-tmux"
         _ = broken_tmux.write_text(
@@ -999,7 +1101,7 @@ class RosterTests(unittest.TestCase):
             "alpha", "runner", "session:sid-runner",
         ))
         self.assertEqual(found.problems, [
-            "tmux for alpha was not read: tmux could not list panes: fixture cannot list panes",
+            "unit hosts for alpha were not read: tmux could not list panes: fixture cannot list panes; herdr is not installed",
         ])
         self.assertEqual(self.ssh_calls(), [])
 
@@ -1028,7 +1130,7 @@ class RosterTests(unittest.TestCase):
                 roster.UnderDirector("unit-one", "director", "session:sid-director"),
             ),
         )
-        self.assertFalse(any("tmux" in problem.lower() for problem in found.problems))
+        self.assertTrue(any("unit hosts for alpha were not read" in problem for problem in found.problems))
 
     def test_unreadable_daemon_is_one_problem_and_main_returns_one(self) -> None:
         result, lines, errors = self._run_main(
@@ -1185,14 +1287,16 @@ class RosterTests(unittest.TestCase):
         self.assertIn("not reached: timed out after 20 s", result.problems[0])
         self.assertEqual(len(calls), 1)
 
-    def test_mac_without_tmux_still_finds_worktree_directors_without_a_tmux_problem(self) -> None:
+    def test_mac_without_hosts_keeps_worktree_directors_without_resolving_tmux(self) -> None:
         with (mock.patch.object(sys, "platform", "darwin"),
               mock.patch.dict(os.environ, {"UNIT_LOOKUP_TMUX": str(self.root / "missing-tmux")}),
-              mock.patch.object(codex_daemon, "loaded_sessions", return_value=[])):
+              mock.patch.object(codex_daemon, "loaded_sessions", return_value=[]),
+              mock.patch.object(unit_lookup, "tmux_binary", side_effect=AssertionError("tmux must be skipped")) as resolver):
             result = roster.roster(os.environ, roster.ThisMachine())
+        resolver.assert_not_called()
         director = next(row for row in result.entries if row.name == "director")
         self.assertEqual(director.role, "unit director")
-        self.assertFalse(any("tmux" in problem.lower() for problem in result.problems))
+        self.assertTrue(any("unit hosts for alpha were not read" in problem for problem in result.problems))
         self.assertEqual(self.ssh_calls(), [])
 
 

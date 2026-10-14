@@ -41,6 +41,8 @@
 | bevy-upgrade-unit | docs/as-built/bevy-upgrade.md | /home/natepiano/worktrees/claude-build-followups-bevy-upgrade | build-followups-bevy-upgrade | — | scripts/bevy_upgrade/, commands/showrunner/bevy_upgrade.md |
 | message-clarity-unit | docs/plans/build-followups-message-clarity.md | /home/natepiano/worktrees/claude-build-followups-message-clarity | build-followups-message-clarity | — | scripts/notify/ |
 | herdr-trial-unit | `docs/plans/build-followups-herdr-adoption.md` (trial: `docs/as-built/herdr-trial.md`) | /home/natepiano/worktrees/claude-build-followups-herdr-trial | build-followups-herdr-trial | — | scripts/herdr/; docs/plans/build-followups-herdr-*.md; docs/as-built/herdr-*.md |
+| herdr-trust-unit | `docs/as-built/herdr-adoption.md` (run done; as-built) | /home/natepiano/worktrees/claude-build-followups-herdr-trust | build-followups-herdr-trust | — | — |
+| herdr-panes-unit | docs/plans/build-followups-herdr-panes.md | /home/natepiano/worktrees/claude-build-followups-herdr-panes | build-followups-herdr-panes | — | — |
 
 ## Hub files
 

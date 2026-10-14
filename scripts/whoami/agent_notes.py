@@ -15,6 +15,7 @@ as the timer left them and hands them to quota_alert.blocked().
 
 from __future__ import annotations
 
+import argparse
 import asyncio
 import json
 import math
@@ -32,12 +33,13 @@ import five_hour
 import note_file
 from note_file import FIELD, Note, reset_time
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from scripts.accounts import refusals
 from scripts.whoami.agent_accounts import KnownCodexAccount, UnknownCodexAccount
-from agent_accounts import (ClaudeAccountSelection, ClaudeDirectorySource, CodexHomeSource, EASTERN, Report,
+from agent_accounts import (ClaudeAccountsInUse, ClaudeDirectorySource, CodexHomeSource, EASTERN, Report,
                             codex_home_display, codex_homes,
                             codex_report_in_use, live_reports, seats_home as resolve_seats_home)
 from quota_alert import (AgentNote, alert, blocked, current_session, refresh, CodexAlertPassReadings,
-                         codex_alert_pass)
+                         codex_alert_pass, RefusedAt, RefusalTimeUnknown)
 from run_out import READINGS_LOG
 import usage_store
 
@@ -262,7 +264,7 @@ def update() -> list[str]:
     return update_for_selection(accounts.claude_account_selection(), seats_home)
 
 
-def update_for_selection(selection: ClaudeAccountSelection, seats_home: Path) -> list[str]:
+def update_for_selection(selection: ClaudeAccountsInUse, seats_home: Path) -> list[str]:
     """Update notes and watch using one live pass."""
     return list(update_alert_pass(selection, seats_home).messages)
 
@@ -273,7 +275,7 @@ class UpdatedAgentNotes:
     codex_readings: CodexAlertPassReadings
 
 
-def update_alert_pass(selection: ClaudeAccountSelection, seats_home: Path) -> UpdatedAgentNotes:
+def update_alert_pass(selection: ClaudeAccountsInUse, seats_home: Path) -> UpdatedAgentNotes:
     """Build the alert readings before writing any note."""
     notes = note_file.read_notes()
     multiple_codex_homes = len(codex_homes(seats_home)) > 1
@@ -291,13 +293,10 @@ def update_alert_pass(selection: ClaudeAccountSelection, seats_home: Path) -> Up
     except (OSError, ValueError) as error:
         # The saved readings must never cost the notes or the alerts.
         messages.append(f"usage store: {error}")
-    activity: AccountActivity = ObservedAccountActivity()
-    if selection.multiple_accounts:
-        activity = RoleAccountActivity(frozenset(
-            login.casefold() for note in notes
-            if note.tool == "claude" and (login := note.get("login"))
-            and selection.roles_for_login(login)
-        ))
+    activity: AccountActivity = RoleAccountActivity(frozenset(
+        login.casefold() for note in notes
+        if note.tool == "claude" and (login := note.get("login")) and selection.is_in_use(login)
+    ))
     selected_account = codex_readings.selected_account
     in_use_login = selected_account.login if isinstance(selected_account, KnownCodexAccount) else None
     codex_activity: AccountActivity = (RoleAccountActivity(frozenset({in_use_login.casefold()}))
@@ -333,16 +332,38 @@ def mark_tier(plan: codex_pacer.Plan) -> None:
             _ = set_fields(note, {"tier": ("fast" if called == "fast" else "regular") if active else "null"}, stamp)
 
 
+class RefusalCommandLine(argparse.Namespace):
+    identity: list[str] = []
+    window: str = "unknown"
+    refused_at: str = ""
+
+
 def main() -> None:
     if sys.argv[1:2] == ["blocked"]:
-        arguments = sys.argv[2:]
+        parser = argparse.ArgumentParser(prog="agent_notes.py blocked")
+        _ = parser.add_argument("identity", nargs="+", metavar="HOME LOGIN LABEL | HOME REASON")
+        _ = parser.add_argument("--window", choices=("weekly", "five_hour", "unknown"), default="unknown")
+        _ = parser.add_argument("--refused-at", default="", metavar="AWARE_ISO_TIME")
+        parsed = parser.parse_args(sys.argv[2:], namespace=RefusalCommandLine())
+        arguments = parsed.identity
         if len(arguments) == 3:
             identity = KnownCodexAccount(Path(arguments[0]), arguments[1], arguments[2])
         elif len(arguments) == 2:
             identity = UnknownCodexAccount(Path(arguments[0]), arguments[1])
         else:
-            sys.exit("usage: agent_notes.py blocked HOME LOGIN LABEL | blocked HOME REASON")
-        for line in blocked(list(note_file.read_notes()), identity):
+            parser.error("expected HOME LOGIN LABEL or HOME REASON")
+        refused_at: RefusedAt | RefusalTimeUnknown = RefusalTimeUnknown()
+        if parsed.refused_at:
+            try:
+                parsed_time = datetime.fromisoformat(parsed.refused_at)
+            except ValueError:
+                parser.error("--refused-at needs an aware ISO time")
+            if parsed_time.tzinfo is None:
+                parser.error("--refused-at needs an aware ISO time")
+            refused_at = RefusedAt(parsed_time)
+        window = (refusals.KnownWindow("weekly") if parsed.window == "weekly" else
+                  refusals.KnownWindow("five_hour") if parsed.window == "five_hour" else refusals.UnknownWindow())
+        for line in blocked(list(note_file.read_notes()), identity, window=window, refused_at=refused_at):
             print(line)
         return
     if sys.argv[1:] not in ([], ["refresh"]):
@@ -365,6 +386,14 @@ def main() -> None:
         # The pacer must never cost the notes or the alerts; launches fall back to
         # default once its decision is ten minutes old.
         print(f"codex pacer did not run: {error!r}")
+    if not sys.argv[1:]:
+        try:
+            from scripts.accounts import refusal_watch
+            for line in refusal_watch.run():
+                print(line)
+        except Exception as error:
+            reason = str(error).splitlines()[0] if str(error) else type(error).__name__
+            print(f"refusal watcher: {reason}", file=sys.stderr)
 
 
 if __name__ == "__main__":

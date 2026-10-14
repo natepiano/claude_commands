@@ -29,13 +29,15 @@ if TYPE_CHECKING:
     from scripts.accounts.accounts import ClaudeLaunchAccount
 
 
-class RetainedUnitAccount(NamedTuple):
-    """The existing config directory saved for this unit's previous launch."""
+class RetainedClaudeAccount(NamedTuple):
+    """The existing config directory saved for a previous Claude launch."""
     dir: Path
 
 
+RetainedUnitAccount = RetainedClaudeAccount
+
 if TYPE_CHECKING:
-    UnitLaunchAccount = ClaudeLaunchAccount | RetainedUnitAccount
+    UnitLaunchAccount = ClaudeLaunchAccount | RetainedClaudeAccount
 
 
 class Production(NamedTuple):
@@ -538,7 +540,10 @@ def director_agent(request: UnitLaunch) -> DirectorAgent:
     return DirectorAgent(model, Effort(effort) if effort else DefaultEffort())
 
 
-def preflight(request: RequestedUnitLaunch) -> ReadyToLaunch:
+def preflight(request: RequestedUnitLaunch, selected: UnitLaunchAccount) -> ReadyToLaunch:
+    from scripts.accounts.accounts import DefaultAccount, NamedAccount
+    from scripts.herdr.herdr import Untrusted, UnreadableTrustFile, claude_trust, repository_trust_key, trust_command
+
     production = request.production
     branch = git(production, "branch", "--show-current").stdout.strip()
     if branch != production.merge_branch:
@@ -567,6 +572,17 @@ def preflight(request: RequestedUnitLaunch) -> ReadyToLaunch:
         launch_kind=request.launch_kind,
         timeout=request.timeout,
     )
+    account = NamedAccount(str(selected.dir), selected.dir) if isinstance(selected, RetainedUnitAccount) else selected
+    account_file = Path.home() / ".claude.json" if isinstance(account, DefaultAccount) else account.dir / ".claude.json"
+    folder = request.session_cwd
+    check_folder = (repository_trust_key(production.checkout)
+                    if isinstance(request.session, NewSession) and not folder.exists() else folder)
+    trust = claude_trust(check_folder, account_file)
+    if isinstance(trust, UnreadableTrustFile):
+        raise Refusal(f"{request.unit}: {trust}")
+    if isinstance(trust, Untrusted):
+        label = "default account" if isinstance(account, DefaultAccount) else account.label
+        raise Refusal(f"{request.unit}: Claude is not trusted in {folder} on {label}. Run: {trust_command(check_folder, account)}")
     if restoring:
         # A restore adopts the row it matched and creates nothing: how the unit was first added, whether
         # its Plan cell still names a live plan rather than its as-built, and whether its worktree and
@@ -746,7 +762,7 @@ def launch_session(
     if target:
         argv = [sys.executable, str(SCRIPTS / "accounts" / "accounts.py"), "exec", target, *argv[1:]]
         prefix = ""
-    command = prefix + "ENABLE_TOOL_SEARCH=true command " + shlex.join(argv) + "; exec zsh"
+    command = "unset CLAUDE_CONFIG_DIR CLAUDE_CODE_REMOTE_MEMORY_DIR CLAUDE_CODE_OAUTH_TOKEN; " + prefix + "ENABLE_TOOL_SEARCH=true command " + shlex.join(argv) + "; exec zsh"
     environment = launch_environment()
     scope_name = re.sub(r"[^A-Za-z0-9_.-]", "-", tmux_session)
     scope = f"--unit={scope_name}-{int(time.time())}"
@@ -830,7 +846,10 @@ def account_for_launch(request: RequestedUnitLaunch, target: str = "", config_di
     if isinstance(request.session, NewSession):
         if target or config_dir:
             raise Refusal("--account and --config-dir require --resume")
-        return accounts.role_account("unit")
+        try:
+            return accounts.role_account("unit")
+        except accounts.AccountsError as error:
+            raise Refusal(str(error)) from error
     if target:
         if config_dir:
             raise Refusal("give only one of --account and --config-dir")
@@ -971,7 +990,7 @@ def main(argv: list[str]) -> int:
                     f"shutdown state unreadable: {permission.detail}"
                 )
 
-            ready = preflight(request)
+            ready = preflight(request, unit_account)
             request = ready.launch
             if cast(bool, args.check):
                 return 0

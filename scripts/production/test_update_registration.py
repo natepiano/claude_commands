@@ -10,12 +10,20 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from datetime import datetime, timedelta, timezone
 from unittest import mock
 from pathlib import Path
-from typing import cast, override
+from typing import TypedDict, cast, override
 
 
 SCRIPT = Path(__file__).with_name("update_registration.py")
+
+
+class QuestionRegistration(TypedDict):
+    time: str
+    text: str
+
+
 NOTIFIER = '''#!__PYTHON__
 import json
 import os
@@ -133,7 +141,7 @@ class RegistrationTests(unittest.TestCase):
     def copied_command(self) -> Path:
         tree = Path(tempfile.mkdtemp(prefix="command-copy-", dir=self.root))
         _ = shutil.copytree(SCRIPT.parent, tree / "scripts/production")
-        for name in ("build_hold", "build_targets", "buildlog", "lib", "lint", "mac_test", "message", "usage", "whoami"):
+        for name in ("build_hold", "build_targets", "buildlog", "herdr", "lib", "lint", "mac_test", "message", "usage", "whoami"):
             _ = shutil.copytree(SCRIPT.parent.parent / name, tree / "scripts" / name)
         hooks = tree / "scripts/hooks"
         hooks.mkdir(parents=True)
@@ -416,6 +424,43 @@ with patch.object(agents_log, 'append', side_effect=RuntimeError('recording fail
         cleared = self.run_command("footer", "--state", str(state))
         self.assertEqual(cleared.returncode, 0, cleared.stdout + cleared.stderr)
         self.assertEqual(json.loads(outstanding.read_text(encoding="utf-8")), [])
+
+    def test_footer_records_only_new_questions_and_prunes_history_older_than_two_days(self) -> None:
+        outstanding = self.outstanding()
+        _ = outstanding.write_text(json.dumps([{"since": "2026-10-01T08:00", "text": "Choose a compiler."}]))
+        now = datetime.now(timezone.utc)
+        history = outstanding.with_suffix(".history.jsonl")
+        records = [QuestionRegistration(time=(now - timedelta(hours=49)).isoformat(), text="Expired question?"),
+                   QuestionRegistration(time=(now - timedelta(hours=1)).isoformat(), text="Recent question?")]
+        _ = history.write_text("\n".join(json.dumps(item) for item in records) + "\n")
+        state = self.root / "judgment.json"
+        _ = state.write_text(json.dumps({"open_for_user": ["Choose a compiler.", "Approve the release."]}))
+        for _ in range(2):
+            result = self.run_command("footer", "--state", str(state))
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        saved = [cast(QuestionRegistration, json.loads(line)) for line in history.read_text().splitlines()]
+        self.assertEqual([item["text"] for item in saved], ["Recent question?", "Approve the release."])
+        self.assertEqual(saved[0], records[1])
+        stamp = datetime.fromisoformat(saved[1]["time"])
+        self.assertIsNotNone(stamp.tzinfo)
+        self.assertGreaterEqual(stamp, now)
+
+    def test_footer_keeps_registration_history_when_the_question_closes(self) -> None:
+        outstanding = self.outstanding()
+        state = self.root / "judgment.json"
+        _ = state.write_text(json.dumps({"open_for_user": ["Would you retry the build?"]}))
+        opened = self.run_command("footer", "--state", str(state))
+        self.assertEqual(opened.returncode, 0, opened.stdout + opened.stderr)
+        history = outstanding.with_suffix(".history.jsonl")
+        before = history.read_bytes()
+        _ = state.write_text(json.dumps({"open_for_user": []}))
+        closed = self.run_command("footer", "--state", str(state))
+        self.assertEqual(closed.returncode, 0, closed.stdout + closed.stderr)
+        self.assertEqual(json.loads(outstanding.read_text()), [])
+        self.assertEqual(history.read_bytes(), before)
+        saved = cast(QuestionRegistration, json.loads(before.decode().strip()))
+        self.assertEqual(saved["text"], "Would you retry the build?")
+        self.assertIsNotNone(datetime.fromisoformat(saved["time"]).tzinfo)
 
     def test_footer_rejects_bad_deferred_item_before_writing_outstanding(self) -> None:
         outstanding = self.outstanding()

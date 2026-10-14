@@ -11,21 +11,20 @@ import shlex
 import subprocess
 import sys
 import tempfile
-import threading
 import time
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from datetime import datetime, timedelta, timezone, tzinfo
 from pathlib import Path
 from collections.abc import Callable
-from concurrent.futures import ThreadPoolExecutor
 from typing import Self, TextIO, cast, final, override
 from unittest.mock import AsyncMock, MagicMock, call, patch
 from zoneinfo import ZoneInfo
 
-from scripts.accounts import accounts
+from scripts.accounts import accounts, refusals
 from scripts.production import showrunners
 from scripts.agents import codex_mesh
+from scripts.accounts import moves
 import account
 import agent_accounts
 import usage_store
@@ -37,6 +36,12 @@ def named_environment(config_dir: Path) -> dict[str, str]:
         "CLAUDE_CONFIG_DIR": str(config_dir),
         "CLAUDE_CODE_REMOTE_MEMORY_DIR": str(Path.home() / ".claude"),
     }
+
+
+def setUpModule() -> None:
+    root = Path(unittest.enterModuleContext(tempfile.TemporaryDirectory()))
+    _ = unittest.enterModuleContext(patch.object(showrunners, "NOTIFIER_STATE_DIR", root))
+    _ = unittest.enterModuleContext(patch.object(accounts, "SEATS_RUN_ROOT", root / "seat-runs"))
 
 
 def named_prefix(config_dir: Path) -> str:
@@ -137,6 +142,8 @@ class AccountsTests(unittest.TestCase):
         self.codex_reads = cast(AsyncMock, self.enterContext(patch.object(
             agent_accounts, "codex_live", return_value=agent_accounts.Report("Codex", problem="Not logged in"),
         )))
+        _ = self.enterContext(patch.object(accounts, "SEATS_RUN_ROOT", self.root / "seat-runs"))
+        _ = self.enterContext(patch.object(showrunners, "NOTIFIER_STATE_DIR", self.root / "notifier"))
         _ = self.enterContext(patch.object(agent_accounts, "prepare_codex_home",
             return_value=agent_accounts.CodexHomePrepared()))
         _ = self.enterContext(patch.object(codex_mesh, "retire_seats_servers", return_value=[]))
@@ -148,6 +155,109 @@ class AccountsTests(unittest.TestCase):
         return self.live.get(config_dir, agent_accounts.Report(
             "Claude", problem="Account unavailable (claude auth status failed)",
         ))
+
+    def test_status_names_live_account_and_codex_refusal_destination_separately(self) -> None:
+        from scripts.message import sessions
+        self.login_directory("claude 2", "main@example.invalid", default=True)
+        owner = sessions.SessionRecord(pid=12345, sessionId="live-identity", name="Live director",
+            messagingSocketPath="/fixture.sock", updatedAt=1, tmux="", formerNames=[])
+        now = datetime.now(timezone.utc)
+        def chosen(tool: str, _now: datetime, **_options: object) -> accounts.PickedAccount:
+            return accounts.PickedAccount("default" if tool == "claude" else "codex 3",
+                self.main_dir if tool == "claude" else self.home / ".codex3", 1,
+                accounts.KnownReset(now + timedelta(days=1)))
+        with (patch.object(sessions, "live_sessions", return_value=[owner]),
+              patch.object(account, "process_config_dir", return_value=self.main_dir),
+              patch.object(accounts, "pick", side_effect=chosen),
+              patch.object(accounts, "role_account", return_value=accounts.CodexSeatsAccount("codex 1", self.home / ".codex1"))):
+            code, output, error = self.run_cli("status")
+        self.assertEqual((code, error), (0, ""))
+        self.assertIn("live-identity", output)
+        self.assertIn("Live director", output)
+        self.assertIn("claude 2", output)
+        self.assertIn("Codex seats: codex 1", output)
+        self.assertIn("on refusal: codex 3", output)
+        self.assertIn("next", output.split("\n\n")[0])
+
+    def test_status_shows_each_owed_continuation_and_its_hold_reason(self) -> None:
+        run = self.root / "seat-runs/run-one"
+        run.mkdir(parents=True)
+        _ = (run / "mesh_server.json").write_text(json.dumps({"pid": os.getpid()}))
+        _ = (run / "mesh_roster.json").write_text(json.dumps({
+            "blocked": {"status": "starting", "continuation_owed": True,
+                "continuation_reason": "destination account refused again"},
+            "capacity": {"status": "waiting_capacity", "continuation_owed": True},
+            "done": {"status": "idle", "continuation_owed": False},
+        }))
+        _, output, _ = self.run_cli("status")
+        self.assertIn("run-one/blocked: continuation owed", output)
+        self.assertIn("destination account refused again", output)
+        self.assertIn("run-one/capacity: continuation owed", output)
+        self.assertIn("waiting for capacity", output)
+        self.assertNotIn("run-one/done", output)
+
+    def test_status_omits_owed_continuations_from_runs_without_a_live_mesh_server(self) -> None:
+        for name, server in (("live", {"pid": 901}), ("dead", {"pid": 902}),
+                             ("missing", None), ("malformed", {"pid": "901"}),
+                             ("invalid-pid", {"pid": True})):
+            run = self.root / "seat-runs" / name
+            run.mkdir(parents=True)
+            _ = (run / "mesh_roster.json").write_text(json.dumps({
+                "worker": {"continuation_owed": True, "status": "waiting_capacity"}}))
+            if server is not None:
+                _ = (run / "mesh_server.json").write_text(json.dumps(server))
+        def check(pid: int, signal: int) -> None:
+            self.assertEqual(signal, 0)
+            if pid != 901:
+                raise ProcessLookupError("mesh server gone")
+        with patch.object(os, "kill", side_effect=check):
+            _, output, _ = self.run_cli("status")
+        self.assertIn("live/worker: continuation owed", output)
+        for name in ("dead", "missing", "malformed", "invalid-pid"):
+            self.assertNotIn(name + "/worker", output)
+
+    def test_status_renders_requested_pending_confirmed_per_seat_and_failed_reason(self) -> None:
+        common = moves.MoveCommon(at="2026-10-14T12:00:00+00:00", tool="codex", subject="seats", move_id="move-one")
+        request: moves.RequestedMove = {**common, "kind": "requested", "from": "codex 1", "to": "codex 3",
+            "why": "weekly refusal", "window": "weekly", "reset": "2026-10-16T12:00:00+00:00"}
+        moves.append_move(request)
+        moves.append_move(moves.ConfirmedMove(**common, kind="confirmed", home=str(self.home / ".codex3"), seat="worker-a", run="run-one"))
+        moves.append_move(moves.ConfirmedMove(**common, kind="confirmed", home=str(self.home / ".codex3"), seat="worker-b", run="run-one"))
+        failed: moves.RequestedMove = {**request, "move_id": "failed-move", "subject": "claude-session: Director", "tool": "claude"}
+        moves.append_move(failed)
+        moves.append_move(moves.FailedMove(at=common["at"], move_id="failed-move", subject="claude-session: Director", tool="claude",
+            kind="failed", reason="still on claude 1"))
+        moves.append_move({**request, "move_id": "pending-move", "subject": "waiting-session: Waiting"})
+        _, output, _ = self.run_cli("status")
+        self.assertIn("confirmed", output)
+        self.assertIn("worker-a", output)
+        self.assertIn("worker-b", output)
+        self.assertIn("still on claude 1", output)
+        self.assertIn("pending", output)
+        self.assertIn("2026-10-14 05:00", output)
+
+    def test_status_limits_move_readout_to_last_ten_entries(self) -> None:
+        for index in range(12):
+            moves.append_move(moves.FailedMove(at="2026-10-14T12:00:00+00:00", tool="claude",
+                subject=f"session-{index}", move_id=f"move-{index}", kind="failed", reason=f"failure-{index}"))
+        _, output, _ = self.run_cli("status")
+        self.assertNotIn("session-0:", output)
+        self.assertNotIn("session-1:", output)
+        for index in range(2, 12):
+            self.assertIn(f"session-{index}", output)
+
+    def test_status_renders_wait_end_no_room_and_room_again_in_user_zone(self) -> None:
+        common = moves.MoveCommon(at="2026-10-14T12:00:00+00:00", tool="claude", subject="director: Director", move_id="wait-one")
+        moves.append_move(moves.WaitedMove(**common, kind="waited", window="five_hour", reset="2026-10-14T12:19:00+00:00"))
+        moves.append_move(moves.WaitEndedMove(**common, kind="wait ended"))
+        room: moves.MoveCommon = {**common, "move_id": "room-one"}
+        moves.append_move(moves.NoRoomMove(**room, kind="no room", earliest_reset="2026-10-15T12:00:00+00:00"))
+        moves.append_move(moves.RoomAgainMove(**room, kind="room again", label="claude 3"))
+        _, output, _ = self.run_cli("status")
+        self.assertIn("waited until 2026-10-14T05:19", output)
+        self.assertIn("wait ended", output)
+        self.assertIn("no room until 2026-10-15T05:00", output)
+        self.assertIn("room again: claude 3", output)
 
     def status_rows(self) -> list[tuple[str, ...]]:
         """The status table's rows after its heading, each a tuple of its cells, then nothing else."""
@@ -239,6 +349,15 @@ class AccountsTests(unittest.TestCase):
         if note_label:
             self.write_note(note_label, login)
 
+    def seed_room(self, login: str, days: float = 2) -> None:
+        now = datetime.now(timezone.utc)
+        file = usage_store.store_file()
+        saved = usage_store.load()
+        saved[usage_store.key("Claude", login)] = usage_store.StoredUsage(weekly=usage_store.StoredWindow(
+            left=80, at=now.isoformat(), resets=(now + timedelta(days=days)).isoformat()))
+        file.parent.mkdir(parents=True, exist_ok=True)
+        _ = file.write_text(json.dumps(saved))
+
     def write_readings(self, readings: list[accounts.QuotaReading]) -> None:
         log = accounts.readings_file()
         log.parent.mkdir(parents=True, exist_ok=True)
@@ -316,18 +435,6 @@ class AccountsTests(unittest.TestCase):
         self.assertEqual(len(reads), 1)
         launch.assert_called_once()
 
-    def test_exec_unit_follows_the_role_and_uses_plain_claude_when_unassigned(self) -> None:
-        with patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": "inherited"}), patch.object(os, "execvpe") as launch:
-            environment = dict(os.environ)
-            del environment["CLAUDE_CONFIG_DIR"]
-            self.assertEqual(self.run_cli("exec", "unit", "--version"), (0, "", ""))
-        launch.assert_called_once_with("claude", ["claude", "--version"], environment)
-        self.login_directory("claude 2", "main@example.invalid", default=True)
-        self.login_directory("claude 3", "main@example.invalid")
-        self.select_named_unit("claude 3")
-        with patch.object(os, "execvpe") as launch:
-            self.assertEqual(self.run_cli("exec", "unit"), (0, "", ""))
-        launch.assert_called_once_with("claude", ["claude"], {**os.environ, **named_environment(accounts.account_dir("claude 3"))})
 
     def test_exec_named_alias_of_default_login_uses_plain_claude(self) -> None:
         self.login_directory("claude 2", "main@example.invalid", default=True)
@@ -340,11 +447,13 @@ class AccountsTests(unittest.TestCase):
     def test_exec_discards_an_inherited_oauth_token_for_every_account_selection(self) -> None:
         self.login_directory("claude 2", "main@example.invalid", default=True)
         self.login_directory("claude 3", "unit@example.invalid")
+        self.seed_room("main@example.invalid", 7)
+        self.seed_room("unit@example.invalid", 2)
         selections = (
             ("named account", "claude 3", False, str(accounts.account_dir("claude 3"))),
             ("default login alias", "claude 2", False, ""),
             ("named unit role", "unit", True, str(accounts.account_dir("claude 3"))),
-            ("unassigned unit", "unit", False, ""),
+            ("legacy unit key absent", "unit", False, str(accounts.account_dir("claude 3"))),
         )
         for selection, label, named_unit, config_dir in selections:
             with self.subTest(selection=selection):
@@ -551,12 +660,11 @@ class AccountsTests(unittest.TestCase):
         self.assertIn("| claude 4 | spare@example.invalid ", result[1])
         selection = accounts.claude_account_selection()
         self.assertEqual([named.identity.label for named in selection.named_accounts], ["claude 4"])
-        self.assertIsInstance(selection.unit_account, agent_accounts.UnreadableClaudeAccount)
         self.assertTrue(selection.is_default_login("main@example.invalid"))
 
     def test_exec_reports_an_unavailable_claude_executable_with_exit_two(self) -> None:
         with patch.object(os, "execvpe", side_effect=FileNotFoundError("fixture executable missing")):
-            result = self.run_cli("exec", "unit")
+            result = self.run_cli("exec", "default")
         self.assertEqual(result, (2, "", "accounts: could not start claude: fixture executable missing\n"))
 
     def test_check_wrong_login_or_missing_note_removes_the_named_account_and_unit_role(self) -> None:
@@ -572,8 +680,7 @@ class AccountsTests(unittest.TestCase):
                 self.assertEqual(accounts.checked_named_accounts(), [])
                 selection = accounts.claude_account_selection()
                 self.assertEqual(selection.named_accounts, ())
-                self.assertIsInstance(selection.unit_account, agent_accounts.UnreadableClaudeAccount)
-                self.assertTrue(selection.multiple_accounts)
+                self.assertFalse(selection.multiple_accounts)
 
     def test_check_retains_link_identity_and_note_failures_in_one_readiness_value(self) -> None:
         self.login_directory("claude 2", "main@example.invalid", default=True)
@@ -601,26 +708,7 @@ class AccountsTests(unittest.TestCase):
         self.assertEqual(accounts.check("claude 3"), [])
         self.assertEqual(accounts.account_identity(accounts.account_dir("claude 3")), agent_accounts.KnownClaudeAccount("main@example.invalid", "claude 2"))
 
-    def test_swap_refuses_a_wrong_login_target_before_any_role_or_history_write(self) -> None:
-        _ = self.prepare_swap()
-        self.write_identity("claude 1", "other@example.invalid")
-        before = self.role_files()
-        with patch.object(subprocess, "run") as shutdown:
-            result = self.run_cli("swap", "unit", "claude 1")
-        self.assertEqual(result[0], 1)
-        self.assertIn("logged in as other@example.invalid, not claude 1", result[2])
-        self.assertEqual(self.role_files(), before)
-        shutdown.assert_not_called()
 
-    def test_swap_refuses_a_wrong_login_current_unit_before_any_role_or_history_write(self) -> None:
-        _ = self.prepare_swap()
-        self.write_identity("claude 3", "other@example.invalid")
-        before = self.role_files()
-        with patch.object(subprocess, "run") as shutdown:
-            result = self.run_cli("swap", "unit", "claude 1")
-        self.assertEqual(result, (1, "", "accounts: current unit account identity is unreadable\n"))
-        self.assertEqual(self.role_files(), before)
-        shutdown.assert_not_called()
 
     def prepare_swap(self, *, shared_default_login: bool = False) -> accounts.SwapInventory:
         self.login_directory("claude 2", "main@example.invalid", default=True)
@@ -664,405 +752,59 @@ class AccountsTests(unittest.TestCase):
             result = self.run_cli("swap", "unit", label, *(["--dry-run"] if dry_run else []))
         return result, commands
 
-    def test_swap_moves_local_units_and_owned_seats_with_an_empty_peer_inventory(self) -> None:
-        local = self.prepare_swap()
-        local["sessions"].insert(0, accounts.SwapSeatSession(
-            kind="seat", session_id="seat-id", name="seat-one",
-            owner=accounts.SwapDirectorOwner(kind="director", session_id="unit-id"),
-        ))
-        remote = accounts.SwapInventory(
-            machine="macbook", login=local["login"], label=local["label"],
-            sessions=[], unattributed=[],
-        )
 
-        result, commands = self.swap_cli([local, remote])
 
-        self.assertEqual(result, (0, "shutdown started\nunits come back on claude 1 when claude 3 is down\n", ""))
-        self.assertEqual([argv[2:] for argv in commands], [
-            ("status", "claude 3", "--json"), ("down", "claude 3", "--restart", "--to", "claude 1"),
-        ])
-        self.assertEqual(accounts.role_account("unit"), accounts.NamedAccount("claude 1", self.home / ".claude1"))
-        audit = cast(dict[str, object], json.loads(accounts.roles_history_file().read_text()))
-        self.assertEqual((audit["label"], audit["account_label"]), ("claude 1", "claude 1"))
 
-    def test_swap_refuses_a_peer_unit_before_writing_the_role_or_starting_shutdown(self) -> None:
-        local = self.prepare_swap()
-        remote = accounts.SwapInventory(
-            machine="macbook", login=local["login"], label=local["label"],
-            sessions=[accounts.SwapUnitSession(kind="unit", session_id="remote-id", name="unit-two")],
-            unattributed=[],
-        )
-        before = self.role_files()
 
-        result, commands = self.swap_cli([local, remote])
 
-        self.assertEqual(result, (1, "", "accounts: cannot swap claude 3: macbook unit unit-two would not move\n"))
-        self.assertEqual([argv[2:] for argv in commands], [("status", "claude 3", "--json")])
-        self.assertEqual(self.role_files(), before)
 
-    def test_swap_refuses_a_peer_owned_seat_before_writing_the_role_or_starting_shutdown(self) -> None:
-        local = self.prepare_swap()
-        remote = accounts.SwapInventory(
-            machine="macbook", login=local["login"], label=local["label"],
-            sessions=[
-                accounts.SwapSeatSession(kind="seat", session_id="remote-seat", name="seat-two",
-                                         owner=accounts.SwapDirectorOwner(kind="director", session_id="remote-id")),
-                accounts.SwapUnitSession(kind="unit", session_id="remote-id", name="unit-two"),
-            ], unattributed=[],
-        )
-        before = self.role_files()
 
-        result, commands = self.swap_cli([local, remote])
 
-        self.assertEqual(result, (1, "", "accounts: cannot swap claude 3: macbook seat seat-two would not move\n"))
-        self.assertEqual([argv[2:] for argv in commands], [("status", "claude 3", "--json")])
-        self.assertEqual(self.role_files(), before)
 
-    def test_swap_inspects_and_stops_the_old_note_identity_instead_of_its_directory_label(self) -> None:
-        found = self.prepare_swap(shared_default_login=True)
 
-        result, commands = self.swap_cli([found])
 
-        self.assertEqual(result[0], 0, result)
-        self.assertEqual([argv[2:] for argv in commands], [
-            ("status", "claude 2", "--json"), ("down", "claude 2", "--restart", "--to", "claude 1"),
-        ])
-        self.assertIn("when claude 2 is down", result[1])
 
-    def test_swap_accepts_an_unnamed_unit_and_identifies_an_unnamed_blocker_by_session_id(self) -> None:
-        found = self.prepare_swap()
-        found["sessions"][0]["name"] = ""
-        result, _ = self.swap_cli([found], dry_run=True)
-        self.assertEqual(result[0], 0, result)
-        found["sessions"].append(accounts.SwapOtherSession(kind="top-level", session_id="unnamed-terminal", name=""))
-        before = self.role_files()
-        result, _ = self.swap_cli([found])
-        self.assertEqual(result[0], 1)
-        self.assertIn("top-level unnamed-terminal", result[2])
-        self.assertEqual(self.role_files(), before)
 
-    def test_swap_default_returns_units_to_the_default_login(self) -> None:
-        found = self.prepare_swap()
 
-        result, commands = self.swap_cli([found], "default")
 
-        self.assertEqual(result, (0, "shutdown started\nunits come back on claude 2 when claude 3 is down\n", ""))
-        self.assertEqual(commands[-1][2:], ("down", "claude 3", "--restart", "--to", "default"))
-        self.assertIsInstance(accounts.role_account("unit"), accounts.DefaultAccount)
-        audit = cast(dict[str, object], json.loads(accounts.roles_history_file().read_text()))
-        self.assertEqual((audit["label"], audit["account_label"]), ("default", "claude 2"))
 
-    def test_swap_dry_run_prints_both_commands_without_writing_or_stopping(self) -> None:
-        found = self.prepare_swap()
-        before = self.role_files()
 
-        result, commands = self.swap_cli([found], dry_run=True)
 
-        self.assertEqual((result[0], result[2]), (0, ""))
-        role_argv, down_argv = [shlex.split(line) for line in result[1].splitlines()]
-        self.assertEqual(role_argv[2:], ["set-role", "unit", "claude 1"])
-        self.assertEqual(down_argv[2:], ["down", "claude 3", "--restart", "--to", "claude 1"])
-        self.assertEqual([argv[2] for argv in commands], ["status"])
-        self.assertEqual(self.role_files(), before)
 
-    def test_swap_refuses_an_unreadable_old_identity_before_any_subprocess_or_write(self) -> None:
-        _ = self.prepare_swap()
-        (accounts.account_dir("claude 3") / ".claude.json").unlink()
-        before = self.role_files()
-        with patch.object(subprocess, "run", side_effect=AssertionError("shutdown called")):
-            result = self.run_cli("swap", "unit", "claude 1")
-        self.assertEqual(result, (1, "", "accounts: current unit account identity is unreadable\n"))
-        self.assertEqual(self.role_files(), before)
 
-    def test_swap_refuses_an_unfit_target_before_any_subprocess_or_write(self) -> None:
-        _ = self.prepare_swap()
-        (accounts.account_dir("claude 1") / "projects").unlink()
-        before = self.role_files()
-        with patch.object(subprocess, "run", side_effect=AssertionError("shutdown called")):
-            result = self.run_cli("swap", "unit", "claude 1")
-        self.assertEqual(result[0:2], (1, ""))
-        self.assertIn("projects", result[2])
-        self.assertEqual(self.role_files(), before)
 
-    def test_swap_refuses_a_missing_target_before_any_subprocess_or_write(self) -> None:
-        _ = self.prepare_swap()
-        before = self.role_files()
-        with patch.object(subprocess, "run", side_effect=AssertionError("shutdown called")):
-            result = self.run_cli("swap", "unit", "claude 9")
-        self.assertEqual(result[0:2], (1, ""))
-        self.assertIn(".claude9 is missing", result[2])
-        self.assertEqual(self.role_files(), before)
 
-    def test_swap_default_note_label_requires_default_even_without_a_named_directory(self) -> None:
-        _ = self.prepare_swap()
-        before = self.role_files()
-        with patch.object(subprocess, "run", side_effect=AssertionError("shutdown called")):
-            result = self.run_cli("swap", "unit", "claude 2")
-        self.assertEqual(result, (1, "", "accounts: claude 2 is the default account; use default\n"))
-        self.assertEqual(self.role_files(), before)
 
-    def test_swap_refuses_the_default_login_named_by_a_directory_with_an_undo_hint(self) -> None:
-        _ = self.prepare_swap()
-        self.login_directory("claude 4", "MAIN@example.invalid", note_label="claude 2")
-        before = self.role_files()
-        with patch.object(subprocess, "run", side_effect=AssertionError("shutdown called")):
-            result = self.run_cli("swap", "unit", "claude 4")
-        self.assertEqual(result, (1, "", "accounts: claude 4 is the default account; use default\n"))
-        self.assertEqual(self.role_files(), before)
-
-    def test_swap_refuses_an_alias_of_the_current_unit_login(self) -> None:
-        _ = self.prepare_swap()
-        self.login_directory("claude 4", "OLD@example.invalid", note_label="claude 3")
-        before = self.role_files()
-        with patch.object(subprocess, "run", side_effect=AssertionError("shutdown called")):
-            result = self.run_cli("swap", "unit", "claude 4")
-        self.assertEqual(result, (1, "", "accounts: claude 3 is already the unit account\n"))
-        self.assertEqual(self.role_files(), before)
-
-    def test_swap_refuses_an_unreadable_default_undo_target(self) -> None:
-        _ = self.prepare_swap()
-        (self.home / ".claude.json").unlink()
-        before = self.role_files()
-        with patch.object(subprocess, "run", side_effect=AssertionError("shutdown called")):
-            result = self.run_cli("swap", "unit", "default")
-        self.assertEqual(result, (1, "", "accounts: default account identity is unreadable\n"))
-        self.assertEqual(self.role_files(), before)
-
-    def test_swap_names_every_kind_of_session_that_would_not_move(self) -> None:
-        found = self.prepare_swap()
-        before = self.role_files()
-        blockers: list[accounts.SwapSession] = [
-            accounts.SwapOtherSession(kind="showrunner", session_id="showrunner", name="showrunner-one"),
-            accounts.SwapOtherSession(kind="top-level", session_id="terminal", name="terminal-one"),
-            accounts.SwapSeatSession(kind="seat", session_id="orphan", name="orphan-seat", owner=accounts.SwapNoDirector(kind="no director")),
-            accounts.SwapSeatSession(kind="seat", session_id="other-seat", name="other-seat", owner=accounts.SwapDirectorOwner(kind="director", session_id="other-director")),
-        ]
-        for blocked in blockers:
-            with self.subTest(blocked=blocked):
-                found["sessions"] = [accounts.SwapUnitSession(kind="unit", session_id="unit-id", name="unit-one"), blocked]
-                result, commands = self.swap_cli([found])
-                self.assertEqual(result[0:2], (1, ""))
-                self.assertIn(f"{blocked['kind']} {blocked['name']}", result[2])
-                self.assertEqual([argv[2] for argv in commands], ["status"])
-                self.assertEqual(self.role_files(), before)
-
-    def test_swap_refuses_and_names_unattributed_sessions(self) -> None:
-        found = self.prepare_swap()
-        found["unattributed"] = [accounts.SwapUnattributedSession(name="unreadable-session", pid=123, reason="account unreadable")]
-        before = self.role_files()
-        result, commands = self.swap_cli([found])
-        self.assertEqual(result[0:2], (1, ""))
-        self.assertIn("unattributed session unreadable-session (pid 123)", result[2])
-        self.assertEqual(len(commands), 1)
-        self.assertEqual(self.role_files(), before)
-
-    def test_swap_refuses_missing_or_unavailable_machine_inventory(self) -> None:
-        found = self.prepare_swap()
-        before = self.role_files()
-        invalid: list[object] = [
-            [], found, [found, {"machine": "macbook", "unreachable": True}],
-            [found, {"machine": "macbook", "status": "unavailable", "rc": 1}],
-            [{**found, "login": "another@example.invalid"}],
-            [{**found, "sessions": [{"kind": "unknown", "session_id": "x", "name": "x"}]}],
-            [{**found, "sessions": "not a list"}],
-            [{"machine": "natedev", "login": found["login"], "label": found["label"], "sessions": []}],
-        ]
-        for wire in invalid:
-            with self.subTest(wire=wire):
-                result, commands = self.swap_cli(wire)
-                self.assertEqual(result[0:2], (1, ""))
-                self.assertEqual(len(commands), 1)
-                self.assertEqual(self.role_files(), before)
-
-    def test_swap_refuses_failed_or_invalid_status_output_without_writing(self) -> None:
-        _ = self.prepare_swap()
-        before = self.role_files()
-        for code, output, error in ((2, "", "status refused\n"), (0, "not JSON", "")):
-            with self.subTest(code=code):
-                with patch.object(subprocess, "run", return_value=subprocess.CompletedProcess([], code, output, error)) as shutdown:
-                    result = self.run_cli("swap", "unit", "claude 1")
-                self.assertEqual(result[0:2], (1, ""))
-                shutdown.assert_called_once()
-                self.assertEqual(self.role_files(), before)
-
-    def test_refused_down_restores_the_previous_role_and_can_be_retried_immediately(self) -> None:
-        found = self.prepare_swap()
-        before = accounts.accounts_config_file().read_text()
-
-        result, _ = self.swap_cli([found], down_code=2, down_stdout="", down_stderr="shutdown: nothing was shut down\n")
-
-        self.assertEqual(result, (2, "unit account unchanged: still claude 3\n", "shutdown: nothing was shut down\n"))
-        self.assertEqual(accounts.accounts_config_file().read_text(), before)
-        history = [cast(dict[str, object], json.loads(line)) for line in accounts.roles_history_file().read_text().splitlines()]
-        self.assertEqual([(line["label"], line["account_label"]) for line in history], [("claude 1", "claude 1"), ("claude 3", "claude 3")])
-        retried, _ = self.swap_cli([found])
-        self.assertEqual(retried[0], 0, retried)
-
-    def test_refused_down_restores_an_absent_default_role_configuration(self) -> None:
-        found = self.prepare_swap(shared_default_login=True)
-        accounts.accounts_config_file().unlink()
-
-        result, _ = self.swap_cli([found], down_code=1, down_stdout="nothing was shut down\n")
-
-        self.assertEqual(result[0], 1)
-        self.assertFalse(accounts.accounts_config_file().exists())
-        self.assertIsInstance(accounts.role_account("unit"), accounts.DefaultAccount)
-        self.assertIn("unit account unchanged: still claude 2", result[1])
-
-    def test_failed_down_spawn_restores_the_old_role(self) -> None:
-        found = self.prepare_swap()
-        before = accounts.accounts_config_file().read_text()
-        with patch.object(subprocess, "run", side_effect=[
-            subprocess.CompletedProcess([], 0, json.dumps([found]), ""), OSError("missing executable"),
-        ]):
-            result = self.run_cli("swap", "unit", "claude 1")
-        self.assertEqual(result[0], 1)
-        self.assertIn("missing executable", result[2])
-        self.assertEqual(accounts.accounts_config_file().read_text(), before)
-
-    def test_accepted_shutdown_retains_the_new_role_and_partial_stop_retry_line(self) -> None:
-        found = self.prepare_swap()
-        notice = "shutdown: stop partial\nshutdown.py down claude 3 --restart\n"
-        result, _ = self.swap_cli([found], down_stdout=notice)
-        self.assertEqual(result[0], 0, result)
-        self.assertTrue(result[1].startswith(notice))
-        self.assertEqual(accounts.role_account("unit"), accounts.NamedAccount("claude 1", self.home / ".claude1"))
-
-    def test_swap_uses_one_selection_through_role_write_and_shutdown(self) -> None:
-        found = self.prepare_swap()
-
-        def shutdown(argv: tuple[str, ...], **_options: object) -> subprocess.CompletedProcess[str]:
-            if argv[2] == "status":
-                _ = self.enterContext(patch.object(accounts, "account_identity", side_effect=AssertionError("identity resolved again")))
-                return subprocess.CompletedProcess(argv, 0, json.dumps([found]), "")
-            return subprocess.CompletedProcess(argv, 0, "", "")
-
-        with (patch.object(accounts, "claude_account_selection", wraps=accounts.claude_account_selection) as selection,
-              patch.object(subprocess, "run", side_effect=shutdown)):
-            result = self.run_cli("swap", "unit", "claude 1")
-        self.assertEqual(result[0], 0, result)
-        selection.assert_called_once_with()
-
-    def test_burn_keeps_the_swapped_account_identity_after_logout_or_another_login(self) -> None:
-        found = self.prepare_swap()
-        self.login_directory("claude 4", "new@example.invalid")
-        notes = Path(os.environ["AGENT_NOTES_DIR"])
-        _ = (notes / "claude 5.md").write_text("---\nlogin: another@example.invalid\n---\n")
-        with patch.object(accounts, "datetime", RoleWriteTime):
-            result, _ = self.swap_cli([found], "claude 4")
-        self.assertEqual(result[0], 0, result)
-        audit = cast(dict[str, object], json.loads(accounts.roles_history_file().read_text()))
-        self.assertEqual((audit["label"], audit["account_label"]), ("claude 4", "claude 1"))
-        self.write_readings([
-            accounts.QuotaReading(account="claude 1", at=f"2026-10-{day:02d}T00:00:00Z", remaining=left)
-            for day, left in ((9, 90.0), (10, 80.0))
-        ])
-        config = accounts.account_dir("claude 4") / ".claude.json"
-        for content in ({}, {"oauthAccount": {"emailAddress": "another@example.invalid"}}):
-            with self.subTest(content=content):
-                _ = config.write_text(json.dumps(content))
-                results = accounts.burn(datetime(2026, 10, 9, tzinfo=timezone.utc), datetime(2026, 10, 10, tzinfo=timezone.utc))
-                self.assertEqual(results, [accounts.AccountRoleBurn("claude 1", ("unit directors",), 10, 1)])
-
-    def test_set_role_refuses_unreadable_named_and_default_identities_without_writing(self) -> None:
-        for label in ("claude 1", "default"):
-            with self.subTest(label=label):
-                result = self.run_cli("set-role", "unit", label)
-                self.assertEqual(result, (1, "", f"accounts: account identity for {label} is unreadable\n"))
-                self.assertEqual(self.role_files(), {})
-
-    def test_new_default_role_history_keeps_its_identity_after_default_logout(self) -> None:
+    def test_burn_keeps_historical_account_identity_after_logout_or_another_login(self) -> None:
         self.login_directory("claude 2", "main@example.invalid", default=True)
-        with patch.object(accounts, "datetime", RoleWriteTime):
-            accounts.set_role("unit", "default")
-        (self.home / ".claude.json").unlink()
-        self.write_readings([
-            accounts.QuotaReading(account="claude 2", at=f"2026-10-{day:02d}T00:00:00Z", remaining=left)
-            for day, left in ((9, 90.0), (10, 80.0))
-        ])
-        self.assertEqual(accounts.burn(datetime(2026, 10, 9, tzinfo=timezone.utc), datetime(2026, 10, 10, tzinfo=timezone.utc)),
-                         [accounts.AccountRoleBurn("claude 2", ("unit directors",), 10, 1)])
+        self.write_role_history([accounts.RoleChange(at="2026-10-08T00:00:00Z", role="unit", label="claude 1", account_label="claude 1")])
+        self.write_readings([accounts.QuotaReading(account="claude 1", at=f"2026-10-{day:02d}T00:00:00Z", remaining=left)
+                            for day, left in ((9, 90.0), (10, 80.0))])
+        result = accounts.burn(datetime(2026, 10, 9, tzinfo=timezone.utc), datetime(2026, 10, 10, tzinfo=timezone.utc))
+        self.assertIn(accounts.AccountRoleBurn("claude 1", ("unit directors",), 10, 1), result)
 
     def test_legacy_default_role_history_refuses_an_unreadable_identity(self) -> None:
         self.write_role_history([accounts.LegacyRoleChange(at="2026-10-08T00:00:00Z", role="unit", label="default")])
         with self.assertRaisesRegex(accounts.AccountsError, "account identity for default is unreadable"):
             _ = accounts.burn(datetime(2026, 10, 9, tzinfo=timezone.utc), datetime(2026, 10, 10, tzinfo=timezone.utc))
 
-    def test_single_default_account_serves_both_roles_without_multi_account_displays(self) -> None:
-        self.login_directory("claude 2", "main@example.invalid", default=True)
-        self.assertFalse(accounts.multiple_accounts_configured())
-        roles = accounts.claude_account_selection()
-        self.assertFalse(roles.multiple_accounts)
-        self.assertEqual(roles.roles_for_login("MAIN@example.invalid"), ("showrunners", "unit directors"))
-        self.assertEqual(roles.roles_for_login("unknown@example.invalid"), ())
-        self.assertEqual(roles.roles_for_login(""), ())
-
-    def test_account_selection_uses_the_whoami_identity_types(self) -> None:
-        """Factory values must pass the top-level whoami type checks."""
+    def test_account_selection_uses_whoami_accounts_in_use_type_and_checked_directories(self) -> None:
         self.login_directory("claude 2", "main@example.invalid", default=True)
         self.login_directory("claude 3", "unit@example.invalid")
-        self.select_named_unit("claude 3")
-
         selection = accounts.claude_account_selection()
-
-        self.assertIsInstance(selection, agent_accounts.ClaudeAccountSelection)
+        self.assertIsInstance(selection, agent_accounts.ClaudeAccountsInUse)
         self.assertIsInstance(selection.default_account, agent_accounts.KnownClaudeAccount)
-        self.assertIsInstance(selection.unit_account, agent_accounts.KnownClaudeAccount)
         self.assertIsInstance(selection.named_accounts[0], agent_accounts.CheckedNamedClaudeAccount)
-        self.assertIsInstance(selection.named_accounts[0].identity, agent_accounts.KnownClaudeAccount)
-        self.assertTrue(agent_accounts.ClaudeAccountSelection.is_default_login(
-            selection, "MAIN@example.invalid",
-        ))
-        self.assertEqual(agent_accounts.ClaudeAccountSelection.roles_for_login(
-            selection, "unit@example.invalid",
-        ), ("unit directors",))
-        self.assertIsInstance(
-            accounts.account_identity(self.home / "unreadable-account"),
-            agent_accounts.UnreadableClaudeAccount,
-        )
+        self.assertTrue(selection.is_default_login("MAIN@example.invalid"))
+        self.assertFalse(hasattr(selection, "unit_account"))
+        self.assertFalse(hasattr(selection, "roles_for_login"))
 
-    def test_current_roles_distinguish_default_unit_and_spare_logins(self) -> None:
+    def test_unfit_named_accounts_are_excluded_from_checked_directories(self) -> None:
         self.login_directory("claude 2", "main@example.invalid", default=True)
         self.login_directory("claude 3", "unit@example.invalid")
-        self.login_directory("claude 1", "spare@example.invalid")
-        self.select_named_unit("claude 3")
-        self.assertTrue(accounts.multiple_accounts_configured())
-        roles = accounts.claude_account_selection()
-        self.assertEqual(roles.roles_for_login("main@example.invalid"), ("showrunners",))
-        self.assertEqual(roles.roles_for_login("UNIT@example.invalid"), ("unit directors",))
-        self.assertEqual(roles.roles_for_login("spare@example.invalid"), ())
-        self.assertEqual([named.label for named in roles.named_accounts], ["claude 1", "claude 3"])
-
-    def test_same_login_in_default_and_unit_directory_serves_both_roles(self) -> None:
-        self.login_directory("claude 2", "main@example.invalid", default=True)
-        self.login_directory("claude 3", "main@example.invalid")
-        self.select_named_unit("claude 3")
-        self.assertEqual(accounts.claude_account_selection().roles_for_login("main@example.invalid"), ("showrunners", "unit directors"))
-
-    def test_unfit_named_accounts_are_excluded_from_reads_and_roles(self) -> None:
-        self.login_directory("claude 2", "main@example.invalid", default=True)
-        self.login_directory("claude 3", "unit@example.invalid")
-        self.select_named_unit("claude 3")
         (accounts.account_dir("claude 3") / "projects").unlink()
         self.assertEqual(accounts.checked_named_accounts(), [])
-        self.assertEqual(accounts.claude_account_selection().roles_for_login("unit@example.invalid"), ())
-
-    def test_selection_keeps_roles_fixed_when_the_unit_changes(self) -> None:
-        """Comparisons within one run cannot activate both old and new units."""
-        self.login_directory("claude 2", "main@example.invalid", default=True)
-        self.login_directory("claude 3", "old-unit@example.invalid")
-        self.login_directory("claude 1", "new-unit@example.invalid")
-        self.select_named_unit("claude 3")
-        with patch.object(accounts, "role_account", wraps=accounts.role_account) as selected:
-            roles = accounts.claude_account_selection()
-            self.select_named_unit("claude 1")
-            with patch.object(accounts, "account_identity", side_effect=AssertionError("comparison reads disk")):
-                self.assertEqual(roles.roles_for_login("MAIN@example.invalid"), ("showrunners",))
-                self.assertEqual(roles.roles_for_login("old-unit@example.invalid"), ("unit directors",))
-                self.assertEqual(roles.roles_for_login("new-unit@example.invalid"), ())
-                self.assertTrue(roles.is_default_login("MAIN@example.invalid"))
-            selected.assert_called_once_with("unit")
-        self.assertEqual(accounts.claude_account_selection().roles_for_login("new-unit@example.invalid"), ("unit directors",))
+        self.assertEqual(accounts.claude_account_selection().named_accounts, ())
 
     def test_burn_maps_a_unit_directory_to_its_shared_login_note_identity(self) -> None:
         """A directory label is not the quota account's note label."""
@@ -1090,6 +832,40 @@ class AccountsTests(unittest.TestCase):
         self.assertEqual((result, stdout), (1, ""))
         self.assertIn("account identity for claude 3 is unreadable", stderr)
 
+    def test_burn_after_unit_role_retirement_labels_default_and_old_unit_by_account_only(self) -> None:
+        self.login_directory("claude 2", "main@example.invalid", default=True)
+        self.write_role_history([accounts.RoleChange(at="2026-10-08T00:00:00Z", role="unit",
+                                                     label="claude 3", account_label="claude 3")])
+        self.write_readings([accounts.QuotaReading(account=label, at=stamp, remaining=left)
+            for label in ("claude 2", "claude 3")
+            for stamp, left in (("2030-01-01T00:00:00Z", 90), ("2030-01-02T00:00:00Z", 80))])
+        results = accounts.burn(datetime(2030, 1, 1, tzinfo=timezone.utc), datetime(2030, 1, 2, tzinfo=timezone.utc))
+        self.assertEqual(results, [accounts.AccountRoleBurn(label, (), 10, 1) for label in ("claude 2", "claude 3")])
+        code, output, error = self.run_cli("burn", "--since", "2030-01-01T00:00:00Z", "--until", "2030-01-02T00:00:00Z")
+        self.assertEqual((code, error), (0, ""))
+        self.assertEqual(output.splitlines(), [f"{label}: 10 points/day (10 points over 1 observed days)"
+                                              for label in ("claude 2", "claude 3")])
+
+    def test_burn_splits_observed_spend_at_unit_role_retirement(self) -> None:
+        self.login_directory("claude 2", "main@example.invalid", default=True)
+        self.write_role_history([accounts.RoleChange(at="2026-10-08T00:00:00Z", role="unit",
+                                                     label="claude 3", account_label="claude 3")])
+        self.write_readings([accounts.QuotaReading(account=label, at=stamp, remaining=left)
+            for label in ("claude 2", "claude 3")
+            for stamp, left in (("2026-10-12T00:00:00Z", 90), ("2026-10-14T00:00:00Z", 70))])
+        results = accounts.burn(datetime(2026, 10, 12, tzinfo=timezone.utc), datetime(2026, 10, 14, tzinfo=timezone.utc))
+        self.assertCountEqual(results, [accounts.AccountRoleBurn("claude 2", ("showrunners",), 10, 1),
+                                       accounts.AccountRoleBurn("claude 3", ("unit directors",), 10, 1),
+                                       accounts.AccountRoleBurn("claude 2", (), 10, 1),
+                                       accounts.AccountRoleBurn("claude 3", (), 10, 1)])
+
+    def test_burn_after_role_retirement_without_history_never_defaults_to_showrunners(self) -> None:
+        self.login_directory("claude 2", "main@example.invalid", default=True)
+        self.write_readings([accounts.QuotaReading(account="claude 2", at=stamp, remaining=left)
+                            for stamp, left in (("2030-01-01T00:00:00Z", 90), ("2030-01-02T00:00:00Z", 80))])
+        self.assertEqual(accounts.burn(datetime(2030, 1, 1, tzinfo=timezone.utc), datetime(2030, 1, 2, tzinfo=timezone.utc)),
+                         [accounts.AccountRoleBurn("claude 2", (), 10, 1)])
+
     def test_burn_reports_each_account_with_its_historical_role(self) -> None:
         self.login_directory("claude 2", "main@example.invalid", default=True)
         self.login_directory("claude 3", "unit@example.invalid")
@@ -1105,7 +881,7 @@ class AccountsTests(unittest.TestCase):
         result, stdout, stderr = self.run_cli("burn", "--since", "2026-10-09T00:00:00Z", "--until", "2026-10-11T00:00:00Z")
         self.assertEqual((result, stderr), (0, ""))
         self.assertEqual(stdout.splitlines(), [
-            "claude 1 (spare): 4 points/day (8 points over 2 observed days)",
+            "claude 1: 4 points/day (8 points over 2 observed days)",
             "claude 2 (showrunners): 10 points/day (20 points over 2 observed days)",
             "claude 3 (unit directors): 10 points/day (20 points over 2 observed days)",
         ])
@@ -1561,7 +1337,8 @@ class AccountsTests(unittest.TestCase):
 
         self.assertEqual(result, 0)
         self.assertEqual(stderr, "")
-        self.assertIn("| ~/.claude | claude 2 | owner@example.invalid | showrunners, unit directors |", stdout)
+        self.assertIn("| ~/.claude | claude 2 | owner@example.invalid |", stdout)
+        self.assertNotIn("unit directors", stdout)
         self.assertNotIn("unclassified:", stdout)
         self.assertNotIn("mcpServers:", stdout)
         self.assertEqual(set(self.home.iterdir()), before)
@@ -1591,7 +1368,7 @@ class AccountsTests(unittest.TestCase):
         self.assertNotIn("mcpServers:", stdout)
         self.assertEqual(
             login_read.call_args_list,
-            [call(self.main_dir), call(self.main_dir)],
+            [call(self.main_dir)] * login_read.call_count,
         )
 
     def test_status_shows_role_problems_unclassified_entries_and_mcp_difference(
@@ -1628,7 +1405,7 @@ class AccountsTests(unittest.TestCase):
 
         self.assertEqual(result, 0)
         self.assertEqual(stderr, "")
-        self.assertIn("| ~/.claude2 | claude 2 | not logged in | unit directors |", stdout)
+        self.assertIn("| ~/.claude2 | claude 2 | not logged in |", stdout)
         self.assertIn("\n~/.claude2: unclassified: mystery-cache\n", stdout)
         self.assertIn("\n~/.claude2: mcpServers: - brp, + account-only\n", stdout)
 
@@ -1660,12 +1437,12 @@ class AccountsTests(unittest.TestCase):
         weekly_cell = later.astimezone(zone).strftime("%a %m-%d %H:%M %Z")
 
         self.assertEqual(self.status_rows(), [
-            ("~/.claude", "claude 2", "main@example.invalid", "showrunners",
+            ("~/.claude", "claude 2", "main@example.invalid", "next",
              "64%", soon.astimezone(zone).strftime("%H:%M %Z"), "71%", weekly_cell, "—", "—", read_cell),
-            ("~/.claude1", "claude 1", "not set up", "—", *("—",) * 7),
-            ("~/.claude3", "claude 3", "unit@example.invalid", "unit directors",
+            ("~/.claude1", "claude 1", "not set up", "", *("—",) * 7),
+            ("~/.claude3", "claude 3", "unit@example.invalid", "",
              "100%", "—", "12%", weekly_cell, "—", "—", read_cell),
-            ("~/.claude4", "claude 4", "not logged in", "spare", *("—",) * 7),
+            ("~/.claude4", "claude 4", "not logged in", "", *("—",) * 7),
             CODEX_HOME_ROW,
         ])
         self.assertIn("PDT", read_cell + weekly_cell)
@@ -1687,16 +1464,17 @@ class AccountsTests(unittest.TestCase):
     def test_status_table_is_padded_markdown_and_a_folder_in_order_adds_no_line(self) -> None:
         self.write_main_config()
         self.login_directory("claude 2", "main@example.invalid", default=True)
+        self.seed_room("main@example.invalid")
 
         result, stdout, stderr = self.run_cli("status")
 
         self.assertEqual((result, stderr), (0, ""))
-        lines = stdout.splitlines()
+        lines = stdout.split("\n\n")[0].splitlines()
         # The heading, the rule, the default folder, and the Codex home.
         self.assertEqual(len(lines), 4)
         self.assertEqual(len({len(line) for line in lines}), 1)
         self.assertEqual(set(lines[1]), {"|", " ", "-"})
-        self.assertTrue(lines[2].startswith("| ~/.claude | claude 2 | main@example.invalid | showrunners, unit directors | "))
+        self.assertEqual([cell.strip() for cell in lines[2].strip("|").split("|")][:4], ["~/.claude", "claude 2", "main@example.invalid", "next"])
 
     def test_status_reads_live_only_when_no_reading_is_recent_and_keeps_what_it_read(self) -> None:
         self.write_main_config()
@@ -2108,7 +1886,7 @@ class AccountsTests(unittest.TestCase):
         self.login_directory("claude 2", "main@example.invalid", default=True)
         self.write_note("codex 1", "spare@example.invalid")
         self.codex_login("spare@example.invalid", self.home / ".codex1")
-        self.assertNotIn("\n\n", self.run_cli("status")[1].rstrip())
+        self.assertNotIn("unclassified:", self.run_cli("status")[1])
         _ = (self.home / ".codex1" / "unclassified-item").write_text("own")
 
         result, stdout, stderr = self.run_cli("status")
@@ -2142,7 +1920,7 @@ class AccountsTests(unittest.TestCase):
         self.assertEqual(rows[0][4:7], ("unavailable", "unavailable", "75%"))
         self.assertEqual(rows[0][10], read.astimezone(ZoneInfo("America/Los_Angeles")).strftime("%H:%M %Z"))
         # claude 3 is logged in and has never been read.
-        self.assertEqual(rows[1][2:], ("unit@example.invalid", "spare", *("unavailable",) * 4, "—", "—", "—"))
+        self.assertEqual(rows[1][2:], ("unit@example.invalid", "", *("unavailable",) * 4, "—", "—", "—"))
         self.assertEqual(self.live_reads.call_count, 2)
 
     def test_status_times_use_the_users_zone_setting_when_no_production_runs_or_none_can_be_read(self) -> None:
@@ -2175,22 +1953,16 @@ class AccountsTests(unittest.TestCase):
             self.assertEqual(self.status_rows()[0][7], resets.astimezone(zone).strftime("%a %m-%d %H:%M %Z"))
         resolve.assert_called_once_with()
 
-    def test_absent_role_configuration_uses_default_account(self) -> None:
-        resolved = accounts.role_account("unit")
-
-        self.assertIsInstance(resolved, accounts.DefaultAccount)
-        self.assertEqual(accounts.launch_prefix("unit"), "")
-        self.assertEqual(self.run_cli("role", "unit"), (0, "default\n", ""))
-        self.assertEqual(self.run_cli("env", "unit"), (0, "\n", ""))
 
     def test_account_prefix_keeps_the_selection_after_the_role_changes(self) -> None:
         """Rendering a selected account never resolves the role again."""
         self.write_main_config()
         self.login_directory("claude 3", "old@example.invalid")
         self.login_directory("claude 1", "new@example.invalid")
-        accounts.set_role("unit", "claude 3")
-        selected = accounts.role_account("unit")
-        accounts.set_role("unit", "claude 1")
+        selected = accounts.NamedAccount("claude 3", accounts.account_dir("claude 3"))
+        self.seed_room("old@example.invalid", 7)
+        self.seed_room("new@example.invalid", 2)
+        self.select_named_unit("claude 1")
 
         self.assertEqual(
             accounts.account_prefix(selected),
@@ -2219,69 +1991,8 @@ class AccountsTests(unittest.TestCase):
 
         self.assertFalse(hasattr(accounts, "HOME"))
 
-    def test_named_role_resolves_label_directory_and_quoted_launch_prefix(self) -> None:
-        config_dir = self.main_dir / "config"
-        _ = config_dir.mkdir()
-        _ = (config_dir / "accounts.json").write_text(
-            json.dumps({"unit": "claude 3"}), encoding="utf-8"
-        )
 
-        resolved = accounts.role_account("unit")
 
-        self.assertIsInstance(resolved, accounts.NamedAccount)
-        assert isinstance(resolved, accounts.NamedAccount)
-        self.assertEqual(resolved.label, "claude 3")
-        self.assertEqual(resolved.dir, self.home / ".claude3")
-        expected = named_prefix(self.home / ".claude3")
-        self.assertEqual(
-            expected,
-            f"CLAUDE_CONFIG_DIR={shlex.quote(str(self.home / '.claude3'))} "
-            + f"CLAUDE_CODE_REMOTE_MEMORY_DIR={shlex.quote(str(self.home / '.claude'))} ",
-        )
-        self.assertEqual(accounts.launch_prefix("unit"), expected)
-        self.assertEqual(self.run_cli("role", "unit"), (0, "claude 3\n", ""))
-        self.assertEqual(self.run_cli("env", "unit"), (0, expected + "\n", ""))
-
-    def test_set_role_writes_atomically_and_appends_audit_line(self) -> None:
-        self.write_main_config()
-        self.login_directory("claude 2", "selected@example.invalid")
-        original_replace = os.replace
-        with patch.object(os, "replace", wraps=original_replace) as replace:
-            result, stdout, stderr = self.run_cli("set-role", "unit", "claude 2")
-
-        self.assertEqual((result, stdout, stderr), (0, "", ""))
-        config_path = self.main_dir / "config" / "accounts.json"
-        self.assertEqual(json.loads(config_path.read_text()), {"unit": "claude 2"})
-        replace.assert_called_once()
-        replace_call = cast(tuple[object, ...], replace.call_args.args)
-        self.assertEqual(Path(cast(str | os.PathLike[str], replace_call[1])), config_path)
-        self.assertFalse(Path(cast(str | os.PathLike[str], replace_call[0])).exists())
-
-        audit_path = self.home / ".local" / "state" / "accounts" / "roles.jsonl"
-        lines = audit_path.read_text(encoding="utf-8").splitlines()
-        self.assertEqual(len(lines), 1)
-        audit = cast(dict[str, object], json.loads(lines[0]))
-        self.assertEqual(audit["role"], "unit")
-        self.assertEqual(audit["label"], "claude 2")
-        self.assertEqual(audit["account_label"], "claude 2")
-        self.assertIsInstance(audit["at"], str)
-        self.assertTrue(cast(str, audit["at"]))
-
-    def test_set_role_default_removes_assignment_and_records_default(self) -> None:
-        self.login_directory("claude 2", "main@example.invalid", default=True)
-        config_dir = self.main_dir / "config"
-        _ = config_dir.mkdir()
-        config_path = config_dir / "accounts.json"
-        _ = config_path.write_text('{"unit": "claude 2"}', encoding="utf-8")
-
-        result, stdout, stderr = self.run_cli("set-role", "unit", "default")
-
-        self.assertEqual((result, stdout, stderr), (0, "", ""))
-        self.assertEqual(json.loads(config_path.read_text()), {})
-        audit_path = self.home / ".local" / "state" / "accounts" / "roles.jsonl"
-        audit = cast(dict[str, object], json.loads(audit_path.read_text()))
-        self.assertEqual(audit["label"], "default")
-        self.assertEqual(audit["account_label"], "claude 2")
 
     def test_unknown_role_is_refused_by_every_role_command(self) -> None:
         for arguments in (
@@ -2299,92 +2010,12 @@ class AccountsTests(unittest.TestCase):
                     "accounts: showrunner is not a role; only unit and seats are supported\n",
                 )
 
-    def test_set_role_refuses_the_default_note_label_without_writing(self) -> None:
-        """Status names ~/.claude by its note label; set-role points that label at default, not ~/.claude2."""
-        self.login_directory("claude 2", "main@example.invalid", default=True)
-        result = self.run_cli("set-role", "unit", "claude 2")
-        self.assertEqual(result, (1, "", "accounts: claude 2 is the default account; use default\n"))
-        self.assertEqual(self.role_files(), {})
 
-    def test_set_role_refuses_a_directory_logged_in_as_the_default_login(self) -> None:
-        self.login_directory("claude 2", "main@example.invalid", default=True)
-        self.login_directory("claude 4", "MAIN@example.invalid")
-        result = self.run_cli("set-role", "unit", "claude 4")
-        self.assertEqual(result, (1, "", "accounts: claude 4 is the default account; use default\n"))
-        self.assertEqual(self.role_files(), {})
 
-    def test_set_role_refuses_an_unknown_label_without_writing(self) -> None:
-        result, stdout, stderr = self.run_cli("set-role", "unit", "claude2")
 
-        self.assertEqual(result, 1)
-        self.assertEqual(stdout, "")
-        self.assertEqual(stderr, "accounts: claude2 is not a claude N label\n")
-        self.assertFalse((self.main_dir / "config" / "accounts.json").exists())
-        self.assertFalse((self.home / ".local" / "state" / "accounts").exists())
 
-    def test_role_refuses_an_unknown_label_stored_in_configuration(self) -> None:
-        config_dir = self.main_dir / "config"
-        _ = config_dir.mkdir()
-        _ = (config_dir / "accounts.json").write_text(
-            '{"unit": "claude2"}', encoding="utf-8"
-        )
 
-        result, stdout, stderr = self.run_cli("role", "unit")
 
-        self.assertEqual(result, 1)
-        self.assertEqual(stdout, "")
-        self.assertEqual(stderr, "accounts: claude2 is not a claude N label\n")
-
-    def test_role_refuses_a_null_unit_in_configuration(self) -> None:
-        config_dir = self.main_dir / "config"
-        _ = config_dir.mkdir()
-        config_path = config_dir / "accounts.json"
-        _ = config_path.write_text('{"unit": null}', encoding="utf-8")
-
-        result, stdout, stderr = self.run_cli("role", "unit")
-
-        self.assertEqual(result, 1)
-        self.assertEqual(stdout, "")
-        self.assertEqual(
-            stderr,
-            f"accounts: {config_path} has an invalid unit account\n",
-        )
-
-    def test_set_role_restores_existing_configuration_when_history_fails(
-        self,
-    ) -> None:
-        self.write_main_config()
-        self.login_directory("claude 2", "selected@example.invalid")
-        config_dir = self.main_dir / "config"
-        _ = config_dir.mkdir()
-        config_path = config_dir / "accounts.json"
-        original = '{"unit": "claude 1"}\n'
-        _ = config_path.write_text(original, encoding="utf-8")
-
-        with patch.object(
-            accounts, "_append_role_change", side_effect=OSError("disk full")
-        ):
-            result, stdout, stderr = self.run_cli("set-role", "unit", "claude 2")
-
-        self.assertEqual(result, 1)
-        self.assertEqual(stdout, "")
-        self.assertIn("could not record role change: disk full", stderr)
-        self.assertEqual(config_path.read_text(encoding="utf-8"), original)
-
-    def test_set_role_removes_new_configuration_when_history_fails(self) -> None:
-        self.write_main_config()
-        self.login_directory("claude 2", "selected@example.invalid")
-        config_path = self.main_dir / "config" / "accounts.json"
-
-        with patch.object(
-            accounts, "_append_role_change", side_effect=OSError("disk full")
-        ):
-            result, stdout, stderr = self.run_cli("set-role", "unit", "claude 2")
-
-        self.assertEqual(result, 1)
-        self.assertEqual(stdout, "")
-        self.assertIn("could not record role change: disk full", stderr)
-        self.assertFalse(config_path.exists())
 
     def seats_fixture(self) -> tuple[Path, Path]:
         default = self.home / ".codex"
@@ -2416,6 +2047,8 @@ class AccountsTests(unittest.TestCase):
                     self.assertEqual(shlex.split(stdout), [f"CODEX_HOME={home}"])
 
     def test_default_prefixes_keep_claude_unassigned_and_codex_explicit(self) -> None:
+        self.login_directory("claude 2", "main@example.invalid", default=True)
+        self.seed_room("main@example.invalid")
         with patch.dict(os.environ, {"CODEX_HOME": str(self.root / "caller")}):
             unit = accounts.role_account("unit")
             seats = accounts.role_account("seats")
@@ -2458,28 +2091,6 @@ class AccountsTests(unittest.TestCase):
                 with self.assertRaises(type(error)):
                     _ = self.run_cli("status")
 
-    def test_interleaved_role_writes_preserve_the_other_role_including_defaults(self) -> None:
-        default, target = self.seats_fixture()
-        self.login_directory("claude 2", "main@example.invalid", default=True)
-        self.login_directory("claude 3", "unit@example.invalid")
-        for role, label, unit, seats in (
-            ("unit", "claude 3", "claude 3", "default"),
-            ("seats", "codex 1", "claude 3", "codex 1"),
-            ("unit", "default", "default", "codex 1"),
-            ("unit", "claude 3", "claude 3", "codex 1"),
-            ("seats", "default", "claude 3", "default"),
-        ):
-            with self.subTest(role=role, label=label):
-                self.assertEqual(self.run_cli("set-role", role, label), (0, "", ""))
-                self.assertEqual(self.run_cli("role", "unit"), (0, unit + "\n", ""))
-                self.assertEqual(self.run_cli("role", "seats"), (0, seats + "\n", ""))
-                self.assertEqual(agent_accounts.seats_home(), default if seats == "default" else target)
-        history = [cast(dict[str, object], json.loads(line)) for line in accounts.roles_history_file().read_text().splitlines()]
-        self.assertEqual([(entry["role"], entry["label"]) for entry in history], [
-            ("unit", "claude 3"), ("seats", "codex 1"), ("unit", "default"),
-            ("unit", "claude 3"), ("seats", "default"),
-        ])
-        self.assertEqual([entry["account_label"] for entry in history if entry["role"] == "seats"], ["codex 1", "codex 2"])
 
     def test_seats_only_configuration_preserves_claude_selection(self) -> None:
         _ = self.seats_fixture()
@@ -2491,28 +2102,12 @@ class AccountsTests(unittest.TestCase):
                 self.assertEqual(accounts.claude_account_selection(), before)
                 self.assertFalse(accounts.multiple_accounts_configured())
 
-    def test_concurrent_role_writes_keep_both_assignments(self) -> None:
-        _ = self.seats_fixture()
-        self.login_directory("claude 2", "main@example.invalid", default=True)
-        self.login_directory("claude 3", "unit@example.invalid")
-        start = threading.Barrier(2)
-        def select(role: str, label: str) -> int:
-            _ = start.wait(timeout=5)
-            return accounts.main(["set-role", role, label])
-        with ThreadPoolExecutor(max_workers=2) as pool:
-            unit = pool.submit(select, "unit", "claude 3")
-            seats = pool.submit(select, "seats", "codex 1")
-            self.assertEqual((unit.result(timeout=5), seats.result(timeout=5)), (0, 0))
-        self.assertEqual(self.run_cli("role", "unit"), (0, "claude 3\n", ""))
-        self.assertEqual(self.run_cli("role", "seats"), (0, "codex 1\n", ""))
-        history = [cast(dict[str, object], json.loads(line)) for line in accounts.roles_history_file().read_text().splitlines()]
-        self.assertCountEqual([(entry["role"], entry["label"]) for entry in history], [("unit", "claude 3"), ("seats", "codex 1")])
 
     def test_failed_seats_history_write_restores_both_roles(self) -> None:
         _ = self.seats_fixture()
         self.login_directory("claude 2", "main@example.invalid", default=True)
         self.login_directory("claude 3", "unit@example.invalid")
-        self.assertEqual(self.run_cli("set-role", "unit", "claude 3"), (0, "", ""))
+        self.select_named_unit("claude 3")
         before = self.role_files()
         with patch.object(accounts, "_append_role_change", side_effect=OSError("disk full")):
             result, _, stderr = self.run_cli("set-role", "seats", "codex 1")
@@ -2525,7 +2120,7 @@ class AccountsTests(unittest.TestCase):
         self.login_directory("claude 2", "main@example.invalid", default=True)
         self.login_directory("claude 3", "unit@example.invalid")
         with patch.object(accounts, "datetime", RoleWriteTime):
-            self.assertEqual(self.run_cli("set-role", "unit", "claude 3"), (0, "", ""))
+            self.write_role_history([accounts.RoleChange(at="2026-10-08T00:00:00Z", role="unit", label="claude 3", account_label="claude 3")])
             self.assertEqual(self.run_cli("set-role", "seats", "codex 1"), (0, "", ""))
             self.assertEqual(self.run_cli("set-role", "seats", "default"), (0, "", ""))
         self.write_readings([accounts.QuotaReading(account="claude 3", at=f"2026-10-{day:02d}T00:00:00Z", remaining=left)
@@ -2811,6 +2406,350 @@ _ = sys.stdin.read()
         _ = config.write_text('{"unit": "claude 3"}')
         self.assertEqual(self.run_cli("role", "seats"), (0, "default\n", ""))
         self.assertEqual(agent_accounts.seats_home(), self.home / ".codex")
+
+
+@final
+class PickerTime(datetime):
+    @classmethod
+    @override
+    def now(cls, tz: tzinfo | None = None) -> Self:
+        return cls(2026, 10, 13, 12, tzinfo=timezone.utc).astimezone(tz)
+
+
+ZERO_AGE = timedelta()
+
+
+class PickerTests(unittest.TestCase):
+    home: Path = Path()
+    now: datetime = datetime(2026, 10, 13, 12, tzinfo=timezone.utc)
+
+    @override
+    def setUp(self) -> None:
+        self.home = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        _ = cast(object, self.enterContext(patch.dict(os.environ, {
+            "HOME": str(self.home), "AGENT_NOTES_DIR": str(self.home / "notes"), "USER_ZONE": "UTC",
+        }, clear=True)))
+        (self.home / "notes").mkdir()
+        (self.home / ".claude").mkdir()
+        self.claude("default", "main@example.invalid")
+        self.claude("claude 1", "first@example.invalid")
+        self.claude("claude 3", "third@example.invalid")
+        self.reading("Claude", "main@example.invalid", 50, 7)
+        self.reading("Claude", "first@example.invalid", 90, 5)
+        self.reading("Claude", "third@example.invalid", 3, 2)
+        _ = self.enterContext(patch.object(agent_accounts, "prepare_codex_home", return_value=agent_accounts.CodexHomePrepared()))
+
+    def claude(self, label: str, login: str) -> None:
+        if label == "default":
+            config = self.home / ".claude.json"
+            note = "claude 2"
+        else:
+            self.assertEqual(accounts.setup(label), [])
+            config = accounts.account_dir(label) / ".claude.json"
+            note = label
+        _ = config.write_text(json.dumps({"oauthAccount": {"emailAddress": login}}))
+        _ = (self.home / "notes" / f"{note}.md").write_text(f"---\nlogin: {login}\n---\n")
+
+    def codex(self, label: str, login: str) -> None:
+        home = self.home / (".codex" if label == "default" else "." + label.replace(" ", ""))
+        note = "codex 1" if label == "default" else label
+        _ = (self.home / "notes" / f"{note}.md").write_text(f"---\nlogin: {login}\n---\n")
+        if label != "default":
+            self.assertEqual(accounts.setup(label), [])
+        home.mkdir(exist_ok=True)
+        claims = base64.urlsafe_b64encode(json.dumps({"email": login}).encode()).decode().rstrip("=")
+        _ = (home / "auth.json").write_text(json.dumps({"tokens": {"id_token": f"header.{claims}.signature"}}))
+        note = "codex 1" if label == "default" else label
+        _ = (self.home / "notes" / f"{note}.md").write_text(f"---\nlogin: {login}\n---\n")
+
+    def reading(self, tool: str, login: str, left: float, reset_days: float, *,
+                age: timedelta = ZERO_AGE, five_left: float = 50, five: bool = True,
+                reset: bool = True, credits: str = "0") -> None:
+        at = (self.now - age).isoformat()
+        usage = usage_store.StoredUsage(weekly=usage_store.StoredWindow(left=left,
+            resets=(self.now + timedelta(days=reset_days)).isoformat() if reset else "", at=at))
+        if five:
+            usage["five_hour"] = usage_store.StoredWindow(left=five_left,
+                resets=(self.now + timedelta(hours=3)).isoformat(), at=at)
+        if tool == "Codex":
+            usage["credits"] = usage_store.StoredCredits(balance=credits, at=at)
+        saved = usage_store.load()
+        saved[usage_store.key(tool, login)] = usage
+        file = usage_store.store_file()
+        file.parent.mkdir(parents=True, exist_ok=True)
+        _ = file.write_text(json.dumps(saved))
+
+    def cli(self, *options: str, tool: str = "claude") -> tuple[int, str, str]:
+        output, error = io.StringIO(), io.StringIO()
+        with patch.object(accounts, "datetime", PickerTime), redirect_stdout(output), redirect_stderr(error):
+            result = accounts.main(["pick", tool, *options])
+        return result, output.getvalue(), error.getvalue()
+
+    def assert_picked(self, label: str, *options: str, tool: str = "claude") -> None:
+        self.assertEqual(self.cli(*options, tool=tool), (0, label + "\n", ""))
+
+    def test_picker_without_any_saved_reading_uses_default_and_explains_fallback(self) -> None:
+        usage_store.store_file().unlink()
+        code, output, error = self.cli("--explain")
+        self.assertEqual((code, error), (0, ""))
+        self.assertEqual(output.splitlines()[0], "default")
+        self.assertIn("no fresh readings on this machine; using default", output)
+
+    def test_picker_without_fresh_readings_keeps_candidate_despite_stale_zero_room(self) -> None:
+        for login in ("main@example.invalid", "first@example.invalid", "third@example.invalid"):
+            self.reading("Claude", login, 0, 2, age=timedelta(minutes=11), five_left=0)
+        self.assert_picked("claude 3", "--keep", "claude 3")
+        self.assert_picked("default", "--keep", "claude 3", "--exclude", "claude 3")
+
+    def test_picker_without_fresh_readings_skips_refused_keep_and_uses_default(self) -> None:
+        usage_store.store_file().unlink()
+        refusals.write_refusal(refusals.AccountRefusal("claude", "third@example.invalid",
+            refusals.UnknownWindow(), refusals.NoResetKnown(), self.now))
+        self.assert_picked("default", "--keep", "claude 3")
+        _, output, _ = self.cli("--keep", "claude 3", "--explain")
+        self.assertIn("refused at", output)
+
+    def test_picker_without_fresh_readings_never_falls_back_to_refused_default(self) -> None:
+        usage_store.store_file().unlink()
+        refusals.write_refusal(refusals.AccountRefusal("claude", "main@example.invalid",
+            refusals.UnknownWindow(), refusals.NoResetKnown(), self.now))
+        code, output, error = self.cli()
+        self.assertEqual(code, 1)
+        self.assertIn("no claude account has room", output + error)
+
+    def test_picker_one_fresh_exhausted_candidate_disables_missing_reading_fallback(self) -> None:
+        usage_store.store_file().unlink()
+        self.reading("Claude", "third@example.invalid", 0, 2)
+        code, output, error = self.cli("--keep", "default")
+        self.assertEqual(code, 1)
+        self.assertIn("no claude account has room", output + error)
+
+    def test_picker_prefers_soonest_weekly_reset_over_most_room(self) -> None:
+        self.assert_picked("claude 3")
+
+    def test_picker_breaks_equal_weekly_resets_by_most_weekly_left(self) -> None:
+        self.reading("Claude", "first@example.invalid", 4, 2)
+        self.assert_picked("claude 1")
+
+    def test_picker_breaks_equal_reset_and_room_by_label(self) -> None:
+        self.reading("Claude", "first@example.invalid", 3, 2)
+        self.assert_picked("claude 1")
+
+    def test_picker_keeps_current_account_with_room_despite_a_sooner_reset(self) -> None:
+        self.assert_picked("claude 1", "--keep", "claude 1")
+
+    def test_picker_does_not_keep_an_exhausted_account(self) -> None:
+        self.reading("Claude", "first@example.invalid", 0, 2)
+        self.assert_picked("claude 3", "--keep", "claude 1")
+
+    def test_picker_has_no_minimum_remaining_percentage(self) -> None:
+        self.reading("Claude", "third@example.invalid", 1, 2, five_left=1)
+        self.assert_picked("claude 3")
+
+    def test_picker_excludes_each_explicit_label(self) -> None:
+        self.assert_picked("default", "--exclude", "claude 3", "--exclude", "claude 1")
+
+    def test_picker_exclude_overrides_keep(self) -> None:
+        self.assert_picked("claude 1", "--keep", "claude 3", "--exclude", "claude 3")
+
+    def test_picker_refuses_a_zero_five_hour_window(self) -> None:
+        self.reading("Claude", "third@example.invalid", 90, 2, five_left=0)
+        self.assert_picked("claude 1")
+
+    def test_picker_accepts_weekly_room_when_claude_has_no_five_hour_window(self) -> None:
+        self.reading("Claude", "third@example.invalid", 1, 2, five=False)
+        self.assert_picked("claude 3")
+
+    def test_picker_skips_readings_older_than_ten_minutes_with_the_cause(self) -> None:
+        self.reading("Claude", "third@example.invalid", 90, 2, age=timedelta(minutes=10, microseconds=1))
+        code, output, error = self.cli("--explain")
+        self.assertEqual((code, error), (0, ""))
+        self.assertIn("no reading in the last 10 minutes", output)
+        self.assertEqual(output.splitlines()[0], "claude 1")
+
+    def test_picker_accepts_a_reading_exactly_ten_minutes_old(self) -> None:
+        self.reading("Claude", "third@example.invalid", 1, 2, age=timedelta(minutes=10))
+        self.assert_picked("claude 3")
+
+    def test_picker_skips_an_account_with_no_saved_reading(self) -> None:
+        self.claude("claude 4", "unread@example.invalid")
+        _, output, _ = self.cli("--explain")
+        self.assertIn("claude 4", output)
+        self.assertIn("no reading in the last 10 minutes", output)
+        self.assert_picked("claude 3")
+
+    def test_picker_skips_a_named_directory_that_fails_check(self) -> None:
+        (accounts.account_dir("claude 3") / "projects").unlink()
+        self.assert_picked("claude 1")
+
+    def test_picker_deduplicates_logins_in_favor_of_default(self) -> None:
+        self.claude("claude 3", "main@example.invalid")
+        self.reading("Claude", "main@example.invalid", 3, 1)
+        self.assert_picked("default")
+
+    def test_picker_deduplicates_named_logins_in_favor_of_lowest_number(self) -> None:
+        self.claude("claude 10", "shared@example.invalid")
+        self.claude("claude 4", "shared@example.invalid")
+        self.reading("Claude", "shared@example.invalid", 3, 1)
+        self.assert_picked("claude 4")
+
+    def test_picker_reads_codex_namespace_independently_of_claude(self) -> None:
+        self.codex("default", "main@example.invalid")
+        self.codex("codex 2", "second@example.invalid")
+        self.reading("Codex", "main@example.invalid", 0, 1)
+        self.reading("Codex", "second@example.invalid", 1, 2)
+        self.assert_picked("codex 2", tool="codex")
+
+    def test_codex_picker_without_fresh_readings_keeps_candidate_or_uses_default(self) -> None:
+        self.codex("default", "seats@example.invalid")
+        self.codex("codex 2", "other@example.invalid")
+        self.assert_picked("default", tool="codex")
+        self.assert_picked("codex 2", "--keep", "codex 2", tool="codex")
+        refusals.write_refusal(refusals.AccountRefusal("codex", "other@example.invalid",
+            refusals.UnknownWindow(), refusals.NoResetKnown(), self.now))
+        self.assert_picked("default", "--keep", "codex 2", tool="codex")
+
+    def test_picker_codex_credits_allow_work_after_both_windows_are_exhausted(self) -> None:
+        self.codex("default", "seats@example.invalid")
+        self.reading("Codex", "seats@example.invalid", 0, 2, five_left=0, credits="1")
+        self.assert_picked("default", tool="codex")
+
+    def test_picker_codex_unlimited_credits_allow_work(self) -> None:
+        self.codex("default", "seats@example.invalid")
+        self.reading("Codex", "seats@example.invalid", 0, 2, five_left=0, credits="unlimited")
+        self.assert_picked("default", tool="codex")
+
+    def test_picker_codex_without_credits_requires_both_windows_with_room(self) -> None:
+        self.codex("default", "seats@example.invalid")
+        self.reading("Codex", "seats@example.invalid", 80, 2, five_left=0)
+        code, output, error = self.cli(tool="codex")
+        self.assertEqual(code, 1)
+        self.assertIn("no codex account has room", output + error)
+
+    def test_picker_no_room_reports_earliest_known_reset(self) -> None:
+        for login, days in (("main@example.invalid", 7), ("first@example.invalid", 5), ("third@example.invalid", 2)):
+            self.reading("Claude", login, 0, days, five_left=0)
+        selected = accounts.pick("claude", self.now, keep=accounts.NoKeep())
+        self.assertIsInstance(selected, accounts.NoAccountWithRoom)
+        assert isinstance(selected, accounts.NoAccountWithRoom)
+        self.assertEqual(selected.earliest_reset, accounts.EarliestReset(self.now + timedelta(hours=3)))
+        self.assertEqual(len(selected.reasons), 3)
+        self.assertEqual(self.cli()[0], 1)
+        self.assertIn("earliest reset", "".join(self.cli()[1:]))
+
+    def test_picker_no_room_without_any_reset_uses_no_reset_known(self) -> None:
+        for login in ("main@example.invalid", "first@example.invalid", "third@example.invalid"):
+            self.reading("Claude", login, 0, 2, reset=False, five=False)
+        selected = accounts.pick("claude", self.now, keep=accounts.NoKeep())
+        self.assertIsInstance(selected, accounts.NoAccountWithRoom)
+        assert isinstance(selected, accounts.NoAccountWithRoom)
+        self.assertIsInstance(selected.earliest_reset, refusals.NoResetKnown)
+        self.assertEqual(len(selected.reasons), 3)
+        self.assertEqual(self.cli()[0], 1)
+        self.assertIn("no claude account has room", "".join(self.cli()[1:]))
+
+    def test_picker_unresolved_refusal_beats_positive_saved_room_and_keep(self) -> None:
+        refusals.write_refusal(refusals.AccountRefusal("claude", "third@example.invalid",
+            refusals.KnownWindow("weekly"), refusals.KnownReset(self.now + timedelta(days=2)), self.now))
+        self.assert_picked("claude 1", "--keep", "claude 3")
+        code, output, error = self.cli("--explain")
+        self.assertEqual((code, error), (0, ""))
+        self.assertIn("refused at", output)
+
+    def test_picker_codex_unresolved_refusal_beats_positive_windows_and_credits(self) -> None:
+        self.codex("default", "seats@example.invalid")
+        self.reading("Codex", "seats@example.invalid", 90, 2, five_left=90, credits="100")
+        refusals.write_refusal(refusals.AccountRefusal("codex", "seats@example.invalid",
+            refusals.KnownWindow("weekly"), refusals.KnownReset(self.now + timedelta(days=2)), self.now))
+        selected = accounts.pick("codex", self.now, keep=accounts.KeepAccount("default"))
+        self.assertIsInstance(selected, accounts.NoAccountWithRoom)
+        code, output, error = self.cli("--explain", tool="codex")
+        self.assertEqual(code, 1)
+        self.assertIn("refused at", output + error)
+
+    def test_picker_accepts_account_after_its_refusal_reset_passes(self) -> None:
+        refusals.write_refusal(refusals.AccountRefusal("claude", "third@example.invalid",
+            refusals.KnownWindow("weekly"), refusals.KnownReset(self.now), self.now - timedelta(days=7)))
+        self.assert_picked("claude 3")
+
+    def test_stored_reading_adapter_returns_fresh_stale_and_missing_states(self) -> None:
+        self.assertIsInstance(refusals.stored_reading("claude", "third@example.invalid", self.now), accounts.FreshReading)
+        self.assertIsInstance(refusals.stored_reading("claude", "unknown@example.invalid", self.now), accounts.NoReading)
+        self.reading("Claude", "third@example.invalid", 1, 2, age=timedelta(minutes=11))
+        self.assertIsInstance(refusals.stored_reading("claude", "third@example.invalid", self.now), accounts.StaleReading)
+
+    def test_stored_reading_adapter_represents_missing_reset_by_name(self) -> None:
+        self.reading("Claude", "third@example.invalid", 1, 2, reset=False, five=False)
+        reading = refusals.stored_reading("claude", "third@example.invalid", self.now)
+        self.assertIsInstance(reading, accounts.FreshReading)
+        assert isinstance(reading, accounts.FreshReading)
+        self.assertIsInstance(reading.weekly.reset, refusals.NoResetKnown)
+        self.assertIsInstance(reading.five_hour, accounts.NoWindow)
+
+    def test_status_marks_only_pickers_current_choice_as_next(self) -> None:
+        with patch.object(accounts, "datetime", PickerTime):
+            output, error = io.StringIO(), io.StringIO()
+            with redirect_stdout(output), redirect_stderr(error):
+                self.assertEqual(accounts.main(["status"]), 0)
+        rows = [[cell.strip() for cell in line.strip("|").split("|")]
+                for line in output.getvalue().splitlines() if line.startswith("| ~/.claude")]
+        self.assertEqual([row[1] for row in rows if row[3] == "next"], ["claude 3"])
+        self.assertTrue(all("unit" not in row[3] for row in rows))
+
+    def test_unit_role_reads_picker_and_ignores_saved_unit_key_without_writes(self) -> None:
+        config = accounts.accounts_config_file()
+        config.parent.mkdir(parents=True, exist_ok=True)
+        _ = config.write_text('{"unit": "claude 1"}')
+        before = config.read_bytes()
+        with patch.object(accounts, "datetime", PickerTime):
+            selected = accounts.role_account("unit")
+            output = io.StringIO()
+            with redirect_stdout(output):
+                self.assertEqual(accounts.main(["role", "unit"]), 0)
+        self.assertEqual(selected, accounts.NamedAccount("claude 3", accounts.account_dir("claude 3")))
+        self.assertEqual(output.getvalue(), "claude 3\n")
+        self.assertEqual(config.read_bytes(), before)
+        self.assertFalse(accounts.roles_history_file().exists())
+
+    def test_env_unit_and_exec_unit_use_the_picked_account_without_recording_a_role(self) -> None:
+        with patch.object(accounts, "datetime", PickerTime):
+            output = io.StringIO()
+            with redirect_stdout(output):
+                self.assertEqual(accounts.main(["env", "unit"]), 0)
+            environment = shlex.split(output.getvalue())
+            self.assertIn(f"CLAUDE_CONFIG_DIR={accounts.account_dir('claude 3')}", environment)
+            with patch.object(os, "execvpe") as launch:
+                self.assertEqual(accounts.main(["exec", "unit", "--version"]), 0)
+        self.assertEqual(launch.call_args.args[:2], ("claude", ["claude", "--version"]))
+        self.assertEqual(launch.call_args.args[2]["CLAUDE_CONFIG_DIR"], str(accounts.account_dir("claude 3")))
+        self.assertFalse(accounts.accounts_config_file().exists())
+        self.assertFalse(accounts.roles_history_file().exists())
+
+    def test_picked_account_exposes_its_directory_weekly_room_and_reset(self) -> None:
+        picked = accounts.pick("claude", self.now, keep=accounts.NoKeep())
+        self.assertIsInstance(picked, accounts.PickedAccount)
+        assert isinstance(picked, accounts.PickedAccount)
+        self.assertEqual(picked.label, "claude 3")
+        self.assertEqual(picked.dir, accounts.account_dir("claude 3"))
+        self.assertEqual(picked.weekly_left, 3)
+        self.assertEqual(picked.weekly_reset, refusals.KnownReset(self.now + timedelta(days=2)))
+        self.assertEqual({reason.label for reason in picked.reasons}, {"default", "claude 1", "claude 3"})
+        self.assertEqual([reason.label for reason in picked.reasons if reason.status == "picked"], ["claude 3"])
+
+    def test_retired_unit_mutations_refuse_before_disk_or_process_changes(self) -> None:
+        cause = "the unit role is gone: new sessions pick the account with room (accounts.py pick claude); move one session with accounts.py move"
+        for verb in ("set-role", "swap"):
+            with self.subTest(verb=verb), patch.object(subprocess, "run") as process:
+                output, error = io.StringIO(), io.StringIO()
+                with redirect_stdout(output), redirect_stderr(error):
+                    result = accounts.main([verb, "unit", "claude 3"])
+                self.assertEqual(result, 1)
+                self.assertEqual(len(error.getvalue().splitlines()), 1)
+                self.assertIn(cause, error.getvalue())
+                self.assertEqual(output.getvalue(), "")
+                self.assertFalse(accounts.accounts_config_file().exists())
+                self.assertFalse(accounts.roles_history_file().exists())
+                process.assert_not_called()
 
 
 if __name__ == "__main__":

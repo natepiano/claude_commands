@@ -23,7 +23,7 @@ import note_file
 import whoami
 from agent_accounts import (
     CheckedNamedClaudeAccount,
-    ClaudeAccountSelection,
+    ClaudeAccountsInUse,
     CodexAccountResult,
     CodexHomeSource,
     CodexRateLimits,
@@ -57,8 +57,8 @@ class CodexHomesTests(unittest.TestCase):
         self.assertEqual(accounts.main(["set-role", "seats", label]), 0)
         return home
 
-    def legacy_selection(self) -> ClaudeAccountSelection:
-        return ClaudeAccountSelection(UnreadableClaudeAccount(), UnreadableClaudeAccount(), False, ())
+    def legacy_selection(self) -> ClaudeAccountsInUse:
+        return ClaudeAccountsInUse(UnreadableClaudeAccount(), False, (), frozenset())
 
     def live_fixture(self, home: Path) -> Report:
         return Report("Codex", email=f"{home.name}@example.invalid", source=CodexHomeSource(home))
@@ -166,7 +166,7 @@ class CodexHomesTests(unittest.TestCase):
             KnownClaudeAccount("unit@example.invalid", "claude 2"))
         selections = (
             self.legacy_selection(),
-            ClaudeAccountSelection(default, named.identity, True, (named,)),
+            ClaudeAccountsInUse(default, True, (named,), frozenset((named.identity.login,))),
         )
         homes = [self.home / name for name in (".codex", ".codex2", ".codex10")]
         for selection in selections:
@@ -182,7 +182,7 @@ class CodexHomesTests(unittest.TestCase):
             if selection.multiple_accounts:
                 self.assertCountEqual(claude.call_args_list, [call(self.home / ".claude"), call(named.directory)])
             else:
-                claude.assert_called_once_with()
+                claude.assert_called_once_with(self.home / ".claude")
 
     def test_whoami_prints_each_codex_account_and_marks_only_the_selected_home(self) -> None:
         default = self.home / ".codex"
@@ -280,7 +280,7 @@ class CodexHomesTests(unittest.TestCase):
         selected = self.select_seats("codex 2")
         reports = [Report("Codex", email="selected@example.invalid", source=CodexHomeSource(selected)),
             Report("Codex", problem="Not logged in", source=CodexHomeSource(self.home / ".codex"))]
-        async def read(_selection: ClaudeAccountSelection, home: Path) -> list[Report]:
+        async def read(_selection: ClaudeAccountsInUse, home: Path) -> list[Report]:
             self.assertEqual(home, selected)
             _ = self.select_seats("codex 3")
             return reports
