@@ -634,8 +634,8 @@ def _unit_argv(record: SessionShutdown) -> list[str]:
     # The Units row first: a brief unit's row names its stub plan before any run record exists.
     row_plan = _units_row_plan(host["doc"], host["unit"])
     plan_arguments: list[str]
-    if row_plan == "standby":
-        plan_arguments = ["--standby"]
+    if row_plan in ("standby", "permanent"):
+        plan_arguments = ["--" + row_plan]
     elif row_plan:
         plan_arguments = ["--plan", row_plan]
     elif recorded_plan["kind"] == "plan":
