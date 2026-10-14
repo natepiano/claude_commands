@@ -340,6 +340,36 @@ class IndexTests(unittest.TestCase):
         self.assertIn("mem_stall_some_s", result.stdout)
         self.assertIn("mem_stall_full_s", result.stdout)
 
+    def test_sample_power_profile_indexes_without_backfilling_old_lines(self) -> None:
+        path = self.root / "natedev" / "samples-2026-10.jsonl"
+        since = "2026-10-02T12:00:30.000Z"
+        records = (sample(STAMP), sample("2026-10-02T12:01:00.000Z",
+                                         power_profile="performance", power_profile_since=since))
+        self.write(path, *records)
+        original = path.read_bytes()
+        self.assertEqual(index.update(), 2)
+        self.assertEqual(
+            self.rows("SELECT power_profile, power_profile_since FROM samples ORDER BY at"),
+            [(None, None), ("performance", since)],
+        )
+        self.assertEqual(path.read_bytes(), original)
+        self.assertEqual(index.SAMPLE_COLUMNS[-2:], [
+            ("power_profile", "TEXT", "power-profiles-daemon profile; NULL when not recorded"),
+            ("power_profile_since", "TEXT", "UTC ISO mtime of the daemon's state file: when the profile was set"),
+        ])
+
+    def test_schema_fourteen_rebuilds_sample_profiles_from_json_lines(self) -> None:
+        path = self.root / "natedev" / "samples-2026-10.jsonl"
+        self.write(path, sample(STAMP, power_profile="power-saver", power_profile_since=STAMP))
+        _ = index.update()
+        with closing(sqlite3.connect(index.index_path())) as connection:
+            _ = connection.execute("PRAGMA user_version = 14")
+            _ = connection.execute("UPDATE samples SET power_profile = NULL, power_profile_since = NULL")
+            connection.commit()
+        self.assertEqual(index.update(), 1)
+        self.assertEqual(self.rows("PRAGMA user_version"), [(15,)])
+        self.assertEqual(self.rows("SELECT power_profile, power_profile_since FROM samples"), [("power-saver", STAMP)])
+
     def test_reindex_reads_everything_again(self) -> None:
         self.write(self.host_file, step("s0"), step("s1"), call("c0"))
         self.assertEqual(index.update(), 3)
@@ -543,7 +573,7 @@ class IndexTests(unittest.TestCase):
                 ("old", None, None, None, None),
             ],
         )
-        self.assertEqual(index.SCHEMA_VERSION, 14)
+        self.assertEqual(index.SCHEMA_VERSION, 15)
 
     def test_schema_thirteen_rebuilds_call_fields_from_json_lines(self) -> None:
         self.write(self.host_file, call("recorded", target="mac", hold_wait_s=0.4))
@@ -553,7 +583,7 @@ class IndexTests(unittest.TestCase):
             _ = connection.execute("UPDATE calls SET target = 'natedev', hold_wait_s = 99")
             connection.commit()
         self.assertEqual(index.update(), 1)
-        self.assertEqual(self.rows("PRAGMA user_version"), [(14,)])
+        self.assertEqual(self.rows("PRAGMA user_version"), [(index.SCHEMA_VERSION,)])
         self.assertEqual(self.rows("SELECT target, hold_wait_s FROM calls"), [("mac", 0.4)])
 
     def test_old_calls_have_null_target_and_hold_wait_but_new_empty_target_is_preserved(self) -> None:
