@@ -123,6 +123,11 @@ class PromoteShowrunnerTests(unittest.TestCase):
 
     def tmux(self, *arguments: str) -> subprocess.CompletedProcess[str]:
         self.events.append(" ".join(("tmux", *arguments)))
+        if arguments[0] in {"show-options", "set-option"}:
+            # Like tmux 3.6, an option command takes a pane target: a bare `=name` names no session.
+            target = arguments[arguments.index("-t") + 1]
+            if target.startswith("=") and not target.endswith(":"):
+                return subprocess.CompletedProcess(["tmux", *arguments], 1, "", f"no such session: {target}")
         shown = "╭───╮\n│ > │\n╰───╯\n" if arguments[0] == "capture-pane" else ""
         if arguments[0] == "show-options" and arguments[-1] == "@claude_config_dir":
             shown = str(self.root / ".claude" if isinstance(self.unit_account, accounts.DefaultAccount) else self.unit_account.dir) + "\n"
