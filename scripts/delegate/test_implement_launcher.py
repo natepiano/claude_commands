@@ -22,7 +22,7 @@ import unittest
 from pathlib import Path
 from typing import TypedDict, cast, override
 
-from scripts.delegate.wait_for_test_state import wait_for_file, wait_until
+from scripts.delegate.wait_for_test_state import wait_for_file, wait_for_pid, wait_until
 from scripts.delegate.recorder_fixture import communicate_launcher, invoke_recorder
 
 
@@ -429,7 +429,9 @@ class ImplementLauncherWorkerTests(unittest.TestCase):
                     "verb = sys.argv[1]", "verb = sys.argv[1]\n"
                     + "if verb in ('start', 'follow'):\n"
                     + "    import subprocess\n"
-                    + "    pathlib.Path(os.environ['TEST_AGENT_PID']).write_text(str(os.getpid()))\n"
+                    + "    agent_pid = pathlib.Path(os.environ['TEST_AGENT_PID'])\n"
+                    + "    agent_pid.with_name(agent_pid.name + '.tmp').write_text(str(os.getpid()))\n"
+                    + "    os.replace(agent_pid.with_name(agent_pid.name + '.tmp'), agent_pid)\n"
                     + "    subprocess.run([sys.executable, os.environ['TEST_WAIT_HELPER'], os.environ['TEST_DEFAULT_RELEASE']], check=True)"
                 ))
                 probes = session / "probes"
@@ -447,8 +449,7 @@ class ImplementLauncherWorkerTests(unittest.TestCase):
                                            stderr=subprocess.PIPE, text=True, start_new_session=True)
                 try:
                     wait_until(lambda: finished.exists(), session, processes=(process,))
-                    wait_for_file(pid_file)
-                    os.kill(int(pid_file.read_text()), 0)
+                    os.kill(wait_for_pid(pid_file, processes=(process,)), 0)
                     self.assertIsNone(process.poll())
                     self.assertEqual(probes.read_text().splitlines(), ["1"] * 30)
                     if follow:
@@ -473,16 +474,15 @@ class ImplementLauncherWorkerTests(unittest.TestCase):
         ready = self.root / "blocked-launcher-child"
         child_code = ("import os, signal, sys; from pathlib import Path; "
                       "signal.signal(signal.SIGTERM, signal.SIG_IGN); "
-                      "Path(sys.argv[1]).write_text(str(os.getpid())); signal.pause()")
+                      "p = Path(sys.argv[1]); staged = p.with_name(p.name + '.tmp'); "
+                      "staged.write_text(str(os.getpid())); os.replace(staged, p); signal.pause()")
         program = f"import subprocess, sys; child = subprocess.Popen([sys.executable, '-c', {child_code!r}, {str(ready)!r}]); child.wait()"
         process = subprocess.Popen([sys.executable, "-c", program], stdout=subprocess.PIPE,
                                    stderr=subprocess.PIPE, text=True, start_new_session=True)
         mesh = self.root / "scripts/agents/codex_mesh.py"
         _ = mesh.write_text("blocked fixture")
         try:
-            # write_text creates the file before it writes the pid, so wait for the pid.
-            wait_until(lambda: ready.exists() and ready.read_text() != "", self.root, processes=(process,))
-            descriptor = os.pidfd_open(int(ready.read_text()))
+            descriptor = os.pidfd_open(wait_for_pid(ready, processes=(process,)))
             try:
                 with self.assertRaises(subprocess.TimeoutExpired):
                     _ = self.finish_default_launcher(process, self.root / "release", mesh, timeout=0)
