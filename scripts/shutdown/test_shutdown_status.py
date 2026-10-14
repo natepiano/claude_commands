@@ -439,7 +439,7 @@ else:
         self.assertIn("  shutdown: waiting\n", output)
         self.assertEqual(error, "")
 
-    def test_status_renders_local_and_remote_stop_issues_under_their_sessions(self) -> None:
+    def test_status_renders_canonical_remote_stop_issues_under_their_sessions(self) -> None:
         at = "2026-10-09T21:49:10+00:00"
         local = complete_record()
         local["entries"][0]["session"]["name"] = "local"
@@ -454,10 +454,12 @@ else:
             record_store.CodexServerLeftRunning(
                 kind="codex server left running", at=at, run_dir="/tmp/run", cause="stop not confirmed",
             ),
-            record_store.UnitTmuxLeftRunning(
-                kind="unit tmux session left running", at=at, tmux_session="demo-unit", cause="owner identity lost",
+            record_store.UnitSessionLeftRunning(
+                kind="unit session left running", at=at, host="tmux",
+                session_name="demo-unit", cause="owner identity lost",
             ),
         ]
+        self.assertEqual(remote_record["stop_issues"][-1]["kind"], "unit session left running")
         write_old(local)
         os.environ["SHUTDOWN_STATUS_RECORD_OUTPUT"] = json.dumps([remote_record])
         result, output, error = self.run_plain_status_with_ssh()

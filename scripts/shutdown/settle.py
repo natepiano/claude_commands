@@ -803,8 +803,8 @@ def stop_issue_text(issue: SessionStopIssue) -> str:
             return "not stopped: account unreadable"
         case "codex server left running":
             return f"Codex server {issue['run_dir']} left running: {issue['cause']}"
-        case "unit tmux session left running":
-            return f"tmux session {issue['tmux_session']} left running: {issue['cause']}"
+        case "unit session left running":
+            return f"{issue['host']} session {issue['session_name']} left running: {issue['cause']}"
 
 
 def _restore_record(saved: SessionShutdown) -> None:

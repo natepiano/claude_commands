@@ -938,7 +938,7 @@ def main(argv: list[str]) -> int:
     _ = parser.add_argument("--cwd")
     _ = parser.add_argument("--restart-note")
     _ = parser.add_argument("--session-name")
-    _ = parser.add_argument("--tmux-session")
+    _ = parser.add_argument("--host-session", "--tmux-session", dest="tmux_session")
     _ = parser.add_argument("--check", action="store_true")
     args = parser.parse_args(argv)
     try:

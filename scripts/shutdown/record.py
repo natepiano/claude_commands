@@ -120,9 +120,18 @@ class CodexServerLeftRunning(TypedDict):
 
 
 class UnitTmuxLeftRunning(TypedDict):
+    """Legacy wire form; readers normalize it to UnitSessionLeftRunning."""
     kind: Literal["unit tmux session left running"]
     at: str
     tmux_session: str
+    cause: StopLeftRunningCause
+
+
+class UnitSessionLeftRunning(TypedDict):
+    kind: Literal["unit session left running"]
+    at: str
+    host: Literal["tmux", "herdr"]
+    session_name: str
     cause: StopLeftRunningCause
 
 
@@ -131,7 +140,7 @@ SessionStopIssue = (
     | StillRunningAfterStop
     | AccountUnreadableAtStop
     | CodexServerLeftRunning
-    | UnitTmuxLeftRunning
+    | UnitSessionLeftRunning
 )
 
 
@@ -652,6 +661,7 @@ def _session_stop_issue(value: object, place: str, *, legacy: bool = False) -> S
                 "seat still live",
                 "codex server left running",
                 "unit tmux session left running",
+                "unit session left running",
             }
         ),
     )
@@ -671,10 +681,22 @@ def _session_stop_issue(value: object, place: str, *, legacy: bool = False) -> S
         cause = _string(_required(values, "cause", place), f"{place}.cause")
         if cause not in {"stop not confirmed", "owner identity lost"}:
             raise InvalidRecord(f"{place}.cause is invalid")
-    elif kind == "unit tmux session left running":
-        _ = _string(
-            _required(values, "tmux_session", place), f"{place}.tmux_session"
-        )
+    elif kind in {"unit tmux session left running", "unit session left running"}:
+        if kind == "unit tmux session left running":
+            values = {
+                **values,
+                "kind": "unit session left running",
+                "host": "tmux",
+                "session_name": _string(
+                    _required(values, "tmux_session", place), f"{place}.tmux_session"
+                ),
+            }
+            del values["tmux_session"]
+        else:
+            _ = _string(_required(values, "session_name", place), f"{place}.session_name")
+            host = _string(_required(values, "host", place), f"{place}.host")
+            if host not in {"tmux", "herdr"}:
+                raise InvalidRecord(f"{place}.host is invalid")
         cause = _string(_required(values, "cause", place), f"{place}.cause")
         if cause not in {"stop not confirmed", "owner identity lost"}:
             raise InvalidRecord(f"{place}.cause is invalid")

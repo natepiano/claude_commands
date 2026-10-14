@@ -326,11 +326,13 @@ class Herdr:
         _ = self.run("pane", "rename", pane, label)
         return pane
 
-    def start_agent(self, name: str, pane: str, kind: str, argv: list[str],
+    def start_agent(self, name: str, pane: str, kind: str, agent_arguments: list[str],
                     opening_prompt: str, timeout_ms: int) -> None:
+        """Start the kind's executable with extra arguments, then prompt once."""
+        _check_agent_arguments(kind, agent_arguments)
         _timeout(timeout_ms)
         result = run_program(self.argv("agent", "start", name, "--kind", kind, "--pane", pane,
-                                       "--timeout", str(timeout_ms), "--", *argv), timeout=timeout_ms / 1000 + 10)
+                                       "--timeout", str(timeout_ms), "--", *agent_arguments), timeout=timeout_ms / 1000 + 10)
         try:
             require_success(result, f"start agent {name}")
         except HerdrFailure as error:
@@ -631,10 +633,16 @@ def herdr_processes() -> list[HerdrProcess]:
     return processes
 
 
-def start_agent(name: str, pane: str, kind: str, argv: list[str],
+def _check_agent_arguments(kind: str, agent_arguments: list[str]) -> None:
+    if agent_arguments and agent_arguments[0] == kind:
+        raise ValueError(f"agent_arguments must omit the {kind!r} executable selected by --kind")
+
+
+def start_agent(name: str, pane: str, kind: str, agent_arguments: list[str],
                 opening_prompt: str, timeout_ms: int) -> None:
     """Start in the named session, using the pane's label as the agent label."""
+    _check_agent_arguments(kind, agent_arguments)
     herdr = Herdr(name)
     labels = [row.get("label") for row in herdr.panes() if row["pane_id"] == pane]
     label = labels[0] if labels else pane
-    herdr.start_agent(label or pane, pane, kind, argv, opening_prompt, timeout_ms)
+    herdr.start_agent(label or pane, pane, kind, agent_arguments, opening_prompt, timeout_ms)
