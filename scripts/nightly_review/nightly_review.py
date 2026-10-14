@@ -331,7 +331,7 @@ def launch_environment(_selection: ClaudeAccountsInUse) -> dict[str, str]:
 def tonight(selection: ClaudeAccountsInUse) -> list[str]:
     """Start the review on the configured units account, or report the refusal."""
     from scripts.accounts import accounts
-    from scripts.herdr.herdr import Untrusted, UnreadableTrustFile, claude_trust, trust_command
+    from scripts.herdr.herdr import Untrusted, UnreadableTrustFile, claude_trust
 
     try:
         selected = accounts.role_account("unit")
@@ -359,7 +359,7 @@ def tonight(selection: ClaudeAccountsInUse) -> list[str]:
         return [f"{SESSION}: {trust}"]
     if isinstance(trust, Untrusted):
         label = trust_account.label if isinstance(trust_account, accounts.NamedAccount) else "default account"
-        return [f"{SESSION}: Claude is not trusted in {folder} on {label}. Run: {trust_command(folder, trust_account)}"]
+        return [f"{SESSION}: Claude is not trusted in {folder} on {label}. Run: {accounts.trust_command(folder, trust_account)}"]
     return start(selection, accounts.account_prefix(selected), environment)
 
 

@@ -1151,6 +1151,15 @@ def account_prefix(selected: AccountSelection) -> str:
     return account.named_account_prefix(selected.dir)
 
 
+def trust_command(folder: Path, selected: ClaudeLaunchAccount) -> str:
+    """The command the user runs to accept trust, then type /exit in Claude."""
+    if isinstance(selected, DefaultAccount):
+        prefix = "env " + " ".join(f"-u {shlex.quote(name)}" for name in account.NAMED_ACCOUNT_VARIABLES)
+    else:
+        prefix = account_prefix(selected).strip()
+    return f"cd {shlex.quote(str(folder))} && {prefix} claude"
+
+
 def launch_prefix(role: str) -> str:
     """Return the shell assignment needed before launching this role."""
     return account_prefix(role_account(role))

@@ -531,8 +531,8 @@ def director_agent(request: UnitLaunch) -> DirectorAgent:
 
 
 def preflight(request: RequestedUnitLaunch, selected: ClaudeLaunchAccount) -> ReadyToLaunch:
-    from scripts.accounts.accounts import DefaultAccount
-    from scripts.herdr.herdr import Untrusted, UnreadableTrustFile, claude_trust, repository_trust_key, trust_command
+    from scripts.accounts.accounts import DefaultAccount, trust_command
+    from scripts.herdr.herdr import Untrusted, UnreadableTrustFile, claude_trust, repository_trust_key
 
     production = request.production
     branch = git(production, "branch", "--show-current").stdout.strip()

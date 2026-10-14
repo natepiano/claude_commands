@@ -14,16 +14,12 @@ from __future__ import annotations
 import json
 import os
 import re
-import shlex
 import shutil
 import subprocess
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, NotRequired, TypedDict, cast, override
-
-if TYPE_CHECKING:
-    from scripts.accounts.accounts import ClaudeLaunchAccount
+from typing import NotRequired, TypedDict, cast, override
 
 
 class HerdrFailure(Exception):
@@ -431,18 +427,6 @@ def claude_trust(folder: Path, claude_json: Path) -> Trusted | Untrusted | Unrea
         if configuration["projects"].get(str(key), {"hasTrustDialogAccepted": False})["hasTrustDialogAccepted"]:
             return Trusted(folder, claude_json, key)
     return Untrusted(folder, claude_json, keys)
-
-
-def trust_command(folder: Path, account: ClaudeLaunchAccount) -> str:
-    """The command the user runs to accept trust, then type /exit in Claude."""
-    from scripts.accounts.accounts import DefaultAccount, account_prefix
-    from scripts.whoami.account import NAMED_ACCOUNT_VARIABLES
-
-    if isinstance(account, DefaultAccount):
-        prefix = "env " + " ".join(f"-u {shlex.quote(name)}" for name in NAMED_ACCOUNT_VARIABLES)
-    else:
-        prefix = account_prefix(account).strip()
-    return f"cd {shlex.quote(str(folder))} && {prefix} claude"
 
 
 def repository_root(directory: Path) -> Path:
