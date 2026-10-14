@@ -478,19 +478,20 @@ class OffloadSettingsTests(unittest.TestCase):
         self.assertEqual(destination.read_text().splitlines()[:2], ["mac=declined", "reason=unreachable"])
         self.assertTrue((self.root / "state" / "unreachable_until").exists())
 
-    def test_checked_in_settings_let_every_cargo_liner_package_reach_the_claim(self) -> None:
+    def test_checked_in_settings_send_cargo_liner_to_the_mac_except_cargo_berth(self) -> None:
         config = offload.read_config(Path(__file__).resolve().parents[2] / "config" / "mac_test.conf")
-        self.assertEqual(config.values["linux_only.cargo-liner"], "")
+        self.assertEqual(config.values["linux_only.cargo-liner"], "cargo-berth")
         self.assertEqual(config.default_target_budget_gib, "24")
         self.assertNotIn("mac_budget_gib.cargo-liner", config.values)
         offload.write_backoff(time.time() + 60)
-        for package in ("cargo-port", "cargo-tile", "tui_pane"):
+        expected = {"cargo-port": "backoff", "cargo-tile": "backoff", "tui_pane": "backoff", "cargo-berth": "linux_only"}
+        for package, reason in expected.items():
             with self.subTest(package=package):
                 request = offload.OffloadRequest(self.root, package, "cargo-liner", offload.NO_RESULT_FILE, ())
                 with mock.patch.object(offload, "repository_identity",
                                        return_value=offload.KnownRepository("cargo-liner")):
                     result = offload.run_offload(offload.ProcessController(), config, request, time.monotonic())
-                self.assertEqual(result.reason if isinstance(result, offload.DeclinedMacRun) else result, "backoff")
+                self.assertEqual(result.reason if isinstance(result, offload.DeclinedMacRun) else result, reason)
 
 
 @final
