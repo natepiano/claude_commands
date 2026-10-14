@@ -16,8 +16,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "herdr"))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "message"))
 
 import fake_tmux
-import herdr
 import session_pane
+import herdr
 from fake_tmux import FakeSession
 from herdr import AgentBlocked, HerdrPlace, HerdrRefusal, SessionListResult
 from fake_herdr import CommandResponse
@@ -111,6 +111,44 @@ class SessionPaneTests(unittest.TestCase):
     def log(self, host: str) -> list[list[str]]:
         path = self.root / f"{host}.log"
         return [cast(list[str], json.loads(line)) for line in path.read_text().splitlines()] if path.exists() else []
+
+    def test_tmux_read_returns_only_the_requested_tail_without_screen_padding(self) -> None:
+        for capture, expected, ansi in (
+            ("oldest\nolder\nfirst\nsecond\nthird\n\n \t\n", "first\nsecond\nthird\n", False),
+            ("oldest\nolder\n\x1b[31mfirst\x1b[0m\n\nthird  \n\x1b[0m \t\x1b[2m\n\x1b[0m\n",
+             "\x1b[31mfirst\x1b[0m\n\nthird  \n", True),
+            ("short", "short\n", False),
+            ("\n \t\n", "", False),
+            ("\x1b[0m \t\x1b[2m\n\x1b[0m\n", "", True),
+        ):
+            with self.subTest(capture=capture, ansi=ansi):
+                state = fake_tmux.read(self.state)
+                state["$1"]["screens"] = {"%41": capture}
+                fake_tmux.write(self.state, state)
+                options = ("--ansi",) if ansi else ()
+                result = self.run_cli("read", "unit", "show", "tmux-unit", "--lines", "3", *options)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stdout, expected)
+        self.assertIn(["capture-pane", "-p", "-S", "-3", "-t", "%41"], self.log("tmux"))
+        self.assertIn(["capture-pane", "-p", "-e", "-S", "-3", "-t", "%41"], self.log("tmux"))
+
+    def test_herdr_read_forwards_the_line_count_and_preserves_output_unchanged(self) -> None:
+        path = self.root / "responses.json"
+        responses = cast(dict[str, CommandResponse], json.loads(path.read_text()))
+        for ansi in (False, True):
+            for output in ("first\nsecond\nthird\n\n \t\n", "\x1b[31mshort\x1b[0m", ""):
+                with self.subTest(ansi=ansi, output=output):
+                    command = ["--session", "native", "pane", "read", "w1:p1", "--source", "recent",
+                               "--lines", "3"]
+                    if ansi:
+                        command.extend(("--format", "ansi"))
+                    responses[" ".join(command)] = {"stdout": output, "code": 0}
+                    _ = path.write_text(json.dumps(responses))
+                    options = ("--ansi",) if ansi else ()
+                    result = self.run_cli("read", "unit", "show", "herdr-unit", "--lines", "3", *options)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertEqual(result.stdout, output)
+                    self.assertEqual(self.log("herdr")[-1], command)
 
     def test_every_verb_on_both_unit_hosts(self) -> None:
         for unit, where, screen in (("tmux-unit", "tmux:%41", "tmux screen"),

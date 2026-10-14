@@ -1053,6 +1053,29 @@ land a phase sooner. Each design check covers every view of the change at once
 
 ---
 
+<PauseForMove>
+A message whose first line starts `Pause for move:` or `Pause for stop:` is the
+shutdown mover asking this session to stop so it can move or stop it. Act on it
+at once, in the turn it arrives:
+
+1. Stop mid-step and start nothing new: no merge, gate or launch that has not
+   begun. Leave uncommitted work in place.
+2. Append a `### STATE` block to your LOG, and stop any build you started or name
+   it in the line below.
+3. Run the `shutdown.py ready --where "<one line>"` command the message gives.
+4. End the turn.
+
+The session is resumed with that line, on the account the message names; continue
+from it. A unit of yours that vanished during a move is the mover's to bring back:
+do not restore it while its move is in progress.
+
+Before the mover stops one of your units, you get one line from `shutdown`:
+`<unit> is stopping: <why>; it comes back on <account> within minutes`, or that
+it stays stopped until the user restarts it. One more line follows:
+`<unit> is back on <account>`, or `<unit> did not come back: <reason>`. The user
+is told of a failure; you hold the unit's work until it is back.
+</PauseForMove>
+
 <QuotaAlert>
 Unit directors' seats run on accounts with a weekly usage limit. The notices about
 them, how to tell the three kinds apart, and what a receiver does are in
