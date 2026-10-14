@@ -66,6 +66,14 @@ def main(arguments: list[str]) -> int:
             found["env"][name] = value
             write(path, sessions)
             return 0
+        case ["set-environment", "-u", "-t", target, name]:
+            found = _find(sessions, target)
+            if found is None:
+                print(f"can't find session: {target}", file=sys.stderr)
+                return 1
+            _ = found["env"].pop(name, None)
+            write(path, sessions)
+            return 0
         case ["capture-pane", "-p", "-e", "-t", pane]:
             found = _find(sessions, pane)
             if found is None:

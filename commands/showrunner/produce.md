@@ -369,8 +369,8 @@ to confirm the block remains and no compaction is running. Type `/compact` with
 
 **Resume.** To bring back a unit director whose session ended, use
    `$HOME/.claude/scripts/lib/py $HOME/.claude/scripts/production/add_unit.py --production PRODUCTION_DOC <name> --plan <unit plan> --resume <session-id> --cwd <recorded cwd>`.
-   The launcher keeps the unit's recorded account and model, checks shutdown holds, and preserves its name and Remote Control link.
-   If it reports no recorded account, stop and tell the user its line; give `--account "claude N"|default` only when the user chooses the account.
+   The launcher starts it on the configured units account, keeps its recorded model, checks shutdown holds, and preserves its name and Remote Control link.
+   If it reports the units account is not configured, stop and tell the user its line: `accounts.py move units "claude N"` sets it.
 </LaunchUnits>
 
 ---
@@ -1074,6 +1074,12 @@ Before the mover stops one of your units, you get one line from `shutdown`:
 it stays stopped until the user restarts it. One more line follows:
 `<unit> is back on <account>`, or `<unit> did not come back: <reason>`. The user
 is told of a failure; you hold the unit's work until it is back.
+
+To move a session yourself, or stop one to change its account, run
+`/showrunner:move`: it pauses the session first and proves the account it comes
+back on. Never send `/exit` into a pane, run `shutdown.py now`, kill a Claude
+process or resume `claude` with a `CLAUDE_CONFIG_DIR` by hand; a hook refuses
+each in your session.
 </PauseForMove>
 
 <QuotaAlert>
@@ -1118,7 +1124,8 @@ every unit director.
 When every unit's final-gate and as-built checkpoints are merged:
 
 With a **Review pool** line, exclude `review-unit`'s standing phase from
-that condition.
+that condition. A unit whose Plan cell is `permanent` (the nightly review) is
+outside it too: wrap neither waits on it nor retires its worktree or branch.
 
 1. Run a final <CIPoint/> and all <PromoteMain/> checks on its exact sha:
    local validation, smoke launch and GitHub CI verdict, then the promotion

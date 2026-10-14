@@ -1,14 +1,15 @@
 #!/usr/bin/env python3
-"""The nightly review: one read-only session, one improvement proposal per mode, queued for the user.
+"""The nightly review: one read-only unit, one improvement proposal per mode, queued for the user.
 
 `launch` runs from the nightly-review timer on natedev (/etc/nixos/modules/linux/nightly-review.nix).
-It starts `/nightly_review config rust messages` in one named, detached tmux session with Remote Control under
-the same name, replacing the previous night's unless the user is attached to it. A session under that
-name that no nightly review started is left running, and the review skips the night. The session runs
-on the account with room whose weekly allowance resets soonest.
-It does the modes in order; for each it writes NIGHT/<mode>.md and messages natedev, which distills
-the proposals into NIGHT/digest.md and the ledger (/watcher). The night is skipped while that account
-is shut down, is not fit to launch, or no account has room.
+The review is the permanent nightly-review-unit of one production: wrap never retires it, so it
+keeps one conversation across nights. Each night the timer sends that unit the night's job,
+`/nightly_review config rust messages` for NIGHT=<date>. When the unit is gone, the timer first
+starts it through add_unit.py --permanent, which uses the configured units account, checks shutdown holds and trust,
+and keeps the unit's launch flags (its own settings, ~/rust, /etc/nixos and ~/.claude).
+The unit does the modes in order; for each it writes NIGHT/<mode>.md and messages natedev, which
+distills the proposals into NIGHT/digest.md and the ledger (/watcher). The night is skipped when no
+running production holds the unit.
 
 Nothing offers the proposals: the ledger's queue grows until the user asks for /nightly_next
 (user, 2026-10-10).
@@ -19,7 +20,6 @@ from __future__ import annotations
 import os
 import json
 import re
-import shlex
 import subprocess
 import sys
 from dataclasses import dataclass
@@ -27,27 +27,20 @@ from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, NotRequired, TypedDict, cast
 
-# The quota readers live with the agent notes, one directory over.
+# The account reader and the production scripts sit one directory over.
 SCRIPTS = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(SCRIPTS.parent))
 sys.path.insert(0, str(SCRIPTS / "whoami"))
 sys.path.insert(0, str(SCRIPTS / "shutdown"))
-from launch_permission import (  # noqa: E402
-    BlockedByShutdown,
-    NewWorkLaunchPurpose,
-    ShutdownStateUnreadable,
-    launch_barrier,
-    launch_permission,
-)
-from account import NAMED_ACCOUNT_VARIABLES  # noqa: E402
-from agent_accounts import ClaudeAccountsInUse  # noqa: E402
+sys.path.insert(0, str(SCRIPTS / "production"))
 import account  # noqa: E402
+
+if TYPE_CHECKING:
+    from scripts.production.unit_lookup import LiveClaude
 
 ROOT = Path(os.environ.get("XDG_STATE_HOME") or Path.home() / ".local" / "state") / "nightly-review"
 MODES = ("config", "rust", "messages")
 SESSION = "nightly-review"
-# The two sessions a night had before one session ran every mode.
-LEGACY_SESSIONS = ("nightly-config", "nightly-rust")
 PROMPT = "/nightly_review " + " ".join(MODES)
 SETTINGS = Path(__file__).with_name("settings.json")
 SESSIONS_DIR = Path.home() / ".claude/sessions"
@@ -224,166 +217,91 @@ def messages(since: datetime) -> list[str]:
     return lines
 
 
-@dataclass(frozen=True)
-class QuotaClear:
-    """The account the review launches on has enough weekly quota to launch work."""
-
-
-@dataclass(frozen=True)
-class ReviewAccountUnavailable:
-    """Tonight's run must wait for weekly quota."""
-
-    reason: str
-
-
-QuotaPermission = QuotaClear | ReviewAccountUnavailable
+NIGHTLY_UNIT = "nightly-review-unit"
 
 
 def night_dir(day: date) -> Path:
     return ROOT / day.isoformat()
 
 
-def tmux(*args: str) -> subprocess.CompletedProcess[str]:
+def job(day: date) -> str:
+    """The night's work, sent to the permanent unit as a message."""
+    return (f"Nightly review for NIGHT={day.isoformat()}: follow ~/.claude/commands/nightly_review.md "
+            + f"with the modes {' '.join(MODES)}, in that order.")
+
+
+@dataclass(frozen=True)
+class NightlyProduction:
+    doc: Path
+    slug: str
+
+
+def nightly_production() -> NightlyProduction | str:
+    """The one production whose Units table holds the permanent nightly review unit, or why there is none."""
+    from scripts.production import showrunners
+
+    if TYPE_CHECKING:
+        from scripts.production import add_unit
+    else:
+        import add_unit
+
+    found: list[NightlyProduction] = []
+    for runner in showrunners.registered_showrunners():
+        try:
+            rows = add_unit.unit_table(Path(runner["doc"]).read_text(encoding="utf-8").splitlines())
+        except (OSError, UnicodeError, add_unit.Refusal):
+            continue
+        if any(add_unit.cell_value(row.get("Unit", "")) == NIGHTLY_UNIT
+               and add_unit.cell_value(row.get("Plan", "")) == "permanent" for row in rows):
+            found.append(NightlyProduction(Path(runner["doc"]), runner["slug"]))
+    if not found:
+        return f"no running production has a permanent {NIGHTLY_UNIT} row; add it with add_unit.py {SESSION} --permanent"
+    if len(found) > 1:
+        return f"{len(found)} productions hold {NIGHTLY_UNIT}: " + ", ".join(item.slug for item in found)
+    return found[0]
+
+
+def live_unit(slug: str) -> LiveClaude | None:
+    if TYPE_CHECKING:
+        from scripts.production import unit_lookup
+    else:
+        import unit_lookup
+
+    unit = unit_lookup.marked_units(slug).get(NIGHTLY_UNIT)
+    return unit.claude if unit is not None and isinstance(unit.claude, unit_lookup.LiveClaude) else None
+
+
+def tonight(day: date) -> list[str]:
+    """Send the night's review to the live unit, starting it first through add_unit when it is gone."""
+    production = nightly_production()
+    if isinstance(production, str):
+        return [f"skipped: {production}"]
+    lines: list[str] = []
     try:
-        return subprocess.run(["tmux", *args], capture_output=True, text=True, check=False)
-    except FileNotFoundError:
-        return subprocess.CompletedProcess(["tmux", *args], 127, "", "tmux is not installed")
-
-
-def running(name: str) -> bool:
-    return tmux("has-session", "-t", f"={name}").returncode == 0
-
-
-def quota_permission() -> QuotaPermission:
-    from scripts.accounts import accounts
-
-    return quota_for_selection(accounts.claude_account_selection())
-
-
-def quota_for_selection(_selection: ClaudeAccountsInUse) -> QuotaPermission:
-    """The picker decides room without a minimum percentage."""
-    from scripts.accounts import accounts
-
-    chosen = accounts.pick("claude", datetime.now(timezone.utc), keep=accounts.NoKeep())
-    return ReviewAccountUnavailable(accounts.no_room_line("claude", chosen)) if isinstance(chosen, accounts.NoAccountWithRoom) else QuotaClear()
-
-
-@dataclass(frozen=True)
-class LeftRunning:
-    """A session under a review name stays, with the line that says why."""
-
-    line: str
-
-
-@dataclass(frozen=True)
-class NameFree:
-    """No session holds the name now."""
-
-
-def retire(name: str, attached: str, foreign: str) -> LeftRunning | NameFree:
-    """End a past night's session unless the user is attached or no review started it."""
-    if not running(name):
-        return NameFree()
-    if tmux("list-clients", "-t", f"={name}").stdout.strip():
-        return LeftRunning(f"{name}: {attached}")
-    # A session promoted out of a nightly review keeps its tmux name.
-    if "/nightly_review " not in tmux("list-panes", "-F", "#{pane_start_command}", "-t", f"={name}:").stdout:
-        return LeftRunning(f"{name}: {foreign}")
-    _ = tmux("kill-session", "-t", f"={name}")
-    return NameFree()
-
-
-def start(_selection: ClaudeAccountsInUse, prefix: str, environment: dict[str, str]) -> list[str]:
-    """Replace last night's session with tonight's; `prefix` selects a named account."""
-    lines = [
-        left.line for name in LEGACY_SESSIONS
-        if isinstance(left := retire(
-            name, "you are attached, so it was left running",
-            "another session holds this name, so it was left running",
-        ), LeftRunning)
-    ]
-    last_night = retire(
-        SESSION, "you are attached, so last night's session was left running",
-        "another session holds this name, so tonight's review did not start",
-    )
-    if isinstance(last_night, LeftRunning):
-        return [*lines, last_night.line]
-    # The session works in ~/rust; the config mode also reads /etc/nixos and ~/.claude.
-    home = Path.home()
-    argv = ["claude", "--remote-control", SESSION, "-n", SESSION,
-            "--add-dir", "/etc/nixos", "--add-dir", str(home / ".claude"),
-            "--settings", str(SETTINGS), PROMPT]
-    # A scope of its own, so a tmux server this starts outlives the timer's oneshot unit.
-    command = f"{prefix}ENABLE_TOOL_SEARCH=true command {shlex.join(argv)}; exec zsh"
-    command = f"unset {' '.join(NAMED_ACCOUNT_VARIABLES)} CLAUDE_CODE_OAUTH_TOKEN; " + command
-    spawn = ["systemd-run", "--user", "--scope", "--quiet", "--collect", "tmux", "new-session", "-d", "-s", SESSION,
-             "-c", str(home / "rust"), "zsh", "-ic", command]
-    started = subprocess.run(spawn, capture_output=True, text=True, check=False, env=environment)
-    outcome = "started" if started.returncode == 0 else f"failed to start: {started.stderr.strip()}"
+        claude = live_unit(production.slug)
+        if claude is None:
+            # add_unit picks the account, checks shutdown holds and trust, and keeps the unit's launch flags.
+            started = subprocess.run([sys.executable, str(SCRIPTS / "production" / "add_unit.py"), "--production",
+                                      str(production.doc), SESSION, "--permanent"], capture_output=True, text=True, check=False)
+            if started.returncode != 0:
+                return [f"{SESSION}: not started: {started.stderr.strip() or started.stdout.strip()}"]
+            lines.append(f"{SESSION}: started")
+            claude = live_unit(production.slug)
+    except OSError as error:
+        return [f"skipped: units unreadable: {error}"]
+    if claude is None:
+        return [*lines, f"{SESSION}: no live Claude carries the unit's mark"]
+    sent = subprocess.run([sys.executable, str(SCRIPTS / "message" / "send.py"), "--to", f"uds:{claude.socket}",
+                           "--from", "nightly-review timer", "--key", f"nightly-{day.isoformat()}", "--text", job(day)],
+                          capture_output=True, text=True, check=False)
+    outcome = "tonight's review sent" if sent.returncode == 0 else f"tonight's review not sent: {sent.stderr.strip()}"
     return [*lines, f"{SESSION}: {outcome}"]
 
 
-def launch_environment(_selection: ClaudeAccountsInUse) -> dict[str, str]:
-    """The launch environment without an inherited Claude account."""
-    return {key: value for key, value in os.environ.items() if not key.startswith("CLAUDE_")}
-
-
-def tonight(selection: ClaudeAccountsInUse) -> list[str]:
-    """Start the review on the picked account, or give the one line that says why not."""
-    from scripts.accounts import accounts
-    from scripts.herdr.herdr import Untrusted, UnreadableTrustFile, claude_trust, trust_command
-
-    try:
-        selected = accounts.role_account("unit")
-    except accounts.AccountsError as error:
-        return [str(error)]
-    environment = launch_environment(selection)
-    permission_environment = dict(environment)
-    if isinstance(selected, accounts.NamedAccount):
-        problems = accounts.check(selected.label)
-        if problems:
-            return [f"skipped: unit account {selected.label}: {problems[0]}"]
-        # The shutdown check reads the account the review will run on.
-        permission_environment["CLAUDE_CONFIG_DIR"] = str(selected.dir)
-    permission = launch_permission(permission_environment, NewWorkLaunchPurpose())
-    if isinstance(permission, BlockedByShutdown):
-        return [f"skipped: {permission.reason}"]
-    if isinstance(permission, ShutdownStateUnreadable):
-        return [f"skipped: shutdown state unreadable: {permission.detail}"]
-    folder = Path.home() / "rust"
-    trust_account = selected
-    inherited_config = environment.get("CLAUDE_CONFIG_DIR", "")
-    if isinstance(selected, accounts.DefaultAccount) and inherited_config:
-        trust_account = accounts.NamedAccount(inherited_config, Path(inherited_config))
-    account_file = (trust_account.dir / ".claude.json" if isinstance(trust_account, accounts.NamedAccount)
-                    else Path.home() / ".claude.json")
-    trust = claude_trust(folder, account_file)
-    if isinstance(trust, UnreadableTrustFile):
-        return [f"{SESSION}: {trust}"]
-    if isinstance(trust, Untrusted):
-        label = trust_account.label if isinstance(trust_account, accounts.NamedAccount) else "default account"
-        return [f"{SESSION}: Claude is not trusted in {folder} on {label}. Run: {trust_command(folder, trust_account)}"]
-    return start(selection, accounts.account_prefix(selected), environment)
-
-
 def launch(today: date) -> list[str]:
-    from scripts.accounts import accounts
-
-    selection = accounts.claude_account_selection()
     directory = night_dir(today)
     directory.mkdir(parents=True, exist_ok=True)
-    barrier = launch_barrier()
-    try:
-        _ = barrier.__enter__()
-    except OSError as error:
-        lines = [
-            f"skipped: shutdown state unreadable: launch barrier: {error}"
-        ]
-    else:
-        try:
-            lines = tonight(selection)
-        finally:
-            _ = barrier.__exit__(None, None, None)
+    lines = tonight(today)
     _ = (directory / "launch.log").write_text("\n".join(lines) + "\n", encoding="utf-8")
     return lines
 

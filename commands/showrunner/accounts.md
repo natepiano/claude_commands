@@ -1,6 +1,6 @@
 ---
-description: Show accounts, move a session, pick an account with room, or swap Codex seats.
-argument-hint: '[pick claude|codex [--exclude <label>] [--keep <label>] [--explain] | move <session-id|name> "claude N"|default [--why <text>] | move showrunners --from "claude N" --to "claude N"|default [--dry-run] [--why <text>] | setup "claude N" | setup "codex N" | check "codex N" | role seats | set-role seats "codex N"|default | swap seats "codex N"|default [--dry-run]]'
+description: Show account groups, move a group or ad hoc session, or swap Codex seats.
+argument-hint: '[pick claude|codex [--exclude <label>] [--keep <label>] [--explain] | move <session-id|name> "claude N"|default [--why <text>] | move units|showrunners "claude N"|default [--dry-run] [--why <text>] | setup "claude N" | setup "codex N" | check "codex N" | role seats | set-role seats "codex N"|default | swap seats "codex N"|default [--dry-run]]'
 ---
 
 # Accounts
@@ -8,7 +8,7 @@ argument-hint: '[pick claude|codex [--exclude <label>] [--keep <label>] [--expla
 Run `"$HOME/.claude/scripts/lib/py" "$HOME/.claude/scripts/accounts/accounts.py" $ARGUMENTS`
 and print its output exactly as it comes, with nothing added.
 
-- No arguments: one Markdown table, a row for `~/.claude` and each `~/.claudeN`,
+- No arguments: the units and showrunners accounts, then one Markdown table, a row for `~/.claude` and each `~/.claudeN`,
   logged in or not, and for each Codex account, then a line for anything wrong in a folder.
   Status also lists each live session's account, Codex's destination on a refusal,
   held seat continuations and the last ten move entries with their outcomes.
@@ -18,9 +18,11 @@ and print its output exactly as it comes, with nothing added.
 - `setup "codex N"`: links the home, finishes its first startup (up to 20 minutes: run it in the background), then prints the login command.
   Keep `CODEX_HOME` on it: without it, `codex login` signs `~/.codex` out and in, stopping seats on the default role.
 - `pick claude|codex [--explain]`: picks room with the soonest weekly reset; `--keep <label>` keeps a working account, and repeated `--exclude <label>` skips accounts.
-- `claude-unit` and `role unit` use `pick claude`; new sessions have no unit role.
-- `move <session-id|name> "claude N"|default`: moves one local session, keeping its conversation and name; `--why <text>` explains the move on resume; an unknown host prints the resume line to run after exit.
-- `move showrunners --from "claude N" --to "claude N"|default [--dry-run]`: moves that account's local showrunners on their original desktops; skips sessions already in shutdown.
+- `placement --explain`: room and each group's destination on refusal. Low or 0% is room until refused; healthy groups stay put.
+- Configuration decides every new and resumed launch: `claude-unit` and `role unit` use units; `role showrunner` uses showrunners. Set it with `accounts.py move <group> "claude N"`; an unconfigured group refuses with that command.
+- A showrunner moves sessions and groups with `/showrunner:move`, which proves where each came back; `move` below starts a move and does not wait for it.
+- `move <session-id|name> "claude N"|default`: moves one local ad hoc session; grouped sessions must use the group command; `--why <text>` explains the move on resume; an unknown host prints the resume line to run after exit.
+- `move units|showrunners "claude N"|default [--dry-run]`: selects the group account and requests shutdown’s pause-for-move protocol; members record `ready --where` before stopping, except shutdown’s idle usage-held owners and requester rules. The timer retries members still off target without duplicating open shutdowns. A preview prints the target and each off-target name/id, or `no live session moves`, and writes nothing; missing showrunner registrations print their repair command. An empty group still selects its account.
 - `role seats` shows the selection; `set-role seats "codex N"|default` selects future turns.
 - `swap seats "codex N"|default [--dry-run]` checks usage and moves every run at its next turn;
   working seats finish first. `default` selects `~/.codex`.

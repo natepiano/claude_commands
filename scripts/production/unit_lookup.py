@@ -290,6 +290,22 @@ def marked_units(slug: str) -> dict[str, MarkedUnit]:
     return found.units.get(slug, {})
 
 
+def tmux_claude(label: str) -> Claude:
+    """The live Claude in the tmux session named `label`, marked or not."""
+    claudes, _, unread = _claudes()
+    panes = next((panes for name, panes in tmux_sessions().values() if name == label), None)
+    if panes is None:
+        return ClaudeNotRunning()
+    live = [claudes[pane] for pane in panes if pane in claudes]
+    return live[0] if live else ClaudeUnknown(unread) if unread else ClaudeNotRunning()
+
+
+def unmark(target: str) -> None:
+    """Remove both marks from the tmux session `target` names."""
+    for name in (PRODUCTION_MARK, UNIT_MARK):
+        _ = _tmux("set-environment", "-u", "-t", target, name)
+
+
 def mark(target: str, slug: str, unit: str) -> None:
     """Mark the tmux session `target` names, or holds as a pane, as this unit of this production."""
     for name, value in ((PRODUCTION_MARK, slug), (UNIT_MARK, unit)):
