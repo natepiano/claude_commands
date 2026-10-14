@@ -122,7 +122,7 @@ Moved to unit `herdr-trust-unit`, run in parallel with Phase 5; shipped as `docs
 
 ### Phase 4 — Typing into and reading sessions on either host  · status: moved
 
-Moved to `docs/plans/build-followups-herdr-panes.md` (unit `herdr-panes-unit`), run in parallel with Phase 5. Phase 7 waits for it.
+Moved to unit `herdr-panes-unit`, run in parallel with Phase 5; shipped as `docs/as-built/herdr-adoption.md` → "Typing into and reading sessions on either host". Phase 7 waits for it.
 
 ### Phase 5 — Shutdown and restart for herdr sessions  · status: done
 
@@ -174,7 +174,7 @@ Moved to `docs/plans/build-followups-herdr-panes.md` (unit `herdr-panes-unit`), 
 
 ### Phase 7 — Units and child showrunners launch in herdr  · status: todo
 
-**Depends on:** Phase 6; the herdr-trust and herdr-panes units' phases landed on the production's merge branch (`docs/plans/build-followups-herdr-trust.md`, `docs/plans/build-followups-herdr-panes.md`); two-accounts-unit's `prepared_account` (Spec 7) and its Phase 17 landed before Spec 6
+**Depends on:** Phase 6; the herdr-trust and herdr-panes units' phases landed on the production's merge branch (`docs/plans/build-followups-herdr-trust.md`, `docs/as-built/herdr-adoption.md` → "Typing into and reading sessions on either host"); two-accounts-unit's `prepared_account` (Spec 7) and its Phase 17 landed before Spec 6
 
 **Blocked by:** the user's nixos rebuild with herdr installed on natedev and herdr servers in earlyoom's `--avoid` list (Spec 1).
 
