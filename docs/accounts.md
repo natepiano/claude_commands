@@ -151,6 +151,17 @@ Claude accounts have room until they have an unresolved provider refusal. Low an
 
 New units and showrunners save `@claude_config_dir` and `@claude_model` on tmux. A resume uses its group's configured account, and accepts `--account` or `--config-dir` only when it names that account. Promoting a unit uses the configured showrunners account; recovery as a unit uses the configured units account.
 
+## Adding an account
+
+One command adds an account and checks every place that names accounts:
+
+```text
+/new_account claude claude4
+/new_account codex codex3 <login>
+```
+
+Each step prints `done:` or `for you:`: the login, and the lines it cannot write itself (`~/.claude/settings.json`, the nixos shell aliases). Run it again after those; the run after a Claude login writes the account note from that login. Everything else finds accounts by their `~/.claudeN` or `~/.codexN` folder and their note.
+
 ## Setting up a new directory
 
 For claude 3, run inside a session:
