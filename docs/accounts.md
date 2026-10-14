@@ -2,7 +2,7 @@
 
 ## Which account am I on?
 
-The status line's second row shows this session's account label. To print it:
+The status line's first row shows this session's account label, after its role. To print it:
 
 ```sh
 ~/.claude/scripts/lib/py ~/.claude/scripts/whoami/account.py
