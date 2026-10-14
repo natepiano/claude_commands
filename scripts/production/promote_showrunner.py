@@ -180,7 +180,7 @@ def stop(promotion: Promotion) -> bool:
 
 def recorded_account_directory(marked: unit_lookup.MarkedUnit) -> Path:
     if isinstance(marked.place, unit_lookup.TmuxPlace):
-        held = _tmux("show-options", "-v", "-t", f"={marked.label}", "@claude_config_dir")
+        held = _tmux("show-options", "-v", "-t", f"={marked.label}:", "@claude_config_dir")
         if held.returncode != 0 or not held.stdout.strip():
             raise Refusal("no account recorded for this unit; resume with --account before promoting")
         directory = Path(held.stdout.strip()).expanduser()

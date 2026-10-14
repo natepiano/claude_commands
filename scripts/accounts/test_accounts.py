@@ -981,6 +981,27 @@ class AccountsTests(unittest.TestCase):
                                        accounts.AccountRoleBurn("claude 2", (), 10, 1),
                                        accounts.AccountRoleBurn("claude 3", (), 10, 1)])
 
+    def test_move_showrunners_names_a_timer_whose_session_is_not_running(self) -> None:
+        from importlib import import_module
+        # The modules move_showrunners imports by the paths it adds, as it finds them.
+        sys.path.insert(0, str(accounts.SCRIPTS / "shutdown"))
+        inventory = import_module("inventory")
+        stale = showrunners.Showrunner(session="", socket="", slug="remove-running-section", zone="America/New_York",
+                                       doc="/w/remove-running-section-production.md")
+        with (
+            patch.object(account, "named_claude_account", return_value=account.Account("claude", "main@example.invalid", "claude 2")),
+            patch.object(accounts, "_move_target", return_value=agent_accounts.KnownClaudeAccount("other@example.invalid", "claude 3")),
+            patch.object(inventory, "inventory", return_value={"machine": "natedev", "login": "main@example.invalid",
+                                                                 "label": "claude 2", "sessions": [], "unattributed": []}),
+            patch.object(inventory, "unregistered_showrunners", return_value=[stale]),
+        ):
+            refused = accounts.move_showrunners("claude 2", "claude 3")
+        self.assertIsInstance(refused, accounts.MoveRefused)
+        reason = cast(accounts.MoveRefused, refused).reason
+        self.assertEqual(reason.splitlines()[0], "no showrunner on claude 2 on this machine")
+        self.assertIn("remove-running-section: no session runs under the id its update timer names", reason)
+        self.assertIn("update_registration.py register --production /w/remove-running-section-production.md", reason)
+
     def test_burn_after_role_retirement_without_history_never_defaults_to_showrunners(self) -> None:
         self.login_directory("claude 2", "main@example.invalid", default=True)
         self.write_readings([accounts.QuotaReading(account="claude 2", at=stamp, remaining=left)

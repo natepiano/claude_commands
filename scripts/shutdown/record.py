@@ -367,6 +367,14 @@ class SessionShutdown(TypedDict):
     progress: SessionProgress
     stop_issues: list[SessionStopIssue]
     alerted_at: NotRequired[str]
+    # The phone push for a form open in the session's pane; the user is told once.
+    form_alerted_at: NotRequired[str]
+    # The one repeat of the pause message when no ready mark came back.
+    reasked_at: NotRequired[str]
+    # The not-back failure last pushed to the user, so an unchanged one is not pushed again.
+    restore_alerted: NotRequired[str]
+    # The last line a unit's showrunner was sent about this stop: "stopping", "back", or the not-back failure.
+    showrunner_told: NotRequired[str]
     # Absent means resume on session.config_dir, never on a changed role.
     target: NotRequired[str]
     source_label: NotRequired[str]
@@ -986,8 +994,12 @@ def _session_shutdown(value: object, place: str) -> SessionShutdown:
             raise InvalidRecord(f"{seat_place}.owner must identify this session")
         parsed_seats.append(parsed)
     values["seats"] = parsed_seats
-    if "alerted_at" in values:
-        _ = _utc_time(values["alerted_at"], f"{place}.alerted_at")
+    for field in ("alerted_at", "form_alerted_at", "reasked_at"):
+        if field in values:
+            _ = _utc_time(values[field], f"{place}.{field}")
+    for field in ("restore_alerted", "showrunner_told"):
+        if field in values:
+            _ = _string(values[field], f"{place}.{field}")
     return cast(SessionShutdown, cast(object, values))
 
 
