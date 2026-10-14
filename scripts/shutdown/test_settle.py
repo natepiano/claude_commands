@@ -21,6 +21,7 @@ from unittest.mock import Mock, call, patch
 
 from test_support import registry_confirmation, ShutdownSendLeaf, ShutdownTestCase
 import inventory
+from fake_herdr import CommandResponse
 import record
 import sessions
 from user_action import ActionRequired
@@ -265,7 +266,7 @@ class SettleTests(ShutdownTestCase):
             desktop=inventory.DesktopNotInSnapshot(kind="not in snapshot"))
         self.write_refusal_transcript(owner["session_id"])
         saved = session_shutdown(owner)
-        with patch.object(settle, "_screen", return_value=settle.ScreenUnreadable("no tmux host")):
+        with patch.object(settle, "_screen", return_value=settle.ScreenUnreadable("no pane host")):
             self.assertIsInstance(settle._usage_limit_change(saved, self.matching(saved)),  # pyright: ignore[reportPrivateUsage]
                 settle.EnterUsageLimitHold)
             owner["status"] = "busy"
@@ -282,7 +283,7 @@ class SettleTests(ShutdownTestCase):
             "window": "weekly", "reset": ""}))
         saved = session_shutdown(owner)
         other = session_shutdown(top_level("unrelated-owner", "Unrelated owner"))
-        with patch.object(settle, "_screen", return_value=settle.ScreenUnreadable("no tmux host")):
+        with patch.object(settle, "_screen", return_value=settle.ScreenUnreadable("no pane host")):
             self.assertIsInstance(settle._usage_limit_change(saved, self.matching(saved)),  # pyright: ignore[reportPrivateUsage]
                 settle.EnterUsageLimitHold)
             self.assertIsInstance(settle._usage_limit_change(other, self.matching(other)),  # pyright: ignore[reportPrivateUsage]
@@ -420,6 +421,39 @@ class SettleTests(ShutdownTestCase):
         assert latest is not None
         self.assertEqual(latest["progress"], {"kind": "waiting"})
 
+    def test_herdr_owner_screen_reads_its_named_pane_and_usage_limit(self) -> None:
+        owner = top_level("native", "Native")
+        owner["host"] = inventory.HerdrHost(kind="herdr", herdr_session="native-host", pane_id="w1:p2")
+        responses = self.root / "herdr-responses.json"
+        log = self.root / "herdr.jsonl"
+        command = ["--session", "native-host", "pane", "read", "w1:p2", "--source", "recent", "--lines", "60"]
+        response = CommandResponse(code=0, stdout="hit your usage limit\nEsc to cancel\n")
+        _ = responses.write_text(json.dumps({" ".join(command): response}))
+        with patch.dict(os.environ, {
+            "HERDR_BIN": str(Path(__file__).resolve().parents[1] / "herdr" / "fake_herdr.py"),
+            "FAKE_HERDR_LOG": str(log), "FAKE_HERDR_RESPONSES": str(responses),
+        }):
+            screen = settle._screen(owner)  # pyright: ignore[reportPrivateUsage]
+        self.assertEqual(screen, settle.ScreenText("hit your usage limit\nEsc to cancel\n"))
+        self.assertTrue(settle._held_by_usage_limit(screen))  # pyright: ignore[reportPrivateUsage]
+        self.assertEqual([json.loads(line) for line in log.read_text().splitlines()], [command])
+
+    def test_herdr_screen_failure_never_creates_a_usage_limit_hold(self) -> None:
+        owner = top_level("native", "Native")
+        owner["host"] = inventory.HerdrHost(kind="herdr", herdr_session="native-host", pane_id="w1:p2")
+        responses = self.root / "herdr-responses.json"
+        log = self.root / "herdr.jsonl"
+        response = CommandResponse(code=1, stdout="hit your weekly limit", stderr="pane unavailable")
+        _ = responses.write_text(json.dumps({"default": response}))
+        for binary in (Path(__file__).resolve().parents[1] / "herdr" / "fake_herdr.py", self.root / "absent-herdr"):
+            with self.subTest(binary=binary), patch.dict(os.environ, {
+                "HERDR_BIN": str(binary), "FAKE_HERDR_LOG": str(log),
+                "FAKE_HERDR_RESPONSES": str(responses),
+            }):
+                screen = settle._screen(owner)  # pyright: ignore[reportPrivateUsage]
+                self.assertEqual(screen, settle.ScreenUnreadable("capture failed"))
+                self.assertFalse(settle._held_by_usage_limit(screen))  # pyright: ignore[reportPrivateUsage]
+
     def test_unreadable_owner_screens_never_create_a_usage_limit_hold(self) -> None:
         owner = showrunner("owner", "Owner")
         for tmux, identity in (("", "owner"), ("shared:@2.%5", "another"), ("shared:@2", "owner"), ("shared:@2.%bad", "owner")):
@@ -443,7 +477,7 @@ class SettleTests(ShutdownTestCase):
         owner["host"] = inventory.WindowHost(kind="ghostty", window_shell=123,
             desktop=inventory.DesktopNotInSnapshot(kind="not in snapshot"))
         with patch.object(subprocess, "run") as capture:
-            self.assertEqual(settle._screen(owner), settle.ScreenUnreadable("no tmux host"))  # pyright: ignore[reportPrivateUsage]
+            self.assertEqual(settle._screen(owner), settle.ScreenUnreadable("no pane host"))  # pyright: ignore[reportPrivateUsage]
             self.assertFalse(settle._usage_limit_shown(owner))  # pyright: ignore[reportPrivateUsage]
         capture.assert_not_called()
 

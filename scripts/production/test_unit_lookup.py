@@ -89,7 +89,7 @@ class UnitLookupTests(unittest.TestCase):
         found = unit_lookup.marked_units("show")
         self.assertEqual(list(found), ["trunk-unit"])
         unit = found["trunk-unit"]
-        self.assertEqual((unit.pane, unit.label), ("%4", "renamed-since-launch"))
+        self.assertEqual((unit.place, unit.label), (unit_lookup.TmuxPlace("%4"), "renamed-since-launch"))
         assert isinstance(unit.claude, LiveClaude)
         self.assertEqual((unit.claude.name, unit.claude.session_id), ("renamed-since-launch", "id-renamed-since-launch"))
 
@@ -104,7 +104,7 @@ class UnitLookupTests(unittest.TestCase):
     def test_a_marked_session_with_no_claude_is_still_the_units_pane(self) -> None:
         fake_tmux.write(self.state, {"$1": marked("trunk", "%4", "trunk-unit")})
         unit = unit_lookup.marked_units("show")["trunk-unit"]
-        self.assertEqual(unit.pane, "%4")
+        self.assertEqual(unit.place, unit_lookup.TmuxPlace("%4"))
         self.assertIsInstance(unit.claude, ClaudeNotRunning)
 
     def test_an_unreadable_record_leaves_a_unit_without_a_match_unknown_not_stopped(self) -> None:
@@ -140,7 +140,7 @@ class UnitLookupTests(unittest.TestCase):
         self.assertEqual(sorted(found.units), ["other", "show"])
         self.assertEqual(found.faults, {"faulty": "tmux sessions copy-a and copy-b both carry the mark of dup-unit"})
         # A unit director's pane is the one its Claude runs in.
-        self.assertEqual(found.units["other"]["fps-unit"].pane, "%6")
+        self.assertEqual(found.units["other"]["fps-unit"].place, unit_lookup.TmuxPlace("%6"))
         self.assertIsInstance(found.units["show"]["trunk-unit"].claude, ClaudeNotRunning)
         self.assertEqual(list(unit_lookup.marked_units("other")), ["fps-unit"])
         with self.assertRaisesRegex(OSError, "both carry the mark of dup-unit"):
@@ -177,7 +177,7 @@ class UnitLookupTests(unittest.TestCase):
         found = unit_lookup.marked_units("show")
         self.assertEqual(list(found), ["trunk-unit"])
         unit = found["trunk-unit"]
-        self.assertEqual((unit.pane, unit.label, unit.place), ("", "native", herdr.HerdrPlace("native", "w1:p1")))
+        self.assertEqual((unit.label, unit.place), ("native", herdr.HerdrPlace("native", "w1:p1")))
         assert isinstance(unit.claude, LiveClaude)
         self.assertEqual(unit.claude.name, "current")
         self.assertEqual(self.run_script("pane", "show", "trunk-unit").stdout, "herdr:native:w1:p1\n")
@@ -229,8 +229,8 @@ class UnitLookupTests(unittest.TestCase):
         with self.assertRaisesRegex(OSError, "tmux session trunk and herdr session native both carry the mark of trunk-unit"):
             _ = unit_lookup.marked_units("show")
 
-    def test_a_tmux_place_is_kept_for_existing_unit_constructors(self) -> None:
-        unit = unit_lookup.MarkedUnit("u", "%41", "label", ClaudeNotRunning())
+    def test_a_unit_requires_its_host_place(self) -> None:
+        unit = unit_lookup.MarkedUnit("u", "label", ClaudeNotRunning(), unit_lookup.TmuxPlace("%41"))
         self.assertEqual(unit.place, unit_lookup.TmuxPlace("%41"))
         self.assertEqual(unit_lookup.place_text(unit.place), "%41")
 

@@ -19,13 +19,13 @@ from zoneinfo import ZoneInfo
 import add_unit
 import showrunners
 import unit_lookup
+from session_pane import HerdrFailure, read_place
 
 STATE_DIR = Path(os.environ.get("STALL_WATCH_STATE_DIR") or Path.home() / ".local/state/stall-watch")
 SESSIONS_DIR = Path(os.environ.get("NOTIFIER_SESSIONS_DIR") or Path.home() / ".claude/sessions")
 PROJECTS_DIR = Path(os.environ.get("STALL_WATCH_PROJECTS_DIR") or Path.home() / ".claude/projects")
 SESSIONS = Path(os.environ.get("STALL_WATCH_SESSIONS") or Path(__file__).resolve().parent.parent / "message/sessions.py")
 SEND = Path(os.environ.get("STALL_WATCH_SEND") or Path(__file__).resolve().parent.parent / "message/send.py")
-TMUX = os.environ.get("STALL_WATCH_TMUX") or "tmux"
 PS = os.environ.get("STALL_WATCH_PS") or "ps"
 WAITING_KINDS = ("done", "blocked", "gate", "decision")
 HOLDING_KIND = "holding"
@@ -208,8 +208,8 @@ def tick(now: float) -> None:
                     print(f"stall-watch: {name}: {claude.reason}", file=sys.stderr)
                 continue
             try:
-                pane = command_output([TMUX, "capture-pane", "-p", "-J", "-S", "-400", "-t", unit.pane])
-            except OSError as error:
+                pane = read_place(unit.place, 400, joined=True).strip()
+            except (OSError, HerdrFailure) as error:
                 print(f"stall-watch: {name}: {error}", file=sys.stderr)
                 continue
             pid, session_id, socket = claude.pid, claude.session_id, claude.socket

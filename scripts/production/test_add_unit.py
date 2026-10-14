@@ -24,6 +24,8 @@ import add_unit
 import conversation_pause
 import launch_permission
 import unit_lookup
+import session_pane
+from herdr import HerdrPlace
 from add_unit import cell_value, live_unit_table, plan_cell_is_retired, retired_units
 from scripts.accounts import accounts
 import usage_store
@@ -31,6 +33,7 @@ from test_support import ShutdownTestCase
 
 
 SCRIPT = Path(__file__).with_name("add_unit.py")
+MARKED_TMUX_PLACE = unit_lookup.TmuxPlace("%7")
 OLD_HEADER = ["## Units", "| Unit | Plan | Worktree | Branch | Session | Port | Owns |",
               "| --- | --- | --- | --- | --- | --- | --- |"]
 STUB = r'''#!/usr/bin/env python3
@@ -547,6 +550,7 @@ class AddUnitTests(ShutdownTestCase):
         claude: unit_lookup.Claude,
         *,
         already_marked: bool = True,
+        place: unit_lookup.Place = MARKED_TMUX_PLACE,
     ) -> tuple[int, str, list[list[str]], int, int]:
         request = add_unit.UnitLaunch(
             production=add_unit.read_production(self.doc),
@@ -561,7 +565,8 @@ class AddUnitTests(ShutdownTestCase):
             launch_kind=launch_kind,
             timeout=1.0,
         )
-        marked = unit_lookup.MarkedUnit("alpha-unit", "%7", "marked-tmux", claude)
+        label = place.session if isinstance(place, HerdrPlace) else "marked-tmux"
+        marked = unit_lookup.MarkedUnit("alpha-unit", label, claude, place)
         ready = add_unit.ReadyToLaunch(
             request,
             add_unit.NoUnitRow(),
@@ -702,6 +707,19 @@ class AddUnitTests(ShutdownTestCase):
         self.assertEqual(commands, [["tmux", "kill-session", "-t", "%7"]])
         self.assertEqual(launches, 1)
         self.assertEqual(writes, 1)
+
+    def test_restore_replaces_stopped_herdr_unit_by_name_without_tmux_commands(self) -> None:
+        launch_kind = add_unit.UnitRestoreLaunch(
+            "session-123", self.root / "restart-note", "recorded-name", "recorded-tmux"
+        )
+        with patch("herdr.stop_session") as stopped:
+            result, error, commands, launches, writes = self.run_with_marked_unit(
+                launch_kind, unit_lookup.ClaudeNotRunning(), place=HerdrPlace("native-unit", "w1:p1")
+            )
+        self.assertEqual(result, 0, error)
+        stopped.assert_called_once_with("native-unit")
+        self.assertEqual(commands, [])
+        self.assertEqual((launches, writes), (1, 1))
 
     def test_new_work_is_refused_while_account_is_down(self) -> None:
         self.write_shutdown_record(self.shutdown_record("down"))
@@ -1164,7 +1182,7 @@ class AddUnitTests(ShutdownTestCase):
 
         self.assertEqual(result, 2)
         self.assertIn(
-            "cannot tell whether Claude runs in tmux session marked-tmux: session registry unreadable",
+            "cannot tell whether Claude runs in session marked-tmux: session registry unreadable",
             error,
         )
         self.assertEqual(commands, [])
@@ -2158,6 +2176,25 @@ class AddUnitTests(ShutdownTestCase):
         self.assertEqual(set(has_targets), {"=alpha"})
         self.assertEqual(set(pane_targets), {"%1"})
 
+    def test_remote_control_polling_reads_each_host_through_its_place(self) -> None:
+        request = add_unit.UnitLaunch(
+            production=add_unit.read_production(self.doc), identity=add_unit.UnitIdentity("alpha-unit", "alpha"),
+            branch="build-followups-alpha", worktree=self.root / "project-alpha", plan=add_unit.Standby(),
+            port=add_unit.OmittedCell(), owns=add_unit.OmittedCell(), session=add_unit.NewSession(),
+            launch_kind=add_unit.NewWorkLaunch(), timeout=0,
+        )
+        for place in (unit_lookup.TmuxPlace("%1"), HerdrPlace("native", "w1:p1")):
+            with self.subTest(place=place):
+                marked = unit_lookup.MarkedUnit("alpha-unit", "label", unit_lookup.ClaudeNotRunning(), place)
+                with patch.object(add_unit, "launched_unit", return_value=add_unit.MarkedUnitFound(marked)), \
+                        patch.object(session_pane, "read_place", return_value="/remote-control is active") as read:
+                    self.assertEqual(add_unit.wait_for_remote_control(request, "unused-tmux"), marked)
+                read.assert_called_once_with(place)
+                with patch.object(add_unit, "launched_unit", return_value=add_unit.MarkedUnitFound(marked)), \
+                        patch.object(session_pane, "read_place", side_effect=session_pane.TmuxFailure("unreadable")):
+                    with self.assertRaisesRegex(RuntimeError, "did not become active\\nunreadable"):
+                        _ = add_unit.wait_for_remote_control(request, "unused-tmux")
+
     def test_underscore_name_and_checkout_without_trunk_suffix(self) -> None:
         renamed = self.root / "project"
         _ = self.checkout.rename(renamed)
@@ -2262,7 +2299,7 @@ class RetiredRowTests(ShutdownTestCase):
         return f"| `{unit}-unit` | {plan} | `{worktree}` | `branch` | `{unit}` (resumed elsewhere) | — | — |"
 
     def session(self, unit: str) -> unit_lookup.MarkedUnit:
-        return unit_lookup.MarkedUnit(unit, "%1", "any-label", unit_lookup.ClaudeNotRunning())
+        return unit_lookup.MarkedUnit(unit, "any-label", unit_lookup.ClaudeNotRunning(), unit_lookup.TmuxPlace("%1"))
 
     def retired(self, worktree: Path, *, gone: bool, plan: str = "`docs/plan.md`") -> tuple[bool, int]:
         """Whether the row is retired, and how many times tmux was asked."""

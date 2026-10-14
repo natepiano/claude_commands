@@ -33,6 +33,7 @@ Agents' test builds linked far more than the tests they ran, and the daily build
 5. `### Memory pressure`, always present: memory waits, the sccache, unsliced-step and memory-kill lines, the stall table and the sample line (`docs/as-built/buildlog-memory-stalls.md`, `docs/as-built/build-memory-admission.md`)
 6. `### Agent calls (verify.sh)`
 7. `### Test builds (temporary)`, only on a day with a measured `verify.sh test` call
+   - `### Power profile`, once any natedev sample carries a profile: the current profile, then like-with-like step timings before and after each profile change in the last 7 days (`docs/as-built/build-targets.md`, "What the reports read")
    - `Tests by target`, on a day with test calls, then `### Mac`: the Mac's steps by caller and kind, or `No steps recorded on the Mac.` (`docs/as-built/mac-test-offload.md`, "Build log and report")
 8. `### cargo-port calls (port-lint)`
 9. `### CI`
@@ -153,7 +154,7 @@ Measured by the buildlog disk job at 12:14 EDT: allocated blocks, each hard-link
 - Every inode counts once across all Disk rows, in `FOLDERS` order, through one shared `seen`; `other` is used minus the rows, clamped at zero.
 - `disk.json` stays at the log root beside `sync.json`. `buildlog sync` moves only `<host>/` and `ci/`, so the snapshot never reaches the Mac, and the Mac's report has no Disk section.
 - `report.py` keeps one style: `table()`, `seconds()`, `count()`, `gib()`. Times carry their zone, and their date when not today.
-- Nothing sits directly under a report table but its one `Source:` line, which carries any explanation of the table: the Waiting, both Rebuilds and both Tests per edit tables have that line, and so does any new table; every other table ends at the next blank line (Memory pressure and Test builds put their `Source:` line under the heading, above the table).
+- Nothing sits directly under a report table but its one `Source:` line, which carries any explanation of the table: the Waiting, both Rebuilds, the Power profile and both Tests per edit tables have that line, and so does any new table; every other table ends at the next blank line (Memory pressure and Test builds put their `Source:` line under the heading, above the table).
 - `rebuild_bin` and its edge constants are the one definition of rebuild bins; the labels derive from the edges, and code compares against the named labels, never a tuple index.
 - The test-builds table stays until the user calls the result settled.
 
