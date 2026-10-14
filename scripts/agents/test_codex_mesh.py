@@ -2735,6 +2735,9 @@ class MeshCommandTests(unittest.TestCase):
         self.assertEqual(agent_accounts.seats_home(), target)
 
     def assert_quota_continuation_after_move(self, held: tuple[str, ...]) -> None:
+        # This checks the handoff's ordering. Its many socket/file round trips must
+        # not race a five-second task deadline when the machine is busy.
+        self.start_args_timeout = 30.0
         target, new = self.prepare_seats_move()
         respond = self.server.respond
         def refuse(request: dict[str, object]) -> list[dict[str, object]] | None:
@@ -2884,6 +2887,16 @@ class MeshCommandTests(unittest.TestCase):
         self.assertEqual(len(failures), 1)
         self.assertEqual(failures[0]["move_id"], "resume-failure-move")
         self.assertIn("destination cannot restore thread", failures[0]["reason"])
+
+    def test_start_on_a_closed_ephemeral_port_fails_before_creating_a_thread(self) -> None:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
+            listener.bind(("127.0.0.1", 0))
+            port = cast(tuple[str, int], listener.getsockname())[1]
+        outcome = codex_mesh._run_delegate(self.start_args(), port)  # pyright: ignore[reportPrivateUsage]
+        self.assertIsInstance(outcome, codex_mesh.FailedBeforeThread)
+        assert isinstance(outcome, codex_mesh.FailedBeforeThread)
+        self.assertIn("refused", outcome.failure.lower())
+        self.assertEqual(self.methods("thread/start"), [])
 
     def test_refused_seat_without_queued_messages_continues_once_on_new_home(self) -> None:
         self.assert_quota_continuation_after_move(())

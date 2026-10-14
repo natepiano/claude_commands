@@ -841,6 +841,18 @@ def _registered_productions() -> tuple[dict[str, ProductionSession], list[showru
     return found, runners
 
 
+def unregistered_showrunners() -> list[showrunners.Showrunner]:
+    """Each production whose update timer names a session that is not running.
+
+    A showrunner is known only by the session its timer names, so one running under another id
+    without registering reads as a plain session. Empty when the session records cannot be read.
+    """
+    try:
+        return [runner for runner in showrunners.registered_showrunners(_notifier_state_dir()) if not runner["session"]]
+    except OSError:
+        return []
+
+
 def _unit_sessions(runners: list[showrunners.Showrunner]) -> dict[str, UnitMarks]:
     """Each running unit director of a registered production, by session id.
 

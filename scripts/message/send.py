@@ -179,6 +179,12 @@ class FailedPush:
     action: UserAction
     body: str
     hold: RevisionHold = NO_HELD_REVISION
+    reviewed: bool = False
+    need: Need = "note"
+
+    @property
+    def fallback_allowed(self) -> bool:
+        return self.reviewed or self.need == "blocked"
 
     @property
     def message(self) -> str:
@@ -217,6 +223,22 @@ class FailedPushRecord(ReviewedPushRecord):
     time: float
     message: str
     fallback: str
+    reviewed: bool
+    need: Need
+
+
+class FailedPushTransportRecord(ReviewedPushRecord):
+    reviewed: bool
+    need: Need
+
+
+UNREVIEWED_FALLBACK = ("This push was never reviewed, so it cannot go out as a fallback. "
+    "Bring it to the user in your reply, or resend it with send.py once the failure is fixed.")
+
+
+def failure_detail(reason: str, failed: FailedPush) -> str:
+    reason = reason.partition(" fallback text:")[0].partition(" " + UNREVIEWED_FALLBACK)[0]
+    return reason + (" fallback text:\n" + failed.text if failed.fallback_allowed else " " + UNREVIEWED_FALLBACK)
 
 
 class Result(NamedTuple):
@@ -895,7 +917,8 @@ def action_arguments(action: UserAction) -> list[str]:
 
 
 def reviewed_failure(stdout: str, original: FailedPush, *,
-                     prefix: str = "pushover: reviewed JSON: ", machine: str = "") -> FailedPush:
+                     prefix: str = "pushover: reviewed JSON: ", machine: str = "",
+                     remote_record: bool = False) -> FailedPush:
     for line in stdout.splitlines():
         if not line.startswith(prefix):
             continue
@@ -908,7 +931,11 @@ def reviewed_failure(stdout: str, original: FailedPush, *,
             hold: RevisionHold = (HeldRevision(source, identity, machine)
                                   if isinstance(source, str) and source and isinstance(identity, str) and identity
                                   else NO_HELD_REVISION)
-            return FailedPush(title, action, body, hold)
+            reviewed = record.get("reviewed") is True if remote_record else True
+            need = record.get("need") if remote_record else original.need
+            if need not in ("note", "decision", "blocked"):
+                need = original.need
+            return FailedPush(title, action, body, hold, reviewed=reviewed, need=need)
         return original
     return original
 
@@ -929,8 +956,8 @@ def user(message: Message, need: Need, action: UserAction, timeout: float, *, an
     why = one_line(err or out) or ("timed out" if code is None else f"exit {code}")
     if code == 2 and f"{REFUSED_BEFORE_SENDING}:" in err:
         return Result("refused", why)
-    failed = reviewed_failure(out, FailedPush(message.summary, action, message.text))
-    return Result("failed", f"the user was not reached: {why} fallback text:\n{failed.text}", failed)
+    failed = reviewed_failure(out, FailedPush(message.summary, action, message.text, need=need))
+    return Result("failed", failure_detail(f"the user was not reached: {why}", failed), failed)
 
 
 def remote(message: Message, host: str, options: Options) -> Result:
@@ -952,22 +979,22 @@ def remote(message: Message, host: str, options: Options) -> Result:
         forwarded += ["--repeat-minutes", f"{options.repeat_minutes:g}"]
     command = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", host, f"{'CLAUDE_PID= ' if message.to == USER else ''}{REMOTE} {shlex.join(forwarded)}"]
     code, out, err = run(command, message.text, options.timeout + KILL_GRACE + 30)
+    failure: FailureText = NO_FAILED_PUSH
+    if message.to == USER and "send.py: failed push JSON: " in err:
+        if isinstance(options.action, NoUserRecipient):
+            raise AssertionError("a user message must state its action")
+        failure = reviewed_failure(err, FailedPush(message.summary, options.action, message.text, need=options.need),
+                                   prefix="send.py: failed push JSON: ", machine=host, remote_record=True)
     lines = out.removesuffix("\n").split("\n")
     headers = [(index, line.partition(": ")) for index, line in enumerate(lines)
                if line.partition(": ")[0] in ("SENT", "HELD", "SKIPPED", "QUEUED", "FAILED", "REFUSED", "REPLACED")]
     if not headers:
         why = one_line(err or out) or ("timed out" if code is None else f"exit {code}")
-        return Result("failed", f"ssh {host}: {why}")
+        return Result("failed", f"ssh {host}: {why}", failure)
     index, (word, _, detail) = headers[0]
     payload = "\n".join(lines[index + 1:])
     if payload:
         detail += "\n" + payload
-    failure: FailureText = NO_FAILED_PUSH
-    if word == "FAILED" and message.to == USER and "send.py: failed push JSON: " in err:
-        if isinstance(options.action, NoUserRecipient):
-            raise AssertionError("a user message must state its action")
-        failure = reviewed_failure(err, FailedPush(message.summary, options.action, message.text),
-                                   prefix="send.py: failed push JSON: ", machine=host)
     return Result(cast(Outcome, word.lower()), f"on {host}: {detail}", failure)
 
 
@@ -976,14 +1003,13 @@ def remote(message: Message, host: str, options: Options) -> Result:
 # ---------------------------------------------------------------------------
 
 
-def user_failure(message: Message, action: MessageUserAction, result: Result) -> Result:
+def user_failure(message: Message, action: MessageUserAction, result: Result, need: Need) -> Result:
     if isinstance(action, NoUserRecipient):
         raise AssertionError("a user message must state its action")
     failed = result.failure
     if isinstance(failed, NoFailedPush):
-        failed = FailedPush(message.summary, action, message.text)
-    reason, _, _ = result.detail.partition(" fallback text:")
-    result = Result("failed", reason + " fallback text:\n" + failed.text, failed)
+        failed = FailedPush(message.summary, action, message.text, need=need)
+    result = Result("failed", failure_detail(result.detail, failed), failed)
     try:
         pid = os.environ.get("CLAUDE_PID", "")
         if not pid:
@@ -993,7 +1019,8 @@ def user_failure(message: Message, action: MessageUserAction, result: Result) ->
         if session_id and Path(session_id).name == session_id and session_id not in (".", ".."):
             entry: FailedPushRecord = {"time": time.time(), "title": failed.title,
                 "action": failed.action.text if isinstance(failed.action, ActionRequired) else None,
-                "body": failed.body, "message": failed.message, "fallback": failed.text}
+                "body": failed.body, "message": failed.message, "fallback": failed.text,
+                "reviewed": failed.reviewed, "need": failed.need}
             if isinstance(failed.hold, HeldRevision):
                 entry["held_source"] = failed.hold.source
                 entry["held_identity"] = failed.hold.identity
@@ -1241,7 +1268,7 @@ def send(options: Options) -> Result:
         for recipient in dict.fromkeys((message.to, options.to)):
             _ = remove_queued_key(recipient, message.key)
     if message.to == USER and result.outcome == "failed":
-        result = user_failure(message, options.action, result)
+        result = user_failure(message, options.action, result, options.need)
     log(message, result, started, log_route)
     return result
 
@@ -1270,9 +1297,9 @@ def main(argv: list[str]) -> int:
             print(f"{result.outcome.upper()}: {result.detail}")
             if isinstance(result.failure, FailedPush):
                 failed = result.failure
-                record: ReviewedPushRecord = {"title": failed.title,
+                record: FailedPushTransportRecord = {"title": failed.title,
                     "action": failed.action.text if isinstance(failed.action, ActionRequired) else None,
-                    "body": failed.body}
+                    "body": failed.body, "reviewed": failed.reviewed, "need": failed.need}
                 if isinstance(failed.hold, HeldRevision):
                     record["held_source"] = failed.hold.source
                     record["held_identity"] = failed.hold.identity

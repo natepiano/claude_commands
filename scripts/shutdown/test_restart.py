@@ -31,6 +31,8 @@ from fake_herdr import CommandResponse
 import conversation_pause
 import settle
 import showrunner_footer
+# The module settle imports by its own path entry: a separate object from the package import below.
+import showrunners as settle_showrunners
 import shutdown
 import account as account_reader
 from scripts.accounts import moves
@@ -243,6 +245,7 @@ def setUpModule() -> None:
     unittest.enterModuleContext(patch.dict(os.environ, {"USER_ZONE": "America/Los_Angeles"}))
     root = Path(unittest.enterModuleContext(tempfile.TemporaryDirectory()))
     _ = unittest.enterModuleContext(patch.object(showrunners, "NOTIFIER_STATE_DIR", root))
+    _ = unittest.enterModuleContext(patch.object(settle_showrunners, "NOTIFIER_STATE_DIR", root))
 
 
 @final
@@ -353,6 +356,80 @@ class RestartTests(ShutdownTestCase):
         assert item["kind"] == "failed"
         self.assertEqual(item["move_id"], saved["request_id"])
         self.assertIn("not live", item["reason"])
+
+    def hand_restart_record(self, identity: str = "moved-owner") -> SessionShutdown:
+        saved = self.moved_record(identity)
+        progress: SessionProgress = record.SessionNeedsManualRestart(kind="manual restart", command="add_unit.py --resume moved-owner")
+        _ = record.update_session(LOGIN, saved["session"]["session_id"], lambda current: current.update(progress=progress))
+        return self.stored_record()
+
+    def running_on(self, saved: SessionShutdown, directory: Path) -> list[sessions.SessionRecord]:
+        owner = saved["session"]
+        _ = self.enterContext(patch.object(account_reader, "process_config_dir", return_value=directory))
+        return [sessions.SessionRecord(pid=owner["pid"], sessionId=owner["session_id"],
+            name=owner["name"], messagingSocketPath="", updatedAt=1, tmux="", formerNames=[])]
+
+    def test_session_relaunched_by_hand_on_its_target_is_never_reported_not_back(self) -> None:
+        saved = self.hand_restart_record()
+        live = self.running_on(saved, self.root / ".claude3")
+        with (patch.object(sessions, "live_sessions", return_value=live),
+              patch.object(settle, "run_remote", return_value=(0, "[]")),
+              patch.object(settle, "send_message") as sender, patch.object(settle, "alert_user") as alert):
+            settle.report_stop([saved])
+        alert.assert_not_called()
+        sender.assert_not_called()
+        self.assertEqual(record.session_records(LOGIN), [])
+        self.assertEqual([item["kind"] for item in moves.read_moves()], ["confirmed"])
+
+    def test_status_and_restart_finish_a_session_relaunched_by_hand_on_its_target(self) -> None:
+        for command in ("status", "restart"):
+            with self.subTest(command=command):
+                saved = self.hand_restart_record(command + "-owner")
+                live = self.running_on(saved, self.root / ".claude3")
+                output = io.StringIO()
+                with (patch.object(sessions, "live_sessions", return_value=live),
+                      patch.object(restart, "relaunch_session") as relaunch, redirect_stdout(output)):
+                    if command == "status":
+                        outcome = shutdown._local_shutdown_records(LOGIN, "natedev")  # pyright: ignore[reportPrivateUsage]
+                        self.assertEqual(outcome, {"kind": "records", "records": []})
+                    else:
+                        _ = restart._up(LOGIN, False)  # pyright: ignore[reportPrivateUsage]
+                        self.assertIn("restart-owner is already running on claude 3", output.getvalue())
+                relaunch.assert_not_called()
+                self.assertEqual(record.session_records(LOGIN), [])
+
+    def test_cancel_finishes_a_session_relaunched_by_hand_on_its_target(self) -> None:
+        saved = self.hand_restart_record("cancel-owner")
+        live = self.running_on(saved, self.root / ".claude3")
+        output = io.StringIO()
+        with (patch.object(sessions, "live_sessions", return_value=live),
+              patch.object(settle, "run_remote", return_value=(0, "")), redirect_stdout(output)):
+            _ = settle.cancel(self.account, True, only=[saved["session"]["session_id"]])
+        self.assertIn("cancel-owner is already running on claude 3; its shutdown is finished", output.getvalue())
+        self.assertNotIn("was not cancelled", output.getvalue())
+        self.assertEqual(record.session_records(LOGIN), [])
+
+    def test_session_running_on_its_source_account_stays_not_back(self) -> None:
+        saved = self.hand_restart_record()
+        live = self.running_on(saved, self.root / ".claude2")
+        with patch.object(sessions, "live_sessions", return_value=live):
+            checked = restart.clear_running_on_target([saved])
+        self.assertEqual((checked.remaining, checked.finished), ([saved], []))
+        self.assertEqual(self.stored_record(), saved)
+
+    def test_unchanged_not_back_failure_is_pushed_once(self) -> None:
+        saved = self.hand_restart_record()
+        with (patch.object(sessions, "live_sessions", return_value=[]),
+              patch.object(settle, "run_remote", return_value=(0, "[]")),
+              patch.object(settle, "send_message"), patch.object(settle, "alert_user") as alert):
+            settle.report_stop([saved])
+            settle.report_stop([self.stored_record()])
+            alert.assert_called_once()
+            progress: SessionProgress = record.SessionRestartFailed(kind="restart failed", at=RESTARTED, reason="window failed to open")
+            _ = record.update_session(LOGIN, saved["session"]["session_id"], lambda current: current.update(progress=progress))
+            settle.report_stop([self.stored_record()])
+        self.assertEqual(alert.call_count, 2)
+        self.assertIn("window failed to open", cast(str, alert.call_args.args[1]))
 
     def test_default_target_process_confirms_main_directory_and_removes_assumption(self) -> None:
         saved = entry(top_level("default-target", host=tmux_host("default-target")))
@@ -1054,6 +1131,45 @@ class RestartTests(ShutdownTestCase):
         argv = next((shlex.split(line) for line in output.getvalue().splitlines() if 'add_unit.py' in line))
         self.assertEqual(argv[argv.index('--plan') + 1], 'docs/as-built/tables.md')
 
+    def test_standby_unit_without_a_run_record_resumes_with_standby(self) -> None:
+        doc = self.root / 'production.md'
+        _ = doc.write_text('\n'.join(['# Demo', '', '## Units', '', '| Unit | Plan | Worktree | Branch | Port | Owns |', '| --- | --- | --- | --- | --- | --- |', '| gate-unit | standby | /w/gate | demo-gate | — | — |', '']), encoding='utf-8')
+        moved = entry(unit('gate', doc=str(doc), plan=inventory.NoRunRecord(kind='no run record')))
+        self.create(records_for_test([moved]))
+        output = io.StringIO()
+        with patch.object(restart, '_live_session_ids', return_value=frozenset()), patch.object(settle, 'record_time', return_value=RESTARTED), redirect_stdout(output):
+            self.assertEqual(restart.up(LOGIN, dry_run=True), 0)
+        self.assertNotIn('manual restart', output.getvalue())
+        argv = next((shlex.split(line) for line in output.getvalue().splitlines() if 'add_unit.py' in line))
+        self.assertIn('--standby', argv)
+        self.assertNotIn('--plan', argv)
+
+    def test_brief_unit_without_a_run_record_resumes_with_its_stub_plan(self) -> None:
+        doc = self.root / 'production.md'
+        _ = doc.write_text('\n'.join(['# Demo', '', '## Units', '', '| Unit | Plan | Worktree | Branch | Port | Owns |', '| --- | --- | --- | --- | --- | --- |', '| notes-unit | docs/plans/demo-notes.md | /w/notes | demo-notes | — | — |', '']), encoding='utf-8')
+        moved = entry(unit('notes', doc=str(doc), plan=inventory.NoRunRecord(kind='no run record')))
+        self.create(records_for_test([moved]))
+        output = io.StringIO()
+        with patch.object(restart, '_live_session_ids', return_value=frozenset()), patch.object(settle, 'record_time', return_value=RESTARTED), redirect_stdout(output):
+            self.assertEqual(restart.up(LOGIN, dry_run=True), 0)
+        self.assertNotIn('manual restart', output.getvalue())
+        argv = next((shlex.split(line) for line in output.getvalue().splitlines() if 'add_unit.py' in line))
+        self.assertEqual(argv[argv.index('--plan') + 1], 'docs/plans/demo-notes.md')
+        self.assertNotIn('<plan>', argv)
+
+    def test_unit_with_no_row_plan_and_no_run_record_is_refused_with_its_reason(self) -> None:
+        doc = self.root / 'production.md'
+        _ = doc.write_text('# Demo\n\n## Units\n', encoding='utf-8')
+        moved = entry(unit('lost', doc=str(doc), plan=inventory.NoRunRecord(kind='no run record')))
+        with self.assertRaisesRegex(restart.NoUnitPlan, 'no Plan in the Units table'):
+            _ = restart._unit_argv(moved)  # pyright: ignore[reportPrivateUsage]
+        self.create(records_for_test([moved]))
+        output = io.StringIO()
+        with patch.object(restart, '_live_session_ids', return_value=frozenset()), patch.object(settle, 'record_time', return_value=RESTARTED), redirect_stdout(output):
+            _ = restart.up(LOGIN, dry_run=True)
+        self.assertIn('cannot restart', output.getvalue())
+        self.assertNotIn('add_unit.py', output.getvalue())
+
     def test_dry_run_without_target_keeps_recorded_dir_for_every_host(self) -> None:
         config_dir = str(self.root / "account with 'quotes' and $()")
         restored_entries = [entry(showrunner('named-showrunner')), entry(top_level('named-tmux', host=tmux_host('named-tmux-host'))), entry(top_level('named-terminal', host=inventory.TerminalHost(kind='terminal'))), entry(top_level('named-window', host=inventory.WindowHost(kind='ghostty', window_shell=10, desktop=inventory.DesktopNotInSnapshot(kind='not in snapshot')))), entry(top_level('named-manual')), entry(unit('named-unit'))]
@@ -1634,16 +1750,28 @@ class RestartTests(ShutdownTestCase):
         threads: set[int] = set()
         lock = threading.Lock()
         launches_in_flight = threading.Barrier(6, timeout=10)
+        launches: list[str] = []
 
-        def launch(_record: SessionShutdown, _note: str, _state: restart.DesktopLaunchState, *, dry_run: bool) -> restart.SessionLaunched:
+        def run(argv: list[str], *, dry_run: bool, check: bool = True) -> subprocess.CompletedProcess[str]:
+            del check
             self.assertFalse(dry_run)
+            self.assertEqual(argv[:2], ["tmux", "new-session"])
             with lock:
                 threads.add(threading.get_ident())
+                launches.append(argv[argv.index("-s") + 1])
             _ = launches_in_flight.wait()
-            return restart.SessionLaunched()
+            return subprocess.CompletedProcess(argv, 0, "", "")
 
-        with patch.object(restart, "_retire"), patch.object(restart, "_live_session_ids", return_value=frozenset()), patch.object(restart, "_launch_session", launch), patch.object(restart, "wait_for_confirmation", side_effect=self.all_sessions_live), redirect_stdout(io.StringIO()):
+        def confirm(ids: frozenset[str], timeout: float) -> restart.RegistryConfirmation:
+            self.assertCountEqual(launches, [str(index) for index in range(6)])
+            return self.all_sessions_live(ids, timeout)
+
+        missing = subprocess.CompletedProcess(["tmux"], 1, "", "")
+        with patch.object(restart, "_retire"), patch.object(restart, "_live_session_ids", return_value=frozenset()), patch.object(restart, "_run", run), patch.object(restart, "_probe", return_value=missing) as probing, patch.object(restart, "_record_scheduled_restart_prompt"), patch.object(restart, "wait_for_confirmation", side_effect=confirm), patch.object(time, "sleep") as sleeping, redirect_stdout(io.StringIO()):
             self.assertEqual(restart.up(LOGIN), 0)
+        self.assertEqual(probing.call_count, 6)
+        sleeping.assert_not_called()
+        self.assertCountEqual(launches, [str(index) for index in range(6)])
         self.assertEqual(restart.RESTART_LAUNCH_WORKERS, 6)
         self.assertEqual(len(threads), 6)
         self.assertNotIn(threading.get_ident(), threads)

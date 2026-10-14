@@ -34,6 +34,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "whoami"))
 import account
 import agent_accounts
 import quota_alert
+from scripts.accounts.accounts import CodexSeatsAccount
 
 
 SCRIPT = Path(__file__).with_name("waiting.py")
@@ -159,6 +160,8 @@ class WaitingTests(unittest.TestCase):
             "default": CommandResponse(stdout="", code=1),
         }))
         self.enterContext(mock.patch.dict(os.environ, {
+            "HOME": str(home),
+            "CODEX_HOME": str(home / "codex-fixture"),
             "UNIT_LOOKUP_TMUX": str(Path(__file__).with_name("fake_tmux.py")),
             "FAKE_TMUX_STATE": str(self.root / "tmux.json"),
             "NOTIFIER_SESSIONS_DIR": str(self.root / "sessions"),
@@ -167,6 +170,8 @@ class WaitingTests(unittest.TestCase):
             "FAKE_HERDR_LOG": str(self.root / "herdr.jsonl"),
             "FAKE_HERDR_RESPONSES": str(self.root / "herdr-responses.json"),
             "SHOWRUNNERS_CONFIG": str(self.root / "showrunners.json")}))
+        _ = self.enterContext(mock.patch.object(quota_alert, "seats_home", side_effect=AssertionError(
+            "quota tests must supply Codex readings instead of resolving a live home")))
         self.write(self.root / "tmux.json", json.dumps({
             f"${index}": {"label": "any-label", "panes": [f"%{index}"],
                           "env": {"SHOWRUNNER_UNIT": "example", "SHOWRUNNER_UNIT_ID": unit}}
@@ -454,7 +459,13 @@ class WaitingTests(unittest.TestCase):
             "faults_to": "showrunner-example",
             "always": [],
         }
-        return quota_alert.message(note, [], config, selection=selection)
+        home = self.root / "codex-fixture"
+        readings = quota_alert.CodexAlertPassReadings(
+            CodexSeatsAccount("default", home),
+            agent_accounts.KnownCodexAccount(home, "codex@example.invalid", note.path.stem),
+            (),
+        )
+        return quota_alert.message(note, [], config, selection=selection, codex_readings=readings)
 
     def acknowledgement_message(self, account: str) -> str:
         state_path = self.root / "quota-alert-state.json"
@@ -898,7 +909,7 @@ os.execv(os.environ["WAITING_TEST_REAL_GIT"], [os.environ["WAITING_TEST_REAL_GIT
         self.assertEqual(waiting.eta_moment(eta_text, report_at), waiting.EtaOnLog(eta))
 
     def test_log_timeline_spans_two_midnights_for_waits_and_first_phase(self) -> None:
-        now = datetime.now(ZoneInfo("America/Los_Angeles"))
+        now = datetime.now(ZoneInfo("America/Los_Angeles")).replace(second=0, microsecond=0)
         moments = [now - timedelta(hours=hours) for hours in (50, 40, 26, 14, 2)]
         start = moments[0]
         lines = [
@@ -910,12 +921,14 @@ os.execv(os.environ["WAITING_TEST_REAL_GIT"], [os.environ["WAITING_TEST_REAL_GIT
             "",
         ]
         self.write(self.log, "\n".join(lines))
-        waits = self.run_waiting("waits")
-        self.assertEqual(waits.returncode, 0, waits.stdout + waits.stderr)
-        found = re.search(r"open (\d+) minutes", waits.stdout)
-        self.assertIsNotNone(found, waits.stdout)
+        output = io.StringIO()
+        clock = mock.Mock(wraps=datetime, now=mock.Mock(return_value=now))
+        with mock.patch.dict(os.environ, self.env), mock.patch.object(waiting, "datetime", clock), redirect_stdout(output):
+            waiting.waits(add_unit.read_production(self.doc))
+        found = re.search(r"open (\d+) minutes", output.getvalue())
+        self.assertIsNotNone(found, output.getvalue())
         age = int(found.group(1)) if found else 0
-        self.assertLessEqual(abs(age - 3000), 2)
+        self.assertEqual(age, 3000)
         agenda = self.run_waiting("agenda", "--state-dir", str(self.state))
         self.assertEqual(agenda.returncode, 0, agenda.stdout + agenda.stderr)
         self.assertIn(f"{ALPHA}|{PHASE_IDENTITY}", agenda.stdout)

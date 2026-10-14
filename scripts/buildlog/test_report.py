@@ -6,24 +6,22 @@ from __future__ import annotations
 import json
 import os
 import resource
-import subprocess
 import sqlite3
+import subprocess
 import sys
 import tempfile
 import time
 import unittest
-from collections.abc import Callable
 from contextlib import closing
-from dataclasses import FrozenInstanceError
+from dataclasses import FrozenInstanceError, dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import cast, override
+from typing import TypedDict, cast, override
 from unittest import mock
 
 import disk
 import ci
 import index
-import launches
 import mac_outcome
 import report
 import holds
@@ -34,39 +32,72 @@ from test_holds import timed_hold_events, write_holder, write_mac_block
 from test_index import COORDINATION_VARIABLES, STAMP, Record, call, ci_job, ci_run, encode, local_day, point_root_at, sample, step
 
 
-def section_seconds(connection: sqlite3.Connection, day: str) -> dict[str, float]:
-    found = report.kinds(connection, day)
-    elapsed: dict[str, float] = {}
-    began = time.perf_counter()
-    calls = report.reported_mac_calls(connection, day)
-    elapsed["test calls"] = time.perf_counter() - began
-    began = time.perf_counter()
-    waits = report.daily_waits(connection, day)
-    elapsed["wait data"] = time.perf_counter() - began
-    sections: dict[str, Callable[[], object]] = {
-        "Waiting": lambda: report.waiting_lines(waits),
-        "Rebuilds": lambda: report.rebuilds_section(connection, day),
-        "step tables": lambda: [report.kind_section(connection, day, kind, 1) for kind in found],
-        "Memory pressure": lambda: report.memory_pressure_section(connection, day, 1),
-        "Agent calls": lambda: report.calls_section(connection, day),
-        "Test builds": lambda: report.test_builds_section(connection, day),
-        "Tests by target": lambda: report.tests_by_target_lines(calls),
-        "Mac": lambda: report.mac_section(connection, day),
-        "cargo-port": lambda: report.port_lint_section(connection, day),
-        "CI": lambda: report.ci_section(connection, day),
-        "Tests per edit": lambda: report.tests_per_edit_section(connection, day),
-        "call trees": lambda: report.call_trees(connection, day),
-        "Disk": report.disk_section,
-        "summaries": lambda: [report.summary(connection, day, found, which, with_failed)
-                              for _, which, with_failed in report.SUMMARIES],
-        "lead block": lambda: report.lead_block(connection, day, calls, waits),
-        "report body": lambda: report.report(connection, day),
+class CliWork(TypedDict):
+    cpu_seconds: float
+    statements: int
+    step_reads: int
+    instructions: int
+    index_updates: int
+    launch_collections: int
+
+
+@dataclass(frozen=True)
+class MeasuredCliRun:
+    result: subprocess.CompletedProcess[str]
+    work: CliWork
+
+
+def probe_cli() -> None:
+    """Instrument the real CLI entry point, including its preparation work."""
+    import cli
+    import launches
+
+    statements: list[str] = []
+    instruction_batches = 0
+    instruction_limit = int(os.environ["BUILDLOG_TEST_INSTRUCTION_LIMIT"])
+    read_only = index.read_only
+
+    def count_instructions() -> int:
+        nonlocal instruction_batches
+        instruction_batches += 1
+        # Stop pathological plans by work count rather than waiting for a timeout.
+        return int(instruction_batches * 1000 > instruction_limit)
+
+    def traced_read_only() -> sqlite3.Connection:
+        connection = read_only()
+        connection.set_trace_callback(statements.append)
+        connection.set_progress_handler(count_instructions, 1000)
+        return connection
+
+    before = resource.getrusage(resource.RUSAGE_CHILDREN)
+    began = time.process_time()
+    with mock.patch.object(index, "read_only", traced_read_only), mock.patch.object(index, "update", wraps=index.update) as updating, mock.patch.object(launches, "collect", wraps=launches.collect) as collecting:
+        status = cli.main(sys.argv[1:])
+    after = resource.getrusage(resource.RUSAGE_CHILDREN)
+    work: CliWork = {
+        "cpu_seconds": time.process_time() - began + after.ru_utime + after.ru_stime - before.ru_utime - before.ru_stime,
+        "statements": len(statements),
+        "step_reads": sum("JOIN steps" in sql or "FROM steps" in sql for sql in statements),
+        "instructions": instruction_batches * 1000,
+        "index_updates": updating.call_count,
+        "launch_collections": collecting.call_count,
     }
-    for name, render in sections.items():
-        began = time.perf_counter()
-        _ = render()
-        elapsed[name] = time.perf_counter() - began
-    return elapsed
+    print("CLI_WORK=" + json.dumps(work), file=sys.stderr)
+    raise SystemExit(status)
+
+
+def measure_cli_work(command: str, environment: dict[str, str], row_count: int) -> MeasuredCliRun:
+    # Importing test_index installs its own paths; restore this fixture afterwards.
+    result = subprocess.run(
+        [sys.executable, "-c", "import os; environment = dict(os.environ); from test_report import probe_cli; os.environ.update(environment); probe_cli()", command],
+        cwd=Path(__file__).resolve().parents[2],
+        env={**environment, "PYTHONPATH": str(Path(__file__).resolve().parent), "BUILDLOG_TEST_INSTRUCTION_LIMIT": str(row_count * 500)},
+        capture_output=True, text=True, check=False, timeout=120,
+    )
+    if result.returncode != 0:
+        raise AssertionError(f"CLI failed: {result.stderr}\n{result.stdout}")
+    metrics = next(line.removeprefix("CLI_WORK=") for line in result.stderr.splitlines() if line.startswith("CLI_WORK="))
+    return MeasuredCliRun(result, cast(CliWork, json.loads(metrics)))
 
 
 def setUpModule() -> None:
@@ -112,7 +143,7 @@ class ReportSpeedTests(unittest.TestCase):
                 self.assertIn("| Mac ran | Mac passed | Mac failed |", result.stdout)
                 print(result.stdout, flush=True)
 
-    def test_report_at_the_live_index_size_finishes_in_two_seconds(self) -> None:
+    def test_report_cli_work_grows_near_linearly_at_the_live_index_size(self) -> None:
         self.addCleanup(time.tzset)
         with tempfile.TemporaryDirectory(prefix="buildlog-report-") as temporary:
             root = Path(temporary) / "buildlog"
@@ -121,7 +152,6 @@ class ReportSpeedTests(unittest.TestCase):
                            "BUILDLOG_TRANSCRIPTS": str(transcripts), "TZ": "America/Los_Angeles", "USER_ZONE": "America/Los_Angeles"}
             with mock.patch.dict(os.environ, environment):
                 time.tzset()
-                day = datetime.now().date().isoformat()
                 midnight = datetime.combine(datetime.now().date(), datetime.min.time()).astimezone(UTC)
                 path = root / "natedev" / "timing.jsonl"
                 path.parent.mkdir(parents=True)
@@ -154,30 +184,28 @@ class ReportSpeedTests(unittest.TestCase):
                     for hold_row in hold_rows:
                         _ = output.write(encode(hold_row))
                 self.assertEqual(index.update(), 29_138 + 36_462 + len(hold_rows))
-                usage_before = resource.getrusage(resource.RUSAGE_CHILDREN)
-                began = time.perf_counter()
-                result = subprocess.run(
-                    [sys.executable, "scripts/buildlog/cli.py", "report"],
-                    cwd=Path(__file__).resolve().parents[2], env=environment,
-                    capture_output=True, text=True, check=False,
-                )
-                elapsed = time.perf_counter() - began
-                usage_after = resource.getrusage(resource.RUSAGE_CHILDREN)
-                cpu_seconds = usage_after.ru_utime + usage_after.ru_stime - usage_before.ru_utime - usage_before.ru_stime
-                print(f"report CPU: {cpu_seconds:.3f} s", flush=True)
-                print(f"report: {elapsed:.3f} s (29,138 calls, 36,462 steps)", flush=True)
-                self.assertEqual(result.returncode, 0, result.stderr)
-                self.assertIn("### Tests by target", result.stdout)
-                self.assertIn("Now: Mac blocked by", result.stdout)
-                self.assertIn("Now: natedev held by", result.stdout)
-                for name, job in (("launches.collect", launches.collect), ("index.update", index.update)):
-                    began = time.perf_counter()
-                    _ = job()
-                    print(f"report part {name}: {time.perf_counter() - began:.3f} s", flush=True)
-                with closing(index.read_only()) as connection:
-                    for name, duration in section_seconds(connection, day).items():
-                        print(f"report section {name}: {duration:.3f} s", flush=True)
-                self.assertLessEqual(cpu_seconds, 2.0, result.stderr)
+                full_rows = path.read_bytes().splitlines(keepends=True)
+                # Preserve the distribution of timestamps, kinds and Mac results.
+                quarter_rows = full_rows[:29_138:4] + full_rows[29_138:65_600:4] + full_rows[65_600:]
+                runs: list[list[MeasuredCliRun]] = []
+                for rows in (quarter_rows, full_rows):
+                    _ = path.write_bytes(b"".join(rows))
+                    _ = index.reindex()
+                    runs.append([measure_cli_work("report", environment, len(rows)) for _ in range(3)])
+                for size, measurements in zip((len(quarter_rows), len(full_rows)), runs, strict=True):
+                    for measured in measurements:
+                        result = measured.result
+                        self.assertEqual(result.returncode, 0, result.stderr)
+                        self.assertIn("### Tests by target", result.stdout)
+                        self.assertIn("Now: Mac blocked by", result.stdout)
+                        self.assertIn("Now: natedev held by", result.stdout)
+                        self.assertEqual(measured.work["index_updates"], 1)
+                        self.assertEqual(measured.work["launch_collections"], 1)
+                        self.assertLessEqual(measured.work["statements"], 100)
+                        self.assertLessEqual(measured.work["instructions"], size * 500)
+                baseline = min(run.work["cpu_seconds"] for run in runs[0])
+                full = min(run.work["cpu_seconds"] for run in runs[1])
+                self.assertLessEqual(full, baseline * 8, f"CLI CPU grew from {baseline} to {full} for four times the rows")
         time.tzset()
 
 
