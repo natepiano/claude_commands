@@ -5,10 +5,10 @@
 It starts `/nightly_review config rust messages` in one named, detached tmux session with Remote Control under
 the same name, replacing the previous night's unless the user is attached to it. A session under that
 name that no nightly review started is left running, and the review skips the night. The session runs
-on the account the unit role names, started as a unit is, or on the default login when no role is set.
+on the account with room whose weekly allowance resets soonest.
 It does the modes in order; for each it writes NIGHT/<mode>.md and messages natedev, which distills
 the proposals into NIGHT/digest.md and the ledger (/watcher). The night is skipped while that account
-is shut down, is not fit to launch, or has less than MIN_REMAINING percent of its weekly usage left.
+is shut down, is not fit to launch, or no account has room.
 
 Nothing offers the proposals: the ledger's queue grows until the user asks for /nightly_next
 (user, 2026-10-10).
@@ -40,9 +40,7 @@ from launch_permission import (  # noqa: E402
     launch_permission,
 )
 from account import NAMED_ACCOUNT_VARIABLES  # noqa: E402
-from agent_accounts import ClaudeAccountSelection  # noqa: E402
-import note_file  # noqa: E402
-from quota_alert import ahead, remaining  # noqa: E402
+from agent_accounts import ClaudeAccountsInUse  # noqa: E402
 import account  # noqa: E402
 
 ROOT = Path(os.environ.get("XDG_STATE_HOME") or Path.home() / ".local" / "state") / "nightly-review"
@@ -52,7 +50,6 @@ SESSION = "nightly-review"
 LEGACY_SESSIONS = ("nightly-config", "nightly-rust")
 PROMPT = "/nightly_review " + " ".join(MODES)
 SETTINGS = Path(__file__).with_name("settings.json")
-MIN_REMAINING = 10.0
 SESSIONS_DIR = Path.home() / ".claude/sessions"
 REVIEW_SCRIPT = SCRIPTS / "notify/review.py"
 
@@ -226,13 +223,13 @@ class QuotaClear:
 
 
 @dataclass(frozen=True)
-class QuotaBelowFloor:
+class ReviewAccountUnavailable:
     """Tonight's run must wait for weekly quota."""
 
     reason: str
 
 
-QuotaPermission = QuotaClear | QuotaBelowFloor
+QuotaPermission = QuotaClear | ReviewAccountUnavailable
 
 
 def night_dir(day: date) -> Path:
@@ -256,22 +253,12 @@ def quota_permission() -> QuotaPermission:
     return quota_for_selection(accounts.claude_account_selection())
 
 
-def quota_for_selection(selection: ClaudeAccountSelection) -> QuotaPermission:
-    """Whether the account the review launches on has enough weekly quota to run."""
-    for note in note_file.read_notes():
-        left = remaining(note)
-        launch_account = (
-            "unit directors" in selection.roles_for_login(note.get("login") or "")
-            if selection.multiple_accounts else note.get("state") == "active"
-        )
-        if (note.tool == "claude" and launch_account and left is not None
-                and left < MIN_REMAINING and ahead(note.get("resets"))):
-            reason = (
-                f"{note.path.stem} has {left:g}% of its weekly usage left, under "
-                + f"the {MIN_REMAINING:g}% floor"
-            )
-            return QuotaBelowFloor(reason)
-    return QuotaClear()
+def quota_for_selection(_selection: ClaudeAccountsInUse) -> QuotaPermission:
+    """The picker decides room without a minimum percentage."""
+    from scripts.accounts import accounts
+
+    chosen = accounts.pick("claude", datetime.now(timezone.utc), keep=accounts.NoKeep())
+    return ReviewAccountUnavailable(accounts.no_room_line("claude", chosen)) if isinstance(chosen, accounts.NoAccountWithRoom) else QuotaClear()
 
 
 @dataclass(frozen=True)
@@ -299,7 +286,7 @@ def retire(name: str, attached: str, foreign: str) -> LeftRunning | NameFree:
     return NameFree()
 
 
-def start(selection: ClaudeAccountSelection, prefix: str) -> list[str]:
+def start(_selection: ClaudeAccountsInUse, prefix: str, environment: dict[str, str]) -> list[str]:
     """Replace last night's session with tonight's; `prefix` selects a named account."""
     lines = [
         left.line for name in LEGACY_SESSIONS
@@ -321,48 +308,55 @@ def start(selection: ClaudeAccountSelection, prefix: str) -> list[str]:
             "--settings", str(SETTINGS), PROMPT]
     # A scope of its own, so a tmux server this starts outlives the timer's oneshot unit.
     command = f"{prefix}ENABLE_TOOL_SEARCH=true command {shlex.join(argv)}; exec zsh"
-    if selection.multiple_accounts:
-        # tmux may supply another account from its server environment. Clear
-        # its variables and the token inside the command before Claude runs.
-        command = f"unset {' '.join(NAMED_ACCOUNT_VARIABLES)} CLAUDE_CODE_OAUTH_TOKEN; " + command
+    command = f"unset {' '.join(NAMED_ACCOUNT_VARIABLES)} CLAUDE_CODE_OAUTH_TOKEN; " + command
     spawn = ["systemd-run", "--user", "--scope", "--quiet", "--collect", "tmux", "new-session", "-d", "-s", SESSION,
              "-c", str(home / "rust"), "zsh", "-ic", command]
-    if selection.multiple_accounts:
-        started = subprocess.run(spawn, capture_output=True, text=True, check=False,
-                                 env=launch_environment(selection))
-    else:
-        started = subprocess.run(spawn, capture_output=True, text=True, check=False)
+    started = subprocess.run(spawn, capture_output=True, text=True, check=False, env=environment)
     outcome = "started" if started.returncode == 0 else f"failed to start: {started.stderr.strip()}"
     return [*lines, f"{SESSION}: {outcome}"]
 
 
-def launch_environment(selection: ClaudeAccountSelection) -> dict[str, str]:
-    """The launch environment without an inherited account, retaining legacy inheritance."""
-    return {key: value for key, value in os.environ.items()
-            if not selection.multiple_accounts or not key.startswith("CLAUDE_")}
+def launch_environment(_selection: ClaudeAccountsInUse) -> dict[str, str]:
+    """The launch environment without an inherited Claude account."""
+    return {key: value for key, value in os.environ.items() if not key.startswith("CLAUDE_")}
 
 
-def tonight(selection: ClaudeAccountSelection) -> list[str]:
-    """Start the review on the unit role's account, or give the one line that says why not."""
+def tonight(selection: ClaudeAccountsInUse) -> list[str]:
+    """Start the review on the picked account, or give the one line that says why not."""
     from scripts.accounts import accounts
+    from scripts.herdr.herdr import Untrusted, UnreadableTrustFile, claude_trust, trust_command
 
-    selected = accounts.role_account("unit")
+    try:
+        selected = accounts.role_account("unit")
+    except accounts.AccountsError as error:
+        return [str(error)]
     environment = launch_environment(selection)
+    permission_environment = dict(environment)
     if isinstance(selected, accounts.NamedAccount):
         problems = accounts.check(selected.label)
         if problems:
             return [f"skipped: unit account {selected.label}: {problems[0]}"]
         # The shutdown check reads the account the review will run on.
-        environment["CLAUDE_CONFIG_DIR"] = str(selected.dir)
-    permission = launch_permission(environment, NewWorkLaunchPurpose())
+        permission_environment["CLAUDE_CONFIG_DIR"] = str(selected.dir)
+    permission = launch_permission(permission_environment, NewWorkLaunchPurpose())
     if isinstance(permission, BlockedByShutdown):
         return [f"skipped: {permission.reason}"]
     if isinstance(permission, ShutdownStateUnreadable):
         return [f"skipped: shutdown state unreadable: {permission.detail}"]
-    quota = quota_for_selection(selection)
-    if isinstance(quota, QuotaBelowFloor):
-        return [f"skipped: {quota.reason}"]
-    return start(selection, accounts.account_prefix(selected))
+    folder = Path.home() / "rust"
+    trust_account = selected
+    inherited_config = environment.get("CLAUDE_CONFIG_DIR", "")
+    if isinstance(selected, accounts.DefaultAccount) and inherited_config:
+        trust_account = accounts.NamedAccount(inherited_config, Path(inherited_config))
+    account_file = (trust_account.dir / ".claude.json" if isinstance(trust_account, accounts.NamedAccount)
+                    else Path.home() / ".claude.json")
+    trust = claude_trust(folder, account_file)
+    if isinstance(trust, UnreadableTrustFile):
+        return [f"{SESSION}: {trust}"]
+    if isinstance(trust, Untrusted):
+        label = trust_account.label if isinstance(trust_account, accounts.NamedAccount) else "default account"
+        return [f"{SESSION}: Claude is not trusted in {folder} on {label}. Run: {trust_command(folder, trust_account)}"]
+    return start(selection, accounts.account_prefix(selected), environment)
 
 
 def launch(today: date) -> list[str]:

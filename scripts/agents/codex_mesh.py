@@ -60,6 +60,7 @@ import errno
 import fcntl
 import json
 import os
+import re
 import secrets
 import shlex
 import signal
@@ -73,14 +74,18 @@ from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
-from typing import Literal, NoReturn, NotRequired, TextIO, TypedDict, cast, final
+from typing import TYPE_CHECKING, Literal, NoReturn, NotRequired, TextIO, TypedDict, cast, final
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.usage import agents_log
 from scripts.whoami.agent_accounts import (
     seats_home, codex_home, codex_home_display, user_zone,
-    KnownCodexAccount, UnknownCodexAccount, RefusingCodexAccount, codex_account,
+    KnownCodexAccount, UnknownCodexAccount, RefusingCodexAccount, codex_account, codex_home_role_label,
 )
+
+
+if TYPE_CHECKING:
+    from scripts.accounts.moves import RequestedMove
 
 
 @dataclass(frozen=True)
@@ -130,6 +135,7 @@ def _bind_serving_server(client: Client, session_dir: str, *, started_here: bool
     if started_here:
         serving = replace(serving, started_here=True)
     client.serving = serving
+    client.session_dir = session_dir
     return serving
 
 
@@ -154,7 +160,8 @@ def _serving_request(
         proven = submits_work and QUOTA_REFUSAL in detail and (
             serving.started_here or time.time() - opened > RETRY_FAST_FAILURE_SECS)
         if proven:
-            _report_quota_refusal(client.name, serving)
+            _owe_quota_continuation(client, _as_str(params.get("threadId")))
+            _report_quota_refusal(client.name, serving, detail)
         raise ServingRequestFailure(detail, serving, proven) from error
 
 SERVER_FILE = "mesh_server.json"
@@ -265,6 +272,7 @@ class FollowableRecord(TypedDict):
     role: NotRequired[SeatRole]
     context_tokens: NotRequired[int | Literal["not_measured_since_compaction"]]
     instructions_file: NotRequired[str]
+    continuation_owed: NotRequired[bool]
 
 
 # `port` is the app-server the seat's launcher is attached to. It stays the seat's way in while
@@ -279,6 +287,7 @@ class ActiveRecord(TypedDict):
     role: NotRequired[SeatRole]
     context_tokens: NotRequired[int | Literal["not_measured_since_compaction"]]
     instructions_file: NotRequired[str]
+    continuation_owed: NotRequired[bool]
 
 
 class StartingRecord(TypedDict):
@@ -290,6 +299,7 @@ class StartingRecord(TypedDict):
     role: NotRequired[SeatRole]
     context_tokens: NotRequired[int | Literal["not_measured_since_compaction"]]
     instructions_file: NotRequired[str]
+    continuation_owed: NotRequired[bool]
 
 
 class WaitingCapacityRecord(TypedDict):
@@ -301,6 +311,7 @@ class WaitingCapacityRecord(TypedDict):
     role: NotRequired[SeatRole]
     context_tokens: NotRequired[int | Literal["not_measured_since_compaction"]]
     instructions_file: NotRequired[str]
+    continuation_owed: NotRequired[bool]
 
 
 class ExhaustedRecord(TypedDict):
@@ -310,6 +321,7 @@ class ExhaustedRecord(TypedDict):
     role: NotRequired[SeatRole]
     context_tokens: NotRequired[int | Literal["not_measured_since_compaction"]]
     instructions_file: NotRequired[str]
+    continuation_owed: NotRequired[bool]
 
 
 class EndedRecord(TypedDict):
@@ -319,6 +331,7 @@ class EndedRecord(TypedDict):
     role: NotRequired[SeatRole]
     context_tokens: NotRequired[int | Literal["not_measured_since_compaction"]]
     instructions_file: NotRequired[str]
+    continuation_owed: NotRequired[bool]
 
 
 ThreadRecord = (FollowableRecord | ActiveRecord | StartingRecord |
@@ -628,6 +641,7 @@ class Client:
     def __init__(self, port: int, name: str) -> None:
         self.port: int = port
         self.name: str = name
+        self.session_dir: str = ""
         self.serving: CodexServingState = NotBoundCodexServer()
         self.turn_submitted_at: float = time.time()
         self._ws: WebSocket = WebSocket(port)
@@ -776,6 +790,10 @@ def _write_roster_record(handle: TextIO, roster: dict[str, object], name: str,
                         record: ThreadRecord) -> None:
     previous = _as_dict(roster.get(name))
     stored = dict(record)
+    if "continuation_owed" not in record and previous.get("thread_id") == record["thread_id"]:
+        owed = previous.get("continuation_owed")
+        if isinstance(owed, bool):
+            stored["continuation_owed"] = owed
     size = _context_size_from_record(record if "context_tokens" in record else previous)
     role = record.get("role", previous.get("role"))
     if isinstance(role, str) and role in SEAT_ROLES:
@@ -1832,15 +1850,34 @@ def _quota_refused(outcome: RunOutcome, tested: bool, resident: bool) -> bool:
     )
 
 
-def _report_quota_refusal(name: str, serving: CodexServingState) -> None:
-    """Hand a proven refusal to the quota alert, which decides whether Codex work moves to Claude."""
+def _quota_window(detail: str) -> str:
+    weekly = bool(re.search(r"\bweek(?:ly)?\b|7[ -]?day", detail, re.IGNORECASE))
+    five = bool(re.search(r"5[ -]?(?:hour|hr)|five[ -]?hour", detail, re.IGNORECASE))
+    return "weekly" if weekly and not five else "five_hour" if five and not weekly else "unknown"
+
+
+def _continuation_is_owed(session_dir: str, name: str) -> bool:
+    record = _as_dict(_read_json_object(_session_path(session_dir, ROSTER_FILE)).get(name))
+    return record.get("continuation_owed") is True
+
+
+def _owe_quota_continuation(client: Client, thread_id: str) -> None:
+    if client.session_dir and thread_id:
+        _ = _update_roster_if_expected(client.session_dir, client.name,
+            {"thread_id": thread_id, "status": "starting", "continuation_owed": True},
+            RosterOnThread(thread_id))
+
+
+def _report_quota_refusal(name: str, serving: CodexServingState, detail: str = "") -> None:
+    """Hand the serving identity, named limit and refusal time to the account mover."""
     try:
         account = serving.account
         identity = ([str(account.home), account.login, account.label]
                     if isinstance(account, KnownCodexAccount)
                     else [str(account.home), account.reason])
         done = subprocess.run(
-            [sys.executable, str(QUOTA_REPORT), "blocked", *identity],
+            [sys.executable, str(QUOTA_REPORT), "blocked", *identity,
+             "--window", _quota_window(detail), "--refused-at", datetime.now(timezone.utc).isoformat()],
             capture_output=True, text=True, timeout=QUOTA_REPORT_TIMEOUT_SECS, check=False,
         )
     except (OSError, subprocess.TimeoutExpired) as exc:
@@ -1922,7 +1959,7 @@ def command_start(args: argparse.Namespace) -> int:
     if isinstance(outcome, (FailedBeforeThread, FailedWithThread)):
         print(f"codex_mesh: {name}: {outcome.failure}", file=sys.stderr)
         if not outcome.refusal_reported and not (isinstance(outcome, FailedWithThread) and outcome.refusal_checked) and _quota_refused(outcome, tested, resident):
-            _report_quota_refusal(name, outcome.serving)
+            _report_quota_refusal(name, outcome.serving, outcome.failure)
         return 1
     if isinstance(outcome, CapacityRetriesExhausted):
         print(f"codex_mesh: {name}: {outcome.message(name)}", file=sys.stderr)
@@ -2352,6 +2389,7 @@ def _stream_turn(
     follow: bool = False,
 ) -> RunOutcome:
     """Stream a new or resumed thread's turn through the same lifecycle."""
+    client.session_dir = session_dir
     port: int = initial_port
     thread_id: str = initial_thread_id
     log_path = Path(_as_str(_attr(args, "log_file")))
@@ -2377,7 +2415,7 @@ def _stream_turn(
     failure_serving = client.serving
     reported_turns: set[tuple[CodexServingState, str, str]] = set()
     changed: bool
-    moved: SeatMoveResult
+    moved: SeatMoveResult = SeatWaitingOnLiveTurn()
     started: MovedSeat
     deadline = time.time() + timeout
     with _pending_file(session_dir, name) as handle:
@@ -2420,10 +2458,12 @@ def _stream_turn(
             while time.time() < deadline:
                 # A resident thread must wake to see `end` between turns. Any other
                 # wakes to check that its turn has not ended without the notice.
-                poll = RESIDENT_POLL_SECS if resident else UNSEEN_END_CHECK_SECS
+                poll = (RESIDENT_POLL_SECS if resident or _continuation_is_owed(session_dir, name)
+                        else UNSEEN_END_CHECK_SECS)
                 frame = client.next_frame(min(deadline, time.time() + poll))
                 if frame is None:
                     if not resident and time.time() < deadline:
+                        quota_owed = _continuation_is_owed(session_dir, name)
                         if not resume_owed and _ended_unseen(client, thread_id):
                             moved = _move_resident(args, session_dir, name, thread_id, client)
                             if isinstance(moved, SeatThreadStateUnknown):
@@ -2431,15 +2471,19 @@ def _stream_turn(
                                     raise SeatMoveUncertain(thread_id, moved)
                                 hold_messages_for_next_launch(moved.reason)
                             else:
+                                if quota_owed and isinstance(moved, SeatWaitingOnLiveTurn):
+                                    continue
                                 if isinstance(moved, MovedSeat):
                                     client, port, thread_id = moved.client, moved.port, moved.thread_id
-                                    if moved.turn_id:
-                                        turn_id = moved.turn_id
+                                    if moved.turn_id or _continuation_is_owed(session_dir, name):
+                                        turn_id = moved.turn_id or turn_id
                                         if follow:
                                             followed_turn = turn_id
                                         continue
                                 if not _close_messages_if_empty(session_dir, name, thread_id):
                                     continue
+                            if quota_owed:
+                                continue
                             _ = log.write(f"[{_now_stamp()}] mesh: {name} thread is idle and no "
                                           + "completion notice arrived; finishing\n")
                             log.flush()
@@ -2456,7 +2500,8 @@ def _stream_turn(
                         with _pending_file(session_dir, name) as handle:
                             held_messages = bool(_pending_for_thread(handle, thread_id))
                         if (server_record_home(record) == selected_home
-                                and record.get("port") == port and not held_messages):
+                                and record.get("port") == port and not held_messages
+                                and not _continuation_is_owed(session_dir, name)):
                             continue
                         moved = _move_resident(args, session_dir, name, thread_id, client)
                         if isinstance(moved, SeatThreadStateUnknown):
@@ -2529,7 +2574,8 @@ def _stream_turn(
                         if identity not in reported_turns:
                             reported_turns.add(identity)
                             if _quota_refused(failed, serving.started_here, False):
-                                _report_quota_refusal(name, serving)
+                                _owe_quota_continuation(client, thread_id)
+                                _report_quota_refusal(name, serving, turn_outcome.detail)
                                 refusal_reported = True
                         if not followed_failure:
                             failure_serving = serving
@@ -2684,7 +2730,8 @@ def _stream_turn(
                             followed_turn = turn_id
                         resume_owed = False
                         continue
-                    if follow and not resident and isinstance(turn_outcome, TurnFailed) and not followed_failure:
+                    quota_owed = _continuation_is_owed(session_dir, name)
+                    if follow and not resident and isinstance(turn_outcome, TurnFailed) and not followed_failure and not quota_owed:
                         followed_failure = turn_outcome.detail
                     failure = followed_failure or (turn_outcome.detail if isinstance(turn_outcome, TurnFailed) else "")
                     if resident:
@@ -2696,7 +2743,8 @@ def _stream_turn(
                             break
                     with _pending_file(session_dir, name) as handle:
                         held_messages = bool(_pending_for_thread(handle, thread_id))
-                    if resident or held_messages:
+                    owed = _continuation_is_owed(session_dir, name)
+                    if resident or held_messages or owed:
                         thread_id = _as_str(cast(object, thread_id))
                         moved = _move_resident(args, session_dir, name, thread_id, client)
                         if isinstance(moved, SeatThreadStateUnknown):
@@ -2710,11 +2758,14 @@ def _stream_turn(
                             break
                         if isinstance(moved, MovedSeat):
                             client, port, thread_id = moved.client, moved.port, moved.thread_id
-                            if moved.turn_id:
-                                turn_id = moved.turn_id
+                            if moved.turn_id or _continuation_is_owed(session_dir, name):
+                                turn_id = moved.turn_id or turn_id
                                 if follow:
                                     followed_turn = turn_id
                                 continue
+                    if owed and isinstance(moved, SeatWaitingOnLiveTurn):
+                        time.sleep(RESIDENT_POLL_SECS)
+                        continue
                     # A finished turn may have a peer turn opening behind it.
                     if not resident and _more_work_coming(client, thread_id, deadline):
                         continue
@@ -2729,8 +2780,8 @@ def _stream_turn(
                             break
                         if isinstance(moved, MovedSeat):
                             client, port, thread_id = moved.client, moved.port, moved.thread_id
-                            if moved.turn_id:
-                                turn_id = moved.turn_id
+                            if moved.turn_id or _continuation_is_owed(session_dir, name):
+                                turn_id = moved.turn_id or turn_id
                                 if follow:
                                     followed_turn = turn_id
                         continue
@@ -2790,7 +2841,7 @@ def _stream_turn(
 class MovedSeat:
     client: Client
     port: int
-    # Empty when the move has no messages to start.
+    # Empty when no new turn was accepted.
     turn_id: str
     thread_id: str
     thread_replaced: bool
@@ -2802,6 +2853,11 @@ class SeatWaitingOnLiveTurn:
     """The outgoing thread is still working and keeps its server."""
 
     reason: str = "the outgoing thread still has a live turn"
+
+
+@dataclass(frozen=True)
+class SeatAwaitingQuotaRecovery(MovedSeat):
+    """The thread resumed, but the destination refused its owed continuation."""
 
 
 @dataclass(frozen=True)
@@ -2993,6 +3049,69 @@ def _move_resident(
         return SeatThreadStateUnknown(str(error) or type(error).__name__)
 
 
+def _quota_continuation_ready(client: Client, selected_home: Path) -> bool:
+    from scripts.accounts import moves, refusals
+
+    now = datetime.now(timezone.utc)
+    serving = client.serving
+    if selected_home != serving.home:
+        return True
+    identity = serving.account
+    if isinstance(identity, UnknownCodexAccount):
+        return False
+    refusal = refusals.load().get(refusals.key("codex", identity.login))
+    if refusal is None or not refusals.resolved(refusal, refusals.stored_reading("codex", identity.login, now), now):
+        return False
+    entries = moves.read_moves()
+    ended = {entry["move_id"] for entry in entries if entry["kind"] == "wait ended"}
+    for entry in entries:
+        if (entry["tool"] == "codex" and entry["subject"] == "seats" and entry["kind"] == "waited"
+                and entry["move_id"] not in ended and datetime.fromisoformat(entry["reset"]) <= now):
+            moves.append_move(moves.WaitEndedMove(kind="wait ended", at=now.isoformat(), tool="codex",
+                subject="seats", move_id=entry["move_id"]))
+    return True
+
+
+@dataclass(frozen=True)
+class NoRequestedSeatMove:
+    """No seats transition requests this source-to-destination resume."""
+
+
+def _requested_seat_move(source: CodexServingState, destination: Path) -> RequestedMove | NoRequestedSeatMove:
+    from scripts.accounts import moves
+
+    if not isinstance(source, ServingCodexServer) or source.home == destination:
+        return NoRequestedSeatMove()
+    requests = [entry for entry in moves.read_moves() if entry["kind"] == "requested"
+                and entry["tool"] == "codex" and entry["subject"] == "seats"]
+    if (requests and requests[-1]["from"] == codex_home_role_label(source.home)
+            and requests[-1]["to"] == codex_home_role_label(destination)):
+        return requests[-1]
+    return NoRequestedSeatMove()
+
+
+def _record_seat_move_failure(request: RequestedMove | NoRequestedSeatMove, reason: str) -> None:
+    from scripts.accounts import moves
+
+    if isinstance(request, NoRequestedSeatMove):
+        return
+    moves.append_move(moves.FailedMove(kind="failed", at=datetime.now(timezone.utc).isoformat(),
+        tool="codex", subject="seats", move_id=request["move_id"], reason=reason))
+
+
+def _confirm_seat_move(session_dir: str, name: str, request: RequestedMove | NoRequestedSeatMove,
+                       serving: CodexServingState) -> None:
+    from scripts.accounts import moves
+
+    if not isinstance(serving, ServingCodexServer):
+        return
+    if isinstance(request, NoRequestedSeatMove) or codex_home_role_label(serving.home) != request["to"]:
+        return
+    moves.append_move(moves.ConfirmedMove(kind="confirmed", at=datetime.now(timezone.utc).isoformat(),
+        tool="codex", subject="seats", move_id=request["move_id"], home=str(serving.home),
+        seat=name, run=str(Path(session_dir).resolve())))
+
+
 def _move_idle_seat(
     args: argparse.Namespace, session_dir: str, name: str, thread_id: str, client: Client,
     *, message: str = "",
@@ -3003,9 +3122,14 @@ def _move_idle_seat(
         return SeatThreadStateUnknown(state.reason)
     if not isinstance(state, ThreadIdle):
         return SeatWaitingOnLiveTurn()
+    if isinstance(client.serving, NotBoundCodexServer):
+        _ = _bind_serving_server(client, session_dir)
+    source = client.serving
     seats_home_for_turn = seats_home()
+    request = _requested_seat_move(source, seats_home_for_turn)
     cleanup: SeatTurnCleanup | NoSeatTurnToCleanUp = NoSeatTurnToCleanUp()
     moved = client
+    replaced = False
     try:
         with _pending_file(session_dir, name) as handle:
             if _end_marker_path(session_dir, name).exists() or not _roster_still_on_thread(session_dir, name, thread_id):
@@ -3030,15 +3154,23 @@ def _move_idle_seat(
             port, _fresh = ensure_server(session_dir, seats_home_for_turn)
             previous = _as_dict(_read_json_object(_session_path(session_dir, ROSTER_FILE)).get(name))
             old_port = client.port
+            owes_continuation = previous.get("continuation_owed") is True
+            if owes_continuation and not _quota_continuation_ready(client, seats_home_for_turn):
+                from scripts.accounts import refusals
+                identity = client.serving.account
+                if (isinstance(identity, UnknownCodexAccount) or
+                        refusals.key("codex", identity.login) not in refusals.load()):
+                    return SeatThreadStateUnknown("quota handoff did not establish a recoverable account; continuation is held")
+                return SeatWaitingOnLiveTurn("the refused account has not recovered")
             if isinstance(client.serving, NotBoundCodexServer):
                 _ = _bind_serving_server(client, session_dir, started_here=_fresh)
             if _fresh and port == old_port:
                 serving = client.serving
                 client.serving = replace(serving, started_here=True)
-            replaced = False
             if port != old_port:
                 released = _release_seat_thread(client, thread_id, session_dir)
                 if isinstance(released, SeatThreadStateUnknown):
+                    _record_seat_move_failure(request, released.reason)
                     return released
                 moved = Client(port, name)
                 _ = _bind_serving_server(moved, session_dir, started_here=_fresh)
@@ -3047,10 +3179,13 @@ def _move_idle_seat(
                     thread_id, replaced = resumed.thread_id, resumed.thread_replaced
                     if replaced:
                         _write_pending(handle, thread_id, messages)
+                        _update_roster(session_dir, name, {"thread_id": thread_id, "status": "starting",
+                            "port": port, "continuation_owed": owes_continuation})
                         role = _roster_role(previous.get("role"))
                         if isinstance(role, AssignedDelegateRole):
                             _record_assignment(thread_id, role.role, _dispatch_lens(args))
                 except (ConnectionError, OSError, SystemExit) as error:
+                    _record_seat_move_failure(request, str(error) or type(error).__name__)
                     moved.close()
                     current = _as_dict(_read_json_object(_session_path(session_dir, ROSTER_FILE)).get(name))
                     current_thread = _as_str(current.get("thread_id")) or thread_id
@@ -3059,20 +3194,28 @@ def _move_idle_seat(
                     return SeatThreadStateUnknown(str(error) or type(error).__name__, cleanup,
                         error.serving if isinstance(error, ServingRequestFailure) else moved.serving,
                         error.reported if isinstance(error, ServingRequestFailure) else False)
+                _confirm_seat_move(session_dir, name, request, moved.serving)
                 client.close()
             turn_id = ""
-            if message or messages:
+            if owes_continuation or message or messages:
                 _update_roster(session_dir, name, {"thread_id": thread_id, "status": "starting", "port": port})
-                inputs = [message, *messages] if message else messages
+                inputs = (["Continue where you stopped.", *([message] if message else []), *messages] if owes_continuation
+                          else [message, *messages] if message else messages)
                 cleanup = SeatTurnCleanup(port, thread_id)
                 turn_id = _start_turn(moved, args, thread_id, inputs[0], tuple(inputs[1:]))
+                if owes_continuation and not turn_id:
+                    raise SystemExit("quota continuation was not confirmed by turn/start; task is still owed")
                 _write_pending(handle, thread_id, [])
             prior_turn = _as_str(previous.get("turn_id")) if not replaced else ""
             _update_roster(session_dir, name, {
-                "thread_id": thread_id, "turn_id": turn_id or prior_turn, "status": "running", "port": port
+                "thread_id": thread_id, "turn_id": turn_id or prior_turn, "status": "running", "port": port,
+                "continuation_owed": False
             })
         return MovedSeat(moved, port, turn_id, thread_id, replaced, moved.serving)
     except (ConnectionError, OSError, SystemExit) as error:
+        if isinstance(error, ServingRequestFailure) and error.reported:
+            return SeatAwaitingQuotaRecovery(moved, moved.port, "", thread_id, replaced, moved.serving)
+        _record_seat_move_failure(request, str(error) or type(error).__name__)
         if isinstance(cleanup, NoSeatTurnToCleanUp):
             raise
         if moved is not client:
@@ -3086,17 +3229,29 @@ def _start_seats_turn(
     args: argparse.Namespace, session_dir: str, name: str, thread_id: str,
     client: Client, message: str,
 ) -> MovedSeat:
-    deadline = time.monotonic() + _as_float(_attr(args, "timeout"), 86400.0)
-    while time.monotonic() < deadline:
-        result = _move_resident(args, session_dir, name, thread_id, client, message=message)
-        if isinstance(result, SeatThreadStateUnknown):
-            raise SeatMoveUncertain(thread_id, result)
-        if isinstance(result, MovedSeat):
-            return result
-        if _end_marker_path(session_dir, name).exists():
-            raise SystemExit(f"thread {thread_id}: ended while waiting; no turn started")
-        time.sleep(RESIDENT_POLL_SECS)
-    raise SystemExit(f"thread {thread_id}: still live at the timeout; no new turn started")
+    initial_client = client
+    try:
+        deadline = time.monotonic() + _as_float(_attr(args, "timeout"), 86400.0)
+        while time.monotonic() < deadline:
+            result = _move_resident(args, session_dir, name, thread_id, client, message=message)
+            if isinstance(result, SeatThreadStateUnknown):
+                raise SeatMoveUncertain(thread_id, result)
+            if isinstance(result, MovedSeat) and not isinstance(result, SeatAwaitingQuotaRecovery):
+                return result
+            if isinstance(result, SeatAwaitingQuotaRecovery):
+                client, thread_id = result.client, result.thread_id
+            if _continuation_is_owed(session_dir, name):
+                # A rejected submission's prompt was already handed to Codex; only the continuation is owed.
+                message = ""
+            if _end_marker_path(session_dir, name).exists():
+                raise SystemExit(f"thread {thread_id}: ended while waiting; no turn started")
+            time.sleep(RESIDENT_POLL_SECS)
+        raise SystemExit(f"thread {thread_id}: still live at the timeout; no new turn started")
+
+    except (ConnectionError, OSError, SystemExit):
+        if client is not initial_client:
+            client.close()
+        raise
 
 
 def _start_turn(

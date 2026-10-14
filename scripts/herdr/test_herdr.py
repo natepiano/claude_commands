@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import shlex
 import subprocess
 import shutil
 import sys
@@ -13,8 +14,13 @@ from pathlib import Path
 from typing import cast, override
 from unittest.mock import patch
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
 import herdr
+import trust_survey
 from fake_herdr import CommandResponse
+from scripts.accounts.accounts import DefaultAccount, NamedAccount
+from scripts.whoami.account import NAMED_ACCOUNT_VARIABLES
 
 GIT_BINARY = shutil.which("git") or "git"
 
@@ -236,7 +242,7 @@ class HerdrTests(unittest.TestCase):
             "GIT_CONFIG_COUNT": "1", "GIT_CONFIG_KEY_0": "safe.directory", "GIT_CONFIG_VALUE_0": "*",
         }
         with patch.dict(os.environ, hostile_environment), patch.object(subprocess, "run", wraps=subprocess.run) as invoked:
-            self.assertEqual(herdr.trusted_by_claude(requested, config), herdr.ProjectTrust(requested, False))
+            self.assertEqual(herdr.claude_trust(requested, config), herdr.Untrusted(requested, config, (requested,)))
             self.assertEqual(herdr.repository_trust_key(self.root), self.root)
             environment = cast(dict[str, str], invoked.call_args.kwargs["env"])
         self.assertEqual({key: value for key, value in environment.items() if key.startswith("GIT_")},
@@ -283,9 +289,135 @@ class HerdrTests(unittest.TestCase):
         config = self.root / "claude.json"
         _ = config.write_text(json.dumps({"projects": {"/repository": {"hasTrustDialogAccepted": True}}}))
         with patch.object(herdr, "run_program", return_value=subprocess.CompletedProcess(["git"], 0, "/repository/.git\n", "")):
-            self.assertEqual(herdr.trusted_by_claude(Path("/repository/worktree"), config), herdr.ProjectTrust(Path("/repository"), True))
+            self.assertEqual(herdr.claude_trust(Path("/repository/worktree"), config),
+                             herdr.Trusted(Path("/repository/worktree"), config, Path("/repository")))
         with patch.object(herdr, "run_program", return_value=subprocess.CompletedProcess(["git"], 1, "", "")):
             self.assertEqual(herdr.repository_trust_key(self.root), self.root)
+
+    def trust_git(self, folder: Path, root: Path, main: Path) -> None:
+        def result(argv: list[str], timeout: float = 10.0, *,
+                   environment: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
+            _ = timeout, environment
+            self.assertEqual(argv[2], str(folder))
+            path = root if argv[-1] == "--show-toplevel" else main / ".git"
+            return subprocess.CompletedProcess(argv, 0, str(path) + "\n", "")
+
+        _ = cast(object, self.enterContext(patch.object(herdr, "run_program", side_effect=result)))
+
+    def test_each_exact_folder_repository_root_and_main_key_trusts(self) -> None:
+        folder = self.root / "worktree" / "nested"
+        root = folder.parent
+        main = self.root / "main"
+        config = self.root / "claude.json"
+        self.trust_git(folder, root, main)
+        for key in (folder, root, main):
+            with self.subTest(key=key):
+                _ = config.write_text(json.dumps({"projects": {str(key): {"hasTrustDialogAccepted": True}}}))
+                self.assertEqual(herdr.claude_trust(folder, config), herdr.Trusted(folder, config, key))
+
+    def test_ancestor_trust_does_not_authorize_child_repository(self) -> None:
+        folder = self.root / "worktree" / "nested"
+        main = self.root / "main"
+        config = self.root / "claude.json"
+        _ = config.write_text(json.dumps({"projects": {str(self.root): {"hasTrustDialogAccepted": True}}}))
+        self.trust_git(folder, folder.parent, main)
+        self.assertEqual(herdr.claude_trust(folder, config),
+                         herdr.Untrusted(folder, config, (folder, folder.parent, main)))
+
+    def test_only_boolean_true_accepts_project_trust(self) -> None:
+        config = self.root / "claude.json"
+        with patch.object(herdr, "run_program", return_value=subprocess.CompletedProcess(["git"], 1, "", "")):
+            refused_values: tuple[object, ...] = (False, 1, "true", None, {}, [])
+            for value in refused_values:
+                with self.subTest(value=value):
+                    _ = config.write_text(json.dumps({"projects": {str(self.root): {"hasTrustDialogAccepted": value}}}))
+                    self.assertEqual(herdr.claude_trust(self.root, config), herdr.Untrusted(self.root, config, (self.root,)))
+
+    def test_missing_or_malformed_account_file_refuses_without_contents(self) -> None:
+        config = self.root / "claude.json"
+        self.assertEqual(herdr.claude_trust(self.root, config),
+                         herdr.UnreadableTrustFile(self.root, config, "FileNotFoundError"))
+        for contents, error_class in (("private malformed contents", "JSONDecodeError"),
+                                      ("[]", "ValueError"), ('{"projects": []}', "ValueError")):
+            with self.subTest(error_class=error_class, contents=contents):
+                _ = config.write_text(contents)
+                result = herdr.claude_trust(self.root, config)
+                self.assertEqual(result, herdr.UnreadableTrustFile(self.root, config, error_class))
+                self.assertEqual(str(result), f"cannot read {config} to check Claude trust ({error_class})")
+                self.assertNotIn(contents, repr(result))
+        with patch.object(Path, "read_text", side_effect=PermissionError("private exception detail")):
+            result = herdr.claude_trust(self.root, config)
+            self.assertEqual(str(result), f"cannot read {config} to check Claude trust (PermissionError)")
+            self.assertNotIn("private exception detail", repr(result))
+        _ = config.write_bytes(b"\xffprivate content")
+        self.assertEqual(str(herdr.claude_trust(self.root, config)),
+                         f"cannot read {config} to check Claude trust (UnicodeDecodeError)")
+
+    def test_unreadable_account_file_identifies_the_claude_trust_check(self) -> None:
+        config = self.root / "account file.json"
+        self.assertEqual(str(herdr.UnreadableTrustFile(self.root, config, "PermissionError")),
+                         f"cannot read {config} to check Claude trust (PermissionError)")
+
+    def test_new_worktree_checks_main_checkout_not_trusted_showrunner_worktree(self) -> None:
+        showrunner = self.root / "showrunner"
+        main = self.root / "main"
+        config = self.root / "claude.json"
+        _ = config.write_text(json.dumps({"projects": {str(showrunner): {"hasTrustDialogAccepted": True}}}))
+
+        def result(argv: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
+            path = Path(argv[2]) if argv[-1] == "--show-toplevel" else main / ".git"
+            return subprocess.CompletedProcess(argv, 0, str(path) + "\n", "")
+
+        with patch.object(herdr, "run_program", side_effect=result):
+            checked_folder = herdr.repository_trust_key(showrunner)
+            self.assertEqual(checked_folder, main)
+            self.assertEqual(herdr.claude_trust(checked_folder, config), herdr.Untrusted(main, config, (main,)))
+
+    def test_trust_command_default_and_named_accounts_quote_paths(self) -> None:
+        folder = self.root / "folder ' with $spaces"
+        clear_variables = " ".join(f"-u {name}" for name in NAMED_ACCOUNT_VARIABLES)
+        self.assertEqual(herdr.trust_command(folder, DefaultAccount()),
+                         f"cd {shlex.quote(str(folder))} && env {clear_variables} claude")
+        config_dir = self.root / "account ' directory"
+        expected = (f"cd {shlex.quote(str(folder))} && CLAUDE_CONFIG_DIR={shlex.quote(str(config_dir))} "
+                    + f"CLAUDE_CODE_REMOTE_MEMORY_DIR={shlex.quote(str(self.root / '.claude'))} claude")
+        with patch.object(Path, "home", return_value=self.root):
+            self.assertEqual(herdr.trust_command(folder, NamedAccount("fixture", config_dir)), expected)
+
+    def test_default_trust_command_clears_named_account_variables_only_in_child(self) -> None:
+        folder = self.root / "folder ' with $spaces"
+        folder.mkdir()
+        fake_claude = self.root / "claude"
+        _ = fake_claude.write_text(
+            f"#!{sys.executable}\nimport json, os\n"
+            + f"print(json.dumps({{name: os.environ.get(name) for name in {NAMED_ACCOUNT_VARIABLES!r}}}))\n")
+        fake_claude.chmod(0o755)
+        inherited = {name: "named account value" for name in NAMED_ACCOUNT_VARIABLES}
+        with patch.dict(os.environ, {**inherited, "PATH": f"{self.root}{os.pathsep}{os.defpath}"}):
+            result = subprocess.run(["/bin/sh", "-c", herdr.trust_command(folder, DefaultAccount())],
+                                    capture_output=True, text=True, check=True)
+            self.assertEqual(cast(object, json.loads(result.stdout)), {name: None for name in NAMED_ACCOUNT_VARIABLES})
+            self.assertEqual({name: os.environ[name] for name in NAMED_ACCOUNT_VARIABLES}, inherited)
+
+    def test_trust_command_preserves_the_library_import_path(self) -> None:
+        repository = str(Path(__file__).resolve().parents[2])
+        original_path = [entry for entry in sys.path if entry != repository]
+        with patch.object(sys, "path", original_path.copy()):
+            _ = herdr.trust_command(self.root, DefaultAccount())
+            self.assertEqual(sys.path, original_path)
+
+    def test_survey_counts_nested_repositories_and_submodules_but_skips_generated_trees(self) -> None:
+        checkout = self.root / "checkout"
+        (checkout / ".git").mkdir(parents=True)
+        (checkout / "nested" / ".git").mkdir(parents=True)
+        submodule = checkout / "submodule"
+        submodule.mkdir()
+        _ = (submodule / ".git").write_text("gitdir: ../.git/modules/submodule\n")
+        for generated in (".git", "target", "node_modules"):
+            (checkout / generated / "ignored" / ".git").mkdir(parents=True)
+        self.assertEqual(trust_survey.descendant_repositories(self.root), 3)
+        self.assertEqual(trust_survey.descendant_repositories(checkout), 2)
+        self.assertEqual(trust_survey.project_kind(self.root, self.root, self.root), "ancestor of 3 repos")
 
 
 if __name__ == "__main__":
