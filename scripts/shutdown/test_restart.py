@@ -393,6 +393,17 @@ class RestartTests(ShutdownTestCase):
                 relaunch.assert_not_called()
                 self.assertEqual(record.session_records(LOGIN), [])
 
+    def test_cancel_finishes_a_session_relaunched_by_hand_on_its_target(self) -> None:
+        saved = self.hand_restart_record("cancel-owner")
+        live = self.running_on(saved, self.root / ".claude3")
+        output = io.StringIO()
+        with (patch.object(sessions, "live_sessions", return_value=live),
+              patch.object(settle, "run_remote", return_value=(0, "")), redirect_stdout(output)):
+            _ = settle.cancel(self.account, True, only=[saved["session"]["session_id"]])
+        self.assertIn("cancel-owner is already running on claude 3; its shutdown is finished", output.getvalue())
+        self.assertNotIn("was not cancelled", output.getvalue())
+        self.assertEqual(record.session_records(LOGIN), [])
+
     def test_session_running_on_its_source_account_stays_not_back(self) -> None:
         saved = self.hand_restart_record()
         live = self.running_on(saved, self.root / ".claude2")

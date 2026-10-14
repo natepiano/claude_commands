@@ -838,9 +838,15 @@ def cancel(account: Account, here: bool = False, only: Iterable[str] = ()) -> in
         print(line)
     retained = False
     ids = tuple(only)
-    records = store.session_records(account.login)
-    missing = unrecorded_local_sessions(account.login, ids, records)
-    local_ids = {saved["session"]["session_id"] for saved in records} | missing.keys()
+    import restart as restart_work
+    every = store.session_records(account.login)
+    checked = restart_work.clear_running_on_target(every)
+    records = checked.remaining
+    for saved in checked.finished:
+        if not ids or saved["session"]["session_id"] in ids:
+            print(f"{saved['session']['name']} is already running on {saved.get('target') or saved['label']}; its shutdown is finished")
+    missing = unrecorded_local_sessions(account.login, ids, every)
+    local_ids = {saved["session"]["session_id"] for saved in every} | missing.keys()
     for name in missing.values():
         print(f"{name}: no shutdown in progress")
         retained = True
