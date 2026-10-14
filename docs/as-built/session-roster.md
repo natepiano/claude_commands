@@ -63,7 +63,7 @@ Codex rows:
 
 ### Domain types (`roster.py`)
 
-- `RosterEntry` (frozen): `machine`, `kind` (`claude` | `codex`), `role` (`showrunner` | `unit director` | `worker` | `freestanding`), `name`, `status`, `reach`, `cwd`, `showrunner`, `director`, `assignment`, `thread`, `session`.
+- `RosterEntry` (frozen): `machine`, `kind` (`claude` | `codex`), `role` (`showrunner` | `unit director` | `worker` | `freestanding`), `name`, `status`, `reach`, `cwd`, `showrunner`, `director`, `assignment`, `thread`, `session`, `account` (`AccountLabel`, `AccountUnread`, or `AccountAttributionUnavailable`).
 - `reach: Messageable(address) | CannotReceiveMessages(reason)`.
   - Claude: `session:<id>` with a messaging socket, else `CannotReceiveMessages("no messaging socket")`.
   - Codex worker: `worker:<run id>/<worker name>` (run id = the run directory's name) at mesh status `running` / `waiting_capacity`; otherwise `between turns; its unit director resumes it` or `between turns; no unit director is running`.
@@ -464,3 +464,7 @@ Senders:
 - **Shutdown tests can never reach the user's phone.** Two fixture alerts once reached it from a test whose fake had gone stale. The guard fails at the last call before a real process, so a stale fake fails loudly instead of sending.
 - **The installer writes atomically.** `Path.write_bytes` truncates first, so a failed in-place write would erase the user's rules outside the block and leave markers every later install refuses.
 - **The process table has its own module** so `broadcast.py` can import `roster.py` without a cycle, and roster, broadcast and wind-down share one reader.
+
+Account attribution is read on the owning machine and travels in the snapshot. Claude rows use their process configuration; Codex workers use their serving server's home, including retired servers while a turn finishes. Daemon rows use the socket home; reviewers and herdr panes require a readable process environment. Missing attribution from an older peer is distinct from an unreadable account. Account notes retain that peer's rows until attribution returns.
+
+`peer_snapshot(environment)` returns a `Roster` or `PeerNotReached(host, reason)`; `peer_roster` retains its existing `Roster` interface. Snapshots accept the optional tagged `account` field: a missing field becomes `AccountAttributionUnavailable("peer sent no account")`, while a read failure is `AccountUnread`. Worker attribution reads `mesh_server.json` and `mesh_retired.json` by the worker's port, using the current server only between turns. It never infers a serving home from the workers' configured role.

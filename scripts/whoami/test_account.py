@@ -20,8 +20,8 @@ import account
 
 
 STATUS_LINE = Path(__file__).parents[1] / "statusline" / "statusline.jq"
-EXAMPLE_FIRST_LINE = "natedev | claude_commands | 182,340 | Opus 5.5 high"
-ACCOUNT_FIRST_LINE = "natedev | claude2 | claude_commands | 182,340 | Opus 5.5 high"
+EXAMPLE_FIRST_LINE = "unassigned | claude_commands | 182,340 | Opus 5.5 high"
+ACCOUNT_FIRST_LINE = "unassigned | claude2 | claude_commands | 182,340 | Opus 5.5 high"
 
 
 class AccountTests(unittest.TestCase):
@@ -56,7 +56,7 @@ class AccountTests(unittest.TestCase):
 
     def write_note(self, name: str, login: str) -> None:
         _ = (self.notes / name).write_text(
-            f"---\nlogin: {login}\nstate: inactive\n---\nBody stays.\n"
+            f"---\nlogin: {login}\n---\nBody stays.\n"
         )
 
     def environment_without_claude_config_dir(self) -> dict[str, str]:
@@ -103,8 +103,8 @@ class AccountTests(unittest.TestCase):
         )
 
     def test_label_for_matches_tool_note_login_case_insensitively(self) -> None:
-        self.write_note("codex 2.md", "person@example.com")
-        self.write_note("claude 2.md", "Person@Example.COM")
+        self.write_note("codex2.md", "person@example.com")
+        self.write_note("claude2.md", "Person@Example.COM")
 
         with patch.dict(os.environ, {"AGENT_NOTES_DIR": str(self.notes)}):
             label = account.label_for("claude", "person@example.com")
@@ -112,7 +112,7 @@ class AccountTests(unittest.TestCase):
         self.assertEqual(label, "claude 2")
 
     def test_label_for_falls_back_to_login_without_a_matching_note(self) -> None:
-        self.write_note("claude 2.md", "someone-else@example.com")
+        self.write_note("claude2.md", "someone-else@example.com")
 
         with patch.dict(os.environ, {"AGENT_NOTES_DIR": str(self.notes)}):
             label = account.label_for("claude", "unlisted@example.com")
@@ -120,7 +120,7 @@ class AccountTests(unittest.TestCase):
         self.assertEqual(label, "unlisted@example.com")
 
     def test_named_claude_account_resolves_label_and_login(self) -> None:
-        self.write_note("claude 2.md", "person@example.com")
+        self.write_note("claude2.md", "person@example.com")
         with patch.dict(os.environ, {"AGENT_NOTES_DIR": str(self.notes)}):
             by_label = account.named_claude_account("CLAUDE 2")
             by_login = account.named_claude_account("other@example.com")
@@ -180,6 +180,28 @@ class AccountTests(unittest.TestCase):
             f"CLAUDE_CONFIG_DIR={shlex.quote(str(config_dir))} "
             + f"CLAUDE_CODE_REMOTE_MEMORY_DIR={shlex.quote(str(home / '.claude'))} ",
         )
+
+    def test_process_codex_home_distinguishes_explicit_home_missing_variable_and_unreadable_environment(self) -> None:
+        with patch.object(sys, "platform", "linux"):
+            with patch.object(Path, "read_bytes", return_value=b"USER=test\0CODEX_HOME=/tmp/codex-two\0"):
+                resolved = account.process_codex_home(4321)
+            self.assertIsInstance(resolved, account.ProcessCodexHome)
+            assert isinstance(resolved, account.ProcessCodexHome)
+            self.assertEqual(resolved.home, Path("/tmp/codex-two"))
+            with patch.object(Path, "read_bytes", return_value=b"USER=test\0PATH=/usr/bin\0"):
+                missing = account.process_codex_home(4321)
+            self.assertIsInstance(missing, account.ProcessWithoutCodexHome)
+            with patch.object(Path, "read_bytes", side_effect=PermissionError("no process access")):
+                unreadable = account.process_codex_home(4321)
+            self.assertIsInstance(unreadable, account.ProcessEnvironmentUnread)
+            assert isinstance(unreadable, account.ProcessEnvironmentUnread)
+            self.assertTrue(unreadable.reason)
+
+    def test_legacy_note_alone_still_resolves_the_spaced_account_label(self) -> None:
+        self.write_note("claude 2.md", "legacy@example.invalid")
+        with patch.dict(os.environ, {"AGENT_NOTES_DIR": str(self.notes)}):
+            self.assertEqual(account.label_for("claude", "legacy@example.invalid"), "claude 2")
+            self.assertEqual(account.named_claude_account("claude 2").login, "legacy@example.invalid")
 
     def test_process_config_dir_reads_set_variable_from_linux_process_environment(self) -> None:
         environ = b"USER=test\0CLAUDE_CONFIG_DIR=/tmp/claude-two\0PATH=/usr/bin\0"
@@ -296,7 +318,7 @@ class AccountTests(unittest.TestCase):
         config_dir = self.root / "claude-two"
         config_dir.mkdir()
         self.write_claude_config(config_dir / ".claude.json", "person@example.com")
-        self.write_note("claude 2.md", "person@example.com")
+        self.write_note("claude2.md", "person@example.com")
         environment = self.environment_without_claude_config_dir()
         environment["CLAUDE_CONFIG_DIR"] = str(config_dir)
 
@@ -378,8 +400,8 @@ class AccountTests(unittest.TestCase):
         codex_home.mkdir()
         self.write_claude_config(config_dir / ".claude.json", "claude@example.com")
         self.write_codex_auth(codex_home, "codex@example.com")
-        self.write_note("claude 2.md", "claude@example.com")
-        self.write_note("codex 3.md", "codex@example.com")
+        self.write_note("claude2.md", "claude@example.com")
+        self.write_note("codex3.md", "codex@example.com")
         environment = self.environment_without_claude_config_dir()
         environment["CLAUDE_CONFIG_DIR"] = str(config_dir)
         environment["CODEX_HOME"] = str(codex_home)
@@ -442,7 +464,6 @@ class AccountTests(unittest.TestCase):
         self,
         document: object,
         label: str | None = None,
-        home: str = "/home/someone",
     ) -> str:
         arguments = [
             "jq",
@@ -458,7 +479,7 @@ class AccountTests(unittest.TestCase):
             arguments,
             capture_output=True,
             check=True,
-            env=dict(os.environ) | {"HOME": home},
+            env={"PATH": os.environ["PATH"]},
             input=json.dumps(document),
             text=True,
         )
@@ -515,18 +536,6 @@ class AccountTests(unittest.TestCase):
             self.render_status_line(self.status_line_input(), "claude 2"),
             ACCOUNT_FIRST_LINE + "\n",
         )
-
-    def test_status_line_names_the_machine_by_home_directory(self) -> None:
-        cases = (
-            ("/home/someone", "natedev"),
-            ("/Users/someone", "mac"),
-        )
-        for home, machine in cases:
-            with self.subTest(home=home):
-                self.assertEqual(
-                    self.render_status_line(self.status_line_input(), home=home),
-                    f"{machine} | claude_commands | 182,340 | Opus 5.5 high\n",
-                )
 
     def test_status_line_prints_windows_without_an_account_argument(self) -> None:
         document = self.status_line_input() | {

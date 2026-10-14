@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from scripts.whoami.note_file import note_name
+
 import io
 import json
 import os
@@ -180,8 +182,8 @@ else:
         del environment_context
 
     def write_note(self, label: str, login: str) -> None:
-        _ = (self.notes / f"{label}.md").write_text(
-            f"---\nlogin: {login}\nstate: active\n---\n",
+        _ = (self.notes / note_name(label)).write_text(
+            f"---\nlogin: {login}\nsessions: 1\n---\n",
             encoding="utf-8",
         )
 

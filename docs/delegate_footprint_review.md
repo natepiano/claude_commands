@@ -87,7 +87,8 @@ share a file named for the lead tag.
 | `commands/plan/delegate_phase_report.md` | `<VerbosePostPhaseReport/>`, `<CombinedWindowReport/>`, `<RemainingWorkOutlook/>` | `/plan:delegate_phase_report` |
 | `commands/plan/delegate_checkpoint.md` | `<CheckpointCommit/>` | `/plan:delegate_checkpoint` |
 | `commands/plan/delegate_next.md` | `<ConsiderNextItems/>` | `/plan:delegate_next` |
-| `commands/plan/delegate_style.md` | `<ResolveStyleDiffBase/>`, `<RunProjectStyleReview/>` | `/plan:delegate_style` |
+| `commands/unit/style_review.md` | `<StyleReview/>` | `/unit:style_review` |
+| `docs/delegate/phase_checks.md` | `<PhaseChecks/>` | none |
 | `docs/delegate/compose_work_order.md` | `<ComposeWorkOrder/>` | none |
 
 Each stub keeps its tag, so all existing `<Tag/>` call sites resolve unchanged;

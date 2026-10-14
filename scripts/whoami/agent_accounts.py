@@ -71,18 +71,14 @@ class StoredCodexAccount(TypedDict):
 
 
 def codex_account(home: Path) -> RefusingCodexAccount:
-    from scripts.whoami.note_file import AGENTS_DIR, read_note
+    from scripts.whoami.note_file import read_notes
 
     login = codex_email_on_disk(home)
     if not login:
         return UnknownCodexAccount(home, "the home's sign-in cannot be read")
-    notes = Path(os.environ.get("AGENT_NOTES_DIR", str(AGENTS_DIR)))
-    for path in sorted(notes.glob("*.md")):
-        if not path.stem.casefold().startswith("codex"):
-            continue
-        note = read_note(path)
-        if note is not None and (note.get("login") or "").casefold() == login.casefold():
-            return KnownCodexAccount(home, login, path.stem)
+    for note in read_notes():
+        if note.tool == "codex" and (note.get("login") or "").casefold() == login.casefold():
+            return KnownCodexAccount(home, login, note.label)
     return UnknownCodexAccount(home, "the signed-in account has no named note")
 
 
@@ -101,10 +97,14 @@ CodexCreditsSetting = CreditsOn | CreditsOff
 
 
 def codex_credits_setting(label: str) -> CodexCreditsSetting:
-    from scripts.whoami.note_file import AGENTS_DIR, read_note
+    from scripts.whoami.note_file import note_path, read_note
 
-    directory = Path(os.environ.get("AGENT_NOTES_DIR", str(AGENTS_DIR)))
-    note = read_note(directory / f"{label}.md")
+    try:
+        path = note_path(label)
+    except ValueError:
+        # An unnamed home's display label has no account note or explicit setting.
+        return CreditsOn()
+    note = read_note(path)
     value = note.get("use_credits") if note is not None else None
     if value == "off":
         return CreditsOff()
@@ -128,13 +128,12 @@ class CodexSetupHome:
 
 
 def codex_account_home(label: str) -> CodexHomeHoldingLogin | CodexSetupHome:
-    from scripts.whoami.note_file import AGENTS_DIR, read_note
+    from scripts.whoami.note_file import note_path, read_note
 
     match = re.fullmatch(r"codex ([1-9][0-9]*)", label)
     if match is None:
         raise ValueError(f"accounts: {label} is not a codex N label")
-    directory = Path(os.environ.get("AGENT_NOTES_DIR", str(AGENTS_DIR)))
-    note = read_note(directory / f"{label}.md")
+    note = read_note(note_path(label))
     login = (note.get("login") or "") if note is not None else ""
     if login:
         for home in codex_homes(Path.home() / ".codex"):

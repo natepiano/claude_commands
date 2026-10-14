@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from scripts.whoami.note_file import note_name
+
 import io
 from importlib import import_module
 import base64
@@ -173,7 +175,7 @@ class AccountsTests(unittest.TestCase):
               patch.object(account, "process_config_dir", return_value=self.main_dir),
               patch.object(accounts, "pick", side_effect=chosen),
               patch.object(accounts, "role_account", return_value=accounts.CodexSeatsAccount("codex 1", self.home / ".codex1"))):
-            code, output, error = self.run_cli("status")
+            code, output, error = self.run_cli("--detail")
         self.assertEqual((code, error), (0, ""))
         self.assertIn("live-identity", output)
         self.assertIn("Live director", output)
@@ -192,7 +194,7 @@ class AccountsTests(unittest.TestCase):
             "capacity": {"status": "waiting_capacity", "continuation_owed": True},
             "done": {"status": "idle", "continuation_owed": False},
         }))
-        _, output, _ = self.run_cli("status")
+        _, output, _ = self.run_cli("--detail")
         self.assertIn("run-one/blocked: continuation owed", output)
         self.assertIn("destination account refused again", output)
         self.assertIn("run-one/capacity: continuation owed", output)
@@ -214,7 +216,7 @@ class AccountsTests(unittest.TestCase):
             if pid != 901:
                 raise ProcessLookupError("mesh server gone")
         with patch.object(os, "kill", side_effect=check):
-            _, output, _ = self.run_cli("status")
+            _, output, _ = self.run_cli("--detail")
         self.assertIn("live/worker: continuation owed", output)
         for name in ("dead", "missing", "malformed", "invalid-pid"):
             self.assertNotIn(name + "/worker", output)
@@ -231,7 +233,7 @@ class AccountsTests(unittest.TestCase):
         moves.append_move(moves.FailedMove(at=common["at"], move_id="failed-move", subject="claude-session: Director", tool="claude",
             kind="failed", reason="still on claude 1"))
         moves.append_move({**request, "move_id": "pending-move", "subject": "waiting-session: Waiting"})
-        _, output, _ = self.run_cli("status")
+        _, output, _ = self.run_cli("--detail")
         self.assertIn("confirmed", output)
         self.assertIn("worker-a", output)
         self.assertIn("worker-b", output)
@@ -243,7 +245,7 @@ class AccountsTests(unittest.TestCase):
         for index in range(12):
             moves.append_move(moves.FailedMove(at="2026-10-14T12:00:00+00:00", tool="claude",
                 subject=f"session-{index}", move_id=f"move-{index}", kind="failed", reason=f"failure-{index}"))
-        _, output, _ = self.run_cli("status")
+        _, output, _ = self.run_cli("--detail")
         self.assertNotIn("session-0:", output)
         self.assertNotIn("session-1:", output)
         for index in range(2, 12):
@@ -256,11 +258,30 @@ class AccountsTests(unittest.TestCase):
         room: moves.MoveCommon = {**common, "move_id": "room-one"}
         moves.append_move(moves.NoRoomMove(**room, kind="no room", earliest_reset="2026-10-15T12:00:00+00:00"))
         moves.append_move(moves.RoomAgainMove(**room, kind="room again", label="claude 3"))
-        _, output, _ = self.run_cli("status")
+        _, output, _ = self.run_cli("--detail")
         self.assertIn("waited until 2026-10-14T05:19", output)
         self.assertIn("wait ended", output)
         self.assertIn("no room until 2026-10-15T05:00", output)
         self.assertIn("room again: claude 3", output)
+
+    def test_status_shows_sessions_seats_and_moves_only_with_detail(self) -> None:
+        from scripts.message import sessions
+        self.login_directory("claude 2", "main@example.invalid", default=True)
+        owner = sessions.SessionRecord(pid=12345, sessionId="live-identity", name="Live director",
+            messagingSocketPath="/fixture.sock", updatedAt=1, tmux="", formerNames=[])
+        moves.append_move(moves.FailedMove(at="2026-10-14T12:00:00+00:00", tool="claude",
+            subject="moved-session", move_id="move-one", kind="failed", reason="still on claude 1"))
+        with (patch.object(sessions, "live_sessions", return_value=[owner]),
+              patch.object(import_module("sessions"), "live_sessions", return_value=[owner]),
+              patch.object(account, "process_config_dir", return_value=self.main_dir)):
+            summary = self.run_cli()
+            detail = self.run_cli("--detail")
+        self.assertEqual((summary[0], summary[2], detail[0], detail[2]), (0, "", 0, ""))
+        for line in ("session live-identity (Live director)", "Codex seats:", "moved-session: failed"):
+            self.assertNotIn(line, summary[1])
+            self.assertIn(line, detail[1])
+        self.assertEqual(detail[1].splitlines()[:len(summary[1].splitlines())], summary[1].splitlines())
+        self.assertEqual(self.run_cli("--detail", "pick", "claude"), (1, "", "--detail goes only with no action\n"))
 
     def status_rows(self) -> list[tuple[str, ...]]:
         """The status table's rows after its heading, each a tuple of its cells, then nothing else."""
@@ -321,8 +342,24 @@ class AccountsTests(unittest.TestCase):
             _ = (account_dir / entry).symlink_to(source)
 
     def write_note(self, label: str, login: str) -> None:
-        path = Path(os.environ["AGENT_NOTES_DIR"]) / f"{label}.md"
+        path = Path(os.environ["AGENT_NOTES_DIR"]) / note_name(label)
         _ = path.write_text(f"---\nlogin: {login}\n---\n", encoding="utf-8")
+
+    def test_group_note_labels_map_each_configured_group_and_omit_unconfigured_groups(self) -> None:
+        self.write_note("claude 1", "unit@example.invalid")
+        self.write_note("claude 3", "runner@example.invalid")
+        accounts.set_group_account("units", "claude 1", why="fixture", now=datetime.now(timezone.utc))
+        self.assertEqual(accounts.group_note_labels(), {"units": "claude 1"})
+        accounts.set_group_account("showrunners", "claude 3", why="fixture", now=datetime.now(timezone.utc))
+        self.assertEqual(accounts.group_note_labels(), {"units": "claude 1", "showrunners": "claude 3"})
+
+    def test_group_note_labels_resolve_a_stored_default_from_its_actual_login(self) -> None:
+        self.write_note("claude 2", "home@example.invalid")
+        _ = (self.home / ".claude.json").write_text(json.dumps({"oauthAccount": {"emailAddress": "home@example.invalid"}}))
+        accounts.set_group_account("units", "default", why="fixture", now=datetime.now(timezone.utc))
+        self.assertEqual(accounts.group_note_labels(), {"units": "claude 2"})
+        _ = (self.home / ".claude.json").write_text("not json")
+        self.assertEqual(accounts.group_note_labels(), {})
 
     def codex_login(self, login: str, home: Path | None = None) -> None:
         """Sign the Codex home in the way Codex stores it: the login is a claim of its id token."""
@@ -563,7 +600,7 @@ class AccountsTests(unittest.TestCase):
     def test_exec_uses_one_expected_login_through_resolution_and_readiness(self) -> None:
         self.login_directory("claude 2", "main@example.invalid", default=True)
         self.login_directory("claude 3", "unit@example.invalid")
-        note = Path(os.environ["AGENT_NOTES_DIR"]) / "claude 3.md"
+        note = Path(os.environ["AGENT_NOTES_DIR"]) / "claude3.md"
         reads: list[str] = []
         original_read = Path.read_text
 
@@ -650,7 +687,7 @@ class AccountsTests(unittest.TestCase):
         self.login_directory("claude 2", "main@example.invalid", default=True)
         self.login_directory("claude 3", "unit@example.invalid")
         _ = (accounts.account_dir("claude 3") / ".claude.json").write_text("{}")
-        (Path(os.environ["AGENT_NOTES_DIR"]) / "claude 3.md").unlink()
+        (Path(os.environ["AGENT_NOTES_DIR"]) / "claude3.md").unlink()
         with patch.object(os, "execvpe") as launch:
             self.assertEqual(self.run_cli("exec", "claude 3"), (0, "", ""))
         launch.assert_called_once()
@@ -766,7 +803,7 @@ class AccountsTests(unittest.TestCase):
     def test_exec_refuses_missing_or_unreadable_account_notes_for_a_logged_in_directory(self) -> None:
         self.login_directory("claude 2", "main@example.invalid", default=True)
         self.login_directory("claude 3", "unit@example.invalid")
-        note = Path(os.environ["AGENT_NOTES_DIR"]) / "claude 3.md"
+        note = Path(os.environ["AGENT_NOTES_DIR"]) / "claude3.md"
         for content in (b"missing", b"body without frontmatter", b"---\nlogin: null\n---\n", b"\xff"):
             with self.subTest(content=content):
                 if content == b"missing":
@@ -776,14 +813,14 @@ class AccountsTests(unittest.TestCase):
                 with patch.object(os, "execvpe") as launch:
                     result = self.run_cli("exec", "claude 3")
                 self.assertEqual(result[0], 2)
-                self.assertIn("claude 3.md", result[2])
+                self.assertIn("claude3.md", result[2])
                 launch.assert_not_called()
 
     def test_exec_refuses_an_unreadable_note_even_when_the_directory_is_logged_out(self) -> None:
         self.login_directory("claude 2", "main@example.invalid", default=True)
         self.login_directory("claude 3", "unit@example.invalid")
         _ = (accounts.account_dir("claude 3") / ".claude.json").write_text("{}")
-        _ = (Path(os.environ["AGENT_NOTES_DIR"]) / "claude 3.md").write_text("not frontmatter")
+        _ = (Path(os.environ["AGENT_NOTES_DIR"]) / "claude3.md").write_text("not frontmatter")
         with patch.object(os, "execvpe") as launch:
             result = self.run_cli("exec", "claude 3")
         self.assertEqual(result[0], 2)
@@ -797,7 +834,7 @@ class AccountsTests(unittest.TestCase):
         self.login_directory("claude 3", "unit@example.invalid")
         self.login_directory("claude 4", "spare@example.invalid")
         self.select_named_unit("claude 3")
-        _ = (Path(os.environ["AGENT_NOTES_DIR"]) / "claude 3.md").write_bytes(b"\xff")
+        _ = (Path(os.environ["AGENT_NOTES_DIR"]) / "claude3.md").write_bytes(b"\xff")
         result = self.run_cli("status")
         self.assertEqual((result[0], result[2]), (0, ""))
         self.assertIn("| claude 3 | unit@example.invalid ", result[1])
@@ -820,7 +857,7 @@ class AccountsTests(unittest.TestCase):
         for missing_note in (False, True):
             with self.subTest(missing_note=missing_note):
                 if missing_note:
-                    (Path(os.environ["AGENT_NOTES_DIR"]) / "claude 3.md").unlink()
+                    (Path(os.environ["AGENT_NOTES_DIR"]) / "claude3.md").unlink()
                 self.assertTrue(accounts.check("claude 3"))
                 self.assertEqual(accounts.checked_named_accounts(), [])
                 selection = accounts.claude_account_selection()
@@ -842,8 +879,8 @@ class AccountsTests(unittest.TestCase):
     def test_check_missing_note_alone_excludes_an_otherwise_matching_account(self) -> None:
         self.login_directory("claude 2", "main@example.invalid", default=True)
         self.login_directory("claude 3", "unit@example.invalid")
-        (Path(os.environ["AGENT_NOTES_DIR"]) / "claude 3.md").unlink()
-        self.assertEqual(accounts.check("claude 3"), [f"accounts: claude 3 has no account note at {Path(os.environ['AGENT_NOTES_DIR']) / 'claude 3.md'}"])
+        (Path(os.environ["AGENT_NOTES_DIR"]) / "claude3.md").unlink()
+        self.assertEqual(accounts.check("claude 3"), [f"accounts: claude 3 has no account note at {Path(os.environ['AGENT_NOTES_DIR']) / 'claude3.md'}"])
         self.assertEqual(accounts.claude_account_selection().named_accounts, ())
         self.assertTrue(accounts.multiple_accounts_configured())
 
@@ -1007,6 +1044,7 @@ class AccountsTests(unittest.TestCase):
     def test_showrunner_group_move_names_every_unregistered_timer_even_without_live_members(self) -> None:
         self.login_directory("claude 2", "main@example.invalid", default=True)
         self.login_directory("claude 3", "other@example.invalid")
+        sys.path.insert(0, str(accounts.SCRIPTS / "shutdown"))
         inventory = import_module("inventory")
         stale = [showrunners.Showrunner(session="", socket="", slug=slug, zone="America/New_York",
                                        doc=f"/w/{slug}-production.md") for slug in ("first", "second")]
@@ -1025,6 +1063,7 @@ class AccountsTests(unittest.TestCase):
     def test_showrunner_group_preview_names_unregistered_timers_without_configuring_or_requesting(self) -> None:
         self.login_directory("claude 2", "main@example.invalid", default=True)
         self.login_directory("claude 3", "other@example.invalid")
+        sys.path.insert(0, str(accounts.SCRIPTS / "shutdown"))
         inventory = import_module("inventory")
         stale = showrunners.Showrunner(session="", socket="", slug="missing", zone="America/New_York",
                                        doc="/w/missing-production.md")
@@ -2386,7 +2425,7 @@ class AccountsTests(unittest.TestCase):
 
     def test_seats_swap_refuses_paid_credits_when_the_target_setting_is_off(self) -> None:
         _, target = self.seats_fixture()
-        note = Path(os.environ["AGENT_NOTES_DIR"]) / "codex 1.md"
+        note = Path(os.environ["AGENT_NOTES_DIR"]) / "codex1.md"
         _ = note.write_text("---\nlogin: target@example.invalid\nuse_credits: off\n---\n")
         report = cast(agent_accounts.Report, self.codex_reads.return_value)
         report.quotas = [agent_accounts.Quota("Weekly", 100, datetime.now(timezone.utc) + timedelta(days=1))]
@@ -2710,19 +2749,19 @@ class PickerTests(unittest.TestCase):
             config = accounts.account_dir(label) / ".claude.json"
             note = label
         _ = config.write_text(json.dumps({"oauthAccount": {"emailAddress": login}}))
-        _ = (self.home / "notes" / f"{note}.md").write_text(f"---\nlogin: {login}\n---\n")
+        _ = (self.home / "notes" / note_name(note)).write_text(f"---\nlogin: {login}\n---\n")
 
     def codex(self, label: str, login: str) -> None:
         home = self.home / (".codex" if label == "default" else "." + label.replace(" ", ""))
         note = "codex 1" if label == "default" else label
-        _ = (self.home / "notes" / f"{note}.md").write_text(f"---\nlogin: {login}\n---\n")
+        _ = (self.home / "notes" / note_name(note)).write_text(f"---\nlogin: {login}\n---\n")
         if label != "default":
             self.assertEqual(accounts.setup(label), [])
         home.mkdir(exist_ok=True)
         claims = base64.urlsafe_b64encode(json.dumps({"email": login}).encode()).decode().rstrip("=")
         _ = (home / "auth.json").write_text(json.dumps({"tokens": {"id_token": f"header.{claims}.signature"}}))
         note = "codex 1" if label == "default" else label
-        _ = (self.home / "notes" / f"{note}.md").write_text(f"---\nlogin: {login}\n---\n")
+        _ = (self.home / "notes" / note_name(note)).write_text(f"---\nlogin: {login}\n---\n")
 
     def reading(self, tool: str, login: str, left: float, reset_days: float, *,
                 age: timedelta = ZERO_AGE, five_left: float = 50, five: bool = True,
@@ -2989,7 +3028,7 @@ class PickerTests(unittest.TestCase):
         """F002: a picker destination must be usable by its swap consumer."""
         self.codex("default", "unnamed@example.invalid")
         self.codex("codex 2", "seats@example.invalid")
-        (self.home / "notes/codex 1.md").unlink()
+        (self.home / "notes/codex1.md").unlink()
         self.assertEqual(accounts.main(["set-role", "seats", "codex 2"]), 0)
         self.reading("Codex", "unnamed@example.invalid", 80, 1)
         self.reading("Codex", "seats@example.invalid", 50, 3)
@@ -3030,7 +3069,7 @@ class PickerTests(unittest.TestCase):
         self.codex("default", "main@example.invalid")
         self.codex("codex 1", "original@example.invalid")
         _ = (self.home / ".codex1/auth.json").write_text((self.home / ".codex/auth.json").read_text())
-        _ = (self.home / "notes/codex 1.md").write_text("---\nlogin: main@example.invalid\n---\n")
+        _ = (self.home / "notes/codex1.md").write_text("---\nlogin: main@example.invalid\n---\n")
         self.codex("codex 2", "spare@example.invalid")
         self.reading("Codex", "main@example.invalid", 80, 1)
         self.reading("Codex", "spare@example.invalid", 50, 3)
@@ -3053,7 +3092,7 @@ class PickerTests(unittest.TestCase):
     def test_picker_skips_paid_room_on_a_credits_off_account(self) -> None:
         self.codex("default", "seats@example.invalid")
         self.codex("codex 2", "spare@example.invalid")
-        note = self.home / "notes/codex 1.md"
+        note = self.home / "notes/codex1.md"
         _ = note.write_text("---\nlogin: seats@example.invalid\nuse_credits: off\n---\n")
         self.reading("Codex", "seats@example.invalid", 0, 1, credits="6370")
         self.reading("Codex", "spare@example.invalid", 1, 3)
