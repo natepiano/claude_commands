@@ -37,6 +37,7 @@ import agent_accounts  # noqa: E402
 import note_file  # noqa: E402
 import usage_store  # noqa: E402
 from scripts.accounts import refusals  # noqa: E402
+from scripts.accounts import moves  # noqa: E402
 from scripts.accounts.refusals import (  # noqa: E402
     KnownReset as KnownReset, NoResetKnown as NoResetKnown,
     ReadingWindow as ReadingWindow, NoWindow as NoWindow, FreshReading as FreshReading,
@@ -1202,32 +1203,6 @@ class NoAccountWithRoom:
     reasons: tuple[PickReason, ...]
 
 
-def _reading_window(window: usage_store.StoredWindow) -> ReadingWindow:
-    at = datetime.fromisoformat(window["at"])
-    if at.tzinfo is None or not math.isfinite(window["left"]):
-        raise ValueError("invalid usage reading")
-    reset = NoResetKnown() if not window["resets"] else KnownReset(datetime.fromisoformat(window["resets"]))
-    if isinstance(reset, KnownReset) and reset.at.tzinfo is None:
-        raise ValueError("reset time needs an offset")
-    return ReadingWindow(window["left"], reset, at)
-
-
-def stored_reading(tool: Literal["claude", "codex"], login: str, now: datetime) -> FreshReading | StaleReading | NoReading:
-    """Convert optional saved windows at the boundary into named reading states."""
-    held = usage_store.load().get(usage_store.key(tool.capitalize(), login))
-    if held is None or "weekly" not in held:
-        return NoReading()
-    try:
-        weekly = _reading_window(held["weekly"])
-        five = _reading_window(held["five_hour"]) if "five_hour" in held else NoWindow()
-        if now - weekly.at > timedelta(minutes=10) or weekly.at > now:
-            return StaleReading(weekly, five)
-        credits = held["credits"]["balance"] if "credits" in held else ""
-        return FreshReading(weekly, five, credits)
-    except (ValueError, TypeError):
-        return NoReading()
-
-
 def _codex_reading_can_work(reading: FreshReading, now: datetime) -> bool:
     """Use Codex's shared allowance and credit rule through its report boundary."""
     def quota(window: ReadingWindow, label: str) -> agent_accounts.Quota:
@@ -1278,7 +1253,7 @@ def pick(tool: Literal["claude", "codex"], now: datetime, *, exclude: frozenset[
         if label in exclude or login.casefold() in seen:
             continue
         seen.add(login.casefold())
-        reading = stored_reading(tool, login, now)
+        reading = refusals.stored_reading(tool, login, now)
         any_fresh = any_fresh or isinstance(reading, FreshReading)
         weekly: ReadingWindow | NoWindow = reading.weekly if isinstance(reading, (FreshReading, StaleReading)) else NoWindow()
         five: ReadingWindow | NoWindow = reading.five_hour if isinstance(reading, (FreshReading, StaleReading)) else NoWindow()
@@ -1646,6 +1621,127 @@ class MoveRefused:
 
 
 @dataclass(frozen=True)
+class SessionMoveRequested:
+    session_id: str
+    request_id: str
+    target: str
+    stdout: str = ""
+    stderr: str = ""
+    returncode: int = 0
+
+
+@dataclass(frozen=True)
+class SessionMoveRefused:
+    session_id: str
+    reason: str
+    stdout: str = ""
+    stderr: str = ""
+    returncode: int = 1
+
+
+def move_sessions(ids: tuple[str, ...], target: str, *, why: str) -> tuple[SessionMoveRequested | SessionMoveRefused, ...]:
+    """Start one selected shutdown for each source login and report each owner's record."""
+    from uuid import uuid4
+    sys.path.insert(0, str(SCRIPTS / "shutdown"))
+    if TYPE_CHECKING:
+        from scripts.shutdown import inventory, record
+        from scripts.message import sessions
+    else:
+        inventory = import_module("inventory")
+        record = import_module("record")
+        sessions = import_module("sessions")
+    outcomes: dict[str, SessionMoveRequested | SessionMoveRefused] = {}
+    owners: dict[str, Session] = {}
+    groups: dict[str, list[str]] = {}
+
+    def refuse(session_id: str, reason: str, *, stdout: str = "", stderr: str = "", returncode: int = 1) -> None:
+        outcomes[session_id] = SessionMoveRefused(session_id, reason, stdout, stderr, returncode)
+        name = owners[session_id]["name"] if session_id in owners else session_id
+        moves.append_move(moves.FailedMove(kind="failed", at=datetime.now(timezone.utc).isoformat(),
+            tool="claude", subject=session_id + ": " + name, move_id=uuid4().hex, reason=reason))
+
+    try:
+        destination = _move_target(target)
+        if isinstance(destination, MoveRefused):
+            for session_id in ids:
+                refuse(session_id, destination.reason)
+            return tuple(outcomes[session_id] for session_id in ids)
+        live = {item["sessionId"]: item for item in sessions.live_sessions()}
+        before = {saved["session"]["session_id"] for saved in record.all_session_records()}
+        for session_id in ids:
+            found = live.get(session_id)
+            if found is None:
+                refuse(session_id, "session is not live on this machine")
+                continue
+            directory = account.process_config_dir(found["pid"])
+            identity = account_identity(directory) if directory is not None else agent_accounts.UnreadableClaudeAccount()
+            if isinstance(identity, agent_accounts.UnreadableClaudeAccount):
+                refuse(session_id, "account unreadable")
+                continue
+            if session_id in before:
+                refuse(session_id, "already has a shutdown in progress")
+                continue
+            selected = [item for item in inventory.inventory(identity.login, frozenset({session_id}), refresh_desktops=False)["sessions"]
+                        if item["session_id"] == session_id and item["kind"] != "seat"]
+            if not selected:
+                refuse(session_id, "live owner account could not be confirmed")
+                continue
+            owners[session_id] = selected[0]
+            if identity.login.casefold() == destination.login.casefold():
+                refuse(session_id, "already on " + destination.label)
+                continue
+            groups.setdefault(identity.login, []).append(session_id)
+        for login, selected_ids in groups.items():
+            source = account.label_for("Claude", login)
+            command = _shutdown_argv("down", source, "--here", "--only", ",".join(selected_ids),
+                "--restart", "--to", target, "--why", why)
+            try:
+                prior_requests = {(entry["move_id"], entry["subject"]) for entry in moves.read_moves()
+                                  if entry["kind"] == "requested"}
+                result = subprocess.run(command, capture_output=True, text=True, check=False,
+                    env={**os.environ, "REFUSAL_WATCH_INVENTORY": "read existing"})
+                saved_by_id = {saved["session"]["session_id"]: saved for saved in record.all_session_records()}
+                for session_id in selected_ids:
+                    saved = saved_by_id.get(session_id)
+                    if saved is None or saved.get("target") != target:
+                        # A fast conductor may already have archived a confirmed restart.
+                        journal_request = next((entry for entry in reversed(moves.read_moves())
+                            if entry["kind"] == "requested" and entry["tool"] == "claude" and entry["to"] == target
+                            and entry["subject"] == session_id + ": " + owners[session_id]["name"]
+                            and (entry["move_id"], entry["subject"]) not in prior_requests), None)
+                        if journal_request is not None:
+                            outcomes[session_id] = SessionMoveRequested(session_id, journal_request["move_id"], target,
+                                result.stdout, result.stderr, result.returncode)
+                            continue
+                        refuse(session_id, result.stderr.strip() or result.stdout.strip() or "shutdown refused before a record was created",
+                            stdout=result.stdout, stderr=result.stderr, returncode=result.returncode or 1)
+                        continue
+                    outcome = SessionMoveRequested(session_id, saved["request_id"], target,
+                        result.stdout, result.stderr, result.returncode)
+                    outcomes[session_id] = outcome
+                    if not any(entry["kind"] == "requested" and entry["move_id"] == saved["request_id"]
+                            and entry["subject"] == session_id + ": " + owners[session_id]["name"] for entry in moves.read_moves()):
+                        request: moves.RequestedMove = {"kind": "requested", "at": saved["requested_at"],
+                            "tool": "claude", "subject": session_id + ": " + owners[session_id]["name"],
+                            "move_id": saved["request_id"], "from": saved.get("source_label", source),
+                            "to": target, "why": why, "window": "unknown"}
+                        refusal = refusals.load().get(refusals.key("claude", login))
+                        if refusal is not None:
+                            request["window"] = refusal.window.name if isinstance(refusal.window, refusals.KnownWindow) else "unknown"
+                            if isinstance(refusal.reset, refusals.KnownReset):
+                                request["reset"] = refusal.reset.at.isoformat()
+                        moves.append_move(request)
+            except (OSError, ValueError, record.InvalidRecord) as error:
+                for session_id in selected_ids:
+                    refuse(session_id, str(error))
+    except (AccountsError, OSError, ValueError, inventory.InvalidInventory, record.InvalidRecord) as error:
+        for session_id in ids:
+            if session_id not in outcomes:
+                refuse(session_id, str(error))
+    return tuple(outcomes[session_id] for session_id in ids)
+
+
+@dataclass(frozen=True)
 class MoveStarted:
     session_id: str
     target: str
@@ -1719,7 +1815,7 @@ def move_showrunners(source: str, target: str, *, dry_run: bool = False, why: st
             return destination
         if destination.login.casefold() == current.login.casefold():
             return MoveRefused(f"{source} is already on {destination.label}")
-        owners = [item for item in inventory.inventory(current.login)["sessions"] if item["kind"] == "showrunner"]
+        owners = [item for item in inventory.inventory(current.login, refresh_desktops=False)["sessions"] if item["kind"] == "showrunner"]
         if not owners:
             return MoveRefused(f"no showrunner on {source} on this machine")
         open_ids = {saved["session"]["session_id"] for saved in record.all_session_records()}
@@ -1737,10 +1833,14 @@ def move_showrunners(source: str, target: str, *, dry_run: bool = False, why: st
         for owner in selected:
             if owner["host"]["kind"] == "unknown":
                 print(f"run this once {owner['name']} has exited: {restart.resume_command(owner, target, current.label, why)}", flush=True)
-        result = subprocess.run(command, capture_output=True, text=True, check=False)
+        results = move_sessions(ids, target, why=reason)
+        refused = [item for item in results if isinstance(item, SessionMoveRefused)]
+        requested = [item for item in results if isinstance(item, SessionMoveRequested)]
         prefix = "\n".join(skipped) + "\n" if skipped else ""
-        outcome = ShowrunnersMoveStartFailed if result.returncode else ShowrunnersMoveStarted
-        return outcome(ids, target, prefix + result.stdout, result.stderr, result.returncode)
+        outcome = ShowrunnersMoveStartFailed if refused or any(item.returncode for item in requested) else ShowrunnersMoveStarted
+        return outcome(ids, target, prefix + (results[0].stdout if results else ""),
+            (results[0].stderr if results and results[0].stderr else "\n".join(item.reason for item in refused)),
+            max((item.returncode for item in results), default=0))
     except (AccountsError, account.UnknownAccountName, record.InvalidRecord, inventory.InvalidInventory, OSError, ValueError) as error:
         return MoveRefused(str(error))
 
@@ -2218,7 +2318,8 @@ def _status_notes(status: AccountStatus) -> list[str]:
 def status_report() -> str:
     """One table row per account folder, then one line for each thing wrong in a folder."""
     statuses = account_statuses()
-    seats_home = _seats_home()
+    selected_seats = role_account("seats")
+    seats_home = selected_seats.home
     codex = codex_statuses(seats_home)
     now = datetime.now(timezone.utc)
     usage = _stored_usage(statuses, codex, now)
@@ -2231,7 +2332,99 @@ def status_report() -> str:
     ])
     notes = [*(note for status in statuses for note in _status_notes(status)),
              *(problem for status in codex for problem in status.problems)]
-    return "\n".join([table, *([""] if notes else []), *notes])
+    return "\n".join([table, "", *notes,
+        *_live_status_lines(), *_seats_status_lines(now, selected_seats), *_move_status_lines(moves.read_moves(), zone)])
+
+
+SEATS_RUN_ROOT = Path("/tmp/claude/delegate")
+
+
+def _live_status_lines() -> list[str]:
+    from scripts.message import sessions
+    lines: list[str] = []
+    for session in sessions.live_sessions():
+        directory = account.process_config_dir(session["pid"])
+        identity = account_identity(directory) if directory is not None else agent_accounts.UnreadableClaudeAccount()
+        label = identity.label if isinstance(identity, agent_accounts.KnownClaudeAccount) else "account unreadable"
+        lines.append(f"session {session['sessionId']} ({session['name']}): {label}")
+    return lines
+
+
+def _mesh_server_running(run: Path) -> bool:
+    try:
+        raw = cast(object, json.loads((run / "mesh_server.json").read_text()))
+        if not isinstance(raw, dict):
+            return False
+        pid = cast(dict[str, object], raw).get("pid")
+        if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
+            return False
+    except (OSError, ValueError):
+        return False
+    try:
+        os.kill(pid, 0)
+    except PermissionError:
+        return True
+    except (OSError, OverflowError):
+        return False
+    return True
+
+
+def _seats_status_lines(now: datetime, selected: CodexSeatsAccount) -> list[str]:
+    chosen = pick("codex", now, exclude=frozenset({selected.label}), keep=NoKeep())
+    destination = chosen.label if isinstance(chosen, PickedAccount) else no_room_line("codex", chosen)
+    lines = [f"Codex seats: {selected.label}; on refusal: {destination}"]
+    for path in sorted(SEATS_RUN_ROOT.glob("*/mesh_roster.json")):
+        if not _mesh_server_running(path.parent):
+            continue
+        try:
+            raw = cast(object, json.loads(path.read_text()))
+        except (OSError, ValueError):
+            continue
+        if not isinstance(raw, dict):
+            continue
+        for name, value in cast(dict[str, object], raw).items():
+            if not isinstance(value, dict):
+                continue
+            entry = cast(dict[str, object], value)
+            if entry.get("continuation_owed") is True:
+                reason = entry.get("continuation_reason")
+                if not isinstance(reason, str):
+                    reason = "quota refusal; waiting for account recovery or a confirmed move"
+                    if entry.get("status") == "waiting_capacity":
+                        reason = "waiting for capacity on the selected account"
+                lines.append(f"seat {path.parent.name}/{name}: continuation owed — {reason}")
+    return lines
+
+
+def _move_status_lines(entries: list[moves.MoveEntry], zone: tzinfo) -> list[str]:
+    lines: list[str] = []
+    for entry in entries[-10:]:
+        at = datetime.fromisoformat(entry["at"]).astimezone(zone).strftime("%Y-%m-%d %H:%M:%S %Z")
+        detail: str = entry["kind"]
+        if entry["kind"] == "requested":
+            outcomes: list[str] = []
+            for outcome in entries:
+                if outcome["move_id"] != entry["move_id"] or outcome["subject"] != entry["subject"]:
+                    continue
+                if outcome["kind"] == "confirmed":
+                    seat = outcome.get("seat", entry["subject"])
+                    outcomes.append(f"confirmed {seat} on {outcome.get('home', outcome.get('config_dir', ''))}")
+                elif outcome["kind"] == "failed":
+                    outcomes.append("failed: " + outcome["reason"])
+            detail = f"requested {entry['from']} → {entry['to']}: {entry['why']} — " + ("; ".join(outcomes) or "pending")
+        elif entry["kind"] == "confirmed":
+            detail = f"confirmed {entry.get('seat', entry['subject'])}: {entry.get('home', entry.get('config_dir', ''))}"
+        elif entry["kind"] == "failed":
+            detail = "failed: " + entry["reason"]
+        elif entry["kind"] == "waited":
+            detail = "waited until " + datetime.fromisoformat(entry["reset"]).astimezone(zone).isoformat()
+        elif entry["kind"] == "no room":
+            reset = entry["earliest_reset"]
+            detail = "no room until " + (datetime.fromisoformat(reset).astimezone(zone).isoformat() if reset else "unknown reset")
+        elif entry["kind"] == "room again":
+            detail = "room again: " + entry["label"]
+        lines.append(f"{at} {entry['tool']} {entry['subject']}: {detail}")
+    return lines
 
 
 def _parser() -> argparse.ArgumentParser:

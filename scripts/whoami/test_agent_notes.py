@@ -11,7 +11,7 @@ import sys
 import tempfile
 import unittest
 import urllib.request
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 from datetime import datetime, timedelta, timezone, tzinfo
 from pathlib import Path
 from typing import Self, cast, override
@@ -30,7 +30,13 @@ from agent_accounts import (ClaudeDirectorySource, CodexHomeSource, CodexRateLim
                             codex_credits, reset_credits)
 from agent_notes import apply, local_reset
 from note_file import Note, read_note
-from scripts.accounts import accounts
+from scripts.accounts import accounts, refusal_watch, refusals
+from scripts.production import showrunners
+
+
+def setUpModule() -> None:
+    root = Path(unittest.enterModuleContext(tempfile.TemporaryDirectory()))
+    _ = unittest.enterModuleContext(patch.object(showrunners, "NOTIFIER_STATE_DIR", root))
 
 
 class AgentNotesTests(unittest.TestCase):
@@ -54,6 +60,56 @@ class AgentNotesTests(unittest.TestCase):
         _ = os.environ.pop("CODEX_HOME", None)
         _ = self.enterContext(patch.object(note_file, "AGENTS_DIR", self.root))
         _ = self.enterContext(patch.object(agent_notes, "READINGS_LOG", self.root / "readings.jsonl", create=True))
+        _ = self.enterContext(patch.object(showrunners, "NOTIFIER_STATE_DIR", self.root / "notifier"))
+
+    def test_argument_free_notes_update_runs_watcher_after_notes_alert_and_pacer(self) -> None:
+        events: list[str] = []
+        update = agent_notes.update_alert_pass
+        def updated(selection: agent_accounts.ClaudeAccountsInUse, home: Path) -> agent_notes.UpdatedAgentNotes:
+            events.append("notes")
+            return update(selection, home)
+        def alerted(*_args: object, **_kwargs: object) -> list[str]:
+            events.append("alert")
+            return []
+        def paced(*_args: object, **_kwargs: object) -> None:
+            events.append("pacer")
+        def watched(*_args: object, **_kwargs: object) -> list[str]:
+            events.append("watcher")
+            return ["fixture watcher decision"]
+        with (patch.object(sys, "argv", ["agent_notes.py"]),
+              patch.object(agent_notes, "live_reports", return_value=[]),
+              patch.object(five_hour, "watch", return_value=[]),
+              patch.object(agent_notes, "update_alert_pass", side_effect=updated),
+              patch.object(agent_notes, "alert", side_effect=alerted),
+              patch.object(codex_pacer, "tick", side_effect=paced),
+              patch.object(agent_notes, "mark_tier"),
+              patch.object(refusal_watch, "run", side_effect=watched), redirect_stdout(io.StringIO()) as output):
+            agent_notes.main()
+        self.assertEqual(events, ["notes", "alert", "pacer", "watcher"])
+        self.assertIn("fixture watcher decision", output.getvalue())
+
+    def test_watcher_failure_prints_one_stderr_line_without_failing_notes_update(self) -> None:
+        with (patch.object(sys, "argv", ["agent_notes.py"]),
+              patch.object(agent_notes, "live_reports", return_value=[]),
+              patch.object(five_hour, "watch", return_value=[]),
+              patch.object(agent_notes, "alert", return_value=[]),
+              patch.object(codex_pacer, "tick"), patch.object(agent_notes, "mark_tier"),
+              patch.object(refusal_watch, "run", side_effect=OSError("watch fixture unavailable")),
+              redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()) as error):
+            agent_notes.main()
+        self.assertEqual(len(error.getvalue().splitlines()), 1)
+        self.assertIn("watch fixture unavailable", error.getvalue())
+
+    def test_explicit_refresh_does_not_run_automatic_refusal_watcher(self) -> None:
+        with (patch.object(sys, "argv", ["agent_notes.py", "refresh"]),
+              patch.object(agent_notes, "live_reports", return_value=[]),
+              patch.object(five_hour, "watch", return_value=[]),
+              patch.object(agent_notes, "refresh", return_value=[]),
+              patch.object(agent_notes, "current_session", return_value=None),
+              patch.object(codex_pacer, "tick"), patch.object(agent_notes, "mark_tier"),
+              patch.object(refusal_watch, "run") as watcher, redirect_stdout(io.StringIO())):
+            agent_notes.main()
+        watcher.assert_not_called()
 
     def note(self, name: str, email: str, extra: str = "") -> Note:
         path = self.root / name
@@ -141,6 +197,34 @@ class AgentNotesTests(unittest.TestCase):
             self.assertEqual(passes[0].seats.home, default)
             self.assertEqual([reading.home for reading in passes[0].checked_homes], [default, spare])
             self.assertTrue(all(reading.observed_at.tzinfo is not None for reading in passes[0].checked_homes))
+
+    def test_blocked_cli_passes_explicit_window_and_aware_refusal_time(self) -> None:
+        refused_at = self.now - timedelta(seconds=3)
+        with (patch.object(sys, "argv", ["agent_notes.py", "blocked", str(self.root / ".codex"),
+                  "seats@example.invalid", "codex 1", "--window", "five_hour", "--refused-at", refused_at.isoformat()]),
+              patch.object(agent_notes, "blocked", return_value=[]) as blocked,
+              patch.object(note_file, "read_notes", return_value=[])):
+            agent_notes.main()
+        blocked.assert_called_once()
+        self.assertEqual(blocked.call_args.kwargs["window"], refusals.KnownWindow("five_hour"))
+        self.assertEqual(blocked.call_args.kwargs["refused_at"], quota_alert.RefusedAt(refused_at))
+
+    def test_blocked_cli_missing_time_has_explicit_unknown_refusal_time(self) -> None:
+        with (patch.object(sys, "argv", ["agent_notes.py", "blocked", str(self.root / ".codex"),
+                  "seats@example.invalid", "codex 1"]),
+              patch.object(agent_notes, "blocked", return_value=[]) as blocked,
+              patch.object(note_file, "read_notes", return_value=[])):
+            agent_notes.main()
+        self.assertEqual(blocked.call_args.kwargs["refused_at"], quota_alert.RefusalTimeUnknown())
+
+    def test_blocked_cli_rejects_naive_refusal_time_before_reporting(self) -> None:
+        with (patch.object(sys, "argv", ["agent_notes.py", "blocked", str(self.root / ".codex"),
+                  "seats@example.invalid", "codex 1", "--refused-at", "2026-10-13T12:00:00"]),
+              patch.object(agent_notes, "blocked") as blocked,
+              redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as exited):
+            agent_notes.main()
+        self.assertEqual(exited.exception.code, 2)
+        blocked.assert_not_called()
 
     def test_update_writes_each_codex_home_and_keeps_only_the_seats_note_active(self) -> None:
         default = self.root / ".codex"

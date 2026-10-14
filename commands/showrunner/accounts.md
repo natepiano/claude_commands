@@ -10,6 +10,10 @@ and print its output exactly as it comes, with nothing added.
 
 - No arguments: one Markdown table, a row for `~/.claude` and each `~/.claudeN`,
   logged in or not, and for each Codex account, then a line for anything wrong in a folder.
+  Status also lists each live session's account, Codex's destination on a refusal,
+  held seat continuations and the last ten move entries with their outcomes.
+  Claude sessions refused by the provider move automatically on the notes timer;
+  the shutdown progress line keeps their target and reason visible until safe to stop.
 - `setup "claude N"`: builds the folder and prints how to log in.
 - `setup "codex N"`: links the home, finishes its first startup (up to 20 minutes: run it in the background), then prints the login command.
   Keep `CODEX_HOME` on it: without it, `codex login` signs `~/.codex` out and in, stopping seats on the default role.

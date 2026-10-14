@@ -278,6 +278,27 @@ class AccountMoveTests(ShutdownTestCase):
         return inventory.Inventory(machine="natedev", login="current@example.invalid", label="claude 1",
             sessions=[first, unit("unit-id"), second, top_level("ordinary-id")], unattributed=[])
 
+    def batch_registry(self, report: inventory.Inventory) -> list[sessions.SessionRecord]:
+        return [sessions.SessionRecord(pid=owner["pid"], sessionId=owner["session_id"],
+            name=owner["name"], messagingSocketPath="", updatedAt=1, tmux="", formerNames=[])
+            for owner in report["sessions"]]
+
+    def start_batch(self, command: list[str], **_options: object) -> subprocess.CompletedProcess[str]:
+        selected = command[command.index("--only") + 1].split(",")
+        report = self.showrunner_inventory()
+        for owner in report["sessions"]:
+            if owner["session_id"] not in selected:
+                continue
+            saved = entry(owner)
+            saved["login"] = report["login"]
+            saved["label"] = report["label"]
+            saved["source_label"] = report["label"]
+            saved["target"] = command[command.index("--to") + 1]
+            saved["why"] = command[command.index("--why") + 1]
+            saved["progress"] = record.SessionWaiting(kind="waiting")
+            self.assertTrue(record.create_session(saved))
+        return subprocess.CompletedProcess(command, 0, "", "")
+
     def batch_cli(self, *, target: str = "claude 3", dry_run: bool = False) -> tuple[int, str, str]:
         output, error = io.StringIO(), io.StringIO()
         arguments = ["move", "showrunners", "--from", "claude 1", "--to", target]
@@ -307,7 +328,8 @@ class AccountMoveTests(ShutdownTestCase):
         report = self.showrunner_inventory()
         with (
             patch.object(inventory, "inventory", return_value=report) as read_inventory,
-            patch.object(subprocess, "run", return_value=subprocess.CompletedProcess([], 0, "", "")) as process,
+            patch.object(sessions, "live_sessions", return_value=self.batch_registry(report)),
+            patch.object(subprocess, "run", side_effect=self.start_batch) as process,
         ):
             result, _, error = self.batch_cli()
         self.assertEqual((result, error), (0, ""))
@@ -321,9 +343,11 @@ class AccountMoveTests(ShutdownTestCase):
         self.assertEqual(set(arguments[arguments.index("--only") + 1].split(",")), {"sr-one", "sr-two"})
 
     def test_bulk_move_forwards_a_single_explicit_reason_for_all_selected_showrunners(self) -> None:
+        report = self.showrunner_inventory()
         with (
-            patch.object(inventory, "inventory", return_value=self.showrunner_inventory()),
-            patch.object(subprocess, "run", return_value=subprocess.CompletedProcess([], 0, "", "")) as process,
+            patch.object(inventory, "inventory", return_value=report),
+            patch.object(sessions, "live_sessions", return_value=self.batch_registry(report)),
+            patch.object(subprocess, "run", side_effect=self.start_batch) as process,
         ):
             self.assertEqual(accounts.main(["move", "showrunners", "--from", "claude 1", "--to", "claude 3",
                 "--why", "weekly limit reached"]), 0)
@@ -332,8 +356,10 @@ class AccountMoveTests(ShutdownTestCase):
         process.assert_called_once()
 
     def test_bulk_move_failed_shutdown_start_returns_failure_instead_of_started(self) -> None:
+        report = self.showrunner_inventory()
         with (
-            patch.object(inventory, "inventory", return_value=self.showrunner_inventory()),
+            patch.object(inventory, "inventory", return_value=report),
+            patch.object(sessions, "live_sessions", return_value=self.batch_registry(report)),
             patch.object(subprocess, "run", return_value=subprocess.CompletedProcess([], 2,
                 "", "shutdown: keys are cold\n")),
         ):
@@ -379,14 +405,19 @@ class AccountMoveTests(ShutdownTestCase):
         before = self.disk_state()
         with (
             patch.object(inventory, "inventory", return_value=report),
-            patch.object(subprocess, "run", return_value=subprocess.CompletedProcess([], 0, "", "")) as process,
+            patch.object(sessions, "live_sessions", return_value=self.batch_registry(report)),
+            patch.object(subprocess, "run", side_effect=self.start_batch) as process,
         ):
             result, output, error = self.batch_cli()
         self.assertEqual(result, 0)
         self.assertIn("first showrunner already has a shutdown in progress", output + error)
         arguments = cast(tuple[str, ...], process.call_args.args[0])
         self.assertEqual(arguments[arguments.index("--only") + 1], "sr-two")
-        self.assertEqual(self.disk_state(), before)
+        self.assertEqual(record.find_session("current@example.invalid", "sr-one"), saved)
+        added = record.find_session("current@example.invalid", "sr-two")
+        assert added is not None and "target" in added
+        self.assertEqual(added["target"], "claude 3")
+        self.assertNotEqual(self.disk_state(), before)
 
     def test_bulk_move_dry_run_prints_selection_down_and_each_exact_resume_without_change(self) -> None:
         report = self.showrunner_inventory()
@@ -409,9 +440,11 @@ class AccountMoveTests(ShutdownTestCase):
         process.assert_not_called()
 
     def test_bulk_move_to_default_preserves_default_target_in_the_single_down(self) -> None:
+        report = self.showrunner_inventory()
         with (
-            patch.object(inventory, "inventory", return_value=self.showrunner_inventory()),
-            patch.object(subprocess, "run", return_value=subprocess.CompletedProcess([], 0, "", "")) as process,
+            patch.object(inventory, "inventory", return_value=report),
+            patch.object(sessions, "live_sessions", return_value=self.batch_registry(report)),
+            patch.object(subprocess, "run", side_effect=self.start_batch) as process,
         ):
             result, _, error = self.batch_cli(target="default")
         self.assertEqual((result, error), (0, ""))

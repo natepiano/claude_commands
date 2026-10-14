@@ -118,7 +118,7 @@ Evidence: `docs/as-built/herdr-trial.md` (findings 1–8, gotchas, reusable and 
 
 ### Phase 3 — Trust checked before every launch  · status: moved
 
-Moved to `docs/plans/build-followups-herdr-trust.md` (unit `herdr-trust-unit`), run in parallel with Phase 5. Phase 7 waits for it.
+Moved to unit `herdr-trust-unit`, run in parallel with Phase 5; shipped as `docs/as-built/herdr-adoption.md` → "Claude trust before every launch". Phase 7 waits for it.
 
 ### Phase 4 — Typing into and reading sessions on either host  · status: moved
 

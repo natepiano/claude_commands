@@ -44,7 +44,7 @@ class AccountRefusalTests(unittest.TestCase):
         file = usage_store.store_file()
         file.parent.mkdir(parents=True, exist_ok=True)
         _ = file.write_text(json.dumps({usage_store.key(tool.capitalize(), "owner@example.invalid"): usage}))
-        return accounts.stored_reading("codex" if tool == "codex" else "claude", "owner@example.invalid", self.now + timedelta(minutes=2))
+        return refusals.stored_reading("codex" if tool == "codex" else "claude", "owner@example.invalid", self.now + timedelta(minutes=2))
 
     def test_refusal_round_trips_semantic_window_reset_and_timestamp(self) -> None:
         original = self.refusal(reset=refusals.KnownReset(self.now + timedelta(hours=3)))

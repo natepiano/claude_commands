@@ -32,6 +32,9 @@ import conversation_pause
 import settle
 import showrunner_footer
 import shutdown
+import account as account_reader
+from scripts.accounts import moves
+from scripts.production import showrunners
 from account import Account, UnknownAccountName, UnreadableAccount
 from record import SessionShutdown, SessionProgress, TimerRestore, Where
 
@@ -238,6 +241,8 @@ def peer_json(*, outcome: str = "done", lines: Sequence[str] = (), missing: Sequ
 def setUpModule() -> None:
     """The times these tests expect are Pacific; the user's zone setting must not change them."""
     unittest.enterModuleContext(patch.dict(os.environ, {"USER_ZONE": "America/Los_Angeles"}))
+    root = Path(unittest.enterModuleContext(tempfile.TemporaryDirectory()))
+    _ = unittest.enterModuleContext(patch.object(showrunners, "NOTIFIER_STATE_DIR", root))
 
 
 @final
@@ -289,6 +294,99 @@ class RestartTests(ShutdownTestCase):
 
     def stored_record(self) -> SessionShutdown:
         return record.session_records(LOGIN)[0]
+
+    def moved_record(self, identity: str = "moved-owner") -> SessionShutdown:
+        saved = entry(top_level(identity, host=tmux_host(identity)))
+        saved["target"] = "claude 3"
+        saved["source_label"] = LABEL
+        saved["why"] = "weekly refusal"
+        self.create([saved])
+        return saved
+
+    def test_live_source_account_cannot_confirm_a_move(self) -> None:
+        saved = self.moved_record()
+        owner = saved["session"]
+        live = sessions.SessionRecord(pid=owner["pid"], sessionId=owner["session_id"],
+            name=owner["name"], messagingSocketPath="", updatedAt=1, tmux="", formerNames=[])
+        with (patch.object(sessions, "live_sessions", return_value=[live]),
+              patch.object(account_reader, "process_config_dir", return_value=self.root / ".claude2"),
+              patch.object(account_reader, "account_of", return_value=Account("claude", LOGIN, LABEL)),
+              patch.object(settle, "run_notifier") as timers):
+            restart.confirm_entry(saved, RESTARTED, True)
+        timers.assert_not_called()
+        entries = moves.read_moves()
+        self.assertEqual([item["kind"] for item in entries], ["failed"])
+        failed = entries[0]
+        assert failed["kind"] == "failed"
+        self.assertEqual(failed["move_id"], saved["request_id"])
+        self.assertEqual(failed["reason"], "still on claude 2")
+        self.assertNotEqual(self.stored_record()["progress"]["kind"], "restarted")
+
+    def test_target_process_confirms_move_even_when_timer_restoration_is_pending(self) -> None:
+        saved = self.moved_record()
+        saved["timers"] = [TimerRestore(instance="timer", was_enabled=True,
+            footer=record.NoFooter(kind="no footer"))]
+        _ = record.update_session(LOGIN, saved["session"]["session_id"],
+            lambda current: current.update(timers=saved["timers"]))
+        owner = saved["session"]
+        live = sessions.SessionRecord(pid=owner["pid"], sessionId=owner["session_id"],
+            name=owner["name"], messagingSocketPath="", updatedAt=1, tmux="", formerNames=[])
+        with (patch.object(sessions, "live_sessions", return_value=[live]),
+              patch.object(account_reader, "process_config_dir", return_value=self.root / ".claude3"),
+              patch.object(account_reader, "account_of", return_value=Account("claude", "target@example.com", "claude 3")),
+              patch.object(settle, "run_notifier", side_effect=RuntimeError("timer unavailable"))):
+            restart.confirm_entry(saved, RESTARTED, True)
+        self.assertEqual(self.stored_record()["progress"]["kind"], "timers pending")
+        confirmed = moves.read_moves()
+        self.assertEqual([item["kind"] for item in confirmed], ["confirmed"])
+        item = confirmed[0]
+        assert item["kind"] == "confirmed" and "config_dir" in item
+        self.assertEqual(item["move_id"], saved["request_id"])
+        self.assertEqual(item["config_dir"], str(self.root / ".claude3"))
+
+    def test_unconfirmed_target_restart_records_failure_with_request_id(self) -> None:
+        saved = self.moved_record()
+        restart.confirm_entry(saved, RESTARTED, False)
+        entries = moves.read_moves()
+        self.assertEqual([item["kind"] for item in entries], ["failed"])
+        item = entries[0]
+        assert item["kind"] == "failed"
+        self.assertEqual(item["move_id"], saved["request_id"])
+        self.assertIn("not live", item["reason"])
+
+    def test_default_target_process_confirms_main_directory_and_removes_assumption(self) -> None:
+        saved = entry(top_level("default-target", host=tmux_host("default-target")))
+        saved["target"] = "default"
+        self.create([saved])
+        assumed = self.root / ".local/state/accounts/assumed_refusals/default-target.json"
+        assumed.parent.mkdir(parents=True)
+        _ = assumed.write_text("{}")
+        live = sessions.SessionRecord(pid=23456, sessionId="default-target", name="default-target",
+            messagingSocketPath="", updatedAt=1, tmux="", formerNames=[])
+        with (patch.object(sessions, "live_sessions", return_value=[live]),
+              patch.object(account_reader, "process_config_dir", return_value=self.root / ".claude")):
+            restart.confirm_entry(saved, RESTARTED, True)
+        self.assertFalse(assumed.exists())
+        entries = moves.read_moves()
+        self.assertEqual([item["kind"] for item in entries], ["confirmed"])
+        confirmed = entries[0]
+        assert confirmed["kind"] == "confirmed" and "config_dir" in confirmed
+        self.assertEqual(confirmed["config_dir"], str(self.root / ".claude"))
+
+    def test_manual_move_restart_records_failure_instead_of_confirmation(self) -> None:
+        saved = entry(top_level("manual-owner"))
+        saved["target"] = "claude 3"
+        self.create([saved])
+        with (patch.object(restart, "_retire"),
+              patch.object(restart, "_live_session_ids", return_value=frozenset()),
+              redirect_stdout(io.StringIO())):
+            _ = restart.launch_entry(saved, RESTARTED, self.desktop_state, dry_run=False)
+        entries = moves.read_moves()
+        self.assertEqual([item["kind"] for item in entries], ["failed"])
+        item = entries[0]
+        assert item["kind"] == "failed"
+        self.assertEqual(item["move_id"], saved["request_id"])
+        self.assertIn("manual restart", item["reason"])
 
     @staticmethod
     def all_sessions_live(ids: frozenset[str], _timeout: float) -> restart.RegistryConfirmation:
@@ -390,9 +488,36 @@ class RestartTests(ShutdownTestCase):
         launch = next(argv for argv in commands if "ghostty" in argv)
         self.assert_move_resume(launch[-1], owner)
 
+    def test_linux_terminal_move_requires_manual_resume_and_journals_failure(self) -> None:
+        owner = top_level("linux-terminal", host=inventory.TerminalHost(kind="terminal"))
+        saved = entry(owner)
+        saved["target"] = "claude 3"
+        saved["source_label"] = LABEL
+        saved["why"] = "weekly refusal"
+        self.create([saved])
+        with (patch.object(sys, "platform", "linux"),
+              patch.object(restart, "_retire"),
+              patch.object(restart, "_live_session_ids", return_value=frozenset()),
+              patch.object(restart, "_run") as launch, redirect_stdout(io.StringIO()) as output):
+            result = restart.launch_entry(saved, RESTARTED, self.desktop_state, dry_run=False)
+        launch.assert_not_called()
+        self.assertIsInstance(result, restart.EntrySettled)
+        progress = self.stored_record()["progress"]
+        self.assertEqual(progress["kind"], "manual restart")
+        assert progress["kind"] == "manual restart"
+        self.assert_move_resume(progress["command"], owner)
+        self.assertIn("manual restart linux-terminal:", output.getvalue())
+        entries = moves.read_moves()
+        self.assertEqual([entry["kind"] for entry in entries], ["failed"])
+        failed = entries[0]
+        assert failed["kind"] == "failed"
+        self.assertEqual(failed["move_id"], saved["request_id"])
+        self.assertEqual(failed["reason"], "manual restart")
+
     def test_move_target_reopens_terminal_through_accounts_exec(self) -> None:
         owner = top_level("move-terminal", host=inventory.TerminalHost(kind="terminal"))
-        commands, _ = self.moved_restart(owner)
+        with patch.object(sys, "platform", "darwin"):
+            commands, _ = self.moved_restart(owner)
         launch = next(argv for argv in commands if argv[:1] == ["open"])
         self.assert_move_resume(launch[-1], owner)
 
@@ -857,8 +982,12 @@ class RestartTests(ShutdownTestCase):
         window_argvs = [argv for argv in argvs if argv[:1] == ['systemd-run']]
         self.assertEqual(len(window_argvs), 2)
         self.assertTrue(all(('ghostty' in argv for argv in window_argvs)))
-        terminal = next((argv for argv in argvs if argv[:1] == ['open']))
-        self.assertEqual(terminal[:4], ['open', '-na', '/Applications/Nix Apps/Ghostty.app', '--args'])
+        if sys.platform == "linux":
+            self.assertFalse(any(argv[:1] == ['open'] for argv in argvs))
+            self.assertTrue(any(line.startswith('manual restart terminal:') for line in lines))
+        else:
+            terminal = next(argv for argv in argvs if argv[:1] == ['open'])
+            self.assertEqual(terminal[:4], ['open', '-na', '/Applications/Nix Apps/Ghostty.app', '--args'])
         tmux = next((argv for argv in argvs if argv[:2] == ['tmux', 'respawn-pane']))
         self.assertIn('%dry', tmux)
         display = next(argv for argv in argvs if argv[:2] == ['tmux', 'display'])
@@ -894,7 +1023,7 @@ class RestartTests(ShutdownTestCase):
         with patch.object(restart, '_run', commands), patch.object(restart, '_live_session_ids', return_value=frozenset()), patch.object(settle, 'record_time', return_value=RESTARTED), redirect_stdout(output):
             self.assertEqual(restart.up(LOGIN, dry_run=True), 0)
         resume_commands = [argv[-1] for argv in commands.calls if '-ic' in argv]
-        self.assertEqual(len(resume_commands), 4)
+        self.assertEqual(len(resume_commands), 3 if sys.platform == "linux" else 4)
         for command in resume_commands:
             self.assertIn(f'&& {named_prefix(config_dir)}ENABLE_TOOL_SEARCH=true command claude', command)
         self.assertIn(f'{named_prefix(config_dir)}ENABLE_TOOL_SEARCH=true command claude', output.getvalue().split('manual restart named-manual:', 1)[1])
@@ -1723,11 +1852,13 @@ class RestartTests(ShutdownTestCase):
             self.assertEqual(restart.up(LOGIN, dry_run=True), 0)
         self.assertEqual(output.getvalue().replace(str(restart.SCRIPTS), "<scripts>").splitlines(), [
             f"{sys.executable} <scripts>/message/send.py retire --to session:alpha --from shutdown --key shutdown-owner@example.com-alpha",
-            "open -na '/Applications/Nix Apps/Ghostty.app' --args -e zsh -ic 'claude --resume alpha'",
+            ("manual restart alpha: claude --resume alpha" if sys.platform == "linux" else
+             "open -na '/Applications/Nix Apps/Ghostty.app' --args -e zsh -ic 'claude --resume alpha'"),
             f"{sys.executable} <scripts>/message/send.py retire --to session:manual --from shutdown --key shutdown-owner@example.com-manual",
             "manual restart manual: claude --resume manual",
             f"{sys.executable} <scripts>/message/send.py retire --to session:zeta --from shutdown --key shutdown-owner@example.com-zeta",
-            "open -na '/Applications/Nix Apps/Ghostty.app' --args -e zsh -ic 'claude --resume zeta'",
+            ("manual restart zeta: claude --resume zeta" if sys.platform == "linux" else
+             "open -na '/Applications/Nix Apps/Ghostty.app' --args -e zsh -ic 'claude --resume zeta'"),
         ])
         self.assertEqual(self.files(), before)
 
@@ -1776,8 +1907,9 @@ class RestartTests(ShutdownTestCase):
             events.append("delay")
 
         with patch.object(restart, "_retire"), patch.object(restart, "_record_scheduled_restart_prompt"), patch.object(restart, "_run", run), patch.object(restart, "_live_session_ids", return_value=frozenset()), patch.object(restart, "wait_for_confirmation", side_effect=self.all_sessions_live), patch.object(time, "sleep", sleep), redirect_stdout(io.StringIO()):
-            self.assertEqual(restart.up(LOGIN), 0)
-        self.assertEqual(events, ["a-ghostty", "delay", "b-zed", "delay", "c-terminal"])
+            self.assertEqual(restart.up(LOGIN), 1 if sys.platform == "linux" else 0)
+        self.assertEqual(events, ["a-ghostty", "delay", "b-zed"] if sys.platform == "linux" else
+            ["a-ghostty", "delay", "b-zed", "delay", "c-terminal"])
 
     def test_a_competing_relaunch_claim_is_not_confirmed_by_the_losing_caller(self) -> None:
         saved = entry(top_level("owner", host=tmux_host("owner")))
