@@ -294,7 +294,7 @@ class VerifyRoutingTests(unittest.TestCase):
     def reset_cycle(self) -> None:
         now = datetime.now().astimezone().isoformat()
         cycle: dict[str, object] = {
-            "id": CYCLE_ID, "opened_at": now, "release_started_at": now,
+            "id": CYCLE_ID, "opened_at": now, "release_started_at": "",
             "holders": {"holder": {"since": now, "released_at": ""}},
             "recipients": {"unit-director": "unit"},
             "entries": [{

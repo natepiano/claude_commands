@@ -24,6 +24,7 @@ if not __package__:
 sys.path.insert(0, str(PRODUCTION_SCRIPTS))
 
 from scripts.delegate import progress_history
+from scripts.lib.user_zone import user_zone
 from scripts.production import showrunners, unit_lookup
 from scripts.production.add_unit import (
     Production,
@@ -161,6 +162,27 @@ class UnknownFinish(NamedTuple):
     """The plan's completion time cannot yet be determined."""
 
 
+class CouldStart(NamedTuple):
+    """Waiting phases whose dependencies are all done."""
+
+    phases: tuple[str, ...]
+
+
+class NothingToStart(NamedTuple):
+    """No waiting phase can start; names what the first one waits on."""
+
+    reason: str
+
+
+class DependenciesUnknown(NamedTuple):
+    """Waiting phases with no `**Depends on:**` line in the plan."""
+
+    phases: tuple[str, ...]
+
+
+ParallelCheck = CouldStart | NothingToStart | DependenciesUnknown
+
+
 class PhaseRecord(NamedTuple):
     """The complete read-only phase view for one delegate session."""
 
@@ -169,6 +191,7 @@ class PhaseRecord(NamedTuple):
     current: OpenPhase | NoOpenPhase
     phases: list[DonePhase | OpenPhase | TodoPhase]
     plan_finish: FinishedAt | PredictedFinish | UnknownFinish
+    parallel: ParallelCheck
 
 
 class InstanceFinished(NamedTuple):
@@ -478,6 +501,70 @@ def _newest_open_instance(
     return NoOpenPhase()
 
 
+def _open_phase_ids(runs: list[list[dict[str, object]]]) -> set[str]:
+    if not runs or any(
+        _text(event.get("event_type")) == "run_finished" for event in runs[-1]
+    ):
+        return set()
+    opened: dict[str, str] = {}
+    for event in runs[-1]:
+        event_type = _text(event.get("event_type"))
+        instance_id = _text(event.get("phase_instance_id"))
+        if event_type == "phase_started" and instance_id:
+            opened[instance_id] = _text(event.get("phase_id"))
+        elif event_type == "phase_finished":
+            _ = opened.pop(instance_id, None)
+    return set(opened.values())
+
+
+def _parallel_check(
+    phases: list[progress_history.PlanPhase], open_ids: set[str]
+) -> ParallelCheck:
+    states = {
+        phase["id"]: "done"
+        if phase["done"]
+        else "running"
+        if phase["id"] in open_ids
+        else "todo"
+        for phase in phases
+    }
+    waiting = [phase for phase in phases if states[phase["id"]] == "todo"]
+    unknown = tuple(phase["id"] for phase in waiting if phase["depends_on"] is None)
+    if unknown:
+        return DependenciesUnknown(unknown)
+    ready: list[str] = []
+    first_wait = ""
+    for phase in waiting:
+        unmet = [
+            f"Phase {needed} ({states.get(needed, 'not in the plan')})"
+            for needed in phase["depends_on"] or []
+            if states.get(needed) != "done"
+        ]
+        if phase["blocked_by"]:
+            unmet.append(phase["blocked_by"])
+        if not unmet:
+            ready.append(phase["id"])
+        elif not first_wait:
+            first_wait = f"Phase {phase['id']} needs {', '.join(unmet)}"
+    if ready:
+        return CouldStart(tuple(ready))
+    return NothingToStart(first_wait or "no phase is waiting")
+
+
+def parallel_line(check: ParallelCheck) -> str:
+    """The checkpoint notice's `Parallel:` line."""
+    if isinstance(check, CouldStart):
+        return f"Parallel: {', '.join(f'Phase {phase}' for phase in check.phases)} could start"
+    if isinstance(check, NothingToStart):
+        return f"Parallel: none — {check.reason}"
+    named = ", ".join(check.phases)
+    which = f"Phase {named} has" if len(check.phases) == 1 else f"Phases {named} have"
+    return (
+        f"Parallel: unknown — {which} no **Depends on:** line; "
+        + "add one under each phase heading and rerun"
+    )
+
+
 def _normalized_title(title: str) -> str:
     return " ".join(title.replace("`", "").casefold().split())
 
@@ -508,7 +595,9 @@ def _gap_samples(runs: list[list[dict[str, object]]]) -> list[int]:
         pending_finishes: list[float] = []
         for event in events:
             at = _epoch(event.get("timestamp_epoch"))
-            if at is None:
+            # A phase recorded after the fact is written out of time order, so
+            # the gap before it measures nothing.
+            if at is None or event.get("backfilled") is True:
                 continue
             event_type = _text(event.get("event_type"))
             if (
@@ -738,6 +827,7 @@ def build_plan(plan_path: Path) -> PhaseRecord:
     run_events = [_events(path) for path in progress_history.plan_runs(plan_path)]
     instances = _phase_instances(run_events)
     open_instance = _newest_open_instance(run_events)
+    open_ids = _open_phase_ids(run_events)
     assigned = _instances_by_phase(phases, instances)
     current: OpenPhase | NoOpenPhase = NoOpenPhase()
     current_position: PlanPhasePosition | OutsidePlan = OutsidePlan()
@@ -775,6 +865,7 @@ def build_plan(plan_path: Path) -> PhaseRecord:
                 first_stated=open_instance.first_stated,
             )
             rows.append(current)
+            open_ids.add(phase["id"])
         elif phase["done"]:
             rows.append(_done_phase(phase, assigned[index]))
         else:
@@ -856,6 +947,7 @@ def build_plan(plan_path: Path) -> PhaseRecord:
         current=current,
         phases=rows,
         plan_finish=_plan_finish(rows),
+        parallel=_parallel_check(phases, open_ids),
     )
 
 
@@ -1090,6 +1182,12 @@ def _json_record(record: PhaseRecord, zone: ZoneInfo) -> dict[str, object]:
         "plan_finish": plan_finish,
         "current": current_json,
         "phases": [_json_phase(row, zone) for row in record.phases],
+        "parallel": {
+            "could_start": list(record.parallel.phases)
+            if isinstance(record.parallel, CouldStart)
+            else [],
+            "line": parallel_line(record.parallel),
+        },
     }
 
 
@@ -1478,24 +1576,6 @@ def refresh(session_dir: Path) -> None:
     _remove_stale_notes(vault_root, target, ownership)
 
 
-def _local_zone() -> ZoneInfo:
-    configured = os.environ.get("TZ")
-    if configured:
-        try:
-            return ZoneInfo(configured)
-        except ZoneInfoNotFoundError:
-            pass
-    try:
-        localtime = Path("/etc/localtime").resolve()
-        marker = "/zoneinfo/"
-        if marker in str(localtime):
-            return ZoneInfo(str(localtime).split(marker, 1)[1])
-    except (OSError, ZoneInfoNotFoundError):
-        pass
-    local = datetime.now().astimezone().tzinfo
-    return local if isinstance(local, ZoneInfo) else ZoneInfo("UTC")
-
-
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Show or refresh a unit run's plan phases."
@@ -1507,6 +1587,10 @@ def _build_parser() -> argparse.ArgumentParser:
     _ = show_target.add_argument("--production-doc", type=Path)
     _ = show_parser.add_argument("--zone", default="")
     _ = show_parser.add_argument("--json", action="store_true")
+    parallel_parser = commands.add_parser(
+        "parallel", help="print the checkpoint notice's Parallel: line"
+    )
+    _ = parallel_parser.add_argument("--session-dir", type=Path, required=True)
     refresh_parser = commands.add_parser("refresh")
     _ = refresh_parser.add_argument("--session-dir", type=Path, required=True)
     prune_parser = commands.add_parser("prune")
@@ -1531,6 +1615,9 @@ def main() -> int:
         if command == "refresh":
             refresh(session_dir.expanduser().resolve())
             return 0
+        if command == "parallel":
+            print(parallel_line(build(session_dir.expanduser().resolve()).parallel))
+            return 0
         if command == "prune":
             if production_doc is None:
                 raise Refusal("prune requires a production document")
@@ -1546,7 +1633,7 @@ def main() -> int:
             output = show_production(production_doc.expanduser().resolve())
             print(output)
             return 0
-        zone = ZoneInfo(zone_name) if zone_name else _local_zone()
+        zone = ZoneInfo(zone_name) if zone_name else user_zone()
         output = show(session_dir.expanduser().resolve(), zone, json_value is True)
     except (NoState, NoPlan, Refusal, ZoneInfoNotFoundError) as error:
         print(str(error), file=sys.stderr)

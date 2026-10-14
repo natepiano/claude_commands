@@ -5,7 +5,8 @@ from __future__ import annotations
 
 import argparse
 from collections.abc import Generator
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 import fcntl
@@ -17,13 +18,18 @@ import subprocess
 import sys
 import tempfile
 import time
-from typing import Literal, TypeGuard, TypedDict, cast
+import threading
+from typing import Literal, NotRequired, TypeGuard, TypedDict, cast
 
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lint"))
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "build_hold"))
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
 import override_guard
+import build_hold
+import offload
 import sweep
+from user_zone import user_zone
 
 
 MESSAGE_TIMEOUT_S = 30.0
@@ -41,6 +47,8 @@ class ClaimOwnerRecord(TypedDict):
     what: str
     worktree: str
     since: str
+    holder_session: NotRequired[str]
+    idle_since: NotRequired[str]
 
 
 class ProcessBoundClaim(ClaimOwnerRecord):
@@ -279,7 +287,7 @@ NO_EXPIRED_BLOCK_LIFT_FAILURE = NoExpiredBlockLiftFailure()
 
 @dataclass(frozen=True)
 class MacTestConfig:
-    """Mac block and CI settings."""
+    """Mac claim, block and CI settings."""
 
     ci_repo: str
     ci_variable: str
@@ -289,6 +297,32 @@ class MacTestConfig:
     block_hours: float
     block_max_hours: float
     block_warn_minutes: float
+    host: str = "mac"
+    connect_timeout_s: float = 6.0
+    claim_idle_minutes: float = 15.0
+    claim_poll_seconds: float = 60.0
+
+
+@dataclass(frozen=True)
+class MacActive:
+    """The user's Mac processes seen by the activity check."""
+
+    count: int
+
+
+@dataclass(frozen=True)
+class MacIdle:
+    """The activity check found no Mac process."""
+
+
+@dataclass(frozen=True)
+class ActivityCheckFailed:
+    """Mac activity could not be checked or its answer could not be read."""
+
+    reason: str
+
+
+MacActivity = MacActive | MacIdle | ActivityCheckFailed
 
 
 @dataclass(frozen=True)
@@ -342,6 +376,7 @@ class StatePaths:
         self.lock: Path = directory / "state.lock"
         self.control_lock: Path = directory / "control.lock"
         self.watch_lock: Path = directory / "watch.lock"
+        self.claim_watch_lock: Path = directory / "claim_watch.lock"
         self.run: Path = directory / "run.json"
         self.block: Path = directory / "block.json"
 
@@ -375,13 +410,17 @@ def read_config() -> MacTestConfig:
         block_hours=configured_number(values, "block_hours", 4.0),
         block_max_hours=configured_number(values, "block_max_hours", 48.0),
         block_warn_minutes=configured_number(values, "block_warn_minutes", 15.0),
+        host=values.get("host", "mac"),
+        connect_timeout_s=configured_number(values, "connect_timeout_s", 6.0),
+        claim_idle_minutes=configured_number(values, "claim_idle_minutes", 15.0),
+        claim_poll_seconds=configured_number(values, "claim_poll_seconds", 60.0),
     )
 
 
 @contextmanager
 def locked(path: Path) -> Generator[None, None, None]:
     path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("a+", encoding="utf-8") as lock_file:
+    with record_after_unlock(), path.open("a+", encoding="utf-8") as lock_file:
         fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
         try:
             yield
@@ -441,6 +480,15 @@ def read_run(path: Path) -> RunState:
         "worktree": worktree,
         "since": since,
     }
+    if "holder_session" in values:
+        holder_session = required_string(values, "holder_session", path)
+        if not holder_session.strip():
+            raise StateReadError(f"{path} has an invalid holder_session")
+        record["holder_session"] = holder_session
+    if "idle_since" in values:
+        idle_since = values["idle_since"]
+        _ = aware_timestamp(idle_since, path, "idle_since")
+        record["idle_since"] = cast(str, idle_since)
     if "remote_host" not in values:
         return record
     host = values["remote_host"]
@@ -648,20 +696,66 @@ def write_block(path: Path, block: PendingMacBlock | ActiveMacBlock) -> None:
 
 
 def utc_now() -> datetime:
-    return datetime.now(timezone.utc).replace(microsecond=0)
+    return datetime.now(timezone.utc)
+
+
+@dataclass(frozen=True)
+class MacBlockEvent:
+    kind: Literal["began", "ended"]
+    block: PendingMacBlock | ActiveMacBlock
+    at: datetime
+
+
+pending_hold_events: ContextVar[tuple[MacBlockEvent, ...]] = ContextVar("pending_hold_events", default=())
+coordination_depth: ContextVar[int] = ContextVar("coordination_depth", default=0)
+
+
+@contextmanager
+def record_after_unlock() -> Generator[None, None, None]:
+    depth = coordination_depth.get()
+    token = coordination_depth.set(depth + 1)
+    try:
+        yield
+    finally:
+        coordination_depth.reset(token)
+        if depth == 0:
+            events = pending_hold_events.get()
+            _ = pending_hold_events.set(())
+            for event in events:
+                start_hold_recorder(event)
+
+
+def start_hold_recorder(event: MacBlockEvent) -> None:
+    command = [sys.executable, str(Path(__file__).resolve().parent.parent / "buildlog" / "record.py"),
+               "hold-event", event.kind, "mac", timestamp(event.block.since), event.block.holder, event.block.reason,
+               timestamp(event.at.astimezone(timezone.utc)), timestamp(event.block.expires)]
+    try:
+        process = subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                   stderr=subprocess.DEVNULL, start_new_session=True, close_fds=True)
+    except OSError:
+        return
+    threading.Thread(target=process.wait, name="hold-event-recorder", daemon=True).start()
+
+
+def record_hold_event(event: Literal["began", "ended"], block: PendingMacBlock | ActiveMacBlock, at: datetime) -> None:
+    record = MacBlockEvent(event, block, at)
+    if coordination_depth.get():
+        _ = pending_hold_events.set((*pending_hold_events.get(), record))
+    else:
+        start_hold_recorder(record)
 
 
 def local_time(instant: str, include_zone: bool = True) -> str:
     format_string = "%H:%M %Z" if include_zone else "%H:%M"
-    return datetime.fromisoformat(instant).astimezone().strftime(format_string)
+    return datetime.fromisoformat(instant).astimezone(user_zone()).strftime(format_string)
 
 
 def block_time(instant: datetime) -> str:
-    return instant.astimezone().strftime("%a %H:%M %Z")
+    return instant.astimezone(user_zone()).strftime("%a %H:%M %Z")
 
 
 def message_time(instant: datetime) -> str:
-    return instant.astimezone().strftime("%H:%M %Z")
+    return instant.astimezone(user_zone()).strftime("%H:%M %Z")
 
 
 def process_start_time(pid: int) -> str | None:
@@ -992,7 +1086,7 @@ def skipped_ci_runs(config: MacTestConfig, since: datetime) -> str:
         "--workflow",
         config.ci_workflow,
         "--created",
-        f">={timestamp(since)}",
+        f">={timestamp(since.replace(microsecond=0))}",
         "--limit",
         "200",
         "--json",
@@ -1114,7 +1208,13 @@ def expire_block(
                 NO_PROBLEM,
             )
     with locked(paths.lock):
-        paths.block.unlink(missing_ok=True)
+        at = utc_now()
+        try:
+            paths.block.unlink()
+        except FileNotFoundError:
+            pass
+        else:
+            record_hold_event("ended", block, at)
     skipped = (
         skipped_ci_runs(config, block.since)
         if block.ci != "not_configured"
@@ -1188,6 +1288,169 @@ def start_watcher(paths: StatePaths) -> None:
             "warning: the Mac block watcher could not be started",
             file=sys.stderr,
         )
+
+
+def start_claim_watcher(paths: StatePaths) -> None:
+    with lock_if_available(paths.claim_watch_lock) as acquired:
+        if not acquired:
+            return
+    environment = [
+        f"{name}={value}"
+        for name, value in sorted(os.environ.items())
+        if name.startswith("MAC_TEST_")
+    ]
+    command = [
+        "systemd-run", "--user", "--collect", "--quiet", "--no-block",
+        "--unit", f"mac-test-claim-watch-{os.getpid()}", "--", "/usr/bin/env",
+        f"HOME={os.environ.get('HOME', '')}",
+        f"PATH={os.environ.get('PATH', '')}",
+        *environment, sys.executable, str(Path(__file__).resolve()), "watch-claim",
+    ]
+    try:
+        result = subprocess.run(
+            command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False,
+        )
+        failed = result.returncode != 0
+    except OSError:
+        failed = True
+    if failed:
+        print("warning: the Mac claim watcher could not be started", file=sys.stderr)
+
+
+def mac_activity_script() -> str:
+    """Count the user's mirror work and build executables without sending signals."""
+    return offload.mirror_selector_script() + r'''
+mirror_pids=$(select_leftovers) || exit 1
+process_records=$(ps -axww -o pid=,uid=,comm=) || exit 1
+activity_user=$(id -u) || exit 1
+executable_pids=$(printf '%s\n' "$process_records" | awk -v user="$activity_user" '
+    $2 == user {
+        executable = $0
+        sub(/^[[:space:]]*[0-9]+[[:space:]]+[0-9]+[[:space:]]+/, "", executable)
+        name = executable
+        sub(/^.*\//, "", name)
+        if (name == "cargo" || name == "rustc" || name == "cargo-nextest" || executable ~ /\/target\//)
+            print $1
+    }') || exit 1
+active_count=$(printf '%s\n%s\n' "$mirror_pids" "$executable_pids" | awk '/^[0-9]+$/ && !seen[$0]++ { count++ } END { print count+0 }') || exit 1
+printf 'active=%s\nrc=0\n' "$active_count"
+'''
+
+
+def check_mac_activity(config: MacTestConfig, host: str) -> MacActivity:
+    try:
+        result = subprocess.run(
+            ["ssh", "-o", "BatchMode=yes", "-o",
+             f"ConnectTimeout={config.connect_timeout_s:g}", host, mac_activity_script()],
+            stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            text=True, check=False, timeout=10,
+        )
+    except subprocess.TimeoutExpired:
+        return ActivityCheckFailed("SSH activity check timed out after 10 s")
+    except OSError as error:
+        return ActivityCheckFailed(f"SSH activity check could not start: {error}")
+    except UnicodeError:
+        return ActivityCheckFailed("the activity check answer could not be read")
+    if result.returncode != 0:
+        reason = " ".join(result.stderr.split()) or f"SSH exited {result.returncode}"
+        return ActivityCheckFailed(reason)
+    lines = result.stdout.splitlines()
+    if len(lines) != 2 or lines[1] != "rc=0" or not lines[0].startswith("active="):
+        return ActivityCheckFailed("the activity check answer could not be read")
+    count_text = lines[0].removeprefix("active=")
+    if not count_text.isascii() or not count_text.isdecimal():
+        return ActivityCheckFailed("the activity check answer could not be read")
+    try:
+        count = int(count_text)
+    except ValueError:
+        return ActivityCheckFailed("the activity check answer could not be read")
+    return MacActive(count) if count else MacIdle()
+
+
+def claim_idle_clause(run: RunRecord) -> str:
+    if "idle_since" not in run:
+        return ""
+    return f", idle since {local_time(run['idle_since'], include_zone=False)}"
+
+
+def claim_watch_pass(paths: StatePaths, config: MacTestConfig) -> bool:
+    """Check one claim; return whether another pass may still be needed."""
+    with locked(paths.lock):
+        run = read_run(paths.run)
+    if isinstance(run, NoRun) or not run_is_live(run):
+        return False
+    host = run["remote_host"] if "remote_host" in run else config.host
+    activity = check_mac_activity(config, host)
+    now = utc_now()
+    with locked(paths.lock):
+        current = read_run(paths.run)
+        if isinstance(current, NoRun):
+            return False
+        if (current["pid"], current["proc_start"], current["since"]) != (
+            run["pid"], run["proc_start"], run["since"],
+        ):
+            return True
+        if not run_is_live(current):
+            return False
+        if isinstance(activity, ActivityCheckFailed):
+            print(f"Mac claim activity check failed: {activity.reason}", flush=True)
+            return True
+        if isinstance(activity, MacActive):
+            if "idle_since" in current:
+                del current["idle_since"]
+                write_json(paths.run, current)
+            return True
+        if "idle_since" not in current:
+            current["idle_since"] = timestamp(now)
+            write_json(paths.run, current)
+            return True
+        idle_since = aware_timestamp(current["idle_since"], paths.run, "idle_since")
+        if now - idle_since < timedelta(minutes=config.claim_idle_minutes):
+            return True
+        block_present = not isinstance(read_block(paths.block), NoMacBlock)
+        paths.run.unlink(missing_ok=True)
+    if block_present:
+        start_watcher(paths)
+    released_at = local_time(timestamp(now), include_zone=False)
+    quoted_what = "'" + current["what"].replace("'", "'\"'\"'") + "'"
+    remote_argument = ""
+    if "remote_host" in current:
+        quoted_host = "'" + current["remote_host"].replace("'", "'\"'\"'") + "'"
+        remote_argument = f" --remote {quoted_host}"
+    text = (
+        f'Your Mac claim "{current["what"]}" '
+        + f"(since {local_time(current['since'], include_zone=False)}) was released at {released_at}: "
+        + f"nothing ran on the Mac for {config.claim_idle_minutes:g} minutes, so tests waiting for it can run. "
+        + "Claim it again before your next Mac command: "
+        + "python3 ~/.claude/scripts/mac_test/mac_test.py claim --pid $$ "
+        + f"--what {quoted_what}{remote_argument} (see /build:mac)."
+    )
+    print(text, flush=True)
+    if "holder_session" in current:
+        _ = send_message(
+            f"session:{current['holder_session']}", "Mac claim released",
+            f"mac-claim-idle-{current['pid']}-{current['since']}", 0, text,
+        )
+    return False
+
+
+def command_watch_claim(paths: StatePaths, config: MacTestConfig) -> int:
+    with ExitStack() as watcher_lock:
+        acquired = watcher_lock.enter_context(lock_if_available(paths.claim_watch_lock))
+        if not acquired:
+            return 0
+        while True:
+            try:
+                if not claim_watch_pass(paths, config):
+                    with locked(paths.lock):
+                        run = read_run(paths.run)
+                        if isinstance(run, NoRun) or not run_is_live(run):
+                            # A new claimant must see the watcher lock released.
+                            watcher_lock.close()
+                            return 0
+            except (OSError, StateReadError) as error:
+                print(f"Mac claim state unreadable: {error}", flush=True)
+            time.sleep(config.claim_poll_seconds)
 
 
 def pending_with_wait(
@@ -1405,7 +1668,8 @@ def command_claim(args: CliArguments, paths: StatePaths) -> int:
                 kept["proc_start"] = proc_start
                 write_json(paths.run, kept)
                 print(f"leftovers: {kept['remote_host']}")
-                return 13
+                claim_result = 13
+                break
             try:
                 block = read_claim_block(paths)
             except (OSError, StateReadError):
@@ -1432,9 +1696,17 @@ def command_claim(args: CliArguments, paths: StatePaths) -> int:
                 if isinstance(args.remote, str):
                     remote_claim: RemoteJobClaim = {**claimed, "remote_host": args.remote}
                     claimed = remote_claim
+                session = os.environ.get("CLAUDE_CODE_SESSION_ID", "")
+                if session:
+                    claimed["holder_session"] = session
+                else:
+                    owner = build_hold.owning_session()
+                    if isinstance(owner, build_hold.OwningSession):
+                        claimed["holder_session"] = owner.session_id
                 write_json(paths.run, claimed)
                 print("claimed")
-                return 0
+                claim_result = 0
+                break
             busy_run = run
 
         remaining = deadline - time.monotonic()
@@ -1450,6 +1722,8 @@ def command_claim(args: CliArguments, paths: StatePaths) -> int:
             )
             return 11
         time.sleep(min(2.0, remaining))
+    start_claim_watcher(paths)
+    return claim_result
 
 
 def command_release(args: CliArguments, paths: StatePaths) -> int:
@@ -1580,6 +1854,8 @@ def command_block(
                 )
                 new_block = False
             write_block(paths.block, block)
+            if new_block:
+                record_hold_event("began", block, now)
         outcome = full_settle(
             paths,
             config,
@@ -1634,7 +1910,13 @@ def command_unblock(
                 )
                 return 2
         with locked(paths.lock):
-            paths.block.unlink(missing_ok=True)
+            at = utc_now()
+            try:
+                paths.block.unlink()
+            except FileNotFoundError:
+                pass
+            else:
+                record_hold_event("ended", block, at)
         if ci_needs_restore(block.ci):
             print("Mac unblocked; CI may use the Mac again.")
         elif block.ci == "off_before":
@@ -1703,11 +1985,13 @@ def command_status(paths: StatePaths, config: MacTestConfig) -> int:
         elif run_is_kept(outcome.run):
             kept = outcome.run
             print(f"running: leftovers of {kept['what']} on {kept['remote_host']} "
-                  + f"since {local_time(kept['since'])}, kept under pid {kept['pid']}")
+                  + f"since {local_time(kept['since'])}, kept under pid {kept['pid']}"
+                  + claim_idle_clause(kept))
         else:
             print(
                 f"running: {outcome.run['what']} ({outcome.run['worktree']}) "
                 + f"since {local_time(outcome.run['since'])}"
+                + claim_idle_clause(outcome.run)
             )
         block = outcome.block
         if isinstance(block, NoMacBlock):
@@ -1796,6 +2080,7 @@ def parser() -> argparse.ArgumentParser:
 
     _ = commands.add_parser("status")
     _ = commands.add_parser("watch")
+    _ = commands.add_parser("watch-claim")
     return root
 
 
@@ -1814,6 +2099,8 @@ def main() -> int:
         return command_unblock(args, paths, config)
     if args.command == "watch":
         return command_watch(paths, config)
+    if args.command == "watch-claim":
+        return command_watch_claim(paths, config)
     return command_status(paths, config)
 
 

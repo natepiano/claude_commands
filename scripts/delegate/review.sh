@@ -131,6 +131,15 @@ case "${LENS}" in
     ;;
 esac
 
+if [[ "${POOL_TYPE}" == ui && "${LENS}" != ux ]]; then
+  echo "ERROR: --pool ui requires lens ux." >&2
+  exit 2
+fi
+if [[ "${POOL_TYPE}" == code && "${LENS}" == ux ]]; then
+  echo "ERROR: --pool code does not accept lens ux." >&2
+  exit 2
+fi
+
 # A seated pass belongs to the chair that actually ran it, not to the lens's
 # historical default chair. Seat names end in their semantic slot (`impl`,
 # `test`, `review`, `fix2`); solo reviewers retain the lens mapping above.
@@ -177,6 +186,7 @@ PY="${SCRIPT_DIR}/../lib/py"
 POOL_HELPER="${SCRIPT_DIR}/review_pool.py"
 MESH_SESSION_DIR="${SESSION_DIR}"
 POOL_ALLOCATED=0
+POOL_PROMPT_FILE=""
 MESH_CLAIMED=0
 TURN_THREAD_ID=""
 LEASE_ORDINAL=0
@@ -244,9 +254,9 @@ board_post() {
   bash "${BOARD_HELPER}" post "${SESSION_DIR}" "${TEAM_SLOT}" "$1" "$2" || true
 }
 
-# Preserve the old launcher's observable failure path: a solo review creates
-# its artifacts before agent resolution. A seated review claims first, so a
-# busy-seat refusal cannot overwrite another review's status or findings.
+# A solo review creates its artifacts before agent resolution. A seated review
+# claims first, so a busy-seat refusal cannot overwrite another review's status
+# or findings.
 if [[ -z "${REVIEW_SEAT}" && -z "${POOL_TYPE}" ]]; then
   initialize_review_artifacts
 fi
@@ -283,7 +293,7 @@ def post(message):
 with (root / "impl_seat_claim.lock").open("a+") as lock:
     fcntl.flock(lock, fcntl.LOCK_EX)
     entry = read_roster().get(name, {})
-    context_tokens = entry.get("context_tokens", 0) if isinstance(entry, dict) else 0
+    context_tokens = entry.get("context_tokens") if isinstance(entry, dict) else None
     if isinstance(context_tokens, int) and context_tokens > compact_above:
         compact = subprocess.run(
             [sys.executable, mesh_script, "compact", "--session-dir", root_text,
@@ -420,7 +430,7 @@ PY
 
 count_turn_findings() {
   [[ "${TURN_FINDINGS_READY}" -eq 1 && "${TURN_COUNT_READY}" -eq 0 ]] || return 0
-  TURN_RAISED="$("$PY" - "${FINDINGS_FILE}" <<'PY'
+  TURN_RAISED="$("$PY" - "${FINDINGS_FILE}" "${LENS}" <<'PY'
 import re
 import sys
 from pathlib import Path
@@ -428,7 +438,25 @@ try:
     findings = Path(sys.argv[1]).read_text(encoding="utf-8")
 except OSError:
     findings = ""
-print(len(re.findall(r"^\s*\d+[.)]\s+", findings, re.MULTILINE)))
+if sys.argv[2] == "ux":
+    raised = 0
+    in_defects = False
+    for line in findings.splitlines():
+        if not line.strip().startswith("|"):
+            in_defects = False
+            continue
+        cells = [cell.strip() for cell in re.split(r"(?<!\\)\|", line.strip())[1:]]
+        if cells and not cells[-1]:
+            cells.pop()
+        if cells == ["Shot", "Rule", "Defect", "Fix"]:
+            in_defects = True
+        elif len(cells) != 4:
+            in_defects = False
+        elif in_defects and not all(re.fullmatch(r":?-+:?", cell) for cell in cells):
+            raised += 1
+    print(raised)
+else:
+    print(len(re.findall(r"^\s*\d+[.)]\s+", findings, re.MULTILINE)))
 PY
 )"
   TURN_COUNT_READY=1
@@ -505,6 +533,9 @@ finish_review_exit() {
   if [[ "${POOL_ALLOCATED}" -eq 1 ]]; then
     "$PY" "${POOL_HELPER}" release --production "${POOL_PRODUCTION}" \
       --reviewer "${REVIEW_SEAT}" --pid "$$" --thread-id "${TURN_THREAD_ID}" >>"${LOG_FILE}" 2>&1
+  fi
+  if [[ -n "${POOL_PROMPT_FILE}" ]]; then
+    rm -f "${POOL_PROMPT_FILE}"
   fi
   exit "${code}"
 }
@@ -588,6 +619,7 @@ TREE_STATUS_BEFORE=""
 TREE_DIFF_HASH_BEFORE=""
 TREE_UNTRACKED_HASH_BEFORE=""
 TREE_PATHS_BEFORE=""
+TURN_IMAGE_ARGS=()
 
 if [[ -n "${POOL_TYPE}" ]]; then
   CODEX_MESH="${PLAN_DELEGATE_CODEX_MESH:-$(_agents_registry_get delegate.options codex_mesh)}"
@@ -595,10 +627,28 @@ if [[ -n "${POOL_TYPE}" ]]; then
     echo "ERROR: --pool requires the Codex mesh." >&2
     exit 2
   fi
+  POOL_FRESH_ARGS=()
+  if [[ "${POOL_TYPE}" == ui ]]; then
+    POOL_FRESH_ARGS=(--fresh)
+    SHOTS_FILE="${SESSION_DIR}/ux_shots_${PASS_INDEX}.txt"
+    if [[ ! -r "${SHOTS_FILE}" ]]; then
+      echo "ERROR: UI shots file is unreadable: ${SHOTS_FILE}." >&2
+      exit 1
+    fi
+    while IFS= read -r shot || [[ -n "${shot}" ]]; do
+      shot="${shot%$'\r'}"
+      [[ -n "${shot}" ]] || continue
+      TURN_IMAGE_ARGS+=(--image "${shot}")
+    done < "${SHOTS_FILE}"
+    if [[ "${#TURN_IMAGE_ARGS[@]}" -eq 0 ]]; then
+      echo "ERROR: UI shots file has no paths: ${SHOTS_FILE}." >&2
+      exit 1
+    fi
+  fi
   if ! POOL_ALLOCATION="$("$PY" "${POOL_HELPER}" allocate \
     --production "${POOL_PRODUCTION}" --type "${POOL_TYPE}" \
     --unit "${POOL_UNIT}" --phase "${POOL_PHASE}" --pass "${PASS_INDEX}" \
-    "${LENS_ARGS[@]}" --pid "$$" 2>>"${LOG_FILE}")"; then
+    "${LENS_ARGS[@]}" "${POOL_FRESH_ARGS[@]}" --pid "$$" 2>>"${LOG_FILE}")"; then
     echo "ERROR: pool allocation failed; see ${LOG_FILE}." >&2
     exit 1
   fi
@@ -616,6 +666,19 @@ if [[ -n "${POOL_TYPE}" ]]; then
   TEAM_SLOT="pool_${REVIEW_SEAT}"
   printf '%s\n' "${TEAM_SLOT}" > "${SLOT_FILE}"
   export PLAN_DELEGATE_TEAM_ROLE="${TEAM_SLOT}"
+  if [[ "${POOL_TYPE}" == ui || "${LEASE_ORDINAL}" -eq 1 ]]; then
+    POOL_PROMPT_FILE="$(mktemp "${SESSION_DIR}/review_message_${PASS_INDEX}${SUFFIX}.XXXXXX")"
+    "$PY" "${POOL_HELPER}" unit-memory --production "${POOL_PRODUCTION}" \
+      --unit "${POOL_UNIT}" > "${POOL_PROMPT_FILE}" 2>>"${LOG_FILE}"
+    if [[ -s "${POOL_PROMPT_FILE}" ]]; then
+      printf '\n\n' >> "${POOL_PROMPT_FILE}"
+      cat "${PROMPT_FILE}" >> "${POOL_PROMPT_FILE}"
+      PROMPT_FILE="${POOL_PROMPT_FILE}"
+    else
+      rm -f "${POOL_PROMPT_FILE}"
+      POOL_PROMPT_FILE=""
+    fi
+  fi
 fi
 
 if [[ -n "${REVIEW_SEAT}" ]]; then
@@ -668,6 +731,8 @@ board_post register \
 
 PASS_STARTED=0
 record_pass_start() {
+  # UX time belongs to the director's activity, including early launches.
+  [[ "${LENS}" != ux ]] || return 0
   [[ -f "${PROGRESS_STATE}" ]] || return 0
   if ! PLAN_DELEGATE_PASS_OWNER=launcher "$PY" "${PROGRESS_HELPER}" start-pass \
     --session-dir "${SESSION_DIR}" \
@@ -699,7 +764,7 @@ fi
 if [[ -n "${FOLLOW_TO}" ]]; then
   "$PY" "${SCRIPT_DIR}/../agents/codex_mesh.py" follow \
     --session-dir "${MESH_SESSION_DIR}" --to "${FOLLOW_TO}" \
-    --claim-pid "${FOLLOW_LAUNCHER_PID}" --role review "${LENS_ARGS[@]}" "${TURN_WORKTREE_ARGS[@]}" \
+    --claim-pid "${FOLLOW_LAUNCHER_PID}" --role review "${LENS_ARGS[@]}" "${TURN_WORKTREE_ARGS[@]}" "${TURN_IMAGE_ARGS[@]}" \
     --message-file "${PROMPT_FILE}" --summary-file "${FINDINGS_FILE}" \
     --reply-file "${REPLY_FILE}" --log-file "${LOG_FILE}" \
     --model "${AGENT_MODEL}" --effort "${AGENT_EFFORT:-}" \
@@ -729,7 +794,7 @@ if [[ -n "${EARLY_READY_FILE}" ]]; then
   # The implementation pass is open until the sentinel appears; starting the
   # review pass before then would close it as interrupted.
   while kill -0 "${AGENT_PID}" 2>/dev/null && [[ ! -e "${EARLY_READY_FILE}" ]]; do
-    sleep 5
+    sleep "${PLAN_DELEGATE_EARLY_POLL_SECS:-5}"
   done
   if [[ -e "${EARLY_READY_FILE}" && "${TREE_BASELINE_READY}" -eq 0 ]]; then
     capture_tree_baseline

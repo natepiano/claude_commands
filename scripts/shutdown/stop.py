@@ -18,10 +18,11 @@ from pathlib import Path
 from typing import Literal, Protocol, TypedDict, cast
 
 SCRIPTS = Path(__file__).resolve().parents[1]
-for dependency in ("message", "production"):
+for dependency in ("message", "production", "herdr"):
     sys.path.insert(0, str(SCRIPTS / dependency))
 
 import sessions
+import herdr
 from inventory import Inventory, Session, terminal_kind
 from record import (
     CLAIM_STALE_SECONDS,
@@ -332,14 +333,15 @@ def _stop_codex_servers(
 def _stop_unit_tmux(
     session: Session, tmux: CommandRunner, clock: Clock, claim: StopClaim
 ) -> list[SessionStopIssue]:
-    if session["kind"] != "unit":
+    if session["kind"] != "unit" or session["host"]["session_host"] != "tmux":
         return []
-    tmux_session = session["host"]["tmux_session"]
+    tmux_session = session["host"]["session_name"]
     target = f"={tmux_session}"
     issue: SessionStopIssue = {
-        "kind": "unit tmux session left running",
+        "kind": "unit session left running",
         "at": _timestamp(clock),
-        "tmux_session": tmux_session,
+        "host": "tmux",
+        "session_name": tmux_session,
         "cause": "stop not confirmed",
     }
     try:
@@ -354,6 +356,37 @@ def _stop_unit_tmux(
     if remaining is None or remaining == 0:
         return [issue]
     return []
+
+
+def _stop_unit_session(
+    session: Session, tmux: CommandRunner, clock: Clock, claim: StopClaim
+) -> list[SessionStopIssue]:
+    if session["kind"] != "unit":
+        return []
+    if session["host"]["session_host"] == "tmux":
+        return _stop_unit_tmux(session, tmux, clock, claim)
+    name = session["host"]["session_name"]
+    issue: SessionStopIssue = {
+        "kind": "unit session left running",
+        "at": _timestamp(clock),
+        "host": "herdr",
+        "session_name": name,
+        "cause": "stop not confirmed",
+    }
+    claim.check()
+    try:
+        herdr.stop_session(name)
+    except (herdr.HerdrFailure, OSError, subprocess.TimeoutExpired):
+        pass
+    finally:
+        claim.check()
+    try:
+        remaining = herdr.live_sessions()
+    except (herdr.HerdrFailure, OSError, subprocess.TimeoutExpired):
+        return [issue]
+    finally:
+        claim.check()
+    return [issue] if any(row["name"] == name for row in remaining) else []
 
 
 def _process_row(pid: int) -> tuple[int, str] | None:
@@ -418,7 +451,10 @@ def _stop_owner_resources(
     issues = _stop_codex_servers(
         session, codex_mesh=codex_mesh, is_alive=is_alive, clock=clock, claim=claim
     )
-    issues.extend(_stop_unit_tmux(session, tmux, clock, claim))
+    if session["host"]["kind"] == "herdr":
+        # Leave the pane and server running; herdr session cleanup is manual for now.
+        return issues
+    issues.extend(_stop_unit_session(session, tmux, clock, claim))
     return issues
 
 
@@ -437,9 +473,10 @@ def _owner_identity_lost_issues(
     if session["kind"] == "unit":
         issues.append(
             {
-                "kind": "unit tmux session left running",
+                "kind": "unit session left running",
                 "at": _timestamp(clock),
-                "tmux_session": session["host"]["tmux_session"],
+                "host": session["host"]["session_host"],
+                "session_name": session["host"]["session_name"],
                 "cause": "owner identity lost",
             }
         )
@@ -460,7 +497,7 @@ def _retry_owner_cleanup(
         issue for issue in entry["stop_issues"]
         if (
             issue["kind"] == "codex server left running"
-            or issue["kind"] == "unit tmux session left running"
+            or issue["kind"] == "unit session left running"
         ) and issue["cause"] == "stop not confirmed"
     ]
     if not pending:
@@ -475,8 +512,8 @@ def _retry_owner_cleanup(
     issues.extend(_stop_codex_servers(
         session, codex_mesh=codex_mesh, is_alive=is_alive, clock=clock, claim=claim
     ))
-    if any(issue["kind"] == "unit tmux session left running" for issue in pending):
-        issues.extend(_stop_unit_tmux(session, tmux, clock, claim))
+    if any(issue["kind"] == "unit session left running" for issue in pending):
+        issues.extend(_stop_unit_session(session, tmux, clock, claim))
     _ = _replace_stop_issues(claim, issues)
 
 
@@ -530,7 +567,7 @@ def _stop_owner(
 
     current = match["session"]
     if not force_now and (
-        prior["kind"] not in {"ready", "stopping", "stop failed"}
+        prior["kind"] not in {"ready", "held by usage limit", "stopping", "stop failed"}
         or current["status"] != "idle"
         or any(seat["status"] != "idle" for seat in match["seats"])
         or settle.blocker(current)["kind"] != "clear"
@@ -538,7 +575,8 @@ def _stop_owner(
         issue = NotReadyToStop(
             kind="not ready to stop", at=_timestamp(clock),
             status=current["status"],
-            progress="ready" if prior["kind"] == "ready" else "waiting",
+            progress=("held by usage limit" if prior["kind"] == "held by usage limit"
+                      else "ready" if prior["kind"] == "ready" else "waiting"),
         )
         _ = _set_stop_outcome(
             claim, "stop failed", clock, [issue],
@@ -699,7 +737,7 @@ def stop_session(
             if age < CLAIM_STALE_SECONDS:
                 return
         elif progress["kind"] not in {
-            "waiting", "ready", "stop failed", "stopped", "already gone", "process identity lost", "restart failed",
+            "waiting", "ready", "held by usage limit", "stop failed", "stopped", "already gone", "process identity lost", "restart failed",
         }:
             return
         prior = copy.deepcopy(progress)

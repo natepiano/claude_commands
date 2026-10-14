@@ -5,66 +5,114 @@ from __future__ import annotations
 
 import json
 import os
-import subprocess
+import resource
 import sqlite3
+import subprocess
 import sys
 import tempfile
 import time
 import unittest
-from collections.abc import Callable
 from contextlib import closing
-from dataclasses import FrozenInstanceError
+from dataclasses import FrozenInstanceError, dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import cast, override
+from typing import TypedDict, cast, override
 from unittest import mock
 
 import disk
 import ci
 import index
-import launches
 import mac_outcome
 import report
+import holds
+from user_zone import user_zone
 import rust_release
 import sync
-from test_index import STAMP, Record, call, ci_job, ci_run, encode, local_day, point_root_at, sample, step
+from test_holds import timed_hold_events, write_holder, write_mac_block
+from test_index import COORDINATION_VARIABLES, STAMP, Record, call, ci_job, ci_run, encode, local_day, point_root_at, sample, step
 
 
-def section_seconds(connection: sqlite3.Connection, day: str) -> dict[str, float]:
-    found = report.kinds(connection, day)
-    elapsed: dict[str, float] = {}
-    began = time.perf_counter()
-    calls = report.reported_mac_calls(connection, day)
-    elapsed["test calls"] = time.perf_counter() - began
-    began = time.perf_counter()
-    waits = report.daily_waits(connection, day)
-    elapsed["wait data"] = time.perf_counter() - began
-    sections: dict[str, Callable[[], object]] = {
-        "Waiting": lambda: report.waiting_lines(waits),
-        "Rebuilds": lambda: report.rebuilds_section(connection, day),
-        "step tables": lambda: [report.kind_section(connection, day, kind, 1) for kind in found],
-        "Memory pressure": lambda: report.memory_pressure_section(connection, day, 1),
-        "Agent calls": lambda: report.calls_section(connection, day),
-        "Test builds": lambda: report.test_builds_section(connection, day),
-        "Tests by target": lambda: report.tests_by_target_lines(calls),
-        "cargo-port": lambda: report.port_lint_section(connection, day),
-        "CI": lambda: report.ci_section(connection, day),
-        "Tests per edit": lambda: report.tests_per_edit_section(connection, day),
-        "call trees": lambda: report.call_trees(connection, day),
-        "Disk": report.disk_section,
-        "summaries": lambda: [report.summary(connection, day, found, which, with_failed)
-                              for _, which, with_failed in report.SUMMARIES],
-        "lead block": lambda: report.lead_block(connection, day, calls, waits),
-        "report body": lambda: report.report(connection, day),
+class CliWork(TypedDict):
+    cpu_seconds: float
+    statements: int
+    step_reads: int
+    instructions: int
+    index_updates: int
+    launch_collections: int
+
+
+@dataclass(frozen=True)
+class MeasuredCliRun:
+    result: subprocess.CompletedProcess[str]
+    work: CliWork
+
+
+def probe_cli() -> None:
+    """Instrument the real CLI entry point, including its preparation work."""
+    import cli
+    import launches
+
+    statements: list[str] = []
+    instruction_batches = 0
+    instruction_limit = int(os.environ["BUILDLOG_TEST_INSTRUCTION_LIMIT"])
+    read_only = index.read_only
+
+    def count_instructions() -> int:
+        nonlocal instruction_batches
+        instruction_batches += 1
+        # Stop pathological plans by work count rather than waiting for a timeout.
+        return int(instruction_batches * 1000 > instruction_limit)
+
+    def traced_read_only() -> sqlite3.Connection:
+        connection = read_only()
+        connection.set_trace_callback(statements.append)
+        connection.set_progress_handler(count_instructions, 1000)
+        return connection
+
+    before = resource.getrusage(resource.RUSAGE_CHILDREN)
+    began = time.process_time()
+    with mock.patch.object(index, "read_only", traced_read_only), mock.patch.object(index, "update", wraps=index.update) as updating, mock.patch.object(launches, "collect", wraps=launches.collect) as collecting:
+        status = cli.main(sys.argv[1:])
+    after = resource.getrusage(resource.RUSAGE_CHILDREN)
+    work: CliWork = {
+        "cpu_seconds": time.process_time() - began + after.ru_utime + after.ru_stime - before.ru_utime - before.ru_stime,
+        "statements": len(statements),
+        "step_reads": sum("JOIN steps" in sql or "FROM steps" in sql for sql in statements),
+        "instructions": instruction_batches * 1000,
+        "index_updates": updating.call_count,
+        "launch_collections": collecting.call_count,
     }
-    for name, render in sections.items():
-        began = time.perf_counter()
-        _ = render()
-        elapsed[name] = time.perf_counter() - began
-    return elapsed
+    print("CLI_WORK=" + json.dumps(work), file=sys.stderr)
+    raise SystemExit(status)
+
+
+def measure_cli_work(command: str, environment: dict[str, str], row_count: int) -> MeasuredCliRun:
+    # Importing test_index installs its own paths; restore this fixture afterwards.
+    result = subprocess.run(
+        [sys.executable, "-c", "import os; environment = dict(os.environ); from test_report import probe_cli; os.environ.update(environment); probe_cli()", command],
+        cwd=Path(__file__).resolve().parents[2],
+        env={**environment, "PYTHONPATH": str(Path(__file__).resolve().parent), "BUILDLOG_TEST_INSTRUCTION_LIMIT": str(row_count * 500)},
+        capture_output=True, text=True, check=False, timeout=120,
+    )
+    if result.returncode != 0:
+        raise AssertionError(f"CLI failed: {result.stderr}\n{result.stdout}")
+    metrics = next(line.removeprefix("CLI_WORK=") for line in result.stderr.splitlines() if line.startswith("CLI_WORK="))
+    return MeasuredCliRun(result, cast(CliWork, json.loads(metrics)))
+
+
+def setUpModule() -> None:
+    """The times these tests expect are Pacific; the user's zone setting must not change them."""
+    unittest.addModuleCleanup(time.tzset)
+    unittest.enterModuleContext(mock.patch.dict(os.environ, {"TZ": "America/Los_Angeles", "USER_ZONE": "America/Los_Angeles"}))
+    time.tzset()
 
 
 class ReportSpeedTests(unittest.TestCase):
+    @override
+    def setUp(self) -> None:
+        temporary = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {name: str(temporary / name) for name in COORDINATION_VARIABLES})))
+
     def test_report_command_from_a_temporary_log_shows_lead_and_targets(self) -> None:
         with tempfile.TemporaryDirectory(prefix="buildlog-report-output-") as temporary:
             root = Path(temporary) / "buildlog"
@@ -85,7 +133,7 @@ class ReportSpeedTests(unittest.TestCase):
                 result = subprocess.run(
                     [sys.executable, "scripts/buildlog/cli.py", "report"],
                     cwd=Path(__file__).resolve().parents[2],
-                    env={**os.environ, "TZ": "America/Los_Angeles",
+                    env={**os.environ, "TZ": "America/Los_Angeles", "USER_ZONE": "America/Los_Angeles",
                          "BUILDLOG_TRANSCRIPTS": str(Path(temporary) / "transcripts")},
                     capture_output=True, text=True, check=False,
                 )
@@ -95,16 +143,15 @@ class ReportSpeedTests(unittest.TestCase):
                 self.assertIn("| Mac ran | Mac passed | Mac failed |", result.stdout)
                 print(result.stdout, flush=True)
 
-    def test_report_at_the_live_index_size_finishes_in_two_seconds(self) -> None:
+    def test_report_cli_work_grows_near_linearly_at_the_live_index_size(self) -> None:
         self.addCleanup(time.tzset)
         with tempfile.TemporaryDirectory(prefix="buildlog-report-") as temporary:
             root = Path(temporary) / "buildlog"
             transcripts = Path(temporary) / "transcripts"
             environment = {**os.environ, "BUILDLOG_DIR": str(root),
-                           "BUILDLOG_TRANSCRIPTS": str(transcripts), "TZ": "America/Los_Angeles"}
+                           "BUILDLOG_TRANSCRIPTS": str(transcripts), "TZ": "America/Los_Angeles", "USER_ZONE": "America/Los_Angeles"}
             with mock.patch.dict(os.environ, environment):
                 time.tzset()
-                day = datetime.now().date().isoformat()
                 midnight = datetime.combine(datetime.now().date(), datetime.min.time()).astimezone(UTC)
                 path = root / "natedev" / "timing.jsonl"
                 path.parent.mkdir(parents=True)
@@ -133,25 +180,32 @@ class ReportSpeedTests(unittest.TestCase):
                             crates_compiled=1, mem_wait_s=0, tests_flaky=0,
                             mem_stall_some_s=0.2 if number % 100 == 0 else 0,
                         )))
-                self.assertEqual(index.update(), 29_138 + 36_462)
-                began = time.perf_counter()
-                result = subprocess.run(
-                    [sys.executable, "scripts/buildlog/cli.py", "report"],
-                    cwd=Path(__file__).resolve().parents[2], env=environment,
-                    capture_output=True, text=True, check=False,
-                )
-                elapsed = time.perf_counter() - began
-                print(f"report: {elapsed:.3f} s (29,138 calls, 36,462 steps)", flush=True)
-                self.assertEqual(result.returncode, 0, result.stderr)
-                self.assertIn("### Tests by target", result.stdout)
-                for name, job in (("launches.collect", launches.collect), ("index.update", index.update)):
-                    began = time.perf_counter()
-                    _ = job()
-                    print(f"report part {name}: {time.perf_counter() - began:.3f} s", flush=True)
-                with closing(index.read_only()) as connection:
-                    for name, duration in section_seconds(connection, day).items():
-                        print(f"report section {name}: {duration:.3f} s", flush=True)
-                self.assertLessEqual(elapsed, 2.0, result.stderr)
+                    hold_rows = timed_hold_events(midnight, datetime.now(UTC))
+                    for hold_row in hold_rows:
+                        _ = output.write(encode(hold_row))
+                self.assertEqual(index.update(), 29_138 + 36_462 + len(hold_rows))
+                full_rows = path.read_bytes().splitlines(keepends=True)
+                # Preserve the distribution of timestamps, kinds and Mac results.
+                quarter_rows = full_rows[:29_138:4] + full_rows[29_138:65_600:4] + full_rows[65_600:]
+                runs: list[list[MeasuredCliRun]] = []
+                for rows in (quarter_rows, full_rows):
+                    _ = path.write_bytes(b"".join(rows))
+                    _ = index.reindex()
+                    runs.append([measure_cli_work("report", environment, len(rows)) for _ in range(3)])
+                for size, measurements in zip((len(quarter_rows), len(full_rows)), runs, strict=True):
+                    for measured in measurements:
+                        result = measured.result
+                        self.assertEqual(result.returncode, 0, result.stderr)
+                        self.assertIn("### Tests by target", result.stdout)
+                        self.assertIn("Now: Mac blocked by", result.stdout)
+                        self.assertIn("Now: natedev held by", result.stdout)
+                        self.assertEqual(measured.work["index_updates"], 1)
+                        self.assertEqual(measured.work["launch_collections"], 1)
+                        self.assertLessEqual(measured.work["statements"], 100)
+                        self.assertLessEqual(measured.work["instructions"], size * 500)
+                baseline = min(run.work["cpu_seconds"] for run in runs[0])
+                full = min(run.work["cpu_seconds"] for run in runs[1])
+                self.assertLessEqual(full, baseline * 8, f"CLI CPU grew from {baseline} to {full} for four times the rows")
         time.tzset()
 
 
@@ -242,6 +296,148 @@ class ReportTests(unittest.TestCase):
         _ = index.update()
         with closing(index.read_only()) as connection:
             return report.mac_tests_section(connection, day)
+
+    def section_lines(self, text: str, heading: str) -> list[str]:
+        lines = text.splitlines()
+        start = lines.index(heading)
+        end = next((i for i in range(start + 1, len(lines)) if lines[i].startswith("### ")), len(lines))
+        return lines[start:end]
+
+    def test_power_profile_section_follows_test_builds_in_full_report(self) -> None:
+        self.write(self.root / "natedev" / "samples-2026-10.jsonl",
+                   sample(STAMP, power_profile="performance", power_profile_since=STAMP))
+        self.write(self.root / "natedev" / "2026-10.jsonl", call("measured", build_s=90))
+        lines = self.render().splitlines()
+        start = lines.index("### Test builds (temporary)")
+        next_section = next(line for line in lines[start + 1:] if line.startswith("### "))
+        self.assertEqual(next_section, "### Power profile")
+
+    def test_mac_rows_leave_natedev_sections_and_failed_steps_unchanged(self) -> None:
+        self.write(
+            self.root / "natedev" / "2026-10.jsonl",
+            call("local", target="natedev"),
+            self.nextest_step(
+                "local-pass", "local", duration_s=20, finished_s=10,
+                crates_compiled=1, mem_wait_s=5, mem_stall_some_s=2,
+                tests_flaky=1, peak_mem_bytes=2**30,
+            ),
+            self.nextest_step(
+                "local-failure", "local", duration_s=40, status=1, finished_s=20,
+                crates_compiled=2, mem_wait_s=10, mem_stall_some_s=4,
+                tests_flaky=2, peak_mem_bytes=2 * 2**30,
+            ),
+        )
+        before = self.render()
+        mac_host = "Nates-MacBook-Pro-2023"
+        self.write(
+            self.root / mac_host / "2026-10.jsonl",
+            step("offload", host=mac_host, caller="verify-mac", step="nextest",
+                 duration_s=100, status=1, finished_s=90, crates_compiled=50,
+                 mem_wait_s=600, mem_stall_some_s=900, tests_flaky=20, peak_mem_bytes=99 * 2**30,
+                 slice="fallback"),
+            step("direct", host=mac_host, caller="unknown", step="nextest",
+                 duration_s=200, status=1, finished_s=180, crates_compiled=50,
+                 mem_wait_s=900, mem_stall_some_s=1000, tests_flaky=30, peak_mem_bytes=100 * 2**30,
+                 slice="none"),
+            step("mac-kind", host=mac_host, caller="unknown", step="sweep", status=1),
+        )
+        after = self.render()
+        for heading in (
+            "### Waiting", "### Rebuilds", "### nextest", "### Memory pressure",
+            "### Summary: successes", "### Summary: failures", "### Summary: all",
+        ):
+            with self.subTest(heading=heading):
+                self.assertEqual(self.section_lines(after, heading), self.section_lines(before, heading))
+        self.assertIn("Failed steps: 1; flaky tests: 3.", after)
+        self.assertNotIn("### sweep", after)
+        self.assertNotIn("(natedev)", after)
+        mac = self.section_lines(after, "### Mac")
+        self.assertTrue(any(line.startswith("| verify.sh offload | nextest | 1 | 1 |") for line in mac))
+        self.assertTrue(any(line.startswith("| unknown | nextest | 1 | 1 |") for line in mac))
+        self.assertTrue(any(line.startswith("| unknown | sweep | 1 | 1 |") for line in mac))
+        _ = index.update()
+        with closing(index.read_only()) as connection:
+            self.assertEqual(report.kinds(connection, local_day(STAMP)), ["nextest"])
+
+    def test_mac_table_groups_callers_and_kinds_with_counts_times_and_nextest_facts(self) -> None:
+        self.write(
+            self.root / "natedev" / "2026-10.jsonl",
+            call("routed", mac="passed", mac_s=30, target="mac"),
+            step("local", step="nextest", caller="unknown", duration_s=900, tests_run=900),
+        )
+        mac_host = "Nates-MacBook-Pro-2023"
+        self.write(
+            self.root / mac_host / "2026-10.jsonl",
+            step("direct", host=mac_host, step="nextest", caller="unknown", duration_s=50,
+                 status=1, finished_s=25, tests_run=5, tests_failed=1),
+            step("sweep", host=mac_host, step="sweep", caller="verify-mac", duration_s=8),
+            step("pass", host=mac_host, step="nextest", caller="verify-mac", duration_s=10,
+                 finished_s=5, tests_run=0, tests_failed=0),
+            step("no-tests", host=mac_host, step="nextest", caller="verify-mac", duration_s=20,
+                 status=4, finished_s=5, tests_run=0, tests_failed=0),
+            step("failed", host=mac_host, step="nextest", caller="verify-mac", duration_s=30,
+                 status=1, finished_s=5, tests_run=0, tests_failed=0),
+            step("other-day", host=mac_host, step="nextest", caller="verify-mac", duration_s=900,
+                 started_at="2026-10-01T12:00:00Z"),
+        )
+        self.write(
+            self.root / "Mac" / "2026-10.jsonl",
+            step("other-mac", host="Mac", step="doc", caller="agent", duration_s=6),
+        )
+        text = self.render()
+        mac = self.section_lines(text, "### Mac")
+        self.assertIn("| Caller | Kind | Runs | Failed | Avg | p95 | Range | Build | Tests | Tests failed |", mac)
+        rows = [line for line in mac if line.startswith("| ")][1:]
+        self.assertEqual(len(rows), 4)
+        self.assertEqual(rows[0], "| verify.sh offload | nextest | 3 | 1 | 20.0 s | 30.0 s | 10.0 s – 30.0 s | 5.0 s | 0 | 0 |")
+        self.assertIn("| unknown | nextest | 1 | 1 | 50.0 s | 50.0 s | 50.0 s | 25.0 s | 5 | 1 |", rows)
+        self.assertIn("| verify.sh offload | sweep | 1 | 0 | 8.0 s | 8.0 s | 8.0 s | — | — | — |", rows)
+        self.assertIn("| agent (direct) | doc | 1 | 0 | 6.0 s | 6.0 s | 6.0 s | — | — | — |", rows)
+        self.assertIn("Mac total: 6 steps, 2.1 min; 2 failed.", mac)
+        self.assertIn(
+            "Source: steps recorded on the Mac; failed follows the build log's failure rule, so a Mac nextest that matched no tests is not a failure.",
+            mac,
+        )
+        lines = text.splitlines()
+        targets = self.section_lines(text, "### Tests by target")
+        self.assertEqual(lines[lines.index("### Tests by target") + len(targets)], "### Mac")
+        _ = index.update()
+        with closing(index.read_only()) as connection:
+            self.assertEqual(report.mac_section(connection, local_day(STAMP)), mac)
+            nextest_runs = cast(int, connection.execute(
+                "SELECT count(*) FROM steps WHERE host <> 'natedev' AND step = 'nextest'"
+                + " AND date(started_at, 'localtime') = ?", (local_day(STAMP),),
+            ).fetchone()[0])
+            self.assertEqual(sum(int(row.split("|")[3]) for row in rows if "| nextest |" in row), nextest_runs)
+
+    def test_mac_no_test_match_is_not_failed_but_other_callers_status_four_is(self) -> None:
+        self.write(
+            self.root / "Mac" / "2026-10.jsonl",
+            step("offload", host="Mac", caller="verify-mac", step="nextest", status=4, duration_s=1),
+            step("direct", host="Mac", caller="unknown", step="nextest", status=4, duration_s=1),
+            step("other-kind", host="Mac", caller="verify-mac", step="sweep", status=4, duration_s=1),
+        )
+        text = self.render()
+        mac = self.section_lines(text, "### Mac")
+        self.assertTrue(any(line.startswith("| verify.sh offload | nextest | 1 | 0 |") for line in mac))
+        self.assertTrue(any(line.startswith("| unknown | nextest | 1 | 1 |") for line in mac))
+        self.assertTrue(any(line.startswith("| verify.sh offload | sweep | 1 | 1 |") for line in mac))
+        self.assertIn("Mac total: 3 steps, 3.0 s; 2 failed.", mac)
+        self.assertIn("No build steps recorded.", text)
+        self.assertNotIn("Failed steps:", text)
+
+    def test_day_without_mac_steps_has_the_empty_mac_section(self) -> None:
+        self.write(
+            self.root / "natedev" / "2026-10.jsonl",
+            step("local", caller="verify-mac", step="nextest"),
+        )
+        self.write(
+            self.root / "Mac" / "2026-10.jsonl",
+            step("other-day", host="Mac", started_at="2026-10-01T12:00:00Z"),
+        )
+        text = self.render()
+        self.assertEqual(self.section_lines(text, "### Mac"), ["### Mac", "", "No steps recorded on the Mac.", ""])
+        self.assertIn("### nextest", text)
 
     def target_cells(self, package: str = "hana", day: str = "2026-10-02") -> dict[str, str]:
         lines = self.mac_tests_lines(day)
@@ -381,7 +577,7 @@ class ReportTests(unittest.TestCase):
 
     def test_day_ranges_match_sqlite_on_each_side_of_local_midnight(self) -> None:
         self.addCleanup(time.tzset)
-        with mock.patch.dict(os.environ, {"TZ": "America/Los_Angeles"}):
+        with mock.patch.dict(os.environ, {"TZ": "America/Los_Angeles", "USER_ZONE": "America/Los_Angeles"}):
             time.tzset()
             before = "2026-10-03T06:59:59.999Z"
             after = "2026-10-03T07:00:00.000Z"
@@ -403,6 +599,7 @@ class ReportTests(unittest.TestCase):
         time.tzset()
 
     def test_lead_block_has_all_five_facts_before_waiting(self) -> None:
+        write_mac_block(datetime(2026, 10, 12, 15, tzinfo=UTC), "mac-holder", "preview")
         self.write(
             self.root / "natedev" / "2026-10.jsonl",
             call("passed", mac="passed", mac_reason="", mac_s=10, hold_wait_s=600),
@@ -413,11 +610,39 @@ class ReportTests(unittest.TestCase):
         lines = self.render().splitlines()
         lead = [line for line in lines[2:lines.index("### Waiting")] if line]
         self.assertEqual(lead, [
+            "Now: Mac blocked by mac-holder for preview since 2026-10-12 08:00 PDT",
             "Mac when usable: 1 of 1 candidates finished there (100%).",
             "Longest wait: 10.0 min for Held target.",
             "Failed steps: 1; flaky tests: 2.", "Pass records saved: 2.0 min.",
-            f"Mac blocked as of {local_clock('2026-10-02T12:10:00Z').split()[0]}",
         ])
+
+    def test_earlier_day_names_the_hold_in_force_now_and_that_days_unreachable_call(self) -> None:
+        now = datetime(2026, 10, 12, 15, tzinfo=UTC)
+        write_holder("session", now, "renderer", "screenshot")
+        write_mac_block(now, "mac-holder", "preview")
+        self.write(self.root / "natedev" / "2026-10.jsonl",
+                   call("old-unreachable", mac="declined", mac_reason="unreachable", mac_s=1))
+        output = self.render("2026-10-02")
+        self.assertIn("Now: natedev held by renderer for screenshot since 2026-10-12 08:00 PDT", output)
+        self.assertIn("Now: Mac blocked by mac-holder for preview since 2026-10-12 08:00 PDT", output)
+        self.assertIn("Mac unreachable as of 2026-10-02 05:00 PDT", output)
+        self.assertLess(output.index("Now: Mac"), output.index("### Waiting"))
+
+    def test_a_historical_blocked_call_does_not_claim_a_current_block(self) -> None:
+        self.write(self.root / "natedev" / "2026-10.jsonl",
+                   call("old-block", mac="declined", mac_reason="blocked", mac_s=1))
+        output = self.render()
+        self.assertNotIn("Mac blocked as of", output)
+        self.assertNotIn("Now: Mac blocked", output)
+
+    def test_todays_unreachable_call_keeps_the_short_time(self) -> None:
+        now = datetime.now(UTC)
+        stamp = now.isoformat()
+        self.write(self.root / "natedev" / "2026-10.jsonl",
+                   call("today-unreachable", started_at=stamp, ended_at=stamp,
+                        mac="declined", mac_reason="unreachable", mac_s=1))
+        output = self.render(now.astimezone(user_zone()).date().isoformat())
+        self.assertIn(f"Mac unreachable as of {now.astimezone(user_zone()):%H:%M}", output.splitlines())
 
     def test_lead_block_uses_latest_candidate_and_groups_backoff_with_unreachable(self) -> None:
         for reason in ("backoff", "unreachable"):
@@ -428,7 +653,7 @@ class ReportTests(unittest.TestCase):
                     call("local", started_at="2026-10-02T12:10:00Z", mac="declined", mac_reason="local_flag"),
                     call("linux", started_at="2026-10-02T12:20:00Z", mac="declined", mac_reason="linux_only"),
                 )
-                self.assertIn(f"Mac unreachable as of {local_clock(STAMP).split()[0]}", self.render())
+                self.assertIn("Mac unreachable as of " + holds.shown_time(datetime.fromisoformat(STAMP)), self.render())
         self.write(
             self.root / "natedev" / "2026-10.jsonl",
             call("blocked", mac="declined", mac_reason="blocked", mac_s=1),
@@ -1545,7 +1770,7 @@ class ReportTests(unittest.TestCase):
             "| **All steps** | 1 | 20.0 s | 20.0 s | 20.0 s |  |",
             successes,
         )
-        self.assertFalse(any(line.startswith("| fmt |") for line in lines))
+        self.assertFalse(any(line.startswith("| fmt |") for line in successes))
 
     def test_verify_step_without_call_record_remains_in_reports(self) -> None:
         self.write(
@@ -1818,8 +2043,8 @@ class ReportTests(unittest.TestCase):
         )
         section = self.memory_section()
         self.assertIn("| Caller | Kind | Stall | At once |", section)
-        self.assertIn("| verify.sh (agents) (natedev) | clippy | 12.0 s | 1 |", section)
-        self.assertIn("| agent (direct) (natedev) | mend | 9.0 s | 2 |", section)
+        self.assertIn("| verify.sh (agents) | clippy | 12.0 s | 1 |", section)
+        self.assertIn("| agent (direct) | mend | 9.0 s | 2 |", section)
         self.assertTrue(any("| 8.0 s | 3 |" in line for line in section))
         self.assertTrue(any("| 7.0 s | 4 |" in line for line in section))
         self.assertTrue(any("| 6.0 s | 4 |" in line for line in section))
@@ -1889,7 +2114,7 @@ class ReportTests(unittest.TestCase):
 
     def test_memory_pressure_counts_counter_rise_across_midnight_when_samples_are_close(self) -> None:
         self.addCleanup(time.tzset)
-        with mock.patch.dict(os.environ, {"TZ": "UTC"}):
+        with mock.patch.dict(os.environ, {"TZ": "UTC", "USER_ZONE": "UTC"}):
             time.tzset()
             self.write(
                 self.root / "natedev" / "samples-2026-10.jsonl",
@@ -1947,7 +2172,7 @@ class ReportTests(unittest.TestCase):
         self.assertIn("| scratch (temp folders) | 1 | 0 | 1.0 s | 1.0 s | 1.0 s |  |  |  |  |", lines)
         self.assertNotIn("steps under a temp folder", text)
 
-    def test_launch_in_temp_folder_counts_host_for_caller_labels(self) -> None:
+    def test_mac_launch_in_temp_folder_leaves_natedev_caller_without_host(self) -> None:
         self.write(
             self.root / "natedev" / "2026-10.jsonl",
             step("local", host="natedev", caller="verify", step="check"),
@@ -1958,8 +2183,11 @@ class ReportTests(unittest.TestCase):
         )
 
         lines = self.render().splitlines()
-        self.assertTrue(any(line.startswith("| verify.sh (agents) (natedev) |") for line in lines))
-        self.assertTrue(any(line.startswith("| example launches (brp) (mac) |") for line in lines))
+        self.assertTrue(any(line.startswith("| verify.sh (agents) |") for line in lines))
+        self.assertFalse(any("(natedev)" in line for line in lines))
+        self.assertNotIn("### build", lines)
+        mac = self.section_lines(self.render(), "### Mac")
+        self.assertTrue(any(line.startswith("| example launches (brp) | build | 1 |") for line in mac))
 
     def test_ci_queue_summary_when_all_queue_times_are_known(self) -> None:
         self.write(
@@ -2055,16 +2283,18 @@ class ReportTests(unittest.TestCase):
 
         lines = self.render().splitlines()
         fmt = lines[lines.index("### fmt") : lines.index("### doc")]
-        self.assertIn("| scratch (temp folders) | 2 | 0 | 15.0 s | 20.0 s | 10.0 s – 20.0 s |", fmt)
+        self.assertIn("| scratch (temp folders) | 1 | 0 | 10.0 s | 10.0 s | 10.0 s |", fmt)
         self.assertEqual(1, sum(line.startswith("| scratch (temp folders) |") for line in fmt))
         doc = lines[lines.index("### doc") : lines.index("### Summary: successes")]
         self.assertIn("| scratch (temp folders) | 1 | 1 | 10.0 s | 10.0 s | 10.0 s |  |  |  |", doc)
         successes = lines[lines.index("### Summary: successes") : lines.index("### Summary: failures")]
-        self.assertIn("| fmt | 3 | 1.0 min | 20.0 s | 30.0 s | 2.0 GiB |", successes)
+        self.assertIn("| fmt | 2 | 40.0 s | 20.0 s | 30.0 s | 2.0 GiB |", successes)
         failures = lines[lines.index("### Summary: failures") : lines.index("### Summary: all")]
         self.assertIn("| doc | 1 | 10.0 s | 10.0 s | 10.0 s | 4.0 GiB |", failures)
         combined = lines[lines.index("### Summary: all") :]
-        self.assertIn("| **All steps** | 4 | 1 | 1.2 min | 17.5 s | 30.0 s | 4.0 GiB |", combined)
+        self.assertIn("| **All steps** | 3 | 1 | 50.0 s | 16.7 s | 30.0 s | 4.0 GiB |", combined)
+        mac = self.section_lines(self.render(), "### Mac")
+        self.assertTrue(any(line.startswith("| terminal | fmt | 1 | 0 | 20.0 s |") for line in mac))
 
     def test_port_lint_calls_have_their_own_section(self) -> None:
         self.write(
@@ -2208,7 +2438,7 @@ class ReportTests(unittest.TestCase):
 
     def test_sync_time_names_its_zone_and_an_earlier_day(self) -> None:
         self.addCleanup(time.tzset)
-        with mock.patch.dict(os.environ, {"TZ": "America/New_York"}):
+        with mock.patch.dict(os.environ, {"TZ": "America/New_York", "USER_ZONE": "America/New_York"}):
             time.tzset()
             now = datetime.fromisoformat("2026-10-03T15:00:00-04:00")
             self.assertEqual(sync.sync_time("2026-10-03T16:14:00+00:00", now), "12:14 EDT")
@@ -2330,6 +2560,233 @@ class ReportTests(unittest.TestCase):
         row = [cell.strip() for cell in lines[start + 4].strip("|").split("|")]
         self.assertEqual(head[head.index("Avg") + 1], "p95")
         self.assertEqual(row[head.index("p95")], "20.0 s")
+
+
+class PowerProfileTests(unittest.TestCase):
+    root: Path  # pyright: ignore[reportUninitializedInstanceVariable]
+
+    @override
+    def setUp(self) -> None:
+        self.root = Path(self.enterContext(tempfile.TemporaryDirectory())) / "buildlog"
+        point_root_at(self, self.root)
+        self.addCleanup(time.tzset)
+        _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {"TZ": "UTC", "USER_ZONE": "UTC"})))
+        time.tzset()
+
+    def write(self, *records: Record) -> None:
+        path = self.root / "natedev" / "profiles.jsonl"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        _ = path.write_bytes(b"".join(encode(record) for record in records))
+
+    def changes(self) -> list[report.ProfileChange]:
+        _ = index.update()
+        with closing(index.read_only()) as connection:
+            return report.profile_changes(connection)
+
+    def section(self, day: str = "2026-10-13") -> list[str]:
+        _ = index.update()
+        with closing(index.read_only()) as connection:
+            return report.power_profile_section(connection, day)
+
+    def rows(self, lines: list[str]) -> list[list[str]]:
+        return [[cell.strip() for cell in line.strip("|").split("|")]
+                for line in lines if line.startswith("| ") and not line.startswith("| Kind |")]
+
+    def profiled(self, at: str, profile: str = "performance", since: str | None = None) -> Record:
+        return sample(at, power_profile=profile, power_profile_since=since)
+
+    def runs(self, prefix: str, at: str, count: int, duration: float) -> list[Record]:
+        return [step(f"{prefix}-{number}", started_at=at, ended_at=at, duration_s=duration,
+                     step="nextest", caller="verify", crates_compiled=1)
+                for number in range(count)]
+
+    def test_first_profile_uses_since_after_null_samples_in_time_order(self) -> None:
+        since = "2026-10-13T12:29:56.000Z"
+        self.write(
+            self.profiled("2026-10-13T12:31:00.000Z", since=since),
+            sample("2026-10-13T12:28:00.000Z"),
+            sample("2026-10-13T12:29:00.000Z", power_profile=None, power_profile_since=None),
+            self.profiled("2026-10-13T12:30:00.000Z", since=since),
+            sample("2026-10-13T12:27:00.000Z", host="macbook", power_profile="balanced"),
+        )
+        self.assertEqual(self.changes(), [report.ProfileChange(since, "performance")])
+
+    def test_same_profile_rewrite_keeps_original_change_time(self) -> None:
+        self.write(
+            self.profiled("2026-10-12T12:01:00.000Z", since="2026-10-12T12:00:00.000Z"),
+            self.profiled("2026-10-13T12:01:00.000Z", since="2026-10-13T12:00:00.000Z"),
+        )
+        self.assertEqual(self.changes(), [report.ProfileChange("2026-10-12T12:00:00.000Z", "performance")])
+
+    def test_each_profile_transition_is_recorded_with_sample_time_fallback(self) -> None:
+        self.write(
+            self.profiled("2026-10-11T12:01:00.000Z", since="2026-10-11T12:00:00.000Z"),
+            self.profiled("2026-10-12T12:00:00.000Z", "balanced"),
+            self.profiled("2026-10-13T12:01:00.000Z", since="2026-10-13T12:00:00.000Z"),
+        )
+        self.assertEqual(self.changes(), [
+            report.ProfileChange("2026-10-11T12:00:00.000Z", "performance"),
+            report.ProfileChange("2026-10-12T12:00:00.000Z", "balanced"),
+            report.ProfileChange("2026-10-13T12:00:00.000Z", "performance"),
+        ])
+
+    def test_rows_match_kind_caller_and_rebuild_class_with_counts_and_busiest_first(self) -> None:
+        before = "2026-10-12T12:00:00.000Z"
+        after = "2026-10-13T12:00:00.000Z"
+        records = [self.profiled(after)]
+        groups = (
+            ("nextest", "verify", 1, 10, 12),
+            ("nextest", "verify", 4, 2, 3),
+            ("nextest", "alias", 1, 1, 2),
+            ("clippy", "verify", 1, 2, 1),
+            ("nextest", "verify", None, 1, 4),
+        )
+        for group, (kind, caller, crates, before_count, after_count) in enumerate(groups):
+            for side, at, count, duration in (("before", before, before_count, 120),
+                                             ("after", after, after_count, 90)):
+                records.extend(step(f"{group}-{side}-{number}", started_at=at, ended_at=at,
+                                    step=kind, caller=caller, crates_compiled=crates, duration_s=duration)
+                               for number in range(count))
+        # Different crate counts in the same rebuild class belong in one row.
+        records[2]["crates_compiled"] = 3
+        records.extend((step("only-before", started_at=before, step="fmt"),
+                        step("only-after", started_at=after, step="doc")))
+        self.write(*records)
+        lines = self.section()
+        rows = self.rows(lines)
+        self.assertEqual(rows, [
+            ["nextest", "verify.sh (agents)", "edited crate (1–3 crates)", "10", "2.0 min", "12", "1.5 min", "−25%"],
+            ["nextest", "verify.sh (agents)", "—", "1", "2.0 min", "4", "1.5 min", "—"],
+            ["nextest", "verify.sh (agents)", "cascade (4–49 crates)", "2", "2.0 min", "3", "1.5 min", "—"],
+            ["nextest", "terminal", "edited crate (1–3 crates)", "1", "2.0 min", "2", "1.5 min", "—"],
+            ["clippy", "verify.sh (agents)", "edited crate (1–3 crates)", "2", "2.0 min", "1", "1.5 min", "—"],
+        ])
+        self.assertIn("Before 2026-10-13 12:00:00 UTC (profile not recorded) vs after (performance):", lines)
+        self.assertIn("| Kind | Caller | Rebuild | Before runs | Before p50 | After runs | After p50 | Change |", lines)
+        self.assertIn("Source: natedev steps that passed, the 7 days before the change against the time since, up to the next change; p50 is the nearest rank; Change is shown only with at least 10 runs on each side. Load and time of day are not matched.", lines)
+
+    def test_change_requires_ten_runs_on_each_side_and_prints_signed_percent(self) -> None:
+        self.assertEqual(report.MIN_PROFILE_RUNS, 10)
+        for before_count, after_count, expected in ((9, 10, "—"), (10, 9, "—"),
+                                                    (10, 10, "+25%")):
+            with self.subTest(before=before_count, after=after_count):
+                self.write(self.profiled("2026-10-13T12:00:00.000Z"),
+                           *self.runs("before", "2026-10-12T12:00:00.000Z", before_count, 40),
+                           *self.runs("after", "2026-10-13T12:00:00.000Z", after_count, 50))
+                row = self.rows(self.section())[0]
+                self.assertEqual(row[3], str(before_count))
+                self.assertEqual(row[5], str(after_count))
+                self.assertEqual(row[7], expected)
+
+    def test_unmatched_step_groups_explain_comparison_without_table_or_source(self) -> None:
+        self.write(
+            self.profiled("2026-10-13T12:00:00.000Z"),
+            step("before", started_at="2026-10-12T12:00:00.000Z", step="clippy",
+                 caller="verify", crates_compiled=1),
+            step("after", started_at="2026-10-13T12:00:00.000Z", step="nextest",
+                 caller="verify", crates_compiled=1),
+        )
+        lines = self.section()
+        self.assertEqual([line for line in lines if line], [
+            "### Power profile",
+            "Profile now: performance, since 2026-10-13 12:00:00 UTC.",
+            "Before 2026-10-13 12:00:00 UTC (profile not recorded) vs after (performance):",
+            "No step ran with the same kind, caller and rebuild class on both sides.",
+        ])
+
+    def test_p50_uses_nearest_rank_rather_than_interpolated_median(self) -> None:
+        records = [self.profiled("2026-10-13T12:00:00.000Z")]
+        for side, at, durations in (("before", "2026-10-12T12:00:00.000Z", (200, 10, 100, 20)),
+                                    ("after", "2026-10-13T12:00:00.000Z", (2000, 50, 1000, 40))):
+            records.extend(step(f"{side}-{number}", started_at=at, duration_s=duration,
+                                step="clippy", caller="verify", crates_compiled=1)
+                           for number, duration in enumerate(durations))
+        self.write(*records)
+        self.assertEqual(self.rows(self.section())[0][3:], ["4", "20.0 s", "4", "50.0 s", "—"])
+
+    def test_mac_failed_and_sweep_steps_do_not_enter_comparisons(self) -> None:
+        records = [self.profiled("2026-10-13T12:00:00.000Z")]
+        for side, at in (("before", "2026-10-12T12:00:00.000Z"), ("after", "2026-10-13T12:00:00.000Z")):
+            records.extend(self.runs(side, at, 1, 20))
+            records.extend((step(f"mac-{side}", started_at=at, host="macbook", step="nextest",
+                                 caller="verify", crates_compiled=1, duration_s=500),
+                            step(f"failed-{side}", started_at=at, status=1, step="nextest",
+                                 caller="verify", crates_compiled=1, duration_s=500),
+                            step(f"sweep-{side}", started_at=at, step="sweep", duration_s=500)))
+        self.write(*records)
+        self.assertEqual(self.rows(self.section()), [["nextest", "verify.sh (agents)",
+                         "edited crate (1–3 crates)", "1", "20.0 s", "1", "20.0 s", "—"]])
+
+    def test_previous_and_next_changes_bound_windows_and_newest_is_first(self) -> None:
+        self.write(
+            self.profiled("2026-10-10T12:00:00.000Z", "power-saver"),
+            self.profiled("2026-10-12T12:00:00.000Z", "balanced"),
+            self.profiled("2026-10-13T12:00:00.000Z"),
+            *self.runs("unknown", "2026-10-09T12:00:00.000Z", 1, 80),
+            *self.runs("saver", "2026-10-10T12:00:00.000Z", 2, 60),
+            *self.runs("balanced", "2026-10-12T12:00:00.000Z", 3, 40),
+            *self.runs("performance", "2026-10-13T12:00:00.000Z", 4, 20),
+        )
+        lines = self.section()
+        rows = self.rows(lines)
+        self.assertEqual([row[3:] for row in rows], [
+            ["3", "40.0 s", "4", "20.0 s", "—"],
+            ["2", "1.0 min", "3", "40.0 s", "—"],
+            ["1", "1.3 min", "2", "1.0 min", "—"],
+        ])
+        comparisons = [line for line in lines if line.startswith("Before ")]
+        self.assertEqual(len(comparisons), 3)
+        self.assertIn("2026-10-13 12:00:00 UTC", comparisons[0])
+        self.assertIn("(balanced) vs after (performance)", comparisons[0])
+        self.assertIn("2026-10-12 12:00:00 UTC", comparisons[1])
+        self.assertIn("(power-saver) vs after (balanced)", comparisons[1])
+        self.assertIn("(profile not recorded)", comparisons[2])
+
+    def test_before_window_is_seven_days_and_after_ends_at_report_day_end(self) -> None:
+        self.write(
+            self.profiled("2026-10-13T12:00:00.000Z"),
+            *self.runs("too-old", "2026-10-06T11:59:59.999Z", 1, 500),
+            *self.runs("before-edge", "2026-10-06T12:00:00.000Z", 1, 20),
+            *self.runs("after-edge", "2026-10-13T12:00:00.000Z", 1, 30),
+            *self.runs("before-end", "2026-10-13T23:59:59.999Z", 1, 30),
+            *self.runs("at-end", "2026-10-14T00:00:00.000Z", 1, 500),
+        )
+        self.assertEqual(self.rows(self.section())[0][3:], ["1", "20.0 s", "2", "30.0 s", "—"])
+
+    def test_change_older_than_seven_days_only_shows_current_profile(self) -> None:
+        since = "2026-10-06T00:00:00.000Z"
+        self.write(self.profiled("2026-10-06T00:01:00.000Z", since=since),
+                   self.profiled("2026-10-13T12:00:00.000Z", since="2026-10-13T11:00:00.000Z"))
+        lines = self.section()
+        self.assertEqual([line for line in lines if line], [
+            "### Power profile", "Profile now: performance, since 2026-10-06 00:00:00 UTC.",
+        ])
+
+    def test_no_profiled_natedev_sample_omits_section(self) -> None:
+        self.write(sample(STAMP), sample("2026-10-13T12:00:00.000Z", host="macbook", power_profile="balanced"))
+        self.assertEqual(self.changes(), [])
+        self.assertEqual(self.section(), [])
+
+    def test_report_window_includes_start_and_excludes_change_at_day_end(self) -> None:
+        self.write(
+            self.profiled("2026-10-07T00:00:00.000Z", "balanced"),
+            self.profiled("2026-10-14T00:00:00.000Z"),
+            *self.runs("before", "2026-10-06T12:00:00.000Z", 1, 20),
+            *self.runs("after", "2026-10-13T12:00:00.000Z", 1, 30),
+        )
+        lines = self.section()
+        self.assertIn("Profile now: balanced, since 2026-10-07 00:00:00 UTC.", lines)
+        self.assertEqual(sum(line.startswith("Before ") for line in lines), 1)
+        self.assertNotIn("performance", "\n".join(lines))
+        self.assertEqual(self.rows(lines)[0][3:], ["1", "20.0 s", "1", "30.0 s", "—"])
+
+    def test_profile_labels_use_user_zone_with_seconds(self) -> None:
+        self.write(self.profiled("2026-10-14T02:30:00.000Z", since="2026-10-14T02:29:56.000Z"))
+        with mock.patch.dict(os.environ, {"TZ": "America/New_York", "USER_ZONE": "America/New_York"}):
+            time.tzset()
+            lines = self.section()
+        self.assertIn("Profile now: performance, since 2026-10-13 22:29:56 EDT.", lines)
+        self.assertIn("Before 2026-10-13 22:29:56 EDT (profile not recorded) vs after (performance):", lines)
 
 
 if __name__ == "__main__":

@@ -30,7 +30,7 @@ from urllib.parse import quote
 
 import store
 
-SCHEMA_VERSION = 13
+SCHEMA_VERSION = 15
 LOCK_NAME = "index.lock"
 MARK_BYTES = 256
 BUSY_TIMEOUT_MS = 30_000
@@ -136,6 +136,7 @@ CALL_COLUMNS: list[Column] = [
     ("token_wait_s", "INTEGER", "seconds spent acquiring the cargo token, a wait that timed out included; 0 when verify.sh sought none"),
     ("mac", "TEXT", "passed, passed_filter, failed, lost or declined when Mac offload ran or was considered"),
     ("mac_reason", "TEXT", "why Mac offload declined or had no usable result"),
+    ("mac_holder", "TEXT", "busy decline: the claim what, leftovers or unreadable; NULL in old rows"),
     (
         "local_reason",
         "TEXT",
@@ -232,6 +233,8 @@ SAMPLE_COLUMNS: list[Column] = [
     ("ci_anon_bytes", "INTEGER", "anon memory in hana-ci.slice; process memory"),
     ("stall_some_us", "INTEGER", "machine memory some stall counter since boot, microseconds"),
     ("stall_full_us", "INTEGER", "machine memory full stall counter since boot, microseconds"),
+    ("power_profile", "TEXT", "power-profiles-daemon profile; NULL when not recorded"),
+    ("power_profile_since", "TEXT", "UTC ISO mtime of the daemon's state file: when the profile was set"),
 ]
 
 MEMORY_SNAPSHOT_COLUMNS: list[Column] = [
@@ -242,7 +245,20 @@ MEMORY_SNAPSHOT_COLUMNS: list[Column] = [
     ("zram", "TEXT", "JSON zram storage at the snapshot time"),
 ]
 
+HOLD_EVENT_COLUMNS: list[Column] = [
+    ("src", "TEXT", "the source file; forgetting it removes this event only"),
+    ("at", "TEXT", "UTC instant of the file change, taken under its lock"),
+    ("host", "TEXT", "the machine that ran the command"),
+    ("target", "TEXT", "mac or natedev"),
+    ("event", "TEXT", "began or ended"),
+    ("hold_key", "TEXT", "the hold identity on its host and target: holder file key or Mac block since"),
+    ("holder", "TEXT", "the name to show"),
+    ("reason", "TEXT", "the reason given when the hold began"),
+    ("until", "TEXT", "the planned end; empty when none was given"),
+]
+
 TABLES: dict[str, tuple[list[Column], str, str]] = {
+    "hold_events": (HOLD_EVENT_COLUMNS, "", "one row per began or ended event; current holds come from coordination files"),
     "steps": (STEP_COLUMNS, "", "one row per step invoke.sh's run() ran: clippy, mend, doc, fmt, nextest, check, sweep"),
     "tests": (
         TEST_COLUMNS,
@@ -262,6 +278,23 @@ TABLES: dict[str, tuple[list[Column], str, str]] = {
 }
 
 VIEWS: dict[str, tuple[str, str]] = {
+    "holds": (
+        "one interval per began row; ends when the next row of its key is ended; a next began or no later row leaves ended_at NULL; an ended row without a preceding began has began_at NULL; previous_at and next_at bound missing events; later_row is 1 when a later row exists; no row proves a hold is in force now",
+        """WITH ordered AS (
+SELECT *, LAG(event) OVER hold_order AS previous_event,
+       LAG(at) OVER hold_order AS previous_at,
+       LEAD(event) OVER hold_order AS next_event,
+       LEAD(at) OVER hold_order AS next_at
+FROM hold_events
+WINDOW hold_order AS (PARTITION BY host, target, hold_key ORDER BY at, CASE event WHEN 'began' THEN 0 ELSE 1 END)
+)
+SELECT host, target, hold_key, holder, reason, until,
+       CASE WHEN event = 'began' THEN at END AS began_at,
+       CASE WHEN event = 'ended' THEN at WHEN next_event = 'ended' THEN next_at END AS ended_at,
+       CASE WHEN next_event IS NOT NULL THEN 1 ELSE 0 END AS later_row,
+       previous_at, next_at
+FROM ordered WHERE event = 'began' OR (event = 'ended' AND previous_event IS NOT 'began')""",
+    ),
     "step_days": (
         "per local day, host, repo, step and caller: runs, failed, total_s, avg_s, max_s, avg_build_s, max_peak_gib",
         f"""SELECT date(started_at, 'localtime') AS day, host, repo, step, caller,
@@ -339,6 +372,8 @@ def create_schema(connection: sqlite3.Connection) -> None:
             body.append(key)
         statements.append(f"CREATE TABLE {table} ({', '.join(body)})")
         statements.append(f"CREATE INDEX {table}_src ON {table} (src)")
+    statements.append("CREATE INDEX hold_events_key_at ON hold_events (host, target, hold_key, at, event)")
+    statements.append("CREATE INDEX hold_events_target_at ON hold_events (target, at)")
     statements.append("CREATE INDEX steps_started ON steps (started_at)")
     statements.append("CREATE INDEX steps_host_started ON steps (host, started_at)")
     statements.append("CREATE INDEX steps_tree ON steps (worktree, step, tree_key)")
@@ -517,7 +552,11 @@ def add_ci_run(connection: sqlite3.Connection, record: dict[str, object], src: s
             insert(connection, "ci_steps", pick(step_row, CI_STEP_COLUMNS))
 
 
-ADDERS = {"step": add_step, "call": add_call, "ci_run": add_ci_run, "sample": add_sample,
+def add_hold_event(connection: sqlite3.Connection, record: dict[str, object], src: str) -> None:
+    insert(connection, "hold_events", pick({**record, "src": src}, HOLD_EVENT_COLUMNS))
+
+
+ADDERS = {"hold_event": add_hold_event, "step": add_step, "call": add_call, "ci_run": add_ci_run, "sample": add_sample,
           "memory_snapshot": add_memory_snapshot}
 
 

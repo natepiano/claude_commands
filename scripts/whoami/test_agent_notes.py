@@ -6,18 +6,20 @@ import io
 import json
 import os
 import subprocess
+import time
 import sys
 import tempfile
 import unittest
 import urllib.request
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 from datetime import datetime, timedelta, timezone, tzinfo
 from pathlib import Path
 from typing import Self, cast, override
-from unittest.mock import patch
+from unittest.mock import call, patch
 
 import agent_notes
 import note_file
+import account
 import agent_accounts
 import codex_pacer
 import five_hour
@@ -28,7 +30,13 @@ from agent_accounts import (ClaudeDirectorySource, CodexHomeSource, CodexRateLim
                             codex_credits, reset_credits)
 from agent_notes import apply, local_reset
 from note_file import Note, read_note
-from scripts.accounts import accounts
+from scripts.accounts import accounts, refusal_watch, refusals
+from scripts.production import showrunners
+
+
+def setUpModule() -> None:
+    root = Path(unittest.enterModuleContext(tempfile.TemporaryDirectory()))
+    _ = unittest.enterModuleContext(patch.object(showrunners, "NOTIFIER_STATE_DIR", root))
 
 
 class AgentNotesTests(unittest.TestCase):
@@ -52,6 +60,56 @@ class AgentNotesTests(unittest.TestCase):
         _ = os.environ.pop("CODEX_HOME", None)
         _ = self.enterContext(patch.object(note_file, "AGENTS_DIR", self.root))
         _ = self.enterContext(patch.object(agent_notes, "READINGS_LOG", self.root / "readings.jsonl", create=True))
+        _ = self.enterContext(patch.object(showrunners, "NOTIFIER_STATE_DIR", self.root / "notifier"))
+
+    def test_argument_free_notes_update_runs_watcher_after_notes_alert_and_pacer(self) -> None:
+        events: list[str] = []
+        update = agent_notes.update_alert_pass
+        def updated(selection: agent_accounts.ClaudeAccountsInUse, home: Path) -> agent_notes.UpdatedAgentNotes:
+            events.append("notes")
+            return update(selection, home)
+        def alerted(*_args: object, **_kwargs: object) -> list[str]:
+            events.append("alert")
+            return []
+        def paced(*_args: object, **_kwargs: object) -> None:
+            events.append("pacer")
+        def watched(*_args: object, **_kwargs: object) -> list[str]:
+            events.append("watcher")
+            return ["fixture watcher decision"]
+        with (patch.object(sys, "argv", ["agent_notes.py"]),
+              patch.object(agent_notes, "live_reports", return_value=[]),
+              patch.object(five_hour, "watch", return_value=[]),
+              patch.object(agent_notes, "update_alert_pass", side_effect=updated),
+              patch.object(agent_notes, "alert", side_effect=alerted),
+              patch.object(codex_pacer, "tick", side_effect=paced),
+              patch.object(agent_notes, "mark_tier"),
+              patch.object(refusal_watch, "run", side_effect=watched), redirect_stdout(io.StringIO()) as output):
+            agent_notes.main()
+        self.assertEqual(events, ["notes", "alert", "pacer", "watcher"])
+        self.assertIn("fixture watcher decision", output.getvalue())
+
+    def test_watcher_failure_prints_one_stderr_line_without_failing_notes_update(self) -> None:
+        with (patch.object(sys, "argv", ["agent_notes.py"]),
+              patch.object(agent_notes, "live_reports", return_value=[]),
+              patch.object(five_hour, "watch", return_value=[]),
+              patch.object(agent_notes, "alert", return_value=[]),
+              patch.object(codex_pacer, "tick"), patch.object(agent_notes, "mark_tier"),
+              patch.object(refusal_watch, "run", side_effect=OSError("watch fixture unavailable")),
+              redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()) as error):
+            agent_notes.main()
+        self.assertEqual(len(error.getvalue().splitlines()), 1)
+        self.assertIn("watch fixture unavailable", error.getvalue())
+
+    def test_explicit_refresh_does_not_run_automatic_refusal_watcher(self) -> None:
+        with (patch.object(sys, "argv", ["agent_notes.py", "refresh"]),
+              patch.object(agent_notes, "live_reports", return_value=[]),
+              patch.object(five_hour, "watch", return_value=[]),
+              patch.object(agent_notes, "refresh", return_value=[]),
+              patch.object(agent_notes, "current_session", return_value=None),
+              patch.object(codex_pacer, "tick"), patch.object(agent_notes, "mark_tier"),
+              patch.object(refusal_watch, "run") as watcher, redirect_stdout(io.StringIO())):
+            agent_notes.main()
+        watcher.assert_not_called()
 
     def note(self, name: str, email: str, extra: str = "") -> Note:
         path = self.root / name
@@ -78,9 +136,15 @@ class AgentNotesTests(unittest.TestCase):
         return directory
 
     def select_unit(self, label: str) -> None:
-        config = accounts.accounts_config_file()
-        config.parent.mkdir(parents=True, exist_ok=True)
-        _ = config.write_text(json.dumps(accounts.AccountsConfiguration(unit=label)))
+        """Represent a live local session on this account for the activity snapshot."""
+        from scripts.message import sessions
+        identity = accounts.account_identity(accounts.account_dir(label))
+        assert isinstance(identity, agent_accounts.KnownClaudeAccount)
+        _ = self.enterContext(patch.object(sessions, "live_sessions", return_value=[sessions.SessionRecord(
+            pid=43210, sessionId="activity-fixture", name="live unit", messagingSocketPath="/fixture.sock",
+            updatedAt=1, tmux="", formerNames=[])]))
+        _ = self.enterContext(patch.object(account, "account_of",
+            return_value=account.Account("claude", identity.login, identity.label)))
 
     def select_seats(self, label: str) -> None:
         self.assertEqual(accounts.main(["set-role", "seats", label]), 0)
@@ -92,6 +156,41 @@ class AgentNotesTests(unittest.TestCase):
             "tokens": {"id_token": f"header.{claims}.signature"},
         }))
 
+    def test_two_minute_snapshots_preserve_the_user_credit_setting_line_in_place(self) -> None:
+        for setting in ("off", "on"):
+            with self.subTest(setting=setting):
+                path = self.root / "codex 2.md"
+                original = ("---\ncredit_balance: 2115\ndate_modified: old\nlimit_reset: null\n"
+                    + "limit_reset_count: 0\nlogin: snapshot@example.invalid\nresets: old\nstate: inactive\n"
+                    + f"# My credit policy\nuse_credits: {setting}\n# Keep the policy here\n"
+                    + "weekly_remaining_usage: 98\nweekly_usage_checked_at: old\n---\nBody stays.\n").encode()
+                _ = path.write_bytes(original)
+                policy = f"use_credits: {setting}\n".encode()
+                policy_index = original.splitlines(keepends=True).index(policy)
+                for minute, used, credits in ((0, 3, "2114"), (2, 4, "2113")):
+                    note = read_note(path)
+                    assert note is not None
+                    observed = self.now + timedelta(minutes=minute)
+                    report = Report("Codex", email="snapshot@example.invalid",
+                        source=CodexHomeSource(self.root / ".codex"),
+                        quotas=[Quota("Weekly", used, self.future)], credit_balance=credits,
+                        limit_reset_count=1)
+                    messages = apply([note], report, observed)
+                    self.assertTrue(messages, "the usage observation must actually rewrite the note")
+                    rewritten = path.read_bytes()
+                    lines = rewritten.splitlines(keepends=True)
+                    self.assertEqual(lines.count(policy), 1)
+                    self.assertEqual(lines[policy_index], policy)
+                    self.assertEqual(lines[policy_index - 1:policy_index + 2],
+                                     original.splitlines(keepends=True)[policy_index - 1:policy_index + 2])
+                    self.assertTrue(rewritten.endswith(b"---\nBody stays.\n"))
+                    updated = read_note(path)
+                    assert updated is not None
+                    self.assertEqual(updated.get("credit_balance"), credits)
+                    self.assertEqual(updated.get("weekly_remaining_usage"), str(100 - used))
+                    self.assertEqual(updated.get("weekly_usage_checked_at"), observed.isoformat(timespec="seconds"))
+                    self.assertEqual(updated.get("use_credits"), setting)
+
     def test_update_passes_one_frozen_codex_reading_to_watch_alert_and_refresh(self) -> None:
         default, spare = self.root / ".codex", self.root / ".codex2"
         self.codex_login(default, "seats@example.com")
@@ -101,7 +200,7 @@ class AgentNotesTests(unittest.TestCase):
         reports = [Report("Codex", email="seats@example.com", source=CodexHomeSource(default)),
                    Report("Codex", email="spare@example.com", source=CodexHomeSource(spare))]
 
-        async def collect(selection: agent_accounts.ClaudeAccountSelection, seats_home: Path) -> list[Report]:
+        async def collect(selection: agent_accounts.ClaudeAccountsInUse, seats_home: Path) -> list[Report]:
             del selection
             self.assertEqual(seats_home, default)
             self.select_seats("codex 2")
@@ -133,6 +232,34 @@ class AgentNotesTests(unittest.TestCase):
             self.assertEqual(passes[0].seats.home, default)
             self.assertEqual([reading.home for reading in passes[0].checked_homes], [default, spare])
             self.assertTrue(all(reading.observed_at.tzinfo is not None for reading in passes[0].checked_homes))
+
+    def test_blocked_cli_passes_explicit_window_and_aware_refusal_time(self) -> None:
+        refused_at = self.now - timedelta(seconds=3)
+        with (patch.object(sys, "argv", ["agent_notes.py", "blocked", str(self.root / ".codex"),
+                  "seats@example.invalid", "codex 1", "--window", "five_hour", "--refused-at", refused_at.isoformat()]),
+              patch.object(agent_notes, "blocked", return_value=[]) as blocked,
+              patch.object(note_file, "read_notes", return_value=[])):
+            agent_notes.main()
+        blocked.assert_called_once()
+        self.assertEqual(blocked.call_args.kwargs["window"], refusals.KnownWindow("five_hour"))
+        self.assertEqual(blocked.call_args.kwargs["refused_at"], quota_alert.RefusedAt(refused_at))
+
+    def test_blocked_cli_missing_time_has_explicit_unknown_refusal_time(self) -> None:
+        with (patch.object(sys, "argv", ["agent_notes.py", "blocked", str(self.root / ".codex"),
+                  "seats@example.invalid", "codex 1"]),
+              patch.object(agent_notes, "blocked", return_value=[]) as blocked,
+              patch.object(note_file, "read_notes", return_value=[])):
+            agent_notes.main()
+        self.assertEqual(blocked.call_args.kwargs["refused_at"], quota_alert.RefusalTimeUnknown())
+
+    def test_blocked_cli_rejects_naive_refusal_time_before_reporting(self) -> None:
+        with (patch.object(sys, "argv", ["agent_notes.py", "blocked", str(self.root / ".codex"),
+                  "seats@example.invalid", "codex 1", "--refused-at", "2026-10-13T12:00:00"]),
+              patch.object(agent_notes, "blocked") as blocked,
+              redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as exited):
+            agent_notes.main()
+        self.assertEqual(exited.exception.code, 2)
+        blocked.assert_not_called()
 
     def test_update_writes_each_codex_home_and_keeps_only_the_seats_note_active(self) -> None:
         default = self.root / ".codex"
@@ -245,8 +372,8 @@ class AgentNotesTests(unittest.TestCase):
         seats_report = Report("Codex", problem="Account unavailable", source=CodexHomeSource(selected))
         spare_report = Report("Codex", email="spare@example.com", source=CodexHomeSource(default),
             quotas=[Quota("Weekly", 95, self.future)], credit_balance="23")
-        selection = agent_accounts.ClaudeAccountSelection(
-            agent_accounts.UnreadableClaudeAccount(), agent_accounts.UnreadableClaudeAccount(), False, (),
+        selection = agent_accounts.ClaudeAccountsInUse(
+            agent_accounts.UnreadableClaudeAccount(), False, (), frozenset(),
         )
 
         with (
@@ -378,7 +505,7 @@ class AgentNotesTests(unittest.TestCase):
             quotas=[Quota("Weekly", 100, self.future)]),
             Report("Codex", email="next@example.com", source=CodexHomeSource(next_home),
                 quotas=[Quota("Weekly", 10, self.future)])]
-        async def read(_selection: agent_accounts.ClaudeAccountSelection, seats_home: Path) -> list[Report]:
+        async def read(_selection: agent_accounts.ClaudeAccountsInUse, seats_home: Path) -> list[Report]:
             self.assertEqual(seats_home, selected)
             self.select_seats("codex 3")
             return reports
@@ -465,36 +592,118 @@ class AgentNotesTests(unittest.TestCase):
             {login: usage.get("weekly", {}).get("left") for login, usage in usage_store.load().items()},
             {"main@example.com": 80.0, "unit@example.com": 4.0},
         )
+        by_label = (self.root / ".local/state/agent-notes/by-label.json").read_text(encoding="utf-8")
+        self.assertEqual(
+            {label: usage["weekly"]["left"]
+             for label, usage in cast(dict[str, dict[str, dict[str, float]]], json.loads(by_label)).items()},
+            {"claude 2": 80.0, "claude 3": 4.0},
+        )
+        self.assertNotIn("@", by_label)
 
-    def test_role_swap_during_update_keeps_one_unit_login_active(self) -> None:
-        """Every note uses the same role selection for the entire update."""
+    def test_update_keeps_its_live_login_snapshot_when_sessions_change_mid_read(self) -> None:
         _ = self.account_dir("default", "main@example.com", "main-token")
         _ = self.account_dir("claude 1", "old-unit@example.com", "old-token")
         _ = self.account_dir("claude 3", "new-unit@example.com", "new-token")
         self.select_unit("claude 1")
-        for label, login in (("claude 1", "old-unit@example.com"),
-                             ("claude 2", "main@example.com"),
+        for label, login in (("claude 1", "old-unit@example.com"), ("claude 2", "main@example.com"),
                              ("claude 3", "new-unit@example.com")):
             _ = self.note(f"{label}.md", login)
-        resolve = accounts.role_account
+        resolve = accounts.claude_account_selection
 
-        def swap_after_selection(role: str) -> accounts.AccountSelection:
-            selected = resolve(role)
+        def changed_after_snapshot() -> agent_accounts.ClaudeAccountsInUse:
+            selection = resolve()
             self.select_unit("claude 3")
-            return selected
+            return selection
 
         reports = [Report("Claude", email=login, quotas=[Quota("Weekly", 20, self.future)])
                    for login in ("old-unit@example.com", "main@example.com", "new-unit@example.com")]
-        with (
-            patch.object(accounts, "role_account", side_effect=swap_after_selection) as selection,
-            patch.object(agent_notes, "live_reports", return_value=reports),
-            patch.object(five_hour, "watch", return_value=[]),
-        ):
+        with (patch.object(accounts, "claude_account_selection", side_effect=changed_after_snapshot) as snapshot,
+              patch.object(agent_notes, "live_reports", return_value=reports),
+              patch.object(five_hour, "watch", return_value=[])):
             _ = agent_notes.update()
-        selection.assert_called_once_with("unit")
+        snapshot.assert_called_once_with()
         self.assertEqual({note.path.stem: note.get("state") for note in note_file.read_notes()}, {
-            "claude 1": "active", "claude 2": "active", "claude 3": "inactive",
-        })
+            "claude 1": "active", "claude 2": "active", "claude 3": "inactive"})
+
+    def test_sessions_on_multiple_logins_all_stay_visible_in_notes_and_whoami(self) -> None:
+        from scripts.message import sessions
+        _ = self.account_dir("default", "main@example.com", "main-token")
+        _ = self.account_dir("claude 1", "first@example.com", "first-token")
+        _ = self.account_dir("claude 3", "third@example.com", "third-token")
+        for label, login in (("claude 1", "first@example.com"), ("claude 2", "main@example.com"),
+                             ("claude 3", "third@example.com")):
+            _ = self.note(f"{label}.md", login)
+        owners = [sessions.SessionRecord(pid=pid, sessionId=str(pid), name=str(pid),
+                  messagingSocketPath="/fixture.sock", updatedAt=1, tmux="", formerNames=[])
+                  for pid in (10001, 10003, 10009)]
+        identities = {10001: account.Account("claude", "FIRST@example.com", "claude 1"),
+                      10003: account.Account("claude", "third@example.com", "claude 3")}
+        reports = [Report("Claude", email=login, quotas=[Quota("Weekly", 20, self.future)])
+                   for login in ("main@example.com", "first@example.com", "third@example.com")]
+        def observed_account(pid: int) -> account.Account | None:
+            return identities.get(pid)
+        with (patch.object(sessions, "live_sessions", return_value=owners),
+              patch.object(account, "account_of", side_effect=observed_account),
+              patch.object(agent_notes, "live_reports", return_value=reports),
+              patch.object(five_hour, "watch", return_value=[])):
+            selection = accounts.claude_account_selection()
+            _ = agent_notes.update_for_selection(selection, agent_accounts.seats_home())
+            output = io.StringIO()
+            with patch.object(whoami, "live_reports", return_value=reports), redirect_stdout(output):
+                asyncio.run(whoami.main())
+        self.assertEqual({note.path.stem: note.get("state") for note in note_file.read_notes()}, {
+            "claude 1": "active", "claude 2": "active", "claude 3": "active"})
+        for label in ("claude 1", "claude 2", "claude 3"):
+            self.assertIn(label, output.getvalue())
+
+    def test_live_unfit_and_external_accounts_are_collected_once_and_remain_visible(self) -> None:
+        from scripts.message import sessions
+        default = self.account_dir("default", "main@example.com", "main-token")
+        unfit = self.account_dir("claude 3", "unfit@example.com", "unfit-token")
+        (unfit / "projects").unlink()
+        external = self.root / "external account"
+        external.mkdir()
+        _ = (external / ".claude.json").write_text(json.dumps({"oauthAccount": {"emailAddress": "external@example.com"}}))
+        for label, login in (("claude 2", "main@example.com"), ("claude 3", "unfit@example.com"),
+                             ("claude 4", "external@example.com")):
+            _ = self.note(label + ".md", login)
+        directories = {10001: unfit, 10002: external, 10003: external, 10004: default}
+        owners = [sessions.SessionRecord(pid=pid, sessionId=str(pid), name=str(pid),
+            messagingSocketPath="/fixture.sock", updatedAt=1, tmux="", formerNames=[]) for pid in directories]
+        logins = {default: "main@example.com", unfit: "unfit@example.com", external: "external@example.com"}
+        def process_directory(pid: int) -> Path | None:
+            return directories.get(pid)
+        def process_account(pid: int) -> account.Account | None:
+            directory = directories.get(pid)
+            return account.Account("claude", logins[directory], "fixture") if directory is not None else None
+        def live(directory: Path) -> Report:
+            return Report("Claude", email=logins[directory], quotas=[Quota("Weekly", 96, self.future)],
+                          source=agent_accounts.ClaudeDirectorySource(directory))
+        with (patch.object(sessions, "live_sessions", return_value=owners) as observed_sessions,
+              patch.object(account, "process_config_dir", side_effect=process_directory) as observed_directories,
+              patch.object(account, "account_of", side_effect=process_account)):
+            selection = accounts.claude_account_selection()
+        observed_sessions.assert_called_once_with()
+        self.assertEqual(observed_directories.call_args_list, [call(pid) for pid in directories])
+        self.assertCountEqual(selection.live_directories, logins)
+        self.assertEqual(selection.named_accounts, ())
+        self.assertTrue(selection.is_in_use("external@example.com"))
+        with (patch.object(agent_accounts, "claude_live", side_effect=live) as reads,
+              patch.object(agent_accounts, "codex_homes", return_value=[]),
+              patch.object(accounts, "claude_account_selection", return_value=selection),
+              patch.object(five_hour, "watch", return_value=[]),
+              patch.object(agent_notes, "alert", return_value=[])):
+            _ = agent_notes.update_for_selection(selection, self.root / ".codex")
+            self.assertCountEqual(reads.call_args_list, [call(directory) for directory in logins])
+            reads.reset_mock()
+            output = io.StringIO()
+            with redirect_stdout(output):
+                asyncio.run(whoami.main())
+            self.assertCountEqual(reads.call_args_list, [call(directory) for directory in logins])
+        self.assertEqual({note.path.stem: note.get("state") for note in note_file.read_notes()},
+                         {"claude 2": "active", "claude 3": "active", "claude 4": "active"})
+        for login in logins.values():
+            self.assertIn(login, output.getvalue())
 
     def test_five_hour_watch_uses_the_default_directory_independent_of_report_order(self) -> None:
         """Order, shared logins and missing emails cannot select the named reading."""
@@ -542,7 +751,8 @@ class AgentNotesTests(unittest.TestCase):
         notice_roles = cast(object, alert.call_args.kwargs["selection"])
         self.assertIs(notice_roles, selection)
 
-    def test_legacy_live_collection_keeps_the_original_call_and_note_states(self) -> None:
+    def test_default_account_collection_reads_its_directory_and_keeps_note_states(self) -> None:
+        _ = self.account_dir("default", "main@example.com", "main-token")
         active = self.note("claude 2.md", "main@example.com")
         spare = self.note("claude 3.md", "other@example.com")
         report = Report("Claude", email="main@example.com", quotas=[Quota("Weekly", 20, self.future)])
@@ -550,7 +760,7 @@ class AgentNotesTests(unittest.TestCase):
               patch.object(agent_accounts, "codex_live", return_value=Report("Codex")),
               patch.object(five_hour, "watch", return_value=[])):
             _ = agent_notes.update()
-        claude.assert_called_once_with()
+        claude.assert_called_once_with(self.root / ".claude")
         updated = {note.path.stem: note for note in note_file.read_notes()}
         self.assertEqual(updated[active.path.stem].get("state"), "active")
         self.assertEqual(updated[spare.path.stem].get("state"), "inactive")
@@ -572,6 +782,21 @@ class AgentNotesTests(unittest.TestCase):
         request = cast(urllib.request.Request, usage.call_args.args[0])
         self.assertEqual(request.get_header("Authorization"), "Bearer fixture-inherited")
         self.assertEqual(report.source, ClaudeDirectorySource(self.root / ".claude"))
+
+    def test_an_expired_stored_token_is_not_sent(self) -> None:
+        named = self.root / ".claude3"
+        named.mkdir()
+        _ = (named / ".credentials.json").write_text(json.dumps({"claudeAiOauth": {
+            "accessToken": "fixture-stale", "expiresAt": int((time.time() - 60) * 1000)}}))
+        with (
+            patch.object(agent_accounts, "executable", return_value="fixture-claude"),
+            patch.object(subprocess, "run", return_value=subprocess.CompletedProcess(
+                [], 0, '{"loggedIn": true, "email": "unit@example.com", "authMethod": "claude.ai"}', "")),
+            patch.object(urllib.request, "urlopen", side_effect=AssertionError("a stale token was sent")),
+        ):
+            report = agent_accounts.claude_live(named)
+        self.assertEqual(report.quota_problem,
+                         "Weekly quota: not read (stale token; a Claude session on this account refreshes it)")
 
     def test_named_credentials_never_fall_back_to_the_default_keychain(self) -> None:
         named = self.root / ".claude3"
@@ -604,40 +829,41 @@ class AgentNotesTests(unittest.TestCase):
             Report("Claude", email="spare@example.com"), Report("Codex", problem="fixture"),
         ]), redirect_stdout(output)):
             asyncio.run(whoami.main())
-        self.assertIn("Account: claude 2 (showrunners)", output.getvalue())
-        self.assertIn("Account: claude 3 (unit directors)", output.getvalue())
+        self.assertIn("Account: claude 2 (in use)", output.getvalue())
+        self.assertIn("Account: claude 3 (in use)", output.getvalue())
         self.assertNotIn("spare@example.com", output.getvalue())
 
-    def test_whoami_filter_and_labels_share_one_role_selection_during_a_swap(self) -> None:
-        """One display cannot switch unit accounts between filtering and rendering."""
+    def test_whoami_filters_inactive_accounts_even_when_only_default_is_configured(self) -> None:
+        _ = self.account_dir("default", "main@example.com", "main-token")
+        _ = self.note("claude 2.md", "main@example.com")
+        _ = self.note("claude 3.md", "inactive@example.com")
+        reports = [Report("Claude", email="main@example.com"), Report("Claude", email="inactive@example.com")]
+        output = io.StringIO()
+        with patch.object(whoami, "live_reports", return_value=reports), redirect_stdout(output):
+            asyncio.run(whoami.main())
+        self.assertIn("main@example.com", output.getvalue())
+        self.assertNotIn("inactive@example.com", output.getvalue())
+
+    def test_whoami_filters_and_renders_from_one_live_account_snapshot(self) -> None:
         _ = self.account_dir("default", "main@example.com", "main-token")
         _ = self.account_dir("claude 1", "old-unit@example.com", "old-token")
         _ = self.account_dir("claude 3", "new-unit@example.com", "new-token")
         self.select_unit("claude 1")
-        for label, login in (("claude 1", "old-unit@example.com"),
-                             ("claude 2", "main@example.com"),
-                             ("claude 3", "new-unit@example.com")):
+        for label, login in (("claude 1", "old-unit@example.com"), ("claude 2", "main@example.com"), ("claude 3", "new-unit@example.com")):
             _ = self.note(f"{label}.md", login)
-        resolve = accounts.role_account
-
-        def swap_after_selection(role: str) -> accounts.AccountSelection:
-            selected = resolve(role)
+        resolve = accounts.claude_account_selection
+        def changed_after_snapshot() -> agent_accounts.ClaudeAccountsInUse:
+            selected = resolve()
             self.select_unit("claude 3")
             return selected
-
-        reports = [Report("Claude", email=login) for login in (
-            "old-unit@example.com", "main@example.com", "new-unit@example.com",
-        )]
+        reports = [Report("Claude", email=login) for login in ("old-unit@example.com", "main@example.com", "new-unit@example.com")]
         output = io.StringIO()
-        with (
-            patch.object(accounts, "role_account", side_effect=swap_after_selection) as selection,
-            patch.object(whoami, "live_reports", return_value=reports),
-            redirect_stdout(output),
-        ):
+        with (patch.object(accounts, "claude_account_selection", side_effect=changed_after_snapshot) as snapshot,
+              patch.object(whoami, "live_reports", return_value=reports), redirect_stdout(output)):
             asyncio.run(whoami.main())
-        selection.assert_called_once_with("unit")
-        self.assertIn("Account: claude 1 (unit directors)", output.getvalue())
-        self.assertIn("Account: claude 2 (showrunners)", output.getvalue())
+        snapshot.assert_called_once_with()
+        self.assertIn("Account: claude 1 (in use)", output.getvalue())
+        self.assertIn("Account: claude 2 (in use)", output.getvalue())
         self.assertNotIn("new-unit@example.com", output.getvalue())
 
     def test_legacy_whoami_account_line_is_unchanged(self) -> None:
@@ -759,11 +985,18 @@ class AgentNotesTests(unittest.TestCase):
             {"account": "codex 2", "at": self.now.isoformat(timespec="seconds"), "remaining": 60},
         ])
 
-    def test_claude_manual_reset_fields_are_preserved(self):
-        note = self.note("claude 1.md", "a@example.com", "limit_reset: 2026-10-22\nlimit_reset_count: 1\n")
+    def test_a_refresh_clears_a_stale_claude_reset_count_on_every_claude_note(self):
+        signed_in = self.note("claude 1.md", "a@example.com", "limit_reset: 2026-10-22T12:34:00\nlimit_reset_count: 1\n")
+        other = self.note("claude 2.md", "b@example.com", "limit_reset: null\nlimit_reset_count: 0\n")
+        _ = apply([signed_in, other], Report("Claude", email="a@example.com"), self.now)
+        for note in (signed_in, other):
+            self.assertEqual((note.get("limit_reset_count"), note.get("limit_reset")), ("null", "null"))
+
+    def test_a_claude_note_with_no_reset_count_gains_none(self):
+        note = self.note("claude 1.md", "a@example.com")
         _ = apply([note], Report("Claude", email="a@example.com"), self.now)
-        self.assertEqual(note.get("limit_reset"), "2026-10-22")
-        self.assertEqual(note.get("limit_reset_count"), "1")
+        self.assertIsNone(note.get("limit_reset_count"))
+        self.assertIsNone(note.get("limit_reset"))
 
     def test_reading_for_each_active_value_and_none_for_null_or_inactive(self):
         checked = datetime(2026, 10, 5, 19, 45, tzinfo=timezone.utc)
@@ -808,6 +1041,39 @@ class AgentNotesTests(unittest.TestCase):
         self.assertEqual(note.get("weekly_usage_checked_at"), "2026-10-05T19:45:00+00:00")
         self.assertEqual(len(messages), 2)
         self.assertEqual(sum("log" in message.lower() or "readings" in message.lower() for message in messages), 1)
+
+
+class ResetTimeTests(unittest.TestCase):
+    """Notes travel between machines in the vault, so a reset time carries its offset."""
+
+    def test_a_reset_is_written_with_its_offset(self) -> None:
+        at = datetime(2026, 10, 13, 7, 0, 20, tzinfo=timezone.utc)
+        written = datetime.fromisoformat(local_reset(at))
+        self.assertIsNotNone(written.tzinfo)
+        self.assertEqual(written, at.replace(second=0))
+
+    def test_a_reset_written_in_another_zone_is_read_by_its_offset(self) -> None:
+        self.assertEqual(note_file.reset_time("2026-10-13T03:00:00-07:00"),
+                         datetime(2026, 10, 13, 10, tzinfo=timezone.utc))
+        self.assertTrue(agent_notes.still_ahead("2099-01-01T00:00:00-07:00"))
+        self.assertFalse(agent_notes.still_ahead("2000-01-01T00:00:00-07:00"))
+        self.assertTrue(quota_alert.ahead("2099-01-01T00:00:00+09:00"))
+        self.assertFalse(quota_alert.ahead("2000-01-01T00:00:00+09:00"))
+        self.assertEqual(codex_pacer.parse_local("2026-10-13T03:00:00-07:00"),
+                         datetime(2026, 10, 13, 10, tzinfo=timezone.utc).astimezone().replace(tzinfo=None))
+
+    def test_a_reset_written_before_the_offset_is_read_in_the_machines_zone(self) -> None:
+        self.assertEqual(note_file.reset_time("2026-10-13T03:00:00"), datetime(2026, 10, 13, 3).astimezone())
+        self.assertTrue(agent_notes.still_ahead("2099-01-01T00:00:00"))
+        self.assertFalse(quota_alert.ahead("2000-01-01T00:00:00"))
+        self.assertEqual(codex_pacer.parse_local("2026-10-13T03:00:00"), datetime(2026, 10, 13, 3))
+
+    def test_an_absent_or_unreadable_reset_is_none(self) -> None:
+        for value in (None, "", "null", "soon"):
+            with self.subTest(value=value):
+                self.assertIsNone(note_file.reset_time(value))
+                self.assertFalse(agent_notes.still_ahead(value))
+                self.assertFalse(quota_alert.ahead(value))
 
 
 if __name__ == "__main__":

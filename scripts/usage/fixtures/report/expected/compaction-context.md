@@ -11,7 +11,7 @@ Bounds: unbounded <= at < unbounded; zone: America/Los_Angeles
 | natedev | loose | unassigned | not_applicable | claude-opus-4-6 | unreported | — | 1 | 0.00 |
 | natedev | no-turn | unassigned | not_applicable | unreported | unreported | 1 | — | — |
 | natedev | unknown | review | unrecorded | claude-opus-4-6 | unreported | — | 1 | 0.00 |
-| natedev | unknown | unassigned | not_applicable | gpt-6-sol | unreported | — | 1 | 0.00 |
+| natedev | unknown | unassigned | not_applicable | invented-unweighted-model | unreported | — | 1 | 0.00 |
 
 Coverage
 
@@ -25,7 +25,7 @@ Unweighted:
 
 | model | turns |
 | --- | --- |
-| gpt-6-sol | 1 |
+| invented-unweighted-model | 1 |
 
 Review turns with unrecorded lens: 1.
 Outcome rows with unknown unit (compactions): 0.

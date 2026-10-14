@@ -21,7 +21,7 @@ The feature log is the current account of what six projects do: hana, natedev, c
 | `/etc/nixos/README.md` | Per-change loop step 6: the natedev close-out. Outside this repository. |
 | `pyrightconfig.json` | An `executionEnvironments` entry for `scripts/feature_log`. |
 | `/home/natepiano/rust/hanadocs/feature-log/<project>/` | The notes. |
-| `/home/natepiano/rust/hanadocs/feature-log.base`, `feature-log - <project>.base` | The seven Bases. |
+| `/home/natepiano/rust/hanadocs/home-base/feature-log.base`, `feature-log - <project>.base` | The seven Bases. |
 | `~/.local/state/claude/feature-log/` | State: lock, events, proposals, digest cursor, ledgers, saved release contents. |
 | `/home/natepiano/rust/hanadocs/proposals/feature-log.md` | The design this implements. Read-only for agents. |
 
@@ -195,7 +195,7 @@ Release refusals, each checked before any write:
 
 ### Events
 
-`FeatureLogEvent = AddEvent | SupersedeEvent | LegacyAmendEvent | AmendEvent | ReleaseEvent`, narrowed on `verb`. `at` is an ISO time in America/Los_Angeles, to the second.
+`FeatureLogEvent = AddEvent | SupersedeEvent | LegacyAmendEvent | AmendEvent | ReleaseEvent`, narrowed on `verb`. `at` is an ISO time with its offset, written in the user's zone, to the second.
 
 | Type | Keys |
 | --- | --- |
@@ -221,7 +221,7 @@ A verb that differs from the proposal's fails and names the right verb. `propose
 
 ### Digest
 
-`digest` lists events by project in `PROJECTS` order: `+ <title> — <summary>` for an add, `→ <old> ⇒ <new>` for a supersede, `~ <title> (<fields>)` for an amend, `= X@V (<n> notes)` for a release. Events with `backfill: true` are left out. It ends `<n> changes since <YYYY-MM-DD HH:MM PDT>` or `feature log: nothing new since <…>`. Without `--since` it reads events and the cursor, and writes the advanced cursor, under one `locked()`. The cursor is a line position, so it passes backfill events and lists same-second events once each. `--since` starts at midnight America/Los_Angeles, takes no lock and moves no cursor.
+`digest` lists events by project in `PROJECTS` order: `+ <title> — <summary>` for an add, `→ <old> ⇒ <new>` for a supersede, `~ <title> (<fields>)` for an amend, `= X@V (<n> notes)` for a release. Events with `backfill: true` are left out. It ends `<n> changes since <YYYY-MM-DD HH:MM PDT>` or `feature log: nothing new since <…>`. Without `--since` it reads events and the cursor, and writes the advanced cursor, under one `locked()`. The cursor is a line position, so it passes backfill events and lists same-second events once each. `--since` starts at midnight in the user's zone, takes no lock and moves no cursor.
 
 ### Changelog export and release stamp
 
@@ -369,7 +369,7 @@ Rules the backfill followed, which bind any correction:
 - A note is true at the audit ref. Backfill invents no result.
 - Tests never touch the live vault or state: `FEATURE_LOG_VAULT` and `XDG_STATE_HOME` point at temp dirs, and no test runs `ssh`.
 - Python: no `Any`, a `TypedDict` per JSON layout, no file-level ignores. Both scripts stay importable on Python 3.10.
-- Times shown to the user are America/Los_Angeles.
+- Times shown to the user are in the user's zone (`config/user_zone.conf`, read through `scripts/lib/user_zone.py`).
 
 ## Calibration and gotchas
 
@@ -384,7 +384,7 @@ The script:
 - The scripts run under Python 3.10 on the Mac (`scripts/lib/py`); the tests run only on natedev's 3.13 and use 3.12 names.
 - A tool or test run off natedev without `FEATURE_LOG_VAULT` reaches natedev's live vault. An empty `FEATURE_LOG_VAULT` stops forwarding and selects the local `~/rust/hanadocs`.
 - A forwarded call runs natedev's deployed `~/.claude` copy, not the caller's checkout.
-- Note dates use the vault host's local date (natedev is America/New_York); event times are America/Los_Angeles.
+- Note dates use the vault host's local date (natedev is America/New_York); event times are in the user's zone.
 - A kill between a note and its event leaves a note with no event; the next identical call appends it. For link, date and release amendments the order is reversed: the event exists and the note lags until a retry.
 - `propose` checks a link against notes already written. Two open proposals for one merge cannot see each other, so the second is refused at landing unless every row carries `--separate-result`.
 - `--backfill` only omits the `@Unreleased` default; `add`, `supersede` and `amend` each accept `--backfill --release X@Unreleased`.

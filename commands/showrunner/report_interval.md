@@ -14,10 +14,11 @@ during `/showrunner:produce`, whose state (`PRODUCTION_DOC`, `PROMPT_FILE`,
 nothing; when the doc's Updates line reads `on demand`, say updates are on demand. With anything but a whole number of minutes above 0, say so and stop.
 
 1. **Change it.** With the Edit tool, change the production doc's
-   `**Updates:** every N minutes` line and `every N minutes` in `PROMPT_FILE`.
+   `**Updates:**` line to `every N minutes`, adding it under Production
+   Context when there is none, and `every N minutes` in `PROMPT_FILE`.
    Run `NOTIFIER interval UPDATES <minutes>`; it restarts the instance and
    prints `next_due`. When it refuses (exit 2), report what it names and stop.
-   A doc whose line read `on demand` has a stopped instance: commit the doc
+   A doc whose line read `on demand`, or had none, has a stopped instance: commit the doc
    first (step 2), run `update_registration.py register` as
    `/showrunner:produce` does at start, which rewrites `PROMPT_FILE` and sets
    the interval, then `NOTIFIER start UPDATES`, which starts the instance and

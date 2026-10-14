@@ -15,10 +15,11 @@ from pathlib import Path
 from typing import Literal, NotRequired, TypedDict, cast
 
 SCRIPTS = Path(__file__).resolve().parents[1]
-for dependency in ("whoami", "message", "production"):
+for dependency in ("whoami", "message", "production", "herdr"):
     sys.path.insert(0, str(SCRIPTS / dependency))
 
 import account
+import herdr
 import sessions
 from sessions import process_start as _process_start
 import showrunners
@@ -43,7 +44,8 @@ class UnitHost(TypedDict):
     production: str
     unit: str
     doc: str
-    tmux_session: str
+    session_name: str
+    session_host: Literal["tmux", "herdr"]
     plan: UnitPlan
 
 
@@ -57,10 +59,37 @@ class PaneNotRecorded(TypedDict):
     kind: Literal["not recorded"]
 
 
+class TmuxSessionId(TypedDict):
+    kind: Literal["session id"]
+    session_id: str
+
+
+class TmuxSessionIdNotRecorded(TypedDict):
+    kind: Literal["not recorded"]
+
+
+class TmuxServer(TypedDict):
+    kind: Literal["server"]
+    pid: int
+    started_at: int
+
+
+class TmuxServerNotRecorded(TypedDict):
+    kind: Literal["not recorded"]
+
+
 class TmuxHost(TypedDict):
     kind: Literal["tmux"]
     tmux_session: str
+    session_ref: TmuxSessionId | TmuxSessionIdNotRecorded
+    server: TmuxServer | TmuxServerNotRecorded
     pane: TmuxPane | PaneNotRecorded
+
+
+class HerdrHost(TypedDict):
+    kind: Literal["herdr"]
+    herdr_session: str
+    pane_id: str
 
 
 class NamedDesktop(TypedDict):
@@ -89,8 +118,8 @@ class UnknownHost(TypedDict):
     kind: Literal["unknown"]
 
 
-Host = UnitHost | TmuxHost | WindowHost | TerminalHost | UnknownHost
-SessionHost = TmuxHost | WindowHost | TerminalHost | UnknownHost
+Host = UnitHost | TmuxHost | HerdrHost | WindowHost | TerminalHost | UnknownHost
+SessionHost = TmuxHost | HerdrHost | WindowHost | TerminalHost | UnknownHost
 
 
 class OnBranch(TypedDict):
@@ -254,7 +283,8 @@ class UnitMarks:
     production: str
     unit: str
     doc: str
-    tmux_session: str
+    session_name: str
+    session_host: Literal["tmux", "herdr"]
 
 
 DESKTOP_HEADING = re.compile(r"^##\s+desktop:\s*(.+?)\s*$")
@@ -353,10 +383,51 @@ def _parse_tmux_pane(value: object, place: str) -> TmuxPane | PaneNotRecorded:
     raise InvalidInventory(f"{place}.kind is invalid")
 
 
+def _parse_tmux_session_ref(
+    value: object, place: str,
+) -> TmuxSessionId | TmuxSessionIdNotRecorded:
+    data = _wire_object(value, place)
+    kind = _wire_kind(data, place)
+    if kind == "session id":
+        session_id = _wire_string(
+            _wire_required(data, "session_id", place), f"{place}.session_id"
+        )
+        if re.fullmatch(r"\$[0-9]+", session_id) is None:
+            raise InvalidInventory(f"{place}.session_id is invalid")
+        return {"kind": "session id", "session_id": session_id}
+    if kind == "not recorded":
+        return {"kind": "not recorded"}
+    raise InvalidInventory(f"{place}.kind is invalid")
+
+
+def _parse_tmux_server(
+    value: object, place: str,
+) -> TmuxServer | TmuxServerNotRecorded:
+    data = _wire_object(value, place)
+    kind = _wire_kind(data, place)
+    if kind == "server":
+        if "pid" not in data:
+            return {"kind": "not recorded"}
+        return {
+            "kind": "server",
+            "pid": _wire_integer(data["pid"], f"{place}.pid"),
+            "started_at": _wire_integer(
+                _wire_required(data, "started_at", place), f"{place}.started_at"
+            ),
+        }
+    if kind == "not recorded":
+        return {"kind": "not recorded"}
+    raise InvalidInventory(f"{place}.kind is invalid")
+
+
 def _parse_host(value: object, place: str, allow_unit: bool) -> Host:
     data = _wire_object(value, place)
     kind = _wire_kind(data, place)
     if kind == "unit" and allow_unit:
+        name_key = "tmux_session" if "tmux_session" in data and "session_name" not in data else "session_name"
+        session_host = data.get("session_host", "tmux")
+        if session_host not in ("tmux", "herdr"):
+            raise InvalidInventory(f"{place}.session_host is invalid")
         return {
             "kind": "unit",
             "production": _wire_string(
@@ -366,12 +437,23 @@ def _parse_host(value: object, place: str, allow_unit: bool) -> Host:
                 _wire_required(data, "unit", place), f"{place}.unit"
             ),
             "doc": _wire_string(_wire_required(data, "doc", place), f"{place}.doc"),
-            "tmux_session": _wire_string(
-                _wire_required(data, "tmux_session", place),
-                f"{place}.tmux_session",
+            "session_name": _wire_string(
+                _wire_required(data, name_key, place),
+                f"{place}.{name_key}",
             ),
+            "session_host": session_host,
             "plan": _parse_unit_plan(
                 _wire_required(data, "plan", place), f"{place}.plan"
+            ),
+        }
+    if kind == "herdr":
+        return {
+            "kind": "herdr",
+            "herdr_session": _wire_string(
+                _wire_required(data, "herdr_session", place), f"{place}.herdr_session"
+            ),
+            "pane_id": _wire_string(
+                _wire_required(data, "pane_id", place), f"{place}.pane_id"
             ),
         }
     if kind == "tmux":
@@ -387,6 +469,16 @@ def _parse_host(value: object, place: str, allow_unit: bool) -> Host:
                 f"{place}.tmux_session",
             ),
             "pane": pane,
+            "session_ref": (
+                _parse_tmux_session_ref(data["session_ref"], f"{place}.session_ref")
+                if "session_ref" in data
+                else {"kind": "not recorded"}
+            ),
+            "server": (
+                _parse_tmux_server(data["server"], f"{place}.server")
+                if "server" in data
+                else {"kind": "not recorded"}
+            ),
         }
     if kind in {"ghostty", "zed"}:
         window = {
@@ -749,23 +841,44 @@ def _registered_productions() -> tuple[dict[str, ProductionSession], list[showru
     return found, runners
 
 
+def unregistered_showrunners() -> list[showrunners.Showrunner]:
+    """Each production whose update timer names a session that is not running.
+
+    A showrunner is known only by the session its timer names, so one running under another id
+    without registering reads as a plain session. Empty when the session records cannot be read.
+    """
+    try:
+        return [runner for runner in showrunners.registered_showrunners(_notifier_state_dir()) if not runner["session"]]
+    except OSError:
+        return []
+
+
 def _unit_sessions(runners: list[showrunners.Showrunner]) -> dict[str, UnitMarks]:
+    """Each running unit director of a registered production, by session id.
+
+    One read of every production's marks (`unit_lookup.every_marked_unit`) serves them all. A
+    production with no showrunner timer has no doc to restart its units from, so its units are not
+    counted here; a production whose marks are at fault is left out by the lookup.
+    """
+    try:
+        every = unit_lookup.every_marked_unit()
+    except OSError:
+        return {}
+    docs = {runner["slug"]: runner["doc"] for runner in runners}
     found: dict[str, UnitMarks] = {}
-    for runner in runners:
-        slug = runner["slug"]
-        try:
-            marked = unit_lookup.marked_units(slug)
-        except OSError:
+    for slug, units in every.units.items():
+        if slug not in docs:
             continue
-        for unit_id, marked_unit in marked.items():
+        for unit_id, marked_unit in units.items():
             claude = marked_unit.claude
             if not isinstance(claude, unit_lookup.LiveClaude):
                 continue
             found[claude.session_id] = UnitMarks(
                 production=slug,
                 unit=unit_id,
-                doc=runner["doc"],
-                tmux_session=marked_unit.label,
+                doc=docs[slug],
+                session_name=marked_unit.label,
+                session_host="tmux" if isinstance(marked_unit.place, unit_lookup.TmuxPlace) else "herdr",
             )
     return found
 
@@ -839,6 +952,15 @@ def _newest_unit_plans() -> dict[str, str]:
 def _process_environment(pid: int) -> dict[str, str]:
     if sys.platform == "darwin":
         try:
+            command = subprocess.run(
+                ("ps", "-o", "command=", "-p", str(pid)),
+                capture_output=True,
+                text=True,
+                timeout=5,
+                check=False,
+            )
+            if command.returncode:
+                return {}
             result = subprocess.run(
                 ("ps", "eww", "-o", "command=", "-p", str(pid)),
                 capture_output=True,
@@ -846,11 +968,27 @@ def _process_environment(pid: int) -> dict[str, str]:
                 timeout=5,
                 check=False,
             )
+            if result.returncode:
+                return {}
+            confirmed_command = subprocess.run(
+                ("ps", "-o", "command=", "-p", str(pid)),
+                capture_output=True,
+                text=True,
+                timeout=5,
+                check=False,
+            )
         except (OSError, subprocess.TimeoutExpired):
             return {}
-        if result.returncode:
+        if confirmed_command.returncode or confirmed_command.stdout != command.stdout:
             return {}
-        tokens = result.stdout.split()
+        arguments = command.stdout.rstrip("\r\n").lstrip()
+        with_environment = result.stdout.rstrip("\r\n").lstrip()
+        if not arguments or not with_environment.startswith(arguments):
+            return {}
+        environment_text = with_environment[len(arguments):]
+        if environment_text and not environment_text[0].isspace():
+            return {}
+        tokens = environment_text.split()
         pairs = (token.split("=", 1) for token in tokens if "=" in token)
         return {name: value for name, value in pairs}
     try:
@@ -861,10 +999,15 @@ def _process_environment(pid: int) -> dict[str, str]:
     return {name: value for name, value in entries}
 
 
-def _tmux_session(pane: str) -> tuple[str, TmuxPane | PaneNotRecorded]:
+def _tmux_session(pane: str) -> tuple[
+    str, TmuxSessionId | TmuxSessionIdNotRecorded,
+    TmuxServer | TmuxServerNotRecorded, TmuxPane | PaneNotRecorded,
+]:
     not_recorded: PaneNotRecorded = {"kind": "not recorded"}
+    no_session_id: TmuxSessionIdNotRecorded = {"kind": "not recorded"}
+    no_server: TmuxServerNotRecorded = {"kind": "not recorded"}
     if not pane:
-        return "", not_recorded
+        return "", no_session_id, no_server, not_recorded
     try:
         result = subprocess.run(
             (
@@ -873,7 +1016,7 @@ def _tmux_session(pane: str) -> tuple[str, TmuxPane | PaneNotRecorded]:
                 "-p",
                 "-t",
                 pane,
-                "#{session_name}\t#{pane_pid}",
+                "#{session_name}\t#{session_id}\t#{pane_pid}\t#{start_time}\t#{pid}",
             ),
             capture_output=True,
             text=True,
@@ -881,21 +1024,33 @@ def _tmux_session(pane: str) -> tuple[str, TmuxPane | PaneNotRecorded]:
             check=False,
         )
     except (OSError, subprocess.TimeoutExpired, subprocess.CalledProcessError):
-        return "", not_recorded
+        return "", no_session_id, no_server, not_recorded
     if result.returncode != 0:
-        return "", not_recorded
-    session_name, separator, pane_pid_text = result.stdout.rstrip("\r\n").partition("\t")
+        return "", no_session_id, no_server, not_recorded
+    fields = result.stdout.rstrip("\r\n").split("\t")
+    session_name = fields[0]
     if not session_name:
-        return "", not_recorded
-    if not separator:
-        return session_name, not_recorded
+        return "", no_session_id, no_server, not_recorded
+    if len(fields) < 3:
+        return session_name, no_session_id, no_server, not_recorded
+    session_ref: TmuxSessionId | TmuxSessionIdNotRecorded = no_session_id
+    if re.fullmatch(r"\$[0-9]+", fields[1]) is not None:
+        session_ref = {"kind": "session id", "session_id": fields[1]}
+    server: TmuxServer | TmuxServerNotRecorded = no_server
+    if len(fields) == 5:
+        try:
+            server = {"kind": "server", "pid": int(fields[4]), "started_at": int(fields[3])}
+        except ValueError:
+            pass
     try:
-        pane_pid = int(pane_pid_text)
+        pane_pid = int(fields[2])
     except ValueError:
-        return session_name, not_recorded
+        return session_name, session_ref, server, not_recorded
     if pane_pid <= 0:
-        return session_name, not_recorded
-    return session_name, {"kind": "pane", "pane_id": pane, "pane_pid": pane_pid}
+        return session_name, session_ref, server, not_recorded
+    return session_name, session_ref, server, {
+        "kind": "pane", "pane_id": pane, "pane_pid": pane_pid,
+    }
 
 
 def terminal_kind(command: str) -> Literal["ghostty", "zed", "terminal", "unknown"]:
@@ -961,10 +1116,11 @@ def _terminal_host(pid: int, desktop: Desktop) -> SessionHost:
     return {"kind": "unknown"}
 
 
-def _snapshot_desktops() -> dict[str, str]:
+def _snapshot_desktops(*, refresh: bool = True) -> dict[str, str]:
     if sys.platform == "darwin":
         return {}
-    snapshotter = shutil.which("agent-sessions-snapshot")
+    snapshotter = (shutil.which("agent-sessions-snapshot")
+                   if refresh and os.environ.get("REFUSAL_WATCH_INVENTORY") != "read existing" else None)
     if snapshotter is not None:
         try:
             _ = subprocess.run(
@@ -1018,10 +1174,11 @@ def _host(
             "production": unit.production,
             "unit": unit.unit,
             "doc": unit.doc,
-            "tmux_session": (
-                unit.tmux_session
-                or _string(session.get("tmux")).partition(":")[0]
+            "session_name": (
+                unit.session_name
+                or (_string(session.get("tmux")).partition(":")[0] if unit.session_host == "tmux" else "")
             ),
+            "session_host": unit.session_host,
             "plan": (
                 {"kind": "plan", "path": plan}
                 if plan is not None
@@ -1031,17 +1188,22 @@ def _host(
 
     environment = _process_environment(session.get("pid", 0))
     pane = environment.get("TMUX_PANE", "")
-    tmux_session, tmux_pane = _tmux_session(pane)
+    tmux_session, session_ref, server, tmux_pane = _tmux_session(pane)
     if pane:
         return (
             {
                 "kind": "tmux",
                 "tmux_session": tmux_session,
                 "pane": tmux_pane,
+                "session_ref": session_ref,
+                "server": server,
             }
             if tmux_session
             else {"kind": "unknown"}
         )
+    place = herdr.herdr_place_of(session.get("pid", 0))
+    if isinstance(place, herdr.HerdrPlace):
+        return {"kind": "herdr", "herdr_session": place.session, "pane_id": place.pane}
     desktop_name = desktops.get(session_id)
     desktop: Desktop = (
         {"kind": "named", "name": desktop_name}
@@ -1124,7 +1286,7 @@ def _model(session_id: str) -> LastModel:
         if entry.get("type") != "assistant" or not isinstance(entry.get("message"), dict):
             continue
         candidate = cast(dict[str, object], entry["message"]).get("model")
-        if isinstance(candidate, str):
+        if isinstance(candidate, str) and candidate != "<synthetic>":
             model = candidate
     return (
         {"kind": "model", "name": model}
@@ -1173,6 +1335,7 @@ def _machine() -> str:
 def inventory(
     login: str,
     only: frozenset[str] = frozenset(),  # pyright: ignore[reportCallInDefaultInitializer]
+    *, refresh_desktops: bool = True,
 ) -> Inventory:
     """Return the live sessions safely attributable to ``login`` on this machine."""
     records = [_session_file(record) for record in sessions.live_sessions()]
@@ -1187,7 +1350,7 @@ def inventory(
     productions, runners = _registered_productions()
     units = _unit_sessions(runners)
     plans = _newest_unit_plans()
-    desktops = _snapshot_desktops()
+    desktops = _snapshot_desktops() if refresh_desktops else _snapshot_desktops(refresh=False)
     wanted_login = login.casefold()
     found: list[Session] = []
     unattributed: list[UnattributedSession] = []

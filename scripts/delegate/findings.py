@@ -53,6 +53,7 @@ import fcntl
 import json
 import math
 import os
+import shutil
 import sys
 import tempfile
 import time
@@ -277,9 +278,31 @@ def _state_path(session_dir: Path) -> Path:
     return session_dir / STATE_FILENAME
 
 
+def _parked_path(session_dir: Path, instance_id: str) -> Path:
+    """Where a phase's ledger waits while another open phase is current.
+
+    Phases can be open together, and the current one owns `findings_state.json`
+    (implement.sh reads it there). The ledger it displaces is kept here rather
+    than discarded, so the older phase finds its findings when it is current
+    again.
+    """
+    return session_dir / f"findings_state-{instance_id}.json"
+
+
+def _ledger_instance(path: Path) -> str:
+    try:
+        state = _json_object(path.read_text(encoding="utf-8"))
+    except OSError:
+        return ""
+    return _string(state.get("phase_instance_id")) if state is not None else ""
+
+
 def _write_state(session_dir: Path, state: dict[str, object]) -> None:
     session_dir.mkdir(parents=True, exist_ok=True)
     target = _state_path(session_dir)
+    displaced = _ledger_instance(target) if target.exists() else ""
+    if displaced and displaced != _string(state.get("phase_instance_id")):
+        _ = shutil.copyfile(target, _parked_path(session_dir, displaced))
     with tempfile.NamedTemporaryFile(
         "w",
         encoding="utf-8",
@@ -343,7 +366,9 @@ def _append_event(session_dir: Path, state: dict[str, object], event: dict[str, 
         fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
         _ = handle.write(line)
         handle.flush()
-        os.fsync(handle.fileno())
+        # Disposable fixtures may omit disk durability; production syncs by default.
+        if os.environ.get("PLAN_DELEGATE_SYNC_WRITES", "1") != "0":
+            os.fsync(handle.fileno())
         fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
 
@@ -361,7 +386,7 @@ def _fresh_state(session_dir: Path, now: float) -> dict[str, object]:
 
 
 def _read_state(session_dir: Path, now: float) -> dict[str, object]:
-    """Load the ledger, resetting it when the active phase has moved on."""
+    """Load the current phase's ledger: the live file, a parked one, or a fresh one."""
     path = _state_path(session_dir)
     instance_id, phase_id = _phase_identity(session_dir)
     if not path.exists():
@@ -373,6 +398,14 @@ def _read_state(session_dir: Path, now: float) -> dict[str, object]:
     if state is None:
         raise SystemExit(f"Invalid findings state: {path}")
     if instance_id and _string(state.get("phase_instance_id")) != instance_id:
+        parked = _parked_path(session_dir, instance_id)
+        if parked.exists():
+            try:
+                kept = _json_object(parked.read_text(encoding="utf-8"))
+            except OSError as error:
+                raise SystemExit(f"Unable to read findings state {parked}: {error}") from error
+            if kept is not None:
+                return kept
         fresh = _fresh_state(session_dir, now)
         fresh["phase_instance_id"] = instance_id
         fresh["phase_id"] = phase_id

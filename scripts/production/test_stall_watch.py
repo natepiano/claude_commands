@@ -9,13 +9,15 @@ import socket
 import subprocess
 import sys
 import tempfile
-import time
 import unittest
+from unittest import mock
 from datetime import datetime
 from pathlib import Path
-from typing import cast, override
+from typing import TYPE_CHECKING, cast, override
 from zoneinfo import ZoneInfo
 
+if TYPE_CHECKING:
+    from herdr import SessionListResult
 
 SCRIPT = Path(__file__).with_name("stall_watch.py")
 START = int(datetime(2026, 10, 6, 12, 0, tzinfo=ZoneInfo("America/Los_Angeles")).timestamp())
@@ -25,6 +27,11 @@ PANE = "— holding: waiting on a decision\n"
 def executable(path: Path, source: str) -> None:
     _ = path.write_text(source)
     path.chmod(0o755)
+
+
+def setUpModule() -> None:
+    """The times these tests expect are Pacific; the user's zone setting must not change them."""
+    unittest.enterModuleContext(mock.patch.dict(os.environ, {"USER_ZONE": "America/Los_Angeles"}))
 
 
 class StallWatchTests(unittest.TestCase):
@@ -123,7 +130,12 @@ line = (json.dumps(record) + '\\n').encode()
 fd = os.open(os.environ['STALL_TEST_SEND_LOG'], os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
 os.write(fd, line)
 os.close(fd)
-time.sleep(float(os.environ.get('STALL_TEST_SEND_DELAY', '0')))
+expected = int(os.environ.get('STALL_TEST_SEND_TOGETHER', '0'))
+deadline = time.monotonic() + 30
+while expected and len(open(os.environ['STALL_TEST_SEND_LOG']).readlines()) < expected:
+    if time.monotonic() >= deadline:
+        raise SystemExit('send barrier did not receive every concurrent delivery')
+    time.sleep(0.01)
 fail = json.load(open(os.environ['STALL_TEST_FAIL_FILE']))
 raise SystemExit(1 if record['to'] in fail else 0)
 """)
@@ -147,12 +159,19 @@ raise SystemExit(1 if record['to'] in fail else 0)
             "STALL_TEST_PS_FILE": str(self.ps_file),
             "STALL_TEST_SEND_LOG": str(self.send_log),
             "STALL_TEST_FAIL_FILE": str(self.fail_file),
+            "HERDR_BIN": str(SCRIPT.parents[1] / "herdr/fake_herdr.py"),
+            "HERDR_PROC": str(self.root / "proc"),
+            "FAKE_HERDR_LOG": str(self.root / "herdr.log"),
+            "FAKE_HERDR_RESPONSES": str(self.root / "herdr-responses.json"),
         }
+        _ = (self.root / "herdr-responses.json").write_text(json.dumps({
+            "default": {"code": 0, "stdout": '{"sessions": []}'}}))
         _ = self.record_session(os.getpid(), "show-id", "showrunner")
         _ = self.record_session(os.getpid() + 1_000_000, "fault-id", "natedev")
         _ = self.unit("unit-one")
 
-    def configure(self, runners: dict[str, list[str]], *, stall_minutes: int = 5) -> None:
+    def configure(self, runners: dict[str, list[str]], *, stall_minutes: int = 5,
+                  review_pool: bool = False) -> None:
         """Give each showrunner an update timer and a production doc that lists its units. The slug is its name."""
         _ = self.config.write_text(json.dumps({
             "threshold_percent": 1, "repeat_minutes": 30, "stall_minutes": stall_minutes,
@@ -164,17 +183,18 @@ raise SystemExit(1 if record['to'] in fail else 0)
             rows = [f"| {unit} | {self.plans.get(unit, '`docs/plan.md`')} | /tmp/no-worktree-of-{unit} | {unit} | — | — |"
                     for unit in units]
             _ = (self.root / f"{session}-production.md").write_text("\n".join((
-                "- **User zone:** America/Los_Angeles", "",
+                "- **User zone:** America/Los_Angeles",
+                *(["- **Review pool:** natedev"] if review_pool else []), "",
                 "## Units", "", "| Unit | Plan | Worktree | Branch | Port | Owns |",
                 "| --- | --- | --- | --- | --- | --- |", *rows, "")))
 
     def configure_registered(self, runners: dict[str, list[tuple[str, str]]],
-                             *, stall_minutes: int = 5) -> None:
+                             *, stall_minutes: int = 5, review_pool: bool = False) -> None:
         """As `configure`, and each unit's run records say the state given."""
         for units in runners.values():
             self.states.update(dict(units))
         self.configure({session: [unit for unit, _ in units] for session, units in runners.items()},
-                       stall_minutes=stall_minutes)
+                       stall_minutes=stall_minutes, review_pool=review_pool)
 
     def close_processes(self) -> None:
         for child in self.children:
@@ -228,7 +248,7 @@ raise SystemExit(1 if record['to'] in fail else 0)
         os.utime(transcript, (START - 3600, START - 3600))
         return child.pid, socket_path
 
-    def tick(self, at: int, *, delay: int = 0) -> subprocess.CompletedProcess[str]:
+    def tick(self, at: int, *, together: int = 0) -> subprocess.CompletedProcess[str]:
         _ = self.ps_file.write_text("\n".join(self.process_rows) + "\n")
         _ = self.tmux_file.write_text(json.dumps({
             name: dict(pane) for name, pane in self.panes.items()}))
@@ -247,7 +267,7 @@ raise SystemExit(1 if record['to'] in fail else 0)
             _ = (runs / f"{name}.jsonl").write_text("".join(json.dumps(event) + "\n" for event in events))
         return subprocess.run(
             [sys.executable, str(SCRIPT)],
-            env={**self.environment, "STALL_WATCH_NOW_EPOCH": str(at), "STALL_TEST_SEND_DELAY": str(delay)},
+            env={**self.environment, "STALL_WATCH_NOW_EPOCH": str(at), "STALL_TEST_SEND_TOGETHER": str(together)},
             capture_output=True, text=True, check=False,
         )
 
@@ -255,6 +275,41 @@ raise SystemExit(1 if record['to'] in fail else 0)
         if not self.send_log.exists():
             return []
         return [json.loads(line) for line in self.send_log.read_text().splitlines()]
+
+    def test_a_herdr_unit_is_watched_through_a_joined_400_line_read(self) -> None:
+        pid = self.children[0].pid
+        record_path = self.sessions / f"{pid}.json"
+        record = cast(dict[str, object], json.loads(record_path.read_text()))
+        _ = record_path.write_text(json.dumps({**record, "tmux": ""}))
+        # Keep the fixture's unit for its run record, but remove its tmux mark from this production.
+        self.panes["unit-one"]["slug"] = "other"
+        for process_pid, parent, argv, environment in (
+            (991000, 0, ["herdr", "--session", "native", "server"], {}),
+            (pid, 991000, ["claude"], {"HERDR_PANE_ID": "w1:p1", "SHOWRUNNER_UNIT": "showrunner",
+                                      "SHOWRUNNER_UNIT_ID": "unit-one"}),
+        ):
+            path = self.root / "proc" / str(process_pid)
+            path.mkdir(parents=True)
+            _ = (path / "stat").write_text(f"{process_pid} (fixture) S {parent} 0 0")
+            _ = (path / "cmdline").write_bytes("\0".join(argv).encode())
+            _ = (path / "environ").write_bytes("\0".join(f"{key}={value}" for key, value in environment.items()).encode())
+            (path / "cwd").symlink_to(self.root)
+        sessions: SessionListResult = {"sessions": [{
+            "name": "native", "running": True, "default": False,
+            "session_dir": "/fixture", "socket_path": "/fixture/socket"}]}
+        _ = (self.root / "herdr-responses.json").write_text(json.dumps({
+            "--session default session list --json": {"code": 0, "stdout": json.dumps(sessions)},
+            "--session native pane read w1:p1 --source recent-unwrapped --lines 400": {
+                "code": 0, "stdout": PANE},
+            "default": {"code": 1, "stdout": "unexpected herdr command"},
+        }))
+        first = self.tick(START)
+        second = self.tick(START + 300)
+        self.assertEqual((first.returncode, second.returncode), (0, 0), first.stderr + second.stderr)
+        self.assertEqual(len(self.sent()), 2)
+        calls = (self.root / "herdr.log").read_text().splitlines()
+        self.assertIn(json.dumps(["--session", "native", "pane", "read", "w1:p1", "--source",
+                                  "recent-unwrapped", "--lines", "400"]), calls)
 
     def test_reported_unit_is_not_bumped_again_after_its_session_is_renamed(self) -> None:
         self.assertEqual(self.tick(START).returncode, 0)
@@ -455,6 +510,24 @@ raise SystemExit(1 if record['to'] in fail else 0)
                 self.assertEqual(self.sent(), [])
                 _ = self.process_rows.pop()
 
+    def test_work_the_unit_started_outside_its_tree_prevents_a_bump(self) -> None:
+        """A build a unit backgrounded is reparented away from its Claude but keeps the unit's marks."""
+        for unit, bumps in (("unit-one", 0), ("unit-two", 2)):
+            with self.subTest(unit=unit):
+                self.state.mkdir(exist_ok=True)
+                for path in self.state.glob("*.json"):
+                    path.unlink()
+                self.send_log.unlink(missing_ok=True)
+                _ = self.tick(START)
+                marks = {"SHOWRUNNER_UNIT": "showrunner", "SHOWRUNNER_UNIT_ID": unit}
+                worker = subprocess.Popen(["sleep", "60"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                          env={**os.environ, **marks})
+                self.children.append(worker)
+                self.process_rows.append(f"{worker.pid} 1 sleep 60")
+                _ = self.tick(START + 300)
+                self.assertEqual(len(self.sent()), bumps)
+                _ = self.process_rows.pop()
+
     def test_recent_transcript_or_subagent_activity_prevents_a_bump(self) -> None:
         _ = self.tick(START)
         transcript = self.projects / "project" / "sid-unit-one.jsonl"
@@ -579,6 +652,30 @@ raise SystemExit(1 if record['to'] in fail else 0)
         self.assertEqual(self.sent(), [])
         self.assertFalse((self.state / stall_watch.stretch_path("showrunner", "unit-one").name).exists())
 
+    def test_an_idle_review_unit_is_not_bumped_while_a_unit_beside_it_is(self) -> None:
+        import stall_watch
+        self.configure_registered({"showrunner": [("review-unit", "running"), ("hook-unit", "running")]},
+                                  review_pool=True)
+        for name in ("review-unit", "hook-unit"):
+            _ = self.unit(name)
+
+        self.assertEqual(self.tick(START).returncode, 0)
+        self.assertEqual(self.tick(START + 600).returncode, 0)
+        sent = self.sent()
+        self.assertEqual({item["key"].rsplit(":", 1)[-1] for item in sent}, {"bump", "tell"})
+        self.assertTrue(all(item["key"].startswith("stall-watch:hook-unit:") for item in sent), sent)
+        self.assertFalse((self.state / stall_watch.stretch_path("showrunner", "review-unit").name).exists())
+
+    def test_a_unit_named_review_unit_with_no_review_pool_is_bumped(self) -> None:
+        self.configure_registered({"showrunner": [("review-unit", "running")]})
+        _ = self.unit("review-unit")
+
+        self.assertEqual(self.tick(START).returncode, 0)
+        self.assertEqual(self.tick(START + 600).returncode, 0)
+        sent = self.sent()
+        self.assertEqual({item["key"].rsplit(":", 1)[-1] for item in sent}, {"bump", "tell"})
+        self.assertTrue(all(item["key"].startswith("stall-watch:review-unit:") for item in sent), sent)
+
     def test_finished_units_are_skipped_while_a_running_unit_is_bumped(self) -> None:
         import stall_watch
         self.plans["build-report-unit"] = "`docs/as-built/build-report-session.md` (run done; as-built 2b4d952)"
@@ -653,12 +750,10 @@ raise SystemExit(1 if record['to'] in fail else 0)
         _ = self.unit("unit-three")
         self.configure({"showrunner": ["unit-one", "unit-two", "unit-three"]})
         _ = self.tick(START)
-        started = time.monotonic()
-        result = self.tick(START + 300, delay=20)
-        elapsed = time.monotonic() - started
+        result = self.tick(START + 300, together=6)
         self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stderr, "", "every sender must complete the concurrency barrier")
         self.assertEqual(len(self.sent()), 6)
-        self.assertLess(elapsed, 35)
 
 
 if __name__ == "__main__":

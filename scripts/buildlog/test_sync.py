@@ -27,6 +27,11 @@ import sync
 from test_index import point_root_at
 
 
+def setUpModule() -> None:
+    """The times these tests expect are Eastern; the user's zone setting must not change them."""
+    unittest.enterModuleContext(mock.patch.dict(os.environ, {"USER_ZONE": "America/New_York"}))
+
+
 class SyncTests(unittest.TestCase):
     root: Path  # pyright: ignore[reportUninitializedInstanceVariable]
     commands: list[list[str]] = []
@@ -170,7 +175,7 @@ class SyncTests(unittest.TestCase):
         )
         output = StringIO()
         self.addCleanup(time.tzset)
-        with mock.patch.dict(os.environ, {"TZ": "America/New_York"}):
+        with mock.patch.dict(os.environ, {"TZ": "America/New_York", "USER_ZONE": "America/New_York"}):
             time.tzset()
             with redirect_stdout(output):
                 self.assertEqual(sync.sync(), 0)

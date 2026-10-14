@@ -8,6 +8,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, cast, final
@@ -27,6 +28,11 @@ SCRIPT = Path(__file__).with_name("bevy_upgrade.py")
 REGISTRY = "registry+https://github.com/rust-lang/crates.io-index"
 REVISION = "1234567890abcdef1234567890abcdef12345678"
 ZONE = ZoneInfo("Pacific/Kiritimati")
+
+
+def setUpModule() -> None:
+    """The dates these tests expect are in `ZONE`; the user's zone setting must not change them."""
+    unittest.enterModuleContext(mock.patch.dict(os.environ, {"USER_ZONE": "Pacific/Kiritimati"}))
 
 
 @final
@@ -696,6 +702,90 @@ class CliTests(unittest.TestCase):
         self.assertFalse((self.root / "save-calls").exists())
         self.assertEqual(self.tool_args("send"), [])
         self.assertTrue(any(args[0] == "new" for args in self.tool_args("notifier")))
+
+    def test_line_json_reports_unanswered_git_pin_without_saving_or_sending(self) -> None:
+        self.begin()
+        self.make_branch_ready()
+        self.env["TEST_SHOWRUNNER_ADDRESS"] = ""
+        self.assert_silent_check(self.run_cli("check", "--scheduled"))
+        self.clear_calls()
+        path = self.root / "state/demo.json"
+        before = path.read_bytes()
+        lock = path.with_suffix(".lock")
+        lock.unlink()
+        result = self.run_cli("line", "--json", count_saves=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stderr, "")
+        self.assertEqual(len(result.stdout.splitlines()), 1)
+        update = cast(dict[str, object], json.loads(result.stdout))
+        self.assertEqual(set(update), {"update", "needs_user"})
+        self.assertIs(update["needs_user"], True)
+        self.assertIn("1 git ready (1 waiting for your answer)", str(update["update"]))
+        self.assertEqual(path.read_bytes(), before)
+        self.assertFalse(lock.exists(), "line --json acquired the record lock")
+        self.assertFalse((self.root / "save-calls").exists())
+        self.assertFalse((self.root / "fetch-calls").exists())
+        self.assertEqual(self.tool_args("send"), [])
+        self.assertEqual([args[0] for args in self.tool_args("notifier")], ["new", "status"])
+
+    def test_line_json_needs_no_user_for_answered_pins_or_pins_now_on_target(self) -> None:
+        self.begin()
+        self.make_branch_ready()
+        self.assert_silent_check(self.run_cli("check", "--scheduled"))
+        for verb in ("approve", "decline"):
+            with self.subTest(answer=verb):
+                self.assert_table(self.run_cli(verb, "adapter", "my answer"))
+                result = self.run_cli("line", "--json")
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stderr, "")
+                update = cast(dict[str, object], json.loads(result.stdout))
+                self.assertIs(update["needs_user"], False)
+                self.assertIn("1 git ready", str(update["update"]))
+                self.assertNotIn("waiting for your answer", str(update["update"]))
+        self.assert_table(self.run_cli("forget", "adapter"))
+        self.write_lock(bevy="0.20.0")
+        before = (self.root / "state/demo.json").read_bytes()
+        result = self.run_cli("line", "--json")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        update = cast(dict[str, object], json.loads(result.stdout))
+        self.assertIs(update["needs_user"], False)
+        self.assertIn("1 of 1 done", str(update["update"]))
+        self.assertEqual((self.root / "state/demo.json").read_bytes(), before)
+
+    def test_line_json_failed_pins_prints_one_object_using_stored_facts(self) -> None:
+        self.begin()
+        self.make_branch_ready()
+        self.assert_silent_check(self.run_cli("check", "--scheduled"))
+        before = (self.root / "state/demo.json").read_bytes()
+        self.clear_calls()
+        (self.checkout / "Cargo.lock").unlink()
+        result = self.run_cli("line", "--json", count_saves=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stderr, "")
+        self.assertEqual(len(result.stdout.splitlines()), 1)
+        update = cast(dict[str, object], json.loads(result.stdout))
+        self.assertEqual(set(update), {"update", "needs_user"})
+        self.assertIs(update["needs_user"], True)
+        self.assertIn("(1 waiting for your answer)", str(update["update"]))
+        self.assertIn("; pins not re-read since ", str(update["update"]))
+        self.assertEqual((self.root / "state/demo.json").read_bytes(), before)
+        self.assertFalse((self.root / "save-calls").exists())
+        self.assertFalse((self.root / "fetch-calls").exists())
+        self.assertEqual(self.tool_args("send"), [])
+
+    def test_line_json_is_empty_with_no_watch_or_a_closed_watch(self) -> None:
+        self.assert_silent_check(self.run_cli("line", "--json", count_saves=True))
+        self.assertEqual(self.tool_args("notifier"), [])
+        self.assertEqual(self.tool_args("send"), [])
+        self.begin()
+        self.assert_table(self.run_cli("stop"))
+        self.clear_calls()
+        before = (self.root / "state/demo.json").read_bytes()
+        self.assert_silent_check(self.run_cli("line", "--json", count_saves=True))
+        self.assertEqual((self.root / "state/demo.json").read_bytes(), before)
+        self.assertEqual(self.tool_args("notifier"), [])
+        self.assertEqual(self.tool_args("send"), [])
+        self.assertFalse((self.root / "save-calls").exists())
 
     def test_status_with_failed_pins_saves_the_displayed_baseline_once(self) -> None:
         self.begin()

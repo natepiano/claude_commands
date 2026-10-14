@@ -8,6 +8,7 @@ import json
 import os
 import re
 import stat
+import sys
 import tempfile
 import time
 from collections.abc import Callable, Generator
@@ -16,10 +17,12 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Literal, NotRequired, TypedDict, cast
-from zoneinfo import ZoneInfo
 
 from inventory import Session, parse_session
 from launch_permission import launch_barrier, shutdown_state_root
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
+from user_zone import user_zone  # noqa: E402
 
 CLAIM_STALE_SECONDS = 120
 CONDUCTOR_LOCK_RETRY_DELAYS = (0.05,) * 5
@@ -90,7 +93,7 @@ class NotReadyToStop(TypedDict):
     kind: Literal["not ready to stop"]
     at: str
     status: str
-    progress: Literal["waiting", "ready", "passive seat ready"]
+    progress: Literal["waiting", "ready", "held by usage limit", "passive seat ready"]
 
 
 class StillRunningAfterStop(TypedDict):
@@ -117,9 +120,18 @@ class CodexServerLeftRunning(TypedDict):
 
 
 class UnitTmuxLeftRunning(TypedDict):
+    """Legacy wire form; readers normalize it to UnitSessionLeftRunning."""
     kind: Literal["unit tmux session left running"]
     at: str
     tmux_session: str
+    cause: StopLeftRunningCause
+
+
+class UnitSessionLeftRunning(TypedDict):
+    kind: Literal["unit session left running"]
+    at: str
+    host: Literal["tmux", "herdr"]
+    session_name: str
     cause: StopLeftRunningCause
 
 
@@ -128,7 +140,7 @@ SessionStopIssue = (
     | StillRunningAfterStop
     | AccountUnreadableAtStop
     | CodexServerLeftRunning
-    | UnitTmuxLeftRunning
+    | UnitSessionLeftRunning
 )
 
 
@@ -205,6 +217,11 @@ class SessionReadyToStop(TypedDict):
     at: str
 
 
+class SessionHeldByUsageLimit(TypedDict):
+    kind: Literal["held by usage limit"]
+    at: str
+
+
 class _LegacyPassiveSeatReady(TypedDict):
     kind: Literal["passive seat ready"]
     at: str
@@ -277,6 +294,7 @@ class SessionNeedsManualRestart(TypedDict):
 SessionRestartPrior = (
     SessionWaiting
     | SessionReadyToStop
+    | SessionHeldByUsageLimit
     | SessionStopped
     | SessionStopping
     | SessionAlreadyGone
@@ -349,6 +367,18 @@ class SessionShutdown(TypedDict):
     progress: SessionProgress
     stop_issues: list[SessionStopIssue]
     alerted_at: NotRequired[str]
+    # The phone push for a form open in the session's pane; the user is told once.
+    form_alerted_at: NotRequired[str]
+    # The one repeat of the pause message when no ready mark came back.
+    reasked_at: NotRequired[str]
+    # The not-back failure last pushed to the user, so an unchanged one is not pushed again.
+    restore_alerted: NotRequired[str]
+    # The last line a unit's showrunner was sent about this stop: "stopping", "back", or the not-back failure.
+    showrunner_told: NotRequired[str]
+    # Absent means resume on session.config_dir, never on a changed role.
+    target: NotRequired[str]
+    source_label: NotRequired[str]
+    why: NotRequired[str]
 
 
 class AccountHold(TypedDict):
@@ -397,6 +427,7 @@ _RECORD_STATES = frozenset(
 _PROGRESS_WITH_TIME = frozenset(
     {
         "ready",
+        "held by usage limit",
         "passive seat ready",
         "stopped",
         "stopping",
@@ -638,6 +669,7 @@ def _session_stop_issue(value: object, place: str, *, legacy: bool = False) -> S
                 "seat still live",
                 "codex server left running",
                 "unit tmux session left running",
+                "unit session left running",
             }
         ),
     )
@@ -648,7 +680,7 @@ def _session_stop_issue(value: object, place: str, *, legacy: bool = False) -> S
         progress = _string(
             _required(values, "progress", place), f"{place}.progress"
         )
-        if progress not in {"waiting", "ready", "passive seat ready"}:
+        if progress not in {"waiting", "ready", "held by usage limit", "passive seat ready"}:
             raise InvalidRecord(f"{place}.progress is invalid")
     elif kind == "still running":
         _ = _string(_required(values, "reason", place), f"{place}.reason")
@@ -657,10 +689,22 @@ def _session_stop_issue(value: object, place: str, *, legacy: bool = False) -> S
         cause = _string(_required(values, "cause", place), f"{place}.cause")
         if cause not in {"stop not confirmed", "owner identity lost"}:
             raise InvalidRecord(f"{place}.cause is invalid")
-    elif kind == "unit tmux session left running":
-        _ = _string(
-            _required(values, "tmux_session", place), f"{place}.tmux_session"
-        )
+    elif kind in {"unit tmux session left running", "unit session left running"}:
+        if kind == "unit tmux session left running":
+            values = {
+                **values,
+                "kind": "unit session left running",
+                "host": "tmux",
+                "session_name": _string(
+                    _required(values, "tmux_session", place), f"{place}.tmux_session"
+                ),
+            }
+            del values["tmux_session"]
+        else:
+            _ = _string(_required(values, "session_name", place), f"{place}.session_name")
+            host = _string(_required(values, "host", place), f"{place}.host")
+            if host not in {"tmux", "herdr"}:
+                raise InvalidRecord(f"{place}.host is invalid")
         cause = _string(_required(values, "cause", place), f"{place}.cause")
         if cause not in {"stop not confirmed", "owner identity lost"}:
             raise InvalidRecord(f"{place}.cause is invalid")
@@ -913,6 +957,13 @@ def _shutdown_request_fields(values: dict[str, object], place: str) -> None:
 def _session_shutdown(value: object, place: str) -> SessionShutdown:
     values = _mapping(value, place)
     _shutdown_request_fields(values, place)
+    if "target" in values:
+        target = _string(values["target"], f"{place}.target")
+        if target != "default" and not re.fullmatch(r"claude [1-9][0-9]*", target):
+            raise InvalidRecord(f"{place}.target must be default or claude N")
+    for field in ("source_label", "why"):
+        if field in values:
+            _ = _string(values[field], f"{place}.{field}")
     for field, allowed in (
         ("hold", {"account", "session"}),
         ("force", {"wait for ready", "now"}),
@@ -943,8 +994,12 @@ def _session_shutdown(value: object, place: str) -> SessionShutdown:
             raise InvalidRecord(f"{seat_place}.owner must identify this session")
         parsed_seats.append(parsed)
     values["seats"] = parsed_seats
-    if "alerted_at" in values:
-        _ = _utc_time(values["alerted_at"], f"{place}.alerted_at")
+    for field in ("alerted_at", "form_alerted_at", "reasked_at"):
+        if field in values:
+            _ = _utc_time(values[field], f"{place}.{field}")
+    for field in ("restore_alerted", "showrunner_told"):
+        if field in values:
+            _ = _string(values[field], f"{place}.{field}")
     return cast(SessionShutdown, cast(object, values))
 
 
@@ -1321,7 +1376,7 @@ def migrate(login: str) -> list[str]:
         for (source, saved), target in zip(sources, targets):
             os.replace(source, target)
             when = datetime.fromisoformat(saved["requested_at"]).astimezone(
-                ZoneInfo("America/Los_Angeles")
+                user_zone()
             ).strftime("%Y-%m-%d %H:%M %Z")
             lines.append(f"shutdown: converted the {saved['state']} record of {saved['label']} from {when}")
         return lines
@@ -1399,7 +1454,7 @@ def _withdraw_session(
         if saved["session"]["session_id"] != session_id:
             raise InvalidRecord(f"{path} is used by a different session id")
         progress = saved["progress"]["kind"]
-        if progress not in {"waiting", "ready"} and not (
+        if progress not in {"waiting", "ready", "held by usage limit"} and not (
             progress == "stop failed" and identity_check(saved)
         ):
             return SessionRetained(saved)

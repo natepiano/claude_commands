@@ -5,21 +5,28 @@ from __future__ import annotations
 import json
 import os
 import socket
+import shutil
 import subprocess
 import sys
 import tempfile
 import unittest
+from datetime import datetime
 from pathlib import Path
 from typing import cast, final, override
 from unittest.mock import patch
 
 from test_support import ShutdownTestCase
+from test_restart import pane_display, top_level
 import inventory
 import account
 import fake_tmux
+import herdr
 import sessions
 import showrunners
 import unit_lookup
+import restart
+import shutdown
+import stop
 from fake_tmux import FakeSession
 
 
@@ -44,6 +51,42 @@ FAKE_TMUX = Path(__file__).parents[1] / "production" / "fake_tmux.py"
 
 @final
 class InventoryTests(ShutdownTestCase):
+    def test_cached_desktop_snapshot_never_invokes_the_snapshot_updater(self) -> None:
+        with (patch.object(shutil, "which", return_value="/fixture/agent-sessions-snapshot"),
+              patch.object(subprocess, "run") as updater):
+            desktops = inventory._snapshot_desktops(refresh=False)  # pyright: ignore[reportPrivateUsage]
+        updater.assert_not_called()
+        self.assertEqual(desktops[DESKTOP_ID], "Writing")
+
+    def test_nested_shutdown_inventory_reads_existing_snapshot_without_updating_notes(self) -> None:
+        with (patch.dict(os.environ, {"REFUSAL_WATCH_INVENTORY": "read existing"}),
+              patch.object(shutil, "which", return_value="/fixture/agent-sessions-snapshot"),
+              patch.object(subprocess, "run") as updater):
+            desktops = inventory._snapshot_desktops()  # pyright: ignore[reportPrivateUsage]
+        updater.assert_not_called()
+        self.assertEqual(desktops[DIRECTOR_ID], "Production")
+
+    def test_refusal_synthetic_model_keeps_the_last_real_reply_model(self) -> None:
+        transcript = self.home / ".claude/projects/model-fixture/refused.jsonl"
+        transcript.parent.mkdir(parents=True)
+        entries = [
+            {"type": "assistant", "message": {"model": "claude-opus-real"}},
+            {"type": "assistant", "isApiErrorMessage": True, "error": "rate_limit",
+             "message": {"model": "<synthetic>", "content": [{"type": "text", "text": "weekly limit"}]}},
+        ]
+        _ = transcript.write_text("\n".join(json.dumps(entry) for entry in entries) + "\n")
+        model = inventory._model("refused")  # pyright: ignore[reportPrivateUsage]
+        self.assertEqual(model, inventory.ModelName(kind="model", name="claude-opus-real"))
+        owner = top_level("refused", model=model)
+        self.assertIn("--model claude-opus-real", restart.resume_command(owner, "claude 3"))
+        self.assertNotIn("<synthetic>", restart.resume_command(owner, "claude 3"))
+
+    def test_only_synthetic_refusal_has_no_real_reply_model(self) -> None:
+        transcript = self.home / ".claude/projects/model-fixture/refused.jsonl"
+        transcript.parent.mkdir(parents=True)
+        _ = transcript.write_text(json.dumps({"type": "assistant", "message": {"model": "<synthetic>"}}) + "\n")
+        self.assertEqual(inventory._model("refused"), inventory.NoReplyYet(kind="no reply yet"))  # pyright: ignore[reportPrivateUsage]
+
     def __init__(self, methodName: str = "runTest") -> None:
         super().__init__(methodName)
         self.root = Path()
@@ -57,6 +100,8 @@ class InventoryTests(ShutdownTestCase):
         self.origin = Path()
         self.bin = Path()
         self.tmux_state = Path()
+        self.proc = Path()
+        self.herdr_log = Path()
         self.target_config = Path()
         self.other_config = Path()
         self.director_pid = 0
@@ -77,6 +122,10 @@ class InventoryTests(ShutdownTestCase):
         self.origin = self.root / "origin.git"
         self.bin = self.root / "bin"
         self.tmux_state = self.root / "tmux.json"
+        self.proc = self.root / "proc"
+        self.herdr_log = self.root / "herdr.jsonl"
+        responses = self.root / "herdr-responses.json"
+        self.herdr_sessions([])
         self.target_config = self.root / "claude-owner"
         self.other_config = self.root / "claude-other"
         for directory in (
@@ -90,6 +139,7 @@ class InventoryTests(ShutdownTestCase):
             self.checkout,
             self.target_config,
             self.other_config,
+            self.proc,
         ):
             directory.mkdir(parents=True)
 
@@ -103,6 +153,10 @@ class InventoryTests(ShutdownTestCase):
             "SHUTDOWN_DELEGATE_ROOT": str(self.delegate),
             "UNIT_LOOKUP_TMUX": str(FAKE_TMUX),
             "FAKE_TMUX_STATE": str(self.tmux_state),
+            "HERDR_BIN": str(Path(__file__).parents[1] / "herdr" / "fake_herdr.py"),
+            "HERDR_PROC": str(self.proc),
+            "FAKE_HERDR_LOG": str(self.herdr_log),
+            "FAKE_HERDR_RESPONSES": str(responses),
             "PATH": str(self.bin) + os.pathsep + os.environ.get("PATH", ""),
         }
         patch_dict_context: object = cast(
@@ -177,6 +231,22 @@ class InventoryTests(ShutdownTestCase):
             encoding="utf-8",
         )
 
+    def herdr_process(self, pid: int, parent: int, arguments: list[str], environment: dict[str, str]) -> None:
+        process = self.proc / str(pid)
+        process.mkdir()
+        _ = (process / "stat").write_text(f"{pid} (fixture) S {parent} 0 0\n")
+        _ = (process / "cmdline").write_bytes(("\0".join(arguments) + "\0").encode())
+        _ = (process / "environ").write_bytes(
+            ("\0".join(f"{key}={value}" for key, value in environment.items()) + "\0").encode()
+        )
+        (process / "cwd").symlink_to(self.checkout)
+
+    def herdr_sessions(self, names: list[str]) -> None:
+        entries = [herdr.SessionEntry(name=name, running=True, default=False,
+                                    session_dir=str(self.root / name), socket_path="fake-socket") for name in names]
+        response = {"stdout": json.dumps(herdr.SessionListResult(sessions=entries)), "code": 0}
+        _ = (self.root / "herdr-responses.json").write_text(json.dumps({"default": response}))
+
     def git(self, *arguments: str, cwd: Path | None = None) -> str:
         result = subprocess.run(
             ["git", *arguments],
@@ -242,6 +312,7 @@ elif "comm=" in joined:
         )
         os.environ["SHUTDOWN_TEST_PARENT_ROWS"] = json.dumps(parent_rows)
         self.write_executable("agent-sessions-snapshot", "raise SystemExit(0)\n")
+        self.write_executable("kdotool", "raise SystemExit(1)\n")
 
     def write_session(
         self,
@@ -496,7 +567,8 @@ elif "comm=" in joined:
                 "unit": "shutdown-unit",
                 "doc": str(self.root / "build-followups-production.md"),
                 "plan": {"kind": "plan", "path": "docs/shutdown-plan.md"},
-                "tmux_session": "unit-renamed",
+                "session_name": "unit-renamed",
+                "session_host": "tmux",
             },
         )
         self.assertEqual(
@@ -547,7 +619,78 @@ elif "comm=" in joined:
         found = inventory.inventory(TARGET_LOGIN)
         unit = next(session for session in found["sessions"] if session["session_id"] == UNIT_ID)
 
-        self.assertEqual(unit["host"].get("tmux_session"), "unit-renamed")
+        self.assertEqual(unit["host"].get("session_name"), "unit-renamed")
+        self.assertEqual(unit["host"].get("session_host"), "tmux")
+        self.assertEqual(shutdown._host_text(unit["host"]), "unit build-followups/shutdown-unit")  # pyright: ignore[reportPrivateUsage]
+
+    def test_empty_herdr_unit_name_does_not_fall_back_to_a_tmux_record(self) -> None:
+        session = inventory.SessionFile(sessionId="unit", tmux="unrelated:0.0")
+        for host in ("tmux", "herdr"):
+            marks = inventory.UnitMarks(production="build", unit="one", doc="/tmp/build.md",
+                                        session_name="", session_host=host)
+            recorded = inventory._host(session, marks, {}, {})  # pyright: ignore[reportPrivateUsage]
+            self.assertEqual(recorded.get("session_name"), "unrelated" if host == "tmux" else "")
+
+    def test_herdr_host_comes_from_the_process_server_ancestor(self) -> None:
+        self.herdr_process(71_001, 1, ["/fixture/herdr", "--session", "writing", "server"], {})
+        self.herdr_process(DESKTOP_PID, 71_001, ["/bin/claude"],
+                           {"HERDR_PANE_ID": "w1:p1", "HERDR_SESSION": "inherited-other-name"})
+        self.assertEqual(herdr.herdr_place_of(DESKTOP_PID), herdr.HerdrPlace("writing", "w1:p1"))
+        found = inventory.inventory(TARGET_LOGIN)
+        desktop = next(session for session in found["sessions"] if session["session_id"] == DESKTOP_ID)
+        self.assertEqual(desktop["host"], {"kind": "herdr", "herdr_session": "writing", "pane_id": "w1:p1"})
+        self.assertEqual(inventory.parse_inventory(json.dumps(found)), found)
+        self.assertEqual(shutdown._host_text(desktop["host"]), "herdr writing")  # pyright: ignore[reportPrivateUsage]
+
+    def test_herdr_unit_records_its_host_and_live_session_name(self) -> None:
+        self.herdr_sessions(["unit-herdr"])
+        fake_tmux.write(self.tmux_state, {})
+        path = self.records / f"{UNIT_PID}.json"
+        record = cast(dict[str, object], json.loads(path.read_text()))
+        record["tmux"] = ""
+        _ = path.write_text(json.dumps(record))
+        self.herdr_process(71_001, 1, ["/fixture/herdr", "--session", "unit-herdr", "server"], {})
+        self.herdr_process(UNIT_PID, 71_001, ["/bin/claude"], {
+            "HERDR_PANE_ID": "w1:p1", "SHOWRUNNER_UNIT": "build-followups",
+            "SHOWRUNNER_UNIT_ID": "shutdown-unit",
+        })
+        found = inventory.inventory(TARGET_LOGIN)
+        unit = next(session for session in found["sessions"] if session["session_id"] == UNIT_ID)
+        self.assertEqual(unit["kind"], "unit")
+        self.assertEqual(unit["host"].get("session_name"), "unit-herdr")
+        self.assertEqual(unit["host"].get("session_host"), "herdr")
+        self.assertEqual(inventory.parse_inventory(json.dumps(found)), found)
+        self.assertEqual(shutdown._host_text(unit["host"]), "unit build-followups/shutdown-unit (herdr unit-herdr)")  # pyright: ignore[reportPrivateUsage]
+        self.assertEqual(unit["host"].get("plan"), {"kind": "plan", "path": "docs/shutdown-plan.md"})
+
+    def test_herdr_host_cleanup_leaves_its_pane_and_server_running(self) -> None:
+        session = cast(inventory.TopLevelSession, next(
+            item for item in inventory.inventory(TARGET_LOGIN)["sessions"] if item["session_id"] == DESKTOP_ID
+        ))
+        session["host"] = inventory.HerdrHost(kind="herdr", herdr_session="writing", pane_id="w1:p1")
+        with patch.object(stop, "_stop_unit_tmux") as tmux_cleanup, patch.object(stop, "_close_ghostty_window"):
+            issues = stop._stop_owner_resources(  # pyright: ignore[reportPrivateUsage]
+                session, kill=lambda _pid, _signal: self.fail("unexpected kill"), is_alive=lambda _pid: False,
+                codex_mesh=lambda _argv: self.fail("unexpected Codex stop"),
+                tmux=lambda _argv: self.fail("unexpected tmux call"), clock=datetime.now,
+                claim=stop.StopClaim(TARGET_LOGIN, DESKTOP_ID, "fixture", "fixture"),
+            )
+        self.assertEqual(issues, [])
+        tmux_cleanup.assert_not_called()
+
+    def test_tmux_host_takes_precedence_over_inherited_herdr_environment(self) -> None:
+        self.herdr_process(71_001, 1, ["/fixture/herdr", "--session", "outer", "server"], {})
+        self.herdr_process(DESKTOP_PID, 71_001, ["/bin/claude"], {"HERDR_PANE_ID": "w1:p1"})
+        with patch("inventory._process_environment", return_value={"TMUX_PANE": "%9"}), patch(
+            "inventory._tmux_session", return_value=(
+                "inner", inventory.TmuxSessionIdNotRecorded(kind="not recorded"),
+                inventory.TmuxServerNotRecorded(kind="not recorded"), inventory.PaneNotRecorded(kind="not recorded"),
+            ),
+        ):
+            found = inventory.inventory(TARGET_LOGIN)
+        desktop = next(session for session in found["sessions"] if session["session_id"] == DESKTOP_ID)
+        self.assertEqual(desktop["host"]["kind"], "tmux")
+        self.assertEqual(desktop["host"].get("tmux_session"), "inner")
 
     def test_tmux_hosts_record_the_pane_or_an_explicit_absence(self) -> None:
         def process_environment(pid: int) -> dict[str, str]:
@@ -559,16 +702,16 @@ elif "comm=" in joined:
 
         def tmux_details(
             pane: str,
-        ) -> tuple[str, inventory.TmuxPane | inventory.PaneNotRecorded]:
+        ) -> tuple[str, inventory.TmuxSessionId | inventory.TmuxSessionIdNotRecorded, inventory.TmuxServer | inventory.TmuxServerNotRecorded, inventory.TmuxPane | inventory.PaneNotRecorded]:
             if pane == "%8":
-                return "production work", {
+                return "production work", inventory.TmuxSessionId(kind="session id", session_id="$8"), inventory.TmuxServer(kind="server", pid=34500, started_at=1700000000), {
                     "kind": "pane",
                     "pane_id": "%8",
                     "pane_pid": 62_008,
                 }
             if pane == "%9":
-                return "writing", {"kind": "not recorded"}
-            return "", {"kind": "not recorded"}
+                return "writing", inventory.TmuxSessionIdNotRecorded(kind="not recorded"), inventory.TmuxServerNotRecorded(kind="not recorded"), {"kind": "not recorded"}
+            return "", inventory.TmuxSessionIdNotRecorded(kind="not recorded"), inventory.TmuxServerNotRecorded(kind="not recorded"), {"kind": "not recorded"}
 
         with (
             patch("inventory._process_environment", side_effect=process_environment),
@@ -582,6 +725,8 @@ elif "comm=" in joined:
             {
                 "kind": "tmux",
                 "tmux_session": "production work",
+                "session_ref": {"kind": "session id", "session_id": "$8"},
+                "server": {"kind": "server", "pid": 34500, "started_at": 1700000000},
                 "pane": {"kind": "pane", "pane_id": "%8", "pane_pid": 62_008},
             },
         )
@@ -590,62 +735,70 @@ elif "comm=" in joined:
             {
                 "kind": "tmux",
                 "tmux_session": "writing",
+                "session_ref": {"kind": "not recorded"},
+                "server": {"kind": "not recorded"},
                 "pane": {"kind": "not recorded"},
             },
         )
 
-    def test_tmux_discovery_reads_session_and_pane_pid_in_one_call(self) -> None:
-        completed = subprocess.CompletedProcess(
-            args=(), returncode=0, stdout="production work\t62008\n"
-        )
-        with (
-            patch.object(unit_lookup, "tmux_binary", return_value="/test/tmux"),
-            patch("inventory.subprocess.run", return_value=completed) as run,
-        ):
+    def discover_tmux(
+        self, name: str, session_id: str, pid: str, started_at: str = "1700000000",
+        *, include_start: bool = True, server_pid: str = "34500", include_pid: bool = True,
+    ) -> tuple[str, inventory.TmuxSessionId | inventory.TmuxSessionIdNotRecorded,
+               inventory.TmuxServer | inventory.TmuxServerNotRecorded, inventory.TmuxPane | inventory.PaneNotRecorded]:
+        calls: list[tuple[str, ...]] = []
+        def probe(argv: tuple[str, ...], *, capture_output: bool, text: bool, timeout: int, check: bool) -> subprocess.CompletedProcess[str]:
+            del capture_output, text, timeout, check
+            calls.append(argv)
+            self.assertEqual(argv[:5], ("/test/tmux", "display", "-p", "-t", "%8"))
+            self.assertCountEqual(argv[-1].split("\t"), ["#{session_name}", "#{session_id}", "#{pane_pid}", "#{start_time}", "#{pid}"])
+            format_text = argv[-1]
+            if not include_start:
+                format_text = "\t".join(field for field in format_text.split("\t") if field != "#{start_time}")
+            if not include_pid:
+                format_text = "\t".join(field for field in format_text.split("\t") if field != "#{pid}")
+            return subprocess.CompletedProcess(argv, 0,
+                pane_display(format_text, name, session_id, pid, "", started_at, server_pid), "")
+        with patch.object(unit_lookup, "tmux_binary", return_value="/test/tmux"), patch("inventory.subprocess.run", probe):
             found = inventory._tmux_session("%8")  # pyright: ignore[reportPrivateUsage]
+        self.assertEqual(len(calls), 1)
+        return found
 
-        self.assertEqual(
-            found,
-            (
-                "production work",
-                {"kind": "pane", "pane_id": "%8", "pane_pid": 62_008},
-            ),
-        )
-        self.assertEqual(
-            run.call_args.args[0],
-            (
-                "/test/tmux",
-                "display",
-                "-p",
-                "-t",
-                "%8",
-                "#{session_name}\t#{pane_pid}",
-            ),
-        )
+    def test_tmux_discovery_reads_session_and_pane_pid_in_one_call(self) -> None:
+        self.assertEqual(self.discover_tmux("production work", "$8", "62008"),
+            ("production work", {"kind": "session id", "session_id": "$8"},
+             {"kind": "server", "pid": 34500, "started_at": 1700000000},
+             {"kind": "pane", "pane_id": "%8", "pane_pid": 62008}))
 
     def test_tmux_discovery_preserves_spaces_in_session_name(self) -> None:
-        completed = subprocess.CompletedProcess(
-            args=(), returncode=0, stdout=" work \t62008\n"
-        )
-        with patch("inventory.subprocess.run", return_value=completed):
-            found = inventory._tmux_session("%8")  # pyright: ignore[reportPrivateUsage]
-
-        self.assertEqual(
-            found,
-            (
-                " work ",
-                {"kind": "pane", "pane_id": "%8", "pane_pid": 62_008},
-            ),
-        )
+        self.assertEqual(self.discover_tmux(" work ", "$8", "62008"),
+            (" work ", {"kind": "session id", "session_id": "$8"},
+             {"kind": "server", "pid": 34500, "started_at": 1700000000},
+             {"kind": "pane", "pane_id": "%8", "pane_pid": 62008}))
 
     def test_tmux_discovery_keeps_session_when_pane_pid_is_unusable(self) -> None:
-        completed = subprocess.CompletedProcess(
-            args=(), returncode=0, stdout="writing\tnot-a-pid\n"
-        )
-        with patch("inventory.subprocess.run", return_value=completed):
-            found = inventory._tmux_session("%9")  # pyright: ignore[reportPrivateUsage]
+        self.assertEqual(self.discover_tmux("writing", "$9", "not-a-pid"),
+            ("writing", {"kind": "session id", "session_id": "$9"},
+             {"kind": "server", "pid": 34500, "started_at": 1700000000}, {"kind": "not recorded"}))
 
-        self.assertEqual(found, ("writing", {"kind": "not recorded"}))
+    def test_tmux_discovery_records_missing_session_id_without_losing_pane(self) -> None:
+        self.assertEqual(self.discover_tmux("writing", "", "62009"),
+            ("writing", {"kind": "not recorded"}, {"kind": "server", "pid": 34500, "started_at": 1700000000},
+             {"kind": "pane", "pane_id": "%8", "pane_pid": 62009}))
+
+    def test_tmux_discovery_records_missing_or_invalid_server_without_losing_ids(self) -> None:
+        for started_at, include_start in (("1700000000", False), ("", True), ("not-an-integer", True)):
+            with self.subTest(started_at=started_at, include_start=include_start):
+                self.assertEqual(self.discover_tmux("writing", "$9", "62009", started_at, include_start=include_start),
+                    ("writing", {"kind": "session id", "session_id": "$9"}, {"kind": "not recorded"},
+                     {"kind": "pane", "pane_id": "%8", "pane_pid": 62009}))
+
+    def test_tmux_discovery_records_missing_or_invalid_server_pid_without_losing_ids(self) -> None:
+        for server_pid, include_pid in (("34500", False), ("", True), ("not-an-integer", True)):
+            with self.subTest(server_pid=server_pid, include_pid=include_pid):
+                self.assertEqual(self.discover_tmux("writing", "$9", "62009", server_pid=server_pid, include_pid=include_pid),
+                    ("writing", {"kind": "session id", "session_id": "$9"}, {"kind": "not recorded"},
+                     {"kind": "pane", "pane_id": "%8", "pane_pid": 62009}))
 
     def test_ghostty_host_carries_window_shell_between_terminal_and_claude(self) -> None:
         found = inventory.inventory(TARGET_LOGIN)
@@ -666,6 +819,17 @@ elif "comm=" in joined:
             ["busy-codex", "busy-without-launcher"],
         )
         self.assertNotIn("orphaned-start", director["codex_servers"][0]["busy_seats"])
+
+    def test_a_showrunner_timer_naming_a_session_not_running_is_unregistered(self) -> None:
+        before = {runner["slug"] for runner in inventory.unregistered_showrunners()}
+        stale = self.notifier / "showrunner-stale"
+        stale.mkdir()
+        stale_doc = self.root / "stale-production.md"
+        _ = stale_doc.write_text("- **User zone:** America/Los_Angeles\n", encoding="utf-8")
+        _ = (stale / "conf").write_text(
+            f"TARGET=session:00000000-0000-4000-8000-000000000000\nCHECK=zsh /opt/production_check.sh {stale_doc}\n",
+            encoding="utf-8")
+        self.assertEqual({runner["slug"] for runner in inventory.unregistered_showrunners()} - before, {"stale"})
 
     def test_incomplete_showrunner_timer_leaves_session_top_level(self) -> None:
         invalid_showrunner = self.notifier / "showrunner-incomplete"
@@ -848,9 +1012,33 @@ elif "comm=" in joined:
             {
                 "kind": "tmux",
                 "tmux_session": "legacy",
+                "session_ref": {"kind": "not recorded"},
+                "server": {"kind": "not recorded"},
                 "pane": {"kind": "not recorded"},
             },
         )
+
+    def test_parse_inventory_restores_session_reference_and_preserves_legacy_pane(self) -> None:
+        found = inventory.inventory(TARGET_LOGIN, only=frozenset({DESKTOP_ID}))
+        document = cast(dict[str, object], cast(object, json.loads(json.dumps(found))))
+        session_values = cast(list[object], document["sessions"])
+        owner = cast(dict[str, object], session_values[0])
+        host: dict[str, object] = {"kind": "tmux", "tmux_session": "old name",
+            "pane": {"kind": "pane", "pane_id": "%8", "pane_pid": 700},
+            "session_ref": {"kind": "session id", "session_id": "$4"},
+            "server": {"kind": "server", "pid": 34500, "started_at": 1700000000}}
+        owner["host"] = host
+        parsed = inventory.parse_inventory(json.dumps(document))["sessions"][0]["host"]
+        self.assertEqual(parsed, host)
+        host["server"] = {"kind": "server", "started_at": 1700000000}
+        parsed = inventory.parse_inventory(json.dumps(document))["sessions"][0]["host"]
+        self.assertEqual(parsed, {**host, "server": {"kind": "not recorded"}})
+        del host["server"]
+        parsed = inventory.parse_inventory(json.dumps(document))["sessions"][0]["host"]
+        self.assertEqual(parsed, {**host, "server": {"kind": "not recorded"}})
+        del host["session_ref"]
+        parsed = inventory.parse_inventory(json.dumps(document))["sessions"][0]["host"]
+        self.assertEqual(parsed, {**host, "session_ref": {"kind": "not recorded"}, "server": {"kind": "not recorded"}})
 
     def test_parse_inventory_validates_a_recorded_tmux_pane(self) -> None:
         found = inventory.inventory(TARGET_LOGIN)
@@ -899,6 +1087,79 @@ elif "comm=" in joined:
             r"inventory\.sessions\[0\]\.host\.window_shell is missing",
         ):
             _ = inventory.parse_inventory(json.dumps(document))
+
+
+class ProcessEnvironmentTests(unittest.TestCase):
+    def test_darwin_environment_excludes_assignments_in_arguments(self) -> None:
+        arguments = 'claude --resume conversation "TMUX_PANE=%41 CLAUDE_CONFIG_DIR=/x"'
+        with patch.object(sys, "platform", "darwin"), patch.object(subprocess, "run", side_effect=[
+            subprocess.CompletedProcess[str]([], 0, f"  {arguments}\n", ""),
+            subprocess.CompletedProcess[str]([], 0, f"  {arguments} HERDR_PANE_ID=w1:p1 REAL_ENTRY=value=with=equals\n", ""),
+            subprocess.CompletedProcess[str]([], 0, f"  {arguments}\n", ""),
+        ]) as probe:
+            environment = inventory._process_environment(42)  # pyright: ignore[reportPrivateUsage]
+        self.assertEqual(environment, {"HERDR_PANE_ID": "w1:p1", "REAL_ENTRY": "value=with=equals"})
+        self.assertEqual(probe.call_args_list[0].args[0], ("ps", "-o", "command=", "-p", "42"))
+        self.assertEqual(probe.call_args_list[1].args[0], ("ps", "eww", "-o", "command=", "-p", "42"))
+        self.assertEqual(probe.call_args_list[2].args[0], ("ps", "-o", "command=", "-p", "42"))
+        self.assertEqual(probe.call_count, 3)
+
+    def test_darwin_environment_refuses_arguments_added_between_reads(self) -> None:
+        arguments = "claude --resume conversation"
+        extended_arguments = arguments + " TMUX_PANE=%41 CLAUDE_CONFIG_DIR=/x"
+        with patch.object(sys, "platform", "darwin"), patch.object(subprocess, "run", side_effect=[
+            subprocess.CompletedProcess[str]([], 0, arguments + "\n", ""),
+            subprocess.CompletedProcess[str]([], 0, extended_arguments + "\n", ""),
+            subprocess.CompletedProcess[str]([], 0, extended_arguments + "\n", ""),
+        ]) as probe:
+            self.assertEqual(inventory._process_environment(42), {})  # pyright: ignore[reportPrivateUsage]
+        self.assertEqual(probe.call_count, 3)
+
+    def test_darwin_environment_refuses_changed_or_empty_command(self) -> None:
+        for arguments, expanded in (
+            ("claude --resume old", "claude --resume new TMUX_PANE=%41"),
+            ("claude", "claude-other TMUX_PANE=%41"),
+            ("", "TMUX_PANE=%41"),
+        ):
+            with self.subTest(arguments=arguments, expanded=expanded):
+                with patch.object(sys, "platform", "darwin"), patch.object(subprocess, "run", side_effect=[
+                    subprocess.CompletedProcess[str]([], 0, arguments + "\n", ""),
+                    subprocess.CompletedProcess[str]([], 0, expanded + "\n", ""),
+                    subprocess.CompletedProcess[str]([], 0, arguments + "\n", ""),
+                ]):
+                    self.assertEqual(inventory._process_environment(42), {})  # pyright: ignore[reportPrivateUsage]
+
+    def test_darwin_environment_is_empty_when_any_ps_call_fails(self) -> None:
+        for failed_call in (0, 1, 2):
+            for failure in (
+                subprocess.CompletedProcess[str]([], 1, "claude TMUX_PANE=%41", "gone"),
+                OSError("process vanished"),
+                subprocess.TimeoutExpired("ps", 5),
+            ):
+                with self.subTest(failed_call=failed_call, failure=failure):
+                    answers = [subprocess.CompletedProcess[str]([], 0, "claude\n", "")] * failed_call + [failure]
+                    with patch.object(sys, "platform", "darwin"), patch.object(subprocess, "run", side_effect=answers) as probe:
+                        self.assertEqual(inventory._process_environment(42), {})  # pyright: ignore[reportPrivateUsage]
+                    self.assertEqual(probe.call_count, failed_call + 1)
+
+    def test_darwin_command_without_environment_contributes_no_assignments(self) -> None:
+        arguments = "claude TMUX_PANE=%41 CLAUDE_CONFIG_DIR=/x"
+        with patch.object(sys, "platform", "darwin"), patch.object(subprocess, "run", side_effect=[
+            subprocess.CompletedProcess[str]([], 0, arguments + "\n", ""),
+            subprocess.CompletedProcess[str]([], 0, arguments + "\n", ""),
+            subprocess.CompletedProcess[str]([], 0, arguments + "\n", ""),
+        ]):
+            self.assertEqual(inventory._process_environment(42), {})  # pyright: ignore[reportPrivateUsage]
+
+    def test_linux_environment_still_reads_null_delimited_proc_entries(self) -> None:
+        with patch.object(sys, "platform", "linux"), patch.object(Path, "read_bytes", return_value=(
+            b"TMUX_PANE=%41\0CLAUDE_CONFIG_DIR=/real account\0INVALID\0VALUE=a=b\0"
+        )) as read_environment, patch.object(subprocess, "run") as probe:
+            self.assertEqual(inventory._process_environment(42), {  # pyright: ignore[reportPrivateUsage]
+                "TMUX_PANE": "%41", "CLAUDE_CONFIG_DIR": "/real account", "VALUE": "a=b",
+            })
+        read_environment.assert_called_once_with()
+        probe.assert_not_called()
 
 
 if __name__ == "__main__":

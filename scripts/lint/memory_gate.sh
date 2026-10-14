@@ -14,6 +14,7 @@ build_override_refusal "${BASH_SOURCE[0]}" lint/memory_gate.sh || exit 2
 BUILD_HOLD_MARK_SCRIPT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../build_hold" && pwd)/build_hold.py"
 BUILD_TARGETS_SCRIPT="${BUILD_TARGETS_SCRIPT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../build_targets" && pwd)/build_targets.py}"
 BUILDLOG_MEM_ADMIT_SCRIPT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/memory_admit.py"
+USER_ZONE_SCRIPT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../lib" && pwd)/user_zone.py"
 
 buildlog_memory_python() {
     if [[ -x "$HOME/.claude/scripts/lib/py" ]]; then
@@ -42,8 +43,24 @@ build_hold_mark() {
     python3 "$BUILD_HOLD_MARK_SCRIPT" "${arguments[@]}" >/dev/null 2>&1 || true
 }
 
+# Status 0 only when the holder directory is a readable directory with no
+# entry at all and this shell expands patterns unfiltered; any doubt starts
+# the Python, which decides as before.
+build_hold_nothing_held() {
+    [[ -n "${BUILD_HOLD_DIR-x}" ]] || return 1
+    [[ "$-" != *f* && -z "${GLOBIGNORE-}" ]] || return 1
+    if shopt -q failglob; then return 1; fi
+    local holder_dir="${BUILD_HOLD_DIR-$HOME/.local/state/build-hold}" entry
+    [[ -d "$holder_dir" && -r "$holder_dir" && -x "$holder_dir" ]] || return 1
+    for entry in "$holder_dir"/* "$holder_dir"/.[!.]* "$holder_dir"/..?*; do
+        if [[ -e "$entry" || -L "$entry" ]]; then return 1; fi
+    done
+    return 0
+}
+
 build_hold_wait_local() {
     [[ -n "${BUILDLOG_CALL_ID:-}" && "${BUILDLOG_CALLER:-}" == verify ]] || return 0
+    if build_hold_nothing_held; then return 0; fi
     local waiter_pid status=0
     python3 "$BUILD_TARGETS_SCRIPT" wait-local --call-id "$BUILDLOG_CALL_ID" --pid "${BUILDLOG_HOLD_PID:-$$}" &
     waiter_pid=$!
@@ -53,6 +70,7 @@ build_hold_wait_local() {
 
 build_hold_check_admission() {
     [[ -n "${BUILDLOG_CALL_ID:-}" && "${BUILDLOG_CALLER:-}" == verify ]] || return 0
+    if build_hold_nothing_held; then return 0; fi
     python3 "$BUILD_TARGETS_SCRIPT" check-admission --call-id "$BUILDLOG_CALL_ID"
 }
 
@@ -71,7 +89,7 @@ buildlog_memory_line() {
     esac
     if [[ "$kind" == first ]]; then
         awk -v a="$available" -v t="$threshold" -v n="$need" -v p="$promised" -v m="$running" -v r="$reserve" \
-            -v since="$(TZ=America/Los_Angeles date '+%H:%M %Z')" -v repo="${11}" -v step="${12}" -v desc="$description" -v summary="$summary" \
+            -v since="$(TZ="$(buildlog_memory_python "$USER_ZONE_SCRIPT" 2>/dev/null)" date '+%H:%M %Z')" -v repo="${11}" -v step="${12}" -v desc="$description" -v summary="$summary" \
             'BEGIN { subject=(repo == "" ? step : repo " " step); printf "waiting for memory since %s: the machine has %.1f GiB free; a build starts at %.1f (%s needs %.1f GiB, %s", since,a/1073741824,t/1073741824,subject,n/1073741824,desc > "/dev/stderr"; if (m>0) printf "; %.1f GiB still promised to %d running steps: %s",p/1073741824,m,summary > "/dev/stderr"; if (r>0) printf "; %.1f GiB kept for earlyoom",r/1073741824 > "/dev/stderr"; print ")" > "/dev/stderr" }'
     elif [[ "$kind" == periodic ]]; then
         awk -v a="$available" -v t="$threshold" -v m="$(( BUILDLOG_MEM_WAIT_S / 60 ))" \

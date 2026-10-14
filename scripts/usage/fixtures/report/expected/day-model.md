@@ -6,8 +6,8 @@ Bounds: unbounded <= at < unbounded; zone: America/Los_Angeles
 | 2026-10-10 | claude-haiku-4-5 | 20 | 1 | 20 |
 | 2026-10-10 | claude-opus-4-6 | 1,635 | 5 | 1,635 |
 | 2026-10-10 | gpt-5.6-sol | 100 | 1 | 100 |
-| 2026-10-10 | gpt-6-sol | unweighted | 1 | unweighted |
 | 2026-10-10 | gpt-6.1-sol | 230 | 3 | 230 |
+| 2026-10-10 | invented-unweighted-model | unweighted | 1 | unweighted |
 | 2026-10-11 | gpt-6.1-sol | 75 | 1 | 75 |
 
 Coverage
@@ -22,7 +22,7 @@ Unweighted:
 
 | model | turns |
 | --- | --- |
-| gpt-6-sol | 1 |
+| invented-unweighted-model | 1 |
 
 Review turns with unrecorded lens: 1.
 

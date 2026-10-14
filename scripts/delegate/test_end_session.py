@@ -19,7 +19,6 @@ from scripts.delegate import remove_seats
 
 
 END_SESSION = Path(__file__).with_name("end_session.sh")
-ACTIVE_ROOT = Path("/tmp/claude/delegate/active")
 
 
 class EndSessionTests(unittest.TestCase):
@@ -40,8 +39,9 @@ class EndSessionTests(unittest.TestCase):
         self.session_dir = self.root / "run"
         self.session_dir.mkdir()
         session_id = f"end-session-test-{os.getpid()}-{self.root.name}"
-        ACTIVE_ROOT.mkdir(parents=True, exist_ok=True)
-        self.marker = ACTIVE_ROOT / session_id
+        active_root = self.root / "active"
+        active_root.mkdir()
+        self.marker = active_root / session_id
         _ = self.marker.write_text(f"{self.session_dir}\n", encoding="utf-8")
         self.calls = self.root / "calls"
 
@@ -83,6 +83,7 @@ class EndSessionTests(unittest.TestCase):
             "HOME": str(self.root),
             "CLAUDE_CODE_SESSION_ID": self.session_id,
             "END_SESSION_CALLS": str(self.calls),
+            "PLAN_DELEGATE_ACTIVE_DIR": str(self.marker.parent),
         })
 
         result = subprocess.run(

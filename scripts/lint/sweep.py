@@ -141,8 +141,13 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
 from pathlib import Path
-from typing import Literal, TypeGuard, TypedDict, cast
-from zoneinfo import ZoneInfo
+from typing import TYPE_CHECKING, Literal, TypeGuard, TypedDict, cast
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
+from user_zone import user_zone  # noqa: E402
+if TYPE_CHECKING:
+    from ..notify.push_texts import RenderedPush
+    from ..notify import review
 
 GIB = 1 << 30
 MIB = 1 << 20
@@ -192,7 +197,6 @@ ALERT_INTERVAL_SECONDS = 60 * 60
 # loss each; their smallest removal was 35.2 GiB, versus 29.2 GiB at most otherwise.
 UNEXPLAINED_FALL_BYTES = 10 * GIB
 LARGE_REMOVAL_BYTES = 32 * GIB
-PACIFIC = ZoneInfo("America/Los_Angeles")
 # A nightly worktree's target is 5 below its root, a scratch crate's under
 # /tmp/claude-<uid>/<project>/<session>/scratchpad/ up to 7.
 FLOOR_SEARCH_DEPTH = 8
@@ -755,7 +759,7 @@ def mib(size: int) -> str:
 
 
 def when(timestamp: float) -> str:
-    return datetime.fromtimestamp(timestamp).strftime("%Y-%m-%d %H:%M")
+    return datetime.fromtimestamp(timestamp, user_zone()).strftime("%Y-%m-%d %H:%M")
 
 
 def scan_roots(roots: list[str], trees: list[str]) -> Scan:
@@ -996,7 +1000,7 @@ def read_disk_measurement() -> DiskMeasurement:
 
 
 def pacific_time(timestamp: float | datetime) -> str:
-    value = timestamp.astimezone(PACIFIC) if isinstance(timestamp, datetime) else datetime.fromtimestamp(timestamp, PACIFIC)
+    value = timestamp.astimezone(user_zone()) if isinstance(timestamp, datetime) else datetime.fromtimestamp(timestamp, user_zone())
     return value.strftime("%Y-%m-%d %H:%M %Z")
 
 
@@ -1085,8 +1089,8 @@ def floor_out_of_reach_text(now: float, removed: int, free: int, floor: int,
     held = f"{held_count} target dirs a build holds ({gib(held_bytes)}), which the sweep takes once their builds end; " if held_count else ""
     for path_limit in (256, 128, 96, 72, 56, 40, 24, 16):
         message = "\n".join([
-            f"Disk floor sweep at {pacific_time(now)} removed {gib(removed)} and has no build cache left that it may remove; free space is {gib(free)}, under the {gib(floor)} floor.",
-            f"To get back over the floor, free {gib(floor - free)} outside build caches.",
+            f"Build cache cleanup removed {gib(removed)}, but natedev still has only {gib(free)} free. Builds need {gib(floor)} free. No build cache is left to remove.",
+            f"Free {gib(floor - free)} outside build caches in a terminal on natedev.",
             f"Not swept: {held}CI's targets ({gib(ci_bytes)}).",
             *([f"Could not remove {failures} {'path' if failures == 1 else 'paths'} this sweep; the next sweep tries again."] if failures else []),
             *disk_measurement_lines(measurement, 0, 0, now, False, path_limit),
@@ -1096,22 +1100,51 @@ def floor_out_of_reach_text(now: float, removed: int, free: int, floor: int,
     return message
 
 
-def send_floor_alert(message: str, channels: FloorAlertChannels) -> bool:
+@dataclass(frozen=True)
+class NoPhoneAlert:
+    """This cleanup report goes only to the machine's session."""
+
+
+NO_PHONE_ALERT = NoPhoneAlert()
+
+
+def disk_floor_push(removed: int, free: int, floor: int) -> RenderedPush:
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "notify"))
+    if TYPE_CHECKING:
+        from ..notify.push_texts import render
+    else:
+        from push_texts import render
+
+    return render("sweep.disk_floor", removed=gib(removed), free=gib(free), floor=gib(floor),
+                  shortfall=gib(max(0, floor - free)))
+
+
+def send_floor_alert(message: str, channels: FloorAlertChannels, *,
+                     phone: RenderedPush | NoPhoneAlert = NO_PHONE_ALERT) -> bool:
     scripts = Path(__file__).resolve().parents[1]
+    if not TYPE_CHECKING:
+        # Imported here, so modules that only read sweep's config never load the reviewer.
+        sys.path.insert(0, str(scripts / "notify"))
+        import review
     commands = [
         ("message", [sys.executable, str(scripts / "message/send.py"), "--to", "natedev", "--from", "disk_floor", "--timeout", "30"]),
     ]
     if channels is FloorAlertChannels.NATEDEV_AND_PHONE:
-        commands.append(("phone", [
-            sys.executable, str(scripts / "message/send.py"),
-            "--to", "user", "--need", "note",
-            "--action", "Free disk space outside build caches on natedev.",
-            "--summary", "natedev: disk under its floor", "--text", message,
-        ]))
+        if TYPE_CHECKING:
+            from ..notify.push_texts import RenderedPush, user_send_argv
+        else:
+            from push_texts import RenderedPush, user_send_argv
+
+        if not isinstance(phone, RenderedPush):
+            raise ValueError("phone channel requires a rendered disk alert")
+        command = user_send_argv(phone)
+        command[1] = str(scripts / "message/send.py")
+        commands.append(("phone", command))
     delivered = False
     for channel, command in commands:
         try:
-            result = subprocess.run(command, input=message if channel == "message" else None, text=True, capture_output=True, timeout=40)
+            timeout = review.user_send_seconds() + 15 if channel == "phone" else 40
+            result = subprocess.run(command, input=message if channel == "message" else None, text=True, capture_output=True, timeout=timeout)
             if result.returncode == 0 or (channel == "message" and result.returncode == 1):
                 delivered = True
                 state = "queued" if result.returncode == 1 else "delivered"
@@ -1209,7 +1242,8 @@ def hold_floor(
             if left > budget and after_free < floor and push_due:
                 message = floor_out_of_reach_text(now, removed, after_free, floor, len(busy),
                                                    held_bytes, ci_bytes, read_disk_measurement(), failures)
-                if send_floor_alert(message, FloorAlertChannels.NATEDEV_AND_PHONE):
+                if send_floor_alert(message, FloorAlertChannels.NATEDEV_AND_PHONE,
+                                    phone=disk_floor_push(removed, after_free, floor)):
                     push_history = DeliveredAlert(time.time())
             elif removed > 0 and (isinstance(history, NoDeliveredAlert) or now - history.at >= ALERT_INTERVAL_SECONDS):
                 free_fall = previous.free_bytes - free if isinstance(previous, FloorRecord) else 0

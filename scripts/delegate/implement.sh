@@ -288,7 +288,7 @@ with lock_file.open("a+") as lock:
         if family == "codex":
             if mesh != "1":
                 fail(f"{name} has mesh=none")
-            context_tokens = entry.get("context_tokens", 0)
+            context_tokens = entry.get("context_tokens")
             if isinstance(context_tokens, int) and context_tokens > compact_above:
                 compact = subprocess.run(
                     [sys.executable, mesh_script, "compact", "--session-dir", root_text,
@@ -498,25 +498,27 @@ else
     "${TASK}" write "${WORKING_DIR}" "${PROMPT_FILE}" "${REPLY_FILE}" "${LOG_FILE}" &
 fi
 AGENT_PID=$!
+# Defaults remain thirty probes one second apart; fixtures probe on a short
+# interval with enough attempts to bound hangs generously under load.
 if [[ -n "${FOLLOW_TO}" ]]; then
   if [[ "${AGENT_FAMILY}" == "codex" ]]; then
-    for ((turn_wait=0; turn_wait<30; turn_wait++)); do
+    for ((turn_wait=0; turn_wait<${PLAN_DELEGATE_SEAT_WAIT_ATTEMPTS:-30}; turn_wait++)); do
       if [[ -n "$(seat_record turn 2>/dev/null || true)" ]]; then
         break
       fi
       kill -0 "${AGENT_PID}" 2>/dev/null || break
       [[ "$(ps -o stat= -p "${AGENT_PID}" 2>/dev/null || true)" == Z* ]] && break
-      sleep 1
+      sleep "${PLAN_DELEGATE_SEAT_POLL_SECS:-1}"
     done
   fi
 elif [[ "${AGENT_FAMILY}" == "claude" || "${USE_CODEX_MESH}" == "1" ]]; then
-  for ((seat_wait=0; seat_wait<30; seat_wait++)); do
+  for ((seat_wait=0; seat_wait<${PLAN_DELEGATE_SEAT_WAIT_ATTEMPTS:-30}; seat_wait++)); do
     if seat_record record 2>/dev/null; then
       break
     fi
     kill -0 "${AGENT_PID}" 2>/dev/null || break
     [[ "$(ps -o stat= -p "${AGENT_PID}" 2>/dev/null || true)" == Z* ]] && break
-    sleep 1
+    sleep "${PLAN_DELEGATE_SEAT_POLL_SECS:-1}"
   done
 fi
 

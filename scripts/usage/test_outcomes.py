@@ -176,7 +176,7 @@ class OutcomeTests(OutcomeFixture):
         self.assertEqual(self.values(columns, "name"),
                          [("machine",), ("family",), ("parent_id",), ("agent_id",), ("folder",)])
         self.assertEqual(self.values(columns, "pk"), [(1,), (2,), (3,), (4,), (0,)])
-        self.assertEqual(cast(int, self.rows("PRAGMA user_version")[0][0]), 7)
+        self.assertEqual(cast(int, self.rows("PRAGMA user_version")[0][0]), 8)
         self.assertEqual(self.values(self.rows("PRAGMA index_info(turns_at)"), "name"), [("at",)])
 
     def test_claude_folder_uses_first_cwd_even_after_saved_cursor(self) -> None:
@@ -206,22 +206,19 @@ class OutcomeTests(OutcomeFixture):
         _ = self.collect()
         self.assertEqual(self.all_values(self.rows("SELECT * FROM folders")), before)
 
-    def test_version_six_store_replays_folders_once_and_preserves_turns(self) -> None:
+    def test_version_six_store_is_refused_without_replaying_folders_or_turns(self) -> None:
         path = self.claude_root / "project/folder-session.jsonl"
         _ = shutil.copyfile(FIXTURES / "updates/claude-folders.jsonl", path)
         _ = self.collect()
-        turns = self.all_values(self.rows("SELECT * FROM turns ORDER BY family, agent_id, turn_key"))
         with closing(sqlite3.connect(self.db_path)) as database, database:
-            _ = database.execute("DROP TABLE folders")
-            _ = database.execute("DROP INDEX turns_at")
             _ = database.execute("PRAGMA user_version = 6")
-        _ = self.collect()
-        self.assertEqual(cast(int, self.rows("PRAGMA user_version")[0][0]), 7)
-        self.assertEqual(self.values(self.rows("SELECT * FROM folders"), "agent_id", "folder"),
-                         [("folder-session", "/invented/first")])
-        self.assertEqual(self.all_values(self.rows("SELECT * FROM turns ORDER BY family, agent_id, turn_key")), turns)
         before = self.snapshot()
-        _ = self.collect()
+        result = self.cli(db=self.db_path)
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(result.stdout, "")
+        self.assertEqual(result.stderr, "collect: store version 6 predates file-named Codex keys; "
+                         + f"delete {self.db_path} and run the collector again to rebuild it\n")
+        self.assertEqual(cast(int, self.rows("PRAGMA user_version")[0][0]), 6)
         self.assertEqual(self.snapshot(), before)
 
     def test_outcome_schema_keeps_identity_and_source_event_without_finding_details(self) -> None:
@@ -549,7 +546,7 @@ class OutcomeTests(OutcomeFixture):
                 expected.append(offset)
             offset += len(line)
         codex = [row for row in edits if row["family"] == "codex"]
-        self.assertEqual([int(cast(str, row["edit_key"])) for row in codex], expected)
+        self.assertEqual(self.values(codex, "edit_key"), [(f"{path.name}:{offset}",) for offset in expected])
         self.assertEqual(self.values(codex, "at"), [("2026-10-11T00:01:05+00:00",), ("2026-10-11T00:01:06+00:00",)])
         last_turn = self.rows("SELECT max(at) AS at FROM turns WHERE agent_id = ?", (THREAD,))
         self.assertTrue(all(cast(str, row["at"]) > cast(str, last_turn[0]["at"]) for row in codex))
@@ -701,20 +698,20 @@ class MacOutcomeTests(OutcomeFixture):
                                            (str(self.mac_home / '.claude/projects/project/folder-session.jsonl'),)))
                 self.assert_family_state(run.output, "mac", "claude", "partial")
 
-    def test_version_six_mac_store_replays_folders_once_without_new_turns(self) -> None:
+    def test_version_six_mac_store_is_refused_without_reading_remote_sources(self) -> None:
         _ = self.add_folder_files(self.mac_home)
         _ = self.mac_collect()
-        turns = self.all_values(self.rows("SELECT * FROM turns ORDER BY machine, family, agent_id, turn_key"))
         with closing(sqlite3.connect(self.db_path)) as database, database:
-            _ = database.execute("DELETE FROM folders")
             _ = database.execute("PRAGMA user_version = 6")
-        replayed = self.mac_collect()
-        self.assertEqual(replayed.stream["folder_records"], 3)
-        self.assertEqual(len(self.rows("SELECT * FROM folders WHERE machine = 'mac'")), 2)
-        self.assertEqual(self.all_values(self.rows("SELECT * FROM turns ORDER BY machine, family, agent_id, turn_key")), turns)
-        repeated = self.mac_collect()
-        self.assertEqual(repeated.stream["folder_records"], 0)
-        self.assertEqual(repeated.stream["measurement_records"], 0)
+        before = self.snapshot()
+        result = self.cli(db=self.db_path, mac_pass="fixture")
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(result.stdout, "")
+        self.assertEqual(result.stderr, "collect: store version 6 predates file-named Codex keys; "
+                         + f"delete {self.db_path} and run the collector again to rebuild it\n")
+        self.assertEqual(cast(int, self.rows("PRAGMA user_version")[0][0]), 6)
+        self.assertEqual(self.snapshot(), before)
+        self.assertFalse((self.root / "ssh-report.json").exists())
 
     def test_mac_outcomes_and_lifecycle_equal_local_rows_without_remote_checkout(self) -> None:
         before = {str(path.relative_to(self.mac_home)): path.read_bytes()

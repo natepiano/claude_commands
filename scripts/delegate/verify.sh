@@ -2,21 +2,24 @@
 # verify.sh — The only build/test/lint commands a delegate may run.
 #
 # Work Orders list exact invocations of this script; the delegate composes no
-# cargo flags and makes no scope choices. Cargo's default target selection
-# compiles examples, so every dev-loop subcommand pins explicit targets
-# (--lib/--bins/--tests). `test` includes examples with test = true; other
-# examples are left out. Nothing below `final` uses --all-targets (mend
-# excepted, see `lint`); `final` is the plan-final full
-# gate, run by the unit director, never by a phase delegate.
+# cargo flags and makes no scope choices. `check` pins lib and bin targets;
+# `test` selects the package's test targets, including examples with test = true.
+# `lint` runs clippy with --all-targets --all-features to match CI, and mend
+# also uses --all-targets. It checks TOML formatting with taplo at the workspace
+# root. `example` runs clippy on one named example while
+# iterating. `final` is the plan-final full gate, run by the unit director,
+# never by a phase delegate.
 #
-# Package selection is always --workspace, with default features. Cargo
-# resolves features per invocation from the selected packages, so `-p <pkg>`
+# Package selection is always --workspace. Commands use default features unless
+# the Work Order supplies --features; `lint`'s clippy always uses all features.
+# Cargo resolves features per invocation from the selected packages, so `-p <pkg>`
 # gives every member its own feature set for bevy and the rest of the
 # dependency tree, and each set is a separate compile of that tree in the
 # shared target directory: nine to eleven copies of bevy_render across the
 # members, which evict one another under the sweep budget and rebuild in
 # minutes each time a phase moves to a new package. --workspace resolves one
-# set for the whole tree, so every command below reuses one compiled copy.
+# set for the whole tree, so commands with the same feature set reuse one
+# compiled copy. `lint`'s all-features clippy shares its set with the push gate.
 # The package argument still decides what runs and what is reported: nextest
 # filters to it with -E 'package(<pkg>)', and --features qualifies its list
 # with it. `test` builds the named package's test targets, plus workspace libs
@@ -31,7 +34,8 @@
 #
 # The lint stages — mend, fmt, clippy, doc — are gated by config/lint.conf (edit
 # it with /lint_config), so one switch silences a check across /clippy, the fix
-# pipeline, and every delegate phase. A phase runs all four; only the
+# pipeline, and every delegate phase. `lint` also always runs taplo fmt --check
+# at the workspace root, using its taplo.toml. A phase runs all five; only the
 # branch-wide style review is left to the plan-final gate. A gated-off check
 # prints a SKIPPED line and the command still exits 0. Scope is never
 # configurable: the target pinning and the single package selection above are
@@ -88,14 +92,18 @@
 #                                          build nothing
 #   verify.sh lint <package>               mend --fix, nightly fmt of the package
 #                                          and the members that differ from HEAD,
-#                                          workspace clippy (warnings denied), then
+#                                          workspace taplo fmt --check,
+#                                          workspace clippy on all targets with
+#                                          all features (warnings denied), then
 #                                          rustdoc on the members that differ
-#                                          — every stage gated by config/lint.conf
+#                                          — cargo stages gated by config/lint.conf;
+#                                          taplo always checks TOML formatting
 #   … [--features <list>]                  check, test, and lint accept one trailing
 #                                          `--features a,b` when the Work Order names
-#                                          it: code behind a non-default feature has
-#                                          no other route to a gate. Names without a
-#                                          `/` are qualified as <package>/<name>
+#                                          it. For lint, the list reaches mend and
+#                                          rustdoc; clippy always checks all features.
+#                                          Names without a `/` are qualified as
+#                                          <package>/<name>
 #   … --no-cache                           test and lint: run even when this
 #                                          exact call already passed (or lint
 #                                          failed) on this tree, a flake hunt;
@@ -118,7 +126,7 @@
 # release checks) use the lint CLI in that directory instead of this script.
 #
 # Exit codes: 2 = usage error or missing tooling; 3 = sandbox failure, re-run
-# the same command unsandboxed; anything else is the underlying cargo status.
+# the same command unsandboxed; anything else is the underlying tool status.
 
 set -euo pipefail
 BUILD_OVERRIDE_GUARD_DIR="${BASH_SOURCE[0]%/*}"
@@ -136,6 +144,7 @@ PY="${HOME}/.claude/scripts/lib/py"
 # shellcheck source=/dev/null
 source "$HOME/.claude/scripts/lint/invoke.sh"
 BUILD_TARGETS_SCRIPT="${BUILD_TARGETS_SCRIPT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../build_targets" && pwd)/build_targets.py}"
+LOCAL_RELEASE_WAIT_SCRIPT="${VERIFY_LOCAL_RELEASE_WAIT_SCRIPT:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/local_release_wait.py}"
 
 # A failed step may be a process killed by earlyoom or the kernel. Keep the
 # journal query here so tests can put a journalctl stub first on PATH.
@@ -443,6 +452,13 @@ require_member() {
     fi
 }
 
+require_taplo() {
+    if ! command -v taplo >/dev/null 2>&1; then
+        echo "taplo is required" >&2
+        exit 2
+    fi
+}
+
 example_features() {
     cargo metadata --no-deps --format-version 1 \
         | "$PY" -c "$EXAMPLE_FEATURES_PY" "$1" "$2"
@@ -548,9 +564,9 @@ compose_nextest_args() {
     # and the package's own bins and test-enabled targets. --bins
     # --tests linked every member's test executables, 78 in hana, to
     # run one package's; this links 4 (2026-10-04). The integration
-    # tests stay in, matching what the lint half compiles under
-    # clippy: without them a phase could lint an integration test,
-    # pass its gate, and checkpoint without ever running it.
+    # tests stay in so a phase runs the package's integration tests
+    # alongside its unit tests. The lint half's clippy checks all
+    # workspace targets with all features.
     take_test_targets
     NEXTEST_ARGS=(--no-fail-fast --workspace "${TEST_SELECTION[@]}" \
         -E "$TEST_FILTER" "${FEATURE_FLAGS[@]}")
@@ -673,6 +689,7 @@ LOOKUP_STATUS=0
 EXIT_STATUS=0
 FILTER_RUN=0
 BUILDLOG_MAC=""
+BUILDLOG_MAC_HOLDER=""
 BUILDLOG_MAC_REASON=""
 BUILDLOG_MAC_S=""
 export BUILDLOG_TARGET=""
@@ -732,7 +749,7 @@ note_event() {
     if [[ -n "${MEM_KILL_FILE:-}" && -f "${MEM_KILL_FILE}.stopped" ]]; then
         mem_kill_stopped=1
     fi
-    BUILDLOG_MEM_KILLS="$mem_kills" BUILDLOG_MEM_KILL_STOPPED="$mem_kill_stopped" BUILDLOG_TOKEN_WAIT_S="${TOKEN_WAIT_S:-0}" BUILDLOG_MAC="$BUILDLOG_MAC" BUILDLOG_MAC_REASON="$BUILDLOG_MAC_REASON" BUILDLOG_MAC_S="$BUILDLOG_MAC_S" "$PY" "$BUILDLOG_RECORD" call "$outcome" "$status" "$cached" "$wait" "$wall" \
+    BUILDLOG_MEM_KILLS="$mem_kills" BUILDLOG_MEM_KILL_STOPPED="$mem_kill_stopped" BUILDLOG_TOKEN_WAIT_S="${TOKEN_WAIT_S:-0}" BUILDLOG_MAC="$BUILDLOG_MAC" BUILDLOG_MAC_HOLDER="$BUILDLOG_MAC_HOLDER" BUILDLOG_MAC_REASON="$BUILDLOG_MAC_REASON" BUILDLOG_MAC_S="$BUILDLOG_MAC_S" "$PY" "$BUILDLOG_RECORD" call "$outcome" "$status" "$cached" "$wait" "$wall" \
         "$build" "$saved" "${SECONDS}" "$CMD" ${ARGS[@]+"${ARGS[@]}"} \
         </dev/null >/dev/null 2>&1 || true
 }
@@ -764,7 +781,7 @@ try_mac_test() {
     trap 'forward_mac_runner_signal TERM 143' TERM
     trap 'forward_mac_runner_signal HUP 129' HUP
     local runner_status result_text="" result_word="" result_reason=""
-    local result_seconds="" mac_words=0 line
+    local result_seconds="" result_holder="" mac_words=0 line
     local runner_args=(run --repo-root "$(git rev-parse --show-toplevel)"
         --package "$PKG" --call-id "$BUILDLOG_CALL_ID" --settings "$1")
     if [[ $# -gt 1 ]]; then
@@ -801,6 +818,7 @@ try_mac_test() {
                     ;;
                 reason=*) result_reason="${line#reason=}" ;;
                 seconds=*) result_seconds="${line#seconds=}" ;;
+                holder=*) result_holder="${line#holder=}" ;;
             esac
         done <<< "$result_text"
     fi
@@ -818,6 +836,7 @@ try_mac_test() {
         BUILDLOG_MAC=declined
         BUILDLOG_MAC_REASON=runner
         BUILDLOG_MAC_S=""
+        BUILDLOG_MAC_HOLDER=""
         export BUILDLOG_TARGET=""
         return
     fi
@@ -825,6 +844,10 @@ try_mac_test() {
     BUILDLOG_MAC="$result_word"
     BUILDLOG_MAC_REASON="$result_reason"
     BUILDLOG_MAC_S="$result_seconds"
+    BUILDLOG_MAC_HOLDER=""
+    if [[ "$result_word" == declined && "$result_reason" == busy ]]; then
+        BUILDLOG_MAC_HOLDER="$result_holder"
+    fi
     case "$result_word" in
         declined|lost)
             export BUILDLOG_TARGET=""
@@ -861,6 +884,7 @@ withdraw_local_demand() {
 # when the holder, reason or escalation message changes during this wait.
 register_routing_demand() {
     local admission=0
+    if build_hold_nothing_held; then return 0; fi
     python3 "$BUILD_TARGETS_SCRIPT" register-local --call-id "$BUILDLOG_CALL_ID" --pid $$ \
         2>"$HOLD_WAIT_DIR/routing-diagnostic" || admission=$?
     if ! cmp -s "$HOLD_WAIT_DIR/routing-diagnostic" "$HOLD_WAIT_DIR/last-routing-diagnostic"; then
@@ -895,7 +919,7 @@ route_test() {
         [[ "$eligibility" == eligible ]] || continue
         if [[ "$settings" == - ]]; then
             admission=0
-            python3 "$BUILD_TARGETS_SCRIPT" check-admission --call-id "$BUILDLOG_CALL_ID" || admission=$?
+            build_hold_check_admission || admission=$?
             case "$admission" in
                 0) return 0 ;;
                 10|12) continue ;;
@@ -928,7 +952,7 @@ route_test() {
             announced_reason="$BUILDLOG_MAC_REASON"
         fi
         ROUTING_WAIT_STARTED="$("$PY" -c 'import time; print(time.monotonic())')"
-        sleep "${BUILD_TARGETS_POLL_S:-15}" &
+        "$PY" "$LOCAL_RELEASE_WAIT_SCRIPT" "${BUILD_TARGETS_POLL_S:-15}" "$BUILDLOG_CALL_ID" &
         HOLD_WAITER_PID=$!
         wait "$HOLD_WAITER_PID"
         HOLD_WAITER_PID=""
@@ -1108,12 +1132,14 @@ if [[ "$CMD" == test ]]; then
     compose_nextest_args
     route_test
 fi
-python3 "$BUILD_TARGETS_SCRIPT" wait-local --call-id "$BUILDLOG_CALL_ID" --pid $$ &
-HOLD_WAITER_PID=$!
-HOLD_WAIT_STATUS=0
-wait "$HOLD_WAITER_PID" || HOLD_WAIT_STATUS=$?
-HOLD_WAITER_PID=""
-if [[ "$HOLD_WAIT_STATUS" != 0 ]]; then exit "$HOLD_WAIT_STATUS"; fi
+if ! build_hold_nothing_held; then
+    python3 "$BUILD_TARGETS_SCRIPT" wait-local --call-id "$BUILDLOG_CALL_ID" --pid $$ &
+    HOLD_WAITER_PID=$!
+    HOLD_WAIT_STATUS=0
+    wait "$HOLD_WAITER_PID" || HOLD_WAIT_STATUS=$?
+    HOLD_WAITER_PID=""
+    if [[ "$HOLD_WAIT_STATUS" != 0 ]]; then exit "$HOLD_WAIT_STATUS"; fi
+fi
 trap - INT TERM HUP
 
 # Open a progress window for the duration of this run when a delegate session is
@@ -1137,8 +1163,18 @@ BOARD_HELPER="${HOME}/.claude/scripts/delegate/board.sh"
 BOARD_DIR="${PLAN_DELEGATE_BOARD_DIR:-}"
 BOARD_SLOT="${PLAN_DELEGATE_TEAM_ROLE:-}"
 TOKEN_HELD=0
+token_wait_clock() {
+    # Tests can advance a disposable clock while acquisition still blocks on
+    # the real board. Normal calls retain Bash's elapsed-seconds clock.
+    if [[ -n "${PLAN_DELEGATE_TOKEN_CLOCK_FILE:-}" ]]; then
+        read -r TOKEN_CLOCK_NOW < "$PLAN_DELEGATE_TOKEN_CLOCK_FILE"
+    else
+        TOKEN_CLOCK_NOW=$SECONDS
+    fi
+}
 if [[ -n "${BOARD_DIR}" && -n "${BOARD_SLOT}" && -f "${BOARD_HELPER}" ]]; then
-    TOKEN_WAIT_STARTED=$SECONDS
+    token_wait_clock
+    TOKEN_WAIT_STARTED=$TOKEN_CLOCK_NOW
     if bash "${BOARD_HELPER}" acquire "${BOARD_DIR}" "${BOARD_SLOT}" cargo \
         --pid $$ --hold 3600 --wait 1800 >/dev/null 2>&1; then
         TOKEN_HELD=1
@@ -1146,7 +1182,8 @@ if [[ -n "${BOARD_DIR}" && -n "${BOARD_SLOT}" && -f "${BOARD_HELPER}" ]]; then
         echo "verify.sh: waited for the cargo token and did not get it." >&2
         exit 1
     fi
-    TOKEN_WAIT_S=$(( SECONDS - TOKEN_WAIT_STARTED ))
+    token_wait_clock
+    TOKEN_WAIT_S=$(( TOKEN_CLOCK_NOW - TOKEN_WAIT_STARTED ))
 fi
 
 # Fork before starting each step. The child creates its own session, records
@@ -1335,11 +1372,13 @@ case "$CMD" in
         shift
         take_features "$@"
         require_member "$PKG"
-        # Order: mend rewrites first, fmt formats what mend wrote, then clippy
-        # and rustdoc read the settled tree. Every stage is gated by lint.conf.
-        # mend is the one stage below `final` that passes --all-targets: it
-        # needs the test and example targets to see every import and
-        # visibility site. It covers the workspace like the other stages, so
+        require_taplo
+        # Order: mend rewrites first, fmt formats what mend wrote, then taplo
+        # checks TOML before clippy and rustdoc read the settled tree.
+        # Cargo stages are gated by lint.conf; the Taplo check always runs.
+        # mend passes --all-targets because it needs the test and example
+        # targets to see every import and visibility site. It covers the
+        # workspace like the other stages, so
         # --fix can also rewrite a member the phase did not edit, when this
         # phase's change left an item there unused or over-visible.
         if lint_config_enabled mend; then
@@ -1379,7 +1418,25 @@ case "$CMD" in
             fi
         done <<< "$FMT_MEMBERS"
         fmt_cargo "${FMT_SCOPE[@]}"
-        invoke_clippy --workspace --lib --bins --tests "${FEATURE_FLAGS[@]}"
+        # Cargo's workspace root can differ from the caller's directory.
+        # Run there so Taplo uses the same config and scope as the push gate.
+        TAPLO_WORKSPACE_ROOT="$(cargo metadata --no-deps --format-version 1 \
+            | "$PY" -c 'import json, sys; print(json.load(sys.stdin)["workspace_root"])')"
+        if (cd "$TAPLO_WORKSPACE_ROOT" && run taplo fmt --check); then
+            :
+        else
+            taplo_status=$?
+            if (( taplo_status == 101 )); then
+                if [[ "$(uname)" == Darwin ]]; then
+                    echo "verify.sh: taplo panicked; the macOS sandbox does this. Re-run the same command with the sandbox disabled." >&2
+                    exit 3
+                fi
+                echo "verify.sh: taplo panicked; this is a tooling failure." >&2
+                exit 2
+            fi
+            exit "$taplo_status"
+        fi
+        invoke_clippy --workspace --all-targets --all-features
         # Found after mend, so a member its --fix rewrote is documented too.
         FEATURE_MEMBER=""
         if [[ ${#FEATURE_FLAGS[@]} -gt 0 ]]; then
@@ -1407,8 +1464,8 @@ case "$CMD" in
         PKG="${1:?verify.sh example <package> <name>}"
         NAME="${2:?verify.sh example <package> <name>}"
         FEATURES="$(example_features "$PKG" "$NAME")"
-        # clippy, not check: `lint` never sees an example, so a check here let
-        # lint errors in a changed example reach the merge branch twice.
+        # Clippy gives focused lint feedback on one changed example while
+        # iterating; the full `lint` command checks every workspace target.
         # Example names are unique across the workspace, so --workspace
         # --example builds this one example under the workspace's feature
         # resolution. A required feature that resolution leaves off still

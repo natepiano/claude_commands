@@ -10,11 +10,20 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from datetime import datetime, timedelta, timezone
+from unittest import mock
 from pathlib import Path
-from typing import cast, override
+from typing import TypedDict, cast, override
 
 
 SCRIPT = Path(__file__).with_name("update_registration.py")
+
+
+class QuestionRegistration(TypedDict):
+    time: str
+    text: str
+
+
 NOTIFIER = '''#!__PYTHON__
 import json
 import os
@@ -43,6 +52,11 @@ elif args[0] == "stop":
 else:
     raise SystemExit(2)
 '''
+
+
+def setUpModule() -> None:
+    """The times these tests expect are Pacific; the user's zone setting must not change them."""
+    unittest.enterModuleContext(mock.patch.dict(os.environ, {"USER_ZONE": "America/Los_Angeles"}))
 
 
 class RegistrationTests(unittest.TestCase):
@@ -127,7 +141,7 @@ class RegistrationTests(unittest.TestCase):
     def copied_command(self) -> Path:
         tree = Path(tempfile.mkdtemp(prefix="command-copy-", dir=self.root))
         _ = shutil.copytree(SCRIPT.parent, tree / "scripts/production")
-        for name in ("build_hold", "lint", "mac_test", "message", "usage", "whoami"):
+        for name in ("build_hold", "build_targets", "buildlog", "herdr", "lib", "lint", "mac_test", "message", "usage", "whoami"):
             _ = shutil.copytree(SCRIPT.parent.parent / name, tree / "scripts" / name)
         hooks = tree / "scripts/hooks"
         hooks.mkdir(parents=True)
@@ -230,8 +244,56 @@ with patch.object(agents_log, 'append', side_effect=RuntimeError('recording fail
         self.assertEqual(again.returncode, 0, again.stdout + again.stderr)
         # A re-register retargets the timer and stops it again, so it stays stopped.
         self.assertEqual([call[0] for call in self.notifier_calls()[before + len(calls):]],
-                         ["new", "stop", "status", "status"])
+                         ["status", "new", "stop", "status", "status"])
         self.assertEqual((self.state / "instance-showrunner-example").read_text(encoding="utf-8"), "stopped")
+
+    def without_updates_line(self) -> None:
+        doc = self.doc.read_text(encoding="utf-8")
+        _ = self.doc.write_text(doc.replace("- **Updates:** every 15 minutes\n", ""), encoding="utf-8")
+        _ = self.git("commit", "-qam", "no Updates line")
+
+    def test_a_new_production_with_no_updates_line_starts_quiet(self) -> None:
+        self.without_updates_line()
+        switch = self.state / "showrunner/footers-off/example"
+
+        first = self.run_command("register")
+
+        self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
+        self.assertIn("register: ok — showrunner-example on demand: no scheduled dailies", first.stdout)
+        self.assertIn("footer: ok — off — new production; /showrunner:footer on turns it on", first.stdout)
+        self.assertEqual((self.state / "instance-showrunner-example").read_text(encoding="utf-8"), "stopped")
+        # Off on purpose: an empty switch, which a conversation pause's resume leaves off.
+        self.assertEqual(switch.read_text(encoding="utf-8"), "")
+
+    def test_a_restart_keeps_the_footer_it_has_on_or_off(self) -> None:
+        switch = self.state / "showrunner/footers-off/example"
+        first = self.run_command("register")
+        self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
+        self.assertTrue(switch.exists())
+        switch.unlink()
+
+        turned_on = self.run_command("register")
+
+        self.assertEqual(turned_on.returncode, 0, turned_on.stdout + turned_on.stderr)
+        self.assertNotIn("footer:", turned_on.stdout)
+        self.assertFalse(switch.exists())
+        _ = switch.write_text("", encoding="utf-8")
+        kept_off = self.run_command("register")
+        self.assertEqual(kept_off.returncode, 0, kept_off.stdout + kept_off.stderr)
+        self.assertEqual(switch.read_text(encoding="utf-8"), "")
+
+    def test_a_line_asking_for_a_schedule_still_schedules(self) -> None:
+        doc = self.doc.read_text(encoding="utf-8")
+        _ = self.doc.write_text(doc.replace("every 15 minutes", "every 20 minutes"), encoding="utf-8")
+        _ = self.git("commit", "-qam", "every 20 minutes")
+
+        result = self.run_command("register")
+
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        updates = next(call for call in self.notifier_calls() if call[:2] == ["new", "showrunner-example"])
+        self.assertEqual(updates[updates.index("--every") + 1], "20")
+        self.assertNotIn(["stop", "showrunner-example"], self.notifier_calls())
+        self.assertIn("next_due", result.stdout)
 
     def test_register_requires_the_environment_session_id(self) -> None:
         without_id = {key: value for key, value in self.env.items() if key != "CLAUDE_CODE_SESSION_ID"}
@@ -362,6 +424,43 @@ with patch.object(agents_log, 'append', side_effect=RuntimeError('recording fail
         cleared = self.run_command("footer", "--state", str(state))
         self.assertEqual(cleared.returncode, 0, cleared.stdout + cleared.stderr)
         self.assertEqual(json.loads(outstanding.read_text(encoding="utf-8")), [])
+
+    def test_footer_records_only_new_questions_and_prunes_history_older_than_two_days(self) -> None:
+        outstanding = self.outstanding()
+        _ = outstanding.write_text(json.dumps([{"since": "2026-10-01T08:00", "text": "Choose a compiler."}]))
+        now = datetime.now(timezone.utc)
+        history = outstanding.with_suffix(".history.jsonl")
+        records = [QuestionRegistration(time=(now - timedelta(hours=49)).isoformat(), text="Expired question?"),
+                   QuestionRegistration(time=(now - timedelta(hours=1)).isoformat(), text="Recent question?")]
+        _ = history.write_text("\n".join(json.dumps(item) for item in records) + "\n")
+        state = self.root / "judgment.json"
+        _ = state.write_text(json.dumps({"open_for_user": ["Choose a compiler.", "Approve the release."]}))
+        for _ in range(2):
+            result = self.run_command("footer", "--state", str(state))
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        saved = [cast(QuestionRegistration, json.loads(line)) for line in history.read_text().splitlines()]
+        self.assertEqual([item["text"] for item in saved], ["Recent question?", "Approve the release."])
+        self.assertEqual(saved[0], records[1])
+        stamp = datetime.fromisoformat(saved[1]["time"])
+        self.assertIsNotNone(stamp.tzinfo)
+        self.assertGreaterEqual(stamp, now)
+
+    def test_footer_keeps_registration_history_when_the_question_closes(self) -> None:
+        outstanding = self.outstanding()
+        state = self.root / "judgment.json"
+        _ = state.write_text(json.dumps({"open_for_user": ["Would you retry the build?"]}))
+        opened = self.run_command("footer", "--state", str(state))
+        self.assertEqual(opened.returncode, 0, opened.stdout + opened.stderr)
+        history = outstanding.with_suffix(".history.jsonl")
+        before = history.read_bytes()
+        _ = state.write_text(json.dumps({"open_for_user": []}))
+        closed = self.run_command("footer", "--state", str(state))
+        self.assertEqual(closed.returncode, 0, closed.stdout + closed.stderr)
+        self.assertEqual(json.loads(outstanding.read_text()), [])
+        self.assertEqual(history.read_bytes(), before)
+        saved = cast(QuestionRegistration, json.loads(before.decode().strip()))
+        self.assertEqual(saved["text"], "Would you retry the build?")
+        self.assertIsNotNone(datetime.fromisoformat(saved["time"]).tzinfo)
 
     def test_footer_rejects_bad_deferred_item_before_writing_outstanding(self) -> None:
         outstanding = self.outstanding()

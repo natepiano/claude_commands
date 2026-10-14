@@ -27,6 +27,11 @@ from typing import TypedDict, cast
 
 import store
 
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
+from user_zone import user_zone  # noqa: E402
+
 SSH_OPTIONS = ["-o", "BatchMode=yes", "-o", "ConnectTimeout=10"]
 REMOTE_ROOT = ".local/state/buildlog/"
 REACH_TIMEOUT_S = 30
@@ -147,9 +152,9 @@ def sync_lock(wait_for_running_sync: bool = False) -> Generator[None]:
 
 
 def sync_time(last: str, now: datetime) -> str:
-    """Local time with its zone, and the date too when it is not today."""
-    at = datetime.fromisoformat(last).astimezone()
-    return at.strftime("%H:%M %Z" if at.date() == now.astimezone().date() else "%Y-%m-%d %H:%M %Z")
+    """The time in the user's zone with its label, and the date too when it is not today."""
+    at = datetime.fromisoformat(last).astimezone(user_zone())
+    return at.strftime("%H:%M %Z" if at.date() == now.astimezone(user_zone()).date() else "%Y-%m-%d %H:%M %Z")
 
 
 def pause(why: str) -> int:

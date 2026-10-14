@@ -10,6 +10,8 @@ import sys
 from pathlib import Path
 from typing import NamedTuple, cast
 
+import showrunners
+import tidy_wrapped
 import unit_lookup
 from add_unit import Production, Refusal, cell_value, read_production, unit_table
 from merge_checkpoint import (CodeCheckpoint, MacCheckout, MergeEntry, NoMerge, NoPromotion,
@@ -106,6 +108,9 @@ def units(lines: list[str], production: Production) -> tuple[UnitRow, ...]:
         row = {heading: cell_value(cell) for heading, cell in cells.items()}
         if not all(heading in row for heading in ("Unit", "Plan", "Worktree", "Branch", "Port", "Owns")):
             raise LifecycleStop("input", "failed", f"invalid Units row: {cells}")
+        # A permanent unit outlives the production: wrap neither waits on it nor retires it.
+        if row["Plan"] == "permanent":
+            continue
         plan = Path(row["Plan"]).expanduser()
         parsed.append(UnitRow(row["Unit"], plan if plan.is_absolute() else production.checkout / plan,
                               Path(row["Worktree"]).expanduser(), row["Branch"]))
@@ -326,12 +331,55 @@ def retire_reservations(worktree: Path) -> None:
             report("retire", "ok", f"released reservation {reservation_id} for {worktree}")
 
 
+def refuse_running_children(slug: str) -> None:
+    """Hold a wrap while a lower production's showrunner still runs: it would be left reporting to nothing."""
+    try:
+        running = [child for child in showrunners.stored_children(slug) if showrunners.current_address(child)]
+    except OSError as error:
+        raise LifecycleStop("children", "failed", str(error)) from error
+    if running:
+        raise LifecycleStop("children", "held", f"{', '.join(running)} still report{'s' if len(running) == 1 else ''} "
+                            + f"to {slug}; wrap each first, or detach it with `showrunners.py detach <child>`")
+
+
+def release_edges(slug: str) -> None:
+    """Drop the wrapped production's place in the showrunner tree, and tell each production it reported to or had."""
+    released = showrunners.release_edges(slug)
+    if not released.parent and not released.orphans:
+        report("tree", "ok", "no parent and no child showrunners")
+        return
+    told: list[str] = []
+    if released.parent:
+        told += showrunners.tell_others({released.parent: f"{slug} wrapped, so it no longer reports to you."},
+                                        f"showrunner-tree:{slug}")
+    for child in released.orphans:
+        told += showrunners.tell_others({child: f"{slug} wrapped, so {child} reports to no one: it is a root now."},
+                                        f"showrunner-tree:{child}")
+    above = f"detached from {released.parent}" if released.parent else ""
+    below = f"{', '.join(released.orphans)} now root{'' if len(released.orphans) == 1 else 's'}" if released.orphans else ""
+    report("tree", "ok", "; ".join(part for part in (above, below, *told) if part))
+
+
+def tidy_state(slug: str) -> None:
+    """Delete the production's own footer, pause, open-question and state files; a failure keeps them for the sweep."""
+    try:
+        removed = tidy_wrapped.tidy(slug)
+    except (tidy_wrapped.TidyRefused, OSError) as error:
+        report("tidy", "kept", f"{error}; tidy_wrapped.py removes them once the doc says wrapped")
+        return
+    names = ", ".join(str(path.relative_to(tidy_wrapped.STATE_DIR)) + ("/" if path.parent == tidy_wrapped.STATE_DIR else "")
+                      for path in removed)
+    report("tidy", "ok", f"removed {names}" if removed else "no state files")
+
+
 def wrap(production: Production, lines: list[str], no_ci: bool,
          ci_green: CommitVerdict | VerdictMissing,
          smoke_passed: CommitVerdict | VerdictMissing, done: tuple[str, ...]) -> None:
     status = doc_status(lines)
     if isinstance(status, ProductionPlanned):
         raise LifecycleStop("wrap", "held", "production must be running")
+    if isinstance(status, ProductionRunning):
+        refuse_running_children(production.slug)
     state = checkout_ready(production)
     if isinstance(state, PlanPending):
         raise LifecycleStop("wrap", "held", "merge branch does not exist")
@@ -390,6 +438,8 @@ def wrap(production: Production, lines: list[str], no_ci: bool,
         # The update timer is the one record of the showrunner, so removing it unregisters it.
         _ = command("notifier", production.checkout, str(notifier), "remove", f"showrunner-{production.slug}")
         report("notifier", "ok", "update timer removed")
+        release_edges(production.slug)
+        tidy_state(production.slug)
         archived = command(
             "phase-notes",
             production.checkout,

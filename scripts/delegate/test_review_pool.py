@@ -11,9 +11,13 @@ import sys
 import tempfile
 import time
 import unittest
+from unittest.mock import patch
 from pathlib import Path
 from typing import cast, override
 
+
+from scripts.delegate import review_pool
+from scripts.delegate.wait_for_test_state import wait_until
 
 SCRIPT = Path(__file__).with_name("review_pool.py")
 
@@ -74,8 +78,10 @@ temporary = events / (str(os.getpid()) + ".tmp")
 temporary.write_text(json.dumps(event))
 temporary.rename(events / (str(os.getpid()) + "-" + str(time.time_ns()) + ".json"))
 gate = setting.get("gate", "")
-while gate and not Path(gate).exists():
-    time.sleep(0.01)
+if gate:
+    sys.path.insert(0, os.environ["POOL_TEST_HELPER_DIR"])
+    from wait_for_test_state import wait_for_file
+    wait_for_file(Path(gate))
 if previous < setting.get("failures", 10**9):
     failure = setting.get("exit", 0)
     if failure:
@@ -117,6 +123,7 @@ class ReviewPoolTests(unittest.TestCase):
 
     @override
     def setUp(self) -> None:
+        self.enterContext(patch.dict(os.environ, {"PLAN_DELEGATE_SYNC_WRITES": "0"}))
         self.temporary = tempfile.TemporaryDirectory()
         self.root = Path(self.temporary.name)
         self.pool = self.root / "state" / "production"
@@ -138,11 +145,32 @@ class ReviewPoolTests(unittest.TestCase):
             gate.touch()
         for process in self.processes:
             try:
-                _ = process.communicate(timeout=5)
+                _ = process.communicate(timeout=300)
             except subprocess.TimeoutExpired:
                 process.kill()
-                _ = process.communicate(timeout=5)
+                _ = process.communicate(timeout=300)
         self.temporary.cleanup()
+
+    def test_pool_write_syncs_by_default_and_flushes_without_sync_for_disposable_state(self) -> None:
+        production = review_pool.ProductionPool(self.pool)
+
+        def flushed(descriptor: int) -> None:
+            self.assertGreaterEqual(descriptor, 0)
+            temporary, = self.pool.glob(".pool-*")
+            self.assertTrue(temporary.read_text())
+
+        for durable in (True, False):
+            with self.subTest(durable=durable), patch.dict(os.environ), patch.object(os, "fsync", side_effect=flushed) as sync:
+                if durable:
+                    _ = os.environ.pop("PLAN_DELEGATE_SYNC_WRITES", None)
+                else:
+                    os.environ["PLAN_DELEGATE_SYNC_WRITES"] = "0"
+                with production.locked() as pool:
+                    pool.generation += 1
+                    generation = pool.generation
+                self.assertEqual(sync.call_count, int(durable))
+                self.assertEqual(json.loads((self.pool / "pool.json").read_text())["generation"], generation)
+                self.assertEqual(list(self.pool.glob(".pool-*")), [])
 
     def environment(self) -> dict[str, str]:
         environment = os.environ.copy()
@@ -151,6 +179,7 @@ class ReviewPoolTests(unittest.TestCase):
             "REVIEW_POOL_MESH": str(self.stub),
             "POOL_STUB_CONTROL": str(self.control_file),
             "POOL_STUB_EVENTS": str(self.events_dir),
+            "POOL_TEST_HELPER_DIR": str(SCRIPT.parent),
         })
         return environment
 
@@ -160,7 +189,7 @@ class ReviewPoolTests(unittest.TestCase):
     def run_pool(self, *arguments: str) -> subprocess.CompletedProcess[str]:
         return subprocess.run(
             self.command(*arguments), env=self.environment(), capture_output=True,
-            text=True, check=False, timeout=10,
+            text=True, check=False, timeout=300,
         )
 
     def succeed(self, *arguments: str) -> str:
@@ -177,7 +206,7 @@ class ReviewPoolTests(unittest.TestCase):
         return process
 
     def finish(self, process: subprocess.Popen[str]) -> tuple[int, str, str]:
-        output, errors = process.communicate(timeout=10)
+        output, errors = process.communicate(timeout=300)
         assert process.returncode is not None
         return process.returncode, output.strip(), errors
 
@@ -209,15 +238,15 @@ class ReviewPoolTests(unittest.TestCase):
         self.assertEqual(len(issued), len(set(issued)), issued)
 
     def await_event(self, verb: str, name: str, process: subprocess.Popen[str]) -> dict[str, object]:
-        deadline = time.monotonic() + 10
-        while time.monotonic() < deadline:
-            for event in self.events(verb):
-                if event["name"] == name:
-                    return event
+        def ready() -> bool:
+            if any(event["name"] == name for event in self.events(verb)):
+                return True
             if process.poll() is not None:
                 self.fail(f"process exited before {verb}:{name}: {self.finish(process)}")
-            time.sleep(0.01)
-        self.fail(f"no {verb}:{name} event before deadline")
+            return False
+
+        wait_until(ready, self.events_dir, processes=(process,))
+        return next(event for event in self.events(verb) if event["name"] == name)
 
     def state(self) -> dict[str, object]:
         return parse_object((self.pool / "pool.json").read_text(encoding="utf-8"))
@@ -350,6 +379,47 @@ class ReviewPoolTests(unittest.TestCase):
         self.assertEqual(self.events("end"), [])
         self.assertEqual(old_file.read_bytes(), old_content)
 
+    def test_unit_memory_prints_only_the_named_unit_file_without_added_newline(self) -> None:
+        memory = self.pool / "memory"
+        memory.mkdir(parents=True)
+        content = "## Unit memory\n2026-10-12 — Source: finding 2. Preserve café."
+        _ = (memory / "unit.md").write_text(content, encoding="utf-8")
+        _ = (memory / "other.md").write_text("Another unit.", encoding="utf-8")
+        _ = (memory / "repository.md").write_text("Repository memory.", encoding="utf-8")
+        result = self.run_pool("unit-memory", "--unit", "unit")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, content)
+        self.assertEqual(result.stderr, "")
+        self.assertFalse((self.pool / "pool.json").exists())
+        self.assertEqual(self.events(), [])
+
+    def test_unit_memory_is_empty_when_the_file_is_absent(self) -> None:
+        result = self.run_pool("unit-memory", "--unit", "unit")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, "")
+        self.assertEqual(result.stderr, "")
+        self.assertFalse(self.pool.exists())
+
+    def test_unit_memory_refuses_a_unit_outside_the_memory_directory(self) -> None:
+        result = self.run_pool("unit-memory", "--unit", "../other")
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("unit must name one memory file", result.stderr)
+        self.assertEqual(result.stdout, "")
+
+    def test_closure_keeps_leased_memory_hash_after_repository_memory_changes(self) -> None:
+        old_hash = self.prime()
+        broad = self.allocate()
+        self.release(str(broad["reviewer"]))
+        _ = self.instructions.write_text("Standing contract with new repository memory.\n", encoding="utf-8")
+        new_hash = self.prime()
+        self.assertNotEqual(new_hash, old_hash)
+        closure = self.allocate(review_pass="2", lens="")
+        self.assertEqual(closure["reviewer"], broad["reviewer"])
+        self.assertEqual(closure["prime_hash"], old_hash)
+        self.assertEqual(closure["lease_ordinal"], 2)
+        self.assertEqual(len(self.events("fork")), 1)
+        self.assertTrue((self.pool / "prime" / f"{old_hash}.md").exists())
+
     def test_prime_failure_does_not_publish_a_template(self) -> None:
         self.control({"prime": {"exit": 1}})
         result = self.run_pool("prime", "--type", "code", "--instructions-file", str(self.instructions))
@@ -433,7 +503,7 @@ class ReviewPoolTests(unittest.TestCase):
 
     def test_dead_owner_is_idle_and_last_allocated_is_refreshed(self) -> None:
         child = subprocess.Popen([sys.executable, "-c", "pass"])
-        _ = child.wait(timeout=5)
+        _ = child.wait(timeout=300)
         self.seed({"code1": {**self.idle("unit"), "busy_pid": child.pid, "last_allocated": 0}})
         self.assertEqual(self.allocate()["reviewer"], "code1")
         self.assertNotEqual(self.reviewer("code1")["last_allocated"], 0)
@@ -660,7 +730,7 @@ class ReviewPoolTests(unittest.TestCase):
 
     def test_end_lease_and_health_remove_reservations_with_dead_owners(self) -> None:
         child = subprocess.Popen([sys.executable, "-c", "pass"])
-        _ = child.wait(timeout=5)
+        _ = child.wait(timeout=300)
         for arguments in (("end-lease", "--unit", "unit"), ("health",)):
             with self.subTest(verb=arguments[0]):
                 self.seed({"code1": {
@@ -691,7 +761,7 @@ class ReviewPoolTests(unittest.TestCase):
     def test_removed_dead_reservation_does_not_free_its_issued_reviewer_name(self) -> None:
         self.seed({})
         child = subprocess.Popen([sys.executable, "-c", "pass"])
-        _ = child.wait(timeout=5)
+        _ = child.wait(timeout=300)
         gate = self.hold("fork:code1")
         arguments = self.allocation_args()
         arguments[arguments.index("--pid") + 1] = str(child.pid)
@@ -772,6 +842,36 @@ class ReviewPoolTests(unittest.TestCase):
         self.assertNotEqual(replacement["mesh_dir"], original["mesh_dir"])
         self.assertEqual(self.event_mesh_dir(self.events("stop")[0]), Path(str(original["mesh_dir"])))
         self.assert_fork_names_are_unique_per_generation()
+
+    def test_stop_clears_ui_adoption_and_prime_keeps_the_new_pool_in_shadow(self) -> None:
+        _ = self.prime("ui")
+        adoption = self.pool / "ui_adopted"
+        adoption.touch()
+        result = self.run_pool("stop")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(adoption.exists())
+        self.assertIn("review_pool: ui adoption cleared", result.stderr)
+        _ = self.prime("ui")
+        self.assertFalse(adoption.exists())
+        self.assertTrue(json_object(self.state()["templates"])["ui"])
+
+    def test_failed_stop_still_clears_ui_adoption(self) -> None:
+        self.seed({})
+        adoption = self.pool / "ui_adopted"
+        adoption.touch()
+        self.control({"stop": {"exit": 1}})
+        result = self.run_pool("stop")
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertFalse(adoption.exists())
+        self.assertIn("review_pool: ui adoption cleared", result.stderr)
+        self.assertTrue(self.state().get("stopping", False))
+
+    def test_stop_without_ui_adoption_does_not_report_an_adoption_change(self) -> None:
+        self.seed({})
+        result = self.run_pool("stop")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("ui adoption cleared", result.stderr)
+        self.assertFalse((self.pool / "ui_adopted").exists())
 
     def test_stop_during_fork_drops_late_thread_instead_of_repopulating_pool(self) -> None:
         self.seed({})
@@ -944,6 +1044,18 @@ class ReviewPoolTests(unittest.TestCase):
         self.seed({"code1": {**self.idle("unit"), "last_allocated": time.time() - 2 * 3600}})
         _ = self.succeed("health", "--stale-hours", "1")
         self.assertIsNone(self.reviewer("code1")["lease"])
+
+
+class UIStandingPromptTests(unittest.TestCase):
+    def test_ui_standing_prompt_defines_report_and_measurement_without_rule_reads(self) -> None:
+        prompt = (SCRIPT.parents[2] / "config" / "review_pool" / "ui.md").read_text(encoding="utf-8")
+        self.assertRegex(prompt, r"Verdict:\s*pass\b")
+        self.assertRegex(prompt, r"Verdict:\s*(?:pass\s*\|\s*)?defects\b")
+        self.assertIn("| Shot | Rule | Defect | Fix |", prompt)
+        self.assertIn("measure_text.py", prompt)
+        instructions = " ".join(prompt.split())
+        self.assertNotIn("Follow `~/.claude/commands/ux_eval.md`", instructions)
+        self.assertNotIn("Read a rule's full text", instructions)
 
 
 if __name__ == "__main__":

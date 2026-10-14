@@ -19,11 +19,14 @@ import uuid
 from collections import defaultdict
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
-from datetime import UTC, datetime, tzinfo
+from datetime import UTC, datetime
 from functools import cache
 from pathlib import Path
 from typing import NamedTuple, NoReturn, TypedDict, cast
-from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+
+if not __package__:
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from scripts.lib.user_zone import user_zone  # noqa: E402
 
 
 SCHEMA_VERSION = 1
@@ -58,6 +61,23 @@ STATE_FILENAME = "progress_history_state.json"
 # marker is presentation-only: it opens no pass, and `findings.py` counts pass
 # events, so convergence never sees it.
 ARMED_REVIEW_KEY = "early_review"
+# A phase stays open until its own finish-phase, however many phases start after
+# it: a unit can run Phase 18 while Phase 6's seats are still working. State
+# holds the most recently started open phase under `phase`, which every reader
+# that needs "the open phase" uses, and the older open ones here, oldest first.
+OPEN_PHASES_KEY = "open_phases"
+# The state that describes the current phase alone. A phase a newer one
+# displaces keeps its own copy under PARKED_KEY, and gets it back when the newer
+# one finishes and it is current again.
+PHASE_SCOPED_KEYS = (
+    ARMED_REVIEW_KEY,
+    "phase_last_percent",
+    "phase_percent_started_at",
+    "last_percent",
+    "percent_started_at",
+    "pending_calibration",
+)
+PARKED_KEY = "parked"
 PROJECT_STARTED_PATTERN = re.compile(
     r"^[ \t]*-[ \t]+\*\*Project started:\*\*[ \t]*(?P<value>.+?)[ \t]*$",
     re.MULTILINE,
@@ -82,6 +102,8 @@ PHASE_STATUS_PATTERN = re.compile(r"·[ \t]*status:[ \t]*(?P<status>todo|done)\b
 # section inside one. A real phase heading always names a title after an
 # em-dash separator.
 PHASE_TITLE_PATTERN = re.compile(r"^[ \t]*[—–-][ \t]*\S")
+DEPENDS_ON_PATTERN = re.compile(r"^\*\*Depends on:\*\*[ \t]*(?P<list>[^\n]*)$", re.MULTILINE)
+BLOCKED_BY_PATTERN = re.compile(r"^\*\*Blocked by:\*\*[ \t]*(?P<gate>G\d+)", re.MULTILINE)
 
 # A percentage is an estimate; a stage is a fact. These ceilings keep an
 # optimistic estimate from claiming a gate that has not run — the failure mode
@@ -175,6 +197,10 @@ class PlanPhase(TypedDict):
     id: str
     title: str
     done: bool
+    # The phases its `**Depends on:**` line names; None when the line is absent.
+    depends_on: list[str] | None
+    # The gate its `**Blocked by:**` line names; empty when none.
+    blocked_by: str
 
 
 class EtaBand(NamedTuple):
@@ -356,17 +382,6 @@ def _refuse_eta(message: str) -> NoReturn:
     raise SystemExit(2)
 
 
-def _process_timezone() -> tzinfo:
-    configured = os.environ.get("TZ")
-    if configured:
-        try:
-            return ZoneInfo(configured)
-        except ZoneInfoNotFoundError:
-            pass
-    detected = datetime.now().astimezone().tzinfo
-    return detected if detected is not None else UTC
-
-
 def _local_eta_epoch(value: str, option: str) -> float:
     layout = "%Y-%m-%dT%H:%M"
     try:
@@ -375,7 +390,7 @@ def _local_eta_epoch(value: str, option: str) -> float:
         _refuse_eta(f"{option} must use YYYY-MM-DDTHH:MM")
     if parsed.strftime(layout) != value:
         _refuse_eta(f"{option} must use YYYY-MM-DDTHH:MM")
-    zone = _process_timezone()
+    zone = user_zone()
     epoch = parsed.replace(tzinfo=zone).timestamp()
     if datetime.fromtimestamp(epoch, zone).strftime(layout) != value:
         _refuse_eta(f"{option} is a time the local clock skips")
@@ -474,7 +489,9 @@ def _append_event(state: dict[str, object], event: dict[str, object]) -> None:
         fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
         _ = handle.write(line)
         handle.flush()
-        os.fsync(handle.fileno())
+        # Disposable fixtures may omit disk durability; production syncs by default.
+        if os.environ.get("PLAN_DELEGATE_SYNC_WRITES", "1") != "0":
+            os.fsync(handle.fileno())
         fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
 
@@ -636,7 +653,8 @@ def _plan_phase_details(plan_path: Path) -> tuple[list[PlanPhase], list[str]]:
     phases: list[PlanPhase] = []
     seen: set[str] = set()
     duplicates: list[str] = []
-    for match in PHASE_HEADING_PATTERN.finditer(text):
+    headings = list(PHASE_HEADING_PATTERN.finditer(text))
+    for position, match in enumerate(headings):
         rest = match.group("rest")
         status_match = PHASE_STATUS_PATTERN.search(rest)
         # `### Phase 12 Review` and its like are sections, not phases.
@@ -657,11 +675,22 @@ def _plan_phase_details(plan_path: Path) -> tuple[list[PlanPhase], list[str]]:
         # No status marker means the phase was shrunk into its as-built record,
         # which only happens after the phase completed.
         done = status_match is None or status_match.group("status") == "done"
+        end = headings[position + 1].start() if position + 1 < len(headings) else len(text)
+        body = text[match.end() : end]
+        depends_match = DEPENDS_ON_PATTERN.search(body)
+        depends_on = (
+            None
+            if depends_match is None
+            else re.findall(r"\b\d+[a-z]?\b", depends_match.group("list"))
+        )
+        blocked_match = BLOCKED_BY_PATTERN.search(body)
         phases.append(
             PlanPhase(
                 id=identifier,
                 title=title,
                 done=done,
+                depends_on=depends_on,
+                blocked_by="" if blocked_match is None else blocked_match.group("gate"),
             )
         )
     return phases, duplicates
@@ -1010,6 +1039,103 @@ def _open_passes(state: dict[str, object]) -> dict[str, dict[str, object]]:
     }
 
 
+def _pass_phase_instance(record: dict[str, object]) -> str:
+    """The instance id of the phase a pass was opened in; empty for a pass older than the stamp."""
+    phase = _object_dict(record.get("phase"))
+    return _string(phase.get("instance_id")) if phase is not None else ""
+
+
+def _phase_stamp(phase: dict[str, object]) -> dict[str, object]:
+    """The fields a pass carries to name the phase it was opened in."""
+    return {
+        "instance_id": _string(phase.get("instance_id")),
+        "id": _string(phase.get("id")),
+        "title": _string(phase.get("title")),
+        "started_at": _number(phase.get("started_at")),
+    }
+
+
+def _parked_phases(state: dict[str, object]) -> list[dict[str, object]]:
+    """The older open phases, oldest first. Returns the list state holds."""
+    raw = state.get(OPEN_PHASES_KEY)
+    items = cast(list[object], raw) if isinstance(raw, list) else []
+    parked = [record for item in items if (record := _object_dict(item)) is not None]
+    state[OPEN_PHASES_KEY] = parked
+    return parked
+
+
+def _park_current(state: dict[str, object], current: dict[str, object]) -> None:
+    """Move the current phase among the older open ones, with its own state.
+
+    Its open passes stay in the slot map, where their launchers close them; a
+    pass opened before passes carried a phase gains this one's stamp, so the
+    phase that finishes later cannot claim it.
+    """
+    for record in _open_passes(state).values():
+        if "phase" not in record:
+            record["phase"] = _phase_stamp(current)
+    current[PARKED_KEY] = {key: state.get(key) for key in PHASE_SCOPED_KEYS}
+    _parked_phases(state).append(current)
+
+
+def _unpark_newest(state: dict[str, object]) -> None:
+    """Make the most recently started older open phase current again."""
+    parked = _parked_phases(state)
+    if not parked:
+        return
+    phase = parked.pop()
+    saved = _object_dict(phase.pop(PARKED_KEY, None)) or {}
+    for key in PHASE_SCOPED_KEYS:
+        state[key] = saved.get(key)
+    state["phase"] = phase
+
+
+def _open_phase_named(state: dict[str, object], phase_id: str) -> dict[str, object] | None:
+    """The open phase with this id: the current one, or an older one still open."""
+    current = _object_dict(state.get("phase"))
+    if current is not None and _string(current.get("status")) == "active":
+        if _string(current.get("id")) == phase_id:
+            return current
+    for phase in _parked_phases(state):
+        if _string(phase.get("id")) == phase_id:
+            return phase
+    return None
+
+
+def _open_phase_ids(state: dict[str, object]) -> list[str]:
+    current = _object_dict(state.get("phase"))
+    ids = [_string(phase.get("id")) for phase in _parked_phases(state)]
+    if current is not None and _string(current.get("status")) == "active":
+        ids.append(_string(current.get("id")))
+    return ids
+
+
+def _optional_arg(args: argparse.Namespace, name: str) -> str:
+    """An option callers added after the recorder's own internal calls were written."""
+    value: object = getattr(args, name, "")
+    return value if isinstance(value, str) else ""
+
+
+def _optional_epoch(args: argparse.Namespace, name: str, option: str, now: float) -> float:
+    """A past moment an option names, for a phase recorded after the fact; now when absent."""
+    value = _optional_arg(args, name)
+    if not value:
+        return now
+    text = value.strip()
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError as error:
+        raise SystemExit(f"{option} must be an ISO 8601 time with a zone; got {value}") from error
+    if parsed.tzinfo is None:
+        raise SystemExit(f"{option} must be an ISO 8601 time with a zone; got {value}")
+    moment = parsed.timestamp()
+    if moment > now:
+        raise SystemExit(f"{option} {value} is in the future")
+    return moment
+
+
 def _reporting_pass(state: dict[str, object]) -> dict[str, object] | None:
     """The open pass a call that is not a pass lifecycle call reports against.
 
@@ -1024,8 +1150,14 @@ def _reporting_pass(state: dict[str, object]) -> dict[str, object] | None:
     own = open_passes.get(_team_slot())
     if own is not None:
         return own
+    current = _object_dict(state.get("phase"))
+    current_id = _string(current.get("instance_id")) if current is not None else ""
     ordered = sorted(
-        open_passes.items(),
+        (
+            entry
+            for entry in open_passes.items()
+            if _pass_phase_instance(entry[1]) in ("", current_id)
+        ),
         key=lambda entry: (_number(entry[1].get("started_at")), entry[0]),
     )
     return ordered[0][1] if ordered else None
@@ -1036,6 +1168,7 @@ def _event(
     event_type: str,
     now: float,
     pass_record: dict[str, object] | None = None,
+    phase_record: dict[str, object] | None = None,
 ) -> dict[str, object]:
     event: dict[str, object] = {
         "schema_version": SCHEMA_VERSION,
@@ -1056,7 +1189,20 @@ def _event(
         "project_plan_doc": _string(state.get("project_plan_doc")),
         "main_agent": state.get("main_agent", {}),
     }
-    phase = _object_dict(state.get("phase"))
+    # An event that names its phase is that phase's own record, so the pass or
+    # activity running in another phase does not belong on it.
+    current_pass = pass_record
+    if current_pass is None and phase_record is None:
+        current_pass = _reporting_pass(state)
+    # The phase an event belongs to: the one the caller names, else the one the
+    # pass it reports against was opened in, else the current one. A pass of an
+    # older open phase that finishes after a newer phase started still belongs
+    # to the phase it worked for.
+    phase = phase_record
+    if phase is None and current_pass is not None:
+        phase = _object_dict(current_pass.get("phase"))
+    if phase is None:
+        phase = _object_dict(state.get("phase"))
     if phase is not None:
         event.update(
             {
@@ -1072,7 +1218,6 @@ def _event(
     # delegate happened to run before it. A pass lifecycle event names its own
     # record instead: several slots are open at once, and the launcher that
     # closes a stale pass is not always the one that opened it.
-    current_pass = pass_record if pass_record is not None else _reporting_pass(state)
     if current_pass is not None and _string(current_pass.get("status")) == "active":
         event.update(
             {
@@ -1085,7 +1230,7 @@ def _event(
                 "called_task": _string(current_pass.get("called_task")),
             }
         )
-    activity = _object_dict(state.get("activity"))
+    activity = _object_dict(state.get("activity")) if phase_record is None else None
     if activity is not None and _string(activity.get("status")) == "active":
         event.update(
             {
@@ -1141,22 +1286,6 @@ def _close_slot_pass(
     current_pass["finished_at"] = now
     _write_state(session_dir, state)
     return True
-
-
-def _close_open_passes(
-    session_dir: Path,
-    state: dict[str, object],
-    status: str,
-    now: float,
-) -> None:
-    """Close every slot's open pass, for a phase or a run that is ending.
-
-    A team phase leaves up to one window open per member. Closing a single one
-    of them leaves the rest open forever: the launchers that would have closed
-    them are the processes that just went away.
-    """
-    for slot in sorted(_open_passes(state)):
-        _ = _close_slot_pass(session_dir, state, slot, status, now)
 
 
 def _close_active_activity(
@@ -1263,6 +1392,7 @@ def _start_run(args: argparse.Namespace) -> None:
         "project_plan_doc": project_timing["plan_doc"],
         "main_agent": main_agent,
         "phase": None,
+        OPEN_PHASES_KEY: [],
         "pass": {},
         "project_last_percent": None,
         "project_percent_started_at": None,
@@ -1312,24 +1442,27 @@ def _start_phase(args: argparse.Namespace) -> None:
     session_dir = _session_dir(args)
     state = _read_state(session_dir)
     now = now_epoch()
-    active = _object_dict(state.get("phase"))
-    if active is not None and _string(active.get("status")) == "active":
-        if _string(active.get("id")) == _arg_string(args, "phase_id"):
-            return
-        raise SystemExit(
-            f"Phase {_string(active.get('id'))} is still active; finish it before starting another"
-        )
+    phase_id = _arg_string(args, "phase_id", "ad hoc")
+    # Starting a phase that is already open does nothing. Starting any other
+    # leaves every open phase open: each closes only by its own finish-phase.
+    if _open_phase_named(state, phase_id) is not None:
+        return
+    started_at = _optional_epoch(args, "started_at", "--started-at", now)
     _close_active_activity(session_dir, state, "interrupted", "", now)
     state = _read_state(session_dir)
+    active = _object_dict(state.get("phase"))
+    if active is not None and _string(active.get("status")) == "active":
+        _park_current(state, active)
+    else:
+        state["pass"] = {}
     phase: dict[str, object] = {
         "instance_id": str(uuid.uuid4()),
-        "id": _arg_string(args, "phase_id", "ad hoc"),
+        "id": phase_id,
         "title": _arg_string(args, "phase_title", "Ad hoc work"),
-        "started_at": now,
+        "started_at": started_at,
         "status": "active",
     }
     state["phase"] = phase
-    state["pass"] = {}
     state[ARMED_REVIEW_KEY] = None
     state["phase_last_percent"] = None
     state["phase_percent_started_at"] = None
@@ -1337,7 +1470,10 @@ def _start_phase(args: argparse.Namespace) -> None:
     state["percent_started_at"] = None
     state["pending_calibration"] = None
     _write_state(session_dir, state)
-    event = _event(state, "phase_started", now)
+    event = _event(state, "phase_started", started_at)
+    if started_at != now:
+        event["recorded_at"] = _iso_time(now)
+        event["backfilled"] = True
     event.update(_work_order_metrics(_arg_string(args, "work_order_file")))
     _append_event(state, event)
     _refresh_phase_table(session_dir)
@@ -1377,6 +1513,7 @@ def _start_pass(args: argparse.Namespace) -> None:
         "called_task": _arg_string(args, "called_task"),
         "called_agent": called_agent,
         "team_slot": team_slot,
+        "phase": _phase_stamp(phase),
         "status": "active",
     }
     slots = _pass_slots(state)
@@ -2129,7 +2266,7 @@ def _clock_line(now: float, next_report_at: float | None) -> str:
     never when. This line is the one place a reader can tell whether the report
     they are looking at is current and how long until the next one lands.
     """
-    line = f"**now {datetime.fromtimestamp(now):%Y-%m-%d %H:%M:%S}"
+    line = f"**now {datetime.fromtimestamp(now, user_zone()):%Y-%m-%d %H:%M:%S}"
     if next_report_at is not None:
         line += f" - next report {_moment_stamp(next_report_at, now)}"
     return line + "**"
@@ -2137,8 +2274,8 @@ def _clock_line(now: float, next_report_at: float | None) -> str:
 
 def _moment_stamp(epoch: float, now: float) -> str:
     """A local clock time, dated only when it falls on a day other than `now`'s."""
-    moment = datetime.fromtimestamp(epoch)
-    if moment.date() == datetime.fromtimestamp(now).date():
+    moment = datetime.fromtimestamp(epoch, user_zone())
+    if moment.date() == datetime.fromtimestamp(now, user_zone()).date():
         return f"{moment:%H:%M:%S}"
     return f"{moment:%Y-%m-%d %H:%M:%S}"
 
@@ -2244,7 +2381,7 @@ def _agent_display(model: str, effort: str) -> str:
 
 
 def _clock_stamp(epoch: float) -> str:
-    return f"{datetime.fromtimestamp(epoch):%H:%M:%S}"
+    return f"{datetime.fromtimestamp(epoch, user_zone()):%H:%M:%S}"
 
 
 def _started_window(event: dict[str, object], event_type: str) -> StageWindow:
@@ -3538,8 +3675,8 @@ def _render_table(
 
 def _arrival_label(arrival_epoch: float, now: float) -> str:
     """A point in time named the way a person would say it aloud on `now`'s day."""
-    arrival = datetime.fromtimestamp(arrival_epoch)
-    days = (arrival.date() - datetime.fromtimestamp(now).date()).days
+    arrival = datetime.fromtimestamp(arrival_epoch, user_zone())
+    days = (arrival.date() - datetime.fromtimestamp(now, user_zone()).date()).days
     if days == 0:
         return f"today {arrival:%H:%M}"
     if days == 1:
@@ -4341,33 +4478,67 @@ def _eta(args: argparse.Namespace) -> None:
 
     _append_event(state, event)
     _refresh_phase_table(session_dir)
-    local_eta = datetime.fromtimestamp(eta_at, _process_timezone())
+    local_eta = datetime.fromtimestamp(eta_at, user_zone())
     print(f"ETA recorded: {local_eta:%H:%M %Z}")
 
 
 def _finish_phase(args: argparse.Namespace) -> None:
+    """Close one open phase: the one --phase-id names, else the current one.
+
+    Only that phase's own passes close with it; another open phase keeps its
+    seats. When the current phase closes, the most recently started older open
+    phase becomes current again.
+    """
     session_dir = _session_dir(args)
     state = _read_state(session_dir)
-    phase = _object_dict(state.get("phase"))
-    if phase is None or _string(phase.get("status")) != "active":
+    phase_id = _optional_arg(args, "phase_id")
+    current = _object_dict(state.get("phase"))
+    current_open = current is not None and _string(current.get("status")) == "active"
+    if phase_id:
+        phase = _open_phase_named(state, phase_id)
+        if phase is None:
+            open_ids = ", ".join(_open_phase_ids(state)) or "none"
+            raise SystemExit(f"Phase {phase_id} is not open; open phases: {open_ids}")
+    elif current is not None and current_open:
+        phase = current
+    else:
         return
+    is_current = phase is current
     now = now_epoch()
-    _close_open_passes(session_dir, state, "interrupted", now)
-    state = _read_state(session_dir)
-    _close_active_activity(session_dir, state, "interrupted", "", now)
-    state = _read_state(session_dir)
-    if _clear_armed_review(session_dir, state, "phase ended", now):
-        state = _read_state(session_dir)
-    event = _event(state, "phase_finished", now)
-    event["status"] = _arg_string(args, "status")
-    event["phase_elapsed_seconds"] = max(
-        0,
-        int(now - _number(phase.get("started_at"), now)),
-    )
+    finished_at = _optional_epoch(args, "finished_at", "--finished-at", now)
+    started_at = _number(phase.get("started_at"), finished_at)
+    if finished_at < started_at:
+        raise SystemExit(
+            f"--finished-at is before Phase {_string(phase.get('id'))} started "
+            + f"({_iso_time(started_at)})"
+        )
+    instance_id = _string(phase.get("instance_id"))
+    # Every window this phase left open, one per team member: the launchers that
+    # would have closed them are gone. A pass from before passes carried their
+    # phase belongs to the current one.
+    for slot, record in sorted(_open_passes(state).items()):
+        owner = _pass_phase_instance(record)
+        if owner == instance_id or (is_current and not owner):
+            _ = _close_slot_pass(session_dir, state, slot, "interrupted", now)
+    if is_current:
+        _close_active_activity(session_dir, state, "interrupted", "", now)
+        _ = _clear_armed_review(session_dir, state, "phase ended", now)
+    status = _arg_string(args, "status")
+    event = _event(state, "phase_finished", finished_at, phase_record=phase)
+    event["status"] = status
+    event["phase_elapsed_seconds"] = max(0, int(finished_at - started_at))
+    if finished_at != now:
+        event["recorded_at"] = _iso_time(now)
+        event["backfilled"] = True
     _append_event(state, event)
-    phase["status"] = _arg_string(args, "status")
-    phase["finished_at"] = now
-    state["phase"] = phase
+    phase["status"] = status
+    phase["finished_at"] = finished_at
+    if is_current:
+        _unpark_newest(state)
+    else:
+        state[OPEN_PHASES_KEY] = [
+            record for record in _parked_phases(state) if record is not phase
+        ]
     _write_state(session_dir, state)
     _refresh_phase_table(session_dir)
 
@@ -4377,8 +4548,9 @@ def _finish_run(args: argparse.Namespace) -> None:
     state = _read_state(session_dir)
     now = now_epoch()
     run_status = _arg_string(args, "status")
-    phase = _object_dict(state.get("phase"))
-    if phase is not None and _string(phase.get("status")) == "active":
+    # Every open phase, newest first: closing the current one makes the next
+    # older one current.
+    while _open_phase_ids(state):
         finish_args = argparse.Namespace(session_dir=str(session_dir), status=run_status)
         _finish_phase(finish_args)
         state = _read_state(session_dir)
@@ -4415,8 +4587,10 @@ def _review_trial(args: argparse.Namespace) -> None:
     """Print one line: the phase's UX and code findings, and review time.
 
     It feeds the unit's checkpoint notice line, which the showrunner records with
-    review_regime.py. The phase is the one in state, active or just closed by
-    finish-phase, and only events stamped with its instance count. Review-seat
+    review_regime.py. The phase is the one --phase-id names -- an open one, else
+    the latest this run started under that id -- or, without it, the one in
+    state, active or just closed by finish-phase. Only events stamped with its
+    instance count. Review-seat
     minutes are every seat's finished review passes, whatever their status, plus
     the UX review activities. The screenshot check's own cost follows: its `UX
     review` activities alone, then every fix pass of a round whose dispatched
@@ -4424,7 +4598,23 @@ def _review_trial(args: argparse.Namespace) -> None:
     """
     session_dir = _session_dir(args)
     state = _read_state(session_dir)
-    phase = _object_dict(state.get("phase"))
+    phase_id = _optional_arg(args, "phase_id")
+    if phase_id:
+        phase = _open_phase_named(state, phase_id)
+        if phase is None:
+            phase = next(
+                (
+                    {"instance_id": _string(event.get("phase_instance_id"))}
+                    for event in reversed(_run_events(state))
+                    if _string(event.get("event_type")) == "phase_started"
+                    and _string(event.get("phase_id")) == phase_id
+                ),
+                None,
+            )
+        if phase is None:
+            raise SystemExit(f"This run never started Phase {phase_id}")
+    else:
+        phase = _object_dict(state.get("phase"))
     instance_id = _string(phase.get("instance_id")) if phase is not None else ""
     if not instance_id:
         raise SystemExit(
@@ -4536,6 +4726,7 @@ def _build_parser() -> argparse.ArgumentParser:
     _ = start_phase.add_argument("--phase-id", required=True)
     _ = start_phase.add_argument("--phase-title", required=True)
     _ = start_phase.add_argument("--work-order-file", default="")
+    _ = start_phase.add_argument("--started-at", default="")
     start_phase.set_defaults(handler=_start_phase)
 
     start_activity = subparsers.add_parser("start-activity")
@@ -4660,6 +4851,8 @@ def _build_parser() -> argparse.ArgumentParser:
         choices=("completed", "stopped", "error"),
         required=True,
     )
+    _ = finish_phase.add_argument("--phase-id", default="")
+    _ = finish_phase.add_argument("--finished-at", default="")
     finish_phase.set_defaults(handler=_finish_phase)
 
     finish_run = subparsers.add_parser("finish-run")
@@ -4677,6 +4870,7 @@ def _build_parser() -> argparse.ArgumentParser:
         + "counts and its review-seat minutes",
     )
     _ = review_trial.add_argument("--session-dir", required=True)
+    _ = review_trial.add_argument("--phase-id", default="")
     review_trial.set_defaults(handler=_review_trial)
 
     aggregate = subparsers.add_parser("aggregate")

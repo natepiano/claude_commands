@@ -10,13 +10,11 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import re
 import shlex
 import subprocess
 import sys
 from pathlib import Path
 from typing import NamedTuple, TypedDict, cast
-from zoneinfo import ZoneInfo
 
 CONFIG = Path(os.environ.get("SHOWRUNNERS_CONFIG") or Path(__file__).resolve().parents[2] / "config/showrunners.json")
 NOTIFIER_STATE_DIR = Path(os.environ.get("NOTIFIER_STATE_DIR") or Path.home() / ".local/state/notifier")
@@ -25,6 +23,9 @@ SESSIONS = Path(os.environ.get("SHOWRUNNERS_SESSIONS") or Path(__file__).resolve
 SHOWRUNNER_STATE_DIR = Path(os.environ.get("SHOWRUNNER_STATE_DIR") or Path.home() / ".local/state/showrunner")
 SEND = Path(os.environ.get("SHOWRUNNERS_SEND") or Path(__file__).resolve().parent.parent / "message/send.py")
 PARENT_FILE = "parent"
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
+from user_zone import user_zone_name  # noqa: E402
+
 RULES = "Read the Nested showrunners rules in ~/.claude/commands/showrunner/produce.md."
 
 
@@ -37,7 +38,7 @@ class Showrunner(TypedDict):
     socket: str
     # The production's slug, which names the showrunner whatever its session is called.
     slug: str
-    # The user's zone, read from the production doc.
+    # The user's zone setting. A production doc's own User zone line is no longer read.
     zone: str
     # The production doc, whose Units table says which units the showrunner has.
     doc: str
@@ -159,22 +160,12 @@ def _session_name(session_id: str) -> str:
     raise ValueError(f"session {session_id} has no live named process")
 
 
-def _doc_zone(doc: Path) -> str:
-    """The user's zone, from the production doc's own User zone line."""
-    prefix = "- **User zone:** "
+def _readable(doc: Path) -> None:
+    """Refuse a production doc that cannot be read."""
     try:
-        lines = doc.read_text(encoding="utf-8").splitlines()
+        _ = doc.read_text(encoding="utf-8")
     except (OSError, UnicodeError) as error:
         raise ValueError(f"production doc could not be read: {error}") from error
-    found = next((re.search(r"[A-Za-z][\w+-]*(?:/[\w+-]+)*", line[len(prefix):]) for line in lines
-                  if line.startswith(prefix)), None)
-    if found is None:
-        raise ValueError("production doc lacks User zone")
-    try:
-        _ = ZoneInfo(found.group(0))
-    except (KeyError, ValueError) as error:
-        raise ValueError(f"production doc has an invalid User zone: {error}") from error
-    return found.group(0)
 
 
 def _timer(instance: Path) -> Timer:
@@ -185,7 +176,8 @@ def _timer(instance: Path) -> Timer:
     doc = checked_doc(instance)
     if isinstance(doc, NoCheckedDoc):
         raise ValueError(doc.reason)
-    return Timer(instance.name.removeprefix("showrunner-"), target, doc.path, _doc_zone(doc.path))
+    _readable(doc.path)
+    return Timer(instance.name.removeprefix("showrunner-"), target, doc.path, user_zone_name())
 
 
 def _registered(instance: Path) -> Showrunner:
@@ -424,6 +416,33 @@ def detach(child: str) -> str:
         raise ValueError(f"{child} reports to no one")
     (SHOWRUNNER_STATE_DIR / child / PARENT_FILE).unlink()
     return parent
+
+
+class Released(NamedTuple):
+    """The edges a wrapped production left: each one's parent file is gone."""
+
+    # The production it reported to. Empty when it had none.
+    parent: str
+    # The productions that reported to it, each a root now.
+    orphans: list[str]
+
+
+def stored_children(slug: str) -> list[str]:
+    """Every production whose parent file names `slug`, whether or not that edge counts."""
+    return sorted(path.parent.name for path in SHOWRUNNER_STATE_DIR.glob(f"*/{PARENT_FILE}")
+                  if path.parent.name != slug and _stored_parent(path.parent.name) == slug)
+
+
+def release_edges(slug: str) -> Released:
+    """Remove `slug`'s parent file and every parent file that names it, so a wrap leaves no edge behind.
+
+    An edge to a wrapped production already counts for nothing; its file would come back to life if a
+    production of the same slug ran again.
+    """
+    released = Released(_stored_parent(slug), stored_children(slug))
+    for child in ([slug] if released.parent else []) + released.orphans:
+        (SHOWRUNNER_STATE_DIR / child / PARENT_FILE).unlink(missing_ok=True)
+    return released
 
 
 def tell(slug: str, key: str, text: str) -> str:

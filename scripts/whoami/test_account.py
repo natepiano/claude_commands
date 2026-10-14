@@ -21,7 +21,7 @@ import account
 
 STATUS_LINE = Path(__file__).parents[1] / "statusline" / "statusline.jq"
 EXAMPLE_FIRST_LINE = "natedev | claude_commands | 182,340 | Opus 5.5 high"
-ACCOUNT_FIRST_LINE = "natedev | claude 2 | claude_commands | 182,340 | Opus 5.5 high"
+ACCOUNT_FIRST_LINE = "natedev | claude2 | claude_commands | 182,340 | Opus 5.5 high"
 
 
 class AccountTests(unittest.TestCase):
@@ -469,6 +469,20 @@ class AccountTests(unittest.TestCase):
             "rate_limits": {
                 "five_hour": {"used_percentage": 26.4, "resets_at": 1_800_000_000},
                 "seven_day": {"used_percentage": 58.2, "resets_at": 1_800_000_000},
+            }
+        }
+
+        self.assertEqual(
+            self.render_status_line(document, "claude 2"),
+            ACCOUNT_FIRST_LINE
+            + "\n5-hour 73% left until 03:00 EST | weekly 41% left until Fri 03:00 EST\n",
+        )
+
+    def test_status_line_without_reset_times_names_no_reset(self) -> None:
+        document = self.status_line_input() | {
+            "rate_limits": {
+                "five_hour": {"used_percentage": 26.4},
+                "seven_day": {"used_percentage": 58.2},
             }
         }
 

@@ -21,11 +21,14 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta, timezone, tzinfo
 from pathlib import Path
-from typing import Literal, NotRequired, TypedDict, cast, overload
+from typing import override, TYPE_CHECKING, Literal, NotRequired, Protocol, TypedDict, cast, overload
+from importlib import import_module
 
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
 SCRIPTS = REPOSITORY_ROOT / "scripts"
+# Direct CLI and imported callers share the picker's domain variants.
+_ = sys.modules.setdefault("scripts.accounts.accounts", sys.modules[__name__])
 sys.path.insert(0, str(REPOSITORY_ROOT))
 sys.path.insert(0, str(SCRIPTS / "whoami"))
 
@@ -33,6 +36,20 @@ import account  # noqa: E402
 import agent_accounts  # noqa: E402
 import note_file  # noqa: E402
 import usage_store  # noqa: E402
+from scripts.accounts import refusals  # noqa: E402
+from scripts.accounts import moves  # noqa: E402
+from scripts.accounts.refusals import (  # noqa: E402
+    KnownReset as KnownReset, NoResetKnown as NoResetKnown,
+    ReadingWindow as ReadingWindow, NoWindow as NoWindow, FreshReading as FreshReading,
+    StaleReading as StaleReading, NoReading as NoReading,
+)
+
+if TYPE_CHECKING:
+    from scripts.shutdown.inventory import Session
+
+
+class ManualMoveResume(Protocol):
+    def resume_command(self, session: Session, target: str, source_label: str = "", why: str = "") -> str: ...
 
 
 # Shared means Claude Code reads the entry as user content or cross-session
@@ -383,6 +400,14 @@ class CommandLine(argparse.Namespace):
     until: str = ""
     dry_run: bool = False
     claude_args: list[str] = []
+    session: str = ""
+    source: str = ""
+    target: str = ""
+    tool: str = "claude"
+    exclude: list[str] = []
+    keep: str = ""
+    explain: bool = False
+    why: str = ""
 
 
 @dataclass(frozen=True)
@@ -538,11 +563,18 @@ def account_dir(label: str) -> Path:
     return accounts_home() / f".claude{match.group(1)}"
 
 
-def codex_account_home(label: str) -> Path:
+def codex_setup_home(label: str) -> Path:
     match = CODEX_LABEL_PATTERN.fullmatch(label)
     if match is None:
         raise AccountsError(f"accounts: {label} is not a codex N label")
     return accounts_home() / f".codex{match.group(1)}"
+
+
+def _codex_account_home(label: str) -> Path:
+    try:
+        return agent_accounts.codex_account_home(label).home
+    except ValueError as error:
+        raise AccountsError(str(error)) from error
 
 
 def _is_expected_link(path: Path, target: Path) -> bool:
@@ -839,13 +871,15 @@ def _inspect_account_directory(selected: NamedAccount, expected: AccountNote) ->
 
 def check(label: str) -> list[str]:
     """Return every reason a named account is not fit to launch."""
+    if label == "default":
+        return _login_problem(main_config_dir())
     if CODEX_LABEL_PATTERN.fullmatch(label):
         return _check_codex_home(label, _seats_home())
     return list(account_directory_readiness(label).problems)
 
 
 def _setup_codex_home(label: str) -> list[str]:
-    destination = codex_account_home(label)
+    destination = codex_setup_home(label)
     expected = _account_note(label)
     if not isinstance(expected, ExpectedAccountLogin):
         return [expected.problem]
@@ -919,7 +953,7 @@ def _codex_folder(home: Path) -> str:
 
 
 def _check_codex_home(label: str, seats_home: Path) -> list[str]:
-    destination = codex_account_home(label)
+    destination = _codex_account_home(label)
     folder = _codex_folder(destination)
     if destination.is_symlink():
         return [f"accounts: {folder} is a link; an account home must be a real directory"]
@@ -927,17 +961,18 @@ def _check_codex_home(label: str, seats_home: Path) -> list[str]:
         return [f"accounts: {folder} is missing"]
     if not destination.is_dir():
         return [f"accounts: {folder} is not a directory"]
-    problems = _shared_link_problems(
-        destination, (accounts_home() / ".codex").absolute(), CODEX_SHARED, frozenset(),
-    )
+    problems = (_check_default_codex_home(seats_home) if destination == accounts_home() / ".codex"
+                else _shared_link_problems(destination, (accounts_home() / ".codex").absolute(),
+                                           CODEX_SHARED, frozenset()))
     problems.extend(_codex_private_link_problems(destination))
-    try:
-        unknown = sorted(entry.name for entry in destination.iterdir()
-                         if entry.name not in CODEX_SHARED and entry.name not in CODEX_PRIVATE_NAMES)
-        if unknown:
-            problems.append(f"{folder}: unclassified: {', '.join(unknown)}")
-    except OSError as error:
-        problems.append(f"accounts: could not inspect {destination}: {error}")
+    if destination != accounts_home() / ".codex":
+        try:
+            unknown = sorted(entry.name for entry in destination.iterdir()
+                             if entry.name not in CODEX_SHARED and entry.name not in CODEX_PRIVATE_NAMES)
+            if unknown:
+                problems.append(f"{folder}: unclassified: {', '.join(unknown)}")
+        except OSError as error:
+            problems.append(f"accounts: could not inspect {destination}: {error}")
     expected = _account_note(label)
     if not isinstance(expected, ExpectedAccountLogin):
         problems.append(expected.problem)
@@ -969,19 +1004,31 @@ def _check_default_codex_home(seats_home: Path) -> list[str]:
     ]
 
 
-def _drop_named_account(environment: dict[str, str]) -> None:
-    for name in account.NAMED_ACCOUNT_VARIABLES:
-        _ = environment.pop(name, None)
+@dataclass(frozen=True)
+class PreparedAccount:
+    """Account launch variables to apply to a caller's own environment."""
+    variables: dict[str, str]
+    remove: frozenset[str]
 
 
-def exec_account(label: str, arguments: list[str]) -> None:
-    """Replace this process with Claude on the selected, safe directory."""
-    if label == "unit":
-        selected = role_account("unit")
-    else:
-        selected = NamedAccount(label, account_dir(label))
-    environment = dict(os.environ)
-    _ = environment.pop("CLAUDE_CODE_OAUTH_TOKEN", None)
+@dataclass(frozen=True)
+class AccountRefused:
+    """The selected account cannot safely prepare this launch."""
+    reason: str
+
+
+def prepared_account(label: str, *, resume: bool) -> PreparedAccount | AccountRefused:
+    """Prepare an account for any launcher without inheriting its environment."""
+    try:
+        if label in ("unit", "showrunner"):
+            selected = role_account(label)
+        elif label == "default":
+            selected = DefaultAccount()
+        else:
+            selected = NamedAccount(label, account_dir(label))
+    except AccountsError as error:
+        return AccountRefused(str(error))
+    remove = frozenset({"CLAUDE_CODE_OAUTH_TOKEN"})
     if isinstance(selected, NamedAccount):
         default = _directory_identity(main_config_dir()) if label != "unit" else ClaudeDirectoryLoggedOut()
         expected = _account_note(selected.label)
@@ -989,16 +1036,31 @@ def exec_account(label: str, arguments: list[str]) -> None:
         if not default_login:
             readiness = _inspect_account_directory(selected, expected)
             if isinstance(readiness, AccountDirectoryNotSetUp):
-                raise AccountsError(
+                return AccountRefused(
                     f'accounts: ~/.claude{selected.label.removeprefix("claude ")} is not set up; /showrunner:accounts setup "{selected.label}" first'
                 )
-            if not isinstance(readiness, (AccountDirectoryReady, AccountDirectoryLoggedOut)):
-                raise AccountsError(readiness.problems[0])
-            environment.update(account.named_account_environment(selected.dir))
-        else:
-            _drop_named_account(environment)
+            if not isinstance(readiness, (AccountDirectoryReady, AccountDirectoryLoggedOut)) or (
+                resume and isinstance(readiness, AccountDirectoryLoggedOut)
+            ):
+                return AccountRefused(readiness.problems[0])
+            return PreparedAccount(account.named_account_environment(selected.dir), remove)
     else:
-        _drop_named_account(environment)
+        if resume:
+            problems = check("default")
+            if problems:
+                return AccountRefused(problems[0])
+    return PreparedAccount({}, remove | frozenset(account.NAMED_ACCOUNT_VARIABLES))
+
+
+def exec_account(label: str, arguments: list[str]) -> None:
+    """Replace this process with Claude on the selected, safe directory."""
+    prepared = prepared_account(label, resume="--resume" in arguments)
+    if isinstance(prepared, AccountRefused):
+        raise AccountsError(prepared.reason)
+    environment = dict(os.environ)
+    for name in prepared.remove:
+        _ = environment.pop(name, None)
+    environment.update(prepared.variables)
     try:
         os.execvpe("claude", ["claude", *arguments], environment)
     except OSError as error:
@@ -1006,8 +1068,8 @@ def exec_account(label: str, arguments: list[str]) -> None:
 
 
 def _validate_role(role: str) -> None:
-    if role not in {"unit", "seats"}:
-        raise AccountsError(f"accounts: {role} is not a role; only unit and seats are supported")
+    if role not in {"unit", "showrunner", "seats"}:
+        raise AccountsError(f"accounts: {role} is not a role; only unit, showrunner and seats are supported")
 
 
 def _read_accounts_configuration() -> AccountsConfiguration:
@@ -1019,7 +1081,7 @@ def _read_accounts_configuration() -> AccountsConfiguration:
     except (OSError, ValueError, TypeError) as error:
         raise AccountsError(f"accounts: could not read {path}: {error}") from error
     configuration = AccountsConfiguration()
-    for role, directory in (("unit", account_dir), ("seats", codex_account_home)):
+    for role, directory in (("seats", _codex_account_home),):
         if role not in decoded:
             continue
         label = decoded[role]
@@ -1042,7 +1104,7 @@ def _seats_home() -> Path:
 
 
 @overload
-def role_account(role: Literal["unit"]) -> ClaudeLaunchAccount: ...
+def role_account(role: Literal["unit", "showrunner"]) -> ClaudeLaunchAccount: ...
 
 
 @overload
@@ -1058,13 +1120,34 @@ def role_account(role: str) -> AccountSelection:
     _validate_role(role)
     if role == "seats":
         home = _seats_home()
-        label = "default" if home == accounts_home() / ".codex" else f"codex {home.name.removeprefix('.codex')}"
+        label = agent_accounts.codex_home_role_label(home)
         return CodexSeatsAccount(label, home)
-    configuration = _read_accounts_configuration()
-    label = configuration.get("unit")
-    if label is None:
+    group: ClaudeGroup = "units" if role == "unit" else "showrunners"
+    selected = group_label(group_accounts(), group)
+    if isinstance(selected, GroupNotConfigured):
+        raise AccountsError("accounts: " + group_configuration_line(group))
+    return DefaultAccount() if selected == "default" else NamedAccount(selected, account_dir(selected))
+
+
+def account_for_group_launch(role: Literal["unit", "showrunner"], *, resume: bool,
+                             target: str = "", config_dir: str = "") -> ClaudeLaunchAccount:
+    """Keep every launcher and explicit override on its configured group account."""
+    selected = role_account(role)
+    label = "default" if isinstance(selected, DefaultAccount) else selected.label
+    directory = main_config_dir() if isinstance(selected, DefaultAccount) else selected.dir
+    group = "units" if role == "unit" else "showrunners"
+    if target and config_dir:
+        raise AccountsError("give only one of --account and --config-dir")
+    requested = (main_config_dir() if target == "default" else account_dir(target)) if target else Path(config_dir).expanduser() if config_dir else directory
+    if requested.resolve() != directory.resolve():
+        raise AccountsError(f"accounts: {group} account is {label}; --account and --config-dir must name {label}")
+    prepared = prepared_account(label, resume=resume)
+    if isinstance(prepared, AccountRefused):
+        raise AccountsError(prepared.reason)
+    # Preparation may resolve a named alias to the default directory.
+    if not prepared.variables:
         return DefaultAccount()
-    return NamedAccount(label, account_dir(label))
+    return selected
 
 
 def account_prefix(selected: AccountSelection) -> str:
@@ -1076,6 +1159,15 @@ def account_prefix(selected: AccountSelection) -> str:
     return account.named_account_prefix(selected.dir)
 
 
+def trust_command(folder: Path, selected: ClaudeLaunchAccount) -> str:
+    """The command the user runs to accept trust, then type /exit in Claude."""
+    if isinstance(selected, DefaultAccount):
+        prefix = "env " + " ".join(f"-u {shlex.quote(name)}" for name in account.NAMED_ACCOUNT_VARIABLES)
+    else:
+        prefix = account_prefix(selected).strip()
+    return f"cd {shlex.quote(str(folder))} && {prefix} claude"
+
+
 def launch_prefix(role: str) -> str:
     """Return the shell assignment needed before launching this role."""
     return account_prefix(role_account(role))
@@ -1083,8 +1175,7 @@ def launch_prefix(role: str) -> str:
 
 def multiple_accounts_configured() -> bool:
     """Whether account configuration or a named account opts into role displays."""
-    configuration = _read_accounts_configuration()
-    return "unit" in configuration or bool(_existing_named_accounts())
+    return bool(_existing_named_accounts())
 
 
 def checked_named_accounts() -> list[NamedAccount]:
@@ -1100,25 +1191,479 @@ def account_identity(config_dir: Path) -> agent_accounts.KnownClaudeAccount | ag
     return agent_accounts.KnownClaudeAccount(identity.login, identity.label)
 
 
-def claude_account_selection() -> agent_accounts.ClaudeAccountSelection:
-    """Resolve role identities and fit named accounts once for this run."""
-    multiple = multiple_accounts_configured()
+def claude_account_selection() -> agent_accounts.ClaudeAccountsInUse:
+    """Freeze the default, readable directories and local live logins once per run."""
+    from scripts.message import sessions
+
     default = account_identity(main_config_dir())
-    selected = role_account("unit")
     named_accounts: list[agent_accounts.CheckedNamedClaudeAccount] = []
     for named in checked_named_accounts():
         identity = account_identity(named.dir)
         if isinstance(identity, agent_accounts.KnownClaudeAccount):
-            named_accounts.append(agent_accounts.CheckedNamedClaudeAccount(
-                named.label, named.dir, identity,
+            named_accounts.append(agent_accounts.CheckedNamedClaudeAccount(named.label, named.dir, identity))
+    live_logins: set[str] = set()
+    live_directories: dict[Path, None] = {}
+    for session in sessions.live_sessions():
+        identity = account.account_of(session["pid"])
+        directory = account.process_config_dir(session["pid"])
+        if identity is not None:
+            live_logins.add(identity.login.casefold())
+        if directory is not None:
+            live_directories[directory] = None
+    return agent_accounts.ClaudeAccountsInUse(
+        default, bool(named_accounts) or len(live_logins) > 1, tuple(named_accounts),
+        frozenset(live_logins), tuple(live_directories),
+    )
+
+
+UNIT_ROLE_GONE = "unit launches use the configured units account; select and move the group with accounts.py move units <claude N>"
+
+
+@dataclass(frozen=True)
+class KeepAccount:
+    label: str
+
+
+@dataclass(frozen=True)
+class NoKeep:
+    pass
+
+
+_NO_KEEP = NoKeep()
+_NO_EXCLUSIONS: frozenset[str] = frozenset()
+
+
+@dataclass(frozen=True)
+class EarliestReset:
+    at: datetime
+
+
+@dataclass(frozen=True)
+class PickReason:
+    label: str
+    weekly: ReadingWindow | NoWindow
+    five_hour: ReadingWindow | NoWindow
+    status: str
+
+
+@dataclass(frozen=True)
+class PickedAccount:
+    label: str
+    dir: Path
+    weekly_left: float
+    weekly_reset: KnownReset | NoResetKnown
+    reasons: tuple[PickReason, ...] = ()
+
+
+@dataclass(frozen=True)
+class NoAccountWithRoom:
+    earliest_reset: EarliestReset | NoResetKnown
+    reasons: tuple[PickReason, ...]
+
+
+def _codex_reading_can_work(reading: FreshReading, now: datetime, credits: agent_accounts.CodexCreditsSetting) -> bool:
+    """Use Codex's shared allowance and credit rule through its report boundary."""
+    def quota(window: ReadingWindow, label: str) -> agent_accounts.Quota:
+        return agent_accounts.Quota(label=label, used_percent=100 - window.left,
+            resets_at=window.reset.at if isinstance(window.reset, KnownReset) else None)
+    report = agent_accounts.Report(tool="Codex", email="stored reading",
+        quotas=[quota(reading.weekly, "Weekly")],
+        five_hour=quota(reading.five_hour, "5-hour") if isinstance(reading.five_hour, ReadingWindow) else None,
+        credit_balance=reading.credits or None)
+    return isinstance(agent_accounts.codex_can_work(report, now, credits), agent_accounts.CodexWorkAvailable)
+
+
+def pick(tool: Literal["claude", "codex"], now: datetime, *, exclude: frozenset[str] = _NO_EXCLUSIONS, keep: KeepAccount | NoKeep = _NO_KEEP, prefer_weekly_room: bool = False) -> PickedAccount | NoAccountWithRoom:
+    """Keep a working account, otherwise spend the weekly allowance resetting soonest."""
+    candidates: list[tuple[str, Path, str]] = []
+    if tool == "claude":
+        directories = [("default", main_config_dir()), *((item.label, item.dir) for item in checked_named_accounts())]
+        for label, directory in directories:
+            if label == "default" and check(label):
+                continue
+            identity = account_identity(directory)
+            if isinstance(identity, agent_accounts.KnownClaudeAccount):
+                candidates.append((label, directory, identity.login))
+    else:
+        seats_home = _seats_home()
+        for home in agent_accounts.codex_homes(seats_home):
+            label = agent_accounts.codex_home_role_label(home)
+            if not CODEX_LABEL_PATTERN.fullmatch(label):
+                if home != accounts_home() / ".codex":
+                    continue
+                label = "default"
+            elif _codex_account_home(label) != home:
+                # A duplicate login must not reintroduce an excluded home or change the swap destination.
+                continue
+            problems = check(label) if label != "default" else _check_default_codex_home(seats_home)
+            # Duplicate homes are one picker candidate; safety checks still reject other defects.
+            if any("two homes on one login" not in problem and "keep each login in one home" not in problem for problem in problems):
+                continue
+            login = _codex_home_login(home)
+            if login:
+                candidates.append((label, home, login))
+    seen: set[str] = set()
+    reasons: list[PickReason] = []
+    available: list[PickedAccount] = []
+    allowance_available: set[str] = set()
+    fallback: list[PickedAccount] = []
+    any_fresh = False
+    resets: list[datetime] = []
+    try:
+        held_refusals = refusals.load()
+        refusal_problem = ""
+    except refusals.RefusalsError as error:
+        held_refusals = {}
+        refusal_problem = str(error)
+    for label, directory, login in candidates:
+        excluded = (any(agent_accounts.codex_home_matches_label(directory, omitted) for omitted in exclude)
+                    if tool == "codex" else label in exclude)
+        if excluded or login.casefold() in seen:
+            continue
+        seen.add(login.casefold())
+        reading = refusals.stored_reading(tool, login, now)
+        any_fresh = any_fresh or isinstance(reading, FreshReading)
+        weekly: ReadingWindow | NoWindow = reading.weekly if isinstance(reading, (FreshReading, StaleReading)) else NoWindow()
+        five: ReadingWindow | NoWindow = reading.five_hour if isinstance(reading, (FreshReading, StaleReading)) else NoWindow()
+        for window in (weekly, five):
+            if isinstance(window, ReadingWindow) and isinstance(window.reset, KnownReset) and window.reset.at > now:
+                resets.append(window.reset.at)
+        refusal = held_refusals.get(refusals.key(tool, login))
+        if refusal is not None and isinstance(refusal.reset, KnownReset) and refusal.reset.at > now:
+            resets.append(refusal.reset.at)
+        if refusal_problem:
+            reason = refusal_problem
+        elif refusal is not None and not refusals.resolved(refusal, reading, now):
+            reason = "refused at " + refusal.at.astimezone(agent_accounts.user_zone()).strftime("%Y-%m-%d %H:%M %Z")
+        elif tool == "claude":
+            reason = "has room" if isinstance(reading, FreshReading) else "has room; no reading in the last 10 minutes"
+            candidate = PickedAccount(label, directory, weekly.left if isinstance(weekly, ReadingWindow) and isinstance(reading, FreshReading) else 0,
+                weekly.reset if isinstance(weekly, ReadingWindow) and isinstance(reading, FreshReading) else NoResetKnown())
+            available.append(candidate)
+            if not isinstance(reading, FreshReading):
+                fallback.append(candidate)
+        elif not isinstance(reading, FreshReading):
+            reason = "no reading in the last 10 minutes"
+            fallback.append(PickedAccount(
+                label, directory, weekly.left if isinstance(weekly, ReadingWindow) else 0,
+                weekly.reset if isinstance(weekly, ReadingWindow) else NoResetKnown(),
             ))
-    unit: agent_accounts.KnownClaudeAccount | agent_accounts.UnreadableClaudeAccount = default
-    if isinstance(selected, NamedAccount):
-        unit = next(
-            (named.identity for named in named_accounts if named.directory == selected.dir),
-            agent_accounts.UnreadableClaudeAccount(),
-        )
-    return agent_accounts.ClaudeAccountSelection(default, unit, multiple, tuple(named_accounts))
+        elif tool == "codex" and not _codex_reading_can_work(reading, now, agent_accounts.codex_credits_setting(label)):
+            reason = "no room"
+        else:
+            reason = "has room"
+            available.append(PickedAccount(label, directory, reading.weekly.left, reading.weekly.reset))
+            if tool == "codex" and _codex_reading_can_work(reading, now, agent_accounts.CreditsOff()):
+                allowance_available.add(label)
+        reasons.append(PickReason(label, weekly, five, reason))
+    if not any_fresh:
+        default_label = "default" if tool == "claude" else agent_accounts.codex_home_role_label(accounts_home() / ".codex")
+        if tool == "codex" and not CODEX_LABEL_PATTERN.fullmatch(default_label):
+            default_label = "default"
+        preferred = keep.label if isinstance(keep, KeepAccount) else default_label
+        choices = [item for label in dict.fromkeys((preferred, default_label))
+                   for item in fallback if (agent_accounts.codex_home_matches_label(item.dir, label)
+                                            if tool == "codex" else item.label == label)]
+        if choices:
+            chosen = choices[0]
+            status = f"no fresh readings on this machine; using {chosen.label}"
+            return replace(chosen, reasons=tuple(
+                replace(reason, status=status) if reason.label == chosen.label else reason
+                for reason in reasons
+            ))
+    if not available:
+        return NoAccountWithRoom(EarliestReset(min(resets)) if resets else NoResetKnown(), tuple(reasons))
+    def order(item: PickedAccount) -> tuple[bool, bool, datetime, float, str]:
+        kept = isinstance(keep, KeepAccount) and (agent_accounts.codex_home_matches_label(item.dir, keep.label)
+                                                 if tool == "codex" else keep.label == item.label)
+        return (tool == "codex" and prefer_weekly_room and item.label not in allowance_available,
+                not kept,
+                item.weekly_reset.at if isinstance(item.weekly_reset, KnownReset) else datetime.max.replace(tzinfo=timezone.utc),
+                -item.weekly_left, item.label)
+    chosen = min(available, key=order)
+    return replace(chosen, reasons=tuple(replace(reason, status="picked") if reason.label == chosen.label else reason for reason in reasons))
+
+
+def codex_destination_uses_credits(chosen: PickedAccount, now: datetime) -> bool:
+    """A destination needs paid credits when either included window cannot serve work."""
+    for reason in chosen.reasons:
+        if reason.label == chosen.label:
+            return not all(isinstance(window, ReadingWindow) and window.left > 0
+                           and isinstance(window.reset, KnownReset) and window.reset.at > now
+                           for window in (reason.weekly, reason.five_hour))
+    return chosen.weekly_left <= 0
+
+
+
+ClaudeGroup = Literal["units", "showrunners"]
+CLAUDE_GROUPS: tuple[ClaudeGroup, ...] = ("units", "showrunners")
+
+
+@dataclass(frozen=True)
+class GroupNotConfigured:
+    """No account was explicitly selected for this group."""
+
+    @override
+    def __str__(self) -> str:
+        return "not configured"
+
+
+GROUP_NOT_CONFIGURED = GroupNotConfigured()
+
+
+@dataclass(frozen=True)
+class AccountDecisionNow:
+    """Use the current time for this account decision."""
+
+
+ACCOUNT_DECISION_NOW = AccountDecisionNow()
+
+
+class GroupAccounts(TypedDict, total=False):
+    units: str
+    showrunners: str
+
+
+class GroupAccountChange(TypedDict):
+    at: str
+    group: ClaudeGroup
+    label: str
+    why: str
+
+
+@dataclass(frozen=True)
+class UnitsResetSoonest:
+    """Spend the allowance with the earliest weekly renewal first."""
+
+
+@dataclass(frozen=True)
+class ShowrunnersMostLeft:
+    """Keep showrunners on the account with the most weekly allowance."""
+
+
+@dataclass(frozen=True)
+class GroupNoRoom:
+    """Keep the group's selected account because every destination refused."""
+    outcome: NoAccountWithRoom
+
+
+@dataclass(frozen=True)
+class GroupPlacement:
+    group: ClaudeGroup
+    label: str | GroupNotConfigured
+    dir: Path | GroupNotConfigured
+    reason: UnitsResetSoonest | ShowrunnersMostLeft | GroupNoRoom
+    reasons: tuple[PickReason, ...] = ()
+
+
+def groups_file() -> Path:
+    return accounts_home() / ".local" / "state" / "accounts" / "groups.json"
+
+
+def _stored_groups() -> GroupAccounts:
+    path = groups_file()
+    try:
+        raw = _read_json_object(path)
+    except FileNotFoundError:
+        return GroupAccounts()
+    except (OSError, ValueError, TypeError) as error:
+        raise AccountsError(f"accounts: could not read {path}: {error}") from error
+    result = GroupAccounts()
+    for group in CLAUDE_GROUPS:
+        if group not in raw:
+            continue
+        label = raw[group]
+        if not isinstance(label, str):
+            raise AccountsError(f"accounts: {path} has an invalid {group} account")
+        if label != "default":
+            _ = account_dir(label)
+        result[group] = label
+    return result
+
+
+def session_group(session: Session) -> ClaudeGroup | Literal["ungrouped"]:
+    if session["kind"] == "unit":
+        return "units"
+    if session["kind"] == "showrunner":
+        return "showrunners"
+    return "ungrouped"
+
+
+def live_group_members() -> dict[ClaudeGroup, list[Session]]:
+    """Classify local live owners using shutdown's existing production inventory."""
+    sys.path.insert(0, str(SCRIPTS / "shutdown"))
+    if TYPE_CHECKING:
+        from scripts.shutdown import inventory
+        from scripts.message import sessions
+    else:
+        inventory = import_module("inventory")
+        sessions = import_module("sessions")
+    members: dict[ClaudeGroup, list[Session]] = {"units": [], "showrunners": []}
+    logins = {identity.login.casefold() for item in sessions.live_sessions()
+              if (identity := account.account_of(item["pid"])) is not None}
+    for login in sorted(logins):
+        for session in inventory.inventory(login, refresh_desktops=False)["sessions"]:
+            group = session_group(session)
+            if group != "ungrouped":
+                members[group].append(session)
+    return members
+
+
+def session_account_label(session: Session) -> str:
+    directory = Path(session.get("config_dir", str(main_config_dir())))
+    current = account_identity(directory)
+    default = account_identity(main_config_dir())
+    if directory == main_config_dir() or (isinstance(current, agent_accounts.KnownClaudeAccount)
+            and isinstance(default, agent_accounts.KnownClaudeAccount) and current.login.casefold() == default.login.casefold()):
+        return "default"
+    for named in _existing_named_accounts():
+        identity = account_identity(named.dir)
+        if isinstance(current, agent_accounts.KnownClaudeAccount) and isinstance(identity, agent_accounts.KnownClaudeAccount) and current.login.casefold() == identity.login.casefold():
+            return named.label
+    raise AccountsError(f"accounts: live session {session['name']} uses an account outside the configured Claude directories")
+
+
+def account_labels_for_logins(logins: frozenset[str]) -> frozenset[str]:
+    """Exclude every alias of an account, including the default directory."""
+    labels: set[str] = set()
+    for label, directory in [("default", main_config_dir()), *((item.label, item.dir) for item in checked_named_accounts())]:
+        identity = account_identity(directory)
+        if isinstance(identity, agent_accounts.KnownClaudeAccount) and identity.login.casefold() in logins:
+            labels.add(label)
+    return frozenset(labels)
+
+
+def placement(group: ClaudeGroup, now: datetime, *, exclude: frozenset[str] = _NO_EXCLUSIONS) -> GroupPlacement:
+    """Rank working Claude accounts for a group; percentages alone refuse none."""
+    chosen = pick("claude", now, exclude=exclude, keep=NoKeep())
+    if isinstance(chosen, NoAccountWithRoom):
+        label = group_label(group_accounts(), group)
+        directory = (main_config_dir() if label == "default" else account_dir(label)) if isinstance(label, str) else GROUP_NOT_CONFIGURED
+        return GroupPlacement(group, label, directory, GroupNoRoom(chosen), chosen.reasons)
+    eligible: list[PickedAccount] = []
+    for reason in chosen.reasons:
+        if not reason.status.startswith("has room") and reason.status != "picked" and not reason.status.startswith("no fresh readings"):
+            continue
+        directory = main_config_dir() if reason.label == "default" else account_dir(reason.label)
+        identity = account_identity(directory)
+        if isinstance(identity, agent_accounts.UnreadableClaudeAccount):
+            continue
+        reading = refusals.stored_reading("claude", identity.login, now)
+        weekly = reading.weekly if isinstance(reading, FreshReading) else NoWindow()
+        eligible.append(PickedAccount(reason.label, directory, weekly.left if isinstance(weekly, ReadingWindow) else 0,
+            weekly.reset if isinstance(weekly, ReadingWindow) else NoResetKnown()))
+    if not eligible:
+        eligible = [chosen]
+    def order(candidate: PickedAccount) -> tuple[datetime, float, str]:
+        reset = candidate.weekly_reset.at if isinstance(candidate.weekly_reset, KnownReset) else datetime.max.replace(tzinfo=timezone.utc)
+        return (reset, -candidate.weekly_left, "" if candidate.label == "default" else candidate.label)
+    selected = min(eligible, key=order) if group == "units" else min(eligible, key=lambda item: (-item.weekly_left, *order(item)))
+    reason = UnitsResetSoonest() if group == "units" else ShowrunnersMostLeft()
+    return GroupPlacement(group, selected.label, selected.dir, reason, chosen.reasons)
+
+
+def group_label(groups: GroupAccounts, group: ClaudeGroup) -> str | GroupNotConfigured:
+    """Convert the optional JSON key into its configuration meaning."""
+    return groups.get(group, GROUP_NOT_CONFIGURED)
+
+
+def group_configuration_line(group: ClaudeGroup) -> str:
+    return f"{group}: not configured — accounts.py move {group} <claude N>"
+
+
+def group_status_line(groups: GroupAccounts) -> str:
+    return f"units: {group_label(groups, 'units')}, showrunners: {group_label(groups, 'showrunners')}"
+
+
+@contextmanager
+def _groups_lock() -> Generator[None]:
+    path = groups_file().with_suffix(".lock")
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as output:
+        fcntl.flock(output.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(output.fileno(), fcntl.LOCK_UN)
+
+
+def _save_groups(groups: GroupAccounts, previous: GroupAccounts, why: str, now: datetime) -> None:
+    path = groups_file()
+    prior_file = _previous_accounts_configuration_file(path)
+    history = roles_history_file()
+    size = history.stat().st_size if history.exists() else -1
+    try:
+        _atomic_write(path, json.dumps(groups, sort_keys=True) + "\n")
+        changes = [GroupAccountChange(at=now.isoformat(), group=group, label=label, why=why)
+                   for group in CLAUDE_GROUPS if isinstance(label := group_label(groups, group), str)
+                   and group_label(previous, group) != label]
+        if changes:
+            history.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+            with history.open("a", encoding="utf-8") as output:
+                for change in changes:
+                    _ = output.write(json.dumps(change, sort_keys=True) + "\n")
+    except OSError as error:
+        _restore_accounts_configuration_file(path, prior_file)
+        if size < 0:
+            history.unlink(missing_ok=True)
+        elif history.exists():
+            with history.open("r+b") as output:
+                _ = output.truncate(size)
+        raise AccountsError(f"accounts: could not write group selection: {error}") from error
+
+
+def group_accounts() -> GroupAccounts:
+    """Read only explicit group selections; an absent key stays unconfigured."""
+    return _stored_groups()
+
+
+def set_group_account(group: ClaudeGroup, label: str, *, why: str, now: datetime | AccountDecisionNow = ACCOUNT_DECISION_NOW) -> None:
+    if label != "default":
+        _ = account_dir(label)
+    at = now if isinstance(now, datetime) else datetime.now(timezone.utc)
+    with _groups_lock():
+        stored = _stored_groups()
+        selected: GroupAccounts = stored.copy()
+        selected[group] = label
+        with _roles_lock():
+            _save_groups(selected, stored, why, at)
+
+
+def placement_report(now: datetime | AccountDecisionNow = ACCOUNT_DECISION_NOW) -> str:
+    at = now if isinstance(now, datetime) else datetime.now(timezone.utc)
+    groups = group_accounts()
+    room = pick("claude", at, keep=NoKeep())
+    lines = [group_status_line(groups)]
+    lines.extend(_pick_explanation(reason) for reason in room.reasons)
+    for group in CLAUDE_GROUPS:
+        configured = group_label(groups, group)
+        if isinstance(configured, GroupNotConfigured):
+            lines.append(group_configuration_line(group))
+            continue
+        excluded = frozenset({configured})
+        directory = main_config_dir() if configured == "default" else account_dir(configured)
+        identity = account_identity(directory)
+        if isinstance(identity, agent_accounts.KnownClaudeAccount):
+            excluded |= account_labels_for_logins(frozenset({identity.login.casefold()}))
+        chosen = placement(group, at, exclude=excluded)
+        reason_text = (no_room_line("claude", chosen.reason.outcome) if isinstance(chosen.reason, GroupNoRoom) else
+                       "soonest weekly reset" if isinstance(chosen.reason, UnitsResetSoonest) else "most weekly left")
+        lines.append(f"{group} on refusal: {chosen.label}; {reason_text}")
+    return "\n".join(lines)
+
+
+def no_room_line(tool: str, outcome: NoAccountWithRoom) -> str:
+    reset = outcome.earliest_reset
+    time = reset.at.astimezone(agent_accounts.user_zone()).strftime("%a %Y-%m-%d %H:%M %Z") if isinstance(reset, EarliestReset) else "unknown"
+    return f"no {tool} account has room; the earliest reset is {time}"
+
+
+def _pick_explanation(reason: PickReason) -> str:
+    weekly = f"{reason.weekly.left:g}%" if isinstance(reason.weekly, ReadingWindow) else "unavailable"
+    reset = (reason.weekly.reset.at.astimezone(agent_accounts.user_zone()).strftime("%a %Y-%m-%d %H:%M %Z")
+             if isinstance(reason.weekly, ReadingWindow) and isinstance(reason.weekly.reset, KnownReset) else "unknown")
+    five = f"{reason.five_hour.left:g}%" if isinstance(reason.five_hour, ReadingWindow) else "no window"
+    return f"{reason.label}: weekly {weekly}, resets {reset}, 5-hour {five}; {reason.status}"
 
 
 def readings_file() -> Path:
@@ -1133,9 +1678,9 @@ def _iso_time(text: str, place: str) -> datetime:
         raise AccountsError(f"accounts: {place} must be an ISO timestamp") from error
     if at.tzinfo is None:
         # Command-line and historical wall times use the user's zone.
-        from zoneinfo import ZoneInfo
+        from scripts.lib.user_zone import user_zone
 
-        at = at.replace(tzinfo=ZoneInfo("America/Los_Angeles"))
+        at = at.replace(tzinfo=user_zone())
     return at.astimezone(timezone.utc)
 
 
@@ -1191,6 +1736,8 @@ def _unit_role_history(default_label: str) -> list[UnitRoleAssignment]:
             if not isinstance(decoded, dict):
                 raise ValueError("expected a JSON object")
             values = cast(dict[str, object], decoded)
+            if values.get("group") in ("units", "showrunners"):
+                continue
             role = values.get("role")
             if role not in {"unit", "seats"}:
                 raise ValueError("invalid role")
@@ -1198,7 +1745,7 @@ def _unit_role_history(default_label: str) -> list[UnitRoleAssignment]:
             if not isinstance(label, str) or not isinstance(stamp, str):
                 raise ValueError("invalid label or timestamp")
             if label != "default":
-                _ = account_dir(label) if role == "unit" else codex_account_home(label)
+                _ = account_dir(label) if role == "unit" else _codex_account_home(label)
             if role == "seats":
                 _ = _iso_time(stamp, "role time")
                 if "account_label" in values and not isinstance(values["account_label"], str):
@@ -1226,10 +1773,16 @@ def _unit_role_history(default_label: str) -> list[UnitRoleAssignment]:
     return sorted(history, key=lambda assignment: assignment.at)
 
 
+# Fixed account roles ended when account selection moved to available room.
+UNIT_ROLE_ENDED_AT = datetime(2026, 10, 13, tzinfo=timezone.utc)
+
+
 def _historical_roles(
     label: str, at: datetime, default_label: str, history: list[UnitRoleAssignment],
     fallback_unit: str,
 ) -> tuple[agent_accounts.ClaudeRole, ...]:
+    if at >= UNIT_ROLE_ENDED_AT:
+        return ()
     unit_label = default_label if history else fallback_unit
     for assignment in history:
         if assignment.at > at:
@@ -1256,8 +1809,7 @@ def burn(since: datetime, until: datetime) -> list[AccountRoleBurn]:
     default = selection.default_account
     default_label = default.label if isinstance(default, agent_accounts.KnownClaudeAccount) else ""
     history = _unit_role_history(default_label)
-    unit = selection.unit_account
-    fallback_unit = unit.label if isinstance(unit, agent_accounts.KnownClaudeAccount) else ""
+    fallback_unit = default_label
     totals: dict[tuple[str, tuple[agent_accounts.ClaudeRole, ...]], tuple[float, float]] = {}
     for label, observations in _quota_observations().items():
         for before, after in zip(observations, observations[1:]):
@@ -1267,6 +1819,9 @@ def burn(since: datetime, until: datetime) -> list[AccountRoleBurn]:
             seconds = (after.at - before.at).total_seconds()
             rate = (before.remaining - after.remaining) / seconds
             boundaries = [start, *(assignment.at for assignment in history if start < assignment.at < end), end]
+            if start < UNIT_ROLE_ENDED_AT < end:
+                boundaries.append(UNIT_ROLE_ENDED_AT)
+            boundaries.sort()
             for left, right in zip(boundaries, boundaries[1:]):
                 span = (right - left).total_seconds()
                 if span <= 0:
@@ -1373,7 +1928,7 @@ def _write_role(role: str, label: str, account_label: str) -> PreviousRoleSelect
             elif label == "default":
                 _ = configuration.pop("seats", None)
             else:
-                _ = codex_account_home(label)
+                _ = _codex_account_home(label)
                 configuration["seats"] = label
             _atomic_write(path, json.dumps(configuration, indent=2, sort_keys=True) + "\n")
         except (OSError, ValueError) as error:
@@ -1397,160 +1952,317 @@ def _write_role(role: str, label: str, account_label: str) -> PreviousRoleSelect
     return PreviousRoleSelection(previous_label, previous)
 
 
-def _write_unit_role(label: str, identity: agent_accounts.KnownClaudeAccount) -> PreviousRoleSelection:
-    return _write_role("unit", label, identity.label)
-
-
-def _restore_unit_role(previous: PreviousRoleSelection, account_label: str) -> None:
-    """Undo the unit move without discarding a seats write made during shutdown."""
-    with _roles_lock():
-        path = accounts_config_file()
-        configuration = _read_accounts_configuration()
-        earlier = (cast(dict[str, object], json.loads(previous.configuration.contents))
-                   if isinstance(previous.configuration, ExistingAccountsConfigurationFile) else {})
-        if configuration.get("seats") == earlier.get("seats"):
-            _restore_accounts_configuration_file(path, previous.configuration)
-        else:
-            if previous.label == "default":
-                _ = configuration.pop("unit", None)
-            else:
-                configuration["unit"] = previous.label
-            _atomic_write(path, json.dumps(configuration, indent=2, sort_keys=True) + "\n")
-        _append_role_change("unit", previous.label, account_label)
-
-
 def set_role(role: str, label: str) -> None:
     """Atomically select a readable account and preserve its note identity."""
     _validate_role(role)
     if role == "seats":
         home = _seats_home()
         target = check_codex_target(label, home)
-        _ = _write_role(role, label, target.label)
+        _ = _write_role(role, target.label if CODEX_LABEL_PATTERN.fullmatch(target.label) else label, target.label)
         return
-    if label == "default":
-        identity = account_identity(main_config_dir())
-    else:
-        directory = account_dir(label)
-        default = account_identity(main_config_dir())
-        if isinstance(default, agent_accounts.KnownClaudeAccount) and label.casefold() == default.label.casefold():
-            raise AccountsError(f"accounts: {label} is the default account; use default")
-        identity = account_identity(directory)
-        if (
-            isinstance(default, agent_accounts.KnownClaudeAccount)
-            and isinstance(identity, agent_accounts.KnownClaudeAccount)
-            and identity.login.casefold() == default.login.casefold()
-        ):
-            raise AccountsError(f"accounts: {label} is the default account; use default")
-    if isinstance(identity, agent_accounts.UnreadableClaudeAccount):
-        raise AccountsError(f"accounts: account identity for {label} is unreadable")
-    _ = _write_unit_role(label, identity)
-
-
-def _status_object(value: object, place: str) -> dict[str, object]:
-    if not isinstance(value, dict):
-        raise AccountsError(f"accounts: shutdown inventory {place} must be an object")
-    return cast(dict[str, object], value)
-
-
-def _status_string(values: dict[str, object], field: str, place: str, *, allow_empty: bool = False) -> str:
-    value = values.get(field)
-    if not isinstance(value, str) or (not value and not allow_empty):
-        raise AccountsError(f"accounts: shutdown inventory {place}.{field} must be a nonempty string")
-    return value
-
-
-def _status_list(values: dict[str, object], field: str, place: str) -> list[object]:
-    value = values.get(field)
-    if not isinstance(value, list):
-        raise AccountsError(f"accounts: shutdown inventory {place}.{field} must be a list")
-    return cast(list[object], value)
-
-
-def _swap_session(value: object, place: str) -> SwapSession:
-    values = _status_object(value, place)
-    session_id = _status_string(values, "session_id", place)
-    name = _status_string(values, "name", place, allow_empty=True) or session_id
-    kind = values.get("kind")
-    if kind == "unit":
-        return SwapUnitSession(kind="unit", session_id=session_id, name=name)
-    if kind in ("showrunner", "top-level"):
-        return SwapOtherSession(kind=kind, session_id=session_id, name=name)
-    if kind == "seat":
-        owner_values = _status_object(values.get("owner"), f"{place}.owner")
-        owner: SwapDirectorOwner | SwapNoDirector
-        if owner_values.get("kind") == "director":
-            owner = SwapDirectorOwner(kind="director", session_id=_status_string(owner_values, "session_id", f"{place}.owner"))
-        elif owner_values.get("kind") == "no director":
-            owner = SwapNoDirector(kind="no director")
-        else:
-            raise AccountsError(f"accounts: shutdown inventory {place}.owner.kind is invalid")
-        return SwapSeatSession(kind="seat", session_id=session_id, name=name, owner=owner)
-    raise AccountsError(f"accounts: shutdown inventory {place}.kind is invalid")
-
-
-def _swap_inventories(text: str, old: agent_accounts.KnownClaudeAccount) -> list[SwapInventory]:
-    try:
-        decoded = cast(object, json.loads(text))
-    except ValueError as error:
-        raise AccountsError(f"accounts: shutdown inventory is invalid JSON: {error}") from error
-    if not isinstance(decoded, list) or not decoded:
-        raise AccountsError("accounts: shutdown inventory must be a nonempty list of machines")
-    inventories: list[SwapInventory] = []
-    for index, value in enumerate(cast(list[object], decoded)):
-        place = f"machines[{index}]"
-        values = _status_object(value, place)
-        machine = _status_string(values, "machine", place)
-        if values.get("unreachable") or values.get("status") == "unavailable":
-            raise AccountsError(f"accounts: {machine}: old account inventory unavailable")
-        login = _status_string(values, "login", place)
-        if login.casefold() != old.login.casefold():
-            raise AccountsError(f"accounts: {machine}: inventory is not for {old.label}")
-        sessions = [_swap_session(item, f"{place}.sessions[{i}]")
-                    for i, item in enumerate(_status_list(values, "sessions", place))]
-        unattributed: list[SwapUnattributedSession] = []
-        for i, item in enumerate(_status_list(values, "unattributed", place)):
-            item_place = f"{place}.unattributed[{i}]"
-            unknown = _status_object(item, item_place)
-            pid = unknown.get("pid")
-            if isinstance(pid, bool) or not isinstance(pid, int):
-                raise AccountsError(f"accounts: shutdown inventory {item_place}.pid must be an integer")
-            unattributed.append(SwapUnattributedSession(
-                name=_status_string(unknown, "name", item_place, allow_empty=True) or str(pid), pid=pid,
-                reason=_status_string(unknown, "reason", item_place),
-            ))
-        inventories.append(SwapInventory(
-            machine=machine, login=login, label=_status_string(values, "label", place),
-            sessions=sessions, unattributed=unattributed,
-        ))
-    return inventories
-
-
-def _require_moving_sessions(inventories: list[SwapInventory], old_label: str) -> None:
-    # Shutdown status lists this machine first; only its unit role is written.
-    for index, found in enumerate(inventories):
-        units = {session["session_id"] for session in found["sessions"] if session["kind"] == "unit"}
-        for session in found["sessions"]:
-            if index == 0 and session["kind"] == "unit":
-                continue
-            if index == 0 and session["kind"] == "seat":
-                owner = session["owner"]
-                if owner["kind"] == "director" and owner["session_id"] in units:
-                    continue
-            raise AccountsError(
-                f"accounts: cannot swap {old_label}: {found['machine']} {session['kind']} {session['name']} would not move"
-            )
-        for unknown in found["unattributed"]:
-            raise AccountsError(
-                f"accounts: cannot swap {old_label}: {found['machine']} unattributed session {unknown['name']} (pid {unknown['pid']})"
-            )
+    raise AccountsError(UNIT_ROLE_GONE)
 
 
 def _shutdown_argv(*arguments: str) -> tuple[str, ...]:
     return (sys.executable, str(SCRIPTS / "shutdown" / "shutdown.py"), *arguments)
 
 
+@dataclass(frozen=True)
+class MoveRefused:
+    reason: str
+
+
+@dataclass(frozen=True)
+class SessionMoveRequested:
+    session_id: str
+    request_id: str
+    target: str
+    stdout: str = ""
+    stderr: str = ""
+    returncode: int = 0
+
+
+@dataclass(frozen=True)
+class SessionMoveRefused:
+    session_id: str
+    reason: str
+    stdout: str = ""
+    stderr: str = ""
+    returncode: int = 1
+
+
+def move_sessions(ids: tuple[str, ...], target: str, *, why: str) -> tuple[SessionMoveRequested | SessionMoveRefused, ...]:
+    """Start one selected shutdown for each source login and report each owner's record."""
+    from uuid import uuid4
+    sys.path.insert(0, str(SCRIPTS / "shutdown"))
+    if TYPE_CHECKING:
+        from scripts.shutdown import inventory, record
+        from scripts.message import sessions
+    else:
+        inventory = import_module("inventory")
+        record = import_module("record")
+        sessions = import_module("sessions")
+    outcomes: dict[str, SessionMoveRequested | SessionMoveRefused] = {}
+    owners: dict[str, Session] = {}
+    groups: dict[str, list[str]] = {}
+
+    def refuse(session_id: str, reason: str, *, stdout: str = "", stderr: str = "", returncode: int = 1) -> None:
+        outcomes[session_id] = SessionMoveRefused(session_id, reason, stdout, stderr, returncode)
+        name = owners[session_id]["name"] if session_id in owners else session_id
+        moves.append_move(moves.FailedMove(kind="failed", at=datetime.now(timezone.utc).isoformat(),
+            tool="claude", subject=session_id + ": " + name, move_id=uuid4().hex, reason=reason))
+
+    try:
+        destination = _move_target(target)
+        if isinstance(destination, MoveRefused):
+            for session_id in ids:
+                refuse(session_id, destination.reason)
+            return tuple(outcomes[session_id] for session_id in ids)
+        live = {item["sessionId"]: item for item in sessions.live_sessions()}
+        before = {saved["session"]["session_id"] for saved in record.all_session_records()}
+        for session_id in ids:
+            found = live.get(session_id)
+            if found is None:
+                refuse(session_id, "session is not live on this machine")
+                continue
+            directory = account.process_config_dir(found["pid"])
+            identity = account_identity(directory) if directory is not None else agent_accounts.UnreadableClaudeAccount()
+            if isinstance(identity, agent_accounts.UnreadableClaudeAccount):
+                refuse(session_id, "account unreadable")
+                continue
+            if session_id in before:
+                refuse(session_id, "already has a shutdown in progress")
+                continue
+            selected = [item for item in inventory.inventory(identity.login, frozenset({session_id}), refresh_desktops=False)["sessions"]
+                        if item["session_id"] == session_id and item["kind"] != "seat"]
+            if not selected:
+                refuse(session_id, "live owner account could not be confirmed")
+                continue
+            owners[session_id] = selected[0]
+            if identity.login.casefold() == destination.login.casefold():
+                refuse(session_id, "already on " + destination.label)
+                continue
+            groups.setdefault(identity.login, []).append(session_id)
+        for login, selected_ids in groups.items():
+            source = account.label_for("Claude", login)
+            command = _shutdown_argv("down", source, "--here", "--only", ",".join(selected_ids),
+                "--restart", "--to", target, "--why", why)
+            try:
+                prior_requests = {(entry["move_id"], entry["subject"]) for entry in moves.read_moves()
+                                  if entry["kind"] == "requested"}
+                result = subprocess.run(command, capture_output=True, text=True, check=False,
+                    env={**os.environ, "REFUSAL_WATCH_INVENTORY": "read existing"})
+                saved_by_id = {saved["session"]["session_id"]: saved for saved in record.all_session_records()}
+                for session_id in selected_ids:
+                    saved = saved_by_id.get(session_id)
+                    if saved is None or saved.get("target") != target:
+                        # A fast conductor may already have archived a confirmed restart.
+                        journal_request = next((entry for entry in reversed(moves.read_moves())
+                            if entry["kind"] == "requested" and entry["tool"] == "claude" and entry["to"] == target
+                            and entry["subject"] == session_id + ": " + owners[session_id]["name"]
+                            and (entry["move_id"], entry["subject"]) not in prior_requests), None)
+                        if journal_request is not None:
+                            outcomes[session_id] = SessionMoveRequested(session_id, journal_request["move_id"], target,
+                                result.stdout, result.stderr, result.returncode)
+                            continue
+                        refuse(session_id, result.stderr.strip() or result.stdout.strip() or "shutdown refused before a record was created",
+                            stdout=result.stdout, stderr=result.stderr, returncode=result.returncode or 1)
+                        continue
+                    outcome = SessionMoveRequested(session_id, saved["request_id"], target,
+                        result.stdout, result.stderr, result.returncode)
+                    outcomes[session_id] = outcome
+                    if not any(entry["kind"] == "requested" and entry["move_id"] == saved["request_id"]
+                            and entry["subject"] == session_id + ": " + owners[session_id]["name"] for entry in moves.read_moves()):
+                        request: moves.RequestedMove = {"kind": "requested", "at": saved["requested_at"],
+                            "tool": "claude", "subject": session_id + ": " + owners[session_id]["name"],
+                            "move_id": saved["request_id"], "from": saved.get("source_label", source),
+                            "to": target, "why": why, "window": "unknown"}
+                        refusal = refusals.load().get(refusals.key("claude", login))
+                        if refusal is not None:
+                            request["window"] = refusal.window.name if isinstance(refusal.window, refusals.KnownWindow) else "unknown"
+                            if isinstance(refusal.reset, refusals.KnownReset):
+                                request["reset"] = refusal.reset.at.isoformat()
+                        moves.append_move(request)
+            except (OSError, ValueError, record.InvalidRecord) as error:
+                for session_id in selected_ids:
+                    refuse(session_id, str(error))
+    except (AccountsError, OSError, ValueError, inventory.InvalidInventory, record.InvalidRecord) as error:
+        for session_id in ids:
+            if session_id not in outcomes:
+                refuse(session_id, str(error))
+    return tuple(outcomes[session_id] for session_id in ids)
+
+
+@dataclass(frozen=True)
+class MoveStarted:
+    session_id: str
+    target: str
+    stdout: str
+    stderr: str
+    returncode: int
+
+
+@dataclass(frozen=True)
+class MoveStartFailed:
+    session_id: str
+    target: str
+    stdout: str
+    stderr: str
+    returncode: int
+
+
+@dataclass(frozen=True)
+class GroupMoveStartFailed:
+    session_ids: tuple[str, ...]
+    target: str
+    stdout: str
+    stderr: str
+    returncode: int
+
+
+@dataclass(frozen=True)
+class GroupMoveDryRun:
+    session_ids: tuple[str, ...]
+    lines: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class GroupMoveStarted:
+    session_ids: tuple[str, ...]
+    target: str
+    stdout: str
+    stderr: str
+    returncode: int
+
+
+def _move_target(target: str) -> agent_accounts.KnownClaudeAccount | MoveRefused:
+    default = account_identity(main_config_dir())
+    destination = default if target == "default" else account_identity(account_dir(target))
+    if target != "default" and isinstance(default, agent_accounts.KnownClaudeAccount) and (
+        target.casefold() == default.label.casefold() or
+        isinstance(destination, agent_accounts.KnownClaudeAccount) and
+        destination.login.casefold() == default.login.casefold()
+    ):
+        return MoveRefused(f"{target} is the default account; use default")
+    problems = check(target)
+    if problems:
+        return MoveRefused(problems[0])
+    if isinstance(destination, agent_accounts.UnreadableClaudeAccount):
+        return MoveRefused(f"account identity for {target} is unreadable")
+    return destination
+
+
+def move_group(group: ClaudeGroup, target: str, *, dry_run: bool = False, why: str = "") -> GroupMoveStarted | GroupMoveStartFailed | GroupMoveDryRun | MoveRefused:
+    """Select the group's account before requesting each off-target member's move."""
+    if target != "default":
+        try:
+            _ = account_dir(target)
+        except AccountsError as error:
+            return MoveRefused(str(error))
+    prepared = prepared_account(target, resume=True)
+    if isinstance(prepared, AccountRefused):
+        return MoveRefused(prepared.reason)
+    if target != "default":
+        default = _directory_identity(main_config_dir())
+        expected = _account_note(target)
+        if isinstance(default, ClaudeDirectoryLogin) and isinstance(expected, ExpectedAccountLogin) and expected.login.casefold() == default.login.casefold():
+            target = "default"
+    members = live_group_members()[group]
+    selected = [session for session in members if not session_on_account(session, target)]
+    ids = tuple(session["session_id"] for session in selected)
+    reason = why or f"{group} moved by hand"
+    notices = (f"{group}: no live session moves",) if not ids else ()
+    if group == "showrunners":
+        if TYPE_CHECKING:
+            from scripts.shutdown import inventory
+        else:
+            inventory = import_module("inventory")
+        notices += tuple(
+            f"{runner['slug']}: no session runs under the id its update timer names; a showrunner running "
+            + f"under another id is not moved until it runs `update_registration.py register --production {runner['doc']}`"
+            for runner in inventory.unregistered_showrunners())
+    if dry_run:
+        return GroupMoveDryRun(ids, (f"{group}: would select {target}",
+            *(f"{item['name']}: {item['session_id']}" for item in selected), *notices))
+    set_group_account(group, target, why=reason)
+    results = move_sessions(ids, target, why=reason) if ids else ()
+    stdout = ("\n".join(notices) + "\n" if notices else "") + "".join(dict.fromkeys(item.stdout for item in results))
+    stderr = "".join(dict.fromkeys(item.stderr for item in results))
+    refused = [item for item in results if isinstance(item, SessionMoveRefused)]
+    if refused:
+        stderr += "\n".join(item.reason for item in refused if not item.stderr) + "\n"
+    code = max((item.returncode for item in results), default=0)
+    outcome = GroupMoveStartFailed if refused or code else GroupMoveStarted
+    return outcome(ids, target, stdout, stderr, code or (1 if refused else 0))
+
+
+def session_on_account(session: Session, label: str) -> bool:
+    target = main_config_dir() if label == "default" else account_dir(label)
+    current = account_identity(Path(session.get("config_dir", str(main_config_dir()))))
+    destination = account_identity(target)
+    return (isinstance(current, agent_accounts.KnownClaudeAccount)
+            and isinstance(destination, agent_accounts.KnownClaudeAccount)
+            and current.login.casefold() == destination.login.casefold())
+
+
+def move(session: str, target: str, *, why: str = "") -> MoveStarted | MoveStartFailed | MoveRefused:
+    """Move one local live owner after completing every read-only refusal check."""
+    sys.path.insert(0, str(SCRIPTS / "shutdown"))
+    if TYPE_CHECKING:
+        from scripts.shutdown import inventory, record
+        from scripts.message import sessions
+    else:
+        inventory = import_module("inventory")
+        record = import_module("record")
+        sessions = import_module("sessions")
+
+    try:
+        live = sessions.live_sessions()
+        matches = [item for item in live if item["sessionId"] == session]
+        if not matches:
+            matches = [item for item in live if item["name"] == session]
+        if not matches:
+            return MoveRefused(f"no live session by id or name {session} on this machine; a session on the other machine moves from there")
+        if len(matches) != 1:
+            return MoveRefused(f"{session} names multiple live sessions: " + ", ".join(item["sessionId"] for item in matches))
+        found = matches[0]
+        directory = account.process_config_dir(found["pid"])
+        if directory is None:
+            return MoveRefused(f"{found['name'] or session}: account unreadable")
+        current = account_identity(directory)
+        if isinstance(current, agent_accounts.UnreadableClaudeAccount):
+            return MoveRefused(f"{found['name'] or session}: account unreadable")
+        report = inventory.inventory(current.login, frozenset((found["sessionId"],)))
+        owners = [item for item in report["sessions"] if item["session_id"] == found["sessionId"]]
+        if not owners:
+            return MoveRefused(f"{found['name'] or session}: live session account could not be confirmed")
+        owner = owners[0]
+        name = owner["name"] or owner["session_id"]
+        if owner["kind"] == "seat":
+            return MoveRefused("seats move with their unit director")
+        group = session_group(owner)
+        if group != "ungrouped":
+            return MoveRefused(f"{name} belongs to {group}; use accounts.py move {group} {target}")
+        destination = _move_target(target)
+        if isinstance(destination, MoveRefused):
+            return destination
+        if destination.login.casefold() == current.login.casefold():
+            return MoveRefused(f"{name} is already on {destination.label}")
+        if any(saved["session"]["session_id"] == owner["session_id"] for saved in record.all_session_records()):
+            return MoveRefused(f"{name} already has a shutdown in progress")
+        if owner["host"]["kind"] == "unknown":
+            restart = cast(ManualMoveResume, cast(object, import_module("restart")))
+            print(f"run this once {name} has exited: {restart.resume_command(owner, target, current.label, why)}", flush=True)
+        command = _shutdown_argv("down", current.label, "--here", "--only", owner["session_id"], "--restart", "--to", target, "--why", why or f"{current.label} is out of usage")
+        result = subprocess.run(command, capture_output=True, text=True, check=False)
+        outcome = MoveStartFailed if result.returncode else MoveStarted
+        return outcome(owner["session_id"], target, result.stdout, result.stderr, result.returncode)
+    except (AccountsError, record.InvalidRecord, inventory.InvalidInventory, OSError, ValueError) as error:
+        return MoveRefused(str(error))
+
+
 def check_codex_target(label: str, seats_home: Path) -> SelectableCodexAccount:
-    home = accounts_home() / ".codex" if label == "default" else codex_account_home(label)
+    home = accounts_home() / ".codex" if label == "default" else _codex_account_home(label)
     problems = (_check_default_codex_home(seats_home) if label == "default"
                 else _check_codex_home(label, seats_home))
     if problems:
@@ -1562,14 +2274,9 @@ def check_codex_target(label: str, seats_home: Path) -> SelectableCodexAccount:
     return SelectableCodexAccount(home, login, account.label_for("Codex", login))
 
 
-def codex_home_label(home: Path, login: str | None = None) -> str:
-    """The signed-in account's note label, or the numbered home's intended account."""
-    if login:
-        return account.label_for("Codex", login)
-    match = re.fullmatch(r"\.codex([1-9][0-9]*)", home.name)
-    if home.parent == accounts_home() and match:
-        return agent_accounts.codex_home_role_label(home)
-    return NO_VALUE
+def codex_home_label(home: Path) -> str:
+    """The account's note label, or its folder when the login has no note."""
+    return agent_accounts.codex_home_role_label(home)
 
 
 def _retire_seats_servers(home: Path, label: str, *, dry_run: bool) -> list[str]:
@@ -1590,9 +2297,11 @@ def _swap_seats(label: str, *, dry_run: bool) -> SeatsSwapOutcome:
     if (not report.email or report.email.casefold() != target.login.casefold()
             or _codex_home_login(target_home).casefold() != target.login.casefold()):
         raise AccountsError(f"accounts: cannot read {account_label} ({_codex_folder(target_home)}); check its sign-in and try again")
-    readiness = agent_accounts.codex_can_work(report, datetime.now(timezone.utc))
+    credits = agent_accounts.codex_credits_setting(account_label)
+    readiness = agent_accounts.codex_can_work(report, datetime.now(timezone.utc), credits)
     if isinstance(readiness, agent_accounts.CodexWorkExhausted):
-        raise AccountsError(f"accounts: {account_label} ({_codex_folder(target_home)}) is used up with no credits; choose another account or wait for reset")
+        reason = "and set not to use credits" if isinstance(credits, agent_accounts.CreditsOff) else "with no credits"
+        raise AccountsError(f"accounts: {account_label} ({_codex_folder(target_home)}) is used up {reason}; choose another account or wait for reset")
     if isinstance(readiness, agent_accounts.CodexWorkUnknown):
         raise AccountsError(f"accounts: cannot use {account_label} ({_codex_folder(target_home)}): {readiness.problem}")
     if dry_run:
@@ -1600,7 +2309,7 @@ def _swap_seats(label: str, *, dry_run: bool) -> SeatsSwapOutcome:
         return SeatsSwapDryRun(tuple([
             f"Would move seats to {account_label} ({_codex_folder(target_home)}); live turns finish first.", *lines,
         ]))
-    _ = _write_role("seats", label, account_label)
+    _ = _write_role("seats", account_label if CODEX_LABEL_PATTERN.fullmatch(account_label) else label, account_label)
     lines = _retire_seats_servers(target_home, account_label, dry_run=False)
     return SeatsSwapStarted(tuple([
         f"Seats now use {account_label} ({_codex_folder(target_home)}); working seats move at their next turn.", *lines,
@@ -1612,54 +2321,7 @@ def swap(role: str, label: str, *, dry_run: bool = False) -> SwapOutcome | Seats
     _validate_role(role)
     if role == "seats":
         return _swap_seats(label, dry_run=dry_run)
-    if label != "default":
-        _ = account_dir(label)
-    selection = claude_account_selection()
-    old = selection.unit_account
-    if isinstance(old, agent_accounts.UnreadableClaudeAccount):
-        raise AccountsError("accounts: current unit account identity is unreadable")
-    if label == "default":
-        target = selection.default_account
-        if isinstance(target, agent_accounts.UnreadableClaudeAccount):
-            raise AccountsError("accounts: default account identity is unreadable")
-    else:
-        default = selection.default_account
-        if isinstance(default, agent_accounts.KnownClaudeAccount) and label.casefold() == default.label.casefold():
-            raise AccountsError(f"accounts: {label} is the default account; use default")
-        for named in selection.named_accounts:
-            if named.label == label:
-                target = named.identity
-                break
-        else:
-            problems = check(label)
-            raise AccountsError(problems[0] if problems else f"accounts: {label} was not in the checked account selection")
-        if selection.is_default_login(target.login):
-            raise AccountsError(f"accounts: {label} is the default account; use default")
-    if target.login.casefold() == old.login.casefold():
-        raise AccountsError(f"accounts: {target.label} is already the unit account")
-    try:
-        status = subprocess.run(_shutdown_argv("status", old.label, "--json"), capture_output=True, text=True, check=False, timeout=120)
-    except (OSError, subprocess.TimeoutExpired) as error:
-        raise AccountsError(f"accounts: could not inspect {old.label}: {error}") from error
-    if status.returncode:
-        reason = (status.stderr or status.stdout).strip()
-        raise AccountsError(f"accounts: shutdown status {old.label} failed: {reason}")
-    _require_moving_sessions(_swap_inventories(status.stdout, old), old.label)
-    down_command = _shutdown_argv("down", old.label, "--restart")
-    if dry_run:
-        return SwapDryRun((sys.executable, str(Path(__file__).resolve()), "set-role", role, label), down_command)
-    previous = _write_unit_role(label, target)
-    try:
-        down = subprocess.run(down_command, capture_output=True, text=True, check=False)
-    except OSError as error:
-        down = subprocess.CompletedProcess(down_command, 1, "", f"accounts: could not start shutdown: {error}\n")
-    if down.returncode:
-        try:
-            _restore_unit_role(previous, old.label)
-        except OSError as error:
-            raise AccountsError(f"accounts: could not restore unit account {old.label}: {error}") from error
-        return SwapRolledBack(old.label, down.stdout, down.stderr, down.returncode)
-    return SwapStarted(old.label, target.label, down.stdout, down.stderr)
+    raise AccountsError(UNIT_ROLE_GONE)
 
 
 def _is_known_private(name: str) -> bool:
@@ -1710,18 +2372,6 @@ def _existing_named_accounts() -> list[NamedAccount]:
     return sorted(accounts, key=lambda account: int(account.label.removeprefix("claude ")))
 
 
-def _folder_role(config_dir: Path) -> str:
-    """The sessions a folder's account runs now; `spare` when no role uses it."""
-    selected = role_account("unit")
-    unit_dir = main_config_dir() if isinstance(selected, DefaultAccount) else selected.dir
-    roles: list[agent_accounts.ClaudeRole] = []
-    if config_dir == main_config_dir():
-        roles.append("showrunners")
-    if config_dir == unit_dir:
-        roles.append("unit directors")
-    return ", ".join(roles) or "spare"
-
-
 def _status_for(config_dir: Path, folder: str, named: NamedAccount | None, problems: list[str]) -> AccountStatus:
     baseline = _mcp_server_names(accounts_home() / ".claude.json")
     account_is_safe_to_inspect = not config_dir.is_symlink() and not (
@@ -1754,7 +2404,7 @@ def _status_for(config_dir: Path, folder: str, named: NamedAccount | None, probl
         account_is_safe_to_inspect=account_is_safe_to_inspect,
         label=label,
         login=login,
-        role=_folder_role(config_dir),
+        role="",
         problems=tuple(problems),
         unclassified=unclassified,
         missing_mcp_servers=tuple(sorted(baseline - current)),
@@ -1820,11 +2470,14 @@ def codex_statuses(seats_home: Path) -> list[CodexStatus]:
         folder = _codex_folder(home)
         safe = not home.is_symlink() and not (home / "auth.json").is_symlink()
         login = _codex_home_login(home)
-        label = codex_home_label(home, login or None)
+        label = codex_home_label(home)
         match = re.fullmatch(r"\.codex([1-9][0-9]*)", home.name) if home.parent == accounts_home() else None
-        problems = _check_codex_home(f"codex {match.group(1)}", seats_home) if match else []
+        problems = _check_codex_home(label, seats_home) if CODEX_LABEL_PATTERN.fullmatch(label) else _check_default_codex_home(seats_home) if home == accounts_home() / ".codex" else []
         if match and not login:
-            problems.append(f"accounts: sign in as {label} at {folder}")
+            intended = f"codex {match.group(1)}"
+            expected = _account_note(intended)
+            hint = intended if isinstance(expected, ExpectedAccountLogin) else label
+            problems.append(f"accounts: sign in as {hint} at {folder}")
         statuses.append(CodexStatus(
             folder, home, True, safe, NO_VALUE if label == login else label, login,
             CODEX_ROLE if home == seats_home else "spare", tuple(problems),
@@ -1835,7 +2488,7 @@ def codex_statuses(seats_home: Path) -> list[CodexStatus]:
         key=lambda stem: int(stem.removeprefix("codex ")),
     )
     for label in noted:
-        home = codex_account_home(label)
+        home = _codex_account_home(label)
         expected = _account_note(label)
         if home in homes or (
             isinstance(expected, ExpectedAccountLogin) and expected.login.casefold() in held_logins
@@ -2028,18 +2681,130 @@ def _status_notes(status: AccountStatus) -> list[str]:
 def status_report() -> str:
     """One table row per account folder, then one line for each thing wrong in a folder."""
     statuses = account_statuses()
-    seats_home = _seats_home()
+    selected_seats = role_account("seats")
+    seats_home = selected_seats.home
     codex = codex_statuses(seats_home)
     now = datetime.now(timezone.utc)
     usage = _stored_usage(statuses, codex, now)
     zone = agent_accounts.user_zone()
+    groups = group_accounts()
+    group_directories = {group: main_config_dir() if label == "default" else account_dir(label)
+                         for group in CLAUDE_GROUPS if isinstance(label := group_label(groups, group), str)}
+    statuses = [replace(status, role=", ".join(group for group, directory in group_directories.items()
+        if status.config_dir == directory)) for status in statuses]
     table = _render_table([
         *(_table_row(status, usage.get(usage_store.key("Claude", status.login)), now, zone) for status in statuses),
         *(_codex_row(status, usage.get(usage_store.key("Codex", status.login)), now, zone) for status in codex),
     ])
     notes = [*(note for status in statuses for note in _status_notes(status)),
              *(problem for status in codex for problem in status.problems)]
-    return "\n".join([table, *([""] if notes else []), *notes])
+    return "\n".join([group_status_line(groups), table, "", *notes,
+        *_live_status_lines(groups), *_seats_status_lines(now, selected_seats), *_move_status_lines(moves.read_moves(), zone)])
+
+
+SEATS_RUN_ROOT = Path("/tmp/claude/delegate")
+
+
+def _live_status_lines(groups: GroupAccounts) -> list[str]:
+    from scripts.message import sessions
+    members = live_group_members()
+    moving = {item["session_id"]: label for group in CLAUDE_GROUPS
+              if isinstance(label := group_label(groups, group), str) for item in members[group]
+              if not session_on_account(item, label)}
+    lines: list[str] = []
+    live = sessions.live_sessions()
+    for session in live:
+        directory = account.process_config_dir(session["pid"])
+        identity = account_identity(directory) if directory is not None else agent_accounts.UnreadableClaudeAccount()
+        label = identity.label if isinstance(identity, agent_accounts.KnownClaudeAccount) else "account unreadable"
+        suffix = f"; moving to {moving[session['sessionId']]}" if session["sessionId"] in moving else ""
+        lines.append(f"session {session['sessionId']} ({session['name']}): {label}{suffix}")
+    listed = {session["sessionId"] for session in live}
+    for group in CLAUDE_GROUPS:
+        for member in members[group]:
+            if member["session_id"] not in listed:
+                label = session_account_label(member)
+                suffix = f"; moving to {moving[member['session_id']]}" if member["session_id"] in moving else ""
+                lines.append(f"session {member['session_id']} ({member['name']}): {label}{suffix}")
+    return lines
+
+
+def _mesh_server_running(run: Path) -> bool:
+    try:
+        raw = cast(object, json.loads((run / "mesh_server.json").read_text()))
+        if not isinstance(raw, dict):
+            return False
+        pid = cast(dict[str, object], raw).get("pid")
+        if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
+            return False
+    except (OSError, ValueError):
+        return False
+    try:
+        os.kill(pid, 0)
+    except PermissionError:
+        return True
+    except (OSError, OverflowError):
+        return False
+    return True
+
+
+def _seats_status_lines(now: datetime, selected: CodexSeatsAccount) -> list[str]:
+    chosen = pick("codex", now, exclude=frozenset({selected.label}), keep=NoKeep())
+    destination = chosen.label if isinstance(chosen, PickedAccount) else no_room_line("codex", chosen)
+    lines = [f"Codex seats: {selected.label}; on refusal: {destination}"]
+    for path in sorted(SEATS_RUN_ROOT.glob("*/mesh_roster.json")):
+        if not _mesh_server_running(path.parent):
+            continue
+        try:
+            raw = cast(object, json.loads(path.read_text()))
+        except (OSError, ValueError):
+            continue
+        if not isinstance(raw, dict):
+            continue
+        for name, value in cast(dict[str, object], raw).items():
+            if not isinstance(value, dict):
+                continue
+            entry = cast(dict[str, object], value)
+            if entry.get("continuation_owed") is True:
+                reason = entry.get("continuation_reason")
+                if not isinstance(reason, str):
+                    reason = "quota refusal; waiting for account recovery or a confirmed move"
+                    if entry.get("status") == "waiting_capacity":
+                        reason = "waiting for capacity on the selected account"
+                lines.append(f"seat {path.parent.name}/{name}: continuation owed — {reason}")
+    return lines
+
+
+def _move_status_lines(entries: list[moves.MoveEntry], zone: tzinfo) -> list[str]:
+    lines: list[str] = []
+    for entry in entries[-10:]:
+        at = datetime.fromisoformat(entry["at"]).astimezone(zone).strftime("%Y-%m-%d %H:%M:%S %Z")
+        detail: str = entry["kind"]
+        if entry["kind"] == "requested":
+            outcomes: list[str] = []
+            for outcome in entries:
+                if outcome["move_id"] != entry["move_id"] or outcome["subject"] != entry["subject"]:
+                    continue
+                if outcome["kind"] == "confirmed":
+                    seat = outcome.get("seat", entry["subject"])
+                    outcomes.append(f"confirmed {seat} on {outcome.get('home', outcome.get('config_dir', ''))}")
+                elif outcome["kind"] == "failed":
+                    outcomes.append("failed: " + outcome["reason"])
+            cause = f" ({entry.get('cause', 'refusal')})" if entry["tool"] == "codex" else ""
+            detail = f"requested {entry['from']} → {entry['to']}: {entry['why']}{cause} — " + ("; ".join(outcomes) or "pending")
+        elif entry["kind"] == "confirmed":
+            detail = f"confirmed {entry.get('seat', entry['subject'])}: {entry.get('home', entry.get('config_dir', ''))}"
+        elif entry["kind"] == "failed":
+            detail = "failed: " + entry["reason"]
+        elif entry["kind"] == "waited":
+            detail = "waited until " + datetime.fromisoformat(entry["reset"]).astimezone(zone).isoformat()
+        elif entry["kind"] == "no room":
+            reset = entry["earliest_reset"]
+            detail = "no room until " + (datetime.fromisoformat(reset).astimezone(zone).isoformat() if reset else "unknown reset")
+        elif entry["kind"] == "room again":
+            detail = "room again: " + entry["label"]
+        lines.append(f"{at} {entry['tool']} {entry['subject']}: {detail}")
+    return lines
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -2050,9 +2815,23 @@ def _parser() -> argparse.ArgumentParser:
         command = commands.add_parser(action)
         _ = command.add_argument("label")
     _ = commands.add_parser("status")
+    placer = commands.add_parser("placement")
+    _ = placer.add_argument("--explain", action="store_true")
+    picker = commands.add_parser("pick")
+    _ = picker.add_argument("tool", choices=("claude", "codex"))
+    _ = picker.add_argument("--exclude", action="append", default=[])
+    _ = picker.add_argument("--keep", default="")
+    _ = picker.add_argument("--explain", action="store_true")
     exec_command = commands.add_parser("exec")
     _ = exec_command.add_argument("label")
     _ = exec_command.add_argument("claude_args", nargs=argparse.REMAINDER)
+    move_command = commands.add_parser("move")
+    _ = move_command.add_argument("session")
+    _ = move_command.add_argument("label", nargs="?", default="")
+    _ = move_command.add_argument("--from", dest="source", default="")
+    _ = move_command.add_argument("--to", dest="target", default="")
+    _ = move_command.add_argument("--dry-run", action="store_true")
+    _ = move_command.add_argument("--why", default="")
     for action in ("role", "env"):
         command = commands.add_parser(action)
         _ = command.add_argument("role")
@@ -2072,15 +2851,44 @@ def _parser() -> argparse.ArgumentParser:
 def main(argv: list[str]) -> int:
     options = cast(CommandLine, _parser().parse_args(argv))
     try:
+        if options.action == "placement":
+            print(placement_report())
+            return 0
+        if options.action == "pick":
+            chosen = pick(cast(Literal["claude", "codex"], options.tool), datetime.now(timezone.utc),
+                          exclude=frozenset(options.exclude), keep=KeepAccount(options.keep) if options.keep else NoKeep())
+            print(chosen.label if isinstance(chosen, PickedAccount) else no_room_line(options.tool, chosen))
+            if options.explain:
+                for reason in chosen.reasons:
+                    print(_pick_explanation(reason))
+            return 0 if isinstance(chosen, PickedAccount) else 1
         if options.action == "exec":
             exec_account(options.label, options.claude_args)
             return 0
+        if options.action == "move":
+            if options.session in CLAUDE_GROUPS:
+                if not options.label or options.source or options.target:
+                    raise AccountsError("move units|showrunners requires <claude N|default>")
+                moved = move_group(options.session, options.label, dry_run=options.dry_run, why=options.why)
+            else:
+                if not options.label or options.source or options.target or options.dry_run:
+                    raise AccountsError("move requires <session-id|name> <claude N|default>")
+                moved = move(options.session, options.label, why=options.why)
+            if isinstance(moved, MoveRefused):
+                print(moved.reason, file=sys.stderr)
+                return 1
+            if isinstance(moved, GroupMoveDryRun):
+                print("\n".join(moved.lines))
+                return 0
+            _ = sys.stdout.write(moved.stdout)
+            _ = sys.stderr.write(moved.stderr)
+            return moved.returncode
         if options.action == "setup":
             problems = setup(options.label)
             for problem in problems:
                 print(problem, file=sys.stderr)
             if CODEX_LABEL_PATTERN.fullmatch(options.label):
-                home = codex_account_home(options.label)
+                home = codex_setup_home(options.label)
                 if not problems and home.is_dir() and not home.is_symlink():
                     print(f"CODEX_HOME=~/{home.name} codex login")
                     print("Keep CODEX_HOME on that command: codex login without it signs ~/.codex out and in; seats use that home unless their role names another.")
@@ -2130,9 +2938,9 @@ def main(argv: list[str]) -> int:
             until = _iso_time(options.until, "--until") if options.until else datetime.now(timezone.utc)
             results = burn(since, until)
             for result in results:
-                roles = ", ".join(result.roles) or ("spare" if result.label.startswith("claude ") else "unassigned")
+                roles = f" ({', '.join(result.roles)})" if result.roles else ""
                 print(
-                    f"{result.label} ({roles}): {result.points_per_day:g} points/day "
+                    f"{result.label}{roles}: {result.points_per_day:g} points/day "
                     + f"({result.points:g} points over {result.observed_days:g} observed days)"
                 )
             if not results:

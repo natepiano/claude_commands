@@ -20,7 +20,7 @@ from datetime import datetime, timezone
 from enum import Enum
 from fnmatch import fnmatchcase
 from pathlib import Path
-from typing import BinaryIO, Literal, cast
+from typing import BinaryIO, Literal, cast, override
 
 # Direct execution from any directory uses this checkout's modules.
 if __package__ in (None, ""):
@@ -34,6 +34,17 @@ from scripts.usage.rollouts import (
 
 
 MAC_HOST = "natemccoy@mac"
+
+
+class LedgerDurability(Enum):
+    """Durable production commits or disposable ledgers that need no disk sync."""
+
+    DURABLE = "full"
+    DISPOSABLE = "off"
+
+    @override
+    def __str__(self) -> str:
+        return self.value
 
 
 @dataclass(frozen=True)
@@ -60,7 +71,8 @@ Family = Literal["claude", "codex"]
 LogFamily = Literal["claude", "codex", "history"]
 SourceFamily = Literal["claude", "codex", "history", "checkpoints", "readings", "baseline_readings", "account_roles"]
 LOG_FAMILIES: tuple[LogFamily, ...] = ("claude", "codex", "history")
-STORE_VERSION = 7
+FILE_NAMED_CODEX_KEYS_VERSION = 8
+STORE_VERSION = FILE_NAMED_CODEX_KEYS_VERSION
 MAX_SQLITE_INTEGER = (1 << 63) - 1
 
 
@@ -257,6 +269,7 @@ class ThreadNotIdentified:
 @dataclass
 class CodexContext:
     machine: str
+    file_name: str
     agent: CodexThread | ThreadNotIdentified = field(default_factory=ThreadNotIdentified)
     model: Model = field(default_factory=ModelNotReported)
     effort: Effort = field(default_factory=EffortNotReported)
@@ -292,7 +305,7 @@ class CodexContext:
         if at is None:
             return tuple(values)
         if edited:
-            values.append(Edit(self.agent, str(offset), at))
+            values.append(Edit(self.agent, codex_key(self.file_name, offset), at))
         if is_compaction(record):
             values.append(Compaction(self.agent, at))
         usage = token_usage(record)
@@ -300,11 +313,15 @@ class CodexContext:
             return tuple(values)
         # Validate the reported input total before its cached portion is removed.
         _ = token_count(usage.uncached_input + usage.cached_input)
-        values.append(Turn(self.agent, str(offset), at, self.model, self.effort,
+        values.append(Turn(self.agent, codex_key(self.file_name, offset), at, self.model, self.effort,
                            RawTokens(token_count(usage.uncached_input), 0, 0,
                                      token_count(usage.cached_input), token_count(usage.output)),
                            not self.edit_seen))
         return tuple(values)
+
+
+def codex_key(file_name: str, offset: int) -> str:
+    return f"{file_name}:{offset}"
 
 
 def object_fields(value: object) -> dict[str, object]:
@@ -470,8 +487,21 @@ CREATE TABLE IF NOT EXISTS account_role_changes (
 """
 
 
-def migrate_store(db: sqlite3.Connection) -> None:
+class StorePredatesFileNamedCodexKeys(Exception):
+    def __init__(self, version: int) -> None:
+        super().__init__(f"store version {version} predates file-named Codex keys")
+        self.version: int = version
+
+
+def check_store_key_version(db: sqlite3.Connection) -> int:
     version = cast(int, db.execute("PRAGMA user_version").fetchone()[0])
+    if 0 < version < FILE_NAMED_CODEX_KEYS_VERSION:
+        raise StorePredatesFileNamedCodexKeys(version)
+    return version
+
+
+def migrate_store(db: sqlite3.Connection) -> None:
+    version = check_store_key_version(db)
     if version < STORE_VERSION:
         with db:
             _ = db.execute("DELETE FROM cursors")
@@ -641,7 +671,7 @@ def read_file(machine: str, path: Path, family: Family,
         return
     if previous > size:
         previous = 0
-    context = CodexContext(machine)
+    context = CodexContext(machine, path.name)
     agent = claude_identity(machine, path)
     edit_seen = False
     opening_seen = False
@@ -1018,7 +1048,7 @@ def measurement_record(value: ThreadMeasurement) -> dict[str, object]:
         "agent": agent_record(value.agent), "at": value.at.isoformat(),
     }
     if isinstance(value, Edit):
-        record["key"] = token_count(int(value.key)) if isinstance(value.agent, CodexThread) else value.key
+        record["key"] = value.key
     if isinstance(value, Turn):
         tokens = value.tokens
         record.update(key=value.key,
@@ -1187,7 +1217,7 @@ def remote_measurement(record: dict[str, object], machine: str, family: Family) 
     if measurement_kind == "opening":
         return Opening(agent, at)
     if measurement_kind == "edit":
-        key = str(remote_integer(record, "key")) if isinstance(agent, CodexThread) else remote_string(record, "key")
+        key = remote_string(record, "key")
         return Edit(agent, key, at)
     if measurement_kind != "turn":
         raise RemoteReadFailed("unknown remote measurement kind")
@@ -1454,6 +1484,7 @@ class CommandLine(argparse.Namespace):
     account_roles: Path
     claude_repo: Path
     production_docs: Path
+    durability: LedgerDurability
 
     def __init__(self, readings: Path, baseline_readings: Path, account_roles: Path, claude_repo: Path, production_docs: Path) -> None:
         super().__init__()
@@ -1468,6 +1499,7 @@ class CommandLine(argparse.Namespace):
         self.account_roles = account_roles
         self.claude_repo = claude_repo
         self.production_docs = production_docs
+        self.durability = LedgerDurability.DURABLE
 
 
 def main(argv: Sequence[str] = ()) -> int:
@@ -1486,6 +1518,8 @@ def main(argv: Sequence[str] = ()) -> int:
     _ = parser.add_argument("--account-roles", type=Path)
     _ = parser.add_argument("--claude-repo", type=Path)
     _ = parser.add_argument("--production-docs", type=Path)
+    _ = parser.add_argument("--durability", type=LedgerDurability, choices=list(LedgerDurability),
+                            help="full (default) syncs commits; off is for disposable ledgers")
     defaults = outcomes.default_paths()
     args = parser.parse_args(argv, namespace=CommandLine(defaults.readings, defaults.baseline_readings, defaults.account_roles,
                                                        defaults.claude_repo, defaults.production_docs))
@@ -1502,6 +1536,10 @@ def main(argv: Sequence[str] = ()) -> int:
             return collect_pass(args)
         finally:
             lock.close()
+    except StorePredatesFileNamedCodexKeys as error:
+        print(f"collect: store version {error.version} predates file-named Codex keys; "
+              + f"delete {args.db} and run the collector again to rebuild it", file=sys.stderr)
+        return 1
     except (OSError, sqlite3.Error) as error:
         print("collect: database write failed: " + " ".join(str(error).splitlines()), file=sys.stderr)
         return 1
@@ -1512,6 +1550,8 @@ def collect_pass(args: CommandLine) -> int:
     db = sqlite3.connect(args.db)
     try:
         db.row_factory = sqlite3.Row
+        _ = check_store_key_version(db)
+        _ = db.execute(f"PRAGMA synchronous={args.durability.value.upper()}")
         _ = db.execute("PRAGMA journal_mode=WAL")
         _ = db.executescript(SCHEMA)
         migrate_store(db)

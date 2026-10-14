@@ -53,7 +53,7 @@ the SKIPPED line), or run it as the `/lint_config` CLI.
 
 ## mac_test.conf
 
-Controls Mac test offload and the `/mac_test` block command. It names the CI
+Controls Mac test offload and the `/build:mac` block command. It names the CI
 repository, workflow, job and repository variable; bounds each `gh` call;
 sets the default and maximum block lifetime; and sets the expiry-warning
 window. Offload settings name the SSH host and connection and probe time
@@ -119,10 +119,11 @@ makes the notifier use 900 seconds; Codex requires a positive integer. It is
 `unit_notifier.sh --all` retimes every unit run's instance to the new value,
 or to `--all <minutes>`, and leaves each one on or off.
 
-`PLAN_DELEGATE_PROGRESS_UPDATES=on-demand` gives a new Claude unit run no
-notifier instance, so `/unit:report` runs only when someone asks for it;
-`/unit:report on` makes the instance then. `scheduled`, or no line, makes it
-at every run's start. It is `scheduled` (user, 2026-10-10).
+`PLAN_DELEGATE_PROGRESS_UPDATES=on-demand`, or no line, gives a new Claude
+unit run no notifier instance, so `/unit:report` runs only when someone asks
+for it; `/unit:report on` makes the instance then. `scheduled` makes it at
+every run's start. A resumed run that already has an instance keeps it, on or
+off. It is `on-demand` (user, 2026-10-13: no timer unless asked).
 
 `scripts/delegate/findings.py` reads the file at startup, so an edit applies to
 the next `findings.py gate` with nothing to restart. The file is authoritative:
@@ -146,6 +147,28 @@ found`. A bad line leaves out the counts line, and the builder prints
 `counts: unavailable — dailies.conf line <n>: …`. `DAILIES_COUNTS_CONFIG`
 overrides the path. Today it holds build-followups' nightly review queue and
 plan backlog, and tool-based-ui's hanadocs proposals (user, 2026-10-10).
+
+## user_zone.conf
+
+The zone every time shown to the user is written in: `zone=<IANA zone name>`,
+such as `zone=America/New_York`. Reports, tables, alerts and the commands in
+skills read it through `scripts/lib/user_zone.py`, so changing the zone is this
+one line, and it applies to the next report with nothing to restart. The label
+beside a time (EDT, EST) comes from the zone. With no file, or no `zone=` line,
+the zone is America/New_York; a name that is not a zone is refused, with this
+file named.
+
+- Python imports `user_zone()`, `user_zone_name()` or `zone_label()` from the
+  script.
+- Shell and skill text run it for the name:
+  `TZ="$(~/.claude/scripts/lib/py ~/.claude/scripts/lib/user_zone.py)" date '+%H:%M %Z'`.
+- `USER_ZONE` in the environment wins over the file. Tests whose expected
+  output is in one zone pin it this way.
+
+A production keeps its own `User zone` line in its production doc, and the
+dailies read that. A time stored without an offset keeps the zone it was
+recorded in: `scripts/model_study/turns.py` names Pacific for the model study's
+roster.
 
 ## cargo-fmt-exclusions.json
 

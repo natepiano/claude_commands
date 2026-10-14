@@ -17,7 +17,9 @@ from contextlib import contextmanager
 from datetime import date, datetime
 from pathlib import Path
 from typing import Callable, Literal, NamedTuple, NoReturn, TypedDict, cast
-from zoneinfo import ZoneInfo
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
+from user_zone import user_zone  # noqa: E402
 
 
 class ProjectSpec(NamedTuple):
@@ -967,7 +969,7 @@ def _write_json(path: Path, value: object) -> None:
 
 
 def _event_time() -> str:
-    return datetime.now(ZoneInfo("America/Los_Angeles")).replace(microsecond=0).isoformat()
+    return datetime.now(user_zone()).replace(microsecond=0).isoformat()
 
 
 def _append_event(event: FeatureLogEvent) -> None:
@@ -2146,7 +2148,7 @@ def _event_datetime(value: str) -> datetime:
         raise FeatureLogError(f"event time is invalid: {value}") from error
     if parsed.tzinfo is None:
         raise FeatureLogError(f"event time has no timezone: {value}")
-    return parsed.astimezone(ZoneInfo("America/Los_Angeles"))
+    return parsed.astimezone(user_zone())
 
 
 def _digest_time_label(value: str) -> str:
@@ -2183,9 +2185,7 @@ def _run_digest(arguments: argparse.Namespace) -> int:
     if since is not None:
         _validate_date(since, "since")
         events = _read_events()
-        boundary = datetime.fromisoformat(f"{since}T00:00:00").replace(
-            tzinfo=ZoneInfo("America/Los_Angeles")
-        )
+        boundary = datetime.fromisoformat(f"{since}T00:00:00").replace(tzinfo=user_zone())
         selected = [event for event in events if _event_datetime(event["at"]) >= boundary]
         return _print_digest(selected, boundary.strftime("%Y-%m-%d %H:%M %Z"))
 

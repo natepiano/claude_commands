@@ -107,6 +107,11 @@ def session_shutdown(machine: str = "natedev", name: str = "shutdown") -> Sessio
     )
 
 
+def setUpModule() -> None:
+    """The times these tests expect are Pacific; the user's zone setting must not change them."""
+    unittest.enterModuleContext(patch.dict(os.environ, {"USER_ZONE": "America/Los_Angeles"}))
+
+
 @final
 class ShutdownStatusTests(ShutdownTestCase):
     def __init__(self, methodName: str = "runTest") -> None:
@@ -434,7 +439,7 @@ else:
         self.assertIn("  shutdown: waiting\n", output)
         self.assertEqual(error, "")
 
-    def test_status_renders_local_and_remote_stop_issues_under_their_sessions(self) -> None:
+    def test_status_renders_canonical_remote_stop_issues_under_their_sessions(self) -> None:
         at = "2026-10-09T21:49:10+00:00"
         local = complete_record()
         local["entries"][0]["session"]["name"] = "local"
@@ -449,10 +454,12 @@ else:
             record_store.CodexServerLeftRunning(
                 kind="codex server left running", at=at, run_dir="/tmp/run", cause="stop not confirmed",
             ),
-            record_store.UnitTmuxLeftRunning(
-                kind="unit tmux session left running", at=at, tmux_session="demo-unit", cause="owner identity lost",
+            record_store.UnitSessionLeftRunning(
+                kind="unit session left running", at=at, host="tmux",
+                session_name="demo-unit", cause="owner identity lost",
             ),
         ]
+        self.assertEqual(remote_record["stop_issues"][-1]["kind"], "unit session left running")
         write_old(local)
         os.environ["SHUTDOWN_STATUS_RECORD_OUTPUT"] = json.dumps([remote_record])
         result, output, error = self.run_plain_status_with_ssh()
@@ -531,6 +538,27 @@ else:
         with patch.object(shutdown, "inventory", return_value=empty_inventory()), patch.object(settle, "_showing_form", side_effect=RuntimeError("cannot observe")), redirect_stdout(output):
             self.assertEqual(shutdown.main(["status", LOGIN, "--here"]), 0)
         self.assertIn("  missing: waiting\n", output.getvalue())
+
+    def test_status_usage_limit_held_owner_shows_busy_seat_without_form_and_offers_actions(self) -> None:
+        saved = session_shutdown(name="Held")
+        saved["progress"] = record_store.SessionHeldByUsageLimit(kind="held by usage limit", at=saved["requested_at"])
+        saved["session"]["status"] = "idle"
+        self.assertTrue(record_store.create_session(saved))
+        worker = inventory.parse_session({**saved["session"], "kind": "seat", "session_id": "worker",
+            "name": "worker", "status": "busy", "host": {"kind": "unknown"},
+            "owner": {"kind": "director", "session_id": saved["session"]["session_id"]}}, "worker")
+        report = empty_inventory()
+        report["sessions"] = [saved["session"], worker]
+        output = io.StringIO()
+        with patch.object(shutdown, "inventory", return_value=report), patch.object(settle, "_showing_form", return_value=True) as form, patch.object(settle, "merge_in_progress", return_value=False), redirect_stdout(output):
+            self.assertEqual(shutdown.main(["status", LOGIN, "--here"]), 0)
+        self.assertIn("  Held: held by usage limit — Codex seat worker is still running\n", output.getvalue())
+        self.assertNotIn("showing a form", output.getvalue())
+        form.assert_not_called()
+        self.assertIn("  no conductor running; /shutdown --only <name> resumes one, /shutdown cancel --only <name> takes it out\n", output.getvalue())
+        self.assertIn("  take out: /shutdown cancel --only <name> · Held\n", output.getvalue())
+        self.assertIn("  stop now: /shutdown now --only <name> · Held\n", output.getvalue())
+        self.assertNotIn("  bring back:", output.getvalue())
 
     def test_status_reports_owned_busy_seats_and_a_queued_message_once(self) -> None:
         saved = session_shutdown(name="owner")

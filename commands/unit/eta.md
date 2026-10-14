@@ -22,19 +22,17 @@ not pause the phase's work.
 3. **Name the basis.** Say which recorded steps the time comes from, e.g. "hana
    full tests took 14–19 min in phases 10–11".
 4. **When the answer has an ETA, record it before answering.** Run
-   `TZ=<User zone> python3 ~/.claude/scripts/delegate/progress_history.py eta --session-dir "${SESSION_DIR}" --time "<YYYY-MM-DDTHH:MM>" --earliest "<YYYY-MM-DDTHH:MM>" --latest "<YYYY-MM-DDTHH:MM>" --basis "<basis>"`
+   `python3 ~/.claude/scripts/delegate/progress_history.py eta --session-dir "${SESSION_DIR}" --time "<YYYY-MM-DDTHH:MM>" --earliest "<YYYY-MM-DDTHH:MM>" --latest "<YYYY-MM-DDTHH:MM>" --basis "<basis>"`
    with the ETA, range and basis in the answer. The recorder reads each time
-   in the zone it runs under, so `TZ` is the production doc's **User zone**,
-   and the `ETA recorded:` line it prints names that zone. If the answer has
-   no range, omit both range options.
+   in the user's zone setting, and the `ETA recorded:` line it prints names
+   that zone. If the answer has no range, omit both range options.
 5. **Only when no remaining step has any record,** say `none measured` and name
    the step that lacks one, and when its first run will give a time.
 
 ## Answer
 
 Send the showrunner one message, first line self-contained, with every time
-in the production doc's **User zone**, converted from the recorder's machine
-time (user, 2026-10-04):
+in the user's zone, as the recorder prints it (user, 2026-10-04):
 
 `From <unit>: Phase <N> ETA: <HH:MM zone>, <P>% done (range <HH:MM>–<HH:MM>), from <basis>.`
 

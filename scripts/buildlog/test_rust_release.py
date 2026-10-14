@@ -13,10 +13,18 @@ import unittest
 from collections.abc import Callable
 from datetime import datetime
 from pathlib import Path
-from typing import final, override
+from typing import TYPE_CHECKING, final, override
 from unittest import mock
 
 import rust_release
+if TYPE_CHECKING:
+    from ..notify import review
+    from ..notify.push_texts import RenderedPush, render, user_send_argv
+    from ..notify.user_action import ActionRequired
+else:
+    import review
+    from push_texts import RenderedPush, render, user_send_argv
+    from user_action import ActionRequired
 from test_index import point_root_at
 
 
@@ -109,9 +117,9 @@ class RustReleaseTests(unittest.TestCase):
                 fetches.append(version)
             return channel(version)
 
-        def send(title: str, message: str) -> bool:
+        def send(push: RenderedPush) -> bool:
             if texts is not None:
-                texts.append((title, message))
+                texts.append((push.title, push.body))
             return True
 
         def no_run(args: list[str], cwd: Path | None, env: dict[str, str], timeout: int) -> subprocess.CompletedProcess[str]:
@@ -143,6 +151,17 @@ class RustReleaseTests(unittest.TestCase):
         self.assertEqual([], texts)
         self.assertEqual([], rust_release.report_line())
 
+    def test_compiler_upgrade_is_recommended_only_when_both_checks_pass(self) -> None:
+        trial: rust_release.TrialFinished = {"status": "finished", "version": "1.100.0", "warnings": 0,
+            "warning_crates": 1, "errors": 0, "error_crates": 0, "mend_builds": True,
+            "target_gib": 1, "mend_target_gib": 1}
+        self.assertEqual(rust_release.release_push("1.100.0", "1.99.0", trial).id, "rust.passed")
+        trial["errors"] = 1
+        self.assertEqual(rust_release.release_push("1.100.0", "1.99.0", trial).id, "rust.errors")
+        trial["errors"] = 0
+        trial["mend_builds"] = False
+        self.assertEqual(rust_release.release_push("1.100.0", "1.99.0", trial).id, "rust.repair_failed")
+
     def test_release_text_uses_user_send_and_only_success_returns_true(self) -> None:
         fake_module = self.scratch / "scripts/buildlog/rust_release.py"
         sender = self.scratch / "scripts/message/send.py"
@@ -151,20 +170,43 @@ class RustReleaseTests(unittest.TestCase):
             "import os\nraise SystemExit(int(os.environ['RELEASE_SEND_EXIT']))\n",
             encoding="utf-8",
         )
-        command = [
-            "python3", str(sender), "--to", "user", "--need", "note",
-            "--action", "Tell natedev to bump Rust or wait.",
-            "--summary", "Rust 1.100.0 out", "--text", "trial passed",
-        ]
+        push = render("rust.passed", version="1.100.0", pin="1.99.0")
+        command = user_send_argv(push)
+        command[1] = str(sender)
         real_run = subprocess.run
         with (mock.patch.object(rust_release, "__file__", str(fake_module)),
+              mock.patch.object(review, "user_send_seconds", return_value=85),
               mock.patch.object(subprocess, "run", wraps=real_run) as run,
               mock.patch.dict(os.environ, {"RELEASE_SEND_EXIT": "0"})):
-            self.assertTrue(rust_release.send_release_text("Rust 1.100.0 out", "trial passed"))
+            self.assertTrue(rust_release.send_release_text(render("rust.passed", version="1.100.0", pin="1.99.0")))
             self.assertEqual(run.call_args.args[0], command)
+            self.assertEqual(run.call_args.kwargs["timeout"], 100)
         with (mock.patch.object(rust_release, "__file__", str(fake_module)),
+              mock.patch.object(review, "user_send_seconds", return_value=85),
               mock.patch.dict(os.environ, {"RELEASE_SEND_EXIT": "3"})):
-            self.assertFalse(rust_release.send_release_text("Rust 1.100.0 out", "trial passed"))
+            self.assertFalse(rust_release.send_release_text(render("rust.passed", version="1.100.0", pin="1.99.0")))
+
+    def test_every_compiler_decision_names_the_claude_session_that_takes_the_reply(self) -> None:
+        for errors, warnings, mend_builds in ((0, 0, True), (0, 2, True), (1, 2, True), (0, 0, False)):
+            trial: rust_release.TrialFinished = {"status": "finished", "version": "1.100.0", "warnings": warnings,
+                "warning_crates": 1, "errors": errors, "error_crates": 1, "mend_builds": mend_builds,
+                "target_gib": 1, "mend_target_gib": 1}
+            with self.subTest(errors=errors, warnings=warnings, mend_builds=mend_builds):
+                push = rust_release.release_push("1.100.0", "1.99.0", trial)
+                self.assertIsInstance(push.action, ActionRequired)
+                assert isinstance(push.action, ActionRequired)
+                self.assertTrue(push.action.text.startswith("In the Claude session named natedev, reply "))
+                self.assertIn("upgrade", push.action.text)
+                self.assertIn("wait", push.action.text)
+
+    def test_release_send_wait_includes_the_configured_review_limit(self) -> None:
+        config = self.scratch / "notify.conf"
+        _ = config.write_text("REVIEW_TIMEOUT_SECONDS=90\n")
+        done = subprocess.CompletedProcess(["send.py"], 0, "SENT: to the user", "")
+        with (mock.patch.object(review, "NOTIFY_CONFIG", config),
+              mock.patch.object(subprocess, "run", return_value=done) as run):
+            self.assertTrue(rust_release.send_release_text(render("rust.passed", version="1.100.0", pin="1.99.0")))
+            self.assertEqual(run.call_args.kwargs["timeout"], review.user_send_seconds() + 15)
 
     def test_newer_stable_is_fetched_once_per_local_day(self) -> None:
         fetches: list[str] = []
@@ -198,7 +240,7 @@ class RustReleaseTests(unittest.TestCase):
             self.assertEqual(expected, rust_release.check_release(
                 fetch_channel=fetch, read_pin=lambda: "1.99.0", run_command=no_run,
                 now=lambda hour=hour: datetime(2026, 11, 12, hour), free_gib=lambda: 600,
-                held=lambda: False, building=lambda: False, send_text=lambda title, message: True,
+                held=lambda: False, building=lambda: False, send_text=lambda push: True,
             ))
         self.assertEqual(2, attempts)
         self.assertIn("channel unavailable", (self.root / "errors.log").read_text())
@@ -209,16 +251,15 @@ class RustReleaseTests(unittest.TestCase):
         self.assertEqual(0, self.invoke(pin=None, at=datetime(2026, 11, 12, 13)))
         self.assertEqual([], rust_release.report_line())
 
-    def test_hold_waits_with_reason_and_sends_one_text(self) -> None:
+    def test_unfinished_trial_is_logged_without_consuming_the_upgrade_notice(self) -> None:
         texts: list[tuple[str, str]] = []
         self.assertEqual(0, self.invoke(held=True, texts=texts))
         self.assertEqual(0, self.invoke(held=True, texts=texts))
-        self.assertEqual(1, len(texts))
-        self.assertEqual("Rust 1.100.0 out", texts[0][0])
-        self.assertIn("trial waiting: build hold active", texts[0][1])
+        self.assertEqual(texts, [])
         state = rust_release.read_state()
         assert state is not None
         self.assertEqual("waiting", state["trial"]["status"])
+        self.assertFalse(state["text_sent"])
 
     def test_existing_cargo_build_waits_with_reason(self) -> None:
         self.assertEqual(0, self.invoke(building=True))
@@ -297,9 +338,8 @@ class RustReleaseTests(unittest.TestCase):
         self.assertEqual("1", mend[2]["RUSTC_BOOTSTRAP"])
         self.assertEqual(str(clone / "mend-target"), mend[2]["CARGO_TARGET_DIR"])
         self.assertEqual(1, len(texts))
-        self.assertIn("2 new warnings in 2 crates", texts[0][1])
-        self.assertIn("1 error in 1 crate", texts[0][1])
-        self.assertIn("cargo-mend builds", texts[0][1])
+        self.assertIn("Errors: 1; new warnings: 2", texts[0][1])
+        self.assertIn("Hana still uses Rust 1.99.0", texts[0][1])
 
     def test_stale_trial_clone_is_removed_before_commands_and_after_success(self) -> None:
         clone = self.scratch / "rust-release-trial-1.100.0"
@@ -329,7 +369,7 @@ class RustReleaseTests(unittest.TestCase):
         assert trial["status"] == "finished"
         self.assertFalse(trial["mend_builds"])
         self.assertFalse(clone.exists())
-        self.assertIn("cargo-mend does not build", texts[0][1])
+        self.assertIn("The tool that repairs Rust build errors fails to compile", texts[0][1])
 
     def test_failed_clippy_step_records_first_error_and_is_not_retried(self) -> None:
         clone = self.scratch / "rust-release-trial-1.100.0"
@@ -404,11 +444,11 @@ class RustReleaseTests(unittest.TestCase):
         assert state is not None
         self.assertEqual("finished", state["trial"]["status"])
 
-    def test_new_version_gets_its_own_text(self) -> None:
+    def test_new_version_does_not_push_an_untested_trial(self) -> None:
         texts: list[tuple[str, str]] = []
         self.assertEqual(0, self.invoke(held=True, texts=texts))
         self.assertEqual(0, self.invoke(version="1.101.0", at=datetime(2026, 11, 13, 3), held=True, texts=texts))
-        self.assertEqual(["Rust 1.100.0 out", "Rust 1.101.0 out"], [title for title, _ in texts])
+        self.assertEqual(texts, [])
 
     def test_clippy_diagnostics_finish_trial_but_non_diagnostic_exit_fails(self) -> None:
         clone = self.scratch / "rust-release-trial-1.100.0"
@@ -422,8 +462,8 @@ class RustReleaseTests(unittest.TestCase):
         assert trial["status"] == "finished"
         self.assertEqual((1, 1), (trial["errors"], trial["error_crates"]))
         self.assertEqual("cargo", runner.calls[-1][0][0])
-        self.assertIn("1 error in 1 crate", texts[0][1])
-        self.assertIn("cargo-mend builds", texts[0][1])
+        self.assertIn("Errors: 1", texts[0][1])
+        self.assertIn("Hana still uses Rust 1.99.0", texts[0][1])
         self.assertIn("1 error in 1 crate, cargo-mend builds", rust_release.report_line()[0])
 
         rust_release.state_path().unlink()

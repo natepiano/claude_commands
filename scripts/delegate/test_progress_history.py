@@ -65,6 +65,7 @@ class ProgressHistoryTests(unittest.TestCase):
 
     @override
     def setUp(self) -> None:
+        self.enterContext(patch.dict(os.environ, {"PLAN_DELEGATE_SYNC_WRITES": "0"}))
         self.temporary = tempfile.TemporaryDirectory()
         self.root = Path(self.temporary.name)
         self.history_dir = self.root / "history"
@@ -94,6 +95,25 @@ class ProgressHistoryTests(unittest.TestCase):
     @override
     def tearDown(self) -> None:
         self.temporary.cleanup()
+
+    def test_event_write_syncs_by_default_and_flushes_without_sync_for_disposable_state(self) -> None:
+        append = cast(Callable[[dict[str, object], dict[str, object]], None], vars(progress_history)["_append_event"])
+        history = self.root / "sync-event.jsonl"
+
+        def flushed(descriptor: int) -> None:
+            self.assertGreaterEqual(descriptor, 0)
+            self.assertTrue(history.read_text())
+
+        for durable in (True, False):
+            with self.subTest(durable=durable), patch.dict(os.environ), patch.object(os, "fsync", side_effect=flushed) as sync:
+                if durable:
+                    _ = os.environ.pop("PLAN_DELEGATE_SYNC_WRITES", None)
+                else:
+                    os.environ["PLAN_DELEGATE_SYNC_WRITES"] = "0"
+                append({"history_file": str(history)}, {"event_type": "probe"})
+                self.assertEqual(sync.call_count, int(durable))
+                self.assertEqual(json.loads(history.read_text()), {"event_type": "probe"})
+            history.unlink()
 
     def write_interval(self, seconds: object) -> None:
         _ = self.config_file.write_text(
@@ -135,6 +155,7 @@ class ProgressHistoryTests(unittest.TestCase):
         environment["PLAN_DELEGATE_CONFIG"] = str(self.config_file)
         environment["AGENTS_CONFIG_FILE"] = str(self.agents_config_file)
         environment["TZ"] = zone
+        environment["USER_ZONE"] = zone
         environment["PLAN_DELEGATE_NOW_EPOCH"] = str(at)
         environment["PLAN_DELEGATE_PASS_OWNER"] = "launcher"
         # Popped rather than left alone: the suite copies the ambient
@@ -165,6 +186,7 @@ class ProgressHistoryTests(unittest.TestCase):
         environment["PLAN_DELEGATE_CONFIG"] = str(self.config_file)
         environment["AGENTS_CONFIG_FILE"] = str(self.agents_config_file)
         environment["TZ"] = zone
+        environment["USER_ZONE"] = zone
         environment["PLAN_DELEGATE_NOW_EPOCH"] = str(at)
         environment["PLAN_DELEGATE_PASS_OWNER"] = "launcher"
         # Popped rather than left alone: the suite copies the ambient
@@ -198,6 +220,7 @@ class ProgressHistoryTests(unittest.TestCase):
         environment["PLAN_DELEGATE_NOW_EPOCH"] = str(at)
         environment["PLAN_DELEGATE_PASS_OWNER"] = "launcher"
         environment["TZ"] = "UTC"
+        environment["USER_ZONE"] = "UTC"
         self.isolate_recorder_roots(environment)
         self.isolate_identity(environment)
         stdout = io.StringIO()
@@ -792,6 +815,7 @@ class ProgressHistoryTests(unittest.TestCase):
         environment["NOTIFIER_STATE_DIR"] = str(state_dir)
         environment["NOTIFIER_NOW_EPOCH"] = str(started_at)
         environment["TZ"] = "UTC"
+        environment["USER_ZONE"] = "UTC"
         _ = subprocess.run(
             [
                 "zsh",
@@ -837,6 +861,7 @@ class ProgressHistoryTests(unittest.TestCase):
         environment["NOTIFIER_STATE_DIR"] = str(state_dir)
         environment["NOTIFIER_NOW_EPOCH"] = str(started_at)
         environment["TZ"] = "UTC"
+        environment["USER_ZONE"] = "UTC"
         _ = subprocess.run(
             [
                 "zsh",
@@ -905,6 +930,7 @@ class ProgressHistoryTests(unittest.TestCase):
         environment["NOTIFIER_STATE_DIR"] = str(state_dir)
         environment["NOTIFIER_NOW_EPOCH"] = str(started_at)
         environment["TZ"] = "UTC"
+        environment["USER_ZONE"] = "UTC"
         _ = subprocess.run(
             [
                 "zsh",
@@ -1374,6 +1400,7 @@ class ProgressHistoryTests(unittest.TestCase):
         environment["NOTIFIER_STATE_DIR"] = str(state_dir)
         environment["NOTIFIER_NOW_EPOCH"] = str(started_at)
         environment["TZ"] = "UTC"
+        environment["USER_ZONE"] = "UTC"
         _ = subprocess.run(
             [
                 "zsh",
@@ -1809,6 +1836,7 @@ class ProgressHistoryTests(unittest.TestCase):
         environment["PLAN_DELEGATE_CONFIG"] = str(self.config_file)
         environment["AGENTS_CONFIG_FILE"] = str(self.agents_config_file)
         environment["TZ"] = "UTC"
+        environment["USER_ZONE"] = "UTC"
         environment["PLAN_DELEGATE_NOW_EPOCH"] = str(at)
         _ = environment.pop("PLAN_DELEGATE_PASS_OWNER", None)
         if self.team_slot:
@@ -2879,6 +2907,7 @@ class ProgressHistoryTests(unittest.TestCase):
         environment["PLAN_DELEGATE_HISTORY_DIR"] = str(self.history_dir)
         environment["PLAN_DELEGATE_CONFIG"] = str(self.config_file)
         environment["TZ"] = "UTC"
+        environment["USER_ZONE"] = "UTC"
         environment["PLAN_DELEGATE_NOW_EPOCH"] = str(at)
         result = subprocess.run(
             ["python3", str(FINDINGS), *arguments, "--session-dir", str(session_dir)],
@@ -4901,6 +4930,170 @@ class ProgressHistoryTests(unittest.TestCase):
         )
 
 
+    def start_numbered_phase(
+        self, session_dir: Path, phase_id: str, at: int, *extra: str
+    ) -> None:
+        _ = self.run_command(
+            "start-phase",
+            "--session-dir",
+            str(session_dir),
+            "--phase-id",
+            phase_id,
+            "--phase-title",
+            f"Phase {phase_id} work",
+            *extra,
+            at=at,
+        )
+
+    def finish_numbered_phase(self, session_dir: Path, at: int, *extra: str) -> None:
+        _ = self.run_command(
+            "finish-phase",
+            "--session-dir",
+            str(session_dir),
+            "--status",
+            "completed",
+            *extra,
+            at=at,
+        )
+
+    def phase_events(self, name: str, event_type: str) -> list[dict[str, object]]:
+        return [event for event in self.read_events(name) if event.get("event_type") == event_type]
+
+    def open_phase_ids(self, session_dir: Path) -> tuple[str, list[str]]:
+        state = self.read_state(session_dir)
+        current = cast(dict[str, object], state["phase"])
+        parked = cast(list[dict[str, object]], state.get("open_phases", []))
+        return cast(str, current["id"]), [cast(str, phase["id"]) for phase in parked]
+
+    def test_a_phase_started_while_another_is_open_leaves_the_older_one_open(self) -> None:
+        started_at = 40_000
+        session_dir = self.start_run("overlapping-phases", started_at)
+        self.start_numbered_phase(session_dir, "6", started_at + 10)
+        self.start_slot_pass(session_dir, "impl", "impl", started_at + 20)
+        self.team_slot = ""
+        self.start_numbered_phase(session_dir, "18", started_at + 100)
+
+        self.assertEqual(self.open_phase_ids(session_dir), ("18", ["6"]))
+        self.assertEqual(self.pass_slots(session_dir)["impl"]["status"], "active")
+        self.assertEqual(self.phase_events("overlapping-phases", "phase_finished"), [])
+
+        self.finish_slot_pass(session_dir, "impl", "completed", started_at + 150)
+        finished_pass = self.phase_events("overlapping-phases", "pass_finished")[-1]
+        self.assertEqual(finished_pass.get("phase_id"), "6")
+
+        self.team_slot = ""
+        self.finish_numbered_phase(session_dir, started_at + 200)
+        state = self.read_state(session_dir)
+        current = cast(dict[str, object], state["phase"])
+        self.assertEqual((current["id"], current["status"]), ("6", "active"))
+        self.assertEqual(state["open_phases"], [])
+        self.finish_numbered_phase(session_dir, started_at + 300, "--phase-id", "6")
+        finished = self.phase_events("overlapping-phases", "phase_finished")
+        self.assertEqual(
+            [(event.get("phase_id"), event.get("phase_elapsed_seconds")) for event in finished],
+            [("18", 100), ("6", 290)],
+        )
+
+    def test_finishing_an_older_open_phase_leaves_the_current_one_and_its_seats(self) -> None:
+        started_at = 41_000
+        session_dir = self.start_run("finish-older-phase", started_at)
+        self.start_numbered_phase(session_dir, "6", started_at + 10)
+        self.start_slot_pass(session_dir, "impl", "impl", started_at + 20)
+        self.team_slot = ""
+        self.start_numbered_phase(session_dir, "18", started_at + 100)
+        self.start_slot_pass(session_dir, "review", "review", started_at + 110)
+        self.team_slot = ""
+
+        self.finish_numbered_phase(session_dir, started_at + 200, "--phase-id", "6")
+
+        self.assertEqual(self.open_phase_ids(session_dir), ("18", []))
+        slots = self.pass_slots(session_dir)
+        self.assertEqual(slots["impl"]["status"], "interrupted")
+        self.assertEqual(slots["review"]["status"], "active")
+        finished = self.phase_events("finish-older-phase", "phase_finished")[-1]
+        self.assertEqual(finished.get("phase_id"), "6")
+        self.assertNotIn("pass_instance_id", finished)
+
+    def test_finish_phase_naming_a_phase_that_is_not_open_is_refused(self) -> None:
+        started_at = 42_000
+        session_dir = self.start_run("finish-unknown-phase", started_at)
+        self.start_numbered_phase(session_dir, "6", started_at + 10)
+        with self.assertRaises(subprocess.CalledProcessError) as raised:
+            self.finish_numbered_phase(session_dir, started_at + 20, "--phase-id", "7")
+        self.assertIn("Phase 7 is not open; open phases: 6", cast(str, raised.exception.stderr))
+        self.assertEqual(self.open_phase_ids(session_dir), ("6", []))
+
+    def test_back_filling_an_earlier_phase_leaves_the_open_phase_unchanged(self) -> None:
+        started_at = 43_000
+        session_dir = self.start_run("back-filled-phase", started_at)
+        self.start_numbered_phase(session_dir, "6", started_at + 10)
+        self.start_slot_pass(session_dir, "impl", "impl", started_at + 20)
+        self.team_slot = ""
+        phase_six = cast(dict[str, object], self.read_state(session_dir)["phase"])
+
+        def moment(offset: int) -> str:
+            return datetime.fromtimestamp(started_at + offset, UTC).isoformat()
+
+        self.start_numbered_phase(
+            session_dir, "18", started_at + 500, "--started-at", moment(30)
+        )
+        self.finish_numbered_phase(
+            session_dir, started_at + 510, "--phase-id", "18", "--finished-at", moment(70)
+        )
+
+        state = self.read_state(session_dir)
+        self.assertEqual(state["phase"], phase_six)
+        self.assertEqual(state["open_phases"], [])
+        self.assertEqual(self.pass_slots(session_dir)["impl"]["status"], "active")
+        started = self.phase_events("back-filled-phase", "phase_started")[-1]
+        finished = self.phase_events("back-filled-phase", "phase_finished")[-1]
+        self.assertEqual(
+            (started.get("phase_id"), started.get("timestamp_epoch"), started.get("backfilled")),
+            ("18", float(started_at + 30), True),
+        )
+        self.assertEqual(
+            (finished.get("phase_id"), finished.get("phase_elapsed_seconds"), finished.get("backfilled")),
+            ("18", 40, True),
+        )
+        trial = self.run_command(
+            "review-trial", "--session-dir", str(session_dir), "--phase-id", "18",
+            at=started_at + 520,
+        )
+        self.assertTrue(trial.startswith("review trial: ux 0 findings, code 0 findings"))
+
+    def test_a_back_fill_time_in_the_future_or_before_its_start_is_refused(self) -> None:
+        started_at = 44_000
+        session_dir = self.start_run("bad-back-fill", started_at)
+
+        def moment(offset: int) -> str:
+            return datetime.fromtimestamp(started_at + offset, UTC).isoformat()
+
+        with self.assertRaises(subprocess.CalledProcessError) as future:
+            self.start_numbered_phase(
+                session_dir, "18", started_at + 10, "--started-at", moment(60)
+            )
+        self.assertIn("--started-at", cast(str, future.exception.stderr))
+        self.start_numbered_phase(session_dir, "18", started_at + 100, "--started-at", moment(50))
+        with self.assertRaises(subprocess.CalledProcessError) as early:
+            self.finish_numbered_phase(
+                session_dir, started_at + 110, "--phase-id", "18", "--finished-at", moment(40)
+            )
+        self.assertIn("--finished-at is before Phase 18 started", cast(str, early.exception.stderr))
+
+    def test_finish_run_closes_every_open_phase(self) -> None:
+        started_at = 45_000
+        session_dir = self.start_run("finish-run-open-phases", started_at)
+        self.start_numbered_phase(session_dir, "6", started_at + 10)
+        self.start_numbered_phase(session_dir, "18", started_at + 20)
+        _ = self.run_command(
+            "finish-run", "--session-dir", str(session_dir), "--status", "completed",
+            at=started_at + 30,
+        )
+        finished = self.phase_events("finish-run-open-phases", "phase_finished")
+        self.assertEqual([event.get("phase_id") for event in finished], ["18", "6"])
+        self.assertEqual(self.read_state(session_dir)["open_phases"], [])
+
+
 class PhaseCountTests(unittest.TestCase):
     """A plan's phase headings take three forms; all three must be counted.
 
@@ -4912,6 +5105,7 @@ class PhaseCountTests(unittest.TestCase):
 
     @override
     def setUp(self) -> None:
+        self.enterContext(patch.dict(os.environ, {"PLAN_DELEGATE_SYNC_WRITES": "0"}))
         self.temporary = tempfile.TemporaryDirectory()
         self.addCleanup(self.temporary.cleanup)
 
@@ -5001,6 +5195,7 @@ class PublicPhaseHelperTests(unittest.TestCase):
 
     @override
     def setUp(self) -> None:
+        self.enterContext(patch.dict(os.environ, {"PLAN_DELEGATE_SYNC_WRITES": "0"}))
         self.temporary = tempfile.TemporaryDirectory()
         self.addCleanup(self.temporary.cleanup)
         self.root = Path(self.temporary.name)
@@ -5040,10 +5235,34 @@ class PublicPhaseHelperTests(unittest.TestCase):
         self.assertEqual(
             progress_history.plan_phases(plan),
             [
-                {"id": "1", "title": "Archived delivery", "done": True},
-                {"id": "2", "title": "Finished delivery", "done": True},
-                {"id": "3", "title": "Live delivery", "done": False},
+                {"id": "1", "title": "Archived delivery", "done": True, "depends_on": None, "blocked_by": ""},
+                {"id": "2", "title": "Finished delivery", "done": True, "depends_on": None, "blocked_by": ""},
+                {"id": "3", "title": "Live delivery", "done": False, "depends_on": None, "blocked_by": ""},
             ],
+        )
+
+    def test_plan_phases_read_each_phase_dependencies_and_gate(self) -> None:
+        plan = self.root / "plan.md"
+        _ = plan.write_text(
+            "\n".join(
+                (
+                    "### Phase 1 — Base  · status: todo",
+                    "**Depends on:** none",
+                    "### Phase 2 — Report  · status: todo",
+                    "**Blocked by:** G3 — trunk phase 4 merged",
+                    "**Depends on:** Phase 1, Phase 4",
+                    "### Phase 3 — Docs  · status: todo",
+                    "",
+                )
+            ),
+            encoding="utf-8",
+        )
+
+        phases = progress_history.plan_phases(plan)
+
+        self.assertEqual(
+            [(phase["depends_on"], phase["blocked_by"]) for phase in phases],
+            [([], ""), (["1", "4"], "G3"), (None, "")],
         )
 
     def test_plan_phases_preserves_descriptive_parentheticals(self) -> None:

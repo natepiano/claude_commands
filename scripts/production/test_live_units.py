@@ -43,7 +43,12 @@ class LiveUnitsTests(unittest.TestCase):
         self.records.mkdir()
         self.environment = {**os.environ, "NOTIFIER_STATE_DIR": str(self.timers),
                             "NOTIFIER_SESSIONS_DIR": str(self.records),
-                            "UNIT_LOOKUP_TMUX": FAKE, "FAKE_TMUX_STATE": str(self.state)}
+                            "UNIT_LOOKUP_TMUX": FAKE, "FAKE_TMUX_STATE": str(self.state),
+                            "HERDR_BIN": str(SCRIPT.parents[1] / "herdr/fake_herdr.py"),
+                            "HERDR_PROC": str(self.root / "proc"),
+                            "FAKE_HERDR_LOG": str(self.root / "herdr.jsonl"),
+                            "FAKE_HERDR_RESPONSES": str(self.root / "herdr-responses.json")}
+        _ = (self.root / "herdr-responses.json").write_text(json.dumps({"default": {"stdout": "", "code": 1}}))
 
     def write_doc(self, header: tuple[str, str], *rows: str) -> None:
         _ = self.doc.write_text("\n".join(("# Production", "## Units", *header, *rows)), encoding="utf-8")
@@ -56,7 +61,7 @@ class LiveUnitsTests(unittest.TestCase):
         self.addCleanup(held.close)
         _ = (self.records / f"{name}.json").write_text(json.dumps({
             "pid": os.getpid(), "sessionId": f"id-{name}", "name": name,
-            "messagingSocketPath": str(path), "updatedAt": 1, "tmux": f"label-at-start:@1.{pane}"}))
+            "messagingSocketPath": str(path), "updatedAt": 1, "tmux": f"label-at-start:@1.{pane}" if pane else ""}))
 
     def run_script(self, *arguments: str) -> subprocess.CompletedProcess[str]:
         return subprocess.run([sys.executable, str(SCRIPT), *(arguments or ("--production", str(self.doc)))],
@@ -80,6 +85,39 @@ class LiveUnitsTests(unittest.TestCase):
         # `gone-unit` has neither a worktree nor a session of this production, so it is retired.
         self.assertEqual(result.stdout.splitlines(), ["alpha-unit\t%4\tlive\trenamed-since-launch",
                                                       "beta-unit\t%5\tstopped\t"])
+
+    def test_tmux_pane_targets_match_between_live_units_and_lookup(self) -> None:
+        self.write_doc(HEADER, "| alpha-unit | docs/plans/alpha.md | /tmp/no-such-worktree-alpha | alpha | — | — |")
+        fake_tmux.write(self.state, {"$1": marked("alpha-label", "%41", "alpha-unit")})
+        listed = self.run_script()
+        target = subprocess.run([sys.executable, str(SCRIPT.with_name("unit_lookup.py")),
+                                 "pane", "show", "alpha-unit"], env=self.environment,
+                                capture_output=True, text=True, check=False)
+        self.assertEqual((listed.returncode, target.returncode), (0, 0), listed.stderr + target.stderr)
+        self.assertEqual(listed.stdout.split("\t")[1], "%41")
+        self.assertEqual(target.stdout, "%41\n")
+
+    def test_a_herdr_unit_is_listed_with_its_live_claude(self) -> None:
+        self.write_doc(HEADER, "| alpha-unit | docs/plans/alpha.md | /tmp/no-such-worktree-alpha | alpha | — | — |")
+        _ = (self.root / "herdr-responses.json").write_text(json.dumps({"default": {"code": 0, "stdout": json.dumps({
+            "sessions": [{"name": "native", "running": True, "default": False,
+                          "session_dir": "/fixture", "socket_path": "/fixture/socket"}]
+        })}}))
+        for pid, parent, argv, environment in (
+            (991000, 0, ["herdr", "--session", "native", "server"], {}),
+            (os.getpid(), 991000, ["claude"], {"HERDR_PANE_ID": "w1:p1", "SHOWRUNNER_UNIT": "show",
+                                             "SHOWRUNNER_UNIT_ID": "alpha-unit"}),
+        ):
+            directory = self.root / "proc" / str(pid)
+            directory.mkdir(parents=True)
+            _ = (directory / "stat").write_text(f"{pid} (fixture) S {parent} 0 0")
+            _ = (directory / "cmdline").write_bytes("\0".join(argv).encode())
+            _ = (directory / "environ").write_bytes("\0".join(f"{key}={value}" for key, value in environment.items()).encode())
+            (directory / "cwd").symlink_to(self.root)
+        self.claude("native-claude", "")
+        result = self.run_script()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, "alpha-unit\therdr:native:w1:p1\tlive\tnative-claude\n")
 
     def test_a_doc_that_still_has_the_session_column_lists_the_same_units(self) -> None:
         self.write_doc(OLD_HEADER,

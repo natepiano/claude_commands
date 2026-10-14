@@ -13,9 +13,11 @@ import sqlite3
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, date, datetime, timedelta
-from typing import cast
+from typing import NamedTuple, cast
 
 import ci
+import holds
+import index
 import disk
 import memory
 import sync
@@ -25,6 +27,7 @@ from mac_outcome import (
     CacheReuse,
     DurationNotRecorded,
     LocalRunRequested,
+    MAC_STEP_CALLER,
     MacRunCompleted,
     MacRunLost,
     MacRunMatchedNoTest,
@@ -39,6 +42,11 @@ from mac_outcome import (
     offload_seconds,
     usable_share,
 )
+
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
+from user_zone import user_zone  # noqa: E402
 
 KIND_ORDER = ["fmt", "check", "clippy", "mend", "doc", "nextest", "sweep"]
 CALLER_LABELS = {
@@ -59,6 +67,7 @@ COMMON_HEAD = ["Runs", "Failed", "Avg", "p95", "Range"]
 COMMON_SQL = "count(*), sum(status <> 0), avg(duration_s), min(duration_s), max(duration_s), group_concat(duration_s)"
 CI_STALE_AFTER_S = 2 * 3600
 MAX_SAMPLE_GAP_S = 5 * 60
+MIN_PROFILE_RUNS = 10
 # 2026-10-01–04 log: 1 edit 12.54 min, 2–3 16.09, 4–7 20.94, 8+ 31.28.
 # One test per two edits leaves headroom for most gaps to stay within 2–3;
 # the 4–7 bin is where recovery time starts to climb.
@@ -401,7 +410,7 @@ def wait_row(row: WaitingRow) -> list[str]:
     longest = measurements.longest
     if isinstance(longest, NoWait):
         return [label, "none", "0", waited, f"0.0 {'job' if unit == 'jobs' else 'seat'}-hours", ""]
-    when = call_time(longest.started_at).astimezone().strftime("%H:%M %Z")
+    when = memory.local_time(call_time(longest.started_at))
     totals: dict[str, float] = {}
     for duration, owner, _, _ in positive:
         totals[owner] = totals.get(owner, 0.0) + duration
@@ -739,13 +748,15 @@ def memory_pressure_section(connection: sqlite3.Connection, day: str, hosts: int
     waits = fetch(
         connection,
         "SELECT count(*), sum(mem_wait_s), max(mem_wait_s) FROM steps"
-        + " WHERE date(started_at, 'localtime') = ? AND mem_wait_s > 0",
+        + " WHERE date(started_at, 'localtime') = ? AND mem_wait_s > 0"
+        + f" AND {natedev_step_predicate()}",
         day,
     )[0]
     longest = fetch(
         connection,
         f"SELECT {SCRATCH} AS is_scratch, caller, host FROM steps"
         + " WHERE date(started_at, 'localtime') = ? AND mem_wait_s > 0"
+        + f" AND {natedev_step_predicate()}"
         + " ORDER BY mem_wait_s DESC LIMIT 1",
         day,
     )
@@ -753,8 +764,10 @@ def memory_pressure_section(connection: sqlite3.Connection, day: str, hosts: int
         connection,
         f"SELECT {SCRATCH} AS is_scratch, s.step, s.caller, s.host, s.mem_stall_some_s,"
         + " (SELECT count(*) FROM steps other WHERE other.host = s.host"
-        + " AND other.started_at <= s.started_at AND s.started_at < other.ended_at)"
+        + " AND other.started_at <= s.started_at AND s.started_at < other.ended_at"
+        + f" AND {natedev_step_predicate('other')})"
         + " FROM steps s WHERE date(s.started_at, 'localtime') = ? AND s.mem_stall_some_s > 0"
+        + f" AND {natedev_step_predicate('s')}"
         + " ORDER BY s.mem_stall_some_s DESC LIMIT 5",
         day,
     )
@@ -765,7 +778,8 @@ def memory_pressure_section(connection: sqlite3.Connection, day: str, hosts: int
         + " FROM samples WHERE date(at, 'localtime') = ? ORDER BY host, at",
         day,
     )
-    instruments = memory.instrument_lines(connection, "date({column}, 'localtime') = ?", (day,))
+    instrument_predicate = "date({column}, 'localtime') = ? AND " + natedev_step_predicate().removeprefix("steps.")
+    instruments = memory.instrument_lines(connection, instrument_predicate, (day,))
     section = ["### Memory pressure", "", "Source: 60 s machine samples and step cgroup stall counters.", ""]
     if longest:
         is_scratch, caller, host = longest[0]
@@ -882,6 +896,104 @@ def test_builds_section(connection: sqlite3.Connection, day: str) -> list[str]:
     ]
 
 
+class ProfileChange(NamedTuple):
+    at: str
+    profile: str
+
+
+def profile_changes(connection: sqlite3.Connection) -> list[ProfileChange]:
+    """Keep the first observation of each distinct natedev profile run."""
+    changes: list[ProfileChange] = []
+    for at, profile, since in fetch(
+        connection,
+        "SELECT at, power_profile, power_profile_since FROM samples"
+        + " WHERE host = 'natedev' AND power_profile IS NOT NULL ORDER BY julianday(at), rowid",
+    ):
+        name = cast(str, profile)
+        if not changes or changes[-1].profile != name:
+            changes.append(ProfileChange(cast(str, since if since is not None else at), name))
+    return changes
+
+
+def profile_step_durations(
+    connection: sqlite3.Connection, start: datetime, end: datetime,
+) -> dict[tuple[str, str, str], list[float]]:
+    """Group passing steps by the kind, caller and rebuild class we compare."""
+    groups: dict[tuple[str, str, str], list[float]] = {}
+    for kind, caller, crates, duration in fetch(
+        connection,
+        "SELECT step, caller, crates_compiled, duration_s FROM steps"
+        + " WHERE julianday(started_at) >= julianday(?) AND julianday(started_at) < julianday(?)"
+        + f" AND {natedev_step_predicate()} AND status = 0 AND step <> 'sweep'"
+        + " AND duration_s IS NOT NULL",
+        start.isoformat(), end.isoformat(),
+    ):
+        rebuild = rebuild_bin(cast(int, crates)) if crates is not None else "—"
+        key = (str(kind), str(caller), rebuild)
+        groups.setdefault(key, []).append(cast(float, duration))
+    return groups
+
+
+def power_profile_section(connection: sqlite3.Connection, day: str) -> list[str]:
+    """Compare like steps on each side of the recent observed profile changes."""
+    zone = user_zone()
+    end = datetime.combine(date.fromisoformat(day) + timedelta(days=1), datetime.min.time(), zone).astimezone(UTC)
+    changes = [change for change in profile_changes(connection) if call_time(change.at) < end]
+    if not changes:
+        return []
+
+    def local_time(at: str) -> str:
+        return call_time(at).astimezone(zone).strftime("%Y-%m-%d %H:%M:%S %Z")
+
+    latest = changes[-1]
+    lines = ["### Power profile", "", f"Profile now: {latest.profile}, since {local_time(latest.at)}.", ""]
+    window_start = end - timedelta(days=7)
+    for position in range(len(changes) - 1, -1, -1):
+        change = changes[position]
+        at = call_time(change.at)
+        if at < window_start:
+            continue
+        before_start = at - timedelta(days=7)
+        before_profile = "profile not recorded"
+        if position:
+            previous = changes[position - 1]
+            before_start = max(before_start, call_time(previous.at))
+            before_profile = previous.profile
+        after_end = min(end, call_time(changes[position + 1].at)) if position + 1 < len(changes) else end
+        before = profile_step_durations(connection, before_start, at)
+        after = profile_step_durations(connection, at, after_end)
+        rows: list[list[str]] = []
+        for key in sorted(before.keys() & after.keys(), key=lambda key: (-len(after[key]), key)):
+            before_runs, after_runs = before[key], after[key]
+            before_p50 = nearest_rank(before_runs, 50)
+            after_p50 = nearest_rank(after_runs, 50)
+            difference = "—"
+            if len(before_runs) >= MIN_PROFILE_RUNS and len(after_runs) >= MIN_PROFILE_RUNS and before_p50 > 0:
+                difference = f"{(after_p50 - before_p50) / before_p50:+.0%}".replace("-", "−")
+            kind, caller, rebuild = key
+            rows.append([
+                kind, caller_label(caller, "natedev", 1), rebuild,
+                str(len(before_runs)), seconds(before_p50), str(len(after_runs)), seconds(after_p50), difference,
+            ])
+        lines += [
+            f"Before {local_time(change.at)} ({before_profile}) vs after ({change.profile}):",
+            "",
+        ]
+        if not rows:
+            lines += ["No step ran with the same kind, caller and rebuild class on both sides.", ""]
+            continue
+        lines += [
+            "| Kind | Caller | Rebuild | Before runs | Before p50 | After runs | After p50 | Change |",
+            "|---|---|---|--:|--:|--:|--:|--:|",
+            *("| " + " | ".join(row) + " |" for row in rows),
+            "Source: natedev steps that passed, the 7 days before the change against the time since, up to the next change;"
+            + f" p50 is the nearest rank; Change is shown only with at least {MIN_PROFILE_RUNS} runs on each side."
+            + " Load and time of day are not matched.",
+            "",
+        ]
+    return lines
+
+
 def day_range(day: str) -> tuple[str, str]:
     """UTC bounds for a local day, including days that change the clocks."""
     first = datetime.combine(date.fromisoformat(day), datetime.min.time())
@@ -985,6 +1097,44 @@ def matched_local_failures(
 
 def median_duration(values: Sequence[float]) -> float:
     return nearest_rank(values, 50) if values else 0.0
+
+
+def mac_section(connection: sqlite3.Connection, day: str) -> list[str]:
+    """Steps recorded on Mac hosts, including calls started there directly."""
+    start, end = day_range(day)
+    rows = fetch(
+        connection,
+        f"SELECT caller, step, count(*), sum({index.COUNTED_FAILURE}),"
+        + " avg(duration_s), min(duration_s), max(duration_s), group_concat(duration_s),"
+        + " avg(finished_s), sum(tests_run), sum(tests_failed), sum(duration_s)"
+        + " FROM steps WHERE started_at >= ? AND started_at < ? AND host <> 'natedev'"
+        + " GROUP BY caller, step ORDER BY count(*) DESC, caller, step",
+        start, end,
+    )
+    if not rows:
+        return ["### Mac", "", "No steps recorded on the Mac.", ""]
+    body = [
+        [
+            "verify.sh offload" if row[0] == MAC_STEP_CALLER else caller_label(row[0], "", 1),
+            str(row[1]),
+            *common(row[2:8]),
+            seconds(row[8]) or "—",
+            count(row[9]) or "—",
+            count(row[10]) or "—",
+        ]
+        for row in rows
+    ]
+    mac_table = table(["Caller", "Kind", *COMMON_HEAD, "Build", "Tests", "Tests failed"], body)
+    mac_table[1] = "|---|---|--:|--:|--:|--:|--:|--:|--:|--:|"
+    runs = sum(cast(int, row[2]) for row in rows)
+    failed = sum(cast(int, row[3] or 0) for row in rows)
+    duration = sum(cast(float, row[11] or 0) for row in rows)
+    return [
+        "### Mac", "", *mac_table,
+        f"Mac total: {runs} steps, {seconds(duration)}; {failed} failed.",
+        "Source: steps recorded on the Mac; failed follows the build log's failure rule, so a Mac nextest that matched no tests is not a failure.",
+        "",
+    ]
 
 
 def mac_tests_section(connection: sqlite3.Connection, day: str) -> list[str]:
@@ -1166,10 +1316,10 @@ def ci_freshness(day: str) -> str:
     if not polled:
         return "; CI never polled"
     newest = max(polled, key=lambda state: datetime.fromisoformat(state.polled_at.replace("Z", "+00:00")))
-    now = datetime.now().astimezone()
-    day_end = datetime.combine(date.fromisoformat(day) + timedelta(days=1), datetime.min.time()).astimezone()
+    now = datetime.now(user_zone())
+    day_end = datetime.combine(date.fromisoformat(day) + timedelta(days=1), datetime.min.time(), user_zone())
     horizon = min(now, day_end)
-    at = datetime.fromisoformat(newest.polled_at.replace("Z", "+00:00")).astimezone()
+    at = datetime.fromisoformat(newest.polled_at.replace("Z", "+00:00")).astimezone(user_zone())
     if day_end < now and at >= day_end:
         return ""
     stale = at < horizon - timedelta(seconds=CI_STALE_AFTER_S)
@@ -1442,7 +1592,7 @@ def lead_block(connection: sqlite3.Connection, day: str, calls: Sequence[Reporte
     """The day's routing, waits, failures and saved work, before the tables."""
     start, end = day_range(day)
     share = usable_share(connection, start, end)
-    lines: list[str] = []
+    lines = holds.now_lines(holds.read_current_holds())
     if share.candidates:
         lines.append(f"Mac when usable: {share.finished} of {share.candidates} candidates finished there ({share.finished / share.candidates:.0%}).")
     measured_rows = [(row.measurements.longest.seconds, row.name) for row in waits.rows
@@ -1469,9 +1619,10 @@ def lead_block(connection: sqlite3.Connection, day: str, calls: Sequence[Reporte
     candidates = [call for call in calls if call.on_report_day and call.candidate]
     if candidates:
         latest = candidates[-1]
-        if isinstance(latest.offload, OffloadDeclined) and latest.offload.reason in ('blocked', 'backoff', 'unreachable'):
-            state = 'blocked' if latest.offload.reason == 'blocked' else 'unreachable'
-            lines.append(f"Mac {state} as of {latest.started_at.astimezone().strftime('%H:%M')}")
+        if isinstance(latest.offload, OffloadDeclined) and latest.offload.reason in ('backoff', 'unreachable'):
+            instant = latest.started_at.astimezone(user_zone())
+            shown = instant.strftime('%H:%M' if day == datetime.now(user_zone()).date().isoformat() else '%Y-%m-%d %H:%M %Z')
+            lines.append(f"Mac unreachable as of {shown}")
     return [*lines, ""] if lines else []
 
 
@@ -1501,7 +1652,9 @@ def report(connection: sqlite3.Connection, day: str) -> str:
     lines += (
         calls
         + test_builds_section(connection, day)
+        + power_profile_section(connection, day)
         + tests_by_target_lines(test_calls)
+        + mac_section(connection, day)
         + port_lint
         + ci
         + tests_per_edit_section(connection, day)

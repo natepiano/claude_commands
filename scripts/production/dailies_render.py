@@ -97,6 +97,7 @@ STARTED = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}$")
 UNREADABLE_LIST = "needs-user list unreadable"
 STAMP = "%Y-%m-%dT%H:%M"
 NO_REPORT = "no report yet"
+NO_ROWS = "No unit is working: every run has finished."
 # Words for the production's own coordination, which you never see in the app
 # (user, 2026-10-02: "i have no idea what a stale file holds from the merged
 # work are released even means"; "retaking every view" and "file clashes get
@@ -125,7 +126,7 @@ CHART_CONF = Path.home() / ".local/state/showrunner/dailies.conf"
 AGENTS_DIR = Path.home() / "rust" / "hanadocs" / "agents"
 CHART_KEY = "chart"
 NOW_MARK = "▼ "
-# A unit under a /build_hold carries this marker on its timeline row; no
+# A unit under a /build:hold carries this marker on its timeline row; no
 # marker means not held (user, 2026-10-03: "Without that marker I will assume
 # it is not held"). The hold's start, purpose and release are stated once, in
 # the line after the timeline (user, 2026-10-04: "you do not need to repeat
@@ -237,6 +238,8 @@ class Unit:
     held: str | None
     held_examples: str | None
     build_hold: bool
+    # The unit's own session holds the builds: the builder writes it, since a holder is named by its session.
+    holds_builds: bool
     update: str
     eta: Eta
     waiting_on_it: str | None
@@ -872,7 +875,7 @@ def read_dailies_hold() -> HoldState:
             try:
                 check_plumbing(holder.purpose, f"build hold {holder.name!r} purpose")
             except InputError as error:
-                raise InputError(f"{error}; have {holder.name} run /build_hold hold again with other words") from None
+                raise InputError(f"{error}; have {holder.name} run /build:hold hold again with other words") from None
     return hold
 
 
@@ -888,7 +891,7 @@ def read_mac_block() -> MacBlockFooterState:
             check_plumbing(block.reason, f"Mac block {block.holder!r} reason")
         except InputError as error:
             raise InputError(
-                f"{error}; have {block.holder} run /mac_test block again with other words"
+                f"{error}; have {block.holder} run /build:mac block again with other words"
             ) from None
     return block
 
@@ -943,7 +946,7 @@ def parse_unit(value: object, where: str, length: str) -> Unit:
     fields = as_map(value, where)
     check_keys(
         fields,
-        {"unit", "name", "label", "project", "goal", "phase", "started", "held", "held_examples", "build_hold", "update", "eta", "waiting_on_it", "needed", "needs_user", "then", "idle"},
+        {"unit", "name", "label", "project", "goal", "phase", "started", "held", "held_examples", "build_hold", "holds_builds", "update", "eta", "waiting_on_it", "needed", "needs_user", "then", "idle"},
         where,
     )
     if "held" not in fields:
@@ -1001,6 +1004,9 @@ def parse_unit(value: object, where: str, length: str) -> Unit:
     build_hold = fields.get("build_hold", False)
     if not isinstance(build_hold, bool):
         raise InputError(f"{where}.build_hold: true while the unit is held, else left out; hold details come from the holder files")
+    holds_builds = fields.get("holds_builds", False)
+    if not isinstance(holds_builds, bool):
+        raise InputError(f"{where}.holds_builds: true while the unit's own session holds the builds, else left out")
     return Unit(
         unit=unit,
         name=optional_text(fields, "name", where) or unit,
@@ -1012,6 +1018,7 @@ def parse_unit(value: object, where: str, length: str) -> Unit:
         held=held,
         held_examples=held_examples,
         build_hold=build_hold,
+        holds_builds=holds_builds,
         update=update,
         eta=parse_eta(fields.get("eta"), f"{where}.eta"),
         waiting_on_it=optional_text(fields, "waiting_on_it", where),
@@ -1068,20 +1075,20 @@ def parse_report(value: object, chart: str) -> Report:
     zone = text(fields, "zone", "input")
     next_run = clock_text(fields, "next_run", "input")
     units = [parse_unit(item, f"units[{index}]", length) for index, item in enumerate(as_list(fields.get("units"), "input.units"))]
-    if not units:
-        raise InputError("input.units: every unit is reported, so the list cannot be empty")
     topics = [parse_topic(item, f"topics[{index}]", length) for index, item in enumerate(as_list(fields.get("topics"), "input.topics"))]
     hold = read_dailies_hold()
     mac_block = read_mac_block()
     marked = any(unit.build_hold for unit in units)
     if marked and isinstance(hold, NoHolders):
         raise InputError("units.build_hold: a unit is marked but no holder file exists; remove the stale unit marker")
-    if not marked and isinstance(hold, ActiveHolders):
-        raise InputError("units.build_hold: holder files are active but no unit is marked; mark the held unit")
     if isinstance(hold, ActiveHolders):
         holder_names = {holder.name for holder in hold.holders}
+        holding = {unit.unit for unit in units if unit.holds_builds or unit.unit in holder_names}
+        # A holder's own unit is never marked, so a marker is owed only where some unit holds nothing.
+        if not marked and any(unit.unit not in holding for unit in units):
+            raise InputError("units.build_hold: holder files are active but no unit is marked; mark the held unit")
         for unit in units:
-            if unit.build_hold and unit.unit in holder_names:
+            if unit.build_hold and unit.unit in holding:
                 raise InputError(f"units.build_hold: {unit.unit} holds the build hold itself; remove its marker")
     counts = [parse_count(item, f"counts[{index}]") for index, item in enumerate(as_list(fields.get("counts"), "input.counts"))]
     supplied_children = as_list(fields.get("children"), "input.children")
@@ -1733,7 +1740,11 @@ def render(report: Report, previous: dict[str, LastUnitReport], resolved: dict[s
             rows.extend(Row(f"{child.name}/{row.name}", row.estimate, False, None) for row in child.report.rows)
     if report.counts:
         lines.extend([counts_line(report.counts), ""])
-    lines.extend(["```", *draw(now, rows, CHART_STYLES[report.chart]), "```", ""])
+    if rows:
+        lines.extend(["```", *draw(now, rows, CHART_STYLES[report.chart]), "```", ""])
+    else:
+        # Every unit's run has finished and was left out, and no production is below: there is nothing to chart.
+        lines.extend([NO_ROWS, ""])
     # A due item in a lower production's list needs the user as much as one named here.
     needed = (any(unit.needed for unit in report.units) or any(topic.needed for topic in report.topics)
               or any(child.open for child in report.children))

@@ -15,6 +15,7 @@ from typing import Literal, TypedDict, cast, override
 from unittest import mock
 
 import targets
+import build_hold
 import mac_test
 import offload
 
@@ -77,6 +78,7 @@ class IsolatedTargetTest(unittest.TestCase):
         _ = self.settings.write_text("host=test-mac\n", encoding="utf-8")
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {
             "BUILD_HOLD_DIR": str(self.holders),
+            "BUILDLOG_DIR": str(self.root / "buildlog"),
             "MAC_TEST_STATE_DIR": str(self.mac_state),
             "NOTIFIER_SESSIONS_DIR": str(self.root / "sessions"),
             "CLAUDE_CODE_SESSION_ID": "",
@@ -84,6 +86,7 @@ class IsolatedTargetTest(unittest.TestCase):
             "PLAN_DELEGATE_ACTIVE_DIR": str(self.root / "active"),
             "BUILDLOG_CALL_ID": "", "BUILDLOG_CALLER": "",
         })))
+        _ = self.enterContext(mock.patch.object(build_hold, "record_hold_event"))
         _ = os.environ.pop("BUILD_TARGETS_CONFIG", None)
         _ = self.enterContext(mock.patch.object(Path, "home", return_value=self.root))
         _ = self.enterContext(mock.patch(
@@ -301,9 +304,16 @@ class TargetStateTests(IsolatedTargetTest):
         args.what = "nextest hana"
         args.worktree = str(self.root)
         output = io.StringIO()
-        with mock.patch.object(mac_test, "process_start_time", return_value="test-run-start"):
+        with mock.patch.object(mac_test, "process_start_time", return_value="test-run-start"), \
+             mock.patch.object(mac_test, "start_claim_watcher") as watcher:
             with redirect_stdout(output):
                 code = mac_test.command_claim(args, mac_test.StatePaths(self.mac_state))
+        if code == 0:
+            watcher.assert_called_once()
+            paths = cast(mac_test.StatePaths, watcher.call_args.args[0])
+            self.assertEqual(paths.directory, self.mac_state)
+        else:
+            watcher.assert_not_called()
         return code, output.getvalue()
 
     def test_retained_expired_block_is_held_and_refuses_claim(self) -> None:

@@ -17,11 +17,11 @@ fi
 notifier=$REPO/scripts/message/notifier.sh
 
 # The leading digits, as progress_timer.sh reads them, so a trailing comment
-# leaves the interval alone. PLAN_DELEGATE_PROGRESS_UPDATES=on-demand gives a
-# new run no schedule: /unit:report runs only when someone asks for it, and
-# `on` makes the schedule then.
+# leaves the interval alone. PLAN_DELEGATE_PROGRESS_UPDATES=on-demand, or no
+# line, gives a new run no schedule: /unit:report runs only when someone asks
+# for it, and `on` makes the schedule then. Only `scheduled` starts one.
 seconds=900
-updates=scheduled
+updates=on-demand
 config=${PLAN_DELEGATE_CONFIG:-$HOME/.claude/config/delegate.conf}
 if [[ -r $config ]]; then
   while IFS= read -r line || [[ -n $line ]]; do
@@ -91,9 +91,11 @@ if (( $# == 2 )); then
 fi
 
 if [[ $updates == on-demand ]]; then
-  # A resumed run may still hold the schedule an earlier start made.
+  # A resumed run keeps the schedule it has, on or off: `new` retargets it and
+  # leaves its clock alone (user, 2026-10-13: existing work keeps what it has).
   if zsh "$notifier" status "$instance" >/dev/null 2>&1; then
-    zsh "$notifier" stop "$instance" >/dev/null || exit $?
+    make_instance
+    exit $?
   fi
   print -r -- "progress updates on demand: $instance has no schedule; /unit:report on starts one"
   exit 0

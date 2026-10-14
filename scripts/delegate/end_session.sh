@@ -33,7 +33,7 @@ if [[ -z "${CLAUDE_CODE_SESSION_ID:-}" ]]; then
   exit 0
 fi
 
-MARKER="/tmp/claude/delegate/active/${CLAUDE_CODE_SESSION_ID}"
+MARKER="${PLAN_DELEGATE_ACTIVE_DIR:-/tmp/claude/delegate/active}/${CLAUDE_CODE_SESSION_ID}"
 
 if [[ -f "${MARKER}" ]]; then
   # The marker holds the session directory, which is where the mesh files live.

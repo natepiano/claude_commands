@@ -8,7 +8,7 @@ import os
 import re
 import subprocess
 import sys
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, NamedTuple, TypedDict, cast
 
@@ -16,10 +16,10 @@ from add_unit import Production, Refusal, cell_value, read_production, unit_tabl
 from merge_checkpoint import NoMerge, merge_branch_history, report
 
 if TYPE_CHECKING:
-    from ..hooks.showrunner_footer import FooterState, footer_state
+    from ..hooks.showrunner_footer import FooterState, footer_state, set_footer_state
 else:
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "hooks"))
-    from showrunner_footer import FooterState, footer_state
+    from showrunner_footer import FooterState, footer_state, set_footer_state
 import showrunners
 from dailies_render import UNREADABLE_LIST, InputError, footer_main, read_outstanding
 
@@ -42,6 +42,11 @@ class OutstandingItem(TypedDict):
     since: str
     text: str
     after: str
+
+
+class QuestionRegistration(TypedDict):
+    time: str
+    text: str
 
 
 class UnitJudgment(NamedTuple):
@@ -106,15 +111,16 @@ DEFAULT_MINUTES = 15
 
 
 class UpdatesOnDemand(NamedTuple):
-    """The doc's Updates line reads `on demand`: a dailies runs only when the user asks for one."""
+    """The doc's Updates line reads `on demand`, or there is none: a dailies runs only when the user asks for one."""
 
 
 def update_schedule(lines: list[str]) -> ScheduledUpdates | UpdatesOnDemand:
     line = next((line for line in lines if line.startswith("- **Updates:**")), "")
-    if re.search(r"\bon demand\b", line):
-        return UpdatesOnDemand()
     match = re.search(r"every (\d+) minutes", line)
-    minutes = int(match.group(1)) if match else DEFAULT_MINUTES
+    # Quiet by default (user, 2026-10-13): only a line asking for a schedule makes one.
+    if match is None or re.search(r"\bon demand\b", line):
+        return UpdatesOnDemand()
+    minutes = int(match.group(1))
     if minutes <= 0:
         raise RegistrationFailure("prompt", "Updates interval must be positive")
     return ScheduledUpdates(minutes, "on the hour" in line)
@@ -161,11 +167,17 @@ def register(production: Production) -> None:
     if not prompt_file.exists() or prompt_file.read_text(encoding="utf-8") != prompt:
         _ = prompt_file.write_text(prompt, encoding="utf-8")
     check = f"zsh {Path.home()}/.claude/scripts/production/production_check.sh {production.doc}"
+    # No instance yet means a new production, which starts with its footer off (user, 2026-10-13). A
+    # restart finds its instance, so an existing production keeps the footer it has.
+    new_production = isinstance(instance(updates), InstanceAbsent)
     _ = notifier(["new", updates, "--to", f"session:{session_id}", "--every", str(minutes),
               "--prompt-file", str(prompt_file), "--from", f"showrunner-timer-{production.slug}",
               "--check", check, *(["--aligned"] if aligned else [])])
     if isinstance(schedule, UpdatesOnDemand):
         _ = notifier(["stop", updates])
+    if new_production:
+        set_footer_state(production.slug, FooterState.OFF)
+        report("footer", "ok", "off — new production; /showrunner:footer on turns it on")
     for name, script in (("stall-watch", "stall_watch.py"), ("tmux-names", "tmux_names.py")):
         if isinstance(instance(name), InstanceAbsent):
             run = f"{Path.home()}/.claude/scripts/lib/py {Path.home()}/.claude/scripts/production/{script}"
@@ -340,6 +352,30 @@ def append_log(production: Production, event: str, path: Path | None, before_com
     report("log", "ok", f"event {count}" + (" with STATE" if block else ""))
 
 
+def record_question_history(outstanding: Path, texts: list[str], now: datetime) -> None:
+    """Retain two days of registrations, including questions that have closed."""
+    history = outstanding.with_suffix(".history.jsonl")
+    retained: list[QuestionRegistration] = []
+    cutoff = now - timedelta(hours=48)
+    if history.exists():
+        for line in history.read_text(encoding="utf-8").splitlines():
+            try:
+                value = cast(object, json.loads(line))
+                if not isinstance(value, dict):
+                    continue
+                fields = cast(dict[str, object], value)
+                stamp, text = fields.get("time"), fields.get("text")
+                if not isinstance(stamp, str) or not isinstance(text, str):
+                    continue
+                dated = datetime.fromisoformat(stamp.replace("Z", "+00:00"))
+                if dated.tzinfo is not None and dated >= cutoff:
+                    retained.append(QuestionRegistration(time=stamp, text=text))
+            except ValueError:
+                continue
+    retained.extend(QuestionRegistration(time=now.isoformat(), text=text) for text in dict.fromkeys(texts))
+    _ = history.write_text("".join(json.dumps(item) + "\n" for item in retained), encoding="utf-8")
+
+
 def footer(production: Production, path: Path | None, nothing_needed: bool) -> None:
     state = judgment_state(path, "footer")
     outstanding = outstanding_path(production)
@@ -356,7 +392,8 @@ def footer(production: Production, path: Path | None, nothing_needed: bool) -> N
                         if isinstance(text, str) and isinstance(since, str):
                             previous[text] = OutstandingItem(since=since, text=text,
                                                              after=str(fields.get("after", "")))
-        since = datetime.now(production.zone).strftime("%Y-%m-%dT%H:%M")
+        now = datetime.now(production.zone)
+        since = now.strftime("%Y-%m-%dT%H:%M")
         entries: list[dict[str, str]] = []
         for item in state.outstanding.items:
             entry = {"since": previous[item.text]["since"] if item.text in previous else since,
@@ -365,6 +402,8 @@ def footer(production: Production, path: Path | None, nothing_needed: bool) -> N
                 entry["after"] = item.after
             entries.append(entry)
         outstanding.parent.mkdir(parents=True, exist_ok=True)
+        record_question_history(outstanding, [item.text for item in state.outstanding.items
+                                             if item.text not in previous], now)
         _ = outstanding.write_text(json.dumps(entries) + "\n", encoding="utf-8")
     # The switch hides the printed footer only. What waits on the user is stored above either way,
     # so the dailies and the open-questions count still see it.

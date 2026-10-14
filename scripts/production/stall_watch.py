@@ -19,13 +19,13 @@ from zoneinfo import ZoneInfo
 import add_unit
 import showrunners
 import unit_lookup
+from session_pane import HerdrFailure, read_place
 
 STATE_DIR = Path(os.environ.get("STALL_WATCH_STATE_DIR") or Path.home() / ".local/state/stall-watch")
 SESSIONS_DIR = Path(os.environ.get("NOTIFIER_SESSIONS_DIR") or Path.home() / ".claude/sessions")
 PROJECTS_DIR = Path(os.environ.get("STALL_WATCH_PROJECTS_DIR") or Path.home() / ".claude/projects")
 SESSIONS = Path(os.environ.get("STALL_WATCH_SESSIONS") or Path(__file__).resolve().parent.parent / "message/sessions.py")
 SEND = Path(os.environ.get("STALL_WATCH_SEND") or Path(__file__).resolve().parent.parent / "message/send.py")
-TMUX = os.environ.get("STALL_WATCH_TMUX") or "tmux"
 PS = os.environ.get("STALL_WATCH_PS") or "ps"
 WAITING_KINDS = ("done", "blocked", "gate", "decision")
 HOLDING_KIND = "holding"
@@ -85,14 +85,41 @@ def descendants(root: int, rows: list[Process]) -> list[Process]:
     return found
 
 
-def work_running(pid: int, rows: list[Process]) -> bool:
+def unit_marks(pid: int) -> tuple[str, str] | None:
+    """The production and unit a process's environment marks it with, inherited from its unit's session."""
+    try:
+        environment = Path(f"/proc/{pid}/environ").read_bytes().split(b"\0")
+    except OSError:
+        return None
+    values = dict(item.decode(errors="replace").split("=", 1) for item in environment if b"=" in item)
+    slug, unit = values.get(unit_lookup.PRODUCTION_MARK, ""), values.get(unit_lookup.UNIT_MARK, "")
+    return (slug, unit) if slug and unit else None
+
+
+def work_running(pid: int, rows: list[Process], marks: tuple[str, str] | None = None) -> bool:
+    """A shell or launcher under the unit's Claude, or any process the unit started that left its tree.
+
+    A process carrying the unit's marks counts wherever it sits, except the Claude, the pane around
+    it, and the long-lived helpers the Claude starts itself (its MCP servers).
+    """
     for row in descendants(pid, rows):
         if row.command.endswith(" <defunct>"):
             continue
         word = row.command.split(" ", 1)[0]
         if Path(word).name in WORK:
             return True
-    return False
+    if marks is None:
+        return False
+    parents = {row.pid: row.parent for row in rows}
+    ancestors: set[int] = set()
+    current = pid
+    while current in parents and current not in ancestors:
+        ancestors.add(current)
+        current = parents[current]
+    helpers = {row.pid for row in rows if row.parent == pid}
+    helpers.update(child.pid for helper in tuple(helpers) for child in descendants(helper, rows))
+    return any(row.pid not in ancestors and row.pid not in helpers and not row.command.endswith(" <defunct>")
+               and unit_marks(row.pid) == marks for row in rows)
 
 
 def latest_transcript_activity(session_id: str) -> float:
@@ -189,6 +216,10 @@ def tick(now: float) -> None:
             print(f"stall-watch: {configured['slug']}: its units are not watched: {error}", file=sys.stderr)
             continue
         for name, unit in marked.items():
+            # The review unit waits for a review merge by design, so idle is its normal state.
+            if add_unit.is_review_unit(name, lines):
+                stretch_path(slug, name).unlink(missing_ok=True)
+                continue
             # A unit is watched while the newest /unit:direct run in its worktree is unfinished.
             try:
                 running = name in live and unit_lookup.run_state(Path(live[name])) is unit_lookup.UnitState.RUNNING
@@ -204,8 +235,8 @@ def tick(now: float) -> None:
                     print(f"stall-watch: {name}: {claude.reason}", file=sys.stderr)
                 continue
             try:
-                pane = command_output([TMUX, "capture-pane", "-p", "-J", "-S", "-400", "-t", unit.pane])
-            except OSError as error:
+                pane = read_place(unit.place, 400, joined=True).strip()
+            except (OSError, HerdrFailure) as error:
                 print(f"stall-watch: {name}: {error}", file=sys.stderr)
                 continue
             pid, session_id, socket = claude.pid, claude.session_id, claude.socket
@@ -218,7 +249,7 @@ def tick(now: float) -> None:
                                   bump_sent=False, tell_sent=False, reported_status="")
                 save_stretch(path, stretch)
                 continue
-            running_work = work_running(pid, rows)
+            running_work = work_running(pid, rows, (slug, unit.unit))
             if running_work or (stretch["reported_status"] and last != stretch["reported_status"]):
                 stretch = Stretch(pane_hash=hashlib.sha256(pane.encode()).hexdigest(), since=now,
                                   bump_sent=False, tell_sent=False, reported_status="")

@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import json
+import dailies_input
+import dailies_render
+from cli_fixture import ImmutableGitSeed, invoke_cli
 import os
 import subprocess
 import sys
@@ -10,15 +13,19 @@ import tempfile
 import unittest
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import cast, override
+from typing import ClassVar, cast, override
+from unittest import mock
 from zoneinfo import ZoneInfo
 
-from dailies_input import (Activity, Block, ClaudeNotRunning, Decision, FormWaiting,
+from add_unit import read_production
+from dailies_render import LENGTHS
+from dailies_input import (Activity, BevyUpgradeUnavailable, Block, ClaudeNotRunning, Decision, FormWaiting,
                            Running, SessionGone, StillWaiting, TicksFailing, UnitRow,
-                           status_blocks)
+                           bevy_upgrade_watch, status_blocks)
 from unit_lookup import UnitState
 
 
+# Script completion deadlines only bound hangs; startup can be slow under load.
 SCRIPT = Path(__file__).with_name("dailies_input.py")
 RENDERER = SCRIPT.with_name("dailies_render.py")
 CI_POINTS = SCRIPT.with_name("ci_points.py")
@@ -100,13 +107,36 @@ if command == failure:
 if command == "show":
     print(Path(os.environ["DAILIES_PHASE_TABLE_JSON"]).read_text(encoding="utf-8"))
     raise SystemExit(0)
-if command == "prune":
-    raise SystemExit(0)
 raise SystemExit(2)
+'''
+BEVY_UPGRADE_STUB = '''
+import json
+import os
+from pathlib import Path
+import sys
+
+Path(os.environ["DAILIES_BEVY_EVENTS"]).write_text(json.dumps(sys.argv[1:]), encoding="utf-8")
+print(os.environ.get("DAILIES_BEVY_STDERR", ""), file=sys.stderr, flush=True)
+print(os.environ.get("DAILIES_BEVY_OUTPUT", ""))
+raise SystemExit(int(os.environ.get("DAILIES_BEVY_EXIT", "0")))
 '''
 
 
+def setUpModule() -> None:
+    """The times these tests expect are Pacific; the user's zone setting must not change them."""
+    unittest.enterModuleContext(mock.patch.dict(os.environ, {"USER_ZONE": "America/Los_Angeles"}))
+
+
 class DailiesInputTests(unittest.TestCase):
+    seed: ClassVar[ImmutableGitSeed]
+
+    @classmethod
+    @override
+    def setUpClass(cls) -> None:
+        super().setUpClass()
+        root = Path(cls.enterClassContext(tempfile.TemporaryDirectory(prefix="DailiesInputTests-seed-")))
+        cls.seed = ImmutableGitSeed.create(root, 'production', 'Dailies Test', 'dailies@example.invalid', {'README.md': 'base\n'})
+
     root: Path = Path()
     home: Path = Path()
     origin: Path = Path()
@@ -132,10 +162,8 @@ class DailiesInputTests(unittest.TestCase):
         self.home = self.root / "home"
         self.home.mkdir()
         self.origin = self.root / "origin.git"
-        _ = subprocess.run(["git", "init", "--bare", str(self.origin)],
-                           check=True, capture_output=True, text=True)
         self.checkout = self.root / "merge"
-        self.checkout.mkdir()
+        self.seed.copy_to(self.checkout, self.origin)
         self.doc = self.root / "example-production.md"
         self.status = self.root / "status.txt"
         self.judgment = self.root / "judgment.json"
@@ -156,7 +184,13 @@ class DailiesInputTests(unittest.TestCase):
         self.phase_table.chmod(0o755)
         _ = self.phase_table_json.write_text("{}\n", encoding="utf-8")
         self.showrunner_state = self.root / "showrunner-state"
+        upgrade = self.root / "bevy upgrade stub.py"
+        _ = upgrade.write_text(BEVY_UPGRADE_STUB, encoding="utf-8")
         self.env = {**os.environ, "HOME": str(self.home), "BUILD_HOLD_DIR": str(self.holders),
+                    "DAILIES_BEVY_UPGRADE": str(upgrade),
+                    "DAILIES_BEVY_EVENTS": str(self.root / "bevy-events.json"),
+                    "DAILIES_BEVY_OUTPUT": "", "DAILIES_BEVY_STDERR": "",
+                    "DAILIES_BEVY_EXIT": "0",
                     "MAC_TEST_STATE_DIR": str(self.root / "mac-test"),
                     "DAILIES_TEST_EVENTS": str(self.events), "DAILIES_TEST_FAIL": str(self.notifier_failure),
                     "DAILIES_PHASE_TABLE": str(self.phase_table),
@@ -167,19 +201,10 @@ class DailiesInputTests(unittest.TestCase):
                     "NOTIFIER_STATE_DIR": str(self.root / "notifier-state"),
                     "SHOWRUNNER_STATE_DIR": str(self.showrunner_state),
                     # Unit sessions are looked up in this stand-in; with no state file it has no sessions.
-                    "UNIT_LOOKUP_TMUX": str(Path(__file__).with_name("fake_tmux.py")),
+                    "UNIT_LOOKUP_TMUX": str(Path(__file__).with_name("fake_tmux.sh")),
                     "FAKE_TMUX_STATE": str(self.root / "tmux.json"),
                     "NOTIFIER_SESSIONS_DIR": str(self.root / "sessions")}
         (self.root / "sessions").mkdir()
-        _ = subprocess.run(["git", "init", "-b", "production", str(self.checkout)],
-                           check=True, capture_output=True, text=True)
-        _ = self.git("config", "user.name", "Dailies Test")
-        _ = self.git("config", "user.email", "dailies@example.invalid")
-        _ = self.git("remote", "add", "origin", str(self.origin))
-        _ = (self.checkout / "README.md").write_text("base\n", encoding="utf-8")
-        _ = self.git("add", "README.md")
-        _ = self.git("commit", "-m", "initial")
-        _ = self.git("push", "-u", "origin", "production")
         self.production_doc()
         self.status_lines(f"== {ALPHA}", "● Checking panel labels", "ETA 23:40")
         self.judgment_file()
@@ -242,30 +267,29 @@ class DailiesInputTests(unittest.TestCase):
             })
         _ = self.judgment.write_text(json.dumps({"units": units, "topics": []}) + "\n", encoding="utf-8")
 
-    def run_builder(self, *extra: str, include_render_state: bool = True) -> subprocess.CompletedProcess[str]:
+    def run_builder(self, *extra: str, include_render_state: bool = True, subprocess_cli: bool = False) -> subprocess.CompletedProcess[str]:
         state_args = (
             ("--render-state", str(self.root / "render-state.json"))
             if include_render_state and "--render-state" not in extra else ()
         )
-        return subprocess.run(
-            [sys.executable, str(SCRIPT), "--production", str(self.doc),
+        arguments = ["--production", str(self.doc),
              "--status", str(self.status), "--judgment", str(self.judgment),
              "--state-dir", str(self.state), "--out", str(self.output),
              "--holders", str(self.holders), "--notifier", str(self.notifier),
-             "--at", AT, *state_args, *extra],
-            cwd=self.checkout, env=self.env, capture_output=True, text=True, check=False,
-        )
+             "--at", AT, *state_args, *extra]
+        if subprocess_cli:
+            return subprocess.run([sys.executable, str(SCRIPT), *arguments], cwd=self.checkout,
+                                  env=self.env, capture_output=True, text=True, check=False, timeout=300)
+        return invoke_cli(dailies_input, dailies_input.main, arguments, self.env, self.checkout, production_state=True)
 
     def report(self) -> dict[str, object]:
         return cast(dict[str, object], json.loads(self.output.read_text(encoding="utf-8")))
 
     def run_renderer(self, at: str) -> subprocess.CompletedProcess[str]:
-        return subprocess.run(
-            [sys.executable, str(RENDERER), str(self.output), "--at", at,
-             "--state", str(self.root / "render-state.json"),
-             "--log", str(self.root / "dailies.log")],
-            cwd=self.checkout, env=self.env, capture_output=True, text=True, check=False,
-        )
+        arguments = [str(self.output), "--at", at, "--state", str(self.root / "render-state.json"),
+                     "--log", str(self.root / "dailies.log")]
+        return invoke_cli(dailies_render, lambda: dailies_render.main(arguments), arguments,
+                          self.env, self.checkout, production_state=True)
 
     def unit(self) -> dict[str, object]:
         return cast(dict[str, object], cast(list[object], self.report()["units"])[0])
@@ -356,13 +380,13 @@ class DailiesInputTests(unittest.TestCase):
     def run_merge_watch(self) -> subprocess.CompletedProcess[str]:
         return subprocess.run([sys.executable, str(CI_POINTS), "watch", "--production", str(self.doc),
                                "--state-dir", str(self.state)], cwd=self.checkout, env=self.env,
-                              capture_output=True, text=True, check=False, timeout=25)
+                              capture_output=True, text=True, check=False, timeout=300)
 
     def run_eta_request(self, phase: str = "Phase 2 of 3: panel labels stay clear") -> subprocess.CompletedProcess[str]:
         return subprocess.run([sys.executable, str(WAITING), "eta-request", ALPHA,
                                "--phase", phase, "--production", str(self.doc),
                                "--state-dir", str(self.state)], cwd=self.checkout, env=self.env,
-                              capture_output=True, text=True, check=False, timeout=25)
+                              capture_output=True, text=True, check=False, timeout=300)
 
     def rename_unit(self, name: str) -> None:
         for path in (self.doc, self.status, self.judgment):
@@ -429,7 +453,7 @@ class DailiesInputTests(unittest.TestCase):
     def test_each_length_produces_input_the_renderer_accepts(self) -> None:
         for length in ("gantt", "simple", "page", "elaborate"):
             with self.subTest(length=length):
-                result = self.run_builder("--length", length)
+                result = self.run_builder("--length", length, subprocess_cli=length == "gantt")
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
                 report = self.report()
                 self.assertEqual(report["length"], length)
@@ -467,8 +491,8 @@ class DailiesInputTests(unittest.TestCase):
             "first": "2026-10-06T17:30", "why": "checks and build remain",
             "fixes": 0, "stated": "2026-10-06T16:45",
         })
+        # Pruning is the snapshot timer's (prune_phase_notes.py): a dailies only reads.
         self.assertEqual(self.phase_table_calls(), [
-            ["prune", "--production-doc", str(self.doc)],
             ["show", "--production-doc", str(self.doc), "--json"],
         ])
 
@@ -889,6 +913,22 @@ class DailiesInputTests(unittest.TestCase):
                 self.assertIn(f"flags first: {ALPHA}: {marker}", built.stdout)
                 self.assertEqual(cast(dict[str, object], self.unit()["eta"])["time"], "17:40")
 
+    def test_phases_that_could_start_are_printed_for_the_showrunner(self) -> None:
+        self.open_phase_record()
+        payload = cast(dict[str, dict[str, object]], json.loads(self.phase_table_json.read_text()))
+        payload[ALPHA]["parallel"] = {"could_start": ["3", "4"], "line": "Parallel: Phase 3, Phase 4 could start"}
+        _ = self.phase_table_json.write_text(json.dumps(payload), encoding="utf-8")
+        built = self.run_builder()
+        self.assertEqual(built.returncode, 0, built.stdout + built.stderr)
+        self.assertIn(f"parallel check: {ALPHA}: Phase 3 could start\n"
+                      + f"parallel check: {ALPHA}: Phase 4 could start", built.stdout)
+
+        payload[ALPHA]["parallel"] = {"could_start": [], "line": "Parallel: none — no phase is waiting"}
+        _ = self.phase_table_json.write_text(json.dumps(payload), encoding="utf-8")
+        quiet = self.run_builder()
+        self.assertEqual(quiet.returncode, 0, quiet.stdout + quiet.stderr)
+        self.assertNotIn("parallel check:", quiet.stdout)
+
     def test_phase_table_failures_continue_from_the_status_capture(self) -> None:
         self.env["DAILIES_PHASE_TABLE_FAIL"] = "show"
         built = self.run_builder()
@@ -902,14 +942,13 @@ class DailiesInputTests(unittest.TestCase):
             self.judgment.read_text(encoding="utf-8")))
         del judgment["units"][0]["started"]
         _ = self.judgment.write_text(json.dumps(judgment) + "\n", encoding="utf-8")
-        self.env["DAILIES_PHASE_TABLE_FAIL"] = "prune"
-        pruned = self.run_builder()
-        self.assertEqual(pruned.returncode, 0, pruned.stdout + pruned.stderr)
-        self.assertIn("phase tables: unavailable — prune could not read records", pruned.stdout)
+        _ = self.env.pop("DAILIES_PHASE_TABLE_FAIL")
+        recorded = self.run_builder()
+        self.assertEqual(recorded.returncode, 0, recorded.stdout + recorded.stderr)
+        self.assertNotIn("phase tables: unavailable", recorded.stdout)
         self.assertEqual(self.unit()["started"], "2026-10-06T08:30")
         self.assertEqual(cast(dict[str, object], self.unit()["eta"])["time"], "17:40")
 
-        _ = self.env.pop("DAILIES_PHASE_TABLE_FAIL")
         self.status_lines(f"== {ALPHA}", "● Checking panel labels", "ETA 23:40")
         self.judgment_file()
         _ = self.phase_table_json.write_text("not json\n", encoding="utf-8")
@@ -918,7 +957,7 @@ class DailiesInputTests(unittest.TestCase):
         self.assertIn("phase tables: unavailable —", unparsable.stdout)
         self.assertEqual(cast(dict[str, object], self.unit()["eta"])["time"], "23:40")
 
-    def test_retiring_the_last_unit_runs_prune_before_no_live_units(self) -> None:
+    def test_a_dailies_leaves_a_retired_units_note_for_the_timer_to_prune(self) -> None:
         note = self.root / "vault/old-showrunner/alpha-unit.md"
         note.parent.mkdir(parents=True)
         _ = note.write_text(
@@ -930,8 +969,7 @@ class DailiesInputTests(unittest.TestCase):
                                 encoding="utf-8")
         _ = self.env.pop("DAILIES_PHASE_TABLE")
         _ = self.assert_refused_without_output(mention="no live units: every Units row is retired")
-        self.assertFalse(note.exists())
-        self.assertFalse(note.parent.exists())
+        self.assertTrue(note.exists())
 
     def test_record_backed_input_renders_at_every_length_without_screen_eta(self) -> None:
         self.open_phase_record()
@@ -1016,7 +1054,7 @@ class DailiesInputTests(unittest.TestCase):
 
     def test_render_state_is_required_before_notifier_or_output(self) -> None:
         _ = self.output.write_text("sentinel\n", encoding="utf-8")
-        result = self.run_builder(include_render_state=False)
+        result = self.run_builder(include_render_state=False, subprocess_cli=True)
         self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
         self.assertIn("usage:", result.stderr)
         self.assertIn("--render-state", result.stderr)
@@ -1137,13 +1175,36 @@ class DailiesInputTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         units = cast(list[dict[str, object]], self.report()["units"])
         self.assertFalse(units[0].get("build_hold", False))
+        self.assertTrue(units[0]["holds_builds"])
         self.assertTrue(units[1]["build_hold"])
+        self.assertNotIn("holds_builds", units[1])
 
-    def test_holder_with_no_other_unit_is_refused(self) -> None:
+    def test_a_holder_with_no_other_unit_renders_with_no_marker(self) -> None:
         _ = (self.holders / ALPHA).write_text(json.dumps({"holder": ALPHA,
             "since": "2026-10-06T09:55:00-07:00", "for": "the panel timing check",
             "release_eta": "unknown"}) + "\n", encoding="utf-8")
-        _ = self.assert_refused_without_output(mention="build_hold")
+        result = self.run_builder()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        units = cast(list[dict[str, object]], self.report()["units"])
+        self.assertNotIn("build_hold", units[0])
+        self.assertTrue(units[0]["holds_builds"])
+
+    def test_a_supplied_holder_mark_is_refused(self) -> None:
+        self.judgment_file(alpha={"holds_builds": True})
+        _ = self.assert_refused_without_output(mention="holds_builds: supplied by holder files")
+
+    def test_a_hold_with_every_unit_left_out_still_renders(self) -> None:
+        # Seen 2026-10-12: the only unit's run had finished while another session held the builds.
+        self.finished_run(self.root / "alpha")
+        _ = self.judgment.write_text(json.dumps({"units": [], "topics": []}) + "\n", encoding="utf-8")
+        _ = (self.holders / "elsewhere").write_text(json.dumps({"holder": "elsewhere",
+            "since": "2026-10-06T09:55:00-07:00", "for": "a frame timing check",
+            "release_eta": "unknown"}) + "\n", encoding="utf-8")
+        result = self.run_builder()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(self.report()["units"], [])
+        self.assertIn(f"left out, run finished and nothing waiting on the user: {ALPHA}", result.stdout)
+        self.assertIn("build hold: ok — 1 active holders checked", result.stdout)
 
     def test_build_hold_marker_without_holder_file_is_refused(self) -> None:
         self.judgment_file(alpha={"build_hold": True})
@@ -1278,7 +1339,135 @@ class DailiesInputTests(unittest.TestCase):
         topics = cast(list[dict[str, object]], self.report()["topics"])
         self.assertFalse(any(item["title"] == "Review watch" for item in topics))
 
-    def test_dailies_first_review_alert_marks_topic_and_merge_watch_repeats(self) -> None:
+    def test_bevy_upgrade_topic_uses_record_line_and_waiting_answer_flag(self) -> None:
+        for needs_user in (True, False):
+            with self.subTest(needs_user=needs_user):
+                waiting = " (1 waiting for your answer)" if needs_user else ""
+                update = f"Bevy 0.20 upgrade: 1 of 2 done, 1 git ready{waiting}; checked 10:00 PDT"
+                self.env["DAILIES_BEVY_OUTPUT"] = json.dumps({"update": update, "needs_user": needs_user})
+                result = self.run_builder()
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                topics = cast(list[dict[str, object]], self.report()["topics"])
+                self.assertEqual([item for item in topics if item["title"] == "Bevy upgrade"], [
+                    {"title": "Bevy upgrade", "update": update, "eta": "no ETA stated yet", "needs_user": needs_user}])
+                self.assertIn(f"bevy upgrade: ok — {update}\n", result.stdout)
+                self.assertLess(result.stdout.index("review watch: ok"), result.stdout.index("bevy upgrade: ok"))
+                self.assertLess(result.stdout.index("bevy upgrade: ok"), result.stdout.index("merge branch: ok"))
+                args = cast(list[str], json.loads((self.root / "bevy-events.json").read_text()))
+                self.assertEqual(args, ["--production", str(self.doc), "line", "--json"])
+
+    def test_bevy_upgrade_empty_output_adds_no_topic(self) -> None:
+        result = self.run_builder()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("bevy upgrade: ok — no open watch\n", result.stdout)
+        topics = cast(list[dict[str, object]], self.report()["topics"])
+        self.assertFalse(any(item["title"] == "Bevy upgrade" for item in topics))
+
+    def test_bevy_upgrade_long_sentence_is_bounded_and_report_is_written(self) -> None:
+        limit = min(limit for limit in LENGTHS.values() if limit is not None)
+        sentence = "Bevy 0.20 upgrade: " + "waiting " * limit
+        self.env["DAILIES_BEVY_OUTPUT"] = json.dumps({"update": sentence, "needs_user": True})
+        result = self.run_builder()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        topics = cast(list[dict[str, object]], self.report()["topics"])
+        topic = next(item for item in topics if item["title"] == "Bevy upgrade")
+        update = cast(str, topic["update"])
+        self.assertLessEqual(len(update), limit)
+        self.assertEqual(update, sentence[:limit - 1] + "…")
+        self.assertIs(topic["needs_user"], True)
+        self.assertIn(f"bevy upgrade: ok — {update}\n", result.stdout)
+        self.assertIn("input: ok", result.stdout)
+
+    def test_bevy_upgrade_long_failure_reason_is_bounded_and_report_is_written(self) -> None:
+        limit = min(limit for limit in LENGTHS.values() if limit is not None)
+        reason = "record unreadable " * limit
+        self.env.update({"DAILIES_BEVY_EXIT": "2", "DAILIES_BEVY_STDERR": reason + "\nmore detail"})
+        result = self.run_builder()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        topics = cast(list[dict[str, object]], self.report()["topics"])
+        topic = next(item for item in topics if item["title"] == "Bevy upgrade")
+        update = cast(str, topic["update"])
+        self.assertLessEqual(len(update), limit)
+        self.assertEqual(update, ("the record could not be read: " + reason)[:limit - 1] + "…")
+        self.assertIs(topic["needs_user"], False)
+        self.assertIn(f"bevy upgrade: unavailable — {update}\n", result.stdout)
+        self.assertIn("input: ok", result.stdout)
+
+    def test_bevy_upgrade_sentence_at_renderer_limit_is_unchanged(self) -> None:
+        limit = min(limit for limit in LENGTHS.values() if limit is not None)
+        sentence = "Bevy 0.20 upgrade: ".ljust(limit, "x")
+        self.env["DAILIES_BEVY_OUTPUT"] = json.dumps({"update": sentence, "needs_user": False})
+        result = self.run_builder()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        topics = cast(list[dict[str, object]], self.report()["topics"])
+        topic = next(item for item in topics if item["title"] == "Bevy upgrade")
+        self.assertEqual(topic["update"], sentence)
+        self.assertIn(f"bevy upgrade: ok — {sentence}\n", result.stdout)
+        self.assertIn("input: ok", result.stdout)
+
+    def assert_bevy_unavailable(self, result: subprocess.CompletedProcess[str], reason: str) -> None:
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        update = f"the record could not be read: {reason}"
+        self.assertIn(f"bevy upgrade: unavailable — {update}\n", result.stdout)
+        self.assertNotIn("bevy upgrade: failed", result.stdout)
+        self.assertIn("input: ok", result.stdout)
+        topics = cast(list[dict[str, object]], self.report()["topics"])
+        self.assertEqual([item for item in topics if item["title"] == "Bevy upgrade"], [
+            {"title": "Bevy upgrade", "update": update, "eta": "no ETA stated yet", "needs_user": False}])
+
+    def test_bevy_upgrade_nonzero_exit_keeps_report_with_first_stderr_line(self) -> None:
+        self.env.update({"DAILIES_BEVY_EXIT": "2", "DAILIES_BEVY_STDERR": "record is unreadable\nmore detail"})
+        self.assert_bevy_unavailable(self.run_builder(), "record is unreadable")
+        self.env["DAILIES_BEVY_STDERR"] = ""
+        self.assert_bevy_unavailable(self.run_builder(), "command exited 2")
+
+    def test_bevy_upgrade_wrong_json_shape_keeps_report_with_unavailable_topic(self) -> None:
+        cases: tuple[object, ...] = ([], None, {}, {"update": 1, "needs_user": False},
+                                   {"update": "Bevy upgrade", "needs_user": "false"},
+                                   {"update": "", "needs_user": False},
+                                   {"update": "Bevy upgrade\nextra line", "needs_user": False})
+        for value in cases:
+            with self.subTest(value=value):
+                self.env["DAILIES_BEVY_OUTPUT"] = json.dumps(value)
+                self.assert_bevy_unavailable(self.run_builder(),
+                                             "expected an object with update text and needs_user boolean")
+
+    def test_bevy_upgrade_invalid_json_prefers_first_stderr_line(self) -> None:
+        self.env.update({"DAILIES_BEVY_OUTPUT": "not JSON", "DAILIES_BEVY_STDERR": "bad record\nmore detail"})
+        self.assert_bevy_unavailable(self.run_builder(), "bad record")
+
+    def test_bevy_upgrade_invalid_json_without_stderr_keeps_report_with_parse_reason(self) -> None:
+        self.env["DAILIES_BEVY_OUTPUT"] = "not JSON"
+        self.assert_bevy_unavailable(self.run_builder(), "Expecting value: line 1 column 1 (char 0)")
+
+    def test_bevy_upgrade_missing_script_keeps_report_with_unavailable_topic(self) -> None:
+        script = Path(self.env["DAILIES_BEVY_UPGRADE"])
+        script.unlink()
+        result = self.run_builder()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        topics = cast(list[dict[str, object]], self.report()["topics"])
+        topic = next(item for item in topics if item["title"] == "Bevy upgrade")
+        self.assertIn("can't open file", str(topic["update"]))
+        self.assertFalse(topic["needs_user"])
+        self.assertIn("bevy upgrade: unavailable", result.stdout)
+        self.assertIn("input: ok", result.stdout)
+
+    def test_bevy_upgrade_timeout_returns_unavailable_without_waiting(self) -> None:
+        cases: tuple[tuple[str | bytes | None, str], ...] = (
+            (None, "timed out after 30 seconds"),
+            ("record locked\nmore detail", "record locked"),
+            (b"record locked\nmore detail", "record locked"),
+        )
+        production = read_production(self.doc)
+        command = [sys.executable, self.env["DAILIES_BEVY_UPGRADE"], "--production", str(self.doc), "line", "--json"]
+        for stderr, reason in cases:
+            with self.subTest(stderr=stderr), mock.patch.dict(os.environ, self.env), mock.patch(
+                "dailies_input.subprocess.run", side_effect=subprocess.TimeoutExpired(command, 30, stderr=stderr),
+            ) as run:
+                self.assertEqual(bevy_upgrade_watch(production), BevyUpgradeUnavailable(reason))
+                run.assert_called_once_with(command, capture_output=True, text=True, timeout=30, check=False)
+
+    def test_dailies_first_review_alert_logs_once_without_a_phone_push(self) -> None:
         events = self.watch_stubs()
         result = self.run_builder()
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
@@ -1292,14 +1481,11 @@ class DailiesInputTests(unittest.TestCase):
         self.assertNotIn("| phases merged |", later.stdout)
         calls = self.watch_events(events)
         self.assertEqual(sum(row[0] == "review_regime.py" and row[1] == "report" for row in calls), 1)
-        self.assertEqual([row for row in calls if row[0] == "send.py"], [[
-            "send.py", "--to", "user", "--need", "decision", "--action",
-            "Acknowledge the review watch in this session.", "--summary", "Hana: review watch", "--text",
-            "12 of 12 phases: report ready, waiting for your acknowledgment; the table is in this session",
-        ]])
+        self.assertEqual([row for row in calls if row[0] == "send.py"], [])
+        self.assertIn("| phases merged | 12 |", (self.checkout / "production.log").read_text())
         self.assertEqual((self.checkout / "production.log").read_text().count("review watch"), 1)
 
-    def test_merge_first_review_alert_is_not_repeated_by_dailies(self) -> None:
+    def test_merge_first_review_alert_logs_once_without_a_dailies_phone_push(self) -> None:
         events = self.watch_stubs()
         first = self.run_merge_watch()
         self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
@@ -1311,11 +1497,8 @@ class DailiesInputTests(unittest.TestCase):
         self.assertTrue(watch["needs_user"])
         calls = self.watch_events(events)
         self.assertEqual(sum(row[0] == "review_regime.py" and row[1] == "report" for row in calls), 1)
-        self.assertEqual([row for row in calls if row[0] == "send.py"], [[
-            "send.py", "--to", "user", "--need", "decision", "--action",
-            "Acknowledge the review watch in this session.", "--summary", "Hana: review watch", "--text",
-            "12 of 12 phases: report ready, waiting for your acknowledgment; the table is in this session",
-        ]])
+        self.assertEqual([row for row in calls if row[0] == "send.py"], [])
+        self.assertIn("| phases merged | 12 |", (self.checkout / "production.log").read_text())
         self.assertEqual((self.checkout / "production.log").read_text().count("review watch"), 1)
 
     def test_judgment_held_and_testing_keep_merge_topic_even_when_pushed(self) -> None:

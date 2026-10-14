@@ -5,7 +5,10 @@ from __future__ import annotations
 
 import argparse
 from collections.abc import Callable
+from contextlib import ExitStack
+from contextvars import ContextVar
 from datetime import datetime, timezone
+import importlib
 import json
 import os
 from pathlib import Path
@@ -13,7 +16,9 @@ import signal
 import sys
 import time
 from types import FrameType
-from typing import TypedDict, cast
+from typing import Protocol, TypedDict, cast, final
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 
 from targets import (
@@ -38,7 +43,9 @@ from targets import (
 )
 import offload
 import build_hold
+import mac_test
 import override_guard
+from user_zone import user_zone
 
 
 
@@ -69,7 +76,7 @@ class CliArguments(argparse.Namespace):
 
 
 def local_time(instant: datetime) -> str:
-    return instant.astimezone().strftime("%H:%M %Z")
+    return instant.astimezone(user_zone()).strftime("%H:%M %Z")
 
 
 def display_field(value: str) -> str:
@@ -115,7 +122,16 @@ def command_status(probe: bool = False) -> int:
             if probe and isinstance(target, SshTarget)
             else target_state(target)
         )
-        print(format_state(target.name, state))
+        line = format_state(target.name, state)
+        if isinstance(target, SshTarget) and isinstance(state, Running):
+            try:
+                paths = mac_test.state_paths()
+                run = mac_test.read_run(paths.run)
+                if isinstance(run, dict) and datetime.fromisoformat(run["since"]) == state.since:
+                    line += mac_test.claim_idle_clause(run)
+            except (OSError, mac_test.StateReadError) as error:
+                line = format_state(target.name, StateUnreadable(str(error)))
+        print(line)
     return 0
 
 
@@ -142,8 +158,35 @@ def wait_clock() -> datetime:
     return build_hold.aware_instant(supplied) if supplied else datetime.now(timezone.utc)
 
 
+@final
+class NoActiveLocalAdmissionWait:
+    """No wait owns a release-wait mechanism in this execution context."""
+
+    def wait(self, _seconds: float) -> None:
+        raise RuntimeError("local admission waiting requires an active wait")
+
+
+class LocalAdmissionWait(Protocol):
+    """An admission wait owns and closes its notification or polling mechanism."""
+
+    def arm(self) -> None: ...
+    def wait(self, seconds: float) -> None: ...
+    def __enter__(self) -> "LocalAdmissionWait": ...
+    def __exit__(self, *_arguments: object) -> None: ...
+
+
+# This CLI's import root excludes delegate; keep the runtime import at a typed
+# provider boundary rather than expanding the shared checker configuration.
+release_waiter = cast(Callable[[Path, Path], LocalAdmissionWait], getattr(
+    importlib.import_module("scripts.delegate.local_release_wait"), "local_release_waiter"))
+
+LOCAL_ADMISSION_WAIT: ContextVar[LocalAdmissionWait | NoActiveLocalAdmissionWait] = ContextVar(
+    "local_admission_wait", default=NoActiveLocalAdmissionWait())
+
+
 def wait_sleep(seconds: float) -> None:
-    time.sleep(seconds)
+    # Keep the existing wait boundary; its owner selects notifications or polling.
+    LOCAL_ADMISSION_WAIT.get().wait(seconds)
 
 
 def local_target() -> LocalTarget:
@@ -218,6 +261,7 @@ def command_wait_local(call_id: str, *, pid: int = 0) -> int:
     cancelled = False
     waiter_file = os.environ.get("BUILDLOG_HOLD_WAITER_FILE", "")
     previous_handlers: dict[int, Callable[[int, FrameType | None], object] | int | None] = {}
+    notifications = ExitStack()
 
     def interrupted(signum: int, _frame: object) -> None:
         nonlocal cancelled
@@ -234,9 +278,14 @@ def command_wait_local(call_id: str, *, pid: int = 0) -> int:
             _ = temporary.write_text(json.dumps(waiter))
             os.replace(temporary, waiter_file)
         target = local_target()
+        release_events = notifications.enter_context(release_waiter(
+            build_hold.holder_directory(), build_hold.release_directory()))
+        context = LOCAL_ADMISSION_WAIT.set(release_events)
+        _ = notifications.callback(LOCAL_ADMISSION_WAIT.reset, context)
         interval = max(0.001, float(os.environ.get("BUILD_TARGETS_POLL_S", "15")))
         escalation = float(os.environ.get("BUILD_TARGETS_ESCALATE_S", "7200"))
         while True:
+            release_events.arm()
             state = target_state(target)
             if isinstance(state, StateUnreadable):
                 print(wait_diagnostic(state.reason), file=sys.stderr, flush=True)
@@ -262,10 +311,10 @@ def command_wait_local(call_id: str, *, pid: int = 0) -> int:
                         registered = identity
                     continue
             if not announced:
+                announced = True
                 print(f"verify.sh: natedev is held by {display_field(state.holder)} for "
                       + f"{display_field(state.reason)}; waiting (tests that can run on the Mac keep running there).",
                       file=sys.stderr, flush=True)
-                announced = True
             if not escalated and (wait_clock() - state.since).total_seconds() >= escalation:
                 print(f"verify.sh: natedev has been held for 2 h by {display_field(state.holder)}; ask them.",
                       file=sys.stderr, flush=True)
@@ -275,9 +324,10 @@ def command_wait_local(call_id: str, *, pid: int = 0) -> int:
         print(wait_diagnostic(str(error)), file=sys.stderr, flush=True)
         return 12
     finally:
-        if cancelled and registered[0]:
+        notifications.close()
+        if cancelled and key:
             try:
-                build_hold.remove_call(key, call_id, cycle_id=registered[0])
+                build_hold.remove_call(key, call_id)
             except (OSError, build_hold.ReleaseRecordReadError):
                 pass
         for signum, handler in previous_handlers.items():
@@ -339,6 +389,15 @@ def command_check_admission(call_id: str) -> int:
         return 12
 
 
+def holds_only_own(owner: build_hold.OwningSession, directory: Path) -> bool:
+    try:
+        holds = build_hold.natedev_holds(directory)
+        key = build_hold.holder_path(directory, owner.session_id).name
+    except ValueError:
+        return False
+    return bool(holds.in_force) and all(holder.key == key for holder in holds.in_force)
+
+
 def command_check_local() -> int:
     try:
         state = target_state(local_target())
@@ -348,6 +407,8 @@ def command_check_local() -> int:
         if not isinstance(state, Held):
             return 0
         owner = build_hold.owning_session()
+        if isinstance(owner, build_hold.OwningSession) and holds_only_own(owner, build_hold.holder_directory()):
+            return 0
         key = owner.session_id if isinstance(owner, build_hold.OwningSession) else ""
         admission = build_hold.read_admission(key)
         if isinstance(admission, build_hold.AdmissionReadError):

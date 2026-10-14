@@ -18,10 +18,20 @@ import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from datetime import datetime
 from pathlib import Path
-from typing import cast
+from typing import TYPE_CHECKING, cast
 from unittest import mock
+from zoneinfo import ZoneInfo
 
 import sweep
+if TYPE_CHECKING:
+    from ..notify import review
+    from ..notify.push_texts import catalog, render, render_entry
+    from ..notify.user_action import ActionRequired
+else:
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "notify"))
+    import review
+    from push_texts import catalog, render, render_entry
+    from user_action import ActionRequired
 
 GIB = 1 << 30
 SIZE = 64 * 1024
@@ -55,6 +65,14 @@ def unit(tree: Path, directory: str, name: str, digest: str, used: float, size: 
     os.utime(record, (used, used))
     os.utime(fingerprint, (used, used))
     return write(tree / directory / f"{name}-{digest}", size)
+
+
+PACIFIC = ZoneInfo("America/Los_Angeles")
+
+
+def setUpModule() -> None:
+    """The times these tests expect are Pacific; the user's zone setting must not change them."""
+    unittest.enterModuleContext(mock.patch.dict(os.environ, {"USER_ZONE": "America/Los_Angeles"}))
 
 
 class Target:
@@ -308,7 +326,8 @@ class FloorTests(SweepCase):
             sweep, "send_floor_alert", side_effect=AssertionError("unexpected floor alert send")))
         return base
 
-    def test_base_blocks_unexpected_alert_send(self) -> None:
+    def test_base_blocks_real_phone_sends(self) -> None:
+        """Guard the fixture patch that prevents real phone sends."""
         _ = self.base()
         self.assertIsInstance(sweep.send_floor_alert, mock.Mock)
         with self.assertRaisesRegex(AssertionError, "unexpected floor alert send"):
@@ -435,9 +454,9 @@ class FloorTests(SweepCase):
         self.assertEqual(send.call_count, 1)
         self.assertEqual(send.call_args.args[1], sweep.FloorAlertChannels.NATEDEV_AND_PHONE)
         message = cast(str, send.call_args.args[0])
-        self.assertIn("has no build cache left that it may remove", message)
-        self.assertIn("free space is 9.0 GiB, under the 10.0 GiB floor", message)
-        self.assertIn("free 1.0 GiB outside build caches", message)
+        self.assertIn("No build cache is left to remove", message)
+        self.assertIn("natedev still has only 9.0 GiB free. Builds need 10.0 GiB free", message)
+        self.assertIn("Free 1.0 GiB outside build caches", message)
         self.assertIn(f"Not swept: 1 target dirs a build holds ({sweep.gib(held_bytes)})", message)
         self.assertIn(f"CI's targets ({sweep.gib(ci_bytes)})", message)
         self.assertNotIn("Could not remove", message)
@@ -505,7 +524,7 @@ class FloorTests(SweepCase):
         start = time.time()
         clock = [start]
 
-        def deliver(_message: str, _channels: sweep.FloorAlertChannels) -> bool:
+        def deliver(_message: str, _channels: sweep.FloorAlertChannels, **_phone: object) -> bool:
             clock[0] = start + 80
             return True
 
@@ -591,20 +610,18 @@ raise SystemExit(int(os.environ[variable]))
         )
         output = io.StringIO()
         errors = io.StringIO()
-        expected_commands = [
-            [sys.executable, str(sender), "--to", "natedev", "--from", "disk_floor", "--timeout", "30"],
-            [sys.executable, str(sender), "--to", "user", "--need", "note", "--action",
-             "Free disk space outside build caches on natedev.", "--summary",
-             "natedev: disk under its floor", "--text", "disk notice"],
-        ]
         real_run = subprocess.run
         with (mock.patch.object(sweep, "__file__", str(fake_module)),
               mock.patch.object(subprocess, "run", wraps=real_run) as run,
               mock.patch.dict(os.environ, {"SWEEP_NATEDEV_EXIT": "1", "SWEEP_USER_EXIT": "0"}),
               redirect_stdout(output), redirect_stderr(errors)):
-            self.assertTrue(sweep.send_floor_alert("disk notice", sweep.FloorAlertChannels.NATEDEV_AND_PHONE))
+            self.assertTrue(sweep.send_floor_alert("disk notice", sweep.FloorAlertChannels.NATEDEV_AND_PHONE,
+                                                   phone=sweep.disk_floor_push(2 * GIB, 9 * GIB, 10 * GIB)))
         self.assertEqual(run.call_count, 2)
-        self.assertEqual([call.args[0] for call in run.call_args_list], expected_commands)
+        commands = [cast(list[str], call.args[0]) for call in run.call_args_list]
+        self.assertEqual([command[command.index("--to") + 1] for command in commands], ["natedev", "user"])
+        self.assertEqual(commands[1][commands[1].index("--text-id") + 1], "sweep.disk_floor")
+        self.assertIn("shortfall=1.0 GiB", commands[1])
         self.assertEqual(run.call_args_list[0].kwargs["input"], "disk notice")
         self.assertIsNone(cast(object, run.call_args_list[1].kwargs["input"]))
         self.assertIn("message alert queued", output.getvalue())
@@ -613,11 +630,62 @@ raise SystemExit(int(os.environ[variable]))
         with (mock.patch.object(sweep, "__file__", str(fake_module)),
               mock.patch.dict(os.environ, {"SWEEP_NATEDEV_EXIT": "0", "SWEEP_USER_EXIT": "3"}),
               redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO())):
-            self.assertTrue(sweep.send_floor_alert("disk notice", sweep.FloorAlertChannels.NATEDEV_AND_PHONE))
+            self.assertTrue(sweep.send_floor_alert("disk notice", sweep.FloorAlertChannels.NATEDEV_AND_PHONE,
+                                                   phone=sweep.disk_floor_push(2 * GIB, 9 * GIB, 10 * GIB)))
         with (mock.patch.object(sweep, "__file__", str(fake_module)),
               mock.patch.dict(os.environ, {"SWEEP_NATEDEV_EXIT": "3", "SWEEP_USER_EXIT": "3"}),
               redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO())):
-            self.assertFalse(sweep.send_floor_alert("disk notice", sweep.FloorAlertChannels.NATEDEV_AND_PHONE))
+            self.assertFalse(sweep.send_floor_alert("disk notice", sweep.FloorAlertChannels.NATEDEV_AND_PHONE,
+                                                   phone=sweep.disk_floor_push(2 * GIB, 9 * GIB, 10 * GIB)))
+
+    def test_phone_alert_wait_covers_configured_review_while_session_wait_stays_short(self) -> None:
+        config = Path(self.enterContext(tempfile.TemporaryDirectory())) / "notify.conf"
+        _ = config.write_text("REVIEW_TIMEOUT_SECONDS=90\n")
+        with (mock.patch.object(review, "NOTIFY_CONFIG", config),
+              mock.patch.object(subprocess, "run", return_value=subprocess.CompletedProcess([], 0, "", "")) as run,
+              redirect_stdout(io.StringIO())):
+            self.assertTrue(sweep.send_floor_alert("disk notice", sweep.FloorAlertChannels.NATEDEV_AND_PHONE,
+                                                   phone=sweep.disk_floor_push(2 * GIB, 9 * GIB, 10 * GIB)))
+        self.assertEqual([call.kwargs["timeout"] for call in run.call_args_list], [40, 220])
+        self.assertEqual(run.call_count, 2)
+
+    def test_phone_disk_alert_keeps_action_and_build_shortfall_without_directory_dump(self) -> None:
+        """F011: the disk action states how much to free and the body explains why."""
+        text = sweep.floor_out_of_reach_text(2000, 2 * GIB, 9 * GIB, 10 * GIB,
+            0, 0, 0, sweep.UnavailableDiskMeasurement("missing"), 0)
+        with (mock.patch.object(subprocess, "run", return_value=subprocess.CompletedProcess([], 0, "", "")) as run,
+              redirect_stdout(io.StringIO())):
+            self.assertTrue(sweep.send_floor_alert(text, sweep.FloorAlertChannels.NATEDEV_AND_PHONE,
+                                                   phone=sweep.disk_floor_push(2 * GIB, 9 * GIB, 10 * GIB)))
+        self.assertEqual(run.call_args_list[0].kwargs["input"], text)
+        command = cast(list[str], run.call_args_list[1].args[0])
+        self.assertEqual(command[command.index("--text-id") + 1], "sweep.disk_floor")
+        self.assertIn("shortfall=1.0 GiB", command)
+        self.assertIn("floor=10.0 GiB", command)
+        self.assertNotIn("measurement unavailable", " ".join(command))
+
+    def test_typical_disk_cleanup_example_uses_the_live_build_floor(self) -> None:
+        entry = next(entry for entry in catalog() if entry.id == "sweep.disk_floor")
+        typical = next(example for example in entry.examples if example.name == "typical")
+        push = render_entry(entry, typical.values)
+        actual = sweep.disk_floor_push(2 * GIB, 290 * GIB, 300 * GIB)
+        self.assertEqual(push, actual)
+        self.assertEqual(typical.values, {"shortfall": "10.0 GiB", "free": "290.0 GiB",
+                                        "floor": "300.0 GiB", "removed": "2.0 GiB"})
+
+    def test_nixos_disk_action_states_the_space_needed_to_restore_the_build_floor(self) -> None:
+        for free in (149, 0, 290):
+            with self.subTest(free=free):
+                shortfall = str(300 - free)
+                push = render("nixos.disk_low", free=str(free), shortfall=shortfall)
+                assert isinstance(push.action, ActionRequired)
+                self.assertIn(f"delete {shortfall} GiB", push.action.text)
+        entry = next(entry for entry in catalog() if entry.id == "nixos.disk_low")
+        for example in entry.examples:
+            push = render_entry(entry, example.values)
+            assert isinstance(push.action, ActionRequired)
+            self.assertEqual(int(example.values["shortfall"]), 300 - int(example.values["free"]))
+            self.assertIn(example.values["shortfall"] + " GiB", push.action.text)
 
     def test_failed_phone_send_reports_the_cause_printed_on_stdout(self) -> None:
         fake_module = Path(self.enterContext(tempfile.TemporaryDirectory())) / "scripts/lint/sweep.py"
@@ -635,7 +703,8 @@ if sys.argv[sys.argv.index("--to") + 1] == "user":
         errors = io.StringIO()
         with (mock.patch.object(sweep, "__file__", str(fake_module)),
               redirect_stdout(io.StringIO()), redirect_stderr(errors)):
-            self.assertTrue(sweep.send_floor_alert("disk notice", sweep.FloorAlertChannels.NATEDEV_AND_PHONE))
+            self.assertTrue(sweep.send_floor_alert("disk notice", sweep.FloorAlertChannels.NATEDEV_AND_PHONE,
+                                                   phone=sweep.disk_floor_push(2 * GIB, 9 * GIB, 10 * GIB)))
         self.assertIn("phone alert failed (3): FAILED: Pushover keys are missing", errors.getvalue())
 
     def test_natedev_only_channel_never_calls_phone(self) -> None:
@@ -786,8 +855,8 @@ if sys.argv[sys.argv.index("--to") + 1] == "user":
     def test_snapshot_growth_above_fall_covers_all_without_negative_remainder(self) -> None:
         now = time.time()
         measurement = sweep.AvailableDiskMeasurement(
-            datetime.fromtimestamp(now - 60, sweep.PACIFIC),
-            sweep.EarlierDiskMeasurement(datetime.fromtimestamp(now - 660, sweep.PACIFIC)),
+            datetime.fromtimestamp(now - 60, PACIFIC),
+            sweep.EarlierDiskMeasurement(datetime.fromtimestamp(now - 660, PACIFIC)),
             [], 30 * GIB,
         )
         previous = sweep.FloorRecord(now - 120, 30 * GIB, 0, sweep.NoDeliveredAlert(), sweep.NoDeliveredAlert())
@@ -801,10 +870,10 @@ if sys.argv[sys.argv.index("--to") + 1] == "user":
 
     def test_measurement_within_fall_places_remainder_after_its_time(self) -> None:
         now = time.time()
-        measured = datetime.fromtimestamp(now - 30, sweep.PACIFIC)
+        measured = datetime.fromtimestamp(now - 30, PACIFIC)
         measurement = sweep.AvailableDiskMeasurement(
             measured,
-            sweep.EarlierDiskMeasurement(datetime.fromtimestamp(now - 600, sweep.PACIFIC)),
+            sweep.EarlierDiskMeasurement(datetime.fromtimestamp(now - 600, PACIFIC)),
             [], 2 * GIB,
         )
         previous = sweep.FloorRecord(now - 120, 30 * GIB, 0, sweep.NoDeliveredAlert(),
@@ -816,8 +885,8 @@ if sys.argv[sys.argv.index("--to") + 1] == "user":
     def test_no_prior_floor_sweep_omits_explained_fall(self) -> None:
         now = time.time()
         measurement = sweep.AvailableDiskMeasurement(
-            datetime.fromtimestamp(now, sweep.PACIFIC),
-            sweep.EarlierDiskMeasurement(datetime.fromtimestamp(now - 600, sweep.PACIFIC)),
+            datetime.fromtimestamp(now, PACIFIC),
+            sweep.EarlierDiskMeasurement(datetime.fromtimestamp(now - 600, PACIFIC)),
             [], 30 * GIB,
         )
         message = sweep.floor_alert_text(now, 35 * GIB, sweep.NoFloorRecord(), 0, 0,
@@ -844,8 +913,8 @@ if sys.argv[sys.argv.index("--to") + 1] == "user":
             ) for index in range(3)
         ]
         measurement = sweep.AvailableDiskMeasurement(
-            datetime.fromtimestamp(now, sweep.PACIFIC),
-            sweep.EarlierDiskMeasurement(datetime.fromtimestamp(now - 600, sweep.PACIFIC)),
+            datetime.fromtimestamp(now, PACIFIC),
+            sweep.EarlierDiskMeasurement(datetime.fromtimestamp(now - 600, PACIFIC)),
             directories, 30 * GIB,
         )
         previous = sweep.FloorRecord(now - 60, 30 * GIB, 0, sweep.NoDeliveredAlert(), sweep.NoDeliveredAlert())

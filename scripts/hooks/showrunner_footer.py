@@ -15,6 +15,9 @@ from pathlib import Path
 from typing import TYPE_CHECKING, cast
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
+from user_zone import user_zone_name  # noqa: E402
+
 if TYPE_CHECKING:
     from showrunners import Place
 
@@ -26,7 +29,6 @@ REASON_HEAD = ("Showrunner footer missing or out of date. End this reply with th
                "then two empty lines, `Waiting on:`, an empty line, and one `* ` bullet per item. A question for the user "
                "is never restated there; while any is open, the first bullet is its count, as below:")
 STATUS = re.compile(r"Status: PRODUCTION — ([a-z]*)")
-ZONE_MARKER = "- **User zone:**"
 TIME_LINE = re.compile(r"^(\d{2}):(\d{2}) (\S+) update:$")
 RENDER_TIMEOUT_SECONDS = 10
 TIME = r"(?:[01]\d|2[0-3]):[0-5]\d(?:\+1)?"
@@ -44,6 +46,11 @@ QUOTA_LEAD = "quota: "
 # User, 2026-10-12: "your messages should just say 'there are {n} open questions for you' - that's it".
 ASK_ONCE = ("A question for the user is asked once, in full, when it first comes up. After that the Waiting on "
             + "block never restates it or its choices; list the questions in full only when the user asks what they are. ")
+
+
+# The switch file's content when a conversation pause turned the footer off. A switch turned off
+# on purpose is empty, so the pause's resume leaves it off.
+PAUSE_MARK = "paused by a conversation pause\n"
 
 
 class FooterState(Enum):
@@ -116,12 +123,36 @@ def footer_state(slug: str) -> FooterState:
 
 
 def set_footer_state(slug: str, state: FooterState) -> None:
+    """Switch the footer on purpose; `off` writes the switch empty, which clears any pause mark."""
     path = switch_path(slug)
     if state is FooterState.OFF:
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.touch(exist_ok=True)
+        _ = path.write_text("", encoding="utf-8")
     else:
         path.unlink(missing_ok=True)
+
+
+def pause_footer(slug: str) -> None:
+    """Turn the footer off for a conversation pause, with the mark `unpause_footer` looks for."""
+    path = switch_path(slug)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    _ = path.write_text(PAUSE_MARK, encoding="utf-8")
+
+
+def footer_paused(slug: str) -> bool:
+    """Whether the footer is off because a conversation pause turned it off, and only that."""
+    try:
+        return switch_path(slug).read_text(encoding="utf-8") == PAUSE_MARK
+    except FileNotFoundError:
+        return False
+
+
+def unpause_footer(slug: str) -> bool:
+    """Turn the footer back on if the pause's mark is still there; whether it came back."""
+    if not footer_paused(slug):
+        return False
+    switch_path(slug).unlink(missing_ok=True)
+    return True
 
 
 def targeted_instances(session_id: str) -> list[Path]:
@@ -152,14 +183,8 @@ def read_production(instance_dir: Path) -> Production | None:
         status = next((match.group(1) for line in lines if (match := STATUS.search(line))), None)
         if status != "running":
             return None
-        zone_line = next((line for line in lines if line.startswith(ZONE_MARKER)), None)
-        if zone_line is None:
-            return None
-        zone_words = zone_line[len(ZONE_MARKER):].strip().split()
-        if not zone_words:
-            return None
-        zone = zone_words[0].strip("`")
-        _ = ZoneInfo(zone)
+        # The user's zone setting; the doc's own User zone line is no longer read.
+        zone = user_zone_name()
         try:
             state = key_values(instance_dir / "state")
         except OSError:
