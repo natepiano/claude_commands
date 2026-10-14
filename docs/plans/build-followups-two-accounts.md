@@ -97,7 +97,7 @@ Each step lists what changes live, what the user does, and how to undo it. Steps
 5. **Move any one session (Phase 8), when the user says go.**
    - `/showrunner:accounts move <session> "claude N"` moves one showrunner, unit director or top-level session to any account. It stops safely, as `/shutdown` does it, and resumes the same conversation on the target in its own tmux pane or window.
    - Undo: move it back.
-6. **Accounts by room (Phases 14–23).** No role ties a kind of session to an account. A new session launches on the account with room that resets soonest (`accounts.py pick`). When an account refuses a session or the Codex seats, they move to the picked account by themselves and continue; a 5-hour refusal whose reset is under 20 minutes away waits instead. Phase 18 replaces the picker with two groups (showrunners, units), each on one account and moved together. Phase 19 makes every group move pause first. Phase 20 adds a per-Codex-account credits setting and one alert when the workers' account reaches 0%; Phase 21 names every account by its number, never "default"; Phase 23 proves the moves live with the user.
+6. **Accounts by room (Phases 14–24).** No role ties a kind of session to an account. A new session launches on the account with room that resets soonest (`accounts.py pick`). When an account refuses a session or the Codex seats, they move to the picked account by themselves and continue; a 5-hour refusal whose reset is under 20 minutes away waits instead. Phase 18 replaces the picker with two groups (showrunners, units), each on one account and moved together. Phase 19 makes every group move pause first. Phase 20 adds a per-Codex-account credits setting and one alert when the workers' account reaches 0%; Phase 21 renames the account notes by number and gives each note its roles, live session count and session table; Phase 22 names every account by its number, never "default"; Phase 24 proves the moves live with the user.
 7. **A week later (Phase 9).** A readout gives the moves, their causes, any time with no account having room, and points per account per day.
 
 ## Delegation Context
@@ -179,8 +179,8 @@ Each step lists what changes live, what the user does, and how to undo it. Steps
 | G0 | Phase 1 | the user | cleared 2026-10-10 for the code phases 1–5: "prepare everything but don't initiate" |
 | G1 | Phase 6 | the user | the user explicitly authorizes the first live proof. Phase 6 then creates `~/.claude3`, and the user completes its login (step 2) before any probe starts |
 | G2 | Phase 7 | the user | the user authorizes cutover at a chosen time and confirms the unit account. Phase 7 then sets up and logs in the remaining dirs, and every check passes before step 4 writes the role |
-| G3 | Phase 9 | the clock | 7 days after Phase 23's live proof |
-| G4 | Phase 23 | the user | the user is present for the live moves |
+| G3 | Phase 9 | the clock | 7 days after Phase 24's live proof |
+| G4 | Phase 24 | the user | the user is present for the live moves |
 
 ## Phases
 
@@ -454,7 +454,7 @@ Asked for by the user through the showrunner. Text above this section that names
 
 ### Phase 9 — Readout of the moves  · status: todo · gated by G3
 
-**Depends on:** Phase 23
+**Depends on:** Phase 24
 
 #### Work Order
 
@@ -759,7 +759,7 @@ After a seat launch's own turn has ended, a move to the selected seats home that
 
 **Ruled out:** a PATH launcher and an automatic herdr unit relaunch inside restart.py, superseded by herdr-trial's restart.
 
-### Phase 20 — Codex credits setting and the 0% alert  · status: todo
+### Phase 20 — Codex credits setting and the 0% alert  · status: done
 
 **Depends on:** Phase 19 (numbering only)
 
@@ -770,14 +770,14 @@ After a seat launch's own turn has ended, a move to the selected seats home that
 **Spec:**
 
 1. **The setting lives in the account's note.** Each Codex account is defined by its note `~/rust/hanadocs/agents/codex N.md` (`login:` names the account; `agent_accounts.codex_account(home)` maps a home's login to that note's stem). A new frontmatter field `use_credits: on` or `use_credits: off`; absent reads as `on` (today's behavior). Any other value reads as `on` and the alert pass prints one log line `codex N: use_credits must be on or off; reading it as on`. One reader, `agent_accounts.codex_credits_setting(label: str) -> CreditsOn | CreditsOff` (frozen dataclasses; `CodexCreditsSetting = CreditsOn | CreditsOff`), reads the note through `note_file.read_note`. `agent_notes.apply` rewrites only named keys (`set_fields` / `_rewrite`), so the updater keeps the field. The setting that counts at 0% is the one on the account the seats are on at that pass (`CodexAlertPassReadings.selected_account`).
-2. **The 0% episode.** In `quota_alert._alert_for_saved_readings`, the Codex branch opens a zero episode when `selected_codex_report(codex_readings, now)` has `weekly_remaining == 0` and `weekly_reset > now` for a `KnownCodexAccount`. State: a new `State`/`StoredState` key `codex_zero: dict[str, CodexZeroEpisode]` keyed by the note label, in the existing `~/.local/state/quota_alert.json` under `state_file()`'s flock. `CodexZeroEpisode` (TypedDict): `since`, `weekly_reset`, `credits: Literal["on", "off"]` (the setting read when it opened), `phone: "due" | <ISO sent>`, `sessions: <ISO stamped>`, `forecast_at: <ISO of the last hourly forecast, or since>`, `forecast_phone: NotRequired["due" | <ISO sent>]`. It closes, silently, when `weekly_reset <= now`, or a fresh reading of that account shows weekly above 0, or the seats are no longer on that account. When the zero episode opens, that account's Codex low-threshold episode (`episodes[...]`, fed by `_low_codex_notes`) closes silently and does not reopen while the zero episode is open, so at 0% no Codex alert repeats every `repeat_minutes`, none asks for `/quota_ack`, and no `Quota restored:` relay follows. The low-threshold alert above 0% and every Claude episode are unchanged.
+2. **The 0% episode.** In `quota_alert._alert_for_saved_readings`, the Codex branch opens a zero episode when `selected_codex_report(codex_readings, now)` has `weekly_remaining == 0` and `weekly_reset > now` for a `KnownCodexAccount`. State: a new `State`/`StoredState` key `codex_zero: dict[str, CodexZeroEpisode]` keyed by the note label, in the existing `~/.local/state/quota_alert.json` under `state_file()`'s flock. `CodexZeroEpisode` (TypedDict): `since`, `weekly_reset`, `credits: Literal["on", "off"]` (the setting read when it opened), reread on every alert pass (each 2-minute snapshot), so the move follows within minutes: an episode opened `on` whose account now reads `off` runs the credits-off path once (`pick` + `swap`, a `requested` entry with cause `credits off`), sends no later forecast and never repeats the opening alert, while `off` to `on` mid-episode changes nothing, `phone: "due" | <ISO sent>`, `sessions: <ISO stamped>`, `forecast_at: <ISO of the last hourly forecast, or since>`, `forecast_phone: NotRequired["due" | <ISO sent>]`. It closes, silently, when `weekly_reset <= now`, or a fresh reading of that account shows weekly above 0, or the seats are no longer on that account. When the zero episode opens, that account's Codex low-threshold episode (`episodes[...]`, fed by `_low_codex_notes`) closes silently and does not reopen while the zero episode is open, so at 0% no Codex alert repeats every `repeat_minutes`, none asks for `/quota_ack`, and no `Quota restored:` relay follows. The low-threshold alert above 0% and every Claude episode are unchanged.
 3. **Exactly one alert.** Opening the episode renders one catalog push (item 6) and sends: the phone through `tell_user(rendered)` (`push_texts.user_send_argv`), and the running showrunners through `deliver_and_record` with relay text `f"{rendered.title}\n{rendered.body}"`, recipients `recipients(config)` (config `always` plus each running showrunner). `sessions` is stamped under the lock before the relays start (a run the timer kills after the stamp sends no second copy). `phone` stays `"due"` until `tell_user` returns `PushSent`; each later 2-minute run retries only the phone while it is due, and never re-relays.
 4. **Credits on.** The workers stay. The alert names the account, its refill time, its credits and where workers go when the credits run out: `accounts.pick("codex", now, exclude=frozenset({seats label}), keep=accounts.NoKeep())` → `PickedAccount.label`, or, for `NoAccountWithRoom`, that Codex work moves to Claude until the earliest reset (`reset_display`). Example: `Codex account codex 1 has used its weekly usage; it refills Mon 2026-10-20 00:58 EDT. Workers keep working on its 6,370 credits. When codex 1's credits run out, workers move to codex 2.`
-5. **Credits off.** The workers move. `accounts.pick("codex", now, exclude=frozenset({seats label}), keep=accounts.NoKeep())` (its order is soonest weekly reset, then most weekly left, then label), then one `moves.RequestedMove` (`tool: codex`, `subject: seats`, `why: "<label> weekly usage used; credits off"`, `window: weekly`, `reset`) and `accounts.swap("seats", chosen.label)`, exactly as `quota_alert.blocked` does at ~1250–1268: the swap retires each run's server and working seats finish their turn on the old home first. A failed swap appends `moves.FailedMove` and the alert says the workers could not move and why. `NoAccountWithRoom` appends one `moves.NoRoomMove` (same dedup as `blocked` ~1270–1276) and the alert says workers stay on the account until the earliest reset and Codex work moves to Claude when Codex refuses it. Refusal handling (`blocked`, `switch_to_claude`, `switch_back`) is otherwise unchanged. The `requested` entry carries a new optional `cause: "credits off"` (`RequestedMove.cause: NotRequired[Literal["credits off"]]`; a reader treats a missing `cause` as `refusal`), so the readout never counts this move as a refusal.
+5. **Credits off.** The workers move. `accounts.pick("codex", now, exclude=frozenset({seats label}), keep=accounts.NoKeep())` (its order is soonest weekly reset, then most weekly left, then label; for a credits-off move an account with weekly room comes before a credits-on account at 0%, which is taken only when none has room, and the alert then says that account's paid credits are spent), then one `moves.RequestedMove` (`tool: codex`, `subject: seats`, `why: "<label> weekly usage used; credits off"`, `window: weekly`, `reset`) and `accounts.swap("seats", chosen.label)`, exactly as `quota_alert.blocked` does at ~1250–1268: the swap retires each run's server and working seats finish their turn on the old home first. A failed swap appends `moves.FailedMove`; `NoAccountWithRoom` appends one `moves.NoRoomMove` (same dedup as `blocked` ~1270–1276). In both cases that same pass calls `switch_to_claude`, the path a provider refusal takes, so no paid credits are spent on a credits-off account: the workers never stay on it, and the alert says Codex work moves to Claude until the earliest reset (with the swap failure's reason when there is one). Refusal handling (`blocked`, `switch_to_claude`, `switch_back`) is otherwise unchanged. The `requested` entry carries a new optional `cause: "credits off"` (`RequestedMove.cause: NotRequired[Literal["credits off"]]`; a reader treats a missing `cause` as `refusal`), so the readout never counts this move as a refusal.
 6. **Credits count only where they are on.** `accounts._codex_reading_can_work` (~1242) and `agent_accounts.codex_can_work` gain the account's setting: with `CreditsOff`, credits never make room, so `pick` skips a credits-off candidate whose weekly or 5-hour window is at 0, and `_swap_seats` refuses it with `accounts: <label> (<folder>) is used up and set not to use credits; choose another account or wait for reset`. `codex_can_work(report, now, credits: CodexCreditsSetting)`; every caller passes the setting of the report's account.
 7. **The hourly forecast.** While a zero episode with `credits: on` is open and the seats are still on that account, each run where `now - forecast_at >= 1 h` sends a forecast to `recipients(config)` and sets `forecast_at = now`. The first forecast of the episode also goes to the phone (`forecast_phone` `"due"` until `PushSent`, retried each run while due); later forecasts never do. Text (catalog `quota.codex_credits_forecast`): `In the last hour Codex workers used <used> credits on codex 1; its <balance> credits last until about <time>. When they run out, workers move to codex 2.` With zero use: `Codex workers used no credits on codex 1 in the last hour; <balance> credits left.` With `unlimited`: `codex 1 has unlimited credits.` With balance `null`: `codex 1 reports no credit balance; the forecast is unknown.`
 8. **Forecast inputs.** Balance now: the pass's `selected_codex_report(...).credit_balance` (`agent_accounts.codex_credits`: whole credits as text, `unlimited`, or `null`). Use in the last hour: `~/.local/state/agent-notes/readings.jsonl` (`run_out.READINGS_LOG`), whose `StoredReading {account, at, remaining, credits?}` lines `agent_notes.apply` (~227–241) appends for the matching Codex note whenever a note field changes. `credits_used(readings, label, since=now - 1 h, until=now) -> CreditsUsed | NoCreditReading`: start from the last reading at or before `since` (else the first in the hour), sum each decrease between consecutive `credits` values, skip each increase (a purchase), and return `NoCreditReading` when no line in or before the hour carries `credits`. Run-out time = `now + balance / used * 1 h`, shown in the user's zone (`scripts.lib.user_zone.user_zone()`). One reader of the log for credits: add `read_credit_readings(path) -> dict[str, list[CreditReading]]` beside `run_out.read_readings`, not a second JSON parser. `CreditsUsed` carries `used` and the observed interval (`observed_from`, `observed_to`); the rate is `used / (observed_to - observed_from)`. When the observations cover under 30 minutes of the hour, or the newest is older than `CODEX_READING_MAX_AGE`, it returns `UsageUnknown(reason)` and the forecast says the use is unknown this hour.
-9. **Push texts.** Every new user-facing text is a `PushText` in `scripts/notify/push_catalog.py` with `sender="quota_alert"`, need `note`, action `NoActionNeeded()`, and two or more `PushExample`s with realistic values (codex 1 / codex 2, credits 6370 and 2114 from the notes on 2026-10-14). Ids: `quota.codex_on_credits` (item 4, a next account), `quota.codex_on_credits_last` (item 4, no other account), `quota.codex_workers_moved` (item 5, moved), `quota.codex_workers_stay` (item 5, no room or failed swap; value `reason`), `quota.codex_credits_forecast` (item 7; the zero-use, unlimited and unknown forms are their own ids or examples, writer's choice). Titles under 45 characters; `"No action needed.\n" + body` under 500 (`test_every_catalog_example_fits_the_phone_title_and_body_limits`). Senders of these pushes use `tell_user(push_texts.render(id, **values))`; `UserPush.ask` asserts `ActionRequired`, so these go through a new `QuotaNote(name, rendered)` NamedTuple, not `UserPush`. The session-only lines in `blocked` (`seats moved from …`, `seats wait for …`, `Codex refused work on …`) say `workers` and the account number.
+9. **Push texts.** Every new user-facing text is a `PushText` in `scripts/notify/push_catalog.py` with `sender="quota_alert"`, need `note`, action `NoActionNeeded()` (except `quota.codex_on_credits` and `quota.codex_on_credits_last`, whose `ActionTemplate` says how to stop paid credit use: `use_credits: off` in the account's note on the alert's machine, the move following within minutes), and two or more `PushExample`s with realistic values (codex 1 / codex 2, credits 6370 and 2114 from the notes on 2026-10-14). Ids: `quota.codex_on_credits` (item 4, a next account), `quota.codex_on_credits_last` (item 4, no other account), `quota.codex_workers_moved` (item 5, moved), `quota.codex_workers_stay` (item 5, no room or failed swap; value `reason`), `quota.codex_credits_forecast` (item 7; the zero-use, unlimited and unknown forms are their own ids or examples, writer's choice). Titles under 45 characters; `"No action needed.\n" + body` under 500 (`test_every_catalog_example_fits_the_phone_title_and_body_limits`). Senders of these pushes use `tell_user(push_texts.render(id, **values))`; `UserPush.ask` asserts `ActionRequired`, so these go through a new `QuotaNote(name, rendered)` NamedTuple, not `UserPush`. The session-only lines in `blocked` (`seats moved from …`, `seats wait for …`, `Codex refused work on …`) say `workers` and the account number.
 10. **The approval gate, from the code.** `test_push_texts.test_every_catalog_example_has_current_approval` fails unless `push_texts_reviewed.json[id][example]["sha256"]` equals `push_texts.fingerprint(entry)` (a hash over sender, need, title, action, body and every example's values and filled text) for every example. To get a text approved, the seat runs from the worktree root `~/.claude/scripts/lib/py scripts/notify/review.py texts --id <id> --approve` (one `--id` per new entry). `review.texts` renders each example, runs the live reviewer (`_review`, `reviewer_prompt.md`), and records an approval only when the outcome is `Approved` with the draft unchanged; a `rewrite`, `ask` or `withhold` verdict records nothing and exits 1. On `rewrite`, copy the reviewer's printed title/body into the catalog entry and run again; any later edit to a template or an example value invalidates the approval and needs the same run. The reviewer withholds a push that "asks nothing of the user and tells nothing they must know now"; each body states the fact the user must know now (workers on paid credits, where they go, when credits end). A `withhold` that stays after one rewrite stops the seat and goes to the unit director: the user asked for these on the phone.
 11. **Workers, numbers, no `default`.** `codex_swap_line` (~145) says `workers move to {chosen.label} when Codex refuses work`, or `no other Codex account has room until <reset>`. `agent_accounts.codex_home_role_label(home)` (~89) returns the note label of the home's login (`codex_account(home)`), and the home's folder (`codex_home_display`, e.g. `~/.codex`) when its login has no note; never `default`. `accounts.role_account("seats")` (~1115) and `codex_home_label` (~2231) take their label from it. Today on natedev `~/.codex` reads `codex 2` everywhere. A test renders every Codex alert text (each new catalog example, `codex_swap_line`, the relays from items 3–7, the `blocked` session lines) and asserts none contains `default` and none contains `seats`.
 12. **`codex N` names an account, not a folder.** `agent_accounts.codex_account_home(label) -> CodexHomeHoldingLogin | CodexSetupHome`: the home among `codex_homes(...)` whose on-disk login (`codex_email_on_disk`) matches the `codex N` note's login (`CodexHomeHoldingLogin(label, home, login)`), else `~/.codexN` (`CodexSetupHome(label, home)`: no home holds the account yet; setup puts it there). `agent_accounts.seats_home()` (~398–413) resolves a stored `codex N` through it. `accounts.check_codex_target`, `_check_codex_home`, `check`, `codex_statuses`, `_write_role` and `_read_accounts_configuration` resolve through it; `setup "codex N"` keeps creating `~/.codexN` (rename `accounts.codex_account_home` to `codex_setup_home`). The role file stores the account label. `swap seats "codex 2"` and `set-role seats "codex 2"` then select `~/.codex` on natedev; today they fail with `~/.codex2 is missing`. `default` stays accepted as input for `~/.codex` until "Accounts named by number only".
@@ -802,9 +802,176 @@ After a seat launch's own turn has ended, a move to the selected seats home that
 
 **Acceptance gate:** the whoami, accounts, notify and lib suites (`python3 -m unittest discover -s scripts/<dir> -p 'test_*.py'`) and `basedpyright` on the touched files pass, and pass again under the real home; `test_push_texts` green with every new id approved; on natedev `accounts.py swap seats "codex 2" --dry-run` prints `Would move seats to codex 2 (~/.codex)` or `already serves seats`, and `accounts.py role seats` prints `codex 2`.
 
-### Phase 21 — Accounts named by number only  · status: todo
+### Phase 21 — Account notes by number, with role and sessions  · status: todo
 
 **Depends on:** Phase 20
+
+#### Work Order
+
+**Goal:** the account notes are named `claude1.md` … `codex2.md`, matching the `claude1` command line, and move to those names on the first updater pass after promotion; the hand-free `state` field is gone; each note carries `role` (the roles its account serves now) and `sessions` (its live session count), and its body holds a table of those sessions under a heading the script owns. Labels stay `claude 1` / `codex 2` everywhere; only the file names lose the space.
+
+**Spec:**
+
+1. **One mapping between a label and a file, in `scripts/whoami/note_file.py`** (the standard-library leaf every note reader already imports):
+   - `ACCOUNT_STEM = re.compile(r"(claude|codex) ?([1-9][0-9]*)")`.
+   - `label_from_stem(stem: str) -> str | None`: `"codex2"` and the old `"codex 2"` both give `"codex 2"`; any other stem gives `None`.
+   - `note_name(label: str) -> str`: `"codex 2"` → `"codex2.md"`; raises `ValueError` for a string that is not `claude N` / `codex N`.
+   - `notes_dir() -> Path`: `AGENT_NOTES_DIR` when set, else the module's `AGENTS_DIR` read at call time (tests that patch `AGENTS_DIR` keep working). Every `Path(os.environ.get("AGENT_NOTES_DIR", str(AGENTS_DIR)))` copy calls it instead (`agent_accounts.py:79, 106, 136`, `account.py:54, 84`), and `accounts._account_notes_directory` (`accounts.py:772–773`) returns `note_file.notes_dir()` (both resolve `Path.home()` per call).
+   - `note_path(label: str) -> Path`: `notes_dir() / note_name(label)`; the old `<tool> <n>.md` only when it alone exists (a vault not yet migrated, such as the Mac's copy before its next pull or update pass). Readers never build a note path any other way.
+   - `Note.label` (property, `label_from_stem(self.path.stem)`); `read_note` sets `tool` from the label (`label.split(" ")[0]`) instead of `path.stem.split(" ")[0].lower()` (`note_file.py:59`, which gives `codex2` for the new name and breaks `note.tool == "codex"` in `codex_pacer.accounts` ~352, `agent_notes.apply` ~193, `quota_alert`), and returns `None` for a file whose stem is not an account stem.
+   - `read_notes()` reads `notes_dir()`, one note per label: when both names exist, the numbered one.
+   - `Note.get_list(key) -> tuple[str, ...]`: a block list (`key:` then `  - item` lines, as Obsidian writes `return:` today), a flow list (`[a, b]`) or `[]`; a scalar reads as one item, an absent key as `()`.
+   - `in_use(note: FieldReader) -> bool`: `note.get_list("role") != ()` or `sessions` parses to an int above 0. `FieldReader` is a `Protocol` with `get` and `get_list`.
+
+2. **Every file-name user goes through the mapping** (file:line read 2026-10-14; re-read each before editing):
+
+   | Site | Today | Becomes |
+   | --- | --- | --- |
+   | `scripts/whoami/note_file.py:10, 59, 62–63` | `AGENTS_DIR` only, tool from the stem's first word, every `*.md` | `notes_dir()`, tool from `label_from_stem`, account stems only, one note per label |
+   | `scripts/whoami/account.py:51–62` `label_for` | globs `*.md`, stem starts with the tool, returns `path.stem` | `read_notes()`, matches `note.tool` and login, returns `note.label` |
+   | `account.py:82–93` `named_claude_account` | stem equals the text | `label_from_stem`-style match on `note.label`; returns `note.label` |
+   | `scripts/whoami/agent_accounts.py:73–85` `codex_account` | glob, returns `path.stem` | `read_notes()`, returns `note.label` |
+   | `agent_accounts.py:103–113` `codex_credits_setting` (Phase 20) | `directory / f"{label}.md"` | `read_note(note_path(label))` |
+   | `agent_accounts.py:130–145` `codex_account_home` (Phase 20) | `directory / f"{label}.md"` | `read_note(note_path(label))` |
+   | `scripts/whoami/agent_notes.py:229` | readings `account: note.path.stem` | `note.label` (keeps `readings.jsonl` keyed `codex 2`; 8 days of history stay continuous) |
+   | `agent_notes.py:287` | `no agent notes in {note_file.AGENTS_DIR}` | `notes_dir()` |
+   | `agent_notes.py:290` | `usage_store.save` logins keyed by stem | `note.label` |
+   | `scripts/whoami/quota_alert.py:605, 699, 700, 718, 720, 725, 804, 806, 828, 848, 870, 883, 885, 900, 929, 948, 978, 1305, 1350, 1608` | `note.path.stem` as the label | `note.label` (episode keys in `quota_alert.json` stay `codex 1`) |
+   | `quota_alert.py:454–458` `AgentNote` | `path`, `tool`, `get` | adds `label: str` and `get_list` |
+   | `quota_alert.py:1376–1382` `RefusingAccountNote` | no label | `label` field and `get_list` returning `()` |
+   | `quota_alert.py:1131` (Phase 20) | `values["file"] = f"{label}.md"` | `note_file.note_name(label)` |
+   | `quota_alert.py:1464` | `RefusingAccountNote(Path(name + ".md"), {})` | `RefusingAccountNote(note_path(name), {}, name)` |
+   | `quota_alert.py:965` `Read from {note.path}` | prints the path | no edit; it prints the new name once the note moves |
+   | `scripts/whoami/codex_pacer.py:349–353` | `note.tool == "codex"` | no edit; correct once `read_note` sets the tool from the label |
+   | `scripts/accounts/accounts.py:776–790` `_account_note` | `f"{label}.md"`, `Note(path, label.partition(" ")[0], …)` | `note_path(label)`; the missing-note line names that path |
+   | `accounts.py:2382–2387` `_noted_labels` | glob `claude *.md`, stems | `note.label` for each `read_notes()` note with tool `claude` |
+   | `accounts.py:2449–2452` `codex_statuses` noted labels | glob `codex *.md`, stems | same, tool `codex` |
+   | `scripts/production/dailies_render.py:126, 1413–1428, 1489–1500` | own `AGENTS_DIR`, own frontmatter parser, `state == "active"`, readings by stem | `note_file.read_notes()`, `note_file.in_use`, `readings.get(note.label)`; `AGENTS_DIR` and `agent_fields` go (the whoami dir is already on its path for `run_out`); the empty line stays `- none active` (the footer hook and its tests match it) |
+   | `scripts/notify/push_catalog.py:62–65, 72–73` (Phase 20) | examples `"file": "codex 1.md"` / `"codex 2.md"` | `"codex1.md"` / `"codex2.md"` |
+   | `docs/accounts.md:166` | `~/rust/hanadocs/agents/codex N.md` | `codexN.md` (`codex1.md` for codex 1) |
+   | `docs/quota_alerts.md:44` | `Each codex N.md account note` | `codexN.md`; line 3 adds the `role`/`sessions` fields and the table |
+   | `docs/as-built/shutdown-and-restart.md:42` | label is the note stem | label is read from the note name (`claude2.md` → `claude 2`) |
+   | `docs/as-built/build-memory-admission.md:190`, `docs/as-built/build-followups-fn-length-hook.md:55` | `state: active` notes, by file stem | notes in use (`role` or `sessions`), by label |
+   | `commands/quota_refresh.md:5` | "each active account" | "each account in use" |
+
+   Not file names, unchanged: `scripts/shutdown/inventory.py` (`label_for`), `restart.py:1993` and `shutdown.py:133` (`named_claude_account`), `scripts/message/escalate.py:471` (`codex_account`), `whoami.py:46` (`label_for`), `account.write_label` (the label text). `AGENT_NOTES_DIR` stays the one test and relocation variable.
+
+3. **The notes move when the new code first runs.** `agent_notes.rename_legacy_notes(directory: Path) -> list[str]` runs first in `update_alert_pass` (before `note_file.read_notes()`, `agent_notes.py:280`), so the timer and `refresh` both move them and `blocked` reads through `note_path`'s fallback. For each `*.md` whose stem matches `(claude|codex) ([1-9][0-9]*)` (with the space): when `<tool><n>.md` is absent, `os.link(old, new)` then `os.unlink(old)` (same inode: body and mode kept; `link` fails with `FileExistsError` instead of replacing a file that appeared since the check), log `agents: renamed codex 2.md to codex2.md`; when both exist, change nothing and log `agents: codex 2.md and codex2.md both exist; reading codex2.md` on every pass; any other `OSError` logs `agents: could not rename codex 2.md: <error>` and the pass goes on. Nobody moves a live note by hand.
+
+4. **`state` goes.** Writers: `agent_notes.apply` (`agent_notes.py:198–201`) sets `active`/`inactive` from `AccountActivity` (`ObservedAccountActivity`, `RoleAccountActivity`, `UnknownAccountActivity`, `OBSERVED_ACCOUNT_ACTIVITY`, `agent_notes.py:55–73`), fed at `agent_notes.py:296–303`: Claude `active` = the login is `~/.claude`'s or a local live session's (`ClaudeAccountsInUse.is_in_use`, `agent_accounts.py:194–195`); Codex `active` = the workers' account (`codex_readings.selected_account`), kept as is when that account is unknown. The activity types, the `activity` parameter and lines 296–303 are removed; the update pass deletes an existing `state:` line once (item 6). Readers and their replacement:
+
+   | Reader | Decides | Becomes |
+   | --- | --- | --- |
+   | `agent_notes.py:331` `mark_tier` | which Codex note shows the launch tier | `"worker" in note.get_list("role")` |
+   | `quota_alert.py:590` `low` | which notes open a low-quota episode | `in_use(note)` |
+   | `quota_alert.py:597` `usable` | which notes count as places with room | `in_use(note)` |
+   | `quota_alert.py:634` `recovered` | a single-account Claude note not in use closes its episode | `note is None or not in_use(note)` |
+   | `quota_alert.py:879` `run_out_push` candidates | a Claude note the updater manages | `candidate.get("sessions") is not None` |
+   | `quota_alert.py:948` notice line | `<label>: <state>, …` | `<label>: role <showrunner, unit or none>, <n> live sessions, …` |
+   | `quota_alert.py:1609` `refresh` lines | the accounts listed after a refresh | `in_use(note)` |
+   | `dailies_render.py:1491` | the Agents section's accounts | `in_use(note)` |
+
+   Calls (one line each): an account becomes in use by holding a role even with no session, which keeps the next launch's account in the alerts and the Agents section; `~/.claude`'s account is in use only through a role or a session (it no longer counts by being `~/.claude`, which "Accounts named by number only" removes as an account name anyway); a Mac session counts as soon as the roster sees it.
+
+5. **`role`: what the account is configured to serve now**, a block list in the fixed order showrunner, unit, worker, or `role: []`. The names `role` and `sessions` are fixed by hanadocs (its `agents.base`); do not rename them.
+   - Claude: `accounts.group_accounts()` (`accounts.py:1577`) and `accounts.group_label(groups, group)` (`accounts.py:1527`). Add `accounts.group_note_labels() -> dict[ClaudeGroup, str]`: each configured group's label; a stored `default` maps to the label of `account_identity(main_config_dir())` when that is a `KnownClaudeAccount`, and the group is left out otherwise. `units` gives `unit`, `showrunners` gives `showrunner`; one account can carry both. "Accounts named by number only" removes the `default` branch.
+   - Codex: `worker` on the note whose label is `codex_readings.selected_account.label` when that is a `KnownCodexAccount` (the same input `state` used, `agent_notes.py:300–303`).
+   - When `groups.json` cannot be read (`AccountsError`), every Claude note keeps its `role` line; when the workers' account is an `UnknownCodexAccount`, every Codex note keeps its `role` line. A pass never empties a role it could not read. Claude workers (the roster's Claude `worker` rows) appear in the table but give no Claude account the `worker` role; `worker` names the Codex account the workers run on.
+
+6. **One writer, only on change.** `agent_notes.set_fields` (`agent_notes.py:84–102`) and `_rewrite` (`:105–120`) grow into `write_note(note, updates: dict[str, str | tuple[str, ...]], *, remove: frozenset[str] = frozenset(), section: SessionsSection | KeepSections = KEEP_SECTIONS, stamp) -> bool`; `set_fields` stays a thin call of it for the existing callers. A tuple value renders as `key:` plus `  - item` lines, or `key: []` when empty. Replacing or removing a key also removes its continuation lines (lines that start with whitespace or `- `), so a `role:` block Obsidian rewrote leaves no orphan items; an inserted key still lands in sorted order and never splits another key's block (`return:` and its `  - "[[agents.base]]"` item stay together). Frontmatter and body are rebuilt in memory and the file is written once, with the note's mode and `os.replace` as now, and only when the text differs; `date_modified` is stamped only then. The 2-minute pass leaves a note untouched when no session started, stopped or moved.
+
+7. **The sessions table.** In each account note's body, under the heading `## Live sessions`, which the script owns:
+
+   ```
+   ## Live sessions
+
+   | Session | Role | Machine | Folder | Session id |
+   | --- | --- | --- | --- | --- |
+   | two-accounts | unit | natedev | ~/worktrees/claude-build-followups-two-accounts | 8f90aab3-fd40-47ea-8d7a-2858d9c26d6e |
+   | impl | worker | natedev | ~/worktrees/claude-build-followups-two-accounts | 019a1b2c-… |
+   ```
+
+   - Columns hold only values that change when a session starts, stops or moves (showrunner, binding): the roster name, the role (`showrunner`, `unit`, `worker` or `freestanding`), the machine, the folder (the session's cwd with a leading `/home/<user>` or `/Users/<user>` shown as `~`) and the id (Claude session id, Codex thread id, `—` for a row with neither). Never ages, token counts, statuses or activity times. `|` in a cell is written `\|`.
+   - Rows sort by machine, role in the order above, name, id, so the same sessions always render the same text.
+   - No rows: the line `No live sessions.` under the heading.
+   - The section runs from the heading to the next `# ` or `## ` heading or the end of the file and is replaced in place; when absent it is appended after the body with one blank line before it. Nothing else in the body changes.
+   - `sessions: <n>` is the number of rows.
+   - New module `scripts/whoami/session_table.py`: `SessionRow(NamedTuple)` (`name`, `role: SessionRole`, `machine`, `folder`, `session_id`), `render_section(rows) -> str`, `section_rows(body) -> tuple[SessionRow, ...]` (parses the owned table; an unparsable row is dropped), `replace_section(body, section) -> str`.
+
+8. **Where the rows come from: the session roster**, which already lists every live session on both machines with its role, cwd and id (`scripts/message/roster.py`, as-built `docs/as-built/session-roster.md`): Claude rows from the session registry, Codex workers from each live run's `mesh_roster.json` (live = not `ended` and its server pid or `launcher_pid` alive), blind reviewers, Codex daemon threads and herdr Codex panes. The shutdown inventory (`inventory.inventory(login)`, `live_group_members`) is per login and per machine and has no Codex rows, so it does not serve here. Role map: `showrunner` → `showrunner`, `unit director` → `unit`, `worker` → `worker`, `freestanding` → `freestanding`.
+   - `RosterEntry` (`roster.py:173–186`) gains `account: AccountLabel | AccountUnread = AccountUnread("not read")` (frozen dataclasses in `roster.py`; `AccountLabel(label)`, `AccountUnread(reason)`), set on the machine that owns the session:
+     - Claude rows (`_claude_entries`): `account.account_of(record["pid"])` → `Account.label` (`account.py:186–189`).
+     - Codex workers (`_delegate_workers`, `roster.py:1051–1106`): the run's `mesh_server.json` `codex_home` (`ServerRecord.codex_home`, `codex_mesh.py:230–233`) when the server is alive, else `agent_accounts.seats_home()`; label from `agent_accounts.codex_account(home)` when `KnownCodexAccount`.
+     - Codex daemon threads: the home holding the daemon socket (`codex_daemon.daemon_socket(environment)`, `~/.codex/app-server-control/…`). Blind reviewers and herdr Codex panes: `CODEX_HOME` from the process environment when the row has a pid (new `account.process_codex_home(pid) -> Path | None`, read like `process_config_dir`, `account.py:159–183`), else `~/.codex`; a Claude reviewer uses `account.account_of(pid)`.
+   - The snapshot carries it: `SnapshotEntry.account: NotRequired[dict[str, str]]`, `AccountLabel`/`AccountUnread` join `_SNAPSHOT_STATES`, and `_decode_entry` (`roster.py:261–284`) accepts an entry with or without `account` (without → `AccountUnread("peer sent no account")`). Today it refuses any entry whose field set differs (`:263`), so a peer one version apart would read as not reached; the two machines update their `~/.claude` at different times.
+   - `roster.peer_snapshot(environment) -> Roster | PeerNotReached(host, reason)`; `peer_roster` (`roster.py:1194–1215`) wraps it with today's return, so `send.py:734` and `roster()` are unchanged.
+   - `session_table.live_sessions(environment) -> ReadSessions | SessionsUnread`: `roster.roster(environment, ThisMachine())` and `peer_snapshot` in parallel (as `roster()` does); `ReadSessions(rows_by_label: dict[str, tuple[SessionRow, ...]], unreached: frozenset[str])`. A row with `AccountUnread`, or whose label has no note, lands in no note.
+   - The update pass (in `update_alert_pass`, after the `apply` loop and before the alert reads the notes): for each note, its rows are `rows_by_label[label]` plus, for each machine in `unreached`, the rows the note's table already holds for that machine (a sleeping Mac keeps its rows until the roster reaches it again). `SessionsUnread` (the local roster raised) leaves every `sessions` line and table as written and logs `sessions: <reason>`. A roster failure never costs the readings or the alerts (same `try` discipline as `usage_store.save`, `agent_notes.py:288–295`).
+   - Cost, named: one local roster read and one `ssh` to the peer (20 s timeout, run in parallel) per 2-minute pass, inside the timer's 120 s budget for `agent_notes.py`.
+
+9. **Phase 20's texts follow the new name.** `quota.codex_on_credits` (`push_catalog.py:59`, examples 62–65) and `quota.codex_on_credits_last` (`push_catalog.py:67`, examples 72–73) take `{file}` from `quota_alert.py:1131`; their examples change to `codex1.md` / `codex2.md`, which changes `push_texts.fingerprint(entry)`, so the impl worker re-approves both from the worktree root: `~/.claude/scripts/lib/py scripts/notify/review.py texts --id quota.codex_on_credits --approve` and `--id quota.codex_on_credits_last --approve` (a `rewrite` verdict goes into the entry and the command runs again, as in Phase 20 item 10). The template text `~/rust/hanadocs/agents/{file}` itself is unchanged. No other catalog entry names a note file.
+
+**Files:**
+
+- `scripts/whoami/note_file.py` — `ACCOUNT_STEM`, `label_from_stem`, `note_name`, `notes_dir`, `note_path`, `Note.label`, `get_list`, `in_use`, `FieldReader`; `read_notes` one per label.
+- `scripts/whoami/agent_notes.py` — `rename_legacy_notes`, `write_note` (lists, removal, the section, one write), `state` and the activity types removed, `role` and `sessions` and the table written, labels in readings and the usage store, `mark_tier` by role.
+- `scripts/whoami/session_table.py` — new: `SessionRow`, `live_sessions`, `render_section`, `section_rows`, `replace_section`.
+- `scripts/whoami/account.py` — `label_for`, `named_claude_account` by label; `process_codex_home`.
+- `scripts/whoami/agent_accounts.py` — `codex_account`, `codex_credits_setting`, `codex_account_home` through `note_path`/`read_notes`.
+- `scripts/whoami/quota_alert.py` — `note.label`, `in_use`, `AgentNote.label`/`get_list`, `RefusingAccountNote`, `note_name` for `{file}`, the notice line.
+- `scripts/accounts/accounts.py` — `_account_notes_directory`, `_account_note`, `_noted_labels`, `codex_statuses` labels; `group_note_labels`.
+- `scripts/message/roster.py` — `RosterEntry.account`, the snapshot field and tolerant decode, `peer_snapshot`, `PeerNotReached`.
+- `scripts/production/dailies_render.py` — the Agents section through `note_file`.
+- `scripts/notify/push_catalog.py`, `scripts/notify/push_texts_reviewed.json` — the two examples and their approvals.
+- `docs/accounts.md`, `docs/quota_alerts.md`, `docs/as-built/session-roster.md`, `docs/as-built/shutdown-and-restart.md`, `docs/as-built/build-memory-admission.md`, `docs/as-built/build-followups-fn-length-hook.md`, `commands/quota_refresh.md` — names, `role`, `sessions`, the table, the roster's account.
+- `scripts/accounts/test_accounts.py` — numbered note names, no `state:`, the new behavior.
+- `scripts/accounts/test_refusal_watch.py` — numbered note names, no `state:`, the new behavior.
+- `scripts/agents/test_codex_mesh.py` — numbered note names, no `state:`, the new behavior.
+- `scripts/message/test_codex_daemon.py` — numbered note names, no `state:`, the new behavior.
+- `scripts/message/test_escalate.py` — numbered note names, no `state:`, the new behavior.
+- `scripts/message/test_roster.py` — numbered note names, no `state:`, the new behavior.
+- `scripts/nightly_review/test_nightly_review.py` — numbered note names, no `state:`, the new behavior.
+- `scripts/notify/test_push_texts.py` — numbered note names, no `state:`, the new behavior.
+- `scripts/production/test_add_showrunner.py` — numbered note names, no `state:`, the new behavior.
+- `scripts/production/test_dailies_render_agents.py` — numbered note names, no `state:`, the new behavior.
+- `scripts/shutdown/test_account_move.py` — numbered note names, no `state:`, the new behavior.
+- `scripts/usage/test_usage_report.py` — numbered note names, no `state:`, the new behavior.
+- `scripts/whoami/test_agent_notes.py` — numbered note names, no `state:`, the new behavior.
+- `scripts/whoami/test_five_hour.py` — numbered note names, no `state:`, the new behavior.
+- `scripts/whoami/test_note_file.py` — numbered note names, no `state:`, the new behavior.
+- `scripts/whoami/test_quota_alert.py` — numbered note names, no `state:`, the new behavior.
+- `scripts/whoami/test_session_table.py` — numbered note names, no `state:`, the new behavior.
+- `scripts/whoami/test_account.py` — numbered note names, no `state:`, the new behavior.
+- `scripts/production/test_add_unit.py` — numbered note names, no `state:`, the new behavior.
+- `scripts/whoami/test_codex_alert_accounts.py` — numbered note names, no `state:`, the new behavior.
+- `scripts/whoami/test_codex_homes.py` — numbered note names, no `state:`, the new behavior.
+- `scripts/shutdown/test_inventory.py` — numbered note names, no `state:`, the new behavior.
+- `scripts/production/test_production_lifecycle.py` — numbered note names, no `state:`, the new behavior.
+- `scripts/production/test_promote_showrunner.py` — numbered note names, no `state:`, the new behavior.
+- `scripts/shutdown/test_restart.py` — numbered note names, no `state:`, the new behavior.
+- `scripts/shutdown/test_shutdown_cli.py` — numbered note names, no `state:`, the new behavior.
+- `scripts/shutdown/test_shutdown_status.py` — numbered note names, no `state:`, the new behavior.
+- `scripts/production/test_waiting.py` — numbered note names, no `state:`, the new behavior.
+
+**Seats:** 1 writer + 1 tester.
+- `impl` — every production file and doc above, and the two re-approvals; hub: `scripts/whoami/note_file.py` (the label/file mapping every other file calls).
+- `test` — every note a test writes uses the numbered name (`note_file.note_name(label)` or the literal `claude3.md`), and fixtures drop `state:`:
+  - `scripts/whoami/test_note_file.py`: `label_from_stem` for `codex2`, `codex 2`, `claude10`, and `None` for `codex0`, `codex`, `notes`; `note_name` and its `ValueError`; `note_path` with the numbered file, the old file alone, both, neither; `read_notes` one note per label (numbered preferred) and a non-account `.md` skipped; `tool` is `codex` for `codex2.md`; `get_list` for block, flow, `[]`, scalar and absent; `in_use` for a role alone, sessions alone, neither, an unparsable `sessions`; `notes_dir` with and without `AGENT_NOTES_DIR`.
+  - `scripts/whoami/test_agent_notes.py`: a first pass renames `codex 2.md` to `codex2.md` with body and mode (0o644 under umask 0o077) kept; both names present changes neither and logs the line; no `state` is written and an existing `state:` line is removed with every other line kept; `role` for a units-and-showrunners account is the two-item block, `worker` on the selected Codex note, `role: []` elsewhere; an unknown Codex selection and an unreadable `groups.json` keep their roles; `sessions` and the table written; a second pass with the same rows writes nothing (no `os.replace`, mtime unchanged) and a status change alone writes nothing; the section replaced in place with body text above and below it unchanged, and created when missing; an unreached peer keeps its rows while local rows are replaced; `SessionsUnread` leaves tables and counts alone; an Obsidian block `role:` rewritten leaves no orphan items and `return:` stays whole; `readings.jsonl` lines from `codex2.md` carry `account: codex 2`; `mark_tier` writes the tier only on the worker note. Every test reaching `update_alert_pass` or `main` replaces `session_table.live_sessions` with a fake (no roster read, no `ssh`).
+  - `scripts/whoami/test_session_table.py` (new): render and `section_rows` round trip with a `\|` cell; sort order; folder shortening for `/home/<user>` and `/Users/<user>`; `replace_section` at the end, in the middle and absent; `No live sessions.`.
+  - `scripts/whoami/test_quota_alert.py`: `low`, `usable`, `recovered` and the refresh lines by `in_use`; the notice line with roles and session count; `{file}` is `codex1.md`; the `blocked` fallback note carries its label. `test_codex_alert_accounts.py`, `test_codex_homes.py`, `test_account.py`: labels `codex 2`/`claude 2` from numbered files; an old name alone still resolves.
+  - `scripts/accounts/test_accounts.py`: the missing-note line names `claude3.md`; status lists noted labels from numbered names; `group_note_labels` for configured, unconfigured and a stored `default`.
+  - `scripts/message/test_roster.py`: a Claude row's account from its config dir, a Codex worker's from `mesh_server.json`'s `codex_home`, a daemon thread's from the socket's home; a snapshot entry without `account` decodes as `AccountUnread`; one with it round-trips; `peer_snapshot` returns `PeerNotReached` on a timeout.
+  - `scripts/production/test_dailies_render_agents.py`: the Agents section by `in_use` and by label from numbered files; `- none active` when nothing is in use.
+  - Fixture renames only: `scripts/accounts/test_refusal_watch.py`, `scripts/agents/test_codex_mesh.py`, `scripts/message/test_escalate.py`, `scripts/message/test_codex_daemon.py`, `scripts/nightly_review/test_nightly_review.py`, `scripts/production/test_add_showrunner.py`, `test_add_unit.py`, `test_promote_showrunner.py`, `test_production_lifecycle.py`, `test_waiting.py`, `scripts/shutdown/test_account_move.py`, `test_inventory.py`, `test_restart.py`, `test_shutdown_status.py`, `test_shutdown_cli.py`, `scripts/usage/test_usage_report.py`, `scripts/whoami/test_five_hour.py`. `scripts/notify/test_push_texts.py` stays green with the two re-approved ids.
+
+**Constraints from prior phases:** "Codex credits setting and the 0% alert" reads `use_credits` through `codex_credits_setting(label)` and resolves `codex N` through `codex_account_home(label)`, both by note path; its `quota.codex_on_credits`/`_last` entries carry `{file}`; keep its names and return types. "Two account groups" ships `group_accounts`, `group_label`, `GroupNotConfigured` and `role_account("unit"|"showrunner")`; names and types stay (herdr adoption depends on them). Every state file keys accounts by label — `quota_alert.json` `episodes` and `codex_zero`, `~/.local/state/agent-notes/readings.jsonl`, `usage.json`, `roles.jsonl`, `groups.json` — and labels do not change, so no state file is rewritten. The alert pass runs at the end of `agent_notes.py`'s argument-free run, every 2 minutes from natedev's `agent-sessions-snapshot` timer (`/etc/nixos/modules/linux/agent-sessions-snapshot.py`, which then commits `agents/*.md` through `hanadocs-commit.py`, leaving `date_modified`, `weekly_usage_checked_at`, `weekly_remaining_usage`, `credit_balance`, `resets` and `limit_reset` out of its change test); the Mac has no timer. `accounts.py` never imports `quota_alert` or `codex_mesh` at module level; `agent_notes` reaches `roster` and `accounts` inside functions. `agent_accounts` is imported by name, never by path. Every test reaching `agent_accounts.user_zone()` points `showrunners.NOTIFIER_STATE_DIR` at an empty dir. Tests set `HOME` and `AGENT_NOTES_DIR` to temp dirs, never touch `~/rust/hanadocs` or `~/.codex*`, and never `ssh`. `agents.base` and every other vault file are hanadocs's: this phase edits no vault file; the notes change only through `agent_notes.py` at run time. "Accounts named by number only" follows and adds `accounts.group_note_labels`'s `default` branch to its site table; its line numbers in `agent_notes.py` (~296–317) move with this phase.
+
+**Acceptance gate:** the whoami, accounts, notify, lib, production, shutdown, nightly_review and message suites (`python3 -m unittest discover -s scripts/<dir> -p 'test_*.py'`) pass under a temp `HOME`, and `basedpyright` on the touched files reports nothing; `test_push_texts` green with both ids re-approved; `grep -rnE '(claude|codex) \{|f"\{label\}\.md"|\.stem' scripts/whoami scripts/accounts/accounts.py scripts/production/dailies_render.py` finds no note path built outside `note_file`. No live note is moved by hand: the first timer pass after promotion renames them. After promotion (showrunner): the timer's log shows five `agents: renamed …` lines and no `both exist`; `~/rust/hanadocs/agents/` holds `claude1.md` … `codex2.md` with their bodies, each with `role`, `sessions` and `## Live sessions`; `/showrunner:accounts status` reads every account.
+
+### Phase 22 — Accounts named by number only  · status: todo
+
+**Depends on:** Phase 20, Phase 21
 
 #### Work Order
 
@@ -891,9 +1058,9 @@ Not account names, unchanged: `codex_pacer.py` tier `default`, `dailies_render.p
 
 **Acceptance gate:** the accounts, shutdown, production, whoami, nightly_review, herdr, notify and lib suites and `basedpyright` on the touched files pass, and pass again under the real home; on natedev `accounts.py status`, `placement --explain`, `pick claude --explain`, `pick codex --explain` and `role seats` print no account named `default`, and `move units default --dry-run` refuses with the numbered line.
 
-### Phase 22 — Proof refusals stay with their session  · status: todo
+### Phase 23 — Proof refusals stay with their session  · status: todo
 
-**Depends on:** Phase 16, Phase 17, Phase 18, Phase 19, Phase 21
+**Depends on:** Phase 16, Phase 17, Phase 18, Phase 19, Phase 22
 
 #### Work Order
 
@@ -930,9 +1097,9 @@ Not account names, unchanged: `codex_pacer.py` tier `default`, `dailies_render.p
 
 **Acceptance gate:** the accounts, shutdown, production, whoami and nightly_review suites and the scoped lint pass, and pass again under the real home. `refusal_watch.py --dry-run` on natedev reports no refused session, or each one with its decision.
 
-### Phase 23 — Live proof of the moves  · status: todo · gated by G4
+### Phase 24 — Live proof of the moves  · status: todo · gated by G4
 
-**Depends on:** Phase 15, Phase 16, Phase 18, Phase 19, Phase 20, Phase 21, Phase 22
+**Depends on:** Phase 15, Phase 16, Phase 18, Phase 19, Phase 20, Phase 22, Phase 23
 
 #### Work Order
 
@@ -946,7 +1113,7 @@ Not account names, unchanged: `codex_pacer.py` tier `default`, `dailies_render.p
 4. Codex, with the user present: `agent_notes.py blocked <seats home> <login> '<seats label>' --window weekly --refused-at <now, aware ISO>` moves the seats role to the picked Codex account: one `requested`, then one `confirmed` per seat as each resumes on the new home. The mesh's own path — a seat refused mid-turn resumes with exactly one "Continue where you stopped." before any held message — is proved by its tests and live by the first real Codex refusal (item 6). A Codex 5-hour wait is shown live only if a 5-hour reset under 20 minutes away occurs during the session; otherwise its tests stand.
 4a. **A scratch group moves whole** (showrunner, 2026-10-14; no user needed, nothing real moves). Two probe sessions taken as one group with `--proof-group` ("Proof refusals stay with their session" item 10) take a refusal: both probes get the `Pause for move` message and answer `ready --where`, both resume on the target account with their conversations, and no real session receives any message.
 5. `moves.jsonl` holds, for each move above, its `requested` and then a `confirmed` per seat or session (or `failed` with its reason), and for each wait its `waited` and `wait ended`; `/showrunner:accounts status` lists them with their outcomes.
-6. The first real refusal after this phase, Claude or Codex, is reported to the showrunner with its entries when it happens. Phase 23 completes, and G3's clock starts, without waiting for it.
+6. The first real refusal after this phase, Claude or Codex, is reported to the showrunner with its entries when it happens. Phase 24 completes, and G3's clock starts, without waiting for it.
 
 **Files:**
 

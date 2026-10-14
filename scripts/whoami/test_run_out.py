@@ -4,10 +4,12 @@ import json
 import math
 import tempfile
 import unittest
+from collections.abc import Sequence
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from run_out import HALF_LIFE, MAX_GAP, MIN_SPAN, Reading, read_readings, weighted_rate
+import run_out
 
 START = datetime(2026, 10, 5, 12, 0, tzinfo=timezone.utc)
 
@@ -25,6 +27,62 @@ def step(steps: float) -> float:
 
 
 class RunOutTests(unittest.TestCase):
+    def credit_history(self, values: Sequence[tuple[int, float]]) -> Path:
+        path = Path(self.enterContext(tempfile.TemporaryDirectory())) / "readings.jsonl"
+        _ = path.write_text("".join(json.dumps({"account": "codex 1", "at":
+            (START + timedelta(minutes=minute)).isoformat(), "remaining": 0, "credits": balance})
+            + "\n" for minute, balance in values))
+        return path
+
+    def test_credit_use_counts_decreases_and_skips_a_purchase(self) -> None:
+        path = self.credit_history([(-2, 100), (10, 90), (30, 200), (60, 170), (70, 0)])
+        used = run_out.credits_used(run_out.read_credit_readings(path), "codex 1",
+            since=START, until=START + timedelta(hours=1))
+        self.assertIsInstance(used, run_out.CreditsUsed)
+        assert isinstance(used, run_out.CreditsUsed)
+        self.assertEqual(used.used, 40)
+        self.assertEqual(used.observed_from, START - timedelta(minutes=2))
+        self.assertEqual(used.observed_to, START + timedelta(hours=1))
+
+    def test_credit_use_reports_zero_only_with_observations_covering_the_hour(self) -> None:
+        path = self.credit_history([(0, 6370), (30, 6370), (60, 6370)])
+        used = run_out.credits_used(run_out.read_credit_readings(path), "codex 1",
+            since=START, until=START + timedelta(hours=1))
+        self.assertIsInstance(used, run_out.CreditsUsed)
+        assert isinstance(used, run_out.CreditsUsed)
+        self.assertEqual((used.used, used.observed_from, used.observed_to),
+                         (0, START, START + timedelta(hours=1)))
+
+    def test_credit_use_without_a_credit_line_names_the_missing_reading(self) -> None:
+        path = self.credit_history([])
+        _ = path.write_text(json.dumps({"account": "codex 1", "at": START.isoformat(), "remaining": 0}) + "\n")
+        self.assertIsInstance(run_out.credits_used(run_out.read_credit_readings(path), "codex 1",
+            since=START, until=START + timedelta(hours=1)), run_out.NoCreditReading)
+
+    def test_credit_use_with_stale_or_short_observation_coverage_is_unknown(self) -> None:
+        for values in ([(-120, 100), (-90, 90)], [(40, 100), (60, 90)], [(0, 100), (49, 90)]):
+            with self.subTest(values=values):
+                path = self.credit_history(values)
+                result = run_out.credits_used(run_out.read_credit_readings(path), "codex 1",
+                    since=START, until=START + timedelta(hours=1))
+                self.assertIsInstance(result, run_out.UsageUnknown)
+                assert isinstance(result, run_out.UsageUnknown)
+                self.assertTrue(result.reason)
+
+    def test_credit_reader_keeps_accounts_separate_orders_them_and_skips_invalid_balances(self) -> None:
+        path = self.credit_history([(60, 2114), (0, 6370)])
+        with path.open("a") as output:
+            _ = output.write("bad json\n[]\n")
+            for balance in (True, -1, math.nan, "unlimited", None):
+                _ = output.write(json.dumps({"account": "codex 1", "at": START.isoformat(),
+                    "remaining": 0, "credits": balance}) + "\n")
+            _ = output.write(json.dumps({"account": "codex 2", "at": START.isoformat(),
+                "remaining": 1, "credits": 20}) + "\n")
+        readings = run_out.read_credit_readings(path)
+        self.assertEqual([reading.at for reading in readings["codex 1"]], [START, START + timedelta(hours=1)])
+        self.assertEqual(len(readings["codex 2"]), 1)
+        self.assertEqual(run_out.read_credit_readings(path.with_name("absent")), {})
+
     def test_readings_are_per_account_in_time_order_and_bad_lines_are_skipped(self) -> None:
         path = Path(self.enterContext(tempfile.TemporaryDirectory())) / "readings.jsonl"
         records: list[dict[str, object]] = [

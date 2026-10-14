@@ -205,7 +205,7 @@ Refusals leave both the role and history unchanged. A home-check failure names t
 
 ## Automatic Codex moves
 
-A provider quota refusal moves seats to the picked Codex account with room; low quota alone changes nothing. A known 5-hour reset less than 20 minutes away waits once, with its reset time in the notice. An unknown window or reset, a passed reset, or exactly 20 minutes remaining moves instead. The picked home becomes the seats role through the seats-swap path; each seat moves after its live turn ends and continues the refused work before held messages.
+A provider quota refusal moves workers to the picked Codex account with room. Above zero, low quota alone changes nothing; weekly zero with `use_credits: off` also requests a move. A known 5-hour reset less than 20 minutes away waits once, with its reset time in the notice. An unknown window or reset, a passed reset, or exactly 20 minutes remaining moves instead. The picked home becomes the seats role through the seats-swap path; each seat moves after its live turn ends and continues the refused work before held messages.
 
 When no Codex account has room, assignments fall back to Claude and the notice names the earliest reset. A failed move to the picked home also falls back to Claude, with the failed move and cause in the notice. They return only when the selected Codex account can work and its refusal is resolved. Recorded refusals override saved percentages. The moves journal at `~/.local/state/accounts/moves.jsonl` separates a requested role change from each seat's confirmed resume, and records waits, failures and renewed room.
 
@@ -240,3 +240,9 @@ add_unit: unit account <label>: <problem>; /showrunner:accounts
 ```
 
 Run `/showrunner:accounts`, fix what it names (most often the account's alias and `/login` as that account), then launch again.
+
+## Codex account numbers and credits
+
+`codex N` names the login in its account note, rather than a folder number. Selecting `codex 2` finds the existing home holding that note's login; it may be `~/.codex`. A home with no named note is shown by its folder. `default` remains accepted as input for `~/.codex`; account output uses its note number. Setup still creates `~/.codexN` when no home holds that account.
+
+Set `use_credits: on` or `use_credits: off` in each Codex note. Missing values mean on. With off, an exhausted weekly or 5-hour window makes the account unavailable even with credits. At weekly 0%, on keeps workers on paid credits with one phone and showrunner notice and hourly forecasts; off prefers an account with weekly usage left, then an account using its own credits. When neither is available or the move fails, Codex assignments move to Claude until the earliest refill. Only the first forecast goes to the phone. See `docs/quota_alerts.md` for delivery retries and unknown forecasts.
