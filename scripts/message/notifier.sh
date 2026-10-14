@@ -15,7 +15,7 @@ SESSIONS_DIR=${NOTIFIER_SESSIONS_DIR:-$HOME/.claude/sessions}
 NOW=${NOTIFIER_NOW_EPOCH:-$EPOCHSECONDS}
 
 die() { print -u2 -r -- "notifier.sh: $*"; exit 2 }
-usage() { die 'usage: notifier.sh new <instance> --every <min> (--run <cmd> | --to <target> (--command <text> | --prompt-file <path>)) [--from <sender>] [--check <cmd>] [--hold] [--aligned] [--timeout <s>]; start|stop|status|fire|restart|remove|health <instance>; interval <instance> <min>; align <instance> on|off; status|tick' }
+usage() { die 'usage: notifier.sh new <instance> --every <min> (--run <cmd> | --to <target> (--command <text> | --prompt-file <path>)) [--from <sender>] [--check <cmd>] [--hold] [--aligned] [--timeout <s>]; start|resume|stop|pause|unpause|status|fire|restart|remove|health <instance>; interval <instance> <min>; align <instance> on|off; status|tick' }
 
 [[ $NOW == <0-> ]] || die "invalid clock: $NOW"
 
@@ -55,8 +55,8 @@ write_conf() {
     print -r -- "HOLD=${conf[HOLD]}"
     print -r -- "ALIGN=${conf[ALIGN]:-0}"
     print -r -- "TIMEOUT=${conf[TIMEOUT]}"
-  } > "$tmp"
-  mv -f -- "$tmp" "$dir/conf"
+  } > "$tmp" || return 1
+  mv -f -- "$tmp" "$dir/conf" || { rm -f -- "$tmp"; return 1; }
 }
 
 write_state() {
@@ -67,8 +67,9 @@ write_state() {
     print -r -- "LAST_SENT=${state[LAST_SENT]}"
     print -r -- "LAST_RESTART=${state[LAST_RESTART]}"
     print -r -- "LAST_TARGET=${state[LAST_TARGET]}"
-  } > "$tmp"
-  mv -f -- "$tmp" "$dir/state"
+    if [[ ${state[PAUSED]:-0} == 1 ]]; then print -r -- "PAUSED=1"; fi
+  } > "$tmp" || return 1
+  mv -f -- "$tmp" "$dir/state" || { rm -f -- "$tmp"; return 1; }
 }
 
 # An aligned instance fires on the local clock's multiples of EVERY (every 60:
@@ -93,7 +94,15 @@ utc_offset() {
   print -r -- $seconds
 }
 
-local_time() { strftime "$1" "$2" }
+# Times shown are in the user's zone setting. It is read on first use, because most ticks show
+# none; when it cannot be read, the machine's zone stands in.
+shown_zone() {
+  (( ${+SHOWN_ZONE} )) || typeset -g SHOWN_ZONE="$("$PY" "${SCRIPT:h:h}/lib/user_zone.py" 2>/dev/null)"
+}
+local_time() {
+  shown_zone
+  if [[ -n $SHOWN_ZONE ]]; then TZ=$SHOWN_ZONE strftime "$1" "$2"; else strftime "$1" "$2"; fi
+}
 next_line() { print -r -- "next_due=${state[NEXT_DUE]} ($(local_time '%Y-%m-%d %H:%M %Z' ${state[NEXT_DUE]}))" }
 time_line() {
   if (( $2 == 0 )); then
@@ -111,7 +120,7 @@ log_error() { print -r -- "$fired | $1" >> "$STATE_DIR/notifier.log" }
 cmd_new() {
   (( $# >= 2 )) || usage
   local name=$1 dir lock_fd target='' every='' command='' prompt_file='' run='' sender='' check='' hold=0 align=0 timeout=120
-  local command_given=0 prompt_given=0 run_given=0
+  local command_given=0 prompt_given=0 run_given=0 state_created=0
   shift
   valid_name "$name"
   while (( $# )); do
@@ -156,12 +165,13 @@ cmd_new() {
   (( command_given )) && conf[COMMAND]=$command
   (( prompt_given )) && conf[PROMPT_FILE]=$prompt_file
   (( run_given )) && conf[RUN]=$run
-  write_conf
   if [[ ! -e $dir/state ]]; then
     state=(ENABLED 1 NEXT_DUE 0 LAST_SENT 0 LAST_RESTART 0 LAST_TARGET '')
-    schedule
-    next_line
+    schedule || { zsystem flock -u "$lock_fd"; return 1; }
+    state_created=1
   fi
+  write_conf || { zsystem flock -u "$lock_fd"; return 1; }
+  (( state_created )) && next_line
   zsystem flock -u "$lock_fd"
 }
 
@@ -176,9 +186,17 @@ cmd_state() {
   read_conf
   read_state
   case $action in
-    start) state[ENABLED]=1; schedule; next_line ;;
-    stop) state[ENABLED]=0; write_state ;;
-    restart) state[LAST_RESTART]=$NOW; schedule; next_line ;;
+    # A conversation pause stops a timer with `pause`, which marks it, and brings it back with
+    # `unpause` only while the mark is there. Any explicit action clears the mark, so a timer
+    # someone stopped or started during the pause stays as they left it.
+    start) state[PAUSED]=0; state[ENABLED]=1; schedule; next_line ;;
+    resume) state[PAUSED]=0; state[ENABLED]=1; write_state; next_line ;;
+    stop) state[PAUSED]=0; state[ENABLED]=0; write_state ;;
+    pause)
+      if [[ ${state[ENABLED]:-0} == 1 ]]; then state[PAUSED]=1; state[ENABLED]=0; write_state; fi ;;
+    unpause)
+      if [[ ${state[PAUSED]:-0} == 1 ]]; then state[PAUSED]=0; state[ENABLED]=1; write_state; next_line; fi ;;
+    restart) state[PAUSED]=0; state[LAST_RESTART]=$NOW; schedule; next_line ;;
     interval)
       conf[EVERY]=$3
       write_conf
@@ -276,8 +294,10 @@ instance_tick() {
   fi
 
   socket=$(NOTIFIER_SESSIONS_DIR="$SESSIONS_DIR" "$PY" "$SESSIONS" socket "${conf[TARGET]}" 2>/dev/null)
+  rc=$?
   if [[ -z $socket ]]; then
-    log_skip 'session not running'
+    # Exit 1 is no such live session. Any other failure is the lookup itself failing.
+    if (( rc == 0 || rc == 1 )); then log_skip 'session not running'; else log_skip "session lookup exit $rc"; fi
     return 0
   fi
 
@@ -353,6 +373,7 @@ cmd_status() {
 cmd_status_all() {
   local dir name mode
   typeset -A conf state
+  shown_zone
   for dir in "$STATE_DIR"/*(/N); do
     [[ -r $dir/conf && -r $dir/state ]] || continue
     name=${dir:t}
@@ -461,7 +482,7 @@ action=$1
 shift
 case $action in
   new) cmd_new "$@" ;;
-  start|stop|restart)
+  start|resume|stop|restart|pause|unpause)
     (( $# == 1 )) || usage
     cmd_state "$action" "$1" ;;
   interval)

@@ -230,13 +230,10 @@ def review_watch(production: Production, state_dir: Path) -> WatchFirstAlert | W
         if record.exists():
             return WatchRepeat(line)
         table = required(command("watch", sys.executable, str(review_script), "report", "--since", "2026-09-28"), "watch")
-        notice = f"{line}; the table is in this session"
-        push = Path.home() / ".claude/scripts/notify/pushover.py"
-        _ = required(command("watch", sys.executable, str(push), "--priority", "1", "Hana: review watch", notice), "watch")
         moment = datetime.now(production.zone).strftime("%H:%M %Z")
         production.log.parent.mkdir(parents=True, exist_ok=True)
         with production.log.open("a", encoding="utf-8") as log:
-            _ = log.write(f"- {moment}: review watch: {line}\n")
+            _ = log.write(f"- {moment}: review watch: {line}\n{table}\n")
         write_json(record, {"alerted": datetime.now(production.zone).isoformat(timespec="seconds"), "line": line})
         return WatchFirstAlert(line, table)
 

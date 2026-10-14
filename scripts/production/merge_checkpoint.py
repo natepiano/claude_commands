@@ -14,7 +14,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import NamedTuple, cast
 
-from add_unit import Production, Refusal, cell_value, read_production, unit_rows
+from add_unit import Production, Refusal, cell_value, read_production, unit_table
 
 
 class ValidateAndPush(NamedTuple):
@@ -93,7 +93,7 @@ class MergeEntry(NamedTuple):
     short: str
     merge_branch: str
     merge_hash: str
-    kind: CodeCheckpoint | ShrinkCommit
+    kind: CodeCheckpoint | ShrinkCommit | AsBuiltCommit
 
 
 class MergeBranchHistory(NamedTuple):
@@ -125,6 +125,10 @@ class ShrinkCommit(NamedTuple):
     pass
 
 
+class AsBuiltCommit(NamedTuple):
+    """A unit's closing commit: its as-built docs and the plan's deletion, after its last phase merged."""
+
+
 class ReviewTrial(NamedTuple):
     ux_findings: str
     code_findings: str
@@ -151,7 +155,7 @@ class MergeRequest(NamedTuple):
     phase: str
     commit: str
     also: tuple[str, ...]
-    kind: CodeCheckpoint | ShrinkCommit
+    kind: CodeCheckpoint | ShrinkCommit | AsBuiltCommit
     push: ValidateAndPush | GitPush
     promotion: NoPromotion | PromoteTo
     merge_tests: tuple[str, ...]
@@ -208,6 +212,8 @@ def promotion_from_doc(lines: list[str]) -> NoPromotion | PromoteTo:
     if isinstance(field, FieldAbsent):
         return NoPromotion()
     promote_raw = field.text.split(" — ", 1)[0].replace("`", "")
+    if promote_raw.strip().casefold() == "none":
+        return NoPromotion()
     local: list[Path] = []
     mac: NoMac | MacCheckout = NoMac()
     for item in promote_raw.split(","):
@@ -220,14 +226,12 @@ def promotion_from_doc(lines: list[str]) -> NoPromotion | PromoteTo:
 
 
 def parse_units(lines: list[str]) -> tuple[Unit, ...]:
-    _, rows = unit_rows(lines)
     result: list[Unit] = []
-    for row in rows:
-        cells = [cell.strip() for cell in row.strip().strip("|").split("|")]
-        if len(cells) < 7:
+    for cells in unit_table(lines):
+        if not all(heading in cells for heading in ("Unit", "Plan", "Worktree", "Branch", "Owns")):
             continue
-        plan = Path(cell_value(cells[1]).split(" ", 1)[0])
-        owns_cell = cells[6]
+        plan = Path(cell_value(cells["Plan"]).split(" ", 1)[0])
+        owns_cell = cells["Owns"]
         quoted = cast(list[str], re.findall(r"`([^`]+)`", owns_cell))
         plain = owns_cell.split(" — ", 1)[0]
         if quoted:
@@ -243,8 +247,8 @@ def parse_units(lines: list[str]) -> tuple[Unit, ...]:
             owns = tuple(owned)
         else:
             owns = tuple(part.strip() for part in plain.split(",") if part.strip())
-        result.append(Unit(cell_value(cells[0]), plan,
-                           Path(cell_value(cells[2])).expanduser(), cell_value(cells[3]), owns))
+        result.append(Unit(cell_value(cells["Unit"]), plan,
+                           Path(cell_value(cells["Worktree"])).expanduser(), cell_value(cells["Branch"]), owns))
     return tuple(result)
 
 
@@ -279,23 +283,33 @@ def request_from(args: argparse.Namespace) -> MergeRequest:
     if cast(bool, args.cancel_prior) and isinstance(push, GitPush):
         raise Refusal("--cancel-prior applies only to Push: validate_and_push")
     promotion = promotion_from_doc(lines)
+    # Checked at load, so a bad destination stops the checkpoint before anything is pushed.
+    if isinstance(promotion, PromoteTo):
+        for checkout in promotion.checkouts:
+            if not checkout.is_dir():
+                raise Refusal(f"Promote checkout {checkout} does not exist; name an existing checkout, or none")
     flakes_field = optional_field(lines, "Known flakes")
     flakes: frozenset[str] = frozenset()
     if isinstance(flakes_field, FieldPresent):
         quoted = re.findall(r"`([^`]+)`", flakes_field.text)
         names = quoted if quoted else flakes_field.text.split(" — ", 1)[0].split(",")
         flakes = frozenset(name.strip() for name in names if name.strip())
-    kind: CodeCheckpoint | ShrinkCommit = ShrinkCommit() if cast(bool, args.shrink) else CodeCheckpoint()
+    if cast(bool, args.shrink) and cast(bool, args.as_built):
+        raise Refusal("--shrink and --as-built are separate checkpoints")
+    kind: CodeCheckpoint | ShrinkCommit | AsBuiltCommit = (
+        ShrinkCommit() if cast(bool, args.shrink) else AsBuiltCommit() if cast(bool, args.as_built) else CodeCheckpoint())
     trial = cast(str | None, args.review_trial)
     if isinstance(kind, CodeCheckpoint) and not trial:
         raise Refusal("code checkpoint requires --review-trial")
     review_trial: ReviewTrial | NoReviewTrial = review_numbers(trial) if trial else NoReviewTrial()
+    if isinstance(kind, CodeCheckpoint):
+        check_parallel(cast(str | None, args.parallel))
     delivers = cast(str | None, args.delivers)
     if isinstance(kind, CodeCheckpoint) and (not delivers or not delivers.strip()):
         raise Refusal("code checkpoint requires --delivers")
     if delivers and ("\n" in delivers or "\r" in delivers):
         raise Refusal("--delivers must be one line")
-    if isinstance(kind, ShrinkCommit) and delivers:
+    if not isinstance(kind, CodeCheckpoint) and delivers:
         raise Refusal("--delivers applies only to a code checkpoint")
     scratch = Path(cast(str | None, args.scratch) or os.environ.get("MERGE_CHECKPOINT_SCRATCH")
                    or tempfile.gettempdir()).expanduser()
@@ -311,16 +325,16 @@ def request_from(args: argparse.Namespace) -> MergeRequest:
 def merge_branch_history(checkout: Path, merge_branch: str) -> MergeBranchHistory:
     """Read checkpoint merge subjects on a branch, newest first."""
     output = good(git(checkout, "log", "--first-parent", merge_branch, "--format=%H%x00%s"), "ancestry")
-    pattern = re.compile(r"^Merge (.+?) phase (\S+?)( shrink)? \(([0-9a-f]+)\)")
+    pattern = re.compile(r"^Merge (.+?) phase (\S+?)( shrink| as-built)? \(([0-9a-f]+)\)")
     entries: list[MergeEntry] = []
     for row in output.splitlines():
         merge_hash, separator, subject = row.partition("\x00")
         match = pattern.match(subject) if separator else None
         if match is None:
             continue
-        unit, phase, shrink, short = match.groups()
-        entries.append(MergeEntry(unit, phase, short, merge_branch, merge_hash,
-                                  ShrinkCommit() if shrink else CodeCheckpoint()))
+        unit, phase, docs, short = match.groups()
+        kind = ShrinkCommit() if docs == " shrink" else AsBuiltCommit() if docs == " as-built" else CodeCheckpoint()
+        entries.append(MergeEntry(unit, phase, short, merge_branch, merge_hash, kind))
     return MergeBranchHistory(tuple(entries))
 
 
@@ -338,6 +352,19 @@ def code_merged(request: MergeRequest) -> bool:
     return history.has_code_merge(request.unit.name, request.phase)
 
 
+def on_origin(request: MergeRequest) -> bool:
+    """Fetch the unit branch and say whether it holds the checkpoint."""
+    checkout = request.production.checkout
+    fetched = git(checkout, "fetch", "origin", request.unit.branch)
+    # A branch not pushed yet holds no commit: ls-remote exits 2 when origin lacks the ref.
+    if fetched.returncode and git(checkout, "ls-remote", "--exit-code", "origin",
+                                  f"refs/heads/{request.unit.branch}").returncode == 2:
+        return False
+    _ = good(fetched, "ancestry")
+    return git(checkout, "merge-base", "--is-ancestor", request.commit,
+               f"origin/{request.unit.branch}").returncode == 0
+
+
 def ancestry(request: MergeRequest) -> bool:
     checkout = request.production.checkout
     if git(checkout, "cat-file", "-e", f"{request.commit}^{{commit}}").returncode:
@@ -350,13 +377,12 @@ def ancestry(request: MergeRequest) -> bool:
         if git(checkout, "merge-base", "--is-ancestor", request.commit, request.production.merge_branch).returncode:
             raise Stop("ancestry", "held", "checkpoint drops an earlier merge",
                        "merge the latest unit checkpoint and send a new hash")
-    _ = good(git(checkout, "fetch", "origin", request.unit.branch), "ancestry")
-    if git(checkout, "merge-base", "--is-ancestor", request.commit, f"origin/{request.unit.branch}").returncode:
+    if not on_origin(request):
         raise Stop("ancestry", "held", "commit is not on origin",
                    "push your branch to origin and resend the checkpoint")
     already = git(checkout, "merge-base", "--is-ancestor", request.commit,
                   request.production.merge_branch).returncode == 0
-    if isinstance(request.kind, ShrinkCommit) and not code_merged(request):
+    if not isinstance(request.kind, CodeCheckpoint) and not code_merged(request):
         raise Stop("ancestry", "held", f"phase {request.phase} code checkpoint has not merged",
                    "wait for the phase code checkpoint to merge, then resend the shrink")
     report("ancestry", "ok", "checkpoint exists, follows history, and is on origin" +
@@ -364,9 +390,10 @@ def ancestry(request: MergeRequest) -> bool:
     return already
 
 
-def changed_paths(request: MergeRequest) -> tuple[str, ...]:
+def changed_paths(request: MergeRequest, base: str = "") -> tuple[str, ...]:
+    """The paths the checkpoint changes from `base`, by default the merge branch's tip."""
     output = good(git(request.production.checkout, "diff", "--name-only",
-                      f"{request.production.merge_branch}...{request.commit}"), "scope")
+                      f"{base or request.production.merge_branch}...{request.commit}"), "scope")
     return tuple(line for line in output.splitlines() if line)
 
 
@@ -386,6 +413,13 @@ def scope(request: MergeRequest, paths: tuple[str, ...]) -> None:
         if unexpected or plan not in paths:
             raise Stop("scope", "held", f"shrink paths must be {plan} and optional {next_items}; got {', '.join(paths)}",
                        "commit only the plan doc and its next-items file, then resend the shrink")
+    elif isinstance(request.kind, AsBuiltCommit):
+        plan = request.unit.plan.as_posix()
+        unexpected = [path for path in paths if not path.endswith(".md")]
+        if unexpected or plan not in paths:
+            raise Stop("scope", "held", f"an as-built commit carries only docs and must change or delete {plan}; "
+                       + f"got {', '.join(paths)}",
+                       "commit only the as-built docs and the plan's deletion, then resend the as-built")
     else:
         hubs = hub_paths(request.lines, request.unit.name)
         permitted = (*request.unit.owns, *request.also, *hubs)
@@ -458,7 +492,8 @@ def into(path: Path, branch: str, why: str, unblocks: str) -> None:
 
 
 def merge_subject(request: MergeRequest) -> str:
-    kind = " shrink" if isinstance(request.kind, ShrinkCommit) else ""
+    kind = (" shrink" if isinstance(request.kind, ShrinkCommit) else " as-built" if isinstance(request.kind, AsBuiltCommit)
+            else "")
     return (f"Merge {request.unit.name} phase {request.phase}{kind} "
             f"({request.commit[:7]}) into {request.production.merge_branch}")
 
@@ -485,6 +520,7 @@ def merge(request: MergeRequest) -> str:
     request.scratch.mkdir(parents=True, exist_ok=True)
     message_path = request.scratch / f"merge_{short}.msg"
     message = merge_subject(request) + "\n\n" + ("Phase plan shrink." if isinstance(request.kind, ShrinkCommit)
+                                                  else "Closing as-built docs." if isinstance(request.kind, AsBuiltCommit)
                                                   else request.delivers)
     if request.trailer:
         message += "\n\n" + "\n".join(request.trailer)
@@ -548,8 +584,8 @@ def undo_unpushed_merge(request: MergeRequest, merge_head: str) -> None:
 
 
 def tests(request: MergeRequest, paths: tuple[str, ...], merge_head: str) -> str:
-    if isinstance(request.kind, ShrinkCommit):
-        report("test", "ok", "shrink has no package tests")
+    if not isinstance(request.kind, CodeCheckpoint):
+        report("test", "ok", f"{'shrink' if isinstance(request.kind, ShrinkCommit) else 'as-built'} has no package tests")
         return "no tests"
     steps, log = test_steps(request, paths)
     failed: list[tuple[str, list[str]]] = []
@@ -716,13 +752,26 @@ def promote(request: MergeRequest, tip: str) -> None:
 
 
 def review_numbers(line: str) -> ReviewTrial:
-    pattern = (r"review trial: ux (\d+) findings, code (\d+) findings, review-seat minutes ([\d.]+), "
+    pattern = (r"review trial: ux (\d+) findings, code (\d+) findings, review-worker minutes ([\d.]+), "
                r"ux check minutes ([\d.]+), ux repair minutes ([\d.]+)")
     match = re.fullmatch(pattern, line.strip())
     if match is None:
         raise Refusal("--review-trial must read: review trial: ux <N> findings, code <N> findings, "
-                      + "review-seat minutes <M>, ux check minutes <U>, ux repair minutes <R>")
+                      + "review-worker minutes <M>, ux check minutes <U>, ux repair minutes <R>")
     return ReviewTrial(*match.groups())
+
+
+def check_parallel(line: str | None) -> None:
+    """Refuse a code checkpoint whose notice lacks a usable `Parallel:` line."""
+    if not line:
+        raise Refusal("code checkpoint requires --parallel: the notice's line from phase_table.py parallel")
+    text = line.strip()
+    if text.startswith("Parallel: unknown"):
+        raise Refusal("--parallel is unknown: the unit adds a **Depends on:** line under each waiting phase "
+                      + "heading of its plan, reruns phase_table.py parallel and resends the notice")
+    if re.fullmatch(r"Parallel: (Phase \S+(, Phase \S+)* could start|none — .+)", text) is None:
+        raise Refusal("--parallel must read: Parallel: Phase <N>[, Phase <M>] could start, "
+                      + "or Parallel: none — <what the next phase waits on>")
 
 
 def record(request: MergeRequest, merge_head: str, tests_green: str) -> None:
@@ -738,8 +787,8 @@ def record(request: MergeRequest, merge_head: str, tests_green: str) -> None:
         script = tool("review_regime.py", Path.home() / ".claude/scripts/production/review_regime.py",
                       "MERGE_CHECKPOINT_REVIEW_REGIME")
         review_command = [script] if os.access(script, os.X_OK) else [sys.executable, script]
-        command = [*review_command, "add", "--unit", request.unit.name, "--phase", request.phase,
-                   "--regime", request.regime, "--started", request.started, "--merged", merged,
+        command = [*review_command, "add", "--unit", request.unit.name, "--plan", request.unit.plan.as_posix(),
+                   "--phase", request.phase, "--regime", request.regime, "--started", request.started, "--merged", merged,
                    "--holds", str(request.holds), "--merge-defects", str(request.merge_defects),
                    "--ux-findings", numbers.ux_findings, "--code-findings", numbers.code_findings,
                    "--review-minutes", numbers.review_minutes, "--ux-check-minutes", numbers.ux_check_minutes,
@@ -756,32 +805,37 @@ def record(request: MergeRequest, merge_head: str, tests_green: str) -> None:
         _ = log.write(f"- {datetime.now(request.production.zone):%H:%M %Z}: {request.unit.name} phase {request.phase} "
                       + f"({request.commit}) merged as {merge_head}; {tests_green} green; pushed{suffix}\n")
     report("record", "ok", "review ledger and production log updated" if isinstance(request.kind, CodeCheckpoint)
-           else "shrink logged without review-ledger row")
+           else f"{'shrink' if isinstance(request.kind, ShrinkCommit) else 'as-built'} logged without review-ledger row")
 
 
 def run(request: MergeRequest) -> int:
     try:
         already = ancestry(request)
-        paths: tuple[str, ...] = ()
-        tests_green = "no tests" if isinstance(request.kind, ShrinkCommit) else "merge tests"
+        tests_green = "merge tests" if isinstance(request.kind, CodeCheckpoint) else "no tests"
+        pushed = pushed_state(request) if already else NotYetPushed()
         if not already:
             paths = changed_paths(request)
             scope(request, paths)
             conflicts(request)
             other_units(request, paths)
             merge_head = merge(request)
+        else:
+            merge_head = merged_checkpoint(request)
+            # A run killed between its merge and its push left a merge nothing has tested.
+            steps = ("scope", "conflicts", "other units", "merge")
+            if isinstance(pushed, PushedTip):
+                steps += ("test", "red")
+            for step in steps:
+                report(step, "ok", "checkpoint already merged; resuming promotion")
+            paths = changed_paths(request, f"{merge_head}^1")
+        if isinstance(pushed, NotYetPushed):
             try:
                 tests_green = tests(request, paths, merge_head)
             except (OSError, ValueError) as error:
                 undo_unpushed_merge(request, merge_head)
                 raise Stop("red", "failed", str(error),
                            "repair the test logging failure and send a new checkpoint") from error
-        else:
-            merge_head = merged_checkpoint(request)
-            for step in ("scope", "conflicts", "other units", "merge", "test", "red"):
-                report(step, "ok", "checkpoint already merged; resuming promotion")
-        first_code_merge = not already and isinstance(request.kind, CodeCheckpoint)
-        pushed = pushed_state(request) if already else NotYetPushed()
+        first_code_merge = isinstance(pushed, NotYetPushed) and isinstance(request.kind, CodeCheckpoint)
         if isinstance(pushed, PushedTip):
             tip = pushed.tip
             report("push", "ok", f"{request.production.merge_branch} already pushed at {tip}")
@@ -813,8 +867,10 @@ def main() -> int:
     _ = parser.add_argument("hash")
     _ = parser.add_argument("--also", action="append", default=[])
     _ = parser.add_argument("--shrink", action="store_true")
+    _ = parser.add_argument("--as-built", action="store_true")
     _ = parser.add_argument("--trailer", action="append", default=[])
     _ = parser.add_argument("--review-trial")
+    _ = parser.add_argument("--parallel")
     _ = parser.add_argument("--delivers")
     _ = parser.add_argument("--cancel-prior", action="store_true")
     _ = parser.add_argument("--started", required=True)

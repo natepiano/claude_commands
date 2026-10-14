@@ -14,6 +14,7 @@ from contextlib import closing
 from datetime import datetime
 from pathlib import Path
 from typing import cast, override
+from unittest import mock
 
 import index
 import parse
@@ -26,9 +27,16 @@ _TEST_LOG = tempfile.TemporaryDirectory(prefix="buildlog-tests-")
 _TEST_ROOT = Path(_TEST_LOG.name) / "buildlog"
 
 
+COORDINATION_VARIABLES = (
+    "BUILD_HOLD_DIR", "BUILD_HOLD_RELEASE_DIR", "PLAN_DELEGATE_ACTIVE_DIR",
+    "MAC_TEST_STATE_DIR", "NOTIFIER_SESSIONS_DIR",
+)
+
+
 def use_test_log() -> None:
     os.environ["BUILDLOG_DIR"] = str(_TEST_ROOT)
     os.environ["BUILDLOG_TRANSCRIPTS"] = str(Path(_TEST_LOG.name) / "transcripts")
+    os.environ.update({name: str(_TEST_ROOT / name) for name in COORDINATION_VARIABLES})
 
 
 use_test_log()
@@ -157,6 +165,7 @@ def point_root_at(test: unittest.TestCase, root: Path) -> None:
     """Override the suite's temporary log root for this test only."""
     previous = os.environ.get("BUILDLOG_DIR")
     os.environ["BUILDLOG_DIR"] = str(root)
+    _ = cast(object, test.enterContext(mock.patch.dict(os.environ, {name: str(root / name) for name in COORDINATION_VARIABLES})))
 
     def restore() -> None:
         if previous is None:
@@ -216,6 +225,21 @@ class IndexTests(unittest.TestCase):
 
     def ids(self) -> list[object]:
         return [row[0] for row in self.rows("SELECT id FROM steps ORDER BY id")]
+
+    def test_first_index_read_migrates_worker_fields_and_preserves_incomplete_appends(self) -> None:
+        partial = encode(step("pending", worker="next"))[:20]
+        self.write(self.host_file, step("old-step", seat="impl"), call("old-call", seat="test"))
+        with self.host_file.open("ab") as output:
+            _ = output.write(partial)
+        self.assertEqual(index.update(), 2)
+        self.assertEqual(self.rows("SELECT worker FROM steps"), [("impl",)])
+        self.assertEqual(self.rows("SELECT worker FROM calls"), [("test",)])
+        rewritten = self.host_file.read_bytes()
+        self.assertNotIn(b'"seat"', rewritten)
+        self.assertTrue(rewritten.endswith(partial))
+        modified = self.host_file.stat().st_mtime_ns
+        self.assertEqual(index.update(), 0)
+        self.assertEqual(self.host_file.stat().st_mtime_ns, modified)
 
     def test_reads_only_new_complete_lines(self) -> None:
         first, second, third = (encode(step(f"s{number}")) for number in range(3))
@@ -331,6 +355,36 @@ class IndexTests(unittest.TestCase):
         self.assertIn("mem_stall_some_s", result.stdout)
         self.assertIn("mem_stall_full_s", result.stdout)
 
+    def test_sample_power_profile_indexes_without_backfilling_old_lines(self) -> None:
+        path = self.root / "natedev" / "samples-2026-10.jsonl"
+        since = "2026-10-02T12:00:30.000Z"
+        records = (sample(STAMP), sample("2026-10-02T12:01:00.000Z",
+                                         power_profile="performance", power_profile_since=since))
+        self.write(path, *records)
+        original = path.read_bytes()
+        self.assertEqual(index.update(), 2)
+        self.assertEqual(
+            self.rows("SELECT power_profile, power_profile_since FROM samples ORDER BY at"),
+            [(None, None), ("performance", since)],
+        )
+        self.assertEqual(path.read_bytes(), original)
+        self.assertEqual(index.SAMPLE_COLUMNS[-2:], [
+            ("power_profile", "TEXT", "power-profiles-daemon profile; NULL when not recorded"),
+            ("power_profile_since", "TEXT", "UTC ISO mtime of the daemon's state file: when the profile was set"),
+        ])
+
+    def test_schema_fourteen_rebuilds_sample_profiles_from_json_lines(self) -> None:
+        path = self.root / "natedev" / "samples-2026-10.jsonl"
+        self.write(path, sample(STAMP, power_profile="power-saver", power_profile_since=STAMP))
+        _ = index.update()
+        with closing(sqlite3.connect(index.index_path())) as connection:
+            _ = connection.execute("PRAGMA user_version = 14")
+            _ = connection.execute("UPDATE samples SET power_profile = NULL, power_profile_since = NULL")
+            connection.commit()
+        self.assertEqual(index.update(), 1)
+        self.assertEqual(self.rows("PRAGMA user_version"), [(16,)])
+        self.assertEqual(self.rows("SELECT power_profile, power_profile_since FROM samples"), [("power-saver", STAMP)])
+
     def test_reindex_reads_everything_again(self) -> None:
         self.write(self.host_file, step("s0"), step("s1"), call("c0"))
         self.assertEqual(index.update(), 3)
@@ -408,6 +462,43 @@ class IndexTests(unittest.TestCase):
         self.assertEqual(runs, [(1, 1, 2, 600.0), (1, 2, 1, 600.0)])
         self.assertEqual(len(self.rows("SELECT * FROM ci_steps")), 3)
 
+    def test_verify_mac_no_test_status_stays_raw_without_counting_as_failure(self) -> None:
+        mac_file = self.root / "Mac" / "2026-10.jsonl"
+        self.write(
+            mac_file,
+            step("no-test", host="Mac", caller="verify-mac", step="nextest", status=4),
+            step("test-failure", host="Mac", caller="verify-mac", step="nextest", status=42),
+            step("test-pass", host="Mac", caller="verify-mac", step="nextest", status=0),
+        )
+        self.assertEqual(index.update(), 3)
+
+        self.assertGreater(index.SCHEMA_VERSION, 10)
+        self.assertEqual(
+            self.rows("SELECT id, status FROM steps ORDER BY id"),
+            [("no-test", 4), ("test-failure", 42), ("test-pass", 0)],
+        )
+        self.assertEqual(
+            self.rows("SELECT runs, failed FROM step_days WHERE caller = 'verify-mac'"),
+            [(3, 1)],
+        )
+        self.assertEqual(
+            self.rows("SELECT id, status FROM failures ORDER BY id"),
+            [("test-failure", 42)],
+        )
+
+    def test_verify_mac_status_four_without_step_counts_as_failure(self) -> None:
+        self.write(self.host_file, step("missing-step", caller="verify-mac", step=None, status=4))
+        self.assertEqual(index.update(), 1)
+
+        self.assertEqual(
+            self.rows("SELECT step, runs, failed FROM step_days WHERE caller = 'verify-mac'"),
+            [(None, 1, 1)],
+        )
+        self.assertEqual(
+            self.rows("SELECT id, status FROM failures"),
+            [("missing-step", 4)],
+        )
+
     def test_ci_jobs_distinguish_rerun_from_carried_over_and_exclude_carried_time(self) -> None:
         original = ("2026-10-02T12:00:00Z", "2026-10-02T12:00:30Z", "2026-10-02T12:02:30Z")
         carried = ("2026-10-03T12:20:00Z", original[1], original[2])
@@ -466,7 +557,88 @@ class IndexTests(unittest.TestCase):
             self.rows("SELECT id, token_wait_s FROM calls ORDER BY id"),
             [("new", 13), ("old", 0)],
         )
-        self.assertEqual(index.SCHEMA_VERSION, 9)
+
+    def test_offload_call_fields_reach_index_and_old_records_read_as_null(self) -> None:
+        self.write(
+            self.host_file,
+            call("old"),
+            call(
+                "offloaded",
+                mac="declined",
+                mac_reason="no_tests",
+                local_reason="needs Linux filesystem semantics",
+                mac_s=12.5,
+            ),
+        )
+
+        _ = index.update()
+
+        self.assertEqual(
+            self.rows(
+                "SELECT id, mac, mac_reason, local_reason, mac_s FROM calls ORDER BY id"
+            ),
+            [
+                (
+                    "offloaded",
+                    "declined",
+                    "no_tests",
+                    "needs Linux filesystem semantics",
+                    12.5,
+                ),
+                ("old", None, None, None, None),
+            ],
+        )
+        self.assertEqual(index.SCHEMA_VERSION, 16)
+
+    def test_schema_thirteen_rebuilds_call_fields_from_json_lines(self) -> None:
+        self.write(self.host_file, call("recorded", target="mac", hold_wait_s=0.4))
+        _ = index.update()
+        with closing(sqlite3.connect(index.index_path())) as connection:
+            _ = connection.execute("PRAGMA user_version = 13")
+            _ = connection.execute("UPDATE calls SET target = 'natedev', hold_wait_s = 99")
+            connection.commit()
+        self.assertEqual(index.update(), 1)
+        self.assertEqual(self.rows("PRAGMA user_version"), [(index.SCHEMA_VERSION,)])
+        self.assertEqual(self.rows("SELECT target, hold_wait_s FROM calls"), [("mac", 0.4)])
+
+    def test_old_calls_have_null_target_and_hold_wait_but_new_empty_target_is_preserved(self) -> None:
+        self.write(self.host_file, call("old"), call("empty", target="", hold_wait_s=0))
+        _ = index.update()
+        self.assertEqual(
+            self.rows("SELECT id, target, hold_wait_s FROM calls ORDER BY id"),
+            [("empty", "", 0.0), ("old", None, None)],
+        )
+
+    def test_steps_call_index_is_built_and_used(self) -> None:
+        self.write(self.host_file, step("step", call_id="call"))
+        _ = index.update()
+        self.assertEqual(self.rows("PRAGMA index_info(steps_call)"), [(0, 23, "call_id")])
+        self.assertIn("steps_call", str(self.rows("EXPLAIN QUERY PLAN SELECT id FROM steps WHERE call_id = ?", "call")))
+
+    def test_mac_holder_and_hold_event_schema_keep_source_and_identity_indexes(self) -> None:
+        self.write(self.host_file, call("busy", mac="declined", mac_reason="busy", mac_holder="hana nextest"), call("old"))
+        _ = index.update()
+        self.assertEqual(self.rows("SELECT id, mac_holder FROM calls ORDER BY id"), [("busy", "hana nextest"), ("old", None)])
+        self.assertEqual([row[2] for row in self.rows("PRAGMA index_info(hold_events_key_at)")],
+                         ["host", "target", "hold_key", "at", "event"])
+        self.assertEqual([row[2] for row in self.rows("PRAGMA index_info(hold_events_target_at)")], ["target", "at"])
+        self.assertEqual([row[2] for row in self.rows("PRAGMA index_info(hold_events_src)")], ["src"])
+        result = subprocess.run([sys.executable, str(CLI), "schema"], capture_output=True, text=True, check=False)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("TABLE hold_events", result.stdout)
+        self.assertIn("one row per began or ended event", result.stdout)
+        self.assertIn("no row proves a hold is in force now", result.stdout)
+
+    def test_schema_describes_target_and_hold_wait(self) -> None:
+        result = subprocess.run(
+            [sys.executable, str(CLI), "schema"], capture_output=True, text=True, check=False, timeout=60,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertRegex(result.stdout, r"target\s+TEXT\s+where the call was when it ended: mac, natedev, or empty")
+        self.assertRegex(
+            result.stdout,
+            r"hold_wait_s\s+REAL\s+seconds waited on a held target, each declined Mac retry included; memory waits are not counted",
+        )
 
     def test_ci_skipped_and_zero_queue_jobs_have_distinct_states(self) -> None:
         same_stamp = "2026-10-02T12:00:00Z"

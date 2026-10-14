@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+"""After Claude edits a Python file, type check it with basedpyright and report the result."""
 
 import json
 import os

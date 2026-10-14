@@ -8,7 +8,6 @@ import hashlib
 import json
 import os
 import re
-import shlex
 import subprocess
 import sys
 import time
@@ -17,15 +16,16 @@ from pathlib import Path
 from typing import NamedTuple, TypedDict, cast
 from zoneinfo import ZoneInfo
 
+import add_unit
 import showrunners
-from add_unit import cell_value
+import unit_lookup
+from session_pane import HerdrFailure, read_place
 
 STATE_DIR = Path(os.environ.get("STALL_WATCH_STATE_DIR") or Path.home() / ".local/state/stall-watch")
 SESSIONS_DIR = Path(os.environ.get("NOTIFIER_SESSIONS_DIR") or Path.home() / ".claude/sessions")
 PROJECTS_DIR = Path(os.environ.get("STALL_WATCH_PROJECTS_DIR") or Path.home() / ".claude/projects")
 SESSIONS = Path(os.environ.get("STALL_WATCH_SESSIONS") or Path(__file__).resolve().parent.parent / "message/sessions.py")
 SEND = Path(os.environ.get("STALL_WATCH_SEND") or Path(__file__).resolve().parent.parent / "message/send.py")
-TMUX = os.environ.get("STALL_WATCH_TMUX") or "tmux"
 PS = os.environ.get("STALL_WATCH_PS") or "ps"
 WAITING_KINDS = ("done", "blocked", "gate", "decision")
 HOLDING_KIND = "holding"
@@ -51,6 +51,9 @@ class Delivery(NamedTuple):
     state_path: Path
     kind: str
     command: list[str]
+
+
+
 
 
 def command_output(command: list[str]) -> str:
@@ -82,21 +85,41 @@ def descendants(root: int, rows: list[Process]) -> list[Process]:
     return found
 
 
-def claude_pid(pane_pid: int, rows: list[Process]) -> int | None:
-    pane = next((row for row in rows if row.pid == pane_pid), None)
-    candidates = ([pane] if pane is not None else []) + descendants(pane_pid, rows)
-    return next((row.pid for row in candidates
-                 if row.command == "claude" or row.command.startswith("claude ")), None)
+def unit_marks(pid: int) -> tuple[str, str] | None:
+    """The production and unit a process's environment marks it with, inherited from its unit's session."""
+    try:
+        environment = Path(f"/proc/{pid}/environ").read_bytes().split(b"\0")
+    except OSError:
+        return None
+    values = dict(item.decode(errors="replace").split("=", 1) for item in environment if b"=" in item)
+    slug, unit = values.get(unit_lookup.PRODUCTION_MARK, ""), values.get(unit_lookup.UNIT_MARK, "")
+    return (slug, unit) if slug and unit else None
 
 
-def work_running(pid: int, rows: list[Process]) -> bool:
+def work_running(pid: int, rows: list[Process], marks: tuple[str, str] | None = None) -> bool:
+    """A shell or launcher under the unit's Claude, or any process the unit started that left its tree.
+
+    A process carrying the unit's marks counts wherever it sits, except the Claude, the pane around
+    it, and the long-lived helpers the Claude starts itself (its MCP servers).
+    """
     for row in descendants(pid, rows):
         if row.command.endswith(" <defunct>"):
             continue
         word = row.command.split(" ", 1)[0]
         if Path(word).name in WORK:
             return True
-    return False
+    if marks is None:
+        return False
+    parents = {row.pid: row.parent for row in rows}
+    ancestors: set[int] = set()
+    current = pid
+    while current in parents and current not in ancestors:
+        ancestors.add(current)
+        current = parents[current]
+    helpers = {row.pid for row in rows if row.parent == pid}
+    helpers.update(child.pid for helper in tuple(helpers) for child in descendants(helper, rows))
+    return any(row.pid not in ancestors and row.pid not in helpers and not row.command.endswith(" <defunct>")
+               and unit_marks(row.pid) == marks for row in rows)
 
 
 def latest_transcript_activity(session_id: str) -> float:
@@ -110,64 +133,9 @@ def latest_transcript_activity(session_id: str) -> float:
     return latest
 
 
-def unit_socket(pid: int) -> tuple[str, str] | None:
-    try:
-        session_id = command_output([sys.executable, str(SESSIONS), "id", str(pid)])
-        record = cast(dict[str, object], json.loads((SESSIONS_DIR / f"{pid}.json").read_text(encoding="utf-8")))
-        socket = record.get("messagingSocketPath")
-        if session_id and isinstance(socket, str) and socket:
-            return session_id, socket
-    except (OSError, ValueError, TypeError):
-        pass
-    return None
-
-
 def stretch_path(slug: str, unit: str) -> Path:
     name = hashlib.sha256(f"{slug}\0{unit}".encode()).hexdigest()
     return STATE_DIR / f"{name}.json"
-
-
-def finished_run_units(runner: showrunners.RunningShowrunner) -> set[str]:
-    """Read the production doc named by this notifier's check command."""
-    try:
-        conf = (showrunners.NOTIFIER_STATE_DIR / f"showrunner-{runner.slug}" / "conf").read_text(encoding="utf-8")
-        check = next(line.partition("=")[2] for line in conf.splitlines() if line.startswith("CHECK="))
-        command = shlex.split(check)
-        check_index = next(index for index, token in enumerate(command)
-                           if Path(token).name == "production_check.sh")
-        doc = Path(command[check_index + 1])
-        if not doc.is_absolute():
-            return set()
-        lines = doc.read_text(encoding="utf-8").splitlines()
-    except (OSError, ValueError, IndexError, StopIteration):
-        return set()
-
-    finished: set[str] = set()
-    in_units = False
-    for line in lines:
-        if line.strip() == "## Units":
-            in_units = True
-        elif in_units and line.startswith("## "):
-            break
-        elif in_units:
-            cells = line.split("|")
-            if len(cells) >= 4 and not cells[0].strip() and re.search(r"\brun done\b", cells[2]):
-                finished.add(cells[1].strip())
-                if len(cells) >= 6:
-                    finished.add(cell_value(cells[5]))
-    return finished
-
-
-def rename_state(old: str, new: str, runner_before: str, runner_after: str,
-                 units: list[str]) -> None:
-    """Move saved stretches while the registry rename is locked."""
-    STATE_DIR.mkdir(parents=True, exist_ok=True)
-    for unit in units:
-        previous_unit = old if unit == new else unit
-        source = stretch_path(runner_before, previous_unit)
-        destination = stretch_path(runner_after, unit)
-        if source != destination and source.exists():
-            os.replace(source, destination)
 
 
 def read_stretch(path: Path, pane_hash: str, now: float) -> Stretch:
@@ -187,13 +155,6 @@ def save_stretch(path: Path, stretch: Stretch) -> None:
     temporary = path.with_suffix(f".{os.getpid()}.tmp")
     _ = temporary.write_text(json.dumps(stretch) + "\n", encoding="utf-8")
     os.replace(temporary, path)
-
-
-def socket_for_target(target: str) -> str | None:
-    try:
-        return command_output([sys.executable, str(SESSIONS), "socket", target]) or None
-    except OSError:
-        return None
 
 
 def delivery(path: Path, kind: str, socket: str, key: str, text: str) -> Delivery:
@@ -234,67 +195,52 @@ def tick(now: float) -> None:
     settings = showrunners.load_settings()
     rows = processes()
     pending: list[Delivery] = []
-    running = showrunners.running_showrunners()
-    sockets = {configured["session"]: socket_for_target(configured["session"])
-               for configured in settings["showrunners"]}
-    configured_sockets = set(sockets.values())
-    missing = [runner for runner in running if runner.socket not in configured_sockets]
-    runners_by_socket = {runner.socket: runner for runner in running}
-    missing_slugs = {runner.slug for runner in missing}
-    for path in STATE_DIR.glob("missing-*.json"):
-        if path.stem.removeprefix("missing-") not in missing_slugs:
-            path.unlink()
-    faults_socket = socket_for_target(settings["faults_to"])
-    for runner in missing:
-        path = STATE_DIR / f"missing-{runner.slug}.json"
-        stretch = read_stretch(path, runner.socket, now)
-        save_stretch(path, stretch)
-        if not stretch["tell_sent"] and faults_socket:
-            if isinstance(runner.prompt, showrunners.PromptUnits):
-                args = shlex.join(["add", runner.session, "--zone", runner.prompt.zone,
-                                   *(arg for unit in runner.prompt.unit_sessions for arg in ("--unit", unit))])
-                prompt_note = ""
-            else:
-                args = f"add {shlex.quote(runner.session)} --zone <zone> --unit <tmux session>"
-                prompt_note = f" The prompt gave no zone or units because {runner.prompt.reason}."
-            add = "$HOME/.claude/scripts/lib/py $HOME/.claude/scripts/production/showrunners.py " + args
-            message = (f"stall-watch: showrunner {runner.slug} (session {runner.session}) is running but "
-                       "missing from config/showrunners.json, so its units are not watched. "
-                       f"It should run: {add}.{prompt_note}")
-            pending.append(delivery(path, "missing", faults_socket,
-                                    f"stall-watch:missing:{runner.slug}:{int(stretch['since'])}", message))
-    for configured in settings["showrunners"]:
-        showrunner_socket = sockets[configured["session"]]
-        if showrunner_socket is None:
+    for configured in showrunners.registered_showrunners():
+        # A showrunner that is not running has no one to tell: its units are not watched.
+        showrunner_socket = configured["socket"]
+        if not showrunner_socket:
             continue
-        runner = runners_by_socket.get(showrunner_socket)
-        finished: set[str] = finished_run_units(runner) if runner is not None else set()
         try:
             zone = ZoneInfo(configured["zone"])
         except (KeyError, ValueError):
-            print(f"stall-watch: invalid zone for {configured['session']}: {configured['zone']}", file=sys.stderr)
+            print(f"stall-watch: invalid zone for {configured['slug']}: {configured['zone']}", file=sys.stderr)
             continue
-        for unit in configured["units"]:
-            if isinstance(unit, showrunners.StandbyUnit) or unit.name in finished:
-                stretch_path(configured["session"], unit.name).unlink(missing_ok=True)
+        # The units are the doc's live rows; each is found by the mark on its tmux session.
+        try:
+            slug = showrunners.production_slug(configured["doc"])
+            lines = Path(configured["doc"]).read_text(encoding="utf-8").splitlines()
+            live = {add_unit.cell_value(cells.get("Unit", "")): add_unit.cell_value(cells.get("Worktree", ""))
+                    for cells in add_unit.live_unit_table(lines, slug)}
+            marked = unit_lookup.marked_units(slug)
+        except (OSError, UnicodeError, ValueError, add_unit.Refusal) as error:
+            print(f"stall-watch: {configured['slug']}: its units are not watched: {error}", file=sys.stderr)
+            continue
+        for name, unit in marked.items():
+            # The review unit waits for a review merge by design, so idle is its normal state.
+            if add_unit.is_review_unit(name, lines):
+                stretch_path(slug, name).unlink(missing_ok=True)
                 continue
-            name = unit.name
-            if subprocess.run([TMUX, "has-session", "-t", f"={name}"], capture_output=True, check=False).returncode != 0:
+            # A unit is watched while the newest /unit:direct run in its worktree is unfinished.
+            try:
+                running = name in live and unit_lookup.run_state(Path(live[name])) is unit_lookup.UnitState.RUNNING
+            except (OSError, UnicodeError) as error:
+                print(f"stall-watch: {name}: its run state is unknown: {error}", file=sys.stderr)
+                continue
+            if not running:
+                stretch_path(slug, name).unlink(missing_ok=True)
+                continue
+            claude = unit.claude
+            if not isinstance(claude, unit_lookup.LiveClaude):
+                if isinstance(claude, unit_lookup.ClaudeUnknown):
+                    print(f"stall-watch: {name}: {claude.reason}", file=sys.stderr)
                 continue
             try:
-                pane_pid = int(command_output([TMUX, "display-message", "-p", "-t", f"={name}:", "#{pane_pid}"]))
-                pane = command_output([TMUX, "capture-pane", "-p", "-J", "-S", "-400", "-t", f"={name}:"])
-            except (OSError, ValueError) as error:
+                pane = read_place(unit.place, 400, joined=True).strip()
+            except (OSError, HerdrFailure) as error:
                 print(f"stall-watch: {name}: {error}", file=sys.stderr)
                 continue
-            pid = claude_pid(pane_pid, rows)
-            if pid is None:
-                continue
-            identity = unit_socket(pid)
-            if identity is None:
-                continue
-            session_id, socket = identity
-            path = stretch_path(configured["session"], name)
+            pid, session_id, socket = claude.pid, claude.session_id, claude.socket
+            path = stretch_path(slug, name)
             stretch = read_stretch(path, hashlib.sha256(pane.encode()).hexdigest(), now)
             turns = list(TURN_END.finditer(pane))
             last = turns[-1].group(0).strip() if turns else "none on screen"
@@ -303,7 +249,7 @@ def tick(now: float) -> None:
                                   bump_sent=False, tell_sent=False, reported_status="")
                 save_stretch(path, stretch)
                 continue
-            running_work = work_running(pid, rows)
+            running_work = work_running(pid, rows, (slug, unit.unit))
             if running_work or (stretch["reported_status"] and last != stretch["reported_status"]):
                 stretch = Stretch(pane_hash=hashlib.sha256(pane.encode()).hexdigest(), since=now,
                                   bump_sent=False, tell_sent=False, reported_status="")
@@ -341,9 +287,6 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    if len(sys.argv) >= 6 and sys.argv[1] == "rename-state":
-        rename_state(sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5], sys.argv[6:])
-        raise SystemExit(0)
     try:
         raise SystemExit(main())
     except (OSError, ValueError, KeyError) as error:

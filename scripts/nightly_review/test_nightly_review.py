@@ -1,199 +1,250 @@
-"""Launch, quota gate and morning offer of the nightly review."""
+"""The nightly review: its night's job reaches the permanent unit, and its message counts."""
 
 from __future__ import annotations
 
+import json
 import os
 import shutil
 import subprocess
+import sys
 import tempfile
 import unittest
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
-from typing import override
+from typing import TYPE_CHECKING, cast, override
 from unittest import mock
 
 import nightly_review
+import account
+from scripts.accounts import accounts
+from scripts.production import showrunners
+# `messages` reads the message review from its own folder, as the timer does.
+sys.path.insert(0, str(Path(nightly_review.__file__).resolve().parents[1] / "notify"))
+if TYPE_CHECKING:
+    from scripts.notify import review
+    from scripts.production.unit_lookup import LiveClaude
+else:
+    import review
+    from unit_lookup import LiveClaude
 
-REAL_TMUX = nightly_review.tmux
 NIGHT = date(2026, 9, 29)
-MORNING = datetime(2026, 9, 29, 7, 30)
+SESSION = "nightly-review"
+DOC = Path("/work/docs/plans/build-followups-production.md")
+UNIT = LiveClaude("nightly-review", "aaaaaaaa-0000-0000-0000-000000000001", "/run/cc-socks/42.sock", 42)
+PRODUCTION = nightly_review.NightlyProduction(DOC, "build-followups")
 
 
-class FakeNote:
-    def __init__(self, stem: str, fields: dict[str, str]) -> None:
-        self.path: Path = Path(f"/vault/agents/{stem}.md")
-        self.tool: str = stem.split()[0]
-        self.fields: dict[str, str] = fields
-
-    def get(self, key: str) -> str | None:
-        return self.fields.get(key)
+def setUpModule() -> None:
+    """The times these tests expect are Pacific; neither the user's zone setting nor a showrunner
+    registered on the machine running them may change them."""
+    unittest.enterModuleContext(mock.patch.dict(os.environ, {"USER_ZONE": "America/Los_Angeles"}))
+    no_showrunners = unittest.enterModuleContext(tempfile.TemporaryDirectory())
+    _ = unittest.enterModuleContext(mock.patch.object(showrunners, "NOTIFIER_STATE_DIR", Path(no_showrunners)))
 
 
-def done(stdout: str = "", code: int = 0) -> subprocess.CompletedProcess[str]:
-    return subprocess.CompletedProcess([], code, stdout, "")
+def done(stdout: str = "", code: int = 0, stderr: str = "") -> subprocess.CompletedProcess[str]:
+    return subprocess.CompletedProcess([], code, stdout, stderr)
 
 
 class NightlyReviewTests(unittest.TestCase):
     def __init__(self, methodName: str = "runTest") -> None:
         super().__init__(methodName)
         self.root: Path = Path()
-        self.live: set[str] = set()
-        self.attached: set[str] = set()
-        self.foreign: set[str] = set()
-        self.calls: list[list[str]] = []
 
     @override
     def setUp(self) -> None:
         directory = tempfile.TemporaryDirectory()
         self.addCleanup(directory.cleanup)
         self.root = Path(directory.name)
-        for name, value in (("ROOT", self.root), ("tmux", self.tmux)):
-            patcher = mock.patch.object(nightly_review, name, value)
-            _ = patcher.start()
-            self.addCleanup(patcher.stop)
+        home = self.root / "home"
+        (home / ".claude").mkdir(parents=True)
+        environment_context: object = cast(object, self.enterContext(mock.patch.dict(os.environ, {"HOME": str(home)})))
+        del environment_context
+        _ = self.enterContext(mock.patch.object(nightly_review, "ROOT", self.root / "nights"))
 
-    def tmux(self, *args: str) -> subprocess.CompletedProcess[str]:
-        verb, name = args[0], args[-1].removeprefix("=").removesuffix(":")
-        if verb == "has-session":
-            return done(code=0 if name in self.live else 1)
-        if verb == "list-clients":
-            return done("/dev/pts/3: nightly-config\n" if name in self.attached else "")
-        if verb == "list-panes":
-            mode = name.removeprefix("nightly-")
-            return done("zsh -ic \"claude --resume x\"\n" if name in self.foreign else f"zsh -ic \"claude '/nightly_review {mode}'\"\n")
-        self.live.discard(name)
-        return done()
-
-    def launched(self, notes: list[FakeNote]) -> list[str]:
-        def run(command: list[str], **_: object) -> subprocess.CompletedProcess[str]:
-            self.calls.append(command)
-            return done()
-
-        with mock.patch("agent_notes.read_notes", return_value=notes), mock.patch("subprocess.run", run):
-            return nightly_review.launch(NIGHT)
-
-    def night(self, log: str) -> Path:
-        directory = self.root / NIGHT.isoformat()
-        directory.mkdir()
-        _ = (directory / "launch.log").write_text(log)
-        return directory
-
-    def test_launch_starts_both_agents_with_the_prompt_last(self) -> None:
-        self.assertEqual(self.launched([]), ["nightly-config: started", "nightly-rust: started"])
-        command = self.calls[0]
-        self.assertEqual(command[command.index("-s") + 1], "nightly-config")
-        self.assertEqual(command[command.index("-c") + 1], "/etc/nixos")
-        self.assertTrue(command[-1].endswith("'/nightly_review config'; exec zsh"))
-        self.assertTrue((self.root / NIGHT.isoformat() / "launch.log").read_text().startswith("nightly-config: started"))
-
-    def test_last_night_is_replaced_unless_the_user_is_attached(self) -> None:
-        self.live = {"nightly-config", "nightly-rust"}
-        self.attached = {"nightly-rust"}
-        lines = self.launched([])
-        self.assertEqual(lines[0], "nightly-config: started")
-        self.assertIn("left running", lines[1])
-        self.assertEqual(len(self.calls), 1)
-
-    def test_a_session_no_review_started_is_left_running(self) -> None:
-        self.live = {"nightly-config", "nightly-rust"}
-        self.foreign = {"nightly-config"}
-        lines = self.launched([])
-        self.assertIn("another session holds this name", lines[0])
-        self.assertIn("nightly-config", self.live)
-        self.assertEqual(lines[1], "nightly-rust: started")
-        self.assertEqual(len(self.calls), 1)
-
-    def test_low_quota_skips_the_night(self) -> None:
-        resets = (datetime.now() + timedelta(days=1)).isoformat(timespec="seconds")
-        low = FakeNote("claude 2", {"state": "active", "weekly_remaining_usage": "4", "resets": resets})
-        lines = self.launched([low])
-        self.assertEqual(lines, ["skipped: claude 2 has 4% of its weekly usage left, under the 10% floor"])
-        self.assertEqual(self.calls, [])
-
-    def test_unknown_or_reset_usage_does_not_skip(self) -> None:
-        past = (datetime.now() - timedelta(hours=1)).isoformat(timespec="seconds")
-        notes = [FakeNote("claude 1", {"state": "active", "weekly_remaining_usage": "null"}),
-                 FakeNote("claude 2", {"state": "active", "weekly_remaining_usage": "2", "resets": past})]
-        self.assertEqual(len(self.launched(notes)), 2)
-
-    def test_offer_waits_for_five_and_fires_once(self) -> None:
-        directory = self.night("nightly-config: started\nnightly-rust: started\n")
-        _ = (directory / "config.md").write_text("# proposal\n")
-        self.live = {"nightly-rust"}
-        self.assertIsNone(nightly_review.offer(MORNING.replace(hour=4, minute=59), lambda: "natedev"))
-        context = nightly_review.offer(MORNING, lambda: "natedev")
-        self.assertIsNotNone(context)
-        self.assertIn("config.md is ready", context or "")
-        self.assertIn("rust is still running (tmux session nightly-rust)", context or "")
-        self.assertIn("digest.md is not written yet", context or "")
-        self.assertIsNone(nightly_review.offer(MORNING, lambda: "natedev"))
-
-    def test_offer_is_for_natedev_only(self) -> None:
-        directory = self.night("nightly-config: started\n")
-        self.assertIsNone(nightly_review.offer(MORNING, lambda: "boss of bosses"))
-        self.assertFalse((directory / "offered").exists())
-
-    def test_offer_asks_and_carries_deferred_proposals(self) -> None:
-        _ = self.night("nightly-config: started\n")
-        _ = (self.root / "ledger.md").write_text(
-            "- 2026-09-27 config: Old one — accepted, applied\n- 2026-09-28 rust/hana: Warm runners — deferred\n")
-        context = nightly_review.offer(MORNING, lambda: "natedev") or ""
-        self.assertIn("Deferred earlier: 2026-09-28 rust/hana: Warm runners.", context)
-        self.assertNotIn("Old one", context)
-        self.assertIn("see it and the deferred proposals now or defer it, and on yes present it with /nightly_next", context)
-        self.assertIn("change its ledger line's `— proposed` to `— deferred`", context)
-
-    def test_offer_asks_about_deferred_on_a_skipped_night(self) -> None:
-        _ = self.night("skipped: claude 2 has 4% of its weekly usage left, under the 10% floor\n")
-        _ = (self.root / "ledger.md").write_text("- 2026-09-28 config: Kwin keys — deferred\n")
-        context = nightly_review.offer(MORNING, lambda: "natedev") or ""
-        self.assertIn("Deferred earlier: 2026-09-28 config: Kwin keys.", context)
-        self.assertIn("ask the user once whether they want to see the deferred proposals now or defer", context)
-
-    def test_offer_reports_a_skipped_night(self) -> None:
-        _ = self.night("skipped: claude 2 has 4% of its weekly usage left, under the 10% floor\n")
-        context = nightly_review.offer(MORNING, lambda: "natedev") or ""
-        self.assertIn("skipped: claude 2 has 4%", context)
-        self.assertNotIn("ask the user", context)
+    def test_timer_runs_messages_after_rust(self) -> None:
+        self.assertEqual(nightly_review.MODES, ("config", "rust", "messages"))
+        self.assertEqual(nightly_review.PROMPT, "/nightly_review config rust messages")
 
 
-    def test_a_session_the_review_name_prefixes_is_never_taken_for_it(self) -> None:
-        binary = shutil.which("tmux")
-        if binary is None:
-            self.skipTest("tmux is required to check its session matching")
-        server_dir = self.root / "tmux"
-        server_dir.mkdir()
-        self.enterContext(mock.patch.dict(os.environ, {"TMUX_TMPDIR": str(server_dir)}))
-        _ = os.environ.pop("TMUX", None)
-        self.addCleanup(subprocess.run, [binary, "kill-server"], capture_output=True, check=False)
-        real_run = subprocess.run
+    def test_copied_nightly_library_import_needs_no_message_review_or_production_modules(self) -> None:
+        copied = self.root / "copy/scripts/nightly_review/nightly_review.py"
+        copied.parent.mkdir(parents=True)
+        _ = shutil.copyfile(nightly_review.__file__, copied)
+        whoami = copied.parents[1] / "whoami"
+        whoami.mkdir()
+        _ = (whoami / "account.py").write_text("def process_config_dir(pid): pass\n")
+        result = subprocess.run([sys.executable, "-I", "-c",
+                                 "import runpy,sys; runpy.run_path(sys.argv[1], run_name='copied_library')", str(copied)],
+                                cwd=self.root, capture_output=True, text=True, check=False, timeout=10)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
-        def review(name: str) -> None:
-            _ = real_run([binary, "-f", "/dev/null", "new-session", "-d", "-s", name,
-                          ": /nightly_review config; exec sleep 60"], check=True)
+    def test_transcripts_use_session_accounts_and_timer_identity_after_rename(self) -> None:
+        sessions = self.root / "sessions"
+        sessions.mkdir()
+        since = datetime(2026, 10, 13, tzinfo=timezone.utc)
+        paths: list[Path] = []
+        for index, name in enumerate(("renamed coordinator", "natedev")):
+            config = self.root / f"account-{index}"
+            path = config / "projects/-work" / f"sid-{index}.jsonl"
+            path.parent.mkdir(parents=True)
+            _ = path.write_text(json.dumps(nightly_review.DatedTranscriptRecord(
+                type="assistant", timestamp=since.isoformat())) + "\n")
+            paths.append(path)
+            record = nightly_review.TranscriptSessionRecord(sessionId=f"sid-{index}", name=name,
+                cwd="/work", config_dir=str(config))
+            if index == 0:
+                record["transcript_path"] = str(path)
+                record["cwd"] = "/old-work"
+            _ = (sessions / f"{index}.json").write_text(json.dumps(record))
+        def production_of(sid: str) -> Path | None:
+            return self.root if sid == "sid-0" else None
+        with (mock.patch.object(nightly_review, "SESSIONS_DIR", sessions),
+              mock.patch.object(showrunners, "registered_showrunners", return_value=[]),
+              mock.patch.object(showrunners, "production_of", side_effect=production_of),
+              mock.patch.object(account, "process_config_dir", side_effect=AssertionError("recorded account lost"))):
+            self.assertEqual(nightly_review.showrunner_transcripts(since), sorted(paths))
 
-        def live(name: str) -> bool:
-            return real_run([binary, "has-session", "-t", f"={name}"], capture_output=True,
-                            check=False).returncode == 0
+    def test_transcript_selection_uses_reply_time_instead_of_recent_file_write(self) -> None:
+        sessions = self.root / "sessions"
+        sessions.mkdir()
+        since = datetime(2026, 10, 13, tzinfo=timezone.utc)
+        path = self.root / "old.jsonl"
+        _ = path.write_text(json.dumps(nightly_review.DatedTranscriptRecord(
+            type="assistant", timestamp=(since - timedelta(days=2)).isoformat())) + "\n")
+        _ = (sessions / "1.json").write_text(json.dumps(nightly_review.TranscriptSessionRecord(
+            name="natedev", sessionId="sid", transcriptPath=str(path))))
+        with (mock.patch.object(nightly_review, "SESSIONS_DIR", sessions),
+              mock.patch.object(showrunners, "registered_showrunners", return_value=[])):
+            self.assertEqual(nightly_review.showrunner_transcripts(since), [])
 
-        def run(command: list[str], **_: object) -> subprocess.CompletedProcess[str]:
-            if command[0] == "tmux":
-                return real_run(command, capture_output=True, text=True, check=False)
-            self.calls.append(command)
-            return done()
+    def test_transcript_lookup_uses_the_sessions_process_account(self) -> None:
+        sessions = self.root / "sessions"
+        sessions.mkdir()
+        since = datetime(2026, 10, 13, tzinfo=timezone.utc)
+        config = self.root / "showrunner-account"
+        path = config / "projects/-work" / "sid.jsonl"
+        path.parent.mkdir(parents=True)
+        _ = path.write_text(json.dumps(nightly_review.DatedTranscriptRecord(
+            type="assistant", timestamp=since.isoformat())) + "\n")
+        _ = (sessions / "1.json").write_text(json.dumps(nightly_review.TranscriptSessionRecord(
+            name="natedev", sessionId="sid", cwd="/work", pid=42)))
+        with (mock.patch.object(nightly_review, "SESSIONS_DIR", sessions),
+              mock.patch.object(showrunners, "registered_showrunners", return_value=[]),
+              mock.patch.object(account, "process_config_dir", return_value=config) as directory):
+            self.assertEqual(nightly_review.showrunner_transcripts(since), [path])
+        directory.assert_called_once_with(42)
 
-        def start() -> str:
-            with mock.patch.object(nightly_review, "tmux", REAL_TMUX), mock.patch("subprocess.run", run):
-                return nightly_review.start("config")
+    def test_live_counts_exclude_dry_runs_and_keep_unreviewed_apart_from_failures(self) -> None:
+        since = datetime(2026, 10, 13, tzinfo=timezone.utc)
+        records = [nightly_review.NightlyVerdictRecord(time=since.isoformat(), verdict=verdict,
+                   failed_rules=["reader-starts-cold"]) for verdict in ("send", "rewrite", "ask", "unreviewed: timeout")]
+        records += [nightly_review.NightlyVerdictRecord(time=since.isoformat(), verdict="rewrite", failed_rules=[], replay=True),
+                    nightly_review.NightlyVerdictRecord(time=since.isoformat(), verdict="rewrite", failed_rules=[], dry=True),
+                    nightly_review.NightlyVerdictRecord(time=since.isoformat(), verdict="rewrite", failed_rules=[], sample=True)]
+        records.append(nightly_review.NightlyVerdictRecord(time=(since - timedelta(seconds=1)).isoformat(),
+            verdict="rewrite", failed_rules=["reader-starts-cold"]))
+        path = self.root / "review.jsonl"
+        _ = path.write_text("\n".join(json.dumps(record) for record in records) + '\n{"time":{},"verdict":"ask"}\n')
+        self.assertEqual(nightly_review.live_message_counts(path, since),
+                         nightly_review.LiveMessageCounts(4, 2, 1, (("reader-starts-cold", 2),)))
 
-        review("nightly-config-kept")
-        self.assertEqual(start(), "nightly-config: started")
-        self.assertTrue(live("nightly-config-kept"))
-        review("nightly-config")
-        self.assertEqual(start(), "nightly-config: started")
-        self.assertFalse(live("nightly-config"))
-        self.assertTrue(live("nightly-config-kept"))
-        self.assertEqual(len(self.calls), 2)
+    def test_failed_and_withheld_live_pushes_count_and_registry_failures_are_attributed(self) -> None:
+        since = datetime(2026, 10, 13, tzinfo=timezone.utc)
+        path = self.root / "review.jsonl"
+        records: list[dict[str, object]] = [{"time": since.isoformat(), "verdict": verdict, "failed_rules": ["reader-starts-cold"],
+                    "text_id": "quota", "detail": "sent despite failed review: reader-starts-cold", "sent": {"body": "original"}} for verdict in ("failed", "withhold")]
+        records.append({"time": since.isoformat(), "verdict": "failed", "failed_rules": ["reader-starts-cold"], "text_id": "quota", "dry": True})
+        _ = path.write_text("\n".join(json.dumps(record) for record in records))
+        self.assertEqual(nightly_review.live_message_counts(path, since), nightly_review.LiveMessageCounts(2, 2, 0, (("reader-starts-cold", 2),), (("quota", 2),)))
+
+    def test_messages_mode_runs_only_the_dry_sample_cli_with_a_derived_wait(self) -> None:
+        since = datetime(2026, 10, 13, tzinfo=timezone.utc)
+        paths = [self.root / "one.jsonl", self.root / "two.jsonl"]
+        with (mock.patch.object(nightly_review, "showrunner_transcripts", return_value=paths),
+              mock.patch.object(nightly_review, "live_message_counts", return_value=nightly_review.LiveMessageCounts(0, 0, 0, ())),
+              mock.patch.object(review, "user_send_seconds", return_value=115),
+              mock.patch.object(subprocess, "run", return_value=done("Sampled: 1; failures: 0; Unreviewed: 0; unregistered questions: 1\n")) as run):
+            lines = nightly_review.messages(since)
+        self.assertIn("unregistered questions: 1", lines[-1])
+        self.assertEqual(run.call_args.args[0], [sys.executable, str(nightly_review.REVIEW_SCRIPT), "sample",
+                         *(str(path) for path in paths), "--limit", "20", "--since", since.isoformat()])
+        self.assertEqual(run.call_args.kwargs["timeout"], 2315)
+
+    def test_review_settings_deny_edits_under_the_main_folder_and_every_account_folder(self) -> None:
+        settings = cast(dict[str, dict[str, list[str]]], json.loads(nightly_review.SETTINGS.read_text(encoding="utf-8")))
+        denied = settings["permissions"]["deny"]
+
+        self.assertIn("Edit(~/.claude/**)", denied)
+        for label in ("claude 1", "claude 2", "claude 3"):
+            self.assertIn(f"Edit(~/{accounts.account_dir(label).name}/**)", denied)
+
+
+
+class TonightTests(NightlyReviewTests):
+    def tonight(self, units: list[LiveClaude | None], runs: list[subprocess.CompletedProcess[str]],
+                production: nightly_review.NightlyProduction | str = PRODUCTION) -> tuple[list[str], list[list[str]]]:
+        with (mock.patch.object(nightly_review, "nightly_production", return_value=production),
+              mock.patch.object(nightly_review, "live_unit", side_effect=units),
+              mock.patch.object(subprocess, "run", side_effect=runs) as run):
+            lines = nightly_review.launch(NIGHT)
+        return lines, [cast(list[str], call.args[0]) for call in run.call_args_list]
+
+    def test_a_live_unit_is_sent_the_nights_job_under_the_nights_key(self) -> None:
+        lines, calls = self.tonight([UNIT], [done()])
+        self.assertEqual(lines, [f"{SESSION}: tonight's review sent"])
+        self.assertEqual(calls, [[sys.executable, str(nightly_review.SCRIPTS / "message/send.py"), "--to", f"uds:{UNIT.socket}",
+                                  "--from", "nightly-review timer", "--key", "nightly-2026-09-29",
+                                  "--text", nightly_review.job(NIGHT)]])
+        self.assertIn("NIGHT=2026-09-29", nightly_review.job(NIGHT))
+        self.assertEqual((self.root / "nights/2026-09-29/launch.log").read_text(), f"{SESSION}: tonight's review sent\n")
+
+    def test_a_gone_unit_is_started_through_add_unit_as_permanent_then_sent(self) -> None:
+        lines, calls = self.tonight([None, UNIT], [done(), done()])
+        self.assertEqual(lines, [f"{SESSION}: started", f"{SESSION}: tonight's review sent"])
+        self.assertEqual(calls[0], [sys.executable, str(nightly_review.SCRIPTS / "production/add_unit.py"),
+                                    "--production", str(DOC), SESSION, "--permanent"])
+        self.assertEqual(calls[1][calls[1].index("--to") + 1], f"uds:{UNIT.socket}")
+
+    def test_a_refused_start_names_add_units_reason_and_sends_nothing(self) -> None:
+        lines, calls = self.tonight([None], [done(code=1, stderr="claude 3 is shut down")])
+        self.assertEqual(lines, [f"{SESSION}: not started: claude 3 is shut down"])
+        self.assertEqual(len(calls), 1)
+
+    def test_a_night_with_no_production_holding_the_unit_is_skipped(self) -> None:
+        lines, calls = self.tonight([], [], production="no running production has a permanent nightly-review-unit row")
+        self.assertEqual(lines, ["skipped: no running production has a permanent nightly-review-unit row"])
+        self.assertEqual(calls, [])
+
+    def test_a_failed_send_is_reported(self) -> None:
+        lines, _ = self.tonight([UNIT], [done(code=1, stderr="socket gone")])
+        self.assertEqual(lines, [f"{SESSION}: tonight's review not sent: socket gone"])
+
+
+class NightlyProductionTests(NightlyReviewTests):
+    def doc(self, name: str, plan: str) -> str:
+        path = self.root / f"{name}.md"
+        _ = path.write_text("\n".join(["# production", "", "## Units", "| Unit | Plan | Worktree | Branch | Port | Owns |",
+                                       "| --- | --- | --- | --- | --- | --- |",
+                                       f"| nightly-review-unit | {plan} | `/w/{name}` | `{name}` | 0 | nightly |", ""]))
+        return str(path)
+
+    def runners(self, *docs: tuple[str, str]) -> list[showrunners.Showrunner]:
+        return [showrunners.Showrunner(session="", socket="", slug=slug, zone="", doc=doc) for slug, doc in docs]
+
+    def test_the_production_with_the_permanent_row_is_found(self) -> None:
+        listed = self.runners(("one", self.doc("one", "standby")), ("two", self.doc("two", "permanent")))
+        with mock.patch.object(showrunners, "registered_showrunners", return_value=listed):
+            self.assertEqual(nightly_review.nightly_production(),
+                             nightly_review.NightlyProduction(self.root / "two.md", "two"))
+
+    def test_no_permanent_row_and_two_permanent_rows_are_each_named(self) -> None:
+        with mock.patch.object(showrunners, "registered_showrunners", return_value=self.runners(("one", self.doc("one", "standby")))):
+            self.assertIn("no running production", cast(str, nightly_review.nightly_production()))
+        twice = self.runners(("one", self.doc("one", "permanent")), ("two", self.doc("two", "permanent")))
+        with mock.patch.object(showrunners, "registered_showrunners", return_value=twice):
+            self.assertEqual(nightly_review.nightly_production(), "2 productions hold nightly-review-unit: one, two")
+
 
 if __name__ == "__main__":
     _ = unittest.main()

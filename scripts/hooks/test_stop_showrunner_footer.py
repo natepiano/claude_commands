@@ -26,7 +26,15 @@ SETTINGS = HOOK.parent.parent.parent / "settings.json"
 ZONE = "America/Los_Angeles"
 SESSION = "showrunner-session"
 AGENT_LINE = "* test agent: week's usage unknown; refill time unknown; resets unknown"
-WAITING_BLOCK = "\n\n\nWaiting on:\n\n* you: x"
+WAITING_BLOCK = "\n\n\nWaiting on:\n\n* no ETA measured - x"
+ONE_OPEN = "There is 1 open question for you."
+TWO_OPEN = "There are 2 open questions for you."
+QUOTA_LINE = "quota: codex at 12% for the week, resets Tue 14:00"
+
+
+def setUpModule() -> None:
+    """The times these tests expect are Pacific; the user's zone setting must not change them."""
+    unittest.enterModuleContext(patch.dict(os.environ, {"USER_ZONE": "America/Los_Angeles"}))
 
 
 class FooterLibraryTests(unittest.TestCase):
@@ -34,14 +42,14 @@ class FooterLibraryTests(unittest.TestCase):
         reply = "Done.\n\n---\n12:00 PDT update:\n\n* none active\n* no dailies scheduled" + WAITING_BLOCK
         self.assertEqual(showrunner_footer.reply_lines(reply), [
             "Done.", "", "---", "12:00 PDT update:", "", "* none active", "* no dailies scheduled",
-            "", "", "Waiting on:", "", "* you: x",
+            "", "", "Waiting on:", "", "* no ETA measured - x",
         ])
 
     def test_stamp_accepts_five_minutes_but_rejects_six_and_future(self) -> None:
         now = datetime(2026, 10, 6, 12, 0, tzinfo=ZoneInfo(ZONE))
         self.assertEqual(showrunner_footer.stamp(["11:55 PDT update:"], now),
                          (now - timedelta(minutes=5), False))
-        suffix = ["", "", "Waiting on:", "", "* you: x"]
+        suffix = ["", "", "Waiting on:", "", "* no ETA measured - x"]
         at_five, quiet = showrunner_footer.stamp(["11:55 PDT update:", "", "* no dailies scheduled - nothing needed", *suffix], now)
         self.assertEqual(at_five, now - timedelta(minutes=5))
         self.assertTrue(quiet)
@@ -114,6 +122,7 @@ class ShowrunnerFooterHookTests(unittest.TestCase):
             **os.environ, "HOME": str(self.root), "NOTIFIER_STATE_DIR": str(self.notifier),
             "SHOWRUNNER_STATE_DIR": str(self.root / "showrunner-state"),
             "BUILD_HOLD_DIR": str(holds),
+            "MAC_TEST_STATE_DIR": str(self.root / "mac-test"),
         }
 
     def write_state(self, *, enabled: bool = True) -> None:
@@ -121,12 +130,17 @@ class ShowrunnerFooterHookTests(unittest.TestCase):
             f"ENABLED={int(enabled)}\nNEXT_DUE={int(self.next_due.timestamp())}\n"
         )
 
-    def footer(self, *, at: datetime | None = None, nothing_needed: bool = False) -> str:
+    def footer(self, *, at: datetime | None = None, nothing_needed: bool = False,
+               below: tuple[str, ...] = (), reports_to: str = "") -> str:
         minute = at or datetime.now(ZoneInfo(ZONE))
         days = (self.next_due.date() - minute.date()).days
         next_run = f"{self.next_due:%H:%M}" + (f"+{days}" if days > 0 else "")
         args = [sys.executable, str(DAILIES), "--footer", "--zone", ZONE,
                 "--outstanding", str(self.outstanding)]
+        for slug in below:
+            args.extend(["--below", str(self.outstanding.with_name(f"{slug}.json"))])
+        if reports_to:
+            args.extend(["--reports-to", reports_to])
         if (self.instance / "state").read_text().startswith("ENABLED=1"):
             args.extend(["--next-run", next_run])
         if nothing_needed:
@@ -178,7 +192,7 @@ class ShowrunnerFooterHookTests(unittest.TestCase):
 
     def test_matching_footer_passes_with_one_or_more_waiting_items(self) -> None:
         footer = self.footer(at=datetime.now(ZoneInfo(ZONE)))
-        for waiting in (WAITING_BLOCK, WAITING_BLOCK + "\n* you: y"):
+        for waiting in (WAITING_BLOCK, WAITING_BLOCK + "\n* no ETA measured - y"):
             with self.subTest(items=waiting.count("\n* ")):
                 self.assert_passes(self.run_hook("Done.\n" + footer + waiting))
 
@@ -228,8 +242,8 @@ class ShowrunnerFooterHookTests(unittest.TestCase):
         for reply in ("Done.\n" + footer,
                       "Done.\n" + footer + "\n— waiting on: you: x",
                       "Done.\n" + footer + "\n\n\nWaiting on:",
-                      "Done.\n" + footer + "\n\nWaiting on:\n\n* you: x",
-                      "Done.\n" + footer + "\n\n\nWaiting on:\n\n- you: x"):
+                      "Done.\n" + footer + "\n\nWaiting on:\n\n* no ETA measured - x",
+                      "Done.\n" + footer + "\n\n\nWaiting on:\n\n- no ETA measured - x"):
             with self.subTest(reply=reply):
                 _ = self.assert_blocked_with_current_footer(reply)
 
@@ -260,7 +274,9 @@ class ShowrunnerFooterHookTests(unittest.TestCase):
     def test_false_nothing_needed_claim_blocks_and_reason_drops_suffix(self) -> None:
         _ = self.outstanding.write_text(json.dumps([{"since": "2026-10-06T08:00", "text": "choose the path"}]))
         footer = self.footer(at=datetime.now(ZoneInfo(ZONE)))
-        reason = self.assert_blocked_with_current_footer("Done.\n" + footer + " - nothing needed" + WAITING_BLOCK)
+        reason = self.assert_blocked_with_current_footer(
+            "Done.\n" + footer + " - nothing needed\n\n\nWaiting on:\n\n* " + ONE_OPEN)
+        self.assertIn(f"Waiting on:\n\n* {ONE_OPEN}\n* <item>", reason)
         self.assertFalse(any(line.startswith("* next dailies:") and line.endswith(" - nothing needed")
                              for line in reason.splitlines()))
 
@@ -302,9 +318,10 @@ class ShowrunnerFooterHookTests(unittest.TestCase):
         self.assert_passes(self.run_hook())
 
     def test_hook_fails_open_for_unknown_zone_and_bad_outstanding_json(self) -> None:
-        _ = self.doc.write_text(self.doc.read_text().replace(ZONE, "Pacific/Nowhere"))
+        # The zone is the user's setting; a setting that names no zone stands the hook down.
+        self.environment["USER_ZONE"] = "Pacific/Nowhere"
         self.assert_passes(self.run_hook())
-        _ = self.doc.write_text(self.doc.read_text().replace("Pacific/Nowhere", ZONE))
+        self.environment["USER_ZONE"] = ZONE
         _ = self.outstanding.write_text("{bad")
         self.assert_passes(self.run_hook())
 
@@ -415,7 +432,7 @@ class ShowrunnerFooterHookTests(unittest.TestCase):
         footer = self.footer(at=datetime.now(ZoneInfo(ZONE)))
         tomorrow = (datetime.now(ZoneInfo(ZONE)) + timedelta(days=1)).strftime("%a")
         valid = [
-            "* you: choose the path", "* 19:45 (18:20–23:55) - startup Phase 16",
+            "* " + QUOTA_LINE, "* 19:45 (18:20–23:55) - startup Phase 16",
             "* 23:30 - later", "* 00:15+1 - overnight",
             f"* {tomorrow} 09:00 - tomorrow", "* no ETA measured - awaiting estimate",
         ]
@@ -427,7 +444,7 @@ class ShowrunnerFooterHookTests(unittest.TestCase):
             (["* startup 19:45 (18:20–23:55)"], "ETA"),
             (["* 19:45 PDT - startup"], "zone"),
             (["* 21:00 - later", "* 19:45 - earlier"], "order"),
-            (["* 19:45 - startup", "* you: choose"], "user"),
+            (["* 19:45 - startup", "* " + QUOTA_LINE], "order"),
             (["* no ETA measured - one", "* 19:45 - two"], "order"),
             (["* 23:30 - today", "* 00:15 - earlier today"], "order"),
         ]
@@ -437,6 +454,151 @@ class ShowrunnerFooterHookTests(unittest.TestCase):
                 self.assertIn(rule.lower(), reason.lower())
                 self.assertIn("19:45 (18:20–23:55) - startup Phase 16", reason)
                 self.assertIn("no ETA measured - <item>", reason)
+
+    def waiting(self, footer: str, *bullets: str) -> str:
+        return "Done.\n" + footer + "\n\n\nWaiting on:\n\n" + "\n".join(f"* {bullet}" for bullet in bullets)
+
+    def write_open(self, *items: dict[str, str]) -> str:
+        """Store what waits on the user and return the footer rendered with it."""
+        _ = self.outstanding.write_text(json.dumps(list(items)))
+        return self.footer(at=datetime.now(ZoneInfo(ZONE)))
+
+    def test_open_questions_show_only_as_their_count(self) -> None:
+        path = {"since": "2026-10-06T08:00", "text": "WESL: prepare first, or straight to the upgrade?"}
+        merge = {"since": "2026-10-06T09:00", "text": "merge the branch today?"}
+        footer = self.write_open(path)
+        self.assert_passes(self.run_hook(self.waiting(footer, ONE_OPEN)))
+        self.assert_passes(self.run_hook(self.waiting(footer, ONE_OPEN, QUOTA_LINE, "19:45 - startup Phase 16")))
+        footer = self.write_open(path, merge)
+        self.assert_passes(self.run_hook(self.waiting(footer, TWO_OPEN, "no ETA measured - startup")))
+        refused = [
+            ("the question restated", [path["text"]]),
+            ("the question beside its count", [TWO_OPEN, path["text"]]),
+            ("the wrong count", ["There are 3 open questions for you."]),
+            ("the count for one", [ONE_OPEN]),
+            ("the count twice", [TWO_OPEN, TWO_OPEN]),
+            ("the count after a quota line", [QUOTA_LINE, TWO_OPEN]),
+            ("no count", ["19:45 - startup Phase 16"]),
+        ]
+        for name, bullets in refused:
+            with self.subTest(name):
+                reason = self.reason(self.waiting(footer, *bullets))
+                self.assertIn(f"`* {TWO_OPEN}`", reason)
+                self.assertIn("asked once, in full", reason)
+                self.assertIn("only when the user asks", reason)
+
+    def test_deferred_question_is_not_counted_until_its_time(self) -> None:
+        footer = self.write_open(
+            {"since": "2026-10-06T08:00", "text": "choose the path"},
+            {"since": "2026-10-06T09:00", "text": "merge today?", "after": "2099-01-01T00:00"},
+            {"since": "2026-10-06T10:00", "text": "rename the unit?", "after": "2026-10-07T00:00"},
+        )
+        self.assert_passes(self.run_hook(self.waiting(footer, TWO_OPEN, "no ETA measured - startup")))
+        self.assertIn(f"`* {TWO_OPEN}`", self.reason(self.waiting(footer, "There are 3 open questions for you.")))
+
+    def test_with_nothing_open_the_block_takes_no_line_for_the_user(self) -> None:
+        footer = self.footer(at=datetime.now(ZoneInfo(ZONE)))
+        self.assert_passes(self.run_hook(self.waiting(footer, QUOTA_LINE, "no ETA measured - startup")))
+        for bullet in (ONE_OPEN, "you: choose the path"):
+            with self.subTest(bullet=bullet):
+                reason = self.reason(self.waiting(footer, bullet, "no ETA measured - startup"))
+                self.assertIn(f"remove `* {bullet}`", reason)
+                self.assertIn("begins `quota: `", reason)
+
+    def test_missing_footer_reason_shows_the_count_line(self) -> None:
+        reason = self.assert_blocked_with_current_footer("Done.")
+        self.assertTrue(reason.endswith("Waiting on:\n\n* <item>"), reason)
+        _ = self.write_open({"since": "2026-10-06T08:00", "text": "choose the path"},
+                            {"since": "2026-10-06T09:00", "text": "merge today?"})
+        reason = self.assert_blocked_with_current_footer("Done.")
+        self.assertTrue(reason.endswith(f"Waiting on:\n\n* {TWO_OPEN}\n* <item>"), reason)
+        self.assertIn("never restated", reason)
+
+    def test_count_covers_every_production_the_session_runs(self) -> None:
+        _ = self.outstanding.write_text(json.dumps([{"since": "2026-10-06T08:00", "text": "choose the path"}]))
+        _ = self.outstanding.with_name("other.json").write_text(json.dumps(
+            [{"since": "2026-10-06T09:00", "text": "merge today?"}]))
+        quiet = showrunner_footer.NoDailiesSchedule.PAUSED_OR_UNSCHEDULED
+        productions = [showrunner_footer.Production(slug, self.doc, ZONE, quiet) for slug in ("demo", "other", "absent")]
+        with patch.dict(os.environ, self.environment):
+            self.assertEqual(showrunner_footer.open_questions(productions, {}), 2)
+            _ = self.outstanding.with_name("other.json").write_text("{bad")
+            self.assertIsNone(showrunner_footer.open_questions(productions, {}))
+        self.assertIsNone(showrunner_footer.open_questions_error(["you: choose the path"], None))
+
+    def timer(self, slug: str) -> None:
+        """Another production with a complete update timer, run by some other session."""
+        instance = self.notifier / f"showrunner-{slug}"
+        instance.mkdir()
+        _ = (instance / "conf").write_text(
+            f"TARGET=session:{slug}-session\nCHECK=zsh /x/production_check.sh {self.doc}\n")
+
+    def attach(self, child: str, parent: str) -> None:
+        edge = self.root / "showrunner-state" / child / "parent"
+        edge.parent.mkdir(parents=True, exist_ok=True)
+        _ = edge.write_text(parent + "\n")
+
+    def write_open_for(self, slug: str, *texts: str) -> None:
+        _ = self.outstanding.with_name(f"{slug}.json").write_text(json.dumps(
+            [{"since": "2026-10-06T08:00", "text": text} for text in texts]))
+
+    def test_root_count_covers_every_production_below_it(self) -> None:
+        for slug in ("kid", "grandkid", "stranger"):
+            self.timer(slug)
+            self.write_open_for(slug, f"{slug}: merge today?")
+        self.attach("kid", "demo")
+        self.attach("grandkid", "kid")
+        footer = self.write_open({"since": "2026-10-06T08:00", "text": "choose the path"})
+        three = "There are 3 open questions for you."
+        self.assert_passes(self.run_hook(self.waiting(footer, three)))
+        self.assertIn(f"`* {three}`", self.reason(self.waiting(footer, ONE_OPEN)))
+        self.write_open_for("grandkid")
+        self.assert_passes(self.run_hook(self.waiting(footer, TWO_OPEN)))
+
+    def test_a_showrunner_below_a_root_counts_only_its_own_items(self) -> None:
+        for slug in ("top", "kid"):
+            self.timer(slug)
+            self.write_open_for(slug, f"{slug}: merge today?")
+        self.attach("demo", "top")
+        self.attach("kid", "demo")
+        alone = self.write_open({"since": "2026-10-06T08:00", "text": "choose the path"})
+        footer = self.footer(at=datetime.now(ZoneInfo(ZONE)), reports_to="top")
+        self.assertIn("* reports to top", footer.splitlines())
+        self.assert_passes(self.run_hook(self.waiting(footer, ONE_OPEN)))
+        self.assertIn(f"`* {ONE_OPEN}`", self.reason(self.waiting(footer, TWO_OPEN)))
+        self.assertIn("* reports to top", self.reason(self.waiting(alone, ONE_OPEN)).splitlines())
+
+    def test_an_unreadable_list_below_the_root_skips_the_count_check(self) -> None:
+        self.timer("kid")
+        self.attach("kid", "demo")
+        alone = self.write_open({"since": "2026-10-06T08:00", "text": "choose the path"})
+        _ = self.outstanding.with_name("kid.json").write_text("{bad")
+        footer = self.footer(at=datetime.now(ZoneInfo(ZONE)), below=("kid",))
+        self.assertIn("* kid: needs-user list unreadable", footer.splitlines())
+        for count in (ONE_OPEN, TWO_OPEN):
+            with self.subTest(count=count):
+                self.assert_passes(self.run_hook(self.waiting(footer, count)))
+        # The root's footer must name the list it could not read.
+        self.assertIn("* kid: needs-user list unreadable", self.reason(self.waiting(alone, ONE_OPEN)).splitlines())
+
+    def test_a_lower_item_keeps_the_root_footer_from_saying_nothing_needed(self) -> None:
+        self.timer("kid")
+        self.attach("kid", "demo")
+        quiet = self.footer(at=datetime.now(ZoneInfo(ZONE)), nothing_needed=True)
+        self.assertTrue(quiet.endswith(" - nothing needed"))
+        self.assert_passes(self.run_hook(self.waiting(quiet, "no ETA measured - x")))
+        self.write_open_for("kid", "kid: merge today?")
+        busy = self.footer(at=datetime.now(ZoneInfo(ZONE)), nothing_needed=True, below=("kid",))
+        self.assertFalse(busy.endswith(" - nothing needed"))
+        self.assert_passes(self.run_hook(self.waiting(busy, ONE_OPEN)))
+
+    def test_produce_states_the_count_rule_in_the_hook_s_words(self) -> None:
+        produce = " ".join((SETTINGS.parent / "commands/showrunner/produce.md").read_text(encoding="utf-8").split())
+        self.assertIn(f"`{showrunner_footer.count_sentence(1)}`", produce)
+        self.assertIn("`There are {n} open questions for you.`", produce)
+        self.assertEqual(showrunner_footer.count_sentence(7), "There are 7 open questions for you.")
+        self.assertIn(f"led by `{showrunner_footer.QUOTA_LEAD}`", produce)
+        self.assertNotIn("The user's items come first", produce)
 
     def test_no_eta_items_and_malformed_leading_eta_cannot_hide_times(self) -> None:
         footer = self.footer(at=datetime.now(ZoneInfo(ZONE)))

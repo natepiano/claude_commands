@@ -21,8 +21,8 @@ contradicts itself, found because five readers read it closely at once.
 
 | # | Where | Defect | Status |
 | --- | --- | --- | --- |
-| C1 | `<PhaseTeam/>` | "**Only `impl` is given a `${PASS_KIND}`**" contradicted `<LaunchImplementation/>` step 5 ("**Both seats carry a pass kind**") and the recorder, which keys open passes by slot and closes only the calling slot's stale pass (`progress_history.py:1188-1213`, `_pass_slots` / `_close_slot_pass`). The stale rule made the unit director launch `test` and `review` with an empty pass kind, which is why those seats showed a role and no duration in the round table. | **fixed** |
-| C2 | `<ProgressContract/>` | Describes "Two stage rows" and a reviewer row reading `running (early)`. The recorder emits a round table with seat columns; an armed reviewer occupies the `test` seat's column, not a second stage row. | **fixed** |
+| C1 | `<PhaseTeam/>` | "**Only `impl` is given a `${PASS_KIND}`**" contradicted `<LaunchImplementation/>` step 5 ("**Both workers carry a pass kind**") and the recorder, which keys open passes by slot and closes only the calling slot's stale pass (`progress_history.py:1188-1213`, `_pass_slots` / `_close_slot_pass`). The stale rule made the unit director launch `test` and `review` with an empty pass kind, which is why those workers showed a role and no duration in the round table. | **fixed** |
+| C2 | `<ProgressContract/>` | Describes "Two stage rows" and a reviewer row reading `running (early)`. The recorder emits a round table with worker columns; an armed reviewer occupies the `test` worker's column, not a second stage row. | **fixed** |
 | C3 | `<DelegationResultFormat/>` 1638 | "all three tables" — the recorder emits two (`progress_history.py:3298,3310`). The phrase wraps across a line break, so a single-line grep misses it; an earlier pass wrongly cleared this finding on that evidence. | **fixed** |
 | C4 | `<BackgroundVerificationContract/>` 134-144 | Says Codex waits with progress disabled, then unconditionally says to arm a timer; `<ProgressContract/>` says Codex never launches that timer. | **fixed** |
 | C5 | `<RunSummary/>` 2377 | Lists `convergence reason` as a stop reason. `findings.py` emits only `converged` and `dispatch`; the run cannot stop for it. | **fixed** |
@@ -87,7 +87,8 @@ share a file named for the lead tag.
 | `commands/plan/delegate_phase_report.md` | `<VerbosePostPhaseReport/>`, `<CombinedWindowReport/>`, `<RemainingWorkOutlook/>` | `/plan:delegate_phase_report` |
 | `commands/plan/delegate_checkpoint.md` | `<CheckpointCommit/>` | `/plan:delegate_checkpoint` |
 | `commands/plan/delegate_next.md` | `<ConsiderNextItems/>` | `/plan:delegate_next` |
-| `commands/plan/delegate_style.md` | `<ResolveStyleDiffBase/>`, `<RunProjectStyleReview/>` | `/plan:delegate_style` |
+| `commands/unit/style_review.md` | `<StyleReview/>` | `/unit:style_review` |
+| `docs/delegate/phase_checks.md` | `<PhaseChecks/>` | none |
 | `docs/delegate/compose_work_order.md` | `<ComposeWorkOrder/>` | none |
 
 Each stub keeps its tag, so all existing `<Tag/>` call sites resolve unchanged;
@@ -145,7 +146,7 @@ a reachable failure.
 - **Both timer absolutes** (`<ProgressContract/>` 666-669 and 803-812). They read as one rule twice and prevent opposite defects: running work with no wake-up, and satisfying the Stop hook by re-arming without giving the report already owed. The hook blocks once and cannot compose a report.
 - **The phase-count story at both sites.** `progress_history.py` corrects the percentage only when called; it cannot stop a *later* report from counting by hand. `<RemainingWorkOutlook/>` runs after phase completion when no live progress call exists — a cross-reference there is not equivalent.
 - **Token self-deadlock and premature-green.** `verify.sh` cannot stop a delegate acquiring the token first, and cannot know whether the peer owning a package has posted `done`.
-- **Provider and transport fallbacks.** `codex_mesh=0` is still supported; Claude `--bg` has no reply redirect, so the summary-as-last-act rule is live; a finished Claude session resumes and a finished Codex thread does not.
+- **Provider and transport fallbacks.** `codex_mesh=0` is still supported; Claude `--bg` has no reply redirect, so the summary-as-last-act rule is live; a finished Claude session resumes and a finished Codex thread stays open for `implement.sh --to` follow-ups.
 - **Every literal block**: the four reservation JSON records, the commit-message template, exact authorization strings, `<BroadReviewPrompt/>`, the result template, report tables. Scripts do not reconstruct these; rewording an authorization string changes which reply advances the run.
 - **The "Not this / This" progress example** (775-792). The imported guide states the rule; this pair is the only thing that demonstrates turning "edge" and "ancestry" into what the user actually receives.
 

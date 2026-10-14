@@ -18,6 +18,7 @@
 !config/**
 /config/showrunners.json
 /config/showrunners.lock
+/config/accounts.json
 !docs/
 !docs/**
 !scripts/
@@ -26,5 +27,8 @@
 !shared/**
 !templates/
 !templates/**
+!mods/
+!mods/**
+mods/**/.claude-plugin/types/
 # Python cache (inside allowed dirs)
 **/__pycache__/

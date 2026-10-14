@@ -1,0 +1,10 @@
+{"event_id":"report-run-start","event_type":"run_started","timestamp":"2026-10-10T21:00:00Z","plan_doc":"docs/plans/report-plan.md","worktree":"/invented/build/component","main_agent":{"family":"claude","session_id":"report-director"}}
+{"event_id":"report-phase-start","event_type":"phase_started","timestamp":"2026-10-10T21:01:00Z","phase_instance_id":"report-phase","phase_id":"7","phase_title":"Invented report"}
+{"event_id":"review-one","event_type":"pass_started","timestamp":"2026-10-10T21:02:00Z","phase_instance_id":"report-phase","pass_instance_id":"review-one","pass_kind":"review"}
+{"event_id":"review-two","event_type":"pass_started","timestamp":"2026-10-10T21:03:00Z","phase_instance_id":"report-phase","pass_instance_id":"review-two","pass_kind":"review"}
+{"event_id":"fix-one","event_type":"pass_started","timestamp":"2026-10-10T21:04:00Z","phase_instance_id":"report-phase","pass_instance_id":"fix-one","pass_kind":"fix"}
+{"event_id":"finding-one","event_type":"finding_opened","timestamp":"2026-10-10T21:05:00Z","phase_instance_id":"report-phase","finding_id":"one"}
+{"event_id":"finding-two","event_type":"finding_opened","timestamp":"2026-10-10T21:06:00Z","phase_instance_id":"report-phase","finding_id":"two"}
+{"event_id":"finding-three","event_type":"finding_opened","timestamp":"2026-10-10T21:07:00Z","phase_instance_id":"report-phase","finding_id":"three"}
+{"event_id":"finding-one-accepted","event_type":"finding_verdict","timestamp":"2026-10-10T21:37:00Z","phase_instance_id":"report-phase","finding_id":"one","resulting_state":"accepted"}
+{"event_id":"finding-two-accepted","event_type":"finding_verdict","timestamp":"2026-10-10T21:38:00Z","phase_instance_id":"report-phase","finding_id":"two","resulting_state":"accepted"}

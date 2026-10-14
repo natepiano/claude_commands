@@ -30,10 +30,11 @@ from urllib.parse import quote
 
 import store
 
-SCHEMA_VERSION = 9
+SCHEMA_VERSION = 16
 LOCK_NAME = "index.lock"
 MARK_BYTES = 256
 BUSY_TIMEOUT_MS = 30_000
+COUNTED_FAILURE = "status != 0 AND NOT (caller IS 'verify-mac' AND step IS 'nextest' AND status = 4)"
 
 Column = tuple[str, str, str]
 
@@ -70,7 +71,7 @@ STEP_COLUMNS: list[Column] = [
     ),
     ("tree_changed", "INTEGER", "1 when the files changed during the step (fmt, mend --fix, an edit), 0 when not, NULL when unknown"),
     ("caller", "TEXT", "verify, cargo-port, validate_ci (push gate), brp-launch (build and app start), agent, alias, unknown"),
-    ("seat", "TEXT", "delegate seat (PLAN_DELEGATE_TEAM_ROLE)"),
+    ("worker", "TEXT", "delegate worker (PLAN_DELEGATE_TEAM_ROLE)"),
     ("delegate_session", "TEXT", "delegate session folder name"),
     ("session", "TEXT", "Claude Code session id or Codex thread id"),
     ("call_id", "TEXT", "calls.id of the verify.sh call that ran this step"),
@@ -133,6 +134,17 @@ CALL_COLUMNS: list[Column] = [
     ("cached", "INTEGER", "1 when the call could use a pass record (a delegate session's test or lint)"),
     ("wait_s", "INTEGER", "seconds from script start until the run began"),
     ("token_wait_s", "INTEGER", "seconds spent acquiring the cargo token, a wait that timed out included; 0 when verify.sh sought none"),
+    ("mac", "TEXT", "passed, passed_filter, failed, lost or declined when Mac offload ran or was considered"),
+    ("mac_reason", "TEXT", "why Mac offload declined or had no usable result"),
+    ("mac_holder", "TEXT", "busy decline: the claim what, leftovers or unreadable; NULL in old rows"),
+    (
+        "local_reason",
+        "TEXT",
+        "verify.sh test --local: why the test must run on Linux; empty otherwise",
+    ),
+    ("mac_s", "REAL", "seconds spent deciding or running on the Mac"),
+    ("target", "TEXT", "where the call was when it ended: mac, natedev, or empty"),
+    ("hold_wait_s", "REAL", "seconds waited on a held target, each declined Mac retry included; memory waits are not counted"),
     ("wall_s", "INTEGER", "seconds the run took"),
     ("build_s", "INTEGER", "cargo's own build seconds, NULL when unmeasured"),
     ("saved_s", "INTEGER", "seconds a reused or replayed record saved"),
@@ -147,7 +159,7 @@ CALL_COLUMNS: list[Column] = [
     ("worktree_name", "TEXT", "worktree folder name"),
     ("branch", "TEXT", "branch"),
     ("sha", "TEXT", "short commit"),
-    ("seat", "TEXT", "delegate seat"),
+    ("worker", "TEXT", "delegate worker"),
     ("delegate_session", "TEXT", "delegate session folder name"),
     ("session", "TEXT", "Claude Code session or Codex thread"),
     ("backfilled", "INTEGER", "1 when copied from the old events.jsonl ledger"),
@@ -221,6 +233,8 @@ SAMPLE_COLUMNS: list[Column] = [
     ("ci_anon_bytes", "INTEGER", "anon memory in hana-ci.slice; process memory"),
     ("stall_some_us", "INTEGER", "machine memory some stall counter since boot, microseconds"),
     ("stall_full_us", "INTEGER", "machine memory full stall counter since boot, microseconds"),
+    ("power_profile", "TEXT", "power-profiles-daemon profile; NULL when not recorded"),
+    ("power_profile_since", "TEXT", "UTC ISO mtime of the daemon's state file: when the profile was set"),
 ]
 
 MEMORY_SNAPSHOT_COLUMNS: list[Column] = [
@@ -231,7 +245,20 @@ MEMORY_SNAPSHOT_COLUMNS: list[Column] = [
     ("zram", "TEXT", "JSON zram storage at the snapshot time"),
 ]
 
+HOLD_EVENT_COLUMNS: list[Column] = [
+    ("src", "TEXT", "the source file; forgetting it removes this event only"),
+    ("at", "TEXT", "UTC instant of the file change, taken under its lock"),
+    ("host", "TEXT", "the machine that ran the command"),
+    ("target", "TEXT", "mac or natedev"),
+    ("event", "TEXT", "began or ended"),
+    ("hold_key", "TEXT", "the hold identity on its host and target: holder file key or Mac block since"),
+    ("holder", "TEXT", "the name to show"),
+    ("reason", "TEXT", "the reason given when the hold began"),
+    ("until", "TEXT", "the planned end; empty when none was given"),
+]
+
 TABLES: dict[str, tuple[list[Column], str, str]] = {
+    "hold_events": (HOLD_EVENT_COLUMNS, "", "one row per began or ended event; current holds come from coordination files"),
     "steps": (STEP_COLUMNS, "", "one row per step invoke.sh's run() ran: clippy, mend, doc, fmt, nextest, check, sweep"),
     "tests": (
         TEST_COLUMNS,
@@ -251,10 +278,27 @@ TABLES: dict[str, tuple[list[Column], str, str]] = {
 }
 
 VIEWS: dict[str, tuple[str, str]] = {
+    "holds": (
+        "one interval per began row; ends when the next row of its key is ended; a next began or no later row leaves ended_at NULL; an ended row without a preceding began has began_at NULL; previous_at and next_at bound missing events; later_row is 1 when a later row exists; no row proves a hold is in force now",
+        """WITH ordered AS (
+SELECT *, LAG(event) OVER hold_order AS previous_event,
+       LAG(at) OVER hold_order AS previous_at,
+       LEAD(event) OVER hold_order AS next_event,
+       LEAD(at) OVER hold_order AS next_at
+FROM hold_events
+WINDOW hold_order AS (PARTITION BY host, target, hold_key ORDER BY at, CASE event WHEN 'began' THEN 0 ELSE 1 END)
+)
+SELECT host, target, hold_key, holder, reason, until,
+       CASE WHEN event = 'began' THEN at END AS began_at,
+       CASE WHEN event = 'ended' THEN at WHEN next_event = 'ended' THEN next_at END AS ended_at,
+       CASE WHEN next_event IS NOT NULL THEN 1 ELSE 0 END AS later_row,
+       previous_at, next_at
+FROM ordered WHERE event = 'began' OR (event = 'ended' AND previous_event IS NOT 'began')""",
+    ),
     "step_days": (
         "per local day, host, repo, step and caller: runs, failed, total_s, avg_s, max_s, avg_build_s, max_peak_gib",
-        """SELECT date(started_at, 'localtime') AS day, host, repo, step, caller,
-       count(*) AS runs, sum(status != 0) AS failed,
+        f"""SELECT date(started_at, 'localtime') AS day, host, repo, step, caller,
+       count(*) AS runs, sum({COUNTED_FAILURE}) AS failed,
        round(sum(duration_s), 1) AS total_s, round(avg(duration_s), 1) AS avg_s,
        round(max(duration_s), 1) AS max_s, round(avg(finished_s), 1) AS avg_build_s,
        round(max(peak_mem_bytes) / 1073741824.0, 2) AS max_peak_gib
@@ -282,11 +326,11 @@ HAVING retried > 0 OR (passed > 0 AND failed > 0)""",
     ),
     "failures": (
         "failed steps, newest last: local time, where, step, caller, status, errors, tests_failed, log (absolute), argv",
-        """SELECT datetime(started_at, 'localtime') AS at, host, repo, worktree_name, branch, step, caller,
+        f"""SELECT datetime(started_at, 'localtime') AS at, host, repo, worktree_name, branch, step, caller,
        status, errors, tests_failed,
        CASE WHEN log IS NULL THEN NULL ELSE (SELECT value FROM meta WHERE key = 'root') || '/' || log END AS log,
        argv, id
-FROM steps WHERE status != 0""",
+FROM steps WHERE {COUNTED_FAILURE}""",
     ),
     "ci_job_days": (
         "CI jobs per local day, workflow and job name: jobs, failed, avg_s, max_s, avg_queue_s, max_queue_s",
@@ -328,9 +372,12 @@ def create_schema(connection: sqlite3.Connection) -> None:
             body.append(key)
         statements.append(f"CREATE TABLE {table} ({', '.join(body)})")
         statements.append(f"CREATE INDEX {table}_src ON {table} (src)")
+    statements.append("CREATE INDEX hold_events_key_at ON hold_events (host, target, hold_key, at, event)")
+    statements.append("CREATE INDEX hold_events_target_at ON hold_events (target, at)")
     statements.append("CREATE INDEX steps_started ON steps (started_at)")
     statements.append("CREATE INDEX steps_host_started ON steps (host, started_at)")
     statements.append("CREATE INDEX steps_tree ON steps (worktree, step, tree_key)")
+    statements.append("CREATE INDEX steps_call ON steps (call_id)")
     statements.append("CREATE INDEX tests_step ON tests (step_id)")
     statements.append("CREATE INDEX calls_started ON calls (started_at)")
     statements.append("CREATE INDEX ci_jobs_run ON ci_jobs (run_id, attempt)")
@@ -505,7 +552,11 @@ def add_ci_run(connection: sqlite3.Connection, record: dict[str, object], src: s
             insert(connection, "ci_steps", pick(step_row, CI_STEP_COLUMNS))
 
 
-ADDERS = {"step": add_step, "call": add_call, "ci_run": add_ci_run, "sample": add_sample,
+def add_hold_event(connection: sqlite3.Connection, record: dict[str, object], src: str) -> None:
+    insert(connection, "hold_events", pick({**record, "src": src}, HOLD_EVENT_COLUMNS))
+
+
+ADDERS = {"hold_event": add_hold_event, "step": add_step, "call": add_call, "ci_run": add_ci_run, "sample": add_sample,
           "memory_snapshot": add_memory_snapshot}
 
 
@@ -524,8 +575,39 @@ def marks(handle: BinaryIO, offset: int) -> str:
     return head.hex() + ":" + handle.read(offset - start).hex()
 
 
+def migrate_worker_fields(path: Path) -> None:
+    """Rename old step/call fields once under the same lock as appenders."""
+    with path.open("r+b") as handle:
+        fcntl.flock(handle, fcntl.LOCK_EX)
+        data = handle.read()
+        end = data.rfind(b"\n") + 1
+        lines: list[bytes] = []
+        changed = False
+        for raw in data[:end].splitlines(keepends=True):
+            try:
+                value = cast(object, json.loads(raw))
+            except ValueError:
+                lines.append(raw)
+                continue
+            if isinstance(value, dict):
+                fields = cast(dict[str, object], value)
+                if fields.get("kind") in ("step", "call") and "seat" in fields:
+                    _ = fields.setdefault("worker", fields["seat"])
+                    del fields["seat"]
+                    raw = (json.dumps(fields, ensure_ascii=False) + "\n").encode()
+                    changed = True
+            lines.append(raw)
+        if changed:
+            _ = handle.seek(0)
+            _ = handle.write(b"".join(lines) + data[end:])
+            _ = handle.truncate()
+            handle.flush()
+            os.fsync(handle.fileno())
+
+
 def read_file(connection: sqlite3.Connection, path: Path, src: str, known: tuple[int, str] | None) -> int:
     """Index the complete lines past the stored offset; returns the lines read."""
+    migrate_worker_fields(path)
     with path.open("rb") as handle:
         size = os.fstat(handle.fileno()).st_size
         offset = 0

@@ -30,7 +30,15 @@ while [ "$#" -gt 0 ]; do
   i=$((i + 1))
 done
 
-jq -s -r --arg clock "$(date '+%H:%M:%S %Z')" '
+# The clock is in the user's zone setting; the machine's zone when the setting cannot be read.
+lib="$(cd "$(dirname "${BASH_SOURCE[0]}")/../lib" && pwd)"
+if zone="$("$lib/py" "$lib/user_zone.py" 2>/dev/null)" && [ -n "$zone" ]; then
+  clock="$(TZ="$zone" date '+%H:%M:%S %Z')"
+else
+  clock="$(date '+%H:%M:%S %Z')"
+fi
+
+jq -s -r --arg clock "$clock" '
   def secs: if . >= 60 then "\((./60)|floor)m \((.%60)|floor)s" else "\(.|floor)s" end;
   def icon: if .status != "completed" then "…"
             elif .conclusion == "success" then "green"

@@ -1,12 +1,12 @@
 ---
-description: Compile a design/plan doc into a delegate-ready phased implementation plan — strip design narrative, bake in the codebase context every phase needs, and front each phase with a self-contained Work Order so /unit:delegate can dispatch by assembly with zero research.
+description: Compile a design/plan doc into a delegate-ready phased implementation plan — strip design narrative, bake in the codebase context every phase needs, and front each phase with a self-contained Work Order so /unit:direct can dispatch by assembly with zero research.
 ---
 
 # Phase Plan
 
 **Purpose:** Turn a plan/design doc into a **delegate-ready implementation plan**
 (format: `~/.claude/docs/delegate_plan_format.md`). After this runs, a compacted
-orchestrator can hand any phase to `/unit:delegate` by copy-and-assemble — the
+orchestrator can hand any phase to `/unit:direct` by copy-and-assemble — the
 expensive codebase research is paid **once**, here, and baked into the doc.
 
 **Usage:** `/plan:to_phased_plan [plan-doc-path] [--out <path>]`
@@ -78,6 +78,12 @@ is baked into its checkpoint commit message, which cannot be rewritten. Renumber
 a `done` phase silently severs the doc from `git log`. If an edit genuinely must
 renumber one, add an old→new mapping note to the doc so history stays traceable,
 and say so in `<Report/>`.
+
+**Every todo phase states its dependencies** on the line after its heading:
+`**Depends on:** Phase 2, Phase 4` (the plan phases that must be done before it
+starts), or `**Depends on:** none`. Phase ids only. A `**Blocked by:**` gate
+stays its own line. `phase_table.py parallel` reads these lines; renumbering
+fixes them like any other reference.
 </PhaseNumbering>
 
 ---
@@ -98,7 +104,7 @@ the source doc to a pointer is a **separate, later** action the user takes once
 the compiled plan is good; never do it as part of this run.
 
 Read `~/.claude/docs/delegate_plan_format.md` — it is the target format and the
-contract `/unit:delegate`, `/plan:phase_review`, and `/plan:to_as_built` all depend on.
+contract `/unit:direct`, `/plan:phase_review`, and `/plan:to_as_built` all depend on.
 
 Resolve `${PLAN_REPOSITORY_ROOT}` from `${DEST}`'s containing Git repository.
 When `${DEST}` is not in Git, use its parent directory.
@@ -142,7 +148,7 @@ block — nothing else. The prompt must include:
 
 - The absolute plan-doc path (the subagent reads it to learn which files/areas
   the phases touch).
-- Do not return `Project started`; `/unit:delegate`'s progress recorder derives
+- Do not return `Project started`; `/unit:direct`'s progress recorder derives
   that runtime provenance from Git and memorializes it on the first delegation
   run.
 - A directive to determine and return, terse:
@@ -158,21 +164,17 @@ block — nothing else. The prompt must include:
      Build = `bash ~/.claude/scripts/delegate/verify.sh check <pkg>`;
      Test = `bash ~/.claude/scripts/delegate/verify.sh test <pkg>`;
      Lint = `bash ~/.claude/scripts/delegate/verify.sh lint <pkg>`.
-     Workspace-wide breadth — `--all-targets`, all examples, the full `clippy`
-     skill — belongs to /unit:delegate's <FinalGate/> after the last phase,
-     never to any phase. For non-Rust projects, record the exact commands the
-     project uses (read `package.json`/`justfile`/CI config; do not invent).
-  6. **Style** — for Rust, record `run-end /clippy style-only auto-proceed`.
-     /unit:delegate keeps this line out of coding and fix prompts, then runs one
-     style review for the whole project at <FinalGate/>, diffing the branch so
-     it reaches work every phase already checkpointed; omit for non-Rust.
-  7. **Invariants** — project-wide rules every phase must preserve (from the plan
+     <PhaseChecks/> defines the lint scope and the phase's style review in
+     the unit director's main review; workers never load the guide. For
+     non-Rust projects, record the exact commands the project uses (read
+     `package.json`/`justfile`/CI config; do not invent).
+  6. **Invariants** — project-wide rules every phase must preserve (from the plan
      and from obvious code constraints).
-  8. **Test lanes** — for each crate a phase touches, its `tests/` directory
-     path or `none`. **Seats** (`<Restructure/>` step 2) is drafted from this
+  7. **Test lanes** — for each crate a phase touches, its `tests/` directory
+     path or `none`. **Workers** (`<Restructure/>` step 2) is drafted from this
      line without opening the tree again.
 - Output format: the `## Delegation Context` bullet block from the format doc,
-  omitting `Project started` until `/unit:delegate`'s progress recorder resolves
+  omitting `Project started` until `/unit:direct`'s progress recorder resolves
   it. No prose, no findings list.
 
 The subagent does not edit anything. Capture its block as ${DELEGATION_CONTEXT}.
@@ -198,7 +200,7 @@ not codebase searching.
      and carry the gate onto the phase itself: a phase blocked by `G2` opens with
      `**Blocked by:** G2 — <the unblocking event>`. A delegate reaching that
      phase must be able to see it cannot start without reading the whole doc.
-   - **Do not mark a gated phase ready.** `/unit:delegate` runs phases in order;
+   - **Do not mark a gated phase ready.** `/unit:direct` runs phases in order;
      a gated phase is a deliberate stop, and the report at STEP 5 should say
      which phase the plan runs to before it parks.
    - **`**Scope now:**` sets the working repo** for the early phases. When the
@@ -220,13 +222,13 @@ not codebase searching.
    chunk of work; do not over-split.
 
    **Right-size each phase — split signals.** A phase must be **delegate-sized**:
-   two concurrent seats on disjoint file sets, with no prior context, get the
+   two concurrent workers on disjoint file sets, with no prior context, get the
    tree green in a single pass — one writer where the files cannot split, two
    where they can. Whether the spine is inherited or freshly decomposed,
    test every phase against these signals **before** drafting its Work Order.
    If any fires, split the phase into delegate-sized units — the usual split is
    **types → systems/wiring**, or one subsystem per file group. Tests are never
-   the split: the `test` seat writes them inside the phase, against the Spec,
+   the split: the `test` worker writes them inside the phase, against the Spec,
    while the writers build.
 
    - **Gate breadth:** the Acceptance gate would enumerate more than ~8–10
@@ -240,12 +242,12 @@ not codebase searching.
      callers cannot compile until it lands.
    - **File span:** the Spec expects a single new or edited file to grow by many
      hundreds of lines. Creating several files is not this signal: independent
-     new files go to different seats (step 2, **Seats**), and split a phase only
+     new files go to different workers (step 2, **Workers**), and split a phase only
      when one cannot compile until another lands.
    - **Serial kinds:** the phase bundles work whose second half cannot start
      until the first compiles — data types, then the systems that consume them
      — and each half is a real chunk. Bundling tests with the code they prove
-     is not this signal: the `test` seat writes them concurrently from the Spec.
+     is not this signal: the `test` worker writes them concurrently from the Spec.
    - **Compound goal:** the Goal joins two outcomes with "and" that need not ship
      together.
 
@@ -256,8 +258,8 @@ not codebase searching.
 
    **Divisibility check.** A phase whose Files cannot partition into two or more
    owner sets **and** that has no test lane (Delegation Context → **Test lanes**)
-   idles one of two seats. Merge an independent-by-file sibling phase into it,
-   or let its **Seats** opening line say a single writer holds it and why.
+   idles one of two workers. Merge an independent-by-file sibling phase into it,
+   or let its **Workers** opening line say a single writer holds it and why.
 
 2. **For each phase, draft a Work Order** per the format doc:
    - **Goal** — one line, the observable outcome.
@@ -266,7 +268,7 @@ not codebase searching.
      the Spec. Do NOT compress a settled decision to a summary — the delegate
      needs the detail to implement without searching.
    - **Files** — the files to create/modify, with line refs the doc already cites.
-   - **Seats** — the opening. One line `1 writer + 1 tester` or `2 writers` and
+   - **Workers** — the opening. One line `1 writer + 1 tester` or `2 writers` and
      where the work splits (by crate, module, or file group — or why it does
      not), then one line per slot. `impl` always opens as `impl`. `test` opens
      as `test` when the phase has a test lane — a `tests/` directory in a
@@ -290,7 +292,7 @@ not codebase searching.
      to the Acceptance gate with the one-line tests of the rules the change
      touches, from
      `zsh ~/.claude/scripts/ux_style/load-ux-style.sh --checklist --tags <tags>`.
-     Never paste the whole guide; seats carry only these lines.
+     Never paste the whole guide; workers carry only these lines.
 
 3. **Fold design history into the phases, then drop the narrative.** Justification
    essays ("why this exists", "what's wrong with the old model"), alternatives,
@@ -318,7 +320,7 @@ not codebase searching.
 - Compile **only** the target phases into Work Orders (steps 2–3 above, applied to
   each target). Already-complete `todo` Work Orders and all `done` phases are left
   byte-for-byte unchanged — no churn, no drift. A `todo` Work Order without
-  **Seats** is not already-complete: add that field from its Files and **Test
+  **Workers** is not already-complete: add that field from its Files and **Test
   lanes**, and leave every other byte alone.
 - **Forward-propagate.** For each freshly compiled target phase, apply the
   **Propagate-Forward** rule from the format doc (`~/.claude/docs/delegate_plan_format.md`
@@ -373,7 +375,7 @@ PYTHONPATH="$HOME/.claude/scripts" python3 -m berth.work_order \
 ```
 
 The final validation covers the complete Work Order: non-empty Goal, Spec, and
-Files, lexical repository-relative paths, and a non-empty Seats wherever the
+Files, lexical repository-relative paths, and a non-empty Workers wherever the
 field is present. Any edit in this command that
 changes Files or adds an implementation path must revalidate the whole Work
 Order before this command returns. Do not copy the parser into this command.
@@ -389,10 +391,10 @@ Order before this command returns. Do not copy the parser into this command.
 | --- | --- |
 | Compiled | <plan path → delegate-ready; N phases> |
 | Live phases | <count of todo phases, with titles> |
-| Seats | <per todo phase: `N: <opening line>`> |
+| Workers | <per todo phase: `N: <opening line>`> |
 | Archived | <count of done phases preserved, or None> |
 | Stripped | <what design narrative was removed and folded where> |
-| Next | `/unit:delegate <plan path> phase <first todo N>` |
+| Next | `/unit:direct <plan path> phase <first todo N>` |
 ```
 
 **Reconcile mode** — report what changed vs what was left alone:
@@ -402,10 +404,10 @@ Order before this command returns. Do not copy the parser into this command.
 | --- | --- |
 | Mode | Reconcile (already delegate-ready) |
 | Compiled (new) | <target phases brought up to Work Order, with titles> |
-| Seats | <per compiled or re-seated phase: `N: <opening line>`> |
+| Workers | <per compiled phase or phase with reassigned workers: `N: <opening line>`> |
 | Propagated | <later phases whose Constraints from prior phases were updated, or None> |
 | Preserved | <count of done + already-compiled todo phases left untouched> |
-| Next | `/unit:delegate <plan path> phase <first todo N>` |
+| Next | `/unit:direct <plan path> phase <first todo N>` |
 ```
 
 Then stop. Do not start implementing a phase.
@@ -424,10 +426,10 @@ Then stop. Do not start implementing a phase.
   exists to remove.
 - Every remaining Work Order must satisfy the format doc's self-containment rule:
   a fresh codex implements it from the named files + Delegation Context, no search.
-  It also carries **Seats** (format doc rule 7), so the opening is decided here
+  It also carries **Workers** (format doc rule 7), so the opening is decided here
   and never at launch.
 - Never delete completed-phase history. Strip design *narrative*, not shipped facts.
-- Every phase must be **delegate-sized** (Restructure step 1): two seats on
+- Every phase must be **delegate-sized** (Restructure step 1): two workers on
   disjoint files build it green in one pass, one writer where nothing splits.
   Apply the split signals at compile time — an over-size phase is a
   decomposition miss, not the delegate's problem to absorb.

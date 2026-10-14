@@ -58,7 +58,7 @@ agents_exec_main() {
     local prompt_file="$4"
     local output_file="$5"
     local log_file="$6"
-    local script_dir prompt family_args_line claude_code
+    local script_dir prompt family_args_line claude_code seats_home
     local -a family_args extra_args command
 
     if [[ ! -f "$prompt_file" ]]; then
@@ -86,9 +86,16 @@ agents_exec_main() {
 
     case "$AGENT_FAMILY" in
         codex)
+            seats_home="$("$PY" - "$script_dir/../whoami" <<'PY'
+import sys
+sys.path.insert(0, sys.argv[1])
+from agent_accounts import seats_home
+print(seats_home())
+PY
+            )"
             family_args_line="$(agents_codex_args)"
             read -r -a family_args <<< "$family_args_line"
-            command=(codex exec "${family_args[@]}")
+            command=(env "CODEX_HOME=$seats_home" codex exec "${family_args[@]}")
             if [[ -n "${AGENT_EXEC_EXTRA_ARGS:-}" ]]; then
                 command+=("${extra_args[@]}")
             fi

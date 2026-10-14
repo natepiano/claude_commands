@@ -26,7 +26,7 @@ PENDING_DECISION_HEADING = re.compile(
     r"^\*\*Pending decision:\s*(?P<subject>[^*\n]+)\*\*\s*$", re.MULTILINE
 )
 WORK_ORDER_HEADING = re.compile(r"^#### Work Order\s*$", re.MULTILINE)
-PHASE_HEADING = re.compile(r"^### Phase\s+(?P<identifier>\d+)\b(?P<title>.*)$", re.MULTILINE)
+PHASE_HEADING = re.compile(r"^### Phase\s+(?P<identifier>\d+[a-z]?)\b(?P<title>.*)$", re.MULTILINE)
 SECTION_HEADING = re.compile(r"^## ", re.MULTILINE)
 CODE_SPAN = re.compile(r"`([^`]+)`")
 LINE_REFERENCE = re.compile(r"(?::\d+(?:-\d+)?|#L\d+(?:-L\d+)?)$")
@@ -37,7 +37,7 @@ WORK_ORDER_FIELD_LABELS = frozenset(
         "Goal",
         "Spec",
         "Files",
-        "Seats",
+        "Workers",
         "Acceptance gate",
         "Constraints from prior phases",
         "Pending decision",
@@ -448,10 +448,10 @@ def validate_work_order(
             errors.append(f"Work Order is missing **{field}:**")
         elif not sections[field].strip():
             errors.append(f"Work Order has an empty **{field}:** section")
-    # Seats is optional -- plans compiled before the field existed carry none --
+    # Workers is optional -- plans compiled before the field existed carry none --
     # but a present field with nothing under it is a heading, not an opening.
-    if "Seats" in sections and not sections["Seats"].strip():
-        errors.append("Work Order has an empty **Seats:** section")
+    if "Workers" in sections and not sections["Workers"].strip():
+        errors.append("Work Order has an empty **Workers:** section")
     if errors:
         raise WorkOrderValidationError(errors)
 

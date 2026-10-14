@@ -40,7 +40,7 @@ if [ "$1" = metadata ]; then
 fi
 printf "%s\n" "$*" >> "$CARGO_CALLS"
 case "$1 $2" in
-    "nextest --version"|"nextest run"|"+nightly fmt") exit 0 ;;
+    "nextest --version"|"nextest run"|"+nightly fmt"|"check --workspace") exit 0 ;;
     *) exit 97 ;;
 esac
 ''')
@@ -60,6 +60,9 @@ esac
                               + 'lint_config_skip_notice() { :; }\n')
         meminfo = self.root / "meminfo"
         _ = meminfo.write_text("MemAvailable: 67108864 kB\n")
+        claude = self.root / ".claude"
+        claude.mkdir()
+        (claude / "scripts").symlink_to(VERIFY.parent.parent, target_is_directory=True)
         for name in ("tmp", "runtime", "state", "cache", "session", "target", "cgroup"):
             (self.root / name).mkdir()
         self.environment = {
@@ -68,6 +71,8 @@ esac
                 if name not in {"PLAN_DELEGATE_BOARD_DIR", "PLAN_DELEGATE_TEAM_ROLE"}
             },
             "PATH": f"{stubs}:{os.environ['PATH']}",
+            "HOME": str(self.root),
+            "RUSTUP_HOME": os.environ.get("RUSTUP_HOME", str(Path.home() / ".rustup")),
             "REAL_CARGO": str(REAL_CARGO),
             "PACKAGE_ROOT": str(self.root),
             "CARGO_CALLS": str(self.calls),
@@ -86,6 +91,17 @@ esac
             "BUILDLOG_OFF": "1",
             "BUILDLOG_SCOPE": "0",
             "BUILD_HOLD_DIR": str(self.root / "build-hold"),
+            "BUILD_HOLD_RELEASE_DIR": str(self.root / "release"),
+            "PLAN_DELEGATE_ACTIVE_DIR": str(self.root / "active"),
+            "PLAN_DELEGATE_BOARD_DIR": "",
+            "BUILDLOG_CALL_ID": "", "BUILDLOG_CALLER": "",
+            "BUILD_TARGETS_SCRIPT": str(VERIFY.parent.parent / "build_targets" / "build_targets.py"),
+            "BUILDLOG_HOLD_WAIT_FILE": "", "BUILDLOG_HOLD_ADMISSION_FILE": "",
+            "BUILDLOG_HOLD_STARTED_FILE": "", "BUILDLOG_HOLD_WAITER_FILE": "",
+            "BUILDLOG_HOLD_REGISTRATION_FILE": str(self.root / "registration"),
+            "NOTIFIER_SESSIONS_DIR": str(self.root / "sessions"),
+            "MAC_TEST_STATE_DIR": str(self.root / "mac-state"),
+            "VERIFY_MAC_RUNNER": str(self.root / "no-mac-runner"),
             "LINT_CONFIG_READER": str(reader),
             "LINT_CONFIG_FILE": str(reader),
             "PLAN_DELEGATE_SESSION_DIR": str(self.root / "session"),
@@ -272,7 +288,7 @@ esac
         self.assertEqual(self.calls_made(), first_calls)
         self.assertEqual(self.metadata_count(), 2)
 
-    def test_final_checks_every_workspace_member_before_format(self) -> None:
+    def test_final_checks_every_workspace_member_before_workspace_gate(self) -> None:
         _ = (self.root / "Cargo.toml").write_text('[workspace]\nmembers = ["alpha", "beta"]\nresolver = "2"\n')
         alpha_root = self.root / "alpha"
         beta_root = self.root / "beta"
@@ -293,6 +309,19 @@ esac
         )
         self.assertEqual(self.calls_made(), [])
         self.assertEqual(self.metadata_count(), 1)
+
+    def test_final_runs_workspace_check_and_tests_without_format(self) -> None:
+        _ = self.package()
+        self.environment["NEXTEST_TEST_THREADS"] = "2"
+
+        result = self.verify("final")
+
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(self.calls_made(), [
+            "check --workspace --all-targets",
+            "nextest --version",
+            "nextest run --workspace",
+        ])
 
     def test_removed_example_test_runs_no_cargo(self) -> None:
         _ = self.package()

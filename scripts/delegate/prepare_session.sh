@@ -11,7 +11,7 @@
 # session is mid-run, so an approaching context limit cannot end the turn and
 # strand the run. end_session.sh removes it.
 #
-# First it removes every seat a dead run left alive (remove_seats.py), so a run
+# First it removes every worker a dead run left alive (remove_workers.py), so a run
 # whose unit director died before its own cleanup never outlives the next start.
 #
 # Prints the session directory path to stdout (last line) for the caller to capture.
@@ -22,7 +22,7 @@ set -euo pipefail
 # rather than by path: the python3 on PATH is Apple 3.9 on the Mac, and this
 # repo needs >= 3.10.
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-"${SCRIPT_DIR}/../lib/py" "${SCRIPT_DIR}/remove_seats.py" || true
+"${SCRIPT_DIR}/../lib/py" "${SCRIPT_DIR}/remove_workers.py" || true
 
 SESSION_ID="$(uuidgen | tr '[:upper:]' '[:lower:]')"
 SESSION_DIR="/tmp/claude/delegate/${SESSION_ID}"
@@ -33,10 +33,11 @@ if [[ -n "${CLAUDE_CODE_SESSION_ID:-}" ]]; then
   ACTIVE_DIR=/tmp/claude/delegate/active
   mkdir -p "${ACTIVE_DIR}"
   printf '%s\n' "${SESSION_DIR}" > "${ACTIVE_DIR}/${CLAUDE_CODE_SESSION_ID}"
+  "${SCRIPT_DIR}/../lib/py" "${SCRIPT_DIR}/../usage/agents_log.py" append --id "${CLAUDE_CODE_SESSION_ID}" --role director || true
   # Pinned: an inherited test override would send the notifier to another marker.
   if notifier_output="$(PLAN_DELEGATE_ACTIVE_DIR="${ACTIVE_DIR}" zsh "${SCRIPT_DIR}/unit_notifier.sh" "${CLAUDE_CODE_SESSION_ID}" 2>&1)"; then
     while IFS= read -r line; do
-      if [[ "${line}" == next_due=* ]]; then
+      if [[ "${line}" == next_due=* || "${line}" == "progress updates on demand:"* ]]; then
         printf '%s\n' "${line}"
       fi
     done <<< "${notifier_output}"

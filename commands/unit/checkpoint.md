@@ -1,14 +1,14 @@
 ---
-description: Commit and push a finished delegate phase and release its reservation, when the run did not.
+description: Commit and push a finished /unit:direct phase and release its reservation, when the run did not.
 ---
 
-# Delegate — checkpoint
+# Direct — checkpoint
 
 **Usage:** `/unit:checkpoint`
 
 Type this when a phase finished and was never committed, or when a run stopped
 between the commit and the reservation release. It runs inside the current
-session and already knows the phase, the plan doc, and the mode. If no delegate
+session and already knows the phase, the plan doc, and the mode. If no `/unit:direct`
 run is active, say so in one line and stop.
 
 This is durable state with no cheap undo. Read the whole contract before acting
@@ -16,7 +16,7 @@ on any part of it, and read the reservation record from disk — a value
 remembered from conversation, from the harness session mapping, or re-derived
 from current `HEAD` is not proof and will silently accept the wrong checkpoint.
 
-`/unit:delegate` reads this file once per completed phase in loop and verbose
+`/unit:direct` reads this file once per completed phase in loop and verbose
 mode. It defines `<CheckpointCommit/>`, `<ShrinkCommit/>`, and
 `<PushCheckpoint/>` in full. `single` never commits.
 Phase-end order: `~/.claude/docs/delegate/phase_end.md` → <PhaseEnd/>.
@@ -28,16 +28,14 @@ Everything below is the contract.
 <CheckpointCommit>
 Loop/verbose only:
 
-1. Require smoke pass, `not applicable`, or `deferred`. Style is not a phase
-   gate: <RunProjectStyleReview/> runs once at <FinalGate/>, over every
-   checkpoint this one joins.
+1. Require smoke pass, `not applicable`, or `deferred`, and a `converged`
+   phase findings ledger per <FindingsLedger/>. An off check reports `Off`.
 2. Confirm status contains only this phase, source-comment edits left by the
    previous phase's plan review, its plan doc, and an approved change to
    `${NEXT_ITEMS_PATH}` when present. The current phase may still have its Work
    Order. Refuse the checkpoint if any earlier `done` phase still has a Work
    Order; its shrink must be repaired first.
-3. Run `verify.sh fmt <package>` for every touched package; include resulting
-   formatting changes.
+3. Formatting is covered by <PhaseChecks/>; do not rerun it here.
 4. Mark the phase `status: done`. Never put its commit hash in the plan.
 5. Read and validate
    `${SESSION_DIR}/delegated_phase_reservation_state.json`; never use a value
@@ -50,7 +48,7 @@ Loop/verbose only:
    | `CheckpointCommittedAwaitingReleaseConfirmation` | Valid only as a resumed state: route directly to step 7, re-entering neither drift nor checkpoint creation. |
 
    Run each cargo-berth command in this checkpoint as written, under
-   `/unit:delegate` <BerthDecisions/>:
+   `/unit:direct` <BerthDecisions/>:
 
    ```sh
    cargo-berth drift --full --json
@@ -172,16 +170,17 @@ Loop/verbose only:
    This report follows successful release when the phase was active.
 9. In a production unit, run
    `python3 ~/.claude/scripts/delegate/progress_history.py review-trial --session-dir "${SESSION_DIR}"`
-   and keep its line for <ProductionUnit/> item 3's checkpoint notice.
+   and `python3 ~/.claude/scripts/delegate/phase_table.py parallel --session-dir "${SESSION_DIR}"`,
+   and keep both lines for <ProductionUnit/> item 3's checkpoint notice.
 </CheckpointCommit>
 
 <ShrinkCommit>
 Loop/verbose only, after <RunPhaseShrink/> passes its structural check. The
-next phase's seats may be editing, but they never stage files.
+next phase's workers may be editing, but they never stage files.
 
 1. Stage only `${PLAN_DOC}` and an approved, changed `${NEXT_ITEMS_PATH}`.
    Inspect the staged path set. Refuse the commit if it contains any other
-   path; leave the seats running and repair the staged set before retrying.
+   path; leave the workers running and repair the staged set before retrying.
 2. Commit only the staged paths, once:
 
    ```

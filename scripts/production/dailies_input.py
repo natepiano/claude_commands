@@ -8,21 +8,46 @@ import os
 import re
 import subprocess
 import sys
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone, tzinfo
 from pathlib import Path
 from typing import NamedTuple, cast
 from zoneinfo import ZoneInfo
 
-from add_unit import Refusal, cell_value, read_production, unit_rows
+import showrunners
+import unit_lookup
+from add_unit import Production, Refusal, cell_value, live_unit_table, read_production, unit_table
 from ci_points import PointFailure, WatchFirstAlert, WatchRepeat, review_watch
-from dailies_render import InputError, StateRefused, as_list, as_map, check_render_state, local_now, parse_report, parse_time
+from dailies_counts import CountsFailure, production_counts
+from dailies_render import (LENGTHS, InputError, StateRefused, as_list, as_map, check_render_state, due, last_report,
+                            local_now, parse_child_report, parse_range_end, parse_report, parse_time,
+                            read_outstanding)
 from merge_checkpoint import NoMerge, git, merge_branch_history
+from update_registration import RegistrationFailure, UpdatesOnDemand, outstanding_file, update_schedule
 from waiting import EtaNotYetRequested, EtaRequested, eta_requested, update_state
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "build_hold"))
 from build_hold import ActiveHolders, read_holders
+import override_guard
 
 JsonMap = dict[str, object]
+LAST_REPORT = "dailies_last.json"
+EXPAND_ALL = "all"
+
+
+class OpenBevyUpgradeWatch(NamedTuple):
+    update: str
+    needs_user: bool
+
+
+class NoOpenBevyUpgradeWatch(NamedTuple):
+    pass
+
+
+class BevyUpgradeUnavailable(NamedTuple):
+    reason: str
+
+
+BevyUpgradeWatch = OpenBevyUpgradeWatch | NoOpenBevyUpgradeWatch | BevyUpgradeUnavailable
 
 
 class SessionGone(NamedTuple):
@@ -63,6 +88,8 @@ class Activity(NamedTuple):
 
 
 Flag = FormWaiting | Decision | StillWaiting | Block | TicksFailing
+# What waits on the user: a form, a question on its first report, and the same question on every later one.
+WAITS_ON_USER = (FormWaiting, Decision, StillWaiting)
 SessionState = SessionGone | ClaudeNotRunning | Running
 
 
@@ -75,6 +102,7 @@ class StatusBlock(NamedTuple):
 
 class EtaFresh(NamedTuple):
     text: str
+    first_seen: datetime
 
 
 class EtaStale(NamedTuple):
@@ -93,9 +121,126 @@ class EtaNone(NamedTuple):
 EtaState = EtaFresh | EtaStale | EtaPassed | EtaNone
 
 
+class ReportedPhasePercent(NamedTuple):
+    percent: int
+
+
+class PhasePercentNotReported(NamedTuple):
+    pass
+
+
+class StatedPhaseEtaRange(NamedTuple):
+    earliest: datetime
+    latest: datetime
+
+
+class StatedEtaWithoutRange(NamedTuple):
+    pass
+
+
+class RendererSafeRecordEtaRange(NamedTuple):
+    earliest: str
+    latest: str
+
+
+class RecordEtaRangeOmitted(NamedTuple):
+    pass
+
+
+class CurrentStatedPhaseEta(NamedTuple):
+    time: datetime
+    range: StatedPhaseEtaRange | StatedEtaWithoutRange
+    stated_at: datetime
+    basis: str
+
+
+class CurrentProjectedPhaseEta(NamedTuple):
+    time: datetime
+    earliest: datetime
+    latest: datetime
+    as_of: datetime
+
+
+class CurrentPhaseEtaUnavailable(NamedTuple):
+    pass
+
+
+class FirstStatedEtaTarget(NamedTuple):
+    time: datetime
+    repair_rounds: int
+
+
+class EtaNeverStated(NamedTuple):
+    pass
+
+
+class NumberedOpenPlanPhase(NamedTuple):
+    number: int
+    started: datetime
+    percent: ReportedPhasePercent | PhasePercentNotReported
+    eta: CurrentStatedPhaseEta | CurrentProjectedPhaseEta | CurrentPhaseEtaUnavailable
+    first_stated: FirstStatedEtaTarget | EtaNeverStated
+
+
+class NoOpenPhase(NamedTuple):
+    pass
+
+
+class OpenPhaseOutsidePlan(NamedTuple):
+    pass
+
+
+class NonNumericPhaseId(NamedTuple):
+    pass
+
+
+class UnitPhaseRecordUnavailable(NamedTuple):
+    reason: str
+
+
+NoNumberedOpenPlanPhaseReason = (
+    NoOpenPhase | OpenPhaseOutsidePlan | NonNumericPhaseId | UnitPhaseRecordUnavailable
+)
+
+
+class NoNumberedOpenPlanPhase(NamedTuple):
+    reason: NoNumberedOpenPlanPhaseReason
+
+
+UnitPhaseState = NumberedOpenPlanPhase | NoNumberedOpenPlanPhase
+
+
+class PhaseTablesUnavailable(NamedTuple):
+    reason: str
+
+
+class PhaseTablesAvailable(NamedTuple):
+    units: dict[str, UnitPhaseState]
+    # Waiting phases whose dependencies are all done, by unit.
+    could_start: dict[str, tuple[str, ...]]
+
+
+PhaseTablesState = PhaseTablesUnavailable | PhaseTablesAvailable
+
+
+class JudgmentNumberedPlanPhase(NamedTuple):
+    number: int
+
+
+class JudgmentOutsideNumberedPlan(NamedTuple):
+    pass
+
+
+JudgmentPlanPhase = JudgmentNumberedPlanPhase | JudgmentOutsideNumberedPlan
+
+
 class UnitRow(NamedTuple):
     name: str
+    # The unit's session name at this moment, read from its live session; empty when none runs.
+    # It addresses the unit and is never a key: every record is kept under the unit's name.
     session: str
+    # Read from the records of the unit's /unit:delegate runs.
+    run: unit_lookup.UnitState
 
 
 class DailiesFailure(Exception):
@@ -109,19 +254,66 @@ def report(step: str, state: str, detail: str) -> None:
     print(f"{step}: {state} — {detail.replace(chr(10), '; ')}", flush=True)
 
 
-def units_from_doc(lines: list[str]) -> tuple[UnitRow, ...]:
-    _, rows = unit_rows(lines)
+def bevy_upgrade_watch(production: Production) -> BevyUpgradeWatch:
+    script = os.environ.get("DAILIES_BEVY_UPGRADE", str(
+        Path(__file__).resolve().parent.parent / "bevy_upgrade/bevy_upgrade.py"))
+    try:
+        result = subprocess.run([sys.executable, script, "--production", str(production.doc),
+                                 "line", "--json"], capture_output=True, text=True, timeout=30, check=False)
+    except subprocess.TimeoutExpired as error:
+        stderr = error.stderr.decode("utf-8", errors="replace") if isinstance(error.stderr, bytes) else error.stderr
+        return BevyUpgradeUnavailable(stderr.strip().splitlines()[0] if stderr and stderr.strip()
+                                      else "timed out after 30 seconds")
+    except OSError as error:
+        return BevyUpgradeUnavailable(str(error))
+    if result.returncode:
+        return BevyUpgradeUnavailable(result.stderr.strip().splitlines()[0] if result.stderr.strip()
+                                      else f"command exited {result.returncode}")
+    if not result.stdout.strip():
+        return NoOpenBevyUpgradeWatch()
+    try:
+        raw = cast(object, json.loads(result.stdout))
+        fields = cast(JsonMap, raw) if isinstance(raw, dict) else {}
+        update, needs_user = fields.get("update"), fields.get("needs_user")
+        if (not isinstance(update, str) or not update.strip() or "\n" in update or "\r" in update
+                or not isinstance(needs_user, bool)):
+            raise ValueError("expected an object with update text and needs_user boolean")
+    except ValueError as error:
+        return BevyUpgradeUnavailable(result.stderr.strip().splitlines()[0] if result.stderr.strip()
+                                      else str(error))
+    return OpenBevyUpgradeWatch(update, needs_user)
+
+
+def bounded_bevy_update(text: str) -> str:
+    limit = min(limit for limit in LENGTHS.values() if limit is not None)
+    return text if len(text) <= limit else text[:limit - 1] + "…"
+
+
+def units_from_doc(lines: list[str], slug: str) -> tuple[UnitRow, ...]:
+    live_rows = live_unit_table(lines, slug)
+    if unit_table(lines) and not live_rows:
+        raise DailiesFailure("production", "no live units: every Units row is retired")
+    try:
+        marked = unit_lookup.marked_units(slug)
+    except OSError as error:
+        raise DailiesFailure("production", f"the unit sessions could not be looked up: {error}") from error
     units: list[UnitRow] = []
-    for row in rows:
-        cells = [cell.strip() for cell in row.strip().strip("|").split("|")]
-        if len(cells) < 5:
-            raise DailiesFailure("production", f"invalid Units row: {row}")
-        units.append(UnitRow(cell_value(cells[0]), cell_value(cells[4])))
+    for cells in live_rows:
+        name = cell_value(cells.get("Unit", ""))
+        if not name:
+            raise DailiesFailure("production", f"invalid Units row: {cells}")
+        found = marked.get(name)
+        claude = found.claude if found is not None else None
+        try:
+            run = unit_lookup.run_state(Path(cell_value(cells.get("Worktree", ""))))
+        except OSError as error:
+            raise DailiesFailure("production", f"the run records of {name} could not be read: {error}") from error
+        units.append(UnitRow(name, claude.name if isinstance(claude, unit_lookup.LiveClaude) else "", run))
     return tuple(units)
 
 
 def status_blocks(path: Path, units: tuple[UnitRow, ...]) -> tuple[StatusBlock, ...]:
-    names = {unit.session for unit in units}
+    names = {unit.name for unit in units}
     blocks: list[StatusBlock] = []
     session = ""
     state: SessionState = Running()
@@ -178,35 +370,66 @@ def status_blocks(path: Path, units: tuple[UnitRow, ...]) -> tuple[StatusBlock, 
     return tuple(blocks)
 
 
-def eta_state(block: StatusBlock, phase: str, seen: JsonMap, now: datetime, *, held: bool) -> EtaState:
-    line = next((item.text for item in reversed(block.activity) if "ETA" in item.text), "")
-    if not line:
+# The time an ETA line states: the clock, `+N` days, and the zone word after it when there is one.
+ETA_TIME = re.compile(r"\b(\d{1,2}:\d{2})(\+\d+)?(?: ([A-Z]{2,4})\b)?")
+# Zone words a unit writes after an ETA. An unknown word leaves the time as written.
+ETA_ZONES: dict[str, tzinfo] = {
+    **{word: timezone(timedelta(hours=hours)) for word, hours in (
+        ("UTC", 0), ("GMT", 0), ("EDT", -4), ("EST", -5), ("CDT", -5), ("CST", -6),
+        ("MDT", -6), ("MST", -7), ("PDT", -7), ("PST", -8))},
+    **{word: ZoneInfo(name) for word, name in (
+        ("ET", "America/New_York"), ("CT", "America/Chicago"),
+        ("MT", "America/Denver"), ("PT", "America/Los_Angeles"))},
+}
+
+
+def in_report_zone(line: str, now: datetime, zone: ZoneInfo) -> str:
+    """`line` with a time stated in another zone rewritten as a clock in the report's zone."""
+    found = ETA_TIME.search(line)
+    stated = ETA_ZONES.get(found.group(3) or "") if found is not None else None
+    if found is None or stated is None:
+        return line
+    hour, minute = found.group(1).split(":")
+    days = int(found.group(2) or 0)
+    there = now.replace(tzinfo=zone).astimezone(stated)
+    local = (there.replace(hour=int(hour), minute=int(minute)) + timedelta(days=days)).astimezone(zone)
+    # A line that named no day keeps none: the renderer's own rule decides today or tomorrow.
+    ahead = (local.date() - now.date()).days if days else 0
+    clock = f"{local:%H:%M}" + (f"+{ahead}" if ahead > 0 else "")
+    return line[:found.start()] + clock + line[found.end():]
+
+
+def eta_state(block: StatusBlock, phase: str, seen: JsonMap, now: datetime, zone: ZoneInfo, *, held: bool) -> EtaState:
+    lines = list(dict.fromkeys(item.text for item in block.activity if "ETA" in item.text))
+    if not lines:
         return EtaNone()
     key = f"{block.session}|{phase}"
     prior = seen.get(key)
     requested = isinstance(eta_requested(seen, key), EtaRequested)
-    unchanged = False
-    if isinstance(prior, dict):
-        record = cast(JsonMap, prior)
-        text = record.get("text")
-        first = record.get("first_seen")
-        if text == line and isinstance(first, str):
-            first_seen = datetime.fromisoformat(first)
-            unchanged = True
-        else:
-            first_seen = now
-    else:
-        first_seen = now
-    seen[key] = {"text": line, "first_seen": first_seen.isoformat(timespec="minutes"), "requested": requested}
-    if held and unchanged:
-        return EtaFresh(line)
-    time = re.search(r"\b(\d{1,2}:\d{2}(?:\+\d+)?)\b", line)
+    record = cast(JsonMap, prior) if isinstance(prior, dict) else {}
+    also = record.get("also")
+    known = {**(cast(JsonMap, also) if isinstance(also, dict) else {}), record.get("text"): record.get("first_seen")}
+    first = {text: datetime.fromisoformat(stamp) if isinstance(stamp := known.get(text), str) else now for text in lines}
+    # The pane's lowest ETA line is not its newest: a pinned table sits below later messages. The
+    # line first seen most recently is the one the unit stated last; among equals the lowest wins.
+    line = max(reversed(lines), key=lambda text: first[text])
+    first_seen = first[line]
+    unchanged = record.get("text") == line and isinstance(record.get("first_seen"), str)
+    others = {text: first[text].isoformat(timespec="minutes") for text in lines if text != line}
+    seen[key] = {"text": line, "first_seen": first_seen.isoformat(timespec="minutes"), "requested": requested,
+                 **({"also": others} if others else {})}
+    shown = in_report_zone(line, now, zone)
+    # A held unit cannot move, so the ETA it had is kept and no new one is asked for. One that had gone
+    # old or passed before the hold, so that a new one was asked for, is not brought back as current.
+    if held and unchanged and not requested:
+        return EtaFresh(shown, first_seen)
+    time = re.search(r"\b(\d{1,2}:\d{2}(?:\+\d+)?)\b", shown)
     if time is not None:
         if parse_time(time.group(1), now) < now:
             return EtaPassed()
     if now - first_seen > timedelta(hours=1):
-        return EtaStale(line, first_seen)
-    return EtaFresh(line)
+        return EtaStale(shown, first_seen)
+    return EtaFresh(shown, first_seen)
 
 
 def eta_value(state: EtaState, supplied: object, requested: bool = False) -> JsonMap:
@@ -222,9 +445,292 @@ def eta_value(state: EtaState, supplied: object, requested: bool = False) -> Jso
     found = re.search(r"\b(\d{1,2}:\d{2}(?:\+\d+)?)\b", state.text)
     if found:
         result["time"] = found.group(1)
+        # A time that names no day is read on the day the unit stated it, not the day of the report.
+        result["stated"] = state.first_seen.isoformat(timespec="minutes")
         _ = result.pop("none", None)
     if isinstance(state, EtaStale):
         result["detail"] = f"set {state.first_seen.strftime('%H:%M')}"
+    return result
+
+
+def record_time(value: object, where: str, zone: ZoneInfo) -> datetime:
+    if not isinstance(value, str):
+        raise ValueError(f"{where}: expected an ISO-8601 time")
+    moment = datetime.fromisoformat(value)
+    if moment.tzinfo is None or moment.utcoffset() is None:
+        raise ValueError(f"{where}: expected an offset-aware ISO-8601 time")
+    return moment.astimezone(zone)
+
+
+def record_percent(value: object, where: str) -> ReportedPhasePercent | PhasePercentNotReported:
+    if value is None:
+        return PhasePercentNotReported()
+    if not isinstance(value, int) or isinstance(value, bool) or not 0 <= value <= 100:
+        raise ValueError(f"{where}: expected a whole number from 0 to 100 or null")
+    return ReportedPhasePercent(value)
+
+
+def record_eta(value: object, where: str, zone: ZoneInfo) -> (
+    CurrentStatedPhaseEta | CurrentProjectedPhaseEta | CurrentPhaseEtaUnavailable
+):
+    if value is None:
+        return CurrentPhaseEtaUnavailable()
+    fields = as_map(value, where)
+    source = fields.get("source")
+    time = record_time(fields.get("time"), f"{where}.time", zone)
+    if source == "stated":
+        stated_at = record_time(fields.get("stated_at"), f"{where}.stated_at", zone)
+        basis = fields.get("basis")
+        if not isinstance(basis, str) or not basis.strip():
+            raise ValueError(f"{where}.basis: expected non-empty text")
+        earliest_value, latest_value = fields.get("earliest"), fields.get("latest")
+        if earliest_value is None and latest_value is None:
+            eta_range: StatedPhaseEtaRange | StatedEtaWithoutRange = StatedEtaWithoutRange()
+        elif earliest_value is not None and latest_value is not None:
+            eta_range = StatedPhaseEtaRange(
+                record_time(earliest_value, f"{where}.earliest", zone),
+                record_time(latest_value, f"{where}.latest", zone),
+            )
+        else:
+            raise ValueError(f"{where}: earliest and latest must both be set or both be null")
+        return CurrentStatedPhaseEta(time, eta_range, stated_at, basis)
+    if source == "projected":
+        return CurrentProjectedPhaseEta(
+            time,
+            record_time(fields.get("earliest"), f"{where}.earliest", zone),
+            record_time(fields.get("latest"), f"{where}.latest", zone),
+            record_time(fields.get("as_of"), f"{where}.as_of", zone),
+        )
+    raise ValueError(f"{where}.source: expected stated or projected")
+
+
+def unit_phase_state(value: object, where: str, zone: ZoneInfo) -> UnitPhaseState:
+    fields = as_map(value, where)
+    unavailable = fields.get("unavailable")
+    if isinstance(unavailable, str):
+        return NoNumberedOpenPlanPhase(UnitPhaseRecordUnavailable(unavailable))
+    current_value = fields.get("current")
+    if current_value is None:
+        return NoNumberedOpenPlanPhase(NoOpenPhase())
+    current = as_map(current_value, f"{where}.current")
+    phase = current.get("phase")
+    if not isinstance(phase, str) or not phase.isdigit():
+        return NoNumberedOpenPlanPhase(NonNumericPhaseId())
+    phases = as_list(fields.get("phases"), f"{where}.phases")
+    in_plan = False
+    for index, phase_value in enumerate(phases):
+        phase_fields = as_map(phase_value, f"{where}.phases[{index}]")
+        if phase_fields.get("phase") == phase and phase_fields.get("status") == "running":
+            in_plan = True
+            break
+    if not in_plan:
+        return NoNumberedOpenPlanPhase(OpenPhaseOutsidePlan())
+    first_value = current.get("first_stated_eta_target")
+    first_stated: FirstStatedEtaTarget | EtaNeverStated
+    if first_value is None:
+        first_stated = EtaNeverStated()
+    else:
+        repair_rounds_path = f"{where}.current.repair_rounds_since_first_stated_eta"
+        repair_rounds = current.get("repair_rounds_since_first_stated_eta")
+        if (
+            isinstance(repair_rounds, bool)
+            or not isinstance(repair_rounds, int)
+            or repair_rounds < 0
+        ):
+            raise ValueError(
+                f"{repair_rounds_path}: expected a whole number from 0"
+            )
+        first_stated = FirstStatedEtaTarget(
+            record_time(first_value, f"{where}.current.first_stated_eta_target", zone),
+            repair_rounds,
+        )
+    return NumberedOpenPlanPhase(
+        int(phase),
+        record_time(current.get("started"), f"{where}.current.started", zone),
+        record_percent(current.get("percent"), f"{where}.current.percent"),
+        record_eta(current.get("eta"), f"{where}.current.eta", zone),
+        first_stated,
+    )
+
+
+def phase_table_path() -> Path:
+    configured = os.environ.get("DAILIES_PHASE_TABLE")
+    return Path(configured) if configured else Path(__file__).resolve().parent.parent / "delegate/phase_table.py"
+
+
+def phase_tables(production_doc: Path, zone: ZoneInfo) -> PhaseTablesState:
+    result = command(phase_table_path(), "show", "--production-doc", str(production_doc), "--json")
+    if result.returncode:
+        return PhaseTablesUnavailable(result.stderr.strip() or result.stdout.strip() or f"exit {result.returncode}")
+    try:
+        raw = cast(object, json.loads(result.stdout))
+        fields = as_map(raw, "phase tables")
+        return PhaseTablesAvailable(
+            {unit: unit_phase_state(value, f"phase tables.{unit}", zone) for unit, value in fields.items()},
+            {unit: could_start(value, f"phase tables.{unit}") for unit, value in fields.items()},
+        )
+    except (InputError, ValueError, json.JSONDecodeError) as error:
+        return PhaseTablesUnavailable(str(error))
+
+
+def could_start(value: object, where: str) -> tuple[str, ...]:
+    parallel = as_map(value, where).get("parallel")
+    if parallel is None:
+        return ()
+    phases = as_list(as_map(parallel, f"{where}.parallel").get("could_start"), f"{where}.parallel.could_start")
+    if not all(isinstance(phase, str) for phase in phases):
+        raise ValueError(f"{where}.parallel.could_start: expected phase ids")
+    return tuple(cast(list[str], phases))
+
+
+def judgment_phase_number(text: str) -> JudgmentPlanPhase:
+    matched = re.match(r"^Phase (\d+) of \d+: ", text)
+    if matched is None:
+        return JudgmentOutsideNumberedPlan()
+    return JudgmentNumberedPlanPhase(int(matched.group(1)))
+
+
+def record_text(moment: datetime) -> str:
+    return moment.strftime("%Y-%m-%dT%H:%M")
+
+
+def record_clock(moment: datetime, now: datetime) -> str:
+    days = (moment.date() - now.date()).days
+    return moment.strftime("%H:%M") + (f"+{days}" if days > 0 else "")
+
+
+def record_eta_stated(target: datetime, source: datetime, rendered_time: str) -> datetime:
+    """The anchor that makes the renderer resolve `rendered_time` to `target`."""
+    target_minute = target.replace(second=0, microsecond=0, tzinfo=None)
+    source_minute = source.replace(second=0, microsecond=0, tzinfo=None)
+    if "+" not in rendered_time and parse_time(rendered_time, source_minute) != target_minute:
+        return target_minute
+    return source_minute
+
+
+def record_eta_range(
+    target: datetime,
+    earliest: datetime,
+    latest: datetime,
+    source: datetime,
+    rendered_time: str,
+    now: datetime,
+) -> RendererSafeRecordEtaRange | RecordEtaRangeOmitted:
+    """A range whose written clocks resolve to the record's own minutes."""
+    stated = record_eta_stated(target, source, rendered_time)
+    eta_moment = parse_time(rendered_time, stated if "+" not in rendered_time else now)
+    earliest_text = record_clock(earliest, now)
+    latest_text = record_clock(latest, now)
+    earliest_minute = earliest.replace(second=0, microsecond=0, tzinfo=None)
+    latest_minute = latest.replace(second=0, microsecond=0, tzinfo=None)
+    if (
+        parse_range_end(earliest_text, now, eta_moment, earliest=True) != earliest_minute
+        or parse_range_end(latest_text, now, eta_moment, earliest=False) != latest_minute
+    ):
+        return RecordEtaRangeOmitted()
+    return RendererSafeRecordEtaRange(earliest_text, latest_text)
+
+
+def record_eta_state(
+    phase: NumberedOpenPlanPhase,
+    key: str,
+    seen: JsonMap,
+    now: datetime,
+    *,
+    held: bool,
+) -> EtaState:
+    requested = isinstance(eta_requested(seen, key), EtaRequested)
+    prior_value = seen.get(key)
+    prior = cast(JsonMap, prior_value) if isinstance(prior_value, dict) else {}
+    if isinstance(phase.eta, CurrentPhaseEtaUnavailable):
+        if isinstance(phase.first_stated, EtaNeverStated):
+            return EtaNone()
+        target = phase.first_stated.time
+        source = now
+    elif isinstance(phase.eta, CurrentStatedPhaseEta):
+        target = phase.eta.time
+        source = phase.eta.stated_at
+    else:
+        target = phase.eta.time
+        source = phase.eta.as_of
+    aware_now = now.replace(tzinfo=target.tzinfo) if now.tzinfo is None else now.astimezone(target.tzinfo)
+    text = record_text(target)
+    old_text = prior.get("text")
+    legacy = isinstance(old_text, str) and re.fullmatch(r"\d{4}-\d\d-\d\dT\d\d:\d\d", old_text) is None
+    unchanged = old_text == text or legacy
+    first_seen_value = prior.get("first_seen")
+    prior_first_seen = (
+        datetime.fromisoformat(first_seen_value) if isinstance(first_seen_value, str) else source
+    )
+    adopted_screen_record = legacy or (old_text == text and prior_first_seen.tzinfo is None)
+    first_seen = (
+        prior_first_seen if adopted_screen_record else source
+    )
+    seen[key] = {
+        "text": text,
+        "first_seen": first_seen.isoformat(timespec="minutes"),
+        "requested": requested,
+    }
+    if isinstance(phase.eta, CurrentPhaseEtaUnavailable):
+        return EtaPassed()
+    if held and unchanged and not requested:
+        return EtaFresh(text, source)
+    if target <= aware_now:
+        return EtaPassed()
+    if aware_now - source > timedelta(hours=1):
+        return EtaStale(text, source)
+    return EtaFresh(text, source)
+
+
+def record_eta_value(
+    phase: NumberedOpenPlanPhase,
+    state: EtaState,
+    supplied: object,
+    now: datetime,
+    requested: bool = False,
+) -> JsonMap:
+    fields = as_map(supplied, "judgment.eta") if supplied is not None else {}
+    if isinstance(state, EtaPassed):
+        return {"none": "none measured - requested"}
+    if isinstance(state, EtaNone):
+        if requested:
+            return {"none": "none measured - requested"}
+        none = fields.get("none")
+        return {"none": none if isinstance(none, str) else "no ETA stated yet"}
+    eta = phase.eta
+    if isinstance(eta, CurrentPhaseEtaUnavailable):
+        return {"none": "no ETA stated yet"}
+    rendered_time = record_clock(eta.time, now)
+    result: JsonMap = {
+        "time": rendered_time,
+        "stated": record_eta_stated(eta.time, state.first_seen, rendered_time).isoformat(timespec="minutes"),
+    }
+    eta_range: RendererSafeRecordEtaRange | RecordEtaRangeOmitted
+    if isinstance(eta, CurrentStatedPhaseEta) and isinstance(eta.range, StatedPhaseEtaRange):
+        eta_range = record_eta_range(
+            eta.time, eta.range.earliest, eta.range.latest, state.first_seen, rendered_time, now)
+    elif isinstance(eta, CurrentProjectedPhaseEta):
+        eta_range = record_eta_range(
+            eta.time, eta.earliest, eta.latest, state.first_seen, rendered_time, now)
+    else:
+        eta_range = RecordEtaRangeOmitted()
+    if isinstance(eta_range, RendererSafeRecordEtaRange):
+        result.update({
+            "earliest": eta_range.earliest,
+            "latest": eta_range.latest,
+        })
+    result["percent"] = phase.percent.percent if isinstance(phase.percent, ReportedPhasePercent) else None
+    if isinstance(phase.first_stated, FirstStatedEtaTarget):
+        result["first"] = record_text(phase.first_stated.time)
+        result["fixes"] = phase.first_stated.repair_rounds
+    if isinstance(eta, CurrentStatedPhaseEta):
+        result["why"] = " ".join(eta.basis.split())
+    else:
+        percent = phase.percent.percent if isinstance(phase.percent, ReportedPhasePercent) else 0
+        result["why"] = f"it is now projected from {percent}% done"
+    result.update(fields)
+    if isinstance(state, EtaStale) and "detail" not in fields:
+        result["detail"] = f"set {state.first_seen:%H:%M}"
     return result
 
 
@@ -240,6 +746,48 @@ def next_due(output: str, now: datetime, zone: ZoneInfo) -> str:
     due = datetime.fromtimestamp(int(match.group(1)), zone)
     days = (due.date() - now.date()).days
     return due.strftime("%H:%M") + (f"+{days}" if days > 0 else "")
+
+
+def last_report_path(slug: str) -> Path:
+    """Where a production saves what the showrunner above it shows of it."""
+    return showrunners.SHOWRUNNER_STATE_DIR / slug / LAST_REPORT
+
+
+def child_fields(child: str, now: datetime, zone: ZoneInfo, *, expand: bool) -> JsonMap:
+    """One production directly below this one: its saved report, and what waits on the user in it and below it."""
+    fields: JsonMap = {"name": child, "expand": expand}
+    path = last_report_path(child)
+    try:
+        saved = cast(object, json.loads(path.read_text(encoding="utf-8")))
+        _ = parse_child_report(saved, str(path), zone)
+    except FileNotFoundError:
+        pass
+    except (InputError, OSError, ValueError) as error:
+        # A saved report that cannot be used costs the row its numbers, never the parent its report.
+        report("children", "unavailable", f"{child}: {error}")
+    else:
+        fields["report"] = saved
+    waiting = 0
+    unreadable: list[str] = []
+    for slug in (child, *showrunners.descendants_of(child)):
+        try:
+            waiting += len(due(read_outstanding(outstanding_file(slug)), now))
+        except (InputError, OSError, ValueError):
+            unreadable.append(slug)
+    fields["open"] = waiting
+    if unreadable:
+        fields["unreadable"] = unreadable
+    return fields
+
+
+def save_last_report(slug: str, saved: JsonMap) -> Path:
+    path = last_report_path(slug)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    # Written beside the file and renamed, so the showrunner above never reads half of one.
+    scratch = path.with_name(f".{path.name}.{os.getpid()}")
+    _ = scratch.write_text(json.dumps(saved, indent=2) + "\n", encoding="utf-8")
+    _ = scratch.replace(path)
+    return path
 
 
 def validate_report(result: JsonMap, holders_path: Path, judgment_path: Path) -> None:
@@ -269,13 +817,31 @@ def run(args: argparse.Namespace) -> int:
     user_run = cast(bool, args.user_run)
     at = cast(str | None, args.at)
     render_state = cast(Path, args.render_state)
+    expand = cast(list[str], args.expand)
     production = read_production(production_path)
     now, _ = local_now(str(production.zone), "--zone", at)
     lines = production.doc.read_text(encoding="utf-8").splitlines()
-    units = units_from_doc(lines)
+    units = units_from_doc(lines, production.slug)
+    table_state = phase_tables(production.doc, production.zone)
+    if isinstance(table_state, PhaseTablesUnavailable):
+        report("phase tables", "unavailable", table_state.reason)
     instance = f"showrunner-{production.slug}"
     blocks = status_blocks(status_path, units)
     report("status", "ok", f"{len(blocks)} units read")
+    # A unit whose run is finished has nothing to report: it needs no judgment entry and is left out,
+    # unless something in it waits on the user, who still has to see it.
+    asking = {block.session for block in blocks
+              if any(isinstance(flag, WAITS_ON_USER) for flag in block.flags)}
+    finished = [unit.name for unit in units
+                if unit.run is unit_lookup.UnitState.RUN_FINISHED and unit.name not in asking]
+    if finished:
+        units = tuple(unit for unit in units if unit.name not in finished)
+        blocks = tuple(block for block in blocks if block.session not in finished)
+        report("status", "ok", f"left out, run finished and nothing waiting on the user: {', '.join(finished)}")
+    if isinstance(table_state, PhaseTablesAvailable):
+        for unit in units:
+            for phase in table_state.could_start.get(unit.name, ()):
+                print(f"parallel check: {unit.name}: Phase {phase} could start")
     for block in blocks:
         first: list[str] = []
         if isinstance(block.state, SessionGone):
@@ -312,39 +878,74 @@ def run(args: argparse.Namespace) -> int:
     missing: list[str] = []
     blocks_by_session = {block.session: block for block in blocks}
     for index, unit in enumerate(units):
-        block = blocks_by_session[unit.session]
-        fields = by_session.get(unit.session, by_session.get(unit.name, {}))
+        block = blocks_by_session[unit.name]
+        fields = by_session.get(unit.name, {})
         result = dict(fields)
-        result["unit"] = unit.session
-        if "build_hold" in result:
-            raise DailiesFailure("build hold", f"{judgment_path}.units[{index}].build_hold: supplied by holder files")
-        if holder_names and unit.session not in holder_names and unit.name not in holder_names:
-            result["build_hold"] = True
-        if "needs_user" not in result and any(isinstance(flag, (FormWaiting, Decision, StillWaiting)) for flag in block.flags):
+        result["unit"] = unit.name
+        for key in ("build_hold", "holds_builds"):
+            if key in result:
+                raise DailiesFailure("build hold", f"{judgment_path}.units[{index}].{key}: supplied by holder files")
+        # A holder is named by its session, which the renderer never sees: its own unit is marked as holding.
+        if holder_names:
+            holds = unit.session in holder_names or unit.name in holder_names
+            result["holds_builds" if holds else "build_hold"] = True
+        if "needs_user" not in result and any(isinstance(flag, WAITS_ON_USER) for flag in block.flags):
             result["needs_user"] = True
         phase = fields.get("phase")
         phase_text = phase if isinstance(phase, str) else ""
-        key = f"{unit.session}|{phase_text}"
+        key = f"{unit.name}|{phase_text}"
         held = fields.get("held")
-        state = eta_state(block, phase_text, seen, now,
-                          held=isinstance(held, str) and bool(held.strip()))
-        if not isinstance(state, EtaNone):
-            eta_touched[key] = None
-        requested = isinstance(eta_requested(seen, key), EtaRequested)
-        result["eta"] = eta_value(state, fields.get("eta"), requested)
-        if isinstance(state, (EtaStale, EtaPassed)):
-            record = seen.get(key)
-            if isinstance(record, dict) and isinstance(eta_requested(seen, key), EtaNotYetRequested):
-                eta_request_candidates[key] = unit.session
-                cast(JsonMap, record)["requested"] = True
+        phase_state: UnitPhaseState = (
+            table_state.units.get(
+                unit.name,
+                NoNumberedOpenPlanPhase(UnitPhaseRecordUnavailable("unit missing from phase-table output")),
+            )
+            if isinstance(table_state, PhaseTablesAvailable)
+            else NoNumberedOpenPlanPhase(UnitPhaseRecordUnavailable(table_state.reason))
+        )
+        judgment_phase = judgment_phase_number(phase_text)
+        record_matches = (
+            isinstance(phase_state, NumberedOpenPlanPhase)
+            and isinstance(judgment_phase, JudgmentNumberedPlanPhase)
+            and judgment_phase.number == phase_state.number
+        )
+        supplied_eta = fields.get("eta")
+        supplied_eta_fields = as_map(supplied_eta, "judgment.eta") if supplied_eta is not None else {}
+        eta_is_decided = "time" in supplied_eta_fields or "none" in supplied_eta_fields
+        held_now = isinstance(held, str) and bool(held.strip())
+        if record_matches and isinstance(phase_state, NumberedOpenPlanPhase):
+            if "started" not in result:
+                result["started"] = record_text(phase_state.started)
+            if eta_is_decided:
+                result["eta"] = dict(supplied_eta_fields)
+            else:
+                state = record_eta_state(phase_state, key, seen, now, held=held_now)
+                if not isinstance(state, EtaNone):
+                    eta_touched[key] = None
+                requested = isinstance(eta_requested(seen, key), EtaRequested)
+                result["eta"] = record_eta_value(phase_state, state, supplied_eta, now, requested)
+                if isinstance(state, (EtaStale, EtaPassed)):
+                    record = seen.get(key)
+                    if isinstance(record, dict) and isinstance(eta_requested(seen, key), EtaNotYetRequested):
+                        eta_request_candidates[key] = unit.name
+                        cast(JsonMap, record)["requested"] = True
+        else:
+            state = eta_state(block, phase_text, seen, now, ZoneInfo(str(production.zone)), held=held_now)
+            if not isinstance(state, EtaNone):
+                eta_touched[key] = None
+            requested = isinstance(eta_requested(seen, key), EtaRequested)
+            result["eta"] = eta_value(state, supplied_eta, requested)
+            if isinstance(state, (EtaStale, EtaPassed)):
+                record = seen.get(key)
+                if isinstance(record, dict) and isinstance(eta_requested(seen, key), EtaNotYetRequested):
+                    eta_request_candidates[key] = unit.name
+                    cast(JsonMap, record)["requested"] = True
         for key in ("project", "phase", "started", "held", "update"):
             if key not in result or (key != "held" and result[key] is None):
                 missing.append(f"units[{index}].{key}: required")
         units_out.append(result)
     if missing:
         raise DailiesFailure("judgment", f"{judgment_path}: " + "; ".join(missing))
-    if bool(holder_names) != any(bool(unit.get("build_hold")) for unit in units_out):
-        raise DailiesFailure("build hold", "units.build_hold: holder files and unit markers disagree")
     report("build hold", "ok", f"{len(holder_names)} active holders checked")
     try:
         review = review_watch(production, state_dir)
@@ -359,6 +960,16 @@ def run(args: argparse.Namespace) -> int:
     report("review watch", "ok", review_line or "no open review watch")
     if isinstance(review, WatchFirstAlert):
         print(review.table)
+    upgrade = bevy_upgrade_watch(production)
+    if isinstance(upgrade, NoOpenBevyUpgradeWatch):
+        report("bevy upgrade", "ok", "no open watch")
+    else:
+        update = bounded_bevy_update(upgrade.update if isinstance(upgrade, OpenBevyUpgradeWatch)
+                                     else f"the record could not be read: {upgrade.reason}")
+        topics_out.append({"title": "Bevy upgrade", "update": update,
+                           "eta": "no ETA stated yet",
+                           "needs_user": isinstance(upgrade, OpenBevyUpgradeWatch) and upgrade.needs_user})
+        report("bevy upgrade", "ok" if isinstance(upgrade, OpenBevyUpgradeWatch) else "unavailable", update)
     history = merge_branch_history(production.checkout, production.merge_branch)
     last = history.last_merge()
     local = git(production.checkout, "rev-parse", production.merge_branch)
@@ -379,6 +990,28 @@ def run(args: argparse.Namespace) -> int:
                            "eta": str(merge.get("eta") or "no ETA stated yet"), "needs_user": bool(merge.get("needs_user", False))})
     report("merge branch", "ok", "pushed" if pushed else "not pushed")
     result: JsonMap = {"length": length, "zone": str(production.zone), "units": units_out, "topics": topics_out}
+    root = showrunners.place_of(production.slug).root
+    if root:
+        result["reports_to"] = root
+    children = showrunners.children_of(production.slug)
+    strangers = [name for name in expand if name != EXPAND_ALL and name not in children]
+    if strangers:
+        raise DailiesFailure("expand", f"{', '.join(strangers)}: not directly below {production.slug}; "
+                             + (f"choose from {', '.join(children)} or {EXPAND_ALL}" if children
+                                else "no production reports to it"))
+    if children:
+        result["children"] = [child_fields(child, now, production.zone, expand=EXPAND_ALL in expand or child in expand)
+                              for child in children]
+        report("children", "ok", f"{len(children)} below: {', '.join(children)}")
+    # A bad config line costs only the counts line, never the report.
+    try:
+        counts = production_counts(production.slug)
+    except CountsFailure as failure:
+        report("counts", "unavailable", str(failure))
+    else:
+        if counts:
+            result["counts"] = counts
+            report("counts", "ok", f"{len(counts)} from dailies.conf")
     validate_report(result, holders_path, judgment_path)
     checked = check_render_state(result, render_state, at)
     if isinstance(checked, StateRefused):
@@ -388,16 +1021,24 @@ def run(args: argparse.Namespace) -> int:
         production.log.parent.mkdir(parents=True, exist_ok=True)
         with production.log.open("a", encoding="utf-8"):
             pass
-    action = "restart" if user_run else "status"
-    clock = command(notifier, action, instance)
-    if clock.returncode:
-        raise DailiesFailure("clock", clock.stderr.strip() or clock.stdout.strip())
-    result["next_run"] = next_due(clock.stdout, now, production.zone)
-    if user_run:
-        production.log.parent.mkdir(parents=True, exist_ok=True)
-        with production.log.open("a", encoding="utf-8") as log:
-            _ = log.write(next(line for line in clock.stdout.splitlines() if line.startswith("next_due=")) + "\n")
-    report("clock", "ok", str(result["next_run"]))
+    try:
+        schedule = update_schedule(lines)
+    except RegistrationFailure as failure:
+        raise DailiesFailure("clock", str(failure)) from failure
+    if isinstance(schedule, UpdatesOnDemand):
+        # No schedule runs, so there is no clock to restart and the report names no next run.
+        report("clock", "ok", "on demand: no scheduled dailies")
+    else:
+        action = "restart" if user_run else "status"
+        clock = command(notifier, action, instance)
+        if clock.returncode:
+            raise DailiesFailure("clock", clock.stderr.strip() or clock.stdout.strip())
+        result["next_run"] = next_due(clock.stdout, now, production.zone)
+        if user_run:
+            production.log.parent.mkdir(parents=True, exist_ok=True)
+            with production.log.open("a", encoding="utf-8") as log:
+                _ = log.write(next(line for line in clock.stdout.splitlines() if line.startswith("next_due=")) + "\n")
+        report("clock", "ok", str(result["next_run"]))
     validate_report(result, holders_path, judgment_path)
     report("judgment", "ok", f"{len(units_out)} units accepted")
     def merge_eta_records(fresh: JsonMap) -> tuple[str, ...]:
@@ -421,19 +1062,30 @@ def run(args: argparse.Namespace) -> int:
     out.parent.mkdir(parents=True, exist_ok=True)
     _ = out.write_text(json.dumps(result, indent=2) + "\n", encoding="utf-8")
     report("input", "ok", f"wrote {out}")
+    # What the showrunner above this one shows of it. Failing to save it never costs this report.
+    interval = None if isinstance(schedule, UpdatesOnDemand) else schedule.minutes
+    try:
+        saved_at = save_last_report(production.slug, last_report(result, render_state, at, interval))
+    except (InputError, OSError) as error:
+        report("saved report", "unavailable", str(error))
+    else:
+        report("saved report", "ok", f"wrote {saved_at}")
     return 0
 
 
 def main() -> int:
+    override_guard.refuse_overrides(Path(__file__), "production/dailies_input.py")
     parser = argparse.ArgumentParser(description=__doc__)
     for name in ("production", "status", "judgment", "state-dir", "out"):
         _ = parser.add_argument(f"--{name}", required=True, type=Path)
-    _ = parser.add_argument("--length", choices=("simple", "page", "elaborate"), default="simple")
+    _ = parser.add_argument("--length", choices=("gantt", "simple", "page", "elaborate"), default="gantt")
     _ = parser.add_argument("--holders", type=Path)
     _ = parser.add_argument("--notifier", type=Path)
     _ = parser.add_argument("--render-state", required=True, type=Path)
     _ = parser.add_argument("--at")
     _ = parser.add_argument("--user-run", action="store_true")
+    _ = parser.add_argument("--expand", action="append", default=[], metavar="CHILD",
+                            help=f"also print this lower production's own rows; `{EXPAND_ALL}` for every one")
     args = parser.parse_args()
     try:
         return run(args)

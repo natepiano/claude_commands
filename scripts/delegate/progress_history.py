@@ -12,15 +12,21 @@ import re
 import shutil
 import statistics
 import subprocess
+import sys
 import tempfile
 import time
 import uuid
 from collections import defaultdict
 from collections.abc import Callable, Iterable
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from functools import cache
 from pathlib import Path
-from typing import TypedDict, cast
+from typing import NamedTuple, NoReturn, TypedDict, cast
+
+if not __package__:
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from scripts.lib.user_zone import user_zone  # noqa: E402
 
 
 SCHEMA_VERSION = 1
@@ -55,6 +61,23 @@ STATE_FILENAME = "progress_history_state.json"
 # marker is presentation-only: it opens no pass, and `findings.py` counts pass
 # events, so convergence never sees it.
 ARMED_REVIEW_KEY = "early_review"
+# A phase stays open until its own finish-phase, however many phases start after
+# it: a unit can run Phase 18 while Phase 6's workers are still working. State
+# holds the most recently started open phase under `phase`, which every reader
+# that needs "the open phase" uses, and the older open ones here, oldest first.
+OPEN_PHASES_KEY = "open_phases"
+# The state that describes the current phase alone. A phase a newer one
+# displaces keeps its own copy under PARKED_KEY, and gets it back when the newer
+# one finishes and it is current again.
+PHASE_SCOPED_KEYS = (
+    ARMED_REVIEW_KEY,
+    "phase_last_percent",
+    "phase_percent_started_at",
+    "last_percent",
+    "percent_started_at",
+    "pending_calibration",
+)
+PARKED_KEY = "parked"
 PROJECT_STARTED_PATTERN = re.compile(
     r"^[ \t]*-[ \t]+\*\*Project started:\*\*[ \t]*(?P<value>.+?)[ \t]*$",
     re.MULTILINE,
@@ -79,6 +102,8 @@ PHASE_STATUS_PATTERN = re.compile(r"·[ \t]*status:[ \t]*(?P<status>todo|done)\b
 # section inside one. A real phase heading always names a title after an
 # em-dash separator.
 PHASE_TITLE_PATTERN = re.compile(r"^[ \t]*[—–-][ \t]*\S")
+DEPENDS_ON_PATTERN = re.compile(r"^\*\*Depends on:\*\*[ \t]*(?P<list>[^\n]*)$", re.MULTILINE)
+BLOCKED_BY_PATTERN = re.compile(r"^\*\*Blocked by:\*\*[ \t]*(?P<gate>G\d+)", re.MULTILINE)
 
 # A percentage is an estimate; a stage is a fact. These ceilings keep an
 # optimistic estimate from claiming a gate that has not run — the failure mode
@@ -134,9 +159,9 @@ class StageWindow(TypedDict):
 
     Two tables read these. `timeline` renders one row apiece, which is the
     provenance view. The progress report groups them by `fix_round` and lays the
-    seats out as columns, which is why `slot` is carried here rather than
-    recovered later: a window with no seat is a unit-director activity, and it is
-    the absence of a seat that tells the two apart.
+    workers out as columns, which is why `slot` is carried here rather than
+    recovered later: a window with no worker is a unit-director activity, and it is
+    the absence of a worker that tells the two apart.
     """
 
     instance_id: str
@@ -146,7 +171,7 @@ class StageWindow(TypedDict):
     label: str
     # What the window actually ran, for an activity: the `--activity` text the
     # unit director opened it with ("test hana"). Empty for passes, whose work is
-    # described by kind and seat. The gate notes under the round table are the
+    # described by kind and worker. The gate notes under the round table are the
     # one reader of it -- the label alone renders a block of verification
     # commands as identical rows.
     text: str
@@ -166,6 +191,30 @@ class FindingTally(TypedDict):
     reopened: int
 
 
+class PlanPhase(TypedDict):
+    """One real phase heading, classified as the plan records it now."""
+
+    id: str
+    title: str
+    done: bool
+    # The phases its `**Depends on:**` line names; None when the line is absent.
+    depends_on: list[str] | None
+    # The gate its `**Blocked by:**` line names; empty when none.
+    blocked_by: str
+
+
+class EtaBand(NamedTuple):
+    """Remaining seconds and the earliest and latest plausible arrivals."""
+
+    remaining: int
+    earliest: int
+    latest: int
+
+
+class EtaProjectionUnavailable(NamedTuple):
+    """The reported progress cannot support an ETA projection."""
+
+
 def _history_root() -> Path:
     configured = os.environ.get("PLAN_DELEGATE_HISTORY_DIR")
     if configured:
@@ -173,7 +222,7 @@ def _history_root() -> Path:
     return Path.home() / ".local" / "state" / "plan-delegate"
 
 
-def _now_epoch() -> float:
+def now_epoch() -> float:
     configured = os.environ.get("PLAN_DELEGATE_NOW_EPOCH")
     if configured:
         return float(configured)
@@ -216,7 +265,7 @@ def _config_digest() -> str:
 
     Cached for the life of the process: one launcher records one pass, and both
     files answer the same way every call. This is telemetry and must never stop
-    a delegate run, so an unreadable file returns empty rather than raising --
+    a unit run, so an unreadable file returns empty rather than raising --
     and empty rather than the hash of the half that could be read, which would
     name a configuration this process never saw and group unlike passes under it.
     """
@@ -328,6 +377,26 @@ def _arg_integer(args: argparse.Namespace, name: str, default: int = 0) -> int:
     return _integer(value, default)
 
 
+def _refuse_eta(message: str) -> NoReturn:
+    print(message, file=sys.stderr)
+    raise SystemExit(2)
+
+
+def _local_eta_epoch(value: str, option: str) -> float:
+    layout = "%Y-%m-%dT%H:%M"
+    try:
+        parsed = datetime.strptime(value, layout)
+    except ValueError:
+        _refuse_eta(f"{option} must use YYYY-MM-DDTHH:MM")
+    if parsed.strftime(layout) != value:
+        _refuse_eta(f"{option} must use YYYY-MM-DDTHH:MM")
+    zone = user_zone()
+    epoch = parsed.replace(tzinfo=zone).timestamp()
+    if datetime.fromtimestamp(epoch, zone).strftime(layout) != value:
+        _refuse_eta(f"{option} is a time the local clock skips")
+    return epoch
+
+
 def _session_dir(args: argparse.Namespace) -> Path:
     value = _arg_string(args, "session_dir")
     if not value:
@@ -366,6 +435,49 @@ def _write_state(session_dir: Path, state: dict[str, object]) -> None:
     os.replace(temporary, target)
 
 
+def _refresh_phase_table(session_dir: Path) -> None:
+    """Rewrite a production unit's phase note without affecting the recorder."""
+    try:
+        state = _read_state(session_dir)
+        plan_doc = _string(state.get("project_plan_doc")) or _string(
+            state.get("plan_doc")
+        )
+        if not plan_doc:
+            return
+        plan_path = resolve_plan_path(
+            Path(_string(state.get("working_dir"))),
+            plan_doc,
+        )
+        if "> **Production:" not in plan_path.read_text(encoding="utf-8"):
+            return
+    except (OSError, UnicodeError, SystemExit):
+        return
+
+    command = [
+        sys.executable,
+        str(Path(__file__).with_name("phase_table.py")),
+        "refresh",
+        "--session-dir",
+        str(session_dir),
+    ]
+    try:
+        result = subprocess.run(
+            command,
+            check=False,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=10,
+        )
+    except (OSError, subprocess.TimeoutExpired) as error:
+        print(f"phase table not written: {error}", file=sys.stderr)
+        return
+    if result.returncode == 0:
+        return
+    reason = " ".join(result.stderr.split()) or f"exit status {result.returncode}"
+    print(f"phase table not written: {reason}", file=sys.stderr)
+
+
 def _append_event(state: dict[str, object], event: dict[str, object]) -> None:
     history_file_value = _string(state.get("history_file"))
     if not history_file_value:
@@ -377,7 +489,9 @@ def _append_event(state: dict[str, object], event: dict[str, object]) -> None:
         fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
         _ = handle.write(line)
         handle.flush()
-        os.fsync(handle.fileno())
+        # Disposable fixtures may omit disk durability; production syncs by default.
+        if os.environ.get("PLAN_DELEGATE_SYNC_WRITES", "1") != "0":
+            os.fsync(handle.fileno())
         fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
 
@@ -529,9 +643,63 @@ def _iso_epoch(value: str, context: str) -> float:
     return parsed.timestamp()
 
 
-def _plan_path(working_dir: Path, value: str) -> Path:
+def resolve_plan_path(working_dir: Path, value: str) -> Path:
     path = Path(value).expanduser()
     return path.resolve() if path.is_absolute() else (working_dir / path).resolve()
+
+
+def _plan_phase_details(plan_path: Path) -> tuple[list[PlanPhase], list[str]]:
+    text = plan_path.read_text(encoding="utf-8")
+    phases: list[PlanPhase] = []
+    seen: set[str] = set()
+    duplicates: list[str] = []
+    headings = list(PHASE_HEADING_PATTERN.finditer(text))
+    for position, match in enumerate(headings):
+        rest = match.group("rest")
+        status_match = PHASE_STATUS_PATTERN.search(rest)
+        # `### Phase 12 Review` and its like are sections, not phases.
+        if status_match is None and not PHASE_TITLE_PATTERN.match(rest):
+            continue
+        identifier = match.group("id")
+        if identifier in seen:
+            duplicates.append(identifier)
+            continue
+        seen.add(identifier)
+        title_text = rest if status_match is None else rest[: status_match.start()]
+        title_text = re.sub(r"^[ \t]*[—–-][ \t]*", "", title_text, count=1)
+        title = re.sub(
+            r"[ \t]+\((?:commit[ \t]+)?(?:`[0-9a-fA-F]{7,40}`|[0-9a-fA-F]{7,40})\)[ \t]*$",
+            "",
+            title_text,
+        ).strip()
+        # No status marker means the phase was shrunk into its as-built record,
+        # which only happens after the phase completed.
+        done = status_match is None or status_match.group("status") == "done"
+        end = headings[position + 1].start() if position + 1 < len(headings) else len(text)
+        body = text[match.end() : end]
+        depends_match = DEPENDS_ON_PATTERN.search(body)
+        depends_on = (
+            None
+            if depends_match is None
+            else re.findall(r"\b\d+[a-z]?\b", depends_match.group("list"))
+        )
+        blocked_match = BLOCKED_BY_PATTERN.search(body)
+        phases.append(
+            PlanPhase(
+                id=identifier,
+                title=title,
+                done=done,
+                depends_on=depends_on,
+                blocked_by="" if blocked_match is None else blocked_match.group("gate"),
+            )
+        )
+    return phases, duplicates
+
+
+def plan_phases(plan_path: Path) -> list[PlanPhase]:
+    """Return the plan's unique phase headings in document order."""
+    phases, _ = _plan_phase_details(plan_path)
+    return phases
 
 
 def _count_plan_phases(plan_path: Path) -> dict[str, object]:
@@ -542,32 +710,11 @@ def _count_plan_phases(plan_path: Path) -> dict[str, object]:
     silently corrupts every project percentage the run reports.
     """
     try:
-        text = plan_path.read_text(encoding="utf-8")
+        phases, duplicates = _plan_phase_details(plan_path)
     except OSError:
         return {"available": False, "reason": f"unable to read {plan_path}"}
-    done = 0
-    todo = 0
-    seen: set[str] = set()
-    order: list[str] = []
-    duplicates: list[str] = []
-    for match in PHASE_HEADING_PATTERN.finditer(text):
-        rest = match.group("rest")
-        status_match = PHASE_STATUS_PATTERN.search(rest)
-        if status_match is None and not PHASE_TITLE_PATTERN.match(rest):
-            # `### Phase 12 Review` and friends — a section, not a phase.
-            continue
-        identifier = match.group("id")
-        if identifier in seen:
-            duplicates.append(identifier)
-            continue
-        seen.add(identifier)
-        order.append(identifier)
-        # No status marker means the phase was shrunk into an as-built record,
-        # which only ever happens after it completed.
-        if status_match is not None and status_match.group("status") == "todo":
-            todo += 1
-        else:
-            done += 1
+    done = sum(phase["done"] for phase in phases)
+    todo = len(phases) - done
     total = done + todo
     if total == 0:
         return {"available": False, "reason": f"no phase headings in {plan_path}"}
@@ -576,7 +723,7 @@ def _count_plan_phases(plan_path: Path) -> dict[str, object]:
         "done": done,
         "todo": todo,
         "total": total,
-        "order": order,
+        "order": [phase["id"] for phase in phases],
         "duplicate_ids": sorted(set(duplicates)),
     }
 
@@ -658,7 +805,7 @@ def _explicit_plan_timing(
     plan_doc: str,
     now: float,
 ) -> ProjectTiming:
-    plan_path = _plan_path(working_dir, plan_doc)
+    plan_path = resolve_plan_path(working_dir, plan_doc)
     existing = _read_plan_project_start(plan_path)
     if existing is not None:
         return ProjectTiming(
@@ -711,6 +858,31 @@ def _run_started_event(path: Path) -> dict[str, object] | None:
     return event
 
 
+def plan_runs(plan_path: Path) -> list[Path]:
+    """Return this plan's durable run files, oldest first."""
+    target = plan_path.expanduser().resolve()
+    try:
+        paths = list((_history_root() / "runs").glob("*.jsonl"))
+    except OSError:
+        return []
+    matches: list[tuple[float, str, Path]] = []
+    for path in paths:
+        event = _run_started_event(path)
+        if event is None:
+            continue
+        working_dir = _string(event.get("working_dir"))
+        plan_doc = _string(event.get("plan_doc"))
+        if not working_dir or not plan_doc:
+            continue
+        if resolve_plan_path(Path(working_dir), plan_doc) != target:
+            continue
+        started_at = _number(
+            event.get("run_started_at"), _number(event.get("timestamp_epoch"))
+        )
+        matches.append((started_at, path.name, path))
+    return [path for _, _, path in sorted(matches)]
+
+
 def _historical_project_timing(
     working_dir: Path,
     branch: str,
@@ -746,7 +918,7 @@ def _historical_project_timing(
     project_plan_doc = _string(latest_event.get("project_plan_doc")) or _string(
         latest_event.get("plan_doc")
     )
-    plan_path = _plan_path(working_dir, project_plan_doc)
+    plan_path = resolve_plan_path(working_dir, project_plan_doc)
     if plan_path.is_file():
         existing = _read_plan_project_start(plan_path)
         if existing is not None:
@@ -797,13 +969,13 @@ def _ensure_project_timing(
     return state
 
 
-# The seat this launcher occupies in its phase team, exported by implement.sh
+# The worker this launcher occupies in its phase team, exported by implement.sh
 # before it calls start-pass. A phase runs two launchers against one state
 # file and each records its own pass, so this is the key their windows are kept
 # apart under -- without it a team phase and a solo phase produce identical rows.
 #
-# The variable says role and its value is a seat: `impl` and `test` name the
-# two chairs, not the work done in them. Both seats can be implementing at one moment and reviewing at another; the role a seat holds
+# The variable says role and its value is a worker: `impl` and `test` name the
+# two chairs, not the work done in them. Both workers can be implementing at one moment and reviewing at another; the role a worker holds
 # right now lives on the coordination board, which records it as a `handoff` and
 # never writes it here. Reading the value as a role is the mistake this comment
 # exists to stop -- the variable is the half with the wrong name, and it stays
@@ -812,9 +984,9 @@ TEAM_SLOT_ENV = "PLAN_DELEGATE_TEAM_ROLE"
 
 
 def _team_slot() -> str:
-    """The recording member's seat, empty when nothing named one.
+    """The recording member's worker, empty when nothing named one.
 
-    Empty is a seat like any other rather than a missing value: passes predating
+    Empty is a worker like any other rather than a missing value: passes predating
     the field, and every recorder that does not run through implement.sh --
     review.sh included -- record under it, and must stay distinguishable from a
     launcher that really is sitting in `impl`.
@@ -823,11 +995,11 @@ def _team_slot() -> str:
 
 
 def _record_slot(record: dict[str, object]) -> str:
-    """The seat stamped on a pass record, under whichever key wrote it.
+    """The worker stamped on a pass record, under whichever key wrote it.
 
     The field was `team_role` for a day, until the value turned out to name the
-    seat rather than the work. A run in flight across that change holds the old
-    key on a pass it has already opened, and must not lose its seat halfway
+    worker rather than the work. A run in flight across that change holds the old
+    key on a pass it has already opened, and must not lose its worker halfway
     through.
     """
     if "team_slot" in record:
@@ -840,7 +1012,7 @@ def _pass_slots(state: dict[str, object]) -> dict[str, dict[str, object]]:
 
     Returns the records state itself holds, so a caller that changes one changes
     state. State written before the phase team existed holds a single pass
-    object instead of a map; it reads as the entry for its own seat,
+    object instead of a map; it reads as the entry for its own worker,
     which is how a run already in flight keeps its open pass. Migration happens
     in memory and reaches disk only when something else writes state -- a run is
     never rewritten for the change alone.
@@ -867,6 +1039,103 @@ def _open_passes(state: dict[str, object]) -> dict[str, dict[str, object]]:
     }
 
 
+def _pass_phase_instance(record: dict[str, object]) -> str:
+    """The instance id of the phase a pass was opened in; empty for a pass older than the stamp."""
+    phase = _object_dict(record.get("phase"))
+    return _string(phase.get("instance_id")) if phase is not None else ""
+
+
+def _phase_stamp(phase: dict[str, object]) -> dict[str, object]:
+    """The fields a pass carries to name the phase it was opened in."""
+    return {
+        "instance_id": _string(phase.get("instance_id")),
+        "id": _string(phase.get("id")),
+        "title": _string(phase.get("title")),
+        "started_at": _number(phase.get("started_at")),
+    }
+
+
+def _parked_phases(state: dict[str, object]) -> list[dict[str, object]]:
+    """The older open phases, oldest first. Returns the list state holds."""
+    raw = state.get(OPEN_PHASES_KEY)
+    items = cast(list[object], raw) if isinstance(raw, list) else []
+    parked = [record for item in items if (record := _object_dict(item)) is not None]
+    state[OPEN_PHASES_KEY] = parked
+    return parked
+
+
+def _park_current(state: dict[str, object], current: dict[str, object]) -> None:
+    """Move the current phase among the older open ones, with its own state.
+
+    Its open passes stay in the slot map, where their launchers close them; a
+    pass opened before passes carried a phase gains this one's stamp, so the
+    phase that finishes later cannot claim it.
+    """
+    for record in _open_passes(state).values():
+        if "phase" not in record:
+            record["phase"] = _phase_stamp(current)
+    current[PARKED_KEY] = {key: state.get(key) for key in PHASE_SCOPED_KEYS}
+    _parked_phases(state).append(current)
+
+
+def _unpark_newest(state: dict[str, object]) -> None:
+    """Make the most recently started older open phase current again."""
+    parked = _parked_phases(state)
+    if not parked:
+        return
+    phase = parked.pop()
+    saved = _object_dict(phase.pop(PARKED_KEY, None)) or {}
+    for key in PHASE_SCOPED_KEYS:
+        state[key] = saved.get(key)
+    state["phase"] = phase
+
+
+def _open_phase_named(state: dict[str, object], phase_id: str) -> dict[str, object] | None:
+    """The open phase with this id: the current one, or an older one still open."""
+    current = _object_dict(state.get("phase"))
+    if current is not None and _string(current.get("status")) == "active":
+        if _string(current.get("id")) == phase_id:
+            return current
+    for phase in _parked_phases(state):
+        if _string(phase.get("id")) == phase_id:
+            return phase
+    return None
+
+
+def _open_phase_ids(state: dict[str, object]) -> list[str]:
+    current = _object_dict(state.get("phase"))
+    ids = [_string(phase.get("id")) for phase in _parked_phases(state)]
+    if current is not None and _string(current.get("status")) == "active":
+        ids.append(_string(current.get("id")))
+    return ids
+
+
+def _optional_arg(args: argparse.Namespace, name: str) -> str:
+    """An option callers added after the recorder's own internal calls were written."""
+    value: object = getattr(args, name, "")
+    return value if isinstance(value, str) else ""
+
+
+def _optional_epoch(args: argparse.Namespace, name: str, option: str, now: float) -> float:
+    """A past moment an option names, for a phase recorded after the fact; now when absent."""
+    value = _optional_arg(args, name)
+    if not value:
+        return now
+    text = value.strip()
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError as error:
+        raise SystemExit(f"{option} must be an ISO 8601 time with a zone; got {value}") from error
+    if parsed.tzinfo is None:
+        raise SystemExit(f"{option} must be an ISO 8601 time with a zone; got {value}")
+    moment = parsed.timestamp()
+    if moment > now:
+        raise SystemExit(f"{option} {value} is in the future")
+    return moment
+
+
 def _reporting_pass(state: dict[str, object]) -> dict[str, object] | None:
     """The open pass a call that is not a pass lifecycle call reports against.
 
@@ -881,8 +1150,14 @@ def _reporting_pass(state: dict[str, object]) -> dict[str, object] | None:
     own = open_passes.get(_team_slot())
     if own is not None:
         return own
+    current = _object_dict(state.get("phase"))
+    current_id = _string(current.get("instance_id")) if current is not None else ""
     ordered = sorted(
-        open_passes.items(),
+        (
+            entry
+            for entry in open_passes.items()
+            if _pass_phase_instance(entry[1]) in ("", current_id)
+        ),
         key=lambda entry: (_number(entry[1].get("started_at")), entry[0]),
     )
     return ordered[0][1] if ordered else None
@@ -893,6 +1168,7 @@ def _event(
     event_type: str,
     now: float,
     pass_record: dict[str, object] | None = None,
+    phase_record: dict[str, object] | None = None,
 ) -> dict[str, object]:
     event: dict[str, object] = {
         "schema_version": SCHEMA_VERSION,
@@ -913,7 +1189,20 @@ def _event(
         "project_plan_doc": _string(state.get("project_plan_doc")),
         "main_agent": state.get("main_agent", {}),
     }
-    phase = _object_dict(state.get("phase"))
+    # An event that names its phase is that phase's own record, so the pass or
+    # activity running in another phase does not belong on it.
+    current_pass = pass_record
+    if current_pass is None and phase_record is None:
+        current_pass = _reporting_pass(state)
+    # The phase an event belongs to: the one the caller names, else the one the
+    # pass it reports against was opened in, else the current one. A pass of an
+    # older open phase that finishes after a newer phase started still belongs
+    # to the phase it worked for.
+    phase = phase_record
+    if phase is None and current_pass is not None:
+        phase = _object_dict(current_pass.get("phase"))
+    if phase is None:
+        phase = _object_dict(state.get("phase"))
     if phase is not None:
         event.update(
             {
@@ -929,7 +1218,6 @@ def _event(
     # delegate happened to run before it. A pass lifecycle event names its own
     # record instead: several slots are open at once, and the launcher that
     # closes a stale pass is not always the one that opened it.
-    current_pass = pass_record if pass_record is not None else _reporting_pass(state)
     if current_pass is not None and _string(current_pass.get("status")) == "active":
         event.update(
             {
@@ -942,7 +1230,7 @@ def _event(
                 "called_task": _string(current_pass.get("called_task")),
             }
         )
-    activity = _object_dict(state.get("activity"))
+    activity = _object_dict(state.get("activity")) if phase_record is None else None
     if activity is not None and _string(activity.get("status")) == "active":
         event.update(
             {
@@ -975,8 +1263,8 @@ def _close_slot_pass(
     event = _event(state, "pass_finished", now, current_pass)
     event["status"] = status
     # Taken from the pass, not from the environment. A stale pass is closed by
-    # whichever launcher starts the next one in that seat, and reading the
-    # environment here would stamp the closer's seat onto the opener's work.
+    # whichever launcher starts the next one in that worker, and reading the
+    # environment here would stamp the closer's worker onto the opener's work.
     event["team_slot"] = _record_slot(current_pass)
     event["pass_elapsed_seconds"] = max(
         0,
@@ -998,22 +1286,6 @@ def _close_slot_pass(
     current_pass["finished_at"] = now
     _write_state(session_dir, state)
     return True
-
-
-def _close_open_passes(
-    session_dir: Path,
-    state: dict[str, object],
-    status: str,
-    now: float,
-) -> None:
-    """Close every slot's open pass, for a phase or a run that is ending.
-
-    A team phase leaves up to one window open per member. Closing a single one
-    of them leaves the rest open forever: the launchers that would have closed
-    them are the processes that just went away.
-    """
-    for slot in sorted(_open_passes(state)):
-        _ = _close_slot_pass(session_dir, state, slot, status, now)
 
 
 def _close_active_activity(
@@ -1043,10 +1315,11 @@ def _close_active_activity(
 def _start_activity(args: argparse.Namespace) -> None:
     session_dir = _session_dir(args)
     state = _read_state(session_dir)
-    phase = _object_dict(state.get("phase"))
-    if phase is None or _string(phase.get("status")) != "active":
+    if _string(state.get("status")) != "active":
+        raise SystemExit("Cannot start an activity: the run is finished")
+    if _object_dict(state.get("phase")) is None:
         raise SystemExit("Start a phase before starting an activity")
-    now = _now_epoch()
+    now = now_epoch()
     _close_active_activity(session_dir, state, "interrupted", "", now)
     state = _read_state(session_dir)
     _refresh_main_identity(state)
@@ -1071,7 +1344,7 @@ def _finish_activity(args: argparse.Namespace) -> None:
         state,
         status,
         _arg_string(args, "result"),
-        _now_epoch(),
+        now_epoch(),
     )
 
 
@@ -1082,7 +1355,7 @@ def _start_run(args: argparse.Namespace) -> None:
         state = _ensure_project_timing(
             session_dir,
             _read_state(session_dir),
-            _now_epoch(),
+            now_epoch(),
         )
         print(_string(state.get("history_file"), str(existing)))
         return
@@ -1091,7 +1364,7 @@ def _start_run(args: argparse.Namespace) -> None:
     if not working_dir_value:
         raise SystemExit("--working-dir is required")
     working_dir = Path(working_dir_value).expanduser().resolve()
-    now = _now_epoch()
+    now = now_epoch()
     run_id = session_dir.name
     branch = _git_value(working_dir, "branch", "--show-current")
     if not branch:
@@ -1119,6 +1392,7 @@ def _start_run(args: argparse.Namespace) -> None:
         "project_plan_doc": project_timing["plan_doc"],
         "main_agent": main_agent,
         "phase": None,
+        OPEN_PHASES_KEY: [],
         "pass": {},
         "project_last_percent": None,
         "project_percent_started_at": None,
@@ -1167,23 +1441,28 @@ def _work_order_metrics(work_order_file: str) -> dict[str, object]:
 def _start_phase(args: argparse.Namespace) -> None:
     session_dir = _session_dir(args)
     state = _read_state(session_dir)
-    now = _now_epoch()
+    now = now_epoch()
+    phase_id = _arg_string(args, "phase_id", "ad hoc")
+    # Starting a phase that is already open does nothing. Starting any other
+    # leaves every open phase open: each closes only by its own finish-phase.
+    if _open_phase_named(state, phase_id) is not None:
+        return
+    started_at = _optional_epoch(args, "started_at", "--started-at", now)
+    _close_active_activity(session_dir, state, "interrupted", "", now)
+    state = _read_state(session_dir)
     active = _object_dict(state.get("phase"))
     if active is not None and _string(active.get("status")) == "active":
-        if _string(active.get("id")) == _arg_string(args, "phase_id"):
-            return
-        raise SystemExit(
-            f"Phase {_string(active.get('id'))} is still active; finish it before starting another"
-        )
+        _park_current(state, active)
+    else:
+        state["pass"] = {}
     phase: dict[str, object] = {
         "instance_id": str(uuid.uuid4()),
-        "id": _arg_string(args, "phase_id", "ad hoc"),
+        "id": phase_id,
         "title": _arg_string(args, "phase_title", "Ad hoc work"),
-        "started_at": now,
+        "started_at": started_at,
         "status": "active",
     }
     state["phase"] = phase
-    state["pass"] = {}
     state[ARMED_REVIEW_KEY] = None
     state["phase_last_percent"] = None
     state["phase_percent_started_at"] = None
@@ -1191,9 +1470,13 @@ def _start_phase(args: argparse.Namespace) -> None:
     state["percent_started_at"] = None
     state["pending_calibration"] = None
     _write_state(session_dir, state)
-    event = _event(state, "phase_started", now)
+    event = _event(state, "phase_started", started_at)
+    if started_at != now:
+        event["recorded_at"] = _iso_time(now)
+        event["backfilled"] = True
     event.update(_work_order_metrics(_arg_string(args, "work_order_file")))
     _append_event(state, event)
+    _refresh_phase_table(session_dir)
 
 
 def _start_pass(args: argparse.Namespace) -> None:
@@ -1213,7 +1496,7 @@ def _start_pass(args: argparse.Namespace) -> None:
     phase = _object_dict(state.get("phase"))
     if phase is None or _string(phase.get("status")) != "active":
         raise SystemExit("Start a phase before starting a pass")
-    now = _now_epoch()
+    now = now_epoch()
     # This slot's stale pass and no other. The peers belong to launchers still
     # waiting on their own agents, and a phase team opens both within the same
     # second: closing them here is the corruption this key exists to
@@ -1230,6 +1513,7 @@ def _start_pass(args: argparse.Namespace) -> None:
         "called_task": _arg_string(args, "called_task"),
         "called_agent": called_agent,
         "team_slot": team_slot,
+        "phase": _phase_stamp(phase),
         "status": "active",
     }
     slots = _pass_slots(state)
@@ -1269,7 +1553,7 @@ def _finish_pass(args: argparse.Namespace) -> None:
         state,
         slot,
         status,
-        _now_epoch(),
+        now_epoch(),
         _arg_integer(args, "agent_awake_seconds", -1),
     )
     if orphaned and not closed:
@@ -1334,7 +1618,7 @@ def _arm_review(args: argparse.Namespace) -> None:
             + "a pass must be open. With none open the review is not early -- "
             + "launch it through review.sh and let it record its own pass."
         )
-    now = _now_epoch()
+    now = now_epoch()
     called_task = _arg_string(args, "called_task", "delegate.review") or "delegate.review"
     lens = _arg_string(args, "lens")
     suffix = f"_{lens}" if lens else ""
@@ -1398,7 +1682,7 @@ def _disarm_review(args: argparse.Namespace) -> None:
         session_dir,
         state,
         _arg_string(args, "reason", "cleared") or "cleared",
-        _now_epoch(),
+        now_epoch(),
     )
 
 
@@ -1757,7 +2041,7 @@ def _current_hold_seconds(state: dict[str, object], candidate_percent: int, now:
 def _calibrate(args: argparse.Namespace) -> None:
     session_dir = _session_dir(args)
     state = _read_state(session_dir)
-    now = _now_epoch()
+    now = now_epoch()
     candidate = _arg_integer(args, "candidate_percent")
     if not 0 <= candidate <= 100:
         raise SystemExit("--candidate-percent must be between 0 and 100")
@@ -1982,7 +2266,7 @@ def _clock_line(now: float, next_report_at: float | None) -> str:
     never when. This line is the one place a reader can tell whether the report
     they are looking at is current and how long until the next one lands.
     """
-    line = f"**now {datetime.fromtimestamp(now):%Y-%m-%d %H:%M:%S}"
+    line = f"**now {datetime.fromtimestamp(now, user_zone()):%Y-%m-%d %H:%M:%S}"
     if next_report_at is not None:
         line += f" - next report {_moment_stamp(next_report_at, now)}"
     return line + "**"
@@ -1990,8 +2274,8 @@ def _clock_line(now: float, next_report_at: float | None) -> str:
 
 def _moment_stamp(epoch: float, now: float) -> str:
     """A local clock time, dated only when it falls on a day other than `now`'s."""
-    moment = datetime.fromtimestamp(epoch)
-    if moment.date() == datetime.fromtimestamp(now).date():
+    moment = datetime.fromtimestamp(epoch, user_zone())
+    if moment.date() == datetime.fromtimestamp(now, user_zone()).date():
         return f"{moment:%H:%M:%S}"
     return f"{moment:%Y-%m-%d %H:%M:%S}"
 
@@ -2004,24 +2288,18 @@ STAGE_HEADERS: tuple[str, ...] = (
     "Elapsed",
     "Result",
 )
-# The two slots a phase always runs, in the order they are reported: the seats
+# The two slots a phase always runs, in the order they are reported: the workers
 # that write. A slot is a fixed identity; the role it is doing is what the cell
 # shows, so a `test` slot opened as a writer reads "impl" under Agent 2.
 ROUND_SLOTS: tuple[str, ...] = ("impl", "test")
-# The seat the broad review's craft lens records under. No writer sits there,
-# so it is a third column only when a stage the table shows seated it, and a
+# The worker the broad review's craft lens records under. No writer sits there,
+# so it is a third column only when a stage the table shows assigned it, and a
 # table without one keeps the two columns it always had.
 REVIEW_SLOT = "review"
-# The header each slot is reported under. A slot name doubles as a role word,
-# and `impl` under a column headed `Test` read as a contradiction; a numbered
-# seat carries no role, so the cell alone says what the seat is doing. The
-# bullets under the table keep the slot in parentheses so the reader can still
-# find `impl_status_<slot>` and the `[slot]` board lines.
-SEAT_LABELS: dict[str, str] = {"impl": "Agent 1", "test": "Agent 2", REVIEW_SLOT: "Agent 3"}
 # The statuses that mean a window is being worked right now. Narrower than the
 # set `_window_span` runs to the clock: a window left `open` is one whose finish
 # was never recorded, so its launcher is gone and its span is merely unbounded.
-# Reading that as work is the mistake the seat states exist to stop making.
+# Reading that as work is the mistake the worker states exist to stop making.
 LIVE_WINDOW_STATUSES: tuple[str, ...] = ("running", "armed")
 # A pass kind's display name, where the two differ. `arch` is deliberately
 # absent: it is retired rather than renamed, and the handful of back-corpus
@@ -2032,31 +2310,31 @@ SUMMARY_HEADERS: tuple[str, ...] = ("Scope", "%", "Elapsed", "ETA", "Unchanged")
 # so the alignment follows a column that moves. The two scope labels and the
 # phase tally read as words and stay left.
 RIGHT_ALIGNED_SUMMARY_COLUMNS = frozenset({"%", "Elapsed", "ETA", "ETA low", "ETA high"})
-# How much of a seat's last board line the note under the table carries. The
+# How much of a worker's last board line the note under the table carries. The
 # board caps a post far higher than a terminal line can hold, and a wrapped
 # narration costs the reader the three-line scan the note exists to give.
 BOARD_NOTE_CHARS = 72
 # What implement.sh puts in front of the `done` and `blocked` it posts on the
-# worker's exit, so the note can tell the launcher's line from the seat's own.
+# worker's exit, so the note can tell the launcher's line from the worker's own.
 LAUNCHER_PREFIX = "launcher:"
-# What a seat's own narration says when it is alive but not working: held up on
+# What a worker's own narration says when it is alive but not working: held up on
 # a peer's edit, on a token, on a gate. Nothing in the pass record separates that
 # from work -- the process is up and the window is open either way -- so the last
-# board line is the only source there is, and these are the words the seats use.
+# board line is the only source there is, and these are the words the workers use.
 WAITING_PHRASES: tuple[str, ...] = ("waiting", "wait for", "blocked on", "standing by")
-# Where a window that sits in no round is drawn when its kind names a seat. A
+# Where a window that sits in no round is drawn when its kind names a worker. A
 # lone reviewer between rounds -- the closure review, the broad review of a
 # solo run -- is doing review work and reads in the `test` column, where the
 # adversary lens sits; a row of dashes would hide it. A unit-director activity
-# names no seat and keeps them.
-LONE_SEATS: dict[str, str] = {"impl": "impl", "fix": "impl", "test": "test", "review": "test"}
+# names no worker and keeps them.
+LONE_WORKERS: dict[str, str] = {"impl": "impl", "fix": "impl", "test": "test", "review": "test"}
 # How many stages the round table draws. A long phase runs dozens -- ten repair
 # rounds and eleven verifications in the one that prompted the cap -- and a
 # table that tall is scrolled past rather than read. What a reader acts on is
 # the last few; the rest is history, and `timeline` still renders it in full.
 ROUND_TABLE_STAGES = 3
 # How close together two role movements are before they are one movement of the
-# team. Seats converge in sequence -- each seat's `board.sh role` call landing
+# team. Workers converge in sequence -- each worker's `board.sh role` call landing
 # a second or two apart -- and a boundary each would put a near-empty row on
 # every call. The cost is small: a movement inside the window describes its row
 # from the row's start, at most this many seconds early, which is invisible at
@@ -2103,7 +2381,7 @@ def _agent_display(model: str, effort: str) -> str:
 
 
 def _clock_stamp(epoch: float) -> str:
-    return f"{datetime.fromtimestamp(epoch):%H:%M:%S}"
+    return f"{datetime.fromtimestamp(epoch, user_zone()):%H:%M:%S}"
 
 
 def _started_window(event: dict[str, object], event_type: str) -> StageWindow:
@@ -2124,9 +2402,9 @@ def _started_window(event: dict[str, object], event_type: str) -> StageWindow:
     main_model, main_effort = _agent_fields(event, "main_agent")
     return StageWindow(
         instance_id=instance_id,
-        # An activity is the unit director, which sits in no seat. Passes recorded
+        # An activity is the unit director, which sits in no worker. Passes recorded
         # before the field existed also read empty, and land in the same place:
-        # a row of their own rather than a seat's column.
+        # a row of their own rather than a worker's column.
         slot="" if event_type != "pass_started" else _record_slot(event),
         kind=kind,
         fix_round=_integer(event.get("fix_pass")),
@@ -2278,7 +2556,7 @@ def _armed_window(
     started_at = _number(armed.get("started_at"), now)
     return StageWindow(
         instance_id=_string(armed.get("instance_id")) or "armed",
-        # The early reviewer occupies the `test` seat before its pass exists --
+        # The early reviewer occupies the `test` worker before its pass exists --
         # where the adversary lens sits and where a lone closure reviewer reads
         # -- so it claims that column. Its round is left at zero and resolved
         # against the phase in `_round_windows`: the marker is written before
@@ -2479,16 +2757,16 @@ def _window_result(window: StageWindow, tally: FindingTally) -> str:
 
 
 class BoardActivity(TypedDict):
-    """The latest board line under a seat, and the seat's own last words."""
+    """The latest board line under a worker, and the worker's own last words."""
 
     at: float
     kind: str
     message: str
-    # The seat's latest line that the launcher did not write, empty when the
-    # seat has said nothing itself since it was launched. Carried beside
-    # `message` because the launcher's `done` lands after the seat's final
+    # The worker's latest line that the launcher did not write, empty when the
+    # worker has said nothing itself since it was launched. Carried beside
+    # `message` because the launcher's `done` lands after the worker's final
     # narration, and a note that read only the latest line reported every
-    # finished seat with the same boilerplate.
+    # finished worker with the same boilerplate.
     own: str
 
 
@@ -2541,10 +2819,7 @@ def _board_role_changes(session_dir: Path) -> list[RoleChange]:
             continue
         role = re.search(r"\brole=(\w+)", match.group(3))
         at = _board_stamp(line)
-        # The writing seats only. The craft reviewer in `review` never hands
-        # off, so it has no movement to split a row on, and its cell reads the
-        # kind its own pass recorded.
-        if role is None or at is None or match.group(1) not in ROUND_SLOTS:
+        if role is None or at is None:
             continue
         changes.append(
             RoleChange(
@@ -2558,35 +2833,35 @@ def _board_role_changes(session_dir: Path) -> list[RoleChange]:
 
 
 def _launcher_authored(kind: str, message: str) -> bool:
-    """Whether a board line came from implement.sh rather than from the seat.
+    """Whether a board line came from implement.sh rather than from the worker.
 
     The launcher writes two kinds of line: `register`, which is always its, and
     a `done` or `blocked` on exit, which it prefixes `launcher:` so the note can
-    tell it from a `done` the seat posted itself.
+    tell it from a `done` the worker posted itself.
     """
     return kind == "register" or message.startswith(LAUNCHER_PREFIX)
 
 
 def _board_activity(session_dir: Path) -> dict[str, BoardActivity]:
-    """The most recent line under each seat on the board, keyed by slot.
+    """The most recent line under each worker on the board, keyed by slot.
 
-    A seat that recorded no pass reaches the table with a role and no duration,
-    and a role on its own cannot tell a seat deep in its work from one that
+    A worker that recorded no pass reaches the table with a role and no duration,
+    and a role on its own cannot tell a worker deep in its work from one that
     stopped an hour ago. The board can. Every delegate posts what it is about to
     do before doing it, attributed to its slot, so the latest line and its age
-    answer the question a pass window alone cannot -- for a seat that has one as
-    much as for a seat that does not, since an open window says only that the
+    answer the question a pass window alone cannot -- for a worker that has one as
+    much as for a worker that does not, since an open window says only that the
     launcher is still waiting.
 
-    The latest line of any kind, not just `status`: a seat whose last act was a
-    handoff or a `blocked` is exactly the seat a reader needs to hear about, and
+    The latest line of any kind, not just `status`: a worker whose last act was a
+    handoff or a `blocked` is exactly the worker a reader needs to hear about, and
     filtering to narration would render it as silent.
 
-    Beside it, the seat's own last words. The launcher posts `done` when the
-    worker exits, which is after the seat's final narration, so the latest line
-    of every finished seat is the launcher's boilerplate and the narration the
+    Beside it, the worker's own last words. The launcher posts `done` when the
+    worker exits, which is after the worker's final narration, so the latest line
+    of every finished worker is the launcher's boilerplate and the narration the
     reader wanted sits one line up. A `register` clears them: it opens a new
-    occupancy of the seat, and words from the previous one do not describe it.
+    occupancy of the worker, and words from the previous one do not describe it.
     """
     activity: dict[str, BoardActivity] = {}
     try:
@@ -2611,15 +2886,15 @@ def _board_activity(session_dir: Path) -> dict[str, BoardActivity]:
 
 
 def _board_phrase(said: BoardActivity) -> str:
-    """One seat's last board line, cut to fit a terminal row.
+    """One worker's last board line, cut to fit a terminal row.
 
     A `status` is narration and reads as itself. Any other kind is named,
     because the kind is then the news -- `blocked` and `done` change what the
     reader should do next, where a bare message would look like more work in
-    progress. The words are the seat's own wherever it has any: the launcher's
-    `done` supplies the kind and the seat's last narration supplies what it was
+    progress. The words are the worker's own wherever it has any: the launcher's
+    `done` supplies the kind and the worker's last narration supplies what it was
     doing when it finished, which is what the reader asked. A leading `role=`
-    field is dropped: the role it announces is already in that seat's column,
+    field is dropped: the role it announces is already in that worker's column,
     and repeating it here spends the line.
     """
     message = said["own"] or said["message"].removeprefix(LAUNCHER_PREFIX)
@@ -2636,7 +2911,7 @@ def _roles_over(changes: list[RoleChange], upper: float) -> dict[str, str]:
 
     Any entry before the stretch ends describes it from the start. For a
     register that is the roll-call reasoning: the launchers land a second
-    or two apart, and reading them strictly would show a seat idle while the
+    or two apart, and reading them strictly would show a worker idle while the
     third works. For a handoff it holds because `_round_segments` opens a
     boundary at every movement wave: a handoff inside this stretch is either
     the movement that opened it or a member of that movement's wave, seconds
@@ -2652,7 +2927,7 @@ def _roles_over(changes: list[RoleChange], upper: float) -> dict[str, str]:
 def _role_movements(changes: list[RoleChange]) -> list[RoleChange]:
     """The handoffs that changed what their slot was doing.
 
-    Seats re-announce the role they already hold -- an opening `board.sh role`
+    Workers re-announce the role they already hold -- an opening `board.sh role`
     seconds after the launcher registered the same role, or narration routed
     through `role` because it is the command that takes a note. Neither moves
     the team, and a row split on one shows columns identical to the row
@@ -2776,12 +3051,12 @@ def _round_of(window: StageWindow, open_round: int) -> int:
 
 
 class RoundEntry(TypedDict):
-    """One row of the progress report: a round of seats, or a lone window."""
+    """One row of the progress report: a round of workers, or a lone window."""
 
     label: str
     started_at: float
-    # The round these seats worked, and None for a window that sits in no round:
-    # a unit-director activity, or a pass from a run that recorded no seat at all.
+    # The round these workers worked, and None for a window that sits in no round:
+    # a unit-director activity, or a pass from a run that recorded no worker at all.
     # The distinction picks the row's finding attribution, which is the whole
     # reason the two shapes stay separable rather than being forced into one.
     number: int | None
@@ -2793,9 +3068,9 @@ def _round_entries(windows: list[StageWindow], labels: list[str]) -> list[RoundE
 
     A round is the unit that advances -- it is dispatched, it lands, and the
     ledger stamps it on every finding it produces -- so it is the row, and the
-    seats working it read across as columns. Everything else keeps a row
-    of its own: verification is the unit director between rounds, in no seat and in
-    no round, and a solo run records no seat at all, so both render one window
+    workers working it read across as columns. Everything else keeps a row
+    of its own: verification is the unit director between rounds, in no worker and in
+    no round, and a solo run records no worker at all, so both render one window
     per row exactly as they did before the phase team existed.
     """
     rounds = {
@@ -2808,7 +3083,7 @@ def _round_entries(windows: list[StageWindow], labels: list[str]) -> list[RoundE
     entries: list[RoundEntry] = []
     for index, window in enumerate(windows):
         # An armed reviewer joins the round it reads only when a round exists to
-        # join. In a solo run it is the only seated window there is, and it
+        # join. In a solo run it is the only assigned window there is, and it
         # belongs beside the writer in a row of its own, as it always rendered.
         lone = not window["slot"] or (window["status"] == "armed" and not rounds)
         if lone:
@@ -2825,7 +3100,7 @@ def _round_entries(windows: list[StageWindow], labels: list[str]) -> list[RoundE
     for number, members in grouped.items():
         # Round zero is whatever the phase opened with -- an implementation, or a
         # review of work that arrived already written -- so it is named for the
-        # kind its seats actually ran. Every later round is a repair round, and
+        # kind its workers actually ran. Every later round is a repair round, and
         # carries the number convergence counts.
         if number:
             label = f"Fix {number}"
@@ -2890,13 +3165,13 @@ def _round_segments(
     changes: list[RoleChange],
     now: float,
 ) -> list[tuple[float, float, dict[str, str]]]:
-    """A round split at every moment its seats changed what they were doing.
+    """A round split at every moment its workers changed what they were doing.
 
-    A round is not one shape held to the end. Seats get recruited across as the
+    A round is not one shape held to the end. Workers get recruited across as the
     work moves -- one writing while the other tests, then both writing, then
     both converging on review -- and a single row would report whichever shape happened to be last
     as though it had held throughout. Each segment is a stretch over which no
-    seat changed role, so a row per segment tells the reader what the team was
+    worker changed role, so a row per segment tells the reader what the team was
     when, which is what the board records and nothing else preserves.
     """
     start = entry["started_at"]
@@ -2910,10 +3185,10 @@ def _round_segments(
     # splitting on either repeats the row above with a fresh clock. A movement
     # exactly at the round's start opens it rather than splitting it, and one
     # at or past its end belongs to the round that follows.
-    # A seat re-occupied is the other way a round moves on, and the one no
+    # A worker re-occupied is the other way a round moves on, and the one no
     # handoff marks: a blind reviewer is a fresh session that takes the chair
     # after the writer's has exited, so nothing posts a movement between them.
-    # One boundary per wave rather than per movement -- seats converge seconds
+    # One boundary per wave rather than per movement -- workers converge seconds
     # apart, and a boundary each would put a near-empty row on every one, so a
     # candidate within ROLE_WAVE_SECONDS of the boundary before it joins that
     # boundary's row instead of opening its own.
@@ -2927,12 +3202,13 @@ def _round_segments(
         )
         for index in range(1, depth)
     }
-    # No writer sits in the review seat, so its first occupancy is a re-seating
-    # too: the craft reviewer sits down with the other lenses, and landing a
-    # second ahead of them must not put a sliver of review in the writers' row.
-    review_seated = occupancies.get(REVIEW_SLOT)
-    if review_seated:
-        waves.add(review_seated[0]["started_at"])
+    # A worker outside the phase's opening impl/test pair joins the round when its
+    # first occupancy begins. Treat that as a reassigning workers wave just like the
+    # original craft-review worker, so `review2` and `fix2` do not appear to have
+    # worked from the writers' start time.
+    for slot, assigned in occupancies.items():
+        if slot not in ROUND_SLOTS and assigned:
+            waves.add(assigned[0]["started_at"])
     candidates = sorted({change["at"] for change in _role_movements(changes)} | waves)
     boundaries = [start]
     for at in candidates:
@@ -2946,12 +3222,12 @@ def _round_segments(
 
 
 def _slot_occupancies(members: list[StageWindow]) -> dict[str, list[StageWindow]]:
-    """Each seat's windows in one round, oldest first.
+    """Each worker's windows in one round, oldest first.
 
-    A seat sits down more than once in a round wherever the round runs a stage
+    A worker sits down more than once in a round wherever the round runs a stage
     after the one it opened with: the writers finish, and the reviewers that
     read what they wrote take the same chairs. Keeping one
-    member per seat reported whichever occupancy happened to be last as though
+    member per worker reported whichever occupancy happened to be last as though
     it had held the round from the start.
     """
     occupancies: dict[str, list[StageWindow]] = defaultdict(list)
@@ -2962,10 +3238,10 @@ def _slot_occupancies(members: list[StageWindow]) -> dict[str, list[StageWindow]
     return occupancies
 
 
-def _seat_is_waiting(said: BoardActivity | None) -> bool:
-    """Whether a seat's last board line says it is held up rather than working."""
+def _worker_is_waiting(said: BoardActivity | None) -> bool:
+    """Whether a worker's last board line says it is held up rather than working."""
     if said is None or said["message"].startswith(LAUNCHER_PREFIX):
-        # A launcher writes one line only as its seat exits, and a seat that has
+        # A launcher writes one line only as its worker exits, and a worker that has
         # exited is not waiting on anything.
         return False
     if said["kind"] == "blocked":
@@ -2974,8 +3250,8 @@ def _seat_is_waiting(said: BoardActivity | None) -> bool:
     return any(phrase in text for phrase in WAITING_PHRASES)
 
 
-def _seat_state(member: StageWindow, live: bool, said: BoardActivity | None) -> str:
-    """What this seat is doing at the end of the stretch its cell covers.
+def _worker_state(member: StageWindow, live: bool, said: BoardActivity | None) -> str:
+    """What this worker is doing at the end of the stretch its cell covers.
 
     The duration cannot say it. An open window and a closed one both render a
     number, and a number that stopped growing looks exactly like one still
@@ -2983,19 +3259,19 @@ def _seat_state(member: StageWindow, live: bool, said: BoardActivity | None) -> 
     one the row could not answer.
 
     `done` is every stretch that is already over, which is every row but the
-    last of a live round. Inside that last row three answers separate. A seat
+    last of a live round. Inside that last row three answers separate. A worker
     whose window has closed is `idle`: finished with what it was given while the
-    round it belongs to is not, so it is a seat available for more work rather
-    than a phase that ended. A seat whose window is open is working, unless its
+    round it belongs to is not, so it is a worker available for more work rather
+    than a phase that ended. A worker whose window is open is working, unless its
     own narration says it is held up on a peer, a token, or a gate -- which the
-    records cannot see, and which is `waiting`. Both seats reading `running`
+    records cannot see, and which is `waiting`. Both workers reading `running`
     while one sits on the other is the picture this exists to correct.
     """
     if not live:
         return "done"
     if member["status"] not in LIVE_WINDOW_STATUSES:
         return "idle"
-    return "waiting" if _seat_is_waiting(said) else "running"
+    return "waiting" if _worker_is_waiting(said) else "running"
 
 
 def _round_cells(
@@ -3008,34 +3284,34 @@ def _round_cells(
     activity: dict[str, BoardActivity],
     slots: tuple[str, ...],
 ) -> list[str]:
-    """A cell per seat in `slots`: its role over this stretch, how long, and its state."""
+    """A cell per worker in `slots`: its role over this stretch, how long, and its state."""
     occupancies = _slot_occupancies(members)
     cells: list[str] = []
     for slot in slots:
         # The occupancy this stretch falls in: the last one that had begun by
         # the time the stretch ended.
-        seated = occupancies.get(slot, [])
+        assigned = occupancies.get(slot, [])
         member = next(
-            (window for window in reversed(seated) if window["started_at"] < upper),
+            (window for window in reversed(assigned) if window["started_at"] < upper),
             None,
         )
         if member is None:
-            # A seat that recorded no pass: it was launched without a pass
+            # A worker that recorded no pass: it was launched without a pass
             # kind, or it died before `start-pass`. The board still knows its
             # role, and knows it after the round closes -- the old reading gated
             # this on the round running, so a finished round rendered its other
-            # seats as "-" and read as a solo pass. The duration is what is
-            # genuinely unknown here; the seat is not.
+            # workers as "-" and read as a solo pass. The duration is what is
+            # genuinely unknown here; the worker is not.
             cells.append(roles.get(slot) or "-")
             continue
         # The board's role wins wherever it has one, for this stretch rather than
-        # for now: it is the only source that tracks a seat recruited across, and
+        # for now: it is the only source that tracks a worker recruited across, and
         # reading it per segment is what keeps an earlier row describing the team
-        # that was. A seat whose board never spoke reports the kind it recorded.
-        # Only for the seat's opening occupancy, though: a later one is a
+        # that was. A worker whose board never spoke reports the kind it recorded.
+        # Only for the worker's opening occupancy, though: a later one is a
         # different session in the same chair, and the role the last occupant
         # left behind describes work that is already over.
-        role = (roles.get(slot) or member["kind"]) if member is seated[0] else member["kind"]
+        role = (roles.get(slot) or member["kind"]) if member is assigned[0] else member["kind"]
         opened, closed = _window_span(member, now)
         overlap = int(min(closed, upper) - max(opened, lower))
         cells.append(
@@ -3044,7 +3320,7 @@ def _round_cells(
                 for word in (
                     role,
                     _compact_duration(overlap) if overlap > 0 else "",
-                    _seat_state(member, live, activity.get(slot)),
+                    _worker_state(member, live, activity.get(slot)),
                 )
                 if word
             )
@@ -3057,20 +3333,20 @@ def _lone_cells(
     activity: dict[str, BoardActivity],
     slots: tuple[str, ...],
 ) -> list[str]:
-    """The seat cells of a window in no round: its kind's seat filled, or none."""
+    """The worker cells of a window in no round: its kind's worker filled, or none."""
     cells = ["-"] * len(slots)
-    seat = LONE_SEATS.get(window["kind"])
-    if seat is not None:
+    worker = LONE_WORKERS.get(window["kind"])
+    if worker is not None:
         # One worker, so there is no round to outlive: it is either running or
-        # over, and `idle` -- a seat free while its round continues -- cannot
+        # over, and `idle` -- a worker free while its round continues -- cannot
         # arise here.
         live = window["status"] in LIVE_WINDOW_STATUSES
         said = activity.get(window["slot"]) if window["slot"] else None
-        cells[slots.index(seat)] = " ".join(
+        cells[slots.index(worker)] = " ".join(
             (
                 window["kind"],
                 _compact_duration(window["elapsed"]),
-                _seat_state(window, live, said),
+                _worker_state(window, live, said),
             )
         )
     return cells
@@ -3086,30 +3362,60 @@ class RoundTable(TypedDict):
     # block. Only the newest block's -- an earlier one keeps its row and its
     # tally, but its gate-by-gate story is history the reader is not acting on.
     gates: list[str]
-    # The seats the rows have cells for, in column order: ROUND_SLOTS, and the
-    # review seat after them when a shown stage seated it.
+    # The workers the rows have cells for, in column order: ROUND_SLOTS, and the
+    # review worker after them when a shown stage assigned it.
     slots: tuple[str, ...]
 
 
 def _round_headers(slots: tuple[str, ...]) -> list[str]:
-    """The round table's header, with a column for each seat in `slots`."""
-    return ["Stage", "Start", "Elapsed", *(SEAT_LABELS[slot] for slot in slots), "Result"]
+    """The round table's header, with a column for each worker in `slots`."""
+    return [
+        "Stage",
+        "Start",
+        "Elapsed",
+        *(f"Agent {index}" for index, _slot in enumerate(slots, start=1)),
+        "Result",
+    ]
 
 
-def _shown_slots(shown: list[list[RoundEntry]]) -> tuple[str, ...]:
-    """The seat columns the shown stages need.
+def _reported_slots(
+    shown: list[list[RoundEntry]],
+    windows: list[StageWindow],
+    changes: list[RoleChange],
+) -> tuple[str, ...]:
+    """The worker columns this phase needs, in first-seen order after impl/test.
 
     The writers' two always, so a phase without a craft review keeps the table
-    it always drew. The review seat only when one of these stages seated it:
-    a column of dashes for a seat nothing sat in would read as a stalled agent.
+    it always drew. The original `review` worker retains its prior visibility
+    rule when it only recorded a pass: it appears while a shown stage workers it,
+    keeping existing impl/test/review tables byte-identical. Every other worker
+    that recorded a phase pass, plus every worker with a board handoff, gets a
+    column ordered by the first of those records.
     """
-    seated = {
+    shown_assigned = {
         member["slot"]
         for group in shown
         for entry in group
         for member in entry["members"]
     }
-    return (*ROUND_SLOTS, REVIEW_SLOT) if REVIEW_SLOT in seated else ROUND_SLOTS
+    appearances: list[tuple[float, str]] = []
+    for window in windows:
+        slot = window["slot"]
+        if not slot or slot in ROUND_SLOTS:
+            continue
+        if slot == REVIEW_SLOT and REVIEW_SLOT not in shown_assigned:
+            continue
+        appearances.append((window["started_at"], slot))
+    appearances.extend(
+        (change["at"], change["slot"])
+        for change in changes
+        if change["kind"] == "handoff" and change["slot"] not in ROUND_SLOTS
+    )
+    extra: list[str] = []
+    for _at, slot in sorted(appearances, key=lambda appearance: appearance[0]):
+        if slot not in extra:
+            extra.append(slot)
+    return (*ROUND_SLOTS, *extra)
 
 
 def _round_table(
@@ -3120,18 +3426,18 @@ def _round_table(
     activity: dict[str, BoardActivity],
     now: float,
 ) -> RoundTable:
-    """The last ROUND_TABLE_STAGES stages, each split wherever its seats moved.
+    """The last ROUND_TABLE_STAGES stages, each split wherever its workers moved.
 
-    A stage keeps every row it owns: a repair round that recruited two seats
+    A stage keeps every row it owns: a repair round that recruited two workers
     across renders the two rows that say so. The cap counts stages rather than
     rows because a row is not a unit a reader asks for -- "what happened in the
     last few stages" is the question, and a stage answers it whole.
     """
     # A window with no round is attributed the way the stage table always did
     # it, by the interval running to whatever opened next. That slice is wrong
-    # for concurrent seats, which is why a round does not use it -- but it is
+    # for concurrent workers, which is why a round does not use it -- but it is
     # exactly right for the sequential windows that still reach this branch.
-    # Its seat cells come from its kind: a lone review sits under the test seat.
+    # Its worker cells come from its kind: a lone review sits under the test worker.
     uppers = {
         window["instance_id"]: (
             windows[index + 1]["started_at"]
@@ -3142,7 +3448,7 @@ def _round_table(
     }
     groups = _stage_groups(_round_entries(windows, labels))
     shown = groups[-ROUND_TABLE_STAGES:]
-    slots = _shown_slots(shown)
+    slots = _reported_slots(shown, windows, changes)
     rows: list[list[str]] = []
     gate_lines: list[str] = []
     for group in shown:
@@ -3191,7 +3497,7 @@ def _round_table(
             for index, (lower, upper, roles) in enumerate(segments):
                 last = index + 1 == len(segments)
                 # Only the closing row of a live round is the present. Every
-                # earlier segment is a stretch that ended, whatever its seats
+                # earlier segment is a stretch that ended, whatever its workers
                 # are doing now.
                 cells = _round_cells(
                     members, roles, lower, upper, now, running and last, activity, slots
@@ -3201,14 +3507,16 @@ def _round_table(
                 # where. The row's result cell says so in the table's own
                 # column terms, from the rendered cells rather than the board
                 # -- what it reports is exactly what changed on screen, whether
-                # a handoff or a re-seated chair caused it.
-                seat_roles = [cell.split()[0] for cell in cells]
+                # a handoff or a reassigned chair caused it.
+                worker_roles = [cell.split()[0] for cell in cells]
                 moved = ", ".join(
-                    f"{SEAT_LABELS[slot]} → {role}"
-                    for slot, before, role in zip(slots, previous_roles, seat_roles)
+                    f"Agent {position} → {role}"
+                    for position, (_slot, before, role) in enumerate(
+                        zip(slots, previous_roles, worker_roles), start=1
+                    )
                     if role != before and role != "-"
                 )
-                previous_roles = seat_roles
+                previous_roles = worker_roles
                 # The result belongs to the round, which is the granularity the
                 # ledger stamps, so it sits on the row that closes it, after
                 # the movement that opened the row if one did.
@@ -3218,7 +3526,7 @@ def _round_table(
                     else ""
                 )
                 # The round label names the round once. A continuation row is
-                # the same round with its seats moved, and repeating the name
+                # the same round with its workers moved, and repeating the name
                 # there would read as a second round rather than as the team
                 # having moved.
                 rows.append(
@@ -3244,21 +3552,21 @@ def _delegate_note(
     now: float,
     slots: tuple[str, ...],
 ) -> list[str]:
-    """A line per seat the table has a column for: its agent, and its last words.
+    """A line per worker the table has a column for: its agent, and its last words.
 
-    Which model is sitting in which seat is the thing a reader cannot recover
-    from the table and asks about first when a seat runs long -- and it is not
+    Which model is sitting in which worker is the thing a reader cannot recover
+    from the table and asks about first when a worker runs long -- and it is not
     the only thing the table cannot say. A duration is the age of an open pass
-    window, which grows whether the seat is working or wedged, and a seat that
+    window, which grows whether the worker is working or wedged, and a worker that
     recorded no pass shows a role and nothing else. The board line closes both
-    gaps: what the seat said last, and how long ago, which is the difference
+    gaps: what the worker said last, and how long ago, which is the difference
     between working and stalled.
 
-    It goes under the table rather than into it -- one answer per seat, not per
+    It goes under the table rather than into it -- one answer per worker, not per
     row, and a column repeating it down every row would crowd out the roles. The
-    unit director is left out; the reader is the unit director. So is a seat the
-    table draws no column for: the review seat's board line outlives the phase
-    that seated it, and a line with no column above it names nothing on screen.
+    unit director is left out; the reader is the unit director. So is a worker the
+    table draws no column for: the review worker's board line outlives the phase
+    that assigned it, and a line with no column above it names nothing on screen.
     """
     live = {
         window["slot"]: window["delegate"]
@@ -3266,20 +3574,20 @@ def _delegate_note(
         if window["slot"] and window["status"] in ("running", "armed", "open")
     }
     lines: list[str] = []
-    for slot in slots:
+    for position, slot in enumerate(slots, start=1):
         agent, said = live.get(slot), activity.get(slot)
         if agent is None and said is None:
             continue
         if said is None:
             # Launched and yet to narrate. Naming that is the useful answer: a
-            # seat short of its first line is either still starting or gone
+            # worker short of its first line is either still starting or gone
             # before it began, and neither should read to the reader as work.
             detail = "no board line yet"
         else:
             age = _compact_duration(max(int(now - said["at"]), 0))
             detail = f"{age} ago \u00b7 {_board_phrase(said)}"
         lines.append(
-            f"- **{SEAT_LABELS[slot]}** ({slot}){f' {agent}' if agent else ''} \u00b7 {detail}"
+            f"- **Agent {position}** ({slot}){f' {agent}' if agent else ''} \u00b7 {detail}"
         )
     return lines
 
@@ -3367,8 +3675,8 @@ def _render_table(
 
 def _arrival_label(arrival_epoch: float, now: float) -> str:
     """A point in time named the way a person would say it aloud on `now`'s day."""
-    arrival = datetime.fromtimestamp(arrival_epoch)
-    days = (arrival.date() - datetime.fromtimestamp(now).date()).days
+    arrival = datetime.fromtimestamp(arrival_epoch, user_zone())
+    days = (arrival.date() - datetime.fromtimestamp(now, user_zone()).date()).days
     if days == 0:
         return f"today {arrival:%H:%M}"
     if days == 1:
@@ -3425,20 +3733,32 @@ def _eta_band_cells(
     otherwise push the pessimistic end down to 1% and quote an arrival ninety-nine
     times the elapsed clock — a number no reader can use and none should trust.
     """
+    band = eta_band_seconds(percent, elapsed, spread)
+    if isinstance(band, EtaProjectionUnavailable):
+        return "", ""
+    return (
+        f"{_arrival_label(as_of + band.earliest, now)} "
+        + f"(-{_format_offset(band.remaining - band.earliest)})",
+        f"{_arrival_label(as_of + band.latest, now)} "
+        + f"(+{_format_offset(band.latest - band.remaining)})",
+    )
+
+
+def eta_band_seconds(
+    percent: int, elapsed: int, spread: float
+) -> EtaBand | EtaProjectionUnavailable:
+    """Return the projected remaining seconds and its optimistic/pessimistic band."""
     eta = _eta_seconds(percent, elapsed)
     if eta is None:
-        return "", ""
+        return EtaProjectionUnavailable()
     optimistic = min(99.0, percent * RATE_FACTOR_LIMIT, percent + max(0.0, spread))
     pessimistic = max(1.0, percent / RATE_FACTOR_LIMIT, percent - max(0.0, spread))
     low = int(elapsed * (100.0 - optimistic) / optimistic)
     high = int(elapsed * (100.0 - pessimistic) / pessimistic)
-    return (
-        f"{_arrival_label(as_of + low, now)} (-{_format_offset(eta - low)})",
-        f"{_arrival_label(as_of + high, now)} (+{_format_offset(high - eta)})",
-    )
+    return EtaBand(remaining=eta, earliest=low, latest=high)
 
 
-def _percent_spread(calibration: dict[str, object] | None) -> float:
+def percent_spread(calibration: dict[str, object] | None) -> float:
     """How far off the percentage has actually run, when history can say.
 
     A calibration that cleared its sample floor has measured this reporter's
@@ -3482,7 +3802,7 @@ def _timeline(args: argparse.Namespace) -> None:
     """
     session_dir = _session_dir(args)
     state = _read_state(session_dir)
-    now = _now_epoch()
+    now = now_epoch()
     events = _run_events(state)
     wanted = _arg_string(args, "phase")
     started: list[tuple[str, str, str, float]] = []
@@ -3560,7 +3880,7 @@ def _phase_count(args: argparse.Namespace) -> None:
 
 # What a report that describes no live window adds. The recorder knows what its
 # own records say and nothing about the processes behind them: a live run once
-# had two seats with passes recorded `error` while their workers were still
+# had two workers with passes recorded `error` while their workers were still
 # posting to the board, and reading the closed passes as a finished dispatch
 # would have routed a healthy round through the abandon path.
 WORKERS_UNSEEN = (
@@ -3589,6 +3909,25 @@ class RecordedReport(TypedDict):
     calibration: dict[str, object] | None
 
 
+@dataclass(frozen=True)
+class ReportedPassWindow:
+    """A progress report that measures a live launcher pass."""
+
+    record: dict[str, object]
+
+
+@dataclass(frozen=True)
+class ReportedActivityWindow:
+    """A progress report that describes a live unit-director activity."""
+
+    record: dict[str, object]
+
+
+@dataclass(frozen=True)
+class NoReportedWindow:
+    """A progress report made between live windows."""
+
+
 def _state_plan_phase_counts(state: dict[str, object]) -> dict[str, object]:
     """The run's plan counted by phase heading, unavailable without an absolute path."""
     plan_doc = _string(state.get("project_plan_doc")) or _string(state.get("plan_doc"))
@@ -3599,8 +3938,10 @@ def _state_plan_phase_counts(state: dict[str, object]) -> dict[str, object]:
     return {"available": False, "reason": "no plan doc"}
 
 
-def _reported_window(state: dict[str, object]) -> tuple[str, dict[str, object] | None]:
-    """The window a report describes and the state key holding it, or no window.
+def _reported_window(
+    state: dict[str, object],
+) -> ReportedPassWindow | ReportedActivityWindow | NoReportedWindow:
+    """The live window a report describes, or the state between windows.
 
     A launcher's pass when one is open, and otherwise the unit director's
     activity. Both render the same line under the round table; only a pass
@@ -3609,11 +3950,11 @@ def _reported_window(state: dict[str, object]) -> tuple[str, dict[str, object] |
     """
     current_pass = _reporting_pass(state)
     if current_pass is not None:
-        return "pass", current_pass
+        return ReportedPassWindow(current_pass)
     activity = _object_dict(state.get("activity"))
     if activity is not None and _string(activity.get("status")) == "active":
-        return "activity", activity
-    return "pass", None
+        return ReportedActivityWindow(activity)
+    return NoReportedWindow()
 
 
 def _scope_row(label: str, clock: ScopeClock, as_of: float, now: float) -> list[str]:
@@ -3683,10 +4024,10 @@ def _phase_section(
     """
     phase_instance_id = _string(phase.get("instance_id"))
     stage_windows, stage_labels, _ = _stage_table(events, state, phase_instance_id, now)
-    # One row per round, one column per seat. A round is what advances and
+    # One row per round, one column per worker. A round is what advances and
     # what the ledger stamps on its findings, so it is the row that can carry
     # a Start, an Elapsed, and a Result that all mean something; the
-    # seats working it read across. Per-pass provenance -- which model ran
+    # workers working it read across. Per-pass provenance -- which model ran
     # where, and a review overlapping the writer as its own row -- is the
     # `timeline` view, which still renders one row per window, and so is the
     # history behind the last few stages this table keeps.
@@ -3808,20 +4149,31 @@ def _print_last_recorded(
     phase: dict[str, object],
     now: float,
     notifier_due: int | None,
+    reported_window: ReportedActivityWindow | NoReportedWindow,
 ) -> None:
-    """Report an active phase that has no window open.
+    """Report the last recorded clocks without assessing progress again.
 
     Between windows -- the reviews closed, the repair writers not launched yet
-    -- there is nothing live to measure, and the unit is still in this phase.
-    The report keeps every section: the clocks table as the last `progress`
-    call left it, stamped with when that was, and the round table as the
-    phase's windows stand now. It writes nothing -- no event, no window, no
-    state -- so pass counts, convergence and calibration never see it.
+    -- there is nothing live to measure. The same is true of an activity opened
+    after its phase closed: it belongs in the round table, but does not revise
+    the closed phase's assessment. The report keeps every section: the clocks
+    table as the last `progress` call left it, stamped with when that was, and
+    the round table as the phase's windows stand now. It writes nothing -- no
+    event, no window, no state -- so pass counts, convergence and calibration
+    never see it.
     """
     events = _run_events(state)
     plan_phase_counts = _state_plan_phase_counts(state)
     recorded = _recorded_report(state, phase, events, plan_phase_counts, now)
-    section, _, _ = _phase_section(session_dir, state, phase, events, now)
+    section, stage_windows, stage_labels = _phase_section(
+        session_dir, state, phase, events, now
+    )
+    if isinstance(reported_window, ReportedActivityWindow):
+        activity = reported_window.record
+        reported_label = _reported_label(stage_windows, stage_labels, activity)
+        window_line = f"▸ **{reported_label} - {_string(activity.get('activity'))}**"
+    else:
+        window_line = f"No pass or activity is open. {WORKERS_UNSEEN}"
     lines = [
         _scope_line(state),
         "",
@@ -3833,30 +4185,40 @@ def _print_last_recorded(
             recorded["project"],
             recorded["phase"],
             plan_phase_counts,
-            _percent_spread(recorded["calibration"]),
+            percent_spread(recorded["calibration"]),
             recorded["at"],
             now,
         ),
         *section,
-        f"No pass or activity is open. {WORKERS_UNSEEN}",
+        window_line,
         _clock_line(now, _next_report_at(session_dir, now, notifier_due)),
     ]
     print("\n".join(lines))
 
 
-def _progress(args: argparse.Namespace) -> None:
+def _report_progress(args: argparse.Namespace) -> None:
     session_dir = _session_dir(args)
-    now = _now_epoch()
+    now = now_epoch()
     notifier_due = _restart_unit_notifier(session_dir)
     state = _ensure_project_timing(session_dir, _read_state(session_dir), now)
     phase = _object_dict(state.get("phase"))
-    if phase is None or _string(phase.get("status")) != "active":
-        phase_status = _string((phase or {}).get("status")) or "missing"
+    reported_window = _reported_window(state)
+    if phase is None:
+        raise SystemExit(f"No active phase to report: phase missing. {WORKERS_UNSEEN}")
+    if _string(phase.get("status")) != "active":
+        if isinstance(reported_window, ReportedActivityWindow):
+            _print_last_recorded(
+                session_dir, state, phase, now, notifier_due, reported_window
+            )
+            return
+        phase_status = _string(phase.get("status")) or "missing"
         raise SystemExit(f"No active phase to report: phase {phase_status}. {WORKERS_UNSEEN}")
-    window_key, current_pass = _reported_window(state)
-    if current_pass is None:
-        _print_last_recorded(session_dir, state, phase, now, notifier_due)
+    if isinstance(reported_window, NoReportedWindow):
+        _print_last_recorded(
+            session_dir, state, phase, now, notifier_due, reported_window
+        )
         return
+    current_pass = reported_window.record
     legacy_raw_percent = _arg_integer(args, "raw_percent", -1)
     legacy_percent = _arg_integer(args, "percent", -1)
     project_raw_percent = _arg_integer(args, "project_raw_percent", -1)
@@ -4015,7 +4377,7 @@ def _progress(args: argparse.Namespace) -> None:
     # The reported window is the object state already holds, so the activity
     # edit above has landed either way; a pass is written back through its slot,
     # never over the map that holds every slot's.
-    if window_key == "activity":
+    if isinstance(reported_window, ReportedActivityWindow):
         state["activity"] = current_pass
     _write_state(session_dir, state)
 
@@ -4046,7 +4408,7 @@ def _progress(args: argparse.Namespace) -> None:
                     unchanged=phase_unchanged_seconds,
                 ),
                 plan_phase_counts,
-                _percent_spread(phase_calibration),
+                percent_spread(phase_calibration),
                 now,
                 now,
             ),
@@ -4072,44 +4434,130 @@ def _progress(args: argparse.Namespace) -> None:
     print("\n".join(lines))
 
 
-def _finish_phase(args: argparse.Namespace) -> None:
+def _progress(args: argparse.Namespace) -> None:
+    session_dir = _session_dir(args)
+    _report_progress(args)
+    _refresh_phase_table(session_dir)
+
+
+def _eta(args: argparse.Namespace) -> None:
     session_dir = _session_dir(args)
     state = _read_state(session_dir)
-    now = _now_epoch()
-    _close_open_passes(session_dir, state, "interrupted", now)
-    state = _read_state(session_dir)
-    _close_active_activity(session_dir, state, "interrupted", "", now)
-    state = _read_state(session_dir)
-    if _clear_armed_review(session_dir, state, "phase ended", now):
-        state = _read_state(session_dir)
     phase = _object_dict(state.get("phase"))
     if phase is None or _string(phase.get("status")) != "active":
-        return
-    event = _event(state, "phase_finished", now)
-    event["status"] = _arg_string(args, "status")
-    event["phase_elapsed_seconds"] = max(
-        0,
-        int(now - _number(phase.get("started_at"), now)),
-    )
+        _refuse_eta("An active phase is required to record an ETA")
+    basis = _arg_string(args, "basis").strip()
+    if not basis:
+        _refuse_eta("--basis must not be blank")
+
+    now = now_epoch()
+    eta_at = _local_eta_epoch(_arg_string(args, "time"), "--time")
+    if eta_at < now:
+        _refuse_eta("--time must not be in the past")
+
+    earliest_text = _arg_string(args, "earliest")
+    latest_text = _arg_string(args, "latest")
+    if bool(earliest_text) != bool(latest_text):
+        _refuse_eta("--earliest and --latest must be supplied together")
+
+    event = _event(state, "eta_stated", now)
+    event.update({"eta_at": eta_at, "basis": basis})
+    if earliest_text and latest_text:
+        earliest_at = _local_eta_epoch(earliest_text, "--earliest")
+        latest_at = _local_eta_epoch(latest_text, "--latest")
+        if earliest_at > eta_at:
+            _refuse_eta("--earliest must not be after --time")
+        if latest_at < eta_at:
+            _refuse_eta("--latest must not be before --time")
+        event.update(
+            {
+                "eta_earliest_at": earliest_at,
+                "eta_latest_at": latest_at,
+            }
+        )
+
     _append_event(state, event)
-    phase["status"] = _arg_string(args, "status")
-    phase["finished_at"] = now
-    state["phase"] = phase
+    _refresh_phase_table(session_dir)
+    local_eta = datetime.fromtimestamp(eta_at, user_zone())
+    print(f"ETA recorded: {local_eta:%H:%M %Z}")
+
+
+def _finish_phase(args: argparse.Namespace) -> None:
+    """Close one open phase: the one --phase-id names, else the current one.
+
+    Only that phase's own passes close with it; another open phase keeps its
+    workers. When the current phase closes, the most recently started older open
+    phase becomes current again.
+    """
+    session_dir = _session_dir(args)
+    state = _read_state(session_dir)
+    phase_id = _optional_arg(args, "phase_id")
+    current = _object_dict(state.get("phase"))
+    current_open = current is not None and _string(current.get("status")) == "active"
+    if phase_id:
+        phase = _open_phase_named(state, phase_id)
+        if phase is None:
+            open_ids = ", ".join(_open_phase_ids(state)) or "none"
+            raise SystemExit(f"Phase {phase_id} is not open; open phases: {open_ids}")
+    elif current is not None and current_open:
+        phase = current
+    else:
+        return
+    is_current = phase is current
+    now = now_epoch()
+    finished_at = _optional_epoch(args, "finished_at", "--finished-at", now)
+    started_at = _number(phase.get("started_at"), finished_at)
+    if finished_at < started_at:
+        raise SystemExit(
+            f"--finished-at is before Phase {_string(phase.get('id'))} started "
+            + f"({_iso_time(started_at)})"
+        )
+    instance_id = _string(phase.get("instance_id"))
+    # Every window this phase left open, one per team member: the launchers that
+    # would have closed them are gone. A pass from before passes carried their
+    # phase belongs to the current one.
+    for slot, record in sorted(_open_passes(state).items()):
+        owner = _pass_phase_instance(record)
+        if owner == instance_id or (is_current and not owner):
+            _ = _close_slot_pass(session_dir, state, slot, "interrupted", now)
+    if is_current:
+        _close_active_activity(session_dir, state, "interrupted", "", now)
+        _ = _clear_armed_review(session_dir, state, "phase ended", now)
+    status = _arg_string(args, "status")
+    event = _event(state, "phase_finished", finished_at, phase_record=phase)
+    event["status"] = status
+    event["phase_elapsed_seconds"] = max(0, int(finished_at - started_at))
+    if finished_at != now:
+        event["recorded_at"] = _iso_time(now)
+        event["backfilled"] = True
+    _append_event(state, event)
+    phase["status"] = status
+    phase["finished_at"] = finished_at
+    if is_current:
+        _unpark_newest(state)
+    else:
+        state[OPEN_PHASES_KEY] = [
+            record for record in _parked_phases(state) if record is not phase
+        ]
     _write_state(session_dir, state)
+    _refresh_phase_table(session_dir)
 
 
 def _finish_run(args: argparse.Namespace) -> None:
     session_dir = _session_dir(args)
     state = _read_state(session_dir)
-    now = _now_epoch()
+    now = now_epoch()
     run_status = _arg_string(args, "status")
-    phase = _object_dict(state.get("phase"))
-    if phase is not None and _string(phase.get("status")) == "active":
+    # Every open phase, newest first: closing the current one makes the next
+    # older one current.
+    while _open_phase_ids(state):
         finish_args = argparse.Namespace(session_dir=str(session_dir), status=run_status)
         _finish_phase(finish_args)
         state = _read_state(session_dir)
     if _string(state.get("status")) != "active":
         return
+    _close_active_activity(session_dir, state, "interrupted", "", now)
+    state = _read_state(session_dir)
     event = _event(state, "run_finished", now)
     event["status"] = run_status
     event["run_elapsed_seconds"] = max(
@@ -4124,6 +4572,7 @@ def _finish_run(args: argparse.Namespace) -> None:
     state["status"] = run_status
     state["finished_at"] = now
     _write_state(session_dir, state)
+    _refresh_phase_table(session_dir)
 
 
 def _finding_lenses(event: dict[str, object]) -> set[str]:
@@ -4135,19 +4584,37 @@ def _finding_lenses(event: dict[str, object]) -> set[str]:
 
 
 def _review_trial(args: argparse.Namespace) -> None:
-    """Print one line: what the phase's UX and craft lenses found, and review time.
+    """Print one line: the phase's UX and code findings, and review time.
 
     It feeds the unit's checkpoint notice line, which the showrunner records with
-    review_regime.py. The phase is the one in state, active or just closed by
-    finish-phase, and only events stamped with its instance count. Review-seat
-    minutes are every seat's finished review passes, whatever their status, plus
+    review_regime.py. The phase is the one --phase-id names -- an open one, else
+    the latest this run started under that id -- or, without it, the one in
+    state, active or just closed by finish-phase. Only events stamped with its
+    instance count. Review-worker
+    minutes are every worker's finished review passes, whatever their status, plus
     the UX review activities. The screenshot check's own cost follows: its `UX
     review` activities alone, then every fix pass of a round whose dispatched
     batch covered a `ux` finding. All round to the nearest whole minute.
     """
     session_dir = _session_dir(args)
     state = _read_state(session_dir)
-    phase = _object_dict(state.get("phase"))
+    phase_id = _optional_arg(args, "phase_id")
+    if phase_id:
+        phase = _open_phase_named(state, phase_id)
+        if phase is None:
+            phase = next(
+                (
+                    {"instance_id": _string(event.get("phase_instance_id"))}
+                    for event in reversed(_run_events(state))
+                    if _string(event.get("event_type")) == "phase_started"
+                    and _string(event.get("phase_id")) == phase_id
+                ),
+                None,
+            )
+        if phase is None:
+            raise SystemExit(f"This run never started Phase {phase_id}")
+    else:
+        phase = _object_dict(state.get("phase"))
     instance_id = _string(phase.get("instance_id")) if phase is not None else ""
     if not instance_id:
         raise SystemExit(
@@ -4170,7 +4637,7 @@ def _review_trial(args: argparse.Namespace) -> None:
             if "ux" in lenses:
                 ux_findings += 1
                 ux_finding_ids.add(_string(event.get("finding_id")))
-            if "craft" in lenses:
+            if not lenses or lenses - {"ux"}:
                 code_findings += 1
         elif event_type == "finding_batch_dispatched":
             dispatched.append(event)
@@ -4199,7 +4666,7 @@ def _review_trial(args: argparse.Namespace) -> None:
     )
     print(
         f"review trial: ux {ux_findings} findings, code {code_findings} findings, "
-        + f"review-seat minutes {(review_seconds + 30) // 60}, "
+        + f"review-worker minutes {(review_seconds + 30) // 60}, "
         + f"ux check minutes {(ux_check_seconds + 30) // 60}, "
         + f"ux repair minutes {(ux_repair_seconds + 30) // 60}"
     )
@@ -4225,7 +4692,7 @@ def _aggregate(args: argparse.Namespace) -> None:
         )
     output = {
         "schema_version": SCHEMA_VERSION,
-        "generated_at": _iso_time(_now_epoch()),
+        "generated_at": _iso_time(now_epoch()),
         "history_root": str(_history_root()),
         "completed_raw_estimate_samples": len(samples),
         "ignored_history_rows": ignored,
@@ -4259,6 +4726,7 @@ def _build_parser() -> argparse.ArgumentParser:
     _ = start_phase.add_argument("--phase-id", required=True)
     _ = start_phase.add_argument("--phase-title", required=True)
     _ = start_phase.add_argument("--work-order-file", default="")
+    _ = start_phase.add_argument("--started-at", default="")
     start_phase.set_defaults(handler=_start_phase)
 
     start_activity = subparsers.add_parser("start-activity")
@@ -4354,6 +4822,14 @@ def _build_parser() -> argparse.ArgumentParser:
     _ = progress.add_argument("--phase-override-reason", default="")
     progress.set_defaults(handler=_progress)
 
+    eta = subparsers.add_parser("eta")
+    _ = eta.add_argument("--session-dir", required=True)
+    _ = eta.add_argument("--time", required=True)
+    _ = eta.add_argument("--earliest", default="")
+    _ = eta.add_argument("--latest", default="")
+    _ = eta.add_argument("--basis", required=True)
+    eta.set_defaults(handler=_eta)
+
     timeline = subparsers.add_parser("timeline")
     _ = timeline.add_argument("--session-dir", required=True)
     _ = timeline.add_argument(
@@ -4375,6 +4851,8 @@ def _build_parser() -> argparse.ArgumentParser:
         choices=("completed", "stopped", "error"),
         required=True,
     )
+    _ = finish_phase.add_argument("--phase-id", default="")
+    _ = finish_phase.add_argument("--finished-at", default="")
     finish_phase.set_defaults(handler=_finish_phase)
 
     finish_run = subparsers.add_parser("finish-run")
@@ -4389,9 +4867,10 @@ def _build_parser() -> argparse.ArgumentParser:
     review_trial = subparsers.add_parser(
         "review-trial",
         help="one line for the checkpoint notice: the phase's ux and craft finding "
-        + "counts and its review-seat minutes",
+        + "counts and its review-worker minutes",
     )
     _ = review_trial.add_argument("--session-dir", required=True)
+    _ = review_trial.add_argument("--phase-id", default="")
     review_trial.set_defaults(handler=_review_trial)
 
     aggregate = subparsers.add_parser("aggregate")

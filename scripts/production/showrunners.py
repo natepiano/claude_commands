@@ -1,41 +1,47 @@
 #!/usr/bin/env python3
-"""Maintain the machine-local showrunner registry."""
+"""Read this machine's showrunners from their update timers, and its showrunner settings.
+
+A showrunner may report to another: `attach <child> [<parent>]` stores the one fact, the parent's
+slug, in the child's `parent` file under the showrunner state dir. Children, the root and names are
+looked up from the update timers at each call, so the tree holds no name and no list.
+"""
 from __future__ import annotations
 
 import argparse
-import fcntl
 import json
 import os
-import re
 import shlex
 import subprocess
 import sys
-import tempfile
 from pathlib import Path
 from typing import NamedTuple, TypedDict, cast
-from zoneinfo import ZoneInfo
 
 CONFIG = Path(os.environ.get("SHOWRUNNERS_CONFIG") or Path(__file__).resolve().parents[2] / "config/showrunners.json")
 NOTIFIER_STATE_DIR = Path(os.environ.get("NOTIFIER_STATE_DIR") or Path.home() / ".local/state/notifier")
 SESSIONS_DIR = Path(os.environ.get("NOTIFIER_SESSIONS_DIR") or Path.home() / ".claude/sessions")
 SESSIONS = Path(os.environ.get("SHOWRUNNERS_SESSIONS") or Path(__file__).resolve().parent.parent / "message/sessions.py")
+SHOWRUNNER_STATE_DIR = Path(os.environ.get("SHOWRUNNER_STATE_DIR") or Path.home() / ".local/state/showrunner")
+SEND = Path(os.environ.get("SHOWRUNNERS_SEND") or Path(__file__).resolve().parent.parent / "message/send.py")
+PARENT_FILE = "parent"
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
+from user_zone import user_zone_name  # noqa: E402
 
-
-class WorkingUnit(NamedTuple):
-    name: str
-
-
-class StandbyUnit(NamedTuple):
-    name: str
-
-
-UnitState = WorkingUnit | StandbyUnit
+RULES = "Read the Nested showrunners rules in ~/.claude/commands/showrunner/produce.md."
 
 
 class Showrunner(TypedDict):
+    """One showrunner, read from its update timer each time. Nothing here is stored in the config."""
+
+    # The session's name now, looked up by its Claude session id. Empty while it is not running.
     session: str
+    # Where a message reaches it now. Empty while it is not running.
+    socket: str
+    # The production's slug, which names the showrunner whatever its session is called.
+    slug: str
+    # The user's zone setting. A production doc's own User zone line is no longer read.
     zone: str
-    units: list[UnitState]
+    # The production doc, whose Units table says which units the showrunner has.
+    doc: str
 
 
 class ShowrunnerSettings(TypedDict):
@@ -44,34 +50,37 @@ class ShowrunnerSettings(TypedDict):
     stall_minutes: float
     faults_to: str
     always: list[str]
-    showrunners: list[Showrunner]
 
 
-class RunningShowrunner(NamedTuple):
+class Timer(NamedTuple):
+    """One complete update timer. It is what makes a production's showrunner exist, running or not."""
+
     slug: str
-    session: str
-    socket: str
-    prompt: PromptUnits | UnreadablePrompt
-
-
-class PromptUnits(NamedTuple):
+    target: str
+    doc: Path
     zone: str
-    unit_sessions: tuple[str, ...]
 
 
-class UnreadablePrompt(NamedTuple):
+class CheckedDoc(NamedTuple):
+    path: Path
+
+
+class NoCheckedDoc(NamedTuple):
     reason: str
 
 
 def defaults() -> ShowrunnerSettings:
     return ShowrunnerSettings(threshold_percent=2, repeat_minutes=30, stall_minutes=5,
-                              faults_to="natedev", always=["natedev"], showrunners=[])
+                              faults_to="natedev", always=["natedev"])
 
 
-def load_settings(path: Path | None = None) -> ShowrunnerSettings:
-    source = path or CONFIG
+def load_settings() -> ShowrunnerSettings:
+    return load_settings_from(CONFIG)
+
+
+def load_settings_from(path: Path) -> ShowrunnerSettings:
     try:
-        raw = cast(object, json.loads(source.read_text(encoding="utf-8")))
+        raw = cast(object, json.loads(path.read_text(encoding="utf-8")))
         if not isinstance(raw, dict):
             raise ValueError("expected an object")
         data = cast(dict[str, object], raw)
@@ -80,44 +89,27 @@ def load_settings(path: Path | None = None) -> ShowrunnerSettings:
                 raise ValueError(f"invalid {key}")
         if not isinstance(data.get("faults_to"), str) or not data["faults_to"]:
             raise ValueError("invalid faults_to")
-        always, runners = data.get("always"), data.get("showrunners")
+        always = data.get("always")
         if not isinstance(always, list) or not all(isinstance(item, str) for item in cast(list[object], always)):
             raise ValueError("invalid always")
-        if not isinstance(runners, list):
-            raise ValueError("invalid showrunners")
-        checked: list[Showrunner] = []
-        for item in cast(list[object], runners):
-            if not isinstance(item, dict):
-                raise ValueError("invalid showrunner")
-            entry = cast(dict[str, object], item)
-            session, zone, units = entry.get("session"), entry.get("zone"), entry.get("units")
-            standby = entry.get("standby", [])
-            if (not isinstance(session, str) or not session or not isinstance(zone, str)
-                    or not isinstance(units, list)
-                    or not all(isinstance(unit, str) for unit in cast(list[object], units))
-                    or not isinstance(standby, list)
-                    or not all(isinstance(unit, str) for unit in cast(list[object], standby))):
-                raise ValueError("invalid showrunner fields")
-            names = cast(list[str], units)
-            waiting = cast(list[str], standby)
-            if len(set(names)) != len(names) or len(set(waiting)) != len(waiting) or not set(waiting) <= set(names):
-                raise ValueError("invalid standby units")
-            _ = ZoneInfo(zone)
-            checked.append(Showrunner(session=session, zone=zone,
-                                      units=[StandbyUnit(unit) if unit in waiting else WorkingUnit(unit)
-                                             for unit in names]))
+        # A file written while showrunners were listed here still has the list; it is not read.
         return ShowrunnerSettings(threshold_percent=cast(float, data["threshold_percent"]),
                                   repeat_minutes=cast(float, data["repeat_minutes"]),
                                   stall_minutes=cast(float, data["stall_minutes"]),
-                                  faults_to=cast(str, data["faults_to"]), always=cast(list[str], always),
-                                  showrunners=checked)
+                                  faults_to=cast(str, data["faults_to"]), always=cast(list[str], always))
     except (OSError, ValueError, TypeError, KeyError) as error:
-        raise ValueError(f"{source}: {error}") from error
+        raise ValueError(f"{path}: {error}") from error
 
 
 def socket_for(target: str) -> str | None:
+    """The session's socket, or None when it is not running. Raises OSError when the session
+    records cannot be read, which says nothing about whether it runs."""
     result = subprocess.run([sys.executable, str(SESSIONS), "socket", target], capture_output=True,
                             text=True, check=False)
+    # Exit 1 is no such live session. Any other failure is the lookup itself failing.
+    if result.returncode not in (0, 1):
+        reason = result.stderr.strip() or f"sessions.py exited {result.returncode}"
+        raise OSError(f"cannot tell whether {target} is running: {reason}")
     return result.stdout.strip() if result.returncode == 0 and result.stdout.strip() else None
 
 
@@ -125,11 +117,40 @@ def _fields(path: Path) -> dict[str, str]:
     return dict(line.split("=", 1) for line in path.read_text(encoding="utf-8").splitlines() if "=" in line)
 
 
+def checked_doc(instance: Path) -> CheckedDoc | NoCheckedDoc:
+    """Read the production doc passed to an update instance's production check."""
+    try:
+        check = _fields(instance / "conf").get("CHECK")
+    except (OSError, UnicodeError) as error:
+        return NoCheckedDoc(f"conf could not be read: {error}")
+    if check is None:
+        return NoCheckedDoc("CHECK is missing")
+    try:
+        command = shlex.split(check)
+    except ValueError as error:
+        return NoCheckedDoc(f"CHECK could not be parsed: {error}")
+    try:
+        script_index = next(index for index, token in enumerate(command)
+                            if Path(token).name == "production_check.sh")
+    except StopIteration:
+        return NoCheckedDoc("CHECK has no production_check.sh token")
+    if script_index + 1 >= len(command):
+        return NoCheckedDoc("CHECK has no production doc token")
+    path = Path(command[script_index + 1])
+    if not path.is_absolute():
+        return NoCheckedDoc("production doc path is relative")
+    return CheckedDoc(path)
+
+
 def _session_name(session_id: str) -> str:
     for path in SESSIONS_DIR.glob("*.json"):
         try:
             pid = int(path.stem)
-            os.kill(pid, 0)
+            try:
+                os.kill(pid, 0)
+            except PermissionError:
+                # Another user's process is still a live one.
+                pass
             data = cast(dict[str, object], json.loads(path.read_text(encoding="utf-8")))
             name = data.get("name")
             if data.get("sessionId") == session_id and isinstance(name, str) and name:
@@ -139,238 +160,381 @@ def _session_name(session_id: str) -> str:
     raise ValueError(f"session {session_id} has no live named process")
 
 
-def _prompt_units(fields: dict[str, str]) -> PromptUnits | UnreadablePrompt:
-    value = fields.get("PROMPT_FILE")
-    if not value:
-        return UnreadablePrompt("PROMPT_FILE is missing")
-    prompt_file = Path(value)
-    if not prompt_file.is_absolute():
-        return UnreadablePrompt("PROMPT_FILE is not absolute")
+def _readable(doc: Path) -> None:
+    """Refuse a production doc that cannot be read."""
     try:
-        prompt = prompt_file.read_text(encoding="utf-8")
+        _ = doc.read_text(encoding="utf-8")
     except (OSError, UnicodeError) as error:
-        return UnreadablePrompt(f"prompt could not be read: {error}")
-    match = re.search(r"unit_status\.sh\s+\S+\s+([^\s|`]+)\s+([^|`\n]+)", prompt)
-    if match is None:
-        return UnreadablePrompt("unit_status.sh command is missing its zone or units")
-    zone = match.group(1)
-    try:
-        _ = ZoneInfo(zone)
-        units = tuple(shlex.split(match.group(2).strip()))
-    except (KeyError, ValueError) as error:
-        return UnreadablePrompt(f"prompt has invalid zone or units: {error}")
-    if units[:1] == ("--showrunner",):
-        if len(units) != 2:
-            return UnreadablePrompt("unit_status.sh --showrunner needs a session")
-        return PromptUnits(zone, ())
-    if not units:
-        return UnreadablePrompt("unit_status.sh command has no units")
-    return PromptUnits(zone, units)
+        raise ValueError(f"production doc could not be read: {error}") from error
 
 
-def _running(instance: Path) -> RunningShowrunner | None:
+def _timer(instance: Path) -> Timer:
     fields = _fields(instance / "conf")
     target = fields["TARGET"]
     if not target.startswith("session:") or not target[8:]:
         raise ValueError("invalid TARGET")
-    socket = socket_for(target)
-    if socket is None:
-        return None
-    return RunningShowrunner(instance.name.removeprefix("showrunner-"), _session_name(target[8:]),
-                             socket, _prompt_units(fields))
+    doc = checked_doc(instance)
+    if isinstance(doc, NoCheckedDoc):
+        raise ValueError(doc.reason)
+    _readable(doc.path)
+    return Timer(instance.name.removeprefix("showrunner-"), target, doc.path, user_zone_name())
 
 
-def running_showrunners(state_dir: Path | None = None) -> list[RunningShowrunner]:
-    found: list[RunningShowrunner] = []
+def _registered(instance: Path) -> Showrunner:
+    timer = _timer(instance)
+    socket = socket_for(timer.target)
+    name = _session_name(timer.target[8:]) if socket is not None else ""
+    return Showrunner(session=name, socket=socket or "", slug=timer.slug, zone=timer.zone, doc=str(timer.doc))
+
+
+def registered_showrunners(state_dir: Path | None = None) -> list[Showrunner]:
+    """Every showrunner that has an update timer, running or not.
+
+    The timer is addressed to the Claude session id and holds the production doc, so it is the one
+    record of a showrunner and holds no name: the name is looked up here, at each call. Raises OSError
+    when the session records cannot say whether a showrunner runs; a timer that is not a complete
+    showrunner's is left out, with the reason on stderr.
+    """
+    found: list[Showrunner] = []
     for instance in sorted((state_dir or NOTIFIER_STATE_DIR).glob("showrunner-*")):
         if not instance.is_dir():
             continue
         try:
-            runner = _running(instance)
-            if runner is not None:
-                found.append(runner)
-        except (OSError, KeyError, ValueError) as error:
+            found.append(_registered(instance))
+        except (KeyError, ValueError, UnicodeError) as error:
             print(f"showrunners: skipping {instance.name}: {error}", file=sys.stderr)
     return found
 
 
-def missing_showrunners(settings: ShowrunnerSettings) -> list[RunningShowrunner]:
-    sockets = {socket for runner in settings["showrunners"]
-               if (socket := socket_for(runner["session"])) is not None}
-    return [runner for runner in running_showrunners() if runner.socket not in sockets]
-
-
-def add(settings: ShowrunnerSettings, session: str, zone: str, units: list[str], standby: bool = False) -> None:
-    _ = ZoneInfo(zone)
-    requested = [StandbyUnit(unit) if standby else WorkingUnit(unit) for unit in dict.fromkeys(units)]
-    for runner in settings["showrunners"]:
-        if runner["session"] == session:
-            runner["zone"] = zone
-            known = {unit.name for unit in runner["units"]}
-            runner["units"].extend(unit for unit in requested if unit.name not in known)
-            if standby:
-                runner["units"] = [StandbyUnit(unit.name) if unit.name in units else unit
-                                   for unit in runner["units"]]
-            return
-    settings["showrunners"].append(Showrunner(session=session, zone=zone, units=requested))
-
-
-def remove(settings: ShowrunnerSettings, session: str, units: list[str]) -> None:
-    if not units:
-        settings["showrunners"] = [runner for runner in settings["showrunners"] if runner["session"] != session]
-    else:
-        for runner in settings["showrunners"]:
-            if runner["session"] == session:
-                runner["units"] = [unit for unit in runner["units"] if unit.name not in units]
-
-
-def ready(settings: ShowrunnerSettings, session: str, units: list[str]) -> list[str]:
-    changed: set[str] = set()
-    for runner in settings["showrunners"]:
-        if runner["session"] == session:
-            changed.update(unit.name for unit in runner["units"]
-                           if isinstance(unit, StandbyUnit) and unit.name in units)
-            runner["units"] = [WorkingUnit(unit.name) if isinstance(unit, StandbyUnit) and unit.name in units
-                               else unit for unit in runner["units"]]
-            break
-    return [unit for unit in units if unit not in changed]
-
-
-def stored_settings(settings: ShowrunnerSettings) -> dict[str, object]:
-    runners: list[dict[str, object]] = []
-    for runner in settings["showrunners"]:
-        stored: dict[str, object] = {"session": runner["session"], "zone": runner["zone"],
-                                     "units": [unit.name for unit in runner["units"]]}
-        waiting = [unit.name for unit in runner["units"] if isinstance(unit, StandbyUnit)]
-        if waiting:
-            stored["standby"] = waiting
-        runners.append(stored)
-    return {**settings, "showrunners": runners}
-
-
-def rewrite_prompt_names(old: str, new: str) -> None:
-    status_command = re.compile(r"(unit_status\.sh\s+\S+\s+\S+\s+)([^|`\n]+)")
-    for instance in NOTIFIER_STATE_DIR.glob("showrunner-*"):
+def production_of(session_id: str, state_dir: Path | None = None) -> Path | None:
+    """The production doc of the showrunner whose update timer is addressed to `session_id`."""
+    for instance in sorted((state_dir or NOTIFIER_STATE_DIR).glob("showrunner-*")):
         try:
-            prompt_value = _fields(instance / "conf").get("PROMPT_FILE", "")
-            prompt_path = Path(prompt_value)
-            if not prompt_path.is_absolute():
-                continue
-            original = prompt_path.read_text(encoding="utf-8")
+            target = _fields(instance / "conf").get("TARGET")
         except (OSError, UnicodeError):
             continue
+        doc = checked_doc(instance)
+        if session_id and target == f"session:{session_id}" and isinstance(doc, CheckedDoc):
+            return doc.path
+    return None
 
-        def replace_status(match: re.Match[str]) -> str:
-            arguments = match.group(2)
-            try:
-                tokens = shlex.split(arguments)
-            except ValueError:
-                return match.group(0)
-            if not tokens or (tokens[0] == "--showrunner" and len(tokens) != 2):
-                return match.group(0)
-            if old not in tokens:
-                return match.group(0)
-            renamed = [new if token == old else token for token in tokens]
-            return match.group(1) + shlex.join(renamed) + arguments[len(arguments.rstrip()):]
 
-        updated = status_command.sub(replace_status, original)
-        if updated == original:
+def production_slug(doc: str) -> str:
+    """The slug a production's units are marked with: its doc's name without the suffix."""
+    slug = Path(doc).name.removesuffix("-production.md")
+    if not doc or slug == Path(doc).name:
+        raise ValueError(f"not a production doc: {doc or 'none registered'}")
+    return slug
+
+
+def current_name(slug: str) -> str:
+    """The name now of the production's showrunner. Empty while it is not running or has no update timer."""
+    return next((runner["session"] for runner in registered_showrunners() if runner["slug"] == slug), "")
+
+
+def current_address(slug: str) -> str:
+    """Where `SendMessage` reaches the production's showrunner now: its session on this machine.
+    Empty while it is not running or has no update timer."""
+    socket = next((runner["socket"] for runner in registered_showrunners() if runner["slug"] == slug), "")
+    return f"uds:{socket}" if socket else ""
+
+
+def named(showrunner: str) -> Showrunner:
+    """The showrunner called `showrunner` now, or whose production has that slug."""
+    for runner in registered_showrunners():
+        if showrunner and showrunner in (runner["session"], runner["slug"]):
+            return runner
+    raise ValueError(f"no showrunner with an update timer is called {showrunner} or runs that production")
+
+
+def timer_slugs(state_dir: Path | None = None) -> set[str]:
+    """Every production with a complete update timer, whether or not its showrunner runs."""
+    found: set[str] = set()
+    for instance in (state_dir or NOTIFIER_STATE_DIR).glob("showrunner-*"):
+        try:
+            found.add(_timer(instance).slug)
+        except (OSError, KeyError, ValueError, UnicodeError):
             continue
-        with tempfile.NamedTemporaryFile("w", dir=prompt_path.parent, prefix=f".{prompt_path.name}-",
-                                         delete=False, encoding="utf-8") as temporary:
-            _ = temporary.write(updated)
-            temporary.flush()
-            os.fsync(temporary.fileno())
-            temporary_path = Path(temporary.name)
-        os.chmod(temporary_path, prompt_path.stat().st_mode)
-        os.replace(temporary_path, prompt_path)
+    return found
 
 
-def change(action: str, session: str, zone: str, units: list[str], new_name: str = "",
-           standby: bool = False) -> None:
-    CONFIG.parent.mkdir(parents=True, exist_ok=True)
-    with CONFIG.with_suffix(".lock").open("a+", encoding="utf-8") as lock:
-        fcntl.flock(lock, fcntl.LOCK_EX)
-        settings = load_settings() if CONFIG.exists() else defaults()
-        if action == "add":
-            add(settings, session, zone, units, standby)
-        elif action == "remove":
-            remove(settings, session, units)
-        elif action == "ready":
-            missing = ready(settings, session, units)
-            for unit in missing:
-                print(f"{unit} is not on standby")
-            if len(missing) == len(units):
-                return
-        elif action == "rename":
-            for runner in settings["showrunners"]:
-                old_runner = runner["session"]
-                if old_runner == session:
-                    runner["session"] = new_name
-                runner["units"] = [type(unit)(new_name if unit.name == session else unit.name)
-                                   for unit in runner["units"]]
-                result = subprocess.run([sys.executable, str(Path(__file__).with_name("stall_watch.py")),
-                                         "rename-state", session, new_name, old_runner,
-                                         runner["session"], *(unit.name for unit in runner["units"])],
-                                        capture_output=True, text=True, check=False)
-                if result.returncode != 0:
-                    raise ValueError(f"stall state rename failed: {result.stderr.strip()}")
-            rewrite_prompt_names(session, new_name)
-        else:
-            for runner in running_showrunners():
-                if isinstance(runner.prompt, UnreadablePrompt):
-                    print(f"showrunners: skipping showrunner-{runner.slug}: {runner.prompt.reason}", file=sys.stderr)
-                    continue
-                add(settings, runner.session, runner.prompt.zone, list(runner.prompt.unit_sessions))
-        with tempfile.NamedTemporaryFile("w", dir=CONFIG.parent, prefix=".showrunners-", delete=False,
-                                         encoding="utf-8") as temporary:
-            json.dump(stored_settings(settings), temporary, indent=2)
-            _ = temporary.write("\n")
-            temporary.flush()
-            os.fsync(temporary.fileno())
-            temporary_path = Path(temporary.name)
-        os.replace(temporary_path, CONFIG)
+def _stored_parent(child: str) -> str:
+    """What the child's parent file says, whether or not that edge counts. Empty when it has none."""
+    try:
+        return (SHOWRUNNER_STATE_DIR / child / PARENT_FILE).read_text(encoding="utf-8").strip()
+    except (OSError, UnicodeError):
+        return ""
+
+
+def _on_cycle(slug: str, stored: dict[str, str]) -> bool:
+    seen = {slug}
+    current = stored.get(slug, "")
+    while current and current not in seen:
+        seen.add(current)
+        current = stored.get(current, "")
+    return current == slug
+
+
+def edges(slugs: set[str] | None = None) -> dict[str, str]:
+    """Each child's parent, among `slugs` or every production with an update timer.
+
+    An edge counts only while both ends have an update timer, so a wrapped production leaves no
+    broken tree. `attach` writes no cycle; one written by hand counts for none of its members, so
+    each of them is a root.
+    """
+    known = timer_slugs() if slugs is None else slugs
+    stored = {child: parent for child in known if (parent := _stored_parent(child)) in known and parent != child}
+    return {child: parent for child, parent in stored.items() if not _on_cycle(child, stored)}
+
+
+def parent_of(slug: str) -> str:
+    """The production `slug` reports to. Empty for a root."""
+    return edges().get(slug, "")
+
+
+def children_of(slug: str) -> list[str]:
+    """The productions that report to `slug`, one level down."""
+    return sorted(child for child, parent in edges().items() if parent == slug)
+
+
+def _below(slug: str, tree: dict[str, str]) -> list[str]:
+    level = [slug]
+    found: list[str] = []
+    while level:
+        level = sorted(child for child, parent in tree.items() if parent in level)
+        found.extend(level)
+    return found
+
+
+def descendants_of(slug: str) -> list[str]:
+    """Every production below `slug`, at any depth, the nearest level first."""
+    return _below(slug, edges())
+
+
+def _root_in(slug: str, tree: dict[str, str]) -> str:
+    while slug in tree:
+        slug = tree[slug]
+    return slug
+
+
+class Place(NamedTuple):
+    """Where a production sits in its tree, for what its showrunner shows the user."""
+    root: str  # the root it is under; empty when it is a root itself
+    below: list[str]  # for a root, every production below it; empty otherwise
+
+
+def place_of(slug: str) -> Place:
+    """`slug`'s place in its tree, from one reading of the edges."""
+    tree = edges()
+    return Place(_root_in(slug, tree), []) if slug in tree else Place("", _below(slug, tree))
+
+
+def user_facing(slug: str) -> list[str]:
+    """The productions whose items for the user `slug`'s showrunner counts and lists.
+
+    A root answers for itself and every production below it. Any other showrunner answers for its
+    own items alone.
+    """
+    return [slug, *place_of(slug).below]
+
+
+def root_of(slug: str) -> str:
+    """The top of the tree `slug` is in, the showrunner that shows the user everything below it. A root is its own."""
+    return _root_in(slug, edges())
+
+
+def highest_running(runners: list[Showrunner]) -> list[Showrunner]:
+    """Each running showrunner with no running showrunner above it.
+
+    These are the roots, and below a root that is down, the showrunners nearest it. What every
+    production must hear once, a machine-wide fault, goes to these.
+    """
+    tree = edges({runner["slug"] for runner in runners})
+    running = {runner["slug"] for runner in runners if runner["socket"]}
+
+    def covered(slug: str) -> bool:
+        while slug in tree:
+            slug = tree[slug]
+            if slug in running:
+                return True
+        return False
+
+    return [runner for runner in runners if runner["socket"] and not covered(runner["slug"])]
+
+
+def tree_lines(runners: list[Showrunner]) -> list[str]:
+    """One line per showrunner, each child indented under its parent."""
+    tree = edges({runner["slug"] for runner in runners})
+    names = {runner["slug"]: runner["session"] or "<not running>" for runner in runners}
+    lines: list[str] = []
+
+    def add(slug: str, depth: int) -> None:
+        lines.append(f"{'  ' * depth}{slug}\t{names[slug]}")
+        for child in sorted(child for child, parent in tree.items() if parent == slug):
+            add(child, depth + 1)
+
+    for slug in sorted(names):
+        if slug not in tree:
+            add(slug, 0)
+    return lines
+
+
+def own_slug() -> str:
+    """The production this session runs as showrunner. Empty when it runs none."""
+    doc = production_of(os.environ.get("CLAUDE_CODE_SESSION_ID", ""))
+    return production_slug(str(doc)) if doc is not None else ""
+
+
+def attach(child: str, parent: str) -> None:
+    """Store that `child` reports to `parent`. Raises ValueError naming why it cannot."""
+    known = timer_slugs()
+    for slug in (child, parent):
+        if slug not in known:
+            raise ValueError(f"{slug} has no update timer, so it has no showrunner to attach")
+    if child == parent:
+        raise ValueError(f"{child} cannot report to itself")
+    tree = edges(known)
+    if child in tree:
+        raise ValueError(f"{child} already reports to {tree[child]}; detach it first")
+    above = parent
+    while above in tree:
+        above = tree[above]
+        if above == child:
+            raise ValueError(f"{parent} already reports to {child}, directly or through others")
+    path = SHOWRUNNER_STATE_DIR / child / PARENT_FILE
+    path.parent.mkdir(parents=True, exist_ok=True)
+    # Written beside the file and moved over it, so a reader never sees half a slug.
+    temporary = path.with_name(f".{PARENT_FILE}.{os.getpid()}")
+    _ = temporary.write_text(f"{parent}\n", encoding="utf-8")
+    _ = temporary.replace(path)
+
+
+def detach(child: str) -> str:
+    """Remove `child`'s parent file and return the parent it named. Raises ValueError when it has none."""
+    parent = _stored_parent(child)
+    if not parent:
+        raise ValueError(f"{child} reports to no one")
+    (SHOWRUNNER_STATE_DIR / child / PARENT_FILE).unlink()
+    return parent
+
+
+class Released(NamedTuple):
+    """The edges a wrapped production left: each one's parent file is gone."""
+
+    # The production it reported to. Empty when it had none.
+    parent: str
+    # The productions that reported to it, each a root now.
+    orphans: list[str]
+
+
+def stored_children(slug: str) -> list[str]:
+    """Every production whose parent file names `slug`, whether or not that edge counts."""
+    return sorted(path.parent.name for path in SHOWRUNNER_STATE_DIR.glob(f"*/{PARENT_FILE}")
+                  if path.parent.name != slug and _stored_parent(path.parent.name) == slug)
+
+
+def release_edges(slug: str) -> Released:
+    """Remove `slug`'s parent file and every parent file that names it, so a wrap leaves no edge behind.
+
+    An edge to a wrapped production already counts for nothing; its file would come back to life if a
+    production of the same slug ran again.
+    """
+    released = Released(_stored_parent(slug), stored_children(slug))
+    for child in ([slug] if released.parent else []) + released.orphans:
+        (SHOWRUNNER_STATE_DIR / child / PARENT_FILE).unlink(missing_ok=True)
+    return released
+
+
+def tell(slug: str, key: str, text: str) -> str:
+    """Send one line to the production's showrunner, and say in a few words whether it got there."""
+    address = current_address(slug)
+    if not address:
+        return f"{slug} is not running: tell it when it starts"
+    sent = subprocess.run([sys.executable, str(SEND), "--to", address, "--from", "showrunners", "--key", key,
+                           "--text", text], capture_output=True, text=True, check=False)
+    if sent.returncode != 0:
+        return f"could not tell {slug}: {sent.stderr.strip() or f'send.py exited {sent.returncode}'}"
+    return f"told {slug}"
+
+
+def tell_others(texts: dict[str, str], key: str) -> list[str]:
+    """Tell each production its line, but for the one this session runs, which reads the command's own output."""
+    own = own_slug()
+    return [tell(slug, key, text) for slug, text in texts.items() if slug != own]
 
 
 def main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser()
     commands = parser.add_subparsers(dest="action", required=True)
-    adding = commands.add_parser("add")
-    _ = adding.add_argument("session")
-    _ = adding.add_argument("--zone", required=True)
-    _ = adding.add_argument("--unit", action="append", default=[])
-    _ = adding.add_argument("--standby", action="store_true")
-    removing = commands.add_parser("remove")
-    _ = removing.add_argument("session")
-    _ = removing.add_argument("--unit", action="append", default=[])
+    # Does nothing: a unit's run state is read from its run records. Delete once no session started before that is left.
     making_ready = commands.add_parser("ready")
-    _ = making_ready.add_argument("session")
-    _ = making_ready.add_argument("--unit", action="append", required=True)
-    renaming = commands.add_parser("rename")
-    _ = renaming.add_argument("session")
-    _ = renaming.add_argument("new_name")
-    _ = commands.add_parser("import")
+    _ = making_ready.add_argument("session", nargs="?")
+    _ = making_ready.add_argument("--unit", action="append")
+    naming = commands.add_parser("name")
+    _ = naming.add_argument("slug")
+    addressing = commands.add_parser("address")
+    _ = addressing.add_argument("slug")
+    # Does nothing: a unit's run state is read from its run records. Delete once no session started before that is left.
+    setting_status = commands.add_parser("status")
+    _ = setting_status.add_argument("session", nargs="?")
+    _ = setting_status.add_argument("--unit")
+    _ = setting_status.add_argument("--state")
     _ = commands.add_parser("list")
+    for lookup in ("parent", "children", "root"):
+        looking_up = commands.add_parser(lookup)
+        _ = looking_up.add_argument("slug")
+    _ = commands.add_parser("tree")
+    attaching = commands.add_parser("attach")
+    _ = attaching.add_argument("child")
+    _ = attaching.add_argument("parent", nargs="?")
+    detaching = commands.add_parser("detach")
+    _ = detaching.add_argument("child")
     args = parser.parse_args(argv)
     action = cast(str, args.action)
     try:
         if action == "list":
-            settings = load_settings()
-            for runner in settings["showrunners"]:
-                state = "running" if socket_for(runner["session"]) else "not running"
-                unit_names = (unit.name + (":standby" if isinstance(unit, StandbyUnit) else "")
-                              for unit in runner["units"])
-                print(f"{runner['session']}\t{state}\t{runner['zone']}\t{' '.join(unit_names)}")
-            for runner in missing_showrunners(settings):
-                if isinstance(runner.prompt, PromptUnits):
-                    detail = f"{runner.prompt.zone}\t{' '.join(runner.prompt.unit_sessions)}"
-                else:
-                    detail = f"<zone>\t<tmux session>\t{runner.prompt.reason}"
-                print(f"missing: showrunner-{runner.slug}\t{runner.session}\t{detail}")
-        else:
-            change(action, cast(str, getattr(args, "session", "")), cast(str, getattr(args, "zone", "")),
-                   cast(list[str], getattr(args, "unit", [])),
-                   cast(str, getattr(args, "new_name", "")), cast(bool, getattr(args, "standby", False)))
+            for runner in registered_showrunners():
+                print(f"{runner['slug']}\t{runner['session'] or '<not running>'}\t{runner['zone']}"
+                      + f"\t{runner['doc']}")
+        elif action in ("name", "address"):
+            slug = cast(str, args.slug)
+            found = current_name(slug) if action == "name" else current_address(slug)
+            if not found:
+                raise ValueError(f"the showrunner of {slug} is not running")
+            print(found)
+        elif action in ("parent", "children", "root"):
+            slug = cast(str, args.slug)
+            if slug not in timer_slugs():
+                raise ValueError(f"{slug} has no update timer")
+            # A root prints no parent and no children: an empty answer is the answer.
+            answers = children_of(slug) if action == "children" else [parent_of(slug) if action == "parent" else root_of(slug)]
+            for answer in answers:
+                if answer:
+                    print(answer)
+        elif action == "tree":
+            for line in tree_lines(registered_showrunners()):
+                print(line)
+        elif action == "attach":
+            child = cast(str, args.child)
+            parent = cast(str | None, args.parent) or own_slug()
+            if not parent:
+                raise ValueError("name the parent: this session runs no production")
+            attach(child, parent)
+            top = root_of(parent)
+            print(f"{child} now reports to {parent}")
+            for line in tell_others({
+                child: f"{child} now reports to {parent}. The root is {top}: send it each item for the user. {RULES}",
+                parent: f"{child} now reports to {parent}. It is a child showrunner, never a unit: it has no Units "
+                        + f"row, and no broadcast is passed on to it. {RULES}",
+            }, f"showrunner-tree:{child}"):
+                print(line)
+        elif action == "detach":
+            child = cast(str, args.child)
+            parent = detach(child)
+            print(f"{child} no longer reports to {parent}")
+            text = f"{child} no longer reports to {parent}. {child} is a root again."
+            for line in tell_others({child: text, parent: text}, f"showrunner-tree:{child}"):
+                print(line)
     except (OSError, ValueError, KeyError) as error:
         print(f"showrunners: {error}", file=sys.stderr)
         return 1

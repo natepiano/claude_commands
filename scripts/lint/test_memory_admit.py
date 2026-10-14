@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sqlite3
 import subprocess
 import tempfile
@@ -22,6 +23,7 @@ store = gate.store
 
 GIB = gate.GIB
 NOW = datetime(2026, 10, 6, 22, 0, tzinfo=UTC)
+HISTORY_AT = NOW - timedelta(seconds=1)
 INVOKE = Path(__file__).with_name("invoke.sh")
 MEMORY_GATE = Path(__file__).with_name("memory_gate.sh")
 
@@ -56,19 +58,27 @@ class HistoryTests(unittest.TestCase):
         self.host = "test-host"
 
     def add_measured(self, count: int, *, host: str = "test-host", repo: str = "hana",
-                     at: datetime = NOW) -> None:
+                     at: datetime = HISTORY_AT, test_threads: int | None = None,
+                     start_gib: int = 1) -> None:
         with (self.admission / "anon_peaks.jsonl").open("a") as out:
             for index in range(count):
-                _ = out.write(json.dumps({"host": host, "repo": repo, "step": "nextest",
-                                          "ended_at": store.utc_iso(at.timestamp()),
-                                          "anon_peak_bytes": (index + 1) * GIB}) + "\n")
+                record: dict[str, object] = {
+                    "host": host,
+                    "repo": repo,
+                    "step": "nextest",
+                    "ended_at": store.utc_iso(at.timestamp()),
+                    "anon_peak_bytes": (start_gib + index) * GIB,
+                }
+                if test_threads is not None:
+                    record["test_threads"] = test_threads
+                _ = out.write(json.dumps(record) + "\n")
 
-    def add_index(self) -> None:
+    def add_index(self, *, at: datetime = HISTORY_AT) -> None:
         with closing(sqlite3.connect(self.root / "index.sqlite")) as db, db:
             _ = db.execute("CREATE TABLE steps(host TEXT, repo TEXT, step TEXT, started_at TEXT, peak_mem_bytes INTEGER)")
             for index in range(5):
                 _ = db.execute("INSERT INTO steps VALUES (?, ?, ?, ?, ?)",
-                               (self.host, "hana", "nextest", store.utc_iso(NOW.timestamp()), (index + 1) * GIB))
+                               (self.host, "hana", "nextest", store.utc_iso(at.timestamp()), (index + 1) * GIB))
 
     def peak(self) -> gate.ExpectedPeak:
         return gate.expected_peak("hana", "nextest", self.host, NOW, self.root)
@@ -91,6 +101,52 @@ class HistoryTests(unittest.TestCase):
         self.add_index()
         self.assertEqual(self.peak().source, "buildlog")
 
+    def test_measured_history_is_keyed_by_test_width(self) -> None:
+        self.add_measured(5, test_threads=16)
+        self.add_measured(5, start_gib=6)
+        self.assertEqual(
+            gate.expected_peak("hana", "nextest", self.host, NOW, self.root, test_threads=16),
+            gate.ExpectedPeak(5 * GIB, "measured", 5),
+        )
+        self.assertEqual(
+            gate.expected_peak("hana", "nextest", self.host, NOW, self.root),
+            gate.ExpectedPeak(10 * GIB, "measured", 5),
+        )
+
+    def test_future_measured_records_do_not_override_prior_index_history(self) -> None:
+        """F002: a historical report excludes measured records beyond its end."""
+        self.add_index()
+        self.add_measured(5, at=NOW + timedelta(seconds=1), start_gib=10)
+        self.assertEqual(self.peak(), gate.ExpectedPeak(int(5 * GIB * gate.ANON_SHARE), "buildlog", 5))
+
+    def test_future_index_rows_do_not_supply_buildlog_history(self) -> None:
+        """F002: a historical report excludes index rows beyond its end."""
+        self.add_index(at=NOW + timedelta(seconds=1))
+        self.assertEqual(self.peak(), gate.ExpectedPeak(gate.FALLBACK, "fallback", 0))
+
+
+class TestThreadParsingTests(unittest.TestCase):
+    def test_all_integer_forms_are_recognized(self) -> None:
+        cases = (
+            (["cargo", "nextest", "run", "--test-threads", "16"], 16),
+            (["cargo", "nextest", "run", "--test-threads=32"], 32),
+            (["cargo", "nextest", "run", "-j", "12"], 12),
+            (["cargo", "nextest", "run", "-j8"], 8),
+        )
+        for argv, expected in cases:
+            with self.subTest(argv=argv):
+                self.assertEqual(gate.test_threads(argv), expected)
+
+    def test_absent_or_non_integer_width_is_unset(self) -> None:
+        for argv in (
+            ["cargo", "nextest", "run"],
+            ["cargo", "nextest", "run", "--test-threads", "num-cpus"],
+            ["cargo", "nextest", "run", "--test-threads=num-cpus"],
+            ["cargo", "nextest", "run", "-jnum-cpus"],
+        ):
+            with self.subTest(argv=argv):
+                self.assertIsNone(gate.test_threads(argv))
+
 
 class LedgerTests(unittest.TestCase):
     root: Path = Path()
@@ -106,18 +162,20 @@ class LedgerTests(unittest.TestCase):
         _ = self.meminfo.write_text("MemAvailable: 12582912 kB\n")
         self.pid = os.getpid()
 
-    def check(self, available: int, *, force: bool = False, sidecar: str = "") -> tuple[gate.AdmissionDecision, Path | None]:
+    def check(self, available: int, *, force: bool = False, sidecar: str = "",
+              argv: list[str] | None = None) -> tuple[gate.AdmissionDecision, Path | None]:
         self.write_meminfo(available)
-        return self.admit(force=force, sidecar=sidecar)
+        return self.admit(force=force, sidecar=sidecar, argv=argv)
 
     def write_meminfo(self, available: int) -> None:
         _ = self.meminfo.write_text(f"MemAvailable: {available // 1024} kB\n")
 
-    def admit(self, *, force: bool = False, sidecar: str = "") -> tuple[gate.AdmissionDecision, Path | None]:
+    def admit(self, *, force: bool = False, sidecar: str = "",
+              argv: list[str] | None = None) -> tuple[gate.AdmissionDecision, Path | None]:
         with patch.object(gate, "git_identity", return_value=("hana", "test-worktree")), \
              patch.object(store, "host_name", return_value="test-host"):
             result = gate.check(
-                self.meminfo, self.pid, sidecar, ["cargo", "nextest"], force, self.root, NOW
+                self.meminfo, self.pid, sidecar, argv or ["cargo", "nextest"], force, self.root, NOW
             )
         path = result.reservation.path if isinstance(result.reservation, gate.Reserved) else None
         return result.decision, path
@@ -142,7 +200,12 @@ class LedgerTests(unittest.TestCase):
         scope.mkdir()
         _ = (scope / "memory.stat").write_text(f"anon {8 * GIB}\nfile 1\n")
         _ = self.sidecar.write_text(str(scope) + "\n")
-        _, path = self.check(12 * GIB, sidecar=str(self.sidecar))
+        with patch.dict(os.environ, {"BUILDLOG_CALL_ID": "call-width-16"}):
+            _, path = self.check(
+                12 * GIB,
+                sidecar=str(self.sidecar),
+                argv=["cargo", "nextest", "run", "--test-threads", "16"],
+            )
         assert path is not None
         result, _ = self.check(12 * GIB)
         self.assertEqual(result.promised, 4 * GIB)
@@ -153,6 +216,7 @@ class LedgerTests(unittest.TestCase):
         self.assertFalse(self.sidecar.exists())
         line = cast(dict[str, object], json.loads((self.root / "admission/anon_peaks.jsonl").read_text()))
         self.assertEqual((line["anon_peak_bytes"], line["status"]), (8 * GIB, 7))
+        self.assertEqual((line["test_threads"], line["call_id"]), (16, "call-width-16"))
 
     def test_unscoped_step_writes_no_peak(self) -> None:
         _, path = self.check(12 * GIB)
@@ -167,7 +231,8 @@ class LedgerTests(unittest.TestCase):
             path = directory / f"{pid}.reservation"
             row: gate.Reservation = {"pid": pid, "start_time": start, "need": 12 * GIB,
                                      "repo": "hana", "step": "nextest", "worktree": "old",
-                                     "admitted_at": "", "sidecar": ""}
+                                     "admitted_at": "", "sidecar": "", "test_threads": None,
+                                     "call_id": None}
             _ = path.write_text(json.dumps(row))
         decision, _ = self.check(12 * GIB)
         self.assertEqual(decision.state, "admit")
@@ -230,7 +295,15 @@ class ShellTests(unittest.TestCase):
             _ = meminfo.write_text("MemAvailable: 67108864 kB\n")
             config = root / "config.sh"
             _ = config.write_text('lint_config_enabled() { return 0; }\nlint_config_skip_notice() { :; }\n')
-            environment = {**os.environ, "HOME": str(root), "BUILDLOG_MEMINFO": str(meminfo),
+            environment = {**os.environ,
+                           "BUILD_HOLD_DIR": str(root / "holders"),
+                           "BUILD_HOLD_RELEASE_DIR": str(root / "release"),
+                           "PLAN_DELEGATE_ACTIVE_DIR": str(root / "active"),
+                           "BUILDLOG_CALL_ID": "", "BUILDLOG_CALLER": "",
+                           "BUILDLOG_HOLD_WAIT_FILE": "", "BUILDLOG_HOLD_ADMISSION_FILE": "",
+                           "BUILDLOG_HOLD_STARTED_FILE": "", "BUILDLOG_HOLD_WAITER_FILE": "",
+                           "BUILDLOG_HOLD_REGISTRATION_FILE": str(root / "registration"),
+                           "MAC_TEST_STATE_DIR": str(root / "mac-state"), "HOME": str(root), "BUILDLOG_MEMINFO": str(meminfo),
                            "BUILDLOG_OFF": "1", "BUILDLOG_SCOPE": "0",
                            "LINT_CONFIG_READER": str(config)}
             command = 'source "$1"; sweep_after_step() { :; }; run_once true'
@@ -249,7 +322,15 @@ class ShellTests(unittest.TestCase):
             result = subprocess.run(
                 ["bash", "-c", command, "test", str(MEMORY_GATE)],
                 capture_output=True, text=True, timeout=8, check=False,
-                env={**os.environ, "HOME": str(root), "BUILDLOG_DIR": str(root / "log"),
+                env={**os.environ,
+                                         "BUILD_HOLD_DIR": str(root / "holders"),
+                                         "BUILD_HOLD_RELEASE_DIR": str(root / "release"),
+                                         "PLAN_DELEGATE_ACTIVE_DIR": str(root / "active"),
+                                         "BUILDLOG_CALL_ID": "", "BUILDLOG_CALLER": "",
+                                         "BUILDLOG_HOLD_WAIT_FILE": "", "BUILDLOG_HOLD_ADMISSION_FILE": "",
+                                         "BUILDLOG_HOLD_STARTED_FILE": "", "BUILDLOG_HOLD_WAITER_FILE": "",
+                                         "BUILDLOG_HOLD_REGISTRATION_FILE": str(root / "registration"),
+                                         "MAC_TEST_STATE_DIR": str(root / "mac-state"), "HOME": str(root), "BUILDLOG_DIR": str(root / "log"),
                      "BUILDLOG_MEMINFO": str(meminfo)},
             )
             self.assertEqual(result.returncode, 0, result.stderr)
@@ -276,7 +357,15 @@ class ShellTests(unittest.TestCase):
             command = 'source "$1"; buildlog_sample_anon "$2" "$3" & p=$!; sleep 1.2; kill "$p"; wait "$p" 2>/dev/null || true'
             result = subprocess.run(["bash", "-c", command, "test", str(INVOKE), str(sidecar), str(maximum)],
                                     capture_output=True, text=True, timeout=5, check=False,
-                                    env={**os.environ, "BUILDLOG_OFF": "1"})
+                                    env={**os.environ,
+                                         "BUILD_HOLD_DIR": str(root / "holders"),
+                                         "BUILD_HOLD_RELEASE_DIR": str(root / "release"),
+                                         "PLAN_DELEGATE_ACTIVE_DIR": str(root / "active"),
+                                         "BUILDLOG_CALL_ID": "", "BUILDLOG_CALLER": "",
+                                         "BUILDLOG_HOLD_WAIT_FILE": "", "BUILDLOG_HOLD_ADMISSION_FILE": "",
+                                         "BUILDLOG_HOLD_STARTED_FILE": "", "BUILDLOG_HOLD_WAITER_FILE": "",
+                                         "BUILDLOG_HOLD_REGISTRATION_FILE": str(root / "registration"),
+                                         "MAC_TEST_STATE_DIR": str(root / "mac-state"), "BUILDLOG_OFF": "1"})
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertEqual(maximum.read_text().strip(), str(GIB))
             with patch.object(store, "host_name", return_value="test-host"):
@@ -292,7 +381,15 @@ class ShellTests(unittest.TestCase):
             command = 'source "$1"; buildlog_wait_for_memory; printf "%s\n" "$BUILDLOG_MEM_RESERVATION"'
             result = subprocess.run(["bash", "-c", command, "test", str(MEMORY_GATE)],
                                     capture_output=True, text=True, timeout=5, check=False,
-                                    env={**os.environ, "BUILDLOG_DIR": str(root),
+                                    env={**os.environ,
+                                         "BUILD_HOLD_DIR": str(root / "holders"),
+                                         "BUILD_HOLD_RELEASE_DIR": str(root / "release"),
+                                         "PLAN_DELEGATE_ACTIVE_DIR": str(root / "active"),
+                                         "BUILDLOG_CALL_ID": "", "BUILDLOG_CALLER": "",
+                                         "BUILDLOG_HOLD_WAIT_FILE": "", "BUILDLOG_HOLD_ADMISSION_FILE": "",
+                                         "BUILDLOG_HOLD_STARTED_FILE": "", "BUILDLOG_HOLD_WAITER_FILE": "",
+                                         "BUILDLOG_HOLD_REGISTRATION_FILE": str(root / "registration"),
+                                         "MAC_TEST_STATE_DIR": str(root / "mac-state"), "BUILDLOG_DIR": str(root),
                                          "BUILDLOG_MEMINFO": str(meminfo), "BUILDLOG_MEM_POLL_S": "1",
                                          "BUILDLOG_MEM_WAIT_LIMIT_S": "1"})
             self.assertEqual(result.returncode, 0, result.stderr)
@@ -314,7 +411,15 @@ class ShellTests(unittest.TestCase):
             )
             result = subprocess.run(["bash", "-c", command, "test", str(MEMORY_GATE)],
                                     capture_output=True, text=True, timeout=8, check=False,
-                                    env={**os.environ, "HOME": str(root), "BUILDLOG_DIR": str(root / "log"),
+                                    env={**os.environ,
+                                         "BUILD_HOLD_DIR": str(root / "holders"),
+                                         "BUILD_HOLD_RELEASE_DIR": str(root / "release"),
+                                         "PLAN_DELEGATE_ACTIVE_DIR": str(root / "active"),
+                                         "BUILDLOG_CALL_ID": "", "BUILDLOG_CALLER": "",
+                                         "BUILDLOG_HOLD_WAIT_FILE": "", "BUILDLOG_HOLD_ADMISSION_FILE": "",
+                                         "BUILDLOG_HOLD_STARTED_FILE": "", "BUILDLOG_HOLD_WAITER_FILE": "",
+                                         "BUILDLOG_HOLD_REGISTRATION_FILE": str(root / "registration"),
+                                         "MAC_TEST_STATE_DIR": str(root / "mac-state"), "HOME": str(root), "BUILDLOG_DIR": str(root / "log"),
                                          "BUILDLOG_MEMINFO": str(meminfo)})
             self.assertEqual(result.returncode, 0, result.stderr)
             lines = result.stderr.splitlines()
@@ -337,7 +442,15 @@ class ShellTests(unittest.TestCase):
             )
             result = subprocess.run(["bash", "-c", command, "test", str(MEMORY_GATE)],
                                     capture_output=True, text=True, timeout=8, check=False,
-                                    env={**os.environ, "HOME": str(root), "BUILDLOG_DIR": str(root / "log"),
+                                    env={**os.environ,
+                                         "BUILD_HOLD_DIR": str(root / "holders"),
+                                         "BUILD_HOLD_RELEASE_DIR": str(root / "release"),
+                                         "PLAN_DELEGATE_ACTIVE_DIR": str(root / "active"),
+                                         "BUILDLOG_CALL_ID": "", "BUILDLOG_CALLER": "",
+                                         "BUILDLOG_HOLD_WAIT_FILE": "", "BUILDLOG_HOLD_ADMISSION_FILE": "",
+                                         "BUILDLOG_HOLD_STARTED_FILE": "", "BUILDLOG_HOLD_WAITER_FILE": "",
+                                         "BUILDLOG_HOLD_REGISTRATION_FILE": str(root / "registration"),
+                                         "MAC_TEST_STATE_DIR": str(root / "mac-state"), "HOME": str(root), "BUILDLOG_DIR": str(root / "log"),
                                          "BUILDLOG_MEMINFO": str(meminfo), "BUILDLOG_MEM_WAIT_LIMIT_S": "0"})
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertRegex(result.stdout, r"^TimedOut\|[^|\n]+\|exists\ngone\n$")
@@ -353,7 +466,15 @@ class ShellTests(unittest.TestCase):
                        'buildlog_wait_for_memory /bin/true; printf "%s\n" "$BUILDLOG_MEM_OUTCOME"; buildlog_release_memory 0')
             result = subprocess.run(["bash", "-c", command, "test", str(MEMORY_GATE)],
                                     capture_output=True, text=True, timeout=8, check=False,
-                                    env={**os.environ, "HOME": str(root), "BUILDLOG_DIR": str(root / "log"),
+                                    env={**os.environ,
+                                         "BUILD_HOLD_DIR": str(root / "holders"),
+                                         "BUILD_HOLD_RELEASE_DIR": str(root / "release"),
+                                         "PLAN_DELEGATE_ACTIVE_DIR": str(root / "active"),
+                                         "BUILDLOG_CALL_ID": "", "BUILDLOG_CALLER": "",
+                                         "BUILDLOG_HOLD_WAIT_FILE": "", "BUILDLOG_HOLD_ADMISSION_FILE": "",
+                                         "BUILDLOG_HOLD_STARTED_FILE": "", "BUILDLOG_HOLD_WAITER_FILE": "",
+                                         "BUILDLOG_HOLD_REGISTRATION_FILE": str(root / "registration"),
+                                         "MAC_TEST_STATE_DIR": str(root / "mac-state"), "HOME": str(root), "BUILDLOG_DIR": str(root / "log"),
                                          "BUILDLOG_MEMINFO": str(meminfo), "BUILDLOG_MEM_WAIT_LIMIT_S": "1"})
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertEqual(result.stdout, "Granted\n")
@@ -370,7 +491,15 @@ class ShellTests(unittest.TestCase):
             command = 'set -e; source "$1"; BUILDLOG_MEM_ADMIT_SCRIPT=$2; buildlog_wait_for_memory /bin/true; printf "%s\n" "$BUILDLOG_MEM_OUTCOME"'
             result = subprocess.run(["bash", "-c", command, "test", str(MEMORY_GATE), str(broken)],
                                     capture_output=True, text=True, timeout=8, check=False,
-                                    env={**os.environ, "BUILDLOG_MEMINFO": str(meminfo)})
+                                    env={**os.environ,
+                                         "BUILD_HOLD_DIR": str(root / "holders"),
+                                         "BUILD_HOLD_RELEASE_DIR": str(root / "release"),
+                                         "PLAN_DELEGATE_ACTIVE_DIR": str(root / "active"),
+                                         "BUILDLOG_CALL_ID": "", "BUILDLOG_CALLER": "",
+                                         "BUILDLOG_HOLD_WAIT_FILE": "", "BUILDLOG_HOLD_ADMISSION_FILE": "",
+                                         "BUILDLOG_HOLD_STARTED_FILE": "", "BUILDLOG_HOLD_WAITER_FILE": "",
+                                         "BUILDLOG_HOLD_REGISTRATION_FILE": str(root / "registration"),
+                                         "MAC_TEST_STATE_DIR": str(root / "mac-state"), "BUILDLOG_MEMINFO": str(meminfo)})
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertEqual(result.stdout, "MeminfoUnavailable\n")
             self.assertIn("memory gate failed (RuntimeError: broken lookup); starting anyway", result.stderr)
@@ -387,7 +516,15 @@ class ShellTests(unittest.TestCase):
                     result = subprocess.run(
                         ["bash", "-c", command, "test", str(MEMORY_GATE)],
                         capture_output=True, text=True, timeout=8, check=False,
-                        env={**os.environ, "HOME": str(root), "BUILDLOG_DIR": str(root / "log"),
+                        env={**os.environ,
+                                         "BUILD_HOLD_DIR": str(root / "holders"),
+                                         "BUILD_HOLD_RELEASE_DIR": str(root / "release"),
+                                         "PLAN_DELEGATE_ACTIVE_DIR": str(root / "active"),
+                                         "BUILDLOG_CALL_ID": "", "BUILDLOG_CALLER": "",
+                                         "BUILDLOG_HOLD_WAIT_FILE": "", "BUILDLOG_HOLD_ADMISSION_FILE": "",
+                                         "BUILDLOG_HOLD_STARTED_FILE": "", "BUILDLOG_HOLD_WAITER_FILE": "",
+                                         "BUILDLOG_HOLD_REGISTRATION_FILE": str(root / "registration"),
+                                         "MAC_TEST_STATE_DIR": str(root / "mac-state"), "HOME": str(root), "BUILDLOG_DIR": str(root / "log"),
                              "BUILDLOG_MEMINFO": str(meminfo)},
                     )
                     self.assertEqual(result.returncode, 0, result.stderr)
@@ -403,11 +540,126 @@ class ShellTests(unittest.TestCase):
             command = 'source "$1"; BUILDLOG_MEM_ADMIT_SCRIPT=$2; buildlog_wait_for_memory /bin/true; printf "%s|%s\n" "$BUILDLOG_MEM_OUTCOME" "$BUILDLOG_MEM_RESERVATION"'
             result = subprocess.run(["bash", "-c", command, "test", str(MEMORY_GATE), str(wrapper)],
                                     capture_output=True, text=True, timeout=8, check=False,
-                                    env={**os.environ, "HOME": str(root), "BUILDLOG_DIR": str(root / "log"),
+                                    env={**os.environ,
+                                         "BUILD_HOLD_DIR": str(root / "holders"),
+                                         "BUILD_HOLD_RELEASE_DIR": str(root / "release"),
+                                         "PLAN_DELEGATE_ACTIVE_DIR": str(root / "active"),
+                                         "BUILDLOG_CALL_ID": "", "BUILDLOG_CALLER": "",
+                                         "BUILDLOG_HOLD_WAIT_FILE": "", "BUILDLOG_HOLD_ADMISSION_FILE": "",
+                                         "BUILDLOG_HOLD_STARTED_FILE": "", "BUILDLOG_HOLD_WAITER_FILE": "",
+                                         "BUILDLOG_HOLD_REGISTRATION_FILE": str(root / "registration"),
+                                         "MAC_TEST_STATE_DIR": str(root / "mac-state"), "HOME": str(root), "BUILDLOG_DIR": str(root / "log"),
                                          "BUILDLOG_MEMINFO": str(meminfo)})
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertEqual(result.stdout, "Granted|\n")
             self.assertIn("memory gate could not track this step; starting without a reservation", result.stderr)
+
+
+class QueueLeaveTests(unittest.TestCase):
+    """LINT_QUEUE_LEAVE_HOOK on run_once's memory wait, with a stand-in build log recorder."""
+
+    root: Path = Path()
+    meminfo: Path = Path()
+    calls: Path = Path()
+    ran: Path = Path()
+    recorded: Path = Path()
+    environment: dict[str, str] = {}
+
+    @override
+    def setUp(self) -> None:
+        self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        self.meminfo = self.root / "meminfo"
+        self.calls = self.root / "hook-calls"
+        self.ran = self.root / "ran"
+        self.recorded = self.root / "recorded"
+        scripts = self.root / ".claude/scripts"
+        (scripts / "lib").mkdir(parents=True)
+        (scripts / "buildlog").mkdir()
+        py = scripts / "lib/py"
+        _ = py.write_text('#!/bin/sh\nexec python3 "$@"\n')
+        py.chmod(0o755)
+        _ = (scripts / "buildlog/record.py").write_text(
+            f"import sys\nwith open({str(self.recorded)!r}, 'a') as log:\n    log.write(sys.argv[1] + '\\n')\n")
+        config = self.root / "config.sh"
+        _ = config.write_text('lint_config_enabled() { return 0; }\nlint_config_skip_notice() { :; }\n')
+        self.environment = {**os.environ,
+                            "BUILD_HOLD_DIR": str(self.root / "holders"),
+                            "BUILD_HOLD_RELEASE_DIR": str(self.root / "release"),
+                            "PLAN_DELEGATE_ACTIVE_DIR": str(self.root / "active"),
+                            "BUILDLOG_CALL_ID": "", "BUILDLOG_CALLER": "",
+                            "BUILDLOG_HOLD_WAIT_FILE": "", "BUILDLOG_HOLD_ADMISSION_FILE": "",
+                            "BUILDLOG_HOLD_STARTED_FILE": "", "BUILDLOG_HOLD_WAITER_FILE": "",
+                            "BUILDLOG_HOLD_REGISTRATION_FILE": str(self.root / "registration"),
+                            "MAC_TEST_STATE_DIR": str(self.root / "mac-state"), "HOME": str(self.root),
+                            "BUILDLOG_DIR": str(self.root / "log"), "BUILDLOG_MEMINFO": str(self.meminfo),
+                            "BUILDLOG_SCOPE": "0", "BUILDLOG_SYNC": "1", "LINT_SKIP_SWEEP": "1",
+                            "LINT_CONFIG_READER": str(config)}
+        _ = self.environment.pop("LINT_QUEUE_LEAVE_HOOK", None)
+
+    def run_step(self, hook: str | None, sleep: str, step: str = 'run_once touch "$2"') -> subprocess.CompletedProcess[str]:
+        _ = self.meminfo.write_text("MemAvailable: 0 kB\n")
+        environment = dict(self.environment)
+        if hook is not None:
+            environment["LINT_QUEUE_LEAVE_HOOK"] = f'echo poll >> "{self.calls}"; {hook}'
+        command = (f'source "$1"; sleeps=0; sleep() {{ sleeps=$((sleeps + 1)); {sleep} }}; '
+                   + f'status=0; {step} || status=$?; '
+                   + 'printf "%s|%s|%s\\n" "$status" "$BUILDLOG_MEM_OUTCOME" "${BUILDLOG_START:-}"')
+        return subprocess.run(["bash", "-c", command, "test", str(INVOKE), str(self.ran)],
+                              capture_output=True, text=True, timeout=20, check=False, env=environment)
+
+    def hook_calls(self) -> int:
+        return len(self.calls.read_text().splitlines()) if self.calls.exists() else 0
+
+    def recorder_actions(self) -> list[str]:
+        return self.recorded.read_text().splitlines() if self.recorded.exists() else []
+
+    def reservations(self) -> list[Path]:
+        return list((self.root / "log/admission").glob("*.reservation"))
+
+    def test_hook_leaves_a_held_step_before_it_starts(self) -> None:
+        result = self.run_step("exit 0", ":;")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.splitlines()[-1], "75|LeftQueue|")
+        self.assertFalse(self.ran.exists())
+        self.assertEqual(self.hook_calls(), 1)
+        self.assertEqual(self.reservations(), [])
+        self.assertEqual(self.recorder_actions(), ["key"])
+        self.assertIn("another machine is free after 0 min 0 s: leaving the memory wait\n", result.stderr)
+
+    def test_step_that_can_start_never_asks_the_hook(self) -> None:
+        free = 'printf "MemAvailable: 67108864 kB\\n" > "$BUILDLOG_MEMINFO";'
+        result = self.run_step("exit 0", free)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.splitlines()[-1].split("|")[:2], ["0", "Granted"])
+        self.assertTrue(self.ran.exists())
+        self.assertEqual(self.hook_calls(), 0)
+        self.assertEqual(self.recorder_actions(), ["key", "step"])
+
+    def test_declining_hook_and_no_hook_wait_alike(self) -> None:
+        free_on_second = 'if (( sleeps == 2 )); then printf "MemAvailable: 67108864 kB\\n" > "$BUILDLOG_MEMINFO"; fi;'
+        outputs: list[tuple[str, list[str]]] = []
+        for hook in ("exit 1", None):
+            with self.subTest(hook=hook):
+                self.ran.unlink(missing_ok=True)
+                result = self.run_step(hook, free_on_second)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertTrue(self.ran.exists())
+                self.assertEqual(self.reservations(), [])
+                lines = result.stderr.splitlines()
+                outputs.append((result.stdout.splitlines()[-1].split("|")[1], [re.sub(r"\d+", "N", line) for line in lines]))
+        self.assertEqual(self.hook_calls(), 1)
+        self.assertEqual(outputs[0], outputs[1])
+        self.assertEqual(outputs[0][0], "Granted")
+
+    def test_nextest_helper_returns_the_status_and_drops_its_width_claim(self) -> None:
+        step = ('LINT_TEST_WIDTH=logical; cargo() { [[ "$*" == "nextest --version" ]] && return 0; touch "$2"; }; '
+                + 'run_nextest --workspace')
+        result = self.run_step("exit 0", ":;", step)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.splitlines()[-1], "75|LeftQueue|")
+        self.assertFalse(self.ran.exists())
+        self.assertEqual([path.name for path in (self.root / "log/admission/nextest").iterdir()], ["lock"])
+        self.assertEqual(self.reservations(), [])
 
 
 if __name__ == "__main__":

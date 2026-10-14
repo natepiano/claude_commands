@@ -2,7 +2,7 @@
 # invoke.sh — sourced library holding every cargo invocation policy: canonical
 # flags, config/lint.conf gating, and macOS sandbox-failure detection. This is the single bottom layer. The lint CLI in
 # this directory is the public entry point (shell aliases, validate_ci.sh,
-# the fix pipeline, pre_release_checks.sh, /clippy); delegate/verify.sh sources this
+# the fix pipeline and pre_release_checks.sh); delegate/verify.sh sources this
 # file directly and adds only its per-package scope rules on top. Nothing
 # outside this directory composes policy flags like -D warnings or the nextest
 # profile.
@@ -112,6 +112,7 @@ buildlog_step_compiles() {
     for arg in "$@"; do
         [[ "$arg" == */sweep.py ]] && return 1
     done
+    [[ "${1:-}" == taplo ]] && return 1
     [[ "${1:-}" == cargo ]] || return 0
     shift
     if [[ "${1:-}" == +* ]]; then
@@ -196,12 +197,46 @@ buildlog_finish_memory() {
     fi
 }
 
+# run() returns this when LINT_QUEUE_LEAVE_HOOK (memory_gate.sh) ended the
+# memory wait: the step never started, holds no reservation and leaves no build
+# log row, and BUILDLOG_MEM_WAIT_S keeps the time it waited. run_nextest
+# passes it through. 75 is EX_TEMPFAIL; neither cargo nor nextest exits with it.
+LINT_LEFT_QUEUE_STATUS=75
+
 run_once() {
     printf '+ %s\n' "$*"
-    buildlog_begin "$@" || true
-    local sampler_pid="" parent_pid=$BASHPID status=0
     if buildlog_step_compiles "$@"; then
-        buildlog_wait_for_memory "$@"
+        build_hold_wait_local || return $?
+    fi
+    buildlog_begin "$@" || true
+    local sampler_pid="" parent_pid=$BASHPID status=0 memory_wait=0
+    if buildlog_step_compiles "$@"; then
+        build_hold_step_started
+        while :; do
+            buildlog_wait_for_memory "$@"
+            memory_wait=$(( memory_wait + BUILDLOG_MEM_WAIT_S ))
+            if [[ "$BUILDLOG_MEM_OUTCOME" == LeftQueue ]]; then
+                buildlog_release_memory 0
+                BUILDLOG_MEM_WAIT_S=$memory_wait BUILDLOG_START="" BUILDLOG_TREE=""
+                return "$LINT_LEFT_QUEUE_STATUS"
+            fi
+            if build_hold_check_admission; then
+                break
+            else
+                status=$?
+            fi
+            buildlog_release_memory 0
+            if [[ "$status" != 10 ]]; then
+                BUILDLOG_MEM_WAIT_S=$memory_wait
+                return "$status"
+            fi
+            build_hold_wait_local || {
+                status=$?
+                BUILDLOG_MEM_WAIT_S=$memory_wait
+                return "$status"
+            }
+        done
+        BUILDLOG_MEM_WAIT_S=$memory_wait
         build_hold_mark MemoryGateReturned "$BUILDLOG_MEM_OUTCOME"
     fi
     if [[ -n "${BUILDLOG_MEM_RESERVATION:-}" && -n "${BUILDLOG_PEAK:-}" ]]; then
@@ -275,6 +310,7 @@ run() {
 SWEEP_EVERY_S=300
 
 sweep_after_step() {
+    [[ "${LINT_SKIP_SWEEP:-}" == 1 ]] && return 0
     local arg now last=0 dir stamp
     for arg in "$@"; do
         [[ "$arg" == */sweep.py ]] && return 0
@@ -300,8 +336,132 @@ require_nextest() {
     fi
 }
 
+# The nextest width mode: trial alternates physical and logical by block, and
+# physical or logical fixes the width. The trial block length must stay in sync
+# with BLOCK_S in scripts/buildlog/width_trial.py.
+LINT_TEST_WIDTH=logical
+
+nextest_physical_cores() {
+    [[ "${LINT_PHYSICAL_CORES+x}" == x ]] && return 0
+    LINT_PHYSICAL_CORES=""
+
+    local sysfs_root="${1:-/sys/devices/system/cpu}"
+    local topology package core pair seen="" count=0 value=""
+    case "$OSTYPE" in
+        linux*)
+            for topology in "$sysfs_root"/cpu[0-9]*/topology; do
+                [[ -r "$topology/physical_package_id" && -r "$topology/core_id" ]] || continue
+                IFS= read -r package < "$topology/physical_package_id" 2>/dev/null || continue
+                IFS= read -r core < "$topology/core_id" 2>/dev/null || continue
+                pair=":$package:$core:"
+                case "$seen" in
+                    *"$pair"*) continue ;;
+                esac
+                seen="$seen$pair"
+                (( count += 1 ))
+            done
+            value="$count"
+            ;;
+        darwin*)
+            value="$(sysctl -n hw.physicalcpu 2>/dev/null)" || value=""
+            ;;
+    esac
+    [[ "$value" =~ ^[1-9][0-9]*$ ]] && LINT_PHYSICAL_CORES="$value"
+    return 0
+}
+
+nextest_logical_cores() {
+    [[ "${LINT_LOGICAL_CORES+x}" == x ]] && return 0
+    LINT_LOGICAL_CORES=""
+
+    local value=""
+    value="$(getconf _NPROCESSORS_ONLN 2>/dev/null)" || value=""
+    [[ "$value" =~ ^[1-9][0-9]*$ ]] && LINT_LOGICAL_CORES="$value"
+    return 0
+}
+
+nextest_width_arm() {
+    local epoch="$1"
+    if (( (epoch / 6000) % 2 == 0 )); then
+        LINT_TEST_WIDTH_ARM=physical
+    else
+        LINT_TEST_WIDTH_ARM=logical
+    fi
+}
+
+# Local nextest runs share the machine's test threads: a run takes the mode's
+# width divided by the runs in flight, itself included, never below
+# nextest_budget.FLOOR (4). Each run holds an flock on its own marker through fd
+# 9 for as long as it runs, so a killed run stops counting with its shell. The
+# test processes do not inherit the fd. The trial mode stays unshared, since
+# width_trial.py names its arm by width. Any failure runs at the full width.
+LINT_TEST_BUDGET_SCRIPT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/nextest_budget.py"
+
+run_nextest_shared() {
+    local width=$1 shared="" status=0 dir name
+    shift
+    dir="${BUILDLOG_DIR:-$HOME/.local/state/buildlog}/admission/nextest"
+    name="$$.$RANDOM$RANDOM"
+    if ! { mkdir -p "$dir" && : > "$dir/$name.new"; } 2>/dev/null; then
+        run cargo nextest run --test-threads "$width" "$@"
+        return
+    fi
+    {
+        shared="$(buildlog_memory_python "$LINT_TEST_BUDGET_SCRIPT" claim "$dir" "$name" "$width" 9 2>/dev/null)" \
+            || shared=""
+        [[ "$shared" =~ ^[1-9][0-9]*$ ]] || shared=$width
+        run cargo nextest run --test-threads "$shared" "$@" 9>&- || status=$?
+    } 9>>"$dir/$name.new"
+    rm -f "$dir/$name.run" "$dir/$name.new"
+    return "$status"
+}
+
 run_nextest() {
     require_nextest
+    build_hold_wait_local || return $?
+
+    local arg arm="" width=""
+    if [[ "${NEXTEST_TEST_THREADS+x}" != x ]]; then
+        for arg in "$@"; do
+            case "$arg" in
+                --)
+                    break
+                    ;;
+                --test-threads|--test-threads=*|-j|-j*)
+                    run cargo nextest run "$@"
+                    return
+                    ;;
+            esac
+        done
+
+        case "$LINT_TEST_WIDTH" in
+            trial)
+                nextest_width_arm "${EPOCHSECONDS:-$(date +%s)}"
+                arm="$LINT_TEST_WIDTH_ARM"
+                ;;
+            physical|logical)
+                arm="$LINT_TEST_WIDTH"
+                ;;
+        esac
+        case "$arm" in
+            physical)
+                nextest_physical_cores
+                width="${LINT_PHYSICAL_CORES:-}"
+                ;;
+            logical)
+                nextest_logical_cores
+                width="${LINT_LOGICAL_CORES:-}"
+                ;;
+        esac
+        if [[ -n "$width" ]]; then
+            if [[ "$LINT_TEST_WIDTH" == trial ]]; then
+                run cargo nextest run --test-threads "$width" "$@"
+            else
+                run_nextest_shared "$width" "$@"
+            fi
+            return
+        fi
+    fi
     run cargo nextest run "$@"
 }
 

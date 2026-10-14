@@ -1,0 +1,8 @@
+{"timestamp":"2026-10-10T21:34:58Z","type":"session_meta","payload":{"id":"outcome-thread","timestamp":"2026-10-10T21:00:00Z"}}
+{"timestamp":"2026-10-10T21:34:58Z","type":"turn_context","payload":{"model":"gpt-6.1-sol","effort":"high"}}
+{"timestamp":"2026-10-10T21:34:59Z","type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":15,"cached_input_tokens":5,"output_tokens":2}}}}
+{"timestamp":"2026-10-10T21:35:00Z","type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":30,"cached_input_tokens":10,"output_tokens":3}}}}
+{"timestamp":"2026-10-11T00:01:00Z","type":"turn_context","payload":{"model":"unknown-model"}}
+{"timestamp":"2026-10-11T00:01:01Z","type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":4,"cached_input_tokens":1,"output_tokens":1}}}}
+{"timestamp":"2026-10-11T00:01:05Z","type":"response_item","payload":{"type":"custom_tool_call","name":"apply_patch","input":"*** Begin Patch\n*** Add File: invented.py\n+value = 1\n*** End Patch"}}
+{"timestamp":"2026-10-11T00:01:06Z","type":"response_item","payload":{"type":"custom_tool_call","name":"apply_patch","input":"*** Begin Patch\n*** Update File: invented.py\n-value = 1\n+value = 2\n*** End Patch"}}

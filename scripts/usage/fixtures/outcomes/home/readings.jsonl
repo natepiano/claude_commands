@@ -1,0 +1,12 @@
+{"account":"fixture-account","at":"2026-10-10T17:00:00-04:00","remaining":25,"credits":4.5}
+{"account":"fixture-account","at":"2026-10-10T21:01:00Z"}
+{"account":"fixture-account","at":"2026-10-10T21:02:00Z","remaining":null,"credits":null}
+{"account":"fixture-account","at":"2026-10-10T21:03:00Z","remaining":0,"credits":0}
+{"account":"fixture-account","at":"2026-10-10T21:04:00Z","remaining":100,"credits":1000000}
+{"account":"fixture-account","at":"2026-10-10T21:05:00Z","remaining":101,"credits":-1}
+{"account":"fixture-account","at":"2026-10-10T21:06:00Z","remaining":"25","credits":"4.5"}
+{"account":"fixture-account","at":"2026-10-10T21:07:00Z","remaining":true,"credits":false}
+{"account":"fixture-account","at":"2026-10-10T21:08:00Z","remaining":NaN,"credits":Infinity}
+{"account":"fixture-account","at":"2026-10-10T21:09:00Z","remaining":-0.1,"credits":-Infinity}
+{"account":42,"at":"2026-10-10T21:10:00Z","remaining":25}
+{"account":"fixture-account","at":"invalid-time","remaining":25}

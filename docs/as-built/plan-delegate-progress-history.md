@@ -1,7 +1,7 @@
 # Plan-delegate progress history
 
 `scripts/delegate/progress_history.py` is the shared progress recorder for
-Claude and Codex implementations of `/unit:delegate`. It writes append-only
+Claude and Codex implementations of `/unit:direct`. It writes append-only
 per-run JSONL files under:
 
 ```text
@@ -21,6 +21,7 @@ Schema version 1 records these event types:
 - `pass_started` / `pass_finished`
 - `activity_started` / `activity_finished`
 - `progress_reported`
+- `eta_stated`
 - `finding_opened` / `finding_batch_dispatched` / `finding_verdict` /
   `finding_gate`, appended by `scripts/delegate/findings.py` to the same stream
 
@@ -37,6 +38,11 @@ percentages, decision source, override reason, each elapsed clock, and the
 calibration evidence used for that report. The phase decision also repeats the
 historical bias, suggested adjustment, and chosen adjustment so downstream
 analysis does not need to unpack the calibration snapshot.
+
+`eta_stated` records the active phase's promised arrival as epoch `eta_at` and
+its `basis`. A ranged statement also carries epoch `eta_earliest_at` and
+`eta_latest_at`; an exact statement carries neither range key. The event is the
+only recorder copy of a stated ETA. The live state does not duplicate it.
 
 ## Project clock
 
@@ -146,13 +152,16 @@ whether the calibration helped and continue tuning that original estimate.
 
 ## Findings ledger
 
-`scripts/delegate/findings.py` bounds `/unit:delegate`'s fix loop. It replaced a
+`scripts/delegate/findings.py` bounds `/unit:direct`'s fix loop. It replaced a
 `FIX_PASS < 10` counter, which could not converge: the re-review after each fix
 was a fresh blind review of a now-larger diff, with no memory of what had already
 been accepted, so it always returned something.
 
-State lives in `findings_state.json` beside the progress state and resets itself
-when the progress state's active `phase.instance_id` changes. Findings get stable
+State lives in `findings_state.json` beside the progress state and holds the
+ledger of the progress state's current `phase.instance_id`. When the current
+phase changes, the ledger it displaces is copied to
+`findings_state-<instance_id>.json` and read back when that phase is current
+again; a phase with no ledger yet starts fresh. Findings get stable
 ids (`F001…`) that survive across rounds, so "the same finding came back" is a
 fact the script can check rather than a judgment the unit director has to make.
 Each finding is `open`, `fixed_pending_review`, or `accepted`.
@@ -182,7 +191,7 @@ verdict: a finding reopened `MAX_REOPENS` times after being accepted; a finding
 that failed to close after `MAX_FIX_ATTEMPTS` repair attempts; `STALLED_ROUNDS`
 consecutive rounds with no decrease in the gating-open count;
 `MAX_CONSECUTIVE_SAME_KIND_PASSES` passes of one kind in a row; more than
-`MAX_REVIEW_CANCELLATIONS` blind-review cancellations; a spent repair budget; the
+`MAX_REVIEW_CANCELLATIONS` review cancellations; a spent repair budget; the
 `RUNAWAY_ROUNDS` backstop.
 
 Each of these used to stop the phase and hand it to the user. They stopped too
@@ -214,19 +223,52 @@ findings.py status --session-dir <dir>
 
 ```text
 progress_history.py start-run --session-dir <dir> --working-dir <dir> [--plan-doc <path>]
-progress_history.py start-phase --session-dir <dir> --phase-id <id> --phase-title <title> [--work-order-file <path>]
+progress_history.py start-phase --session-dir <dir> --phase-id <id> --phase-title <title> [--work-order-file <path>] [--started-at <ISO with zone>]
 progress_history.py start-pass ...        # launcher only
 progress_history.py finish-pass ...       # launcher only, or --orphaned-launcher --status canceled
 progress_history.py start-activity --session-dir <dir> --label <label> --activity <text>
 progress_history.py finish-activity --session-dir <dir> [--status completed|error|canceled|interrupted] [--result <outcome>]
 progress_history.py calibrate --session-dir <dir> --candidate-percent <N>
 progress_history.py progress --session-dir <dir> --project-raw-percent <N> --project-percent <N> --phase-raw-percent <N> --phase-percent <N> --cap-stage <stage> --activity <text> [--phase-override-reason <evidence>]
-progress_history.py finish-phase ...
+progress_history.py eta --session-dir <dir> --time <YYYY-MM-DDTHH:MM> [--earliest <YYYY-MM-DDTHH:MM> --latest <YYYY-MM-DDTHH:MM>] --basis <text>
+progress_history.py finish-phase --session-dir <dir> --status completed|stopped|error [--phase-id <id>] [--finished-at <ISO with zone>]
 progress_history.py finish-run ...
+progress_history.py review-trial --session-dir <dir> [--phase-id <id>]
 progress_history.py timeline --session-dir <dir> [--phase <id>]
 progress_history.py phase-count --plan-doc <path> [--phase-percent <N>]
 progress_history.py aggregate [--percent <N>]
 ```
+
+Phases can be open together. State holds the most recently started open phase
+under `phase` (what `progress`, `eta`, `start-pass`, `arm-review` and
+`findings.py` use) and the older open ones under `open_phases`, each carrying
+its own percent, calibration and early-review state under `parked`.
+`start-phase` for an id already open does nothing; for any other id it leaves
+every open phase open. A phase closes only by its own `finish-phase`:
+`--phase-id` names it, and without it the current one closes. Only that phase's
+passes close with it (each pass carries the phase it was opened in, under
+`phase`), and when the current phase closes, the newest older open phase is
+current again. `finish-run` closes every open phase, newest first. A back-fill
+is `start-phase --started-at` then `finish-phase --phase-id <id>
+--finished-at`; both events carry `backfilled: true` and `recorded_at`, neither
+time may be in the future or the finish before the start, and the phase table's
+gap samples skip them. Findings recorded between the two calls go to the
+back-filled phase. A launcher names no phase, so a pass it starts belongs to
+the current phase.
+
+For production plans, `start-phase`, every `progress` report, `finish-phase`,
+and `finish-run` end by asking `phase_table.py refresh` to rewrite the unit's
+phase note from the event stream; `eta` asks for it after its append and before
+its `ETA recorded:` line. A refresh failure adds one stderr line and changes
+neither the command's output nor its exit status. Plans without a
+`> **Production:` line skip the subprocess. [Phase tables](phase-tables.md)
+covers the note, the table built from these events and the hook's limits.
+
+`eta` reads its times in the user's zone setting (`scripts/lib/user_zone.py`), requires an active phase, appends
+one `eta_stated` event, and prints `ETA recorded: <HH:MM zone>`. It exits 2 on
+a malformed or past time, a time the local clock skips, a range that does not
+enclose the target, one range end alone, a blank basis, or no active phase.
+`/unit:eta` and `/unit:eta_breakdown` pass no `TZ=`; the process `TZ` is not read.
 
 `implement.sh` and `review.sh` own pass lifecycle: they set
 `PLAN_DELEGATE_PASS_OWNER=launcher` on their own `start-pass` / `finish-pass`
@@ -235,7 +277,10 @@ rejects an unowned call, because a hand-written pass forges one that never ran
 and `findings.py gate` counts passes to decide whether a phase is converging.
 The single exception is a launcher the unit director killed, whose pass stays
 open: `finish-pass --status canceled --orphaned-launcher` closes it, and only
-that status, and only while a pass is open.
+that status, and only while a pass is open. A review with lens `ux` records
+no pass: the unit director's `UX review` activity carries that time. A pooled
+review records its pass under the slot `pool_<reviewer>`
+(`docs/as-built/review-pool.md`).
 
 `progress` writes the event and prints two tables under a line naming the
 worktree, and the branch when it differs. The line carries no position: how
@@ -247,30 +292,33 @@ row and a phase row carrying the reported percentage, elapsed, ETA, unchanged,
 the best and worst arrival the percentage still allows.
 
 The second is the round table, under the phase heading: one row per round,
-oldest first, led by `Stage`, `Start` and `Elapsed`, then a column for each of
-the two slots — `Agent 1` and `Agent 2`, the `impl` and `test` slots in that
-order, numbered so the header carries no role word the cell
-beneath could contradict — and closed by the finding result. The first column is
+oldest first, led by `Stage`, `Start` and `Elapsed`, then a column for each
+worker — `Agent 1` and `Agent 2`, the `impl` and `test` slots in that order, then
+one `Agent N` per extra worker (`review`, `review2`, `fix2`, …) in the order workers
+first appear, numbered so the header carries no role word the cell beneath
+could contradict — and closed by the finding result. An extra worker appears when
+it records a pass or receives a board `handoff`; the original `review` worker
+shows only while a displayed stage assigns it. The first column is
 `Stage` rather than `Round` because a row is not always a round: a verification,
 a smoke run, or a lone reviewer each own one. A round is nonetheless the unit
 that advances: it is dispatched, it lands, and the ledger stamps its number
 on every finding it produces, so it is the only row key whose start, elapsed and
-result all describe the same thing. The seats working it read across as
-columns, each cell naming the role that seat held, how long it held it, and what
+result all describe the same thing. The workers working it read across as
+columns, each cell naming the role that worker held, how long it held it, and what
 it is doing at the end of the row's stretch — `fix 11m running`,
 `review 13m waiting`. Under the table sits the running round's activity
 sentence, which no fixed-width column can carry, and then the wall clock.
 
-The four seat states answer the question a duration cannot: an open window and a
+The four worker states answer the question a duration cannot: an open window and a
 closed one both render a number, and a number that stopped growing looks exactly
 like one still growing. `done` is every stretch already over, which is every row
-but the last of a live round. Within that last row, `idle` is a seat whose
+but the last of a live round. Within that last row, `idle` is a worker whose
 window closed while its round did not — free for more work rather than finished
-with the phase — and an open window is `running` unless the seat's own last
+with the phase — and an open window is `running` unless the worker's own last
 board line says it is held up, which is `waiting`. Only the board can supply
-that last one: a seat blocked on a peer's edit, on the cargo token, or on a gate
+that last one: a worker blocked on a peer's edit, on the cargo token, or on a gate
 has a live process and an open window, so the pass record cannot tell it from
-work, and both seats reading `running` while one sits on the other is the
+work, and both workers reading `running` while one sits on the other is the
 picture the word exists to correct.
 
 The table draws the last three stages only. A stage is one labelled unit of the
@@ -287,39 +335,39 @@ above the table, `*Earlier: 21 stages not shown - Impl through Fix 9.*`, so a
 phase eleven hours deep cannot read as one that has barely started; `timeline`
 still renders the full history on demand.
 
-A row per *pass* cannot do this once a phase team exists. The seats launch
-within the same second, so a per-pass table repeats one Start per seat and
+A row per *pass* cannot do this once a phase team exists. The workers launch
+within the same second, so a per-pass table repeats one Start per worker and
 learns nothing from it; worse, attributing findings by the interval from one row
-to the next gives the first seat a window under a second wide and hands the
+to the next gives the first worker a window under a second wide and hands the
 whole phase to whichever registered last. Grouping by round settles attribution
 rather than narrowing it: `findings.py` already writes `round` on
 every event, so the Result cell is counted, not inferred from timestamps. What a
-round table cannot show — which model ran which seat, and a review overlapping
+round table cannot show — which model ran which worker, and a review overlapping
 the writer as a window of its own — is `timeline`'s question, and `timeline`
 still renders one row per window.
 
 A round is not one shape held to the end, so it is split again at every moment
-its seats changed role: each stretch over which no seat moved is a row. A phase
+its workers changed role: each stretch over which no worker moved is a row. A phase
 opening `impl / test`, its writer finishing early and taking a slice of the
 tests as `test / test`, and converging on `review / review` renders as three
 rows under one round label. The label is printed once and the
 continuations leave it blank — repeating it would read as three rounds rather
 than one team moving — and the round's result sits on the row that closes it,
 since a round is the granularity the ledger stamps. Each cell carries that
-seat's own time within the stretch, so a seat that finished early shows less
+worker's own time within the stretch, so a worker that finished early shows less
 than the row's elapsed rather than being backdated to it.
 
 Roles come from `board.log`, not from the launch arguments, because they move
 during a phase. `board.sh role` stamps a `role=<name>` field on each `handoff`
 line, and the launcher stamps the same field on its `register` line — the pass
-kind it was launched with, which is the opening role the Work Order's Seats
-field chose for that seat — so a seat reports a role from second zero.
+kind it was launched with, which is the opening role the Work Order's Workers
+field chose for that worker — so a worker reports a role from second zero.
 `board.sh post` refuses a `handoff` that does not lead with `role=`, so a move
 narrated in prose is rejected rather than lost. The whole history is read rather than the
 latest entry: collapsing to the current answer would report the last shape as
-though it had held all along. A role a seat never posted is a shape the run
+though it had held all along. A role a worker never posted is a shape the run
 never shows, which is why the verb's contract says to call it the moment the
-work changes. A seat whose board never spoke falls back to the kind its pass
+work changes. A worker whose board never spoke falls back to the kind its pass
 recorded; one that has registered without opening a pass shows the role alone,
 with no duration — the board knows what it is doing and nothing yet knows for
 how long.
@@ -330,36 +378,37 @@ events, `board.sh` and the recorder read the same clock: both honour
 outside a ledger stamped from an override and drop every role change out of
 every round.
 
-Under the table sits one line per seat — `- **Agent 1** (impl) <model> <effort> · 3m ago ·
+Under the table sits one line per worker — `- **Agent 1** (impl) <model> <effort> · 3m ago ·
 rerunning the scoped test` — naming the delegate in it for the round in flight
-and the last thing that seat said on the board, with its age. It is one answer
+and the last thing that worker said on the board, with its age. It is one answer
 per phase rather than per row, so a column repeating the same values down every
-row would crowd out the roles for nothing. The words are the seat's own: the
-launcher prefixes its exit posts `launcher:`, and the note keeps the seat's
+row would crowd out the roles for nothing. The words are the worker's own: the
+launcher prefixes its exit posts `launcher:`, and the note keeps the worker's
 latest unprefixed line behind the launcher's kind — `done: hana_catalyst tests
-240 passed` rather than the launcher's `done:` line on every seat. A seat that never
+240 passed` rather than the launcher's `done:` line on every worker. A worker that never
 narrated shows the launcher's words; one that has registered and said nothing
 shows `no board line yet`; a fresh `register` clears the previous occupant's
 words. The unit director is omitted: the reader is the unit director, and `timeline`
 carries both identities per pass for anyone reconstructing a run after the fact.
 
 Windows that sit in no round keep a row apiece, named as they always were: a
-unit-director activity, which holds no seat, and every pass that records none — a
-solo run's, and the closure reviewer `review.sh` launches between rounds. A
-broad review's two lens reviewers do record seats and join the round they
-read, one row below the writers. Such a seatless pass is drawn in the seat its
+unit-director activity, which holds no worker, and every pass that records none — a
+solo run's, and a lens-less review `review.sh` runs with neither `--to` nor
+`--slot`. A review on an open worker records under that worker, and a broad
+review's lens reviewers join the round they read, one row below the writers. Such a workerless pass is drawn in the worker its
 kind names — `review 9m` under
-Agent 2, `impl 3m` under Agent 1 — so a reader finds the closure review in a
-seat's column rather than a row of dashes; an activity
-names no seat and keeps them. These rows keep the per-window finding attribution — the interval
-running to whatever opened next — which is wrong for concurrent seats and
+Agent 2, `impl 3m` under Agent 1 — so a reader finds a workerless review in a
+worker's column rather than a row of dashes; an activity
+names no worker and keeps them. These rows keep the per-window finding attribution — the interval
+running to whatever opened next — which is wrong for concurrent workers and
 exactly right for the sequential windows that still reach it. An early-armed reviewer joins the round it reads when there is
 one, and otherwise keeps its own row beside the writer.
 
-A round splits into a further row wherever a seat is occupied a second time,
-because that is a move no `handoff` marks: the writers' sessions have
-exited and the reviewers that take their chairs are fresh read-only ones that
-post no movement. The whole wave takes one boundary rather than one per launch,
+A round splits into a further row wherever a worker is occupied a second time,
+as when a writer's open worker takes a review after its writing pass closes: a
+new pass is a move whether or not the worker posted a `handoff` for it. An extra
+worker outside `impl` and `test` opens such a row when its first occupancy
+begins, so it does not appear to have worked from the writers' start. The whole wave takes one boundary rather than one per launch,
 and each cell reports the occupancy that stretch falls in — so a phase reads
 `impl / test / impl` on one row and `review / review / review` on the next,
 with the round's result on the row that closes it. A later occupancy reports the
@@ -408,6 +457,11 @@ capped number the row displays, it never contradicts the percentage beside it,
 and it inherits that number's accuracy: derived phase counts for the project,
 the reporter's estimate for the phase.
 
+`eta_band_seconds` names both outcomes. `EtaBand` carries the projected
+`remaining`, `earliest`, and `latest` seconds in that order;
+`EtaProjectionUnavailable` says the displayed percentage and elapsed time do
+not support a projection.
+
 `ETA low` and `ETA high` close the row with the two arrivals that same
 percentage still allows, each followed by its own distance from the ETA as
 `(-HH:MM)` and `(+HH:MM)` so the swing reads without subtracting clock times by
@@ -440,7 +494,10 @@ is still running. The percent options are neither required nor checked. The
 call appends no event and opens no window; like every `progress` call it
 restarts the notifier clock, and it writes state only to resolve a missing
 project clock.
-Only a missing or finished phase is refused, with `No active phase to report`.
+A missing phase, or a closed phase with no open activity, is refused with
+`No active phase to report`. When the last phase is closed and an activity is
+still open, `progress` prints both tables from that phase's last recorded values
+and shows the activity as the running row.
 
 `timeline` renders the stage table alone, for one phase or for every phase of
 the run, and needs no open window. It answers the questions asked after the
@@ -463,7 +520,7 @@ restart that fails, the recorder falls
 back to a still-future deadline in `${SESSION_DIR}/progress_timer`, then to now
 plus `PLAN_DELEGATE_PROGRESS_INTERVAL_SECONDS` in `delegate.conf`. That key sets
 the Codex poll timeout and the default interval of a Claude unit's notifier
-instance; `/unit:interval` changes one run's interval. An unusable interval
+instance; `/unit:report_interval` changes one run's interval. An unusable interval
 drops the clause instead of stopping the header.
 
 `aggregate` calibrates phase estimates by

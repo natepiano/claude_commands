@@ -22,28 +22,125 @@ FAULT_STATE_DIR = Path(os.environ.get("TMUX_NAMES_FAULT_STATE_DIR") or Path.home
 
 class ClaudeSession(NamedTuple):
     name: str
+    session_id: str
     pane: str
     user_named: bool
 
 
-def live_sessions() -> list[ClaudeSession]:
-    found: list[ClaudeSession] = []
+class TmuxServerSocket(NamedTuple):
+    path: Path
+
+
+class TmuxServerUnavailable(NamedTuple):
+    reason: str
+
+
+class SessionRenamed(NamedTuple):
+    descriptions: tuple[str, ...]
+
+
+class RenameIncomplete(NamedTuple):
+    reason: str
+
+
+def _tmux_server_socket() -> TmuxServerSocket | TmuxServerUnavailable:
+    try:
+        result = subprocess.run([TMUX, "display-message", "-p", "#{socket_path}"],
+                                capture_output=True, text=True, check=False)
+    except OSError as error:
+        return TmuxServerUnavailable(str(error))
+    if result.returncode != 0:
+        detail = result.stderr.strip() or f"tmux exited {result.returncode}"
+        return TmuxServerUnavailable(detail)
+    socket_path = result.stdout.strip()
+    if not socket_path:
+        return TmuxServerUnavailable("tmux returned no socket path")
+    return TmuxServerSocket(Path(socket_path))
+
+
+def _ancestors(pid: int) -> list[int]:
+    """The process's parent, its parent's parent, and so on, as far as /proc can be read."""
+    found: list[int] = []
+    while pid > 1:
+        try:
+            status = (PROC_DIR / str(pid) / "status").read_text(encoding="utf-8")
+        except OSError:
+            break
+        pid = next((int(line.split()[1]) for line in status.splitlines() if line.startswith("PPid:")), 0)
+        if pid <= 1 or pid in found:
+            break
+        found.append(pid)
+    return found
+
+
+def live_sessions() -> list[ClaudeSession] | TmuxServerUnavailable:
+    server = _tmux_server_socket()
+    if isinstance(server, TmuxServerUnavailable):
+        return server
+    found: dict[int, ClaudeSession] = {}
     for path in SESSIONS_DIR.glob("*.json"):
         try:
             pid = int(path.stem)
             os.kill(pid, 0)
             record = cast(dict[str, object], json.loads(path.read_text(encoding="utf-8")))
             name = record.get("name")
-            if not isinstance(name, str) or not name:
+            session_id = record.get("sessionId")
+            if not isinstance(name, str) or not name or not isinstance(session_id, str) or not session_id:
                 continue
-            environ = (PROC_DIR / str(pid) / "environ").read_bytes()
-            pane = next((entry.removeprefix("TMUX_PANE=") for entry in environ.decode(errors="replace").split("\0")
-                         if entry.startswith("TMUX_PANE=")), "")
-            if pane:
-                found.append(ClaudeSession(name, pane, record.get("nameSource") == "user"))
+            environ = {
+                key: value
+                for entry in (PROC_DIR / str(pid) / "environ").read_bytes().decode(
+                    errors="replace"
+                ).split("\0")
+                for key, separator, value in [entry.partition("=")]
+                if separator
+            }
+            pane = environ.get("TMUX_PANE")
+            session_tmux = environ.get("TMUX")
+            if (pane and session_tmux
+                    and Path(session_tmux.split(",", 1)[0]) == server.path):
+                found[pid] = ClaudeSession(name, session_id, pane, record.get("nameSource") == "user")
         except (OSError, ValueError, TypeError):
             continue
-    return found
+    # A claude started inside another claude's pane, even through a shell, inherits its TMUX_PANE;
+    # the pane belongs to the outer one.
+    return [session for pid, session in found.items()
+            if not any(ancestor in found for ancestor in _ancestors(pid))]
+
+
+def _rename_session(pane: str, old: str, new: str, panes: dict[str, str]) -> SessionRenamed | RenameIncomplete:
+    """Bring the tmux label in step with the session's name. The label is display only: nothing else follows a rename."""
+    changed: list[str] = []
+    current = panes.get(pane)
+    if current == new:
+        return SessionRenamed(tuple(changed))
+    if current != old:
+        shown = "no tmux session" if current is None else f"tmux session {current}"
+        return RenameIncomplete(f"pane {pane} belongs to {shown}, not {old} or {new}")
+    try:
+        renamed = subprocess.run([TMUX, "rename-session", "-t", f"={old}", new],
+                                 capture_output=True, text=True, check=False)
+    except OSError as error:
+        return RenameIncomplete(f"the tmux session still names {pane} {old}: {error}")
+    if renamed.returncode != 0:
+        detail = renamed.stderr.strip() or f"tmux exited {renamed.returncode}"
+        return RenameIncomplete(f"the tmux session still names {pane} {old}: {detail}")
+    changed.append("tmux session")
+    return SessionRenamed(tuple(changed))
+
+
+def rename_session(pane: str, old: str, new: str) -> SessionRenamed | RenameIncomplete:
+    try:
+        result = subprocess.run([TMUX, "list-panes", "-a", "-F", "#{session_name}\t#{pane_id}"],
+                                capture_output=True, text=True, check=False)
+    except OSError as error:
+        return RenameIncomplete(f"the tmux session for pane {pane} could not be read: {error}")
+    if result.returncode != 0:
+        detail = result.stderr.strip() or f"tmux exited {result.returncode}"
+        return RenameIncomplete(f"the tmux session for pane {pane} could not be read: {detail}")
+    panes = {pane_id: name for line in result.stdout.splitlines() if "\t" in line
+             for name, pane_id in [line.split("\t", 1)]}
+    return _rename_session(pane, old, new, panes)
 
 
 def fault(kind: str, old: str, new: str, settings: showrunners.ShowrunnerSettings) -> None:
@@ -52,17 +149,30 @@ def fault(kind: str, old: str, new: str, settings: showrunners.ShowrunnerSetting
     marker = FAULT_STATE_DIR / key
     if marker.exists():
         return
-    socket = showrunners.socket_for(settings["faults_to"])
-    if socket is None:
+    try:
+        socket = showrunners.socket_for(settings["faults_to"])
+        # The session named for faults is not live: each tree's highest running showrunner is told
+        # instead, and told why. A showrunner below it hears nothing, so the user hears once.
+        sockets = [socket] if socket is not None else [
+            runner["socket"] for runner in showrunners.highest_running(showrunners.registered_showrunners())]
+    except OSError as error:
+        print(f"tmux-names: {error}", file=sys.stderr)
         return
     message = f"tmux-names: skipped {old} → {new}: {kind}"
-    result = subprocess.run([sys.executable, str(SEND), "--to", f"uds:{socket}", "--from", "tmux-names",
-                             "--key", f"tmux-names:{key}", "--text", message],
-                            capture_output=True, text=True, check=False)
-    if result.returncode == 0:
+    if socket is None:
+        message += (f". {settings['faults_to']}, which {showrunners.CONFIG} names for faults, is not a live session,"
+                    + " so every running showrunner that reports to no running one is told.")
+    if not sockets:
+        print(f"{message} No showrunner is running to tell.", file=sys.stderr)
+        return
+    results = [subprocess.run([sys.executable, str(SEND), "--to", f"uds:{one}", "--from", "tmux-names",
+                               "--key", f"tmux-names:{key}", "--text", message],
+                              capture_output=True, text=True, check=False) for one in sockets]
+    failed = [result.stderr.strip() for result in results if result.returncode != 0]
+    if not failed:
         marker.touch()
     else:
-        print(f"tmux-names: fault delivery failed: {result.stderr.strip()}", file=sys.stderr)
+        print(f"tmux-names: fault delivery failed: {'; '.join(failed)}", file=sys.stderr)
 
 
 def tick() -> None:
@@ -81,6 +191,8 @@ def tick() -> None:
     if not panes:
         return
     sessions = live_sessions()
+    if isinstance(sessions, TmuxServerUnavailable):
+        return
     by_tmux: dict[str, list[ClaudeSession]] = {}
     for session in sessions:
         old = panes.get(session.pane)
@@ -90,27 +202,23 @@ def tick() -> None:
     names = set(panes.values())
     for old, hosted in by_tmux.items():
         new = hosted[0].name
+        if any(session.name == old for session in hosted):
+            continue
         if len(hosted) > 1:
             fault("more than one Claude session", old, new, settings)
             continue
         if not hosted[0].user_named:
             continue
-        if old == new:
-            continue
         if new in names:
             fault("name already taken", old, new, settings)
             continue
-        renamed = subprocess.run([TMUX, "rename-session", "-t", f"={old}", new],
-                                 capture_output=True, text=True, check=False)
-        if renamed.returncode != 0:
-            print(f"tmux-names: rename {old} → {new}: {renamed.stderr.strip()}", file=sys.stderr)
+        outcome = _rename_session(hosted[0].pane, old, new, panes)
+        if isinstance(outcome, RenameIncomplete):
+            print(f"tmux-names: {outcome.reason}", file=sys.stderr)
             continue
-        try:
-            showrunners.change("rename", old, "", [], new)
-        except (OSError, ValueError) as error:
-            print(f"tmux-names: config rename {old} → {new}: {error}", file=sys.stderr)
         names.remove(old)
         names.add(new)
+        panes[hosted[0].pane] = new
 
 
 def main() -> int:

@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
-"""Behavior of the shell command run inside each build step's systemd scope."""
+"""Build-step admission and behavior inside each step's systemd scope."""
 
 from __future__ import annotations
 
 import os
 import re
+import select
 import signal
 import subprocess
 import tempfile
@@ -114,7 +115,15 @@ class BuildScopeTests(unittest.TestCase):
                 ["bash", "-c", 'source "$1"; parent=$BASHPID; buildlog_sample_anon "$2" "$3" "$parent" & printf "%s\\n" "$!"; wait',
                  "sampler-test", str(INVOKE), str(root / "scope.cgroup"), str(root / "maximum")],
                 stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True,
-                env={**os.environ, "HOME": directory, "LINT_CONFIG_READER": str(root / "missing-config")},
+                env={**os.environ,
+                     "BUILD_HOLD_DIR": str(root / "holders"),
+                     "BUILD_HOLD_RELEASE_DIR": str(root / "release"),
+                     "PLAN_DELEGATE_ACTIVE_DIR": str(root / "active"),
+                     "BUILDLOG_CALL_ID": "", "BUILDLOG_CALLER": "",
+                     "BUILDLOG_HOLD_WAIT_FILE": "", "BUILDLOG_HOLD_ADMISSION_FILE": "",
+                     "BUILDLOG_HOLD_STARTED_FILE": "", "BUILDLOG_HOLD_WAITER_FILE": "",
+                     "BUILDLOG_HOLD_REGISTRATION_FILE": str(root / "registration"),
+                     "MAC_TEST_STATE_DIR": str(root / "mac-state"), "HOME": directory, "LINT_CONFIG_READER": str(root / "missing-config")},
             )
             sampler_pid = 0
             try:
@@ -171,11 +180,141 @@ class BuildScopeTests(unittest.TestCase):
             result = subprocess.run(
                 ["bash", "-c", shell, "sidecar-test", str(INVOKE), command],
                 capture_output=True, text=True, check=False,
-                env={**os.environ, "HOME": directory, "TMPDIR": directory,
+                env={**os.environ,
+                     "BUILD_HOLD_DIR": str(root / "holders"),
+                     "BUILD_HOLD_RELEASE_DIR": str(root / "release"),
+                     "PLAN_DELEGATE_ACTIVE_DIR": str(root / "active"),
+                     "BUILDLOG_CALL_ID": "", "BUILDLOG_CALLER": "",
+                     "BUILDLOG_HOLD_WAIT_FILE": "", "BUILDLOG_HOLD_ADMISSION_FILE": "",
+                     "BUILDLOG_HOLD_STARTED_FILE": "", "BUILDLOG_HOLD_WAITER_FILE": "",
+                     "BUILDLOG_HOLD_REGISTRATION_FILE": str(root / "registration"),
+                     "MAC_TEST_STATE_DIR": str(root / "mac-state"), "HOME": directory, "TMPDIR": directory,
                      "LINT_CONFIG_READER": str(root / "missing-config")},
             )
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
             self.assertEqual(list(root.glob("*.peak.cgroup")), [])
+
+
+class SweepStartupTests(unittest.TestCase):
+    def sweep_events(self, switch: str) -> str:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            reader, writer = os.pipe()
+            process = subprocess.Popen(
+                ["bash", "-c", 'source "$1"; invoke_sweep() { printf "started\\n" >&"$SWEEP_TEST_FD"; }; sweep_after_step test-step',
+                 "sweep-test", str(INVOKE)],
+                cwd=root, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                pass_fds=(writer,),
+                env={**os.environ, "HOME": directory, "TMPDIR": directory,
+                     "XDG_RUNTIME_DIR": str(root / "runtime"), "LINT_INVOKE_SOURCED": "",
+                     "LINT_CONFIG_READER": str(root / "missing-config"), "LINT_SKIP_SWEEP": switch,
+                     "SWEEP_TEST_FD": str(writer)},
+            )
+            os.close(writer)
+            try:
+                output, errors = process.communicate(timeout=10)
+                self.assertEqual(process.returncode, 0, output + errors)
+                events = b""
+                deadline = time.monotonic() + 10
+                while True:
+                    ready, _, _ = select.select([reader], [], [], max(0, deadline - time.monotonic()))
+                    self.assertTrue(ready, "sweep stand-in still holds its pipe")
+                    chunk = os.read(reader, 4096)
+                    if not chunk:
+                        break
+                    events += chunk
+                if switch == "1":
+                    self.assertFalse((root / "runtime" / "lint-sweep").exists())
+                return events.decode()
+            finally:
+                if process.poll() is None:
+                    process.kill()
+                    _ = process.communicate(timeout=5)
+                os.close(reader)
+
+    def test_offload_switch_starts_no_detached_sweep(self) -> None:
+        self.assertEqual(self.sweep_events("1"), "")
+
+    def test_without_offload_switch_the_detached_sweep_still_starts(self) -> None:
+        self.assertEqual(self.sweep_events(""), "started\n")
+
+    def test_switch_set_to_zero_keeps_detached_sweep_enabled(self) -> None:
+        self.assertEqual(self.sweep_events("0"), "started\n")
+
+
+class BuildAdmissionTests(unittest.TestCase):
+    def run_invoke(
+        self, root: Path, shell: str, arguments: list[str]
+    ) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            ["bash", "-c", 'set -euo pipefail; source "$1"; shift; ' + shell,
+             "admission-test", str(INVOKE), *arguments],
+            capture_output=True, text=True, check=False,
+            env={**os.environ,
+                 "HOME": str(root), "TMPDIR": str(root),
+                 "BUILDLOG_DIR": str(root / "buildlog"),
+                 "BUILD_HOLD_DIR": str(root / "holders"),
+                 "BUILD_HOLD_RELEASE_DIR": str(root / "release"),
+                 "PLAN_DELEGATE_ACTIVE_DIR": str(root / "active"),
+                 "BUILDLOG_CALL_ID": "", "BUILDLOG_CALLER": "",
+                 "BUILDLOG_HOLD_WAIT_FILE": "", "BUILDLOG_HOLD_ADMISSION_FILE": "",
+                 "BUILDLOG_HOLD_STARTED_FILE": "", "BUILDLOG_HOLD_WAITER_FILE": "",
+                 "BUILDLOG_HOLD_REGISTRATION_FILE": str(root / "registration"),
+                 "MAC_TEST_STATE_DIR": str(root / "mac-state"),
+                 "LINT_CONFIG_READER": str(root / "missing-config")},
+        )
+
+    def test_taplo_does_not_compile_and_existing_command_classification_is_preserved(self) -> None:
+        cases = [
+            (["taplo", "fmt", "--check"], 1),
+            (["cargo", "clippy", "--workspace", "--all-targets", "--all-features"], 0),
+            (["env", "RUSTC_WRAPPER=", "cargo", "mend", "--workspace"], 0),
+            (["cargo", "+nightly", "fmt", "--all", "--check"], 1),
+            (["python3", "/tmp/sweep.py", "--check"], 1),
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            for arguments, expected_status in cases:
+                with self.subTest(arguments=arguments):
+                    result = self.run_invoke(Path(directory), 'buildlog_step_compiles "$@"', arguments)
+                    self.assertEqual(result.returncode, expected_status, result.stdout + result.stderr)
+
+    def test_taplo_skips_build_hold_and_memory_admission_but_records_its_status(self) -> None:
+        shell = r'''
+events="$TMPDIR/events"
+build_hold_wait_local() { echo hold >> "$events"; }
+buildlog_wait_for_memory() {
+    echo memory >> "$events"
+    BUILDLOG_MEM_WAIT_S=0 BUILDLOG_MEM_OUTCOME=Granted
+}
+build_hold_step_started() { :; }
+build_hold_check_admission() { return 0; }
+build_hold_mark() { :; }
+buildlog_begin() {
+    printf 'begin %s\n' "$*" >> "$events"
+    BUILDLOG_START="" BUILDLOG_PEAK="" BUILDLOG_MEM_RESERVATION=""
+    BUILDLOG_MEM_WAIT_S=0
+}
+buildlog_end() {
+    local recorded_status=$1
+    shift 3
+    printf 'end %s %s\n' "$recorded_status" "$*" >> "$events"
+}
+buildlog_release_memory() { :; }
+sweep_after_step() { :; }
+step_status=$1
+taplo() { printf 'checked Cargo.toml\n'; return "$step_status"; }
+run_once taplo fmt --check
+'''
+        for status in (0, 1):
+            with self.subTest(status=status), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                result = self.run_invoke(root, shell, [str(status)])
+                self.assertEqual(result.returncode, status, result.stdout + result.stderr)
+                self.assertIn("checked Cargo.toml", result.stdout)
+                self.assertEqual(
+                    (root / "events").read_text().splitlines(),
+                    ["begin taplo fmt --check", f"end {status} taplo fmt --check"],
+                )
 
 
 if __name__ == "__main__":

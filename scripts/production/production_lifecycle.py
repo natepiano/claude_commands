@@ -6,15 +6,21 @@ import argparse
 import json
 import re
 import subprocess
+import sys
 from pathlib import Path
 from typing import NamedTuple, cast
 
-from add_unit import Production, Refusal, cell_value, read_production, unit_rows
+import showrunners
+import tidy_wrapped
+import unit_lookup
+from add_unit import Production, Refusal, cell_value, read_production, unit_table
 from merge_checkpoint import (CodeCheckpoint, MacCheckout, MergeEntry, NoMerge, NoPromotion,
                               PromotionAlreadyAtTip, PromotionOriginPushed, PromotionNotPushed,
                               PromoteTo, Stop,
                               git, good, merge_branch_history, promote_local_checkout,
                               promotion_from_doc, pull_mac_checkout, report)
+
+PHASE_TABLE = Path(__file__).resolve().parent.parent / "delegate" / "phase_table.py"
 
 
 class PlanLanded(NamedTuple):
@@ -45,20 +51,11 @@ class CommitVerdict(NamedTuple):
     sha: str
 
 
-class SessionLive(NamedTuple):
-    name: str
-
-
-class SessionGone(NamedTuple):
-    name: str
-
-
 class UnitRow(NamedTuple):
     name: str
     plan: Path
     worktree: Path
     branch: str
-    session: str
 
 
 class LifecycleStop(Exception):
@@ -106,16 +103,17 @@ def production_name(lines: list[str]) -> str:
 
 
 def units(lines: list[str], production: Production) -> tuple[UnitRow, ...]:
-    _, rows = unit_rows(lines)
     parsed: list[UnitRow] = []
-    for row in rows:
-        cells = [cell_value(cell) for cell in row.strip("|").split("|")]
-        if len(cells) != 7:
-            raise LifecycleStop("input", "failed", f"invalid Units row: {row}")
-        plan = Path(cells[1]).expanduser()
-        worktree = Path(cells[2]).expanduser()
-        parsed.append(UnitRow(cells[0], plan if plan.is_absolute() else production.checkout / plan,
-                              worktree, cells[3], cells[4]))
+    for cells in unit_table(lines):
+        row = {heading: cell_value(cell) for heading, cell in cells.items()}
+        if not all(heading in row for heading in ("Unit", "Plan", "Worktree", "Branch", "Port", "Owns")):
+            raise LifecycleStop("input", "failed", f"invalid Units row: {cells}")
+        # A permanent unit outlives the production: wrap neither waits on it nor retires it.
+        if row["Plan"] == "permanent":
+            continue
+        plan = Path(row["Plan"]).expanduser()
+        parsed.append(UnitRow(row["Unit"], plan if plan.is_absolute() else production.checkout / plan,
+                              Path(row["Worktree"]).expanduser(), row["Branch"]))
     return tuple(parsed)
 
 
@@ -141,16 +139,6 @@ def checkout_ready(production: Production) -> PlanLanded | PlanPending:
     return state
 
 
-def session_state(name: str) -> SessionLive | SessionGone:
-    result = subprocess.run(["tmux", "has-session", "-t", f"={name}"], capture_output=True,
-                            text=True, check=False)
-    if result.returncode == 0:
-        return SessionLive(name)
-    if result.returncode == 1:
-        return SessionGone(name)
-    raise LifecycleStop("session", "failed", result.stderr.strip() or f"tmux exited {result.returncode}")
-
-
 def load(production: Production, lines: list[str], resume: bool) -> None:
     state = checkout_ready(production)
     report("load", "ok", "production doc read")
@@ -165,14 +153,17 @@ def load(production: Production, lines: list[str], resume: bool) -> None:
         report("state", "ok", "no production log yet")
     history = (merge_branch_history(production.checkout, production.merge_branch)
                if isinstance(state, PlanLanded) else None)
+    try:
+        marked = unit_lookup.marked_units(production.slug)
+    except OSError as error:
+        raise LifecycleStop("session", "failed", str(error)) from error
     for unit in units(lines, production):
         last: MergeEntry | NoMerge = history.last_code_for_unit(unit.name) if history else NoMerge()
         detail = (f"phase {last.phase} at {last.merge_hash}" if isinstance(last, MergeEntry)
                   else "no code checkpoint")
         report("last-merged", "ok", f"{unit.name}: {detail}")
-        session = session_state(unit.session)
-        report("session", "ok", f"{unit.name}: {session.name} "
-               + ("live" if isinstance(session, SessionLive) else "gone"))
+        found = marked.get(unit.name)
+        report("session", "ok", f"{unit.name}: " + (f"{found.label} live" if found is not None else "gone"))
 
 
 def doc_path_in_checkout(production: Production, path: Path) -> str:
@@ -182,7 +173,7 @@ def doc_path_in_checkout(production: Production, path: Path) -> str:
         raise LifecycleStop("open", "failed", f"{path} is outside {production.checkout}") from error
 
 
-def open_production(production: Production, lines: list[str], session: str) -> None:
+def open_production(production: Production, lines: list[str]) -> None:
     status = doc_status(lines)
     if isinstance(status, ProductionWrapped):
         raise LifecycleStop("open", "held", "production is already wrapped")
@@ -196,16 +187,9 @@ def open_production(production: Production, lines: list[str], session: str) -> N
     if isinstance(status, ProductionPlanned):
         updated = [line.replace("**Status: PRODUCTION — planned.**", "**Status: PRODUCTION — running.**")
                    for line in updated]
-    if isinstance(status, ProductionPlanned):
-        for index, line in enumerate(updated):
-            if line.startswith("- **Showrunner session:**"):
-                updated[index] = f"- **Showrunner session:** {session}"
-                break
-        else:
-            raise LifecycleStop("doc", "failed", "production doc lacks Showrunner session")
     if updated != lines:
         _ = production.doc.write_text("\n".join(updated) + "\n", encoding="utf-8")
-    report("doc", "ok", f"running; showrunner {production.showrunner_session if isinstance(status, ProductionRunning) else session}")
+    report("doc", "ok", "running")
     rows = units(updated, production)
     paths = [doc_path_in_checkout(production, production.doc)]
     paths.extend(doc_path_in_checkout(production, unit.plan) for unit in rows)
@@ -347,12 +331,55 @@ def retire_reservations(worktree: Path) -> None:
             report("retire", "ok", f"released reservation {reservation_id} for {worktree}")
 
 
+def refuse_running_children(slug: str) -> None:
+    """Hold a wrap while a lower production's showrunner still runs: it would be left reporting to nothing."""
+    try:
+        running = [child for child in showrunners.stored_children(slug) if showrunners.current_address(child)]
+    except OSError as error:
+        raise LifecycleStop("children", "failed", str(error)) from error
+    if running:
+        raise LifecycleStop("children", "held", f"{', '.join(running)} still report{'s' if len(running) == 1 else ''} "
+                            + f"to {slug}; wrap each first, or detach it with `showrunners.py detach <child>`")
+
+
+def release_edges(slug: str) -> None:
+    """Drop the wrapped production's place in the showrunner tree, and tell each production it reported to or had."""
+    released = showrunners.release_edges(slug)
+    if not released.parent and not released.orphans:
+        report("tree", "ok", "no parent and no child showrunners")
+        return
+    told: list[str] = []
+    if released.parent:
+        told += showrunners.tell_others({released.parent: f"{slug} wrapped, so it no longer reports to you."},
+                                        f"showrunner-tree:{slug}")
+    for child in released.orphans:
+        told += showrunners.tell_others({child: f"{slug} wrapped, so {child} reports to no one: it is a root now."},
+                                        f"showrunner-tree:{child}")
+    above = f"detached from {released.parent}" if released.parent else ""
+    below = f"{', '.join(released.orphans)} now root{'' if len(released.orphans) == 1 else 's'}" if released.orphans else ""
+    report("tree", "ok", "; ".join(part for part in (above, below, *told) if part))
+
+
+def tidy_state(slug: str) -> None:
+    """Delete the production's own footer, pause, open-question and state files; a failure keeps them for the sweep."""
+    try:
+        removed = tidy_wrapped.tidy(slug)
+    except (tidy_wrapped.TidyRefused, OSError) as error:
+        report("tidy", "kept", f"{error}; tidy_wrapped.py removes them once the doc says wrapped")
+        return
+    names = ", ".join(str(path.relative_to(tidy_wrapped.STATE_DIR)) + ("/" if path.parent == tidy_wrapped.STATE_DIR else "")
+                      for path in removed)
+    report("tidy", "ok", f"removed {names}" if removed else "no state files")
+
+
 def wrap(production: Production, lines: list[str], no_ci: bool,
          ci_green: CommitVerdict | VerdictMissing,
          smoke_passed: CommitVerdict | VerdictMissing, done: tuple[str, ...]) -> None:
     status = doc_status(lines)
     if isinstance(status, ProductionPlanned):
         raise LifecycleStop("wrap", "held", "production must be running")
+    if isinstance(status, ProductionRunning):
+        refuse_running_children(production.slug)
     state = checkout_ready(production)
     if isinstance(state, PlanPending):
         raise LifecycleStop("wrap", "held", "merge branch does not exist")
@@ -408,12 +435,28 @@ def wrap(production: Production, lines: list[str], no_ci: bool,
             elif remote.returncode != 2:
                 raise LifecycleStop("retire", "failed", remote.stderr.strip() or f"ls-remote exited {remote.returncode}")
         notifier = Path.home() / ".claude/scripts/message/notifier.sh"
-        showrunners = Path.home() / ".claude/scripts/production/showrunners.py"
-        py = Path.home() / ".claude/scripts/lib/py"
+        # The update timer is the one record of the showrunner, so removing it unregisters it.
         _ = command("notifier", production.checkout, str(notifier), "remove", f"showrunner-{production.slug}")
-        _ = command("showrunner", production.checkout, str(py), str(showrunners), "remove",
-                    production.showrunner_session)
-        report("notifier", "ok", "update instance and showrunner registration removed")
+        report("notifier", "ok", "update timer removed")
+        release_edges(production.slug)
+        tidy_state(production.slug)
+        archived = command(
+            "phase-notes",
+            production.checkout,
+            sys.executable,
+            str(PHASE_TABLE),
+            "archive",
+            "--production-doc",
+            str(production.doc),
+        )
+        count = len(archived.splitlines())
+        report(
+            "phase-notes",
+            "ok",
+            f"archived {count} phase note{'' if count == 1 else 's'}"
+            if count
+            else "no phase notes to archive",
+        )
         updated = [line.replace("**Status: PRODUCTION — running.**", "**Status: PRODUCTION — wrapped.**")
                    for line in lines]
         _ = production.doc.write_text("\n".join(updated) + "\n", encoding="utf-8")
@@ -462,6 +505,7 @@ def main() -> int:
     _ = parser.add_argument("--production", required=True, type=Path)
     _ = parser.add_argument("--no-ci", action="store_true")
     _ = parser.add_argument("--resume", action="store_true")
+    # Accepted and unused: a showrunner started before its name was looked up still passes it.
     _ = parser.add_argument("--session")
     _ = parser.add_argument("--ci-green")
     _ = parser.add_argument("--smoke-passed")
@@ -476,15 +520,12 @@ def main() -> int:
             raise LifecycleStop("input", "failed", "--no-ci excludes the verdict flags")
         ci_green = CommitVerdict(ci_sha) if ci_sha is not None else VerdictMissing()
         smoke_passed = CommitVerdict(smoke_sha) if smoke_sha is not None else VerdictMissing()
-        session = cast(str | None, args.session)
-        if action == "open" and not session:
-            raise LifecycleStop("input", "failed", "open needs --session")
         production = read_production(cast(Path, args.production))
         lines = doc_lines(production)
         if action == "load":
             load(production, lines, cast(bool, args.resume))
         elif action == "open":
-            open_production(production, lines, cast(str, session))
+            open_production(production, lines)
         elif action == "promote-main":
             _ = promote_main(production, lines, no_ci, ci_green, smoke_passed)
         else:

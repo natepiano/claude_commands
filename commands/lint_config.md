@@ -1,5 +1,5 @@
 ---
-description: Show or edit which lint checks run — across /clippy, delegate phases, and the fix pipeline
+description: Show or edit which lint checks run — across /unit:direct phases, the lint CLI, and the fix pipeline
 ---
 
 # lint_config
@@ -49,42 +49,33 @@ effect on the next run of each consumer; nothing needs restarting.
 
 | Check | Runs | Where it applies |
 |---|---|---|
-| `mend` | `cargo mend` check pass and `--fix` | `/clippy` mend check/fix · `invoke.sh mend` (lint CLI, fix pipeline, validate_ci mend steps) |
-| `style_review` | style-guide walk over the uncommitted diff | `/clippy` style review · `/unit:delegate` phase-end gate |
-| `clippy` | `cargo clippy` | `/clippy` clippy stage · `invoke.sh clippy` (lint CLI, fix pipeline, `verify.sh lint <pkg>`) |
-| `doc` | `cargo doc -D warnings` | `/clippy` doc stage · `invoke.sh doc` (`lint doc`) |
-| `fmt` | `cargo +nightly fmt` | `/clippy` format stage · `invoke.sh fmt` (`lint fmt`, `verify.sh lint`/`fmt`/`final`) |
+| `mend` | `cargo mend` check pass and `--fix` | `invoke.sh mend` (lint CLI, fix pipeline, validate_ci mend steps, `verify.sh lint`) |
+| `style_review` | style-guide walk and banned-words scan over the caller's diff | `/unit:style_review` · `/unit:direct` main phase review |
+| `clippy` | `cargo clippy` | `invoke.sh clippy` (lint CLI, fix pipeline, `verify.sh lint`) |
+| `doc` | `cargo doc -D warnings` | `invoke.sh doc` (`lint doc`, `verify.sh lint`) |
+| `fmt` | `cargo +nightly fmt` | `invoke.sh fmt` (`lint fmt`, `verify.sh lint`/`fmt`) |
 
-The two consumers: the `/clippy` skill (reads the file at the start of every run,
-including runs started by `/commit_prep` or a `/unit:delegate` work order) and
-`scripts/lint/invoke.sh` — the sourced bottom layer that the `lint` CLI,
-`scripts/delegate/verify.sh`, and `scripts/fix/fix.sh` all flow
-through.
-`/unit:delegate` uses `/clippy style-only` for the one style review it runs over
-the whole branch at the end of a project, so `style_review=off` blocks that run
-from completing instead of silently passing it.
+Consumers: `/unit:style_review` reads the style switch, and
+`scripts/lint/invoke.sh` reads the tool switches for the `lint` CLI,
+`scripts/delegate/verify.sh`, and `scripts/fix/fix.sh`.
+<PhaseChecks/> defines each phase's checks. `LINT_OP_STYLE_REVIEW=off` makes
+the phase style review report `Off`.
 
 ## What this file deliberately does not gate
 
 - **`verify.sh check` / `test` / `example`, and the workspace
   check and test inside `verify.sh final`.** Those are correctness gates, not
-  lints. A delegate phase that compiles nothing has verified nothing.
+  lints. A `/unit:direct` phase that compiles nothing has verified nothing.
 - **`pre_release_checks.sh` and `validate_ci.sh`.** A release or CI check that
   silently no-ops is worse than a noisy one. Both route through the `lint` CLI
   like everything else, but set `LINT_CONFIG_FORCE=1` on the steps they never
   allow to skip (every step except validate_ci's two mend steps).
-- **Scope.** `verify.sh` pins targets per package on purpose (see its header
-  comment); config decides *whether* a check runs, never with what flags.
-- **Who runs a check.** Whether `/clippy` puts its mend/clippy/doc stages in a
-  subagent, and whether it splits an approved fix batch across parallel fixers,
-  lives in `config/clippy.conf` — read with
-  `bash ~/.claude/scripts/lint/clippy_config.sh`, hand-edited like
-  `delegate.conf`. A check turned off here does not run whoever would have run
-  it; that file only moves the work.
+- **Scope.** <PhaseChecks/> and `verify.sh` define scope and target flags;
+  config decides whether a check runs.
 
 A check gated off inside `verify.sh` prints
 `SKIPPED: <command> — <key>=off in <config path>` and exits 0. When you see that
-line in a delegate log, report the check as **skipped**, never as passed.
+line in a delegate log, report the check as `Off`, never as passed.
 
 ## Examples
 

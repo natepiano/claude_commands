@@ -34,6 +34,9 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import TypedDict, cast
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from scripts.lib.user_zone import user_zone  # noqa: E402
+
 
 SPINE_VERSION = 1
 
@@ -452,9 +455,9 @@ def _since_epoch(value: str) -> float:
     except ValueError as error:
         raise SystemExit(f"Unreadable --since value {value!r}: {error}") from error
     if parsed.tzinfo is None:
-        # A bare date means local midnight, matching the local stamps `runs`
+        # A bare date means midnight in the user's zone, matching the stamps `runs`
         # prints; reading it as UTC shifted the window by the offset.
-        parsed = parsed.astimezone()
+        parsed = parsed.replace(tzinfo=user_zone())
     return parsed.timestamp()
 
 
@@ -517,7 +520,7 @@ def _count(value: float, singular: str, plural: str) -> str:
 def _stamp(epoch: float) -> str:
     if epoch <= 0:
         return ""
-    return datetime.fromtimestamp(epoch, UTC).astimezone().strftime("%Y-%m-%d %H:%M")
+    return datetime.fromtimestamp(epoch, UTC).astimezone(user_zone()).strftime("%Y-%m-%d %H:%M")
 
 
 def _meta(tally: dict[str, int]) -> dict[str, object]:

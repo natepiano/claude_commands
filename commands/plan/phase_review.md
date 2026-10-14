@@ -4,7 +4,7 @@ description: After implementing a phase, keep review prose temporary, update rem
 
 Use this after implementing a phase of a multi-phase plan. Review prose is
 ephemeral: write it only under `${SESSION_DIR}`, use it to update remaining Work
-Orders and prepare as-built input, then let `/unit:delegate` delete it after the
+Orders and prepare as-built input, then let `/unit:direct` delete it after the
 shrink. The forward review also checks the plan's sibling `{plan-name}-next.md`
 when present. Never append review prose to either file.
 Phase-end order: `~/.claude/docs/delegate/phase_end.md` → <PhaseEnd/>.
@@ -12,11 +12,11 @@ Phase-end order: `~/.claude/docs/delegate/phase_end.md` → <PhaseEnd/>.
 **Read `~/.claude/docs/type_design.md` first and follow it.** Apply its type-name
 and `Option<T>` rules to the temporary retrospective, remaining-phase review, and all
 Work Order revisions. Include its complete contents verbatim in the architect
-subagent prompt so the reviewer receives the same contract as `/unit:delegate`.
+subagent prompt so the reviewer receives the same contract as `/unit:direct`.
 
-**Delegate-ready plans.** If the plan follows `~/.claude/docs/delegate_plan_format.md` (a `## Delegation Context` section + per-phase `#### Work Order`), this command must keep every remaining phase **dispatch-ready**: learnings are folded *into* the remaining Work Orders (Spec, Files, Acceptance gate, and especially **Constraints from prior phases**), not merely appended as review notes. The test after this command runs: `/unit:delegate <plan> phase <next>` can assemble its prompt with zero codebase research. See `<MaintainWorkOrders/>` in Step 5.
+**Delegate-ready plans.** If the plan follows `~/.claude/docs/delegate_plan_format.md` (a `## Delegation Context` section + per-phase `#### Work Order`), this command must keep every remaining phase **dispatch-ready**: learnings are folded *into* the remaining Work Orders (Spec, Files, Acceptance gate, and especially **Constraints from prior phases**), not merely appended as review notes. The test after this command runs: `/unit:direct <plan> phase <next>` can assemble its prompt with zero codebase research. See `<MaintainWorkOrders/>` in Step 5.
 
-**Auto mode.** If `$ARGUMENTS` contains the token `auto` (passed by the `/unit:delegate` loop), this command asks the user nothing: significant findings that survive filtering are deferred into the affected phase's Work Order as `**Pending decision:**` blocks (format: `~/.claude/docs/delegate_plan_format.md`) instead of being presented. Invocations without `auto` behave exactly as written below.
+**Auto mode.** If `$ARGUMENTS` contains the token `auto` (passed by the `/unit:direct` loop), this command asks the user nothing: significant findings that survive filtering are deferred into the affected phase's Work Order as `**Pending decision:**` blocks (format: `~/.claude/docs/delegate_plan_format.md`) instead of being presented. Invocations without `auto` behave exactly as written below.
 
 ## Step 1: Locate the plan doc
 
@@ -26,11 +26,11 @@ The plan doc should already be in conversation context — it is the doc the jus
 - If exactly one plan doc is in scope, use it.
 - If `$ARGUMENTS` names a path, use that path (overrides inference).
 - If no plan doc is in scope, **ask the user** for the path before proceeding. Do not infer one. This case should be rare.
-- Under `/unit:delegate`, inherit its `${SESSION_DIR}` and `${WORKING_DIR}`.
+- Under `/unit:direct`, inherit its `${SESSION_DIR}` and `${WORKING_DIR}`.
   Invoked standalone, create a session with `prepare_session.sh` now so every
   temporary review artifact has an explicit owner.
 - Set `${NEXT_ITEMS_PATH}` from the caller when available. Otherwise derive the
-  sibling kebab-case `{plan-name}-next.md` path using `/unit:delegate`'s naming
+  sibling kebab-case `{plan-name}-next.md` path using `/unit:direct`'s naming
   rule. The file is optional.
 
 State the path you picked in one line: `Reviewing <relative/path/to/plan.md>.`
@@ -63,9 +63,9 @@ If the conversation does not make the phase obvious, ask the user one clarifying
    Drop empty fields. Keep bullets short and concrete. This file is input to the
    remaining-phase review and closeout shrink; it never enters the repository.
    Read **Split observed** from `${SESSION_DIR}/board.log` — the `register`
-   and `handoff` posts say which seat held which role, and when — and from the
+   and `handoff` posts say which worker held which role, and when — and from the
    two `impl_summary_<slot>.txt`; never reconstruct it from memory. It is what
-   `<MaintainWorkOrders/>` re-seats the remaining Work Orders from.
+   `<MaintainWorkOrders/>` assigns workers to the remaining Work Orders from.
 
 <StateAndConsequenceAudit>
 Always perform this audit, including when the caller passes `skip-architect`.
@@ -125,12 +125,12 @@ phase's checkpoint commit.
 ## Step 4: Dispatch an architect review of the remaining phases
 
 **Skip this whole step when `$ARGUMENTS` contains `skip-architect`.** The caller
-has already applied the trigger test in `/unit:delegate`'s `<RunPhaseReview/>`
+has already applied the trigger test in `/unit:direct`'s `<RunPhaseReview/>`
 and determined this phase produced nothing for an architect to find. Write
 `not run — phase matched its plan` into the final update's architect row and go
 straight to Step 5; the temporary retrospective's implications still get folded into the
 remaining Work Orders exactly as written there, and its **Split observed**
-still re-seats them per `<MaintainWorkOrders/>`. Do not override the token or
+still assigns workers to them per `<MaintainWorkOrders/>`. Do not override the token or
 re-derive the trigger test — the caller has the review results and the ledger,
 this command does not.
 
@@ -151,10 +151,11 @@ subagent produces no readable liveness signal — its only output is a full
 transcript too large to read — which leaves the user with an unexplained
 multi-minute silence at the same point in every phase.
 
-Write the prompt to `${SESSION_DIR}/architect_prompt_<phase>.md`, then:
+Write the prompt to `${SESSION_DIR}/architect_prompt_<phase>.md`. In a delegate
+run, select an open worker per `/unit:direct`'s `<RunPhaseReview/>`, then:
 
 ```
-bash ~/.claude/scripts/delegate/review.sh \
+bash ~/.claude/scripts/delegate/review.sh --to "<full-worker-name>" \
   "${SESSION_DIR}" "${WORKING_DIR}" \
   "${SESSION_DIR}/architect_prompt_<phase>.md" \
   review \
@@ -163,6 +164,10 @@ architect review of the remaining phases against what phase <phase> actually shi
   "reviewing the remaining phases against what just shipped" \
   <pass_index>
 ```
+
+If every open worker is busy, use the same call with `--slot review` in place of
+`--to "<full-worker-name>"`; that worker stays open. Only a phase review outside a
+delegate run calls `review.sh` with neither option.
 
 - `review` is the subtask name; it resolves through `[delegate.<family>]` in
   `~/.claude/config/agents.conf` like every other delegate subtask. There is no
@@ -173,7 +178,7 @@ architect review of the remaining phases against what phase <phase> actually shi
   review pass — so `review_findings_<N>.txt` never overwrites a code review's
   findings. Findings come back in that file.
 - **`SESSION_DIR`**: use the session established in Step 1.
-- Apply `/unit:delegate`'s `<DispatchContract/>`; do not invent another wait or
+- Apply `/unit:direct`'s `<DispatchContract/>`; do not invent another wait or
   progress mechanism.
 
 The prompt must include:
@@ -188,6 +193,8 @@ The prompt must include:
   for retrospective or review prose.
 - The complete contents of `~/.claude/docs/type_design.md`, under a `Type Design
   Contract` heading.
+- The inline sentence: "We believe in three gods, Simple, Fast and Beautiful,
+  with correctness as the floor beneath them."
 - The review questions:
   1. Are any remaining phases now redundant, partially redundant, or already satisfied by what was just built?
   2. Do any remaining phases need re-scoping (smaller, larger, split, merged, reordered) given the implications surfaced in the retrospective?
@@ -209,7 +216,7 @@ The prompt must include:
      make any item inaccurate, redundant, already satisfied, or aimed at the
      wrong target? Quote the current item and propose its exact replacement or
      removal with concrete evidence. Do not propose optional polish.
-  9. (Delegate-ready plans only) For each remaining phase, does its **Seats**
+  9. (Delegate-ready plans only) For each remaining phase, does its **Workers**
      still describe a real partition against the code that now exists —
      disjoint owner sets, one owner per hub file, a test lane that exists? Name
      a better opening where one is visible, in the field's own words
@@ -266,7 +273,7 @@ current-phase defect: in loop/verbose, insert a follow-up phase next per
 to <Synthesize/>; standalone, fix it before Step 6. A Work Order's **Files**
 list is the scope the plan predicted, not a limit on what this phase may repair.
 
-Under `/unit:delegate`, stop there; <ConsiderNextItems/> writes the `apply` ones
+Under `/unit:direct`, stop there; <ConsiderNextItems/> writes the `apply` ones
 and accumulates the rest for <ReviewPendingAddOns/> at the run's next
 interactive point. Invoked standalone, write every `apply` proposal to
 `${NEXT_ITEMS_PATH}` now and report it as one line naming the count and the
@@ -294,12 +301,12 @@ byte-identical.
 1. **Propagate forward.** Apply the **Propagate-Forward** rule from the format doc
    (`~/.claude/docs/delegate_plan_format.md` → "Forward-propagation") for the facts
    the just-shipped phase produced. This is the single most important maintenance
-   step: it is what lets the next `/unit:delegate` assemble without research.
-2. **Re-seat.** For each remaining Work Order that shares files or crates with
-   the shipped phase, revise its **Seats** from the retrospective's **Split
+   step: it is what lets the next `/unit:direct` assemble without research.
+2. **Reassign workers.** For each remaining Work Order that shares files or crates with
+   the shipped phase, revise its **Workers** from the retrospective's **Split
    observed** and any Q9 finding: owner sets that turned out independent, the
    hub file every writer needed, a test lane that was or was not real. Add
-   **Seats** to any remaining Work Order that lacks one (format doc rule 7).
+   **Workers** to any remaining Work Order that lacks one (format doc rule 7).
    Mechanical, no gate.
 3. **Apply each Q6 finding** by editing the named Work Order in place — add the
    missing constraint, fix the drifted file/line ref, adjust the **Spec** or
@@ -323,11 +330,11 @@ byte-identical.
    ```
 
    This shared tagged contract validates Goal, Spec, and Files together, and a
-   non-empty Seats wherever the field is present. After any Files edit or newly
+   non-empty Workers wherever the field is present. After any Files edit or newly
    named implementation path, rerun this command; failure blocks Step 6.
 
 Mechanical Work Order edits (added constraints, corrected refs, gate tweaks, a
-re-seated opening) need no user gate — they go straight in. A finding that changes a remaining phase's
+reassigned worker opening) need no user gate — they go straight in. A finding that changes a remaining phase's
 *intent, scope, or ordering* is a significant finding: route it through
 `<SignificantFindings/>` below, and once resolved, write the outcome into the
 affected Work Order, not a prose review note.
@@ -338,7 +345,7 @@ Edit each minor finding straight into the plan — inline amendment to the affec
 </MinorFindings>
 
 <SignificantFindings>
-**`<DecisionEconomy/>` binds this command**, by the same import `/unit:delegate`
+**`<DecisionEconomy/>` binds this command**, by the same import `/unit:direct`
 uses. Read it before deciding anything reaches the user:
 
 @~/.claude/docs/decision_criteria.md
@@ -347,7 +354,7 @@ uses. Read it before deciding anything reaches the user:
 
 Execute `<FilterFindingsForUserReview/>` before presenting anything to the user. Subagent `Severity: significant` means "needs filtering," not automatically "ask the user."
 
-**Auto mode:** do not execute `<PresentInlineSingle/>` or `<DispatchAdhocReview/>`. For each unresolved user decision after filtering, write a `**Pending decision:**` block containing the filled `<DecisionPresentationTemplate/>` into the Work Order of the earliest affected remaining phase — the `/unit:delegate` loop stops for it at that phase's pre-dispatch check. List each deferral in the final update's `User decisions` row as `deferred to phase N: <one-line title>`. Then skip the rest of this block.
+**Auto mode:** do not execute `<PresentInlineSingle/>` or `<DispatchAdhocReview/>`. For each unresolved user decision after filtering, write a `**Pending decision:**` block containing the filled `<DecisionPresentationTemplate/>` into the Work Order of the earliest affected remaining phase — the `/unit:direct` loop stops for it at that phase's pre-dispatch check. List each deferral in the final update's `User decisions` row as `deferred to phase N: <one-line title>`. Then skip the rest of this block.
 
 After filtering, count unresolved user decisions, not raw subagent findings:
 
@@ -440,7 +447,7 @@ Write the decision using `<DecisionPresentationTemplate/>`. Ask once for approve
 principle the presentation rules here derive from — you do the reconstruction,
 not the user — plus the build order, naming, banned vocabulary, the
 comprehension gate, which decisions are worth the user's attention, and the
-choice-line format. `/unit:delegate` and `/adhoc_review` share the same file, so
+choice-line format. `/unit:direct` and `/adhoc_review` share the same file, so
 the three cannot drift.
 </UserFacingText>
 
@@ -454,7 +461,7 @@ counts as approval.
 **Read `~/.claude/docs/explain_on_demand.md` and follow it.** It owns the
 method: rebuild from the bottom, stay technical, name real signatures read from
 real source, and put a short code example under every mechanism — problem code
-before fix code. `/unit:delegate` shares the same file, so the two commands
+before fix code. `/unit:direct` shares the same file, so the two commands
 cannot drift.
 
 This is the one place terseness is wrong. Do not compress and do not re-emit the
@@ -521,9 +528,9 @@ Style rules for the final update:
 - Do not relitigate the just-completed phase's implementation. The temporary retrospective records what was learned; the review is about what comes next.
 - Raw significant findings must be filtered before user review. Only unresolved user decisions go through the user; mechanical changes and already-implied work go straight into the plan.
 - User decisions never use `AskUserQuestion`. Single decision → inline decision template; two or more → `/adhoc_review`. See `<SignificantFindings/>`, `<FilterFindingsForUserReview/>`, and `<DecisionPresentationTemplate/>` in Step 5.
-- In auto mode this command asks the user nothing: unresolved decisions become `**Pending decision:**` blocks in the affected Work Orders, surfaced later by the `/unit:delegate` pre-dispatch check.
+- In auto mode this command asks the user nothing: unresolved decisions become `**Pending decision:**` blocks in the affected Work Orders, surfaced later by the `/unit:direct` pre-dispatch check.
 - Next-item amendments never use plan finding routing and never edit the next
-  file without approval; `/unit:delegate` accumulates them for its next
+  file without approval; `/unit:direct` accumulates them for its next
   interactive point.
 - Never write retrospective, finding, reviewer, pass, or approval prose into the
   plan. Review text exists only under `${SESSION_DIR}` until shrink cleanup.
