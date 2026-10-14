@@ -35,7 +35,7 @@ path arguments. Set `${CLOSEOUT_DIR}` only when closeout was supplied; reject a
 missing directory, multiple phase ids, or closeout without `--phases`.
 
 `/unit:direct` runs closeout mode after the code commit, beside the next
-phase's seats, then makes a plan-doc-only shrink commit. Standalone mode remains
+phase's workers, then makes a plan-doc-only shrink commit. Standalone mode remains
 for legacy accumulated plans and immediately before `/plan:to_as_built`.
 Phase-end order: `~/.claude/docs/delegate/phase_end.md` → <PhaseEnd/>.
 
@@ -163,7 +163,7 @@ delegate-ready and this command does not apply to it — say so and stop.
 **Running mid-run is fine** — shrinking only touches `done` phases, and the
 phase `/unit:direct` is working is `todo`. Under `/unit:direct`, the code
 checkpoint is already committed; closeout shrink runs beside the next phase's
-seats and receives its own plan-doc-only commit. State in one line that any copy
+workers and receives its own plan-doc-only commit. State in one line that any copy
 of the doc already in the orchestrator's context is stale (a later `Edit`
 against pre-shrink text will fail loudly, not silently).
 </ResolvePlan>

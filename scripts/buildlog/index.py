@@ -30,7 +30,7 @@ from urllib.parse import quote
 
 import store
 
-SCHEMA_VERSION = 15
+SCHEMA_VERSION = 16
 LOCK_NAME = "index.lock"
 MARK_BYTES = 256
 BUSY_TIMEOUT_MS = 30_000
@@ -71,7 +71,7 @@ STEP_COLUMNS: list[Column] = [
     ),
     ("tree_changed", "INTEGER", "1 when the files changed during the step (fmt, mend --fix, an edit), 0 when not, NULL when unknown"),
     ("caller", "TEXT", "verify, cargo-port, validate_ci (push gate), brp-launch (build and app start), agent, alias, unknown"),
-    ("seat", "TEXT", "delegate seat (PLAN_DELEGATE_TEAM_ROLE)"),
+    ("worker", "TEXT", "delegate worker (PLAN_DELEGATE_TEAM_ROLE)"),
     ("delegate_session", "TEXT", "delegate session folder name"),
     ("session", "TEXT", "Claude Code session id or Codex thread id"),
     ("call_id", "TEXT", "calls.id of the verify.sh call that ran this step"),
@@ -159,7 +159,7 @@ CALL_COLUMNS: list[Column] = [
     ("worktree_name", "TEXT", "worktree folder name"),
     ("branch", "TEXT", "branch"),
     ("sha", "TEXT", "short commit"),
-    ("seat", "TEXT", "delegate seat"),
+    ("worker", "TEXT", "delegate worker"),
     ("delegate_session", "TEXT", "delegate session folder name"),
     ("session", "TEXT", "Claude Code session or Codex thread"),
     ("backfilled", "INTEGER", "1 when copied from the old events.jsonl ledger"),
@@ -575,8 +575,39 @@ def marks(handle: BinaryIO, offset: int) -> str:
     return head.hex() + ":" + handle.read(offset - start).hex()
 
 
+def migrate_worker_fields(path: Path) -> None:
+    """Rename old step/call fields once under the same lock as appenders."""
+    with path.open("r+b") as handle:
+        fcntl.flock(handle, fcntl.LOCK_EX)
+        data = handle.read()
+        end = data.rfind(b"\n") + 1
+        lines: list[bytes] = []
+        changed = False
+        for raw in data[:end].splitlines(keepends=True):
+            try:
+                value = cast(object, json.loads(raw))
+            except ValueError:
+                lines.append(raw)
+                continue
+            if isinstance(value, dict):
+                fields = cast(dict[str, object], value)
+                if fields.get("kind") in ("step", "call") and "seat" in fields:
+                    _ = fields.setdefault("worker", fields["seat"])
+                    del fields["seat"]
+                    raw = (json.dumps(fields, ensure_ascii=False) + "\n").encode()
+                    changed = True
+            lines.append(raw)
+        if changed:
+            _ = handle.seek(0)
+            _ = handle.write(b"".join(lines) + data[end:])
+            _ = handle.truncate()
+            handle.flush()
+            os.fsync(handle.fileno())
+
+
 def read_file(connection: sqlite3.Connection, path: Path, src: str, known: tuple[int, str] | None) -> int:
     """Index the complete lines past the stored offset; returns the lines read."""
+    migrate_worker_fields(path)
     with path.open("rb") as handle:
         size = os.fstat(handle.fileno()).st_size
         offset = 0

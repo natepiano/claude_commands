@@ -679,11 +679,11 @@ runpy.run_path(sys.argv[0], run_name="__main__")
         self.assertEqual(self.relayed[0].to, f"uds:{self.root / 'id-1.sock'}")
         self.assertEqual(self.log()[0]["to"], "session:id-1")
 
-    def test_same_seat_name_in_two_runs_resolves_by_address_and_is_ambiguous_by_name(
+    def test_same_worker_name_in_two_runs_resolves_by_address_and_is_ambiguous_by_name(
         self,
     ) -> None:
-        first_address = "seat:11111111-1111-1111-1111-111111111111/shared"
-        second_address = "seat:22222222-2222-2222-2222-222222222222/shared"
+        first_address = "worker:11111111-1111-1111-1111-111111111111/shared"
+        second_address = "worker:22222222-2222-2222-2222-222222222222/shared"
         first_dir = self.root / "11111111-1111-1111-1111-111111111111"
         second_dir = self.root / "22222222-2222-2222-2222-222222222222"
         entries = [
@@ -771,7 +771,7 @@ runpy.run_path(sys.argv[0], run_name="__main__")
     ) -> None:
         worker = roster.RosterEntry(
             "machine", "codex", "worker", "paused worker", "waiting",
-            roster.CannotReceiveMessages("seat between turns; no unit director is running"), "/work",
+            roster.CannotReceiveMessages("worker between turns; no unit director is running"), "/work",
             roster.UnderShowrunner("production", "runner", "session:runner"),
             roster.NoDirector(),
             roster.WorkerAssignment("impl", str(self.root / "run")),
@@ -795,7 +795,7 @@ runpy.run_path(sys.argv[0], run_name="__main__")
         self.assertEqual(raised.exception.code, 2)
         self.assertEqual(
             errors.getvalue(),
-            "send.py: paused worker cannot take messages (seat between turns; no unit director is running)\n",
+            "send.py: paused worker cannot take messages (worker between turns; no unit director is running)\n",
         )
         codex_send.assert_not_called()
         claude_send.assert_not_called()
@@ -836,8 +836,8 @@ runpy.run_path(sys.argv[0], run_name="__main__")
             errors.getvalue(),
         )
 
-    def test_roster_problem_is_printed_while_a_usable_seat_still_succeeds(self) -> None:
-        address = "seat:33333333-3333-3333-3333-333333333333/worker"
+    def test_roster_problem_is_printed_while_a_usable_worker_still_succeeds(self) -> None:
+        address = "worker:33333333-3333-3333-3333-333333333333/worker"
         run = self.root / "33333333-3333-3333-3333-333333333333"
         worker = roster.RosterEntry(
             "machine", "codex", "worker", "worker", "running",
@@ -873,8 +873,8 @@ runpy.run_path(sys.argv[0], run_name="__main__")
             [("worker", str(run))],
         )
 
-    def test_unique_seat_name_resolves_to_its_run(self) -> None:
-        address = "seat:55555555-5555-5555-5555-555555555555/only-worker"
+    def test_unique_worker_name_resolves_to_its_run(self) -> None:
+        address = "worker:55555555-5555-5555-5555-555555555555/only-worker"
         run = self.root / "55555555-5555-5555-5555-555555555555"
         worker = roster.RosterEntry(
             "machine", "codex", "worker", "only-worker", "running",
@@ -906,7 +906,7 @@ runpy.run_path(sys.argv[0], run_name="__main__")
             [("only-worker", str(run))],
         )
 
-    def test_unreadable_roster_keeps_bare_claude_fallback_but_seat_address_fails(
+    def test_unreadable_roster_keeps_bare_claude_fallback_but_worker_address_fails(
         self,
     ) -> None:
         unavailable = roster.Roster([], ["cannot read the delegate root"])
@@ -926,20 +926,20 @@ runpy.run_path(sys.argv[0], run_name="__main__")
             "send.py: roster: cannot read the delegate root\n",
         )
 
-        seat_errors = io.StringIO()
+        worker_errors = io.StringIO()
         with (
             mock.patch.object(roster, "roster", return_value=unavailable),
             mock.patch.object(send, "codex") as codex_send,
             self.assertRaises(SystemExit) as raised,
-            redirect_stderr(seat_errors),
+            redirect_stderr(worker_errors),
         ):
             _ = send.main(["--here",
-                "--to", "seat:missing/worker", "--from", "test", "--text", "hello",
+                "--to", "worker:missing/worker", "--from", "test", "--text", "hello",
             ])
 
         self.assertEqual(raised.exception.code, 2)
-        self.assertIn("send.py: roster: cannot read the delegate root", seat_errors.getvalue())
-        self.assertIn("seat:missing/worker", seat_errors.getvalue())
+        self.assertIn("send.py: roster: cannot read the delegate root", worker_errors.getvalue())
+        self.assertIn("worker:missing/worker", worker_errors.getvalue())
         codex_send.assert_not_called()
 
     def test_codex_thread_address_queues_after_one_local_roster_read(self) -> None:
@@ -999,7 +999,7 @@ runpy.run_path(sys.argv[0], run_name="__main__")
         self.assertEqual(send.pending("codex:thread-one"), "")
 
     def test_local_roster_is_read_once_for_every_roster_address_and_bare_name(self) -> None:
-        address = "seat:44444444-4444-4444-4444-444444444444/worker"
+        address = "worker:44444444-4444-4444-4444-444444444444/worker"
         worker = roster.RosterEntry(
             "machine", "codex", "worker", "worker", "running",
             roster.Messageable(address), "/work", roster.NoShowrunner(),
@@ -1021,7 +1021,7 @@ runpy.run_path(sys.argv[0], run_name="__main__")
                 with (
                     mock.patch.object(roster, "roster", read_roster),
                     mock.patch.object(
-                        send, "codex", return_value=send.Result("sent", "seat"),
+                        send, "codex", return_value=send.Result("sent", "worker"),
                     ),
                     mock.patch.object(
                         codex_daemon, "queue", return_value=codex_daemon.Queued(),
@@ -1036,11 +1036,11 @@ runpy.run_path(sys.argv[0], run_name="__main__")
                     _ = send.send(local_options(options))
                 self.assertEqual(read_roster.call_count, expected_reads)
 
-    def test_seat_address_with_action_is_a_usage_error(self) -> None:
+    def test_worker_address_with_action_is_a_usage_error(self) -> None:
         errors = io.StringIO()
         with self.assertRaises(SystemExit) as raised, redirect_stderr(errors):
             _ = local_options([
-                "--to", "seat:run/worker", "--action", "reply", "--text", "hello",
+                "--to", "worker:run/worker", "--action", "reply", "--text", "hello",
             ])
         self.assertEqual(raised.exception.code, 2)
         self.assertIn("go with --to user", errors.getvalue())
@@ -1053,7 +1053,7 @@ runpy.run_path(sys.argv[0], run_name="__main__")
         help_text = " ".join(output.getvalue().split())
         for recipient_form in (
             "a roster name", "uds:<path>", "session:<id>",
-            "seat:<run id>/<seat name>", "codex:<thread id>", "user",
+            "worker:<run id>/<worker name>", "codex:<thread id>", "user",
         ):
             self.assertGreaterEqual(help_text.count(recipient_form), 2)
 
@@ -1650,7 +1650,7 @@ class PeerSendTests(ShutdownTestCase):
 
     def row(self, name: str, address: str, *, machine: str = "mac") -> roster.RosterEntry:
         kind = "claude" if address.startswith("session:") else "codex"
-        worker = address.startswith("seat:")
+        worker = address.startswith("worker:")
         return roster.RosterEntry(
             machine, kind, "worker" if worker else "freestanding", name, "working",
             roster.Messageable(address), "/fixture", roster.NoShowrunner(), roster.NoDirector(),
@@ -1681,7 +1681,7 @@ class PeerSendTests(ShutdownTestCase):
         return status, output.getvalue(), errors.getvalue()
 
     def test_remote_only_claude_mesh_and_daemon_recipients_forward_their_addresses(self) -> None:
-        for address in ("session:peer", "seat:peer-run/impl", "codex:peer-thread"):
+        for address in ("session:peer", "worker:peer-run/impl", "codex:peer-thread"):
             with self.subTest(address=address):
                 self.peer([self.row("peer name", address)])
                 status, output, errors = self.run_main("peer name")
@@ -1697,7 +1697,7 @@ class PeerSendTests(ShutdownTestCase):
         self.assertEqual(self.daemon_calls, [])
 
     def test_remote_only_addresses_are_looked_up_before_local_transport_fallback(self) -> None:
-        for address in ("session:peer", "seat:peer-run/impl", "codex:peer-thread"):
+        for address in ("session:peer", "worker:peer-run/impl", "codex:peer-thread"):
             with self.subTest(address=address):
                 self.peer([self.row("peer", address)])
                 status, output, errors = self.run_main(address)
@@ -1733,7 +1733,7 @@ class PeerSendTests(ShutdownTestCase):
                                       (["--machine", "mac"], send.NamedMachine("mac"))):
             for selection_flags, expected_selection in (
                 ([], send.RosterLookup("recipient")),
-                (["--codex", "--session-dir", "/fixture/run"], send.MeshSeat("/fixture/run", "recipient")),
+                (["--codex", "--session-dir", "/fixture/run"], send.MeshWorker("/fixture/run", "recipient")),
             ):
                 with self.subTest(scope=expected_scope, selection=expected_selection):
                     options = send.parse(["--to", "recipient", *flags, *selection_flags, "--text", "hello"])
@@ -1767,7 +1767,7 @@ class PeerSendTests(ShutdownTestCase):
         self.assertIn("--here", self.forwarded()[0])
 
     def test_clean_peer_misses_keep_each_forms_local_outcome(self) -> None:
-        for target, expected in (("session:gone", 1), ("codex:gone", 0), ("seat:gone/impl", 2), ("bare missing", 0)):
+        for target, expected in (("session:gone", 1), ("codex:gone", 0), ("worker:gone/impl", 2), ("bare missing", 0)):
             with self.subTest(target=target):
                 before = len(self.ssh_calls())
                 status, output, errors = self.run_main(target)
@@ -1775,7 +1775,7 @@ class PeerSendTests(ShutdownTestCase):
                 self.assertEqual(len(self.ssh_calls()), before + 1)
                 if target.startswith("session:"):
                     self.assertIn("fixture text", send.queue_path("session-gone").read_text())
-                elif target.startswith("seat:"):
+                elif target.startswith("worker:"):
                     self.assertIn("no roster session has address", errors)
         self.assertEqual(self.daemon_calls, ["gone"])
         self.assertEqual(len(self.relayed), 1)
@@ -1800,23 +1800,23 @@ class PeerSendTests(ShutdownTestCase):
         self.assertIn("delegate source unreadable", errors)
         self.assertEqual(len(self.forwarded()), 1)
 
-    def test_remote_between_turns_seat_address_keeps_no_roster_address_error(self) -> None:
-        row = self.row("impl", "seat:remote/impl")
+    def test_remote_between_turns_worker_address_keeps_no_roster_address_error(self) -> None:
+        row = self.row("impl", "worker:remote/impl")
         row = roster.RosterEntry(row.machine, row.kind, row.role, row.name, row.status,
             roster.CannotReceiveMessages("between turns; its unit director resumes it"), row.cwd,
             row.showrunner, row.director, row.assignment, row.thread, row.session)
         self.peer([row])
-        status, output, errors = self.run_main("seat:remote/impl")
+        status, output, errors = self.run_main("worker:remote/impl")
         self.assertEqual(status, 2, output + errors)
-        self.assertIn("no roster session has address seat:remote/impl", errors)
+        self.assertIn("no roster session has address worker:remote/impl", errors)
         self.assertEqual(self.forwarded(), [])
 
     def test_ambiguous_peer_name_lists_every_address_before_sending(self) -> None:
-        self.peer([self.row("shared", "codex:one"), self.row("shared", "seat:run/two")])
+        self.peer([self.row("shared", "codex:one"), self.row("shared", "worker:run/two")])
         status, output, errors = self.run_main("shared")
         self.assertEqual(status, 2, output + errors)
         self.assertIn("codex:one", errors)
-        self.assertIn("seat:run/two", errors)
+        self.assertIn("worker:run/two", errors)
         self.assertEqual(self.forwarded(), [])
 
     def test_unreachable_peer_reports_one_problem_and_fails_the_send(self) -> None:

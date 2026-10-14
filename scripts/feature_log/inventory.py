@@ -39,7 +39,7 @@ class Unclaimed(TypedDict):
 
 class ClaimedBy(TypedDict):
     state: Literal["claimed"]
-    seat: str
+    worker: str
 
 
 ClaimState = Unclaimed | ClaimedBy
@@ -440,7 +440,7 @@ def _validate_record(value: object, project: str) -> BackfillSourceRecord:
         tagged = cast(dict[str, object], raw)
         state = tagged.get("state")
         if key == "claim":
-            required = {"unclaimed": {"state"}, "claimed": {"state", "seat"}}
+            required = {"unclaimed": {"state"}, "claimed": {"state", "worker"}}
         else:
             required = {"undisposed": {"state"}, "represented": {"state", "note"},
                         "combined": {"state", "note"}, "internal": {"state", "reason"},
@@ -458,16 +458,28 @@ def _read_ledger(project: str) -> list[BackfillSourceRecord]:
         raise InventoryError(f"no ledger for {project}; run collect first")
     records: list[BackfillSourceRecord] = []
     ids: set[str] = set()
+    changed = False
     for number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
         try:
             value = cast(object, json.loads(line))
-            record = _validate_record(value, project)
+            if isinstance(value, dict):
+                fields = cast(dict[str, object], value)
+                claim = fields.get("claim")
+                if isinstance(claim, dict):
+                    claim_fields = cast(dict[str, object], claim)
+                    if "seat" in claim_fields:
+                        _ = claim_fields.setdefault("worker", claim_fields["seat"])
+                        del claim_fields["seat"]
+                        changed = True
+            record = _validate_record(cast(object, value), project)
         except (ValueError, TypeError) as error:
             raise InventoryError(f"{path.name}:{number}: {error}") from error
         if record["id"] in ids:
             raise InventoryError(f"duplicate ledger record {record['id']}")
         ids.add(record["id"])
         records.append(record)
+    if changed:
+        _write_ledger(project, records)
     return records
 
 
@@ -527,13 +539,13 @@ def _run_next(arguments: argparse.Namespace) -> int:
     project = cast(str, arguments.project)
     pool = cast(Pool, arguments.pool)
     kind = cast(RecordKind | None, arguments.kind)
-    seat = cast(str | None, arguments.claim)
+    worker = cast(str | None, arguments.claim)
     prefixes = cast(list[str], arguments.path)
     limit = cast(int, arguments.limit)
     if limit < 0:
         raise InventoryError("--limit must be nonnegative")
-    if seat is not None and not seat.strip():
-        raise InventoryError("--claim needs a nonempty seat")
+    if worker is not None and not worker.strip():
+        raise InventoryError("--claim needs a nonempty worker")
     with locked():
         records = _read_ledger(project)
         selected: list[BackfillSourceRecord] = []
@@ -541,7 +553,7 @@ def _run_next(arguments: argparse.Namespace) -> int:
             claim = record["claim"]
             if (record["pool"] != pool or record["outcome"]["state"] != "undisposed"
                     or (kind is not None and record["kind"] != kind)
-                    or (claim["state"] == "claimed" and claim["seat"] != seat)):
+                    or (claim["state"] == "claimed" and claim["worker"] != worker)):
                 continue
             source_path, separator, _line = record["source"].rpartition(":")
             if prefixes and (not separator or not any(source_path.startswith(prefix) for prefix in prefixes)):
@@ -549,9 +561,9 @@ def _run_next(arguments: argparse.Namespace) -> int:
             selected.append(record)
             if limit and len(selected) >= limit:
                 break
-        if seat is not None and selected:
+        if worker is not None and selected:
             for record in selected:
-                record["claim"] = {"state": "claimed", "seat": seat}
+                record["claim"] = {"state": "claimed", "worker": worker}
             _write_ledger(project, records)
     for record in selected:
         print(" | ".join((record["id"], record["date"], record["kind"], record["title"], record["source"])))
@@ -613,7 +625,7 @@ def _run_mark(arguments: argparse.Namespace) -> int:
         if reason is None or not reason.strip() or note is not None:
             raise InventoryError(f"{disposition} needs --reason")
         outcome = {"state": disposition, "reason": reason}
-    seat = cast(str | None, arguments.seat)
+    worker = cast(str | None, arguments.worker)
     with locked():
         ledgers: dict[str, list[BackfillSourceRecord]] = {}
         selected: list[BackfillSourceRecord] = []
@@ -625,8 +637,8 @@ def _run_mark(arguments: argparse.Namespace) -> int:
             if record is None:
                 raise InventoryError(f"unknown source record {identifier}")
             claim = record["claim"]
-            if claim["state"] == "claimed" and claim["seat"] != seat:
-                raise InventoryError(f"{identifier} is claimed by {claim['seat']}")
+            if claim["state"] == "claimed" and claim["worker"] != worker:
+                raise InventoryError(f"{identifier} is claimed by {claim['worker']}")
             if note is not None:
                 _note_exists(project, note)
             selected.append(record)
@@ -679,7 +691,7 @@ def _parser() -> InventoryArgumentParser:
     mark = commands.add_parser("mark")
     _ = mark.add_argument("ids", nargs="*")
     _ = mark.add_argument("--ids-from")
-    _ = mark.add_argument("--seat")
+    _ = mark.add_argument("--worker")
     _ = mark.add_argument("--as", dest="disposition", required=True, choices=DISPOSITIONS)
     destination = mark.add_mutually_exclusive_group(required=True)
     _ = destination.add_argument("--note")

@@ -21,6 +21,7 @@ RequestedFields = TypedDict("RequestedFields", {"from": str, "to": str, "why": s
 
 class RequestedMove(MoveCommon, RequestedFields):
     kind: Literal["requested"]
+    cause: NotRequired[Literal["credits off"]]
 
 
 class ConfirmedMove(MoveCommon):
@@ -83,6 +84,8 @@ def _valid(value: object) -> bool:
     if "window" in fields and fields["window"] not in ("weekly", "five_hour", "unknown"):
         return False
     kind = fields.get("kind")
+    if "cause" in fields and (kind != "requested" or fields["cause"] != "credits off"):
+        return False
     if kind in ("requested", "waited") and "reset" in fields:
         if not isinstance(fields["reset"], str) or not fields["reset"]:
             return False

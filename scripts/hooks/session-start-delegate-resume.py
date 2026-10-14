@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""SessionStart(compact) hook: re-seat a /unit:direct run after compaction.
+"""SessionStart(compact) hook: restore a /unit:direct run after compaction.
 
 `direct.md` already says to re-read the command file after compaction and
 resume the same control flow. The problem is where that instruction lives: in

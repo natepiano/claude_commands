@@ -170,7 +170,7 @@ def role_at(log: RoleLog, agent_id: str, at: datetime) -> Assignment | Unassigne
 
 
 def _review_lens(run: Path, name: str) -> Lens | None:
-    seat_name = re.compile(r"(?<![\w.-])" + re.escape(name) + r"(?![\w.-])")
+    worker_name = re.compile(r"(?<![\w.-])" + re.escape(name) + r"(?![\w.-])")
     log_name = re.compile(r"review_agent_(?:\d+_)?(" + "|".join(LENSES) + r")\.log")
     evidence_mtimes: dict[Lens, float] = {}
     for path in sorted(run.glob("review_agent_*.log")):
@@ -179,7 +179,7 @@ def _review_lens(run: Path, name: str) -> Lens | None:
             continue
         try:
             with path.open(encoding="utf-8") as log:
-                if any(seat_name.search(line) for line in log):
+                if any(worker_name.search(line) for line in log):
                     lens = _lens(match.group(1))
                     stamp = path.stat().st_mtime
                     evidence_mtimes[lens] = max(stamp, evidence_mtimes.get(lens, float("-inf")))
@@ -189,6 +189,10 @@ def _review_lens(run: Path, name: str) -> Lens | None:
 
 
 def _run_assignments(run: Path) -> Iterator[tuple[str, Assignment]]:
+    # The remote reader loads this module without a delegate checkout.
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+    from scripts.delegate.worker_state import worker_ledger
+
     roster_path = run / "mesh_roster.json"
     try:
         if roster_path.is_file():
@@ -199,12 +203,12 @@ def _run_assignments(run: Path) -> Iterator[tuple[str, Assignment]]:
             for name, value in cast(dict[str, object], value).items():
                 if not isinstance(value, dict):
                     continue
-                seat = cast(dict[str, object], value)
-                agent_id = seat.get("thread_id")
+                worker = cast(dict[str, object], value)
+                agent_id = worker.get("thread_id")
                 if not isinstance(agent_id, str) or not agent_id.strip():
                     continue
-                role = seat.get("role")
-                previous_role = seat.get("previous_role")
+                role = worker.get("role")
+                previous_role = worker.get("previous_role")
                 if isinstance(previous_role, str) and previous_role in ROLES:
                     # The only surviving timestamp is the roster's mtime. One second
                     # earlier preserves the known order without claiming precision.
@@ -217,16 +221,16 @@ def _run_assignments(run: Path) -> Iterator[tuple[str, Assignment]]:
                     yield agent_id, Assignment(stamp, current, lens, True)
     except (OSError, ValueError, RecursionError) as exc:
         _report_problem(f"{roster_path}: {exc}")
-    seats_path = run / "seats"
+    workers_path = worker_ledger(run)
     try:
-        if seats_path.is_file():
-            stamp = datetime.fromtimestamp(seats_path.stat().st_mtime, timezone.utc)
-            for line in seats_path.read_text(encoding="utf-8").splitlines():
+        if workers_path.is_file():
+            stamp = datetime.fromtimestamp(workers_path.stat().st_mtime, timezone.utc)
+            for line in workers_path.read_text(encoding="utf-8").splitlines():
                 agent_id, separator, _name = line.partition("\t")
                 if separator and agent_id.strip():
                     yield agent_id, Assignment(stamp, "worker", None, True)
     except (OSError, ValueError) as exc:
-        _report_problem(f"{seats_path}: {exc}")
+        _report_problem(f"{workers_path}: {exc}")
 
 
 def backfill(archive: Path, live: Path) -> int:

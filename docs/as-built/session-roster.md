@@ -25,7 +25,7 @@ other machine: ssh roster.py --here --snapshot ──►├─► Roster(entries
 
 ### Record sources
 
-The roster joins records that each name one part of the picture. A session's role comes from these records, never from its name; the one value read from a name is a Claude worker's slot role, the suffix of its seats-ledger seat name.
+The roster joins records that each name one part of the picture. A session's role comes from these records, never from its name; the one value read from a name is a Claude worker's slot role, the suffix of its worker ledger worker name.
 
 | Source | Where | Gives |
 |---|---|---|
@@ -34,14 +34,14 @@ The roster joins records that each name one part of the picture. A session's rol
 | Unit marks | tmux sessions marked for a production, one read for every production (`unit_lookup.every_marked_unit`) joined per doc by `live_units.units_in(doc, every)` | each unit's marked pane and the live Claude in it |
 | Units table | the production doc, via `add_unit.live_unit_table` | `Unit` and `Worktree` per row (fallback only) |
 | Run markers | `/tmp/claude/delegate/active/<director session id>` (`ROSTER_DELEGATE_ROOT`) | first line: the run's session directory |
-| Run heartbeats | `<run>/heartbeat.log` | a run is live if written within `remove_seats.LIVE_HEARTBEAT_SECS` (600 s) |
-| Seats ledgers | `<run>/seats`, one `<background id>\t<seat name>` per `agent_bg.sh` launch | Claude workers |
-| Mesh roster | `<run>/mesh_roster.json`, `<run>/mesh_server.json` | Codex seats: `thread_id`, `status`, `role`, `lens`, `launcher_pid`, `cwd`; server `pid` |
+| Run heartbeats | `<run>/heartbeat.log` | a run is live if written within `remove_workers.LIVE_HEARTBEAT_SECS` (600 s) |
+| Workers ledgers | `<run>/workers`, one `<background id>\t<worker name>` per `agent_bg.sh` launch | Claude workers |
+| Mesh roster | `<run>/mesh_roster.json`, `<run>/mesh_server.json` | Codex workers: `thread_id`, `status`, `role`, `lens`, `launcher_pid`, `cwd`; server `pid` |
 | Review state | `<run>/review_status[_<lens>]`, `<run>/review_pid[_<lens>]` | running blind reviewers |
 | Codex daemon | `~/.codex/app-server-control/app-server-control.sock` (`ROSTER_CODEX_SOCKET`) | loaded threads: id, name, cwd, status |
-| Process table | `ps -eo pid=,ppid=,comm=,args=` (`PROCESS_TABLE_PS`) | Codex agent processes, reviewer descendants, seat `--cwd` |
+| Process table | `ps -eo pid=,ppid=,comm=,args=` (`PROCESS_TABLE_PS`) | Codex agent processes, reviewer descendants, worker `--cwd` |
 
-The mesh roster format belongs to `scripts/agents/codex_mesh.py` (see `docs/as-built/long-lived-seats.md`); the roster reads it and never writes it.
+The mesh roster format belongs to `scripts/agents/codex_mesh.py` (see `docs/as-built/long-lived-workers.md`); the roster reads it and never writes it.
 
 ### How each row's role is derived
 
@@ -50,9 +50,9 @@ A live run is a run directory with a marker whose director session is running, o
 Claude rows come from `sessions.running_sessions()`, one per `sessionId` (newest `updatedAt`). First match wins:
 
 1. **showrunner** — the session matches a registration: by messaging socket when the registration has one, else by the registration's session name. Link: `RunsProduction(slug)`.
-2. **unit director under a production** — with tmux readable, from tmux only: the marked pane's live Claude, else the running non-worker record whose tmux pane id is the marked pane; a unit with no marked session has no director. Only when tmux is unreadable or absent (the Mac) does a Units row's `Worktree` equal to the session's cwd make it the director (never a seats-ledger worker). Links: `DirectsUnit(unit)` and `UnderShowrunner(slug, name, session:<id>)` when the showrunner runs, else `ProductionWithoutRunningShowrunner(slug)`.
+2. **unit director under a production** — with tmux readable, from tmux only: the marked pane's live Claude, else the running non-worker record whose tmux pane id is the marked pane; a unit with no marked session has no director. Only when tmux is unreadable or absent (the Mac) does a Units row's `Worktree` equal to the session's cwd make it the director (never a worker ledger worker). Links: `DirectsUnit(unit)` and `UnderShowrunner(slug, name, session:<id>)` when the showrunner runs, else `ProductionWithoutRunningShowrunner(slug)`.
 3. **unit director by run marker** — the session id names a live run's marker. Links: `NoShowrunner`, `NoDirector`.
-4. **worker** — the session id equals or starts with a seats-ledger id in a live run. `WorkerAssignment(slot_role, run dir)`, the slot role being the seat name's suffix when it is `impl`, `test`, `fix` or `review`, else `role unknown`. When the run's director runs: `UnderDirector(unit, name, session:<id>)` plus the director's showrunner link.
+4. **worker** — the session id equals or starts with a worker ledger id in a live run. `WorkerAssignment(slot_role, run dir)`, the slot role being the worker name's suffix when it is `impl`, `test`, `fix` or `review`, else `role unknown`. When the run's director runs: `UnderDirector(unit, name, session:<id>)` plus the director's showrunner link.
 5. **freestanding** — everything else.
 
 Codex rows:
@@ -66,7 +66,7 @@ Codex rows:
 - `RosterEntry` (frozen): `machine`, `kind` (`claude` | `codex`), `role` (`showrunner` | `unit director` | `worker` | `freestanding`), `name`, `status`, `reach`, `cwd`, `showrunner`, `director`, `assignment`, `thread`, `session`.
 - `reach: Messageable(address) | CannotReceiveMessages(reason)`.
   - Claude: `session:<id>` with a messaging socket, else `CannotReceiveMessages("no messaging socket")`.
-  - Codex worker: `seat:<run id>/<seat name>` (run id = the run directory's name) at mesh status `running` / `waiting_capacity`; otherwise `between turns; its unit director resumes it` or `between turns; no unit director is running`.
+  - Codex worker: `worker:<run id>/<worker name>` (run id = the run directory's name) at mesh status `running` / `waiting_capacity`; otherwise `between turns; its unit director resumes it` or `between turns; no unit director is running`.
   - Daemon session: `codex:<thread id>`.
   - Blind reviewer: `CannotReceiveMessages("blind reviewer")`.
 - `ShowrunnerRelationship = RunsProduction | UnderShowrunner | ProductionWithoutRunningShowrunner | NoShowrunner`; `DirectorRelationship = DirectsUnit | UnderDirector | NoDirector`; `Assignment = WorkerAssignment | NotAWorker`.
@@ -90,7 +90,7 @@ Codex rows:
 ### `send.py`: one recipient
 
 ```
-send.py --to NAME|uds:<path>|session:<id>|seat:<run>/<seat>|codex:<thread>
+send.py --to NAME|uds:<path>|session:<id>|worker:<run>/<worker>|codex:<thread>
         [--from NAME] [--summary TEXT] [--key KEY [--repeat-minutes N]]
         [--here | --machine HOST] [--codex --session-dir DIR] [--timeout SECONDS]
         (--text TEXT | --file PATH | stdin)
@@ -98,7 +98,7 @@ send.py --to user --summary TITLE [--need note|decision|blocked] (--action TEXT 
 send.py ack KEY | reopen KEY | pending [NAME] | retire --to ADDRESS --from SENDER --key KEY
 ```
 
-The argparse boundary builds `RecipientSelection = RosterLookup(to) | MeshSeat(session_dir, seat)` and `RecipientResolutionScope = LocalOnly | LocalThenPeer | NamedMachine(host)`: `--here` is `LocalOnly`, `--machine HOST` is `NamedMachine`, neither is `LocalThenPeer`; the two together are a usage error. `Options.action: MessageUserAction = UserAction | NoUserRecipient`.
+The argparse boundary builds `RecipientSelection = RosterLookup(to) | MeshWorker(session_dir, worker)` and `RecipientResolutionScope = LocalOnly | LocalThenPeer | NamedMachine(host)`: `--here` is `LocalOnly`, `--machine HOST` is `NamedMachine`, neither is `LocalThenPeer`; the two together are a usage error. `Options.action: MessageUserAction = UserAction | NoUserRecipient`.
 
 Routes (`resolve_recipient(to, scope) -> DeliveryRoute`):
 
@@ -108,18 +108,18 @@ Routes (`resolve_recipient(to, scope) -> DeliveryRoute`):
 | `uds:<path>` | Claude delivery on this machine, even with `--machine`; postmaster first when registered and available, else relay |
 | any form, `--machine HOST` | `ssh HOST send.py --here ...` with no local roster read |
 | `session:<id>` | Claude delivery; resolved to the live session's `uds:` socket first; postmaster first when available, else relay; no live session → `QUEUED` |
-| `seat:<run>/<seat>` | that row's `codex_mesh.py send --session-dir <run dir> --to <seat>` |
+| `worker:<run>/<worker>` | that row's `codex_mesh.py send --session-dir <run dir> --to <worker>` |
 | `codex:<thread>` | `codex_daemon.queue(thread_id, text, timeout)`: `codex queue --thread <id> --message <text>` |
 | bare name | roster rows with that `name`; one `Messageable` sends by its address |
-| `--codex --session-dir DIR` | `MeshSeat`: `codex_mesh.py send` directly, no roster read |
+| `--codex --session-dir DIR` | `MeshWorker`: `codex_mesh.py send` directly, no roster read |
 
-Resolution for `session:`, `seat:`, `codex:` and bare names reads this machine's roster once (problems print as `send.py: roster: <problem>`). Address forms match `Messageable` addresses; names match any row.
+Resolution for `session:`, `worker:`, `codex:` and bare names reads this machine's roster once (problems print as `send.py: roster: <problem>`). Address forms match `Messageable` addresses; names match any row.
 
 - A match here sends here; the other machine is not asked.
 - Several matching rows: exit 2, `<name> matches <N> sessions:` with each address (or its `cannot take messages` reason) and role.
 - One `CannotReceiveMessages` row: exit 2 with `cannot_receive_message_text`.
 - No match under `LocalThenPeer`: the other machine's roster is read. One `Messageable` row there sends through `ssh` with its address; ambiguity and `cannot take messages` apply to its rows too; a miss while it reports problems is `FAILED` with those problems. A bare name absent from a local roster that had problems asks no one: exit 2, `absence of <name> here is not proven; use an address or --machine`.
-- A clean miss: `session:` queues here (exit 1), `codex:` queues to this machine's daemon, `seat:` exits 2 with `no roster session has address <address>`, a bare name goes to the Claude relay by name.
+- A clean miss: `session:` queues here (exit 1), `codex:` queues to this machine's daemon, `worker:` exits 2 with `no roster session has address <address>`, a bare name goes to the Claude relay by name.
 
 Every ssh send runs `"$HOME/.claude/scripts/lib/py" "$HOME/.claude/scripts/message/send.py" --here ...` with the text on stdin. `remote()` reads the outcome word from the last stdout line there, prefixing the detail `on <host>: `; a run that prints no outcome line (usage errors, `cannot take messages`, ambiguity, `no roster session has address`, which go to stderr) returns `FAILED: ssh <host>: <reason>`. Action flags are forwarded only for `--to user`.
 
@@ -181,7 +181,7 @@ A forward begins `Message from <name> (their answer to <sender>, passed on by po
 
 **Start, check and stop procedure**
 
-The unit director runs this on natedev, from main, since the session loads `~/.claude/mods/postmaster`. No seat runs it. All message recipients are throwaway sessions created for the check. The permanent directory is outside the repo and must already be trusted by each account used. Every launch removes all environment variables whose names begin `CLAUDE`, including variables restored by shell startup, and uses a shell whose child is `command claude`. Retain each new session's registry identity and pid; end only those processes. No pane input, settings edit or marketplace installation is part of the procedure.
+The unit director runs this on natedev, from main, since the session loads `~/.claude/mods/postmaster`. No worker runs it. All message recipients are throwaway sessions created for the check. The permanent directory is outside the repo and must already be trusted by each account used. Every launch removes all environment variables whose names begin `CLAUDE`, including variables restored by shell startup, and uses a shell whose child is `command claude`. Retain each new session's registry identity and pid; end only those processes. No pane input, settings edit or marketplace installation is part of the procedure.
 
 1. Check `~/.claude/scripts/lib/py ~/.claude/scripts/message/postmaster.py status`: expect `not running`, exit 1.
 2. Start a new tmux session named `postmaster` in `/home/natepiano/postmaster`, running `command claude -n postmaster --plugin-dir /home/natepiano/.claude/mods/postmaster` with the environment removal above. Confirm with `~/.claude/scripts/lib/py ~/.claude/scripts/message/sessions.py id postmaster`. Within 10 s, `postmaster.py status` must exit 0.
@@ -328,7 +328,7 @@ Senders:
 ### Instructions: which tool each session uses
 
 - **Claude sessions** (`commands/message.md`, "Finding sessions"): ListAgents and SendMessage for Claude sessions; `roster.py` for Codex workers, unit-director and showrunner relationships, and the other machine; `send.py --to <address>` for anything the roster lists; `broadcast.py` for groups. Scripts always send with `send.py`.
-- **Codex sessions** read `~/.codex/AGENTS.md`, seats included. Codex has no scriptable list, so its text points to `roster.py`, `send.py` and `broadcast.py` for every kind. `codex/AGENTS-messaging.md` is the source: listing, sending, groups, messaging the user, "Outcomes and recovery", partly missing results, the message rules, and the sandbox rerun.
+- **Codex sessions** read `~/.codex/AGENTS.md`, workers included. Codex has no scriptable list, so its text points to `roster.py`, `send.py` and `broadcast.py` for every kind. `codex/AGENTS-messaging.md` is the source: listing, sending, groups, messaging the user, "Outcomes and recovery", partly missing results, the message rules, and the sandbox rerun.
 - Both texts carry the same outcome and recovery words.
 - `scripts/message/install_codex_agents.py [--machine HOST] [--agents-file PATH]` writes that text into `~/.codex/AGENTS.md` between `<!-- claude-messaging: begin -->` and `<!-- claude-messaging: end -->`:
   - No markers: appends the block, creating the file and parent if needed.
@@ -360,8 +360,8 @@ Senders:
 - Roles and links come from records, never names. Nesting, `--kind` context rows, broadcast membership, sender exclusion and `--of` match on `session:<id>` / thread identity, never on names.
 - Everything an agent reads in the roster text is plain words: no pids or ports. `--json` is the flat public form with no session field; `--snapshot` is the lossless form between machines only.
 - A source that cannot be read becomes one problem line naming it; the rest still prints. Every consumer prints `Roster.problems` and continues.
-- Every address is unique on both machines: `session:<id>`, `seat:<run id>/<seat name>`, `codex:<thread id>`. A `CannotReceiveMessages` row has an empty address and takes no messages; broadcast skips it rather than send to `""`.
-- A seat is `Messageable` only at mesh status `running` / `waiting_capacity`; a seat between turns is resumed only by its unit director.
+- Every address is unique on both machines: `session:<id>`, `worker:<run id>/<worker name>`, `codex:<thread id>`. A `CannotReceiveMessages` row has an empty address and takes no messages; broadcast skips it rather than send to `""`.
+- A worker is `Messageable` only at mesh status `running` / `waiting_capacity`; a worker between turns is resumed only by its unit director.
 - `--action` / `--no-action` go only with `--to user`; every other recipient carries `NoUserRecipient`; `broadcast.py` passes no action flags; `remote()` forwards them only for `user`.
 - No message reaches the user without `--action` or `--no-action`. `REFUSED:` (exit 2) means fix the flags and resend, never a PushNotification fallback.
 - Under `LocalThenPeer` a local match is sent here and the other machine is not asked. Every ssh send and every per-row broadcast send passes `--here`. `--here` keeps `roster.py`, `send.py` and `broadcast.py` to this machine.
@@ -380,7 +380,7 @@ Senders:
 ## Calibration / gotchas
 
 **Roster records**
-- A Claude seats-ledger id is `agent_bg.sh`'s background id, a prefix of the `sessionId`.
+- A Claude worker ledger id is `agent_bg.sh`'s background id, a prefix of the `sessionId`.
 - Session records are one file per pid, indexed by `(sessionId, pid)`; the newest `updatedAt` wins. A pid-to-name map therefore cannot hold a stale name.
 - Blind reviewers (`codex exec` via `agent_exec.sh`) carry no `--name` or `--session-dir`; only the review status and pid files find them.
 - No launcher writes `lens` into the mesh roster; the lens lives in review artifact names and the progress and findings records.
@@ -392,8 +392,8 @@ Senders:
 **Sending**
 - Under `--machine HOST`, `remote()` keeps the outcome word from the other machine's last stdout line, so a `REFUSED:` there stays `REFUSED` (exit 2). Only stderr-only exit-2 errors (cannot take messages, ambiguous name, no roster session has address, usage) return as `FAILED: ssh <host>: <reason>` (exit 3).
 - `uds:` is always this machine's socket, even with `--machine`.
-- A `seat:` address of a seat between turns matches no row on either machine and reads `no roster session has address`, not `cannot take messages`.
-- `codex_mesh.py send` accepts only `running` / `waiting_capacity` seats.
+- A `worker:` address of a worker between turns matches no row on either machine and reads `no roster session has address`, not `cannot take messages`.
+- `codex_mesh.py send` accepts only `running` / `waiting_capacity` workers.
 - `pushover.py` exit 2 also means usage or missing keys; only the `refused before sending:` stderr marker marks a refusal. A caller with no keys and no action flag gets the action refusal, not `keys missing`.
 - Every roster problem on stderr carries `could not read: `, so a machine not reached reads `could not read: <host>: not reached: <why>` (exit 1). In a sandbox this usually means rerun outside it, or use `--here`.
 - The ssh commands run `$HOME/.claude/scripts/...` on the other machine, its main checkout: a branch's changes reach it only once merged and pulled there. A `BROADCAST_SEND` set here is set there to the same path, and a path missing there fails the send there.

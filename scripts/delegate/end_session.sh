@@ -7,8 +7,8 @@
 # stop-delegate-continue.py refuses to let the turn end near the auto-compaction
 # threshold, on the assumption that the run still has phases to go.
 #
-# Removes every claude seat this run launched, and any a dead run left alive
-# (remove_seats.py). Also stops this run's codex app-server, if one was
+# Removes every claude worker this run launched, and any a dead run left alive
+# (remove_workers.py). Also stops this run's codex app-server, if one was
 # started. That server is detached on purpose -- it has to outlive each
 # delegate so a peer can still reach a thread between turns -- so the end of
 # the run is the only point that knows nobody needs it any more.
@@ -39,7 +39,7 @@ if [[ -f "${MARKER}" ]]; then
   # The marker holds the session directory, which is where the mesh files live.
   SESSION_DIR="$(head -n 1 "${MARKER}")"
   if [[ -n "${SESSION_DIR}" ]]; then
-    "$PY" "${SCRIPT_DIR}/remove_seats.py" \
+    "$PY" "${SCRIPT_DIR}/remove_workers.py" \
       --session-dir "${SESSION_DIR}" || true
   fi
   if [[ -n "${SESSION_DIR}" && ( -f "${SESSION_DIR}/mesh_roster.json" || -f "${SESSION_DIR}/mesh_server.json" || -f "${SESSION_DIR}/mesh_retired.json" ) ]]; then
