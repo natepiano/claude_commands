@@ -74,33 +74,22 @@ Source: natedev steps that passed, the 7 days before the change against the time
 
 ### Phase 1 — Each sample records natedev's power profile, and the report compares builds across every profile change  · status: done
 
-**Depends on:** none
+#### As-built
 
-#### Work Order
-
-**Goal:** the build log records natedev's power profile once a minute, and `/build:report` shows how like-with-like build steps changed across each profile change. Source: the user, 2026-10-13 ("treat this as an inflection point to measure against"); the showrunner's three design calls above.
-
-**Spec:**
-- `sample.py`: a `POWER_PROFILE_STATE = Path("/var/lib/power-profiles-daemon/state.ini")` constant, overridable for tests the way the other paths are patched. `read_power_profile(path) -> PowerProfile | Unmeasured`, where `PowerProfile(name: str, since_epoch: float)`. It does one `os.stat` and one `read_text`, finds `Profile=` under `[State]` with a plain line scan, and returns `Unmeasured.VALUE` on `OSError`, a missing section or a missing or empty value. `sample()` writes `power_profile` and `power_profile_since` (`store.utc_iso(since_epoch)`), or `None` for both.
-- `index.py`: the two columns at the end of `SAMPLE_COLUMNS`, with descriptions ("power-profiles-daemon profile; NULL when not recorded", "UTC ISO mtime of the daemon's state file: when the profile was set"). `SCHEMA_VERSION` + 1.
-- `report.py`: `ProfileChange` (NamedTuple: `at: str`, `profile: str`), `profile_changes(connection)`, `power_profile_section(connection, day)`, and `MIN_PROFILE_RUNS = 10`, all as in the Design. The section goes after `test_builds_section` in `report`. Times print in the user's zone as `YYYY-MM-DD HH:MM:SS <zone>`.
-- `commands/build/report.md`: one sentence saying the Power profile section compares passing natedev steps before and after each profile change in the last 7 days.
-- Tests:
-  - `test_sample.py`: state-file fixtures for `performance`, `power-saver`, a missing file, a file without `[State]` and an empty `Profile=`. A full `sample()` run with a fixture state file writes both fields, and without one writes `null` for both and still writes the sample.
-  - `test_index.py`: a sample line with both fields indexes them; an old line without them gives NULL.
-  - `test_report.py`:
-    - Change points: NULL samples then `performance` gives one change at its `power_profile_since`. A rewrite with the same profile and a newer `since` is not a change. `performance` → `balanced` gives two.
-    - The section: one row per kind, caller and rebuild class; counts on both sides; `—` below 10 runs on either side; a row with no before-side runs left out; the "profile not recorded" label; the before window cut at the previous change; a change outside the 7 days gives only the `Profile now:` line; no profiled sample omits the section; Mac steps and failed steps excluded.
+- `sample.py` holds `POWER_PROFILE_STATE = Path("/var/lib/power-profiles-daemon/state.ini")` (patched in tests like the other paths), `PowerProfile(name: str, since_epoch: float)` and `read_power_profile(path) -> PowerProfile | Unmeasured`. The read opens the file once, takes `os.fstat` on the descriptor, then reads that same handle. It scans lines for `Profile=` under `[State]`. It returns `Unmeasured.VALUE` on `OSError`, a missing section, a missing or empty value, undecodable text, or a file of 1 KiB or more.
+- Each sample line carries `power_profile` and `power_profile_since` (`store.utc_iso(since_epoch)`), both `None` when unmeasured. No process, no D-Bus; a missing file (the Mac) never stops a sample, and nothing is backfilled.
+- `index.py` appends the two columns to `SAMPLE_COLUMNS` with descriptions and bumps `SCHEMA_VERSION` (now 15); an old line without them indexes as NULL.
+- `report.py` has `ProfileChange(at: str, profile: str)`, `profile_changes(connection)`, `power_profile_section(connection, day)` and `MIN_PROFILE_RUNS = 10`, placed after `test_builds_section` in `report`. A change is the first natedev sample of each distinct profile run, timed at its `power_profile_since`; a rewrite of the same profile with a newer mtime is not a change.
+- The section prints `Profile now: <profile>, since <YYYY-MM-DD HH:MM:SS zone>.`, then one block per change inside the last 7 days. Each block is a table of passing natedev steps (Mac and failed steps excluded) with one row per kind, caller and rebuild class that has runs on both sides, showing before and after counts and p50 (nearest rank). Change is `—` below 10 runs on either side. The before window is 7 days, cut at the previous change; its profile reads "profile not recorded" when none precedes. The after window runs to the next change. A comparison with no shared row prints one line instead of an empty table. The section is omitted when no sample carries a profile; a change older than 7 days gives only the `Profile now:` line.
+- Read cost measured at 21.9 µs per call.
 
 **Files:**
-- `scripts/buildlog/sample.py`
-- `scripts/buildlog/index.py`
-- `scripts/buildlog/report.py`
-- `scripts/buildlog/test_sample.py`
-- `scripts/buildlog/test_index.py`
-- `scripts/buildlog/test_report.py`
-- `commands/build/report.md`
+- `scripts/buildlog/sample.py` — profile constant, `PowerProfile`, `read_power_profile`, the two sample fields.
+- `scripts/buildlog/index.py` — the two sample columns and the schema version.
+- `scripts/buildlog/report.py` — `ProfileChange`, `profile_changes`, `profile_step_durations`, `power_profile_section`.
+- `scripts/buildlog/test_sample.py`, `test_index.py`, `test_report.py` — state-file fixtures, index round trip, change points and section cases.
+- `commands/build/report.md` — one sentence describing the Power profile section.
 
-**Seats:** 1 writer + 1 tester.
+**Gotchas:** The daemon replaces the state file by rename, so a path stat followed by a separate read can pair a new profile with the old mtime; keep one open, fstat on the descriptor, one read of the same handle. basedpyright exits 3 in every worktree because the configured `.venv` is absent while diagnostics are clean.
 
-**Acceptance gate:** the buildlog lane passes, and basedpyright reports 0 errors and 0 warnings on every changed file. A live check runs the worktree's `cli.py sample` with `BUILDLOG_DIR` set to a scratch folder and shows the written sample carries `performance` and a since time of 2026-10-14T02:29:56Z. It times 1000 calls of `read_power_profile` on the real state file and gives the cost per read for the showrunner's notice. A scratch copy of the live log, with that scratch sample appended, then gives a report whose Power profile section shows the 22:29:56 EDT change with before and after rows.
+**Ruled out:** forking `powerprofilesctl` or opening D-Bus every 60 s (cost and a process per sample); a hand-kept marker for the switch (the file mtime already records it); `/sys/firmware/acpi/platform_profile` (this daemon does not drive it, `PlatformDriver=placeholder`).
