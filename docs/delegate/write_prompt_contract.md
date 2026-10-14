@@ -33,9 +33,9 @@ opening in <ReviewPromptContract/>.
    verify, and what it touched outside its file set**. No reviewer receives a
    summary, so a doubt left unstated arrives at review as a line of code that
    looks deliberate. Carry verbatim: "Do not open the `rust_style` skill or run
-   `load-rust-style.sh`; this run's one style audit happens at the end." That
-   audit is <RunProjectStyleReview/>; Codex lists `rust_style` to every worker,
-   which loads it unless told not to.
+   `load-rust-style.sh`; the unit director runs the style review in its main
+   review each phase." Codex lists `rust_style` to every worker, which loads
+   it unless told not to.
 3. Narration: before each activity, run
    `bash ~/.claude/scripts/delegate/board.sh post <concrete SESSION_DIR> <slot> status "<activity>"`.
    Use short present-tense text and never read the heartbeat file. Role

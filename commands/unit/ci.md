@@ -35,11 +35,8 @@ plan's checkpoint count is a multiple of five. The final point always runs after
 <RunAsBuilt/>. Count from git, never from memory:
 
 ```sh
-git rev-list --count --grep='^checkpoint(<plan-slug>): ' "${STYLE_DIFF_BASE}..HEAD"
+git rev-list --count --grep='^checkpoint(<plan-slug>): ' HEAD
 ```
-
-With no `STYLE_DIFF_BASE`, count every checkpoint of this plan reachable from
-`HEAD`.
 
 **CI branch.** The branch <PushCheckpoint/> pushes: the current branch, or
 `delegate/<plan-slug>` on the default branch. It is already on origin.
@@ -61,7 +58,7 @@ earlier one is unresolved; repair it first (step 4).
    <BackgroundVerificationContract/> and dispatch the next phase only after it
    returns: it needs the clean tree and may commit.
 2. **Local failure.** A validation failure is a red point. Open a synthetic phase
-   `ci` / `CI point after phase <N>` the way <FinalGate/> step 3 does, repair
+   `ci` / `CI point after phase <N>` the way <FinalGate/> step 2 does, repair
    through <FixDispatch/>, commit each repair once as
    `ci(<plan-slug>): <what the repair fixed>`, and rerun step 1. No phase review
    or checkpoint for the synthetic phase.

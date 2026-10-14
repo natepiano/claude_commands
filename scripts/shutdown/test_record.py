@@ -9,6 +9,7 @@ import tempfile
 import threading
 import time
 import unittest
+from datetime import datetime, tzinfo
 from pathlib import Path
 from typing import Literal, TypedDict, NotRequired, cast, final, override
 from collections.abc import Callable
@@ -22,6 +23,15 @@ from launch_permission import launch_barrier
 
 NOW = "2026-10-09T21:49:10+00:00"
 LATER = "2026-10-09T21:50:10+00:00"
+
+
+class ProgressWriteTime(datetime):
+    at: str = NOW
+
+    @classmethod
+    @override
+    def now(cls, tz: tzinfo | None = None) -> "ProgressWriteTime":
+        return cls.fromisoformat(cls.at).astimezone(tz)
 
 
 class LegacyEntryFixture(TypedDict):
@@ -149,7 +159,7 @@ def session_shutdown(
         hold=hold, then="stop", force="wait for ready", alerts="user",
         session=saved_entry["session"], seats=[], timers=saved_entry["timers"],
         settle_message=saved_entry["settle_message"], where=saved_entry["where"],
-        progress=cast(record.SessionProgress, saved_entry["progress"]), stop_issues=[],
+        progress=cast(record.SessionProgress, saved_entry["progress"]), trail=[], stop_issues=[],
     )
 
 
@@ -271,6 +281,76 @@ class SessionRecordTests(ShutdownTestCase):
                     session_name="named-unit", cause="stop not confirmed")]
                 self.assertEqual(record.parse_session_records(json.dumps([saved])), [saved])
 
+    def test_pre_trail_record_loads_without_inventing_history(self) -> None:
+        saved = session_shutdown()
+        document = cast(dict[str, object], json.loads(json.dumps(saved)))
+        _ = document.pop("trail", None)
+        path = self.directory / "sessions/session-1.json"
+        path.parent.mkdir(parents=True)
+        _ = path.write_text(json.dumps(document))
+        before = path.read_bytes()
+        found = record.find_session(saved["login"], "session-1")
+        assert found is not None
+        self.assertEqual(found["trail"], [])
+        self.assertEqual(found["progress"], {"kind": "waiting"})
+        self.assertEqual(path.read_bytes(), before)
+
+    def test_progress_trail_keeps_order_details_and_times_after_archival(self) -> None:
+        saved = session_shutdown()
+        self.assertTrue(record.create_session(saved))
+        baseline = list(record.session_records(saved["login"])[0]["trail"])
+        transitions: list[record.SessionProgress] = [
+            record.SessionReaping(kind="reaping", at=NOW,
+                because="account out of usage", detail="weekly limit, resets tomorrow"),
+            record.SessionStopping(kind="stopping", at=LATER),
+            record.SessionStopped(kind="stopped", at="2026-10-09T21:51:10+00:00"),
+            record.SessionRestarted(kind="restarted", at="2026-10-09T21:52:10+00:00"),
+        ]
+        for progress in transitions:
+            def change(current: record.SessionShutdown) -> None:
+                current["progress"] = progress
+            with patch.object(record, "datetime", ProgressWriteTime):
+                ProgressWriteTime.at = progress.get("at", NOW)
+                saved = record.update_session(saved["login"], "session-1", change)
+        appended = saved["trail"][len(baseline):]
+        self.assertEqual([step["kind"] for step in appended], ["reaping", "stopping", "stopped", "restarted"])
+        self.assertEqual([step["at"] for step in appended],
+            [NOW, LATER, "2026-10-09T21:51:10+00:00", "2026-10-09T21:52:10+00:00"])
+        self.assertIn("weekly limit, resets tomorrow", appended[0]["detail"])
+        self.assertIn("account out of usage", appended[0]["detail"])
+        def delivery_only(current: record.SessionShutdown) -> None:
+            current["settle_message"] = record.SettleMessageSent(kind="sent", at=LATER)
+        saved = record.update_session(saved["login"], "session-1", delivery_only)
+        self.assertEqual(saved["trail"][len(baseline):], appended)
+        record.archive_session(saved["login"], "session-1")
+        history = list((self.directory / "history").glob("*.json"))
+        self.assertEqual(len(history), 1)
+        archived = record.parse_session_records("[" + history[0].read_text() + "]")[0]
+        self.assertEqual(archived["trail"], saved["trail"])
+        self.assertEqual(archived["progress"], transitions[-1])
+
+    def test_progress_restoration_uses_write_time_and_preserves_original_progress(self) -> None:
+        saved = session_shutdown()
+        stopped = record.SessionStopped(kind="stopped", at=NOW)
+        saved["progress"] = stopped
+        self.assertTrue(record.create_session(saved))
+        restarting = record.SessionRestarting(kind="restarting", at=LATER, prior=stopped)
+        rollback_at = "2026-10-09T21:51:10+00:00"
+        with patch.object(record, "datetime", ProgressWriteTime):
+            ProgressWriteTime.at = LATER
+            _ = record.update_session(saved["login"], "session-1",
+                lambda current: current.update(progress=restarting))
+            ProgressWriteTime.at = rollback_at
+            restored = record.update_session(saved["login"], "session-1",
+                lambda current: current.update(progress=stopped))
+        self.assertEqual(restored["progress"], stopped)
+        self.assertEqual(restored["trail"], [
+            record.ProgressStep(at=NOW, kind="stopped", detail=""),
+            record.ProgressStep(at=LATER, kind="restarting", detail=""),
+            record.ProgressStep(at=rollback_at, kind="stopped", detail=""),
+        ])
+        self.assertEqual(record.find_session(saved["login"], "session-1"), restored)
+
     def test_old_tmux_leftover_issue_is_normalized_on_read_and_written_canonically(self) -> None:
         saved = session_shutdown()
         saved["stop_issues"] = [record.UnitSessionLeftRunning(
@@ -284,7 +364,7 @@ class SessionRecordTests(ShutdownTestCase):
         self.assertTrue(record.create_session(parsed))
         stored = cast(dict[str, object], json.loads((self.directory / "sessions/session-1.json").read_text()))
         self.assertEqual(stored["stop_issues"], saved["stop_issues"])
-        self.assertEqual(record.find_session(saved["login"], "session-1"), saved)
+        self.assertEqual(record.find_session(saved["login"], "session-1"), parsed)
 
     def test_unit_session_leftover_issue_rejects_an_unknown_host_or_missing_name(self) -> None:
         for fields in ({"host": "other", "session_name": "unit"}, {"host": "herdr"},

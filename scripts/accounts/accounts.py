@@ -408,6 +408,7 @@ class CommandLine(argparse.Namespace):
     keep: str = ""
     explain: bool = False
     why: str = ""
+    detail: bool = False
 
 
 @dataclass(frozen=True)
@@ -2678,8 +2679,11 @@ def _status_notes(status: AccountStatus) -> list[str]:
     return notes
 
 
-def status_report() -> str:
-    """One table row per account folder, then one line for each thing wrong in a folder."""
+def status_report(*, detail: bool = False) -> str:
+    """One table row per account folder, then one line for each thing wrong in a folder.
+
+    With `detail`, also each live session, the Codex seats and the recent moves.
+    """
     statuses = account_statuses()
     selected_seats = role_account("seats")
     seats_home = selected_seats.home
@@ -2698,7 +2702,10 @@ def status_report() -> str:
     ])
     notes = [*(note for status in statuses for note in _status_notes(status)),
              *(problem for status in codex for problem in status.problems)]
-    return "\n".join([group_status_line(groups), table, "", *notes,
+    summary = [group_status_line(groups), table, "", *notes]
+    if not detail:
+        return "\n".join(summary)
+    return "\n".join([*summary,
         *_live_status_lines(groups), *_seats_status_lines(now, selected_seats), *_move_status_lines(moves.read_moves(), zone)])
 
 
@@ -2811,6 +2818,7 @@ def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="action")
     parser.set_defaults(action="status")
+    _ = parser.add_argument("--detail", action="store_true")
     for action in ("setup", "check"):
         command = commands.add_parser(action)
         _ = command.add_argument("label")
@@ -2851,6 +2859,8 @@ def _parser() -> argparse.ArgumentParser:
 def main(argv: list[str]) -> int:
     options = cast(CommandLine, _parser().parse_args(argv))
     try:
+        if options.detail and options.action != "status":
+            raise AccountsError("--detail goes only with no action")
         if options.action == "placement":
             print(placement_report())
             return 0
@@ -2903,7 +2913,7 @@ def main(argv: list[str]) -> int:
                 print(problem)
             return 1 if problems else 0
         if options.action == "status":
-            print(status_report())
+            print(status_report(detail=options.detail))
             return 0
         if options.action == "role":
             selected = role_account(options.role)
