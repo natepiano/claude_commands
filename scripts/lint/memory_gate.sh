@@ -6,6 +6,12 @@
 # Python once more. With hana nextest's 5,397 index rows, measured first check
 # 431 ms, cached poll 102 ms, and release 97 ms (temporary ledger and real
 # read-only index, 2026-10-06 PDT).
+#
+# LINT_QUEUE_LEAVE_HOOK, when set, is a shell command run on every held poll
+# after the first; status 0 ends the wait with BUILDLOG_MEM_OUTCOME=LeftQueue
+# and no reservation, so the caller can run the step elsewhere. A poll that
+# admits never runs it: a step that can start here starts at once.
+# mac_test.py free-now is written as this hook: local state only, 130 ms.
 
 BUILD_OVERRIDE_GUARD_DIR="${BASH_SOURCE[0]%/*}"
 [[ "$BUILD_OVERRIDE_GUARD_DIR" != "${BASH_SOURCE[0]}" ]] || BUILD_OVERRIDE_GUARD_DIR=.
@@ -94,6 +100,8 @@ buildlog_memory_line() {
     elif [[ "$kind" == periodic ]]; then
         awk -v a="$available" -v t="$threshold" -v m="$(( BUILDLOG_MEM_WAIT_S / 60 ))" \
             'BEGIN { printf "still waiting for memory (%d min): the machine has %.1f GiB free; a build starts at %.1f\n",m,a/1073741824,t/1073741824 > "/dev/stderr" }'
+    elif [[ "$kind" == left ]]; then
+        printf 'another machine is free after %d min %d s: leaving the memory wait\n' "$(( BUILDLOG_MEM_WAIT_S / 60 ))" "$(( BUILDLOG_MEM_WAIT_S % 60 ))" >&2
     else
         printf 'memory free after %d min %d s: starting\n' "$(( BUILDLOG_MEM_WAIT_S / 60 ))" "$(( BUILDLOG_MEM_WAIT_S % 60 ))" >&2
     fi
@@ -154,6 +162,11 @@ buildlog_wait_for_memory() {
             announced=1
             buildlog_memory_line first "$available" "$threshold" "$need" "$source" "$count" "$promised" "$running" "$reserve" "$summary" "$repo" "$step"
             build_hold_mark WaitingForMemory
+        elif [[ -n "${LINT_QUEUE_LEAVE_HOOK:-}" ]] \
+              && /bin/sh -c "$LINT_QUEUE_LEAVE_HOOK" </dev/null >/dev/null 2>&1; then
+            BUILDLOG_MEM_OUTCOME=LeftQueue
+            buildlog_memory_line left "$available" "$threshold" "$need" "$source" "$count" "$promised" "$running" "$reserve" "$summary"
+            break
         elif (( BUILDLOG_MEM_WAIT_S >= next_notice )); then
             buildlog_memory_line periodic "$available" "$threshold" "$need" "$source" "$count" "$promised" "$running" "$reserve" "$summary"
             next_notice=$(( next_notice + 60 ))
