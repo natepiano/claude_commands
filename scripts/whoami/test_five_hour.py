@@ -1,4 +1,4 @@
-"""Tests for the 5-hour limit watch: who is told, once per low spell, and what is held for the user."""
+"""Tests for session warnings, repeat suppression and old-hold cleanup."""
 from __future__ import annotations
 
 import tempfile
@@ -60,7 +60,8 @@ class WatchTests(unittest.TestCase):
 
         for module, name, stand_in in ((five_hour, "relay", relay), (five_hour, "load_config", config),
                                        (quota_alert, "registered_showrunners", showrunners),
-                                       (escalate, "schedule", schedule), (escalate, "STATE", self.state)):
+                                       (escalate, "schedule", schedule), (escalate, "STATE", self.state / "holds"),
+                                       (five_hour, "STATE", self.state / "notices")):
             _ = self.enterContext(patch.object(module, name, stand_in))
 
     def watch(self, reports: list[Report]) -> list[str]:
@@ -76,24 +77,30 @@ class WatchTests(unittest.TestCase):
             tuple(quota_alert.CodexHomeReading(home, live, now) for live in reports if live.tool == "Codex"))
         return five_hour.watch(reports, codex_readings=readings)
 
-    def test_a_low_window_tells_the_alert_list_once_and_holds_it_for_the_user(self) -> None:
-        lines = self.watch([report("Claude", 82.4), report("Codex", 10)])
+    def test_a_low_window_tells_the_alert_list_once_without_a_phone_hold(self) -> None:
+        with patch.object(escalate, "hold", side_effect=AssertionError("phone hold")):
+            lines = self.watch([report("Claude", 82.4), report("Codex", 10)])
         self.assertEqual(lines, ["5-hour limit: Claude 18% left -> natedev",
                                  "5-hour limit: Claude 18% left -> hana: NOT sent: QUEUED: no live session"])
         self.assertEqual([(name, key) for name, _, key in self.sent],
                          [("natedev", "5-hour Claude"), ("hana", "5-hour Claude")])
-        self.assertTrue(self.sent[0][1].startswith(
-            "5-hour limit: Claude has 18% of its 5-hour limit left; it resets at 14:20 PDT.\nTell the user"))
-        held = escalate.read(escalate.held_path("five-hour-claude"))
-        self.assertIsInstance(held, escalate.HeldMessage)
-        assert isinstance(held, escalate.HeldMessage)
-        self.assertEqual((held.summary, held.text, held.minutes, held.need, held.outcome, held.action),
-                         ("Claude 5-hour limit", "Claude has 18% of its 5-hour limit left; it resets at 14:20 PDT.",
-                          15, "note", "waiting", NoActionRequired()))
+        self.assertEqual(self.sent[0][1],
+                         "5-hour limit: Claude has 18% of its 5-hour limit left; it resets at 14:20 PDT.\n"
+                         + "Tell the user in one line and change nothing else.\n"
+                         + f"Protocol: {quota_alert.PROTOCOL}")
+        self.assertIsInstance(escalate.read(escalate.held_path("five-hour-claude")), escalate.NoHeld)
+        self.assertEqual(five_hour.notice_path("five-hour-claude").read_text(), "Claude")
         self.assertEqual(self.watch([report("Claude", 90)]), [])
         self.assertEqual(len(self.sent), 2)
 
-    def test_a_window_back_above_the_threshold_closes_the_hold_and_the_next_low_spell_is_new(self) -> None:
+    def test_old_phone_hold_closes_once_on_recovery(self) -> None:
+        _ = escalate.hold("five-hour-claude", escalate.SessionPush("Claude", "Usage low", NoActionRequired(), "note"))
+        self.assertEqual(self.watch([report("Claude", 3)]), ["5-hour limit: Claude is back above 20%"])
+        self.assertEqual(self.watch([report("Claude", 3)]), [])
+        self.assertIsInstance(escalate.read(escalate.held_path("five-hour-claude")), escalate.NoHeld)
+        self.assertEqual(self.sent, [])
+
+    def test_recovery_clears_the_warning_record_and_the_next_low_spell_is_new(self) -> None:
         _ = self.watch([report("Codex", 95)])
         self.assertEqual(self.watch([report("Codex", 3)]), ["5-hour limit: codex 1 is back above 20%"])
         self.assertIsInstance(escalate.read(escalate.held_path("five-hour-codex")), escalate.NoHeld)
@@ -103,7 +110,7 @@ class WatchTests(unittest.TestCase):
     def test_no_reading_changes_nothing(self) -> None:
         _ = self.watch([report("Claude", 99)])
         self.assertEqual(self.watch([report("Claude", None), Report("Codex", problem="Not logged in")]), [])
-        self.assertIsInstance(escalate.read(escalate.held_path("five-hour-claude")), escalate.HeldMessage)
+        self.assertTrue(five_hour.notice_path("five-hour-claude").exists())
 
 
 class AccountHoldTests(unittest.TestCase):
@@ -118,6 +125,7 @@ class AccountHoldTests(unittest.TestCase):
         self.now = datetime.now(timezone.utc)
         _ = cast(object, self.enterContext(patch.dict(os.environ, {"HOME": str(self.root), "AGENT_NOTES_DIR": str(self.root)})))
         _ = self.enterContext(patch.object(escalate, "STATE", self.root / "holds"))
+        _ = self.enterContext(patch.object(five_hour, "STATE", self.root / "notices"))
         _ = self.enterContext(patch.object(escalate, "schedule"))
         _ = self.enterContext(patch.object(escalate, "load_settings", return_value=CONFIG))
         _ = self.enterContext(patch.object(escalate, "registered_showrunners", return_value=SHOWRUNNERS))
@@ -147,8 +155,8 @@ class AccountHoldTests(unittest.TestCase):
     def test_swap_cancels_outgoing_and_legacy_holds_without_recovery_and_keeps_other_tools(self) -> None:
         a = self.readings(1)
         _ = five_hour.watch([a.checked_homes[0].report], codex_readings=a)
-        _ = escalate.hold("five-hour-codex", "Old Codex", "old", NoActionRequired(), need="note")
-        _ = escalate.hold("five-hour-claude", "Claude", "other", NoActionRequired(), need="note")
+        _ = escalate.hold("five-hour-codex", escalate.SessionPush("Old Codex", "old", NoActionRequired(), "note"))
+        _ = escalate.hold("five-hour-claude", escalate.SessionPush("Claude", "other", NoActionRequired(), "note"))
         self.sent.clear()
         b = self.readings(2, None)
         _ = five_hour.watch([b.checked_homes[0].report], codex_readings=b)
@@ -161,7 +169,7 @@ class AccountHoldTests(unittest.TestCase):
         self.assertTrue(self.sent)
         self.assertTrue(all("codex 2" in text for text in self.sent))
 
-    def test_swap_retires_a_relay_queued_for_an_offline_recipient(self) -> None:
+    def test_known_swap_retires_an_offline_relay_even_without_a_usage_reading(self) -> None:
         with (patch.object(send, "STATE", self.root / "messages"),
               patch.object(sessions, "live_sessions", return_value=[])):
             def queue(recipient: str, text: str, key: str | None) -> str:
@@ -171,7 +179,8 @@ class AccountHoldTests(unittest.TestCase):
             with patch.object(five_hour, "relay", side_effect=queue):
                 _ = five_hour.watch([a.checked_homes[0].report], codex_readings=a)
             self.assertTrue(send.read_queue(send.queue_path("hana")))
-            b = self.readings(2, None)
+            chosen = self.readings(2, None)
+            b = quota_alert.CodexAlertPassReadings(chosen.seats, chosen.selected_account, ())
             def retire(command: list[str], **_options: object) -> subprocess.CompletedProcess[str]:
                 _ = send.retire(command[command.index("--to") + 1], "quota_alert", command[command.index("--key") + 1])
                 return subprocess.CompletedProcess(command, 0, "", "")
@@ -179,17 +188,18 @@ class AccountHoldTests(unittest.TestCase):
                 self.assertEqual(five_hour.watch([], codex_readings=b), [])
             self.assertEqual(send.read_queue(send.queue_path("hana")), [])
 
-    def test_unknown_selected_identity_preserves_outgoing_hold_and_sends_nothing(self) -> None:
+    def test_unknown_selected_identity_preserves_warning_records_and_sends_nothing(self) -> None:
         a = self.readings(1)
         _ = five_hour.watch([a.checked_homes[0].report], codex_readings=a)
-        before = {path.name: path.read_text() for path in (escalate.STATE / "held").glob("*.json")}
+        before = {path.name: path.read_text() for path in five_hour.STATE.glob("*.notice")}
         self.sent.clear()
         b = self.readings(2, None)
         unknown = quota_alert.CodexAlertPassReadings(b.seats,
             UnknownCodexAccount(b.seats.home, "unreadable login"), b.checked_homes)
         _ = five_hour.watch([], codex_readings=unknown)
         self.assertEqual(self.sent, [])
-        self.assertEqual({path.name: path.read_text() for path in (escalate.STATE / "held").glob("*.json")}, before)
+        self.assertTrue(before)
+        self.assertEqual({path.name: path.read_text() for path in five_hour.STATE.glob("*.notice")}, before)
 
     def test_spare_used_up_window_is_not_relayed_or_held(self) -> None:
         a = self.readings(1, 10)
