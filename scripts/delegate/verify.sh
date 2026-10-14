@@ -33,10 +33,10 @@
 # the whole workspace.
 #
 # The lint stages — mend, fmt, clippy, doc — are gated by config/lint.conf (edit
-# it with /lint_config), so one switch silences a check across /clippy, the fix
-# pipeline, and every delegate phase. `lint` also always runs taplo fmt --check
-# at the workspace root, using its taplo.toml. A phase runs all five; only the
-# branch-wide style review is left to the plan-final gate. A gated-off check
+# it with /lint_config), so one switch silences a check across the fix pipeline
+# and every delegate phase. `lint` also always runs taplo fmt --check at the
+# workspace root, using its taplo.toml. A phase runs all five; its unit director
+# runs the style review in the main review. A gated-off check
 # prints a SKIPPED line and the command still exits 0. Scope is never
 # configurable: the target pinning and the single package selection above are
 # correctness and cache constraints, not preferences. cargo check and cargo
@@ -109,8 +109,6 @@
 #                                          failed) on this tree, a flake hunt;
 #                                          the result replaces the record
 #   verify.sh test <package> --local "<why>"   run on natedev; only for a test that must run on Linux
-#   verify.sh fmt <package>               format only (checkpoint-commit backstop)
-#                                          — gated by config/lint.conf
 #   verify.sh example <package> <name>     clippy one example (only when the
 #                                          phase changed that example)
 #   verify.sh final                        full workspace gate; refuse examples
@@ -1456,10 +1454,6 @@ case "$CMD" in
             echo "verify.sh: no workspace member differs from HEAD; rustdoc skipped"
         fi
         ;;
-    fmt)
-        PKG="${1:?verify.sh fmt <package>}"
-        fmt_cargo -p "$PKG"
-        ;;
     example)
         PKG="${1:?verify.sh example <package> <name>}"
         NAME="${2:?verify.sh example <package> <name>}"
@@ -1478,7 +1472,6 @@ case "$CMD" in
         fi
         ;;
     final)
-        fmt_cargo --check
         run cargo check --workspace --all-targets
         run_nextest --workspace
         ;;

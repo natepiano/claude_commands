@@ -8,6 +8,7 @@ import json
 import os
 import signal
 import subprocess
+import sys
 import tempfile
 import threading
 import unittest
@@ -27,6 +28,7 @@ import record
 import settle
 import sessions
 import stop
+import relaunch
 
 LOGIN = "owner@example.com"
 LABEL = "claude 2"
@@ -995,6 +997,102 @@ class StopTests(ShutdownTestCase):
             )
         self.assertEqual(signals, [(101, signal.SIGTERM), (901, signal.SIGHUP)])
         self.assertEqual(finished["progress"]["kind"], "stopped")
+
+    def test_supervised_ghostty_restart_holds_window_before_claude_sigterm(self) -> None:
+        owner = top_level("supervised-owner", 101, host=inventory.WindowHost(
+            kind="ghostty", window_shell=901,
+            desktop=inventory.NamedDesktop(kind="named", name="Production"),
+            supervisor=inventory.SupervisorIdentity(kind="supervisor", pid=902, proc_start="supervisor-start")))
+        saved = entry(owner)
+        saved["then"] = "restart"
+        self.create([saved])
+        hold = self.root / "shutdown/relaunch/902.hold"
+        signals: list[tuple[int, int]] = []
+        def kill(pid: int, sent: int) -> None:
+            self.assertTrue(hold.is_file(), "supervisor could exit before the hold is written")
+            signals.append((pid, sent))
+        with (patch.object(inventory, "_process_start", return_value="supervisor-start"),
+              patch.object(stop, "_ghostty_still_owns_shell", return_value=True)):
+            finished = stop.stop_session(saved, kill=kill, is_alive=lambda pid: pid in {901, 902},
+                session_record_exists=lambda _pid: False,
+                fresh_inventory=lambda _login, _only: machine_inventory([owner]),
+                clock=lambda: NOW_UTC, codex_mesh=lambda _args: 0, tmux=lambda _args: 1,
+                sleep=lambda _seconds: None)
+        self.assertEqual(signals, [(101, signal.SIGTERM)])
+        self.assertEqual(finished["progress"]["kind"], "stopped")
+        self.assertTrue(hold.exists())
+
+    def test_mac_supervised_terminal_restart_writes_hold_before_claude_sigterm(self) -> None:
+        owner = top_level("mac-supervised-owner", 101, host=inventory.TerminalHost(
+            kind="terminal", supervisor=inventory.SupervisorIdentity(
+                kind="supervisor", pid=902, proc_start="supervisor-start")))
+        saved = entry(owner)
+        saved["then"] = "restart"
+        self.create([saved])
+        hold = self.root / "shutdown/relaunch/902.hold"
+        signals: list[tuple[int, int]] = []
+        def kill(pid: int, sent: int) -> None:
+            self.assertTrue(hold.is_file(), "hold must precede the Claude signal")
+            signals.append((pid, sent))
+        with (patch.object(sys, "platform", "darwin"),
+              patch.object(inventory, "_process_start", return_value="supervisor-start")):
+            finished = stop.stop_session(saved, kill=kill, is_alive=lambda pid: pid == 902,
+                session_record_exists=lambda _pid: False,
+                fresh_inventory=lambda _login, _only: machine_inventory([owner]),
+                clock=lambda: NOW_UTC, codex_mesh=lambda _args: 0, tmux=lambda _args: 1,
+                sleep=lambda _seconds: None)
+        self.assertEqual(signals, [(101, signal.SIGTERM)])
+        self.assertEqual(finished["progress"]["kind"], "stopped")
+        self.assertTrue(hold.exists())
+
+    def test_unwritable_supervisor_hold_fails_the_stop_without_signalling_claude(self) -> None:
+        owner = top_level("unwritable-hold-owner", 101, host=inventory.WindowHost(
+            kind="ghostty", window_shell=901,
+            desktop=inventory.NamedDesktop(kind="named", name="Production"),
+            supervisor=inventory.SupervisorIdentity(kind="supervisor", pid=902, proc_start="supervisor-start")))
+        saved = entry(owner)
+        saved["then"] = "restart"
+        self.create([saved])
+        signals: list[tuple[int, int]] = []
+        with (patch.object(inventory, "_process_start", return_value="supervisor-start"),
+              patch.object(relaunch, "write_hold", side_effect=PermissionError("state is read only"))):
+            finished = stop.stop_session(saved, kill=lambda pid, sent: signals.append((pid, sent)),
+                is_alive=lambda pid: pid in {101, 901, 902},
+                session_record_exists=lambda _pid: True,
+                fresh_inventory=lambda _login, _only: machine_inventory([owner]),
+                clock=lambda: NOW_UTC, codex_mesh=lambda _args: 0, tmux=lambda _args: 1,
+                sleep=lambda _seconds: None)
+        self.assertEqual(signals, [])
+        self.assertEqual(finished["progress"]["kind"], "stop failed")
+
+    def test_stop_only_or_unavailable_supervisor_closes_owned_ghostty_shell(self) -> None:
+        for then, actual_start, supervised in (("stop", "supervisor-start", True),
+                ("restart", "reused-pid", True), ("restart", "", False)):
+            with self.subTest(then=then, actual_start=actual_start, supervised=supervised):
+                owner = top_level(f"close-{then}-{supervised}", 101, host=inventory.WindowHost(
+                    kind="ghostty", window_shell=901,
+                    desktop=inventory.DesktopNotInSnapshot(kind="not in snapshot"),
+                    supervisor=inventory.SupervisorIdentity(kind="supervisor", pid=902,
+                        proc_start="supervisor-start")))
+                saved = entry(owner)
+                if not supervised:
+                    host = owner["host"]
+                    assert host["kind"] == "ghostty"
+                    _ = host.pop("supervisor", None)
+                saved["then"] = "restart" if then == "restart" else "stop"
+                self.create([saved])
+                signals: list[tuple[int, int]] = []
+                with (patch.object(inventory, "_process_start", return_value=actual_start),
+                      patch.object(stop, "_ghostty_still_owns_shell", return_value=True)):
+                    finished = stop.stop_session(saved,
+                        kill=lambda pid, sent: signals.append((pid, sent)),
+                        is_alive=lambda pid: pid in {901, 902}, session_record_exists=lambda _pid: False,
+                        fresh_inventory=lambda _login, _only: machine_inventory([owner]),
+                        clock=lambda: NOW_UTC, codex_mesh=lambda _args: 0, tmux=lambda _args: 1,
+                        sleep=lambda _seconds: None)
+                self.assertEqual(signals, [(101, signal.SIGTERM), (901, signal.SIGHUP)])
+                self.assertEqual(finished["progress"]["kind"], "stopped")
+                self.assertFalse((self.root / "shutdown/relaunch/902.hold").exists())
 
 
     def test_moved_ghostty_showrunner_closes_its_recorded_shell_when_stopped(self) -> None:

@@ -1076,7 +1076,8 @@ class SettleTests(ShutdownTestCase):
     def test_moved_ghostty_showrunner_records_its_existing_desktop_without_old_window_tracking(self) -> None:
         owner = showrunner("hana-id", "hana")
         owner["host"] = inventory.WindowHost(kind="ghostty", window_shell=123,
-            desktop=inventory.NamedDesktop(kind="named", name="Production"))
+            desktop=inventory.NamedDesktop(kind="named", name="Production"),
+            supervisor=inventory.NoSupervisor(kind="no supervisor"))
         with (
             patch.object(settle, "run_inventory", return_value=machine_inventory([owner])),
             patch.object(subprocess, "run", return_value=subprocess.CompletedProcess([], 1, "", "")) as windows_probe,

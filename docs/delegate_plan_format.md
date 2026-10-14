@@ -55,13 +55,9 @@ to rediscover after a context compaction lives in the doc.
   otherwise the project's exact build command>
 - **Test:** <for Rust always `bash ~/.claude/scripts/delegate/verify.sh test <pkg>`;
   otherwise the project's exact test command>
-- **Lint:** <for Rust always `bash ~/.claude/scripts/delegate/verify.sh lint <pkg>`.
-  Never raw cargo commands and never the full `clippy` skill here — phase
-  verification is deliberately scoped; workspace breadth and the `clippy`
-  skill run once in /unit:direct's <FinalGate/> after the last phase>
-- **Style:** <for Rust use `run-end /clippy style-only auto-proceed`;
-  /unit:direct omits it from coding prompts and runs it once at <FinalGate/>,
-  over the whole branch diff rather than one phase; omit for non-Rust>
+- **Lint:** <for Rust always `bash ~/.claude/scripts/delegate/verify.sh lint <pkg>`;
+  never raw cargo commands. <PhaseChecks/> defines scope and the phase's
+  style review in the unit director's main review; workers never load the guide>
 - **Invariants:** <project-wide rules every phase must preserve; omit if none>
 
 ## Phases

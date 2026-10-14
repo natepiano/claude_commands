@@ -30,21 +30,21 @@ whose first 1M release changes, is a row here.
 Which lint checks run, everywhere they run: `cache`, `mend`, `style_review`,
 `clippy`, `doc`, `fmt`, under an `[operations]` section. Values are `on` or
 `off`; a missing key or missing file means `on`. One key per check with no
-per-consumer override — `clippy=off` means cargo clippy does not run in the
-`/clippy` skill *or* in a `/unit:direct` phase.
+per-consumer override — `clippy=off` means cargo clippy does not run in a
+`/unit:direct` phase, the lint CLI, or the fix pipeline.
 
-Use `/lint_config` to view or change them. The two consumers read it on their
+Use `/lint_config` to view or change them. Consumers read it on their
 next run, so a change is immediate:
 
-- the `/clippy` skill, at the start of every run — including runs started by
-  `/commit_prep` or a `/unit:direct` work order
-- `scripts/delegate/verify.sh` — the `lint`, `fmt`, and `final` arms
+- `/unit:style_review` — the phase's main review or a run by hand
+- `scripts/lint/invoke.sh` — the lint CLI, fix pipeline, and
+  `scripts/delegate/verify.sh`'s `lint` and `fmt` arms
 
 Deliberately not gated: `verify.sh check`/`test`/`example`, the workspace check
 and test inside `verify.sh final`, `pre_release_checks.sh`, and
 `validate_ci.sh`. Those are correctness gates rather than lints, and a release
 check that silently no-ops is worse than a noisy one. Scope is never
-configurable either — `verify.sh` pins targets per package for correctness, so
+configurable either — <PhaseChecks/> and `verify.sh` define scope and targets, so
 config decides whether a check runs, never with what flags.
 
 `scripts/lint/lint_config.sh` is both the reader and the editor: source it and
@@ -64,32 +64,6 @@ Linux-only packages, and Mac nextest exclusions. A repository needs a
 the Mac. An empty `ci_repo` disables CI calls. `MAC_TEST_CONFIG` selects a
 different file for a checkout's scripts in tests. Installed scripts refuse to
 run with `MAC_TEST_CONFIG` set.
-
-## clippy.conf
-
-The `/clippy` delegation tuning file — *who* runs the checks, where `lint.conf`
-says *which* checks run. `SCAN_AGENT` puts the mend/clippy/doc stages in one
-subagent so a workspace-sized cargo log never enters the main conversation;
-`FANOUT` lets an approved fix batch split across parallel fixer agents.
-`MIN_FINDINGS` (12), `MIN_FILES` (4), `MAX_AGENTS` (4), and
-`FINDINGS_PER_AGENT` (8) decide whether a batch is large and splittable enough
-to be worth a wave and how wide it opens; `PROGRESS_INTERVAL_SECONDS` (120) is
-the gap between supervision reports while one runs.
-
-Fixers own whole files, never individual findings, so no two ever edit the same
-file — which is why `MIN_FILES` exists and why a batch concentrated in two files
-stays inline however many findings it holds. Everything past that partition is
-settled between the agents themselves over `SendMessage`, under
-`<PeerCoordinationContract/>` in `commands/clippy.md`.
-
-Hand-edited, like `delegate.conf`; `scripts/lint/clippy_config.sh` reads and
-validates it (`export`, `get <key>`, or no argument for a status listing) and
-carries no defaults. A missing file, an unset key, a non-numeric value, or a
-value below its minimum makes it print every problem it found and exit 2 —
-whereupon `/clippy` runs the whole pipeline inline and says why. The lint never
-depends on this file: inline is what the skill did before it existed.
-`/clippy no-agents` forces that path for one run, and `auto-proceed` takes it
-always, since a codex sub-session has no agent tool to launch anything with.
 
 ## delegate.conf
 

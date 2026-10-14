@@ -18,7 +18,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from importlib import import_module
 from dataclasses import dataclass, field, replace
-from datetime import datetime
+from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
 from typing import Literal, Protocol, TypedDict, cast
@@ -34,10 +34,12 @@ from account import (  # noqa: E402
     named_account_environment,
     named_claude_account,
     own_claude_account,
+    NAMED_ACCOUNT_VARIABLES,
 )
 import add_unit  # noqa: E402
 import herdr  # noqa: E402
 import conversation_pause  # noqa: E402
+import relaunch  # noqa: E402
 from inventory import (  # noqa: E402
     PaneNotRecorded,
     Session,
@@ -48,6 +50,7 @@ from inventory import (  # noqa: E402
     TmuxSessionId,
     TmuxSessionIdNotRecorded,
     WindowHost,
+    live_supervisor,
 )
 from record import (  # noqa: E402
     CLAIM_STALE_SECONDS,
@@ -545,15 +548,41 @@ def _resume_parts(session: Session, prompt: str, target: str = "") -> ResumePart
     return ResumeParts(session["cwd"], environment, tuple(argv), prompt, account)
 
 
-def _resume_shell(parts: ResumeParts) -> str:
+def _resume_shell(parts: ResumeParts, *, supervised: bool = False) -> str:
     argv = ["claude", *parts.claude_arguments, parts.opening_prompt]
     if isinstance(parts.account, MoveResumeAccount):
         argv = [sys.executable, str(SCRIPTS / "accounts" / "accounts.py"),
                 "exec", parts.account.target, *argv[1:]]
+    if supervised:
+        argv = [str(SCRIPTS / "lib" / "py"), str(SCRIPTS / "lib" / "relaunch.py"),
+                "run", "--", *argv]
     prefix = "".join(f"{key}={shlex.quote(value)} " for key, value in parts.environment.items())
     return (
         f"cd {shlex.quote(parts.cwd)} && {prefix}command "
         f"{shlex.join(argv)}; exec zsh"
+    )
+
+
+def _relaunch_request(parts: ResumeParts, note: str) -> relaunch.RelaunchRequest:
+    environment = dict(parts.environment)
+    unset = {"CLAUDE_CODE_OAUTH_TOKEN"}
+    if isinstance(parts.account, MoveResumeAccount):
+        from scripts.accounts import accounts
+
+        prepared = accounts.prepared_account(parts.account.target, resume=True)
+        if isinstance(prepared, accounts.AccountRefused):
+            raise accounts.AccountsError(prepared.reason)
+        environment.update(prepared.variables)
+        unset.update(prepared.remove)
+    elif parts.account.config_dir == Path.home() / ".claude":
+        unset.update(NAMED_ACCOUNT_VARIABLES)
+    return relaunch.RelaunchRequest(
+        argv=["claude", *parts.claude_arguments, parts.opening_prompt],
+        cwd=parts.cwd,
+        environment=environment,
+        unset=sorted(unset),
+        written_at=datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        note=note,
     )
 
 
@@ -1052,12 +1081,24 @@ def _launch_session(
                 session, f"{_showrunner_prompt(session)} {note}", record.get("target", "")))
         _herdr_launch(parts, session, dry_run=dry_run)
         return SessionLaunched()
-    command = _resume_shell(parts)
+    window_launch = host["kind"] in {"ghostty", "zed"} or (
+        host["kind"] == "terminal" and sys.platform == "darwin"
+    )
+    command = _resume_shell(parts, supervised=True) if window_launch else _resume_shell(parts)
     if host["kind"] == "unknown" or (host["kind"] == "terminal" and sys.platform == "linux"):
         return ManualRestartRequired(command)
     _record_scheduled_restart_prompt(
         session["session_id"], prompt, dry_run=dry_run
     )
+    if host["kind"] == "ghostty" or (host["kind"] == "terminal" and sys.platform == "darwin"):
+        supervisor = live_supervisor(host)
+        if supervisor["kind"] == "supervisor":
+            request = _relaunch_request(parts, note)
+            if dry_run:
+                print(f"restart in window via supervisor {supervisor['pid']}: {shlex.join(request['argv'])}")
+            else:
+                relaunch.write_request(supervisor["pid"], request)
+            return SessionLaunched()
     match host["kind"]:
         case "ghostty" | "zed":
             _window_launch(command, session, desktop_state, dry_run=dry_run)

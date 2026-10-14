@@ -68,19 +68,29 @@ Fence (showrunner): Phase 2 edits `commands/unit/direct.md` and `scripts/delegat
 
 **Gotchas:** the style review's diff directory is per invocation; a fixed shared path lets concurrent units scan each other's diffs.
 
-### Phase 2 — Unit directors run the step, and /clippy is gone  · status: todo (fenced)
+### Phase 2 — Unit directors run the step, and /clippy is gone  · status: done
 
 **Depends on:** Phase 1
 
-- `docs/delegate/dual_review.md`: the main review runs `<PhaseChecks/>`'s style review by reading `commands/unit/style_review.md` → `<StyleReview/>` with the phase baseline as its range and `${SESSION_DIR}` as its directory (it writes its diff there, never a shared path), opens each violation in the phase's findings ledger, and records its table. A phase with no Rust change runs only the banned-words scan.
-- `docs/delegate/write_prompt_contract.md` item 2: the `rust_style` line's reason ("this run's one style audit happens at the end") becomes the per-phase review: the unit director runs the style review in its main review, so seats still never load the guide.
-- `commands/unit/style_review.md`: remove `<ResolveStyleDiffBase/>`, `<RunProjectStyleReview/>` and its `clippy.md` read, and the intro's "`/unit:direct` reads this file twice" paragraph. `<StyleReview/>` already takes `since <ref>` and a caller directory, checks the baseline, and reports `Off` from `LINT_OP_STYLE_REVIEW`.
-- `commands/unit/direct.md`: name `<PhaseChecks/>` in the TagReferenceContract table and at the phase's review point. `<FinalGate/>` loses its `clippy.md` step and its `<RunProjectStyleReview/>` step, so `final` runs once with no cleanup rerun. Remove `<ResolveStyleDiffBase/>`, `STYLE_GATE_CONFIG`, `STYLE_REVIEW_DONE`, `STYLE_DIFF_BASE` and their handoff fields, the `/clippy` load rule (line 87) and the "full `clippy` skill" phase rule.
-- `scripts/delegate/verify.sh`: `final` drops fmt `--check`, which repeats the phases' fmt. It keeps `cargo check --workspace --all-targets` and the full tests, which no phase runs. Its comment naming `/clippy` is reworded.
-- Delete `commands/clippy.md` and `scripts/delegate/style_branch.sh`. Delete `scripts/lint/scan.sh`, `scripts/lint/clippy_config.sh` and `config/clippy.conf` only after confirming nothing else calls them — hooks, the nightly review, cargo-port's lint mirror, any script or settings entry; a file that has another caller stays. `scripts/delegate/progress_timer.sh` stays; the unit notifier uses it.
-- Reword every remaining reference: `commands/unit/checkpoint.md`, `commands/unit/ci.md`, `docs/delegate/compose_work_order.md`, `docs/delegate/final_gate_commit.md` (its report names "style review and closing repairs"), `docs/delegate_footprint_review.md`, `docs/delegate_plan_format.md` and `commands/plan/to_phased_plan.md` (the plan's **Style** field goes), `commands/commit_prep.md`, `commands/validate_and_push.md` (it states mend's rollback stop itself instead of pointing at `/clippy`), `commands/lint_config.md` and `scripts/lint/lint_config.sh` (consumer columns), `config/README.md` (the `clippy.conf` section goes), `scripts/lint/invoke.sh` and `scripts/hooks/banned_words_lib.py` (comments).
-- Gate: `scripts/lint` and `scripts/delegate` suites and basedpyright on the touched Python. Then `rg -n '/clippy\b|clippy\.md|style_branch|clippy_config|clippy\.conf|scan\.sh'` over this repository returns only as-built history, and the same search over `~/rust/*/CLAUDE.md`, `~/rust/*/docs`, `~/rust/nate_style` and `/etc/nixos` is reported to the showrunner hit by hit — those repositories are not this unit's to edit.
+#### As-built
 
-As-built at run end: `docs/as-built/session-notifier.md` (its `/clippy launches progress_timer.sh` line), `docs/as-built/build-memory-admission.md`, and the as-built that describes `/unit:direct`'s gates.
+- Each `/unit:direct` phase runs `<PhaseChecks/>` once: lint in the workers' last `verify.sh lint` (mend `--fix`, fmt, taplo, clippy, rustdoc), and the style review in the unit director's main review, where pass 1 runs `<StyleReview/>` with `since` the commit in `${SESSION_DIR}/phase_baseline` and `${SESSION_DIR}` as its directory. Each violation opens in the phase ledger (`findings.py open --caught-by main`).
+- PhaseChecks findings pass through the ledger's severity gate like any other finding. `/unit:checkpoint` requires a converged ledger and does not reformat.
+- `LINT_OP_STYLE_REVIEW=off` makes the phase style review report `Off`. Workers still never load the style guide (`write_prompt_contract.md` item 2).
+- Nothing at run end repeats the checks. `<FinalGate/>` runs `verify.sh final` once (`cargo check --workspace --all-targets` and the full tests, no fmt), with no style review and no cleanup rerun. `STYLE_GATE_CONFIG`, `STYLE_REVIEW_DONE`, `STYLE_DIFF_BASE`, `<ResolveStyleDiffBase/>` and `<RunProjectStyleReview/>` are gone.
+- `/clippy` and its files are gone, `verify.sh` has no `fmt` arm, and the plan format has no **Style** field.
 
-Out of scope, stated: editing other repositories (their hits are reported, above), and memories that mention `/clippy` (six memory files under `~/.claude/projects/`); this run fixes memories it owns only.
+**Files:**
+- `commands/unit/direct.md` — ExecutionSteps 1–10; `<PhaseChecks/>` in TagReferenceContract, VerificationContract and at the phase review point; the Synthesize inline path records verdicts
+- `docs/delegate/dual_review.md` — main review runs `<StyleReview/>` on pass 1
+- `docs/delegate/launch_implementation.md` — saves `${SESSION_DIR}/phase_baseline` at step 1
+- `commands/unit/style_review.md` — `<StyleReview/>` only, with no end-of-run sections
+- `commands/unit/checkpoint.md` — converged-ledger prerequisite
+- `docs/delegate/final_gate_commit.md` — commits synthetic repairs and review comment edits only
+- `scripts/delegate/verify.sh` — `final` without fmt; no `fmt` arm
+- `config/lint.conf`, `scripts/lint/lint_config.sh` — consumer names without `/clippy`
+- Removed: `commands/clippy.md`, `config/clippy.conf`, `scripts/lint/scan.sh`, `scripts/lint/clippy_config.sh`, `scripts/delegate/style_branch.sh`
+
+**Gotchas:** A phase with no Rust change runs only the banned-words scan as its style review. Repositories outside this one (`~/rust`, `/etc/nixos`) still name `/clippy` and are not edited from here.
+
+**Ruled out:** a checkpoint gate requiring every PhaseChecks finding resolved, which contradicts the ledger's severity gate and deadlocks against Synthesize.

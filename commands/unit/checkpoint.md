@@ -28,16 +28,14 @@ Everything below is the contract.
 <CheckpointCommit>
 Loop/verbose only:
 
-1. Require smoke pass, `not applicable`, or `deferred`. Style is not a phase
-   gate: <RunProjectStyleReview/> runs once at <FinalGate/>, over every
-   checkpoint this one joins.
+1. Require smoke pass, `not applicable`, or `deferred`, and a `converged`
+   phase findings ledger per <FindingsLedger/>. An off check reports `Off`.
 2. Confirm status contains only this phase, source-comment edits left by the
    previous phase's plan review, its plan doc, and an approved change to
    `${NEXT_ITEMS_PATH}` when present. The current phase may still have its Work
    Order. Refuse the checkpoint if any earlier `done` phase still has a Work
    Order; its shrink must be repaired first.
-3. Run `verify.sh fmt <package>` for every touched package; include resulting
-   formatting changes.
+3. Formatting is covered by <PhaseChecks/>; do not rerun it here.
 4. Mark the phase `status: done`. Never put its commit hash in the plan.
 5. Read and validate
    `${SESSION_DIR}/delegated_phase_reservation_state.json`; never use a value
