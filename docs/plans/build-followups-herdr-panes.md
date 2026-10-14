@@ -97,3 +97,29 @@ Design calls and evidence: `docs/plans/build-followups-herdr-adoption.md` (Calls
 - `read --ansi` dimmed-suggestion detection (`\e[2m` after `❯`) has not been seen live on herdr.
 
 **Ruled out:** parsing Darwin `ps eww` for `TMUX_PANE` (argv tokens read as environment); a second process-environment reader for accounts.
+
+### Phase 2 — The same number of lines from either host  · status: done
+
+**Depends on:** Phase 1
+
+**User sees:** before — `session_pane.py read --lines 20` returns the last 20 lines on a herdr host but the whole visible screen plus 20 lines of history on a tmux host; after — it returns the last 20 lines of output on both.
+
+#### Work Order
+
+**Goal:** `read_place(place, lines)` returns the last `lines` lines of output on both hosts.
+
+**Spec:**
+1. In `scripts/production/session_pane.py` `read_place`, keep the tmux capture as it is (`capture-pane -p [-J] [-e] -S -<lines> -t <pane>`), then trim its text in Python: drop the trailing empty rows tmux pads below the last written line, keep the last `lines` lines, and end with one newline when any line remains. With `ansi`, a row holding only escape sequences and whitespace counts as empty. The herdr branch is unchanged.
+2. The CLI `read` verb goes through `read_place`, so it changes with it; no other caller changes.
+3. Showrunner call, 2026-10-13: a wrong result in this unit's own tool, so it is fixed here.
+
+**Files:**
+- `scripts/production/session_pane.py` — `read_place`'s tmux branch and one private trim helper.
+- `scripts/production/test_session_pane.py` — one test per host. For tmux, the fake `capture-pane` returns more rows than asked for plus trailing empty rows, and `read --lines N` prints exactly the last N written lines. For herdr, `read --lines N` passes `--lines N` and prints herdr's text unchanged.
+- `scripts/production/fake_tmux.py` — only if the fake cannot yet return a multi-row capture.
+
+**Seats:** 1 writer + 1 tester: `impl` owns `session_pane.py`; `test` owns `test_session_pane.py` and `fake_tmux.py`.
+
+**Constraints from prior phases:** `read_place(place, lines=60, *, joined=False, ansi=False) -> str`; `TmuxFailure(OSError)`, `NoSuchTarget`; tmux calls go through `_tmux`; herdr reads call `Herdr.read(pane, lines, joined=, ansi=)`, which passes `pane read --source recent|recent-unwrapped --lines N [--format ansi]`. `stall_watch.py` and `unit_status.sh` read 400 joined lines and search the text, so a shorter tmux read only drops rows above the last 400.
+
+**Acceptance gate:** `python3 -m unittest discover -s scripts/production -p 'test_*.py'` and `-s scripts/shutdown` green; `basedpyright scripts/production/session_pane.py scripts/production/test_session_pane.py` prints `0 errors, 0 warnings`.

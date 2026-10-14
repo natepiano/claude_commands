@@ -40,6 +40,20 @@ def _tmux(*arguments: str) -> str:
     return result.stdout
 
 
+def _trim_tmux_output(text: str, lines: int, *, ansi: bool) -> str:
+    """Discard screen padding before retaining the requested written rows."""
+    rows = text.split("\n")
+    while rows:
+        last = rows[-1]
+        if ansi:
+            # CSI, OSC and other ESC sequences affect presentation, not row content.
+            last = re.sub(r"\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07\x1b]*(?:\x07|\x1b\\)|[ -/]*[@-~])", "", last)
+        if last.strip():
+            break
+        _ = rows.pop()
+    return "\n".join(rows[-lines:]) + "\n" if rows else ""
+
+
 def read_place(place: Place, lines: int = 60, *, joined: bool = False, ansi: bool = False) -> str:
     if lines <= 0:
         raise ValueError("lines must be positive")
@@ -50,7 +64,8 @@ def read_place(place: Place, lines: int = 60, *, joined: bool = False, ansi: boo
         options.append("-J")
     if ansi:
         options.append("-e")
-    return _tmux(*options, "-S", f"-{lines}", "-t", place.pane)
+    captured = _tmux(*options, "-S", f"-{lines}", "-t", place.pane)
+    return _trim_tmux_output(captured, lines, ansi=ansi)
 
 
 def type_place(place: Place, text: str) -> None:
