@@ -76,7 +76,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Literal, NamedTuple, NoReturn, NotRequired, TypedDict, cast
+from typing import TYPE_CHECKING, Literal, NamedTuple, NoReturn, NotRequired, TypedDict, cast
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "notify"))
@@ -84,7 +84,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
 import sessions  # noqa: E402
 import postmaster  # noqa: E402
 import codex_daemon  # noqa: E402
-import roster  # noqa: E402
+if TYPE_CHECKING:
+    import roster
 import review  # noqa: E402
 from user_zone import user_zone  # noqa: E402
 from user_action import (FIX, REFUSED_BEFORE_SENDING, ActionRefused, ActionRequired, ActionUnstated,
@@ -662,6 +663,8 @@ def _print_roster_problems(problems: list[str]) -> None:
 
 
 def _messageable_recipient(entry: roster.RosterEntry) -> SessionRecipient:
+    import roster
+
     if not isinstance(entry.reach, roster.Messageable):
         raise AssertionError("a messageable recipient needs an address")
     address = entry.reach.address
@@ -679,10 +682,14 @@ def _messageable_recipient(entry: roster.RosterEntry) -> SessionRecipient:
 
 
 def _cannot_receive_message(entry: roster.RosterEntry) -> NoReturn:
+    import roster
+
     usage_error(roster.cannot_receive_message_text(entry))
 
 
 def _ambiguous_name(name: str, entries: list[roster.RosterEntry]) -> NoReturn:
+    import roster
+
     lines = [f"{name} matches {len(entries)} sessions:"]
     for entry in entries:
         recipient = (
@@ -695,6 +702,8 @@ def _ambiguous_name(name: str, entries: list[roster.RosterEntry]) -> NoReturn:
 
 
 def _recipient_matches(to: str, entries: list[roster.RosterEntry]) -> list[roster.RosterEntry]:
+    import roster
+
     if to.startswith(("session:", "worker:", "codex:")):
         return [entry for entry in entries
                 if isinstance(entry.reach, roster.Messageable) and entry.reach.address == to]
@@ -702,6 +711,8 @@ def _recipient_matches(to: str, entries: list[roster.RosterEntry]) -> list[roste
 
 
 def _matched_recipient(to: str, matches: list[roster.RosterEntry]) -> SessionRecipient:
+    import roster
+
     if len(matches) > 1:
         _ambiguous_name(to, matches)
     entry = matches[0]
@@ -722,6 +733,9 @@ def resolve_recipient(
         thread_id = to.removeprefix("codex:")
         if not thread_id:
             usage_error("codex: needs a thread id")
+    # Acknowledgements, explicit sockets and named-machine sends need no local roster.
+    import roster
+
     result = roster.roster(os.environ, roster.ThisMachine())
     _print_roster_problems(result.problems)
     matches = _recipient_matches(to, result.entries)

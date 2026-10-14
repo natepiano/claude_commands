@@ -358,6 +358,26 @@ class SendTests(ShutdownTestCase):
             self.assertEqual((entry["from"], entry["to"], entry["outcome"], entry["text"]),
                              ("test", "bogus", outcome, text))
 
+    def test_ack_cli_persists_acknowledgement_without_loading_session_discovery(self) -> None:
+        program = r'''import importlib.abc, runpy, sys
+class NoDiscovery(importlib.abc.MetaPathFinder):
+    def find_spec(self, fullname, path=None, target=None):
+        if fullname == "roster":
+            raise AssertionError("ack must not start session discovery")
+sys.meta_path.insert(0, NoDiscovery())
+sys.argv.pop(0)
+runpy.run_path(sys.argv[0], run_name="__main__")
+'''
+        state = self.root / "cli-state"
+        result = subprocess.run([sys.executable, "-c", program, str(Path(send.__file__)), "ack", "notice"],
+                                env={**os.environ, "XDG_STATE_HOME": str(state)},
+                                capture_output=True, text=True, check=False, timeout=300)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("notice", result.stdout)
+        with mock.patch.object(send, "STATE", state / "message"):
+            with send.key_states() as saved:
+                self.assertIn("acknowledged", saved["notice"])
+
     def test_ack_skips_until_reopen(self) -> None:
         _ = send.acknowledge("k")
         self.assertIn("already acknowledged", send.acknowledge("k"))

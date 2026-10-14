@@ -2893,6 +2893,48 @@ class MeshCommandTests(unittest.TestCase):
         self.assertTrue(any(request.get("method") == "thread/resume" for request in new.requests))
         self.assertEqual([entry for entry in moves.read_moves() if entry["kind"] == "confirmed"], [])
 
+    def assert_legacy_default_move_confirmed(self, *, default_destination: bool) -> None:
+        numbered, new = self.prepare_workers_move()
+        default = numbered.parent / ".codex"
+        default.mkdir()
+        login = "home@example.invalid"
+        claims = base64.urlsafe_b64encode(json.dumps({"email": login}).encode()).decode().rstrip("=")
+        _ = (default / "auth.json").write_text(json.dumps({"tokens": {"id_token": f"header.{claims}.signature"}}))
+        _ = (numbered.parent / "codex 2.md").write_text(f"---\nlogin: {login}\n---\n")
+        source, destination = (numbered, default) if default_destination else (default, numbered)
+        source_label, destination_label = ("codex 1", "default") if default_destination else ("default", "codex 1")
+        _ = (self.session_dir / codex_mesh.SERVER_FILE).write_text(json.dumps({
+            "port": self.server.port, "pid": os.getpid(), "codex_home": str(source),
+        }))
+        self.request_workers_move(source_label, destination_label, "legacy-default-move")
+        self.assertEqual(accounts.main(["set-role", "seats", destination_label]), 0)
+        self.write_pool_roster({"worker": {"thread_id": THREAD_ID, "status": "done"}})
+        client = codex_mesh.Client(self.server.port, "worker")
+        try:
+            result = codex_mesh._move_resident(self.start_args(), str(self.session_dir), "worker", THREAD_ID, client)  # pyright: ignore[reportPrivateUsage]
+            self.assertIsInstance(result, codex_mesh.MovedWorker)
+            assert isinstance(result, codex_mesh.MovedWorker)
+            result.client.close()
+        finally:
+            client.close()
+        self.assertTrue(any(request.get("method") == "thread/resume" for request in new.requests))
+        entries = moves.read_moves()
+        confirmed = [entry for entry in entries if entry["kind"] == "confirmed"]
+        self.assertEqual(len(confirmed), 1)
+        self.assertEqual(confirmed[0]["move_id"], "legacy-default-move")
+        assert "home" in confirmed[0]
+        self.assertEqual(confirmed[0]["home"], str(destination))
+        requested = [entry for entry in entries if entry["kind"] == "requested"]
+        self.assertEqual((requested[0]["from"], requested[0]["to"]), (source_label, destination_label))
+
+    def test_resumed_worker_confirms_a_legacy_default_source_under_its_numbered_label(self) -> None:
+        """F004: a pending default-source request survives numbered account display."""
+        self.assert_legacy_default_move_confirmed(default_destination=False)
+
+    def test_resumed_worker_confirms_a_legacy_default_destination_under_its_numbered_label(self) -> None:
+        """F004: a default destination is matched and confirmed without rewriting history."""
+        self.assert_legacy_default_move_confirmed(default_destination=True)
+
     def test_worker_resume_failure_records_the_current_move_request_and_reason(self) -> None:
         _target, new = self.prepare_workers_move()
         self.request_workers_move("default", "codex 1", "resume-failure-move")
