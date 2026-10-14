@@ -80,11 +80,13 @@ from typing import Literal, NamedTuple, NoReturn, NotRequired, TypedDict, cast
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "notify"))
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
 import sessions  # noqa: E402
 import postmaster  # noqa: E402
 import codex_daemon  # noqa: E402
 import roster  # noqa: E402
 import review  # noqa: E402
+from user_zone import user_zone  # noqa: E402
 from user_action import (FIX, REFUSED_BEFORE_SENDING, ActionRefused, ActionRequired, ActionUnstated,
                          UserAction, NoActionRequired, first_line, parse_user_action)  # noqa: E402
 
@@ -1001,7 +1003,7 @@ def template_fix_notice(record: dict[str, object]) -> None:
     try:
         directory.mkdir(parents=True, exist_ok=True)
         text_key = hashlib.sha256(text_id.encode()).hexdigest()
-        key = now().astimezone().date().isoformat() + "-" + text_key
+        key = now().astimezone(user_zone()).date().isoformat() + "-" + text_key
         stamp = directory / key
         with (directory / (text_key + ".lock")).open("a") as lock:
             try:
