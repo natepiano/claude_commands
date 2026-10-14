@@ -669,6 +669,59 @@ class OffloadCommandTests(unittest.TestCase):
             timeout=timeout,
         )
 
+    def command_with_cleanup_clock(self, *, separate_stderr: bool = False) -> subprocess.CompletedProcess[str]:
+        # Keep elapsed_seconds real; advance its underlying clock at work boundaries.
+        program = r'''
+import subprocess
+import sys
+sys.path.insert(0, sys.argv.pop(1))
+import offload
+
+clock = [100.0]
+offload.time.monotonic = lambda: clock[0]
+real_capture = offload.ProcessController.capture
+real_stream = offload.ProcessController.stream_mac_run
+real_run = subprocess.run
+
+def capture(self, arguments, *args, **kwargs):
+    answer = real_capture(self, arguments, *args, **kwargs)
+    if arguments[0] == "ssh":
+        clock[0] = 101.0
+    elif arguments[0] == "rsync":
+        clock[0] = 102.0
+    return answer
+
+def stream(self, arguments):
+    answer = real_stream(self, arguments)
+    clock[0] = 103.0
+    return answer
+
+def run(arguments, **kwargs):
+    if arguments[0] != "ssh" or "select_leftovers()" not in arguments[-1]:
+        return real_run(arguments, **kwargs)
+    clock[0] = 105.0
+    try:
+        answer = real_run(arguments, **kwargs)
+    except subprocess.TimeoutExpired:
+        clock[0] = 113.0
+        raise
+    clock[0] = 108.0
+    return answer
+
+offload.ProcessController.capture = capture
+offload.ProcessController.stream_mac_run = stream
+subprocess.run = run
+raise SystemExit(offload.main())
+'''
+        return subprocess.run(
+            [sys.executable, "-c", program, str(SCRIPT.parent), "run",
+             "--repo-root", str(self.repository), "--package", "hana",
+             "--call-id", "call-17", "--result", str(self.result_path), "--"],
+            cwd=self.root, env=self.environment, stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE if separate_stderr else subprocess.STDOUT,
+            text=True, check=False, timeout=30,
+        )
+
     def start_command(
         self,
         *nextest_arguments: str,
@@ -1676,12 +1729,8 @@ class OffloadCommandTests(unittest.TestCase):
             {"stream": "stdout", "text": "partial output"}
         ]
         self.fixture["run_status_reported"] = False
-        cleanup_seconds = 1.0
-        self.fixture["cleanup_delay_s"] = cleanup_seconds
         self.sync_fixture()
-        command_started = time.monotonic()
-        result = self.command()
-        command_seconds = time.monotonic() - command_started
+        result = self.command_with_cleanup_clock()
         self.assertEqual(result.returncode, 75, result.stdout)
         self.assertIn("partial output\n", result.stdout)
         self.assertIn(
@@ -1692,8 +1741,7 @@ class OffloadCommandTests(unittest.TestCase):
         self.assertEqual(wire["mac"], "lost")
         self.assertEqual(wire["reason"], "")
         recorded_seconds = float(wire["seconds"])
-        self.assertGreaterEqual(recorded_seconds, cleanup_seconds)
-        self.assertLess(command_seconds - recorded_seconds, cleanup_seconds)
+        self.assertEqual(recorded_seconds, 8.0)
         self.assertFalse((self.state_directory / "run.json").exists())
         cleanup_events = [
             event
@@ -1711,7 +1759,7 @@ class OffloadCommandTests(unittest.TestCase):
             with self.subTest(outcome=outcome):
                 self.reset_leftover_case()
                 self.set_leftover_answer(outcome)
-                result = self.command(separate_stderr=True, timeout=20)
+                result = self.command_with_cleanup_clock(separate_stderr=True)
                 self.assertEqual(result.returncode, 75, result.stdout + result.stderr)
                 self.assert_wire("lost", "")
                 self.assertIn("mac_test: the link to the Mac dropped; running on natedev instead\n", result.stdout)
@@ -1719,8 +1767,7 @@ class OffloadCommandTests(unittest.TestCase):
                 self.assert_claim_is_kept()
                 self.assertEqual(len(self.leftover_events()), 1)
                 self.assert_leftover_selectors(self.leftover_events()[0]["args"][-1])
-                if outcome == "timeout":
-                    self.assertGreaterEqual(float(self.wire_result()["seconds"]), 10)
+                self.assertEqual(float(self.wire_result()["seconds"]), 13.0 if outcome == "timeout" else 8.0)
 
     def test_signal_keeps_claim_when_leftover_check_does_not_prove_completion(self) -> None:
         self.fixture["run_delay_s"] = 30

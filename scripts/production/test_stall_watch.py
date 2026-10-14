@@ -9,7 +9,6 @@ import socket
 import subprocess
 import sys
 import tempfile
-import time
 import unittest
 from unittest import mock
 from datetime import datetime
@@ -131,7 +130,12 @@ line = (json.dumps(record) + '\\n').encode()
 fd = os.open(os.environ['STALL_TEST_SEND_LOG'], os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
 os.write(fd, line)
 os.close(fd)
-time.sleep(float(os.environ.get('STALL_TEST_SEND_DELAY', '0')))
+expected = int(os.environ.get('STALL_TEST_SEND_TOGETHER', '0'))
+deadline = time.monotonic() + 30
+while expected and len(open(os.environ['STALL_TEST_SEND_LOG']).readlines()) < expected:
+    if time.monotonic() >= deadline:
+        raise SystemExit('send barrier did not receive every concurrent delivery')
+    time.sleep(0.01)
 fail = json.load(open(os.environ['STALL_TEST_FAIL_FILE']))
 raise SystemExit(1 if record['to'] in fail else 0)
 """)
@@ -244,7 +248,7 @@ raise SystemExit(1 if record['to'] in fail else 0)
         os.utime(transcript, (START - 3600, START - 3600))
         return child.pid, socket_path
 
-    def tick(self, at: int, *, delay: int = 0) -> subprocess.CompletedProcess[str]:
+    def tick(self, at: int, *, together: int = 0) -> subprocess.CompletedProcess[str]:
         _ = self.ps_file.write_text("\n".join(self.process_rows) + "\n")
         _ = self.tmux_file.write_text(json.dumps({
             name: dict(pane) for name, pane in self.panes.items()}))
@@ -263,7 +267,7 @@ raise SystemExit(1 if record['to'] in fail else 0)
             _ = (runs / f"{name}.jsonl").write_text("".join(json.dumps(event) + "\n" for event in events))
         return subprocess.run(
             [sys.executable, str(SCRIPT)],
-            env={**self.environment, "STALL_WATCH_NOW_EPOCH": str(at), "STALL_TEST_SEND_DELAY": str(delay)},
+            env={**self.environment, "STALL_WATCH_NOW_EPOCH": str(at), "STALL_TEST_SEND_TOGETHER": str(together)},
             capture_output=True, text=True, check=False,
         )
 
@@ -728,12 +732,10 @@ raise SystemExit(1 if record['to'] in fail else 0)
         _ = self.unit("unit-three")
         self.configure({"showrunner": ["unit-one", "unit-two", "unit-three"]})
         _ = self.tick(START)
-        started = time.monotonic()
-        result = self.tick(START + 300, delay=20)
-        elapsed = time.monotonic() - started
+        result = self.tick(START + 300, together=6)
         self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stderr, "", "every sender must complete the concurrency barrier")
         self.assertEqual(len(self.sent()), 6)
-        self.assertLess(elapsed, 35)
 
 
 if __name__ == "__main__":
