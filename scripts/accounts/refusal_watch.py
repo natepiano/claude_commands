@@ -365,7 +365,7 @@ def _run(now: datetime, dry_run: bool) -> list[str]:
                 if isinstance(value, refusals.ReadingWindow):
                     reset = value.reset
             account_refusal = refusals.AccountRefusal("claude", identity.login, window, reset, refusal.refused_at.at)
-            # Older watch files already recorded the entry, before observations were retained here.
+            # A watch entry without its first observation takes the stored refusal written at that time.
             if previous and previous["entry_id"] == refusal.entry_id:
                 saved = refusals.load().get(refusals.key("claude", identity.login))
                 if saved is not None and saved.at == refusal.refused_at.at:
