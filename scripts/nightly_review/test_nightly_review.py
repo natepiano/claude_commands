@@ -22,6 +22,7 @@ import launch_permission
 import agent_notes
 import note_file
 from scripts.accounts import accounts
+from scripts.herdr import herdr
 import usage_store
 from scripts.production import showrunners
 if TYPE_CHECKING:
@@ -78,7 +79,8 @@ class NightlyReviewTests(unittest.TestCase):
         home.mkdir()
         (home / ".claude").mkdir()
         _ = (home / ".claude.json").write_text(
-            json.dumps({"oauthAccount": {"emailAddress": "owner@example.com"}}),
+            json.dumps({"oauthAccount": {"emailAddress": "owner@example.com"},
+                        "projects": {str(home / "rust"): {"hasTrustDialogAccepted": True}}}),
             encoding="utf-8",
         )
         notes = self.root / "notes"
@@ -106,6 +108,7 @@ class NightlyReviewTests(unittest.TestCase):
         )
         del environment_context
         _ = os.environ.pop("CLAUDE_CONFIG_DIR", None)
+        _ = self.enterContext(mock.patch.object(herdr, "run_program", return_value=done(code=1)))
         self.quota_reading("owner@example.com", 80, 7)
         for name, value in (("ROOT", self.root), ("tmux", self.tmux)):
             patcher = mock.patch.object(nightly_review, name, value)
@@ -166,7 +169,9 @@ class NightlyReviewTests(unittest.TestCase):
         directory = self.unit_role(label)
         self.assertEqual(accounts.setup(label), [])
         _ = (directory / ".claude.json").write_text(
-            json.dumps({"oauthAccount": {"emailAddress": UNIT_LOGIN}}), encoding="utf-8",
+            json.dumps({"oauthAccount": {"emailAddress": UNIT_LOGIN},
+                        "projects": {str(Path.home() / "rust"): {"hasTrustDialogAccepted": True}}}),
+            encoding="utf-8",
         )
         _ = (self.notes / f"{label}.md").write_text(
             f"---\nlogin: {UNIT_LOGIN}\nstate: active\n---\n", encoding="utf-8",
@@ -192,6 +197,79 @@ class NightlyReviewTests(unittest.TestCase):
     def test_timer_runs_messages_after_rust(self) -> None:
         self.assertEqual(nightly_review.MODES, ("config", "rust", "messages"))
         self.assertEqual(nightly_review.PROMPT, "/nightly_review config rust messages")
+
+    def test_untrusted_default_folder_refuses_before_retiring_or_spawning(self) -> None:
+        _ = (Path.home() / ".claude.json").write_text(json.dumps({
+            "oauthAccount": {"emailAddress": "owner@example.com"},
+            "projects": {str(Path.home()): {"hasTrustDialogAccepted": True}}}))
+        self.live = {SESSION, *nightly_review.LEGACY_SESSIONS}
+        folder = Path.home() / "rust"
+        self.assertEqual(self.launched([]), [
+            f"{SESSION}: Claude is not trusted in {folder} on default account. "
+            + f"Run: cd {shlex.quote(str(folder))} && "
+            + "env -u CLAUDE_CONFIG_DIR -u CLAUDE_CODE_REMOTE_MEMORY_DIR claude",
+        ])
+        self.assertEqual(self.calls, [])
+        self.assertEqual(self.live, {SESSION, *nightly_review.LEGACY_SESSIONS})
+
+    def test_trust_reads_the_named_launch_account(self) -> None:
+        directory = self.unit_account("claude 3")
+        _ = (directory / ".claude.json").write_text(json.dumps({
+            "oauthAccount": {"emailAddress": UNIT_LOGIN}, "projects": {}}))
+        lines = self.launched([])
+        self.assertEqual(len(lines), 1)
+        self.assertIn(f"{SESSION}: Claude is not trusted in {Path.home() / 'rust'} on claude 3. Run:", lines[0])
+        self.assertIn(f"CLAUDE_CONFIG_DIR={shlex.quote(str(directory))}", lines[0])
+        self.assertEqual(self.calls, [])
+
+    def test_picked_launch_checks_default_trust_despite_a_trusted_inherited_account(self) -> None:
+        directory = self.root / "inherited account"
+        directory.mkdir()
+        _ = (directory / ".claude.json").write_text(json.dumps({
+            "projects": {str(Path.home() / "rust"): {"hasTrustDialogAccepted": True}}}))
+        _ = (Path.home() / ".claude.json").write_text(json.dumps({
+            "oauthAccount": {"emailAddress": "owner@example.com"}, "projects": {}}))
+        self.live = {SESSION, *nightly_review.LEGACY_SESSIONS}
+        with mock.patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": str(directory)}):
+            lines = self.launched([])
+        folder = Path.home() / "rust"
+        self.assertEqual(lines, [
+            f"{SESSION}: Claude is not trusted in {folder} on default account. "
+            + f"Run: cd {shlex.quote(str(folder))} && "
+            + "env -u CLAUDE_CONFIG_DIR -u CLAUDE_CODE_REMOTE_MEMORY_DIR claude",
+        ])
+        self.assertEqual(self.calls, [])
+        self.assertEqual(self.live, {SESSION, *nightly_review.LEGACY_SESSIONS})
+
+    def test_picked_launch_ignores_untrusted_inherited_account_and_preserves_checked_environment(self) -> None:
+        directory = self.root / "inherited account"
+        directory.mkdir()
+        _ = (directory / ".claude.json").write_text(json.dumps({"projects": {}}))
+        with (
+            mock.patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": str(directory)}),
+            mock.patch("note_file.read_notes", return_value=[]),
+            mock.patch.object(nightly_review, "launch_permission",
+                              return_value=launch_permission.AllowedByShutdownState()) as permission,
+            mock.patch("subprocess.run", return_value=done()) as spawn,
+        ):
+            self.assertEqual(nightly_review.launch(NIGHT), STARTED)
+        spawn.assert_called_once()
+        environment = cast(dict[str, str], spawn.call_args.kwargs["env"])
+        self.assertEqual(environment, permission.call_args.args[0])
+        self.assertNotIn("CLAUDE_CONFIG_DIR", environment)
+        command = cast(list[str], spawn.call_args.args[0])[-1]
+        self.assertEqual(command, "unset CLAUDE_CONFIG_DIR CLAUDE_CODE_REMOTE_MEMORY_DIR CLAUDE_CODE_OAUTH_TOKEN; "
+                         + f"ENABLE_TOOL_SEARCH=true command {self.review_command()}; exec zsh")
+
+    def test_unreadable_trust_file_refuses_without_contents(self) -> None:
+        selected = accounts.role_account("unit")
+        config = Path.home() / ".claude.json"
+        _ = config.write_text('{"oauthAccount": "SECRET-EMAIL", ')
+        with mock.patch.object(accounts, "role_account", return_value=selected):
+            lines = self.launched([])
+        self.assertEqual(lines, [f"{SESSION}: cannot read {config} to check Claude trust (JSONDecodeError)"])
+        self.assertNotIn("SECRET", lines[0])
+        self.assertEqual(self.calls, [])
 
     def test_copied_nightly_library_import_needs_no_message_review_or_production_modules(self) -> None:
         copied = self.root / "copy/scripts/nightly_review/nightly_review.py"
@@ -454,6 +532,19 @@ class NightlyReviewTests(unittest.TestCase):
             self.assertEqual(self.launched(self.account_notes("1", "0")), STARTED)
         self.assertNotIn(str(named), self.calls[-1][-1])
 
+    def test_nightly_gate_uses_the_supplied_identities_for_the_whole_launch(self) -> None:
+        """Nightly does not independently resolve a login after the snapshot."""
+        (Path.home() / ".claude3").mkdir()
+        selection = accounts.claude_account_selection()
+        _ = (Path.home() / ".claude.json").write_text(json.dumps({
+            "oauthAccount": {"emailAddress": UNIT_LOGIN},
+            "projects": {str(Path.home() / "rust"): {"hasTrustDialogAccepted": True}},
+        }), encoding="utf-8")
+        notes = self.account_notes(default_left="80", unit_left="2")
+        with mock.patch.object(accounts, "claude_account_selection", return_value=selection) as resolve:
+            self.assertEqual(self.launched(notes), STARTED)
+        resolve.assert_called_once_with()
+
     def test_nightly_ignores_legacy_unit_assignment_for_an_unread_account(self) -> None:
         _ = self.unit_role("claude 3")
         self.assertEqual(self.launched(self.account_notes("80", "0")), STARTED)
@@ -513,6 +604,7 @@ class NightlyReviewTests(unittest.TestCase):
         guard = cast(dict[str, str], permission.call_args.args[0])
         self.assertFalse(any(key.startswith("CLAUDE_") for key in guard))
         spawn.assert_called_once()
+        self.assertEqual(spawn.call_args.kwargs["env"], guard)
         argv = cast(list[str], spawn.call_args.args[0])
         self.assertIn("unset CLAUDE_CONFIG_DIR", argv[-1])
         self.assertIn(f"ENABLE_TOOL_SEARCH=true command {self.review_command()}; exec zsh", argv[-1])
@@ -561,7 +653,7 @@ class NightlyReviewTests(unittest.TestCase):
     def test_the_start_runs_while_the_launch_barrier_is_held(self) -> None:
         starts: list[str] = []
 
-        def start(_selection: object, prefix: str) -> list[str]:
+        def start(_selection: object, prefix: str, _environment: dict[str, str]) -> list[str]:
             lock_path = self.state / "launch.lock"
             with lock_path.open("a+", encoding="utf-8") as contender:
                 with self.assertRaises(BlockingIOError):
@@ -592,42 +684,28 @@ class NightlyReviewTests(unittest.TestCase):
         self.assertEqual(self.launched(notes), STARTED)
 
     def test_a_session_the_review_name_prefixes_is_never_taken_for_it(self) -> None:
-        binary = shutil.which("tmux")
-        if binary is None:
-            self.skipTest("tmux is required to check its session matching")
-        server_dir = self.root / "tmux"
-        server_dir.mkdir()
-        self.enterContext(mock.patch.dict(os.environ, {"TMUX_TMPDIR": str(server_dir)}))
-        _ = os.environ.pop("TMUX", None)
-        self.addCleanup(subprocess.run, [binary, "kill-server"], capture_output=True, check=False)
-        real_run = subprocess.run
         selection = accounts.claude_account_selection()
-
-        def review(name: str) -> None:
-            _ = real_run([binary, "-f", "/dev/null", "new-session", "-d", "-s", name,
-                          ": /nightly_review config rust; exec sleep 60"], check=True)
-
-        def live(name: str) -> bool:
-            return real_run([binary, "has-session", "-t", f"={name}"], capture_output=True,
-                            check=False).returncode == 0
+        targets = {f"={name}{suffix}" for name in (SESSION, *nightly_review.LEGACY_SESSIONS)
+                   for suffix in ("", ":")}
 
         def run(command: list[str], **_: object) -> subprocess.CompletedProcess[str]:
             if command[0] == "tmux":
-                return real_run(command, capture_output=True, text=True, check=False)
+                self.assertIn(command[-1], targets)
+                return self.tmux(*command[1:])
             self.calls.append(command)
             return done()
 
         def start() -> list[str]:
             with mock.patch.object(nightly_review, "tmux", REAL_TMUX), mock.patch("subprocess.run", run):
-                return nightly_review.start(selection, "")
+                return nightly_review.start(selection, "", nightly_review.launch_environment(selection))
 
-        review(f"{SESSION}-kept")
+        self.live = {f"{SESSION}-kept"}
         self.assertEqual(start(), STARTED)
-        self.assertTrue(live(f"{SESSION}-kept"))
-        review(SESSION)
+        self.assertIn(f"{SESSION}-kept", self.live)
+        self.live.add(SESSION)
         self.assertEqual(start(), STARTED)
-        self.assertFalse(live(SESSION))
-        self.assertTrue(live(f"{SESSION}-kept"))
+        self.assertNotIn(SESSION, self.live)
+        self.assertIn(f"{SESSION}-kept", self.live)
         self.assertEqual(len(self.calls), 2)
 
 if __name__ == "__main__":

@@ -17,7 +17,6 @@ and no showrunner appeared in WAIT_S seconds (the session is left running); 2 on
 from __future__ import annotations
 
 import argparse
-import json
 import os
 import re
 import shlex
@@ -60,48 +59,15 @@ def claude_json(config_dir: Path | DefaultClaudeConfiguration = _DEFAULT_CONFIGU
     return Path(os.environ.get("ADD_SHOWRUNNER_CLAUDE_JSON") or (config_dir / ".claude.json" if isinstance(config_dir, Path) and config_dir != Path.home() / ".claude" else Path.home() / ".claude.json"))
 
 
-def _project_keys(folder: Path) -> set[str]:
-    """The paths Claude may keep the folder's trust under: the folder, its repository root, and for a
-    worktree its main checkout, whose trust it shares."""
-    keys = {str(folder)}
-    for flag in ("--show-toplevel", "--git-common-dir"):
-        found = subprocess.run(["git", "-C", str(folder), "rev-parse", "--path-format=absolute", flag],
-                               capture_output=True, text=True, check=False)
-        if found.returncode == 0 and found.stdout.strip():
-            path = Path(found.stdout.strip())
-            keys.add(str(path.parent if flag == "--git-common-dir" and path.name == ".git" else path))
-    return keys
-
-
-def trusted(folder: Path, config_dir: Path | DefaultClaudeConfiguration = _DEFAULT_CONFIGURATION) -> bool:
-    """Whether Claude's folder-trust prompt was accepted for `folder` on the showrunner account.
-
-    Only `projects[<path>].hasTrustDialogAccepted` is read: the file also holds account details, and
-    no message ever carries any of it. A trusted parent folder does not cover a repository below it
-    (G1 live check, 2026-10-13: the child sat on the prompt). Raises Refusal when the file cannot be read.
-    """
-    path = claude_json(config_dir)
-    try:
-        config = cast(object, json.loads(path.read_text(encoding="utf-8")))
-    except (OSError, UnicodeError, ValueError) as error:
-        raise Refusal(f"cannot read {path} to see whether {folder} is trusted ({type(error).__name__})") from error
-    projects = cast(dict[str, object], config).get("projects") if isinstance(config, dict) else None
-    if not isinstance(projects, dict):
-        return False
-    entries = cast(dict[str, object], projects)
-    for key in _project_keys(folder.resolve()):
-        entry = entries.get(key)
-        if isinstance(entry, dict) and cast(dict[str, object], entry).get("hasTrustDialogAccepted") is True:
-            return True
-    return False
-
-
 def checked(child: Production, caller: str, ending: str = "", start_in: Path | None = None, *, config_dir: Path | DefaultClaudeConfiguration = _DEFAULT_CONFIGURATION) -> str:
     """The tmux to start `child`'s showrunner with. Raises Refusal naming what is in the way.
 
     `ending` names a tmux session the caller ends before the start, so it is not in the way.
     `start_in` is the folder the session starts in, the child's checkout unless given.
     """
+    from scripts.accounts.accounts import DefaultAccount, NamedAccount, account_dir, main_config_dir
+    from scripts.herdr.herdr import Untrusted, UnreadableTrustFile, claude_trust, trust_command
+
     if not caller:
         raise Refusal(f"this session runs no production, so it has nothing to attach {child.slug} to")
     if child.slug == caller:
@@ -121,9 +87,21 @@ def checked(child: Production, caller: str, ending: str = "", start_in: Path | N
     if child.slug != ending and tmux_live(tmux, child.slug):
         raise Refusal(f"a tmux session named {child.slug} is already live")
     folder = start_in or child.checkout
-    if not trusted(folder, config_dir):
-        raise Refusal(f"Claude is not trusted in {folder} on the showrunner account. The user trusts it first, "
-                      + "by running `claude` there once and accepting: a showrunner never answers a trust prompt")
+    if isinstance(config_dir, Path) and config_dir != main_config_dir():
+        label = str(config_dir)
+        numbered = re.fullmatch(r"\.claude([0-9]+)", config_dir.name)
+        if numbered and config_dir == account_dir(f"claude {numbered.group(1)}"):
+            label = f"claude {numbered.group(1)}"
+        selected = NamedAccount(label, config_dir)
+    else:
+        selected = DefaultAccount()
+        label = "default account"
+    trust = claude_trust(folder, claude_json(config_dir))
+    if isinstance(trust, UnreadableTrustFile):
+        raise Refusal(f"{child.slug}: {trust}")
+    if isinstance(trust, Untrusted):
+        raise Refusal(f"{child.slug}: Claude is not trusted in {folder} on {label}. "
+                      + f"Run: {trust_command(folder, selected)}")
     return tmux
 
 

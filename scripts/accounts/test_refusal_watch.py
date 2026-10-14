@@ -120,7 +120,7 @@ class RefusalWatchTests(unittest.TestCase):
             run_dirs=[], codex_servers=[], timers=[], config_dir=str(accounts.account_dir(label)))
         if host == "unit":
             owner: inventory.Session = inventory.UnitSession(**fields, kind="unit", host=inventory.UnitHost(
-                kind="unit", production="fixture", unit=identity, doc="/fixture.md", tmux_session=identity,
+                kind="unit", production="fixture", unit=identity, doc="/fixture.md", session_name=identity, session_host="tmux",
                 plan=inventory.NoRunRecord(kind="no run record")))
         elif host == "tmux":
             owner = inventory.ShowrunnerSession(**fields, kind="showrunner", production="fixture", doc="/fixture.md",

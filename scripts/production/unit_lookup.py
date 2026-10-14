@@ -1,12 +1,10 @@
 #!/usr/bin/env python3
-"""Find units by the marks on their tmux sessions: one production's, or every production's at once.
+"""Find production units by marks on tmux sessions and herdr panes.
 
-A unit's tmux session carries two marks in its environment: the production slug and the unit id.
-Nothing else records which session is which unit. A unit's current name, pane and socket are read
-here, from tmux and the live session records, each time they are needed, so a rename or a relaunch
-leaves nothing to bring in step. Its run state is stored nowhere either: it is read from the
-records /unit:direct keeps of its runs. `every_marked_unit` is the one enumeration of units on this
-machine; a caller that wants every unit director, whatever its production, reads it once.
+Both hosts carry SHOWRUNNER_UNIT and SHOWRUNNER_UNIT_ID. Current names,
+places and messaging sockets are read from the hosts and live session records.
+Run state comes from /unit:direct records. `every_marked_unit` reads both hosts
+once for every production, rejecting duplicate marks rather than choosing one.
 """
 from __future__ import annotations
 
@@ -16,12 +14,16 @@ import shutil
 import subprocess
 import sys
 from collections.abc import Iterable
+from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
 from typing import NamedTuple, cast
 
 MESSAGE = Path(__file__).resolve().parent.parent / "message"
 sys.path.insert(0, str(MESSAGE))
+sys.path.insert(0, str(MESSAGE.parent / "herdr"))
+import herdr  # noqa: E402
+from herdr import HerdrPlace  # noqa: E402
 from sessions import UnreadableSessionRecord, live_session, read_session  # noqa: E402
 
 PRODUCTION_MARK = "SHOWRUNNER_UNIT"
@@ -56,14 +58,34 @@ class ClaudeUnknown(NamedTuple):
 Claude = LiveClaude | ClaudeNotRunning | ClaudeUnknown
 
 
-class MarkedUnit(NamedTuple):
-    unit: str
-    # The pane its live Claude runs in, else the first pane of the marked tmux session, as tmux
-    # addresses it ("%41").
+@dataclass(frozen=True)
+class TmuxPlace:
     pane: str
-    # The tmux session's label now. It is a display name: nothing finds a pane by it.
+
+
+Place = TmuxPlace | HerdrPlace
+
+
+@dataclass(frozen=True)
+class MarkedUnit:
+    unit: str
+    # Tmux pane id, empty for herdr; removed once every consumer reads place.
+    pane: str
+    # The tmux session label or herdr session name.
     label: str
     claude: Claude
+    place: Place = TmuxPlace("")
+
+    def __post_init__(self) -> None:
+        # Existing callers construct tmux units with four arguments.
+        if isinstance(self.place, TmuxPlace) and not self.place.pane:
+            object.__setattr__(self, "place", TmuxPlace(self.pane))
+
+
+def place_text(place: Place) -> str:
+    if isinstance(place, HerdrPlace):
+        return f"herdr:{place.session}:{place.pane}"
+    return place.pane
 
 
 class MarkedProductions(NamedTuple):
@@ -166,34 +188,41 @@ def _marks(session: str) -> dict[str, str]:
     return {name: value for name, value in pairs if name in (PRODUCTION_MARK, UNIT_MARK)}
 
 
-def _claudes() -> tuple[dict[str, LiveClaude], str]:
-    """The newest live Claude in each pane, and why the records were not all read (empty if they were)."""
+def _claudes() -> tuple[dict[str, LiveClaude], dict[HerdrPlace, LiveClaude], str]:
+    """Newest live Claude per tmux or herdr pane, and any unread records."""
     try:
         paths = sorted(path for path in sessions_dir().iterdir() if path.suffix == ".json")
     except OSError as error:
-        return {}, f"cannot list session records: {error}"
-    newest: dict[str, tuple[int, LiveClaude]] = {}
+        return {}, {}, f"cannot list session records: {error}"
+    newest: dict[Place, tuple[int, LiveClaude]] = {}
     unread = ""
     for path in paths:
         record = read_session(path)
         if isinstance(record, UnreadableSessionRecord):
             unread = "one or more session records could not be read"
             continue
-        pane = record["tmux"].rpartition(".")[2]
-        if not pane or not live_session(record):
+        if not live_session(record):
             continue
-        if pane not in newest or record["updatedAt"] > newest[pane][0]:
-            newest[pane] = (record["updatedAt"], LiveClaude(record["name"], record["sessionId"],
-                                                            record["messagingSocketPath"], record["pid"]))
-    return {pane: claude for pane, (_, claude) in newest.items()}, unread
+        if record["tmux"]:
+            pane = record["tmux"].rpartition(".")[2]
+            if not pane:
+                continue
+            place: Place = TmuxPlace(pane)
+        else:
+            found = herdr.herdr_place_of(record["pid"])
+            if isinstance(found, herdr.NotInHerdr):
+                continue
+            place = found
+        if place not in newest or record["updatedAt"] > newest[place][0]:
+            newest[place] = (record["updatedAt"], LiveClaude(record["name"], record["sessionId"],
+                                                           record["messagingSocketPath"], record["pid"]))
+    tmux = {place.pane: claude for place, (_, claude) in newest.items() if isinstance(place, TmuxPlace)}
+    native = {place: claude for place, (_, claude) in newest.items() if isinstance(place, HerdrPlace)}
+    return tmux, native, unread
 
 
-def _marked_sessions() -> Iterable[tuple[str, MarkedUnit]]:
-    """Each tmux session that carries both marks, with its production slug.
-
-    Raises OSError when tmux cannot say which sessions exist.
-    """
-    claudes, unread = _claudes()
+def _marked_sessions(claudes: dict[str, LiveClaude], unread: str) -> Iterable[tuple[str, MarkedUnit]]:
+    """Each tmux session carrying both marks, with its production slug."""
     for session, (label, panes) in tmux_sessions().items():
         marks = _marks(session)
         slug, unit = marks.get(PRODUCTION_MARK, ""), marks.get(UNIT_MARK, "")
@@ -201,31 +230,65 @@ def _marked_sessions() -> Iterable[tuple[str, MarkedUnit]]:
             continue
         live = [pane for pane in panes if pane in claudes]
         claude: Claude = (claudes[live[0]] if live else ClaudeUnknown(unread) if unread else ClaudeNotRunning())
-        yield slug, MarkedUnit(unit, live[0] if live else panes[0], label, claude)
+        pane = live[0] if live else panes[0]
+        yield slug, MarkedUnit(unit, pane, label, claude, TmuxPlace(pane))
 
 
-def every_marked_unit() -> MarkedProductions:
-    """Every unit on this machine that has a tmux session, whatever its production.
+def _herdr_marked(claudes: dict[HerdrPlace, LiveClaude], unread: str) -> Iterable[tuple[str, MarkedUnit]]:
+    """Each running herdr pane carrying both marks, once per place."""
+    running = {session["name"] for session in herdr.live_sessions()}
+    seen: set[HerdrPlace] = set()
+    for process in herdr.herdr_processes():
+        place = process.place
+        if place.session not in running or place in seen:
+            continue
+        slug, unit = process.marks.get(PRODUCTION_MARK, ""), process.marks.get(UNIT_MARK, "")
+        if not slug or not unit:
+            continue
+        seen.add(place)
+        claude: Claude = claudes.get(place, ClaudeUnknown(unread) if unread else ClaudeNotRunning())
+        yield slug, MarkedUnit(unit, "", place.session, claude, place)
 
-    One read of tmux and the session records serves every production. Raises OSError when tmux
-    cannot say which sessions exist. Two sessions carrying one unit's mark is a fault of whoever
-    marked them: that production's units are left out, with why, since no caller may pick one.
+
+def every_marked_unit(*, include_tmux: bool = True) -> MarkedProductions:
+    """Read herdr and optionally tmux. Failure of all included sources is unreadable.
+
+    Duplicate marks leave that production out; callers must never pick one host.
     """
+    tmux_claudes, herdr_claudes, unread = _claudes()
+    marked_units: list[tuple[str, MarkedUnit]] = []
+    failures: list[str] = []
+    sources = [_herdr_marked(herdr_claudes, unread)]
+    if include_tmux:
+        sources.insert(0, _marked_sessions(tmux_claudes, unread))
+    for source in sources:
+        try:
+            marked_units.extend(source)
+        except (OSError, herdr.HerdrFailure) as error:
+            failures.append(str(error))
+    if len(failures) == len(sources):
+        raise OSError("; ".join(failures))
     units: dict[str, dict[str, MarkedUnit]] = {}
     faults: dict[str, str] = {}
-    for slug, marked in _marked_sessions():
+    for slug, marked in marked_units:
         production = units.setdefault(slug, {})
         if marked.unit in production:
-            _ = faults.setdefault(slug, f"tmux sessions {production[marked.unit].label} and {marked.label}"
-                                  + f" both carry the mark of {marked.unit}")
+            previous = production[marked.unit]
+            if isinstance(previous.place, TmuxPlace) and isinstance(marked.place, TmuxPlace):
+                hosts = f"tmux sessions {previous.label} and {marked.label}"
+            else:
+                first = "tmux" if isinstance(previous.place, TmuxPlace) else "herdr"
+                second = "tmux" if isinstance(marked.place, TmuxPlace) else "herdr"
+                hosts = f"{first} session {previous.label} and {second} session {marked.label}"
+            _ = faults.setdefault(slug, f"{hosts} both carry the mark of {marked.unit}")
         production[marked.unit] = marked
     return MarkedProductions({slug: found for slug, found in units.items() if slug not in faults}, faults)
 
 
 def marked_units(slug: str) -> dict[str, MarkedUnit]:
-    """Every unit of the production that has a tmux session, by unit id.
+    """Every marked unit of the production, in either host, by unit id.
 
-    Raises OSError when tmux cannot say which sessions exist, and when two sessions carry one of
+    Raises OSError when neither host can say which sessions exist, or two sessions carry one of
     the production's unit marks.
     """
     found = every_marked_unit()
@@ -253,12 +316,12 @@ def main(arguments: list[str]) -> int:
                             else ("", "", ""))
                     running = ("live" if isinstance(claude, LiveClaude)
                                else "unknown" if isinstance(claude, ClaudeUnknown) else "stopped")
-                    print("\t".join((unit.unit, unit.pane, unit.label, running, *told)))
+                    print("\t".join((unit.unit, place_text(unit.place), unit.label, running, *told)))
             case ["pane", slug, name]:
                 found = marked_units(slug).get(name)
                 if found is None:
                     return 1
-                print(found.pane)
+                print(place_text(found.place))
             case ["mark", slug, name, target]:
                 mark(target, slug, name)
             case _:

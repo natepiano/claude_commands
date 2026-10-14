@@ -141,6 +141,8 @@ exit 0
                 environment = real_tmux.environment(environment)
             for source_name in ("add_unit.py", "live_units.py", "showrunners.py", "unit_lookup.py"):
                 _ = shutil.copy2(SCRIPT.with_name(source_name), script.with_name(source_name))
+            (root / "scripts" / "herdr").mkdir()
+            _ = shutil.copy2(SCRIPT.parent.parent / "herdr" / "herdr.py", root / "scripts" / "herdr" / "herdr.py")
             # The copied scripts read the user's zone setting through the helper beside them.
             _ = shutil.copy2(SCRIPT.parent.parent / "lib" / "user_zone.py", script.parent.parent / "lib" / "user_zone.py")
             (root / "sessions").mkdir()
