@@ -231,7 +231,7 @@ Each subcommand takes `--production`; `main` catches `merge_checkpoint.Stop`, so
 - The renderer exposes no list of required fields, which is why the builder names five itself.
 - Agenda threshold is 8 hours; waits act at 60 minutes open or 30 minutes past the clear time; the weekday ETA window is ±3 days.
 - `log_events` dates a date-less LOG line by walking backward across midnights; a gap over 24 hours between timestamped lines is invisible.
-- Producer output shapes are not the obvious ones: the unconfigured berth board is a JSON envelope with exit 4, the ETA line is `dailies ETAs: <unit> <phase> <eta>; …`, and an account stem can hold a space (`codex 1`). Test fixtures come from calling the producers.
+- Producer output shapes are not the obvious ones: the unconfigured berth board is a JSON envelope with exit 4, the ETA line is `dailies ETAs: <unit> <phase> <eta>; …`, and account labels use one spelling (`codex1`). Test fixtures come from calling the producers.
 - `unit_status.sh` routes `gate:` exactly as `decision:` and `blocked:`, while the stall watch treats all four waiting kinds as silent; a unit at a gate is quiet in the stall watch and flagged to the user by the status script.
 - `unit_status.sh` is zsh.
 - Units are found only by their tmux marks. A unit director started in a herdr pane has none: `production_lifecycle.py load` reports it as `session: gone`, and `waiting.py quota` cannot reach it (`docs/as-built/herdr-trial.md`, finding 1).

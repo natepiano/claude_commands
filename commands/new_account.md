@@ -1,6 +1,6 @@
 ---
 description: Add a Claude or Codex account and wire it into every system that names accounts.
-argument-hint: 'claude claudeN [login] | codex codexN <login>'
+argument-hint: 'claudeN [login] | codexN <login>'
 ---
 
 # New account

@@ -1,6 +1,8 @@
 """Account transitions: a request is distinct from a confirmed session move."""
 from __future__ import annotations
 
+from scripts.whoami.note_file import canonical_label
+
 import fcntl
 import json
 from datetime import datetime
@@ -98,10 +100,20 @@ def _valid(value: object) -> bool:
     return isinstance(kind, str) and kind in required and all(isinstance(fields.get(key), str) for key in required[kind])
 
 
+def _canonical_entry(entry: MoveEntry) -> MoveEntry:
+    fields: dict[str, object] = dict(entry)
+    for field in ("from", "to", "label"):
+        value = fields.get(field)
+        if isinstance(value, str):
+            fields[field] = canonical_label(value)
+    return cast(MoveEntry, cast(object, fields))
+
+
 def append_move(entry: MoveEntry) -> None:
     """Append a complete transition while holding the shared writer lock."""
     if not _valid(entry):
         raise ValueError("invalid account move")
+    entry = _canonical_entry(entry)
     path = store_file()
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a+", encoding="utf-8") as output:
@@ -139,5 +151,5 @@ def read_moves() -> list[MoveEntry]:
         except ValueError:
             continue
         if _valid(value):
-            entries.append(cast(MoveEntry, value))
+            entries.append(_canonical_entry(cast(MoveEntry, value)))
     return entries

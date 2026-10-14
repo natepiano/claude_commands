@@ -66,7 +66,7 @@ class WatchTests(unittest.TestCase):
 
     def watch(self, reports: list[Report]) -> list[str]:
         home = self.state / ".codex"
-        identity = KnownCodexAccount(home, "fixture@example.invalid", "codex 1")
+        identity = KnownCodexAccount(home, "fixture@example.invalid", "codex1")
         now = datetime.now(timezone.utc)
         for live in reports:
             if live.tool == "Codex":
@@ -102,7 +102,7 @@ class WatchTests(unittest.TestCase):
 
     def test_recovery_clears_the_warning_record_and_the_next_low_spell_is_new(self) -> None:
         _ = self.watch([report("Codex", 95)])
-        self.assertEqual(self.watch([report("Codex", 3)]), ["5-hour limit: codex 1 is back above 20%"])
+        self.assertEqual(self.watch([report("Codex", 3)]), ["5-hour limit: codex1 is back above 20%"])
         self.assertIsInstance(escalate.read(escalate.held_path("five-hour-codex")), escalate.NoHeld)
         self.assertEqual(self.watch([report("Codex", 3)]), [])
         self.assertEqual(len(self.watch([report("Codex", 80)])), 2)
@@ -145,8 +145,8 @@ class AccountHoldTests(unittest.TestCase):
         claims = base64.urlsafe_b64encode(json.dumps({"email": login}).encode()).decode().rstrip("=")
         _ = (home / "auth.json").write_text(json.dumps({"tokens": {"id_token": f"x.{claims}.y"}}))
         _ = (self.root / f"codex{number}.md").write_text(f"---\nlogin: {login}\n---\n")
-        self.assertEqual(accounts.main(["set-role", "seats", f"codex {number}"]), 0)
-        identity = KnownCodexAccount(home, f"a{number}@example.invalid", f"codex {number}")
+        self.assertEqual(accounts.main(["set-role", "seats", f"codex{number}"]), 0)
+        identity = KnownCodexAccount(home, f"a{number}@example.invalid", f"codex{number}")
         live = Report("Codex", email=identity.login, source=CodexHomeSource(home),
             five_hour=None if used is None else Quota("5-hour", used, self.now + timedelta(hours=2)))
         return quota_alert.CodexAlertPassReadings(accounts.role_account("seats"), identity,
@@ -167,7 +167,7 @@ class AccountHoldTests(unittest.TestCase):
         low_b = self.readings(2)
         _ = five_hour.watch([low_b.checked_homes[0].report], codex_readings=low_b)
         self.assertTrue(self.sent)
-        self.assertTrue(all("codex 2" in text for text in self.sent))
+        self.assertTrue(all("codex2" in text for text in self.sent))
 
     def test_known_swap_retires_an_offline_relay_even_without_a_usage_reading(self) -> None:
         with (patch.object(send, "STATE", self.root / "messages"),

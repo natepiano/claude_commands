@@ -43,7 +43,7 @@ from account import Account, UnknownAccountName, UnreadableAccount
 from record import SessionShutdown, SessionProgress, TimerRestore, Where
 
 LOGIN = "owner@example.com"
-LABEL = "claude 2"
+LABEL = "claude2"
 STOPPED = "2026-10-09T21:49:10+00:00"
 RESTARTED = "2026-10-10T01:02:03+00:00"
 EMPTY_SESSION_IDS: frozenset[str] = frozenset()
@@ -303,7 +303,7 @@ class RestartTests(ShutdownTestCase):
         _ = (self.root / ".claude.json").write_text(json.dumps({"oauthAccount": {"emailAddress": LOGIN}}))
         _ = (self.root / "notes/claude2.md").write_text(f"---\nlogin: {LOGIN}\n---\n")
         _ = (self.root / "notes/claude3.md").write_text("---\nlogin: third@example.invalid\n---\n")
-        self.assertEqual(accounts.setup("claude 3"), [])
+        self.assertEqual(accounts.setup("claude3"), [])
         _ = (self.root / ".claude3/.claude.json").write_text(json.dumps({"oauthAccount": {"emailAddress": "third@example.invalid"}}))
         self.configure_groups()
         _ = self.enterContext(patch.object(settle, "record_time", return_value=RESTARTED))
@@ -323,7 +323,7 @@ class RestartTests(ShutdownTestCase):
 
     def moved_record(self, identity: str = "moved-owner") -> SessionShutdown:
         saved = entry(top_level(identity, host=tmux_host(identity)))
-        saved["target"] = "claude 3"
+        saved["target"] = "claude3"
         saved["source_label"] = LABEL
         saved["why"] = "weekly refusal"
         self.create([saved])
@@ -345,7 +345,7 @@ class RestartTests(ShutdownTestCase):
         failed = entries[0]
         assert failed["kind"] == "failed"
         self.assertEqual(failed["move_id"], saved["request_id"])
-        self.assertEqual(failed["reason"], "still on claude 2")
+        self.assertEqual(failed["reason"], "still on claude2")
         self.assertNotEqual(self.stored_record()["progress"]["kind"], "restarted")
 
     def test_target_process_confirms_move_even_when_timer_restoration_is_pending(self) -> None:
@@ -359,7 +359,7 @@ class RestartTests(ShutdownTestCase):
             name=owner["name"], messagingSocketPath="", updatedAt=1, tmux="", formerNames=[])
         with (patch.object(sessions, "live_sessions", return_value=[live]),
               patch.object(account_reader, "process_config_dir", return_value=self.root / ".claude3"),
-              patch.object(account_reader, "account_of", return_value=Account("claude", "target@example.com", "claude 3")),
+              patch.object(account_reader, "account_of", return_value=Account("claude", "target@example.com", "claude3")),
               patch.object(settle, "run_notifier", side_effect=RuntimeError("timer unavailable"))):
             restart.confirm_entry(saved, RESTARTED, True)
         self.assertEqual(self.stored_record()["progress"]["kind"], "timers pending")
@@ -417,7 +417,7 @@ class RestartTests(ShutdownTestCase):
                         self.assertEqual(outcome, {"kind": "records", "records": []})
                     else:
                         _ = restart._up(LOGIN, False)  # pyright: ignore[reportPrivateUsage]
-                        self.assertIn("restart-owner is already running on claude 3", output.getvalue())
+                        self.assertIn("restart-owner is already running on claude3", output.getvalue())
                 relaunch.assert_not_called()
                 self.assertEqual(record.session_records(LOGIN), [])
 
@@ -428,7 +428,7 @@ class RestartTests(ShutdownTestCase):
         with (patch.object(sessions, "live_sessions", return_value=live),
               patch.object(settle, "run_remote", return_value=(0, "")), redirect_stdout(output)):
             _ = settle.cancel(self.account, True, only=[saved["session"]["session_id"]])
-        self.assertIn("cancel-owner is already running on claude 3; its shutdown is finished", output.getvalue())
+        self.assertIn("cancel-owner is already running on claude3; its shutdown is finished", output.getvalue())
         self.assertNotIn("was not cancelled", output.getvalue())
         self.assertEqual(record.session_records(LOGIN), [])
 
@@ -477,7 +477,7 @@ class RestartTests(ShutdownTestCase):
 
     def test_manual_move_restart_records_failure_instead_of_confirmation(self) -> None:
         saved = entry(top_level("manual-owner"))
-        saved["target"] = "claude 3"
+        saved["target"] = "claude3"
         self.create([saved])
         with (patch.object(restart, "_retire"),
               patch.object(restart, "_live_session_ids", return_value=frozenset()),
@@ -496,9 +496,9 @@ class RestartTests(ShutdownTestCase):
 
     def moved_restart(self, session: inventory.Session) -> tuple[list[list[str]], str]:
         if session["kind"] == "showrunner":
-            self.configure_groups(showrunners="claude 3")
+            self.configure_groups(showrunners="claude3")
         saved = entry(session)
-        saved["target"] = "claude 3"
+        saved["target"] = "claude3"
         commands = CommandRecorder()
         output = io.StringIO()
 
@@ -524,7 +524,7 @@ class RestartTests(ShutdownTestCase):
         arguments = shlex.split(command.removesuffix("; exec zsh"))
         script = next(argument for argument in arguments if argument.endswith("/accounts.py"))
         start = arguments.index(script)
-        self.assertEqual(arguments[start + 1:start + 3], ["exec", "claude 3"])
+        self.assertEqual(arguments[start + 1:start + 3], ["exec", "claude3"])
         self.assertEqual(arguments[arguments.index("--resume") + 1], session["session_id"])
         self.assertEqual(arguments[arguments.index("-n") + 1], session["name"])
         self.assertEqual(arguments[arguments.index("--remote-control") + 1], session["name"])
@@ -543,7 +543,7 @@ class RestartTests(ShutdownTestCase):
         self.assert_move_resume(launch[-1], owner)
 
     def test_tmux_account_move_updates_retained_directory_for_named_and_default_targets(self) -> None:
-        for target, directory in (("claude 3", self.root / ".claude3"), ("default", self.root / ".claude")):
+        for target, directory in (("claude3", self.root / ".claude3"), ("default", self.root / ".claude")):
             with self.subTest(target=target):
                 owner = showrunner("moved-showrunner", host=recorded_tmux_host("kept", "%move", 420))
                 owner["config_dir"] = str(self.root / ".claude1")
@@ -569,13 +569,13 @@ class RestartTests(ShutdownTestCase):
         owner = unit("move-unit")
         commands, _ = self.moved_restart(owner)
         launch = next(argv for argv in commands if any(part.endswith("/add_unit.py") for part in argv))
-        self.assertEqual(launch[launch.index("--account") + 1], "claude 3")
+        self.assertEqual(launch[launch.index("--account") + 1], "claude3")
         self.assertEqual(launch[launch.index("--resume") + 1], "move-unit")
         self.assertEqual(launch[launch.index("--session-name") + 1], "move-unit")
 
     def test_ordinary_unit_restart_defers_to_configured_units_instead_of_recorded_account(self) -> None:
         """F005: an untargeted stopped unit carries no obsolete account override."""
-        self.configure_groups(units="claude 1")
+        self.configure_groups(units="claude1")
         owner = unit("stopped-unit")
         owner["config_dir"] = str(self.root / ".claude2")
         saved = entry(owner)
@@ -591,7 +591,7 @@ class RestartTests(ShutdownTestCase):
 
     def test_stopped_showrunner_restart_uses_prepared_configured_showrunners_account(self) -> None:
         """F005: showrunner restarts use their group's selection instead of the stop directory."""
-        self.configure_groups(showrunners="claude 3")
+        self.configure_groups(showrunners="claude3")
         owner = showrunner("stopped-runner")
         owner["config_dir"] = str(self.root / ".claude2")
         saved = entry(owner)
@@ -601,10 +601,10 @@ class RestartTests(ShutdownTestCase):
               patch.object(restart, "_live_session_ids", return_value=frozenset()),
               redirect_stdout(io.StringIO())):
             _ = restart.relaunch_session(saved, dry_run=True, desktop_state=self.desktop_state)
-        prepare.assert_any_call("claude 3", resume=True)
+        prepare.assert_any_call("claude3", resume=True)
         command = next(argv[-1] for argv in commands.calls if "-ic" in argv)
         arguments = shlex.split(command.removesuffix("; exec zsh"))
-        self.assertEqual(arguments[arguments.index("exec") + 1], "claude 3")
+        self.assertEqual(arguments[arguments.index("exec") + 1], "claude3")
         self.assertEqual(arguments[arguments.index("--resume") + 1], owner["session_id"])
         self.assertNotIn(str(self.root / ".claude2"), command)
 
@@ -695,7 +695,7 @@ class RestartTests(ShutdownTestCase):
                 supervisor=inventory.SupervisorIdentity(kind="supervisor", pid=902,
                     proc_start="supervisor-start")))
         saved = entry(owner)
-        saved["target"] = "claude 3"
+        saved["target"] = "claude3"
         destination = self.state_root / "relaunch/902.json"
         published: list[dict[str, object]] = []
         replace = os.replace
@@ -841,7 +841,7 @@ class RestartTests(ShutdownTestCase):
     def test_linux_terminal_move_requires_manual_resume_and_journals_failure(self) -> None:
         owner = top_level("linux-terminal", host=inventory.TerminalHost(kind="terminal"))
         saved = entry(owner)
-        saved["target"] = "claude 3"
+        saved["target"] = "claude3"
         saved["source_label"] = LABEL
         saved["why"] = "weekly refusal"
         self.create([saved])
@@ -1004,7 +1004,7 @@ class RestartTests(ShutdownTestCase):
     def test_herdr_account_move_keeps_claude_arguments_and_refuses_before_start(self) -> None:
         owner, _, log = self.herdr_restart_fixture()
         saved = entry(owner)
-        saved["target"] = "claude 3"
+        saved["target"] = "claude3"
         observed: list[restart.ResumeParts] = []
         launch = restart._herdr_launch  # pyright: ignore[reportPrivateUsage]
 
@@ -1020,7 +1020,7 @@ class RestartTests(ShutdownTestCase):
             "--resume", "resume-id", "-n", "kept name", "--remote-control", "kept name",
             "--model", "opus", "--settings", '{"disableAgentView": true}',
         ))
-        self.assertEqual(observed[0].account, restart.MoveResumeAccount("claude 3"))
+        self.assertEqual(observed[0].account, restart.MoveResumeAccount("claude3"))
         self.assertEqual(observed[0].opening_prompt, "account move")
         self.assertFalse(log.exists())
         self.assertEqual(conversation_pause.read_scheduled_prompts("resume-id"), ())
@@ -1106,7 +1106,7 @@ class RestartTests(ShutdownTestCase):
         """F001/F002: unrestricted unit names never reach native herdr agent launch."""
         template, _, log = self.herdr_restart_fixture()
         checkpoint = "finish Parser Review; keep 'quotes' and $(literal)"
-        for label in ("default", "claude 3"):
+        for label in ("default", "claude3"):
             self.configure_groups(units=label)
             for moved in (False, True):
                 for already_on_group in (False, True):
@@ -1117,7 +1117,7 @@ class RestartTests(ShutdownTestCase):
                             owner["name"] = "Parser Review"
                             owner["cwd"] = template["cwd"]
                             directory = accounts.main_config_dir() if label == "default" else accounts.account_dir(label)
-                            old_directory = accounts.account_dir("claude 1")
+                            old_directory = accounts.account_dir("claude1")
                             owner["config_dir"] = str(directory if already_on_group else old_directory)
                             saved = entry(owner, where=record.WhereSaid(kind="said", text=checkpoint, at=STOPPED))
                             if moved:
@@ -1149,7 +1149,7 @@ class RestartTests(ShutdownTestCase):
         """F001: account changes never rely on PATH inside a herdr shell."""
         template, _, log = self.herdr_restart_fixture()
         checkpoint = "continue the saved showrunner checkpoint"
-        for label in ("default", "claude 3"):
+        for label in ("default", "claude3"):
             self.configure_groups(showrunners=label)
             for moved in (False, True):
                 for dry_run in (False, True):
@@ -1157,7 +1157,7 @@ class RestartTests(ShutdownTestCase):
                         owner = showrunner("runner-resume", host=template["host"])
                         owner["name"] = "Production Review"
                         owner["cwd"] = template["cwd"]
-                        owner["config_dir"] = str(accounts.account_dir("claude 1"))
+                        owner["config_dir"] = str(accounts.account_dir("claude1"))
                         saved = entry(owner, where=record.WhereSaid(kind="said", text=checkpoint, at=STOPPED))
                         if moved:
                             saved["target"] = label
@@ -1185,12 +1185,12 @@ class RestartTests(ShutdownTestCase):
 
     def test_herdr_showrunner_already_on_configured_account_retains_native_resume(self) -> None:
         template, _, log = self.herdr_restart_fixture()
-        directory = accounts.account_dir("claude 3")
+        directory = accounts.account_dir("claude3")
         _ = (directory / ".claude.json").write_text(json.dumps({
             "oauthAccount": {"emailAddress": "third@example.invalid"},
             "projects": {template["cwd"]: {"hasTrustDialogAccepted": True}},
         }))
-        self.configure_groups(showrunners="claude 3")
+        self.configure_groups(showrunners="claude3")
         owner = showrunner("runner-resume", host=template["host"])
         owner["name"] = "production-review"
         owner["cwd"] = template["cwd"]
@@ -1218,16 +1218,16 @@ class RestartTests(ShutdownTestCase):
 
     def test_targeted_unit_and_showrunner_resume_prompts_carry_the_ready_checkpoint(self) -> None:
         checkpoint = "commit the partial parser; keep 'quotes' and $(literal)"
-        self.configure_groups(units="claude 3", showrunners="claude 3")
+        self.configure_groups(units="claude3", showrunners="claude3")
         for owner in (unit("checkpoint-unit"), showrunner("checkpoint-runner")):
             with self.subTest(kind=owner["kind"]):
                 saved = entry(owner, where=record.WhereSaid(kind="said", text=checkpoint, at=STOPPED))
-                saved["target"] = "claude 3"
+                saved["target"] = "claude3"
                 saved["source_label"] = LABEL
                 saved["why"] = "weekly refusal"
                 note = restart.restart_note(saved, RESTARTED)
                 self.assertIn(checkpoint, note)
-                self.assertIn("moved from claude 2 to claude 3", note)
+                self.assertIn("moved from claude2 to claude3", note)
                 captured: list[str] = []
 
                 def launched(argv: list[str], *, dry_run: bool) -> subprocess.CompletedProcess[str]:
@@ -1252,10 +1252,10 @@ class RestartTests(ShutdownTestCase):
         launch = next(argv for argv in commands if "-ic" in argv)
         arguments = shlex.split(launch[-1].removesuffix("; exec zsh"))
         self.assertIn("accounts.py", " ".join(arguments))
-        self.assertEqual(arguments[arguments.index("exec") + 1], "claude 3")
+        self.assertEqual(arguments[arguments.index("exec") + 1], "claude3")
         self.assertEqual(arguments[arguments.index("--resume") + 1], "move-showrunner")
         self.assertTrue(arguments[-1].startswith("/showrunner:produce /tmp/demo production.md resume "))
-        self.assertIn("moved from claude 2 to claude 3", arguments[-1])
+        self.assertIn("moved from claude2 to claude3", arguments[-1])
 
     def test_moved_showrunners_each_keep_cwd_name_model_and_their_own_production_resume(self) -> None:
         for identity, name, model, doc in (
@@ -1278,14 +1278,14 @@ class RestartTests(ShutdownTestCase):
                 self.assertEqual(arguments[arguments.index("--remote-control") + 1], name)
                 self.assertEqual(arguments[arguments.index("--model") + 1], model)
                 self.assertTrue(arguments[-1].startswith(f"/showrunner:produce {doc} resume "))
-                self.assertIn("moved from claude 2 to claude 3", arguments[-1])
+                self.assertIn("moved from claude2 to claude3", arguments[-1])
 
     def test_moved_ghostty_showrunner_reopens_on_its_recorded_desktop_without_window_title_tracking(self) -> None:
-        self.configure_groups(showrunners="claude 3")
+        self.configure_groups(showrunners="claude3")
         owner = showrunner("hana-id", host=inventory.WindowHost(kind="ghostty", window_shell=123,
             desktop=inventory.NamedDesktop(kind="named", name="Production")))
         saved = entry(owner)
-        saved["target"] = "claude 3"
+        saved["target"] = "claude3"
         commands = CommandRecorder()
         with (
             patch.object(restart, "_run", commands),
@@ -1301,10 +1301,10 @@ class RestartTests(ShutdownTestCase):
 
     def test_live_unknown_host_move_reports_its_manual_resume_line_once(self) -> None:
         saved = entry(top_level("manual-move", name="kept name"), where=record.WhereNotSaid(kind="not said"))
-        saved["target"] = "claude 3"
+        saved["target"] = "claude3"
         self.create([saved])
         output = io.StringIO()
-        command = restart.resume_command(saved["session"], "claude 3", LABEL)
+        command = restart.resume_command(saved["session"], "claude3", LABEL)
         with (
             patch.object(restart, "_retire"),
             patch.object(restart, "_live_session_ids", return_value=frozenset()),
@@ -1317,7 +1317,7 @@ class RestartTests(ShutdownTestCase):
 
     def test_live_restart_verb_reports_an_unknown_host_move_command_exactly_once(self) -> None:
         saved = entry(top_level("manual-move", name="kept name"), where=record.WhereNotSaid(kind="not said"))
-        saved["target"] = "claude 3"
+        saved["target"] = "claude3"
         self.create([saved])
         output = io.StringIO()
         with (
@@ -1329,16 +1329,16 @@ class RestartTests(ShutdownTestCase):
             result = restart.up_result(LOGIN, False, ["manual-move"])
         lines = [line for line in result["lines"] if "manual restart kept name:" in line]
         self.assertEqual(len(lines), 1, "\n".join(result["lines"]))
-        self.assertIn(restart.resume_command(saved["session"], "claude 3", LABEL), lines[0])
+        self.assertIn(restart.resume_command(saved["session"], "claude3", LABEL), lines[0])
 
     def test_move_restart_note_names_source_target_reason_and_continuation_for_every_session_kind(self) -> None:
         for owner in (top_level("top"), unit("unit"), showrunner("runner")):
             with self.subTest(kind=owner["kind"]):
                 saved = entry(owner)
-                saved["target"] = "claude 3"
+                saved["target"] = "claude3"
                 note = restart.restart_note(saved, RESTARTED)
-                self.assertIn("moved from claude 2 to claude 3", note.casefold())
-                self.assertIn("claude 2 is out of usage", note)
+                self.assertIn("moved from claude2 to claude3", note.casefold())
+                self.assertIn("claude2 is out of usage", note)
                 self.assertIn("account move", note.casefold())
                 self.assertIn("not a stop", note.casefold())
                 self.assertIn("continue", note.casefold())
@@ -1359,13 +1359,13 @@ class RestartTests(ShutdownTestCase):
             with self.subTest(host=owner["host"]["kind"], kind=owner["kind"]):
                 saved = entry(owner, where=record.WhereNotSaid(kind="not said"))
                 saved["target"] = "default"
-                saved["source_label"] = "claude 3"
+                saved["source_label"] = "claude3"
                 saved["why"] = "weekly limit reached"
                 note = restart.restart_note(saved, RESTARTED)
-                self.assertIn("moved from claude 3 to default because weekly limit reached", note)
+                self.assertIn("moved from claude3 to default because weekly limit reached", note)
                 self.assertIn("account move, not a stop", note)
                 self.assertIn("Continue where you stopped", note)
-                command = restart.resume_command(owner, "default", "claude 3", "weekly limit reached")
+                command = restart.resume_command(owner, "default", "claude3", "weekly limit reached")
                 arguments = shlex.split(command.removesuffix("; exec zsh"))
                 self.assertIn(note, arguments[-1])
                 if owner["kind"] == "showrunner":
@@ -1622,11 +1622,11 @@ class RestartTests(ShutdownTestCase):
             + " ENABLE_TOOL_SEARCH=true command claude " + suffix,
         )
         self.assertEqual(
-            restart._resume_command(owner, "line one\nline two", "claude 3"),  # pyright: ignore[reportPrivateUsage]
+            restart._resume_command(owner, "line one\nline two", "claude3"),  # pyright: ignore[reportPrivateUsage]
             "cd '/tmp/with space' && ENABLE_TOOL_SEARCH=true command "
             + shlex.quote(sys.executable) + " "
             + shlex.quote(str(restart.SCRIPTS / "accounts" / "accounts.py"))
-            + " exec 'claude 3' " + suffix,
+            + " exec claude3 " + suffix,
         )
 
     def test_window_dry_run_reads_and_restores_the_starting_desktop(self) -> None:
@@ -2083,19 +2083,19 @@ class RestartTests(ShutdownTestCase):
         self.assertEqual(len(sent), 1)
         args, body = sent[0]
         self.assertEqual(args[args.index("--text-id") + 1], "shutdown.restart_incomplete")
-        self.assertIn('account="claude 2"', args)
+        self.assertIn('account="claude2"', args)
         self.assertIn("machine=Mac", args)
         self.assertEqual(body, "")
         self.assertNotIn("--action", args)
 
     def test_restart_failure_push_uses_only_account_count_and_machine_facts(self) -> None:
-        push = restart.restart_push("claude 2", ["Beta"], machine="natedev")
+        push = restart.restart_push("claude2", ["Beta"], machine="natedev")
         self.assertEqual(push.id, "shutdown.restart_failed")
-        self.assertEqual(push.values, {"account": '"claude 2"', "stopped": "One session", "machine": "natedev"})
-        self.assertIn('/shutdown restart "claude 2"', cast(ActionRequired, push.action).text)
-        unknown = restart.restart_push("claude 2", [], machine="Mac")
+        self.assertEqual(push.values, {"account": '"claude2"', "stopped": "One session", "machine": "natedev"})
+        self.assertIn('/shutdown restart "claude2"', cast(ActionRequired, push.action).text)
+        unknown = restart.restart_push("claude2", [], machine="Mac")
         self.assertEqual(unknown.id, "shutdown.restart_incomplete")
-        self.assertEqual(unknown.values, {"account": '"claude 2"', "machine": "Mac"})
+        self.assertEqual(unknown.values, {"account": '"claude2"', "machine": "Mac"})
 
     def test_large_restart_failure_group_keeps_count_without_exceeding_phone_limit(self) -> None:
         names = ["Session" + str(index) + "x" * 80 for index in range(100)]

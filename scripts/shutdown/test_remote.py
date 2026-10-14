@@ -92,7 +92,7 @@ raise SystemExit(int(os.environ.get("SHUTDOWN_TEST_SSH_STATUS", "0")))
         os.environ["SHUTDOWN_TEST_REMOTE_STATUS"] = "3"
 
         status, output = remote.run_remote(
-            ["status", "claude 2", "--json"], stdin="request body"
+            ["status", "claude2", "--json"], stdin="request body"
         )
 
         self.assertEqual((status, output), (3, "remote output"))
@@ -107,7 +107,7 @@ raise SystemExit(int(os.environ.get("SHUTDOWN_TEST_SSH_STATUS", "0")))
         command = called["arguments"][5]
         self.assertIn('"$HOME/.claude/scripts/lib/py"', command)
         self.assertIn('"$HOME/.claude/scripts/shutdown/shutdown.py"', command)
-        self.assertIn("'claude 2'", command)
+        self.assertIn("status claude2 --json", command)
         self.assertTrue(command.endswith('; printf "rc=%s\\n" $?'))
 
     def test_missing_remote_status_line_is_unreachable(self) -> None:

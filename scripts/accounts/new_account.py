@@ -22,7 +22,7 @@ import tempfile
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Literal, cast
+from typing import Literal, NotRequired, TypedDict, cast
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.accounts import accounts  # noqa: E402
@@ -30,7 +30,6 @@ from scripts.lib.user_zone import user_zone  # noqa: E402
 import agent_accounts  # noqa: E402
 import note_file  # noqa: E402
 
-NAME = re.compile(r"(claude|codex)([1-9][0-9]*)")
 # The alias loop in the nixos shell module reads the notes folder; its path is the marker.
 ALIAS_LOOP_MARKER = "hanadocs/agents/claude"
 
@@ -43,24 +42,42 @@ class Step:
 
 @dataclass(frozen=True)
 class NewAccount:
-    tool: Literal["claude", "codex"]
-    number: int
-    name: str
-    label: str
+    account: note_file.NumberedAccountLabel
+
+    @property
+    def tool(self) -> Literal["claude", "codex"]:
+        return self.account.tool
+
+    @property
+    def number(self) -> int:
+        return self.account.number
+
+    @property
+    def name(self) -> str:
+        return self.account.label
+
+    @property
+    def label(self) -> str:
+        return self.account.label
 
 
-def account_label(name: str) -> str:
-    """The label accounts.py accepts today: claude4 is "claude 4". The no-space rename deletes this."""
-    return re.sub(r"([a-z])([0-9])", r"\1 \2", name, count=1)
+@dataclass(frozen=True)
+class HomeLogin:
+    login: str
+
+
+@dataclass(frozen=True)
+class NoHomeLogin:
+    """No readable login is held by this account's home."""
 
 
 def parse_account(tool: str, name: str) -> NewAccount:
-    match = NAME.fullmatch(name)
+    parsed = note_file.parse_account_label(name)
     if tool not in ("claude", "codex"):
         raise accounts.AccountsError(f"new_account: the type is claude or codex, not {tool}")
-    if match is None or match.group(1) != tool:
+    if not isinstance(parsed, note_file.NumberedAccountLabel) or parsed.tool != tool:
         raise accounts.AccountsError(f"new_account: name a {tool} account {tool}N, such as {tool}4, not {name}")
-    return NewAccount(tool, int(match.group(2)), name, account_label(name))
+    return NewAccount(parsed)
 
 
 def notes_directory() -> Path:
@@ -68,28 +85,34 @@ def notes_directory() -> Path:
 
 
 def note_path(account: NewAccount) -> Path:
-    return notes_directory() / f"{account.label}.md"
+    directory = notes_directory()
+    canonical = directory / note_file.note_name(account.label)
+    legacy = directory / f"{account.tool} {account.number}.md"
+    return legacy if not canonical.exists() and legacy.exists() else canonical
 
 
-def home_login(account: NewAccount) -> str | None:
-    """The login the account's own folder already holds, if any."""
+def home_login(account: NewAccount) -> HomeLogin | NoHomeLogin:
+    """Read the login held by the account's own folder."""
     home = accounts.accounts_home() / f".{account.name}"
     if account.tool == "codex":
-        return agent_accounts.codex_email_on_disk(home) if (home / "auth.json").is_file() else None
-    return agent_accounts.claude_on_disk(home).email if home.is_dir() else None
+        login = agent_accounts.codex_email_on_disk(home) if (home / "auth.json").is_file() else None
+    else:
+        login = agent_accounts.claude_on_disk(home).email if home.is_dir() else None
+    return HomeLogin(login) if login else NoHomeLogin()
 
 
-def note_step(account: NewAccount, login: str | None) -> Step:
+def note_step(account: NewAccount, identity: HomeLogin | NoHomeLogin) -> Step:
     path = note_path(account)
     if path.exists():
         return Step(True, f"account note {path}")
-    if login is None:
+    if isinstance(identity, NoHomeLogin):
         then = (f"log in (below), then run /new_account {account.tool} {account.name} again"
                 if account.tool == "claude" else f"run /new_account codex {account.name} <its login>")
         return Step(False, f"{account.label} needs its login in an account note: {then}")
+    login = identity.login
     for other in sorted(notes_directory().glob("*.md")):
         note = note_file.read_note(other)
-        held = note.get("login") if note is not None else None
+        held = note.get("login") if isinstance(note, note_file.Note) else None
         if held is not None and held.casefold() == login.casefold():
             return Step(False, f"{other.name} already holds that login; one login, one account")
     today = datetime.now(user_zone()).strftime("%Y-%m-%d")
@@ -123,7 +146,7 @@ def claude_login_step(account: NewAccount) -> Step:
 
 def codex_steps(account: NewAccount) -> list[Step]:
     home = accounts.codex_setup_home(account.label)
-    if home_login(account) is None:
+    if isinstance(home_login(account), NoHomeLogin):
         problems = accounts.setup(account.label)
         if problems:
             return [Step(False, "\n    ".join(problems))]
@@ -134,7 +157,7 @@ def codex_steps(account: NewAccount) -> list[Step]:
     if problems:
         return [Step(False, "\n    ".join(problems))]
     return [Step(True, f"~/.{account.name} is set up and signed in; it is a spare until "
-                 + f"/showrunner:accounts swap seats \"{account.label}\"")]
+                 + f"/showrunner:accounts swap seats {account.label}")]
 
 
 def settings_entries(account: NewAccount) -> list[tuple[str, str]]:
@@ -157,6 +180,34 @@ def _covers(where: str, rule: str, entry: str) -> bool:
     if where.startswith("sandbox.") and sys.platform != "darwin":
         return rule == entry
     return fnmatch.fnmatchcase(entry, rule)
+
+
+class NightlyReviewPermissions(TypedDict):
+    deny: list[str]
+
+
+class NightlyReviewSettings(TypedDict):
+    disableAgentView: NotRequired[bool]
+    permissions: NightlyReviewPermissions
+
+
+def nightly_review_step(account: NewAccount) -> Step:
+    path = accounts.main_config_dir() / "scripts" / "nightly_review" / "settings.json"
+    try:
+        settings = cast(NightlyReviewSettings, json.loads(path.read_text(encoding="utf-8")))
+        deny = settings["permissions"]["deny"]
+        entry = f"Edit(~/.{account.name}/**)"
+        if entry not in deny:
+            deny.append(entry)
+            temporary = path.with_name(".settings.new-account.tmp")
+            try:
+                _ = temporary.write_text(json.dumps(settings, indent=2) + "\n", encoding="utf-8")
+                _ = temporary.replace(path)
+            finally:
+                temporary.unlink(missing_ok=True)
+    except (OSError, ValueError, KeyError, TypeError) as error:
+        return Step(False, f"could not update {path}: {error}")
+    return Step(True, f"nightly review cannot edit ~/.{account.name}")
 
 
 def settings_step(account: NewAccount) -> Step:
@@ -194,19 +245,22 @@ def alias_step(account: NewAccount) -> Step | None:
     if re.search(rf"^\s*{account.name}\s*=", text, re.MULTILINE):
         return Step(True, f"{account.name} alias in {module} (live after a rebuild)")
     return Step(False, f"add to shellAliases in {module}, then rebuild:\n    {account.name} = "
-                + f"\"~/.claude/scripts/lib/py ~/.claude/scripts/accounts/accounts.py exec '{account.label}'\";")
+                + f"\"~/.claude/scripts/lib/py ~/.claude/scripts/accounts/accounts.py exec {account.label}\";")
 
 
-def new_account(account: NewAccount, login: str | None) -> list[Step]:
+def new_account(account: NewAccount, identity: HomeLogin | NoHomeLogin) -> list[Step]:
+    if isinstance(identity, NoHomeLogin):
+        identity = home_login(account)
     if account.tool == "codex":
-        note = note_step(account, login or home_login(account))
+        note = note_step(account, identity)
         return [note, *codex_steps(account)] if note.done else [note]
     problems = accounts.setup(account.label)
     if problems:
         return [Step(False, "\n    ".join(problems))]
-    steps = [Step(True, f"set up ~/.{account.name}"), note_step(account, login or home_login(account))]
+    steps = [Step(True, f"set up ~/.{account.name}"), note_step(account, identity)]
     steps.append(claude_login_step(account) if steps[-1].done else claude_login_instruction(account))
     steps.append(settings_step(account))
+    steps.append(nightly_review_step(account))
     if (alias := alias_step(account)) is not None:
         steps.append(alias)
     return steps
@@ -217,10 +271,16 @@ def main(argv: list[str]) -> int:
     _ = parser.add_argument("tool")
     _ = parser.add_argument("name")
     _ = parser.add_argument("login", nargs="?")
+    if argv:
+        parsed = note_file.parse_account_label(argv[0])
+        if isinstance(parsed, note_file.NumberedAccountLabel):
+            argv = [parsed.tool, parsed.label, *argv[1:]]
     options = parser.parse_args(argv)
+    login = cast(str | None, options.login)
+    identity = HomeLogin(login) if login else NoHomeLogin()
     try:
         account = parse_account(cast(str, options.tool), cast(str, options.name))
-        steps = new_account(account, cast(str | None, options.login))
+        steps = new_account(account, identity)
     except (accounts.AccountsError, OSError) as error:
         print(error, file=sys.stderr)
         return 1

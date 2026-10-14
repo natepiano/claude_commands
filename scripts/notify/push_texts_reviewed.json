@@ -45,120 +45,120 @@
   "quota.claude": {
     "exhausted": {
       "reviewer": "opus",
-      "sha256": "6ed3c4053b703a244352efb2afe69e975d529c61d2e51d879e77920e9628fd10",
-      "time": "2026-10-14T04:28:28.772852-04:00"
+      "sha256": "6b0887a34c590125a16f1efc9fd4cbfc20534fbc6752642092dfa5d0c0029d4a",
+      "time": "2026-10-14T17:16:07.558043-04:00"
     },
     "long_target": {
       "reviewer": "opus",
-      "sha256": "6ed3c4053b703a244352efb2afe69e975d529c61d2e51d879e77920e9628fd10",
-      "time": "2026-10-14T04:28:35.364172-04:00"
+      "sha256": "6b0887a34c590125a16f1efc9fd4cbfc20534fbc6752642092dfa5d0c0029d4a",
+      "time": "2026-10-14T17:16:22.604143-04:00"
     },
     "typical": {
       "reviewer": "opus",
-      "sha256": "6ed3c4053b703a244352efb2afe69e975d529c61d2e51d879e77920e9628fd10",
-      "time": "2026-10-14T04:28:21.311604-04:00"
+      "sha256": "6b0887a34c590125a16f1efc9fd4cbfc20534fbc6752642092dfa5d0c0029d4a",
+      "time": "2026-10-14T17:15:53.416495-04:00"
     }
   },
   "quota.codex_credits_forecast": {
     "codex_one": {
-      "reviewer": "user-spec: Phase 20 alert text close-out, showrunner option 1. Verdict: unreviewed: timeout. The user asked for these pushes by name and explicitly authorizes every remaining example for this close-out; Phase 21 rewrites them with the new note file names.",
-      "sha256": "cdd9e63de8920030f3bfdc7ff4d597a584a36dd02fbc567e6cc55d96359309ab",
-      "time": "2026-10-14T13:04:42.858321-04:00"
+      "reviewer": "user-spec: Phase 22 label spelling only; text otherwise as approved under the user spec in Phase 20 (showrunner ruling 2026-10-14: adopt printed drafts, record the rest under the user spec). Verdict: withhold; rules: push-only-what-the-user-must-do, title-names-the-stake.",
+      "sha256": "72e9468f1080b8c5c5e4228071589f8cd4d6a89ab87f250c7cf3db41cbcb1662",
+      "time": "2026-10-14T17:24:33.346626-04:00"
     },
     "codex_two": {
-      "reviewer": "user-spec: Phase 20 alert text close-out, showrunner option 1. Verdict: withhold; rules: push-only-what-the-user-must-do, title-names-the-stake. The user asked for these pushes by name and explicitly authorizes every remaining example for this close-out; Phase 21 rewrites them with the new note file names.",
-      "sha256": "cdd9e63de8920030f3bfdc7ff4d597a584a36dd02fbc567e6cc55d96359309ab",
-      "time": "2026-10-14T13:04:42.858330-04:00"
+      "reviewer": "user-spec: Phase 22 label spelling only; text otherwise as approved under the user spec in Phase 20 (showrunner ruling 2026-10-14: adopt printed drafts, record the rest under the user spec). Verdict: withhold; rules: push-only-what-the-user-must-do, title-names-the-stake, reader-starts-cold.",
+      "sha256": "72e9468f1080b8c5c5e4228071589f8cd4d6a89ab87f250c7cf3db41cbcb1662",
+      "time": "2026-10-14T17:24:33.346764-04:00"
     },
     "unknown_balance": {
-      "reviewer": "user-spec: Phase 20 alert text close-out, showrunner option 1. Verdict: withhold; rules: push-only-what-the-user-must-do, title-names-the-stake. The user asked for these pushes by name and explicitly authorizes every remaining example for this close-out; Phase 21 rewrites them with the new note file names.",
-      "sha256": "cdd9e63de8920030f3bfdc7ff4d597a584a36dd02fbc567e6cc55d96359309ab",
-      "time": "2026-10-14T13:04:42.858356-04:00"
+      "reviewer": "user-spec: Phase 22 label spelling only; text otherwise as approved under the user spec in Phase 20 (showrunner ruling 2026-10-14: adopt printed drafts, record the rest under the user spec). Verdict: withhold; rules: push-only-what-the-user-must-do, title-names-the-stake.",
+      "sha256": "72e9468f1080b8c5c5e4228071589f8cd4d6a89ab87f250c7cf3db41cbcb1662",
+      "time": "2026-10-14T17:24:33.346962-04:00"
     },
     "unknown_use": {
-      "reviewer": "user-spec: Phase 20 alert text close-out, showrunner option 1. Verdict: no current review after repair; earlier withhold applies to the prior wording. The user asked for these pushes by name and explicitly authorizes every remaining example for this close-out; Phase 21 rewrites them with the new note file names.",
-      "sha256": "cdd9e63de8920030f3bfdc7ff4d597a584a36dd02fbc567e6cc55d96359309ab",
-      "time": "2026-10-14T13:04:42.858365-04:00"
+      "reviewer": "user-spec: Phase 22 label spelling only; text otherwise as approved under the user spec in Phase 20 (showrunner ruling 2026-10-14: adopt printed drafts, record the rest under the user spec). Verdict: withhold; rules: push-only-what-the-user-must-do, title-names-the-stake, short-plain-sentences.",
+      "sha256": "72e9468f1080b8c5c5e4228071589f8cd4d6a89ab87f250c7cf3db41cbcb1662",
+      "time": "2026-10-14T17:24:33.347022-04:00"
     },
     "unlimited": {
-      "reviewer": "user-spec: Phase 20 alert text close-out, showrunner option 1. Verdict: withhold; rules: push-only-what-the-user-must-do, title-names-the-stake. The user asked for these pushes by name and explicitly authorizes every remaining example for this close-out; Phase 21 rewrites them with the new note file names.",
-      "sha256": "cdd9e63de8920030f3bfdc7ff4d597a584a36dd02fbc567e6cc55d96359309ab",
-      "time": "2026-10-14T13:04:42.858347-04:00"
+      "reviewer": "user-spec: Phase 22 label spelling only; text otherwise as approved under the user spec in Phase 20 (showrunner ruling 2026-10-14: adopt printed drafts, record the rest under the user spec). Verdict: withhold; rules: push-only-what-the-user-must-do, title-names-the-stake, short-plain-sentences.",
+      "sha256": "72e9468f1080b8c5c5e4228071589f8cd4d6a89ab87f250c7cf3db41cbcb1662",
+      "time": "2026-10-14T17:24:33.346901-04:00"
     },
     "zero_use": {
-      "reviewer": "user-spec: Phase 20 alert text close-out, showrunner option 1. Verdict: withhold; rules: push-only-what-the-user-must-do, title-names-the-stake. The user asked for these pushes by name and explicitly authorizes every remaining example for this close-out; Phase 21 rewrites them with the new note file names.",
-      "sha256": "cdd9e63de8920030f3bfdc7ff4d597a584a36dd02fbc567e6cc55d96359309ab",
-      "time": "2026-10-14T13:04:42.858338-04:00"
+      "reviewer": "user-spec: Phase 22 label spelling only; text otherwise as approved under the user spec in Phase 20 (showrunner ruling 2026-10-14: adopt printed drafts, record the rest under the user spec). Verdict: withhold; rules: push-only-what-the-user-must-do.",
+      "sha256": "72e9468f1080b8c5c5e4228071589f8cd4d6a89ab87f250c7cf3db41cbcb1662",
+      "time": "2026-10-14T17:24:33.346836-04:00"
     }
   },
   "quota.codex_on_credits": {
     "codex_one": {
       "reviewer": "opus",
-      "sha256": "87f1d651ed26f8055ca76293bc1dbfa0cf67a242d846ffc11c391fcbec5ae3c3",
-      "time": "2026-10-14T13:49:53.490615-04:00"
+      "sha256": "f186d9e828e0265428a4f35649c38feaa20e639654a51c50ca3cd24c3f8b1fe0",
+      "time": "2026-10-14T17:17:10.090305-04:00"
     },
     "codex_two": {
       "reviewer": "opus",
-      "sha256": "87f1d651ed26f8055ca76293bc1dbfa0cf67a242d846ffc11c391fcbec5ae3c3",
-      "time": "2026-10-14T13:50:02.938058-04:00"
+      "sha256": "f186d9e828e0265428a4f35649c38feaa20e639654a51c50ca3cd24c3f8b1fe0",
+      "time": "2026-10-14T17:17:25.066720-04:00"
     },
     "unknown": {
       "reviewer": "opus",
-      "sha256": "87f1d651ed26f8055ca76293bc1dbfa0cf67a242d846ffc11c391fcbec5ae3c3",
-      "time": "2026-10-14T13:50:21.066225-04:00"
+      "sha256": "f186d9e828e0265428a4f35649c38feaa20e639654a51c50ca3cd24c3f8b1fe0",
+      "time": "2026-10-14T17:17:52.609465-04:00"
     },
     "unlimited": {
       "reviewer": "opus",
-      "sha256": "87f1d651ed26f8055ca76293bc1dbfa0cf67a242d846ffc11c391fcbec5ae3c3",
-      "time": "2026-10-14T13:50:11.999022-04:00"
+      "sha256": "f186d9e828e0265428a4f35649c38feaa20e639654a51c50ca3cd24c3f8b1fe0",
+      "time": "2026-10-14T17:17:40.281298-04:00"
     }
   },
   "quota.codex_on_credits_last": {
     "codex_one": {
       "reviewer": "opus",
-      "sha256": "9cbe9e8840761faa3ba320cb0a28fe993303e2490a271cd8660c7e244386ad89",
-      "time": "2026-10-14T13:48:42.931541-04:00"
+      "sha256": "053bc510811c6d4a91da8b7b13121e28358a4d55855be134b4f0451d9b2c0d75",
+      "time": "2026-10-14T17:18:26.639966-04:00"
     },
     "codex_two": {
       "reviewer": "opus",
-      "sha256": "9cbe9e8840761faa3ba320cb0a28fe993303e2490a271cd8660c7e244386ad89",
-      "time": "2026-10-14T13:48:54.141528-04:00"
+      "sha256": "053bc510811c6d4a91da8b7b13121e28358a4d55855be134b4f0451d9b2c0d75",
+      "time": "2026-10-14T17:18:39.094798-04:00"
     }
   },
   "quota.codex_refused": {
     "long_account": {
       "reviewer": "opus",
-      "sha256": "a458484a23c15ebd83530b0cf9227d67f228f462518c055384499f51209e0130",
-      "time": "2026-10-14T04:23:43.509679-04:00"
+      "sha256": "9821feb876944f8af363d3f23a515c4a774c4b8b5093741197ff61be643231d9",
+      "time": "2026-10-14T17:25:03.862362-04:00"
     },
     "typical": {
       "reviewer": "opus",
-      "sha256": "a458484a23c15ebd83530b0cf9227d67f228f462518c055384499f51209e0130",
-      "time": "2026-10-14T04:23:32.371307-04:00"
+      "sha256": "9821feb876944f8af363d3f23a515c4a774c4b8b5093741197ff61be643231d9",
+      "time": "2026-10-14T17:24:52.774397-04:00"
     }
   },
   "quota.codex_workers_moved": {
     "codex_one": {
-      "reviewer": "user-spec: Phase 20 requested weekly-zero Codex phone notices; showrunner ruling 2026-10-14 overrides only push-only-what-the-user-must-do withholding. Round nine found no factual or text objection for this example.",
-      "sha256": "99a3cd8d8c6118f6aeca551d5fcadb483cf3354819c8948eda0252e1b54957a5",
-      "time": "2026-10-14T09:41:41.076236-04:00"
+      "reviewer": "user-spec: Phase 22 label spelling. Verdict: withhold; rules: push-only-what-the-user-must-do. Account labels are canonical; this automatic transition remains a log notice under the authorized policy-only exception.",
+      "sha256": "233702f81d87c356f311a13870b8ba0df36d2ebaf8513a16baa9bcffb2e17932",
+      "time": "2026-10-14T17:20:35.075286-04:00"
     },
     "codex_two": {
-      "reviewer": "user-spec: Phase 20 alert text close-out, showrunner option 1. Verdict: withhold; rules: push-only-what-the-user-must-do, title-names-the-stake, reader-starts-cold. The user asked for these pushes by name and explicitly authorizes every remaining example for this close-out; Phase 21 rewrites them with the new note file names.",
-      "sha256": "99a3cd8d8c6118f6aeca551d5fcadb483cf3354819c8948eda0252e1b54957a5",
-      "time": "2026-10-14T13:04:42.858233-04:00"
+      "reviewer": "opus",
+      "sha256": "233702f81d87c356f311a13870b8ba0df36d2ebaf8513a16baa9bcffb2e17932",
+      "time": "2026-10-14T17:20:24.112436-04:00"
     }
   },
   "quota.codex_workers_stay": {
     "failed_move": {
-      "reviewer": "user-spec: Phase 20 alert text close-out, showrunner option 1. Verdict: no current review after repair; earlier withhold applies to the prior wording. The user asked for these pushes by name and explicitly authorizes every remaining example for this close-out; Phase 21 rewrites them with the new note file names.",
-      "sha256": "5d0851d30f41547b47a8286789e9e63d4c5fb3d9c57c38d1b201b636ca36333c",
-      "time": "2026-10-14T13:04:42.858273-04:00"
+      "reviewer": "user-spec: Phase 22 label spelling. Verdict: withhold; rules: push-only-what-the-user-must-do. Automatic fallback is a log notice with no user action; spelling approval follows the authorized policy-only exception.",
+      "sha256": "1ee15b895de80dc3878df4d770ecf96769314534287581b440a0d2a46cdf6d12",
+      "time": "2026-10-14T17:21:34.175985-04:00"
     },
     "no_room": {
-      "reviewer": "user-spec: Phase 20 alert text close-out, showrunner option 1. Verdict: withhold; rules: push-only-what-the-user-must-do. The user asked for these pushes by name and explicitly authorizes every remaining example for this close-out; Phase 21 rewrites them with the new note file names.",
-      "sha256": "5d0851d30f41547b47a8286789e9e63d4c5fb3d9c57c38d1b201b636ca36333c",
-      "time": "2026-10-14T13:04:42.858263-04:00"
+      "reviewer": "user-spec: Phase 22 label spelling. Verdict: withhold; rules: push-only-what-the-user-must-do. Automatic fallback is a log notice with no user action; spelling approval follows the authorized policy-only exception.",
+      "sha256": "1ee15b895de80dc3878df4d770ecf96769314534287581b440a0d2a46cdf6d12",
+      "time": "2026-10-14T17:21:34.175899-04:00"
     }
   },
   "rust.errors": {
@@ -248,37 +248,37 @@
   "shutdown.restart_failed": {
     "many_long_names": {
       "reviewer": "opus",
-      "sha256": "4bb01ea838c7ae3a141b80061acbd5e555c48302d30a1df09dbdaeebd1fe32e2",
-      "time": "2026-10-14T04:21:57.542505-04:00"
+      "sha256": "9907644376f89f8308d043bdabdfabfc561846e95cc47bf9ce89c600a4f4a827",
+      "time": "2026-10-14T17:14:54.384371-04:00"
     },
     "typical": {
       "reviewer": "opus",
-      "sha256": "4bb01ea838c7ae3a141b80061acbd5e555c48302d30a1df09dbdaeebd1fe32e2",
-      "time": "2026-10-14T04:21:51.094583-04:00"
+      "sha256": "9907644376f89f8308d043bdabdfabfc561846e95cc47bf9ce89c600a4f4a827",
+      "time": "2026-10-14T17:14:42.537350-04:00"
     }
   },
   "shutdown.restart_incomplete": {
     "long_account": {
       "reviewer": "opus",
-      "sha256": "6751d9bd85b7579cd86339c828961cd67ecbd2f0550f501e188f7f8364261549",
-      "time": "2026-10-14T04:22:11.782018-04:00"
+      "sha256": "f5e0e31c30d4008c005131d88f87330e7b85b24a28214e26a81c6dc89cfdfc46",
+      "time": "2026-10-14T17:15:31.310232-04:00"
     },
     "typical": {
       "reviewer": "opus",
-      "sha256": "6751d9bd85b7579cd86339c828961cd67ecbd2f0550f501e188f7f8364261549",
-      "time": "2026-10-14T04:22:04.939432-04:00"
+      "sha256": "f5e0e31c30d4008c005131d88f87330e7b85b24a28214e26a81c6dc89cfdfc46",
+      "time": "2026-10-14T17:15:20.109165-04:00"
     }
   },
   "shutdown.stop_failed": {
     "many_long_names": {
       "reviewer": "opus",
-      "sha256": "fe0d4d2d128c4fbf657d52bfd219d736060090a3ce802200abed02d2aed4c491",
-      "time": "2026-10-14T04:21:43.228645-04:00"
+      "sha256": "8efd8b84f8e237ada5cdb202c25229645bd2526c2f2b7a298effbb256131dc9e",
+      "time": "2026-10-14T17:14:12.173899-04:00"
     },
     "typical": {
       "reviewer": "opus",
-      "sha256": "fe0d4d2d128c4fbf657d52bfd219d736060090a3ce802200abed02d2aed4c491",
-      "time": "2026-10-14T04:21:37.175861-04:00"
+      "sha256": "8efd8b84f8e237ada5cdb202c25229645bd2526c2f2b7a298effbb256131dc9e",
+      "time": "2026-10-14T17:14:02.345122-04:00"
     }
   },
   "sweep.disk_floor": {

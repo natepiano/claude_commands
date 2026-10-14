@@ -34,10 +34,11 @@ import herdr  # noqa: E402
 import codex_daemon  # noqa: E402
 import process_table  # noqa: E402
 if TYPE_CHECKING:
-    from ..whoami import account, agent_accounts
+    from ..whoami import account, agent_accounts, note_file
 else:
     import account as account
     import agent_accounts as agent_accounts
+    import note_file as note_file
 import remote as remote  # noqa: E402
 from sessions import SessionRecord, messaging_socket_exists, running_sessions  # noqa: E402
 
@@ -306,6 +307,8 @@ def _decode_entry(value: object) -> RosterEntry:
             and isinstance(session, ClaudeSession | NoClaudeSession)
             and isinstance(attributed, AccountAttribution)):
         raise ValueError("snapshot state is in the wrong field")
+    if isinstance(attributed, AccountLabel):
+        attributed = AccountLabel(note_file.canonical_label(attributed.label))
     return RosterEntry(
         machine=_snapshot_string(values, "machine"), kind=_snapshot_string(values, "kind"),
         role=_snapshot_string(values, "role"), name=_snapshot_string(values, "name"),

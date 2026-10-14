@@ -32,7 +32,7 @@ from account import Account, UnreadableAccount
 
 
 LOGIN = "owner@example.com"
-LABEL = "claude 2"
+LABEL = "claude2"
 OCTOBER = "2026-10-09T21:49:10+00:00"
 JANUARY = "2026-01-15T17:30:00+00:00"
 PERMISSION_SCRIPT = Path(__file__).with_name("launch_permission.py")
@@ -316,9 +316,9 @@ class ShutdownLaunchCliTests(ShutdownTestCase):
             patch.object(shutdown, "resolve_sessions", return_value=shutdown.ResolvedSessions(("move-id",), report)),
         ):
             self.assertEqual(shutdown.main(["down", LABEL, "--here", "--only", "move-id",
-                "--restart", "--to", "claude 3"]), 0)
+                "--restart", "--to", "claude3"]), 0)
         down.assert_called_once_with(selected, True, ("move-id",), then="restart", alerts="user",
-            requested_by=None, request_id="", target="claude 3", why="", report=report)
+            requested_by=None, request_id="", target="claude3", why="", report=report)
 
     def test_down_to_passes_custom_move_reason_through_the_cli_to_settle(self) -> None:
         selected = Account("claude", LOGIN, LABEL)
@@ -330,9 +330,9 @@ class ShutdownLaunchCliTests(ShutdownTestCase):
             patch.object(shutdown, "resolve_sessions", return_value=shutdown.ResolvedSessions(("move-id",), report)),
         ):
             self.assertEqual(shutdown.main(["down", LABEL, "--here", "--only", "move-id",
-                "--restart", "--to", "claude 3", "--why", "weekly limit reached"]), 0)
+                "--restart", "--to", "claude3", "--why", "weekly limit reached"]), 0)
         down.assert_called_once_with(selected, True, ("move-id",), then="restart", alerts="user",
-            requested_by=None, request_id="", target="claude 3", why="weekly limit reached", report=report)
+            requested_by=None, request_id="", target="claude3", why="weekly limit reached", report=report)
 
     def test_down_restart_passes_the_selected_scope_and_intent(self) -> None:
         selected = Account("claude", LOGIN, LABEL)
@@ -764,7 +764,7 @@ class ShutdownLaunchCliTests(ShutdownTestCase):
         self.assertEqual(blocked.returncode, 0)
         self.assertEqual(
             blocked.stdout,
-            "test-job: skipped: claude 2 is held by a shutdown "
+            "test-job: skipped: claude2 is held by a shutdown "
             + "(since 2026-10-09 14:49 PDT)\n",
         )
         self.assertEqual(blocked.stderr, "")
