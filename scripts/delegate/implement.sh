@@ -500,25 +500,27 @@ else
     "${TASK}" write "${WORKING_DIR}" "${PROMPT_FILE}" "${REPLY_FILE}" "${LOG_FILE}" &
 fi
 AGENT_PID=$!
+# Defaults remain thirty probes one second apart; fixtures probe on a short
+# interval with enough attempts to bound hangs generously under load.
 if [[ -n "${FOLLOW_TO}" ]]; then
   if [[ "${AGENT_FAMILY}" == "codex" ]]; then
-    for ((turn_wait=0; turn_wait<30; turn_wait++)); do
+    for ((turn_wait=0; turn_wait<${PLAN_DELEGATE_WORKER_WAIT_ATTEMPTS:-30}; turn_wait++)); do
       if [[ -n "$(worker_record turn 2>/dev/null || true)" ]]; then
         break
       fi
       kill -0 "${AGENT_PID}" 2>/dev/null || break
       [[ "$(ps -o stat= -p "${AGENT_PID}" 2>/dev/null || true)" == Z* ]] && break
-      sleep 1
+      sleep "${PLAN_DELEGATE_WORKER_POLL_SECS:-1}"
     done
   fi
 elif [[ "${AGENT_FAMILY}" == "claude" || "${USE_CODEX_MESH}" == "1" ]]; then
-  for ((worker_wait=0; worker_wait<30; worker_wait++)); do
+  for ((worker_wait=0; worker_wait<${PLAN_DELEGATE_WORKER_WAIT_ATTEMPTS:-30}; worker_wait++)); do
     if worker_record record 2>/dev/null; then
       break
     fi
     kill -0 "${AGENT_PID}" 2>/dev/null || break
     [[ "$(ps -o stat= -p "${AGENT_PID}" 2>/dev/null || true)" == Z* ]] && break
-    sleep 1
+    sleep "${PLAN_DELEGATE_WORKER_POLL_SECS:-1}"
   done
 fi
 

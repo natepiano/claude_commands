@@ -1804,19 +1804,35 @@ for arguments in (
 
     def test_gh_timeout_uses_configured_limit(self) -> None:
         self.write_config(gh_timeout_s="0.2")
-        self.gh["delays"] = [
-            {
-                "match": "variable get",
-                "seconds": 30.0,
-                "marker": "gh-timeout-started",
-            }
-        ]
-        self.sync_gh()
+        # Inject expiry at the subprocess boundary: a real 0.2 s timer can
+        # kill the Python gh stand-in before it even starts under load.
+        timeout_stub = r'''
+from pathlib import Path
+
+original_run = subprocess.run
+
+def expire_gh(command, *args, **kwargs):
+    if command[0] == "gh":
+        root = Path(os.environ["MAC_TEST_STUB_DIR"])
+        with (root / "gh-timeout-limits").open("a") as limits:
+            limits.write(str(kwargs.get("timeout")) + "\n")
+        raise subprocess.TimeoutExpired(command, kwargs.get("timeout"))
+    return original_run(command, *args, **kwargs)
+
+subprocess.run = expire_gh
+'''
+        _ = (self.root / "child-lifetime" / "sitecustomize.py").write_text(
+            FIXTURE_CHILD_LIFETIME + timeout_stub
+        )
         process = self.start_command(
             "block", "--holder", "alice", "--for", "rendering"
         )
-        self.wait_for_path(self.stub_directory / "gh-timeout-started")
-        stdout, stderr = process.communicate(timeout=20)
+        limits_path = self.stub_directory / "gh-timeout-limits"
+        self.wait_for_path(limits_path, timeout=300)
+        stdout, stderr = process.communicate(timeout=300)
+        limits = [float(line) for line in limits_path.read_text().splitlines()]
+        self.assertTrue(limits)
+        self.assertEqual(limits, [0.2] * len(limits))
         self.assertEqual(process.returncode, 2, stdout + stderr)
         self.assertIn("gh timed out after 0.2 s", stdout)
         self.assertEqual(self.block_state()["ci"], "still_on")

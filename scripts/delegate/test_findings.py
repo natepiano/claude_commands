@@ -8,8 +8,11 @@ import os
 import subprocess
 import tempfile
 import unittest
+from unittest.mock import patch
 from pathlib import Path
 from typing import cast, override
+from collections.abc import Callable
+from scripts.delegate import findings
 
 
 SCRIPT = Path(__file__).with_name("findings.py")
@@ -38,6 +41,7 @@ class FindingsLedgerTests(unittest.TestCase):
 
     @override
     def setUp(self) -> None:
+        self.enterContext(patch.dict(os.environ, {"PLAN_DELEGATE_SYNC_WRITES": "0"}))
         self.temporary = tempfile.TemporaryDirectory()
         self.root = Path(self.temporary.name)
         self.session_dir = self.root / "session"
@@ -61,6 +65,25 @@ class FindingsLedgerTests(unittest.TestCase):
         # there.
         environment["PLAN_DELEGATE_HISTORY_DIR"] = str(self.root / "history")
         return environment
+
+    def test_event_write_syncs_by_default_and_flushes_without_sync_for_disposable_state(self) -> None:
+        self.write_progress_state("phase-probe")
+        append = cast(Callable[[Path, dict[str, object], dict[str, object]], None], vars(findings)["_append_event"])
+
+        def flushed(descriptor: int) -> None:
+            self.assertGreaterEqual(descriptor, 0)
+            self.assertTrue(self.history_file.read_text())
+
+        for durable in (True, False):
+            with self.subTest(durable=durable), patch.dict(os.environ), patch.object(os, "fsync", side_effect=flushed) as sync:
+                if durable:
+                    _ = os.environ.pop("PLAN_DELEGATE_SYNC_WRITES", None)
+                else:
+                    os.environ["PLAN_DELEGATE_SYNC_WRITES"] = "0"
+                append(self.session_dir, {}, {"event_type": "probe"})
+                self.assertEqual(sync.call_count, int(durable))
+                self.assertEqual(self.events()[0]["event_type"], "probe")
+            self.history_file.unlink()
 
     def write_config(self, text: str) -> None:
         """Write the standard limits with `text` appended; a repeated key there wins."""

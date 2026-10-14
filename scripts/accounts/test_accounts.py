@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import io
+from importlib import import_module
 import base64
 import json
 import os
@@ -168,6 +169,7 @@ class AccountsTests(unittest.TestCase):
                 self.main_dir if tool == "claude" else self.home / ".codex3", 1,
                 accounts.KnownReset(now + timedelta(days=1)))
         with (patch.object(sessions, "live_sessions", return_value=[owner]),
+              patch.object(import_module("sessions"), "live_sessions", return_value=[owner]),
               patch.object(account, "process_config_dir", return_value=self.main_dir),
               patch.object(accounts, "pick", side_effect=chosen),
               patch.object(accounts, "role_account", return_value=accounts.CodexSeatsAccount("codex 1", self.home / ".codex1"))):
@@ -178,7 +180,7 @@ class AccountsTests(unittest.TestCase):
         self.assertIn("claude 2", output)
         self.assertIn("Codex seats: codex 1", output)
         self.assertIn("on refusal: codex 3", output)
-        self.assertIn("next", output.split("\n\n")[0])
+        self.assertIn("units:", output.splitlines()[0])
 
     def test_status_shows_each_owed_continuation_and_its_hold_reason(self) -> None:
         run = self.root / "seat-runs/run-one"
@@ -264,7 +266,7 @@ class AccountsTests(unittest.TestCase):
         """The status table's rows after its heading, each a tuple of its cells, then nothing else."""
         result, stdout, stderr = self.run_cli("status")
         self.assertEqual((result, stderr), (0, ""))
-        table = stdout.split("\n\n")[0].splitlines()
+        table = [line for line in stdout.split("\n\n")[0].splitlines() if line.startswith("|")]
         self.assertEqual(
             [cell.strip() for cell in table[0].strip("|").split("|")], list(accounts.TABLE_HEADINGS),
         )
@@ -373,6 +375,9 @@ class AccountsTests(unittest.TestCase):
         config = accounts.accounts_config_file()
         config.parent.mkdir(parents=True, exist_ok=True)
         _ = config.write_text(json.dumps(accounts.AccountsConfiguration(unit=label)), encoding="utf-8")
+        path = accounts.groups_file()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        _ = path.write_text(json.dumps({"units": label}))
 
     def test_exec_default_login_without_named_dirs_preserves_arguments_and_removes_config_override(self) -> None:
         self.login_directory("claude 2", "main@example.invalid", default=True)
@@ -474,6 +479,24 @@ class AccountsTests(unittest.TestCase):
         assert isinstance(result, accounts.AccountRefused)
         self.assertEqual(result.reason,
             "accounts: ~/.claude3 is logged in as other@example.invalid, not claude 3; see Log out and in in ~/.claude/docs/accounts.md")
+
+    def test_group_launch_prepares_configured_account_for_new_work_and_resumes(self) -> None:
+        """F006: every launch checks readiness without selecting another account."""
+        self.login_directory("claude 2", "main@example.invalid", default=True)
+        self.login_directory("claude 3", "expected@example.invalid")
+        path = accounts.groups_file()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        _ = path.write_text(json.dumps({"units": "claude 3", "showrunners": "claude 3"}))
+        before = path.read_bytes()
+        for role in ("unit", "showrunner"):
+            for resume in (False, True):
+                with self.subTest(role=role, resume=resume), patch.object(accounts, "prepared_account",
+                        return_value=accounts.AccountRefused("configured account is not ready")) as prepare:
+                    with self.assertRaises(accounts.AccountsError) as refused:
+                        _ = accounts.account_for_group_launch(role, resume=resume)
+                    self.assertEqual(str(refused.exception), "configured account is not ready")
+                    prepare.assert_called_once_with("claude 3", resume=resume)
+        self.assertEqual(path.read_bytes(), before)
 
     def test_prepared_account_broken_links_refuse_even_when_logged_out(self) -> None:
         self.login_directory("claude 2", "main@example.invalid", default=True)
@@ -981,26 +1004,42 @@ class AccountsTests(unittest.TestCase):
                                        accounts.AccountRoleBurn("claude 2", (), 10, 1),
                                        accounts.AccountRoleBurn("claude 3", (), 10, 1)])
 
-    def test_move_showrunners_names_a_timer_whose_session_is_not_running(self) -> None:
-        from importlib import import_module
-        # The modules move_showrunners imports by the paths it adds, as it finds them.
-        sys.path.insert(0, str(accounts.SCRIPTS / "shutdown"))
+    def test_showrunner_group_move_names_every_unregistered_timer_even_without_live_members(self) -> None:
+        self.login_directory("claude 2", "main@example.invalid", default=True)
+        self.login_directory("claude 3", "other@example.invalid")
         inventory = import_module("inventory")
-        stale = showrunners.Showrunner(session="", socket="", slug="remove-running-section", zone="America/New_York",
-                                       doc="/w/remove-running-section-production.md")
-        with (
-            patch.object(account, "named_claude_account", return_value=account.Account("claude", "main@example.invalid", "claude 2")),
-            patch.object(accounts, "_move_target", return_value=agent_accounts.KnownClaudeAccount("other@example.invalid", "claude 3")),
-            patch.object(inventory, "inventory", return_value={"machine": "natedev", "login": "main@example.invalid",
-                                                                 "label": "claude 2", "sessions": [], "unattributed": []}),
-            patch.object(inventory, "unregistered_showrunners", return_value=[stale]),
-        ):
-            refused = accounts.move_showrunners("claude 2", "claude 3")
-        self.assertIsInstance(refused, accounts.MoveRefused)
-        reason = cast(accounts.MoveRefused, refused).reason
-        self.assertEqual(reason.splitlines()[0], "no showrunner on claude 2 on this machine")
-        self.assertIn("remove-running-section: no session runs under the id its update timer names", reason)
-        self.assertIn("update_registration.py register --production /w/remove-running-section-production.md", reason)
+        stale = [showrunners.Showrunner(session="", socket="", slug=slug, zone="America/New_York",
+                                       doc=f"/w/{slug}-production.md") for slug in ("first", "second")]
+        with (patch.object(accounts, "live_group_members", return_value={"units": [], "showrunners": []}),
+              patch.object(inventory, "unregistered_showrunners", return_value=stale),
+              patch.object(accounts, "move_sessions") as moved):
+            code, output, error = self.run_cli("move", "showrunners", "claude 3")
+        self.assertEqual((code, error), (0, ""))
+        self.assertEqual(accounts.group_accounts().get("showrunners"), "claude 3")
+        self.assertEqual(output.replace("`", "").splitlines(), ["showrunners: no live session moves", *(
+            f"{runner['slug']}: no session runs under the id its update timer names; "
+            + "a showrunner running under another id is not moved until it runs "
+            + f"update_registration.py register --production {runner['doc']}" for runner in stale)])
+        moved.assert_not_called()
+
+    def test_showrunner_group_preview_names_unregistered_timers_without_configuring_or_requesting(self) -> None:
+        self.login_directory("claude 2", "main@example.invalid", default=True)
+        self.login_directory("claude 3", "other@example.invalid")
+        inventory = import_module("inventory")
+        stale = showrunners.Showrunner(session="", socket="", slug="missing", zone="America/New_York",
+                                       doc="/w/missing-production.md")
+        with (patch.object(accounts, "live_group_members", return_value={"units": [], "showrunners": []}),
+              patch.object(inventory, "unregistered_showrunners", return_value=[stale]),
+              patch.object(accounts, "move_sessions") as moved):
+            code, output, error = self.run_cli("move", "showrunners", "claude 3", "--dry-run")
+        self.assertEqual((code, error), (0, ""))
+        self.assertEqual(output.replace("`", "").splitlines(), ["showrunners: would select claude 3",
+            "showrunners: no live session moves",
+            "missing: no session runs under the id its update timer names; a showrunner running under "
+            + "another id is not moved until it runs update_registration.py register --production /w/missing-production.md"])
+        self.assertFalse(accounts.groups_file().exists())
+        self.assertFalse(accounts.roles_history_file().exists())
+        moved.assert_not_called()
 
     def test_burn_after_role_retirement_without_history_never_defaults_to_showrunners(self) -> None:
         self.login_directory("claude 2", "main@example.invalid", default=True)
@@ -1580,10 +1619,10 @@ class AccountsTests(unittest.TestCase):
         weekly_cell = later.astimezone(zone).strftime("%a %m-%d %H:%M %Z")
 
         self.assertEqual(self.status_rows(), [
-            ("~/.claude", "claude 2", "main@example.invalid", "next",
+            ("~/.claude", "claude 2", "main@example.invalid", "",
              "64%", soon.astimezone(zone).strftime("%H:%M %Z"), "71%", weekly_cell, "—", "—", read_cell),
             ("~/.claude1", "claude 1", "not set up", "", *("—",) * 7),
-            ("~/.claude3", "claude 3", "unit@example.invalid", "",
+            ("~/.claude3", "claude 3", "unit@example.invalid", "units",
              "100%", "—", "12%", weekly_cell, "—", "—", read_cell),
             ("~/.claude4", "claude 4", "not logged in", "", *("—",) * 7),
             CODEX_HOME_ROW,
@@ -1612,12 +1651,12 @@ class AccountsTests(unittest.TestCase):
         result, stdout, stderr = self.run_cli("status")
 
         self.assertEqual((result, stderr), (0, ""))
-        lines = stdout.split("\n\n")[0].splitlines()
+        lines = [line for line in stdout.split("\n\n")[0].splitlines() if line.startswith("|")]
         # The heading, the rule, the default folder, and the Codex home.
         self.assertEqual(len(lines), 4)
         self.assertEqual(len({len(line) for line in lines}), 1)
         self.assertEqual(set(lines[1]), {"|", " ", "-"})
-        self.assertEqual([cell.strip() for cell in lines[2].strip("|").split("|")][:4], ["~/.claude", "claude 2", "main@example.invalid", "next"])
+        self.assertEqual([cell.strip() for cell in lines[2].strip("|").split("|")][:4], ["~/.claude", "claude 2", "main@example.invalid", ""])
 
     def test_status_reads_live_only_when_no_reading_is_recent_and_keeps_what_it_read(self) -> None:
         self.write_main_config()
@@ -2139,10 +2178,10 @@ class AccountsTests(unittest.TestCase):
 
     def test_unknown_role_is_refused_by_every_role_command(self) -> None:
         for arguments in (
-            ("role", "showrunner"),
-            ("env", "showrunner"),
-            ("set-role", "showrunner", "default"),
-            ("swap", "showrunner", "default"),
+            ("role", "unknown"),
+            ("env", "unknown"),
+            ("set-role", "unknown", "default"),
+            ("swap", "unknown", "default"),
         ):
             with self.subTest(arguments=arguments):
                 result, stdout, stderr = self.run_cli(*arguments)
@@ -2150,7 +2189,7 @@ class AccountsTests(unittest.TestCase):
                 self.assertEqual(stdout, "")
                 self.assertEqual(
                     stderr,
-                    "accounts: showrunner is not a role; only unit and seats are supported\n",
+                    "accounts: unknown is not a role; only unit, showrunner and seats are supported\n",
                 )
 
 
@@ -2189,7 +2228,37 @@ class AccountsTests(unittest.TestCase):
                     self.assertEqual((result, stderr), (0, ""))
                     self.assertEqual(shlex.split(stdout), [f"CODEX_HOME={home}"])
 
+    def test_trust_command_default_and_named_accounts_quote_paths(self) -> None:
+        folder = self.root / "folder ' with $spaces"
+        clear_variables = " ".join(f"-u {name}" for name in account.NAMED_ACCOUNT_VARIABLES)
+        self.assertEqual(accounts.trust_command(folder, accounts.DefaultAccount()),
+                         f"cd {shlex.quote(str(folder))} && env {clear_variables} claude")
+        config_dir = self.root / "account ' directory"
+        expected = (f"cd {shlex.quote(str(folder))} && CLAUDE_CONFIG_DIR={shlex.quote(str(config_dir))} "
+                    + f"CLAUDE_CODE_REMOTE_MEMORY_DIR={shlex.quote(str(self.root / '.claude'))} claude")
+        with patch.object(Path, "home", return_value=self.root):
+            self.assertEqual(accounts.trust_command(folder, accounts.NamedAccount("fixture", config_dir)), expected)
+
+    def test_default_trust_command_clears_named_account_variables_only_in_child(self) -> None:
+        folder = self.root / "folder ' with $spaces"
+        folder.mkdir()
+        fake_claude = self.root / "claude"
+        _ = fake_claude.write_text(
+            f"#!{sys.executable}\nimport json, os\n"
+            + f"print(json.dumps({{name: os.environ.get(name) for name in {account.NAMED_ACCOUNT_VARIABLES!r}}}))\n")
+        fake_claude.chmod(0o755)
+        inherited = {name: "named account value" for name in account.NAMED_ACCOUNT_VARIABLES}
+        with patch.dict(os.environ, {**inherited, "PATH": f"{self.root}{os.pathsep}{os.defpath}"}):
+            result = subprocess.run(["/bin/sh", "-c", accounts.trust_command(folder, accounts.DefaultAccount())],
+                                    capture_output=True, text=True, check=True)
+            self.assertEqual(cast(object, json.loads(result.stdout)),
+                             {name: None for name in account.NAMED_ACCOUNT_VARIABLES})
+            self.assertEqual({name: os.environ[name] for name in account.NAMED_ACCOUNT_VARIABLES}, inherited)
+
     def test_default_prefixes_keep_claude_unassigned_and_codex_explicit(self) -> None:
+        path = accounts.groups_file()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        _ = path.write_text(json.dumps({"units": "default"}))
         self.login_directory("claude 2", "main@example.invalid", default=True)
         self.seed_room("main@example.invalid")
         with patch.dict(os.environ, {"CODEX_HOME": str(self.root / "caller")}):
@@ -2257,6 +2326,20 @@ class AccountsTests(unittest.TestCase):
         self.assertNotEqual(result, 0)
         self.assertIn("disk full", stderr)
         self.assertEqual(self.role_files(), before)
+
+    def test_burn_skips_group_history_between_legacy_unit_and_seats_entries(self) -> None:
+        self.login_directory("claude 2", "main@example.invalid", default=True)
+        self.write_role_history([accounts.RoleChange(at="2026-10-08T00:00:00Z", role="unit",
+            label="claude 3", account_label="claude 3")])
+        with accounts.roles_history_file().open("a") as history:
+            for entry in ({"at": "2026-10-09T00:00:00Z", "role": "seats", "label": "default"},
+                          {"at": "2026-10-09T00:00:00Z", "group": "units", "label": "claude 1", "why": "refused"},
+                          {"at": "2026-10-09T00:00:00Z", "group": "showrunners", "label": "claude 3", "why": "refused"}):
+                _ = history.write(json.dumps(entry) + "\n")
+        self.write_readings([accounts.QuotaReading(account="claude 3", at=f"2026-10-{day:02d}T00:00:00Z", remaining=left)
+            for day, left in ((9, 90.0), (10, 80.0))])
+        self.assertEqual(accounts.burn(datetime(2026, 10, 9, tzinfo=timezone.utc), datetime(2026, 10, 10, tzinfo=timezone.utc)),
+            [accounts.AccountRoleBurn("claude 3", ("unit directors",), 10, 1)])
 
     def test_unit_burn_ignores_seats_history_records(self) -> None:
         _ = self.seats_fixture()
@@ -2631,12 +2714,138 @@ class PickerTests(unittest.TestCase):
     def assert_picked(self, label: str, *options: str, tool: str = "claude") -> None:
         self.assertEqual(self.cli(*options, tool=tool), (0, label + "\n", ""))
 
-    def test_picker_without_any_saved_reading_uses_default_and_explains_fallback(self) -> None:
+    def groups(self, units: str = "claude 1", showrunners: str = "claude 3") -> Path:
+        path = self.home / ".local/state/accounts/groups.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        _ = path.write_text(json.dumps({"units": units, "showrunners": showrunners}))
+        return path
+
+    def group_cli(self, *arguments: str) -> tuple[int, str, str]:
+        output, error = io.StringIO(), io.StringIO()
+        with patch.object(accounts, "datetime", PickerTime), redirect_stdout(output), redirect_stderr(error):
+            code = accounts.main(list(arguments))
+        return code, output.getvalue(), error.getvalue()
+
+    def test_placement_zero_percent_without_refusal_has_room_for_units(self) -> None:
+        self.reading("Claude", "third@example.invalid", 0, 2, five_left=0)
+        result = accounts.placement("units", self.now, exclude=frozenset())
+        self.assertEqual(result.label, "claude 3")
+        self.assertIsInstance(result.reason, accounts.UnitsResetSoonest)
+
+    def test_placement_unresolved_refusal_excludes_positive_room(self) -> None:
+        refusals.write_refusal(refusals.AccountRefusal("claude", "third@example.invalid",
+            refusals.KnownWindow("weekly"), refusals.KnownReset(self.now + timedelta(days=2)), self.now))
+        result = accounts.placement("units", self.now, exclude=frozenset())
+        self.assertEqual(result.label, "claude 1")
+
+    def test_placement_units_choose_soonest_reset_and_break_ties_by_most_left(self) -> None:
+        self.assertEqual(accounts.placement("units", self.now, exclude=frozenset()).label, "claude 3")
+        self.reading("Claude", "first@example.invalid", 4, 2)
+        self.assertEqual(accounts.placement("units", self.now, exclude=frozenset()).label, "claude 1")
+
+    def test_placement_showrunners_choose_most_weekly_left(self) -> None:
+        result = accounts.placement("showrunners", self.now, exclude=frozenset())
+        self.assertEqual(result.label, "claude 1")
+        self.assertIsInstance(result.reason, accounts.ShowrunnersMostLeft)
+
+    def test_placement_no_room_stays_on_stored_group_account(self) -> None:
+        path = self.groups()
+        for login in ("main@example.invalid", "first@example.invalid", "third@example.invalid"):
+            refusals.write_refusal(refusals.AccountRefusal("claude", login,
+                refusals.KnownWindow("weekly"), refusals.KnownReset(self.now + timedelta(days=2)), self.now))
+        before = path.read_bytes()
+        unit = accounts.placement("units", self.now, exclude=frozenset())
+        self.assertEqual(unit.label, "claude 1")
+        self.assertIsInstance(unit.reason, accounts.GroupNoRoom)
+        self.assertEqual(accounts.placement("showrunners", self.now, exclude=frozenset()).label, "claude 3")
+        self.assertEqual(path.read_bytes(), before)
+
+    def test_placement_example_ranks_zero_percent_units_and_high_room_showrunners(self) -> None:
+        _ = self.groups()
+        self.reading("Claude", "main@example.invalid", 0, 2)
+        self.reading("Claude", "third@example.invalid", 3, 4)
+        self.reading("Claude", "first@example.invalid", 53, 6)
+        self.assertEqual(accounts.placement("showrunners", self.now, exclude=frozenset({"claude 3"})).label, "claude 1")
+        self.assertEqual(accounts.placement("units", self.now, exclude=frozenset({"claude 1"})).label, "default")
+        with patch.object(accounts, "datetime", PickerTime):
+            self.assertEqual(accounts.role_account("unit"), accounts.NamedAccount("claude 1", accounts.account_dir("claude 1")))
+            self.assertEqual(accounts.role_account("showrunner"), accounts.NamedAccount("claude 3", accounts.account_dir("claude 3")))
+
+    def test_new_launches_keep_each_stored_group_even_when_readings_rank_better_elsewhere(self) -> None:
+        path = self.groups()
+        before = path.read_bytes()
+        with patch.object(accounts, "datetime", PickerTime):
+            unit = accounts.prepared_account("unit", resume=True)
+            runner = accounts.role_account("showrunner")
+        self.assertIsInstance(unit, accounts.PreparedAccount)
+        assert isinstance(unit, accounts.PreparedAccount)
+        self.assertEqual(unit.variables, named_environment(accounts.account_dir("claude 1")))
+        self.assertEqual(runner, accounts.NamedAccount("claude 3", accounts.account_dir("claude 3")))
+        self.assertEqual(path.read_bytes(), before)
+
+    def test_read_only_placement_and_status_leave_absent_group_file_absent(self) -> None:
+        path = self.home / ".local/state/accounts/groups.json"
+        for arguments in (("placement", "--explain"), ("status",)):
+            with self.subTest(arguments=arguments):
+                code, output, error = self.group_cli(*arguments)
+                self.assertEqual((code, error), (0, ""))
+                self.assertIn("units", output)
+                self.assertIn("showrunners", output)
+                self.assertIn("not configured", output)
+                self.assertFalse(path.exists())
+                self.assertFalse(accounts.roles_history_file().exists())
+
+    def test_unconfigured_launch_roles_refuse_without_inference_or_group_writes(self) -> None:
+        """F004: configuration alone decides a launch account."""
+        with patch.object(accounts, "pick", side_effect=AssertionError("launch inferred from readings")):
+            for role, group in (("unit", "units"), ("showrunner", "showrunners")):
+                with self.subTest(role=role), self.assertRaises(accounts.AccountsError) as refused:
+                    _ = accounts.role_account(role)
+                self.assertIn(f"accounts.py move {group} <claude N>", str(refused.exception))
+        self.assertFalse(accounts.groups_file().exists())
+        self.assertFalse(accounts.roles_history_file().exists())
+
+    def test_configured_launch_roles_ignore_room_and_allow_one_shared_account(self) -> None:
+        """F004: even a refused configured account is returned without a picker call."""
+        path = self.groups(units="claude 1", showrunners="claude 1")
+        before = path.read_bytes()
+        refusals.write_refusal(refusals.AccountRefusal("claude", "first@example.invalid",
+            refusals.KnownWindow("weekly"), refusals.KnownReset(self.now + timedelta(days=2)), self.now))
+        with patch.object(accounts, "pick", side_effect=AssertionError("launch checked room")):
+            for role in ("unit", "showrunner"):
+                self.assertEqual(accounts.role_account(role), accounts.NamedAccount("claude 1", accounts.account_dir("claude 1")))
+        self.assertEqual(path.read_bytes(), before)
+        self.assertFalse(accounts.roles_history_file().exists())
+
+    def test_manual_group_move_creates_only_requested_configuration_when_file_absent(self) -> None:
+        """F004: an explicit move can configure one group without bootstrapping the other."""
+        with patch.object(accounts, "move_sessions", return_value=()) as moved:
+            code, _, error = self.group_cli("move", "units", "claude 1")
+        self.assertEqual((code, error), (0, ""))
+        self.assertEqual(accounts.role_account("unit"), accounts.NamedAccount("claude 1", accounts.account_dir("claude 1")))
+        with self.assertRaises(accounts.AccountsError) as refused:
+            _ = accounts.role_account("showrunner")
+        self.assertIn("accounts.py move showrunners <claude N>", str(refused.exception))
+        self.assertEqual(json.loads(accounts.groups_file().read_text()), {"units": "claude 1"})
+        self.assertFalse(moved.called)
+
+    def test_status_opens_with_groups_and_role_cells_replace_next(self) -> None:
+        _ = self.groups()
+        code, output, error = self.group_cli("status")
+        self.assertEqual((code, error), (0, ""))
+        self.assertEqual(output.splitlines()[0], "units: claude 1, showrunners: claude 3")
+        rows = [[cell.strip() for cell in line.strip("|").split("|")]
+                for line in output.splitlines() if line.startswith("| ~/.claude")]
+        self.assertIn("units", next(row[3] for row in rows if row[1] == "claude 1"))
+        self.assertIn("showrunners", next(row[3] for row in rows if row[1] == "claude 3"))
+        self.assertFalse(any("next" in row[3] for row in rows))
+
+    def test_picker_without_saved_readings_keeps_unrefused_accounts_eligible(self) -> None:
         usage_store.store_file().unlink()
         code, output, error = self.cli("--explain")
         self.assertEqual((code, error), (0, ""))
         self.assertEqual(output.splitlines()[0], "default")
-        self.assertIn("no fresh readings on this machine; using default", output)
+        self.assertIn("no fresh readings", output)
 
     def test_picker_without_fresh_readings_keeps_candidate_despite_stale_zero_room(self) -> None:
         for login in ("main@example.invalid", "first@example.invalid", "third@example.invalid"):
@@ -2644,7 +2853,7 @@ class PickerTests(unittest.TestCase):
         self.assert_picked("claude 3", "--keep", "claude 3")
         self.assert_picked("default", "--keep", "claude 3", "--exclude", "claude 3")
 
-    def test_picker_without_fresh_readings_skips_refused_keep_and_uses_default(self) -> None:
+    def test_picker_without_fresh_readings_skips_refused_keep(self) -> None:
         usage_store.store_file().unlink()
         refusals.write_refusal(refusals.AccountRefusal("claude", "third@example.invalid",
             refusals.UnknownWindow(), refusals.NoResetKnown(), self.now))
@@ -2656,16 +2865,13 @@ class PickerTests(unittest.TestCase):
         usage_store.store_file().unlink()
         refusals.write_refusal(refusals.AccountRefusal("claude", "main@example.invalid",
             refusals.UnknownWindow(), refusals.NoResetKnown(), self.now))
-        code, output, error = self.cli()
-        self.assertEqual(code, 1)
-        self.assertIn("no claude account has room", output + error)
+        self.assert_picked("claude 1")
 
-    def test_picker_one_fresh_exhausted_candidate_disables_missing_reading_fallback(self) -> None:
+    def test_picker_fresh_zero_candidate_remains_eligible_with_missing_other_readings(self) -> None:
         usage_store.store_file().unlink()
         self.reading("Claude", "third@example.invalid", 0, 2)
-        code, output, error = self.cli("--keep", "default")
-        self.assertEqual(code, 1)
-        self.assertIn("no claude account has room", output + error)
+        self.assert_picked("default", "--keep", "default")
+        self.assert_picked("claude 3")
 
     def test_picker_prefers_soonest_weekly_reset_over_most_room(self) -> None:
         self.assert_picked("claude 3")
@@ -2681,9 +2887,9 @@ class PickerTests(unittest.TestCase):
     def test_picker_keeps_current_account_with_room_despite_a_sooner_reset(self) -> None:
         self.assert_picked("claude 1", "--keep", "claude 1")
 
-    def test_picker_does_not_keep_an_exhausted_account(self) -> None:
+    def test_picker_keeps_zero_percent_account_without_a_refusal(self) -> None:
         self.reading("Claude", "first@example.invalid", 0, 2)
-        self.assert_picked("claude 3", "--keep", "claude 1")
+        self.assert_picked("claude 1", "--keep", "claude 1")
 
     def test_picker_has_no_minimum_remaining_percentage(self) -> None:
         self.reading("Claude", "third@example.invalid", 1, 2, five_left=1)
@@ -2695,9 +2901,9 @@ class PickerTests(unittest.TestCase):
     def test_picker_exclude_overrides_keep(self) -> None:
         self.assert_picked("claude 1", "--keep", "claude 3", "--exclude", "claude 3")
 
-    def test_picker_refuses_a_zero_five_hour_window(self) -> None:
+    def test_picker_zero_five_hour_window_without_refusal_still_has_room(self) -> None:
         self.reading("Claude", "third@example.invalid", 90, 2, five_left=0)
-        self.assert_picked("claude 1")
+        self.assert_picked("claude 3")
 
     def test_picker_accepts_weekly_room_when_claude_has_no_five_hour_window(self) -> None:
         self.reading("Claude", "third@example.invalid", 1, 2, five=False)
@@ -2707,7 +2913,7 @@ class PickerTests(unittest.TestCase):
         self.reading("Claude", "third@example.invalid", 90, 2, age=timedelta(minutes=10, microseconds=1))
         code, output, error = self.cli("--explain")
         self.assertEqual((code, error), (0, ""))
-        self.assertIn("no reading in the last 10 minutes", output)
+        self.assertIn("has room", output)
         self.assertEqual(output.splitlines()[0], "claude 1")
 
     def test_picker_accepts_a_reading_exactly_ten_minutes_old(self) -> None:
@@ -2718,7 +2924,7 @@ class PickerTests(unittest.TestCase):
         self.claude("claude 4", "unread@example.invalid")
         _, output, _ = self.cli("--explain")
         self.assertIn("claude 4", output)
-        self.assertIn("no reading in the last 10 minutes", output)
+        self.assertIn("has room", output)
         self.assert_picked("claude 3")
 
     def test_picker_skips_a_named_directory_that_fails_check(self) -> None:
@@ -2772,6 +2978,8 @@ class PickerTests(unittest.TestCase):
     def test_picker_no_room_reports_earliest_known_reset(self) -> None:
         for login, days in (("main@example.invalid", 7), ("first@example.invalid", 5), ("third@example.invalid", 2)):
             self.reading("Claude", login, 0, days, five_left=0)
+            refusals.write_refusal(refusals.AccountRefusal("claude", login, refusals.UnknownWindow(),
+                refusals.NoResetKnown(), self.now))
         selected = accounts.pick("claude", self.now, keep=accounts.NoKeep())
         self.assertIsInstance(selected, accounts.NoAccountWithRoom)
         assert isinstance(selected, accounts.NoAccountWithRoom)
@@ -2783,6 +2991,8 @@ class PickerTests(unittest.TestCase):
     def test_picker_no_room_without_any_reset_uses_no_reset_known(self) -> None:
         for login in ("main@example.invalid", "first@example.invalid", "third@example.invalid"):
             self.reading("Claude", login, 0, 2, reset=False, five=False)
+            refusals.write_refusal(refusals.AccountRefusal("claude", login, refusals.UnknownWindow(),
+                refusals.NoResetKnown(), self.now))
         selected = accounts.pick("claude", self.now, keep=accounts.NoKeep())
         self.assertIsInstance(selected, accounts.NoAccountWithRoom)
         assert isinstance(selected, accounts.NoAccountWithRoom)
@@ -2829,17 +3039,19 @@ class PickerTests(unittest.TestCase):
         self.assertIsInstance(reading.weekly.reset, refusals.NoResetKnown)
         self.assertIsInstance(reading.five_hour, accounts.NoWindow)
 
-    def test_status_marks_only_pickers_current_choice_as_next(self) -> None:
+    def test_status_marks_configured_groups_instead_of_picker_next(self) -> None:
+        _ = self.groups(units="claude 3", showrunners="claude 1")
         with patch.object(accounts, "datetime", PickerTime):
             output, error = io.StringIO(), io.StringIO()
             with redirect_stdout(output), redirect_stderr(error):
                 self.assertEqual(accounts.main(["status"]), 0)
         rows = [[cell.strip() for cell in line.strip("|").split("|")]
                 for line in output.getvalue().splitlines() if line.startswith("| ~/.claude")]
-        self.assertEqual([row[1] for row in rows if row[3] == "next"], ["claude 3"])
-        self.assertTrue(all("unit" not in row[3] for row in rows))
+        self.assertEqual([row[1] for row in rows if row[3] == "units"], ["claude 3"])
+        self.assertEqual([row[1] for row in rows if row[3] == "showrunners"], ["claude 1"])
 
-    def test_unit_role_reads_picker_and_ignores_saved_unit_key_without_writes(self) -> None:
+    def test_unit_role_reads_group_and_ignores_legacy_saved_unit_key(self) -> None:
+        _ = self.groups(units="claude 3")
         config = accounts.accounts_config_file()
         config.parent.mkdir(parents=True, exist_ok=True)
         _ = config.write_text('{"unit": "claude 1"}')
@@ -2854,7 +3066,8 @@ class PickerTests(unittest.TestCase):
         self.assertEqual(config.read_bytes(), before)
         self.assertFalse(accounts.roles_history_file().exists())
 
-    def test_env_unit_and_exec_unit_use_the_picked_account_without_recording_a_role(self) -> None:
+    def test_env_unit_and_exec_unit_use_configured_units_account(self) -> None:
+        _ = self.groups(units="claude 3")
         with patch.object(accounts, "datetime", PickerTime):
             output = io.StringIO()
             with redirect_stdout(output):
@@ -2880,7 +3093,7 @@ class PickerTests(unittest.TestCase):
         self.assertEqual([reason.label for reason in picked.reasons if reason.status == "picked"], ["claude 3"])
 
     def test_retired_unit_mutations_refuse_before_disk_or_process_changes(self) -> None:
-        cause = "the unit role is gone: new sessions pick the account with room (accounts.py pick claude); move one session with accounts.py move"
+        cause = "unit launches use the configured units account; select and move the group with accounts.py move units <claude N>"
         for verb in ("set-role", "swap"):
             with self.subTest(verb=verb), patch.object(subprocess, "run") as process:
                 output, error = io.StringIO(), io.StringIO()

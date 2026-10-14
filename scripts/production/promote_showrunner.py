@@ -5,7 +5,7 @@ Usage: promote_showrunner.py <unit> --production <child production doc> --model 
 
 The parent showrunner runs it, once the unit has written the child's production doc and committed it.
 The unit gets `/exit`; once its Claude is gone its host session is ended, and add_showrunner.py resumes
-the same conversation as the child's showrunner: in tmux, with no unit mark, on its retained account,
+the same conversation as the child's showrunner: in tmux, with no unit mark, on the configured showrunners account,
 attached to this showrunner's production. The unit's Units row is then retired and committed in this
 showrunner's checkout. --check runs every refusal and stops nothing.
 
@@ -35,7 +35,6 @@ import herdr
 from session_pane import HerdrFailure, read_place, type_place, where_place
 from add_unit import (Production, Refusal, cell_value, commit_paths, plan_cell_is_retired, read_production,
                       unit_headings, unit_rows, unit_table)
-from scripts.whoami import account
 
 STOP_WAIT_S = float(os.environ.get("PROMOTE_STOP_WAIT_S") or 60)
 POLL_S = 0.5
@@ -135,7 +134,7 @@ def checked(name: str, child_doc: Path) -> Promotion:
     child = read_production(child_doc)
     _committed(child.doc)
     # Only the unit's tmux session is exempt from the destination's tmux name collision.
-    directory = recorded_account_directory(marked)
+    directory = showrunner_account_directory()
     ending = marked.label if isinstance(marked.place, unit_lookup.TmuxPlace) else ""
     _ = add_showrunner.checked(child, parent.slug, ending=ending, start_in=worktree, config_dir=directory)
     return Promotion(unit, parent, child, marked, claude, worktree, cell_value(cells.get("Plan", "")))
@@ -178,25 +177,17 @@ def stop(promotion: Promotion) -> bool:
     return True
 
 
-def recorded_account_directory(marked: unit_lookup.MarkedUnit) -> Path:
-    if isinstance(marked.place, unit_lookup.TmuxPlace):
-        held = _tmux("show-options", "-v", "-t", f"={marked.label}:", "@claude_config_dir")
-        if held.returncode != 0 or not held.stdout.strip():
-            raise Refusal("no account recorded for this unit; resume with --account before promoting")
-        directory = Path(held.stdout.strip()).expanduser()
-    else:
-        if not isinstance(marked.claude, unit_lookup.LiveClaude):
-            raise Refusal(f"{marked.unit}: no live Claude to read its account")
-        directory = account.process_config_dir(marked.claude.pid)
-        if directory is None:
-            raise Refusal(f"{marked.unit}: cannot read its live Claude's account environment")
-    if not directory.is_dir():
-        raise Refusal(f"recorded resume account directory {directory} is missing")
-    return directory
+def showrunner_account_directory() -> Path:
+    from scripts.accounts import accounts
+    try:
+        selected = accounts.account_for_group_launch("showrunner", resume=True)
+    except accounts.AccountsError as error:
+        raise Refusal(str(error)) from error
+    return accounts.main_config_dir() if isinstance(selected, accounts.DefaultAccount) else selected.dir
 
 
 def account_line() -> str:
-    return "same account, no move"
+    return "showrunners account"
 
 
 def retire(promotion: Promotion) -> None:
@@ -222,11 +213,11 @@ def retire(promotion: Promotion) -> None:
                  + f"promoted to showrunner of {promotion.child.slug}")
 
 
-def restore_line(promotion: Promotion, retained: Path) -> str:
+def restore_line(promotion: Promotion) -> str:
     """The command that resumes the stopped session as the unit it was."""
     return "~/.claude/scripts/lib/py ~/.claude/scripts/production/add_unit.py " + shlex.join([
         "--production", str(promotion.parent.doc), promotion.unit.removesuffix("-unit"), "--plan", promotion.plan,
-        "--resume", promotion.claude.session_id, "--cwd", str(promotion.worktree), "--config-dir", str(retained)])
+        "--resume", promotion.claude.session_id, "--cwd", str(promotion.worktree)])
 
 
 def main(argv: list[str]) -> int:
@@ -239,7 +230,7 @@ def main(argv: list[str]) -> int:
     args = parser.parse_args(argv)
     try:
         promotion = checked(cast(str, args.unit), cast(Path, args.production))
-        retained = recorded_account_directory(promotion.marked)
+        target_directory = showrunner_account_directory()
         moved = account_line()
     except Refusal as refusal:
         print(f"promote_showrunner: {refusal}", file=sys.stderr)
@@ -262,10 +253,10 @@ def main(argv: list[str]) -> int:
         return 1
     started = add_showrunner.main(["--production", str(promotion.child.doc), "--model", cast(str, args.model),
                                    "--effort", cast(str, args.effort), "--resume", promotion.claude.session_id,
-                                   "--cwd", str(promotion.worktree), "--config-dir", str(retained)])
+                                   "--cwd", str(promotion.worktree), "--config-dir", str(target_directory)])
     if started == 2:
         print(f"{unit} is stopped and did not start as a showrunner; its Units row is unchanged. "
-              + f"Bring it back as the unit it was with: {restore_line(promotion, retained)}")
+              + f"Bring it back as the unit it was with: {restore_line(promotion)}")
         return 1
     try:
         retire(promotion)

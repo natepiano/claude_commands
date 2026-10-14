@@ -189,6 +189,9 @@ QUEUE_GRACE_SECS = 3.0
 # A resident delegate sits between turns with nothing on the socket, so its loop
 # wakes this often to look for the end marker.
 RESIDENT_POLL_SECS = 1.0
+# Production gives a server five seconds to stop; disposable child processes need no long grace.
+REAP_WAIT_SECS = 5.0
+REAP_POLL_SECS = 0.2
 # A launcher waiting on a turn wakes this often to check that the turn has not ended unseen.
 UNSEEN_END_CHECK_SECS = 60.0
 UNSEEN_END_CALL_SECS = 10.0
@@ -3594,9 +3597,9 @@ def _reap(pid: int) -> bool:
     except OSError as exc:
         print(f"could not signal app-server {pid}: {exc}")
         return False
-    deadline = time.time() + 5.0
+    deadline = time.time() + REAP_WAIT_SECS
     while time.time() < deadline and _pid_alive(pid):
-        time.sleep(0.2)
+        time.sleep(REAP_POLL_SECS)
     if _pid_alive(pid):
         with contextlib.suppress(OSError):
             os.kill(pid, signal.SIGKILL)

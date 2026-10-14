@@ -5,6 +5,7 @@ from __future__ import annotations
 import importlib
 import json
 import os
+import shlex
 import shutil
 import sqlite3
 import stat
@@ -150,7 +151,7 @@ class CollectorFixture(unittest.TestCase):
         environment["PATH"] = f"{self.root / 'bin'}:{environment.get('PATH', '')}"
         environment["PLAN_DELEGATE_HISTORY_DIR"] = (
             "" if history_override == "empty" else str(self.root / ".local/state/plan-delegate"))
-        command = [sys.executable, str(COLLECTOR), "--db", str(db),
+        command = [sys.executable, str(COLLECTOR), "--db", str(db), "--durability", "off",
                    "--machine", machine, "--claude-root", str(self.claude_root),
                    "--codex-root", str(self.codex_root), "--agents-log", str(self.agents_path),
                    "--readings", str(self.root / "readings.jsonl"),
@@ -181,6 +182,35 @@ class CollectorFixture(unittest.TestCase):
             timeout=30,
             check=False,
         )
+
+    def assert_cli_durability(self, selection: list[str], expected: str) -> None:
+        command, environment = self.collector_invocation(db=self.db_path)
+        # Remove the fixture's disposable default to exercise the actual CLI default too.
+        position = command.index("--durability")
+        del command[position:position + 2]
+        trace = self.root / "durability-sql.jsonl"
+        program = f'''import json, runpy, sqlite3, sys
+from pathlib import Path
+trace = Path({str(trace)!r})
+original_connect = sqlite3.connect
+def record(statement):
+    with trace.open("a") as output:
+        output.write(json.dumps(statement) + "\\n")
+def connect(*args, **kwargs):
+    database = original_connect(*args, **kwargs)
+    database.set_trace_callback(record)
+    return database
+sqlite3.connect = connect
+sys.argv.pop(0)
+runpy.run_path(sys.argv[0], run_name="__main__")
+'''
+        result = subprocess.run([sys.executable, "-c", program, *command[1:], *selection],
+                                env=environment, cwd=REPOSITORY, capture_output=True,
+                                text=True, check=False, timeout=300)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        statements = [cast(str, json.loads(line)) for line in trace.read_text().splitlines()]
+        self.assertEqual([sql for sql in statements if sql.startswith("PRAGMA synchronous=")], [expected])
+        self.assertGreater(len(self.rows("SELECT * FROM turns")), 0)
 
     def collect(self, *, machine: str = "natedev",
                 history_override: Literal["configured", "empty"] = "configured",
@@ -283,6 +313,12 @@ class CollectorFixture(unittest.TestCase):
 
 
 class CollectTests(CollectorFixture):
+    def test_collector_cli_keeps_durable_commits_by_default(self) -> None:
+        self.assert_cli_durability([], "PRAGMA synchronous=FULL")
+
+    def test_collector_cli_can_disable_sync_for_disposable_ledgers(self) -> None:
+        self.assert_cli_durability(["--durability", "off"], "PRAGMA synchronous=OFF")
+
     def two_codex_sessions(self) -> tuple[Path, Path, int, int]:
         shutil.rmtree(self.codex_root)
         first = self.codex_root / "2026/10/10/rollout-first.jsonl"
@@ -1744,6 +1780,35 @@ class MacCollectTests(CollectorFixture):
             lines = [line for line in run.output.splitlines() if line.startswith(f"mac {family}:")]
             self.assertRegex(lines[0], r"\bcut\b")
             self.assertNotIn("invalid remote stream", lines[0])
+
+    def test_cut_stream_drains_remote_writer_before_reaping_shell(self) -> None:
+        report = self.root / "ssh-report.json"
+        finished = self.root / "remote-writer-finished"
+        configuration = {"home": str(self.mac_home), "execution_directory": str(self.execution_directory),
+                         "report": str(report), "behavior": "cut_inside_record", "database": str(self.db_path),
+                         "previous_role_read_at": ""}
+        config = self.root / "ssh-configuration.json"
+        _ = config.write_text(json.dumps(configuration), encoding="utf-8")
+        records = ('{"type":"file","kind":"claude"}\n{"type":"cursor"}\n'
+                   '{"type":"file","kind":"claude"}\n{"type":"turn"}\n')
+        writer = (
+            "import sys; from pathlib import Path; "
+            f"sys.stdout.write({records!r}); sys.stdout.flush(); "
+            "sys.stdout.write('{}\\n' * 100000); sys.stdout.flush(); "
+            "Path(sys.argv[1]).write_text('finished')"
+        )
+        remote_command = shlex.join((sys.executable, "-c", writer, str(finished))) + '; printf "\\nrc=%s\\n" "$?"'
+        result = subprocess.run(
+            [str(self.root / "bin/ssh"), remote_command],
+            input=b"fixture request", capture_output=True, timeout=30, check=False,
+            env={**os.environ, "USAGE_TEST_SSH_CONFIG": str(config)},
+        )
+        self.assertEqual(result.stderr, b"", result.stderr.decode(errors="replace"))
+        self.assertEqual(result.returncode, 0)
+        self.assertTrue(finished.is_file(), "A cut fixture must reap the writer after it finishes")
+        lines = records.splitlines(keepends=True)
+        expected = "".join(lines[:-1]) + lines[-1][:len(lines[-1]) // 2]
+        self.assertEqual(result.stdout, expected.encode())
 
 
 if __name__ == "__main__":

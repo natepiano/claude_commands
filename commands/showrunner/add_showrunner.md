@@ -34,10 +34,10 @@ What it does:
   showrunner checkout, with `/showrunner:produce <doc>`. With `resume` it
   resumes that session in `<dir>`, the directory it ran in, with
   `/showrunner:produce <doc> resume`.
-- New sessions pick an account with room whose weekly reset comes soonest.
-  Resumes retain the tmux session’s recorded account; use `--account <label>`
-  or `--config-dir <dir>` with `--resume` to supply or override it. With no
-  recorded account, resume refuses and names `--account`. It carries no unit
+- New and resumed sessions start on the configured showrunners account. An
+  `--account` or `--config-dir` naming another account is refused; with the
+  showrunners account not configured, it refuses and names
+  `accounts.py move showrunners "claude N"`. It carries no unit
   mark, so it is never relayed to as one of your units.
 - It waits up to three minutes for the new showrunner to register its update
   timer, then attaches it to your production and tells it so. Session records

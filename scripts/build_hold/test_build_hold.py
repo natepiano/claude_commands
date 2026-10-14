@@ -82,11 +82,6 @@ class IsolatedBuildHoldTest(unittest.TestCase):
                 self.assertFalse(thread.is_alive())
 
 
-class ImportTests(IsolatedBuildHoldTest):
-    def test_helper_imports_from_its_sibling_directory(self) -> None:
-        self.assertEqual(build_hold.__name__, "build_hold")
-
-
 class OwningSessionTests(IsolatedBuildHoldTest):
     active: Path = Path()
     delegate_run: Path = Path()

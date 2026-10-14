@@ -144,6 +144,7 @@ PY="${HOME}/.claude/scripts/lib/py"
 # shellcheck source=/dev/null
 source "$HOME/.claude/scripts/lint/invoke.sh"
 BUILD_TARGETS_SCRIPT="${BUILD_TARGETS_SCRIPT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../build_targets" && pwd)/build_targets.py}"
+LOCAL_RELEASE_WAIT_SCRIPT="${VERIFY_LOCAL_RELEASE_WAIT_SCRIPT:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/local_release_wait.py}"
 
 # A failed step may be a process killed by earlyoom or the kernel. Keep the
 # journal query here so tests can put a journalctl stub first on PATH.
@@ -951,7 +952,7 @@ route_test() {
             announced_reason="$BUILDLOG_MAC_REASON"
         fi
         ROUTING_WAIT_STARTED="$("$PY" -c 'import time; print(time.monotonic())')"
-        sleep "${BUILD_TARGETS_POLL_S:-15}" &
+        "$PY" "$LOCAL_RELEASE_WAIT_SCRIPT" "${BUILD_TARGETS_POLL_S:-15}" "$BUILDLOG_CALL_ID" &
         HOLD_WAITER_PID=$!
         wait "$HOLD_WAITER_PID"
         HOLD_WAITER_PID=""
@@ -1162,8 +1163,18 @@ BOARD_HELPER="${HOME}/.claude/scripts/delegate/board.sh"
 BOARD_DIR="${PLAN_DELEGATE_BOARD_DIR:-}"
 BOARD_SLOT="${PLAN_DELEGATE_TEAM_ROLE:-}"
 TOKEN_HELD=0
+token_wait_clock() {
+    # Tests can advance a disposable clock while acquisition still blocks on
+    # the real board. Normal calls retain Bash's elapsed-seconds clock.
+    if [[ -n "${PLAN_DELEGATE_TOKEN_CLOCK_FILE:-}" ]]; then
+        read -r TOKEN_CLOCK_NOW < "$PLAN_DELEGATE_TOKEN_CLOCK_FILE"
+    else
+        TOKEN_CLOCK_NOW=$SECONDS
+    fi
+}
 if [[ -n "${BOARD_DIR}" && -n "${BOARD_SLOT}" && -f "${BOARD_HELPER}" ]]; then
-    TOKEN_WAIT_STARTED=$SECONDS
+    token_wait_clock
+    TOKEN_WAIT_STARTED=$TOKEN_CLOCK_NOW
     if bash "${BOARD_HELPER}" acquire "${BOARD_DIR}" "${BOARD_SLOT}" cargo \
         --pid $$ --hold 3600 --wait 1800 >/dev/null 2>&1; then
         TOKEN_HELD=1
@@ -1171,7 +1182,8 @@ if [[ -n "${BOARD_DIR}" && -n "${BOARD_SLOT}" && -f "${BOARD_HELPER}" ]]; then
         echo "verify.sh: waited for the cargo token and did not get it." >&2
         exit 1
     fi
-    TOKEN_WAIT_S=$(( SECONDS - TOKEN_WAIT_STARTED ))
+    token_wait_clock
+    TOKEN_WAIT_S=$(( TOKEN_CLOCK_NOW - TOKEN_WAIT_STARTED ))
 fi
 
 # Fork before starting each step. The child creates its own session, records

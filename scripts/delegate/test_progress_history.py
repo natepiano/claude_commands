@@ -65,6 +65,7 @@ class ProgressHistoryTests(unittest.TestCase):
 
     @override
     def setUp(self) -> None:
+        self.enterContext(patch.dict(os.environ, {"PLAN_DELEGATE_SYNC_WRITES": "0"}))
         self.temporary = tempfile.TemporaryDirectory()
         self.root = Path(self.temporary.name)
         self.history_dir = self.root / "history"
@@ -94,6 +95,25 @@ class ProgressHistoryTests(unittest.TestCase):
     @override
     def tearDown(self) -> None:
         self.temporary.cleanup()
+
+    def test_event_write_syncs_by_default_and_flushes_without_sync_for_disposable_state(self) -> None:
+        append = cast(Callable[[dict[str, object], dict[str, object]], None], vars(progress_history)["_append_event"])
+        history = self.root / "sync-event.jsonl"
+
+        def flushed(descriptor: int) -> None:
+            self.assertGreaterEqual(descriptor, 0)
+            self.assertTrue(history.read_text())
+
+        for durable in (True, False):
+            with self.subTest(durable=durable), patch.dict(os.environ), patch.object(os, "fsync", side_effect=flushed) as sync:
+                if durable:
+                    _ = os.environ.pop("PLAN_DELEGATE_SYNC_WRITES", None)
+                else:
+                    os.environ["PLAN_DELEGATE_SYNC_WRITES"] = "0"
+                append({"history_file": str(history)}, {"event_type": "probe"})
+                self.assertEqual(sync.call_count, int(durable))
+                self.assertEqual(json.loads(history.read_text()), {"event_type": "probe"})
+            history.unlink()
 
     def write_interval(self, seconds: object) -> None:
         _ = self.config_file.write_text(
@@ -5085,6 +5105,7 @@ class PhaseCountTests(unittest.TestCase):
 
     @override
     def setUp(self) -> None:
+        self.enterContext(patch.dict(os.environ, {"PLAN_DELEGATE_SYNC_WRITES": "0"}))
         self.temporary = tempfile.TemporaryDirectory()
         self.addCleanup(self.temporary.cleanup)
 
@@ -5174,6 +5195,7 @@ class PublicPhaseHelperTests(unittest.TestCase):
 
     @override
     def setUp(self) -> None:
+        self.enterContext(patch.dict(os.environ, {"PLAN_DELEGATE_SYNC_WRITES": "0"}))
         self.temporary = tempfile.TemporaryDirectory()
         self.addCleanup(self.temporary.cleanup)
         self.root = Path(self.temporary.name)

@@ -20,6 +20,8 @@ import fcntl
 import io
 import json
 import os
+import select
+import signal
 import socket
 import struct
 import subprocess
@@ -75,6 +77,12 @@ def setUpModule() -> None:
         home.cleanup()
 
     unittest.addModuleCleanup(restore)
+    retries = patch.object(codex_mesh, "REAP_POLL_SECS", 0.001)
+    _ = retries.start()
+    unittest.addModuleCleanup(retries.stop)
+    grace = patch.object(codex_mesh, "REAP_WAIT_SECS", 0.05)
+    _ = grace.start()
+    unittest.addModuleCleanup(grace.stop)
 
 USAGE_LIMIT = "You've hit your usage limit. Visit https://chatgpt.com/codex/settings/usage"
 CAPACITY = "Selected model is at capacity. Please try a different model."
@@ -135,9 +143,10 @@ class StubAppServer:
         self.listener: socket.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.listener.bind(("127.0.0.1", 0))
         self.listener.listen()
-        self.listener.settimeout(0.1)
+        self.close_reader, self.close_writer = socket.socketpair()
         self.port: int = cast("tuple[str, int]", self.listener.getsockname())[1]
         self.stopping: threading.Event = threading.Event()
+        self.accept_waiting: threading.Event = threading.Event()
         self.conversations: list[threading.Thread] = []
         self.thread: threading.Thread = threading.Thread(target=self._serve, daemon=True)
         self.thread.start()
@@ -145,10 +154,13 @@ class StubAppServer:
     def close(self) -> None:
         self.stopping.set()
         self.release_compact_turn_completion.set()
+        _ = self.close_writer.send(b"close")
+        self.thread.join(timeout=300)
         self.listener.close()
-        self.thread.join(timeout=2)
+        self.close_reader.close()
+        self.close_writer.close()
         for conversation in self.conversations:
-            conversation.join(timeout=2)
+            conversation.join(timeout=300)
         if self.thread.is_alive():
             raise AssertionError("stub app-server did not stop")
         if self.errors:
@@ -157,9 +169,11 @@ class StubAppServer:
     def _serve(self) -> None:
         while not self.stopping.is_set():
             try:
+                self.accept_waiting.set()
+                ready, _, _ = select.select([self.listener, self.close_reader], [], [])
+                if self.close_reader in ready:
+                    return
                 connection = self.listener.accept()[0]
-            except TimeoutError:
-                continue
             except OSError:
                 return
             conversation = threading.Thread(
@@ -214,6 +228,20 @@ def _notice(method: str, params: dict[str, object]) -> dict[str, object]:
 
 def _as_test_dict(value: object) -> dict[str, object]:
     return cast("dict[str, object]", value) if isinstance(value, dict) else {}
+
+
+class StubServerShutdownTests(unittest.TestCase):
+    def test_close_wakes_a_blocking_listener_and_reaps_its_thread(self) -> None:
+        server = StubAppServer(lambda _request: [])
+        try:
+            self.assertTrue(server.accept_waiting.wait(timeout=300))
+            self.assertIsNone(server.listener.gettimeout())
+        finally:
+            server.close()
+        self.assertFalse(server.thread.is_alive())
+        self.assertEqual(server.listener.fileno(), -1)
+        self.assertEqual(server.close_reader.fileno(), -1)
+        self.assertEqual(server.close_writer.fileno(), -1)
 
 
 class MeshCommandTests(unittest.TestCase):
@@ -282,7 +310,7 @@ class MeshCommandTests(unittest.TestCase):
         self.auto_turn_starts = 0
         self.waits = []
         self.elapsed = 0.0
-        self.start_args_timeout = 5.0
+        self.start_args_timeout = 300.0
         self.server = StubAppServer(self.respond)
         _ = (self.session_dir / codex_mesh.SERVER_FILE).write_text(
             json.dumps({"port": self.server.port, "pid": os.getpid(), "codex_home": str(agent_accounts.seats_home())}),
@@ -291,6 +319,7 @@ class MeshCommandTests(unittest.TestCase):
         self.patches = contextlib.ExitStack()
         _ = self.patches.callback(set_environment("USAGE_STATE_DIR", str(self.session_dir / "usage-state")))
         _ = self.patches.enter_context(patch.object(codex_mesh, "QUEUE_GRACE_SECS", 0.0))
+        _ = self.patches.enter_context(patch.object(codex_mesh, "RESIDENT_POLL_SECS", 0.01))
         _ = self.patches.enter_context(patch.object(codex_mesh, "_capacity_clock", self.clock, create=True))
         _ = self.patches.enter_context(patch.object(codex_mesh, "_capacity_sleep", self.wait, create=True))
 
@@ -2957,6 +2986,20 @@ class MeshCommandTests(unittest.TestCase):
         self.assertEqual(self.live_turn, "")
         self.assertEqual(self.worker_record()["status"], "done")
 
+    def test_initial_turn_retries_live_state_with_the_configured_interval(self) -> None:
+        with contextlib.closing(codex_mesh.Client(self.server.port, "worker")) as client:
+            moved = codex_mesh.MovedWorker(client, self.server.port, "next-turn", THREAD_ID, False)
+            sleeping = MagicMock()
+            with patch.object(codex_mesh, "_move_resident", side_effect=[codex_mesh.WorkerWaitingOnLiveTurn(), moved]) as move, \
+                    patch.object(codex_mesh, "time", SimpleNamespace(monotonic=lambda: 100.0,
+                        sleep=sleeping)), \
+                    patch.object(codex_mesh, "_continuation_is_owed", return_value=False):
+                result = codex_mesh._start_workers_turn(  # pyright: ignore[reportPrivateUsage]
+                    self.start_args(), str(self.session_dir), "worker", THREAD_ID, client, "next work")
+                self.assertIs(result, moved)
+                self.assertEqual(move.call_count, 2)
+                sleeping.assert_called_once_with(0.01)
+
     def test_message_for_retired_live_server_is_held_and_steer_stays_on_live_turn(self) -> None:
         _, new = self.prepare_workers_move()
         _ = (self.session_dir / codex_mesh.ROSTER_FILE).write_text(json.dumps({"worker": {
@@ -3140,7 +3183,7 @@ class MeshCommandTests(unittest.TestCase):
     def test_follow_failure_without_turn_id_finishes_as_failed(self) -> None:
         self.assertEqual(self.run_start()[0], 0)
         self.outcomes = ["failed"]
-        self.start_args_timeout = 1.0
+        self.start_args_timeout = 300
 
         code, errors = self.run_follow()
 
@@ -3151,9 +3194,25 @@ class MeshCommandTests(unittest.TestCase):
     def test_follow_completion_without_turn_id_finishes_as_done(self) -> None:
         self.assertEqual(self.run_start()[0], 0)
         self.outcomes = ["completed_without_id"]
-        self.start_args_timeout = 1.0
+        # The socket completion notice advances this test; its deadline only
+        # catches a hung launcher, including when the server is starved of CPU.
+        self.start_args_timeout = 300
+        submission_delay = [0.0]
+        respond = self.server.respond
 
-        code, errors = self.run_follow()
+        def clock() -> float:
+            return time.time() + submission_delay[0]
+
+        def submission_uses_cpu(request: dict[str, object]) -> list[dict[str, object]] | None:
+            if request.get("method") == "turn/start":
+                # Model scheduling delay without sleeping or comparing wall time.
+                submission_delay[0] += 1
+            return respond(request)
+
+        self.server.respond = submission_uses_cpu
+
+        with patch.object(codex_mesh, "time", SimpleNamespace(time=clock, monotonic=time.monotonic, sleep=time.sleep)):
+            code, errors = self.run_follow()
 
         self.assertEqual((code, errors), (0, ""))
         self.assertEqual(self.worker_record()["status"], "done")
@@ -6037,6 +6096,33 @@ class ServerRecordTests(unittest.TestCase):
         process = subprocess.Popen(["sleep", "30"])
         self.spawned.append(process)
         return process.pid
+
+    def test_reap_uses_configured_probes_and_escalates_only_for_a_live_server(self) -> None:
+        elapsed = [0.0]
+        waits: list[float] = []
+
+        def wait(seconds: float) -> None:
+            waits.append(seconds)
+            elapsed[0] += 1
+
+        for grace in (5.0, 2.0):
+            with self.subTest(grace=grace):
+                elapsed[0] = 0.0
+                waits.clear()
+                with patch.object(codex_mesh, "REAP_WAIT_SECS", grace), \
+                        patch.object(codex_mesh, "time", SimpleNamespace(time=lambda: elapsed[0], sleep=wait)), \
+                        patch.object(codex_mesh, "_pid_alive", return_value=True), \
+                        patch.object(os, "kill") as kill:
+                    self.assertTrue(codex_mesh._reap(12345))  # pyright: ignore[reportPrivateUsage]
+                self.assertEqual(waits, [0.001] * int(grace))
+                self.assertEqual([call.args for call in kill.call_args_list],
+                                 [(12345, signal.SIGTERM), (12345, signal.SIGKILL)])
+        with patch.object(codex_mesh, "_pid_alive", side_effect=[True, False, False]), \
+                patch.object(time, "sleep") as sleeping, \
+                patch.object(os, "kill") as kill:
+            self.assertTrue(codex_mesh._reap(12345))  # pyright: ignore[reportPrivateUsage]
+        kill.assert_called_once_with(12345, signal.SIGTERM)
+        sleeping.assert_not_called()
 
     def write_server(self, port: int, pid: int) -> None:
         _ = (self.session_dir / codex_mesh.SERVER_FILE).write_text(

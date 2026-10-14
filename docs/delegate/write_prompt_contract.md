@@ -74,6 +74,7 @@ opening in <ReviewPromptContract/>.
    prohibition.
 5. `## Project Context`.
 6. `## Work Specification`.
+   For workers writing tests, carry: "Do not write trivial tests that cannot fail for a real defect: assertions of a constant, literal or default against itself, implementation repetition, tests of the standard library or a mock they configure, name-existence or import-only checks, or duplicates of another test; a test that pins behaviour a user or another script depends on is not trivial."
 7. `## Type Design Contract` per <TypeDesignContract/>. Copy it verbatim in an
    opening prompt. A follow-up may instead say: `Read
    ~/.claude/docs/type_design.md in full and apply its Type Design Contract to

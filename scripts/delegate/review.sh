@@ -797,7 +797,7 @@ if [[ -n "${EARLY_READY_FILE}" ]]; then
   # The implementation pass is open until the sentinel appears; starting the
   # review pass before then would close it as interrupted.
   while kill -0 "${AGENT_PID}" 2>/dev/null && [[ ! -e "${EARLY_READY_FILE}" ]]; do
-    sleep 5
+    sleep "${PLAN_DELEGATE_EARLY_POLL_SECS:-5}"
   done
   if [[ -e "${EARLY_READY_FILE}" && "${TREE_BASELINE_READY}" -eq 0 ]]; then
     capture_tree_baseline

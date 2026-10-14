@@ -257,12 +257,7 @@ def _selection(value: ClaudeAccountsInUse | ReadCurrentClaudeSelection) -> Claud
     return value
 
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-# Direct script execution and unittest discovery import this as a top-level module.
-if __package__ in (None, ""):
-    __package__ = "scripts.whoami"
-
-from ..production.showrunners import (
+from scripts.production.showrunners import (
     CONFIG as CONFIG,
     Showrunner as Showrunner,
     ShowrunnerSettings as ShowrunnerSettings,
@@ -793,20 +788,34 @@ def claude_roles(note: AgentNote, selection: ClaudeAccountsInUse) -> tuple[str, 
 
 
 def unit_swap_line(note: AgentNote, _notes: list[AgentNote], selection: ClaudeAccountsInUse) -> str:
-    """Explain where sessions on this login can move after a refusal."""
+    """Forecast each group's destination and the destination for ungrouped owners."""
     from scripts.accounts import accounts
 
     login = (note.get("login") or "").casefold()
     excluded = {named.label for named in selection.named_accounts if named.identity.login.casefold() == login}
     if selection.is_default_login(login):
         excluded.add("default")
-    selected = accounts.pick("claude", datetime.now(timezone.utc), exclude=frozenset(excluded), keep=accounts.NoKeep())
+    excluded.update(accounts.account_labels_for_logins(frozenset({login})))
+    now = datetime.now(timezone.utc)
+    destinations = [accounts.placement(group, now, exclude=frozenset(excluded))
+                    for group in accounts.CLAUDE_GROUPS]
+    selected = accounts.pick("claude", now, exclude=frozenset(excluded), keep=accounts.NoKeep())
     label = note.path.stem
-    if isinstance(selected, accounts.PickedAccount):
-        return f"{label} is low; sessions on it move to {selected.label} when refused"
-    reset = selected.earliest_reset
-    time = reset.at.astimezone(user_zone()).strftime("%a %Y-%m-%d %H:%M %Z") if isinstance(reset, accounts.EarliestReset) else "an unknown reset"
-    return f"{label} is low; no other account has room until {time}"
+
+    def no_room(outcome: accounts.NoAccountWithRoom) -> str:
+        reset = outcome.earliest_reset
+        time = reset.at.astimezone(user_zone()).strftime("%a %Y-%m-%d %H:%M %Z") if isinstance(reset, accounts.EarliestReset) else "an unknown reset"
+        return f"no other account has room until {time}"
+
+    if isinstance(selected, accounts.NoAccountWithRoom) and all(
+            isinstance(destination.reason, accounts.GroupNoRoom) for destination in destinations):
+        return f"{label} is low; {no_room(selected)}"
+    forecasts = [f"{destination.group}: " + (no_room(destination.reason.outcome)
+                 if isinstance(destination.reason, accounts.GroupNoRoom) else f"move to {destination.label}")
+                 for destination in destinations]
+    forecasts.append("ungrouped sessions: " + (f"move to {selected.label}"
+        if isinstance(selected, accounts.PickedAccount) else no_room(selected)))
+    return f"{label} is low; when refused, " + "; ".join(forecasts)
 
 
 def credit_line(note: AgentNote) -> str:

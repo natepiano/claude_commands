@@ -29,7 +29,7 @@ The session notifier sends a message to a live Claude session on a schedule: the
 | `config/delegate.conf` | `PLAN_DELEGATE_PROGRESS_INTERVAL_SECONDS`, the unit interval; `PLAN_DELEGATE_PROGRESS_UPDATES`, `on-demand` (shipped, and the value with no line) or `scheduled`. |
 | `/etc/nixos/modules/common/session-notifier.nix` | The 15 s job. |
 | `scripts/message/test_notifier.py`, `test_sessions.py`, `scripts/delegate/test_delegate_check.py` | CLI tests, run through the `NOTIFIER_*` variables. |
-| `scripts/production/test_unit_status.py` | `TICKS FAILING`: runs a copy of `unit_status.sh` in a temp tree with a stub `notifier.sh`, fake `tmux` and `ps`, and a temp `PLAN_DELEGATE_ACTIVE_DIR`; covers a failing idle run, a healthy run, a missing or empty marker, Claude found under the pane despite a different remote-control name, and the `--showrunner` form. |
+| `scripts/production/test_unit_status.py` | `TICKS FAILING`: runs a copy of `unit_status.sh` in a temp tree with a stub `notifier.sh`, fake `tmux` and herdr, and a temp `PLAN_DELEGATE_ACTIVE_DIR`; covers a failing idle run, a healthy run, a missing or empty marker, the session id taken from the lookup despite a different remote-control name, and the `--showrunner` form. |
 | `scripts/delegate/test_progress_history.py` | The `progress` restart, refused calls included (missing `--cap-stage`, no active phase): `LAST_RESTART` at the call time and `NEXT_DUE` one interval later. |
 
 ### Instance state
@@ -156,7 +156,7 @@ A Codex unit has no `CLAUDE_CODE_SESSION_ID`, so it gets no marker and no instan
 
 ### TICKS FAILING
 
-For each unit with a running Claude pid, `unit_status.sh` runs `sessions.py id <pid>`, reads the marker `${PLAN_DELEGATE_ACTIVE_DIR:-/tmp/claude/delegate/active}/<session id>`, and, whenever the marker names a session directory, runs `zsh notifier.sh health delegate-<run id>` (run id = that directory's basename), idle or working. Health exit 1 prints `TICKS FAILING (<health line without "failing: ">)`: `no instance`, `no tick since <time>`, or `last two sends exit a, b`. No marker, or an empty one, prints nothing. The showrunner reads this line in every scheduled update and typed dailies.
+For each unit with a live Claude, `unit_status.sh` takes its session id from `unit_lookup.py list` (column 6), reads the marker `${PLAN_DELEGATE_ACTIVE_DIR:-/tmp/claude/delegate/active}/<session id>`, and, whenever the marker names a session directory, runs `zsh notifier.sh health delegate-<run id>` (run id = that directory's basename), idle or working. Health exit 1 prints `TICKS FAILING (<health line without "failing: ">)`: `no instance`, `no tick since <time>`, or `last two sends exit a, b`. No marker, or an empty one, prints nothing. The showrunner reads this line in every scheduled update and typed dailies.
 
 ## Invariants
 

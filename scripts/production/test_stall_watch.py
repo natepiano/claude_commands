@@ -510,6 +510,24 @@ raise SystemExit(1 if record['to'] in fail else 0)
                 self.assertEqual(self.sent(), [])
                 _ = self.process_rows.pop()
 
+    def test_work_the_unit_started_outside_its_tree_prevents_a_bump(self) -> None:
+        """A build a unit backgrounded is reparented away from its Claude but keeps the unit's marks."""
+        for unit, bumps in (("unit-one", 0), ("unit-two", 2)):
+            with self.subTest(unit=unit):
+                self.state.mkdir(exist_ok=True)
+                for path in self.state.glob("*.json"):
+                    path.unlink()
+                self.send_log.unlink(missing_ok=True)
+                _ = self.tick(START)
+                marks = {"SHOWRUNNER_UNIT": "showrunner", "SHOWRUNNER_UNIT_ID": unit}
+                worker = subprocess.Popen(["sleep", "60"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                          env={**os.environ, **marks})
+                self.children.append(worker)
+                self.process_rows.append(f"{worker.pid} 1 sleep 60")
+                _ = self.tick(START + 300)
+                self.assertEqual(len(self.sent()), bumps)
+                _ = self.process_rows.pop()
+
     def test_recent_transcript_or_subagent_activity_prevents_a_bump(self) -> None:
         _ = self.tick(START)
         transcript = self.projects / "project" / "sid-unit-one.jsonl"

@@ -378,6 +378,33 @@ nextest_width_arm() {
     fi
 }
 
+# Local nextest runs share the machine's test threads: a run takes the mode's
+# width divided by the runs in flight, itself included, never below
+# nextest_budget.FLOOR (4). Each run holds an flock on its own marker through fd
+# 9 for as long as it runs, so a killed run stops counting with its shell. The
+# test processes do not inherit the fd. The trial mode stays unshared, since
+# width_trial.py names its arm by width. Any failure runs at the full width.
+LINT_TEST_BUDGET_SCRIPT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/nextest_budget.py"
+
+run_nextest_shared() {
+    local width=$1 shared="" status=0 dir name
+    shift
+    dir="${BUILDLOG_DIR:-$HOME/.local/state/buildlog}/admission/nextest"
+    name="$$.$RANDOM$RANDOM"
+    if ! { mkdir -p "$dir" && : > "$dir/$name.new"; } 2>/dev/null; then
+        run cargo nextest run --test-threads "$width" "$@"
+        return
+    fi
+    {
+        shared="$(buildlog_memory_python "$LINT_TEST_BUDGET_SCRIPT" claim "$dir" "$name" "$width" 9 2>/dev/null)" \
+            || shared=""
+        [[ "$shared" =~ ^[1-9][0-9]*$ ]] || shared=$width
+        run cargo nextest run --test-threads "$shared" "$@" 9>&- || status=$?
+    } 9>>"$dir/$name.new"
+    rm -f "$dir/$name.run" "$dir/$name.new"
+    return "$status"
+}
+
 run_nextest() {
     require_nextest
     build_hold_wait_local || return $?
@@ -416,7 +443,11 @@ run_nextest() {
                 ;;
         esac
         if [[ -n "$width" ]]; then
-            run cargo nextest run --test-threads "$width" "$@"
+            if [[ "$LINT_TEST_WIDTH" == trial ]]; then
+                run cargo nextest run --test-threads "$width" "$@"
+            else
+                run_nextest_shared "$width" "$@"
+            fi
             return
         fi
     fi

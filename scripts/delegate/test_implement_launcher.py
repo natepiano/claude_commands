@@ -15,11 +15,13 @@ import os
 import signal
 import shutil
 import subprocess
+import sys
 import tempfile
-import time
 import unittest
 from pathlib import Path
 from typing import TypedDict, cast, override
+
+from scripts.delegate.wait_for_test_state import wait_for_file, wait_until
 
 
 DELEGATE_DIR = Path(__file__).parent
@@ -42,6 +44,7 @@ import os
 import pathlib
 import sys
 import time
+import signal
 
 verb = sys.argv[1]
 def option(name):
@@ -109,7 +112,7 @@ elif verb == 'follow':
         roster_path.write_text(json.dumps(roster))
         sys.exit(1)
     if os.environ.get('STUB_FOLLOW_HOLD') == 'before':
-        time.sleep(60)
+        signal.pause()
     roster[name]['role'] = option('--role')
     (session / 'follow_message.txt').write_text(pathlib.Path(option('--message-file')).read_text())
     if os.environ.get('STUB_FOLLOW_FAIL') == '1':
@@ -122,7 +125,11 @@ elif verb == 'follow':
         roster[name]['launcher_pid'] = os.getpid()
     roster_path.write_text(json.dumps(roster))
     if os.environ.get('STUB_FOLLOW_HOLD') == 'after':
-        time.sleep(60)
+        if os.environ.get('STUB_LAUNCH_RELEASE'):
+            import subprocess
+            subprocess.run([sys.executable, os.environ['TEST_WAIT_HELPER'], os.environ['STUB_LAUNCH_RELEASE']], check=True)
+        else:
+            signal.pause()
         roster[name]['status'] = 'done'
     pathlib.Path(option('--summary-file')).write_text('follow-up summary\\n')
 elif verb == 'release-follow':
@@ -134,6 +141,9 @@ elif verb == 'release-follow':
 else:
     sys.exit(2)
 roster_path.write_text(json.dumps(roster))
+if verb == 'start' and os.environ.get('STUB_LAUNCH_RELEASE'):
+    import subprocess
+    subprocess.run([sys.executable, os.environ['TEST_WAIT_HELPER'], os.environ['STUB_LAUNCH_RELEASE']], check=True)
 """
 
 CLAUDE_REGISTRY = """[assignments]
@@ -324,6 +334,16 @@ class ImplementLauncherWorkerTests(unittest.TestCase):
     def environment(self) -> dict[str, str]:
         environment = os.environ.copy()
         environment["HOME"] = str(self.root)
+        environment["XDG_CACHE_HOME"] = str(self.root / "cache")
+        cache = self.root / "cache" / "claude" / "python3-3.10"
+        cache.parent.mkdir(parents=True, exist_ok=True)
+        _ = cache.write_text(sys.executable + "\n")
+        _ = environment.pop("CLAUDE_PYTHON", None)
+        environment["PLAN_DELEGATE_WORKER_POLL_SECS"] = "0.01"
+        environment["PLAN_DELEGATE_WORKER_WAIT_ATTEMPTS"] = "30000"
+        environment["PLAN_DELEGATE_SYNC_WRITES"] = "0"
+        environment["TEST_WAIT_HELPER"] = str(DELEGATE_DIR.resolve() / "wait_for_test_state.py")
+        environment["TEST_HEARTBEAT_READY"] = str(self.root / "heartbeat-ready")
         environment["PLAN_DELEGATE_HISTORY_DIR"] = str(self.history_dir)
         environment["PLAN_DELEGATE_CONFIG"] = str(self.config_file)
         environment["AGENTS_CONFIG_FILE"] = str(self.root / ".claude" / "config" / "agents.conf")
@@ -378,7 +398,7 @@ class ImplementLauncherWorkerTests(unittest.TestCase):
             capture_output=True,
             text=True,
             env=self.environment(),
-            timeout=120,
+            timeout=300,
         )
 
     def mesh_environment(self, fail: bool = False) -> dict[str, str]:
@@ -410,7 +430,7 @@ class ImplementLauncherWorkerTests(unittest.TestCase):
             environment["PLAN_DELEGATE_RESOLVES_ROUND"] = "1"
         return subprocess.run(
             arguments, check=False, capture_output=True, text=True,
-            env=environment, timeout=120,
+            env=environment, timeout=300,
         )
 
     def set_mesh_context(self, session_dir: Path, name: str, tokens: int) -> None:
@@ -528,7 +548,7 @@ if len(_probe_sys.argv) > 1 and _probe_sys.argv[1] in {commands!r}:
                 ["bash", str(self.implement_script), "--to", "fixture-impl",
                  str(session_dir), str(self.working_dir), str(self.prompt_file),
                  "impl", "the retry path", "impl", "writing the retry path", "0", "impl"],
-                check=False, capture_output=True, text=True, env=environment, timeout=30,
+                check=False, capture_output=True, text=True, env=environment, timeout=300,
             )
         except subprocess.TimeoutExpired as error:
             delivered = self.root / "delivered_message.txt"
@@ -568,7 +588,7 @@ if len(_probe_sys.argv) > 1 and _probe_sys.argv[1] in {commands!r}:
             ["bash", str(self.implement_script), str(session_dir), str(self.working_dir),
              str(self.prompt_file), "impl", "the retry path", "impl",
              "writing the retry path", "0", "impl"],
-            check=False, capture_output=True, text=True, env=environment, timeout=30,
+            check=False, capture_output=True, text=True, env=environment, timeout=300,
         )
 
     def open_passes(self, session_dir: Path) -> dict[str, OpenPass]:
@@ -682,7 +702,7 @@ if len(_probe_sys.argv) > 1 and _probe_sys.argv[1] in {commands!r}:
             capture_output=True,
             text=True,
             env=self.environment(),
-            timeout=120,
+            timeout=300,
         )
         self.assertEqual(result.returncode, 2, result.stderr)
         self.assertIn("pass_kind must be impl, test, fix, or review", result.stderr)
@@ -1026,7 +1046,7 @@ if len(_probe_sys.argv) > 1 and _probe_sys.argv[1] in {commands!r}:
             ["bash", str(self.implement_script), "--to", name,
              str(session_dir), str(self.working_dir), str(self.prompt_file),
              "impl", "the retry path", "impl", "writing the retry path", "0", "impl"],
-            env=environment, capture_output=True, text=True, check=False, timeout=120,
+            env=environment, capture_output=True, text=True, check=False, timeout=300,
         )
 
         self.assertEqual(result.returncode, 1, result.stderr)
@@ -1153,28 +1173,23 @@ if len(_probe_sys.argv) > 1 and _probe_sys.argv[1] in {commands!r}:
                 )
                 claim_path = session_dir / "impl_claim_impl.json"
                 try:
-                    deadline = time.monotonic() + 8
-                    while time.monotonic() < deadline:
-                        if claim_path.exists():
+                    def held_claim() -> bool:
+                        try:
                             claim = cast("dict[str, object]", json.loads(
                                 claim_path.read_text(encoding="utf-8")
                             ))
-                            if stage == "before" and claim.get("turn_id") == "":
-                                break
-                            if stage == "after" and roster[name]["status"] == "running":
-                                break
-                        time.sleep(0.05)
-                        try:
                             roster = cast("dict[str, dict[str, object]]", json.loads(
                                 roster_path.read_text(encoding="utf-8")
                             ))
-                        except json.JSONDecodeError:
-                            continue
-                    else:
-                        self.fail(f"launcher never held a {stage} claim")
+                        except (FileNotFoundError, json.JSONDecodeError):
+                            return False
+                        return (claim.get("turn_id") == "" if stage == "before"
+                                else roster[name]["status"] == "running")
+
+                    wait_until(held_claim, session_dir)
                 finally:
                     os.killpg(process.pid, signal.SIGKILL)
-                    _ = process.wait(timeout=5)
+                    _ = process.wait(timeout=300)
 
                 result = self.mesh_launch(session_dir, to=name)
 
@@ -1201,23 +1216,66 @@ if len(_probe_sys.argv) > 1 and _probe_sys.argv[1] in {commands!r}:
                 "impl", "the retry path", "impl", "writing the retry path", "0", "impl"]
 
         refused = subprocess.run(args, env=self.environment(), capture_output=True,
-                                 text=True, check=False, timeout=30)
+                                 text=True, check=False, timeout=300)
 
         self.assertEqual(refused.returncode, 2, refused.stderr)
         self.assertEqual(status_path.read_text(encoding="utf-8"), before)
         self.assertEqual(self.open_passes(session_dir), passes)
         self.assertNotIn("follow-up to", (session_dir / "board.log").read_text())
 
+    def test_worker_and_turn_identity_are_recorded_before_the_heartbeat_watcher_starts(self) -> None:
+        for follow in (False, True):
+            with self.subTest(follow=follow):
+                session = self.start_phase(f"identity-before-heartbeat-{follow}")
+                arguments = ["bash", str(self.implement_script)]
+                if follow:
+                    initial = self.mesh_launch(session)
+                    self.assertEqual(initial.returncode, 0, initial.stderr)
+                    roster = cast("dict[str, object]", json.loads((session / "mesh_roster.json").read_text()))
+                    arguments.extend(["--to", next(iter(roster))])
+                arguments.extend([str(session), str(self.working_dir), str(self.prompt_file),
+                                  "impl", "the retry path", "impl", "writing the retry path", "0", "impl"])
+                witness = session / "watcher-identity"
+                source = session / ("impl_claim_impl.json" if follow else "impl_worker_impl.json")
+                watcher = self.root / "scripts" / "agents" / "heartbeat_watch.sh"
+                _ = watcher.write_text(
+                    '#!/bin/bash\nif [ -f "$TEST_IDENTITY_SOURCE" ]; then\n'
+                    + 'cat "$TEST_IDENTITY_SOURCE" > "$TEST_IDENTITY_WITNESS.tmp"\n'
+                    + 'else printf "{}\\n" > "$TEST_IDENTITY_WITNESS.tmp"; fi\n'
+                    + 'mv "$TEST_IDENTITY_WITNESS.tmp" "$TEST_IDENTITY_WITNESS"\n'
+                )
+                release = session / "launch-release"
+                environment = self.mesh_environment()
+                environment.update({"TEST_IDENTITY_SOURCE": str(source), "TEST_IDENTITY_WITNESS": str(witness),
+                                    "STUB_LAUNCH_RELEASE": str(release)})
+                if follow:
+                    environment.update({"STUB_FOLLOW_HOLD": "after", "STUB_LAUNCH_RELEASE": str(release)})
+                process = subprocess.Popen(arguments, env=environment, stdout=subprocess.PIPE,
+                                           stderr=subprocess.PIPE, text=True, start_new_session=True)
+                try:
+                    wait_for_file(witness)
+                    identity = cast("dict[str, object]", json.loads(witness.read_text()))
+                    self.assertIsNone(process.poll())
+                    if follow:
+                        self.assertEqual(identity.get("turn_id"), "turn-2")
+                        self.assertEqual(identity.get("pid"), process.pid)
+                    else:
+                        self.assertTrue(identity.get("worker_id"), identity)
+                finally:
+                    release.touch()
+                    output, errors = process.communicate(timeout=300)
+                self.assertEqual(process.returncode, 0, output + errors)
+
     def test_new_launch_keeps_heartbeat_watcher_output(self) -> None:
         watcher = self.root / "scripts" / "agents" / "heartbeat_watch.sh"
         _ = watcher.write_text(
-            "#!/usr/bin/env bash\nprintf 'heartbeat watcher output\\n'\n",
+            "#!/usr/bin/env bash\nprintf 'heartbeat watcher output\\n'\n: > \"$TEST_HEARTBEAT_READY\"\n",
             encoding="utf-8",
         )
         agent = self.root / "scripts" / "agents" / "agent_exec.sh"
         _ = agent.write_text(
             agent.read_text(encoding="utf-8").replace(
-                "set -euo pipefail", "set -euo pipefail\nsleep 0.2"
+                "set -euo pipefail", 'set -euo pipefail\npython3 "$TEST_WAIT_HELPER" "$TEST_HEARTBEAT_READY"'
             ), encoding="utf-8",
         )
         session_dir = self.start_phase("heartbeat-visible")

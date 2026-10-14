@@ -16,6 +16,7 @@ import fake_tmux
 from fake_tmux import FakeSession
 
 
+# Script completion deadlines only bound hangs; startup can be slow under load.
 SCRIPT = Path(__file__).with_name("production_lifecycle.py")
 STUB = '''#!__PYTHON__
 import os
@@ -184,7 +185,7 @@ class LifecycleTests(unittest.TestCase):
     def run_lifecycle(self, action: str, *extra: str) -> subprocess.CompletedProcess[str]:
         return subprocess.run([sys.executable, str(SCRIPT), action, "--production", str(self.doc),
                                *extra], cwd=self.checkout, env=self.env, capture_output=True,
-                              text=True, check=False, timeout=25)
+                              text=True, check=False, timeout=300)
 
     def assert_step(self, result: subprocess.CompletedProcess[str], state: str) -> None:
         self.assertRegex(result.stdout, rf"(?m)^[\w-]+: {state} — .+")
@@ -817,3 +818,17 @@ class LifecycleTests(unittest.TestCase):
 
 if __name__ == "__main__":
     _ = unittest.main()
+
+
+class PermanentUnitTests(unittest.TestCase):
+    def test_wrap_neither_waits_on_nor_retires_a_permanent_unit(self) -> None:
+        sys.path.insert(0, str(SCRIPT.parent))
+        import production_lifecycle
+        from add_unit import Production
+        from zoneinfo import ZoneInfo
+
+        lines = ["## Units", "", "| Unit | Plan | Worktree | Branch | Port | Owns |", "| --- | --- | --- | --- | --- | --- |",
+                 "| alpha-unit | docs/plans/alpha.md | /w/alpha | demo-alpha | — | — |",
+                 "| nightly-review-unit | permanent | /w/nightly | demo-nightly-review | — | — |", ""]
+        production = Production(Path("/c/docs/demo-production.md"), "demo", "demo", Path("/c"), Path("/c/log.md"), ZoneInfo("UTC"))
+        self.assertEqual([row.name for row in production_lifecycle.units(lines, production)], ["alpha-unit"])
