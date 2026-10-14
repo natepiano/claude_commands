@@ -114,33 +114,26 @@ A test that pins a behaviour a user or another script depends on is not trivial,
 
 ### Phase 3 — The code under test stops waiting  · status: done
 
-**Depends on:** Phase 2
+#### As-built
 
-#### Work Order
-
-**Goal:** the named waits leave the suites without weakening any test.
-
-**Spec:** `review.sh:797` `sleep 5`; `implement.sh:509/519` `sleep 1`; `add_showrunner.py:45` `POLL_S`; `offload.py:1130` ssh timeout made overridable and short in tests; `codex_mesh.py:3599`, `:3248` sleeps and `RESIDENT_POLL_SECS` (`:191`) made event-driven or overridable; the stub server's accept loop woken on close (`test_codex_mesh.py:138,145-151`); the delegate test polls and stub sleeps (`test_verify_token_wait.py:69`; Phase 2 already made `test_verify_mac_offload.py` and `test_verify_hold_wait.py` advance on events and `verify.sh` routing wake on release through `local_release_wait.py`); fsync in `progress_history.py:492`, `review_pool.py:225`, `findings.py:369`, usage `collect.py`; `lib/py`'s interpreter cache under a test `HOME`. Each wait becomes an event, a parameter the test passes, or a value the test overrides; production defaults stay.
+- Every fixed wait the tests sat through is an override the test sets, with production defaults unchanged and each default pinned by a test: `review.sh` early-delivery poll `PLAN_DELEGATE_EARLY_POLL_SECS` (5); `implement.sh` seat and turn probes `PLAN_DELEGATE_SEAT_POLL_SECS` (1) and `PLAN_DELEGATE_SEAT_WAIT_ATTEMPTS` (30); `add_showrunner.py` `ADD_SHOWRUNNER_POLL_S` (2.0); `OffloadConfig.leftover_timeout_s` in `offload.py` (10, from the settings file); `codex_mesh.py` `RESIDENT_POLL_SECS` (1.0), `REAP_WAIT_SECS` (5.0) and `REAP_POLL_SECS` (0.2), patched as module attributes in tests.
+- `verify.sh` reads its token-wait clock from `PLAN_DELEGATE_TOKEN_CLOCK_FILE` when set, else `$SECONDS`, so the token-wait test advances a file instead of sleeping.
+- Disposable fixtures skip disk sync: `PLAN_DELEGATE_SYNC_WRITES=0` skips fsync in `progress_history.py`, `findings.py` and `review_pool.py`; `collect.py --durability off` (`LedgerDurability`, default `full`) sets `PRAGMA synchronous=OFF`.
+- The interpreter-cache miss is fixed in the delegate fixtures, not in `lib/py`: each temporary `HOME` gets `XDG_CACHE_HOME` with a seeded `claude/python3-<version>` cache.
+- `scripts/delegate/wait_for_test_state.py` (`wait_until`, `wait_for_file`) waits on directory events and child pidfds through `local_release_wait`, polling where inotify or pidfd is absent. The stub app-server's accept loop blocks in `select` on the listener and a socketpair that `close()` writes, so closing wakes it at once.
+- `merge_gate.py` refuses a `--type-dirs` path absent from the merge checkout before any suite starts.
+- Measured: gate green at 183 s and 2.33 GiB peak at load 88–123; 151.6 s and 2.41 GiB on the merged tree at load 92–121. Matched-load A/B: `test_review_launcher` 69→36 s, `test_implement_launcher` 37→33 s, `test_progress_history` unchanged at 78 s.
 
 **Files:**
-- `scripts/delegate/review.sh` — `:797` `sleep 5`
-- `scripts/delegate/implement.sh` — `:509`, `:519` `sleep 1`
-- `scripts/delegate/progress_history.py` — fsync (`:492`)
-- `scripts/delegate/review_pool.py` — fsync (`:225`)
-- `scripts/delegate/findings.py` — fsync (`:369`)
-- `scripts/delegate/` — the test polls and stub sleeps named in the Spec
-- `scripts/lib/py` — interpreter cache under a test `HOME`
-- `scripts/production/add_showrunner.py` — `POLL_S` (`:45`)
-- `scripts/mac_test/offload.py` — ssh timeout (`:1130`)
-- `scripts/agents/codex_mesh.py` — sleeps (`:3248`, `:3599`) and `RESIDENT_POLL_SECS` (`:191`)
-- `scripts/agents/test_codex_mesh.py` — stub server accept loop (`:138`, `:145-151`)
-- `scripts/usage/collect.py` — sqlite fsync
+- `scripts/delegate/review.sh`, `implement.sh`, `verify.sh` — poll, probe and token-clock overrides
+- `scripts/delegate/progress_history.py`, `findings.py`, `review_pool.py` — `PLAN_DELEGATE_SYNC_WRITES`
+- `scripts/delegate/wait_for_test_state.py` — event-driven fixture waits
+- `scripts/production/add_showrunner.py`, `scripts/mac_test/offload.py`, `scripts/agents/codex_mesh.py`, `scripts/usage/collect.py` — poll, timeout, reap and sync overrides
+- `scripts/agents/test_codex_mesh.py`, `scripts/delegate/test_*.py`, `scripts/mac_test/test_offload.py`, `scripts/production/test_add_showrunner.py`, `scripts/usage/test_collect.py` — fixtures on the overrides and regressions pinning each default
 
-**Seats:** 2 writers — split by suite
-- `impl` — `scripts/delegate/` and `scripts/lib/py`
-- `test` — opens as impl; `scripts/agents/`, `scripts/mac_test/`, `scripts/usage/`, `scripts/production/`
+**Binds later work:** "Trivial tests are gone" keeps this phase's regressions (sync default, interpreter cache, wait helper, reap, stub close); each was mutation-proved. "Fewer process launches per test" starts from the gate's slowest modules at load 88–123: `delegate/test_verify_mac_offload` 181 s, `delegate/test_review_launcher` 165 s, `production/test_dailies_input` 163 s, `delegate/test_progress_history` 161 s, `mac_test/test_offload` 134 s, `production/test_add_unit` 132 s; the gate's wall time is its slowest module.
 
-**Acceptance gate:** touched suites green; basedpyright clean; the gate command's time recorded before and after (`python3 scripts/production/merge_gate.py --tests-only --repo <worktree> </dev/null`; before: 75 s, peak 2.3 GiB at load 6–22).
+**Gotchas:** fsync was already cheap on tmpfs; `test_progress_history`'s cost is about 750 launches of `progress_history.py`. A pidfd stays readable after exit, so `wait_until` observes each one once and drops it.
 
 ### Phase 4 — Trivial tests are gone  · status: todo
 
@@ -162,6 +155,8 @@ A test that pins a behaviour a user or another script depends on is not trivial,
 
 **Acceptance gate:** every suite green; the counts report sent before deletion; the instruction line in place.
 
+**Constraints from prior phases:** Phase 3's regressions were each mutation-proved and are not trivial: the fsync-by-default tests (`test_findings.py`, `test_progress_history.py`, `test_review_pool.py`), the interpreter-cache launch count (`test_review_launcher.py`), the `wait_for_test_state` child-exit and no-pidfd tests, codex_mesh reap and stub-close tests, `test_add_showrunner.py`'s `ADD_SHOWRUNNER_POLL_S` tests, `test_offload.py`'s `leftover_timeout_s` test and `test_collect.py`'s `--durability` tests. These pin settings a caller can set (`collect.py --durability` is in its help; `leftover_timeout_s` is offload configuration). Every proposed deletion names the behavior no test then checks (none) or the surviving test with identical inputs and outcome.
+
 ### Phase 5 — Fewer process launches per test  · status: todo
 
 **Depends on:** Phase 4
@@ -170,14 +165,18 @@ A test that pins a behaviour a user or another script depends on is not trivial,
 
 **Goal:** the heaviest suites start far fewer processes.
 
-**Spec:** run the heaviest scripts in-process or trim their import chains (`dailies_input`, `dailies_render`, `send`, `build_targets`, `waiting`); write the fake tmux and gh tools as shell instead of Python; share git fixtures where a test only reads them (e.g. `merge_checkpoint`). Keep each test's assertions.
+**Spec:** the gate's wall time is its slowest module, so start from the slowest modules (learned timings at load 88–123: delegate/test_verify_mac_offload 181 s, delegate/test_review_launcher 165 s, production/test_dailies_input 163 s, delegate/test_progress_history 161 s, mac_test/test_offload 134 s, production/test_add_unit 132 s), and record each targeted module's launch count and matched-load duration before and after. `test_progress_history.py` launches `progress_history.py` about 750 times (its existing `invoke_handler` already runs handlers in-process). Run the heaviest scripts in-process or trim their import chains (`dailies_input`, `dailies_render`, `send`, `build_targets`, `waiting`); write the fake tmux and gh tools as shell instead of Python; share git fixtures where a test only reads them (e.g. `merge_checkpoint`). Keep each test's assertions.
+
+In-process rules: restore environment, cwd, import-time configuration (e.g. `add_showrunner.POLL_S`), module globals and signal state after each case; keep at least one subprocess test per script for CLI parsing, exit status and the launch contract. Shared git fixtures: share only an immutable seed; each mutating case gets its own origin and worktrees, never shared refs, index, config or worktree metadata; modules pass in any order and alone. Add tests that run with the Phase 3 overrides absent (`PLAN_DELEGATE_SEAT_POLL_SECS`/`_WAIT_ATTEMPTS`, `PLAN_DELEGATE_EARLY_POLL_SECS`, `PLAN_DELEGATE_TOKEN_CLOCK_FILE`) and pin the production defaults. If recorder identity paths (`_main_identity_from_codex`/`_claude`, `AgentIdentity | None`) become an in-process API, return a semantic result (known / unavailable) instead of a bare optional, keeping the fallback in `_detect_main_identity()`.
 
 **Files:**
 - `scripts/production/` — tests, fake tmux and gh, and the named scripts
-- `scripts/delegate/` — tests and fakes
+- `scripts/message/` — `send.py` and its tests
+- `scripts/build_targets/` — `build_targets.py` and its tests
+- `scripts/delegate/` — tests and fakes, including `wait_for_test_state.py`
 
 **Seats:** 2 writers — split by suite
-- `impl` — `scripts/production/`
-- `test` — opens as impl; `scripts/delegate/`
+- `impl` — `scripts/production/`, `scripts/message/send.py`, `scripts/build_targets/`
+- `test` — opens as impl; `scripts/delegate/` (sole owner of `wait_for_test_state.py`)
 
-**Acceptance gate:** suites green; exec counts and gate time recorded before and after.
+**Acceptance gate:** production, delegate, message and build_targets suites green, each targeted module also alone; per-module launch counts and matched-load durations, and gate time, recorded before and after.
