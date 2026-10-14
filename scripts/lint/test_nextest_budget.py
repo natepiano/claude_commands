@@ -112,9 +112,12 @@ run() {{
     printf '<%s>' "$@"
     printf '\\n'
 }}
-LINT_LOGICAL_CORES=32
+# Bash ignores assignments to EPOCHSECONDS, and core counts come from the
+# machine: fix the trial arm and both widths so the case never reads either.
+nextest_width_arm() {{ LINT_TEST_WIDTH_ARM=logical; }}
+nextest_logical_cores() {{ LINT_LOGICAL_CORES=32; }}
+nextest_physical_cores() {{ LINT_PHYSICAL_CORES=16; }}
 LINT_TEST_WIDTH={mode}
-EPOCHSECONDS=6000
 run_nextest "$@"
 """
         environment = {
