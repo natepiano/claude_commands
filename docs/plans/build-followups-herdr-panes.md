@@ -100,26 +100,22 @@ Design calls and evidence: `docs/plans/build-followups-herdr-adoption.md` (Calls
 
 ### Phase 2 — The same number of lines from either host  · status: done
 
-**Depends on:** Phase 1
-
 **User sees:** before — `session_pane.py read --lines 20` returns the last 20 lines on a herdr host but the whole visible screen plus 20 lines of history on a tmux host; after — it returns the last 20 lines of output on both.
 
-#### Work Order
+#### As-built
 
-**Goal:** `read_place(place, lines)` returns the last `lines` lines of output on both hosts.
-
-**Spec:**
-1. In `scripts/production/session_pane.py` `read_place`, keep the tmux capture as it is (`capture-pane -p [-J] [-e] -S -<lines> -t <pane>`), then trim its text in Python: drop the trailing empty rows tmux pads below the last written line, keep the last `lines` lines, and end with one newline when any line remains. With `ansi`, a row holding only escape sequences and whitespace counts as empty. The herdr branch is unchanged.
-2. The CLI `read` verb goes through `read_place`, so it changes with it; no other caller changes.
-3. Showrunner call, 2026-10-13: a wrong result in this unit's own tool, so it is fixed here.
+- `read_place`'s tmux branch keeps `capture-pane -p [-J] [-e] -S -<lines> -t <pane>` and passes the text through the private `_trim_tmux_output(text, lines, *, ansi) -> str`: trailing whitespace-only rows are dropped, the last `lines` rows are kept, and the result ends in one newline, or is `""` when no row remains. Retained rows keep their text, interior blank rows and escape sequences.
+- With `ansi`, a row counts as empty after its CSI, OSC and two-byte ESC sequences are removed.
+- The herdr branch passes `Herdr.read`'s text through unchanged. Public signatures, the CLI and every caller are unchanged; `stall_watch.py` and `unit_status.sh` read 400 joined lines, so only rows above the last 400 drop.
 
 **Files:**
-- `scripts/production/session_pane.py` — `read_place`'s tmux branch and one private trim helper.
-- `scripts/production/test_session_pane.py` — one test per host. For tmux, the fake `capture-pane` returns more rows than asked for plus trailing empty rows, and `read --lines N` prints exactly the last N written lines. For herdr, `read --lines N` passes `--lines N` and prints herdr's text unchanged.
-- `scripts/production/fake_tmux.py` — only if the fake cannot yet return a multi-row capture.
+- `scripts/production/session_pane.py` — `_trim_tmux_output` and the tmux branch of `read_place`.
+- `scripts/production/test_session_pane.py` — `test_tmux_read_returns_only_the_requested_tail_without_screen_padding` and `test_herdr_read_forwards_the_line_count_and_preserves_output_unchanged`.
 
-**Seats:** 1 writer + 1 tester: `impl` owns `session_pane.py`; `test` owns `test_session_pane.py` and `fake_tmux.py`.
+**Gotchas:**
+- `test_session_pane.py` imports `session_pane` before `herdr`: `session_pane` puts `scripts/herdr` on `sys.path`. Reversed, the standalone `python3 -m unittest test_session_pane` run fails with `ModuleNotFoundError`, while directory discovery still passes. Nothing in the file marks the order, so an import sorter can reverse it.
+- `fake_tmux` ignores `-S`; the tests cover the trim, not tmux's capture range. A real tmux pane returned exactly 5 and 20 lines for `read session <id> --lines 5|20`.
+- Tests exercise only SGR sequences; the CSI, OSC and ESC branches of the `ansi` pattern are untested.
+- herdr's trailing-blank behavior under `pane read --lines N` has not been observed live.
 
-**Constraints from prior phases:** `read_place(place, lines=60, *, joined=False, ansi=False) -> str`; `TmuxFailure(OSError)`, `NoSuchTarget`; tmux calls go through `_tmux`; herdr reads call `Herdr.read(pane, lines, joined=, ansi=)`, which passes `pane read --source recent|recent-unwrapped --lines N [--format ansi]`. `stall_watch.py` and `unit_status.sh` read 400 joined lines and search the text, so a shorter tmux read only drops rows above the last 400.
-
-**Acceptance gate:** `python3 -m unittest discover -s scripts/production -p 'test_*.py'` and `-s scripts/shutdown` green; `basedpyright scripts/production/session_pane.py scripts/production/test_session_pane.py` prints `0 errors, 0 warnings`.
+**Ruled out:** changing the tmux capture arguments instead of trimming in Python (`-S -N` counts from the top of the visible screen, and the screen carries empty padding rows below the last written line).
