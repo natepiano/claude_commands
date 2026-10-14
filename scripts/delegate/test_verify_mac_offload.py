@@ -10,6 +10,7 @@ import signal
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from contextlib import contextmanager
@@ -126,46 +127,40 @@ raise SystemExit(0)
 '''
 
 
-GIT_STUB = r'''
-from __future__ import annotations
-
-import os
-from pathlib import Path
-import sys
-
-arguments = sys.argv[1:]
-root = Path(os.environ["PACKAGE_ROOT"])
-if "rev-parse" in arguments and "HEAD^{tree}" in arguments:
-    print("fixed-tree")
-    raise SystemExit(0)
-if "rev-parse" in arguments and "--show-toplevel" in arguments:
-    if "--git-common-dir" in arguments:
-        print(root / ".git")
-        print(root)
-        if "--abbrev-ref" in arguments:
-            print("main")
-    else:
-        print(root)
-    raise SystemExit(0)
-if "rev-parse" in arguments and "--short" in arguments:
-    print("abc1234")
-    raise SystemExit(0)
-if "status" in arguments or "diff" in arguments or "ls-files" in arguments:
-    raise SystemExit(0)
-raise SystemExit(1)
+GIT_STUB = r'''#!/bin/bash
+has() { local word; for word in "$@"; do [[ "$word" == "$wanted" ]] && return 0; done; return 1; }
+wanted=rev-parse
+if has "$@"; then
+    wanted='HEAD^{tree}'
+    if has "$@"; then printf 'fixed-tree\n'; exit 0; fi
+    wanted=--show-toplevel
+    if has "$@"; then
+        wanted=--git-common-dir
+        if has "$@"; then
+            printf '%s\n' "$PACKAGE_ROOT/.git" "$PACKAGE_ROOT"
+            wanted=--abbrev-ref
+            if has "$@"; then printf 'main\n'; fi
+        else
+            printf '%s\n' "$PACKAGE_ROOT"
+        fi
+        exit 0
+    fi
+    wanted=--short
+    if has "$@"; then printf 'abc1234\n'; exit 0; fi
+fi
+for wanted in status diff ls-files; do if has "$@"; then exit 0; fi; done
+exit 1
 '''
 
 
-RUSTC_STUB = r'''
-import sys
-
-if sys.argv[1:] == ["-vV"]:
-    print("rustc 1.90.0\nhost: x86_64-unknown-linux-gnu")
-    raise SystemExit(0)
-if sys.argv[1:] == ["-V"]:
-    print("rustc 1.90.0")
-    raise SystemExit(0)
-raise SystemExit(1)
+RUSTC_STUB = r'''#!/bin/bash
+if [[ $# == 1 && $1 == -vV ]]; then
+    printf 'rustc 1.90.0\nhost: x86_64-unknown-linux-gnu\n'
+elif [[ $# == 1 && $1 == -V ]]; then
+    printf 'rustc 1.90.0\n'
+else
+    exit 1
+fi
 '''
 
 
@@ -414,7 +409,7 @@ class VerifyMacOffloadTests(unittest.TestCase):
         self.write_executable(self.bin_directory / "cargo", CARGO_STUB)
         self.write_executable(self.bin_directory / "git", GIT_STUB)
         self.write_executable(self.bin_directory / "rustc", RUSTC_STUB)
-        self.write_executable(self.bin_directory / "taplo", "raise SystemExit(0)\n")
+        self.write_executable(self.bin_directory / "taplo", "#!/bin/sh\nexit 0\n")
         self.write_executable(self.runner, RUNNER_STUB)
         self.write_executable(self.root / "free-now.py", FREE_NOW_STUB)
         blocker = "#!/bin/sh\nexit 99\n"
@@ -530,8 +525,14 @@ class VerifyMacOffloadTests(unittest.TestCase):
             "TEST_REAL_RECORD": str(VERIFY.parent.parent / "buildlog" / "record.py"),
         }
 
+        cache = self.root / "cache/claude/python3-3.10"
+        cache.parent.mkdir(parents=True, exist_ok=True)
+        _ = cache.write_text(sys.executable + "\n")
+        _ = self.environment.pop("CLAUDE_PYTHON", None)
+
     def write_executable(self, path: Path, source: str) -> None:
-        _ = path.write_text(f"#!{sys.executable}\n" + source, encoding="utf-8")
+        _ = path.write_text(source if source.startswith("#!") else f"#!{sys.executable}\n" + source,
+                            encoding="utf-8")
         path.chmod(0o755)
 
     def verify(
@@ -635,6 +636,54 @@ class VerifyMacOffloadTests(unittest.TestCase):
             assert cycle is not None
             return self.root / "release" / cycle["id"] / "cycle.json"
 
+    def test_hold_fixture_reaps_its_recorders_without_waiting_for_an_existing_recorder(self) -> None:
+        # The real hold dispatcher starts this child and its reaper. Only a
+        # join at the fixture boundary releases the child to write completion.
+        tree = self.root / "record-tree/scripts"
+        (tree / "build_hold").mkdir(parents=True)
+        (tree / "buildlog").mkdir()
+        release, completed = self.root / "recorder-release", self.root / "recorder-completed"
+        self.write_executable(tree / "buildlog/record.py", f'''
+from pathlib import Path
+from scripts.delegate.wait_for_test_state import wait_for_file
+wait_for_file(Path({str(release)!r}))
+Path({str(completed)!r}).touch()
+'''.replace("from scripts.delegate.wait_for_test_state import wait_for_file",
+            "import sys\nsys.path.insert(0, " + repr(str(VERIFY.resolve().parents[2])) + ")\n"
+            + "from scripts.delegate.wait_for_test_state import wait_for_file"))
+        outside_release = threading.Event()
+        outside = threading.Thread(target=outside_release.wait, name="hold-event-recorder", daemon=True)
+        outside.start()
+        original_join = threading.Thread.join
+        owned: list[threading.Thread] = []
+
+        def release_on_join(thread: threading.Thread, timeout: float | None = None) -> None:
+            if thread.name == "hold-event-recorder":
+                self.assertIsNot(thread, outside, "fixture tried to wait for a recorder it did not start")
+                owned.append(thread)
+                release.touch()
+            original_join(thread, timeout)
+
+        existing = set(threading.enumerate())
+        try:
+            with mock.patch.object(build_hold, "__file__", str(tree / "build_hold/build_hold.py")), \
+                    mock.patch.object(threading.Thread, "join", release_on_join):
+                with self.hold_environment():
+                    _ = build_hold.start_hold(Path(self.environment["BUILD_HOLD_DIR"]),
+                        build_hold.HolderIdentity("hana", "hana"), "fixture recording", build_hold.NoReleaseEta(),
+                        datetime.now().astimezone())
+                self.assertTrue(completed.exists(), "fixture returned while its recorder still owned its files")
+            self.assertEqual(len(owned), 1)
+            self.assertFalse(owned[0].is_alive())
+            self.assertTrue(outside.is_alive())
+        finally:
+            release.touch()
+            outside_release.set()
+            for thread in threading.enumerate():
+                if thread is outside or (thread not in existing and thread.name == "hold-event-recorder"):
+                    original_join(thread, HANG_GUARD_S)
+                    self.assertFalse(thread.is_alive())
+
     def control_routing_clock(self) -> Path:
         clock = self.runner_state / "routing-clock"
         _ = clock.write_text("100")
@@ -645,16 +694,107 @@ class VerifyMacOffloadTests(unittest.TestCase):
         self.environment["TEST_ROUTING_CLOCK"] = str(clock)
         return clock
 
+    def test_hold_fixture_timeout_reaps_all_children_and_owned_threads_before_restoring_home(self) -> None:
+        tree = self.root / "blocked-record-tree/scripts"
+        (tree / "build_hold").mkdir(parents=True)
+        (tree / "buildlog").mkdir()
+        ready = self.root / "blocked-recorders"
+        ready.mkdir()
+        self.write_executable(tree / "buildlog/record.py", f'''
+import os, signal, sys
+from pathlib import Path
+signal.signal(signal.SIGTERM, signal.SIG_IGN)
+Path({str(ready)!r}, sys.argv[4]).write_text(str(os.getpid()))
+signal.pause()
+''')
+        children: list[subprocess.Popen[bytes]] = []
+        threads: list[threading.Thread] = []
+        launch = cast(Callable[..., subprocess.Popen[bytes]], subprocess.Popen)
+        start = threading.Thread.start
+        caller_home = os.environ.get("HOME")
+
+        def capture_child(*arguments: object, **options: object) -> subprocess.Popen[bytes]:
+            child = launch(*arguments, **options)
+            children.append(child)
+            return child
+
+        def capture_thread(thread: threading.Thread) -> None:
+            if thread.name == "hold-event-recorder":
+                threads.append(thread)
+            start(thread)
+
+        try:
+            with mock.patch.object(build_hold, "__file__", str(tree / "build_hold/build_hold.py")), \
+                    mock.patch.object(subprocess, "Popen", side_effect=capture_child), \
+                    mock.patch.object(threading.Thread, "start", capture_thread):
+                with self.assertRaisesRegex(AssertionError, "fixture hold recorder never exited"):
+                    with self.hold_environment(timeout=0):
+                        for key in ("first", "second"):
+                            _ = build_hold.start_hold(Path(self.environment["BUILD_HOLD_DIR"]),
+                                build_hold.HolderIdentity(key, key), "blocked recording", build_hold.NoReleaseEta(),
+                                datetime.now().astimezone())
+                            self.wait_for_path(ready / key)
+                self.assertEqual(len(children), 2)
+                self.assertEqual(len(threads), 2)
+                self.assertTrue(all(child.poll() is not None for child in children))
+                self.assertTrue(all(not thread.is_alive() for thread in threads))
+                self.assertEqual(os.environ.get("HOME"), caller_home)
+        finally:
+            # Also contain a deliberately broken implementation during regression checks.
+            for child in children:
+                if child.poll() is None:
+                    child.kill()
+                _ = child.wait()
+            for thread in threads:
+                thread.join(timeout=HANG_GUARD_S)
+
     @contextmanager
-    def hold_environment(self) -> Generator[None, None, None]:
+    def hold_environment(self, timeout: float = HANG_GUARD_S) -> Generator[None, None, None]:
+        children: list[subprocess.Popen[bytes]] = []
+        threads: list[threading.Thread] = []
+        launch = cast(Callable[..., subprocess.Popen[bytes]], subprocess.Popen)
+        start = threading.Thread.start
+
+        def launch_owned(*arguments: object, **options: object) -> subprocess.Popen[bytes]:
+            process = launch(*arguments, **options)
+            children.append(process)
+            return process
+
+        def start_owned(thread: threading.Thread) -> None:
+            if thread.name == "hold-event-recorder":
+                threads.append(thread)
+            start(thread)
+
         with mock.patch.dict(os.environ, {name: self.environment[name] for name in (
+            "HOME", "XDG_STATE_HOME", "XDG_CACHE_HOME",
             "BUILD_HOLD_DIR", "BUILD_HOLD_RELEASE_DIR", "PLAN_DELEGATE_ACTIVE_DIR",
             "BUILDLOG_DIR", "MAC_TEST_STATE_DIR", "NOTIFIER_SESSIONS_DIR")}), \
              mock.patch.dict(os.environ, {"PLAN_DELEGATE_BOARD_DIR": "", "PLAN_DELEGATE_SESSION_DIR": "",
                                           "BUILDLOG_CALL_ID": "", "BUILDLOG_CALLER": ""}), \
              mock.patch.object(build_hold, "socket_for", return_value=build_hold.RecipientLive("/test/socket")), \
-             mock.patch.object(build_hold, "send_release", return_value=build_hold.ReleaseDelivered()):
-            yield
+             mock.patch.object(build_hold, "send_release", return_value=build_hold.ReleaseDelivered()), \
+             mock.patch.object(subprocess, "Popen", side_effect=launch_owned), \
+             mock.patch.object(threading.Thread, "start", start_owned):
+            try:
+                yield
+            finally:
+                timed_out = False
+                for thread in threads:
+                    thread.join(timeout=timeout)
+                    timed_out |= thread.is_alive()
+                if timed_out:
+                    # Stop every child before restoring HOME or reporting the
+                    # timeout, including children owned by later reapers.
+                    for process in children:
+                        if process.poll() is None:
+                            process.terminate()
+                    for process in children:
+                        if process.poll() is None:
+                            process.kill()
+                        _ = process.wait()
+                    for thread in threads:
+                        thread.join()
+                self.assertFalse(timed_out, "fixture hold recorder never exited")
 
     def release_local_turn(self) -> None:
         with self.hold_environment(), build_hold.release_lock():

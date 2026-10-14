@@ -35,7 +35,7 @@ The hook is registered twice in `settings.json`, with the command `"$HOME/.claud
 
 ### Collector: `scripts/usage/collect.py`
 
-`python3 scripts/usage/collect.py [--db PATH] [--machine NAME] [--claude-root DIR] [--codex-root DIR] [--agents-log FILE] [--no-mac] [--readings FILE] [--baseline-readings FILE] [--account-roles FILE] [--claude-repo DIR] [--production-docs DIR]`
+`python3 scripts/usage/collect.py [--db PATH] [--machine NAME] [--claude-root DIR] [--codex-root DIR] [--agents-log FILE] [--no-mac] [--readings FILE] [--baseline-readings FILE] [--account-roles FILE] [--claude-repo DIR] [--production-docs DIR] [--durability full|off]`
 
 Defaults: `<state_dir()>/usage.db`, machine `natedev`, `~/.claude/projects`, `~/.codex/sessions`, `<state_dir()>/agents.jsonl`, the live readings log (`run_out.READINGS_LOG`), the baseline copy `~/.local/state/usage-model/workers-baseline/readings-2026-10-10.jsonl`, `accounts.roles_history_file()`, and the repository and production docs from `outcomes.default_sources()`. It prints one line per source, `<machine> <source>: <n> turns added; <state>` (or `outcomes added`), and exits 0 unless the store cannot be written or is refused.
 
@@ -43,7 +43,7 @@ Defaults: `<state_dir()>/usage.db`, machine `natedev`, `~/.claude/projects`, `~/
 
 1. Takes an exclusive, non-blocking `fcntl.flock` on `<db>.lock`. A second pass beside a running one prints `usage collect: another pass is running` and exits 0.
 2. `check_store_key_version(db)`: a store stamped 1 through 7 raises `StorePredatesFileNamedCodexKeys`, and `main` prints `collect: store version <n> predates file-named Codex keys; delete <db> and run the collector again to rebuild it` and exits 1. This check runs before any statement that writes.
-3. `PRAGMA journal_mode=WAL`, the `SCHEMA` script, then `migrate_store(db)`, which deletes every `cursors` row and stamps `user_version` 8 on a new store.
+3. `PRAGMA synchronous=FULL` (`--durability off`, `LedgerDurability.DISPOSABLE`, sets `OFF` for a disposable test ledger; the default is `full`, `DURABLE`), `PRAGMA journal_mode=WAL`, the `SCHEMA` script, then `migrate_store(db)`, which deletes every `cursors` row and stamps `user_version` 8 on a new store.
 4. `collect_local`: Claude transcripts, Codex rollouts and run-history files on this machine, then the role log and `reattribute`.
 5. `collect_mac` (or, under `--no-mac`, every Mac source stored as `skipped`).
 6. `outcomes.collect`: baseline readings, live readings, account role changes and checkpoints, natedev only.

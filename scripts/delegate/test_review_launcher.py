@@ -6,6 +6,7 @@ from __future__ import annotations
 from contextlib import ExitStack
 import json
 import os
+import select
 import shutil
 import signal
 import subprocess
@@ -19,6 +20,7 @@ from typing import TypedDict, cast, override
 from scripts.delegate import wait_for_test_state
 from scripts.delegate.local_release_wait import IntervalReleasePolling
 from scripts.delegate.wait_for_test_state import wait_for_file, wait_until
+from scripts.delegate.recorder_fixture import communicate_launcher, invoke_recorder
 
 
 DELEGATE_DIR = Path(__file__).parent
@@ -487,14 +489,78 @@ else:
     def recorder(self, *arguments: str) -> None:
         environment = self.environment()
         environment["PLAN_DELEGATE_PASS_OWNER"] = "launcher"
-        result = subprocess.run(
-            ["python3", str(DELEGATE_DIR / "progress_history.py"), *arguments],
-            check=False,
-            capture_output=True,
-            text=True,
-            env=environment,
-        )
+        result = invoke_recorder(arguments, environment, Path.cwd())
         self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_early_delivery_probes_default_to_five_seconds_without_test_overrides(self) -> None:
+        session = self.start_implementation("default-early-poll")
+        worker = self.open_worker(session)
+        self.finish_implementation(session)
+        ready, finish = session / "ready", session / "finish"
+        binaries = session / "bin"
+        binaries.mkdir()
+        sleep = binaries / "sleep"
+        _ = sleep.write_text('#!/bin/bash\nprintf "%s\\n" "$*" >> "$TEST_POLL_ARGUMENTS"\n'
+                             + ': > "$TEST_POLL_ENTERED"\n'
+                             + ': > "$TEST_EARLY_READY"\n')
+        sleep.chmod(0o755)
+        entered = session / "poll-entered"
+        arguments = session / "poll-arguments"
+        environment = self.environment()
+        for key in ("PLAN_DELEGATE_WORKER_POLL_SECS", "PLAN_DELEGATE_WORKER_WAIT_ATTEMPTS",
+                    "PLAN_DELEGATE_EARLY_POLL_SECS", "PLAN_DELEGATE_TOKEN_CLOCK_FILE"):
+            _ = environment.pop(key, None)
+        environment.update({"PATH": str(binaries) + os.pathsep + environment["PATH"],
+                            "TEST_POLL_ARGUMENTS": str(arguments), "TEST_POLL_ENTERED": str(entered),
+                            "TEST_EARLY_READY": str(ready), "STUB_REVIEW_FINISH_FILE": str(finish)})
+        process = subprocess.Popen(self.review_command(session, "adversary", str(ready), worker),
+                                   env=environment, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                                   start_new_session=True)
+        try:
+            wait_until(entered.exists, session, processes=(process,))
+            self.assertEqual(arguments.read_text().splitlines(), ["5"])
+            self.assertIsNone(process.poll())
+            wait_until(lambda: any(event.get("pass_kind") == "review" for event in self.pass_events(session.name)),
+                       self.history_dir / "runs", processes=(process,))
+        finally:
+            output, errors = self.finish_early_launcher(process, ready, finish)
+        self.assertEqual(process.returncode, 0, output + errors)
+
+    def finish_early_launcher(self, process: subprocess.Popen[str], ready: Path,
+                              finish: Path, timeout: float = 300) -> tuple[str, str]:
+        ready.touch()
+        finish.touch()
+        return communicate_launcher(process, timeout)
+
+    def test_early_launcher_timeout_reaps_its_group_before_fixture_cleanup(self) -> None:
+        child_ready = self.root / "blocked-review-child"
+        child_code = ("import os, signal, sys; from pathlib import Path; "
+                      "signal.signal(signal.SIGTERM, signal.SIG_IGN); "
+                      "Path(sys.argv[1]).write_text(str(os.getpid())); signal.pause()")
+        program = f"import subprocess, sys; child = subprocess.Popen([sys.executable, '-c', {child_code!r}, {str(child_ready)!r}]); child.wait()"
+        process = subprocess.Popen([sys.executable, "-c", program], stdout=subprocess.PIPE,
+                                   stderr=subprocess.PIPE, text=True, start_new_session=True)
+        ready, finish = self.root / "early-ready", self.root / "early-finish"
+        try:
+            wait_until(child_ready.exists, self.root, processes=(process,))
+            descriptor = os.pidfd_open(int(child_ready.read_text()))
+            try:
+                with self.assertRaises(subprocess.TimeoutExpired):
+                    _ = self.finish_early_launcher(process, ready, finish, timeout=0)
+                self.assertIsNotNone(process.poll())
+                self.assertEqual(select.select([descriptor], [], [], 300)[0], [descriptor])
+                self.assertTrue(ready.exists())
+                self.assertTrue(finish.exists())
+                self.assertTrue(process.stdout is not None and process.stdout.closed)
+                self.assertTrue(process.stderr is not None and process.stderr.closed)
+            finally:
+                os.close(descriptor)
+        finally:
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            _ = process.communicate()
 
     def start_implementation(self, name: str) -> Path:
         session_dir = self.root / name
