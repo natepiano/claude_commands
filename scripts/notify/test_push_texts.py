@@ -105,6 +105,13 @@ class PushTextTests(unittest.TestCase):
                     self.assertLess(len(text), 500)
                     self.assertLess(len(push.title), 45)
 
+    def test_every_catalog_example_keeps_email_addresses_out_of_pushes(self) -> None:
+        for entry in push_texts.catalog():
+            for example in entry.examples:
+                with self.subTest(id=entry.id, example=example.name):
+                    push = push_texts.render_entry(entry, example.values)
+                    self.assertNotIn("@", push.sender + "\n" + push.title + "\n" + push.message)
+
     def test_session_template_renders_before_action_and_body(self) -> None:
         entry = replace(self.entry(), session=SessionTemplate("{version}"))
         push = push_texts.render_entry(entry, {"version": "1.2"})
@@ -127,11 +134,12 @@ class PushTextTests(unittest.TestCase):
 
     def test_holdout_begins_with_the_users_four_lines(self) -> None:
         entry = next(entry for entry in push_texts.catalog() if entry.id == "shutdown.holdout")
-        push = push_texts.render_entry(entry, entry.examples[0].values)
+        values = dict(entry.examples[0].values, session="widget", operation="shutdown")
+        push = push_texts.render_entry(entry, values)
         self.assertEqual(push.title + "\n" + push.message.split("\n\n", 1)[0],
-            "Owner Restart is blocked\nSession: Owner\n"
-            + "Action: answer the open form, or run the command below to stop Owner\n"
-            + "Reason: Restart is blocked because Owner's claude session is not answering, and it can't proceed.")
+            "widget shutdown is blocked\nSession: widget\n"
+            + "Action: answer the open form\n"
+            + "Reason: shutdown is blocked because widget's claude session is showing a form and it can't proceed.")
 
     def test_remote_control_examples_keep_role_in_title_and_session_in_message(self) -> None:
         entry = next(entry for entry in push_texts.catalog() if entry.id == "shutdown.remote_control")
@@ -148,12 +156,26 @@ class PushTextTests(unittest.TestCase):
                     f"{who} remote-control is off\nSession: {session}\n"
                     + "Action: run /remote-control\nReason: Remote control is off.")
 
-    def test_holdout_reports_time_already_waited_within_the_message_limit(self) -> None:
-        entry = next(entry for entry in push_texts.catalog() if entry.id == "shutdown.holdout")
+    def test_holdout_offers_one_stop_command_on_the_named_machine(self) -> None:
+        for entry in push_texts.catalog():
+            if entry.id not in {"shutdown.holdout", "shutdown.holdout_unanswered"}:
+                continue
+            for example in entry.examples:
+                with self.subTest(id=entry.id, example=example.name):
+                    push = push_texts.render_entry(entry, example.values)
+                    instruction = (f"Or stop it instead, and the {example.values['operation']} goes on without it." if entry.id == "shutdown.holdout"
+                        else f"Stopping ends only that session, and the {example.values['operation']} goes on.")
+                    self.assertEqual(push.body.split("\n\n")[1:],
+                        [f"{instruction} In a terminal on {example.values['machine']}: {example.values['command']}"])
+
+    def test_unanswered_holdout_asks_to_stop_the_session_without_a_form(self) -> None:
+        entry = next(entry for entry in push_texts.catalog() if entry.id == "shutdown.holdout_unanswered")
         push = push_texts.render_entry(entry, entry.examples[0].values)
-        self.assertIn("Do nothing: the restart keeps waiting. It has waited 4 minutes so far.", push.body)
-        self.assertIn("Command: " + push.values["command"] + " (on natedev)", push.body)
-        self.assertLess(len(push.message), 500)
+        self.assertEqual(push.title + "\n" + push.message.split("\n\n", 1)[0],
+            "pm-move-ghostty restart is blocked\nSession: pm-move-ghostty\n"
+            + "Action: in a terminal on natedev, stop pm-move-ghostty with the command below\n"
+            + "Reason: restart is blocked because pm-move-ghostty's claude session has not paused for it and it can't proceed.")
+        self.assertNotIn("form", push.title + "\n" + push.message)
 
     def test_template_change_with_same_example_output_invalidates_every_approval(self) -> None:
         entry = self.entry()

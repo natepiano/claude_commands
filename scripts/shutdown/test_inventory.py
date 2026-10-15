@@ -20,6 +20,7 @@ from test_support import ShutdownTestCase
 from test_restart import entry, pane_display, top_level
 import record
 import inventory
+import unit_runs
 import account
 import fake_tmux
 import herdr
@@ -73,6 +74,35 @@ class TranscriptReadCounter(io.BufferedReader):
 
 @final
 class InventoryTests(ShutdownTestCase):
+    def test_updated_at_preserves_registry_milliseconds_through_inventory_wire_parse(self) -> None:
+        timestamp = 1_791_563_350_123
+        self.write_session(DESKTOP_PID, DESKTOP_ID, "notes", self.root / "plain", updated_at=timestamp)
+        found = inventory.inventory(TARGET_LOGIN, only=frozenset({DESKTOP_ID}))
+        self.assertEqual(found["sessions"][0]["updated_at"], timestamp)
+        decoded = inventory.parse_inventory(json.dumps(found))
+        self.assertEqual(decoded["sessions"][0]["updated_at"], timestamp)
+
+    def test_updated_at_is_required_and_must_be_an_integer_in_fresh_inventory(self) -> None:
+        found = inventory.inventory(TARGET_LOGIN, only=frozenset({DESKTOP_ID}))
+        values = cast(dict[str, object], cast(object, found["sessions"][0]))
+        for invalid in (True, 12.5, "123", None):
+            with self.subTest(updated_at=invalid):
+                values["updated_at"] = invalid
+                with self.assertRaisesRegex(inventory.InvalidInventory, r"updated_at"):
+                    _ = inventory.parse_inventory(json.dumps(found))
+        del values["updated_at"]
+        with self.assertRaisesRegex(inventory.InvalidInventory, r"updated_at"):
+            _ = inventory.parse_inventory(json.dumps(found))
+
+    def test_shutdown_record_without_updated_at_remains_readable(self) -> None:
+        saved = entry(top_level("legacy-owner"))
+        document = cast(dict[str, object], json.loads(json.dumps(saved)))
+        owner = cast(dict[str, object], document["session"])
+        del owner["updated_at"]
+        parsed = record.parse_session_records(json.dumps([document]))[0]
+        self.assertEqual(parsed["session"]["updated_at"], 0)
+        self.assertEqual(parsed["session"]["session_id"], "legacy-owner")
+
     def test_last_model_skips_trailing_metadata_and_invalid_json(self) -> None:
         transcript = self.root / "metadata.jsonl"
         entries: list[dict[str, object]] = [
@@ -87,6 +117,20 @@ class InventoryTests(ShutdownTestCase):
             with self.subTest(ending=repr(ending)):
                 _ = transcript.write_text(contents + "\nmalformed-json" + ending, encoding="utf-8")
                 self.assertEqual(inventory.last_model(transcript), "latest-model")
+
+    def test_run_markers_under_either_folder_name_map_their_directors(self) -> None:
+        for name in ("unit", "delegate"):
+            (self.root / name / "active").mkdir(parents=True, exist_ok=True)
+            _ = (self.root / name / "active" / f"{name}-director").write_text(f"/runs/{name}\n", encoding="utf-8")
+        environment = {key: value for key, value in os.environ.items() if key != "SHUTDOWN_DELEGATE_ROOT"}
+        with patch.dict(os.environ, environment, clear=True), \
+                patch.object(unit_runs, "RUN_ROOT", self.root / "unit"), \
+                patch.object(unit_runs, "FORMER_RUN_ROOT", self.root / "delegate"):
+            found = inventory._active_run_directories()  # pyright: ignore[reportPrivateUsage]
+        self.assertEqual(
+            (found.get("unit-director"), found.get("delegate-director")),
+            ([Path("/runs/unit")], [Path("/runs/delegate")]),
+        )
 
     def test_last_model_reassembles_lines_across_tail_blocks(self) -> None:
         transcript = self.root / "split-line.jsonl"

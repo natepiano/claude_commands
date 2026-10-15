@@ -114,22 +114,26 @@ Never `/logout` in a unit director's session: every unit on that account stops w
 In this terminal:
 
 ```sh
-~/.claude/scripts/lib/py ~/.claude/scripts/accounts/accounts.py move <session-id-or-exact-name> <target> [--dry-run] [--why "<text>"]
-~/.claude/scripts/lib/py ~/.claude/scripts/accounts/accounts.py move units|showrunners <target> [--dry-run] [--why "<text>"]
+~/.claude/scripts/lib/py ~/.claude/scripts/accounts/accounts.py move <session-id-or-exact-name> <target> [--dry-run] [--no-alert] [--why "<text>"]
+~/.claude/scripts/lib/py ~/.claude/scripts/accounts/accounts.py move units|showrunners <target> [--dry-run] [--no-alert] [--why "<text>"]
 ```
 
 The first form moves one local ungrouped session, found by id, else by exact name. The second selects the group's account for future launches and moves every live member not already on it. An empty group still selects its account (`<group>: no live session moves`); an open shutdown receives no duplicate request. A session can request its own move, then mark ready and end its turn.
+
+A move never waits on a session agreeing to it. An idle session is stopped with no pause message. A busy one gets `Pause for move: <label> → <target> (<why>, <time>)`; its second line says the request comes from the shutdown the user started, not from another session's own choice, and gives the check to run in its own terminal, `~/.claude/scripts/lib/py ~/.claude/scripts/shutdown/shutdown.py status <account label> --here`, which lists the session under the move. It then stops at once and runs `ready --where`; a session that answers the pause and goes idle without that line is stopped too.
+
+Use `--no-alert` for live checks: it adds `--no-alert` to each `shutdown.py down`, so no shutdown alert reaches the phone. With `--dry-run --no-alert`, it prints each planned `down` command and changes nothing.
 
 ### Preview
 
 `--dry-run` writes nothing, for a group or a single session. Selection reads shutdown's lightweight listing (`ListedSession`), without worktrees, restart resources or desktop inventory; each member's line reads only its newest transcript exchange and the stored usage reading. A warm preview takes about 0.3 to 0.4 s on natedev. A group preview first prints `<group>: would select <target>`, then one line per member:
 
 ```text
-<name>: <session id> · pause, then move (<source> has room)
+<name>: <session id> · move when idle (<source> has room)
 <name>: <session id> · reap and restart now (<source> out of usage: weekly limit, resets Sat 9:00 AM)
 ```
 
-A source with no fresh reading prints `pause, then move (<source> no fresh reading)`. A paused member is asked to stop at a safe point and mark ready; a member whose transcript ends in a refusal, or whose source account has a fresh reading at 0%, is reaped and restarted at once with no pause message. Process identity checks still precede every signal. Showrunner previews read the update timers once in-process, sharing that snapshot with the registration check without resolving messaging sockets, and name each production whose timer's target session is absent, with the full repair command to run inside that showrunner's own session.
+A source with no fresh reading prints `move when idle (<source> no fresh reading)`. An idle member stops without a pause; a busy member is asked to stop at once and mark ready; a member whose transcript ends in a refusal, or whose source account has a fresh reading at 0%, is reaped and restarted at once with no pause message. Process identity checks still precede every signal. Showrunner previews read the update timers once in-process, sharing that snapshot with the registration check without resolving messaging sockets, and name each production whose timer's target session is absent, with the full repair command to run inside that showrunner's own session.
 
 ### Target check and refusals
 
@@ -276,7 +280,7 @@ Run `/showrunner:accounts`, fix what it names (most often the account's alias an
 
 Set `use_credits: on` or `use_credits: off` in each Codex note. Missing values mean on. With off, an exhausted weekly or 5-hour window makes the account unavailable even with credits. At weekly 0%, on keeps workers on paid credits with one phone and showrunner notice and hourly forecasts; off prefers an account with weekly usage left, then an account using its own credits. When neither is available or the move fails, Codex assignments move to Claude until the earliest refill. Only the first forecast goes to the phone. See `docs/quota_alerts.md` for delivery retries and unknown forecasts.
 
-Account notes use numbered filenames such as `claude1.md` and `codex2.md`; their labels are `claude1` and `codex2`. The updater renames old filenames on its first pass, preserving bodies and modes. If both names exist it reports them and reads the numbered file. Each note carries a `role` list, a `sessions` count and a `## Live sessions` table from the roster on both machines. An unreachable or older peer keeps its last rows marked `last seen <time>`; these rows do not count in `sessions`. Unread identities appear below the table as live sessions not attributed to an account. Legacy spaced labels remain accepted as input and are printed without spaces. Notes list by tool and account number.
+Account notes use numbered filenames such as `claude1.md` and `codex2.md`; their labels are `claude1` and `codex2`. The updater renames old filenames on its first pass, preserving bodies and modes. If both names exist it reports them and reads the numbered file. Each note carries a `role` list, a `sessions` count and a `## Live sessions` table from the roster on both machines. Live rows carry no timestamp. An unreachable or older peer keeps its last rows marked `last seen <time>`; these rows do not count in `sessions`. The updater records successful machine observations in `~/.local/state/agent-notes/sessions_seen.json`, outside the vault. A kept row retains its last-seen marker, or takes the machine's saved time, a legacy hidden observation comment, or `unknown`, in that order. Unread identities appear below the table as live sessions not attributed to an account. Legacy spaced labels remain accepted as input and are printed without spaces. Notes list by tool and account number.
 
 
 A signed-in home without a matching account note is never selectable. Status prints

@@ -38,6 +38,8 @@ from record import (
 )
 
 class ShutdownReadiness(Protocol):
+    def stoppable_status(self, status: str) -> bool: ...
+
     def blocker(self, session: Session) -> ReadinessCheck: ...
 
 
@@ -56,6 +58,13 @@ FreshInventory = Callable[[str, frozenset[str]], Inventory]
 Clock = Callable[[], datetime]
 CommandRunner = Callable[[list[str]], int | None]
 Sleeper = Callable[[float], None]
+IdleStopReason = Literal[
+    "not an idle stop",
+    "idle; nothing in progress",
+    "idle after the pause message; no ready line",
+    "idle; nothing in progress; a background shell was running",
+    "idle after the pause message; no ready line; a background shell was running",
+]
 
 
 class StopClaimLost(Exception):
@@ -539,6 +548,7 @@ def _stop_owner(
     entry: SessionShutdown,
     *,
     prior: SessionProgress,
+    idle_reason: IdleStopReason,
     force_now: bool,
     kill: KillProcess,
     is_alive: LivenessCheck,
@@ -591,8 +601,9 @@ def _stop_owner(
 
     current = match["session"]
     if not force_now and prior["kind"] != "reaping" and (
-        prior["kind"] not in {"ready", "held by usage limit", "stopping", "stop failed"}
-        or current["status"] != "idle"
+        (prior["kind"] not in {"ready", "held by usage limit", "stopping", "stop failed"}
+         and not (prior["kind"] == "waiting" and idle_reason != "not an idle stop"))
+        or not settle.stoppable_status(current["status"])
         or any(worker["status"] != "idle" for worker in match["workers"])
         or settle.blocker(current)["kind"] != "clear"
     ):
@@ -602,10 +613,17 @@ def _stop_owner(
             progress=("held by usage limit" if prior["kind"] == "held by usage limit"
                       else "ready" if prior["kind"] == "ready" else "waiting"),
         )
-        _ = _set_stop_outcome(
-            claim, "stop failed", clock, [issue],
-            "session or worker is not idle and ready",
-        )
+        def wait_until_ready(changing: SessionShutdown) -> None:
+            claim.require(changing)
+            if issue["progress"] == "held by usage limit":
+                changing["progress"] = {"kind": "held by usage limit", "at": issue["at"]}
+            elif issue["progress"] == "ready":
+                changing["progress"] = {"kind": "ready", "at": issue["at"]}
+            else:
+                changing["progress"] = {"kind": "waiting"}
+            changing["stop_issues"] = [issue]
+
+        _ = update_session(claim.login, claim.session_id, wait_until_ready)
         return
     if force_now:
         _end_busy_codex_workers(current, codex_mesh, claim)
@@ -745,6 +763,7 @@ def _stop_owner(
 def stop_session(
     record: SessionShutdown,
     *,
+    idle_reason: IdleStopReason = "not an idle stop",
     kill: KillProcess = os.kill,
     is_alive: LivenessCheck = process_is_alive,
     session_record_exists: SessionRecordPresence = session_record_exists,
@@ -773,6 +792,8 @@ def stop_session(
             return
         prior = copy.deepcopy(progress)
         current["progress"] = {"kind": "stopping", "at": _timestamp(clock)}
+        if idle_reason != "not an idle stop" and prior["kind"] == "waiting":
+            current["where"] = {"kind": "said", "text": idle_reason, "at": current["progress"]["at"]}
         claimed = True
 
     current = update_session(record["login"], record["session"]["session_id"], claim)
@@ -795,7 +816,7 @@ def stop_session(
 
             return update_session(current["login"], current["session"]["session_id"], restore_progress)
         _stop_owner(
-            owned, current, prior=prior,
+            owned, current, prior=prior, idle_reason=idle_reason,
             force_now=current["force"] == "now",
             kill=kill, is_alive=is_alive,
             session_record_exists=session_record_exists,

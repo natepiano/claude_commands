@@ -245,6 +245,53 @@ class AgentNotesTests(unittest.TestCase):
         self.assertEqual(note.path.read_text(), before)
         self.assertTrue(any("sessions: local registry unreadable" in line for line in result.messages))
 
+    def test_machine_observations_replace_once_for_all_notes_and_keep_unreached_times(self) -> None:
+        _ = self.note("claude1.md", "unit@example.invalid")
+        _ = self.note("claude2.md", "spare@example.invalid")
+        path = self.root / "seen.json"
+        previous = (self.now - timedelta(hours=2)).isoformat()
+        _ = path.write_text(json.dumps({"mac": previous}))
+        self.rows.return_value = session_table.ReadSessions({}, frozenset({"mac"}),
+                                                            machines_read=frozenset({"natedev"}))
+        with patch.object(agent_notes, "SESSIONS_SEEN", path), patch.object(os, "replace", wraps=os.replace) as replace:
+            started = datetime.now(timezone.utc).replace(microsecond=0)
+            _ = self.snapshot([])
+            state_replaces = [event for event in replace.call_args_list if event.args[1] == path]
+            self.assertEqual(len(state_replaces), 1)
+            source = Path(cast(str | Path, cast(object, state_replaces[0].args[0])))
+            self.assertEqual(source.parent, path.parent)
+            self.assertFalse(source.exists())
+            seen = agent_notes.read_sessions_seen()
+            self.assertEqual(seen["mac"], previous)
+            self.assertGreaterEqual(datetime.fromisoformat(seen["natedev"]), started)
+            self.assertLessEqual(datetime.fromisoformat(seen["natedev"]), datetime.now(timezone.utc))
+            self.rows.return_value = session_table.SessionsUnread("registry unavailable")
+            before = path.read_bytes()
+            _ = self.snapshot([])
+            self.assertEqual(path.read_bytes(), before)
+
+    def test_missing_or_damaged_machine_observations_do_not_block_refresh(self) -> None:
+        note = self.note("claude1.md", "unit@example.invalid")
+        path = self.root / "seen.json"
+        self.rows.return_value = session_table.ReadSessions({}, frozenset(), machines_read=frozenset({"natedev"}))
+        with patch.object(agent_notes, "SESSIONS_SEEN", path):
+            for data in (None, b"not json", b"\xff", b"[]", b'{"mac":"not a time"}',
+                         b'{"mac":"2026-10-14T12:00:00"}', b'{"mac":42}'):
+                with self.subTest(data=data):
+                    path.unlink(missing_ok=True)
+                    if data is not None:
+                        _ = path.write_bytes(data)
+                    messages = self.snapshot([]).messages
+                    self.assertFalse(any(message.startswith("sessions seen:") for message in messages))
+                    self.assertEqual(set(agent_notes.read_sessions_seen()), {"natedev"})
+                    self.assertIn("No live sessions.", note.path.read_text())
+            path.unlink()
+            path.mkdir()
+            messages = self.snapshot([]).messages
+            self.assertTrue(any(message.startswith("sessions seen:") for message in messages))
+            self.assertIn("No live sessions.", note.path.read_text())
+            self.assertEqual(list(self.root.glob(".sessions-seen-*")), [])
+
     def test_writer_replaces_role_blocks_and_owned_sections_without_disturbing_user_text(self) -> None:
         note = self.note("claude1.md", "unit@example.invalid", "return:\n  - \"[[agents.base]]\"\nrole:\n  - old\n  - orphan\nstate: active\n")
         original = note.text + "\n## Live sessions\n\nOld rows.\n\n## User notes\nKeep below.\n"

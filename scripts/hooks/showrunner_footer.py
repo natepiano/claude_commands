@@ -12,7 +12,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from enum import Enum
 from pathlib import Path
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING, Literal, TypedDict, cast
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
@@ -72,6 +72,112 @@ class FooterError(Exception):
 
 
 @dataclass(frozen=True)
+class PendingReviewedQuestion:
+    text: str
+    reviewed: str
+
+
+@dataclass(frozen=True)
+class PendingReviewUnavailableQuestion:
+    text: str
+    question: str
+    reason: str
+
+
+PendingQuestion = PendingReviewedQuestion | PendingReviewUnavailableQuestion
+
+
+@dataclass(frozen=True)
+class QuestionReplyReady:
+    pass
+
+
+@dataclass(frozen=True)
+class QuestionReplyBlocked:
+    reason: str
+
+
+class PendingReviewedQuestionRecord(TypedDict):
+    kind: Literal["reviewed"]
+    text: str
+    reviewed: str
+
+
+class PendingReviewUnavailableQuestionRecord(TypedDict):
+    kind: Literal["review unavailable"]
+    text: str
+    question: str
+    reason: str
+
+
+class PendingReviewedRecord(TypedDict):
+    items: list[PendingReviewedQuestionRecord | PendingReviewUnavailableQuestionRecord]
+
+
+def pending_reviewed_path(instance_dir: Path) -> Path:
+    return instance_dir / "pending_reviewed.json"
+
+
+def read_pending_reviewed(instance_dir: Path) -> list[PendingQuestion]:
+    path = pending_reviewed_path(instance_dir)
+    try:
+        raw = cast(object, json.loads(path.read_text(encoding="utf-8")))
+    except FileNotFoundError:
+        return []
+    if not isinstance(raw, dict):
+        raise FooterError(f"{path}: expected an object")
+    entries = cast(dict[str, object], raw).get("items")
+    if not isinstance(entries, list):
+        raise FooterError(f"{path}: expected items")
+    items: list[PendingQuestion] = []
+    for raw_item in cast(list[object], entries):
+        if not isinstance(raw_item, dict):
+            raise FooterError(f"{path}: expected a question object")
+        item = cast(dict[str, object], raw_item)
+        text = item.get("text")
+        if not isinstance(text, str) or not text.strip():
+            raise FooterError(f"{path}: expected item text")
+        if item.get("kind") == "reviewed":
+            reviewed = item.get("reviewed")
+            if not isinstance(reviewed, str) or not reviewed.strip():
+                raise FooterError(f"{path}: expected reviewed question")
+            items.append(PendingReviewedQuestion(text, reviewed))
+        elif item.get("kind") == "review unavailable":
+            question, reason = item.get("question"), item.get("reason")
+            if not isinstance(question, str) or not question.strip() or not isinstance(reason, str):
+                raise FooterError(f"{path}: expected unavailable question and reason")
+            items.append(PendingReviewUnavailableQuestion(text, question, reason))
+        else:
+            raise FooterError(f"{path}: unknown question kind")
+    return items
+
+
+def add_pending_reviewed(instance_dir: Path, items: list[PendingQuestion]) -> None:
+    combined = read_pending_reviewed(instance_dir)
+    for item in items:
+        if item not in combined:
+            combined.append(item)
+    if not combined:
+        return
+    record: PendingReviewedRecord = {"items": []}
+    for item in combined:
+        if isinstance(item, PendingReviewedQuestion):
+            record["items"].append({"kind": "reviewed", "text": item.text, "reviewed": item.reviewed})
+        else:
+            record["items"].append({"kind": "review unavailable", "text": item.text,
+                                    "question": item.question, "reason": item.reason})
+    path = pending_reviewed_path(instance_dir)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    scratch = path.with_suffix(".tmp")
+    _ = scratch.write_text(json.dumps(record, ensure_ascii=False) + "\n", encoding="utf-8")
+    _ = scratch.replace(path)
+
+
+def delete_pending_reviewed(instance_dir: Path) -> None:
+    pending_reviewed_path(instance_dir).unlink(missing_ok=True)
+
+
+@dataclass(frozen=True)
 class ScheduledDailies:
     next_due: int
 
@@ -103,7 +209,7 @@ def key_values(path: Path) -> dict[str, str]:
 
 
 def outstanding_path(slug: str) -> Path:
-    return Path.home() / ".local/state/showrunner/outstanding" / f"{slug}.json"
+    return state_root() / "outstanding" / f"{slug}.json"
 
 
 def state_root() -> Path:
@@ -365,8 +471,79 @@ def waiting_format_error(bullets: list[str], now: datetime) -> str | None:
     return None
 
 
+def normalised(text: str) -> str:
+    return " ".join(text.split())
+
+
+def choice_comparison_text(text: str) -> str:
+    return normalised(re.sub(r"^\s*(?:[-*+]|\d+[.)])\s+", "", text))
+
+
+def pending_question_text(item: PendingQuestion) -> str:
+    return item.reviewed if isinstance(item, PendingReviewedQuestion) else item.question
+
+
+def check_reviewed_text(instance_dirs: list[str], reply: str) -> QuestionReplyReady | QuestionReplyBlocked:
+    accepted: list[str] = []
+    slugs: set[str] = set()
+    for instance in instance_dirs:
+        for item in read_pending_reviewed(Path(instance)):
+            question = pending_question_text(item)
+            accepted.append(question)
+            if normalised(question) not in normalised(reply):
+                return QuestionReplyBlocked(f"Question {item.text!r}: paste its reviewed question into this reply:\n{question}")
+        slugs.add(Path(instance).name.removeprefix("showrunner-"))
+    if "(recommended" not in reply.lower():
+        return QuestionReplyReady()
+    for slug in tuple(slugs):
+        slugs.update(place_of(slug).below)
+    for slug in slugs:
+        try:
+            raw = cast(object, json.loads(outstanding_path(slug).read_text(encoding="utf-8")))
+        except FileNotFoundError:
+            continue
+        if not isinstance(raw, list):
+            raise FooterError(f"{slug}: expected outstanding list")
+        for entry in cast(list[object], raw):
+            if isinstance(entry, dict):
+                fields = cast(dict[str, object], entry)
+                accepted.extend(value for key in ("text", "question", "reviewed")
+                                if isinstance(value := fields.get(key), str))
+    notify_scripts = str(Path(__file__).resolve().parent.parent / "notify")
+    if notify_scripts not in sys.path:
+        sys.path.insert(0, notify_scripts)
+    if TYPE_CHECKING:
+        from ..notify import review
+    else:
+        import review
+    recorded_choices = {choice_comparison_text(line) for question in accepted
+                        for line in review.reply_questions(question).choice_lines}
+    for line in review.reply_questions(reply).choice_lines:
+        compared = choice_comparison_text(line)
+        if compared not in recorded_choices and not any(compared in choice_comparison_text(question) for question in accepted):
+            return QuestionReplyBlocked(f"Unrecorded choice {line!r}: record the item and paste its reviewed question "
+                                        + "into this reply.")
+    return QuestionReplyReady()
+
+
 def block_reason(instance_dirs: list[str], reply: str,
-                 states: dict[str, FooterState]) -> str | None:
+                 states: dict[str, FooterState], *, skip_footer: bool = False) -> str | None:
+    if not instance_dirs:
+        return None
+    checked = check_reviewed_text(instance_dirs, reply)
+    if isinstance(checked, QuestionReplyBlocked):
+        return checked.reason
+    reason = footer_block_reason(instance_dirs, reply, states, skip_footer=skip_footer)
+    if reason is None:
+        for instance in instance_dirs:
+            delete_pending_reviewed(Path(instance))
+    return reason
+
+
+def footer_block_reason(instance_dirs: list[str], reply: str,
+                       states: dict[str, FooterState], *, skip_footer: bool) -> str | None:
+    if skip_footer:
+        return None
     productions = [production for path in instance_dirs if (production := read_production(Path(path))) is not None]
     if not productions or all(states[production.slug] is FooterState.OFF for production in productions):
         return None

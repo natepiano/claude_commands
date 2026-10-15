@@ -7,6 +7,7 @@ import json
 import os
 import shlex
 import shutil
+import signal
 import subprocess
 import tempfile
 import sys
@@ -17,8 +18,9 @@ import unittest
 from contextlib import contextmanager, redirect_stderr, redirect_stdout
 from collections.abc import Callable, Generator
 from datetime import datetime, timedelta, timezone
+from functools import partial
 from pathlib import Path
-from typing import TYPE_CHECKING, Literal, TypedDict, cast, final, override
+from typing import TYPE_CHECKING, Literal, Protocol, TypedDict, cast, final, override
 from unittest.mock import Mock, call, patch
 
 from test_support import registry_confirmation, ShutdownSendLeaf, ShutdownTestCase
@@ -88,6 +90,7 @@ def common_session(
         "name": name,
         "cwd": f"/tmp/{session_id}",
         "status": status,
+        "updated_at": 0,
         "model": inventory.NoReplyYet(kind="no reply yet"),
         "checkout": checkout(ahead=ahead, path=f"/tmp/{session_id}"),
         "run_dirs": [],
@@ -220,12 +223,44 @@ def session_shutdown(session: inventory.Session, *, progress: record.SessionProg
     )
 
 
+class StopFake(Protocol):
+    def __call__(self, saved: record.SessionShutdown, *,
+                 idle_reason: stop_work.IdleStopReason = "not an idle stop") -> record.SessionShutdown: ...
+
+
+def ignoring_idle_reason(action: Callable[[record.SessionShutdown], record.SessionShutdown]) -> StopFake:
+    def perform(saved: record.SessionShutdown, *,
+                idle_reason: stop_work.IdleStopReason = "not an idle stop") -> record.SessionShutdown:
+        del idle_reason
+        return action(saved)
+    return perform
+
+
+def await_ready_mark(saved: record.SessionShutdown) -> None:
+    """Keep an idle fixture waiting until the test supplies its ready mark."""
+    saved["settle_message"] = {"kind": "sent", "at": NOW}
+    saved["session"]["updated_at"] = int(NOW_UTC.timestamp() * 1000) - 1
+
+
 def unchanged(saved: record.SessionShutdown) -> record.SessionShutdown:
     return saved
 
 
 class PassObserved(Exception):
     """The test has observed one complete conducting pass."""
+
+
+class ConsumptionObservedFuture[T](Future[T]):
+    """Expose whether the conductor consumed a completed action's result."""
+
+    consumed: bool = False
+
+    @override
+    def result(self, timeout: float | None = None) -> T:
+        try:
+            return super().result(timeout)
+        finally:
+            self.consumed = True
 
 
 @final
@@ -321,7 +356,7 @@ class SettleTests(ShutdownTestCase):
             patch.object(settle, "run_inventory", return_value=machine_inventory(owners)),
             patch.object(settle, "_showing_form", return_value=False),
             patch.object(settle, "_send_settle_message"),
-            patch.object(stop_work, "stop_session", side_effect=self.fake_stop),
+            patch.object(stop_work, "stop_session", side_effect=ignoring_idle_reason(self.fake_stop)),
             patch.object(settle, "report_stop"),
             patch.object(settle, "send_message", return_value=settle.MessageSent(kind="sent")),
             patch.object(settle, "alert_user") as alert,
@@ -337,26 +372,19 @@ class SettleTests(ShutdownTestCase):
         pushes = [cast(RenderedPush, call.args[0]) for call in alert.call_args_list]
         self.assertEqual({push.values["session"] for push in pushes}, set(identities))
         for push in pushes:
-            self.assertEqual(push.id, "shutdown.holdout")
+            self.assertEqual(push.id, "shutdown.holdout_unanswered")
             self.assertIn(push.values["session"], push.title)
             self.assertIn("is blocked", push.title)
             self.assertIn(push.values["command"], push.body)
-            self.assertIn("5 minutes", push.body)
             combined = push.body + " " + cast(ActionRequired, push.action).text
-            self.assertIn("(on natedev)", combined.casefold())
-            self.assertIn(f"now {LOGIN} --here --only {identities[push.values['session']]}", combined)
-            self.assertTrue(push.body.startswith(f"Reason: {push.values['operation']} is blocked because {push.values['session']}'s claude session is not answering, and it can't proceed.\n\n"))
-            self.assertIn("Stop now (recommended)", push.body)
-            self.assertIn("mid-step", push.body)
-            self.assertIn("Uncommitted work stays", push.body)
+            self.assertIn("in a terminal on natedev:", combined.casefold())
+            self.assertIn(f"now {LABEL} --here --only {identities[push.values['session']]}", combined)
+            self.assertTrue(push.body.startswith(f"Reason: {push.values['operation']} is blocked because {push.values['session']}'s claude session has not paused for it and it can't proceed.\n\n"))
+            self.assertNotIn("form", push.title + "\n" + push.message)
             if identities[push.values["session"]] == "session-wait":
-                self.assertIn("Restart", push.title)
-                self.assertIn("Do nothing: the restart keeps waiting", push.body)
-                self.assertIn("the restart brings it back", push.body)
+                self.assertIn("restart", push.title)
             else:
-                self.assertIn("Shutdown", push.title)
-                self.assertIn("Do nothing: the shutdown keeps waiting", push.body)
-                self.assertIn("it stays stopped until restarted", push.body)
+                self.assertIn("shutdown", push.title)
 
     def test_shutdown_closing_cold_key_peer_and_holdout_lines_name_command_places(self) -> None:
         owner = top_level("place-owner", "Owner")
@@ -484,7 +512,7 @@ class SettleTests(ShutdownTestCase):
             stops.append(saved["session"]["session_id"])
             return self.fake_stop(saved)
         with (patch.object(settle, "run_inventory", return_value=report),
-              patch.object(stop_work, "stop_session", side_effect=stop_once),
+              patch.object(stop_work, "stop_session", side_effect=ignoring_idle_reason(stop_once)),
               patch.object(restart_work, "relaunch_session", side_effect=self.fake_launch) as launch,
               patch.object(restart_work, "wait_for_confirmation", side_effect=self.all_live),
               patch.object(restart_work, "confirm_entry", side_effect=self.fake_confirm),
@@ -515,7 +543,7 @@ class SettleTests(ShutdownTestCase):
         assert current is not None
         self.assertEqual(current["settle_message"]["kind"], "sent")
         self.assertIsInstance(settle.next_step(current, self.matching(current), [], NOW_UTC), settle.Hold)
-        with patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": owner["session_id"]}), patch.object(settle, "run_inventory", return_value=report):
+        with patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": owner["session_id"]}), patch.object(settle, "run_inventory", return_value=report), patch.object(settle, "_launch_conductor"):
             self.assertEqual(settle.ready("saved and pushed"), 0)
         current = record.find_session(LOGIN, owner["session_id"])
         assert current is not None
@@ -537,7 +565,7 @@ class SettleTests(ShutdownTestCase):
             observed.append(current["session"]["session_id"])
             return self.fake_stop(current)
         with (patch.object(settle, "run_inventory", return_value=machine_inventory([owner])) as read,
-              patch.object(stop_work, "stop_session", side_effect=stop_refused),
+              patch.object(stop_work, "stop_session", side_effect=ignoring_idle_reason(stop_refused)),
               patch.object(settle, "send_message") as send,
               patch.object(settle, "report_stop")):
             self.assertEqual(settle.conduct(LOGIN), 0)
@@ -568,7 +596,7 @@ class SettleTests(ShutdownTestCase):
         with (patch.object(refusal_watch, "transcript_refusal", side_effect=withdraw_after_read) as scan,
               patch.object(settle, "_usage_limit_shown", return_value=False),
               patch.object(settle, "run_inventory", return_value=machine_inventory([withdrawn["session"], ready["session"]])),
-              patch.object(stop_work, "stop_session", side_effect=self.fake_stop) as stop,
+              patch.object(stop_work, "stop_session", side_effect=ignoring_idle_reason(self.fake_stop)) as stop,
               patch.object(settle, "send_message") as send,
               patch.object(settle, "report_stop") as report):
             self.assertEqual(settle.conduct(LOGIN), 0)
@@ -593,7 +621,7 @@ class SettleTests(ShutdownTestCase):
                 self.save(saved)
                 with (patch.object(settle, "_launch_conductor", side_effect=self.run_conductor) as launch,
                       patch.object(settle, "run_inventory", return_value=machine_inventory([owner])),
-                      patch.object(stop_work, "stop_session", side_effect=self.fake_stop) as stop,
+                      patch.object(stop_work, "stop_session", side_effect=ignoring_idle_reason(self.fake_stop)) as stop,
                       patch.object(settle, "send_message") as send,
                       patch.object(settle, "report_stop"), redirect_stdout(io.StringIO())):
                     self.assertEqual(settle.now(Account("claude", LOGIN, LABEL), here=True, only=ids), 0)
@@ -840,6 +868,266 @@ class SettleTests(ShutdownTestCase):
     def matching(self, saved: record.SessionShutdown) -> stop_work.FreshSession:
         return stop_work.MatchingSession(kind="matching session", session=saved["session"], workers=saved["workers"])
 
+    def conduct_idle_stop(self, saved: record.SessionShutdown, owner: inventory.Session,
+                          expected_where: str) -> None:
+        self.save(saved)
+        claims: list[record.Where] = []
+        signals: list[tuple[int, int]] = []
+
+        def observe_update(login: str, identity: str,
+                           change: Callable[[record.SessionShutdown], None]) -> record.SessionShutdown:
+            def observe(current: record.SessionShutdown) -> None:
+                before = current["progress"]["kind"]
+                where_before = current["where"].copy()
+                change(current)
+                progress = current["progress"]
+                if before == "waiting" and progress["kind"] == "stopping":
+                    self.assertEqual(where_before, {"kind": "not said"})
+                    self.assertEqual(current["where"], {
+                        "kind": "said", "text": expected_where, "at": progress["at"],
+                    })
+                    self.assertEqual(datetime.fromisoformat(progress["at"]).microsecond, 0)
+                    claims.append(current["where"].copy())
+            return record.update_session(login, identity, observe)
+
+        def kill(pid: int, sent_signal: int) -> None:
+            current = record.find_session(LOGIN, owner["session_id"])
+            assert current is not None
+            self.assertEqual(current["progress"]["kind"], "stopping")
+            self.assertEqual(current["where"], claims[0])
+            signals.append((pid, sent_signal))
+
+        perform_stop = partial(stop_work.stop_session, kill=kill, is_alive=lambda _pid: False,
+            session_record_exists=lambda _pid: False,
+            fresh_inventory=lambda _login, _only: machine_inventory([owner]),
+            clock=lambda: NOW_UTC, codex_mesh=lambda _args: 0,
+            tmux=lambda _args: 1, sleep=lambda _seconds: None)
+        with (
+            patch.object(settle, "run_inventory", return_value=machine_inventory([owner])),
+            patch.object(stop_work, "update_session", side_effect=observe_update),
+            patch.object(stop_work, "stop_session", new=perform_stop),
+            patch.object(settle, "send_message") as sender,
+            patch.object(settle, "alert_user") as alert,
+            patch.object(settle, "report_stop"),
+        ):
+            self.assertEqual(settle.conduct(LOGIN), 0)
+        self.assertEqual(signals, [(owner["pid"], signal.SIGTERM)])
+        sender.assert_not_called()
+        alert.assert_not_called()
+        self.assertEqual(len(claims), 1)
+        latest = record.find_session(LOGIN, owner["session_id"])
+        assert latest is not None
+        self.assertEqual(latest["progress"]["kind"], "stopped")
+        self.assertEqual(latest["where"], claims[0])
+        self.assertEqual(latest["settle_message"], saved["settle_message"])
+
+    def test_not_ready_stop_waits_then_retries_and_restarts_without_reporting_early(self) -> None:
+        owner = top_level("retry-owner", "Retry owner")
+        saved = session_shutdown(owner, progress={"kind": "ready", "at": NOW}, then="restart")
+        saved["where"] = {"kind": "said", "text": "resume the check", "at": NOW}
+        self.save(saved)
+        fresh_busy = top_level("retry-owner", "Retry owner", status="busy")
+        fresh_calls = 0
+        saw_refusal = False
+        signals: list[int] = []
+
+        def fresh(_login: str, _only: frozenset[str]) -> inventory.Inventory:
+            nonlocal fresh_calls
+            fresh_calls += 1
+            return machine_inventory([fresh_busy if fresh_calls == 1 else owner])
+
+        def observe(_login: str, _only: object = (), *, refresh_desktops: bool = True) -> inventory.Inventory:
+            nonlocal saw_refusal
+            del refresh_desktops
+            current = record.find_session(LOGIN, owner["session_id"])
+            if current is not None and current["stop_issues"] and current["progress"]["kind"] == "ready":
+                saw_refusal = True
+                self.assertFalse(settle._done(current))  # pyright: ignore[reportPrivateUsage]
+                report.assert_not_called()
+            return machine_inventory([owner])
+
+        perform_stop = partial(stop_work.stop_session, kill=lambda _pid, sent: signals.append(sent),
+            is_alive=lambda _pid: False, session_record_exists=lambda _pid: False,
+            fresh_inventory=fresh, clock=lambda: NOW_UTC, codex_mesh=lambda _args: 0,
+            tmux=lambda _args: 1, sleep=lambda _seconds: None)
+        with (
+            patch.object(settle, "SETTLE_INTERVAL_SECONDS", 0.001),
+            patch.object(settle, "run_inventory", side_effect=observe),
+            patch.object(stop_work, "stop_session", new=perform_stop),
+            patch.object(restart_work, "relaunch_session", side_effect=self.fake_launch),
+            patch.object(restart_work, "wait_for_confirmation", side_effect=self.all_live),
+            patch.object(restart_work, "confirm_entry", side_effect=self.fake_confirm),
+            patch.object(settle, "report_stop") as report,
+        ):
+            self.assertEqual(settle.conduct(LOGIN), 0)
+        self.assertTrue(saw_refusal)
+        self.assertEqual(fresh_calls, 2)
+        self.assertEqual(signals, [signal.SIGTERM])
+        report.assert_called_once()
+        outcomes = cast(list[record.SessionShutdown], report.call_args.args[0])
+        self.assertEqual(outcomes[0]["progress"]["kind"], "restarted")
+        self.assertEqual(outcomes[0]["where"], saved["where"])
+        self.assertEqual(outcomes[0]["stop_issues"], [])
+
+    def test_real_stop_exception_replaces_an_earlier_not_ready_issue(self) -> None:
+        saved = session_shutdown(top_level("failed-owner", "Failed owner"), progress={"kind": "ready", "at": NOW})
+        saved["stop_issues"] = [record.NotReadyToStop(kind="not ready to stop", at=NOW,
+            status="busy", progress="ready")]
+        self.save(saved)
+        settle._action_failed(saved, RuntimeError("signal refused"), stopping=True)  # pyright: ignore[reportPrivateUsage]
+        current = record.find_session(LOGIN, "failed-owner")
+        assert current is not None
+        self.assertEqual(current["progress"], {"kind": "stop failed", "at": NOW, "reason": "signal refused"})
+        self.assertEqual(current["stop_issues"], [])
+        self.assertTrue(settle._done(current))  # pyright: ignore[reportPrivateUsage]
+
+    def test_ready_recovers_old_not_ready_failure_and_launches_conductor(self) -> None:
+        saved = session_shutdown(top_level("recovered-owner", "Recovered owner"), progress={
+            "kind": "stop failed", "at": NOW, "reason": "session or worker is not idle and ready"})
+        saved["stop_issues"] = [record.NotReadyToStop(kind="not ready to stop", at=NOW,
+            status="busy", progress="waiting")]
+        directory = self.root / "state" / LOGIN / "sessions"
+        directory.mkdir(parents=True)
+        _ = (directory / "recovered-owner.json").write_text(json.dumps(saved))
+        with (
+            patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": "recovered-owner"}),
+            patch.object(settle, "run_inventory", return_value=machine_inventory([saved["session"]])),
+            patch.object(settle, "_launch_conductor") as launch,
+        ):
+            self.assertEqual(settle.ready("finish next check"), 0)
+        launch.assert_called_once_with(LOGIN, LABEL)
+        current = record.find_session(LOGIN, "recovered-owner")
+        assert current is not None
+        self.assertEqual(current["progress"], {"kind": "ready", "at": NOW})
+        self.assertEqual(current["where"], {"kind": "said", "at": NOW, "text": "finish next check"})
+
+    def test_ready_launch_failure_keeps_checkpoint_and_names_recovery_terminal_command(self) -> None:
+        saved = session_shutdown(top_level("orphan-owner", "Orphan owner"))
+        self.save(saved)
+        output, error = io.StringIO(), io.StringIO()
+        with (
+            patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": "orphan-owner"}),
+            patch.object(settle, "run_inventory", return_value=machine_inventory([saved["session"]])),
+            patch.object(settle, "_launch_conductor", side_effect=RuntimeError("launch unavailable")),
+            redirect_stdout(output), redirect_stderr(error),
+        ):
+            self.assertEqual(settle.ready("resume here"), 2)
+        text = output.getvalue() + error.getvalue()
+        self.assertIn("in a terminal on natedev", text)
+        self.assertIn("~/.claude/scripts/lib/py ~/.claude/scripts/shutdown/shutdown.py", text)
+        self.assertIn(f"conduct {LOGIN}", text)
+        current = record.find_session(LOGIN, "orphan-owner")
+        assert current is not None
+        self.assertEqual(current["progress"]["kind"], "ready")
+        self.assertEqual(current["where"], {"kind": "said", "at": NOW, "text": "resume here"})
+
+    def test_shell_automatic_stops_record_background_shell_for_both_pause_states(self) -> None:
+        for message in ("not sent", "sent"):
+            with self.subTest(message=message):
+                owner = top_level("shell-" + message, "Shell owner", status="shell")
+                owner["updated_at"] = int(NOW_UTC.timestamp() * 1000) + 1
+                saved = session_shutdown(owner)
+                saved["settle_message"] = {"kind": "not sent"} if message == "not sent" else {"kind": "sent", "at": NOW}
+                saved["workers"] = [worker_session("idle-worker", "Idle worker", owner=owner["session_id"])]
+                step = settle.next_step(saved, self.matching(saved), [], NOW_UTC)
+                self.assertIsInstance(step, settle.StopSession)
+                assert isinstance(step, settle.StopSession)
+                saved["workers"] = []
+                reason = "idle; nothing in progress" if message == "not sent" else "idle after the pause message; no ready line"
+                self.assertEqual(step.idle_reason, reason + "; a background shell was running")
+                self.conduct_idle_stop(saved, owner, reason + "; a background shell was running")
+
+    def test_ready_shell_keeps_checkpoint_but_shell_worker_and_busy_owner_still_wait(self) -> None:
+        owner = top_level("shell-ready", "Shell owner", status="shell")
+        saved = session_shutdown(owner, progress={"kind": "ready", "at": NOW})
+        saved["where"] = {"kind": "said", "text": "my own checkpoint", "at": NOW}
+        step = settle.next_step(saved, self.matching(saved), [], NOW_UTC)
+        self.assertIsInstance(step, settle.StopSession)
+        assert isinstance(step, settle.StopSession)
+        self.assertEqual(step.idle_reason, "not an idle stop")
+        self.assertNotIn("shell", settle.hold_reason(saved, self.matching(saved)))
+        saved["workers"] = [worker_session("worker-shell", "Shell worker", owner="shell-ready", status="shell")]
+        self.assertIsInstance(settle.next_step(saved, self.matching(saved), [], NOW_UTC), settle.Hold)
+        busy = session_shutdown(top_level("busy-owner", "Busy owner", status="busy"))
+        self.assertIsInstance(settle.next_step(busy, self.matching(busy), [], NOW_UTC), settle.SendSettleMessage)
+
+    def test_idle_before_any_message_stops_without_sending_and_records_where(self) -> None:
+        saved = session_shutdown(top_level("idle-before", "Idle before", status="busy"))
+        fresh = top_level("idle-before", "Idle before")
+        self.conduct_idle_stop(saved, fresh, "idle; nothing in progress")
+
+    def test_idle_after_pause_with_fresh_update_stops_and_records_where(self) -> None:
+        saved = session_shutdown(top_level("idle-after", "Idle after", status="busy"))
+        saved["settle_message"] = {"kind": "sent", "at": NOW}
+        fresh = top_level("idle-after", "Idle after")
+        fresh["updated_at"] = int(NOW_UTC.timestamp() * 1000) + 1
+        self.conduct_idle_stop(saved, fresh, "idle after the pause message; no ready line")
+
+    def test_idle_with_queued_pause_stops_without_retrying_delivery(self) -> None:
+        saved = session_shutdown(top_level("queued-idle", "Queued idle"))
+        saved["settle_message"] = {"kind": "queued", "at": NOW, "reason": "delivery failed"}
+        self.conduct_idle_stop(saved, saved["session"], "idle; nothing in progress")
+
+    def test_busy_after_pause_reasks_holds_and_alerts_only_when_requested(self) -> None:
+        for alerts in ("user", "none"):
+            with self.subTest(alerts=alerts):
+                saved = session_shutdown(unit("busy-" + alerts, "Busy", status="busy"))
+                saved["alerts"] = alerts
+                saved["settle_message"] = {"kind": "sent", "at": NOW}
+                owner = self.matching(saved)
+                self.assertIsInstance(settle.next_step(saved, owner, [],
+                    NOW_UTC + settle.REASK_AFTER - timedelta(seconds=1)), settle.Hold)
+                self.assertIsInstance(settle.next_step(saved, owner, [],
+                    NOW_UTC + settle.REASK_AFTER), settle.SendSettleMessage)
+                saved["reasked_at"] = (NOW_UTC + settle.REASK_AFTER).isoformat()
+                self.assertIsInstance(settle.next_step(saved, owner, [],
+                    NOW_UTC + settle.NOT_ANSWERING_AFTER), settle.Hold)
+                self.assertFalse(settle._holdout_due(saved, NOW_UTC + settle.NOT_ANSWERING_AFTER  # pyright: ignore[reportPrivateUsage]
+                    - timedelta(seconds=1)))
+                self.save(saved)
+
+                def end_pass(_seconds: float) -> None:
+                    raise PassObserved()
+
+                with (
+                    patch.object(settle, "now_utc", return_value=NOW_UTC + settle.NOT_ANSWERING_AFTER),
+                    patch.object(settle, "run_inventory", return_value=machine_inventory([saved["session"]])),
+                    patch.object(settle, "send_message", return_value=settle.MessageSent(kind="sent")),
+                    patch.object(settle, "alert_user") as alert,
+                    patch.object(stop_work, "stop_session") as stop,
+                    patch.object(time, "sleep", side_effect=end_pass),
+                    self.assertRaises(PassObserved),
+                ):
+                    _ = settle.conduct(LOGIN)
+                self.assertEqual(alert.call_count, 1 if alerts == "user" else 0)
+                stop.assert_not_called()
+                record.archive_session(LOGIN, saved["session"]["session_id"])
+
+    def test_idle_update_at_or_before_pause_is_not_an_answer(self) -> None:
+        saved = session_shutdown(top_level("stale-idle", "Stale idle"))
+        saved["session"]["updated_at"] = int(NOW_UTC.timestamp() * 1000) + 1000
+        saved["settle_message"] = {"kind": "sent", "at": NOW}
+        for offset in (-1, 0):
+            with self.subTest(milliseconds=offset):
+                fresh = top_level("stale-idle", "Stale idle")
+                fresh["updated_at"] = int(NOW_UTC.timestamp() * 1000) + offset
+                owner = stop_work.MatchingSession(kind="matching session", session=fresh, workers=[])
+                self.assertIsInstance(settle.next_step(saved, owner, [], NOW_UTC), settle.Hold)
+                self.assertIsInstance(settle.next_step(saved, owner, [], NOW_UTC + settle.REASK_AFTER),
+                    settle.SendSettleMessage)
+
+    def test_idle_with_form_blocker_or_busy_worker_still_holds(self) -> None:
+        saved = session_shutdown(top_level("blocked-idle", "Blocked idle"))
+        saved["settle_message"] = {"kind": "sent", "at": NOW}
+        saved["session"]["updated_at"] = int(NOW_UTC.timestamp() * 1000) + 1
+        with patch.object(settle, "_showing_form", return_value=True):
+            self.assertIsInstance(settle.next_step(saved, self.matching(saved), [], NOW_UTC), settle.Hold)
+        saved["session"]["checkout"] = checkout(ahead=1)
+        self.assertIsInstance(settle.next_step(saved, self.matching(saved), [], NOW_UTC), settle.Hold)
+        saved["session"]["checkout"] = checkout()
+        saved["workers"] = [worker_session("busy-worker", "Busy worker", owner="blocked-idle", status="busy")]
+        self.assertIsInstance(settle.next_step(saved, self.matching(saved), [], NOW_UTC), settle.Hold)
+
     def write_owner_pane(self, owner: inventory.Session, tmux: str, *, identity: str = "") -> None:
         directory = self.root / "sessions"
         directory.mkdir(exist_ok=True)
@@ -862,6 +1150,7 @@ class SettleTests(ShutdownTestCase):
 
     def test_screen_targets_owner_pane_when_other_pane_shows_usage_limit(self) -> None:
         owner = showrunner("owner", "Owner")
+        owner["checkout"] = checkout(ahead=1)
         owner["host"] = inventory.TmuxHost(kind="tmux", tmux_session="shared",
             server=inventory.TmuxServerNotRecorded(kind="not recorded"),
             session_ref=inventory.TmuxSessionIdNotRecorded(kind="not recorded"),
@@ -1019,7 +1308,7 @@ class SettleTests(ShutdownTestCase):
             seen.append(saved["session"]["session_id"])
             return self.fake_stop(saved)
         report = machine_inventory([held["session"], ordinary["session"], *held["workers"], *ordinary["workers"]])
-        with patch.object(settle, "run_inventory", return_value=report) as observe, patch.object(settle, "_screen", side_effect=screen), patch.object(stop_work, "stop_session", side_effect=stop), patch.object(settle, "send_message") as sender, patch.object(settle, "report_stop"):
+        with patch.object(settle, "run_inventory", return_value=report) as observe, patch.object(settle, "_screen", side_effect=screen), patch.object(stop_work, "stop_session", side_effect=ignoring_idle_reason(stop)), patch.object(settle, "send_message") as sender, patch.object(settle, "report_stop"):
             self.assertEqual(settle.conduct(LOGIN), 0)
         self.assertCountEqual(seen, ["held", "ordinary"])
         observe.assert_called_once()
@@ -1033,7 +1322,7 @@ class SettleTests(ShutdownTestCase):
         ]
         for delivery in deliveries:
             with self.subTest(delivery=delivery["kind"]):
-                owner = top_level("owner-" + delivery["kind"], "Owner")
+                owner = top_level("owner-" + delivery["kind"], "Owner", status="busy")
                 saved = session_shutdown(owner, progress=record.SessionHeldByUsageLimit(kind="held by usage limit", at=NOW))
                 saved["settle_message"] = delivery
                 saved["alerts"] = "none"
@@ -1105,7 +1394,7 @@ class SettleTests(ShutdownTestCase):
     def test_ready_accepts_owner_held_by_usage_limit(self) -> None:
         saved = session_shutdown(top_level("owner", "Owner"), progress=record.SessionHeldByUsageLimit(kind="held by usage limit", at=NOW))
         self.save(saved)
-        with patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": "owner"}), patch.object(settle, "run_inventory", return_value=machine_inventory([saved["session"]])):
+        with patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": "owner"}), patch.object(settle, "run_inventory", return_value=machine_inventory([saved["session"]])), patch.object(settle, "_launch_conductor"):
             self.assertEqual(settle.ready("limit reset"), 0)
         latest = record.find_session(LOGIN, "owner")
         assert latest is not None
@@ -1114,7 +1403,7 @@ class SettleTests(ShutdownTestCase):
     def test_next_step_covers_request_delivery_stop_restore_and_terminal_states(self) -> None:
         saved = session_shutdown(top_level("owner", "Owner"))
         cases: list[tuple[record.SessionProgress, str, record.ShutdownContinuation, type[settle.Step]]] = [
-            ({"kind": "waiting"}, "idle", "stop", settle.SendSettleMessage),
+            ({"kind": "waiting"}, "idle", "stop", settle.StopSession),
             ({"kind": "ready", "at": NOW}, "idle", "stop", settle.StopSession),
             ({"kind": "ready", "at": NOW}, "busy", "stop", settle.Hold),
             ({"kind": "stopped", "at": NOW}, "idle", "restart", settle.RelaunchSession),
@@ -1158,27 +1447,58 @@ class SettleTests(ShutdownTestCase):
     def test_pause_message_starts_with_a_fixed_line_and_asks_for_a_stop_at_once(self) -> None:
         moving = session_shutdown(unit("unit", "Unit"))
         moving["target"], moving["why"] = "claude1", "out of usage"
-        first, body = settle._settle_text(moving, moving["session"]).split("\n\n", 1)  # pyright: ignore[reportPrivateUsage]
+        first, body = settle._settle_text(moving, moving["session"]).split("\n", 1)  # pyright: ignore[reportPrivateUsage]
         self.assertTrue(first.startswith("Pause for move: claude2 → claude1 (out of usage, "), first)
         self.assertIn("Stop now, without finishing the step you are in", body)
         self.assertIn("shutdown.py ready --where", body)
         self.assertIn("You will be resumed on claude1 with that line", body)
         self.assertNotIn("let any worker turn", body)
         stopping = session_shutdown(top_level("owner", "Owner"))
-        first, _ = settle._settle_text(stopping, stopping["session"]).split("\n\n", 1)  # pyright: ignore[reportPrivateUsage]
+        first = settle._settle_text(stopping, stopping["session"]).splitlines()[0]  # pyright: ignore[reportPrivateUsage]
         self.assertTrue(first.startswith("Pause for stop: claude2 (requested by the user, "), first)
 
-    def test_busy_unit_is_asked_once_more_after_two_minutes_and_never_stopped_without_its_mark(self) -> None:
-        saved = session_shutdown(unit("unit", "Unit"), requester="requester")
-        sent = NOW_UTC - settle.REASK_AFTER
-        saved["settle_message"] = {"kind": "sent", "at": sent.isoformat()}
-        busy = self.matching(saved)
-        self.assertNotIsInstance(settle.next_step(saved, busy, [saved], sent + settle.REASK_AFTER - timedelta(seconds=1)), settle.SendSettleMessage)
-        self.assertIsInstance(settle.next_step(saved, busy, [saved], NOW_UTC), settle.SendSettleMessage)
-        saved["reasked_at"] = NOW
-        step = settle.next_step(saved, busy, [saved], NOW_UTC + timedelta(hours=1))
-        self.assertNotIsInstance(step, settle.SendSettleMessage)
-        self.assertNotIsInstance(step, settle.StopSession)
+    def assert_pause_confirmation(self, saved: record.SessionShutdown, first_line: str,
+                                  citation: str, operation: str) -> None:
+        with patch.object(settle, "_user_time", return_value="Fri 2:49 PM"):
+            text = settle._settle_text(saved, saved["session"])  # pyright: ignore[reportPrivateUsage]
+        lines = text.splitlines()
+        self.assertEqual(lines[0], first_line)
+        confirmation = lines[1]
+        self.assertEqual(confirmation, settle.pause_confirmation_line(saved))
+        self.assertIn("the shutdown the user started", confirmation)
+        self.assertIn(citation, confirmation)
+        self.assertIn("not from another session's own choice", confirmation)
+        self.assertIn("run in this terminal:", confirmation)
+        self.assertIn("~/.claude/scripts/lib/py ~/.claude/scripts/shutdown/shutdown.py status claude2 --here",
+                      confirmation)
+        self.assertTrue(confirmation.endswith(f"It lists this session under the {operation}."), confirmation)
+        self.assertNotIn(saved["login"], text)
+        self.assertEqual(lines[2], "")
+        self.assertTrue(lines[3].startswith("Stop now, without finishing the step you are in"), lines[3])
+        self.assertIn("shutdown.py ready --where", lines[3])
+
+    def test_move_pause_confirms_user_request_by_canonical_account_before_stop_instructions(self) -> None:
+        for owner in (top_level("owner", "Owner", status="busy"),
+                      unit("unit", "Unit", status="busy"), showrunner("runner", "Runner")):
+            with self.subTest(kind=owner["kind"]):
+                owner["status"] = "busy"
+                saved = session_shutdown(owner, then="restart")
+                saved["label"] = "claude 2"
+                saved["target"], saved["why"] = "claude1", "out of usage"
+                self.assert_pause_confirmation(saved,
+                    "Pause for move: claude 2 → claude1 (out of usage, Fri 2:49 PM)",
+                    'docs/accounts.md, "Move a session"', "move")
+
+    def test_stop_pause_confirms_user_request_by_canonical_account_before_stop_instructions(self) -> None:
+        for owner in (top_level("owner", "Owner", status="busy"),
+                      unit("unit", "Unit", status="busy"), showrunner("runner", "Runner")):
+            with self.subTest(kind=owner["kind"]):
+                owner["status"] = "busy"
+                saved = session_shutdown(owner)
+                saved["label"] = "claude 2"
+                self.assert_pause_confirmation(saved,
+                    "Pause for stop: claude 2 (requested by the user, Fri 2:49 PM)",
+                    "docs/as-built/shutdown-and-restart.md", "stop")
 
     def unit_for_showrunner(self, then: record.ShutdownContinuation = "restart") -> record.SessionShutdown:
         owner = unit("unit", "Unit")
@@ -1198,7 +1518,7 @@ class SettleTests(ShutdownTestCase):
         with (
             patch.object(settle_showrunners, "current_name", return_value="runner") as named,
             patch.object(settle, "send_message", return_value={"kind": "sent"}) as send,
-            patch.object(stop_work, "stop_session", side_effect=unchanged),
+            patch.object(stop_work, "stop_session", side_effect=ignoring_idle_reason(unchanged)),
         ):
             _ = settle._stop_after_telling(saved)  # pyright: ignore[reportPrivateUsage]
             _ = settle._stop_after_telling(record.session_records(LOGIN)[0])  # pyright: ignore[reportPrivateUsage]
@@ -1261,6 +1581,7 @@ class SettleTests(ShutdownTestCase):
 
     def test_queued_message_retries_only_after_five_minutes_and_showrunner_is_immediate(self) -> None:
         saved = session_shutdown(showrunner("runner", "Runner"))
+        saved["session"]["status"] = "busy"
         self.assertIsInstance(settle.next_step(saved, self.matching(saved), [], NOW_UTC), settle.SendSettleMessage)
         saved["settle_message"] = {"kind": "queued", "at": NOW, "reason": "no live session"}
         self.assertIsInstance(settle.next_step(saved, self.matching(saved), [], NOW_UTC + timedelta(seconds=299)), settle.Hold)
@@ -1561,7 +1882,7 @@ class SettleTests(ShutdownTestCase):
         def report(_records: list[record.SessionShutdown]) -> None:
             self.assertCountEqual(completed, ["first", "second"])
         owners = [saved["session"] for saved in record.session_records(LOGIN)]
-        with patch.object(stop_work, "stop_session", side_effect=stop), patch.object(settle, "_launch_conductor", side_effect=self.run_conductor), patch.object(settle, "run_inventory", return_value=machine_inventory(owners)), patch.object(settle, "report_stop", side_effect=report):
+        with patch.object(stop_work, "stop_session", side_effect=ignoring_idle_reason(stop)), patch.object(settle, "_launch_conductor", side_effect=self.run_conductor), patch.object(settle, "run_inventory", return_value=machine_inventory(owners)), patch.object(settle, "report_stop", side_effect=report):
             self.assertEqual(settle.now(Account("claude", LOGIN, LABEL), True), 0)
         self.assertEqual([saved["progress"]["kind"] for saved in record.session_records(LOGIN)], ["stopped", "stopped"])
 
@@ -1608,7 +1929,7 @@ class SettleTests(ShutdownTestCase):
         with (
             patch.object(settle, "run_inventory", return_value=machine_inventory(owners)),
             patch.object(settle, "_showing_form", side_effect=form),
-            patch.object(stop_work, "stop_session", side_effect=self.fake_stop),
+            patch.object(stop_work, "stop_session", side_effect=ignoring_idle_reason(self.fake_stop)),
             patch.object(restart_work, "relaunch_session", side_effect=self.fake_launch),
             patch.object(restart_work, "wait_for_confirmation", side_effect=self.all_live) as wait,
             patch.object(restart_work, "confirm_entry", side_effect=self.fake_confirm),
@@ -1861,9 +2182,326 @@ class SettleTests(ShutdownTestCase):
         observe.assert_not_called()
         self.assertEqual(record.find_session(LOGIN, "owner"), saved)
 
+    @contextmanager
+    def conductor_modules(self) -> Generator[dict[str, Path], None, None]:
+        directory = self.root / "conductor-modules"
+        directory.mkdir(exist_ok=True)
+        modules = {name: directory / name for name in (
+            "shutdown.py", "settle.py", "stop.py", "record.py", "inventory.py", "restart.py")}
+        for path in modules.values():
+            _ = path.write_text("# original module\n")
+        with patch.object(settle, "__file__", str(modules["settle.py"])):
+            yield modules
+
+    def test_conductor_changed_module_reexecs_service_argv_after_unlock_without_new_steps(self) -> None:
+        self.allow_leaf(ShutdownSendLeaf.LAUNCH_CONDUCTOR)
+        with patch.object(subprocess, "run", return_value=subprocess.CompletedProcess([], 0)) as service:
+            settle._launch_conductor(LOGIN, LABEL)  # pyright: ignore[reportPrivateUsage]
+        service_command = cast(list[str], service.call_args.args[0])
+        python_index = service_command.index(sys.executable)
+        argv = service_command[python_index + 2:]
+        self.assertEqual(service_command[python_index + 1], "-u")
+        self.assertEqual(argv, [str(settle.SHUTDOWN), "conduct", LOGIN])
+        choose_step = settle.next_step
+        changes = ((name, field) for name in (
+            "shutdown.py", "settle.py", "stop.py", "record.py", "inventory.py", "restart.py")
+            for field in ("mtime", "size"))
+        for name, field in changes:
+            with self.subTest(module=name, field=field), self.conductor_modules() as modules:
+                identity = f"reload-{Path(name).stem}-{field}"
+                owner = top_level(identity, "Waiting", status="busy")
+                saved = session_shutdown(owner, progress={"kind": "ready", "at": NOW})
+                self.save(saved)
+                fresh_owner = top_level(identity, "Waiting", status="busy")
+                changed = False
+                output = io.StringIO()
+
+                def install(_seconds: float) -> None:
+                    nonlocal changed
+                    self.assertFalse(changed, "conductor did not notice the changed module on its next pass")
+                    path = modules[name]
+                    metadata = path.stat()
+                    if field == "mtime":
+                        os.utime(path, ns=(metadata.st_atime_ns, metadata.st_mtime_ns + 1_000_000_000))
+                    else:
+                        _ = path.write_text("# replacement module with a different size\n")
+                        os.utime(path, ns=(metadata.st_atime_ns, metadata.st_mtime_ns))
+                    changed = True
+                    fresh_owner["status"] = "idle"
+
+                def step(current: record.SessionShutdown, fresh: stop_work.FreshSession,
+                         others: list[record.SessionShutdown], at: datetime) -> settle.Step:
+                    self.assertFalse(changed, "a new step was selected with obsolete code")
+                    return choose_step(current, fresh, others, at)
+
+                def reexec(executable: str, arguments: list[str]) -> None:
+                    self.assertEqual((executable, arguments), (sys.executable, [sys.executable, "-u", *argv]))
+                    with record.conductor_lock(LOGIN) as ownership:
+                        self.assertIsInstance(ownership, record.ConductorAcquired)
+                    restore.assert_called_once_with(dry_run=False)
+                    raise PassObserved()
+
+                with (
+                    patch.object(sys, "argv", argv),
+                    patch.object(settle, "run_inventory", return_value=machine_inventory([fresh_owner])),
+                    patch.object(settle, "next_step", side_effect=step) as selected,
+                    patch.object(time, "sleep", side_effect=install),
+                    patch.object(restart_work.DesktopLaunchState, "restore") as restore,
+                    patch.object(os, "execv", side_effect=reexec) as execute,
+                    patch.object(stop_work, "stop_session") as stop,
+                    patch.object(settle, "report_stop") as report,
+                    redirect_stdout(output),
+                    self.assertRaises(PassObserved),
+                ):
+                    _ = settle.conduct(LOGIN)
+                execute.assert_called_once()
+                selected.assert_called_once()
+                stop.assert_not_called()
+                report.assert_not_called()
+                self.assertEqual(output.getvalue().count("shutdown modules changed"), 1)
+                self.assertIn(name, output.getvalue())
+                self.assertEqual(record.find_session(LOGIN, owner["session_id"]), saved)
+                record.archive_session(LOGIN, owner["session_id"])
+
+    def test_conductor_reload_drains_and_consumes_launch_stop_message_alert_and_registry_work(self) -> None:
+        for stage in ("launch", "stop", "message", "alert", "confirmation"):
+            with self.subTest(stage=stage), self.conductor_modules() as modules:
+                owner = top_level("draining-" + stage, "Draining", status="busy" if stage in {"message", "alert"} else "idle")
+                progress: record.SessionProgress = ({"kind": "stopped", "at": NOW} if stage in {"launch", "confirmation"}
+                    else {"kind": "ready", "at": NOW} if stage == "stop" else {"kind": "waiting"})
+                saved = session_shutdown(owner, progress=progress,
+                    then="restart" if stage in {"launch", "confirmation"} else "stop")
+                if stage == "confirmation":
+                    owner["host"] = inventory.TerminalHost(kind="terminal")
+                if stage == "alert":
+                    saved["settle_message"] = {"kind": "sent", "at": NOW}
+                    saved["reasked_at"] = NOW
+                self.save(saved)
+                jobs: list[tuple[ConsumptionObservedFuture[object], Callable[[], None]]] = []
+                ticks = 0
+                changed = False
+                choose_step = settle.next_step
+
+                def submit[**P, R](executor: ThreadPoolExecutor, function: Callable[P, R], /,
+                                   *args: P.args, **kwargs: P.kwargs) -> Future[R]:
+                    del executor
+                    future = ConsumptionObservedFuture[R]()
+                    _ = future.set_running_or_notify_cancel()
+
+                    def finish() -> None:
+                        try:
+                            future.set_result(function(*args, **kwargs))
+                        except BaseException as error:
+                            future.set_exception(error)
+
+                    jobs.append((cast(ConsumptionObservedFuture[object], cast(object, future)), finish))
+                    return future
+
+                def advance() -> None:
+                    nonlocal ticks, changed
+                    ticks += 1
+                    self.assertLess(ticks, 8, "reload failed to finish draining")
+                    execute.assert_not_called()
+                    self.assertTrue(jobs, "test never put an action in flight")
+                    if ticks == 1:
+                        _ = modules["restart.py"].write_text("# replacement restart module\n")
+                        changed = True
+                    else:
+                        if ticks == 2:
+                            self.assertTrue(all(not future.done() for future, _finish in jobs))
+                        for future, finish in list(jobs):
+                            if not future.done():
+                                finish()
+
+                def sleep(_seconds: float) -> None:
+                    advance()
+
+                def wait(futures: list[Future[object]], *, timeout: float,
+                         return_when: str) -> tuple[set[Future[object]], set[Future[object]]]:
+                    del timeout, return_when
+                    advance()
+                    return ({future for future in futures if future.done()},
+                            {future for future in futures if not future.done()})
+
+                def step(current: record.SessionShutdown, fresh: stop_work.FreshSession,
+                         others: list[record.SessionShutdown], at: datetime) -> settle.Step:
+                    self.assertFalse(changed, "reload started another record step")
+                    return choose_step(current, fresh, others, at)
+
+                def reexec(_executable: str, _arguments: list[str]) -> None:
+                    self.assertGreaterEqual(ticks, 2)
+                    self.assertTrue(all(future.done() and future.consumed for future, _finish in jobs),
+                                    "exec lost an owned action's result")
+                    latest = record.find_session(LOGIN, owner["session_id"])
+                    if stage in {"launch", "confirmation"}:
+                        self.assertIsNone(latest, "registry result was not archived before reload")
+                    else:
+                        assert latest is not None
+                        if stage == "stop":
+                            self.assertEqual(latest["progress"]["kind"], "stopped")
+                        elif stage == "message":
+                            self.assertEqual(latest["settle_message"]["kind"], "sent")
+                        else:
+                            self.assertIn("alerted_at", latest)
+                            alert.assert_called_once()
+                    raise PassObserved()
+
+                with (
+                    patch.object(ThreadPoolExecutor, "submit", new=submit),
+                    patch.object(settle, "run_inventory", return_value=machine_inventory([owner])),
+                    patch.object(settle, "now_utc", return_value=NOW_UTC + (settle.NOT_ANSWERING_AFTER if stage == "alert" else timedelta())),
+                    patch.object(settle, "next_step", side_effect=step),
+                    patch.object(settle, "wait", side_effect=wait),
+                    patch.object(time, "sleep", side_effect=sleep),
+                    patch.object(stop_work, "stop_session", side_effect=ignoring_idle_reason(self.fake_stop)),
+                    patch.object(restart_work, "relaunch_session", side_effect=self.fake_launch),
+                    patch.object(restart_work, "wait_for_confirmation", side_effect=self.all_live),
+                    patch.object(restart_work, "confirm_entry", side_effect=self.fake_confirm),
+                    patch.object(settle, "send_message", return_value=settle.MessageSent(kind="sent")),
+                    patch.object(settle, "alert_user") as alert,
+                    patch.object(settle, "report_stop"),
+                    patch.object(os, "execv", side_effect=reexec) as execute,
+                    self.assertRaises(PassObserved),
+                ):
+                    _ = settle.conduct(LOGIN)
+                execute.assert_called_once()
+                if record.find_session(LOGIN, owner["session_id"]) is not None:
+                    record.archive_session(LOGIN, owner["session_id"])
+                (self.root / "state" / LOGIN / "conduct_archive.json").unlink(missing_ok=True)
+
+    def test_conductor_unchanged_modules_finish_without_reexec(self) -> None:
+        owner = top_level("same-code", "Same code")
+        self.save(session_shutdown(owner, progress={"kind": "ready", "at": NOW}, then="restart"))
+        with (
+            self.conductor_modules(),
+            patch.object(settle, "run_inventory", return_value=machine_inventory([owner])),
+            patch.object(stop_work, "stop_session", side_effect=ignoring_idle_reason(self.fake_stop)) as stop,
+            patch.object(restart_work, "relaunch_session", side_effect=self.fake_launch) as launch,
+            patch.object(restart_work, "wait_for_confirmation", side_effect=self.all_live),
+            patch.object(restart_work, "confirm_entry", side_effect=self.fake_confirm),
+            patch.object(settle, "report_stop") as report,
+            patch.object(os, "execv", side_effect=AssertionError("unchanged code re-executed")) as execute,
+        ):
+            self.assertEqual(settle.conduct(LOGIN), 0)
+        stop.assert_called_once()
+        launch.assert_called_once()
+        execute.assert_not_called()
+        outcomes = cast(list[record.SessionShutdown], report.call_args.args[0])
+        self.assertEqual([(saved["session"]["session_id"], saved["progress"]["kind"]) for saved in outcomes],
+                         [("same-code", "restarted")])
+
+    def test_conductor_reload_keeps_archived_outcomes_and_never_launches_an_owner_twice(self) -> None:
+        first, second = top_level("before-reload", "Before"), top_level("after-reload", "After")
+        self.save(session_shutdown(first, progress={"kind": "stopped", "at": NOW}, then="restart"))
+        self.save(session_shutdown(second, progress={"kind": "ready", "at": NOW}, then="restart"))
+        archive_path = self.root / "state" / LOGIN / "conduct_archive.json"
+        reloaded = False
+
+        def form(owner: inventory.Session) -> bool:
+            return owner["session_id"] == "after-reload" and not reloaded
+
+        with self.conductor_modules() as modules:
+            def install(_seconds: float) -> None:
+                self.assertIsNone(record.find_session(LOGIN, "before-reload"))
+                _ = modules["record.py"].write_text("# replacement record module\n")
+
+            def reexec(_executable: str, _arguments: list[str]) -> None:
+                self.assertTrue(archive_path.is_file())
+                self.assertIn("before-reload", archive_path.read_text())
+                self.assertIsNone(record.find_session(LOGIN, "before-reload"))
+                report.assert_not_called()
+                raise PassObserved()
+
+            with (
+                patch.object(settle, "run_inventory", return_value=machine_inventory([first, second])),
+                patch.object(settle, "_showing_form", side_effect=form),
+                patch.object(stop_work, "stop_session", side_effect=ignoring_idle_reason(self.fake_stop)) as stop,
+                patch.object(restart_work, "relaunch_session", side_effect=self.fake_launch) as launch,
+                patch.object(restart_work, "wait_for_confirmation", side_effect=self.all_live),
+                patch.object(restart_work, "confirm_entry", side_effect=self.fake_confirm),
+                patch.object(settle, "report_stop") as report,
+                patch.object(os, "execv", side_effect=reexec) as execute,
+            ):
+                with patch.object(time, "sleep", side_effect=install), self.assertRaises(PassObserved):
+                    _ = settle.conduct(LOGIN)
+                execute.assert_called_once()
+                reloaded = True
+                self.assertEqual(settle.conduct(LOGIN), 0)
+        execute.assert_called_once()
+        report.assert_called_once()
+        outcomes = cast(list[record.SessionShutdown], report.call_args.args[0])
+        self.assertCountEqual([(saved["session"]["session_id"], saved["progress"]["kind"]) for saved in outcomes],
+                              [("before-reload", "restarted"), ("after-reload", "restarted")])
+        self.assertCountEqual([cast(record.SessionShutdown, item.args[0])["session"]["session_id"]
+                               for item in launch.call_args_list], ["before-reload", "after-reload"])
+        stop.assert_called_once()
+        self.assertFalse(archive_path.exists(), "the new conductor did not consume its saved outcomes")
+
+    def test_conductor_unreadable_module_pass_keeps_outcomes_until_complete_reload(self) -> None:
+        first = top_level("before-install-gap", "Before install gap")
+        second = top_level("after-install-gap", "After install gap")
+        self.save(session_shutdown(first, progress={"kind": "stopped", "at": NOW}, then="restart"))
+        self.save(session_shutdown(second, progress={"kind": "ready", "at": NOW}, then="restart"))
+        archive_path = self.root / "state" / LOGIN / "conduct_archive.json"
+        reloaded = False
+        install_passes = 0
+
+        def form(owner: inventory.Session) -> bool:
+            return owner["session_id"] == "after-install-gap" and not reloaded
+
+        with self.conductor_modules() as modules:
+            def install(_seconds: float) -> None:
+                nonlocal install_passes
+                install_passes += 1
+                self.assertLessEqual(install_passes, 2, "complete changed fingerprint did not request reload")
+                self.assertIsNone(record.find_session(LOGIN, "before-install-gap"))
+                execute.assert_not_called()
+                report.assert_not_called()
+                if install_passes == 1:
+                    modules["stop.py"].unlink()
+                else:
+                    self.assertFalse(modules["stop.py"].exists())
+                    self.assertFalse(archive_path.exists(), "unreadable module prematurely requested reload")
+                    _ = modules["stop.py"].write_text("# replacement stop module after install gap\n")
+
+            def reexec(_executable: str, _arguments: list[str]) -> None:
+                self.assertEqual(install_passes, 2)
+                self.assertTrue(modules["stop.py"].is_file())
+                handed_off = record.parse_session_records(archive_path.read_text())
+                self.assertEqual([saved["session"]["session_id"] for saved in handed_off], ["before-install-gap"])
+                stop.assert_not_called()
+                report.assert_not_called()
+                raise PassObserved()
+
+            with (
+                patch.object(settle, "run_inventory", return_value=machine_inventory([first, second])),
+                patch.object(settle, "_showing_form", side_effect=form),
+                patch.object(stop_work, "stop_session", side_effect=ignoring_idle_reason(self.fake_stop)) as stop,
+                patch.object(restart_work, "relaunch_session", side_effect=self.fake_launch) as launch,
+                patch.object(restart_work, "wait_for_confirmation", side_effect=self.all_live),
+                patch.object(restart_work, "confirm_entry", side_effect=self.fake_confirm),
+                patch.object(settle, "report_stop") as report,
+                patch.object(os, "execv", side_effect=reexec) as execute,
+            ):
+                with patch.object(time, "sleep", side_effect=install), self.assertRaises(PassObserved):
+                    _ = settle.conduct(LOGIN)
+                execute.assert_called_once()
+                reloaded = True
+                self.assertEqual(settle.conduct(LOGIN), 0)
+        execute.assert_called_once()
+        report.assert_called_once()
+        outcomes = cast(list[record.SessionShutdown], report.call_args.args[0])
+        self.assertCountEqual([(saved["session"]["session_id"], saved["progress"]["kind"]) for saved in outcomes],
+                             [("before-install-gap", "restarted"), ("after-install-gap", "restarted")])
+        self.assertCountEqual([cast(record.SessionShutdown, call.args[0])["session"]["session_id"]
+                              for call in launch.call_args_list], ["before-install-gap", "after-install-gap"])
+        stop.assert_called_once()
+        self.assertFalse(archive_path.exists())
+
     def test_running_stop_does_not_prevent_a_new_inventory_or_another_ready_owner(self) -> None:
         slow = session_shutdown(top_level("slow", "Slow"), progress={"kind": "ready", "at": NOW})
         fast = session_shutdown(top_level("fast", "Fast"))
+        await_ready_mark(fast)
         self.save(slow)
         self.save(fast)
         entered, release, fast_done = threading.Event(), threading.Event(), threading.Event()
@@ -1875,6 +2513,7 @@ class SettleTests(ShutdownTestCase):
                 self.assertTrue(release.wait(1))
             result = self.fake_stop(saved)
             if saved["session"]["session_id"] == "fast":
+                self.assertEqual(saved["progress"]["kind"], "ready")
                 self.assertFalse(release.is_set())
                 fast_done.set()
             return result
@@ -1893,7 +2532,7 @@ class SettleTests(ShutdownTestCase):
             return wait_futures(futures, timeout=0.01, return_when=return_when)
         with (
             patch.object(settle, "run_inventory", return_value=machine_inventory([slow["session"], fast["session"]])) as observe,
-            patch.object(stop_work, "stop_session", side_effect=stop),
+            patch.object(stop_work, "stop_session", side_effect=ignoring_idle_reason(stop)),
             patch.object(settle, "_send_settle_message"),
             patch.object(settle, "report_stop"),
             patch.object(time, "monotonic", side_effect=lambda: elapsed[0]),
@@ -1915,11 +2554,16 @@ class SettleTests(ShutdownTestCase):
     def test_registry_wait_does_not_prevent_another_owner_becoming_ready(self) -> None:
         slow = session_shutdown(top_level("slow", "Slow"), progress={"kind": "stopped", "at": NOW}, then="restart")
         fast = session_shutdown(top_level("fast", "Fast"), then="restart")
+        await_ready_mark(fast)
         self.save(slow)
         self.save(fast)
         registry_entered, release, fast_confirmed = threading.Event(), threading.Event(), threading.Event()
         elapsed = [0.0]
         advanced = [False]
+        def stop_ready(saved: record.SessionShutdown) -> record.SessionShutdown:
+            self.assertEqual(saved["progress"]["kind"], "ready")
+            self.assertTrue(registry_entered.is_set())
+            return self.fake_stop(saved)
         def registry(ids: frozenset[str], _timeout: float) -> restart_work.RegistryConfirmation:
             if ids == frozenset({"slow"}):
                 registry_entered.set()
@@ -1943,7 +2587,7 @@ class SettleTests(ShutdownTestCase):
             return wait_futures(futures, timeout=0.01, return_when=return_when)
         with (
             patch.object(settle, "run_inventory", return_value=machine_inventory([slow["session"], fast["session"]])) as observe,
-            patch.object(stop_work, "stop_session", side_effect=self.fake_stop),
+            patch.object(stop_work, "stop_session", side_effect=ignoring_idle_reason(stop_ready)),
             patch.object(restart_work, "relaunch_session", side_effect=self.fake_launch),
             patch.object(restart_work, "wait_for_confirmation", side_effect=registry),
             patch.object(restart_work, "confirm_entry", side_effect=confirm),
@@ -2003,7 +2647,7 @@ class SettleTests(ShutdownTestCase):
     def test_ready_preserves_the_recorded_process_identity_and_where_contract(self) -> None:
         saved = session_shutdown(top_level("owner", "Owner"))
         self.save(saved)
-        with patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": "owner"}), patch.object(settle, "run_inventory", return_value=machine_inventory([saved["session"]])):
+        with patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": "owner"}), patch.object(settle, "run_inventory", return_value=machine_inventory([saved["session"]])), patch.object(settle, "_launch_conductor"):
             self.assertEqual(settle.ready("next test"), 0)
         changed = record.find_session(LOGIN, "owner")
         self.assertIsNotNone(changed)
@@ -2042,7 +2686,7 @@ class SettleTests(ShutdownTestCase):
             return self.fake_stop(saved)
         with (
             patch.object(settle, "run_inventory", return_value=machine_inventory(owners)),
-            patch.object(stop_work, "stop_session", side_effect=stop),
+            patch.object(stop_work, "stop_session", side_effect=ignoring_idle_reason(stop)),
             patch.object(restart_work, "relaunch_session", side_effect=self.fake_launch),
             patch.object(restart_work, "wait_for_confirmation", side_effect=self.all_live),
             patch.object(restart_work, "confirm_entry", side_effect=self.fake_confirm),
@@ -2088,7 +2732,7 @@ class SettleTests(ShutdownTestCase):
                 self.save(saved)
                 self.assertEqual(settle.conduct(login), 0)
             return records
-        with patch.object(record, "session_records", side_effect=snapshot), patch.object(settle, "run_inventory", return_value=machine_inventory([saved["session"]])), patch.object(stop_work, "stop_session", side_effect=self.fake_stop) as stop, patch.object(settle, "report_stop"):
+        with patch.object(record, "session_records", side_effect=snapshot), patch.object(settle, "run_inventory", return_value=machine_inventory([saved["session"]])), patch.object(stop_work, "stop_session", side_effect=ignoring_idle_reason(self.fake_stop)) as stop, patch.object(settle, "report_stop"):
             self.assertEqual(settle.conduct(LOGIN), 0)
         stop.assert_called_once()
         current = record.find_session(LOGIN, "late")
@@ -2127,7 +2771,7 @@ class SettleTests(ShutdownTestCase):
                         add()
                         deferred = True
                     return records
-                with patch.object(record, "conductor_lock", side_effect=handoff), patch.object(record, "session_records", side_effect=snapshot), patch.object(settle, "run_inventory", return_value=machine_inventory([saved["session"]])), patch.object(stop_work, "stop_session", side_effect=self.fake_stop) as stop, patch.object(settle, "report_stop"):
+                with patch.object(record, "conductor_lock", side_effect=handoff), patch.object(record, "session_records", side_effect=snapshot), patch.object(settle, "run_inventory", return_value=machine_inventory([saved["session"]])), patch.object(stop_work, "stop_session", side_effect=ignoring_idle_reason(self.fake_stop)) as stop, patch.object(settle, "report_stop"):
                     self.assertEqual(settle.conduct(LOGIN), 0)
                     if deferred:
                         self.assertEqual(settle.conduct(LOGIN), 0)
@@ -2318,8 +2962,24 @@ class SettleTests(ShutdownTestCase):
         self.assertEqual(alert.call_count, 2)
         pushes = [cast(RenderedPush, call.args[0]) for call in alert.call_args_list]
         self.assertEqual({push.values["session"] for push in pushes}, {"Owner", "Busy"})
-        self.assertTrue(all(push.id == "shutdown.holdout" for push in pushes))
+        self.assertEqual([push.id for push in pushes], ["shutdown.holdout", "shutdown.holdout_unanswered"])
+        self.assertIn("claude session is showing a form and it can't proceed.", pushes[0].body)
+        self.assertEqual(cast(ActionRequired, pushes[0].action).text, "answer the open form")
+        self.assertEqual(cast(ActionRequired, pushes[1].action).text, "in a terminal on natedev, stop Busy with the command below")
+        self.assertIn("claude session has not paused for it and it can't proceed.", pushes[1].body)
+        self.assertNotIn("form", pushes[1].title + "\n" + pushes[1].message)
         self.assertIn("Busy", cast(str, sender.call_args.args[2]))
+
+    def test_holdout_with_a_form_among_other_details_asks_to_answer_the_form(self) -> None:
+        saved = session_shutdown(top_level("held", "pm-move-ghostty"), requester="requester")
+        with patch.object(settle, "send_message"), patch.object(settle, "alert_user") as alert:
+            settle._send_holdout_alert([(saved, "busy, ahead 3 on main, showing a form, merge in progress")])  # pyright: ignore[reportPrivateUsage]
+        push = cast(RenderedPush, alert.call_args.args[0])
+        self.assertEqual(push.id, "shutdown.holdout")
+        self.assertEqual(cast(ActionRequired, push.action).text, "answer the open form")
+        self.assertTrue(push.body.startswith("Reason: shutdown is blocked because pm-move-ghostty's claude session is showing a form and it can't proceed.\n\n"))
+        self.assertNotIn("ahead 3", push.body)
+        self.assertNotIn("merge in progress", push.body)
 
     def test_holdout_alert_names_the_session_and_machine_for_the_command(self) -> None:
         owner = top_level("form", "Display name")
@@ -2332,7 +2992,21 @@ class SettleTests(ShutdownTestCase):
         push = cast(RenderedPush, alert.call_args.args[0])
         self.assertEqual(push.values["session"], "Display name")
         self.assertTrue(push.message.startswith("Session: Display name\nAction: "))
-        self.assertIn("(on natedev)", push.body)
+        self.assertIn("in a terminal on natedev:", push.body.casefold())
+
+    def test_holdout_push_uses_the_canonical_label_without_the_login_email(self) -> None:
+        for reason, expected_id in (("showing a form", "shutdown.holdout"), ("waiting", "shutdown.holdout_unanswered")):
+            with self.subTest(reason=reason):
+                saved = session_shutdown(top_level("held", "pm-move-ghostty"), then="restart")
+                saved["login"] = "held-account@example.com"
+                saved["label"] = "claude 4"
+                with patch.object(settle, "send_message"), patch.object(settle, "alert_user") as alert:
+                    settle._send_holdout_alert([(saved, reason)])  # pyright: ignore[reportPrivateUsage]
+                push = cast(RenderedPush, alert.call_args.args[0])
+                self.assertEqual(push.id, expected_id)
+                self.assertNotIn("@", push.title + "\n" + push.message)
+                self.assertEqual(push.title, "pm-move-ghostty restart is blocked")
+                self.assertIn("shutdown.py now claude4 --here --only held", push.body)
 
     def test_pending_scheduled_jobs_remain_in_session_reports_without_a_phone_alert(self) -> None:
         saved = session_shutdown(top_level("owner", "Owner"), progress={"kind": "timers pending", "at": NOW, "timers": []}, requester="requester")
@@ -2421,7 +3095,7 @@ class SettleTests(ShutdownTestCase):
         def cleanup(current: record.SessionShutdown) -> record.SessionShutdown:
             self.assertEqual(current["force"], "now")
             return record.update_session(LOGIN, "owner", cleaned)
-        with patch.object(settle, "_launch_conductor", side_effect=self.run_conductor), patch.object(settle, "run_inventory", return_value=machine_inventory([saved["session"]])), patch.object(stop_work, "stop_session", side_effect=cleanup) as stop, patch.object(settle, "report_stop"):
+        with patch.object(settle, "_launch_conductor", side_effect=self.run_conductor), patch.object(settle, "run_inventory", return_value=machine_inventory([saved["session"]])), patch.object(stop_work, "stop_session", side_effect=ignoring_idle_reason(cleanup)) as stop, patch.object(settle, "report_stop"):
             self.assertEqual(settle.now(Account("claude", LOGIN, LABEL), True), 0)
         stop.assert_called_once()
         current = record.find_session(LOGIN, "owner")
@@ -2435,7 +3109,7 @@ class SettleTests(ShutdownTestCase):
         self.save(saved)
         def failed_cleanup(current: record.SessionShutdown) -> record.SessionShutdown:
             return current
-        with patch.object(settle, "_launch_conductor", side_effect=self.run_conductor), patch.object(settle, "run_inventory", return_value=machine_inventory([])), patch.object(stop_work, "stop_session", side_effect=failed_cleanup) as stop, patch.object(settle, "report_stop") as report:
+        with patch.object(settle, "_launch_conductor", side_effect=self.run_conductor), patch.object(settle, "run_inventory", return_value=machine_inventory([])), patch.object(stop_work, "stop_session", side_effect=ignoring_idle_reason(failed_cleanup)) as stop, patch.object(settle, "report_stop") as report:
             self.assertEqual(settle.now(Account("claude", LOGIN, LABEL), True), 0)
         stop.assert_called_once()
         outcome = cast(list[record.SessionShutdown], report.call_args.args[0])[0]
@@ -2593,17 +3267,23 @@ class SettleTests(ShutdownTestCase):
             self.assertFalse(settle._holdout_due(saved, baseline + timedelta(hours=3)))  # pyright: ignore[reportPrivateUsage]
 
     def test_plain_wait_reaches_the_requester_and_the_phone(self) -> None:
-        for reason in ("waiting", "busy", "ahead 2 on main"):
+        for reason in ("waiting", "busy", "ahead 2 on main", "merge in progress", "Codex worker writer is still running",
+                       "busy, ahead 3 on main, merge in progress"):
             with self.subTest(reason=reason):
                 saved = session_shutdown(top_level("owner", "Owner"), requester="requester")
                 with patch.object(settle, "alert_user") as alert, patch.object(settle, "send_message", return_value=settle.MessageSent(kind="sent")) as sender:
                     settle._send_holdout_alert([(saved, reason)])  # pyright: ignore[reportPrivateUsage]
                 alert.assert_called_once()
+                push = cast(RenderedPush, alert.call_args.args[0])
+                self.assertEqual(push.id, "shutdown.holdout_unanswered")
+                self.assertEqual(cast(ActionRequired, push.action).text, "in a terminal on natedev, stop Owner with the command below")
+                self.assertNotIn("form", push.title + "\n" + push.message)
+                self.assertTrue(push.body.startswith("Reason: shutdown is blocked because Owner's claude session has not paused for it and it can't proceed.\n\n"))
                 self.assertIn("Owner has not answered the pause", cast(str, sender.call_args.args[2]))
                 self.assertIn(f"now {LOGIN} --here --only owner", cast(str, sender.call_args.args[2]))
 
     def test_holdout_does_not_push_again_when_a_form_opens_after_wait_alert(self) -> None:
-        owner = top_level("owner", "Owner")
+        owner = top_level("owner", "Owner", status="busy")
         self.save(session_shutdown(owner, requester="requester"))
         at = NOW_UTC + timedelta(minutes=5)
         shown = [False]
@@ -2635,12 +3315,13 @@ class SettleTests(ShutdownTestCase):
         at = NOW_UTC + timedelta(minutes=5)
         def form(owner: inventory.Session) -> bool:
             return owner["session_id"] == "form"
-        with patch.object(settle, "now_utc", return_value=at), patch.object(settle, "run_inventory", return_value=machine_inventory(owners)), patch.object(settle, "SETTLE_INTERVAL_SECONDS", 0.001), patch.object(settle, "_showing_form", side_effect=form), patch.object(stop_work, "stop_session", side_effect=self.fake_stop), patch.object(restart_work, "relaunch_session", side_effect=self.fake_launch), patch.object(restart_work, "wait_for_confirmation", side_effect=self.all_live), patch.object(restart_work, "confirm_entry", side_effect=self.fake_confirm), patch.object(settle, "alert_user", side_effect=phone) as alert, patch.object(settle, "send_message", return_value=settle.MessageSent(kind="sent")) as sender, patch.object(time, "sleep", side_effect=end), self.assertRaises(PassObserved):
+        with patch.object(settle, "now_utc", return_value=at), patch.object(settle, "run_inventory", return_value=machine_inventory(owners)), patch.object(settle, "SETTLE_INTERVAL_SECONDS", 0.001), patch.object(settle, "_showing_form", side_effect=form), patch.object(stop_work, "stop_session", side_effect=ignoring_idle_reason(self.fake_stop)), patch.object(restart_work, "relaunch_session", side_effect=self.fake_launch), patch.object(restart_work, "wait_for_confirmation", side_effect=self.all_live), patch.object(restart_work, "confirm_entry", side_effect=self.fake_confirm), patch.object(settle, "alert_user", side_effect=phone) as alert, patch.object(settle, "send_message", return_value=settle.MessageSent(kind="sent")) as sender, patch.object(time, "sleep", side_effect=end), self.assertRaises(PassObserved):
             _ = settle.conduct(LOGIN)
         self.assertEqual(alert.call_count, 2)
         pushes = [cast(RenderedPush, call.args[0]) for call in alert.call_args_list]
         self.assertEqual({push.values["session"] for push in pushes}, {"form", "requester"})
-        self.assertTrue(all(push.id == "shutdown.holdout" for push in pushes))
+        self.assertEqual({push.values["session"]: push.id for push in pushes},
+            {"form": "shutdown.holdout", "requester": "shutdown.holdout_unanswered"})
         requester_texts = [cast(str, sent.args[2]) for sent in sender.call_args_list
             if sent.args[0] == "session:requester"]
         self.assertEqual(len(requester_texts), 1)
@@ -2680,7 +3361,7 @@ class SettleTests(ShutdownTestCase):
                         raise PassObserved()
                 def form(shown: inventory.Session) -> bool:
                     return shown["session_id"] == owner["session_id"]
-                with patch.object(settle, "now_utc", return_value=NOW_UTC + timedelta(minutes=5)), patch.object(settle, "run_inventory", return_value=machine_inventory([owner, ready])), patch.object(settle, "SETTLE_INTERVAL_SECONDS", 0.001), patch.object(settle, "_showing_form", side_effect=form), patch.object(stop_work, "stop_session", side_effect=stop), patch.object(settle, "alert_user", side_effect=pause if paused == "phone" else None), patch.object(settle, "send_message", side_effect=pause if paused == "requester" else None, return_value=settle.MessageSent(kind="sent")), patch.object(time, "sleep", side_effect=end), self.assertRaises(PassObserved):
+                with patch.object(settle, "now_utc", return_value=NOW_UTC + timedelta(minutes=5)), patch.object(settle, "run_inventory", return_value=machine_inventory([owner, ready])), patch.object(settle, "SETTLE_INTERVAL_SECONDS", 0.001), patch.object(settle, "_showing_form", side_effect=form), patch.object(stop_work, "stop_session", side_effect=ignoring_idle_reason(stop)), patch.object(settle, "alert_user", side_effect=pause if paused == "phone" else None), patch.object(settle, "send_message", side_effect=pause if paused == "requester" else None, return_value=settle.MessageSent(kind="sent")), patch.object(time, "sleep", side_effect=end), self.assertRaises(PassObserved):
                     _ = settle.conduct(LOGIN)
                 record.archive_session(LOGIN, owner["session_id"])
                 record.archive_session(LOGIN, ready["session_id"])
@@ -2691,6 +3372,7 @@ class SettleTests(ShutdownTestCase):
                 restored = session_shutdown(top_level("restored-" + policy, "Restored"), progress={"kind": "stopped", "at": NOW}, then="restart")
                 restored["alerts"] = policy
                 other = session_shutdown(top_level("other-" + policy, "Other"), progress={"kind": "waiting"})
+                await_ready_mark(other)
                 other["alerts"] = "none"
                 self.save(restored)
                 self.save(other)
@@ -2707,6 +3389,7 @@ class SettleTests(ShutdownTestCase):
                     self.assertTrue(stopped.wait(2))
                     return frozenset()
                 def stop(saved: record.SessionShutdown) -> record.SessionShutdown:
+                    self.assertEqual(saved["progress"]["kind"], "ready")
                     result = self.fake_stop(saved)
                     stopped.set()
                     return result
@@ -2718,7 +3401,7 @@ class SettleTests(ShutdownTestCase):
                                 current["progress"] = {"kind": "ready", "at": NOW}
                         _ = record.update_session(LOGIN, other["session"]["session_id"], ready)
                     return machine_inventory([restored["session"], other["session"]])
-                with patch.object(settle, "run_inventory", side_effect=observe), patch.object(settle, "SETTLE_INTERVAL_SECONDS", 0.001), patch.object(restart_work, "relaunch_session", side_effect=self.fake_launch), patch.object(restart_work, "wait_for_confirmation", side_effect=confirmed), patch.object(restart_work, "confirm_entry", side_effect=self.fake_confirm), patch.object(restart_work, "wait_for_remote_control", side_effect=check), patch.object(remote_control, "launch_fixer") as fixer, patch.object(stop_work, "stop_session", side_effect=stop), patch.object(settle, "_send_settle_message"), patch.object(settle, "alert_user") as alert, patch.object(settle, "report_stop"), redirect_stdout(io.StringIO()) as output:
+                with patch.object(settle, "run_inventory", side_effect=observe), patch.object(settle, "SETTLE_INTERVAL_SECONDS", 0.001), patch.object(restart_work, "relaunch_session", side_effect=self.fake_launch), patch.object(restart_work, "wait_for_confirmation", side_effect=confirmed), patch.object(restart_work, "confirm_entry", side_effect=self.fake_confirm), patch.object(restart_work, "wait_for_remote_control", side_effect=check), patch.object(remote_control, "launch_fixer") as fixer, patch.object(stop_work, "stop_session", side_effect=ignoring_idle_reason(stop)), patch.object(settle, "_send_settle_message"), patch.object(settle, "alert_user") as alert, patch.object(settle, "report_stop"), redirect_stdout(io.StringIO()) as output:
                     self.assertEqual(settle.conduct(LOGIN), 0)
                 self.assertIn("Restored: Remote Control not on yet;", output.getvalue())
                 self.assertIsNone(record.find_session(LOGIN, restored["session"]["session_id"]))
@@ -2767,6 +3450,7 @@ class SettleTests(ShutdownTestCase):
     def test_remote_control_paused_fixer_launch_does_not_delay_later_ready_session(self) -> None:
         restored = session_shutdown(top_level("restored", "Restored"), progress={"kind": "stopped", "at": NOW}, then="restart")
         other = session_shutdown(top_level("other", "Other"))
+        await_ready_mark(other)
         self.save(restored)
         self.save(other)
         entered, stopped = threading.Event(), threading.Event()
@@ -2784,10 +3468,11 @@ class SettleTests(ShutdownTestCase):
                 _ = record.update_session(LOGIN, "other", ready)
             return machine_inventory([restored["session"], other["session"]])
         def stop(saved: record.SessionShutdown) -> record.SessionShutdown:
+            self.assertEqual(saved["progress"]["kind"], "ready")
             result = self.fake_stop(saved)
             stopped.set()
             return result
-        with patch.object(settle, "run_inventory", side_effect=observe), patch.object(settle, "SETTLE_INTERVAL_SECONDS", 0.001), patch.object(restart_work, "relaunch_session", side_effect=self.fake_launch), patch.object(restart_work, "wait_for_confirmation", side_effect=self.all_live), patch.object(restart_work, "confirm_entry", side_effect=self.fake_confirm), patch.object(restart_work, "wait_for_remote_control", return_value=frozenset()), patch.object(stop_work, "stop_session", side_effect=stop), patch.object(settle, "_send_settle_message"), patch.object(remote_control, "launch_fixer", side_effect=launch_fixer) as fixer, patch.object(settle, "alert_user") as alert, patch.object(settle, "report_stop"), redirect_stdout(io.StringIO()):
+        with patch.object(settle, "run_inventory", side_effect=observe), patch.object(settle, "SETTLE_INTERVAL_SECONDS", 0.001), patch.object(restart_work, "relaunch_session", side_effect=self.fake_launch), patch.object(restart_work, "wait_for_confirmation", side_effect=self.all_live), patch.object(restart_work, "confirm_entry", side_effect=self.fake_confirm), patch.object(restart_work, "wait_for_remote_control", return_value=frozenset()), patch.object(stop_work, "stop_session", side_effect=ignoring_idle_reason(stop)), patch.object(settle, "_send_settle_message"), patch.object(remote_control, "launch_fixer", side_effect=launch_fixer) as fixer, patch.object(settle, "alert_user") as alert, patch.object(settle, "report_stop"), redirect_stdout(io.StringIO()):
             self.assertEqual(settle.conduct(LOGIN), 0)
         fixer.assert_called_once()
         alert.assert_not_called()
@@ -2801,9 +3486,10 @@ class SettleTests(ShutdownTestCase):
         self.assertEqual(alert.call_args.kwargs, {"machine": "natedev"})
         push = cast(RenderedPush, alert.call_args.args[0])
         self.assertIn("Held", push.title)
-        self.assertIn("Shutdown", push.title)
+        self.assertIn("shutdown", push.title)
         self.assertIn("is blocked", push.title)
-        self.assertIn("(on mac)", push.body.casefold())
+        self.assertIn("in a terminal on mac:", push.body.casefold())
+        self.assertIn(f"now {LABEL} --here --only held", push.body)
         self.assertIn(f"now {LOGIN} --here --only held", cast(str, sender.call_args.args[2]))
 
 

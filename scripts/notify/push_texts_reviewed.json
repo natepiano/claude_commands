@@ -211,9 +211,67 @@
   },
   "shutdown.holdout": {
     "typical": {
-      "reviewer": "user-spec: Phase 12, the user's four lines (2026-10-14 16:3x EDT, via the showrunner). Verdict: ask x3; rules: say-where-to-act, reader-starts-cold, every-choice-says-what-it-does, what-happened-why-what-you-do, short-plain-sentences, title-names-the-stake. Each objection targets the user's own title, Action or Reason words, which the user set as the template; recorded, not applied.",
-      "sha256": "acca2a1cb6d9479f5a937563988512c2a5d6b1650d6927abfb051e350f7b06ed",
-      "time": "2026-10-14T18:48:24.445038-04:00"
+      "objections": [
+        {
+          "quote": "pm-move-ghostty restart is blocked",
+          "rule": "reader-starts-cold"
+        },
+        {
+          "quote": "pm-move-ghostty restart is blocked",
+          "rule": "title-names-the-stake"
+        },
+        {
+          "quote": "answer the open form",
+          "rule": "say-where-to-act"
+        },
+        {
+          "quote": "Or stop it instead, and the restart goes on without it.",
+          "rule": "every-choice-says-what-it-does"
+        },
+        {
+          "quote": "Reason: restart is blocked because pm-move-ghostty's claude session is showing a form and it can't proceed.",
+          "rule": "what-happened-why-what-you-do"
+        }
+      ],
+      "reviewer": "user-spec: user-spec: the user's four lines for a blocked shutdown (2026-10-14, via the showrunner); Phase 14 split by the showrunner 2026-10-15. After 3 review passes the remaining objections target the user's title, Action and Reason (recorded, not applied) and the stop line's what-you-lose; the stop line names the account by label, never the login.; reviewer: opus",
+      "sha256": "e1d8cd06e360928d19fd968f542b96f4eed614568d6408f6af59728b1f302b5a",
+      "time": "2026-10-15T11:46:59.648725-04:00"
+    }
+  },
+  "shutdown.holdout_unanswered": {
+    "long_session": {
+      "objections": [
+        {
+          "quote": "Reason: shutdown is blocked because build-followups-director's claude session has not paused for it and it can't proceed.",
+          "rule": "short-plain-sentences"
+        }
+      ],
+      "reviewer": "user-spec: user-spec: the user's four lines for a blocked shutdown (2026-10-14, via the showrunner); Phase 14 split by the showrunner 2026-10-15. After 3 review passes the remaining objections target the user's title, Action and Reason (recorded, not applied) and the stop line's what-you-lose; the stop line names the account by label, never the login.; reviewer: opus",
+      "sha256": "a6e6dce0d515bc65821d718b32775934aa380975aeccffa03ec78ef77b640cf8",
+      "time": "2026-10-15T11:47:28.739116-04:00"
+    },
+    "typical": {
+      "objections": [
+        {
+          "quote": "Reason: restart is blocked because pm-move-ghostty's claude session has not paused for it",
+          "rule": "reader-starts-cold"
+        },
+        {
+          "quote": "Reason: restart is blocked because pm-move-ghostty's claude session has not paused for it and it can't proceed.",
+          "rule": "what-happened-why-what-you-do"
+        },
+        {
+          "quote": "Stopping ends only that session, and the restart goes on.",
+          "rule": "every-choice-says-what-it-does"
+        },
+        {
+          "quote": "pm-move-ghostty restart is blocked",
+          "rule": "title-names-the-stake"
+        }
+      ],
+      "reviewer": "user-spec: user-spec: the user's four lines for a blocked shutdown (2026-10-14, via the showrunner); Phase 14 split by the showrunner 2026-10-15. After 3 review passes the remaining objections target the user's title, Action and Reason (recorded, not applied) and the stop line's what-you-lose; the stop line names the account by label, never the login.; reviewer: opus",
+      "sha256": "a6e6dce0d515bc65821d718b32775934aa380975aeccffa03ec78ef77b640cf8",
+      "time": "2026-10-15T11:47:15.105664-04:00"
     }
   },
   "shutdown.manual_restart": {

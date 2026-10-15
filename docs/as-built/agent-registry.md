@@ -409,7 +409,7 @@ All four wrappers capture resolver stderr into their log (`agents_resolve "$TASK
   refreshed`. `codex_mesh.py signin-changed` runs the moment that file changes,
   from a path watch the NixOS config installs (a systemd user path unit on
   Linux, a launchd agent on the Mac). It reads only the file's change time,
-  never its contents. For each run folder under `/tmp/claude/delegate` whose
+  never its contents. For each run folder under `/tmp/claude/unit` or `/tmp/claude/delegate` whose
   recorded server started before that time (`ps -o etime`, the same on both
   systems), it retires the record, stops the old server at once if nothing uses
   it or leaves it a watcher, writes a line to `mesh_server.log`, and sends that

@@ -35,11 +35,12 @@ import phase_table
 import progress_history
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
+import unit_runs
 from user_zone import user_zone
 
 BACKLOG_DIR = Path(os.environ.get("PLAN_BACKLOG_DIR") or Path.home() / ".local/state/plan-backlog")
-# A run keeps its pending add-ons here, in a directory named by its run id.
-SESSION_ROOT = Path("/tmp/claude/delegate")
+# A run keeps its pending add-ons in a directory named by its run id, under either run-folder name.
+SESSION_ROOTS = unit_runs.run_roots()
 PENDING_NAME = "next_items_pending.md"
 INDEX_NAME = "index.md"
 # The Production Context line that names the folder a production keeps its proposals in.
@@ -248,7 +249,7 @@ def unit_add_on_rows(unit: str, plan: Path) -> list[Row]:
     rows: list[Row] = []
     for path in unit_plans(plan):
         for run in progress_history.plan_runs(path):
-            rows.extend(add_on_rows(unit, SESSION_ROOT / run.stem / PENDING_NAME))
+            rows.extend(row for root in SESSION_ROOTS for row in add_on_rows(unit, root / run.stem / PENDING_NAME))
     return rows
 
 

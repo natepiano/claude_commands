@@ -749,6 +749,27 @@ def _orchestration_stop_issue(
     return cast(_LegacyOrchestrationIssue, cast(object, values))
 
 
+def _recover_not_ready_stop(entry: _LegacySessionEntry) -> None:
+    """Recover only the old terminal outcome for a temporary readiness refusal."""
+    progress = entry["progress"]
+    issues = entry["stop_issues"]
+    if (progress["kind"] != "stop failed"
+            or progress["reason"] != "session or worker is not idle and ready"
+            or len(issues) != 1):
+        return
+    issue = issues[0]
+    if issue["kind"] != "not ready to stop":
+        return
+    if issue["progress"] == "waiting":
+        entry["progress"] = SessionWaiting(kind="waiting")
+    elif issue["progress"] == "ready":
+        entry["progress"] = SessionReadyToStop(kind="ready", at=issue["at"])
+    elif issue["progress"] == "held by usage limit":
+        entry["progress"] = SessionHeldByUsageLimit(kind="held by usage limit", at=issue["at"])
+    else:
+        entry["progress"] = _LegacyPassiveWorkerReady(kind="passive worker ready", at=issue["at"])
+
+
 def _entry(value: object, place: str) -> _LegacySessionEntry:
     values = _mapping(value, place)
     # Earlier records duplicated this session field on the entry.
@@ -778,7 +799,9 @@ def _entry(value: object, place: str) -> _LegacySessionEntry:
         _session_stop_issue(issue, f"{place}.stop_issues[{index}]", legacy=True)
         for index, issue in enumerate(stop_issue_values)
     ]
-    return cast(_LegacySessionEntry, cast(object, values))
+    checked = cast(_LegacySessionEntry, cast(object, values))
+    _recover_not_ready_stop(checked)
+    return checked
 
 
 def _record(value: object, place: str) -> _LegacyShutdownRecord:

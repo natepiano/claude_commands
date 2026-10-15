@@ -300,7 +300,7 @@ finishes first, and nothing is owed in reply.
 
 Recovering by hand, in that case only. Check that no peer run claims the
 recorded pid or port before signalling anything —
-`grep -l '<pid>\|<port>' /tmp/claude/delegate/*/mesh_server.json` should name
+`grep -l '<pid>\|<port>' /tmp/claude/unit/*/mesh_server.json /tmp/claude/delegate/*/mesh_server.json` should name
 only this session's file, and any second file means leave the process alone.
 Then kill that pid, move `mesh_server.json` aside, and relaunch verbatim; the
 next launcher starts a fresh server. Leave `mesh_roster.json` alone — its other
@@ -561,7 +561,7 @@ Before every Codex poll, set `${PROGRESS_INTERVAL_SECONDS}` from
 `PLAN_DELEGATE_PROGRESS_INTERVAL_SECONDS` in `~/.claude/config/delegate.conf`.
 The key sets the Codex poll timeout and a Claude unit's notifier interval.
 For Codex, a missing or non-positive integer is an error; tell the user to set
-it. <PrepareSession/> creates Claude's `delegate-<run id>` instance, where
+it. <PrepareSession/> creates Claude's `unit-<run id>` instance, where
 the run id is the basename of `${SESSION_DIR}`; `end_session.sh` removes it.
 With `PLAN_DELEGATE_PROGRESS_UPDATES=on-demand`, the default, it creates none:
 reports run only when asked, until `/unit:report on` starts the schedule. A
@@ -570,7 +570,7 @@ change the Codex poll interval. The agent arms nothing. When `prepare_session.sh
 created`, say so in one line: this run gets no ticks until
 `zsh ~/.claude/scripts/delegate/unit_notifier.sh "$CLAUDE_CODE_SESSION_ID"`
 succeeds. While work runs, the notifier sends
-`/unit:report` from `delegate-<run id>` every interval. That message
+`/unit:report` from `unit-<run id>` every interval. That message
 is the Claude tick. Each `progress_history.py progress` call restarts its
 clock; `--hold` keeps at most one tick waiting.
 
@@ -742,7 +742,7 @@ on-disk shapes are:
 | --- | --- | --- |
 | `RepositoryNotEnrolled` | `/sync board` returning `unconfigured` | Owns no reservation; supplies no release argument. |
 | `EnrolledAwaitingFirstTouch` | `/sync board` returning `board_ready` | The registered edit hook still owns first-touch acquisition; supplies no release argument. |
-| `Active` | The edit hook, from a clear check that acquired or already held the scopes | Copies the returned reservation and coordination-run ids, phase, and protected phase-start HEAD; supplies a release argument. |
+| `Active` | A clear check that acquired or already held the scopes: the Codex seat hook, or the checkpoint backstop for a first touch no hook recorded | Copies the returned reservation and coordination-run ids, phase, and protected phase-start HEAD; supplies a release argument. |
 | `CheckpointCommittedAwaitingReleaseConfirmation` | <CheckpointCommit/> step 6, atomically replacing `Active` once that step's commit succeeds | Copies the active fields plus the full object id captured immediately from that commit; supplies a release argument, and resumes only at release confirmation. |
 
 These are
@@ -817,12 +817,17 @@ Do not dispatch until this contract reaches one of its four persisted states.
    | `board_ready` | Persist `EnrolledAwaitingFirstTouch` and proceed without claiming predicted paths. |
    | `ledger_unreadable` | Stop the run; it is never opt-out. |
    | `busy` | Stop with “the ledger is busy, try again” and the exact board command to rerun; do not retry. |
-2. The registered PreToolUse edit hook owns the next transition. A clear check
-   atomically acquires exact `file:` scopes before the edit, then replaces
-   `EnrolledAwaitingFirstTouch` with `Active` from the returned facts. A blocked
-   check refuses the edit and leaves the pending state intact; answer an overlap
-   under <BerthDecisions/>. An unreadable ledger stops without facts. Beyond
-   those answers, do not call `cargo-berth claim` on behalf of a Work Order.
+2. The registered PreToolUse edit hooks own the next transition. A clear check
+   atomically acquires exact `file:` scopes before the edit. A Codex seat's
+   `apply_patch` runs `scripts/hooks/pre-tool-use-berth.py`, which checks under
+   this session's id and replaces `EnrolledAwaitingFirstTouch` with `Active`
+   from the returned facts; a Claude edit's hook protects the paths but writes
+   no state, so a first touch of your own leaves the state for the checkpoint
+   backstop (<CheckpointCommit/> step 5). A blocked check refuses the edit and
+   leaves the pending state intact; a seat reports the refusal to you, and you
+   answer the overlap under <BerthDecisions/>. An unreadable ledger stops
+   without facts. Beyond those answers, do not call `cargo-berth claim` on
+   behalf of a Work Order.
 </CoordinateDelegatedPhaseReservation>
 
 <BerthDecisions>

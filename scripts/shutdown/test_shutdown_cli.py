@@ -50,6 +50,7 @@ def unit_session(session_id: str) -> inventory.UnitSession:
         name="alpha",
         cwd="/tmp/alpha",
         status="idle",
+        updated_at=0,
         model=inventory.NoReplyYet(kind="no reply yet"),
         checkout=inventory.NotACheckout(kind="not a checkout"),
         run_dirs=[],
@@ -255,6 +256,38 @@ class ShutdownLaunchCliTests(ShutdownTestCase):
         ):
             result = shutdown.main(["follow", LOGIN, "--request", "request-one"])
         return result, output.getvalue()
+
+    def test_recovered_not_ready_status_offers_cancel_and_force_while_follow_keeps_waiting(self) -> None:
+        saved = session_shutdown(record.SessionStopFailed(kind="stop failed", at=OCTOBER,
+            reason="session or worker is not idle and ready"))
+        saved["stop_issues"] = [record.NotReadyToStop(kind="not ready to stop", at=OCTOBER,
+            status="busy", progress="waiting")]
+        directory = self.state / LOGIN / "sessions"
+        directory.mkdir(parents=True)
+        _ = (directory / "session-123.json").write_text(json.dumps(saved))
+        output = io.StringIO()
+        with (
+            patch.object(shutdown, "named_claude_account", return_value=Account("claude", LOGIN, LABEL)),
+            redirect_stdout(output),
+        ):
+            self.assertEqual(shutdown.main(["status", LOGIN, "--here"]), 0)
+        text = output.getvalue()
+        self.assertIn("waiting", text)
+        self.assertIn("not stopped: busy, waiting", text)
+        self.assertIn(f"cancel {LOGIN} --here --only session-123", text)
+        self.assertIn(f"now {LOGIN} --here --only session-123", text)
+        self.assertIn("in a terminal on natedev", text)
+        self.assertNotIn("stop failed", text)
+        self.assertNotIn("bring back:", text)
+        with patch.object(time, "sleep", side_effect=KeyboardInterrupt) as wait:
+            status, text = self.follow_request()
+        wait.assert_called_once()
+        self.assertEqual(status, 130)
+        self.assertIn("the shutdown keeps running", text)
+        self.assertNotIn("stop failed", text)
+        current = record.find_session(LOGIN, "session-123")
+        assert current is not None
+        self.assertEqual(current["progress"], {"kind": "waiting"})
 
     def test_follow_prints_each_new_step_once_and_waits_for_pending_restart(self) -> None:
         saved = session_shutdown(record.SessionWaiting(kind="waiting"))
@@ -940,7 +973,7 @@ class ShutdownLaunchCliTests(ShutdownTestCase):
         owner = saved["session"]
         saved["workers"] = [inventory.WorkerSession(
             session_id="a-worker", pid=23456, proc_start="worker-start", name="worker",
-            cwd=owner["cwd"], status="idle", model=owner["model"], checkout=owner["checkout"],
+            cwd=owner["cwd"], status="idle", updated_at=0, model=owner["model"], checkout=owner["checkout"],
             run_dirs=["/tmp/run"], codex_servers=[], timers=[], kind="worker",
             host=inventory.UnknownHost(kind="unknown"),
             owner=inventory.DirectorOwner(kind="director", session_id="z-owner"),
