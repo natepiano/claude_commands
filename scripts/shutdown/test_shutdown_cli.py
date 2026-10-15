@@ -50,7 +50,7 @@ def unit_session(session_id: str) -> inventory.UnitSession:
         name="alpha",
         cwd="/tmp/alpha",
         status="idle",
-        updated_at=0,
+        updated_at=0, probe=False,
         model=inventory.NoReplyYet(kind="no reply yet"),
         checkout=inventory.NotACheckout(kind="not a checkout"),
         run_dirs=[],
@@ -110,7 +110,7 @@ def session_shutdown(
     return record.SessionShutdown(
         login=LOGIN, label=LABEL, machine="natedev", requested_at=OCTOBER,
         requested_by=old["requested_by"], hold=hold, request_id="request-one",
-        then="restart", force="wait for ready", alerts="user",
+        then="restart", force="wait for ready", alerts="user", probe=False,
         session=item["session"], workers=[], timers=[],
         settle_message=item["settle_message"], where=item["where"],
         progress=progress, trail=[], stop_issues=[],
@@ -239,12 +239,20 @@ class ShutdownLaunchCliTests(ShutdownTestCase):
                 else:
                     self.assertIsInstance(origin, accounts.HandOrigin)
 
-    def test_remote_control_cli_passes_identity_and_failure_alert_policy_to_fixer(self) -> None:
-        for policy in ("user", "none"):
-            with self.subTest(policy=policy), patch.object(remote_control, "fix", return_value=remote_control.AlreadyOn()) as fix:
-                self.assertEqual(shutdown.main(["remote-control", "owner", "--pid", "321",
-                    "--proc-start", "original", "--who", "trunk unit", "--session", "Owner", "--alerts", policy]), 0)
-            fix.assert_called_once_with("owner", 321, "original", "trunk unit", policy, "Owner")
+    def test_remote_control_cli_passes_identity_without_an_alert_option(self) -> None:
+        arguments = ["remote-control", "owner", "--pid", "321",
+            "--proc-start", "original", "--who", "trunk unit", "--session", "Owner"]
+        with patch.object(remote_control, "fix", return_value=remote_control.AlreadyOn()) as fix:
+            self.assertEqual(shutdown.main(arguments), 0)
+        fix.assert_called_once_with("owner", 321, "original", "trunk unit", "Owner")
+        with patch.object(remote_control, "fix") as fix, redirect_stderr(io.StringIO()):
+            with self.assertRaises(SystemExit) as rejected:
+                _ = shutdown.main([*arguments, "--alerts", "user"])
+        self.assertEqual(rejected.exception.code, 2)
+        fix.assert_not_called()
+        with redirect_stdout(help_text := io.StringIO()), self.assertRaises(SystemExit):
+            _ = shutdown.main(["remote-control", "--help"])
+        self.assertNotIn("--alerts", help_text.getvalue())
 
     def follow_request(self, output: io.StringIO | None = None) -> tuple[int, str]:
         output = output if output is not None else io.StringIO()
@@ -973,7 +981,7 @@ class ShutdownLaunchCliTests(ShutdownTestCase):
         owner = saved["session"]
         saved["workers"] = [inventory.WorkerSession(
             session_id="a-worker", pid=23456, proc_start="worker-start", name="worker",
-            cwd=owner["cwd"], status="idle", updated_at=0, model=owner["model"], checkout=owner["checkout"],
+            cwd=owner["cwd"], status="idle", updated_at=0, probe=False, model=owner["model"], checkout=owner["checkout"],
             run_dirs=["/tmp/run"], codex_servers=[], timers=[], kind="worker",
             host=inventory.UnknownHost(kind="unknown"),
             owner=inventory.DirectorOwner(kind="director", session_id="z-owner"),
@@ -1488,7 +1496,7 @@ class OnlySessionCliTests(ShutdownTestCase):
                 with patch.object(shutdown, "own_claude_account", side_effect=UnreadableAccount("own account unreadable")), patch.object(restart_work, "own_claude_account", side_effect=UnreadableAccount("own account unreadable")), patch.object(restart_work, "run_remote", return_value=(0, "[]")), patch.object(restart_work, "_up", return_value=restart_work.MachineRestartResult("natedev", LABEL, "done")) as resume, redirect_stdout(output), redirect_stderr(error):
                     self.assertEqual(shutdown.main(["restart", "--only", "beta-id", "--here", "--no-alert"]), 0)
                 self.assertEqual(error.getvalue(), "")
-                resume.assert_called_once_with(LOGIN, False, ("beta-id",), notify=False)
+                resume.assert_called_once_with(LOGIN, False, ("beta-id",))
 
     def test_selected_restart_silent_failure_ignores_sibling_policy_and_never_reads_peer_here(self) -> None:
         before = self.save_three({"kind": "stopped", "at": OCTOBER})
@@ -1632,10 +1640,10 @@ class OnlySessionCliTests(ShutdownTestCase):
         result = restart_work.parse_peer_result(output.getvalue())
         self.assertEqual(result["outcome"], "nothing")
         self.assertEqual(result["lines"], ["Beta is waiting, not stopped; nothing to restart"])
-        self.assertEqual(result["no_remote_control"], [])
+        self.assertEqual(cast(dict[str, object], json.loads(output.getvalue()))["no_remote_control"], [])
         self.assertEqual(result["refused"], [{"kind": "not stopped", "session_id": "beta-id", "name": "Beta", "progress": "waiting"}])
 
-    def test_up_json_keeps_remote_control_diagnostic_and_archived_alert_policy(self) -> None:
+    def test_up_json_keeps_remote_control_quiet_and_emits_legacy_empty_key(self) -> None:
         _ = self.save_three({"kind": "stopped", "at": OCTOBER})
         def quiet(current: record.SessionShutdown) -> None:
             current["alerts"] = "none"
@@ -1643,11 +1651,11 @@ class OnlySessionCliTests(ShutdownTestCase):
         with patch.object(restart_work, "wait_for_remote_control", return_value=frozenset()), patch.object(remote_control, "launch_fixer") as fixer, redirect_stdout(output := io.StringIO()):
             self.assertEqual(shutdown.main(["up", LOGIN, "--here", "--json", "--only", "beta-id"]), 0)
         result = restart_work.parse_peer_result(output.getvalue())
-        self.assertIn("Beta: Remote Control not on yet; turning it on in the background", result["lines"])
+        self.assertFalse(any("Remote Control" in line for line in result["lines"]))
         fixer.assert_called_once()
         self.assertEqual(fixer.call_args.args[0], "beta-id")
-        self.assertEqual(fixer.call_args.args[-2:], ("none", "Beta"))
-        self.assertEqual(result["no_remote_control"], [{"session_id": "beta-id", "name": "Beta", "alerts": "none"}])
+        self.assertEqual(fixer.call_args.args[-2:], ("alpha unit", "Beta"))
+        self.assertEqual(cast(dict[str, object], json.loads(output.getvalue()))["no_remote_control"], [])
         self.assertIsNone(record.find_session(LOGIN, "beta-id"))
 
 

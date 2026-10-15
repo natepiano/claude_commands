@@ -54,13 +54,6 @@ ENTRIES = (
         + "Its terminal cannot restart on its own. Its shutdown record holds the command to resume it.",
         (PushExample("typical", {"machine": "natedev", "session": "Owner"}),
          PushExample("long_session", {"machine": "Mac", "session": "build-followups-message-clarity-unit-director-session-12"}))),
-    PushText("shutdown.remote_control", "shutdown", "decision", "{who} remote-control is off",
-        ActionTemplate("run /remote-control"),
-        "Reason: Remote control is off.",
-        (PushExample("typical", {"who": "Owner", "session": "Owner"}),
-         PushExample("unit", {"who": "trunk unit", "session": "build-followups-trunk-unit-director"}),
-         PushExample("showrunner", {"who": "demo showrunner", "session": "build-followups-director"})),
-        session=SessionTemplate("{session}")),
     PushText("quota.claude", "quota_alert", "decision", "Coding may stop: Claude account out of usage",
         ActionTemplate("In a Claude terminal on natedev, run /login and sign in to account {target}."),
         "Claude account {account} has {remaining} of its weekly usage left. Its coding work may stop until {reset}. "

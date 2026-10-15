@@ -1219,6 +1219,23 @@ runpy.run_path(sys.argv[0], run_name="__main__")
         entry = cast(send.TemplateFixErrorRecord, json.loads((self.root / "notify/template-fix-errors.jsonl").read_text()))
         self.assertEqual((entry["text_id"], entry["error"]), ("quota", "timed out"))
 
+    def test_probe_user_send_exits_successfully_before_review_delivery_or_logging(self) -> None:
+        arguments = ["--to", "user", "--from", "probe", "--summary", "Throwaway",
+                     "--no-action", "--text", "A probe must never reach the phone."]
+        with (mock.patch.dict(os.environ, {"CLAUDE_PROBE_SESSION": "1"}),
+              mock.patch.object(send, "run", side_effect=AssertionError("probe invoked a transport")) as transport,
+              mock.patch.object(send, "log", side_effect=AssertionError("probe wrote a message log")) as log,
+              mock.patch.object(review, "review_timeout_seconds", side_effect=AssertionError("probe began review")) as reviewed,
+              redirect_stdout(output := io.StringIO()), redirect_stderr(error := io.StringIO())):
+            self.assertEqual(send.main(arguments), 0)
+        self.assertIn("not sent: probe sessions never push to the phone", output.getvalue())
+        self.assertEqual(error.getvalue(), "")
+        transport.assert_not_called()
+        log.assert_not_called()
+        reviewed.assert_not_called()
+        self.assertFalse((self.root / "log.jsonl").exists())
+        self.assertEqual(self.relayed, [])
+
     def test_user_delivery_wait_uses_the_review_limit_locally_and_across_machines(self) -> None:
         arguments = ["--to", "user", "--from", "script", "--summary", "Build choice",
                      "--action", "Choose retry.", "--text", "The build stopped."]

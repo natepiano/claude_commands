@@ -24,6 +24,7 @@ import unit_lookup
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
 from user_zone import user_zone  # noqa: E402
+from probe_session import PROBE_ENV  # noqa: E402
 
 if TYPE_CHECKING:
     from scripts.accounts.accounts import ClaudeLaunchAccount
@@ -101,6 +102,7 @@ class UnitRestoreLaunch(NamedTuple):
     session_name: str
     # The unit's tmux or herdr session it is restored into.
     host_session: str
+    probe: bool = False
 
 
 class DefaultEffort(NamedTuple):
@@ -344,6 +346,9 @@ def launch_request(args: argparse.Namespace) -> RequestedUnitLaunch:
         )
     if restart_note is not None and resumed is None:
         raise Refusal("restart launch flags require --resume")
+    probe = cast(bool, args.probe)
+    if probe and restart_note is None:
+        raise Refusal("--probe requires a shutdown restore with --restart-note")
     if (resumed is None) != (cwd is None):
         raise Refusal("--resume and --cwd must be given together")
     if resumed is not None and isinstance(plan, BriefGiven):
@@ -365,6 +370,7 @@ def launch_request(args: argparse.Namespace) -> RequestedUnitLaunch:
             Path(restart_note).expanduser(),
             session_name,
             host_session,
+            probe,
         )
     else:
         launch_kind = NewWorkLaunch()
@@ -816,6 +822,8 @@ def launch_session(
     if target:
         argv = [sys.executable, str(SCRIPTS / "accounts" / "accounts.py"), "exec", target, *argv[1:]]
         prefix = ""
+    if isinstance(request.launch_kind, UnitRestoreLaunch) and request.launch_kind.probe:
+        prefix += f"{PROBE_ENV}=1 "
     command = "unset CLAUDE_CONFIG_DIR CLAUDE_CODE_REMOTE_MEMORY_DIR CLAUDE_CODE_OAUTH_TOKEN; " + prefix + "ENABLE_TOOL_SEARCH=true command " + shlex.join(argv) + "; exec zsh"
     environment = launch_environment()
     scope_name = re.sub(r"[^A-Za-z0-9_.-]", "-", tmux_session)
@@ -1014,6 +1022,7 @@ def main(argv: list[str]) -> int:
     _ = parser.add_argument("--restart-note")
     _ = parser.add_argument("--session-name")
     _ = parser.add_argument("--host-session")
+    _ = parser.add_argument("--probe", action="store_true", help=argparse.SUPPRESS)
     _ = parser.add_argument("--check", action="store_true")
     args = parser.parse_args(argv)
     try:

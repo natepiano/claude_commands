@@ -70,7 +70,8 @@ exit "$NOTIFIER_HEALTH_EXIT"
                 _ = shutil.copy2(SCRIPT.with_name(source_name), script.with_name(source_name))
             (root / "scripts" / "herdr").mkdir()
             _ = shutil.copy2(SCRIPT.parent.parent / "herdr" / "herdr.py", root / "scripts" / "herdr" / "herdr.py")
-            _ = shutil.copy2(SCRIPT.parent.parent / "lib" / "user_zone.py", script.parent.parent / "lib" / "user_zone.py")
+            for source_name in ("user_zone.py", "probe_session.py"):
+                _ = shutil.copy2(SCRIPT.parent.parent / "lib" / source_name, script.parent.parent / "lib" / source_name)
             active_dir = root / "active"
             active_dir.mkdir()
             call_log = root / "notifier_calls"
