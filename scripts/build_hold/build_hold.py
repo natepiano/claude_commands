@@ -27,6 +27,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "message"))
 from sessions import addressed, live_sessions  # noqa: E402
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
 from user_zone import user_zone
+import unit_runs
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import override_guard
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "build_targets"))
@@ -36,7 +37,9 @@ from target_config import ConfigError, read_targets
 BUILD_COMMANDS = frozenset({"cargo", "rustc", "cargo-nextest"})
 INSTANT = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?(?:Z|[+-]\d{2}:\d{2})")
 SAFE = re.compile(r"[^A-Za-z0-9._-]")
-RELEASE_SETTLE_S = 60
+# The memory gate starts a step anyway at BUILDLOG_MEM_WAIT_LIMIT_S and then marks its return;
+# a memory wait ends as unanswered only this long after that limit.
+MEMORY_GATE_GRACE_S = 60
 NO_ADMISSION_ACK_S = 900
 NO_REGISTRATION_S = 60
 RELEASE_POLL_S = 15
@@ -224,6 +227,7 @@ class NoRegistration:
 ReleaseState = (AwaitingRelease | RecipientGone | NoPendingTurn | DeliveryFailed | DeliveryQueued |
                 ReleasedAwaitingAdmission | WaitingForMemory | MemoryGateReturned |
                 NothingToBuild | NoAdmissionAck | NoRegistration)
+IN_PROGRESS_STATES = (AwaitingRelease, DeliveryQueued, ReleasedAwaitingAdmission, WaitingForMemory)
 
 
 def read_release_state(entry: Mapping[str, object]) -> ReleaseState:
@@ -482,11 +486,12 @@ def owning_session() -> OwningSession | NoOwningSession:
     """Find the session that owns this run before using the shell's session id."""
     run = os.environ.get("PLAN_DELEGATE_BOARD_DIR", "") or os.environ.get("PLAN_DELEGATE_SESSION_DIR", "")
     if run:
-        active = Path(os.environ.get("PLAN_DELEGATE_ACTIVE_DIR", "/tmp/claude/delegate/active"))
-        try:
-            markers = tuple(active.iterdir())
-        except OSError:
-            markers = ()
+        markers: list[Path] = []
+        for active in unit_runs.active_dirs(os.environ.get("PLAN_DELEGATE_ACTIVE_DIR")):
+            try:
+                markers.extend(active.iterdir())
+            except OSError:
+                continue
         matches: list[tuple[int, str]] = []
         for marker in markers:
             try:
@@ -1131,10 +1136,7 @@ def register_wait(session_id: str, name: str = "", *, call_id: str = "", pid: in
         terminal = (NothingToBuild, MemoryGateReturned, NoAdmissionAck, NoRegistration, RecipientGone, DeliveryFailed, NoPendingTurn)
         pending = any(call["admitted_generation"] != generation for call in existing["calls"])
         if isinstance(state, terminal) and not existing["active_call_id"] and (pending or existing["session_pending"]):
-            cycle["entries"].remove(existing)
-            existing["active_call_id"] = ""
             store_release_state(existing, AwaitingRelease())
-            cycle["entries"].append(existing)
         save_cycle(cycle)
         return f"registered {session_id}; wait for direct release before building"
 
@@ -1224,7 +1226,7 @@ def mark_gate(session_id: str, state: str, outcome: str = "", *, call_id: str = 
 
 
 def answer_nothing_to_build(session_id: str) -> str:
-    """A released session's answer when it has no build or BRP launch to start, so the next is released."""
+    """A released session's answer when it has no build or BRP launch to start, so the release stops waiting for it."""
     if not session_id:
         return "NoSessionId"
     if not has_holder_file(holder_directory()):
@@ -1246,7 +1248,7 @@ def answer_nothing_to_build(session_id: str) -> str:
         entry["session_pending"] = False
         store_release_state(entry, NothingToBuild(datetime.now(timezone.utc)))
         save_cycle(cycle)
-        return f"{entry_text(entry)}; the release moves on to the next session"
+        return f"{entry_text(entry)}; the release stops waiting for this session"
 
 
 def confirm_delivery(entry: ReleaseEntry, generation: int) -> bool:
@@ -1279,7 +1281,7 @@ def socket_for(session_id: str) -> RecipientLive | RecipientGone | RecipientLook
 def send_release(entry: ReleaseEntry, socket: str) -> ReleaseDelivered | ReleaseQueued | ReleaseSendFailed:
     script = Path(__file__).resolve().parent.parent / "message" / "send.py"
     notice = ("/build:hold: your hold has been released. Start your next build or BRP launch now; its memory gate records admission. "
-              "With nothing to build, run python3 ~/.claude/scripts/build_hold/build_hold.py nothing-to-build now, so the next session is released. "
+              "With nothing to build, run python3 ~/.claude/scripts/build_hold/build_hold.py nothing-to-build now, so the release stops waiting for you. "
               f"Session {entry['session_id']}.")
     try:
         result = subprocess.run([sys.executable, str(script), "--to", f"uds:{socket}", "--text", notice], capture_output=True, text=True)
@@ -1300,55 +1302,34 @@ def entry_text(entry: ReleaseEntry) -> str:
     return f"{entry['name']} [{entry['session_id']}]: {label}"
 
 
-def cycle_status_lines(cycle: HoldCycle, now: datetime) -> list[str]:
-    lines = [entry_text(entry) for entry in cycle["entries"]]
-    for index, entry in enumerate(cycle["entries"]):
-        state = read_release_state(entry)
-        if not isinstance(state, MemoryGateReturned):
-            continue
-        ready = state.wait_ended_at + timedelta(seconds=RELEASE_SETTLE_S)
-        if now >= ready:
-            continue
-        following = next((candidate for candidate in cycle["entries"][index + 1:] if isinstance(read_release_state(candidate), AwaitingRelease)), None)
-        if following is not None:
-            lines.append(f"next {following['name']} [{following['session_id']}] at {ready.astimezone(user_zone()):%H:%M:%S %Z}")
-        break
-    return lines
+def cycle_status_lines(cycle: HoldCycle) -> list[str]:
+    return [entry_text(entry) for entry in cycle["entries"]]
 
 
 def release_clock() -> datetime:
     return datetime.now(timezone.utc)
 
 
-def release_queue_idle(entries: Sequence[ReleaseEntry], generation: int, now: datetime) -> bool:
-    for entry in entries:
-        state = read_release_state(entry)
-        if (entry["active_call_id"]
-            or isinstance(state, (AwaitingRelease, DeliveryQueued, ReleasedAwaitingAdmission, WaitingForMemory))
-            or any(call["admitted_generation"] != generation for call in entry["calls"])
-            or (isinstance(state, MemoryGateReturned) and now < state.wait_ended_at + timedelta(seconds=RELEASE_SETTLE_S))):
-            return False
-    return True
+def in_progress(entry: ReleaseEntry) -> bool:
+    return bool(entry["active_call_id"]) or isinstance(read_release_state(entry), IN_PROGRESS_STATES)
 
 
-def queue_told_sessions(cycle: HoldCycle, now: datetime) -> None:
+def has_pending_call(entry: ReleaseEntry, generation: int) -> bool:
+    return any(call["admitted_generation"] != generation for call in entry["calls"])
+
+
+def queue_told_sessions(cycle: HoldCycle) -> None:
+    """Every session the hold told gets its own release, registered or not, in the same pass as the rest."""
     entries = cycle["entries"]
     generation = cycle.get("holder_generation", 1)
-    if not release_queue_idle(entries, generation, now):
-        return
     registered = {entry["session_id"] for entry in entries}
-    missing = [new_entry(session_id, name) for session_id, name in cycle["recipients"].items()
-               if session_id not in registered and not session_id.startswith("verify:")]
-    changed = bool(missing)
     for entry in entries:
         if (entry["session_id"] in cycle["recipients"] and not entry["session_id"].startswith("verify:")
-            and entry["delivery"]["generation"] != generation):
+            and entry["delivery"]["generation"] != generation and not in_progress(entry)):
             entry["session_pending"] = True
             store_release_state(entry, AwaitingRelease())
-            changed = True
-    if changed:
-        entries.extend(missing)
-        save_cycle(cycle)
+    entries.extend(new_entry(session_id, name) for session_id, name in cycle["recipients"].items()
+                   if session_id not in registered and not session_id.startswith("verify:"))
 
 
 def not_reached_detail(cycle: HoldCycle) -> str:
@@ -1364,158 +1345,102 @@ def not_reached_detail(cycle: HoldCycle) -> str:
     return " Not reached, tell them yourself: " + ", ".join(missing) if missing else ""
 
 
+def end_lapsed_turn(entry: ReleaseEntry, now: datetime, release_start: datetime) -> None:
+    """A released turn that outlives its limit, or whose session left, ends; it never holds another session."""
+    state = read_release_state(entry)
+    match state:
+        case RecipientGone() | DeliveryFailed() if entry["active_call_id"]:
+            released_at = (aware_instant(entry["active_released_at"]) if entry["active_released_at"]
+                           else state.attempted_at if isinstance(state, DeliveryFailed) else release_start)
+            deadline = released_at + timedelta(seconds=NO_ADMISSION_ACK_S)
+        case WaitingForMemory(released_at=released_at, wait_started_at=wait_started_at):
+            limit_s = int(os.environ.get("BUILDLOG_MEM_WAIT_LIMIT_S", "900")) + MEMORY_GATE_GRACE_S
+            deadline = wait_started_at + timedelta(seconds=limit_s)
+        case ReleasedAwaitingAdmission(released_at=released_at) | DeliveryQueued(attempted_at=released_at):
+            deadline = released_at + timedelta(seconds=NO_ADMISSION_ACK_S)
+        case _:
+            return
+    if now >= deadline:
+        entry["active_call_id"] = ""
+        entry["session_pending"] = False
+        store_release_state(entry, NoAdmissionAck(released_at))
+    elif (not entry["active_call_id"] and not isinstance(state, (RecipientGone, DeliveryFailed))
+          and isinstance(socket_for(entry["session_id"]), RecipientGone)):
+        entry["session_pending"] = False
+        store_release_state(entry, RecipientGone())
+
+
+def release_entry(cycle: HoldCycle, entry: ReleaseEntry, clock: Callable[[], datetime]) -> None:
+    """Admit the session's next pending call, or its session wait, and send its release notice once per generation."""
+    generation = cycle.get("holder_generation", 1)
+    pending_calls = sorted((call for call in entry["calls"] if call["admitted_generation"] != generation),
+                           key=lambda call: not call["started"])
+    if pending_calls:
+        entry["active_call_id"] = pending_calls[0]["call_id"]
+        pending_calls[0]["admitted_generation"] = generation
+        entry["session_admitted_generation"] = generation
+        entry["session_pending"] = False
+    elif not entry["session_pending"]:
+        if entry["session_id"] not in cycle["recipients"] or entry["delivery"]["generation"] == generation:
+            store_release_state(entry, NoPendingTurn())
+            return
+        entry["session_pending"] = True
+    entry["active_released_at"] = clock().isoformat()
+    if entry["session_id"].startswith("verify:") or entry["delivery"]["generation"] == generation:
+        store_release_state(entry, ReleasedAwaitingAdmission(clock()))
+        return
+    recipient = socket_for(entry["session_id"])
+    if isinstance(recipient, RecipientGone):
+        entry["delivery"] = {"generation": generation, "outcome": "RecipientGone"}
+        store_release_state(entry, RecipientGone())
+    elif isinstance(recipient, RecipientLookupFailed):
+        print(f"build_hold: {entry_text(entry)}: {recipient.reason}", file=sys.stderr)
+        entry["delivery"] = {"generation": generation, "outcome": "DeliveryFailed"}
+        store_release_state(entry, DeliveryFailed(clock()))
+    else:
+        attempted_at = clock()
+        outcome = send_release(entry, recipient.socket)
+        if isinstance(outcome, ReleaseDelivered):
+            entry["delivery"] = {"generation": generation, "outcome": "Delivered"}
+            store_release_state(entry, ReleasedAwaitingAdmission(clock()))
+        elif isinstance(outcome, ReleaseQueued):
+            entry["delivery"] = {"generation": generation, "outcome": "QueuedUnconfirmed"}
+            store_release_state(entry, DeliveryQueued(attempted_at))
+        else:
+            print(f"build_hold: {entry_text(entry)}: {outcome.reason}", file=sys.stderr)
+            entry["delivery"] = {"generation": generation, "outcome": "DeliveryFailed"}
+            store_release_state(entry, DeliveryFailed(attempted_at))
+    if isinstance(read_release_state(entry), (RecipientGone, DeliveryFailed)):
+        entry["session_pending"] = False
+
+
 def advance_release(cycle: HoldCycle, now: datetime, *, clock: Callable[[], datetime] = release_clock) -> tuple[bool, str]:
+    """One pass: every waiting session is released at once, and each turn ends on its own clock.
+
+    No stagger between notices: every released build passes memory_gate.sh, whose check and
+    reservation run under one flock (memory_admit.check), so two builds starting together
+    cannot both count the same free memory.
+    """
     entries = cycle["entries"]
+    generation = cycle.get("holder_generation", 1)
+    release_start = aware_instant(cycle["release_started_at"])
+    queue_told_sessions(cycle)
     for entry in entries:
         prune_calls(entry)
-    generation = cycle.get("holder_generation", 1)
-    for entry in tuple(entries):
-        state = read_release_state(entry)
-        pending = any(call["admitted_generation"] != generation for call in entry["calls"])
-        if isinstance(state, MemoryGateReturned) and now >= state.wait_ended_at + timedelta(seconds=RELEASE_SETTLE_S) and pending:
-            entries.remove(entry)
+        end_lapsed_turn(entry, now, release_start)
+        if not in_progress(entry) and (has_pending_call(entry, generation) or entry["session_pending"]):
             store_release_state(entry, AwaitingRelease())
-            entries.append(entry)
-    resumed = [entry for entry in entries if isinstance(read_release_state(entry), AwaitingRelease)
-               and any(call["started"] and call["admitted_generation"] != generation for call in entry["calls"])]
-    turn_in_progress = any(entry["active_call_id"]
-                           or isinstance(read_release_state(entry), (DeliveryQueued, ReleasedAwaitingAdmission, WaitingForMemory))
-                           or (isinstance(state := read_release_state(entry), MemoryGateReturned)
-                               and now < state.wait_ended_at + timedelta(seconds=RELEASE_SETTLE_S))
-                           for entry in entries)
-    if resumed and not turn_in_progress:
-        entries[:] = resumed + [entry for entry in entries if entry not in resumed]
+        if isinstance(read_release_state(entry), AwaitingRelease):
+            # The record holds every queued entry and each earlier notice before this one is sent,
+            # so a driver stopped mid-pass resumes without sending a notice twice.
+            save_cycle(cycle)
+            release_entry(cycle, entry, clock)
     save_cycle(cycle)
-    release_start = aware_instant(cycle["release_started_at"])
-    queue_told_sessions(cycle, now)
-    active = (AwaitingRelease, DeliveryQueued, ReleasedAwaitingAdmission, WaitingForMemory)
-    for index, entry in enumerate(entries):
-        state = read_release_state(entry)
-        if isinstance(state, (RecipientGone, DeliveryFailed)) and entry["active_call_id"]:
-            started_at = aware_instant(entry["active_released_at"]) if entry["active_released_at"] else state.attempted_at if isinstance(state, DeliveryFailed) else release_start
-            if (now - started_at).total_seconds() < NO_ADMISSION_ACK_S:
-                return False, entry_text(entry)
-            entry["active_call_id"] = ""
-            entry["session_pending"] = False
-            store_release_state(entry, NoAdmissionAck(started_at))
-            save_cycle(cycle)
-            queue_told_sessions(cycle, now)
-            continue
-        if isinstance(state, WaitingForMemory):
-            if (now - state.wait_started_at).total_seconds() < int(os.environ.get("BUILDLOG_MEM_WAIT_LIMIT_S", "900")) + RELEASE_SETTLE_S:
-                if not entry["active_call_id"] and isinstance(socket_for(entry["session_id"]), RecipientGone):
-                    entry["session_pending"] = False
-                    store_release_state(entry, RecipientGone())
-                    save_cycle(cycle)
-                    queue_told_sessions(cycle, now)
-                    continue
-                return False, entry_text(entry)
-            entry["active_call_id"] = ""
-            entry["session_pending"] = False
-            store_release_state(entry, NoAdmissionAck(state.released_at))
-            save_cycle(cycle)
-            queue_told_sessions(cycle, now)
-        elif isinstance(state, (ReleasedAwaitingAdmission, DeliveryQueued)):
-            started_at = state.released_at if isinstance(state, ReleasedAwaitingAdmission) else state.attempted_at
-            turn_limit_s = NO_ADMISSION_ACK_S
-            if (not entry["active_call_id"]
-                and any(isinstance(read_release_state(other), AwaitingRelease) for other in entries if other is not entry)):
-                turn_limit_s = RELEASE_SETTLE_S
-            if (now - started_at).total_seconds() < turn_limit_s:
-                if not entry["active_call_id"] and isinstance(socket_for(entry["session_id"]), RecipientGone):
-                    entry["session_pending"] = False
-                    store_release_state(entry, RecipientGone())
-                    save_cycle(cycle)
-                    queue_told_sessions(cycle, now)
-                    continue
-                return False, entry_text(entry)
-            entry["active_call_id"] = ""
-            entry["session_pending"] = False
-            store_release_state(entry, NoAdmissionAck(started_at))
-            save_cycle(cycle)
-            queue_told_sessions(cycle, now)
-        elif isinstance(state, MemoryGateReturned):
-            ready = state.wait_ended_at + timedelta(seconds=RELEASE_SETTLE_S)
-            if now < ready:
-                next_entry = next((following for following in entries[index + 1:] if isinstance(read_release_state(following), AwaitingRelease)), None)
-                target = entry_text(next_entry) if next_entry is not None else "final check"
-                return False, f"{entry_text(entry)}; next {target} at {ready.astimezone(user_zone()):%H:%M:%S %Z}"
-            pending = any(call["admitted_generation"] != generation for call in entry["calls"])
-            if pending or entry["session_pending"]:
-                entries.remove(entry)
-                store_release_state(entry, AwaitingRelease())
-                entries.append(entry)
-                save_cycle(cycle)
-                return False, entry_text(entry)
-        elif isinstance(state, AwaitingRelease):
-            pending_calls = [call for call in entry["calls"] if call["admitted_generation"] != generation]
-            pending_calls.sort(key=lambda call: not call["started"])
-            if pending_calls:
-                entry["active_call_id"] = pending_calls[0]["call_id"]
-                entry["session_admitted_generation"] = generation
-                entry["session_pending"] = False
-            elif not entry["session_pending"]:
-                if entry["session_id"] in cycle["recipients"] and entry["delivery"]["generation"] != generation:
-                    entry["session_pending"] = True
-                else:
-                    store_release_state(entry, NoPendingTurn())
-                    save_cycle(cycle)
-                    queue_told_sessions(cycle, now)
-                    continue
-            entry["active_released_at"] = clock().isoformat()
-            if entry["session_id"].startswith("verify:"):
-                store_release_state(entry, ReleasedAwaitingAdmission(clock()))
-                for call in pending_calls:
-                    if call["call_id"] == entry["active_call_id"]:
-                        call["admitted_generation"] = generation
-                save_cycle(cycle)
-                return False, entry_text(entry)
-            if entry["delivery"]["generation"] == generation:
-                store_release_state(entry, ReleasedAwaitingAdmission(clock()))
-            else:
-                recipient = socket_for(entry["session_id"])
-                if isinstance(recipient, RecipientGone):
-                    entry["delivery"] = {"generation": generation, "outcome": "RecipientGone"}
-                    store_release_state(entry, RecipientGone())
-                elif isinstance(recipient, RecipientLookupFailed):
-                    print(f"build_hold: {entry_text(entry)}: {recipient.reason}", file=sys.stderr)
-                    entry["delivery"] = {"generation": generation, "outcome": "DeliveryFailed"}
-                    store_release_state(entry, DeliveryFailed(clock()))
-                else:
-                    attempted_at = clock()
-                    outcome = send_release(entry, recipient.socket)
-                    if isinstance(outcome, ReleaseDelivered):
-                        entry["delivery"] = {"generation": generation, "outcome": "Delivered"}
-                        store_release_state(entry, ReleasedAwaitingAdmission(clock()))
-                    elif isinstance(outcome, ReleaseQueued):
-                        entry["delivery"] = {"generation": generation, "outcome": "QueuedUnconfirmed"}
-                        store_release_state(entry, DeliveryQueued(attempted_at))
-                    else:
-                        print(f"build_hold: {entry_text(entry)}: {outcome.reason}", file=sys.stderr)
-                        entry["delivery"] = {"generation": generation, "outcome": "DeliveryFailed"}
-                        store_release_state(entry, DeliveryFailed(attempted_at))
-                if isinstance(read_release_state(entry), (RecipientGone, DeliveryFailed)):
-                    entry["session_pending"] = False
-            if entry["active_call_id"]:
-                for call in pending_calls:
-                    if call["call_id"] == entry["active_call_id"]:
-                        call["admitted_generation"] = generation
-            save_cycle(cycle)
-            if entry["active_call_id"] or isinstance(read_release_state(entry), active):
-                return False, entry_text(entry)
-            queue_told_sessions(cycle, now)
-    for entry in entries:
-        state = read_release_state(entry)
-        pending = any(call["admitted_generation"] != generation for call in entry["calls"])
-        if pending and not isinstance(state, active):
-            store_release_state(entry, AwaitingRelease())
-            entry["active_call_id"] = ""
-            save_cycle(cycle)
-            return False, entry_text(entry)
+    waiting = [entry_text(entry) for entry in entries if in_progress(entry)]
+    if waiting:
+        return False, "; ".join(waiting)
     if not cycle["recipients"] and (now - release_start).total_seconds() < NO_REGISTRATION_S:
         return False, "waiting for registrations"
-    if any(isinstance(read_release_state(entry), active) for entry in entries):
-        return False, "waiting for release progress"
     return True, "; ".join(entry_text(entry) for entry in entries) or "NoRegistration timeout; no recipients registered"
 
 
@@ -1771,7 +1696,7 @@ def main(arguments: list[str]) -> int:
                     print(release_record_error_line(error))
                 else:
                     if cycle is not None:
-                        for line in cycle_status_lines(cycle, datetime.now(timezone.utc)):
+                        for line in cycle_status_lines(cycle):
                             print(line)
     except (ValueError, OSError) as error:
         print(f"build_hold: {error}", file=sys.stderr)

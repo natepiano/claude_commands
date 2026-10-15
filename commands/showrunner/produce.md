@@ -22,6 +22,10 @@ Read `~/.claude/docs/production_format.md` first. It defines:
 State:
 
 - `PRODUCTION_DOC`, `MERGE_BRANCH`, `LOG`, `UNITS` — from the production doc.
+  After a `/showrunner:rename apply` succeeds, read them again from the
+  renamed doc, along with `UPDATES` and `PROMPT_FILE`, which come from its
+  slug: apply moves the doc, the update timer and the state directory, and
+  switches `CHECKOUT` to the new merge branch.
 - `ZONE` — the user's zone setting, which
   `python3 ~/.claude/scripts/lib/user_zone.py` prints. It is one setting for
   every production; a doc's own **User zone** line is not read.
@@ -39,7 +43,7 @@ State:
 - `SHOWRUNNER_STATE` — `<SCRATCH>/showrunner_state.json`, one JSON object with
   optional `units` rows (`{"unit": "<unit session name>", "phase": "<text>",
   "wait": "<text>"}`), `merges_held` (a list of text), and `open_for_user`
-  (a list of text or `{"text": "<text>", "after": "YYYY-MM-DDTHH:MM"}`).
+  (a list of text or `{"text": "<text>", "after": "YYYY-MM-DDTHH:MM"}`); a new question goes in the object's `question` field, and the reply carries the printed `reviewed question` text.
 - `OUTSTANDING` — `~/.local/state/showrunner/outstanding/<slug>.json`, written
   by `update_registration.py footer --state` when `SHOWRUNNER_STATE` includes
   `open_for_user`. Omitting that key leaves the durable list unchanged.

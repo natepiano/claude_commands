@@ -9,7 +9,7 @@ per-run JSONL files under:
 ```
 
 The live session cache remains in
-`/tmp/claude/delegate/<run-id>/progress_history_state.json`. Deleting `/tmp`
+`/tmp/claude/unit/<run-id>/progress_history_state.json` (under `/tmp/claude/delegate/` for a run started before the folder rename). Deleting `/tmp`
 does not remove the durable event stream.
 
 ## Event model
@@ -516,7 +516,7 @@ tick lands on a later day. The elapsed and unchanged columns are durations, whic
 say how long but never when, and an ETA says when the work lands rather than when
 this report was made; this line is what tells a reader whether the report in
 front of them is current and how long until the next one. The next tick comes
-from the Claude unit's `delegate-<run id>` notifier instance: every `progress`
+from the Claude unit's `unit-<run id>` notifier instance (`delegate-<run id>` for a run started before the folder rename): every `progress`
 call runs `notifier.sh restart` on it as its first act, before it reads state,
 and a rendered report names the `next_due` that restart prints. A refused call
 (no active phase, a failed percent check, a missing override reason or

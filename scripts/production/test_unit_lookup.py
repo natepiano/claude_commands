@@ -12,7 +12,10 @@ from pathlib import Path
 from typing import override
 from unittest import mock
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
 import fake_tmux
+import showrunners
 import unit_lookup
 import herdr
 from fake_tmux import FakeSession
@@ -39,6 +42,8 @@ class UnitLookupTests(unittest.TestCase):
         self.records = self.root / "sessions"
         self.records.mkdir()
         self.environment = {**os.environ, "FAKE_TMUX_STATE": str(self.state), "UNIT_LOOKUP_TMUX": FAKE,
+                            "HOME": str(self.root / "home"),
+                            "NOTIFIER_STATE_DIR": str(self.root / "notifier"),
                             "NOTIFIER_SESSIONS_DIR": str(self.records),
                             "PLAN_DELEGATE_HISTORY_DIR": str(self.root / "history"),
                             "HERDR_BIN": str(SCRIPT.parents[1] / "herdr/fake_herdr.py"),
@@ -47,6 +52,15 @@ class UnitLookupTests(unittest.TestCase):
                             "FAKE_HERDR_RESPONSES": str(self.root / "herdr-responses.json")}
         _ = (self.root / "herdr-responses.json").write_text(json.dumps({"default": {"stdout": "", "code": 1}}))
         self.enterContext(mock.patch.dict(os.environ, self.environment))
+        _ = self.enterContext(mock.patch.object(showrunners, "NOTIFIER_STATE_DIR", self.root / "notifier"))
+
+    def renamed_production(self) -> None:
+        doc = self.root / "new-production.md"
+        _ = doc.write_text("# Production\n\n## Production Context\n\n- **Formerly:** `old`\n")
+        instance = self.root / "notifier/showrunner-new"
+        instance.mkdir(parents=True)
+        _ = (instance / "conf").write_text(
+            f"TARGET=session:showrunner\nCHECK=zsh /scripts/production_check.sh {doc}\n")
 
     def process(self, pid: int, parent: int, argv: list[str], **environment: str) -> None:
         directory = self.root / "proc" / str(pid)
@@ -92,6 +106,81 @@ class UnitLookupTests(unittest.TestCase):
         self.assertEqual((unit.place, unit.label), (unit_lookup.TmuxPlace("%4"), "renamed-since-launch"))
         assert isinstance(unit.claude, LiveClaude)
         self.assertEqual((unit.claude.name, unit.claude.session_id), ("renamed-since-launch", "id-renamed-since-launch"))
+
+    def test_old_marked_sessions_are_found_under_both_production_names(self) -> None:
+        self.renamed_production()
+        fake_tmux.write(self.state, {"$1": marked("still-old", "%4", "trunk-unit", slug="old")})
+        self.claude("still-old", "%4")
+        found = unit_lookup.every_marked_unit()
+        self.assertEqual(list(found.units), ["new"])
+        for slug in ("old", "new"):
+            with self.subTest(slug=slug):
+                self.assertEqual(unit_lookup.marked_units(slug)["trunk-unit"].place, unit_lookup.TmuxPlace("%4"))
+                pane = self.run_script("pane", slug, "trunk-unit")
+                self.assertEqual((pane.returncode, pane.stdout), (0, "%4\n"), pane.stderr)
+                listed = self.run_script("list", slug)
+                self.assertEqual(listed.returncode, 0, listed.stderr)
+                self.assertEqual(listed.stdout.split("\t")[:6],
+                                 ["trunk-unit", "%4", "still-old", "live", "still-old", "id-still-old"])
+        self.assertEqual(fake_tmux.read(self.state)["$1"]["env"]["SHOWRUNNER_UNIT"], "old")
+
+    def test_former_and_current_marks_cannot_hide_duplicate_unit_sessions(self) -> None:
+        self.renamed_production()
+        fake_tmux.write(self.state, {"$1": marked("before", "%4", "trunk-unit", slug="old"),
+                                     "$2": marked("after", "%5", "trunk-unit", slug="new")})
+        found = unit_lookup.every_marked_unit()
+        self.assertEqual(found.units, {})
+        self.assertIn("both carry the mark of trunk-unit", found.faults["new"])
+        for slug in ("old", "new"):
+            with self.subTest(slug=slug):
+                with self.assertRaisesRegex(OSError, "both carry the mark of trunk-unit"):
+                    _ = unit_lookup.marked_units(slug)
+                for arguments in (("list", slug), ("pane", slug, "trunk-unit")):
+                    result = self.run_script(*arguments)
+                    self.assertEqual(result.returncode, 3, result.stdout + result.stderr)
+                    self.assertIn("both carry the mark of trunk-unit", result.stderr)
+
+    def test_sessions_sharing_a_production_read_its_timer_once_per_discovery(self) -> None:
+        self.renamed_production()
+        fake_tmux.write(self.state, {
+            "$1": marked("first", "%4", "first-unit", slug="old"),
+            "$2": marked("second", "%5", "second-unit", slug="old"),
+            "$3": marked("third", "%6", "third-unit", slug="old"),
+        })
+        with mock.patch.object(showrunners, "checked_doc", wraps=showrunners.checked_doc) as reads:
+            for expected_reads in (1, 2):
+                found = unit_lookup.every_marked_unit()
+                self.assertEqual(set(found.units["new"]), {"first-unit", "second-unit", "third-unit"})
+                self.assertEqual(reads.call_count, expected_reads)
+
+    def test_current_production_discovery_keeps_an_existing_timer_read_budget(self) -> None:
+        self.renamed_production()
+        fake_tmux.write(self.state, {"$1": marked("current", "%4", "trunk-unit", slug="new")})
+        with mock.patch.object(showrunners, "checked_doc", wraps=showrunners.checked_doc) as reads:
+            checked = showrunners.checked_doc(self.root / "notifier/showrunner-new")
+            self.assertIsInstance(checked, showrunners.CheckedDoc)
+            found = unit_lookup.every_marked_unit()
+            self.assertEqual(list(found.units["new"]), ["trunk-unit"])
+            self.assertEqual(reads.call_count, 1, "current marks must not reread already inventoried timers")
+
+    def test_current_production_lookup_does_not_read_timer_docs(self) -> None:
+        self.renamed_production()
+        fake_tmux.write(self.state, {"$1": marked("current", "%4", "trunk-unit", slug="new")})
+        with mock.patch.object(showrunners, "checked_doc", wraps=showrunners.checked_doc) as reads:
+            found = unit_lookup.marked_units("new")
+            self.assertEqual(found["trunk-unit"].place, unit_lookup.TmuxPlace("%4"))
+            self.assertEqual(reads.call_count, 0)
+
+    def test_herdr_marks_are_grouped_under_the_current_production(self) -> None:
+        self.renamed_production()
+        self.herdr_session()
+        environment = self.root / "proc" / str(os.getpid()) / "environ"
+        _ = environment.write_bytes(b"HERDR_PANE_ID=w1:p1\0SHOWRUNNER_UNIT=old\0SHOWRUNNER_UNIT_ID=trunk-unit")
+        self.assertEqual(list(unit_lookup.every_marked_unit().units), ["new"])
+        for slug in ("old", "new"):
+            with self.subTest(slug=slug):
+                pane = self.run_script("pane", slug, "trunk-unit")
+                self.assertEqual((pane.returncode, pane.stdout), (0, "herdr:native:w1:p1\n"), pane.stderr)
 
     def test_the_claude_in_an_unmarked_session_is_found_by_its_name(self) -> None:
         fake_tmux.write(self.state, {"$1": FakeSession(label="nightly-review", panes=["%6"], env={}),
@@ -232,6 +321,32 @@ class UnitLookupTests(unittest.TestCase):
         self.herdr_session()
         with mock.patch.dict(os.environ, {"UNIT_LOOKUP_TMUX": str(self.root / "missing-tmux")}):
             self.assertEqual(list(unit_lookup.marked_units("show")), ["trunk-unit"])
+
+    def test_every_host_lookup_refuses_partial_discovery_but_default_keeps_available_units(self) -> None:
+        self.herdr_session()
+        with mock.patch.dict(os.environ, {"UNIT_LOOKUP_TMUX": str(self.root / "missing-tmux")}):
+            self.assertEqual(list(unit_lookup.marked_units("show")), ["trunk-unit"])
+            with self.assertRaisesRegex(OSError, "tmux:"):
+                _ = unit_lookup.marked_units("show", every_host=True)
+
+    def test_every_host_lookup_names_herdr_failure_even_when_tmux_answers(self) -> None:
+        fake_tmux.write(self.state, {"$1": marked("trunk", "%4", "trunk-unit")})
+        self.assertEqual(list(unit_lookup.marked_units("show")), ["trunk-unit"])
+        with self.assertRaisesRegex(OSError, "herdr session list:"):
+            _ = unit_lookup.marked_units("show", every_host=True)
+
+    def test_unreadable_hosts_keep_original_errors_and_strict_lookup_avoids_repeated_host_names(self) -> None:
+        binary = self.root / "broken-tmux"
+        _ = binary.write_text("#!/bin/sh\necho 'fixture cannot list panes' >&2\nexit 2\n")
+        binary.chmod(0o755)
+        with (mock.patch.dict(os.environ, {"UNIT_LOOKUP_TMUX": str(binary)}),
+              mock.patch.object(herdr, "herdr_binary", side_effect=herdr.HerdrMissing("herdr is not installed"))):
+            for every_host in (False, True):
+                with self.subTest(every_host=every_host):
+                    with self.assertRaises(OSError) as refused:
+                        _ = unit_lookup.every_marked_unit(every_host=every_host)
+                    self.assertEqual(str(refused.exception),
+                                     "tmux could not list panes: fixture cannot list panes; herdr is not installed")
 
     def test_an_empty_herdr_answer_is_enough_when_tmux_cannot_answer(self) -> None:
         _ = (self.root / "herdr-responses.json").write_text(json.dumps({"default": {"code": 0, "stdout": '{"sessions": []}'}}))

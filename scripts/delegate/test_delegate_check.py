@@ -33,8 +33,9 @@ class DelegateCheckTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory()
         self.root = Path(self.temporary.name)
-        self.session_dir = self.root / "delegate-run"
-        self.session_dir.mkdir()
+        # A run started before the rename, under the former folder name, keeps its delegate- instance.
+        self.session_dir = self.root / "delegate" / "delegate-run"
+        self.session_dir.mkdir(parents=True)
         self.active_dir = self.root / "active"
         self.active_dir.mkdir()
         self.state_dir = self.root / "notifier"
@@ -126,6 +127,15 @@ class DelegateCheckTests(unittest.TestCase):
         self.assertIn("delegate_run.py check", conf["CHECK"])
         self.assertIn(self.session_id, conf["CHECK"])
         self.assertIn(str(self.session_dir), conf["CHECK"])
+
+    def test_unit_notifier_names_a_run_under_the_new_folder_name_unit(self) -> None:
+        new_run = self.root / "unit" / "new-run"
+        new_run.mkdir(parents=True)
+        self.write_marker(new_run)
+        result = self.run_unit_notifier()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue((self.state_dir / "unit-new-run" / "conf").is_file())
+        self.assertFalse((self.state_dir / "delegate-new-run").exists())
 
     def test_unit_notifier_exits_one_without_marker(self) -> None:
         result = self.run_unit_notifier()
@@ -253,7 +263,8 @@ class DelegateCheckTests(unittest.TestCase):
         _ = (self.active_dir / session_id).write_text(f"{session_dir}\n", encoding="utf-8")
         created = self.run_unit_notifier_as(session_id)
         self.assertEqual(created.returncode, 0, created.stderr)
-        return f"delegate-{session_dir.name}"
+        # A run outside the former folder name gets the new unit- instance.
+        return f"unit-{session_dir.name}"
 
     def instance_files(self, instance: str) -> tuple[list[str], list[str]]:
         directory = self.state_dir / instance

@@ -26,6 +26,7 @@ from typing import NamedTuple, NoReturn, TypedDict, cast
 
 if not __package__:
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from scripts.lib import unit_runs  # noqa: E402
 from scripts.lib.user_zone import user_zone  # noqa: E402
 
 
@@ -2223,7 +2224,7 @@ def _restart_unit_notifier(session_dir: Path) -> int | None:
         environment["NOTIFIER_NOW_EPOCH"] = configured_now
     try:
         result = subprocess.run(
-            [zsh, str(notifier), "restart", f"delegate-{session_dir.name}"],
+            [zsh, str(notifier), "restart", unit_runs.instance(session_dir)],
             capture_output=True,
             text=True,
             timeout=10,
