@@ -1439,6 +1439,10 @@ def pick(tool: Literal["claude", "codex"], now: datetime, *, exclude: frozenset[
             reason = refusal_problem
         elif refusal is not None and not refusals.resolved(refusal, reading, now):
             reason = "refused at " + refusal.at.astimezone(agent_accounts.user_zone()).strftime("%Y-%m-%d %H:%M %Z")
+        elif tool == "claude" and isinstance(reading, FreshReading) and any(
+            isinstance(window, ReadingWindow) and window.left <= 0 for window in (weekly, five)
+        ):
+            reason = "no room"
         elif tool == "claude":
             reason = "has room" if isinstance(reading, FreshReading) else "has room; no reading in the last 10 minutes"
             candidate = PickedAccount(label, directory, weekly.left if isinstance(weekly, ReadingWindow) and isinstance(reading, FreshReading) else 0,
@@ -1717,7 +1721,7 @@ def account_labels_for_logins(logins: frozenset[str]) -> frozenset[str]:
 
 
 def placement(group: ClaudeGroup, now: datetime, *, exclude: frozenset[str] = _NO_EXCLUSIONS) -> GroupPlacement:
-    """Rank working Claude accounts for a group; percentages alone refuse none."""
+    """Rank Claude accounts with room for a group using the picker's reading rules."""
     chosen = pick("claude", now, exclude=exclude, keep=NoKeep())
     if isinstance(chosen, NoAccountWithRoom):
         label = group_label(group_accounts(), group)

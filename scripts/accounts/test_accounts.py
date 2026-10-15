@@ -3311,10 +3311,10 @@ class PickerTests(unittest.TestCase):
                 else:
                     self.assertNotEqual(code, 0)
 
-    def test_placement_zero_percent_without_refusal_has_room_for_units(self) -> None:
+    def test_placement_fresh_zero_percent_without_refusal_selects_an_account_with_room(self) -> None:
         self.reading("Claude", "third@example.invalid", 0, 2, five_left=0)
         result = accounts.placement("units", self.now, exclude=frozenset())
-        self.assertEqual(result.label, "claude3")
+        self.assertEqual(result.label, "claude1")
         self.assertIsInstance(result.reason, accounts.UnitsResetSoonest)
 
     def test_placement_unresolved_refusal_excludes_positive_room(self) -> None:
@@ -3345,13 +3345,13 @@ class PickerTests(unittest.TestCase):
         self.assertEqual(accounts.placement("showrunners", self.now, exclude=frozenset()).label, "claude3")
         self.assertEqual(path.read_bytes(), before)
 
-    def test_placement_example_ranks_zero_percent_units_and_high_room_showrunners(self) -> None:
+    def test_placement_example_skips_zero_percent_units_and_ranks_high_room_showrunners(self) -> None:
         _ = self.groups()
         self.reading("Claude", "main@example.invalid", 0, 2)
         self.reading("Claude", "third@example.invalid", 3, 4)
         self.reading("Claude", "first@example.invalid", 53, 6)
         self.assertEqual(accounts.placement("showrunners", self.now, exclude=frozenset({"claude3"})).label, "claude1")
-        self.assertEqual(accounts.placement("units", self.now, exclude=frozenset({"claude1"})).label, "claude2")
+        self.assertEqual(accounts.placement("units", self.now, exclude=frozenset({"claude1"})).label, "claude3")
         with patch.object(accounts, "datetime", PickerTime):
             self.assertEqual(accounts.role_account("unit"), accounts.NamedAccount("claude1", accounts.account_dir("claude1")))
             self.assertEqual(accounts.role_account("showrunner"), accounts.NamedAccount("claude3", accounts.account_dir("claude3")))
@@ -3437,6 +3437,17 @@ class PickerTests(unittest.TestCase):
             self.reading("Claude", login, 0, 2, age=timedelta(minutes=11), five_left=0)
         self.assert_picked("claude3", "--keep", "claude3")
         self.assert_picked("claude2", "--keep", "claude3", "--exclude", "claude3")
+        self.reading("Claude", "main@example.invalid", 50, 7)
+        self.reading("Claude", "first@example.invalid", 90, 5)
+        code, output, error = self.cli("--explain")
+        self.assertEqual((code, error), (0, ""))
+        explanation = next(line for line in output.splitlines() if line.startswith("claude3:"))
+        self.assertTrue(explanation.endswith("; has room; no reading in the last 10 minutes"), explanation)
+        for group in accounts.CLAUDE_GROUPS:
+            with self.subTest(group=group):
+                result = accounts.placement(group, self.now, exclude=frozenset({"claude1", "claude2"}))
+                self.assertEqual(result.label, "claude3")
+                self.assertNotIsInstance(result.reason, accounts.GroupNoRoom)
 
     def test_picker_without_fresh_readings_skips_refused_keep(self) -> None:
         usage_store.store_file().unlink()
@@ -3452,11 +3463,11 @@ class PickerTests(unittest.TestCase):
             refusals.UnknownWindow(), refusals.NoResetKnown(), self.now))
         self.assert_picked("claude1")
 
-    def test_picker_fresh_zero_candidate_remains_eligible_with_missing_other_readings(self) -> None:
+    def test_picker_fresh_zero_candidate_is_ineligible_even_with_missing_other_readings(self) -> None:
         usage_store.store_file().unlink()
         self.reading("Claude", "third@example.invalid", 0, 2)
         self.assert_picked("claude2", "--keep", "claude2")
-        self.assert_picked("claude3")
+        self.assert_picked("claude1")
 
     def test_picker_prefers_soonest_weekly_reset_over_most_room(self) -> None:
         self.assert_picked("claude3")
@@ -3472,9 +3483,9 @@ class PickerTests(unittest.TestCase):
     def test_picker_keeps_current_account_with_room_despite_a_sooner_reset(self) -> None:
         self.assert_picked("claude1", "--keep", "claude1")
 
-    def test_picker_keeps_zero_percent_account_without_a_refusal(self) -> None:
+    def test_picker_does_not_keep_a_fresh_zero_percent_account_without_a_refusal(self) -> None:
         self.reading("Claude", "first@example.invalid", 0, 2)
-        self.assert_picked("claude1", "--keep", "claude1")
+        self.assert_picked("claude3", "--keep", "claude1")
 
     def test_picker_has_no_minimum_remaining_percentage(self) -> None:
         self.reading("Claude", "third@example.invalid", 1, 2, five_left=1)
@@ -3486,9 +3497,42 @@ class PickerTests(unittest.TestCase):
     def test_picker_exclude_overrides_keep(self) -> None:
         self.assert_picked("claude1", "--keep", "claude3", "--exclude", "claude3")
 
-    def test_picker_zero_five_hour_window_without_refusal_still_has_room(self) -> None:
-        self.reading("Claude", "third@example.invalid", 90, 2, five_left=0)
-        self.assert_picked("claude3")
+    def test_picker_explains_fresh_zero_weekly_or_five_hour_as_no_room_and_placement_agrees(self) -> None:
+        for weekly, five_hour in ((0, 90), (90, 0)):
+            with self.subTest(weekly=weekly, five_hour=five_hour):
+                self.reading("Claude", "third@example.invalid", weekly, 2, five_left=five_hour)
+                code, output, error = self.cli("--explain")
+                self.assertEqual((code, error), (0, ""))
+                self.assertEqual(output.splitlines()[0], "claude1")
+                explanation = next(line for line in output.splitlines() if line.startswith("claude3:"))
+                self.assertTrue(explanation.endswith("; no room"), explanation)
+                self.assert_picked("claude1", "--keep", "claude3")
+                for group in accounts.CLAUDE_GROUPS:
+                    with self.subTest(group=group):
+                        result = accounts.placement(group, self.now)
+                        self.assertEqual(result.label, "claude1")
+                        reason = next(reason for reason in result.reasons if reason.label == "claude3")
+                        self.assertEqual(reason.status, "no room")
+
+    def test_picker_all_fresh_zero_candidates_refuses_with_the_soonest_reset_and_placement_agrees(self) -> None:
+        _ = self.groups()
+        cases = ((0, 50, False, self.now + timedelta(days=2), "Thu 2026-10-15 12:00 UTC"),
+                 (50, 0, True, self.now + timedelta(hours=3), "Tue 2026-10-13 15:00 UTC"))
+        for weekly, five_hour, five, earliest, reset_text in cases:
+            with self.subTest(weekly=weekly, five_hour=five_hour):
+                for login, days in (("main@example.invalid", 7), ("first@example.invalid", 5),
+                                    ("third@example.invalid", 2)):
+                    self.reading("Claude", login, weekly, days, five_left=five_hour, five=five)
+                code, output, error = self.cli("--explain")
+                self.assertEqual(code, 1, output + error)
+                self.assertIn("no claude account has room; the earliest reset is " + reset_text, output + error)
+                self.assertEqual(sum(line.endswith("; no room") for line in output.splitlines()), 3)
+                for group in accounts.CLAUDE_GROUPS:
+                    result = accounts.placement(group, self.now)
+                    self.assertEqual(result.label, "claude1" if group == "units" else "claude3")
+                    self.assertIsInstance(result.reason, accounts.GroupNoRoom)
+                    assert isinstance(result.reason, accounts.GroupNoRoom)
+                    self.assertEqual(result.reason.outcome.earliest_reset, accounts.EarliestReset(earliest))
 
     def test_picker_accepts_weekly_room_when_claude_has_no_five_hour_window(self) -> None:
         self.reading("Claude", "third@example.invalid", 1, 2, five=False)
