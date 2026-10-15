@@ -337,26 +337,19 @@ class SettleTests(ShutdownTestCase):
         pushes = [cast(RenderedPush, call.args[0]) for call in alert.call_args_list]
         self.assertEqual({push.values["session"] for push in pushes}, set(identities))
         for push in pushes:
-            self.assertEqual(push.id, "shutdown.holdout")
+            self.assertEqual(push.id, "shutdown.holdout_unanswered")
             self.assertIn(push.values["session"], push.title)
             self.assertIn("is blocked", push.title)
             self.assertIn(push.values["command"], push.body)
-            self.assertIn("5 minutes", push.body)
             combined = push.body + " " + cast(ActionRequired, push.action).text
-            self.assertIn("(on natedev)", combined.casefold())
-            self.assertIn(f"now {LOGIN} --here --only {identities[push.values['session']]}", combined)
-            self.assertTrue(push.body.startswith(f"Reason: {push.values['operation']} is blocked because {push.values['session']}'s claude session is not answering, and it can't proceed.\n\n"))
-            self.assertIn("Stop now (recommended)", push.body)
-            self.assertIn("mid-step", push.body)
-            self.assertIn("Uncommitted work stays", push.body)
+            self.assertIn("in a terminal on natedev:", combined.casefold())
+            self.assertIn(f"now {LABEL} --here --only {identities[push.values['session']]}", combined)
+            self.assertTrue(push.body.startswith(f"Reason: {push.values['operation']} is blocked because {push.values['session']}'s claude session has not paused for it and it can't proceed.\n\n"))
+            self.assertNotIn("form", push.title + "\n" + push.message)
             if identities[push.values["session"]] == "session-wait":
-                self.assertIn("Restart", push.title)
-                self.assertIn("Do nothing: the restart keeps waiting", push.body)
-                self.assertIn("the restart brings it back", push.body)
+                self.assertIn("restart", push.title)
             else:
-                self.assertIn("Shutdown", push.title)
-                self.assertIn("Do nothing: the shutdown keeps waiting", push.body)
-                self.assertIn("it stays stopped until restarted", push.body)
+                self.assertIn("shutdown", push.title)
 
     def test_shutdown_closing_cold_key_peer_and_holdout_lines_name_command_places(self) -> None:
         owner = top_level("place-owner", "Owner")
@@ -2318,8 +2311,24 @@ class SettleTests(ShutdownTestCase):
         self.assertEqual(alert.call_count, 2)
         pushes = [cast(RenderedPush, call.args[0]) for call in alert.call_args_list]
         self.assertEqual({push.values["session"] for push in pushes}, {"Owner", "Busy"})
-        self.assertTrue(all(push.id == "shutdown.holdout" for push in pushes))
+        self.assertEqual([push.id for push in pushes], ["shutdown.holdout", "shutdown.holdout_unanswered"])
+        self.assertIn("claude session is showing a form and it can't proceed.", pushes[0].body)
+        self.assertEqual(cast(ActionRequired, pushes[0].action).text, "answer the open form")
+        self.assertEqual(cast(ActionRequired, pushes[1].action).text, "in a terminal on natedev, stop Busy with the command below")
+        self.assertIn("claude session has not paused for it and it can't proceed.", pushes[1].body)
+        self.assertNotIn("form", pushes[1].title + "\n" + pushes[1].message)
         self.assertIn("Busy", cast(str, sender.call_args.args[2]))
+
+    def test_holdout_with_a_form_among_other_details_asks_to_answer_the_form(self) -> None:
+        saved = session_shutdown(top_level("held", "pm-move-ghostty"), requester="requester")
+        with patch.object(settle, "send_message"), patch.object(settle, "alert_user") as alert:
+            settle._send_holdout_alert([(saved, "busy, ahead 3 on main, showing a form, merge in progress")])  # pyright: ignore[reportPrivateUsage]
+        push = cast(RenderedPush, alert.call_args.args[0])
+        self.assertEqual(push.id, "shutdown.holdout")
+        self.assertEqual(cast(ActionRequired, push.action).text, "answer the open form")
+        self.assertTrue(push.body.startswith("Reason: shutdown is blocked because pm-move-ghostty's claude session is showing a form and it can't proceed.\n\n"))
+        self.assertNotIn("ahead 3", push.body)
+        self.assertNotIn("merge in progress", push.body)
 
     def test_holdout_alert_names_the_session_and_machine_for_the_command(self) -> None:
         owner = top_level("form", "Display name")
@@ -2332,7 +2341,21 @@ class SettleTests(ShutdownTestCase):
         push = cast(RenderedPush, alert.call_args.args[0])
         self.assertEqual(push.values["session"], "Display name")
         self.assertTrue(push.message.startswith("Session: Display name\nAction: "))
-        self.assertIn("(on natedev)", push.body)
+        self.assertIn("in a terminal on natedev:", push.body.casefold())
+
+    def test_holdout_push_uses_the_canonical_label_without_the_login_email(self) -> None:
+        for reason, expected_id in (("showing a form", "shutdown.holdout"), ("waiting", "shutdown.holdout_unanswered")):
+            with self.subTest(reason=reason):
+                saved = session_shutdown(top_level("held", "pm-move-ghostty"), then="restart")
+                saved["login"] = "held-account@example.com"
+                saved["label"] = "claude 4"
+                with patch.object(settle, "send_message"), patch.object(settle, "alert_user") as alert:
+                    settle._send_holdout_alert([(saved, reason)])  # pyright: ignore[reportPrivateUsage]
+                push = cast(RenderedPush, alert.call_args.args[0])
+                self.assertEqual(push.id, expected_id)
+                self.assertNotIn("@", push.title + "\n" + push.message)
+                self.assertEqual(push.title, "pm-move-ghostty restart is blocked")
+                self.assertIn("shutdown.py now claude4 --here --only held", push.body)
 
     def test_pending_scheduled_jobs_remain_in_session_reports_without_a_phone_alert(self) -> None:
         saved = session_shutdown(top_level("owner", "Owner"), progress={"kind": "timers pending", "at": NOW, "timers": []}, requester="requester")
@@ -2593,12 +2616,18 @@ class SettleTests(ShutdownTestCase):
             self.assertFalse(settle._holdout_due(saved, baseline + timedelta(hours=3)))  # pyright: ignore[reportPrivateUsage]
 
     def test_plain_wait_reaches_the_requester_and_the_phone(self) -> None:
-        for reason in ("waiting", "busy", "ahead 2 on main"):
+        for reason in ("waiting", "busy", "ahead 2 on main", "merge in progress", "Codex worker writer is still running",
+                       "busy, ahead 3 on main, merge in progress"):
             with self.subTest(reason=reason):
                 saved = session_shutdown(top_level("owner", "Owner"), requester="requester")
                 with patch.object(settle, "alert_user") as alert, patch.object(settle, "send_message", return_value=settle.MessageSent(kind="sent")) as sender:
                     settle._send_holdout_alert([(saved, reason)])  # pyright: ignore[reportPrivateUsage]
                 alert.assert_called_once()
+                push = cast(RenderedPush, alert.call_args.args[0])
+                self.assertEqual(push.id, "shutdown.holdout_unanswered")
+                self.assertEqual(cast(ActionRequired, push.action).text, "in a terminal on natedev, stop Owner with the command below")
+                self.assertNotIn("form", push.title + "\n" + push.message)
+                self.assertTrue(push.body.startswith("Reason: shutdown is blocked because Owner's claude session has not paused for it and it can't proceed.\n\n"))
                 self.assertIn("Owner has not answered the pause", cast(str, sender.call_args.args[2]))
                 self.assertIn(f"now {LOGIN} --here --only owner", cast(str, sender.call_args.args[2]))
 
@@ -2640,7 +2669,8 @@ class SettleTests(ShutdownTestCase):
         self.assertEqual(alert.call_count, 2)
         pushes = [cast(RenderedPush, call.args[0]) for call in alert.call_args_list]
         self.assertEqual({push.values["session"] for push in pushes}, {"form", "requester"})
-        self.assertTrue(all(push.id == "shutdown.holdout" for push in pushes))
+        self.assertEqual({push.values["session"]: push.id for push in pushes},
+            {"form": "shutdown.holdout", "requester": "shutdown.holdout_unanswered"})
         requester_texts = [cast(str, sent.args[2]) for sent in sender.call_args_list
             if sent.args[0] == "session:requester"]
         self.assertEqual(len(requester_texts), 1)
@@ -2801,9 +2831,10 @@ class SettleTests(ShutdownTestCase):
         self.assertEqual(alert.call_args.kwargs, {"machine": "natedev"})
         push = cast(RenderedPush, alert.call_args.args[0])
         self.assertIn("Held", push.title)
-        self.assertIn("Shutdown", push.title)
+        self.assertIn("shutdown", push.title)
         self.assertIn("is blocked", push.title)
-        self.assertIn("(on mac)", push.body.casefold())
+        self.assertIn("in a terminal on mac:", push.body.casefold())
+        self.assertIn(f"now {LABEL} --here --only held", push.body)
         self.assertIn(f"now {LOGIN} --here --only held", cast(str, sender.call_args.args[2]))
 
 

@@ -294,6 +294,30 @@ Outside `scripts/accounts/` and `scripts/whoami/`, every delegate agent is a "wo
 
 **Ruled out:** applying the reviewer's rewrites to the user's four lines.
 
+### Phase 14 — The shutdown holdout push in the user's four lines, with no email  · status: done
+
+**Depends on:** Phase 13
+
+#### Work Order
+
+**Goal:** The push sent when a session holds up a shutdown or restart reads as the user's four lines, passes review, and never carries an email address.
+
+**Spec:**
+- Split from Phase 5 and checkpointed ahead of it (showrunner, 2026-10-15 11:4x EDT): shutdown-unit's next run also edits `scripts/shutdown/settle.py` and builds on this change.
+- The `shutdown.holdout` push failed review on four rules (title-names-the-stake, say-where-to-act, short-plain-sentences, push-body-under-500) and was sent anyway under its user-spec approval, and its command line carried the account's login email. It leads with the user's four lines (Title / Session / Action / Reason, the user's words of 2026-10-14: "widget shutdown is blocked" / "widget" / "answer the open form" / "shutdown is blocked because widget's claude session is showing a form and it can't proceed"), with the operation in lower case in the title; any stop command names the account by its canonical label (`claude4`), never the login; the body stays under 500 characters. No push ever carries an email address: a test renders every catalog example and the live holdout push from a record whose login is an email and finds no `@`. The new text passes `review.py texts --id shutdown.holdout` (unit director).
+
+**Files:**
+- `scripts/notify/push_catalog.py` — the `shutdown.holdout` text and examples
+- `scripts/notify/test_push_texts.py` — no catalog push renders an `@`
+- `scripts/notify/push_texts_reviewed.json` — the re-reviewed text's approval (unit director)
+- `scripts/shutdown/settle.py` — the holdout push names the account by label (owner shutdown-unit; also touches)
+- `scripts/shutdown/test_settle.py` — a login that is an email never reaches the push
+
+**Workers:** 1 writer
+- `fix2` — every file above except `push_texts_reviewed.json`
+
+**Acceptance gate:** `scripts/notify`, `scripts/shutdown` and `scripts/lib` suites green; basedpyright 0/0; `review.py texts --id shutdown.holdout` approves the new text; no catalog example renders an `@`.
+
 ### Phase 5 — Questions in showrunner replies  · status: todo
 
 **Depends on:** Phase 4, Phase 6, Phase 9, Phase 10
