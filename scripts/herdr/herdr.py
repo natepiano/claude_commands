@@ -22,6 +22,10 @@ from pathlib import Path
 from typing import NotRequired, TypedDict, cast, override
 
 
+# Herdr requires agent-start timeouts strictly above this boundary.
+_AGENT_START_TIMEOUT_MINIMUM_MS = 3000
+
+
 class HerdrFailure(Exception):
     """An external command failure or malformed herdr response."""
 
@@ -32,6 +36,14 @@ class HerdrFailure(Exception):
 
 class HerdrMissing(HerdrFailure):
     """No herdr binary is available."""
+
+
+class SessionTaken(HerdrFailure):
+    """A new session cannot own a server or systemd unit already in use."""
+
+    def __init__(self, name: str) -> None:
+        super().__init__(f"herdr session {name} is already taken", "session_taken")
+        self.name: str = name
 
 
 class AgentBlocked(HerdrFailure):
@@ -74,6 +86,16 @@ class HerdrProcess:
     marks: dict[str, str]
     command: str
     cwd: str
+
+
+@dataclass(frozen=True)
+class _ServerSession:
+    session: str
+
+
+@dataclass(frozen=True)
+class _NotHerdrServer:
+    """The process argv does not identify a headless herdr server."""
 
 
 @dataclass(frozen=True)
@@ -129,6 +151,16 @@ class NoPane:
 class SeveralPanes:
     label: str
     count: int
+
+
+@dataclass(frozen=True)
+class PaneAtShell:
+    """The pane's foreground process group is its original shell."""
+
+
+@dataclass(frozen=True)
+class PaneRunning:
+    commands: tuple[str, ...]
 
 
 class SessionEntry(TypedDict):
@@ -304,6 +336,21 @@ class Herdr:
             return SeveralPanes(label, len(matches))
         return PaneFound(matches[0])
 
+    def pane_activity(self, pane: str) -> PaneAtShell | PaneRunning:
+        """Describe whether the pane is at its shell or running foreground work."""
+        context = f"herdr session {self.session} pane {pane} process info"
+        info = json_object(self.result("pane", "process-info", "--pane", pane).get("process_info"), context)
+        foreground = info.get("foreground_process_group_id")
+        shell = info.get("shell_pid")
+        for pid in (foreground, shell):
+            if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0:
+                raise HerdrFailure(f"{context}: expected positive process ids")
+        commands = tuple(
+            json_text(json_object(process, context).get("name"), context)
+            for process in json_items(info.get("foreground_processes"), context)
+        )
+        return PaneAtShell() if foreground == shell else PaneRunning(commands)
+
     def pane_id(self, label: str) -> str:
         found = self.lookup(label)
         if isinstance(found, NoPane):
@@ -324,13 +371,30 @@ class Herdr:
 
     def start_agent(self, name: str, pane: str, kind: str, agent_arguments: list[str],
                     opening_prompt: str, timeout_ms: int) -> None:
-        """Start the kind's executable with extra arguments, then prompt once."""
+        """Wait through busy-pane refusals, start the executable, then prompt once."""
         _check_agent_arguments(kind, agent_arguments)
         _timeout(timeout_ms)
-        result = run_program(self.argv("agent", "start", name, "--kind", kind, "--pane", pane,
-                                       "--timeout", str(timeout_ms), "--", *agent_arguments), timeout=timeout_ms / 1000 + 10)
+        deadline = time.monotonic() + timeout_ms / 1000
+        attempt_timeout_ms = timeout_ms
         try:
-            require_success(result, f"start agent {name}")
+            while True:
+                result = run_program(self.argv("agent", "start", _agent_name(name), "--kind", kind, "--pane", pane,
+                                               "--timeout", str(attempt_timeout_ms), "--", *agent_arguments),
+                                     timeout=attempt_timeout_ms / 1000 + 10)
+                try:
+                    require_success(result, f"start agent {name}")
+                except HerdrFailure as error:
+                    if error.code != "agent_pane_busy":
+                        raise
+                    remaining_ms = int((deadline - time.monotonic()) * 1000)
+                    if remaining_ms <= _AGENT_START_TIMEOUT_MINIMUM_MS:
+                        raise
+                    time.sleep(0.1)
+                    attempt_timeout_ms = int((deadline - time.monotonic()) * 1000)
+                    if attempt_timeout_ms <= _AGENT_START_TIMEOUT_MINIMUM_MS:
+                        raise
+                    continue
+                break
         except HerdrFailure as error:
             if error.code != "agent_not_ready":
                 raise
@@ -488,6 +552,28 @@ def server_answering(status: subprocess.CompletedProcess[str]) -> bool:
     return status.returncode == 0 and "status: running" in status.stdout.splitlines()
 
 
+def _clear_restored_workspaces(client: Herdr) -> None:
+    """A server we just spawned holds restored layout, never live work."""
+    result = client.result("workspace", "list")
+    workspaces = [json_text(json_object(item, "herdr workspace").get("workspace_id"),
+                            "herdr workspace id")
+                  for item in json_items(result.get("workspaces"), "herdr workspace list")]
+    for workspace in workspaces:
+        try:
+            _ = client.run("workspace", "close", workspace)
+        except HerdrFailure as error:
+            raise HerdrFailure(
+                f"herdr session {client.session}: cannot close restored workspace {workspace}: {error}",
+                error.code,
+            ) from error
+
+
+def _server_unit_active(name: str) -> bool:
+    return run_program([
+        os.environ.get("SYSTEMCTL", "systemctl"), "--user", "is-active", server_unit(name),
+    ]).returncode == 0
+
+
 def start_server(name: str, timeout_ms: int) -> None:
     _timeout(timeout_ms)
     herdr = Herdr(name)
@@ -507,6 +593,44 @@ def start_server(name: str, timeout_ms: int) -> None:
             raise HerdrFailure(f"server {name} not answering after {timeout_ms} ms")
         try:
             if server_answering(run_program(herdr.argv("status", "server"), timeout=max(0.001, remaining))):
+                if _server_unit_active(name):
+                    _clear_restored_workspaces(herdr)
+                return
+        except subprocess.TimeoutExpired:
+            pass
+        remaining = deadline - time.monotonic()
+        if remaining > 0:
+            time.sleep(min(0.1, remaining))
+
+
+def start_new_server(name: str, timeout_ms: int) -> None:
+    """Create an exclusive server; never adopt a server another launch started."""
+    _timeout(timeout_ms)
+    herdr = Herdr(name)
+    deadline = time.monotonic() + timeout_ms / 1000
+    try:
+        if server_answering(run_program(herdr.argv("status", "server"), timeout=max(0.001, timeout_ms / 1000))):
+            raise SessionTaken(name)
+    except subprocess.TimeoutExpired:
+        pass
+    created = run_program([
+        os.environ.get("SYSTEMD_RUN", "systemd-run"), "--user", f"--unit={server_unit(name)}",
+        "--collect", *herdr.argv("server"),
+    ])
+    if created.returncode:
+        detail = (created.stdout + created.stderr).lower()
+        if "already exists" in detail or "already loaded" in detail:
+            raise SessionTaken(name)
+        require_success(created, f"start {server_unit(name)}")
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise HerdrFailure(f"server {name} not answering after {timeout_ms} ms")
+        try:
+            if server_answering(run_program(herdr.argv("status", "server"), timeout=max(0.001, remaining))):
+                if not _server_unit_active(name):
+                    raise SessionTaken(name)
+                _clear_restored_workspaces(herdr)
                 return
         except subprocess.TimeoutExpired:
             pass
@@ -542,36 +666,88 @@ def _process_arguments(process: Path) -> list[str]:
     return [value for value in process.joinpath("cmdline").read_bytes().decode(errors="replace").split("\0") if value]
 
 
+def _server_session(arguments: list[str]) -> _ServerSession | _NotHerdrServer:
+    if not arguments or Path(arguments[0]).name != "herdr":
+        return _NotHerdrServer()
+    session = "default"
+    index = 1
+    while index < len(arguments) and arguments[index].startswith("-"):
+        option = arguments[index]
+        if option == "--":
+            index += 1
+            break
+        if option in ("--session", "--remote", "--remote-keybindings"):
+            if index + 1 >= len(arguments):
+                return _NotHerdrServer()
+            if option == "--session":
+                session = arguments[index + 1]
+            index += 2
+        elif option.startswith("--session="):
+            session = option.split("=", 1)[1]
+            index += 1
+        else:
+            index += 1
+    # Clients can contain "server" as prompt text or a nested subcommand.
+    if session and arguments[index:] == ["server"]:
+        return _ServerSession(session)
+    return _NotHerdrServer()
+
+
+def server_environment(name: str) -> dict[str, str]:
+    """Read the environment of the process holding this session's listener."""
+    context = f"herdr session {name} server environment"
+    config = Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config") / "herdr"
+    session_directory = config if name == "default" else config / "sessions" / name
+    socket_path = str(session_directory / "herdr.sock")
+    try:
+        sockets = _proc_root().joinpath("net", "unix").read_text().splitlines()
+    except (OSError, UnicodeError) as error:
+        raise HerdrFailure(f"{context}: cannot read listening sockets") from error
+    listening_inodes: list[str] = []
+    for line in sockets:
+        fields = line.split(maxsplit=7)
+        if (len(fields) == 8 and fields[7] == socket_path
+                and fields[3] == "00010000" and fields[6].isdecimal()):
+            listening_inodes.append(fields[6])
+    if len(listening_inodes) != 1:
+        raise HerdrFailure(f"{context}: expected one listening socket, found {len(listening_inodes)}")
+    listener = f"socket:[{listening_inodes[0]}]"
+    try:
+        candidates = list(_proc_root().iterdir())
+    except OSError as error:
+        raise HerdrFailure(f"{context}: cannot read process directory") from error
+    matches: list[Path] = []
+    for process in candidates:
+        if not process.name.isdecimal():
+            continue
+        try:
+            descriptors = list(process.joinpath("fd").iterdir())
+        except OSError:
+            continue
+        for descriptor in descriptors:
+            try:
+                if os.readlink(descriptor) == listener:
+                    matches.append(process)
+                    break
+            except OSError:
+                continue
+    if len(matches) != 1:
+        raise HerdrFailure(f"{context}: expected one listening socket holder, found {len(matches)}")
+    try:
+        return _process_environment(matches[0])
+    except OSError as error:
+        raise HerdrFailure(f"{context}: cannot read process environment") from error
+
+
 def _place_of(pid: int, pane: str) -> HerdrPlace | NotInHerdr:
     visited: set[int] = set()
     while pid > 0 and pid not in visited:
         visited.add(pid)
         process = _proc_root() / str(pid)
         try:
-            arguments = _process_arguments(process)
-            if arguments and Path(arguments[0]).name == "herdr":
-                session = "default"
-                index = 1
-                while index < len(arguments) and arguments[index].startswith("-"):
-                    option = arguments[index]
-                    if option == "--":
-                        index += 1
-                        break
-                    if option in ("--session", "--remote", "--remote-keybindings"):
-                        if index + 1 >= len(arguments):
-                            break
-                        if option == "--session":
-                            session = arguments[index + 1]
-                        index += 2
-                    elif option.startswith("--session="):
-                        session = option.split("=", 1)[1]
-                        index += 1
-                    else:
-                        index += 1
-                # Only the headless server command owns a session. Clients
-                # can contain "server" as prompt text or a nested subcommand.
-                if session and arguments[index:] == ["server"]:
-                    return HerdrPlace(session, pane)
+            server = _server_session(_process_arguments(process))
+            if isinstance(server, _ServerSession):
+                return HerdrPlace(server.session, pane)
             stat = process.joinpath("stat").read_text()
             pid = int(stat[stat.rindex(")") + 1:].split()[1])
         except (OSError, ValueError, IndexError):
@@ -620,6 +796,13 @@ def herdr_processes() -> list[HerdrProcess]:
 def _check_agent_arguments(kind: str, agent_arguments: list[str]) -> None:
     if agent_arguments and agent_arguments[0] == kind:
         raise ValueError(f"agent_arguments must omit the {kind!r} executable selected by --kind")
+
+
+def _agent_name(name: str) -> str:
+    mapped = re.sub(r"[^a-z0-9_-]", "-", name.lower())
+    if not mapped or not "a" <= mapped[0] <= "z":
+        mapped = "a-" + mapped
+    return mapped[:32]
 
 
 def start_agent(name: str, pane: str, kind: str, agent_arguments: list[str],

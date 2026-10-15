@@ -218,7 +218,7 @@ In the code:
 
 - **Scratch root under `~/rust`.** No session may face a trust prompt, and none is answered for the user. The scratch root `/home/natepiano/rust/herdr-trial-scratch/` sits where the user can grant trust once on `repo/`, which then covers every scratch worktree.
 - **One named herdr session, `herdr-trial`.** Nothing joins or disturbs a default herdr session.
-- **Units launched by `trial.py launch`, not `add_unit.py`.** `add_unit.py` starts tmux sessions. Each place the production commands assume tmux became a finding.
+- **Units launched by `trial.py launch`, not `add_unit.py`.** `add_unit.py` started tmux sessions when the trial was built (herdr sessions since herdr-adoption Phase 7). Each place the production commands assume tmux became a finding.
 - **`Promote: none`.** The fake production merges to its own branch and pushes to the bare origin; nothing reaches `~/.claude`.
 - **One work record per worker.** Three directors call `work` at once; one file each needs no lock.
 - **The manifest outside the scratch tree.** Retries and `leftovers` still work after the scratch tree is deleted.

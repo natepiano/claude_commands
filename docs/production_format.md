@@ -33,9 +33,9 @@ must not drift from it:
   branch. A unit is named `<area>-unit`, e.g. `widget-unit`. Its plan, worktree,
   branch, phases, checkpoints and ETA are the unit's.
 - **Unit director** — the Claude session that runs a unit: the `/unit:direct`
-  session the showrunner launches in tmux. It receives messages, decides, writes
-  Work Orders, dispatches workers, runs gates, checkpoints and reports. It writes
-  no implementation code.
+  session the showrunner launches in its own herdr session. It receives messages,
+  decides, writes Work Orders, dispatches workers, runs gates, checkpoints and
+  reports. It writes no implementation code.
 - **Worker** — a Codex worker thread the unit director dispatches. Implementation
   workers open once per run, continue across phases and repairs in whatever role
   is needed, attempt compaction above `PLAN_DELEGATE_COMPACT_ABOVE_TOKENS` but
@@ -128,8 +128,8 @@ one standing phase that stays `todo`; `/review:direct` writes it when absent.
 
 The Unit value names the unit everywhere: in the log, the dailies, the waits and every
 tool's arguments. A unit's session name is written nowhere, because the user may rename
-a session at any time. The unit's tmux session carries the production's slug and the
-unit's id as marks, set at launch. To reach a unit, look it up at that moment:
+a session at any time. The unit's herdr or tmux session carries the production's
+slug and the unit's id as marks, set at launch. To reach a unit, look it up at that moment:
 `$HOME/.claude/scripts/lib/py $HOME/.claude/scripts/production/unit_lookup.py pane <slug> <unit>`
 prints its pane, and `unit_lookup.py list <slug>` prints every unit's pane and its
 session name now. `<slug>` is this doc's file name without `-production.md`; a former
