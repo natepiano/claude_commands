@@ -14,8 +14,9 @@ from collections.abc import Iterable
 from concurrent.futures import Future, ThreadPoolExecutor, wait, FIRST_COMPLETED
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+from importlib import import_module
 from pathlib import Path
-from typing import TYPE_CHECKING, Literal, TypedDict, cast
+from typing import TYPE_CHECKING, Literal, Protocol, TypedDict, cast
 from uuid import uuid4
 
 SCRIPTS = Path(__file__).resolve().parents[1]
@@ -26,15 +27,16 @@ from account import Account
 import conversation_pause
 from inventory import Inventory, Session, inventory
 import record as store
-from record import NoRemoteControl, SessionShutdown, SessionStopIssue, TimerRestore, ShowrunnerFooter, NoFooter, ShutdownContinuation, ReadinessCheck
+from record import SessionShutdown, SessionStopIssue, TimerRestore, ShowrunnerFooter, NoFooter, ShutdownContinuation, ReadinessCheck
 from remote import other_machine, run_remote
 import showrunner_footer
 import sessions
 import showrunners
 import stop as stop_work
 from user_zone import user_zone
+from scripts.accounts.accounts import HAND_ORIGIN
 if TYPE_CHECKING:
-    from ..accounts import refusals
+    from ..accounts import refusals, accounts
     from ..notify import review
     from ..notify.push_texts import RenderedPush, render, user_send_argv
 else:
@@ -86,6 +88,10 @@ class InventoryNeeded:
 
 
 _INVENTORY_NEEDED = InventoryNeeded()
+
+
+class RequestFollower(Protocol):
+    def follow(self, login: str, request_id: str) -> int: ...
 
 
 def _limit_detail(window: str, reset: refusals.KnownReset | refusals.NoResetKnown) -> str:
@@ -507,11 +513,11 @@ def _held_by_usage_limit(screen: ScreenText | ScreenUnreadable) -> bool:
 
 
 def _usage_limit_shown(session: Session) -> bool:
-    from scripts.accounts.refusal_watch import session_refusal, TranscriptRefusal
+    from scripts.accounts.refusal_watch import session_refusal, TranscriptRefusal, ProofRefusal
     if session["status"] == "busy":
         return False
     try:
-        if isinstance(session_refusal(session["session_id"]), TranscriptRefusal):
+        if isinstance(session_refusal(session["session_id"]), (TranscriptRefusal, ProofRefusal)):
             return True
     except (OSError, ValueError):
         pass
@@ -635,7 +641,7 @@ def _settle_text(record: SessionShutdown, session: Session) -> str:
         ending = " and end your turn"
     return first_line + "\n\n" + (
         f"Stop now, without finishing the step you are in, and start nothing new. Leave uncommitted work in place, "
-        f"{started}, then run {command}{where}`{ending}. "
+        f"{started}, then in this terminal run {command}{where}`{ending}. "
         f"You will be resumed {'on ' + target + ' ' if target else ''}with that line and continue from it."
     )
 
@@ -657,8 +663,17 @@ def _progress_text(record: SessionShutdown) -> str:
         )
         progress += f" — {timers}"
     elif entry_progress["kind"] == "manual restart":
-        progress += f" — run: {entry_progress['command']}"
-    return progress
+        progress += f" — in a terminal on {record['machine']}: {entry_progress['command']}"
+    return located_detail(record, progress)
+
+
+def located_detail(record: SessionShutdown, detail: str) -> str:
+    """Keep commands inside stored progress readable with their execution place."""
+    if any(word in detail for word in ("/shutdown", "shutdown.py", "accounts.py", "github-warm")) and not any(
+        phrase in detail for phrase in ("in this terminal", "in a terminal on ", "in any Claude session on ")
+    ):
+        return f"in a terminal on {record['machine']}: {detail}"
+    return detail
 
 
 def status_record_lines(record: SessionShutdown, owner: stop_work.FreshSession | _StatusUnobserved = _STATUS_UNOBSERVED,
@@ -685,7 +700,7 @@ def status_record_lines(record: SessionShutdown, owner: stop_work.FreshSession |
     lines = [f"  {record['session']['name']}: {progress}{message}"]
     for step in record.get("trail", []):
         at = datetime.fromisoformat(step["at"]).astimezone(user_zone()).strftime("%H:%M:%S")
-        lines.append(f"    {at} {step['kind']} {step['detail']}".rstrip())
+        lines.append(f"    {at} {step['kind']} {located_detail(record, step['detail'])}".rstrip())
     lines.extend(f"    {stop_issue_text(issue)}" for issue in record["stop_issues"])
     return lines
 
@@ -698,7 +713,7 @@ def run_inventory(
 
 
 def _owned_workers(report: Inventory, session_id: str) -> list[Session]:
-    return [item for item in report["sessions"] if item["kind"] == "seat"
+    return [item for item in report["sessions"] if item["kind"] == "worker"
             and item["owner"]["kind"] == "director"
             and item["owner"]["session_id"] == session_id]
 
@@ -707,7 +722,7 @@ def begin(
     login: str, requested_by: str | None = None, only: Iterable[str] = (), *,
     then: ShutdownContinuation = "stop", alerts: Literal["user", "none"] = "user",
     request_id: str,
-    target: str = "", why: str = "",
+    target: str = "", why: str = "", move_id: str = "",
     report: Inventory | InventoryNeeded = _INVENTORY_NEEDED,
 ) -> list[SessionShutdown]:
     """Add independent owners, leaving every existing request intact."""
@@ -726,7 +741,7 @@ def begin(
         ))
     added: list[SessionShutdown] = []
     for session in report["sessions"]:
-        if session["kind"] == "seat":
+        if session["kind"] == "worker":
             continue
         state = prompt_state(PromptSubject(session["session_id"], login, Path(session.get("config_dir", str(Path.home() / ".claude")))), now_utc())
         progress: store.SessionProgress = (
@@ -737,10 +752,12 @@ def begin(
             login=login, label=report["label"], machine=report["machine"], requested_at=at,
             request_id=request_id, requested_by=origin, hold="session" if ids else "account",
             then=then, force="wait for ready", alerts=alerts, session=session,
-            seats=_owned_workers(report, session["session_id"]), timers=[],
+            workers=_owned_workers(report, session["session_id"]), timers=[],
             settle_message={"kind": "not sent"}, where={"kind": "not said"},
             progress=progress, trail=[], stop_issues=[],
         )
+        if move_id:
+            saved["move_id"] = move_id
         if target:
             saved["target"] = target
             saved["source_label"] = report["label"]
@@ -802,7 +819,7 @@ def _hold_details(owner: stop_work.FreshSession, progress: str, *, local_observa
         details.append("merge in progress")
     for server in session["codex_servers"]:
         details.extend(f"Codex worker {name} is still running" for name in server["busy_workers"])
-    details.extend(f"Codex worker {worker['name']} is still running" for worker in owner["seats"]
+    details.extend(f"Codex worker {worker['name']} is still running" for worker in owner["workers"]
                    if worker["status"] != "idle")
     return details
 
@@ -844,7 +861,7 @@ def next_step(saved: SessionShutdown, owner: stop_work.FreshSession,
             if saved["force"] == "now":
                 return StopSession()
             if progress in {"ready", "held by usage limit"} and owner["session"]["status"] == "idle" and all(
-                worker["status"] == "idle" for worker in owner["seats"]
+                worker["status"] == "idle" for worker in owner["workers"]
             ) and blocker(owner["session"])["kind"] == "clear" and (progress == "held by usage limit" or not _showing_form(owner["session"])):
                 return StopSession()
         if progress == "waiting" and not _is_requester(saved):
@@ -955,7 +972,7 @@ def unrecorded_local_sessions(login: str, ids: tuple[str, ...], records: list[Se
         return {}
     report = inventory(login, missing)
     return {owner["session_id"]: owner["name"] for owner in report["sessions"]
-            if owner["session_id"] in missing and owner["kind"] != "seat"}
+            if owner["session_id"] in missing and owner["kind"] != "worker"}
 
 
 def cancel(account: Account, here: bool = False, only: Iterable[str] = ()) -> int:
@@ -1002,8 +1019,8 @@ def cancel(account: Account, here: bool = False, only: Iterable[str] = ()) -> in
             retained = True
             name = outcome.record["session"]["name"]
             detail = _progress_text(outcome.record)
-            action = f"/shutdown restart --only {name}" if ids else "/shutdown restart"
-            print(f"{name} was not cancelled: {detail}; {action} brings it back")
+            action = shutdown_command("restart", account.login, "--here", "--only", outcome.record["session"]["session_id"])
+            print(f"{name} was not cancelled: {detail}; in a terminal on {outcome.record['machine']}: {action} brings it back")
         else:
             withdrawn_requests.append(outcome.record["request_id"])
             session = outcome.record["session"]
@@ -1011,7 +1028,8 @@ def cancel(account: Account, here: bool = False, only: Iterable[str] = ()) -> in
                 from scripts.accounts import moves
                 moves.append_move(moves.FailedMove(kind="failed", at=record_time(), tool="claude",
                     subject=session["session_id"] + ": " + session["name"],
-                    move_id=outcome.record["request_id"], reason="cancelled"))
+                    move_id=outcome.record.get("move_id", outcome.record["request_id"]),
+                    request_id=outcome.record["request_id"], reason="cancelled"))
             if outcome.record["progress"]["kind"] == "stop failed":
                 print(f"{outcome.record['session']['name']}: taken out, still running")
             elif ids:
@@ -1030,7 +1048,7 @@ def cancel(account: Account, here: bool = False, only: Iterable[str] = ()) -> in
         if output.strip():
             print(output.strip())
         if status not in {0, 1}:
-            print(f"{other_machine()}: not reached; run /shutdown there", file=sys.stderr)
+            print(f"{other_machine()}: not reached; in a terminal on {other_machine()}: {shutdown_command(*arguments)}", file=sys.stderr)
             return 1
         retained = retained or status == 1
     return 1 if retained else 0
@@ -1087,7 +1105,7 @@ def now(account: Account, here: bool = False, only: Iterable[str] = ()) -> int:
         if output.strip():
             print(output.strip())
         if status not in {0, 1}:
-            print(f"{other_machine()}: not reached; run /shutdown there", file=sys.stderr)
+            print(f"{other_machine()}: not reached; in a terminal on {other_machine()}: {shutdown_command(*arguments)}", file=sys.stderr)
             return 1
         refused = refused or status == 1
     return 1 if refused else 0
@@ -1096,7 +1114,7 @@ def now(account: Account, here: bool = False, only: Iterable[str] = ()) -> int:
 def _launch_conductor(login: str, label: str) -> None:
     slug = re.sub(r"[^a-z0-9]+", "-", label.casefold()).strip("-") or "account"
     service = f"shutdown-{slug}-{os.getpid()}"
-    command = [sys.executable, str(SHUTDOWN), "conduct", login]
+    command = ["env", "PYTHONUNBUFFERED=1", sys.executable, "-u", str(SHUTDOWN), "conduct", login]
     if os.environ.get("REFUSAL_WATCH_INVENTORY") == "read existing":
         # Service managers do not inherit the caller's environment automatically.
         command = ["env", "REFUSAL_WATCH_INVENTORY=read existing", *command]
@@ -1110,19 +1128,42 @@ def _launch_conductor(login: str, label: str) -> None:
 def down(account: Account, here: bool = False, only: Iterable[str] = (), *,
          then: ShutdownContinuation = "stop", alerts: Literal["user", "none"] = "user",
          requested_by: str | None = None, request_id: str = "", target: str = "", why: str = "",
-         report: Inventory | InventoryNeeded = _INVENTORY_NEEDED) -> int:
+         report: Inventory | InventoryNeeded = _INVENTORY_NEEDED,
+         origin: accounts.MoveOrigin = HAND_ORIGIN, move_id: str = "") -> int:
     """Start local work immediately and ask the peer to conduct its own owners."""
-    if not _warm():
-        print(f"GitHub keys are cold: run `github-warmup` in a terminal on {_machine()}, then `/shutdown` again", file=sys.stderr)
-        return 1
+    from scripts.accounts import accounts
+    origin_arguments = accounts.move_origin_arguments(origin)
     ids = tuple(only)
-    origin = requested_by or os.environ.get("CLAUDE_CODE_SESSION_ID", "")
+    if not _warm():
+        retry = ["down", account.login]
+        if here:
+            retry.append("--here")
+        if ids:
+            retry.extend(("--only", ",".join(ids)))
+        if then == "restart":
+            retry.append("--restart")
+        if target:
+            retry.extend(("--to", target, "--why", why, *origin_arguments))
+            if move_id:
+                retry.extend(("--move-id", move_id))
+        if alerts == "none":
+            retry.append("--no-alert")
+        print(f"GitHub keys are cold; in a terminal on {_machine()}: github-warm-status; github-warmup. Then in a terminal on {_machine()}: {shutdown_command(*retry)}", file=sys.stderr)
+        return 1
+    request_origin = requested_by or os.environ.get("CLAUDE_CODE_SESSION_ID", "")
     identity = request_id or str(uuid4())
     if isinstance(report, InventoryNeeded):
         report = run_inventory(account.login, ids)
     local_ids: set[str] = ({saved["session"]["session_id"] for saved in store.session_records(account.login)}
                  | {session["session_id"] for session in report["sessions"]}) if ids else set()
-    added = begin(account.login, origin, ids, then=then, alerts=alerts, request_id=identity, target=target, why=why, report=report)
+    added = begin(account.login, request_origin, ids, then=then, alerts=alerts, request_id=identity, target=target, why=why, move_id=move_id, report=report)
+    # Snapshot the selected requests before the conductor can archive them.
+    selected = {session["session_id"] for session in report["sessions"] if session["kind"] != "worker"}
+    selected.update(ids)
+    requests: dict[str, list[SessionShutdown]] = {}
+    for saved in store.session_records(account.login):
+        if saved["session"]["session_id"] in selected:
+            requests.setdefault(saved["request_id"], []).append(saved)
     try:
         _launch_conductor(account.login, account.label)
     except (OSError, RuntimeError, subprocess.SubprocessError):
@@ -1131,38 +1172,53 @@ def down(account: Account, here: bool = False, only: Iterable[str] = (), *,
                 _ = store.withdraw_session(account.login, saved["session"]["session_id"], _restore_record)
         raise
     if target:
-        from scripts.accounts import moves, refusals
+        from scripts.accounts import moves
         for saved in added:
             session = saved["session"]
             request: moves.RequestedMove = {"kind": "requested", "at": saved["requested_at"],
                 "tool": "claude", "subject": session["session_id"] + ": " + session["name"],
-                "move_id": saved["request_id"], "from": saved.get("source_label", account.label),
+                "move_id": saved.get("move_id", saved["request_id"]), "request_id": saved["request_id"], "from": saved.get("source_label", account.label),
                 "to": target, "why": saved.get("why", why), "window": "unknown"}
-            refusal = refusals.load().get(refusals.key("claude", account.login))
-            if refusal is not None:
-                request["window"] = refusal.window.name if isinstance(refusal.window, refusals.KnownWindow) else "unknown"
-                if isinstance(refusal.reset, refusals.KnownReset):
-                    request["reset"] = refusal.reset.at.isoformat()
+            fields = accounts.move_origin_fields(origin)
+            request["cause"], request["window"] = fields["cause"], fields["window"]
+            if "reset" in fields:
+                request["reset"] = fields["reset"]
             moves.append_move(request)
     peer_ids = [session_id for session_id in ids if session_id not in local_ids]
     if not here and (not ids or peer_ids):
         arguments = ["down", account.login, "--here", "--request-id", identity]
-        if origin:
-            arguments.extend(("--requested-by", origin))
+        if request_origin:
+            arguments.extend(("--requested-by", request_origin))
         if ids:
             arguments.extend(("--only", ",".join(peer_ids)))
         if then == "restart":
             arguments.append("--restart")
         if target:
-            arguments.extend(("--to", target, "--why", why or f"{account.label} is out of usage"))
+            arguments.extend(("--to", target, "--why", why or f"{account.label} is out of usage", *origin_arguments))
+            if move_id:
+                arguments.extend(("--move-id", move_id))
         if alerts == "none":
             arguments.append("--no-alert")
         status, output = run_remote(arguments)
         if status != 0:
-            print(f"{other_machine()}: not reached; run /shutdown there", file=sys.stderr)
+            print(f"{other_machine()}: not reached; in a terminal on {other_machine()}: {shutdown_command(*arguments)}", file=sys.stderr)
         elif output.strip():
             print(output.strip())
-    print(f"shutdown of {account.label} started; /shutdown status to watch, /shutdown cancel to undo")
+    if not request_origin and sys.stdout.isatty() and requests:
+        follower = cast(RequestFollower, cast(object, import_module("shutdown")))
+        for active_request in requests:
+            result = follower.follow(account.login, active_request)
+            if result != 0:
+                return result
+        return 0
+    for active_request, records in requests.items():
+        follow_command = shutdown_command("follow", account.login, "--request", active_request)
+        selected_ids = ",".join(saved["session"]["session_id"] for saved in records)
+        cancel_command = shutdown_command("cancel", account.login, "--here", "--only", selected_ids)
+        action = "stop the move of the ones not yet stopped" if any(saved.get("target") for saved in records) else "stop the ones not yet stopped"
+        print(f"shutdown of {account.label} started for {len(records)} sessions. To follow it, in a terminal on {report['machine']}: {follow_command}. To {action}, in a terminal on {report['machine']}: {cancel_command}.")
+    if not requests:
+        print(f"shutdown of {account.label}: no local sessions selected")
     return 0
 
 def _stop_retry_pending(saved: SessionShutdown) -> bool:
@@ -1222,21 +1278,23 @@ def report_stop(records: list[SessionShutdown]) -> None:
         if progress["kind"] == "stop failed" or progress["kind"] == "restart failed":
             lines.append(f"  {saved['session']['name']}: {progress['reason']}")
         elif progress["kind"] == "manual restart":
-            lines.append(f"  {saved['session']['name']}: run {progress['command']}")
+            lines.append(f"  {saved['session']['name']}: in a terminal on {saved['machine']}: {progress['command']}")
     failed = [saved for saved in records if store.stop_incomplete(saved)]
     restore_failed = [saved for saved in records if saved["progress"]["kind"] in {"restart failed", "manual restart", "timers pending"}]
     if failed:
         summary = f"{first['label']}: stop partial"
-        lines.append("/shutdown now retries the failed stop")
+        for saved in failed:
+            lines.append(f"in a terminal on {saved['machine']}: " + shutdown_command("now", saved["login"], "--here", "--only", saved["session"]["session_id"]))
     elif restore_failed:
         summary = f"{first['label']} is not fully back"
-        lines.append(shutdown_command("restart", first["label"]))
+        for saved in restore_failed:
+            lines.append(f"in a terminal on {saved['machine']}: " + shutdown_command("restart", saved["login"], "--here", "--only", saved["session"]["session_id"]))
     elif all(saved["progress"]["kind"] == "restarted" for saved in records):
         summary = f"{first['label']} is back"
     else:
         summary = f"{first['label']} is down"
-        lines.append(f"/shutdown restart in any Claude session on {first['label']}, or in a terminal "
-                     + shutdown_command("restart", first["label"]))
+        for saved in records:
+            lines.append(f"in a terminal on {saved['machine']}: " + shutdown_command("restart", saved["login"], "--here", "--only", saved["session"]["session_id"]))
     tell_showrunners_outcome([saved for saved in records if saved["machine"] == local_machine()])
     text = "\n".join(lines)
     origins = {saved["requested_by"]["session_id"] for saved in records if saved["requested_by"]["kind"] == "session"}
@@ -1340,7 +1398,8 @@ def tell_showrunners_outcome(records: list[SessionShutdown]) -> None:
             told = _not_back_text(saved)
             reason = progress["reason"] if progress["kind"] == "restart failed" else "it needs a manual restart"
             summary = f"{name} did not come back: {reason}"
-            text = f"{summary}. The user is told; {shutdown_command('restart', saved['label'])} retries it."
+            command = shutdown_command("restart", saved["login"], "--here", "--only", saved["session"]["session_id"])
+            text = f"{summary}. The user is told; in a terminal on {saved['machine']}: {command} retries it."
         else:
             continue
         if saved.get("showrunner_told") == told:
@@ -1371,7 +1430,6 @@ class PendingSessionAction:
 @dataclass(frozen=True)
 class ConfirmedRelaunchPass:
     records: list[SessionShutdown]
-    no_remote_control: tuple[NoRemoteControl, ...]
 
 
 @dataclass(frozen=True)
@@ -1399,40 +1457,25 @@ def _confirm_relaunch_pass(records: list[SessionShutdown]) -> ConfirmedRelaunchP
     confirmed_ids = {saved["session"]["session_id"] for saved in confirmed}
     control_records = restart_work.RegistryConfirmation(tuple(
         item for item in confirmation.records if item["sessionId"] in confirmed_ids))
-    missing = restart_work.remote_control_missing(confirmed, control_records)
-    return ConfirmedRelaunchPass(records, missing)
+    _ = restart_work.remote_control_missing(confirmed, control_records)
+    return ConfirmedRelaunchPass(records)
 
 
-def _remote_control_alert(records: list[SessionShutdown], missing: tuple[NoRemoteControl, ...]) -> None:
-    due = [item for item in missing if item["alerts"] == "user"]
-    if not due:
-        return
-    for item in due:
-        alert_user(render("shutdown.remote_control", session=item["name"], machine=records[0]["machine"]),
-                   machine="natedev" if local_machine().casefold() == "mac" else "")
-
-
-def _shows_form(reason: str) -> bool:
-    return SHOWING_FORM in reason.split(", ")
-
-
-def _holdout_due(saved: SessionShutdown, at: datetime, *, form: bool = False) -> bool:
-    """A holdout is told once to its requester, and pushed once more only when a form opens in its pane."""
+def _holdout_due(saved: SessionShutdown, at: datetime) -> bool:
+    """Alert once for an unanswered pause, whether or not its pane is readable."""
     message = saved["settle_message"]
     since = message["at"] if message["kind"] == "sent" else saved["requested_at"]
     return (saved["alerts"] == "user" and at - datetime.fromisoformat(since) >= NOT_ANSWERING_AFTER
-        and ("alerted_at" not in saved or (form and "form_alerted_at" not in saved)))
+        and saved["progress"]["kind"] == "waiting" and "alerted_at" not in saved)
 
 
-def _reserve_holdout_alert(saved: SessionShutdown, at: datetime, *, form: bool = False) -> bool:
+def _reserve_holdout_alert(saved: SessionShutdown, at: datetime) -> bool:
     accepted = False
     def mark(current: SessionShutdown) -> None:
         nonlocal accepted
-        if (current["request_id"] == saved["request_id"] and current["progress"]["kind"] in {"waiting", "ready"}
-            and _holdout_due(current, at, form=form)):
+        if (current["request_id"] == saved["request_id"]
+            and _holdout_due(current, at)):
             current["alerted_at"] = record_time()
-            if form:
-                current["form_alerted_at"] = current["alerted_at"]
             accepted = True
     try:
         _ = store.update_session(saved["login"], saved["session"]["session_id"], mark)
@@ -1441,26 +1484,52 @@ def _reserve_holdout_alert(saved: SessionShutdown, at: datetime, *, form: bool =
     return accepted
 
 
+def _holdout_host(saved: SessionShutdown) -> str:
+    host = saved["session"]["host"]
+    if host["kind"] == "tmux":
+        pane = host["pane"]
+        return f"tmux {host['tmux_session']}" + (f" pane {pane['pane_id']}" if pane["kind"] == "pane" else " pane")
+    if host["kind"] == "unit":
+        return f"unit {host['production']}/{host['unit']}"
+    if host["kind"] == "ghostty" or host["kind"] == "zed":
+        desktop = host["desktop"]
+        window = "Ghostty window" if host["kind"] == "ghostty" else "Zed window"
+        return window + (f", {desktop['name']} desktop" if desktop["kind"] == "named" else "")
+    return f"{host['kind']} window for {saved['session']['name']}"
+
+
+def holdout_line(saved: SessionShutdown) -> str:
+    message = saved["settle_message"]
+    since = message["at"] if message["kind"] == "sent" else saved["requested_at"]
+    minutes = max(0, int((now_utc() - datetime.fromisoformat(since)).total_seconds() // 60))
+    command = shutdown_command("now", saved["login"], "--here", "--only", saved["session"]["session_id"])
+    request = "restart" if saved["then"] == "restart" else "shutdown"
+    after_stop = "the restart brings it back." if saved["then"] == "restart" else "it stays stopped until restarted."
+    return (f"{saved['session']['name']} has not answered the pause for {minutes} minutes "
+            f"in {_holdout_host(saved)}. A {saved['label']} {request} asked it to pause at a safe point and say ready. "
+            f"Do nothing: the {request} keeps waiting. Stop now (recommended): ends Claude mid-step so the {request} goes on. "
+            f"Uncommitted work stays; {after_stop} "
+            f"To stop it now, in a terminal on {saved['machine']}: {command}")
+
+
 def _send_holdout_alert(held: list[tuple[SessionShutdown, str]]) -> None:
-    """Tell the requester about every holdout; push to the phone only a form the user must answer."""
-    summaries = [f"{saved['session']['name']} is not answering the shutdown of {saved['label']}" for saved, _ in held]
-    lines: list[str] = []
-    for saved, reason in held:
-        name = saved["session"]["name"]
-        action = f"/shutdown cancel --only {name} (take it out; it carries on), /shutdown now --only {name} (stop it anyway)"
-        lines.append(f"{saved['machine']} {name}: {reason}; {action}")
-    text = "\n".join(lines)
-    summary = "; ".join(summaries)
-    due = [(saved, reason) for saved, reason in held if _shows_form(reason)]
-    if not due:
-        _tell_holdout_requesters(held, summary, text)
+    """Push every unanswered pause and tell its requester where to act."""
+    held = [(saved, reason) for saved, reason in held if saved["progress"]["kind"] == "waiting"]
+    if not held:
         return
+    summary = "; ".join(f"{'Restart' if saved['then'] == 'restart' else 'Shutdown'} stuck waiting on {saved['session']['name']} session" for saved, _ in held)
+    text = "\n".join(holdout_line(saved) for saved, _ in held)
     try:
-        for saved, _ in due:
-            host = saved["session"]["host"]
-            window = (host["tmux_session"] if host["kind"] == "tmux" else
-                      host["session_name"] if host["kind"] == "unit" else saved["session"]["name"])
-            alert_user(render("shutdown.form", session=window, machine=saved["machine"]),
+        for saved, _ in held:
+            message = saved["settle_message"]
+            since = message["at"] if message["kind"] == "sent" else saved["requested_at"]
+            elapsed = f"{max(0, int((now_utc() - datetime.fromisoformat(since)).total_seconds() // 60))} minutes"
+            command = shutdown_command("now", saved["login"], "--here", "--only", saved["session"]["session_id"])
+            after_stop = "the restart brings it back." if saved["then"] == "restart" else "it stays stopped until restarted."
+            alert_user(render("shutdown.holdout", session=saved["session"]["name"], machine=saved["machine"],
+                              elapsed=elapsed, command=command, after_stop=after_stop,
+                              operation="Restart" if saved["then"] == "restart" else "Shutdown",
+                              request="restart" if saved["then"] == "restart" else "shutdown"),
                        machine="natedev" if local_machine().casefold() == "mac" else "")
     finally:
         _tell_holdout_requesters(held, summary, text)
@@ -1596,8 +1665,6 @@ def _conduct_owned(login: str, archived: dict[str, SessionShutdown]) -> None:
                         for saved in batch.records:
                             _action_failed(saved, error, stopping=False)
                         continue
-                    if completed.no_remote_control:
-                        sends.append(notifications.submit(_remote_control_alert, completed.records, completed.no_remote_control))
                     for saved in completed.records:
                         found = store.lookup_session(login, saved["session"]["session_id"])
                         if isinstance(found, store.ShutdownFound) and found.record["progress"]["kind"] == "restarted":
@@ -1647,11 +1714,9 @@ def _conduct_owned(login: str, archived: dict[str, SessionShutdown]) -> None:
                                 continue
                             saved = updated
                         step = next_step(saved, owner, records, now_utc())
-                        if (due and saved["progress"]["kind"] in {"waiting", "ready"}
-                            and (saved["progress"]["kind"] == "waiting" or isinstance(step, Hold))
-                            and _holdout_due(saved, now_utc(), form=True)):
+                        if due and _holdout_due(saved, now_utc()):
                             reason = hold_reason(saved, owner)
-                            if _reserve_holdout_alert(saved, now_utc(), form=_shows_form(reason)):
+                            if _reserve_holdout_alert(saved, now_utc()):
                                 holdouts.append((saved, reason))
                         if (session_id, type(step)) in attempted:
                             continue

@@ -2,13 +2,13 @@
 
 ## Which account am I on?
 
-The status line's second row shows this session's account label. To print it:
+The status line's first row shows this session's account label, after its role. To print it:
 
 ```sh
 ~/.claude/scripts/lib/py ~/.claude/scripts/whoami/account.py
 ```
 
-`/whoami` shows Claude accounts in use used by the default login or local live sessions, omitting unused Claude accounts. It also shows every Codex home; with multiple homes, the home in use is marked `(seats)`. It does not identify this session's account.
+`/whoami` shows Claude accounts in use used by the login in `~/.claude` or local live sessions, omitting unused Claude accounts. It also shows every Codex home; with multiple homes, the home in use is marked `(workers)`. It does not identify this session's account.
 
 ## Every account in one table
 
@@ -22,13 +22,13 @@ The status line's second row shows this session's account label. To print it:
 | --- | --- |
 | Label | The account's label. A named Claude folder keeps its own label; a Codex home shows the label of its login's note. |
 | Login | The login, `not logged in`, or `not set up` for an account that has a note and is in no folder. |
-| Role | `units` and/or `showrunners` for the selected Claude groups; `seats` for the Codex home in use, `spare` for the other Codex homes. |
-| 5-hour left, Weekly left | Percent of each window left, each with its reset time. A dash when the account has no such window. |
+| Role | `units` and/or `showrunners` for the selected Claude groups; `workers` for the Codex home in use, `spare` for the other Codex homes. |
+| Weekly left | Percent of the weekly window left, with its reset time. A dash when the account has no weekly window. |
 | On credits | Codex only: `yes` when a window is used up and the account's credits now pay for the work. |
 | Credits left | Codex only: the credit balance, or `unlimited`. |
 | Read | When those numbers were read. |
 
-Each Codex account can stay signed in in its own home. The table's `seats` role follows `seats` in `~/.claude/config/accounts.json`, defaulting to `~/.codex`. A caller's `CODEX_HOME` does not change the `seats` role. Signed-in spares get usage readings too; their notes stay inactive and raise no quota alerts. Freestanding Codex sessions keep their own process home.
+Each Codex account can stay signed in in its own home. The table's `workers` role follows `workers` in `~/.claude/config/accounts.json`, defaulting to `~/.codex`. A caller's `CODEX_HOME` does not change the `workers` role. Signed-in spares get usage readings too; their notes stay inactive and raise no quota alerts. Freestanding Codex sessions keep their own process home.
 
 Times are in the user's zone setting (`config/user_zone.conf`). The numbers are each account's last good reading: the usage service refuses many reads, so the two-minute updater saves each one it gets, and an account with none in the last 10 minutes is read once more. `unavailable` means no reading is held for a window that is still open. Lines under the table name anything wrong or unusual in a folder: a failed check, unclassified entries, MCP servers that differ from `~/.claude`.
 
@@ -38,27 +38,27 @@ Run these in a terminal:
 
 | Command | Account |
 | --- | --- |
-| `claude` | Default (`~/.claude`). |
+| `claude` | `~/.claude` (today claudeN, the number of its login’s note). |
 | `claude-unit` | The configured units account. |
-| `claude1` | claude 1 |
-| `claude2` | claude 2 |
-| `claude3` | claude 3 |
+| `claude1` | claude1 |
+| `claude2` | claude2 |
+| `claude3` | claude3 |
 
 These aliases come from natedev's shell configuration after a rebuild; the Mac has none. In a shell without them, run:
 
 ```sh
-~/.claude/scripts/lib/py ~/.claude/scripts/accounts/accounts.py exec 'claude 3'
+~/.claude/scripts/lib/py ~/.claude/scripts/accounts/accounts.py exec claude3
 ~/.claude/scripts/lib/py ~/.claude/scripts/accounts/accounts.py exec unit
 ```
 
 Arguments after the label pass through to `claude`.
 
-Configuration decides the account every launch starts on: new, standby and resumed units and nightly reviews use the units account; new and resumed showrunners use the showrunners account. Set a group with `accounts.py move units|showrunners "claude N"`. An unconfigured group refuses with that command; an `--account` or `--config-dir` override must name its configured account. Each unit launch saves its config directory and model on tmux for observation; that directory no longer chooses a resume account. A named alias whose login matches the default runs on `~/.claude`, with `CLAUDE_CONFIG_DIR` and `CLAUDE_CODE_REMOTE_MEMORY_DIR` removed. `exec default` starts plain `claude`, removing those variables and any inherited OAuth token.
+Configuration decides the account every launch starts on: new, standby and resumed units and nightly reviews use the units account; new and resumed showrunners use the showrunners account. Set a group with `accounts.py move units|showrunners claudeN`. An unconfigured group refuses with that command; an `--account` or `--config-dir` override must name its configured account. Each unit launch saves its config directory and model on tmux for observation; that directory no longer chooses a resume account. A numbered selection whose login matches `~/.claude` runs there, with `CLAUDE_CONFIG_DIR` and `CLAUDE_CODE_REMOTE_MEMORY_DIR` removed. The same launch removes any inherited OAuth token. Commands accept account numbers only; `default` refuses and reports each home’s current number.
 
 A missing directory refuses without starting Claude, for example:
 
 ```text
-accounts: ~/.claude3 is not set up; /showrunner:accounts setup "claude 3" first
+accounts: ~/.claude3 is not set up; /showrunner:accounts setup claude3 first
 ```
 
 Broken shared links or unreadable identity files also refuse. A directory that is set up but logged out can start so you can log in.
@@ -80,7 +80,7 @@ Each directory holds one login. `/login` or `/logout` inside a session changes i
 
 To switch `~/.claude`'s account, start `claude`, then run `/login`, as today. Do not do this in a `claude-unit` or `claudeN` session.
 
-To renew or fix a named account, start its alias, then `/login` as that account. For claude 3:
+To renew or fix a named account, start its alias, then `/login` as that account. For claude3:
 
 ```sh
 claude3
@@ -93,10 +93,10 @@ claude3
 If the directory holds another login, the alias refuses with:
 
 ```text
-accounts: ~/.claude3 is logged in as <login>, not claude 3; see Log out and in in ~/.claude/docs/accounts.md
+accounts: ~/.claude3 is logged in as <login>, not claude3; see Log out and in in ~/.claude/docs/accounts.md
 ```
 
-Start that directory directly, then log out and log in as claude 3. `env -u` drops an inherited `CLAUDE_CODE_OAUTH_TOKEN`, which would otherwise override the directory's login:
+Start that directory directly, then log out and log in as claude3. `env -u` drops an inherited `CLAUDE_CODE_OAUTH_TOKEN`, which would otherwise override the directory's login:
 
 ```sh
 env -u CLAUDE_CODE_OAUTH_TOKEN CLAUDE_CONFIG_DIR=~/.claude3 claude
@@ -111,33 +111,51 @@ Never `/logout` in a unit director's session: every unit on that account stops w
 
 ## Move a session
 
-Move a showrunner, unit director or top-level session from the machine where it runs:
+In this terminal:
 
-```text
-/showrunner:accounts move <session-id-or-exact-name> "claude 3"
-/showrunner:accounts move <session-id-or-exact-name> default
+```sh
+~/.claude/scripts/lib/py ~/.claude/scripts/accounts/accounts.py move <session-id-or-exact-name> <target> [--dry-run] [--why "<text>"]
+~/.claude/scripts/lib/py ~/.claude/scripts/accounts/accounts.py move units|showrunners <target> [--dry-run] [--why "<text>"]
 ```
 
-In a terminal, use `~/.claude/scripts/lib/py ~/.claude/scripts/accounts/accounts.py move <session-id-or-exact-name> 'claude 3'`. A session can move itself. The request names its requester and stops through the normal shutdown readiness checks. It keeps its conversation, name, model and Remote Control name. SendMessage and `send.py` still reach it; Remote Control registers on the target account and leaves the old account's phone app.
+The first form moves one local ungrouped session, found by id, else by exact name. The second selects the group's account for future launches and moves every live member not already on it. An empty group still selects its account (`<group>: no live session moves`); an open shutdown receives no duplicate request. A session can request its own move, then mark ready and end its turn.
 
-Before changing anything, move refuses when:
+### Preview
 
-- No live session has that id or exact name here; move a session on the other machine from there.
-- Two live sessions share the name; their ids are listed so you can select one.
-- The session is a worker: `seats move with their unit director`.
-- The target fails `check`; its first problem is printed.
-- Its login is already the target: `<name> is already on <label>`.
-- A target label names the default login, or its directory holds that login: `<label> is the default account; use default`.
-- That session has an open shutdown: `<name> already has a shutdown in progress`. An unrelated session's shutdown does not refuse.
-- The current account or shutdown state cannot be read safely.
+`--dry-run` writes nothing, for a group or a single session. Selection reads shutdown's lightweight listing (`ListedSession`), without worktrees, restart resources or desktop inventory; each member's line reads only its newest transcript exchange and the stored usage reading. A warm preview takes about 0.3 to 0.4 s on natedev. A group preview first prints `<group>: would select <target>`, then one line per member:
 
-Move runs `shutdown.py down '<current note label>' --here --only <id> --restart --to '<target>'`. A tmux session respawns its pane; a unit resumes through `add_unit.py --resume --account '<target>'`; Ghostty, Zed and Terminal reopen a window. Use `--why "<text>"` to explain the move; the default is `<old label> is out of usage`. Every resume says it was an account move, not a stop, and continues where it stopped; a unit director continues its `/unit:direct` run. An unknown host prints exactly one resume command with `run this once <name> has exited` before starting shutdown. Run it after exit; restart reports the same command as `manual restart <name>: <line>`.
+```text
+<name>: <session id> · pause, then move (<source> has room)
+<name>: <session id> · reap and restart now (<source> out of usage: weekly limit, resets Sat 9:00 AM)
+```
 
-The target is checked again at launch. A moved launch uses `accounts.py exec '<target>'`, which drops inherited OAuth tokens. Moving changes no login or credentials and leaves other sessions in place. Grouped sessions move with their group; ad hoc sessions can move alone.
+A source with no fresh reading prints `pause, then move (<source> no fresh reading)`. A paused member is asked to stop at a safe point and mark ready; a member whose transcript ends in a refusal, or whose source account has a fresh reading at 0%, is reaped and restarted at once with no pause message. Process identity checks still precede every signal. Showrunner previews read the update timers once in-process, sharing that snapshot with the registration check without resolving messaging sockets, and name each production whose timer's target session is absent, with the full repair command to run inside that showrunner's own session.
 
-Move a whole group with `/showrunner:accounts move units "claude 3"` or `move showrunners "claude 3"`. The terminal command is `accounts.py move units|showrunners '<target>' [--dry-run] [--why '<text>']`. It checks the target, selects it for new launches, and requests each live member still off that account. An open shutdown record receives no second request; the notes timer completes remaining members on later ticks. Moving one grouped session refuses and names the group command. A dry run prints `<group>: would select <target>` and each off-target live name and session id, or `<group>: no live session moves`; it changes nothing. An empty group still selects its account for future launches. Showrunner moves and previews name productions whose update timer points at no live session and give the registration command.
+### Target check and refusals
 
-Group requests use shutdown’s pause-for-move path: each member receives `Pause for move`, writes its checkpoint with `shutdown.py ready --where`, and its unit showrunner is told before it stops. Shutdown’s existing exceptions apply: an idle owner held by a usage limit can stop without a mark; the requester sends its own ready mark. The restart prompt carries the checkpoint. Each returns to its own conversation, cwd, name, model and production resume prompt. Tmux respawns its existing pane and keeps the attached desktop window. For a direct Ghostty showrunner, shutdown closes its window as usual and restart opens a replacement on the recorded desktop. The batch command also accepts `--why "<text>"`; each resume carries the same account-move explanation.
+Before any group change or shutdown write, the target must pass its home and sign-in checks. A fresh reading with no credits and a window at 0 refuses:
+
+```text
+accounts: <target> is out of usage (weekly 0% left, resets Sat 8:59 AM); pick another: ~/.claude/scripts/lib/py ~/.claude/scripts/accounts/accounts.py pick claude --exclude <target> in this terminal
+```
+
+A stale or missing reading permits the move and prints `no fresh usage reading for <target> (last <n> minutes ago)`. A missing or ambiguous local session, a worker, a grouped session (the refusal names `accounts.py move <group> <target>`), a session already on the target, and an unreadable account or shutdown state also refuse. A session on the other machine moves from there. Workers move with their unit director.
+
+### Following the move
+
+The move hands the selected ids to one `shutdown.py down --only` per source login, then prints the move-back line:
+
+```text
+to move them back, in this terminal: ~/.claude/scripts/lib/py ~/.claude/scripts/accounts/accounts.py move <subject> <account>
+```
+
+A group's line names the account it held before the move; with none stored, it names the common source of the moved members, and mixed sources print no line. A single move names that session and its source account.
+
+Run from a terminal (`CLAUDE_CODE_SESSION_ID` unset, stdout a tty), the move then follows each request in turn, printing `<HH:MM:SS> <name>: <kind> <detail>` for every step (`reaping`, `waiting`, `ready`, `stopped`, `restarted`). It ends on `all N back on <target>`; a summary containing `taken out` counts cancelled members as done. A needs-user line gives the next command and where to run it; following continues through the remaining source requests and exits 1 if any needs help. Ctrl-C detaches with a follow command while the shutdown continues (exit 130). Run from a Claude session or with redirected output, the move prints the follow and cancel commands instead. The showrunner wrapper (`/showrunner:move`) keeps the missing-reading notice and the move-back line beside its process proof.
+
+Each return keeps the conversation, cwd, name, model and production resume prompt, including a unit director's ongoing run. A manual restart outcome supplies its command and place. The target is checked again at launch; its prepared environment drops inherited OAuth tokens without changing credentials or other sessions.
+
+Numbered Claude aliases through `accounts.py exec` use the terminal supervisor when stdin is a tty. Its child gets `RELAUNCH_SUPERVISED=1`; a resumed `accounts.py exec` sees that marker and execs Claude directly. Redirected and already supervised launches also exec Claude directly. Tmux respawns its existing pane. Supervised Ghostty and Terminal restarts keep the same window and scroll history; the existing fallback opens a new window if the supervisor is gone or its identity changed. Legacy Ghostty and Zed windows use the recorded desktop restart path.
 
 ## Picking an account
 
@@ -151,22 +169,33 @@ Claude accounts have room until they have an unresolved provider refusal. Low an
 
 New units and showrunners save `@claude_config_dir` and `@claude_model` on tmux. A resume uses its group's configured account, and accepts `--account` or `--config-dir` only when it names that account. Promoting a unit uses the configured showrunners account; recovery as a unit uses the configured units account.
 
-## Setting up a new directory
+## Adding an account
 
-For claude 3, run inside a session:
+One command adds an account and checks every place that names accounts:
 
 ```text
-/showrunner:accounts setup "claude 3"
+/new_account claude claude4
+/new_account codex codex3 <login>
 ```
 
-Then start `claude3` in a terminal, run `/login` as claude 3, and check `/showrunner:accounts`. Setup links shared content to `~/.claude`; it reports existing real files or directories rather than replacing them. Login stays separate for each directory.
+Each step prints `done:` or `for you:`: the login, and the lines it cannot write itself (`~/.claude/settings.json`, the nixos shell aliases). Run it again after those; the run after a Claude login writes the account note from that login. Everything else finds accounts by their `~/.claudeN` or `~/.codexN` folder and their note.
+
+## Setting up a new directory
+
+For claude3, run inside a session:
+
+```text
+/showrunner:accounts setup claude3
+```
+
+Then start `claude3` in a terminal, run `/login` as claude3, and check `/showrunner:accounts`. Setup links shared content to `~/.claude`; it reports existing real files or directories rather than replacing them. Login stays separate for each directory.
 
 ## Setting up a Codex home
 
-Create an account note with its login first (`~/rust/hanadocs/agents/codex N.md`). For codex 1:
+Create an account note with its login first (`~/rust/hanadocs/agents/codexN.md`). For codex1:
 
 ```text
-/showrunner:accounts setup "codex 1"
+/showrunner:accounts setup codex1
 ```
 
 Setup creates `~/.codex1` with mode 0700 and links existing shared entries to `~/.codex`: configuration, hooks, instructions, skills, rules, plugins, sessions, archived sessions, the session index, history and the model cache. It reports real files or directories that prevent a link. Sign-in and Codex's home state stay separate; setup never links or copies `auth.json`.
@@ -175,37 +204,37 @@ Setup refuses without changing files or printing a sign-in command when another 
 
 Before printing the command, setup waits for Codex to finish indexing the shared sessions and answer its startup request. An interrupted first start can block later starts for 15 minutes, followed by the remaining index work; setup retries servers that exit unanswered and waits up to 20 minutes. If the limit is reached, rerun setup. A table row saying Codex did not start names the same repair command.
 
-Run the printed command in a terminal and sign in as codex 1:
+Run the printed command in a terminal and sign in as codex1:
 
 ```sh
 CODEX_HOME=~/.codex1 codex login
 ```
 
-Keep `CODEX_HOME` on that command. Without it, `codex login` signs `~/.codex` out and in, leaving its workers unable to work until login finishes; workers use that default home unless their role names another.
+Keep `CODEX_HOME` on that command. Without it, `codex login` signs `~/.codex` out and in, leaving its workers unable to work until login finishes; workers use that home unless their role names another.
 
-Then run `/showrunner:accounts`. The new home's row shows `spare` and its own numbers until selected for workers. To check the home directly, use `/showrunner:accounts check "codex 1"`. Problems under the table name missing, broken or replaced shared links, unclassified entries, the wrong login, or a login held by another home. Keep each login in one home: two homes on one login break token refresh.
+Then run `/showrunner:accounts`. The new home's row shows `spare` and its own numbers until selected for workers. To check the home directly, use `/showrunner:accounts check codex1`. Problems under the table name missing, broken or replaced shared links, unclassified entries, the wrong login, or a login held by another home. Keep each login in one home: two homes on one login break token refresh.
 
-The repository's hook installer keeps a linked `hooks.json` and adds missing hooks to its target, so numbered homes continue to share the default home's hooks.
+The repository's hook installer keeps a linked `hooks.json` and adds missing hooks to its target, so numbered homes continue to share `~/.codex`'s hooks.
 
 ## Swapping the Codex workers account
 
-One account serves every unit's Codex workers, including the `codex exec` fallback. The updater, 5-hour watcher, `/whoami` and account table follow that role. Read it with `/showrunner:accounts role seats`.
+One account serves every unit's Codex workers, including the `codex exec` fallback. The updater, 5-hour watcher, `/whoami` and account table follow that role. Read it with `/showrunner:accounts role workers`.
 
 ```text
-/showrunner:accounts swap seats "codex 1" --dry-run
-/showrunner:accounts swap seats "codex 1"
-/showrunner:accounts swap seats default
+/showrunner:accounts swap workers codex1 --dry-run
+/showrunner:accounts swap workers codex1
+/showrunner:accounts swap workers codex2
 ```
 
 A swap checks the target home, its sign-in, both usage windows and its credits before changing the role. It retires each run's current server and tells each affected unit director once. A working worker finishes its turn on the outgoing home; its next turn runs under the new one. Held messages move with it. The move confirms that the old server released the thread before the new server resumes it. If Codex refuses that resume, the worker starts a new thread and its board line names the replacement. An unreadable thread state or unconfirmed release starts no replacement turn.
 
-`--dry-run` prints the target account, its home and the runs that would move, with no role or history write. `set-role seats "codex N"` (or `default`) selects future turns directly, without the swap's usage check or notices. Each role write keeps the other role; `unit` and `seats` history share `~/.local/state/accounts/roles.jsonl`.
+`--dry-run` prints the target account, its home and the runs that would move, with no role or history write. `set-role workers codexN` selects future turns directly, without the swap's usage check or notices. Each role write keeps the other role; `unit` and `workers` history share `~/.local/state/accounts/roles.jsonl`.
 
-Refusals leave both the role and history unchanged. A home-check failure names the file, link, login or duplicate sign-in to fix; rerun setup or correct that home's sign-in. An already-selected account needs no swap. An account used up with no credits needs a different target, credits or its reset. Unknown or expired usage needs a fresh reading before trying again. Selecting `default` requires a real, signed-in `~/.codex` whose login no other home holds; its shared entries remain real files and directories.
+Refusals leave both the role and history unchanged. A home-check failure names the file, link, login or duplicate sign-in to fix; rerun setup or correct that home's sign-in. An already-selected account needs no swap. An account used up with no credits needs a different target, credits or its reset. Unknown or expired usage needs a fresh reading before trying again. Selecting the numbered account held in `~/.codex` requires a real, signed-in home whose login no other home holds; its shared entries remain real files and directories.
 
 ## Automatic Codex moves
 
-A provider quota refusal moves workers to the picked Codex account with room. Above zero, low quota alone changes nothing; weekly zero with `use_credits: off` also requests a move. A known 5-hour reset less than 20 minutes away waits once, with its reset time in the notice. An unknown window or reset, a passed reset, or exactly 20 minutes remaining moves instead. The picked home becomes the `seats` role through the `swap seats` path; each worker moves after its live turn ends and continues the refused work before held messages.
+A provider quota refusal moves workers to the picked Codex account with room. Above zero, low quota alone changes nothing; weekly zero with `use_credits: off` also requests a move. A known 5-hour reset less than 20 minutes away waits once, with its reset time in the notice. An unknown window or reset, a passed reset, or exactly 20 minutes remaining moves instead. The picked home becomes the `workers` role through the `swap workers` path; each worker moves after its live turn ends and continues the refused work before held messages.
 
 When no Codex account has room, assignments fall back to Claude and the notice names the earliest reset. A failed move to the picked home also falls back to Claude, with the failed move and cause in the notice. They return only when the selected Codex account can work and its refusal is resolved. Recorded refusals override saved percentages. The moves journal at `~/.local/state/accounts/moves.jsonl` separates a requested role change from each worker's confirmed resume, and records waits, failures and renewed room.
 
@@ -215,13 +244,13 @@ Watcher inventories read the existing desktop snapshot. They never invoke the sn
 
 The argument-free notes timer checks local top-level sessions' last transcript entries for provider quota refusals. A refused unit or showrunner moves its whole group. Owners outside either group move alone through the selected shutdown and restart path, across terminal, tmux, Ghostty and zed hosts. An open shutdown request stays with its conductor. The Mac has no timer.
 
-Group membership comes from shutdown inventory's `unit` and `showrunner` classifications. An update timer is not required for a classified showrunner to move with its group.
+Group membership uses the lightweight listing; absent registration targets are checked separately. Manual move previews and terminal following are described above.
 
 A known 5-hour reset in less than 20 minutes waits once per session and reset. Other refusals move; no room sends one account notice until a usage reading changes. Shutdown waits for an idle owner, idle workers, no merge and nothing ahead of upstream. Its status line keeps the target and refusal reason visible while blocked. Cancellation records a failed move, removes the assumption and suppresses the unchanged transcript refusal.
 
-`scripts/accounts/refusal_watch.py --dry-run` reports decisions without changing anything. For a live proof, `--assume-refused '<session id or name>' weekly|five-hour [--reset-in <minutes>]` writes a refusal for that owner only and runs once. The optional reset affects its wait decision, not stored account usage. A confirmed restart or cancellation deletes the assumption. A process still on the source is a failed move; a target process with pending timers is confirmed while those timers stay visible.
+`scripts/accounts/refusal_watch.py --dry-run` reports decisions without changing anything. For a live proof, `--assume-refused '<session id or name>' weekly|five-hour [--reset-in <minutes>]` writes a refusal for that owner only and runs once. Only ungrouped probes are accepted. The proof changes neither the account refusal nor other sessions’ picks. The optional reset affects its wait decision, not stored account usage. Restart, cancellation or a delivered continuation deletes the assumption. Add `--proof-group <probe id>…` to move exactly those probes together, without touching real groups. A process still on the source is a failed move; a target process with pending timers is confirmed while those timers stay visible.
 
-Account status with `--detail` also shows live sessions' accounts, the Codex workers account and its destination on refusal, workers still owing a continuation, and the last ten move entries with outcomes. The first line names both groups; table role cells show their selected accounts. A member still on its old account shows as `moving`.
+Account status with `--detail` also shows live sessions' accounts, the Codex workers account and its destination on refusal, workers still owing a continuation, and the last ten move entries with outcomes and their `refusal`, `credits off` or `by hand` cause. Hand moves never inherit a stored refusal. Group selections persist one transition ID and origin across member retries, while each shutdown attempt keeps its own request ID. `Codex work routing:` lists assignment fallbacks separately, paired by their start time, as open, routed back, or not restored (partial or failed). Recovery is recorded only after all assignments are restored or kept because they were reassigned. The first line names both groups; table role cells show their selected accounts. A member still on its old account shows as `moving`.
 
 ## Low-quota alerts
 
@@ -243,6 +272,14 @@ Run `/showrunner:accounts`, fix what it names (most often the account's alias an
 
 ## Codex account numbers and credits
 
-`codex N` names the login in its account note, rather than a folder number. Selecting `codex 2` finds the existing home holding that note's login; it may be `~/.codex`. A home with no named note is shown by its folder. `default` remains accepted as input for `~/.codex`; account output uses its note number. Setup still creates `~/.codexN` when no home holds that account.
+`codexN` names the login in its account note, rather than a folder number. Selecting `codex2` finds the existing home holding that note's login; it may be `~/.codex`. A home with no named note is shown by its folder. Both tools accept only numbered account names. Legacy stored `default` values read as numbers on their next normal write; historical move entries use evidence recorded at the time, or show `home account unresolved`. Setup still creates `~/.codexN` when no home holds that account.
 
 Set `use_credits: on` or `use_credits: off` in each Codex note. Missing values mean on. With off, an exhausted weekly or 5-hour window makes the account unavailable even with credits. At weekly 0%, on keeps workers on paid credits with one phone and showrunner notice and hourly forecasts; off prefers an account with weekly usage left, then an account using its own credits. When neither is available or the move fails, Codex assignments move to Claude until the earliest refill. Only the first forecast goes to the phone. See `docs/quota_alerts.md` for delivery retries and unknown forecasts.
+
+Account notes use numbered filenames such as `claude1.md` and `codex2.md`; their labels are `claude1` and `codex2`. The updater renames old filenames on its first pass, preserving bodies and modes. If both names exist it reports them and reads the numbered file. Each note carries a `role` list, a `sessions` count and a `## Live sessions` table from the roster on both machines. An unreachable or older peer keeps its last rows marked `last seen <time>`; these rows do not count in `sessions`. Unread identities appear below the table as live sessions not attributed to an account. Legacy spaced labels remain accepted as input and are printed without spaces. Notes list by tool and account number.
+
+
+A signed-in home without a matching account note is never selectable. Status prints
+`~/.claude — no account note, not selectable: add ~/rust/hanadocs/agents/claudeN.md with login: <login>`
+or the corresponding `~/.codex` / `codexN.md` line. Add its numbered note before selecting it;
+an unrelated numbered account remains usable.

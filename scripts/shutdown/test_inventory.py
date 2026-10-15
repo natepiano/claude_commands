@@ -137,7 +137,7 @@ class InventoryTests(ShutdownTestCase):
                     )
                     self.assertEqual({session["session_id"] for session in found["sessions"]}, expected)
                     for session in found["sessions"]:
-                        if session["kind"] == "seat":
+                        if session["kind"] == "worker":
                             self.assertEqual(session["owner"], {"kind": "director", "session_id": DIRECTOR_ID})
 
     def test_inventory_only_builds_expensive_fields_for_selected_ids(self) -> None:
@@ -178,6 +178,29 @@ class InventoryTests(ShutdownTestCase):
                 elif session["kind"] == "unit":
                     self.assertEqual(light.production, session["host"]["production"])
                     self.assertEqual(light.doc, session["host"]["doc"])
+
+    def test_listing_and_absent_target_check_share_timer_reads_without_resolving_sockets(self) -> None:
+        stale = self.notifier / "showrunner-stale"
+        stale.mkdir()
+        stale_doc = self.root / "stale-production.md"
+        _ = stale_doc.write_text("- **User zone:** America/Los_Angeles\n", encoding="utf-8")
+        _ = (stale / "conf").write_text(
+            f"TARGET=session:00000000-0000-4000-8000-000000000000\nCHECK=zsh /opt/production_check.sh {stale_doc}\n",
+            encoding="utf-8")
+        with (patch.object(showrunners, "socket_for", side_effect=AssertionError("listing probed a messaging socket")),
+              patch.object(showrunners, "registered_showrunners", side_effect=AssertionError("listing resolved showrunner messaging")),
+              patch.object(showrunners, "checked_doc", wraps=showrunners.checked_doc) as checked):
+            registrations = inventory.showrunner_registrations()
+            listed = inventory.listing(registrations=registrations)
+            missing = inventory.unregistered_showrunners(listed, registrations=registrations)
+        self.assertEqual(checked.call_count, 2, "membership and missing-target check must share the timer read")
+        director = next(item for item in listed if item.session_id == DIRECTOR_ID)
+        self.assertEqual((director.kind, director.production, director.doc),
+            ("showrunner", "build-followups", str(self.root / "build-followups-production.md")))
+        unit = next(item for item in listed if item.session_id == UNIT_ID)
+        self.assertEqual((unit.kind, unit.production, unit.doc),
+            ("unit", "build-followups", director.doc))
+        self.assertEqual([(runner["slug"], runner["doc"]) for runner in missing], [("stale", str(stale_doc))])
 
     def test_forty_session_listing_and_large_transcript_read_budget(self) -> None:
         for path in self.records.glob("*.json"):
@@ -231,8 +254,8 @@ class InventoryTests(ShutdownTestCase):
         self.assertEqual(inventory.last_model(transcript), "claude-opus-real")
         self.assertEqual(model, inventory.ModelName(kind="model", name="claude-opus-real"))
         owner = top_level("refused", model=model)
-        self.assertIn("--model claude-opus-real", restart.resume_command(owner, "claude 3"))
-        self.assertNotIn("<synthetic>", restart.resume_command(owner, "claude 3"))
+        self.assertIn("--model claude-opus-real", restart.resume_command(owner, "claude3"))
+        self.assertNotIn("<synthetic>", restart.resume_command(owner, "claude3"))
 
     def test_only_synthetic_refusal_has_no_real_reply_model(self) -> None:
         transcript = self.home / ".claude/projects/model-fixture/refused.jsonl"
@@ -348,8 +371,8 @@ class InventoryTests(ShutdownTestCase):
         self.addCleanup(self.live_socket.close)
         self.write_account(self.target_config, TARGET_LOGIN)
         self.write_account(self.other_config, OTHER_LOGIN)
-        _ = (self.notes / "claude 2.md").write_text(
-            f"---\nlogin: {TARGET_LOGIN.upper()}\nstate: active\n---\n",
+        _ = (self.notes / "claude2.md").write_text(
+            f"---\nlogin: {TARGET_LOGIN.upper()}\nsessions: 1\n---\n",
             encoding="utf-8",
         )
         config_by_pid: dict[int, Path | None] = {
@@ -662,7 +685,7 @@ elif "comm=" in joined:
         found = inventory.inventory(TARGET_LOGIN)
 
         self.assertEqual(found["login"], TARGET_LOGIN)
-        self.assertEqual(found["label"], "claude 2")
+        self.assertEqual(found["label"], "claude2")
         by_id = {session["session_id"]: session for session in found["sessions"]}
         self.assertEqual(set(by_id), {DIRECTOR_ID, UNIT_ID, WORKER_ID, DESKTOP_ID})
         self.assertTrue(
@@ -737,8 +760,8 @@ elif "comm=" in joined:
             },
         )
 
-        worker = cast(inventory.SeatSession, by_id[WORKER_ID])
-        self.assertEqual(worker["kind"], "seat")
+        worker = cast(inventory.WorkerSession, by_id[WORKER_ID])
+        self.assertEqual(worker["kind"], "worker")
         self.assertEqual(
             worker["owner"], {"kind": "director", "session_id": DIRECTOR_ID}
         )
@@ -1102,11 +1125,11 @@ elif "comm=" in joined:
         _ = current.replace(previous)
         found = inventory.inventory(TARGET_LOGIN)
         worker = next(session for session in found["sessions"] if session["session_id"] == WORKER_ID)
-        self.assertEqual(worker["kind"], "seat")
-        self.assertEqual(cast(inventory.SeatSession, worker)["owner"],
+        self.assertEqual(worker["kind"], "worker")
+        self.assertEqual(cast(inventory.WorkerSession, worker)["owner"],
                          {"kind": "director", "session_id": DIRECTOR_ID})
         late_worker = next(session for session in found["sessions"] if session["session_id"] == DESKTOP_ID)
-        self.assertEqual(cast(inventory.SeatSession, late_worker)["owner"], {"kind": "no director"})
+        self.assertEqual(cast(inventory.WorkerSession, late_worker)["owner"], {"kind": "no director"})
         self.assertTrue(previous.samefile(current))
         self.assertEqual(current.stat().st_mtime_ns, modified)
         _ = inventory.inventory(TARGET_LOGIN)
@@ -1117,8 +1140,8 @@ elif "comm=" in joined:
         modified = current.stat().st_mtime_ns
         found = inventory.inventory(TARGET_LOGIN)
         late_worker = next(session for session in found["sessions"] if session["session_id"] == DESKTOP_ID)
-        self.assertEqual(late_worker["kind"], "seat")
-        self.assertEqual(cast(inventory.SeatSession, late_worker)["owner"],
+        self.assertEqual(late_worker["kind"], "worker")
+        self.assertEqual(cast(inventory.WorkerSession, late_worker)["owner"],
                          {"kind": "director", "session_id": DIRECTOR_ID})
         self.assertTrue(previous.samefile(current))
         self.assertEqual(current.stat().st_mtime_ns, modified)
@@ -1132,7 +1155,7 @@ elif "comm=" in joined:
             [
                 (session["session_id"], session["owner"])
                 for session in found["sessions"]
-                if session["kind"] == "seat"
+                if session["kind"] == "worker"
             ],
             [(WORKER_ID, {"kind": "director", "session_id": DIRECTOR_ID})],
         )
@@ -1159,7 +1182,7 @@ elif "comm=" in joined:
         by_id = {session["session_id"]: session for session in found["sessions"]}
 
         unit = cast(inventory.UnitSession, by_id[UNIT_ID])
-        worker = cast(inventory.SeatSession, by_id[WORKER_ID])
+        worker = cast(inventory.WorkerSession, by_id[WORKER_ID])
         self.assertEqual(unit["host"]["plan"], {"kind": "no run record"})
         self.assertEqual(by_id[DESKTOP_ID]["model"], {"kind": "no reply yet"})
         self.assertEqual(worker["owner"], {"kind": "no director"})

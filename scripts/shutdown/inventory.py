@@ -11,6 +11,7 @@ import shlex
 import socket
 import subprocess
 import sys
+from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal, NotRequired, TypedDict, cast
@@ -252,8 +253,8 @@ class UnitSession(SessionFields):
     host: UnitHost
 
 
-class SeatSession(SessionFields):
-    kind: Literal["seat"]
+class WorkerSession(SessionFields):
+    kind: Literal["worker"]
     host: SessionHost
     owner: WorkerOwner
 
@@ -263,7 +264,7 @@ class TopLevelSession(SessionFields):
     host: SessionHost
 
 
-Session = ShowrunnerSession | UnitSession | SeatSession | TopLevelSession
+Session = ShowrunnerSession | UnitSession | WorkerSession | TopLevelSession
 
 
 @dataclass(frozen=True)
@@ -274,7 +275,7 @@ class ListedSession:
     pid: int
     proc_start: str
     name: str
-    kind: Literal["showrunner", "unit", "seat", "top-level"]
+    kind: Literal["showrunner", "unit", "worker", "top-level"]
     config_dir: Path
     login: str
     # Empty for sessions outside a registered production.
@@ -322,6 +323,18 @@ class SessionFile(TypedDict, total=False):
 class ProductionSession:
     slug: str
     doc: str
+
+
+@dataclass(frozen=True)
+class ShowrunnerRegistration:
+    session_id: str
+    slug: str
+    doc: str
+
+
+@dataclass(frozen=True)
+class ShowrunnerRegistrations:
+    entries: tuple[ShowrunnerRegistration, ...]
 
 
 @dataclass(frozen=True)
@@ -671,7 +684,7 @@ def parse_session(value: object, place: str) -> Session:
     """Validate and return one session from an inventory or shutdown record."""
     data = _wire_object(value, place)
     kind = _wire_kind(data, place)
-    if kind not in {"showrunner", "unit", "seat", "top-level"}:
+    if kind not in {"showrunner", "unit", "worker", "top-level"}:
         raise InvalidInventory(f"{place}.kind is invalid")
     servers = [
         _parse_codex_server(item, f"{place}.codex_servers[{index}]")
@@ -731,7 +744,7 @@ def parse_session(value: object, place: str) -> Session:
         parsed["doc"] = _wire_string(
             _wire_required(data, "doc", place), f"{place}.doc"
         )
-    elif kind == "seat":
+    elif kind == "worker":
         parsed["owner"] = _parse_owner(
             _wire_required(data, "owner", place), f"{place}.owner"
         )
@@ -890,36 +903,47 @@ def _conf(path: Path) -> dict[str, str]:
         return {}
 
 
-def _registered_productions() -> tuple[dict[str, ProductionSession], list[showrunners.Showrunner]]:
-    state_dir = _notifier_state_dir()
-    try:
-        runners = showrunners.registered_showrunners(state_dir)
-    except OSError:
-        runners = []
-    found: dict[str, ProductionSession] = {}
-    for runner in runners:
-        instance = state_dir / f"showrunner-{runner['slug']}"
+def showrunner_registrations() -> ShowrunnerRegistrations:
+    """Read timer identities and production docs without resolving messaging sockets."""
+    found: list[ShowrunnerRegistration] = []
+    for instance in sorted(_notifier_state_dir().glob("showrunner-*")):
+        if not instance.is_dir():
+            continue
         fields = _conf(instance / "conf")
         target = fields.get("TARGET", "")
         if not target.startswith("session:") or not target[8:]:
             continue
-        found[target[8:]] = ProductionSession(runner["slug"], runner["doc"])
-    return found, runners
+        doc = showrunners.checked_doc(instance)
+        if isinstance(doc, showrunners.NoCheckedDoc):
+            continue
+        try:
+            _ = doc.path.read_text(encoding="utf-8")
+        except (OSError, UnicodeError):
+            continue
+        found.append(ShowrunnerRegistration(target[8:], instance.name.removeprefix("showrunner-"), str(doc.path)))
+    return ShowrunnerRegistrations(tuple(found))
 
 
-def unregistered_showrunners() -> list[showrunners.Showrunner]:
+def unregistered_showrunners(
+    listed: Sequence[ListedSession] | Literal["read sessions"] = "read sessions", *,
+    registrations: ShowrunnerRegistrations | Literal["read timers"] = "read timers",
+) -> list[showrunners.Showrunner]:
     """Each production whose update timer names a session that is not running.
 
     A showrunner is known only by the session its timer names, so one running under another id
     without registering reads as a plain session. Empty when the session records cannot be read.
     """
     try:
-        return [runner for runner in showrunners.registered_showrunners(_notifier_state_dir()) if not runner["session"]]
+        timers = showrunner_registrations() if isinstance(registrations, str) else registrations
+        entries = listing(registrations=timers) if isinstance(listed, str) else listed
     except OSError:
         return []
+    live_ids = {entry.session_id for entry in entries}
+    return [showrunners.Showrunner(slug=timer.slug, doc=timer.doc, session="", socket="", zone="")
+            for timer in timers.entries if timer.session_id not in live_ids]
 
 
-def _unit_sessions(runners: list[showrunners.Showrunner]) -> dict[str, UnitMarks]:
+def _unit_sessions(runners: tuple[ShowrunnerRegistration, ...]) -> dict[str, UnitMarks]:
     """Each running unit director of a registered production, by session id.
 
     One read of every production's marks (`unit_lookup.every_marked_unit`) serves them all. A
@@ -930,7 +954,7 @@ def _unit_sessions(runners: list[showrunners.Showrunner]) -> dict[str, UnitMarks
         every = unit_lookup.every_marked_unit()
     except OSError:
         return {}
-    docs = {runner["slug"]: runner["doc"] for runner in runners}
+    docs = {runner.slug: runner.doc for runner in runners}
     found: dict[str, UnitMarks] = {}
     for slug, units in every.units.items():
         if slug not in docs:
@@ -1464,13 +1488,13 @@ def _listed_session(
     production = productions.get(session_id)
     unit = units.get(session_id)
     if production is not None:
-        kind: Literal["showrunner", "unit", "seat", "top-level"] = "showrunner"
+        kind: Literal["showrunner", "unit", "worker", "top-level"] = "showrunner"
         slug, doc = production.slug, production.doc
     elif unit is not None:
         kind = "unit"
         slug, doc = unit.production, unit.doc
     else:
-        kind = "seat" if record.get("kind") == "bg" else "top-level"
+        kind = "worker" if record.get("kind") == "bg" else "top-level"
         slug, doc = "", ""
     return ListedSession(
         session_id=session_id,
@@ -1485,10 +1509,12 @@ def _listed_session(
     )
 
 
-def listing(login: str | None = None) -> list[ListedSession]:
+def listing(login: str | None = None, *,
+            registrations: ShowrunnerRegistrations | Literal["read timers"] = "read timers") -> list[ListedSession]:
     """List membership without inspecting transcripts, worktrees or host resources."""
-    productions, runners = _registered_productions()
-    units = _unit_sessions(runners)
+    timers = showrunner_registrations() if isinstance(registrations, str) else registrations
+    productions = {timer.session_id: ProductionSession(timer.slug, timer.doc) for timer in timers.entries}
+    units = _unit_sessions(timers.entries)
     found: list[ListedSession] = []
     for record in sessions.live_sessions():
         entry = _listed_session(_session_file(record), productions, units)
@@ -1506,8 +1532,9 @@ def inventory(
 ) -> Inventory:
     """Return account sessions in ``only`` and their workers, or all when empty."""
     records = [_session_file(record) for record in sessions.live_sessions()]
-    productions, runners = _registered_productions()
-    units = _unit_sessions(runners)
+    timers = showrunner_registrations()
+    productions = {timer.session_id: ProductionSession(timer.slug, timer.doc) for timer in timers.entries}
+    units = _unit_sessions(timers.entries)
     session_ids = {
         session_id
         for record in records
@@ -1577,10 +1604,10 @@ def inventory(
                 "kind": "unit",
                 "host": _host(record, unit, plans, desktops),
             }
-        elif kind == "seat":
+        elif kind == "worker":
             value = {
                 **common,
-                "kind": "seat",
+                "kind": "worker",
                 "host": _host(record, None, plans, desktops),
                 "owner": (
                     {"kind": "director", "session_id": owner}

@@ -506,7 +506,8 @@ if action == "submit":
         stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL, start_new_session=True,
     )
-    (state / "pid").write_text(str(job.pid))
+    (state / "pid.tmp").write_text(str(job.pid))
+    os.replace(state / "pid.tmp", state / "pid")
 elif action == "loop":
     label = sys.argv[2]
     removed = state / f"{label}.removed"

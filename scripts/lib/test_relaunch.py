@@ -13,10 +13,13 @@ import tempfile
 import time
 from typing import TypedDict, cast, override
 import unittest
+from unittest.mock import patch
+
 
 sys.path.insert(0, str(Path(__file__).parents[1] / "shutdown"))
 sys.path.insert(0, str(Path(__file__).parents[2]))
 from scripts.shutdown.test_support import ShutdownTestCase
+from scripts.lib import relaunch
 
 SUPERVISOR = Path(__file__).with_name("relaunch.py")
 
@@ -27,6 +30,11 @@ class RelaunchObservation(TypedDict):
     cwd: str
     marker: str
     removed: bool
+
+
+class FinishedChild:
+    def wait(self) -> int:
+        return 23
 
 
 class RelaunchTests(ShutdownTestCase):
@@ -69,7 +77,7 @@ class RelaunchTests(ShutdownTestCase):
     def waiting_child(self) -> str:
         return (
             "import os,time; from pathlib import Path; "
-            "Path('ready').write_text(str(os.getppid())); "
+            "Path('ready.tmp').write_text(str(os.getppid())); os.replace('ready.tmp', 'ready'); "
             "\nwhile not Path('release').exists(): time.sleep(.01)\n"
             "raise SystemExit(7)"
         )
@@ -103,6 +111,18 @@ class RelaunchTests(ShutdownTestCase):
         self.assertTrue(observed["removed"])
         self.assertEqual(stdout.count("restarting fixture on its target account\n"), 1)
         self.assertFalse(request.exists(), "a consumed request could launch twice")
+
+    def test_child_environment_marks_supervision_without_changing_the_parent(self) -> None:
+        with (patch.dict(os.environ, {"HOME": str(self.root),
+                  "SHUTDOWN_STATE_DIR": str(self.state), "PRESERVED_MARKER": "keep"}, clear=True),
+              patch.object(subprocess, "Popen", return_value=FinishedChild()) as launch):
+            self.assertEqual(relaunch.run(["claude", "--resume", "conversation-id"]), 23)
+            self.assertNotIn("RELAUNCH_SUPERVISED", os.environ)
+        launch.assert_called_once()
+        self.assertEqual(launch.call_args.args[0], ["claude", "--resume", "conversation-id"])
+        environment = cast(dict[str, str], launch.call_args.kwargs["env"])
+        self.assertEqual(environment["RELAUNCH_SUPERVISED"], "1")
+        self.assertEqual(environment["PRESERVED_MARKER"], "keep")
 
     def test_no_request_preserves_the_child_exit_code(self) -> None:
         process = self.start("raise SystemExit(23)")
@@ -186,7 +206,8 @@ class RelaunchTests(ShutdownTestCase):
             "def interrupted(number,frame):\n"
             " Path('interrupted').write_text(str(number)); raise SystemExit(17)\n"
             "signal.signal(signal.SIGINT,interrupted)\n"
-            "Path('ready').write_text(str(os.getpgrp()))\nwhile True: time.sleep(.01)\n"
+            "Path('ready.tmp').write_text(str(os.getpgrp())); os.replace('ready.tmp', 'ready')\n"
+            "while True: time.sleep(.01)\n"
         )
         process = self.start(child)
         self.wait_for_file(self.root / "ready", process)

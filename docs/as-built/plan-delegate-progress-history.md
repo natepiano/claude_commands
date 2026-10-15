@@ -76,11 +76,17 @@ keeps no durable history. Each `finding_*` event repeats `phase_instance_id` and
 `phase_id`, so the fix loop's rounds join to the phase they belong to.
 
 The unit director's exact family, session id, model, and effort come from the
-active Claude or Codex transcript. `implement.sh` and `review.sh` provide the
+active Claude or Codex transcript. `_main_identity_from_codex` and
+`_main_identity_from_claude` each return `KnownMainIdentity |
+MainIdentityUnavailable`; `_detect_main_identity()` takes explicit `--main-*`
+flags first, then the Codex transcript (`CODEX_THREAD_ID`), then the Claude one
+(`CLAUDE_CODE_SESSION_ID`), and falls back to model `unknown`. `implement.sh` and `review.sh` provide the
 called task, family, model, and effort after resolving `config/agents.conf`.
 
 Each recorder command takes a session lock around its state transition. Each
-append also takes an exclusive history-file lock, flushes, and calls `fsync`;
+append also takes an exclusive history-file lock, flushes, and calls `fsync`
+(`PLAN_DELEGATE_SYNC_WRITES=0` skips the `fsync` for disposable test fixtures; the
+default is `1`, and `findings.py` and `review_pool.py` read the same switch);
 aggregate reads take a shared history-file lock. Different runs have different
 files, while multiple processes participating in one run share its locked
 stream and live-state cache.

@@ -72,7 +72,8 @@ LogFamily = Literal["claude", "codex", "history"]
 SourceFamily = Literal["claude", "codex", "history", "checkpoints", "readings", "baseline_readings", "account_roles"]
 LOG_FAMILIES: tuple[LogFamily, ...] = ("claude", "codex", "history")
 FILE_NAMED_CODEX_KEYS_VERSION = 8
-STORE_VERSION = FILE_NAMED_CODEX_KEYS_VERSION
+WORKER_ACCOUNT_ROLES_VERSION = 9
+STORE_VERSION = WORKER_ACCOUNT_ROLES_VERSION
 MAX_SQLITE_INTEGER = (1 << 63) - 1
 
 
@@ -504,6 +505,12 @@ def migrate_store(db: sqlite3.Connection) -> None:
     version = check_store_key_version(db)
     if version < STORE_VERSION:
         with db:
+            if version < WORKER_ACCOUNT_ROLES_VERSION:
+                _ = db.execute("""
+                    INSERT OR IGNORE INTO account_role_changes (machine, at, role, label)
+                    SELECT machine, at, 'workers', label FROM account_role_changes WHERE role = 'seats'
+                """)
+                _ = db.execute("DELETE FROM account_role_changes WHERE role = 'seats'")
             _ = db.execute("DELETE FROM cursors")
             _ = db.execute(f"PRAGMA user_version = {STORE_VERSION}")
 

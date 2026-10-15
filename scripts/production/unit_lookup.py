@@ -23,8 +23,10 @@ MESSAGE = Path(__file__).resolve().parent.parent / "message"
 sys.path.insert(0, str(MESSAGE))
 sys.path.insert(0, str(MESSAGE.parent / "herdr"))
 import herdr  # noqa: E402
+import showrunners  # noqa: E402
 from herdr import HerdrPlace  # noqa: E402
 from sessions import UnreadableSessionRecord, live_session, read_session  # noqa: E402
+from showrunners import canonical_slug  # noqa: E402
 
 PRODUCTION_MARK = "SHOWRUNNER_UNIT"
 UNIT_MARK = "SHOWRUNNER_UNIT_ID"
@@ -243,27 +245,41 @@ def _herdr_marked(claudes: dict[HerdrPlace, LiveClaude], unread: str) -> Iterabl
         yield slug, MarkedUnit(unit, place.session, claude, place)
 
 
-def every_marked_unit(*, include_tmux: bool = True) -> MarkedProductions:
+def _lookup_slug(slug: str) -> str:
+    # A current notifier name needs no scan of Formerly entries or reread of its doc.
+    if (showrunners.NOTIFIER_STATE_DIR / f"showrunner-{slug}").is_dir():
+        return slug
+    return canonical_slug(slug)
+
+
+def every_marked_unit(*, include_tmux: bool = True, every_host: bool = False) -> MarkedProductions:
     """Read herdr and optionally tmux. Failure of all included sources is unreadable.
 
-    Duplicate marks leave that production out; callers must never pick one host.
+    With every_host, any included source failure is unreadable. Duplicate marks leave that
+    production out; callers must never pick one host.
     """
     tmux_claudes, herdr_claudes, unread = _claudes()
     marked_units: list[tuple[str, MarkedUnit]] = []
-    failures: list[str] = []
-    sources = [_herdr_marked(herdr_claudes, unread)]
+    failures: list[tuple[str, str]] = []
+    sources = [("herdr", _herdr_marked(herdr_claudes, unread))]
     if include_tmux:
-        sources.insert(0, _marked_sessions(tmux_claudes, unread))
-    for source in sources:
+        sources.insert(0, ("tmux", _marked_sessions(tmux_claudes, unread)))
+    for host, source in sources:
         try:
             marked_units.extend(source)
         except (OSError, herdr.HerdrFailure) as error:
-            failures.append(str(error))
-    if len(failures) == len(sources):
-        raise OSError("; ".join(failures))
+            failures.append((host, str(error)))
+    if failures and (every_host or len(failures) == len(sources)):
+        raise OSError("; ".join(
+            f"{host}: {detail}" if every_host and not detail.startswith((f"{host}:", f"{host} ")) else detail
+            for host, detail in failures))
     units: dict[str, dict[str, MarkedUnit]] = {}
     faults: dict[str, str] = {}
+    current_slugs: dict[str, str] = {}
     for slug, marked in marked_units:
+        if slug not in current_slugs:
+            current_slugs[slug] = _lookup_slug(slug)
+        slug = current_slugs[slug]
         production = units.setdefault(slug, {})
         if marked.unit in production:
             previous = production[marked.unit]
@@ -278,13 +294,14 @@ def every_marked_unit(*, include_tmux: bool = True) -> MarkedProductions:
     return MarkedProductions({slug: found for slug, found in units.items() if slug not in faults}, faults)
 
 
-def marked_units(slug: str) -> dict[str, MarkedUnit]:
+def marked_units(slug: str, *, every_host: bool = False) -> dict[str, MarkedUnit]:
     """Every marked unit of the production, in either host, by unit id.
 
     Raises OSError when neither host can say which sessions exist, or two sessions carry one of
-    the production's unit marks.
+    the production's unit marks. With every_host, any host failure raises OSError.
     """
-    found = every_marked_unit()
+    slug = _lookup_slug(slug)
+    found = every_marked_unit(every_host=every_host)
     if slug in found.faults:
         raise OSError(found.faults[slug])
     return found.units.get(slug, {})

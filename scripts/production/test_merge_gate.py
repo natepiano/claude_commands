@@ -17,7 +17,7 @@ import unittest
 from contextlib import redirect_stdout
 from unittest import mock
 
-from scripts.production import merge_gate
+from scripts.production import change_review, merge_gate
 
 
 # Script completion deadlines only bound hangs; startup can be slow under load.
@@ -104,12 +104,16 @@ class FixtureTest(unittest.TestCase):
             import subprocess
             child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(120)"],
                                      stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            (state / "child-pid").write_text(str(child.pid))
+            (state / "child-pid.tmp").write_text(str(child.pid))
+            # Publish by rename: a reader must never see the file empty.
+            os.replace(state / "child-pid.tmp", state / "child-pid")
         if (state / "modify-tracked").exists() and suite == "hooks":
             Path("unit.txt").write_text("gate debris\\n")
             self.fail("fixture edited a tracked checkpoint file")
         if (state / "hold-module").exists() and suite == "hooks":
-            (state / "module-held").write_text(str(os.getpid()))
+            (state / "module-held.tmp").write_text(str(os.getpid()))
+            # Publish by rename: a reader must never see the file empty.
+            os.replace(state / "module-held.tmp", state / "module-held")
             while True:
                 time.sleep(0.01)
         if (state / "barrier").exists() and suite == "lib":
@@ -348,6 +352,54 @@ class MergeGateTests(unittest.TestCase):
         self.assertEqual(self.git(self.checkout, "status", "--porcelain"), "")
         self.assertFalse((self.checkout / ".git" / "MERGE_HEAD").exists())
 
+    def checkpoint_commit(self, message: str) -> str:
+        """A checkpoint(...) commit on the unit branch, dated after the Change-Review rule landed."""
+        self.write(self.unit / "visible.txt", message)
+        _ = self.git(self.unit, "add", ".")
+        self.environment["GIT_COMMITTER_DATE"] = "2026-10-15T12:00:00-04:00"
+        try:
+            _ = self.git(self.unit, "commit", "-m", message)
+        finally:
+            del self.environment["GIT_COMMITTER_DATE"]
+        _ = self.git(self.unit, "push", "origin", "unit-phase")
+        return self.git(self.unit, "rev-parse", "HEAD")
+
+    def test_a_checkpoint_without_a_change_review_line_is_refused_before_the_merge(self) -> None:
+        checkpoint = self.checkpoint_commit("checkpoint(fixture): grid fades")
+        result = self.run_gate(checkpoint=checkpoint)
+        self.assert_refused_before_gate(result)
+        self.assertIn("checkpoint(fixture): grid fades: no Change-Review line", result.stderr)
+
+    def test_a_green_merge_adds_one_row_per_visible_change_to_the_named_list(self) -> None:
+        review = self.root / "change-review.md"
+        self.write(review, "## To review\n\n| # | Change | Merged | On the Mac build | How to check |\n"
+                   + "| --- | --- | --- | --- | --- |\n| C7 | old | 2026-10-14 | yes | - |\n")
+        doc = self.root / "production.md"
+        self.write(doc, f"# p\n\n## Production Context\n\n- **Change review:** `{review}`\n")
+        checkpoint = self.checkpoint_commit("checkpoint(fixture): grid fades\n\n"
+                                            + "Change-Review: The grid fades gently | Look across the floor\n"
+                                            + "Change-Review: none — the gate script")
+        # The row carries today in the user's zone, as the gate reads it; a run across midnight may take either day.
+        before = change_review.today()
+        result = self.run_gate("--production", str(doc), checkpoint=checkpoint)
+        days = {before.isoformat(), change_review.today().isoformat()}
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        merged = self.git(self.checkout, "rev-parse", "--short=8", "HEAD")
+        written = review.read_text(encoding="utf-8").splitlines()[-1]
+        rows = {f"| C8 | The grid fades gently | {day} · {merged} | not yet | Look across the floor |" for day in days}
+        self.assertIn(written, rows)
+        self.assertIn(f"Change review: {written}", result.stdout)
+        self.assertNotIn("drift", result.stderr)
+        self.assertEqual(self.git(self.checkout, "status", "--porcelain"), "")
+
+    def test_a_production_without_a_list_still_merges_a_checkpoint_with_its_line(self) -> None:
+        doc = self.root / "production.md"
+        self.write(doc, "# p\n")
+        checkpoint = self.checkpoint_commit("checkpoint(fixture): grid fades\n\nChange-Review: none — the gate script")
+        result = self.run_gate("--production", str(doc), checkpoint=checkpoint)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertNotIn("Change review:", result.stdout)
+
     def test_green_gate_pushes_no_ff_merge_with_subject_body_and_all_modules(self) -> None:
         self.write(self.state / "types-barrier", "overlap")
         result = self.run_gate()
@@ -546,8 +598,11 @@ class MergeGateTests(unittest.TestCase):
     def test_signal_during_merge_aborts_pending_merge_and_its_hook(self) -> None:
         ready = self.state / "merge-hook-ready"
         hook = self.checkout / ".git" / "hooks" / "prepare-commit-msg"
+        # The pid is published by rename, so the test never reads a created but
+        # still empty file.
         self.write(hook, f"#!{sys.executable}\nimport os, time\nfrom pathlib import Path\n"
-                   + f"Path({str(ready)!r}).write_text(str(os.getpid()))\nwhile True: time.sleep(0.01)\n")
+                   + f"Path({str(ready) + '.tmp'!r}).write_text(str(os.getpid()))\n"
+                   + f"os.replace({str(ready) + '.tmp'!r}, {str(ready)!r})\nwhile True: time.sleep(0.01)\n")
         hook.chmod(0o755)
         process = subprocess.Popen(
             [sys.executable, str(SCRIPT), "--repo", str(self.checkout), "--merge-branch", "integration",

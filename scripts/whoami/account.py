@@ -17,6 +17,12 @@ from typing import Literal, TypedDict, cast
 from agent_accounts import claude_config_dir, claude_on_disk, codex_email_on_disk, codex_home
 import note_file
 
+# Package and sibling callers share process readers and identity outcomes.
+if __name__ == "account":
+    _ = sys.modules.setdefault("scripts.whoami.account", sys.modules[__name__])
+elif __name__ == "scripts.whoami.account":
+    _ = sys.modules.setdefault("account", sys.modules[__name__])
+
 
 @dataclass(frozen=True)
 class Account:
@@ -50,16 +56,12 @@ class CommandLine(argparse.Namespace):
 
 
 def label_for(tool: str, login: str) -> str:
-    """The matching hanadocs note stem, or the login when no note matches."""
-    notes_dir = Path(os.environ.get("AGENT_NOTES_DIR", str(note_file.AGENTS_DIR)))
+    """The matching hanadocs account label, or the login when no note matches."""
     folded_tool = tool.casefold()
     folded_login = login.casefold()
-    for path in sorted(notes_dir.glob("*.md")):
-        if not path.stem.casefold().startswith(folded_tool):
-            continue
-        note = note_file.read_note(path)
-        if note is not None and (note.get("login") or "").casefold() == folded_login:
-            return path.stem
+    for note in note_file.read_notes():
+        if note.tool == folded_tool and (note.get("login") or "").casefold() == folded_login:
+            return note.label
     return login
 
 
@@ -81,16 +83,13 @@ def own_claude_account() -> Account:
 
 def named_claude_account(text: str) -> Account:
     """Resolve a Claude note label or accept an explicit login."""
-    notes_dir = Path(os.environ.get("AGENT_NOTES_DIR", str(note_file.AGENTS_DIR)))
-    folded = text.casefold()
-    for path in sorted(notes_dir.glob("*.md")):
-        stem = path.stem.casefold()
-        if not stem.startswith("claude") or stem != folded:
+    parsed = note_file.parse_account_label(text.casefold())
+    for note in note_file.read_notes():
+        if note.tool != "claude" or not isinstance(parsed, note_file.NumberedAccountLabel) or note.label != parsed.label:
             continue
-        note = note_file.read_note(path)
-        login = None if note is None else note.get("login")
-        if isinstance(login, str) and login:
-            return Account("claude", login, path.stem)
+        login = note.get("login")
+        if login:
+            return Account("claude", login, note.label)
     if (
         "@" in text
         and "/" not in text
@@ -100,7 +99,7 @@ def named_claude_account(text: str) -> Account:
     ):
         return Account("claude", text, label_for("claude", text))
     raise UnknownAccountName(
-        f"unknown account {text}: give a note label such as claude 2, or a login"
+        f"unknown account {text}: give a note label such as claude2, or a login"
     )
 
 
@@ -183,6 +182,52 @@ def process_config_dir(pid: int) -> Path | None:
     return _default_claude_config_dir()
 
 
+
+@dataclass(frozen=True)
+class ProcessCodexHome:
+    home: Path
+
+
+@dataclass(frozen=True)
+class ProcessWithoutCodexHome:
+    """A readable environment has no CODEX_HOME; it uses the default home."""
+
+
+@dataclass(frozen=True)
+class ProcessEnvironmentUnread:
+    reason: str
+
+
+def process_codex_home(pid: int) -> ProcessCodexHome | ProcessWithoutCodexHome | ProcessEnvironmentUnread:
+    """Distinguish an absent variable from an unreadable process environment."""
+    if sys.platform == "darwin":
+        try:
+            result = subprocess.run(
+                ("ps", "eww", "-o", "uid=,command=", "-p", str(pid)),
+                capture_output=True, text=True, timeout=5,
+            )
+        except (OSError, subprocess.TimeoutExpired) as error:
+            return ProcessEnvironmentUnread(str(error))
+        fields = result.stdout.split(maxsplit=1)
+        if result.returncode or len(fields) != 2 or fields[0] != str(os.getuid()):
+            return ProcessEnvironmentUnread("process environment could not be read")
+        words = fields[1].split()
+        if not any(word.startswith("HOME=") for word in words):
+            return ProcessEnvironmentUnread("process environment could not be read")
+        for word in reversed(words):
+            if word.startswith("CODEX_HOME="):
+                return ProcessCodexHome(Path(word.removeprefix("CODEX_HOME=")))
+        return ProcessWithoutCodexHome()
+    try:
+        environment = Path(f"/proc/{pid}/environ").read_bytes()
+    except OSError as error:
+        return ProcessEnvironmentUnread(str(error))
+    for entry in environment.split(b"\0"):
+        if entry.startswith(b"CODEX_HOME="):
+            return ProcessCodexHome(Path(os.fsdecode(entry.removeprefix(b"CODEX_HOME="))))
+    return ProcessWithoutCodexHome()
+
+
 def account_of(pid: int) -> Account | None:
     """The Claude account of a process whose environment can be read."""
     config_dir = process_config_dir(pid)
@@ -191,7 +236,7 @@ def account_of(pid: int) -> Account | None:
 
 def write_label(config_dir: Path, account: Account) -> None:
     """Atomically refresh a config directory's cheap status-line label cache."""
-    expected = account.label + "\n"
+    expected = note_file.canonical_label(account.label) + "\n"
     destination = config_dir / "account-label"
     try:
         if destination.read_text(encoding="utf-8") == expected:

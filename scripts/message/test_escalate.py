@@ -243,26 +243,26 @@ class EscalateTests(unittest.TestCase):
         login = f"account{number}@example.invalid"
         claims = base64.urlsafe_b64encode(json.dumps({"email": login}).encode()).decode().rstrip("=")
         _ = (home / "auth.json").write_text(json.dumps({"tokens": {"id_token": f"x.{claims}.y"}}))
-        _ = (self.root / f"codex {number}.md").write_text(f"---\nlogin: {login}\n---\n")
+        _ = (self.root / f"codex{number}.md").write_text(f"---\nlogin: {login}\n---\n")
         script = SCRIPT.parent.parent / "accounts" / "accounts.py"
 
-        selected = subprocess.run([sys.executable, str(script), "set-role", "seats", f"codex {number}"],
+        selected = subprocess.run([sys.executable, str(script), "set-role", "workers", f"codex{number}"],
             env={**self.environment, "HOME": str(self.root), "AGENT_NOTES_DIR": str(self.root)}, capture_output=True, text=True, check=False)
         self.assertEqual(selected.returncode, 0, selected.stderr)
-        return KnownCodexAccount(home, login, f"codex {number}")
+        return KnownCodexAccount(home, login, f"codex{number}")
 
     def test_due_after_swap_cancels_outgoing_account_without_waiting_for_updater(self) -> None:
         with (patch.dict(os.environ, {"HOME": str(self.root), "AGENT_NOTES_DIR": str(self.root)}),
               patch.object(escalate, "STATE", self.root / "owned holds"),
               patch.object(escalate, "schedule"), patch.object(escalate, "deliver", return_value="") as deliver):
             a = self.select_codex(1)
-            _ = escalate.hold("a-window", escalate.SessionPush("codex 1", "A low", NoActionRequired(), "note"), minutes=0, owner=a)
+            _ = escalate.hold("a-window", escalate.SessionPush("codex1", "A low", NoActionRequired(), "note"), minutes=0, owner=a)
             b = self.select_codex(2)
-            _ = escalate.hold("b-window", escalate.SessionPush("codex 2", "B low", NoActionRequired(), "note"), minutes=0, owner=b)
+            _ = escalate.hold("b-window", escalate.SessionPush("codex2", "B low", NoActionRequired(), "note"), minutes=0, owner=b)
             _ = escalate.hold("other-tool", escalate.SessionPush("Claude", "Claude low", NoActionRequired(), "note"), minutes=0)
             _ = escalate.due(10**12)
             held = [cast(escalate.HeldMessage, call.args[0]) for call in deliver.call_args_list]
-            self.assertEqual({entry.summary for entry in held}, {"codex 2", "Claude"})
+            self.assertEqual({entry.summary for entry in held}, {"codex2", "Claude"})
             self.assertIsInstance(escalate.read(escalate.held_path("a-window")), escalate.NoHeld)
 
     def test_due_with_unknown_selected_login_preserves_owned_hold_without_delivery(self) -> None:
@@ -270,7 +270,7 @@ class EscalateTests(unittest.TestCase):
               patch.object(escalate, "STATE", self.root / "owned holds"),
               patch.object(escalate, "schedule"), patch.object(escalate, "deliver", return_value="") as deliver):
             a = self.select_codex(1)
-            _ = escalate.hold("a-window", escalate.SessionPush("codex 1", "A low", NoActionRequired(), "note"), minutes=0, owner=a)
+            _ = escalate.hold("a-window", escalate.SessionPush("codex1", "A low", NoActionRequired(), "note"), minutes=0, owner=a)
             _ = (a.home / "auth.json").write_text("unreadable")
             before = escalate.held_path("a-window").read_text()
             _ = escalate.due(10**12)
@@ -282,9 +282,9 @@ class EscalateTests(unittest.TestCase):
               patch.object(escalate, "STATE", self.root / "owned holds"),
               patch.object(escalate, "schedule"), patch.object(escalate, "deliver", return_value="") as deliver):
             a = self.select_codex(1)
-            _ = escalate.hold("a-window", escalate.SessionPush("codex 1", "A low", NoActionRequired(), "note"), minutes=0, owner=a)
+            _ = escalate.hold("a-window", escalate.SessionPush("codex1", "A low", NoActionRequired(), "note"), minutes=0, owner=a)
             _ = escalate.hold("five-hour-codex", escalate.SessionPush("legacy Codex", "old low", NoActionRequired(), "note"), minutes=0)
-            _ = (self.root / "codex 1.md").unlink()
+            _ = (self.root / "codex1.md").unlink()
             before = {path.name: path.read_text() for path in (escalate.STATE / "held").glob("*.json")}
             _ = escalate.due(10**12)
             deliver.assert_not_called()
@@ -297,10 +297,10 @@ class EscalateTests(unittest.TestCase):
               patch.object(sessions, "live_sessions", return_value=[]),
               patch.object(escalate, "schedule"), patch.object(escalate, "deliver", return_value="") as deliver):
             a = self.select_codex(1)
-            for key in ("5-hour codex 1", "5-hour Codex", "5-hour Claude"):
+            for key in ("5-hour codex1", "5-hour Codex", "5-hour Claude"):
                 send.enqueue(send.Message("offline", "quota_alert", "", "low window", key), "offline", datetime.now(timezone.utc))
-            relay = escalate.HeldRelay(recipient="offline", key="5-hour codex 1")
-            _ = escalate.hold("a-window", escalate.SessionPush("codex 1", "A low", NoActionRequired(), "note"), owner=a, relays=(relay,))
+            relay = escalate.HeldRelay(recipient="offline", key="5-hour codex1")
+            _ = escalate.hold("a-window", escalate.SessionPush("codex1", "A low", NoActionRequired(), "note"), owner=a, relays=(relay,))
             _ = escalate.hold("five-hour-codex", escalate.SessionPush("legacy", "old low", NoActionRequired(), "note"))
             _ = self.select_codex(2)
             def retire(command: list[str], **_options: object) -> subprocess.CompletedProcess[str]:

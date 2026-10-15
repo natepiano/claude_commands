@@ -13,8 +13,8 @@ from typing import cast
 from unittest import mock
 
 import push_texts
-from push_texts import ActionTemplate, PushExample, PushText
-from user_action import ActionRequired
+from push_texts import ActionTemplate, PushExample, PushText, SessionTemplate
+from user_action import NO_SESSION_LINE, SessionLine
 
 ROOT = Path(__file__).resolve().parents[2]
 EXEMPT = {"scripts/notify/push_texts.py", "scripts/notify/pushover.py", "scripts/message/send.py", "scripts/message/escalate.py"}
@@ -101,10 +101,59 @@ class PushTextTests(unittest.TestCase):
             for example in entry.examples:
                 with self.subTest(id=entry.id, example=example.name):
                     push = push_texts.render_entry(entry, example.values)
-                    text = ("Action: " + push.action.text + "\n" + push.body
-                            if isinstance(push.action, ActionRequired) else push.body)
+                    text = push.message
                     self.assertLess(len(text), 500)
                     self.assertLess(len(push.title), 45)
+
+    def test_session_template_renders_before_action_and_body(self) -> None:
+        entry = replace(self.entry(), session=SessionTemplate("{version}"))
+        push = push_texts.render_entry(entry, {"version": "1.2"})
+        self.assertEqual(push.session, SessionLine("1.2"))
+        self.assertEqual(push.message, "Session: 1.2\nAction: Reply upgrade or wait.\nThe check passed on 1.2.")
+
+    def test_entry_without_session_keeps_its_existing_message(self) -> None:
+        push = push_texts.render_entry(self.entry(), {"version": "1.2"})
+        self.assertEqual(push.session, NO_SESSION_LINE)
+        self.assertEqual(push.message, "Action: Reply upgrade or wait.\nThe check passed on 1.2.")
+
+    def test_session_only_placeholder_is_required_and_fingerprinted(self) -> None:
+        entry = replace(self.entry(), session=SessionTemplate("{session}"))
+        with self.assertRaises(ValueError):
+            _ = push_texts.render_entry(entry, {"version": "1.2"})
+        values = {"version": "1.2", "session": "Owner"}
+        self.assertEqual(push_texts.render_entry(entry, values).session, SessionLine("Owner"))
+        entry = replace(entry, examples=(PushExample("typical", values),))
+        self.assertNotEqual(push_texts.fingerprint(entry), push_texts.fingerprint(replace(entry, session=SessionTemplate("{session:s}"))))
+
+    def test_holdout_begins_with_the_users_four_lines(self) -> None:
+        entry = next(entry for entry in push_texts.catalog() if entry.id == "shutdown.holdout")
+        push = push_texts.render_entry(entry, entry.examples[0].values)
+        self.assertEqual(push.title + "\n" + push.message.split("\n\n", 1)[0],
+            "Owner Restart is blocked\nSession: Owner\n"
+            + "Action: answer the open form, or run the command below to stop Owner\n"
+            + "Reason: Restart is blocked because Owner's claude session is not answering, and it can't proceed.")
+
+    def test_remote_control_examples_keep_role_in_title_and_session_in_message(self) -> None:
+        entry = next(entry for entry in push_texts.catalog() if entry.id == "shutdown.remote_control")
+        expected = {
+            "typical": ("Owner", "Owner"),
+            "unit": ("trunk unit", "build-followups-trunk-unit-director"),
+            "showrunner": ("demo showrunner", "build-followups-director"),
+        }
+        for example in entry.examples:
+            with self.subTest(example=example.name):
+                who, session = expected[example.name]
+                push = push_texts.render_entry(entry, example.values)
+                self.assertEqual(push.title + "\n" + push.message,
+                    f"{who} remote-control is off\nSession: {session}\n"
+                    + "Action: run /remote-control\nReason: Remote control is off.")
+
+    def test_holdout_reports_time_already_waited_within_the_message_limit(self) -> None:
+        entry = next(entry for entry in push_texts.catalog() if entry.id == "shutdown.holdout")
+        push = push_texts.render_entry(entry, entry.examples[0].values)
+        self.assertIn("Do nothing: the restart keeps waiting. It has waited 4 minutes so far.", push.body)
+        self.assertIn("Command: " + push.values["command"] + " (on natedev)", push.body)
+        self.assertLess(len(push.message), 500)
 
     def test_template_change_with_same_example_output_invalidates_every_approval(self) -> None:
         entry = self.entry()

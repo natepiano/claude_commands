@@ -27,7 +27,7 @@ REPOSITORY = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPOSITORY))
 from scripts.production import review_regime
 from scripts.usage import collect, usage_report, weights
-from scripts.whoami.seat_usage import parse_boundary
+from scripts.whoami.worker_usage import parse_boundary
 
 Arm = Literal["pool", "own"]
 Kind = Literal["broad", "closure", "ux"]

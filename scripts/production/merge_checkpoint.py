@@ -1,5 +1,10 @@
 #!/usr/bin/env python3
-"""Merge, test, push, promote, and record one production checkpoint."""
+"""Merge, test, push, promote, and record one production checkpoint.
+
+A unit checkpoint commit without its Change-Review line is held before the merge. After the push,
+each visible change becomes a row in the change-review list the production doc names
+(`change_review.py`); the file is written and never committed.
+"""
 from __future__ import annotations
 
 import argparse
@@ -14,6 +19,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import NamedTuple, cast
 
+import change_review
 from add_unit import Production, Refusal, cell_value, read_production, unit_table
 
 
@@ -388,6 +394,43 @@ def ancestry(request: MergeRequest) -> bool:
     report("ancestry", "ok", "checkpoint exists, follows history, and is on origin" +
            ("; already merged" if already else ""))
     return already
+
+
+def change_review_commits(request: MergeRequest) -> list[change_review.Commit]:
+    """The unit's own commits in this checkpoint; hold it when one lacks its Change-Review line."""
+    history = merge_history(request)
+    previous = history.hash if isinstance(history, LastMerged) else f"origin/{request.production.merge_branch}"
+    try:
+        commits = change_review.unit_commits(request.production.checkout, request.commit, previous,
+                                             request.production.merge_branch)
+    except change_review.ChangeReviewError as error:
+        raise Stop("change review", "failed", str(error), "the showrunner will inspect the failed command") from error
+    if refused := change_review.missing(commits):
+        raise Stop("change review", "held", "; ".join(refused),
+                   f"commit a checkpoint whose {change_review.TRAILER} lines describe the change and that names each "
+                   + f"listed commit in a `{change_review.TRAILER}-Covers: <hash>` line, push it, and send its hash")
+    report("change review", "ok", f"{len(commits)} unit commit(s) carry their {change_review.TRAILER} lines")
+    return commits
+
+
+def record_changes(request: MergeRequest, commits: list[change_review.Commit], merge_head: str) -> None:
+    """Add one row per visible change to the production's list, then name any merge still missing rows."""
+    doc = change_review.list_path(request.production.doc)
+    if doc is None:
+        report("change review", "ok", "the production keeps no change-review list")
+        return
+    merged = good(git(request.production.checkout, "rev-parse", f"--short={change_review.SHORT}", merge_head), "push")
+    try:
+        rows = change_review.append_rows(doc, change_review.visible(commits),
+                                         datetime.now(request.production.zone).date(), merged)
+        drifted = change_review.drift(request.production.checkout, request.production.merge_branch,
+                                      doc.read_text(encoding="utf-8"), change_review.LANDED)
+    except (change_review.ChangeReviewError, OSError) as error:
+        report("change review", "failed", f"{doc} not written: {error}; add its rows by hand")
+        return
+    report("change review", "ok", f"{len(rows)} row(s) added to {doc}" + "".join(f"; {row}" for row in rows))
+    for line in drifted:
+        report("change review", "drift", line)
 
 
 def changed_paths(request: MergeRequest, base: str = "") -> tuple[str, ...]:
@@ -813,6 +856,7 @@ def run(request: MergeRequest) -> int:
         already = ancestry(request)
         tests_green = "merge tests" if isinstance(request.kind, CodeCheckpoint) else "no tests"
         pushed = pushed_state(request) if already else NotYetPushed()
+        commits = [] if already else change_review_commits(request)
         if not already:
             paths = changed_paths(request)
             scope(request, paths)
@@ -843,6 +887,8 @@ def run(request: MergeRequest) -> int:
             tip = push_git(request, not already)
         else:
             tip = push_validate(request, not already)
+        if isinstance(pushed, NotYetPushed):
+            record_changes(request, commits, merge_head)
         into(request.production.checkout, request.production.merge_branch,
              "the merge branch collects every unit's checkpoints", gate_names(request, first_code_merge))
         promote(request, tip)
