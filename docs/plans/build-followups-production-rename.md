@@ -52,40 +52,33 @@
 
 ### Phase 1 — Formerly resolver  · status: done
 
-#### Work Order
+#### As-built
 
-**Goal:** Every slug lookup accepts a former slug and answers for the production that now holds it.
-
-**Depends on:** none.
-
-**Spec:**
-- A production doc may carry `- **Formerly:** \`<old>\`[, \`<older>\`]` in Production Context.
-- `showrunners.py` gains `canonical_slug(slug: str, state_dir: Path | None = None) -> str`. It returns `slug` when a timer has it. Otherwise it reads each registered timer's doc for a Formerly line naming `slug` and returns that timer's slug. With neither, it returns `slug` unchanged: the resolver only maps former names, and each caller keeps its own existing check for an unknown production, so the review pool and unit lookup still work for a production with no timer. (Changed in phase 1 review: a raising resolver broke both for timer-less productions.)
-- `current_name`, `current_address`, `named`, `attach`, `detach`, and the `parent|children|root` CLI all canonicalize their slug argument first.
-- `production_slug(doc)` is unchanged; the doc name is the current slug.
-- `unit_lookup.py pane|list <slug>` and `review_pool.py`'s production argument canonicalize the same way, by importing `canonical_slug`.
+- A production doc may carry `- **Formerly:** \`<old>\`[, \`<older>\`]` inside its `## Production Context` section; `production_slug(doc)` is unchanged, so the doc name is the current slug.
+- `showrunners.canonical_slug(slug: str, state_dir: Path | None = None) -> str` returns `slug` when an update timer has it; otherwise it returns the slug of the current production whose Production Context Formerly line names `slug`; otherwise it returns `slug` unchanged. It never raises. A slug that is both current and former resolves to the current one.
+- `current_name`, `current_address`, `named`, `attach`, `detach`, and the `parent|children|root` CLI canonicalize their slug first. Each caller keeps its own existence check: `attach`, `detach` and the CLI still refuse a slug with no update timer.
+- `named()` prefers the production a name resolves to over a live session that shares the name.
+- `unit_lookup.py pane|list <slug>` and `review_pool.py`'s `_production` canonicalize the production slug by importing `canonical_slug`.
 
 **Files:**
-- `scripts/production/showrunners.py` — `canonical_slug`, plus its uses.
-- `scripts/production/unit_lookup.py` — canonicalize its slug argument.
-- `scripts/delegate/review_pool.py` — canonicalize at lines 266-270.
-- `scripts/production/test_showrunners.py` — tests.
+- `scripts/production/showrunners.py` — `canonical_slug`, Formerly parsing, resolved lookups.
+- `scripts/production/unit_lookup.py` — canonicalizes the production argument.
+- `scripts/delegate/review_pool.py` — canonicalizes the production argument.
+- `scripts/production/test_showrunners.py` — resolver, collision and section-scoping tests.
 
-**Workers:** 1 writer + 1 tester
-- `impl` — showrunners.py, unit_lookup.py, review_pool.py; hub: `scripts/production/showrunners.py` (every lookup imports it).
-- `test` — test_showrunners.py: a timer for `new` whose doc says Formerly `old`. `address old` returns new's address. An unknown slug passes through `canonical_slug` unchanged and `address` still refuses it. A slug both current and former resolves to the current one.
+**Binds later work:** `canonical_slug` reads Formerly only from `## Production Context` and returns an unknown slug unchanged; the rename tool's apply step must add the Formerly line inside Production Context before the update-timer dir moves (consumer: "rename.py plan|apply").
 
-**Constraints from prior phases:** none.
+**Gotchas:** `test_unit_lookup` and `test_review_pool` use productions with no update timer, so a strict lookup at those callers breaks them. A `**Formerly:**` line outside `## Production Context` is ignored. The CLI `attach`/`detach` canonicalize twice (CLI and function); harmless.
 
-**Acceptance gate:** `python3 -m unittest scripts.production.test_showrunners scripts.production.test_unit_lookup scripts.delegate.test_review_pool` green; basedpyright 0/0.
+**Ruled out:** a resolver that raises on an unknown slug — it breaks the review pool and unit lookup for timer-less productions. Importing `unit_lookup` as a package from the repo root — every importer loads production modules flat from `scripts/production`.
 
-### Phase 2 — rename.py plan|apply (production-wide)  · status: todo
+### Phase 2 — rename.py plan|apply (production-wide)  · status: done
 
 #### Work Order
 
 **Goal:** `rename.py plan <old> <new>` prints every move in items 1-6 of the slug list without touching anything. `apply` performs them atomically and stops at the first refusal.
 
-**Depends on:** Formerly resolver.
+**Depends on:** Phase 1
 
 **Spec:**
 - `new` must match `tidy_wrapped.SLUG`, must not be in `SHARED`, and must not already be a timer slug or a Formerly entry.
@@ -109,7 +102,7 @@
 - `impl` — rename.py; hub: `scripts/production/rename.py`.
 - `test` — test_rename.py, on a fixture modeled on test_production_lifecycle.py:77-180: plan prints every item; apply moves every one; a rerun after a simulated failure at step 4 resumes; refusals for a bad or taken slug.
 
-**Constraints from prior phases:** `canonical_slug` resolves Formerly entries. `apply` must add the Formerly line before renaming the timer dir, so lookups never fail in between.
+**Constraints from prior phases:** `canonical_slug` resolves Formerly entries, read only from the doc's `## Production Context` section, and returns an unknown slug unchanged (it never raises). `apply` must add the Formerly line inside Production Context before renaming the timer dir, so lookups never fail in between.
 
 **Acceptance gate:** `python3 -m unittest scripts.production.test_rename` green; basedpyright 0/0.
 
@@ -119,7 +112,7 @@
 
 **Goal:** `rename.py unit <new> <unit>` moves one unit's branch and worktree between its runs. `finish <new>` retires the old merge branch once every unit has moved.
 
-**Depends on:** rename.py plan|apply.
+**Depends on:** Phase 2
 
 **Spec:**
 - `unit` refuses while the unit's tmux session has a live Claude in the worktree; the check uses `unit_lookup.py pane`.
@@ -148,14 +141,17 @@
 
 **Goal:** The showrunner can run a rename from a command doc, and the as-built records it.
 
-**Depends on:** rename.py unit|finish.
+**Depends on:** Phase 3
 
 **Spec:**
 - `commands/showrunner/rename.md`: the order is plan, then apply, then for each unit between its runs `unit`, then `finish`. Tell each unit director its new worktree path before it resumes. Never rewrite history.
 - Add the `**Formerly:**` line to `~/.claude/docs/production_format.md`'s doc structure, in the Production Context list.
 - `docs/as-built/production-rename.md`.
 
-**Files:** `commands/showrunner/rename.md`, `docs/production_format.md` (outside this unit's Units row; send the one-line overlap to the showrunner before editing), `docs/as-built/production-rename.md`.
+**Files:**
+- `commands/showrunner/rename.md` — the command doc.
+- `docs/production_format.md` — the **Formerly:** line only (outside this unit's Units row; the showrunner granted it for this run on 2026-10-15).
+- `docs/as-built/production-rename.md` — the as-built.
 
 **Workers:** 1 writer; nothing splits (docs only).
 - `impl` — all three files.
@@ -170,14 +166,15 @@
 
 **Goal:** A real rename of a scratch production on natedev, end to end, leaves every lookup working under both names.
 
-**Depends on:** Command doc and as-built.
+**Depends on:** Phase 4
 
 **Spec:**
 - Build a scratch production with one unit by hand, as test_production_lifecycle.py:77-180 does: a scratch git repo whose origin is a local bare repo, a doc, a Units row, a worktree, and state dirs pointed at a scratch root through the env overrides. Run the real `rename.py` CLI: plan, apply, unit and finish. No branch reaches GitHub. Check `showrunners.py address <old>` and `<new>`, `unit_lookup.py list <old>`, the stall watch and the review-pool lease paths.
 - Then delete the scratch root, which holds every path the check created.
 - Never touch a real production's state.
 
-**Files:** none changed; a findings note goes into the handoff only.
+**Files:**
+- `docs/as-built/production-rename.md` — a short Live check section with what the scratch run showed; the run itself writes only under a scratch root it deletes.
 
 **Workers:** 1 writer; nothing splits.
 - `impl` — runs the check and reports.
