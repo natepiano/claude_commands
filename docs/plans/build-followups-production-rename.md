@@ -72,7 +72,7 @@
 
 **Ruled out:** a resolver that raises on an unknown slug — it breaks the review pool and unit lookup for timer-less productions. Importing `unit_lookup` as a package from the repo root — every importer loads production modules flat from `scripts/production`.
 
-### Phase 2 — rename.py plan|apply (production-wide)  · status: todo
+### Phase 2 — rename.py plan|apply (production-wide)  · status: done
 
 #### Work Order
 
