@@ -360,7 +360,7 @@ print("SENT: delivered")
         return [cast(list[str], json.loads(line)) for line in path.read_text().splitlines()]
 
     def wait_for_path(self, path: Path) -> None:
-        deadline = time.monotonic() + 3
+        deadline = time.monotonic() + TEST_WALL
         while time.monotonic() < deadline and not path.exists():
             time.sleep(0.01)
         self.assertTrue(path.exists(), f"timed out waiting for {path}")
@@ -1016,6 +1016,7 @@ print("SENT: delivered")
 
     def test_tick_releases_record_lock_during_session_lookup(self) -> None:
         marker = self.root / "lookup-started"
+        release = self.root / "lookup-release"
         sessions = self.root / "sessions-slow.py"
         _ = sessions.write_text(
             "".join((
@@ -1023,7 +1024,10 @@ print("SENT: delivered")
                 "import os, time\n",
                 "from pathlib import Path\n",
                 "Path(os.environ['LOOKUP_MARKER']).touch()\n",
-                "time.sleep(2)\n",
+                "release = Path(os.environ['LOOKUP_RELEASE'])\n",
+                f"deadline = time.monotonic() + {TEST_WALL}\n",
+                "while not release.exists() and time.monotonic() < deadline:\n",
+                "    time.sleep(0.01)\n",
                 "print(os.environ['SESSION_SOCKET'])\n",
             ))
         )
@@ -1036,6 +1040,8 @@ print("SENT: delivered")
             "CONVERSATION_PAUSE_SESSIONS": str(sessions),
             "CONVERSATION_PAUSE_NOW_EPOCH": "200",
             "LOOKUP_MARKER": str(marker),
+            # The lookup holds until the lock is tried, so a loaded machine cannot finish it first.
+            "LOOKUP_RELEASE": str(release),
         }
         process = subprocess.Popen(
             [sys.executable, str(LIBRARY), "tick"],
@@ -1050,6 +1056,7 @@ print("SENT: delivered")
                 fcntl.flock(
                     lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB
                 )
+            release.touch()
             _, stderr = process.communicate(timeout=TEST_WALL)
         finally:
             if process.poll() is None:
@@ -1552,6 +1559,7 @@ print("SENT: delivered")
 
     def test_delivery_does_not_overwrite_newer_replying_phase(self) -> None:
         marker = self.root / "send-started"
+        release = self.root / "send-release"
         send = self.root / "send-slow.py"
         _ = send.write_text(
             "".join((
@@ -1559,7 +1567,10 @@ print("SENT: delivered")
                 "import os, time\n",
                 "from pathlib import Path\n",
                 "Path(os.environ['SEND_MARKER']).touch()\n",
-                "time.sleep(2)\n",
+                "release = Path(os.environ['SEND_RELEASE'])\n",
+                f"deadline = time.monotonic() + {TEST_WALL}\n",
+                "while not release.exists() and time.monotonic() < deadline:\n",
+                "    time.sleep(0.01)\n",
                 "print('SENT: delivered')\n",
             ))
         )
@@ -1575,6 +1586,8 @@ print("SENT: delivered")
             "CONVERSATION_PAUSE_SEND": str(send),
             "CONVERSATION_PAUSE_NOW_EPOCH": "150",
             "SEND_MARKER": str(marker),
+            # The send holds until the typed prompt is done, however slowly a loaded machine runs it.
+            "SEND_RELEASE": str(release),
         }
         process = subprocess.Popen(
             [sys.executable, str(LIBRARY), "tick"],
@@ -1586,6 +1599,7 @@ print("SENT: delivered")
         try:
             self.wait_for_path(marker)
             typed = self.run_prompt("new topic", now=160)
+            release.touch()
             self.assertEqual(
                 (typed.returncode, typed.stdout, typed.stderr), (0, "", "")
             )

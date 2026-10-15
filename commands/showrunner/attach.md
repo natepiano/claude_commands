@@ -8,7 +8,8 @@ argument-hint: "<child> [parent] | detach <child> | tree"
 **Usage:** `/showrunner:attach <child> [parent]`, `/showrunner:attach detach <child>`,
 `/showrunner:attach tree`. A child and a parent are named by production slug
 (the production doc's file name without `-production.md`) or, for the caller's
-own production, left out.
+own production, left out. A former slug, from the doc's **Formerly** line
+after `/showrunner:rename`, names the same production.
 
 Run `"$HOME/.claude/scripts/lib/py" "$HOME/.claude/scripts/production/showrunners.py" <verb> …`
 with the sandbox off, and print its output as it comes:

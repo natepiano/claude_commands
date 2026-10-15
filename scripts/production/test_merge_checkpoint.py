@@ -184,10 +184,11 @@ class MergeCheckpointTests(unittest.TestCase):
 
     def production_doc(self, *, owns_cell: str = SIMPLE_OWNS,
                        merge_tests_line: str | None = SIMPLE_MERGE_TESTS,
-                       hub_files: bool = True) -> None:
+                       hub_files: bool = True, change_review: Path | None = None) -> None:
         rows = [
             "# Production — example", "", "## Production Context", "",
             "- **Merge branch:** `production`",
+            *([f"- **Change review:** `{change_review}`"] if change_review else []),
             f"- **Showrunner checkout:** `{self.checkout}`",
             "- **Showrunner session:** test-showrunner",
             "- **Log:** `production.log`",
@@ -503,6 +504,45 @@ class MergeCheckpointTests(unittest.TestCase):
         self.assertIn("--cancel-prior applies only to Push: validate_and_push", result.process.stdout)
         self.assertEqual(self.git("rev-parse", "HEAD"), result.before)
         self.assertEqual(self.events("checkpoint-test"), [])
+
+    def dated_checkpoint(self, message: str) -> str:
+        """A checkpoint(...) commit on the unit branch, dated after the Change-Review rule landed."""
+        self.write(self.unit, "src/alpha.txt", message)
+        _ = self.git("add", "src/alpha.txt", cwd=self.unit)
+        _ = subprocess.run(["git", "commit", "-q", "-m", message], cwd=self.unit, check=True,
+                           env={**os.environ, "GIT_COMMITTER_DATE": "2026-10-15T12:00:00-04:00"})
+        _ = self.git("push", "origin", "alpha-branch", cwd=self.unit)
+        return self.git("rev-parse", "HEAD", cwd=self.unit)
+
+    def test_a_checkpoint_without_a_change_review_line_is_held_before_merge(self) -> None:
+        sha = self.dated_checkpoint("checkpoint(alpha): grid fades")
+        result = self.run_checkpoint(sha)
+        self.assertNotEqual(result.process.returncode, 0)
+        self.assert_stopped_before_merge(result, "held", "checkpoint(alpha): grid fades: no Change-Review line")
+        self.assertIn("Change-Review-Covers", result.process.stdout)
+
+    def test_a_merge_adds_a_row_per_visible_change_to_the_named_list(self) -> None:
+        review = self.root / "change-review.md"
+        _ = review.write_text("## To review\n\n| # | Change | Merged | On the Mac build | How to check |\n"
+                              + "| --- | --- | --- | --- | --- |\n| C7 | old | 2026-10-14 | yes | - |\n", encoding="utf-8")
+        self.production_doc(change_review=review)
+        sha = self.dated_checkpoint("checkpoint(alpha): grid fades\n\n"
+                                    + "Change-Review: The grid fades gently | Look across the floor\n"
+                                    + "Change-Review: none — the merge script")
+        result = self.run_checkpoint(sha)
+        self.assertEqual(result.process.returncode, 0, result.process.stderr + result.process.stdout)
+        merged = self.git("rev-parse", "--short=8", "HEAD")
+        self.assertRegex(review.read_text(encoding="utf-8").splitlines()[-1],
+                         rf"^\| C8 \| The grid fades gently \| \d{{4}}-\d\d-\d\d · {merged} \| not yet \| Look across the floor \|$")
+        self.assertIn("change review: ok — 1 row(s) added", result.process.stdout)
+        self.assertNotIn("change review: drift", result.process.stdout)
+        self.assertEqual(self.git("status", "--porcelain"), "")
+
+    def test_a_production_without_a_list_writes_no_rows(self) -> None:
+        sha = self.dated_checkpoint("checkpoint(alpha): grid fades\n\nChange-Review: none — the merge script")
+        result = self.run_checkpoint(sha)
+        self.assertEqual(result.process.returncode, 0, result.process.stderr + result.process.stdout)
+        self.assertIn("change review: ok — the production keeps no change-review list", result.process.stdout)
 
     def test_absent_optional_fields_default_to_validate_push_without_promotion(self) -> None:
         self.push = ""

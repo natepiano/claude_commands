@@ -26,11 +26,11 @@ Each production has its own pool of long-lived, read-only Codex reviewers. A uni
 
 ### State
 
-A pool belongs to one production. Its state is `~/.local/state/review-pool/<slug>/`; `REVIEW_POOL_STATE` replaces the root. `<slug>` is the production doc's file name without `-production.md`, and `--production` accepts the slug or the doc's path.
+A pool belongs to one production. Its state is `~/.local/state/review-pool/<slug>/`; `REVIEW_POOL_STATE` replaces the root. `<slug>` is the production doc's file name without `-production.md`, and `--production` accepts the slug or the doc's path. `_production` passes that slug through `showrunners.canonical_slug`, so a former slug reaches the current pool; a production rename moves the pool directory, leases included (`docs/as-built/production-rename.md`).
 
 | Path | Holds |
 | --- | --- |
-| `pool.json` | Templates, reviewers, leases, the split, the generation. Written through a temporary file and `os.replace` |
+| `pool.json` | Templates, reviewers, leases, the split, the generation. Written through a temporary file, `fsync` (skipped when `PLAN_DELEGATE_SYNC_WRITES=0`, for test fixtures) and `os.replace` |
 | `pool.lock` | One `fcntl.flock` around every read-modify-write of `pool.json` |
 | `prime/<sha256>.md` | Copies of standing prompts, named by content hash |
 | `cwd/` | The templates' working directory, empty |
@@ -112,7 +112,7 @@ Lens `ux` with no pool is accepted. From there the launcher:
 5. Takes `reviewer`, `mesh_dir`, `thread_id`, `lease_ordinal` and `prime_hash` from the allocation line. Its slot is `pool_<reviewer>`: exported as `PLAN_DELEGATE_TEAM_ROLE` and written as one line to the slot file, since the slot is known only after allocation and the unit director needs it to cancel.
 6. Prepends the unit's memory (`review_pool.py unit-memory`) for `code` when `lease_ordinal` is 1, and on every `ui` turn, which starts from a reset thread that holds nothing from an earlier turn. It writes `${SESSION_DIR}/review_message_<pass><suffix>.XXXXXX` (the memory, a blank line, the prompt), sends that file as the prompt and removes it at exit. With no memory the prompt goes unchanged. A failed `unit-memory` call ends the attempt as an `error`.
 7. Claims the reviewer in the pool's `mesh_dir` (`can-follow --claim-pid $$`), compacting it first when its recorded context is an integer over `PLAN_DELEGATE_COMPACT_ABOVE_TOKENS` (100000 in `config/delegate.conf`). Roster, compaction, claim and claim release use the pool's `mesh_dir`; status file, findings, agent log, heartbeat, board and pass stay in the unit's `${SESSION_DIR}`.
-8. Records the review pass under its slot, except for lens `ux` (`record_pass_start` returns at once, with a pool and without one): the unit director's `UX review` activity already carries that time, and a pass would count it twice. An early launch defers the pass until its sentinel file appears, as on the assigned path.
+8. Records the review pass under its slot, except for lens `ux` (`record_pass_start` returns at once, with a pool and without one): the unit director's `UX review` activity already carries that time, and a pass would count it twice. An early launch defers the pass until its sentinel file appears, as on the assigned path; it checks for the file every `PLAN_DELEGATE_EARLY_POLL_SECS` (default 5 s; tests set it small).
 9. Runs `codex_mesh.py follow --session-dir <mesh_dir> --to <reviewer> --claim-pid $$ --role review [--lens L] --cwd "${WORKING_DIR}" --read-only [--image …] --message-file … --summary-file <findings> --reply-file … --log-file … --model … --effort … --service-tier …` with the review model, effort and tier.
 10. After the turn, checks that the working tree is unchanged, counts the findings, writes `reviewed` or `error` to the status file and closes the pass (`finish-pass --status completed` or `error`).
 11. On every exit: writes `error` to the status file when the exit code is not 0, reads the reviewer's thread id from the mesh roster, writes the turn record, releases the mesh claim, runs `review_pool.py release --production <slug> --reviewer R --pid $$ --thread-id <id>` and removes the temporary prompt file. A record that cannot be written prints `ERROR: unable to write review turn record.` and makes the exit 1.
@@ -375,7 +375,7 @@ production with the same assignment by hash.
 reviewer judges the same shots as the Claude helper. Its verdict is recorded
 but not used. Adopt when it found every defect the helper found.
 
-**Measuring tokens per review.** `seat_usage.py --reviews --since <date>` reads
+**Measuring tokens per review.** `worker_usage.py --reviews --since <date>` reads
 every `review_turn_*.json` under `/tmp/claude/delegate/` on natedev and the
 Mac. It sums the rollout's token counts for that turn id, and prints weighted
 tokens per review by arm (fresh, own worker, pool) and kind (broad lens, closure,
@@ -398,7 +398,7 @@ records each unit already keeps:
   in code the broad review read, merge holds and merge design-check defects
   (`review_regime.py`, regime `pool`), and red CI traced to the phase.
 
-`seat_usage.py --reviews --quality` plots precision and escapes per review
+`worker_usage.py --reviews --quality` plots precision and escapes per review
 against two measures:
 - the memory entry count when the review ran (memory version, stored with the
   turn record);

@@ -4,7 +4,7 @@
 used percent counts half as much per `HALF_LIFE` of age, and a refill only skips
 the drop, so the night before a morning refill still counts toward the next day.
 Time an account sat logged out is skipped too, so it does not read as quiet use.
-Replayed hourly over 2026-10-05 to 10-07 (claude 1 and codex 2, three run-outs),
+Replayed hourly over 2026-10-05 to 10-07 (claude1 and codex2, three run-outs),
 it cut the footer's run-out error from a 3.4 h median and 8.2 h p90, 2.9 h early
 on average, to 1.7 h and 4.0 h, 0.3 h early. The footer it replaced took a plain
 rate over the day since the last refill and scaled the time left by how much
@@ -21,6 +21,11 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import NotRequired, TypedDict, cast
+
+if __package__:
+    from .note_file import canonical_label
+else:
+    from note_file import canonical_label
 
 # Timer and package callers share credit observation types and the log location.
 if __name__ == "run_out":
@@ -92,7 +97,7 @@ def _reading_records(path: Path) -> list[StoredReading]:
                 continue
             at = datetime.fromisoformat(cast(str, value["at"]))
             if at.tzinfo is not None:
-                record = StoredReading(account=cast(str, value["account"]), at=cast(str, value["at"]))
+                record = StoredReading(account=canonical_label(cast(str, value["account"])), at=cast(str, value["at"]))
                 if _numeric(value.get("remaining")):
                     record["remaining"] = cast(float, value["remaining"])
                 if _numeric(value.get("credits")):
@@ -130,7 +135,7 @@ def read_credit_readings(path: Path) -> dict[str, list[CreditReading]]:
 
 def credits_used(readings: dict[str, list[CreditReading]], label: str, *,
                  since: datetime, until: datetime) -> CreditsUsed | NoCreditReading | UsageUnknown:
-    available = sorted(item for item in readings.get(label, []) if item.at <= until)
+    available = sorted(item for item in readings.get(canonical_label(label), []) if item.at <= until)
     if not available:
         return NoCreditReading()
     before = [item for item in available if item.at <= since]

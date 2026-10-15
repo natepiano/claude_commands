@@ -183,7 +183,7 @@ def showrunner_account_directory() -> Path:
         selected = accounts.account_for_group_launch("showrunner", resume=True)
     except accounts.AccountsError as error:
         raise Refusal(str(error)) from error
-    return accounts.main_config_dir() if isinstance(selected, accounts.DefaultAccount) else selected.dir
+    return selected.dir
 
 
 def account_line() -> str:

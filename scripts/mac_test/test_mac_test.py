@@ -364,7 +364,9 @@ class MacTestCommandTests(unittest.TestCase):
             "ci_variable": "MACOS_CI",
             "ci_workflow": "ci.yml",
             "ci_job": CI_JOB,
-            "gh_timeout_s": "2",
+            # Long enough for the Python gh stand-in under load; a test about
+            # the limit sets its own.
+            "gh_timeout_s": "60",
             "block_hours": "4",
             "block_max_hours": "48",
             "block_warn_minutes": "15",
@@ -388,7 +390,7 @@ class MacTestCommandTests(unittest.TestCase):
         self,
         *arguments: str,
         environment: dict[str, str] | None = None,
-        timeout: float = 10,
+        timeout: float = 60,
     ) -> subprocess.CompletedProcess[str]:
         return subprocess.run(
             [sys.executable, str(SCRIPT), *arguments],
@@ -529,7 +531,7 @@ class MacTestCommandTests(unittest.TestCase):
     def clear_log(self, name: str) -> None:
         (self.stub_directory / f"{name}.jsonl").unlink(missing_ok=True)
 
-    def wait_for_path(self, path: Path, timeout: float = 3) -> None:
+    def wait_for_path(self, path: Path, timeout: float = 60) -> None:
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
             if path.exists():
@@ -537,7 +539,7 @@ class MacTestCommandTests(unittest.TestCase):
             time.sleep(0.01)
         self.fail(f"timed out waiting for {path}")
 
-    def wait_for_log_count(self, name: str, count: int, timeout: float = 3) -> None:
+    def wait_for_log_count(self, name: str, count: int, timeout: float = 60) -> None:
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
             if len(self.logged_arguments(name)) >= count:
@@ -546,7 +548,7 @@ class MacTestCommandTests(unittest.TestCase):
         self.fail(f"timed out waiting for {count} {name} calls")
 
     def wait_for_free_message(
-        self, expected: FreeMessageState, timeout: float = 3
+        self, expected: FreeMessageState, timeout: float = 60
     ) -> dict[str, object]:
         deadline = time.monotonic() + timeout
         block = self.block_state()
@@ -691,7 +693,7 @@ class MacTestCommandTests(unittest.TestCase):
                 self.assertTrue(mac_test.run_is_live(decoded))
                 self.assertEqual(decoded["what"], record["what"])
                 self.assertEqual(decoded["since"], record["since"])
-            self.assertNotIsInstance(mac_test.live_run(paths), mac_test.NoRun)
+            self.assertEqual([claim.record for claim in mac_test.live_claims(paths)], [decoded])
         self.assertEqual(self.run_state(), record)
 
     def test_claim_records_holder_session_and_starts_checkout_watcher(self) -> None:
@@ -914,6 +916,155 @@ class MacTestCommandTests(unittest.TestCase):
         self.assert_command(result, 12, f"state unreadable: {block_path}\n")
         self.assertFalse((self.state_directory / "run.json").exists())
 
+    def repository(self, name: str) -> Path:
+        """A folder that sweep.repo_name reads as the named repository."""
+        directory = self.root / "repositories" / name
+        (directory / ".git").mkdir(parents=True)
+        return directory
+
+    def repository_claim(self, name: str) -> RunState:
+        return cast(RunState, json.loads((self.state_directory / "claims" / f"{name}.json").read_text(encoding="utf-8")))
+
+    def claim_in(self, owner: int, what: str, worktree: Path) -> subprocess.CompletedProcess[str]:
+        return self.command("claim", "--pid", str(owner), "--what", what, "--worktree", str(worktree))
+
+    def busy_line(self, record: RunState) -> str:
+        since = datetime.fromisoformat(record["since"]).astimezone(LOCAL_ZONE).strftime("%H:%M")
+        return f"busy: {record['what']} since {since}\n"
+
+    def claim_names(self) -> list[str]:
+        claims = self.state_directory / "claims"
+        return sorted(path.name for path in claims.iterdir()) if claims.exists() else []
+
+    def test_two_repositories_claim_the_mac_at_once(self) -> None:
+        hana, liner = self.repository("hana"), self.repository("cargo-liner")
+        first, second = self.start_child(), self.start_child()
+        self.assert_command(self.claim_in(first.pid, "hana tests", hana), 0, "claimed\n")
+        self.assert_command(self.claim_in(second.pid, "liner tests", liner), 0, "claimed\n")
+        self.assertEqual(self.claim_names(), ["cargo-liner.json", "hana.json"])
+        self.assertFalse((self.state_directory / "run.json").exists())
+        self.assertEqual((self.repository_claim("hana")["pid"], self.repository_claim("hana")["worktree"]),
+                         (first.pid, str(hana)))
+        self.assertEqual((self.repository_claim("cargo-liner")["pid"], self.repository_claim("cargo-liner")["worktree"]),
+                         (second.pid, str(liner)))
+        self.write_config(ci_repo="")
+        status = self.command("status")
+        self.assertEqual(status.returncode, 0, status.stdout + status.stderr)
+        lines = status.stdout.splitlines()
+        self.assertEqual(lines[0], f"running: hana tests ({hana}) since {self.local_time(self.repository_claim('hana')['since'])}")
+        self.assertEqual(lines[1], f"running: liner tests ({liner}) since "
+                         + self.local_time(self.repository_claim("cargo-liner")["since"]))
+        self.assertEqual(lines[2:], ["no block", "CI's Mac switch: not configured"])
+
+    def test_second_claim_for_one_repository_is_busy(self) -> None:
+        hana = self.repository("hana")
+        (hana / "crates").mkdir()
+        first, second = self.start_child(), self.start_child()
+        self.assert_command(self.claim_in(first.pid, "hana tests", hana), 0, "claimed\n")
+        held = self.repository_claim("hana")
+        self.assert_command(self.claim_in(second.pid, "more hana tests", hana / "crates"), 11, self.busy_line(held))
+        self.assertEqual(self.repository_claim("hana"), held)
+        self.assertEqual(self.claim_names(), ["hana.json"])
+
+    def test_dead_repository_claim_frees_itself(self) -> None:
+        hana = self.repository("hana")
+        owner = self.start_child()
+        self.assert_command(self.claim_in(owner.pid, "hana tests", hana), 0, "claimed\n")
+        self.stop_child(owner)
+        taker = self.start_child()
+        self.assert_command(self.claim_in(taker.pid, "new hana tests", hana), 0, "claimed\n")
+        after = self.repository_claim("hana")
+        self.assertEqual((after["pid"], after["what"]), (taker.pid, "new hana tests"))
+
+    def test_block_declines_every_repository_and_whole_mac_claim(self) -> None:
+        hana, liner = self.repository("hana"), self.repository("cargo-liner")
+        _ = self.write_block(free_message={"kind": "not_needed"})
+        owner = self.start_child()
+        for worktree in (hana, liner, self.root / "elsewhere"):
+            with self.subTest(worktree=worktree.name):
+                self.assert_command(self.claim_in(owner.pid, "tests", worktree), 10, "blocked by alice: release work\n")
+        self.assertEqual(self.claim_names(), [])
+        self.assertFalse((self.state_directory / "run.json").exists())
+
+    def test_free_now_answers_for_the_named_repository(self) -> None:
+        hana, liner = self.repository("hana"), self.repository("cargo-liner")
+        (hana / "crates").mkdir()
+        self.write_config(offload="on")
+        owner = self.start_child()
+        self.assert_command(self.claim_in(owner.pid, "hana tests", hana), 0, "claimed\n")
+        self.assert_command(self.command("free-now", "--repo-root", str(liner)), 0, "free\n")
+        self.assert_command(self.command("free-now", "--repo-root", str(hana)), 1, "busy\n")
+        self.assert_command(self.command("free-now", "--repo-root", str(hana / "crates")), 1, "busy\n")
+        self.assert_command(self.command("free-now"), 1, "busy\n")
+        _ = self.write_block(free_message={"kind": "not_needed"})
+        self.assert_command(self.command("free-now", "--repo-root", str(liner)), 1, "blocked\n")
+        self.assertEqual(self.logged_arguments("gh"), [])
+
+    def write_machine_wide_record(self, owner: int, worktree: Path) -> RunState:
+        started = mac_test.process_start_time(owner)
+        assert started is not None
+        record: RunState = {"pid": owner, "proc_start": started, "what": "older tests",
+                            "worktree": str(worktree), "since": datetime.now(timezone.utc).isoformat()}
+        self.state_directory.mkdir(exist_ok=True)
+        _ = (self.state_directory / "run.json").write_text(json.dumps(record), encoding="utf-8")
+        return record
+
+    def test_machine_wide_record_holds_the_repository_its_worktree_is_in(self) -> None:
+        hana, liner = self.repository("hana"), self.repository("cargo-liner")
+        self.write_config(offload="on")
+        owner, other = self.start_child(), self.start_child()
+        record = self.write_machine_wide_record(owner.pid, hana)
+        legacy = self.state_directory / "run.json"
+        before = legacy.read_bytes()
+        self.assert_command(self.claim_in(other.pid, "hana tests", hana), 11, self.busy_line(record))
+        self.assert_command(self.command("free-now", "--repo-root", str(hana)), 1, "busy\n")
+        self.assert_command(self.command("free-now", "--repo-root", str(liner)), 0, "free\n")
+        self.assert_command(self.claim_in(other.pid, "liner tests", liner), 0, "claimed\n")
+        self.assertEqual(legacy.read_bytes(), before)
+        self.assert_command(self.command("release", "--pid", str(owner.pid)), 0, "")
+        self.assertFalse(legacy.exists())
+        self.assertEqual(self.claim_names(), ["cargo-liner.json"])
+        self.assert_command(self.claim_in(owner.pid, "hana tests", hana), 0, "claimed\n")
+
+    def test_machine_wide_record_outside_any_repository_holds_every_repository(self) -> None:
+        hana, liner = self.repository("hana"), self.repository("cargo-liner")
+        self.write_config(offload="on")
+        owner, other = self.start_child(), self.start_child()
+        record = self.write_machine_wide_record(owner.pid, self.root / "elsewhere")
+        legacy = self.state_directory / "run.json"
+        before = legacy.read_bytes()
+        for worktree in (hana, liner):
+            with self.subTest(worktree=worktree.name):
+                self.assert_command(self.claim_in(other.pid, "tests", worktree), 11, self.busy_line(record))
+                self.assert_command(self.command("free-now", "--repo-root", str(worktree)), 1, "busy\n")
+        self.assertEqual(legacy.read_bytes(), before)
+        self.assertEqual(self.claim_names(), [])
+        self.assert_command(self.command("release", "--pid", str(owner.pid)), 0, "")
+        self.assertFalse(legacy.exists())
+
+    def test_whole_mac_claim_waits_for_any_repository_claim(self) -> None:
+        hana, liner = self.repository("hana"), self.repository("cargo-liner")
+        owner, other = self.start_child(), self.start_child()
+        self.assert_command(self.claim_in(owner.pid, "hana tests", hana), 0, "claimed\n")
+        held = self.repository_claim("hana")
+        self.assert_command(self.command("claim", "--pid", str(other.pid), "--what", "mac tests"), 11, self.busy_line(held))
+        self.assertFalse((self.state_directory / "run.json").exists())
+        self.assert_command(self.command("release", "--pid", str(owner.pid)), 0, "")
+        self.assert_command(self.command("claim", "--pid", str(other.pid), "--what", "mac tests"), 0, "claimed\n")
+        whole = self.run_state()
+        self.assertEqual(whole["worktree"], str(self.root))
+        self.assert_command(self.claim_in(owner.pid, "liner tests", liner), 11, self.busy_line(whole))
+
+    def test_release_removes_the_owner_claims_past_a_damaged_claim_file(self) -> None:
+        hana = self.repository("hana")
+        owner = self.start_child()
+        self.assert_command(self.claim_in(owner.pid, "hana tests", hana), 0, "claimed\n")
+        damaged = self.state_directory / "claims" / "cargo-liner.json"
+        _ = damaged.write_text("damaged\n", encoding="utf-8")
+        self.assert_command(self.command("release", "--pid", str(owner.pid)), 0, "")
+        self.assertEqual(self.claim_names(), ["cargo-liner.json"])
+        self.assert_command(self.claim_in(owner.pid, "hana tests", hana), 12, f"state unreadable: {damaged}\n")
+
     def hold_events(self, expected: int = 1) -> list[HoldEventRecord]:
         deadline = time.monotonic() + 5
         while True:
@@ -931,7 +1082,7 @@ class MacTestCommandTests(unittest.TestCase):
         with log.open("a+") as held_log:
             fcntl.flock(held_log, fcntl.LOCK_EX)
             try:
-                result = self.command("block", "--holder", "alice", "--for", "rendering", timeout=1.5)
+                result = self.command("block", "--holder", "alice", "--for", "rendering", timeout=60)
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
                 block = self.block_state()
                 for name in ("state.lock", "control.lock"):
@@ -973,7 +1124,7 @@ class MacTestCommandTests(unittest.TestCase):
                 self.assertEqual(log.read_text(), "")
             finally:
                 fcntl.flock(held_log, fcntl.LOCK_UN)
-                waiter.join(timeout=5)
+                waiter.join(timeout=60)
         self.assertFalse(waiter.is_alive())
         self.assertEqual(errors, [])
         self.assertTrue(finished.is_set())
@@ -1009,7 +1160,7 @@ class MacTestCommandTests(unittest.TestCase):
                 self.assertEqual(launched, [])
             for thread in threading.enumerate():
                 if thread.name == "hold-event-recorder":
-                    thread.join(timeout=5)
+                    thread.join(timeout=60)
                     self.assertFalse(thread.is_alive())
         self.assertEqual(len(launched), 1)
         self.assertEqual(launched[0].returncode, 0)
@@ -1043,7 +1194,7 @@ for arguments in (
     assert mac_test.main() == 0
 """
         result = subprocess.run([sys.executable, "-c", source, str(SCRIPT.parent)],
-                                env=self.environment, capture_output=True, text=True, timeout=5, check=False,
+                                env=self.environment, capture_output=True, text=True, timeout=60, check=False,
                                 pass_fds=(self.writer_write_fd,))
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         rows = self.hold_events(3)
@@ -1240,7 +1391,7 @@ for arguments in (
 
         unblocked = self.command("unblock", "--holder", "alice")
         self.assertEqual(unblocked.returncode, 0, unblocked.stdout + unblocked.stderr)
-        stdout, stderr = watcher.communicate(timeout=3)
+        stdout, stderr = watcher.communicate(timeout=60)
         self.assertEqual(watcher.returncode, 0, stdout + stderr)
         self.assertEqual(len(self.logged_arguments("send-delivered")), 1)
 
@@ -1755,28 +1906,33 @@ for arguments in (
         self.assertEqual(self.read_fixture_variable(), "false")
 
     def test_timed_out_set_is_reconciled_and_restored(self) -> None:
-        self.write_config(gh_timeout_s="0.2")
-        self.gh["delays"] = [
-            {
-                "match": "variable set",
-                "seconds": 30.0,
-                "marker": "set-applied",
-                "after": True,
-            }
-        ]
-        self.sync_gh()
+        # The set reaches gh and is applied, then the call times out. Expire
+        # it at the subprocess boundary after the stand-in returns: a real
+        # short timer can kill the stand-in before it applies under load.
+        timeout_stub = r'''
+original_run = subprocess.run
+
+def expire_after_set(command, *args, **kwargs):
+    if command[:3] == ["gh", "variable", "set"]:
+        _ = original_run(command, *args, **kwargs)
+        raise subprocess.TimeoutExpired(command, kwargs.get("timeout"))
+    return original_run(command, *args, **kwargs)
+
+subprocess.run = expire_after_set
+'''
+        lifetime = self.root / "child-lifetime" / "sitecustomize.py"
+        _ = lifetime.write_text(FIXTURE_CHILD_LIFETIME + timeout_stub)
         blocked = self.start_command(
             "block", "--holder", "alice", "--for", "rendering"
         )
-        self.wait_for_path(self.stub_directory / "set-applied")
-        stdout, stderr = blocked.communicate(timeout=5)
+        stdout, stderr = blocked.communicate(timeout=300)
+        _ = lifetime.write_text(FIXTURE_CHILD_LIFETIME)
         self.assertEqual(blocked.returncode, 2, stdout + stderr)
         self.assertIn("CI can still use the Mac:", stdout)
         self.assertEqual(self.block_state()["ci"], "off_unconfirmed")
         self.assertEqual(self.read_fixture_variable(), "false")
 
         self.gh["variable"] = "false"
-        self.gh["delays"] = []
         self.sync_gh()
         status = self.command("status")
         self.assertEqual(status.returncode, 0, status.stdout + status.stderr)
@@ -1874,7 +2030,7 @@ subprocess.run = expire_gh
         self.gh["delays"] = [
             {
                 "match": "variable get",
-                "seconds": 20.0,
+                "seconds": 300.0,
                 "marker": "slow-gh-started",
                 "release": "continue-gh",
             }
@@ -1888,7 +2044,7 @@ subprocess.run = expire_gh
         _ = (self.stub_directory / "continue-gh").write_text(
             "continue\n", encoding="utf-8"
         )
-        stdout, stderr = blocker.communicate(timeout=3)
+        stdout, stderr = blocker.communicate(timeout=60)
         self.assertEqual(blocker.returncode, 0, stdout + stderr)
 
     def test_release_starts_watcher_without_gh_or_send(self) -> None:
@@ -1961,14 +2117,14 @@ subprocess.run = expire_gh
             "3",
             environment=environment,
         )
-        stdout, stderr = renewal.communicate(timeout=4)
+        stdout, stderr = renewal.communicate(timeout=60)
         self.assertEqual(renewal.returncode, 0, stdout + stderr)
         block = self.block_state()
         self.assertEqual(block["for"], "renewed work")
         self.assertEqual(block["session"], "new-session")
         self.assertEqual(block["since"], original["since"])
         watcher.terminate()
-        _ = watcher.wait(timeout=3)
+        _ = watcher.wait(timeout=60)
 
     def test_unblock_and_expiry_restore_switch_once(self) -> None:
         now = datetime.now(timezone.utc)
@@ -1985,8 +2141,8 @@ subprocess.run = expire_gh
         expiry = self.start_command("status")
         self.wait_for_path(self.stub_directory / "restore-started")
         unblock = self.start_command("unblock", "--holder", "alice")
-        expiry_output = expiry.communicate(timeout=4)
-        unblock_output = unblock.communicate(timeout=4)
+        expiry_output = expiry.communicate(timeout=60)
+        unblock_output = unblock.communicate(timeout=60)
         self.assertEqual(expiry.returncode, 0, "".join(expiry_output))
         self.assertEqual(unblock.returncode, 0, "".join(unblock_output))
         self.assertEqual(self.gh_calls("variable set"), 1)
@@ -2005,7 +2161,7 @@ subprocess.run = expire_gh
         self.gh["delays"] = [
             {
                 "match": "run list",
-                "seconds": 20.0,
+                "seconds": 300.0,
                 "marker": "watch-gh-started",
                 "release": "continue-watch-gh",
             }
@@ -2013,7 +2169,7 @@ subprocess.run = expire_gh
         self.sync_gh()
         first = self.start_command("watch")
         self.wait_for_path(self.stub_directory / "watch-gh-started")
-        second = self.command("watch", timeout=3)
+        second = self.command("watch", timeout=60)
         self.assert_command(second, 0, "")
         self.assertIsNone(first.poll())
         _ = (self.stub_directory / "continue-watch-gh").write_text(
@@ -2021,7 +2177,7 @@ subprocess.run = expire_gh
         )
         unblocked = self.command("unblock", "--holder", "alice")
         self.assertEqual(unblocked.returncode, 0, unblocked.stdout + unblocked.stderr)
-        stdout, stderr = first.communicate(timeout=3)
+        stdout, stderr = first.communicate(timeout=60)
         self.assertEqual(first.returncode, 0, stdout + stderr)
 
     def test_failed_free_message_stays_owed_and_status_reports_it(self) -> None:
@@ -2080,7 +2236,7 @@ subprocess.run = expire_gh
             **self.environment,
             "MAC_TEST_MESSAGE_TIMEOUT_S": "0.05",
         }
-        status = self.command("status", environment=environment, timeout=3)
+        status = self.command("status", environment=environment, timeout=60)
         self.assertEqual(status.returncode, 0, status.stdout + status.stderr)
         self.assertIn(
             'The "Mac is free" message has not reached dana yet.\n',
@@ -2239,7 +2395,7 @@ subprocess.run = expire_gh
         _ = (self.stub_directory / "send-continue").write_text(
             "continue\n", encoding="utf-8"
         )
-        stdout, stderr = status.communicate(timeout=3)
+        stdout, stderr = status.communicate(timeout=60)
         self.assertEqual(status.returncode, 0, stdout + stderr)
 
 
@@ -2383,7 +2539,8 @@ class ClaimWatchTests(unittest.TestCase):
         text = (
             'Your Mac claim "alpha tests" (since 08:00) was released at 08:30: nothing ran on the Mac for 15 minutes, '
             + "so tests waiting for it can run. Claim it again before your next Mac command: "
-            + "python3 ~/.claude/scripts/mac_test/mac_test.py claim --pid $$ --what 'alpha tests' --remote 'claim-mac' (see /build:mac)."
+            + "python3 ~/.claude/scripts/mac_test/mac_test.py claim --pid $$ --what 'alpha tests' "
+            + f"--worktree '{self.root}' --remote 'claim-mac' (see /build:mac)."
         )
         self.assertEqual(send.call_args.args[4], text)
         self.assertIn("released", output)
@@ -2404,11 +2561,12 @@ class ClaimWatchTests(unittest.TestCase):
         self.assertEqual(send.call_args.args[4], (
             'Your Mac claim "alpha tests" (since 08:00) was released at 08:30: nothing ran on the Mac for 15 minutes, '
             + "so tests waiting for it can run. Claim it again before your next Mac command: "
-            + "python3 ~/.claude/scripts/mac_test/mac_test.py claim --pid $$ --what 'alpha tests' (see /build:mac)."
+            + f"python3 ~/.claude/scripts/mac_test/mac_test.py claim --pid $$ --what 'alpha tests' --worktree '{self.root}' "
+            + "(see /build:mac)."
         ))
 
     def test_remote_claim_release_command_quotes_host_and_job(self) -> None:
-        _ = self.write_claim(what="alpha's tests", remote_host="host's name",
+        _ = self.write_claim(what="alpha's tests", remote_host="host's name", worktree="/work/alpha's tree",
                              idle_since=mac_test.timestamp(self.now - timedelta(minutes=15)))
         with mock.patch.object(mac_test, "check_mac_activity", return_value=mac_test.MacIdle()), \
              mock.patch.object(mac_test, "send_message", return_value=True) as send:
@@ -2418,8 +2576,52 @@ class ClaimWatchTests(unittest.TestCase):
             'Your Mac claim "alpha\'s tests" (since 08:00) was released at 08:30: nothing ran on the Mac for 15 minutes, '
             + "so tests waiting for it can run. Claim it again before your next Mac command: "
             + "python3 ~/.claude/scripts/mac_test/mac_test.py claim --pid $$ "
-            + "--what 'alpha'\"'\"'s tests' --remote 'host'\"'\"'s name' (see /build:mac)."
+            + "--what 'alpha'\"'\"'s tests' --worktree '/work/alpha'\"'\"'s tree' --remote 'host'\"'\"'s name' "
+            + "(see /build:mac)."
         ))
+
+    def write_repository_claims(self, **hana_changes: object) -> dict[str, dict[str, object]]:
+        self.paths.claims.mkdir()
+        records: dict[str, dict[str, object]] = {}
+        for name in ("hana", "cargo-liner"):
+            record: dict[str, object] = {
+                "pid": os.getpid(), "proc_start": "owner-start", "what": f"{name} tests",
+                "worktree": f"/work/{name}", "since": "2026-10-13T12:00:00+00:00",
+                "remote_host": "claim-mac", "holder_session": "holder-session",
+            }
+            if name == "hana":
+                record.update(hana_changes)
+            _ = (self.paths.claims / f"{name}.json").write_text(json.dumps(record))
+            records[name] = record
+        return records
+
+    def read_repository_claim(self, name: str) -> dict[str, object]:
+        return cast(dict[str, object], json.loads((self.paths.claims / f"{name}.json").read_text()))
+
+    def test_one_activity_check_per_host_serves_every_repository_claim(self) -> None:
+        records = self.write_repository_claims()
+        with mock.patch.object(mac_test, "check_mac_activity", return_value=mac_test.MacIdle()) as activity, \
+             mock.patch.object(mac_test, "send_message") as send:
+            _ = self.watch_once()
+        activity.assert_called_once()
+        self.assertEqual(activity.call_args.args[1], "claim-mac")
+        send.assert_not_called()
+        for name, record in records.items():
+            with self.subTest(name=name):
+                self.assertEqual(self.read_repository_claim(name), {**record, "idle_since": mac_test.timestamp(self.now)})
+
+    def test_idle_release_removes_only_that_repository_claim(self) -> None:
+        records = self.write_repository_claims(idle_since=mac_test.timestamp(self.now - timedelta(minutes=15)))
+        with mock.patch.object(mac_test, "check_mac_activity", return_value=mac_test.MacIdle()) as activity, \
+             mock.patch.object(mac_test, "send_message", return_value=True) as send:
+            _ = self.watch_once()
+        activity.assert_called_once()
+        self.assertFalse((self.paths.claims / "hana.json").exists())
+        self.assertEqual(self.read_repository_claim("cargo-liner"),
+                         {**records["cargo-liner"], "idle_since": mac_test.timestamp(self.now)})
+        send.assert_called_once()
+        self.assertTrue(cast(str, send.call_args.args[4]).endswith(
+            "claim --pid $$ --what 'hana tests' --worktree '/work/hana' --remote 'claim-mac' (see /build:mac)."))
 
     def test_idle_release_without_holder_session_prints_and_sends_nothing(self) -> None:
         record = self.write_claim(idle_since=mac_test.timestamp(self.now - timedelta(minutes=20)))

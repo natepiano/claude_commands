@@ -18,7 +18,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from importlib import import_module
 from dataclasses import dataclass, field, replace
-from datetime import datetime
+from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
 from typing import Literal, Protocol, TypedDict, cast
@@ -34,10 +34,12 @@ from account import (  # noqa: E402
     named_account_environment,
     named_claude_account,
     own_claude_account,
+    NAMED_ACCOUNT_VARIABLES,
 )
 import add_unit  # noqa: E402
 import herdr  # noqa: E402
 import conversation_pause  # noqa: E402
+import relaunch  # noqa: E402
 from inventory import (  # noqa: E402
     PaneNotRecorded,
     Session,
@@ -48,6 +50,7 @@ from inventory import (  # noqa: E402
     TmuxSessionId,
     TmuxSessionIdNotRecorded,
     WindowHost,
+    live_supervisor,
 )
 from record import (  # noqa: E402
     CLAIM_STALE_SECONDS,
@@ -79,6 +82,7 @@ from record import (  # noqa: E402
 )
 from remote import other_machine, run_remote  # noqa: E402
 import sessions  # noqa: E402
+import remote_control  # noqa: E402
 import showrunner_footer  # noqa: E402
 import stop as stop_work  # noqa: E402
 from push_texts import RenderedPush, render  # noqa: E402
@@ -103,6 +107,7 @@ class ShutdownServices(Protocol):
     def record_time(self) -> str: ...
     def local_machine(self) -> str: ...
     def stopped_sessions_text(self, count: int) -> str: ...
+    def shutdown_command(self, *arguments: str) -> str: ...
     def retire_command(self, login: str, session_id: str) -> list[str]: ...
     def run_notifier(self, verb: str, instance: str) -> None: ...
     def send_message(
@@ -232,7 +237,7 @@ class RestartNotStopped(TypedDict):
     kind: Literal["not stopped"]
     session_id: str
     name: str
-    progress: Literal["waiting", "ready", "held by usage limit", "stopping"]
+    progress: Literal["waiting", "ready", "held by usage limit", "reaping", "stopping"]
 
 
 class RestartNoShutdown(TypedDict):
@@ -430,14 +435,26 @@ def wait_for_remote_control(records: Sequence[sessions.SessionRecord], timeout: 
     return active
 
 
-def remote_control_missing(records: list[SessionShutdown], confirmation: RegistryConfirmation) -> tuple[NoRemoteControl, ...]:
+def remote_control_missing(records: list[SessionShutdown], confirmation: RegistryConfirmation, *, notify: bool = True) -> tuple[NoRemoteControl, ...]:
     """Print the diagnostic while retaining each archived session's alert policy."""
     active = wait_for_remote_control(confirmation.records, REMOTE_CONTROL_WAIT_SECONDS)
     missing = tuple(NoRemoteControl(session_id=saved["session"]["session_id"],
         name=saved["session"]["name"], alerts=saved["alerts"]) for saved in records
         if saved["session"]["session_id"] in confirmation.live_ids - active)
+    by_id = {saved["session"]["session_id"]: saved for saved in records}
+    live_by_id = {item["sessionId"]: item for item in confirmation.records}
     for item in missing:
-        print(f"{item['name']}: running, no Remote Control")
+        live = live_by_id[item["session_id"]]
+        who = remote_control.remote_control_who(by_id[item["session_id"]])
+        alerts = item["alerts"] if notify else "none"
+        try:
+            remote_control.launch_fixer(item["session_id"], live["pid"], live.get("procStart", ""), who, alerts, item["name"])
+        except (OSError, RuntimeError, ValueError, subprocess.SubprocessError):
+            print(f"{item['name']}: Remote Control is off; turn it on at its terminal with /remote-control")
+            if alerts == "user":
+                remote_control.alert_failed(who, item["name"])
+        else:
+            print(f"{item['name']}: Remote Control not on yet; turning it on in the background")
     return missing
 
 
@@ -514,12 +531,12 @@ def _resume_parts(session: Session, prompt: str, target: str = "") -> ResumePart
 
         role = "unit" if session["kind"] == "unit" else "showrunner"
         selected = accounts.account_for_group_launch(role, resume=True, target=target)
-        selected_dir = accounts.main_config_dir() if isinstance(selected, accounts.DefaultAccount) else selected.dir
+        selected_dir = selected.dir
         host = session["host"]
         herdr_host = host["kind"] == "herdr"
         # Only native herdr resumes retain an already configured directory.
         if target or not herdr_host or selected_dir.resolve() != config_dir.resolve():
-            target = "default" if isinstance(selected, accounts.DefaultAccount) else selected.label
+            target = selected.label
         else:
             config_dir = selected_dir
     account: RetainResumeAccount | MoveResumeAccount = (
@@ -545,15 +562,41 @@ def _resume_parts(session: Session, prompt: str, target: str = "") -> ResumePart
     return ResumeParts(session["cwd"], environment, tuple(argv), prompt, account)
 
 
-def _resume_shell(parts: ResumeParts) -> str:
+def _resume_shell(parts: ResumeParts, *, supervised: bool = False) -> str:
     argv = ["claude", *parts.claude_arguments, parts.opening_prompt]
     if isinstance(parts.account, MoveResumeAccount):
         argv = [sys.executable, str(SCRIPTS / "accounts" / "accounts.py"),
                 "exec", parts.account.target, *argv[1:]]
+    if supervised:
+        argv = [str(SCRIPTS / "lib" / "py"), str(SCRIPTS / "lib" / "relaunch.py"),
+                "run", "--", *argv]
     prefix = "".join(f"{key}={shlex.quote(value)} " for key, value in parts.environment.items())
     return (
         f"cd {shlex.quote(parts.cwd)} && {prefix}command "
         f"{shlex.join(argv)}; exec zsh"
+    )
+
+
+def _relaunch_request(parts: ResumeParts, note: str) -> relaunch.RelaunchRequest:
+    environment = dict(parts.environment)
+    unset = {"CLAUDE_CODE_OAUTH_TOKEN"}
+    if isinstance(parts.account, MoveResumeAccount):
+        from scripts.accounts import accounts
+
+        prepared = accounts.prepared_account(parts.account.target, resume=True)
+        if isinstance(prepared, accounts.AccountRefused):
+            raise accounts.AccountsError(prepared.reason)
+        environment.update(prepared.variables)
+        unset.update(prepared.remove)
+    elif parts.account.config_dir == Path.home() / ".claude":
+        unset.update(NAMED_ACCOUNT_VARIABLES)
+    return relaunch.RelaunchRequest(
+        argv=["claude", *parts.claude_arguments, parts.opening_prompt],
+        cwd=parts.cwd,
+        environment=environment,
+        unset=sorted(unset),
+        written_at=datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        note=note,
     )
 
 
@@ -990,17 +1033,15 @@ def _herdr_launch(parts: ResumeParts, session: Session, *, dry_run: bool) -> Non
         return
     _record_scheduled_restart_prompt(session["session_id"], parts.opening_prompt, dry_run=False)
     try:
-        from scripts.accounts.accounts import ClaudeLaunchAccount, DefaultAccount, NamedAccount, trust_command
+        from scripts.accounts.accounts import NamedAccount, home_account_label, trust_command
 
         config_dir = parts.account.config_dir
         claude_json = (Path.home() / ".claude.json" if config_dir == Path.home() / ".claude"
                        else config_dir / ".claude.json")
         trust = herdr.claude_trust(Path(parts.cwd), claude_json)
         if isinstance(trust, (herdr.Untrusted, herdr.UnreadableTrustFile)):
-            account: ClaudeLaunchAccount = (
-                DefaultAccount() if config_dir == Path.home() / ".claude"
-                else NamedAccount(str(config_dir), config_dir)
-            )
+            account = NamedAccount(home_account_label("claude") if config_dir == Path.home() / ".claude"
+                                   else str(config_dir), config_dir)
             reason = (str(trust) if isinstance(trust, herdr.UnreadableTrustFile)
                       else f"{parts.cwd}: Claude has not trusted this folder")
             raise OSError(f"{reason}. Run: {trust_command(Path(parts.cwd), account)}")
@@ -1052,12 +1093,24 @@ def _launch_session(
                 session, f"{_showrunner_prompt(session)} {note}", record.get("target", "")))
         _herdr_launch(parts, session, dry_run=dry_run)
         return SessionLaunched()
-    command = _resume_shell(parts)
+    window_launch = host["kind"] in {"ghostty", "zed"} or (
+        host["kind"] == "terminal" and sys.platform == "darwin"
+    )
+    command = _resume_shell(parts, supervised=True) if window_launch else _resume_shell(parts)
     if host["kind"] == "unknown" or (host["kind"] == "terminal" and sys.platform == "linux"):
         return ManualRestartRequired(command)
     _record_scheduled_restart_prompt(
         session["session_id"], prompt, dry_run=dry_run
     )
+    if host["kind"] == "ghostty" or (host["kind"] == "terminal" and sys.platform == "darwin"):
+        supervisor = live_supervisor(host)
+        if supervisor["kind"] == "supervisor":
+            request = _relaunch_request(parts, note)
+            if dry_run:
+                print(f"restart in window via supervisor {supervisor['pid']}: {shlex.join(request['argv'])}")
+            else:
+                relaunch.write_request(supervisor["pid"], request)
+            return SessionLaunched()
     match host["kind"]:
         case "ghostty" | "zed":
             _window_launch(command, session, desktop_state, dry_run=dry_run)
@@ -1084,8 +1137,7 @@ def _launch_session(
             if "target" in record:
                 from scripts.accounts import accounts
 
-                directory = (accounts.main_config_dir() if record["target"] == "default"
-                             else accounts.account_dir(record["target"]))
+                directory = accounts.claude_account_dir(record["target"])
                 _ = _run([os.environ.get("SHUTDOWN_TMUX", "tmux"), "set-option", "-t",
                           retained_session, "@claude_config_dir", str(directory)], dry_run=dry_run)
         case "unit":
@@ -1220,32 +1272,57 @@ def _journal_move_failure(record: SessionShutdown, reason: str) -> None:
     from scripts.accounts import moves
     session = record["session"]
     moves.append_move(moves.FailedMove(kind="failed", at=settle.record_time(), tool="claude",
-        subject=session["session_id"] + ": " + session["name"], move_id=record["request_id"], reason=reason))
+        subject=session["session_id"] + ": " + session["name"], move_id=record.get("move_id", record["request_id"]), request_id=record["request_id"], reason=reason))
 
 
-def _target_config_dir(record: SessionShutdown) -> Path | None:
-    """The config directory a restored session belongs on: its move target, else the one it left, if recorded."""
+@dataclass(frozen=True)
+class RecordedConfigDir:
+    path: Path
+
+
+@dataclass(frozen=True)
+class NoRecordedConfigDir:
+    """Neither a move target nor the original directory was recorded."""
+
+
+@dataclass(frozen=True)
+class ObservedConfigDir:
+    path: Path
+
+
+@dataclass(frozen=True)
+class LiveObservationUnavailable:
+    reason: Literal["not live", "environment unreadable"]
+
+
+def _target_config_dir(record: SessionShutdown) -> RecordedConfigDir | NoRecordedConfigDir:
     target_label = record.get("target", "")
     if not target_label:
         session = record["session"]
-        return Path(session["config_dir"]) if "config_dir" in session else None
+        return RecordedConfigDir(Path(session["config_dir"])) if "config_dir" in session else NoRecordedConfigDir()
     from scripts.accounts import accounts
-    return accounts.main_config_dir() if target_label == "default" else accounts.account_dir(target_label)
+    return RecordedConfigDir(accounts.claude_account_dir(target_label))
 
 
-def _live_config_dir(record: SessionShutdown) -> Path | None:
+def _live_config_dir(record: SessionShutdown) -> ObservedConfigDir | LiveObservationUnavailable:
     import account
     live = next((item for item in sessions.live_sessions() if item["sessionId"] == record["session"]["session_id"]), None)
-    return account.process_config_dir(live["pid"]) if live is not None else None
+    if live is None:
+        return LiveObservationUnavailable("not live")
+    directory = account.process_config_dir(live["pid"])
+    return ObservedConfigDir(directory) if directory is not None else LiveObservationUnavailable("environment unreadable")
 
 
 def _confirm_move(record: SessionShutdown) -> None:
     from scripts.accounts import moves
     from scripts.accounts.refusal_watch import clear_assumed
     session = record["session"]
+    target = _target_config_dir(record)
+    if isinstance(target, NoRecordedConfigDir):
+        return
     moves.append_move(moves.ConfirmedMove(kind="confirmed", at=settle.record_time(), tool="claude",
-        subject=session["session_id"] + ": " + session["name"], move_id=record["request_id"],
-        config_dir=str(_target_config_dir(record) or "")))
+        subject=session["session_id"] + ": " + session["name"], move_id=record.get("move_id", record["request_id"]), request_id=record["request_id"],
+        config_dir=str(target.path)))
     clear_assumed(session["session_id"])
 
 
@@ -1254,8 +1331,11 @@ def _prove_move(record: SessionShutdown) -> bool:
     if not record.get("target", ""):
         return True
     directory, target = _live_config_dir(record), _target_config_dir(record)
-    if directory is None or target is None or directory.resolve() != target.resolve():
-        reason = "still on " + record.get("source_label", record["label"]) if directory is not None else "resumed account unreadable"
+    if isinstance(directory, LiveObservationUnavailable) or isinstance(target, NoRecordedConfigDir):
+        mark_restart_failed(record, "resumed account unreadable")
+        return False
+    if directory.path.resolve() != target.path.resolve():
+        reason = "still on " + record.get("source_label", record["label"])
         mark_restart_failed(record, reason)
         return False
     _confirm_move(record)
@@ -1285,7 +1365,8 @@ def clear_running_on_target(records: list[SessionShutdown]) -> TargetCheck:
             remaining.append(record)
             continue
         directory, target = _live_config_dir(record), _target_config_dir(record)
-        if directory is None or target is None or directory.resolve() != target.resolve():
+        if (isinstance(directory, LiveObservationUnavailable) or isinstance(target, NoRecordedConfigDir)
+                or directory.path.resolve() != target.path.resolve()):
             remaining.append(record)
             continue
         if record.get("target", ""):
@@ -1557,7 +1638,7 @@ def _machine_result(records: list[SessionShutdown], machine: str, label: str) ->
         machine, label, "partial" if failed or manual or pending or any(
             item["progress"]["kind"] != "restarted" for item in records
         ) else "done",
-        restarted=restarted, workers=sum(len(item["seats"]) for item in records if item["progress"]["kind"] == "restarted"),
+        restarted=restarted, workers=sum(len(item["workers"]) for item in records if item["progress"]["kind"] == "restarted"),
         failed=len(failed), manual=len(manual), failed_sessions=failed,
         manual_sessions=manual, timers_not_started=pending,
     )
@@ -1663,7 +1744,8 @@ def relaunch_session(
         if record["progress"]["kind"] == "stopping":
             return record
         if _unfinished_cleanup(record):
-            mark_restart_failed(record, "owner cleanup not confirmed; run /shutdown restart again")
+            command = settle.shutdown_command("restart", record["login"], "--here", "--only", record["session"]["session_id"])
+            mark_restart_failed(record, f"owner cleanup not confirmed; in a terminal on {record['machine']}: {command}")
             return record
     try:
         current, claimed = _claim_relaunch(record)
@@ -1716,7 +1798,7 @@ def owns_relaunch_claim(original: SessionShutdown, result: SessionShutdown) -> b
     )
 
 
-def _confirm_entries(records: list[SessionShutdown]) -> tuple[NoRemoteControl, ...]:
+def _confirm_entries(records: list[SessionShutdown], *, notify: bool = True) -> tuple[NoRemoteControl, ...]:
     launched = [record for record in records if record["progress"]["kind"] == "restarting"]
     confirmation = wait_for_confirmation(
         frozenset(record["session"]["session_id"] for record in launched),
@@ -1730,10 +1812,10 @@ def _confirm_entries(records: list[SessionShutdown]) -> tuple[NoRemoteControl, .
         if record["progress"]["kind"] == "restarted":
             archive_session(record["login"], record["session"]["session_id"])
 
-    return remote_control_missing(launched, confirmation)
+    return remote_control_missing(launched, confirmation, notify=notify)
 
 
-def _up(login: str, dry_run: bool, only: Iterable[str] = ()) -> MachineRestartResult:
+def _up(login: str, dry_run: bool, only: Iterable[str] = (), *, notify: bool = True) -> MachineRestartResult:
     if not dry_run:
         for line in migrate(login):
             print(line)
@@ -1756,9 +1838,9 @@ def _up(login: str, dry_run: bool, only: Iterable[str] = ()) -> MachineRestartRe
         print(refusal_line(refusal))
     at = datetime.fromisoformat(settle.record_time())
     for saved in records:
-        if ids and saved["progress"]["kind"] in {"waiting", "ready", "held by usage limit", "stopping"}:
+        if ids and saved["progress"]["kind"] in {"waiting", "ready", "held by usage limit", "reaping", "stopping"}:
             refusal = RestartNotStopped(kind="not stopped", session_id=saved["session"]["session_id"],
-                name=saved["session"]["name"], progress=cast(Literal["waiting", "ready", "held by usage limit", "stopping"], saved["progress"]["kind"]))
+                name=saved["session"]["name"], progress=cast(Literal["waiting", "ready", "held by usage limit", "reaping", "stopping"], saved["progress"]["kind"]))
             refused.append(refusal)
             print(refusal_line(refusal))
         elif ids and saved["progress"]["kind"] == "restarting" and (
@@ -1809,7 +1891,7 @@ def _up(login: str, dry_run: bool, only: Iterable[str] = ()) -> MachineRestartRe
                 if current["progress"]["kind"] == "restarting" and not owns_relaunch_claim(original, current):
                     continue
                 attempted.append(current)
-        missing_control = list(_confirm_entries(attempted))
+        missing_control = list(_confirm_entries(attempted, notify=notify))
         for record in requesters:
             other_unfinished = [
                 item for item in session_records(login)
@@ -1822,7 +1904,7 @@ def _up(login: str, dry_run: bool, only: Iterable[str] = ()) -> MachineRestartRe
             current = relaunch_session(record, dry_run=False, desktop_state=state)
             if current["progress"]["kind"] == "restarting" and not owns_relaunch_claim(record, current):
                 continue
-            missing_control.extend(_confirm_entries([current]))
+            missing_control.extend(_confirm_entries([current], notify=notify))
             attempted.append(current)
         settle.tell_showrunners_outcome([*finished, *attempted])
         remaining = session_records(login)
@@ -1852,12 +1934,12 @@ def refusal_line(refusal: RestartRefusal) -> str:
     return f"{refusal['name']} is {refusal['progress']}, not stopped; nothing to restart"
 
 
-def up_result(login: str, dry_run: bool = False, only: Iterable[str] = ()) -> PeerRestartResult:
+def up_result(login: str, dry_run: bool = False, only: Iterable[str] = (), *, notify: bool = True) -> PeerRestartResult:
     """Run the local verb and retain its printed lines in a validated peer object."""
     output = io.StringIO()
     with redirect_stdout(output):
         try:
-            result = _up(login, dry_run, only)
+            result = _up(login, dry_run, only, notify=notify)
         except (InvalidRecord, OSError, RuntimeError, ValueError, subprocess.SubprocessError) as error:
             print(f"{settle.local_machine()}: restart failed: {error}")
             result = MachineRestartResult(settle.local_machine(), login, "partial", failed=1)
@@ -1898,9 +1980,9 @@ def parse_peer_result(text: str) -> PeerRestartResult:
                 missing.append(NoRemoteControl(session_id=identity, name=name, alerts=cast(Literal["user", "none"], item["alerts"])))
             elif item.get("kind") == "no shutdown":
                 refusals.append(RestartNoShutdown(kind="no shutdown", session_id=identity, name=name))
-            elif item.get("kind") == "not stopped" and item.get("progress") in ("waiting", "ready", "held by usage limit", "stopping"):
+            elif item.get("kind") == "not stopped" and item.get("progress") in ("waiting", "ready", "held by usage limit", "reaping", "stopping"):
                 refusals.append(RestartNotStopped(kind="not stopped", session_id=identity, name=name,
-                    progress=cast(Literal["waiting", "ready", "held by usage limit", "stopping"], item["progress"])))
+                    progress=cast(Literal["waiting", "ready", "held by usage limit", "reaping", "stopping"], item["progress"])))
             else:
                 raise ValueError("invalid peer restart refusal")
     return PeerRestartResult(machine=cast(str, fields["machine"]), label=cast(str, fields["label"]),
@@ -1908,10 +1990,10 @@ def parse_peer_result(text: str) -> PeerRestartResult:
         no_remote_control=missing, refused=refusals)
 
 
-def up(login: str, dry_run: bool = False, only: Iterable[str] = ()) -> int:
+def up(login: str, dry_run: bool = False, only: Iterable[str] = (), *, notify: bool = True) -> int:
     """Resume each eligible local session without waiting on another machine."""
     try:
-        result = _up(login, dry_run, only)
+        result = _up(login, dry_run, only, notify=notify)
         return result.exit_status
     except (InvalidRecord, OSError, RuntimeError, ValueError, subprocess.SubprocessError) as error:
         print(f"{settle.local_machine()}: restart failed: {error}")
@@ -2062,7 +2144,7 @@ def restart(
     ids = tuple(only)
     local_ids: set[str] = set()
     try:
-        local = _up(selected.login, dry_run, ids)
+        local = _up(selected.login, dry_run, ids, notify=notify)
         local_ids = set(local.local_session_ids)
     except (
         InvalidRecord,
@@ -2082,6 +2164,8 @@ def restart(
             ),
         )
     remote_args = ["up", selected.login, "--here", "--json"]
+    if isinstance(alerts, NeverAlert):
+        remote_args.append("--no-alert")
     if dry_run:
         remote_args.append("--dry-run")
     peer_ids = [identity for identity in ids if identity not in local_ids]
@@ -2102,11 +2186,16 @@ def restart(
     not_reached = peer_availability is PeerRestartAvailability.NOT_REACHED
     for line in peer["lines"]:
         print(line)
-    incomplete = ""
     if not_reached:
-        incomplete = (f"restart incomplete: {other_machine()} not reached — run /shutdown "
-            "restart again when it is back")
-        print(incomplete)
+        retry = ["restart", selected.login, "--here"]
+        if peer_ids:
+            retry.extend(("--only", ",".join(peer_ids)))
+        if dry_run:
+            retry.append("--dry-run")
+        if isinstance(alerts, NeverAlert):
+            retry.append("--no-alert")
+        print(f"restart incomplete: {other_machine()} not reached; when it is back, "
+            + f"in a terminal on {other_machine()}: {settle.shutdown_command(*retry)}")
     bring_back = local.status == "partial" or peer["outcome"] == "partial" or not_reached
     if notify:
         failure_alert = bring_back and _restart_alerts_enabled(selected.login, ids, peer=peer_availability)
@@ -2129,11 +2218,6 @@ def restart(
                 for line in peer["lines"]:
                     if match := re.match(r"[^:]+: manual restart (.+?):", line):
                         settle.alert_user(render("shutdown.manual_restart", session=match.group(1), machine=peer["machine"]))
-            for machine, items in ((local.machine, local.no_remote_control),
-                                   (peer["machine"], peer["no_remote_control"])):
-                for item in items:
-                    if item["alerts"] == "user":
-                        settle.alert_user(render("shutdown.remote_control", session=item["name"], machine=machine))
         except (OSError, RuntimeError, ValueError):
             pass
     return 0 if local.exit_status == 0 and peer["outcome"] != "partial" and not peer["refused"] else 1

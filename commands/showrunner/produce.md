@@ -22,6 +22,10 @@ Read `~/.claude/docs/production_format.md` first. It defines:
 State:
 
 - `PRODUCTION_DOC`, `MERGE_BRANCH`, `LOG`, `UNITS` — from the production doc.
+  After a `/showrunner:rename apply` succeeds, read them again from the
+  renamed doc, along with `UPDATES` and `PROMPT_FILE`, which come from its
+  slug: apply moves the doc, the update timer and the state directory, and
+  switches `CHECKOUT` to the new merge branch.
 - `ZONE` — the user's zone setting, which
   `python3 ~/.claude/scripts/lib/user_zone.py` prints. It is one setting for
   every production; a doc's own **User zone** line is not read.
@@ -182,7 +186,8 @@ State:
 
   Nothing else does. Handle unit messages (checkpoints, merges, ETAs, plans,
   promotions, routine fixes) without telling the user; they wait for the next
-  dailies (user, 2026-10-12).
+  dailies (user, 2026-10-12). A turn with nothing for the user replies with
+  just "—": never "No update for you." or the like (user, 2026-10-14).
 - **Designs and add-ons.** A unit's design choices and add-ons are yours to
   settle, not the user's. User, 2026-10-12: "when it comes to designs you
   absolutely should be able to tell units what to do and change. I do not have
@@ -289,7 +294,7 @@ State:
 
   * build hold: <holder> holds builds since 11:34 EDT for the frame-time lane's breakdown of what each added tool costs; expected to release 11:40 EDT (in 3 minutes)
   * Mac block: <holder> since 11:35 EDT, for the Mac-only test run - lifts Wed 12:35 EDT
-  * claude 1: …
+  * claude1: …
   * next dailies: 11:53 EDT - nothing needed
 
 
@@ -370,7 +375,7 @@ to confirm the block remains and no compaction is running. Type `/compact` with
 **Resume.** To bring back a unit director whose session ended, use
    `$HOME/.claude/scripts/lib/py $HOME/.claude/scripts/production/add_unit.py --production PRODUCTION_DOC <name> --plan <unit plan> --resume <session-id> --cwd <recorded cwd>`.
    The launcher starts it on the configured units account, keeps its recorded model, checks shutdown holds, and preserves its name and Remote Control link.
-   If it reports the units account is not configured, stop and tell the user its line: `accounts.py move units "claude N"` sets it.
+   If it reports the units account is not configured, stop and tell the user its line: `accounts.py move units <claudeN>` sets it.
 </LaunchUnits>
 
 ---
@@ -577,9 +582,13 @@ Run only when the production repository is `~/rust/hana` or
 For each distinct user-visible result:
 
 1. Check the Hana live log for entries it replaces.
-2. Add the next `A<n>` or `C<n>` row under `## To review` in
-   `~/rust/hanadocs/change-review.md`: change, merge date, passing Mac build
-   when available, and a visual or behavioral check.
+2. Take the rows `merge_checkpoint.py` added: its `change review: ok` line
+   names each `C<n>` row it wrote under `## To review` in the list the
+   production doc's **Change review** line names, one per `Change-Review:`
+   line in the unit's checkpoint commits. The script holds a checkpoint whose
+   commit lacks the line before it merges. On a `change review: failed` line,
+   add the rows by hand; a `change review: drift` line names an earlier merge
+   whose rows are missing, which you add the same way.
 3. Run `~/.claude/scripts/lib/py
    ~/.claude/scripts/feature_log/feature_log.py propose --review <row>` with
    `--project hana`, every owning crate, kind, title, summary, current behavior,
@@ -1096,7 +1105,7 @@ reaches them only as your relay (<Throughout/>). Run `python3
 --state-dir DAILIES_STATE_DIR --notice "<full notice>"`. It relays
 to every unit director and prints one `send <unit>:` receipt each. With more
 than one Claude account in use, a Claude `Quota alert:` names its account and
-roles (`claude 3 (unit directors) at …`). It reaches only the unit directors
+roles (`claude3 (unit directors) at …`). It reaches only the unit directors
 running on that account, prints `skip <unit>: it runs on <other account>` for
 the rest, and reports a unit whose account cannot be read as not told:
 - `Quota alert:` — the command picks the instruction from the notice. A Codex

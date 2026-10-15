@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import copy
 import fcntl
 import json
 import os
@@ -14,7 +15,7 @@ import time
 from collections.abc import Callable, Generator
 from contextlib import contextmanager
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Literal, NotRequired, TypedDict, cast
 
@@ -23,6 +24,7 @@ from launch_permission import launch_barrier, shutdown_state_root
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
 from user_zone import user_zone  # noqa: E402
+from scripts.whoami.note_file import canonical_label, parse_account_label, NumberedAccountLabel
 
 CLAIM_STALE_SECONDS = 120
 CONDUCTOR_LOCK_RETRY_DELAYS = (0.05,) * 5
@@ -212,6 +214,13 @@ class SessionWaiting(TypedDict):
     kind: Literal["waiting"]
 
 
+class SessionReaping(TypedDict):
+    kind: Literal["reaping"]
+    at: str
+    because: Literal["refused in its transcript", "account out of usage"]
+    detail: str
+
+
 class SessionReadyToStop(TypedDict):
     kind: Literal["ready"]
     at: str
@@ -293,6 +302,7 @@ class SessionNeedsManualRestart(TypedDict):
 
 SessionRestartPrior = (
     SessionWaiting
+    | SessionReaping
     | SessionReadyToStop
     | SessionHeldByUsageLimit
     | SessionStopped
@@ -348,7 +358,14 @@ class _LegacyShutdownRecord(TypedDict):
     stop_issues: list[_LegacyOrchestrationIssue]
 
 
+class ProgressStep(TypedDict):
+    at: str
+    kind: str
+    detail: str
+
+
 class SessionShutdown(TypedDict):
+    move_id: NotRequired[str]
     login: str
     label: str
     machine: str
@@ -360,11 +377,12 @@ class SessionShutdown(TypedDict):
     force: StopTiming
     alerts: Literal["user", "none"]
     session: Session
-    seats: list[Session]
+    workers: list[Session]
     timers: list[TimerRestore]
     settle_message: SettleMessage
     where: Where
     progress: SessionProgress
+    trail: list[ProgressStep]
     stop_issues: list[SessionStopIssue]
     alerted_at: NotRequired[str]
     # The phone push for a form open in the session's pane; the user is told once.
@@ -427,6 +445,7 @@ _RECORD_STATES = frozenset(
 _PROGRESS_WITH_TIME = frozenset(
     {
         "ready",
+        "reaping",
         "held by usage limit",
         "passive worker ready",
         "stopped",
@@ -621,6 +640,12 @@ def _progress(value: object, place: str, *, legacy: bool = False) -> SessionProg
         _ = _utc_time(_required(values, "at", place), f"{place}.at")
     if kind in {"passive worker ready", "worker available on demand"} and not legacy:
         raise InvalidRecord(f"{place}.kind is invalid")
+    if kind == "reaping":
+        _ = _kind(values, place, frozenset({"reaping"}))
+        because = _string(_required(values, "because", place), f"{place}.because")
+        if because not in {"refused in its transcript", "account out of usage"}:
+            raise InvalidRecord(f"{place}.because is invalid")
+        _ = _string(_required(values, "detail", place), f"{place}.detail")
     if kind == "restarting":
         prior = _progress(_required(values, "prior", place), f"{place}.prior")
         if prior["kind"] == "restarting":
@@ -763,7 +788,7 @@ def _record(value: object, place: str) -> _LegacyShutdownRecord:
         _ = _safe_login(login)
     except ValueError as error:
         raise InvalidRecord(f"{place}.login is unsafe for record storage") from error
-    _ = _string(_required(values, "label", place), f"{place}.label")
+    values["label"] = canonical_label(_string(_required(values, "label", place), f"{place}.label"))
     _ = _string(_required(values, "machine", place), f"{place}.machine")
     state = _string(_required(values, "state", place), f"{place}.state")
     if state not in _RECORD_STATES:
@@ -946,10 +971,15 @@ def _shutdown_request_fields(values: dict[str, object], place: str) -> None:
         raise InvalidRecord(f"{place}.login is unsafe for record storage") from error
     for field in ("label", "machine"):
         _ = _string(_required(values, field, place), f"{place}.{field}")
+    values["label"] = canonical_label(cast(str, values["label"]))
     _ = _utc_time(_required(values, "requested_at", place), f"{place}.requested_at")
     request_id = _string(_required(values, "request_id", place), f"{place}.request_id")
     if not request_id:
         raise InvalidRecord(f"{place}.request_id must not be empty")
+    if "move_id" in values:
+        move_id = _string(values["move_id"], f"{place}.move_id")
+        if not move_id:
+            raise InvalidRecord(f"{place}.move_id must not be empty")
     values["requested_by"] = _request_origin(
         _required(values, "requested_by", place), f"{place}.requested_by"
     )
@@ -961,10 +991,20 @@ def _shutdown_request_fields(values: dict[str, object], place: str) -> None:
 def _session_shutdown(value: object, place: str) -> SessionShutdown:
     values = _mapping(value, place)
     _shutdown_request_fields(values, place)
+    for field in ("source_label",):
+        if isinstance(values.get(field), str):
+            values[field] = canonical_label(cast(str, values[field]))
     if "target" in values:
         target = _string(values["target"], f"{place}.target")
-        if target != "default" and not re.fullmatch(r"claude [1-9][0-9]*", target):
-            raise InvalidRecord(f"{place}.target must be default or claude N")
+        if target == "default":
+            from scripts.whoami.account import claude_account
+            home = claude_account(Path.home() / ".claude")
+            parsed_home = parse_account_label(home.label) if home is not None else None
+            target = parsed_home.label if isinstance(parsed_home, NumberedAccountLabel) else "~/.claude"
+        parsed = parse_account_label(target)
+        if target != "~/.claude" and not (isinstance(parsed, NumberedAccountLabel) and parsed.tool == "claude"):
+            raise InvalidRecord(f"{place}.target must name a numbered Claude account")
+        values["target"] = canonical_label(target)
     for field in ("source_label", "why"):
         if field in values:
             _ = _string(values[field], f"{place}.{field}")
@@ -979,25 +1019,34 @@ def _session_shutdown(value: object, place: str) -> SessionShutdown:
     _ = _required(values, "stop_issues", place)
     fields = _entry(values, place)
     values["progress"] = _progress(values["progress"], f"{place}.progress")
+    trail: list[ProgressStep] = []
+    for index, step in enumerate(_items(values.get("trail", []), f"{place}.trail")):
+        step_place = f"{place}.trail[{index}]"
+        fields_step = _mapping(step, step_place)
+        at = _utc_time(_required(fields_step, "at", step_place), f"{step_place}.at")
+        kind = _string(_required(fields_step, "kind", step_place), f"{step_place}.kind")
+        detail = _string(_required(fields_step, "detail", step_place), f"{step_place}.detail")
+        trail.append(ProgressStep(at=at, kind=kind, detail=detail))
+    values["trail"] = trail
     values["stop_issues"] = [_session_stop_issue(issue, f"{place}.stop_issues") for issue in fields["stop_issues"]]
-    if fields["session"]["kind"] == "seat":
+    if fields["session"]["kind"] == "worker":
         raise InvalidRecord(f"{place}.session must not be a worker")
     _ = _session_filename(fields["session"]["session_id"])
-    workers = _items(_required(values, "seats", place), f"{place}.seats")
+    workers = _items(_required(values, "workers", place), f"{place}.workers")
     parsed_workers: list[Session] = []
     for index, worker in enumerate(workers):
-        worker_place = f"{place}.seats[{index}]"
+        worker_place = f"{place}.workers[{index}]"
         try:
             parsed = parse_session(worker, worker_place)
         except ValueError as error:
             raise InvalidRecord(str(error)) from error
-        if parsed["kind"] != "seat":
+        if parsed["kind"] != "worker":
             raise InvalidRecord(f"{worker_place} must be a worker")
         owner = parsed["owner"]
         if owner["kind"] != "director" or owner["session_id"] != fields["session"]["session_id"]:
             raise InvalidRecord(f"{worker_place}.owner must identify this session")
         parsed_workers.append(parsed)
-    values["seats"] = parsed_workers
+    values["workers"] = parsed_workers
     for field in ("alerted_at", "form_alerted_at", "reasked_at"):
         if field in values:
             _ = _utc_time(values[field], f"{place}.{field}")
@@ -1044,17 +1093,18 @@ def _record_directory(path: Path, *, create: bool = False) -> bool:
 
 
 def _worker_record_names(value: object) -> bool:
-    """Convert names owned by shutdown; account session kinds remain unchanged."""
+    """Convert stored worker fields and session kinds before validation."""
     changed = False
     if isinstance(value, dict):
         fields = cast(dict[str, object], value)
-        for old, new in (("busy_seats", "busy_workers"),):
+        for old, new in (("busy_seats", "busy_workers"), ("seats", "workers")):
             if old in fields:
                 if new not in fields:
                     fields[new] = fields[old]
                 del fields[old]
                 changed = True
-        labels = {"passive seat ready": "passive worker ready",
+        labels = {"seat": "worker",
+                  "passive seat ready": "passive worker ready",
                   "seat available on demand": "worker available on demand",
                   "seat still live": "worker still live"}
         for name in ("kind", "progress"):
@@ -1123,7 +1173,7 @@ def _convert_session(record: _LegacyShutdownRecord, entry: _LegacySessionEntry) 
     workers: list[Session] = []
     for candidate in record["entries"]:
         worker = candidate["session"]
-        if worker["kind"] == "seat" and worker["owner"]["kind"] == "director":
+        if worker["kind"] == "worker" and worker["owner"]["kind"] == "director":
             if worker["owner"]["session_id"] == session["session_id"]:
                 workers.append(worker)
     return SessionShutdown(
@@ -1132,9 +1182,9 @@ def _convert_session(record: _LegacyShutdownRecord, entry: _LegacySessionEntry) 
         request_id=f"legacy-{record['machine']}-{record['requested_at']}",
         hold="account" if record["scope"]["kind"] == "all account sessions" else "session",
         then=_legacy_continuation(record), force=record["force"], alerts="user",
-        session=session, seats=workers, timers=entry["timers"],
+        session=session, workers=workers, timers=entry["timers"],
         settle_message=entry["settle_message"], where=entry["where"],
-        progress=cast(SessionProgress, cast(object, progress)), stop_issues=[issue for issue in entry["stop_issues"] if issue["kind"] != "worker still live"],
+        progress=cast(SessionProgress, cast(object, progress)), trail=[], stop_issues=[issue for issue in entry["stop_issues"] if issue["kind"] != "worker still live"],
     )
 
 
@@ -1160,7 +1210,7 @@ def _session_records_in_directory(directory: Path, login: str) -> list[SessionSh
             continue
         for entry in old["entries"]:
             session = entry["session"]
-            if session["kind"] != "seat" and session["session_id"] not in stored_ids:
+            if session["kind"] != "worker" and session["session_id"] not in stored_ids:
                 records.append(_convert_session(old, entry))
                 stored_ids.add(session["session_id"])
     return sorted(records, key=lambda item: (item["requested_at"], item["session"]["name"]))
@@ -1197,9 +1247,28 @@ def find_session(login: str, session_id: str) -> SessionShutdown | None:
     return next((item for item in session_records(login) if item["session"]["session_id"] == session_id), None)
 
 
+def _progress_step(record: SessionShutdown, at: str) -> ProgressStep:
+    progress = record["progress"]
+    detail = ""
+    if progress["kind"] == "reaping":
+        detail = progress["because"] + (": " + progress["detail"] if progress["detail"] else "")
+    elif progress["kind"] == "stop failed" or progress["kind"] == "restart failed":
+        detail = progress["reason"]
+    elif progress["kind"] == "manual restart":
+        detail = progress["command"]
+    elif progress["kind"] == "timers pending":
+        detail = "; ".join(timer["instance"] + ": " + timer["reason"] for timer in progress["timers"])
+    elif progress["kind"] == "ready" and record["where"]["kind"] == "said":
+        detail = record["where"]["text"]
+    return ProgressStep(at=at, kind=progress["kind"], detail=detail)
+
+
 def create_session(record: SessionShutdown) -> bool:
     """Create one session record while excluding competing launch decisions."""
     checked = _session_shutdown(record, "record")
+    if not checked["trail"]:
+        checked["trail"].append(_progress_step(
+            checked, checked["progress"].get("at", checked["requested_at"])))
     with launch_barrier():
         with _session_store_lock(checked["login"], create=True) as directory:
             existing = _session_records_in_directory(directory, checked["login"])
@@ -1230,7 +1299,13 @@ def update_session(
         if record["session"]["session_id"] != session_id:
             raise InvalidRecord(f"{path} is used by a different session id")
         identity = record["login"], record["machine"], record["session"]["session_id"]
+        prior_progress = copy.deepcopy(record["progress"])
+        trail = copy.deepcopy(record["trail"])
         change(record)
+        record["trail"] = trail
+        if record["progress"] != prior_progress:
+            at = datetime.now(timezone.utc).isoformat(timespec="seconds")
+            record["trail"].append(_progress_step(record, at))
         checked = _session_shutdown(record, str(path))
         if (checked["login"], checked["machine"], checked["session"]["session_id"]) != identity:
             raise ValueError("a session record update cannot change its login, machine or session id")
@@ -1331,6 +1406,7 @@ def parse_session_records(text: str) -> list[SessionShutdown]:
         value = cast(object, json.loads(text))
     except (ValueError, TypeError) as error:
         raise InvalidRecord("session records is not valid JSON") from error
+    _ = _worker_record_names(value)
     return [
         _session_shutdown(item, f"records[{index}]")
         for index, item in enumerate(_items(value, "records"))
@@ -1488,7 +1564,7 @@ def _withdraw_session(
         if saved["session"]["session_id"] != session_id:
             raise InvalidRecord(f"{path} is used by a different session id")
         progress = saved["progress"]["kind"]
-        if progress not in {"waiting", "ready", "held by usage limit"} and not (
+        if progress not in {"waiting", "ready", "held by usage limit", "reaping"} and not (
             progress == "stop failed" and identity_check(saved)
         ):
             return SessionRetained(saved)

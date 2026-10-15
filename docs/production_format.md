@@ -83,6 +83,8 @@ The production doc sits beside the source plan as `<source-stem>-production.md`.
 
 ## Production Context
 
+- **Formerly:** `<old>`, `<older>` — previous production slugs, newest first, written by
+  `/showrunner:rename`; old names keep resolving through it; omit before the first rename
 - **Source plans:** <path(s)> — split on <date> by /producer:to_production
 - **Repository:** <main checkout path>
 - **Merge branch:** `<branch>` — every unit merges here; only the showrunner pushes it
@@ -98,6 +100,10 @@ The production doc sits beside the source plan as `<source-stem>-production.md`.
 - **Capacity:** <cores and memory read by /producer:greenlight, and the unit count it allows>
 - **UX guide:** <path to the project's UX rules, e.g. `~/rust/hanadocs/ux`>; omit when
   nothing users see changes
+- **Change review:** <path to the user's change-review list, e.g.
+  `~/rust/hanadocs/change-review.md`>; `merge_checkpoint.py` adds a row per
+  `Change-Review:` line a merged checkpoint names. Omit when the production keeps none; its
+  checkpoints still carry the lines
 - **Review pool:** code (or `code, ui`); omit when the production has none
 - **Proposals:** <folder for finished proposals, e.g. `~/rust/hanadocs/proposals`>; its
   `index.md` holds one row for each, `| Date | Proposal | Unit | Summary | Status |`,
@@ -127,7 +133,9 @@ a session at any time. The unit's tmux session carries the production's slug and
 unit's id as marks, set at launch. To reach a unit, look it up at that moment:
 `$HOME/.claude/scripts/lib/py $HOME/.claude/scripts/production/unit_lookup.py pane <slug> <unit>`
 prints its pane, and `unit_lookup.py list <slug>` prints every unit's pane and its
-session name now. `<slug>` is this doc's file name without `-production.md`.
+session name now. `<slug>` is this doc's file name without `-production.md`; a former
+slug from the Formerly line also works, and a mark set before a rename is found under
+the current slug.
 
 A retired unit keeps its row. Its Plan cell begins with `retired`, alone or inside
 an opening parenthesis, as in `(retired by the user 2026-10-07, worktree removed)`.
@@ -176,6 +184,9 @@ Applies to a `/unit:direct` run whose plan header carries a
 `> **Production:**` line. Read the production doc it names at the start of the
 run and after every compaction. Your row in its **Units** table gives your name,
 branch, port and the files you own.
+
+A turn with nothing for the user replies with just "—": never "No update for
+you." or the like (user, 2026-10-14).
 
 A unit's run state is written down nowhere and the unit sets nothing. Each reader takes it, when it needs it, from the records `/unit:direct` keeps of the runs in the unit's worktree: no run yet is standing by, a newest run with no finish is running, a newest run that finished is run-finished. A session stays live after its run ends, and its next run reads as running from that run's first record.
 A run that stopped, failed, or waits on a decision has no finish in its record, so it does not read as finished, and nothing asks for `run done` text in the Plan cell.

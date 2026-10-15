@@ -89,7 +89,8 @@ if TYPE_CHECKING:
 import review  # noqa: E402
 from user_zone import user_zone  # noqa: E402
 from user_action import (FIX, REFUSED_BEFORE_SENDING, ActionRefused, ActionRequired, ActionUnstated,
-                         UserAction, NoActionRequired, first_line, parse_user_action)  # noqa: E402
+                         UserAction, NoActionRequired, first_line, parse_user_action,
+                         SessionLine, split_session, session_prefix)  # noqa: E402
 
 STATE = Path(os.environ.get("XDG_STATE_HOME") or Path.home() / ".local" / "state") / "message"
 CLAUDE = Path.home() / ".local" / "bin" / "claude"
@@ -193,11 +194,12 @@ class FailedPush:
 
     @property
     def message(self) -> str:
-        return first_line(self.action) + "\n" + self.body
+        session, body = split_session(self.body)
+        return first_line(self.action, session) + "\n" + body
 
     @property
     def text(self) -> str:
-        line = " ".join((self.title + " — " + first_line(self.action)).split())
+        line = " ".join((self.title + " — " + first_line(self.action, split_session(self.body)[0])).split())
         if len(line) <= 200:
             return line
         shortened = line[:199]
@@ -961,6 +963,9 @@ def reviewed_failure(stdout: str, original: FailedPush, *,
             need = record.get("need") if remote_record else original.need
             if need not in ("note", "decision", "blocked"):
                 need = original.need
+            session = record.get("session")
+            if isinstance(session, str):
+                body = session_prefix(SessionLine(session)) + body
             return FailedPush(title, action, body, hold, reviewed=reviewed, need=need, held=record.get("held") is True)
         return original
     return original
@@ -1223,7 +1228,7 @@ def parse(argv: list[str]) -> Options:
             rendered = push_texts.render(text_id, **values)
         except ValueError as error:
             parser.error(str(error))
-        args.summary, args.text = rendered.title, rendered.body
+        args.summary, args.text = rendered.title, session_prefix(rendered.session) + rendered.body
         args.need = "blocked" if as_str(attr(args, "need")) == "blocked" else rendered.need
         args.action = rendered.action.text if isinstance(rendered.action, ActionRequired) else None
         args.no_action = isinstance(rendered.action, NoActionRequired)

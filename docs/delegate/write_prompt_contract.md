@@ -33,9 +33,9 @@ opening in <ReviewPromptContract/>.
    verify, and what it touched outside its file set**. No reviewer receives a
    summary, so a doubt left unstated arrives at review as a line of code that
    looks deliberate. Carry verbatim: "Do not open the `rust_style` skill or run
-   `load-rust-style.sh`; this run's one style audit happens at the end." That
-   audit is <RunProjectStyleReview/>; Codex lists `rust_style` to every worker,
-   which loads it unless told not to.
+   `load-rust-style.sh`; the unit director runs the style review in its main
+   review each phase." Codex lists `rust_style` to every worker, which loads
+   it unless told not to.
 3. Narration: before each activity, run
    `bash ~/.claude/scripts/delegate/board.sh post <concrete SESSION_DIR> <slot> status "<activity>"`.
    Use short present-tense text and never read the heartbeat file. Role
@@ -72,9 +72,28 @@ opening in <ReviewPromptContract/>.
    reply. A repair worker per <FixDispatch/> has no peer: its `## Team` carries
    its file set, the other repair workers' files as read only, and the token
    prohibition.
+
 5. `## Project Context`.
 6. `## Work Specification`.
    For workers writing tests, carry: "Do not write trivial tests that cannot fail for a real defect: assertions of a constant, literal or default against itself, implementation repetition, tests of the standard library or a mock they configure, name-existence or import-only checks, or duplicates of another test; a test that pins behaviour a user or another script depends on is not trivial."
+
+   Every repair prompt's Work Specification also carries these fixing rules inline:
+
+   - Remove dead code; do not mark it as dead to silence a warning.
+   - Remove an unused binding; do not prefix its name with `_`.
+   - Before a rename or signature change, use LSP `findReferences` to find
+     every reference and update each affected reference. Reread the changed
+     body afterwards.
+   - Before fixing a clippy lint, find its governing style rule with:
+
+     ```bash
+     grep -l "^lint:.*\b<lint>\b" ~/rust/nate_style/rust/*.md docs/style/*.md
+     ```
+
+     Read each matching rule, apply it, and cite its file in the fix summary.
+     If none matches, report that no style-guide rule governs the lint and
+     choose the fix from the finding and surrounding code.
+   - On a `cargo mend --fix` rollback, stop and keep the tree for inspection.
 7. `## Type Design Contract` per <TypeDesignContract/>. Copy it verbatim in an
    opening prompt. A follow-up may instead say: `Read
    ~/.claude/docs/type_design.md in full and apply its Type Design Contract to

@@ -1,7 +1,8 @@
-"""Tests for statusline.jq: the usage line, its reset times, and their zone."""
+"""Tests for statusline.sh and statusline.jq: the role, the usage line, its reset times, and their zone."""
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import tempfile
 import time
@@ -12,10 +13,12 @@ from typing import final, override
 from zoneinfo import ZoneInfo
 
 PROGRAM = Path(__file__).with_name("statusline.jq")
+# The settings.json statusLine command, naming this folder in place of ~/.claude's.
+COMMAND = f'statusline="{Path(__file__).parent}"; . "$statusline/statusline.sh"'
 USER_ZONE = ZoneInfo("America/New_York")
 
 
-def status_lines(*inputs: object, labels: Path | None = None, account: str = "claude 1") -> list[str]:
+def status_lines(*inputs: object, labels: Path | None = None, account: str = "claude1") -> list[str]:
     """Run statusline.jq once over every input and return its output lines.
 
     `labels` is the by-label readings file, passed as the settings command passes it.
@@ -100,30 +103,36 @@ class StoredReadingTests(unittest.TestCase):
         return {"weekly": {"left": left, "resets_at": resets_at, "at": at}}
 
     def test_a_fresh_reading_for_the_label_replaces_the_response_figure(self) -> None:
-        path = self.labels({"claude 1": self.weekly(2.0, self.now - 120, self.reset)})
+        path = self.labels({"claude1": self.weekly(2.0, self.now - 120, self.reset)})
         self.assertEqual(
             status_lines(self.live, labels=path)[1].split(" | ")[1],
             f"weekly 2% left until {user_time(self.reset, '%a %H:%M %Z')}",
         )
 
+    def test_legacy_and_canonical_account_caches_find_the_canonical_reading(self) -> None:
+        path = self.labels({"claude2": self.weekly(42, self.now - 60, self.reset)})
+        for label in ("claude 2", "claude2"):
+            with self.subTest(label=label):
+                self.assertIn("weekly 42% left", status_lines(self.live, labels=path, account=label)[1])
+
     def test_a_reading_older_than_ten_minutes_gives_the_response_figure(self) -> None:
-        path = self.labels({"claude 1": self.weekly(2.0, self.now - 601, self.reset)})
+        path = self.labels({"claude1": self.weekly(2.0, self.now - 601, self.reset)})
         self.assertTrue(status_lines(self.live, labels=path)[1].endswith("| weekly 3% left until "
                         + user_time(self.now + 86400, "%a %H:%M %Z")))
 
     def test_a_reading_whose_window_has_reset_gives_the_response_figure(self) -> None:
-        path = self.labels({"claude 1": self.weekly(2.0, self.now - 60, self.now - 1)})
+        path = self.labels({"claude1": self.weekly(2.0, self.now - 60, self.now - 1)})
         self.assertIn("weekly 3% left", status_lines(self.live, labels=path)[1])
 
     def test_another_label_s_reading_is_not_used(self) -> None:
-        path = self.labels({"claude 2": self.weekly(50.0, self.now - 60, self.reset)})
+        path = self.labels({"claude2": self.weekly(50.0, self.now - 60, self.reset)})
         self.assertIn("weekly 3% left", status_lines(self.live, labels=path)[1])
 
     def test_a_missing_file_given_as_dev_null_gives_the_response_figure(self) -> None:
         self.assertIn("weekly 3% left", status_lines(self.live, labels=Path("/dev/null"))[1])
 
     def test_a_none_open_five_hour_reading_shows_all_left_with_no_reset(self) -> None:
-        path = self.labels({"claude 1": {"five_hour": {"left": 100.0, "resets_at": None, "at": self.now - 60}}})
+        path = self.labels({"claude1": {"five_hour": {"left": 100.0, "resets_at": None, "at": self.now - 60}}})
         self.assertTrue(status_lines(self.live, labels=path)[1].startswith("5-hour 100% left | weekly"))
 
     def test_an_address_as_the_account_never_reaches_the_line(self) -> None:
@@ -134,6 +143,85 @@ class StoredReadingTests(unittest.TestCase):
         line = status_lines(self.live, account="claude 3")[0]
         self.assertIn("| claude3 |", line)
         self.assertNotIn("claude 3", line)
+
+
+@final
+class RoleTests(unittest.TestCase):
+    """The first field, as statusline.sh and statusline.jq read it from the session."""
+
+    def __init__(self, methodName: str = "runTest") -> None:
+        super().__init__(methodName)
+        self.home = Path()
+
+    @override
+    def setUp(self) -> None:
+        self.home = Path(self.enterContext(tempfile.TemporaryDirectory()))
+
+    def timer(self, instance: str, target: str) -> None:
+        """A notifier instance whose conf opens with TARGET, as notifier.sh writes it."""
+        directory = self.home / ".local/state/notifier" / instance
+        directory.mkdir(parents=True)
+        _ = (directory / "conf").write_text(f"TARGET={target}\nEVERY=600\n", encoding="utf-8")
+
+    def first_line(self, session_id: str = "aaaa-1111", **marks: str) -> str:
+        """Run the statusLine command as Claude Code does, with only `marks` beside a bare environment."""
+        env = {"PATH": os.environ["PATH"], "HOME": str(self.home), **marks}
+        result = subprocess.run(
+            ["/bin/sh", "-c", COMMAND], input=json.dumps({"session_id": session_id}), capture_output=True, text=True,
+            check=True, env=env, cwd=self.home,
+        )
+        return result.stdout.splitlines()[0]
+
+    def role(self, session_id: str = "aaaa-1111", **marks: str) -> str:
+        return self.first_line(session_id, **marks).split(" | ")[0]
+
+    def test_a_session_with_no_mark_is_unassigned(self) -> None:
+        self.assertEqual(self.role(), "unassigned")
+
+    def test_a_session_a_showrunner_timer_targets_is_the_showrunner(self) -> None:
+        self.timer("showrunner-other", "session:bbbb-2222")
+        self.timer("showrunner-show", "session:aaaa-1111")
+        self.assertEqual(self.role(), "showrunner")
+
+    def test_a_unit_promoted_to_showrunner_reads_as_the_showrunner(self) -> None:
+        self.timer("showrunner-show", "session:aaaa-1111")
+        self.assertEqual(self.role(SHOWRUNNER_UNIT="show"), "showrunner")
+
+    def test_another_session_s_timer_does_not_make_a_showrunner(self) -> None:
+        self.timer("showrunner-show", "session:bbbb-2222")
+        self.assertEqual(self.role(), "unassigned")
+
+    def test_a_timer_that_is_not_a_showrunner_s_does_not_make_one(self) -> None:
+        self.timer("delegate-aaaa-1111", "session:aaaa-1111")
+        self.assertEqual(self.role(), "unassigned")
+
+    def test_an_empty_target_does_not_match_an_empty_session_id(self) -> None:
+        self.timer("showrunner-show", "session:")
+        self.assertEqual(self.role(session_id=""), "unassigned")
+
+    def test_the_notifier_dir_variable_names_where_timers_are(self) -> None:
+        self.timer("showrunner-show", "session:aaaa-1111")
+        moved = self.home / "moved"
+        _ = (self.home / ".local/state/notifier").rename(moved)
+        self.assertEqual(self.role(NOTIFIER_STATE_DIR=str(moved)), "showrunner")
+
+    def test_a_unit_mark_is_a_unit_director(self) -> None:
+        self.assertEqual(self.role(SHOWRUNNER_UNIT="show", SHOWRUNNER_UNIT_ID="trunk-unit"), "unit director")
+
+    def test_an_empty_unit_mark_is_unassigned(self) -> None:
+        self.assertEqual(self.role(SHOWRUNNER_UNIT=""), "unassigned")
+
+    def test_a_worker_under_a_daemon_a_unit_started_is_a_worker(self) -> None:
+        self.assertEqual(self.role(PLAN_DELEGATE_TEAM_ROLE="impl", SHOWRUNNER_UNIT="show"), "worker")
+
+    def test_the_empty_team_role_agent_bg_hands_a_friend_is_unassigned(self) -> None:
+        self.assertEqual(self.role(PLAN_DELEGATE_TEAM_ROLE=""), "unassigned")
+
+    def test_the_account_label_follows_the_role(self) -> None:
+        config = self.home / "config"
+        config.mkdir()
+        _ = (config / "account-label").write_text("claude4\n", encoding="utf-8")
+        self.assertTrue(self.first_line(CLAUDE_CONFIG_DIR=str(config)).startswith("unassigned | claude4 | "))
 
 
 if __name__ == "__main__":
