@@ -19,8 +19,8 @@ The pieces this depends on, each verified against codex 0.162.0:
 
 `start` deliberately blocks for the delegate's lifetime. Launches that return
 immediately would break every caller that waits on a pid, so this stays in the
-foreground and implement.sh's `wait`, heartbeat watch, awake timer, and pass
-recording work unchanged.
+foreground and implement.sh's `wait`, heartbeat watch, and pass recording work
+unchanged.
 
 Verbs:
   serve  Start the session's app-server and record where it listens.
@@ -3625,7 +3625,7 @@ SERVER_IDLE_SECS = 1800.0
 WATCH_WAKE_SECS = 300
 # Files in a run folder whose change means the run is still working. `ensure_server` touches the
 # server's record on every use.
-SWEEP_ACTIVITY_FILES = ("heartbeat.log", "board.log", ROSTER_FILE, SERVER_LOG, SERVER_FILE)
+SWEEP_ACTIVITY_FILES = (unit_runs.HEARTBEAT, "board.log", ROSTER_FILE, SERVER_LOG, SERVER_FILE)
 SERVER_ARGUMENTS = ("app-server", "--listen")
 
 

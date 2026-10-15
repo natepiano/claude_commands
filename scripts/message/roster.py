@@ -766,13 +766,13 @@ def _live_runs(
     for root in roots:
         _read_run_markers(root / "active", live_session_ids, by_path, problems)
         try:
-            heartbeats.extend(root.glob(f"*/{remove_workers.HEARTBEAT}"))
+            heartbeats.extend(root.glob(f"*/{unit_runs.HEARTBEAT}"))
         except OSError as error:
             _problem(problems, f"unit runs in {root}", error)
     now = time.time()
     for heartbeat in heartbeats:
         try:
-            if now - heartbeat.stat().st_mtime < remove_workers.LIVE_HEARTBEAT_SECS:
+            if now - heartbeat.stat().st_mtime < unit_runs.LIVE_HEARTBEAT_SECS:
                 _ = by_path.setdefault(heartbeat.parent.resolve(), _NoRunningDirector())
         except OSError as error:
             _problem(problems, f"delegate heartbeat {heartbeat}", error)
