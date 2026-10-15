@@ -73,7 +73,7 @@ class WatchTests(unittest.TestCase):
                 live.email = identity.login
                 live.source = CodexHomeSource(home)
         readings = quota_alert.CodexAlertPassReadings(
-            accounts.CodexSeatsAccount(label="default", home=home), identity,
+            accounts.CodexSeatsAccount(label="codex1", home=home), identity,
             tuple(quota_alert.CodexHomeReading(home, live, now) for live in reports if live.tool == "Codex"))
         return five_hour.watch(reports, codex_readings=readings)
 

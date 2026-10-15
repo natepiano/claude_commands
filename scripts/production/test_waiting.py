@@ -49,8 +49,8 @@ BETA = "beta-unit"
 GAMMA = "gamma-unit"
 PHASE = "Phase 2 of 3: panel labels stay clear"
 # Quota notices read no live account dirs: each test names the Claude accounts in use.
-MAIN_CLAUDE = agent_accounts.KnownClaudeAccount("main@example.invalid", "claude2")
-UNIT_CLAUDE = agent_accounts.KnownClaudeAccount("unit@example.invalid", "claude3")
+MAIN_CLAUDE = agent_accounts.NumberedAccount("claude2", Path.home() / ".claude", "main@example.invalid")
+UNIT_CLAUDE = agent_accounts.NumberedAccount("claude3", Path("/unread/.claude3"), "unit@example.invalid")
 ONE_CLAUDE_ACCOUNT = agent_accounts.ClaudeAccountsInUse(MAIN_CLAUDE, False, (), frozenset())
 TWO_CLAUDE_ACCOUNTS = agent_accounts.ClaudeAccountsInUse(
     MAIN_CLAUDE, True,
@@ -519,7 +519,7 @@ class WaitingTests(unittest.TestCase):
         }
         home = self.root / "codex-fixture"
         readings = quota_alert.CodexAlertPassReadings(
-            CodexSeatsAccount("default", home),
+            CodexSeatsAccount(note.label, home),
             agent_accounts.KnownCodexAccount(home, "codex@example.invalid", note.label),
             (),
         )

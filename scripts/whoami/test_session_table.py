@@ -89,7 +89,7 @@ class SessionTableTests(unittest.TestCase):
             def now(cls, tz: tzinfo | None = None) -> Self:
                 return cls.fromtimestamp(at.timestamp(), tz)
 
-        selection = agent_accounts.ClaudeAccountsInUse(agent_accounts.UnreadableClaudeAccount(), False, (), frozenset())
+        selection = agent_accounts.ClaudeAccountsInUse(agent_accounts.UnreadableIdentity(Path.home() / ".claude", "fixture identity unavailable"), False, (), frozenset())
         with patch.dict(os.environ, {"HOME": str(root), "AGENT_NOTES_DIR": str(root)}), \
              patch.object(roster, "roster", return_value=roster.Roster(local, [])), \
              patch.object(roster, "peer_snapshot", return_value=peer), \

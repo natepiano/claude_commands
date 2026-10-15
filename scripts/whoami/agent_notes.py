@@ -377,7 +377,7 @@ def update_alert_pass(selection: ClaudeAccountsInUse, seats_home: Path) -> Updat
                          and (report.tool.lower() != "claude" or not selection.multiple_accounts
                               or (report.source.directory == Path.home() / ".claude"
                                   if isinstance(report.source, ClaudeDirectorySource)
-                                  else selection.is_default_login(report.email or "")))]
+                                  else selection.is_home_directory_login(report.email or "")))]
         messages += five_hour.watch(watch_reports, codex_readings=codex_readings)
     except (OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError) as error:
         # The 5-hour watch must never cost the notes or the weekly alerts.

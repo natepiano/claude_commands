@@ -74,7 +74,7 @@ class PromoteShowrunnerTests(unittest.TestCase):
     alive: list[bool] = []
     started: int = 0
     marked: dict[str, unit_lookup.MarkedUnit] = {}
-    unit_account: accounts.ClaudeLaunchAccount = accounts.DefaultAccount()
+    unit_account: accounts.ClaudeLaunchAccount = accounts.NamedAccount("claude2", Path())
     # What the stand-ins answer; a refusal case changes one of them.
     runs_production: bool = True
     pane: unit_effort.Ready | unit_effort.Skipped = unit_effort.Ready()
@@ -100,12 +100,15 @@ class PromoteShowrunnerTests(unittest.TestCase):
         self.events, self.alive, self.started = [], [True, True, False], 0
         self.marked = {"demo-unit": unit_lookup.MarkedUnit(
             "demo-unit", "demo", unit_lookup.LiveClaude("demo", SESSION, "/sock", PID), unit_lookup.TmuxPlace(PANE))}
-        self.unit_account = accounts.DefaultAccount()
+        self.unit_account = accounts.NamedAccount("claude2", self.root / ".claude")
         (self.root / ".claude").mkdir()
         _ = (self.root / ".claude.json").write_text(json.dumps({"oauthAccount": {"emailAddress": "default@example.invalid"}}))
+        notes = self.root / "notes"
+        notes.mkdir()
+        _ = (notes / "claude2.md").write_text("---\nlogin: default@example.invalid\n---\n")
         self.runs_production, self.pane, self.child_refusal = True, unit_effort.Ready(), ""
         self.enterContext(mock.patch.dict(os.environ, {
-            "HOME": str(self.root), "NOTIFIER_SESSIONS_DIR": str(sessions), "PLAN_DELEGATE_ACTIVE_DIR": str(self.root / "active")}))
+            "HOME": str(self.root), "AGENT_NOTES_DIR": str(notes), "NOTIFIER_SESSIONS_DIR": str(sessions), "PLAN_DELEGATE_ACTIVE_DIR": str(self.root / "active")}))
         for module, name, stand_in in (
                 (showrunners, "production_of", self.production_of), (unit_lookup, "marked_units", self.marked_units),
                 (promote_showrunner, "_tmux", self.tmux), (session_pane, "_tmux", self.pane_tmux), (promote_showrunner, "_alive", self.is_alive),
@@ -145,7 +148,7 @@ class PromoteShowrunnerTests(unittest.TestCase):
                 return subprocess.CompletedProcess(["tmux", *arguments], 1, "", f"no such session: {target}")
         shown = "╭───╮\n│ > │\n╰───╯\n" if arguments[0] == "capture-pane" else ""
         if arguments[0] == "show-options" and arguments[-1] == "@claude_config_dir":
-            shown = str(self.root / ".claude" if isinstance(self.unit_account, accounts.DefaultAccount) else self.unit_account.dir) + "\n"
+            shown = str(self.unit_account.dir) + "\n"
         return subprocess.CompletedProcess(["tmux", *arguments], 0, shown, "")
 
     def pane_tmux(self, *arguments: str) -> str:
@@ -157,7 +160,7 @@ class PromoteShowrunnerTests(unittest.TestCase):
 
     def child_checked(self, _child: Production, caller: str, ending: str = "", start_in: Path | None = None, *, config_dir: Path | None = None) -> str:
         self.events.append(f"check child for {caller}, ending {ending}, starting in {start_in}")
-        self.assertEqual(config_dir, self.root / ".claude" if isinstance(self.unit_account, accounts.DefaultAccount) else self.unit_account.dir)
+        self.assertEqual(config_dir, self.unit_account.dir)
         if self.child_refusal:
             raise Refusal(f"{self.child_refusal} (ending {ending})")
         return "tmux"
@@ -286,7 +289,7 @@ class PromoteShowrunnerTests(unittest.TestCase):
             self.events.append("check showrunner account")
             return "tmux"
         def resolved(role: str) -> accounts.ClaudeLaunchAccount:
-            return selected if role == "showrunner" else accounts.DefaultAccount()
+            return selected if role == "showrunner" else accounts.NamedAccount("claude2", self.root / ".claude")
         with (mock.patch.object(accounts, "role_account", side_effect=resolved) as resolve,
               mock.patch.object(add_showrunner, "checked", side_effect=checked)):
             code, _, error = self.run_main()
@@ -305,7 +308,7 @@ class PromoteShowrunnerTests(unittest.TestCase):
         selected = self.ready_showrunner_account()
         def resolved(role: str) -> accounts.ClaudeLaunchAccount:
             self.events.append("resolve " + role)
-            return selected if role == "showrunner" else accounts.DefaultAccount()
+            return selected if role == "showrunner" else accounts.NamedAccount("claude2", self.root / ".claude")
         def checked(_child: Production, _caller: str, ending: str = "", start_in: Path | None = None,
                     *, config_dir: Path | None = None) -> str:
             self.assertEqual(config_dir, selected.dir)
@@ -331,7 +334,7 @@ class PromoteShowrunnerTests(unittest.TestCase):
             self.assertEqual((ending, start_in), ("demo", self.worktree))
             return "tmux"
         def resolved(role: str) -> accounts.ClaudeLaunchAccount:
-            return selected if role == "showrunner" else accounts.DefaultAccount()
+            return selected if role == "showrunner" else accounts.NamedAccount("claude2", self.root / ".claude")
         with (mock.patch.object(accounts, "role_account", side_effect=resolved),
               mock.patch.object(add_showrunner, "checked", side_effect=checked)):
             code, output, error = self.run_main()
@@ -497,7 +500,7 @@ class PromoteShowrunnerTests(unittest.TestCase):
               mock.patch.object(showrunners, "descendants_of", mock.Mock(return_value=[])),
               mock.patch.object(unit_lookup, "tmux_binary", mock.Mock(return_value="tmux"))):
             with self.assertRaisesRegex(Refusal, f"child: Claude is not trusted in {self.worktree.resolve()} on "
-                                        + "default account. Run:"):
+                                        + "claude2. Run:"):
                 _ = ORIGINAL_CHECKED(child, "parent", ending="demo", start_in=self.worktree)
 
 
