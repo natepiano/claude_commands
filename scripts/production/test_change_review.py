@@ -4,14 +4,19 @@ Every test works in a temporary git repository and a temporary list; none reads 
 """
 from __future__ import annotations
 
+import fcntl
+import io
 import os
 import subprocess
 import sys
 import tempfile
+import threading
 import unittest
+from contextlib import redirect_stderr, redirect_stdout
 from datetime import date
 from pathlib import Path
 from typing import override
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import change_review
@@ -29,6 +34,12 @@ LIST = """# Change review list
 ## Questions: later
 
 | C80 | a closed row elsewhere still counts | 2026-10-01 | yes | - |
+
+## Reviewed
+
+| # | Change | Verdict | Date |
+| --- | --- | --- | --- |
+| C70 | Older | works | 2026-10-13 |
 """
 SEE = "Change-Review: The grid fades more gently | Look across the floor"
 
@@ -82,6 +93,106 @@ class ListTest(unittest.TestCase):
         self.assertEqual(change_review.list_path(doc), Path.home() / "rust/hanadocs/change-review.md")
         _ = doc.write_text("# p\n", encoding="utf-8")
         self.assertIsNone(change_review.list_path(doc))
+
+
+def run(*arguments: str) -> tuple[int, str, str]:
+    """The command line's exit code, standard output and standard error."""
+    output, error = io.StringIO(), io.StringIO()
+    with redirect_stdout(output), redirect_stderr(error):
+        code = change_review.main(list(arguments))
+    return code, output.getvalue(), error.getvalue()
+
+
+class ActionTest(unittest.TestCase):
+    """add, show, verdict and list-path, on a Hana-shaped list and on a list not yet written."""
+
+    path: Path = Path()
+    fresh: Path = Path()
+
+    @override
+    def setUp(self) -> None:
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        self.path = Path(directory.name) / "change-review.md"
+        _ = self.path.write_text(LIST, encoding="utf-8")
+        self.fresh = Path(directory.name) / "change-review" / "slug.md"
+
+    def test_the_first_row_creates_a_missing_list_from_the_skeleton(self) -> None:
+        rows = change_review.append_rows(self.fresh, [Visible("A", "B")], date(2026, 10, 15), "")
+        self.assertEqual(rows, ["| C1 | A | 2026-10-15 | B |"])
+        self.assertEqual(self.fresh.read_text(encoding="utf-8"), change_review.SKELETON.replace(
+            "| --- | --- | --- | --- |\n\n## Reviewed", "| --- | --- | --- | --- |\n| C1 | A | 2026-10-15 | B |\n\n## Reviewed"))
+
+    def test_add_takes_the_next_number_and_fills_the_mac_build_column_only_where_the_table_has_one(self) -> None:
+        self.assertEqual(run("add", "--list", str(self.path), "--change", "Tabs | spaces", "--check", "Look",
+                             "--merged", "216c4e1d"), (0, "C81\n", ""))
+        day = change_review.today().isoformat()
+        self.assertIn(f"| C81 | Tabs \\| spaces | {day} · 216c4e1d | not yet | Look |\n\n## Questions",
+                      self.path.read_text(encoding="utf-8"))
+        self.assertEqual(run("add", "--list", str(self.fresh), "--change", "A", "--check", "B")[1], "C1\n")
+        self.assertIn(f"| C1 | A | {day} | B |", self.fresh.read_text(encoding="utf-8"))
+
+    def test_add_refuses_an_empty_or_multi_line_part_and_writes_nothing(self) -> None:
+        for change, check in (("", "Look"), ("A", " "), ("A\nB", "Look")):
+            code, _, error = run("add", "--list", str(self.path), "--change", change, "--check", check)
+            self.assertEqual(code, 1)
+            self.assertIn("needs one line of words", error)
+        self.assertEqual(self.path.read_text(encoding="utf-8"), LIST)
+
+    def test_show_walks_the_rows_to_review_and_reads_only(self) -> None:
+        self.assertEqual(run("show", "--list", str(self.path)), (0, (
+            "C76 Panels keep shields\n  How to check: Launch Hana\n  Merged: 2026-10-14\n  On the Mac build: not yet\n\n"
+            + "C77 Fonts redraw\n  How to check: Change a font\n  Merged: 2026-10-14\n  On the Mac build: not yet\n"), ""))
+        self.assertEqual(run("show", "--list", str(self.fresh)), (0, "nothing to review\n", ""))
+        self.assertFalse(self.fresh.parent.exists())
+
+    def test_a_verdict_moves_the_row_to_the_top_of_reviewed(self) -> None:
+        self.assertEqual(change_review.record_verdict(self.path, "C76", "Works, thanks", date(2026, 10, 15)), "2026-10-14")
+        text = self.path.read_text(encoding="utf-8")
+        self.assertNotIn("| C76 | Panels keep shields | 2026-10-14", text)
+        self.assertIn("| --- | --- | --- | --- |\n| C76 | Panels keep shields | Works, thanks | 2026-10-15 |\n| C70 |", text)
+
+    def test_works_or_fine_lands_and_any_other_verdict_returns_to_the_unit(self) -> None:
+        self.assertEqual(run("verdict", "--list", str(self.path), "--row", "C76", "--verdict", "fine"),
+                         (0, "C76 landed\n", ""))
+        self.assertEqual(run("verdict", "--list", str(self.path), "--row", "C77", "--verdict", "still the old font | x"),
+                         (0, "C77 returns to its unit (merged 2026-10-14)\n", ""))
+        self.assertIn("| C77 | Fonts redraw | still the old font \\| x |", self.path.read_text(encoding="utf-8"))
+        self.assertTrue(change_review.lands("Works: it does"))
+        self.assertFalse(change_review.lands("not fine"))
+
+    def test_a_verdict_for_a_row_not_to_review_is_refused(self) -> None:
+        for row in ("C70", "C99", "76"):
+            code, output, error = run("verdict", "--list", str(self.path), "--row", row, "--verdict", "works")
+            self.assertEqual((code, output), (1, ""), row)
+            self.assertEqual(len(error.splitlines()), 1, row)
+        self.assertEqual(self.path.read_text(encoding="utf-8"), LIST)
+
+    def test_a_write_waits_for_the_lock_and_concurrent_writes_keep_every_row(self) -> None:
+        held = os.open(self.path.parent, os.O_RDONLY)
+        fcntl.flock(held, fcntl.LOCK_EX)
+        writers = [threading.Thread(target=change_review.append_rows,
+                                    args=(self.path, [Visible(f"Row {index}", "Look")], date(2026, 10, 15), ""))
+                   for index in range(8)]
+        for writer in writers:
+            writer.start()
+        writers[0].join(0.3)
+        self.assertTrue(writers[0].is_alive())
+        self.assertEqual(self.path.read_text(encoding="utf-8"), LIST)
+        os.close(held)
+        for writer in writers:
+            writer.join(10)
+        rows = [row for row in self.path.read_text(encoding="utf-8").splitlines() if "| Row " in row]
+        self.assertEqual(sorted(row.split(" ")[1] for row in rows), [f"C{number}" for number in range(81, 89)])
+
+    def test_list_path_prints_the_list_a_production_doc_names(self) -> None:
+        doc = self.path.with_name("production.md")
+        _ = doc.write_text(f"# p\n\n- **Change review:** `{self.fresh}`\n", encoding="utf-8")
+        self.assertEqual(run("list-path", "--production", str(doc)), (0, f"{self.fresh}\n", ""))
+        _ = doc.write_text("# p\n", encoding="utf-8")
+        self.assertEqual(run("list-path", "--production", str(doc))[:2], (1, ""))
+        with mock.patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": ""}):
+            self.assertIn("pass --production", run("list-path")[2])
 
 
 class RepositoryTest(unittest.TestCase):

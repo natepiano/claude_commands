@@ -56,8 +56,10 @@ and replies with the plan path and phases. Then:
 … proposal_issue.py approve <issue> --showrunner "<name>" --unit <unit> --plan "<plan path> Phase N–M"
 ```
 
-- `--showrunner`: this session's name, `showrunners.py name <slug>`.
-- `--unit`: the unit's name in the production doc's **Units** table.
+- `--showrunner`: this session's name as `showrunners.py name <slug>` prints it
+  (`hana`, `natedev`), never the production slug.
+- `--unit`: the unit's full name in the production doc's **Units** table
+  (`trunk-unit`).
 
 The stage stays backlog until the work starts. A proposal the user declines
 closes through `/close_issue` with its reason.
