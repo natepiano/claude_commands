@@ -9,6 +9,7 @@ import io
 import json
 import os
 import subprocess
+import sys
 import tempfile
 import unittest
 from collections.abc import Callable
@@ -19,6 +20,7 @@ from typing import cast, override
 from unittest.mock import patch
 
 from scripts.delegate import progress_history
+from scripts.delegate.recorder_fixture import invoke_recorder
 
 
 SCRIPT = Path(__file__).with_name("progress_history.py")
@@ -121,6 +123,70 @@ class ProgressHistoryTests(unittest.TestCase):
             encoding="utf-8",
         )
 
+    def test_cold_recorder_calls_use_each_home_and_restore_the_callers_configuration(self) -> None:
+        caller = self.root / "caller"
+        caller.mkdir()
+        program = r'''import fcntl, hashlib, json, os, signal, sys
+from pathlib import Path
+from unittest.mock import patch
+from scripts.delegate.recorder_fixture import invoke_recorder
+from scripts.delegate import progress_history
+from scripts.lib import user_zone
+
+root, working = map(Path, sys.argv[1:])
+caller = (os.environ.copy(), Path.cwd(), sys.argv.copy(), sys.path.copy(),
+          progress_history.DEFAULT_CONFIG_PATH, progress_history.DEFAULT_AGENTS_CONFIG_PATH,
+          user_zone.CONF, {sig: signal.getsignal(sig) for sig in
+                          (signal.SIGINT, signal.SIGTERM, signal.SIGHUP, signal.SIGQUIT)})
+plan = working / 'cold-plan.md'
+plan.write_text('## Delegation Context\n\n- **Project:** Cold recorder\n')
+for number in (1, 2):
+    home = root / str(number)
+    config = home / '.claude/config'
+    config.mkdir(parents=True)
+    settings = config / 'delegate.conf'
+    registry = config / 'agents.conf'
+    settings.write_text(f'PLAN_DELEGATE_PROGRESS_INTERVAL_SECONDS={number * 60}\n')
+    registry.write_text(f'registry-{number}\n')
+    environment = {**os.environ, 'HOME': str(home), 'USER_ZONE': 'UTC',
+                   'PLAN_DELEGATE_SYNC_WRITES': '0', 'PLAN_DELEGATE_PASS_OWNER': 'launcher',
+                   'PLAN_DELEGATE_NOW_EPOCH': '1000'}
+    for key in ('PLAN_DELEGATE_CONFIG', 'AGENTS_CONFIG_FILE', 'PLAN_DELEGATE_HISTORY_DIR',
+                'CODEX_THREAD_ID', 'CLAUDE_CODE_SESSION_ID'):
+        environment.pop(key, None)
+    session = home / 'session'
+    commands = (
+        ['start-run', '--session-dir', str(session), '--working-dir', str(working),
+         '--plan-doc', str(plan), '--main-model', 'fixture-model'],
+        ['start-phase', '--session-dir', str(session), '--phase-id', '1', '--phase-title', 'First'],
+        ['start-pass', '--session-dir', str(session), '--pass-kind', 'impl', '--activity', 'writing',
+         '--called-task', 'delegate.implementation', '--called-family', 'codex',
+         '--called-model', 'fixture-model'],
+    )
+    for arguments in commands:
+        with patch.object(fcntl, 'flock', wraps=fcntl.flock) as lock:
+            result = invoke_recorder(arguments, environment, working, check=True)
+        assert [call.args[1] for call in lock.call_args_list][0] == fcntl.LOCK_EX
+        assert lock.call_args_list[-1].args[1] == fcntl.LOCK_UN
+        assert (session / '.progress_history.lock').exists()
+    history, = (home / '.local/state/plan-delegate/runs').glob('*.jsonl')
+    events = [json.loads(line) for line in history.read_text().splitlines()]
+    started, = [event for event in events if event['event_type'] == 'pass_started']
+    assert started['config_digest'] == hashlib.sha256(registry.read_bytes() + settings.read_bytes()).hexdigest()[:12]
+    assert progress_history._config_digest.cache_info().currsize == 0
+    restored = (os.environ.copy(), Path.cwd(), sys.argv.copy(), sys.path.copy(),
+                progress_history.DEFAULT_CONFIG_PATH, progress_history.DEFAULT_AGENTS_CONFIG_PATH,
+                user_zone.CONF, {sig: signal.getsignal(sig) for sig in caller[-1]})
+    assert restored == caller, (restored, caller)
+print('two homes isolated; recorder lock retained; caller restored')
+'''
+        environment = {**os.environ, "HOME": str(caller),
+                       "USER_ZONE_CONF": str(caller / "zone.conf")}
+        result = subprocess.run([sys.executable, "-c", program, str(self.root), str(self.working_dir)],
+                                env=environment, capture_output=True, text=True, check=False, timeout=300)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("two homes isolated; recorder lock retained; caller restored", result.stdout)
+
     def isolate_identity(self, environment: dict[str, str]) -> None:
         """Point unit-director detection at the temporary home, not this machine's.
 
@@ -169,13 +235,7 @@ class ProgressHistoryTests(unittest.TestCase):
         self.isolate_identity(environment)
         if claude_session:
             environment["CLAUDE_CODE_SESSION_ID"] = claude_session
-        result = subprocess.run(
-            ["python3", str(SCRIPT), *arguments],
-            check=True,
-            capture_output=True,
-            text=True,
-            env=environment,
-        )
+        result = invoke_recorder(arguments, environment, Path.cwd(), check=True)
         return result.stdout.strip()
 
     def run_failing_command(
@@ -198,13 +258,7 @@ class ProgressHistoryTests(unittest.TestCase):
             _ = environment.pop("PLAN_DELEGATE_TEAM_ROLE", None)
         self.isolate_recorder_roots(environment)
         self.isolate_identity(environment)
-        return subprocess.run(
-            ["python3", str(SCRIPT), *arguments],
-            check=False,
-            capture_output=True,
-            text=True,
-            env=environment,
-        )
+        return invoke_recorder(arguments, environment, Path.cwd())
 
     def invoke_handler(
         self,
@@ -1844,13 +1898,8 @@ class ProgressHistoryTests(unittest.TestCase):
         else:
             _ = environment.pop("PLAN_DELEGATE_TEAM_ROLE", None)
         self.isolate_recorder_roots(environment)
-        return subprocess.run(
-            ["python3", str(SCRIPT), *arguments],
-            check=False,
-            capture_output=True,
-            text=True,
-            env=environment,
-        )
+        self.isolate_identity(environment)
+        return invoke_recorder(arguments, environment, Path.cwd())
 
     def test_start_pass_outside_a_launcher_is_refused(self) -> None:
         session_dir = self.start_run("owned", 20_000)
@@ -4137,6 +4186,40 @@ class ProgressHistoryTests(unittest.TestCase):
         )
         self.assertIn("| sonnet-5 low |", rendered)
         self.assertNotIn("gpt-main xhigh", rendered)
+
+    def test_identity_detection_prefers_codex_falls_back_to_claude_and_refuses_unknown(self) -> None:
+        codex = self.root / ".codex/sessions/turn-codex-session.jsonl"
+        claude = self.root / ".claude/projects/project/claude-session.jsonl"
+        codex.parent.mkdir(parents=True)
+        claude.parent.mkdir(parents=True)
+        _ = codex.write_text(json.dumps({"type": "turn_context", "payload": {"model": "codex-model"}}) + "\n")
+        _ = claude.write_text(json.dumps({"type": "assistant", "message": {"model": "claude-model"}}) + "\n")
+        plan = self.working_dir / "identity-plan.md"
+        _ = plan.write_text("## Delegation Context\n\n- **Project:** Identity fallback\n")
+        environment = os.environ.copy()
+        self.isolate_recorder_roots(environment)
+        self.isolate_identity(environment)
+        environment.update({"CODEX_THREAD_ID": "codex-session", "CLAUDE_CODE_SESSION_ID": "claude-session",
+                            "PLAN_DELEGATE_HISTORY_DIR": str(self.history_dir), "PLAN_DELEGATE_NOW_EPOCH": "1000"})
+        for family, model in (("codex", "codex-model"), ("claude", "claude-model"), ("unknown", "unknown")):
+            with self.subTest(family=family):
+                session = self.root / f"identity-{family}"
+                result = invoke_recorder(["start-run", "--session-dir", str(session),
+                                          "--working-dir", str(self.working_dir), "--plan-doc", str(plan)],
+                                         environment, self.working_dir)
+                if family == "unknown":
+                    self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+                    self.assertIn("Unable to detect the unit director's model and effort", result.stderr)
+                    self.assertFalse((session / "progress_history_state.json").exists())
+                else:
+                    self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                    identity = cast("dict[str, object]", self.read_state(session)["main_agent"])
+                    self.assertEqual((identity["family"], identity["model"], identity["effort"]),
+                                     (family, model, "unset"))
+                if family == "codex":
+                    _ = codex.write_text('{"type":"turn_context","payload":{}}\n')
+                elif family == "claude":
+                    claude.unlink()
 
     def test_the_eta_names_the_day_the_work_is_expected_to_land(self) -> None:
         """A duration has to be added to the clock by hand; an arrival does not."""

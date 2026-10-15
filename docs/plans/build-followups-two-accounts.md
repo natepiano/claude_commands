@@ -824,7 +824,7 @@ After a worker launch's own turn has ended, a move to the selected seats home th
 
 **Ruled out:** reading a worker's account from the run's newest server or `agent_accounts.seats_home()`; defaulting to `~/.codex` without a read process environment; the shutdown inventory as the session source (per login, no Codex rows); emptying a role the pass could not read.
 
-### Phase 22 — Account labels without a space  · status: todo
+### Phase 22 — Account labels without a space  · status: done
 
 **Depends on:** Phase 20, Phase 21
 

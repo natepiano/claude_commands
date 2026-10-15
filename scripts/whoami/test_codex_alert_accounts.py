@@ -87,7 +87,7 @@ class CodexAccountAlertTests(unittest.TestCase):
             "id_token": f"header.{claims}.signature",
         }}))
         _ = self.note(number, "inactive", 80)
-        return agent_accounts.KnownCodexAccount(home, login, f"codex {number}")
+        return agent_accounts.KnownCodexAccount(home, login, f"codex{number}")
 
     def note(self, number: int, state: str, left: int, credits: str = "0") -> quota_alert.AgentNote:
         path = self.root / f"codex{number}.md"
@@ -95,7 +95,7 @@ class CodexAccountAlertTests(unittest.TestCase):
             + f"weekly_remaining_usage: {left}\ncredit_balance: {credits}\n"
             + f"resets: {(self.now + timedelta(days=2)).isoformat()}\n---\n")
         note = note_file.read_note(path)
-        assert note is not None
+        assert isinstance(note, note_file.Note)
         return note
 
     def report(self, account: agent_accounts.KnownCodexAccount, left: int = 1,
@@ -180,7 +180,7 @@ class CodexAccountAlertTests(unittest.TestCase):
         self.save_room(old, 1)
         self.save_room(target, 1)
         with patch.object(usage_store, "write") as write:
-            self.assertEqual(quota_alert.codex_swap_line(readings, self.now), "workers move to codex 2 when Codex refuses work")
+            self.assertEqual(quota_alert.codex_swap_line(readings, self.now), "workers move to codex2 when Codex refuses work")
         write.assert_not_called()
 
     def test_each_alert_refresh_and_blocked_pass_saves_usage_once(self) -> None:
@@ -252,10 +252,10 @@ class CodexAccountAlertTests(unittest.TestCase):
                 codex_readings=readings, window=refusals.KnownWindow("weekly"))
         fallback.assert_not_called()
         swap.assert_called_once()
-        self.assertEqual(swap.call_args.args[:2], ("seats", "codex 2"))
+        self.assertEqual(swap.call_args.args[:2], ("seats", "codex2"))
         self.assertEqual(agent_accounts.seats_home(), target.home)
         self.assertIn("delegate=codex", quota_alert.REGISTRY.read_text())
-        self.assertEqual(sum(text.startswith("workers moved from codex 1 to codex 2:")
+        self.assertEqual(sum(text.startswith("workers moved from codex1 to codex2:")
                              for text in self.sent), 1)
         held = refusals.load()[refusals.key("codex", old.login)]
         self.assertEqual(held.window, refusals.KnownWindow("weekly"))
@@ -266,7 +266,7 @@ class CodexAccountAlertTests(unittest.TestCase):
         requested = entries[0]
         assert requested["kind"] == "requested"
         self.assertEqual((requested["from"], requested["to"], requested["window"]),
-                         ("codex 1", "codex 2", "weekly"))
+                         ("codex1", "codex2", "weekly"))
         assert "reset" in requested
         self.assertEqual(requested["reset"], (self.now + timedelta(days=2)).isoformat())
 
@@ -299,7 +299,7 @@ class CodexAccountAlertTests(unittest.TestCase):
                 codex_readings=readings, window=refusals.KnownWindow("five_hour"))
         self.assertEqual(agent_accounts.seats_home(), old.home)
         self.assertIn("delegate=codex", quota_alert.REGISTRY.read_text())
-        self.assertEqual(sum(text.startswith("workers wait for codex 1's 5-hour reset at ")
+        self.assertEqual(sum(text.startswith("workers wait for codex1's 5-hour reset at ")
                              for text in self.sent), 1)
         self.assertEqual([entry["kind"] for entry in moves.read_moves()], ["waited"])
         renewed = self.report(old, 80)
@@ -444,7 +444,7 @@ class CodexAccountAlertTests(unittest.TestCase):
         entries = moves.read_moves()
         recovered_entries = [entry for entry in entries if entry["kind"] == "room again"]
         self.assertEqual(len(recovered_entries), 1)
-        self.assertEqual(recovered_entries[0]["label"], "codex 2")
+        self.assertEqual(recovered_entries[0]["label"], "codex2")
         self.assertEqual(entries[0]["move_id"], recovered_entries[0]["move_id"])
 
     def test_acknowledged_account_stays_quiet_after_swap_away_and_back(self) -> None:
@@ -452,7 +452,7 @@ class CodexAccountAlertTests(unittest.TestCase):
         a_pass = self.readings(a, self.report(a), self.report(b, 70))
         _ = quota_alert.alert([self.note(1, "active", 1), self.note(2, "inactive", 70)],
                               self.now, codex_readings=a_pass)
-        _ = quota_alert.acknowledge("codex 1", now=self.now)
+        _ = quota_alert.acknowledge("codex1", now=self.now)
         self.sent.clear()
         self.now += timedelta(hours=1)
         b_pass = self.readings(b, self.report(a), self.report(b, 70))
@@ -464,7 +464,7 @@ class CodexAccountAlertTests(unittest.TestCase):
                               self.now, codex_readings=a_pass)
         self.assertEqual(self.sent, [])
         with quota_alert.state_file() as state:
-            self.assertIn("acknowledged", state["episodes"]["codex 1"])
+            self.assertIn("acknowledged", state["episodes"]["codex1"])
 
     def test_stale_active_spare_never_opens_an_episode_with_or_without_credits(self) -> None:
         a, b = self.account(1), self.account(2, default=True)
@@ -475,18 +475,18 @@ class CodexAccountAlertTests(unittest.TestCase):
                 _ = quota_alert.alert([self.note(1, "active", 1), self.note(2, "active", 0, credits)],
                                       self.now, codex_readings=readings)
                 with quota_alert.state_file() as state:
-                    self.assertEqual(set(state["episodes"]), {"codex 1"})
+                    self.assertEqual(set(state["episodes"]), {"codex1"})
 
     def test_spare_episode_closes_only_when_its_own_quota_recovers(self) -> None:
         a, b = self.account(1), self.account(2)
         selected_a = self.readings(a, self.report(a))
         _ = quota_alert.alert([self.note(1, "active", 1)], self.now, codex_readings=selected_a)
-        _ = quota_alert.acknowledge("codex 1", now=self.now)
+        _ = quota_alert.acknowledge("codex1", now=self.now)
         selected_b = self.readings(b, self.report(a, 90), self.report(b, 90))
         _ = quota_alert.alert([self.note(1, "inactive", 90), self.note(2, "active", 90)],
                               self.now + timedelta(minutes=1), codex_readings=selected_b)
         with quota_alert.state_file() as state:
-            self.assertNotIn("codex 1", state["episodes"])
+            self.assertNotIn("codex1", state["episodes"])
 
     def test_spare_recommendation_uses_the_home_login_account_number_and_live_credits(self) -> None:
         a, b = self.account(1), self.account(2, default=True)
@@ -496,7 +496,7 @@ class CodexAccountAlertTests(unittest.TestCase):
         text = "\n".join(self.sent)
         self.assertIn("workers move to", text)
         self.assertNotIn("swap seats", text)
-        self.assertIn("codex 2", text)
+        self.assertIn("codex2", text)
         self.assertEqual(agent_accounts.seats_home(), a.home)
 
     def test_each_new_codex_catalog_example_names_workers_and_numbered_accounts(self) -> None:
@@ -553,14 +553,14 @@ class CodexAccountAlertTests(unittest.TestCase):
         self.assertNotIn("default", text.lower())
         self.assertNotIn("seats", text.lower())
         self.assertIn("workers", text)
-        self.assertIn("codex 2", text)
+        self.assertIn("codex2", text)
 
     def test_spare_with_used_up_window_and_no_credits_is_not_recommended(self) -> None:
         a, b = self.account(1), self.account(2)
         readings = self.readings(a, self.report(a), self.report(b, 80, "0", five_left=0))
         _ = quota_alert.alert([self.note(1, "active", 1), self.note(2, "inactive", 80)],
                               self.now, codex_readings=readings)
-        self.assertNotIn("workers move to codex 2 when Codex refuses work", "\n".join(self.sent))
+        self.assertNotIn("workers move to codex2 when Codex refuses work", "\n".join(self.sent))
 
     def test_failed_or_expired_spare_read_never_uses_saved_credits_for_advice(self) -> None:
         a, b = self.account(1), self.account(2)
@@ -571,7 +571,7 @@ class CodexAccountAlertTests(unittest.TestCase):
                 readings = self.readings(a, self.report(a), report)
                 _ = quota_alert.alert([self.note(1, "active", 1), self.note(2, "inactive", 90, "999")],
                                       self.now, codex_readings=readings)
-                self.assertNotIn("workers move to codex 2 when Codex refuses work", "\n".join(self.sent))
+                self.assertNotIn("workers move to codex2 when Codex refuses work", "\n".join(self.sent))
 
     def test_unchecked_target_is_not_recommended_even_with_live_allowance(self) -> None:
         a, b = self.account(1), self.account(2)
@@ -579,7 +579,7 @@ class CodexAccountAlertTests(unittest.TestCase):
         readings = self.readings(a, self.report(a), self.report(b, 90))
         _ = quota_alert.alert([self.note(1, "active", 1), self.note(2, "inactive", 90)],
                               self.now, codex_readings=readings)
-        self.assertNotIn("workers move to codex 2 when Codex refuses work", "\n".join(self.sent))
+        self.assertNotIn("workers move to codex2 when Codex refuses work", "\n".join(self.sent))
 
     def test_unknown_selected_identity_does_not_alert_old_active_notes(self) -> None:
         a = self.account(1)
@@ -643,7 +643,7 @@ class CodexAccountAlertTests(unittest.TestCase):
         identity = agent_accounts.codex_account(a.home)
         self.assertIsInstance(identity, agent_accounts.KnownCodexAccount)
         assert isinstance(identity, agent_accounts.KnownCodexAccount)
-        self.assertEqual((identity.home, identity.login, identity.label), (a.home, a.login, "codex 1"))
+        self.assertEqual((identity.home, identity.login, identity.label), (a.home, a.login, "codex1"))
 
     def test_selected_and_spare_readings_share_the_ten_minute_limit(self) -> None:
         a, b = self.account(1), self.account(2)
@@ -652,7 +652,7 @@ class CodexAccountAlertTests(unittest.TestCase):
         readings = self.readings(a, self.report(a), self.report(b, 80))
         at_limit = self.now + timedelta(minutes=10)
         self.assertIsNone(quota_alert.selected_codex_report(readings, at_limit).problem)
-        self.assertIn("workers move to codex 2 when Codex refuses work", quota_alert.codex_swap_line(readings, at_limit))
+        self.assertIn("workers move to codex2 when Codex refuses work", quota_alert.codex_swap_line(readings, at_limit))
         after_limit = at_limit + timedelta(microseconds=1)
         self.assertIsNotNone(quota_alert.selected_codex_report(readings, after_limit).problem)
         self.assertIn("no other Codex account has room until", quota_alert.codex_swap_line(readings, after_limit))
@@ -664,7 +664,7 @@ class CodexAccountAlertTests(unittest.TestCase):
             return self.report(a if home == a.home else b, 0 if home == a.home else 80)
         with patch.object(quota_alert, "codex_live", side_effect=live), patch.object(quota_alert, "tell_user", wraps=self.push) as push:
             _ = quota_alert.blocked([self.note(1, "active", 0)], a)
-        self.assertIn("workers moved from codex 1 to codex 2", "\n".join(self.sent))
+        self.assertIn("workers moved from codex1 to codex2", "\n".join(self.sent))
         self.assertEqual(agent_accounts.seats_home(), b.home)
         push.assert_not_called()
 
@@ -676,13 +676,13 @@ class CodexAccountAlertTests(unittest.TestCase):
             return self.report(a if home == a.home else b, 1 if home == a.home else 80)
         with patch.object(quota_alert, "codex_live", side_effect=live):
             _ = quota_alert.alert([note])
-            self.assertIn("workers move to codex 2 when Codex refuses work", "\n".join(self.sent))
+            self.assertIn("workers move to codex2 when Codex refuses work", "\n".join(self.sent))
             text = quota_alert.message(note, [note], quota_alert.load_config())
-            self.assertIn("workers move to codex 2 when Codex refuses work", text)
+            self.assertIn("workers move to codex2 when Codex refuses work", text)
             quota_alert.STATE.unlink(missing_ok=True)
             self.sent.clear()
             _ = quota_alert.refresh([note], None)
-            self.assertIn("workers move to codex 2 when Codex refuses work", "\n".join(self.sent))
+            self.assertIn("workers move to codex2 when Codex refuses work", "\n".join(self.sent))
 
     def test_refusals_create_no_weekly_episodes_or_false_recovery_notices(self) -> None:
         a, b = self.account(1), self.account(2)
@@ -705,12 +705,12 @@ class CodexAccountAlertTests(unittest.TestCase):
         a, b = self.account(1), self.account(2)
         _ = quota_alert.alert([self.note(1, "active", 1)], self.now,
             codex_readings=self.readings(a, self.report(a), self.report(b, 80)))
-        _ = quota_alert.acknowledge("codex 1", now=self.now)
+        _ = quota_alert.acknowledge("codex1", now=self.now)
         self.now += timedelta(days=3)
         _ = quota_alert.alert([self.note(1, "inactive", 1), self.note(2, "active", 80)], self.now,
             codex_readings=self.readings(b, self.report(a), self.report(b, 80)))
         with quota_alert.state_file() as state:
-            self.assertNotIn("codex 1", state["episodes"])
+            self.assertNotIn("codex1", state["episodes"])
         self.sent.clear()
         _ = quota_alert.alert([self.note(1, "active", 1)], self.now,
             codex_readings=self.readings(a, self.report(a), self.report(b, 80)))
@@ -724,7 +724,7 @@ class CodexAccountAlertTests(unittest.TestCase):
             lines = quota_alert.blocked([self.note(1, "inactive", 0)], a, self.now, codex_readings=readings)
         push.assert_not_called()
         self.assertEqual(self.sent, [])
-        self.assertIn("quota status codex 1: Codex refused work on codex 1, the outgoing account. Nothing switched to Claude.", lines)
+        self.assertIn("quota status codex1: Codex refused work on codex1, the outgoing account. Nothing switched to Claude.", lines)
 
     def test_failed_restoration_is_attempted_and_reported_once(self) -> None:
         a = self.account(1)

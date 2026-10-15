@@ -83,9 +83,9 @@ def own_claude_account() -> Account:
 
 def named_claude_account(text: str) -> Account:
     """Resolve a Claude note label or accept an explicit login."""
-    parsed = note_file.account_stem(text.casefold())
+    parsed = note_file.parse_account_label(text.casefold())
     for note in note_file.read_notes():
-        if note.tool != "claude" or not isinstance(parsed, note_file.AccountStem) or note.label != parsed.label:
+        if note.tool != "claude" or not isinstance(parsed, note_file.NumberedAccountLabel) or note.label != parsed.label:
             continue
         login = note.get("login")
         if login:
@@ -99,7 +99,7 @@ def named_claude_account(text: str) -> Account:
     ):
         return Account("claude", text, label_for("claude", text))
     raise UnknownAccountName(
-        f"unknown account {text}: give a note label such as claude 2, or a login"
+        f"unknown account {text}: give a note label such as claude2, or a login"
     )
 
 
@@ -236,7 +236,7 @@ def account_of(pid: int) -> Account | None:
 
 def write_label(config_dir: Path, account: Account) -> None:
     """Atomically refresh a config directory's cheap status-line label cache."""
-    expected = account.label + "\n"
+    expected = note_file.canonical_label(account.label) + "\n"
     destination = config_dir / "account-label"
     try:
         if destination.read_text(encoding="utf-8") == expected:

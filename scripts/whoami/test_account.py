@@ -109,7 +109,7 @@ class AccountTests(unittest.TestCase):
         with patch.dict(os.environ, {"AGENT_NOTES_DIR": str(self.notes)}):
             label = account.label_for("claude", "person@example.com")
 
-        self.assertEqual(label, "claude 2")
+        self.assertEqual(label, "claude2")
 
     def test_label_for_falls_back_to_login_without_a_matching_note(self) -> None:
         self.write_note("claude2.md", "someone-else@example.com")
@@ -127,7 +127,7 @@ class AccountTests(unittest.TestCase):
 
         self.assertEqual(
             by_label,
-            account.Account("claude", "person@example.com", "claude 2"),
+            account.Account("claude", "person@example.com", "claude2"),
         )
         self.assertEqual(
             by_login,
@@ -139,7 +139,7 @@ class AccountTests(unittest.TestCase):
             patch.dict(os.environ, {"AGENT_NOTES_DIR": str(self.notes)}),
             self.assertRaisesRegex(
                 account.UnknownAccountName,
-                "unknown account claude2: give a note label such as claude 2, or a login",
+                "unknown account claude2: give a note label such as claude2, or a login",
             ),
         ):
             _ = account.named_claude_account("claude2")
@@ -200,7 +200,7 @@ class AccountTests(unittest.TestCase):
     def test_legacy_note_alone_still_resolves_the_spaced_account_label(self) -> None:
         self.write_note("claude 2.md", "legacy@example.invalid")
         with patch.dict(os.environ, {"AGENT_NOTES_DIR": str(self.notes)}):
-            self.assertEqual(account.label_for("claude", "legacy@example.invalid"), "claude 2")
+            self.assertEqual(account.label_for("claude", "legacy@example.invalid"), "claude2")
             self.assertEqual(account.named_claude_account("claude 2").login, "legacy@example.invalid")
 
     def test_process_config_dir_reads_set_variable_from_linux_process_environment(self) -> None:
@@ -285,7 +285,7 @@ class AccountTests(unittest.TestCase):
     def test_write_label_does_not_rewrite_unchanged_content(self) -> None:
         config_dir = self.root / "claude-two"
         config_dir.mkdir()
-        identity = account.Account("claude", "second@example.com", "claude 2")
+        identity = account.Account("claude", "second@example.com", "claude2")
 
         account.write_label(config_dir, identity)
         label_path = config_dir / "account-label"
@@ -293,9 +293,17 @@ class AccountTests(unittest.TestCase):
         os.utime(label_path, ns=(old_timestamp, old_timestamp))
         account.write_label(config_dir, identity)
 
-        self.assertEqual(label_path.read_text(), "claude 2\n")
+        self.assertEqual(label_path.read_text(), "claude2\n")
         self.assertEqual(label_path.stat().st_mtime_ns, old_timestamp)
         self.assertEqual(set(config_dir.iterdir()), {label_path})
+
+    def test_write_label_replaces_a_legacy_cache_with_the_canonical_label(self) -> None:
+        config_dir = self.root / "claude-two"
+        config_dir.mkdir()
+        path = config_dir / "account-label"
+        _ = path.write_text("claude 2\n")
+        account.write_label(config_dir, account.Account("claude", "second@example.com", "claude2"))
+        self.assertEqual(path.read_text(), "claude2\n")
 
     def test_write_label_option_removes_stale_label_when_account_is_unreadable(self) -> None:
         config_dir = self.root / "claude-two"
@@ -329,7 +337,7 @@ class AccountTests(unittest.TestCase):
             status = account.main(["--write-label"])
 
         self.assertEqual(status, 0)
-        self.assertEqual((config_dir / "account-label").read_text(), "claude 2\n")
+        self.assertEqual((config_dir / "account-label").read_text(), "claude2\n")
 
     def test_codex_account_reads_id_token_email_from_given_home(self) -> None:
         codex_home = self.root / "codex-two"
@@ -418,7 +426,7 @@ class AccountTests(unittest.TestCase):
         self.assertEqual(status, 0)
         self.assertEqual(
             output.getvalue(),
-            "claude 2 (claude@example.com) · codex 3 (codex@example.com)\n",
+            "claude2 (claude@example.com) · codex3 (codex@example.com)\n",
         )
 
     def test_json_cli_prints_both_accounts_from_configured_directories(self) -> None:
@@ -433,8 +441,8 @@ class AccountTests(unittest.TestCase):
         self.assertEqual(
             json.loads(output.getvalue()),
             {
-                "claude": {"login": "claude@example.com", "label": "claude 2"},
-                "codex": {"login": "codex@example.com", "label": "codex 3"},
+                "claude": {"login": "claude@example.com", "label": "claude2"},
+                "codex": {"login": "codex@example.com", "label": "codex3"},
             },
         )
 
@@ -494,7 +502,7 @@ class AccountTests(unittest.TestCase):
         }
 
         self.assertEqual(
-            self.render_status_line(document, "claude 2"),
+            self.render_status_line(document, "claude2"),
             ACCOUNT_FIRST_LINE
             + "\n5-hour 73% left until 03:00 EST | weekly 41% left until Fri 03:00 EST\n",
         )
@@ -508,7 +516,7 @@ class AccountTests(unittest.TestCase):
         }
 
         self.assertEqual(
-            self.render_status_line(document, "claude 2"),
+            self.render_status_line(document, "claude2"),
             ACCOUNT_FIRST_LINE + "\n5-hour 73% left | weekly 41% left\n",
         )
 
@@ -533,7 +541,7 @@ class AccountTests(unittest.TestCase):
 
     def test_status_line_is_one_line_with_the_account_when_limits_are_absent(self) -> None:
         self.assertEqual(
-            self.render_status_line(self.status_line_input(), "claude 2"),
+            self.render_status_line(self.status_line_input(), "claude2"),
             ACCOUNT_FIRST_LINE + "\n",
         )
 

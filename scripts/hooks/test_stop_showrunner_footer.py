@@ -25,7 +25,7 @@ DAILIES = HOOK.parent.parent / "production" / "dailies_render.py"
 SETTINGS = HOOK.parent.parent.parent / "settings.json"
 ZONE = "America/Los_Angeles"
 SESSION = "showrunner-session"
-AGENT_LINE = "* claude 1: week's usage unknown; refill time unknown; resets unknown"
+AGENT_LINE = "* claude1: week's usage unknown; refill time unknown; resets unknown"
 WAITING_BLOCK = "\n\n\nWaiting on:\n\n* no ETA measured - x"
 ONE_OPEN = "There is 1 open question for you."
 TWO_OPEN = "There are 2 open questions for you."
@@ -215,12 +215,13 @@ class ShowrunnerFooterHookTests(unittest.TestCase):
             )
 
         def reading(remaining: int, at: datetime) -> str:
+            # Legacy-spelled readings still land on the canonical footer line.
             return json.dumps({"account": "claude 1", "at": at.isoformat(), "remaining": remaining}) + "\n"
 
         note(81, before_at)
         _ = readings.write_text(reading(81, before_at), encoding="utf-8")
         footer = self.footer(at=stamp)
-        self.assertIn("* claude 1: 19%", footer)
+        self.assertIn("* claude1: 19%", footer)
 
         note(80, after_at)
         _ = readings.write_text(reading(81, before_at) + reading(80, after_at), encoding="utf-8")

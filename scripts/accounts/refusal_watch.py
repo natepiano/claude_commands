@@ -26,6 +26,7 @@ sys.path.insert(0, str(ROOT / "scripts" / "whoami"))
 from scripts.accounts import accounts, moves, refusals
 import account
 import agent_accounts
+from note_file import canonical_label
 import usage_store
 from quota_alert import RefusedAt, _refusal_window  # pyright: ignore[reportPrivateUsage]
 
@@ -540,7 +541,7 @@ def _run(now: datetime, dry_run: bool) -> list[str]:
         for named in accounts.checked_named_accounts():
             identity = accounts.account_identity(named.dir)
             if isinstance(identity, agent_accounts.KnownClaudeAccount) and identity.login.casefold() in refusing_logins:
-                excluded.add(named.label)
+                excluded.add(canonical_label(named.label))
         if group_name == "ungrouped":
             chosen = accounts.pick("claude", now, exclude=frozenset(excluded), keep=accounts.NoKeep())
         else:

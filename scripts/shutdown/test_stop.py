@@ -31,7 +31,7 @@ import stop
 import relaunch
 
 LOGIN = "owner@example.com"
-LABEL = "claude 2"
+LABEL = "claude2"
 NOW = "2026-10-09T21:49:10+00:00"
 NOW_UTC = datetime.fromisoformat(NOW)
 
@@ -1100,7 +1100,7 @@ class StopTests(ShutdownTestCase):
         owner["host"] = inventory.WindowHost(kind="ghostty", window_shell=901,
             desktop=inventory.NamedDesktop(kind="named", name="Production"))
         saved = entry(owner)
-        saved["target"] = "claude 3"
+        saved["target"] = "claude3"
         self.create([saved])
         signals: list[tuple[int, int]] = []
         with patch.object(stop, "_ghostty_still_owns_shell", return_value=True):

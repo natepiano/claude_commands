@@ -289,7 +289,7 @@ class CodexDaemonTests(unittest.TestCase):
         with mock.patch.dict(os.environ, {"AGENT_NOTES_DIR": str(notes)}):
             module = importlib.import_module("scripts.accounts.accounts")
             run_accounts = cast(Callable[[list[str]], int], module.main)
-            self.assertEqual(run_accounts(["set-role", "seats", "codex 1"]), 0)
+            self.assertEqual(run_accounts(["set-role", "seats", "codex1"]), 0)
         self.assertEqual(codex_daemon.daemon_socket(os.environ),
             self.root / ".codex" / "app-server-control" / "app-server-control.sock")
         completed = subprocess.CompletedProcess(["codex", "queue"], 0, stdout="", stderr="")

@@ -137,8 +137,6 @@ KNOWN_PRIVATE_NAMES = frozenset(
 )
 IDENTITY_ENTRIES = (".credentials.json", ".claude.json", "account-label")
 IDENTITY_ENTRIES_NOT_SEEDED = (".credentials.json", "account-label")
-LABEL_PATTERN = re.compile(r"claude ([1-9][0-9]*)")
-CODEX_LABEL_PATTERN = re.compile(r"codex ([1-9][0-9]*)")
 # What the Codex account does in a production.
 CODEX_ROLE = "seats"
 # A table cell with nothing to show: the folder has no login, or is not set up.
@@ -557,18 +555,23 @@ def roles_history_file() -> Path:
     return accounts_home() / ".local" / "state" / "accounts" / "roles.jsonl"
 
 
+def _label_is(label: str, tool: str) -> bool:
+    parsed = note_file.parse_account_label(label)
+    return isinstance(parsed, note_file.NumberedAccountLabel) and parsed.tool == tool
+
+
 def account_dir(label: str) -> Path:
-    match = LABEL_PATTERN.fullmatch(label)
-    if match is None:
-        raise AccountsError(f"accounts: {label} is not a claude N label")
-    return accounts_home() / f".claude{match.group(1)}"
+    parsed = note_file.parse_account_label(label)
+    if not isinstance(parsed, note_file.NumberedAccountLabel) or parsed.tool != "claude":
+        raise AccountsError(f"accounts: {label} is not a claudeN label")
+    return accounts_home() / f".claude{parsed.number}"
 
 
 def codex_setup_home(label: str) -> Path:
-    match = CODEX_LABEL_PATTERN.fullmatch(label)
-    if match is None:
-        raise AccountsError(f"accounts: {label} is not a codex N label")
-    return accounts_home() / f".codex{match.group(1)}"
+    parsed = note_file.parse_account_label(label)
+    if not isinstance(parsed, note_file.NumberedAccountLabel) or parsed.tool != "codex":
+        raise AccountsError(f"accounts: {label} is not a codexN label")
+    return accounts_home() / f".codex{parsed.number}"
 
 
 def _codex_account_home(label: str) -> Path:
@@ -670,7 +673,8 @@ def _seed_config(destination: Path) -> list[str]:
 
 def setup(label: str) -> list[str]:
     """Build or repair one named account, returning every refusal or failure."""
-    if CODEX_LABEL_PATTERN.fullmatch(label):
+    label = note_file.canonical_label(label)
+    if _label_is(label, "codex"):
         return _setup_codex_home(label)
     destination = account_dir(label)
     problems: list[str] = []
@@ -774,6 +778,7 @@ _account_notes_directory = note_file.notes_dir
 
 
 def _account_note(label: str) -> AccountNote:
+    label = note_file.canonical_label(label)
     path = note_file.note_path(label)
     try:
         text = path.read_text(encoding="utf-8")
@@ -783,7 +788,9 @@ def _account_note(label: str) -> AccountNote:
         return UnreadableAccountNote(f"accounts: could not read {path}: {error}")
     close = text.find("\n---", 3)
     if text.startswith("---\n") and close != -1:
-        login = note_file.Note(path, label.partition(" ")[0], text, 4, close, label).get("login")
+        parsed = note_file.parse_account_label(label)
+        assert isinstance(parsed, note_file.NumberedAccountLabel)
+        login = note_file.Note(path, parsed.tool, text, 4, close, parsed.label).get("login")
         if isinstance(login, str) and login.strip() and login not in {"null", "~"}:
             return ExpectedAccountLogin(login)
     return UnreadableAccountNote(f"accounts: {path} has no readable login in its frontmatter")
@@ -809,6 +816,7 @@ def _private_identity_problems(destination: Path) -> list[str]:
 
 def account_directory_readiness(label: str) -> AccountDirectoryReadiness:
     """Read launch safety and login matching once, retaining every diagnostic."""
+    label = note_file.canonical_label(label)
     selected = NamedAccount(label, account_dir(label))
     return _inspect_account_directory(selected, _account_note(label))
 
@@ -851,7 +859,7 @@ def _inspect_account_directory(selected: NamedAccount, expected: AccountNote) ->
         wrong_login = identity.login.casefold() != expected.login.casefold()
         if wrong_login:
             problems.append(
-                f"accounts: ~/.claude{label.removeprefix('claude ')} is logged in as {identity.login}, not {label}; see Log out and in in ~/.claude/docs/accounts.md"
+                f"accounts: ~/.claude{_label_number(label)} is logged in as {identity.login}, not {label}; see Log out and in in ~/.claude/docs/accounts.md"
             )
     if links:
         return AccountDirectoryBrokenLinks(tuple(problems))
@@ -871,9 +879,10 @@ def _inspect_account_directory(selected: NamedAccount, expected: AccountNote) ->
 
 def check(label: str) -> list[str]:
     """Return every reason a named account is not fit to launch."""
+    label = note_file.canonical_label(label)
     if label == "default":
         return _login_problem(main_config_dir())
-    if CODEX_LABEL_PATTERN.fullmatch(label):
+    if _label_is(label, "codex"):
         return _check_codex_home(label, _seats_home())
     return list(account_directory_readiness(label).problems)
 
@@ -1019,6 +1028,7 @@ class AccountRefused:
 
 def prepared_account(label: str, *, resume: bool) -> PreparedAccount | AccountRefused:
     """Prepare an account for any launcher without inheriting its environment."""
+    label = note_file.canonical_label(label)
     try:
         if label in ("unit", "showrunner"):
             selected = role_account(label)
@@ -1037,7 +1047,7 @@ def prepared_account(label: str, *, resume: bool) -> PreparedAccount | AccountRe
             readiness = _inspect_account_directory(selected, expected)
             if isinstance(readiness, AccountDirectoryNotSetUp):
                 return AccountRefused(
-                    f'accounts: ~/.claude{selected.label.removeprefix("claude ")} is not set up; /showrunner:accounts setup "{selected.label}" first'
+                    f'accounts: ~/.claude{_label_number(selected.label)} is not set up; /showrunner:accounts setup "{selected.label}" first'
                 )
             if not isinstance(readiness, (AccountDirectoryReady, AccountDirectoryLoggedOut)) or (
                 resume and isinstance(readiness, AccountDirectoryLoggedOut)
@@ -1054,6 +1064,7 @@ def prepared_account(label: str, *, resume: bool) -> PreparedAccount | AccountRe
 
 def exec_account(label: str, arguments: list[str]) -> None:
     """Replace this process with Claude on the selected, safe directory."""
+    label = note_file.canonical_label(label)
     prepared = prepared_account(label, resume="--resume" in arguments)
     if isinstance(prepared, AccountRefused):
         raise AccountsError(prepared.reason)
@@ -1089,9 +1100,9 @@ def _read_accounts_configuration() -> AccountsConfiguration:
             raise AccountsError(f"accounts: {path} has an invalid {role} account")
         _ = directory(label)
         if role == "unit":
-            configuration["unit"] = label
+            configuration["unit"] = note_file.canonical_label(label)
         else:
-            configuration["seats"] = label
+            configuration["seats"] = note_file.canonical_label(label)
     return configuration
 
 
@@ -1200,7 +1211,7 @@ def claude_account_selection() -> agent_accounts.ClaudeAccountsInUse:
     for named in checked_named_accounts():
         identity = account_identity(named.dir)
         if isinstance(identity, agent_accounts.KnownClaudeAccount):
-            named_accounts.append(agent_accounts.CheckedNamedClaudeAccount(named.label, named.dir, identity))
+            named_accounts.append(agent_accounts.CheckedNamedClaudeAccount(note_file.canonical_label(named.label), named.dir, identity))
     live_logins: set[str] = set()
     live_directories: dict[Path, None] = {}
     for session in sessions.live_sessions():
@@ -1216,7 +1227,7 @@ def claude_account_selection() -> agent_accounts.ClaudeAccountsInUse:
     )
 
 
-UNIT_ROLE_GONE = "unit launches use the configured units account; select and move the group with accounts.py move units <claude N>"
+UNIT_ROLE_GONE = "unit launches use the configured units account; select and move the group with accounts.py move units <claudeN>"
 
 
 @dataclass(frozen=True)
@@ -1275,9 +1286,11 @@ def _codex_reading_can_work(reading: FreshReading, now: datetime, credits: agent
 
 def pick(tool: Literal["claude", "codex"], now: datetime, *, exclude: frozenset[str] = _NO_EXCLUSIONS, keep: KeepAccount | NoKeep = _NO_KEEP, prefer_weekly_room: bool = False) -> PickedAccount | NoAccountWithRoom:
     """Keep a working account, otherwise spend the weekly allowance resetting soonest."""
+    exclude = frozenset(note_file.canonical_label(label) for label in exclude)
+    keep = KeepAccount(note_file.canonical_label(keep.label)) if isinstance(keep, KeepAccount) else keep
     candidates: list[tuple[str, Path, str]] = []
     if tool == "claude":
-        directories = [("default", main_config_dir()), *((item.label, item.dir) for item in checked_named_accounts())]
+        directories = [("default", main_config_dir()), *((note_file.canonical_label(item.label), item.dir) for item in checked_named_accounts())]
         for label, directory in directories:
             if label == "default" and check(label):
                 continue
@@ -1288,7 +1301,7 @@ def pick(tool: Literal["claude", "codex"], now: datetime, *, exclude: frozenset[
         seats_home = _seats_home()
         for home in agent_accounts.codex_homes(seats_home):
             label = agent_accounts.codex_home_role_label(home)
-            if not CODEX_LABEL_PATTERN.fullmatch(label):
+            if not _label_is(label, "codex"):
                 if home != accounts_home() / ".codex":
                     continue
                 label = "default"
@@ -1358,7 +1371,7 @@ def pick(tool: Literal["claude", "codex"], now: datetime, *, exclude: frozenset[
         reasons.append(PickReason(label, weekly, five, reason))
     if not any_fresh:
         default_label = "default" if tool == "claude" else agent_accounts.codex_home_role_label(accounts_home() / ".codex")
-        if tool == "codex" and not CODEX_LABEL_PATTERN.fullmatch(default_label):
+        if tool == "codex" and not _label_is(default_label, "codex"):
             default_label = "default"
         preferred = keep.label if isinstance(keep, KeepAccount) else default_label
         choices = [item for label in dict.fromkeys((preferred, default_label))
@@ -1477,7 +1490,7 @@ def _stored_groups() -> GroupAccounts:
             raise AccountsError(f"accounts: {path} has an invalid {group} account")
         if label != "default":
             _ = account_dir(label)
-        result[group] = label
+        result[group] = note_file.canonical_label(label)
     return result
 
 
@@ -1526,7 +1539,7 @@ def session_account_label(session: Session) -> str:
 def account_labels_for_logins(logins: frozenset[str]) -> frozenset[str]:
     """Exclude every alias of an account, including the default directory."""
     labels: set[str] = set()
-    for label, directory in [("default", main_config_dir()), *((item.label, item.dir) for item in checked_named_accounts())]:
+    for label, directory in [("default", main_config_dir()), *((note_file.canonical_label(item.label), item.dir) for item in checked_named_accounts())]:
         identity = account_identity(directory)
         if isinstance(identity, agent_accounts.KnownClaudeAccount) and identity.login.casefold() in logins:
             labels.add(label)
@@ -1564,11 +1577,12 @@ def placement(group: ClaudeGroup, now: datetime, *, exclude: frozenset[str] = _N
 
 def group_label(groups: GroupAccounts, group: ClaudeGroup) -> str | GroupNotConfigured:
     """Convert the optional JSON key into its configuration meaning."""
-    return groups.get(group, GROUP_NOT_CONFIGURED)
+    label = groups.get(group, GROUP_NOT_CONFIGURED)
+    return note_file.canonical_label(label) if isinstance(label, str) else label
 
 
 def group_configuration_line(group: ClaudeGroup) -> str:
-    return f"{group}: not configured — accounts.py move {group} <claude N>"
+    return f"{group}: not configured — accounts.py move {group} <claudeN>"
 
 
 def group_status_line(groups: GroupAccounts) -> str:
@@ -1636,6 +1650,7 @@ def group_accounts() -> GroupAccounts:
 
 
 def set_group_account(group: ClaudeGroup, label: str, *, why: str, now: datetime | AccountDecisionNow = ACCOUNT_DECISION_NOW) -> None:
+    label = note_file.canonical_label(label)
     if label != "default":
         _ = account_dir(label)
     at = now if isinstance(now, datetime) else datetime.now(timezone.utc)
@@ -1724,6 +1739,7 @@ def _quota_observations() -> dict[str, list[WeeklyQuotaObservation]]:
                 or not math.isfinite(left) or not 0 <= left <= 100
             ):
                 continue
+            label = note_file.canonical_label(label)
             wire: QuotaReading = {"account": label, "at": stamp, "remaining": float(left)}
             at = datetime.fromisoformat(wire["at"])
             if at.tzinfo is None:
@@ -1762,6 +1778,7 @@ def _unit_role_history(default_label: str) -> list[UnitRoleAssignment]:
             label, stamp = values.get("label"), values.get("at")
             if not isinstance(label, str) or not isinstance(stamp, str):
                 raise ValueError("invalid label or timestamp")
+            label = note_file.canonical_label(label)
             if label != "default":
                 _ = account_dir(label) if role == "unit" else _codex_account_home(label)
             if role == "seats":
@@ -1774,7 +1791,7 @@ def _unit_role_history(default_label: str) -> list[UnitRoleAssignment]:
                 if not isinstance(account_label, str) or not account_label:
                     raise ValueError("invalid account_label")
                 wire: HistoricalRoleChange = RoleChange(
-                    at=stamp, role="unit", label=label, account_label=account_label,
+                    at=stamp, role="unit", label=label, account_label=note_file.canonical_label(account_label),
                 )
             else:
                 wire = LegacyRoleChange(at=stamp, role="unit", label=label)
@@ -1785,7 +1802,7 @@ def _unit_role_history(default_label: str) -> list[UnitRoleAssignment]:
                         raise ValueError(f"account identity for {label} is unreadable")
                     note_labels[label] = identity.label
                 account_label = note_labels[label]
-            history.append(UnitRoleAssignment(_iso_time(wire["at"], "role time"), account_label))
+            history.append(UnitRoleAssignment(_iso_time(wire["at"], "role time"), note_file.canonical_label(account_label)))
         except (ValueError, TypeError) as error:
             raise AccountsError(f"accounts: {path}:{index}: invalid role change: {error}") from error
     return sorted(history, key=lambda assignment: assignment.at)
@@ -1929,6 +1946,8 @@ def _roles_lock() -> Generator[None]:
 def _write_role(role: str, label: str, account_label: str) -> PreviousRoleSelection:
     """Change one role under the lock; failed history writes restore the file."""
     _validate_role(role)
+    label = note_file.canonical_label(label)
+    account_label = note_file.canonical_label(account_label)
     path = accounts_config_file()
     with _roles_lock():
         try:
@@ -1942,12 +1961,12 @@ def _write_role(role: str, label: str, account_label: str) -> PreviousRoleSelect
                     _ = configuration.pop("unit", None)
                 else:
                     _ = account_dir(label)
-                    configuration["unit"] = label
+                    configuration["unit"] = note_file.canonical_label(label)
             elif label == "default":
                 _ = configuration.pop("seats", None)
             else:
                 _ = _codex_account_home(label)
-                configuration["seats"] = label
+                configuration["seats"] = note_file.canonical_label(label)
             _atomic_write(path, json.dumps(configuration, indent=2, sort_keys=True) + "\n")
         except (OSError, ValueError) as error:
             raise AccountsError(f"accounts: could not write {path}: {error}") from error
@@ -1972,11 +1991,12 @@ def _write_role(role: str, label: str, account_label: str) -> PreviousRoleSelect
 
 def set_role(role: str, label: str) -> None:
     """Atomically select a readable account and preserve its note identity."""
+    label = note_file.canonical_label(label)
     _validate_role(role)
     if role == "seats":
         home = _seats_home()
         target = check_codex_target(label, home)
-        _ = _write_role(role, target.label if CODEX_LABEL_PATTERN.fullmatch(target.label) else label, target.label)
+        _ = _write_role(role, target.label if _label_is(target.label, "codex") else label, target.label)
         return
     raise AccountsError(UNIT_ROLE_GONE)
 
@@ -2011,6 +2031,7 @@ class SessionMoveRefused:
 
 def move_sessions(ids: tuple[str, ...], target: str, *, why: str) -> tuple[SessionMoveRequested | SessionMoveRefused, ...]:
     """Start one selected shutdown for each source login and report each owner's record."""
+    target = note_file.canonical_label(target)
     from uuid import uuid4
     sys.path.insert(0, str(SCRIPTS / "shutdown"))
     if TYPE_CHECKING:
@@ -2154,6 +2175,7 @@ class GroupMoveStarted:
 
 
 def _move_target(target: str) -> agent_accounts.KnownClaudeAccount | MoveRefused:
+    target = note_file.canonical_label(target)
     default = account_identity(main_config_dir())
     destination = default if target == "default" else account_identity(account_dir(target))
     if target != "default" and isinstance(default, agent_accounts.KnownClaudeAccount) and (
@@ -2172,6 +2194,7 @@ def _move_target(target: str) -> agent_accounts.KnownClaudeAccount | MoveRefused
 
 def move_group(group: ClaudeGroup, target: str, *, dry_run: bool = False, why: str = "") -> GroupMoveStarted | GroupMoveStartFailed | GroupMoveDryRun | MoveRefused:
     """Select the group's account before requesting each off-target member's move."""
+    target = note_file.canonical_label(target)
     if target != "default":
         try:
             _ = account_dir(target)
@@ -2225,6 +2248,7 @@ def session_on_account(session: Session, label: str) -> bool:
 
 def move(session: str, target: str, *, why: str = "") -> MoveStarted | MoveStartFailed | MoveRefused:
     """Move one local live owner after completing every read-only refusal check."""
+    target = note_file.canonical_label(target)
     sys.path.insert(0, str(SCRIPTS / "shutdown"))
     if TYPE_CHECKING:
         from scripts.shutdown import inventory, record
@@ -2280,6 +2304,7 @@ def move(session: str, target: str, *, why: str = "") -> MoveStarted | MoveStart
 
 
 def check_codex_target(label: str, seats_home: Path) -> SelectableCodexAccount:
+    label = note_file.canonical_label(label)
     home = accounts_home() / ".codex" if label == "default" else _codex_account_home(label)
     problems = (_check_default_codex_home(seats_home) if label == "default"
                 else _check_codex_home(label, seats_home))
@@ -2327,7 +2352,7 @@ def _swap_seats(label: str, *, dry_run: bool) -> SeatsSwapOutcome:
         return SeatsSwapDryRun(tuple([
             f"Would move seats to {account_label} ({_codex_folder(target_home)}); live turns finish first.", *lines,
         ]))
-    _ = _write_role("seats", account_label if CODEX_LABEL_PATTERN.fullmatch(account_label) else label, account_label)
+    _ = _write_role("seats", account_label if _label_is(account_label, "codex") else label, account_label)
     lines = _retire_seats_servers(target_home, account_label, dry_run=False)
     return SeatsSwapStarted(tuple([
         f"Seats now use {account_label} ({_codex_folder(target_home)}); working seats move at their next turn.", *lines,
@@ -2386,8 +2411,8 @@ def _existing_named_accounts() -> list[NamedAccount]:
     for child in children:
         match = re.fullmatch(r"\.claude([1-9][0-9]*)", child.name)
         if match is not None:
-            accounts.append(NamedAccount(f"claude {match.group(1)}", child))
-    return sorted(accounts, key=lambda account: int(account.label.removeprefix("claude ")))
+            accounts.append(NamedAccount(note_file.NumberedAccountLabel("claude", int(match.group(1))).label, child))
+    return sorted(accounts, key=lambda account: _label_number(account.label))
 
 
 def _status_for(config_dir: Path, folder: str, named: NamedAccount | None, problems: list[str]) -> AccountStatus:
@@ -2431,11 +2456,14 @@ def _status_for(config_dir: Path, folder: str, named: NamedAccount | None, probl
 
 
 def _label_number(label: str) -> int:
-    return int(label.removeprefix("claude "))
+    parsed = note_file.parse_account_label(label)
+    if not isinstance(parsed, note_file.NumberedAccountLabel):
+        raise AccountsError(f"accounts: {label} is not a numbered account label")
+    return parsed.number
 
 
 def _noted_labels() -> set[str]:
-    """Every `claude N` label that has an account note, with or without a folder."""
+    """Every `claudeN` label that has an account note, with or without a folder."""
     return {
         note.label for note in note_file.read_notes() if note.tool == "claude"
     }
@@ -2489,9 +2517,9 @@ def codex_statuses(seats_home: Path) -> list[CodexStatus]:
         login = _codex_home_login(home)
         label = codex_home_label(home)
         match = re.fullmatch(r"\.codex([1-9][0-9]*)", home.name) if home.parent == accounts_home() else None
-        problems = _check_codex_home(label, seats_home) if CODEX_LABEL_PATTERN.fullmatch(label) else _check_default_codex_home(seats_home) if home == accounts_home() / ".codex" else []
+        problems = _check_codex_home(label, seats_home) if _label_is(label, "codex") else _check_default_codex_home(seats_home) if home == accounts_home() / ".codex" else []
         if match and not login:
-            intended = f"codex {match.group(1)}"
+            intended = note_file.NumberedAccountLabel("codex", int(match.group(1))).label
             expected = _account_note(intended)
             hint = intended if isinstance(expected, ExpectedAccountLogin) else label
             problems.append(f"accounts: sign in as {hint} at {folder}")
@@ -2502,7 +2530,7 @@ def codex_statuses(seats_home: Path) -> list[CodexStatus]:
     held_logins = {status.login.casefold() for status in statuses if status.login}
     noted = sorted(
         (note.label for note in note_file.read_notes() if note.tool == "codex"),
-        key=lambda stem: int(stem.removeprefix("codex ")),
+        key=lambda stem: _label_number(stem),
     )
     for label in noted:
         home = _codex_account_home(label)
@@ -2874,6 +2902,8 @@ def _parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str]) -> int:
     options = cast(CommandLine, _parser().parse_args(argv))
+    if hasattr(options, "label"):
+        options.label = note_file.canonical_label(options.label)
     try:
         if options.detail and options.action != "status":
             raise AccountsError("--detail goes only with no action")
@@ -2894,11 +2924,11 @@ def main(argv: list[str]) -> int:
         if options.action == "move":
             if options.session in CLAUDE_GROUPS:
                 if not options.label or options.source or options.target:
-                    raise AccountsError("move units|showrunners requires <claude N|default>")
+                    raise AccountsError("move units|showrunners requires <claudeN|default>")
                 moved = move_group(options.session, options.label, dry_run=options.dry_run, why=options.why)
             else:
                 if not options.label or options.source or options.target or options.dry_run:
-                    raise AccountsError("move requires <session-id|name> <claude N|default>")
+                    raise AccountsError("move requires <session-id|name> <claudeN|default>")
                 moved = move(options.session, options.label, why=options.why)
             if isinstance(moved, MoveRefused):
                 print(moved.reason, file=sys.stderr)
@@ -2913,7 +2943,7 @@ def main(argv: list[str]) -> int:
             problems = setup(options.label)
             for problem in problems:
                 print(problem, file=sys.stderr)
-            if CODEX_LABEL_PATTERN.fullmatch(options.label):
+            if _label_is(options.label, "codex"):
                 home = codex_setup_home(options.label)
                 if not problems and home.is_dir() and not home.is_symlink():
                     print(f"CODEX_HOME=~/{home.name} codex login")
