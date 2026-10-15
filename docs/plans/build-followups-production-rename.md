@@ -141,26 +141,14 @@
 
 ### Phase 5 — Live check on a scratch production  · status: done
 
-#### Work Order
+#### As-built
 
-**Goal:** A real rename of a scratch production on natedev, end to end, leaves every lookup working under both names.
-
-**Depends on:** Phase 4
-
-**Spec:**
-- Build a scratch production with one unit by hand, as test_production_lifecycle.py:77-180 does: a scratch git repo whose origin is a local bare repo, a doc, a Units row, a worktree, and state dirs pointed at a scratch root through the env overrides. Run the real `rename.py` CLI: plan, apply, unit and finish. No branch reaches GitHub. Create isolated session fixtures (a running showrunner and a marked unit) so lookups have something to find. Check that `showrunners.py address` and `unit_lookup.py list` give the same non-empty answer under `<old>` and `<new>` after apply, between apply and the unit move, and after finish, plus the stall watch and the review-pool lease paths.
-- Then delete the scratch root, which holds every path the check created.
-- Never touch a real production's state.
+- A scratch production on natedev (local bare origin, isolated account and state roots, fake tmux and herdr discovery) completes `rename.py` plan, apply, unit and finish with no branch reaching GitHub.
+- `showrunners.py address`, `unit_lookup.py list` and `pane` give identical non-empty answers under the old and new names after apply, before and after the unit move, and after finish; canonicalized stall-watch and review-pool lease paths resolve to the same retained files under both names.
+- A worktree path holding `.` and `_` moves, transcripts move, and trust entries copy in both the default and the separate account layouts.
+- The scratch root holds every path the check creates and is removed afterwards; no real production's state is touched.
 
 **Files:**
-- `docs/as-built/production-rename.md` — a short Live check section with what the scratch run showed; the run itself writes only under a scratch root it deletes.
+- `docs/as-built/production-rename.md` — Live check section recording what the scratch run shows.
 
-**Workers:** 1 writer; nothing splits.
-- `impl` — runs the check and reports.
-
-**Constraints from prior phases:**
-- Point `HOME` and `CLAUDE_CONFIG_DIR` at the scratch root too, not only the state dirs: `unit` moves `projects/<dashed path>` in every `~/.claude*` dir and copies a trust key into `~/.claude.json` (default account) or `<config-dir>/.claude.json`. With the real `HOME` it writes the user's account files.
-- `unit` discovers sessions with `every_host=True`, so both hosts must answer: point `UNIT_LOOKUP_TMUX` at a fake tmux and `NOTIFIER_SESSIONS_DIR` at scratch session records, and fake herdr as `test_unit_lookup.py` does. The marked unit must read as not running (`ClaudeNotRunning`) for the move to proceed.
-- Run the shutdown and message suites as well if the check leads to any `unit_lookup.py` change; they exercise it.
-
-**Acceptance gate:** every lookup answers under both slugs; the scratch state is removed afterwards.
+**Gotchas:** A rerun needs `HOME`, `CLAUDE_CONFIG_DIR`, `NOTIFIER_STATE_DIR`, `SHOWRUNNER_STATE_DIR`, `STALL_WATCH_STATE_DIR`, `REVIEW_POOL_STATE`, `NOTIFIER_SESSIONS_DIR`, `UNIT_LOOKUP_TMUX` and the herdr fakes (`HERDR_BIN`, `HERDR_PROC`) all inside the scratch root; with the real `HOME`, `unit` writes the user's account files. `unit` discovers sessions with `every_host=True`, so both hosts must answer, and the marked unit must read as not running (`ClaudeNotRunning`) for the move to proceed. Git needs explicit identities, `GIT_CONFIG_NOSYSTEM=1` and signing off; an `env -i` environment must carry the git and Python executable directories on `PATH`. A `unit_lookup.py` change also needs the shutdown and message suites, which exercise it. The check does not cover a real Claude process, a real tmux or herdr server, or a network git remote.
