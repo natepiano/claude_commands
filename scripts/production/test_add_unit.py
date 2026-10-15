@@ -780,6 +780,33 @@ class AddUnitTests(ShutdownTestCase):
         self.assertEqual(len(self.events("systemd-run")), 1)
         self.assertEqual(len(self.recorded_prompts("session-123")), 1)
 
+    def test_restart_restore_marks_only_the_probe_claude_command_after_environment_cleanup(self) -> None:
+        self.env["CLAUDE_PROBE_SESSION"] = "1"
+        prior = self.root / "prior-session"
+        prior.mkdir()
+        note = self.root / "restart-note.txt"
+        _ = note.write_text("Resume this unit.", encoding="utf-8")
+        cases = ((False, ""), (True, ""), (False, "claude2"), (True, "claude2"))
+        for count, (probe, target) in enumerate(cases, 1):
+            with self.subTest(probe=probe, target=target):
+                name = ("probe" if probe else "ordinary") + ("-move" if target else "-restore")
+                self.commit_prepared_row(self.unit_row(name))
+                result = self.successful(
+                    name, "--plan", "docs/plans/given.md", "--resume", f"session-{name}",
+                    "--cwd", str(prior), "--restart-note", str(note),
+                    "--session-name", name, "--host-session", name,
+                    *(["--probe"] if probe else []),
+                    *(["--account", target] if target else []),
+                )
+                self.assertIn(f"{name}-unit restore launched", result.stdout)
+                launches = self.events("systemd-run")
+                self.assertEqual(len(launches), count)
+                self.assertEqual(launches[-1]["claude_env"], [])
+                command = self.new_sessions()[-1][-1]
+                arguments = shlex.split(command)
+                self.assertIn(f"session-{name}", arguments)
+                self.assertEqual("CLAUDE_PROBE_SESSION=1" in arguments, probe)
+
     def test_restart_restore_adopts_a_row_added_from_a_brief_whose_plan_is_now_its_as_built(self) -> None:
         checkout = self.doc.parents[2]
         (checkout / "docs/as-built").mkdir(parents=True, exist_ok=True)
@@ -1986,6 +2013,7 @@ class AddUnitTests(ShutdownTestCase):
             "owns": None,
             "timeout": 90.0,
             "check": False,
+            "probe": False,
         }
         restored = add_unit.launch_request(argparse.Namespace(
             **common,
@@ -2026,7 +2054,7 @@ class AddUnitTests(ShutdownTestCase):
             launched = add_unit.launch_request(argparse.Namespace(
                 production=str(self.doc), name=name, plan="docs/plans/given.md", brief=None,
                 standby=False, permanent=False, adopt=None, port=None, owns=None, timeout=90.0, check=False,
-                resume=None, cwd=None, restart_note=None, session_name=None, host_session=None,
+                resume=None, cwd=None, restart_note=None, session_name=None, host_session=None, probe=False,
             ))
             return launched.unit, launched.branch, launched.worktree, launched.requested_name
 

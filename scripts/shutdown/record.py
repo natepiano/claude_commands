@@ -30,12 +30,6 @@ CLAIM_STALE_SECONDS = 120
 CONDUCTOR_LOCK_RETRY_DELAYS = (0.05,) * 5
 
 
-class NoRemoteControl(TypedDict):
-    session_id: str
-    name: str
-    alerts: Literal["user", "none"]
-
-
 class ReadinessClear(TypedDict):
     kind: Literal["clear"]
 
@@ -376,6 +370,7 @@ class SessionShutdown(TypedDict):
     then: ShutdownContinuation
     force: StopTiming
     alerts: Literal["user", "none"]
+    probe: bool
     session: Session
     workers: list[Session]
     timers: list[TimerRestore]
@@ -1039,6 +1034,10 @@ def _session_shutdown(value: object, place: str) -> SessionShutdown:
         text = _string(_required(values, field, place), f"{place}.{field}")
         if text not in allowed:
             raise InvalidRecord(f"{place}.{field} is invalid")
+    probe = values.get("probe", False)
+    if not isinstance(probe, bool):
+        raise InvalidRecord(f"{place}.probe must be a boolean")
+    values["probe"] = probe
     _ = _required(values, "stop_issues", place)
     fields = _entry(values, place)
     values["progress"] = _progress(values["progress"], f"{place}.progress")
@@ -1204,7 +1203,7 @@ def _convert_session(record: _LegacyShutdownRecord, entry: _LegacySessionEntry) 
         requested_at=record["requested_at"], requested_by=record["requested_by"],
         request_id=f"legacy-{record['machine']}-{record['requested_at']}",
         hold="account" if record["scope"]["kind"] == "all account sessions" else "session",
-        then=_legacy_continuation(record), force=record["force"], alerts="user",
+        then=_legacy_continuation(record), force=record["force"], alerts="user", probe=False,
         session=session, workers=workers, timers=entry["timers"],
         settle_message=entry["settle_message"], where=entry["where"],
         progress=cast(SessionProgress, cast(object, progress)), trail=[], stop_issues=[issue for issue in entry["stop_issues"] if issue["kind"] != "worker still live"],
