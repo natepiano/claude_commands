@@ -3,7 +3,7 @@
 
 A unit checkpoint commit without its Change-Review line is held before the merge. After the push,
 each visible change becomes a row in the change-review list the production doc names
-(`change_review.py`); the file is written and never committed.
+(`change_review.py`); the first row creates a missing list, and the file is written and never committed.
 """
 from __future__ import annotations
 
@@ -417,14 +417,14 @@ def record_changes(request: MergeRequest, commits: list[change_review.Commit], m
     """Add one row per visible change to the production's list, then name any merge still missing rows."""
     doc = change_review.list_path(request.production.doc)
     if doc is None:
-        report("change review", "ok", "the production keeps no change-review list")
+        report("change review", "ok", "the production doc has no Change review line; no rows written")
         return
     merged = good(git(request.production.checkout, "rev-parse", f"--short={change_review.SHORT}", merge_head), "push")
     try:
         rows = change_review.append_rows(doc, change_review.visible(commits),
                                          datetime.now(request.production.zone).date(), merged)
         drifted = change_review.drift(request.production.checkout, request.production.merge_branch,
-                                      doc.read_text(encoding="utf-8"), change_review.LANDED)
+                                      change_review.read(doc), change_review.LANDED)
     except (change_review.ChangeReviewError, OSError) as error:
         report("change review", "failed", f"{doc} not written: {error}; add its rows by hand")
         return

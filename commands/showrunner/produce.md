@@ -217,6 +217,10 @@ State:
   for one), where n counts every `OUTSTANDING` item now due: everything that
   waits on the user, a step only they can run included. A root's n also counts
   every due item of every production below it (**Nested showrunners** above).
+  A change waiting for the user's check is never an open question: it goes on
+  the change review list through `/change_review` add, never into
+  `open_for_user` or the count, and the user asks for "change review" when
+  they want it (user, 2026-10-15).
   List the questions in full only when the user asks what they are: run
   `python3 ~/.claude/scripts/production/update_registration.py open
   --production PRODUCTION_DOC` and show its list, oldest first, each item led
@@ -493,6 +497,8 @@ whatever arrived:
 | the user asks for a status | `/showrunner:dailies`, `gantt` unless they name a length |
 | the user asks which phase or task each unit is on | `/showrunner:units` |
 | the user asks which proposals are open | `/showrunner:proposals` |
+| the user asks for "change review" | `/change_review` show; each verdict through <CloseChangeReview/> |
+| a change for the user to check that no checkpoint `Change-Review:` line carries | `/change_review` add |
 | a unit's finished proposal, or the user approves, declines or re-rates one | `/showrunner:proposal` |
 | the user asks for the nightly improvement list | `/showrunner:nightly` |
 | the user asks to put a showrunner under another, or asks for the tree | `/showrunner:attach` |
@@ -580,12 +586,15 @@ notice to the unit director before any merge command runs:
    message to the unit director.
 
 <ChangeReviewFeatureLog>
-Run only when the production repository is `~/rust/hana` or
-`~/rust/hana_catalyst`, after `merge_checkpoint.py` accepts the merge.
+Run only for a project that closes out by change review, after
+`merge_checkpoint.py` accepts the merge: Hana (`~/rust/hana` or
+`~/rust/hana_catalyst`, project `hana`) and ~/.claude (project `claude`).
+Every other project closes out through `/validate_and_push`, so its merges
+add rows and no proposals.
 
 For each distinct user-visible result:
 
-1. Check the Hana live log for entries it replaces.
+1. Check the project's live log for entries it replaces.
 2. Take the rows `merge_checkpoint.py` added: its `change review: ok` line
    names each `C<n>` row it wrote under `## To review` in the list the
    production doc's **Change review** line names, one per `Change-Review:`
@@ -595,11 +604,13 @@ For each distinct user-visible result:
    whose rows are missing, which you add the same way.
 3. Run `~/.claude/scripts/lib/py
    ~/.claude/scripts/feature_log/feature_log.py propose --review <row>` with
-   `--project hana`, every owning crate, kind, title, summary, current behavior,
+   `--project hana` or `--project claude`, every owning crate (claude has none), kind, title, summary, current behavior,
    check, merge SHA as `--link`, `--evidence "Showrunner merge <merge-sha>,
    from checkpoint <checkpoint-sha>."`, `--production <slug>`, every source
    `--unit`, and one `--old` per replaced live entry. When the merge has
-   several results, pass `--separate-result` for every row.
+   several results, pass `--separate-result` for every row. A Hana row is the
+   bare `C<n>`; any other list's row names the list, `<slug>/C<n>`
+   (`build-followups/C3`).
 
 Several results get several rows. Internal-only work gets none; write
 `feature log: none — <reason>` to the production log. The merge is not complete
@@ -640,18 +651,29 @@ message.
 ---
 
 <CloseChangeReview>
-When the user gives a change-review verdict:
+When the user gives a change-review verdict, in any production. A verdict
+beginning `works` or `fine` lands the row; any other returns it to its unit.
 
-- A verdict beginning `works` or `fine` lands the row with `add --review
-  <row>`, or `supersede --review <row>` when its proposal has `--old`. Propose
-  a missing row first; correct wrong meaning by rerunning `propose` while it is
-  open.
-- Any other verdict runs `drop --review <row> --verdict "<verdict>"`. A fixing
-  merge gets a new row and proposal.
+1. **Feature log.** Only when the production's project closes out by change
+   review: Hana (`~/rust/hana`, `~/rust/hana_catalyst`) and `~/.claude`. Other
+   projects close out through `/validate_and_push`, so skip to step 2. The
+   review id is the row: bare `C<n>` on Hana's list, `<list>/C<n>` on any other,
+   where `<list>` is the list file's name without `.md`
+   (`build-followups/C3`).
+   - A landing row runs `add --review <id>`, or `supersede --review <id>` when
+     its proposal has `--old`. Propose a missing row first; correct wrong
+     meaning by rerunning `propose` while it is open.
+   - A returning row runs `drop --review <id> --verdict "<verdict>"`.
 
-A script failure leaves the row open. After success, move it to `## Reviewed`
-with verdict and date; a landed Change cell may use the printed note link.
-Report no separate feature-log message.
+   A script failure leaves the row open. Report no separate feature-log
+   message.
+2. **Move the row.** Run `/change_review` verdict with the row and the user's
+   words. It moves the row to `## Reviewed` with the verdict and date. A landed
+   row's Change cell may link the printed note.
+3. **Return it.** A row that returns goes to the unit that made it: send the
+   row, the change and the verdict. The merge commit its Merged cell names
+   gives the checkpoint, and so the unit. The fix comes back as a new row, with
+   a new proposal where step 1 applies.
 </CloseChangeReview>
 
 ---
