@@ -413,7 +413,7 @@ class SettleTests(ShutdownTestCase):
                 ):
                     self.assertEqual(shutdown.main(argv[2:]), 0)
                 request.assert_called_once_with(account, here, ids, then=then, alerts=alerts,
-                    requested_by=None, request_id="", target=target, why=why, report=report)
+                    requested_by=None, request_id="", target="claude3" if target else "", why=why, report=report)
                 if ids:
                     resolve.assert_called_once_with(LOGIN, ids, here=here)
                 else:
@@ -809,7 +809,7 @@ class SettleTests(ShutdownTestCase):
         with (patch.object(record, "withdraw_session", side_effect=withdraw_then_tick),
               patch.object(sessions, "live_sessions", return_value=[live]),
               patch.object(refusal_watch, "live_owners", return_value=[owner]),
-              patch.object(accounts, "account_identity", return_value=agent_accounts.KnownClaudeAccount(LOGIN, LABEL)),
+              patch.object(accounts, "account_identity", return_value=agent_accounts.NumberedAccount(LABEL, Path.home() / ".claude", LOGIN)),
               patch.object(accounts, "pick", return_value=accounts.PickedAccount("claude3", self.root / ".claude3",
                   80, accounts.NoResetKnown())),
               patch.object(accounts, "move_sessions", return_value=(
@@ -1302,7 +1302,7 @@ class SettleTests(ShutdownTestCase):
             patch.object(settle, "run_inventory", return_value=machine_inventory([top_level("owner", "Owner")])),
             redirect_stdout(io.StringIO()),
         ):
-            saved = settle.begin(LOGIN, only=["owner"], request_id="move", then="restart", target="default")
+            saved = settle.begin(LOGIN, only=["owner"], request_id="move", then="restart", target="claude2")
         self.assertEqual(saved[0].get("why"), f"{LABEL} is out of usage")
         self.assertEqual(saved[0].get("source_label"), LABEL)
 
@@ -1341,10 +1341,10 @@ class SettleTests(ShutdownTestCase):
             redirect_stdout(io.StringIO()),
         ):
             self.assertEqual(settle.down(Account("claude", LOGIN, LABEL), False, ["remote"],
-                then="restart", target="default", why="weekly limit reached", requested_by="requester", request_id="move-request"), 0)
+                then="restart", target="claude2", why="weekly limit reached", requested_by="requester", request_id="move-request"), 0)
         arguments = cast(list[str], peer.call_args.args[0])
         self.assertEqual(arguments[:3], ["down", LOGIN, "--here"])
-        self.assertEqual(arguments[arguments.index("--to") + 1], "default")
+        self.assertEqual(arguments[arguments.index("--to") + 1], "claude2")
         self.assertEqual(arguments[arguments.index("--why") + 1], "weekly limit reached")
         self.assertEqual(arguments[arguments.index("--only") + 1], "remote")
         self.assertEqual(arguments[arguments.index("--requested-by") + 1], "requester")

@@ -122,11 +122,17 @@ class LocalReviewTests(unittest.TestCase):
     @override
     def setUp(self) -> None:
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
-        _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {"NOTIFY_STATE_DIR": str(self.root / "state")})))
+        notes = self.root / "notes"
+        notes.mkdir()
+        (self.root / ".claude").mkdir()
+        _ = (self.root / ".claude.json").write_text(json.dumps({"oauthAccount": {"emailAddress": "reviewer@example.invalid"}}))
+        _ = (notes / "claude2.md").write_text("---\nlogin: reviewer@example.invalid\n---\n")
+        _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {
+            "HOME": str(self.root), "AGENT_NOTES_DIR": str(notes), "NOTIFY_STATE_DIR": str(self.root / "state")})))
         guide = self.root / "guide"
         guide.mkdir()
         _ = self.enterContext(mock.patch.object(review, "GUIDE", guide))
-        _ = self.enterContext(mock.patch.object(accounts, "role_account", return_value=accounts.DefaultAccount()))
+        _ = self.enterContext(mock.patch.object(accounts, "role_account", return_value=accounts.NamedAccount("claude2", accounts.main_config_dir())))
         # Calls without an explicit fake must never start a reviewer or notifier.
         _ = self.enterContext(mock.patch.object(subprocess, "run", side_effect=AssertionError("real process")))
         _ = self.enterContext(mock.patch.object(review, "schedule"))
@@ -893,7 +899,7 @@ class LocalReviewTests(unittest.TestCase):
                 def read(draft: review.Draft, revision: bool) -> review.ReviewOutcome:
                     return REAL_REVIEW(draft, revision, runner=selected)
 
-                with mock.patch.object(review, "reviewer_environment", return_value=({}, "default"),
+                with mock.patch.object(review, "reviewer_environment", return_value=({}, "claude2"),
                                        side_effect=error if target != "runner" else None):
                     outcome = REAL_REVIEW(self.draft, False, runner=selected)
                     self.assertIsInstance(outcome, review.Unreviewed)
@@ -991,12 +997,15 @@ class LocalReviewTests(unittest.TestCase):
 
     def test_named_unit_account_replaces_the_callers_directory(self) -> None:
         runner = FakeReviewer(verdict(self.draft))
-        directory = self.root / "unit account"
-        with (mock.patch.object(accounts, "role_account", return_value=accounts.NamedAccount("claude2", directory)) as select,
+        _ = (self.root / "notes/claude3.md").write_text("---\nlogin: unit@example.invalid\n---\n")
+        self.assertEqual(accounts.setup("claude3"), [])
+        directory = accounts.account_dir("claude3")
+        _ = (directory / ".claude.json").write_text(json.dumps({"oauthAccount": {"emailAddress": "unit@example.invalid"}}))
+        with (mock.patch.object(accounts, "role_account", return_value=accounts.NamedAccount("claude3", directory)) as select,
               mock.patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": "writer config", "ANTHROPIC_API_KEY": "writer key"})):
             result = review.review(self.draft, False, runner=runner)
         select.assert_called_once_with("unit")
-        self.assertEqual(result.metadata.account, "claude2")
+        self.assertEqual(result.metadata.account, "claude3")
         for call in runner.calls:
             self.assertEqual(call.environment["CLAUDE_CONFIG_DIR"], str(directory))
             self.assertNotIn("ANTHROPIC_API_KEY", call.environment)
@@ -1015,7 +1024,7 @@ class LocalReviewTests(unittest.TestCase):
         self.assertEqual(cast(dict[str, object], entry["sent"])["body"], "Choose whether to retry.")
         self.assertIsNotNone(datetime.fromisoformat(str(entry["time"])).utcoffset())
         self.assertGreaterEqual(cast(float, entry["seconds"]), 0)
-        self.assertEqual((entry["account"], entry["model"]), ("default", "sonnet"))
+        self.assertEqual((entry["account"], entry["model"]), ("claude2", "sonnet"))
 
     def held(self, created: float = 1000) -> review.Held:
         return review.Held(self.draft.source, created, self.draft,

@@ -1,11 +1,13 @@
 """Move requests, outcomes and waits remain distinct in an append-only journal."""
 from __future__ import annotations
 
+import base64
 import json
 import os
 import tempfile
 import unittest
 from concurrent.futures import ThreadPoolExecutor
+from datetime import timezone
 from pathlib import Path
 from typing import cast, override
 from unittest.mock import patch
@@ -63,6 +65,103 @@ class MoveJournalTests(unittest.TestCase):
         self.assertEqual(loaded[0].get("to"), "claude2")
         self.assertEqual(loaded[1].get("label"), "codex1")
         self.assertEqual(path.read_bytes(), original)
+
+    def test_legacy_home_labels_use_the_role_evidence_in_force_at_each_move(self) -> None:
+        path = moves.store_file()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        roles = path.with_name("roles.jsonl")
+        evidence = [
+            {"at": "2026-10-12T00:00:00Z", "role": "unit", "label": "default", "account_label": "claude2"},
+            {"at": "2026-10-12T00:00:00Z", "role": "seats", "label": "default", "account_label": "codex2"},
+            {"at": "2026-10-14T00:00:00Z", "role": "unit", "label": "default", "account_label": "claude3"},
+            {"at": "2026-10-14T00:00:00Z", "role": "seats", "label": "default", "account_label": "codex3"},
+        ]
+        _ = roles.write_text("".join(json.dumps(entry) + "\n" for entry in evidence))
+        records = [
+            {**self.common(tool="claude", subject="units"), "kind": "requested", "from": "claude1",
+             "to": "default", "why": "quota", "window": "unknown"},
+            {**self.requested(), "from": "default", "to": "codex1"},
+            {**self.common(), "kind": "room again", "label": "default"},
+            {**self.common(), "at": "2026-10-14T00:00:00Z", "kind": "room again", "label": "default"},
+        ]
+        original = "".join(json.dumps(entry) + "\n" for entry in records).encode()
+        _ = path.write_bytes(original)
+        before_roles = roles.read_bytes()
+
+        loaded = moves.read_moves()
+
+        self.assertEqual([entry.get("to") for entry in loaded[:2]], ["claude2", "codex1"])
+        self.assertEqual(loaded[1].get("from"), "codex2")
+        self.assertEqual([entry.get("label") for entry in loaded[2:]], ["codex2", "codex3"])
+        # Today's login must never change the meaning of a historical home alias.
+        _ = (self.home / ".claude.json").write_text(json.dumps({"oauthAccount": {"emailAddress": "new@example.invalid"}}))
+        notes = self.home / "rust/hanadocs/agents"
+        notes.mkdir(parents=True)
+        _ = (notes / "claude9.md").write_text("---\nlogin: new@example.invalid\n---\n")
+        self.assertEqual(moves.read_moves(), loaded)
+        self.assertEqual(path.read_bytes(), original)
+        self.assertEqual(roles.read_bytes(), before_roles)
+
+    def test_legacy_home_without_historical_evidence_is_never_resolved_from_todays_login(self) -> None:
+        path = moves.store_file()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        records = [
+            {**self.common(tool="claude", subject="units"), "kind": "requested", "from": "claude1",
+             "to": "default", "why": "quota", "window": "unknown"},
+            {**self.requested(), "from": "default", "to": "codex1"},
+            {**self.common(), "kind": "room again", "label": "default"},
+        ]
+        original = "".join(json.dumps(entry) + "\n" for entry in records).encode()
+        _ = path.write_bytes(original)
+        notes = self.home / "rust/hanadocs/agents"
+        notes.mkdir(parents=True)
+        (self.home / ".claude").mkdir()
+        _ = (self.home / ".claude.json").write_text(json.dumps({"oauthAccount": {"emailAddress": "today@example.invalid"}}))
+        _ = (notes / "claude9.md").write_text("---\nlogin: today@example.invalid\n---\n")
+        codex = self.home / ".codex"
+        codex.mkdir()
+        claims = base64.urlsafe_b64encode(json.dumps({"email": "today@example.invalid"}).encode()).decode().rstrip("=")
+        _ = (codex / "auth.json").write_text(json.dumps({"tokens": {"id_token": f"header.{claims}.signature"}}))
+        _ = (notes / "codex9.md").write_text("---\nlogin: today@example.invalid\n---\n")
+        # Later role evidence cannot establish which login a home held yesterday.
+        _ = path.with_name("roles.jsonl").write_text(json.dumps({
+            "at": "2026-10-14T00:00:00Z", "role": "unit", "label": "default", "account_label": "claude9"}) + "\n")
+        loaded = moves.read_moves()
+        for entry, field, home in ((loaded[0], "to", self.home / ".claude"),
+                                   (loaded[1], "from", self.home / ".codex"),
+                                   (loaded[2], "label", self.home / ".codex")):
+            value = entry.get(field)
+            self.assertIsInstance(value, moves.HomeAccountUnresolved)
+            assert isinstance(value, moves.HomeAccountUnresolved)
+            self.assertEqual(value.home, home)
+        from scripts.accounts import accounts
+        rendered = "\n".join(accounts._move_status_lines(loaded, timezone.utc))  # pyright: ignore[reportPrivateUsage]
+        self.assertIn("home account unresolved", rendered)
+        self.assertNotIn("default", rendered)
+        self.assertEqual(path.read_bytes(), original)
+
+    def test_superseded_home_role_evidence_leaves_later_legacy_moves_unresolved(self) -> None:
+        path = moves.store_file()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        roles = path.with_name("roles.jsonl")
+        assignments = [
+            {"at": "2026-10-11T00:00:00Z", "role": "seats", "label": "default", "account_label": "codex2"},
+            {"at": "2026-10-12T00:00:00Z", "role": "seats", "label": "codex3"},
+        ]
+        _ = roles.write_text("".join(json.dumps(row) + "\n" for row in assignments))
+        entries = [{**self.requested(), "to": "default"},
+                   {**self.common(), "kind": "room again", "label": "default"}]
+        original = "".join(json.dumps(entry) + "\n" for entry in entries).encode()
+        _ = path.write_bytes(original)
+        role_bytes = roles.read_bytes()
+        loaded = moves.read_moves()
+        for entry, field in ((loaded[0], "to"), (loaded[1], "label")):
+            value = entry.get(field)
+            self.assertIsInstance(value, moves.HomeAccountUnresolved)
+            assert isinstance(value, moves.HomeAccountUnresolved)
+            self.assertEqual(value.home, self.home / ".codex")
+        self.assertEqual(path.read_bytes(), original)
+        self.assertEqual(roles.read_bytes(), role_bytes)
 
     def test_request_alone_never_implies_confirmation(self) -> None:
         requested = self.requested()

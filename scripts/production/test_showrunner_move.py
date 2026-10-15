@@ -80,7 +80,7 @@ class GroupTest(unittest.TestCase):
     def run_group(self, argv: list[str], moved: object, outcome: showrunner_move.Outcome = PROVEN) -> tuple[int, str]:
         output = io.StringIO()
         with patch("showrunner_move.accounts.move_group", return_value=moved) as move_group, \
-             patch("showrunner_move.accounts.account_dir", return_value=TARGET), \
+             patch("showrunner_move.accounts.claude_account_dir", return_value=TARGET), \
              patch("showrunner_move.sessions.live_sessions", return_value=live()), \
              patch.object(showrunner_move, "settle", return_value=outcome) as settle, redirect_stdout(output):
             code = showrunner_move.main(argv)
@@ -123,10 +123,18 @@ class GroupTest(unittest.TestCase):
 
 
 class MainTest(unittest.TestCase):
+    def test_help_teaches_only_numbered_claude_targets(self) -> None:
+        output = io.StringIO()
+        with redirect_stdout(output), self.assertRaises(SystemExit) as result:
+            _ = showrunner_move.main(["--help"])
+        self.assertEqual(result.exception.code, 0)
+        self.assertIn("<claudeN>", output.getvalue())
+        self.assertNotIn("default", output.getvalue())
+
     def run_main(self, argv: list[str], moved: object, outcome: showrunner_move.Outcome) -> tuple[int, str]:
         output = io.StringIO()
         with patch("showrunner_move.accounts.move", return_value=moved) as move, \
-             patch("showrunner_move.accounts.account_dir", return_value=TARGET), \
+             patch("showrunner_move.accounts.claude_account_dir", return_value=TARGET), \
              patch("showrunner_move.sessions.live_sessions", return_value=live()), \
              patch.object(showrunner_move, "settle", return_value=outcome), redirect_stdout(output):
             code = showrunner_move.main(argv)
@@ -156,6 +164,7 @@ class MainTest(unittest.TestCase):
         ):
             with (self.subTest(outcome=outcome),
                   patch.object(accounts, "move", return_value=accounts.MoveStarted(UNIT, "claude2", "", "", 0)),
+                  patch.object(accounts, "claude_account_dir", return_value=target),
                   patch("showrunner_move.sessions.live_sessions", return_value=live()),
                   patch.object(showrunner_move, "settle", return_value=outcome)):
                 output = io.StringIO()

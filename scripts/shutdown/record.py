@@ -991,9 +991,14 @@ def _session_shutdown(value: object, place: str) -> SessionShutdown:
             values[field] = canonical_label(cast(str, values[field]))
     if "target" in values:
         target = _string(values["target"], f"{place}.target")
+        if target == "default":
+            from scripts.whoami.account import claude_account
+            home = claude_account(Path.home() / ".claude")
+            parsed_home = parse_account_label(home.label) if home is not None else None
+            target = parsed_home.label if isinstance(parsed_home, NumberedAccountLabel) else "~/.claude"
         parsed = parse_account_label(target)
-        if target != "default" and not (isinstance(parsed, NumberedAccountLabel) and parsed.tool == "claude"):
-            raise InvalidRecord(f"{place}.target must be default or claudeN")
+        if target != "~/.claude" and not (isinstance(parsed, NumberedAccountLabel) and parsed.tool == "claude"):
+            raise InvalidRecord(f"{place}.target must name a numbered Claude account")
         values["target"] = canonical_label(target)
     for field in ("source_label", "why"):
         if field in values:

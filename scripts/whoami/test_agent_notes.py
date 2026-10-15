@@ -84,7 +84,7 @@ class AgentNotesTests(unittest.TestCase):
         self.rows = cast(MagicMock, self.enterContext(patch.object(session_table, "live_sessions", return_value=session_table.ReadSessions({}, frozenset()))))
 
     def snapshot(self, reports: list[Report]) -> agent_notes.UpdatedAgentNotes:
-        selection = agent_accounts.ClaudeAccountsInUse(agent_accounts.UnreadableClaudeAccount(), False, (), frozenset())
+        selection = agent_accounts.ClaudeAccountsInUse(agent_accounts.UnreadableIdentity(Path.home() / ".claude", "fixture identity unavailable"), False, (), frozenset())
         with patch.object(agent_notes, "live_reports", return_value=reports), patch.object(five_hour, "watch", return_value=[]):
             return agent_notes.update_alert_pass(selection, agent_accounts.seats_home())
 
@@ -366,7 +366,10 @@ class AgentNotesTests(unittest.TestCase):
         """Represent a live local session on this account for the activity snapshot."""
         from scripts.message import sessions
         identity = accounts.account_identity(accounts.account_dir(label))
-        assert isinstance(identity, agent_accounts.KnownClaudeAccount)
+        if isinstance(identity, agent_accounts.UnnotedLogin):
+            _ = self.note(note_file.note_name(label), identity.login)
+            identity = accounts.account_identity(accounts.account_dir(label))
+        assert isinstance(identity, agent_accounts.NumberedAccount)
         _ = self.enterContext(patch.object(sessions, "live_sessions", return_value=[sessions.SessionRecord(
             pid=43210, sessionId="activity-fixture", name="live unit", messagingSocketPath="/fixture.sock",
             updatedAt=1, tmux="", formerNames=[])]))
@@ -444,7 +447,7 @@ class AgentNotesTests(unittest.TestCase):
             return []
 
         for verb in ([], ["refresh"]):
-            self.select_seats("default")
+            self.select_seats("codex1")
             passes.clear()
             with (self.subTest(verb=verb),
                   patch.object(sys, "argv", ["agent_notes.py", *verb]),
@@ -597,7 +600,7 @@ class AgentNotesTests(unittest.TestCase):
         spare_report = Report("Codex", email="spare@example.com", source=CodexHomeSource(default),
             quotas=[Quota("Weekly", 95, self.future)], credit_balance="23")
         selection = agent_accounts.ClaudeAccountsInUse(
-            agent_accounts.UnreadableClaudeAccount(), False, (), frozenset(),
+            agent_accounts.UnreadableIdentity(Path.home() / ".claude", "fixture identity unavailable"), False, (), frozenset(),
         )
 
         with (

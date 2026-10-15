@@ -165,6 +165,41 @@ class ShutdownLaunchCliTests(ShutdownTestCase):
         if self.state.exists():
             shutil.rmtree(self.state)
 
+    def test_down_rejects_non_numbered_targets_before_creating_records_requests_or_a_conductor(self) -> None:
+        moves_file = self.home / ".local/state/accounts/moves.jsonl"
+        selected = Account("claude", LOGIN, LABEL)
+        report = inventory.Inventory(machine="natedev", login=LOGIN, label=LABEL,
+            sessions=[unit_session("session-123")], unattributed=[])
+        for target in ("default", "~/.claude", "claude", "codex1"):
+            self.clear_state()
+            moves_file.unlink(missing_ok=True)
+            with (self.subTest(target=target),
+                  patch.object(shutdown, "named_claude_account", return_value=selected),
+                  patch.object(shutdown, "inventory", return_value=report) as observed,
+                  patch.object(shutdown, "run_remote") as peer,
+                  patch.object(settle, "run_remote", return_value=(0, "")) as forwarded,
+                  patch.object(settle, "_warm", return_value=True),
+                  patch.object(settle, "send_message", return_value=settle.MessageSent(kind="sent")),
+                  patch.object(settle, "_launch_conductor") as conductor):
+                output, error = io.StringIO(), io.StringIO()
+                with redirect_stdout(output), redirect_stderr(error):
+                    try:
+                        status = shutdown.main(["down", LABEL, "--restart", "--to", target])
+                    except SystemExit as exit_error:
+                        status = exit_error.code
+                self.assertNotEqual(status, 0)
+                if target == "default":
+                    self.assertIn("name the account by number", error.getvalue())
+                    self.assertIn("~/.claude is claude2", error.getvalue())
+                else:
+                    self.assertIn(target, error.getvalue())
+                self.assertFalse(self.state.exists() and any(self.state.iterdir()))
+                self.assertFalse(moves_file.exists() and moves_file.stat().st_size)
+                conductor.assert_not_called()
+                peer.assert_not_called()
+                forwarded.assert_not_called()
+                observed.assert_not_called()
+
     def test_remote_control_cli_passes_identity_and_failure_alert_policy_to_fixer(self) -> None:
         for policy in ("user", "none"):
             with self.subTest(policy=policy), patch.object(remote_control, "fix", return_value=remote_control.AlreadyOn()) as fix:

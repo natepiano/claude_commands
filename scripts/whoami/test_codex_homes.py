@@ -29,9 +29,9 @@ from agent_accounts import (
     CodexAccountResult,
     CodexHomeSource,
     CodexRateLimits,
-    KnownClaudeAccount,
+    NumberedAccount,
     Report,
-    UnreadableClaudeAccount,
+    UnreadableIdentity,
 )
 
 
@@ -71,12 +71,12 @@ class CodexHomesTests(unittest.TestCase):
         self.assertIsInstance(missing, agent_accounts.CodexSetupHome)
         self.assertEqual((missing.label, missing.home), ("codex1", self.home / ".codex1"))
 
-    def test_home_matches_its_numbered_account_and_legacy_default_alias(self) -> None:
-        """F003/F004: aliases identify the same home without matching another login."""
+    def test_home_matches_its_numbered_account_but_refuses_the_default_alias(self) -> None:
+        """Numbered identities identify the home; new input cannot use the old alias."""
         home = self.select_seats("codex2")
         _ = home.rename(self.home / ".codex")
         current = self.home / ".codex"
-        self.assertTrue(agent_accounts.codex_home_matches_label(current, "default"))
+        self.assertFalse(agent_accounts.codex_home_matches_label(current, "default"))
         self.assertTrue(agent_accounts.codex_home_matches_label(current, "codex2"))
         other = self.select_seats("codex1")
         self.assertFalse(agent_accounts.codex_home_matches_label(other, "default"))
@@ -130,7 +130,7 @@ class CodexHomesTests(unittest.TestCase):
         self.assertFalse(numbered.exists(), "readers must not migrate files")
 
     def legacy_selection(self) -> ClaudeAccountsInUse:
-        return ClaudeAccountsInUse(UnreadableClaudeAccount(), False, (), frozenset())
+        return ClaudeAccountsInUse(UnreadableIdentity(Path.home() / ".claude", "fixture identity unavailable"), False, (), frozenset())
 
     def live_fixture(self, home: Path) -> Report:
         return Report("Codex", email=f"{home.name}@example.invalid", source=CodexHomeSource(home))
@@ -233,9 +233,9 @@ class CodexHomesTests(unittest.TestCase):
     def test_live_reports_reads_each_home_in_order_in_both_claude_branches(self) -> None:
         for name in (".codex10", ".codex2"):
             (self.home / name).mkdir()
-        default = KnownClaudeAccount("main@example.invalid", "claude1")
+        default = NumberedAccount("claude1", Path.home() / ".claude", "main@example.invalid")
         named = CheckedNamedClaudeAccount("claude2", self.home / ".claude2",
-            KnownClaudeAccount("unit@example.invalid", "claude2"))
+            NumberedAccount("claude2", self.home / ".claude2", "unit@example.invalid"))
         selections = (
             self.legacy_selection(),
             ClaudeAccountsInUse(default, True, (named,), frozenset((named.identity.login,))),

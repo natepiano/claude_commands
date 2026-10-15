@@ -663,7 +663,21 @@ def main(arguments: list[str] | None = None) -> int:
     _ = down.add_argument("--here", action="store_true")
     _ = down.add_argument("--only", metavar="NAME[,NAME...]", help="session ids or exact names, separated by commas")
     _ = down.add_argument("--restart", action="store_true")
-    _ = down.add_argument("--to", dest="target", default="", help="resume on default or claude N")
+    from typing import override
+
+    class NumberedClaudeTarget(argparse.Action):
+        @override
+        def __call__(self, parser: argparse.ArgumentParser, namespace: argparse.Namespace,
+                     values: object, option_string: str | None = None) -> None:
+            from scripts.accounts import accounts
+
+            assert isinstance(values, str)
+            try:
+                namespace.target = accounts.numbered_account_label(values, "claude").label
+            except accounts.AccountsError as error:
+                raise argparse.ArgumentError(self, str(error)) from error
+
+    _ = down.add_argument("--to", dest="target", action=NumberedClaudeTarget, default="", help="resume on claudeN")
     _ = down.add_argument("--why", default="", help="reason for the account move")
     _ = down.add_argument("--requested-by", help=argparse.SUPPRESS)
     _ = down.add_argument("--request-id", default="", help=argparse.SUPPRESS)

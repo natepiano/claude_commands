@@ -903,8 +903,10 @@ def unit_swap_line(note: AgentNote, _notes: list[AgentNote], selection: ClaudeAc
 
     login = (note.get("login") or "").casefold()
     excluded = {named.label for named in selection.named_accounts if named.identity.login.casefold() == login}
-    if selection.is_default_login(login):
-        excluded.add("default")
+    if selection.is_home_directory_login(login):
+        home = selection.home_directory_account
+        if isinstance(home, agent_accounts.NumberedAccount):
+            excluded.add(home.label)
     excluded.update(accounts.account_labels_for_logins(frozenset({login})))
     now = datetime.now(timezone.utc)
     destinations = [accounts.placement(group, now, exclude=frozenset(excluded))

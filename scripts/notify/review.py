@@ -30,7 +30,6 @@ from user_action import (ActionRequired, NoActionRequired, UserAction, first_lin
 
 if TYPE_CHECKING:
     from ..accounts import accounts
-    from ..whoami.account import named_account_environment
 
 ROOT = Path(__file__).resolve().parents[2]
 STATE_DIR = Path.home() / ".local/state/notify"
@@ -156,7 +155,7 @@ def reviewer_binary() -> ResolvedReviewerBinary | MissingReviewerBinary:
 @dataclass(frozen=True)
 class ReviewMetadata:
     seconds: float = 0.0
-    account: str = "default"
+    account: str = "not selected"
     model: str = "opus"
     binary: ResolvedReviewerBinary | MissingReviewerBinary | ReviewerNotResolved = ReviewerNotResolved()
 
@@ -571,15 +570,17 @@ def reviewer_environment() -> tuple[dict[str, str], str]:
         sys.path.insert(0, str(ROOT))
     if not TYPE_CHECKING:
         from scripts.accounts import accounts
-        from scripts.whoami.account import named_account_environment
     environment = dict(os.environ)
     for key in ("CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_API_KEY", "CLAUDE_CONFIG_DIR"):
         _ = environment.pop(key, None)
     selected = accounts.role_account("unit")
-    if isinstance(selected, accounts.NamedAccount):
-        environment.update(named_account_environment(selected.dir))
-        return environment, selected.label
-    return environment, "default"
+    prepared = accounts.prepared_account(selected.label, resume=False)
+    if isinstance(prepared, accounts.AccountRefused):
+        raise accounts.AccountsError(prepared.reason)
+    for name in prepared.remove:
+        _ = environment.pop(name, None)
+    environment.update(prepared.variables)
+    return environment, selected.label
 
 
 def reviewer_assignment(runner: ProcessRunner, environment: dict[str, str],
@@ -599,7 +600,7 @@ def reviewer_assignment(runner: ProcessRunner, environment: dict[str, str],
 def _review(draft: Draft, revision: bool, runner: ProcessRunner,
             context: PushReview | ReplyContext = PUSH_REVIEW, *, timeout_seconds: float) -> ReviewOutcome:
     started = time.monotonic()
-    account, model = "default", "opus"
+    account, model = "not selected", "opus"
     timeout = timeout_seconds
     binary: ResolvedReviewerBinary | MissingReviewerBinary | ReviewerNotResolved = ReviewerNotResolved()
 

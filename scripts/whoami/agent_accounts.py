@@ -153,61 +153,72 @@ def codex_home_role_label(home: Path) -> str:
 
 
 def codex_home_matches_label(home: Path, label: str) -> bool:
-    """Match a current account label or the legacy default-home alias."""
-    if label == "default":
-        return home == Path.home() / ".codex"
-    from scripts.whoami.note_file import canonical_label, NumberedAccountLabel, parse_account_label
+    """Match only a numbered account label to the home holding its login."""
+    from scripts.whoami.note_file import NumberedAccountLabel, parse_account_label
 
-    label = canonical_label(label)
-    if label == codex_home_role_label(home):
-        return True
     parsed = parse_account_label(label)
-    if isinstance(parsed, NumberedAccountLabel) and parsed.tool == "codex":
-        return codex_account_home(label).home == home
-    return False
+    if not isinstance(parsed, NumberedAccountLabel) or parsed.tool != "codex":
+        return False
+    return (parsed.label == codex_home_role_label(home)
+            or codex_account_home(parsed.label).home == home)
 
 
 ClaudeRole = Literal["showrunners", "unit directors"]
 
 
 @dataclass(frozen=True)
-class KnownClaudeAccount:
-    """The login and note label stored for a readable Claude directory."""
+class NumberedAccount:
+    """A readable login with an account note, fit to name a destination."""
 
-    login: str
     label: str
+    home: Path
+    login: str
 
 
 @dataclass(frozen=True)
-class UnreadableClaudeAccount:
-    """A directory with no readable logged-in Claude identity."""
+class UnnotedLogin:
+    """A signed-in home whose login has no numbered account note."""
+
+    home: Path
+    login: str
+
+
+@dataclass(frozen=True)
+class UnreadableIdentity:
+    """A home whose signed-in identity cannot be read."""
+
+    home: Path
+    reason: str
+
+
+AccountIdentity = NumberedAccount | UnnotedLogin | UnreadableIdentity
 
 
 @dataclass(frozen=True)
 class CheckedNamedClaudeAccount:
-    """A named directory fit to read, with its resolved login and note label."""
+    """A named directory fit to read, with its numbered identity."""
 
     label: str
     directory: Path
-    identity: KnownClaudeAccount
+    identity: NumberedAccount
 
 
 @dataclass(frozen=True)
 class ClaudeAccountsInUse:
     """One run's readable accounts and local sessions' logins."""
 
-    default_account: KnownClaudeAccount | UnreadableClaudeAccount
+    home_directory_account: AccountIdentity
     multiple_accounts: bool
     named_accounts: tuple[CheckedNamedClaudeAccount, ...]
     live_logins: frozenset[str]
     live_directories: tuple[Path, ...] = ()
 
-    def is_default_login(self, login: str) -> bool:
-        return (isinstance(self.default_account, KnownClaudeAccount)
-                and login.casefold() == self.default_account.login.casefold())
+    def is_home_directory_login(self, login: str) -> bool:
+        return (isinstance(self.home_directory_account, (NumberedAccount, UnnotedLogin))
+                and login.casefold() == self.home_directory_account.login.casefold())
 
     def is_in_use(self, login: str) -> bool:
-        return self.is_default_login(login) or login.casefold() in self.live_logins
+        return self.is_home_directory_login(login) or login.casefold() in self.live_logins
 
 
 WEEK_MINUTES = 7 * 24 * 60
@@ -486,6 +497,8 @@ def seats_home() -> Path:
     label = values["seats"]
     from scripts.whoami.note_file import NumberedAccountLabel, parse_account_label
 
+    if label == "default":
+        return Path.home() / ".codex"
     if not isinstance(label, str):
         raise ValueError(f"accounts: {path} has an invalid seats account")
     parsed = parse_account_label(label)

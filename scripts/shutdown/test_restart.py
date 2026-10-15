@@ -310,7 +310,7 @@ class RestartTests(ShutdownTestCase):
         _ = self.enterContext(patch.object(settle, "record_time", return_value=RESTARTED))
         _ = self.enterContext(patch.object(settle, "inventory", return_value=inventory.Inventory(machine="natedev", login=LOGIN, label=LABEL, sessions=[], unattributed=[])))
 
-    def configure_groups(self, *, units: str = "default", showrunners: str = "default") -> None:
+    def configure_groups(self, *, units: str = "claude2", showrunners: str = "claude2") -> None:
         path = accounts.groups_file()
         path.parent.mkdir(parents=True, exist_ok=True)
         _ = path.write_text(json.dumps({"units": units, "showrunners": showrunners}))
@@ -457,6 +457,36 @@ class RestartTests(ShutdownTestCase):
         self.assertEqual(push.id, "shutdown.restart_failed")
         self.assertEqual(push.values["stopped"], "One session")
 
+    def test_legacy_default_record_restarts_on_the_numbered_home_without_rewriting_it_on_read(self) -> None:
+        saved = entry(top_level("legacy-home-move", host=tmux_host("legacy-home-move")))
+        saved["target"] = "claude2"
+        self.create([saved])
+        path = next((self.state_root / LOGIN / "sessions").glob("*.json"))
+        original = path.read_bytes().replace(b'"target": "claude2"', b'"target": "default"')
+        self.assertIn(b'"target": "default"', original)
+        _ = path.write_bytes(original)
+
+        loaded = record.session_records(LOGIN)[0]
+
+        self.assertEqual(loaded.get("target"), "claude2")
+        self.assertEqual(path.read_bytes(), original)
+        recorder = CommandRecorder()
+        with patch.object(restart, "_run", recorder):
+            result = restart._launch_session(loaded, "resume the saved checkpoint", self.desktop_state, dry_run=False)  # pyright: ignore[reportPrivateUsage]
+        self.assertIsInstance(result, restart.SessionLaunched)
+        commands = [argv[-1] for argv in recorder.calls if "-ic" in argv]
+        self.assertEqual(len(commands), 1)
+        self.assertIn("accounts.py exec claude2", commands[0])
+        self.assertNotIn("CLAUDE_CONFIG_DIR=", commands[0])
+
+    def test_resume_parts_for_both_groups_on_the_home_account_use_its_number(self) -> None:
+        self.configure_groups(units="claude2", showrunners="claude2")
+        for owner in (unit("home-unit"), showrunner("home-runner")):
+            with self.subTest(kind=owner["kind"]):
+                owner["config_dir"] = str(self.root / ".claude3")
+                parts = restart._resume_parts(owner, "continue the checkpoint")  # pyright: ignore[reportPrivateUsage]
+                self.assertEqual(parts.account, restart.MoveResumeAccount("claude2"))
+
     def test_default_target_process_confirms_main_directory_and_removes_assumption(self) -> None:
         saved = entry(top_level("default-target", host=tmux_host("default-target")))
         saved["target"] = "default"
@@ -544,7 +574,7 @@ class RestartTests(ShutdownTestCase):
         self.assert_move_resume(launch[-1], owner)
 
     def test_tmux_account_move_updates_retained_directory_for_named_and_default_targets(self) -> None:
-        for target, directory in (("claude3", self.root / ".claude3"), ("default", self.root / ".claude")):
+        for target, directory in (("claude3", self.root / ".claude3"), ("claude2", self.root / ".claude")):
             with self.subTest(target=target):
                 owner = showrunner("moved-showrunner", host=recorded_tmux_host("kept", "%move", 420))
                 owner["config_dir"] = str(self.root / ".claude1")
@@ -1107,7 +1137,7 @@ class RestartTests(ShutdownTestCase):
         """F001/F002: unrestricted unit names never reach native herdr agent launch."""
         template, _, log = self.herdr_restart_fixture()
         checkpoint = "finish Parser Review; keep 'quotes' and $(literal)"
-        for label in ("default", "claude3"):
+        for label in ("claude2", "claude3"):
             self.configure_groups(units=label)
             for moved in (False, True):
                 for already_on_group in (False, True):
@@ -1117,7 +1147,7 @@ class RestartTests(ShutdownTestCase):
                             owner = unit("parser-review", session_host="herdr", session_name="writing")
                             owner["name"] = "Parser Review"
                             owner["cwd"] = template["cwd"]
-                            directory = accounts.main_config_dir() if label == "default" else accounts.account_dir(label)
+                            directory = accounts.main_config_dir() if label == "claude2" else accounts.account_dir(label)
                             old_directory = accounts.account_dir("claude1")
                             owner["config_dir"] = str(directory if already_on_group else old_directory)
                             saved = entry(owner, where=record.WhereSaid(kind="said", text=checkpoint, at=STOPPED))
@@ -1150,7 +1180,7 @@ class RestartTests(ShutdownTestCase):
         """F001: account changes never rely on PATH inside a herdr shell."""
         template, _, log = self.herdr_restart_fixture()
         checkpoint = "continue the saved showrunner checkpoint"
-        for label in ("default", "claude3"):
+        for label in ("claude2", "claude3"):
             self.configure_groups(showrunners=label)
             for moved in (False, True):
                 for dry_run in (False, True):
@@ -1359,14 +1389,14 @@ class RestartTests(ShutdownTestCase):
         for owner in owners:
             with self.subTest(host=owner["host"]["kind"], kind=owner["kind"]):
                 saved = entry(owner, where=record.WhereNotSaid(kind="not said"))
-                saved["target"] = "default"
+                saved["target"] = "claude2"
                 saved["source_label"] = "claude3"
                 saved["why"] = "weekly limit reached"
                 note = restart.restart_note(saved, RESTARTED)
-                self.assertIn("moved from claude3 to default because weekly limit reached", note)
+                self.assertIn("moved from claude3 to claude2 because weekly limit reached", note)
                 self.assertIn("account move, not a stop", note)
                 self.assertIn("Continue where you stopped", note)
-                command = restart.resume_command(owner, "default", "claude3", "weekly limit reached")
+                command = restart.resume_command(owner, "claude2", "claude3", "weekly limit reached")
                 arguments = shlex.split(command.removesuffix("; exec zsh"))
                 self.assertIn(note, arguments[-1])
                 if owner["kind"] == "showrunner":
@@ -1587,7 +1617,7 @@ class RestartTests(ShutdownTestCase):
         self.assertEqual(len(resume_commands), 3 if sys.platform == "linux" else 4)
         for command in resume_commands:
             if "--resume named-showrunner " in command:
-                self.assertIn("accounts.py exec default", command)
+                self.assertIn("accounts.py exec claude2", command)
                 self.assertNotIn(config_dir, command)
             else:
                 launcher = "claude"
