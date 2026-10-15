@@ -573,11 +573,21 @@ class CodexAccountAlertTests(unittest.TestCase):
 
     def test_unchecked_target_is_not_recommended_even_with_live_allowance(self) -> None:
         a, b = self.account(1), self.account(2)
-        _ = (b.home / "unexpected").write_text("private entry")
+        private_cache = b.home / "cache"
+        private_cache.symlink_to(self.root, target_is_directory=True)
         readings = self.readings(a, self.report(a), self.report(b, 90))
         _ = quota_alert.alert([self.note(1, "active", 1), self.note(2, "inactive", 90)],
                               self.now, codex_readings=readings)
         self.assertNotIn("workers move to codex2 when Codex refuses work", "\n".join(self.sent))
+        self.assertEqual(accounts.check("codex2"), [
+            f"accounts: {private_cache} is a link; sign-in and home state stay in each account home",
+        ])
+
+        private_cache.unlink()
+
+        self.assertEqual(accounts.check("codex2"), [])
+        self.assertEqual(quota_alert.codex_swap_line(readings, self.now),
+                         "workers move to codex2 when Codex refuses work")
 
     def test_unknown_selected_identity_does_not_alert_old_active_notes(self) -> None:
         a = self.account(1)

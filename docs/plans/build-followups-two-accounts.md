@@ -1041,3 +1041,32 @@ After a worker launch's own turn has ended, a move to the selected seats home th
 - The record reaches jq as text, never through `--slurpfile`: a damaged record makes `--slurpfile` exit 2 and blank the whole line.
 - Every account's `sessions` folder links to `~/.claude/sessions` (`accounts.py` `ALWAYS_LINKED`), so the lookup finds a showrunner running on any account.
 - zsh's `read` reads byte by byte and cost about 3 ms per render; `$(<file)` does not.
+
+### Phase 30 — The accounts table shows only accounts  · status: done
+
+**Depends on:** Phase 29
+
+#### Work Order
+
+**Goal:** the default `/showrunner:accounts` output (`accounts.py`, no action) prints no unclassified lines; Claude Code's own per-account folders count as per-account; stale temp files from Claude Code's atomic writes are deleted (the user, via the showrunner: "i think that we should be cleaning these up … are they really accounts?").
+
+**Constraints from prior phases:** `scripts/accounts/accounts.py` classifies a numbered folder's entries: `SHARED` (linked into `~/.claude`), `ALWAYS_LINKED`, `KNOWN_PRIVATE_NAMES` (`.credentials.json`, `.claude.json`, `account-label`, `daemon`, `jobs`, `backups`, `cache`, `.last-cleanup`) and `_is_known_private`'s prefixes (`daemon-auth-`, `.oauth_refresh.lock`). `_unclassified(config_dir)` lists the rest, only for numbered folders, and `_status_notes` prints them under the table; the Codex home has its own unclassified listing. `status` already takes `--detail` (only with no action). Claude Code writes `.claude.json` atomically through `.claude.json.tmp.<pid>.<hex>` beside it — in `$HOME` for `~/.claude` (whose config is `$HOME/.claude.json`), in the folder for a `~/.claudeN` — and leaves some behind: 874 in `$HOME` on 2026-10-15, all older than a day. `agent_notes.py`'s updater runs every two minutes on a timer.
+
+**Spec:**
+
+1. `feedback` and `telemetry` join `KNOWN_PRIVATE_NAMES`, and `_is_known_private` accepts the prefix `.claude.json.tmp.`: per-account, never linked, never reported.
+2. Unclassified entries (Claude and Codex) print only under `--detail`; the default output prints none.
+3. A sweep deletes each regular file named `.claude.json.tmp.*` whose modification time is more than a day old, in `$HOME` and in each `~/.claudeN` on disk, never following a link and never touching any other name; a file that vanishes or cannot be deleted is skipped silently. The updater runs it once per run. A file under a day old is left alone (an atomic write in flight is milliseconds old).
+4. `docs/accounts.md` says the default table shows only accounts and `--detail` shows unknown entries.
+
+**Files:**
+
+- `scripts/accounts/accounts.py` — the names, the prefix, the `--detail` gate, the sweep.
+- `scripts/whoami/agent_notes.py` — the updater calls the sweep.
+- `scripts/accounts/test_accounts.py` — the three names classified; default output has no unclassified line and `--detail` has it; the sweep deletes an old temp file in `$HOME` and in a numbered folder, keeps a fresh one, a link and any other name.
+- `scripts/whoami/test_agent_notes.py` — the updater runs the sweep.
+- `docs/accounts.md` — one line.
+
+**Workers:** `impl` takes `accounts.py`, `agent_notes.py` and the doc; `test` takes both test files.
+
+**Acceptance gate:** basedpyright zero errors and warnings on the changed Python; the accounts and whoami suites pass; run against a scratch home, the default output prints no unclassified line, `--detail` prints it, and the sweep deletes only the old temp files.

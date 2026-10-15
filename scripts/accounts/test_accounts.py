@@ -17,11 +17,11 @@ import sys
 import tempfile
 import time
 import unittest
-from contextlib import redirect_stderr, redirect_stdout
+from contextlib import contextmanager, redirect_stderr, redirect_stdout
 from dataclasses import FrozenInstanceError
 from datetime import datetime, timedelta, timezone, tzinfo
 from pathlib import Path
-from collections.abc import Callable
+from collections.abc import Callable, Generator, Iterator
 from typing import Self, TextIO, cast, final, override
 from unittest.mock import AsyncMock, MagicMock, call, patch
 from zoneinfo import ZoneInfo
@@ -1762,7 +1762,7 @@ class AccountsTests(unittest.TestCase):
             [call(self.main_dir)] * login_read.call_count,
         )
 
-    def test_status_shows_role_problems_unclassified_entries_and_mcp_difference(
+    def test_status_detail_shows_unclassified_entries_and_mcp_difference(
         self,
     ) -> None:
         self.write_main_config()
@@ -1792,13 +1792,182 @@ class AccountsTests(unittest.TestCase):
             patch.object(account, "claude_account", return_value=None),
             patch.object(account, "label_for", return_value="unknown"),
         ):
-            result, stdout, stderr = self.run_cli("status")
+            result, stdout, stderr = self.run_cli("--detail")
 
         self.assertEqual(result, 0)
         self.assertEqual(stderr, "")
         self.assertRegex(stdout, r"\| ~/\.claude2 +\| claude2 +\| not logged in \|")
         self.assertIn("\n~/.claude2: unclassified: mystery-cache\n", stdout)
         self.assertIn("\n~/.claude2: mcpServers: - brp, + account-only\n", stdout)
+
+    def test_claude_feedback_telemetry_and_atomic_write_temps_stay_private_after_setup(self) -> None:
+        self.write_main_config()
+        directory = self.home / ".claude2"
+        directory.mkdir()
+        for name in ("feedback", "telemetry"):
+            (directory / name).mkdir()
+        temporary = directory / ".claude.json.tmp.1234.abcdef"
+        _ = temporary.write_text("unfinished config", encoding="utf-8")
+        _ = (directory / "unexpected-entry").write_text("keep visible in detail", encoding="utf-8")
+
+        self.assertEqual(accounts.setup("claude2"), [])
+
+        self.assertEqual(accounts._unclassified(directory), ("unexpected-entry",))  # pyright: ignore[reportPrivateUsage]
+        for name in ("feedback", "telemetry", temporary.name):
+            self.assertFalse((directory / name).is_symlink())
+        self.assertEqual(temporary.read_text(encoding="utf-8"), "unfinished config")
+
+    def test_unknown_claude_and_codex_entries_show_only_with_detail(self) -> None:
+        self.login_directory("claude2", "main@example.invalid", default=True)
+        self.login_directory("claude3", "spare@example.invalid")
+        self.write_note("codex1", "worker@example.invalid")
+        codex_home = self.home / ".codex1"
+        self.codex_login("worker@example.invalid", codex_home)
+        _ = (self.home / ".claude3" / "unknown-claude-entry").write_text("own", encoding="utf-8")
+        _ = (codex_home / "unknown-codex-entry").write_text("own", encoding="utf-8")
+
+        for arguments in ((), ("status",)):
+            with self.subTest(arguments=arguments):
+                code, output, error = self.run_cli(*arguments)
+                self.assertEqual((code, error), (0, ""))
+                self.assertNotIn("unclassified:", output)
+                self.assertNotIn("unknown-claude-entry", output)
+                self.assertNotIn("unknown-codex-entry", output)
+
+        code, output, error = self.run_cli("--detail")
+
+        self.assertEqual((code, error), (0, ""))
+        self.assertIn("~/.claude3: unclassified: unknown-claude-entry", output)
+        self.assertIn("~/.codex1: unclassified: unknown-codex-entry", output)
+
+    def test_temp_sweep_deletes_only_old_regular_claude_write_temps_in_home_and_numbered_folders(self) -> None:
+        now = datetime(2026, 10, 15, 12, tzinfo=timezone.utc)
+        old = (now - timedelta(days=2)).timestamp()
+        fresh = (now - timedelta(hours=1)).timestamp()
+        cutoff = (now - timedelta(days=1)).timestamp()
+        deleted: list[Path] = []
+        retained: list[Path] = []
+        target = self.root / "symlink-target"
+        _ = target.write_text("outside the sweep", encoding="utf-8")
+        os.utime(target, (old, old))
+        links: list[Path] = []
+        for folder in (self.home, self.home / ".claude2", self.home / ".claude17"):
+            folder.mkdir(exist_ok=True)
+            stale = folder / ".claude.json.tmp.1234.old"
+            _ = stale.write_text("stale", encoding="utf-8")
+            os.utime(stale, (old, old))
+            deleted.append(stale)
+            for name, modified in ((".claude.json.tmp.1234.fresh", fresh),
+                                   (".claude.json.tmp.1234.exactly-one-day", cutoff),
+                                   (".claude.json.tmpx.1234.other", old)):
+                path = folder / name
+                _ = path.write_text("keep", encoding="utf-8")
+                os.utime(path, (modified, modified))
+                retained.append(path)
+            link = folder / ".claude.json.tmp.1234.link"
+            link.symlink_to(target)
+            links.append(link)
+            nested = folder / ".claude.json.tmp.1234.directory"
+            nested.mkdir()
+            child = nested / ".claude.json.tmp.1234.nested"
+            _ = child.write_text("keep", encoding="utf-8")
+            os.utime(child, (old, old))
+            retained.append(child)
+        linked_folder = self.root / "linked-account"
+        linked_folder.mkdir()
+        (self.home / ".claude99").symlink_to(linked_folder, target_is_directory=True)
+        for folder in (linked_folder, self.main_dir, self.home / ".claude-not-numbered"):
+            folder.mkdir(exist_ok=True)
+            path = folder / ".claude.json.tmp.1234.out-of-scope"
+            _ = path.write_text("keep", encoding="utf-8")
+            os.utime(path, (old, old))
+            retained.append(path)
+
+        accounts.sweep_claude_temp_files(now)
+
+        for path in deleted:
+            with self.subTest(deleted=path):
+                self.assertFalse(path.exists())
+        for path in retained:
+            with self.subTest(retained=path):
+                self.assertEqual(path.read_text(encoding="utf-8"), "keep")
+        for link in links:
+            self.assertTrue(link.is_symlink())
+        self.assertTrue((self.home / ".claude99").is_symlink())
+        self.assertEqual(target.read_text(encoding="utf-8"), "outside the sweep")
+
+    def test_temp_sweep_silently_skips_vanished_and_undeletable_files_and_continues(self) -> None:
+        now = datetime.now(timezone.utc)
+        old = (now - timedelta(days=2)).timestamp()
+        vanished, blocked, removable = (
+            self.home / f".claude.json.tmp.1234.{name}" for name in ("vanished", "blocked", "removable")
+        )
+        for path in (vanished, blocked, removable):
+            _ = path.write_text("stale", encoding="utf-8")
+            os.utime(path, (old, old))
+        unlink = os.unlink
+
+        def delete(path: str, *, dir_fd: int) -> None:
+            if path == blocked.name:
+                raise PermissionError("cannot delete this file")
+            unlink(path, dir_fd=dir_fd)
+            if path == vanished.name:
+                raise FileNotFoundError("another process already deleted this file")
+
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        with patch.object(os, "unlink", side_effect=delete), redirect_stdout(stdout), redirect_stderr(stderr):
+            accounts.sweep_claude_temp_files(now)
+
+        self.assertEqual((stdout.getvalue(), stderr.getvalue()), ("", ""))
+        self.assertFalse(vanished.exists())
+        self.assertFalse(removable.exists())
+        self.assertEqual(blocked.read_text(encoding="utf-8"), "stale")
+
+    def test_temp_sweep_keeps_outside_files_when_discovered_folder_becomes_a_link(self) -> None:
+        now = datetime.now(timezone.utc)
+        folder = self.home / ".claude17"
+        folder.mkdir()
+        outside = self.root / "outside"
+        outside.mkdir()
+        temporary = outside / ".claude.json.tmp.1234.old"
+        _ = temporary.write_text("outside the sweep", encoding="utf-8")
+        old = (now - timedelta(days=2)).timestamp()
+        os.utime(temporary, (old, old))
+        scandir = os.scandir
+        listings = 0
+
+        @contextmanager
+        def swap_before_listing(path: int | Path) -> Generator[Iterator[os.DirEntry[str]]]:
+            nonlocal listings
+            listings += 1
+            if listings == 2:
+                _ = folder.rename(self.root / "original-folder")
+                folder.symlink_to(outside, target_is_directory=True)
+            with scandir(path) as entries:
+                yield entries
+
+        with patch.object(os, "scandir", side_effect=swap_before_listing):
+            accounts.sweep_claude_temp_files(now)
+
+        self.assertEqual(listings, 2)
+        self.assertTrue(folder.is_symlink())
+        self.assertEqual(temporary.read_text(encoding="utf-8"), "outside the sweep")
+
+    def test_codex_unknown_entry_does_not_block_check_and_is_only_shown_in_detail(self) -> None:
+        self.write_main_config()
+        self.write_note("codex1", "worker@example.invalid")
+        self.codex_login("worker@example.invalid", self.home / ".codex1")
+        self.assertEqual(accounts.setup("codex1"), [])
+        _ = (self.home / ".codex1" / "unknown-codex-entry").write_text("own", encoding="utf-8")
+
+        self.assertEqual(self.run_cli("check", "codex1"), (0, "", ""))
+        code, output, error = self.run_cli("status")
+        self.assertEqual((code, error), (0, ""))
+        self.assertNotIn("unknown-codex-entry", output)
+        code, output, error = self.run_cli("--detail")
+        self.assertEqual((code, error), (0, ""))
+        self.assertIn("~/.codex1: unclassified: unknown-codex-entry", output)
 
     def reading(
         self, login: str, five_hour: agent_accounts.Quota | None, weekly: agent_accounts.Quota,
@@ -2115,7 +2284,7 @@ class AccountsTests(unittest.TestCase):
         self.assertEqual(self.run_cli("check", "codex1"), (0, "", ""))
         self.codex_reads.assert_not_awaited()
 
-    def test_codex_check_reports_links_unknown_entry_and_login_mismatch_together(self) -> None:
+    def test_codex_check_reports_links_and_login_mismatch_but_not_unknown_entries(self) -> None:
         self.write_note("codex1", "expected@example.invalid")
         self.codex_login("other@example.invalid", self.home / ".codex1")
         default = self.home / ".codex"
@@ -2134,8 +2303,9 @@ class AccountsTests(unittest.TestCase):
 
         self.assertNotEqual(result, 0)
         self.assertEqual(stderr, "")
-        for detail in ("config.toml", "hooks.json", "AGENTS.md", "unknown-entry", "other@example.invalid", "codex1"):
+        for detail in ("config.toml", "hooks.json", "AGENTS.md", "other@example.invalid", "codex1"):
             self.assertIn(detail, stdout)
+        self.assertNotIn("unknown-entry", stdout)
         self.assertEqual((home / "hooks.json").read_text(), "replacement")
         self.codex_reads.assert_not_awaited()
 
@@ -2296,14 +2466,14 @@ class AccountsTests(unittest.TestCase):
         self.assertEqual([row[4] for row in rows], ["80%", "5%"])
         self.assertEqual([row[7] for row in rows], ["7", "13"])
 
-    def test_status_prints_codex_check_problems_below_the_table(self) -> None:
+    def test_status_detail_prints_codex_check_problems_below_the_table(self) -> None:
         self.login_directory("claude2", "main@example.invalid", default=True)
         self.write_note("codex1", "spare@example.invalid")
         self.codex_login("spare@example.invalid", self.home / ".codex1")
         self.assertNotIn("unclassified:", self.run_cli("status")[1])
         _ = (self.home / ".codex1" / "unclassified-item").write_text("own")
 
-        result, stdout, stderr = self.run_cli("status")
+        result, stdout, stderr = self.run_cli("--detail")
 
         self.assertEqual((result, stderr), (0, ""))
         table, problems = stdout.split("\n\n", 1)
