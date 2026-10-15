@@ -205,8 +205,8 @@ class RoleTests(unittest.TestCase):
         _ = (self.home / ".local/state/notifier").rename(moved)
         self.assertEqual(self.role(NOTIFIER_STATE_DIR=str(moved)), "showrunner")
 
-    def test_a_unit_mark_is_a_unit(self) -> None:
-        self.assertEqual(self.role(SHOWRUNNER_UNIT="show", SHOWRUNNER_UNIT_ID="trunk-unit"), "unit")
+    def test_a_unit_mark_is_a_unit_director(self) -> None:
+        self.assertEqual(self.role(SHOWRUNNER_UNIT="show", SHOWRUNNER_UNIT_ID="trunk-unit"), "unit director")
 
     def test_an_empty_unit_mark_is_unassigned(self) -> None:
         self.assertEqual(self.role(SHOWRUNNER_UNIT=""), "unassigned")
