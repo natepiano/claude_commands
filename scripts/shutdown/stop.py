@@ -56,6 +56,11 @@ FreshInventory = Callable[[str, frozenset[str]], Inventory]
 Clock = Callable[[], datetime]
 CommandRunner = Callable[[list[str]], int | None]
 Sleeper = Callable[[float], None]
+IdleStopReason = Literal[
+    "not an idle stop",
+    "idle; nothing in progress",
+    "idle after the pause message; no ready line",
+]
 
 
 class StopClaimLost(Exception):
@@ -539,6 +544,7 @@ def _stop_owner(
     entry: SessionShutdown,
     *,
     prior: SessionProgress,
+    idle_reason: IdleStopReason,
     force_now: bool,
     kill: KillProcess,
     is_alive: LivenessCheck,
@@ -591,7 +597,8 @@ def _stop_owner(
 
     current = match["session"]
     if not force_now and prior["kind"] != "reaping" and (
-        prior["kind"] not in {"ready", "held by usage limit", "stopping", "stop failed"}
+        (prior["kind"] not in {"ready", "held by usage limit", "stopping", "stop failed"}
+         and not (prior["kind"] == "waiting" and idle_reason != "not an idle stop"))
         or current["status"] != "idle"
         or any(worker["status"] != "idle" for worker in match["seats"])
         or settle.blocker(current)["kind"] != "clear"
@@ -745,6 +752,7 @@ def _stop_owner(
 def stop_session(
     record: SessionShutdown,
     *,
+    idle_reason: IdleStopReason = "not an idle stop",
     kill: KillProcess = os.kill,
     is_alive: LivenessCheck = process_is_alive,
     session_record_exists: SessionRecordPresence = session_record_exists,
@@ -773,6 +781,8 @@ def stop_session(
             return
         prior = copy.deepcopy(progress)
         current["progress"] = {"kind": "stopping", "at": _timestamp(clock)}
+        if idle_reason != "not an idle stop":
+            current["where"] = {"kind": "said", "text": idle_reason, "at": current["progress"]["at"]}
         claimed = True
 
     current = update_session(record["login"], record["session"]["session_id"], claim)
@@ -795,7 +805,7 @@ def stop_session(
 
             return update_session(current["login"], current["session"]["session_id"], restore_progress)
         _stop_owner(
-            owned, current, prior=prior,
+            owned, current, prior=prior, idle_reason=idle_reason,
             force_now=current["force"] == "now",
             kill=kill, is_alive=is_alive,
             session_record_exists=session_record_exists,

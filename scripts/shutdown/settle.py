@@ -172,6 +172,8 @@ class SendSettleMessage:
 class StopSession:
     """The owner can attempt its stop now."""
 
+    idle_reason: stop_work.IdleStopReason = "not an idle stop"
+
 @dataclass(frozen=True)
 class RelaunchSession:
     """The stopped owner can begin its restore now."""
@@ -857,10 +859,18 @@ def next_step(saved: SessionShutdown, owner: stop_work.FreshSession,
         if owner["kind"] == "matching session":
             if saved["force"] == "now":
                 return StopSession()
-            if progress in {"ready", "held by usage limit"} and owner["session"]["status"] == "idle" and all(
+            if owner["session"]["status"] == "idle" and all(
                 worker["status"] == "idle" for worker in owner["seats"]
             ) and blocker(owner["session"])["kind"] == "clear" and (progress == "held by usage limit" or not _showing_form(owner["session"])):
-                return StopSession()
+                if progress in {"ready", "held by usage limit"}:
+                    return StopSession()
+                message = saved["settle_message"]
+                if message["kind"] in {"not sent", "queued"}:
+                    return StopSession("idle; nothing in progress")
+                if message["kind"] == "sent":
+                    updated_at = datetime.fromtimestamp(owner["session"]["updated_at"] / 1000, timezone.utc)
+                    if updated_at > datetime.fromisoformat(message["at"]):
+                        return StopSession("idle after the pause message; no ready line")
         if progress == "waiting" and not _is_requester(saved):
             message = saved["settle_message"]
             if message["kind"] == "not sent" or (message["kind"] == "queued" and
@@ -1533,12 +1543,12 @@ def _tell_holdout_requesters(held: list[tuple[SessionShutdown, str]], summary: s
         _ = send_message(f"session:{origin}", summary, text, key=f"shutdown-holdout-{held[0][0]['login']}")
 
 
-def _stop_after_telling(saved: SessionShutdown) -> SessionShutdown:
+def _stop_after_telling(saved: SessionShutdown, idle_reason: stop_work.IdleStopReason = "not an idle stop") -> SessionShutdown:
     try:
         tell_showrunner_stopping(saved)
     except Exception as error:
         print(f"{saved['session']['name']}: showrunner not told of the stop: {error}", file=sys.stderr)
-    return stop_work.stop_session(saved)
+    return stop_work.stop_session(saved, idle_reason=idle_reason)
 
 
 def _archive_finished(saved: SessionShutdown) -> bool:
@@ -1704,7 +1714,7 @@ def _conduct_owned(login: str, archived: dict[str, SessionShutdown]) -> None:
                                 continue
                             saved = updated
                         step = next_step(saved, owner, records, now_utc())
-                        if due and _holdout_due(saved, now_utc()):
+                        if due and not isinstance(step, StopSession) and _holdout_due(saved, now_utc()):
                             reason = hold_reason(saved, owner)
                             if _reserve_holdout_alert(saved, now_utc()):
                                 holdouts.append((saved, reason))
@@ -1716,7 +1726,7 @@ def _conduct_owned(login: str, archived: dict[str, SessionShutdown]) -> None:
                                 messages[session_id] = notifications.submit(_send_settle_message, saved)
                         elif isinstance(step, StopSession):
                             attempted.add((session_id, type(step)))
-                            future = executor.submit(_stop_after_telling, saved)
+                            future = executor.submit(_stop_after_telling, saved, step.idle_reason)
                             pending[session_id] = PendingSessionAction(saved, step, future)
                         elif isinstance(step, RelaunchSession):
                             attempted.add((session_id, type(step)))

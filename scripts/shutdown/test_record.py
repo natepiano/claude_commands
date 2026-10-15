@@ -88,6 +88,7 @@ def session(number: int = 1) -> inventory.TopLevelSession:
         name=f"Claude {number}",
         cwd=f"/tmp/checkout-{number}",
         status="idle",
+        updated_at=0,
         model=inventory.NoReplyYet(kind="no reply yet"),
         checkout=inventory.NotACheckout(kind="not a checkout"),
         run_dirs=[],
@@ -174,7 +175,7 @@ def account_hold(login: str = "owner@example.com") -> record.AccountHold:
 def owned_worker(owner: str = "session-1") -> inventory.SeatSession:
     return inventory.SeatSession(
         kind="seat", session_id="worker-1", pid=20001, proc_start="worker-start",
-        name="worker", cwd="/tmp/worker", status="idle",
+        name="worker", cwd="/tmp/worker", status="idle", updated_at=0,
         model=inventory.NoReplyYet(kind="no reply yet"),
         checkout=inventory.NotACheckout(kind="not a checkout"),
         run_dirs=[], codex_servers=[], timers=[], host=inventory.UnknownHost(kind="unknown"),

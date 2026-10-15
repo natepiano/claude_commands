@@ -60,6 +60,7 @@ def complete_session(*, host: object) -> dict[str, object]:
         "cwd": "/tmp/checkout",
         "kind": "top-level",
         "status": "idle",
+        "updated_at": 0,
         "host": host,
         "model": {"kind": "model", "name": "opus"},
         "checkout": {
