@@ -395,3 +395,37 @@ Measured 2026-10-06/07 on the build machine, 300 s split, Sep 9 PDT to 2026-10-0
 **Binds later work:** the re-rank in "Proposals: the next change, ranked by measured minutes saved" reads failure texts from the records' `error` field, not transcripts, and compares the weeks before and after this change.
 
 **Gotchas:** the hints that need live Hana are covered by the fake BRP server only. The fake server projects only requested components, so a test that depends on parents needs the query to ask for `ChildOf`.
+
+### Phase 11 — A view can face its target along the target's own axis · status: done
+
+**Source:** the hana showrunner via natedev, 2026-10-15 16:2x EDT: "hana_shot cannot express 'face along the entity's own normal': view yaw and pitch are world angles only (hana_shot.py Pose(focus, yaw, pitch, radius)), so a tilted panel, such as Hana's Frame time panel on the tilted placement disk, cannot be shot face-on from a named view. Add a view option that faces a target entity along its local forward or normal (radius still applies), with a test."
+
+#### Work Order
+
+**Goal:** a stored view or a `shot` call can say "look at this target face-on from its own +z side", and the camera lands square to a tilted panel without anyone working out yaw and pitch.
+
+**Spec:**
+- New view key `face` and `shot` flag `--face`, one of `+x`, `-x`, `+y`, `-y`, `+z`, `-z`: a local axis of the target. The camera sits on that side of the target and looks back along the axis. Bevy's local forward is `-z`, so a panel whose readable side faces its local `+z` uses `face = "+z"`.
+- The script reads the target's `GlobalTransform` over BRP, takes the named axis column of its 3×3 part (x, y, z axes, then translation; see `affine_point`), negates it for a `-` axis, and normalizes it, so scale does not matter. It turns that world direction `d` into orbit angles with Hana's convention (`hana_lagrange` `orbit_transform.rs`: the camera offset from the focus is `rotation * (0, 0, r)` with `rotation = yaw about Y * (-pitch about X)`, so `yaw = atan2(d.x, d.z)`, `pitch = asin(d.y)`, Y up). One pure function maps a transform and an axis to `(yaw, pitch)`. The tests call it directly.
+- `face` works in the two modes that take angles:
+  - `fit`: the derived angles go to `AnimateToFit`, and margin applies as today. Stored views stay fit views where they can, because a fit follows its target.
+  - `pose`: radius applies. The focus defaults to the target's world translation, so `--focus` is optional with `face`, and `pose` with `face` needs a target. An explicit `--focus` still wins.
+  - `face` with `hana-frame` or `home` is refused with a text that names `fit` and `pose`.
+- `face` together with an explicit yaw or pitch (flag, or view key present) is refused: the two disagree. The refusal names both and says to drop one. `Shot` must tell an explicit angle from the default 0, so carry the angles as given, or as derived from the face, without a sentinel number.
+- When `d` is within 1° of straight up or down, yaw is undefined, and Hana's orbit pitch clamp keeps the camera from reaching it. Refuse with a text that says so and suggests `--yaw 0 --pitch 1.55` (or -1.55) as a pose that comes close.
+- The move key that skips an unchanged camera move (`take`, `move_key`) uses the angles derived on this run, so a repeated face view still moves when the target has turned.
+- `views add` stores `face` when it is given and leaves out yaw and pitch. `views check` runs face views like any other. `views show` prints the key. `VIEW_KEYS`, `ViewValue`, `validate_view` and `format_view` learn it; the header comment names it.
+- `pose get/set` is unchanged.
+- `commands/hana_shot.md` documents `face`/`--face` in the list of view keys and flags, with the Frame time example: `face = "+z"` on `tool:FrameTimeInfoPanel`.
+- The timing and invocation records carry `face` when it is set, as an optional field that old records lack. `/shot_report` needs no change.
+
+**Files:**
+- `scripts/hana_shot/hana_shot.py` — `face` key and flag, the axis-to-angles function, the GlobalTransform read, the refusals, the move key, views add/show
+- `scripts/hana_shot/test_hana_shot.py` — the axis-to-angles function on an identity, a yawed, a pitched and a tilted, scaled transform for all six axes (check the round trip: the camera offset built from the returned angles points along `d`); a fake-server fit shot and a pose shot with `face` (the fit event carries the derived angles; the pose mutation carries the target's translation as its focus and the given radius); the refusals for face with yaw or pitch, for hana-frame/home, and for a vertical axis; views add writing `face` without angles; a stored face view loading and validating
+- `commands/hana_shot.md` — the key, the flag and the example
+
+**Workers:** two — `impl` owns `hana_shot.py` and `commands/hana_shot.md`; `test` owns `test_hana_shot.py`. They agree the names of the new function and refusal texts by message first.
+
+**Constraints from prior phases:** failure records carry `error` (Phase 10); every refusal names its next step (Phase 10), and the new refusals follow that rule. The fake BRP server projects only requested components, so a test that reads `GlobalTransform` on the target must have the query ask for it. Python is typed throughout: no `Any`, no file-level ignores. basedpyright reports 0 errors, 0 warnings and 0 notes on each changed .py file.
+
+**Acceptance gate:** `python3 -m unittest discover -s scripts/hana_shot -p 'test_*.py'` passes, and basedpyright is clean on `scripts/hana_shot/hana_shot.py` and `test_hana_shot.py`. A live shot of `tool:FrameTimeInfoPanel` with `--face +z`, in fit mode and in pose mode, shows the panel square to the camera on Hana on port 15797. The unit director takes these shots.
