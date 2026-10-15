@@ -146,7 +146,7 @@ For `cargo-liner`, `bevy_brp`, `obsidian_knife`, or `nateroids`, check `live`
 for affected entries, then run `add` or `supersede`, or record `none — <reason>`.
 The close-out is incomplete until the script succeeds or the reason is
 recorded. Run this after `push_pr_branch_and_merge.sh` too. Print nothing for
-`hana`, `natedev`, or `none`.
+`hana`, `natedev`, `claude`, or `none`.
 </FeatureLogCloseOut>
 
 On success, report a compact aligned summary in a fenced `text` block so columns survive rendering:
@@ -164,6 +164,6 @@ Feature log:      added <title> | superseded <old> → <title> | none — <reaso
 Final state:      <final branch state>
 ```
 
-Omit the `Feature log:` line for `hana`, `natedev`, or `none`.
+Omit the `Feature log:` line for `hana`, `natedev`, `claude`, or `none`.
 
 After the block, add one short sentence listing the validation steps that ran.
