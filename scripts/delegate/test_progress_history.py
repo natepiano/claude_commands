@@ -875,7 +875,7 @@ print('two homes isolated; recorder lock retained; caller restored')
                 "zsh",
                 str(SCRIPT.parents[1] / "message" / "notifier.sh"),
                 "new",
-                f"delegate-{session_dir.name}",
+                f"unit-{session_dir.name}",
                 "--to",
                 "session:test-claude-session",
                 "--every",
@@ -898,7 +898,7 @@ print('two homes isolated; recorder lock retained; caller restored')
         self.assertIn("**now 1970-01-01 05:35:00 - next report 05:50:00**", report)
         state = dict(
             line.split("=", 1)
-            for line in (state_dir / f"delegate-{session_dir.name}" / "state")
+            for line in (state_dir / f"unit-{session_dir.name}" / "state")
             .read_text(encoding="utf-8")
             .splitlines()
         )
@@ -921,7 +921,7 @@ print('two homes isolated; recorder lock retained; caller restored')
                 "zsh",
                 str(SCRIPT.parents[1] / "message" / "notifier.sh"),
                 "new",
-                f"delegate-{session_dir.name}",
+                f"unit-{session_dir.name}",
                 "--to",
                 "session:test-claude-session",
                 "--every",
@@ -958,7 +958,7 @@ print('two homes isolated; recorder lock retained; caller restored')
         self.assertIn("--cap-stage is required", result.stderr)
         state = dict(
             line.split("=", 1)
-            for line in (state_dir / f"delegate-{session_dir.name}" / "state")
+            for line in (state_dir / f"unit-{session_dir.name}" / "state")
             .read_text(encoding="utf-8")
             .splitlines()
         )
@@ -990,7 +990,7 @@ print('two homes isolated; recorder lock retained; caller restored')
                 "zsh",
                 str(SCRIPT.parents[1] / "message" / "notifier.sh"),
                 "new",
-                f"delegate-{session_dir.name}",
+                f"unit-{session_dir.name}",
                 "--to",
                 "session:test-claude-session",
                 "--every",
@@ -1020,7 +1020,7 @@ print('two homes isolated; recorder lock retained; caller restored')
         self.assertIn("say nothing about whether the workers are alive", result.stderr)
         state = dict(
             line.split("=", 1)
-            for line in (state_dir / f"delegate-{session_dir.name}" / "state")
+            for line in (state_dir / f"unit-{session_dir.name}" / "state")
             .read_text(encoding="utf-8")
             .splitlines()
         )
@@ -1460,7 +1460,7 @@ print('two homes isolated; recorder lock retained; caller restored')
                 "zsh",
                 str(SCRIPT.parents[1] / "message" / "notifier.sh"),
                 "new",
-                f"delegate-{session_dir.name}",
+                f"unit-{session_dir.name}",
                 "--to",
                 "session:test-claude-session",
                 "--every",
@@ -1521,7 +1521,7 @@ print('two homes isolated; recorder lock retained; caller restored')
         self.assertEqual(lines[-1], "**now 1970-01-01 05:40:00 - next report 05:55:00**")
         restart = dict(
             line.split("=", 1)
-            for line in (state_dir / f"delegate-{session_dir.name}" / "state")
+            for line in (state_dir / f"unit-{session_dir.name}" / "state")
             .read_text(encoding="utf-8")
             .splitlines()
         )

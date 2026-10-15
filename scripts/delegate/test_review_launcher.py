@@ -367,6 +367,7 @@ class ReviewLauncherPassTests(unittest.TestCase):
         # directory.
         _ = shutil.copy2(DELEGATE_DIR.parent / "lib" / "py", lib / "py")
         _ = shutil.copy2(DELEGATE_DIR.parent / "lib" / "user_zone.py", lib / "user_zone.py")
+        _ = shutil.copy2(DELEGATE_DIR.parent / "lib" / "unit_runs.py", lib / "unit_runs.py")
         for name in (
             "review.sh", "implement.sh", "progress_history.py", "findings.py",
             "board.sh", "worker_name.sh", "worker_state.py",

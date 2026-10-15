@@ -27,6 +27,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "message"))
 from sessions import addressed, live_sessions  # noqa: E402
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
 from user_zone import user_zone
+import unit_runs
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import override_guard
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "build_targets"))
@@ -485,11 +486,12 @@ def owning_session() -> OwningSession | NoOwningSession:
     """Find the session that owns this run before using the shell's session id."""
     run = os.environ.get("PLAN_DELEGATE_BOARD_DIR", "") or os.environ.get("PLAN_DELEGATE_SESSION_DIR", "")
     if run:
-        active = Path(os.environ.get("PLAN_DELEGATE_ACTIVE_DIR", "/tmp/claude/delegate/active"))
-        try:
-            markers = tuple(active.iterdir())
-        except OSError:
-            markers = ()
+        markers: list[Path] = []
+        for active in unit_runs.active_dirs(os.environ.get("PLAN_DELEGATE_ACTIVE_DIR")):
+            try:
+                markers.extend(active.iterdir())
+            except OSError:
+                continue
         matches: list[tuple[int, str]] = []
         for marker in markers:
             try:

@@ -21,7 +21,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Literal, NotRequired, TypedDict, cast, override
 
 SCRIPTS = Path(__file__).resolve().parents[1]
-for _directory in (SCRIPTS / "production", SCRIPTS / "delegate", SCRIPTS / "shutdown", SCRIPTS / "herdr", SCRIPTS / "whoami", SCRIPTS / "message"):
+for _directory in (SCRIPTS / "production", SCRIPTS / "delegate", SCRIPTS / "shutdown", SCRIPTS / "herdr", SCRIPTS / "whoami", SCRIPTS / "message", SCRIPTS / "lib"):
     if str(_directory) not in sys.path:
         sys.path.insert(0, str(_directory))
 
@@ -30,6 +30,7 @@ import remove_workers  # noqa: E402
 from worker_state import worker_ledger  # noqa: E402
 import showrunners  # noqa: E402
 import unit_lookup  # noqa: E402
+import unit_runs  # noqa: E402
 import herdr  # noqa: E402
 import codex_daemon  # noqa: E402
 import process_table  # noqa: E402
@@ -735,31 +736,39 @@ def _production_places(
     return places
 
 
+def _read_run_markers(
+    active: Path, live_session_ids: set[str], by_path: dict[Path, _RunDirector], problems: list[str]
+) -> None:
+    """Add the run each live director's marker names."""
+    if not active.is_dir():
+        return
+    try:
+        markers = list(active.iterdir())
+    except OSError as error:
+        _problem(problems, f"unit run markers in {active}", error)
+        return
+    for marker in markers:
+        if marker.name not in live_session_ids:
+            continue
+        try:
+            lines = marker.read_text(encoding="utf-8").splitlines()
+            if lines and lines[0].strip():
+                by_path[Path(lines[0].strip()).resolve()] = _DirectorSession(marker.name)
+        except (OSError, UnicodeError) as error:
+            _problem(problems, f"unit run marker {marker}", error)
+
+
 def _live_runs(
-    root: Path, live_session_ids: set[str], problems: list[str]
+    roots: tuple[Path, ...], live_session_ids: set[str], problems: list[str]
 ) -> list[_LiveRun]:
     by_path: dict[Path, _RunDirector] = {}
-    active = root / "active"
-    if active.is_dir():
+    heartbeats: list[Path] = []
+    for root in roots:
+        _read_run_markers(root / "active", live_session_ids, by_path, problems)
         try:
-            markers = list(active.iterdir())
+            heartbeats.extend(root.glob(f"*/{remove_workers.HEARTBEAT}"))
         except OSError as error:
-            _problem(problems, f"delegate markers in {active}", error)
-            markers = []
-        for marker in markers:
-            if marker.name not in live_session_ids:
-                continue
-            try:
-                lines = marker.read_text(encoding="utf-8").splitlines()
-                if lines and lines[0].strip():
-                    by_path[Path(lines[0].strip()).resolve()] = _DirectorSession(marker.name)
-            except (OSError, UnicodeError) as error:
-                _problem(problems, f"delegate marker {marker}", error)
-    try:
-        heartbeats = list(root.glob(f"*/{remove_workers.HEARTBEAT}"))
-    except OSError as error:
-        _problem(problems, f"delegate runs in {root}", error)
-        heartbeats = []
+            _problem(problems, f"unit runs in {root}", error)
     now = time.time()
     for heartbeat in heartbeats:
         try:
@@ -1249,8 +1258,8 @@ def _local_roster(environment: Mapping[str, str]) -> Roster:
     details = _raw_session_details(records, problems)
     registered = _registered_showrunners(environment, problems)
     runner_ids = _showrunner_ids(records, registered)
-    root = Path(environment.get("ROSTER_DELEGATE_ROOT", "/tmp/claude/delegate"))
-    runs = _live_runs(root, {record["sessionId"] for record in records}, problems)
+    roots = unit_runs.run_roots(environment.get("ROSTER_DELEGATE_ROOT"))
+    runs = _live_runs(roots, {record["sessionId"] for record in records}, problems)
     workers = _ledger_workers(runs, records, problems)
     production_places = _production_places(
         records, details, registered, runner_ids, set(workers), problems
