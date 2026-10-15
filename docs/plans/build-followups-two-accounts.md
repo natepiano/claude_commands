@@ -1003,3 +1003,42 @@ After a worker launch's own turn has ended, a move to the selected seats home th
 **Gotchas:** codex_mesh's idle stop deletes the run's `mesh_server.json`, so a stopped server leaves no record of its home in the run folder.
 
 **Ruled out:** retiring the server record into `mesh_retired.json` in codex_mesh instead of the roster fallback.
+
+### Phase 28 — Status line colors  · status: done
+
+**Depends on:** Phase 22
+
+#### Work Order
+
+**Goal:** the status line shows each role and each account in its own color, and colors the token count and the 5-hour and weekly percentages green, yellow or red as they near their limits (the user, via the showrunner, 2026-10-15 16:4x EDT).
+
+**Constraints from prior phases:** `statusline.sh` is sourced by `settings.json`'s `statusLine` command with `statusline` set to its folder; it reads its inputs with shell builtins and ends by exec'ing one `jq` process over `statusline.jq` ("Account labels without a space" left the account field as `claude<N>`). It runs several times a second across all sessions, so it starts no other process. Line 1 is `<role> | <account> | <dir> | <tokens> | <model [effort]>`; line 2 is `5-hour <N>% left[ until <time>] | weekly <M>% left[ until <time>]`.
+
+**Spec:**
+
+- **Config:** new `config/statusline.conf`, `key=value` lines, `#` comments and blank lines ignored. Keys and the values it ships with:
+  - `role.showrunner=bright-magenta`, `role.unit-director=bright-blue`, `role.worker=bright-cyan` (a role's key is its text with spaces as hyphens; `unassigned` has no key and stays uncolored);
+  - `account.claude1=cyan`, `account.claude2=magenta`, `account.claude3=blue`, `account.claude4=bright-white` (keyed by the label as shown on the line);
+  - `level.ok=bright-green`, `level.warn=bright-yellow`, `level.alarm=bright-red`;
+  - `tokens.warn=80`, `tokens.alarm=90` (percent of the context window used);
+  - `left.warn=10`, `left.alarm=5` (percent left).
+  Color names are the eight ANSI names and their `bright-` forms (`black`, `red`, `green`, `yellow`, `blue`, `magenta`, `cyan`, `white`: SGR 30–37, bright 90–97). A header comment says what each key does. Green, yellow and red are used only for levels.
+- **Reading it:** `statusline.sh` passes `"$statusline/../../config/statusline.conf"` to jq as `--rawfile colors`, `/dev/null` when it is unreadable, still one process and no new builtin loop. `statusline.jq` parses it. A missing file, an unknown key, an unknown color name or a threshold that is not a number leaves that piece uncolored; nothing errors and the uncolored text is exactly today's line.
+- **Colors on the line:** each colored field is wrapped as `ESC[<code>m<text>ESC[0m`; the ` | ` separators, the directory, the model, the labels `5-hour` and `weekly` and the ` until <time>` parts stay uncolored.
+  - Role: its `role.*` color.
+  - Account: its `account.*` color.
+  - Tokens: `used = total_input_tokens * 100 / context_window_size` (both from `.context_window`; Claude Code 2.1.296 sets `total_input_tokens` to the current context, input plus cache, and `context_window_size` to the model's window). `level.alarm` when `used >= tokens.alarm`, `level.warn` when `used >= tokens.warn`, else `level.ok`. No positive window size: uncolored.
+  - `<N>% left` for 5-hour and for weekly, judged on the integer shown: `level.alarm` when `N <= left.alarm`, `level.warn` when `N <= left.warn`, else `level.ok`.
+- **Docs:** a `config/README.md` entry for `statusline.conf`; `statusline.jq`'s header comment names the colors and the config.
+
+**Files:**
+
+- `config/statusline.conf` — new.
+- `config/README.md` — its entry.
+- `scripts/statusline/statusline.sh` — passes the config.
+- `scripts/statusline/statusline.jq` — parses the config, colors the fields.
+- `scripts/statusline/test_statusline.py` — tests.
+
+**Workers:** impl writes the config, `config/README.md`, `statusline.sh` and `statusline.jq`; test writes `test_statusline.py`, reading the others.
+
+**Acceptance gate:** tests show each role and each account in its color and `unassigned` and an unknown account uncolored; the token level on each side of 80% and 90% (79/80, 89/90) and with no window size; each window's level at 11/10 and 6/5 percent left; a missing config, a bad color name and a non-numeric threshold giving the uncolored line; and, with ANSI codes stripped, both lines equal to today's output for the same input. The shipped config's thresholds and colors are the ones above. The suite and basedpyright pass, and a live run of the settings command over a sample status JSON shows the colors.
