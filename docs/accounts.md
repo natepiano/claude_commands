@@ -114,11 +114,13 @@ Never `/logout` in a unit director's session: every unit on that account stops w
 In this terminal:
 
 ```sh
-~/.claude/scripts/lib/py ~/.claude/scripts/accounts/accounts.py move <session-id-or-exact-name> <target> [--dry-run] [--why "<text>"]
-~/.claude/scripts/lib/py ~/.claude/scripts/accounts/accounts.py move units|showrunners <target> [--dry-run] [--why "<text>"]
+~/.claude/scripts/lib/py ~/.claude/scripts/accounts/accounts.py move <session-id-or-exact-name> <target> [--dry-run] [--no-alert] [--why "<text>"]
+~/.claude/scripts/lib/py ~/.claude/scripts/accounts/accounts.py move units|showrunners <target> [--dry-run] [--no-alert] [--why "<text>"]
 ```
 
 The first form moves one local ungrouped session, found by id, else by exact name. The second selects the group's account for future launches and moves every live member not already on it. An empty group still selects its account (`<group>: no live session moves`); an open shutdown receives no duplicate request. A session can request its own move, then mark ready and end its turn.
+
+Use `--no-alert` for live checks to suppress shutdown alerts. With `--dry-run`, it also prints the planned shutdown commands with `--no-alert`.
 
 ### Preview
 

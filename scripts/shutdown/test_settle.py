@@ -1304,15 +1304,58 @@ class SettleTests(ShutdownTestCase):
     def test_pause_message_starts_with_a_fixed_line_and_asks_for_a_stop_at_once(self) -> None:
         moving = session_shutdown(unit("unit", "Unit"))
         moving["target"], moving["why"] = "claude1", "out of usage"
-        first, body = settle._settle_text(moving, moving["session"]).split("\n\n", 1)  # pyright: ignore[reportPrivateUsage]
+        first, body = settle._settle_text(moving, moving["session"]).split("\n", 1)  # pyright: ignore[reportPrivateUsage]
         self.assertTrue(first.startswith("Pause for move: claude2 → claude1 (out of usage, "), first)
         self.assertIn("Stop now, without finishing the step you are in", body)
         self.assertIn("shutdown.py ready --where", body)
         self.assertIn("You will be resumed on claude1 with that line", body)
         self.assertNotIn("let any worker turn", body)
         stopping = session_shutdown(top_level("owner", "Owner"))
-        first, _ = settle._settle_text(stopping, stopping["session"]).split("\n\n", 1)  # pyright: ignore[reportPrivateUsage]
+        first = settle._settle_text(stopping, stopping["session"]).splitlines()[0]  # pyright: ignore[reportPrivateUsage]
         self.assertTrue(first.startswith("Pause for stop: claude2 (requested by the user, "), first)
+
+    def assert_pause_confirmation(self, saved: record.SessionShutdown, first_line: str,
+                                  citation: str, operation: str) -> None:
+        with patch.object(settle, "_user_time", return_value="Fri 2:49 PM"):
+            text = settle._settle_text(saved, saved["session"])  # pyright: ignore[reportPrivateUsage]
+        lines = text.splitlines()
+        self.assertEqual(lines[0], first_line)
+        confirmation = lines[1]
+        self.assertEqual(confirmation, settle.pause_confirmation_line(saved))
+        self.assertIn("the shutdown the user started", confirmation)
+        self.assertIn(citation, confirmation)
+        self.assertIn("not from another session's own choice", confirmation)
+        self.assertIn("run in this terminal:", confirmation)
+        self.assertIn("~/.claude/scripts/lib/py ~/.claude/scripts/shutdown/shutdown.py status claude2 --here",
+                      confirmation)
+        self.assertTrue(confirmation.endswith(f"It lists this session under the {operation}."), confirmation)
+        self.assertNotIn(saved["login"], text)
+        self.assertEqual(lines[2], "")
+        self.assertTrue(lines[3].startswith("Stop now, without finishing the step you are in"), lines[3])
+        self.assertIn("shutdown.py ready --where", lines[3])
+
+    def test_move_pause_confirms_user_request_by_canonical_account_before_stop_instructions(self) -> None:
+        for owner in (top_level("owner", "Owner", status="busy"),
+                      unit("unit", "Unit", status="busy"), showrunner("runner", "Runner")):
+            with self.subTest(kind=owner["kind"]):
+                owner["status"] = "busy"
+                saved = session_shutdown(owner, then="restart")
+                saved["label"] = "claude 2"
+                saved["target"], saved["why"] = "claude1", "out of usage"
+                self.assert_pause_confirmation(saved,
+                    "Pause for move: claude 2 → claude1 (out of usage, Fri 2:49 PM)",
+                    'docs/accounts.md, "Move a session"', "move")
+
+    def test_stop_pause_confirms_user_request_by_canonical_account_before_stop_instructions(self) -> None:
+        for owner in (top_level("owner", "Owner", status="busy"),
+                      unit("unit", "Unit", status="busy"), showrunner("runner", "Runner")):
+            with self.subTest(kind=owner["kind"]):
+                owner["status"] = "busy"
+                saved = session_shutdown(owner)
+                saved["label"] = "claude 2"
+                self.assert_pause_confirmation(saved,
+                    "Pause for stop: claude 2 (requested by the user, Fri 2:49 PM)",
+                    "docs/as-built/shutdown-and-restart.md", "stop")
 
     def unit_for_showrunner(self, then: record.ShutdownContinuation = "restart") -> record.SessionShutdown:
         owner = unit("unit", "Unit")

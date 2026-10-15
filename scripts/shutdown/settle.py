@@ -616,6 +616,17 @@ PAUSE_FOR_MOVE = "Pause for move"
 PAUSE_FOR_STOP = "Pause for stop"
 
 
+def pause_confirmation_line(record: SessionShutdown) -> str:
+    """Name the request's source and its local status check."""
+    moving = bool(record.get("target", ""))
+    reference = 'docs/accounts.md, "Move a session"' if moving else "docs/as-built/shutdown-and-restart.md"
+    command = shutdown_command("status", note_file.canonical_label(record["label"]), "--here")
+    return (
+        f"This request comes from the shutdown the user started ({reference}), not from another session's own choice. "
+        f"To confirm it, run in this terminal: {command}. It lists this session under the {'move' if moving else 'stop'}."
+    )
+
+
 def _settle_text(record: SessionShutdown, session: Session) -> str:
     """The pause message: a fixed first line the launching skills react to, then what to do now.
 
@@ -643,7 +654,7 @@ def _settle_text(record: SessionShutdown, session: Session) -> str:
         where = '"<what you were doing and what comes next>"'
         started = "stop or name anything you started that keeps running"
         ending = " and end your turn"
-    return first_line + "\n\n" + (
+    return first_line + "\n" + pause_confirmation_line(record) + "\n\n" + (
         f"Stop now, without finishing the step you are in, and start nothing new. Leave uncommitted work in place, "
         f"{started}, then in this terminal run {command}{where}`{ending}. "
         f"You will be resumed {'on ' + target + ' ' if target else ''}with that line and continue from it."

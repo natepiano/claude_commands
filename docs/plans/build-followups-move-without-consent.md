@@ -29,34 +29,26 @@
 
 ### Phase 1 — An idle session needs no consent  · status: done
 
-#### Work Order
+#### As-built
 
-**Goal:** a move or stop never waits on an idle session: idle before the pause stops it with no message, and idle after the pause counts as ready.
-
-**Spec:**
-- In `next_step` (`scripts/shutdown/settle.py`), for progress `waiting` with a matching-session owner, apply the conditions the ready path already uses (session `status == "idle"`, every seat idle, `blocker(owner["session"])["kind"] == "clear"`, `not _showing_form(owner["session"])`):
-  - **Idle before the pause:** `settle_message` is `not sent` → `StopSession()` and no message is sent. Record `where` as `WhereSaid` with the text `idle; nothing in progress`.
-  - **Idle after the pause:** `settle_message` is `sent`, no ready mark came, and the registry's `updatedAt` is later than the message's `at` → `StopSession()`. Record `where` as `WhereSaid` with the text `idle after the pause message; no ready line`.
-  - A busy session keeps today's path: pause message, re-ask after `REASK_AFTER`, holdout alert at `NOT_ANSWERING_AFTER` when `alerts == "user"`.
-  - A requester still goes last (`_is_requester` check stays before this).
-- `updatedAt`: carry the registry's `updatedAt` (ms, already read by `scripts/message/sessions.py`) into inventory's `Session` as `updated_at: int`, parsed with the other wire fields (~711) and required like `status`.
-- Write `where` in the same record update that moves progress to stopping, so the resume prompt carries the line.
+- `settle.next_step` stops a waiting, matching session that is idle (session and every worker idle, `blocker(...)["kind"] == "clear"`, no form showing): with `settle_message` `not sent` or `queued` it returns `StopSession("idle; nothing in progress")` and sends no pause message; with `settle_message` `sent` and the registry's `updated_at` strictly later than the message's `at` it returns `StopSession("idle after the pause message; no ready line")`. A form, a non-clear blocker (unpushed work included) or a busy worker still holds, and a busy session keeps the pause, re-ask and holdout path.
+- `StopSession` carries `idle_reason: stop.IdleStopReason` (default `"not an idle stop"`); `IdleStopReason` is a `Literal` of that default and the two idle texts.
+- `stop.stop_session(record, *, idle_reason=...)` writes a non-default reason as the stopping claim's `where` (`{"kind": "said", ...}`) in the same record update that moves progress to stopping. `_stop_owner` admits a `waiting` prior only for an idle reason, and still runs fresh idle, worker and blocker checks.
+- The conductor sends no holdout alert for a `StopSession` step.
+- `inventory.SessionFields.updated_at: int` holds the registry's `updatedAt` in ms. `parse_session(..., require_updated_at=False)` defaults a missing value to 0; `parse_inventory` requires it.
 
 **Files:**
-- `scripts/shutdown/settle.py` — `next_step` idle rules; where the stop step records `where`.
-- `scripts/shutdown/inventory.py` — `Session.updated_at` and its wire parse.
-- `scripts/shutdown/test_settle.py` — the new cases.
-- `scripts/shutdown/test_inventory.py` — `updated_at` parse.
+- `scripts/shutdown/settle.py` — `next_step` idle rules; `StopSession.idle_reason`.
+- `scripts/shutdown/stop.py` — `IdleStopReason`, `stop_session`, the `_stop_owner` waiting-prior guard.
+- `scripts/shutdown/inventory.py` — `SessionFields.updated_at` and its parse.
 
-**Workers:** `1 writer + 1 tester` — code in two modules, tests beside them.
-- `impl` — `settle.py`, `inventory.py`; hub: `settle.py`.
-- `test` — `test_settle.py`, `test_inventory.py`, written from the Spec alone.
+**Binds later work:** idle sessions get no pause message, so pause text reaches only busy sessions. The stop reasons `idle; nothing in progress` and `idle after the pause message; no ready line` are what a live check reads in the stopping claim's `where`. Test fixtures carry `updated_at` and the `workers` names (`MatchingSession.workers`, `inventory.WorkerSession`, kind `"worker"`).
 
-**Constraints from prior phases:** none (first phase of this run). The account-move run shipped `begin`'s reaping path for sessions that stopped taking prompts; leave it as is.
+**Gotchas:** `updated_at` equal to or before the pause time is not an answer; only a strictly later value counts. Saved records without `updated_at` parse as 0.
 
-**Acceptance gate:** `python3 -m unittest discover -s scripts/shutdown -p 'test_*.py' </dev/null` and the same for `scripts/accounts`, `scripts/lib`, `scripts/production`, `scripts/whoami` green; `basedpyright scripts/shutdown/settle.py scripts/shutdown/inventory.py` ends `0 errors, 0 warnings, 0 notes`. Tests, one per case: (1) idle before any message stops, sends nothing, `where` is the idle line; (2) pause sent, idle with `updated_at` after the message stops with the after-pause line; (3) pause sent, still busy re-asks, holds, and alerts at `NOT_ANSWERING_AFTER` only with alerts `user`; (4) idle with `updated_at` before the message is not an answer; (5) a form showing or a non-clear blocker still holds. At checkpoint the unit director also folds **Recorded results** into `docs/as-built/shutdown-and-restart.md`, replacing the "Not yet run: the Ghostty leg" sub-bullet.
+### Phase 2 — The pause names its own check; `move --no-alert`  · status: done
 
-### Phase 2 — The pause names its own check; `move --no-alert`  · status: todo
+**Depends on:** Phase 1
 
 #### Work Order
 
@@ -64,7 +56,7 @@
 
 **Spec:**
 - The unit director merges `origin/build-followups` first, after message-clarity's holdout text lands.
-- `_settle_text`: after the first line, one line: `This is the shutdown's own request (docs/accounts.md, Move a session); to confirm, in this terminal: ~/.claude/scripts/lib/py ~/.claude/scripts/shutdown/shutdown.py status <login> --here — it lists this session under the move.` Built with `shutdown_command("status", record["login"], "--here")`. For a `Pause for stop`, say `under the stop` and cite `docs/as-built/shutdown-and-restart.md`.
+- `_settle_text`: after the first line, one line (wording from message-clarity): `This request comes from the shutdown the user started (docs/accounts.md, "Move a session"), not from another session's own choice. To confirm it, run in this terminal: <command>. It lists this session under the move.` `<command>` is `shutdown_command("status", note_file.canonical_label(record["label"]), "--here")`: the account label, never the login. For a `Pause for stop`, say `under the stop` and cite `docs/as-built/shutdown-and-restart.md`.
 - `accounts.py move`, single and group, takes `--no-alert` and appends `--no-alert` to each `shutdown.py down` argv in `move_sessions`; `move_group` passes it through. `docs/accounts.md` "Move a session" shows the flag in both usage lines and says it is for live checks.
 
 **Files:**
@@ -77,19 +69,21 @@
 - `impl` — `settle.py`, `accounts.py`, `docs/accounts.md`; hub: `accounts.py`.
 - `test` — `test_settle.py` (pause line for move and stop), `test_account_move.py` (`--no-alert` reaches each `down` argv, single and group; absent without the flag).
 
-**Constraints from prior phases:** Phase 1's idle rules.
+**Constraints from prior phases:** Phase 1: an idle session (pause not sent or queued, or its registry `updated_at` later than a sent pause) is stopped with no pause message, so the new line reaches busy sessions only. The merge branch names an owner's workers `workers` (`MatchingSession.workers`, `inventory.WorkerSession`); `inventory.SessionFields` fixtures carry `updated_at`. `move_sessions` builds each `down` argv with `_shutdown_argv("down", source, "--here", "--only", …)` (`accounts.py` ~2268).
 
 **Acceptance gate:** the five suites green; basedpyright clean on changed files. The new pause line goes to message-clarity for wording before checkpoint.
 
 ### Phase 3 — Live check without consent  · status: todo
+
+**Depends on:** Phase 1, Phase 2
 
 #### Work Order
 
 **Goal:** on natedev, an idle Ghostty session moves with no pause message and a declining tmux session is stopped once idle, with no push.
 
 **Spec:** unit director only, installed main after the merge, throwaway Haiku sessions in `/home/natepiano/postmaster`, every command with `--no-alert`:
-1. Idle Ghostty session (launched as in **Recorded results**): `accounts.py move <id> claude1 --no-alert`. Expect no pause message in its transcript, stop and restart within seconds, the same KWin window id, desktop and size, the same shell and supervisor, codeword recalled.
-2. Tmux session asked by message to decline any hand-off: move it with `--no-alert`. Expect it to answer, go idle, and be stopped as after-pause idle, with no push.
+1. Idle Ghostty session (launched as in **Recorded results**): `accounts.py move <id> claude1 --no-alert`. Expect no pause message in its transcript, the stop recorded as `idle; nothing in progress`, stop and restart within seconds, the same KWin window id, desktop and size, the same shell and supervisor, codeword recalled.
+2. Tmux session asked by message to decline any hand-off: move it with `--no-alert`. Expect it to answer, go idle, and be stopped with `idle after the pause message; no ready line`, with no push.
 3. Clean up with `down claude1 --only <ids> --here --no-alert`, close the windows, delete logs. Record results in the as-built Results.
 
 **Files:**
