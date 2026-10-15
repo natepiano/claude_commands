@@ -71,6 +71,9 @@ class MoveFollower(Protocol):
     def follow(self, login: str, request_id: str) -> int: ...
 
 
+MoveAlerts = Literal["user", "none"]
+
+
 # Shared means Claude Code reads the entry as user content or cross-session
 # state. Everything not listed here stays private to one account.
 SHARED = (
@@ -161,7 +164,7 @@ CODEX_ROLE = "workers"
 # A table cell with nothing to show: the folder has no login, or is not set up.
 NO_VALUE = "—"
 TABLE_HEADINGS = (
-    "Folder", "Label", "Login", "Role", "5-hour left", "5-hour resets", "Weekly left", "Weekly resets",
+    "Folder", "Label", "Login", "Role", "Weekly left", "Weekly resets",
     "On credits", "Credits left", "Read",
 )
 # A stored reading older than this is read again before the table shows it.
@@ -411,6 +414,7 @@ class CommandLine(argparse.Namespace):
     since: str = ""
     until: str = ""
     dry_run: bool = False
+    alerts: MoveAlerts = "user"
     claude_args: list[str] = []
     session: str = ""
     source: str = ""
@@ -2219,7 +2223,13 @@ class SessionMoveRefused:
     returncode: int = 1
 
 
-def move_sessions(ids: tuple[str, ...], target: str, *, why: str, origin: MoveOrigin, move_id: str = "") -> tuple[SessionMoveRequested | SessionMoveRefused, ...]:
+def _move_down_argv(source: str, ids: tuple[str, ...], target: str, why: str, alerts: MoveAlerts) -> tuple[str, ...]:
+    """Build the selected move's shutdown command, including its alert policy."""
+    return _shutdown_argv("down", source, "--here", "--only", ",".join(ids),
+        "--restart", "--to", target, "--why", why) + (("--no-alert",) if alerts == "none" else ())
+
+
+def move_sessions(ids: tuple[str, ...], target: str, *, why: str, origin: MoveOrigin, move_id: str = "", alerts: MoveAlerts = "user") -> tuple[SessionMoveRequested | SessionMoveRefused, ...]:
     """Start one selected shutdown for each source login and report each owner's record."""
     target = numbered_account_label(target, "claude").label
     from uuid import uuid4
@@ -2266,8 +2276,8 @@ def move_sessions(ids: tuple[str, ...], target: str, *, why: str, origin: MoveOr
             groups.setdefault(found.login, []).append(session_id)
         for login, selected_ids in groups.items():
             source = account.label_for("Claude", login)
-            command = _shutdown_argv("down", source, "--here", "--only", ",".join(selected_ids),
-                "--restart", "--to", target, "--why", why, "--move-id", transition_id, *move_origin_arguments(origin))
+            command = (*_move_down_argv(source, tuple(selected_ids), target, why, alerts),
+                "--move-id", transition_id, *move_origin_arguments(origin))
             try:
                 prior_requests = {(entry.get("request_id", entry["move_id"]), entry["subject"]) for entry in moves.read_moves()
                                   if entry["kind"] == "requested"}
@@ -2420,6 +2430,17 @@ def move_preview_line(member: ListedSession, now: datetime) -> str:
     return f"{member.name}: {member.session_id} · {plan}"
 
 
+def _move_preview_commands(members: list[ListedSession], target: str, why: str, alerts: MoveAlerts) -> tuple[str, ...]:
+    """Show the planned shutdown commands when a preview suppresses alerts."""
+    if alerts == "user":
+        return ()
+    groups: dict[str, list[str]] = {}
+    for member in members:
+        groups.setdefault(member.login, []).append(member.session_id)
+    return tuple(shlex.join(_move_down_argv(account.label_for("Claude", login), tuple(ids), target, why, alerts))
+                 for login, ids in groups.items())
+
+
 def follow_move(login: str, request_id: str) -> int:
     """Follow a local move request using shutdown's archive-aware trail reader."""
     sys.path.insert(0, str(SCRIPTS / "shutdown"))
@@ -2459,7 +2480,7 @@ def _move_output(results: tuple[SessionMoveRequested | SessionMoveRefused, ...],
     return stdout, stderr, code
 
 
-def move_group(group: ClaudeGroup, target: str, *, dry_run: bool = False, why: str = "") -> GroupMoveStarted | GroupMoveStartFailed | GroupMoveDryRun | MoveRefused:
+def move_group(group: ClaudeGroup, target: str, *, dry_run: bool = False, why: str = "", alerts: MoveAlerts = "user") -> GroupMoveStarted | GroupMoveStartFailed | GroupMoveDryRun | MoveRefused:
     """Select the group after target checks, then hand each owner to shutdown."""
     sys.path.insert(0, str(SCRIPTS / "shutdown"))
     target = note_file.canonical_label(target)
@@ -2484,10 +2505,11 @@ def move_group(group: ClaudeGroup, target: str, *, dry_run: bool = False, why: s
             for runner in inventory.unregistered_showrunners(members, registrations=registrations))
     if dry_run:
         return GroupMoveDryRun(ids, (*checked.notices, f"{group}: would select {target}",
-            *(move_preview_line(item, now) for item in selected), *notices))
+            *(move_preview_line(item, now) for item in selected),
+            *_move_preview_commands(selected, target, reason, alerts), *notices))
     previous_target = group_label(group_accounts(), group)
     transition = set_group_account(group, target, why=reason)
-    results = move_sessions(ids, target, why=reason, origin=transition.origin, move_id=transition.move_id) if ids else ()
+    results = move_sessions(ids, target, why=reason, origin=transition.origin, move_id=transition.move_id, alerts=alerts) if ids else ()
     stdout, stderr, code = _move_output(results, (*checked.notices, *notices), group, previous_target)
     outcome = GroupMoveStartFailed if code else GroupMoveStarted
     return outcome(ids, target, stdout, stderr, code)
@@ -2502,18 +2524,18 @@ def session_on_account(session: ListedSession, label: str) -> bool:
 
 
 @overload
-def move(session: str, target: str, *, dry_run: Literal[False] = False, why: str = "") -> MoveStarted | MoveStartFailed | MoveRefused: ...
+def move(session: str, target: str, *, dry_run: Literal[False] = False, why: str = "", alerts: MoveAlerts = "user") -> MoveStarted | MoveStartFailed | MoveRefused: ...
 
 
 @overload
-def move(session: str, target: str, *, dry_run: Literal[True], why: str = "") -> MoveDryRun | MoveRefused: ...
+def move(session: str, target: str, *, dry_run: Literal[True], why: str = "", alerts: MoveAlerts = "user") -> MoveDryRun | MoveRefused: ...
 
 
 @overload
-def move(session: str, target: str, *, dry_run: bool, why: str = "") -> MoveStarted | MoveStartFailed | MoveDryRun | MoveRefused: ...
+def move(session: str, target: str, *, dry_run: bool, why: str = "", alerts: MoveAlerts = "user") -> MoveStarted | MoveStartFailed | MoveDryRun | MoveRefused: ...
 
 
-def move(session: str, target: str, *, dry_run: bool = False, why: str = "") -> MoveStarted | MoveStartFailed | MoveDryRun | MoveRefused:
+def move(session: str, target: str, *, dry_run: bool = False, why: str = "", alerts: MoveAlerts = "user") -> MoveStarted | MoveStartFailed | MoveDryRun | MoveRefused:
     """Move one local ungrouped owner after read-only destination checks."""
     target = note_file.canonical_label(target)
     sys.path.insert(0, str(SCRIPTS / "shutdown"))
@@ -2545,10 +2567,11 @@ def move(session: str, target: str, *, dry_run: bool = False, why: str = "") -> 
             return MoveRefused(f"{owner.name} is already on {checked.destination.label}")
         if any(saved["session"]["session_id"] == owner.session_id for saved in record.all_session_records()):
             return MoveRefused(f"{owner.name} already has a shutdown in progress")
-        if dry_run:
-            return MoveDryRun(owner.session_id, (*checked.notices, move_preview_line(owner, now)))
         reason = why or f"{session_account_label(owner)} is out of usage"
-        results = move_sessions((owner.session_id,), target, why=reason, origin=HAND_ORIGIN)
+        if dry_run:
+            return MoveDryRun(owner.session_id, (*checked.notices, move_preview_line(owner, now),
+                *_move_preview_commands([owner], target, reason, alerts)))
+        results = move_sessions((owner.session_id,), target, why=reason, origin=HAND_ORIGIN, alerts=alerts)
         stdout, stderr, code = _move_output(results, checked.notices, owner.session_id, GROUP_NOT_CONFIGURED)
         outcome = MoveStartFailed if code else MoveStarted
         return outcome(owner.session_id, target, stdout, stderr, code)
@@ -2915,19 +2938,17 @@ def _credit_cells(usage: usage_store.StoredUsage, now: datetime) -> tuple[str, s
 def _reading_cells(
     usage: usage_store.StoredUsage | None, now: datetime, zone: tzinfo | None, *, has_credits: bool,
 ) -> tuple[str, ...]:
-    """The cells after the role: both windows, the credits, and when they were read."""
+    """The cells after the role: the weekly window, credits, and when they were read."""
     held = usage or usage_store.StoredUsage()
     read = _read_at(usage)
-    has_no_five_hour_window = "weekly" in held and "five_hour" not in held
     return (
-        *((NO_VALUE, NO_VALUE) if has_no_five_hour_window else _window_cells(held.get("five_hour"), now, zone, "%H:%M %Z")),
         *_window_cells(held.get("weekly"), now, zone, "%a %m-%d %H:%M %Z"),
         *(_credit_cells(held, now) if has_credits else (NO_VALUE, NO_VALUE)),
         NO_VALUE if read is None else read.astimezone(zone).strftime("%H:%M %Z"),
     )
 
 
-NO_READING = (NO_VALUE,) * 7
+NO_READING = (NO_VALUE,) * 5
 
 
 def _table_row(
@@ -3193,6 +3214,7 @@ def _parser() -> argparse.ArgumentParser:
     _ = move_command.add_argument("--from", dest="source", default="")
     _ = move_command.add_argument("--to", dest="target", default="")
     _ = move_command.add_argument("--dry-run", action="store_true")
+    _ = move_command.add_argument("--no-alert", dest="alerts", action="store_const", const="none", default="user")
     _ = move_command.add_argument("--why", default="")
     for action in ("role", "env"):
         command = commands.add_parser(action)
@@ -3235,11 +3257,11 @@ def main(argv: list[str]) -> int:
             if options.session in CLAUDE_GROUPS:
                 if not options.label or options.source or options.target:
                     raise AccountsError("move units|showrunners requires <claudeN>")
-                moved = move_group(options.session, options.label, dry_run=options.dry_run, why=options.why)
+                moved = move_group(options.session, options.label, dry_run=options.dry_run, why=options.why, alerts=options.alerts)
             else:
                 if not options.label or options.source or options.target:
                     raise AccountsError("move requires <session-id|name> <claudeN>")
-                moved = move(options.session, options.label, dry_run=options.dry_run, why=options.why)
+                moved = move(options.session, options.label, dry_run=options.dry_run, why=options.why, alerts=options.alerts)
             if isinstance(moved, MoveRefused):
                 print(moved.reason, file=sys.stderr)
                 return 1

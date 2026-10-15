@@ -81,6 +81,7 @@ def common_session(
         "name": name,
         "cwd": f"/tmp/{session_id}",
         "status": status,
+        "updated_at": 0,
         "model": inventory.NoReplyYet(kind="no reply yet"),
         "checkout": checkout(),
         "run_dirs": list(run_dirs or []),
@@ -286,6 +287,85 @@ class StopTests(ShutdownTestCase):
         )
         self.assertEqual(sent, [signal.SIGTERM])
         self.assertEqual(finished['progress']['kind'], 'stopped')
+
+    def test_idle_authorization_stops_waiting_owner_and_records_where_before_sigterm(self) -> None:
+        reasons: tuple[stop.IdleStopReason, ...] = (
+            "idle; nothing in progress", "idle after the pause message; no ready line",
+        )
+        for index, reason in enumerate(reasons):
+            with self.subTest(reason=reason):
+                owner = top_level(f"idle-owner-{index}", 101 + index)
+                saved = entry(owner, progress="waiting")
+                if reason == "idle after the pause message; no ready line":
+                    saved["settle_message"] = {"kind": "sent", "at": NOW}
+                    owner["updated_at"] = int(NOW_UTC.timestamp() * 1000) + 1
+                self.create([saved])
+                signals: list[tuple[int, int]] = []
+
+                def kill(pid: int, sent_signal: int) -> None:
+                    current = record.find_session(LOGIN, owner["session_id"])
+                    assert current is not None
+                    self.assertEqual(current["progress"], {"kind": "stopping", "at": NOW})
+                    self.assertEqual(current["where"], {"kind": "said", "text": reason, "at": NOW})
+                    signals.append((pid, sent_signal))
+
+                finished = stop.stop_session(saved, idle_reason=reason,
+                    kill=kill, is_alive=lambda _pid: False, session_record_exists=lambda _pid: False,
+                    fresh_inventory=lambda _login, _only: machine_inventory([owner]),
+                    clock=lambda: NOW_UTC, codex_mesh=lambda _args: 0,
+                    tmux=lambda _args: 1, sleep=lambda _seconds: None)
+                self.assertEqual(signals, [(owner["pid"], signal.SIGTERM)])
+                self.assertEqual(finished["progress"], {"kind": "stopped", "at": NOW})
+                self.assertEqual(finished["where"], {"kind": "said", "text": reason, "at": NOW})
+                self.assertEqual(finished["stop_issues"], [])
+
+    def test_waiting_owner_without_idle_authorization_is_not_signalled(self) -> None:
+        owner = top_level("unapproved-owner", 101)
+        saved = entry(owner, progress="waiting")
+        saved["where"] = {"kind": "said", "text": "existing checkpoint", "at": NOW}
+        self.create([saved])
+        finished = stop.stop_session(saved, idle_reason="not an idle stop",
+            kill=lambda _pid, _sent: self.fail("waiting owner was signalled without idle authorization"),
+            is_alive=lambda _pid: False, session_record_exists=lambda _pid: False,
+            fresh_inventory=lambda _login, _only: machine_inventory([owner]),
+            clock=lambda: NOW_UTC, codex_mesh=lambda _args: self.fail("resources were stopped"),
+            tmux=lambda _args: self.fail("host was stopped"), sleep=lambda _seconds: None)
+        self.assertEqual(finished["progress"]["kind"], "stop failed")
+        self.assertEqual(finished["stop_issues"], [record.NotReadyToStop(
+            kind="not ready to stop", at=NOW, status="idle", progress="waiting")])
+        self.assertEqual(finished["where"], saved["where"])
+
+    def test_idle_authorization_rechecks_fresh_owner_and_workers_before_signalling(self) -> None:
+        reasons: tuple[stop.IdleStopReason, ...] = (
+            "idle; nothing in progress", "idle after the pause message; no ready line",
+        )
+        for index, reason in enumerate(reasons):
+            for obstruction in ("busy owner", "blocked checkout", "busy worker"):
+                with self.subTest(reason=reason, obstruction=obstruction):
+                    owner = top_level(f"changed-owner-{index}-{obstruction}", 101)
+                    saved = entry(owner, progress="waiting")
+                    fresh = copy.deepcopy(owner)
+                    workers: list[inventory.Session] = []
+                    if obstruction == "busy owner":
+                        fresh["status"] = "busy"
+                    elif obstruction == "blocked checkout":
+                        blocked = checkout()
+                        blocked["upstream"] = inventory.Tracking(kind="tracking", ahead=1)
+                        fresh["checkout"] = blocked
+                    else:
+                        worker = worker_session("busy-worker", 102, owner=owner["session_id"])
+                        worker["status"] = "busy"
+                        workers.append(worker)
+                    self.create([saved])
+                    finished = stop.stop_session(saved, idle_reason=reason,
+                        kill=lambda _pid, _sent: self.fail("changed owner was signalled"),
+                        is_alive=lambda _pid: False, session_record_exists=lambda _pid: False,
+                        fresh_inventory=lambda _login, _only: machine_inventory([fresh, *workers]),
+                        clock=lambda: NOW_UTC, codex_mesh=lambda _args: self.fail("resources were stopped"),
+                        tmux=lambda _args: self.fail("host was stopped"), sleep=lambda _seconds: None)
+                    self.assertEqual(finished["progress"]["kind"], "stop failed")
+                    self.assertEqual(finished["stop_issues"], [record.NotReadyToStop(
+                        kind="not ready to stop", at=NOW, status=fresh["status"], progress="waiting")])
 
     def test_reaping_busy_owner_stops_without_ready_but_checks_identity_before_signal(self) -> None:
         owner = top_level("reap-owner", 101, status="busy")

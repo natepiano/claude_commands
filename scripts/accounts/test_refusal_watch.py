@@ -143,7 +143,7 @@ class RefusalWatchTests(unittest.TestCase):
     def owner(self, identity: str, *, host: str = "terminal", label: str = "claude1") -> inventory.Session:
         fields = inventory.SessionFields(session_id=identity, pid=1000 + len(self.owners),
             proc_start="fixture-start", name="owner " + identity, cwd=str(self.home / "checkout"),
-            status="idle", model=inventory.ModelName(kind="model", name="opus-real"),
+            status="idle", updated_at=0, model=inventory.ModelName(kind="model", name="opus-real"),
             checkout=inventory.NotACheckout(kind="not a checkout"),
             run_dirs=[], codex_servers=[], timers=[], config_dir=str(accounts.account_dir(label)))
         if host == "unit":
@@ -1391,7 +1391,7 @@ class RefusalWatchTests(unittest.TestCase):
         _ = self.transcript(owner["session_id"])
         _ = self.cli()
         fields = inventory.SessionFields(session_id="worker-refused", pid=12345, proc_start="fixture-start",
-            name="worker", cwd=owner["cwd"], status="idle", model=owner["model"], checkout=owner["checkout"],
+            name="worker", cwd=owner["cwd"], status="idle", updated_at=0, model=owner["model"], checkout=owner["checkout"],
             run_dirs=[], codex_servers=[], timers=[], config_dir=str(accounts.account_dir("claude1")))
         worker = inventory.WorkerSession(**fields, kind="worker", host=inventory.UnknownHost(kind="unknown"),
             owner=inventory.DirectorOwner(kind="director", session_id=owner["session_id"]))
@@ -1435,7 +1435,7 @@ class RefusalWatchTests(unittest.TestCase):
         transition = accounts.group_transition("showrunners")
         assert isinstance(transition, accounts.GroupTransition)
         move.assert_called_once_with(("first", "second"), "claude3", why="weekly refusal",
-                                     origin=accounts.HandOrigin(), move_id=transition.move_id)
+                                     origin=accounts.HandOrigin(), move_id=transition.move_id, alerts="user")
 
     def test_named_window_without_known_reset_moves(self) -> None:
         _ = self.owner("refused")

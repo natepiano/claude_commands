@@ -74,6 +74,35 @@ class TranscriptReadCounter(io.BufferedReader):
 
 @final
 class InventoryTests(ShutdownTestCase):
+    def test_updated_at_preserves_registry_milliseconds_through_inventory_wire_parse(self) -> None:
+        timestamp = 1_791_563_350_123
+        self.write_session(DESKTOP_PID, DESKTOP_ID, "notes", self.root / "plain", updated_at=timestamp)
+        found = inventory.inventory(TARGET_LOGIN, only=frozenset({DESKTOP_ID}))
+        self.assertEqual(found["sessions"][0]["updated_at"], timestamp)
+        decoded = inventory.parse_inventory(json.dumps(found))
+        self.assertEqual(decoded["sessions"][0]["updated_at"], timestamp)
+
+    def test_updated_at_is_required_and_must_be_an_integer_in_fresh_inventory(self) -> None:
+        found = inventory.inventory(TARGET_LOGIN, only=frozenset({DESKTOP_ID}))
+        values = cast(dict[str, object], cast(object, found["sessions"][0]))
+        for invalid in (True, 12.5, "123", None):
+            with self.subTest(updated_at=invalid):
+                values["updated_at"] = invalid
+                with self.assertRaisesRegex(inventory.InvalidInventory, r"updated_at"):
+                    _ = inventory.parse_inventory(json.dumps(found))
+        del values["updated_at"]
+        with self.assertRaisesRegex(inventory.InvalidInventory, r"updated_at"):
+            _ = inventory.parse_inventory(json.dumps(found))
+
+    def test_shutdown_record_without_updated_at_remains_readable(self) -> None:
+        saved = entry(top_level("legacy-owner"))
+        document = cast(dict[str, object], json.loads(json.dumps(saved)))
+        owner = cast(dict[str, object], document["session"])
+        del owner["updated_at"]
+        parsed = record.parse_session_records(json.dumps([document]))[0]
+        self.assertEqual(parsed["session"]["updated_at"], 0)
+        self.assertEqual(parsed["session"]["session_id"], "legacy-owner")
+
     def test_last_model_skips_trailing_metadata_and_invalid_json(self) -> None:
         transcript = self.root / "metadata.jsonl"
         entries: list[dict[str, object]] = [

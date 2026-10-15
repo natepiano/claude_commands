@@ -23,7 +23,7 @@ The status line's first row shows this session's account label, after its role. 
 | Label | The account's label. A named Claude folder keeps its own label; a Codex home shows the label of its login's note. |
 | Login | The login, `not logged in`, or `not set up` for an account that has a note and is in no folder. |
 | Role | `units` and/or `showrunners` for the selected Claude groups; `workers` for the Codex home in use, `spare` for the other Codex homes. |
-| 5-hour left, Weekly left | Percent of each window left, each with its reset time. A dash when the account has no such window. |
+| Weekly left | Percent of the weekly window left, with its reset time. A dash when the account has no weekly window. |
 | On credits | Codex only: `yes` when a window is used up and the account's credits now pay for the work. |
 | Credits left | Codex only: the credit balance, or `unlimited`. |
 | Read | When those numbers were read. |
@@ -114,11 +114,13 @@ Never `/logout` in a unit director's session: every unit on that account stops w
 In this terminal:
 
 ```sh
-~/.claude/scripts/lib/py ~/.claude/scripts/accounts/accounts.py move <session-id-or-exact-name> <target> [--dry-run] [--why "<text>"]
-~/.claude/scripts/lib/py ~/.claude/scripts/accounts/accounts.py move units|showrunners <target> [--dry-run] [--why "<text>"]
+~/.claude/scripts/lib/py ~/.claude/scripts/accounts/accounts.py move <session-id-or-exact-name> <target> [--dry-run] [--no-alert] [--why "<text>"]
+~/.claude/scripts/lib/py ~/.claude/scripts/accounts/accounts.py move units|showrunners <target> [--dry-run] [--no-alert] [--why "<text>"]
 ```
 
 The first form moves one local ungrouped session, found by id, else by exact name. The second selects the group's account for future launches and moves every live member not already on it. An empty group still selects its account (`<group>: no live session moves`); an open shutdown receives no duplicate request. A session can request its own move, then mark ready and end its turn.
+
+Use `--no-alert` for live checks to suppress shutdown alerts. With `--dry-run`, it also prints the planned shutdown commands with `--no-alert`.
 
 ### Preview
 

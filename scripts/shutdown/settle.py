@@ -14,6 +14,7 @@ from collections.abc import Iterable
 from concurrent.futures import Future, ThreadPoolExecutor, wait, FIRST_COMPLETED
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+from enum import Enum
 from importlib import import_module
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal, Protocol, TypedDict, cast
@@ -25,6 +26,7 @@ for dependency in ("whoami", "message", "notify", "production", "hooks", "lib"):
 
 from account import Account
 import conversation_pause
+import note_file
 from inventory import Inventory, Session, inventory
 import record as store
 from record import SessionShutdown, SessionStopIssue, TimerRestore, ShowrunnerFooter, NoFooter, ShutdownContinuation, ReadinessCheck
@@ -172,6 +174,8 @@ class SendSettleMessage:
 @dataclass(frozen=True)
 class StopSession:
     """The owner can attempt its stop now."""
+
+    idle_reason: stop_work.IdleStopReason = "not an idle stop"
 
 @dataclass(frozen=True)
 class RelaunchSession:
@@ -612,6 +616,17 @@ PAUSE_FOR_MOVE = "Pause for move"
 PAUSE_FOR_STOP = "Pause for stop"
 
 
+def pause_confirmation_line(record: SessionShutdown) -> str:
+    """Name the request's source and its local status check."""
+    moving = bool(record.get("target", ""))
+    reference = 'docs/accounts.md, "Move a session"' if moving else "docs/as-built/shutdown-and-restart.md"
+    command = shutdown_command("status", note_file.canonical_label(record["label"]), "--here")
+    return (
+        f"This request comes from the shutdown the user started ({reference}), not from another session's own choice. "
+        f"To confirm it, run in this terminal: {command}. It lists this session under the {'move' if moving else 'stop'}."
+    )
+
+
 def _settle_text(record: SessionShutdown, session: Session) -> str:
     """The pause message: a fixed first line the launching skills react to, then what to do now.
 
@@ -639,7 +654,7 @@ def _settle_text(record: SessionShutdown, session: Session) -> str:
         where = '"<what you were doing and what comes next>"'
         started = "stop or name anything you started that keeps running"
         ending = " and end your turn"
-    return first_line + "\n\n" + (
+    return first_line + "\n" + pause_confirmation_line(record) + "\n\n" + (
         f"Stop now, without finishing the step you are in, and start nothing new. Leave uncommitted work in place, "
         f"{started}, then in this terminal run {command}{where}`{ending}. "
         f"You will be resumed {'on ' + target + ' ' if target else ''}with that line and continue from it."
@@ -860,10 +875,18 @@ def next_step(saved: SessionShutdown, owner: stop_work.FreshSession,
         if owner["kind"] == "matching session":
             if saved["force"] == "now":
                 return StopSession()
-            if progress in {"ready", "held by usage limit"} and owner["session"]["status"] == "idle" and all(
+            if owner["session"]["status"] == "idle" and all(
                 worker["status"] == "idle" for worker in owner["workers"]
             ) and blocker(owner["session"])["kind"] == "clear" and (progress == "held by usage limit" or not _showing_form(owner["session"])):
-                return StopSession()
+                if progress in {"ready", "held by usage limit"}:
+                    return StopSession()
+                message = saved["settle_message"]
+                if message["kind"] in {"not sent", "queued"}:
+                    return StopSession("idle; nothing in progress")
+                if message["kind"] == "sent":
+                    updated_at = datetime.fromtimestamp(owner["session"]["updated_at"] / 1000, timezone.utc)
+                    if updated_at > datetime.fromisoformat(message["at"]):
+                        return StopSession("idle after the pause message; no ready line")
         if progress == "waiting" and not _is_requester(saved):
             message = saved["settle_message"]
             if message["kind"] == "not sent" or (message["kind"] == "queued" and
@@ -1512,6 +1535,16 @@ def holdout_line(saved: SessionShutdown) -> str:
             f"To stop it now, in a terminal on {saved['machine']}: {command}")
 
 
+class HoldoutKind(Enum):
+    FORM_SHOWN = "shutdown.holdout"
+    UNANSWERED = "shutdown.holdout_unanswered"
+
+    @classmethod
+    def from_reason(cls, reason: str) -> HoldoutKind:
+        details = (detail.strip() for detail in reason.split(","))
+        return cls.FORM_SHOWN if SHOWING_FORM in details else cls.UNANSWERED
+
+
 def _send_holdout_alert(held: list[tuple[SessionShutdown, str]]) -> None:
     """Push every unanswered pause and tell its requester where to act."""
     held = [(saved, reason) for saved, reason in held if saved["progress"]["kind"] == "waiting"]
@@ -1520,16 +1553,11 @@ def _send_holdout_alert(held: list[tuple[SessionShutdown, str]]) -> None:
     summary = "; ".join(f"{'Restart' if saved['then'] == 'restart' else 'Shutdown'} stuck waiting on {saved['session']['name']} session" for saved, _ in held)
     text = "\n".join(holdout_line(saved) for saved, _ in held)
     try:
-        for saved, _ in held:
-            message = saved["settle_message"]
-            since = message["at"] if message["kind"] == "sent" else saved["requested_at"]
-            elapsed = f"{max(0, int((now_utc() - datetime.fromisoformat(since)).total_seconds() // 60))} minutes"
-            command = shutdown_command("now", saved["login"], "--here", "--only", saved["session"]["session_id"])
-            after_stop = "the restart brings it back." if saved["then"] == "restart" else "it stays stopped until restarted."
-            alert_user(render("shutdown.holdout", session=saved["session"]["name"], machine=saved["machine"],
-                              elapsed=elapsed, command=command, after_stop=after_stop,
-                              operation="Restart" if saved["then"] == "restart" else "Shutdown",
-                              request="restart" if saved["then"] == "restart" else "shutdown"),
+        for saved, reason in held:
+            hold = HoldoutKind.from_reason(reason)
+            command = shutdown_command("now", note_file.canonical_label(saved["label"]), "--here", "--only", saved["session"]["session_id"])
+            alert_user(render(hold.value, session=saved["session"]["name"], machine=saved["machine"], command=command,
+                              operation="restart" if saved["then"] == "restart" else "shutdown"),
                        machine="natedev" if local_machine().casefold() == "mac" else "")
     finally:
         _tell_holdout_requesters(held, summary, text)
@@ -1543,12 +1571,12 @@ def _tell_holdout_requesters(held: list[tuple[SessionShutdown, str]], summary: s
         _ = send_message(f"session:{origin}", summary, text, key=f"shutdown-holdout-{held[0][0]['login']}")
 
 
-def _stop_after_telling(saved: SessionShutdown) -> SessionShutdown:
+def _stop_after_telling(saved: SessionShutdown, idle_reason: stop_work.IdleStopReason = "not an idle stop") -> SessionShutdown:
     try:
         tell_showrunner_stopping(saved)
     except Exception as error:
         print(f"{saved['session']['name']}: showrunner not told of the stop: {error}", file=sys.stderr)
-    return stop_work.stop_session(saved)
+    return stop_work.stop_session(saved, idle_reason=idle_reason)
 
 
 def _archive_finished(saved: SessionShutdown) -> bool:
@@ -1714,7 +1742,7 @@ def _conduct_owned(login: str, archived: dict[str, SessionShutdown]) -> None:
                                 continue
                             saved = updated
                         step = next_step(saved, owner, records, now_utc())
-                        if due and _holdout_due(saved, now_utc()):
+                        if due and not isinstance(step, StopSession) and _holdout_due(saved, now_utc()):
                             reason = hold_reason(saved, owner)
                             if _reserve_holdout_alert(saved, now_utc()):
                                 holdouts.append((saved, reason))
@@ -1726,7 +1754,7 @@ def _conduct_owned(login: str, archived: dict[str, SessionShutdown]) -> None:
                                 messages[session_id] = notifications.submit(_send_settle_message, saved)
                         elif isinstance(step, StopSession):
                             attempted.add((session_id, type(step)))
-                            future = executor.submit(_stop_after_telling, saved)
+                            future = executor.submit(_stop_after_telling, saved, step.idle_reason)
                             pending[session_id] = PendingSessionAction(saved, step, future)
                         elif isinstance(step, RelaunchSession):
                             attempted.add((session_id, type(step)))
