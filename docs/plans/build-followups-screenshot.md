@@ -48,7 +48,7 @@ The user, via natedev, 2026-10-06 13:1x PDT: "create a long running unit directo
   - `scripts/hana_shot/hana_shot.py`, `test_hana_shot.py`, `commands/hana_shot.md` — Phase 3 recording
   - the `buildlog hourly` call site in `scripts/buildlog/` — Phase 4 (one call, like `rust_release.py`'s)
   - outside the repository: `~/.local/state/screenshot-analysis/` (history, scan cache, seed)
-- **Key files:** `~/.local/state/screenshot-analysis/seed/analysis.md` and its scripts; `scripts/hana_shot/hana_shot.py` (`stats`, the timings writer); `scripts/buildlog/` (the hourly entry and how `rust_release.py` hooks in); `commands/builds.md` (the shape of a report command).
+- **Key files:** `~/.local/state/screenshot-analysis/seed/analysis.md` and its scripts; `scripts/hana_shot/hana_shot.py` (`stats`, the timings writer); `scripts/buildlog/` (the hourly entry and how `rust_release.py` hooks in); `commands/build/report.md` (the shape of a report command; it replaced `commands/builds.md`, and it reaches this worktree with the next merge of `build-followups`).
 - **Port:** 15797, for any live Hana smoke. Never the user's default port or another unit's.
 - **Test lanes:** `scripts/shot_report/`, `scripts/hana_shot/`, `scripts/buildlog/` — `test_*.py` beside the scripts.
 - **Test:** `python3 -m unittest discover -s scripts/shot_report -p 'test_*.py'` (plus `-s scripts/hana_shot` and `-s scripts/buildlog` when touched), from the worktree root.
@@ -255,7 +255,7 @@ Measured 2026-10-06/07 on the build machine, 300 s split, Sep 9 PDT to 2026-10-0
 
 ### Phase 6 — Proposals: the next change, ranked by measured minutes saved · status: todo (standing)
 
-**Blocked by:** G1 — the next re-rank waits until Wed 2026-10-14 07:50 PDT.
+**Blocked by:** G1 — the next re-rank waits until Wed 2026-10-14 10:50 EDT (07:50 PDT).
 
 #### Work Order
 
@@ -269,6 +269,7 @@ Measured 2026-10-06/07 on the build machine, 300 s split, Sep 9 PDT to 2026-10-0
   - hana-frame settle (787 ms);
   - magick crops moved to extras' rect;
   - the parked speed plan;
+  - a fit that gets no answer on an open Screen's root (hana, 2026-10-08: the `AnimateToFit` event sent at `scripts/hana_shot/hana_shot.py:763` got no answer in 10 s, four tries, on organon's tip 6751bf6f6 with a stock new Screen open; `--mode hana-frame` on the same root shot in 2 s). The cause is on Hana's side, dated by organon to trunk's assembly staging merges, and trunk traces it after its Phase 86 gates, so it is not this unit's to fix. The tool-side candidate is a failure text that names `--mode hana-frame`; price it from the `failure_reason: timeout` records on fit shots, and drop it if Hana's fix lands first;
   - one shot tool for any BRP app, not only Hana (declined 2026-10-07, below).
 - Send natedev the top proposal only. It holds:
   - the measured cost today, with n;
@@ -293,6 +294,13 @@ Measured 2026-10-06/07 on the build machine, 300 s split, Sep 9 PDT to 2026-10-0
 **Acceptance gate:** each proposal cites a report less than 24 h old whose scan covers every host it uses through a time at or after G1 (`scan_status.json` → `last_success` and `host_coverage`), the covered window and n for every number, both splits when it uses episode time, exact or inferred attempt evidence when it uses kept shots, and the calculation of expected agent-minutes saved per week. A candidate without those inputs is labeled unpriced and ranks below every priced one.
 
 **Declined:** one shot tool for any BRP app, not only Hana (about 1.5 agent-minutes a week, 2026-10-07) — not approved for now; the user approved finding out why long `/hana_shot` episodes run long instead.
+
+**Re-rank 2026-10-14 (after G1):** report from the 15:31 EDT scan (both hosts covered through 15:31 EDT; Mac read finished; Mac Codex transcripts and timings in, Mac Claude transcripts out), window 2026-10-07 13:08 to 2026-10-14 15:31 EDT (7.10 days). All 2,429 shot records came from natedev; the Mac recorded none. 184 failed shots, priced as the time from each failure to the same session's next successful shot (at most 15 min): 151 min in the window, 149 min a week. The error text came from the transcript within 20 s of each record. Ranked by the minutes a fix would save, assuming a failure text that names its fix leaves about 10 s of recovery (the median recovery after the margin refusal, which already names its range):
+1. **Approved by the user 2026-10-15; built as Phase 10. Every failure text names its next step.** It merges the deferred refusal fix with the two largest priced failure groups. Rejected fits (the camera did not move): n=20, 21.8 min. A target that found nothing: n=10, 19.9 min, 18 of them from one stale `entity:` id. Margin out of range: n=15, 10.4 min. Pose without focus and radius, and the view-name format: n=11, 8.3 min. About 53 agent-minutes a week saved, 60 at most.
+2. The parked speed plan: about 2,245 successful shots a week at a median of 0.73 to 0.88 s each, so at most about 8 min a week even if the time is cut by 30%.
+3. Moving magick crops to extras' rect: fit with a rect crop, n=108, takes 1.36 s against 0.75 s with no crop, about 1 min a week. Hana-frame settle: n=39 at a median of 1.09 s, under 1 min a week.
+4. Unpriced: other BRP calls (52 min in long episodes at the 5-min split, but the timelines do not name the BRP calls), and the 107 failed shots with no attributable error text (74 min a week). The proposal records each failure's text so the next re-rank can price that group.
+5. Dropped: the fit-timeout text. All nine timeouts fell on 2026-10-07 and 08, and there have been none since 2026-10-08 12:48 EDT.
 
 **Deferred:** the shot tool's refusals fix (help text for `--margin` 0–0.45 and a fix hint in the "pose needs focus and radius" and "not inside a git worktree; pass --views-file" refusals) — the user, 2026-10-07: "wait a week on the screenshot refusal fix". Deferred, not declined: when G1 clears, re-rank every candidate, this one included, from a week of data and send natedev the top one.
 
@@ -363,3 +371,33 @@ Measured 2026-10-06/07 on the build machine, 300 s split, Sep 9 PDT to 2026-10-0
 - A `timeout` parameter on `Brp.mutate` — it only repeated `Brp.call`'s default.
 - Leaving Ctrl-C on the `KeyboardInterrupt` path — one path for all three signals gives one rule and one exit-code scheme.
 
+
+### Phase 10 — Every `/hana_shot` failure names its next step, and the screenshot report follows the user's zone · status: done
+
+**Depends on:** Phase 9
+
+Approved by the user on 2026-10-15 through the showrunner: "okay - i like the failure fix ... failure records keep their error text - great ... approved". The zone half is the showrunner's addition from the same message. It comes from the 2026-10-14 re-rank under Phase 6.
+
+#### Work Order
+
+**Goal:** an agent whose `/hana_shot` call fails reads the fix in the failure itself and gets its next shot in about one turn. Each failure record keeps its error text, and every time in `/shot_report` follows `~/.claude/config/user_zone.conf`.
+
+**Spec:**
+- Rejected fit (`scripts/hana_shot/hana_shot.py:810`): the message names the fallbacks agents used — `--mode pose` with `--focus`/`--radius`, or a fit on a parent target that has geometry. When the target's nearest ancestor with an AABB can be found from data the run already holds, name it as a ready selector; add no BRP round trip only for the hint.
+- Target found nothing (`:951`): for an `entity:` selector, say that entity ids change when Hana restarts and to select by `name:`, `tool:` or `marker:`. For `name:`/`tool:`, list up to five closest names or kinds from the entities the resolve already read (stdlib `difflib`). When the selector matched several entities, list them with their names, not only their ids.
+- Refusals: `--margin` help (`:2330`) states the range `0 to 0.45` and what the number means. The pose refusal (`:1676`) names the missing flags with an example. The view-name refusals (`:1605`, `:2160`) give a valid example built from the refused name.
+- Each failure's invocation record (`:1527`, `:1545`) gains its error text, as one string field, alongside `failure_reason`. Success records do not change. Old records without the field still read. The shot report needs no change to read it. `commands/hana_shot.md` lists the field.
+- Zone: rename `_pacific` in `scripts/shot_report/shot_report.py` to `_user_time`, and update its test. Build the weekly heading (`:606`) from the zone (`user_zone_name()` or the label). The baseline lines (`:942`, `:943`) keep their fixed instant, Sep 9 00:00 PDT = 2026-09-09T07:00Z, but print it through `_user_time`. After the change, no fixed zone name (Pacific, PDT, PST, Los_Angeles, Eastern, EDT, New_York) remains in `scripts/shot_report/*.py`, `scripts/hana_shot/*.py` or the two command docs. Tests may pin `USER_ZONE`.
+- `changes.json` gains a product change (failure texts) and a measurement change (error text in records), both for natedev and the Mac, effective at the checkpoint. The director appends them at checkpoint.
+
+**Files:**
+- `scripts/hana_shot/hana_shot.py`, `scripts/hana_shot/test_hana_shot.py`, `commands/hana_shot.md`
+- `scripts/shot_report/shot_report.py`, `scripts/shot_report/test_shot_report.py`, `commands/shot_report.md`
+
+**Workers:** 1 writer + 1 tester.
+- `impl`: `scripts/hana_shot/hana_shot.py`, `scripts/shot_report/shot_report.py`, `commands/hana_shot.md`, `commands/shot_report.md`
+- `test`: `scripts/hana_shot/test_hana_shot.py`, `scripts/shot_report/test_shot_report.py`
+
+**Verification:** `python3 -m unittest discover -s scripts/hana_shot -p 'test_*.py'`, `python3 -m unittest discover -s scripts/shot_report -p 'test_*.py'`, and `python3 -m unittest discover -s scripts/lib -p 'test_*.py'` (`test_user_zone` scans every script). Then `basedpyright` on each changed `.py` file, ending `0 errors, 0 warnings, 0 notes`. Run lint once after the last edit and the suites after it.
+
+**Acceptance gate:** a test for each new message (rejected fit, stale entity, closest names, several matches, pose, view name, margin help). A failure record carries its error text and a success record does not. The weekly heading follows a pinned `USER_ZONE`. A grep for the fixed zone names finds none outside the tests' pins. All three suites pass, and basedpyright is clean.
