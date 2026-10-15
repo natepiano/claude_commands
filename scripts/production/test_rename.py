@@ -226,6 +226,11 @@ class ProductionRenameTests(unittest.TestCase):
         _ = self.git("init", "-b", OLD)
         _ = self.git("config", "user.name", "Production Rename Test")
         _ = self.git("config", "user.email", "rename@example.invalid")
+        # The snapshots compare every file, .git included: git's own background gc or maintenance
+        # writing a temporary pack file mid-test is not the rename's doing (seen at load 92).
+        for repo in (self.checkout, self.origin):
+            for key, value in (("gc.auto", "0"), ("maintenance.auto", "false")):
+                _ = self.git("-C", str(repo), "config", key, value)
         _ = self.git("remote", "add", "origin", str(self.origin))
         self.write(self.doc, self.production_doc())
         for unit in UNITS:

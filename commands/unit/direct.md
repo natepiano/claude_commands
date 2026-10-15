@@ -742,7 +742,7 @@ on-disk shapes are:
 | --- | --- | --- |
 | `RepositoryNotEnrolled` | `/sync board` returning `unconfigured` | Owns no reservation; supplies no release argument. |
 | `EnrolledAwaitingFirstTouch` | `/sync board` returning `board_ready` | The registered edit hook still owns first-touch acquisition; supplies no release argument. |
-| `Active` | The edit hook, from a clear check that acquired or already held the scopes | Copies the returned reservation and coordination-run ids, phase, and protected phase-start HEAD; supplies a release argument. |
+| `Active` | A clear check that acquired or already held the scopes: the Codex seat hook, or the checkpoint backstop for a first touch no hook recorded | Copies the returned reservation and coordination-run ids, phase, and protected phase-start HEAD; supplies a release argument. |
 | `CheckpointCommittedAwaitingReleaseConfirmation` | <CheckpointCommit/> step 6, atomically replacing `Active` once that step's commit succeeds | Copies the active fields plus the full object id captured immediately from that commit; supplies a release argument, and resumes only at release confirmation. |
 
 These are
@@ -817,12 +817,17 @@ Do not dispatch until this contract reaches one of its four persisted states.
    | `board_ready` | Persist `EnrolledAwaitingFirstTouch` and proceed without claiming predicted paths. |
    | `ledger_unreadable` | Stop the run; it is never opt-out. |
    | `busy` | Stop with “the ledger is busy, try again” and the exact board command to rerun; do not retry. |
-2. The registered PreToolUse edit hook owns the next transition. A clear check
-   atomically acquires exact `file:` scopes before the edit, then replaces
-   `EnrolledAwaitingFirstTouch` with `Active` from the returned facts. A blocked
-   check refuses the edit and leaves the pending state intact; answer an overlap
-   under <BerthDecisions/>. An unreadable ledger stops without facts. Beyond
-   those answers, do not call `cargo-berth claim` on behalf of a Work Order.
+2. The registered PreToolUse edit hooks own the next transition. A clear check
+   atomically acquires exact `file:` scopes before the edit. A Codex seat's
+   `apply_patch` runs `scripts/hooks/pre-tool-use-berth.py`, which checks under
+   this session's id and replaces `EnrolledAwaitingFirstTouch` with `Active`
+   from the returned facts; a Claude edit's hook protects the paths but writes
+   no state, so a first touch of your own leaves the state for the checkpoint
+   backstop (<CheckpointCommit/> step 5). A blocked check refuses the edit and
+   leaves the pending state intact; a seat reports the refusal to you, and you
+   answer the overlap under <BerthDecisions/>. An unreadable ledger stops
+   without facts. Beyond those answers, do not call `cargo-berth claim` on
+   behalf of a Work Order.
 </CoordinateDelegatedPhaseReservation>
 
 <BerthDecisions>

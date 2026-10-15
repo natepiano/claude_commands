@@ -37,7 +37,17 @@ Loop/verbose only:
    Order; its shrink must be repaired first.
 3. Formatting is covered by <PhaseChecks/>; do not rerun it here.
 4. Mark the phase `status: done`. Never put its commit hash in the plan.
-5. Read and validate
+5. First record a first touch no hook recorded. When the state is still
+   `EnrolledAwaitingFirstTouch`, this checks every path changed since
+   `${SESSION_DIR}/phase_baseline` and writes `Active` from the clear answer;
+   every other state it leaves as it is:
+
+   ```sh
+   phase_reservation.py record-active --session-dir "${SESSION_DIR}"
+   ```
+
+   Exit `1` means the check was refused: answer the overlap it names under
+   `/unit:direct` <BerthDecisions/>, then run it again. Then read and validate
    `${SESSION_DIR}/delegated_phase_reservation_state.json`; never use a value
    remembered from conversation or the harness-session mapping.
 

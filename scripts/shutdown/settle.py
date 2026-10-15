@@ -9,6 +9,7 @@ import shlex
 import socket
 import subprocess
 import sys
+import tempfile
 import time
 from collections.abc import Iterable
 from concurrent.futures import Future, ThreadPoolExecutor, wait, FIRST_COMPLETED
@@ -28,6 +29,7 @@ from account import Account
 import conversation_pause
 import note_file
 from inventory import Inventory, Session, inventory
+from launch_permission import shutdown_state_root
 import record as store
 from record import SessionShutdown, SessionStopIssue, TimerRestore, ShowrunnerFooter, NoFooter, ShutdownContinuation, ReadinessCheck
 from remote import other_machine, run_remote
@@ -53,6 +55,7 @@ SETTLE_RETRY_SECONDS = 300
 # A unit in the middle of /unit:direct answered a pause message in about a minute (2026-10-13).
 REASK_AFTER = timedelta(minutes=2)
 NOT_ANSWERING_AFTER = 2 * REASK_AFTER
+_STOPPABLE_STATUSES = frozenset({"idle", "shell"})
 SHOWING_FORM = "showing a form"
 USAGE_LIMIT_PATTERNS = (
     "hit your session limit",
@@ -809,6 +812,11 @@ def _is_requester(saved: SessionShutdown) -> bool:
     return origin["kind"] == "session" and origin["session_id"] == saved["session"]["session_id"]
 
 
+def stoppable_status(status: str) -> bool:
+    """Whether the owner is at its prompt, including with a background shell."""
+    return status in _STOPPABLE_STATUSES
+
+
 def _hold_details(owner: stop_work.FreshSession, progress: str, *, local_observation: bool = True) -> list[str]:
     """Return observed hold conditions without delivery state."""
     if owner["kind"] == "session account unreadable":
@@ -817,7 +825,7 @@ def _hold_details(owner: stop_work.FreshSession, progress: str, *, local_observa
         return [owner["kind"].removeprefix("session ")]
     session = owner["session"]
     details: list[str] = []
-    if session["status"] != "idle":
+    if session["status"] not in _STOPPABLE_STATUSES:
         details.append(session["status"])
     if session["status"] != "busy" and any(server["busy_workers"] for server in session["codex_servers"]):
         details.append("busy")
@@ -875,18 +883,20 @@ def next_step(saved: SessionShutdown, owner: stop_work.FreshSession,
         if owner["kind"] == "matching session":
             if saved["force"] == "now":
                 return StopSession()
-            if owner["session"]["status"] == "idle" and all(
+            if owner["session"]["status"] in _STOPPABLE_STATUSES and all(
                 worker["status"] == "idle" for worker in owner["workers"]
             ) and blocker(owner["session"])["kind"] == "clear" and (progress == "held by usage limit" or not _showing_form(owner["session"])):
                 if progress in {"ready", "held by usage limit"}:
                     return StopSession()
                 message = saved["settle_message"]
                 if message["kind"] in {"not sent", "queued"}:
-                    return StopSession("idle; nothing in progress")
+                    return StopSession("idle; nothing in progress; a background shell was running"
+                        if owner["session"]["status"] == "shell" else "idle; nothing in progress")
                 if message["kind"] == "sent":
                     updated_at = datetime.fromtimestamp(owner["session"]["updated_at"] / 1000, timezone.utc)
                     if updated_at > datetime.fromisoformat(message["at"]):
-                        return StopSession("idle after the pause message; no ready line")
+                        return StopSession("idle after the pause message; no ready line; a background shell was running"
+                            if owner["session"]["status"] == "shell" else "idle after the pause message; no ready line")
         if progress == "waiting" and not _is_requester(saved):
             message = saved["settle_message"]
             if message["kind"] == "not sent" or (message["kind"] == "queued" and
@@ -953,6 +963,12 @@ def ready(where: str) -> int:
                 accepted = True
         _ = store.update_session(saved["login"], session_id, mark)
         if accepted:
+            try:
+                _launch_conductor(saved["login"], saved["label"])
+            except (OSError, RuntimeError, subprocess.SubprocessError):
+                command = shutdown_command("conduct", saved["login"])
+                print(f"ready recorded; conductor could not start; in a terminal on {saved['machine']}: {command}", file=sys.stderr)
+                return 2
             print(f"ready for shutdown: {where}")
             return 0
     print("no shutdown in progress for this session", file=sys.stderr)
@@ -1268,6 +1284,7 @@ def _action_failed(saved: SessionShutdown, error: Exception, *, stopping: bool) 
         return
     def fail(current: SessionShutdown) -> None:
         current["progress"] = {"kind": "stop failed", "at": record_time(), "reason": reason}
+        current["stop_issues"] = []
         current["force"] = "wait for ready"
     try:
         _ = store.update_session(saved["login"], saved["session"]["session_id"], fail)
@@ -1607,8 +1624,75 @@ def _clear_finished_hold(login: str, seen: dict[str, SessionShutdown]) -> None:
         store.clear_finished_account_hold(login)
 
 
+@dataclass(frozen=True)
+class _ModuleFingerprint:
+    """The running shutdown modules' names, modification nanoseconds and sizes."""
+
+    modules: tuple[tuple[str, int, int], ...]
+
+
+def _module_fingerprint() -> _ModuleFingerprint:
+    directory = Path(__file__).parent
+    modules: list[tuple[str, int, int]] = []
+    for name in ("shutdown.py", "settle.py", "stop.py", "record.py", "inventory.py", "restart.py"):
+        metadata = (directory / name).stat()
+        modules.append((name, metadata.st_mtime_ns, metadata.st_size))
+    return _ModuleFingerprint(tuple(modules))
+
+
+@dataclass(frozen=True)
+class _ReloadRequested:
+    """Changed modules require a fresh process after owned work drains."""
+
+    modules: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class _ConductorFinished:
+    """All owned work has reached an outcome without a reload request."""
+
+
+def _conduct_archive_path(login: str) -> Path:
+    if not login or "/" in login or "\0" in login or login.startswith("."):
+        raise ValueError("login is unsafe for record storage")
+    return shutdown_state_root() / login.casefold() / "conduct_archive.json"
+
+
+def _read_conduct_archive(login: str) -> dict[str, SessionShutdown]:
+    """Consume the previous process's outcomes while holding the conductor lock."""
+    path = _conduct_archive_path(login)
+    try:
+        text = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return {}
+    records = store.parse_session_records(text)
+    if any(saved["login"].casefold() != login.casefold() for saved in records):
+        raise store.InvalidRecord(f"{path}: conductor outcomes belong to another account")
+    archived = {saved["session"]["session_id"]: saved for saved in records}
+    path.unlink()
+    return archived
+
+
+def _write_conduct_archive(login: str, archived: dict[str, SessionShutdown]) -> None:
+    """Atomically hand completed outcomes to the replacement conductor."""
+    path = _conduct_archive_path(login)
+    descriptor, temporary_name = tempfile.mkstemp(prefix=".conduct_archive.", suffix=".tmp", dir=path.parent)
+    temporary = Path(temporary_name)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as output:
+            json.dump(list(archived.values()), output, indent=2, sort_keys=True)
+            _ = output.write("\n")
+            output.flush()
+            os.fsync(output.fileno())
+        os.replace(temporary, path)
+    except BaseException:
+        temporary.unlink(missing_ok=True)
+        raise
+
+
 def conduct(login: str) -> int:
     """Keep an owner available for work added while a conductor releases its lock."""
+    fingerprint = _module_fingerprint()
     for line in store.migrate(login):
         print(line)
     archived: dict[str, SessionShutdown] = {}
@@ -1616,7 +1700,12 @@ def conduct(login: str) -> int:
         with store.conductor_lock(login) as ownership:
             if isinstance(ownership, store.ConductorAlreadyRunning):
                 return 0
-            _conduct_owned(login, archived)
+            archived.update(_read_conduct_archive(login))
+            outcome = _conduct_owned(login, archived, fingerprint)
+            if isinstance(outcome, _ReloadRequested):
+                _write_conduct_archive(login, archived)
+        if isinstance(outcome, _ReloadRequested):
+            os.execv(sys.executable, [sys.executable, "-u", *sys.argv])
         records = store.session_records(login)
         if any(not _done(saved) for saved in records):
             continue
@@ -1625,7 +1714,8 @@ def conduct(login: str) -> int:
         return 0
 
 
-def _conduct_owned(login: str, archived: dict[str, SessionShutdown]) -> None:
+def _conduct_owned(login: str, archived: dict[str, SessionShutdown],
+                   fingerprint: _ModuleFingerprint) -> _ConductorFinished | _ReloadRequested:
     """Advance one locked account while long actions run independently."""
     import restart as restart_work
 
@@ -1642,6 +1732,7 @@ def _conduct_owned(login: str, archived: dict[str, SessionShutdown]) -> None:
     report: Inventory = {"machine": local_machine(), "login": login, "label": login,
                          "sessions": [], "unattributed": []}
     next_inventory_at = time.monotonic()
+    reload_state: _ModuleFingerprint | _ReloadRequested = fingerprint
     try:
         with ThreadPoolExecutor(max_workers=restart_work.RESTART_LAUNCH_WORKERS) as executor, ThreadPoolExecutor(max_workers=restart_work.RESTART_LAUNCH_WORKERS) as registry, ThreadPoolExecutor(max_workers=restart_work.RESTART_LAUNCH_WORKERS) as notifications:
             sends: list[Future[None]] = []
@@ -1664,6 +1755,18 @@ def _conduct_owned(login: str, archived: dict[str, SessionShutdown]) -> None:
                     pending[saved["session"]["session_id"]] = PendingSessionAction(saved, RelaunchSession(), future)
 
             while True:
+                if isinstance(reload_state, _ModuleFingerprint):
+                    try:
+                        observed = _module_fingerprint()
+                    except OSError:
+                        # An install may temporarily remove a module between passes.
+                        pass
+                    else:
+                        if observed != reload_state:
+                            reload_state = _ReloadRequested(tuple(
+                                name for name, mtime, size in observed.modules
+                                if (name, mtime, size) not in fingerprint.modules))
+                            print(f"{_user_time(record_time())}: shutdown modules changed: {', '.join(reload_state.modules)}; draining before reload", flush=True)
                 changed = False
                 for session_id, action in list(pending.items()):
                     if not action.future.done():
@@ -1705,24 +1808,33 @@ def _conduct_owned(login: str, archived: dict[str, SessionShutdown]) -> None:
                             future.result()
                         except store.NoLiveRecord:
                             pass
-                sends = [future for future in sends if not future.done()]
+                        except Exception as error:
+                            print(f"shutdown pause message failed for {identity}: {error}", file=sys.stderr)
+                for future in list(sends):
+                    if future.done():
+                        sends.remove(future)
+                        try:
+                            future.result()
+                        except Exception as error:
+                            print(f"shutdown notification failed: {error}", file=sys.stderr)
 
                 records = store.session_records(login)
                 _clear_finished_hold(login, archived)
-                if not pending and not confirmations and not launched and (not records or all(_done(saved) for saved in records)):
+                drained = not pending and not confirmations and not launched and not messages and not sends
+                if drained and (isinstance(reload_state, _ReloadRequested) or not records or all(_done(saved) for saved in records)):
                     for saved in records:
                         if saved["progress"]["kind"] == "restarted":
                             archive(saved)
                     break
                 current = time.monotonic()
                 due = current >= next_inventory_at
-                if due:
+                if due and not isinstance(reload_state, _ReloadRequested):
                     observed_ids = {saved["session"]["session_id"] for saved in records}
                     if observed_ids:
                         report = run_inventory(login, observed_ids, refresh_desktops=False)
                     attempted.clear()
                     next_inventory_at = current + SETTLE_INTERVAL_SECONDS
-                if due or changed:
+                if (due or changed) and not isinstance(reload_state, _ReloadRequested):
                     holdouts: list[tuple[SessionShutdown, str]] = []
                     confirming_ids = {saved["session"]["session_id"] for batch in confirmations for saved in batch.records}
                     confirming_ids.update(saved["session"]["session_id"] for saved in launched)
@@ -1763,18 +1875,22 @@ def _conduct_owned(login: str, archived: dict[str, SessionShutdown]) -> None:
                             archive(saved)
                     if holdouts:
                         sends.append(notifications.submit(_send_holdout_alert, holdouts))
-                if launched and (due or not any(isinstance(action.step, RelaunchSession) for action in pending.values())):
+                if launched and (isinstance(reload_state, _ReloadRequested) or due
+                    or not any(isinstance(action.step, RelaunchSession) for action in pending.values())):
                     batch_records, launched = launched, []
                     future = registry.submit(_confirm_relaunch_pass, batch_records)
                     confirmations.append(PendingRegistryConfirmation(batch_records, future))
                 # wait observes completion without setting either result type.
                 futures = [cast(Future[object], cast(object, action.future)) for action in pending.values()]
                 futures.extend(cast(Future[object], cast(object, batch.future)) for batch in confirmations)
+                futures.extend(cast(Future[object], cast(object, future)) for future in messages.values())
+                futures.extend(cast(Future[object], cast(object, future)) for future in sends)
+                delay = SETTLE_INTERVAL_SECONDS if isinstance(reload_state, _ReloadRequested) else max(0.0, next_inventory_at - time.monotonic())
                 if futures:
-                    _ = wait(futures, timeout=max(0.0, next_inventory_at - time.monotonic()), return_when=FIRST_COMPLETED)
+                    _ = wait(futures, timeout=delay, return_when=FIRST_COMPLETED)
                 else:
-                    time.sleep(max(0.0, next_inventory_at - time.monotonic()))
+                    time.sleep(delay)
         _clear_finished_hold(login, archived)
-        return
+        return reload_state if isinstance(reload_state, _ReloadRequested) else _ConductorFinished()
     finally:
         desktop.restore(dry_run=False)
