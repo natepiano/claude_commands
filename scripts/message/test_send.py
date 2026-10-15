@@ -1329,6 +1329,25 @@ runpy.run_path(sys.argv[0], run_name="__main__")
             self.assertEqual(printed.getvalue(), expected)
             self.assertFalse(self.failure_marker().exists())
 
+    def test_reviewed_failure_keeps_session_before_action_locally_and_remotely(self) -> None:
+        original = send.FailedPush("Owner is blocked", ActionRequired("stop Owner"), "Reason: waiting.")
+        record = {"title": original.title, "action": "stop Owner", "body": original.body, "session": "Owner", "reviewed": True}
+        for prefix, remote_record in (("pushover: reviewed JSON: ", False), ("send.py: failed push JSON: ", True)):
+            with self.subTest(remote=remote_record):
+                failed = send.reviewed_failure(prefix + json.dumps(record), original, prefix=prefix, remote_record=remote_record)
+                self.assertEqual(failed.message, "Session: Owner\nAction: stop Owner\nReason: waiting.")
+
+    def test_catalog_session_is_kept_when_delivery_fails_before_review(self) -> None:
+        import push_texts
+        entry = push_texts.PushText("test", "shutdown", "decision", "Owner is blocked",
+            push_texts.ActionTemplate("stop Owner"), "Reason: waiting.",
+            (push_texts.PushExample("typical", {}),), session=push_texts.SessionTemplate("Owner"))
+        with mock.patch.object(push_texts, "catalog", return_value=(entry,)), mock.patch.object(send, "run", return_value=(1, "", "offline")):
+            result = send.send(local_options(["--to", "user", "--text-id", "test"]))
+        self.assertIsInstance(result.failure, send.FailedPush)
+        assert isinstance(result.failure, send.FailedPush)
+        self.assertEqual(result.failure.message, "Session: Owner\nAction: stop Owner\nReason: waiting.")
+
     def test_every_user_failure_keeps_the_reviewed_text_for_this_session(self) -> None:
         self.writer_session()
         reviewed = {"title": "Retry needs your choice", "action": "Choose retry.\nUse natedev.", "body": "The build stopped.\nChoose retry or stop."}

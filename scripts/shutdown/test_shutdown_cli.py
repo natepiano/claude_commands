@@ -204,8 +204,8 @@ class ShutdownLaunchCliTests(ShutdownTestCase):
         for policy in ("user", "none"):
             with self.subTest(policy=policy), patch.object(remote_control, "fix", return_value=remote_control.AlreadyOn()) as fix:
                 self.assertEqual(shutdown.main(["remote-control", "owner", "--pid", "321",
-                    "--proc-start", "original", "--who", "trunk unit", "--alerts", policy]), 0)
-            fix.assert_called_once_with("owner", 321, "original", "trunk unit", policy)
+                    "--proc-start", "original", "--who", "trunk unit", "--session", "Owner", "--alerts", policy]), 0)
+            fix.assert_called_once_with("owner", 321, "original", "trunk unit", policy, "Owner")
 
     def follow_request(self, output: io.StringIO | None = None) -> tuple[int, str]:
         output = output if output is not None else io.StringIO()
@@ -1575,7 +1575,7 @@ class OnlySessionCliTests(ShutdownTestCase):
         self.assertIn("Beta: Remote Control not on yet; turning it on in the background", result["lines"])
         fixer.assert_called_once()
         self.assertEqual(fixer.call_args.args[0], "beta-id")
-        self.assertEqual(fixer.call_args.args[-1], "none")
+        self.assertEqual(fixer.call_args.args[-2:], ("none", "Beta"))
         self.assertEqual(result["no_remote_control"], [{"session_id": "beta-id", "name": "Beta", "alerts": "none"}])
         self.assertIsNone(record.find_session(LOGIN, "beta-id"))
 

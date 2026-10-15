@@ -1517,7 +1517,7 @@ def _send_holdout_alert(held: list[tuple[SessionShutdown, str]]) -> None:
             command = shutdown_command("now", saved["login"], "--here", "--only", saved["session"]["session_id"])
             after_stop = "the restart brings it back." if saved["then"] == "restart" else "it stays stopped until restarted."
             alert_user(render("shutdown.holdout", session=saved["session"]["name"], machine=saved["machine"],
-                              host=_holdout_host(saved), elapsed=elapsed, command=command, after_stop=after_stop,
+                              elapsed=elapsed, command=command, after_stop=after_stop,
                               operation="Restart" if saved["then"] == "restart" else "Shutdown",
                               request="restart" if saved["then"] == "restart" else "shutdown"),
                        machine="natedev" if local_machine().casefold() == "mac" else "")
