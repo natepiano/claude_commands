@@ -130,7 +130,7 @@ class AddShowrunnerTests(unittest.TestCase):
         self.timer("top", PARENT_SESSION)
         self.live(PARENT_SESSION)
 
-    def configure_groups(self, *, units: str = "default", showrunners: str = "default") -> Path:
+    def configure_groups(self, *, units: str = "claude2", showrunners: str = "claude2") -> Path:
         path = Path(self.env["HOME"]) / ".local/state/accounts/groups.json"
         path.parent.mkdir(parents=True, exist_ok=True)
         _ = path.write_text(json.dumps({"units": units, "showrunners": showrunners}))
@@ -249,7 +249,7 @@ class AddShowrunnerTests(unittest.TestCase):
         self.starts("abc-123", registers="kid")
         elsewhere = self.root / "elsewhere"
         elsewhere.mkdir()
-        result = self.run_command("kid", "--resume", "abc-123", "--cwd", str(elsewhere), "--account", "default")
+        result = self.run_command("kid", "--resume", "abc-123", "--cwd", str(elsewhere), "--account", "claude2")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         args = cast(list[str], self.started()["args"])
         self.assertEqual(args[5], str(elsewhere))
@@ -367,14 +367,14 @@ class AddShowrunnerTests(unittest.TestCase):
         _ = (directory / ".claude.json").write_text("SECRET malformed account contents")
         result = self.run_command("kid", "--resume", "abc-123", "--cwd", str(self.root),
                                   "--config-dir", str(directory))
-        self.refused(result, "default")
+        self.refused(result, "claude2")
         self.assertNotIn("SECRET", result.stderr)
 
     def test_resume_refuses_an_unrelated_tmux_name_collision_without_killing_it(self) -> None:
         (self.state / "live-kid").touch()
         self.live("unrelated-conversation")
         result = self.run_command("kid", "--resume", "ended-conversation", "--cwd", str(self.root),
-                                  "--account", "default")
+                                  "--account", "claude2")
         self.refused(result, "a tmux session named kid is already live")
         self.assertEqual(len(result.stderr.splitlines()), 1)
         self.assertFalse(any(cast(list[str], event["args"])[0] == "kill-session"
@@ -409,7 +409,7 @@ class AddShowrunnerTests(unittest.TestCase):
         directory.mkdir()
         for options in (("--config-dir", str(directory)),
                         ("--resume", "abc-123", "--cwd", str(self.root), "--config-dir", str(directory),
-                         "--account", "default")):
+                         "--account", "claude2")):
             with self.subTest(options=options):
                 result = self.run_command("kid", *options)
                 self.assertEqual(result.returncode, 2)
@@ -428,8 +428,8 @@ class AddShowrunnerTests(unittest.TestCase):
     def test_showrunner_refuses_explicit_account_different_from_configured_group(self) -> None:
         """F004: an explicit account must agree with the showrunners account."""
         _ = self.named_account()
-        for options in (("--account", "default"),
-                        ("--resume", "abc-123", "--cwd", str(self.root), "--account", "default")):
+        for options in (("--account", "claude2"),
+                        ("--resume", "abc-123", "--cwd", str(self.root), "--account", "claude2")):
             with self.subTest(options=options):
                 result = self.run_command("kid", *options)
                 self.refused(result, "claude3")
@@ -471,7 +471,7 @@ class AddShowrunnerTests(unittest.TestCase):
         edge.parent.mkdir(parents=True)
         _ = edge.write_text("top\n", encoding="utf-8")
         self.starts("abc-123")
-        result = self.run_command("kid", "--resume", "abc-123", "--cwd", str(self.root), "--account", "default")
+        result = self.run_command("kid", "--resume", "abc-123", "--cwd", str(self.root), "--account", "claude2")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual(result.stdout.splitlines(), ["started kid in tmux session kid", "kid already reports to top"])
         self.assertEqual(self.sent_to(), [])
@@ -599,7 +599,7 @@ raise SystemExit(add_showrunner.main(sys.argv[2:]))
         _ = self.doc("kid")
         self.trust(self.root, extra={"oauthAccount": {"emailAddress": "SECRET-EMAIL"}, "userID": "SECRET-ID"})
         result = self.run_command("kid", "--check")
-        self.refused(result, f"kid: Claude is not trusted in {checkout.resolve()} on default account. "
+        self.refused(result, f"kid: Claude is not trusted in {checkout.resolve()} on claude2. "
                      + f"Run: cd {shlex.quote(str(checkout.resolve()))} && "
                      + "env -u CLAUDE_CONFIG_DIR -u CLAUDE_CODE_REMOTE_MEMORY_DIR claude")
         self.assertNotIn("SECRET", result.stdout + result.stderr)
@@ -615,7 +615,7 @@ raise SystemExit(add_showrunner.main(sys.argv[2:]))
         self.trust(main)
         for folder in (main / "sub", self.root / "side"):
             with self.subTest(folder=folder.name):
-                result = self.run_command("kid", "--resume", "abc-123", "--cwd", str(folder), "--account", "default", "--check")
+                result = self.run_command("kid", "--resume", "abc-123", "--cwd", str(folder), "--account", "claude2", "--check")
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
     def test_a_trusted_parent_folder_does_not_cover_a_repository_below_it(self) -> None:

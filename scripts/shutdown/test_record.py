@@ -210,6 +210,24 @@ class SessionRecordTests(ShutdownTestCase):
                          ("claude2", "claude2", "claude2"))
         self.assertEqual(path.read_bytes(), original)
 
+    def test_legacy_default_target_reads_as_the_home_number_without_rewriting_the_record(self) -> None:
+        notes = self.root / "notes"
+        notes.mkdir()
+        _ = (notes / "claude2.md").write_text("---\nlogin: home@example.invalid\n---\n")
+        _ = (self.root / ".claude.json").write_text(json.dumps({"oauthAccount": {"emailAddress": "home@example.invalid"}}))
+        saved = session_shutdown()
+        saved["target"] = "claude2"
+        self.assertTrue(record.create_session(saved))
+        path = next((self.directory / "sessions").glob("*.json"))
+        original = path.read_bytes().replace(b'"target": "claude2"', b'"target": "default"')
+        self.assertIn(b'"target": "default"', original)
+        _ = path.write_bytes(original)
+        with patch.dict(os.environ, {"AGENT_NOTES_DIR": str(notes)}):
+            loaded = record.find_session(saved["login"], "session-1")
+        assert loaded is not None
+        self.assertEqual(loaded.get("target"), "claude2")
+        self.assertEqual(path.read_bytes(), original)
+
     def test_first_read_rewrites_busy_worker_fields_and_preserves_the_held_account_schema(self) -> None:
         saved = session_shutdown()
         worker = owned_worker()

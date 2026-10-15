@@ -132,12 +132,20 @@ class AccountMoveTests(ShutdownTestCase):
     def test_move_refuses_its_current_login_without_change(self) -> None:
         self.refuses_without_change("kept name is already on claude1", target="claude1")
 
-    def test_move_refuses_the_default_logins_note_label_without_change(self) -> None:
-        self.refuses_without_change("claude2 is the default account; use default", target="claude2")
+    def assert_move_to_the_home_number(self, target: str) -> None:
+        with patch.object(subprocess, "run", return_value=subprocess.CompletedProcess([], 0, "", "")) as process:
+            self.assertEqual(self.cli(target=target), (0, "", ""))
+        process.assert_called_once()
+        arguments = cast(tuple[str, ...], process.call_args.args[0])
+        self.assertEqual(arguments[arguments.index("--to") + 1], target)
+        self.assertEqual(accounts.claude_account_dir(arguments[arguments.index("--to") + 1]), self.root / ".claude")
 
-    def test_move_refuses_a_named_dir_signed_in_to_default_without_change(self) -> None:
+    def test_move_to_the_home_logins_note_number_uses_its_home(self) -> None:
+        self.assert_move_to_the_home_number("claude2")
+
+    def test_move_to_a_named_directory_sharing_the_home_login_uses_its_home(self) -> None:
         self.named_account("claude4", "default@example.invalid")
-        self.refuses_without_change("claude4 is the default account; use default", target="claude4")
+        self.assert_move_to_the_home_number("claude4")
 
     def test_move_refuses_an_open_shutdown_for_itself_without_change(self) -> None:
         saved = entry(self.owner)
@@ -483,10 +491,10 @@ class AccountMoveTests(ShutdownTestCase):
               patch.object(subprocess, "run", side_effect=self.start_batch) as process):
             result, _, error = self.batch_cli(target=target)
         self.assertEqual((result, error), (0, ""))
-        self.assertEqual(accounts.group_accounts().get("showrunners"), "default")
+        self.assertEqual(accounts.group_accounts().get("showrunners"), target)
         process.assert_called_once()
         arguments = cast(list[str], process.call_args.args[0])
-        self.assertEqual(arguments[arguments.index("--to") + 1], "default")
+        self.assertEqual(arguments[arguments.index("--to") + 1], target)
 
     def test_group_move_default_login_note_alias_selects_default(self) -> None:
         self.assert_group_alias_moves_to_default("claude2")
@@ -541,17 +549,17 @@ class AccountMoveTests(ShutdownTestCase):
         self.assertEqual(self.disk_state(), before)
         process.assert_not_called()
 
-    def test_bulk_move_to_default_preserves_default_target_in_the_single_down(self) -> None:
+    def test_bulk_move_to_home_preserves_its_number_in_the_single_down(self) -> None:
         report = self.showrunner_inventory()
         with (
             patch.object(inventory, "inventory", return_value=report),
             patch.object(sessions, "live_sessions", return_value=self.batch_registry(report)),
             patch.object(subprocess, "run", side_effect=self.start_batch) as process,
         ):
-            result, _, error = self.batch_cli(target="default")
+            result, _, error = self.batch_cli(target="claude2")
         self.assertEqual((result, error), (0, ""))
         arguments = cast(tuple[str, ...], process.call_args.args[0])
-        self.assertEqual(arguments[arguments.index("--to") + 1], "default")
+        self.assertEqual(arguments[arguments.index("--to") + 1], "claude2")
 
     def test_group_move_with_all_members_shutting_down_commits_group_without_second_request(self) -> None:
         report = self.showrunner_inventory()

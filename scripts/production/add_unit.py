@@ -591,7 +591,7 @@ def director_agent(request: UnitLaunch) -> DirectorAgent:
 
 
 def preflight(request: RequestedUnitLaunch, selected: ClaudeLaunchAccount) -> ReadyToLaunch:
-    from scripts.accounts.accounts import DefaultAccount, trust_command
+    from scripts.accounts.accounts import main_config_dir, trust_command
     from scripts.herdr.herdr import Untrusted, UnreadableTrustFile, claude_trust, repository_trust_key
 
     production = request.production
@@ -623,7 +623,7 @@ def preflight(request: RequestedUnitLaunch, selected: ClaudeLaunchAccount) -> Re
         timeout=request.timeout,
     )
     account = selected
-    account_file = Path.home() / ".claude.json" if isinstance(account, DefaultAccount) else account.dir / ".claude.json"
+    account_file = Path.home() / ".claude.json" if account.dir == main_config_dir() else account.dir / ".claude.json"
     folder = request.session_cwd
     check_folder = (repository_trust_key(production.checkout)
                     if isinstance(request.session, NewSession) and not folder.exists() else folder)
@@ -631,7 +631,7 @@ def preflight(request: RequestedUnitLaunch, selected: ClaudeLaunchAccount) -> Re
     if isinstance(trust, UnreadableTrustFile):
         raise Refusal(f"{request.unit}: {trust}")
     if isinstance(trust, Untrusted):
-        label = "default account" if isinstance(account, DefaultAccount) else account.label
+        label = account.label
         raise Refusal(f"{request.unit}: Claude is not trusted in {folder} on {label}. Run: {trust_command(check_folder, account)}")
     if restoring:
         # A restore adopts the row it matched and creates nothing: how the unit was first added, whether
@@ -794,7 +794,7 @@ def launch_session(
 
     The marks are what finds the unit afterwards; its name is only what it is called at launch.
     """
-    from scripts.accounts.accounts import DefaultAccount, account_prefix, main_config_dir
+    from scripts.accounts.accounts import account_prefix
 
     marks = {unit_lookup.PRODUCTION_MARK: request.production.slug, unit_lookup.UNIT_MARK: request.identity.unit}
     launch_model = model or director.model
@@ -825,7 +825,7 @@ def launch_session(
                         *(argument for name, value in marks.items() for argument in ("-e", f"{name}={value}")),
                         "zsh", "-ic", command],
                        env=environment, text=True, capture_output=True, check=True)
-    directory = main_config_dir() if isinstance(selected, DefaultAccount) else selected.dir
+    directory = selected.dir
     for option, value in (("@claude_config_dir", str(directory)), ("@claude_model", launch_model)):
         _ = subprocess.run([tmux, "set-option", "-t", f"={tmux_session}:", option, value],
                            env=environment, text=True, capture_output=True, check=True)
@@ -950,6 +950,7 @@ class AlreadyAdopted:
 def adoptable(request: RequestedUnitLaunch, label: str) -> Adoptable | AlreadyAdopted:
     from scripts.accounts import accounts
     from scripts.whoami.account import process_config_dir
+    from scripts.whoami.agent_accounts import NumberedAccount
 
     found = launched_unit(request)
     if isinstance(found, MarkedUnitFound):
@@ -968,7 +969,10 @@ def adoptable(request: RequestedUnitLaunch, label: str) -> Adoptable | AlreadyAd
     if directory is None:
         raise Refusal(f"tmux session {label} cannot be adopted: the account of pid {claude.pid} is unreadable")
     if directory.resolve() == accounts.main_config_dir().resolve():
-        return Adoptable(label, claude, accounts.DefaultAccount())
+        identity = accounts.account_identity(directory)
+        if not isinstance(identity, NumberedAccount):
+            raise Refusal(f"tmux session {label} cannot be adopted: its account has no numbered note")
+        return Adoptable(label, claude, accounts.NamedAccount(identity.label, directory))
     named = next((item for item in accounts.checked_named_accounts() if item.dir.resolve() == directory.resolve()), None)
     if named is None:
         raise Refusal(f"tmux session {label} cannot be adopted: it runs on {directory}, which is no account fit to launch")
@@ -977,10 +981,8 @@ def adoptable(request: RequestedUnitLaunch, label: str) -> Adoptable | AlreadyAd
 
 def adopt_session(request: UnitLaunch, adopted: Adoptable, tmux: str) -> None:
     """Mark the running session as the unit, record its account, and tell it who it is now."""
-    from scripts.accounts.accounts import DefaultAccount, main_config_dir
-
     unit_lookup.mark(adopted.label, request.production.slug, request.identity.unit)
-    directory = main_config_dir() if isinstance(adopted.account, DefaultAccount) else adopted.account.dir
+    directory = adopted.account.dir
     _ = subprocess.run([tmux, "set-option", "-t", f"={adopted.label}:", "@claude_config_dir", str(directory)],
                        text=True, capture_output=True, check=True)
     prompt = prompt_for(request).replace("You are ", "You are now ", 1)
@@ -1026,7 +1028,7 @@ def main(argv: list[str]) -> int:
             return 0
         unit_account = (adopted.account if adopted is not None
                         else account_for_launch(request, cast(str, args.account), cast(str, args.config_dir)))
-        if isinstance(unit_account, accounts.NamedAccount):
+        if unit_account.dir != accounts.main_config_dir():
             problems = accounts.check(unit_account.label)
             if problems:
                 raise Refusal(
@@ -1053,7 +1055,7 @@ def main(argv: list[str]) -> int:
                 else launch_permission.NewWorkLaunchPurpose()
             )
             permission_environment = launch_environment()
-            if isinstance(unit_account, accounts.NamedAccount):
+            if unit_account.dir != accounts.main_config_dir():
                 permission_environment["CLAUDE_CONFIG_DIR"] = str(unit_account.dir)
             permission = launch_permission.launch_permission(
                 permission_environment, purpose
@@ -1131,7 +1133,7 @@ def main(argv: list[str]) -> int:
                         request.launch_kind.session_id, prompt
                     )
                 launch_session(request, tmux, ready.director, prompt, unit_account,
-                               target=("default" if isinstance(unit_account, accounts.DefaultAccount) else unit_account.label)
+                               target=unit_account.label
                                if isinstance(request.session, ResumedSession) else "", model=resume_model)
         finally:
             _ = barrier.__exit__(None, None, None)

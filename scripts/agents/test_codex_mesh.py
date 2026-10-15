@@ -2730,6 +2730,12 @@ class MeshCommandTests(unittest.TestCase):
         claims = base64.urlsafe_b64encode(json.dumps({"email": login}).encode()).decode().rstrip("=")
         _ = (target / "auth.json").write_text(json.dumps({"tokens": {"id_token": f"header.{claims}.signature"}}))
         _ = (home / "codex1.md").write_text(f"---\nlogin: {login}\n---\n")
+        source = home / ".codex"
+        source.mkdir()
+        source_login = "source@example.invalid"
+        source_claims = base64.urlsafe_b64encode(json.dumps({"email": source_login}).encode()).decode().rstrip("=")
+        _ = (source / "auth.json").write_text(json.dumps({"tokens": {"id_token": f"header.{source_claims}.signature"}}))
+        _ = (home / "codex9.md").write_text(f"---\nlogin: {source_login}\n---\n")
         _ = (self.session_dir / codex_mesh.SERVER_FILE).write_text(json.dumps({
             "port": self.server.port, "pid": os.getpid(), "codex_home": str(home / ".codex"),
         }))
@@ -2779,7 +2785,7 @@ class MeshCommandTests(unittest.TestCase):
         def move_on_refusal(*_arguments: object, **_options: object) -> None:
             requested: moves.RequestedMove = {
                 "kind": "requested", "at": "2026-10-13T12:00:00+00:00", "tool": "codex",
-                "subject": "seats", "move_id": "refused-turn-move", "from": "default",
+                "subject": "seats", "move_id": "refused-turn-move", "from": "codex9",
                 "to": "codex1", "why": "quota refusal", "window": "unknown",
             }
             moves.append_move(requested)
@@ -2873,7 +2879,7 @@ class MeshCommandTests(unittest.TestCase):
 
     def test_new_worker_on_requested_destination_does_not_confirm_another_workers_move(self) -> None:
         _target, new = self.prepare_workers_move()
-        self.request_workers_move("default", "codex1", "another-worker-move")
+        self.request_workers_move("codex9", "codex1", "another-worker-move")
         self.assertEqual(accounts.main(["set-role", "seats", "codex1"]), 0)
         self.assertEqual(self.run_start()[0], 0)
         self.assertTrue(any(request.get("method") == "turn/start" for request in new.requests))
@@ -2927,7 +2933,7 @@ class MeshCommandTests(unittest.TestCase):
     def assert_legacy_default_move_confirmed(self, *, default_destination: bool) -> None:
         numbered, new = self.prepare_workers_move()
         default = numbered.parent / ".codex"
-        default.mkdir()
+        default.mkdir(exist_ok=True)
         login = "home@example.invalid"
         claims = base64.urlsafe_b64encode(json.dumps({"email": login}).encode()).decode().rstrip("=")
         _ = (default / "auth.json").write_text(json.dumps({"tokens": {"id_token": f"header.{claims}.signature"}}))
@@ -2937,8 +2943,17 @@ class MeshCommandTests(unittest.TestCase):
         _ = (self.session_dir / codex_mesh.SERVER_FILE).write_text(json.dumps({
             "port": self.server.port, "pid": os.getpid(), "codex_home": str(source),
         }))
-        self.request_workers_move(source_label, destination_label, "legacy-default-move")
-        self.assertEqual(accounts.main(["set-role", "seats", destination_label]), 0)
+        evidence = accounts.roles_history_file()
+        evidence.parent.mkdir(parents=True, exist_ok=True)
+        _ = evidence.write_text(json.dumps({"at": "2026-10-01T00:00:00Z", "role": "seats",
+                                           "label": "default", "account_label": "codex2"}) + "\n")
+        journal = moves.store_file()
+        # Seed the old spelling directly; new writers take numbered labels only.
+        legacy = json.dumps({"kind": "requested", "at": "2026-10-13T12:00:00Z", "tool": "codex",
+            "subject": "seats", "move_id": "legacy-default-move", "from": source_label,
+            "to": destination_label, "why": "quota refusal", "window": "unknown"}).encode() + b"\n"
+        _ = journal.write_bytes(legacy)
+        self.assertEqual(accounts.main(["set-role", "seats", "codex2" if default_destination else "codex1"]), 0)
         self.write_pool_roster({"worker": {"thread_id": THREAD_ID, "status": "done"}})
         client = codex_mesh.Client(self.server.port, "worker")
         try:
@@ -2956,7 +2971,9 @@ class MeshCommandTests(unittest.TestCase):
         assert "home" in confirmed[0]
         self.assertEqual(confirmed[0]["home"], str(destination))
         requested = [entry for entry in entries if entry["kind"] == "requested"]
-        self.assertEqual((requested[0]["from"], requested[0]["to"]), (source_label, destination_label))
+        self.assertEqual((requested[0]["from"], requested[0]["to"]),
+                         ("codex1", "codex2") if default_destination else ("codex2", "codex1"))
+        self.assertEqual(journal.read_bytes()[:len(legacy)], legacy)
 
     def test_resumed_worker_confirms_a_legacy_default_source_under_its_numbered_label(self) -> None:
         """F004: a pending default-source request survives numbered account display."""
@@ -2968,7 +2985,7 @@ class MeshCommandTests(unittest.TestCase):
 
     def test_worker_resume_failure_records_the_current_move_request_and_reason(self) -> None:
         _target, new = self.prepare_workers_move()
-        self.request_workers_move("default", "codex1", "resume-failure-move")
+        self.request_workers_move("codex9", "codex1", "resume-failure-move")
         self.assertEqual(accounts.main(["set-role", "seats", "codex1"]), 0)
         self.write_pool_roster({"worker": {"thread_id": THREAD_ID, "status": "done"}})
         respond = new.respond

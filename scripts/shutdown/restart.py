@@ -531,12 +531,12 @@ def _resume_parts(session: Session, prompt: str, target: str = "") -> ResumePart
 
         role = "unit" if session["kind"] == "unit" else "showrunner"
         selected = accounts.account_for_group_launch(role, resume=True, target=target)
-        selected_dir = accounts.main_config_dir() if isinstance(selected, accounts.DefaultAccount) else selected.dir
+        selected_dir = selected.dir
         host = session["host"]
         herdr_host = host["kind"] == "herdr"
         # Only native herdr resumes retain an already configured directory.
         if target or not herdr_host or selected_dir.resolve() != config_dir.resolve():
-            target = "default" if isinstance(selected, accounts.DefaultAccount) else selected.label
+            target = selected.label
         else:
             config_dir = selected_dir
     account: RetainResumeAccount | MoveResumeAccount = (
@@ -1033,17 +1033,15 @@ def _herdr_launch(parts: ResumeParts, session: Session, *, dry_run: bool) -> Non
         return
     _record_scheduled_restart_prompt(session["session_id"], parts.opening_prompt, dry_run=False)
     try:
-        from scripts.accounts.accounts import ClaudeLaunchAccount, DefaultAccount, NamedAccount, trust_command
+        from scripts.accounts.accounts import NamedAccount, home_account_label, trust_command
 
         config_dir = parts.account.config_dir
         claude_json = (Path.home() / ".claude.json" if config_dir == Path.home() / ".claude"
                        else config_dir / ".claude.json")
         trust = herdr.claude_trust(Path(parts.cwd), claude_json)
         if isinstance(trust, (herdr.Untrusted, herdr.UnreadableTrustFile)):
-            account: ClaudeLaunchAccount = (
-                DefaultAccount() if config_dir == Path.home() / ".claude"
-                else NamedAccount(str(config_dir), config_dir)
-            )
+            account = NamedAccount(home_account_label("claude") if config_dir == Path.home() / ".claude"
+                                   else str(config_dir), config_dir)
             reason = (str(trust) if isinstance(trust, herdr.UnreadableTrustFile)
                       else f"{parts.cwd}: Claude has not trusted this folder")
             raise OSError(f"{reason}. Run: {trust_command(Path(parts.cwd), account)}")
@@ -1139,8 +1137,7 @@ def _launch_session(
             if "target" in record:
                 from scripts.accounts import accounts
 
-                directory = (accounts.main_config_dir() if record["target"] == "default"
-                             else accounts.account_dir(record["target"]))
+                directory = accounts.claude_account_dir(record["target"])
                 _ = _run([os.environ.get("SHUTDOWN_TMUX", "tmux"), "set-option", "-t",
                           retained_session, "@claude_config_dir", str(directory)], dry_run=dry_run)
         case "unit":
@@ -1285,7 +1282,7 @@ def _target_config_dir(record: SessionShutdown) -> Path | None:
         session = record["session"]
         return Path(session["config_dir"]) if "config_dir" in session else None
     from scripts.accounts import accounts
-    return accounts.main_config_dir() if target_label == "default" else accounts.account_dir(target_label)
+    return accounts.claude_account_dir(target_label)
 
 
 def _live_config_dir(record: SessionShutdown) -> Path | None:

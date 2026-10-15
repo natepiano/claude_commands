@@ -272,7 +272,7 @@ class QuotaAlertTests(unittest.TestCase):
     def set_claude_activity(self, label: str) -> None:
         from scripts.message import sessions
         identity = accounts.account_identity(accounts.account_dir(label))
-        assert isinstance(identity, agent_accounts.KnownClaudeAccount)
+        assert isinstance(identity, agent_accounts.NumberedAccount)
         _ = self.enterContext(mock.patch.object(sessions, "live_sessions", return_value=[sessions.SessionRecord(
             pid=43210, sessionId="activity-fixture", name="live unit", messagingSocketPath="/fixture.sock",
             updatedAt=1, tmux="", formerNames=[])]))
@@ -294,6 +294,7 @@ class QuotaAlertTests(unittest.TestCase):
         _ = (self.root / ".claude.json").write_text(
             json.dumps({"oauthAccount": {"emailAddress": "showrunner@example.invalid"}}), encoding="utf-8",
         )
+        _ = (self.root / "claude2.md").write_text("---\nlogin: showrunner@example.invalid\n---\n")
         for label, login in (("claude1", "spare@example.invalid"), ("claude3", "unit@example.invalid")):
             self.assertEqual(accounts.setup(label), [])
             _ = (self.root / note_name(label)).write_text(f"---\nlogin: {login}\n---\n")
@@ -325,7 +326,7 @@ class QuotaAlertTests(unittest.TestCase):
         peer_only = read_note(peer_only.path)
         assert isinstance(peer_only, note_file.Note)
         selection = ClaudeAccountsInUse(
-            agent_accounts.KnownClaudeAccount("local@example.invalid", "claude3"),
+            agent_accounts.NumberedAccount("claude3", Path.home() / ".claude", "local@example.invalid"),
             True, (), frozenset(),
         )
 
@@ -344,7 +345,7 @@ class QuotaAlertTests(unittest.TestCase):
         """F001: the default login alone does not make an unused note eligible."""
         note = self.note("claude1.md", "inactive", "1")
         selection = ClaudeAccountsInUse(
-            agent_accounts.KnownClaudeAccount("someone@example.com", "claude1"),
+            agent_accounts.NumberedAccount("claude1", Path.home() / ".claude", "someone@example.com"),
             False, (), frozenset(),
         )
 
@@ -358,7 +359,7 @@ class QuotaAlertTests(unittest.TestCase):
 
     def test_single_account_recovery_closes_when_its_role_and_sessions_are_removed(self) -> None:
         note = self.note("claude1.md", "active", "1")
-        selection = ClaudeAccountsInUse(agent_accounts.UnreadableClaudeAccount(), False, (), frozenset())
+        selection = ClaudeAccountsInUse(agent_accounts.UnreadableIdentity(Path.home() / ".claude", "fixture identity unavailable"), False, (), frozenset())
         readings = self.alert_readings([note], self.now)
         episode: quota_alert.Episode = {"since": self.now.isoformat(), "acknowledged": "", "last": {}}
         self.assertFalse(quota_alert.recovered(note.label, [note], 5, selection, self.now, readings, episode))
@@ -379,7 +380,7 @@ class QuotaAlertTests(unittest.TestCase):
         move.assert_not_called()
         move_group.assert_not_called()
         self.assertIn("units: move to claude1", text)
-        self.assertIn("showrunners: move to default", text)
+        self.assertIn("showrunners: move to claude2", text)
         self.assertIn("ungrouped sessions: move to claude1", text)
         self.assertNotIn("swap unit", text)
 
@@ -393,7 +394,7 @@ class QuotaAlertTests(unittest.TestCase):
         with mock.patch.object(accounts, "move_sessions") as move:
             text = quota_alert.unit_swap_line(note, [note], accounts.claude_account_selection())
         self.assertIn("units: move to claude1", text)
-        self.assertIn("showrunners: move to default", text)
+        self.assertIn("showrunners: move to claude2", text)
         self.assertIn("ungrouped sessions: move to claude1", text)
         self.assertNotIn("move to claude3", text)
         self.assertFalse(accounts.groups_file().exists())
@@ -1496,7 +1497,7 @@ class CodexZeroEpisodeTests(unittest.TestCase):
         checked = now or self.now
         notes = [read_note(self.root / f"codex{number}.md") for number in (1, 2, 3)]
         lines = quota_alert.alert([note for note in notes if isinstance(note, note_file.Note)], checked,
-            selection=ClaudeAccountsInUse(agent_accounts.UnreadableClaudeAccount(), False, (), frozenset()),
+            selection=ClaudeAccountsInUse(agent_accounts.UnreadableIdentity(Path.home() / ".claude", "fixture identity unavailable"), False, (), frozenset()),
             codex_readings=self.readings(checked, selected=selected, left=left, balance=balance,
                                         spare_left=spare_left, spare_accounts=spare_accounts,
                                         spare_five_hour=spare_five_hour))
@@ -2079,7 +2080,7 @@ class CodexZeroEpisodeTests(unittest.TestCase):
         readings = self.readings(self.now)
         note = self.note(1)
         _ = quota_alert.alert([note], self.now + timedelta(minutes=10, seconds=1),
-            selection=ClaudeAccountsInUse(agent_accounts.UnreadableClaudeAccount(), False, (), frozenset()),
+            selection=ClaudeAccountsInUse(agent_accounts.UnreadableIdentity(Path.home() / ".claude", "fixture identity unavailable"), False, (), frozenset()),
             codex_readings=readings)
         self.phone.assert_not_called()
         self.relay.assert_not_called()

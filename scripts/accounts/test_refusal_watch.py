@@ -104,7 +104,7 @@ class RefusalWatchTests(unittest.TestCase):
         if directory is None:
             return None
         identity = accounts.account_identity(directory)
-        return account.Account("claude", identity.login, identity.label) if isinstance(identity, agent_accounts.KnownClaudeAccount) else None
+        return account.Account("claude", identity.login, identity.label) if isinstance(identity, agent_accounts.NumberedAccount) else None
 
     def inventory_for(self, login: str, only: frozenset[str] = NO_SESSION_FILTER, *,
                       refresh_desktops: bool = True) -> inventory.Inventory:
@@ -268,8 +268,8 @@ class RefusalWatchTests(unittest.TestCase):
         before = self.snapshot()
         _, output, error = self.cli("--dry-run")
         self.assertEqual(error, "")
-        self.assertIn("move from claude1 to default", output)
-        self.assertIn("owner partial: refused group units; move to default", output)
+        self.assertIn("move from claude1 to claude2", output)
+        self.assertIn("owner partial: refused group units; move to claude2", output)
         self.assertNotIn("moving to claude3", output)
         self.assertNotIn("move to claude3", output)
         self.assertEqual(path.read_bytes(), before[str(path.relative_to(self.home))])
@@ -295,10 +295,10 @@ class RefusalWatchTests(unittest.TestCase):
         runner["config_dir"] = str(accounts.account_dir("claude1"))
         _ = self.transcript("unit")
         _ = self.cli()
-        self.assertEqual(json.loads(path.read_text()), {"units": "default", "showrunners": "claude1"})
+        self.assertEqual(json.loads(path.read_text()), {"units": "claude2", "showrunners": "claude1"})
         command = self.commands[1]
         self.assertEqual(command[command.index("--only") + 1], unit["session_id"])
-        self.assertEqual(command[command.index("--to") + 1], "default")
+        self.assertEqual(command[command.index("--to") + 1], "claude2")
 
     def test_group_selection_is_stored_before_shutdown_requests_are_sent(self) -> None:
         path = self.groups()
@@ -359,8 +359,8 @@ class RefusalWatchTests(unittest.TestCase):
         command = self.commands[0]
         self.assertEqual(set(command[command.index("--only") + 1].split(",")),
             {refused["session_id"], healthy["session_id"]})
-        self.assertEqual(command[command.index("--to") + 1], "default")
-        self.assertEqual(json.loads(path.read_text())["showrunners"], "default")
+        self.assertEqual(command[command.index("--to") + 1], "claude2")
+        self.assertEqual(json.loads(path.read_text())["showrunners"], "claude2")
         self.assertEqual(json.loads(path.read_text())["units"], "claude1")
 
     def test_healthy_groups_stay_on_their_accounts_despite_better_placement(self) -> None:
@@ -524,10 +524,10 @@ class RefusalWatchTests(unittest.TestCase):
         with redirect_stdout(output), redirect_stderr(error):
             code = accounts.main(["move", "units", "claude2"])
         self.assertEqual((code, error.getvalue()), (0, ""))
-        self.assertEqual(cast(dict[str, str], json.loads(path.read_text()))["units"], "default")
+        self.assertEqual(cast(dict[str, str], json.loads(path.read_text()))["units"], "claude2")
         self.assertEqual(len(self.commands), 1)
         command = self.commands[0]
-        self.assertEqual(command[command.index("--to") + 1], "default")
+        self.assertEqual(command[command.index("--to") + 1], "claude2")
 
     def test_status_without_group_file_does_not_infer_live_members_accounts(self) -> None:
         """F004: read-only status reports missing configuration despite live members."""
@@ -933,13 +933,13 @@ class RefusalWatchTests(unittest.TestCase):
         self.reading(TARGET_LOGIN, 80, at=REFUSAL_AT - timedelta(seconds=1), reset=NOW + timedelta(hours=2))
         before = self.snapshot()
         _, preview, _ = self.cli("--dry-run")
-        self.assertIn("owner first: refused; move from claude1 to default", preview)
-        self.assertIn("owner second: refused; move from claude3 to default", preview)
+        self.assertIn("owner first: refused; move from claude1 to claude2", preview)
+        self.assertIn("owner second: refused; move from claude3 to claude2", preview)
         self.assertEqual(self.snapshot(), before)
         _, actual, _ = self.cli()
         self.assertEqual("\n".join(preview.splitlines()[1:]) + "\n", actual)
         self.assertEqual(len(self.commands), 2)
-        self.assertTrue(all(command[command.index("--to") + 1] == "default" for command in self.commands))
+        self.assertTrue(all(command[command.index("--to") + 1] == "claude2" for command in self.commands))
 
     def test_transcript_lookup_ignores_deeper_folders_and_reads_each_live_owner_once_per_tick(self) -> None:
         _ = self.owner("refused")
@@ -1148,7 +1148,7 @@ class RefusalWatchTests(unittest.TestCase):
         self.assertEqual(len(self.commands), 1)
         command = self.commands[0]
         self.assertEqual(command[command.index("--to") + 1], "claude3")
-        self.assertNotEqual(command[command.index("--to") + 1], "default")
+        self.assertNotEqual(command[command.index("--to") + 1], "claude2")
         saved = record.all_session_records()
         self.assertEqual(len(saved), 1)
         self.assertEqual(saved[0]["login"], "main@example.invalid")
