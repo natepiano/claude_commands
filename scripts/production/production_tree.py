@@ -9,8 +9,9 @@ member is its Codex thread id, since a worker has no Claude session. The edges:
 - a showrunner to each unit director marked with its production, role `unit`;
 - a unit director to each worker of its run, with the worker's role from `mesh_roster.json`.
 
-Only local records are read, nothing over ssh, and an edge is printed only while both ends run
-on this machine: a unit whose showrunner is gone has none. cargo-handler polls this every 30
+Only local records are read, nothing over ssh. An edge is printed while its member runs on this
+machine; its manager may run on another one, since cargo-handler joins session ids across machines,
+so a showrunner is named by its production's update timer wherever it runs. cargo-handler polls this every 30
 seconds, so it never prompts and answers well under a second. A source that cannot be read
 leaves its edges out and says why on stderr.
 """
@@ -56,8 +57,8 @@ def _json_object(path: Path) -> dict[str, object]:
     return cast(dict[str, object], raw) if isinstance(raw, dict) else {}
 
 
-def showrunner_sessions(running: set[str]) -> dict[str, str]:
-    """Each production slug to its showrunner's session id, while that session runs."""
+def showrunner_sessions() -> dict[str, str]:
+    """Each production slug to its showrunner's session id, from its update timer, wherever it runs."""
     found: dict[str, str] = {}
     for instance in sorted(showrunners.NOTIFIER_STATE_DIR.glob("showrunner-*")):
         try:
@@ -66,15 +67,16 @@ def showrunner_sessions(running: set[str]) -> dict[str, str]:
             continue
         target = next((line.removeprefix("TARGET=") for line in lines if line.startswith("TARGET=")), "")
         session_id = target.removeprefix("session:") if target.startswith("session:") else ""
-        if session_id in running:
+        if session_id:
             found[instance.name.removeprefix("showrunner-")] = session_id
     return found
 
 
-def showrunner_edges(sessions: dict[str, str]) -> list[Edge]:
+def showrunner_edges(sessions: dict[str, str], running: set[str]) -> list[Edge]:
     return [
         Edge(manager=sessions[parent], member=sessions[child], role="showrunner")
         for child, parent in sorted(showrunners.edges(set(sessions)).items())
+        if sessions[child] in running
     ]
 
 
@@ -141,8 +143,8 @@ def worker_edges(running: set[str]) -> list[Edge]:
 
 def tree() -> list[Edge]:
     running = {record["sessionId"] for record in running_sessions()}
-    sessions = showrunner_sessions(running)
-    return [*showrunner_edges(sessions), *unit_edges(sessions, running), *worker_edges(running)]
+    sessions = showrunner_sessions()
+    return [*showrunner_edges(sessions, running), *unit_edges(sessions, running), *worker_edges(running)]
 
 
 def main(argv: list[str]) -> int:

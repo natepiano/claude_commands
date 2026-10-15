@@ -98,16 +98,25 @@ class ProductionTreeTests(unittest.TestCase):
             {"manager": OLD_DIRECTOR, "member": "thread-fix", "role": "fix"},
         ])
 
-    def test_an_end_that_is_not_running_leaves_its_edges_out(self) -> None:
+    def test_a_manager_on_another_machine_keeps_its_edges(self) -> None:
         _ = self.run_folder("unit", DIRECTOR, {"a-impl": {"thread_id": "thread-impl", "role": "impl", "status": "running"}}, server=False)
         _ = self.run_folder("unit", ORPHAN, {"c-impl": {"thread_id": "thread-orphan", "role": "impl", "status": "running"}})
         edges = self.tree({CHILD_RUNNER, DIRECTOR, ORPHAN}, {
             "main": {"one": unit(DIRECTOR, "one")},
             "gone": {"orphan": unit(ORPHAN, "orphan")},
         })
-        # The main showrunner is not running, so its child and its unit have no manager; the
-        # director's server has stopped, so its worker is gone; the orphan's own worker still runs.
-        self.assertEqual(edges, [{"manager": ORPHAN, "member": "thread-orphan", "role": "impl"}])
+        # Neither showrunner runs here, yet each timer names its session, so its child and its
+        # units keep their manager; the director's server has stopped, so its worker is gone.
+        self.assertEqual(edges, [
+            {"manager": RUNNER, "member": CHILD_RUNNER, "role": "showrunner"},
+            {"manager": GONE_RUNNER, "member": ORPHAN, "role": "unit"},
+            {"manager": RUNNER, "member": DIRECTOR, "role": "unit"},
+            {"manager": ORPHAN, "member": "thread-orphan", "role": "impl"},
+        ])
+
+    def test_a_member_that_is_not_running_here_leaves_its_edges_out(self) -> None:
+        edges = self.tree({RUNNER}, {"main": {"one": unit(DIRECTOR, "one")}})
+        self.assertEqual(edges, [])
 
     def test_unreadable_unit_marks_keep_the_other_edges(self) -> None:
         with mock.patch.object(production_tree, "running_sessions", return_value=[record(RUNNER), record(CHILD_RUNNER)]), \
