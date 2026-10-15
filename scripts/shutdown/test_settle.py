@@ -91,6 +91,7 @@ def common_session(
         "cwd": f"/tmp/{session_id}",
         "status": status,
         "updated_at": 0,
+        "probe": False,
         "model": inventory.NoReplyYet(kind="no reply yet"),
         "checkout": checkout(ahead=ahead, path=f"/tmp/{session_id}"),
         "run_dirs": [],
@@ -217,7 +218,7 @@ def session_shutdown(session: inventory.Session, *, progress: record.SessionProg
     return record.SessionShutdown(
         login=LOGIN, label=LABEL, machine="natedev", requested_at=NOW, request_id=request_id,
         requested_by={"kind": "session", "session_id": requester} if requester else {"kind": "terminal"},
-        hold="session", then=then, force="wait for ready", alerts="user", session=session,
+        hold="session", then=then, force="wait for ready", alerts="user", probe=False, session=session,
         workers=[], timers=[], settle_message={"kind": "not sent"}, where={"kind": "not said"},
         progress=progress or {"kind": "waiting"}, trail=[], stop_issues=[],
     )
@@ -1728,6 +1729,36 @@ class SettleTests(ShutdownTestCase):
                 then="restart", target="claude3"), 0)
         self.assertEqual(record.session_records(LOGIN)[0]["requested_by"],
             record.FromSession(kind="session", session_id="self-id"))
+
+    def test_probe_begin_overrides_user_alerts_and_due_holdout_never_pushes(self) -> None:
+        owner = top_level("probe-owner", "Probe", status="busy")
+        owner["probe"] = True
+        with patch.object(settle, "run_inventory", return_value=machine_inventory([owner])):
+            added = settle.begin(LOGIN, only=[owner["session_id"]], request_id="probe-request",
+                                 then="restart", alerts="user")
+        self.assertEqual(len(added), 1)
+        stored = record.find_session(LOGIN, owner["session_id"])
+        assert stored is not None
+        self.assertTrue(stored["probe"])
+        self.assertEqual(stored["alerts"], "none")
+
+        def mark_pause_sent(current: record.SessionShutdown) -> None:
+            current["settle_message"] = {"kind": "sent", "at": NOW}
+            current["reasked_at"] = NOW
+        _ = record.update_session(LOGIN, owner["session_id"], mark_pause_sent)
+        with (patch.object(settle, "now_utc", return_value=NOW_UTC + timedelta(hours=3)),
+              patch.object(settle, "run_inventory", return_value=machine_inventory([owner])),
+              patch.object(settle, "send_message", return_value=settle.MessageSent(kind="sent")),
+              patch.object(settle, "alert_user") as alert,
+              patch.object(stop_work, "stop_session") as stop,
+              patch.object(time, "sleep", side_effect=PassObserved),
+              self.assertRaises(PassObserved)):
+            _ = settle.conduct(LOGIN)
+        alert.assert_not_called()
+        stop.assert_not_called()
+        current = record.find_session(LOGIN, owner["session_id"])
+        assert current is not None
+        self.assertNotIn("alerted_at", current)
 
     def test_begin_attaches_owned_workers_and_second_request_adds_only_new_owner(self) -> None:
         first, second = top_level("first", "First"), top_level("second", "Second")
@@ -3403,11 +3434,10 @@ class SettleTests(ShutdownTestCase):
                     return machine_inventory([restored["session"], other["session"]])
                 with patch.object(settle, "run_inventory", side_effect=observe), patch.object(settle, "SETTLE_INTERVAL_SECONDS", 0.001), patch.object(restart_work, "relaunch_session", side_effect=self.fake_launch), patch.object(restart_work, "wait_for_confirmation", side_effect=confirmed), patch.object(restart_work, "confirm_entry", side_effect=self.fake_confirm), patch.object(restart_work, "wait_for_remote_control", side_effect=check), patch.object(remote_control, "launch_fixer") as fixer, patch.object(stop_work, "stop_session", side_effect=ignoring_idle_reason(stop)), patch.object(settle, "_send_settle_message"), patch.object(settle, "alert_user") as alert, patch.object(settle, "report_stop"), redirect_stdout(io.StringIO()) as output:
                     self.assertEqual(settle.conduct(LOGIN), 0)
-                self.assertIn("Restored: Remote Control not on yet;", output.getvalue())
+                self.assertNotIn("Remote Control", output.getvalue())
                 self.assertIsNone(record.find_session(LOGIN, restored["session"]["session_id"]))
                 alert.assert_not_called()
-                fixer.assert_called_once_with("restored-" + policy, 912, "resumed-start", "Restored", policy, "Restored")
-                self.assertIn("turning it on in the background", output.getvalue())
+                fixer.assert_called_once_with("restored-" + policy, 912, "resumed-start", "Restored", "Restored")
                 record.archive_session(LOGIN, other["session"]["session_id"])
 
     def test_user_alert_wait_covers_configured_review_and_remote_transport(self) -> None:

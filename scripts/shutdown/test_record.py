@@ -82,6 +82,7 @@ def change_old(login: str, change: Callable[[LegacyRecordFixture], None]) -> Non
 def session(number: int = 1) -> inventory.TopLevelSession:
     return inventory.TopLevelSession(
         kind="top-level",
+        probe=False,
         session_id=f"session-{number}",
         pid=10_000 + number,
         proc_start=f"start-{number}",
@@ -157,7 +158,7 @@ def session_shutdown(
         login=login, label=login.split("@", 1)[0], machine="natedev",
         requested_at=requested_at, requested_by=record.FromTerminal(kind="terminal"),
         request_id=f"legacy-natedev-{NOW}",
-        hold=hold, then="stop", force="wait for ready", alerts="user",
+        hold=hold, then="stop", force="wait for ready", alerts="user", probe=False,
         session=saved_entry["session"], workers=[], timers=saved_entry["timers"],
         settle_message=saved_entry["settle_message"], where=saved_entry["where"],
         progress=cast(record.SessionProgress, saved_entry["progress"]), trail=[], stop_issues=[],
@@ -174,7 +175,7 @@ def account_hold(login: str = "owner@example.com") -> record.AccountHold:
 
 def owned_worker(owner: str = "session-1") -> inventory.WorkerSession:
     return inventory.WorkerSession(
-        kind="worker", session_id="worker-1", pid=20001, proc_start="worker-start",
+        kind="worker", probe=False, session_id="worker-1", pid=20001, proc_start="worker-start",
         name="worker", cwd="/tmp/worker", status="idle", updated_at=0,
         model=inventory.NoReplyYet(kind="no reply yet"),
         checkout=inventory.NotACheckout(kind="not a checkout"),
@@ -927,6 +928,7 @@ class SessionRecordTests(ShutdownTestCase):
                 self.assertEqual(converted[0]["hold"], "account")
                 self.assertEqual(converted[0]["then"], "restart")
                 self.assertEqual(converted[0]["alerts"], "user")
+                self.assertFalse(converted[0]["probe"])
                 self.assertEqual(converted[0]["force"], "now")
                 expected = "stopped" if state in {"down", "restarting"} else "waiting"
                 self.assertEqual(converted[0]["progress"]["kind"], expected)

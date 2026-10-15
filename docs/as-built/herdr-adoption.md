@@ -160,7 +160,8 @@ prompt is refused with a line saying so; nothing is typed into the prompt.
     with `record_place` on the registry record it just observed, reads it with
     `read_place` for `/remote-control is active`, and types `/remote-control`
     with `type_place` while the registry shows the session idle; herdr
-    `AgentBlocked` uses no attempt.
+    `AgentBlocked` uses no attempt. Recovery and failures stay in the service
+    log; no Remote Control message or phone push is sent.
 - `promote_showrunner.py` refuses before anything stops when `read_place`
   fails or `unit_effort.verdict` skips the screen. `stop` types `/exit` with
   `type_place`, waits for the pid to exit, then ends the host session: tmux

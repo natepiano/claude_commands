@@ -51,7 +51,7 @@ These aliases come from natedev's shell configuration after a rebuild; the Mac h
 ~/.claude/scripts/lib/py ~/.claude/scripts/accounts/accounts.py exec unit
 ```
 
-Arguments after the label pass through to `claude`.
+Arguments after the label pass through to `claude`. `--probe` goes before the label: `accounts.py exec --probe claude3 -n check-idle` sets `CLAUDE_PROBE_SESSION=1` for a throwaway session. Its shutdown record always has `probe: true` and `alerts: "none"`; restart and move preserve the marker. Even a direct `send.py --to user` from that session sends no phone push.
 
 Configuration decides the account every launch starts on: new, standby and resumed units and nightly reviews use the units account; new and resumed showrunners use the showrunners account. Set a group with `accounts.py move units|showrunners claudeN`. An unconfigured group refuses with that command; an `--account` or `--config-dir` override must name its configured account. Each unit launch saves its config directory and model on tmux for observation; that directory no longer chooses a resume account. A numbered selection whose login matches `~/.claude` runs there, with `CLAUDE_CONFIG_DIR` and `CLAUDE_CODE_REMOTE_MEMORY_DIR` removed. The same launch removes any inherited OAuth token. Commands accept account numbers only; `default` refuses and reports each home’s current number.
 
