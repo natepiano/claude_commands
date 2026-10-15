@@ -87,6 +87,7 @@ class CommandLine(argparse.Namespace):
     pid: int = 0
     proc_start: str = ""
     who: str = ""
+    session: str = ""
     alerts: Literal["user", "none"] = "none"
     then: ShutdownContinuation = "stop"
 
@@ -650,7 +651,7 @@ def main(arguments: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter,
         usage="in this terminal: ~/.claude/scripts/lib/py ~/.claude/scripts/shutdown/shutdown.py <verb> [arguments]",
-        epilog="Run in this terminal: ~/.claude/scripts/lib/py ~/.claude/scripts/shutdown/shutdown.py <verb> <account> [--only ID[,ID...]].\nFollow in this terminal: ~/.claude/scripts/lib/py ~/.claude/scripts/shutdown/shutdown.py follow <account> --request <request-id>.\nInternal fixer in this terminal: ~/.claude/scripts/lib/py ~/.claude/scripts/shutdown/shutdown.py remote-control <session-id> --pid <pid> --proc-start <start> --who <name> --alerts <user|none>.",
+        epilog="Run in this terminal: ~/.claude/scripts/lib/py ~/.claude/scripts/shutdown/shutdown.py <verb> <account> [--only ID[,ID...]].\nFollow in this terminal: ~/.claude/scripts/lib/py ~/.claude/scripts/shutdown/shutdown.py follow <account> --request <request-id>.\nInternal fixer in this terminal: ~/.claude/scripts/lib/py ~/.claude/scripts/shutdown/shutdown.py remote-control <session-id> --pid <pid> --proc-start <start> --who <name> --session <session-name> --alerts <user|none>.",
     )
     commands = parser.add_subparsers(
         dest="command",
@@ -679,6 +680,7 @@ def main(arguments: list[str] | None = None) -> int:
     _ = control.add_argument("--pid", type=int, required=True)
     _ = control.add_argument("--proc-start", required=True)
     _ = control.add_argument("--who", required=True)
+    _ = control.add_argument("--session", required=True)
     _ = control.add_argument("--alerts", choices=("user", "none"), required=True)
     records = commands.add_parser("records")
     _ = records.add_argument("--json", action="store_true", dest="as_json")
@@ -729,7 +731,7 @@ def main(arguments: list[str] | None = None) -> int:
     if options.command == "remote-control":
         if options.pid <= 0 or not options.proc_start:
             parser.error("remote-control requires a positive pid and nonempty process start")
-        outcome = remote_control.fix(options.session_id, options.pid, options.proc_start, options.who, options.alerts)
+        outcome = remote_control.fix(options.session_id, options.pid, options.proc_start, options.who, options.alerts, options.session)
         return 1 if isinstance(outcome, remote_control.Failed) else 0
 
     if options.command == "held-sessions":

@@ -3202,12 +3202,13 @@ class RestartTests(ShutdownTestCase):
                     self.assertEqual(cast(dict[str, object], json.loads(history[-1].read_text()))["progress"], {"kind": "restarted", "at": RESTARTED})
                     alert.assert_not_called()
                     fixer_policy = policy if isinstance(command_alerts, restart.AlertWhenNotBack) else "none"
-                    fixer.assert_called_once_with("owner", 912, "resumed-start", "Owner", fixer_policy)
+                    fixer.assert_called_once_with("owner", 912, "resumed-start", "Owner", fixer_policy, "Owner")
                     self.assertIn("turning it on in the background", output.getvalue())
 
     def test_remote_control_fixer_argv_carries_effective_alert_policy(self) -> None:
         self.allow_leaf(ShutdownSendLeaf.LAUNCH_REMOTE_CONTROL_FIXER)
-        saved = entry(top_level("owner", name="Owner"))
+        saved = entry(unit("owner"))
+        saved["session"]["name"] = "Owner"
         confirmed = restart.RegistryConfirmation((sessions.SessionRecord(pid=912,
             sessionId="owner", name="Owner", procStart="resumed-start",
             messagingSocketPath="", updatedAt=1, tmux="", formerNames=[]),))
@@ -3224,11 +3225,14 @@ class RestartTests(ShutdownTestCase):
                 argv = cast(list[str], launch.call_args.args[0])
                 self.assertEqual(argv[argv.index("--alerts") + 1], expected)
                 self.assertEqual(argv[argv.index("--pid") + 1], "912")
+                self.assertEqual(argv[argv.index("--who") + 1], "owner unit")
+                self.assertEqual(argv[argv.index("--session") + 1], "Owner")
                 self.assertEqual(argv[argv.index("--proc-start") + 1], "resumed-start")
                 alert.assert_not_called()
 
     def test_remote_control_launch_failure_prints_manual_action_and_only_alerts_when_allowed(self) -> None:
-        saved = entry(top_level("owner", name="Owner"))
+        saved = entry(unit("owner"))
+        saved["session"]["name"] = "Owner"
         confirmed = restart.RegistryConfirmation((sessions.SessionRecord(pid=912,
             sessionId="owner", name="Owner", procStart="resumed-start",
             messagingSocketPath="", updatedAt=1, tmux="", formerNames=[]),))
@@ -3239,12 +3243,15 @@ class RestartTests(ShutdownTestCase):
                     output = io.StringIO()
                     with (patch.object(restart, "wait_for_remote_control", return_value=frozenset()),
                           patch.object(remote_control, "launch_fixer", side_effect=OSError("service unavailable")) as launch,
-                          patch.object(remote_control, "alert_failed") as alert, redirect_stdout(output)):
+                          patch.object(settle, "alert_user") as alert, redirect_stdout(output)):
                         _ = restart.remote_control_missing([saved], confirmed, notify=notify)
-                    launch.assert_called_once_with("owner", 912, "resumed-start", "Owner", policy if notify else "none")
+                    launch.assert_called_once_with("owner", 912, "resumed-start", "owner unit", policy if notify else "none", "Owner")
                     self.assertEqual(output.getvalue(), "Owner: Remote Control is off; turn it on at its terminal with /remote-control\n")
                     if policy == "user" and notify:
-                        alert.assert_called_once_with("Owner")
+                        alert.assert_called_once()
+                        push = cast(RenderedPush, alert.call_args.args[0])
+                        self.assertEqual(push.title, "owner unit remote-control is off")
+                        self.assertEqual(push.message, "Session: Owner\nAction: run /remote-control\nReason: Remote control is off.")
                     else:
                         alert.assert_not_called()
 

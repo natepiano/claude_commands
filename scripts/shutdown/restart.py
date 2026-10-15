@@ -448,11 +448,11 @@ def remote_control_missing(records: list[SessionShutdown], confirmation: Registr
         who = remote_control.remote_control_who(by_id[item["session_id"]])
         alerts = item["alerts"] if notify else "none"
         try:
-            remote_control.launch_fixer(item["session_id"], live["pid"], live.get("procStart", ""), who, alerts)
+            remote_control.launch_fixer(item["session_id"], live["pid"], live.get("procStart", ""), who, alerts, item["name"])
         except (OSError, RuntimeError, ValueError, subprocess.SubprocessError):
             print(f"{item['name']}: Remote Control is off; turn it on at its terminal with /remote-control")
             if alerts == "user":
-                remote_control.alert_failed(who)
+                remote_control.alert_failed(who, item["name"])
         else:
             print(f"{item['name']}: Remote Control not on yet; turning it on in the background")
     return missing

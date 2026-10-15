@@ -133,6 +133,21 @@ class PushTextTests(unittest.TestCase):
             + "Action: answer the open form, or run the command below to stop Owner\n"
             + "Reason: Restart is blocked because Owner's claude session is not answering, and it can't proceed.")
 
+    def test_remote_control_examples_keep_role_in_title_and_session_in_message(self) -> None:
+        entry = next(entry for entry in push_texts.catalog() if entry.id == "shutdown.remote_control")
+        expected = {
+            "typical": ("Owner", "Owner"),
+            "unit": ("trunk unit", "build-followups-trunk-unit-director"),
+            "showrunner": ("demo showrunner", "build-followups-director"),
+        }
+        for example in entry.examples:
+            with self.subTest(example=example.name):
+                who, session = expected[example.name]
+                push = push_texts.render_entry(entry, example.values)
+                self.assertEqual(push.title + "\n" + push.message,
+                    f"{who} remote-control is off\nSession: {session}\n"
+                    + "Action: run /remote-control\nReason: Remote control is off.")
+
     def test_holdout_reports_time_already_waited_within_the_message_limit(self) -> None:
         entry = next(entry for entry in push_texts.catalog() if entry.id == "shutdown.holdout")
         push = push_texts.render_entry(entry, entry.examples[0].values)

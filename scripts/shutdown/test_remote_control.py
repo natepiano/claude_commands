@@ -118,7 +118,7 @@ class RemoteControlTests(ShutdownTestCase):
     def run_fix(self, alerts: Literal["user", "none"] = "user") -> tuple[remote_control.RemoteControlOutcome, str, list[RenderedPush]]:
         output = io.StringIO()
         with patch.object(settle, "alert_user") as alert, redirect_stdout(output):
-            outcome = remote_control.fix("owner", 321, "original", "trunk unit", alerts, clock=self.clock)
+            outcome = remote_control.fix("owner", 321, "original", "trunk unit", alerts, "Owner", clock=self.clock)
         lines = output.getvalue().splitlines()
         self.assertEqual(len(lines), 1, output.getvalue())
         self.assertTrue(lines[0].startswith("trunk unit:"))
@@ -205,7 +205,8 @@ class RemoteControlTests(ShutdownTestCase):
         self.assertIn("Remote Control failed", text)
         self.assertEqual(len(pushes), 1)
         self.assertEqual(pushes[0].id, "shutdown.remote_control")
-        self.assertIn("trunk unit", pushes[0].title + pushes[0].body)
+        self.assertEqual(pushes[0].title, "trunk unit remote-control is off")
+        self.assertEqual(pushes[0].message, "Session: Owner\nAction: run /remote-control\nReason: Remote control is off.")
 
     def test_missing_pane_waits_for_launch_flag_then_pushes_without_typing(self) -> None:
         with patch.object(session_pane, "record_place", side_effect=session_pane.NoSuchTarget("owner")):
@@ -348,14 +349,14 @@ class RemoteControlTests(ShutdownTestCase):
         self.allow_leaf(ShutdownSendLeaf.LAUNCH_REMOTE_CONTROL_FIXER)
         for platform in ("linux", "darwin"):
             with self.subTest(platform=platform), patch.object(sys, "platform", platform), patch.object(subprocess, "run", return_value=subprocess.CompletedProcess([], 0)) as launch:
-                remote_control.launch_fixer("owner-identifier", 321, "original start", "trunk unit", "none")
+                remote_control.launch_fixer("owner-identifier", 321, "original start", "trunk unit", "none", "Owner")
             launch.assert_called_once()
             argv = cast(list[str], launch.call_args.args[0])
             self.assertEqual(argv[0], "launchctl" if platform == "darwin" else "systemd-run")
             env = argv.index("env")
             self.assertEqual(argv[env:], ["env", "PYTHONUNBUFFERED=1", sys.executable, "-u",
                 str(Path(remote_control.__file__).with_name("shutdown.py")), "remote-control", "owner-identifier",
-                "--pid", "321", "--proc-start", "original start", "--who", "trunk unit", "--alerts", "none"])
+                "--pid", "321", "--proc-start", "original start", "--who", "trunk unit", "--alerts", "none", "--session", "Owner"])
             service = argv[argv.index("-l" if platform == "darwin" else "--unit") + 1]
             self.assertEqual(service, "shutdown-remote-control-owner-identi-321")
             if platform == "linux":

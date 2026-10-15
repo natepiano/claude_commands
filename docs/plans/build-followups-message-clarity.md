@@ -276,7 +276,7 @@ Outside `scripts/accounts/` and `scripts/whoami/`, every delegate agent is a "wo
 
 **Ruled out:** applying a reviewer's rewrite of the user's own four lines (objections are recorded, not applied).
 
-### Phase 13 — The remote-control alert in the user's four lines  · status: todo
+### Phase 13 — The remote-control alert in the user's four lines  · status: done
 
 **Depends on:** Phase 12; shutdown checkpoint 0dcaadac merged to build-followups (it is, as 34e46574)
 

@@ -229,15 +229,86 @@
     }
   },
   "shutdown.remote_control": {
-    "long_session": {
-      "reviewer": "opus",
-      "sha256": "b83aeaa99069f8f8022ddb70b6d144fbee382feff2bb8499e9bb611f21602273",
-      "time": "2026-10-14T04:30:40.524520-04:00"
+    "showrunner": {
+      "objections": [
+        {
+          "quote": "demo showrunner remote-control is off",
+          "rule": "reader-starts-cold"
+        },
+        {
+          "quote": "run /remote-control",
+          "rule": "say-where-to-act"
+        },
+        {
+          "quote": "Reason: Remote control is off.",
+          "rule": "what-happened-why-what-you-do"
+        },
+        {
+          "quote": "demo showrunner remote-control is off",
+          "rule": "title-names-the-stake"
+        },
+        {
+          "quote": "run /remote-control",
+          "rule": "push-only-what-the-user-must-do"
+        }
+      ],
+      "reviewer": "user-spec: user, 2026-10-14 16:3x EDT via the showrunner; reviewer: opus",
+      "sha256": "ed68cac320caa0b753d02afc9adb790676b21626e0911011ad0541c61e38ee4b",
+      "time": "2026-10-14T20:39:29.158352-04:00"
     },
     "typical": {
-      "reviewer": "opus",
-      "sha256": "b83aeaa99069f8f8022ddb70b6d144fbee382feff2bb8499e9bb611f21602273",
-      "time": "2026-10-14T04:30:33.860063-04:00"
+      "objections": [
+        {
+          "quote": "Owner remote-control is off",
+          "rule": "reader-starts-cold"
+        },
+        {
+          "quote": "run /remote-control",
+          "rule": "say-where-to-act"
+        },
+        {
+          "quote": "Reason: Remote control is off.",
+          "rule": "what-happened-why-what-you-do"
+        },
+        {
+          "quote": "Reason: Remote control is off.",
+          "rule": "short-plain-sentences"
+        },
+        {
+          "quote": "Owner remote-control is off",
+          "rule": "title-names-the-stake"
+        }
+      ],
+      "reviewer": "user-spec: user, 2026-10-14 16:3x EDT via the showrunner; reviewer: opus",
+      "sha256": "ed68cac320caa0b753d02afc9adb790676b21626e0911011ad0541c61e38ee4b",
+      "time": "2026-10-14T20:39:05.958004-04:00"
+    },
+    "unit": {
+      "objections": [
+        {
+          "quote": "trunk unit remote-control is off",
+          "rule": "reader-starts-cold"
+        },
+        {
+          "quote": "run /remote-control",
+          "rule": "say-where-to-act"
+        },
+        {
+          "quote": "Reason: Remote control is off.",
+          "rule": "what-happened-why-what-you-do"
+        },
+        {
+          "quote": "trunk unit remote-control is off",
+          "rule": "title-names-the-stake"
+        },
+        {
+          "quote": "Reason: Remote control is off.",
+          "rule": "short-plain-sentences"
+        }
+      ],
+      "reviewer": "user-spec: user, 2026-10-14 16:3x EDT via the showrunner; reviewer: opus",
+      "sha256": "ed68cac320caa0b753d02afc9adb790676b21626e0911011ad0541c61e38ee4b",
+      "time": "2026-10-14T20:39:18.850210-04:00"
     }
   },
   "shutdown.restart_failed": {

@@ -1271,22 +1271,65 @@ class TextApproval(TypedDict):
     sha256: str
     time: str
     reviewer: str
+    objections: NotRequired[list[RuleFailureRecord]]
 
 
-def texts(ids: list[str], approve: bool = False, *, runner: ProcessRunner = run_process) -> int:
+@dataclass(frozen=True)
+class ReviewerApprovalRequired:
+    pass
+
+
+@dataclass(frozen=True)
+class UserSpecifiedText:
+    source: str
+
+
+TextApprovalAuthority = ReviewerApprovalRequired | UserSpecifiedText
+REVIEWER_APPROVAL_REQUIRED = ReviewerApprovalRequired()
+
+
+def text_approvals(value: object) -> dict[str, dict[str, TextApproval]]:
+    approvals: dict[str, dict[str, TextApproval]] = {}
+    for text_id, examples in _object(value).items():
+        approvals[text_id] = {}
+        for name, raw in _object(examples).items():
+            record = _object(raw)
+            approval = TextApproval(sha256=_text(record, "sha256"), time=_text(record, "time"),
+                                    reviewer=_text(record, "reviewer"))
+            if "objections" in record:
+                objections = record["objections"]
+                if not isinstance(objections, list):
+                    raise ValueError("objections")
+                approval["objections"] = []
+                for item in cast(list[object], objections):
+                    objection = _object(item)
+                    approval["objections"].append(RuleFailureRecord(
+                        rule=_text(objection, "rule"), quote=_text(objection, "quote")))
+            approvals[text_id][name] = approval
+    return approvals
+
+
+def texts(ids: list[str], approve: bool = False, *, runner: ProcessRunner = run_process,
+          authority: TextApprovalAuthority = REVIEWER_APPROVAL_REQUIRED) -> int:
     import push_texts
+    if isinstance(authority, UserSpecifiedText) and (not approve or not authority.source.strip()):
+        raise ValueError("a user spec requires --approve and a nonempty source")
     entries = push_texts.catalog()
     unknown = set(ids) - {entry.id for entry in entries}
     if unknown:
         raise ValueError("unknown push text ids: " + ", ".join(sorted(unknown)))
     approvals: dict[str, dict[str, TextApproval]] = {}
     if approve and push_texts.REVIEWED_FILE.exists():
-        approvals = cast(dict[str, dict[str, TextApproval]], json.loads(push_texts.REVIEWED_FILE.read_text(encoding="utf-8")))
+        approvals = text_approvals(cast(object, json.loads(push_texts.REVIEWED_FILE.read_text(encoding="utf-8"))))
     failed = False
     timeout_seconds = review_timeout_seconds()
     for entry in entries:
         if ids and entry.id not in ids:
             continue
+        if approve and entry.id in approvals:
+            current_examples = {example.name for example in entry.examples}
+            approvals[entry.id] = {name: approval for name, approval in approvals[entry.id].items()
+                                   if name in current_examples}
         digest = push_texts.fingerprint(entry)
         for example in entry.examples:
             rendered = push_texts.render_entry(entry, example.values)
@@ -1297,9 +1340,15 @@ def texts(ids: list[str], approve: bool = False, *, runner: ProcessRunner = run_
             log_review(draft, outcome, dry=True, text_id=entry.id)
             passed = isinstance(outcome, Approved) and outcome.draft == draft
             failed |= not passed
-            if approve and passed:
-                approvals.setdefault(entry.id, {})[example.name] = TextApproval(
+            if approve and (passed or isinstance(authority, UserSpecifiedText)):
+                approval = TextApproval(
                     sha256=digest, time=datetime.now().astimezone().isoformat(), reviewer=outcome.metadata.model)
+                if isinstance(authority, UserSpecifiedText):
+                    approval["reviewer"] = f"user-spec: {authority.source}; reviewer: {outcome.metadata.model}"
+                    approval["objections"] = ([RuleFailureRecord(rule=failure.rule, quote=failure.quote)
+                                               for failure in outcome.failures]
+                                              if not isinstance(outcome, Approved) else [])
+                approvals.setdefault(entry.id, {})[example.name] = approval
     if approve:
         scratch = push_texts.REVIEWED_FILE.with_suffix(".tmp")
         _ = scratch.write_text(json.dumps(approvals, indent=2, sort_keys=True) + "\n", encoding="utf-8")
@@ -1325,6 +1374,7 @@ def main(argv: list[str]) -> int:
     text_parser = commands.add_parser("texts")
     _ = text_parser.add_argument("--id", action="append", default=[])
     _ = text_parser.add_argument("--approve", action="store_true")
+    _ = text_parser.add_argument("--user-spec", metavar="SOURCE")
     release_parser = commands.add_parser("release")
     _ = release_parser.add_argument("--identity", required=True)
     _ = release_parser.add_argument("source")
@@ -1346,7 +1396,13 @@ def main(argv: list[str]) -> int:
     arguments = parser.parse_args(argv)
     command = cast(str, arguments.command)
     if command == "texts":
-        return texts(cast(list[str], arguments.id), cast(bool, arguments.approve))
+        source = cast(str | None, arguments.user_spec)
+        authority: TextApprovalAuthority = REVIEWER_APPROVAL_REQUIRED
+        if source is not None:
+            if not cast(bool, arguments.approve) or not source.strip():
+                parser.error("--user-spec requires --approve and a nonempty source")
+            authority = UserSpecifiedText(source)
+        return texts(cast(list[str], arguments.id), cast(bool, arguments.approve), authority=authority)
     if command == "release":
         print(release_if_matches(cast(str, arguments.source), cast(str, arguments.identity)).value)
         return 0

@@ -2680,7 +2680,7 @@ class SettleTests(ShutdownTestCase):
                 self.assertIn("Restored: Remote Control not on yet;", output.getvalue())
                 self.assertIsNone(record.find_session(LOGIN, restored["session"]["session_id"]))
                 alert.assert_not_called()
-                fixer.assert_called_once_with("restored-" + policy, 912, "resumed-start", "Restored", policy)
+                fixer.assert_called_once_with("restored-" + policy, 912, "resumed-start", "Restored", policy, "Restored")
                 self.assertIn("turning it on in the background", output.getvalue())
                 record.archive_session(LOGIN, other["session"]["session_id"])
 
