@@ -232,7 +232,7 @@ of reviewing the partial diff.
    remaining hunks. Verify spec, extras, codebase fit, <TypeDesignContract/>, and
    `${IMPL_SUMMARY}` claims. On pass 1 only, run the style review named by
    <PhaseChecks/>: read `~/.claude/commands/unit/style_review.md` in full and
-   apply <StyleReview/> with `since <commit from ${SESSION_DIR}/phase_baseline>`
+   apply <StyleReview/> with `since <commit from ${PHASE_DIR}/phase_baseline>`
    and `${SESSION_DIR}` as its directory; supply the phase's findings ledger.
    A missing or invalid baseline stops the review. Save its table and result to
    `${SESSION_DIR}/phase_style_review_<phase-id>.md`, including `Off` or an
