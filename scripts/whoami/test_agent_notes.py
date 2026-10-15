@@ -139,8 +139,8 @@ class AgentNotesTests(unittest.TestCase):
         _ = self.note("claude2.md", "spare@example.invalid")
         self.codex_login(self.root / ".codex", "worker@example.invalid")
         _ = self.note("codex2.md", "worker@example.invalid")
-        accounts.set_group_account("units", "claude1", why="fixture", now=self.now)
-        accounts.set_group_account("showrunners", "claude1", why="fixture", now=self.now)
+        _ = accounts.set_group_account("units", "claude1", why="fixture", now=self.now)
+        _ = accounts.set_group_account("showrunners", "claude1", why="fixture", now=self.now)
         row = session_table.SessionRow("director", "unit", "natedev", "/home/nate/project", "sid-1")
         self.rows.return_value = session_table.ReadSessions({"claude1": (row,)}, frozenset())
         _ = self.snapshot([])
@@ -215,7 +215,7 @@ class AgentNotesTests(unittest.TestCase):
     def test_role_or_session_changes_alone_do_not_create_usage_observations(self) -> None:
         note = self.note("claude1.md", "unit@example.invalid")
         _ = self.snapshot([])
-        accounts.set_group_account("units", "claude1", why="fixture", now=self.now)
+        _ = accounts.set_group_account("units", "claude1", why="fixture", now=self.now)
         self.rows.return_value = session_table.ReadSessions({"claude1": (
             session_table.SessionRow("director", "unit", "natedev", "~/project", "sid-1"),)}, frozenset())
         _ = self.snapshot([])

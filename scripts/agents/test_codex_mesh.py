@@ -2930,6 +2930,32 @@ class MeshCommandTests(unittest.TestCase):
         self.assertEqual(confirmations[0].get("home"), str(target))
         self.assertEqual(journal.read_bytes()[:len(legacy)], legacy)
 
+    def test_resumed_worker_confirms_a_pending_account_move_among_work_routing_entries(self) -> None:
+        target, new = self.prepare_workers_move()
+        stamp = datetime.now(timezone.utc).isoformat()
+        moves.append_routing(moves.RoutedToClaude(kind="routed to claude", at=stamp, tool="codex",
+            fallback_at=stamp, owner="codex1", cause="refusal", moved=["delegate"]))
+        self.request_workers_move("codex9", "codex1", "pending-among-routing")
+        moves.append_routing(moves.RoutedBack(kind="routed back", at=stamp, tool="codex",
+            fallback_at=stamp, owner="codex1", restored=["delegate"], kept=[]))
+        before = moves.store_file().read_bytes()
+        self.assertEqual(accounts.main(["set-role", "seats", "codex1"]), 0)
+        self.write_pool_roster({"worker": {"thread_id": THREAD_ID, "status": "done"}})
+        client = codex_mesh.Client(self.server.port, "worker")
+        try:
+            result = codex_mesh._move_resident(self.start_args(), str(self.session_dir), "worker", THREAD_ID, client)  # pyright: ignore[reportPrivateUsage]
+            self.assertIsInstance(result, codex_mesh.MovedWorker)
+            assert isinstance(result, codex_mesh.MovedWorker)
+            result.client.close()
+        finally:
+            client.close()
+        self.assertTrue(any(request.get("method") == "thread/resume" for request in new.requests))
+        confirmed = [entry for entry in moves.read_moves() if entry["kind"] == "confirmed"]
+        self.assertEqual(len(confirmed), 1)
+        self.assertEqual(confirmed[0]["move_id"], "pending-among-routing")
+        self.assertEqual(confirmed[0].get("home"), str(target))
+        self.assertEqual(moves.store_file().read_bytes()[:len(before)], before)
+
     def assert_legacy_default_move_confirmed(self, *, default_destination: bool) -> None:
         numbered, new = self.prepare_workers_move()
         default = numbered.parent / ".codex"

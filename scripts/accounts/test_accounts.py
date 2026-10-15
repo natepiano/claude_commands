@@ -34,6 +34,12 @@ import agent_accounts
 import usage_store
 
 
+def stored_group_labels(path: Path) -> dict[str, str]:
+    raw = cast(dict[str, object], json.loads(path.read_text()))
+    return {group: value if isinstance(value, str) else cast(str, cast(dict[str, object], value)["label"])
+            for group, value in raw.items()}
+
+
 def named_environment(config_dir: Path) -> dict[str, str]:
     """What a session on a named account's directory starts with."""
     return {
@@ -348,9 +354,9 @@ class AccountsTests(unittest.TestCase):
     def test_group_note_labels_map_each_configured_group_and_omit_unconfigured_groups(self) -> None:
         self.write_note("claude1", "unit@example.invalid")
         self.write_note("claude3", "runner@example.invalid")
-        accounts.set_group_account("units", "claude1", why="fixture", now=datetime.now(timezone.utc))
+        _ = accounts.set_group_account("units", "claude1", why="fixture", now=datetime.now(timezone.utc))
         self.assertEqual(accounts.group_note_labels(), {"units": "claude1"})
-        accounts.set_group_account("showrunners", "claude3", why="fixture", now=datetime.now(timezone.utc))
+        _ = accounts.set_group_account("showrunners", "claude3", why="fixture", now=datetime.now(timezone.utc))
         self.assertEqual(accounts.group_note_labels(), {"units": "claude1", "showrunners": "claude3"})
 
     def test_group_note_labels_resolve_a_stored_default_from_its_actual_login(self) -> None:
@@ -468,8 +474,8 @@ class AccountsTests(unittest.TestCase):
         self.assertIn("codex2", self.run_cli("role", "seats")[1])
         for path, original in before.items():
             self.assertEqual(path.read_bytes(), original)
-        accounts.set_group_account("units", "claude 2", why="canonical write")
-        self.assertEqual(json.loads(groups.read_text()), {"units": "claude2", "showrunners": "claude 2"})
+        _ = accounts.set_group_account("units", "claude 2", why="canonical write")
+        self.assertEqual(stored_group_labels(groups), {"units": "claude2", "showrunners": "claude 2"})
         self.assertEqual(self.run_cli("set-role", "seats", "codex 2")[0], 0)
         self.assertNotIn("codex 2", config.read_text())
         self.assertEqual(history.read_bytes()[:len(before[history])], before[history])
@@ -909,6 +915,32 @@ class AccountsTests(unittest.TestCase):
         self.assertEqual([named.identity.label for named in selection.named_accounts], ["claude4"])
         self.assertTrue(selection.is_home_directory_login("main@example.invalid"))
 
+    def test_exec_supervises_only_an_unsupervised_terminal(self) -> None:
+        self.login_directory("claude2", "main@example.invalid", default=True)
+        self.login_directory("claude3", "unit@example.invalid")
+        for tty, supervised in ((True, False), (True, True), (False, False)):
+            with self.subTest(tty=tty, supervised=supervised):
+                environment = {**os.environ, "PRESERVED_MARKER": "keep"}
+                if supervised:
+                    environment["RELAUNCH_SUPERVISED"] = "1"
+                else:
+                    _ = environment.pop("RELAUNCH_SUPERVISED", None)
+                with (patch.dict(os.environ, environment, clear=True),
+                      patch.object(sys.stdin, "isatty", return_value=tty),
+                      patch.object(os, "execvpe") as launch):
+                    accounts.exec_account("claude3", ["--resume", "conversation-id"])
+                executable, argv, child_environment = cast(tuple[str, list[str], dict[str, str]], launch.call_args.args)
+                if tty and not supervised:
+                    self.assertEqual(executable, sys.executable)
+                    self.assertEqual(argv, [sys.executable,
+                        str(accounts.SCRIPTS / "lib" / "relaunch.py"), "run", "--",
+                        "claude", "--resume", "conversation-id"])
+                else:
+                    self.assertEqual((executable, argv), ("claude", ["claude", "--resume", "conversation-id"]))
+                self.assertEqual(child_environment["CLAUDE_CONFIG_DIR"], str(accounts.account_dir("claude3")))
+                self.assertEqual(child_environment["PRESERVED_MARKER"], "keep")
+                launch.assert_called_once()
+
     def test_exec_reports_an_unavailable_claude_executable_with_exit_two(self) -> None:
         self.login_directory("claude2", "main@example.invalid", default=True)
         with patch.object(os, "execvpe", side_effect=FileNotFoundError("fixture executable missing")):
@@ -1120,10 +1152,13 @@ class AccountsTests(unittest.TestCase):
             code, output, error = self.run_cli("move", "showrunners", "claude3")
         self.assertEqual((code, error), (0, ""))
         self.assertEqual(accounts.group_accounts().get("showrunners"), "claude3")
-        self.assertEqual(output.replace("`", "").splitlines(), ["showrunners: no live session moves", *(
-            f"{runner['slug']}: no session runs under the id its update timer names; "
-            + "a showrunner running under another id is not moved until it runs "
-            + f"update_registration.py register --production {runner['doc']}" for runner in stale)])
+        self.assertIn("showrunners: no live session moves", output)
+        for runner in stale:
+            line = next(line for line in output.splitlines() if line.startswith(runner["slug"] + ":"))
+            self.assertIn("no session runs under the id", line)
+            self.assertIn("in any Claude session on", line)
+            self.assertIn("~/.claude/scripts/lib/py ~/.claude/scripts/production/update_registration.py", line)
+            self.assertIn(f"--production {runner['doc']}", line)
         moved.assert_not_called()
 
     def test_showrunner_group_preview_names_unregistered_timers_without_configuring_or_requesting(self) -> None:
@@ -1138,10 +1173,12 @@ class AccountsTests(unittest.TestCase):
               patch.object(accounts, "move_sessions") as moved):
             code, output, error = self.run_cli("move", "showrunners", "claude3", "--dry-run")
         self.assertEqual((code, error), (0, ""))
-        self.assertEqual(output.replace("`", "").splitlines(), ["showrunners: would select claude3",
-            "showrunners: no live session moves",
-            "missing: no session runs under the id its update timer names; a showrunner running under "
-            + "another id is not moved until it runs update_registration.py register --production /w/missing-production.md"])
+        self.assertIn("showrunners: would select claude3", output)
+        self.assertIn("showrunners: no live session moves", output)
+        self.assertIn("missing: no session runs under the id", output)
+        self.assertIn("in any Claude session on", output)
+        self.assertIn("~/.claude/scripts/lib/py ~/.claude/scripts/production/update_registration.py", output)
+        self.assertIn("--production /w/missing-production.md", output)
         self.assertFalse(accounts.groups_file().exists())
         self.assertFalse(accounts.roles_history_file().exists())
         moved.assert_not_called()
@@ -2875,6 +2912,92 @@ class PickerTests(unittest.TestCase):
             code = accounts.main(list(arguments))
         return code, output.getvalue(), error.getvalue()
 
+    def test_string_groups_read_without_a_transition_and_next_selection_stores_one_object(self) -> None:
+        path = self.groups()
+        original = path.read_bytes()
+        groups = accounts.group_accounts()
+        self.assertEqual(accounts.group_label(groups, "units"), "claude1")
+        self.assertEqual(accounts.group_note_labels(), {"units": "claude1", "showrunners": "claude3"})
+        self.assertIsInstance(accounts.group_transition("units"), accounts.NoGroupTransition)
+        self.assertEqual(path.read_bytes(), original)
+        transition = accounts.set_group_account("units", "claude2", why="operator choice", now=self.now)
+        stored = cast(dict[str, object], json.loads(path.read_text()))
+        selection = cast(dict[str, object], stored["units"])
+        self.assertEqual((selection["label"], selection["cause"], selection["window"]), ("claude2", "by hand", "unknown"))
+        self.assertNotIn("reset", selection)
+        self.assertTrue(selection["move_id"])
+        self.assertEqual(stored["showrunners"], "claude3")
+        self.assertEqual(accounts.group_transition("units"), transition)
+        self.assertEqual(accounts.group_note_labels(), {"units": "claude2", "showrunners": "claude3"})
+
+    def test_mixed_group_writes_keep_every_sibling_field_and_log_only_the_changed_group(self) -> None:
+        transition = {"label": "claude1", "move_id": "original-transition", "cause": "refusal",
+                      "window": "weekly", "reset": "2026-10-20T12:00:00+00:00"}
+        cases: tuple[tuple[dict[str, object], accounts.ClaudeGroup, str, accounts.ClaudeGroup], ...] = (
+            ({"units": "default", "showrunners": transition}, "showrunners", "claude3", "units"),
+            ({"units": transition, "showrunners": "claude3"}, "showrunners", "claude2", "units"),
+            ({"units": transition, "showrunners": "claude3"}, "units", "claude2", "showrunners"))
+        path = accounts.groups_file()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        for selections, changed, target, sibling in cases:
+            with self.subTest(changed=changed, sibling=selections[sibling]):
+                _ = path.write_text(json.dumps(selections))
+                history = accounts.roles_history_file()
+                history.unlink(missing_ok=True)
+                note = self.home / "notes/claude2.md"
+                content = note.read_bytes()
+                if selections["units"] == "default":
+                    note.unlink()
+                try:
+                    _ = accounts.set_group_account(changed, target, why="one group only", now=self.now)
+                finally:
+                    _ = note.write_bytes(content)
+                stored = cast(dict[str, object], json.loads(path.read_text()))
+                self.assertEqual(stored[sibling], selections[sibling])
+                self.assertIsInstance(stored[changed], dict)
+                self.assertNotIn("~/.claude", path.read_text())
+                rows = [cast(dict[str, object], json.loads(line)) for line in history.read_text().splitlines()]
+                self.assertEqual(len(rows), 1)
+                self.assertEqual(rows[0]["group"], changed)
+                selection = cast(dict[str, object], stored[changed])
+                self.assertEqual(rows[0]["move_id"], selection["move_id"])
+                self.assertEqual(rows[0]["cause"], selection["cause"])
+
+    def test_status_lists_work_routing_separately_from_account_moves(self) -> None:
+        self.codex("default", "worker@example.invalid")
+        common = moves.MoveCommon(at=self.now.isoformat(), tool="codex", subject="seats", move_id="account-move")
+        request: moves.RequestedMove = {**common, "kind": "requested", "from": "codex1", "to": "codex2",
+            "why": "manual", "window": "unknown", "cause": "by hand"}
+        moves.append_move(request)
+        stamp = self.now.isoformat()
+        moves.append_routing(moves.RoutedToClaude(kind="routed to claude", at=stamp, tool="codex",
+            fallback_at=stamp, owner="codex1", cause="credits off", moved=["delegate", "fix"]))
+        with patch.object(accounts, "datetime", PickerTime):
+            text = accounts.status_report(detail=True)
+        self.assertIn("by hand", text)
+        self.assertIn("Codex work routing:", text)
+        routing = text.split("Codex work routing:", 1)[1]
+        self.assertIn("routed to claude", routing)
+        self.assertIn("credits off", routing)
+        self.assertIn("delegate", routing)
+        self.assertIn("— open", routing)
+        self.assertNotIn("routed to claude", text.split("Codex work routing:", 1)[0])
+        moves.append_routing(moves.RoutedBack(kind="routed back", at=stamp, tool="codex",
+            fallback_at=stamp, owner="codex1", restored=["delegate"], kept=["fix"]))
+        failed_at = (self.now + timedelta(minutes=1)).isoformat()
+        moves.append_routing(moves.RoutedToClaude(kind="routed to claude", at=failed_at, tool="codex",
+            fallback_at=failed_at, owner="unknown", cause="refusal", moved=["delegate"]))
+        moves.append_routing(moves.RoutingNotRestored(kind="routing not restored", at=failed_at, tool="codex",
+            fallback_at=failed_at, owner="unknown", outcome="failed", restored=[], kept=[], failed=["delegate (unreadable)"]))
+        with patch.object(accounts, "datetime", PickerTime):
+            routing = accounts.status_report(detail=True).split("Codex work routing:", 1)[1]
+        self.assertEqual(routing.count("routed to claude"), 2)
+        self.assertIn("— routed back", routing)
+        self.assertIn("— not restored (failed)", routing)
+        self.assertIn("delegate (unreadable)", routing)
+        self.assertIn("owner unknown", routing)
+        self.assertNotIn("— open", routing)
+
     def test_default_input_is_refused_before_any_session_or_home_matcher(self) -> None:
         self.codex("default", "worker@example.invalid")
         expected = "accounts: name the account by number (~/.claude is claude2; ~/.codex is codex1)"
@@ -2901,7 +3024,7 @@ class PickerTests(unittest.TestCase):
         code, stdout, stderr = self.group_cli("move", "units", "claude2")
         self.assertEqual((code, stderr), (0, ""), stdout)
         self.assertEqual(accounts.role_account("unit"), accounts.NamedAccount("claude2", self.home / ".claude"))
-        self.assertEqual(json.loads(accounts.groups_file().read_text()), {"units": "claude2"})
+        self.assertEqual(stored_group_labels(accounts.groups_file()), {"units": "claude2"})
         self.assertNotIn('"default"', accounts.roles_history_file().read_text())
         self.assertFalse((self.home / ".claude2").exists())
         self.assertEqual(accounts.group_note_labels(), {"units": "claude2"})
@@ -2917,8 +3040,8 @@ class PickerTests(unittest.TestCase):
             self.assertNotRegex(stdout, r"\bdefault\b")
             self.assertEqual(path.read_bytes(), original)
         self.assertEqual(accounts.group_note_labels(), {"units": "claude2", "showrunners": "claude3"})
-        accounts.set_group_account("showrunners", "claude1", why="numbered selection", now=self.now)
-        self.assertEqual(json.loads(path.read_text()), {"units": "default", "showrunners": "claude1"})
+        _ = accounts.set_group_account("showrunners", "claude1", why="numbered selection", now=self.now)
+        self.assertEqual(stored_group_labels(path), {"units": "default", "showrunners": "claude1"})
 
     def test_missing_or_unreadable_note_refuses_destination_and_leaves_group_storage_untouched(self) -> None:
         groups = self.groups()
@@ -2934,7 +3057,7 @@ class PickerTests(unittest.TestCase):
                 self.assertIn("claude3", str(resolution.exception))
                 self.assertIn(message, str(resolution.exception))
                 with self.assertRaises(accounts.AccountsError) as selection:
-                    accounts.set_group_account("units", "claude3", why="manual selection", now=self.now)
+                    _ = accounts.set_group_account("units", "claude3", why="manual selection", now=self.now)
                 self.assertIn("claude3", str(selection.exception))
                 self.assertIn(message, str(selection.exception))
                 self.assertEqual(groups.read_bytes(), original)
@@ -2987,8 +3110,8 @@ class PickerTests(unittest.TestCase):
         contents = note.read_bytes()
         note.unlink()
         self.assertEqual(accounts.group_accounts().get("units"), "~/.claude")
-        accounts.set_group_account("showrunners", "claude1", why="manual selection", now=self.now)
-        self.assertEqual(json.loads(path.read_text()), {"units": "default", "showrunners": "claude1"})
+        _ = accounts.set_group_account("showrunners", "claude1", why="manual selection", now=self.now)
+        self.assertEqual(stored_group_labels(path), {"units": "default", "showrunners": "claude1"})
         self.assertNotIn("~/.claude", path.read_text())
         _ = note.write_bytes(contents)
         self.assertEqual(accounts.role_account("unit"), accounts.NamedAccount("claude2", self.home / ".claude"))
@@ -3221,7 +3344,7 @@ class PickerTests(unittest.TestCase):
         with self.assertRaises(accounts.AccountsError) as refused:
             _ = accounts.role_account("showrunner")
         self.assertIn("accounts.py move showrunners <claudeN>", str(refused.exception))
-        self.assertEqual(json.loads(accounts.groups_file().read_text()), {"units": "claude1"})
+        self.assertEqual(stored_group_labels(accounts.groups_file()), {"units": "claude1"})
         self.assertFalse(moved.called)
 
     def test_status_opens_with_groups_and_role_cells_replace_next(self) -> None:

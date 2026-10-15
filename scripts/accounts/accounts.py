@@ -11,6 +11,7 @@ import math
 import os
 import re
 import shlex
+import socket
 import stat
 import subprocess
 import sys
@@ -45,11 +46,28 @@ from scripts.accounts.refusals import (  # noqa: E402
 )
 
 if TYPE_CHECKING:
-    from scripts.shutdown.inventory import Session
+    from scripts.shutdown.inventory import ListedSession, Session, ShowrunnerRegistrations
 
 
-class ManualMoveResume(Protocol):
-    def resume_command(self, session: Session, target: str, source_label: str = "", why: str = "") -> str: ...
+class PromptTakingMember(Protocol):
+    @property
+    def because(self) -> Literal["room", "credits", "no fresh reading"]: ...
+
+
+class MemberNeedingReap(Protocol):
+    @property
+    def because(self) -> Literal["refused in its transcript", "account out of usage"]: ...
+    @property
+    def detail(self) -> str: ...
+
+
+class MovePromptReader(Protocol):
+    def PromptSubject(self, session_id: str, login: str, config_dir: Path) -> object: ...
+    def prompt_state(self, session: object, now: datetime) -> PromptTakingMember | MemberNeedingReap: ...
+
+
+class MoveFollower(Protocol):
+    def follow(self, login: str, request_id: str) -> int: ...
 
 
 # Shared means Claude Code reads the entry as user content or cross-session
@@ -1068,7 +1086,11 @@ def exec_account(label: str, arguments: list[str]) -> None:
         _ = environment.pop(name, None)
     environment.update(prepared.variables)
     try:
-        os.execvpe("claude", ["claude", *arguments], environment)
+        if sys.stdin.isatty() and "RELAUNCH_SUPERVISED" not in environment:
+            os.execvpe(sys.executable, [sys.executable, str(SCRIPTS / "lib" / "relaunch.py"),
+                                      "run", "--", "claude", *arguments], environment)
+        else:
+            os.execvpe("claude", ["claude", *arguments], environment)
     except OSError as error:
         raise AccountsError(f"accounts: could not start claude: {error}") from error
 
@@ -1504,11 +1526,78 @@ class GroupAccounts(TypedDict, total=False):
     showrunners: str
 
 
+@dataclass(frozen=True)
+class HandOrigin:
+    """The user requested this move, independently of stored quota refusals."""
+
+
+HAND_ORIGIN = HandOrigin()
+
+
+@dataclass(frozen=True)
+class RefusalOrigin:
+    window: Literal["weekly", "five_hour", "unknown"]
+    reset: KnownReset | NoResetKnown = field(default_factory=NoResetKnown)
+
+
+MoveOrigin = RefusalOrigin | HandOrigin
+
+
+class MoveOriginFields(TypedDict):
+    cause: Literal["refusal", "by hand"]
+    window: Literal["weekly", "five_hour", "unknown"]
+    reset: NotRequired[str]
+
+
+def move_origin_fields(origin: MoveOrigin) -> MoveOriginFields:
+    fields = MoveOriginFields(cause="by hand", window="unknown")
+    if isinstance(origin, RefusalOrigin):
+        fields["cause"] = "refusal"
+        fields["window"] = origin.window
+        if isinstance(origin.reset, KnownReset):
+            fields["reset"] = origin.reset.at.isoformat()
+    return fields
+
+
+def move_origin_arguments(origin: MoveOrigin) -> tuple[str, ...]:
+    if isinstance(origin, HandOrigin):
+        return ()
+    arguments: tuple[str, ...] = ("--refused", origin.window)
+    if isinstance(origin.reset, KnownReset):
+        arguments += ("--reset", origin.reset.at.isoformat())
+    return arguments
+
+
+@dataclass(frozen=True)
+class GroupTransition:
+    move_id: str
+    origin: MoveOrigin
+
+
+@dataclass(frozen=True)
+class NoGroupTransition:
+    """A legacy selection has no recorded transition."""
+
+
+class StoredGroupSelection(MoveOriginFields):
+    label: str
+    move_id: str
+
+
+class StoredGroupSelections(TypedDict, total=False):
+    units: str | StoredGroupSelection
+    showrunners: str | StoredGroupSelection
+
+
 class GroupAccountChange(TypedDict):
     at: str
     group: ClaudeGroup
     label: str
     why: str
+    move_id: NotRequired[str]
+    cause: NotRequired[Literal["refusal", "by hand"]]
+    window: NotRequired[Literal["weekly", "five_hour", "unknown"]]
+    reset: NotRequired[str]
 
 
 @dataclass(frozen=True)
@@ -1540,64 +1629,81 @@ def groups_file() -> Path:
     return accounts_home() / ".local" / "state" / "accounts" / "groups.json"
 
 
-def _stored_groups(*, resolve_home: bool = True) -> GroupAccounts:
+def _stored_groups() -> StoredGroupSelections:
+    """Read stored selections without converting untouched sibling values."""
     path = groups_file()
     try:
         raw = _read_json_object(path)
     except FileNotFoundError:
-        return GroupAccounts()
+        return StoredGroupSelections()
     except (OSError, ValueError, TypeError) as error:
         raise AccountsError(f"accounts: could not read {path}: {error}") from error
-    result = GroupAccounts()
+    result = StoredGroupSelections()
     for group in CLAUDE_GROUPS:
         if group not in raw:
             continue
-        label = raw[group]
+        value = raw[group]
+        label = value
+        if isinstance(value, dict):
+            fields = cast(dict[str, object], value)
+            label = fields.get("label")
+            if (not isinstance(fields.get("move_id"), str) or not fields["move_id"]
+                    or fields.get("cause") not in ("by hand", "refusal")
+                    or fields.get("window") not in ("weekly", "five_hour", "unknown")):
+                raise AccountsError(f"accounts: {path} has an invalid {group} transition")
+            if "reset" in fields:
+                reset = fields["reset"]
+                try:
+                    if not isinstance(reset, str) or datetime.fromisoformat(reset).tzinfo is None:
+                        raise ValueError("reset needs an offset")
+                except ValueError as error:
+                    raise AccountsError(f"accounts: {path} has an invalid {group} reset") from error
         if not isinstance(label, str):
             raise AccountsError(f"accounts: {path} has an invalid {group} account")
-        resolved = home_account_label("claude") if label == "default" else note_file.canonical_label(label)
-        if resolved != "~/.claude":
-            _ = account_dir(resolved)
-        result[group] = resolved if resolve_home else label
+        if label != "default":
+            _ = numbered_account_label(label, "claude")
+        result[group] = cast(str | StoredGroupSelection, value)
     return result
 
 
-def session_group(session: Session) -> ClaudeGroup | Literal["ungrouped"]:
-    if session["kind"] == "unit":
+def group_transition(group: ClaudeGroup) -> GroupTransition | NoGroupTransition:
+    selection = cast(str | StoredGroupSelection | NoGroupTransition,
+                     _stored_groups().get(group, NoGroupTransition()))
+    if not isinstance(selection, dict):
+        return NoGroupTransition()
+    origin: MoveOrigin = HandOrigin()
+    if selection["cause"] == "refusal":
+        reset = KnownReset(datetime.fromisoformat(selection["reset"])) if "reset" in selection else NoResetKnown()
+        origin = RefusalOrigin(selection["window"], reset)
+    return GroupTransition(selection["move_id"], origin)
+
+
+def session_group(session: Session | ListedSession) -> ClaudeGroup | Literal["ungrouped"]:
+    kind = session["kind"] if isinstance(session, dict) else session.kind
+    if kind == "unit":
         return "units"
-    if session["kind"] == "showrunner":
+    if kind == "showrunner":
         return "showrunners"
     return "ungrouped"
 
 
-def live_group_members() -> dict[ClaudeGroup, list[Session]]:
-    """Classify local live owners using shutdown's existing production inventory."""
+def live_group_members(*, registrations: ShowrunnerRegistrations | Literal["read timers"] = "read timers") -> dict[ClaudeGroup, list[ListedSession]]:
+    """Classify local live owners without their restart resources or worktrees."""
     sys.path.insert(0, str(SCRIPTS / "shutdown"))
     if TYPE_CHECKING:
         from scripts.shutdown import inventory
-        from scripts.message import sessions
     else:
         inventory = import_module("inventory")
-        sessions = import_module("sessions")
-    members: dict[ClaudeGroup, list[Session]] = {"units": [], "showrunners": []}
-    logins = {identity.login.casefold() for item in sessions.live_sessions()
-              if (identity := account.account_of(item["pid"])) is not None}
-    for login in sorted(logins):
-        for session in inventory.inventory(login, refresh_desktops=False)["sessions"]:
-            group = session_group(session)
-            if group != "ungrouped":
-                members[group].append(session)
+    members: dict[ClaudeGroup, list[ListedSession]] = {"units": [], "showrunners": []}
+    for session in inventory.listing(registrations=registrations):
+        group = session_group(session)
+        if group != "ungrouped":
+            members[group].append(session)
     return members
 
 
-def session_account_label(session: Session) -> str:
-    directory = Path(session.get("config_dir", str(main_config_dir())))
-    identity = account_identity(directory)
-    if isinstance(identity, agent_accounts.NumberedAccount):
-        return identity.label
-    if isinstance(identity, agent_accounts.UnnotedLogin):
-        raise AccountsError("accounts: " + unnoted_home_line(identity.home, identity.login))
-    raise AccountsError(f"accounts: live session {session['name']} has an unreadable account")
+def session_account_label(session: ListedSession) -> str:
+    return account.label_for("Claude", session.login)
 
 
 def account_labels_for_logins(logins: frozenset[str]) -> frozenset[str]:
@@ -1665,21 +1771,22 @@ def _groups_lock() -> Generator[None]:
             fcntl.flock(output.fileno(), fcntl.LOCK_UN)
 
 
-def _save_groups(groups: GroupAccounts, previous: GroupAccounts, why: str, now: datetime) -> None:
+def _save_groups(groups: StoredGroupSelections, group: ClaudeGroup, why: str, now: datetime) -> None:
     path = groups_file()
     prior_file = _previous_accounts_configuration_file(path)
     history = roles_history_file()
     size = history.stat().st_size if history.exists() else -1
+    selection = cast(str | StoredGroupSelection | NoGroupTransition, groups.get(group, NoGroupTransition()))
+    assert isinstance(selection, dict)
+    change = GroupAccountChange(at=now.isoformat(), group=group, label=selection["label"], why=why,
+        move_id=selection["move_id"], cause=selection["cause"], window=selection["window"])
+    if "reset" in selection:
+        change["reset"] = selection["reset"]
     try:
         _atomic_write(path, json.dumps(groups, sort_keys=True) + "\n")
-        changes = [GroupAccountChange(at=now.isoformat(), group=group, label=label, why=why)
-                   for group in CLAUDE_GROUPS if isinstance(label := group_label(groups, group), str)
-                   and group_label(previous, group) != label]
-        if changes:
-            history.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-            with history.open("a", encoding="utf-8") as output:
-                for change in changes:
-                    _ = output.write(json.dumps(change, sort_keys=True) + "\n")
+        history.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        with history.open("a", encoding="utf-8") as output:
+            _ = output.write(json.dumps(change, sort_keys=True) + "\n")
     except OSError as error:
         _restore_accounts_configuration_file(path, prior_file)
         if size < 0:
@@ -1688,7 +1795,6 @@ def _save_groups(groups: GroupAccounts, previous: GroupAccounts, why: str, now: 
             with history.open("r+b") as output:
                 _ = output.truncate(size)
         raise AccountsError(f"accounts: could not write group selection: {error}") from error
-
 
 
 def group_note_labels() -> dict[ClaudeGroup, str]:
@@ -1706,19 +1812,36 @@ def group_note_labels() -> dict[ClaudeGroup, str]:
 
 def group_accounts() -> GroupAccounts:
     """Read only explicit group selections; an absent key stays unconfigured."""
-    return _stored_groups()
+    result = GroupAccounts()
+    stored = _stored_groups()
+    for group in CLAUDE_GROUPS:
+        selection = cast(str | StoredGroupSelection | GroupNotConfigured, stored.get(group, GROUP_NOT_CONFIGURED))
+        if isinstance(selection, GroupNotConfigured):
+            continue
+        label = selection["label"] if isinstance(selection, dict) else selection
+        result[group] = home_account_label("claude") if label == "default" else note_file.canonical_label(label)
+    return result
 
 
-def set_group_account(group: ClaudeGroup, label: str, *, why: str, now: datetime | AccountDecisionNow = ACCOUNT_DECISION_NOW) -> None:
-    label = note_file.canonical_label(label)
+def set_group_account(group: ClaudeGroup, label: str, *, why: str,
+                      now: datetime | AccountDecisionNow = ACCOUNT_DECISION_NOW,
+                      origin: MoveOrigin = HAND_ORIGIN, move_id: str = "") -> GroupTransition:
+    from uuid import uuid4
+
+    label = numbered_account_label(label, "claude").label
     _ = claude_account_dir(label)
     at = now if isinstance(now, datetime) else datetime.now(timezone.utc)
+    fields = move_origin_fields(origin)
+    selection = StoredGroupSelection(label=label, move_id=move_id or uuid4().hex,
+                                     cause=fields["cause"], window=fields["window"])
+    if "reset" in fields:
+        selection["reset"] = fields["reset"]
     with _groups_lock():
-        stored = _stored_groups(resolve_home=False)
-        selected: GroupAccounts = stored.copy()
-        selected[group] = label
+        selected = _stored_groups()
+        selected[group] = selection
         with _roles_lock():
-            _save_groups(selected, stored, why, at)
+            _save_groups(selected, group, why, at)
+        return GroupTransition(selection["move_id"], origin)
 
 
 def placement_report(now: datetime | AccountDecisionNow = ACCOUNT_DECISION_NOW) -> str:
@@ -2079,6 +2202,12 @@ class SessionMoveRequested:
     stdout: str = ""
     stderr: str = ""
     returncode: int = 0
+    move_id: str = ""
+    source_login: str = field(kw_only=True)
+
+    def __post_init__(self) -> None:
+        if not self.move_id:
+            object.__setattr__(self, "move_id", self.request_id)
 
 
 @dataclass(frozen=True)
@@ -2090,27 +2219,26 @@ class SessionMoveRefused:
     returncode: int = 1
 
 
-def move_sessions(ids: tuple[str, ...], target: str, *, why: str) -> tuple[SessionMoveRequested | SessionMoveRefused, ...]:
+def move_sessions(ids: tuple[str, ...], target: str, *, why: str, origin: MoveOrigin, move_id: str = "") -> tuple[SessionMoveRequested | SessionMoveRefused, ...]:
     """Start one selected shutdown for each source login and report each owner's record."""
-    target = note_file.canonical_label(target)
+    target = numbered_account_label(target, "claude").label
     from uuid import uuid4
+    transition_id = move_id or uuid4().hex
     sys.path.insert(0, str(SCRIPTS / "shutdown"))
     if TYPE_CHECKING:
         from scripts.shutdown import inventory, record
-        from scripts.message import sessions
     else:
         inventory = import_module("inventory")
         record = import_module("record")
-        sessions = import_module("sessions")
     outcomes: dict[str, SessionMoveRequested | SessionMoveRefused] = {}
-    owners: dict[str, Session] = {}
+    owners: dict[str, ListedSession] = {}
     groups: dict[str, list[str]] = {}
 
     def refuse(session_id: str, reason: str, *, stdout: str = "", stderr: str = "", returncode: int = 1) -> None:
         outcomes[session_id] = SessionMoveRefused(session_id, reason, stdout, stderr, returncode)
-        name = owners[session_id]["name"] if session_id in owners else session_id
+        name = owners[session_id].name if session_id in owners else session_id
         moves.append_move(moves.FailedMove(kind="failed", at=datetime.now(timezone.utc).isoformat(),
-            tool="claude", subject=session_id + ": " + name, move_id=uuid4().hex, reason=reason))
+            tool="claude", subject=session_id + ": " + name, move_id=transition_id, reason=reason))
 
     try:
         destination = _move_target(target)
@@ -2118,37 +2246,30 @@ def move_sessions(ids: tuple[str, ...], target: str, *, why: str) -> tuple[Sessi
             for session_id in ids:
                 refuse(session_id, destination.reason)
             return tuple(outcomes[session_id] for session_id in ids)
-        live = {item["sessionId"]: item for item in sessions.live_sessions()}
+        live = {item.session_id: item for item in inventory.listing()}
         before = {saved["session"]["session_id"] for saved in record.all_session_records()}
         for session_id in ids:
             found = live.get(session_id)
             if found is None:
                 refuse(session_id, "session is not live on this machine")
                 continue
-            directory = account.process_config_dir(found["pid"])
-            identity = account_identity(directory) if directory is not None else agent_accounts.UnreadableIdentity(main_config_dir(), "account unreadable")
-            if not isinstance(identity, agent_accounts.NumberedAccount):
-                refuse(session_id, "account unreadable")
+            if found.kind == "seat":
+                refuse(session_id, "workers move with their unit director")
                 continue
             if session_id in before:
                 refuse(session_id, "already has a shutdown in progress")
                 continue
-            selected = [item for item in inventory.inventory(identity.login, frozenset({session_id}), refresh_desktops=False)["sessions"]
-                        if item["session_id"] == session_id and item["kind"] != "seat"]
-            if not selected:
-                refuse(session_id, "live owner account could not be confirmed")
-                continue
-            owners[session_id] = selected[0]
-            if identity.login.casefold() == destination.login.casefold():
+            owners[session_id] = found
+            if found.login.casefold() == destination.login.casefold():
                 refuse(session_id, "already on " + destination.label)
                 continue
-            groups.setdefault(identity.login, []).append(session_id)
+            groups.setdefault(found.login, []).append(session_id)
         for login, selected_ids in groups.items():
             source = account.label_for("Claude", login)
             command = _shutdown_argv("down", source, "--here", "--only", ",".join(selected_ids),
-                "--restart", "--to", target, "--why", why)
+                "--restart", "--to", target, "--why", why, "--move-id", transition_id, *move_origin_arguments(origin))
             try:
-                prior_requests = {(entry["move_id"], entry["subject"]) for entry in moves.read_moves()
+                prior_requests = {(entry.get("request_id", entry["move_id"]), entry["subject"]) for entry in moves.read_moves()
                                   if entry["kind"] == "requested"}
                 result = subprocess.run(command, capture_output=True, text=True, check=False,
                     env={**os.environ, "REFUSAL_WATCH_INVENTORY": "read existing"})
@@ -2159,29 +2280,28 @@ def move_sessions(ids: tuple[str, ...], target: str, *, why: str) -> tuple[Sessi
                         # A fast conductor may already have archived a confirmed restart.
                         journal_request = next((entry for entry in reversed(moves.read_moves())
                             if entry["kind"] == "requested" and entry["tool"] == "claude" and entry["to"] == target
-                            and entry["subject"] == session_id + ": " + owners[session_id]["name"]
-                            and (entry["move_id"], entry["subject"]) not in prior_requests), None)
+                            and entry["subject"] == session_id + ": " + owners[session_id].name
+                            and (entry.get("request_id", entry["move_id"]), entry["subject"]) not in prior_requests), None)
                         if journal_request is not None:
-                            outcomes[session_id] = SessionMoveRequested(session_id, journal_request["move_id"], target,
-                                result.stdout, result.stderr, result.returncode)
+                            outcomes[session_id] = SessionMoveRequested(session_id, journal_request.get("request_id", journal_request["move_id"]), target,
+                                result.stdout, result.stderr, result.returncode, journal_request["move_id"], source_login=login)
                             continue
                         refuse(session_id, result.stderr.strip() or result.stdout.strip() or "shutdown refused before a record was created",
                             stdout=result.stdout, stderr=result.stderr, returncode=result.returncode or 1)
                         continue
                     outcome = SessionMoveRequested(session_id, saved["request_id"], target,
-                        result.stdout, result.stderr, result.returncode)
+                        result.stdout, result.stderr, result.returncode, saved.get("move_id", saved["request_id"]), source_login=login)
                     outcomes[session_id] = outcome
-                    if not any(entry["kind"] == "requested" and entry["move_id"] == saved["request_id"]
-                            and entry["subject"] == session_id + ": " + owners[session_id]["name"] for entry in moves.read_moves()):
+                    if not any(entry["kind"] == "requested" and entry.get("request_id", entry["move_id"]) == saved["request_id"]
+                            and entry["subject"] == session_id + ": " + owners[session_id].name for entry in moves.read_moves()):
                         request: moves.RequestedMove = {"kind": "requested", "at": saved["requested_at"],
-                            "tool": "claude", "subject": session_id + ": " + owners[session_id]["name"],
-                            "move_id": saved["request_id"], "from": saved.get("source_label", source),
+                            "tool": "claude", "subject": session_id + ": " + owners[session_id].name,
+                            "move_id": saved.get("move_id", saved["request_id"]), "request_id": saved["request_id"], "from": saved.get("source_label", source),
                             "to": target, "why": why, "window": "unknown"}
-                        refusal = refusals.load().get(refusals.key("claude", login))
-                        if refusal is not None:
-                            request["window"] = refusal.window.name if isinstance(refusal.window, refusals.KnownWindow) else "unknown"
-                            if isinstance(refusal.reset, refusals.KnownReset):
-                                request["reset"] = refusal.reset.at.isoformat()
+                        fields = move_origin_fields(origin)
+                        request["cause"], request["window"] = fields["cause"], fields["window"]
+                        if "reset" in fields:
+                            request["reset"] = fields["reset"]
                         moves.append_move(request)
             except (OSError, ValueError, record.InvalidRecord) as error:
                 for session_id in selected_ids:
@@ -2250,111 +2370,188 @@ def _move_target(target: str) -> agent_accounts.NumberedAccount | MoveRefused:
     return destination
 
 
-def move_group(group: ClaudeGroup, target: str, *, dry_run: bool = False, why: str = "") -> GroupMoveStarted | GroupMoveStartFailed | GroupMoveDryRun | MoveRefused:
-    """Select the group's account before requesting each off-target member's move."""
-    target = note_file.canonical_label(target)
-    try:
-        _ = claude_account_dir(target)
-    except AccountsError as error:
-        return MoveRefused(str(error))
-    prepared = prepared_account(target, resume=True)
-    if isinstance(prepared, AccountRefused):
-        return MoveRefused(prepared.reason)
-    members = live_group_members()[group]
-    selected = [session for session in members if not session_on_account(session, target)]
-    ids = tuple(session["session_id"] for session in selected)
-    reason = why or f"{group} moved by hand"
-    notices = (f"{group}: no live session moves",) if not ids else ()
-    if group == "showrunners":
-        if TYPE_CHECKING:
-            from scripts.shutdown import inventory
-        else:
-            inventory = import_module("inventory")
-        notices += tuple(
-            f"{runner['slug']}: no session runs under the id its update timer names; a showrunner running "
-            + f"under another id is not moved until it runs `update_registration.py register --production {runner['doc']}`"
-            for runner in inventory.unregistered_showrunners())
-    if dry_run:
-        return GroupMoveDryRun(ids, (f"{group}: would select {target}",
-            *(f"{item['name']}: {item['session_id']}" for item in selected), *notices))
-    set_group_account(group, target, why=reason)
-    results = move_sessions(ids, target, why=reason) if ids else ()
+@dataclass(frozen=True)
+class MoveTargetReady:
+    destination: agent_accounts.NumberedAccount
+    notices: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class MoveDryRun:
+    session_id: str
+    lines: tuple[str, ...]
+
+
+def check_move_target(target: str, now: datetime) -> MoveTargetReady | MoveRefused:
+    """Check the destination without changing a group or starting a shutdown."""
+    destination = _move_target(target)
+    if isinstance(destination, MoveRefused):
+        return destination
+    reading = refusals.stored_reading("claude", destination.login, now)
+    if isinstance(reading, FreshReading):
+        try:
+            credits = float(reading.credits or "0")
+        except ValueError:
+            credits = 0.0
+        if reading.credits != "unlimited" and (not math.isfinite(credits) or credits <= 0):
+            for name, window in (("weekly", reading.weekly), ("5-hour", reading.five_hour)):
+                if isinstance(window, ReadingWindow) and window.left <= 0:
+                    reset = (window.reset.at.astimezone(agent_accounts.user_zone()).strftime("%a %-I:%M %p")
+                             if isinstance(window.reset, KnownReset) else "unknown")
+                    return MoveRefused(f"accounts: {destination.label} is out of usage ({name} {window.left:g}% left, resets {reset}); "
+                        + f"pick another: ~/.claude/scripts/lib/py ~/.claude/scripts/accounts/accounts.py pick claude --exclude {shlex.quote(destination.label)} in this terminal")
+        return MoveTargetReady(destination)
+    windows = ((reading.weekly, reading.five_hour) if isinstance(reading, StaleReading) else ())
+    times = [window.at for window in windows if isinstance(window, ReadingWindow)]
+    age = f"last {max(0, int((now - max(times)).total_seconds() // 60))} minutes ago" if times else "last reading unknown"
+    return MoveTargetReady(destination, (f"no fresh usage reading for {destination.label} ({age})",))
+
+
+def move_preview_line(member: ListedSession, now: datetime) -> str:
+    sys.path.insert(0, str(SCRIPTS / "shutdown"))
+    reader = cast(MovePromptReader, cast(object, import_module("settle")))
+    state = reader.prompt_state(reader.PromptSubject(member.session_id, member.login, member.config_dir), now)
+    source = session_account_label(member)
+    if state.because in {"refused in its transcript", "account out of usage"}:
+        plan = f"reap and restart now ({source} out of usage: {cast(MemberNeedingReap, state).detail})"
+    else:
+        reason = "has room" if state.because == "room" else state.because
+        plan = f"pause, then move ({source} {reason})"
+    return f"{member.name}: {member.session_id} · {plan}"
+
+
+def follow_move(login: str, request_id: str) -> int:
+    """Follow a local move request using shutdown's archive-aware trail reader."""
+    sys.path.insert(0, str(SCRIPTS / "shutdown"))
+    follower = cast(MoveFollower, cast(object, import_module("shutdown")))
+    return follower.follow(login, request_id)
+
+
+def _move_output(results: tuple[SessionMoveRequested | SessionMoveRefused, ...],
+                 notices: tuple[str, ...], back_subject: str,
+                 back_target: str | GroupNotConfigured) -> tuple[str, str, int]:
     stdout = ("\n".join(notices) + "\n" if notices else "") + "".join(dict.fromkeys(item.stdout for item in results))
     stderr = "".join(dict.fromkeys(item.stderr for item in results))
     refused = [item for item in results if isinstance(item, SessionMoveRefused)]
-    if refused:
-        stderr += "\n".join(item.reason for item in refused if not item.stderr) + "\n"
-    code = max((item.returncode for item in results), default=0)
-    outcome = GroupMoveStartFailed if refused or code else GroupMoveStarted
-    return outcome(ids, target, stdout, stderr, code or (1 if refused else 0))
+    reasons = tuple(f"{item.session_id}: {item.reason}" for item in refused if not item.stderr)
+    if reasons:
+        stderr += "\n".join(reasons) + "\n"
+    code = max((item.returncode for item in results), default=0) or (1 if refused else 0)
+    requests = dict.fromkeys((item.source_login, item.request_id)
+                            for item in results if isinstance(item, SessionMoveRequested))
+    if requests and stdout and not stdout.endswith("\n"):
+        stdout += "\n"
+    sources = {request[0] for request in requests}
+    if isinstance(back_target, GroupNotConfigured) and len(sources) == 1:
+        back_target = account.label_for("Claude", next(iter(sources)))
+    if requests and isinstance(back_target, str):
+        stdout += ("to move them back, in this terminal: ~/.claude/scripts/lib/py ~/.claude/scripts/accounts/accounts.py move "
+                   + shlex.quote(back_subject) + " " + shlex.quote(back_target) + "\n")
+    if requests and not os.environ.get("CLAUDE_CODE_SESSION_ID") and sys.stdout.isatty():
+        print(stdout, end="", flush=True)
+        stdout = ""
+        for login, request_id in requests:
+            followed = follow_move(login, request_id)
+            if followed == 130:
+                code = 130
+                break
+            code = max(code, followed)
+    return stdout, stderr, code
 
 
-def session_on_account(session: Session, label: str) -> bool:
+def move_group(group: ClaudeGroup, target: str, *, dry_run: bool = False, why: str = "") -> GroupMoveStarted | GroupMoveStartFailed | GroupMoveDryRun | MoveRefused:
+    """Select the group after target checks, then hand each owner to shutdown."""
+    sys.path.insert(0, str(SCRIPTS / "shutdown"))
+    target = note_file.canonical_label(target)
+    now = datetime.now(timezone.utc)
+    checked = check_move_target(target, now)
+    if isinstance(checked, MoveRefused):
+        return checked
+    if TYPE_CHECKING:
+        from scripts.shutdown import inventory
+    else:
+        inventory = import_module("inventory")
+    registrations = inventory.showrunner_registrations()
+    members = live_group_members(registrations=registrations)[group]
+    selected = [session for session in members if not session_on_account(session, target)]
+    ids = tuple(session.session_id for session in selected)
+    reason = why or f"{group} moved by hand"
+    notices = (f"{group}: no live session moves",) if not ids else ()
+    if group == "showrunners":
+        notices += tuple(
+            f"{runner['slug']}: no session runs under the id its update timer names; "
+            + f"in any Claude session on {socket.gethostname().split('.', 1)[0]}, inside that showrunner's own session: ~/.claude/scripts/lib/py ~/.claude/scripts/production/update_registration.py register --production {shlex.quote(runner['doc'])}"
+            for runner in inventory.unregistered_showrunners(members, registrations=registrations))
+    if dry_run:
+        return GroupMoveDryRun(ids, (*checked.notices, f"{group}: would select {target}",
+            *(move_preview_line(item, now) for item in selected), *notices))
+    previous_target = group_label(group_accounts(), group)
+    transition = set_group_account(group, target, why=reason)
+    results = move_sessions(ids, target, why=reason, origin=transition.origin, move_id=transition.move_id) if ids else ()
+    stdout, stderr, code = _move_output(results, (*checked.notices, *notices), group, previous_target)
+    outcome = GroupMoveStartFailed if code else GroupMoveStarted
+    return outcome(ids, target, stdout, stderr, code)
+
+
+def session_on_account(session: ListedSession, label: str) -> bool:
     if not _label_is(label, "claude"):
         return False
-    target = claude_account_dir(label)
-    current = account_identity(Path(session.get("config_dir", str(main_config_dir()))))
-    destination = account_identity(target)
-    return (isinstance(current, agent_accounts.NumberedAccount)
-            and isinstance(destination, agent_accounts.NumberedAccount)
-            and current.login.casefold() == destination.login.casefold())
+    destination = account_identity(claude_account_dir(label))
+    return (isinstance(destination, agent_accounts.NumberedAccount)
+            and session.login.casefold() == destination.login.casefold())
 
 
-def move(session: str, target: str, *, why: str = "") -> MoveStarted | MoveStartFailed | MoveRefused:
-    """Move one local live owner after completing every read-only refusal check."""
+@overload
+def move(session: str, target: str, *, dry_run: Literal[False] = False, why: str = "") -> MoveStarted | MoveStartFailed | MoveRefused: ...
+
+
+@overload
+def move(session: str, target: str, *, dry_run: Literal[True], why: str = "") -> MoveDryRun | MoveRefused: ...
+
+
+@overload
+def move(session: str, target: str, *, dry_run: bool, why: str = "") -> MoveStarted | MoveStartFailed | MoveDryRun | MoveRefused: ...
+
+
+def move(session: str, target: str, *, dry_run: bool = False, why: str = "") -> MoveStarted | MoveStartFailed | MoveDryRun | MoveRefused:
+    """Move one local ungrouped owner after read-only destination checks."""
     target = note_file.canonical_label(target)
     sys.path.insert(0, str(SCRIPTS / "shutdown"))
     if TYPE_CHECKING:
         from scripts.shutdown import inventory, record
-        from scripts.message import sessions
     else:
         inventory = import_module("inventory")
         record = import_module("record")
-        sessions = import_module("sessions")
-
     try:
-        refuse_default(target)
-        _ = claude_account_dir(target)
-        live = sessions.live_sessions()
-        matches = [item for item in live if item["sessionId"] == session]
+        now = datetime.now(timezone.utc)
+        checked = check_move_target(target, now)
+        if isinstance(checked, MoveRefused):
+            return checked
+        live = inventory.listing()
+        matches = [item for item in live if item.session_id == session]
         if not matches:
-            matches = [item for item in live if item["name"] == session]
+            matches = [item for item in live if item.name == session]
         if not matches:
             return MoveRefused(f"no live session by id or name {session} on this machine; a session on the other machine moves from there")
         if len(matches) != 1:
-            return MoveRefused(f"{session} names multiple live sessions: " + ", ".join(item["sessionId"] for item in matches))
-        found = matches[0]
-        directory = account.process_config_dir(found["pid"])
-        if directory is None:
-            return MoveRefused(f"{found['name'] or session}: account unreadable")
-        current = account_identity(directory)
-        if not isinstance(current, agent_accounts.NumberedAccount):
-            return MoveRefused(f"{found['name'] or session}: account unreadable")
-        report = inventory.inventory(current.login, frozenset((found["sessionId"],)))
-        owners = [item for item in report["sessions"] if item["session_id"] == found["sessionId"]]
-        if not owners:
-            return MoveRefused(f"{found['name'] or session}: live session account could not be confirmed")
-        owner = owners[0]
-        name = owner["name"] or owner["session_id"]
-        if owner["kind"] == "seat":
-            return MoveRefused("seats move with their unit director")
+            return MoveRefused(f"{session} names multiple live sessions: " + ", ".join(item.session_id for item in matches))
+        owner = matches[0]
+        if owner.kind == "seat":
+            return MoveRefused("workers move with their unit director")
         group = session_group(owner)
         if group != "ungrouped":
-            return MoveRefused(f"{name} belongs to {group}; use accounts.py move {group} {target}")
-        destination = _move_target(target)
-        if isinstance(destination, MoveRefused):
-            return destination
-        if destination.login.casefold() == current.login.casefold():
-            return MoveRefused(f"{name} is already on {destination.label}")
-        if any(saved["session"]["session_id"] == owner["session_id"] for saved in record.all_session_records()):
-            return MoveRefused(f"{name} already has a shutdown in progress")
-        if owner["host"]["kind"] == "unknown":
-            restart = cast(ManualMoveResume, cast(object, import_module("restart")))
-            print(f"run this once {name} has exited: {restart.resume_command(owner, target, current.label, why)}", flush=True)
-        command = _shutdown_argv("down", current.label, "--here", "--only", owner["session_id"], "--restart", "--to", target, "--why", why or f"{current.label} is out of usage")
-        result = subprocess.run(command, capture_output=True, text=True, check=False)
-        outcome = MoveStartFailed if result.returncode else MoveStarted
-        return outcome(owner["session_id"], target, result.stdout, result.stderr, result.returncode)
+            return MoveRefused(f"{owner.name} belongs to {group}; in this terminal: ~/.claude/scripts/lib/py ~/.claude/scripts/accounts/accounts.py move {group} {target}")
+        if session_on_account(owner, target):
+            return MoveRefused(f"{owner.name} is already on {checked.destination.label}")
+        if any(saved["session"]["session_id"] == owner.session_id for saved in record.all_session_records()):
+            return MoveRefused(f"{owner.name} already has a shutdown in progress")
+        if dry_run:
+            return MoveDryRun(owner.session_id, (*checked.notices, move_preview_line(owner, now)))
+        reason = why or f"{session_account_label(owner)} is out of usage"
+        results = move_sessions((owner.session_id,), target, why=reason, origin=HAND_ORIGIN)
+        stdout, stderr, code = _move_output(results, checked.notices, owner.session_id, GROUP_NOT_CONFIGURED)
+        outcome = MoveStartFailed if code else MoveStarted
+        return outcome(owner.session_id, target, stdout, stderr, code)
     except (AccountsError, record.InvalidRecord, inventory.InvalidInventory, OSError, ValueError) as error:
         return MoveRefused(str(error))
 
@@ -2828,8 +3025,10 @@ def status_report(*, detail: bool = False) -> str:
     summary = [group_status_line(groups), table, "", *notes]
     if not detail:
         return "\n".join(summary)
+    journal = moves.read_journal()
     return "\n".join([*summary,
-        *_live_status_lines(groups), *_seats_status_lines(now, selected_seats), *_move_status_lines(moves.read_moves(), zone)])
+        *_live_status_lines(groups), *_seats_status_lines(now, selected_seats),
+        *_move_status_lines(moves.account_moves(journal), zone), *_routing_status_lines(journal, zone)])
 
 
 SEATS_RUN_ROOT = Path("/tmp/claude/delegate")
@@ -2838,7 +3037,7 @@ SEATS_RUN_ROOT = Path("/tmp/claude/delegate")
 def _live_status_lines(groups: GroupAccounts) -> list[str]:
     from scripts.message import sessions
     members = live_group_members()
-    moving = {item["session_id"]: label for group in CLAUDE_GROUPS
+    moving = {item.session_id: label for group in CLAUDE_GROUPS
               if isinstance(label := group_label(groups, group), str) for item in members[group]
               if not session_on_account(item, label)}
     lines: list[str] = []
@@ -2852,10 +3051,10 @@ def _live_status_lines(groups: GroupAccounts) -> list[str]:
     listed = {session["sessionId"] for session in live}
     for group in CLAUDE_GROUPS:
         for member in members[group]:
-            if member["session_id"] not in listed:
+            if member.session_id not in listed:
                 label = session_account_label(member)
-                suffix = f"; moving to {moving[member['session_id']]}" if member["session_id"] in moving else ""
-                lines.append(f"session {member['session_id']} ({member['name']}): {label}{suffix}")
+                suffix = f"; moving to {moving[member.session_id]}" if member.session_id in moving else ""
+                lines.append(f"session {member.session_id} ({member.name}): {label}{suffix}")
     return lines
 
 
@@ -2921,7 +3120,7 @@ def _move_status_lines(entries: list[moves.MoveEntry], zone: tzinfo) -> list[str
                     outcomes.append(f"confirmed {seat} on {outcome.get('home', outcome.get('config_dir', ''))}")
                 elif outcome["kind"] == "failed":
                     outcomes.append("failed: " + outcome["reason"])
-            cause = f" ({entry.get('cause', 'refusal')})" if entry["tool"] == "codex" else ""
+            cause = f" ({entry.get('cause', 'refusal')})"
             detail = f"requested {entry['from']} → {entry['to']}: {entry['why']}{cause} — " + ("; ".join(outcomes) or "pending")
         elif entry["kind"] == "confirmed":
             detail = f"confirmed {entry.get('seat', entry['subject'])}: {entry.get('home', entry.get('config_dir', ''))}"
@@ -2936,6 +3135,36 @@ def _move_status_lines(entries: list[moves.MoveEntry], zone: tzinfo) -> list[str
             detail = "room again: " + str(entry["label"])
         lines.append(f"{at} {entry['tool']} {entry['subject']}: {detail}")
     return lines
+
+
+def _routing_status_lines(entries: list[moves.JournalEntry], zone: tzinfo) -> list[str]:
+    routings: dict[str, list[moves.RoutingEntry]] = {}
+    for entry in entries:
+        match entry["kind"]:
+            case "routed to claude" | "routed back" | "routing not restored":
+                routings.setdefault(entry["fallback_at"], []).append(entry)
+            case "requested" | "confirmed" | "failed" | "waited" | "wait ended" | "no room" | "room again":
+                continue
+    lines: list[str] = []
+    for fallback_at, trail in routings.items():
+        opening = next((entry for entry in trail if entry["kind"] == "routed to claude"), None)
+        owner = trail[0]["owner"]
+        started = datetime.fromisoformat(fallback_at).astimezone(zone).isoformat()
+        if opening is not None:
+            text = f"routed to claude {started} ({owner}, {opening['cause']}): {', '.join(opening['moved'])}"
+        else:
+            text = f"routed to claude {started} ({owner}; opening entry not recorded)"
+        ending = next((entry for entry in reversed(trail) if entry["kind"] != "routed to claude"), None)
+        if ending is None:
+            text += " — open"
+        else:
+            at = datetime.fromisoformat(ending["at"]).astimezone(zone).isoformat()
+            if ending["kind"] == "routed back":
+                text += f" — routed back {at}"
+            else:
+                text += f" — not restored ({ending['outcome']}) {at}: {', '.join(ending['failed'])}"
+        lines.append(text)
+    return ["Codex work routing:", *lines] if lines else []
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -3007,13 +3236,13 @@ def main(argv: list[str]) -> int:
                     raise AccountsError("move units|showrunners requires <claudeN>")
                 moved = move_group(options.session, options.label, dry_run=options.dry_run, why=options.why)
             else:
-                if not options.label or options.source or options.target or options.dry_run:
+                if not options.label or options.source or options.target:
                     raise AccountsError("move requires <session-id|name> <claudeN>")
-                moved = move(options.session, options.label, why=options.why)
+                moved = move(options.session, options.label, dry_run=options.dry_run, why=options.why)
             if isinstance(moved, MoveRefused):
                 print(moved.reason, file=sys.stderr)
                 return 1
-            if isinstance(moved, GroupMoveDryRun):
+            if isinstance(moved, (GroupMoveDryRun, MoveDryRun)):
                 print("\n".join(moved.lines))
                 return 0
             _ = sys.stdout.write(moved.stdout)

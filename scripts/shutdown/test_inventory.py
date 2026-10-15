@@ -179,6 +179,29 @@ class InventoryTests(ShutdownTestCase):
                     self.assertEqual(light.production, session["host"]["production"])
                     self.assertEqual(light.doc, session["host"]["doc"])
 
+    def test_listing_and_absent_target_check_share_timer_reads_without_resolving_sockets(self) -> None:
+        stale = self.notifier / "showrunner-stale"
+        stale.mkdir()
+        stale_doc = self.root / "stale-production.md"
+        _ = stale_doc.write_text("- **User zone:** America/Los_Angeles\n", encoding="utf-8")
+        _ = (stale / "conf").write_text(
+            f"TARGET=session:00000000-0000-4000-8000-000000000000\nCHECK=zsh /opt/production_check.sh {stale_doc}\n",
+            encoding="utf-8")
+        with (patch.object(showrunners, "socket_for", side_effect=AssertionError("listing probed a messaging socket")),
+              patch.object(showrunners, "registered_showrunners", side_effect=AssertionError("listing resolved showrunner messaging")),
+              patch.object(showrunners, "checked_doc", wraps=showrunners.checked_doc) as checked):
+            registrations = inventory.showrunner_registrations()
+            listed = inventory.listing(registrations=registrations)
+            missing = inventory.unregistered_showrunners(listed, registrations=registrations)
+        self.assertEqual(checked.call_count, 2, "membership and missing-target check must share the timer read")
+        director = next(item for item in listed if item.session_id == DIRECTOR_ID)
+        self.assertEqual((director.kind, director.production, director.doc),
+            ("showrunner", "build-followups", str(self.root / "build-followups-production.md")))
+        unit = next(item for item in listed if item.session_id == UNIT_ID)
+        self.assertEqual((unit.kind, unit.production, unit.doc),
+            ("unit", "build-followups", director.doc))
+        self.assertEqual([(runner["slug"], runner["doc"]) for runner in missing], [("stale", str(stale_doc))])
+
     def test_forty_session_listing_and_large_transcript_read_budget(self) -> None:
         for path in self.records.glob("*.json"):
             path.unlink()

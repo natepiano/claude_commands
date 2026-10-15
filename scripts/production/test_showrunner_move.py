@@ -93,6 +93,16 @@ class GroupTest(unittest.TestCase):
         code, text = self.run_group(["units", "claude1"], accounts.GroupMoveStarted((UNIT,), "claude1", "", "", 0))
         self.assertEqual((code, text), (0, f"nightly-review: on claude1, proven (pid 4242 runs on {TARGET})\n"))
 
+    def test_group_success_keeps_usage_notice_and_move_back_guidance(self) -> None:
+        notice = "no fresh usage reading for claude1 (last 25 minutes ago)"
+        back = ("to move them back, in this terminal: ~/.claude/scripts/lib/py "
+                + "~/.claude/scripts/accounts/accounts.py move units claude3")
+        code, text = self.run_group(["units", "claude1"], accounts.GroupMoveStarted(
+            (UNIT,), "claude1", "shutdown started\n" + notice + "\n" + back + "\n", "", 0))
+        self.assertEqual(code, 0)
+        self.assertEqual(text.splitlines(), [notice, back,
+            f"nightly-review: on claude1, proven (pid 4242 runs on {TARGET})"])
+
     def test_a_group_already_on_its_account_is_a_note_and_exits_zero(self) -> None:
         code, text = self.run_group(["units", "claude1"],
                                     accounts.GroupMoveStarted((), "claude1", "units: no live session moves\n", "", 0))
@@ -147,6 +157,16 @@ class MainTest(unittest.TestCase):
                                    accounts.MoveStarted(UNIT, "claude1", "", "", 0), Proven(4242, TARGET))
         self.assertEqual(code, 0)
         self.assertEqual(text, f"nightly-review: on claude1, proven (pid 4242 runs on {TARGET})\n")
+
+    def test_single_success_keeps_usage_notice_and_move_back_guidance(self) -> None:
+        notice = "no fresh usage reading for claude1 (last reading unknown)"
+        back = ("to move them back, in this terminal: ~/.claude/scripts/lib/py "
+                + "~/.claude/scripts/accounts/accounts.py move " + UNIT + " claude3")
+        code, text = self.run_main(["session", "nightly-review", "claude1", "--why", "claude3 is out"],
+            accounts.MoveStarted(UNIT, "claude1", notice + "\nshutdown started\n" + back + "\n", "", 0), PROVEN)
+        self.assertEqual(code, 0)
+        self.assertEqual(text.splitlines(), [notice, back,
+            f"nightly-review: on claude1, proven (pid 4242 runs on {TARGET})"])
 
     def test_a_refused_move_exits_one_with_its_reason(self) -> None:
         code, text = self.run_main(["session", "nightly-review", "claude1", "--why", "claude3 is out"],

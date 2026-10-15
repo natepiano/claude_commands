@@ -1332,6 +1332,97 @@ class QuotaAlertTests(unittest.TestCase):
                          {"delegate": "codex", "cli": "claude", "fix": "codex", "ask_a_friend": "caller"})
         self.assertIn("The automatic switch is undone: moved back from Claude to Codex: delegate;", self.sent[0][1])
 
+    def routing_entries(self) -> list[dict[str, object]]:
+        path = moves.store_file()
+        if not path.exists():
+            return []
+        entries = [cast(dict[str, object], json.loads(line)) for line in path.read_text().splitlines()]
+        return [entry for entry in entries if entry.get("kind") in
+                ("routed to claude", "routed back", "routing not restored")]
+
+    def test_fallback_recovery_after_state_reload_keeps_its_pairing_time_and_journals_once(self) -> None:
+        notes = [self.note("codex1.md", "active", "0")]
+        _ = self.block(notes, self.now)
+        _ = self.block(notes, self.now)
+        opened = self.routing_entries()
+        self.assertEqual(len(opened), 1)
+        self.assertEqual((opened[0]["kind"], opened[0]["owner"], opened[0]["cause"]),
+                         ("routed to claude", "codex1", "refusal"))
+        self.assertEqual(set(cast(list[str], opened[0]["moved"])), {"delegate", "fix"})
+        # Reload through the persisted updater state, then recover in another pass.
+        with quota_alert.state_file() as state:
+            fallback = state["fallback"]
+            self.assertIsInstance(fallback, quota_alert.AccountCodexQuotaFallback)
+            assert isinstance(fallback, quota_alert.AccountCodexQuotaFallback)
+            self.assertEqual(fallback.at, opened[0]["fallback_at"])
+        _ = quota_alert.edit_registry("agents_set_assignment", "fix", "codex")
+        later = self.now + timedelta(hours=1)
+        _ = self.alert([self.note("codex1.md", "active", "100")], later)
+        _ = self.alert([self.note("codex1.md", "active", "100")], later)
+        entries = self.routing_entries()
+        self.assertEqual([entry["kind"] for entry in entries], ["routed to claude", "routed back"])
+        self.assertEqual(entries[0]["fallback_at"], entries[1]["fallback_at"])
+        self.assertEqual(entries[1]["restored"], ["delegate"])
+        self.assertEqual(entries[1]["kept"], ["fix"])
+        self.assertNotIn("move_id", entries[1])
+
+    def test_partial_routing_restoration_records_failed_keys_and_never_claims_full_recovery(self) -> None:
+        _ = self.block([self.note("codex1.md", "active", "0")], self.now)
+        edit = quota_alert.edit_registry
+        def fail_one(function: str, *arguments: str) -> str | None:
+            if function == "agents_set_assignment" and arguments[0] == "fix":
+                return "registry locked"
+            return edit(function, *arguments)
+        with mock.patch.object(quota_alert, "edit_registry", side_effect=fail_one):
+            _ = self.alert([self.note("codex1.md", "active", "100")], self.now + timedelta(hours=1))
+        entries = self.routing_entries()
+        self.assertEqual([entry["kind"] for entry in entries], ["routed to claude", "routing not restored"])
+        self.assertEqual(entries[1]["outcome"], "partial")
+        self.assertEqual(entries[1]["restored"], ["delegate"])
+        self.assertEqual(entries[1]["failed"], ["fix (registry locked)"])
+        self.assertEqual(entries[1]["fallback_at"], entries[0]["fallback_at"])
+        self.assertEqual(self.assignments()["fix"], "claude")
+
+    def test_unreadable_registry_records_failed_recovery_for_every_owed_key(self) -> None:
+        _ = self.block([self.note("codex1.md", "active", "0")], self.now)
+        with mock.patch.object(quota_alert, "registry_assignments", side_effect=OSError("registry unreadable")):
+            _ = self.alert([self.note("codex1.md", "active", "100")], self.now + timedelta(hours=1))
+        entries = self.routing_entries()
+        self.assertEqual([entry["kind"] for entry in entries], ["routed to claude", "routing not restored"])
+        self.assertEqual(entries[1]["outcome"], "failed")
+        self.assertEqual(entries[1]["restored"], [])
+        self.assertEqual(set(cast(list[str], entries[1]["failed"])),
+                         {"delegate (registry unreadable)", "fix (registry unreadable)"})
+
+    def test_unknown_fallback_owner_stays_unknown_after_reload_and_recovery_on_a_noted_home(self) -> None:
+        _ = self.block([self.note("codex1.md", "active", "0")], self.now)
+        with quota_alert.state_file() as state:
+            prior = state["fallback"]
+            assert isinstance(prior, quota_alert.AccountCodexQuotaFallback)
+            state["fallback"] = quota_alert.UnknownOwnerCodexQuotaFallback(prior.at, prior.moved)
+        later = self.now + timedelta(hours=1)
+        _ = self.alert([self.note("codex1.md", "active", "100")], later)
+        recovered = self.routing_entries()[-1]
+        self.assertEqual(recovered["kind"], "routed back")
+        self.assertEqual(recovered["owner"], "unknown")
+        self.assertEqual(recovered["fallback_at"], prior.at)
+
+    def test_mixed_routing_journal_closes_codex_wait_and_no_room_only_once(self) -> None:
+        for kind in ("waited", "no room"):
+            common = moves.MoveCommon(at=self.now.isoformat(), tool="codex", subject="seats", move_id=kind)
+            entry: moves.MoveEntry = (moves.WaitedMove(**common, kind="waited", window="five_hour", reset=self.now.isoformat())
+                if kind == "waited" else moves.NoRoomMove(**common, kind="no room", earliest_reset=self.now.isoformat()))
+            moves.append_move(entry)
+        moves.append_routing(moves.RoutedToClaude(kind="routed to claude", at=self.now.isoformat(), tool="codex",
+            fallback_at=self.now.isoformat(), owner="codex1", cause="refusal", moved=["delegate"]))
+        _ = self.note("codex1.md", "active", "100")
+        for _ in range(2):
+            quota_alert._finish_seats_transitions(self.now)  # pyright: ignore[reportPrivateUsage]
+            quota_alert._room_again(self.now)  # pyright: ignore[reportPrivateUsage]
+        closing = [entry for entry in moves.read_moves() if entry["kind"] in ("wait ended", "room again")]
+        self.assertCountEqual([(entry["kind"], entry["move_id"]) for entry in closing],
+                              [("wait ended", "waited"), ("room again", "no room")])
+
     def test_a_refused_switch_still_alerts_and_says_why(self) -> None:
         registry = quota_alert.REGISTRY
         _ = registry.write_text(REGISTRY.replace("impl=opus:high", "impl=opus:ultra"))
@@ -1660,6 +1751,10 @@ class CodexZeroEpisodeTests(unittest.TestCase):
             fallback.assert_called_once()
         self.swap.assert_not_called()
         self.assertEqual(len([entry for entry in moves.read_moves() if entry["kind"] == "no room"]), 1)
+        routed = [entry for entry in moves.read_journal() if entry["kind"] == "routed to claude"]
+        self.assertEqual(len(routed), 1)
+        self.assertEqual(routed[0]["cause"], "credits off")
+        self.assertEqual(set(routed[0]["moved"]), {"delegate", "fix"})
         push = cast(RenderedPush, self.phone.call_args.args[0])
         self.assertIn("Claude", push.body)
         self.assertIn("codex1", push.body)
