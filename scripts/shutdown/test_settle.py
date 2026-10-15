@@ -39,7 +39,7 @@ else:
 import stop as stop_work
 # The module settle imports by its own path entry: a separate object from the package import below.
 import showrunners as settle_showrunners
-from scripts.accounts import moves
+from scripts.accounts import accounts, moves
 import usage_store
 from scripts.production import showrunners
 from account import Account
@@ -401,7 +401,7 @@ class SettleTests(ShutdownTestCase):
                 errors = io.StringIO()
                 with patch.object(settle, "_warm", return_value=False), redirect_stderr(errors):
                     self.assertEqual(settle.down(account, here, ids, then=then, alerts=alerts,
-                        target=target, why=why, report=report), 1)
+                        target=target, why=why, report=report, origin=accounts.HandOrigin(), move_id=""), 1)
                 command = errors.getvalue().split("Then in a terminal on natedev: ", 1)[1].strip()
                 argv = shlex.split(command)
                 self.assertEqual(argv, ["~/.claude/scripts/lib/py", "~/.claude/scripts/shutdown/shutdown.py", *expected])
@@ -413,7 +413,7 @@ class SettleTests(ShutdownTestCase):
                 ):
                     self.assertEqual(shutdown.main(argv[2:]), 0)
                 request.assert_called_once_with(account, here, ids, then=then, alerts=alerts,
-                    requested_by=None, request_id="", target="claude3" if target else "", why=why, report=report)
+                    requested_by=None, request_id="", target="claude3" if target else "", why=why, report=report, origin=accounts.HandOrigin(), move_id="")
                 if ids:
                     resolve.assert_called_once_with(LOGIN, ids, here=here)
                 else:
@@ -788,6 +788,19 @@ class SettleTests(ShutdownTestCase):
         assert failed["kind"] == "failed"
         self.assertEqual(failed["move_id"], saved["request_id"])
         self.assertEqual(failed["reason"], "cancelled")
+
+    def test_cancelling_a_group_member_journals_the_transition_instead_of_its_attempt_id(self) -> None:
+        saved = session_shutdown(top_level("cancel-transition", "Cancelled group member"), then="restart")
+        saved.update(target="claude3", move_id="whole-group-transition")
+        self.save(saved)
+        with (patch.object(settle, "_retire_shutdown_messages"),
+              patch.object(settle, "send_message", return_value=settle.MessageSent(kind="sent")),
+              redirect_stdout(io.StringIO())):
+            self.assertEqual(settle.cancel(Account("claude", LOGIN, LABEL), True), 0)
+        entries = moves.read_moves()
+        self.assertEqual(len(entries), 1)
+        self.assertEqual(entries[0]["move_id"], "whole-group-transition")
+        self.assertNotEqual(entries[0]["move_id"], saved["request_id"])
 
     def test_cancel_suppresses_refusal_before_a_watcher_tick_after_withdrawal(self) -> None:
         from scripts.accounts import accounts, refusal_watch
@@ -1284,6 +1297,36 @@ class SettleTests(ShutdownTestCase):
         saved = record.session_records(LOGIN)
         self.assertEqual(len(saved), 2)
         self.assertTrue(all(item.get("target") == "claude3" for item in saved))
+
+    def test_down_journals_the_supplied_origin_without_inheriting_a_stored_account_refusal(self) -> None:
+        from scripts.accounts import accounts, refusals
+        reset = NOW_UTC + timedelta(days=2)
+        refusals.write_refusal(refusals.AccountRefusal("claude", LOGIN,
+            refusals.KnownWindow("weekly"), refusals.KnownReset(reset), NOW_UTC))
+        for refused in (False, True):
+            identity = "origin-" + str(refused)
+            owner = top_level(identity, identity)
+            origin: accounts.MoveOrigin = accounts.RefusalOrigin("weekly", accounts.KnownReset(reset)) if refused else accounts.HandOrigin()
+            with (self.subTest(refused=refused), patch.object(settle, "_warm", return_value=True),
+                  patch.object(settle, "inventory", return_value=machine_inventory([owner])),
+                  patch.object(settle, "run_inventory", return_value=machine_inventory([owner])),
+                  patch.object(settle, "_launch_conductor"),
+                  patch.object(settle, "send_message", return_value=settle.MessageSent(kind="sent")),
+                  redirect_stdout(io.StringIO())):
+                self.assertEqual(settle.down(Account("claude", LOGIN, LABEL), True, [identity], then="restart",
+                    target="claude3", origin=origin, move_id="group-" + identity), 0)
+            saved = record.find_session(LOGIN, identity)
+            assert saved is not None
+            self.assertEqual(saved.get("move_id"), "group-" + identity)
+            requests = [entry for entry in moves.read_moves() if entry["kind"] == "requested" and entry["subject"].startswith(identity + ":")]
+            self.assertEqual(len(requests), 1)
+            self.assertEqual(requests[0]["move_id"], saved.get("move_id"))
+            self.assertEqual(requests[0].get("cause"), "refusal" if refused else "by hand")
+            self.assertEqual(requests[0]["window"], "weekly" if refused else "unknown")
+            if refused:
+                self.assertEqual(requests[0].get("reset"), reset.isoformat())
+            else:
+                self.assertNotIn("reset", requests[0])
 
     def test_down_to_persists_source_label_and_explicit_reason_beside_each_new_target(self) -> None:
         with (

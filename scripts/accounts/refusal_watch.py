@@ -76,7 +76,15 @@ class TranscriptRefusal:
     reset: refusals.KnownReset | refusals.NoResetKnown = field(default_factory=refusals.NoResetKnown)
 
 
-class AssumedRefusal(TypedDict):
+@dataclass(frozen=True)
+class ProofRefusal:
+    entry_id: str
+    refused_at: RefusedAt
+    window: refusals.KnownWindow | refusals.UnknownWindow
+    reset: refusals.KnownReset | refusals.NoResetKnown = field(default_factory=refusals.NoResetKnown)
+
+
+class AssumedRefusalFile(TypedDict):
     uuid: str
     timestamp: str
     window: Literal["weekly", "five_hour"]
@@ -266,22 +274,22 @@ def transcript_refusal(session_id: str, *, config_dir: Path | None = None) -> Tr
     return TranscriptRefusal(entry_id, RefusedAt(at), window, text, reset)
 
 
-def assumed_refusal(session_id: str) -> TranscriptRefusal | NoSessionRefusal:
+def assumed_refusal(session_id: str) -> ProofRefusal | NoSessionRefusal:
     value = _object(assumed_file(session_id))
     if not value:
         return NoSessionRefusal()
     if (not all(isinstance(value.get(key), str) for key in ("uuid", "timestamp", "window", "reset"))
             or value["window"] not in ("weekly", "five_hour")):
         raise ValueError("invalid assumed refusal")
-    held = cast(AssumedRefusal, cast(object, value))
+    held = cast(AssumedRefusalFile, cast(object, value))
     at = datetime.fromisoformat(held["timestamp"])
     reset = refusals.KnownReset(datetime.fromisoformat(held["reset"])) if held["reset"] else refusals.NoResetKnown()
     if at.tzinfo is None or isinstance(reset, refusals.KnownReset) and reset.at.tzinfo is None:
         raise ValueError("assumed refusal time needs an offset")
-    return TranscriptRefusal(held["uuid"], RefusedAt(at), refusals.KnownWindow(held["window"]), "assumed refusal", reset)
+    return ProofRefusal(held["uuid"], RefusedAt(at), refusals.KnownWindow(held["window"]), reset)
 
 
-def session_refusal(session_id: str) -> TranscriptRefusal | NoSessionRefusal:
+def session_refusal(session_id: str) -> TranscriptRefusal | ProofRefusal | NoSessionRefusal:
     assumed = assumed_refusal(session_id)
     return transcript_refusal(session_id) if isinstance(assumed, NoSessionRefusal) else assumed
 
@@ -373,7 +381,7 @@ def _reading_values_fingerprint() -> str:
     return hashlib.sha256(json.dumps(values, sort_keys=True).encode()).hexdigest()
 
 
-def _run(now: datetime, dry_run: bool) -> list[str]:
+def _run(now: datetime, dry_run: bool, proof_group: frozenset[str] = NO_SESSION_FILTER) -> list[str]:
     state = _load_state()
     original_state = json.dumps(state, sort_keys=True)
     open_ids = {saved["session"]["session_id"] for saved in record.all_session_records()}
@@ -381,22 +389,26 @@ def _run(now: datetime, dry_run: bool) -> list[str]:
     ended = {entry["move_id"] for entry in entries if entry["kind"] == "wait ended"}
     for entry in entries:
         if (entry["tool"] == "claude" and entry["kind"] == "waited" and entry["move_id"] not in ended
+                and (not proof_group or entry["subject"].split(": ", 1)[0] in proof_group)
                 and datetime.fromisoformat(entry["reset"]) <= now and not dry_run):
             moves.append_move(moves.WaitEndedMove(kind="wait ended", at=now.isoformat(), tool="claude",
                 subject=entry["subject"], move_id=entry["move_id"]))
-    groups: dict[str, list[tuple[inventory_module.Session, TranscriptRefusal, refusals.AccountRefusal]]] = {}
+    groups: dict[str, list[tuple[inventory_module.Session, TranscriptRefusal | ProofRefusal, refusals.AccountRefusal]]] = {}
     lines: list[str] = []
-    selected_groups = accounts.group_accounts()
-    unconfigured = {group for group in accounts.CLAUDE_GROUPS if isinstance(accounts.group_label(selected_groups, group), accounts.GroupNotConfigured)}
+    selected_groups = accounts.GroupAccounts() if proof_group else accounts.group_accounts()
+    unconfigured = {group for group in (() if proof_group else accounts.CLAUDE_GROUPS) if isinstance(accounts.group_label(selected_groups, group), accounts.GroupNotConfigured)}
     reported_unconfigured: set[accounts.ClaudeGroup] = set()
     detected = {session["sessionId"]: session_refusal(session["sessionId"]) for session in sessions.live_sessions()
-        if session["sessionId"] not in open_ids}
-    refused_ids = frozenset(session_id for session_id, refusal in detected.items() if isinstance(refusal, TranscriptRefusal))
+        if session["sessionId"] not in open_ids and (not proof_group or session["sessionId"] in proof_group)}
+    refused_ids = frozenset(session_id for session_id, refusal in detected.items() if isinstance(refusal, (TranscriptRefusal, ProofRefusal)))
     refusing_logins: set[str] = set()
     owners = live_owners(only=refused_ids) if refused_ids else []
+    owners = [session for session in owners if not isinstance(detected[session["session_id"]], ProofRefusal)
+              or accounts.session_group(session) == "ungrouped"]
     waiting_groups: set[accounts.ClaudeGroup] = set()
     blocked_groups: set[accounts.ClaudeGroup] = set()
     tick_logins = frozenset(identity.login.casefold() for session in owners
+        if isinstance(detected[session["session_id"]], TranscriptRefusal)
         if isinstance(identity := accounts.account_identity(Path(session.get("config_dir", str(accounts.main_config_dir())))),
                       agent_accounts.NumberedAccount))
     tick_excluded = accounts.account_labels_for_logins(tick_logins)
@@ -470,12 +482,9 @@ def _run(now: datetime, dry_run: bool) -> list[str]:
                 value = reading.weekly if window.name == "weekly" else reading.five_hour
                 if isinstance(value, refusals.ReadingWindow):
                     reset = value.reset
+            if isinstance(refusal.reset, refusals.KnownReset):
+                reset = refusal.reset
             account_refusal = refusals.AccountRefusal("claude", identity.login, window, reset, refusal.refused_at.at)
-            # A watch entry without its first observation takes the stored refusal written at that time.
-            if previous and previous["entry_id"] == refusal.entry_id:
-                saved = refusals.load().get(refusals.key("claude", identity.login))
-                if saved is not None and saved.at == refusal.refused_at.at:
-                    account_refusal = saved
             if not dry_run:
                 observation = FirstRefusalObservation(login=identity.login,
                     window=account_refusal.window.name if isinstance(account_refusal.window, refusals.KnownWindow) else "unknown",
@@ -483,7 +492,8 @@ def _run(now: datetime, dry_run: bool) -> list[str]:
                 if isinstance(account_refusal.reset, refusals.KnownReset):
                     observation["reset"] = account_refusal.reset.at.isoformat()
                 if not previous or previous["entry_id"] != refusal.entry_id:
-                    refusals.write_refusal(account_refusal)
+                    if isinstance(refusal, TranscriptRefusal):
+                        refusals.write_refusal(account_refusal)
                     _set_transition(state, session_id, refusal.entry_id, "retry", "")
                 state["sessions"][session_id]["refusal"] = observation
                 _atomic_json(state_root() / "refusal_watch.json", state)
@@ -498,10 +508,12 @@ def _run(now: datetime, dry_run: bool) -> list[str]:
                     if isinstance(delivery, ContinuationNotDelivered):
                         lines.append(f"{session['name']}: continuation not delivered: {delivery.reason}")
                     else:
+                        clear_assumed(session_id)
                         _set_transition(state, session_id, refusal.entry_id, "continued", previous["move_id"])
                         lines.append(f"{session['name']}: continued on its current account")
                 continue
-        refusing_logins.add(identity.login.casefold())
+        if isinstance(refusal, TranscriptRefusal):
+            refusing_logins.add(identity.login.casefold())
         wait_reset = refusal.reset if isinstance(refusal.reset, refusals.KnownReset) else reset
         subject = session_id + ": " + session["name"]
         if (isinstance(window, refusals.KnownWindow) and window.name == "five_hour"
@@ -515,12 +527,15 @@ def _run(now: datetime, dry_run: bool) -> list[str]:
                 _set_transition(state, session_id, refusal.entry_id, "waited", move_id)
             continue
         group_name = accounts.session_group(session)
-        key = identity.login.casefold() if group_name == "ungrouped" else "group:" + group_name
+        key = ("proof group" if proof_group else "proof:" + session_id if isinstance(refusal, ProofRefusal)
+               else identity.login.casefold()) if group_name == "ungrouped" else "group:" + group_name
         groups.setdefault(key, []).append((session, refusal, account_refusal))
     fingerprint = _reading_values_fingerprint()
     if dry_run:
         lines.insert(0, accounts.group_status_line(selected_groups))
-    all_members: dict[accounts.ClaudeGroup, list[inventory_module.ListedSession]] = accounts.live_group_members() if any(key.startswith("group:") for key in groups) or accounts.groups_file().exists() else {"units": [], "showrunners": []}
+    all_members: dict[accounts.ClaudeGroup, list[inventory_module.ListedSession]] = (accounts.live_group_members()
+        if not proof_group and (any(key.startswith("group:") for key in groups) or accounts.groups_file().exists())
+        else {"units": [], "showrunners": []})
     moved_groups: set[accounts.ClaudeGroup] = set()
     no_room_groups: set[accounts.ClaudeGroup] = set()
     for login, group in groups.items():
@@ -533,6 +548,10 @@ def _run(now: datetime, dry_run: bool) -> list[str]:
         default_identity = accounts.account_identity(accounts.main_config_dir())
         source = source_identity.label
         excluded = {source, source_identity.label, *tick_excluded}
+        for member, _, _ in group:
+            member_identity = accounts.account_identity(Path(member.get("config_dir", str(accounts.main_config_dir()))))
+            if isinstance(member_identity, agent_accounts.NumberedAccount):
+                excluded.add(member_identity.label)
         if isinstance(default_identity, agent_accounts.NumberedAccount) and default_identity.login.casefold() in refusing_logins:
             excluded.add(default_identity.label)
         for named in accounts.checked_named_accounts():
@@ -562,10 +581,10 @@ def _run(now: datetime, dry_run: bool) -> list[str]:
                             subject=session["session_id"] + ": " + session["name"], move_id=move_id,
                             earliest_reset=chosen.earliest_reset.at.isoformat() if isinstance(chosen.earliest_reset, accounts.EarliestReset) else ""))
                         _set_transition(state, session["session_id"], refusal.entry_id, "no room", move_id)
-                notice_login = source_identity.login.casefold()
-                if state["notices"].get(notice_login) != fingerprint:
+                notice_key = login if isinstance(group[0][1], ProofRefusal) else source_identity.login.casefold()
+                if state["notices"].get(notice_key) != fingerprint:
                     _notify_no_room(text, now)
-                    state["notices"][notice_login] = fingerprint
+                    state["notices"][notice_key] = fingerprint
             continue
         if group_name != "ungrouped":
             lines.extend(f"{session.name}: refused group {group_name}; move to {chosen.label}" for session in all_members[group_name]
@@ -585,12 +604,14 @@ def _run(now: datetime, dry_run: bool) -> list[str]:
         window_name = first_refusal.window.name if isinstance(first_refusal.window, refusals.KnownWindow) else "unknown"
         reset_text = first_refusal.reset.at.astimezone(agent_accounts.user_zone()).isoformat() if isinstance(first_refusal.reset, refusals.KnownReset) else "unknown reset"
         why = f"{source} refused: {window_name} limit until {reset_text}"
+        move_origin = accounts.RefusalOrigin(window_name, first_refusal.reset)
+        transition = accounts.GroupTransition(uuid4().hex, move_origin)
         if group_name != "ungrouped":
             prepared = accounts.prepared_account(chosen.label, resume=True)
             if isinstance(prepared, accounts.AccountRefused):
                 lines.append(f"{group_name}: move refused: {prepared.reason}")
                 continue
-            accounts.set_group_account(group_name, chosen.label, why=why, now=now)
+            transition = accounts.set_group_account(group_name, chosen.label, why=why, now=now, origin=move_origin)
             selected_groups[group_name] = chosen.label
             moved_groups.add(group_name)
             for session, refusal, _ in group:
@@ -601,7 +622,7 @@ def _run(now: datetime, dry_run: bool) -> list[str]:
                         if not accounts.session_on_account(session, chosen.label))
         else:
             ids = tuple(session["session_id"] for session, _, _ in group)
-        outcomes = accounts.move_sessions(ids, chosen.label, why=why) if ids else ()
+        outcomes = accounts.move_sessions(ids, chosen.label, why=why, origin=transition.origin, move_id=transition.move_id) if ids else ()
         by_id = {session["session_id"]: refusal for session, refusal, _ in group}
         for outcome in outcomes:
             if outcome.session_id not in by_id:
@@ -611,11 +632,11 @@ def _run(now: datetime, dry_run: bool) -> list[str]:
             refusal = by_id[outcome.session_id]
             _set_transition(state, outcome.session_id, refusal.entry_id,
                 "requested" if isinstance(outcome, accounts.SessionMoveRequested) else "group selected" if group_name != "ungrouped" else "retry",
-                outcome.request_id if isinstance(outcome, accounts.SessionMoveRequested) else "")
+                outcome.move_id if isinstance(outcome, accounts.SessionMoveRequested) else "")
             if isinstance(outcome, accounts.SessionMoveRefused):
                 lines.append(f"{outcome.session_id}: move refused: {outcome.reason}")
     # A committed group choice is stable. Complete its off-target members without choosing again.
-    if accounts.groups_file().exists():
+    if not proof_group and accounts.groups_file().exists():
         for group_name in accounts.CLAUDE_GROUPS:
             if group_name in moved_groups or group_name in waiting_groups or group_name in blocked_groups or group_name in no_room_groups:
                 continue
@@ -644,25 +665,29 @@ def _run(now: datetime, dry_run: bool) -> list[str]:
                 continue
             lines.extend(f"{session.name}: moving to {target} ({group_name})" for session in members)
             if not dry_run:
+                transition = accounts.group_transition(group_name)
+                if isinstance(transition, accounts.NoGroupTransition):
+                    transition = accounts.set_group_account(group_name, target, why=f"complete {group_name} move to {target}", now=now)
                 _ = accounts.move_sessions(tuple(session.session_id for session in members), target,
-                    why=f"complete {group_name} move to {target}")
+                    why=f"complete {group_name} move to {target}", origin=transition.origin, move_id=transition.move_id)
     if not dry_run and json.dumps(state, sort_keys=True) != original_state:
         _atomic_json(state_root() / "refusal_watch.json", state)
     return lines
 
 
-def run(now: datetime | None = None, *, dry_run: bool = False) -> list[str]:
+def run(now: datetime | None = None, *, dry_run: bool = False, proof_group: frozenset[str] = NO_SESSION_FILTER) -> list[str]:
     at = now or datetime.now(timezone.utc)
     if dry_run:
-        return _run(at, True)
+        return _run(at, True, proof_group)
     with _watch_lock():
-        return _run(at, False)
+        return _run(at, False, proof_group)
 
 
 class WatchCommandLine(argparse.Namespace):
     dry_run: bool = False
     assume_refused: list[str] | None = None
     reset_in: float | None = None
+    proof_group: list[str] | None = None
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -670,22 +695,36 @@ def main(argv: list[str] | None = None) -> int:
     _ = parser.add_argument("--dry-run", action="store_true")
     _ = parser.add_argument("--assume-refused", nargs=2, metavar=("SESSION", "WINDOW"))
     _ = parser.add_argument("--reset-in", type=float)
+    _ = parser.add_argument("--proof-group", nargs="+")
     args = parser.parse_args(argv, namespace=WatchCommandLine())
     if args.reset_in is not None and not args.assume_refused:
         parser.error("--reset-in requires --assume-refused")
-    if args.assume_refused and not args.dry_run:
+    if args.proof_group and not args.assume_refused:
+        parser.error("--proof-group requires --assume-refused")
+    proof_ids: set[str] = set()
+    if args.assume_refused:
         name, window = args.assume_refused
         if window not in ("weekly", "five-hour"):
             parser.error("window must be weekly or five-hour")
-        matching = [session for session in live_owners() if session["session_id"] == name or session["name"] == name]
-        if len(matching) != 1:
-            parser.error("name or id must identify one local live owner")
+        owners = live_owners()
+        selected: dict[str, inventory_module.Session] = {}
+        for probe in [name, *(args.proof_group or [])]:
+            matching = [session for session in owners if session["session_id"] == probe or session["name"] == probe]
+            if len(matching) != 1:
+                parser.error("name or id must identify one local live owner")
+            if accounts.session_group(matching[0]) != "ungrouped":
+                parser.error("--assume-refused requires an ungrouped probe, neither unit nor showrunner")
+            selected[matching[0]["session_id"]] = matching[0]
+        if args.proof_group:
+            proof_ids.update(selected)
         now = datetime.now(timezone.utc)
-        held = AssumedRefusal(uuid=uuid4().hex, timestamp=now.isoformat(),
+        held = AssumedRefusalFile(uuid=uuid4().hex, timestamp=now.isoformat(),
             window="weekly" if window == "weekly" else "five_hour",
             reset=(now + timedelta(minutes=float(args.reset_in))).isoformat() if args.reset_in is not None else "")
-        _atomic_json(assumed_file(matching[0]["session_id"]), held)
-    for line in run(dry_run=bool(args.dry_run)):
+        if not args.dry_run:
+            for session_id in selected:
+                _atomic_json(assumed_file(session_id), held)
+    for line in run(dry_run=bool(args.dry_run), proof_group=frozenset(proof_ids)):
         print(line)
     return 0
 

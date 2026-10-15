@@ -1526,11 +1526,78 @@ class GroupAccounts(TypedDict, total=False):
     showrunners: str
 
 
+@dataclass(frozen=True)
+class HandOrigin:
+    """The user requested this move, independently of stored quota refusals."""
+
+
+HAND_ORIGIN = HandOrigin()
+
+
+@dataclass(frozen=True)
+class RefusalOrigin:
+    window: Literal["weekly", "five_hour", "unknown"]
+    reset: KnownReset | NoResetKnown = field(default_factory=NoResetKnown)
+
+
+MoveOrigin = RefusalOrigin | HandOrigin
+
+
+class MoveOriginFields(TypedDict):
+    cause: Literal["refusal", "by hand"]
+    window: Literal["weekly", "five_hour", "unknown"]
+    reset: NotRequired[str]
+
+
+def move_origin_fields(origin: MoveOrigin) -> MoveOriginFields:
+    fields = MoveOriginFields(cause="by hand", window="unknown")
+    if isinstance(origin, RefusalOrigin):
+        fields["cause"] = "refusal"
+        fields["window"] = origin.window
+        if isinstance(origin.reset, KnownReset):
+            fields["reset"] = origin.reset.at.isoformat()
+    return fields
+
+
+def move_origin_arguments(origin: MoveOrigin) -> tuple[str, ...]:
+    if isinstance(origin, HandOrigin):
+        return ()
+    arguments: tuple[str, ...] = ("--refused", origin.window)
+    if isinstance(origin.reset, KnownReset):
+        arguments += ("--reset", origin.reset.at.isoformat())
+    return arguments
+
+
+@dataclass(frozen=True)
+class GroupTransition:
+    move_id: str
+    origin: MoveOrigin
+
+
+@dataclass(frozen=True)
+class NoGroupTransition:
+    """A legacy selection has no recorded transition."""
+
+
+class StoredGroupSelection(MoveOriginFields):
+    label: str
+    move_id: str
+
+
+class StoredGroupSelections(TypedDict, total=False):
+    units: str | StoredGroupSelection
+    showrunners: str | StoredGroupSelection
+
+
 class GroupAccountChange(TypedDict):
     at: str
     group: ClaudeGroup
     label: str
     why: str
+    move_id: NotRequired[str]
+    cause: NotRequired[Literal["refusal", "by hand"]]
+    window: NotRequired[Literal["weekly", "five_hour", "unknown"]]
+    reset: NotRequired[str]
 
 
 @dataclass(frozen=True)
@@ -1562,26 +1629,53 @@ def groups_file() -> Path:
     return accounts_home() / ".local" / "state" / "accounts" / "groups.json"
 
 
-def _stored_groups(*, resolve_home: bool = True) -> GroupAccounts:
+def _stored_groups() -> StoredGroupSelections:
+    """Read stored selections without converting untouched sibling values."""
     path = groups_file()
     try:
         raw = _read_json_object(path)
     except FileNotFoundError:
-        return GroupAccounts()
+        return StoredGroupSelections()
     except (OSError, ValueError, TypeError) as error:
         raise AccountsError(f"accounts: could not read {path}: {error}") from error
-    result = GroupAccounts()
+    result = StoredGroupSelections()
     for group in CLAUDE_GROUPS:
         if group not in raw:
             continue
-        label = raw[group]
+        value = raw[group]
+        label = value
+        if isinstance(value, dict):
+            fields = cast(dict[str, object], value)
+            label = fields.get("label")
+            if (not isinstance(fields.get("move_id"), str) or not fields["move_id"]
+                    or fields.get("cause") not in ("by hand", "refusal")
+                    or fields.get("window") not in ("weekly", "five_hour", "unknown")):
+                raise AccountsError(f"accounts: {path} has an invalid {group} transition")
+            if "reset" in fields:
+                reset = fields["reset"]
+                try:
+                    if not isinstance(reset, str) or datetime.fromisoformat(reset).tzinfo is None:
+                        raise ValueError("reset needs an offset")
+                except ValueError as error:
+                    raise AccountsError(f"accounts: {path} has an invalid {group} reset") from error
         if not isinstance(label, str):
             raise AccountsError(f"accounts: {path} has an invalid {group} account")
-        resolved = home_account_label("claude") if label == "default" else note_file.canonical_label(label)
-        if resolved != "~/.claude":
-            _ = account_dir(resolved)
-        result[group] = resolved if resolve_home else label
+        if label != "default":
+            _ = numbered_account_label(label, "claude")
+        result[group] = cast(str | StoredGroupSelection, value)
     return result
+
+
+def group_transition(group: ClaudeGroup) -> GroupTransition | NoGroupTransition:
+    selection = cast(str | StoredGroupSelection | NoGroupTransition,
+                     _stored_groups().get(group, NoGroupTransition()))
+    if not isinstance(selection, dict):
+        return NoGroupTransition()
+    origin: MoveOrigin = HandOrigin()
+    if selection["cause"] == "refusal":
+        reset = KnownReset(datetime.fromisoformat(selection["reset"])) if "reset" in selection else NoResetKnown()
+        origin = RefusalOrigin(selection["window"], reset)
+    return GroupTransition(selection["move_id"], origin)
 
 
 def session_group(session: Session | ListedSession) -> ClaudeGroup | Literal["ungrouped"]:
@@ -1677,21 +1771,22 @@ def _groups_lock() -> Generator[None]:
             fcntl.flock(output.fileno(), fcntl.LOCK_UN)
 
 
-def _save_groups(groups: GroupAccounts, previous: GroupAccounts, why: str, now: datetime) -> None:
+def _save_groups(groups: StoredGroupSelections, group: ClaudeGroup, why: str, now: datetime) -> None:
     path = groups_file()
     prior_file = _previous_accounts_configuration_file(path)
     history = roles_history_file()
     size = history.stat().st_size if history.exists() else -1
+    selection = cast(str | StoredGroupSelection | NoGroupTransition, groups.get(group, NoGroupTransition()))
+    assert isinstance(selection, dict)
+    change = GroupAccountChange(at=now.isoformat(), group=group, label=selection["label"], why=why,
+        move_id=selection["move_id"], cause=selection["cause"], window=selection["window"])
+    if "reset" in selection:
+        change["reset"] = selection["reset"]
     try:
         _atomic_write(path, json.dumps(groups, sort_keys=True) + "\n")
-        changes = [GroupAccountChange(at=now.isoformat(), group=group, label=label, why=why)
-                   for group in CLAUDE_GROUPS if isinstance(label := group_label(groups, group), str)
-                   and group_label(previous, group) != label]
-        if changes:
-            history.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-            with history.open("a", encoding="utf-8") as output:
-                for change in changes:
-                    _ = output.write(json.dumps(change, sort_keys=True) + "\n")
+        history.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        with history.open("a", encoding="utf-8") as output:
+            _ = output.write(json.dumps(change, sort_keys=True) + "\n")
     except OSError as error:
         _restore_accounts_configuration_file(path, prior_file)
         if size < 0:
@@ -1700,7 +1795,6 @@ def _save_groups(groups: GroupAccounts, previous: GroupAccounts, why: str, now: 
             with history.open("r+b") as output:
                 _ = output.truncate(size)
         raise AccountsError(f"accounts: could not write group selection: {error}") from error
-
 
 
 def group_note_labels() -> dict[ClaudeGroup, str]:
@@ -1718,19 +1812,36 @@ def group_note_labels() -> dict[ClaudeGroup, str]:
 
 def group_accounts() -> GroupAccounts:
     """Read only explicit group selections; an absent key stays unconfigured."""
-    return _stored_groups()
+    result = GroupAccounts()
+    stored = _stored_groups()
+    for group in CLAUDE_GROUPS:
+        selection = cast(str | StoredGroupSelection | GroupNotConfigured, stored.get(group, GROUP_NOT_CONFIGURED))
+        if isinstance(selection, GroupNotConfigured):
+            continue
+        label = selection["label"] if isinstance(selection, dict) else selection
+        result[group] = home_account_label("claude") if label == "default" else note_file.canonical_label(label)
+    return result
 
 
-def set_group_account(group: ClaudeGroup, label: str, *, why: str, now: datetime | AccountDecisionNow = ACCOUNT_DECISION_NOW) -> None:
-    label = note_file.canonical_label(label)
+def set_group_account(group: ClaudeGroup, label: str, *, why: str,
+                      now: datetime | AccountDecisionNow = ACCOUNT_DECISION_NOW,
+                      origin: MoveOrigin = HAND_ORIGIN, move_id: str = "") -> GroupTransition:
+    from uuid import uuid4
+
+    label = numbered_account_label(label, "claude").label
     _ = claude_account_dir(label)
     at = now if isinstance(now, datetime) else datetime.now(timezone.utc)
+    fields = move_origin_fields(origin)
+    selection = StoredGroupSelection(label=label, move_id=move_id or uuid4().hex,
+                                     cause=fields["cause"], window=fields["window"])
+    if "reset" in fields:
+        selection["reset"] = fields["reset"]
     with _groups_lock():
-        stored = _stored_groups(resolve_home=False)
-        selected: GroupAccounts = stored.copy()
-        selected[group] = label
+        selected = _stored_groups()
+        selected[group] = selection
         with _roles_lock():
-            _save_groups(selected, stored, why, at)
+            _save_groups(selected, group, why, at)
+        return GroupTransition(selection["move_id"], origin)
 
 
 def placement_report(now: datetime | AccountDecisionNow = ACCOUNT_DECISION_NOW) -> str:
@@ -2091,7 +2202,12 @@ class SessionMoveRequested:
     stdout: str = ""
     stderr: str = ""
     returncode: int = 0
+    move_id: str = ""
     source_login: str = field(kw_only=True)
+
+    def __post_init__(self) -> None:
+        if not self.move_id:
+            object.__setattr__(self, "move_id", self.request_id)
 
 
 @dataclass(frozen=True)
@@ -2103,10 +2219,11 @@ class SessionMoveRefused:
     returncode: int = 1
 
 
-def move_sessions(ids: tuple[str, ...], target: str, *, why: str) -> tuple[SessionMoveRequested | SessionMoveRefused, ...]:
+def move_sessions(ids: tuple[str, ...], target: str, *, why: str, origin: MoveOrigin, move_id: str = "") -> tuple[SessionMoveRequested | SessionMoveRefused, ...]:
     """Start one selected shutdown for each source login and report each owner's record."""
-    target = note_file.canonical_label(target)
+    target = numbered_account_label(target, "claude").label
     from uuid import uuid4
+    transition_id = move_id or uuid4().hex
     sys.path.insert(0, str(SCRIPTS / "shutdown"))
     if TYPE_CHECKING:
         from scripts.shutdown import inventory, record
@@ -2121,7 +2238,7 @@ def move_sessions(ids: tuple[str, ...], target: str, *, why: str) -> tuple[Sessi
         outcomes[session_id] = SessionMoveRefused(session_id, reason, stdout, stderr, returncode)
         name = owners[session_id].name if session_id in owners else session_id
         moves.append_move(moves.FailedMove(kind="failed", at=datetime.now(timezone.utc).isoformat(),
-            tool="claude", subject=session_id + ": " + name, move_id=uuid4().hex, reason=reason))
+            tool="claude", subject=session_id + ": " + name, move_id=transition_id, reason=reason))
 
     try:
         destination = _move_target(target)
@@ -2150,9 +2267,9 @@ def move_sessions(ids: tuple[str, ...], target: str, *, why: str) -> tuple[Sessi
         for login, selected_ids in groups.items():
             source = account.label_for("Claude", login)
             command = _shutdown_argv("down", source, "--here", "--only", ",".join(selected_ids),
-                "--restart", "--to", target, "--why", why)
+                "--restart", "--to", target, "--why", why, "--move-id", transition_id, *move_origin_arguments(origin))
             try:
-                prior_requests = {(entry["move_id"], entry["subject"]) for entry in moves.read_moves()
+                prior_requests = {(entry.get("request_id", entry["move_id"]), entry["subject"]) for entry in moves.read_moves()
                                   if entry["kind"] == "requested"}
                 result = subprocess.run(command, capture_output=True, text=True, check=False,
                     env={**os.environ, "REFUSAL_WATCH_INVENTORY": "read existing"})
@@ -2164,28 +2281,27 @@ def move_sessions(ids: tuple[str, ...], target: str, *, why: str) -> tuple[Sessi
                         journal_request = next((entry for entry in reversed(moves.read_moves())
                             if entry["kind"] == "requested" and entry["tool"] == "claude" and entry["to"] == target
                             and entry["subject"] == session_id + ": " + owners[session_id].name
-                            and (entry["move_id"], entry["subject"]) not in prior_requests), None)
+                            and (entry.get("request_id", entry["move_id"]), entry["subject"]) not in prior_requests), None)
                         if journal_request is not None:
-                            outcomes[session_id] = SessionMoveRequested(session_id, journal_request["move_id"], target,
-                                result.stdout, result.stderr, result.returncode, source_login=login)
+                            outcomes[session_id] = SessionMoveRequested(session_id, journal_request.get("request_id", journal_request["move_id"]), target,
+                                result.stdout, result.stderr, result.returncode, journal_request["move_id"], source_login=login)
                             continue
                         refuse(session_id, result.stderr.strip() or result.stdout.strip() or "shutdown refused before a record was created",
                             stdout=result.stdout, stderr=result.stderr, returncode=result.returncode or 1)
                         continue
                     outcome = SessionMoveRequested(session_id, saved["request_id"], target,
-                        result.stdout, result.stderr, result.returncode, source_login=login)
+                        result.stdout, result.stderr, result.returncode, saved.get("move_id", saved["request_id"]), source_login=login)
                     outcomes[session_id] = outcome
-                    if not any(entry["kind"] == "requested" and entry["move_id"] == saved["request_id"]
+                    if not any(entry["kind"] == "requested" and entry.get("request_id", entry["move_id"]) == saved["request_id"]
                             and entry["subject"] == session_id + ": " + owners[session_id].name for entry in moves.read_moves()):
                         request: moves.RequestedMove = {"kind": "requested", "at": saved["requested_at"],
                             "tool": "claude", "subject": session_id + ": " + owners[session_id].name,
-                            "move_id": saved["request_id"], "from": saved.get("source_label", source),
+                            "move_id": saved.get("move_id", saved["request_id"]), "request_id": saved["request_id"], "from": saved.get("source_label", source),
                             "to": target, "why": why, "window": "unknown"}
-                        refusal = refusals.load().get(refusals.key("claude", login))
-                        if refusal is not None:
-                            request["window"] = refusal.window.name if isinstance(refusal.window, refusals.KnownWindow) else "unknown"
-                            if isinstance(refusal.reset, refusals.KnownReset):
-                                request["reset"] = refusal.reset.at.isoformat()
+                        fields = move_origin_fields(origin)
+                        request["cause"], request["window"] = fields["cause"], fields["window"]
+                        if "reset" in fields:
+                            request["reset"] = fields["reset"]
                         moves.append_move(request)
             except (OSError, ValueError, record.InvalidRecord) as error:
                 for session_id in selected_ids:
@@ -2370,8 +2486,8 @@ def move_group(group: ClaudeGroup, target: str, *, dry_run: bool = False, why: s
         return GroupMoveDryRun(ids, (*checked.notices, f"{group}: would select {target}",
             *(move_preview_line(item, now) for item in selected), *notices))
     previous_target = group_label(group_accounts(), group)
-    set_group_account(group, target, why=reason)
-    results = move_sessions(ids, target, why=reason) if ids else ()
+    transition = set_group_account(group, target, why=reason)
+    results = move_sessions(ids, target, why=reason, origin=transition.origin, move_id=transition.move_id) if ids else ()
     stdout, stderr, code = _move_output(results, (*checked.notices, *notices), group, previous_target)
     outcome = GroupMoveStartFailed if code else GroupMoveStarted
     return outcome(ids, target, stdout, stderr, code)
@@ -2432,7 +2548,7 @@ def move(session: str, target: str, *, dry_run: bool = False, why: str = "") -> 
         if dry_run:
             return MoveDryRun(owner.session_id, (*checked.notices, move_preview_line(owner, now)))
         reason = why or f"{session_account_label(owner)} is out of usage"
-        results = move_sessions((owner.session_id,), target, why=reason)
+        results = move_sessions((owner.session_id,), target, why=reason, origin=HAND_ORIGIN)
         stdout, stderr, code = _move_output(results, checked.notices, owner.session_id, GROUP_NOT_CONFIGURED)
         outcome = MoveStartFailed if code else MoveStarted
         return outcome(owner.session_id, target, stdout, stderr, code)
@@ -2909,8 +3025,10 @@ def status_report(*, detail: bool = False) -> str:
     summary = [group_status_line(groups), table, "", *notes]
     if not detail:
         return "\n".join(summary)
+    journal = moves.read_journal()
     return "\n".join([*summary,
-        *_live_status_lines(groups), *_seats_status_lines(now, selected_seats), *_move_status_lines(moves.read_moves(), zone)])
+        *_live_status_lines(groups), *_seats_status_lines(now, selected_seats),
+        *_move_status_lines(moves.account_moves(journal), zone), *_routing_status_lines(journal, zone)])
 
 
 SEATS_RUN_ROOT = Path("/tmp/claude/delegate")
@@ -3002,7 +3120,7 @@ def _move_status_lines(entries: list[moves.MoveEntry], zone: tzinfo) -> list[str
                     outcomes.append(f"confirmed {seat} on {outcome.get('home', outcome.get('config_dir', ''))}")
                 elif outcome["kind"] == "failed":
                     outcomes.append("failed: " + outcome["reason"])
-            cause = f" ({entry.get('cause', 'refusal')})" if entry["tool"] == "codex" else ""
+            cause = f" ({entry.get('cause', 'refusal')})"
             detail = f"requested {entry['from']} → {entry['to']}: {entry['why']}{cause} — " + ("; ".join(outcomes) or "pending")
         elif entry["kind"] == "confirmed":
             detail = f"confirmed {entry.get('seat', entry['subject'])}: {entry.get('home', entry.get('config_dir', ''))}"
@@ -3017,6 +3135,36 @@ def _move_status_lines(entries: list[moves.MoveEntry], zone: tzinfo) -> list[str
             detail = "room again: " + str(entry["label"])
         lines.append(f"{at} {entry['tool']} {entry['subject']}: {detail}")
     return lines
+
+
+def _routing_status_lines(entries: list[moves.JournalEntry], zone: tzinfo) -> list[str]:
+    routings: dict[str, list[moves.RoutingEntry]] = {}
+    for entry in entries:
+        match entry["kind"]:
+            case "routed to claude" | "routed back" | "routing not restored":
+                routings.setdefault(entry["fallback_at"], []).append(entry)
+            case "requested" | "confirmed" | "failed" | "waited" | "wait ended" | "no room" | "room again":
+                continue
+    lines: list[str] = []
+    for fallback_at, trail in routings.items():
+        opening = next((entry for entry in trail if entry["kind"] == "routed to claude"), None)
+        owner = trail[0]["owner"]
+        started = datetime.fromisoformat(fallback_at).astimezone(zone).isoformat()
+        if opening is not None:
+            text = f"routed to claude {started} ({owner}, {opening['cause']}): {', '.join(opening['moved'])}"
+        else:
+            text = f"routed to claude {started} ({owner}; opening entry not recorded)"
+        ending = next((entry for entry in reversed(trail) if entry["kind"] != "routed to claude"), None)
+        if ending is None:
+            text += " — open"
+        else:
+            at = datetime.fromisoformat(ending["at"]).astimezone(zone).isoformat()
+            if ending["kind"] == "routed back":
+                text += f" — routed back {at}"
+            else:
+                text += f" — not restored ({ending['outcome']}) {at}: {', '.join(ending['failed'])}"
+        lines.append(text)
+    return ["Codex work routing:", *lines] if lines else []
 
 
 def _parser() -> argparse.ArgumentParser:

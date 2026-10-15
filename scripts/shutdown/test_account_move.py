@@ -224,8 +224,9 @@ class AccountMoveTests(ShutdownTestCase):
             self.assertEqual((result, error), (0, ""))
             self.assertIn("accounts.py move move-id claude1", output)
         arguments = cast(tuple[str, ...], process.call_args.args[0])
-        self.assertEqual(tuple(arguments[2:]), ("down", "claude1", "--here", "--only", "move-id",
+        self.assertEqual(tuple(arguments[2:12]), ("down", "claude1", "--here", "--only", "move-id",
             "--restart", "--to", "claude3", "--why", "claude1 is out of usage"))
+        self.assertEqual(arguments[12], "--move-id")
         saved = record.find_session("current@example.invalid", "move-id")
         self.assertIsNotNone(saved)
         self.assertNotEqual(self.disk_state(), before)
@@ -427,7 +428,8 @@ class AccountMoveTests(ShutdownTestCase):
             self.assertIsInstance(result, accounts.GroupMoveStarted)
             self.assertEqual(len(commands), 1)
             self.assertEqual(tuple(commands[0][2:]), ("down", "claude1", "--here", "--only", "director",
-                "--restart", "--to", "claude3", "--why", "checkpoint move"))
+                "--restart", "--to", "claude3", "--why", "checkpoint move", "--move-id",
+                cast(accounts.GroupTransition, accounts.group_transition("units")).move_id))
             saved = record.session_records(report["login"])[0]
             self.assertEqual(saved["force"], "wait for ready")
             observed = stop_work.fresh_session(saved["session"], report)
@@ -516,7 +518,7 @@ class AccountMoveTests(ShutdownTestCase):
         return result, output.getvalue(), events
 
     def test_mixed_source_group_returns_to_its_previously_selected_account(self) -> None:
-        accounts.set_group_account("showrunners", "claude2", why="original selection")
+        _ = accounts.set_group_account("showrunners", "claude2", why="original selection")
         result, output, events = self.mixed_source_run()
         self.assertEqual(result, 0)
         self.assertEqual(events, [("down", "claude1", "sr-one"), ("down", "claude2", "sr-two"),

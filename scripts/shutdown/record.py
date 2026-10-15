@@ -365,6 +365,7 @@ class ProgressStep(TypedDict):
 
 
 class SessionShutdown(TypedDict):
+    move_id: NotRequired[str]
     login: str
     label: str
     machine: str
@@ -975,6 +976,10 @@ def _shutdown_request_fields(values: dict[str, object], place: str) -> None:
     request_id = _string(_required(values, "request_id", place), f"{place}.request_id")
     if not request_id:
         raise InvalidRecord(f"{place}.request_id must not be empty")
+    if "move_id" in values:
+        move_id = _string(values["move_id"], f"{place}.move_id")
+        if not move_id:
+            raise InvalidRecord(f"{place}.move_id must not be empty")
     values["requested_by"] = _request_origin(
         _required(values, "requested_by", place), f"{place}.requested_by"
     )
