@@ -99,7 +99,9 @@ def start(options: CommandLine, target: str) -> tuple[list[Started], list[str], 
             return [], [f"{options.rest[0]}: not moved: {moved.reason}"], []
         if isinstance(moved, accounts.MoveStartFailed):
             return [], [f"{options.rest[0]}: not moved: {(moved.stderr or moved.stdout).strip() or 'shutdown refused'}"], []
-        return [Started(moved.session_id, live.get(moved.session_id, (moved.session_id, 0))[0])], [], []
+        notes = [text for text in moved.stdout.splitlines()
+                 if text.startswith(("no fresh usage reading for ", "to move them back, in this terminal: "))]
+        return [Started(moved.session_id, live.get(moved.session_id, (moved.session_id, 0))[0])], [], notes
     group = options.kind
     moved_group = accounts.move_group(group, target, dry_run=options.dry_run, why=options.why)
     if isinstance(moved_group, accounts.MoveRefused):
@@ -108,7 +110,8 @@ def start(options: CommandLine, target: str) -> tuple[list[Started], list[str], 
         return [], [], list(moved_group.lines)
     printed = moved_group.stdout.splitlines()
     refused = [text for text in printed if UNREGISTERED in text]
-    notes = [text for text in printed if text == f"{group}: no live session moves"]
+    notes = [text for text in printed if text == f"{group}: no live session moves"
+             or text.startswith(("no fresh usage reading for ", "to move them back, in this terminal: "))]
     if isinstance(moved_group, accounts.GroupMoveStartFailed):
         refused += [f"{group}: {text}" for text in (moved_group.stderr or moved_group.stdout).strip().splitlines()
                     if UNREGISTERED not in text and text not in notes]

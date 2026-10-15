@@ -533,7 +533,7 @@ def _run(now: datetime, dry_run: bool, proof_group: frozenset[str] = NO_SESSION_
     fingerprint = _reading_values_fingerprint()
     if dry_run:
         lines.insert(0, accounts.group_status_line(selected_groups))
-    all_members: dict[accounts.ClaudeGroup, list[inventory_module.Session]] = (accounts.live_group_members()
+    all_members: dict[accounts.ClaudeGroup, list[inventory_module.ListedSession]] = (accounts.live_group_members()
         if not proof_group and (any(key.startswith("group:") for key in groups) or accounts.groups_file().exists())
         else {"units": [], "showrunners": []})
     moved_groups: set[accounts.ClaudeGroup] = set()
@@ -587,8 +587,8 @@ def _run(now: datetime, dry_run: bool, proof_group: frozenset[str] = NO_SESSION_
                     state["notices"][notice_key] = fingerprint
             continue
         if group_name != "ungrouped":
-            lines.extend(f"{session['name']}: refused group {group_name}; move to {chosen.label}" for session in all_members[group_name]
-                         if session["session_id"] not in {item[0]["session_id"] for item in group})
+            lines.extend(f"{session.name}: refused group {group_name}; move to {chosen.label}" for session in all_members[group_name]
+                         if session.session_id not in {item[0]["session_id"] for item in group})
         for session, _, _ in group:
             lines.append(f"{session['name']}: refused; move from {source} to {chosen.label}")
             prior = state["sessions"].get(session["session_id"])
@@ -618,7 +618,7 @@ def _run(now: datetime, dry_run: bool, proof_group: frozenset[str] = NO_SESSION_
                 _set_transition(state, session["session_id"], refusal.entry_id, "group selected", "")
             # The chosen group account survives a member's failed request or interrupted delivery.
             _atomic_json(state_root() / "refusal_watch.json", state)
-            ids = tuple(session["session_id"] for session in all_members[group_name]
+            ids = tuple(session.session_id for session in all_members[group_name]
                         if not accounts.session_on_account(session, chosen.label))
         else:
             ids = tuple(session["session_id"] for session, _, _ in group)
@@ -644,10 +644,10 @@ def _run(now: datetime, dry_run: bool, proof_group: frozenset[str] = NO_SESSION_
             if isinstance(target, accounts.GroupNotConfigured):
                 continue
             members = [session for session in all_members[group_name]
-                       if session["session_id"] not in open_ids and not accounts.session_on_account(session, target)
-                       and not (session["session_id"] in state["sessions"] and state["sessions"][session["session_id"]]["state"] == "cancelled"
-                                and isinstance(detected.get(session["session_id"]), TranscriptRefusal)
-                                and state["sessions"][session["session_id"]]["entry_id"] == cast(TranscriptRefusal, detected[session["session_id"]]).entry_id)]
+                       if session.session_id not in open_ids and not accounts.session_on_account(session, target)
+                       and not (session.session_id in state["sessions"] and state["sessions"][session.session_id]["state"] == "cancelled"
+                                and isinstance(detected.get(session.session_id), TranscriptRefusal)
+                                and state["sessions"][session.session_id]["entry_id"] == cast(TranscriptRefusal, detected[session.session_id]).entry_id)]
             if not members:
                 continue
             directory = accounts.claude_account_dir(target)
@@ -663,12 +663,12 @@ def _run(now: datetime, dry_run: bool, proof_group: frozenset[str] = NO_SESSION_
             if isinstance(prepared, accounts.AccountRefused):
                 lines.append(f"{group_name}: move refused: {prepared.reason}")
                 continue
-            lines.extend(f"{session['name']}: moving to {target} ({group_name})" for session in members)
+            lines.extend(f"{session.name}: moving to {target} ({group_name})" for session in members)
             if not dry_run:
                 transition = accounts.group_transition(group_name)
                 if isinstance(transition, accounts.NoGroupTransition):
                     transition = accounts.set_group_account(group_name, target, why=f"complete {group_name} move to {target}", now=now)
-                _ = accounts.move_sessions(tuple(session["session_id"] for session in members), target,
+                _ = accounts.move_sessions(tuple(session.session_id for session in members), target,
                     why=f"complete {group_name} move to {target}", origin=transition.origin, move_id=transition.move_id)
     if not dry_run and json.dumps(state, sort_keys=True) != original_state:
         _atomic_json(state_root() / "refusal_watch.json", state)

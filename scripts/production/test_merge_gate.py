@@ -105,12 +105,16 @@ class FixtureTest(unittest.TestCase):
             import subprocess
             child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(120)"],
                                      stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            (state / "child-pid").write_text(str(child.pid))
+            (state / "child-pid.tmp").write_text(str(child.pid))
+            # Publish by rename: a reader must never see the file empty.
+            os.replace(state / "child-pid.tmp", state / "child-pid")
         if (state / "modify-tracked").exists() and suite == "hooks":
             Path("unit.txt").write_text("gate debris\\n")
             self.fail("fixture edited a tracked checkpoint file")
         if (state / "hold-module").exists() and suite == "hooks":
-            (state / "module-held").write_text(str(os.getpid()))
+            (state / "module-held.tmp").write_text(str(os.getpid()))
+            # Publish by rename: a reader must never see the file empty.
+            os.replace(state / "module-held.tmp", state / "module-held")
             while True:
                 time.sleep(0.01)
         if (state / "barrier").exists() and suite == "lib":

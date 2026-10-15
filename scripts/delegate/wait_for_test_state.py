@@ -66,5 +66,13 @@ def wait_for_file(path: Path) -> None:
     wait_until(path.exists, path.parent)
 
 
+def wait_for_pid(path: Path, *,
+                 processes: Sequence[subprocess.Popen[str] | subprocess.Popen[bytes]] = ()) -> int:
+    """Read a pid file once it holds a pid: a writer that does not publish by
+    rename leaves the file created and still empty for a moment."""
+    wait_until(lambda: path.exists() and path.read_text() != "", path.parent, processes=processes)
+    return int(path.read_text())
+
+
 if __name__ == "__main__":
     wait_for_file(Path(sys.argv[1]))

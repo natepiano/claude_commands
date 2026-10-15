@@ -339,14 +339,13 @@ class SettleTests(ShutdownTestCase):
         for push in pushes:
             self.assertEqual(push.id, "shutdown.holdout")
             self.assertIn(push.values["session"], push.title)
-            self.assertIn("stuck waiting", push.title)
+            self.assertIn("is blocked", push.title)
             self.assertIn(push.values["command"], push.body)
-            self.assertIn("Ghostty window, Writing desktop", push.body)
             self.assertIn("5 minutes", push.body)
             combined = push.body + " " + cast(ActionRequired, push.action).text
-            self.assertIn("in a terminal on natedev", combined.casefold())
+            self.assertIn("(on natedev)", combined.casefold())
             self.assertIn(f"now {LOGIN} --here --only {identities[push.values['session']]}", combined)
-            self.assertIn("pause at a safe point and say ready", push.body)
+            self.assertTrue(push.body.startswith(f"Reason: {push.values['operation']} is blocked because {push.values['session']}'s claude session is not answering, and it can't proceed.\n\n"))
             self.assertIn("Stop now (recommended)", push.body)
             self.assertIn("mid-step", push.body)
             self.assertIn("Uncommitted work stays", push.body)
@@ -651,7 +650,7 @@ class SettleTests(ShutdownTestCase):
         registry.mkdir(parents=True, exist_ok=True)
         _ = (registry / f"{owner['pid']}.json").write_text(json.dumps(
             {**registered, "status": "busy", "cwd": str(self.root)}))
-        _ = self.enterContext(patch.object(inventory, "_registered_productions", return_value=({}, [])))
+        _ = self.enterContext(patch.object(inventory, "showrunner_registrations", return_value=inventory.ShowrunnerRegistrations(())))
         _ = self.enterContext(patch.object(inventory, "_unit_sessions", return_value={}))
         _ = self.enterContext(patch.object(inventory, "_active_run_directories", return_value={}))
         _ = self.enterContext(patch.object(inventory, "_newest_unit_plans", return_value={}))
@@ -827,7 +826,7 @@ class SettleTests(ShutdownTestCase):
               patch.object(accounts, "pick", return_value=accounts.PickedAccount("claude3", self.root / ".claude3",
                   80, accounts.NoResetKnown())),
               patch.object(accounts, "move_sessions", return_value=(
-                  accounts.SessionMoveRequested(owner["session_id"], "replacement", "claude3"),)) as move,
+                  accounts.SessionMoveRequested(owner["session_id"], "replacement", "claude3", source_login=LOGIN),)) as move,
               patch.object(settle, "_restore_record"), redirect_stdout(io.StringIO())):
             self.assertEqual(settle.cancel(Account("claude", LOGIN, LABEL), True), 0)
         self.assertEqual(len(ticks), 1)
@@ -2322,7 +2321,7 @@ class SettleTests(ShutdownTestCase):
         self.assertTrue(all(push.id == "shutdown.holdout" for push in pushes))
         self.assertIn("Busy", cast(str, sender.call_args.args[2]))
 
-    def test_holdout_alert_uses_the_recorded_tmux_window_name(self) -> None:
+    def test_holdout_alert_names_the_session_and_machine_for_the_command(self) -> None:
         owner = top_level("form", "Display name")
         owner["host"] = inventory.TmuxHost(kind="tmux", tmux_session="Actual terminal",
             server=inventory.TmuxServerNotRecorded(kind="not recorded"),
@@ -2332,7 +2331,8 @@ class SettleTests(ShutdownTestCase):
             settle._send_holdout_alert([(saved, "showing a form")])  # pyright: ignore[reportPrivateUsage]
         push = cast(RenderedPush, alert.call_args.args[0])
         self.assertEqual(push.values["session"], "Display name")
-        self.assertIn("Actual terminal", push.body)
+        self.assertTrue(push.message.startswith("Session: Display name\nAction: "))
+        self.assertIn("(on natedev)", push.body)
 
     def test_pending_scheduled_jobs_remain_in_session_reports_without_a_phone_alert(self) -> None:
         saved = session_shutdown(top_level("owner", "Owner"), progress={"kind": "timers pending", "at": NOW, "timers": []}, requester="requester")
@@ -2723,7 +2723,7 @@ class SettleTests(ShutdownTestCase):
                 self.assertIn("Restored: Remote Control not on yet;", output.getvalue())
                 self.assertIsNone(record.find_session(LOGIN, restored["session"]["session_id"]))
                 alert.assert_not_called()
-                fixer.assert_called_once_with("restored-" + policy, 912, "resumed-start", "Restored", policy)
+                fixer.assert_called_once_with("restored-" + policy, 912, "resumed-start", "Restored", policy, "Restored")
                 self.assertIn("turning it on in the background", output.getvalue())
                 record.archive_session(LOGIN, other["session"]["session_id"])
 
@@ -2802,8 +2802,8 @@ class SettleTests(ShutdownTestCase):
         push = cast(RenderedPush, alert.call_args.args[0])
         self.assertIn("Held", push.title)
         self.assertIn("Shutdown", push.title)
-        self.assertIn("stuck waiting", push.title)
-        self.assertIn("in a terminal on mac", cast(ActionRequired, push.action).text.casefold())
+        self.assertIn("is blocked", push.title)
+        self.assertIn("(on mac)", push.body.casefold())
         self.assertIn(f"now {LOGIN} --here --only held", cast(str, sender.call_args.args[2]))
 
 

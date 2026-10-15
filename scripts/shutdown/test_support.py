@@ -146,9 +146,10 @@ class ShutdownTestCase(unittest.TestCase):
         )
 
     def _block_launch_remote_control(
-        self, session_id: str, pid: int, proc_start: str, who: str, alerts: Literal["user", "none"]
+        self, session_id: str, pid: int, proc_start: str, who: str, alerts: Literal["user", "none"],
+        session: str
     ) -> Never:
-        del pid, proc_start, who, alerts
+        del pid, proc_start, who, alerts, session
         self._reached_send_leaf(ShutdownSendLeaf.LAUNCH_REMOTE_CONTROL_FIXER, f"session:{session_id}")
 
     def _block_run_notifier(self, verb: str, instance: str) -> Never:
