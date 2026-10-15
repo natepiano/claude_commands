@@ -46,7 +46,7 @@ TEST_SUITES = (
 DEFAULT_MEMORY_CAP_MIB = 4096
 MODULE_MEMORY_MIB = 48
 MEMORY_SAMPLE_SECONDS = 0.25
-SETTINGS_BLOB = "f430ede1"
+SETTINGS_BLOB = "6ca2d928"
 # Python restores these dispositions before exec, including an inherited SIG_IGN.
 # No preexec_fn is needed, and the suite receives signals as a normal foreground job.
 SUITE_BOOTSTRAP = """import os, signal, sys
