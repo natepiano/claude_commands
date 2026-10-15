@@ -68,6 +68,8 @@ exits 1 and leaves the session running. Look at it with `tmux attach -t
 <slug>`; once it has its update timer, run `/showrunner:attach <slug>`.
 
 The user reaches the lower showrunner with `tmux attach -t <slug>` or by
-Remote Control under the same name. What each side does once attached is in
+Remote Control under the same name. `/showrunner:rename` does not rename a
+running session: its tmux session and Remote Control name keep the slug it
+started with until it is started or resumed again, which uses the new slug. What each side does once attached is in
 `/showrunner:produce` → Nested showrunners. To take it out of the tree, use
 `/showrunner:attach detach <slug>`; wrapping its production does the same.

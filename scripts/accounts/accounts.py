@@ -160,7 +160,7 @@ CODEX_ROLE = "workers"
 # A table cell with nothing to show: the folder has no login, or is not set up.
 NO_VALUE = "—"
 TABLE_HEADINGS = (
-    "Folder", "Label", "Login", "Role", "5-hour left", "5-hour resets", "Weekly left", "Weekly resets",
+    "Folder", "Label", "Login", "Role", "Weekly left", "Weekly resets",
     "On credits", "Credits left", "Read",
 )
 # A stored reading older than this is read again before the table shows it.
@@ -2914,19 +2914,17 @@ def _credit_cells(usage: usage_store.StoredUsage, now: datetime) -> tuple[str, s
 def _reading_cells(
     usage: usage_store.StoredUsage | None, now: datetime, zone: tzinfo | None, *, has_credits: bool,
 ) -> tuple[str, ...]:
-    """The cells after the role: both windows, the credits, and when they were read."""
+    """The cells after the role: the weekly window, credits, and when they were read."""
     held = usage or usage_store.StoredUsage()
     read = _read_at(usage)
-    has_no_five_hour_window = "weekly" in held and "five_hour" not in held
     return (
-        *((NO_VALUE, NO_VALUE) if has_no_five_hour_window else _window_cells(held.get("five_hour"), now, zone, "%H:%M %Z")),
         *_window_cells(held.get("weekly"), now, zone, "%a %m-%d %H:%M %Z"),
         *(_credit_cells(held, now) if has_credits else (NO_VALUE, NO_VALUE)),
         NO_VALUE if read is None else read.astimezone(zone).strftime("%H:%M %Z"),
     )
 
 
-NO_READING = (NO_VALUE,) * 7
+NO_READING = (NO_VALUE,) * 5
 
 
 def _table_row(

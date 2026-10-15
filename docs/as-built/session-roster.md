@@ -139,7 +139,7 @@ Delivery mechanics: for a Claude recipient found in the live registry, `send.py`
 
 The fallback is a headless `command claude -p` relay (sonnet, auto mode, tools `SendMessage` plus `ListAgents` for a name, hooks, MCP and slash commands off, `CLAUDE_*` variables removed, named `--from`); delivery is read from the `SendMessage` tool result in the stream, which stays in `STATE/relay/<to>.jsonl`. `--timeout` defaults to 40 s for every transport. Where `~/.config/claude/oauth-token.gpg` exists (the Mac, whose keychain ssh cannot open) the relay decrypts it, and queues with `gpg-agent is cold on <machine>: run github-warmup there` when it cannot. Undelivered Claude messages go to `STATE/queue/`, latest per `--key`, under the recipient's session id; `pending` prints and clears them. `--key` with `--repeat-minutes` skips a repeat within the window; `ack` skips every later send with the key until `reopen`.
 
-### Postmaster mod (trial)
+### Postmaster mod
 
 Postmaster is a local Claude Code mod in `mods/postmaster/`, loaded directly with `--plugin-dir`; the trial start procedure loads `/home/natepiano/.claude/mods/postmaster` from main. It uses a Claude session named `postmaster` in `/home/natepiano/postmaster`. It reads and writes only under `STATE/postmaster/`, starts no process and makes no network call. `STATE` is `$XDG_STATE_HOME/message`, defaulting to `~/.local/state/message`.
 
@@ -217,6 +217,8 @@ Each following line reads those rows without changing state. The delivery-share 
 | Replies passed on, and confirmed forwards | `python3 -c 'import json,os; from pathlib import Path; p=Path(os.environ.get("XDG_STATE_HOME",str(Path.home()/".local/state")))/"message/postmaster/replies"; r=[json.loads(f.read_text()) for f in p.glob("*.json")]; print(sum(bool(x["forwarded"]) for x in r),sum(len(x["forwarded"]) for x in r))'` |
 
 Reply counts cover retained files, not just today; use `at_ms` and the trial start to select the same measurement interval as the log. A reply can have several confirmed forwards.
+
+Step 2 results (natedev, 2026-10-13 10:07 to 2026-10-15 10:07 EDT, 701 rows): 533 went through postmaster, 167 through the relay, and 1 was queued with no send because no session was live. Excluding the 125 `relay-only-sender` (`shutdown`) rows, the mod delivered 533 of 576 (92.5%). Relays were 61 in the first 24 h and 106 in the second, against a baseline of about 600 a day. The median `sent` time was 0.67 s through postmaster (p90 1.71 s) and 7.09 s through the relay, which includes the wait before falling back. All 31 `unclaimed` rows came from three broadcasts sent in the same second (4, 8 and 19 recipients), and each was sent by the relay. The rest of the misses were 2 `claimed-no-result`, 6 `self` and 4 `unresolved`; 5 rows ended queued (that 1, plus 4 relays whose recipient had ended) and 0 failed. 10 replies were consumed and none was forwarded. No `errors/` file was written. Adopted 2026-10-15.
 
 **API measurement record**
 
