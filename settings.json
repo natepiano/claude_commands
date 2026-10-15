@@ -10,6 +10,7 @@
   "includeCoAuthoredBy": false,
   "permissions": {
     "allow": [
+      "Bash(~/.claude/scripts/lib/py ~/.claude/scripts/accounts/refusal_watch.py --assume-refused *)",
       "Read(~/.claude/projects/**/tool-results/**)",
       "Read(~/.claude1/projects/**/tool-results/**)",
       "Read(~/.claude2/projects/**/tool-results/**)",
@@ -99,7 +100,8 @@
     "deny": [
       "Bash(git stash)",
       "Bash(git stash *)",
-      "Bash(git stash:*)"
+      "Bash(git stash:*)",
+      "AskUserQuestion"
     ],
     "defaultMode": "auto",
     "blockReadsOutsideWorkingDirectories": false,
