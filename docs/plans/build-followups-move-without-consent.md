@@ -92,44 +92,32 @@
 
 **Depends on:** Phase 3
 
-#### Work Order
+#### As-built
 
-**Goal:** a move never gives up on a session because it was briefly busy or had a background shell running: the stop waits until the session is idle, a session that says `ready` after such a refusal is taken at its word and a conductor picks it up, and `move --dry-run` no longer promises a pause it may not send.
-
-**Spec:**
-- Found live (dashboard-unit, request of 2026-10-14 16:18:50 EDT): the session said `ready` at 16:19:20, a message made it busy at 16:19:39, the conductor claimed the stop at 16:19:57, and `stop.py`'s guard in `_stop_owner` (the `current["status"] != "idle"` test) refused at 16:19:59. Refusing was right. Storing the refusal as the final progress `stop failed` (reason `session or worker is not idle and ready`) was not: `_done` (`settle.py`) counts `stop failed` as finished, the conductor exited, and nothing retried when the session went idle 12 seconds later. On 2026-10-15 the session ran `shutdown.py ready`, which looks only at `waiting`/`ready`/`held by usage limit` records, printed `no shutdown in progress for this session`, and went on working on claude1.
-- **A not-ready refusal is not a failure.** In `_stop_owner`'s guard, write the progress the refusal already computes in `NotReadyToStop.progress` (`waiting`, `ready` or `held by usage limit`; a reclaimed stale `stopping` claim maps to `waiting`, as today), and keep the `NotReadyToStop` issue on the record's `stop_issues` so status can show why. Never write `stop failed` for it. `next_step` then stops the session on a later pass once it is idle, under every existing rule (requester goes last, `force == "now"`, forms, blockers). `report_stop` must not report the record as finished while it waits.
-- **Old records recover at one boundary.** In `record.py`'s `_read_record` (the legacy normalization point every reader goes through: `session_records`, `all_session_records`, status, `follow`, restart selection), rewrite a record whose progress is `stop failed`, whose stop reason is exactly `session or worker is not idle and ready`, and whose `stop_issues` hold exactly one `NotReadyToStop`, into that issue's `progress`. No reader carries its own legacy test.
-- **A real failure is never read as a refusal.** `_action_failed` (`settle.py`) and every other writer of `stop failed` replaces `stop_issues` with its own issues, so a stale `NotReadyToStop` from an earlier refusal cannot make a later real failure look recoverable.
-- **`ready` restarts the work.** `ready()` (`settle.py`) records `ready` as today and then starts the account's conductor with `_launch_conductor(login, label)`; when one already holds the lock, the new one exits at once, as today. If the launch fails, print one line naming the command to run and where (`in a terminal on <machine>`), exit 2.
-- **`"shell"` counts as idle for stopping.** The registry status `"shell"` means the session is at its prompt while a background Bash shell it started is still running; the shell ends with the session. Name the set once in `settle.py` (a private `frozenset`, e.g. `_STOPPABLE_STATUSES = frozenset({"idle", "shell"})`) and use it in `next_step`'s idle test, `stop.py`'s guard, and `_hold_details`. Leave `remote_control.py`'s idle check as it is: it authorizes typing into the terminal, which a running shell may still be using. Workers keep their own `"idle"` test.
-- The automatic idle stops (`idle; nothing in progress`, `idle after the pause message; no ready line`) gain `; a background shell was running` when the status was `shell`. A session's own `ready --where` text is never replaced.
-- **The preview stops promising a pause.** `move_preview_line` (`accounts.py`) has no session status (`ListedSession` carries none) and should not run an inventory for a preview. Replace `pause, then move (<account> <reason>)` with `move when idle (<account> <reason>)`, which is true for both paths; the `reap and restart now …` line stays.
-
-**Tests:** `test_stop.py` — a stop whose fresh inventory shows `busy` writes progress `ready` (from `ready`), `waiting` (from `waiting` and from a stale `stopping` claim) and `held by usage limit`, keeps the `NotReadyToStop` issue, and never `stop failed`; a `"shell"` session passes the guard. `test_record.py` — `_read_record` turns a legacy not-ready `stop failed` record into its issue's progress, and leaves a `stop failed` with another reason or more issues alone. `test_settle.py` — a refused record is not `_done`, the next pass with status `idle` stops and restarts it, `report_stop` is not called while it waits; `_action_failed` after a refusal leaves only its own issue; `ready()` on a recovered record returns 0, records `ready` and calls `_launch_conductor` (patched), and a failed launch exits 2 with the command line; a `"shell"` session with idle workers in `waiting` (message not sent) gets `StopSession` with the shell suffix; one at `ready` with status `"shell"` gets `StopSession` and keeps its `where`; a `"busy"` session still gets the pause. `test_shutdown_cli.py` — status and `follow` show a recovered record as waiting, with its cancel and force commands, not as a failed move; a second move of the same session is still refused while the record is open. `test_account_move.py` — the preview line reads `move when idle (…)`.
+- A not-ready refusal in `stop._stop_owner` is no longer a failure: it writes the `NotReadyToStop` issue's progress (`waiting`, `ready` or `held by usage limit`; a stale `stopping` claim returns to `waiting`) and keeps that one issue in `stop_issues`. The record stays open, `report_stop` does not report it, and a later conductor pass stops it once the session is idle, under every existing rule.
+- `record._recover_not_ready_stop`, called from `record._entry` (the validated entry parser every reader goes through, for legacy account files and current session records), turns an old `stop failed` with reason exactly `session or worker is not idle and ready` and exactly one `NotReadyToStop` issue into that issue's progress.
+- `settle._action_failed` clears `stop_issues` when it writes `stop failed`, so a stale refusal never makes a real failure look recoverable.
+- `settle.ready()` records `ready`, then starts the account conductor with `_launch_conductor(login, label)`; a conductor already holding the lock means the new one exits. On `OSError`, `RuntimeError` or `subprocess.SubprocessError` it keeps the ready mark, prints `ready recorded; conductor could not start; in a terminal on <machine>: <conduct command>` to stderr and exits 2.
+- `settle._STOPPABLE_STATUSES = frozenset({"idle", "shell"})` with the public predicate `settle.stoppable_status(status)`, used by `next_step`'s idle test, `_hold_details` and `stop._stop_owner`'s guard (through the `ShutdownReadiness` protocol). Workers still require `"idle"`; `remote_control.py` still requires `"idle"`.
+- With status `shell`, the automatic idle stops read `idle; nothing in progress; a background shell was running` and `idle after the pause message; no ready line; a background shell was running`; both are members of `stop.IdleStopReason`. `stop_session` writes the idle reason as `where` only when the prior progress is `waiting`, so a session's own `ready --where` text is kept.
+- `accounts.move_preview_line` prints `move when idle (<account> <reason>)`; the `reap and restart now …` line is unchanged.
 
 **Files:**
-- `scripts/shutdown/stop.py` — `_stop_owner`'s not-ready guard; the stoppable status set.
-- `scripts/shutdown/settle.py` — `_STOPPABLE_STATUSES`, `next_step`, `_hold_details`, `_action_failed`, `ready`, the shell suffix.
-- `scripts/shutdown/record.py` — `_read_record` legacy normalization.
+- `scripts/shutdown/stop.py` — `_stop_owner` refusal progress, `IdleStopReason` shell variants, `stop_session` `where` rule.
+- `scripts/shutdown/settle.py` — `_STOPPABLE_STATUSES`, `stoppable_status`, `next_step`, `_hold_details`, `_action_failed`, `ready`.
+- `scripts/shutdown/record.py` — `_recover_not_ready_stop` in `_entry`.
 - `scripts/accounts/accounts.py` — `move_preview_line`.
-- `scripts/shutdown/test_stop.py` — the refusal and shell guard cases.
-- `scripts/shutdown/test_record.py` — normalization cases.
-- `scripts/shutdown/test_settle.py` — waiting, `ready`, shell and failure cases.
-- `scripts/shutdown/test_shutdown_cli.py` — status and follow of a recovered record.
-- `scripts/shutdown/test_account_move.py` — the preview line.
-- `docs/as-built/shutdown-and-restart.md` — settle's not-ready refusal and stoppable statuses.
-- `docs/accounts.md` — the preview line.
+- `docs/as-built/shutdown-and-restart.md` — not-ready refusal, legacy recovery, stoppable statuses, `ready` conductor launch.
+- `docs/accounts.md` — the `move when idle` preview line.
+- `scripts/shutdown/test_stop.py`, `test_record.py`, `test_settle.py`, `test_shutdown_cli.py`, `test_account_move.py` — refusal progress, recovery, shell stops, `ready` launch, status and `follow` of a recovered record, the duplicate-move refusal, the preview line.
 
-**Workers:** 1 writer + 1 tester.
-- writer: `stop.py`, `settle.py`, `record.py`, `accounts.py`, the two docs.
-- tester: `test_stop.py`, `test_record.py`, `test_settle.py`, `test_shutdown_cli.py`, `test_account_move.py`.
+**Binds later work:** `ready()` launches the account conductor and a conductor holding the lock keeps the request, so a code reload inside the running conductor is the only path for new code to reach an open request ("A conductor runs the code on disk"). Recovered legacy records read as open everywhere.
 
-**Constraints from prior phases:** Phase 1's idle stops record `idle; nothing in progress` or `idle after the pause message; no ready line`; keep both. Inventory's `Session` carries `updated_at` (registry ms) since Phase 1. `--dry-run` with `--no-alert` also prints each planned `shutdown.py down … --no-alert` command (Phase 2). The pause text's second line names `shutdown.py status <account label> --here` (Phase 2). Two open claude1 records from 2026-10-14 (tile-fixes `da82452f…` at `ready`, dashboard-unit `cf4e3c32…` at `stop failed`) are a live operational matter for the unit director and the user, never touched by tests.
+**Gotchas:** recovery matches only the exact historical reason with exactly one `NotReadyToStop` issue; any other `stop failed` stays terminal. `record._read_record` reads only legacy account files, so recovery there would miss current session records.
 
-**Acceptance gate:** the named tests pass; the shutdown, accounts, lib, production and whoami suites are green; basedpyright 0/0 on changed files.
+**Ruled out:** counting `shell` as idle for workers or for Remote Control typing — a running shell may still be using the terminal.
 
-### Phase 5 — A conductor runs the code on disk  · status: todo
+### Phase 5 — A conductor runs the code on disk  · status: done
 
 **Depends on:** Phase 4
 
@@ -139,7 +127,7 @@
 
 **Spec:**
 - Found live in Phase 3: a claude1 conductor started at 11:34:29 EDT kept running pre-Phase-1 code until it was stopped at 12:48, held `conduct.lock`, and paused two idle sessions that the installed code would have stopped at once. It stayed alive because `conduct` (`settle.py`) loops until every record is done and one record stuck at `ready`. Phase 4 keeps a not-ready refusal's record open, so a conductor now lives until that session goes idle; that makes this phase more needed.
-- **Entry shape.** `_launch_conductor` (`settle.py`) starts `python -u shutdown.py conduct <login>` as a transient systemd user unit. `settle.py` has no entry point of its own. Re-exec with `os.execv(sys.executable, [sys.executable, "-u", *sys.argv])`, which repeats that exact command; test it against the argv `_launch_conductor` builds.
+- **Entry point.** `_launch_conductor` (`settle.py`) starts `python -u shutdown.py conduct <login>` as a transient systemd user unit. `settle.py` has no entry point of its own. Re-exec with `os.execv(sys.executable, [sys.executable, "-u", *sys.argv])`, which repeats that exact command; test it against the argv `_launch_conductor` builds.
 - **Fingerprint.** At `conduct` start, record the mtime and size of the modules it runs: `shutdown.py`, `settle.py`, `stop.py`, `record.py`, `inventory.py`, `restart.py` in `scripts/shutdown/` (resolved from `Path(__file__).parent`). One private function and one private frozen type (`_ModuleFingerprint`); no public API. Compare once per pass of `_conduct_owned`'s loop: six `stat` calls.
 - **Drain before reload.** On a change, enter a reload-requested state (a named private type, not a bool): take no new step on any record; let every owned action finish and be consumed — `pending` futures, `sends`, `messages`, `confirmations` and the `launched` queue; then leave `_conduct_owned` as it does today (desktop state restored), release the lock, and exec. Print one line to the conductor log naming the change, with its time in the user zone.
 - **Outcomes survive.** `conduct` keeps restarted sessions' outcomes in the in-memory `archived` dict for its final `report_stop`. Before exec, write them to `conduct_archive.json` in the login's state directory (atomic write); at `conduct` start, read, merge and delete it. A reload never repeats a launch and never drops an outcome from the final report.
@@ -155,7 +143,7 @@
 - writer: `settle.py`, the as-built doc.
 - tester: `test_settle.py`.
 
-**Constraints from prior phases:** `settle` imports `record as store`; `record.py` owns `conductor_lock`, `stop_incomplete` and the state directory. `conduct` returns 0 on `ConductorAlreadyRunning`, so the re-exec'd process must find the lock free. Tests start no session and send no message or push. After the showrunner installs this phase, the unit director lists `systemctl --user list-units 'shutdown-*'`; a conductor started before the install has no reload check, so it is reported to the showrunner with its open records rather than stopped unasked.
+**Constraints from prior phases:** `settle` imports `record as store`; `record.py` owns `conductor_lock`, `stop_incomplete` and the state directory. `conduct` returns 0 on `ConductorAlreadyRunning`, so the re-exec'd process must find the lock free. Since Phase 4, `ready()` records its checkpoint and then calls `_launch_conductor`, so a conductor already holding the lock keeps that request; the reload is the only way new code reaches it. Legacy not-ready `stop failed` records are recovered as open records in `record._entry` (every reader, not only `_read_record`), so a reloaded conductor picks them up with no extra step. Tests start no session and send no message or push. After the showrunner installs this phase, the unit director lists `systemctl --user list-units 'shutdown-*'`; a conductor started before the install has no reload check, so it is reported to the showrunner with its open records rather than stopped unasked.
 
 **Acceptance gate:** the four tests pass; the shutdown, accounts, lib, production and whoami suites are green; basedpyright 0/0 on changed files.
 
