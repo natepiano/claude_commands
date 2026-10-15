@@ -121,31 +121,19 @@
 
 **Depends on:** Phase 4
 
-#### Work Order
+#### As-built
 
-**Goal:** a long-running shutdown conductor never carries out a request with code older than what is installed: when its modules change on disk it finishes what it has in hand and restarts itself in place, losing no outcome.
-
-**Spec:**
-- Found live in Phase 3: a claude1 conductor started at 11:34:29 EDT kept running pre-Phase-1 code until it was stopped at 12:48, held `conduct.lock`, and paused two idle sessions that the installed code would have stopped at once. It stayed alive because `conduct` (`settle.py`) loops until every record is done and one record stuck at `ready`. Phase 4 keeps a not-ready refusal's record open, so a conductor now lives until that session goes idle; that makes this phase more needed.
-- **Entry point.** `_launch_conductor` (`settle.py`) starts `python -u shutdown.py conduct <login>` as a transient systemd user unit. `settle.py` has no entry point of its own. Re-exec with `os.execv(sys.executable, [sys.executable, "-u", *sys.argv])`, which repeats that exact command; test it against the argv `_launch_conductor` builds.
-- **Fingerprint.** At `conduct` start, record the mtime and size of the modules it runs: `shutdown.py`, `settle.py`, `stop.py`, `record.py`, `inventory.py`, `restart.py` in `scripts/shutdown/` (resolved from `Path(__file__).parent`). One private function and one private frozen type (`_ModuleFingerprint`); no public API. Compare once per pass of `_conduct_owned`'s loop: six `stat` calls.
-- **Drain before reload.** On a change, enter a reload-requested state (a named private type, not a bool): take no new step on any record; let every owned action finish and be consumed — `pending` futures, `sends`, `messages`, `confirmations` and the `launched` queue; then leave `_conduct_owned` as it does today (desktop state restored), release the lock, and exec. Print one line to the conductor log naming the change, with its time in the user zone.
-- **Outcomes survive.** `conduct` keeps restarted sessions' outcomes in the in-memory `archived` dict for its final `report_stop`. Before exec, write them to `conduct_archive.json` in the login's state directory (atomic write); at `conduct` start, read, merge and delete it. A reload never repeats a launch and never drops an outcome from the final report.
-
-**Tests** (`scripts/shutdown/test_settle.py`): a changed fingerprint on the second pass, `os.execv` patched — `execv` called once with `[sys.executable, "-u", *argv]`, the lock released first, no step taken on any record after the change; a change while a launch, a send, or a registry confirmation is in flight — no exec until each finishes and is consumed; an unchanged fingerprint — never `execv`; one owner archived before the reload and another finishing after it — the final `report_stop` holds both, and no session is launched twice.
+- `settle._module_fingerprint()` returns a frozen `_ModuleFingerprint` of `(name, st_mtime_ns, st_size)` for `shutdown.py`, `settle.py`, `stop.py`, `record.py`, `inventory.py` and `restart.py` beside `settle.py`. `conduct` takes it at entry, where an `OSError` propagates; `_conduct_owned` compares it once per pass, and an `OSError` on a pass skips that comparison and retries on the next.
+- On a change, `_conduct_owned` moves to `_ReloadRequested(modules)` (the changed names), prints one line with the time in the user zone, takes no new step on any record, and drains `pending` futures, `messages`, `sends`, `confirmations` and the `launched` queue before it restores desktop state and returns. Without a change it returns `_ConductorFinished`.
+- On `_ReloadRequested`, `conduct` writes the `archived` outcomes with `_write_conduct_archive` (temp file, `fsync`, `os.replace`) to `conduct_archive.json` in the login's directory under `launch_permission.shutdown_state_root()`, still inside `store.conductor_lock`; it then releases the lock and calls `os.execv(sys.executable, [sys.executable, "-u", *sys.argv])`, repeating `shutdown.py conduct <login>`.
+- Under the lock at each start, `_read_conduct_archive` reads that file, raises `store.InvalidRecord` when a record belongs to another login, merges it into `archived` and deletes it. The final `report_stop` holds outcomes from before and after a reload, and a confirmed launch is archived before the reload, so it is never repeated.
 
 **Files:**
-- `scripts/shutdown/settle.py` — `conduct`, `_conduct_owned`, `_ModuleFingerprint`, the reload state, archive persistence.
-- `scripts/shutdown/test_settle.py` — the four tests.
+- `scripts/shutdown/settle.py` — `_ModuleFingerprint`, `_module_fingerprint`, `_ReloadRequested`, `_ConductorFinished`, `_conduct_archive_path`, `_read_conduct_archive`, `_write_conduct_archive`, `conduct`, `_conduct_owned`.
+- `scripts/shutdown/test_settle.py` — re-exec after unlock with no new steps, drain of launch, stop, message, alert and registry work, no re-exec when unchanged, archived outcomes kept with no double launch, an unreadable module on one pass.
 - `docs/as-built/shutdown-and-restart.md` — the conductor's reload.
 
-**Workers:** 1 writer + 1 tester.
-- writer: `settle.py`, the as-built doc.
-- tester: `test_settle.py`.
-
-**Constraints from prior phases:** `settle` imports `record as store`; `record.py` owns `conductor_lock`, `stop_incomplete` and the state directory. `conduct` returns 0 on `ConductorAlreadyRunning`, so the re-exec'd process must find the lock free. Since Phase 4, `ready()` records its checkpoint and then calls `_launch_conductor`, so a conductor already holding the lock keeps that request; the reload is the only way new code reaches it. Legacy not-ready `stop failed` records are recovered as open records in `record._entry` (every reader, not only `_read_record`), so a reloaded conductor picks them up with no extra step. Tests start no session and send no message or push. After the showrunner installs this phase, the unit director lists `systemctl --user list-units 'shutdown-*'`; a conductor started before the install has no reload check, so it is reported to the showrunner with its open records rather than stopped unasked.
-
-**Acceptance gate:** the four tests pass; the shutdown, accounts, lib, production and whoami suites are green; basedpyright 0/0 on changed files.
+**Gotchas:** an install can briefly remove a module, so a per-pass stat failure must not abort the conductor, or its archived outcomes are lost. A conductor started before this code has no reload check; it is reported with its open records, not stopped unasked. `launch_permission.py` and the `scripts/lib` modules are not fingerprinted, so a change there alone triggers no reload. The archive path comes from `launch_permission.shutdown_state_root`, since `record`'s directory helpers are private.
 
 ## Recorded results
 
