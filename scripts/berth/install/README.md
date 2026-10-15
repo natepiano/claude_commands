@@ -8,6 +8,14 @@ picks the change up on its next hook invocation.
 - `hooks/berth_post_bash.sh` — `PostToolUse` drift observation.
 - `hooks/berth_session_start.sh` — `SessionStart` board read.
 
+A unit's Codex seats edit through `apply_patch`, which none of these see.
+`scripts/hooks/pre-tool-use-berth.py` is their `PreToolUse` check: for a seat
+of a running unit it runs `cargo-berth check <paths> --json` under the unit
+director's session id, refuses the edit on any answer but `clear` or
+`unconfigured`, and turns the phase's `enrolled_awaiting_first_touch` state
+`Active` from the acquired reservation. `scripts/hooks/codex_hooks.py install`
+registers and trusts it in `~/.codex/hooks.json` with the other Codex hooks.
+
 Each one checks that `cargo-berth` is on `PATH` and then `exec`s
 `cargo-berth hook <event>`. The pre-edit wrapper first honors
 `CARGO_BERTH_BYPASS=1`: it allows the edit without reaching the engine and
