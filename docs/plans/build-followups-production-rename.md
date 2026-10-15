@@ -123,30 +123,23 @@
 
 ### Phase 4 — Command doc and as-built  · status: done
 
-#### Work Order
+#### As-built
 
-**Goal:** The showrunner can run a rename from a command doc, and the as-built records it.
-
-**Depends on:** Phase 3
-
-**Spec:**
-- `commands/showrunner/rename.md`: the order is plan, then apply, then for each unit between its runs `unit`, then `finish`. Tell each unit director its new worktree path before it resumes. Never rewrite history. Say that apply finishing is not the end (the old merge branch stays until `finish`); that a refused or interrupted step is retried by rerunning the same command, which accepts the old name, the new name, or a former name; and that `rename.lock` is internal coordination and `rename-history/` is archival state.
-- Add the `**Formerly:**` line to `~/.claude/docs/production_format.md`'s doc structure, in the Production Context list.
-- `docs/as-built/production-rename.md`.
+- `/showrunner:rename` runs `plan`, `apply`, then `unit <new> <unit>` for each non-retired row between its runs, then `finish`. It lists the refusals, says apply finishing is not the end (the old merge branch stays until `finish`), and recovers by rerunning the same command with the destination fixed; the source accepts the old, new or a former name.
+- The showrunner tells each unit director the new worktree path before it resumes. No rename force-pushes or rewrites history.
+- `rename.lock` is internal coordination; `rename-history/` is archival state, not a recovery path.
+- The as-built covers files and readers, Formerly resolution with the current-name fast path, apply steps 0–7, unit steps 0–5, account project encoding and trust locations, journal and recovery, finish, exit codes, state roots and tests, and the full merge-gate run required for `unit_lookup.py` changes.
 
 **Files:**
-- `commands/showrunner/rename.md` — the command doc.
-- `docs/production_format.md` — the **Formerly:** line only (outside this unit's Units row; the showrunner granted it for this run on 2026-10-15).
-- `docs/as-built/production-rename.md` — the as-built.
+- `commands/showrunner/rename.md` — showrunner workflow and recovery instructions.
+- `docs/as-built/production-rename.md` — implementation record.
+- `docs/production_format.md` — Production Context's `**Formerly:**` line.
 
-**Workers:** 1 writer; nothing splits (docs only).
-- `impl` — all three files.
+**Binds later work:** Live check on a scratch production points `HOME` and `CLAUDE_CONFIG_DIR` at the scratch root along with the state dirs, since `unit` moves `projects/` dirs in every `~/.claude*` dir and writes trust into `~/.claude.json`. `unit` uses strict every-host discovery, so session fixtures need `UNIT_LOOKUP_TMUX`, `NOTIFIER_SESSIONS_DIR` and a herdr fake.
 
-**Constraints from prior phases:** the CLI verbs and refusals as built in the earlier phases.
+**Gotchas:** The command doc names no internal journal step numbers; `unit` and `finish` require `apply` to have finished through its merge-branch push.
 
-**Acceptance gate:** the lint suite (`python3 -m unittest discover scripts/lint`) green; the doc names only verbs that exist.
-
-### Phase 5 — Live check on a scratch production  · status: todo
+### Phase 5 — Live check on a scratch production  · status: done
 
 #### Work Order
 
@@ -165,6 +158,9 @@
 **Workers:** 1 writer; nothing splits.
 - `impl` — runs the check and reports.
 
-**Constraints from prior phases:** all of the above.
+**Constraints from prior phases:**
+- Point `HOME` and `CLAUDE_CONFIG_DIR` at the scratch root too, not only the state dirs: `unit` moves `projects/<dashed path>` in every `~/.claude*` dir and copies a trust key into `~/.claude.json` (default account) or `<config-dir>/.claude.json`. With the real `HOME` it writes the user's account files.
+- `unit` discovers sessions with `every_host=True`, so both hosts must answer: point `UNIT_LOOKUP_TMUX` at a fake tmux and `NOTIFIER_SESSIONS_DIR` at scratch session records, and fake herdr as `test_unit_lookup.py` does. The marked unit must read as not running (`ClaudeNotRunning`) for the move to proceed.
+- Run the shutdown and message suites as well if the check leads to any `unit_lookup.py` change; they exercise it.
 
 **Acceptance gate:** every lookup answers under both slugs; the scratch state is removed afterwards.

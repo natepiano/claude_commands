@@ -176,3 +176,19 @@ also exercise it, so a change there runs the full merge-gate suites:
 ```sh
 python3 scripts/production/merge_gate.py --repo <checkout> --tests-only
 ```
+
+## Live check
+
+A scratch production completed `plan`, `apply`, `unit` and `finish` with a
+local bare origin, isolated account/state roots and fake tmux/herdr discovery.
+A socket-backed showrunner fixture and an old-marked stopped unit remained
+discoverable under both `old` and `new`: `address`, `list` and `pane` returned
+identical non-empty answers after apply, before and after the unit move, and
+after finish. Canonicalized stall-watch paths and review-pool lease paths
+resolved to the same retained files under both names at every checkpoint.
+
+The worktree path contained `.` and `_`; transcripts moved and trust entries
+were copied in both default and separate account layouts. Plan wrote nothing;
+finish retired the old local/origin branches and marked the journal done.
+Historical commit subjects, saved logs and transcript contents were preserved.
+The scratch script, repositories, sockets and all state were removed afterwards.
