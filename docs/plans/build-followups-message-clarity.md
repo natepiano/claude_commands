@@ -220,36 +220,29 @@ Outside `scripts/accounts/` and `scripts/whoami/`, every delegate agent is a "wo
 
 ### Phase 11 — Workers, not seats, in the accounts and whoami scripts  · status: done
 
-**Depends on:** Phase 10
+#### As-built
 
-#### Work Order
-
-**Goal:** The two directories still held during the rename and every name they define say "worker", with no alias, and `git grep -i seat` finds nothing outside the allowed remainder.
-
-**Spec:**
-- Runs once the showrunner says two-accounts has released `scripts/accounts/` and `scripts/whoami/` (`scripts/delegate/` moved into the phase before when builder-report released it).
-- Applies the rename Spec of the phase before it to `scripts/accounts/` and `scripts/whoami/`, and renames every name they define or read together with each reference elsewhere: `seat_usage.py` → `worker_usage.py` (+ test), `accounts.py swap|set-role|role seats` → `workers` (no alias), `scripts/usage/fixtures/day1_seats/` → `day1_workers/`, identifiers, flags, JSON keys and state file names. Before domain validation, convert account configuration `seats` to `workers`, role-history `role: "seats"` to `"workers"`, moves-journal `subject: "seats"` to `"workers"` and confirmed-move `seat` to `worker`, and shutdown record `seats` with nested `kind: "seat"` to their worker names. accounts and whoami share the configuration conversion, so neither falls back to the default home on an old file (`whoami/agent_accounts.py` does today when the key is absent). Preserve account selection, move ids, timestamps, worker and run identity, confirmation deduplication (`accounts/moves.py` compares `subject`, `seat`, `run`), and shutdown ownership and progress. Journal conversion holds the appenders' lock on the same inode, keeps the reader's malformed-line contract, and reads an old-format entry appended later by a process started before the update. Canonical reads return only worker names. The allowed `git grep -i seat` remainder after this phase is legacy input names in migration code and its tests, plus the `**Seats:**` validator fixtures.
-- Merge origin/build-followups first: two-accounts' work in these directories lands before this phase.
+- The Codex role is `workers` (`accounts.CODEX_ROLE`); `accounts.py swap|set-role|role workers` works and `seats` is "not a role", with no alias. Renamed with every reader: `CodexWorkersAccount`, `SwapWorkerSession`, `WorkersSwapDryRun`/`WorkersSwapStarted`/`WorkersSwapOutcome`, `WorkersTransitionDelivery`, `CodexAlertPassReadings.workers`, `agent_accounts.workers_home`, `codex_mesh.retire_workers_servers`, shutdown `WorkerSession`/inventory `kind: "worker"`, `SessionShutdown.workers`, `stop.MatchingSession.workers`, `whoami/worker_usage.py`, fixtures `scripts/usage/fixtures/day1_workers/`.
+- `scripts/accounts/worker_names.py` owns `accounts_config_file()`, `roles_lock()`, `configuration()`, `journal_entry()`, `migrate_locked_journal()` and `role_history_lines()`. Old names convert at the storage boundary; canonical reads return only worker names.
+  - Configuration `seats` → `workers` in memory, through `configuration()`, shared by `accounts` and `agent_accounts.workers_home`, so neither falls back to the default home on an old file; the file is not rewritten on read.
+  - Role history `role: "seats"` and moves-journal `subject: "seats"` → `"workers"`, confirmed-move `seat` → `worker`: rewritten in place under the exclusive lock, same inode; malformed lines pass through; a second unchanged read writes nothing. `moves.append_move`/`append_routing`/`read_journal` convert under the lock before deduplicating (`subject`, `worker`, `run`) or reading, so a later old-format append is converted too.
+  - Shutdown records: `record._worker_record_names` converts `seats` → `workers` and nested `kind: "seat"` → `"worker"`, remote records too (`parse_session_records`).
+  - Usage store version 9 (`collect.WORKER_ACCOUNT_ROLES_VERSION`) converts `account_role_changes` rows (`INSERT OR IGNORE` keeps an existing worker row); `outcomes.save_account_role` canonicalizes each record through `journal_entry()`.
 
 **Files:**
-- `scripts/accounts/` — account roles, configuration, role history, moves journal, inventory consumers and tests
-- `scripts/whoami/` — worker account resolution, quota transitions, `worker_usage.py` and tests
-- `scripts/agents/` — account imports (`agent_exec.sh` imports `seats_home`), move-journal producers (`codex_mesh.py`), `retire_seats_servers` and tests
-- `scripts/message/` — account imports (`escalate.py`), role descriptions and tests
-- `scripts/shutdown/` — inventory `SeatSession` / `kind: "seat"`, record field `seats`, `stop.MatchingSession.seats`, migration, callers and tests
-- `scripts/production/` — account imports and shutdown-record fixtures in tests
-- `scripts/delegate/` — `review_pool_report.py`'s `seat_usage` import and related tests
-- `scripts/usage/` — the day1 fixture directory, contents and callers
-- `commands/` — references to the renamed names
-- `docs/` — references to the renamed names, outside the plan docs
+- `scripts/accounts/worker_names.py` — config path, roles lock, every stored-name conversion
+- `scripts/accounts/accounts.py`, `moves.py` — the workers role, CLI, journal conversion under lock
+- `scripts/whoami/agent_accounts.py`, `quota_alert.py`, `agent_notes.py`, `whoami.py`, `worker_usage.py` — worker home resolution and quota transitions
+- `scripts/agents/agent_exec.sh`, `codex_mesh.py` — `workers_home`, `subject: "workers"` moves, `retire_workers_servers`
+- `scripts/shutdown/inventory.py`, `record.py`, `stop.py`, `settle.py` — worker sessions and record conversion
+- `scripts/usage/collect.py`, `outcomes.py`, `fixtures/day1_workers/` — store version 9, role canonicalization
+- `commands/showrunner/accounts.md`, `docs/accounts.md`, `docs/as-built/` — worker wording (`shutdown-and-restart.md` keeps the account-move text in worker names)
 
-**Workers:** 2 writers (no test lane)
-- `impl` — agents, message, shutdown, production, delegate, usage, commands and docs above
-- `test` (opens as impl) — `scripts/accounts/`, `scripts/whoami/`; publishes the renamed account and move-journal names before `impl` updates their consumers
+**Binds later work:** the roles lock has one definition, `worker_names.roles_lock()`, taken before the journal lock; a role writer or converter that builds its own lock path splits it. The allowed `git grep -i seat` remainder is legacy-input conversion and its tests, the `**Seats:**` validator fixtures, and every `docs/plans` file (read only to this unit).
 
-**Constraints from prior phases:** Rename together, with no old API or CLI alias: `CodexSeatsAccount`, `seats_home`, `retire_seats_servers`, `SwapSeatSession`, `SeatsSwapDryRun`, `SeatsSwapStarted`, `SeatsSwapOutcome`, `SeatsTransitionDelivery`, `CodexAlertPassReadings.seats` and their seat-spelled helpers and constants; `accounts.py env|swap|set-role|role seats`; shutdown `SeatSession`, inventory `kind: "seat"`, `SessionShutdown.seats`, `MatchingSession.seats`; moves-journal `subject: "seats"` and confirmed-move `seat`. Phase 10's ledger and claim-lock conversion stays as built: old `<run>/seats` and `impl_seat_claim.lock` paths remain linked to the worker files for launchers started before the update (`scripts/delegate/worker_state.py`). Run every script suite before checkpoint, the lib suite and `scripts/notify/test_push_texts.py` included. A changed `push_catalog.py` text needs `review.py texts --id <id>` three times and `--approve`.
+**Gotchas:** the moves journal and role history are never replaced: conversion rewrites the same inode under the appenders' exclusive lock, so a process started before the update keeps appending to it. Journal reads now take `LOCK_EX`, not `LOCK_SH`.
 
-**Acceptance gate:** every script suite green; basedpyright 0/0; `accounts.py swap workers` works and `swap seats` is unknown; `git grep -i seat` reports only the allowed remainder; tests load an old selected-account configuration through both accounts and whoami and keep the selected home; read old role history without changing burn figures; resume an old requested or waited move and deduplicate its confirmation after conversion; see a later old-format journal append; load old shutdown records with nested worker sessions keeping ownership, progress and issues; a second unchanged read rewrites nothing; Phase 10's shared-ledger and claim-lock tests stay green.
+**Ruled out:** aliases for the old CLI or API names.
 
 ### Phase 12 — Shutdown alerts in the user's four-line form; the forms command docs  · status: done
 
