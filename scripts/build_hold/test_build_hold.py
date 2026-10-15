@@ -113,12 +113,25 @@ class IsolatedBuildHoldTest(unittest.TestCase):
         self.addCleanup(self.wait_for_detached_writers)
 
     def wait_for_detached_writers(self) -> None:
-        """Wait until no process a test started holds its FIFO writer."""
+        """Wait until no process a test started holds its FIFO writer.
+
+        A child opens its writer only when its interpreter loads
+        sitecustomize. Under load the FIFO can report EOF before a slow child
+        gets there, and the read then finds that child's writer and no data,
+        so wait again until a read returns EOF.
+        """
         os.close(self.lifetime_writer)
+        deadline = time.monotonic() + 30
         try:
-            readable, _, _ = select.select([self.lifetime_reader], [], [], 30)
-            self.assertTrue(readable, "Detached children did not finish before scratch cleanup")
-            self.assertEqual(os.read(self.lifetime_reader, 1), b"")
+            while True:
+                remaining = max(deadline - time.monotonic(), 0)
+                readable, _, _ = select.select([self.lifetime_reader], [], [], remaining)
+                self.assertTrue(readable, "Detached children did not finish before scratch cleanup")
+                try:
+                    if os.read(self.lifetime_reader, 1) == b"":
+                        return
+                except BlockingIOError:
+                    pass
         finally:
             os.close(self.lifetime_reader)
 
