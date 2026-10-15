@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Compare Codex usage per checkpointed phase before and after long-lived seats."""
+"""Compare Codex usage per checkpointed phase before and after long-lived workers."""
 
 from __future__ import annotations
 
@@ -557,10 +557,10 @@ def run(argv: Sequence[str]) -> int:
         with closing(usage_report.open_read_store(path)) as db:
             print(build_report(windows, db))
     except ValueError as error:
-        print(f"seat_usage.py: {error}", file=sys.stderr)
+        print(f"worker_usage.py: {error}", file=sys.stderr)
         return 2
     except (OSError, sqlite3.Error) as error:
-        print("seat_usage.py: " + " ".join(str(error).splitlines()), file=sys.stderr)
+        print("worker_usage.py: " + " ".join(str(error).splitlines()), file=sys.stderr)
         return 1
     return 0
 

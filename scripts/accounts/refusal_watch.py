@@ -330,7 +330,7 @@ def live_owners(*, only: frozenset[str] = NO_SESSION_FILTER) -> list[inventory_m
               if (identity := account.account_of(session["pid"])) is not None}
     for login in sorted(logins):
         for session in inventory_module.inventory(login, only, refresh_desktops=False)["sessions"]:
-            if session["kind"] != "seat":
+            if session["kind"] != "worker":
                 owners[session["session_id"]] = session
     return list(owners.values())
 

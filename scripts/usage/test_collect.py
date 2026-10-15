@@ -428,9 +428,9 @@ class CollectTests(CollectorFixture):
         for table, before_rows in rows.items():
             self.assertEqual(self.all_values(self.rows('SELECT * FROM "' + table + '"')), before_rows, table)
 
-    def test_new_store_is_stamped_with_the_file_named_key_version(self) -> None:
+    def test_new_store_is_stamped_with_the_worker_role_version(self) -> None:
         _ = self.collect()
-        self.assertEqual(self.rows("PRAGMA user_version")[0][0], 8)
+        self.assertEqual(self.rows("PRAGMA user_version")[0][0], 9)
 
     def test_claude_request_keys_keep_the_message_and_request_identity(self) -> None:
         _ = self.collect()

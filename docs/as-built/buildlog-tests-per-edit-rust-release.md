@@ -162,4 +162,4 @@ The trial part is `waiting, <reason>` or `failed, <step>: <reason>` for the othe
 - **The text goes through `send.py --to user` as a subprocess.** The user channel owns phone delivery and its credentials, so this module never reads them.
 - **State sits in the build-log root.** `BUILDLOG_DIR` moves it with the log, which keeps tests off the real file.
 
-The worker-name change converts old step and call `seat` fields to `worker` once on the first index read, under the append lock. It preserves incomplete trailing lines. Schema version 16 rebuilds the derived index with the new column name.
+The worker-name change converts old worker field names in step and call records once on the first index read, under the append lock. It preserves incomplete trailing lines. Schema version 16 rebuilds the derived index with the new column name.

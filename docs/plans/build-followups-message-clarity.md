@@ -218,7 +218,7 @@ Outside `scripts/accounts/` and `scripts/whoami/`, every delegate agent is a "wo
 
 **Ruled out:** renaming live state files in place — it races running launchers; a CLI or identifier alias for old names — one way to do a thing.
 
-### Phase 11 — Workers, not seats, in the accounts and whoami scripts  · status: todo
+### Phase 11 — Workers, not seats, in the accounts and whoami scripts  · status: done
 
 **Depends on:** Phase 10
 

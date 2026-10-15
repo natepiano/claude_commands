@@ -121,7 +121,7 @@ Exit 2 is a usage error (bad arguments, bad timeout values, bad `--desktop`) or 
 
 - Workspace `herdr-fake`: tab `showrunner` (pane `showrunner`, cwd `repo/`), and per unit a tab with the director pane `<unit>`, `<unit>-impl` split right of it and `<unit>-review` split below `-impl`, cwd the unit's worktree.
 - Unit panes carry `SHOWRUNNER_UNIT=herdr-fake` and `SHOWRUNNER_UNIT_ID=<unit>`; the showrunner pane neither. Claude panes add `CLAUDE_CONFIG_DIR` and `ENABLE_TOOL_SEARCH=true`; Codex panes add `CODEX_HOME`. The caller's `CLAUDE_*` variables are removed from every launch subprocess.
-- Accounts: Claude from `HERDR_TRIAL_CLAUDE_CONFIG_DIR` (default `~/.claude1`); Codex from `HERDR_TRIAL_CODEX_HOME`, else the `seats` role account.
+- Accounts: Claude from `HERDR_TRIAL_CLAUDE_CONFIG_DIR` (default `~/.claude1`); Codex from `HERDR_TRIAL_CODEX_HOME`, else the `workers` role account.
 - Models: `agents_resolve_print` for `production.director` (must be `claude`), `delegate.impl` and `delegate.review`, run under bash (sourced into zsh it returns empty rows). It reads `~/.claude/config/agents.conf` unless `AGENTS_CONFIG_FILE` says otherwise. `HERDR_TRIAL_RESOLVE` swaps in another program.
 - Argv: Codex `-m <model> -c model_reasoning_effort=<effort> -s danger-full-access -a never`. Claude `--model --effort`, plus `--remote-control <name>` for the showrunner and directors, then `-n <name>`. A worker that resolves to claude logs an issue and starts as Claude.
 - Start: `agent start` with no prompt; once ready, `agent prompt` sends the opening text (`/showrunner:produce` or `/unit:direct` with its doc plus `TRIAL_RULE`; workers a one-line wait message). Order: six workers, three directors, the showrunner.
@@ -157,7 +157,7 @@ One exact key serves both agents: the repository's main worktree root (the paren
 | `HERDR_TRIAL_GIT` | `git` | scaffold git and the trust key lookup |
 | `HERDR_TRIAL_RESOLVE` | bash plus `agents_config.sh` | model resolver |
 | `HERDR_TRIAL_CLAUDE_CONFIG_DIR` | `~/.claude1` | Claude account for launch and the manifest |
-| `HERDR_TRIAL_CODEX_HOME` | the `seats` role account | Codex account for launch and the manifest |
+| `HERDR_TRIAL_CODEX_HOME` | the `workers` role account | Codex account for launch and the manifest |
 | `HERDR_TRIAL_PROC` | `/proc` | process inspection root |
 | `HERDR_TRIAL_STOP_PROCESS` | `os.kill(pid, SIGTERM)` | program that stops a pid |
 | `HERDR_TRIAL_NOTIFIER_ROOT` | `~/.local/state/notifier` | notifier instance folders |

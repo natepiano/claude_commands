@@ -1,3 +1,3 @@
-{"timestamp":"2026-10-10T22:00:00Z","type":"session_meta","payload":{"id":"unweighted","cwd":"/invented/seats"}}
+{"timestamp":"2026-10-10T22:00:00Z","type":"session_meta","payload":{"id":"unweighted","cwd":"/invented/workers"}}
 {"timestamp":"2026-10-10T22:00:00Z","type":"turn_context","payload":{"model":"invented-unweighted-model"}}
 {"timestamp":"2026-10-10T22:30:00Z","type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":9999,"cached_input_tokens":999,"output_tokens":999}}}}

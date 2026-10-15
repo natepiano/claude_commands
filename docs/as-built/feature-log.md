@@ -492,4 +492,4 @@ Changelog comparison for the 13 published crates:
 
 The 217 entries stay pending until each crate's release stamps them.
 
-Old claim records convert `seat` to `worker` once on their first ledger read. The CLI accepts only `--worker` when marking a claimed record.
+Old claim records convert old worker field names once on their first ledger read. The CLI accepts only `--worker` when marking a claimed record.
