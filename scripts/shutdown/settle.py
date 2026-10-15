@@ -713,7 +713,7 @@ def run_inventory(
 
 
 def _owned_workers(report: Inventory, session_id: str) -> list[Session]:
-    return [item for item in report["sessions"] if item["kind"] == "seat"
+    return [item for item in report["sessions"] if item["kind"] == "worker"
             and item["owner"]["kind"] == "director"
             and item["owner"]["session_id"] == session_id]
 
@@ -741,7 +741,7 @@ def begin(
         ))
     added: list[SessionShutdown] = []
     for session in report["sessions"]:
-        if session["kind"] == "seat":
+        if session["kind"] == "worker":
             continue
         state = prompt_state(PromptSubject(session["session_id"], login, Path(session.get("config_dir", str(Path.home() / ".claude")))), now_utc())
         progress: store.SessionProgress = (
@@ -752,7 +752,7 @@ def begin(
             login=login, label=report["label"], machine=report["machine"], requested_at=at,
             request_id=request_id, requested_by=origin, hold="session" if ids else "account",
             then=then, force="wait for ready", alerts=alerts, session=session,
-            seats=_owned_workers(report, session["session_id"]), timers=[],
+            workers=_owned_workers(report, session["session_id"]), timers=[],
             settle_message={"kind": "not sent"}, where={"kind": "not said"},
             progress=progress, trail=[], stop_issues=[],
         )
@@ -819,7 +819,7 @@ def _hold_details(owner: stop_work.FreshSession, progress: str, *, local_observa
         details.append("merge in progress")
     for server in session["codex_servers"]:
         details.extend(f"Codex worker {name} is still running" for name in server["busy_workers"])
-    details.extend(f"Codex worker {worker['name']} is still running" for worker in owner["seats"]
+    details.extend(f"Codex worker {worker['name']} is still running" for worker in owner["workers"]
                    if worker["status"] != "idle")
     return details
 
@@ -861,7 +861,7 @@ def next_step(saved: SessionShutdown, owner: stop_work.FreshSession,
             if saved["force"] == "now":
                 return StopSession()
             if progress in {"ready", "held by usage limit"} and owner["session"]["status"] == "idle" and all(
-                worker["status"] == "idle" for worker in owner["seats"]
+                worker["status"] == "idle" for worker in owner["workers"]
             ) and blocker(owner["session"])["kind"] == "clear" and (progress == "held by usage limit" or not _showing_form(owner["session"])):
                 return StopSession()
         if progress == "waiting" and not _is_requester(saved):
@@ -972,7 +972,7 @@ def unrecorded_local_sessions(login: str, ids: tuple[str, ...], records: list[Se
         return {}
     report = inventory(login, missing)
     return {owner["session_id"]: owner["name"] for owner in report["sessions"]
-            if owner["session_id"] in missing and owner["kind"] != "seat"}
+            if owner["session_id"] in missing and owner["kind"] != "worker"}
 
 
 def cancel(account: Account, here: bool = False, only: Iterable[str] = ()) -> int:
@@ -1158,7 +1158,7 @@ def down(account: Account, here: bool = False, only: Iterable[str] = (), *,
                  | {session["session_id"] for session in report["sessions"]}) if ids else set()
     added = begin(account.login, request_origin, ids, then=then, alerts=alerts, request_id=identity, target=target, why=why, move_id=move_id, report=report)
     # Snapshot the selected requests before the conductor can archive them.
-    selected = {session["session_id"] for session in report["sessions"] if session["kind"] != "seat"}
+    selected = {session["session_id"] for session in report["sessions"] if session["kind"] != "worker"}
     selected.update(ids)
     requests: dict[str, list[SessionShutdown]] = {}
     for saved in store.session_records(account.login):

@@ -157,7 +157,7 @@ def session_shutdown(
         requested_at=requested_at, requested_by=record.FromTerminal(kind="terminal"),
         request_id=f"legacy-natedev-{NOW}",
         hold=hold, then="stop", force="wait for ready", alerts="user",
-        session=saved_entry["session"], seats=[], timers=saved_entry["timers"],
+        session=saved_entry["session"], workers=[], timers=saved_entry["timers"],
         settle_message=saved_entry["settle_message"], where=saved_entry["where"],
         progress=cast(record.SessionProgress, saved_entry["progress"]), trail=[], stop_issues=[],
     )
@@ -171,9 +171,9 @@ def account_hold(login: str = "owner@example.com") -> record.AccountHold:
     )
 
 
-def owned_worker(owner: str = "session-1") -> inventory.SeatSession:
-    return inventory.SeatSession(
-        kind="seat", session_id="worker-1", pid=20001, proc_start="worker-start",
+def owned_worker(owner: str = "session-1") -> inventory.WorkerSession:
+    return inventory.WorkerSession(
+        kind="worker", session_id="worker-1", pid=20001, proc_start="worker-start",
         name="worker", cwd="/tmp/worker", status="idle",
         model=inventory.NoReplyYet(kind="no reply yet"),
         checkout=inventory.NotACheckout(kind="not a checkout"),
@@ -250,23 +250,29 @@ class SessionRecordTests(ShutdownTestCase):
         self.assertEqual(loaded.get("target"), "claude2")
         self.assertEqual(path.read_bytes(), original)
 
-    def test_first_read_rewrites_busy_worker_fields_and_preserves_the_held_account_schema(self) -> None:
-        saved = session_shutdown()
+    def test_first_read_converts_nested_worker_ownership_and_fields_without_rewriting_again(self) -> None:
+        saved = session_shutdown(progress=record.SessionStopping(kind="stopping", at=LATER))
+        saved["stop_issues"] = [record.NotReadyToStop(kind="not ready to stop", at=NOW,
+                                                    status="idle", progress="waiting")]
         worker = owned_worker()
         worker["codex_servers"] = [inventory.CodexServer(run_dir="/tmp/run", pid=123,
                                                         busy_workers=["writer"])]
-        saved["seats"] = [worker]
+        saved["workers"] = [worker]
         self.assertTrue(record.create_session(saved))
+        expected = record.find_session(saved["login"], "session-1")
         path = next((self.directory / "sessions").glob("*.json"))
-        old = path.read_text().replace('"busy_workers"', '"busy_seats"')
+        old = (path.read_text().replace('"busy_workers"', '"busy_seats"')
+               .replace('"workers"', '"seats"').replace('"kind": "worker"', '"kind": "seat"'))
         _ = path.write_text(old)
-        self.assertEqual(record.find_session(saved["login"], "session-1"), saved)
+        self.assertEqual(record.find_session(saved["login"], "session-1"), expected)
         rewritten = path.read_text()
-        self.assertIn('"seats"', rewritten)
+        self.assertIn('"workers"', rewritten)
+        self.assertNotIn('"seats"', rewritten)
+        self.assertNotIn('"kind": "seat"', rewritten)
         self.assertNotIn('"busy_seats"', rewritten)
-        self.assertIn('"kind": "seat"', rewritten)
+        self.assertIn('"kind": "worker"', rewritten)
         modified = path.stat().st_mtime_ns
-        self.assertEqual(record.find_session(saved["login"], "session-1"), saved)
+        self.assertEqual(record.find_session(saved["login"], "session-1"), expected)
         self.assertEqual(path.stat().st_mtime_ns, modified)
 
     def test_first_read_rewrites_legacy_worker_progress_and_issues_once(self) -> None:
@@ -436,7 +442,7 @@ class SessionRecordTests(ShutdownTestCase):
         saved["session"] = owner
         worker = owned_worker()
         worker["host"] = inventory.HerdrHost(kind="herdr", herdr_session="director", pane_id="w1:p2")
-        saved["seats"] = [worker]
+        saved["workers"] = [worker]
         self.assertTrue(record.create_session(saved))
         self.assertEqual(record.find_session(saved["login"], "session-1"), saved)
         self.assertEqual(record.parse_session_records(json.dumps([saved])), [saved])
@@ -823,14 +829,24 @@ class SessionRecordTests(ShutdownTestCase):
                     record.set_account_hold(account_hold())
                 self.assertEqual(path.read_text(), text)
 
+    def test_remote_records_convert_old_worker_fields_and_nested_kinds(self) -> None:
+        saved = session_shutdown(progress=record.SessionStopped(kind="stopped", at=LATER))
+        saved["workers"] = [owned_worker()]
+        saved["stop_issues"] = [record.NotReadyToStop(kind="not ready to stop", at=NOW,
+                                                    status="idle", progress="passive worker ready")]
+        previous = (json.dumps([saved]).replace('"workers"', '"seats"')
+                    .replace('"kind": "worker"', '"kind": "seat"')
+                    .replace('passive worker ready', 'passive seat ready'))
+        self.assertEqual(record.parse_session_records(previous), [saved])
+
     def test_session_records_validate_workers_and_claim_timestamps(self) -> None:
         saved = session_shutdown(progress=record.SessionRestarting(kind="restarting", at=LATER, prior=record.SessionStopped(kind="stopped", at=NOW)))
-        saved["seats"] = [owned_worker()]
+        saved["workers"] = [owned_worker()]
         saved["alerted_at"] = NOW
         self.assertEqual(record.parse_session_records(json.dumps([saved])), [saved])
         for field, value in (
-            ("session", owned_worker()), ("seats", [session()]),
-            ("seats", [owned_worker("another")]), ("progress", {"kind": "restarting"}),
+            ("session", owned_worker()), ("workers", [session()]),
+            ("workers", [owned_worker("another")]), ("progress", {"kind": "restarting"}),
             ("alerted_at", "2026-10-09T21:49:10Z"), ("hold", "all"), ("alerts", "phone"),
         ):
             with self.subTest(field=field):
@@ -856,7 +872,7 @@ class SessionRecordTests(ShutdownTestCase):
                 converted = record.session_records(login)
                 self.assertEqual(len(converted), 1)
                 self.assertEqual(converted[0]["session"], old["entries"][0]["session"])
-                self.assertEqual(converted[0]["seats"], [worker["session"]])
+                self.assertEqual(converted[0]["workers"], [worker["session"]])
                 self.assertEqual(converted[0]["timers"], old["entries"][0]["timers"])
                 self.assertEqual(converted[0]["hold"], "account")
                 self.assertEqual(converted[0]["then"], "restart")
@@ -915,7 +931,7 @@ class SessionRecordTests(ShutdownTestCase):
         if found is None:
             self.fail("expected the slot's session record")
         self.assertEqual(found["progress"], slot["entries"][0]["progress"])
-        self.assertEqual(found["seats"], [worker])
+        self.assertEqual(found["workers"], [worker])
         self.assertEqual(record.session_records(slot["login"]), [found])
         self.assertEqual(record.all_session_records(), [found])
 
@@ -942,7 +958,7 @@ class SessionRecordTests(ShutdownTestCase):
             self.fail("expected the newest partial session record")
         self.assertEqual(found["requested_at"], LATER)
         self.assertEqual(found["progress"], newer["entries"][0]["progress"])
-        self.assertEqual(found["seats"], [worker["session"]])
+        self.assertEqual(found["workers"], [worker["session"]])
         self.assertEqual(record.session_records(newer["login"]), [found])
         self.assertEqual(record.all_session_records(), [found])
 

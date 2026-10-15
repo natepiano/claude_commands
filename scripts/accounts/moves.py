@@ -10,6 +10,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Literal, NotRequired, TypedDict, Protocol, cast, override, assert_never
 
+from scripts.accounts import worker_names
+
 
 @dataclass(frozen=True)
 class HomeAccountUnresolved:
@@ -46,7 +48,7 @@ class ConfirmedMove(MoveCommon):
     kind: Literal["confirmed"]
     home: NotRequired[str]
     config_dir: NotRequired[str]
-    seat: NotRequired[str]
+    worker: NotRequired[str]
     run: NotRequired[str]
 
 
@@ -175,7 +177,7 @@ def _valid(value: object) -> bool:
                 "wait ended": (), "no room": ("earliest_reset",), "room again": ("label",)}
     if kind == "confirmed":
         return (isinstance(fields.get("home"), str) or isinstance(fields.get("config_dir"), str)) and (
-            "seat" not in fields or isinstance(fields["seat"], str))
+            "worker" not in fields or isinstance(fields["worker"], str))
     return isinstance(kind, str) and kind in required and all(isinstance(fields.get(key), str) for key in required[kind])
 
 
@@ -199,8 +201,9 @@ def append_move(entry: MoveEntry) -> None:
         raise ValueError("name the account by number")
     path = store_file()
     path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("a+", encoding="utf-8") as output:
+    with os.fdopen(os.open(path, os.O_RDWR | os.O_CREAT, 0o600), "r+", encoding="utf-8") as output:
         fcntl.flock(output.fileno(), fcntl.LOCK_EX)
+        _ = worker_names.migrate_locked_journal(output)
         if entry["kind"] in ("confirmed", "wait ended", "room again"):
             _ = output.seek(0)
             for line in output:
@@ -213,8 +216,9 @@ def append_move(entry: MoveEntry) -> None:
                     if (held.get("kind") == entry["kind"] and held.get("move_id") == entry["move_id"]
                             and held.get("tool") == entry["tool"] and held.get("subject") == entry["subject"]
                             and (entry["kind"] != "confirmed" or
-                                 (held.get("seat") == entry.get("seat") and held.get("run") == entry.get("run")))):
+                                 (held.get("worker") == entry.get("worker") and held.get("run") == entry.get("run")))):
                         return
+        _ = output.seek(0, os.SEEK_END)
         _ = output.write(json.dumps(entry, sort_keys=True) + "\n")
         output.flush()
 
@@ -259,9 +263,9 @@ def read_journal() -> list[JournalEntry]:
         return numbered(matching[-1].label, tool) if matching else HomeAccountUnresolved(home)
 
     try:
-        with store_file().open(encoding="utf-8") as source:
-            fcntl.flock(source.fileno(), fcntl.LOCK_SH)
-            lines = source.readlines()
+        with store_file().open("r+", encoding="utf-8") as source:
+            fcntl.flock(source.fileno(), fcntl.LOCK_EX)
+            lines = worker_names.migrate_locked_journal(source)
     except FileNotFoundError:
         return []
     entries: list[JournalEntry] = []
@@ -335,8 +339,9 @@ def append_routing(entry: RoutingEntry) -> None:
     saved["owner"] = owner if isinstance(owner, str) else "unknown"
     path = store_file()
     path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("a+", encoding="utf-8") as output:
+    with os.fdopen(os.open(path, os.O_RDWR | os.O_CREAT, 0o600), "r+", encoding="utf-8") as output:
         fcntl.flock(output.fileno(), fcntl.LOCK_EX)
+        _ = worker_names.migrate_locked_journal(output)
         _ = output.seek(0)
         for line in output:
             try:
@@ -347,6 +352,7 @@ def append_routing(entry: RoutingEntry) -> None:
                 held = cast(dict[str, object], previous)
                 if held.get("kind") == entry["kind"] and held.get("fallback_at") == entry["fallback_at"]:
                     return
+        _ = output.seek(0, os.SEEK_END)
         _ = output.write(json.dumps(saved, sort_keys=True) + "\n")
         output.flush()
 
@@ -360,7 +366,7 @@ class HomeAccountEvidence:
 
 def _role_evidence(path: Path) -> list[HomeAccountEvidence]:
     try:
-        lines = path.read_text(encoding="utf-8").splitlines()
+        lines = worker_names.role_history_lines(path)
     except (OSError, UnicodeError):
         return []
     found: list[HomeAccountEvidence] = []
@@ -371,7 +377,7 @@ def _role_evidence(path: Path) -> list[HomeAccountEvidence]:
                 continue
             row = cast(dict[str, object], raw)
             role, at = row.get("role"), row.get("at")
-            if role not in ("unit", "seats") or not isinstance(at, str):
+            if role not in ("unit", "workers") or not isinstance(at, str):
                 continue
             tool = "claude" if role == "unit" else "codex"
             account_label = row.get("account_label")

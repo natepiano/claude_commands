@@ -1041,7 +1041,7 @@ class AddUnitTests(ShutdownTestCase):
             "then": "stop",
             "force": old["force"],
             "alerts": "user",
-            "seats": [],
+            "workers": [],
             **owner,
         }
         creator: subprocess.Popen[str] | None = None

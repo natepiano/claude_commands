@@ -219,7 +219,7 @@ class RefusalWatchTests(unittest.TestCase):
             saved = record.SessionShutdown(login=source.login, label=source.label, machine="natedev",
                 requested_at=WatchTime.at.isoformat(), request_id=f"batch-{len(self.commands)}",
                 requested_by=record.FromTerminal(kind="terminal"), hold="session", then="restart",
-                force="wait for ready", alerts="user", session=owner, seats=[], timers=[],
+                force="wait for ready", alerts="user", session=owner, workers=[], timers=[],
                 settle_message=record.SettleMessageNotSent(kind="not sent"), where=record.WhereNotSaid(kind="not said"),
                 progress=record.SessionWaiting(kind="waiting"), trail=[], stop_issues=[], target=target,
                 source_label=source.label, why=why, move_id=command[command.index("--move-id") + 1])
@@ -1388,19 +1388,19 @@ class RefusalWatchTests(unittest.TestCase):
         _ = self.cli()
         self.assertEqual(len(self.commands), 1)
 
-    def test_open_shutdown_owner_and_director_seat_are_excluded(self) -> None:
+    def test_open_shutdown_owner_and_director_worker_are_excluded(self) -> None:
         owner = self.owner("already-moving")
         _ = self.transcript(owner["session_id"])
         _ = self.cli()
-        fields = inventory.SessionFields(session_id="seat-refused", pid=12345, proc_start="fixture-start",
+        fields = inventory.SessionFields(session_id="worker-refused", pid=12345, proc_start="fixture-start",
             name="worker", cwd=owner["cwd"], status="idle", model=owner["model"], checkout=owner["checkout"],
             run_dirs=[], codex_servers=[], timers=[], config_dir=str(accounts.account_dir("claude1")))
-        worker = inventory.SeatSession(**fields, kind="seat", host=inventory.UnknownHost(kind="unknown"),
+        worker = inventory.WorkerSession(**fields, kind="worker", host=inventory.UnknownHost(kind="unknown"),
             owner=inventory.DirectorOwner(kind="director", session_id=owner["session_id"]))
         self.owners.append(worker)
-        self.live.append(sessions.SessionRecord(pid=12345, sessionId="seat-refused", name="worker",
+        self.live.append(sessions.SessionRecord(pid=12345, sessionId="worker-refused", name="worker",
             messagingSocketPath="/fixture.sock", updatedAt=1, tmux="", formerNames=[]))
-        _ = self.transcript("seat-refused")
+        _ = self.transcript("worker-refused")
         _ = self.cli()
         self.assertEqual(len(self.commands), 1)
         self.assertEqual([entry["kind"] for entry in moves.read_moves()], ["requested"])

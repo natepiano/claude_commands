@@ -163,7 +163,7 @@ claims = base64.urlsafe_b64encode(json.dumps({"email": login}).encode()).decode(
 _ = Path(sys.argv[1]).write_text(json.dumps({"tokens": {"id_token": f"header.{claims}.signature"}}))
 _ = Path(sys.argv[2]).write_text(f"---\nlogin: {login}\n---\n")
 PY
-python3 "$SCRIPT_DIR/../accounts/accounts.py" set-role seats "codex 1"
+python3 "$SCRIPT_DIR/../accounts/accounts.py" set-role workers "codex 1"
 CODEX_HOME="$TEST_DIR/caller" bash "$SCRIPT_DIR/agent_exec.sh" \
     codex_case.task write "$WORKING_DIR" "$PROMPT_FILE" "$OUTPUT_FILE" "$LOG_FILE"
 assert_equal "fallback followed its caller instead of the workers role" "$HOME/.codex1" "$(cat "$TEST_CODEX_HOME_FILE")"

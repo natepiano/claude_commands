@@ -482,8 +482,8 @@ def codex_home() -> Path:
     return Path(os.environ.get("CODEX_HOME", str(Path.home() / ".codex")))
 
 
-def seats_home() -> Path:
-    """Resolve the shared seats role without using this process's CODEX_HOME."""
+def workers_home() -> Path:
+    """Resolve the shared workers role without using this process's CODEX_HOME."""
     path = Path.home() / ".claude" / "config" / "accounts.json"
     try:
         decoded = cast(object, json.loads(path.read_text(encoding="utf-8")))
@@ -491,19 +491,21 @@ def seats_home() -> Path:
         return Path.home() / ".codex"
     if not isinstance(decoded, dict):
         raise ValueError(f"accounts: {path} must contain an object")
-    values = cast(dict[str, object], decoded)
-    if "seats" not in values:
+    from scripts.accounts.worker_names import configuration
+
+    values = configuration(cast(dict[str, object], decoded))
+    if "workers" not in values:
         return Path.home() / ".codex"
-    label = values["seats"]
+    label = values["workers"]
     from scripts.whoami.note_file import NumberedAccountLabel, parse_account_label
 
     if label == "default":
         return Path.home() / ".codex"
     if not isinstance(label, str):
-        raise ValueError(f"accounts: {path} has an invalid seats account")
+        raise ValueError(f"accounts: {path} has an invalid workers account")
     parsed = parse_account_label(label)
     if not isinstance(parsed, NumberedAccountLabel) or parsed.tool != "codex":
-        raise ValueError(f"accounts: {path} has an invalid seats account")
+        raise ValueError(f"accounts: {path} has an invalid workers account")
     return codex_account_home(label).home
 
 
@@ -515,7 +517,7 @@ def codex_home_display(home: Path) -> str:
     return f"~/{home.relative_to(user_home)}" if home.is_relative_to(user_home) else str(home)
 
 
-def codex_homes(seats_home: Path) -> list[Path]:
+def codex_homes(workers_home: Path) -> list[Path]:
     """The default home, existing numbered homes, and any other home in use."""
     default = Path.home() / ".codex"
     numbered: list[tuple[int, Path]] = []
@@ -527,18 +529,18 @@ def codex_homes(seats_home: Path) -> list[Path]:
     except OSError:
         pass
     homes = [default, *(home for _, home in sorted(numbered))]
-    if seats_home not in homes:
-        homes.append(seats_home)
+    if workers_home not in homes:
+        homes.append(workers_home)
     return homes
 
 
-def codex_report_in_use(report: Report, seats_home: Path) -> bool:
-    """Select the seats' home; an older report without a source needs a single home."""
+def codex_report_in_use(report: Report, workers_home: Path) -> bool:
+    """Select the workers' home; an older report without a source needs a single home."""
     if report.tool.lower() != "codex":
         return False
     if isinstance(report.source, CodexHomeSource):
-        return report.source.home == seats_home
-    return isinstance(report.source, AccountSourceUnspecified) and len(codex_homes(seats_home)) == 1
+        return report.source.home == workers_home
+    return isinstance(report.source, AccountSourceUnspecified) and len(codex_homes(workers_home)) == 1
 
 
 @dataclass(frozen=True)
@@ -993,9 +995,9 @@ def reset_credits(report: Report, summary: object) -> None:
     report.limit_reset_expirations.sort()
 
 
-async def live_reports(selection: ClaudeAccountsInUse, seats_home: Path) -> list[Report]:
+async def live_reports(selection: ClaudeAccountsInUse, workers_home: Path) -> list[Report]:
     """Live Claude directories and every Codex home, fetched concurrently."""
-    homes = codex_homes(seats_home)
+    homes = codex_homes(workers_home)
     directories = list(dict.fromkeys([
         Path.home() / ".claude", *(named.directory for named in selection.named_accounts),
         *selection.live_directories,

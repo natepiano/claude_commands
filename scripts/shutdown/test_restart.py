@@ -196,15 +196,15 @@ def worker_session(
     *,
     owner: str | None,
     run_dirs: list[str] | None = None,
-) -> inventory.SeatSession:
+) -> inventory.WorkerSession:
     worker_owner: inventory.WorkerOwner = (
         inventory.DirectorOwner(kind="director", session_id=owner)
         if owner is not None
         else inventory.NoDirector(kind="no director")
     )
-    return inventory.SeatSession(
+    return inventory.WorkerSession(
         **common_session(session_id, run_dirs=run_dirs),
-        kind="seat",
+        kind="worker",
         host=inventory.UnknownHost(kind="unknown"),
         owner=worker_owner,
     )
@@ -218,7 +218,7 @@ def entry(
         login=LOGIN, label=LABEL, machine="natedev", requested_at=STOPPED,
         request_id="request", requested_by=record.FromTerminal(kind="terminal"),
         hold="session", then="restart", force="wait for ready", alerts="user",
-        session=session, seats=[], timers=list(timers or []),
+        session=session, workers=[], timers=list(timers or []),
         settle_message=record.SettleMessageNotSent(kind="not sent"),
         where=where or record.WhereSaid(kind="said", text=f"working on {session['name']}", at=STOPPED),
         progress=state or record.SessionStopped(kind="stopped", at=STOPPED), stop_issues=[], trail=[],

@@ -1638,7 +1638,7 @@ def _machine_result(records: list[SessionShutdown], machine: str, label: str) ->
         machine, label, "partial" if failed or manual or pending or any(
             item["progress"]["kind"] != "restarted" for item in records
         ) else "done",
-        restarted=restarted, workers=sum(len(item["seats"]) for item in records if item["progress"]["kind"] == "restarted"),
+        restarted=restarted, workers=sum(len(item["workers"]) for item in records if item["progress"]["kind"] == "restarted"),
         failed=len(failed), manual=len(manual), failed_sessions=failed,
         manual_sessions=manual, timers_not_started=pending,
     )

@@ -13,13 +13,16 @@ import sys
 import time
 from datetime import datetime
 from pathlib import Path
-from typing import NamedTuple, TypedDict, cast
+from typing import TYPE_CHECKING, NamedTuple, TypedDict, cast
 from zoneinfo import ZoneInfo
 
 import add_unit
 import showrunners
 import unit_lookup
 from session_pane import HerdrFailure, read_place
+
+if TYPE_CHECKING:
+    from collections.abc import Iterator
 
 STATE_DIR = Path(os.environ.get("STALL_WATCH_STATE_DIR") or Path.home() / ".local/state/stall-watch")
 SESSIONS_DIR = Path(os.environ.get("NOTIFIER_SESSIONS_DIR") or Path.home() / ".claude/sessions")
@@ -53,7 +56,18 @@ class Delivery(NamedTuple):
     command: list[str]
 
 
+class ContentBlock(TypedDict, total=False):
+    type: str
+    text: str
 
+
+class TranscriptMessage(TypedDict, total=False):
+    content: list[ContentBlock] | str
+
+
+class TranscriptEntry(TypedDict, total=False):
+    type: str
+    message: TranscriptMessage
 
 
 def command_output(command: list[str]) -> str:
@@ -131,6 +145,51 @@ def latest_transcript_activity(session_id: str) -> float:
             if path.is_file():
                 latest = max(latest, path.stat().st_mtime)
     return latest
+
+
+def lines_from_end(path: Path, block: int = 1 << 20) -> Iterator[bytes]:
+    """The file's lines, last first, read a block at a time from its end."""
+    with path.open("rb") as file:
+        end = file.seek(0, os.SEEK_END)
+        rest = b""
+        while end > 0:
+            start = max(0, end - block)
+            _ = file.seek(start)
+            lines = (file.read(end - start) + rest).split(b"\n")
+            rest = lines.pop(0) if start > 0 else b""
+            yield from reversed(lines)
+            end = start
+
+
+def transcript_turn_end(session_id: str) -> re.Match[str] | None:
+    """The turn-end line closing the session's last assistant text, read from its transcript.
+
+    Compaction clears the pane, so a unit that ended its turn and then compacted while idle shows no
+    turn-end line on screen; its transcript still ends with that text. A tool call after the text
+    means the turn went on, so there is no turn-end line.
+    """
+    try:
+        transcripts = sorted(PROJECTS_DIR.glob(f"*/{session_id}.jsonl"), key=lambda path: path.stat().st_mtime)
+        if not transcripts:
+            return None
+        for line in lines_from_end(transcripts[-1]):
+            if b'"assistant"' not in line:
+                continue
+            try:
+                entry = cast(TranscriptEntry, json.loads(line))
+            except ValueError:
+                continue
+            content = entry.get("message", {}).get("content") if entry.get("type") == "assistant" else None
+            blocks = content if isinstance(content, list) else []
+            if any(block.get("type") == "tool_use" for block in blocks):
+                return None
+            text = "\n".join(block.get("text", "") for block in blocks if block.get("type") == "text")
+            if text:
+                turns = list(TURN_END.finditer(text))
+                return turns[-1] if turns else None
+    except OSError:
+        return None
+    return None
 
 
 def stretch_path(slug: str, unit: str) -> Path:
@@ -243,8 +302,9 @@ def tick(now: float) -> None:
             path = stretch_path(slug, name)
             stretch = read_stretch(path, hashlib.sha256(pane.encode()).hexdigest(), now)
             turns = list(TURN_END.finditer(pane))
-            last = turns[-1].group(0).strip() if turns else "none on screen"
-            if turns and turns[-1].group("kind") in WAITING_KINDS:
+            turn = turns[-1] if turns else transcript_turn_end(session_id)
+            last = turn.group(0).strip() if turn else "none on screen"
+            if turn and turn.group("kind") in WAITING_KINDS:
                 stretch = Stretch(pane_hash=hashlib.sha256(pane.encode()).hexdigest(), since=now,
                                   bump_sent=False, tell_sent=False, reported_status="")
                 save_stretch(path, stretch)

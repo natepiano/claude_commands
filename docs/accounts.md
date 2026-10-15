@@ -8,7 +8,7 @@ The status line's first row shows this session's account label, after its role. 
 ~/.claude/scripts/lib/py ~/.claude/scripts/whoami/account.py
 ```
 
-`/whoami` shows Claude accounts in use used by the login in `~/.claude` or local live sessions, omitting unused Claude accounts. It also shows every Codex home; with multiple homes, the home in use is marked `(seats)`. It does not identify this session's account.
+`/whoami` shows Claude accounts in use used by the login in `~/.claude` or local live sessions, omitting unused Claude accounts. It also shows every Codex home; with multiple homes, the home in use is marked `(workers)`. It does not identify this session's account.
 
 ## Every account in one table
 
@@ -22,13 +22,13 @@ The status line's first row shows this session's account label, after its role. 
 | --- | --- |
 | Label | The account's label. A named Claude folder keeps its own label; a Codex home shows the label of its login's note. |
 | Login | The login, `not logged in`, or `not set up` for an account that has a note and is in no folder. |
-| Role | `units` and/or `showrunners` for the selected Claude groups; `seats` for the Codex home in use, `spare` for the other Codex homes. |
+| Role | `units` and/or `showrunners` for the selected Claude groups; `workers` for the Codex home in use, `spare` for the other Codex homes. |
 | 5-hour left, Weekly left | Percent of each window left, each with its reset time. A dash when the account has no such window. |
 | On credits | Codex only: `yes` when a window is used up and the account's credits now pay for the work. |
 | Credits left | Codex only: the credit balance, or `unlimited`. |
 | Read | When those numbers were read. |
 
-Each Codex account can stay signed in in its own home. The table's `seats` role follows `seats` in `~/.claude/config/accounts.json`, defaulting to `~/.codex`. A caller's `CODEX_HOME` does not change the `seats` role. Signed-in spares get usage readings too; their notes stay inactive and raise no quota alerts. Freestanding Codex sessions keep their own process home.
+Each Codex account can stay signed in in its own home. The table's `workers` role follows `workers` in `~/.claude/config/accounts.json`, defaulting to `~/.codex`. A caller's `CODEX_HOME` does not change the `workers` role. Signed-in spares get usage readings too; their notes stay inactive and raise no quota alerts. Freestanding Codex sessions keep their own process home.
 
 Times are in the user's zone setting (`config/user_zone.conf`). The numbers are each account's last good reading: the usage service refuses many reads, so the two-minute updater saves each one it gets, and an account with none in the last 10 minutes is read once more. `unavailable` means no reading is held for a window that is still open. Lines under the table name anything wrong or unusual in a folder: a failed check, unclassified entries, MCP servers that differ from `~/.claude`.
 
@@ -111,13 +111,47 @@ Never `/logout` in a unit director's session: every unit on that account stops w
 
 ## Move a session
 
-In this terminal, run `~/.claude/scripts/lib/py ~/.claude/scripts/accounts/accounts.py move <session-id-or-exact-name> <target> [--dry-run] [--why "<text>"]` for one local ad hoc session. Grouped sessions use `move units <target>` or `move showrunners <target>`, which selects that account for future launches and moves every off-target member. An empty group still selects its account; an open shutdown receives no duplicate request. A session can request its own move, then mark ready and end its turn.
+In this terminal:
 
-Selection and preview use shutdown's lightweight listing (`ListedSession`), without worktrees, restart resources or desktop inventory. Preview writes nothing and shows each name/id, source account and `pause, then move (<source> has room)` or `reap and restart now (<source> out of usage: <limit and reset>)`. Prompt-taking members pause and mark ready; a transcript refusal or fresh exhausted source reading restarts without a pause. Process identity checks still precede signals. Showrunner previews read update timers once in-process, sharing that snapshot with the registration check without resolving messaging sockets. They name productions whose timer's target session is absent, with the full repair command to run inside that showrunner's own session.
+```sh
+~/.claude/scripts/lib/py ~/.claude/scripts/accounts/accounts.py move <session-id-or-exact-name> <target> [--dry-run] [--why "<text>"]
+~/.claude/scripts/lib/py ~/.claude/scripts/accounts/accounts.py move units|showrunners <target> [--dry-run] [--why "<text>"]
+```
 
-Before any group change or shutdown write, the target must pass its home and sign-in checks. A fresh exhausted window with no credits refuses and gives the picker command for this terminal. A stale or missing reading permits the move and prints `no fresh usage reading for <target>` with its age when known. A missing or ambiguous local session, a worker, a session already on the target, or an unreadable account or shutdown state also refuses. Workers move with their unit director.
+The first form moves one local ungrouped session, found by id, else by exact name. The second selects the group's account for future launches and moves every live member not already on it. An empty group still selects its account (`<group>: no live session moves`); an open shutdown receives no duplicate request. A session can request its own move, then mark ready and end its turn.
 
-The run hands selected ids to one shutdown per source login. A terminal requester with tty output follows each request's live trail through archive and restart; session and redirected callers get scoped follow and cancel commands. `all N back on <target>` means done; a summary containing `taken out` also counts cancelled members as complete. A needs-user line gives the next command and place; following continues through the remaining source requests and returns failure if any needs help. Ctrl-C detaches with a follow command while shutdown continues. A group gets one move-back command to its stored account before the move. If none was stored, the command names the common source of the moved members; mixed sources yield no command. A single-session move-back command names that session and its source account. The showrunner wrapper retains missing-reading notices and move-back guidance alongside its process proof.
+### Preview
+
+`--dry-run` writes nothing, for a group or a single session. Selection reads shutdown's lightweight listing (`ListedSession`), without worktrees, restart resources or desktop inventory; each member's line reads only its newest transcript exchange and the stored usage reading. A warm preview takes about 0.3 to 0.4 s on natedev. A group preview first prints `<group>: would select <target>`, then one line per member:
+
+```text
+<name>: <session id> · pause, then move (<source> has room)
+<name>: <session id> · reap and restart now (<source> out of usage: weekly limit, resets Sat 9:00 AM)
+```
+
+A source with no fresh reading prints `pause, then move (<source> no fresh reading)`. A paused member is asked to stop at a safe point and mark ready; a member whose transcript ends in a refusal, or whose source account has a fresh reading at 0%, is reaped and restarted at once with no pause message. Process identity checks still precede every signal. Showrunner previews read the update timers once in-process, sharing that snapshot with the registration check without resolving messaging sockets, and name each production whose timer's target session is absent, with the full repair command to run inside that showrunner's own session.
+
+### Target check and refusals
+
+Before any group change or shutdown write, the target must pass its home and sign-in checks. A fresh reading with no credits and a window at 0 refuses:
+
+```text
+accounts: <target> is out of usage (weekly 0% left, resets Sat 8:59 AM); pick another: ~/.claude/scripts/lib/py ~/.claude/scripts/accounts/accounts.py pick claude --exclude <target> in this terminal
+```
+
+A stale or missing reading permits the move and prints `no fresh usage reading for <target> (last <n> minutes ago)`. A missing or ambiguous local session, a worker, a grouped session (the refusal names `accounts.py move <group> <target>`), a session already on the target, and an unreadable account or shutdown state also refuse. A session on the other machine moves from there. Workers move with their unit director.
+
+### Following the move
+
+The move hands the selected ids to one `shutdown.py down --only` per source login, then prints the move-back line:
+
+```text
+to move them back, in this terminal: ~/.claude/scripts/lib/py ~/.claude/scripts/accounts/accounts.py move <subject> <account>
+```
+
+A group's line names the account it held before the move; with none stored, it names the common source of the moved members, and mixed sources print no line. A single move names that session and its source account.
+
+Run from a terminal (`CLAUDE_CODE_SESSION_ID` unset, stdout a tty), the move then follows each request in turn, printing `<HH:MM:SS> <name>: <kind> <detail>` for every step (`reaping`, `waiting`, `ready`, `stopped`, `restarted`). It ends on `all N back on <target>`; a summary containing `taken out` counts cancelled members as done. A needs-user line gives the next command and where to run it; following continues through the remaining source requests and exits 1 if any needs help. Ctrl-C detaches with a follow command while the shutdown continues (exit 130). Run from a Claude session or with redirected output, the move prints the follow and cancel commands instead. The showrunner wrapper (`/showrunner:move`) keeps the missing-reading notice and the move-back line beside its process proof.
 
 Each return keeps the conversation, cwd, name, model and production resume prompt, including a unit director's ongoing run. A manual restart outcome supplies its command and place. The target is checked again at launch; its prepared environment drops inherited OAuth tokens without changing credentials or other sessions.
 
@@ -184,23 +218,23 @@ The repository's hook installer keeps a linked `hooks.json` and adds missing hoo
 
 ## Swapping the Codex workers account
 
-One account serves every unit's Codex workers, including the `codex exec` fallback. The updater, 5-hour watcher, `/whoami` and account table follow that role. Read it with `/showrunner:accounts role seats`.
+One account serves every unit's Codex workers, including the `codex exec` fallback. The updater, 5-hour watcher, `/whoami` and account table follow that role. Read it with `/showrunner:accounts role workers`.
 
 ```text
-/showrunner:accounts swap seats codex1 --dry-run
-/showrunner:accounts swap seats codex1
-/showrunner:accounts swap seats codex2
+/showrunner:accounts swap workers codex1 --dry-run
+/showrunner:accounts swap workers codex1
+/showrunner:accounts swap workers codex2
 ```
 
 A swap checks the target home, its sign-in, both usage windows and its credits before changing the role. It retires each run's current server and tells each affected unit director once. A working worker finishes its turn on the outgoing home; its next turn runs under the new one. Held messages move with it. The move confirms that the old server released the thread before the new server resumes it. If Codex refuses that resume, the worker starts a new thread and its board line names the replacement. An unreadable thread state or unconfirmed release starts no replacement turn.
 
-`--dry-run` prints the target account, its home and the runs that would move, with no role or history write. `set-role seats codexN` selects future turns directly, without the swap's usage check or notices. Each role write keeps the other role; `unit` and `seats` history share `~/.local/state/accounts/roles.jsonl`.
+`--dry-run` prints the target account, its home and the runs that would move, with no role or history write. `set-role workers codexN` selects future turns directly, without the swap's usage check or notices. Each role write keeps the other role; `unit` and `workers` history share `~/.local/state/accounts/roles.jsonl`.
 
 Refusals leave both the role and history unchanged. A home-check failure names the file, link, login or duplicate sign-in to fix; rerun setup or correct that home's sign-in. An already-selected account needs no swap. An account used up with no credits needs a different target, credits or its reset. Unknown or expired usage needs a fresh reading before trying again. Selecting the numbered account held in `~/.codex` requires a real, signed-in home whose login no other home holds; its shared entries remain real files and directories.
 
 ## Automatic Codex moves
 
-A provider quota refusal moves workers to the picked Codex account with room. Above zero, low quota alone changes nothing; weekly zero with `use_credits: off` also requests a move. A known 5-hour reset less than 20 minutes away waits once, with its reset time in the notice. An unknown window or reset, a passed reset, or exactly 20 minutes remaining moves instead. The picked home becomes the `seats` role through the `swap seats` path; each worker moves after its live turn ends and continues the refused work before held messages.
+A provider quota refusal moves workers to the picked Codex account with room. Above zero, low quota alone changes nothing; weekly zero with `use_credits: off` also requests a move. A known 5-hour reset less than 20 minutes away waits once, with its reset time in the notice. An unknown window or reset, a passed reset, or exactly 20 minutes remaining moves instead. The picked home becomes the `workers` role through the `swap workers` path; each worker moves after its live turn ends and continues the refused work before held messages.
 
 When no Codex account has room, assignments fall back to Claude and the notice names the earliest reset. A failed move to the picked home also falls back to Claude, with the failed move and cause in the notice. They return only when the selected Codex account can work and its refusal is resolved. Recorded refusals override saved percentages. The moves journal at `~/.local/state/accounts/moves.jsonl` separates a requested role change from each worker's confirmed resume, and records waits, failures and renewed room.
 
