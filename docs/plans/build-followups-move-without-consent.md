@@ -117,7 +117,7 @@
 
 **Ruled out:** counting `shell` as idle for workers or for Remote Control typing — a running shell may still be using the terminal.
 
-### Phase 5 — A conductor runs the code on disk  · status: todo
+### Phase 5 — A conductor runs the code on disk  · status: done
 
 **Depends on:** Phase 4
 
