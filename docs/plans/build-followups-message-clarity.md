@@ -315,7 +315,7 @@ Outside `scripts/accounts/` and `scripts/whoami/`, every delegate agent is a "wo
 
 **Binds later work:** shutdown-unit's follow-up run on `settle.py` builds on `HoldoutKind` and the two entry ids.
 
-### Phase 5 — Questions in showrunner replies  · status: todo
+### Phase 5 — Questions in showrunner replies  · status: done
 
 **Depends on:** Phase 4, Phase 6, Phase 9, Phase 10
 
