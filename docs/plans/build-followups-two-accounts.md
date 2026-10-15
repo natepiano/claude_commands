@@ -982,3 +982,28 @@ After a worker launch's own turn has ended, a move to the selected seats home th
 - The skip list lives in `/etc/nixos`, not this repository: a new per-run frontmatter field commits every run unless that list gains it.
 
 **Ruled out:** keeping the first observation time in each row (a long-lived row would read "last seen" days stale); a new per-run frontmatter field (not on the snapshot's skip list).
+
+### Phase 27 — Roster rows stable between runs  · status: done
+
+**Depends on:** Phase 26
+
+#### Work Order
+
+**Goal:** the session roster lists the same sessions on two runs when none started, stopped or moved, so the account notes in the hanadocs vault stop flipping the "not attributed" line and stop dropping whole worker tables.
+
+**Constraints from prior phases:** "Account notes unchanged when nothing changed" removed the per-run time from `## Live sessions`; the remaining churn comes from `scripts/message/roster.py` (message-clarity's file, edited here at the showrunner's direction through berth). Every `AccountUnread` roster entry counts in a "<n> live session(s) not attributed to an account" line written into every note.
+
+**Spec:**
+
+- `_review_workers` adds no entry for a `review_status*` file that says reviewing when `_reviewer_process` finds no reviewer process: lens reviews now run as a `codex_mesh.py follow` turn inside the mesh app-server, whose worker the roster already lists, so the entry was a duplicate counted as unattributed while any review ran. A review whose reviewer process is found keeps its entry as today.
+- `_delegate_workers` lists every mesh record whose status is not `ended` for a live run (an active marker or a fresh heartbeat) whether or not the run's app-server is alive; a server that stopped itself after its idle timeout no longer removes the run's workers. Server liveness may still change the status text a row shows; it never removes the row. A run that is not live keeps today's behavior.
+- A real start, stop or move still changes the roster.
+
+**Files:**
+
+- `scripts/message/roster.py` — the two rules above.
+- `scripts/message/test_roster.py` — a test for each: a reviewing status file with no reviewer process yields no entry and nothing unattributed, while one with a found process still lists it; a live run whose app-server is gone still lists its non-ended mesh workers, and an ended record or a dead run lists none.
+
+**Workers:** one worker, `impl`, owns both files.
+
+**Acceptance gate:** both tests fail without the change and pass with it; `scripts/message`, `scripts/whoami` and `scripts/shutdown` suites pass with a temp `HOME`; basedpyright reports zero errors and zero warnings on the changed files. After the fix is live, `git -C ~/rust/hanadocs log -8 --stat -- agents` shows no run committing only a flip of the not-attributed line or a whole table appearing and vanishing.
