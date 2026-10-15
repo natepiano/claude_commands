@@ -13,6 +13,7 @@ import subprocess
 import tempfile
 import unittest
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import ClassVar, cast, override
 from unittest import mock
@@ -145,6 +146,57 @@ def timeline(lines: list[str]) -> list[str]:
 
 
 class ReportFooterTests(unittest.TestCase):
+    def test_outstanding_reader_preserves_full_questions_and_distinguishes_review_results(self) -> None:
+        question = "Session: demo\nAction: choose a route\n" + "Which route? " * 120
+        with tempfile.TemporaryDirectory() as scratch:
+            path = Path(scratch) / "outstanding.json"
+            _ = path.write_text(json.dumps([
+                {"since": AT, "text": "reminder"},
+                {"since": AT, "text": "facts needed", "question": question},
+                {"since": AT, "text": "route", "question": question, "reviewed": "Use the short route?"},
+                {"since": AT, "text": "review failed", "question": question,
+                 "review_unavailable": "reviewer unavailable", "after": "2026-10-04T12:00"},
+            ]))
+            items = dailies_render.read_outstanding(path)
+            self.assertIsInstance(items[0], dailies_render.OutstandingReminder)
+            awaiting = items[1]
+            self.assertIsInstance(awaiting, dailies_render.OutstandingQuestion)
+            assert isinstance(awaiting, dailies_render.OutstandingQuestion)
+            self.assertEqual(awaiting.question, question)
+            reviewed = items[2]
+            self.assertIsInstance(reviewed, dailies_render.ReviewedOutstandingQuestion)
+            assert isinstance(reviewed, dailies_render.ReviewedOutstandingQuestion)
+            self.assertEqual(reviewed.reviewed, "Use the short route?")
+            unavailable = items[3]
+            self.assertIsInstance(unavailable, dailies_render.ReviewUnavailableOutstandingQuestion)
+            assert isinstance(unavailable, dailies_render.ReviewUnavailableOutstandingQuestion)
+            self.assertEqual(unavailable.question, question)
+            self.assertEqual(unavailable.reason, "reviewer unavailable")
+            self.assertEqual(dailies_render.due(items, datetime.fromisoformat(AT)), items[:3])
+            self.assertEqual(dailies_render.due(items, datetime(2026, 10, 4, 12)), items)
+            output = self.lines(footer("--nothing-needed", "--outstanding", str(path)))
+            self.assertFalse(output[-1].endswith(" - nothing needed"))
+            self.assertFalse(any("Which route?" in line for line in output))
+
+    def test_outstanding_reader_refuses_conflicting_or_incomplete_review_evidence(self) -> None:
+        cases: list[dict[str, object]] = [
+            {"reviewed": "Choose now?"},
+            {"question": "Choose now?", "reviewed": "Choose now?", "review_unavailable": "offline"},
+            {"question": ""},
+            {"question": "Choose now?", "reviewed": 42},
+            {"question": "Choose now?", "review_unavailable": 42},
+            {"question": None},
+            {"question": "Choose now?", "reviewed": None},
+            {"question": "Choose now?", "review_unavailable": None},
+        ]
+        with tempfile.TemporaryDirectory() as scratch:
+            path = Path(scratch) / "outstanding.json"
+            for fields in cases:
+                with self.subTest(fields=fields):
+                    _ = path.write_text(json.dumps([{"since": AT, "text": "route", **fields}]))
+                    with self.assertRaises(dailies_render.InputError):
+                        _ = dailies_render.read_outstanding(path)
+
     def lines(self, result: Run) -> list[str]:
         self.assertEqual(result.code, 0, result.error)
         return result.lines

@@ -298,27 +298,24 @@ Outside `scripts/accounts/` and `scripts/whoami/`, every delegate agent is a "wo
 
 **Depends on:** Phase 13
 
-#### Work Order
+#### As-built
 
-**Goal:** The push sent when a session holds up a shutdown or restart reads as the user's four lines, passes review, and never carries an email address.
-
-**Spec:**
-- Split from Phase 5 and checkpointed ahead of it (showrunner, 2026-10-15 11:4x EDT): shutdown-unit's next run also edits `scripts/shutdown/settle.py` and builds on this change.
-- The `shutdown.holdout` push failed review on four rules (title-names-the-stake, say-where-to-act, short-plain-sentences, push-body-under-500) and was sent anyway under its user-spec approval, and its command line carried the account's login email. It leads with the user's four lines (Title / Session / Action / Reason, the user's words of 2026-10-14: "widget shutdown is blocked" / "widget" / "answer the open form" / "shutdown is blocked because widget's claude session is showing a form and it can't proceed"), with the operation in lower case in the title; any stop command names the account by its canonical label (`claude4`), never the login; the body stays under 500 characters. No push ever carries an email address: a test renders every catalog example and the live holdout push from a record whose login is an email and finds no `@`. The new text passes `review.py texts --id shutdown.holdout` (unit director).
+- Two catalog entries, chosen in `settle._send_holdout_alert` by `settle.HoldoutKind.from_reason` (a form among the hold's details, or any other hold):
+  - `shutdown.holdout` (form shown): the user's four lines — title `{session} {operation} is blocked`, Session `{session}`, Action `answer the open form`, Reason `{operation} is blocked because {session}'s claude session is showing a form and it can't proceed.` — then "Or stop it instead, and the {operation} goes on without it. In a terminal on {machine}: {command}".
+  - `shutdown.holdout_unanswered` (busy, waiting or any other hold): same title and Session; Action `in a terminal on {machine}, stop {session} with the command below`; Reason `… has not paused for it and it can't proceed.`; then "Stopping ends only that session, and the {operation} goes on. In a terminal on {machine}: {command}". No raw hold-detail list reaches the push; the requesting session's message keeps it.
+- The stop command names the account by `note_file.canonical_label(saved["label"])` with `--here`, never the login. `test_push_texts.py` fails if any catalog example renders `@`; `test_settle.py` sends from a record whose login is an email.
+- Both texts are approved under `--user-spec`, with the reviewer's objections to the user's title, Action and Reason and to the stop line recorded, not applied.
 
 **Files:**
-- `scripts/notify/push_catalog.py` — the `shutdown.holdout` text and examples
+- `scripts/notify/push_catalog.py` — both holdout entries and their examples
 - `scripts/notify/test_push_texts.py` — no catalog push renders an `@`
-- `scripts/notify/push_texts_reviewed.json` — the re-reviewed text's approval (unit director)
-- `scripts/shutdown/settle.py` — the holdout push names the account by label (owner shutdown-unit; also touches)
-- `scripts/shutdown/test_settle.py` — a login that is an email never reaches the push
+- `scripts/notify/push_texts_reviewed.json` — both approvals
+- `scripts/shutdown/settle.py` — `HoldoutKind`, entry choice, label in the command (owner shutdown-unit)
+- `scripts/shutdown/test_settle.py` — form vs other holds, no email in the push
 
-**Workers:** 1 writer
-- `fix2` — every file above except `push_texts_reviewed.json`
+**Binds later work:** shutdown-unit's follow-up run on `settle.py` builds on `HoldoutKind` and the two entry ids.
 
-**Acceptance gate:** `scripts/notify`, `scripts/shutdown` and `scripts/lib` suites green; basedpyright 0/0; `review.py texts --id shutdown.holdout` approves the new text; no catalog example renders an `@`.
-
-### Phase 5 — Questions in showrunner replies  · status: todo
+### Phase 5 — Questions in showrunner replies  · status: done
 
 **Depends on:** Phase 4, Phase 6, Phase 9, Phase 10
 
