@@ -69,7 +69,7 @@
 
 **Ruled out:** a bare `no_alert: bool` parameter — the named `MoveAlerts` Literal holds the choice.
 
-### Phase 3 — Live check without consent  · status: todo
+### Phase 3 — Live check without consent  · status: done
 
 **Depends on:** Phase 1, Phase 2
 
