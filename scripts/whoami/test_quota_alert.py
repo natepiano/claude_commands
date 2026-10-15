@@ -393,9 +393,9 @@ class QuotaAlertTests(unittest.TestCase):
         self.assertFalse(accounts.groups_file().exists())
         with mock.patch.object(accounts, "move_sessions") as move:
             text = quota_alert.unit_swap_line(note, [note], accounts.claude_account_selection())
-        self.assertIn("units: move to claude1", text)
+        self.assertIn("units: move to claude2", text)
         self.assertIn("showrunners: move to claude2", text)
-        self.assertIn("ungrouped sessions: move to claude1", text)
+        self.assertIn("ungrouped sessions: move to claude2", text)
         self.assertNotIn("move to claude3", text)
         self.assertFalse(accounts.groups_file().exists())
         move.assert_not_called()

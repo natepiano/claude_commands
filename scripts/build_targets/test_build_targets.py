@@ -773,24 +773,28 @@ class WaitLocalTests(IsolatedTargetTest):
              mock.patch.object(build_hold, "call_is_live", wraps=REAL_CALL_IS_LIVE):
             self.assertTrue(build_hold.call_is_live(call))
 
-    def test_finish_local_on_admitted_unmarked_call_releases_next_entry(self) -> None:
+    def test_finish_local_on_admitted_unmarked_call_ends_its_turn_without_another_notice(self) -> None:
         self.begin_hold()
         build_hold.record_recipients([("owner", "owner"), ("peer", "peer")])
         cycle = build_hold.read_cycle()
         assert cycle is not None
         cycle["release_started_at"] = NOW.isoformat()
         build_hold.save_cycle(cycle)
-        _ = build_hold.advance_release(cycle, NOW, clock=lambda: NOW)
-        with mock.patch.object(build_hold, "waiter_key", return_value="owner"):
-            self.assertEqual(build_targets.command_register_local("call-a", pid=12345), 0)
-        self.assertIsInstance(build_hold.read_admission("owner", "call-a"), build_hold.AdmittedTurn)
-        self.assertEqual(build_targets.command_finish_local("call-a"), 0)
-        cycle = build_hold.read_cycle()
-        assert cycle is not None
         with mock.patch.object(build_hold, "send_release", return_value=build_hold.ReleaseDelivered()) as sent:
             _ = build_hold.advance_release(cycle, NOW, clock=lambda: NOW)
-        self.assertEqual(sent.call_count, 1)
-        self.assertEqual(sent.call_args.args[0]["session_id"], "peer")
+            with mock.patch.object(build_hold, "waiter_key", return_value="owner"):
+                self.assertEqual(build_targets.command_register_local("call-a", pid=12345), 0)
+            self.assertIsInstance(build_hold.read_admission("owner", "call-a"), build_hold.AdmittedTurn)
+            self.assertEqual(build_targets.command_finish_local("call-a"), 0)
+            cycle = build_hold.read_cycle()
+            assert cycle is not None
+            self.assertEqual(build_hold.advance_release(cycle, NOW, clock=lambda: NOW),
+                             (False, "peer [peer]: ReleasedAwaitingAdmission"))
+        self.assertEqual([call.args[0]["session_id"] for call in sent.call_args_list], ["owner", "peer"])
+        cycle = build_hold.read_cycle()
+        assert cycle is not None
+        self.assertEqual([(entry["session_id"], entry["state"], entry["active_call_id"]) for entry in cycle["entries"]],
+                         [("owner", "NoPendingTurn", ""), ("peer", "ReleasedAwaitingAdmission", "")])
 
 
 if __name__ == "__main__":
