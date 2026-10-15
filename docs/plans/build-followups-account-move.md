@@ -204,7 +204,7 @@
 
 **Ruled out:** gating the fixer on alert policy (typing `/remote-control` repairs rather than alerts, and `--no-alert` throwaways must still run it); naming the fixer unit with the launcher's pid.
 
-### Phase 6 — The move command  · status: todo
+### Phase 6 — The move command  · status: done
 
 **Depends on:** Phase 1, Phase 2, Phase 3, Phase 4
 **Blocked by:** two-accounts' "Accounts named by number only" checkpoint on `build-followups` (it holds `scripts/accounts/accounts.py` and spells the labels `claude1`/`codex1`); merge the merge branch first.

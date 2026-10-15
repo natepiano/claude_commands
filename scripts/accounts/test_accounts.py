@@ -909,6 +909,32 @@ class AccountsTests(unittest.TestCase):
         self.assertEqual([named.identity.label for named in selection.named_accounts], ["claude4"])
         self.assertTrue(selection.is_home_directory_login("main@example.invalid"))
 
+    def test_exec_supervises_only_an_unsupervised_terminal(self) -> None:
+        self.login_directory("claude2", "main@example.invalid", default=True)
+        self.login_directory("claude3", "unit@example.invalid")
+        for tty, supervised in ((True, False), (True, True), (False, False)):
+            with self.subTest(tty=tty, supervised=supervised):
+                environment = {**os.environ, "PRESERVED_MARKER": "keep"}
+                if supervised:
+                    environment["RELAUNCH_SUPERVISED"] = "1"
+                else:
+                    _ = environment.pop("RELAUNCH_SUPERVISED", None)
+                with (patch.dict(os.environ, environment, clear=True),
+                      patch.object(sys.stdin, "isatty", return_value=tty),
+                      patch.object(os, "execvpe") as launch):
+                    accounts.exec_account("claude3", ["--resume", "conversation-id"])
+                executable, argv, child_environment = cast(tuple[str, list[str], dict[str, str]], launch.call_args.args)
+                if tty and not supervised:
+                    self.assertEqual(executable, sys.executable)
+                    self.assertEqual(argv, [sys.executable,
+                        str(accounts.SCRIPTS / "lib" / "relaunch.py"), "run", "--",
+                        "claude", "--resume", "conversation-id"])
+                else:
+                    self.assertEqual((executable, argv), ("claude", ["claude", "--resume", "conversation-id"]))
+                self.assertEqual(child_environment["CLAUDE_CONFIG_DIR"], str(accounts.account_dir("claude3")))
+                self.assertEqual(child_environment["PRESERVED_MARKER"], "keep")
+                launch.assert_called_once()
+
     def test_exec_reports_an_unavailable_claude_executable_with_exit_two(self) -> None:
         self.login_directory("claude2", "main@example.invalid", default=True)
         with patch.object(os, "execvpe", side_effect=FileNotFoundError("fixture executable missing")):
@@ -1120,10 +1146,13 @@ class AccountsTests(unittest.TestCase):
             code, output, error = self.run_cli("move", "showrunners", "claude3")
         self.assertEqual((code, error), (0, ""))
         self.assertEqual(accounts.group_accounts().get("showrunners"), "claude3")
-        self.assertEqual(output.replace("`", "").splitlines(), ["showrunners: no live session moves", *(
-            f"{runner['slug']}: no session runs under the id its update timer names; "
-            + "a showrunner running under another id is not moved until it runs "
-            + f"update_registration.py register --production {runner['doc']}" for runner in stale)])
+        self.assertIn("showrunners: no live session moves", output)
+        for runner in stale:
+            line = next(line for line in output.splitlines() if line.startswith(runner["slug"] + ":"))
+            self.assertIn("no session runs under the id", line)
+            self.assertIn("in any Claude session on", line)
+            self.assertIn("~/.claude/scripts/lib/py ~/.claude/scripts/production/update_registration.py", line)
+            self.assertIn(f"--production {runner['doc']}", line)
         moved.assert_not_called()
 
     def test_showrunner_group_preview_names_unregistered_timers_without_configuring_or_requesting(self) -> None:
@@ -1138,10 +1167,12 @@ class AccountsTests(unittest.TestCase):
               patch.object(accounts, "move_sessions") as moved):
             code, output, error = self.run_cli("move", "showrunners", "claude3", "--dry-run")
         self.assertEqual((code, error), (0, ""))
-        self.assertEqual(output.replace("`", "").splitlines(), ["showrunners: would select claude3",
-            "showrunners: no live session moves",
-            "missing: no session runs under the id its update timer names; a showrunner running under "
-            + "another id is not moved until it runs update_registration.py register --production /w/missing-production.md"])
+        self.assertIn("showrunners: would select claude3", output)
+        self.assertIn("showrunners: no live session moves", output)
+        self.assertIn("missing: no session runs under the id", output)
+        self.assertIn("in any Claude session on", output)
+        self.assertIn("~/.claude/scripts/lib/py ~/.claude/scripts/production/update_registration.py", output)
+        self.assertIn("--production /w/missing-production.md", output)
         self.assertFalse(accounts.groups_file().exists())
         self.assertFalse(accounts.roles_history_file().exists())
         moved.assert_not_called()

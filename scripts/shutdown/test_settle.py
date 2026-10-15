@@ -651,7 +651,7 @@ class SettleTests(ShutdownTestCase):
         registry.mkdir(parents=True, exist_ok=True)
         _ = (registry / f"{owner['pid']}.json").write_text(json.dumps(
             {**registered, "status": "busy", "cwd": str(self.root)}))
-        _ = self.enterContext(patch.object(inventory, "_registered_productions", return_value=({}, [])))
+        _ = self.enterContext(patch.object(inventory, "showrunner_registrations", return_value=inventory.ShowrunnerRegistrations(())))
         _ = self.enterContext(patch.object(inventory, "_unit_sessions", return_value={}))
         _ = self.enterContext(patch.object(inventory, "_active_run_directories", return_value={}))
         _ = self.enterContext(patch.object(inventory, "_newest_unit_plans", return_value={}))
@@ -814,7 +814,7 @@ class SettleTests(ShutdownTestCase):
               patch.object(accounts, "pick", return_value=accounts.PickedAccount("claude3", self.root / ".claude3",
                   80, accounts.NoResetKnown())),
               patch.object(accounts, "move_sessions", return_value=(
-                  accounts.SessionMoveRequested(owner["session_id"], "replacement", "claude3"),)) as move,
+                  accounts.SessionMoveRequested(owner["session_id"], "replacement", "claude3", source_login=LOGIN),)) as move,
               patch.object(settle, "_restore_record"), redirect_stdout(io.StringIO())):
             self.assertEqual(settle.cancel(Account("claude", LOGIN, LABEL), True), 0)
         self.assertEqual(len(ticks), 1)

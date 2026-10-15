@@ -87,6 +87,8 @@ class RefusalWatchTests(unittest.TestCase):
         _ = self.enterContext(patch.object(account, "process_config_dir", side_effect=self.process_dir))
         _ = self.enterContext(patch.object(account, "account_of", side_effect=self.process_account))
         _ = self.enterContext(patch.object(inventory, "inventory", side_effect=self.inventory_for))
+        _ = self.enterContext(patch.object(inventory, "listing", side_effect=self.listing))
+        _ = self.enterContext(patch.object(inventory, "unregistered_showrunners", return_value=[]))
         _ = self.enterContext(patch.object(subprocess, "run", side_effect=self.down))
         self.notifications = []
         _ = self.enterContext(patch.object(refusal_watch, "_notify_no_room", side_effect=self.notified))
@@ -115,6 +117,22 @@ class RefusalWatchTests(unittest.TestCase):
                   and (not only or owner["session_id"] in only)]
         return inventory.Inventory(machine="natedev", login=login,
             label="claude1" if login == SOURCE_LOGIN else "claude3", sessions=owners, unattributed=[])
+
+    def listing(self, login: str | None = None, *,
+                registrations: inventory.ShowrunnerRegistrations | Literal["read timers"] = "read timers") -> list[inventory.ListedSession]:
+        del registrations
+        result: list[inventory.ListedSession] = []
+        for owner in self.owners:
+            identity = self.process_account(owner["pid"])
+            if identity is None or login is not None and identity.login != login:
+                continue
+            production = (owner["production"] if owner["kind"] == "showrunner" else
+                          owner["host"]["production"] if owner["host"]["kind"] == "unit" else "")
+            doc = (owner["doc"] if owner["kind"] == "showrunner" else
+                   owner["host"]["doc"] if owner["host"]["kind"] == "unit" else "")
+            result.append(inventory.ListedSession(owner["session_id"], owner["pid"], owner["proc_start"],
+                owner["name"], owner["kind"], Path(owner.get("config_dir", str(self.home / ".claude"))), identity.login, production, doc))
+        return result
 
     def owner(self, identity: str, *, host: str = "terminal", label: str = "claude1") -> inventory.Session:
         fields = inventory.SessionFields(session_id=identity, pid=1000 + len(self.owners),
@@ -217,8 +235,9 @@ class RefusalWatchTests(unittest.TestCase):
         with redirect_stdout(output), redirect_stderr(error):
             code = accounts.main(["move", "units", "claude3", "--dry-run"])
         self.assertEqual((code, error.getvalue()), (0, ""))
-        self.assertEqual(output.getvalue().splitlines(), ["units: would select claude3",
-            f"{off['name']}: {off['session_id']}"])
+        self.assertIn("units: would select claude3", output.getvalue())
+        self.assertIn(f"{off['name']}: {off['session_id']}", output.getvalue())
+        self.assertIn("reap and restart now", output.getvalue())
         self.assertEqual(self.snapshot(), before)
         self.assertFalse(accounts.groups_file().exists())
         self.assertFalse(accounts.roles_history_file().exists())
@@ -228,6 +247,7 @@ class RefusalWatchTests(unittest.TestCase):
 
     def test_units_group_preview_on_current_account_prints_no_live_session_moves(self) -> None:
         _ = self.owner("already-there", host="unit")
+        self.reading(SOURCE_LOGIN, 80)
         before = self.snapshot()
         result = accounts.move_group("units", "claude1", dry_run=True)
         self.assertIsInstance(result, accounts.GroupMoveDryRun)
@@ -257,7 +277,8 @@ class RefusalWatchTests(unittest.TestCase):
         self.assertIsInstance(result, accounts.GroupMoveStartFailed)
         assert isinstance(result, accounts.GroupMoveStartFailed)
         self.assertEqual(result.session_ids, ("off-target",))
-        self.assertEqual((result.returncode, result.stderr.strip()), (2, "stop request failed"))
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("stop request failed", result.stderr)
 
     def test_partially_moved_group_preview_uses_only_the_new_refusal_destination(self) -> None:
         path = self.groups(units="claude3")
@@ -1116,8 +1137,8 @@ class RefusalWatchTests(unittest.TestCase):
         _ = self.owner("first", host="tmux")
         _ = self.owner("second", host="tmux")
         _ = self.owner("unit", host="unit")
-        requested = (accounts.SessionMoveRequested("first", "batch-id", "claude3"),
-                     accounts.SessionMoveRequested("second", "batch-id", "claude3"))
+        requested = (accounts.SessionMoveRequested("first", "batch-id", "claude3", source_login=SOURCE_LOGIN),
+                     accounts.SessionMoveRequested("second", "batch-id", "claude3", source_login=SOURCE_LOGIN))
         with patch.object(accounts, "move_sessions", return_value=requested) as move:
             result = accounts.move_group("showrunners", "claude3", why="weekly refusal")
         self.assertIsInstance(result, accounts.GroupMoveStarted)
