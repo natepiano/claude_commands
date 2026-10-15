@@ -583,7 +583,7 @@ print('two homes isolated; recorder lock retained; caller restored')
                 "",
                 "| Scope   |   % |  Elapsed |         ETA | Unchanged |              ETA low |             ETA high |",
                 "| ------- | --: | -------: | ----------: | --------- | -------------------: | -------------------: |",
-                "| Project |  80 | 00:01:40 | today 05:35 |           | today 05:35 (-00:00) | today 05:35 (+00:00) |",
+                "| Project |  80 | 00:01:40 | today 05:40 |           | today 05:36 (-00:03) | today 05:46 (+00:06) |",
                 "| Phase 3 |  25 | 00:01:40 | today 05:40 |           | today 05:36 (-00:03) | today 05:46 (+00:06) |",
                 "",
                 "**Phase 3: Retry handling**",
@@ -624,7 +624,7 @@ print('two homes isolated; recorder lock retained; caller restored')
             at=started_at + 160,
         )
         self.assertIn(
-            "| Project |  80 | 00:02:40 | today 05:36 | 00:01:00  |",
+            "| Project |  80 | 00:02:40 | today 05:44 | 00:01:00  |",
             unchanged_header,
         )
         self.assertIn(
@@ -659,7 +659,7 @@ print('two homes isolated; recorder lock retained; caller restored')
             at=started_at + 180,
         )
         self.assertIn(
-            "| Project |  85 | 00:03:00 | today 05:36 |           |",
+            "| Project |  85 | 00:03:00 | today 05:45 |           |",
             independently_changed,
         )
         self.assertIn(
@@ -1185,7 +1185,7 @@ print('two homes isolated; recorder lock retained; caller restored')
                     "",
                     "| Scope   |   % |  Elapsed |         ETA | Unchanged |              ETA low |             ETA high |",
                     "| ------- | --: | -------: | ----------: | --------- | -------------------: | -------------------: |",
-                    "| Project |  40 | 00:01:40 | today 05:37 |           | today 05:36 (-00:00) | today 05:38 (+00:01) |",
+                    "| Project |  40 | 00:01:40 | today 05:38 |           | today 05:37 (-00:01) | today 05:41 (+00:02) |",
                     "| Phase 3 |  30 | 00:01:40 | today 05:38 |           | today 05:37 (-00:01) | today 05:41 (+00:02) |",
                     "",
                     "**Phase 3: Retry handling**",
@@ -5468,6 +5468,104 @@ class PublicPhaseHelperTests(unittest.TestCase):
             {"PLAN_DELEGATE_HISTORY_DIR": str(self.root / "history")},
         ):
             self.assertEqual(progress_history.plan_runs(plan), [])
+
+
+WorkSeconds = Callable[[list[dict[str, object]], str, float, float], int]
+SummaryTable = Callable[[str, dict[str, int], dict[str, int], dict[str, object], float, float, float], list[str]]
+CalibrationSamples = Callable[[list[dict[str, object]]], list[dict[str, object]]]
+
+
+def private(name: str) -> object:
+    found = vars(progress_history).get(name)
+    if not callable(found):
+        raise AssertionError(f"progress recorder function is unavailable: {name}")
+    return found
+
+
+def window(kind: str, key: str, started_at: float, finished_at: float | None) -> list[dict[str, object]]:
+    """A pass or activity window of phase `p`, open when `finished_at` is None."""
+    id_field = f"{kind}_instance_id"
+    events: list[dict[str, object]] = [
+        {"phase_instance_id": "p", "event_type": f"{kind}_started", id_field: key, "timestamp_epoch": started_at}
+    ]
+    if finished_at is not None:
+        events.append(
+            {"phase_instance_id": "p", "event_type": f"{kind}_finished", id_field: key, "timestamp_epoch": finished_at}
+        )
+    return events
+
+
+class EtaWorkClockTests(unittest.TestCase):
+    """The phase clock leaves idle stretches out, and the project never lands before its phase.
+
+    herdr-trial, 2026-10-15: a phase whose clock ran through a night quoted the next
+    evening for an hour of work, and the project row arrived hours before it.
+    """
+
+    @property
+    def grace(self) -> int:
+        grace = vars(progress_history).get("IDLE_GRACE_SECONDS")
+        if not isinstance(grace, int):
+            raise AssertionError("progress recorder idle grace is unavailable")
+        return grace
+
+    def work_seconds(self, events: list[dict[str, object]], phase_instance_id: str, started_at: float, until: float) -> int:
+        return cast(WorkSeconds, private("_work_seconds"))(events, phase_instance_id, started_at, until)
+
+    def test_an_overnight_gap_between_dispatches_counts_only_the_grace(self) -> None:
+        night = 10 * 3600
+        events = window("pass", "a", 100, 1_100) + window("pass", "b", 1_100 + night, 2_100 + night)
+        self.assertEqual(self.work_seconds(events, "p", 0, 2_100 + night), 100 + 1_000 + self.grace + 1_000)
+
+    def test_an_open_window_counts_up_to_now(self) -> None:
+        events = window("activity", "a", 0, None)
+        self.assertEqual(self.work_seconds(events, "p", 0, 5 * 3600), 5 * 3600)
+
+    def test_a_wait_after_the_last_window_counts_only_the_grace(self) -> None:
+        events = window("pass", "a", 0, 600)
+        self.assertEqual(self.work_seconds(events, "p", 0, 600 + 8 * 3600), 600 + self.grace)
+
+    def test_overlapping_windows_count_once(self) -> None:
+        events = window("pass", "a", 0, 1_000) + window("activity", "b", 500, 1_500)
+        self.assertEqual(self.work_seconds(events, "p", 0, 1_500), 1_500)
+
+    def test_another_phase_windows_do_not_count(self) -> None:
+        events = [{**event, "phase_instance_id": "q"} for event in window("pass", "a", 0, 10_000)]
+        events += window("pass", "b", 0, 600)
+        self.assertEqual(self.work_seconds(events, "p", 0, 10_000), 600 + self.grace)
+
+    def test_a_phase_with_no_windows_keeps_the_wall_clock(self) -> None:
+        self.assertEqual(self.work_seconds([], "p", 1_000, 1_000 + 9 * 3600), 9 * 3600)
+
+    def test_the_project_eta_is_never_earlier_than_its_phase(self) -> None:
+        summary_table = cast(SummaryTable, private("_summary_table"))
+        # The project reads 90% after ten hours, an hour left; the phase reads 20%
+        # after one hour, four left. Unfloored, the project lands three hours early.
+        project = {"percent": 90, "elapsed": 10 * 3600, "unchanged": 0}
+        phase = {"percent": 20, "elapsed": 3600, "unchanged": 0}
+        rows = [
+            [cell.strip() for cell in line.strip("|").split("|")]
+            for line in summary_table("7", project, phase, {}, 10.0, 0.0, 0.0)
+            if line.startswith("| Project") or line.startswith("| Phase")
+        ]
+        project_row, phase_row = rows
+        self.assertEqual(project_row[3], phase_row[3])
+        self.assertEqual(project_row[5:], phase_row[5:])
+
+    def test_calibration_measures_time_spent_in_work_time(self) -> None:
+        calibration_samples = cast(CalibrationSamples, private("_calibration_samples"))
+        night = 10 * 3600
+        phase: dict[str, object] = {"phase_instance_id": "p", "phase_started_at": 0}
+        events: list[dict[str, object]] = [
+            *window("pass", "a", 0, 3_600),
+            *window("pass", "b", 3_600 + night, 7_200 + night),
+            {**phase, "event_type": "progress_reported", "timestamp_epoch": 7_000 + night, "raw_percent": 90, "percent": 90},
+            {**phase, "event_type": "phase_finished", "status": "completed", "timestamp_epoch": 7_200 + night},
+        ]
+        sample, = calibration_samples(events)
+        # Work time: 3600 + grace + 3400 of 3600 + grace + 3600. Wall time read 79%.
+        expected = 100.0 * (7_000 + self.grace) / (7_200 + self.grace)
+        self.assertAlmostEqual(cast(float, sample["temporal_percent"]), expected, places=3)
 
 
 if __name__ == "__main__":
