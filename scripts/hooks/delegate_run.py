@@ -19,9 +19,16 @@ import os
 import sys
 import time
 from pathlib import Path
-from typing import cast
+from typing import TYPE_CHECKING, cast
 
-ACTIVE_DIR = Path(os.environ.get("PLAN_DELEGATE_ACTIVE_DIR", "/tmp/claude/delegate/active"))
+if TYPE_CHECKING:
+    from ..lib import unit_runs
+else:
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
+    import unit_runs
+
+# A test's own marker folder; unset, the marker is under either run-folder name.
+ACTIVE_OVERRIDE = os.environ.get("PLAN_DELEGATE_ACTIVE_DIR")
 
 # Long enough to span a slow delegate build plus the user's time at a gate, short
 # enough that yesterday's abandoned run cannot block today's turns. It bounds
@@ -29,13 +36,9 @@ ACTIVE_DIR = Path(os.environ.get("PLAN_DELEGATE_ACTIVE_DIR", "/tmp/claude/delega
 # writing.
 MAX_AGE_SECONDS = 12 * 60 * 60
 
-# heartbeat_watch.sh beats every 60s by default (its INTERVAL_SECS). Three beats
-# of slack distinguishes "delegate is working" from "the log stopped moving".
-LIVE_HEARTBEAT_SECONDS = 180
-
 
 def marker_path(session_id: str) -> Path:
-    return ACTIVE_DIR / session_id
+    return unit_runs.marker(session_id, ACTIVE_OVERRIDE)
 
 
 def _recently_active(session_dir: Path) -> bool:
@@ -81,10 +84,10 @@ def delegate_working(session_dir: Path) -> bool:
     is nothing to gain by refusing that stop.
     """
     try:
-        age = time.time() - (session_dir / "heartbeat.log").stat().st_mtime
+        age = time.time() - (session_dir / unit_runs.HEARTBEAT).stat().st_mtime
     except OSError:
         return False
-    return age <= LIVE_HEARTBEAT_SECONDS
+    return age <= unit_runs.LIVE_HEARTBEAT_SECS
 
 
 def _text(path: Path) -> str:

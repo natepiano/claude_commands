@@ -367,6 +367,7 @@ class ReviewLauncherPassTests(unittest.TestCase):
         # directory.
         _ = shutil.copy2(DELEGATE_DIR.parent / "lib" / "py", lib / "py")
         _ = shutil.copy2(DELEGATE_DIR.parent / "lib" / "user_zone.py", lib / "user_zone.py")
+        _ = shutil.copy2(DELEGATE_DIR.parent / "lib" / "unit_runs.py", lib / "unit_runs.py")
         for name in (
             "review.sh", "implement.sh", "progress_history.py", "findings.py",
             "board.sh", "worker_name.sh", "worker_state.py",
@@ -712,7 +713,7 @@ import sys
 
 if sys.argv[1] in ("start-pass", "finish-pass"):
     with Path(os.environ["STUB_PASS_CALLS"]).open("a") as calls:
-        calls.write(json.dumps({"verb": sys.argv[1]}) + "\\n")
+        calls.write(json.dumps({"verb": sys.argv[1], "argv": sys.argv[2:]}) + "\\n")
 os.execv(sys.executable, [sys.executable, str(Path(__file__).with_name("progress_history_real.py")), *sys.argv[1:]])
 ''', encoding="utf-8")
         calls = self.root / "pass-calls.jsonl"
@@ -899,6 +900,19 @@ os.execv(sys.executable, [sys.executable, str(Path(__file__).with_name("progress
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual([call["verb"] for call in self.call_records("pass-calls.jsonl")],
                          ["start-pass", "finish-pass"])
+
+    def test_a_review_naming_an_older_open_phase_starts_its_pass_in_that_phase(self) -> None:
+        session = self.start_implementation("named-phase-pass")
+        self.finish_implementation(session)
+        self.recorder("start-phase", "--session-dir", str(session), "--phase-id", "4", "--phase-title", "Next phase")
+        environment = self.pool_fixture()
+        self.trace_pass_recorder(environment)
+        command = self.pool_command(session)
+        command[2:2] = ["--phase", "3"]
+        result = subprocess.run(command, env=environment, capture_output=True, text=True, check=False, timeout=300)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        start, = [call for call in self.call_records("pass-calls.jsonl") if call["verb"] == "start-pass"]
+        self.assertEqual(cast("list[str]", start["argv"])[-2:], ["--phase-id", "3"])
 
     def test_ui_pool_reviewed_turn_records_ux_kind_without_pass_calls_at_either_start_site(self) -> None:
         session = self.start_implementation("ui-no-pass")

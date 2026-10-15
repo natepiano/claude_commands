@@ -19,8 +19,8 @@ The pieces this depends on, each verified against codex 0.162.0:
 
 `start` deliberately blocks for the delegate's lifetime. Launches that return
 immediately would break every caller that waits on a pid, so this stays in the
-foreground and implement.sh's `wait`, heartbeat watch, awake timer, and pass
-recording work unchanged.
+foreground and implement.sh's `wait`, heartbeat watch, and pass recording work
+unchanged.
 
 Verbs:
   serve  Start the session's app-server and record where it listens.
@@ -77,6 +77,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Literal, NoReturn, NotRequired, TextIO, TypedDict, cast, final
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from scripts.lib import unit_runs
 from scripts.usage import agents_log
 from scripts.whoami.agent_accounts import (
     workers_home, codex_home, codex_home_display, user_zone,
@@ -3613,8 +3614,10 @@ def _reap(pid: int) -> bool:
     return True
 
 
-# Where the run-active markers live.
-SWEEP_ROOT = Path("/tmp/claude/delegate")
+# The run roots, each holding run folders and their run-active markers: unit/, and delegate/ for
+# a run started before the rename. A sweep always judges a server against every real root, since a
+# server another root owns would otherwise look unowned.
+SWEEP_ROOTS = unit_runs.run_roots()
 # How long a server and its run folder must have sat untouched before it counts as unused: the
 # one figure behind both the server's own watcher and the sweep.
 SERVER_IDLE_SECS = 1800.0
@@ -3622,7 +3625,7 @@ SERVER_IDLE_SECS = 1800.0
 WATCH_WAKE_SECS = 300
 # Files in a run folder whose change means the run is still working. `ensure_server` touches the
 # server's record on every use.
-SWEEP_ACTIVITY_FILES = ("heartbeat.log", "board.log", ROSTER_FILE, SERVER_LOG, SERVER_FILE)
+SWEEP_ACTIVITY_FILES = (unit_runs.HEARTBEAT, "board.log", ROSTER_FILE, SERVER_LOG, SERVER_FILE)
 SERVER_ARGUMENTS = ("app-server", "--listen")
 
 
@@ -3824,25 +3827,25 @@ def _retired_file_names_server(path: Path, pid: int, port: int) -> bool:
 
 
 def _server_ownership(
-    root: Path | None, pid: int, port: int, log_folder: Path | None
+    roots: tuple[Path, ...] | None, pid: int, port: int, log_folder: Path | None
 ) -> ServerOwnership:
     """Resolve the record that owns a server; a live current owner wins stale duplicates."""
-    if root is None:
+    if roots is None:
         folders = (log_folder,) if log_folder is not None else ()
     else:
-        current_folders = {path.parent for path in root.glob(f"*/{SERVER_FILE}")}
-        retired_folders = {path.parent for path in root.glob(f"*/{RETIRED_FILE}")}
+        current_folders = {path.parent for root in roots for path in root.glob(f"*/{SERVER_FILE}")}
+        retired_folders = {path.parent for root in roots for path in root.glob(f"*/{RETIRED_FILE}")}
         folders = tuple(sorted(current_folders | retired_folders, key=str))
     current_owners = tuple(
         folder
         for folder in folders
         if _record_names_server(_read_json_object(folder / SERVER_FILE), pid, port)
     )
-    if root is not None:
+    if roots is not None:
         for folder in current_owners:
             quiet = _quiet_secs(folder, time.time())
             if (
-                _marked_active(root, folder)
+                _marked_active(roots, folder)
                 or _running_roster_workers(folder)
                 or _live_launchers(folder)
                 or (quiet is not None and quiet < SERVER_IDLE_SECS)
@@ -3858,10 +3861,10 @@ def _server_ownership(
     return UnownedServerWithoutLog()
 
 
-def _marked_active(root: Path, folder: Path) -> bool:
+def _marked_active(roots: tuple[Path, ...], folder: Path) -> bool:
     """Whether a run-active marker names `folder`. A marker that cannot be read counts as naming it."""
-    active = root / "active"
-    for marker in sorted(active.iterdir()) if active.is_dir() else []:
+    actives = [root / "active" for root in roots]
+    for marker in (found for active in actives if active.is_dir() for found in sorted(active.iterdir())):
         try:
             lines = marker.read_text(encoding="utf-8").splitlines()
         except OSError:
@@ -3945,19 +3948,19 @@ def _busy_threads(port: int, workers: dict[str, str]) -> tuple[str, ...]:
         client.close()
 
 
-def _judge(root: Path | None, pid: int, port: int, age: float,
+def _judge(roots: tuple[Path, ...] | None, pid: int, port: int, age: float,
            clients: int) -> SweepJudgment:
     """Judge one running app-server without erasing its ownership state.
 
-    `root` holds the run-active markers. A server judging itself passes None: a stopped server
+    `roots` hold the run-active markers. A server judging itself passes None: a stopped server
     comes back at the next use, so a run that is only between dispatches does not need it kept.
     """
     log_folder = _server_folder(pid)
-    ownership = _server_ownership(root, pid, port, log_folder)
+    ownership = _server_ownership(roots, pid, port, log_folder)
     folder = None if isinstance(ownership, UnownedServerWithoutLog) else ownership.session_dir
     exists = folder is not None and folder.is_dir()
-    lifecycle: RunLifecycle = UncheckedRunLifecycle() if root is None or folder is None else CheckedRunLifecycle(
-        _marked_active(root, folder),
+    lifecycle: RunLifecycle = UncheckedRunLifecycle() if roots is None or folder is None else CheckedRunLifecycle(
+        _marked_active(roots, folder),
         _running_roster_workers(folder) if exists else (),
     )
     facts = ServerFacts(
@@ -3972,7 +3975,7 @@ def _judge(root: Path | None, pid: int, port: int, age: float,
 
 
 def _stop_unused(
-    root: Path | None, pid: int, port: int, ownership: ServerOwnership
+    roots: tuple[Path, ...] | None, pid: int, port: int, ownership: ServerOwnership
 ) -> bool:
     """Stop a server a first look called unused, if a second look at this moment agrees.
 
@@ -3980,15 +3983,15 @@ def _stop_unused(
     `ensure_server` meanwhile waits and then starts a server of its own. A deleted folder has no
     launcher to wait and is not created again for the lock."""
     if isinstance(ownership, UnownedServerWithoutLog):
-        return _stop_unused_with_lock_held(root, pid, port)
+        return _stop_unused_with_lock_held(roots, pid, port)
     folder = ownership.session_dir
     if not folder.is_dir():
-        return _stop_unused_with_lock_held(root, pid, port)
+        return _stop_unused_with_lock_held(roots, pid, port)
     with _server_lock(str(folder)):
-        return _stop_unused_with_lock_held(root, pid, port)
+        return _stop_unused_with_lock_held(roots, pid, port)
 
 
-def _stop_unused_with_lock_held(root: Path | None, pid: int, port: int) -> bool:
+def _stop_unused_with_lock_held(roots: tuple[Path, ...] | None, pid: int, port: int) -> bool:
     """Repeat an unused-server judgment, then stop and forget that exact owner."""
     try:
         running = {(found, at): age for found, at, age in _running_servers()}
@@ -3999,7 +4002,7 @@ def _stop_unused_with_lock_held(root: Path | None, pid: int, port: int) -> bool:
     age = running.get((pid, port))
     if age is None:
         return False
-    judgment = _judge(root, pid, port, age, clients.get(port, 0))
+    judgment = _judge(roots, pid, port, age, clients.get(port, 0))
     if not isinstance(judgment.verdict, ServerUnused) or not _reap(pid):
         return False
     if isinstance(judgment.ownership, UnownedServerWithoutLog):
@@ -4047,10 +4050,20 @@ def command_idle_stop(args: argparse.Namespace) -> int:
     return 1
 
 
+def _sweep_roots(args: argparse.Namespace) -> tuple[Path, ...]:
+    """The roots `--root` names: every real root when it names one of them, since a run under the
+    other root keeps its server too."""
+    given = _as_str(_attr(args, "root"))
+    if not given:
+        return SWEEP_ROOTS
+    real = {root.resolve() for root in SWEEP_ROOTS}
+    return SWEEP_ROOTS if Path(given).resolve() in real else (Path(given),)
+
+
 def command_sweep(args: argparse.Namespace) -> int:
     """Print every running app-server with whether anything still needs it. Stops one only
     under `--stop`, and then only a server two looks in a row called unused."""
-    root = Path(_as_str(_attr(args, "root")) or SWEEP_ROOT)
+    roots = _sweep_roots(args)
     stop = _attr(args, "stop") is True
     try:
         servers, clients = _running_servers(), _client_counts()
@@ -4059,12 +4072,12 @@ def command_sweep(args: argparse.Namespace) -> int:
         return 1
     unused = stopped = 0
     for pid, port, age in sorted(servers):
-        judgment = _judge(root, pid, port, age, clients.get(port, 0))
+        judgment = _judge(roots, pid, port, age, clients.get(port, 0))
         label = "unused" if isinstance(judgment.verdict, ServerUnused) else "in use"
         reason = judgment.verdict.reason
         if isinstance(judgment.verdict, ServerUnused):
             unused += 1
-            if stop and _stop_unused(root, pid, port, judgment.ownership):
+            if stop and _stop_unused(roots, pid, port, judgment.ownership):
                 stopped += 1
                 label = "stopped"
             elif stop:
@@ -4085,11 +4098,11 @@ SEND_SCRIPT = Path(__file__).resolve().parent.parent / "message" / "send.py"
 NOTICE_TIMEOUT_SECS = 120
 
 
-def _marker_sessions(root: Path, folder: Path) -> list[str]:
+def _marker_sessions(roots: tuple[Path, ...], folder: Path) -> list[str]:
     """The sessions whose run-active marker names `folder`: the marker's file name is the session id."""
-    active = root / "active"
+    actives = [root / "active" for root in roots]
     holders: list[str] = []
-    for marker in sorted(active.iterdir()) if active.is_dir() else []:
+    for marker in (found for active in actives if active.is_dir() for found in sorted(active.iterdir())):
         try:
             lines = marker.read_text(encoding="utf-8").splitlines()
         except OSError:
@@ -4129,7 +4142,7 @@ def command_signin_changed(args: argparse.Namespace) -> int:
     nothing uses it, otherwise by its watcher once nothing does. Run twice for one change, the
     second run finds nothing older and moves nothing.
     """
-    root = Path(_as_str(_attr(args, "root")) or SWEEP_ROOT)
+    roots = _sweep_roots(args)
     home = codex_home()
     changed = _sign_in_changed_at(home)
     if changed is None:
@@ -4137,7 +4150,7 @@ def command_signin_changed(args: argparse.Namespace) -> int:
         return 0
     at = datetime.fromtimestamp(changed).astimezone(user_zone()).strftime("%H:%M %Z")
     moved = 0
-    for record_path in sorted(root.glob(f"*/{SERVER_FILE}")):
+    for record_path in sorted(path for root in roots for path in root.glob(f"*/{SERVER_FILE}")):
         folder = record_path.parent
         with _server_lock(str(folder)):
             record = _read_json_object(record_path)
@@ -4156,7 +4169,7 @@ def command_signin_changed(args: argparse.Namespace) -> int:
                 + "run's workers move to a new server, an idle worker at its next turn and a worker mid-turn when "
                 + f"that turn ends; the old server {old}.")
         _log_server(str(folder), line)
-        for session_id in _marker_sessions(root, folder):
+        for session_id in _marker_sessions(roots, folder):
             _notify_holder(session_id, line, CodexNoticeKind.SIGN_IN_CHANGED)
         print(line)
         moved += 1
@@ -4169,7 +4182,7 @@ def retire_workers_servers(workers_home: Path, label: str, *, dry_run: bool = Fa
     notices: dict[str, list[str]] = {}
     lines: list[str] = []
     at = datetime.now().astimezone(user_zone()).strftime("%H:%M %Z")
-    for record_path in sorted(SWEEP_ROOT.glob(f"*/{SERVER_FILE}")):
+    for record_path in sorted(path for root in SWEEP_ROOTS for path in root.glob(f"*/{SERVER_FILE}")):
         folder = record_path.parent
         with _server_lock(str(folder)):
             record = _read_json_object(record_path)
@@ -4189,7 +4202,7 @@ def retire_workers_servers(workers_home: Path, label: str, *, dry_run: bool = Fa
         if not dry_run and not _stop_unused(None, pid, port, RetiredRunServer(folder)):
             _ = _start_watcher(str(folder), pid, port)
         lines.append(line)
-        for session_id in _marker_sessions(SWEEP_ROOT, folder):
+        for session_id in _marker_sessions(SWEEP_ROOTS, folder):
             notices.setdefault(session_id, []).append(folder.name)
     if not dry_run:
         for session_id, runs in notices.items():

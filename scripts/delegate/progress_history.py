@@ -26,6 +26,7 @@ from typing import NamedTuple, NoReturn, TypedDict, cast
 
 if not __package__:
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from scripts.lib import unit_runs  # noqa: E402
 from scripts.lib.user_zone import user_zone  # noqa: E402
 
 
@@ -1259,7 +1260,6 @@ def _close_slot_pass(
     slot: str,
     status: str,
     now: float,
-    agent_awake_seconds: int = -1,
 ) -> bool:
     """Close one slot's open pass, reporting whether there was one to close.
 
@@ -1280,17 +1280,6 @@ def _close_slot_pass(
         0,
         int(now - _number(current_pass.get("started_at"), now)),
     )
-    # Elapsed time cannot separate an agent that worked for fourteen hours from
-    # a laptop suspended for six of them. heartbeat_watch.sh counts only the
-    # intervals it slept all the way through, so its total is time the machine
-    # was awake with the delegate alive, to one beat interval. Absent when the
-    # loop never beat: a pass shorter than one interval has nothing to report,
-    # and a zero would read as a measurement instead of the lack of one. It
-    # describes the delegate process, not this window -- review.sh starts the
-    # loop before an early review's pass opens, so that pass can report more
-    # awake seconds than it was open.
-    if agent_awake_seconds >= 0:
-        event["agent_awake_seconds"] = agent_awake_seconds
     _append_event(state, event)
     current_pass["status"] = status
     current_pass["finished_at"] = now
@@ -1503,7 +1492,13 @@ def _start_pass(args: argparse.Namespace) -> None:
     )
     team_slot = _team_slot()
     state = _read_state(session_dir)
-    phase = _object_dict(state.get("phase"))
+    # A phase running beside the current one names itself, so its pass is not stamped with
+    # the current phase's.
+    phase_id = _optional_arg(args, "phase_id")
+    phase = _open_phase_named(state, phase_id) if phase_id else _object_dict(state.get("phase"))
+    if phase_id and phase is None:
+        open_ids = ", ".join(_open_phase_ids(state)) or "none"
+        raise SystemExit(f"Phase {phase_id} is not open; open phases: {open_ids}")
     if phase is None or _string(phase.get("status")) != "active":
         raise SystemExit("Start a phase before starting a pass")
     now = now_epoch()
@@ -1558,14 +1553,7 @@ def _finish_pass(args: argparse.Namespace) -> None:
     # still running.
     slot = _team_slot()
     state = _read_state(session_dir)
-    closed = _close_slot_pass(
-        session_dir,
-        state,
-        slot,
-        status,
-        now_epoch(),
-        _arg_integer(args, "agent_awake_seconds", -1),
-    )
+    closed = _close_slot_pass(session_dir, state, slot, status, now_epoch())
     if orphaned and not closed:
         raise SystemExit(
             "No pass is open in this slot, so no launcher was orphaned and "
@@ -2223,7 +2211,7 @@ def _restart_unit_notifier(session_dir: Path) -> int | None:
         environment["NOTIFIER_NOW_EPOCH"] = configured_now
     try:
         result = subprocess.run(
-            [zsh, str(notifier), "restart", f"delegate-{session_dir.name}"],
+            [zsh, str(notifier), "restart", unit_runs.instance(session_dir)],
             capture_output=True,
             text=True,
             timeout=10,
@@ -4768,6 +4756,7 @@ def _build_parser() -> argparse.ArgumentParser:
     _ = start_pass.add_argument("--called-family", required=True)
     _ = start_pass.add_argument("--called-model", required=True)
     _ = start_pass.add_argument("--called-effort", default="unset")
+    _ = start_pass.add_argument("--phase-id", default="", help="the open phase this pass belongs to; default the current one")
     start_pass.set_defaults(handler=_start_pass)
 
     finish_pass = subparsers.add_parser("finish-pass")
@@ -4782,13 +4771,6 @@ def _build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="close this slot's open pass when the unit director killed its "
         + "launcher (--status canceled only)",
-    )
-    _ = finish_pass.add_argument(
-        "--agent-awake-seconds",
-        type=int,
-        default=-1,
-        help="seconds the heartbeat loop counted while the delegate ran, which "
-        + "excludes time the machine was suspended; omit when it counted none",
     )
     finish_pass.set_defaults(handler=_finish_pass)
 

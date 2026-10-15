@@ -124,6 +124,7 @@ def common_session(
         "name": name or session_id,
         "cwd": cwd or f"/tmp/{session_id}",
         "status": "idle",
+        "updated_at": 0,
         "model": model or inventory.NoReplyYet(kind="no reply yet"),
         "checkout": checkout(),
         "run_dirs": list(run_dirs or []),

@@ -640,6 +640,7 @@ print("SENT: delivered")
 
     def test_report_names_for_unit_and_build_instances(self) -> None:
         for name, words in (
+            ("unit-abc", "status reports"),
             ("delegate-abc", "status reports"),
             ("report-builds", "build report"),
         ):

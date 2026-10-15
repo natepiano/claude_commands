@@ -26,11 +26,13 @@ from pathlib import Path
 from typing import NamedTuple, cast
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "whoami"))
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
 
 import add_showrunner
 import showrunners
 import unit_effort
 import unit_lookup
+import unit_runs
 import herdr
 from session_pane import HerdrFailure, read_place, type_place, where_place
 from add_unit import (Production, Refusal, cell_value, commit_paths, plan_cell_is_retired, read_production,
@@ -60,8 +62,8 @@ def _git(where: Path, *arguments: str) -> subprocess.CompletedProcess[str]:
     return subprocess.run(["git", "-C", str(where), *arguments], capture_output=True, text=True, check=False)
 
 
-def active_dir() -> Path:
-    return Path(os.environ.get("PLAN_DELEGATE_ACTIVE_DIR") or "/tmp/claude/delegate/active")
+def run_marker(session_id: str) -> Path:
+    return unit_runs.marker(session_id, os.environ.get("PLAN_DELEGATE_ACTIVE_DIR"))
 
 
 def _unit_row(lines: list[str], unit: str) -> dict[str, str]:
@@ -98,7 +100,7 @@ def _quiet(unit: str, marked: unit_lookup.MarkedUnit, claude: unit_lookup.LiveCl
 
 def _settled(unit: str, claude: unit_lookup.LiveClaude, worktree: Path) -> None:
     """Refuse a unit with a run open, whose workers end only with the run, or with work uncommitted."""
-    if (active_dir() / claude.session_id).exists():
+    if run_marker(claude.session_id).exists():
         raise Refusal(f"{unit} has a /unit:delegate run open, and its workers with it; the run finishes first")
     status = _git(worktree, "status", "--porcelain")
     if status.returncode != 0:

@@ -24,6 +24,7 @@ from unittest import mock
 from zoneinfo import ZoneInfo
 
 import build_hold
+import unit_runs
 from sessions import SessionRecord
 from user_zone import user_zone
 
@@ -113,12 +114,25 @@ class IsolatedBuildHoldTest(unittest.TestCase):
         self.addCleanup(self.wait_for_detached_writers)
 
     def wait_for_detached_writers(self) -> None:
-        """Wait until no process a test started holds its FIFO writer."""
+        """Wait until no process a test started holds its FIFO writer.
+
+        A child opens its writer only when its interpreter loads
+        sitecustomize. Under load the FIFO can report EOF before a slow child
+        gets there, and the read then finds that child's writer and no data,
+        so wait again until a read returns EOF.
+        """
         os.close(self.lifetime_writer)
+        deadline = time.monotonic() + 30
         try:
-            readable, _, _ = select.select([self.lifetime_reader], [], [], 30)
-            self.assertTrue(readable, "Detached children did not finish before scratch cleanup")
-            self.assertEqual(os.read(self.lifetime_reader, 1), b"")
+            while True:
+                remaining = max(deadline - time.monotonic(), 0)
+                readable, _, _ = select.select([self.lifetime_reader], [], [], remaining)
+                self.assertTrue(readable, "Detached children did not finish before scratch cleanup")
+                try:
+                    if os.read(self.lifetime_reader, 1) == b"":
+                        return
+                except BlockingIOError:
+                    pass
         finally:
             os.close(self.lifetime_reader)
 
@@ -163,6 +177,19 @@ class OwningSessionTests(IsolatedBuildHoldTest):
             "PLAN_DELEGATE_SESSION_DIR": str(other_run),
         }):
             self.assertEqual(build_hold.owning_session(), build_hold.OwningSession("board-owner"))
+
+    def test_a_marker_under_either_run_folder_name_owns_the_run(self) -> None:
+        for name in ("unit", "delegate"):
+            active = self.scratch / name / "active"
+            active.mkdir(parents=True)
+            _ = (active / f"{name}-owner").write_text(f"{self.scratch / name / 'run'}\n")
+        environment = {name: value for name, value in os.environ.items() if name != "PLAN_DELEGATE_ACTIVE_DIR"}
+        with mock.patch.object(unit_runs, "RUN_ROOT", self.scratch / "unit"), \
+                mock.patch.object(unit_runs, "FORMER_RUN_ROOT", self.scratch / "delegate"):
+            for name in ("unit", "delegate"):
+                environment["PLAN_DELEGATE_BOARD_DIR"] = str(self.scratch / name / "run")
+                with mock.patch.dict(os.environ, environment, clear=True):
+                    self.assertEqual(build_hold.owning_session(), build_hold.OwningSession(f"{name}-owner"))
 
     def test_marker_content_ignores_surrounding_whitespace(self) -> None:
         marker = self.marker("run-owner", self.delegate_run)

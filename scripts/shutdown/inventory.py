@@ -17,10 +17,11 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Literal, NotRequired, TypedDict, cast
 
 SCRIPTS = Path(__file__).resolve().parents[1]
-for dependency in ("whoami", "message", "production", "herdr", "delegate"):
+for dependency in ("whoami", "message", "production", "herdr", "delegate", "lib"):
     sys.path.insert(0, str(SCRIPTS / dependency))
 
 import account
+import unit_runs
 if TYPE_CHECKING:
     from ..delegate.worker_state import worker_ledger
 else:
@@ -234,6 +235,7 @@ class SessionFields(TypedDict):
     # Records from before account-directory capture use the default directory.
     config_dir: NotRequired[str]
     status: str
+    updated_at: int
     model: LastModel
     checkout: CheckoutState
     run_dirs: list[str]
@@ -680,7 +682,7 @@ def _parse_codex_server(value: object, place: str) -> CodexServer:
     }
 
 
-def parse_session(value: object, place: str) -> Session:
+def parse_session(value: object, place: str, *, require_updated_at: bool = False) -> Session:
     """Validate and return one session from an inventory or shutdown record."""
     data = _wire_object(value, place)
     kind = _wire_kind(data, place)
@@ -710,6 +712,11 @@ def parse_session(value: object, place: str) -> Session:
         "cwd": _wire_string(_wire_required(data, "cwd", place), f"{place}.cwd"),
         "status": _wire_string(
             _wire_required(data, "status", place), f"{place}.status"
+        ),
+        # Old shutdown records predate this field; zero cannot answer a pause.
+        "updated_at": _wire_integer(
+            _wire_required(data, "updated_at", place) if require_updated_at else data.get("updated_at", 0),
+            f"{place}.updated_at",
         ),
         "model": _parse_model(
             _wire_required(data, "model", place), f"{place}.model"
@@ -759,7 +766,7 @@ def parse_inventory(text: str) -> Inventory:
         raise InvalidInventory("inventory is not valid JSON") from None
     data = _wire_object(value, "inventory")
     parsed_sessions = [
-        parse_session(item, f"inventory.sessions[{index}]")
+        parse_session(item, f"inventory.sessions[{index}]", require_updated_at=True)
         for index, item in enumerate(
             _wire_list(
                 _wire_required(data, "sessions", "inventory"),
@@ -844,8 +851,8 @@ def _notifier_state_dir() -> Path:
     return Path(os.environ.get("NOTIFIER_STATE_DIR", str(Path.home() / ".local/state/notifier")))
 
 
-def _delegate_root() -> Path:
-    return Path(os.environ.get("SHUTDOWN_DELEGATE_ROOT", "/tmp/claude/delegate"))
+def _run_roots() -> tuple[Path, ...]:
+    return unit_runs.run_roots(os.environ.get("SHUTDOWN_DELEGATE_ROOT"))
 
 
 def _session_file(record: sessions.SessionRecord) -> SessionFile:
@@ -976,11 +983,12 @@ def _unit_sessions(runners: tuple[ShowrunnerRegistration, ...]) -> dict[str, Uni
 def _active_run_directories() -> dict[str, list[Path]]:
     """Every director-to-run mapping, including directors that have already exited."""
     found: dict[str, list[Path]] = {}
-    active = _delegate_root() / "active"
-    try:
-        mappings = sorted(active.iterdir())
-    except OSError:
-        return found
+    mappings: list[Path] = []
+    for root in _run_roots():
+        try:
+            mappings.extend(sorted((root / "active").iterdir()))
+        except OSError:
+            continue
     for mapping in mappings:
         if not mapping.is_file():
             continue
@@ -1583,6 +1591,7 @@ def inventory(
             "cwd": cwd,
             "config_dir": str(entry.config_dir),
             "status": _string(record.get("status"), "unknown"),
+            "updated_at": _wire_integer(record.get("updatedAt", 0), "session.updatedAt"),
             "model": _model(session_id, entry.config_dir),
             "checkout": _checkout(cwd),
             "run_dirs": [str(directory) for directory in directories],

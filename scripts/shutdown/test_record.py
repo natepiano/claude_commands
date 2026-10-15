@@ -88,6 +88,7 @@ def session(number: int = 1) -> inventory.TopLevelSession:
         name=f"Claude {number}",
         cwd=f"/tmp/checkout-{number}",
         status="idle",
+        updated_at=0,
         model=inventory.NoReplyYet(kind="no reply yet"),
         checkout=inventory.NotACheckout(kind="not a checkout"),
         run_dirs=[],
@@ -174,7 +175,7 @@ def account_hold(login: str = "owner@example.com") -> record.AccountHold:
 def owned_worker(owner: str = "session-1") -> inventory.WorkerSession:
     return inventory.WorkerSession(
         kind="worker", session_id="worker-1", pid=20001, proc_start="worker-start",
-        name="worker", cwd="/tmp/worker", status="idle",
+        name="worker", cwd="/tmp/worker", status="idle", updated_at=0,
         model=inventory.NoReplyYet(kind="no reply yet"),
         checkout=inventory.NotACheckout(kind="not a checkout"),
         run_dirs=[], codex_servers=[], timers=[], host=inventory.UnknownHost(kind="unknown"),
@@ -196,6 +197,55 @@ class SessionRecordTests(ShutdownTestCase):
             "HOME": str(self.root), "SHUTDOWN_STATE_DIR": str(self.root / "shutdown"),
         })))
         del context
+
+    def test_legacy_not_ready_failure_recovers_at_every_record_read_boundary(self) -> None:
+        for index, progress in enumerate(("waiting", "ready", "held by usage limit")):
+            with self.subTest(progress=progress):
+                saved = session_shutdown(index + 1, progress={"kind": "stop failed", "at": LATER,
+                    "reason": "session or worker is not idle and ready"})
+                saved["stop_issues"] = [record.NotReadyToStop(kind="not ready to stop", at=NOW,
+                    status="busy", progress=progress)]
+                directory = self.directory / "sessions"
+                directory.mkdir(parents=True, exist_ok=True)
+                _ = (directory / f"{saved["session"]["session_id"]}.json").write_text(json.dumps(saved))
+                expected: record.SessionProgress = {"kind": "waiting"} if progress == "waiting" else (
+                    record.SessionReadyToStop(kind="ready", at=NOW) if progress == "ready" else
+                    record.SessionHeldByUsageLimit(kind="held by usage limit", at=NOW))
+                identity = saved["session"]["session_id"]
+                for loaded in (record.find_session(saved["login"], identity),
+                               next(item for item in record.all_session_records() if item["session"]["session_id"] == identity),
+                               record.parse_session_records(json.dumps([saved]))[0]):
+                    assert loaded is not None
+                    self.assertEqual(loaded["progress"], expected)
+                    self.assertEqual(loaded["stop_issues"], saved["stop_issues"])
+                    self.assertFalse(record.stop_incomplete(loaded))
+
+    def test_old_account_record_recovers_not_ready_failure_before_conversion(self) -> None:
+        old = shutdown_record(progress={"kind": "stop failed", "at": LATER,
+            "reason": "session or worker is not idle and ready"})
+        old["entries"][0]["stop_issues"] = [record.NotReadyToStop(kind="not ready to stop",
+            at=NOW, status="busy", progress="ready")]
+        write_old(old)
+        loaded = record.find_session(old["login"], "session-1")
+        assert loaded is not None
+        self.assertEqual(loaded["progress"], {"kind": "ready", "at": NOW})
+        self.assertEqual(loaded["stop_issues"], old["entries"][0]["stop_issues"])
+
+    def test_real_stop_failure_with_not_ready_issue_is_not_normalized(self) -> None:
+        for number, reason, extra_issue in ((1, "signal refused", False),
+                (2, "session or worker is not idle and ready", True)):
+            with self.subTest(reason=reason, extra_issue=extra_issue):
+                saved = session_shutdown(number, progress={"kind": "stop failed", "at": LATER, "reason": reason})
+                saved["stop_issues"] = [record.NotReadyToStop(kind="not ready to stop", at=NOW,
+                    status="busy", progress="ready")]
+                if extra_issue:
+                    saved["stop_issues"].append(record.StillRunningAfterStop(kind="still running", at=LATER, reason="still alive"))
+                directory = self.directory / "sessions"
+                directory.mkdir(parents=True, exist_ok=True)
+                _ = (directory / f"{saved["session"]["session_id"]}.json").write_text(json.dumps(saved))
+                loaded = record.find_session(saved["login"], saved["session"]["session_id"])
+                self.assertEqual(loaded, saved)
+                self.assertEqual(record.parse_session_records(json.dumps([saved])), [saved])
 
     def test_transition_id_round_trips_beside_the_independent_request_id_without_migrating_old_records(self) -> None:
         current = session_shutdown()

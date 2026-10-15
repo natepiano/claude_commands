@@ -65,7 +65,7 @@ commands in order; they reuse the existing run and open phase:
 ```
 
 Report a recorder failure to the showrunner and end blocked. Do not run
-`prepare_session.sh`, create a marker under `/tmp/claude/delegate/active/`,
+`prepare_session.sh`, create a marker under `/tmp/claude/unit/active/`,
 or register a `/unit:report` notifier. Read the existing memory, then apply
 <PrimeReviewMemory/> for each type named in **Review pool**.
 

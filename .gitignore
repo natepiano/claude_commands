@@ -19,6 +19,7 @@
 /config/showrunners.json
 /config/showrunners.lock
 /config/accounts.json
+/config/accounts.lock
 !docs/
 !docs/**
 !scripts/

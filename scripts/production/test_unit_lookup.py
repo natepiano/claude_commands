@@ -95,6 +95,16 @@ class UnitLookupTests(unittest.TestCase):
         return subprocess.run([sys.executable, str(SCRIPT), *arguments], env=environment, capture_output=True,
                               text=True, check=False)
 
+    def test_every_sessions_marks_come_from_one_call_and_an_ended_session_stops_none(self) -> None:
+        fake_tmux.write(self.state, {"$1": marked("first", "%4", "one-unit", OTHER="kept out"),
+                                     "$3": marked("third", "%6", "three-unit", slug="other")})
+        # "$2" ended after the listing: tmux stops the chain there, so "$3" is asked again alone.
+        self.assertEqual(unit_lookup._every_marks(["$1", "$2", "$3"]), {  # pyright: ignore[reportPrivateUsage]
+            "$1": {"SHOWRUNNER_UNIT": "show", "SHOWRUNNER_UNIT_ID": "one-unit"},
+            "$2": {},
+            "$3": {"SHOWRUNNER_UNIT": "other", "SHOWRUNNER_UNIT_ID": "three-unit"},
+        })
+
     def test_a_unit_is_found_by_its_mark_whatever_its_session_is_called_now(self) -> None:
         fake_tmux.write(self.state, {"$1": marked("renamed-since-launch", "%4", "trunk-unit"),
                                      "$2": marked("another-show", "%5", "trunk-unit", slug="other"),

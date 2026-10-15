@@ -39,7 +39,12 @@ PYTHON
 ) || exit 1
 marked_lines=$("$PY" "$REPO/scripts/production/unit_lookup.py" list "$slug") || exit 1
 NOTIFIER=$REPO/scripts/message/notifier.sh
-ACTIVE_DIR=${PLAN_DELEGATE_ACTIVE_DIR:-/tmp/claude/delegate/active}
+# Run markers sit under unit/, or delegate/ for a run started before the rename.
+if [[ -n ${PLAN_DELEGATE_ACTIVE_DIR:-} ]]; then
+  ACTIVE_DIRS=($PLAN_DELEGATE_ACTIVE_DIR)
+else
+  ACTIVE_DIRS=(/tmp/claude/unit/active /tmp/claude/delegate/active)
+fi
 mkdir -p "$DIR"
 SEEN=$DIR/decisions_seen
 BLOCKS=$DIR/blocks_open
@@ -125,10 +130,16 @@ for line in $units; do
     unknown) echo 'CLAUDE STATE UNKNOWN' ;;
     stopped) echo 'CLAUDE NOT RUNNING' ;;
   esac
-  if [[ -n $session_id && -f $ACTIVE_DIR/$session_id ]]; then
-    session_dir=$(< "$ACTIVE_DIR/$session_id")
+  marker=
+  for active in $ACTIVE_DIRS; do
+    if [[ -n $session_id && -f $active/$session_id ]]; then marker=$active/$session_id; break; fi
+  done
+  if [[ -n $marker ]]; then
+    session_dir=$(< "$marker")
     if [[ -n $session_dir ]]; then
-      health=$(zsh "$NOTIFIER" health "delegate-${session_dir:t}" 2>&1)
+      instance=unit-${session_dir:t}
+      [[ ${${session_dir:h}:t} == delegate ]] && instance=delegate-${session_dir:t}
+      health=$(zsh "$NOTIFIER" health "$instance" 2>&1)
       if (( $? == 1 )); then
         print -r -- "TICKS FAILING (${health#failing: })"
       fi

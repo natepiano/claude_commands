@@ -259,10 +259,53 @@ class Topic:
 
 
 @dataclass(frozen=True)
-class Outstanding:
+class DueNow:
+    pass
+
+
+@dataclass(frozen=True)
+class DeferredUntil:
+    at: datetime
+
+
+OutstandingTiming = DueNow | DeferredUntil
+
+
+@dataclass(frozen=True)
+class OutstandingReminder:
     since: datetime
     text: str
-    after: datetime | None = None
+    timing: OutstandingTiming = DueNow()
+
+
+@dataclass(frozen=True)
+class OutstandingQuestion:
+    since: datetime
+    text: str
+    question: str
+    timing: OutstandingTiming = DueNow()
+
+
+@dataclass(frozen=True)
+class ReviewedOutstandingQuestion:
+    since: datetime
+    text: str
+    question: str
+    reviewed: str
+    timing: OutstandingTiming = DueNow()
+
+
+@dataclass(frozen=True)
+class ReviewUnavailableOutstandingQuestion:
+    since: datetime
+    text: str
+    question: str
+    reason: str
+    timing: OutstandingTiming = DueNow()
+
+
+Outstanding = (OutstandingReminder | OutstandingQuestion | ReviewedOutstandingQuestion
+               | ReviewUnavailableOutstandingQuestion)
 
 
 @dataclass(frozen=True)
@@ -849,7 +892,7 @@ def read_outstanding(path: Path | None) -> list[Outstanding]:
         if not isinstance(entry, dict):
             raise InputError(f"{where}: expected an object")
         fields = cast(dict[str, object], entry)
-        check_keys(fields, {"since", "text", "after"}, where)
+        check_keys(fields, {"since", "text", "after", "question", "reviewed", "review_unavailable"}, where)
         since, text, after = fields.get("since"), fields.get("text"), fields.get("after")
         if not isinstance(since, str) or not STARTED.match(since):
             raise InputError(f"{where}.since: expected YYYY-MM-DDTHH:MM")
@@ -858,13 +901,33 @@ def read_outstanding(path: Path | None) -> list[Outstanding]:
         if not isinstance(text, str) or not text.strip() or "\n" in text:
             raise InputError(f"{where}.text: expected one non-empty line")
         check_plumbing(text, f"{where}.text")
-        items.append(Outstanding(datetime.fromisoformat(since), text, datetime.fromisoformat(after) if after else None))
+        timing = DeferredUntil(datetime.fromisoformat(after)) if isinstance(after, str) else DueNow()
+        since_at = datetime.fromisoformat(since)
+        question = fields.get("question")
+        reviewed, unavailable = fields.get("reviewed"), fields.get("review_unavailable")
+        if "question" not in fields:
+            if "reviewed" in fields or "review_unavailable" in fields:
+                raise InputError(f"{where}: question required for a review result")
+            items.append(OutstandingReminder(since_at, text, timing))
+            continue
+        if not isinstance(question, str) or not question.strip():
+            raise InputError(f"{where}.question: expected non-empty full question")
+        if "reviewed" in fields:
+            if not isinstance(reviewed, str) or not reviewed.strip() or "review_unavailable" in fields:
+                raise InputError(f"{where}.reviewed: expected completed review without an unavailable result")
+            items.append(ReviewedOutstandingQuestion(since_at, text, question, reviewed, timing))
+        elif "review_unavailable" in fields:
+            if not isinstance(unavailable, str):
+                raise InputError(f"{where}.review_unavailable: expected reason text")
+            items.append(ReviewUnavailableOutstandingQuestion(since_at, text, question, unavailable, timing))
+        else:
+            items.append(OutstandingQuestion(since_at, text, question, timing))
     return sorted(items, key=lambda item: item.since)
 
 
 def due(items: list[Outstanding], now: datetime) -> list[Outstanding]:
     """The items the user has not deferred past `now`, a local time in the report's zone."""
-    return [item for item in items if item.after is None or item.after <= now]
+    return [item for item in items if isinstance(item.timing, DueNow) or item.timing.at <= now]
 
 
 def read_dailies_hold() -> HoldState:

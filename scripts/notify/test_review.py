@@ -14,7 +14,7 @@ import unittest
 import urllib.parse
 from contextlib import redirect_stderr, redirect_stdout
 from dataclasses import dataclass, replace
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal, TypedDict, cast, final, override
 from unittest import mock
@@ -146,6 +146,94 @@ class LocalReviewTests(unittest.TestCase):
         _ = binary.write_text("fake reviewer\n")
         binary.chmod(0o700)
         _ = self.enterContext(mock.patch.object(shutil, "which", return_value=str(binary)))
+
+    def test_questions_keep_multiline_headers_and_long_text_without_push_limits(self) -> None:
+        for prefix in ("Session: Owner", "Action: choose one", "No action needed."):
+            question = prefix + "\n" + "Question context. " * 80 + "\nChoose retry (recommended) or stop?"
+            draft = review.Draft("demo", "0", "", NoActionRequired(), question, False)
+            runner = FakeReviewer(verdict(draft))
+            key = review.QuestionKey("demo", prefix)
+            with (mock.patch.object(review, "length_failures", side_effect=AssertionError("push count")),
+                  mock.patch.object(review, "split_session", side_effect=AssertionError("push header"))):
+                self.assertEqual(review.review_question(key, question, runner=runner),
+                                 review.QuestionAccepted(question))
+            self.assertIn(question, runner.calls[-1].argv[-1])
+            self.assertIn("question,all", runner.calls[0].argv)
+        self.assertEqual([item["kind"] for item in self.entries()], ["question"] * 3)
+        self.assertFalse(pushover.LOG_FILE.exists())
+
+    def test_question_holds_revise_independently_by_summary_and_never_expire_to_post(self) -> None:
+        first = review.QuestionKey("demo", "Retry build")
+        second = review.QuestionKey("demo", "Choose compiler")
+        question = "Retry the build?"
+        draft = review.Draft("demo", "0", "", NoActionRequired(), question, False)
+        asking = FakeReviewer(verdict(draft, "ask", questions=["Which build?"]))
+        for key in (first, second):
+            self.assertIsInstance(review.review_question(key, question, runner=asking), review.QuestionAwaitingFacts)
+        reworded = "Retry build 42 (recommended) or stop?"
+        revised_draft = replace(draft, body=reworded)
+        unresolved = FakeReviewer(verdict(revised_draft, "ask", questions=["Which machine?"]))
+        self.assertIsInstance(review.review_question(first, reworded, runner=unresolved), review.QuestionAwaitingFacts)
+        self.assertIn("Revision: true", unresolved.calls[-1].argv[-1])
+        passed = FakeReviewer(verdict(revised_draft))
+        self.assertEqual(review.review_question(first, reworded, runner=passed), review.QuestionAccepted(reworded))
+        paths = list((review.state_path() / "questions").glob("*.json"))
+        self.assertEqual([path.stem for path in paths], [second.digest])
+        with mock.patch.object(pushover, "http_post", side_effect=AssertionError("question posted")) as post:
+            self.assertEqual(review.due(post=post), 0)
+        post.assert_not_called()
+        self.assertFalse((review.state_path() / "held").exists())
+
+    def test_question_rewrite_needs_approval_and_recheck_failures_stay_held(self) -> None:
+        key = review.QuestionKey("demo", "Retry")
+        draft = review.Draft("demo", "0", "", NoActionRequired(), "Retry it?", False)
+        rewritten = replace(draft, body="Retry build 42 (recommended) or stop?")
+        for decision in ("ask", "rewrite", "send", "timeout"):
+            with self.subTest(recheck=decision):
+                first = FakeReviewer(verdict(draft, "rewrite", body=rewritten.body))
+                second = FakeReviewer(verdict(rewritten, decision if decision != "timeout" else "send",
+                                              questions=["Which machine?"] if decision == "ask" else []),
+                                      failure="timeout" if decision == "timeout" else "none")
+                calls = 0
+                def runner(argv: list[str], *, timeout: float,
+                           env: dict[str, str]) -> subprocess.CompletedProcess[str]:
+                    nonlocal calls
+                    if Path(argv[0]).name == "claude":
+                        calls += 1
+                    return (second if calls > 1 else first)(argv, timeout=timeout, env=env)
+                outcome = review.review_question(key, draft.body, runner=runner)
+                self.assertEqual(calls, 2)
+                if decision == "send":
+                    self.assertEqual(outcome, review.QuestionAccepted(rewritten.body))
+                else:
+                    self.assertIsInstance(outcome, (review.QuestionAwaitingFacts, review.QuestionReviewFailed))
+                    self.assertTrue((review.state_path() / "questions" / (key.digest + ".json")).exists())
+
+    def test_unavailable_question_review_preserves_original_and_logs_reason(self) -> None:
+        draft = review.Draft("demo", "0", "", NoActionRequired(), "Retry build 42?", False)
+        runner = FakeReviewer(verdict(draft), failure="timeout")
+        self.assertEqual(review.review_question(review.QuestionKey("demo", "Retry"), draft.body, runner=runner),
+                         review.QuestionReviewUnavailable(draft.body, "timeout"))
+        record = self.entries()[0]
+        self.assertEqual(record["kind"], "question")
+        self.assertEqual(record["verdict"], "unreviewed: timeout")
+
+    def test_content_reviews_reject_blank_rewrites(self) -> None:
+        draft = review.Draft("demo", "0", "", NoActionRequired(), "Retry build 42?", False)
+        for body in ("", " \n\t"):
+            for mode in ("reply", "question"):
+                with self.subTest(body=body, mode=mode):
+                    outcome = review.validate(verdict(draft, "rewrite", body=body), draft, False,
+                                              reply=mode == "reply", question=mode == "question")
+                    self.assertIsInstance(outcome, review.Unreviewed)
+                    assert isinstance(outcome, review.Unreviewed)
+                    self.assertIn("rewrite needs nonempty text", outcome.why)
+
+    def test_blank_question_input_is_rejected_before_review(self) -> None:
+        runner = mock.Mock(side_effect=AssertionError("blank question reached reviewer"))
+        with self.assertRaisesRegex(ValueError, "question needs nonempty text"):
+            _ = review.review_question(review.QuestionKey("demo", "Retry"), " \n\t", runner=runner)
+        runner.assert_not_called()
 
     def test_session_survives_review_hold_records_and_repeated_headers(self) -> None:
         draft = replace(self.draft, session=SessionLine("Owner"))
@@ -409,12 +497,41 @@ class LocalReviewTests(unittest.TestCase):
             with self.subTest(request=request):
                 self.assertEqual(review.reply_questions("The check passed. " + request), review.ReplyAsks((request,), False))
         self.assertEqual(review.reply_questions("Upgrade (recommended): use the new compiler."),
-                         review.ReplyAsks((), True))
+                         review.ReplyAsks((), True, ("Upgrade (recommended): use the new compiler.",)))
         self.assertEqual(review.reply_questions("- Choose a version.\n2. Confirm the version."),
                          review.ReplyAsks(("Choose a version.", "Confirm the version."), False))
         self.assertEqual(review.reply_questions(
             "> Reply upgrade or wait.\n```\nChoose a version.\n```\n~~~\nApprove it.\n~~~\n"
             + "The example is `Tell me which version.` and ``Choose a version.``."), review.ReplyAsks((), False))
+
+    def test_choice_lines_include_questions_but_skip_quotes_and_code(self) -> None:
+        line = "Retry (recommended) or stop?"
+        asks = review.reply_questions(line + "\n> Use stable (recommended).\n"
+            + "```\nUse nightly (recommended).\n```\nExample: `Upgrade (recommended)`")
+        self.assertEqual(asks.choice_lines, (line,))
+        self.assertIn(line, asks.sentences)
+
+    def test_detected_choice_lines_keep_inline_code_for_record_matching(self) -> None:
+        line = "Run `retry build-42` (recommended), or stop?"
+        asks = review.reply_questions(line + "\nExample: `Stop (recommended)`")
+        self.assertEqual(asks.choice_lines, (line,))
+
+    def test_reviewed_question_is_registered_from_outstanding_and_after_closing(self) -> None:
+        cutoff = datetime.now(timezone.utc) - timedelta(minutes=1)
+        directory = self.root / "showrunner/outstanding"
+        directory.mkdir(parents=True)
+        accepted = "Build 42 failed.\nRetry (recommended) or stop?"
+        item = {"since": "2026-10-15T10:00", "text": "Retry build",
+                "question": "Retry it?", "reviewed": accepted}
+        current = directory / "demo.json"
+        _ = current.write_text(json.dumps([item]))
+        with mock.patch.dict(os.environ, {"SHOWRUNNER_STATE_DIR": str(directory.parent)}):
+            self.assertIn(" ".join(accepted.split()), review.registered_questions(cutoff))
+            _ = current.write_text("[]")
+            history = review.QuestionRegistration(time=datetime.now(timezone.utc).isoformat(),
+                text=item["text"], question=item["question"], reviewed=accepted)
+            _ = current.with_suffix(".history.jsonl").write_text(json.dumps(history) + "\n")
+            self.assertIn(" ".join(accepted.split()), review.registered_questions(cutoff))
 
     def test_sample_matches_registered_asks_without_matching_their_choice_lines(self) -> None:
         question = "Would you retry the build?"
@@ -438,6 +555,30 @@ class LocalReviewTests(unittest.TestCase):
                 self.assertIn("sample: 0 replies", output.getvalue())
                 self.assertIn(f"replies with unregistered questions: {expected}", output.getvalue())
         runner.assert_not_called()
+
+    def test_sample_recognises_reviewed_inline_code_before_and_after_closing(self) -> None:
+        cutoff = datetime.fromisoformat("2026-10-12T00:00:00+00:00")
+        question = "Run `check.py` (recommended), or wait?"
+        path = self.transcript("inline-code.jsonl", [
+            ("2026-10-13T10:00:00Z", question, "end_turn"),
+            ("2026-10-13T11:00:00Z", "The build passed.", "end_turn")])
+        registration = self.root / "showrunner/outstanding/build.json"
+        registration.parent.mkdir(parents=True)
+        item = {"text": "Run check", "question": question, "reviewed": question}
+        _ = registration.write_text(json.dumps([item]))
+        draft = review.Draft("review.sample", "0", "", NoActionRequired(), "The build passed.", False)
+        for closed in (False, True):
+            with self.subTest(closed=closed):
+                if closed:
+                    _ = registration.write_text("[]")
+                    _ = registration.with_suffix(".history.jsonl").write_text(
+                        json.dumps(dict(item, time="2026-10-13T10:00:00+00:00")) + "\n")
+                runner = FakeReviewer(verdict(draft))
+                with (mock.patch.dict(os.environ, {"SHOWRUNNER_STATE_DIR": str(registration.parents[1])}),
+                      redirect_stdout(io.StringIO()) as output):
+                    self.assertEqual(review.sample([path], since=cutoff, runner=runner), 0)
+                self.assertIn("sample: 1 replies; passed: 1", output.getvalue())
+                self.assertIn("replies with unregistered questions: 0", output.getvalue())
 
     def test_sample_excludes_imperative_requests_from_replies_that_ask_nothing(self) -> None:
         path = self.transcript("requests.jsonl", [
