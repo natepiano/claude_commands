@@ -53,6 +53,7 @@ SETTLE_RETRY_SECONDS = 300
 # A unit in the middle of /unit:direct answered a pause message in about a minute (2026-10-13).
 REASK_AFTER = timedelta(minutes=2)
 NOT_ANSWERING_AFTER = 2 * REASK_AFTER
+_STOPPABLE_STATUSES = frozenset({"idle", "shell"})
 SHOWING_FORM = "showing a form"
 USAGE_LIMIT_PATTERNS = (
     "hit your session limit",
@@ -809,6 +810,11 @@ def _is_requester(saved: SessionShutdown) -> bool:
     return origin["kind"] == "session" and origin["session_id"] == saved["session"]["session_id"]
 
 
+def stoppable_status(status: str) -> bool:
+    """Whether the owner is at its prompt, including with a background shell."""
+    return status in _STOPPABLE_STATUSES
+
+
 def _hold_details(owner: stop_work.FreshSession, progress: str, *, local_observation: bool = True) -> list[str]:
     """Return observed hold conditions without delivery state."""
     if owner["kind"] == "session account unreadable":
@@ -817,7 +823,7 @@ def _hold_details(owner: stop_work.FreshSession, progress: str, *, local_observa
         return [owner["kind"].removeprefix("session ")]
     session = owner["session"]
     details: list[str] = []
-    if session["status"] != "idle":
+    if session["status"] not in _STOPPABLE_STATUSES:
         details.append(session["status"])
     if session["status"] != "busy" and any(server["busy_workers"] for server in session["codex_servers"]):
         details.append("busy")
@@ -875,18 +881,20 @@ def next_step(saved: SessionShutdown, owner: stop_work.FreshSession,
         if owner["kind"] == "matching session":
             if saved["force"] == "now":
                 return StopSession()
-            if owner["session"]["status"] == "idle" and all(
+            if owner["session"]["status"] in _STOPPABLE_STATUSES and all(
                 worker["status"] == "idle" for worker in owner["workers"]
             ) and blocker(owner["session"])["kind"] == "clear" and (progress == "held by usage limit" or not _showing_form(owner["session"])):
                 if progress in {"ready", "held by usage limit"}:
                     return StopSession()
                 message = saved["settle_message"]
                 if message["kind"] in {"not sent", "queued"}:
-                    return StopSession("idle; nothing in progress")
+                    return StopSession("idle; nothing in progress; a background shell was running"
+                        if owner["session"]["status"] == "shell" else "idle; nothing in progress")
                 if message["kind"] == "sent":
                     updated_at = datetime.fromtimestamp(owner["session"]["updated_at"] / 1000, timezone.utc)
                     if updated_at > datetime.fromisoformat(message["at"]):
-                        return StopSession("idle after the pause message; no ready line")
+                        return StopSession("idle after the pause message; no ready line; a background shell was running"
+                            if owner["session"]["status"] == "shell" else "idle after the pause message; no ready line")
         if progress == "waiting" and not _is_requester(saved):
             message = saved["settle_message"]
             if message["kind"] == "not sent" or (message["kind"] == "queued" and
@@ -953,6 +961,12 @@ def ready(where: str) -> int:
                 accepted = True
         _ = store.update_session(saved["login"], session_id, mark)
         if accepted:
+            try:
+                _launch_conductor(saved["login"], saved["label"])
+            except (OSError, RuntimeError, subprocess.SubprocessError):
+                command = shutdown_command("conduct", saved["login"])
+                print(f"ready recorded; conductor could not start; in a terminal on {saved['machine']}: {command}", file=sys.stderr)
+                return 2
             print(f"ready for shutdown: {where}")
             return 0
     print("no shutdown in progress for this session", file=sys.stderr)
@@ -1268,6 +1282,7 @@ def _action_failed(saved: SessionShutdown, error: Exception, *, stopping: bool) 
         return
     def fail(current: SessionShutdown) -> None:
         current["progress"] = {"kind": "stop failed", "at": record_time(), "reason": reason}
+        current["stop_issues"] = []
         current["force"] = "wait for ready"
     try:
         _ = store.update_session(saved["login"], saved["session"]["session_id"], fail)

@@ -88,7 +88,7 @@
 
 **Ruled out:** the move preview reading live session status — `ListedSession` carries none, so the label becomes `move when idle`; broadening `remote_control.py`'s idle check to `shell` — it authorizes typing into the terminal.
 
-### Phase 4 — A session that is not ready yet is waited on, not given up on  · status: todo
+### Phase 4 — A session that is not ready yet is waited on, not given up on  · status: done
 
 **Depends on:** Phase 3
 

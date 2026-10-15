@@ -38,6 +38,8 @@ from record import (
 )
 
 class ShutdownReadiness(Protocol):
+    def stoppable_status(self, status: str) -> bool: ...
+
     def blocker(self, session: Session) -> ReadinessCheck: ...
 
 
@@ -60,6 +62,8 @@ IdleStopReason = Literal[
     "not an idle stop",
     "idle; nothing in progress",
     "idle after the pause message; no ready line",
+    "idle; nothing in progress; a background shell was running",
+    "idle after the pause message; no ready line; a background shell was running",
 ]
 
 
@@ -599,7 +603,7 @@ def _stop_owner(
     if not force_now and prior["kind"] != "reaping" and (
         (prior["kind"] not in {"ready", "held by usage limit", "stopping", "stop failed"}
          and not (prior["kind"] == "waiting" and idle_reason != "not an idle stop"))
-        or current["status"] != "idle"
+        or not settle.stoppable_status(current["status"])
         or any(worker["status"] != "idle" for worker in match["workers"])
         or settle.blocker(current)["kind"] != "clear"
     ):
@@ -609,10 +613,17 @@ def _stop_owner(
             progress=("held by usage limit" if prior["kind"] == "held by usage limit"
                       else "ready" if prior["kind"] == "ready" else "waiting"),
         )
-        _ = _set_stop_outcome(
-            claim, "stop failed", clock, [issue],
-            "session or worker is not idle and ready",
-        )
+        def wait_until_ready(changing: SessionShutdown) -> None:
+            claim.require(changing)
+            if issue["progress"] == "held by usage limit":
+                changing["progress"] = {"kind": "held by usage limit", "at": issue["at"]}
+            elif issue["progress"] == "ready":
+                changing["progress"] = {"kind": "ready", "at": issue["at"]}
+            else:
+                changing["progress"] = {"kind": "waiting"}
+            changing["stop_issues"] = [issue]
+
+        _ = update_session(claim.login, claim.session_id, wait_until_ready)
         return
     if force_now:
         _end_busy_codex_workers(current, codex_mesh, claim)
@@ -781,7 +792,7 @@ def stop_session(
             return
         prior = copy.deepcopy(progress)
         current["progress"] = {"kind": "stopping", "at": _timestamp(clock)}
-        if idle_reason != "not an idle stop":
+        if idle_reason != "not an idle stop" and prior["kind"] == "waiting":
             current["where"] = {"kind": "said", "text": idle_reason, "at": current["progress"]["at"]}
         claimed = True
 
