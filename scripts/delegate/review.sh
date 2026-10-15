@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # review.sh — Invoke the configured delegate agent for a review.
 #
-# Usage: review.sh [--to <worker> | --slot <new-slot> | --pool <type> --lease <slug>/<unit>/<phase>] <session_dir>
+# Usage: review.sh [--to <worker> | --slot <new-slot> | --pool <type> --lease <slug>/<unit>/<phase>]
+#                  [--phase <id>] <session_dir>
 #                  [working_dir] [prompt_file] [task]
 #                  [role_description] [pass_activity] [pass_index] [lens]
 #                  [early_ready_file]
@@ -26,6 +27,11 @@
 #   a new one starts, and the implementation pass is still open at launch).
 #   The unit director creates the sentinel after the implementation pass has
 #   finished and the final diff is written.
+#
+#   --phase <id> names the phase this review belongs to: start-pass stamps the
+#   pass with it, and every per-pass file below is written to
+#   <session_dir>/phases/<id>/ instead of <session_dir>, so two phases reviewing
+#   at once never overwrite each other. heartbeat.log stays run-wide.
 #
 # Produces (every name below takes a `_<lens>` suffix when a lens is given):
 #   <session_dir>/review_status            — "reviewing" while running, "reviewed" on success, "error" on failure
@@ -94,8 +100,20 @@ elif [[ -n "${POOL_LEASE}" ]]; then
 fi
 
 SESSION_DIR="${1:?Usage: review.sh <session_dir> [working_dir] [prompt_file] [task] [role_description]}"
+# A named phase keeps its review files in its own directory, so two phases reviewing at once
+# never write the same pass's findings, status or log. Run-wide files stay in the session.
+ARTIFACT_DIR="${SESSION_DIR}"
+if [[ -n "${PHASE_ID}" ]]; then
+  # The directory keeps only the id's letters, digits, `.`, `_` and `-`: `ad hoc` is `adhoc`.
+  PHASE_DIR_NAME="${PHASE_ID//[^[:alnum:]._-]/}"
+  if [[ -z "${PHASE_DIR_NAME}" || "${PHASE_DIR_NAME}" == . || "${PHASE_DIR_NAME}" == .. ]]; then
+    echo "ERROR: phase id names no directory: ${PHASE_ID}" >&2
+    exit 2
+  fi
+  ARTIFACT_DIR="${SESSION_DIR}/phases/${PHASE_DIR_NAME}"
+fi
 WORKING_DIR="${2:-$(pwd)}"
-PROMPT_FILE="${3:-${SESSION_DIR}/review_prompt.md}"
+PROMPT_FILE="${3:-${ARTIFACT_DIR}/review_prompt.md}"
 SUBTASK="${4:-review}"
 ROLE_DESC="${5:-blind review of the current diff against its spec}"
 PASS_ACTIVITY="${6:-reviewing the current diff against its work order}"
@@ -192,16 +210,17 @@ TURN_FINDINGS_READY=0
 TURN_RAISED=0
 TURN_COUNT_READY=0
 TURN_RECORD_STATUS="error"
-FINDINGS_FILE="${SESSION_DIR}/review_findings_${PASS_INDEX}${SUFFIX}.txt"
-STATUS_FILE="${SESSION_DIR}/review_status${SUFFIX}"
-SLOT_FILE="${SESSION_DIR}/review_slot${SUFFIX}"
-LOG_FILE="${SESSION_DIR}/review_agent_${PASS_INDEX}${SUFFIX}.log"
-REPLY_FILE="${SESSION_DIR}/review_reply_${PASS_INDEX}${SUFFIX}.$$.txt"
+mkdir -p "${ARTIFACT_DIR}"
+FINDINGS_FILE="${ARTIFACT_DIR}/review_findings_${PASS_INDEX}${SUFFIX}.txt"
+STATUS_FILE="${ARTIFACT_DIR}/review_status${SUFFIX}"
+SLOT_FILE="${ARTIFACT_DIR}/review_slot${SUFFIX}"
+LOG_FILE="${ARTIFACT_DIR}/review_agent_${PASS_INDEX}${SUFFIX}.log"
+REPLY_FILE="${ARTIFACT_DIR}/review_reply_${PASS_INDEX}${SUFFIX}.$$.txt"
 if [[ -n "${POOL_TYPE}" ]]; then
   rm -f "${SLOT_FILE}"
 fi
 
-AGENT_FILE="${SESSION_DIR}/review_agent${SUFFIX}"
+AGENT_FILE="${ARTIFACT_DIR}/review_agent${SUFFIX}"
 HEARTBEAT_HELPER="${SCRIPT_DIR}/../agents/heartbeat.sh"
 BOARD_HELPER="${SCRIPT_DIR}/board.sh"
 HEARTBEAT_FILE="${SESSION_DIR}/heartbeat.log"
@@ -213,8 +232,8 @@ initialize_review_artifacts() {
   # Every reader of the unnumbered paths — the unit director's mid-run
   # preemption read, the heartbeat digest — keeps working while the per-pass
   # history is kept.
-  ln -sfn "review_findings_${PASS_INDEX}${SUFFIX}.txt" "${SESSION_DIR}/review_findings${SUFFIX}.txt"
-  ln -sfn "review_agent_${PASS_INDEX}${SUFFIX}.log" "${SESSION_DIR}/review_agent${SUFFIX}.log"
+  ln -sfn "review_findings_${PASS_INDEX}${SUFFIX}.txt" "${ARTIFACT_DIR}/review_findings${SUFFIX}.txt"
+  ln -sfn "review_agent_${PASS_INDEX}${SUFFIX}.log" "${ARTIFACT_DIR}/review_agent${SUFFIX}.log"
   rm -f "${REPLY_FILE}"
   if [[ -n "${REVIEW_WORKER}" ]]; then
     : > "${FINDINGS_FILE}"
@@ -223,7 +242,7 @@ initialize_review_artifacts() {
   echo "reviewing" > "${STATUS_FILE}"
   # Only meaningful while an early launch is showing in the progress report,
   # and read there only if written after the review was armed.
-  echo "$$" > "${SESSION_DIR}/review_pid${SUFFIX}"
+  echo "$$" > "${ARTIFACT_DIR}/review_pid${SUFFIX}"
 }
 
 # A assigned reviewer opens a new occupancy of a chair a writer has just left.
@@ -617,7 +636,7 @@ if [[ -n "${POOL_TYPE}" ]]; then
   POOL_FRESH_ARGS=()
   if [[ "${POOL_TYPE}" == ui ]]; then
     POOL_FRESH_ARGS=(--fresh)
-    SHOTS_FILE="${SESSION_DIR}/ux_shots_${PASS_INDEX}.txt"
+    SHOTS_FILE="${ARTIFACT_DIR}/ux_shots_${PASS_INDEX}.txt"
     if [[ ! -r "${SHOTS_FILE}" ]]; then
       echo "ERROR: UI shots file is unreadable: ${SHOTS_FILE}." >&2
       exit 1
@@ -654,7 +673,7 @@ if [[ -n "${POOL_TYPE}" ]]; then
   printf '%s\n' "${TEAM_SLOT}" > "${SLOT_FILE}"
   export PLAN_DELEGATE_TEAM_ROLE="${TEAM_SLOT}"
   if [[ "${POOL_TYPE}" == ui || "${LEASE_ORDINAL}" -eq 1 ]]; then
-    POOL_PROMPT_FILE="$(mktemp "${SESSION_DIR}/review_message_${PASS_INDEX}${SUFFIX}.XXXXXX")"
+    POOL_PROMPT_FILE="$(mktemp "${ARTIFACT_DIR}/review_message_${PASS_INDEX}${SUFFIX}.XXXXXX")"
     "$PY" "${POOL_HELPER}" unit-memory --production "${POOL_PRODUCTION}" \
       --unit "${POOL_UNIT}" > "${POOL_PROMPT_FILE}" 2>>"${LOG_FILE}"
     if [[ -s "${POOL_PROMPT_FILE}" ]]; then

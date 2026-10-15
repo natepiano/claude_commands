@@ -61,8 +61,11 @@ Loop/verbose only:
    `/unit:direct` <BerthDecisions/>:
 
    ```sh
-   cargo-berth drift --full --json
+   cargo-berth drift --full --reservation <recorded-reservation-id> --json
    ```
+
+   Name the reservation: each open phase holds its own, so a drift that picks
+   one for itself is ambiguous whenever a phase runs beside this one.
 
    Require an exit-`0` result with `payload.kind = drift`,
    `payload.data.comparison = full_phase_start`, and exactly one
