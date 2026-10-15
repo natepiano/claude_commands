@@ -255,6 +255,8 @@ Measured 2026-10-06/07 on the build machine, 300 s split, Sep 9 PDT to 2026-10-0
 
 ### Phase 6 — Proposals: the next change, ranked by measured minutes saved · status: todo (standing)
 
+**Depends on:** Phase 10 — the next re-rank measures the week after the failure texts land.
+
 **Blocked by:** G1 — the next re-rank waits until Wed 2026-10-14 10:50 EDT (07:50 PDT).
 
 #### Work Order
@@ -289,7 +291,7 @@ Measured 2026-10-06/07 on the build machine, 300 s split, Sep 9 PDT to 2026-10-0
 
 **Seats:** none — the unit director ranks and proposes from the report; no code is written until a proposal becomes its own phase.
 
-**Constraints from prior phases:** Failure logging, Codex transcript scanning and kept-shot detection are delivered, so `analysis.md` → Next improvements entry 2, entry 3 and the failure-logging half of entry 1 are not proposed again; what fills long `/hana_shot` episodes is answered by the report's "What fills long /hana_shot episodes" section: agent thinking holds 61–67% of long minutes, other BRP calls 7–12%, file work 8–11%, retries 3–5% and shot calls 2–3%, so it is not proposed again. Its first window was under one day; re-rank from that section after a full week of `/hana_shot` data. The hourly phase supplies source-host coverage and says whether each attempt count is exact or inferred from images. The Mac catch-up delivers Codex transcripts and timings and finished in five hourly runs (`scan_status.json` → `mac_read_state`; check it before each estimate); Mac Claude transcripts stay out above 100 files or 100 MB, so every Mac estimate names that limit. A `changes.json` entry is either a product change, which is a speed candidate, or a measurement change, which the report lists separately and never counts as a speed gain; an approved proposal appends a product change carrying its effective time and affected hosts. Scale-aware `--window` (Phase 8, d1efe4c) is in `changes.json` as a product change on natedev and the Mac, effective 2026-10-07 08:04 PDT; it is not proposed again. The window-level restore (Phase 9) is in `changes.json` as a product change on natedev and the Mac, effective 2026-10-07 10:08 PDT; it is not proposed again. Since that change, a `/hana_shot` run ended by Ctrl-C, SIGTERM or SIGHUP writes its invocation record with `status: failure`, `exit_code` 130, 143 or 129 and `failure_reason: shot_failed`; before it, SIGTERM and SIGHUP left no record. When a candidate is priced from failures in `invocations.jsonl`, count records with those exit codes apart from failed shots. Price weekly agent minutes from an observed eligible weekly count, keep per-shot milliseconds distinct from episode minutes, and leave a candidate unpriced when its evidence cannot support that calculation.
+**Constraints from prior phases:** Failure logging, Codex transcript scanning and kept-shot detection are delivered, so `analysis.md` → Next improvements entry 2, entry 3 and the failure-logging half of entry 1 are not proposed again; what fills long `/hana_shot` episodes is answered by the report's "What fills long /hana_shot episodes" section: agent thinking holds 61–67% of long minutes, other BRP calls 7–12%, file work 8–11%, retries 3–5% and shot calls 2–3%, so it is not proposed again. Its first window was under one day; re-rank from that section after a full week of `/hana_shot` data. The hourly phase supplies source-host coverage and says whether each attempt count is exact or inferred from images. The Mac catch-up delivers Codex transcripts and timings and finished in five hourly runs (`scan_status.json` → `mac_read_state`; check it before each estimate); Mac Claude transcripts stay out above 100 files or 100 MB, so every Mac estimate names that limit. A `changes.json` entry is either a product change, which is a speed candidate, or a measurement change, which the report lists separately and never counts as a speed gain; an approved proposal appends a product change carrying its effective time and affected hosts. Scale-aware `--window` (Phase 8, d1efe4c) is in `changes.json` as a product change on natedev and the Mac, effective 2026-10-07 08:04 PDT; it is not proposed again. The window-level restore (Phase 9) is in `changes.json` as a product change on natedev and the Mac, effective 2026-10-07 10:08 PDT; it is not proposed again. Since that change, a `/hana_shot` run ended by Ctrl-C, SIGTERM or SIGHUP writes its invocation record with `status: failure`, `exit_code` 130, 143 or 129 and `failure_reason: shot_failed`; before it, SIGTERM and SIGHUP left no record. When a candidate is priced from failures in `invocations.jsonl`, count records with those exit codes apart from failed shots. Price weekly agent minutes from an observed eligible weekly count, keep per-shot milliseconds distinct from episode minutes, and leave a candidate unpriced when its evidence cannot support that calculation. Since Phase 10 (540c062, in `changes.json` as a product change and a measurement change on natedev and the Mac, effective 2026-10-15 11:07 EDT), every failed invocation and failed attempt carries its failure text in `error`, so a re-rank reads failure texts from the records, not from transcripts; it compares the weeks before and after that time, and does not propose the failure texts again.
 
 **Acceptance gate:** each proposal cites a report less than 24 h old whose scan covers every host it uses through a time at or after G1 (`scan_status.json` → `last_success` and `host_coverage`), the covered window and n for every number, both splits when it uses episode time, exact or inferred attempt evidence when it uses kept shots, and the calculation of expected agent-minutes saved per week. A candidate without those inputs is labeled unpriced and ranks below every priced one.
 
@@ -302,7 +304,7 @@ Measured 2026-10-06/07 on the build machine, 300 s split, Sep 9 PDT to 2026-10-0
 4. Unpriced: other BRP calls (52 min in long episodes at the 5-min split, but the timelines do not name the BRP calls), and the 107 failed shots with no attributable error text (74 min a week). The proposal records each failure's text so the next re-rank can price that group.
 5. Dropped: the fit-timeout text. All nine timeouts fell on 2026-10-07 and 08, and there have been none since 2026-10-08 12:48 EDT.
 
-**Deferred:** the shot tool's refusals fix (help text for `--margin` 0–0.45 and a fix hint in the "pose needs focus and radius" and "not inside a git worktree; pass --views-file" refusals) — the user, 2026-10-07: "wait a week on the screenshot refusal fix". Deferred, not declined: when G1 clears, re-rank every candidate, this one included, from a week of data and send natedev the top one.
+**Deferred:** the shot tool's refusals fix (help text for `--margin` 0–0.45 and a fix hint in the "pose needs focus and radius" and "not inside a git worktree; pass --views-file" refusals) — the user, 2026-10-07: "wait a week on the screenshot refusal fix". Deferred, not declined: when G1 clears, re-rank every candidate, this one included, from a week of data and send natedev the top one. Built as Phase 10 (540c062) after the 2026-10-14 re-rank.
 
 ### Phase 7 — We know what fills a long `/hana_shot` episode, and its fix comes back priced · status: done
 
@@ -374,30 +376,22 @@ Measured 2026-10-06/07 on the build machine, 300 s split, Sep 9 PDT to 2026-10-0
 
 ### Phase 10 — Every `/hana_shot` failure names its next step, and the screenshot report follows the user's zone · status: done
 
-**Depends on:** Phase 9
+#### As-built
 
-Approved by the user on 2026-10-15 through the showrunner: "okay - i like the failure fix ... failure records keep their error text - great ... approved". The zone half is the showrunner's addition from the same message. It comes from the 2026-10-14 re-rank under Phase 6.
-
-#### Work Order
-
-**Goal:** an agent whose `/hana_shot` call fails reads the fix in the failure itself and gets its next shot in about one turn. Each failure record keeps its error text, and every time in `/shot_report` follows `~/.claude/config/user_zone.conf`.
-
-**Spec:**
-- Rejected fit (`scripts/hana_shot/hana_shot.py:810`): the message names the fallbacks agents used — `--mode pose` with `--focus`/`--radius`, or a fit on a parent target that has geometry. When the target's nearest ancestor with an AABB can be found from data the run already holds, name it as a ready selector; add no BRP round trip only for the hint.
-- Target found nothing (`:951`): for an `entity:` selector, say that entity ids change when Hana restarts and to select by `name:`, `tool:` or `marker:`. For `name:`/`tool:`, list up to five closest names or kinds from the entities the resolve already read (stdlib `difflib`). When the selector matched several entities, list them with their names, not only their ids.
-- Refusals: `--margin` help (`:2330`) states the range `0 to 0.45` and what the number means. The pose refusal (`:1676`) names the missing flags with an example. The view-name refusals (`:1605`, `:2160`) give a valid example built from the refused name.
-- Each failure's invocation record (`:1527`, `:1545`) gains its error text, as one string field, alongside `failure_reason`. Success records do not change. Old records without the field still read. The shot report needs no change to read it. `commands/hana_shot.md` lists the field.
-- Zone: rename `_pacific` in `scripts/shot_report/shot_report.py` to `_user_time`, and update its test. Build the weekly heading (`:606`) from the zone (`user_zone_name()` or the label). The baseline lines (`:942`, `:943`) keep their fixed instant, Sep 9 00:00 PDT = 2026-09-09T07:00Z, but print it through `_user_time`. After the change, no fixed zone name (Pacific, PDT, PST, Los_Angeles, Eastern, EDT, New_York) remains in `scripts/shot_report/*.py`, `scripts/hana_shot/*.py` or the two command docs. Tests may pin `USER_ZONE`.
-- `changes.json` gains a product change (failure texts) and a measurement change (error text in records), both for natedev and the Mac, effective at the checkpoint. The director appends them at checkpoint.
+- A rejected fit names `shot --target <quoted label> --mode pose --focus 0,0,0 --radius 6` (a stored `--view` ignores pose flags) or a fit on a parent with geometry. It also names the nearest cached ancestor with an AABB as `--target entity:<id> (<name>)`, from `TargetEvidence`: names, parents and the AABB set, observed from queries the run already makes. An explicit `has[AABB]` false drops an entity.
+- A target that finds nothing: an `entity:` selector says ids change when Hana restarts; `name:`/`tool:` lists up to five closest names or kinds (`difflib`). An ambiguous target lists `entity:<id> (<name>)` per match.
+- The margin refusal and `--margin` help state the range 0 to 0.45 and "fraction of the viewport kept clear on each side (0.1 = 10%)". The pose refusal names the missing flags with an example. View-name refusals (`view_name_refusal`) suggest a valid name built from the refused one.
+- Every failed invocation and failed attempt record carries `error`: one string, several failures joined by newlines; success records have none, and old records without it still read. `CaptureFailure(reason, error)` replaces the bare reason list. Argparse errors reach the record through `RequestArgumentParser`/`ArgumentExit`. A signal exit appends "terminated by SIG…" after earlier failures, so the first real `failure_reason` stays; an unhandled exception appends its type and text, then re-raises.
+- `/shot_report`: `_user_time` prints in `user_zone.conf`'s zone, the weekly heading names the zone, and baseline lines keep the instant 2026-09-09T07:00Z but print it in the user zone. No fixed zone name remains in either script dir or the two command docs. `changes.json` holds a product change and a measurement change for this, on natedev and the Mac.
 
 **Files:**
-- `scripts/hana_shot/hana_shot.py`, `scripts/hana_shot/test_hana_shot.py`, `commands/hana_shot.md`
-- `scripts/shot_report/shot_report.py`, `scripts/shot_report/test_shot_report.py`, `commands/shot_report.md`
+- `scripts/hana_shot/hana_shot.py` — failure hints, `TargetEvidence`, `CaptureFailure`, `view_name_refusal`, `RequestArgumentParser`/`ArgumentExit`, `error` on failure records
+- `scripts/hana_shot/test_hana_shot.py` — a test per hint and per record path, against the fake BRP server
+- `commands/hana_shot.md` — lists the `error` field and the margin meaning
+- `scripts/shot_report/shot_report.py` — `_user_time`, zone-named weekly heading and baseline lines
+- `scripts/shot_report/test_shot_report.py` — zone tests with a pinned `USER_ZONE`
+- `commands/shot_report.md` — no fixed zone name
 
-**Workers:** 1 writer + 1 tester.
-- `impl`: `scripts/hana_shot/hana_shot.py`, `scripts/shot_report/shot_report.py`, `commands/hana_shot.md`, `commands/shot_report.md`
-- `test`: `scripts/hana_shot/test_hana_shot.py`, `scripts/shot_report/test_shot_report.py`
+**Binds later work:** the re-rank in "Proposals: the next change, ranked by measured minutes saved" reads failure texts from the records' `error` field, not transcripts, and compares the weeks before and after this change.
 
-**Verification:** `python3 -m unittest discover -s scripts/hana_shot -p 'test_*.py'`, `python3 -m unittest discover -s scripts/shot_report -p 'test_*.py'`, and `python3 -m unittest discover -s scripts/lib -p 'test_*.py'` (`test_user_zone` scans every script). Then `basedpyright` on each changed `.py` file, ending `0 errors, 0 warnings, 0 notes`. Run lint once after the last edit and the suites after it.
-
-**Acceptance gate:** a test for each new message (rejected fit, stale entity, closest names, several matches, pose, view name, margin help). A failure record carries its error text and a success record does not. The weekly heading follows a pinned `USER_ZONE`. A grep for the fixed zone names finds none outside the tests' pins. All three suites pass, and basedpyright is clean.
+**Gotchas:** the hints that need live Hana are covered by the fake BRP server only. The fake server projects only requested components, so a test that depends on parents needs the query to ask for `ChildOf`.
