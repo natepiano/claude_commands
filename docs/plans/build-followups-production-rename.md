@@ -74,39 +74,26 @@
 
 ### Phase 2 — rename.py plan|apply (production-wide)  · status: done
 
-#### Work Order
+#### As-built
 
-**Goal:** `rename.py plan <old> <new>` prints every move in items 1-6 of the slug list without touching anything. `apply` performs them atomically and stops at the first refusal.
-
-**Depends on:** Phase 1
-
-**Spec:**
-- `new` must match `tidy_wrapped.SLUG`, must not be in `SHARED`, and must not already be a timer slug or a Formerly entry.
-- Plan items, in apply order:
-  1. `git mv` the doc to `<new>-production.md` and add or extend `**Formerly:**`.
-  2. Rewrite every unit plan's Production header.
-  3. Rename the notifier instance dir and rewrite the doc path in its `conf` CHECK.
-  4. Rename the four showrunner state paths and rewrite every `parent` file containing `<old>`.
-  5. Rename each stall-watch file `sha256(old\0unit)` to `sha256(new\0unit)`, for each Units row.
-  6. Rename the review-pool dir.
-  7. Create the merge branch `<new>` at `<old>`'s tip, push it, and keep `<old>` until `finish`. Rewrite the Merge branch line.
-- The doc and plan edits land as one commit on the merge branch, in the showrunner's checkout: `chore(<new>): rename production from <old>`.
-- `apply` writes a journal `SHOWRUNNER_STATE_DIR/<new>/rename.json` (step, done flag), so a rerun resumes.
-- All paths are env-overridable as in showrunners.py, so the tests run against temp dirs.
+- `rename.py plan <old> <new>` builds a `RenamePlan` (frozen dataclass of `PathMove(source, destination)` moves) and prints every move without writing.
+- `rename.py apply <old> <new>` runs seven steps in order under `rename.lock`: (1) add or extend `**Formerly:**` as the first bullet of `## Production Context`, point the notifier `conf` CHECK at the new doc, `git mv` to `<new>-production.md`; (2) rewrite every unit plan's Production header (both header forms, plus the doc path); (3) rename the notifier instance dir; (4) move the four showrunner state paths and rewrite every `parent` file naming `<old>`, keeping any prior journal as `rename-history/<old>.json`; (5) move stall-watch files `sha256(old\0unit)` → `sha256(new\0unit)` per Units row; (6) move the review-pool dir; (7) create branch `<new>` at the old merge branch's tip, rewrite the Merge branch line, commit `chore(<new>): rename production from <old>` (new doc, old doc deletion, plan edits) and push with upstream.
+- Refusals: bad or `SHARED` slug; `new` already a current or former slug; `old` without an update timer; checkout not on the merge branch or not clean; an existing local or origin `<new>` branch; any existing destination; an unfinished prior rename; the merge branch moving mid-rename; unrelated checkout changes.
+- A rerun resumes after the last recorded step and accepts the source, the destination, or any former name resolving to either.
 
 **Files:**
-- `scripts/production/rename.py` — new: `plan`, `apply`.
-- `scripts/production/test_rename.py` — new.
+- `scripts/production/rename.py` — `plan` and `apply`, `RenamePlan`, `PathMove`.
+- `scripts/production/test_rename.py` — fixture production with a bare origin; plan, apply, resume and refusal tests.
 
-**Workers:** 1 writer + 1 tester
-- `impl` — rename.py; hub: `scripts/production/rename.py`.
-- `test` — test_rename.py, on a fixture modeled on test_production_lifecycle.py:77-180: plan prints every item; apply moves every one; a rerun after a simulated failure at step 4 resumes; refusals for a bad or taken slug.
+**Binds later work:** for "rename.py unit|finish": the journal `SHOWRUNNER_STATE_DIR/<new>/rename.json` (version 1, every move, `step`, `done`) is left at step 7 with `done: false` by apply and set done by finish; the old merge branch `<old>` is kept until finish; `RenamePlan.merge_branch` comes from the doc's Merge branch line and may differ from the old slug; retired Units rows contribute units but no plan paths.
 
-**Constraints from prior phases:** `canonical_slug` resolves Formerly entries, read only from the doc's `## Production Context` section, and returns an unknown slug unchanged (it never raises). `apply` must add the Formerly line inside Production Context before renaming the timer dir, so lookups never fail in between.
+**Gotchas:**
+- Retired Units rows (Plan cell starting `(retired`) feed stall-watch moves but never a plan path, whatever their prose quotes (a backticked `/unit:report` is not a path).
+- CHECK names the new doc before `git mv`, so the timer always names a readable doc; CHECK is rewritten by shell-parsed token (the argument after `production_check.sh`) and re-quoted with `shlex.quote`, since it can hold a shell-escaped path.
+- A retry after a `git mv` that moved the file but not the index removes the old doc from the index explicitly.
+- Every path honors the showrunners.py env overrides; never run against live state.
 
-**Acceptance gate:** `python3 -m unittest scripts.production.test_rename` green; basedpyright 0/0.
-
-### Phase 3 — rename.py unit|finish (per unit)  · status: todo
+### Phase 3 — rename.py unit|finish (per unit)  · status: done
 
 #### Work Order
 
@@ -115,25 +102,29 @@
 **Depends on:** Phase 2
 
 **Spec:**
-- `unit` refuses while the unit's tmux session has a live Claude in the worktree; the check uses `unit_lookup.py pane`.
+- `unit` refuses while the unit's tmux session has a live Claude in the worktree, or when its state cannot be told: it inspects unit_lookup's `LiveClaude | ClaudeNotRunning | ClaudeUnknown` result (the `pane` command prints a pane in every state, so its output alone is not a liveness check), refuses `LiveClaude` and `ClaudeUnknown`, and proceeds on `ClaudeNotRunning`.
+- `unit` and `finish` start only once the journal shows step 7; each records its own progress in the journal under the existing `rename.lock`, keeps the `done` flag it read, and resumes an interrupted unit move or branch deletion on rerun. `finish` run again after success is a no-op.
+- Session discovery keeps working while sessions still carry old-slug marks: `unit_lookup.py` normalizes each discovered session's production through `canonical_slug` before grouping, keeping duplicate detection, so `list` and `pane` find a unit under either slug from apply until the unit is relaunched.
 - Branch: create `<new>-<stem>` at the old tip, push it, and delete the old local and remote branch only after the push succeeds.
 - Worktree: `git worktree move` it to the new path, then `git worktree repair`, as in `relocate_legacy_worktree`.
 - For each `~/.claude*/` config dir holding them: rename `projects/<old-path-dashed>` to `projects/<new-path-dashed>`. In `.claude.json` `projects`, copy the old worktree path's entry to the new path's key and leave the old key in place, writing atomically with rename_state's writers. Live sessions on that account rewrite the whole file from memory, so read it back after 2 s and write again if the new key is gone, up to 3 tries. After that, refuse and name the file; the unit then gets one trust prompt at its next launch, which is the only cost.
 - Rewrite the unit's Units row Worktree and Branch cells in the same commit style as Phase 2.
 - The tmux mark is rewritten when the unit is next launched by add_unit; `unit` prints that.
-- `finish` refuses while any Units row still names an `<old>`-prefixed branch. It then deletes the `<old>` merge branch locally and on origin and marks the journal done.
+- `finish` refuses while any Units row still names an `<old>`-prefixed branch. It then deletes the journal's recorded `merge_branch` (read from Production Context; it may differ from `<old>`) locally and on origin and marks the journal done.
 
 **Files:**
 - `scripts/production/rename.py` — `unit`, `finish`.
+- `scripts/production/unit_lookup.py` — canonical production for discovered sessions.
 - `scripts/production/test_rename.py` — tests.
+- `scripts/production/test_unit_lookup.py` — tests.
 
 **Workers:** 1 writer + 1 tester
-- `impl` — rename.py.
-- `test` — test_rename.py: a unit move on a temp repo with a worktree, and a temp config dir holding a projects dir and a `.claude.json` key; refusal while live; finish refuses while a row is unmoved.
+- `impl` — rename.py and unit_lookup.py; hub: rename.py.
+- `test` — test_rename.py and test_unit_lookup.py: a unit move on a temp repo with a worktree, and a temp config dir holding a projects dir and a `.claude.json` key; refusal while live and while unknown, success while stopped; finish refuses while a row is unmoved; retries of an interrupted unit move and finish; repeated finish; finish with a merge branch that differs from the slug; a later rename archiving the completed journal; list and pane finding an old-marked session under both slugs.
 
-**Constraints from prior phases:** the journal at `SHOWRUNNER_STATE_DIR/<new>/rename.json`; Formerly resolution; Phase 2 keeps the old merge branch until `finish`.
+**Constraints from prior phases:** the journal at `SHOWRUNNER_STATE_DIR/<new>/rename.json` (apply leaves it at step 7 with `done: false`; `finish` sets `done: true`); Formerly resolution; Phase 2 keeps the old merge branch until `finish`. A retired Units row (Plan cell starting `(retired`, `add_unit.plan_cell_is_retired`) has no live worktree: `unit` refuses it, and `finish` ignores retired rows when it checks for unmoved `<old>`-prefixed branches. The live build-followups doc has such rows.
 
-**Acceptance gate:** `python3 -m unittest scripts.production.test_rename` green; basedpyright 0/0.
+**Acceptance gate:** `python3 -m unittest scripts.production.test_rename scripts.production.test_unit_lookup` green; basedpyright 0/0.
 
 ### Phase 4 — Command doc and as-built  · status: todo
 
@@ -144,7 +135,7 @@
 **Depends on:** Phase 3
 
 **Spec:**
-- `commands/showrunner/rename.md`: the order is plan, then apply, then for each unit between its runs `unit`, then `finish`. Tell each unit director its new worktree path before it resumes. Never rewrite history.
+- `commands/showrunner/rename.md`: the order is plan, then apply, then for each unit between its runs `unit`, then `finish`. Tell each unit director its new worktree path before it resumes. Never rewrite history. Say that apply finishing is not the end (the old merge branch stays until `finish`); that a refused or interrupted step is retried by rerunning the same command, which accepts the old name, the new name, or a former name; and that `rename.lock` is internal coordination and `rename-history/` is archival state.
 - Add the `**Formerly:**` line to `~/.claude/docs/production_format.md`'s doc structure, in the Production Context list.
 - `docs/as-built/production-rename.md`.
 
@@ -169,7 +160,7 @@
 **Depends on:** Phase 4
 
 **Spec:**
-- Build a scratch production with one unit by hand, as test_production_lifecycle.py:77-180 does: a scratch git repo whose origin is a local bare repo, a doc, a Units row, a worktree, and state dirs pointed at a scratch root through the env overrides. Run the real `rename.py` CLI: plan, apply, unit and finish. No branch reaches GitHub. Check `showrunners.py address <old>` and `<new>`, `unit_lookup.py list <old>`, the stall watch and the review-pool lease paths.
+- Build a scratch production with one unit by hand, as test_production_lifecycle.py:77-180 does: a scratch git repo whose origin is a local bare repo, a doc, a Units row, a worktree, and state dirs pointed at a scratch root through the env overrides. Run the real `rename.py` CLI: plan, apply, unit and finish. No branch reaches GitHub. Create isolated session fixtures (a running showrunner and a marked unit) so lookups have something to find. Check that `showrunners.py address` and `unit_lookup.py list` give the same non-empty answer under `<old>` and `<new>` after apply, between apply and the unit move, and after finish, plus the stall watch and the review-pool lease paths.
 - Then delete the scratch root, which holds every path the check created.
 - Never touch a real production's state.
 
