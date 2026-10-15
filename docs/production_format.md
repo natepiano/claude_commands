@@ -105,10 +105,9 @@ The production doc sits beside the source plan as `<source-stem>-production.md`.
   `Change-Review:` line a merged checkpoint names. Omit when the production keeps none; its
   checkpoints still carry the lines
 - **Review pool:** code (or `code, ui`); omit when the production has none
-- **Proposals:** <folder for finished proposals, e.g. `~/rust/hanadocs/proposals`>; its
-  `index.md` holds one row for each, `| Date | Proposal | Unit | Summary | Status |`,
-  added by the showrunner, and `/showrunner:proposals` shows every row whose Status is
-  not closed; omit when the production keeps no such folder
+- **Proposals:** <the issues folder the production files its proposals in, e.g.
+  `~/rust/hanadocs/issues`>; `/showrunner:proposals` lists every open issue there tagged
+  `proposal`; omit when the production keeps none
 
 The showrunner's session name is not in the doc: a name can change, so it is
 looked up when needed. `~/.claude/scripts/lib/py
