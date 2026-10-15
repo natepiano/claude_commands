@@ -36,10 +36,6 @@ ACTIVE_OVERRIDE = os.environ.get("PLAN_DELEGATE_ACTIVE_DIR")
 # writing.
 MAX_AGE_SECONDS = 12 * 60 * 60
 
-# heartbeat_watch.sh beats every 60s by default (its INTERVAL_SECS). Three beats
-# of slack distinguishes "delegate is working" from "the log stopped moving".
-LIVE_HEARTBEAT_SECONDS = 180
-
 
 def marker_path(session_id: str) -> Path:
     return unit_runs.marker(session_id, ACTIVE_OVERRIDE)
@@ -88,10 +84,10 @@ def delegate_working(session_dir: Path) -> bool:
     is nothing to gain by refusing that stop.
     """
     try:
-        age = time.time() - (session_dir / "heartbeat.log").stat().st_mtime
+        age = time.time() - (session_dir / unit_runs.HEARTBEAT).stat().st_mtime
     except OSError:
         return False
-    return age <= LIVE_HEARTBEAT_SECONDS
+    return age <= unit_runs.LIVE_HEARTBEAT_SECS
 
 
 def _text(path: Path) -> str:

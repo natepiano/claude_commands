@@ -11,6 +11,7 @@ import os
 import shlex
 import subprocess
 import sys
+import syslog
 import tempfile
 import threading
 import time
@@ -18,7 +19,7 @@ import unittest
 from collections.abc import Callable, Iterable, Sequence
 from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
-from typing import Literal, cast, final, override
+from typing import Literal, TypedDict, cast, final, override
 from unittest.mock import patch
 
 from test_support import registry_confirmation, ShutdownSendLeaf, ShutdownTestCase
@@ -124,6 +125,7 @@ def common_session(
         "cwd": cwd or f"/tmp/{session_id}",
         "status": "idle",
         "updated_at": 0,
+        "probe": False,
         "model": model or inventory.NoReplyYet(kind="no reply yet"),
         "checkout": checkout(),
         "run_dirs": list(run_dirs or []),
@@ -218,7 +220,7 @@ def entry(
     return SessionShutdown(
         login=LOGIN, label=LABEL, machine="natedev", requested_at=STOPPED,
         request_id="request", requested_by=record.FromTerminal(kind="terminal"),
-        hold="session", then="restart", force="wait for ready", alerts="user",
+        hold="session", then="restart", force="wait for ready", alerts="user", probe=False,
         session=session, workers=[], timers=list(timers or []),
         settle_message=record.SettleMessageNotSent(kind="not sent"),
         where=where or record.WhereSaid(kind="said", text=f"working on {session['name']}", at=STOPPED),
@@ -247,7 +249,13 @@ def session_shutdown(
     return item
 
 
-def peer_json(*, outcome: str = "done", lines: Sequence[str] = (), missing: Sequence[record.NoRemoteControl] = (), refused: Sequence[restart.RestartRefusal] = ()) -> str:
+class LegacyPeerRemoteControl(TypedDict):
+    session_id: str
+    name: str
+    alerts: Literal["user", "none"]
+
+
+def peer_json(*, outcome: str = "done", lines: Sequence[str] = (), missing: Sequence[LegacyPeerRemoteControl] = (), refused: Sequence[restart.RestartRefusal] = ()) -> str:
     return json.dumps({"machine": "Mac", "label": LABEL, "outcome": outcome, "lines": lines,
         "no_remote_control": missing, "refused": refused})
 
@@ -2605,7 +2613,7 @@ class RestartTests(ShutdownTestCase):
         record.set_account_hold(hold)
         with patch.object(restart, "own_claude_account", side_effect=UnreadableAccount("unreadable")), patch.object(restart, "run_remote", return_value=(0, "[]")), patch.object(restart, "_up", return_value=restart.MachineRestartResult("natedev", LABEL, "nothing")) as up, redirect_stdout(io.StringIO()):
             self.assertEqual(restart.restart(restart.AccountNotNamed(), dry_run=False, alerts=restart.NeverAlert()), 0)
-        up.assert_called_once_with(LOGIN, False, (), notify=False)
+        up.assert_called_once_with(LOGIN, False, ())
 
     def test_restart_account_choice_includes_a_peer_hold_without_sessions(self) -> None:
         hold = record.AccountHold(
@@ -2616,7 +2624,7 @@ class RestartTests(ShutdownTestCase):
             return (0, json.dumps([hold])) if args[0] == "holds" else (0, "[]") if args[0] == "records" else (0, "")
         with patch.object(restart, "own_claude_account", side_effect=UnreadableAccount("unreadable")), patch.object(restart, "run_remote", remote), patch.object(restart, "_up", return_value=restart.MachineRestartResult("natedev", LABEL, "nothing")) as up, redirect_stdout(io.StringIO()):
             self.assertEqual(restart.restart(restart.AccountNotNamed(), dry_run=False, alerts=restart.NeverAlert()), 0)
-        up.assert_called_once_with(LOGIN, False, (), notify=False)
+        up.assert_called_once_with(LOGIN, False, ())
 
     def test_window_hosts_launch_serially_on_the_calling_thread_with_spacing(self) -> None:
         saved = [
@@ -2875,8 +2883,7 @@ class RestartTests(ShutdownTestCase):
         incomplete["alerts"] = "none"
         self.create([complete, incomplete])
 
-        def up(_login: str, _dry_run: bool, _only: Iterable[str], *, notify: bool) -> restart.MachineRestartResult:
-            del notify
+        def up(_login: str, _dry_run: bool, _only: Iterable[str]) -> restart.MachineRestartResult:
             record.archive_session(LOGIN, "complete")
             return restart.MachineRestartResult("natedev", LABEL, "partial", failed=1)
 
@@ -3282,6 +3289,60 @@ class RestartTests(ShutdownTestCase):
             self.assertEqual(restart.restart(restart.AccountNamed(LABEL), only=["peer"], dry_run=False, alerts=restart.AlertWhenNotBack()), 1)
         alert.assert_not_called()
         self.assertEqual(record.find_session(LOGIN, "sibling"), sibling)
+
+    def test_resume_parts_preserve_probe_marker_only_for_probe_records(self) -> None:
+        for probe in (False, True):
+            with self.subTest(probe=probe):
+                saved = entry(top_level("probe-owner", host=tmux_host("probe-owner")))
+                saved["probe"] = probe
+                parts = restart._resume_parts(saved["session"], "continue", probe=saved["probe"])  # pyright: ignore[reportPrivateUsage]
+                if probe:
+                    self.assertEqual(parts.environment["CLAUDE_PROBE_SESSION"], "1")
+                else:
+                    self.assertNotIn("CLAUDE_PROBE_SESSION", parts.environment)
+
+    def test_tmux_unit_restore_carries_probe_policy_through_the_clean_subprocess(self) -> None:
+        for probe in (False, True):
+            for target in ("", "claude3"):
+                with self.subTest(probe=probe, target=target):
+                    saved = entry(unit("probe-unit"))
+                    saved["probe"] = probe
+                    if target:
+                        saved["target"] = target
+                    with (patch.dict(os.environ, {"CLAUDE_PROBE_SESSION": "1"}),
+                          patch.object(subprocess, "run", return_value=subprocess.CompletedProcess([], 0, "", "")) as launch):
+                        result = restart._launch_session(saved, "continue", self.desktop_state, dry_run=False)  # pyright: ignore[reportPrivateUsage]
+                    self.assertIsInstance(result, restart.SessionLaunched)
+                    launch.assert_called_once()
+                    argv = cast(list[str], launch.call_args.args[0])
+                    self.assertEqual(argv[argv.index("--resume") + 1], saved["session"]["session_id"])
+                    self.assertEqual("--probe" in argv, probe)
+                    environment = cast(dict[str, str], launch.call_args.kwargs["env"])
+                    self.assertNotIn("CLAUDE_PROBE_SESSION", environment)
+                    if target:
+                        self.assertEqual(argv[argv.index("--account") + 1], target)
+
+    def test_probe_record_reaches_manual_restart_and_move_commands(self) -> None:
+        for target in ("", "claude3"):
+            with self.subTest(target=target):
+                saved = entry(top_level("probe-manual"))
+                saved["probe"] = True
+                if target:
+                    saved["target"] = target
+                result = restart._launch_session(saved, "continue", self.desktop_state, dry_run=False)  # pyright: ignore[reportPrivateUsage]
+                self.assertIsInstance(result, restart.ManualRestartRequired)
+                assert isinstance(result, restart.ManualRestartRequired)
+                self.assertIn("CLAUDE_PROBE_SESSION=1", result.command)
+                if target:
+                    self.assertIn("exec claude3", result.command)
+
+    def test_old_shutdown_record_without_probe_loads_as_non_probe(self) -> None:
+        saved = cast(dict[str, object], json.loads(json.dumps(entry(top_level("old-owner")))))
+        _ = saved.pop("probe", None)
+        restored = record.parse_session_records(json.dumps([saved]))
+        self.assertEqual(len(restored), 1)
+        self.assertFalse(restored[0]["probe"])
+
     def test_remote_control_missing_archives_restart_and_launches_fixer_without_push(self) -> None:
         for policy in ("user", "none"):
             for command_alerts in (restart.AlertWhenNotBack(), restart.NeverAlert()):
@@ -3293,65 +3354,57 @@ class RestartTests(ShutdownTestCase):
                     output = io.StringIO()
                     with patch.object(restart, "named_claude_account", return_value=self.account), patch.object(restart, "_retire"), patch.object(restart, "_launch_session", return_value=restart.SessionLaunched()), patch.object(restart, "_live_session_ids", return_value=frozenset()), patch.object(restart, "wait_for_confirmation", return_value=restart.RegistryConfirmation((sessions.SessionRecord(pid=912, sessionId="owner", name="Owner", procStart="resumed-start", messagingSocketPath="", updatedAt=1, tmux="", formerNames=[]),))), patch.object(remote_control, "launch_fixer") as fixer, patch.object(restart, "wait_for_remote_control", return_value=frozenset()) as check, patch.object(restart, "_send_restart_note", return_value=settle.MessageSent(kind="sent")), patch.object(settle, "alert_user") as alert, redirect_stdout(output):
                         self.assertEqual(restart.restart(restart.AccountNamed(LOGIN), dry_run=False, alerts=command_alerts, here=True), 0)
-                    self.assertIn("Owner: Remote Control not on yet;", output.getvalue())
+                    self.assertNotIn("Remote Control", output.getvalue())
                     check.assert_called_once()
                     self.assertIsNone(record.find_session(LOGIN, "owner"))
                     history = list((self.state_root / LOGIN / "history").glob("*.json"))
                     self.assertEqual(cast(dict[str, object], json.loads(history[-1].read_text()))["progress"], {"kind": "restarted", "at": RESTARTED})
                     alert.assert_not_called()
-                    fixer_policy = policy if isinstance(command_alerts, restart.AlertWhenNotBack) else "none"
-                    fixer.assert_called_once_with("owner", 912, "resumed-start", "Owner", fixer_policy, "Owner")
-                    self.assertIn("turning it on in the background", output.getvalue())
+                    fixer.assert_called_once_with("owner", 912, "resumed-start", "Owner", "Owner")
 
-    def test_remote_control_fixer_argv_carries_effective_alert_policy(self) -> None:
+    def test_remote_control_fixer_launch_has_no_alert_option_under_any_policy(self) -> None:
         self.allow_leaf(ShutdownSendLeaf.LAUNCH_REMOTE_CONTROL_FIXER)
         saved = entry(unit("owner"))
         saved["session"]["name"] = "Owner"
         confirmed = restart.RegistryConfirmation((sessions.SessionRecord(pid=912,
             sessionId="owner", name="Owner", procStart="resumed-start",
             messagingSocketPath="", updatedAt=1, tmux="", formerNames=[]),))
-        cases: tuple[tuple[Literal["user", "none"], bool, str], ...] = (
-            ("user", True, "user"), ("none", True, "none"), ("user", False, "none"))
-        for policy, notify, expected in cases:
-            with self.subTest(policy=policy, notify=notify):
+        for policy in ("user", "none"):
+            with self.subTest(policy=policy):
                 saved["alerts"] = policy
                 with (patch.object(restart, "wait_for_remote_control", return_value=frozenset()),
                       patch.object(subprocess, "run", return_value=subprocess.CompletedProcess([], 0)) as launch,
                       patch.object(settle, "alert_user") as alert, redirect_stdout(io.StringIO())):
-                    _ = restart.remote_control_missing([saved], confirmed, notify=notify)
+                    _ = restart.remote_control_missing([saved], confirmed)
                 launch.assert_called_once()
                 argv = cast(list[str], launch.call_args.args[0])
-                self.assertEqual(argv[argv.index("--alerts") + 1], expected)
+                self.assertNotIn("--alerts", argv)
                 self.assertEqual(argv[argv.index("--pid") + 1], "912")
                 self.assertEqual(argv[argv.index("--who") + 1], "owner unit")
                 self.assertEqual(argv[argv.index("--session") + 1], "Owner")
                 self.assertEqual(argv[argv.index("--proc-start") + 1], "resumed-start")
                 alert.assert_not_called()
 
-    def test_remote_control_launch_failure_prints_manual_action_and_only_alerts_when_allowed(self) -> None:
+    def test_remote_control_launch_failure_is_quiet_under_every_alert_policy(self) -> None:
         saved = entry(unit("owner"))
         saved["session"]["name"] = "Owner"
         confirmed = restart.RegistryConfirmation((sessions.SessionRecord(pid=912,
             sessionId="owner", name="Owner", procStart="resumed-start",
             messagingSocketPath="", updatedAt=1, tmux="", formerNames=[]),))
         for policy in ("user", "none"):
-            for notify in (True, False):
-                with self.subTest(policy=policy, notify=notify):
-                    saved["alerts"] = policy
-                    output = io.StringIO()
-                    with (patch.object(restart, "wait_for_remote_control", return_value=frozenset()),
-                          patch.object(remote_control, "launch_fixer", side_effect=OSError("service unavailable")) as launch,
-                          patch.object(settle, "alert_user") as alert, redirect_stdout(output)):
-                        _ = restart.remote_control_missing([saved], confirmed, notify=notify)
-                    launch.assert_called_once_with("owner", 912, "resumed-start", "owner unit", policy if notify else "none", "Owner")
-                    self.assertEqual(output.getvalue(), "Owner: Remote Control is off; turn it on at its terminal with /remote-control\n")
-                    if policy == "user" and notify:
-                        alert.assert_called_once()
-                        push = cast(RenderedPush, alert.call_args.args[0])
-                        self.assertEqual(push.title, "owner unit remote-control is off")
-                        self.assertEqual(push.message, "Session: Owner\nAction: run /remote-control\nReason: Remote control is off.")
-                    else:
-                        alert.assert_not_called()
+            with self.subTest(policy=policy):
+                saved["alerts"] = policy
+                output = io.StringIO()
+                with (patch.object(restart, "wait_for_remote_control", return_value=frozenset()),
+                      patch.object(remote_control, "launch_fixer", side_effect=OSError("service unavailable")) as launch,
+                      patch.object(syslog, "syslog") as journal,
+                      patch.object(settle, "alert_user") as alert, redirect_stdout(output)):
+                    _ = restart.remote_control_missing([saved], confirmed)
+                launch.assert_called_once_with("owner", 912, "resumed-start", "owner unit", "Owner")
+                journal.assert_called_once()
+                self.assertIn("service unavailable", cast(str, journal.call_args.args[1]))
+                self.assertEqual(output.getvalue(), "")
+                alert.assert_not_called()
 
     def test_remote_control_active_restart_sends_no_alert(self) -> None:
         saved = entry(top_level("owner", name="Owner", host=tmux_host("owner")))
@@ -3362,16 +3415,25 @@ class RestartTests(ShutdownTestCase):
         self.assertIsNone(record.find_session(LOGIN, "owner"))
         alert.assert_not_called()
 
-    def test_remote_control_peer_diagnostic_starts_no_local_fixer_or_push(self) -> None:
+    def test_legacy_peer_remote_control_entries_start_no_local_fixer_or_push(self) -> None:
         for policy in ("user", "none"):
             with self.subTest(policy=policy):
-                diagnostic = "Remote: Remote Control not on yet; turning it on in the background"
-                missing = record.NoRemoteControl(session_id="peer", name="Remote", alerts=policy)
-                with patch.object(restart, "named_claude_account", return_value=self.account), patch.object(restart, "run_remote", return_value=(0, peer_json(lines=[diagnostic], missing=[missing]))), patch.object(settle, "alert_user") as alert, patch.object(remote_control, "launch_fixer") as fixer, redirect_stdout(io.StringIO()) as output:
+                missing = LegacyPeerRemoteControl(session_id="peer", name="Remote", alerts=policy)
+                with patch.object(restart, "named_claude_account", return_value=self.account), patch.object(restart, "run_remote", return_value=(0, peer_json(missing=[missing]))), patch.object(settle, "alert_user") as alert, patch.object(remote_control, "launch_fixer") as fixer, redirect_stdout(io.StringIO()) as output:
                     self.assertEqual(restart.restart(restart.AccountNamed(LOGIN), dry_run=False, alerts=restart.AlertWhenNotBack()), 0)
-                self.assertIn(diagnostic, output.getvalue())
+                self.assertNotIn("Remote Control", output.getvalue())
                 alert.assert_not_called()
                 fixer.assert_not_called()
+
+    def test_peer_parser_ignores_missing_empty_and_legacy_remote_control_entries(self) -> None:
+        baseline = cast(dict[str, object], json.loads(peer_json()))
+        del baseline["no_remote_control"]
+        expected = restart.parse_peer_result(json.dumps(baseline))
+        for legacy in ([], [{"session_id": "peer", "name": "Remote", "alerts": "user"}],
+                       [{"session_id": "peer", "name": "Remote", "alerts": "none"}], "unread old extension"):
+            with self.subTest(legacy=legacy):
+                parsed = restart.parse_peer_result(json.dumps({**baseline, "no_remote_control": legacy}))
+                self.assertEqual(parsed, expected)
 
     def test_peer_no_shutdown_refusal_keeps_line_without_alert(self) -> None:
         refusal = restart.RestartNoShutdown(kind="no shutdown", session_id="peer", name="Remote")
@@ -3394,7 +3456,7 @@ class RestartTests(ShutdownTestCase):
     def test_peer_result_refuses_old_output_and_invalid_nested_fields(self) -> None:
         valid = cast(dict[str, object], json.loads(peer_json()))
         invalid: list[str] = ["Mac: restarted", "[]", "{}"]
-        for key, value in (("outcome", []), ("lines", [3]), ("no_remote_control", [{"session_id": "x", "name": "X", "alerts": "other"}]), ("refused", [{"kind": "not stopped", "session_id": "x", "name": "X", "progress": "stopped"}])):
+        for key, value in (("outcome", []), ("lines", [3]), ("refused", [{"kind": "not stopped", "session_id": "x", "name": "X", "progress": "stopped"}])):
             invalid.append(json.dumps({**valid, key: value}))
         for response in invalid:
             with self.subTest(response=response), self.assertRaises(ValueError):

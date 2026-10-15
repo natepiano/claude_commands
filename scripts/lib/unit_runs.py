@@ -20,6 +20,11 @@ from typing import TYPE_CHECKING, NamedTuple
 RUN_ROOT = Path("/tmp/claude/unit")
 FORMER_RUN_ROOT = Path("/tmp/claude/delegate")
 INSTANCE_PREFIXES = ("unit-", "delegate-")
+# A run's shared liveness log, beaten every 60 s per worker while one runs.
+HEARTBEAT = "heartbeat.log"
+# A run whose log moved within this window is live. Ten beats of slack, because
+# worker cleanup that reads a live run as dead removes its working workers.
+LIVE_HEARTBEAT_SECS = 600
 
 
 def run_roots(override: str | Path | None = None) -> tuple[Path, ...]:

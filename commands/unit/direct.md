@@ -719,6 +719,10 @@ Run `bash ~/.claude/scripts/delegate/prepare_session.sh` under
 creates the run-active marker and Claude's notifier instance; every exit must
 eventually run `end_session.sh`
 through <RunSummary/> or single-mode completion.
+
+When the plan header carries a `> **Issues:**` line, mark each issue it names
+as being built:
+`~/.claude/scripts/lib/py ~/.claude/scripts/production/proposal_issue.py start <issue>`.
 </PrepareSession>
 
 <ComposeWorkOrder>

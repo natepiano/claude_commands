@@ -44,7 +44,7 @@
 #
 # Concurrency: each post is a single write() to an O_APPEND file descriptor,
 # which is the same guarantee heartbeat.sh relies on for its concurrent wrapper
-# and agent writers. Messages are flattened to one line and capped so a post
+# writers. Messages are flattened to one line and capped so a post
 # never interleaves with another. Tokens use mkdir, which is atomic on POSIX:
 # exactly one of N racing acquirers creates the directory and the rest fail.
 

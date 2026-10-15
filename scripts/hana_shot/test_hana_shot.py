@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
+import math
 import os
 import re
 import shlex
@@ -19,12 +20,17 @@ from typing import NotRequired, TypedDict, cast, override
 import unittest
 import zlib
 
+from scripts.hana_shot import hana_shot
+
 
 SCRIPT = Path(__file__).with_name("hana_shot.py")
 CAMERA_ENTITY = 5
 WINDOW_ENTITY = 3
 NAME = "bevy_ecs::name::Name"
 AABB = "bevy_camera::primitives::Aabb"
+GLOBAL_TRANSFORM = "bevy_transform::components::global_transform::GlobalTransform"
+ORBIT_CAM = "hana_lagrange::orbit_cam::OrbitCam"
+ANIMATE_TO_FIT = "hana_lagrange::fit::triggers::animate::AnimateToFit"
 CHILD_OF = "bevy_ecs::hierarchy::ChildOf"
 EDITOR_CAMERA = "hana::camera::editor_camera::EditorCamera"
 SWITCH_SLIDER = "hana_catalyst::switch::SwitchSlider"
@@ -107,13 +113,16 @@ def png(width: int, height: int, brightness: int = 128) -> bytes:
     return b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", header) + chunk(b"IDAT", zlib.compress(rows)) + chunk(b"IEND", b"")
 
 
-def camera_components(physical_size: tuple[int, int] = (1280, 720), scale_factor: float = 1.0) -> dict[str, object]:
-    angles = {"yaw": 0.0, "pitch": 0.3}
+def camera_components(
+    physical_size: tuple[int, int] = (1280, 720), scale_factor: float = 1.0,
+    yaw: float = 0.0, pitch: float = 0.3, radius: float = 6.0,
+) -> dict[str, object]:
+    angles = {"yaw": yaw, "pitch": pitch}
     return {
         "hana_lagrange::orbit_cam::OrbitCam": {
             "orbit": {"current": angles, "target": angles},
             "pan": {"current": [0.0, 1.0, 0.0], "target": [0.0, 1.0, 0.0]},
-            "zoom": {"current": 6.0, "target": 6.0},
+            "zoom": {"current": radius, "target": radius},
             "update_request": "None",
         },
         "bevy_transform::components::global_transform::GlobalTransform": [1.0, 0, 0, 0, 1.0, 0, 0, 0, 1.0, 0, 2.0, 6.0],
@@ -138,6 +147,10 @@ class Fake:
         ]
         self.named_entity_snapshots: list[list[SceneEntityFixture]] = []
         self.tool_entities: list[tuple[int, str, int, str]] = list(TOOLS)
+        self.fit_moves_camera: bool = False
+        self.camera_yaw: float = 0.0
+        self.camera_pitch: float = 0.3
+        self.camera_radius: float = 6.0
         self.frame: int = 0
         self.screenshot: str = "ok"
         self.remote: Path | None = None
@@ -159,6 +172,11 @@ class Fake:
         with self.lock:
             self.calls.append({"method": method, "params": params})
             screenshots = sum(1 for call in self.calls if call["method"] == "brp_extras/screenshot")
+            if self.fit_moves_camera and method == "world.trigger_event" and params.get("event") == ANIMATE_TO_FIT:
+                fit = cast(dict[str, object], params["value"])
+                self.camera_yaw = cast(float, fit["yaw"])
+                self.camera_pitch = cast(float, fit["pitch"])
+                self.camera_radius = 6.0 * (1.0 + cast(float, fit["margin"]))
             if method == "world.mutate_components" and params.get("component") == WINDOW:
                 width, height = self.window_physical_size
                 if params.get("path") == ".resolution.physical_width":
@@ -181,10 +199,17 @@ class Fake:
         if method == "world.get_resources":
             return {"result": {"value": {"home": {"animation_duration_milliseconds": 2000}}}}
         if method == "world.get_components":
-            return {"result": {"components": camera_components(
-                self.window_physical_size,
-                self.window_scale_factor_override or self.window_scale_factor,
-            ), "errors": {}}}
+            entity = params["entity"]
+            components = camera_components(
+                self.window_physical_size, self.window_scale_factor_override or self.window_scale_factor,
+                self.camera_yaw, self.camera_pitch, self.camera_radius,
+            ) if entity == CAMERA_ENTITY else next(
+                (row["components"] for row in self.named_entities if row["entity"] == entity), dict[str, object](),
+            )
+            requested = cast(list[str], params["components"])
+            return {"result": {
+                "components": {path: components[path] for path in requested if path in components}, "errors": {},
+            }}
         if method == "world.list_components":
             entity = params.get("entity")
             if entity is None:
@@ -224,6 +249,7 @@ def query(fake: Fake, params: dict[str, object]) -> list[SceneEntityFixture]:
         rows = [{"entity": CAMERA_ENTITY, "components": camera_components(
             fake.window_physical_size,
             fake.window_scale_factor_override or fake.window_scale_factor,
+            fake.camera_yaw, fake.camera_pitch, fake.camera_radius,
         )}]
     elif PRIMARY_WINDOW in with_types:
         width, height = fake.window_physical_size
@@ -238,8 +264,10 @@ def query(fake: Fake, params: dict[str, object]) -> list[SceneEntityFixture]:
             {"entity": entity, "components": {path: {"id": tool_id, "definition": definition}}, "has": {AABB: False}}
             for entity, path, tool_id, definition in fake.tool_entities
         ]
-    elif NAME in data.get("components", []):
-        rows = fake.named_entity_snapshots.pop(0) if fake.named_entity_snapshots else fake.named_entities
+    elif NAME in data.get("components", []) or GLOBAL_TRANSFORM in data.get("components", []):
+        if fake.named_entity_snapshots:
+            fake.named_entities = fake.named_entity_snapshots.pop(0)
+        rows = fake.named_entities
     else:
         rows = []
     required = data.get("components", [])
@@ -352,6 +380,341 @@ class HanaShotTest(unittest.TestCase):
 
     def views(self, *args: str) -> subprocess.CompletedProcess[str]:
         return self.run_script("views", *args, "--views-file", str(self.scratch / "views.toml"))
+
+
+def face_transforms() -> dict[str, list[float]]:
+    half = math.sqrt(0.5)
+    sixth = 1.0 / math.sqrt(6.0)
+    third = 1.0 / math.sqrt(3.0)
+    return {
+        "identity": [1.0, 0, 0, 0, 1.0, 0, 0, 0, 1.0, 13, -7, 21],
+        "yawed": [0, 0, -1.0, 0, 1.0, 0, 1.0, 0, 0, 13, -7, 21],
+        "pitched": [1.0, 0, 0, 0, half, half, 0, -half, half, 13, -7, 21],
+        "tilted_scaled": [
+            2 * half, 2 * half, 0,
+            -3 * sixth, 3 * sixth, 6 * sixth,
+            4 * third, -4 * third, 4 * third,
+            13, -7, 21,
+        ],
+    }
+
+
+class FaceAngleTests(unittest.TestCase):
+    def test_all_local_axes_round_trip_through_hana_camera_offset(self) -> None:
+        for label, matrix in face_transforms().items():
+            for column, axis in enumerate(("x", "y", "z")):
+                for sign in ("+", "-"):
+                    face = sign + axis
+                    with self.subTest(transform=label, face=face):
+                        if label in ("identity", "yawed") and axis == "y":
+                            with self.assertRaises(hana_shot.Refused):
+                                _ = hana_shot.face_angles(matrix, face)
+                            continue
+                        direction = matrix[3 * column:3 * column + 3]
+                        length = math.sqrt(sum(value * value for value in direction))
+                        expected = [value / length * (1 if sign == "+" else -1) for value in direction]
+                        yaw, pitch = hana_shot.face_angles(matrix, face)
+                        offset = (
+                            math.sin(yaw) * math.cos(pitch),
+                            math.sin(pitch),
+                            math.cos(yaw) * math.cos(pitch),
+                        )
+                        for actual, wanted in zip(offset, expected, strict=True):
+                            self.assertAlmostEqual(actual, wanted, places=10)
+
+    def test_near_vertical_axis_refuses_inside_one_degree_and_accepts_outside(self) -> None:
+        for degrees in (0.5, 1.5):
+            angle = math.radians(degrees)
+            matrix = [1.0, 0, 0, 0, math.sin(angle), -math.cos(angle),
+                      0, math.cos(angle), math.sin(angle), 0, 0, 0]
+            for face in ("+z", "-z"):
+                with self.subTest(degrees=degrees, face=face):
+                    if degrees < 1:
+                        with self.assertRaises(hana_shot.Refused) as refused:
+                            _ = hana_shot.face_angles(matrix, face)
+                        text = str(refused.exception)
+                        self.assertIn(face, text)
+                        self.assertIn("--yaw 0", text)
+                        self.assertIn("--pitch " + ("1.55" if face == "+z" else "-1.55"), text)
+                    else:
+                        _, pitch = hana_shot.face_angles(matrix, face)
+                        self.assertAlmostEqual(abs(pitch), math.radians(88.5), places=10)
+
+
+class FaceShotTests(HanaShotTest):
+    @override
+    def setUp(self) -> None:
+        super().setUp()
+        self.fake.named_entities = [self.panel(face_transforms()["tilted_scaled"])]
+
+    def panel(self, matrix: list[float]) -> SceneEntityFixture:
+        return {"entity": 101, "components": {NAME: "Panel", GLOBAL_TRANSFORM: matrix}, "has": {AABB: False}}
+
+    def fit_events(self) -> list[dict[str, object]]:
+        return [
+            cast(dict[str, object], request["value"])
+            for request in self.fake.methods("world.trigger_event") if request.get("event") == ANIMATE_TO_FIT
+        ]
+
+    def test_face_fit_event_uses_target_axis_and_preserves_margin_and_record(self) -> None:
+        self.fake.fit_moves_camera = True
+        result = self.shot("--target", "name:Panel", "--face", "+z", "--mode", "fit", "--margin", "0.2")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        [event] = self.fit_events()
+        self.assertEqual(event["target"], 101)
+        self.assertAlmostEqual(cast(float, event["yaw"]), math.pi / 4)
+        self.assertAlmostEqual(cast(float, event["pitch"]), -math.asin(1 / math.sqrt(3)))
+        self.assertEqual(event["margin"], 0.2)
+        [line] = self.timing_lines()
+        self.assertEqual(line["face"], "+z")
+        [attempt] = cast(list[dict[str, object]], line["attempts"])
+        self.assertEqual(attempt["face"], "+z")
+
+    def test_face_pose_defaults_focus_to_translation_and_keeps_radius(self) -> None:
+        result = self.shot("--target", "name:Panel", "--face", "-z", "--mode", "pose", "--radius", "9")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        [mutation] = [request for request in self.fake.methods("world.mutate_components")
+                      if request.get("component") == ORBIT_CAM]
+        pose = cast(dict[str, dict[str, object]], mutation["value"])
+        self.assertEqual(pose["pan"]["current"], [13, -7, 21])
+        self.assertEqual(pose["pan"]["target"], [13, -7, 21])
+        self.assertEqual(pose["zoom"]["current"], 9.0)
+        angles = cast(dict[str, float], pose["orbit"]["current"])
+        self.assertAlmostEqual(angles["yaw"], -3 * math.pi / 4)
+        self.assertAlmostEqual(angles["pitch"], math.asin(1 / math.sqrt(3)))
+        [line] = self.timing_lines()
+        self.assertEqual(line["face"], "-z")
+
+    def test_face_pose_explicit_focus_wins_over_target_translation(self) -> None:
+        result = self.shot("--target", "name:Panel", "--face", "+z", "--mode", "pose",
+                           "--radius", "9", "--focus", "1,2,3")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        [mutation] = [request for request in self.fake.methods("world.mutate_components")
+                      if request.get("component") == ORBIT_CAM]
+        pose = cast(dict[str, dict[str, object]], mutation["value"])
+        self.assertEqual(pose["pan"]["current"], [1, 2, 3])
+
+    def test_face_conflicts_with_explicit_zero_yaw_or_pitch(self) -> None:
+        for flag in ("--yaw", "--pitch"):
+            with self.subTest(flag=flag):
+                result = self.shot("--target", "name:Panel", "--face", "+z", flag, "0")
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertIn("--face", result.stderr)
+                self.assertIn(flag, result.stderr)
+                self.assertRegex(result.stderr.lower(), r"drop|remove|omit")
+        self.assertEqual(self.fake.calls, [])
+
+    def test_face_refuses_modes_without_angles_and_names_supported_modes(self) -> None:
+        for mode in ("home", "hana-frame"):
+            with self.subTest(mode=mode):
+                result = self.shot("--target", "name:Panel", "--face", "+z", "--mode", mode)
+                self.assertEqual(result.returncode, 2, result.stderr)
+                for detail in ("face", mode, "fit", "pose"):
+                    self.assertIn(detail, result.stderr)
+        self.assertEqual(self.fake.calls, [])
+
+    def test_face_pose_requires_target_and_radius(self) -> None:
+        for flags, missing in (
+            (("--radius", "9"), "--target"),
+            (("--target", "name:Panel"), "--radius"),
+        ):
+            with self.subTest(missing=missing):
+                result = self.shot("--mode", "pose", "--face", "+z", *flags)
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertIn(missing, result.stderr)
+        self.assertEqual(self.fake.calls, [])
+
+    def test_vertical_face_refusal_explains_orbit_limit_and_nearby_pose(self) -> None:
+        self.fake.named_entities = [self.panel(face_transforms()["identity"])]
+        for face, pitch in (("+y", "1.55"), ("-y", "-1.55")):
+            with self.subTest(face=face):
+                result = self.shot("--target", "name:Panel", "--face=" + face,
+                                   "--mode", "pose", "--radius", "9")
+                self.assertEqual(result.returncode, 2, result.stderr)
+                for detail in (face, "yaw", "pitch", "--yaw 0", "--pitch " + pitch):
+                    self.assertIn(detail, result.stderr)
+                self.assertRegex(result.stderr.lower(), r"undefined|defin")
+                self.assertRegex(result.stderr.lower(), r"clamp|limit")
+                line = self.timing_lines()[-1]
+                self.assertEqual(line["face"], face)
+                [attempt] = cast(list[dict[str, object]], line["attempts"])
+                self.assertEqual(attempt["face"], face)
+        self.assertEqual(self.fake.methods("brp_extras/screenshot"), [])
+
+    def test_views_add_and_show_preserve_face_without_storing_angles(self) -> None:
+        for mode in ("fit", "pose"):
+            with self.subTest(mode=mode):
+                label = "panel-" + mode
+                flags = ("--radius", "9") if mode == "pose" else ()
+                result = self.views("add", label, "--target", "name:Panel", "--face", "+z", "--mode", mode, *flags)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                document = tomllib.loads((self.scratch / "views.toml").read_text())
+                view = cast(dict[str, object], document["views"][label])
+                self.assertEqual((view["face"], view["mode"], view["target"]), ("+z", mode, "name:Panel"))
+                self.assertNotIn("yaw", view)
+                self.assertNotIn("pitch", view)
+                if mode == "pose":
+                    self.assertEqual(view["radius"], 9)
+                    self.assertNotIn("focus", view)
+                shown = self.views("show", label)
+                self.assertEqual(shown.returncode, 0, shown.stderr)
+                self.assertRegex(shown.stdout, r'(?m)^face\s*=\s*"\+z"$')
+        self.assertEqual(self.fake.calls, [])
+
+    def test_stored_face_pose_loads_and_defaults_focus_to_target(self) -> None:
+        views_path = self.scratch / "views.toml"
+        _ = views_path.write_text('[views.panel]\ntarget = "name:Panel"\nmode = "pose"\nface = "+z"\nradius = 9\n')
+        result = self.shot("--view", "panel", "--views-file", str(views_path))
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        [mutation] = [request for request in self.fake.methods("world.mutate_components")
+                      if request.get("component") == ORBIT_CAM]
+        pose = cast(dict[str, dict[str, object]], mutation["value"])
+        self.assertEqual(pose["pan"]["current"], [13, -7, 21])
+        self.assertEqual(pose["zoom"]["current"], 9)
+        [line] = self.timing_lines()
+        self.assertEqual(line["face"], "+z")
+
+    def test_explicit_focus_overrides_stored_face_pose_default(self) -> None:
+        views_path = self.scratch / "views.toml"
+        _ = views_path.write_text('[views.panel]\ntarget = "name:Panel"\nmode = "pose"\nface = "+z"\nradius = 9\n')
+        result = self.shot("--view", "panel", "--views-file", str(views_path), "--focus", "1,2,3")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        [mutation] = [request for request in self.fake.methods("world.mutate_components")
+                      if request.get("component") == ORBIT_CAM]
+        pose = cast(dict[str, dict[str, object]], mutation["value"])
+        self.assertEqual(pose["pan"]["current"], [1, 2, 3])
+
+    def test_face_conflicts_are_checked_across_stored_views_and_cli_flags(self) -> None:
+        for keys, flags, detail in (
+            ('face = "+z"', ("--yaw", "0"), "--yaw"),
+            ('face = "+z"', ("--pitch", "0"), "--pitch"),
+            ('yaw = 0', ("--face", "+z"), "yaw"),
+        ):
+            with self.subTest(keys=keys, flags=flags):
+                views_path = self.scratch / "views.toml"
+                _ = views_path.write_text('[views.panel]\ntarget = "name:Panel"\nmode = "fit"\n' + keys + "\n")
+                result = self.shot("--view", "panel", "--views-file", str(views_path), *flags)
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertIn("--face", result.stderr)
+                self.assertIn(detail, result.stderr)
+                self.assertRegex(result.stderr.lower(), r"drop|remove|omit")
+        self.assertEqual(self.fake.calls, [])
+
+    def test_failed_face_fit_retains_axis_on_invocation_and_attempt(self) -> None:
+        result = self.shot("--target", "name:Panel", "--face", "+z", "--mode", "fit")
+
+        self.assertEqual(result.returncode, 1, result.stderr)
+        [line] = self.timing_lines()
+        self.assertEqual(line["face"], "+z")
+        [attempt] = cast(list[dict[str, object]], line["attempts"])
+        self.assertEqual(attempt["face"], "+z")
+        self.assertIn("name:Panel", cast(str, line["error"]))
+
+    def test_stored_face_rejects_present_zero_angles_and_unsupported_modes(self) -> None:
+        cases = (
+            ('yaw = 0', "yaw"), ('pitch = 0', "pitch"),
+            ('mode = "home"', "home"), ('mode = "hana-frame"', "hana-frame"),
+            ('face = "front"', "front"),
+        )
+        for extra, detail in cases:
+            with self.subTest(extra=extra):
+                base = '[views.panel]\ntarget = "name:Panel"\n'
+                if not extra.startswith("face"):
+                    base += 'face = "+z"\n'
+                _ = (self.scratch / "views.toml").write_text(base + extra + "\n")
+                result = self.views("show", "panel")
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertIn("face", result.stderr)
+                self.assertIn(detail, result.stderr)
+                if detail in ("home", "hana-frame"):
+                    self.assertIn("fit", result.stderr)
+                    self.assertIn("pose", result.stderr)
+        self.assertEqual(self.fake.calls, [])
+
+    def test_views_check_runs_and_stamps_a_face_fit(self) -> None:
+        self.fake.fit_moves_camera = True
+        _ = (self.scratch / "views.toml").write_text(
+            '[views.panel]\ntarget = "name:Panel"\nmode = "fit"\nface = "+z"\n',
+        )
+        fake_magick = self.scratch / "bin" / "magick"
+        fake_magick.parent.mkdir()
+        _ = fake_magick.write_text("#!/bin/sh\necho 0.5\n")
+        fake_magick.chmod(0o755)
+        result = self.views("check", "--port", str(self.port), "--out", str(self.scratch / "check"))
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("PASS panel", result.stdout)
+        document = tomllib.loads((self.scratch / "views.toml").read_text())
+        view = cast(dict[str, object], document["views"]["panel"])
+        self.assertIn("verified", view)
+        self.assertEqual(view["face"], "+z")
+        self.assertNotIn("yaw", view)
+        self.assertNotIn("pitch", view)
+        [event] = self.fit_events()
+        self.assertAlmostEqual(cast(float, event["pitch"]), -math.asin(1 / math.sqrt(3)))
+
+    def test_views_check_continues_after_face_refusal_and_stamps_passing_views(self) -> None:
+        self.fake.fit_moves_camera = True
+        self.fake.named_entities = [self.panel(face_transforms()["identity"])]
+        views_path = self.scratch / "views.toml"
+        _ = views_path.write_text("".join(
+            f'[views.{name}]\ntarget = "name:Panel"\nmode = "fit"\nface = "{face}"\n'
+            for name, face in (("first", "+z"), ("vertical", "+y"), ("last", "-z"))
+        ))
+        fake_magick = self.scratch / "bin" / "magick"
+        fake_magick.parent.mkdir()
+        _ = fake_magick.write_text("#!/bin/sh\necho 0.5\n")
+        fake_magick.chmod(0o755)
+
+        result = self.views("check", "--port", str(self.port), "--out", str(self.scratch / "check"))
+
+        self.assertEqual(result.returncode, 1, result.stderr)
+        document = tomllib.loads(views_path.read_text())
+        views = cast(dict[str, dict[str, object]], document["views"])
+        for name in ("first", "last"):
+            self.assertIn("verified", views[name])
+            self.assertIn("PASS " + name, result.stdout)
+        self.assertNotIn("verified", views["vertical"])
+        self.assertIn("FAIL vertical:", result.stderr)
+        [line] = self.timing_lines()
+        self.assertEqual((line["status"], line["failure_reason"]), ("failure", "invalid_request"))
+        attempts = cast(list[dict[str, object]], line["attempts"])
+        self.assertEqual([attempt["view"] for attempt in attempts], ["first", "vertical", "last"])
+        self.assertEqual([attempt["status"] for attempt in attempts], ["success", "failure", "success"])
+        failed = attempts[1]
+        self.assertEqual((failed["face"], failed["failure_reason"]), ("+y", "invalid_request"))
+        error = cast(str, failed["error"])
+        for detail in ("+y", "vertical", "--yaw 0", "--pitch 1.55"):
+            self.assertIn(detail, error)
+        self.assertIn(error, result.stderr)
+        self.assertIn(error, cast(str, line["error"]))
+        self.assertEqual(len(self.fake.methods("brp_extras/screenshot")), 2)
+
+    def test_repeated_face_view_moves_again_when_target_turns(self) -> None:
+        self.fake.fit_moves_camera = True
+        self.fake.named_entity_snapshots = [
+            [self.panel(face_transforms()["yawed"])],
+            [self.panel(face_transforms()["tilted_scaled"])],
+        ]
+        views_path = self.scratch / "views.toml"
+        _ = views_path.write_text('[views.panel]\ntarget = "name:Panel"\nmode = "fit"\nface = "+z"\n')
+        result = self.run_script(
+            "shot", "--port", str(self.port), "--out", str(self.scratch / "shots"),
+            "--view", "panel", "--view", "panel", "--views-file", str(views_path),
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        first, second = self.fit_events()
+        self.assertAlmostEqual(cast(float, first["yaw"]), math.pi / 2)
+        self.assertAlmostEqual(cast(float, first["pitch"]), 0.0)
+        self.assertAlmostEqual(cast(float, second["yaw"]), math.pi / 4)
+        self.assertAlmostEqual(cast(float, second["pitch"]), -math.asin(1 / math.sqrt(3)))
+        self.assertEqual(len(self.fake.methods("brp_extras/screenshot")), 2)
 
 
 class PortGuardTests(HanaShotTest):
@@ -692,9 +1055,11 @@ class ShotTests(HanaShotTest):
         self.assertGreaterEqual(line["total_ms"], line["capture_ms"])
         self.assertEqual((line["status"], line["exit_code"]), ("success", 0))
         self.assertNotIn("error", line)
+        self.assertNotIn("face", line)
         self.assertEqual(line["session"], {"state": "absent"})
         [attempt] = line["attempts"]
         self.assertEqual((attempt["status"], attempt["label"], attempt["view"]), ("success", "home", None))
+        self.assertNotIn("face", attempt)
         self.assertEqual(attempt["image_paths"], [str(self.scratch / "shot.png")])
         self.assertEqual([path.name for path in self.scratch.glob(".shot-*")], [])
 

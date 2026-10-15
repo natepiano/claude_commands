@@ -39,6 +39,11 @@ to rediscover after a context compaction lives in the doc.
      it and applies <ProductionUnit/> from ~/.claude/docs/production_format.md. -->
 > **Production: <name>** — unit `<unit>`; production doc `<path>`
 
+<!-- Optional; the hanadocs issues whose work this plan builds (/showrunner:proposal).
+     Preserved verbatim by every command that edits this doc. /unit:direct marks each
+     active at run start; its end-of-run as-built pass closes each. -->
+> **Issues:** <issue path>[, <issue path>]
+
 ## Delegation Context
 <!-- Shared across all phases. /unit:direct prepends this to every dispatch. -->
 

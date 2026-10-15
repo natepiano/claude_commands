@@ -58,6 +58,19 @@ the user, so it needs no gate here. It changes no code and commits nothing itsel
 <RunSummary/>. A refusal there is reported, not repaired, and leaves nothing to
 commit.
 
+When the plan header carries a `> **Issues:**` line, note its issue paths
+before `/plan:to_as_built` runs, since it deletes the plan. Once the as-built
+doc is written, close each issue:
+
+```sh
+~/.claude/scripts/lib/py ~/.claude/scripts/production/proposal_issue.py close <issue> --as-built <doc>
+```
+
+`<doc>` is the as-built doc's repo-relative path, e.g.
+`docs/hana/as-built/<file>.md`; under `amend`, the doc the work was folded
+into. The issues live in the hanadocs vault, outside this worktree, so
+<AsBuiltCommit/> never sees them.
+
 Correcting an as-built doc under `docs/as-built/` that contradicts the code is
 always allowed in this pass, in any unit's doc, without asking the user, the
 showrunner or the owner; a production unit's notice names the file as

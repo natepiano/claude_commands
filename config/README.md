@@ -112,15 +112,17 @@ machine's.
 The counts each production's dailies show on one line above the chart, in
 every length: `counts: nightly queue 8 · proposals 3`. A line is
 `<production slug>.<label>=lines <file> <regex>`, which counts the file's lines
-matching the regex, or `<production slug>.<label>=files <glob>`, which counts
-the matching files. The slug is the production doc's file name less
+matching the regex, `<production slug>.<label>=files <glob>`, which counts the
+matching files, or `<production slug>.<label>=issues <folder> <tag>`, which
+counts the issues directly in the folder whose frontmatter is open and tagged
+with the tag. The slug is the production doc's file name less
 `-production.md`. `~` expands, and a hyphen in the label reads as a space.
 `scripts/production/dailies_counts.py` reads it each time the dailies input is
-built, so an edit applies to the next dailies. A missing file shows as `not
-found`. A bad line leaves out the counts line, and the builder prints
+built, so an edit applies to the next dailies. A missing file or folder shows as
+`not found`. A bad line leaves out the counts line, and the builder prints
 `counts: unavailable — dailies.conf line <n>: …`. `DAILIES_COUNTS_CONFIG`
 overrides the path. Today it holds build-followups' nightly review queue and
-plan backlog, and tool-based-ui's hanadocs proposals (user, 2026-10-10).
+plan backlog, and tool-based-ui's open hanadocs proposal issues (user, 2026-10-10).
 
 ## user_zone.conf
 
@@ -143,6 +145,16 @@ A production keeps its own `User zone` line in its production doc, and the
 dailies read that. A time stored without an offset keeps the zone it was
 recorded in: `scripts/model_study/turns.py` names Pacific for the model study's
 roster.
+
+## statusline.conf
+
+Colors for each role and account in the status line, plus usage-level colors
+and thresholds for context tokens used and quota percentages left.
+`scripts/statusline/statusline.sh` passes it to `statusline.jq` on each refresh;
+an edit applies on the next refresh. A missing or bad entry leaves that piece
+uncolored. Colors use ANSI names (`cyan`, `bright-magenta`, and so on) or the
+named 256-color entries `orange`, `purple`, `pink`, `teal` and `brown`.
+`/new_account` adds the new Claude account's `account.` line.
 
 ## cargo-fmt-exclusions.json
 
