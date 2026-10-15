@@ -2686,6 +2686,24 @@ print('two homes isolated; recorder lock retained; caller restored')
             [("Impl", "impl 3m done", "clean"), ("Fix 1", "fix 1m running", "running")],
         )
 
+    def test_finish_pass_ignores_awake_seconds_from_an_older_launcher(self) -> None:
+        """A launcher started before the flag was retired still finishes its pass."""
+        session_dir = self.start_run("older-launcher", 22_000)
+        self.start_phase_and_pass(session_dir, 22_010)
+        _ = self.run_command(
+            "finish-pass",
+            "--session-dir",
+            str(session_dir),
+            "--status",
+            "completed",
+            "--agent-awake-seconds",
+            "2100",
+            at=22_200,
+        )
+        finished = self.pass_events("older-launcher", "pass_finished")
+        self.assertEqual(len(finished), 1)
+        self.assertNotIn("agent_awake_seconds", finished[0])
+
     def test_aggregate_reports_raw_and_calibrated_error_fields(self) -> None:
         self.complete_historical_run(0)
         output = self.run_command("aggregate", "--percent", "65", at=30_000)

@@ -4772,6 +4772,14 @@ def _build_parser() -> argparse.ArgumentParser:
         help="close this slot's open pass when the unit director killed its "
         + "launcher (--status canceled only)",
     )
+    # Accepted and ignored: implement.sh and review.sh launchers started before
+    # 2026-10-15 18:00 EDT still pass it, since bash keeps the script it began
+    # with. Remove after 2026-10-22.
+    _ = finish_pass.add_argument(
+        "--agent-awake-seconds",
+        default=argparse.SUPPRESS,
+        help=argparse.SUPPRESS,
+    )
     finish_pass.set_defaults(handler=_finish_pass)
 
     arm_review = subparsers.add_parser(
