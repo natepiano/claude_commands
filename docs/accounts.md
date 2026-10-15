@@ -120,7 +120,9 @@ In this terminal:
 
 The first form moves one local ungrouped session, found by id, else by exact name. The second selects the group's account for future launches and moves every live member not already on it. An empty group still selects its account (`<group>: no live session moves`); an open shutdown receives no duplicate request. A session can request its own move, then mark ready and end its turn.
 
-Use `--no-alert` for live checks to suppress shutdown alerts. With `--dry-run`, it also prints the planned shutdown commands with `--no-alert`.
+A move never waits on a session agreeing to it. An idle session is stopped with no pause message. A busy one gets `Pause for move: <label> → <target> (<why>, <time>)`; its second line says the request comes from the shutdown the user started, not from another session's own choice, and gives the check to run in its own terminal, `~/.claude/scripts/lib/py ~/.claude/scripts/shutdown/shutdown.py status <account label> --here`, which lists the session under the move. It then stops at once and runs `ready --where`; a session that answers the pause and goes idle without that line is stopped too.
+
+Use `--no-alert` for live checks: it adds `--no-alert` to each `shutdown.py down`, so no shutdown alert reaches the phone. With `--dry-run --no-alert`, it prints each planned `down` command and changes nothing.
 
 ### Preview
 
