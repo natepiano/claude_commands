@@ -121,7 +121,7 @@
 - `_lookup_slug` keeps the shutdown inventory within its timer-read budget: the membership check and the missing-target check share one timer read.
 - `unit_lookup.py` is shared: the shutdown (`scripts/shutdown/test_inventory.py`) and message (`scripts/message/test_roster.py`) suites exercise it. A change there needs the full merge-gate suites (`scripts/production/merge_gate.py --tests-only`), not only the production suites.
 
-### Phase 4 — Command doc and as-built  · status: todo
+### Phase 4 — Command doc and as-built  · status: done
 
 #### Work Order
 
