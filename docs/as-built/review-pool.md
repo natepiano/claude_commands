@@ -175,7 +175,8 @@ At start and on resume the director:
 1. `config/review_pool/ui.md`;
 2. `## Rules`, then `UX guide: <absolute guide path>`, then each `.md` in the guide root with a non-empty frontmatter `test:`, in file-name order, as `### <file name>` and its text; the selection is `scripts/ux_style/load-ux-style.sh`'s, so README and notes are left out;
 3. when present, `docs/design-decisions.md` of the repository that holds the production doc, under `## Design decisions`: the file the helper's `ux_eval.md` reads from a unit's worktree;
-4. the `ui` section of `memory/repository.md`.
+4. when present, that repository's targets file (`docs/hana/targets.md` in hana), under `## Targets`;
+5. the `ui` section of `memory/repository.md`.
 
 A production doc with no **UX guide** primes no `ui`, and the director tells the showrunner `UI pool not primed: production has no UX guide`. An unreadable guide or rule fails the prime; an incomplete UI prompt is never primed. The prompt is rebuilt at start and on resume, so a changed rule's text changes the prompt hash.
 

@@ -401,4 +401,13 @@ A run that stopped, failed, or waits on a decision has no finish in its record, 
     positional arguments. On `own`, export
     `REVIEW_LEASE=<slug>/<unit>/<phase>` and review as today. `<slug>` is the
     production doc's file name without `-production.md`.
+
+17. **Proposals.** A finished proposal you write is a hanadocs issue, filed
+    through `/issue` with tag `proposal`, `proposed_by` your unit's name, and
+    its five ranking values proposed on a `Proposed ranking:` line. Send the
+    showrunner its path and one line; there is no proposals index. When the
+    showrunner sends back an approved one, write its work into your plan as
+    phases that cite it and add it to the plan's `> **Issues:**` line; your
+    run marks it active and its end-of-run as-built pass closes it
+    (`/showrunner:proposal`).
 </ProductionUnit>
