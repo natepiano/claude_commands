@@ -110,7 +110,7 @@ def session_shutdown(
         login=LOGIN, label=LABEL, machine="natedev", requested_at=OCTOBER,
         requested_by=old["requested_by"], hold=hold, request_id="request-one",
         then="restart", force="wait for ready", alerts="user",
-        session=item["session"], seats=[], timers=[],
+        session=item["session"], workers=[], timers=[],
         settle_message=item["settle_message"], where=item["where"],
         progress=progress, trail=[], stop_issues=[],
     )
@@ -938,10 +938,10 @@ class ShutdownLaunchCliTests(ShutdownTestCase):
     def test_held_sessions_includes_owners_and_workers_sorted_once(self) -> None:
         saved = session_shutdown(record.SessionWaiting(kind="waiting"), "z-owner")
         owner = saved["session"]
-        saved["seats"] = [inventory.SeatSession(
+        saved["workers"] = [inventory.WorkerSession(
             session_id="a-worker", pid=23456, proc_start="worker-start", name="worker",
             cwd=owner["cwd"], status="idle", model=owner["model"], checkout=owner["checkout"],
-            run_dirs=["/tmp/run"], codex_servers=[], timers=[], kind="seat",
+            run_dirs=["/tmp/run"], codex_servers=[], timers=[], kind="worker",
             host=inventory.UnknownHost(kind="unknown"),
             owner=inventory.DirectorOwner(kind="director", session_id="z-owner"),
         )]
@@ -1254,8 +1254,8 @@ class OnlySessionCliTests(ShutdownTestCase):
         self.assertEqual(record.session_records(LOGIN), sorted(before, key=lambda item: item["session"]["name"]))
 
     def test_down_exact_name_builds_one_filtered_inventory_and_keeps_owned_workers(self) -> None:
-        worker = cast(inventory.SeatSession, cast(object, {
-            **unit_session("owned-seat"), "kind": "seat", "name": "Worker",
+        worker = cast(inventory.WorkerSession, cast(object, {
+            **unit_session("owned-worker"), "kind": "worker", "name": "Worker",
             "host": inventory.UnknownHost(kind="unknown"),
             "owner": inventory.DirectorOwner(kind="director", session_id="beta-id"),
         }))
@@ -1273,7 +1273,7 @@ class OnlySessionCliTests(ShutdownTestCase):
         read.assert_called_once_with(LOGIN, only=frozenset({"beta-id"}))
         saved = record.session_records(LOGIN)
         self.assertEqual([item["session"]["session_id"] for item in saved], ["beta-id"])
-        self.assertEqual(saved[0]["seats"], [worker])
+        self.assertEqual(saved[0]["workers"], [worker])
 
     def test_down_ambiguous_name_builds_no_full_inventory_and_starts_nothing(self) -> None:
         self.owners[0]["name"] = self.owners[1]["name"] = "Duplicate"

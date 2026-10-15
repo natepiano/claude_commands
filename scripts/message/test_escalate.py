@@ -246,7 +246,7 @@ class EscalateTests(unittest.TestCase):
         _ = (self.root / f"codex{number}.md").write_text(f"---\nlogin: {login}\n---\n")
         script = SCRIPT.parent.parent / "accounts" / "accounts.py"
 
-        selected = subprocess.run([sys.executable, str(script), "set-role", "seats", f"codex{number}"],
+        selected = subprocess.run([sys.executable, str(script), "set-role", "workers", f"codex{number}"],
             env={**self.environment, "HOME": str(self.root), "AGENT_NOTES_DIR": str(self.root)}, capture_output=True, text=True, check=False)
         self.assertEqual(selected.returncode, 0, selected.stderr)
         return KnownCodexAccount(home, login, f"codex{number}")

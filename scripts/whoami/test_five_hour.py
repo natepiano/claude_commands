@@ -73,7 +73,7 @@ class WatchTests(unittest.TestCase):
                 live.email = identity.login
                 live.source = CodexHomeSource(home)
         readings = quota_alert.CodexAlertPassReadings(
-            accounts.CodexSeatsAccount(label="codex1", home=home), identity,
+            accounts.CodexWorkersAccount(label="codex1", home=home), identity,
             tuple(quota_alert.CodexHomeReading(home, live, now) for live in reports if live.tool == "Codex"))
         return five_hour.watch(reports, codex_readings=readings)
 
@@ -145,11 +145,11 @@ class AccountHoldTests(unittest.TestCase):
         claims = base64.urlsafe_b64encode(json.dumps({"email": login}).encode()).decode().rstrip("=")
         _ = (home / "auth.json").write_text(json.dumps({"tokens": {"id_token": f"x.{claims}.y"}}))
         _ = (self.root / f"codex{number}.md").write_text(f"---\nlogin: {login}\n---\n")
-        self.assertEqual(accounts.main(["set-role", "seats", f"codex{number}"]), 0)
+        self.assertEqual(accounts.main(["set-role", "workers", f"codex{number}"]), 0)
         identity = KnownCodexAccount(home, f"a{number}@example.invalid", f"codex{number}")
         live = Report("Codex", email=identity.login, source=CodexHomeSource(home),
             five_hour=None if used is None else Quota("5-hour", used, self.now + timedelta(hours=2)))
-        return quota_alert.CodexAlertPassReadings(accounts.role_account("seats"), identity,
+        return quota_alert.CodexAlertPassReadings(accounts.role_account("workers"), identity,
             (quota_alert.CodexHomeReading(home, live, self.now),))
 
     def test_swap_cancels_outgoing_and_legacy_holds_without_recovery_and_keeps_other_tools(self) -> None:
@@ -180,7 +180,7 @@ class AccountHoldTests(unittest.TestCase):
                 _ = five_hour.watch([a.checked_homes[0].report], codex_readings=a)
             self.assertTrue(send.read_queue(send.queue_path("hana")))
             chosen = self.readings(2, None)
-            b = quota_alert.CodexAlertPassReadings(chosen.seats, chosen.selected_account, ())
+            b = quota_alert.CodexAlertPassReadings(chosen.workers, chosen.selected_account, ())
             def retire(command: list[str], **_options: object) -> subprocess.CompletedProcess[str]:
                 _ = send.retire(command[command.index("--to") + 1], "quota_alert", command[command.index("--key") + 1])
                 return subprocess.CompletedProcess(command, 0, "", "")
@@ -194,8 +194,8 @@ class AccountHoldTests(unittest.TestCase):
         before = {path.name: path.read_text() for path in five_hour.STATE.glob("*.notice")}
         self.sent.clear()
         b = self.readings(2, None)
-        unknown = quota_alert.CodexAlertPassReadings(b.seats,
-            UnknownCodexAccount(b.seats.home, "unreadable login"), b.checked_homes)
+        unknown = quota_alert.CodexAlertPassReadings(b.workers,
+            UnknownCodexAccount(b.workers.home, "unreadable login"), b.checked_homes)
         _ = five_hour.watch([], codex_readings=unknown)
         self.assertEqual(self.sent, [])
         self.assertTrue(before)
@@ -205,7 +205,7 @@ class AccountHoldTests(unittest.TestCase):
         a = self.readings(1, 10)
         spare = Report("Codex", email="spare@example.invalid", source=CodexHomeSource(self.root / ".codex2"),
             five_hour=Quota("5-hour", 100, self.now + timedelta(hours=1)), credit_balance="0")
-        readings = quota_alert.CodexAlertPassReadings(a.seats, a.selected_account,
+        readings = quota_alert.CodexAlertPassReadings(a.workers, a.selected_account,
             (*a.checked_homes, quota_alert.CodexHomeReading(spare.source.home, spare, self.now))
             if isinstance(spare.source, CodexHomeSource) else a.checked_homes)
         _ = five_hour.watch([a.checked_homes[0].report, spare], codex_readings=readings)

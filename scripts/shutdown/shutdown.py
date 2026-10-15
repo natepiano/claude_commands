@@ -386,7 +386,7 @@ def resolve_sessions(login: str, items: Iterable[str], *, here: bool = False) ->
         owner = saved["session"]
         local[owner["session_id"]] = _SelectableSession(owner["session_id"], owner["name"], saved["machine"])
     for owner in listing(login):
-        if owner.kind != "seat":
+        if owner.kind != "worker":
             local[owner.session_id] = _SelectableSession(owner.session_id, owner.name, local_machine)
     candidates = dict(local)
     peer_unavailable = False
@@ -411,7 +411,7 @@ def resolve_sessions(login: str, items: Iterable[str], *, here: bool = False) ->
                     peer_unavailable = True
                 else:
                     for owner in report["sessions"]:
-                        if owner["kind"] != "seat":
+                        if owner["kind"] != "worker":
                             _ = candidates.setdefault(owner["session_id"], _SelectableSession(owner["session_id"], owner["name"], report["machine"]))
         if peer_unavailable:
             print(f"{other_machine()}: not reached; names checked on {local_machine} only", file=sys.stderr)
@@ -645,7 +645,7 @@ def held_session_ids() -> list[str]:
         {
             session["session_id"]
             for record in all_session_records()
-            for session in [record["session"], *record["seats"]]
+            for session in [record["session"], *record["workers"]]
         }
     )
 

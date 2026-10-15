@@ -179,15 +179,15 @@ def worker_session(
     *,
     owner: str | None,
     status: str = "idle",
-) -> inventory.SeatSession:
+) -> inventory.WorkerSession:
     worker_owner: inventory.WorkerOwner = (
         inventory.DirectorOwner(kind="director", session_id=owner)
         if owner is not None
         else inventory.NoDirector(kind="no director")
     )
-    return inventory.SeatSession(
+    return inventory.WorkerSession(
         **common_session(session_id, name, status=status),
-        kind="seat",
+        kind="worker",
         host=inventory.UnknownHost(kind="unknown"),
         owner=worker_owner,
     )
@@ -215,7 +215,7 @@ def session_shutdown(session: inventory.Session, *, progress: record.SessionProg
         login=LOGIN, label=LABEL, machine="natedev", requested_at=NOW, request_id=request_id,
         requested_by={"kind": "session", "session_id": requester} if requester else {"kind": "terminal"},
         hold="session", then=then, force="wait for ready", alerts="user", session=session,
-        seats=[], timers=[], settle_message={"kind": "not sent"}, where={"kind": "not said"},
+        workers=[], timers=[], settle_message={"kind": "not sent"}, where={"kind": "not said"},
         progress=progress or {"kind": "waiting"}, trail=[], stop_issues=[],
     )
 
@@ -623,7 +623,7 @@ class SettleTests(ShutdownTestCase):
             saved = session_shutdown(owner)
             saved["settle_message"] = record.SettleMessageSent(kind="sent", at=NOW)
             if owner is first:
-                saved["seats"] = [worker]
+                saved["workers"] = [worker]
             self.save(saved)
         with (
             patch.object(settle, "inventory", return_value=machine_inventory([first, second, worker])) as read,
@@ -838,7 +838,7 @@ class SettleTests(ShutdownTestCase):
         self.assertEqual(settle.conduct(login), 0)
 
     def matching(self, saved: record.SessionShutdown) -> stop_work.FreshSession:
-        return stop_work.MatchingSession(kind="matching session", session=saved["session"], seats=saved["seats"])
+        return stop_work.MatchingSession(kind="matching session", session=saved["session"], workers=saved["workers"])
 
     def write_owner_pane(self, owner: inventory.Session, tmux: str, *, identity: str = "") -> None:
         directory = self.root / "sessions"
@@ -984,9 +984,9 @@ class SettleTests(ShutdownTestCase):
         saved = session_shutdown(top_level("owner", "Owner"), progress=record.SessionHeldByUsageLimit(kind="held by usage limit", at=NOW))
         with patch.object(settle, "_showing_form", return_value=True) as form:
             self.assertIsInstance(settle.next_step(saved, self.matching(saved), [], NOW_UTC), settle.StopSession)
-            saved["seats"] = [worker_session("worker", "Worker", owner="owner", status="busy")]
+            saved["workers"] = [worker_session("worker", "Worker", owner="owner", status="busy")]
             self.assertEqual(settle.next_step(saved, self.matching(saved), [], NOW_UTC), settle.Hold("Codex worker Worker is still running"))
-            saved["seats"] = []
+            saved["workers"] = []
             saved["session"]["status"] = "busy"
             self.assertIsInstance(settle.next_step(saved, self.matching(saved), [], NOW_UTC), settle.Hold)
             saved["session"]["status"] = "idle"
@@ -1004,8 +1004,8 @@ class SettleTests(ShutdownTestCase):
     def test_one_conduct_pass_stops_limit_waiting_owner_and_ordinary_ready_owner(self) -> None:
         held = session_shutdown(top_level("held", "Held"))
         ordinary = session_shutdown(top_level("ordinary", "Ordinary"), progress={"kind": "ready", "at": NOW})
-        held["seats"] = [worker_session("held-worker", "Held worker", owner="held")]
-        ordinary["seats"] = [worker_session("ordinary-worker", "Ordinary worker", owner="ordinary")]
+        held["workers"] = [worker_session("held-worker", "Held worker", owner="held")]
+        ordinary["workers"] = [worker_session("ordinary-worker", "Ordinary worker", owner="ordinary")]
         self.save(held)
         self.save(ordinary)
         seen: list[str] = []
@@ -1018,7 +1018,7 @@ class SettleTests(ShutdownTestCase):
             self.assertEqual(saved["progress"]["kind"], "held by usage limit" if saved["session"]["session_id"] == "held" else "ready")
             seen.append(saved["session"]["session_id"])
             return self.fake_stop(saved)
-        report = machine_inventory([held["session"], ordinary["session"], *held["seats"], *ordinary["seats"]])
+        report = machine_inventory([held["session"], ordinary["session"], *held["workers"], *ordinary["workers"]])
         with patch.object(settle, "run_inventory", return_value=report) as observe, patch.object(settle, "_screen", side_effect=screen), patch.object(stop_work, "stop_session", side_effect=stop), patch.object(settle, "send_message") as sender, patch.object(settle, "report_stop"):
             self.assertEqual(settle.conduct(LOGIN), 0)
         self.assertCountEqual(seen, ["held", "ordinary"])
@@ -1087,14 +1087,14 @@ class SettleTests(ShutdownTestCase):
 
     def test_held_owner_has_no_holdout_alert_and_done_requires_stop_or_restart(self) -> None:
         saved = session_shutdown(top_level("owner", "Owner"), progress=record.SessionHeldByUsageLimit(kind="held by usage limit", at=NOW))
-        saved["seats"] = [worker_session("worker", "Worker", owner="owner", status="busy")]
+        saved["workers"] = [worker_session("worker", "Worker", owner="owner", status="busy")]
         self.save(saved)
         self.assertFalse(settle._done(saved))  # pyright: ignore[reportPrivateUsage]
         at = NOW_UTC + settle.NOT_ANSWERING_AFTER + timedelta(seconds=1)
         self.assertFalse(settle._reserve_holdout_alert(saved, at))  # pyright: ignore[reportPrivateUsage]
         def end_pass(_seconds: float) -> None:
             raise PassObserved()
-        with patch.object(settle, "now_utc", return_value=at), patch.object(settle, "_screen", return_value=settle.ScreenText("wait for limit to reset")), patch.object(settle, "run_inventory", return_value=machine_inventory([saved["session"], *saved["seats"]])), patch.object(settle, "alert_user") as alert, patch.object(settle, "send_message") as sender, patch.object(time, "sleep", side_effect=end_pass), self.assertRaises(PassObserved):
+        with patch.object(settle, "now_utc", return_value=at), patch.object(settle, "_screen", return_value=settle.ScreenText("wait for limit to reset")), patch.object(settle, "run_inventory", return_value=machine_inventory([saved["session"], *saved["workers"]])), patch.object(settle, "alert_user") as alert, patch.object(settle, "send_message") as sender, patch.object(time, "sleep", side_effect=end_pass), self.assertRaises(PassObserved):
             _ = settle.conduct(LOGIN)
         alert.assert_not_called()
         sender.assert_not_called()
@@ -1415,7 +1415,7 @@ class SettleTests(ShutdownTestCase):
         with patch.object(settle, "run_inventory", return_value=machine_inventory([first, worker, orphan])):
             added = settle.begin(LOGIN, only=["first"], request_id="one")
         self.assertEqual(len(added), 1)
-        self.assertEqual(added[0]["seats"], [worker])
+        self.assertEqual(added[0]["workers"], [worker])
         original = record.find_session(LOGIN, "first")
         with patch.object(settle, "run_inventory", return_value=machine_inventory([first, second])):
             added = settle.begin(LOGIN, only=["first", "second"], request_id="two", then="restart")
