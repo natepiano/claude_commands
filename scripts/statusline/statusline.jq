@@ -8,10 +8,14 @@
 # one process.
 #
 # Called as:  jq -r --arg pwd "$PWD" --arg account "$account" --arg showrunners "<ids>"
-#                --slurpfile labels <by-label.json> --rawfile colors <statusline.conf> -f statusline.jq
-# Input:      the status line JSON on stdin; labels, showrunners and colors are
-#             optional, and /dev/null stands in for missing labels or colors files.
+#                --arg showrunner "<session JSON>" --slurpfile labels <by-label.json>
+#                --rawfile colors <statusline.conf> -f statusline.jq
+# Input:      the status line JSON on stdin; labels, showrunner, showrunners and
+#             colors are optional; /dev/null stands in for missing input files.
+#             Empty or damaged showrunner text leaves the unit director unnamed.
 # Output:     Line 1: "<role> | <account> | <dirname> | <tokens with thousands separators> | <model [effort]>"
+#             A unit director's role reads "unit director for <showrunner name>"
+#             when the live showrunner record has a name.
 #             Line 2, when present: "5-hour <N>% left until <HH:MM zone> | weekly <M>% left until <Day HH:MM zone>",
 #             each " until ..." only when its window carries a reset time.
 #             ANSI colors wrap the role, account, tokens and percentages only.
@@ -31,7 +35,9 @@ def color($config; $key):
   | ({black: 30, red: 31, green: 32, yellow: 33, blue: 34, magenta: 35,
       cyan: 36, white: 37, "bright-black": 90, "bright-red": 91,
       "bright-green": 92, "bright-yellow": 93, "bright-blue": 94,
-      "bright-magenta": 95, "bright-cyan": 96, "bright-white": 97}
+      "bright-magenta": 95, "bright-cyan": 96, "bright-white": 97,
+      orange: "38;5;208", purple: "38;5;141", pink: "38;5;211",
+      teal: "38;5;30", brown: "38;5;137"}
      [($config[$key] // "")]) as $code
   | if $code == null then $text else "\u001b[\($code)m\($text)\u001b[0m" end;
 
@@ -123,6 +129,9 @@ def usage($config; $label; $window; $fmt):
 
 ($ARGS.named.colors // "" | color_config) as $colors
 | ($ARGS.named.account // "") as $account
+| ($ARGS.named.showrunner // "" | try fromjson catch null
+   | if type == "object" then .name else null end
+   | if type == "string" and . != "" then . else null end) as $showrunner_name
 | ((.workspace.current_dir // .cwd // "") | if . == "" then $pwd else . end) as $d
 # Trailing slashes stripped first, so "/etc/nixos/" gives "nixos" and not "".
 # "/" survives that to become "", and falls back to the path itself.
@@ -131,8 +140,11 @@ def usage($config; $label; $window; $fmt):
 | ((.model.display_name // "")
    + (if (.effort.level // "") == "" then "" else " " + .effort.level end)) as $m
 | ([
-     (role | if . == "unassigned" then .
-             else . as $role | color($colors; "role." + ($role | gsub(" "; "-"))) end),
+     (role as $role
+      | (if $role == "unit director" and ($showrunner_name | type) == "string"
+            and $showrunner_name != ""
+         then $role + " for " + $showrunner_name else $role end)
+      | color($colors; "role." + ($role | gsub(" "; "-")))),
      # A label is a note name; an address never reaches the line.
      (if $account == "" or ($account | contains("@")) then empty
       elif ($account | test("^claude [0-9]+$")) then $account | sub(" "; "")

@@ -1019,3 +1019,35 @@ After a worker launch's own turn has ended, a move to the selected seats home th
 - `config/statusline.conf` — new; `config/README.md` — its entry.
 - `scripts/statusline/statusline.sh`, `statusline.jq` — the colors.
 - `scripts/statusline/test_statusline.py` — each color, each threshold edge, the fallbacks, the stripped-line equality, and the settings command finding the config.
+
+### Phase 29 — Status line follow-ups  · status: done
+
+**Depends on:** Phase 28
+
+#### Work Order
+
+**Goal:** every role, `unassigned` included, and every account shows in a real color of its own (no white or grey; the user, via the showrunner), a unit director's role reads `unit director for <showrunner name>` (the user, via the showrunner), a new Claude account gets its color without a hand edit, and a test proves the status line renders under zsh when no notifier files exist.
+
+**Constraints from prior phases:** "Status line colors" ships `config/statusline.conf` (`key=value`, `#` comments) with `account.claude1=cyan`, `claude2=magenta`, `claude3=blue`, `claude4=bright-white`, the roles `bright-magenta`, `bright-blue`, `bright-cyan`, and the levels bright green, yellow and red. Colors are the eight ANSI names and their `bright-` forms, in the order `statusline.jq` lists them; an unlisted label stays uncolored. `statusline.sh` reads the file at `$statusline/../../config/statusline.conf`, so the installed file is `accounts.main_config_dir() / "config/statusline.conf"`. It sets zsh `nonomatch` so an empty `showrunner-*/conf` glob does not abort the line. `new_account.py` already edits one main-config file in place (`nightly_review_step`: temporary file, then replace) and reports each step as `done:` or `for you:`. Only Claude accounts show on the status line.
+
+**Spec:**
+
+0. **More colors.** The eight ANSI names and their `bright-` forms leave six hues once red, yellow and green (the levels) and black, white and grey are out, too few for four roles and four accounts. `statusline.jq` also accepts five named 256-color entries, written `ESC[38;5;<n>m`: `orange` 208, `purple` 141, `pink` 211, `teal` 30, `brown` 137. `statusline.conf` ships `account.claude4=orange` (was `bright-white`) and a new `role.unassigned=purple`; `statusline.jq` colors `unassigned` from `role.unassigned` like any role (no key still means uncolored). No account or role ships white, bright-white, black or bright-black.
+1. `new_account.py` gains a step for Claude accounts, after the nightly review step: when `config/statusline.conf` has no `account.<label>=` line, add one with a color picked from the palette order (the sixteen ANSI names in `statusline.jq`'s order, then `orange`, `purple`, `pink`, `teal`, `brown`): the first that is not red, green or yellow (either form), not black, white or grey (`black`, `white`, `bright-black`, `bright-white`), and used by no `account.` or `role.` line; when none is left, the first used by no `account.` line; when none is left either, no line. The line goes after the last `account.` line (at the end when there is none), written through a temporary file and a replace, every other line unchanged. Step text: `status line color <color> for <label>`; with a line already present, `status line color <color> for <label>` and nothing written; with no color left, or no config file, a done step saying the label stays uncolored. An unreadable or unwritable file is a `for you:` step naming the path and the error. A rerun writes nothing. The file is written like `nightly_review_step` writes its file, so its permissions stay as they were. With the shipped file, `claude5` gets `pink`, then `claude6` `teal`.
+2. `test_statusline.py` gains a test that runs the settings command under `zsh -c` (skipped when no `zsh` is on `PATH`) with a home holding no notifier state at all, and asserts both lines render.
+2a. **A unit director names its showrunner.** When `SHOWRUNNER_UNIT` is set and `PLAN_DELEGATE_TEAM_ROLE` is empty, `statusline.sh` reads the `TARGET=session:<id>` line of `${NOTIFIER_STATE_DIR:-$HOME/.local/state/notifier}/showrunner-$SHOWRUNNER_UNIT/conf`, then takes the first `${NOTIFIER_SESSIONS_DIR:-$HOME/.claude/sessions}/<pid>.json` whose first line contains `"sessionId":"<id>"` and whose pid is live (`kill -0`), and passes it to jq as `--slurpfile showrunner <file>` (`/dev/null` when any step finds nothing). Shell builtins only, the loop stops at its first match, and no other role looks anything up. The name is read on every refresh, never stored, so a renamed showrunner shows at once. In `statusline.jq`, a unit director whose record carries a non-empty `name` reads `unit director for <name>`, else `unit director`; the whole text takes `role.unit-director`'s color (the key comes from the role, not the text shown).
+3. `commands/new_account.md` and the `config/README.md` entry for `statusline.conf` say that `/new_account` adds the account line; the README entry lists the five named 256-color entries.
+
+**Files:**
+
+- `config/statusline.conf` — `claude4` orange, `unassigned` purple.
+- `scripts/statusline/statusline.sh` — the showrunner lookup.
+- `scripts/statusline/statusline.jq` — the five named colors, `unassigned` colored from its key, `unit director for <name>`.
+- `scripts/accounts/new_account.py` — the color step.
+- `scripts/accounts/test_new_account.py` — the pick order, the placement, the rerun, the missing file, the no-color-left case; the test home ships a `config/statusline.conf`.
+- `scripts/statusline/test_statusline.py` — the zsh test, the named colors, `unassigned` colored, `claude4` orange, every name in `new_account.py`'s palette rendering a color, and the unit director's showrunner name (found, renamed, missing, dead pid, a worker never looking).
+- `commands/new_account.md`, `config/README.md` — one line each.
+
+**Workers:** `impl` takes the config, `statusline.sh`, `statusline.jq`, the step and both docs; `test` takes both test files.
+
+**Acceptance gate:** `basedpyright` reports zero errors and warnings on the changed Python; the accounts and statusline suites pass; a run of `/new_account claude5` against a scratch home writes `account.claude5=pink` once and a rerun writes nothing.
