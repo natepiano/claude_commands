@@ -18,9 +18,10 @@ the next C number, the push date and the merged hash, and "not yet" when the tab
 Mac build" column. `add` writes one row for a change no checkpoint line carries; `show` prints the
 rows still to review; `verdict` moves a row to "## Reviewed" with the user's verdict and today's
 date. Every write holds a lock on the list's directory, and the first write to a missing list
-creates it from the skeleton. Nothing here commits the file. A production doc names its list in a
-`- **Change review:** <path>` line in its Production Context; `list-path` prints it, from the
-calling showrunner's update timer when no doc is given.
+creates it from the skeleton. A list in a git work tree is committed alone after each write, still
+under the lock, and never pushed; a refused commit warns and the next write commits it. A
+production doc names its list in a `- **Change review:** <path>` line in its Production Context;
+`list-path` prints it, from the calling showrunner's update timer when no doc is given.
 """
 from __future__ import annotations
 
@@ -207,11 +208,12 @@ def read(path: Path) -> str:
     return path.read_text(encoding="utf-8") if path.exists() else SKELETON
 
 
-def _edit(path: Path, write: Callable[[list[str]], Result]) -> Result:
-    """Change the list's lines under the lock, then write them back; a change that raises writes nothing.
+def _edit(path: Path, write: Callable[[list[str]], Result], what: Callable[[Result], str]) -> Result:
+    """Change the list's lines under the lock, write and commit them; a change that raises writes nothing.
 
     The lock is the list's directory, so concurrent writers never lose a row and no lock file
-    lands beside the list. A missing list starts from the skeleton.
+    lands beside the list. A missing list starts from the skeleton. `what` names the write in
+    the commit subject.
     """
     path.parent.mkdir(parents=True, exist_ok=True)
     directory = os.open(path.parent, os.O_RDONLY)
@@ -220,9 +222,36 @@ def _edit(path: Path, write: Callable[[list[str]], Result]) -> Result:
         lines = read(path).splitlines(keepends=True)
         result = write(lines)
         _ = path.write_text("".join(lines), encoding="utf-8")
+        _commit(path, what(result))
         return result
     finally:
         os.close(directory)
+
+
+def _commit(path: Path, what: str) -> None:
+    """Commit the list alone when it sits in a git work tree; nothing is pushed.
+
+    `--only` with the one path commits the file's whole content and leaves every other change,
+    staged or not, where it was. A refusal (another git process holding index.lock, say) warns
+    on one line and leaves the write standing: the next write's commit carries this one too.
+    """
+
+    def git(*arguments: str) -> subprocess.CompletedProcess[str]:
+        # Literal pathspecs: a list name could hold glob characters.
+        return subprocess.run(["git", "-C", str(path.parent), "--literal-pathspecs", *arguments],
+                              capture_output=True, text=True, check=False)
+
+    if git("rev-parse", "--is-inside-work-tree").stdout.strip() != "true":
+        return
+    steps = [] if git("ls-files", "--", path.name).stdout.strip() else [["add", "--intent-to-add", "--", path.name]]
+    steps.append(["commit", "--quiet", "--only", "-m", f"change-review: {path.stem} {what}", "--", path.name])
+    for step in steps:
+        done = git(*step)
+        if done.returncode:
+            reason = next(iter((done.stderr or done.stdout).strip().splitlines()), f"git {step[0]} failed")
+            print(f"change review: {path} written but not committed: {reason}; the next write commits it",
+                  file=sys.stderr)
+            return
 
 
 def _table(path: Path, lines: list[str], section: str) -> tuple[list[str], int, int]:
@@ -273,7 +302,14 @@ def append_rows(path: Path, changes: list[Visible], day: date, merged: str) -> l
         _insert(lines, end, rows)
         return rows
 
-    return _edit(path, write)
+    def what(rows: list[str]) -> str:
+        ids = [_cells(row)[0] for row in rows]
+        named = ids[0] if len(ids) == 1 else f"{ids[0]}–{ids[-1]}"
+        if not merged:
+            return f"add {named}"
+        return f"{'row' if len(ids) == 1 else 'rows'} {named} from {merged}"
+
+    return _edit(path, write, what)
 
 
 def pending(path: Path) -> list[dict[str, str]]:
@@ -308,7 +344,7 @@ def record_verdict(path: Path, row: str, verdict: str, day: date) -> str:
                                                    "Verdict": _cell(verdict), "Date": day.isoformat()})])
         return _plain(cells.get("Merged", ""))
 
-    return _edit(path, write)
+    return _edit(path, write, lambda _: f"verdict {row}")
 
 
 def production_list(production: str) -> Path:
