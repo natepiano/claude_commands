@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import sys
 from pathlib import Path
@@ -31,6 +32,11 @@ def main(argv: list[str]) -> int:
     previous = log.read_text().splitlines() if log.exists() else []
     with log.open("a") as output:
         _ = output.write(json.dumps(argv) + "\n")
+    if argv[2:4] == ["agent", "start"] and (len(argv) < 5 or re.fullmatch(r"[a-z][a-z0-9_-]{0,31}", argv[4]) is None):
+        _ = sys.stderr.write(json.dumps({"error": {
+            "code": "invalid_agent_name", "message": "invalid agent name",
+        }}) + "\n")
+        return 1
     responses = cast(
         dict[str, CommandResponse | list[CommandResponse]],
         json.loads(Path(os.environ["FAKE_HERDR_RESPONSES"]).read_text()),

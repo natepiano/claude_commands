@@ -10,8 +10,9 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from typing import cast, override
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
@@ -49,8 +50,10 @@ class HerdrTests(unittest.TestCase):
             "HERDR_BIN": str(self.fake), "SYSTEMD_RUN": str(self.fake), "SYSTEMCTL": str(self.fake),
             "HERDR_PROC": str(self.proc), "FAKE_HERDR_LOG": str(self.log),
             "FAKE_HERDR_RESPONSES": str(self.responses_path), "PATH": str(self.root / "no-tools"),
+            "HOME": str(self.root / "home"), "XDG_CONFIG_HOME": str(self.root / "config"),
         }, clear=True)))
         self.configure([], "")
+        self.configure_herdr(["workspace", "list"], json.dumps({"result": {"workspaces": []}}))
 
     def configure(self, arguments: list[str], stdout: str = "", code: int = 0, stderr: str = "") -> None:
         self.responses[" ".join(arguments)] = {"stdout": stdout, "code": code, "stderr": stderr}
@@ -70,6 +73,20 @@ class HerdrTests(unittest.TestCase):
         _ = process.joinpath("environ").write_bytes("\0".join([*(f"{key}={value}" for key, value in environment.items()), ""]).encode())
         process.joinpath("cwd").symlink_to(self.root)
         return process
+
+    def unix_socket(self, path: Path, inode: int, *, listening: bool = True) -> None:
+        table = self.proc / "net" / "unix"
+        table.parent.mkdir(exist_ok=True)
+        flags = "00010000" if listening else "00000000"
+        if not table.exists():
+            _ = table.write_text("Num RefCount Protocol Flags Type St Inode Path\n")
+        with table.open("a") as output:
+            _ = output.write(f"0000000000000000: 00000002 00000000 {flags} 0001 01 {inode} {path}\n")
+
+    def socket_fd(self, process: Path, inode: int, *, fd: int = 3) -> None:
+        directory = process / "fd"
+        directory.mkdir(exist_ok=True)
+        directory.joinpath(str(fd)).symlink_to(f"socket:[{inode}]")
 
     def test_binary_missing_and_override(self) -> None:
         self.assertEqual(herdr.herdr_binary(), str(self.fake))
@@ -101,8 +118,50 @@ class HerdrTests(unittest.TestCase):
 
     def test_server_start_skips_running_server(self) -> None:
         self.configure_herdr(["status", "server"], "server:\nstatus: running\n")
+        self.configure_herdr(["workspace", "list"], json.dumps({
+            "result": {"workspaces": [{"workspace_id": "w1"}]},
+        }))
         herdr.start_server("fixture", 10_000)
         self.assertEqual(self.commands(), [["--session", "fixture", "status", "server"]])
+
+    def test_new_server_refuses_a_running_destination_without_starting_a_unit(self) -> None:
+        self.configure_herdr(["status", "server"], "status: running\n")
+        with self.assertRaises(herdr.SessionTaken) as raised:
+            herdr.start_new_server("fixture", 10_000)
+        self.assertEqual(raised.exception.name, "fixture")
+        self.assertEqual(self.commands(), [["--session", "fixture", "status", "server"]])
+
+    def test_new_server_refuses_a_unit_taken_after_the_status_probe(self) -> None:
+        self.configure_herdr(["status", "server"], "status: stopped\n")
+        creation = ["--user", "--unit=herdr-fixture", "--collect", str(self.fake),
+                    "--session", "fixture", "server"]
+        self.configure(creation, code=1, stderr="Unit herdr-fixture.service was already loaded or has a fragment file.")
+        with self.assertRaises(herdr.SessionTaken):
+            herdr.start_new_server("fixture", 10_000)
+        self.assertEqual(self.commands(), [["--session", "fixture", "status", "server"], creation])
+
+    def test_new_server_does_not_poll_after_an_unrelated_unit_creation_failure(self) -> None:
+        self.configure_herdr(["status", "server"], "status: stopped\n")
+        creation = ["--user", "--unit=herdr-fixture", "--collect", str(self.fake),
+                    "--session", "fixture", "server"]
+        self.configure(creation, code=1, stderr="fixture manager unavailable")
+        with self.assertRaisesRegex(herdr.HerdrFailure, "fixture manager unavailable"):
+            herdr.start_new_server("fixture", 10_000)
+        self.assertEqual(self.commands(), [["--session", "fixture", "status", "server"], creation])
+
+    def test_new_server_waits_for_its_exclusively_created_unit_to_answer(self) -> None:
+        self.responses["--session fixture status server"] = [
+            {"stdout": "status: stopped\n", "code": 0}, {"stdout": "status: running\n", "code": 0},
+        ]
+        _ = self.responses_path.write_text(json.dumps(self.responses))
+        herdr.start_new_server("fixture", 10_000)
+        self.assertEqual(self.commands(), [
+            ["--session", "fixture", "status", "server"],
+            ["--user", "--unit=herdr-fixture", "--collect", str(self.fake), "--session", "fixture", "server"],
+            ["--session", "fixture", "status", "server"],
+            ["--user", "is-active", "herdr-fixture"],
+            ["--session", "fixture", "workspace", "list"],
+        ])
 
     def test_server_start_deadline_and_sanitized_unit(self) -> None:
         self.configure_herdr(["status", "server"], "status: stopped\n")
@@ -117,7 +176,84 @@ class HerdrTests(unittest.TestCase):
         ]
         _ = self.responses_path.write_text(json.dumps(self.responses))
         herdr.start_server("fixture", 10_000)
-        self.assertEqual(len(self.commands()), 3)
+        self.assertEqual(self.commands(), [
+            ["--session", "fixture", "status", "server"],
+            ["--user", "--unit=herdr-fixture", "--collect", str(self.fake), "--session", "fixture", "server"],
+            ["--session", "fixture", "status", "server"],
+            ["--user", "is-active", "herdr-fixture"],
+            ["--session", "fixture", "workspace", "list"],
+        ])
+
+    def test_spawned_servers_close_every_restored_workspace_before_returning(self) -> None:
+        self.configure_herdr(["workspace", "list"], json.dumps({
+            "id": "cli:workspace:list", "result": {"type": "workspace_list", "workspaces": [
+                {"workspace_id": "w1", "focused": True, "active_tab_id": "w1:t1",
+                 "label": "fixture", "agent_status": "unknown", "number": 1,
+                 "pane_count": 1, "tab_count": 1},
+                {"workspace_id": "w2", "focused": False},
+            ]},
+        }))
+        for start in (herdr.start_server, herdr.start_new_server):
+            with self.subTest(start=start.__name__):
+                self.log.unlink(missing_ok=True)
+                self.responses["--session fixture status server"] = [
+                    {"stdout": "status: stopped\n", "code": 0},
+                    {"stdout": "status: running\n", "code": 0},
+                ]
+                _ = self.responses_path.write_text(json.dumps(self.responses))
+                start("fixture", 10_000)
+                self.assertEqual(self.commands(), [
+                    ["--session", "fixture", "status", "server"],
+                    ["--user", "--unit=herdr-fixture", "--collect", str(self.fake), "--session", "fixture", "server"],
+                    ["--session", "fixture", "status", "server"],
+                    ["--user", "is-active", "herdr-fixture"],
+                    ["--session", "fixture", "workspace", "list"],
+                    ["--session", "fixture", "workspace", "close", "w1"],
+                    ["--session", "fixture", "workspace", "close", "w2"],
+                ])
+
+    def test_spawned_servers_report_session_and_workspace_when_close_fails(self) -> None:
+        self.configure_herdr(["workspace", "list"], json.dumps({
+            "result": {"workspaces": [{"workspace_id": "w1"}]},
+        }))
+        self.configure_herdr(["workspace", "close", "w1"], code=1, stderr="fixture close refused")
+        for start in (herdr.start_server, herdr.start_new_server):
+            with self.subTest(start=start.__name__):
+                self.log.unlink(missing_ok=True)
+                self.responses["--session fixture status server"] = [
+                    {"stdout": "status: stopped\n", "code": 0},
+                    {"stdout": "status: running\n", "code": 0},
+                ]
+                _ = self.responses_path.write_text(json.dumps(self.responses))
+                with self.assertRaisesRegex(herdr.HerdrFailure, "session fixture:.*workspace w1:.*fixture close refused"):
+                    start("fixture", 10_000)
+                self.assertEqual(self.commands()[-1], ["--session", "fixture", "workspace", "close", "w1"])
+
+    def test_answering_server_with_inactive_spawned_unit_is_never_cleared(self) -> None:
+        self.configure(["--user", "is-active", "herdr-fixture"], "inactive\n", code=3)
+        self.configure_herdr(["workspace", "list"], json.dumps({
+            "result": {"workspaces": [{"workspace_id": "w1"}]},
+        }))
+        for start in (herdr.start_server, herdr.start_new_server):
+            with self.subTest(start=start.__name__):
+                self.log.unlink(missing_ok=True)
+                self.responses["--session fixture status server"] = [
+                    {"stdout": "status: stopped\n", "code": 0},
+                    {"stdout": "status: running\n", "code": 0},
+                ]
+                _ = self.responses_path.write_text(json.dumps(self.responses))
+                if start is herdr.start_new_server:
+                    with self.assertRaises(herdr.SessionTaken) as raised:
+                        start("fixture", 10_000)
+                    self.assertEqual(raised.exception.name, "fixture")
+                else:
+                    start("fixture", 10_000)
+                self.assertEqual(self.commands(), [
+                    ["--session", "fixture", "status", "server"],
+                    ["--user", "--unit=herdr-fixture", "--collect", str(self.fake), "--session", "fixture", "server"],
+                    ["--session", "fixture", "status", "server"],
+                    ["--user", "is-active", "herdr-fixture"],
+                ])
 
     def test_stop_stops_only_named_active_unit(self) -> None:
         herdr.stop_session("fixture")
@@ -153,6 +289,86 @@ class HerdrTests(unittest.TestCase):
             ["--session", "fixture", "agent", "start", "worker", "--kind", "codex", "--pane", "pane-1", "--timeout", "200", "--", "-m", "fixture-model"],
             ["--session", "fixture", "agent", "prompt", "pane-1", "opening\nprompt"],
         ])
+
+    def start_responses(self, timeout_ms: int, responses: list[CommandResponse]) -> list[str]:
+        arguments = ["--session", "fixture", "agent", "start", "worker", "--kind", "claude",
+                     "--pane", "pane-1", "--timeout", str(timeout_ms), "--", "--resume", "conversation"]
+        self.responses[" ".join(arguments)] = responses
+        _ = self.responses_path.write_text(json.dumps(self.responses))
+        return arguments
+
+    def enforce_start_timeout_minimum(self) -> None:
+        command = herdr.run_program
+
+        def constrained_command(argv: list[str], timeout: float = 10.0) -> subprocess.CompletedProcess[str]:
+            result = command(argv, timeout)
+            if argv[3:5] == ["agent", "start"] and int(argv[argv.index("--timeout") + 1]) <= 3000:
+                return subprocess.CompletedProcess(argv, 1, "", json.dumps({"error": {
+                    "code": "invalid_agent_timeout", "message": "timeout must exceed 3000 ms",
+                }}))
+            return result
+
+        _ = cast(object, self.enterContext(patch.object(herdr, "run_program", side_effect=constrained_command)))
+
+    def test_start_retries_busy_then_prompts_once(self) -> None:
+        self.enforce_start_timeout_minimum()
+        busy: CommandResponse = {"stdout": "", "code": 1, "stderr": json.dumps({"error": {
+            "code": "agent_pane_busy", "message": "shell not yet available",
+        }})}
+        arguments = self.start_responses(10_000, [busy, busy, {"stdout": "", "code": 0}])
+        pause = Mock()
+        with patch.object(herdr, "time", SimpleNamespace(monotonic=lambda: 0, sleep=pause)):
+            self.herdr.start_agent("worker", "pane-1", "claude", ["--resume", "conversation"], "continue\nworking", 10_000)
+        self.assertEqual(self.commands(), [arguments, arguments, arguments,
+                                          ["--session", "fixture", "agent", "prompt", "pane-1", "continue\nworking"]])
+        self.assertEqual([call.args for call in pause.call_args_list], [(0.1,), (0.1,)])
+
+    def test_start_busy_retries_share_deadline_and_raise_last_failure(self) -> None:
+        self.enforce_start_timeout_minimum()
+        attempts: list[list[str]] = []
+        for timeout_ms, message in ((3200, "first busy"), (3100, "last busy")):
+            attempts.append(self.start_responses(timeout_ms, [{"stdout": "", "code": 1, "stderr": json.dumps({
+                "error": {"code": "agent_pane_busy", "message": message},
+            })}]))
+        elapsed = [0.0]
+
+        def advance(seconds: float) -> None:
+            elapsed[0] += seconds
+
+        with patch.object(herdr, "time", SimpleNamespace(monotonic=lambda: elapsed[0], sleep=advance)):
+            with self.assertRaisesRegex(herdr.HerdrFailure, "last busy") as raised:
+                self.herdr.start_agent("worker", "pane-1", "claude", ["--resume", "conversation"], "continue", 3200)
+        self.assertEqual(raised.exception.code, "agent_pane_busy")
+        self.assertEqual(self.commands(), attempts)
+
+    def test_start_initial_small_timeout_keeps_herdr_refusal_without_retry(self) -> None:
+        self.enforce_start_timeout_minimum()
+        for timeout_ms in (2999, 3000):
+            with self.subTest(timeout_ms=timeout_ms):
+                self.log.unlink(missing_ok=True)
+                arguments = self.start_responses(timeout_ms, [{"stdout": "", "code": 0}])
+                pause = Mock()
+                with patch.object(herdr, "time", SimpleNamespace(monotonic=lambda: 0, sleep=pause)):
+                    with self.assertRaises(herdr.HerdrFailure) as raised:
+                        self.herdr.start_agent("worker", "pane-1", "claude", ["--resume", "conversation"], "continue", timeout_ms)
+                self.assertEqual(raised.exception.code, "invalid_agent_timeout")
+                self.assertEqual(self.commands(), [arguments])
+                pause.assert_not_called()
+
+    def test_start_does_not_retry_other_failure_codes(self) -> None:
+        for code in ("agent_blocked", "invalid_agent_name", "not_found"):
+            with self.subTest(code=code):
+                self.log.unlink(missing_ok=True)
+                arguments = self.start_responses(10_000, [{"stdout": "", "code": 1, "stderr": json.dumps({
+                    "error": {"code": code, "message": "start refused"},
+                })}, {"stdout": "", "code": 0}])
+                pause = Mock()
+                with patch.object(herdr, "time", SimpleNamespace(monotonic=lambda: 0, sleep=pause)):
+                    with self.assertRaisesRegex(herdr.HerdrFailure, "start refused") as raised:
+                        self.herdr.start_agent("worker", "pane-1", "claude", ["--resume", "conversation"], "continue", 10_000)
+                self.assertEqual(raised.exception.code, code)
+                self.assertEqual(self.commands(), [arguments])
+                pause.assert_not_called()
 
     def test_claude_start_passes_only_extra_arguments_after_separator(self) -> None:
         self.herdr.start_agent(
@@ -201,6 +417,63 @@ class HerdrTests(unittest.TestCase):
             ["--session", "fixture", "agent", "prompt", "pane-1", "continue"],
         ])
 
+    def test_agent_names_are_valid_for_method_and_module_launches(self) -> None:
+        for label, expected in (("Kept Runner", "kept-runner"), ("7runner", "a-7runner"),
+                                ("X" * 40, "x" * 32), ("", "a-7pane-1")):
+            for module_launch in (False, True):
+                with self.subTest(label=label, module_launch=module_launch):
+                    self.log.unlink(missing_ok=True)
+                    if module_launch:
+                        self.configure_herdr(["pane", "list"], json.dumps({"result": {"panes": [
+                            {"pane_id": "7pane-1", "label": label},
+                        ]}}))
+                        herdr.start_agent("fixture", "7pane-1", "claude", ["--model", "opus"], "continue", 200)
+                    else:
+                        self.herdr.start_agent(label or "7pane-1", "7pane-1", "claude", ["--model", "opus"], "continue", 200)
+                    start, prompt = self.commands()[-2:]
+                    self.assertEqual(start, [
+                        "--session", "fixture", "agent", "start", expected, "--kind", "claude",
+                        "--pane", "7pane-1", "--timeout", "200", "--", "--model", "opus",
+                    ])
+                    self.assertEqual(prompt, ["--session", "fixture", "agent", "prompt", "7pane-1", "continue"])
+
+    def test_pane_activity_distinguishes_shell_from_foreground_commands(self) -> None:
+        for foreground, names, expected in (
+            (3392858, ("zsh",), herdr.PaneAtShell()),
+            (3393000, ("claude", "node"), herdr.PaneRunning(("claude", "node"))),
+            (3393001, ("zsh",), herdr.PaneRunning(("zsh",))),
+        ):
+            with self.subTest(foreground=foreground):
+                self.configure_herdr(["pane", "process-info", "--pane", "w1:p1"], json.dumps({
+                    "id": "cli:pane:process_info", "result": {"type": "pane_process_info", "process_info": {
+                        "pane_id": "w1:p1", "shell_pid": 3392858,
+                        "foreground_process_group_id": foreground,
+                        "foreground_processes": [{"name": name, "pid": foreground + index,
+                            "argv": [name], "cmdline": name, "cwd": "/tmp"} for index, name in enumerate(names)],
+                    }},
+                }))
+                self.assertEqual(self.herdr.pane_activity("w1:p1"), expected)
+
+    def test_pane_activity_rejects_malformed_process_info(self) -> None:
+        valid: dict[str, object] = {"shell_pid": 10, "foreground_process_group_id": 10,
+                                   "foreground_processes": [{"name": "zsh"}]}
+        malformed: list[object] = [
+            None, [], {}, {**valid, "shell_pid": "10"}, {**valid, "shell_pid": True},
+            {**valid, "foreground_process_group_id": 0},
+            {**valid, "foreground_process_group_id": None},
+            {**valid, "foreground_processes": {}},
+            {**valid, "foreground_processes": ["zsh"]},
+            {**valid, "foreground_processes": [{}]},
+            {**valid, "foreground_processes": [{"name": 10}]},
+        ]
+        for info in malformed:
+            with self.subTest(info=info):
+                self.configure_herdr(["pane", "process-info", "--pane", "w1:p1"], json.dumps({
+                    "result": {"process_info": info},
+                }))
+                with self.assertRaises(herdr.HerdrFailure):
+                    _ = self.herdr.pane_activity("w1:p1")
+
     def test_prompt_refusal_raises_blocked_without_retry(self) -> None:
         self.configure_herdr(["agent", "prompt", "pane-1", "work"], code=1, stderr=json.dumps({"error": {"code": "agent_blocked", "message": "permission dialog"}}))
         with self.assertRaises(herdr.AgentBlocked):
@@ -245,6 +518,105 @@ class HerdrTests(unittest.TestCase):
         self.assertEqual(herdr.herdr_place_of(30), herdr.NotInHerdr())
         self.assertEqual(herdr.herdr_place_of(11), herdr.NotInHerdr())
         self.assertEqual(herdr.herdr_place_of(99), herdr.NotInHerdr())
+
+    def test_server_environment_finds_attach_and_handoff_servers_by_socket(self) -> None:
+        commands = (["/fixture/herdr", "server"], ["/fixture/herdr", "--handoff", "replacement"])
+        for offset, arguments in enumerate(commands):
+            name = f"fixture{offset}"
+            with self.subTest(arguments=arguments):
+                environment = {"HERDR_SESSION": name, "CLAUDE_CONFIG_DIR": "/account",
+                               "CLAUDE_CODE_REMOTE_MEMORY_DIR": "/memory", "VALUE": "one=two"}
+                path = self.root / "config" / "herdr" / "sessions" / name / "herdr.sock"
+                inode = 813310542 + offset * 2
+                self.unix_socket(path, inode)
+                self.unix_socket(path, inode + 1, listening=False)
+                server = self.process(10 + offset, 1, arguments, environment)
+                self.socket_fd(server, inode)
+                self.socket_fd(server, inode, fd=4)
+                # A connected client shares the path, but never the listener inode.
+                client = self.process(20 + offset, 1, ["/fixture/herdr", "--session", name,
+                    "session", "attach", name], {"CLAUDE_CONFIG_DIR": "/client-account"})
+                self.socket_fd(client, inode + 1)
+                # An argv match without the listening fd must not win discovery.
+                _ = self.process(30 + offset, 1, ["/fixture/herdr", "--session", name, "server"],
+                                 {"CLAUDE_CONFIG_DIR": "/old-server-account"})
+                self.assertEqual(herdr.server_environment(name), environment)
+
+    def test_server_environment_uses_root_socket_for_default_session(self) -> None:
+        self.unix_socket(self.root / "config/herdr/herdr.sock", 100)
+        server = self.process(10, 1, ["/fixture/herdr", "server"], {"ACCOUNT": "default-server"})
+        self.socket_fd(server, 100)
+        self.unix_socket(self.root / "config/herdr/sessions/default/herdr.sock", 200)
+        decoy = self.process(20, 1, ["/fixture/herdr", "server"], {"ACCOUNT": "nested-decoy"})
+        self.socket_fd(decoy, 200)
+        self.assertEqual(herdr.server_environment("default"), {"ACCOUNT": "default-server"})
+
+    def test_server_environment_uses_config_directory_with_spaces(self) -> None:
+        path = self.root / "configuration with spaces/herdr/sessions/fixture/herdr.sock"
+        self.unix_socket(path, 100)
+        server = self.process(10, 1, ["/fixture/herdr", "server"], {"ACCOUNT": "configured"})
+        self.socket_fd(server, 100)
+        with patch.dict(os.environ, {"XDG_CONFIG_HOME": str(self.root / "configuration with spaces")}):
+            self.assertEqual(herdr.server_environment("fixture"), {"ACCOUNT": "configured"})
+
+    def test_server_environment_defaults_to_home_config_directory(self) -> None:
+        path = self.root / "home/.config/herdr/sessions/fixture/herdr.sock"
+        self.unix_socket(path, 100)
+        server = self.process(10, 1, ["/fixture/herdr", "server"], {"ACCOUNT": "home"})
+        self.socket_fd(server, 100)
+        with patch.dict(os.environ, {"XDG_CONFIG_HOME": ""}):
+            self.assertEqual(herdr.server_environment("fixture"), {"ACCOUNT": "home"})
+
+    def test_server_environment_requires_a_listener_for_the_exact_session(self) -> None:
+        self.unix_socket(self.root / "config/herdr/sessions/fixture/herdr.sock", 100, listening=False)
+        self.unix_socket(self.root / "config/herdr/sessions/other/herdr.sock", 200)
+        process = self.process(10, 1, ["/fixture/herdr", "--session", "fixture", "server"], {})
+        self.socket_fd(process, 100)
+        with self.assertRaisesRegex(herdr.HerdrFailure, "session fixture.*listening socket, found 0"):
+            _ = herdr.server_environment("fixture")
+
+    def test_server_environment_never_uses_a_connected_client_as_holder(self) -> None:
+        path = self.root / "config/herdr/sessions/fixture/herdr.sock"
+        self.unix_socket(path, 100)
+        self.unix_socket(path, 101, listening=False)
+        client = self.process(10, 1, ["/fixture/herdr", "--session", "fixture", "session", "attach", "fixture"], {})
+        self.socket_fd(client, 101)
+        _ = self.process(20, 1, ["/fixture/herdr", "--session", "fixture", "server"], {})
+        with self.assertRaisesRegex(herdr.HerdrFailure, "session fixture.*socket holder, found 0"):
+            _ = herdr.server_environment("fixture")
+
+    def test_server_environment_refuses_two_listener_holders(self) -> None:
+        self.unix_socket(self.root / "config/herdr/sessions/fixture/herdr.sock", 100)
+        first = self.process(10, 1, ["/fixture/herdr", "server"], {"ACCOUNT": "first"})
+        second = self.process(20, 1, ["/fixture/herdr", "--handoff"], {"ACCOUNT": "second"})
+        self.socket_fd(first, 100)
+        self.socket_fd(second, 100)
+        with self.assertRaisesRegex(herdr.HerdrFailure, "session fixture.*socket holder, found 2"):
+            _ = herdr.server_environment("fixture")
+
+    def test_server_environment_refuses_ambiguous_listeners(self) -> None:
+        path = self.root / "config/herdr/sessions/fixture/herdr.sock"
+        self.unix_socket(path, 100)
+        self.unix_socket(path, 200)
+        for pid, inode in ((10, 100), (20, 200)):
+            process = self.process(pid, 1, ["/fixture/herdr", "server"], {})
+            self.socket_fd(process, inode)
+        with self.assertRaisesRegex(herdr.HerdrFailure, "session fixture.*listening socket, found 2"):
+            _ = herdr.server_environment("fixture")
+
+    def test_server_environment_reports_unreadable_environment(self) -> None:
+        self.unix_socket(self.root / "config/herdr/sessions/fixture/herdr.sock", 100)
+        process = self.process(10, 1, ["/fixture/herdr", "server"], {})
+        self.socket_fd(process, 100)
+        process.joinpath("environ").unlink()
+        process.joinpath("environ").mkdir()
+        with self.assertRaisesRegex(herdr.HerdrFailure, "session fixture.*cannot read process environment"):
+            _ = herdr.server_environment("fixture")
+
+    def test_server_environment_reports_unreadable_socket_table(self) -> None:
+        self.proc.joinpath("net", "unix").mkdir(parents=True)
+        with self.assertRaisesRegex(herdr.HerdrFailure, "session fixture.*cannot read listening sockets"):
+            _ = herdr.server_environment("fixture")
 
     def test_processes_skip_unreadable_and_limit_marks(self) -> None:
         _ = self.process(10, 1, ["/fixture/herdr", "--session", "fixture", "server"], {})
