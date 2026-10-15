@@ -10,6 +10,7 @@
 # It hands jq everything statusline.jq cannot read for itself:
 #   account      the session's label, from its config dir's account-label.
 #   labels       agent_notes' readings by label, /dev/null when missing.
+#   colors       config/statusline.conf, /dev/null when missing or unreadable.
 #   showrunners  the session ids every showrunner's update timer targets: the
 #                TARGET line of each notifier showrunner-<slug>/conf, which
 #                notifier.sh's write_conf always writes first.
@@ -21,7 +22,12 @@ account=
 labels="$HOME/.local/state/agent-notes/by-label.json"
 [ -r "$labels" ] || labels=/dev/null
 
+colors="$statusline/../../config/statusline.conf"
+[ -r "$colors" ] || colors=/dev/null
+
 showrunners=
+# zsh otherwise aborts on an empty notifier glob before jq can render the line.
+[ -z "${ZSH_VERSION:-}" ] || setopt nonomatch
 for conf in "${NOTIFIER_STATE_DIR:-$HOME/.local/state/notifier}"/showrunner-*/conf; do
   target=
   { read -r target < "$conf"; } 2>/dev/null
@@ -32,4 +38,4 @@ done
 
 # shellcheck disable=SC2154 # statusline is set by the command that sources this.
 exec jq -r --arg pwd "$PWD" --arg account "$account" --arg showrunners "$showrunners" \
-  --slurpfile labels "$labels" -f "$statusline/statusline.jq"
+  --slurpfile labels "$labels" --rawfile colors "$colors" -f "$statusline/statusline.jq"
