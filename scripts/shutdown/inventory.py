@@ -17,10 +17,11 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Literal, NotRequired, TypedDict, cast
 
 SCRIPTS = Path(__file__).resolve().parents[1]
-for dependency in ("whoami", "message", "production", "herdr", "delegate"):
+for dependency in ("whoami", "message", "production", "herdr", "delegate", "lib"):
     sys.path.insert(0, str(SCRIPTS / dependency))
 
 import account
+import unit_runs
 if TYPE_CHECKING:
     from ..delegate.worker_state import worker_ledger
 else:
@@ -850,8 +851,8 @@ def _notifier_state_dir() -> Path:
     return Path(os.environ.get("NOTIFIER_STATE_DIR", str(Path.home() / ".local/state/notifier")))
 
 
-def _delegate_root() -> Path:
-    return Path(os.environ.get("SHUTDOWN_DELEGATE_ROOT", "/tmp/claude/delegate"))
+def _run_roots() -> tuple[Path, ...]:
+    return unit_runs.run_roots(os.environ.get("SHUTDOWN_DELEGATE_ROOT"))
 
 
 def _session_file(record: sessions.SessionRecord) -> SessionFile:
@@ -982,11 +983,12 @@ def _unit_sessions(runners: tuple[ShowrunnerRegistration, ...]) -> dict[str, Uni
 def _active_run_directories() -> dict[str, list[Path]]:
     """Every director-to-run mapping, including directors that have already exited."""
     found: dict[str, list[Path]] = {}
-    active = _delegate_root() / "active"
-    try:
-        mappings = sorted(active.iterdir())
-    except OSError:
-        return found
+    mappings: list[Path] = []
+    for root in _run_roots():
+        try:
+            mappings.extend(sorted((root / "active").iterdir()))
+        except OSError:
+            continue
     for mapping in mappings:
         if not mapping.is_file():
             continue

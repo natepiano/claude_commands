@@ -33,7 +33,15 @@ if [[ -z "${CLAUDE_CODE_SESSION_ID:-}" ]]; then
   exit 0
 fi
 
-MARKER="${PLAN_DELEGATE_ACTIVE_DIR:-/tmp/claude/delegate/active}/${CLAUDE_CODE_SESSION_ID}"
+# The marker is under unit/, or delegate/ for a run started before the rename.
+if [[ -n "${PLAN_DELEGATE_ACTIVE_DIR:-}" ]]; then
+  MARKER="${PLAN_DELEGATE_ACTIVE_DIR}/${CLAUDE_CODE_SESSION_ID}"
+else
+  MARKER="/tmp/claude/unit/active/${CLAUDE_CODE_SESSION_ID}"
+  if [[ ! -f "${MARKER}" && -f "/tmp/claude/delegate/active/${CLAUDE_CODE_SESSION_ID}" ]]; then
+    MARKER="/tmp/claude/delegate/active/${CLAUDE_CODE_SESSION_ID}"
+  fi
+fi
 
 if [[ -f "${MARKER}" ]]; then
   # The marker holds the session directory, which is where the mesh files live.
@@ -53,7 +61,12 @@ if [[ -f "${MARKER}" ]]; then
     rm -rf -- "${SESSION_DIR}/verify_cache"
   fi
   if [[ -n "${SESSION_DIR}" ]]; then
-    zsh "${SCRIPT_DIR}/../message/notifier.sh" remove "delegate-$(basename "${SESSION_DIR}")" \
+    # A run folder under delegate/ keeps the instance name it started with.
+    INSTANCE="unit-$(basename "${SESSION_DIR}")"
+    if [[ "$(basename "$(dirname "${SESSION_DIR}")")" == delegate ]]; then
+      INSTANCE="delegate-$(basename "${SESSION_DIR}")"
+    fi
+    zsh "${SCRIPT_DIR}/../message/notifier.sh" remove "${INSTANCE}" \
       >/dev/null 2>&1 || true
   fi
   rm -f "${MARKER}"

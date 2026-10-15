@@ -300,7 +300,7 @@ finishes first, and nothing is owed in reply.
 
 Recovering by hand, in that case only. Check that no peer run claims the
 recorded pid or port before signalling anything —
-`grep -l '<pid>\|<port>' /tmp/claude/delegate/*/mesh_server.json` should name
+`grep -l '<pid>\|<port>' /tmp/claude/unit/*/mesh_server.json /tmp/claude/delegate/*/mesh_server.json` should name
 only this session's file, and any second file means leave the process alone.
 Then kill that pid, move `mesh_server.json` aside, and relaunch verbatim; the
 next launcher starts a fresh server. Leave `mesh_roster.json` alone — its other
@@ -561,7 +561,7 @@ Before every Codex poll, set `${PROGRESS_INTERVAL_SECONDS}` from
 `PLAN_DELEGATE_PROGRESS_INTERVAL_SECONDS` in `~/.claude/config/delegate.conf`.
 The key sets the Codex poll timeout and a Claude unit's notifier interval.
 For Codex, a missing or non-positive integer is an error; tell the user to set
-it. <PrepareSession/> creates Claude's `delegate-<run id>` instance, where
+it. <PrepareSession/> creates Claude's `unit-<run id>` instance, where
 the run id is the basename of `${SESSION_DIR}`; `end_session.sh` removes it.
 With `PLAN_DELEGATE_PROGRESS_UPDATES=on-demand`, the default, it creates none:
 reports run only when asked, until `/unit:report on` starts the schedule. A
@@ -570,7 +570,7 @@ change the Codex poll interval. The agent arms nothing. When `prepare_session.sh
 created`, say so in one line: this run gets no ticks until
 `zsh ~/.claude/scripts/delegate/unit_notifier.sh "$CLAUDE_CODE_SESSION_ID"`
 succeeds. While work runs, the notifier sends
-`/unit:report` from `delegate-<run id>` every interval. That message
+`/unit:report` from `unit-<run id>` every interval. That message
 is the Claude tick. Each `progress_history.py progress` call restarts its
 clock; `--hold` keeps at most one tick waiting.
 

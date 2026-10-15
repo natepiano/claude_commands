@@ -18,8 +18,8 @@ Every launch appends `<id>\\t<name>` to its run's `workers` ledger. This removes
 
   * every worker in `--session-dir`'s ledger -- the caller's own run, at the end
     of a phase or of the run, when nothing will message those workers again;
-  * every worker of a run that is not live, from any ledger under the delegate
-    root -- the sweep that catches a run whose unit director died before its
+  * every worker of a run that is not live, from any ledger under the run
+    roots -- the sweep that catches a run whose unit director died before its
     own cleanup ran.
 
 A run is live while a run-active marker names its session directory and the
@@ -30,7 +30,7 @@ session: a worker still working beats every minute.
 
 Only background sessions are ever removed, and never the session running this.
 After a successful Claude session listing, phase cleanup also asks codex_mesh to
-sweep unused app-servers under the real delegate root. That destructive sweep is
+sweep unused app-servers under the real run roots. That destructive sweep is
 best-effort and never runs when the listing failed and cleanup cannot account for
 its other effects.
 """
@@ -49,12 +49,16 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Literal, TypedDict, cast
 
 if TYPE_CHECKING:
+    from ..lib import unit_runs
     from .worker_state import worker_ledger
 else:
     sys.path.insert(0, str(Path(__file__).resolve().parent))
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
+    import unit_runs
     from worker_state import worker_ledger
 
-DEFAULT_ROOT = Path("/tmp/claude/delegate")
+# Run folders sit under unit/, and under delegate/ for a run started before the rename.
+DEFAULT_ROOTS = unit_runs.run_roots()
 LEDGER = "workers"
 HEARTBEAT = "heartbeat.log"
 LIVE_HEARTBEAT_SECS = 600
@@ -174,7 +178,7 @@ def sweep_app_servers(root: Path) -> None:
         )
 
 
-def live_runs(root: Path, listed_sessions: set[str]) -> set[Path]:
+def live_runs(roots: tuple[Path, ...], listed_sessions: set[str]) -> set[Path]:
     live: set[Path] = set()
     shutdown_state = shutdown_held_sessions()
     if shutdown_state["kind"] == "shutdown state unreadable":
@@ -182,22 +186,23 @@ def live_runs(root: Path, listed_sessions: set[str]) -> set[Path]:
             "remove_workers: shutdown state could not be read; keeping every active run.",
             file=sys.stderr,
         )
-    active = root / "active"
-    if active.is_dir():
-        for marker in active.iterdir():
-            if (
-                shutdown_state["kind"] == "held sessions"
-                and marker.name not in listed_sessions
-                and marker.name not in shutdown_state["session_ids"]
-            ):
-                continue
-            lines = marker.read_text(encoding="utf-8").splitlines()
-            if lines and lines[0].strip():
-                live.add(Path(lines[0].strip()).resolve())
     now = time.time()
-    for heartbeat in root.glob(f"*/{HEARTBEAT}"):
-        if now - heartbeat.stat().st_mtime < LIVE_HEARTBEAT_SECS:
-            live.add(heartbeat.parent.resolve())
+    for root in roots:
+        active = root / "active"
+        if active.is_dir():
+            for marker in active.iterdir():
+                if (
+                    shutdown_state["kind"] == "held sessions"
+                    and marker.name not in listed_sessions
+                    and marker.name not in shutdown_state["session_ids"]
+                ):
+                    continue
+                lines = marker.read_text(encoding="utf-8").splitlines()
+                if lines and lines[0].strip():
+                    live.add(Path(lines[0].strip()).resolve())
+        for heartbeat in root.glob(f"*/{HEARTBEAT}"):
+            if now - heartbeat.stat().st_mtime < LIVE_HEARTBEAT_SECS:
+                live.add(heartbeat.parent.resolve())
     return live
 
 
@@ -214,14 +219,14 @@ def ledger_ids(run: Path) -> list[str]:
 
 
 def removal_targets(
-    root: Path, own_run: Path | None, rows: list[AgentRow], live: set[Path]
+    roots: tuple[Path, ...], own_run: Path | None, rows: list[AgentRow], live: set[Path]
 ) -> dict[str, str]:
     """Worker id to the reason it is being removed."""
     targets: dict[str, str] = {}
     if own_run is not None:
         for worker_id in ledger_ids(own_run):
             targets[worker_id] = "this run's phase is over"
-    for directory in root.glob("*"):
+    for directory in (found for root in roots for found in root.glob("*")):
         if not directory.is_dir() or not worker_ledger(directory).is_file():
             continue
         run = directory.resolve()
@@ -233,21 +238,22 @@ def removal_targets(
         match = LEGACY_NAME.match(row.get("name", ""))
         if match is None:
             continue
-        run = (root / match.group(1)).resolve()
-        if run == own_run:
+        runs = {(root / match.group(1)).resolve() for root in roots}
+        if own_run in runs:
             _ = targets.setdefault(row.get("id", ""), "this run's phase is over")
-        elif run not in live:
-            _ = targets.setdefault(row.get("id", ""), f"run {run.name} is not live")
+        elif not runs & live:
+            _ = targets.setdefault(row.get("id", ""), f"run {match.group(1)} is not live")
     return targets
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__.split("\n", 1)[0] if __doc__ else None)
     _ = parser.add_argument("--session-dir", help="the caller's own run; all its workers go")
-    _ = parser.add_argument("--delegate-root", default=str(DEFAULT_ROOT))
+    _ = parser.add_argument("--delegate-root", help="one run root in place of both run-folder names")
     args = parser.parse_args()
     session_dir = cast("str | None", args.session_dir)
-    root = Path(cast("str", args.delegate_root))
+    given = cast("str | None", args.delegate_root)
+    roots = (Path(given),) if given else DEFAULT_ROOTS
     own_run = Path(session_dir).resolve() if session_dir else None
 
     claude = claude_bin()
@@ -257,14 +263,14 @@ def main() -> int:
         return 1
 
     # --session-dir identifies phase cleanup. Restrict the automatic destructive
-    # sweep to the real delegate root; tests and callers inspecting another root
+    # sweep to the real run roots; tests and callers inspecting another root
     # must invoke codex_mesh.py themselves. List Claude sessions first so an
     # early failure can truthfully promise that cleanup changed nothing.
-    if own_run is not None and root.resolve() == DEFAULT_ROOT.resolve():
-        sweep_app_servers(root)
+    if own_run is not None and any(root.resolve() in {default.resolve() for default in DEFAULT_ROOTS} for root in roots):
+        sweep_app_servers(roots[0])
 
     listed_sessions = {row.get("sessionId", "") for row in rows}
-    targets = removal_targets(root, own_run, rows, live_runs(root, listed_sessions))
+    targets = removal_targets(roots, own_run, rows, live_runs(roots, listed_sessions))
 
     caller = os.environ.get("CLAUDE_CODE_SESSION_ID", "")
     removed = 0

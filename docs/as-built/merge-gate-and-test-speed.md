@@ -8,7 +8,7 @@
 
 ### The gate: `scripts/production/merge_gate.py`
 
-**Invocation.** `merge_gate.py --merge-branch B --unit-branch U --checkpoint C --previous-checkpoint P --unit NAME --phase LABEL [--repo/--checkout DIR] [--body TEXT] [--type-dirs DIR...] [--promote] [--main-repo ~/.claude] [--ssh ssh] [--mac-host mac] [--mac-repo ~/.claude] [--settings-blob f430ede1] [--memory-cap-mib 4096]`. The six merge flags are required unless `--tests-only` is given. `--type-dirs` (alias `--type-dir`) defaults to `scripts`. Any failure prints `REFUSED: <reason>` to stderr and exits 1. Typed boundary: `GateArguments(argparse.Namespace)`; each failure raises `GateRefused`.
+**Invocation.** `merge_gate.py --merge-branch B --unit-branch U --checkpoint C --previous-checkpoint P --unit NAME --phase LABEL [--repo/--checkout DIR] [--body TEXT] [--type-dirs DIR...] [--promote] [--main-repo ~/.claude] [--ssh ssh] [--mac-host mac] [--mac-repo ~/.claude] [--settings-blob 6ca2d928] [--memory-cap-mib 4096]`. The six merge flags are required unless `--tests-only` is given. `--type-dirs` (alias `--type-dir`) defaults to `scripts`. Any failure prints `REFUSED: <reason>` to stderr and exits 1. Typed boundary: `GateArguments(argparse.Namespace)`; each failure raises `GateRefused`.
 
 **Refusals before merging** (`merge_checkpoint`):
 - tracked uncommitted changes. Untracked files never block (`--untracked-files=no`), because each showrunner keeps a LOG there; a merge that would overwrite an untracked file fails and is aborted.
@@ -104,7 +104,7 @@ Tests: `scripts/production/test_merge_gate.py`, on scratch repos.
 
 ## Invariants
 
-- **No test reaches live state:** `~/.codex*`, `~/.local/state/`, `/tmp/claude/delegate/active/`, the live tmux server (real tmux only with a private `TMUX_TMPDIR`), the real `codex app-server`, and phone sends.
+- **No test reaches live state:** `~/.codex*`, `~/.local/state/`, `/tmp/claude/unit/active/` and `/tmp/claude/delegate/active/`, the live tmux server (real tmux only with a private `TMUX_TMPDIR`), the real `codex app-server`, and phone sends.
   - Production quota tests supply `CodexAlertPassReadings` (`scripts/whoami/quota_alert.py`), and a patched `workers_home` raises on any fallback to a live Codex home.
   - Sockets use private temp dirs or ephemeral ports. No test depends on a fixed port: the refused-start test binds an ephemeral port and closes it.
   - No test writes into the repo.

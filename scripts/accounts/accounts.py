@@ -34,6 +34,7 @@ sys.path.insert(0, str(REPOSITORY_ROOT))
 sys.path.insert(0, str(SCRIPTS / "whoami"))
 
 import account  # noqa: E402
+from scripts.lib import unit_runs  # noqa: E402
 import agent_accounts  # noqa: E402
 import note_file  # noqa: E402
 import usage_store  # noqa: E402
@@ -3051,7 +3052,8 @@ def status_report(*, detail: bool = False) -> str:
         *_move_status_lines(moves.account_moves(journal), zone), *_routing_status_lines(journal, zone)])
 
 
-WORKERS_RUN_ROOT = Path("/tmp/claude/delegate")
+# Run folders under unit/, and under delegate/ for a run started before the rename.
+WORKERS_RUN_ROOTS = unit_runs.run_roots()
 
 
 def _live_status_lines(groups: GroupAccounts) -> list[str]:
@@ -3102,7 +3104,7 @@ def _workers_status_lines(now: datetime, selected: CodexWorkersAccount) -> list[
     chosen = pick("codex", now, exclude=exclude, keep=NoKeep())
     destination = chosen.label if isinstance(chosen, PickedAccount) else no_room_line("codex", chosen)
     lines = [f"Codex workers: {selected.label}; on refusal: {destination}"]
-    for path in sorted(WORKERS_RUN_ROOT.glob("*/mesh_roster.json")):
+    for path in sorted(path for root in WORKERS_RUN_ROOTS for path in root.glob("*/mesh_roster.json")):
         if not _mesh_server_running(path.parent):
             continue
         try:

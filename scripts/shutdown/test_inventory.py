@@ -20,6 +20,7 @@ from test_support import ShutdownTestCase
 from test_restart import entry, pane_display, top_level
 import record
 import inventory
+import unit_runs
 import account
 import fake_tmux
 import herdr
@@ -116,6 +117,20 @@ class InventoryTests(ShutdownTestCase):
             with self.subTest(ending=repr(ending)):
                 _ = transcript.write_text(contents + "\nmalformed-json" + ending, encoding="utf-8")
                 self.assertEqual(inventory.last_model(transcript), "latest-model")
+
+    def test_run_markers_under_either_folder_name_map_their_directors(self) -> None:
+        for name in ("unit", "delegate"):
+            (self.root / name / "active").mkdir(parents=True, exist_ok=True)
+            _ = (self.root / name / "active" / f"{name}-director").write_text(f"/runs/{name}\n", encoding="utf-8")
+        environment = {key: value for key, value in os.environ.items() if key != "SHUTDOWN_DELEGATE_ROOT"}
+        with patch.dict(os.environ, environment, clear=True), \
+                patch.object(unit_runs, "RUN_ROOT", self.root / "unit"), \
+                patch.object(unit_runs, "FORMER_RUN_ROOT", self.root / "delegate"):
+            found = inventory._active_run_directories()  # pyright: ignore[reportPrivateUsage]
+        self.assertEqual(
+            (found.get("unit-director"), found.get("delegate-director")),
+            ([Path("/runs/unit")], [Path("/runs/delegate")]),
+        )
 
     def test_last_model_reassembles_lines_across_tail_blocks(self) -> None:
         transcript = self.root / "split-line.jsonl"

@@ -210,12 +210,12 @@ exit "$NOTIFIER_HEALTH_EXIT"
     def test_idle_run_reports_failed_tick_health(self) -> None:
         output, calls = self.run_status("/tmp/test-run\n", "failing: no instance", 1)
         self.assertIn("TICKS FAILING (no instance)", output)
-        self.assertEqual(calls, "health delegate-test-run\n")
+        self.assertEqual(calls, "health unit-test-run\n")
 
     def test_healthy_run_has_no_tick_warning(self) -> None:
         output, calls = self.run_status("/tmp/test-run\n", "ok", 0)
         self.assertNotIn("TICKS FAILING", output)
-        self.assertEqual(calls, "health delegate-test-run\n")
+        self.assertEqual(calls, "health unit-test-run\n")
 
     def test_missing_active_marker_skips_health(self) -> None:
         output, calls = self.run_status(None, "failing: no instance", 1)
@@ -230,7 +230,7 @@ exit "$NOTIFIER_HEALTH_EXIT"
     def test_claude_session_id_comes_from_lookup_even_with_a_different_name(self) -> None:
         output, calls = self.run_status("/tmp/test-run\n", "ok", 0)
         self.assertNotIn("CLAUDE NOT RUNNING", output)
-        self.assertEqual(calls, "health delegate-test-run\n")
+        self.assertEqual(calls, "health unit-test-run\n")
 
     def test_no_live_claude_record_reports_not_running(self) -> None:
         output, calls = self.run_status("/tmp/test-run\n", "ok", 0, stopped_units=("hook",))
@@ -404,5 +404,5 @@ exit "$NOTIFIER_HEALTH_EXIT"
         self.assertIn("=== DECISION for you from native ===", output)
         self.assertNotIn("CLAUDE NOT RUNNING", output)
         self.assertNotIn("SESSION GONE", output)
-        self.assertEqual(calls, "health delegate-native-run\n" * 2)
+        self.assertEqual(calls, "health unit-native-run\n" * 2)
         self.assertEqual(seen, "native|— gate: approve release\n")
