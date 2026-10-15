@@ -25,6 +25,7 @@ sys.path.insert(0, str(MESSAGE.parent / "herdr"))
 import herdr  # noqa: E402
 from herdr import HerdrPlace  # noqa: E402
 from sessions import UnreadableSessionRecord, live_session, read_session  # noqa: E402
+from showrunners import canonical_slug  # noqa: E402
 
 PRODUCTION_MARK = "SHOWRUNNER_UNIT"
 UNIT_MARK = "SHOWRUNNER_UNIT_ID"
@@ -319,7 +320,7 @@ def main(arguments: list[str]) -> int:
     try:
         match arguments:
             case ["list", slug]:
-                for unit in marked_units(slug).values():
+                for unit in marked_units(canonical_slug(slug)).values():
                     claude = unit.claude
                     told = ((claude.name, claude.session_id, claude.socket) if isinstance(claude, LiveClaude)
                             else ("", "", ""))
@@ -327,7 +328,7 @@ def main(arguments: list[str]) -> int:
                                else "unknown" if isinstance(claude, ClaudeUnknown) else "stopped")
                     print("\t".join((unit.unit, place_text(unit.place), unit.label, running, *told)))
             case ["pane", slug, name]:
-                found = marked_units(slug).get(name)
+                found = marked_units(canonical_slug(slug)).get(name)
                 if found is None:
                     return 1
                 print(place_text(found.place))

@@ -9,6 +9,7 @@
 ## Delegation Context
 
 - **Project:** `~/.claude` scripts — production tooling under `scripts/production/`.
+- **Project started:** 2026-10-15T08:34:01.905+00:00
 - **Stack:** Python 3.13 stdlib only; zsh/bash launch scripts; git; tmux.
 - **Layout:**
   - `scripts/production/` — showrunner and unit tooling; tests sit beside each script as `test_<name>.py`.
@@ -49,17 +50,17 @@
 
 ## Phases
 
-### Phase 1 — Formerly resolver  · status: todo
+### Phase 1 — Formerly resolver  · status: done
 
 #### Work Order
 
 **Goal:** Every slug lookup accepts a former slug and answers for the production that now holds it.
 
-**Depends-on:** none.
+**Depends on:** none.
 
 **Spec:**
 - A production doc may carry `- **Formerly:** \`<old>\`[, \`<older>\`]` in Production Context.
-- `showrunners.py` gains `canonical_slug(slug: str, state_dir: Path | None = None) -> str`. It returns `slug` when a timer has it. Otherwise it reads each registered timer's doc for a Formerly line naming `slug` and returns that timer's slug. With neither, it raises `ValueError` naming the slug.
+- `showrunners.py` gains `canonical_slug(slug: str, state_dir: Path | None = None) -> str`. It returns `slug` when a timer has it. Otherwise it reads each registered timer's doc for a Formerly line naming `slug` and returns that timer's slug. With neither, it returns `slug` unchanged: the resolver only maps former names, and each caller keeps its own existing check for an unknown production, so the review pool and unit lookup still work for a production with no timer. (Changed in phase 1 review: a raising resolver broke both for timer-less productions.)
 - `current_name`, `current_address`, `named`, `attach`, `detach`, and the `parent|children|root` CLI all canonicalize their slug argument first.
 - `production_slug(doc)` is unchanged; the doc name is the current slug.
 - `unit_lookup.py pane|list <slug>` and `review_pool.py`'s production argument canonicalize the same way, by importing `canonical_slug`.
@@ -72,7 +73,7 @@
 
 **Workers:** 1 writer + 1 tester
 - `impl` — showrunners.py, unit_lookup.py, review_pool.py; hub: `scripts/production/showrunners.py` (every lookup imports it).
-- `test` — test_showrunners.py: a timer for `new` whose doc says Formerly `old`. `address old` returns new's address. An unknown slug refuses. A slug both current and former resolves to the current one.
+- `test` — test_showrunners.py: a timer for `new` whose doc says Formerly `old`. `address old` returns new's address. An unknown slug passes through `canonical_slug` unchanged and `address` still refuses it. A slug both current and former resolves to the current one.
 
 **Constraints from prior phases:** none.
 
@@ -84,7 +85,7 @@
 
 **Goal:** `rename.py plan <old> <new>` prints every move in items 1-6 of the slug list without touching anything. `apply` performs them atomically and stops at the first refusal.
 
-**Depends-on:** Formerly resolver.
+**Depends on:** Formerly resolver.
 
 **Spec:**
 - `new` must match `tidy_wrapped.SLUG`, must not be in `SHARED`, and must not already be a timer slug or a Formerly entry.
@@ -118,7 +119,7 @@
 
 **Goal:** `rename.py unit <new> <unit>` moves one unit's branch and worktree between its runs. `finish <new>` retires the old merge branch once every unit has moved.
 
-**Depends-on:** rename.py plan|apply.
+**Depends on:** rename.py plan|apply.
 
 **Spec:**
 - `unit` refuses while the unit's tmux session has a live Claude in the worktree; the check uses `unit_lookup.py pane`.
@@ -147,7 +148,7 @@
 
 **Goal:** The showrunner can run a rename from a command doc, and the as-built records it.
 
-**Depends-on:** rename.py unit|finish.
+**Depends on:** rename.py unit|finish.
 
 **Spec:**
 - `commands/showrunner/rename.md`: the order is plan, then apply, then for each unit between its runs `unit`, then `finish`. Tell each unit director its new worktree path before it resumes. Never rewrite history.
@@ -169,7 +170,7 @@
 
 **Goal:** A real rename of a scratch production on natedev, end to end, leaves every lookup working under both names.
 
-**Depends-on:** Command doc and as-built.
+**Depends on:** Command doc and as-built.
 
 **Spec:**
 - Build a scratch production with one unit by hand, as test_production_lifecycle.py:77-180 does: a scratch git repo whose origin is a local bare repo, a doc, a Units row, a worktree, and state dirs pointed at a scratch root through the env overrides. Run the real `rename.py` CLI: plan, apply, unit and finish. No branch reaches GitHub. Check `showrunners.py address <old>` and `<new>`, `unit_lookup.py list <old>`, the stall watch and the review-pool lease paths.
