@@ -197,6 +197,28 @@ class SessionRecordTests(ShutdownTestCase):
         })))
         del context
 
+    def test_transition_id_round_trips_beside_the_independent_request_id_without_migrating_old_records(self) -> None:
+        current = session_shutdown()
+        current["move_id"] = "whole-group-transition"
+        legacy = session_shutdown(2)
+        for saved in (current, legacy):
+            self.assertTrue(record.create_session(saved))
+        before = {path: path.read_bytes() for path in self.directory.rglob("*.json")}
+        self.assertEqual(record.find_session(current["login"], current["session"]["session_id"]), current)
+        loaded = record.find_session(legacy["login"], legacy["session"]["session_id"])
+        self.assertEqual(loaded, legacy)
+        assert loaded is not None
+        self.assertNotIn("move_id", loaded)
+        self.assertEqual({path: path.read_bytes() for path in before}, before)
+
+    def test_transition_id_rejects_nontext_values_without_creating_a_record(self) -> None:
+        for value in (7, None, ["transition"]):
+            with self.subTest(value=value):
+                malformed = {**session_shutdown(), "move_id": value}
+                with self.assertRaises(record.InvalidRecord):
+                    _ = record.create_session(cast(record.SessionShutdown, cast(object, malformed)))
+                self.assertEqual(record.session_records("owner@example.com"), [])
+
     def test_legacy_record_labels_load_canonically_without_rewriting_the_file(self) -> None:
         saved = session_shutdown()
         saved.update(label="claude2", source_label="claude2", target="claude2")

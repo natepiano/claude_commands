@@ -30,7 +30,7 @@ class MoveJournalTests(unittest.TestCase):
 
     def requested(self) -> moves.RequestedMove:
         return {**self.common(), "kind": "requested", "from": "codex1", "to": "codex2",
-            "why": "quota refusal", "window": "unknown"}
+            "why": "quota refusal", "window": "unknown", "cause": "refusal"}
 
     def test_every_transition_kind_round_trips_without_losing_its_semantics(self) -> None:
         entries: list[moves.MoveEntry] = [
@@ -168,20 +168,10 @@ class MoveJournalTests(unittest.TestCase):
         moves.append_move(requested)
         self.assertEqual(moves.read_moves(), [requested])
 
-    def test_credits_off_cause_round_trips_and_legacy_requests_remain_refusals(self) -> None:
-        legacy = self.requested()
-        policy: moves.RequestedMove = {**legacy, "cause": "credits off", "move_id": "policy-1"}
-        moves.append_move(legacy)
-        moves.append_move(policy)
-        entries = moves.read_moves()
-        self.assertEqual(entries, [legacy, policy])
-        self.assertEqual([entry.get("cause", "refusal") for entry in entries if entry["kind"] == "requested"],
-                         ["refusal", "credits off"])
-
     def test_invalid_move_cause_is_refused_by_writer_and_skipped_by_reader(self) -> None:
         valid = self.requested()
         moves.append_move(valid)
-        for cause in ("refusal", "credits on", "", None, 7, ["credits off"]):
+        for cause in ("credits on", "", None, 7, ["credits off"]):
             with self.subTest(cause=cause):
                 malformed = {**valid, "cause": cause}
                 with self.assertRaisesRegex(ValueError, "invalid account move"):
@@ -189,6 +179,92 @@ class MoveJournalTests(unittest.TestCase):
                 with moves.store_file().open("a", encoding="utf-8") as output:
                     _ = output.write(json.dumps(malformed) + "\n")
         self.assertEqual(moves.read_moves(), [valid])
+
+    def test_hand_and_refusal_causes_survive_storage_and_legacy_requests_read_as_refusals(self) -> None:
+        legacy = self.requested()
+        _ = legacy.pop("cause")
+        path = moves.store_file()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        _ = path.write_text(json.dumps(legacy) + "\n")
+        for cause in ("by hand", "refusal", "credits off"):
+            entry = {**legacy, "move_id": cause, "cause": cause}
+            moves.append_move(cast(moves.RequestedMove, cast(object, entry)))
+        requests = [entry for entry in moves.read_moves() if entry["kind"] == "requested"]
+        self.assertEqual([entry.get("cause") for entry in requests],
+                         ["refusal", "by hand", "refusal", "credits off"])
+
+    def test_malformed_optional_request_ids_are_skipped_while_legacy_and_numbered_attempts_remain_readable(self) -> None:
+        legacy = self.requested()
+        attempt: moves.RequestedMove = {**legacy, "move_id": "group-transition", "request_id": "attempt-one"}
+        invalid_ids: tuple[object, ...] = ([], "", None, 7)
+        entries: list[object] = [legacy, *({**legacy, "request_id": value} for value in invalid_ids), attempt]
+        path = moves.store_file()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        original = "".join(json.dumps(entry) + "\n" for entry in entries).encode()
+        _ = path.write_bytes(original)
+        self.assertEqual(moves.read_moves(), [legacy, attempt])
+        self.assertEqual(path.read_bytes(), original)
+
+    def test_routing_variants_validate_without_account_move_identity(self) -> None:
+        common: dict[str, object] = {"at": "2026-10-13T12:00:00Z", "tool": "codex",
+            "fallback_at": "2026-10-13T11:00:00+00:00", "owner": "codex2"}
+        variants: list[dict[str, object]] = [
+            {**common, "kind": "routed to claude", "cause": "refusal", "moved": ["delegate"]},
+            {**common, "kind": "routed back", "restored": ["delegate"], "kept": []},
+            {**common, "kind": "routing not restored", "outcome": "partial",
+             "restored": ["delegate"], "kept": [], "failed": ["fix (unreadable)"]},
+        ]
+        for entry in variants:
+            with self.subTest(kind=entry["kind"]):
+                self.assertTrue(moves._valid(entry))  # pyright: ignore[reportPrivateUsage]
+                for extra in ({"move_id": "not-a-move"}, {"subject": "seats"}):
+                    self.assertFalse(moves._valid({**entry, **extra}))  # pyright: ignore[reportPrivateUsage]
+                missing = dict(entry)
+                _ = missing.pop("fallback_at")
+                self.assertFalse(moves._valid(missing))  # pyright: ignore[reportPrivateUsage]
+        missing_move_id = dict(self.requested())
+        _ = missing_move_id.pop("move_id")
+        self.assertFalse(moves._valid(missing_move_id))  # pyright: ignore[reportPrivateUsage]
+
+    def test_mixed_journal_separates_routing_and_preserves_unresolved_historical_accounts(self) -> None:
+        routing: moves.RoutedToClaude = {"kind": "routed to claude", "at": self.common()["at"],
+            "tool": "codex", "fallback_at": "2026-10-13T11:00:00Z", "owner": "codex2",
+            "cause": "refusal", "moved": ["delegate"]}
+        accounts: list[moves.MoveEntry] = [self.requested(),
+            moves.ConfirmedMove(**self.common(), kind="confirmed", home="/temporary/codex2"),
+            moves.WaitedMove(**self.common(), kind="waited", window="five_hour", reset="2026-10-13T12:19:00Z"),
+            moves.NoRoomMove(**self.common(), kind="no room", earliest_reset="2026-10-15T12:00:00Z")]
+        path = moves.store_file()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        raw: list[object] = []
+        for entry in accounts:
+            raw.extend((entry, routing))
+        raw.append({**self.requested(), "move_id": "old-home", "from": "default"})
+        original = "".join(json.dumps(entry) + "\n" for entry in raw).encode()
+        _ = path.write_bytes(original)
+        loaded = moves.read_moves()
+        self.assertEqual([entry["kind"] for entry in loaded],
+                         ["requested", "confirmed", "waited", "no room", "requested"])
+        self.assertIsInstance(loaded[-1].get("from"), moves.HomeAccountUnresolved)
+        self.assertEqual(len(moves.read_journal()), len(raw))
+        self.assertEqual(path.read_bytes(), original)
+
+    def test_routing_writes_once_per_kind_and_fallback_without_resolving_unknown_owner(self) -> None:
+        entry: moves.RoutedToClaude = {"kind": "routed to claude", "at": self.common()["at"],
+            "tool": "codex", "fallback_at": "2026-10-13T11:00:00Z", "owner": "unknown",
+            "cause": "credits off", "moved": ["delegate", "fix"]}
+        moves.append_routing(entry)
+        moves.append_routing(entry)
+        recovery: moves.RoutedBack = {"kind": "routed back", "at": "2026-10-13T13:00:00Z",
+            "tool": "codex", "fallback_at": entry["fallback_at"], "owner": "unknown",
+            "restored": ["delegate"], "kept": ["fix"]}
+        moves.append_routing(recovery)
+        moves.append_routing(recovery)
+        self.assertEqual(len(moves.store_file().read_text().splitlines()), 2)
+        self.assertEqual(moves.read_moves(), [])
+        self.assertEqual([entry["kind"] for entry in moves.read_journal()], ["routed to claude", "routed back"])
+        with self.assertRaises(ValueError):
+            moves.append_routing({**entry, "owner": "default"})
 
     def test_reader_skips_malformed_lines_and_keeps_later_valid_transitions(self) -> None:
         first = moves.WaitedMove(**self.common(), kind="waited", window="five_hour", reset="2026-10-13T12:19:00+00:00")

@@ -11,8 +11,9 @@ and print its output exactly as it comes, with nothing added.
 - No arguments: the units and showrunners accounts, then one Markdown table, a row for `~/.claude` and each `~/.claudeN`,
   logged in or not, and for each Codex account, then a line for anything wrong in a folder. Nothing else.
 - `--detail`: the same, then each live session's account, the Codex seats line with its refusal destination
-  and held worker continuations, and the last ten move entries with their outcomes.
+  and held worker continuations, the last ten account moves with their cause and outcomes, and `Codex work routing:` with open, recovered or failed assignment fallbacks.
 - An argument it does not recognise: run the no-argument form instead and print only its output, with no explanation.
+- A proof refusal affects only its ungrouped probe; it changes no account refusal or other session’s pick. Hand moves record `by hand`; group retries keep their transition ID and cause.
 - Claude sessions refused by the provider move automatically on the notes timer;
   the shutdown progress line keeps their target and reason visible until safe to stop.
 - `setup claudeN`: builds the folder and prints how to log in.

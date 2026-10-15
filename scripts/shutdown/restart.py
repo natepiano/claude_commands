@@ -1272,32 +1272,57 @@ def _journal_move_failure(record: SessionShutdown, reason: str) -> None:
     from scripts.accounts import moves
     session = record["session"]
     moves.append_move(moves.FailedMove(kind="failed", at=settle.record_time(), tool="claude",
-        subject=session["session_id"] + ": " + session["name"], move_id=record["request_id"], reason=reason))
+        subject=session["session_id"] + ": " + session["name"], move_id=record.get("move_id", record["request_id"]), request_id=record["request_id"], reason=reason))
 
 
-def _target_config_dir(record: SessionShutdown) -> Path | None:
-    """The config directory a restored session belongs on: its move target, else the one it left, if recorded."""
+@dataclass(frozen=True)
+class RecordedConfigDir:
+    path: Path
+
+
+@dataclass(frozen=True)
+class NoRecordedConfigDir:
+    """Neither a move target nor the original directory was recorded."""
+
+
+@dataclass(frozen=True)
+class ObservedConfigDir:
+    path: Path
+
+
+@dataclass(frozen=True)
+class LiveObservationUnavailable:
+    reason: Literal["not live", "environment unreadable"]
+
+
+def _target_config_dir(record: SessionShutdown) -> RecordedConfigDir | NoRecordedConfigDir:
     target_label = record.get("target", "")
     if not target_label:
         session = record["session"]
-        return Path(session["config_dir"]) if "config_dir" in session else None
+        return RecordedConfigDir(Path(session["config_dir"])) if "config_dir" in session else NoRecordedConfigDir()
     from scripts.accounts import accounts
-    return accounts.claude_account_dir(target_label)
+    return RecordedConfigDir(accounts.claude_account_dir(target_label))
 
 
-def _live_config_dir(record: SessionShutdown) -> Path | None:
+def _live_config_dir(record: SessionShutdown) -> ObservedConfigDir | LiveObservationUnavailable:
     import account
     live = next((item for item in sessions.live_sessions() if item["sessionId"] == record["session"]["session_id"]), None)
-    return account.process_config_dir(live["pid"]) if live is not None else None
+    if live is None:
+        return LiveObservationUnavailable("not live")
+    directory = account.process_config_dir(live["pid"])
+    return ObservedConfigDir(directory) if directory is not None else LiveObservationUnavailable("environment unreadable")
 
 
 def _confirm_move(record: SessionShutdown) -> None:
     from scripts.accounts import moves
     from scripts.accounts.refusal_watch import clear_assumed
     session = record["session"]
+    target = _target_config_dir(record)
+    if isinstance(target, NoRecordedConfigDir):
+        return
     moves.append_move(moves.ConfirmedMove(kind="confirmed", at=settle.record_time(), tool="claude",
-        subject=session["session_id"] + ": " + session["name"], move_id=record["request_id"],
-        config_dir=str(_target_config_dir(record) or "")))
+        subject=session["session_id"] + ": " + session["name"], move_id=record.get("move_id", record["request_id"]), request_id=record["request_id"],
+        config_dir=str(target.path)))
     clear_assumed(session["session_id"])
 
 
@@ -1306,8 +1331,11 @@ def _prove_move(record: SessionShutdown) -> bool:
     if not record.get("target", ""):
         return True
     directory, target = _live_config_dir(record), _target_config_dir(record)
-    if directory is None or target is None or directory.resolve() != target.resolve():
-        reason = "still on " + record.get("source_label", record["label"]) if directory is not None else "resumed account unreadable"
+    if isinstance(directory, LiveObservationUnavailable) or isinstance(target, NoRecordedConfigDir):
+        mark_restart_failed(record, "resumed account unreadable")
+        return False
+    if directory.path.resolve() != target.path.resolve():
+        reason = "still on " + record.get("source_label", record["label"])
         mark_restart_failed(record, reason)
         return False
     _confirm_move(record)
@@ -1337,7 +1365,8 @@ def clear_running_on_target(records: list[SessionShutdown]) -> TargetCheck:
             remaining.append(record)
             continue
         directory, target = _live_config_dir(record), _target_config_dir(record)
-        if directory is None or target is None or directory.resolve() != target.resolve():
+        if (isinstance(directory, LiveObservationUnavailable) or isinstance(target, NoRecordedConfigDir)
+                or directory.path.resolve() != target.path.resolve()):
             remaining.append(record)
             continue
         if record.get("target", ""):

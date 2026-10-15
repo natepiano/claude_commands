@@ -897,7 +897,7 @@ After a worker launch's own turn has ended, a move to the selected seats home th
 
 **Ruled out:** resolving a historical `default` from today's login of `~/.claude` or `~/.codex`; rewriting stored files in place (legacy values take the number on their next write); a `settle.py` change for the `--to` parse.
 
-### Phase 24 — Proof refusals stay with their session  · status: todo
+### Phase 24 — Proof refusals stay with their session  · status: done
 
 **Depends on:** Phase 16, Phase 17, Phase 18, Phase 19, Phase 22, Phase 23
 

@@ -790,6 +790,9 @@ def switch_to_claude(state: State, note: AgentNote, stamp: str, owner: agent_acc
     if not moved:
         return NoWorkOnCodex(note.label)
     state["fallback"] = AccountCodexQuotaFallback(owner, stamp, tuple(moved), credits_off_hold)
+    moves.append_routing(moves.RoutedToClaude(kind="routed to claude", at=stamp, tool="codex",
+        fallback_at=stamp, owner=owner.label, moved=moved,
+        cause="credits off" if isinstance(credits_off_hold, CreditsOffHold) else "refusal"))
     state.setdefault("unseen", []).append(
         f"{trigger} ({account}): {', '.join(moved)} moved to Claude at {local_time(stamp)}, "
         + "and move back when Codex recovers.")
@@ -868,6 +871,15 @@ def switch_back(state: State, now: datetime, readings: CodexAlertPassReadings) -
             else:
                 back.moved.append(key)
     stamp = now.isoformat(timespec="seconds")
+    owner = (fallback.owner.label if isinstance(fallback, AccountCodexQuotaFallback) and fallback.owner.label != "default"
+             else moves.UnknownFallbackOwner())
+    if back.failed:
+        moves.append_routing(moves.RoutingNotRestored(kind="routing not restored", at=stamp, tool="codex",
+            fallback_at=fallback.at, owner=owner, restored=back.moved, kept=back.kept,
+            failed=back.failed, outcome="partial" if back.moved else "failed"))
+    else:
+        moves.append_routing(moves.RoutedBack(kind="routed back", at=stamp, tool="codex",
+            fallback_at=fallback.at, owner=owner, restored=back.moved, kept=back.kept))
     state.setdefault("unseen", []).append(f"Codex recovered at {local_time(stamp)}: {back.describe()}.")
     return back
 

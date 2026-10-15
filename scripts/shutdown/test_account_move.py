@@ -403,7 +403,8 @@ class AccountMoveTests(ShutdownTestCase):
             self.assertIsInstance(result, accounts.GroupMoveStarted)
             self.assertEqual(len(commands), 1)
             self.assertEqual(tuple(commands[0][2:]), ("down", "claude1", "--here", "--only", "director",
-                "--restart", "--to", "claude3", "--why", "checkpoint move"))
+                "--restart", "--to", "claude3", "--why", "checkpoint move", "--move-id",
+                cast(accounts.GroupTransition, accounts.group_transition("units")).move_id))
             saved = record.session_records(report["login"])[0]
             self.assertEqual(saved["force"], "wait for ready")
             observed = stop_work.fresh_session(saved["session"], report)
