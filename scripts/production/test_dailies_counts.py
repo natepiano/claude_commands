@@ -42,10 +42,25 @@ class DailiesCountsTests(unittest.TestCase):
         self.assertEqual(production_counts("film"), [{"label": "nightly queue", "count": 2},
                                                      {"label": "proposals", "count": 2}])
 
+    def test_counts_open_issues_with_the_tag_directly_in_the_folder(self) -> None:
+        issues = self.root / "issues"
+        (issues / "a proposal").mkdir(parents=True)
+        for name, fields in (("open block", "status: open\ntags:\n  - issue\n  - proposal"),
+                             ("open inline", 'status: "open"\ntags: [issue, proposal]'),
+                             ("closed", "status: closed\ntags: [issue, proposal]"),
+                             ("untagged", "status: open\ntags: [issue]"),
+                             ("a proposal/notes", "status: open\ntags: [issue, proposal]")):
+            _ = (issues / f"{name}.md").write_text(f"---\n{fields}\n---\nBody.\n", encoding="utf-8")
+        self.configure("film.proposals=issues ~/issues proposal", "film.issues=issues ~/issues issue")
+        self.assertEqual(production_counts("film"), [{"label": "proposals", "count": 2},
+                                                     {"label": "issues", "count": 3}])
+
     def test_a_missing_source_reads_as_not_found(self) -> None:
-        self.configure(f"film.queue=lines ~/absent.md {LEDGER_RULE}", "film.proposals=files ~/absent/*.md")
+        self.configure(f"film.queue=lines ~/absent.md {LEDGER_RULE}", "film.proposals=files ~/absent/*.md",
+                       "film.open=issues ~/absent proposal")
         self.assertEqual(production_counts("film"), [{"label": "queue", "not_found": True},
-                                                     {"label": "proposals", "not_found": True}])
+                                                     {"label": "proposals", "not_found": True},
+                                                     {"label": "open", "not_found": True}])
 
     def test_a_production_without_lines_or_a_config_has_no_counts(self) -> None:
         self.assertEqual(production_counts("film"), [])
@@ -58,7 +73,9 @@ class DailiesCountsTests(unittest.TestCase):
                               ("film.queue=lines ~/ledger.md", "lines needs a file and a regex"),
                               ("film.queue=lines ~/ledger.md (", "bad regex"),
                               ("film.queue=files", "files needs a glob"),
-                              ("film.queue=words ~/x", "the count kind is lines or files, not words")):
+                              ("film.queue=issues ~/issues", "issues needs a folder and a tag"),
+                              ("film.queue=issues ~/issues two tags", "issues needs a folder and a tag"),
+                              ("film.queue=words ~/x", "the count kind is lines, files or issues, not words")):
             with self.subTest(line=line):
                 self.configure(line)
                 with self.assertRaisesRegex(CountsFailure, f"dailies.conf line 3: {message}"):

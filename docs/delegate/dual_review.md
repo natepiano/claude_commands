@@ -16,7 +16,7 @@ is the third reader:
 | Lens | Reads for |
 | --- | --- |
 | `adversary` | the failing case — the input that violates a stated invariant, the caller that was not updated, the state the new code cannot reach, the test that passes for the wrong reason |
-| `contract` | what the Work Order says, including every part no test covers, and anything built that it never asked for; then what the change reaches without naming — callers, consumers, public API, traits, registration, plugin wiring, invariants and transitions |
+| `contract` | what the Work Order says, including every part no test covers, and anything built that it never asked for; then what the change reaches without naming — callers, consumers, public API, traits, registration, plugin wiring, invariants and transitions; and the repository's targets file (`docs/hana/targets.md` in hana), when present |
 
 The `craft` lens is off since 2026-10-04 (user: review trial ended); the unit
 director's main review audits style each phase.
@@ -139,6 +139,8 @@ The questions are the lens, so each prompt carries only its own:
   — and what there still assumes an invariant or state transition it changed?
   4. Consistent with surrounding code? 5. Are domain types clear, and are owned
   bare Option<T> values replaced or justified at an external boundary?
+  6. Does it meet every target in the repository's targets file, when present?
+  A miss is a defect.
 
 **Early form** (an <EarlyReviewArm/> launch, which arms the `adversary` alone):
 the `## Diff` section holds the partial diff at launch, and an

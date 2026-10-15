@@ -1245,7 +1245,7 @@ class DailiesInputTests(unittest.TestCase):
         result = self.run_builder()
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertNotIn("counts", self.report())
-        self.assertIn("counts: unavailable — dailies.conf line 1: the count kind is lines or files", result.stdout)
+        self.assertIn("counts: unavailable — dailies.conf line 1: the count kind is lines, files or issues", result.stdout)
 
     def test_scheduled_run_reads_notifier_status_without_restart(self) -> None:
         result = self.run_builder()
