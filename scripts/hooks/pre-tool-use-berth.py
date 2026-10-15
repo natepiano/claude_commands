@@ -8,12 +8,16 @@ seat's `apply_patch` had no berth check at all, so its first touch never turned 
 carries the director's `CLAUDE_CODE_SESSION_ID`, and that session's run marker names the session
 directory. Any other Codex session is left alone.
 
+Seats persist across phases and the mesh knows no phase, so each edited path goes to the open
+phase that owns it (`phase_reservation.attribute`): the only open phase, else the one whose
+`files` list covers it. A path no single open phase owns refuses the edit.
+
 For a seat it runs `cargo-berth check <paths> --json` from the repository root under the
-director's session id, the same identity the director's own edits and drift use. A clear
-answer allows the edit and, when it carries the acquired reservation, writes `Active` into the
-session directory's state file. An unenrolled repository is allowed. Every other answer, a
-missing engine or a timeout refuses the edit with the engine's reason: an unchecked edit can
-collide with a foreign reservation, where a refused one only costs the seat a retry.
+director's session id, the same identity the director's own edits and drift use, once per
+owning phase. A clear answer allows the edit and, when it carries the acquired reservation,
+writes `Active` into that phase's state file. An unenrolled repository is allowed. Every other
+answer, a missing engine or a timeout refuses the edit with the engine's reason: an unchecked
+edit can collide with a foreign reservation, where a refused one only costs the seat a retry.
 
 Codex accepts only a refusal from a PreToolUse hook: an allow is an exit 0 with no output.
 """
@@ -74,17 +78,23 @@ def decide(raw: str) -> int:
     scopes = phase_reservation.repository_paths(root, Path(cwd), paths) if root is not None else []
     if root is None or not scopes:
         return 0
-    answer = phase_reservation.check(root, scopes, os.environ.get("CLAUDE_CODE_SESSION_ID", ""))
-    if answer.status == phase_reservation.UNCONFIGURED:
-        return 0
-    if answer.status != phase_reservation.CLEAR:
-        return _refuse(f"{answer.status}: {answer.message or 'no detail'}.")
-    if answer.acquisition is not None:
-        try:
-            _ = phase_reservation.record_active(session_dir, answer.acquisition)
-        except OSError:
-            # The edit is protected either way; the checkpoint's backstop records Active.
-            pass
+    phases = phase_reservation.open_phases(session_dir)
+    attribution = phase_reservation.attribute(phases, scopes) if phases else None
+    if attribution is not None and attribution.refused:
+        return _refuse(phase_reservation.refusal_reason(phases, attribution.refused))
+    groups = list(attribution.by_phase.items()) if attribution is not None else [(None, scopes)]
+    for phase, phase_scopes in groups:
+        answer = phase_reservation.check(root, phase_scopes, os.environ.get("CLAUDE_CODE_SESSION_ID", ""))
+        if answer.status == phase_reservation.UNCONFIGURED:
+            return 0
+        if answer.status != phase_reservation.CLEAR:
+            return _refuse(f"{answer.status}: {answer.message or 'no detail'}.")
+        if phase is not None and answer.acquisition is not None:
+            try:
+                _ = phase_reservation.record_active(phase.directory, answer.acquisition)
+            except OSError:
+                # The edit is protected either way; the checkpoint's backstop records Active.
+                pass
     return 0
 
 

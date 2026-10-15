@@ -13,7 +13,7 @@
 | taplo fmt `--check` | the same `lint` | the workspace TOML, run from the cargo workspace root |
 | clippy `--all-targets --all-features` | the same `lint` | the workspace |
 | rustdoc `-D warnings` | the same `lint` | the members that differ from HEAD |
-| style review | the unit director's main review in `<DualReview/>`, pass 1 only | the phase's diff from `${SESSION_DIR}/phase_baseline`, untracked files included |
+| style review | the unit director's main review in `<DualReview/>`, pass 1 only | the phase's diff from `${PHASE_DIR}/phase_baseline`, untracked files included |
 
 `verify.sh lint` runs its stages in this order: mend, fmt, taplo, clippy, doc. Mend rewrites the code first, fmt formats what mend wrote, and clippy and rustdoc read the settled tree.
 
@@ -21,7 +21,7 @@
 
 - `docs/delegate/phase_checks.md` — the one definition of `<PhaseChecks/>`.
 - `commands/unit/style_review.md` — the one definition of `<StyleReview/>`, and the `/unit:style_review [since <ref>]` command for a run by hand.
-- `docs/delegate/launch_implementation.md` — before a phase's first dispatch, step 1 saves `git rev-parse HEAD` to `${SESSION_DIR}/phase_baseline` and stops if that fails. Repairs keep the baseline.
+- `docs/delegate/launch_implementation.md` — before a phase's first dispatch, step 1 saves `git rev-parse HEAD` to `${PHASE_DIR}/phase_baseline` (`${SESSION_DIR}/phases/<phase id>/`) and stops if that fails. Repairs keep the baseline.
 - `docs/delegate/dual_review.md` — on pass 1 the main review reads `style_review.md` and applies `<StyleReview/>` with `since <phase_baseline commit>` and `${SESSION_DIR}` as the diff directory. It saves the result, `Off` or an error included, to `${SESSION_DIR}/phase_style_review_<phase-id>.md`. Blind reviewers never audit style, and later passes do not walk the checklist again.
 - `docs/delegate/write_prompt_contract.md` — item 2 tells every worker not to open `rust_style` or run `load-rust-style.sh`; item 6 puts the fixing rules into every repair prompt's Work Specification.
 - `commands/unit/direct.md` — names `<PhaseChecks/>` in TagReferenceContract, names `verify.sh lint` in VerificationContract as the phase lint checks under `<PhaseChecks/>`, and runs the step at ExecutionSteps step 6 (`<PhaseChecks/>` at `<DualReview/>`). It also holds `<FixDispatch/>`, `<FinalGate/>`, and the RunSummary `**Style review:**` line (each phase's reviewed range and result).

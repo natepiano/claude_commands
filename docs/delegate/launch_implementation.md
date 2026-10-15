@@ -7,13 +7,15 @@ in full.
 completes.
 
 <LaunchImplementation>
-1. Once per phase, save `git rev-parse HEAD` to
-   `${SESSION_DIR}/phase_baseline` and `git status --short` to
-   `${SESSION_DIR}/progress_baseline_status` before dispatch. Stop if either
+1. Once per phase, create `${PHASE_DIR}` if it is missing (ad hoc work uses
+   `${SESSION_DIR}/phases/adhoc`), then save `git rev-parse HEAD` to
+   `${PHASE_DIR}/phase_baseline` and `git status --short` to
+   `${PHASE_DIR}/progress_baseline_status` before dispatch. Stop if either
    fails; fixes retain both baselines.
 2. Close the outgoing phase before opening this one, per <PassOwnership/>: when a
-   phase record is still active, run `progress_history.py finish-phase
-   --session-dir "${SESSION_DIR}" --status completed` first. Then run
+   finished phase's record is still active, run `progress_history.py finish-phase
+   --session-dir "${SESSION_DIR}" --status completed` first. A phase opened
+   beside one still running leaves that one open. Then run
    `progress_history.py start-phase --session-dir "${SESSION_DIR}"
    --phase-id <id> --phase-title <title> --work-order-file
    "${SESSION_DIR}/implementation_prompt.md"`. Use `ad hoc` plus scope without a
