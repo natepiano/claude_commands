@@ -14,6 +14,7 @@ from collections.abc import Iterable
 from concurrent.futures import Future, ThreadPoolExecutor, wait, FIRST_COMPLETED
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+from enum import Enum
 from importlib import import_module
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal, Protocol, TypedDict, cast
@@ -25,6 +26,7 @@ for dependency in ("whoami", "message", "notify", "production", "hooks", "lib"):
 
 from account import Account
 import conversation_pause
+import note_file
 from inventory import Inventory, Session, inventory
 import record as store
 from record import SessionShutdown, SessionStopIssue, TimerRestore, ShowrunnerFooter, NoFooter, ShutdownContinuation, ReadinessCheck
@@ -1512,6 +1514,16 @@ def holdout_line(saved: SessionShutdown) -> str:
             f"To stop it now, in a terminal on {saved['machine']}: {command}")
 
 
+class HoldoutKind(Enum):
+    FORM_SHOWN = "shutdown.holdout"
+    UNANSWERED = "shutdown.holdout_unanswered"
+
+    @classmethod
+    def from_reason(cls, reason: str) -> HoldoutKind:
+        details = (detail.strip() for detail in reason.split(","))
+        return cls.FORM_SHOWN if SHOWING_FORM in details else cls.UNANSWERED
+
+
 def _send_holdout_alert(held: list[tuple[SessionShutdown, str]]) -> None:
     """Push every unanswered pause and tell its requester where to act."""
     held = [(saved, reason) for saved, reason in held if saved["progress"]["kind"] == "waiting"]
@@ -1520,16 +1532,11 @@ def _send_holdout_alert(held: list[tuple[SessionShutdown, str]]) -> None:
     summary = "; ".join(f"{'Restart' if saved['then'] == 'restart' else 'Shutdown'} stuck waiting on {saved['session']['name']} session" for saved, _ in held)
     text = "\n".join(holdout_line(saved) for saved, _ in held)
     try:
-        for saved, _ in held:
-            message = saved["settle_message"]
-            since = message["at"] if message["kind"] == "sent" else saved["requested_at"]
-            elapsed = f"{max(0, int((now_utc() - datetime.fromisoformat(since)).total_seconds() // 60))} minutes"
-            command = shutdown_command("now", saved["login"], "--here", "--only", saved["session"]["session_id"])
-            after_stop = "the restart brings it back." if saved["then"] == "restart" else "it stays stopped until restarted."
-            alert_user(render("shutdown.holdout", session=saved["session"]["name"], machine=saved["machine"],
-                              elapsed=elapsed, command=command, after_stop=after_stop,
-                              operation="Restart" if saved["then"] == "restart" else "Shutdown",
-                              request="restart" if saved["then"] == "restart" else "shutdown"),
+        for saved, reason in held:
+            hold = HoldoutKind.from_reason(reason)
+            command = shutdown_command("now", note_file.canonical_label(saved["label"]), "--here", "--only", saved["session"]["session_id"])
+            alert_user(render(hold.value, session=saved["session"]["name"], machine=saved["machine"], command=command,
+                              operation="restart" if saved["then"] == "restart" else "shutdown"),
                        machine="natedev" if local_machine().casefold() == "mac" else "")
     finally:
         _tell_holdout_requesters(held, summary, text)
