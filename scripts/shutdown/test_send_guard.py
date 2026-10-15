@@ -317,7 +317,7 @@ class SendGuardTests(ShutdownTestCase):
     def test_remote_control_fixer_launch_is_blocked_with_its_alert_policy(self) -> None:
         class UnfakedFixer(ShutdownTestCase):
             def test_launch(self) -> None:
-                remote_control.launch_fixer("owner", 321, "original", "Owner", "none")
+                remote_control.launch_fixer("owner", 321, "original", "Owner", "none", "Owner")
         self.assert_blocked(UnfakedFixer("test_launch"),
             ShutdownSendLeaf.LAUNCH_REMOTE_CONTROL_FIXER, "session:owner")
 

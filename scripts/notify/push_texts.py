@@ -8,9 +8,10 @@ import string
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Literal, TypedDict, cast
+from typing import Literal, NotRequired, TypedDict, cast
 
-from user_action import ActionRequired, NoActionRequired, UserAction
+from user_action import (ActionRequired, NoActionRequired, UserAction, NotificationSession,
+                         NoSessionLine, NO_SESSION_LINE, SessionLine, first_line)
 
 Need = Literal["note", "decision", "blocked"]
 REVIEWED_FILE = Path(__file__).with_name("push_texts_reviewed.json")
@@ -28,6 +29,11 @@ class NoActionNeeded:
 
 
 @dataclass(frozen=True)
+class SessionTemplate:
+    text: str
+
+
+@dataclass(frozen=True)
 class PushExample:
     name: str
     values: dict[str, str]
@@ -42,6 +48,7 @@ class PushText:
     action: ActionTemplate | NoActionNeeded
     body: str
     examples: tuple[PushExample, ...]
+    session: SessionTemplate | NoSessionLine = NO_SESSION_LINE
 
 
 @dataclass(frozen=True)
@@ -53,6 +60,11 @@ class RenderedPush:
     action: UserAction
     body: str
     values: dict[str, str]
+    session: NotificationSession = NO_SESSION_LINE
+
+    @property
+    def message(self) -> str:
+        return first_line(self.action, self.session) + "\n" + self.body
 
 
 def catalog() -> tuple[PushText, ...]:
@@ -70,6 +82,8 @@ def render_entry(entry: PushText, values: dict[str, str]) -> RenderedPush:
     templates = [entry.sender, entry.title, entry.body]
     if isinstance(entry.action, ActionTemplate):
         templates.append(entry.action.text)
+    if isinstance(entry.session, SessionTemplate):
+        templates.append(entry.session.text)
     fields: set[str] = set()
     for template in templates:
         for _, field, _, _ in string.Formatter().parse(template):
@@ -81,7 +95,8 @@ def render_entry(entry: PushText, values: dict[str, str]) -> RenderedPush:
         raise ValueError(f"{entry.id}: missing values {sorted(fields - set(values))}; extra values {sorted(set(values) - fields)}")
     action = ActionRequired(entry.action.text.format(**values)) if isinstance(entry.action, ActionTemplate) else NoActionRequired()
     return RenderedPush(entry.id, entry.sender.format(**values), entry.need,
-                        entry.title.format(**values), action, entry.body.format(**values), dict(values))
+                        entry.title.format(**values), action, entry.body.format(**values), dict(values),
+                        SessionLine(entry.session.text.format(**values)) if isinstance(entry.session, SessionTemplate) else NO_SESSION_LINE)
 
 
 def render(id: str, **values: str) -> RenderedPush:
@@ -107,6 +122,7 @@ def user_send_argv(rendered: RenderedPush, *, sender: str = "", machine: str = "
 
 
 class FilledExampleRecord(TypedDict):
+    session: NotRequired[str]
     name: str
     values: dict[str, str]
     sender: str
@@ -117,6 +133,7 @@ class FilledExampleRecord(TypedDict):
 
 
 class FingerprintRecord(TypedDict):
+    session: NotRequired[str]
     sender: str
     need: Need
     title: str
@@ -133,7 +150,11 @@ def fingerprint(entry: PushText) -> str:
                          "need": rendered.need, "title": rendered.title,
                          "action": rendered.action.text if isinstance(rendered.action, ActionRequired) else None,
                          "body": rendered.body})
+        if isinstance(rendered.session, SessionLine):
+            examples[-1]["session"] = rendered.session.text
     value: FingerprintRecord = {"sender": entry.sender, "need": entry.need, "title": entry.title,
              "action": {"required": entry.action.text} if isinstance(entry.action, ActionTemplate) else {"none": True},
              "body": entry.body, "examples": examples}
+    if isinstance(entry.session, SessionTemplate):
+        value["session"] = entry.session.text
     return hashlib.sha256(json.dumps(value, sort_keys=True, ensure_ascii=False).encode()).hexdigest()

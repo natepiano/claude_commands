@@ -95,7 +95,7 @@ def remote_control_who(saved: SessionShutdown) -> str:
     return session["name"]
 
 
-def launch_fixer(session_id: str, pid: int, proc_start: str, who: str, alerts: Literal["user", "none"]) -> None:
+def launch_fixer(session_id: str, pid: int, proc_start: str, who: str, alerts: Literal["user", "none"], session: str) -> None:
     """Start the local fixer independently of the conductor or restart command."""
     if pid <= 0 or not proc_start:
         raise ValueError("Remote Control fixer requires a process identity")
@@ -103,7 +103,7 @@ def launch_fixer(session_id: str, pid: int, proc_start: str, who: str, alerts: L
     service = f"shutdown-remote-control-{prefix}-{pid}"
     command = ["env", "PYTHONUNBUFFERED=1", sys.executable, "-u",
                str(Path(__file__).with_name("shutdown.py")), "remote-control", session_id,
-               "--pid", str(pid), "--proc-start", proc_start, "--who", who, "--alerts", alerts]
+               "--pid", str(pid), "--proc-start", proc_start, "--who", who, "--alerts", alerts, "--session", session]
     launch = (["launchctl", "submit", "-l", service, "--", *command] if sys.platform == "darwin"
               else ["systemd-run", "--user", "--collect", "--quiet", "--no-block", "--unit", service, *command])
     result = subprocess.run(launch, check=False, timeout=15)
@@ -200,14 +200,14 @@ def _fix(session_id: str, pid: int, proc_start: str, clock: Clock) -> RemoteCont
             clock.sleep(min(POLL_SECONDS, remaining))
 
 
-def alert_failed(who: str) -> None:
+def alert_failed(who: str, session: str) -> None:
     alerts = cast(ShutdownAlerts, cast(object, import_module("settle")))
     machine = alerts.local_machine()
-    alerts.alert_user(render("shutdown.remote_control", session=who, machine=machine),
+    alerts.alert_user(render("shutdown.remote_control", who=who, session=session),
                       machine="natedev" if machine.casefold() == "mac" else "")
 
 
-def fix(session_id: str, pid: int, proc_start: str, who: str, alerts: Literal["user", "none"], *, clock: Clock = _SYSTEM_CLOCK) -> RemoteControlOutcome:
+def fix(session_id: str, pid: int, proc_start: str, who: str, alerts: Literal["user", "none"], session: str, *, clock: Clock = _SYSTEM_CLOCK) -> RemoteControlOutcome:
     outcome = _fix(session_id, pid, proc_start, clock)
     if isinstance(outcome, SessionGone):
         text = "session gone; Remote Control fixer finished"
@@ -219,5 +219,5 @@ def fix(session_id: str, pid: int, proc_start: str, who: str, alerts: Literal["u
         text = f"Remote Control failed: {outcome.reason}"
     print(f"{who}: {text}", flush=True)
     if isinstance(outcome, Failed) and alerts == "user":
-        alert_failed(who)
+        alert_failed(who, session)
     return outcome
