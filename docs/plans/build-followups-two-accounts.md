@@ -1044,29 +1044,83 @@ After a worker launch's own turn has ended, a move to the selected seats home th
 
 ### Phase 30 — The accounts table shows only accounts  · status: done
 
-**Depends on:** Phase 29
+#### As-built
+
+- `KNOWN_PRIVATE_NAMES` in `scripts/accounts/accounts.py` includes `feedback` and `telemetry`; `_is_known_private` accepts the prefix `.claude.json.tmp.`. These are per-account, never linked, never reported.
+- `status_report` prints Claude unknown entries (`AccountStatus.unclassified`) and Codex unknown entries (`CodexStatus.unclassified`) only under `--detail`; the default table shows only accounts.
+- `_check_codex_home` does not count unknown entries, so `check codexN` passes a home whose only oddity is an unknown entry; an unreadable numbered home is still a problem.
+- `sweep_claude_temp_files(now)` opens `$HOME` and each real `~/.claudeN` with `O_RDONLY|O_DIRECTORY|O_NOFOLLOW`, lists each folder once, lstats and unlinks through `dir_fd`, deletes only regular `.claude.json.tmp.*` files strictly more than a day old, and skips every `OSError`. `agent_notes.update_alert_pass` calls it once per pass (the two-minute updater).
+
+**Files:**
+- `scripts/accounts/accounts.py` — private names and prefix, `--detail` gate, `CodexStatus.unclassified`, `_check_codex_home`, `sweep_claude_temp_files`.
+- `scripts/whoami/agent_notes.py` — `update_alert_pass` runs the sweep.
+- `docs/accounts.md` — default table shows only accounts; `--detail` shows unknown entries; the sweep.
+- `scripts/accounts/test_accounts.py`, `scripts/whoami/test_agent_notes.py` — classification, detail gating, sweep and updater tests.
+- `scripts/whoami/test_codex_alert_accounts.py` — the unchecked-target fixture fails its check through a private cache link, not an unknown entry.
+
+**Binds later work:** the sweep scans both `$HOME` (sessions on `~/.claude` write `$HOME/.claude.json.tmp.*`) and each `~/.claudeN` (its own `.claude.json` temps sit inside it); a fresh `~/.claudeN` shows no unknown-entry lines. `quota_alert` may recommend a Codex home that holds unknown entries.
+
+**Gotchas:** folders open without following links, so a `~/.claudeN` swapped for a link after discovery is never scanned.
+
+### Phase 31 — ~/.claude is a config home, not an account  · status: todo
+
+**Depends on:** Phase 30
 
 #### Work Order
 
-**Goal:** the default `/showrunner:accounts` output (`accounts.py`, no action) prints no unclassified lines; Claude Code's own per-account folders count as per-account; stale temp files from Claude Code's atomic writes are deleted (the user, via the showrunner: "i think that we should be cleaning these up … are they really accounts?").
+**Goal:** `~/.claude` holds config and nothing else: no reader treats it as an account, every launch sets `CLAUDE_CONFIG_DIR` to a numbered folder, and claude2 is an account like claude1, 3 and 4 with its own `~/.claude2` (the user, via the showrunner: "claude2 shouldn't be special / why doesn't [it] have its own folder"). Code only; the live cutover is Phase 32.
 
-**Constraints from prior phases:** `scripts/accounts/accounts.py` classifies a numbered folder's entries: `SHARED` (linked into `~/.claude`), `ALWAYS_LINKED`, `KNOWN_PRIVATE_NAMES` (`.credentials.json`, `.claude.json`, `account-label`, `daemon`, `jobs`, `backups`, `cache`, `.last-cleanup`) and `_is_known_private`'s prefixes (`daemon-auth-`, `.oauth_refresh.lock`). `_unclassified(config_dir)` lists the rest, only for numbered folders, and `_status_notes` prints them under the table; the Codex home has its own unclassified listing. `status` already takes `--detail` (only with no action). Claude Code writes `.claude.json` atomically through `.claude.json.tmp.<pid>.<hex>` beside it — in `$HOME` for `~/.claude` (whose config is `$HOME/.claude.json`), in the folder for a `~/.claudeN` — and leaves some behind: 874 in `$HOME` on 2026-10-15, all older than a day. `agent_notes.py`'s updater runs every two minutes on a timer.
+**Constraints from prior phases:** Today `~/.claude`'s own login is claude2's, and these places make it an account (line numbers at b6c064fd): `accounts.py` `main_config_dir` :564, `check` :907-908, `prepared_account` :1066-1070 and `account_prefix` :1187-1191 (unset `CLAUDE_CONFIG_DIR` for `~/.claude`), `trust_command` :1194, `home_account_label` :1229, `refuse_default` :1237, `claude_account_dir` :1270, `_claude_directory_for_note` :1288 (returns `~/.claude` when its login matches the note), `claude_account_selection` :1300, `pick` :1388 and its fallback :1473-1480, `account_labels_for_logins` :1718, `group_accounts` :1823 ("default"), `_stored_groups` :1673, `_unit_role_history` :1951-2000 (raises with no home label), `_historical_roles` :2013, `burn` :2040, `_status_for` :2706-2745 and `account_statuses` :2762-2782 (the `~/.claude` row); `refusal_watch.py` :412 :431 :471 :545-557; `new_account.py` :105-146 :206 :225 :274 :331; `whoami/account.py` :114-181 (no variable → `~/.claude`) :237 :292; `whoami/agent_accounts.py` :209-221 :466-478 :595-606 (macOS keychain only for `~/.claude`) :641 :687-712 :1001; `whoami/agent_notes.py` :423-429; `whoami/quota_alert.py` :918; `whoami/whoami.py` :72; `shutdown/record.py` :1021 ("default" target), `restart.py` :526-547 (missing config dir → `~/.claude`) :591 :621 :1036 :1140 :1298, `inventory.py` :880, `settle.py` :540 :764; `production/add_unit.py` :626 :815 :971 :1031 :1058, `add_showrunner.py` :37-132, `rename.py` :626-662; `nightly_review/nightly_review.py` :139; `statusline/statusline.sh` :25-27 (`${CLAUDE_CONFIG_DIR:-$HOME/.claude}/account-label`); `settings/ensure_git_filters.sh` :77; `herdr/trust_survey.py` :78; `notify/review.py` :625. Tests that take claude2 as `main_config_dir()`: `notify/test_review.py:135`, `production/test_add_unit.py:233`, `shutdown/test_restart.py:1218`, `accounts/test_accounts.py:766`. Phase 30: `sweep_claude_temp_files` scans `$HOME` (sessions on `~/.claude` write `$HOME/.claude.json.tmp.*`) and each `~/.claudeN`; keep both. `feedback` and `telemetry` are known private. Two folders on one login break token refresh. `groups.json`: showrunners on claude1, units on claude4.
 
 **Spec:**
 
-1. `feedback` and `telemetry` join `KNOWN_PRIVATE_NAMES`, and `_is_known_private` accepts the prefix `.claude.json.tmp.`: per-account, never linked, never reported.
-2. Unclassified entries (Claude and Codex) print only under `--detail`; the default output prints none.
-3. A sweep deletes each regular file named `.claude.json.tmp.*` whose modification time is more than a day old, in `$HOME` and in each `~/.claudeN` on disk, never following a link and never touching any other name; a file that vanishes or cannot be deleted is skipped silently. The updater runs it once per run. A file under a day old is left alone (an atomic write in flight is milliseconds old).
-4. `docs/accounts.md` says the default table shows only accounts and `--detail` shows unknown entries.
+1. `~/.claude` is never an account folder: no function returns it as a note's folder, the status table has no `~/.claude` row, and `check claude2` inspects `~/.claude2` like any `~/.claudeN`. A note whose `~/.claudeN` is missing reads "not set up" — never a fallback to `~/.claude`.
+2. Every launch (`exec`, `pick`, a move or resume, `add_unit`, `add_showrunner`, `rename`) sets `CLAUDE_CONFIG_DIR` to a numbered folder; `prepared_account` and `account_prefix` never unset it. `exec` accepts a group name (`exec showrunners`) and launches on that group's account; that is the line the hand-typed `claude` alias will use.
+3. Each machine changes over on its own: while that machine's `~/.claude` holds a login, a process with no `CLAUDE_CONFIG_DIR` reads as that login's account, as today, and the table prints one line: `~/.claude holds a login; run accounts.py cutover-home`. Once it holds none, such a process reads as "no account" everywhere (`whoami/account.py`, `refusal_watch.py`, shutdown inventory, the status line shows no account piece). Promoting this phase therefore changes nothing on a machine until its cutover runs. `account.process_config_dir` returns a tagged result — a configured folder, no account setting, or an unreadable environment — never `Path | None`, and every consumer handles all three.
+4. History keeps per-record evidence: a record naming `default` or `~/.claude` resolves from a login the record itself carries, or from the dated entry `cutover-home` writes to `config/accounts.json` (label, login, time), which covers only records written before that time; otherwise its account stays unresolved. Today's login never names a past record (`moves.read_journal` already forbids it). `burn`, `_historical_roles`, `_unit_role_history` and `group_accounts` follow this; a resume of a `~/.claude` record resolved this way goes to that label's folder.
+5. `accounts.py cutover-home <label>` moves `~/.claude`'s login into `~/.claudeN` by rename, never copy: `.credentials.json` and the `oauthAccount` block of `$HOME/.claude.json` into `~/.claudeN/.claude.json`, both atomic, refused while any process runs with `~/.claude` as its config (no variable), and refused when the destination already holds a login or an `oauthAccount`. `cutover-home --undo` renames back and is refused while any process runs on `~/.claudeN`. Both write a small journal before the first rename, so an interrupted run is finished by rerunning it or reversed by `--undo`. It never prints, copies or logs credential contents.
+9. Launchers that start Claude without choosing an account — `message/send.py` (:878 strips every Claude variable), `cli_agent/cli_agent.sh` (:62), `agents/agent_exec.sh` (:128) — pass the caller's `CLAUDE_CONFIG_DIR`, else the showrunners group's folder.
+6. `$HOME/.claude.json` stays the seed and the MCP baseline; the seed also copies each project's trust entries into a new folder's `.claude.json`.
+7. macOS: `agent_accounts.claude_credentials` reads a named folder's keychain entry by the service name Claude Code uses for that folder (the director supplies the name in the dispatch prompt, found on the Mac by name only).
+8. `docs/accounts.md` and the as-builts that call `~/.claude` an account (`shutdown-and-restart.md`, `herdr-adoption.md`, `production-rename.md`, `showrunner-automation.md`) follow.
 
 **Files:**
 
-- `scripts/accounts/accounts.py` — the names, the prefix, the `--detail` gate, the sweep.
-- `scripts/whoami/agent_notes.py` — the updater calls the sweep.
-- `scripts/accounts/test_accounts.py` — the three names classified; default output has no unclassified line and `--detail` has it; the sweep deletes an old temp file in `$HOME` and in a numbered folder, keeps a fresh one, a link and any other name.
-- `scripts/whoami/test_agent_notes.py` — the updater runs the sweep.
-- `docs/accounts.md` — one line.
+- `scripts/accounts/` — `accounts.py`, `new_account.py`, `refusal_watch.py` and their tests.
+- `scripts/whoami/` — `account.py`, `agent_accounts.py`, `agent_notes.py`, `quota_alert.py`, `whoami.py` and their tests.
+- `scripts/shutdown/` — `record.py`, `restart.py`, `inventory.py`, `settle.py` and their tests.
+- `scripts/production/` — `add_unit.py`, `add_showrunner.py`, `rename.py` and their tests.
+- `scripts/statusline/statusline.sh`, `scripts/statusline/test_statusline.py`, `scripts/settings/ensure_git_filters.sh`, `scripts/herdr/trust_survey.py`, `scripts/notify/review.py`, `scripts/notify/test_review.py`, `scripts/nightly_review/nightly_review.py` — each reads `~/.claude` as an account today.
+- `scripts/message/send.py`, `scripts/cli_agent/cli_agent.sh`, `scripts/agents/agent_exec.sh` — launches that choose no account; their tests beside them.
+- `docs/accounts.md`, `docs/as-built/` — the four named docs.
 
-**Workers:** `impl` takes `accounts.py`, `agent_notes.py` and the doc; `test` takes both test files.
+**Workers:** 2 writers. `impl` takes `scripts/accounts/` and `scripts/whoami/` with their tests; `test` takes `scripts/shutdown/`, `scripts/production/`, the statusline, settings, herdr, notify, nightly-review, message, cli-agent and agent-exec files with their tests, and the docs.
 
-**Acceptance gate:** basedpyright zero errors and warnings on the changed Python; the accounts and whoami suites pass; run against a scratch home, the default output prints no unclassified line, `--detail` prints it, and the sweep deletes only the old temp files.
+**Acceptance gate:** basedpyright zero errors and warnings on the changed Python; `merge_gate.py --tests-only` green; in a scratch home with `~/.claude` holding a login and `~/.claude2` set up, `cutover-home claude2` moves the login (the old files are gone, the new ones in place), `--undo` puts it back, the table shows no `~/.claude` row after the cutover, a process with no `CLAUDE_CONFIG_DIR` reads as `~/.claude`'s login's account before the cutover and as no account after it; the cutover is refused with a destination that holds a login and with a live `~/.claude` session, `--undo` with a live `~/.claude2` session, and an interrupted cutover finishes on rerun; history spanning two different home logins resolves each record from its own evidence.
+
+### Phase 32 — Cutover: claude2 moves into ~/.claude2  · status: todo
+
+**Depends on:** Phase 31
+
+#### Work Order
+
+**Goal:** on natedev and then the Mac, claude2's login lives in `~/.claude2`, no session runs on `~/.claude`, and `/showrunner:accounts` shows no `~/.claude` row. The director runs it; no session loses its login and the user is asked nothing (showrunner, 2026-10-15).
+
+**Constraints from prior phases:** Phase 31's `cutover-home` renames the login and refuses while a process runs on `~/.claude`; `--undo` reverses it. Session moves use the scripted move path (`accounts.py move`), which needs no user approval. Never print, copy or log credential contents. Never restart or kill the ups session (097e0938, `/etc/nixos`) — it runs on `~/.claude1`. The showrunner lands the hand-typed `claude` alias (`/etc/nixos/modules/common/shell.nix:390`) as `accounts.py exec showrunners` before this phase. Mac: the login is in the keychain under a name keyed by folder; the director reports the finding to the showrunner first, and the Mac may need one user `/login` in `~/.claude2` (never `/logout`, which revokes).
+
+**Spec:**
+
+1. Phase 31 is merged and promoted on natedev, and the alias has landed.
+2. `accounts.py setup claude2`.
+3. Move every session running on `~/.claude` to an account with room by the scripted move; none goes to claude2 before its login is in place.
+4. `accounts.py cutover-home claude2`, then `check claude2` passes and the table has no `~/.claude` row.
+5. Mac, after the keychain finding is reported to the showrunner: the same steps 2–4 on the Mac; when its login cannot move by rename, the user runs one `/login` in `~/.claude2` there (never `/logout`). Until then the Mac keeps reading `~/.claude` as its login's account (Phase 31 Spec 3).
+6. `docs/accounts.md` records that `~/.claude` holds no login on either machine.
+
+**Files:**
+
+- `docs/accounts.md` — the cutover line.
+
+**Workers:** none; the director runs each step.
+
+**Acceptance gate:** `check claude2` exits 0; `/showrunner:accounts` shows `~/.claude2` with claude2's login and no `~/.claude` row; no live process has `~/.claude` as its config; a new `claude` launch lands on the showrunners group's account.
