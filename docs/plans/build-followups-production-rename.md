@@ -139,7 +139,7 @@
 
 **Gotchas:** The command doc names no internal journal step numbers; `unit` and `finish` require `apply` to have finished through its merge-branch push.
 
-### Phase 5 — Live check on a scratch production  · status: todo
+### Phase 5 — Live check on a scratch production  · status: done
 
 #### Work Order
 
