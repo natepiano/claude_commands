@@ -48,30 +48,26 @@
 
 ### Phase 2 — The pause names its own check; `move --no-alert`  · status: done
 
-**Depends on:** Phase 1
+#### As-built
 
-#### Work Order
-
-**Goal:** the pause text tells the session how to confirm the request itself, and `accounts.py move` can run with no alerts.
-
-**Spec:**
-- The unit director merges `origin/build-followups` first, after message-clarity's holdout text lands.
-- `_settle_text`: after the first line, one line (wording from message-clarity): `This request comes from the shutdown the user started (docs/accounts.md, "Move a session"), not from another session's own choice. To confirm it, run in this terminal: <command>. It lists this session under the move.` `<command>` is `shutdown_command("status", note_file.canonical_label(record["label"]), "--here")`: the account label, never the login. For a `Pause for stop`, say `under the stop` and cite `docs/as-built/shutdown-and-restart.md`.
-- `accounts.py move`, single and group, takes `--no-alert` and appends `--no-alert` to each `shutdown.py down` argv in `move_sessions`; `move_group` passes it through. `docs/accounts.md` "Move a session" shows the flag in both usage lines and says it is for live checks.
+- `settle.pause_confirmation_line(record)` builds the second pause line: the request comes from the shutdown the user started, not from another session's own choice; to confirm it, run in this terminal `shutdown.py status <account label> --here`, which lists this session under the move. A move cites `docs/accounts.md` "Move a session"; a `Pause for stop` says "under the stop" and cites `docs/as-built/shutdown-and-restart.md`.
+- `_settle_text` places that line right after the unchanged first line; only busy sessions receive it, since an idle session is stopped with no pause message.
+- `accounts.MoveAlerts = Literal["user", "none"]`; `alerts: MoveAlerts = "user"` on `move_sessions`, `move_group` and `move`. `move --no-alert` (store_const `"none"`), single and group, appends `--no-alert` to each `shutdown.py down` argv via `_move_down_argv`.
+- Quiet `--dry-run` prints the planned `down` commands per source login.
+- `docs/accounts.md` "Move a session" shows `--no-alert` in both usage lines, for live checks.
 
 **Files:**
-- `scripts/shutdown/settle.py` — `_settle_text`.
-- `scripts/accounts/accounts.py` — `move_sessions`, `move_group`, `move`, the `move` subparser.
-- `docs/accounts.md` — Move a session.
-- `scripts/shutdown/test_settle.py`, `scripts/shutdown/test_account_move.py` — tests.
+- `scripts/shutdown/settle.py` — `pause_confirmation_line`, `_settle_text`.
+- `scripts/accounts/accounts.py` — `MoveAlerts`, `_move_down_argv`, `move_sessions`, `move_group`, `move`, the `move` subparser.
+- `docs/accounts.md` — Move a session, with `--no-alert`.
+- `scripts/shutdown/test_settle.py`, `scripts/shutdown/test_account_move.py` — pause line for move and stop; `--no-alert` on each `down` argv, single and group, absent without the flag.
+- `scripts/accounts/test_refusal_watch.py` — expects `move_group` to forward `alerts="user"`.
 
-**Workers:** `1 writer + 1 tester`.
-- `impl` — `settle.py`, `accounts.py`, `docs/accounts.md`; hub: `accounts.py`.
-- `test` — `test_settle.py` (pause line for move and stop), `test_account_move.py` (`--no-alert` reaches each `down` argv, single and group; absent without the flag).
+**Binds later work:** `accounts.py move … --dry-run --no-alert` prints each planned `shutdown.py down … --no-alert` command and changes nothing, so the live check previews every move this way. A busy session's pause message has a second line naming `shutdown.py status <account label> --here`, which a declining session in the live check can run before it answers.
 
-**Constraints from prior phases:** Phase 1: an idle session (pause not sent or queued, or its registry `updated_at` later than a sent pause) is stopped with no pause message, so the new line reaches busy sessions only. The merge branch names an owner's workers `workers` (`MatchingSession.workers`, `inventory.WorkerSession`); `inventory.SessionFields` fixtures carry `updated_at`. `move_sessions` builds each `down` argv with `_shutdown_argv("down", source, "--here", "--only", …)` (`accounts.py` ~2268).
+**Gotchas:** the status command uses `note_file.canonical_label(record["label"])`, never the login. The first pause line stays byte-identical, because launching skills match its prefix. `test_refusal_watch.py` pins the `move_sessions` kwargs, so a new move parameter changes that test too.
 
-**Acceptance gate:** the five suites green; basedpyright clean on changed files. The new pause line goes to message-clarity for wording before checkpoint.
+**Ruled out:** a bare `no_alert: bool` parameter — the named `MoveAlerts` Literal holds the choice.
 
 ### Phase 3 — Live check without consent  · status: todo
 
@@ -91,7 +87,7 @@
 
 **Workers:** none — live steps belong to the unit director.
 
-**Constraints from prior phases:** Phases 1 and 2 installed on main.
+**Constraints from prior phases:** Phases 1 and 2 installed on main. `accounts.py move <id> claude1 --dry-run --no-alert` prints each planned `shutdown.py down … --no-alert` command and changes nothing; run it before each leg. A busy session's pause message now has a second line naming `shutdown.py status <account label> --here`, which lists the session under the move; leg 2's session may run it before it answers.
 
 **Acceptance gate:** both legs behave as stated; no push sent.
 
