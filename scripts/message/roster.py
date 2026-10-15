@@ -918,22 +918,11 @@ def _worker_account(run: _LiveRun, worker: _MeshWorker, homes: dict[int, Path]) 
         try:
             port = _read_object(run.path / "mesh_server.json").get("port")
         except (OSError, UnicodeError, ValueError):
-            return AccountUnread("serving server not recorded")
-    if not isinstance(port, int) or isinstance(port, bool) or port not in homes:
-        return AccountUnread("serving server not recorded")
-    return _codex_home_account(homes[port])
-
-
-def _server_alive(run: _LiveRun, problems: list[str]) -> bool:
-    path = run.path / "mesh_server.json"
-    if not path.exists():
-        return False
-    try:
-        pid = _read_object(path).get("pid")
-    except (OSError, UnicodeError, ValueError, json.JSONDecodeError) as error:
-        _problem(problems, f"Codex server {path}", error)
-        return False
-    return isinstance(pid, int) and not isinstance(pid, bool) and _pid_alive(pid)
+            pass
+    if isinstance(port, int) and not isinstance(port, bool) and port in homes:
+        return _codex_home_account(homes[port])
+    # Idle shutdown removes server metadata; the next turn uses the workers home.
+    return _codex_home_account(agent_accounts.workers_home())
 
 
 def _worker_status(status: str) -> str:
@@ -1089,9 +1078,7 @@ def _reviewer_process(
     return claude
 
 
-def _reviewer_cwd(process: _ReviewerProcessState, fallback: str) -> str:
-    if isinstance(process, _ReviewerProcessNotFound):
-        return fallback
+def _reviewer_cwd(process: _ReviewerProcess, fallback: str) -> str:
     try:
         return os.readlink(f"/proc/{process.pid}/cwd")
     except OSError:
@@ -1129,12 +1116,13 @@ def _review_workers(
         if not _pid_alive(launcher_pid):
             continue
         process = _reviewer_process(launcher_pid, table)
-        kind: Kind = process.kind if isinstance(process, _ReviewerProcess) else "codex"
+        if isinstance(process, _ReviewerProcessNotFound):
+            continue
         name = f"{lens} reviewer" if lens else "blind reviewer"
         slot_role = f"review ({lens})" if lens else "review"
         entries.append(RosterEntry(
             machine=machine,
-            kind=kind,
+            kind=process.kind,
             role="worker",
             name=name,
             status="running",
@@ -1143,8 +1131,7 @@ def _review_workers(
             showrunner=place.showrunner,
             director=place.director,
             assignment=WorkerAssignment(slot_role, str(run.path)),
-            account=(_process_account(process.pid, process.kind) if isinstance(process, _ReviewerProcess)
-                     else AccountUnread("reviewer process not found")),
+            account=_process_account(process.pid, process.kind),
         ))
     return entries
 
@@ -1163,20 +1150,11 @@ def _delegate_workers(
     entries: list[RosterEntry] = []
     worker_threads: set[str] = set()
     for run in runs:
-        server_alive = _server_alive(run, problems)
         server_homes = _run_server_homes(run)
         place = _run_place(run, claude_entries, production_places)
         for name, record in sorted(_mesh_records(run, problems).items()):
             status = _as_string(record.get("status"))
             if status == "ended":
-                continue
-            launcher = record.get("launcher_pid")
-            launcher_alive = (
-                isinstance(launcher, int)
-                and not isinstance(launcher, bool)
-                and _pid_alive(launcher)
-            )
-            if not server_alive and not launcher_alive:
                 continue
             thread_id = _as_string(record.get("thread_id"))
             if thread_id:

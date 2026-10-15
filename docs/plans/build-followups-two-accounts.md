@@ -965,28 +965,45 @@ After a worker launch's own turn has ended, a move to the selected seats home th
 
 **Depends on:** Phase 22
 
+#### As-built
+
+- `## Live sessions` rows carry no time: `render_section` writes no `<!-- observed-at: … -->` comment, and live rows have `last_seen` and `observed_at` cleared. `session_table.observed` is gone.
+- `live_sessions` returns `ReadSessions.machines_read`: the local machine always, a reached peer's machines (its `other_machine()` name when it has no entries), never a peer whose attribution is unavailable. Each refresh that reads sessions merges `{machine: checked_at}` for those into `~/.local/state/agent-notes/sessions_seen.json` (`agent_notes.SESSIONS_SEEN`, expanded at call time; `read_sessions_seen`, `write_sessions_seen`), one atomic replace per refresh, outside the vault. A missing, malformed or non-aware entry reads as absent; a failed write is a `sessions seen:` message and never blocks the notes. An unread collection leaves the file and the sections alone.
+- `session_table.last_seen(row, machines_seen)` freezes a kept row's `(last seen <time>)`: its existing marker, else the machine's saved time, else a legacy `observed-at` comment, else `unknown`. The text changes once, when the peer stops answering. `section_rows` still reads the legacy comment.
+- A refresh two minutes after another with the same sessions differs only on lines the vault snapshot skips (`/etc/nixos/modules/linux/agent-sessions-snapshot.py` `TIMESTAMPS`, copied into `test_session_table.py`); a session starting, stopping or moving, the `sessions` count and the unattributed line still change the note. The unattributed line is recomputed each run and never parsed.
+
+**Files:**
+- `scripts/whoami/session_table.py` — no time on live rows; `machines_read`; `last_seen` with the seen map.
+- `scripts/whoami/agent_notes.py` — `SESSIONS_SEEN`, its reader and writer, one write per refresh.
+- `scripts/whoami/test_session_table.py`, `test_agent_notes.py` — the skip-list, real-change, frozen last-seen, legacy-comment and seen-file tests.
+- `docs/accounts.md` — the last-seen source.
+
+**Gotchas:**
+- The skip list lives in `/etc/nixos`, not this repository: a new per-run frontmatter field commits every run unless that list gains it.
+
+**Ruled out:** keeping the first observation time in each row (a long-lived row would read "last seen" days stale); a new per-run frontmatter field (not on the snapshot's skip list).
+
+### Phase 27 — Roster rows stable between runs  · status: done
+
+**Depends on:** Phase 26
+
 #### Work Order
 
-**Goal:** a notes refresh where no session started, stopped or moved leaves each account note different only on lines the vault snapshot already skips, so the hanadocs vault stops taking a commit every two minutes; a real change still commits.
+**Goal:** the session roster lists the same sessions on two runs when none started, stopped or moved, so the account notes in the hanadocs vault stop flipping the "not attributed" line and stop dropping whole worker tables.
 
-**Constraints from prior phases:** "Account labels without a space" put a hidden `<!-- observed-at: <time> -->` comment in every `## Live sessions` row (`session_table.observed`, called from `agent_notes.py` for each live row with the run's `checked_at`), so a row kept for an unreachable peer can show `(last seen <time>)`; kept rows are not counted in `sessions` and return to live when the peer answers. The snapshot (`/etc/nixos/modules/linux/agent-sessions-snapshot.py`, `TIMESTAMPS`, not in this repository) commits `~/rust/hanadocs/agents/` only when a line outside these line-start patterns changed: `^Snapshot taken `, `^date_modified:`, `^weekly_usage_checked_at:`, `^weekly_remaining_usage:`, `^credit_balance:`, `^resets:`, `^limit_reset:`. The observed-at time changes every run, so since that phase every run commits claude1, claude2, claude4 and codex2 (630 commits in a day, reported by hanadocs; vault 57c5886).
+**Constraints from prior phases:** "Account notes unchanged when nothing changed" removed the per-run time from `## Live sessions`; the remaining churn comes from `scripts/message/roster.py` (message-clarity's file, edited here at the showrunner's direction through berth). Every `AccountUnread` roster entry counts in a "<n> live session(s) not attributed to an account" line written into every note.
 
 **Spec:**
 
-- Live rows render with no time: no `<!-- observed-at: … -->` comment and no `(last seen …)`.
-- Each refresh that reads sessions records, outside the vault, the time it last reached each machine: `~/.local/state/agent-notes/sessions_seen.json`, `{machine: aware ISO time}`, written atomically, one write per refresh, for every machine whose rows were read live this run (the local machine always, a peer only when reached). An unreadable or missing file reads as empty and never fails the refresh.
-- A kept row (its machine in `rows_kept`) shows `(last seen <time>)`: the time it already carries in the note when it has one; else the recorded time for its machine; else a legacy `observed-at` comment in the saved row; else `unknown`. So the text changes once, when the peer stops answering, and stays fixed while it stays unreachable.
-- `section_rows` still reads a legacy `<!-- observed-at: … -->` comment from a note written before this phase; nothing writes one. `section_rows(render_section(rows))` gives back the rows of any section this phase writes; the unattributed line is recomputed each run and never parsed.
-- A session starting, stopping or moving, the `sessions` count changing, or the unattributed line changing still changes the note outside the skip list.
-- Docs that describe the hidden comment (`docs/accounts.md` and any as-built that names it) say where the last-seen time now comes from.
+- `_review_workers` adds no entry for a `review_status*` file that says reviewing when `_reviewer_process` finds no reviewer process: lens reviews now run as a `codex_mesh.py follow` turn inside the mesh app-server, whose worker the roster already lists, so the entry was a duplicate counted as unattributed while any review ran. A review whose reviewer process is found keeps its entry as today.
+- `_delegate_workers` lists every mesh record whose status is not `ended` for a live run (an active marker or a fresh heartbeat) whether or not the run's app-server is alive; a server that stopped itself after its idle timeout no longer removes the run's workers. Server liveness may still change the status text a row shows; it never removes the row. A run that is not live keeps today's behavior.
+- A real start, stop or move still changes the roster.
 
 **Files:**
 
-- `scripts/whoami/session_table.py` — live rows render no time; kept rows take last-seen per the order above; legacy comment read only.
-- `scripts/whoami/agent_notes.py` — read and write the per-machine seen file once per refresh; pass it to the kept-row rule.
-- `scripts/whoami/test_session_table.py`, `scripts/whoami/test_agent_notes.py` — the regression tests below.
-- `docs/accounts.md` — the last-seen source, if it names the comment.
+- `scripts/message/roster.py` — the two rules above.
+- `scripts/message/test_roster.py` — a test for each: a reviewing status file with no reviewer process yields no entry and nothing unattributed, while one with a found process still lists it; a live run whose app-server is gone still lists its non-ended mesh workers, and an ended record or a dead run lists none.
 
-**Workers:** one worker, `impl`, owns all files: the change is one writer and its tests.
+**Workers:** one worker, `impl`, owns both files.
 
-**Acceptance gate:** a test refreshes a note twice, two minutes apart, with the same live sessions (local and a reached peer), and asserts every differing line matches one of the snapshot's `TIMESTAMPS` patterns (copied into the test with a comment naming the nixos file). A second test starts or stops one session between the two refreshes and asserts a line outside those patterns differs. A third: reached at T1, unreachable at T2 and T3 — the kept row reads `(last seen T1)` at T2 and the T3 note equals the T2 note outside the skip list. A fourth: a legacy row carrying the comment, unreachable on the first refresh, shows that comment's time. `scripts/whoami` and `scripts/lib` suites pass with a temp `HOME`; basedpyright reports zero errors and zero warnings on the changed files.
+**Acceptance gate:** both tests fail without the change and pass with it; `scripts/message`, `scripts/whoami` and `scripts/shutdown` suites pass with a temp `HOME`; basedpyright reports zero errors and zero warnings on the changed files. After the fix is live, `git -C ~/rust/hanadocs log -8 --stat -- agents` shows no run committing only a flip of the not-attributed line or a whole table appearing and vanishing.
