@@ -88,6 +88,20 @@ class AgentNotesTests(unittest.TestCase):
         with patch.object(agent_notes, "live_reports", return_value=reports), patch.object(five_hour, "watch", return_value=[]):
             return agent_notes.update_alert_pass(selection, agent_accounts.workers_home())
 
+    def test_each_updater_run_sweeps_stale_claude_temps_once_with_multiple_account_notes(self) -> None:
+        _ = self.note("claude1.md", "unit@example.invalid")
+        _ = self.note("claude2.md", "spare@example.invalid")
+        stale = self.root / ".claude.json.tmp.1234.abandoned"
+        old = time.time() - timedelta(days=2).total_seconds()
+        for run in range(2):
+            with self.subTest(run=run):
+                _ = stale.write_text("stale atomic write", encoding="utf-8")
+                os.utime(stale, (old, old))
+                with patch.object(accounts, "sweep_claude_temp_files", wraps=accounts.sweep_claude_temp_files) as sweep:
+                    _ = self.snapshot([])
+                sweep.assert_called_once()
+                self.assertFalse(stale.exists())
+
     def test_first_snapshot_renames_legacy_notes_without_changing_body_or_mode(self) -> None:
         old = self.root / "codex 2.md"
         text = "---\nlogin: legacy@example.invalid\nuse_credits: off\n---\nMy untouched account notes.\n"
