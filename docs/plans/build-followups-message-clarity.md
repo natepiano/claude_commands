@@ -218,38 +218,31 @@ Outside `scripts/accounts/` and `scripts/whoami/`, every delegate agent is a "wo
 
 **Ruled out:** renaming live state files in place — it races running launchers; a CLI or identifier alias for old names — one way to do a thing.
 
-### Phase 11 — Workers, not seats, in the accounts and whoami scripts  · status: todo
+### Phase 11 — Workers, not seats, in the accounts and whoami scripts  · status: done
 
-**Depends on:** Phase 10
+#### As-built
 
-#### Work Order
-
-**Goal:** The two directories still held during the rename and every name they define say "worker", with no alias, and `git grep -i seat` finds nothing outside the allowed remainder.
-
-**Spec:**
-- Runs once the showrunner says two-accounts has released `scripts/accounts/` and `scripts/whoami/` (`scripts/delegate/` moved into the phase before when builder-report released it).
-- Applies the rename Spec of the phase before it to `scripts/accounts/` and `scripts/whoami/`, and renames every name they define or read together with each reference elsewhere: `seat_usage.py` → `worker_usage.py` (+ test), `accounts.py swap|set-role|role seats` → `workers` (no alias), `scripts/usage/fixtures/day1_seats/` → `day1_workers/`, identifiers, flags, JSON keys and state file names. Before domain validation, convert account configuration `seats` to `workers`, role-history `role: "seats"` to `"workers"`, moves-journal `subject: "seats"` to `"workers"` and confirmed-move `seat` to `worker`, and shutdown record `seats` with nested `kind: "seat"` to their worker names. accounts and whoami share the configuration conversion, so neither falls back to the default home on an old file (`whoami/agent_accounts.py` does today when the key is absent). Preserve account selection, move ids, timestamps, worker and run identity, confirmation deduplication (`accounts/moves.py` compares `subject`, `seat`, `run`), and shutdown ownership and progress. Journal conversion holds the appenders' lock on the same inode, keeps the reader's malformed-line contract, and reads an old-format entry appended later by a process started before the update. Canonical reads return only worker names. The allowed `git grep -i seat` remainder after this phase is legacy input names in migration code and its tests, plus the `**Seats:**` validator fixtures.
-- Merge origin/build-followups first: two-accounts' work in these directories lands before this phase.
+- The Codex role is `workers` (`accounts.CODEX_ROLE`); `accounts.py swap|set-role|role workers` works and `seats` is "not a role", with no alias. Renamed with every reader: `CodexWorkersAccount`, `SwapWorkerSession`, `WorkersSwapDryRun`/`WorkersSwapStarted`/`WorkersSwapOutcome`, `WorkersTransitionDelivery`, `CodexAlertPassReadings.workers`, `agent_accounts.workers_home`, `codex_mesh.retire_workers_servers`, shutdown `WorkerSession`/inventory `kind: "worker"`, `SessionShutdown.workers`, `stop.MatchingSession.workers`, `whoami/worker_usage.py`, fixtures `scripts/usage/fixtures/day1_workers/`.
+- `scripts/accounts/worker_names.py` owns `accounts_config_file()`, `roles_lock()`, `configuration()`, `journal_entry()`, `migrate_locked_journal()` and `role_history_lines()`. Old names convert at the storage boundary; canonical reads return only worker names.
+  - Configuration `seats` → `workers` in memory, through `configuration()`, shared by `accounts` and `agent_accounts.workers_home`, so neither falls back to the default home on an old file; the file is not rewritten on read.
+  - Role history `role: "seats"` and moves-journal `subject: "seats"` → `"workers"`, confirmed-move `seat` → `worker`: rewritten in place under the exclusive lock, same inode; malformed lines pass through; a second unchanged read writes nothing. `moves.append_move`/`append_routing`/`read_journal` convert under the lock before deduplicating (`subject`, `worker`, `run`) or reading, so a later old-format append is converted too.
+  - Shutdown records: `record._worker_record_names` converts `seats` → `workers` and nested `kind: "seat"` → `"worker"`, remote records too (`parse_session_records`).
+  - Usage store version 9 (`collect.WORKER_ACCOUNT_ROLES_VERSION`) converts `account_role_changes` rows (`INSERT OR IGNORE` keeps an existing worker row); `outcomes.save_account_role` canonicalizes each record through `journal_entry()`.
 
 **Files:**
-- `scripts/accounts/` — account roles, configuration, role history, moves journal, inventory consumers and tests
-- `scripts/whoami/` — worker account resolution, quota transitions, `worker_usage.py` and tests
-- `scripts/agents/` — account imports (`agent_exec.sh` imports `seats_home`), move-journal producers (`codex_mesh.py`), `retire_seats_servers` and tests
-- `scripts/message/` — account imports (`escalate.py`), role descriptions and tests
-- `scripts/shutdown/` — inventory `SeatSession` / `kind: "seat"`, record field `seats`, `stop.MatchingSession.seats`, migration, callers and tests
-- `scripts/production/` — account imports and shutdown-record fixtures in tests
-- `scripts/delegate/` — `review_pool_report.py`'s `seat_usage` import and related tests
-- `scripts/usage/` — the day1 fixture directory, contents and callers
-- `commands/` — references to the renamed names
-- `docs/` — references to the renamed names, outside the plan docs
+- `scripts/accounts/worker_names.py` — config path, roles lock, every stored-name conversion
+- `scripts/accounts/accounts.py`, `moves.py` — the workers role, CLI, journal conversion under lock
+- `scripts/whoami/agent_accounts.py`, `quota_alert.py`, `agent_notes.py`, `whoami.py`, `worker_usage.py` — worker home resolution and quota transitions
+- `scripts/agents/agent_exec.sh`, `codex_mesh.py` — `workers_home`, `subject: "workers"` moves, `retire_workers_servers`
+- `scripts/shutdown/inventory.py`, `record.py`, `stop.py`, `settle.py` — worker sessions and record conversion
+- `scripts/usage/collect.py`, `outcomes.py`, `fixtures/day1_workers/` — store version 9, role canonicalization
+- `commands/showrunner/accounts.md`, `docs/accounts.md`, `docs/as-built/` — worker wording (`shutdown-and-restart.md` keeps the account-move text in worker names)
 
-**Workers:** 2 writers (no test lane)
-- `impl` — agents, message, shutdown, production, delegate, usage, commands and docs above
-- `test` (opens as impl) — `scripts/accounts/`, `scripts/whoami/`; publishes the renamed account and move-journal names before `impl` updates their consumers
+**Binds later work:** the roles lock has one definition, `worker_names.roles_lock()`, taken before the journal lock; a role writer or converter that builds its own lock path splits it. The allowed `git grep -i seat` remainder is legacy-input conversion and its tests, the `**Seats:**` validator fixtures, and every `docs/plans` file (read only to this unit).
 
-**Constraints from prior phases:** Rename together, with no old API or CLI alias: `CodexSeatsAccount`, `seats_home`, `retire_seats_servers`, `SwapSeatSession`, `SeatsSwapDryRun`, `SeatsSwapStarted`, `SeatsSwapOutcome`, `SeatsTransitionDelivery`, `CodexAlertPassReadings.seats` and their seat-spelled helpers and constants; `accounts.py env|swap|set-role|role seats`; shutdown `SeatSession`, inventory `kind: "seat"`, `SessionShutdown.seats`, `MatchingSession.seats`; moves-journal `subject: "seats"` and confirmed-move `seat`. Phase 10's ledger and claim-lock conversion stays as built: old `<run>/seats` and `impl_seat_claim.lock` paths remain linked to the worker files for launchers started before the update (`scripts/delegate/worker_state.py`). Run every script suite before checkpoint, the lib suite and `scripts/notify/test_push_texts.py` included. A changed `push_catalog.py` text needs `review.py texts --id <id>` three times and `--approve`.
+**Gotchas:** the moves journal and role history are never replaced: conversion rewrites the same inode under the appenders' exclusive lock, so a process started before the update keeps appending to it. Journal reads now take `LOCK_EX`, not `LOCK_SH`.
 
-**Acceptance gate:** every script suite green; basedpyright 0/0; `accounts.py swap workers` works and `swap seats` is unknown; `git grep -i seat` reports only the allowed remainder; tests load an old selected-account configuration through both accounts and whoami and keep the selected home; read old role history without changing burn figures; resume an old requested or waited move and deduplicate its confirmation after conversion; see a later old-format journal append; load old shutdown records with nested worker sessions keeping ownership, progress and issues; a second unchanged read rewrites nothing; Phase 10's shared-ledger and claim-lock tests stay green.
+**Ruled out:** aliases for the old CLI or API names.
 
 ### Phase 12 — Shutdown alerts in the user's four-line form; the forms command docs  · status: done
 
@@ -278,29 +271,52 @@ Outside `scripts/accounts/` and `scripts/whoami/`, every delegate agent is a "wo
 
 ### Phase 13 — The remote-control alert in the user's four lines  · status: done
 
-**Depends on:** Phase 12; shutdown checkpoint 0dcaadac merged to build-followups (it is, as 34e46574)
+#### As-built
+
+- `shutdown.remote_control` holds the user's four lines: Title `{who} remote-control is off`, `Session: {session}`, `Action: run /remote-control`, and a body opening `Reason: Remote control is off.`. `{who}` (from `remote_control.remote_control_who`) is `<unit> unit` for a production unit, `<production> showrunner` for a showrunner, else the session name. Examples: typical, unit, showrunner; `{who}` differs from the session name in the last two.
+- The session name passes through the fixer chain: `restart.remote_control_missing` passes `item["name"]` to `launch_fixer(…, alerts, session)` → `fix(…, session)` → `alert_failed(who, session)`, and straight to `alert_failed` when the fixer cannot launch. `alert_failed` calls `render("shutdown.remote_control", who=..., session=...)` with no `machine`. The fixer CLI in `shutdown.py` requires `--session`.
+- `review.py texts --id <id> --approve --user-spec SOURCE` runs the review and writes the `push_texts_reviewed.json` entry whatever the verdict. Authority is `ReviewerApprovalRequired | UserSpecifiedText`; a user-spec record's reviewer reads `user-spec: <source>; reviewer: <model>` and carries `objections` (`RuleFailureRecord` list, rule and quote each). The command still exits 1 on objections. Without `--user-spec`, `--approve` writes only passing texts.
+- `text_approvals()` types the approval file at the JSON boundary. Approving an id keeps records for exactly its current examples and drops the rest.
+
+**Files:**
+- `scripts/notify/push_catalog.py` — the remote-control entry
+- `scripts/notify/review.py` — user-spec approval, typed approval file, per-id pruning
+- `scripts/notify/push_texts_reviewed.json` — user-spec approvals with objections for the three examples
+- `scripts/shutdown/remote_control.py`, `restart.py`, `shutdown.py` — the session through the fixer chain
+- `scripts/shutdown/test_support.py`, `test_send_guard.py`, `test_settle.py` — fakes and expectations for the session argument
+
+**Binds later work:** the approval file is read only through `review.text_approvals()`; user-spec approvals carry `objections`; approving an id keeps records for exactly its current examples.
+
+**Gotchas:**
+- `--user-spec` without `--approve`, or with an empty source, is a usage error.
+- The reviewer objects to the user's four lines on every run; the objections are recorded, never applied.
+- Every fixer signature change also touches the shutdown test fakes (`test_support.py` launch fake, `test_settle.py` fixer expectation).
+
+**Ruled out:** applying the reviewer's rewrites to the user's four lines.
+
+### Phase 14 — The shutdown holdout push in the user's four lines, with no email  · status: done
+
+**Depends on:** Phase 13
 
 #### Work Order
 
-**Goal:** The remote-control alert reads Title / Session / Action / Reason in the user's own words.
+**Goal:** The push sent when a session holds up a shutdown or restart reads as the user's four lines, passes review, and never carries an email address.
 
 **Spec:**
-- User, 2026-10-14 16:3x EDT (via the showrunner), on the push sent at 16:25 EDT: store this as the template for its type. `shutdown.remote_control` — Title `{who} remote-control is off`; Session `{session}`; Action `run /remote-control`; Reason `Remote control is off.` (the body opens with that `Reason: ` line, as `shutdown.holdout` does). `{who}` is `<unit> unit` for a production unit (`trunk unit`), `<production> showrunner` for a showrunner, and the session name otherwise; `remote_control.remote_control_who` already computes it.
-- The one render call, `alert_failed` in `scripts/shutdown/remote_control.py`, becomes `render("shutdown.remote_control", who=..., session=...)` with no `machine`. The session name reaches it through a new `--session` fixer argument: `restart.remote_control_missing` → `launch_fixer` → `fix` → `alert_failed`; `shutdown.py`'s remote-control verb parses the fixer's flags. The catalog entry and its call site land in one commit. Shutdown agreed (2026-10-14 18:29 EDT).
-- The entry is the user's spec: run `review.py texts --id shutdown.remote_control` three times, then record its approval with the new flag below; a reviewer objection to the user's words is recorded, never applied.
-- Approval of a user-spec text (showrunner, 2026-10-14 19:2x EDT, add-on placed in this phase): `review.py texts --id <id> --approve --user-spec "<source>"` runs the review and writes the `push_texts_reviewed.json` entry even when the verdict is not a pass, with the reviewer string naming the user spec and the entry keeping the reviewer's objections (rule and quote per objection). Without `--user-spec`, `--approve` still writes only passing texts. `--user-spec` without `--approve` is a usage error. Tests: an `ask` verdict with `--user-spec` writes an entry carrying the source and objections and the current fingerprint; without the flag it writes none.
+- Split from Phase 5 and checkpointed ahead of it (showrunner, 2026-10-15 11:4x EDT): shutdown-unit's next run also edits `scripts/shutdown/settle.py` and builds on this change.
+- The `shutdown.holdout` push failed review on four rules (title-names-the-stake, say-where-to-act, short-plain-sentences, push-body-under-500) and was sent anyway under its user-spec approval, and its command line carried the account's login email. It leads with the user's four lines (Title / Session / Action / Reason, the user's words of 2026-10-14: "widget shutdown is blocked" / "widget" / "answer the open form" / "shutdown is blocked because widget's claude session is showing a form and it can't proceed"), with the operation in lower case in the title; any stop command names the account by its canonical label (`claude4`), never the login; the body stays under 500 characters. No push ever carries an email address: a test renders every catalog example and the live holdout push from a record whose login is an email and finds no `@`. The new text passes `review.py texts --id shutdown.holdout` (unit director).
 
 **Files:**
-- `scripts/notify/push_catalog.py`, `scripts/notify/push_texts_reviewed.json`, `scripts/notify/test_push_texts.py` — the entry and its approval
-- `scripts/notify/review.py`, `scripts/notify/test_review.py` — `texts --approve --user-spec`
-- `scripts/shutdown/remote_control.py`, `scripts/shutdown/restart.py`, `scripts/shutdown/shutdown.py`, `scripts/shutdown/test_remote_control.py`, `scripts/shutdown/test_restart.py`, `scripts/shutdown/test_shutdown_cli.py` — the render call and the session name passed to it
+- `scripts/notify/push_catalog.py` — the `shutdown.holdout` text and examples
+- `scripts/notify/test_push_texts.py` — no catalog push renders an `@`
+- `scripts/notify/push_texts_reviewed.json` — the re-reviewed text's approval (unit director)
+- `scripts/shutdown/settle.py` — the holdout push names the account by label (owner shutdown-unit; also touches)
+- `scripts/shutdown/test_settle.py` — a login that is an email never reaches the push
 
-**Workers:** 1 writer (no test lane)
-- `impl` — everything above except `push_texts_reviewed.json` (the director writes approvals)
+**Workers:** 1 writer
+- `fix2` — every file above except `push_texts_reviewed.json`
 
-**Constraints from prior phases:** No test or check reaches the phone. Run every script suite, the lib suite included. Before dispatch, merge origin/build-followups into this branch: `scripts/shutdown/remote_control.py` exists only after that merge. `restart.remote_control_missing` reaches `alert_failed` two ways — through `launch_fixer` → `fix`, and directly when the fixer cannot launch — and both pass the session name. `test_shutdown_cli.py`'s `test_remote_control_cli_passes_identity_and_failure_alert_policy_to_fixer` calls the remote-control verb without `--session` and asserts `fix()`'s old arguments; update it. Phase 12: `PushText` takes `session=SessionTemplate("{session}")` (`push_texts.py`); the rendered message is `Session: …\nAction: …\n<body>`; `test_push_texts.py`'s length test counts the Session line, so the full example stays under 500 characters. The approval is recorded under the user spec as Phase 12 did: `review.py texts --id shutdown.remote_control` three times; an `ask` on the user's words is recorded, not applied, and the director records the approval with `--approve --user-spec` once it exists (the worker never runs `review.py texts`). Phase 12 wrote its holdout entry by hand with `push_texts.fingerprint(entry)`; that entry's shape is what `--user-spec` writes, plus the objections.
-
-**Acceptance gate:** every script suite green; basedpyright 0/0; the rendered example leads with the four lines exactly; tests where `{who}` differs from the session name (a production unit) show both the fixer's failure alert and the immediate alert after a failed fixer launch carrying `Session: <session name>`.
+**Acceptance gate:** `scripts/notify`, `scripts/shutdown` and `scripts/lib` suites green; basedpyright 0/0; `review.py texts --id shutdown.holdout` approves the new text; no catalog example renders an `@`.
 
 ### Phase 5 — Questions in showrunner replies  · status: todo
 
@@ -346,7 +362,7 @@ Outside `scripts/accounts/` and `scripts/whoami/`, every delegate agent is a "wo
 - `impl` — `update_registration.py`, `review.py`, `nightly_review.py` and their tests; hub: `scripts/notify/review.py`
 - `test` (opens as impl) — `showrunner_footer.py`, `stop-showrunner-footer.py`, `dailies_render.py` and their tests, produce.md sentence; publishes the `Outstanding` due-now/deferred types before `impl` changes `open_items()`
 
-**Constraints from prior phases:** `review.py` API from Phase 2 (`Draft`, `review(draft, revision)`, holds keyed by `source`, `Unreviewed` sends as written); guide tags `question`, `reply`, `all`. Phase 4: one review may take up to `review.review_timeout_seconds()` (`config/notify.conf` `REVIEW_TIMEOUT_SECONDS`, default 60 s); any wait around a review derives from `review.py`'s helpers, never a literal. `test_update_registration.py` copies the command tree into a temp directory without `scripts/notify/`, so import `review` inside the function that reviews, never at module level (a module-level import in `sweep.py` broke that test). Lengths are counted in code and each failure carries `{rule, quote}`. Phase 4: `send.py` reports a superseded push as `REPLACED`, exit 0, like `SKIPPED`. Phase 6: `footer()` appends each newly outstanding item's `text` to `outstanding/<slug>.history.jsonl` (`record_question_history`, kept 48 h), and `review.registered_questions(since)` matches reply question sentences against current outstanding texts plus those history lines for the nightly `review.py sample` count. Keep the history written when `footer()` changes, record the reviewed question (the text the reply carries) beside the item text, and have `registered_questions` read both; tests: a reviewed question counts as registered before and after its item closes, and a held batch writes no history line. `review.py` already holds `ReplyContext`, `PushReview`, `reply_questions` -> `ReplyAsks` (question and request sentences, `(recommended` choice lines; code and `>` quotes excluded) and `sample`; the footer hook's choice-line check reuses that detection, never a second detector. Phase 8: the reviewer binary is resolved by `review.reviewer_binary()` (a timer's PATH may lack `claude`); test fakes match it by basename. Phase 9: `ReviewOutcome` adds `Failed(best_version, failed_rules)` and `Withheld(why)`; a `Rewritten` is re-checked once inside a two-review budget (`delivery_waits()`); the `withhold` verdict is push mode only, so question review never returns it, and question mode keeps an `ask` awaiting facts on both first review and revision, never reply mode's revision-ask conversion to `Rewritten` (`review.py` returns `Questions` only when `not reply or not revision`); a rewrite is accepted only after its re-check approves it, and an `ask`, another rewrite or `Failed` from that re-check fails the whole registration with the review details, keeps the question's revision identity, and leaves outstanding, pending and history files unchanged. Tests: an unresolved `ask` on rerun; a rewrite whose re-check fails. Phase 9 also: every fixed phone text is a `scripts/notify/push_catalog.py` entry sent through `push_texts.user_send_argv` (or `pushover.py --text-id`), and `test_push_texts.py` fails a literal phone send (`--to user`, `--to=user`, a `pushover.py` path, `broadcast.send("user", …)`) anywhere under `scripts/` outside `push_texts.py`, `pushover.py`, `send.py` and `escalate.py`; a question review is not a push and needs no catalog entry. `review.py` also holds the `texts` subcommand and its approval file `push_texts_reviewed.json`; keep `test_push_texts.py` green when `review.py` changes. Dry clarity checks use the worktree's `scripts/notify/review.py`; the installed `~/.claude` copy can lag. Merge origin/build-followups before dispatch: other units' recent work touches `test_update_registration.py`.
+**Constraints from prior phases:** `review.py` API from Phase 2 (`Draft`, `review(draft, revision)`, holds keyed by `source`, `Unreviewed` sends as written); guide tags `question`, `reply`, `all`. Phase 4: one review may take up to `review.review_timeout_seconds()` (`config/notify.conf` `REVIEW_TIMEOUT_SECONDS`, default 60 s); any wait around a review derives from `review.py`'s helpers, never a literal. `test_update_registration.py` copies the command tree into a temp directory without `scripts/notify/`, so import `review` inside the function that reviews, never at module level (a module-level import in `sweep.py` broke that test). Lengths are counted in code and each failure carries `{rule, quote}`. Phase 4: `send.py` reports a superseded push as `REPLACED`, exit 0, like `SKIPPED`. Phase 6: `footer()` appends each newly outstanding item's `text` to `outstanding/<slug>.history.jsonl` (`record_question_history`, kept 48 h), and `review.registered_questions(since)` matches reply question sentences against current outstanding texts plus those history lines for the nightly `review.py sample` count. Keep the history written when `footer()` changes, record the reviewed question (the text the reply carries) beside the item text, and have `registered_questions` read both; tests: a reviewed question counts as registered before and after its item closes, and a held batch writes no history line. `review.py` already holds `ReplyContext`, `PushReview`, `reply_questions` -> `ReplyAsks` (question and request sentences, `(recommended` choice lines; code and `>` quotes excluded) and `sample`; the footer hook's choice-line check reuses that detection, never a second detector. Phase 8: the reviewer binary is resolved by `review.reviewer_binary()` (a timer's PATH may lack `claude`); test fakes match it by basename. Phase 9: `ReviewOutcome` adds `Failed(best_version, failed_rules)` and `Withheld(why)`; a `Rewritten` is re-checked once inside a two-review budget (`delivery_waits()`); the `withhold` verdict is push mode only, so question review never returns it, and question mode keeps an `ask` awaiting facts on both first review and revision, never reply mode's revision-ask conversion to `Rewritten` (`review.py` returns `Questions` only when `not reply or not revision`); a rewrite is accepted only after its re-check approves it, and an `ask`, another rewrite or `Failed` from that re-check fails the whole registration with the review details, keeps the question's revision identity, and leaves outstanding, pending and history files unchanged. Tests: an unresolved `ask` on rerun; a rewrite whose re-check fails. Phase 9 also: every fixed phone text is a `scripts/notify/push_catalog.py` entry sent through `push_texts.user_send_argv` (or `pushover.py --text-id`), and `test_push_texts.py` fails a literal phone send (`--to user`, `--to=user`, a `pushover.py` path, `broadcast.send("user", …)`) anywhere under `scripts/` outside `push_texts.py`, `pushover.py`, `send.py` and `escalate.py`; a question review is not a push and needs no catalog entry. `review.py` also holds the `texts` subcommand and its approval file `push_texts_reviewed.json`; keep `test_push_texts.py` green when `review.py` changes. Phase 13: the approval file is read only through `review.text_approvals()` (typed at the JSON boundary; a `TextApproval` may carry `objections`), `texts --approve --user-spec SOURCE` records user-written text with the reviewer's objections kept, and approving an id keeps records for exactly its current examples. Dry clarity checks use the worktree's `scripts/notify/review.py`; the installed `~/.claude` copy can lag. Merge origin/build-followups before dispatch: other units' recent work touches `test_update_registration.py`.
 
 **Acceptance gate:** Test lines for `scripts/production`, `scripts/hooks`, `scripts/notify` green; basedpyright 0/0; tests cover a held question failing registration, its rerun accepted, a reply missing the reviewed text blocked, an unrecorded `(recommended` line blocked, a question beginning `Session:` kept intact, a question record left out of the nightly push count; `scripts/nightly_review` tests green.
 

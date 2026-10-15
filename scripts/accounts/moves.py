@@ -5,9 +5,12 @@ import fcntl
 import json
 import os
 from dataclasses import dataclass
+from importlib import import_module
 from datetime import datetime
 from pathlib import Path
-from typing import Literal, NotRequired, TypedDict, cast, override
+from typing import Literal, NotRequired, TypedDict, Protocol, cast, override, assert_never
+
+from scripts.accounts import worker_names
 
 
 @dataclass(frozen=True)
@@ -25,6 +28,7 @@ HistoricalAccountLabel = str | HomeAccountUnresolved
 
 
 class MoveCommon(TypedDict):
+    request_id: NotRequired[str]
     at: str
     tool: Literal["claude", "codex"]
     subject: str
@@ -37,14 +41,14 @@ RequestedFields = TypedDict("RequestedFields", {"from": HistoricalAccountLabel, 
 
 class RequestedMove(MoveCommon, RequestedFields):
     kind: Literal["requested"]
-    cause: NotRequired[Literal["credits off"]]
+    cause: NotRequired[Literal["refusal", "credits off", "by hand"]]
 
 
 class ConfirmedMove(MoveCommon):
     kind: Literal["confirmed"]
     home: NotRequired[str]
     config_dir: NotRequired[str]
-    seat: NotRequired[str]
+    worker: NotRequired[str]
     run: NotRequired[str]
 
 
@@ -76,6 +80,46 @@ class RoomAgainMove(MoveCommon):
 MoveEntry = RequestedMove | ConfirmedMove | FailedMove | WaitedMove | WaitEndedMove | NoRoomMove | RoomAgainMove
 
 
+@dataclass(frozen=True)
+class UnknownFallbackOwner:
+    """The routing has no recorded numbered owner."""
+
+    @override
+    def __str__(self) -> str:
+        return "owner unknown"
+
+
+class RoutingCommon(TypedDict):
+    at: str
+    tool: Literal["codex"]
+    fallback_at: str
+    owner: str | UnknownFallbackOwner
+
+
+class RoutedToClaude(RoutingCommon):
+    kind: Literal["routed to claude"]
+    cause: Literal["refusal", "credits off"]
+    moved: list[str]
+
+
+class RoutedBack(RoutingCommon):
+    kind: Literal["routed back"]
+    restored: list[str]
+    kept: list[str]
+
+
+class RoutingNotRestored(RoutingCommon):
+    kind: Literal["routing not restored"]
+    outcome: Literal["partial", "failed"]
+    restored: list[str]
+    kept: list[str]
+    failed: list[str]
+
+
+RoutingEntry = RoutedToClaude | RoutedBack | RoutingNotRestored
+JournalEntry = MoveEntry | RoutingEntry
+
+
 def store_file() -> Path:
     return Path.home() / ".local" / "state" / "accounts" / "moves.jsonl"
 
@@ -84,7 +128,30 @@ def _valid(value: object) -> bool:
     if not isinstance(value, dict):
         return False
     fields = cast(dict[str, object], value)
+    kind = fields.get("kind")
+    if kind in ("routed to claude", "routed back", "routing not restored"):
+        if "move_id" in fields or "subject" in fields or fields.get("tool") != "codex":
+            return False
+        if not isinstance(fields.get("owner"), (str, UnknownFallbackOwner)):
+            return False
+        try:
+            for key in ("at", "fallback_at"):
+                stamp = fields.get(key)
+                if not isinstance(stamp, str) or datetime.fromisoformat(stamp).tzinfo is None:
+                    return False
+        except ValueError:
+            return False
+        keys = ("moved",) if kind == "routed to claude" else ("restored", "kept")
+        if kind == "routed to claude" and fields.get("cause") not in ("refusal", "credits off"):
+            return False
+        if kind == "routing not restored":
+            if fields.get("outcome") not in ("partial", "failed"):
+                return False
+            keys += ("failed",)
+        return all(isinstance(fields.get(key), list) and all(isinstance(item, str) for item in cast(list[object], fields[key])) for key in keys)
     if not all(isinstance(fields.get(key), str) and fields[key] for key in ("at", "subject", "move_id")):
+        return False
+    if "request_id" in fields and (not isinstance(fields["request_id"], str) or not fields["request_id"]):
         return False
     if fields.get("tool") not in ("claude", "codex"):
         return False
@@ -100,7 +167,7 @@ def _valid(value: object) -> bool:
     if "window" in fields and fields["window"] not in ("weekly", "five_hour", "unknown"):
         return False
     kind = fields.get("kind")
-    if "cause" in fields and (kind != "requested" or fields["cause"] != "credits off"):
+    if "cause" in fields and (kind != "requested" or fields["cause"] not in ("refusal", "credits off", "by hand")):
         return False
     if kind in ("requested", "waited") and "reset" in fields:
         if not isinstance(fields["reset"], str) or not fields["reset"]:
@@ -110,7 +177,7 @@ def _valid(value: object) -> bool:
                 "wait ended": (), "no room": ("earliest_reset",), "room again": ("label",)}
     if kind == "confirmed":
         return (isinstance(fields.get("home"), str) or isinstance(fields.get("config_dir"), str)) and (
-            "seat" not in fields or isinstance(fields["seat"], str))
+            "worker" not in fields or isinstance(fields["worker"], str))
     return isinstance(kind, str) and kind in required and all(isinstance(fields.get(key), str) for key in required[kind])
 
 
@@ -134,8 +201,9 @@ def append_move(entry: MoveEntry) -> None:
         raise ValueError("name the account by number")
     path = store_file()
     path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("a+", encoding="utf-8") as output:
+    with os.fdopen(os.open(path, os.O_RDWR | os.O_CREAT, 0o600), "r+", encoding="utf-8") as output:
         fcntl.flock(output.fileno(), fcntl.LOCK_EX)
+        _ = worker_names.migrate_locked_journal(output)
         if entry["kind"] in ("confirmed", "wait ended", "room again"):
             _ = output.seek(0)
             for line in output:
@@ -148,13 +216,14 @@ def append_move(entry: MoveEntry) -> None:
                     if (held.get("kind") == entry["kind"] and held.get("move_id") == entry["move_id"]
                             and held.get("tool") == entry["tool"] and held.get("subject") == entry["subject"]
                             and (entry["kind"] != "confirmed" or
-                                 (held.get("seat") == entry.get("seat") and held.get("run") == entry.get("run")))):
+                                 (held.get("worker") == entry.get("worker") and held.get("run") == entry.get("run")))):
                         return
+        _ = output.seek(0, os.SEEK_END)
         _ = output.write(json.dumps(entry, sort_keys=True) + "\n")
         output.flush()
 
 
-def read_moves() -> list[MoveEntry]:
+def read_journal() -> list[JournalEntry]:
     """Read valid transitions in order, skipping malformed or incomplete lines."""
     # Keep this module a standard-library leaf until a journal is actually read.
     from scripts.whoami.note_file import NumberedAccountLabel, parse_account_label
@@ -194,25 +263,98 @@ def read_moves() -> list[MoveEntry]:
         return numbered(matching[-1].label, tool) if matching else HomeAccountUnresolved(home)
 
     try:
-        with store_file().open(encoding="utf-8") as source:
-            fcntl.flock(source.fileno(), fcntl.LOCK_SH)
-            lines = source.readlines()
+        with store_file().open("r+", encoding="utf-8") as source:
+            fcntl.flock(source.fileno(), fcntl.LOCK_EX)
+            lines = worker_names.migrate_locked_journal(source)
     except FileNotFoundError:
         return []
-    entries: list[MoveEntry] = []
+    entries: list[JournalEntry] = []
     for line in lines:
         try:
             value = cast(object, json.loads(line))
         except ValueError:
             continue
         if _valid(value):
+            raw = cast(dict[str, object], value)
+            if raw["kind"] in ("routed to claude", "routed back", "routing not restored"):
+                raw["owner"] = _routing_owner(raw["owner"])
+                entries.append(cast(RoutingEntry, cast(object, raw)))
+                continue
             entry = _canonical_entry(cast(MoveEntry, value))
             fields: dict[str, object] = dict(entry)
             for field in ("from", "to", "label"):
                 if fields.get(field) == "default":
                     fields[field] = historical(entry, field)
+            if fields["kind"] == "requested":
+                _ = fields.setdefault("cause", "refusal")
             entries.append(cast(MoveEntry, cast(object, fields)))
     return entries
+
+
+def account_moves(journal: list[JournalEntry]) -> list[MoveEntry]:
+    """Narrow journal entries exhaustively to account transitions."""
+    entries: list[MoveEntry] = []
+    for entry in journal:
+        match entry["kind"]:
+            case "requested" | "confirmed" | "failed" | "waited" | "wait ended" | "no room" | "room again":
+                entries.append(entry)
+                continue
+            case "routed to claude" | "routed back" | "routing not restored":
+                continue
+        assert_never(entry)
+    return entries
+
+
+def read_moves() -> list[MoveEntry]:
+    """Account transitions only; work routing never participates in a move."""
+    return account_moves(read_journal())
+
+
+def _routing_owner(value: object) -> str | UnknownFallbackOwner:
+    from scripts.whoami.note_file import NumberedAccountLabel
+
+    class RoutingOwnerLabels(Protocol):
+        AccountsError: type[Exception]
+
+        def numbered_account_label(self, label: str, tool: Literal["claude", "codex"]) -> NumberedAccountLabel: ...
+
+    if isinstance(value, str) and value not in ("unknown", "default"):
+        # Resolve the shared input parser lazily: accounts also consumes this journal.
+        accounts = cast(RoutingOwnerLabels, cast(object, import_module("scripts.accounts.accounts")))
+        try:
+            return accounts.numbered_account_label(value, "codex").label
+        except accounts.AccountsError:
+            pass
+    return UnknownFallbackOwner()
+
+
+def append_routing(entry: RoutingEntry) -> None:
+    """Append a routing outcome once, under the account journal's writer lock."""
+    if not _valid(entry):
+        raise ValueError("invalid work routing")
+    if entry["owner"] == "default":
+        raise ValueError("name the account by number")
+    owner = _routing_owner(entry["owner"])
+    saved: dict[str, object] = dict(entry)
+    saved["owner"] = owner if isinstance(owner, str) else "unknown"
+    path = store_file()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with os.fdopen(os.open(path, os.O_RDWR | os.O_CREAT, 0o600), "r+", encoding="utf-8") as output:
+        fcntl.flock(output.fileno(), fcntl.LOCK_EX)
+        _ = worker_names.migrate_locked_journal(output)
+        _ = output.seek(0)
+        for line in output:
+            try:
+                previous = cast(object, json.loads(line))
+            except ValueError:
+                continue
+            if _valid(previous):
+                held = cast(dict[str, object], previous)
+                if held.get("kind") == entry["kind"] and held.get("fallback_at") == entry["fallback_at"]:
+                    return
+        _ = output.seek(0, os.SEEK_END)
+        _ = output.write(json.dumps(saved, sort_keys=True) + "\n")
+        output.flush()
 
 
 @dataclass(frozen=True)
@@ -224,7 +366,7 @@ class HomeAccountEvidence:
 
 def _role_evidence(path: Path) -> list[HomeAccountEvidence]:
     try:
-        lines = path.read_text(encoding="utf-8").splitlines()
+        lines = worker_names.role_history_lines(path)
     except (OSError, UnicodeError):
         return []
     found: list[HomeAccountEvidence] = []
@@ -235,7 +377,7 @@ def _role_evidence(path: Path) -> list[HomeAccountEvidence]:
                 continue
             row = cast(dict[str, object], raw)
             role, at = row.get("role"), row.get("at")
-            if role not in ("unit", "seats") or not isinstance(at, str):
+            if role not in ("unit", "workers") or not isinstance(at, str):
                 continue
             tool = "claude" if role == "unit" else "codex"
             account_label = row.get("account_label")

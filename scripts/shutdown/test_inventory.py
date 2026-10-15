@@ -166,7 +166,7 @@ class InventoryTests(ShutdownTestCase):
                     )
                     self.assertEqual({session["session_id"] for session in found["sessions"]}, expected)
                     for session in found["sessions"]:
-                        if session["kind"] == "seat":
+                        if session["kind"] == "worker":
                             self.assertEqual(session["owner"], {"kind": "director", "session_id": DIRECTOR_ID})
 
     def test_inventory_only_builds_expensive_fields_for_selected_ids(self) -> None:
@@ -789,8 +789,8 @@ elif "comm=" in joined:
             },
         )
 
-        worker = cast(inventory.SeatSession, by_id[WORKER_ID])
-        self.assertEqual(worker["kind"], "seat")
+        worker = cast(inventory.WorkerSession, by_id[WORKER_ID])
+        self.assertEqual(worker["kind"], "worker")
         self.assertEqual(
             worker["owner"], {"kind": "director", "session_id": DIRECTOR_ID}
         )
@@ -1154,11 +1154,11 @@ elif "comm=" in joined:
         _ = current.replace(previous)
         found = inventory.inventory(TARGET_LOGIN)
         worker = next(session for session in found["sessions"] if session["session_id"] == WORKER_ID)
-        self.assertEqual(worker["kind"], "seat")
-        self.assertEqual(cast(inventory.SeatSession, worker)["owner"],
+        self.assertEqual(worker["kind"], "worker")
+        self.assertEqual(cast(inventory.WorkerSession, worker)["owner"],
                          {"kind": "director", "session_id": DIRECTOR_ID})
         late_worker = next(session for session in found["sessions"] if session["session_id"] == DESKTOP_ID)
-        self.assertEqual(cast(inventory.SeatSession, late_worker)["owner"], {"kind": "no director"})
+        self.assertEqual(cast(inventory.WorkerSession, late_worker)["owner"], {"kind": "no director"})
         self.assertTrue(previous.samefile(current))
         self.assertEqual(current.stat().st_mtime_ns, modified)
         _ = inventory.inventory(TARGET_LOGIN)
@@ -1169,8 +1169,8 @@ elif "comm=" in joined:
         modified = current.stat().st_mtime_ns
         found = inventory.inventory(TARGET_LOGIN)
         late_worker = next(session for session in found["sessions"] if session["session_id"] == DESKTOP_ID)
-        self.assertEqual(late_worker["kind"], "seat")
-        self.assertEqual(cast(inventory.SeatSession, late_worker)["owner"],
+        self.assertEqual(late_worker["kind"], "worker")
+        self.assertEqual(cast(inventory.WorkerSession, late_worker)["owner"],
                          {"kind": "director", "session_id": DIRECTOR_ID})
         self.assertTrue(previous.samefile(current))
         self.assertEqual(current.stat().st_mtime_ns, modified)
@@ -1184,7 +1184,7 @@ elif "comm=" in joined:
             [
                 (session["session_id"], session["owner"])
                 for session in found["sessions"]
-                if session["kind"] == "seat"
+                if session["kind"] == "worker"
             ],
             [(WORKER_ID, {"kind": "director", "session_id": DIRECTOR_ID})],
         )
@@ -1211,7 +1211,7 @@ elif "comm=" in joined:
         by_id = {session["session_id"]: session for session in found["sessions"]}
 
         unit = cast(inventory.UnitSession, by_id[UNIT_ID])
-        worker = cast(inventory.SeatSession, by_id[WORKER_ID])
+        worker = cast(inventory.WorkerSession, by_id[WORKER_ID])
         self.assertEqual(unit["host"]["plan"], {"kind": "no run record"})
         self.assertEqual(by_id[DESKTOP_ID]["model"], {"kind": "no reply yet"})
         self.assertEqual(worker["owner"], {"kind": "no director"})

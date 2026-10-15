@@ -1,6 +1,6 @@
 ---
 description: Show account groups, move a group or ad hoc session, or swap Codex workers.
-argument-hint: '[--detail | pick claude|codex [--exclude <label>] [--keep <label>] [--explain] | move <session-id|name> claudeN [--dry-run] [--why <text>] | move units|showrunners claudeN [--dry-run] [--why <text>] | setup claudeN | setup codexN | check codexN | role seats | set-role seats codexN | swap seats codexN [--dry-run]]'
+argument-hint: '[--detail | pick claude|codex [--exclude <label>] [--keep <label>] [--explain] | move <session-id|name> claudeN [--dry-run] [--why <text>] | move units|showrunners claudeN [--dry-run] [--why <text>] | setup claudeN | setup codexN | check codexN | role workers | set-role workers codexN | swap workers codexN [--dry-run]]'
 ---
 
 # Accounts
@@ -10,9 +10,10 @@ and print its output exactly as it comes, with nothing added.
 
 - No arguments: the units and showrunners accounts, then one Markdown table, a row for `~/.claude` and each `~/.claudeN`,
   logged in or not, and for each Codex account, then a line for anything wrong in a folder. Nothing else.
-- `--detail`: the same, then each live session's account, the Codex seats line with its refusal destination
-  and held worker continuations, and the last ten move entries with their outcomes.
+- `--detail`: the same, then each live session's account, the Codex workers line with its refusal destination
+  and held worker continuations, the last ten account moves with their cause and outcomes, and `Codex work routing:` with open, recovered or failed assignment fallbacks.
 - An argument it does not recognise: run the no-argument form instead and print only its output, with no explanation.
+- A proof refusal affects only its ungrouped probe; it changes no account refusal or other session’s pick. Hand moves record `by hand`; group retries keep their transition ID and cause.
 - Claude sessions refused by the provider move automatically on the notes timer;
   the shutdown progress line keeps their target and reason visible until safe to stop.
 - `setup claudeN`: builds the folder and prints how to log in.
@@ -26,8 +27,8 @@ and print its output exactly as it comes, with nothing added.
 - `move units|showrunners claudeN [--dry-run]`: selects the group account and moves off-target members. A preview writes nothing and shows each name/id with `pause, then move` or `reap and restart now`, its source account and reason. A fresh exhausted target with no credits refuses before writes; a missing or stale reading is named and permits the move. A missing showrunner registration names the repair command to run inside that showrunner's own session. An empty group still selects its account.
 - Prompt-taking members pause and mark ready; refused or exhausted members reap and restart immediately, with process identity checks. A terminal run follows every source request, even if one needs help; Ctrl-C detaches without cancelling. The group move-back command names its previous stored account, or its common source when no account was stored; mixed sources without a stored account get no command. A single-session move-back command names its source. Supervised alias-started sessions keep their window and scroll history across restarts.
 - Codex numbers name logins, including a login held in `~/.codex`; setup still uses `~/.codexN`. Each Codex note has `use_credits: on|off` (absent means on); off removes paid-credit room at an exhausted window. Weekly 0% sends one phone/showrunner notice; on stays with hourly forecasts, off prefers weekly room, then another account’s paid credits; no destination or a failed move sends Codex work to Claude until the earliest refill.
-- `role seats` shows the selection; `set-role seats codexN` selects future turns.
-- `swap seats codexN [--dry-run]` checks usage and moves every run at its next turn;
+- `role workers` shows the selection; `set-role workers codexN` selects future turns.
+- `swap workers codexN [--dry-run]` checks usage and moves every run at its next turn;
   working workers finish first. A number resolves to the home holding its note’s login, including `~/.codex`.
 
 Changing the login in `~/.claude` remains `/login` in a `~/.claude` session.

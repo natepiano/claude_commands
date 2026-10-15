@@ -83,6 +83,9 @@ class CommandLine(argparse.Namespace):
     restart: bool = False
     target: str = ""
     why: str = ""
+    move_id: str = ""
+    refused: str = ""
+    reset: datetime | None = None
     session_id: str = ""
     pid: int = 0
     proc_start: str = ""
@@ -383,7 +386,7 @@ def resolve_sessions(login: str, items: Iterable[str], *, here: bool = False) ->
         owner = saved["session"]
         local[owner["session_id"]] = _SelectableSession(owner["session_id"], owner["name"], saved["machine"])
     for owner in listing(login):
-        if owner.kind != "seat":
+        if owner.kind != "worker":
             local[owner.session_id] = _SelectableSession(owner.session_id, owner.name, local_machine)
     candidates = dict(local)
     peer_unavailable = False
@@ -408,7 +411,7 @@ def resolve_sessions(login: str, items: Iterable[str], *, here: bool = False) ->
                     peer_unavailable = True
                 else:
                     for owner in report["sessions"]:
-                        if owner["kind"] != "seat":
+                        if owner["kind"] != "worker":
                             _ = candidates.setdefault(owner["session_id"], _SelectableSession(owner["session_id"], owner["name"], report["machine"]))
         if peer_unavailable:
             print(f"{other_machine()}: not reached; names checked on {local_machine} only", file=sys.stderr)
@@ -642,7 +645,7 @@ def held_session_ids() -> list[str]:
         {
             session["session_id"]
             for record in all_session_records()
-            for session in [record["session"], *record["seats"]]
+            for session in [record["session"], *record["workers"]]
         }
     )
 
@@ -678,6 +681,23 @@ def main(arguments: list[str] | None = None) -> int:
                 raise argparse.ArgumentError(self, str(error)) from error
 
     _ = down.add_argument("--to", dest="target", action=NumberedClaudeTarget, default="", help="resume on claudeN")
+
+    class AwareReset(argparse.Action):
+        @override
+        def __call__(self, parser: argparse.ArgumentParser, namespace: argparse.Namespace,
+                     values: object, option_string: str | None = None) -> None:
+            assert isinstance(values, str)
+            try:
+                reset = datetime.fromisoformat(values)
+                if reset.tzinfo is None:
+                    raise ValueError("reset needs a timezone offset")
+            except ValueError as error:
+                raise argparse.ArgumentError(self, "--reset requires an aware ISO time") from error
+            namespace.reset = reset
+
+    _ = down.add_argument("--refused", choices=("weekly", "five_hour", "unknown"), default="")
+    _ = down.add_argument("--reset", action=AwareReset)
+    _ = down.add_argument("--move-id", default="", help=argparse.SUPPRESS)
     _ = down.add_argument("--why", default="", help="reason for the account move")
     _ = down.add_argument("--requested-by", help=argparse.SUPPRESS)
     _ = down.add_argument("--request-id", default="", help=argparse.SUPPRESS)
@@ -741,6 +761,8 @@ def main(arguments: list[str] | None = None) -> int:
     _ = ownership.add_argument("--here", action="store_true")
     _ = commands.add_parser("held-sessions")
     options = cast(CommandLine, parser.parse_args(arguments))
+    if options.command == "down" and options.reset is not None and not options.refused:
+        parser.error("--reset requires --refused")
 
     if options.command == "remote-control":
         if options.pid <= 0 or not options.proc_start:
@@ -872,12 +894,19 @@ def main(arguments: list[str] | None = None) -> int:
         if options.command == "down":
             if isinstance(down_report, settle.InventoryNeeded):
                 down_report = inventory(selected.login)
+            from scripts.accounts import accounts
+            from scripts.accounts.refusals import KnownReset, NoResetKnown
+            move_origin: accounts.MoveOrigin = accounts.HandOrigin()
+            if options.refused:
+                move_origin = accounts.RefusalOrigin(cast(Literal["weekly", "five_hour", "unknown"], options.refused),
+                    KnownReset(options.reset) if options.reset is not None else NoResetKnown())
             return settle.down(
                 selected, options.here, ids,
                 then="restart" if options.restart else "stop",
                 alerts="none" if options.no_alert else "user",
                 requested_by=options.requested_by, request_id=options.request_id,
                 target=options.target, why=options.why, report=down_report,
+                origin=move_origin, move_id=options.move_id,
             )
         if options.command == "now":
             return settle.now(selected, options.here, ids)

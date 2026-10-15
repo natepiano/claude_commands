@@ -17,6 +17,9 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Literal, NotRequired, TypedDict, cast
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from scripts.production.showrunners import canonical_slug  # noqa: E402
+
 ReviewerType = Literal["code", "ui"]
 Split = Literal["hash", "all", "off"]
 
@@ -266,6 +269,7 @@ def _production(value: str) -> ProductionPool:
     slug = Path(value).name.removesuffix("-production.md")
     if slug in ("", ".", ".."):
         raise PoolError("production must name a production or slug")
+    slug = canonical_slug(slug)
     root = Path(os.environ.get("REVIEW_POOL_STATE", "~/.local/state/review-pool")).expanduser()
     return ProductionPool((root / slug).resolve())
 

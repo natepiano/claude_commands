@@ -16,6 +16,8 @@ from pathlib import Path
 from typing import TYPE_CHECKING, cast, override
 from zoneinfo import ZoneInfo
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
 if TYPE_CHECKING:
     from herdr import SessionListResult
 
@@ -437,6 +439,43 @@ raise SystemExit(1 if record['to'] in fail else 0)
                 for path in self.state.glob("*.json"):
                     path.unlink()
 
+    def compacted(self, *entries: dict[str, object]) -> None:
+        """The pane after an idle compaction, and a transcript whose last turn holds `entries`."""
+        self.panes["unit-one"]["pane"] = "✻ Conversation compacted (ctrl+o for history)\n"
+        transcript = self.projects / "project" / "sid-unit-one.jsonl"
+        after = [{"type": "system", "subtype": "compact_boundary"},
+                 {"type": "user", "message": {"content": "summary: the unit was holding: on the user"}},
+                 {"type": "attachment"}]
+        _ = transcript.write_text("".join(json.dumps(entry) + "\n" for entry in (*entries, *after)))
+        os.utime(transcript, (START - 3600, START - 3600))
+
+    @staticmethod
+    def said(*blocks: dict[str, str]) -> dict[str, object]:
+        return {"type": "assistant", "message": {"content": list(blocks)}}
+
+    def test_a_compacted_pane_reads_a_blocked_turn_end_from_the_transcript(self) -> None:
+        self.compacted(self.said({"type": "text", "text": "Ready for the check."}),
+                       self.said({"type": "thinking", "thinking": ""}),
+                       self.said({"type": "text", "text": "Waiting.\n\n— blocked: the user's Ghostty check"}))
+        self.assertEqual(self.tick(START).returncode, 0)
+        self.assertEqual(self.tick(START + 3600).returncode, 0)
+        self.assertEqual(self.sent(), [])
+
+    def test_a_compacted_pane_bumps_when_the_transcript_turn_holds_or_went_on(self) -> None:
+        for last, status in (([self.said({"type": "text", "text": "— holding: waiting on the tests"})],
+                              "— holding: waiting on the tests"),
+                             ([self.said({"type": "text", "text": "— blocked: the user's Ghostty check"}),
+                               self.said({"type": "tool_use", "name": "Bash"})], "none on screen")):
+            with self.subTest(status=status):
+                self.compacted(*last)
+                self.assertEqual(self.tick(START).returncode, 0)
+                self.assertEqual(self.tick(START + 300).returncode, 0)
+                tell = next(item for item in self.sent() if item["key"].endswith(":tell"))
+                self.assertIn(f"Last status: {status}", tell["text"])
+                self.send_log.unlink()
+                for path in self.state.glob("*.json"):
+                    path.unlink()
+
     def test_holding_turn_end_still_bumps_idle_unit(self) -> None:
         self.configure({"showrunner": ["unit-one"]}, stall_minutes=10)
         self.panes["unit-one"]["pane"] = "— holding: waiting on a decision\n"
@@ -527,6 +566,40 @@ raise SystemExit(1 if record['to'] in fail else 0)
                 _ = self.tick(START + 300)
                 self.assertEqual(len(self.sent()), bumps)
                 _ = self.process_rows.pop()
+
+    def test_detached_work_with_a_former_production_mark_prevents_a_bump(self) -> None:
+        doc = self.root / "showrunner-production.md"
+        _ = doc.write_text("## Production Context\n\n- **Formerly:** `old-showrunner`\n\n" + doc.read_text())
+        self.panes["unit-one"]["slug"] = "old-showrunner"
+        worker = subprocess.Popen(["sleep", "60"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                  env={**self.environment, "SHOWRUNNER_UNIT": "old-showrunner",
+                                       "SHOWRUNNER_UNIT_ID": "unit-one"})
+        self.children.append(worker)
+        self.process_rows.append(f"{worker.pid} 1 sleep 60")
+        for at in (START, START + 300):
+            result = self.tick(at)
+            self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.sent(), [])
+        _ = self.process_rows.pop()
+        result = self.tick(START + 600)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual({item["key"].rsplit(":", 1)[-1] for item in self.sent()}, {"bump", "tell"})
+
+    def test_detached_processes_share_one_slug_resolution_per_work_check(self) -> None:
+        import stall_watch
+        import showrunners
+
+        doc = self.root / "showrunner-production.md"
+        _ = doc.write_text("## Production Context\n\n- **Formerly:** `old-showrunner`\n\n" + doc.read_text())
+        rows = [stall_watch.Process(10, 1, "claude"), stall_watch.Process(20, 1, "build"),
+                stall_watch.Process(21, 1, "build")]
+        with (mock.patch.object(showrunners, "NOTIFIER_STATE_DIR", self.notifier),
+              mock.patch.object(stall_watch, "unit_marks", return_value=("old-showrunner", "unit-one")),
+              mock.patch.object(showrunners, "checked_doc", wraps=showrunners.checked_doc) as reads):
+            self.assertFalse(stall_watch.work_running(10, rows, ("unrelated", "unit-one")))
+            self.assertEqual(reads.call_count, 1)
+            self.assertTrue(stall_watch.work_running(10, rows, ("showrunner", "unit-one")))
+            self.assertEqual(reads.call_count, 2)
 
     def test_recent_transcript_or_subagent_activity_prevents_a_bump(self) -> None:
         _ = self.tick(START)

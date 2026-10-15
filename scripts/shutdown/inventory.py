@@ -254,8 +254,8 @@ class UnitSession(SessionFields):
     host: UnitHost
 
 
-class SeatSession(SessionFields):
-    kind: Literal["seat"]
+class WorkerSession(SessionFields):
+    kind: Literal["worker"]
     host: SessionHost
     owner: WorkerOwner
 
@@ -265,7 +265,7 @@ class TopLevelSession(SessionFields):
     host: SessionHost
 
 
-Session = ShowrunnerSession | UnitSession | SeatSession | TopLevelSession
+Session = ShowrunnerSession | UnitSession | WorkerSession | TopLevelSession
 
 
 @dataclass(frozen=True)
@@ -276,7 +276,7 @@ class ListedSession:
     pid: int
     proc_start: str
     name: str
-    kind: Literal["showrunner", "unit", "seat", "top-level"]
+    kind: Literal["showrunner", "unit", "worker", "top-level"]
     config_dir: Path
     login: str
     # Empty for sessions outside a registered production.
@@ -685,7 +685,7 @@ def parse_session(value: object, place: str, *, require_updated_at: bool = False
     """Validate and return one session from an inventory or shutdown record."""
     data = _wire_object(value, place)
     kind = _wire_kind(data, place)
-    if kind not in {"showrunner", "unit", "seat", "top-level"}:
+    if kind not in {"showrunner", "unit", "worker", "top-level"}:
         raise InvalidInventory(f"{place}.kind is invalid")
     servers = [
         _parse_codex_server(item, f"{place}.codex_servers[{index}]")
@@ -750,7 +750,7 @@ def parse_session(value: object, place: str, *, require_updated_at: bool = False
         parsed["doc"] = _wire_string(
             _wire_required(data, "doc", place), f"{place}.doc"
         )
-    elif kind == "seat":
+    elif kind == "worker":
         parsed["owner"] = _parse_owner(
             _wire_required(data, "owner", place), f"{place}.owner"
         )
@@ -1494,13 +1494,13 @@ def _listed_session(
     production = productions.get(session_id)
     unit = units.get(session_id)
     if production is not None:
-        kind: Literal["showrunner", "unit", "seat", "top-level"] = "showrunner"
+        kind: Literal["showrunner", "unit", "worker", "top-level"] = "showrunner"
         slug, doc = production.slug, production.doc
     elif unit is not None:
         kind = "unit"
         slug, doc = unit.production, unit.doc
     else:
-        kind = "seat" if record.get("kind") == "bg" else "top-level"
+        kind = "worker" if record.get("kind") == "bg" else "top-level"
         slug, doc = "", ""
     return ListedSession(
         session_id=session_id,
@@ -1611,10 +1611,10 @@ def inventory(
                 "kind": "unit",
                 "host": _host(record, unit, plans, desktops),
             }
-        elif kind == "seat":
+        elif kind == "worker":
             value = {
                 **common,
-                "kind": "seat",
+                "kind": "worker",
                 "host": _host(record, None, plans, desktops),
                 "owner": (
                     {"kind": "director", "session_id": owner}

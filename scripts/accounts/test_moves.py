@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import base64
+import fcntl
 import json
 import os
 import tempfile
@@ -23,19 +24,19 @@ class MoveJournalTests(unittest.TestCase):
         self.home = Path(self.enterContext(tempfile.TemporaryDirectory()))
         _ = cast(object, self.enterContext(patch.dict(os.environ, {"HOME": str(self.home)}, clear=True)))
 
-    def common(self, *, tool: str = "codex", subject: str = "seats") -> moves.MoveCommon:
+    def common(self, *, tool: str = "codex", subject: str = "workers") -> moves.MoveCommon:
         self.assertIn(tool, ("claude", "codex"))
         return moves.MoveCommon(at="2026-10-13T12:00:00+00:00",
             tool="claude" if tool == "claude" else "codex", subject=subject, move_id="transition-1")
 
     def requested(self) -> moves.RequestedMove:
         return {**self.common(), "kind": "requested", "from": "codex1", "to": "codex2",
-            "why": "quota refusal", "window": "unknown"}
+            "why": "quota refusal", "window": "unknown", "cause": "refusal"}
 
     def test_every_transition_kind_round_trips_without_losing_its_semantics(self) -> None:
         entries: list[moves.MoveEntry] = [
             self.requested(),
-            moves.ConfirmedMove(**self.common(), kind="confirmed", home="/temporary/codex2", seat="seat-a"),
+            moves.ConfirmedMove(**self.common(), kind="confirmed", home="/temporary/codex2", worker="worker-a"),
             moves.ConfirmedMove(**self.common(tool="claude", subject="conversation: unit"),
                 kind="confirmed", config_dir="/temporary/claude3"),
             moves.FailedMove(**self.common(), kind="failed", reason="old writer still live"),
@@ -72,9 +73,9 @@ class MoveJournalTests(unittest.TestCase):
         roles = path.with_name("roles.jsonl")
         evidence = [
             {"at": "2026-10-12T00:00:00Z", "role": "unit", "label": "default", "account_label": "claude2"},
-            {"at": "2026-10-12T00:00:00Z", "role": "seats", "label": "default", "account_label": "codex2"},
+            {"at": "2026-10-12T00:00:00Z", "role": "workers", "label": "default", "account_label": "codex2"},
             {"at": "2026-10-14T00:00:00Z", "role": "unit", "label": "default", "account_label": "claude3"},
-            {"at": "2026-10-14T00:00:00Z", "role": "seats", "label": "default", "account_label": "codex3"},
+            {"at": "2026-10-14T00:00:00Z", "role": "workers", "label": "default", "account_label": "codex3"},
         ]
         _ = roles.write_text("".join(json.dumps(entry) + "\n" for entry in evidence))
         records = [
@@ -145,8 +146,8 @@ class MoveJournalTests(unittest.TestCase):
         path.parent.mkdir(parents=True, exist_ok=True)
         roles = path.with_name("roles.jsonl")
         assignments = [
-            {"at": "2026-10-11T00:00:00Z", "role": "seats", "label": "default", "account_label": "codex2"},
-            {"at": "2026-10-12T00:00:00Z", "role": "seats", "label": "codex3"},
+            {"at": "2026-10-11T00:00:00Z", "role": "workers", "label": "default", "account_label": "codex2"},
+            {"at": "2026-10-12T00:00:00Z", "role": "workers", "label": "codex3"},
         ]
         _ = roles.write_text("".join(json.dumps(row) + "\n" for row in assignments))
         entries = [{**self.requested(), "to": "default"},
@@ -168,20 +169,10 @@ class MoveJournalTests(unittest.TestCase):
         moves.append_move(requested)
         self.assertEqual(moves.read_moves(), [requested])
 
-    def test_credits_off_cause_round_trips_and_legacy_requests_remain_refusals(self) -> None:
-        legacy = self.requested()
-        policy: moves.RequestedMove = {**legacy, "cause": "credits off", "move_id": "policy-1"}
-        moves.append_move(legacy)
-        moves.append_move(policy)
-        entries = moves.read_moves()
-        self.assertEqual(entries, [legacy, policy])
-        self.assertEqual([entry.get("cause", "refusal") for entry in entries if entry["kind"] == "requested"],
-                         ["refusal", "credits off"])
-
     def test_invalid_move_cause_is_refused_by_writer_and_skipped_by_reader(self) -> None:
         valid = self.requested()
         moves.append_move(valid)
-        for cause in ("refusal", "credits on", "", None, 7, ["credits off"]):
+        for cause in ("credits on", "", None, 7, ["credits off"]):
             with self.subTest(cause=cause):
                 malformed = {**valid, "cause": cause}
                 with self.assertRaisesRegex(ValueError, "invalid account move"):
@@ -189,6 +180,92 @@ class MoveJournalTests(unittest.TestCase):
                 with moves.store_file().open("a", encoding="utf-8") as output:
                     _ = output.write(json.dumps(malformed) + "\n")
         self.assertEqual(moves.read_moves(), [valid])
+
+    def test_hand_and_refusal_causes_survive_storage_and_legacy_requests_read_as_refusals(self) -> None:
+        legacy = self.requested()
+        _ = legacy.pop("cause")
+        path = moves.store_file()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        _ = path.write_text(json.dumps(legacy) + "\n")
+        for cause in ("by hand", "refusal", "credits off"):
+            entry = {**legacy, "move_id": cause, "cause": cause}
+            moves.append_move(cast(moves.RequestedMove, cast(object, entry)))
+        requests = [entry for entry in moves.read_moves() if entry["kind"] == "requested"]
+        self.assertEqual([entry.get("cause") for entry in requests],
+                         ["refusal", "by hand", "refusal", "credits off"])
+
+    def test_malformed_optional_request_ids_are_skipped_while_legacy_and_numbered_attempts_remain_readable(self) -> None:
+        legacy = self.requested()
+        attempt: moves.RequestedMove = {**legacy, "move_id": "group-transition", "request_id": "attempt-one"}
+        invalid_ids: tuple[object, ...] = ([], "", None, 7)
+        entries: list[object] = [legacy, *({**legacy, "request_id": value} for value in invalid_ids), attempt]
+        path = moves.store_file()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        original = "".join(json.dumps(entry) + "\n" for entry in entries).encode()
+        _ = path.write_bytes(original)
+        self.assertEqual(moves.read_moves(), [legacy, attempt])
+        self.assertEqual(path.read_bytes(), original)
+
+    def test_routing_variants_validate_without_account_move_identity(self) -> None:
+        common: dict[str, object] = {"at": "2026-10-13T12:00:00Z", "tool": "codex",
+            "fallback_at": "2026-10-13T11:00:00+00:00", "owner": "codex2"}
+        variants: list[dict[str, object]] = [
+            {**common, "kind": "routed to claude", "cause": "refusal", "moved": ["delegate"]},
+            {**common, "kind": "routed back", "restored": ["delegate"], "kept": []},
+            {**common, "kind": "routing not restored", "outcome": "partial",
+             "restored": ["delegate"], "kept": [], "failed": ["fix (unreadable)"]},
+        ]
+        for entry in variants:
+            with self.subTest(kind=entry["kind"]):
+                self.assertTrue(moves._valid(entry))  # pyright: ignore[reportPrivateUsage]
+                for extra in ({"move_id": "not-a-move"}, {"subject": "workers"}):
+                    self.assertFalse(moves._valid({**entry, **extra}))  # pyright: ignore[reportPrivateUsage]
+                missing = dict(entry)
+                _ = missing.pop("fallback_at")
+                self.assertFalse(moves._valid(missing))  # pyright: ignore[reportPrivateUsage]
+        missing_move_id = dict(self.requested())
+        _ = missing_move_id.pop("move_id")
+        self.assertFalse(moves._valid(missing_move_id))  # pyright: ignore[reportPrivateUsage]
+
+    def test_mixed_journal_separates_routing_and_preserves_unresolved_historical_accounts(self) -> None:
+        routing: moves.RoutedToClaude = {"kind": "routed to claude", "at": self.common()["at"],
+            "tool": "codex", "fallback_at": "2026-10-13T11:00:00Z", "owner": "codex2",
+            "cause": "refusal", "moved": ["delegate"]}
+        accounts: list[moves.MoveEntry] = [self.requested(),
+            moves.ConfirmedMove(**self.common(), kind="confirmed", home="/temporary/codex2"),
+            moves.WaitedMove(**self.common(), kind="waited", window="five_hour", reset="2026-10-13T12:19:00Z"),
+            moves.NoRoomMove(**self.common(), kind="no room", earliest_reset="2026-10-15T12:00:00Z")]
+        path = moves.store_file()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        raw: list[object] = []
+        for entry in accounts:
+            raw.extend((entry, routing))
+        raw.append({**self.requested(), "move_id": "old-home", "from": "default"})
+        original = "".join(json.dumps(entry) + "\n" for entry in raw).encode()
+        _ = path.write_bytes(original)
+        loaded = moves.read_moves()
+        self.assertEqual([entry["kind"] for entry in loaded],
+                         ["requested", "confirmed", "waited", "no room", "requested"])
+        self.assertIsInstance(loaded[-1].get("from"), moves.HomeAccountUnresolved)
+        self.assertEqual(len(moves.read_journal()), len(raw))
+        self.assertEqual(path.read_bytes(), original)
+
+    def test_routing_writes_once_per_kind_and_fallback_without_resolving_unknown_owner(self) -> None:
+        entry: moves.RoutedToClaude = {"kind": "routed to claude", "at": self.common()["at"],
+            "tool": "codex", "fallback_at": "2026-10-13T11:00:00Z", "owner": "unknown",
+            "cause": "credits off", "moved": ["delegate", "fix"]}
+        moves.append_routing(entry)
+        moves.append_routing(entry)
+        recovery: moves.RoutedBack = {"kind": "routed back", "at": "2026-10-13T13:00:00Z",
+            "tool": "codex", "fallback_at": entry["fallback_at"], "owner": "unknown",
+            "restored": ["delegate"], "kept": ["fix"]}
+        moves.append_routing(recovery)
+        moves.append_routing(recovery)
+        self.assertEqual(len(moves.store_file().read_text().splitlines()), 2)
+        self.assertEqual(moves.read_moves(), [])
+        self.assertEqual([entry["kind"] for entry in moves.read_journal()], ["routed to claude", "routed back"])
+        with self.assertRaises(ValueError):
+            moves.append_routing({**entry, "owner": "default"})
 
     def test_reader_skips_malformed_lines_and_keeps_later_valid_transitions(self) -> None:
         first = moves.WaitedMove(**self.common(), kind="waited", window="five_hour", reset="2026-10-13T12:19:00+00:00")
@@ -212,7 +289,7 @@ class MoveJournalTests(unittest.TestCase):
         self.assertEqual(moves.read_moves(), [requested])
 
     def test_malformed_confirmation_does_not_suppress_valid_confirmation(self) -> None:
-        entry = moves.ConfirmedMove(**self.common(), kind="confirmed", home="/temporary/codex2", seat="seat-a")
+        entry = moves.ConfirmedMove(**self.common(), kind="confirmed", home="/temporary/codex2", worker="worker-a")
         path = moves.store_file()
         path.parent.mkdir(parents=True, exist_ok=True)
         _ = path.write_text(json.dumps({**entry, "at": "invalid"}) + "\n")
@@ -224,8 +301,8 @@ class MoveJournalTests(unittest.TestCase):
         self.assertEqual(moves.read_moves(), [])
         self.assertEqual(list(self.home.iterdir()), [])
 
-    def test_concurrent_writers_keep_complete_entries_for_all_seats(self) -> None:
-        entries = [moves.ConfirmedMove(**self.common(), kind="confirmed", home="/temporary/codex2", seat=f"seat-{index}")
+    def test_concurrent_writers_keep_complete_entries_for_all_workers(self) -> None:
+        entries = [moves.ConfirmedMove(**self.common(), kind="confirmed", home="/temporary/codex2", worker=f"worker-{index}")
                    for index in range(40)]
         with ThreadPoolExecutor(max_workers=8) as workers:
             _ = list(workers.map(moves.append_move, entries))
@@ -234,6 +311,70 @@ class MoveJournalTests(unittest.TestCase):
         self.assertCountEqual(observed, entries)
         path = self.home / ".local/state/accounts/moves.jsonl"
         self.assertEqual(len(path.read_text().splitlines()), len(entries))
+
+    def test_legacy_move_names_keep_identity_and_later_appends_on_the_same_inode(self) -> None:
+        path = moves.store_file()
+        path.parent.mkdir(parents=True)
+        requested = {**self.requested(), "subject": "seats"}
+        waited = {**self.common(), "subject": "seats", "kind": "waited", "window": "weekly",
+                  "reset": "2026-10-14T12:00:00+00:00"}
+        confirmed = {**self.common(), "subject": "seats", "kind": "confirmed",
+                     "home": "/temporary/codex2", "seat": "impl", "run": "run-42"}
+        _ = path.write_text(json.dumps(requested) + "\ninvalid JSON\n" + json.dumps(waited) + "\n")
+        inode = path.stat().st_ino
+        with path.open("a", encoding="utf-8") as earlier_writer:
+            loaded = moves.read_moves()
+            self.assertEqual([entry["subject"] for entry in loaded], ["workers", "workers"])
+            self.assertEqual([entry["move_id"] for entry in loaded], ["transition-1", "transition-1"])
+            self.assertEqual(loaded[0]["at"], requested["at"])
+            self.assertEqual(loaded[1].get("reset"), waited["reset"])
+            fcntl.flock(earlier_writer.fileno(), fcntl.LOCK_EX)
+            _ = earlier_writer.write(json.dumps(confirmed) + "\n")
+            earlier_writer.flush()
+            fcntl.flock(earlier_writer.fileno(), fcntl.LOCK_UN)
+            loaded = moves.read_moves()
+        self.assertEqual(path.stat().st_ino, inode)
+        self.assertEqual(loaded[-1].get("worker"), "impl")
+        self.assertEqual(loaded[-1].get("run"), "run-42")
+        self.assertNotIn("seat", loaded[-1])
+        self.assertIn("invalid JSON\n", path.read_text())
+        unchanged = path.stat().st_mtime_ns
+        self.assertEqual(moves.read_moves(), loaded)
+        self.assertEqual(path.stat().st_mtime_ns, unchanged)
+
+    def test_confirmation_deduplicates_old_names_before_validation_and_keeps_other_workers(self) -> None:
+        path = moves.store_file()
+        path.parent.mkdir(parents=True)
+        confirmed = {**self.common(), "subject": "seats", "kind": "confirmed",
+                     "home": "/temporary/codex2", "seat": "impl", "run": "run-42"}
+        _ = path.write_text(json.dumps(confirmed) + "\n")
+        current = moves.ConfirmedMove(**self.common(), kind="confirmed", home="/temporary/codex2",
+                                      worker="impl", run="run-42")
+        moves.append_move(current)
+        moves.append_move({**current, "worker": "test"})
+        moves.append_move({**current, "run": "run-43"})
+        self.assertEqual(moves.read_moves(), [current, {**current, "worker": "test"}, {**current, "run": "run-43"}])
+
+    def test_old_role_history_keeps_historical_login_evidence_and_reads_later_old_appends(self) -> None:
+        path = moves.store_file()
+        path.parent.mkdir(parents=True)
+        roles = path.with_name("roles.jsonl")
+        evidence = {"at": "2026-10-12T00:00:00Z", "role": "seats", "label": "default", "account_label": "codex2"}
+        _ = roles.write_text(json.dumps(evidence) + "\n")
+        _ = path.write_text(json.dumps({**self.requested(), "from": "default"}) + "\n")
+        inode = roles.stat().st_ino
+        with roles.open("a", encoding="utf-8") as earlier_writer:
+            self.assertEqual(moves.read_moves()[0].get("from"), "codex2")
+            self.assertEqual(json.loads(roles.read_text())["role"], "workers")
+            fcntl.flock(earlier_writer.fileno(), fcntl.LOCK_EX)
+            _ = earlier_writer.write(json.dumps({**evidence, "at": "2026-10-13T00:00:00Z", "account_label": "codex3"}) + "\n")
+            earlier_writer.flush()
+            fcntl.flock(earlier_writer.fileno(), fcntl.LOCK_UN)
+            self.assertEqual(moves.read_moves()[0].get("from"), "codex3")
+        self.assertEqual(roles.stat().st_ino, inode)
+        unchanged = roles.stat().st_mtime_ns
+        self.assertEqual(moves.read_moves()[0].get("from"), "codex3")
+        self.assertEqual(roles.stat().st_mtime_ns, unchanged)
 
 
 if __name__ == "__main__":

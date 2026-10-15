@@ -79,7 +79,7 @@ from typing import TYPE_CHECKING, Literal, NoReturn, NotRequired, TextIO, TypedD
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.usage import agents_log
 from scripts.whoami.agent_accounts import (
-    seats_home, codex_home, codex_home_display, user_zone,
+    workers_home, codex_home, codex_home_display, user_zone,
     KnownCodexAccount, UnknownCodexAccount, RefusingCodexAccount, codex_account, codex_home_role_label,
     codex_home_matches_label,
 )
@@ -104,7 +104,7 @@ class ServingCodexServer:
 class NotBoundCodexServer:
     """No serving process was identified; the selected home remains context only."""
 
-    home: Path = field(default_factory=seats_home)
+    home: Path = field(default_factory=workers_home)
     reason: str = "serving server is not bound"
     started_here: bool = False
 
@@ -1522,7 +1522,7 @@ def ensure_server(session_dir: str, home: Path | None = None) -> tuple[int, bool
     provider's answer. A caller that attached to one already running has proved
     nothing of the kind -- see _retry_warranted.
     """
-    selected_home = seats_home() if home is None else home
+    selected_home = workers_home() if home is None else home
     with _server_lock(session_dir):
         path = _session_path(session_dir, SERVER_FILE)
         record = _read_json_object(path)
@@ -1547,7 +1547,7 @@ def ensure_server(session_dir: str, home: Path | None = None) -> tuple[int, bool
         return _start_server(session_dir, selected_home), True
 
 
-def _start_server(session_dir: str, seats_home: Path) -> int:
+def _start_server(session_dir: str, workers_home: Path) -> int:
     """Start this session's app-server and record it. The caller holds the server lock."""
     chosen = _free_port()
     log_path = _session_path(session_dir, SERVER_LOG)
@@ -1557,9 +1557,9 @@ def _start_server(session_dir: str, seats_home: Path) -> int:
             stdout=subprocess.DEVNULL,
             stderr=log_handle,
             start_new_session=True,
-            env={**os.environ, "CODEX_HOME": str(seats_home)},
+            env={**os.environ, "CODEX_HOME": str(workers_home)},
         )
-    served: ServerRecord = {"port": chosen, "pid": process.pid, "codex_home": str(seats_home)}
+    served: ServerRecord = {"port": chosen, "pid": process.pid, "codex_home": str(workers_home)}
     try:
         deadline = time.time() + SERVER_START_TIMEOUT_SECS
         while time.time() < deadline:
@@ -2005,7 +2005,7 @@ def command_follow(args: argparse.Namespace) -> int:
     client: Client | None = None
     live_turn = ""
     try:
-        home = seats_home()
+        home = workers_home()
         port, _fresh = ensure_server(session_dir, home)
         _note_worker_port(session_dir, name, owner_pid, port)
         released = _release_other_worker_writers(session_dir, name, thread_id, port)
@@ -2188,7 +2188,7 @@ def command_compact(args: argparse.Namespace) -> int:
         return 2
     client: Client | None = None
     try:
-        home = seats_home()
+        home = workers_home()
         port, _fresh = ensure_server(session_dir, home)
         released = _release_other_worker_writers(session_dir, name, state.thread_id, port)
         if not isinstance(released, _ReleasedWorkerThread):
@@ -2499,7 +2499,7 @@ def _stream_turn(
                     if end_marker.exists():
                         break
                     if resident:
-                        selected_home = seats_home()
+                        selected_home = workers_home()
                         record = _read_json_object(_session_path(session_dir, SERVER_FILE))
                         with _pending_file(session_dir, name) as handle:
                             held_messages = bool(_pending_for_thread(handle, thread_id))
@@ -2963,7 +2963,7 @@ def _refuse_taken_follow_up(client: Client, replacement: str, session_dir: str) 
 
 def _resume_worker_thread(
     args: argparse.Namespace, session_dir: str, name: str, thread_id: str, client: Client,
-    seats_home: Path,
+    workers_home: Path,
 ) -> _WorkerThreadForHome:
     params = _resume_params(session_dir, name, thread_id)
     instructions_file = _as_str(_lookup(session_dir, name).get("instructions_file"))
@@ -2989,7 +2989,7 @@ def _resume_worker_thread(
     _ = client.call("thread/name/set", {"threadId": replacement, "name": name})
     _post_board_status(
         session_dir, name,
-        f"{codex_home_display(seats_home)} refused to resume {thread_id}; worker continues as new thread {replacement}",
+        f"{codex_home_display(workers_home)} refused to resume {thread_id}; worker continues as new thread {replacement}",
     )
     return _WorkerThreadForHome(replacement, True)
 
@@ -3069,10 +3069,10 @@ def _quota_continuation_ready(client: Client, selected_home: Path) -> bool:
     entries = moves.read_moves()
     ended = {entry["move_id"] for entry in entries if entry["kind"] == "wait ended"}
     for entry in entries:
-        if (entry["tool"] == "codex" and entry["subject"] == "seats" and entry["kind"] == "waited"
+        if (entry["tool"] == "codex" and entry["subject"] == "workers" and entry["kind"] == "waited"
                 and entry["move_id"] not in ended and datetime.fromisoformat(entry["reset"]) <= now):
             moves.append_move(moves.WaitEndedMove(kind="wait ended", at=now.isoformat(), tool="codex",
-                subject="seats", move_id=entry["move_id"]))
+                subject="workers", move_id=entry["move_id"]))
     return True
 
 
@@ -3087,7 +3087,7 @@ def _requested_worker_move(source: CodexServingState, destination: Path) -> Requ
     if not isinstance(source, ServingCodexServer) or source.home == destination:
         return NoRequestedWorkerMove()
     requests = [entry for entry in moves.read_moves() if entry["kind"] == "requested"
-                and entry["tool"] == "codex" and entry["subject"] == "seats"]
+                and entry["tool"] == "codex" and entry["subject"] == "workers"]
     origin = requests[-1]["from"] if requests else moves.HomeAccountUnresolved(source.home)
     target = requests[-1]["to"] if requests else moves.HomeAccountUnresolved(destination)
     if (requests and isinstance(origin, str) and isinstance(target, str)
@@ -3106,7 +3106,7 @@ def _record_worker_move_failure(request: RequestedMove | NoRequestedWorkerMove, 
     if isinstance(request, NoRequestedWorkerMove):
         return
     moves.append_move(moves.FailedMove(kind="failed", at=datetime.now(timezone.utc).isoformat(),
-        tool="codex", subject="seats", move_id=request["move_id"], reason=reason))
+        tool="codex", subject="workers", move_id=request["move_id"], reason=reason))
 
 
 def _confirm_worker_move(session_dir: str, name: str, request: RequestedMove | NoRequestedWorkerMove,
@@ -3118,8 +3118,8 @@ def _confirm_worker_move(session_dir: str, name: str, request: RequestedMove | N
     if isinstance(request, NoRequestedWorkerMove) or codex_home_role_label(serving.home) != request["to"]:
         return
     moves.append_move(moves.ConfirmedMove(kind="confirmed", at=datetime.now(timezone.utc).isoformat(),
-        tool="codex", subject="seats", move_id=request["move_id"], home=str(serving.home),
-        seat=name, run=str(Path(session_dir).resolve())))
+        tool="codex", subject="workers", move_id=request["move_id"], home=str(serving.home),
+        worker=name, run=str(Path(session_dir).resolve())))
 
 
 def _move_idle_worker(
@@ -3135,7 +3135,7 @@ def _move_idle_worker(
     if isinstance(client.serving, NotBoundCodexServer):
         _ = _bind_serving_server(client, session_dir)
     source = client.serving
-    worker_home_for_turn = seats_home()
+    worker_home_for_turn = workers_home()
     request = _requested_worker_move(source, worker_home_for_turn)
     cleanup: WorkerTurnCleanup | NoWorkerTurnToCleanUp = NoWorkerTurnToCleanUp()
     moved = client
@@ -3360,7 +3360,7 @@ def command_send(args: argparse.Namespace) -> int:
         if not isinstance(launcher_pid, int) or launcher_pid <= 0 or not _pid_alive(launcher_pid):
             print(f"codex_mesh: {target} has no live launcher to read a message; end the worker and relaunch it", file=sys.stderr)
             return 2
-        home = seats_home()
+        home = workers_home()
         # Retiring is enough here. A live launcher keeps its outgoing connection
         # and claims this held message at its next checked turn boundary.
         with _server_lock(session_dir):
@@ -4164,7 +4164,7 @@ def command_signin_changed(args: argparse.Namespace) -> int:
     return 0
 
 
-def retire_seats_servers(seats_home: Path, label: str, *, dry_run: bool = False) -> list[str]:
+def retire_workers_servers(workers_home: Path, label: str, *, dry_run: bool = False) -> list[str]:
     """Retire current run servers and notify each affected holder once."""
     notices: dict[str, list[str]] = {}
     lines: list[str] = []
@@ -4179,7 +4179,7 @@ def retire_seats_servers(seats_home: Path, label: str, *, dry_run: bool = False)
             previous_home = server_record_home(record)
             line = (
                 f"Workers account {'would move' if dry_run else 'changed'} at {at} to {label} "
-                + f"({codex_home_display(seats_home)}): run {folder.name}'s workers move from "
+                + f"({codex_home_display(workers_home)}): run {folder.name}'s workers move from "
                 + f"{codex_home_display(previous_home)} at their next turn; "
                 + "a working worker finishes first. Continue dispatching as usual."
             )
@@ -4195,7 +4195,7 @@ def retire_seats_servers(seats_home: Path, label: str, *, dry_run: bool = False)
         for session_id, runs in notices.items():
             _notify_holder(
                 session_id,
-                f"Workers account changed at {at} to {label} ({codex_home_display(seats_home)}): "
+                f"Workers account changed at {at} to {label} ({codex_home_display(workers_home)}): "
                 + f"runs {', '.join(runs)} move at their next turn; working workers finish first. Continue dispatching as usual.",
                 CodexNoticeKind.WORKERS_CHANGED,
             )

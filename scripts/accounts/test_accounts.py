@@ -7,6 +7,7 @@ from scripts.whoami.note_file import note_name
 import io
 from importlib import import_module
 import base64
+import fcntl
 import json
 import os
 import selectors
@@ -28,10 +29,16 @@ from zoneinfo import ZoneInfo
 from scripts.accounts import accounts, refusals
 from scripts.production import showrunners
 from scripts.agents import codex_mesh
-from scripts.accounts import moves
+from scripts.accounts import moves, worker_names
 import account
 import agent_accounts
 import usage_store
+
+
+def stored_group_labels(path: Path) -> dict[str, str]:
+    raw = cast(dict[str, object], json.loads(path.read_text()))
+    return {group: value if isinstance(value, str) else cast(str, cast(dict[str, object], value)["label"])
+            for group, value in raw.items()}
 
 
 def named_environment(config_dir: Path) -> dict[str, str]:
@@ -45,7 +52,7 @@ def named_environment(config_dir: Path) -> dict[str, str]:
 def setUpModule() -> None:
     root = Path(unittest.enterModuleContext(tempfile.TemporaryDirectory()))
     _ = unittest.enterModuleContext(patch.object(showrunners, "NOTIFIER_STATE_DIR", root))
-    _ = unittest.enterModuleContext(patch.object(accounts, "SEATS_RUN_ROOT", root / "seat-runs"))
+    _ = unittest.enterModuleContext(patch.object(accounts, "WORKERS_RUN_ROOT", root / "worker-runs"))
 
 
 def named_prefix(config_dir: Path) -> str:
@@ -105,7 +112,7 @@ class RoleWriteTime(datetime):
 
 
 # The Codex home's row when nothing is signed in to it.
-CODEX_HOME_ROW = ("~/.codex", "~/.codex", "not logged in", "seats", *("—",) * 7)
+CODEX_HOME_ROW = ("~/.codex", "~/.codex", "not logged in", "workers", *("—",) * 5)
 
 
 @final
@@ -146,11 +153,11 @@ class AccountsTests(unittest.TestCase):
         self.codex_reads = cast(AsyncMock, self.enterContext(patch.object(
             agent_accounts, "codex_live", return_value=agent_accounts.Report("Codex", problem="Not logged in"),
         )))
-        _ = self.enterContext(patch.object(accounts, "SEATS_RUN_ROOT", self.root / "seat-runs"))
+        _ = self.enterContext(patch.object(accounts, "WORKERS_RUN_ROOT", self.root / "worker-runs"))
         _ = self.enterContext(patch.object(showrunners, "NOTIFIER_STATE_DIR", self.root / "notifier"))
         _ = self.enterContext(patch.object(agent_accounts, "prepare_codex_home",
             return_value=agent_accounts.CodexHomePrepared()))
-        _ = self.enterContext(patch.object(codex_mesh, "retire_seats_servers", return_value=[]))
+        _ = self.enterContext(patch.object(codex_mesh, "retire_workers_servers", return_value=[]))
         _ = self.enterContext(patch.object(showrunners, "registered_showrunners", return_value=[
             showrunners.Showrunner(session="fixture", socket="", slug="fixture", zone="America/Los_Angeles", doc=""),
         ]))
@@ -174,18 +181,18 @@ class AccountsTests(unittest.TestCase):
               patch.object(import_module("sessions"), "live_sessions", return_value=[owner]),
               patch.object(account, "process_config_dir", return_value=self.main_dir),
               patch.object(accounts, "pick", side_effect=chosen),
-              patch.object(accounts, "role_account", return_value=accounts.CodexSeatsAccount("codex1", self.home / ".codex1"))):
+              patch.object(accounts, "role_account", return_value=accounts.CodexWorkersAccount("codex1", self.home / ".codex1"))):
             code, output, error = self.run_cli("--detail")
         self.assertEqual((code, error), (0, ""))
         self.assertIn("live-identity", output)
         self.assertIn("Live director", output)
         self.assertIn("claude2", output)
-        self.assertIn("Codex seats: codex1", output)
+        self.assertIn("Codex workers: codex1", output)
         self.assertIn("on refusal: codex3", output)
         self.assertIn("units:", output.splitlines()[0])
 
     def test_status_shows_each_owed_continuation_and_its_hold_reason(self) -> None:
-        run = self.root / "seat-runs/run-one"
+        run = self.root / "worker-runs/run-one"
         run.mkdir(parents=True)
         _ = (run / "mesh_server.json").write_text(json.dumps({"pid": os.getpid()}))
         _ = (run / "mesh_roster.json").write_text(json.dumps({
@@ -205,7 +212,7 @@ class AccountsTests(unittest.TestCase):
         for name, server in (("live", {"pid": 901}), ("dead", {"pid": 902}),
                              ("missing", None), ("malformed", {"pid": "901"}),
                              ("invalid-pid", {"pid": True})):
-            run = self.root / "seat-runs" / name
+            run = self.root / "worker-runs" / name
             run.mkdir(parents=True)
             _ = (run / "mesh_roster.json").write_text(json.dumps({
                 "worker": {"continuation_owed": True, "status": "waiting_capacity"}}))
@@ -221,13 +228,13 @@ class AccountsTests(unittest.TestCase):
         for name in ("dead", "missing", "malformed", "invalid-pid"):
             self.assertNotIn(name + "/worker", output)
 
-    def test_status_renders_requested_pending_confirmed_per_seat_and_failed_reason(self) -> None:
-        common = moves.MoveCommon(at="2026-10-14T12:00:00+00:00", tool="codex", subject="seats", move_id="move-one")
+    def test_status_renders_requested_pending_confirmed_per_worker_and_failed_reason(self) -> None:
+        common = moves.MoveCommon(at="2026-10-14T12:00:00+00:00", tool="codex", subject="workers", move_id="move-one")
         request: moves.RequestedMove = {**common, "kind": "requested", "from": "codex1", "to": "codex3",
             "why": "weekly refusal", "window": "weekly", "reset": "2026-10-16T12:00:00+00:00"}
         moves.append_move(request)
-        moves.append_move(moves.ConfirmedMove(**common, kind="confirmed", home=str(self.home / ".codex3"), seat="worker-a", run="run-one"))
-        moves.append_move(moves.ConfirmedMove(**common, kind="confirmed", home=str(self.home / ".codex3"), seat="worker-b", run="run-one"))
+        moves.append_move(moves.ConfirmedMove(**common, kind="confirmed", home=str(self.home / ".codex3"), worker="worker-a", run="run-one"))
+        moves.append_move(moves.ConfirmedMove(**common, kind="confirmed", home=str(self.home / ".codex3"), worker="worker-b", run="run-one"))
         failed: moves.RequestedMove = {**request, "move_id": "failed-move", "subject": "claude-session: Director", "tool": "claude"}
         moves.append_move(failed)
         moves.append_move(moves.FailedMove(at=common["at"], move_id="failed-move", subject="claude-session: Director", tool="claude",
@@ -264,7 +271,7 @@ class AccountsTests(unittest.TestCase):
         self.assertIn("no room until 2026-10-15T05:00", output)
         self.assertIn("room again: claude3", output)
 
-    def test_status_shows_sessions_seats_and_moves_only_with_detail(self) -> None:
+    def test_status_shows_sessions_workers_and_moves_only_with_detail(self) -> None:
         from scripts.message import sessions
         self.login_directory("claude2", "main@example.invalid", default=True)
         owner = sessions.SessionRecord(pid=12345, sessionId="live-identity", name="Live director",
@@ -277,7 +284,7 @@ class AccountsTests(unittest.TestCase):
             summary = self.run_cli()
             detail = self.run_cli("--detail")
         self.assertEqual((summary[0], summary[2], detail[0], detail[2]), (0, "", 0, ""))
-        for line in ("session live-identity (Live director)", "Codex seats:", "moved-session: failed"):
+        for line in ("session live-identity (Live director)", "Codex workers:", "moved-session: failed"):
             self.assertNotIn(line, summary[1])
             self.assertIn(line, detail[1])
         self.assertEqual(detail[1].splitlines()[:len(summary[1].splitlines())], summary[1].splitlines())
@@ -289,9 +296,13 @@ class AccountsTests(unittest.TestCase):
         self.assertEqual((result, stderr), (0, ""))
         table = [line for line in stdout.split("\n\n")[0].splitlines() if line.startswith("|")]
         self.assertEqual(
-            [cell.strip() for cell in table[0].strip("|").split("|")], list(accounts.TABLE_HEADINGS),
+            [cell.strip() for cell in table[0].strip("|").split("|")],
+            ["Folder", "Label", "Login", "Role", "Weekly left", "Weekly resets", "On credits", "Credits left", "Read"],
         )
-        return [tuple(cell.strip() for cell in line.strip("|").split("|")) for line in table[2:]]
+        rows = [tuple(cell.strip() for cell in line.strip("|").split("|")) for line in table[2:]]
+        for row in rows:
+            self.assertEqual(len(row), len(accounts.TABLE_HEADINGS))
+        return rows
 
     def run_cli(self, *arguments: str) -> tuple[int, str, str]:
         stdout = io.StringIO()
@@ -348,9 +359,9 @@ class AccountsTests(unittest.TestCase):
     def test_group_note_labels_map_each_configured_group_and_omit_unconfigured_groups(self) -> None:
         self.write_note("claude1", "unit@example.invalid")
         self.write_note("claude3", "runner@example.invalid")
-        accounts.set_group_account("units", "claude1", why="fixture", now=datetime.now(timezone.utc))
+        _ = accounts.set_group_account("units", "claude1", why="fixture", now=datetime.now(timezone.utc))
         self.assertEqual(accounts.group_note_labels(), {"units": "claude1"})
-        accounts.set_group_account("showrunners", "claude3", why="fixture", now=datetime.now(timezone.utc))
+        _ = accounts.set_group_account("showrunners", "claude3", why="fixture", now=datetime.now(timezone.utc))
         self.assertEqual(accounts.group_note_labels(), {"units": "claude1", "showrunners": "claude3"})
 
     def test_group_note_labels_resolve_a_stored_default_from_its_actual_login(self) -> None:
@@ -459,18 +470,18 @@ class AccountsTests(unittest.TestCase):
         for path in (groups, config, history):
             path.parent.mkdir(parents=True, exist_ok=True)
         _ = groups.write_text('{"units": "claude 2", "showrunners": "claude 2"}\n')
-        _ = config.write_text('{"seats": "codex 2"}\n')
+        _ = config.write_text('{"workers": "codex 2"}\n')
         self.write_role_history([accounts.RoleChange(at="2026-10-08T00:00:00Z", role="unit",
             label="claude 2", account_label="claude 2")])
         before = {path: path.read_bytes() for path in (groups, config, history)}
         self.assertEqual(accounts.role_account("unit"), accounts.NamedAccount("claude2", self.home / ".claude2"))
-        self.assertEqual(agent_accounts.seats_home(), self.home / ".codex2")
-        self.assertIn("codex2", self.run_cli("role", "seats")[1])
+        self.assertEqual(agent_accounts.workers_home(), self.home / ".codex2")
+        self.assertIn("codex2", self.run_cli("role", "workers")[1])
         for path, original in before.items():
             self.assertEqual(path.read_bytes(), original)
-        accounts.set_group_account("units", "claude 2", why="canonical write")
-        self.assertEqual(json.loads(groups.read_text()), {"units": "claude2", "showrunners": "claude 2"})
-        self.assertEqual(self.run_cli("set-role", "seats", "codex 2")[0], 0)
+        _ = accounts.set_group_account("units", "claude 2", why="canonical write")
+        self.assertEqual(stored_group_labels(groups), {"units": "claude2", "showrunners": "claude 2"})
+        self.assertEqual(self.run_cli("set-role", "workers", "codex 2")[0], 0)
         self.assertNotIn("codex 2", config.read_text())
         self.assertEqual(history.read_bytes()[:len(before[history])], before[history])
 
@@ -490,6 +501,47 @@ class AccountsTests(unittest.TestCase):
         self.assertEqual(sum(result.observed_days for result in results), 1)
         self.assertTrue(any("unit directors" in result.roles for result in results))
         self.assertEqual([path.read_bytes() for path in paths], before)
+
+    def test_burn_preserves_unit_spend_while_migrating_legacy_worker_role_history(self) -> None:
+        self.login_directory("claude2", "main@example.invalid", default=True)
+        _ = self.workers_fixture()
+        self.write_role_history([accounts.RoleChange(at="2026-10-08T00:00:00Z", role="unit",
+            label="claude2", account_label="claude2")])
+        path = accounts.roles_history_file()
+        with path.open("a", encoding="utf-8") as output:
+            _ = output.write(json.dumps({"at": "2026-10-09T12:00:00Z", "role": "seats",
+                                        "label": "codex1", "account_label": "codex1"}) + "\n")
+        self.write_readings([accounts.QuotaReading(account="claude2", at=at, remaining=left)
+            for at, left in (("2026-10-09T00:00:00Z", 90), ("2026-10-10T00:00:00Z", 70))])
+        inode = path.stat().st_ino
+        results = accounts.burn(datetime(2026, 10, 9, tzinfo=timezone.utc), datetime(2026, 10, 10, tzinfo=timezone.utc))
+        self.assertEqual([(result.label, result.points, result.observed_days) for result in results], [("claude2", 20, 1)])
+        self.assertIn("unit directors", results[0].roles)
+        self.assertEqual(json.loads(path.read_text().splitlines()[1])["role"], "workers")
+        self.assertEqual(path.stat().st_ino, inode)
+        unchanged = path.stat().st_mtime_ns
+        self.assertEqual(accounts.burn(datetime(2026, 10, 9, tzinfo=timezone.utc), datetime(2026, 10, 10, tzinfo=timezone.utc)), results)
+        self.assertEqual(path.stat().st_mtime_ns, unchanged)
+
+    def test_role_history_conversion_waits_for_the_writers_lock_at_the_selected_config_path(self) -> None:
+        self.write_role_history([])
+        history = accounts.roles_history_file()
+        original = json.dumps({"role": "seats", "label": "codex1"}) + "\n"
+        _ = history.write_text(original)
+        config = self.root / "selected-config" / "accounts.json"
+        flock = fcntl.flock
+
+        def acquire_without_waiting(descriptor: int, operation: int) -> None:
+            flock(descriptor, operation | fcntl.LOCK_NB)
+
+        with patch.object(worker_names, "accounts_config_file", return_value=config):
+            with accounts._roles_lock():  # pyright: ignore[reportPrivateUsage]
+                with patch.object(fcntl, "flock", side_effect=acquire_without_waiting):
+                    with self.assertRaises(BlockingIOError):
+                        _ = worker_names.role_history_lines(history)
+                self.assertEqual(history.read_text(), original)
+            lines = worker_names.role_history_lines(history)
+        self.assertEqual(json.loads(lines[0])["role"], "workers")
 
     def test_exec_default_removes_inherited_config_directory_and_oauth_token(self) -> None:
         self.login_directory("claude2", "main@example.invalid", default=True)
@@ -1236,7 +1288,7 @@ class AccountsTests(unittest.TestCase):
         self.write_role_history([
             accounts.LegacyRoleChange(at="2026-10-10T00:00:00Z", role="unit", label="claude3"),
             accounts.LegacyRoleChange(at="2026-10-11T00:00:00Z", role="unit", label="default"),
-            accounts.LegacyRoleChange(at="2026-10-11T00:00:00Z", role="seats", label="default"),
+            accounts.LegacyRoleChange(at="2026-10-11T00:00:00Z", role="workers", label="default"),
         ])
         self.write_readings([
             accounts.QuotaReading(account="claude2", at=f"2026-10-{day:02d}T00:00:00Z", remaining=float(left))
@@ -1764,11 +1816,11 @@ class AccountsTests(unittest.TestCase):
 
         self.assertEqual(self.status_rows(), [
             ("~/.claude", "claude2", "main@example.invalid", "",
-             "64%", soon.astimezone(zone).strftime("%H:%M %Z"), "71%", weekly_cell, "—", "—", read_cell),
-            ("~/.claude1", "claude1", "not set up", "", *("—",) * 7),
+             "71%", weekly_cell, "—", "—", read_cell),
+            ("~/.claude1", "claude1", "not set up", "", *("—",) * 5),
             ("~/.claude3", "claude3", "unit@example.invalid", "units",
-             "100%", "—", "12%", weekly_cell, "—", "—", read_cell),
-            ("~/.claude4", "claude4", "not logged in", "", *("—",) * 7),
+             "12%", weekly_cell, "—", "—", read_cell),
+            ("~/.claude4", "claude4", "not logged in", "", *("—",) * 5),
             CODEX_HOME_ROW,
         ])
         self.assertIn("PDT", read_cell + weekly_cell)
@@ -1776,6 +1828,31 @@ class AccountsTests(unittest.TestCase):
         self.codex_reads.assert_not_awaited()
         self.assertFalse(accounts.account_dir("claude1").exists())
         self.assertFalse(accounts.account_dir("claude2").exists())
+
+    def test_status_hides_five_hour_cells_and_keeps_weekly_and_read(self) -> None:
+        self.login_directory("claude2", "main@example.invalid", default=True)
+        now = datetime.now(timezone.utc)
+        read = now - timedelta(minutes=1)
+        five_reset = now + timedelta(hours=2)
+        weekly_reset = now + timedelta(days=3)
+        usage_store.save([self.reading(
+            "main@example.invalid", agent_accounts.Quota("5-hour", 37, five_reset),
+            agent_accounts.Quota("Weekly", 44, weekly_reset),
+        )], read)
+
+        result, output, error = self.run_cli("status")
+
+        self.assertEqual((result, error), (0, ""))
+        table = output.split("\n\n")[0]
+        self.assertNotIn("5-hour", table)
+        row = next(row for row in self.status_rows() if row[0] == "~/.claude")
+        zone = ZoneInfo("America/Los_Angeles")
+        self.assertNotIn("63%", row)
+        self.assertNotIn(five_reset.astimezone(zone).strftime("%H:%M %Z"), row)
+        self.assertEqual(row[4:], (
+            "56%", weekly_reset.astimezone(zone).strftime("%a %m-%d %H:%M %Z"),
+            "—", "—", read.astimezone(zone).strftime("%H:%M %Z"),
+        ))
 
     def test_no_action_means_status(self) -> None:
         self.write_main_config()
@@ -1813,17 +1890,17 @@ class AccountsTests(unittest.TestCase):
         first = self.status_rows()[0]
         second = self.status_rows()[0]
 
-        self.assertEqual((first[4], first[6]), ("90%", "60%"))
-        self.assertNotEqual(first[10], "—")
+        self.assertEqual(first[4], "60%")
+        self.assertNotEqual(first[8], "—")
         self.assertEqual(second, first)
         self.live_reads.assert_called_once_with(self.main_dir)
 
     def test_status_table_shows_each_codex_account_and_whether_it_is_on_credits(self) -> None:
         self.write_main_config()
         self.login_directory("claude2", "main@example.invalid", default=True)
-        self.codex_login("Seats@example.invalid")
+        self.codex_login("Workers@example.invalid")
         self.write_note("codex1", "other@example.invalid")
-        self.write_note("codex2", "seats@example.invalid")
+        self.write_note("codex2", "workers@example.invalid")
         now = datetime.now(timezone.utc)
         read = now - timedelta(minutes=1)
         later = now + timedelta(days=3)
@@ -1840,29 +1917,27 @@ class AccountsTests(unittest.TestCase):
         for weekly_used, five_hour, balance, credit_cells in cases:
             with self.subTest(weekly_used=weekly_used, balance=balance):
                 usage_store.save([agent_accounts.Report(
-                    "Codex", email="seats@example.invalid", quotas=[agent_accounts.Quota("Weekly", weekly_used, later)],
+                    "Codex", email="workers@example.invalid", quotas=[agent_accounts.Quota("Weekly", weekly_used, later)],
                     five_hour=five_hour, credit_balance=balance,
                 )], read)
 
                 rows = self.status_rows()
 
-                self.assertEqual(rows[-2][:4], ("~/.codex", "codex2", "Seats@example.invalid", "seats"))
-                # An account with no 5-hour window shows none.
-                self.assertEqual(rows[-2][4:6], ("—", "—") if five_hour is None else ("0%", rows[-2][5]))
-                self.assertEqual(rows[-2][6:], (
+                self.assertEqual(rows[-2][:4], ("~/.codex", "codex2", "Workers@example.invalid", "workers"))
+                self.assertEqual(rows[-2][4:], (
                     f"{100 - weekly_used:.0f}%", later.astimezone(zone).strftime("%a %m-%d %H:%M %Z"),
                     *credit_cells, read.astimezone(zone).strftime("%H:%M %Z"),
                 ))
-                self.assertEqual(rows[-1], ("~/.codex1", "codex1", "not set up", "—", *("—",) * 7))
+                self.assertEqual(rows[-1], ("~/.codex1", "codex1", "not set up", "—", *("—",) * 5))
         self.codex_reads.assert_not_awaited()
 
     def test_status_reads_codex_live_only_when_no_reading_is_recent_and_keeps_what_it_read(self) -> None:
         self.write_main_config()
         self.login_directory("claude2", "main@example.invalid", default=True)
-        self.codex_login("seats@example.invalid")
+        self.codex_login("workers@example.invalid")
         later = datetime.now(timezone.utc) + timedelta(days=3)
         self.codex_reads.return_value = agent_accounts.Report(
-            "Codex", email="seats@example.invalid", quotas=[agent_accounts.Quota("Weekly", 30.0, later)],
+            "Codex", email="workers@example.invalid", quotas=[agent_accounts.Quota("Weekly", 30.0, later)],
             credit_balance="5",
         )
 
@@ -1870,9 +1945,9 @@ class AccountsTests(unittest.TestCase):
         second = self.status_rows()[-1]
 
         # A login with no account note is identified by its home folder.
-        self.assertEqual(first[:4], ("~/.codex", "~/.codex", "seats@example.invalid", "seats"))
-        self.assertEqual((first[6], first[8], first[9]), ("70%", "no", "5"))
-        self.assertNotEqual(first[10], "—")
+        self.assertEqual(first[:4], ("~/.codex", "~/.codex", "workers@example.invalid", "workers"))
+        self.assertEqual((first[4], first[6], first[7]), ("70%", "no", "5"))
+        self.assertNotEqual(first[8], "—")
         self.assertEqual(second, first)
         self.codex_reads.assert_awaited_once_with(self.home / ".codex")
 
@@ -1886,8 +1961,8 @@ class AccountsTests(unittest.TestCase):
         self.codex_reads.assert_not_awaited()
 
     def test_codex_setup_refuses_a_login_already_held_by_the_default_home(self) -> None:
-        self.write_note("codex2", "seats@example.invalid")
-        self.codex_login("SEATS@example.invalid")
+        self.write_note("codex2", "workers@example.invalid")
+        self.codex_login("WORKERS@example.invalid")
         default = self.home / ".codex"
         authentication = (default / "auth.json").read_bytes()
         entries = set(self.home.iterdir())
@@ -1905,8 +1980,8 @@ class AccountsTests(unittest.TestCase):
         self.codex_reads.assert_not_awaited()
 
     def test_codex_setup_duplicate_login_refusal_preserves_an_existing_home(self) -> None:
-        self.write_note("codex2", "seats@example.invalid")
-        self.codex_login("seats@example.invalid")
+        self.write_note("codex2", "workers@example.invalid")
+        self.codex_login("workers@example.invalid")
         default = self.home / ".codex"
         _ = (default / "config.toml").write_text("shared config")
         home = self.home / ".codex2"
@@ -1940,7 +2015,7 @@ class AccountsTests(unittest.TestCase):
 
     def test_codex_setup_links_existing_shared_entries_and_preserves_default_identity(self) -> None:
         self.write_note("codex1", "spare@example.invalid")
-        self.codex_login("seats@example.invalid")
+        self.codex_login("workers@example.invalid")
         default = self.home / ".codex"
         directories = {"skills", "rules", "plugins", "sessions", "archived_sessions"}
         for name in EXPECTED_CODEX_SHARED:
@@ -2093,7 +2168,7 @@ class AccountsTests(unittest.TestCase):
         rows = self.status_rows()[1:]
 
         self.assertEqual([row[:4] for row in rows], [
-            ("~/.codex", "codex1", "MAIN-CODEX@example.invalid", "seats"),
+            ("~/.codex", "codex1", "MAIN-CODEX@example.invalid", "workers"),
             ("~/.codex2", "codex2", "spare@example.invalid", "spare"),
             ("~/.codex4", "~/.codex4", "unknown@example.invalid", "spare"),
             ("~/.codex10", "~/.codex10", "not logged in", "spare"),
@@ -2141,16 +2216,16 @@ class AccountsTests(unittest.TestCase):
         self.assertIn("sign in", report.split("\n\n", 1)[1].lower())
         self.assertEqual(accounts.codex_home_label(self.home / ".codex1"), "~/.codex1")
 
-    def test_status_assigns_seats_to_the_selected_codex_home(self) -> None:
+    def test_status_assigns_workers_to_the_selected_codex_home(self) -> None:
         self.login_directory("claude2", "main@example.invalid", default=True)
         self.write_note("codex1", "spare@example.invalid")
         self.codex_login("default@example.invalid")
         selected = self.home / ".codex1"
         self.codex_login("spare@example.invalid", selected)
-        self.assertEqual(self.run_cli("set-role", "seats", "codex1"), (0, "", ""))
+        self.assertEqual(self.run_cli("set-role", "workers", "codex1"), (0, "", ""))
         with patch.dict(os.environ, {"CODEX_HOME": str(selected)}):
             rows = self.status_rows()[1:]
-        self.assertEqual([row[3] for row in rows], ["spare", "seats"])
+        self.assertEqual([row[3] for row in rows], ["spare", "workers"])
         self.assertEqual([row[0] for row in rows], ["~/.codex", "~/.codex1"])
 
     def test_status_reads_each_stale_codex_home_and_saves_both_readings(self) -> None:
@@ -2158,11 +2233,11 @@ class AccountsTests(unittest.TestCase):
         self.write_note("codex2", "spare@example.invalid")
         default = self.home / ".codex"
         spare = self.home / ".codex2"
-        self.codex_login("seats@example.invalid", default)
+        self.codex_login("workers@example.invalid", default)
         self.codex_login("spare@example.invalid", spare)
         later = datetime.now(timezone.utc) + timedelta(days=3)
         reports = {
-            default: agent_accounts.Report("Codex", email="seats@example.invalid",
+            default: agent_accounts.Report("Codex", email="workers@example.invalid",
                 quotas=[agent_accounts.Quota("Weekly", 20, later)], credit_balance="7"),
             spare: agent_accounts.Report("Codex", email="spare@example.invalid",
                 quotas=[agent_accounts.Quota("Weekly", 95, later)], credit_balance="11"),
@@ -2172,16 +2247,16 @@ class AccountsTests(unittest.TestCase):
         first = self.status_rows()[1:]
         second = self.status_rows()[1:]
 
-        self.assertEqual([row[6] for row in first], ["80%", "5%"])
-        self.assertEqual([row[9] for row in first], ["7", "11"])
+        self.assertEqual([row[4] for row in first], ["80%", "5%"])
+        self.assertEqual([row[7] for row in first], ["7", "11"])
         self.assertEqual(first, second)
         self.assertCountEqual(self.codex_reads.await_args_list, [call(default), call(spare)])
         stored = usage_store.load()
-        seats_usage = stored[usage_store.key("Codex", "seats@example.invalid")]
+        workers_usage = stored[usage_store.key("Codex", "workers@example.invalid")]
         spare_usage = stored[usage_store.key("Codex", "spare@example.invalid")]
-        if "weekly" not in seats_usage or "weekly" not in spare_usage:
+        if "weekly" not in workers_usage or "weekly" not in spare_usage:
             self.fail("Both signed-in homes must save their weekly readings")
-        self.assertEqual(seats_usage["weekly"]["left"], 80)
+        self.assertEqual(workers_usage["weekly"]["left"], 80)
         self.assertEqual(spare_usage["weekly"]["left"], 5)
 
     def test_status_reads_only_the_codex_home_with_an_old_reading(self) -> None:
@@ -2189,11 +2264,11 @@ class AccountsTests(unittest.TestCase):
         self.write_note("codex1", "spare@example.invalid")
         default = self.home / ".codex"
         spare = self.home / ".codex1"
-        self.codex_login("seats@example.invalid", default)
+        self.codex_login("workers@example.invalid", default)
         self.codex_login("spare@example.invalid", spare)
         now = datetime.now(timezone.utc)
         later = now + timedelta(days=3)
-        fresh = agent_accounts.Report("Codex", email="seats@example.invalid",
+        fresh = agent_accounts.Report("Codex", email="workers@example.invalid",
             quotas=[agent_accounts.Quota("Weekly", 20, later)], credit_balance="7")
         old = agent_accounts.Report("Codex", email="spare@example.invalid",
             quotas=[agent_accounts.Quota("Weekly", 70, later)], credit_balance="11")
@@ -2205,8 +2280,8 @@ class AccountsTests(unittest.TestCase):
         rows = self.status_rows()[1:]
 
         self.codex_reads.assert_awaited_once_with(spare)
-        self.assertEqual([row[6] for row in rows], ["80%", "5%"])
-        self.assertEqual([row[9] for row in rows], ["7", "13"])
+        self.assertEqual([row[4] for row in rows], ["80%", "5%"])
+        self.assertEqual([row[7] for row in rows], ["7", "13"])
 
     def test_status_prints_codex_check_problems_below_the_table(self) -> None:
         self.login_directory("claude2", "main@example.invalid", default=True)
@@ -2243,10 +2318,10 @@ class AccountsTests(unittest.TestCase):
 
         rows = self.status_rows()
 
-        self.assertEqual(rows[0][4:7], ("unavailable", "unavailable", "75%"))
-        self.assertEqual(rows[0][10], read.astimezone(ZoneInfo("America/Los_Angeles")).strftime("%H:%M %Z"))
+        self.assertEqual(rows[0][4], "75%")
+        self.assertEqual(rows[0][8], read.astimezone(ZoneInfo("America/Los_Angeles")).strftime("%H:%M %Z"))
         # claude3 is logged in and has never been read.
-        self.assertEqual(rows[1][2:], ("unit@example.invalid", "", *("unavailable",) * 4, "—", "—", "—"))
+        self.assertEqual(rows[1][2:], ("unit@example.invalid", "", *("unavailable",) * 2, "—", "—", "—"))
         self.assertEqual(self.live_reads.call_count, 2)
 
     def test_status_times_use_the_users_zone_setting_when_no_production_runs_or_none_can_be_read(self) -> None:
@@ -2260,11 +2335,11 @@ class AccountsTests(unittest.TestCase):
 
         with patch.dict(os.environ, {"USER_ZONE": "Europe/Paris"}):
             with patch.object(showrunners, "registered_showrunners", return_value=[]):
-                self.assertEqual(self.status_rows()[0][7], setting)
+                self.assertEqual(self.status_rows()[0][5], setting)
             with patch.object(showrunners, "registered_showrunners", side_effect=OSError("session records unreadable")):
-                self.assertEqual(self.status_rows()[0][7], setting)
+                self.assertEqual(self.status_rows()[0][5], setting)
         self.assertEqual(
-            self.status_rows()[0][7],
+            self.status_rows()[0][5],
             resets.astimezone(ZoneInfo("America/Los_Angeles")).strftime("%a %m-%d %H:%M %Z"),
         )
 
@@ -2276,7 +2351,7 @@ class AccountsTests(unittest.TestCase):
         )], datetime.now(timezone.utc))
         zone = ZoneInfo("Asia/Tokyo")
         with patch.object(agent_accounts, "user_zone", return_value=zone) as resolve:
-            self.assertEqual(self.status_rows()[0][7], resets.astimezone(zone).strftime("%a %m-%d %H:%M %Z"))
+            self.assertEqual(self.status_rows()[0][5], resets.astimezone(zone).strftime("%a %m-%d %H:%M %Z"))
         resolve.assert_called_once_with()
 
 
@@ -2333,7 +2408,7 @@ class AccountsTests(unittest.TestCase):
                 self.assertEqual(stdout, "")
                 self.assertEqual(
                     stderr,
-                    "accounts: unknown is not a role; only unit, showrunner and seats are supported\n",
+                    "accounts: unknown is not a role; only unit, showrunner and workers are supported\n",
                 )
 
 
@@ -2343,7 +2418,7 @@ class AccountsTests(unittest.TestCase):
 
 
 
-    def seats_fixture(self) -> tuple[Path, Path]:
+    def workers_fixture(self) -> tuple[Path, Path]:
         default = self.home / ".codex"
         target = self.home / ".codex1"
         self.write_note("codex1", "target@example.invalid")
@@ -2356,19 +2431,44 @@ class AccountsTests(unittest.TestCase):
             quotas=[agent_accounts.Quota("Weekly", 30, now + timedelta(days=3))], credit_balance="0")
         return default, target
 
-    def test_seats_role_defaults_independently_of_the_callers_home(self) -> None:
+    def test_workers_role_defaults_independently_of_the_callers_home(self) -> None:
         with patch.dict(os.environ, {"CODEX_HOME": str(self.root / "caller")}):
-            self.assertEqual(self.run_cli("role", "seats"), (0, "~/.codex\n", ""))
-            self.assertEqual(agent_accounts.seats_home(), self.home / ".codex")
+            self.assertEqual(self.run_cli("role", "workers"), (0, "~/.codex\n", ""))
+            self.assertEqual(agent_accounts.workers_home(), self.home / ".codex")
         self.assertEqual(self.role_files(), {})
 
-    def test_seats_environment_overrides_the_caller_for_default_and_numbered_roles(self) -> None:
-        default, target = self.seats_fixture()
+    def test_old_selected_worker_account_is_shared_by_accounts_and_whoami_until_normal_write(self) -> None:
+        _, target = self.workers_fixture()
+        path = accounts.accounts_config_file()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        _ = path.write_text('{"seats": "codex1"}')
+        original = path.read_bytes()
+        for _ in range(2):
+            self.assertEqual(agent_accounts.workers_home(), target)
+            selected = accounts.role_account("workers")
+            self.assertEqual((selected.label, selected.home), ("codex1", target))
+            self.assertEqual(self.run_cli("role", "workers"), (0, "codex1\n", ""))
+        self.assertEqual(path.read_bytes(), original)
+        self.assertEqual(self.run_cli("set-role", "workers", "codex2"), (0, "", ""))
+        self.assertEqual(json.loads(path.read_text()), {"workers": "codex2"})
+
+    def test_worker_swap_rejects_the_old_role_without_changing_selection(self) -> None:
+        _ = self.workers_fixture()
+        before = self.role_files()
+        for verb in ("swap", "set-role", "role", "env"):
+            arguments = (verb, "seats", "codex1") if verb in ("swap", "set-role") else (verb, "seats")
+            code, stdout, stderr = self.run_cli(*arguments)
+            self.assertNotEqual(code, 0)
+            self.assertIn("not a role", stdout + stderr)
+        self.assertEqual(self.role_files(), before)
+
+    def test_workers_environment_overrides_the_caller_for_default_and_numbered_roles(self) -> None:
+        default, target = self.workers_fixture()
         with patch.dict(os.environ, {"CODEX_HOME": str(self.root / "caller")}):
             for label, home in (("codex1", target), ("codex2", default)):
                 with self.subTest(label=label):
-                    self.assertEqual(self.run_cli("set-role", "seats", label), (0, "", ""))
-                    result, stdout, stderr = self.run_cli("env", "seats")
+                    self.assertEqual(self.run_cli("set-role", "workers", label), (0, "", ""))
+                    result, stdout, stderr = self.run_cli("env", "workers")
                     self.assertEqual((result, stderr), (0, ""))
                     self.assertEqual(shlex.split(stdout), [f"CODEX_HOME={home}"])
 
@@ -2407,36 +2507,36 @@ class AccountsTests(unittest.TestCase):
         self.seed_room("main@example.invalid")
         with patch.dict(os.environ, {"CODEX_HOME": str(self.root / "caller")}):
             unit = accounts.role_account("unit")
-            seats = accounts.role_account("seats")
-            self.assertIsInstance(seats, accounts.CodexSeatsAccount)
-            self.assertEqual((seats.home, seats.label), (self.home / ".codex", "~/.codex"))
+            workers = accounts.role_account("workers")
+            self.assertIsInstance(workers, accounts.CodexWorkersAccount)
+            self.assertEqual((workers.home, workers.label), (self.home / ".codex", "~/.codex"))
             self.assertEqual(accounts.account_prefix(unit), "")
-            self.assertEqual(shlex.split(accounts.account_prefix(seats)), [f"CODEX_HOME={self.home / '.codex'}"])
-            self.assertEqual(accounts.launch_prefix("seats"), accounts.account_prefix(seats))
+            self.assertEqual(shlex.split(accounts.account_prefix(workers)), [f"CODEX_HOME={self.home / '.codex'}"])
+            self.assertEqual(accounts.launch_prefix("workers"), accounts.account_prefix(workers))
 
-    def test_seats_prefix_retains_its_home_when_the_role_changes(self) -> None:
-        default, target = self.seats_fixture()
-        before = accounts.role_account("seats")
-        self.assertEqual(self.run_cli("set-role", "seats", "codex1"), (0, "", ""))
-        selected = accounts.role_account("seats")
-        self.assertEqual(self.run_cli("set-role", "seats", "codex2"), (0, "", ""))
-        with patch.object(agent_accounts, "seats_home", side_effect=AssertionError("A prefix must keep its selection")):
+    def test_workers_prefix_retains_its_home_when_the_role_changes(self) -> None:
+        default, target = self.workers_fixture()
+        before = accounts.role_account("workers")
+        self.assertEqual(self.run_cli("set-role", "workers", "codex1"), (0, "", ""))
+        selected = accounts.role_account("workers")
+        self.assertEqual(self.run_cli("set-role", "workers", "codex2"), (0, "", ""))
+        with patch.object(agent_accounts, "workers_home", side_effect=AssertionError("A prefix must keep its selection")):
             self.assertEqual(shlex.split(accounts.account_prefix(before)), [f"CODEX_HOME={default}"])
             self.assertEqual(shlex.split(accounts.account_prefix(selected)), [f"CODEX_HOME={target}"])
         self.assertEqual((selected.home, selected.label), (target, "codex1"))
 
-    def test_unreadable_seats_role_becomes_an_accounts_error_at_resolution(self) -> None:
-        for error in (ValueError("invalid seats account"), OSError("role file unreadable")):
-            with self.subTest(error=error), patch.object(agent_accounts, "seats_home", side_effect=error):
-                result, stdout, stderr = self.run_cli("env", "seats")
+    def test_unreadable_workers_role_becomes_an_accounts_error_at_resolution(self) -> None:
+        for error in (ValueError("invalid workers account"), OSError("role file unreadable")):
+            with self.subTest(error=error), patch.object(agent_accounts, "workers_home", side_effect=error):
+                result, stdout, stderr = self.run_cli("env", "workers")
                 self.assertEqual((result, stdout), (1, ""))
                 self.assertIn(str(error), stderr)
                 with self.assertRaises(accounts.AccountsError):
-                    _ = accounts.role_account("seats")
+                    _ = accounts.role_account("workers")
 
-    def test_refused_seats_selection_names_the_tool_once(self) -> None:
+    def test_refused_workers_selection_names_the_tool_once(self) -> None:
         (self.home / ".codex1").mkdir(exist_ok=True)
-        result, stdout, stderr = self.run_cli("set-role", "seats", "codex1")
+        result, stdout, stderr = self.run_cli("set-role", "workers", "codex1")
         self.assertEqual((result, stdout), (1, ""))
         self.assertTrue(stderr.startswith("accounts: cannot select codex1 (~/.codex1): "), stderr)
         self.assertEqual(stderr.count("accounts: "), 1, stderr)
@@ -2448,35 +2548,35 @@ class AccountsTests(unittest.TestCase):
                     _ = self.run_cli("status")
 
 
-    def test_seats_only_configuration_preserves_claude_selection(self) -> None:
-        _ = self.seats_fixture()
+    def test_workers_only_configuration_preserves_claude_selection(self) -> None:
+        _ = self.workers_fixture()
         self.login_directory("claude2", "main@example.invalid", default=True)
         before = accounts.claude_account_selection()
         for label in ("codex1", "codex2"):
             with self.subTest(label=label):
-                self.assertEqual(self.run_cli("set-role", "seats", label), (0, "", ""))
+                self.assertEqual(self.run_cli("set-role", "workers", label), (0, "", ""))
                 self.assertEqual(accounts.claude_account_selection(), before)
                 self.assertFalse(accounts.multiple_accounts_configured())
 
 
-    def test_failed_seats_history_write_restores_both_roles(self) -> None:
-        _ = self.seats_fixture()
+    def test_failed_workers_history_write_restores_both_roles(self) -> None:
+        _ = self.workers_fixture()
         self.login_directory("claude2", "main@example.invalid", default=True)
         self.login_directory("claude3", "unit@example.invalid")
         self.select_named_unit("claude3")
         before = self.role_files()
         with patch.object(accounts, "_append_role_change", side_effect=OSError("disk full")):
-            result, _, stderr = self.run_cli("set-role", "seats", "codex1")
+            result, _, stderr = self.run_cli("set-role", "workers", "codex1")
         self.assertNotEqual(result, 0)
         self.assertIn("disk full", stderr)
         self.assertEqual(self.role_files(), before)
 
-    def test_burn_skips_group_history_between_legacy_unit_and_seats_entries(self) -> None:
+    def test_burn_skips_group_history_between_legacy_unit_and_workers_entries(self) -> None:
         self.login_directory("claude2", "main@example.invalid", default=True)
         self.write_role_history([accounts.RoleChange(at="2026-10-08T00:00:00Z", role="unit",
             label="claude3", account_label="claude3")])
         with accounts.roles_history_file().open("a") as history:
-            for entry in ({"at": "2026-10-09T00:00:00Z", "role": "seats", "label": "default"},
+            for entry in ({"at": "2026-10-09T00:00:00Z", "role": "workers", "label": "default"},
                           {"at": "2026-10-09T00:00:00Z", "group": "units", "label": "claude1", "why": "refused"},
                           {"at": "2026-10-09T00:00:00Z", "group": "showrunners", "label": "claude3", "why": "refused"}):
                 _ = history.write(json.dumps(entry) + "\n")
@@ -2485,59 +2585,59 @@ class AccountsTests(unittest.TestCase):
         self.assertEqual(accounts.burn(datetime(2026, 10, 9, tzinfo=timezone.utc), datetime(2026, 10, 10, tzinfo=timezone.utc)),
             [accounts.AccountRoleBurn("claude3", ("unit directors",), 10, 1)])
 
-    def test_unit_burn_ignores_seats_history_records(self) -> None:
-        _ = self.seats_fixture()
+    def test_unit_burn_ignores_workers_history_records(self) -> None:
+        _ = self.workers_fixture()
         self.login_directory("claude2", "main@example.invalid", default=True)
         self.login_directory("claude3", "unit@example.invalid")
         with patch.object(accounts, "datetime", RoleWriteTime):
             self.write_role_history([accounts.RoleChange(at="2026-10-08T00:00:00Z", role="unit", label="claude3", account_label="claude3")])
-            self.assertEqual(self.run_cli("set-role", "seats", "codex1"), (0, "", ""))
-            self.assertEqual(self.run_cli("set-role", "seats", "codex2"), (0, "", ""))
+            self.assertEqual(self.run_cli("set-role", "workers", "codex1"), (0, "", ""))
+            self.assertEqual(self.run_cli("set-role", "workers", "codex2"), (0, "", ""))
         self.write_readings([accounts.QuotaReading(account="claude3", at=f"2026-10-{day:02d}T00:00:00Z", remaining=left)
             for day, left in ((9, 90.0), (10, 80.0))])
         self.assertEqual(accounts.burn(datetime(2026, 10, 9, tzinfo=timezone.utc), datetime(2026, 10, 10, tzinfo=timezone.utc)),
             [accounts.AccountRoleBurn("claude3", ("unit directors",), 10, 1)])
 
-    def test_seats_swap_dry_run_names_target_and_preserves_roles_and_history(self) -> None:
-        _, target = self.seats_fixture()
+    def test_workers_swap_dry_run_names_target_and_preserves_roles_and_history(self) -> None:
+        _, target = self.workers_fixture()
         before = self.role_files()
-        with patch.object(codex_mesh, "retire_seats_servers", return_value=["unit-one would move"]) as retire:
-            result, stdout, stderr = self.run_cli("swap", "seats", "codex1", "--dry-run")
+        with patch.object(codex_mesh, "retire_workers_servers", return_value=["unit-one would move"]) as retire:
+            result, stdout, stderr = self.run_cli("swap", "workers", "codex1", "--dry-run")
         self.assertEqual((result, stderr), (0, ""))
         self.assertIn("codex1", stdout)
         self.assertIn("~/.codex1", stdout)
         self.assertEqual(self.role_files(), before)
         retire.assert_called_once_with(target, "codex1", dry_run=True)
 
-    def test_numbered_seats_target_selects_the_login_in_the_home_directory(self) -> None:
-        default, _ = self.seats_fixture()
-        self.assertEqual(self.run_cli("set-role", "seats", "codex1"), (0, "", ""))
+    def test_numbered_workers_target_selects_the_login_in_the_home_directory(self) -> None:
+        default, _ = self.workers_fixture()
+        self.assertEqual(self.run_cli("set-role", "workers", "codex1"), (0, "", ""))
         report = cast(agent_accounts.Report, self.codex_reads.return_value)
         report.email = "default@example.invalid"
         report.source = agent_accounts.CodexHomeSource(default)
         before = self.role_files()
-        with patch.object(codex_mesh, "retire_seats_servers", return_value=[]) as retire:
-            code, stdout, stderr = self.run_cli("swap", "seats", "codex2", "--dry-run")
+        with patch.object(codex_mesh, "retire_workers_servers", return_value=[]) as retire:
+            code, stdout, stderr = self.run_cli("swap", "workers", "codex2", "--dry-run")
         self.assertEqual((code, stderr), (0, ""))
         self.assertIn("codex2 (~/.codex)", stdout)
         self.assertEqual(self.role_files(), before)
         retire.assert_called_once_with(default, "codex2", dry_run=True)
-        self.assertEqual(self.run_cli("set-role", "seats", "codex2"), (0, "", ""))
-        self.assertEqual(agent_accounts.seats_home(), default)
-        self.assertEqual(self.run_cli("role", "seats"), (0, "codex2\n", ""))
-        self.assertEqual(accounts.role_account("seats").home, default)
-        self.assertEqual(json.loads(accounts.accounts_config_file().read_text())["seats"], "codex2")
+        self.assertEqual(self.run_cli("set-role", "workers", "codex2"), (0, "", ""))
+        self.assertEqual(agent_accounts.workers_home(), default)
+        self.assertEqual(self.run_cli("role", "workers"), (0, "codex2\n", ""))
+        self.assertEqual(accounts.role_account("workers").home, default)
+        self.assertEqual(json.loads(accounts.accounts_config_file().read_text())["workers"], "codex2")
 
-    def test_seats_swap_refuses_paid_credits_when_the_target_setting_is_off(self) -> None:
-        _, target = self.seats_fixture()
+    def test_workers_swap_refuses_paid_credits_when_the_target_setting_is_off(self) -> None:
+        _, target = self.workers_fixture()
         note = Path(os.environ["AGENT_NOTES_DIR"]) / "codex1.md"
         _ = note.write_text("---\nlogin: target@example.invalid\nuse_credits: off\n---\n")
         report = cast(agent_accounts.Report, self.codex_reads.return_value)
         report.quotas = [agent_accounts.Quota("Weekly", 100, datetime.now(timezone.utc) + timedelta(days=1))]
         report.credit_balance = "6370"
         before = self.role_files()
-        with patch.object(codex_mesh, "retire_seats_servers") as retire:
-            code, stdout, stderr = self.run_cli("swap", "seats", "codex1")
+        with patch.object(codex_mesh, "retire_workers_servers") as retire:
+            code, stdout, stderr = self.run_cli("swap", "workers", "codex1")
         self.assertNotEqual(code, 0)
         self.assertIn("is used up and set not to use credits; choose another account or wait for reset", stdout + stderr)
         self.assertIn("codex1 (~/.codex1)", stdout + stderr)
@@ -2545,51 +2645,51 @@ class AccountsTests(unittest.TestCase):
         self.assertEqual(target, self.home / ".codex1")
         retire.assert_not_called()
 
-    def test_seats_swap_writes_role_before_retiring_servers(self) -> None:
-        _, target = self.seats_fixture()
+    def test_workers_swap_writes_role_before_retiring_servers(self) -> None:
+        _, target = self.workers_fixture()
         observed: list[Path] = []
         def retire(home: Path, label: str, dry_run: bool = False) -> list[str]:
             self.assertFalse(dry_run)
             self.assertEqual((home, label), (target, "codex1"))
-            observed.append(agent_accounts.seats_home())
+            observed.append(agent_accounts.workers_home())
             return ["unit-one: codex1 (~/.codex1); current turn finishes, next turn moves"]
-        with patch.object(codex_mesh, "retire_seats_servers", side_effect=retire):
-            result, stdout, stderr = self.run_cli("swap", "seats", "codex1")
+        with patch.object(codex_mesh, "retire_workers_servers", side_effect=retire):
+            result, stdout, stderr = self.run_cli("swap", "workers", "codex1")
         self.assertEqual((result, stderr), (0, ""))
         self.assertEqual(observed, [target])
         self.assertIn("unit-one", stdout)
-        self.assertEqual(self.run_cli("role", "seats"), (0, "codex1\n", ""))
+        self.assertEqual(self.run_cli("role", "workers"), (0, "codex1\n", ""))
 
-    def test_seats_swap_refuses_current_role_without_mutation(self) -> None:
-        _ = self.seats_fixture()
-        self.assertEqual(self.run_cli("set-role", "seats", "codex1"), (0, "", ""))
+    def test_workers_swap_refuses_current_role_without_mutation(self) -> None:
+        _ = self.workers_fixture()
+        self.assertEqual(self.run_cli("set-role", "workers", "codex1"), (0, "", ""))
         before = self.role_files()
-        with patch.object(codex_mesh, "retire_seats_servers") as retire:
-            result, stdout, stderr = self.run_cli("swap", "seats", "codex1")
+        with patch.object(codex_mesh, "retire_workers_servers") as retire:
+            result, stdout, stderr = self.run_cli("swap", "workers", "codex1")
         self.assertNotEqual(result, 0)
         self.assertIn("codex1", stdout + stderr)
         self.assertEqual(self.role_files(), before)
         retire.assert_not_called()
 
-    def test_seats_swap_accepts_default_real_shared_entries(self) -> None:
-        default, _ = self.seats_fixture()
+    def test_workers_swap_accepts_default_real_shared_entries(self) -> None:
+        default, _ = self.workers_fixture()
         _ = (default / "config.toml").write_text("own config")
         (default / "sessions").mkdir()
         for name in ("config.toml", "sessions"):
             _ = (self.home / ".codex1" / name).symlink_to(default / name)
-        self.assertEqual(self.run_cli("set-role", "seats", "codex1"), (0, "", ""))
+        self.assertEqual(self.run_cli("set-role", "workers", "codex1"), (0, "", ""))
         report = cast(agent_accounts.Report, self.codex_reads.return_value)
         report.email = "default@example.invalid"
         report.source = agent_accounts.CodexHomeSource(default)
-        with patch.object(codex_mesh, "retire_seats_servers", return_value=[]) as retire:
-            result, _, stderr = self.run_cli("swap", "seats", "codex2")
+        with patch.object(codex_mesh, "retire_workers_servers", return_value=[]) as retire:
+            result, _, stderr = self.run_cli("swap", "workers", "codex2")
         self.assertEqual((result, stderr), (0, ""))
         retire.assert_called_once_with(default, "codex2", dry_run=False)
-        self.assertEqual(self.run_cli("role", "seats"), (0, "codex2\n", ""))
+        self.assertEqual(self.run_cli("role", "workers"), (0, "codex2\n", ""))
 
-    def test_seats_swap_default_refuses_unreadable_or_duplicate_login_without_mutation(self) -> None:
-        default, _ = self.seats_fixture()
-        self.assertEqual(self.run_cli("set-role", "seats", "codex1"), (0, "", ""))
+    def test_workers_swap_default_refuses_unreadable_or_duplicate_login_without_mutation(self) -> None:
+        default, _ = self.workers_fixture()
+        self.assertEqual(self.run_cli("set-role", "workers", "codex1"), (0, "", ""))
         before = self.role_files()
         for condition in ("unreadable", "duplicate"):
             with self.subTest(condition=condition):
@@ -2598,15 +2698,15 @@ class AccountsTests(unittest.TestCase):
                 else:
                     self.codex_login("default@example.invalid", default)
                     self.codex_login("default@example.invalid", self.home / ".codex3")
-                with patch.object(codex_mesh, "retire_seats_servers") as retire:
-                    result, stdout, stderr = self.run_cli("swap", "seats", "codex2")
+                with patch.object(codex_mesh, "retire_workers_servers") as retire:
+                    result, stdout, stderr = self.run_cli("swap", "workers", "codex2")
                 self.assertNotEqual(result, 0)
                 self.assertIn("~/.codex", stdout + stderr)
                 self.assertEqual(self.role_files(), before)
                 retire.assert_not_called()
 
-    def test_seats_swap_refuses_exhausted_unknown_and_expired_usage(self) -> None:
-        _, target = self.seats_fixture()
+    def test_workers_swap_refuses_exhausted_unknown_and_expired_usage(self) -> None:
+        _, target = self.workers_fixture()
         before = self.role_files()
         now = datetime.now(timezone.utc)
         for report in (
@@ -2616,39 +2716,39 @@ class AccountsTests(unittest.TestCase):
             agent_accounts.Report("Codex", email="target@example.invalid", five_hour=agent_accounts.Quota("5-hour", 0, now - timedelta(seconds=1)),
                 quotas=[agent_accounts.Quota("Weekly", 0, now + timedelta(days=1))], credit_balance="0"),
         ):
-            with self.subTest(report=report), patch.object(codex_mesh, "retire_seats_servers") as retire:
+            with self.subTest(report=report), patch.object(codex_mesh, "retire_workers_servers") as retire:
                 report.source = agent_accounts.CodexHomeSource(target)
                 self.codex_reads.return_value = report
-                result, stdout, stderr = self.run_cli("swap", "seats", "codex1")
+                result, stdout, stderr = self.run_cli("swap", "workers", "codex1")
                 self.assertNotEqual(result, 0)
                 self.assertIn("codex1", stdout + stderr)
                 self.assertIn("~/.codex1", stdout + stderr)
                 self.assertEqual(self.role_files(), before)
                 retire.assert_not_called()
 
-    def test_seats_swap_accepts_credits_when_a_window_is_used_up(self) -> None:
-        _ = self.seats_fixture()
+    def test_workers_swap_accepts_credits_when_a_window_is_used_up(self) -> None:
+        _ = self.workers_fixture()
         report = cast(agent_accounts.Report, self.codex_reads.return_value)
         report.five_hour = agent_accounts.Quota("5-hour", 100, datetime.now(timezone.utc) + timedelta(hours=1))
         report.credit_balance = "5"
-        self.assertEqual(self.run_cli("swap", "seats", "codex1")[0], 0)
+        self.assertEqual(self.run_cli("swap", "workers", "codex1")[0], 0)
 
-    def test_seats_swap_start_failure_names_setup_without_mutating_role_or_history(self) -> None:
-        _, target = self.seats_fixture()
+    def test_workers_swap_start_failure_names_setup_without_mutating_role_or_history(self) -> None:
+        _, target = self.workers_fixture()
         before = self.role_files()
         command = '/showrunner:accounts setup "codex1"'
         self.codex_reads.return_value = agent_accounts.Report("Codex", source=agent_accounts.CodexHomeSource(target),
             problem=f"Codex did not start at ~/.codex1; run {command} and try again")
-        with patch.object(codex_mesh, "retire_seats_servers") as retire:
-            result, stdout, stderr = self.run_cli("swap", "seats", "codex1")
+        with patch.object(codex_mesh, "retire_workers_servers") as retire:
+            result, stdout, stderr = self.run_cli("swap", "workers", "codex1")
         self.assertNotEqual(result, 0)
         self.assertIn(command, stdout + stderr)
         self.assertIn("~/.codex1", stdout + stderr)
         self.assertEqual(self.role_files(), before)
         retire.assert_not_called()
 
-    def test_seats_swap_refuses_a_login_change_during_the_usage_read(self) -> None:
-        _, target = self.seats_fixture()
+    def test_workers_swap_refuses_a_login_change_during_the_usage_read(self) -> None:
+        _, target = self.workers_fixture()
         before = self.role_files()
         report = cast(agent_accounts.Report, self.codex_reads.return_value)
         def read(home: Path) -> agent_accounts.Report:
@@ -2656,8 +2756,8 @@ class AccountsTests(unittest.TestCase):
             self.codex_login("different@example.invalid", target)
             return report
         self.codex_reads.side_effect = read
-        with patch.object(codex_mesh, "retire_seats_servers") as retire:
-            result, stdout, stderr = self.run_cli("swap", "seats", "codex1")
+        with patch.object(codex_mesh, "retire_workers_servers") as retire:
+            result, stdout, stderr = self.run_cli("swap", "workers", "codex1")
         self.assertNotEqual(result, 0)
         self.assertIn("codex1", stdout + stderr)
         self.assertIn("~/.codex1", stdout + stderr)
@@ -2665,7 +2765,7 @@ class AccountsTests(unittest.TestCase):
         retire.assert_not_called()
 
     def test_codex_log_directory_is_own_state(self) -> None:
-        _, target = self.seats_fixture()
+        _, target = self.workers_fixture()
         (target / "log").mkdir()
         self.assertEqual(self.run_cli("check", "codex1"), (0, "", ""))
 
@@ -2739,32 +2839,32 @@ _ = sys.stdin.read()
         self.assertEqual((process.returncode, errors), (0, ""))
         self.assertIn("CODEX_HOME=~/.codex1 codex login", output)
 
-    def test_table_seats_role_ignores_conflicting_process_home(self) -> None:
-        default, target = self.seats_fixture()
+    def test_table_workers_role_ignores_conflicting_process_home(self) -> None:
+        default, target = self.workers_fixture()
         self.login_directory("claude2", "main@example.invalid", default=True)
-        self.assertEqual(self.run_cli("set-role", "seats", "codex1"), (0, "", ""))
+        self.assertEqual(self.run_cli("set-role", "workers", "codex1"), (0, "", ""))
         with patch.dict(os.environ, {"CODEX_HOME": str(default)}):
             rows = self.status_rows()[1:]
-        self.assertEqual([(row[0], row[3]) for row in rows], [("~/.codex", "spare"), ("~/.codex1", "seats")])
-        self.assertEqual(agent_accounts.seats_home(), target)
+        self.assertEqual([(row[0], row[3]) for row in rows], [("~/.codex", "spare"), ("~/.codex1", "workers")])
+        self.assertEqual(agent_accounts.workers_home(), target)
 
-    def test_table_keeps_seats_selection_when_a_live_read_changes_the_role(self) -> None:
-        default, target = self.seats_fixture()
+    def test_table_keeps_workers_selection_when_a_live_read_changes_the_role(self) -> None:
+        default, target = self.workers_fixture()
         self.login_directory("claude2", "main@example.invalid", default=True)
-        self.assertEqual(self.run_cli("set-role", "seats", "codex1"), (0, "", ""))
+        self.assertEqual(self.run_cli("set-role", "workers", "codex1"), (0, "", ""))
         def read(home: Path) -> agent_accounts.Report:
             if home == default:
-                self.assertEqual(self.run_cli("set-role", "seats", "codex2"), (0, "", ""))
+                self.assertEqual(self.run_cli("set-role", "workers", "codex2"), (0, "", ""))
             return agent_accounts.Report("Codex", email="default@example.invalid" if home == default else "target@example.invalid",
                 source=agent_accounts.CodexHomeSource(home))
         self.codex_reads.side_effect = read
         rows = self.status_rows()[1:]
-        self.assertEqual([(row[0], row[3]) for row in rows], [("~/.codex", "spare"), ("~/.codex1", "seats")])
-        self.assertEqual(agent_accounts.seats_home(), default)
+        self.assertEqual([(row[0], row[3]) for row in rows], [("~/.codex", "spare"), ("~/.codex1", "workers")])
+        self.assertEqual(agent_accounts.workers_home(), default)
         self.assertNotEqual(target, default)
 
     def test_numbered_home_start_failure_row_names_setup(self) -> None:
-        _, target = self.seats_fixture()
+        _, target = self.workers_fixture()
         self.login_directory("claude2", "main@example.invalid", default=True)
         problem = 'Codex did not start at ~/.codex1; run /showrunner:accounts setup "codex1" and try again'
         startup = agent_accounts.CodexStartupFailure(target, '/showrunner:accounts setup "codex1"')
@@ -2775,16 +2875,17 @@ _ = sys.stdin.read()
         self.assertIn('/showrunner:accounts setup "codex1"', " ".join(target_row))
 
     def test_table_uses_the_startup_result_command_independently_of_problem_text(self) -> None:
-        _, target = self.seats_fixture()
+        _, target = self.workers_fixture()
         self.login_directory("claude2", "main@example.invalid", default=True)
         command = '/showrunner:accounts setup "codex1"'
         self.codex_reads.return_value = agent_accounts.Report("Codex", problem="Startup request timed out",
             codex_startup=agent_accounts.CodexStartupFailure(target, command))
         row = next(row for row in self.status_rows() if row[0] == "~/.codex1")
         self.assertEqual(row[4], command)
+        self.assertEqual(len(row), len(accounts.TABLE_HEADINGS))
 
     def test_table_does_not_treat_similar_error_text_as_a_startup_failure(self) -> None:
-        _, target = self.seats_fixture()
+        _, target = self.workers_fixture()
         self.login_directory("claude2", "main@example.invalid", default=True)
         self.codex_reads.return_value = agent_accounts.Report("Codex", problem="Codex did not start another service",
             source=agent_accounts.CodexHomeSource(target))
@@ -2806,12 +2907,12 @@ _ = sys.stdin.read()
         self.assertIn("limit", lines[0].lower())
         self.assertLess(stdout.index("initialize"), stdout.index("CODEX_HOME=~/.codex1 codex login"))
 
-    def test_legacy_unit_role_file_still_resolves_seats_to_default(self) -> None:
+    def test_legacy_unit_role_file_still_resolves_workers_to_default(self) -> None:
         config = accounts.accounts_config_file()
         config.parent.mkdir(parents=True, exist_ok=True)
         _ = config.write_text('{"unit": "claude3"}')
-        self.assertEqual(self.run_cli("role", "seats"), (0, "~/.codex\n", ""))
-        self.assertEqual(agent_accounts.seats_home(), self.home / ".codex")
+        self.assertEqual(self.run_cli("role", "workers"), (0, "~/.codex\n", ""))
+        self.assertEqual(agent_accounts.workers_home(), self.home / ".codex")
 
 
 @final
@@ -2906,12 +3007,98 @@ class PickerTests(unittest.TestCase):
             code = accounts.main(list(arguments))
         return code, output.getvalue(), error.getvalue()
 
+    def test_string_groups_read_without_a_transition_and_next_selection_stores_one_object(self) -> None:
+        path = self.groups()
+        original = path.read_bytes()
+        groups = accounts.group_accounts()
+        self.assertEqual(accounts.group_label(groups, "units"), "claude1")
+        self.assertEqual(accounts.group_note_labels(), {"units": "claude1", "showrunners": "claude3"})
+        self.assertIsInstance(accounts.group_transition("units"), accounts.NoGroupTransition)
+        self.assertEqual(path.read_bytes(), original)
+        transition = accounts.set_group_account("units", "claude2", why="operator choice", now=self.now)
+        stored = cast(dict[str, object], json.loads(path.read_text()))
+        selection = cast(dict[str, object], stored["units"])
+        self.assertEqual((selection["label"], selection["cause"], selection["window"]), ("claude2", "by hand", "unknown"))
+        self.assertNotIn("reset", selection)
+        self.assertTrue(selection["move_id"])
+        self.assertEqual(stored["showrunners"], "claude3")
+        self.assertEqual(accounts.group_transition("units"), transition)
+        self.assertEqual(accounts.group_note_labels(), {"units": "claude2", "showrunners": "claude3"})
+
+    def test_mixed_group_writes_keep_every_sibling_field_and_log_only_the_changed_group(self) -> None:
+        transition = {"label": "claude1", "move_id": "original-transition", "cause": "refusal",
+                      "window": "weekly", "reset": "2026-10-20T12:00:00+00:00"}
+        cases: tuple[tuple[dict[str, object], accounts.ClaudeGroup, str, accounts.ClaudeGroup], ...] = (
+            ({"units": "default", "showrunners": transition}, "showrunners", "claude3", "units"),
+            ({"units": transition, "showrunners": "claude3"}, "showrunners", "claude2", "units"),
+            ({"units": transition, "showrunners": "claude3"}, "units", "claude2", "showrunners"))
+        path = accounts.groups_file()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        for selections, changed, target, sibling in cases:
+            with self.subTest(changed=changed, sibling=selections[sibling]):
+                _ = path.write_text(json.dumps(selections))
+                history = accounts.roles_history_file()
+                history.unlink(missing_ok=True)
+                note = self.home / "notes/claude2.md"
+                content = note.read_bytes()
+                if selections["units"] == "default":
+                    note.unlink()
+                try:
+                    _ = accounts.set_group_account(changed, target, why="one group only", now=self.now)
+                finally:
+                    _ = note.write_bytes(content)
+                stored = cast(dict[str, object], json.loads(path.read_text()))
+                self.assertEqual(stored[sibling], selections[sibling])
+                self.assertIsInstance(stored[changed], dict)
+                self.assertNotIn("~/.claude", path.read_text())
+                rows = [cast(dict[str, object], json.loads(line)) for line in history.read_text().splitlines()]
+                self.assertEqual(len(rows), 1)
+                self.assertEqual(rows[0]["group"], changed)
+                selection = cast(dict[str, object], stored[changed])
+                self.assertEqual(rows[0]["move_id"], selection["move_id"])
+                self.assertEqual(rows[0]["cause"], selection["cause"])
+
+    def test_status_lists_work_routing_separately_from_account_moves(self) -> None:
+        self.codex("default", "worker@example.invalid")
+        common = moves.MoveCommon(at=self.now.isoformat(), tool="codex", subject="workers", move_id="account-move")
+        request: moves.RequestedMove = {**common, "kind": "requested", "from": "codex1", "to": "codex2",
+            "why": "manual", "window": "unknown", "cause": "by hand"}
+        moves.append_move(request)
+        stamp = self.now.isoformat()
+        moves.append_routing(moves.RoutedToClaude(kind="routed to claude", at=stamp, tool="codex",
+            fallback_at=stamp, owner="codex1", cause="credits off", moved=["delegate", "fix"]))
+        with patch.object(accounts, "datetime", PickerTime):
+            text = accounts.status_report(detail=True)
+        self.assertIn("by hand", text)
+        self.assertIn("Codex work routing:", text)
+        routing = text.split("Codex work routing:", 1)[1]
+        self.assertIn("routed to claude", routing)
+        self.assertIn("credits off", routing)
+        self.assertIn("delegate", routing)
+        self.assertIn("— open", routing)
+        self.assertNotIn("routed to claude", text.split("Codex work routing:", 1)[0])
+        moves.append_routing(moves.RoutedBack(kind="routed back", at=stamp, tool="codex",
+            fallback_at=stamp, owner="codex1", restored=["delegate"], kept=["fix"]))
+        failed_at = (self.now + timedelta(minutes=1)).isoformat()
+        moves.append_routing(moves.RoutedToClaude(kind="routed to claude", at=failed_at, tool="codex",
+            fallback_at=failed_at, owner="unknown", cause="refusal", moved=["delegate"]))
+        moves.append_routing(moves.RoutingNotRestored(kind="routing not restored", at=failed_at, tool="codex",
+            fallback_at=failed_at, owner="unknown", outcome="failed", restored=[], kept=[], failed=["delegate (unreadable)"]))
+        with patch.object(accounts, "datetime", PickerTime):
+            routing = accounts.status_report(detail=True).split("Codex work routing:", 1)[1]
+        self.assertEqual(routing.count("routed to claude"), 2)
+        self.assertIn("— routed back", routing)
+        self.assertIn("— not restored (failed)", routing)
+        self.assertIn("delegate (unreadable)", routing)
+        self.assertIn("owner unknown", routing)
+        self.assertNotIn("— open", routing)
+
     def test_default_input_is_refused_before_any_session_or_home_matcher(self) -> None:
         self.codex("default", "worker@example.invalid")
         expected = "accounts: name the account by number (~/.claude is claude2; ~/.codex is codex1)"
         commands = (("move", "some-session", "default"), ("move", "units", "default"),
-                    ("move", "showrunners", "default"), ("set-role", "seats", "default"),
-                    ("swap", "seats", "default"), ("exec", "default"), ("check", "default"),
+                    ("move", "showrunners", "default"), ("set-role", "workers", "default"),
+                    ("swap", "workers", "default"), ("exec", "default"), ("check", "default"),
                     *( ("pick", tool, option, "default") for tool in ("claude", "codex")
                        for option in ("--exclude", "--keep") ))
         with (patch.object(agent_accounts, "codex_home_matches_label",
@@ -2932,7 +3119,7 @@ class PickerTests(unittest.TestCase):
         code, stdout, stderr = self.group_cli("move", "units", "claude2")
         self.assertEqual((code, stderr), (0, ""), stdout)
         self.assertEqual(accounts.role_account("unit"), accounts.NamedAccount("claude2", self.home / ".claude"))
-        self.assertEqual(json.loads(accounts.groups_file().read_text()), {"units": "claude2"})
+        self.assertEqual(stored_group_labels(accounts.groups_file()), {"units": "claude2"})
         self.assertNotIn('"default"', accounts.roles_history_file().read_text())
         self.assertFalse((self.home / ".claude2").exists())
         self.assertEqual(accounts.group_note_labels(), {"units": "claude2"})
@@ -2948,8 +3135,8 @@ class PickerTests(unittest.TestCase):
             self.assertNotRegex(stdout, r"\bdefault\b")
             self.assertEqual(path.read_bytes(), original)
         self.assertEqual(accounts.group_note_labels(), {"units": "claude2", "showrunners": "claude3"})
-        accounts.set_group_account("showrunners", "claude1", why="numbered selection", now=self.now)
-        self.assertEqual(json.loads(path.read_text()), {"units": "default", "showrunners": "claude1"})
+        _ = accounts.set_group_account("showrunners", "claude1", why="numbered selection", now=self.now)
+        self.assertEqual(stored_group_labels(path), {"units": "default", "showrunners": "claude1"})
 
     def test_missing_or_unreadable_note_refuses_destination_and_leaves_group_storage_untouched(self) -> None:
         groups = self.groups()
@@ -2965,7 +3152,7 @@ class PickerTests(unittest.TestCase):
                 self.assertIn("claude3", str(resolution.exception))
                 self.assertIn(message, str(resolution.exception))
                 with self.assertRaises(accounts.AccountsError) as selection:
-                    accounts.set_group_account("units", "claude3", why="manual selection", now=self.now)
+                    _ = accounts.set_group_account("units", "claude3", why="manual selection", now=self.now)
                 self.assertIn("claude3", str(selection.exception))
                 self.assertIn(message, str(selection.exception))
                 self.assertEqual(groups.read_bytes(), original)
@@ -3018,33 +3205,33 @@ class PickerTests(unittest.TestCase):
         contents = note.read_bytes()
         note.unlink()
         self.assertEqual(accounts.group_accounts().get("units"), "~/.claude")
-        accounts.set_group_account("showrunners", "claude1", why="manual selection", now=self.now)
-        self.assertEqual(json.loads(path.read_text()), {"units": "default", "showrunners": "claude1"})
+        _ = accounts.set_group_account("showrunners", "claude1", why="manual selection", now=self.now)
+        self.assertEqual(stored_group_labels(path), {"units": "default", "showrunners": "claude1"})
         self.assertNotIn("~/.claude", path.read_text())
         _ = note.write_bytes(contents)
         self.assertEqual(accounts.role_account("unit"), accounts.NamedAccount("claude2", self.home / ".claude"))
 
-    def test_legacy_seats_selection_resolves_its_number_until_the_next_normal_write(self) -> None:
+    def test_legacy_workers_selection_resolves_its_number_until_the_next_normal_write(self) -> None:
         self.codex("default", "worker@example.invalid")
         self.codex("codex2", "spare@example.invalid")
         config = accounts.accounts_config_file()
         config.parent.mkdir(parents=True, exist_ok=True)
-        _ = config.write_text('{"seats": "default"}')
+        _ = config.write_text('{"workers": "default"}')
         original = config.read_bytes()
-        self.assertEqual(self.group_cli("role", "seats"), (0, "codex1\n", ""))
-        self.assertEqual(accounts.role_account("seats"), accounts.CodexSeatsAccount("codex1", self.home / ".codex"))
+        self.assertEqual(self.group_cli("role", "workers"), (0, "codex1\n", ""))
+        self.assertEqual(accounts.role_account("workers"), accounts.CodexWorkersAccount("codex1", self.home / ".codex"))
         self.assertEqual(config.read_bytes(), original)
-        self.assertEqual(self.group_cli("set-role", "seats", "codex2"), (0, "", ""))
-        self.assertEqual(json.loads(config.read_text()), {"seats": "codex2"})
+        self.assertEqual(self.group_cli("set-role", "workers", "codex2"), (0, "", ""))
+        self.assertEqual(json.loads(config.read_text()), {"workers": "codex2"})
         self.assertNotIn('"default"', accounts.roles_history_file().read_text())
 
-    def test_absent_seats_key_reports_the_codex_home_number_without_writing(self) -> None:
+    def test_absent_workers_key_reports_the_codex_home_number_without_writing(self) -> None:
         self.codex("default", "worker@example.invalid")
         config = accounts.accounts_config_file()
         config.parent.mkdir(parents=True, exist_ok=True)
         _ = config.write_text('{"unit": "claude3"}')
         original = config.read_bytes()
-        self.assertEqual(self.group_cli("role", "seats"), (0, "codex1\n", ""))
+        self.assertEqual(self.group_cli("role", "workers"), (0, "codex1\n", ""))
         self.assertEqual(config.read_bytes(), original)
         self.assertFalse(accounts.roles_history_file().exists())
 
@@ -3082,7 +3269,7 @@ class PickerTests(unittest.TestCase):
             _ = accounts.role_account("unit")
         self.assertEqual(path.read_bytes(), original)
 
-    def test_unnoted_codex_home_is_displayed_but_never_picked_or_assigned_to_seats(self) -> None:
+    def test_unnoted_codex_home_is_displayed_but_never_picked_or_assigned_to_workers(self) -> None:
         self.codex("default", "unnoted@example.invalid")
         self.codex("codex2", "spare@example.invalid")
         (self.home / "notes/codex1.md").unlink()
@@ -3096,14 +3283,14 @@ class PickerTests(unittest.TestCase):
         code, stdout, stderr = self.group_cli("status")
         self.assertEqual((code, stderr), (0, ""))
         self.assertIn(message, stdout)
-        for command in (("swap", "seats", "codex1"), ("set-role", "seats", "codex1"),
-                        ("swap", "seats", "default")):
+        for command in (("swap", "workers", "codex1"), ("set-role", "workers", "codex1"),
+                        ("swap", "workers", "default")):
             with self.subTest(command=command):
                 code, stdout, stderr = self.group_cli(*command)
                 self.assertNotEqual(code, 0)
                 self.assertIn(message, stdout + stderr)
-        self.assertEqual(self.group_cli("set-role", "seats", "codex2")[0], 0)
-        self.assertEqual(accounts.role_account("seats").label, "codex2")
+        self.assertEqual(self.group_cli("set-role", "workers", "codex2")[0], 0)
+        self.assertEqual(accounts.role_account("workers").label, "codex2")
 
     def test_reports_and_refusals_never_name_an_account_default_even_with_legacy_journal(self) -> None:
         self.codex("default", "worker@example.invalid")
@@ -3113,17 +3300,17 @@ class PickerTests(unittest.TestCase):
         history.parent.mkdir(parents=True, exist_ok=True)
         _ = history.write_text(''.join(json.dumps(entry) + "\n" for entry in (
             {"at": "2026-10-12T00:00:00Z", "role": "unit", "label": "default", "account_label": "claude2"},
-            {"at": "2026-10-12T00:00:00Z", "role": "seats", "label": "default", "account_label": "codex1"})))
+            {"at": "2026-10-12T00:00:00Z", "role": "workers", "label": "default", "account_label": "codex1"})))
         journal = moves.store_file()
         _ = journal.write_text(''.join(json.dumps(entry) + "\n" for entry in (
             {"at": "2026-10-13T00:00:00Z", "tool": "claude", "kind": "requested", "subject": "units",
              "move_id": "old-claude", "from": "claude1", "to": "default", "why": "quota", "window": "unknown"},
-            {"at": "2026-10-13T00:00:00Z", "tool": "codex", "kind": "requested", "subject": "seats",
+            {"at": "2026-10-13T00:00:00Z", "tool": "codex", "kind": "requested", "subject": "workers",
              "move_id": "old-codex", "from": "default", "to": "codex2", "why": "quota", "window": "unknown"})))
         original = journal.read_bytes()
         for command in (("--detail", "status"), ("placement", "--explain"), ("pick", "claude", "--explain"),
                         ("pick", "codex", "--explain"), ("move", "units", "claude99"),
-                        ("swap", "seats", "codex99")):
+                        ("swap", "workers", "codex99")):
             with self.subTest(command=command):
                 _, stdout, stderr = self.group_cli(*command)
                 self.assertTrue(stdout or stderr)
@@ -3139,10 +3326,10 @@ class PickerTests(unittest.TestCase):
         _ = self.groups(units="claude 1", showrunners="claude 3")
         config = accounts.accounts_config_file()
         config.parent.mkdir(parents=True, exist_ok=True)
-        _ = config.write_text('{"seats": "codex 2"}')
+        _ = config.write_text('{"workers": "codex 2"}')
         for arguments in (("status",), ("placement", "--explain"), ("pick", "claude", "--explain"),
-                          ("pick", "codex", "--explain"), ("role", "seats"),
-                          ("move", "units", "claude 99"), ("swap", "seats", "codex 99")):
+                          ("pick", "codex", "--explain"), ("role", "workers"),
+                          ("move", "units", "claude 99"), ("swap", "workers", "codex 99")):
             with self.subTest(arguments=arguments):
                 code, stdout, stderr = self.group_cli(*arguments)
                 self.assertTrue(stdout or stderr)
@@ -3152,10 +3339,10 @@ class PickerTests(unittest.TestCase):
                 else:
                     self.assertNotEqual(code, 0)
 
-    def test_placement_zero_percent_without_refusal_has_room_for_units(self) -> None:
+    def test_placement_fresh_zero_percent_without_refusal_selects_an_account_with_room(self) -> None:
         self.reading("Claude", "third@example.invalid", 0, 2, five_left=0)
         result = accounts.placement("units", self.now, exclude=frozenset())
-        self.assertEqual(result.label, "claude3")
+        self.assertEqual(result.label, "claude1")
         self.assertIsInstance(result.reason, accounts.UnitsResetSoonest)
 
     def test_placement_unresolved_refusal_excludes_positive_room(self) -> None:
@@ -3186,13 +3373,13 @@ class PickerTests(unittest.TestCase):
         self.assertEqual(accounts.placement("showrunners", self.now, exclude=frozenset()).label, "claude3")
         self.assertEqual(path.read_bytes(), before)
 
-    def test_placement_example_ranks_zero_percent_units_and_high_room_showrunners(self) -> None:
+    def test_placement_example_skips_zero_percent_units_and_ranks_high_room_showrunners(self) -> None:
         _ = self.groups()
         self.reading("Claude", "main@example.invalid", 0, 2)
         self.reading("Claude", "third@example.invalid", 3, 4)
         self.reading("Claude", "first@example.invalid", 53, 6)
         self.assertEqual(accounts.placement("showrunners", self.now, exclude=frozenset({"claude3"})).label, "claude1")
-        self.assertEqual(accounts.placement("units", self.now, exclude=frozenset({"claude1"})).label, "claude2")
+        self.assertEqual(accounts.placement("units", self.now, exclude=frozenset({"claude1"})).label, "claude3")
         with patch.object(accounts, "datetime", PickerTime):
             self.assertEqual(accounts.role_account("unit"), accounts.NamedAccount("claude1", accounts.account_dir("claude1")))
             self.assertEqual(accounts.role_account("showrunner"), accounts.NamedAccount("claude3", accounts.account_dir("claude3")))
@@ -3252,7 +3439,7 @@ class PickerTests(unittest.TestCase):
         with self.assertRaises(accounts.AccountsError) as refused:
             _ = accounts.role_account("showrunner")
         self.assertIn("accounts.py move showrunners <claudeN>", str(refused.exception))
-        self.assertEqual(json.loads(accounts.groups_file().read_text()), {"units": "claude1"})
+        self.assertEqual(stored_group_labels(accounts.groups_file()), {"units": "claude1"})
         self.assertFalse(moved.called)
 
     def test_status_opens_with_groups_and_role_cells_replace_next(self) -> None:
@@ -3278,6 +3465,17 @@ class PickerTests(unittest.TestCase):
             self.reading("Claude", login, 0, 2, age=timedelta(minutes=11), five_left=0)
         self.assert_picked("claude3", "--keep", "claude3")
         self.assert_picked("claude2", "--keep", "claude3", "--exclude", "claude3")
+        self.reading("Claude", "main@example.invalid", 50, 7)
+        self.reading("Claude", "first@example.invalid", 90, 5)
+        code, output, error = self.cli("--explain")
+        self.assertEqual((code, error), (0, ""))
+        explanation = next(line for line in output.splitlines() if line.startswith("claude3:"))
+        self.assertTrue(explanation.endswith("; has room; no reading in the last 10 minutes"), explanation)
+        for group in accounts.CLAUDE_GROUPS:
+            with self.subTest(group=group):
+                result = accounts.placement(group, self.now, exclude=frozenset({"claude1", "claude2"}))
+                self.assertEqual(result.label, "claude3")
+                self.assertNotIsInstance(result.reason, accounts.GroupNoRoom)
 
     def test_picker_without_fresh_readings_skips_refused_keep(self) -> None:
         usage_store.store_file().unlink()
@@ -3293,11 +3491,11 @@ class PickerTests(unittest.TestCase):
             refusals.UnknownWindow(), refusals.NoResetKnown(), self.now))
         self.assert_picked("claude1")
 
-    def test_picker_fresh_zero_candidate_remains_eligible_with_missing_other_readings(self) -> None:
+    def test_picker_fresh_zero_candidate_is_ineligible_even_with_missing_other_readings(self) -> None:
         usage_store.store_file().unlink()
         self.reading("Claude", "third@example.invalid", 0, 2)
         self.assert_picked("claude2", "--keep", "claude2")
-        self.assert_picked("claude3")
+        self.assert_picked("claude1")
 
     def test_picker_prefers_soonest_weekly_reset_over_most_room(self) -> None:
         self.assert_picked("claude3")
@@ -3313,9 +3511,9 @@ class PickerTests(unittest.TestCase):
     def test_picker_keeps_current_account_with_room_despite_a_sooner_reset(self) -> None:
         self.assert_picked("claude1", "--keep", "claude1")
 
-    def test_picker_keeps_zero_percent_account_without_a_refusal(self) -> None:
+    def test_picker_does_not_keep_a_fresh_zero_percent_account_without_a_refusal(self) -> None:
         self.reading("Claude", "first@example.invalid", 0, 2)
-        self.assert_picked("claude1", "--keep", "claude1")
+        self.assert_picked("claude3", "--keep", "claude1")
 
     def test_picker_has_no_minimum_remaining_percentage(self) -> None:
         self.reading("Claude", "third@example.invalid", 1, 2, five_left=1)
@@ -3327,9 +3525,42 @@ class PickerTests(unittest.TestCase):
     def test_picker_exclude_overrides_keep(self) -> None:
         self.assert_picked("claude1", "--keep", "claude3", "--exclude", "claude3")
 
-    def test_picker_zero_five_hour_window_without_refusal_still_has_room(self) -> None:
-        self.reading("Claude", "third@example.invalid", 90, 2, five_left=0)
-        self.assert_picked("claude3")
+    def test_picker_explains_fresh_zero_weekly_or_five_hour_as_no_room_and_placement_agrees(self) -> None:
+        for weekly, five_hour in ((0, 90), (90, 0)):
+            with self.subTest(weekly=weekly, five_hour=five_hour):
+                self.reading("Claude", "third@example.invalid", weekly, 2, five_left=five_hour)
+                code, output, error = self.cli("--explain")
+                self.assertEqual((code, error), (0, ""))
+                self.assertEqual(output.splitlines()[0], "claude1")
+                explanation = next(line for line in output.splitlines() if line.startswith("claude3:"))
+                self.assertTrue(explanation.endswith("; no room"), explanation)
+                self.assert_picked("claude1", "--keep", "claude3")
+                for group in accounts.CLAUDE_GROUPS:
+                    with self.subTest(group=group):
+                        result = accounts.placement(group, self.now)
+                        self.assertEqual(result.label, "claude1")
+                        reason = next(reason for reason in result.reasons if reason.label == "claude3")
+                        self.assertEqual(reason.status, "no room")
+
+    def test_picker_all_fresh_zero_candidates_refuses_with_the_soonest_reset_and_placement_agrees(self) -> None:
+        _ = self.groups()
+        cases = ((0, 50, False, self.now + timedelta(days=2), "Thu 2026-10-15 12:00 UTC"),
+                 (50, 0, True, self.now + timedelta(hours=3), "Tue 2026-10-13 15:00 UTC"))
+        for weekly, five_hour, five, earliest, reset_text in cases:
+            with self.subTest(weekly=weekly, five_hour=five_hour):
+                for login, days in (("main@example.invalid", 7), ("first@example.invalid", 5),
+                                    ("third@example.invalid", 2)):
+                    self.reading("Claude", login, weekly, days, five_left=five_hour, five=five)
+                code, output, error = self.cli("--explain")
+                self.assertEqual(code, 1, output + error)
+                self.assertIn("no claude account has room; the earliest reset is " + reset_text, output + error)
+                self.assertEqual(sum(line.endswith("; no room") for line in output.splitlines()), 3)
+                for group in accounts.CLAUDE_GROUPS:
+                    result = accounts.placement(group, self.now)
+                    self.assertEqual(result.label, "claude1" if group == "units" else "claude3")
+                    self.assertIsInstance(result.reason, accounts.GroupNoRoom)
+                    assert isinstance(result.reason, accounts.GroupNoRoom)
+                    self.assertEqual(result.reason.outcome.earliest_reset, accounts.EarliestReset(earliest))
 
     def test_picker_accepts_weekly_room_when_claude_has_no_five_hour_window(self) -> None:
         self.reading("Claude", "third@example.invalid", 1, 2, five=False)
@@ -3404,7 +3635,7 @@ class PickerTests(unittest.TestCase):
         self.assert_picked("codex2", "--exclude", "codex1", tool="codex")
 
     def test_codex_picker_without_fresh_readings_keeps_candidate_or_uses_the_home_account(self) -> None:
-        self.codex("default", "seats@example.invalid")
+        self.codex("default", "workers@example.invalid")
         self.codex("codex2", "other@example.invalid")
         self.assert_picked("codex1", tool="codex")
         self.assert_picked("codex2", "--keep", "codex2", tool="codex")
@@ -3413,27 +3644,27 @@ class PickerTests(unittest.TestCase):
         self.assert_picked("codex1", "--keep", "codex2", tool="codex")
 
     def test_picker_codex_credits_allow_work_after_both_windows_are_exhausted(self) -> None:
-        self.codex("default", "seats@example.invalid")
-        self.reading("Codex", "seats@example.invalid", 0, 2, five_left=0, credits="1")
+        self.codex("default", "workers@example.invalid")
+        self.reading("Codex", "workers@example.invalid", 0, 2, five_left=0, credits="1")
         self.assert_picked("codex1", tool="codex")
 
     def test_picker_skips_paid_room_on_a_credits_off_account(self) -> None:
-        self.codex("default", "seats@example.invalid")
+        self.codex("default", "workers@example.invalid")
         self.codex("codex2", "spare@example.invalid")
         note = self.home / "notes/codex1.md"
-        _ = note.write_text("---\nlogin: seats@example.invalid\nuse_credits: off\n---\n")
-        self.reading("Codex", "seats@example.invalid", 0, 1, credits="6370")
+        _ = note.write_text("---\nlogin: workers@example.invalid\nuse_credits: off\n---\n")
+        self.reading("Codex", "workers@example.invalid", 0, 1, credits="6370")
         self.reading("Codex", "spare@example.invalid", 1, 3)
         self.assert_picked("codex2", tool="codex")
 
     def test_picker_codex_unlimited_credits_allow_work(self) -> None:
-        self.codex("default", "seats@example.invalid")
-        self.reading("Codex", "seats@example.invalid", 0, 2, five_left=0, credits="unlimited")
+        self.codex("default", "workers@example.invalid")
+        self.reading("Codex", "workers@example.invalid", 0, 2, five_left=0, credits="unlimited")
         self.assert_picked("codex1", tool="codex")
 
     def test_picker_codex_without_credits_requires_both_windows_with_room(self) -> None:
-        self.codex("default", "seats@example.invalid")
-        self.reading("Codex", "seats@example.invalid", 80, 2, five_left=0)
+        self.codex("default", "workers@example.invalid")
+        self.reading("Codex", "workers@example.invalid", 80, 2, five_left=0)
         code, output, error = self.cli(tool="codex")
         self.assertEqual(code, 1)
         self.assertIn("no codex account has room", output + error)
@@ -3473,9 +3704,9 @@ class PickerTests(unittest.TestCase):
         self.assertIn("refused at", output)
 
     def test_picker_codex_unresolved_refusal_beats_positive_windows_and_credits(self) -> None:
-        self.codex("default", "seats@example.invalid")
-        self.reading("Codex", "seats@example.invalid", 90, 2, five_left=90, credits="100")
-        refusals.write_refusal(refusals.AccountRefusal("codex", "seats@example.invalid",
+        self.codex("default", "workers@example.invalid")
+        self.reading("Codex", "workers@example.invalid", 90, 2, five_left=90, credits="100")
+        refusals.write_refusal(refusals.AccountRefusal("codex", "workers@example.invalid",
             refusals.KnownWindow("weekly"), refusals.KnownReset(self.now + timedelta(days=2)), self.now))
         selected = accounts.pick("codex", self.now, keep=accounts.KeepAccount("codex1"))
         self.assertIsInstance(selected, accounts.NoAccountWithRoom)

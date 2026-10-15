@@ -26,7 +26,7 @@ Each production has its own pool of long-lived, read-only Codex reviewers. A uni
 
 ### State
 
-A pool belongs to one production. Its state is `~/.local/state/review-pool/<slug>/`; `REVIEW_POOL_STATE` replaces the root. `<slug>` is the production doc's file name without `-production.md`, and `--production` accepts the slug or the doc's path.
+A pool belongs to one production. Its state is `~/.local/state/review-pool/<slug>/`; `REVIEW_POOL_STATE` replaces the root. `<slug>` is the production doc's file name without `-production.md`, and `--production` accepts the slug or the doc's path. `_production` passes that slug through `showrunners.canonical_slug`, so a former slug reaches the current pool; a production rename moves the pool directory, leases included (`docs/as-built/production-rename.md`).
 
 | Path | Holds |
 | --- | --- |
@@ -375,7 +375,7 @@ production with the same assignment by hash.
 reviewer judges the same shots as the Claude helper. Its verdict is recorded
 but not used. Adopt when it found every defect the helper found.
 
-**Measuring tokens per review.** `seat_usage.py --reviews --since <date>` reads
+**Measuring tokens per review.** `worker_usage.py --reviews --since <date>` reads
 every `review_turn_*.json` under `/tmp/claude/delegate/` on natedev and the
 Mac. It sums the rollout's token counts for that turn id, and prints weighted
 tokens per review by arm (fresh, own worker, pool) and kind (broad lens, closure,
@@ -398,7 +398,7 @@ records each unit already keeps:
   in code the broad review read, merge holds and merge design-check defects
   (`review_regime.py`, regime `pool`), and red CI traced to the phase.
 
-`seat_usage.py --reviews --quality` plots precision and escapes per review
+`worker_usage.py --reviews --quality` plots precision and escapes per review
 against two measures:
 - the memory entry count when the review ran (memory version, stored with the
   turn record);

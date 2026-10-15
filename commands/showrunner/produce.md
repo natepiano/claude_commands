@@ -22,6 +22,10 @@ Read `~/.claude/docs/production_format.md` first. It defines:
 State:
 
 - `PRODUCTION_DOC`, `MERGE_BRANCH`, `LOG`, `UNITS` — from the production doc.
+  After a `/showrunner:rename apply` succeeds, read them again from the
+  renamed doc, along with `UPDATES` and `PROMPT_FILE`, which come from its
+  slug: apply moves the doc, the update timer and the state directory, and
+  switches `CHECKOUT` to the new merge branch.
 - `ZONE` — the user's zone setting, which
   `python3 ~/.claude/scripts/lib/user_zone.py` prints. It is one setting for
   every production; a doc's own **User zone** line is not read.

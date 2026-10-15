@@ -197,15 +197,15 @@ def worker_session(
     *,
     owner: str | None,
     run_dirs: list[str] | None = None,
-) -> inventory.SeatSession:
+) -> inventory.WorkerSession:
     worker_owner: inventory.WorkerOwner = (
         inventory.DirectorOwner(kind="director", session_id=owner)
         if owner is not None
         else inventory.NoDirector(kind="no director")
     )
-    return inventory.SeatSession(
+    return inventory.WorkerSession(
         **common_session(session_id, run_dirs=run_dirs),
-        kind="seat",
+        kind="worker",
         host=inventory.UnknownHost(kind="unknown"),
         owner=worker_owner,
     )
@@ -219,7 +219,7 @@ def entry(
         login=LOGIN, label=LABEL, machine="natedev", requested_at=STOPPED,
         request_id="request", requested_by=record.FromTerminal(kind="terminal"),
         hold="session", then="restart", force="wait for ready", alerts="user",
-        session=session, seats=[], timers=list(timers or []),
+        session=session, workers=[], timers=list(timers or []),
         settle_message=record.SettleMessageNotSent(kind="not sent"),
         where=where or record.WhereSaid(kind="said", text=f"working on {session['name']}", at=STOPPED),
         progress=state or record.SessionStopped(kind="stopped", at=STOPPED), stop_issues=[], trail=[],
@@ -349,6 +349,73 @@ class RestartTests(ShutdownTestCase):
         self.assertEqual(failed["move_id"], saved["request_id"])
         self.assertEqual(failed["reason"], "still on claude2")
         self.assertNotEqual(self.stored_record()["progress"]["kind"], "restarted")
+
+    def test_move_proof_names_absent_environment_and_mismatch_and_confirms_only_the_target(self) -> None:
+        for observation in ("not live", "environment unreadable", "source", "target"):
+            with self.subTest(observation=observation):
+                saved = self.moved_record("proof-" + observation.replace(" ", "-"))
+                transition = "group-" + observation
+                saved["move_id"] = transition
+                _ = record.update_session(LOGIN, saved["session"]["session_id"],
+                    lambda current: current.update(move_id=transition))
+                owner = saved["session"]
+                live = [] if observation == "not live" else [sessions.SessionRecord(
+                    pid=owner["pid"], sessionId=owner["session_id"], name=owner["name"],
+                    messagingSocketPath="", updatedAt=1, tmux="", formerNames=[])]
+                directory = (None if observation == "environment unreadable" else
+                             self.root / (".claude3" if observation == "target" else ".claude2"))
+                with (patch.object(sessions, "live_sessions", return_value=live),
+                      patch.object(account_reader, "process_config_dir", return_value=directory)):
+                    result = restart._prove_move(saved)  # pyright: ignore[reportPrivateUsage]
+                self.assertEqual(result, observation == "target")
+                entries = [entry for entry in moves.read_moves() if entry["move_id"] == saved["move_id"]]
+                self.assertEqual(len(entries), 1)
+                outcome = entries[0]
+                if observation == "target":
+                    self.assertEqual(outcome["kind"], "confirmed")
+                    self.assertEqual(outcome.get("config_dir"), str(self.root / ".claude3"))
+                else:
+                    expected = "still on claude2" if observation == "source" else "resumed account unreadable"
+                    self.assertEqual(outcome.get("reason"), expected)
+                    stored = record.find_session(LOGIN, owner["session_id"])
+                    assert stored is not None
+                    self.assertEqual(stored["progress"]["kind"], "restart failed")
+
+    def test_target_cleanup_keeps_records_when_live_session_or_environment_cannot_be_observed(self) -> None:
+        for absent in (True, False):
+            with self.subTest(absent=absent):
+                saved = self.hand_restart_record("absent" if absent else "unreadable")
+                owner = saved["session"]
+                live = [] if absent else [sessions.SessionRecord(pid=owner["pid"],
+                    sessionId=owner["session_id"], name=owner["name"], messagingSocketPath="",
+                    updatedAt=1, tmux="", formerNames=[])]
+                with (patch.object(sessions, "live_sessions", return_value=live),
+                      patch.object(account_reader, "process_config_dir", return_value=None)):
+                    checked = restart.clear_running_on_target([saved])
+                self.assertEqual((checked.remaining, checked.finished), ([saved], []))
+                self.assertEqual(record.find_session(LOGIN, owner["session_id"]), saved)
+
+    def test_failed_attempt_and_successful_retry_journal_one_transition_with_separate_request_claims(self) -> None:
+        first = self.moved_record("retry-owner")
+        first["move_id"] = "durable-group-transition"
+        _ = record.update_session(LOGIN, "retry-owner", lambda current: current.update(move_id=first["move_id"]))
+        restart.mark_restart_failed(first, "first launch failed")
+        record.archive_session(LOGIN, "retry-owner")
+        retry: SessionShutdown = {**first, "request_id": "second-attempt", "progress": record.SessionWaiting(kind="waiting")}
+        self.create([retry])
+        live = self.running_on(retry, self.root / ".claude3")
+        with patch.object(sessions, "live_sessions", return_value=live):
+            self.assertTrue(restart._prove_move(retry))  # pyright: ignore[reportPrivateUsage]
+        entries = moves.read_moves()
+        self.assertEqual([entry["kind"] for entry in entries], ["failed", "confirmed"])
+        self.assertEqual({entry["move_id"] for entry in entries}, {"durable-group-transition"})
+        # A delayed result for the first attempt cannot modify its replacement.
+        restart.mark_restart_failed(first, "stale failure")
+        loaded = record.find_session(LOGIN, "retry-owner")
+        assert loaded is not None
+        self.assertEqual(loaded["request_id"], "second-attempt")
+        self.assertEqual(loaded["progress"]["kind"], "waiting")
+        self.assertEqual(len(moves.read_moves()), 2)
 
     def test_target_process_confirms_move_even_when_timer_restoration_is_pending(self) -> None:
         saved = self.moved_record()

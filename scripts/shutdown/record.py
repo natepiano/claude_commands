@@ -365,6 +365,7 @@ class ProgressStep(TypedDict):
 
 
 class SessionShutdown(TypedDict):
+    move_id: NotRequired[str]
     login: str
     label: str
     machine: str
@@ -376,7 +377,7 @@ class SessionShutdown(TypedDict):
     force: StopTiming
     alerts: Literal["user", "none"]
     session: Session
-    seats: list[Session]
+    workers: list[Session]
     timers: list[TimerRestore]
     settle_message: SettleMessage
     where: Where
@@ -975,6 +976,10 @@ def _shutdown_request_fields(values: dict[str, object], place: str) -> None:
     request_id = _string(_required(values, "request_id", place), f"{place}.request_id")
     if not request_id:
         raise InvalidRecord(f"{place}.request_id must not be empty")
+    if "move_id" in values:
+        move_id = _string(values["move_id"], f"{place}.move_id")
+        if not move_id:
+            raise InvalidRecord(f"{place}.move_id must not be empty")
     values["requested_by"] = _request_origin(
         _required(values, "requested_by", place), f"{place}.requested_by"
     )
@@ -1024,24 +1029,24 @@ def _session_shutdown(value: object, place: str) -> SessionShutdown:
         trail.append(ProgressStep(at=at, kind=kind, detail=detail))
     values["trail"] = trail
     values["stop_issues"] = [_session_stop_issue(issue, f"{place}.stop_issues") for issue in fields["stop_issues"]]
-    if fields["session"]["kind"] == "seat":
+    if fields["session"]["kind"] == "worker":
         raise InvalidRecord(f"{place}.session must not be a worker")
     _ = _session_filename(fields["session"]["session_id"])
-    workers = _items(_required(values, "seats", place), f"{place}.seats")
+    workers = _items(_required(values, "workers", place), f"{place}.workers")
     parsed_workers: list[Session] = []
     for index, worker in enumerate(workers):
-        worker_place = f"{place}.seats[{index}]"
+        worker_place = f"{place}.workers[{index}]"
         try:
             parsed = parse_session(worker, worker_place)
         except ValueError as error:
             raise InvalidRecord(str(error)) from error
-        if parsed["kind"] != "seat":
+        if parsed["kind"] != "worker":
             raise InvalidRecord(f"{worker_place} must be a worker")
         owner = parsed["owner"]
         if owner["kind"] != "director" or owner["session_id"] != fields["session"]["session_id"]:
             raise InvalidRecord(f"{worker_place}.owner must identify this session")
         parsed_workers.append(parsed)
-    values["seats"] = parsed_workers
+    values["workers"] = parsed_workers
     for field in ("alerted_at", "form_alerted_at", "reasked_at"):
         if field in values:
             _ = _utc_time(values[field], f"{place}.{field}")
@@ -1088,17 +1093,18 @@ def _record_directory(path: Path, *, create: bool = False) -> bool:
 
 
 def _worker_record_names(value: object) -> bool:
-    """Convert names owned by shutdown; account session kinds remain unchanged."""
+    """Convert stored worker fields and session kinds before validation."""
     changed = False
     if isinstance(value, dict):
         fields = cast(dict[str, object], value)
-        for old, new in (("busy_seats", "busy_workers"),):
+        for old, new in (("busy_seats", "busy_workers"), ("seats", "workers")):
             if old in fields:
                 if new not in fields:
                     fields[new] = fields[old]
                 del fields[old]
                 changed = True
-        labels = {"passive seat ready": "passive worker ready",
+        labels = {"seat": "worker",
+                  "passive seat ready": "passive worker ready",
                   "seat available on demand": "worker available on demand",
                   "seat still live": "worker still live"}
         for name in ("kind", "progress"):
@@ -1167,7 +1173,7 @@ def _convert_session(record: _LegacyShutdownRecord, entry: _LegacySessionEntry) 
     workers: list[Session] = []
     for candidate in record["entries"]:
         worker = candidate["session"]
-        if worker["kind"] == "seat" and worker["owner"]["kind"] == "director":
+        if worker["kind"] == "worker" and worker["owner"]["kind"] == "director":
             if worker["owner"]["session_id"] == session["session_id"]:
                 workers.append(worker)
     return SessionShutdown(
@@ -1176,7 +1182,7 @@ def _convert_session(record: _LegacyShutdownRecord, entry: _LegacySessionEntry) 
         request_id=f"legacy-{record['machine']}-{record['requested_at']}",
         hold="account" if record["scope"]["kind"] == "all account sessions" else "session",
         then=_legacy_continuation(record), force=record["force"], alerts="user",
-        session=session, seats=workers, timers=entry["timers"],
+        session=session, workers=workers, timers=entry["timers"],
         settle_message=entry["settle_message"], where=entry["where"],
         progress=cast(SessionProgress, cast(object, progress)), trail=[], stop_issues=[issue for issue in entry["stop_issues"] if issue["kind"] != "worker still live"],
     )
@@ -1204,7 +1210,7 @@ def _session_records_in_directory(directory: Path, login: str) -> list[SessionSh
             continue
         for entry in old["entries"]:
             session = entry["session"]
-            if session["kind"] != "seat" and session["session_id"] not in stored_ids:
+            if session["kind"] != "worker" and session["session_id"] not in stored_ids:
                 records.append(_convert_session(old, entry))
                 stored_ids.add(session["session_id"])
     return sorted(records, key=lambda item: (item["requested_at"], item["session"]["name"]))
@@ -1400,6 +1406,7 @@ def parse_session_records(text: str) -> list[SessionShutdown]:
         value = cast(object, json.loads(text))
     except (ValueError, TypeError) as error:
         raise InvalidRecord("session records is not valid JSON") from error
+    _ = _worker_record_names(value)
     return [
         _session_shutdown(item, f"records[{index}]")
         for index, item in enumerate(_items(value, "records"))

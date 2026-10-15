@@ -93,7 +93,7 @@ class StopClaim:
 class MatchingSession(TypedDict):
     kind: Literal["matching session"]
     session: Session
-    seats: list[Session]
+    workers: list[Session]
 
 
 class SessionAbsent(TypedDict):
@@ -187,9 +187,9 @@ def fresh_session(stored: Session, report: Inventory) -> FreshSession:
             return {"kind": "session identity lost"}
         return {
             "kind": "matching session", "session": current,
-            "seats": [
+            "workers": [
                 item for item in report["sessions"]
-                if item["kind"] == "seat"
+                if item["kind"] == "worker"
                 and item["owner"]["kind"] == "director"
                 and item["owner"]["session_id"] == session_id
             ],
@@ -600,7 +600,7 @@ def _stop_owner(
         (prior["kind"] not in {"ready", "held by usage limit", "stopping", "stop failed"}
          and not (prior["kind"] == "waiting" and idle_reason != "not an idle stop"))
         or current["status"] != "idle"
-        or any(worker["status"] != "idle" for worker in match["seats"])
+        or any(worker["status"] != "idle" for worker in match["workers"])
         or settle.blocker(current)["kind"] != "clear"
     ):
         issue = NotReadyToStop(
