@@ -7,11 +7,9 @@ import sys
 from collections.abc import Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
-from datetime import datetime
 from typing import Literal, NamedTuple
 
 from note_file import canonical_label
-from user_zone import user_zone
 
 if __name__ == "session_table":
     _ = sys.modules.setdefault("scripts.whoami.session_table", sys.modules[__name__])
@@ -32,6 +30,7 @@ class SessionRow(NamedTuple):
     folder: str
     session_id: str
     last_seen: str = ""
+    # Read-only compatibility with notes written before sessions_seen.json.
     observed_at: str = ""
 
 
@@ -53,6 +52,7 @@ class ReadSessions:
     rows_by_label: dict[str, tuple[SessionRow, ...]]
     rows_kept: frozenset[str]
     unattributed: int = 0
+    machines_read: frozenset[str] = frozenset()
 
 
 @dataclass(frozen=True)
@@ -73,8 +73,6 @@ def render_section(rows: Sequence[SessionRow], unattributed: int = 0) -> str:
                   "| --- | --- | --- | --- | --- |"]
     for row in sorted(rows, key=lambda item: (item.machine, ROLE_ORDER.index(item.role), item.name, item.session_id)):
         identity = row.session_id + (f" (last seen {row.last_seen})" if row.last_seen else "")
-        if row.observed_at:
-            identity += f" <!-- observed-at: {row.observed_at} -->"
         cells = (row.name, row.role, row.machine, _short_folder(row.folder), identity)
         lines.append("| " + " | ".join(cell.replace("\n", " ").replace("|", r"\|") for cell in cells) + " |")
     if unattributed:
@@ -126,19 +124,22 @@ def live_sessions(environment: Mapping[str, str]) -> ReadSessions | SessionsUnre
     except Exception as error:
         return SessionsUnread(str(error) or type(error).__name__)
     kept: set[str] = set()
+    machines_read = {roster.machine_name(), *(entry.machine for entry in local.entries)}
     entries = list(local.entries)
     if isinstance(peer, roster.PeerNotReached):
         kept.add(peer.host)
         # SSH aliases (such as "mac") need not equal the hostname in saved rows.
         from note_file import read_notes
 
-        local_machines = {roster.machine_name(), *(entry.machine for entry in local.entries)}
         kept.update(row.machine for note in read_notes() for row in section_rows(note.text)
-                    if row.machine not in local_machines)
+                    if row.machine not in machines_read)
     else:
         unavailable = {entry.machine for entry in peer.entries
                        if isinstance(entry.account, roster.AccountAttributionUnavailable)}
         kept.update(unavailable)
+        machines_read.update(entry.machine for entry in peer.entries if entry.machine not in unavailable)
+        if not peer.entries:
+            machines_read.add(roster.remote.other_machine())
         entries += [entry for entry in peer.entries if entry.machine not in unavailable]
     rows: dict[str, list[SessionRow]] = {}
     roles: dict[str, SessionRole] = {"showrunner": "showrunner", "unit director": "unit",
@@ -153,14 +154,11 @@ def live_sessions(environment: Mapping[str, str]) -> ReadSessions | SessionsUnre
                       else entry.thread.thread_id if isinstance(entry.thread, roster.CodexThread) else "—")
         rows.setdefault(canonical_label(entry.account.label), []).append(
             SessionRow(entry.name, roles[entry.role], entry.machine, _short_folder(entry.cwd), session_id))
-    return ReadSessions({label: tuple(items) for label, items in rows.items()}, frozenset(kept), unattributed)
+    return ReadSessions({label: tuple(items) for label, items in rows.items()}, frozenset(kept),
+                        unattributed, frozenset(machines_read))
 
 
-def observed(row: SessionRow, at: datetime) -> SessionRow:
-    """Save a successful observation for a later refresh that cannot reach this peer."""
-    return row._replace(last_seen="", observed_at=at.astimezone(user_zone()).isoformat(timespec="seconds"))
-
-
-def last_seen(row: SessionRow) -> SessionRow:
-    """Keep the last successful observation; older rows have no known observation time."""
-    return row._replace(last_seen=row.observed_at or "unknown")
+def last_seen(row: SessionRow, machines_seen: Mapping[str, str]) -> SessionRow:
+    """Freeze a kept row's time, preferring its saved marker over outside observations."""
+    return row._replace(last_seen=row.last_seen or machines_seen.get(row.machine) or row.observed_at or "unknown",
+                        observed_at="")

@@ -960,3 +960,33 @@ After a worker launch's own turn has ended, a move to the selected seats home th
 - A stale Claude reading keeps "has room; no reading in the last 10 minutes", ranked after every fresh account with room.
 
 **Ruled out:** moving the real Codex workers for the proof (it moves every unit's workers); moving any real session (probes are throwaway sessions picked by their own ids).
+
+### Phase 26 — Account notes unchanged when nothing changed  · status: done
+
+**Depends on:** Phase 22
+
+#### Work Order
+
+**Goal:** a notes refresh where no session started, stopped or moved leaves each account note different only on lines the vault snapshot already skips, so the hanadocs vault stops taking a commit every two minutes; a real change still commits.
+
+**Constraints from prior phases:** "Account labels without a space" put a hidden `<!-- observed-at: <time> -->` comment in every `## Live sessions` row (`session_table.observed`, called from `agent_notes.py` for each live row with the run's `checked_at`), so a row kept for an unreachable peer can show `(last seen <time>)`; kept rows are not counted in `sessions` and return to live when the peer answers. The snapshot (`/etc/nixos/modules/linux/agent-sessions-snapshot.py`, `TIMESTAMPS`, not in this repository) commits `~/rust/hanadocs/agents/` only when a line outside these line-start patterns changed: `^Snapshot taken `, `^date_modified:`, `^weekly_usage_checked_at:`, `^weekly_remaining_usage:`, `^credit_balance:`, `^resets:`, `^limit_reset:`. The observed-at time changes every run, so since that phase every run commits claude1, claude2, claude4 and codex2 (630 commits in a day, reported by hanadocs; vault 57c5886).
+
+**Spec:**
+
+- Live rows render with no time: no `<!-- observed-at: … -->` comment and no `(last seen …)`.
+- Each refresh that reads sessions records, outside the vault, the time it last reached each machine: `~/.local/state/agent-notes/sessions_seen.json`, `{machine: aware ISO time}`, written atomically, one write per refresh, for every machine whose rows were read live this run (the local machine always, a peer only when reached). An unreadable or missing file reads as empty and never fails the refresh.
+- A kept row (its machine in `rows_kept`) shows `(last seen <time>)`: the time it already carries in the note when it has one; else the recorded time for its machine; else a legacy `observed-at` comment in the saved row; else `unknown`. So the text changes once, when the peer stops answering, and stays fixed while it stays unreachable.
+- `section_rows` still reads a legacy `<!-- observed-at: … -->` comment from a note written before this phase; nothing writes one. `section_rows(render_section(rows))` gives back the rows of any section this phase writes; the unattributed line is recomputed each run and never parsed.
+- A session starting, stopping or moving, the `sessions` count changing, or the unattributed line changing still changes the note outside the skip list.
+- Docs that describe the hidden comment (`docs/accounts.md` and any as-built that names it) say where the last-seen time now comes from.
+
+**Files:**
+
+- `scripts/whoami/session_table.py` — live rows render no time; kept rows take last-seen per the order above; legacy comment read only.
+- `scripts/whoami/agent_notes.py` — read and write the per-machine seen file once per refresh; pass it to the kept-row rule.
+- `scripts/whoami/test_session_table.py`, `scripts/whoami/test_agent_notes.py` — the regression tests below.
+- `docs/accounts.md` — the last-seen source, if it names the comment.
+
+**Workers:** one worker, `impl`, owns all files: the change is one writer and its tests.
+
+**Acceptance gate:** a test refreshes a note twice, two minutes apart, with the same live sessions (local and a reached peer), and asserts every differing line matches one of the snapshot's `TIMESTAMPS` patterns (copied into the test with a comment naming the nixos file). A second test starts or stops one session between the two refreshes and asserts a line outside those patterns differs. A third: reached at T1, unreachable at T2 and T3 — the kept row reads `(last seen T1)` at T2 and the T3 note equals the T2 note outside the skip list. A fourth: a legacy row carrying the comment, unreachable on the first refresh, shows that comment's time. `scripts/whoami` and `scripts/lib` suites pass with a temp `HOME`; basedpyright reports zero errors and zero warnings on the changed files.
