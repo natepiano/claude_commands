@@ -47,11 +47,7 @@
 #                                     this session: a role header block at start,
 #                                     [wrapper] beats every 60s while the agent
 #                                     pid is alive (each carrying an activity
-#                                     digest from the agent log), and [agent]
-#                                     narration lines (prompt-instructed)
-#   <session_dir>/impl_awake_<role>   — seconds the beat loop has counted for
-#                                     this dispatch, which excludes time the
-#                                     machine was suspended; stamped on the pass
+#                                     digest from the agent log)
 
 set -euo pipefail
 
@@ -161,7 +157,6 @@ BG_ID_FILE="${SESSION_DIR}/impl_bg_id${SLOT}"
 BOARD_HELPER="${SCRIPT_DIR}/board.sh"
 HEARTBEAT_HELPER="${SCRIPT_DIR}/../agents/heartbeat.sh"
 HEARTBEAT_FILE="${SESSION_DIR}/heartbeat.log"
-AWAKE_FILE="${SESSION_DIR}/impl_awake${SLOT}"
 PROGRESS_HELPER="${SCRIPT_DIR}/progress_history.py"
 PROGRESS_STATE="${SESSION_DIR}/progress_history_state.json"
 FINDINGS_HELPER="${SCRIPT_DIR}/findings.py"
@@ -178,18 +173,6 @@ if [[ ! "${COMPACT_ABOVE_TOKENS}" =~ ^[0-9]+$ ]] || (( COMPACT_ABOVE_TOKENS <= 0
   echo "ERROR: PLAN_DELEGATE_COMPACT_ABOVE_TOKENS in ${DELEGATE_CONFIG} must be a positive integer." >&2
   exit 2
 fi
-
-# -1 says the beat loop counted nothing, which a dispatch shorter than one
-# interval always does. The previous dispatch's file is removed before this one
-# launches, so a leftover total can never be read as this pass's.
-awake_seconds() {
-  local counted
-  counted="$(cat "${AWAKE_FILE}" 2>/dev/null || true)"
-  case "${counted}" in
-    ''|*[!0-9]*) echo "-1" ;;
-    *) echo "${counted}" ;;
-  esac
-}
 
 source "${SCRIPT_DIR}/../agents/agents_config.sh"
 if ! agents_resolve "${TASK}" 2>"${LOG_FILE}"; then
@@ -363,7 +346,7 @@ if [[ -n "${FOLLOW_TO}" ]]; then
 fi
 
 : > "${SUMMARY_FILE}"
-rm -f "${REPLY_FILE}" "${AWAKE_FILE}"
+rm -f "${REPLY_FILE}"
 echo "implementing" > "${STATUS_FILE}"
 
 printf 'task=%s\nfamily=%s\nagent=%s\neffort=%s\n' \
@@ -526,10 +509,8 @@ fi
 
 # Wrapper beats with an activity digest from the agent log: proves the process
 # is alive and names what it is doing even while blocked in a long tool call.
-# [agent] lines still come from the delegate itself, per its prompt.
 bash "${SCRIPT_DIR}/../agents/heartbeat_watch.sh" \
-  "${HEARTBEAT_FILE}" "${BEAT_TAG}" "${AGENT_PID}" "${LOG_FILE}" "${HEARTBEAT_INTERVAL_SECS}" \
-  "${AWAKE_FILE}" &
+  "${HEARTBEAT_FILE}" "${BEAT_TAG}" "${AGENT_PID}" "${LOG_FILE}" "${HEARTBEAT_INTERVAL_SECS}" &
 HEARTBEAT_LOOP_PID=$!
 
 AGENT_CODE=0
@@ -559,8 +540,7 @@ fi
 if [[ "${AGENT_CODE}" -eq 0 ]]; then
   if [[ -f "${PROGRESS_STATE}" ]]; then
     if ! PLAN_DELEGATE_PASS_OWNER=launcher "$PY" "${PROGRESS_HELPER}" finish-pass \
-      --session-dir "${SESSION_DIR}" --status completed \
-      --agent-awake-seconds "$(awake_seconds)"; then
+      --session-dir "${SESSION_DIR}" --status completed; then
       echo "ERROR: unable to record the ${PASS_KIND} pass completion." >&2
       echo "error" > "${STATUS_FILE}"
       bash "${BOARD_HELPER}" post "${SESSION_DIR}" "${BOARD_AGENT}" blocked \
@@ -596,7 +576,6 @@ else
   if [[ -f "${PROGRESS_STATE}" ]]; then
     PLAN_DELEGATE_PASS_OWNER=launcher "$PY" "${PROGRESS_HELPER}" finish-pass \
       --session-dir "${SESSION_DIR}" --status error \
-      --agent-awake-seconds "$(awake_seconds)" \
       || { echo "ERROR: unable to record the ${PASS_KIND} pass error." >&2; LEDGER_CODE=1; }
   fi
   # The attempt stands rather than being refunded: a worker that ran and then

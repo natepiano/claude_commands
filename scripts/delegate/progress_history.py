@@ -1260,7 +1260,6 @@ def _close_slot_pass(
     slot: str,
     status: str,
     now: float,
-    agent_awake_seconds: int = -1,
 ) -> bool:
     """Close one slot's open pass, reporting whether there was one to close.
 
@@ -1281,17 +1280,6 @@ def _close_slot_pass(
         0,
         int(now - _number(current_pass.get("started_at"), now)),
     )
-    # Elapsed time cannot separate an agent that worked for fourteen hours from
-    # a laptop suspended for six of them. heartbeat_watch.sh counts only the
-    # intervals it slept all the way through, so its total is time the machine
-    # was awake with the delegate alive, to one beat interval. Absent when the
-    # loop never beat: a pass shorter than one interval has nothing to report,
-    # and a zero would read as a measurement instead of the lack of one. It
-    # describes the delegate process, not this window -- review.sh starts the
-    # loop before an early review's pass opens, so that pass can report more
-    # awake seconds than it was open.
-    if agent_awake_seconds >= 0:
-        event["agent_awake_seconds"] = agent_awake_seconds
     _append_event(state, event)
     current_pass["status"] = status
     current_pass["finished_at"] = now
@@ -1559,14 +1547,7 @@ def _finish_pass(args: argparse.Namespace) -> None:
     # still running.
     slot = _team_slot()
     state = _read_state(session_dir)
-    closed = _close_slot_pass(
-        session_dir,
-        state,
-        slot,
-        status,
-        now_epoch(),
-        _arg_integer(args, "agent_awake_seconds", -1),
-    )
+    closed = _close_slot_pass(session_dir, state, slot, status, now_epoch())
     if orphaned and not closed:
         raise SystemExit(
             "No pass is open in this slot, so no launcher was orphaned and "
@@ -4783,13 +4764,6 @@ def _build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="close this slot's open pass when the unit director killed its "
         + "launcher (--status canceled only)",
-    )
-    _ = finish_pass.add_argument(
-        "--agent-awake-seconds",
-        type=int,
-        default=-1,
-        help="seconds the heartbeat loop counted while the delegate ran, which "
-        + "excludes time the machine was suspended; omit when it counted none",
     )
     finish_pass.set_defaults(handler=_finish_pass)
 

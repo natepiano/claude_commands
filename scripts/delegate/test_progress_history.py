@@ -2684,45 +2684,6 @@ print('two homes isolated; recorder lock retained; caller restored')
             [("Impl", "impl 3m done", "clean"), ("Fix 1", "fix 1m running", "running")],
         )
 
-    def test_finish_pass_records_the_seconds_the_delegate_was_awake(self) -> None:
-        session_dir = self.start_run("awake", 22_000)
-        self.start_phase_and_pass(session_dir, 22_010)
-        _ = self.run_command(
-            "finish-pass",
-            "--session-dir",
-            str(session_dir),
-            "--status",
-            "completed",
-            "--agent-awake-seconds",
-            "1800",
-            at=72_020,
-        )
-        finished = self.pass_events("awake", "pass_finished")
-        self.assertEqual(len(finished), 1)
-        # The point of the field: elapsed covers the stretch the machine spent
-        # suspended, and the beat count does not.
-        self.assertEqual(finished[0].get("pass_elapsed_seconds"), 50_000)
-        self.assertEqual(finished[0].get("agent_awake_seconds"), 1800)
-
-    def test_a_pass_with_nothing_counted_records_no_awake_seconds(self) -> None:
-        for name, reported in (("unreported", ()), ("none-counted", ("-1",))):
-            with self.subTest(name):
-                session_dir = self.start_run(name, 23_000)
-                self.start_phase_and_pass(session_dir, 23_010)
-                awake = ("--agent-awake-seconds", *reported) if reported else ()
-                _ = self.run_command(
-                    "finish-pass",
-                    "--session-dir",
-                    str(session_dir),
-                    "--status",
-                    "completed",
-                    *awake,
-                    at=23_050,
-                )
-                finished = self.pass_events(name, "pass_finished")
-                self.assertEqual(len(finished), 1)
-                self.assertNotIn("agent_awake_seconds", finished[0])
-
     def test_aggregate_reports_raw_and_calibrated_error_fields(self) -> None:
         self.complete_historical_run(0)
         output = self.run_command("aggregate", "--percent", "65", at=30_000)
