@@ -113,11 +113,22 @@ class BerthHookTests(unittest.TestCase):
         return subprocess.run([sys.executable, str(HOOK)], input=json.dumps(payload), capture_output=True,
                               text=True, check=False, env=self.environment, timeout=60)
 
+    def test_a_path_a_sibling_phase_holds_allows_the_edit_and_records_nothing(self) -> None:
+        # The engine names the sibling's reservation and leaves this phase's session unmapped.
+        answer = envelope("clear", acquisition=acquired())
+        data = cast(dict[str, object], cast(dict[str, object], answer["payload"])["data"])
+        cast(dict[str, object], data["acquisition"])["session_mapping_publication"] = {"status": "left_unmapped"}
+        self.answer(answer)
+        before = self.state()
+        result = self.hook(patch_text("*** Update File: lib.rs"), cwd=self.repo / "src")
+        self.assertEqual((result.returncode, result.stdout), (0, ""), result.stderr)
+        self.assertEqual(self.state(), before)
+
     def test_a_seat_first_touch_checks_its_paths_and_records_active(self) -> None:
         result = self.hook(patch_text("*** Add File: new.rs", "*** Update File: lib.rs"), cwd=self.repo / "src")
         self.assertEqual((result.returncode, result.stdout), (0, ""), result.stderr)
         self.assertEqual(self.berth_calls(), [{"argv": ["check", "src/new.rs", "src/lib.rs", "--json"],
-                                               "cwd": str(self.repo), "session": DIRECTOR}])
+                                               "cwd": str(self.repo), "session": f"{DIRECTOR}.phase-15"}])
         self.assertEqual(self.state(), {"kind": "active", "active_phase_reservation": {
             "reservation_id": RESERVATION, "coordination_run_id": RUN, "phase": "15", "phase_start_head": HEAD,
         }})
@@ -241,7 +252,7 @@ class BerthHookTests(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertIn(f"Active, reservation {RESERVATION}", written)
         self.assertEqual(self.berth_calls(), [{"argv": ["check", "src/lib.rs", "src/added.rs", "--json"],
-                                               "cwd": str(self.repo), "session": DIRECTOR}])
+                                               "cwd": str(self.repo), "session": f"{DIRECTOR}.phase-15"}])
         self.assertEqual(cast(dict[str, str], self.state()["active_phase_reservation"])["phase"], "15")
 
     def test_the_backstop_checks_only_the_paths_its_phase_owns(self) -> None:

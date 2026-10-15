@@ -62,7 +62,7 @@ that builds the wrong thing.
    normalized stem is empty. The file need not exist.
 
 **Delegate-ready fast path:** do not research the codebase. Assemble
-`${SESSION_DIR}/implementation_prompt.md` under <WritePromptContract/>:
+`${PHASE_DIR}/implementation_prompt.md` under <WritePromptContract/>:
 
 - Project Context: Delegation Context except **Style**, plus Constraints from
   prior phases.
