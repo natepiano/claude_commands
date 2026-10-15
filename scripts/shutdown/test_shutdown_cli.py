@@ -50,6 +50,7 @@ def unit_session(session_id: str) -> inventory.UnitSession:
         name="alpha",
         cwd="/tmp/alpha",
         status="idle",
+        updated_at=0,
         model=inventory.NoReplyYet(kind="no reply yet"),
         checkout=inventory.NotACheckout(kind="not a checkout"),
         run_dirs=[],
@@ -940,7 +941,7 @@ class ShutdownLaunchCliTests(ShutdownTestCase):
         owner = saved["session"]
         saved["workers"] = [inventory.WorkerSession(
             session_id="a-worker", pid=23456, proc_start="worker-start", name="worker",
-            cwd=owner["cwd"], status="idle", model=owner["model"], checkout=owner["checkout"],
+            cwd=owner["cwd"], status="idle", updated_at=0, model=owner["model"], checkout=owner["checkout"],
             run_dirs=["/tmp/run"], codex_servers=[], timers=[], kind="worker",
             host=inventory.UnknownHost(kind="unknown"),
             owner=inventory.DirectorOwner(kind="director", session_id="z-owner"),

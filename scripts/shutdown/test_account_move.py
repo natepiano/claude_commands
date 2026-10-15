@@ -370,7 +370,7 @@ class AccountMoveTests(ShutdownTestCase):
         director = unit("director", doc="/tmp/demo-production.md")
         director["config_dir"] = str(accounts.account_dir("claude1"))
         director["checkout"] = inventory.NotACheckout(kind="not a checkout")
-        director["status"] = "idle"
+        director["status"] = "busy"
         report = inventory.Inventory(machine="natedev", login="current@example.invalid", label="claude1",
                                      sessions=[director], unattributed=[])
         commands: list[list[str]] = []
@@ -392,7 +392,8 @@ class AccountMoveTests(ShutdownTestCase):
                 self.assertIn("shutdown.py ready --where", text)
             return {"kind": "sent"}
 
-        def stopped(saved: record.SessionShutdown) -> record.SessionShutdown:
+        def stopped(saved: record.SessionShutdown, *, idle_reason: stop_work.IdleStopReason = "not an idle stop") -> record.SessionShutdown:
+            self.assertEqual(idle_reason, "not an idle stop")
             events.append("stop")
             self.assertEqual(saved["progress"]["kind"], "ready")
             checkpoint = saved["where"]
@@ -440,6 +441,7 @@ class AccountMoveTests(ShutdownTestCase):
             self.assertNotIsInstance(settle.next_step(saved, observed, [saved], datetime.now(timezone.utc)),
                                      settle.StopSession)
             stop.assert_not_called()
+            director["status"] = "idle"
             with patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": "director"}):
                 self.assertEqual(shutdown.main(["ready", "--where", "finish the checkpoint"]), 0)
             saved = record.session_records(report["login"])[0]

@@ -234,6 +234,7 @@ class SessionFields(TypedDict):
     # Records from before account-directory capture use the default directory.
     config_dir: NotRequired[str]
     status: str
+    updated_at: int
     model: LastModel
     checkout: CheckoutState
     run_dirs: list[str]
@@ -680,7 +681,7 @@ def _parse_codex_server(value: object, place: str) -> CodexServer:
     }
 
 
-def parse_session(value: object, place: str) -> Session:
+def parse_session(value: object, place: str, *, require_updated_at: bool = False) -> Session:
     """Validate and return one session from an inventory or shutdown record."""
     data = _wire_object(value, place)
     kind = _wire_kind(data, place)
@@ -710,6 +711,11 @@ def parse_session(value: object, place: str) -> Session:
         "cwd": _wire_string(_wire_required(data, "cwd", place), f"{place}.cwd"),
         "status": _wire_string(
             _wire_required(data, "status", place), f"{place}.status"
+        ),
+        # Old shutdown records predate this field; zero cannot answer a pause.
+        "updated_at": _wire_integer(
+            _wire_required(data, "updated_at", place) if require_updated_at else data.get("updated_at", 0),
+            f"{place}.updated_at",
         ),
         "model": _parse_model(
             _wire_required(data, "model", place), f"{place}.model"
@@ -759,7 +765,7 @@ def parse_inventory(text: str) -> Inventory:
         raise InvalidInventory("inventory is not valid JSON") from None
     data = _wire_object(value, "inventory")
     parsed_sessions = [
-        parse_session(item, f"inventory.sessions[{index}]")
+        parse_session(item, f"inventory.sessions[{index}]", require_updated_at=True)
         for index, item in enumerate(
             _wire_list(
                 _wire_required(data, "sessions", "inventory"),
@@ -1583,6 +1589,7 @@ def inventory(
             "cwd": cwd,
             "config_dir": str(entry.config_dir),
             "status": _string(record.get("status"), "unknown"),
+            "updated_at": _wire_integer(record.get("updatedAt", 0), "session.updatedAt"),
             "model": _model(session_id, entry.config_dir),
             "checkout": _checkout(cwd),
             "run_dirs": [str(directory) for directory in directories],
