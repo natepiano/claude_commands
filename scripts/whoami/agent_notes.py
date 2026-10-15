@@ -39,7 +39,7 @@ from scripts.accounts import refusals
 from scripts.whoami.agent_accounts import KnownCodexAccount, UnknownCodexAccount
 from agent_accounts import (ClaudeAccountsInUse, ClaudeDirectorySource, CodexHomeSource, EASTERN, Report,
                             codex_home_display, codex_homes,
-                            codex_report_in_use, live_reports, seats_home as resolve_seats_home)
+                            codex_report_in_use, live_reports, workers_home as resolve_workers_home)
 from quota_alert import (AgentNote, alert, blocked, current_session, refresh, CodexAlertPassReadings,
                          codex_alert_pass, RefusedAt, RefusalTimeUnknown)
 from run_out import READINGS_LOG
@@ -68,8 +68,8 @@ NO_REMOVED_FIELDS: frozenset[str] = frozenset()
 def rename_legacy_notes(directory: Path) -> list[str]:
     messages: list[str] = []
     for old in sorted(directory.glob("*.md")):
-        parsed = note_file.account_stem(old.stem)
-        if not isinstance(parsed, note_file.AccountStem) or old.stem != parsed.label:
+        parsed = note_file.parse_account_label(old.stem)
+        if not isinstance(parsed, note_file.NumberedAccountLabel) or old.stem != f"{parsed.tool} {parsed.number}":
             continue
         new = directory / note_file.note_name(parsed.label)
         try:
@@ -160,7 +160,7 @@ def write_note(note: Note, updates: dict[str, str | tuple[str, ...]], *,
 
 def still_ahead(value: str | None) -> bool:
     reset = reset_time(value)
-    return reset is not None and reset > datetime.now(timezone.utc)
+    return isinstance(reset, note_file.KnownReset) and reset.value > datetime.now(timezone.utc)
 
 
 def append_readings(readings: list[StoredReading], checked_at: datetime) -> None:
@@ -290,13 +290,13 @@ def update() -> list[str]:
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
     from scripts.accounts import accounts
 
-    seats_home = resolve_seats_home()
-    return update_for_selection(accounts.claude_account_selection(), seats_home)
+    workers_home = resolve_workers_home()
+    return update_for_selection(accounts.claude_account_selection(), workers_home)
 
 
-def update_for_selection(selection: ClaudeAccountsInUse, seats_home: Path) -> list[str]:
+def update_for_selection(selection: ClaudeAccountsInUse, workers_home: Path) -> list[str]:
     """Update notes and watch using one live pass."""
-    return list(update_alert_pass(selection, seats_home).messages)
+    return list(update_alert_pass(selection, workers_home).messages)
 
 
 @dataclass(frozen=True)
@@ -305,14 +305,14 @@ class UpdatedAgentNotes:
     codex_readings: CodexAlertPassReadings
 
 
-def update_alert_pass(selection: ClaudeAccountsInUse, seats_home: Path) -> UpdatedAgentNotes:
+def update_alert_pass(selection: ClaudeAccountsInUse, workers_home: Path) -> UpdatedAgentNotes:
     """Build the alert readings before writing any note."""
     messages = rename_legacy_notes(note_file.notes_dir())
     notes = note_file.read_notes()
-    multiple_codex_homes = len(codex_homes(seats_home)) > 1
-    reports = asyncio.run(live_reports(selection, seats_home))
+    multiple_codex_homes = len(codex_homes(workers_home)) > 1
+    reports = asyncio.run(live_reports(selection, workers_home))
     checked_at = datetime.now(timezone.utc)
-    codex_readings = codex_alert_pass(seats_home, reports, checked_at)
+    codex_readings = codex_alert_pass(workers_home, reports, checked_at)
     if not notes:
         messages.append(f"no agent notes in {note_file.notes_dir()}")
     try:
@@ -357,11 +357,13 @@ def update_alert_pass(selection: ClaudeAccountsInUse, seats_home: Path) -> Updat
             updates["role"] = ("worker",) if note.label == codex_readings.selected_account.label else ()
         section: SessionsSection | KeepSections = KEEP_SECTIONS
         if isinstance(sessions, session_table.ReadSessions):
-            kept = tuple(row for row in session_table.section_rows(note.text[note.end:])
+            kept = tuple(session_table.last_seen(row) for row in session_table.section_rows(note.text[note.end:])
                          if row.machine in sessions.rows_kept)
-            rows = sessions.rows_by_label.get(note.label, ()) + kept
-            updates["sessions"] = str(len(rows))
-            section = SessionsSection(session_table.render_section(rows))
+            live = tuple(session_table.observed(row, checked_at)
+                         for row in sessions.rows_by_label.get(note.label, ()))
+            rows = live + kept
+            updates["sessions"] = str(len(live))
+            section = SessionsSection(session_table.render_section(rows, sessions.unattributed))
         _ = write_note(note, updates, remove=frozenset({"state"}), section=section, stamp=stamp)
     if readings:
         try:
@@ -371,11 +373,11 @@ def update_alert_pass(selection: ClaudeAccountsInUse, seats_home: Path) -> Updat
     try:
         # Keep the default Claude input; Codex ownership comes from the frozen pass.
         watch_reports = [report for report in reports
-                         if (report.tool.lower() != "codex" or codex_report_in_use(report, seats_home))
+                         if (report.tool.lower() != "codex" or codex_report_in_use(report, workers_home))
                          and (report.tool.lower() != "claude" or not selection.multiple_accounts
                               or (report.source.directory == Path.home() / ".claude"
                                   if isinstance(report.source, ClaudeDirectorySource)
-                                  else selection.is_default_login(report.email or "")))]
+                                  else selection.is_home_directory_login(report.email or "")))]
         messages += five_hour.watch(watch_reports, codex_readings=codex_readings)
     except (OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError) as error:
         # The 5-hour watch must never cost the notes or the weekly alerts.
@@ -408,7 +410,10 @@ def main() -> None:
         parsed = parser.parse_args(sys.argv[2:], namespace=RefusalCommandLine())
         arguments = parsed.identity
         if len(arguments) == 3:
-            identity = KnownCodexAccount(Path(arguments[0]), arguments[1], arguments[2])
+            label = note_file.parse_account_label(arguments[2])
+            if not isinstance(label, note_file.NumberedAccountLabel) or label.tool != "codex":
+                parser.error("LABEL must name a numbered Codex account, such as codex1")
+            identity = KnownCodexAccount(Path(arguments[0]), arguments[1], label.label)
         elif len(arguments) == 2:
             identity = UnknownCodexAccount(Path(arguments[0]), arguments[1])
         else:
@@ -433,8 +438,8 @@ def main() -> None:
     from scripts.accounts import accounts
 
     selection = accounts.claude_account_selection()
-    seats_home = resolve_seats_home()
-    updated = update_alert_pass(selection, seats_home)
+    workers_home = resolve_workers_home()
+    updated = update_alert_pass(selection, workers_home)
     for line in updated.messages:
         print(line)
     notes: list[AgentNote] = list(note_file.read_notes())

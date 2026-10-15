@@ -201,6 +201,22 @@ class SessionPaneTests(unittest.TestCase):
             self.assertEqual(session_pane.session_place("conversation"), TmuxPlace("%99"))
         read.assert_not_called()
 
+    def test_record_place_keeps_the_given_pid_while_session_lookup_chooses_the_newest(self) -> None:
+        older = SessionRecord(pid=991010, sessionId="conversation", name="older", updatedAt=1,
+            messagingSocketPath="", tmux="older:@1.%41", formerNames=[])
+        newer = SessionRecord(pid=991011, sessionId="conversation", name="newer", updatedAt=2,
+            messagingSocketPath="", tmux="newer:@2.%99", formerNames=[])
+        self.process(991010, 0, ["claude"], {"TMUX_PANE": "%41"})
+        self.process(991011, 0, ["claude"], {"TMUX_PANE": "%99"})
+        for saved in (older, newer):
+            _ = (self.records / f"{saved['pid']}.json").write_text(json.dumps(saved))
+        for platform in ("linux", "darwin"):
+            with self.subTest(platform=platform), mock.patch.object(sys, "platform", platform), \
+                    mock.patch.object(session_pane, "live_session", return_value=True):
+                self.assertEqual(session_pane.record_place(older), TmuxPlace("%41"))
+                self.assertEqual(session_pane.record_place(newer), TmuxPlace("%99"))
+                self.assertEqual(session_pane.session_place("conversation"), TmuxPlace("%99"))
+
     def test_darwin_argument_tokens_cannot_supply_a_tmux_pane(self) -> None:
         self.record({}, tmux="")
         with mock.patch.object(sys, "platform", "darwin"), mock.patch.object(

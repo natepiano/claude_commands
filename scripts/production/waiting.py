@@ -20,6 +20,7 @@ import unit_lookup
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "whoami"))
 from account import account_of
+from note_file import canonical_label, canonical_label_text
 from add_unit import Production, Refusal, cell_value, live_unit_table, read_production, retired_units
 from merge_checkpoint import MergeEntry, NoMerge, Stop, git, merge_branch_history, report as merge_report
 
@@ -226,12 +227,19 @@ def read_state(path: Path) -> JsonMap:
     return cast(JsonMap, raw)
 
 
-def update_state(path: Path, change: Callable[[JsonMap], StateResult]) -> StateResult:
+def read_quota_state(path: Path) -> JsonMap:
+    """Read held alerts by canonical identity without rewriting the saved state."""
+    return {canonical_label(label): canonical_label_text(alert) if isinstance(alert, str) else alert
+            for label, alert in read_state(path).items()}
+
+
+def update_state(path: Path, change: Callable[[JsonMap], StateResult], *,
+                 read: Callable[[Path], JsonMap] = read_state) -> StateResult:
     path.parent.mkdir(parents=True, exist_ok=True)
     lock_path = Path(f"{path}.lock")
     with lock_path.open("a+", encoding="utf-8") as lock:
         fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
-        content = read_state(path)
+        content = read(path)
         before = json.dumps(content, sort_keys=True)
         result = change(content)
         if json.dumps(content, sort_keys=True) == before:
@@ -587,7 +595,7 @@ def agenda(production: Production, state_dir: Path) -> None:
 
 
 def quota(production: Production, notice: str, state_dir: Path) -> None:
-    lines = notice.strip().splitlines()
+    lines = canonical_label_text(notice).strip().splitlines()
     line = lines[0] if lines else ""
     kind = next((prefix for prefix in ("Quota alert acknowledged:", "Quota restored:", "Quota alert:")
                  if line.startswith(prefix)), "")
@@ -653,8 +661,8 @@ def quota(production: Production, notice: str, state_dir: Path) -> None:
             if found is None:
                 failures.append(f"{unit.session}: its Claude account could not be read, so it was not told")
                 continue
-            if found.label.casefold() != recipients.account.casefold():
-                print(f"skip {unit.session}: it runs on {found.label}, not {recipients.account}")
+            if canonical_label(found.label).casefold() != recipients.account.casefold():
+                print(f"skip {unit.session}: it runs on {canonical_label(found.label)}, not {recipients.account}")
                 continue
         try:
             delivered = subprocess.run([sys.executable, sender, "--to", unit.session,
@@ -692,7 +700,7 @@ def quota(production: Production, notice: str, state_dir: Path) -> None:
                         _ = held.pop(account, None)
         return held
 
-    held = update_state(path, change_held)
+    held = update_state(path, change_held, read=read_quota_state)
     if failures:
         report("quota", "failed", "; ".join(failures))
         raise WaitingFailure("quota", "")

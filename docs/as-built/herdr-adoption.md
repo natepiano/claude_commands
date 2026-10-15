@@ -117,10 +117,14 @@ prompt is refused with a line saying so; nothing is typed into the prompt.
     two calls; herdr `Herdr.prompt` (`agent prompt`).
   - `keys_place(place, *keys)` — tmux `send-keys`; herdr `Herdr.send_keys`.
   - `where_place(place) -> str` — `tmux:<pane>` or `herdr:<session>:<pane>`.
-  - `session_place(session_id) -> Place` — the newest live session record with
-    that id. On Linux the pane is `TMUX_PANE` from `/proc/<pid>/environ`
-    (`HERDR_PROC` overrides the root); on Darwin it is the `%N` at the end of the
-    record's `tmux` field. With no tmux pane it is `herdr.herdr_place_of(pid)`.
+  - `record_place(record: SessionRecord) -> Place` — the pane of that one
+    registry process. On Linux the pane is `TMUX_PANE` from
+    `/proc/<pid>/environ` (`HERDR_PROC` overrides the root); on Darwin it is the
+    `%N` at the end of the record's `tmux` field. With no tmux pane it is
+    `herdr.herdr_place_of(pid)`; with neither, `NoSuchTarget`.
+  - `session_place(session_id) -> Place` — `record_place` of the newest live
+    session record with that id. Two live processes can share a session id, so
+    a caller holding an observed record uses `record_place`.
   - Errors: `TmuxFailure(OSError)` for tmux, `HerdrFailure` and its subclass
     `AgentBlocked` for herdr, `NoSuchTarget` when no live session or marked unit
     matches.
@@ -152,6 +156,11 @@ prompt is refused with a line saying so; nothing is typed into the prompt.
   - `scripts/shutdown/settle.py` `_screen` reads a herdr host through
     `read_place` (60 lines), a tmux or unit host by the pane id in its session
     record, and returns `ScreenUnreadable("no pane host")` for any other host.
+  - `scripts/shutdown/remote_control.py` resolves a restarted session's pane
+    with `record_place` on the registry record it just observed, reads it with
+    `read_place` for `/remote-control is active`, and types `/remote-control`
+    with `type_place` while the registry shows the session idle; herdr
+    `AgentBlocked` uses no attempt.
 - `promote_showrunner.py` refuses before anything stops when `read_place`
   fails or `unit_effort.verdict` skips the screen. `stop` types `/exit` with
   `type_place`, waits for the pid to exit, then ends the host session: tmux

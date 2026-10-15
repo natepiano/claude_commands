@@ -47,11 +47,11 @@ class UsageStoreTests(unittest.TestCase):
         usage_store.save([Report(
             "Claude", email="Main@Example.invalid", quotas=[Quota("Weekly", 98.0, RESETS)],
             five_hour=Quota("5-hour", 36.0, READ + timedelta(hours=2)),
-        )], READ, {"claude 2": "main@example.invalid", "claude 3": "spare@example.invalid",
+        )], READ, {"claude 2": "main@example.invalid", "claude3": "spare@example.invalid",
                    "main@example.invalid": "main@example.invalid"})
 
         text = usage_store.label_file().read_text(encoding="utf-8")
-        self.assertEqual(json.loads(text), {"claude 2": {
+        self.assertEqual(json.loads(text), {"claude2": {
             "five_hour": {"left": 64.0, "resets_at": int((READ + timedelta(hours=2)).timestamp()),
                           "at": int(READ.timestamp())},
             "weekly": {"left": 2.0, "resets_at": int(RESETS.timestamp()), "at": int(READ.timestamp())},
@@ -60,21 +60,21 @@ class UsageStoreTests(unittest.TestCase):
         self.assertEqual(usage_store.label_file(), self.home / ".local/state/agent-notes/by-label.json")
 
     def test_a_refused_read_keeps_the_label_s_last_reading(self) -> None:
-        logins = {"claude 2": "main@example.invalid"}
+        logins = {"claude2": "main@example.invalid"}
         usage_store.save([Report("Claude", email="main@example.invalid", quotas=[Quota("Weekly", 10.0, RESETS)])],
                          READ, logins)
         usage_store.save([Report("Claude", email="main@example.invalid", problem="HTTP 429")],
                          READ + timedelta(minutes=2), logins)
 
         held = cast(dict[str, dict[str, dict[str, float]]], json.loads(usage_store.label_file().read_text(encoding="utf-8")))
-        self.assertEqual(held["claude 2"]["weekly"]["at"], int(READ.timestamp()))
+        self.assertEqual(held["claude2"]["weekly"]["at"], int(READ.timestamp()))
 
     def test_a_none_open_five_hour_window_has_no_reset(self) -> None:
         usage_store.save([Report("Claude", email="main@example.invalid", quotas=[Quota("Weekly", 10.0, RESETS)])],
-                         READ, {"claude 2": "main@example.invalid"})
+                         READ, {"claude2": "main@example.invalid"})
 
         held = cast(dict[str, dict[str, dict[str, object]]], json.loads(usage_store.label_file().read_text(encoding="utf-8")))
-        self.assertEqual(held["claude 2"]["five_hour"], {"left": 100.0, "resets_at": None, "at": int(READ.timestamp())})
+        self.assertEqual(held["claude2"]["five_hour"], {"left": 100.0, "resets_at": None, "at": int(READ.timestamp())})
 
     def test_a_read_with_no_five_hour_window_stores_all_of_it_left(self) -> None:
         usage_store.save([Report("Claude", email="main@example.invalid", quotas=[Quota("Weekly", 10.0, RESETS)])], READ)

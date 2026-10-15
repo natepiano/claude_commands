@@ -437,6 +437,43 @@ raise SystemExit(1 if record['to'] in fail else 0)
                 for path in self.state.glob("*.json"):
                     path.unlink()
 
+    def compacted(self, *entries: dict[str, object]) -> None:
+        """The pane after an idle compaction, and a transcript whose last turn holds `entries`."""
+        self.panes["unit-one"]["pane"] = "✻ Conversation compacted (ctrl+o for history)\n"
+        transcript = self.projects / "project" / "sid-unit-one.jsonl"
+        after = [{"type": "system", "subtype": "compact_boundary"},
+                 {"type": "user", "message": {"content": "summary: the unit was holding: on the user"}},
+                 {"type": "attachment"}]
+        _ = transcript.write_text("".join(json.dumps(entry) + "\n" for entry in (*entries, *after)))
+        os.utime(transcript, (START - 3600, START - 3600))
+
+    @staticmethod
+    def said(*blocks: dict[str, str]) -> dict[str, object]:
+        return {"type": "assistant", "message": {"content": list(blocks)}}
+
+    def test_a_compacted_pane_reads_a_blocked_turn_end_from_the_transcript(self) -> None:
+        self.compacted(self.said({"type": "text", "text": "Ready for the check."}),
+                       self.said({"type": "thinking", "thinking": ""}),
+                       self.said({"type": "text", "text": "Waiting.\n\n— blocked: the user's Ghostty check"}))
+        self.assertEqual(self.tick(START).returncode, 0)
+        self.assertEqual(self.tick(START + 3600).returncode, 0)
+        self.assertEqual(self.sent(), [])
+
+    def test_a_compacted_pane_bumps_when_the_transcript_turn_holds_or_went_on(self) -> None:
+        for last, status in (([self.said({"type": "text", "text": "— holding: waiting on the tests"})],
+                              "— holding: waiting on the tests"),
+                             ([self.said({"type": "text", "text": "— blocked: the user's Ghostty check"}),
+                               self.said({"type": "tool_use", "name": "Bash"})], "none on screen")):
+            with self.subTest(status=status):
+                self.compacted(*last)
+                self.assertEqual(self.tick(START).returncode, 0)
+                self.assertEqual(self.tick(START + 300).returncode, 0)
+                tell = next(item for item in self.sent() if item["key"].endswith(":tell"))
+                self.assertIn(f"Last status: {status}", tell["text"])
+                self.send_log.unlink()
+                for path in self.state.glob("*.json"):
+                    path.unlink()
+
     def test_holding_turn_end_still_bumps_idle_unit(self) -> None:
         self.configure({"showrunner": ["unit-one"]}, stall_minutes=10)
         self.panes["unit-one"]["pane"] = "— holding: waiting on a decision\n"

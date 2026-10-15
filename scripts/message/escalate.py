@@ -36,10 +36,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "production"))
 from showrunners import load_settings, registered_showrunners
 if TYPE_CHECKING:
     from ..whoami.agent_accounts import (KnownCodexAccount, UnknownCodexAccount, StoredCodexAccount,
-                                        codex_account, seats_home)
+                                        codex_account, workers_home)
 else:
     from scripts.whoami.agent_accounts import (KnownCodexAccount, UnknownCodexAccount, StoredCodexAccount,
-                                codex_account, seats_home)
+                                codex_account, workers_home)
 from user_action import (FIX, ActionRefused, ActionRequired, ActionUnstated, NoActionRequired, UserAction,
                          parse_user_action)
 
@@ -468,7 +468,7 @@ def due(now: float) -> list[Settled]:
             if isinstance(held, RetiredScriptHold):
                 settled.append(discard_script_hold(path, held))
         try:
-            identity = codex_account(seats_home())
+            identity = codex_account(workers_home())
         except (OSError, ValueError):
             identity = UnknownCodexAccount(Path.home() / ".codex", "workers identity cannot be read")
         if isinstance(identity, KnownCodexAccount):

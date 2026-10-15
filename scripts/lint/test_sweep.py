@@ -18,7 +18,7 @@ import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from datetime import datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING, cast, override
 from unittest import mock
 from zoneinfo import ZoneInfo
 
@@ -289,6 +289,20 @@ class TargetDirTests(SweepCase):
         self.assertIn(f"lint sweep: {target.root} is ", output.getvalue())
         self.assertEqual([path for path in target.orphans if not path.exists()], [])
 
+    @unittest.skipUnless(os.path.isdir("/proc/self"), "the process scan reads /proc")
+    def test_a_target_a_process_works_in_is_skipped(self) -> None:
+        target = self.target()
+        worker = subprocess.Popen(["sleep", "60"], cwd=target.root)
+        self.addCleanup(worker.wait)
+        self.addCleanup(worker.kill)
+        output = io.StringIO()
+        environ = {sweep.BUDGET_ENV: "0", sweep.CONFIG_ENV: "/nonexistent/lint.conf"}
+        with mock.patch.dict(os.environ, environ), redirect_stdout(output):
+            status = sweep.main([sweep.TARGET_DIR_FLAG, str(target.root)])
+        self.assertEqual(status, 0)
+        self.assertIn(f"lint sweep: pid {worker.pid} works in {target.root}; {target.root} skipped", output.getvalue())
+        self.assertEqual([path for path in target.orphans if not path.exists()], [])
+
     def test_flag_without_a_directory_is_an_error(self) -> None:
         with redirect_stderr(io.StringIO()):
             self.assertEqual(sweep.main([sweep.TARGET_DIR_FLAG]), 2)
@@ -312,6 +326,83 @@ def cargo_tag_target(base: Path, name: str, digest: str, used: float) -> tuple[P
         f"Signature: 8a477f597d28d172789f06886806bc55\n{sweep.CARGO_TAG_LINE}\n"
     )
     return tree, output
+
+
+def fake_process(proc: Path, pid: int, *, exe: str = "/usr/bin/true", cwd: str = "/", maps: str = "",
+                 argv: tuple[str, ...] = ("true",), environ: tuple[str, ...] = ()) -> None:
+    """A /proc/<pid> entry as the scan reads it."""
+    entry = proc / str(pid)
+    entry.mkdir(parents=True)
+    (entry / "exe").symlink_to(exe)
+    (entry / "cwd").symlink_to(cwd)
+    _ = (entry / "maps").write_text(maps)
+    _ = (entry / "cmdline").write_bytes(b"".join(arg.encode() + b"\0" for arg in argv))
+    _ = (entry / "environ").write_bytes(b"".join(item.encode() + b"\0" for item in environ))
+
+
+def run_from(binary: Path, cwd: Path | None = None) -> subprocess.Popen[bytes]:
+    """A sleeping process whose exe is a copy of sleep at binary, as a test binary runs from deps/."""
+    sleep = shutil.which("sleep")
+    assert sleep is not None
+    _ = shutil.copy2(sleep, binary)
+    # argv[0] stays "sleep": a multi-call coreutils picks its program by that name.
+    return subprocess.Popen(["sleep", "60"], executable=binary, cwd=cwd)
+
+
+class ProcessUseTests(SweepCase):
+    base: Path = Path()
+    proc: Path = Path()
+    workspace: Path = Path()
+    hana: Path = Path()
+    other: Path = Path()
+
+    @override
+    def setUp(self) -> None:
+        self.base = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
+        self.proc = self.base / "proc"
+        self.workspace = self.base / "hana"
+        self.hana = self.workspace / "target"
+        self.other = self.base / "other" / "target"
+        for directory in (self.hana / "debug" / "deps", self.other, self.workspace / "crates" / "app"):
+            directory.mkdir(parents=True)
+
+    def uses(self) -> dict[str, str]:
+        return {root: use.how for root, use in sweep.process_uses([str(self.hana), str(self.other)],
+                                                                   str(self.proc)).items()}
+
+    def test_an_exe_a_working_directory_or_a_mapped_file_under_a_target_is_a_use(self) -> None:
+        library = self.hana / "debug" / "deps" / "libbevy_dylib-1234.so"
+        fake_process(self.proc, 10, exe=str(self.hana / "debug" / "deps" / "hana-f4b6 (deleted)"))
+        fake_process(self.proc, 11, cwd=str(self.other))
+        self.assertEqual(self.uses(), {str(self.hana): f"runs {self.hana}/debug/deps/hana-f4b6 (deleted)",
+                                       str(self.other): f"works in {self.other}"})
+        for entry in self.proc.iterdir():
+            shutil.rmtree(entry)
+        fake_process(self.proc, 12, maps=f"7f00-7f10 r-xp 00000000 00:1f 42    {library}\n")
+        self.assertEqual(self.uses(), {str(self.hana): f"maps {library}"})
+
+    def test_a_sibling_whose_name_starts_with_the_target_is_not_a_use(self) -> None:
+        fake_process(self.proc, 10, exe=f"{self.hana}-old/debug/hana", cwd=f"{self.hana}2",
+                     maps=f"7f00-7f10 r-xp 00000000 00:1f 42    {self.hana}.bak/lib.so\n")
+        self.assertEqual(self.uses(), {})
+
+    def test_a_nextest_run_uses_its_workspace_target_between_test_binaries(self) -> None:
+        fake_process(self.proc, 10, exe="/nix/store/x-cargo-nextest/bin/.cargo-nextest-wrapped",
+                     cwd=str(self.workspace / "crates" / "app"),
+                     argv=("/nix/store/x-cargo-nextest/bin/cargo-nextest", "nextest", "run"))
+        self.assertEqual(self.uses(), {str(self.hana): f"runs cargo-nextest in {self.workspace / 'crates' / 'app'}"})
+
+    def test_a_nextest_run_uses_the_target_its_flag_or_environment_names(self) -> None:
+        for argv, environ in ((("cargo", "nextest", "run", "--target-dir", str(self.other)), ()),
+                              (("cargo", "nextest", "run", f"--target-dir={self.other}"), ()),
+                              (("cargo-nextest", "nextest", "run"), (f"CARGO_TARGET_DIR={self.other}",))):
+            with self.subTest(argv=argv, environ=environ):
+                fake_process(self.proc, 10, exe="/usr/bin/cargo", cwd=str(self.workspace), argv=argv, environ=environ)
+                self.assertEqual(self.uses(), {str(self.other): f"runs cargo-nextest in {self.workspace}"})
+                shutil.rmtree(self.proc)
+
+    def test_without_proc_nothing_is_in_use(self) -> None:
+        self.assertEqual(self.uses(), {})
 
 
 class FloorTests(SweepCase):
@@ -457,7 +548,7 @@ class FloorTests(SweepCase):
         self.assertIn("No build cache is left to remove", message)
         self.assertIn("natedev still has only 9.0 GiB free. Builds need 10.0 GiB free", message)
         self.assertIn("Free 1.0 GiB outside build caches", message)
-        self.assertIn(f"Not swept: 1 target dirs a build holds ({sweep.gib(held_bytes)})", message)
+        self.assertIn(f"Not swept: 1 target dirs a build or test run uses ({sweep.gib(held_bytes)})", message)
         self.assertIn(f"CI's targets ({sweep.gib(ci_bytes)})", message)
         self.assertNotIn("Could not remove", message)
         record = sweep.read_floor_record(sweep.floor_record_path())
@@ -1001,8 +1092,27 @@ if sys.argv[sys.argv.index("--to") + 1] == "user":
         self.assertEqual(status, 0)
         self.assertTrue(scratch.exists())
         self.assertFalse(managed.exists())
-        self.assertIn("1 left alone while a build holds them", output)
+        self.assertIn("1 left alone while a build or test run uses them", output)
         self.assertIn(f"from {base / 'managed' / 'target'}", output)
+
+    @unittest.skipUnless(os.path.isdir("/proc/self"), "the process scan reads /proc")
+    def test_below_the_floor_a_target_a_test_binary_runs_from_is_left_alone(self) -> None:
+        base = self.base()
+        tree, tested = cargo_target(base, "tested", APP, time.time() - DAY)
+        _, idle = cargo_target(base, "idle", DEMO, time.time() - 3600)
+        binary = tree / "deps" / "hana-f4b61d2f4762c609"
+        test = run_from(binary)
+        self.addCleanup(test.wait)
+        self.addCleanup(test.kill)
+
+        status, output = self.hold(base, 10 * GIB, [10 * GIB - 1, 10 * GIB])
+
+        self.assertEqual(status, 0)
+        self.assertTrue(tested.exists())
+        self.assertTrue(binary.exists())
+        self.assertFalse(idle.exists())
+        self.assertIn(f"lint sweep: pid {test.pid} runs {binary}; {base / 'tested' / 'target'} left alone", output)
+        self.assertIn("1 left alone while a build or test run uses them", output)
 
     def test_below_the_floor_a_tag_only_target_loses_output_and_is_named(self) -> None:
         base = self.base()
@@ -1183,7 +1293,7 @@ if sys.argv[sys.argv.index("--to") + 1] == "user":
         _, output = self.hold(base, 10 * GIB, [10 * GIB - SIZE, 10 * GIB])
         self.assertTrue(held.exists())
         self.assertFalse(other.exists())
-        self.assertIn("1 left alone while a build holds them", output)
+        self.assertIn("1 left alone while a build or test run uses them", output)
 
     def test_at_the_floor_or_while_another_sweep_holds_it_nothing_goes(self) -> None:
         base = self.base()

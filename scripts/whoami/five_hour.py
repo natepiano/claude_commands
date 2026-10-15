@@ -13,7 +13,7 @@ from zoneinfo import ZoneInfo
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.whoami.agent_accounts import KnownCodexAccount
-from agent_accounts import Report, seats_home
+from agent_accounts import Report, workers_home
 from quota_alert import (PROTOCOL, load_config, recipients, relay, showrunners_now,
                          CodexAlertPassReadings, ReadCurrentCodexReadings, READ_CURRENT_CODEX_READINGS,
                          codex_alert_pass, selected_codex_report, codex_swap_line)
@@ -49,7 +49,7 @@ def watch(reports: list[Report], *,
     """One line per session told and per alert closed."""
     lines: list[str] = []
     now = datetime.now(timezone.utc)
-    readings = (codex_alert_pass(seats_home(), reports, now)
+    readings = (codex_alert_pass(workers_home(), reports, now)
                 if isinstance(codex_readings, ReadCurrentCodexReadings) else codex_readings)
     selected = readings.selected_account
     if isinstance(selected, KnownCodexAccount):

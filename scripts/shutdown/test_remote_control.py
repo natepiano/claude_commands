@@ -1,0 +1,363 @@
+"""Remote Control repair uses only a proven idle session's own pane."""
+from __future__ import annotations
+
+import io
+import json
+import os
+import subprocess
+import sys
+import tempfile
+from collections.abc import Callable
+from contextlib import redirect_stdout
+from pathlib import Path
+from typing import Literal, TypedDict, cast, final, override
+from unittest.mock import patch
+
+from test_support import ShutdownSendLeaf, ShutdownTestCase
+from test_restart import entry, showrunner, top_level, unit
+import remote_control
+import sessions
+import session_pane
+import settle
+from push_texts import RenderedPush
+from unit_lookup import TmuxPlace
+from herdr import AgentBlocked
+
+
+def unchanged(_at: float) -> None:
+    pass
+
+
+@final
+class FakeClock:
+    def __init__(self) -> None:
+        self.at = 0.0
+        self.tick: Callable[[float], None] = unchanged
+
+    def monotonic(self) -> float:
+        return self.at
+
+    def sleep(self, seconds: float) -> None:
+        if seconds <= 0 or seconds > 0.5:
+            raise AssertionError(f"unexpected poll duration {seconds}")
+        self.at += seconds
+        if self.at > 901:
+            raise AssertionError("fixer exceeded its deadline")
+        self.tick(self.at)
+
+
+class RegistryFixture(TypedDict):
+    pid: int
+    procStart: str
+    sessionId: str
+    name: str
+    messagingSocketPath: str
+    updatedAt: int
+    tmux: str
+    formerNames: list[str]
+    status: Literal["idle", "busy"]
+    bridgeSessionId: str
+
+
+@final
+class RemoteControlTests(ShutdownTestCase):
+    def __init__(self, methodName: str = "runTest") -> None:
+        super().__init__(methodName)
+        self.root = Path()
+        self.registry = Path()
+        self.clock = FakeClock()
+        self.place = TmuxPlace("%7")
+        self.typed: list[tuple[float, str]] = []
+        self.screen = ""
+        self.fields: RegistryFixture = {
+            "pid": 321, "procStart": "original", "sessionId": "owner", "name": "Owner",
+            "messagingSocketPath": "", "updatedAt": 1, "tmux": "owner:@1.%7",
+            "formerNames": [], "status": "idle", "bridgeSessionId": "",
+        }
+
+    @override
+    def setUp(self) -> None:
+        super().setUp()
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name)
+        self.registry = self.root / "registry"
+        self.registry.mkdir()
+        _ = cast(object, self.enterContext(patch.dict(os.environ, {
+            "HOME": str(self.root), "NOTIFIER_SESSIONS_DIR": str(self.registry),
+            "SHUTDOWN_STATE_DIR": str(self.root / "shutdown"),
+        })))
+        _ = self.enterContext(patch.object(Path, "home", return_value=self.root))
+        _ = self.enterContext(patch.object(sessions, "process_start", return_value="original"))
+        _ = self.enterContext(patch.object(settle, "local_machine", return_value="natedev"))
+        self.clock = FakeClock()
+        self.write()
+        _ = self.enterContext(patch.object(session_pane, "record_place", side_effect=self.find_place))
+        _ = self.enterContext(patch.object(session_pane, "type_place", side_effect=self.type_command))
+        _ = self.enterContext(patch.object(session_pane, "read_place", side_effect=self.read_screen))
+
+    def write(self) -> None:
+        _ = (self.registry / "321.json").write_text(json.dumps(self.fields), encoding="utf-8")
+
+    def find_place(self, saved: sessions.SessionRecord) -> TmuxPlace:
+        self.assertEqual(saved["sessionId"], "owner")
+        self.assertEqual(saved["pid"], 321, "fixer must resolve the confirmed process's own pane")
+        self.assertEqual(saved.get("procStart"), "original")
+        return self.place
+
+    def read_screen(self, _place: TmuxPlace) -> str:
+        return self.screen
+
+    def type_command(self, place: TmuxPlace, text: str) -> None:
+        self.assertEqual(place, self.place)
+        current = cast(dict[str, object], json.loads((self.registry / "321.json").read_text()))
+        self.assertEqual(current["status"], "idle", "busy registry must never authorize input")
+        self.assertEqual(current["procStart"], "original", "replacement must never receive input")
+        self.typed.append((self.clock.at, text))
+
+    def run_fix(self, alerts: Literal["user", "none"] = "user") -> tuple[remote_control.RemoteControlOutcome, str, list[RenderedPush]]:
+        output = io.StringIO()
+        with patch.object(settle, "alert_user") as alert, redirect_stdout(output):
+            outcome = remote_control.fix("owner", 321, "original", "trunk unit", alerts, "Owner", clock=self.clock)
+        lines = output.getvalue().splitlines()
+        self.assertEqual(len(lines), 1, output.getvalue())
+        self.assertTrue(lines[0].startswith("trunk unit:"))
+        return outcome, output.getvalue(), [cast(RenderedPush, call.args[0]) for call in alert.call_args_list]
+
+    def test_launch_flag_activates_during_grace_without_pane_input_or_push(self) -> None:
+        def activate(at: float) -> None:
+            if at >= 14.5:
+                self.fields["bridgeSessionId"] = "bridge"
+                self.write()
+        self.clock.tick = activate
+        with patch.object(session_pane, "record_place", side_effect=AssertionError("flag grace inspected a pane")):
+            outcome, text, pushes = self.run_fix()
+        self.assertIsInstance(outcome, remote_control.AlreadyOn)
+        self.assertEqual(self.clock.at, 14.5)
+        self.assertIn("Remote Control", text)
+        self.assertEqual(self.typed, [])
+        self.assertEqual(pushes, [])
+
+    def test_registry_rewrite_after_read_cannot_mix_activation_and_status_snapshots(self) -> None:
+        self.fields["bridgeSessionId"] = "bridge"
+        self.write()
+        read_text = Path.read_text
+        reads: list[str] = []
+        def read_then_rewrite(path: Path, encoding: str | None = None, errors: str | None = None) -> str:
+            text = read_text(path, encoding=encoding, errors=errors)
+            if path == self.registry / "321.json":
+                reads.append(text)
+                self.fields["status"] = "busy"
+                self.fields["bridgeSessionId"] = ""
+                self.write()
+            return text
+        with patch.object(Path, "read_text", new=read_then_rewrite):
+            outcome, _text, pushes = self.run_fix()
+        self.assertIsInstance(outcome, remote_control.AlreadyOn)
+        self.assertEqual(len(reads), 1)
+        self.assertEqual(self.clock.at, 0)
+        self.assertEqual(self.typed, [])
+        self.assertEqual(pushes, [])
+
+    def test_idle_pane_command_enables_control_once_by_registry_or_screen(self) -> None:
+        for evidence in ("registry", "screen"):
+            with self.subTest(evidence=evidence):
+                self.clock = FakeClock()
+                self.fields["bridgeSessionId"] = ""
+                self.screen = ""
+                self.typed.clear()
+                self.write()
+                def activate(at: float) -> None:
+                    if self.typed and at >= self.typed[0][0] + 1:
+                        if evidence == "registry":
+                            self.fields["bridgeSessionId"] = "bridge"
+                            self.write()
+                        else:
+                            self.screen = "/remote-control is active\n"
+                self.clock.tick = activate
+                outcome, text, pushes = self.run_fix()
+                self.assertIsInstance(outcome, remote_control.TurnedOn)
+                self.assertEqual(self.typed, [(60.0, "/remote-control")])
+                self.assertEqual(self.clock.at, 61.0)
+                self.assertIn("Remote Control on", text)
+                self.assertEqual(pushes, [])
+
+    def test_busy_then_idle_registry_delays_input_until_idle(self) -> None:
+        self.fields["status"] = "busy"
+        self.write()
+        def become_idle(at: float) -> None:
+            if at >= 75:
+                self.fields["status"] = "idle"
+            if self.typed:
+                self.fields["bridgeSessionId"] = "bridge"
+            self.write()
+        self.clock.tick = become_idle
+        outcome, _text, pushes = self.run_fix()
+        self.assertIsInstance(outcome, remote_control.TurnedOn)
+        self.assertEqual(self.typed, [(75.0, "/remote-control")])
+        self.assertEqual(pushes, [])
+
+    def test_three_unsuccessful_attempts_push_once_after_last_confirmation_wait(self) -> None:
+        outcome, text, pushes = self.run_fix()
+        self.assertIsInstance(outcome, remote_control.Failed)
+        self.assertEqual(self.typed, [(60.0, "/remote-control"), (90.0, "/remote-control"), (120.0, "/remote-control")])
+        self.assertEqual(self.clock.at, 150.0)
+        self.assertIn("Remote Control failed", text)
+        self.assertEqual(len(pushes), 1)
+        self.assertEqual(pushes[0].id, "shutdown.remote_control")
+        self.assertEqual(pushes[0].title, "trunk unit remote-control is off")
+        self.assertEqual(pushes[0].message, "Session: Owner\nAction: run /remote-control\nReason: Remote control is off.")
+
+    def test_missing_pane_waits_for_launch_flag_then_pushes_without_typing(self) -> None:
+        with patch.object(session_pane, "record_place", side_effect=session_pane.NoSuchTarget("owner")):
+            outcome, _text, pushes = self.run_fix()
+        self.assertIsInstance(outcome, remote_control.Failed)
+        if isinstance(outcome, remote_control.Failed):
+            self.assertEqual(outcome.reason, "no pane to type into")
+        self.assertEqual(self.clock.at, 60.0)
+        self.assertEqual(self.typed, [])
+        self.assertEqual(len(pushes), 1)
+
+    def test_replaced_process_or_registry_ends_without_typing_or_push(self) -> None:
+        for replacement in ("process", "registry"):
+            with self.subTest(replacement=replacement):
+                self.clock = FakeClock()
+                self.fields["procStart"] = "original"
+                self.write()
+                def replace(at: float) -> None:
+                    if replacement == "registry" and at >= 10:
+                        self.fields["procStart"] = "replacement"
+                        self.write()
+                self.clock.tick = replace
+                def observed_start(_pid: int) -> str:
+                    return "replacement" if replacement == "process" and self.clock.at >= 10 else "original"
+                with patch.object(sessions, "process_start", side_effect=observed_start):
+                    outcome, _text, pushes = self.run_fix()
+                self.assertIsInstance(outcome, remote_control.SessionGone)
+                self.assertEqual(self.clock.at, 10.0)
+                self.assertEqual(self.typed, [])
+                self.assertEqual(pushes, [])
+
+    def test_identity_changed_while_resolving_pane_is_rechecked_before_typing(self) -> None:
+        def replace_before_input(saved: sessions.SessionRecord) -> TmuxPlace:
+            place = self.find_place(saved)
+            self.fields["sessionId"] = "different-session"
+            self.write()
+            return place
+        with patch.object(session_pane, "record_place", side_effect=replace_before_input):
+            outcome, _text, pushes = self.run_fix()
+        self.assertIsInstance(outcome, remote_control.SessionGone)
+        self.assertEqual(self.clock.at, 60.0)
+        self.assertEqual(self.typed, [])
+        self.assertEqual(pushes, [])
+
+    def test_duplicate_session_id_routes_input_to_the_confirmed_pid(self) -> None:
+        newer: RegistryFixture = {**self.fields, "pid": 999, "procStart": "newer",
+            "updatedAt": 2, "status": "busy", "tmux": "newer:@2.%99"}
+        _ = (self.registry / "999.json").write_text(json.dumps(newer))
+        resolved: list[int] = []
+        def pane_for_record(saved: sessions.SessionRecord) -> TmuxPlace:
+            resolved.append(saved["pid"])
+            return TmuxPlace("%7" if saved["pid"] == 321 else "%99")
+        def environment(pid: int) -> dict[str, str]:
+            return {"TMUX_PANE": "%7" if pid == 321 else "%99"}
+        def activate(at: float) -> None:
+            if self.typed and at > self.typed[0][0]:
+                self.fields["bridgeSessionId"] = "bridge"
+                self.write()
+        self.clock.tick = activate
+        with (patch.object(sys, "platform", "linux"),
+              patch.object(session_pane, "live_session", return_value=True),
+              patch.object(session_pane, "_session_environment", side_effect=environment),
+              patch.object(session_pane, "record_place", side_effect=pane_for_record)):
+            outcome, _text, pushes = self.run_fix()
+        self.assertIsInstance(outcome, remote_control.TurnedOn)
+        self.assertTrue(resolved)
+        self.assertEqual(set(resolved), {321})
+        self.assertEqual(self.typed, [(60.0, "/remote-control")])
+        self.assertEqual(pushes, [])
+
+    def test_activation_during_failed_pane_lookup_finishes_without_push(self) -> None:
+        for already_typed in (False, True):
+            with self.subTest(already_typed=already_typed):
+                self.clock = FakeClock()
+                self.typed.clear()
+                self.fields["bridgeSessionId"] = ""
+                self.write()
+                def disappearing_pane(saved: sessions.SessionRecord) -> TmuxPlace:
+                    if already_typed and not self.typed:
+                        return self.find_place(saved)
+                    self.fields["bridgeSessionId"] = "bridge"
+                    self.write()
+                    raise session_pane.NoSuchTarget("owner")
+                with patch.object(session_pane, "record_place", side_effect=disappearing_pane):
+                    outcome, _text, pushes = self.run_fix()
+                self.assertIsInstance(outcome, remote_control.TurnedOn if already_typed else remote_control.AlreadyOn)
+                self.assertEqual(len(self.typed), int(already_typed))
+                self.assertEqual(pushes, [])
+
+    def test_failed_repair_respects_push_policy_without_skipping_attempts(self) -> None:
+        for policy in ("user", "none"):
+            with self.subTest(policy=policy):
+                self.clock = FakeClock()
+                self.typed.clear()
+                outcome, _text, pushes = self.run_fix(policy)
+                self.assertIsInstance(outcome, remote_control.Failed)
+                self.assertEqual(len(self.typed), 3)
+                self.assertEqual(len(pushes), int(policy == "user"))
+
+    def test_transient_input_failure_retries_and_exhausted_input_failures_push_once(self) -> None:
+        for recover in (True, False):
+            with self.subTest(recover=recover):
+                self.clock = FakeClock()
+                self.typed.clear()
+                self.fields["bridgeSessionId"] = ""
+                self.write()
+                attempted: list[float] = []
+                def input_with_failure(place: TmuxPlace, text: str) -> None:
+                    attempted.append(self.clock.at)
+                    if not recover or len(attempted) == 1:
+                        raise OSError("temporary pane transport failure")
+                    self.type_command(place, text)
+                    self.fields["bridgeSessionId"] = "bridge"
+                    self.write()
+                with patch.object(session_pane, "type_place", side_effect=input_with_failure):
+                    outcome, _text, pushes = self.run_fix()
+                self.assertEqual(len(attempted), 2 if recover else 3)
+                self.assertIsInstance(outcome, remote_control.TurnedOn if recover else remote_control.Failed)
+                self.assertEqual(len(self.typed), int(recover))
+                self.assertEqual(len(pushes), 0 if recover else 1)
+
+    def test_blocked_herdr_input_is_not_counted_as_a_successful_attempt(self) -> None:
+        def blocked(_place: object, _text: str) -> None:
+            raise AgentBlocked("busy")
+        with patch.object(session_pane, "type_place", side_effect=blocked):
+            outcome, _text, pushes = self.run_fix()
+        self.assertIsInstance(outcome, remote_control.Failed)
+        self.assertEqual(self.clock.at, 900.0)
+        self.assertEqual(self.typed, [])
+        self.assertEqual(len(pushes), 1)
+
+    def test_who_names_the_unit_production_or_plain_session(self) -> None:
+        for saved, expected in ((entry(unit("trunk")), "trunk unit"),
+                                (entry(showrunner("director")), "demo showrunner"),
+                                (entry(top_level("plain", name="Workspace")), "Workspace")):
+            with self.subTest(expected=expected):
+                self.assertEqual(remote_control.remote_control_who(saved), expected)
+
+    def test_detached_launch_carries_process_identity_unbuffered_python_and_who(self) -> None:
+        self.allow_leaf(ShutdownSendLeaf.LAUNCH_REMOTE_CONTROL_FIXER)
+        for platform in ("linux", "darwin"):
+            with self.subTest(platform=platform), patch.object(sys, "platform", platform), patch.object(subprocess, "run", return_value=subprocess.CompletedProcess([], 0)) as launch:
+                remote_control.launch_fixer("owner-identifier", 321, "original start", "trunk unit", "none", "Owner")
+            launch.assert_called_once()
+            argv = cast(list[str], launch.call_args.args[0])
+            self.assertEqual(argv[0], "launchctl" if platform == "darwin" else "systemd-run")
+            env = argv.index("env")
+            self.assertEqual(argv[env:], ["env", "PYTHONUNBUFFERED=1", sys.executable, "-u",
+                str(Path(remote_control.__file__).with_name("shutdown.py")), "remote-control", "owner-identifier",
+                "--pid", "321", "--proc-start", "original start", "--who", "trunk unit", "--alerts", "none", "--session", "Owner"])
+            service = argv[argv.index("-l" if platform == "darwin" else "--unit") + 1]
+            self.assertEqual(service, "shutdown-remote-control-owner-identi-321")
+            if platform == "linux":
+                self.assertTrue({"--user", "--collect", "--quiet", "--no-block"}.issubset(argv))
