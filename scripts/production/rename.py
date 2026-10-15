@@ -140,6 +140,27 @@ def _relative(plan: RenamePlan, path: Path) -> str:
         raise RenameRefused(f"{path} is outside the showrunner checkout {plan.checkout}") from error
 
 
+def _plan_paths(cell: str, checkout: Path) -> tuple[Path, ...]:
+    names = [match[1] for match in re.finditer(r"`([^`]+)`", cell)]
+    if not names:
+        if re.search(r"\s", cell.strip()):
+            return ()
+        names = [cell.strip()]
+    paths: list[Path] = []
+    for name in names:
+        path = Path(name).expanduser()
+        path = (path if path.is_absolute() else checkout / path).resolve()
+        try:
+            relative = path.relative_to(checkout)
+        except ValueError:
+            continue
+        if relative.parts[:2] != ("docs", "plans") or path.suffix != ".md" or not path.is_file():
+            continue
+        if _git(checkout, "ls-files", "-z", "--", f":(literal){relative}"):
+            paths.append(path)
+    return tuple(paths)
+
+
 def _build(old: str, new: str) -> RenamePlan:
     _validate_slug(new)
     old = showrunners.canonical_slug(old)
@@ -171,13 +192,11 @@ def _build(old: str, new: str) -> RenamePlan:
         raw = row.get("Plan", "")
         if add_unit.plan_cell_is_retired(raw):
             continue
-        name = add_unit.cell_value(raw)
-        if name in ("", "—", "-", "permanent"):
+        if raw.strip() in ("", "—", "-", "permanent"):
             continue
-        path = Path(name).expanduser()
-        path = (path if path.is_absolute() else production.checkout / path).resolve()
-        if path not in plans:
-            plans.append(path)
+        for path in _plan_paths(raw, production.checkout):
+            if path not in plans:
+                plans.append(path)
     result = RenamePlan(
         old, new, production.doc, production.doc.with_name(f"{new}-production.md"), production.checkout,
         production.merge_branch, _git(production.checkout, "rev-parse", f"refs/heads/{production.merge_branch}"),
