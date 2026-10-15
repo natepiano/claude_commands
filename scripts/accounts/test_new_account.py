@@ -3,6 +3,7 @@ from __future__ import annotations
 import io
 import json
 import os
+import stat
 import sys
 import tempfile
 import unittest
@@ -22,6 +23,7 @@ class NewAccountTests(unittest.TestCase):
         self.home: Path = Path()
         self.notes: Path = Path()
         self.nixos: Path = Path()
+        self.colors: Path = Path()
 
     @override
     def setUp(self) -> None:
@@ -46,6 +48,10 @@ class NewAccountTests(unittest.TestCase):
         nightly = self.home / ".claude/scripts/nightly_review/settings.json"
         nightly.parent.mkdir(parents=True)
         _ = nightly.write_text(json.dumps({"permissions": {"deny": ["Edit(~/.claude/**)"]}}))
+        self.colors = self.home / ".claude/config/statusline.conf"
+        self.colors.parent.mkdir()
+        shipped = Path(__file__).resolve().parents[2] / "config/statusline.conf"
+        _ = self.colors.write_bytes(shipped.read_bytes())
 
     def write_settings(self, folders: list[str]) -> None:
         settings = {
@@ -170,6 +176,105 @@ class NewAccountTests(unittest.TestCase):
         self.assertTrue(stdout.endswith("claude4 is ready; /showrunner:accounts shows its row.\n"))
         self.assertIsInstance(accounts.account_directory_readiness("claude4"), accounts.AccountDirectoryReady)
 
+    def test_new_claude_account_inserts_pink_after_the_last_shipped_account_without_changing_other_bytes(self) -> None:
+        before = self.colors.read_bytes()
+
+        _, stdout, stderr = self.run_cli("claude5")
+
+        self.assertEqual(stderr, "")
+        self.assertIn("done: status line color pink for claude5", stdout)
+        self.assertLess(stdout.index("nightly review cannot edit ~/.claude5"),
+                        stdout.index("status line color pink for claude5"))
+        self.assertEqual(self.colors.read_bytes(), before.replace(
+            b"account.claude4=orange\n",
+            b"account.claude4=orange\naccount.claude5=pink\n", 1))
+
+    def test_next_claude_account_gets_teal_after_pink_is_taken(self) -> None:
+        first = new_account.statusline_color_step(new_account.parse_account("claude", "claude5"))
+
+        second = new_account.statusline_color_step(new_account.parse_account("claude", "claude6"))
+
+        self.assertTrue(first.done, first.text)
+        self.assertTrue(second.done, second.text)
+        self.assertEqual(second.text, "status line color teal for claude6")
+        self.assertIn(b"account.claude5=pink\naccount.claude6=teal\n", self.colors.read_bytes())
+
+    def test_adding_an_account_color_preserves_restrictive_config_permissions_under_a_looser_umask(self) -> None:
+        before = self.colors.read_bytes()
+        for mode in (0o640, 0o600):
+            with self.subTest(mode=oct(mode)):
+                _ = self.colors.write_bytes(before)
+                self.colors.chmod(mode)
+                previous_umask = os.umask(0o022)
+                try:
+                    step = new_account.statusline_color_step(new_account.parse_account("claude", "claude5"))
+                finally:
+                    _ = os.umask(previous_umask)
+
+                self.assertTrue(step.done, step.text)
+                self.assertIn("account.claude5=pink\n", self.colors.read_text(encoding="utf-8"))
+                self.assertEqual(stat.S_IMODE(self.colors.stat().st_mode), mode)
+
+    def test_existing_account_color_is_reported_without_rewriting_the_file(self) -> None:
+        account = new_account.parse_account("claude", "claude5")
+        first = new_account.statusline_color_step(account)
+        before = self.colors.read_bytes()
+        before_stat = self.colors.stat()
+
+        with patch.object(os, "replace", wraps=os.replace) as replace:
+            repeated = new_account.statusline_color_step(account)
+
+        self.assertTrue(repeated.done, repeated.text)
+        self.assertEqual(repeated.text, "status line color pink for claude5")
+        self.assertEqual(repeated, first)
+        self.assertEqual(self.colors.read_bytes(), before)
+        self.assertEqual((self.colors.stat().st_ino, self.colors.stat().st_mtime_ns),
+                         (before_stat.st_ino, before_stat.st_mtime_ns))
+        replace.assert_not_called()
+
+    def test_exhausted_distinct_colors_fall_back_to_role_colors_then_leave_the_account_uncolored(self) -> None:
+        _ = self.colors.write_text(
+            "# Only the role colors remain unused by accounts.\n"
+            + "role.showrunner=bright-magenta\nrole.unit-director=bright-blue\nrole.worker=bright-cyan\n"
+            + "role.unassigned=purple\n"
+            + "account.claude1=blue\naccount.claude2=magenta\naccount.claude3=cyan\n"
+            + "account.claude4=orange\naccount.claude10=pink\naccount.claude11=teal\naccount.claude12=brown\n",
+            encoding="utf-8")
+        for label, color in (("claude5", "bright-blue"), ("claude6", "bright-magenta"),
+                             ("claude7", "bright-cyan"), ("claude8", "purple")):
+            with self.subTest(label=label):
+                step = new_account.statusline_color_step(new_account.parse_account("claude", label))
+                self.assertTrue(step.done, step.text)
+                self.assertEqual(step.text, f"status line color {color} for {label}")
+                self.assertIn(f"account.{label}={color}\n", self.colors.read_text(encoding="utf-8"))
+        before = self.colors.read_bytes()
+
+        step = new_account.statusline_color_step(new_account.parse_account("claude", "claude9"))
+
+        self.assertTrue(step.done, step.text)
+        self.assertIn("claude9 stays uncolored", step.text)
+        self.assertEqual(self.colors.read_bytes(), before)
+
+    def test_missing_status_line_config_is_done_without_creating_a_file(self) -> None:
+        self.colors.unlink()
+
+        step = new_account.statusline_color_step(new_account.parse_account("claude", "claude5"))
+
+        self.assertTrue(step.done, step.text)
+        self.assertIn("claude5 stays uncolored", step.text)
+        self.assertFalse(self.colors.exists())
+
+    def test_unreadable_status_line_config_reports_for_you_with_its_path_and_error(self) -> None:
+        self.colors.unlink()
+        self.colors.mkdir()
+
+        code, stdout, stderr = self.run_cli("claude5")
+
+        self.assertEqual((code, stderr), (1, ""))
+        self.assertIn(f"for you: could not update {self.colors}:", stdout)
+        self.assertIn("Is a directory", stdout)
+        self.assertTrue(self.colors.is_dir())
+
     def test_a_glob_permission_rule_covers_the_folder_but_not_a_linux_sandbox_entry(self) -> None:
         self.write_settings(["~/.claude[0-9]*"])
         _, stdout, _ = self.run_cli("claude", "claude4")
@@ -210,6 +315,7 @@ class NewAccountTests(unittest.TestCase):
         self.assertFalse((self.home / ".codex3").exists())
 
     def test_codex_with_a_login_writes_the_note_sets_up_and_prints_sign_in(self) -> None:
+        colors_before = self.colors.read_bytes()
         (self.home / ".codex").mkdir()
         _ = (self.home / ".codex" / "config.toml").write_text("", encoding="utf-8")
         with patch.object(agent_accounts, "codex_homes", return_value=[self.home / ".codex"]), \
@@ -220,6 +326,9 @@ class NewAccountTests(unittest.TestCase):
         self.assertTrue((self.home / ".codex3" / "config.toml").is_symlink())
         self.assertIn("CODEX_HOME=~/.codex3 codex login", stdout)
         self.assertNotIn("settings.json", stdout)
+        self.assertNotIn("status line color", stdout)
+        self.assertNotIn("stays uncolored", stdout)
+        self.assertEqual(self.colors.read_bytes(), colors_before)
 
     def test_mac_has_no_alias_step(self) -> None:
         with patch.object(sys, "platform", "darwin"):

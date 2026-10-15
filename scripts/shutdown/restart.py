@@ -13,6 +13,7 @@ import re
 import shlex
 import subprocess
 import sys
+import syslog
 import tempfile
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -21,7 +22,7 @@ from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
-from typing import Literal, Protocol, TypedDict, cast
+from typing import Literal, Never, Protocol, TypedDict, cast
 
 SCRIPTS = Path(__file__).resolve().parents[1]
 for dependency in ("whoami", "message", "notify", "production", "hooks", "lib", "herdr"):
@@ -40,6 +41,7 @@ import add_unit  # noqa: E402
 import herdr  # noqa: E402
 import conversation_pause  # noqa: E402
 import relaunch  # noqa: E402
+from probe_session import PROBE_ENV  # noqa: E402
 from inventory import (  # noqa: E402
     PaneNotRecorded,
     Session,
@@ -57,7 +59,6 @@ from record import (  # noqa: E402
     AccountHold,
     InvalidRecord,
     NoLiveRecord,
-    NoRemoteControl,
     PendingTimer,
     SessionShutdown,
     SessionRestoredTimersPending,
@@ -254,7 +255,7 @@ class PeerRestartResult(TypedDict):
     label: str
     outcome: Literal["done", "partial", "nothing"]
     lines: list[str]
-    no_remote_control: list[NoRemoteControl]
+    no_remote_control: list[Never]
     refused: list[RestartRefusal]
 
 
@@ -282,7 +283,6 @@ class MachineRestartResult:
     timers_not_started: tuple[TimerNotStarted, ...] = ()
     elapsed_seconds: float = 0.0
     refused: list[RestartRefusal] = field(default_factory=list)
-    no_remote_control: list[NoRemoteControl] = field(default_factory=list)
     local_session_ids: frozenset[str] = frozenset()
 
     @property
@@ -435,27 +435,21 @@ def wait_for_remote_control(records: Sequence[sessions.SessionRecord], timeout: 
     return active
 
 
-def remote_control_missing(records: list[SessionShutdown], confirmation: RegistryConfirmation, *, notify: bool = True) -> tuple[NoRemoteControl, ...]:
-    """Print the diagnostic while retaining each archived session's alert policy."""
+def remote_control_missing(records: list[SessionShutdown], confirmation: RegistryConfirmation) -> None:
+    """Launch quiet recovery for each confirmed local session still missing it."""
     active = wait_for_remote_control(confirmation.records, REMOTE_CONTROL_WAIT_SECONDS)
-    missing = tuple(NoRemoteControl(session_id=saved["session"]["session_id"],
-        name=saved["session"]["name"], alerts=saved["alerts"]) for saved in records
-        if saved["session"]["session_id"] in confirmation.live_ids - active)
-    by_id = {saved["session"]["session_id"]: saved for saved in records}
     live_by_id = {item["sessionId"]: item for item in confirmation.records}
-    for item in missing:
-        live = live_by_id[item["session_id"]]
-        who = remote_control.remote_control_who(by_id[item["session_id"]])
-        alerts = item["alerts"] if notify else "none"
+    for saved in records:
+        session = saved["session"]
+        identity = session["session_id"]
+        if identity not in confirmation.live_ids - active:
+            continue
+        live = live_by_id[identity]
         try:
-            remote_control.launch_fixer(item["session_id"], live["pid"], live.get("procStart", ""), who, alerts, item["name"])
-        except (OSError, RuntimeError, ValueError, subprocess.SubprocessError):
-            print(f"{item['name']}: Remote Control is off; turn it on at its terminal with /remote-control")
-            if alerts == "user":
-                remote_control.alert_failed(who, item["name"])
-        else:
-            print(f"{item['name']}: Remote Control not on yet; turning it on in the background")
-    return missing
+            remote_control.launch_fixer(identity, live["pid"], live.get("procStart", ""),
+                                        remote_control.remote_control_who(saved), session["name"])
+        except (OSError, RuntimeError, ValueError, subprocess.SubprocessError) as error:
+            syslog.syslog(syslog.LOG_WARNING, f"{session['name']}: could not start Remote Control fixer: {error}")
 
 
 def _user_time(value: str) -> str:
@@ -537,7 +531,7 @@ class RecordedHerdrPane:
 HerdrDestination = NewHerdrSession | RecordedHerdrPane
 
 
-def _resume_parts(session: Session, prompt: str, target: str = "") -> ResumeParts:
+def _resume_parts(session: Session, prompt: str, target: str = "", *, probe: bool = False) -> ResumeParts:
     default_dir = Path.home() / ".claude"
     config_dir = Path(session.get("config_dir", str(default_dir)))
     if session["kind"] in ("unit", "showrunner"):
@@ -554,6 +548,8 @@ def _resume_parts(session: Session, prompt: str, target: str = "") -> ResumePart
         if config_dir != default_dir and not target else {}
     )
     environment["ENABLE_TOOL_SEARCH"] = "true"
+    if probe or session.get("probe", False):
+        environment[PROBE_ENV] = "1"
     argv = [
         "--resume",
         session["session_id"],
@@ -607,8 +603,8 @@ def _relaunch_request(parts: ResumeParts, note: str) -> relaunch.RelaunchRequest
     )
 
 
-def _resume_command(session: Session, prompt: str, target: str = "") -> str:
-    return _resume_shell(_resume_parts(session, prompt, target))
+def _resume_command(session: Session, prompt: str, target: str = "", *, probe: bool = False) -> str:
+    return _resume_shell(_resume_parts(session, prompt, target, probe=probe))
 
 
 def account_move_note(session: Session, target: str, source_label: str, why: str = "") -> str:
@@ -737,6 +733,8 @@ def _unit_argv(record: SessionShutdown) -> list[str]:
 
     selected = accounts.account_for_group_launch("unit", resume=True, target=record.get("target", ""))
     argv.extend(("--account", selected.label))
+    if record["probe"]:
+        argv.append("--probe")
     return argv
 
 
@@ -1121,7 +1119,7 @@ def _launch_session(
     prompt = _showrunner_prompt(session) if session["kind"] == "showrunner" else note
     if session["kind"] == "showrunner" and "target" in record:
         prompt += " " + note
-    parts = _resume_parts(session, prompt, record.get("target", ""))
+    parts = _resume_parts(session, prompt, record.get("target", ""), probe=record.get("probe", False))
     if host["kind"] == "herdr":
         _herdr_launch(parts, RecordedHerdrPane(host["herdr_session"], host["pane_id"]),
                       session, dry_run=dry_run)
@@ -1835,7 +1833,7 @@ def owns_relaunch_claim(original: SessionShutdown, result: SessionShutdown) -> b
     )
 
 
-def _confirm_entries(records: list[SessionShutdown], *, notify: bool = True) -> tuple[NoRemoteControl, ...]:
+def _confirm_entries(records: list[SessionShutdown]) -> None:
     launched = [record for record in records if record["progress"]["kind"] == "restarting"]
     confirmation = wait_for_confirmation(
         frozenset(record["session"]["session_id"] for record in launched),
@@ -1849,10 +1847,10 @@ def _confirm_entries(records: list[SessionShutdown], *, notify: bool = True) -> 
         if record["progress"]["kind"] == "restarted":
             archive_session(record["login"], record["session"]["session_id"])
 
-    return remote_control_missing(launched, confirmation, notify=notify)
+    remote_control_missing(launched, confirmation)
 
 
-def _up(login: str, dry_run: bool, only: Iterable[str] = (), *, notify: bool = True) -> MachineRestartResult:
+def _up(login: str, dry_run: bool, only: Iterable[str] = ()) -> MachineRestartResult:
     if not dry_run:
         for line in migrate(login):
             print(line)
@@ -1928,7 +1926,7 @@ def _up(login: str, dry_run: bool, only: Iterable[str] = (), *, notify: bool = T
                 if current["progress"]["kind"] == "restarting" and not owns_relaunch_claim(original, current):
                     continue
                 attempted.append(current)
-        missing_control = list(_confirm_entries(attempted, notify=notify))
+        _confirm_entries(attempted)
         for record in requesters:
             other_unfinished = [
                 item for item in session_records(login)
@@ -1941,7 +1939,7 @@ def _up(login: str, dry_run: bool, only: Iterable[str] = (), *, notify: bool = T
             current = relaunch_session(record, dry_run=False, desktop_state=state)
             if current["progress"]["kind"] == "restarting" and not owns_relaunch_claim(record, current):
                 continue
-            missing_control.extend(_confirm_entries([current], notify=notify))
+            _confirm_entries([current])
             attempted.append(current)
         settle.tell_showrunners_outcome([*finished, *attempted])
         remaining = session_records(login)
@@ -1952,7 +1950,7 @@ def _up(login: str, dry_run: bool, only: Iterable[str] = (), *, notify: bool = T
             elif finished_requests:
                 clear_finished_account_hold(login, request_ids=finished_requests)
         result = replace(_machine_result(attempted, machine, label), elapsed_seconds=time.monotonic() - started_at)
-        result = replace(result, refused=refused, no_remote_control=missing_control, local_session_ids=frozenset(local_ids))
+        result = replace(result, refused=refused, local_session_ids=frozenset(local_ids))
         reported = tuple(ManualSessionRestart(record["session"]["name"], record["progress"]["command"])
                              for record in attempted if record["progress"]["kind"] == "manual restart"
                              and record["session"]["session_id"] not in previous_manual_ids)
@@ -1971,17 +1969,17 @@ def refusal_line(refusal: RestartRefusal) -> str:
     return f"{refusal['name']} is {refusal['progress']}, not stopped; nothing to restart"
 
 
-def up_result(login: str, dry_run: bool = False, only: Iterable[str] = (), *, notify: bool = True) -> PeerRestartResult:
+def up_result(login: str, dry_run: bool = False, only: Iterable[str] = ()) -> PeerRestartResult:
     """Run the local verb and retain its printed lines in a validated peer object."""
     output = io.StringIO()
     with redirect_stdout(output):
         try:
-            result = _up(login, dry_run, only, notify=notify)
+            result = _up(login, dry_run, only)
         except (InvalidRecord, OSError, RuntimeError, ValueError, subprocess.SubprocessError) as error:
             print(f"{settle.local_machine()}: restart failed: {error}")
             result = MachineRestartResult(settle.local_machine(), login, "partial", failed=1)
     return PeerRestartResult(machine=result.machine, label=result.label, outcome=result.status,
-        lines=output.getvalue().splitlines(), no_remote_control=list(result.no_remote_control), refused=list(result.refused))
+        lines=output.getvalue().splitlines(), no_remote_control=[], refused=list(result.refused))
 
 
 def parse_peer_result(text: str) -> PeerRestartResult:
@@ -1998,9 +1996,8 @@ def parse_peer_result(text: str) -> PeerRestartResult:
     raw_lines = fields.get("lines")
     if not isinstance(raw_lines, list) or any(not isinstance(line, str) for line in cast(list[object], raw_lines)):
         raise ValueError("invalid peer restart lines")
-    missing: list[NoRemoteControl] = []
     refusals: list[RestartRefusal] = []
-    for key in ("no_remote_control", "refused"):
+    for key in ("refused",):
         raw = fields.get(key)
         if not isinstance(raw, list):
             raise ValueError(f"invalid peer restart {key}")
@@ -2011,11 +2008,7 @@ def parse_peer_result(text: str) -> PeerRestartResult:
             if any(not isinstance(item.get(field), str) or not item[field] for field in ("session_id", "name")):
                 raise ValueError(f"invalid peer restart {key} identity")
             identity, name = cast(str, item["session_id"]), cast(str, item["name"])
-            if key == "no_remote_control":
-                if item.get("alerts") not in ("user", "none"):
-                    raise ValueError("invalid peer alert policy")
-                missing.append(NoRemoteControl(session_id=identity, name=name, alerts=cast(Literal["user", "none"], item["alerts"])))
-            elif item.get("kind") == "no shutdown":
+            if item.get("kind") == "no shutdown":
                 refusals.append(RestartNoShutdown(kind="no shutdown", session_id=identity, name=name))
             elif item.get("kind") == "not stopped" and item.get("progress") in ("waiting", "ready", "held by usage limit", "reaping", "stopping"):
                 refusals.append(RestartNotStopped(kind="not stopped", session_id=identity, name=name,
@@ -2024,13 +2017,13 @@ def parse_peer_result(text: str) -> PeerRestartResult:
                 raise ValueError("invalid peer restart refusal")
     return PeerRestartResult(machine=cast(str, fields["machine"]), label=cast(str, fields["label"]),
         outcome=cast(Literal["done", "partial", "nothing"], fields["outcome"]), lines=cast(list[str], raw_lines),
-        no_remote_control=missing, refused=refusals)
+        no_remote_control=[], refused=refusals)
 
 
-def up(login: str, dry_run: bool = False, only: Iterable[str] = (), *, notify: bool = True) -> int:
+def up(login: str, dry_run: bool = False, only: Iterable[str] = ()) -> int:
     """Resume each eligible local session without waiting on another machine."""
     try:
-        result = _up(login, dry_run, only, notify=notify)
+        result = _up(login, dry_run, only)
         return result.exit_status
     except (InvalidRecord, OSError, RuntimeError, ValueError, subprocess.SubprocessError) as error:
         print(f"{settle.local_machine()}: restart failed: {error}")
@@ -2181,7 +2174,7 @@ def restart(
     ids = tuple(only)
     local_ids: set[str] = set()
     try:
-        local = _up(selected.login, dry_run, ids, notify=notify)
+        local = _up(selected.login, dry_run, ids)
         local_ids = set(local.local_session_ids)
     except (
         InvalidRecord,

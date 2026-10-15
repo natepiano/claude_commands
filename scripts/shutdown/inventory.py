@@ -21,6 +21,7 @@ for dependency in ("whoami", "message", "production", "herdr", "delegate", "lib"
     sys.path.insert(0, str(SCRIPTS / dependency))
 
 import account
+from probe_session import PROBE_ENV
 import unit_runs
 if TYPE_CHECKING:
     from ..delegate.worker_state import worker_ledger
@@ -234,6 +235,7 @@ class SessionFields(TypedDict):
     cwd: str
     # Records from before account-directory capture use the default directory.
     config_dir: NotRequired[str]
+    probe: bool
     status: str
     updated_at: int
     model: LastModel
@@ -732,6 +734,10 @@ def parse_session(value: object, place: str, *, require_updated_at: bool = False
             _wire_required(data, "timers", place), f"{place}.timers"
         ),
     }
+    probe = data.get("probe", False)
+    if not isinstance(probe, bool):
+        raise InvalidInventory(f"{place}.probe must be a boolean")
+    parsed["probe"] = probe
     if "config_dir" in data:
         parsed["config_dir"] = _wire_string(
             data["config_dir"], f"{place}.config_dir"
@@ -1590,6 +1596,7 @@ def inventory(
             "name": entry.name,
             "cwd": cwd,
             "config_dir": str(entry.config_dir),
+            "probe": _process_environment(entry.pid).get(PROBE_ENV) == "1",
             "status": _string(record.get("status"), "unknown"),
             "updated_at": _wire_integer(record.get("updatedAt", 0), "session.updatedAt"),
             "model": _model(session_id, entry.config_dir),

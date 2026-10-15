@@ -6,7 +6,7 @@ import shlex
 import unittest
 from enum import StrEnum
 from types import ModuleType
-from typing import Literal, Never, cast, override
+from typing import Never, cast, override
 from unittest.mock import patch
 
 import remote
@@ -146,10 +146,10 @@ class ShutdownTestCase(unittest.TestCase):
         )
 
     def _block_launch_remote_control(
-        self, session_id: str, pid: int, proc_start: str, who: str, alerts: Literal["user", "none"],
+        self, session_id: str, pid: int, proc_start: str, who: str,
         session: str
     ) -> Never:
-        del pid, proc_start, who, alerts, session
+        del pid, proc_start, who, session
         self._reached_send_leaf(ShutdownSendLeaf.LAUNCH_REMOTE_CONTROL_FIXER, f"session:{session_id}")
 
     def _block_run_notifier(self, verb: str, instance: str) -> Never:

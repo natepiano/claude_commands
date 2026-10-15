@@ -142,7 +142,7 @@ class RefusalWatchTests(unittest.TestCase):
 
     def owner(self, identity: str, *, host: str = "terminal", label: str = "claude1") -> inventory.Session:
         fields = inventory.SessionFields(session_id=identity, pid=1000 + len(self.owners),
-            proc_start="fixture-start", name="owner " + identity, cwd=str(self.home / "checkout"),
+            proc_start="fixture-start", name="owner " + identity, cwd=str(self.home / "checkout"), probe=False,
             status="idle", updated_at=0, model=inventory.ModelName(kind="model", name="opus-real"),
             checkout=inventory.NotACheckout(kind="not a checkout"),
             run_dirs=[], codex_servers=[], timers=[], config_dir=str(accounts.account_dir(label)))
@@ -219,7 +219,7 @@ class RefusalWatchTests(unittest.TestCase):
             saved = record.SessionShutdown(login=source.login, label=source.label, machine="natedev",
                 requested_at=WatchTime.at.isoformat(), request_id=f"batch-{len(self.commands)}",
                 requested_by=record.FromTerminal(kind="terminal"), hold="session", then="restart",
-                force="wait for ready", alerts="user", session=owner, workers=[], timers=[],
+                force="wait for ready", alerts="user", probe=False, session=owner, workers=[], timers=[],
                 settle_message=record.SettleMessageNotSent(kind="not sent"), where=record.WhereNotSaid(kind="not said"),
                 progress=record.SessionWaiting(kind="waiting"), trail=[], stop_issues=[], target=target,
                 source_label=source.label, why=why, move_id=command[command.index("--move-id") + 1])
@@ -1391,7 +1391,7 @@ class RefusalWatchTests(unittest.TestCase):
         _ = self.transcript(owner["session_id"])
         _ = self.cli()
         fields = inventory.SessionFields(session_id="worker-refused", pid=12345, proc_start="fixture-start",
-            name="worker", cwd=owner["cwd"], status="idle", updated_at=0, model=owner["model"], checkout=owner["checkout"],
+            name="worker", cwd=owner["cwd"], status="idle", updated_at=0, probe=False, model=owner["model"], checkout=owner["checkout"],
             run_dirs=[], codex_servers=[], timers=[], config_dir=str(accounts.account_dir("claude1")))
         worker = inventory.WorkerSession(**fields, kind="worker", host=inventory.UnknownHost(kind="unknown"),
             owner=inventory.DirectorOwner(kind="director", session_id=owner["session_id"]))

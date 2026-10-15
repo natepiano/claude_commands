@@ -59,6 +59,7 @@ def complete_session(*, host: object) -> dict[str, object]:
         "name": "shutdown",
         "cwd": "/tmp/checkout",
         "kind": "top-level",
+        "probe": False,
         "status": "idle",
         "updated_at": 0,
         "host": host,
@@ -115,7 +116,7 @@ def session_shutdown(machine: str = "natedev", name: str = "shutdown") -> Sessio
     return SessionShutdown(
         login=LOGIN, label="claude2", machine=machine,
         requested_at=old["requested_at"], requested_by=old["requested_by"], request_id="request-one",
-        hold="account", then="stop", force=old["force"], alerts="user",
+        hold="account", then="stop", force=old["force"], alerts="user", probe=False,
         session=item["session"], workers=[], timers=item["timers"],
         settle_message=item["settle_message"], where=item["where"],
         progress=cast(record_store.SessionProgress, item["progress"]), stop_issues=[], trail=[],

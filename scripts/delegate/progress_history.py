@@ -43,6 +43,11 @@ MIN_CALIBRATION_SAMPLES = 5
 # have shown; a run with enough matching samples replaces it with its own
 # measured error, so this only ever governs the first runs of a fresh history.
 DEFAULT_PERCENT_SPREAD = 10.0
+# How long a stretch with no pass or activity open still counts as phase work: the unit
+# director reviews, gates and writes the next prompt between dispatches. Past it the phase
+# waited, and an overnight wait counted in full turned a phase with an hour left into one
+# finishing the next evening (herdr-trial, 2026-10-15).
+IDLE_GRACE_SECONDS = 30 * 60
 # How far apart two entered percentages may sit and still calibrate each other.
 # The entered percent is itself off by about DEFAULT_PERCENT_SPREAD, so history
 # ten points either side describes the same moment of a phase as well as history
@@ -1733,6 +1738,7 @@ def _calibration_samples(events: list[dict[str, object]]) -> list[CalibrationSam
         phase_finished_at = phase_finishes.get(phase_instance_id)
         if phase_finished_at is None:
             continue
+        phase_events = [event for event in events if _string(event.get("phase_instance_id")) == phase_instance_id]
         reports.sort(key=lambda event: _number(event.get("timestamp_epoch")))
         index = 0
         while index < len(reports):
@@ -1755,10 +1761,12 @@ def _calibration_samples(events: list[dict[str, object]]) -> list[CalibrationSam
                 seen_raw_percentages.add(raw_percent)
                 reported_at = _number(report.get("timestamp_epoch"))
                 phase_started_at = _number(report.get("phase_started_at"))
-                phase_duration = phase_finished_at - phase_started_at
-                if phase_duration <= 0 or reported_at < phase_started_at:
+                if phase_finished_at <= phase_started_at or reported_at < phase_started_at:
                     continue
-                phase_elapsed = reported_at - phase_started_at
+                phase_duration = _work_seconds(phase_events, phase_instance_id, phase_started_at, phase_finished_at)
+                phase_elapsed = _work_seconds(phase_events, phase_instance_id, phase_started_at, reported_at)
+                if phase_duration <= 0:
+                    continue
                 temporal_percent = max(0.0, min(100.0, 100.0 * phase_elapsed / phase_duration))
                 suggested_percent = _integer(report.get("suggested_percent"), raw_percent)
                 main_model, main_effort = _agent_fields(report, "main_agent")
@@ -2183,6 +2191,44 @@ def _assessment_timing(
 
 def _prefixed_decision(scope: str, decision: dict[str, object]) -> dict[str, object]:
     return {f"{scope}_{key}": value for key, value in decision.items()}
+
+
+def _work_seconds(
+    events: list[dict[str, object]], phase_instance_id: str, started_at: float, until: float
+) -> int:
+    """The phase's working time from `started_at` to `until`, idle stretches left out.
+
+    A pass or an activity open is work. A stretch with none open counts up to
+    `IDLE_GRACE_SECONDS`, the unit director's own work between dispatches; the rest of
+    it is waiting, and an ETA extended from a clock that ran through a night quotes
+    that night again for the work left.
+    """
+    opened: dict[str, float] = {}
+    windows: list[tuple[float, float]] = []
+    for event in events:
+        if _string(event.get("phase_instance_id")) != phase_instance_id:
+            continue
+        event_type = _string(event.get("event_type"))
+        key = _string(event.get("pass_instance_id" if event_type.startswith("pass_") else "activity_instance_id"))
+        at = min(until, max(started_at, _number(event.get("timestamp_epoch"))))
+        if event_type in ("pass_started", "activity_started") and key:
+            opened[key] = at
+        elif event_type in ("pass_finished", "activity_finished") and key in opened:
+            windows.append((opened.pop(key), at))
+    windows.extend((start, until) for start in opened.values())
+    if not windows:
+        # History with no windows says nothing about idleness, so the wall clock stands.
+        return max(0, int(until - started_at))
+    work, idle_from = 0.0, started_at
+    for start, end in sorted(windows):
+        if start > idle_from:
+            work += min(start - idle_from, IDLE_GRACE_SECONDS)
+        if end > idle_from:
+            work += end - max(start, idle_from)
+            idle_from = end
+    if until > idle_from:
+        work += min(until - idle_from, IDLE_GRACE_SECONDS)
+    return int(work)
 
 
 def _eta_seconds(percent: int, elapsed: int) -> int | None:
@@ -3682,7 +3728,7 @@ def _arrival_label(arrival_epoch: float, now: float) -> str:
     return f"{arrival:%Y-%m-%d %H:%M}"
 
 
-def _eta_cell(percent: int, elapsed: int, as_of: float, now: float) -> str:
+def _eta_cell(percent: int, elapsed: int, as_of: float, now: float, floor: int = 0) -> str:
     """When the work is expected to land, as a clock time rather than a duration.
 
     A remaining duration has to be added to the current time by hand every time
@@ -3692,7 +3738,7 @@ def _eta_cell(percent: int, elapsed: int, as_of: float, now: float) -> str:
     its last recorded moment; the day is still named from `now`.
     """
     eta = _eta_seconds(percent, elapsed)
-    return "" if eta is None else _arrival_label(as_of + eta, now)
+    return "" if eta is None else _arrival_label(as_of + max(eta, floor), now)
 
 
 def _format_offset(seconds: int) -> str:
@@ -3713,6 +3759,7 @@ def _eta_band_cells(
     as_of: float,
     now: float,
     spread: float,
+    floor: EtaBand | None = None,
 ) -> tuple[str, str]:
     """The best and worst arrival the percentage beside it still allows.
 
@@ -3734,6 +3781,12 @@ def _eta_band_cells(
     band = eta_band_seconds(percent, elapsed, spread)
     if isinstance(band, EtaProjectionUnavailable):
         return "", ""
+    if floor is not None:
+        band = EtaBand(
+            remaining=max(band.remaining, floor.remaining),
+            earliest=max(band.earliest, floor.earliest),
+            latest=max(band.latest, floor.latest),
+        )
     return (
         f"{_arrival_label(as_of + band.earliest, now)} "
         + f"(-{_format_offset(band.remaining - band.earliest)})",
@@ -3955,12 +4008,12 @@ def _reported_window(
     return NoReportedWindow()
 
 
-def _scope_row(label: str, clock: ScopeClock, as_of: float, now: float) -> list[str]:
+def _scope_row(label: str, clock: ScopeClock, as_of: float, now: float, floor: int = 0) -> list[str]:
     return [
         label,
         str(clock["percent"]),
         _format_duration(clock["elapsed"]),
-        _eta_cell(clock["percent"], clock["elapsed"], as_of, now),
+        _eta_cell(clock["percent"], clock["elapsed"], as_of, now, floor),
         _unchanged_cell(clock["unchanged"]),
     ]
 
@@ -3980,7 +4033,11 @@ def _summary_table(
     the two differ only in a report between windows.
     """
     headers = list(SUMMARY_HEADERS)
-    project_row = _scope_row("Project", project, as_of, now)
+    # Each ETA extends its own clock, so nothing else stops the project from landing
+    # before the phase still running inside it; the phase's projection is its floor.
+    phase_band = eta_band_seconds(phase["percent"], phase["elapsed"], phase_spread)
+    floor = None if isinstance(phase_band, EtaProjectionUnavailable) else phase_band
+    project_row = _scope_row("Project", project, as_of, now, floor.remaining if floor else 0)
     phase_row = _scope_row(f"Phase {phase_id}", phase, as_of, now)
     if plan_phase_counts.get("available") is True:
         headers.append("Phases")
@@ -3994,7 +4051,7 @@ def _summary_table(
     headers.extend(("ETA low", "ETA high"))
     project_row.extend(
         _eta_band_cells(
-            project["percent"], project["elapsed"], as_of, now, DEFAULT_PERCENT_SPREAD
+            project["percent"], project["elapsed"], as_of, now, DEFAULT_PERCENT_SPREAD, floor
         )
     )
     phase_row.extend(
@@ -4134,7 +4191,9 @@ def _recorded_report(
         ),
         phase=ScopeClock(
             percent=phase_percent,
-            elapsed=max(0, int(at - _number(phase.get("started_at"), at))),
+            elapsed=_integer(
+                fields.get("phase_elapsed_seconds"), max(0, int(at - _number(phase.get("started_at"), at)))
+            ),
             unchanged=_integer(fields.get("phase_same_percent_elapsed_seconds")),
         ),
         calibration=_object_dict(fields.get("phase_calibration")),
@@ -4326,7 +4385,9 @@ def _report_progress(args: argparse.Namespace) -> None:
             now,
         )
 
-    phase_elapsed = max(0, int(now - _number(phase.get("started_at"), now)))
+    phase_elapsed = _work_seconds(
+        _run_events(state), _string(phase.get("instance_id")), _number(phase.get("started_at"), now), now
+    )
     pass_elapsed = max(0, int(now - _number(current_pass.get("started_at"), now)))
     total_elapsed = max(0, int(now - _number(state.get("project_started_at"), now)))
     next_report_at = _next_report_at(session_dir, now, notifier_due)
@@ -4771,6 +4832,14 @@ def _build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="close this slot's open pass when the unit director killed its "
         + "launcher (--status canceled only)",
+    )
+    # Accepted and ignored: implement.sh and review.sh launchers started before
+    # 2026-10-15 18:00 EDT still pass it, since bash keeps the script it began
+    # with. Remove after 2026-10-22.
+    _ = finish_pass.add_argument(
+        "--agent-awake-seconds",
+        default=argparse.SUPPRESS,
+        help=argparse.SUPPRESS,
     )
     finish_pass.set_defaults(handler=_finish_pass)
 

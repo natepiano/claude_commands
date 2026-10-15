@@ -1008,37 +1008,46 @@ After a worker launch's own turn has ended, a move to the selected seats home th
 
 **Depends on:** Phase 22
 
+#### As-built
+
+- `config/statusline.conf` (`key=value`, `#` comments) holds the colors: `role.<role with hyphens>`, `account.<label>`, `level.ok|warn|alarm`, and the thresholds `tokens.warn|alarm` (percent of the window used, 80/90) and `left.warn|alarm` (percent left, 10/5). Colors are the eight ANSI names and their `bright-` forms. Shipped: showrunner bright magenta, unit director bright blue, worker bright cyan; claude1 cyan, claude2 magenta, claude3 blue, claude4 bright white; levels bright green, yellow, red. `unassigned` and an unlisted label stay uncolored.
+- `statusline.sh` passes the file as `--rawfile colors` (`/dev/null` when unreadable) to the same single jq process, and sets zsh `nonomatch` so an empty notifier glob no longer aborts the line. `statusline.jq` parses it once per render.
+- Only the role, the account, the token count and each `<N>% left` are wrapped (`ESC[<code>m…ESC[0m`). Tokens: `total_input_tokens * 100 / context_window_size`, unrounded, alarm at `>= tokens.alarm`, warn at `>= tokens.warn`. Percent left: judged on the integer shown, alarm at `<= left.alarm`, warn at `<= left.warn`. Claude Code 2.1.296 sets `total_input_tokens` to the current context (input plus cache) and `context_window_size` to the model's window.
+- A missing file, an unknown key or color, a bad threshold, or no positive window size leaves that piece uncolored; with the codes stripped the line equals the uncolored one.
+
+**Files:**
+- `config/statusline.conf` — new; `config/README.md` — its entry.
+- `scripts/statusline/statusline.sh`, `statusline.jq` — the colors.
+- `scripts/statusline/test_statusline.py` — each color, each threshold edge, the fallbacks, the stripped-line equality, and the settings command finding the config.
+
+### Phase 29 — Status line follow-ups  · status: done
+
+**Depends on:** Phase 28
+
 #### Work Order
 
-**Goal:** the status line shows each role and each account in its own color, and colors the token count and the 5-hour and weekly percentages green, yellow or red as they near their limits (the user, via the showrunner, 2026-10-15 16:4x EDT).
+**Goal:** every role, `unassigned` included, and every account shows in a real color of its own (no white or grey; the user, via the showrunner), a unit director's role reads `unit director for <showrunner name>` (the user, via the showrunner), a new Claude account gets its color without a hand edit, and a test proves the status line renders under zsh when no notifier files exist.
 
-**Constraints from prior phases:** `statusline.sh` is sourced by `settings.json`'s `statusLine` command with `statusline` set to its folder; it reads its inputs with shell builtins and ends by exec'ing one `jq` process over `statusline.jq` ("Account labels without a space" left the account field as `claude<N>`). It runs several times a second across all sessions, so it starts no other process. Line 1 is `<role> | <account> | <dir> | <tokens> | <model [effort]>`; line 2 is `5-hour <N>% left[ until <time>] | weekly <M>% left[ until <time>]`.
+**Constraints from prior phases:** "Status line colors" ships `config/statusline.conf` (`key=value`, `#` comments) with `account.claude1=cyan`, `claude2=magenta`, `claude3=blue`, `claude4=bright-white`, the roles `bright-magenta`, `bright-blue`, `bright-cyan`, and the levels bright green, yellow and red. Colors are the eight ANSI names and their `bright-` forms, in the order `statusline.jq` lists them; an unlisted label stays uncolored. `statusline.sh` reads the file at `$statusline/../../config/statusline.conf`, so the installed file is `accounts.main_config_dir() / "config/statusline.conf"`. It sets zsh `nonomatch` so an empty `showrunner-*/conf` glob does not abort the line. `new_account.py` already edits one main-config file in place (`nightly_review_step`: temporary file, then replace) and reports each step as `done:` or `for you:`. Only Claude accounts show on the status line.
 
 **Spec:**
 
-- **Config:** new `config/statusline.conf`, `key=value` lines, `#` comments and blank lines ignored. Keys and the values it ships with:
-  - `role.showrunner=bright-magenta`, `role.unit-director=bright-blue`, `role.worker=bright-cyan` (a role's key is its text with spaces as hyphens; `unassigned` has no key and stays uncolored);
-  - `account.claude1=cyan`, `account.claude2=magenta`, `account.claude3=blue`, `account.claude4=bright-white` (keyed by the label as shown on the line);
-  - `level.ok=bright-green`, `level.warn=bright-yellow`, `level.alarm=bright-red`;
-  - `tokens.warn=80`, `tokens.alarm=90` (percent of the context window used);
-  - `left.warn=10`, `left.alarm=5` (percent left).
-  Color names are the eight ANSI names and their `bright-` forms (`black`, `red`, `green`, `yellow`, `blue`, `magenta`, `cyan`, `white`: SGR 30–37, bright 90–97). A header comment says what each key does. Green, yellow and red are used only for levels.
-- **Reading it:** `statusline.sh` passes `"$statusline/../../config/statusline.conf"` to jq as `--rawfile colors`, `/dev/null` when it is unreadable, still one process and no new builtin loop. `statusline.jq` parses it. A missing file, an unknown key, an unknown color name or a threshold that is not a number leaves that piece uncolored; nothing errors and the uncolored text is exactly today's line.
-- **Colors on the line:** each colored field is wrapped as `ESC[<code>m<text>ESC[0m`; the ` | ` separators, the directory, the model, the labels `5-hour` and `weekly` and the ` until <time>` parts stay uncolored.
-  - Role: its `role.*` color.
-  - Account: its `account.*` color.
-  - Tokens: `used = total_input_tokens * 100 / context_window_size` (both from `.context_window`; Claude Code 2.1.296 sets `total_input_tokens` to the current context, input plus cache, and `context_window_size` to the model's window). `level.alarm` when `used >= tokens.alarm`, `level.warn` when `used >= tokens.warn`, else `level.ok`. No positive window size: uncolored.
-  - `<N>% left` for 5-hour and for weekly, judged on the integer shown: `level.alarm` when `N <= left.alarm`, `level.warn` when `N <= left.warn`, else `level.ok`.
-- **Docs:** a `config/README.md` entry for `statusline.conf`; `statusline.jq`'s header comment names the colors and the config.
+0. **More colors.** The eight ANSI names and their `bright-` forms leave six hues once red, yellow and green (the levels) and black, white and grey are out, too few for four roles and four accounts. `statusline.jq` also accepts five named 256-color entries, written `ESC[38;5;<n>m`: `orange` 208, `purple` 141, `pink` 211, `teal` 30, `brown` 137. `statusline.conf` ships `account.claude4=orange` (was `bright-white`) and a new `role.unassigned=purple`; `statusline.jq` colors `unassigned` from `role.unassigned` like any role (no key still means uncolored). No account or role ships white, bright-white, black or bright-black.
+1. `new_account.py` gains a step for Claude accounts, after the nightly review step: when `config/statusline.conf` has no `account.<label>=` line, add one with a color picked from the palette order (the sixteen ANSI names in `statusline.jq`'s order, then `orange`, `purple`, `pink`, `teal`, `brown`): the first that is not red, green or yellow (either form), not black, white or grey (`black`, `white`, `bright-black`, `bright-white`), and used by no `account.` or `role.` line; when none is left, the first used by no `account.` line; when none is left either, no line. The line goes after the last `account.` line (at the end when there is none), written through a temporary file and a replace, every other line unchanged. Step text: `status line color <color> for <label>`; with a line already present, `status line color <color> for <label>` and nothing written; with no color left, or no config file, a done step saying the label stays uncolored. An unreadable or unwritable file is a `for you:` step naming the path and the error. A rerun writes nothing. The file is written like `nightly_review_step` writes its file, so its permissions stay as they were. With the shipped file, `claude5` gets `pink`, then `claude6` `teal`.
+2. `test_statusline.py` gains a test that runs the settings command under `zsh -c` (skipped when no `zsh` is on `PATH`) with a home holding no notifier state at all, and asserts both lines render.
+2a. **A unit director names its showrunner.** When `SHOWRUNNER_UNIT` is set and `PLAN_DELEGATE_TEAM_ROLE` is empty, `statusline.sh` reads the `TARGET=session:<id>` line of `${NOTIFIER_STATE_DIR:-$HOME/.local/state/notifier}/showrunner-$SHOWRUNNER_UNIT/conf`, then takes the first `${NOTIFIER_SESSIONS_DIR:-$HOME/.claude/sessions}/<pid>.json` whose first line contains `"sessionId":"<id>"` and whose pid is live (`kill -0`), and passes it to jq as `--slurpfile showrunner <file>` (`/dev/null` when any step finds nothing). Shell builtins only, the loop stops at its first match, and no other role looks anything up. The name is read on every refresh, never stored, so a renamed showrunner shows at once. In `statusline.jq`, a unit director whose record carries a non-empty `name` reads `unit director for <name>`, else `unit director`; the whole text takes `role.unit-director`'s color (the key comes from the role, not the text shown).
+3. `commands/new_account.md` and the `config/README.md` entry for `statusline.conf` say that `/new_account` adds the account line; the README entry lists the five named 256-color entries.
 
 **Files:**
 
-- `config/statusline.conf` — new.
-- `config/README.md` — its entry.
-- `scripts/statusline/statusline.sh` — passes the config.
-- `scripts/statusline/statusline.jq` — parses the config, colors the fields.
-- `scripts/statusline/test_statusline.py` — tests.
+- `config/statusline.conf` — `claude4` orange, `unassigned` purple.
+- `scripts/statusline/statusline.sh` — the showrunner lookup.
+- `scripts/statusline/statusline.jq` — the five named colors, `unassigned` colored from its key, `unit director for <name>`.
+- `scripts/accounts/new_account.py` — the color step.
+- `scripts/accounts/test_new_account.py` — the pick order, the placement, the rerun, the missing file, the no-color-left case; the test home ships a `config/statusline.conf`.
+- `scripts/statusline/test_statusline.py` — the zsh test, the named colors, `unassigned` colored, `claude4` orange, every name in `new_account.py`'s palette rendering a color, and the unit director's showrunner name (found, renamed, missing, dead pid, a worker never looking).
+- `commands/new_account.md`, `config/README.md` — one line each.
 
-**Workers:** impl writes the config, `config/README.md`, `statusline.sh` and `statusline.jq`; test writes `test_statusline.py`, reading the others.
+**Workers:** `impl` takes the config, `statusline.sh`, `statusline.jq`, the step and both docs; `test` takes both test files.
 
-**Acceptance gate:** tests show each role and each account in its color and `unassigned` and an unknown account uncolored; the token level on each side of 80% and 90% (79/80, 89/90) and with no window size; each window's level at 11/10 and 6/5 percent left; a missing config, a bad color name and a non-numeric threshold giving the uncolored line; and, with ANSI codes stripped, both lines equal to today's output for the same input. The shipped config's thresholds and colors are the ones above. The suite and basedpyright pass, and a live run of the settings command over a sample status JSON shows the colors.
+**Acceptance gate:** `basedpyright` reports zero errors and warnings on the changed Python; the accounts and statusline suites pass; a run of `/new_account claude5` against a scratch home writes `account.claude5=pink` once and a rerun writes nothing.

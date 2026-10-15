@@ -73,6 +73,8 @@ and merged units.
    - title `# <source title> — <unit>`, the delegate-ready status line, and the
      source's `As-built disposition` line when it has one;
    - the **Production line** from the production format;
+   - the source's **Issues** line when it has one, naming only the issues whose
+     phases this unit takes;
    - **Delegation Context** copied from the source. Narrow **Layout**, **Key
      files**, **Test lanes** and the **Build / Test / Lint** lines to this unit's
      files and packages. Keep **Invariants** whole. Leave out **Project
@@ -89,7 +91,8 @@ and merged units.
      \`<merge branch>\``;
    - every phase number mentioned in moved text is rewritten to its new number,
      or to the other unit's name and number. Substitute highest-first.
-4. **Header line.** Add the Production line to the kept source plan too.
+4. **Header line.** Add the Production line to the kept source plan too, and
+   narrow its Issues line to the issues whose phases it keeps.
 </WriteUnitPlans>
 
 ---

@@ -2,8 +2,10 @@
 """Count what config/dailies.conf names for one production, for the dailies' counts line.
 
 Each line is `<production slug>.<label>=lines <file> <regex>`, the file's lines matching the
-regex, or `<production slug>.<label>=files <glob>`, the files matching the glob. `~` expands,
-and a hyphen in the label reads as a space. A production with no lines gets no counts.
+regex, `<production slug>.<label>=files <glob>`, the files matching the glob, or
+`<production slug>.<label>=issues <folder> <tag>`, the open issues directly in the folder whose
+tags hold the tag. `~` expands, and a hyphen in the label reads as a space. A production with no
+lines gets no counts.
 """
 from __future__ import annotations
 
@@ -12,6 +14,8 @@ import os
 import re
 from pathlib import Path
 from typing import NamedTuple
+
+from issues import open_issues
 
 LABEL = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)*")
 
@@ -29,9 +33,14 @@ class FileCount(NamedTuple):
     pattern: str
 
 
+class IssueCount(NamedTuple):
+    folder: Path
+    tag: str
+
+
 class CountSpec(NamedTuple):
     label: str
-    source: LineCount | FileCount
+    source: LineCount | FileCount | IssueCount
 
 
 class Counted(NamedTuple):
@@ -52,10 +61,10 @@ def parse_line(line: str, number: int) -> tuple[str, CountSpec]:
     key, separator, value = line.partition("=")
     slug, dot, label = key.strip().partition(".")
     if not separator or not dot or not slug or not LABEL.fullmatch(label):
-        raise CountsFailure(f"{where}: expected <production slug>.<label>=lines <file> <regex> | files <glob>")
+        raise CountsFailure(f"{where}: expected <production slug>.<label>=lines <file> <regex> | files <glob> | issues <folder> <tag>")
     kind, _, rest = value.strip().partition(" ")
     rest = rest.strip()
-    source: LineCount | FileCount
+    source: LineCount | FileCount | IssueCount
     if kind == "lines":
         path, _, regex = rest.partition(" ")
         if not path or not regex.strip():
@@ -68,8 +77,13 @@ def parse_line(line: str, number: int) -> tuple[str, CountSpec]:
         if not rest:
             raise CountsFailure(f"{where}: files needs a glob")
         source = FileCount(os.path.expanduser(rest))
+    elif kind == "issues":
+        folder, _, tag = rest.partition(" ")
+        if not folder or not tag.strip() or " " in tag.strip():
+            raise CountsFailure(f"{where}: issues needs a folder and a tag")
+        source = IssueCount(Path(folder).expanduser(), tag.strip())
     else:
-        raise CountsFailure(f"{where}: the count kind is lines or files, not {kind or 'nothing'}")
+        raise CountsFailure(f"{where}: the count kind is lines, files or issues, not {kind or 'nothing'}")
     return slug, CountSpec(label.replace("-", " "), source)
 
 
@@ -98,6 +112,10 @@ def count(spec: CountSpec) -> Counted | SourceNotFound:
             if not Path(pattern).parent.is_dir():
                 return SourceNotFound(spec.label)
             return Counted(spec.label, sum(1 for match in glob.glob(pattern) if Path(match).is_file()))
+        case IssueCount(folder, tag):
+            if not folder.is_dir():
+                return SourceNotFound(spec.label)
+            return Counted(spec.label, len(open_issues(folder, tag)))
 
 
 def production_counts(slug: str) -> list[dict[str, object]]:

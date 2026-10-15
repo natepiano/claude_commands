@@ -766,10 +766,12 @@ def begin(
             store.SessionReaping(kind="reaping", at=at, because=state.because, detail=state.detail)
             if isinstance(state, StoppedTakingPrompts) else store.SessionWaiting(kind="waiting")
         )
+        probe = session["probe"]
         saved = SessionShutdown(
             login=login, label=report["label"], machine=report["machine"], requested_at=at,
             request_id=request_id, requested_by=origin, hold="session" if ids else "account",
-            then=then, force="wait for ready", alerts=alerts, session=session,
+            then=then, force="wait for ready", alerts="none" if probe else alerts,
+            probe=probe, session=session,
             workers=_owned_workers(report, session["session_id"]), timers=[],
             settle_message={"kind": "not sent"}, where={"kind": "not said"},
             progress=progress, trail=[], stop_issues=[],

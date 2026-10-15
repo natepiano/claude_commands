@@ -434,6 +434,7 @@ class AddUnitTests(ShutdownTestCase):
         _ = parser.add_argument("--permanent", action="store_true")
         _ = parser.add_argument("--adopt")
         _ = parser.add_argument("--check", action="store_true")
+        _ = parser.add_argument("--probe", action="store_true")
         _ = parser.add_argument("--timeout", type=float, default=90)
         parsed = parser.parse_args(args)
         parsed.production = str(self.doc)
@@ -1011,6 +1012,35 @@ class AddUnitTests(ShutdownTestCase):
         self.assertEqual(len(self.servers_started()), 1)
         self.assertEqual(len(self.recorded_prompts("session-123")), 1)
 
+    def test_restart_restore_marks_only_the_probe_pane_despite_inherited_marker(self) -> None:
+        self.env["CLAUDE_PROBE_SESSION"] = "1"
+        prior = self.root / "prior-session"
+        prior.mkdir()
+        note = self.root / "restart-note.txt"
+        _ = note.write_text("Resume this unit.", encoding="utf-8")
+        cases = ((False, ""), (True, ""), (False, "claude2"), (True, "claude2"))
+        for count, (probe, target) in enumerate(cases, 1):
+            with self.subTest(probe=probe, target=target):
+                name = ("probe" if probe else "ordinary") + ("-move" if target else "-restore")
+                self.commit_prepared_row(self.unit_row(name))
+                result = self.successful(
+                    name, "--plan", "docs/plans/given.md", "--resume", f"session-{name}",
+                    "--cwd", str(prior), "--restart-note", str(note),
+                    "--session-name", name, "--host-session", name,
+                    *(["--probe"] if probe else []),
+                    *(["--account", target] if target else []),
+                )
+                self.assertIn(f"{name}-unit restore launched", result.stdout)
+                self.assertEqual(len(self.servers_started()), count)
+                opened = self.opened(name)
+                self.assertEqual(opened[opened.index("--cwd") + 1], str(prior))
+                starts = [row for row in self.herdr_calls() if row[:4] == ["--session", name, "agent", "start"]]
+                self.assertEqual(len(starts), 1)
+                arguments = starts[0][starts[0].index("--") + 1:]
+                self.assertEqual(arguments[arguments.index("--resume") + 1], f"session-{name}")
+                environment = self.pane_environment(name)
+                self.assertEqual(environment.get("CLAUDE_PROBE_SESSION", ""), "1" if probe else "")
+                self.assertNotIn("CLAUDE_TEST_SECRET", environment)
 
     def test_restart_restore_adopts_a_row_added_from_a_brief_whose_plan_is_now_its_as_built(self) -> None:
         checkout = self.doc.parents[2]
@@ -2240,6 +2270,7 @@ class AddUnitTests(ShutdownTestCase):
             "owns": None,
             "timeout": 90.0,
             "check": False,
+            "probe": False,
         }
         restored = add_unit.launch_request(argparse.Namespace(
             **common,
@@ -2280,7 +2311,7 @@ class AddUnitTests(ShutdownTestCase):
             launched = add_unit.launch_request(argparse.Namespace(
                 production=str(self.doc), name=name, plan="docs/plans/given.md", brief=None,
                 standby=False, permanent=False, adopt=None, port=None, owns=None, timeout=90.0, check=False,
-                resume=None, cwd=None, restart_note=None, session_name=None, host_session=None,
+                resume=None, cwd=None, restart_note=None, session_name=None, host_session=None, probe=False,
             ))
             return launched.unit, launched.branch, launched.worktree, launched.requested_name
 
