@@ -1,6 +1,8 @@
 """Run folders under the new name and the former one; nothing here touches /tmp/claude."""
 from __future__ import annotations
 
+import contextlib
+import io
 import sys
 import tempfile
 import unittest
@@ -38,6 +40,21 @@ class UnitRunsTest(unittest.TestCase):
         self.assertEqual(unit_runs.instance(Path("/scratch/runs/abc")), "unit-abc")
         self.assertTrue(all("unit-abc".startswith(prefix) or "delegate-abc".startswith(prefix)
                             for prefix in unit_runs.INSTANCE_PREFIXES))
+
+
+    def test_the_removal_check_refuses_while_a_running_session_owns_a_former_marker(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            former = Path(folder) / "delegate"
+            (former / "active").mkdir(parents=True)
+            _ = (former / "active/sid-open").write_text(f"{former / 'run-open'}\n")
+            _ = (former / "active/sid-ended").write_text(f"{former / 'run-ended'}\n")
+            with patch.object(unit_runs, "FORMER_RUN_ROOT", former), \
+                    contextlib.redirect_stdout(io.StringIO()) as shown:
+                self.assertEqual(unit_runs.removal_check({"sid-open": "two-accounts", "sid-other": "elsewhere"}), 1)
+                self.assertEqual(unit_runs.removal_check({"sid-other": "elsewhere"}), 0)
+            self.assertIn(f"two-accounts (sid-open): {former / 'run-open'}", shown.getvalue())
+            self.assertNotIn("sid-ended", shown.getvalue())
+            self.assertIn("the former name can go", shown.getvalue())
 
 
 if __name__ == "__main__":
