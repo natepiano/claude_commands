@@ -104,7 +104,7 @@ Tests: `scripts/production/test_merge_gate.py`, on scratch repos.
 
 ## Invariants
 
-- **No test reaches live state:** `~/.codex*`, `~/.local/state/`, `/tmp/claude/delegate/active/`, the live tmux server (real tmux only with a private `TMUX_TMPDIR`), the real `codex app-server`, and phone sends.
+- **No test reaches live state:** `~/.codex*`, `~/.local/state/`, `/tmp/claude/unit/active/` and `/tmp/claude/delegate/active/`, the live tmux server (real tmux only with a private `TMUX_TMPDIR`), the real `codex app-server`, and phone sends.
   - Production quota tests supply `CodexAlertPassReadings` (`scripts/whoami/quota_alert.py`), and a patched `workers_home` raises on any fallback to a live Codex home.
   - Sockets use private temp dirs or ephemeral ports. No test depends on a fixed port: the refused-start test binds an ephemeral port and closes it.
   - No test writes into the repo.

@@ -27,6 +27,7 @@ import codex_daemon
 import process_table
 import remove_workers
 import roster
+import unit_runs
 import herdr
 from fake_herdr import CommandResponse
 import sessions
@@ -740,6 +741,32 @@ class RosterTests(unittest.TestCase):
             if isinstance(entry.reach, roster.Messageable)
         ]
         self.assertEqual(len(addresses), len(set(addresses)))
+
+    def test_a_run_under_the_former_folder_name_is_still_listed(self) -> None:
+        former = self.root / "former"
+        second_run = former / "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+        self._write_mesh(second_run, {
+            "alpha-impl": {
+                "thread_id": "thread-other-run", "turn_id": "turn-other-run",
+                "status": "running", "launcher_pid": os.getpid(), "role": "impl",
+            },
+        })
+        (second_run / "heartbeat.log").touch()
+        environment = {name: value for name, value in os.environ.items() if name != "ROSTER_DELEGATE_ROOT"}
+
+        with mock.patch.dict(os.environ, environment, clear=True), \
+                mock.patch.object(unit_runs, "RUN_ROOT", self.delegate), \
+                mock.patch.object(unit_runs, "FORMER_RUN_ROOT", former), \
+                mock.patch.object(codex_daemon, "loaded_sessions", return_value=[]):
+            found = roster.roster(os.environ, roster.ThisMachine())
+
+        self.assertEqual(
+            {entry.reach for entry in found.entries if entry.name == "alpha-impl"},
+            {
+                roster.Messageable("worker:director-run/alpha-impl"),
+                roster.Messageable("worker:aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee/alpha-impl"),
+            },
+        )
 
     def test_newer_dead_record_does_not_supply_live_session_details(self) -> None:
         dead_cwd = self.home / "projects" / "dead-resume"

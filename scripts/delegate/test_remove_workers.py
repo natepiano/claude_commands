@@ -209,6 +209,24 @@ class RemoveWorkersTest(unittest.TestCase):
         self.list_rows([row("fresh1", "a-impl"), row("stale1", "b-impl")])
         self.assertEqual(self.remove_workers(), (0, ["stale1"]))
 
+    def test_runs_under_either_folder_name_are_kept_live_or_swept(self) -> None:
+        former = self.root.parent / "former"
+        (former / "active").mkdir(parents=True)
+        new_live = self.run_dir("new-live", ["new1"], orchestrator=ORCHESTRATOR)
+        _ = self.run_dir("new-ended", ["new2"])
+        old_live = former / "old-live"
+        old_live.mkdir()
+        _ = (old_live / "workers").write_text("old1\tproject-old1\n", encoding="utf-8")
+        _ = (former / "active" / GONE_ORCHESTRATOR).write_text(f"{old_live}\n", encoding="utf-8")
+        (former / "old-ended").mkdir()
+        _ = (former / "old-ended" / "workers").write_text("old2\tproject-old2\n", encoding="utf-8")
+        roots = (self.root, former)
+        held: remove_workers.HeldSessions = {"kind": "held sessions", "session_ids": set()}
+        with patch.object(remove_workers, "shutdown_held_sessions", return_value=held):
+            live = remove_workers.live_runs(roots, {ORCHESTRATOR, GONE_ORCHESTRATOR})
+        self.assertEqual(live, {new_live.resolve(), old_live.resolve()})
+        self.assertEqual(set(remove_workers.removal_targets(roots, None, [], live)), {"new2", "old2"})
+
     def test_legacy_names_follow_their_run(self) -> None:
         _ = self.run_dir(LEGACY_LIVE, [], orchestrator=ORCHESTRATOR)
         self.list_rows([
@@ -242,7 +260,7 @@ class RemoveWorkersTest(unittest.TestCase):
             os.fspath(self.root),
         ]
         with patch.object(sys, "argv", arguments), \
-                patch.object(remove_workers, "DEFAULT_ROOT", self.root), \
+                patch.object(remove_workers, "DEFAULT_ROOTS", (self.root,)), \
                 patch.object(remove_workers, "claude_bin", return_value=os.fspath(self.claude)), \
                 patch.object(remove_workers, "list_sessions", return_value=None), \
                 patch.object(remove_workers, "sweep_app_servers") as sweep:

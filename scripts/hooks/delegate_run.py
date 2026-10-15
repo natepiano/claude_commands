@@ -19,9 +19,16 @@ import os
 import sys
 import time
 from pathlib import Path
-from typing import cast
+from typing import TYPE_CHECKING, cast
 
-ACTIVE_DIR = Path(os.environ.get("PLAN_DELEGATE_ACTIVE_DIR", "/tmp/claude/delegate/active"))
+if TYPE_CHECKING:
+    from ..lib import unit_runs
+else:
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
+    import unit_runs
+
+# A test's own marker folder; unset, the marker is under either run-folder name.
+ACTIVE_OVERRIDE = os.environ.get("PLAN_DELEGATE_ACTIVE_DIR")
 
 # Long enough to span a slow delegate build plus the user's time at a gate, short
 # enough that yesterday's abandoned run cannot block today's turns. It bounds
@@ -35,7 +42,7 @@ LIVE_HEARTBEAT_SECONDS = 180
 
 
 def marker_path(session_id: str) -> Path:
-    return ACTIVE_DIR / session_id
+    return unit_runs.marker(session_id, ACTIVE_OVERRIDE)
 
 
 def _recently_active(session_dir: Path) -> bool:

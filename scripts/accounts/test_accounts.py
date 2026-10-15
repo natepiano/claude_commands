@@ -52,7 +52,7 @@ def named_environment(config_dir: Path) -> dict[str, str]:
 def setUpModule() -> None:
     root = Path(unittest.enterModuleContext(tempfile.TemporaryDirectory()))
     _ = unittest.enterModuleContext(patch.object(showrunners, "NOTIFIER_STATE_DIR", root))
-    _ = unittest.enterModuleContext(patch.object(accounts, "WORKERS_RUN_ROOT", root / "worker-runs"))
+    _ = unittest.enterModuleContext(patch.object(accounts, "WORKERS_RUN_ROOTS", (root / "worker-runs",)))
 
 
 def named_prefix(config_dir: Path) -> str:
@@ -153,7 +153,7 @@ class AccountsTests(unittest.TestCase):
         self.codex_reads = cast(AsyncMock, self.enterContext(patch.object(
             agent_accounts, "codex_live", return_value=agent_accounts.Report("Codex", problem="Not logged in"),
         )))
-        _ = self.enterContext(patch.object(accounts, "WORKERS_RUN_ROOT", self.root / "worker-runs"))
+        _ = self.enterContext(patch.object(accounts, "WORKERS_RUN_ROOTS", (self.root / "worker-runs",)))
         _ = self.enterContext(patch.object(showrunners, "NOTIFIER_STATE_DIR", self.root / "notifier"))
         _ = self.enterContext(patch.object(agent_accounts, "prepare_codex_home",
             return_value=agent_accounts.CodexHomePrepared()))
@@ -207,6 +207,19 @@ class AccountsTests(unittest.TestCase):
         self.assertIn("run-one/capacity: continuation owed", output)
         self.assertIn("waiting for capacity", output)
         self.assertNotIn("run-one/done", output)
+
+    def test_status_shows_owed_continuations_under_either_run_folder_name(self) -> None:
+        roots = (self.root / "worker-runs", self.root / "former-worker-runs")
+        for root, name in zip(roots, ("run-new", "run-old")):
+            run = root / name
+            run.mkdir(parents=True)
+            _ = (run / "mesh_server.json").write_text(json.dumps({"pid": os.getpid()}))
+            _ = (run / "mesh_roster.json").write_text(json.dumps({
+                "worker": {"status": "waiting_capacity", "continuation_owed": True}}))
+        with patch.object(accounts, "WORKERS_RUN_ROOTS", roots):
+            _, output, _ = self.run_cli("--detail")
+        self.assertIn("run-new/worker: continuation owed", output)
+        self.assertIn("run-old/worker: continuation owed", output)
 
     def test_status_omits_owed_continuations_from_runs_without_a_live_mesh_server(self) -> None:
         for name, server in (("live", {"pid": 901}), ("dead", {"pid": 902}),

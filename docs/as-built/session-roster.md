@@ -33,7 +33,7 @@ The roster joins records that each name one part of the picture. A session's rol
 | Showrunner registrations | notifier timers under `~/.local/state/notifier/showrunner-*` (`NOTIFIER_STATE_DIR`), via `showrunners.registered_showrunners()` | session name, socket, production slug, production doc |
 | Unit marks | tmux sessions marked for a production, one read for every production (`unit_lookup.every_marked_unit`) joined per doc by `live_units.units_in(doc, every)` | each unit's marked pane and the live Claude in it |
 | Units table | the production doc, via `add_unit.live_unit_table` | `Unit` and `Worktree` per row (fallback only) |
-| Run markers | `/tmp/claude/delegate/active/<director session id>` (`ROSTER_DELEGATE_ROOT`) | first line: the run's session directory |
+| Run markers | `/tmp/claude/unit/active/<director session id>`, and the same under `/tmp/claude/delegate/` for a run started before the folder rename (`ROSTER_DELEGATE_ROOT` replaces both) | first line: the run's session directory |
 | Run heartbeats | `<run>/heartbeat.log` | a run is live if written within `remove_workers.LIVE_HEARTBEAT_SECS` (600 s) |
 | Workers ledgers | `<run>/workers`, one `<background id>\t<worker name>` per `agent_bg.sh` launch | Claude workers |
 | Mesh roster | `<run>/mesh_roster.json`, `<run>/mesh_server.json` | Codex workers: `thread_id`, `status`, `role`, `lens`, `launcher_pid`, `cwd`; server `pid` |

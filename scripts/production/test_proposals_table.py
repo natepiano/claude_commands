@@ -180,10 +180,19 @@ class ProposalsTableTests(unittest.TestCase):
         plan = self.root / "unit/docs/as-built/footers.md"
         earlier = self.root / "unit/docs/plans/footers.md"
         _ = self.write("sessions/run-1/next_items_pending.md", "- add: Keep the old footer for one release\n")
-        with mock.patch.object(proposals_table, "SESSION_ROOT", self.root / "sessions"), \
+        with mock.patch.object(proposals_table, "SESSION_ROOTS", (self.root / "sessions",)), \
                 self.runs_of({earlier: [Path("/history/runs/run-1.jsonl")]}):
             rows = proposals_table.unit_add_on_rows("footer-unit", plan)
         self.assertEqual([row.proposal for row in rows], ["Keep the old footer for one release"])
+
+    def test_add_ons_are_found_under_either_run_folder_name(self) -> None:
+        plan = self.root / "unit/docs/plans/footers.md"
+        _ = self.write("unit-runs/run-new/next_items_pending.md", "- add: New-folder add-on\n")
+        _ = self.write("delegate-runs/run-old/next_items_pending.md", "- add: Former-folder add-on\n")
+        with mock.patch.object(proposals_table, "SESSION_ROOTS", (self.root / "unit-runs", self.root / "delegate-runs")), \
+                self.runs_of({plan: [Path("/history/runs/run-new.jsonl"), Path("/history/runs/run-old.jsonl")]}):
+            rows = proposals_table.unit_add_on_rows("footer-unit", plan)
+        self.assertEqual(sorted(row.proposal for row in rows), ["Former-folder add-on", "New-folder add-on"])
 
     def test_the_table_keeps_one_line_per_row_and_cuts_a_long_title(self) -> None:
         long_title = "word " * 40
@@ -221,7 +230,7 @@ class ProposalsTableTests(unittest.TestCase):
         _ = self.write("sessions/run-1/next_items_pending.md", "- add: Keep the old footer\n")
         records = '{"footer-unit": {"plan": "%s"}, "idle-unit": {"unavailable": "no plan"}}' % plan
         with mock.patch.object(proposals_table, "BACKLOG_DIR", self.root / "backlog"), \
-                mock.patch.object(proposals_table, "SESSION_ROOT", self.root / "sessions"), \
+                mock.patch.object(proposals_table, "SESSION_ROOTS", (self.root / "sessions",)), \
                 mock.patch.object(phase_table, "show_production", return_value=records), \
                 self.runs_of({plan: [Path("run-1.jsonl")]}):
             code, out, err = self.run_main(["--production", str(doc)])

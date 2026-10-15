@@ -521,6 +521,25 @@ for index in range(20):
         self.assertTrue(all(record["role"] == "worker" for record in records))
         self.assertEqual(agents_log.assignments(self.log_path).problems, ())
 
+    def test_backfill_reads_runs_and_directors_under_both_run_folder_names(self) -> None:
+        archive, live, _roster_at, _ledger_at = self.backfill_fixture()
+        former = self.root / "former"
+        former_run = former / "former-run"
+        former_run.mkdir(parents=True)
+        _ = (former_run / "mesh_roster.json").write_text(json.dumps({
+            "project-fix": {"thread_id": "former-thread", "role": "fix", "status": "done"},
+        }), encoding="utf-8")
+        (former / "active").mkdir()
+        _ = (former / "active" / "former-director").write_text(f"{former_run}\n", encoding="utf-8")
+
+        result = self.cli("backfill", "--archive", str(archive), "--live", str(live), "--live", str(former))
+
+        self.assertEqual((result.returncode, result.stderr), (0, ""))
+        log = agents_log.assignments(self.log_path)
+        self.assertEqual(log.assignments["former-thread"][0].role, "fix")
+        self.assertEqual(log.assignments["former-director"][0].role, "director")
+        self.assertEqual(log.assignments["director-session"][0].role, "director")
+
     def test_backfill_recovers_previous_role_workers_director_and_review_lens(self) -> None:
         archive, live, roster_at, ledger_at = self.backfill_fixture()
 

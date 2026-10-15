@@ -4190,7 +4190,7 @@ class MeshCommandTests(unittest.TestCase):
             self.assertEqual(pid, 123456)
             alive[0] = False
             return True
-        with patch.object(codex_mesh, "SWEEP_ROOT", self.session_dir.parent), patch.object(codex_mesh, "_pid_alive", side_effect=running), patch.object(codex_mesh, "_stop_unused", side_effect=stop) as stopped, contextlib.redirect_stdout(io.StringIO()):
+        with patch.object(codex_mesh, "SWEEP_ROOTS", (self.session_dir.parent,)), patch.object(codex_mesh, "_pid_alive", side_effect=running), patch.object(codex_mesh, "_stop_unused", side_effect=stop) as stopped, contextlib.redirect_stdout(io.StringIO()):
             _ = codex_mesh.retire_workers_servers(target, "codex1")
             code, errors = self.run_follow()
         self.assertEqual((code, errors), (0, ""))
@@ -5095,7 +5095,7 @@ class SweepTests(unittest.TestCase):
                 patch.object(codex_mesh, "_server_folder", return_value=None), \
                 patch.object(codex_mesh, "_busy_threads", return_value=()):
             judgment = codex_mesh._judge(  # pyright: ignore[reportPrivateUsage]
-                Path(directory), 5, 4005, codex_mesh.SERVER_IDLE_SECS + 60, 0
+                (Path(directory),), 5, 4005, codex_mesh.SERVER_IDLE_SECS + 60, 0
             )
 
         self.assertIsInstance(judgment.verdict, codex_mesh.ServerUnused)
@@ -5107,10 +5107,10 @@ class SweepTests(unittest.TestCase):
             run = root / "run-a"
             (root / "active").mkdir()
             run.mkdir()
-            self.assertFalse(codex_mesh._marked_active(root, run))  # pyright: ignore[reportPrivateUsage]
+            self.assertFalse(codex_mesh._marked_active((root,), run))  # pyright: ignore[reportPrivateUsage]
             self.assertIsNone(codex_mesh._quiet_secs(run, 0.0))  # pyright: ignore[reportPrivateUsage]
             _ = (root / "active" / "session-1").write_text(f"{run}\n")
-            self.assertTrue(codex_mesh._marked_active(root, run))  # pyright: ignore[reportPrivateUsage]
+            self.assertTrue(codex_mesh._marked_active((root,), run))  # pyright: ignore[reportPrivateUsage]
             _ = (run / "board.log").write_text("x")
             quiet = codex_mesh._quiet_secs(run, (run / "board.log").stat().st_mtime + 5)  # pyright: ignore[reportPrivateUsage]
             self.assertEqual(quiet, 5.0)
@@ -5294,7 +5294,7 @@ class SweepTests(unittest.TestCase):
                 ) as judge, \
                 patch.object(codex_mesh, "_reap", side_effect=reap):
             stopped = codex_mesh._stop_unused(  # pyright: ignore[reportPrivateUsage]
-                folder.parent, 2, 4002, ownership
+                (folder.parent,), 2, 4002, ownership
             )
         if judge.called:
             self.assertEqual(judge.call_args.args[1:], (2, 4002, 9000.0, clients.get(4002, 0)))
@@ -5340,7 +5340,7 @@ class SweepTests(unittest.TestCase):
         with patch.object(codex_mesh, "_running_servers", side_effect=OSError("no ps")), \
                 patch.object(codex_mesh, "_reap") as reap:
             self.assertFalse(codex_mesh._stop_unused(  # pyright: ignore[reportPrivateUsage]
-                gone.parent, 2, 4002, gone_owner
+                (gone.parent,), 2, 4002, gone_owner
             ))
         reap.assert_not_called()
 
@@ -5424,7 +5424,7 @@ class SweepTests(unittest.TestCase):
                 )
                 marked.assert_not_called()
                 self.assertIsInstance(
-                    judge(root, 2, 4002, 9000.0, 0).verdict,
+                    judge((root,), 2, 4002, 9000.0, 0).verdict,
                     codex_mesh.ServerInUse,
                 )
 
@@ -5439,11 +5439,11 @@ class SweepTests(unittest.TestCase):
                     patch.object(codex_mesh, "_busy_threads", return_value=()):
                 judge = codex_mesh._judge  # pyright: ignore[reportPrivateUsage]
                 self.assertIsInstance(
-                    judge(root, 2, 4002, 60.0, 0).verdict,
+                    judge((root,), 2, 4002, 60.0, 0).verdict,
                     codex_mesh.ServerUnused,
                 )
                 self.assertIsInstance(
-                    judge(root, 3, 4003, 10.0, 0).verdict,
+                    judge((root,), 3, 4003, 10.0, 0).verdict,
                     codex_mesh.ServerInUse,
                 )
 
@@ -5465,7 +5465,7 @@ class SweepTests(unittest.TestCase):
             with patch.object(codex_mesh, "_server_folder", return_value=ended), \
                     patch.object(codex_mesh, "_busy_threads", return_value=()):
                 judgment = codex_mesh._judge(  # pyright: ignore[reportPrivateUsage]
-                    root, 2, 4002, 9000.0, 0
+                    (root,), 2, 4002, 9000.0, 0
                 )
         self.assertIsInstance(judgment.verdict, codex_mesh.ServerInUse)
         self.assertEqual(judgment.ownership, codex_mesh.CurrentRunServer(live))
@@ -5488,7 +5488,7 @@ class SweepTests(unittest.TestCase):
             os.utime(stale / codex_mesh.SERVER_FILE, (old, old))
 
             ownership = codex_mesh._server_ownership(  # pyright: ignore[reportPrivateUsage]
-                root, 2, 4002, stale
+                (root,), 2, 4002, stale
             )
 
         self.assertEqual(ownership, codex_mesh.RetiredRunServer(retired))
@@ -5998,7 +5998,7 @@ class WorkersHomeTests(unittest.TestCase):
     def test_swap_reads_legacy_source_as_default_home(self) -> None:
         home = self.select()
         _ = (self.session_dir / codex_mesh.SERVER_FILE).write_text(json.dumps({"port": 4001, "pid": os.getpid()}))
-        with patch.object(codex_mesh, "SWEEP_ROOT", self.session_dir.parent), patch.object(codex_mesh, "_stop_unused", return_value=True):
+        with patch.object(codex_mesh, "SWEEP_ROOTS", (self.session_dir.parent,)), patch.object(codex_mesh, "_stop_unused", return_value=True):
             lines = codex_mesh.retire_workers_servers(home, "codex1")
         self.assertIn("move from ~/.codex at their next turn", "\n".join(lines))
         self.assertIn("codex1 (~/.codex1)", "\n".join(lines))
@@ -6061,7 +6061,7 @@ class WorkersHomeTests(unittest.TestCase):
         _ = (other_run / codex_mesh.SERVER_FILE).write_text(json.dumps({"port": 4002, "pid": os.getpid(), "codex_home": str(self.home / ".codex")}))
         _ = (root / "active" / "director-one").write_text(str(self.session_dir) + "\n")
         _ = (root / "active" / "director-two").write_text(str(other_run) + "\n")
-        with patch.object(codex_mesh, "SWEEP_ROOT", root), patch.object(codex_mesh, "_stop_unused", return_value=False), patch.object(codex_mesh, "_start_watcher"), patch.object(codex_mesh, "_notify_holder") as notify:
+        with patch.object(codex_mesh, "SWEEP_ROOTS", (root,)), patch.object(codex_mesh, "_stop_unused", return_value=False), patch.object(codex_mesh, "_start_watcher"), patch.object(codex_mesh, "_notify_holder") as notify:
             _ = codex_mesh.retire_workers_servers(home, "codex1")
         self.assertFalse((self.session_dir / codex_mesh.SERVER_FILE).exists())
         self.assertFalse((other_run / codex_mesh.SERVER_FILE).exists())
@@ -6073,7 +6073,7 @@ class WorkersHomeTests(unittest.TestCase):
     def test_swap_stops_unused_old_server_immediately_without_starting_a_watcher(self) -> None:
         home = self.select()
         self.record(self.home / ".codex")
-        with patch.object(codex_mesh, "SWEEP_ROOT", self.session_dir.parent), patch.object(codex_mesh, "_stop_unused", return_value=True) as stop, patch.object(codex_mesh, "_start_watcher") as watch, patch.object(codex_mesh, "_notify_holder"):
+        with patch.object(codex_mesh, "SWEEP_ROOTS", (self.session_dir.parent,)), patch.object(codex_mesh, "_stop_unused", return_value=True) as stop, patch.object(codex_mesh, "_start_watcher") as watch, patch.object(codex_mesh, "_notify_holder"):
             _ = codex_mesh.retire_workers_servers(home, "codex1")
         stop.assert_called_once_with(None, os.getpid(), 4001, codex_mesh.RetiredRunServer(self.session_dir))
         watch.assert_not_called()
@@ -6216,7 +6216,7 @@ class WorkersHomeTests(unittest.TestCase):
                     self.assertEqual(codex_mesh.command_signin_changed(argparse.Namespace(root=str(root))), 0)
                 self.assertIn(datetime.fromtimestamp(2000).astimezone(zone).strftime("%H:%M %Z"), output.getvalue())
                 self.record(self.home / ".codex")
-                with patch.object(codex_mesh, "SWEEP_ROOT", root), patch.object(codex_mesh, "user_zone", return_value=zone), patch.object(codex_mesh, "_stop_unused", return_value=True):
+                with patch.object(codex_mesh, "SWEEP_ROOTS", (root,)), patch.object(codex_mesh, "user_zone", return_value=zone), patch.object(codex_mesh, "_stop_unused", return_value=True):
                     lines = codex_mesh.retire_workers_servers(home, "codex1")
                 self.assertIn(datetime.now().astimezone(zone).strftime("%H:%M %Z"), "\n".join(lines))
 
@@ -6224,7 +6224,7 @@ class WorkersHomeTests(unittest.TestCase):
         home = self.select()
         self.record(self.home / ".codex")
         before = (self.session_dir / codex_mesh.SERVER_FILE).read_bytes()
-        with patch.object(codex_mesh, "SWEEP_ROOT", self.session_dir.parent), patch.object(codex_mesh, "_start_watcher") as watch, patch.object(codex_mesh, "_notify_holder") as notify:
+        with patch.object(codex_mesh, "SWEEP_ROOTS", (self.session_dir.parent,)), patch.object(codex_mesh, "_start_watcher") as watch, patch.object(codex_mesh, "_notify_holder") as notify:
             lines = codex_mesh.retire_workers_servers(home, "codex1", dry_run=True)
         self.assertEqual((self.session_dir / codex_mesh.SERVER_FILE).read_bytes(), before)
         self.assertFalse((self.session_dir / codex_mesh.RETIRED_FILE).exists())
@@ -6588,6 +6588,31 @@ class ServerRecordTests(unittest.TestCase):
         ))
         self.assertEqual(roster["project-impl"]["status"], "ended")
         self.assertEqual(roster["project-impl"]["role"], "impl")
+
+
+
+class RunFolderNameSweepTests(unittest.TestCase):
+    """A sweep of one run root still sees the servers of runs under the other name."""
+
+    def test_naming_one_real_root_sweeps_both(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            new, former, other = Path(folder) / "unit", Path(folder) / "delegate", Path(folder) / "scratch"
+            with patch.object(codex_mesh, "SWEEP_ROOTS", (new, former)):
+                for given, roots in ((None, (new, former)), (str(new), (new, former)), (str(former), (new, former)), (str(other), (other,))):
+                    with self.subTest(given=given):
+                        self.assertEqual(codex_mesh._sweep_roots(argparse.Namespace(root=given)), roots)  # pyright: ignore[reportPrivateUsage]
+
+    def test_a_marked_run_under_the_former_name_owns_its_server(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            new, former = Path(folder) / "unit", Path(folder) / "delegate"
+            run = former / "old-run"
+            run.mkdir(parents=True)
+            (new / "active").mkdir(parents=True)
+            (former / "active").mkdir()
+            _ = (run / codex_mesh.SERVER_FILE).write_text(json.dumps({"pid": 4242, "port": 5151}))
+            _ = (former / "active" / "director").write_text(f"{run}\n")
+            owner = codex_mesh._server_ownership((new, former), 4242, 5151, None)  # pyright: ignore[reportPrivateUsage]
+        self.assertEqual(owner, codex_mesh.CurrentRunServer(run))
 
 
 if __name__ == "__main__":
