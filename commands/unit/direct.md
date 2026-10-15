@@ -43,8 +43,13 @@ State:
   dispatch. Owned by <EarlyReviewArm/>.
 - `APPLICATION_SMOKE_RESULT`: starts as `not_run`.
 - `FINDINGS`: the current phase's `findings.py` ledger.
+- `PHASE_DIR`: `${SESSION_DIR}/phases/<phase id>`, one per open phase, so a
+  later phase running beside the current one keeps its own state. It holds that
+  phase's reservation state, its `phase_baseline` and `progress_baseline_status`,
+  and its `files` list. Run-wide files (`board.log`, `mesh_server.json`,
+  `mesh_roster.json`, `impl_status_<slot>`) stay in `${SESSION_DIR}`.
 - `DELEGATED_PHASE_RESERVATION_STATE`: the tagged state persisted at
-  `${SESSION_DIR}/delegated_phase_reservation_state.json`; see
+  `${PHASE_DIR}/delegated_phase_reservation_state.json`; see
   <DelegatedPhaseReservationContract/>.
 
 <TagReferenceContract>
@@ -383,7 +388,7 @@ from it. A forced stop without this message is a separate command the user gives
   wake-up request compacts on its own.
 - After compaction, re-read this command in full, then the handoff. Restore live
   dispatches and state. Independently read and validate
-  `${SESSION_DIR}/delegated_phase_reservation_state.json` once coordination has
+  each open phase's `${PHASE_DIR}/delegated_phase_reservation_state.json` once coordination has
   reached a persisted state, including its durable `checkpoint_commit` when
   release confirmation is pending; the handoff, conversation, and the session
   mapping are never reservation-lifecycle memory. Delete the handoff only after
@@ -553,7 +558,11 @@ Phase records are the unit director's, and both belong at the real boundary:
 `finish-phase` for the outgoing phase and `start-phase` for the incoming one run
 before that phase's first dispatch. Recording them late attributes the new
 phase's work to the finished one — its title, its elapsed clock, and its pass
-counts all describe the wrong phase.
+counts all describe the wrong phase. A phase opened beside one still running
+leaves that one open: `start-phase` parks it, and `finish-phase --phase-id <id>`
+closes each at its own end. While two phases are open, name the phase on every
+launch, or its pass is stamped with the newest phase: `implement.sh`'s tenth
+argument and `review.sh --phase <id>`.
 </PassOwnership>
 
 <ProgressContract>
@@ -725,8 +734,8 @@ follow <AuthorizationContract/>.
 <DelegatedPhaseReservationContract>
 Coordination applies to phased Work Orders in every mode. Ad hoc work skips it.
 
-Persist exactly one tagged `DelegatedPhaseReservationState` for the current
-phase at `${SESSION_DIR}/delegated_phase_reservation_state.json`. Write every
+Persist exactly one tagged `DelegatedPhaseReservationState` for each open
+phase at `${PHASE_DIR}/delegated_phase_reservation_state.json`. Write every
 state transition atomically and read it back before the next lifecycle action;
 the initial state must be durable before dispatch. The domain states and
 on-disk shapes are:
@@ -771,7 +780,7 @@ path, single-mode completion, run summary, or session cleanup.
 
 <RetainDelegatedPhaseReservation>
 For `Active` or `CheckpointCommittedAwaitingReleaseConfirmation`, leave both the
-engine reservation and `${SESSION_DIR}/delegated_phase_reservation_state.json`
+engine reservation and `${PHASE_DIR}/delegated_phase_reservation_state.json`
 intact. Report that the phase stopped before its checkpoint release could be
 confirmed and name the recovery action that stopped; retain the reservation id
 in durable/internal recovery output even when ordinary user-facing prose omits
@@ -792,8 +801,8 @@ Run after phase authorization and task selection, immediately before
 <LaunchImplementation/>. It is the only pre-dispatch coordination boundary.
 Do not dispatch until this contract reaches one of its four persisted states.
 
-0. On resume, read the state file first. A valid state for the current phase is
-   authoritative:
+0. On resume, read this phase's state file first. A valid state for this phase
+   is authoritative:
 
    | State | Resume action |
    | --- | --- |
@@ -804,8 +813,12 @@ Do not dispatch until this contract reaches one of its four persisted states.
 
    A completed phase removes its inactive state under <RecordPhaseCompletion/>,
    so no old inactive tag is silently reused for a new phase.
-1. When no state exists yet, invoke the shared `/sync board` entry point once,
-   under <BerthDecisions/>:
+1. When no state exists yet, create `${PHASE_DIR}` and write its `files` list
+   from the Work Order's Files field: one repository-relative path per line, a
+   trailing `/` covering the tree below it. A phase alone needs no list; with
+   two open, it is how a seat's edit finds its phase, so keep each path in
+   exactly one phase's list and add a path a seat's refusal names. Then invoke
+   the shared `/sync board` entry point once, under <BerthDecisions/>:
 
    ```sh
    cargo-berth board --json
@@ -819,9 +832,11 @@ Do not dispatch until this contract reaches one of its four persisted states.
    | `busy` | Stop with “the ledger is busy, try again” and the exact board command to rerun; do not retry. |
 2. The registered PreToolUse edit hooks own the next transition. A clear check
    atomically acquires exact `file:` scopes before the edit. A Codex seat's
-   `apply_patch` runs `scripts/hooks/pre-tool-use-berth.py`, which checks under
-   this session's id and replaces `EnrolledAwaitingFirstTouch` with `Active`
-   from the returned facts; a Claude edit's hook protects the paths but writes
+   `apply_patch` runs `scripts/hooks/pre-tool-use-berth.py`, which gives each
+   path to its open phase (the only one, else the one whose `files` list covers
+   it, refusing a path no single list owns), checks under this session's id and
+   replaces that phase's `EnrolledAwaitingFirstTouch` with `Active` from the
+   returned facts; a Claude edit's hook protects the paths but writes
    no state, so a first touch of your own leaves the state for the checkpoint
    backstop (<CheckpointCommit/> step 5). A blocked check refuses the edit and
    leaves the pending state intact; a seat reports the refusal to you, and you
@@ -1360,11 +1375,12 @@ User, 2026-10-03.
 <RecordPhaseCompletion>
 In loop and verbose, run at <PhaseEnd/>'s point; in `single`, follow
 <ExecutionSteps/> step 9. Call `progress_history.py finish-phase
---session-dir "${SESSION_DIR}" --status completed`.
+--session-dir "${SESSION_DIR}" --status completed`, adding `--phase-id <id>`
+while another phase is open.
 
 After a loop/verbose phase with `RepositoryNotEnrolled` or
 `EnrolledAwaitingFirstTouch`, delete its completed-phase state
-file. `Active` must already have been replaced by
+file, `${PHASE_DIR}/delegated_phase_reservation_state.json`. `Active` must already have been replaced by
 `CheckpointCommittedAwaitingReleaseConfirmation`, and that pending state must
 already have been deleted by the validated successful release. If either state
 survives, the phase is not complete and this section must not run.

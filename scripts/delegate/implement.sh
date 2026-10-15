@@ -70,6 +70,8 @@ PASS_KIND="${6:-}"
 PASS_ACTIVITY="${7:-${ROLE_DESC%%$'\n'*}}"
 FIX_PASS="${8:-0}"
 TEAM_ROLE="${9:?Usage: implement.sh needs a team_role (impl, test, review) as its 9th argument}"
+# A phase running beside the current one names itself, so start-pass stamps this pass with it.
+PHASE_ID="${10:-}"
 
 # Every worker carries a kind, so an empty one is a dropped argument rather than a
 # choice. It used to be tolerated: the launcher skipped start-pass, ran the agent
@@ -378,7 +380,8 @@ if [[ -f "${PROGRESS_STATE}" ]]; then
     --called-task "${TASK}" \
     --called-family "${AGENT_FAMILY}" \
     --called-model "${AGENT_MODEL}" \
-    --called-effort "${AGENT_EFFORT:-unset}"; then
+    --called-effort "${AGENT_EFFORT:-unset}" \
+    ${PHASE_ID:+--phase-id "${PHASE_ID}"}; then
     echo "ERROR: unable to record the ${PASS_KIND} pass start." >&2
     echo "error" > "${STATUS_FILE}"
     bash "${BOARD_HELPER}" post "${SESSION_DIR}" "${BOARD_AGENT}" blocked \

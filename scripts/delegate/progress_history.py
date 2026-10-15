@@ -1504,7 +1504,13 @@ def _start_pass(args: argparse.Namespace) -> None:
     )
     team_slot = _team_slot()
     state = _read_state(session_dir)
-    phase = _object_dict(state.get("phase"))
+    # A phase running beside the current one names itself, so its pass is not stamped with
+    # the current phase's.
+    phase_id = _optional_arg(args, "phase_id")
+    phase = _open_phase_named(state, phase_id) if phase_id else _object_dict(state.get("phase"))
+    if phase_id and phase is None:
+        open_ids = ", ".join(_open_phase_ids(state)) or "none"
+        raise SystemExit(f"Phase {phase_id} is not open; open phases: {open_ids}")
     if phase is None or _string(phase.get("status")) != "active":
         raise SystemExit("Start a phase before starting a pass")
     now = now_epoch()
@@ -4769,6 +4775,7 @@ def _build_parser() -> argparse.ArgumentParser:
     _ = start_pass.add_argument("--called-family", required=True)
     _ = start_pass.add_argument("--called-model", required=True)
     _ = start_pass.add_argument("--called-effort", default="unset")
+    _ = start_pass.add_argument("--phase-id", default="", help="the open phase this pass belongs to; default the current one")
     start_pass.set_defaults(handler=_start_pass)
 
     finish_pass = subparsers.add_parser("finish-pass")
