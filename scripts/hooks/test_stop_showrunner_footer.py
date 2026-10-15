@@ -38,6 +38,9 @@ def setUpModule() -> None:
 
 
 class FooterLibraryTests(unittest.TestCase):
+    def test_choices_are_not_checked_when_no_instance_targets_the_session(self) -> None:
+        self.assertIsNone(showrunner_footer.block_reason([], "Run now (recommended), or wait?", {}))
+
     def test_reply_lines_keeps_waiting_block_after_footer(self) -> None:
         reply = "Done.\n\n---\n12:00 PDT update:\n\n* none active\n* no dailies scheduled" + WAITING_BLOCK
         self.assertEqual(showrunner_footer.reply_lines(reply), [
@@ -106,7 +109,7 @@ class ShowrunnerFooterHookTests(unittest.TestCase):
         (self.root / ".local/state/agent-notes").mkdir(parents=True)
         holds = self.root / "holds"
         holds.mkdir()
-        self.outstanding = self.root / ".local/state/showrunner/outstanding/demo.json"
+        self.outstanding = self.root / "showrunner-state/outstanding/demo.json"
         self.outstanding.parent.mkdir(parents=True)
         self.doc = self.root / "demo-production.md"
         _ = self.doc.write_text(
@@ -195,6 +198,104 @@ class ShowrunnerFooterHookTests(unittest.TestCase):
         for waiting in (WAITING_BLOCK, WAITING_BLOCK + "\n* no ETA measured - y"):
             with self.subTest(items=waiting.count("\n* ")):
                 self.assert_passes(self.run_hook("Done.\n" + footer + waiting))
+
+    def test_pending_question_kinds_round_trip_without_claiming_an_unavailable_review_completed(self) -> None:
+        reviewed = showrunner_footer.PendingReviewedQuestion("merge", "Merge now (recommended), or wait?")
+        unavailable = showrunner_footer.PendingReviewUnavailableQuestion(
+            "path", "Choose the path.\nUse the short route?", "reviewer unavailable")
+        showrunner_footer.add_pending_reviewed(self.instance, [reviewed])
+        showrunner_footer.add_pending_reviewed(self.instance, [reviewed, unavailable])
+        self.assertEqual(showrunner_footer.read_pending_reviewed(self.instance), [reviewed, unavailable])
+        saved = cast(showrunner_footer.PendingReviewedRecord,
+                     json.loads(showrunner_footer.pending_reviewed_path(self.instance).read_text()))
+        self.assertEqual(saved["items"][1]["kind"], "review unavailable")
+        self.assertNotIn("reviewed", saved["items"][1])
+
+    def test_pending_questions_block_with_footers_off_until_the_whole_reply_contains_both(self) -> None:
+        self.assertEqual(self.run_switch("off").returncode, 0)
+        first = showrunner_footer.PendingReviewedQuestion("merge", "Merge now (recommended), or wait?")
+        second = showrunner_footer.PendingReviewUnavailableQuestion(
+            "path", "Choose the path.\nUse the short route?", "reviewer unavailable")
+        showrunner_footer.add_pending_reviewed(self.instance, [first])
+        showrunner_footer.add_pending_reviewed(self.instance, [second])
+        self.assertIn("merge", self.reason("Done."))
+        self.assertIn("path", self.reason(first.reviewed))
+        self.assertTrue(showrunner_footer.pending_reviewed_path(self.instance).exists())
+        self.assert_passes(self.run_hook("Merge now  (recommended),\n or wait?\n" + second.question))
+        self.assertFalse(showrunner_footer.pending_reviewed_path(self.instance).exists())
+        self.assert_passes(self.run_hook("Later reply with no repeated questions."))
+
+    def test_retry_and_replacement_session_still_require_pending_text(self) -> None:
+        item = showrunner_footer.PendingReviewedQuestion("path", "Which path should we use?")
+        showrunner_footer.add_pending_reviewed(self.instance, [item])
+        self.assertIn("paste its reviewed question", self.reason("Done."))
+        retry = self.run_hook("Still missing.", stop_hook_active=True)
+        self.assertIn("path", retry.stdout)
+        _ = (self.instance / "conf").write_text(
+            f"TARGET=session:replacement\nCHECK=zsh /x/production_check.sh {self.doc}\n")
+        self.assertIn("path", self.reason_for_session("replacement", "A later turn."))
+        self.assert_passes(self.run_hook(item.reviewed, session_id="replacement", stop_hook_active=True))
+        self.assertFalse(showrunner_footer.pending_reviewed_path(self.instance).exists())
+
+    def test_unrelated_footer_rejection_preserves_pending_text_until_a_valid_reply(self) -> None:
+        item = showrunner_footer.PendingReviewedQuestion("path", "Which path should we use?")
+        showrunner_footer.add_pending_reviewed(self.instance, [item])
+        self.assertIn("footer", self.reason(item.reviewed))
+        self.assertEqual(showrunner_footer.read_pending_reviewed(self.instance), [item])
+        self.assertIn("path", self.reason("A later turn.\n" + self.footer() + WAITING_BLOCK))
+        self.assert_passes(self.run_hook(item.reviewed + "\n" + self.footer() + WAITING_BLOCK))
+        self.assertFalse(showrunner_footer.pending_reviewed_path(self.instance).exists())
+
+    def test_unregistered_choices_are_blocked_but_code_and_quotes_are_not(self) -> None:
+        self.assertEqual(self.run_switch("off").returncode, 0)
+        choice = "Run now (recommended), or wait."
+        self.assertIn("record the item", self.reason(choice))
+        self.assertIn("record the item", self.reason("Should we run now (recommended), or wait?"))
+        for example in (f"> {choice}", f"```text\n{choice}\n```", f"`{choice}`"):
+            with self.subTest(example=example):
+                self.assert_passes(self.run_hook(example))
+        item = {"since": "2026-10-06T08:00", "text": "run", "question": choice, "reviewed": choice}
+        _ = self.outstanding.write_text(json.dumps([item]))
+        self.assert_passes(self.run_hook(choice))
+        self.assertIn("record the item", self.reason(choice + "\nDelete the work (recommended), or keep it."))
+        code_choice = "Run `check.py` (recommended), or wait?"
+        showrunner_footer.add_pending_reviewed(self.instance, [
+            showrunner_footer.PendingReviewedQuestion("check", code_choice)])
+        self.assert_passes(self.run_hook("Run `check.py` (recommended),\n or wait?"))
+
+    def test_recorded_choices_pass_with_list_markers_but_unrecorded_choices_block(self) -> None:
+        self.assertEqual(self.run_switch("off").returncode, 0)
+        question = "Run now (recommended), or wait?"
+        item = showrunner_footer.PendingReviewedQuestion("run", question)
+        for marker in ("-", "*", "+", "1.", "1)"):
+            with self.subTest(marker=marker):
+                showrunner_footer.add_pending_reviewed(self.instance, [item])
+                reply = f"{marker} Run  now (recommended), or wait?"
+                self.assertIn("record the item", self.reason(
+                    reply + f"\n{marker} Delete the work (recommended), or keep it?"))
+                self.assertEqual(showrunner_footer.read_pending_reviewed(self.instance), [item])
+                self.assert_passes(self.run_hook(reply))
+                self.assertFalse(showrunner_footer.pending_reviewed_path(self.instance).exists())
+
+    def test_recorded_list_choices_can_be_recalled_without_their_markers(self) -> None:
+        self.assertEqual(self.run_switch("off").returncode, 0)
+        for marker in ("-", "*", "+", "1.", "1)"):
+            with self.subTest(marker=marker):
+                question = f"{marker} Run now (recommended), or wait?"
+                _ = self.outstanding.write_text(json.dumps([{
+                    "since": "2026-10-06T08:00", "text": "run", "question": question, "reviewed": question}]))
+                self.assert_passes(self.run_hook("Run  now (recommended), or wait?"))
+                self.assert_passes(self.run_hook("2) Run now (recommended), or wait?"))
+
+    def test_root_can_recall_a_lower_productions_recorded_choice(self) -> None:
+        self.timer("kid")
+        self.attach("kid", "demo")
+        question = "Use the short route (recommended), or wait?"
+        _ = self.outstanding.with_name("kid.json").write_text(json.dumps([
+            {"since": "2026-10-06T08:00", "text": "choose route", "question": question, "reviewed": question}]))
+        self.assertEqual(self.run_switch("off").returncode, 0)
+        self.assert_passes(self.run_hook(question))
+        self.assertIn("record the item", self.reason("Use the long route (recommended), or wait?"))
 
     def test_footer_stays_valid_when_a_reading_arrives_after_its_stamp(self) -> None:
         zone = ZoneInfo(ZONE)
@@ -379,7 +480,7 @@ class ShowrunnerFooterHookTests(unittest.TestCase):
         self.assertIn("footer", self.reason("Done.\n" + self.footer() + WAITING_BLOCK))
         other_footer = subprocess.run(
             [sys.executable, str(DAILIES), "--footer", "--zone", ZONE,
-             "--outstanding", str(self.root / ".local/state/showrunner/outstanding/other.json"),
+             "--outstanding", str(self.outstanding.with_name("other.json")),
              "--nothing-needed"],
             capture_output=True, text=True, check=False, env=self.environment, timeout=10,
         )
@@ -402,7 +503,7 @@ class ShowrunnerFooterHookTests(unittest.TestCase):
         _ = (other / "state").write_text("ENABLED=0\n")
         other_footer = subprocess.run(
             [sys.executable, str(DAILIES), "--footer", "--zone", ZONE,
-             "--outstanding", str(self.root / ".local/state/showrunner/outstanding/other.json"),
+             "--outstanding", str(self.outstanding.with_name("other.json")),
              "--nothing-needed"],
             capture_output=True, text=True, check=False, env=self.environment, timeout=10,
         )

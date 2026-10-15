@@ -42,7 +42,7 @@ def showrunner_instances(session_id: str) -> list[str]:
 
 def main() -> None:
     payload = cast(StopPayload, json.loads(sys.stdin.read()))
-    if payload.get("stop_hook_active") or "agent_id" in payload:
+    if "agent_id" in payload:
         return
     session_id = payload.get("session_id", "")
     reply = payload.get("last_assistant_message", "")
@@ -57,7 +57,8 @@ def main() -> None:
     for instance in instances:
         slug = os.path.basename(instance).removeprefix("showrunner-")
         states[slug] = showrunner_footer.footer_state(slug)
-    reason = showrunner_footer.block_reason(instances, reply, states)
+    reason = showrunner_footer.block_reason(instances, reply, states,
+                                            skip_footer=payload.get("stop_hook_active", False))
     if reason is not None:
         print(json.dumps({"decision": "block", "reason": reason}))
 

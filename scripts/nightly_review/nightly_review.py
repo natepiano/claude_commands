@@ -165,7 +165,7 @@ def live_message_counts(path: Path, since: datetime) -> LiveMessageCounts:
     for line in path.read_text(encoding="utf-8").splitlines():
         try:
             data = json_record(line)
-            if any(data.get(key) for key in ("replay", "dry", "sample")):
+            if data.get("kind") == "question" or any(data.get(key) for key in ("replay", "dry", "sample")):
                 continue
             raw_rules = data.get("failed_rules", [])
             if not isinstance(raw_rules, list) or not all(isinstance(rule, str) for rule in cast(list[object], raw_rules)):

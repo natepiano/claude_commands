@@ -760,7 +760,7 @@ class AccountMoveTests(ShutdownTestCase):
         self.assertEqual(added["target"], "claude3")
         self.assertNotEqual(self.disk_state(), before)
 
-    def test_group_preview_uses_only_listing_and_explains_pause_or_reap_without_writes(self) -> None:
+    def test_group_preview_uses_only_listing_and_explains_wait_or_reap_without_writes(self) -> None:
         report = self.showrunner_inventory()
         before = self.disk_state()
         states = [settle.TakesPrompts("room"),
@@ -774,7 +774,7 @@ class AccountMoveTests(ShutdownTestCase):
         listing.assert_called()
         self.assertIn("sr-one", output)
         self.assertIn("first showrunner:", output)
-        self.assertIn("pause, then move (claude1 has room)", output)
+        self.assertIn("move when idle (claude1 has room)", output)
         self.assertIn("sr-two", output)
         self.assertIn("second showrunner:", output)
         self.assertIn("reap and restart now (claude1 out of usage: weekly limit, resets Thu 9:00 AM)", output)
@@ -851,6 +851,24 @@ class AccountMoveTests(ShutdownTestCase):
                     self.assertEqual(self.disk_state(), before)
                 process.assert_not_called()
 
+    def test_recovered_not_ready_record_still_refuses_a_second_move(self) -> None:
+        saved = entry(self.owner)
+        saved["login"], saved["label"] = "current@example.invalid", "claude1"
+        saved["progress"] = {"kind": "stop failed", "at": saved["requested_at"],
+            "reason": "session or worker is not idle and ready"}
+        saved["stop_issues"] = [record.NotReadyToStop(kind="not ready to stop", at=saved["requested_at"],
+            status="busy", progress="waiting")]
+        directory = self.root / "shutdown" / saved["login"] / "sessions"
+        directory.mkdir(parents=True)
+        _ = (directory / "move-id.json").write_text(json.dumps(saved))
+        before = self.disk_state()
+        with patch.object(subprocess, "run") as process:
+            result, output, error = self.cli()
+        self.assertEqual(result, 1)
+        self.assertIn("already has a shutdown in progress", output + error)
+        self.assertEqual(self.disk_state(), before)
+        process.assert_not_called()
+
     def test_single_preview_uses_listing_and_writes_nothing(self) -> None:
         before = self.disk_state()
         output, error = io.StringIO(), io.StringIO()
@@ -861,7 +879,7 @@ class AccountMoveTests(ShutdownTestCase):
         self.assertEqual((result, error.getvalue()), (0, ""))
         self.assertIn("kept name:", output.getvalue())
         self.assertIn("move-id", output.getvalue())
-        self.assertIn("pause, then move", output.getvalue())
+        self.assertIn("move when idle", output.getvalue())
         self.assertEqual(self.disk_state(), before)
         process.assert_not_called()
 

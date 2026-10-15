@@ -44,7 +44,47 @@ from quota_alert import (AgentNote, alert, blocked, current_session, refresh, Co
                          codex_alert_pass, RefusedAt, RefusalTimeUnknown)
 from run_out import READINGS_LOG
 import usage_store
+from user_zone import user_zone
 
+
+# Expand at refresh time so callers can substitute HOME or an absolute test path.
+SESSIONS_SEEN = Path("~/.local/state/agent-notes/sessions_seen.json")
+
+
+def read_sessions_seen() -> dict[str, str]:
+    """Read valid machine observations; missing or damaged state never blocks notes."""
+    try:
+        data = cast(object, json.loads(SESSIONS_SEEN.expanduser().read_text(encoding="utf-8")))
+    except (OSError, UnicodeError, ValueError):
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    seen: dict[str, str] = {}
+    for machine, value in cast(dict[str, object], data).items():
+        if not isinstance(value, str):
+            continue
+        try:
+            at = datetime.fromisoformat(value)
+        except ValueError:
+            continue
+        if at.utcoffset() is not None:
+            seen[machine] = value
+    return seen
+
+
+def write_sessions_seen(seen: dict[str, str]) -> None:
+    """Replace the machine observations once, outside the vault."""
+    path = SESSIONS_SEEN.expanduser()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    output = tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=path.parent,
+                                         prefix=".sessions-seen-", delete=False)
+    temporary = Path(output.name)
+    try:
+        with output:
+            _ = output.write(json.dumps(seen, sort_keys=True) + "\n")
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 class StoredReading(TypedDict):
@@ -345,8 +385,17 @@ def update_alert_pass(selection: ClaudeAccountsInUse, workers_home: Path) -> Upd
         groups = None
     group_roles: tuple[tuple[accounts.ClaudeGroup, str], ...] = (("showrunners", "showrunner"), ("units", "unit"))
     sessions = session_table.live_sessions(os.environ)
+    machines_seen: dict[str, str] = {}
     if isinstance(sessions, session_table.SessionsUnread):
         messages.append(f"sessions: {sessions.reason}")
+    else:
+        machines_seen = read_sessions_seen()
+        machines_seen.update({machine: checked_at.astimezone(user_zone()).isoformat(timespec="seconds")
+                              for machine in sessions.machines_read})
+        try:
+            write_sessions_seen(machines_seen)
+        except OSError as error:
+            messages.append(f"sessions seen: {error}")
     stamp = {"date_modified": f'"[[{checked_at.astimezone().strftime("%Y-%m-%d")}]]"'}
     for note in notes:
         updates = merged[note.label]
@@ -357,9 +406,9 @@ def update_alert_pass(selection: ClaudeAccountsInUse, workers_home: Path) -> Upd
             updates["role"] = ("worker",) if note.label == codex_readings.selected_account.label else ()
         section: SessionsSection | KeepSections = KEEP_SECTIONS
         if isinstance(sessions, session_table.ReadSessions):
-            kept = tuple(session_table.last_seen(row) for row in session_table.section_rows(note.text[note.end:])
+            kept = tuple(session_table.last_seen(row, machines_seen) for row in session_table.section_rows(note.text[note.end:])
                          if row.machine in sessions.rows_kept)
-            live = tuple(session_table.observed(row, checked_at)
+            live = tuple(row._replace(last_seen="", observed_at="")
                          for row in sessions.rows_by_label.get(note.label, ()))
             rows = live + kept
             updates["sessions"] = str(len(live))

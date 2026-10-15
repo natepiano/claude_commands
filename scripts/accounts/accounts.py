@@ -2426,7 +2426,7 @@ def move_preview_line(member: ListedSession, now: datetime) -> str:
         plan = f"reap and restart now ({source} out of usage: {cast(MemberNeedingReap, state).detail})"
     else:
         reason = "has room" if state.because == "room" else state.because
-        plan = f"pause, then move ({source} {reason})"
+        plan = f"move when idle ({source} {reason})"
     return f"{member.name}: {member.session_id} · {plan}"
 
 

@@ -20,6 +20,7 @@ from typing import TYPE_CHECKING, cast, override
 from unittest import mock
 
 SCRIPTS = Path(__file__).parents[1]
+sys.path.insert(0, str(Path(__file__).parent))
 sys.path.insert(0, str(SCRIPTS / "production"))
 sys.path.insert(0, str(SCRIPTS / "delegate"))
 
@@ -34,9 +35,10 @@ import sessions
 import showrunners
 import unit_lookup
 if TYPE_CHECKING:
-    from ..whoami import account
+    from ..whoami import account, agent_accounts
 else:
     account = roster.account
+    agent_accounts = roster.agent_accounts
 
 
 ENTRY_FIELDS = {
@@ -481,7 +483,7 @@ class RosterTests(unittest.TestCase):
         self.assertNotIn("contract reviewer", entries)
         self.assertEqual(entries["orphan-impl"].director, roster.NoDirector())
         self.assertNotIn("alpha-ended", entries)
-        self.assertNotIn("dead-impl", entries)
+        self.assertIn("dead-impl", entries)
         self.assertNotIn("stale-impl", entries)
 
         self.assertEqual(entries["Codex window"].role, "freestanding")
@@ -909,6 +911,65 @@ class RosterTests(unittest.TestCase):
         )
         self.assertNotIn("contract reviewer", entries)
 
+    def test_review_markers_without_a_process_add_no_rows_or_unattributed_sessions(self) -> None:
+        _ = self.account_note(2)
+        processes = self.ps_state.read_text()
+        _ = self.ps_state.write_text("")
+        statuses = [self.director_run / "review_status", self.director_run / "review_status_adversary"]
+        for status in statuses:
+            _ = status.write_text("reviewed\n")
+        before = self._entries()
+
+        for status in statuses:
+            _ = status.write_text("reviewing\n")
+        reviewing = self._entries()
+        self.assertEqual(set(reviewing), set(before))
+        self.assertEqual(
+            {name for name, entry in reviewing.items() if isinstance(entry.account, roster.AccountUnread)},
+            {name for name, entry in before.items() if isinstance(entry.account, roster.AccountUnread)},
+        )
+        self.assertNotIn("blind reviewer", reviewing)
+        self.assertNotIn("adversary reviewer", reviewing)
+        self.assertIn("alpha-research", reviewing)
+
+        _ = self.ps_state.write_text(processes)
+        with mock.patch.object(account, "process_codex_home", return_value=account.ProcessWithoutCodexHome()):
+            running = self._entries()
+        for name in ("blind reviewer", "adversary reviewer"):
+            with self.subTest(reviewer=name):
+                self.assertEqual(running[name].status, "running")
+                self.assertEqual(running[name].account, roster.AccountLabel("codex2"))
+
+    def test_live_run_workers_survive_server_exit_but_ended_workers_and_dead_runs_do_not(self) -> None:
+        for liveness in ("active marker", "fresh heartbeat", "dead run"):
+            with self.subTest(liveness=liveness):
+                run = self.delegate / liveness.replace(" ", "-")
+                records: dict[str, dict[str, object]] = {
+                    f"{run.name}-{status}": {
+                        "thread_id": f"{run.name}-{status}-thread",
+                        "status": status,
+                        "launcher_pid": 999_999_999,
+                    }
+                    for status in ("running", "done", "failed", "ended")
+                }
+                self._write_mesh(run, records)
+                if liveness == "active marker":
+                    _ = (self.delegate / "active" / "sid-director").write_text(str(run) + "\n")
+                else:
+                    heartbeat = run / "heartbeat.log"
+                    heartbeat.touch()
+                    if liveness == "dead run":
+                        old = time.time() - remove_workers.LIVE_HEARTBEAT_SECS - 5
+                        os.utime(heartbeat, (old, old))
+                before = self._entries()
+                self._write_mesh(run, records, server_pid=999_999_999)
+                after = self._entries()
+                expected: set[str] = set(records) - {f"{run.name}-ended"} if liveness != "dead run" else set()
+                self.assertEqual(set(before) & set(records), expected)
+                self.assertEqual(set(after) & set(records), expected)
+                for name in expected:
+                    self.assertEqual(after[name], before[name])
+
     def test_kind_codex_keeps_only_needed_claude_context(self) -> None:
         result, lines, errors = self._run_main("--kind", "codex")
         self.assertEqual((result, errors), (0, []))
@@ -1264,6 +1325,7 @@ class RosterTests(unittest.TestCase):
 
     def test_working_workers_keep_their_serving_server_account_across_a_swap(self) -> None:
         old, current = self.account_note(1), self.account_note(2)
+        _ = self.enterContext(mock.patch.object(agent_accounts, "workers_home", return_value=current))
         _ = (self.director_run / "mesh_server.json").write_text(json.dumps({
             "port": 45678, "pid": os.getpid(), "codex_home": str(current),
         }))
@@ -1280,12 +1342,30 @@ class RosterTests(unittest.TestCase):
         self.assertEqual(entries["old-impl"].account, roster.AccountLabel("codex1"))
         self.assertEqual(entries["new-test"].account, roster.AccountLabel("codex2"))
         self.assertEqual(entries["between-turns"].account, roster.AccountLabel("codex2"))
-        self.assertIsInstance(entries["missing-server"].account, roster.AccountUnread)
+        self.assertEqual(entries["missing-server"].account, roster.AccountLabel("codex2"))
         _ = (self.director_run / "mesh_server.json").write_text(json.dumps({"port": 45678, "pid": os.getpid()}))
         entries = self._entries()
-        self.assertIsInstance(entries["new-test"].account, roster.AccountUnread)
-        self.assertIsInstance(entries["between-turns"].account, roster.AccountUnread)
+        self.assertEqual(entries["new-test"].account, roster.AccountLabel("codex2"))
+        self.assertEqual(entries["between-turns"].account, roster.AccountLabel("codex2"))
         self.assertEqual(entries["old-impl"].account, roster.AccountLabel("codex1"))
+
+    def test_live_workers_keep_their_account_when_idle_stop_deletes_server_metadata(self) -> None:
+        home = self.account_note(2)
+        _ = (self.director_run / "mesh_server.json").write_text(json.dumps({
+            "port": 45678, "pid": os.getpid(), "codex_home": str(home),
+        }))
+        _ = (self.director_run / "mesh_roster.json").write_text(json.dumps({
+            "idle-worker": {"thread_id": "idle-thread", "status": "done", "port": 45678},
+            "legacy-worker": {"thread_id": "legacy-thread", "status": "done"},
+        }))
+        with mock.patch.object(agent_accounts, "workers_home", return_value=home):
+            before = self._entries()
+            (self.director_run / "mesh_server.json").unlink()
+            after = self._entries()
+        for name in ("idle-worker", "legacy-worker"):
+            with self.subTest(worker=name):
+                self.assertEqual(before[name].account, roster.AccountLabel("codex2"))
+                self.assertEqual(after[name], before[name])
 
     def test_daemon_rows_use_the_home_holding_the_socket(self) -> None:
         home = self.account_note(1)
@@ -1302,7 +1382,7 @@ class RosterTests(unittest.TestCase):
         self.assertEqual(entries["adversary reviewer"].account, roster.AccountLabel("codex2"))
         with mock.patch.object(process_table, "snapshot", return_value={}):
             missing = self._entries()
-        self.assertIsInstance(missing["blind reviewer"].account, roster.AccountUnread)
+        self.assertNotIn("blind reviewer", missing)
         with mock.patch.object(account, "process_codex_home", return_value=account.ProcessEnvironmentUnread("access denied")):
             entries = self._entries()
         self.assertIsInstance(entries["adversary reviewer"].account, roster.AccountUnread)
