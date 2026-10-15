@@ -83,7 +83,8 @@ The production doc sits beside the source plan as `<source-stem>-production.md`.
 
 ## Production Context
 
-- **Formerly:** `<old>`, `<older>` — previous production slugs; omit before the first rename
+- **Formerly:** `<old>`, `<older>` — previous production slugs, newest first, written by
+  `/showrunner:rename`; old names keep resolving through it; omit before the first rename
 - **Source plans:** <path(s)> — split on <date> by /producer:to_production
 - **Repository:** <main checkout path>
 - **Merge branch:** `<branch>` — every unit merges here; only the showrunner pushes it
@@ -132,7 +133,9 @@ a session at any time. The unit's tmux session carries the production's slug and
 unit's id as marks, set at launch. To reach a unit, look it up at that moment:
 `$HOME/.claude/scripts/lib/py $HOME/.claude/scripts/production/unit_lookup.py pane <slug> <unit>`
 prints its pane, and `unit_lookup.py list <slug>` prints every unit's pane and its
-session name now. `<slug>` is this doc's file name without `-production.md`.
+session name now. `<slug>` is this doc's file name without `-production.md`; a former
+slug from the Formerly line also works, and a mark set before a rename is found under
+the current slug.
 
 A retired unit keeps its row. Its Plan cell begins with `retired`, alone or inside
 an opening parenthesis, as in `(retired by the user 2026-10-07, worktree removed)`.

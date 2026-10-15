@@ -26,7 +26,7 @@ Each production has its own pool of long-lived, read-only Codex reviewers. A uni
 
 ### State
 
-A pool belongs to one production. Its state is `~/.local/state/review-pool/<slug>/`; `REVIEW_POOL_STATE` replaces the root. `<slug>` is the production doc's file name without `-production.md`, and `--production` accepts the slug or the doc's path.
+A pool belongs to one production. Its state is `~/.local/state/review-pool/<slug>/`; `REVIEW_POOL_STATE` replaces the root. `<slug>` is the production doc's file name without `-production.md`, and `--production` accepts the slug or the doc's path. `_production` passes that slug through `showrunners.canonical_slug`, so a former slug reaches the current pool; a production rename moves the pool directory, leases included (`docs/as-built/production-rename.md`).
 
 | Path | Holds |
 | --- | --- |

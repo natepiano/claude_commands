@@ -422,6 +422,77 @@ class ProductionRenameTests(unittest.TestCase):
         self.assertEqual(self.journal()["step"], 7)
         self.assertIs(self.journal()["done"], False)
 
+    def test_plan_ignores_as_built_paths_and_prose_in_plan_cells(self) -> None:
+        text = self.doc.read_text()
+        for unit, prose in zip(UNITS, (
+            "docs/as-built/agent-registry.md and docs/as-built/session-notifier.md (runs done 2026-10-08)",
+            "`docs/as-built/agent-registry.md` and `docs/as-built/session-notifier.md` (runs done 2026-10-08)",
+        ), strict=True):
+            text = text.replace(f"docs/plans/{unit}.md", prose)
+        self.write(self.doc, text)
+        before = self.snapshot()
+        planned = self.run_rename("plan")
+        self.assert_success(planned)
+        self.assertIn("2. Production headers: no unit plans", planned.stdout)
+        self.assertEqual(self.snapshot(), before)
+
+    def test_plan_selects_multiple_quoted_plans_and_apply_rewrites_both_headers(self) -> None:
+        self.write(self.doc, self.doc.read_text().replace(
+            "docs/plans/alpha-unit.md",
+            "`docs/plans/alpha-unit.md` and `docs/plans/beta-unit.md` "
+            + "(see `README.md` and `docs/as-built/history.md`; runs done 2026-10-08)"
+        ).replace("| beta-unit | docs/plans/beta-unit.md |", "| beta-unit | permanent |"))
+        _ = self.git("add", str(self.doc))
+        _ = self.git("commit", "-m", "Record several plans in one cell")
+        planned = self.run_rename("plan")
+        self.assert_success(planned)
+        headers = [line for line in planned.stdout.splitlines() if line.startswith("2.")]
+        self.assertEqual(len(headers), 2, planned.stdout)
+        for unit in UNITS:
+            self.assertTrue(any(str(self.plan_path(unit)) in line for line in headers))
+        self.assert_success(self.run_rename("apply"))
+        for unit in UNITS:
+            self.assertRegex(self.plan_path(unit).read_text(),
+                             r"(?m)^> \*\*Production:(?: new\*\*|\*\* new) — unit")
+        self.assertEqual(self.git("status", "--porcelain"), "")
+
+    def test_plan_and_apply_skip_plans_removed_from_git(self) -> None:
+        untracked = self.plan_path("alpha-unit")
+        original = untracked.read_text()
+        _ = self.git("rm", "--cached", "--", str(untracked))
+        _ = self.git("rm", "--", str(self.plan_path("beta-unit")))
+        self.write(self.checkout / ".gitignore", "docs/plans/alpha-unit.md\n")
+        _ = self.git("add", ".gitignore")
+        _ = self.git("commit", "-m", "Remove obsolete unit plans")
+        planned = self.run_rename("plan")
+        self.assert_success(planned)
+        self.assertIn("2. Production headers: no unit plans", planned.stdout)
+        self.assert_success(self.run_rename("apply"))
+        self.assertEqual(untracked.read_text(), original)
+        self.assertFalse(self.plan_path("beta-unit").exists())
+        self.assertEqual(self.journal()["plans"], [])
+        self.assertEqual(self.git("status", "--porcelain"), "")
+
+    def test_plan_skips_a_tracked_plan_missing_from_disk(self) -> None:
+        self.plan_path("alpha-unit").unlink()
+        planned = self.run_rename("plan")
+        self.assert_success(planned)
+        headers = [line for line in planned.stdout.splitlines() if line.startswith("2.")]
+        self.assertEqual(len(headers), 1, planned.stdout)
+        self.assertIn(str(self.plan_path("beta-unit")), headers[0])
+
+    def test_plan_accepts_absolute_and_home_relative_quoted_plan_paths(self) -> None:
+        self.env["HOME"] = str(self.checkout)
+        self.write(self.doc, self.doc.read_text().replace(
+            "docs/plans/alpha-unit.md", f"`{self.plan_path('alpha-unit')}`"
+        ).replace("| beta-unit | docs/plans/beta-unit.md |", "| beta-unit | `~/docs/plans/beta-unit.md` |"))
+        planned = self.run_rename("plan")
+        self.assert_success(planned)
+        headers = [line for line in planned.stdout.splitlines() if line.startswith("2.")]
+        self.assertEqual(len(headers), 2, planned.stdout)
+        for unit in UNITS:
+            self.assertTrue(any(str(self.plan_path(unit)) in line for line in headers))
+
     def test_plan_lists_every_production_move_without_writing(self) -> None:
         before = self.snapshot()
         result = self.run_rename("plan")
