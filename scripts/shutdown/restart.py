@@ -448,11 +448,11 @@ def remote_control_missing(records: list[SessionShutdown], confirmation: Registr
         who = remote_control.remote_control_who(by_id[item["session_id"]])
         alerts = item["alerts"] if notify else "none"
         try:
-            remote_control.launch_fixer(item["session_id"], live["pid"], live.get("procStart", ""), who, alerts)
+            remote_control.launch_fixer(item["session_id"], live["pid"], live.get("procStart", ""), who, alerts, item["name"])
         except (OSError, RuntimeError, ValueError, subprocess.SubprocessError):
             print(f"{item['name']}: Remote Control is off; turn it on at its terminal with /remote-control")
             if alerts == "user":
-                remote_control.alert_failed(who)
+                remote_control.alert_failed(who, item["name"])
         else:
             print(f"{item['name']}: Remote Control not on yet; turning it on in the background")
     return missing
@@ -531,12 +531,12 @@ def _resume_parts(session: Session, prompt: str, target: str = "") -> ResumePart
 
         role = "unit" if session["kind"] == "unit" else "showrunner"
         selected = accounts.account_for_group_launch(role, resume=True, target=target)
-        selected_dir = accounts.main_config_dir() if isinstance(selected, accounts.DefaultAccount) else selected.dir
+        selected_dir = selected.dir
         host = session["host"]
         herdr_host = host["kind"] == "herdr"
         # Only native herdr resumes retain an already configured directory.
         if target or not herdr_host or selected_dir.resolve() != config_dir.resolve():
-            target = "default" if isinstance(selected, accounts.DefaultAccount) else selected.label
+            target = selected.label
         else:
             config_dir = selected_dir
     account: RetainResumeAccount | MoveResumeAccount = (
@@ -1033,17 +1033,15 @@ def _herdr_launch(parts: ResumeParts, session: Session, *, dry_run: bool) -> Non
         return
     _record_scheduled_restart_prompt(session["session_id"], parts.opening_prompt, dry_run=False)
     try:
-        from scripts.accounts.accounts import ClaudeLaunchAccount, DefaultAccount, NamedAccount, trust_command
+        from scripts.accounts.accounts import NamedAccount, home_account_label, trust_command
 
         config_dir = parts.account.config_dir
         claude_json = (Path.home() / ".claude.json" if config_dir == Path.home() / ".claude"
                        else config_dir / ".claude.json")
         trust = herdr.claude_trust(Path(parts.cwd), claude_json)
         if isinstance(trust, (herdr.Untrusted, herdr.UnreadableTrustFile)):
-            account: ClaudeLaunchAccount = (
-                DefaultAccount() if config_dir == Path.home() / ".claude"
-                else NamedAccount(str(config_dir), config_dir)
-            )
+            account = NamedAccount(home_account_label("claude") if config_dir == Path.home() / ".claude"
+                                   else str(config_dir), config_dir)
             reason = (str(trust) if isinstance(trust, herdr.UnreadableTrustFile)
                       else f"{parts.cwd}: Claude has not trusted this folder")
             raise OSError(f"{reason}. Run: {trust_command(Path(parts.cwd), account)}")
@@ -1139,8 +1137,7 @@ def _launch_session(
             if "target" in record:
                 from scripts.accounts import accounts
 
-                directory = (accounts.main_config_dir() if record["target"] == "default"
-                             else accounts.account_dir(record["target"]))
+                directory = accounts.claude_account_dir(record["target"])
                 _ = _run([os.environ.get("SHUTDOWN_TMUX", "tmux"), "set-option", "-t",
                           retained_session, "@claude_config_dir", str(directory)], dry_run=dry_run)
         case "unit":
@@ -1275,32 +1272,57 @@ def _journal_move_failure(record: SessionShutdown, reason: str) -> None:
     from scripts.accounts import moves
     session = record["session"]
     moves.append_move(moves.FailedMove(kind="failed", at=settle.record_time(), tool="claude",
-        subject=session["session_id"] + ": " + session["name"], move_id=record["request_id"], reason=reason))
+        subject=session["session_id"] + ": " + session["name"], move_id=record.get("move_id", record["request_id"]), request_id=record["request_id"], reason=reason))
 
 
-def _target_config_dir(record: SessionShutdown) -> Path | None:
-    """The config directory a restored session belongs on: its move target, else the one it left, if recorded."""
+@dataclass(frozen=True)
+class RecordedConfigDir:
+    path: Path
+
+
+@dataclass(frozen=True)
+class NoRecordedConfigDir:
+    """Neither a move target nor the original directory was recorded."""
+
+
+@dataclass(frozen=True)
+class ObservedConfigDir:
+    path: Path
+
+
+@dataclass(frozen=True)
+class LiveObservationUnavailable:
+    reason: Literal["not live", "environment unreadable"]
+
+
+def _target_config_dir(record: SessionShutdown) -> RecordedConfigDir | NoRecordedConfigDir:
     target_label = record.get("target", "")
     if not target_label:
         session = record["session"]
-        return Path(session["config_dir"]) if "config_dir" in session else None
+        return RecordedConfigDir(Path(session["config_dir"])) if "config_dir" in session else NoRecordedConfigDir()
     from scripts.accounts import accounts
-    return accounts.main_config_dir() if target_label == "default" else accounts.account_dir(target_label)
+    return RecordedConfigDir(accounts.claude_account_dir(target_label))
 
 
-def _live_config_dir(record: SessionShutdown) -> Path | None:
+def _live_config_dir(record: SessionShutdown) -> ObservedConfigDir | LiveObservationUnavailable:
     import account
     live = next((item for item in sessions.live_sessions() if item["sessionId"] == record["session"]["session_id"]), None)
-    return account.process_config_dir(live["pid"]) if live is not None else None
+    if live is None:
+        return LiveObservationUnavailable("not live")
+    directory = account.process_config_dir(live["pid"])
+    return ObservedConfigDir(directory) if directory is not None else LiveObservationUnavailable("environment unreadable")
 
 
 def _confirm_move(record: SessionShutdown) -> None:
     from scripts.accounts import moves
     from scripts.accounts.refusal_watch import clear_assumed
     session = record["session"]
+    target = _target_config_dir(record)
+    if isinstance(target, NoRecordedConfigDir):
+        return
     moves.append_move(moves.ConfirmedMove(kind="confirmed", at=settle.record_time(), tool="claude",
-        subject=session["session_id"] + ": " + session["name"], move_id=record["request_id"],
-        config_dir=str(_target_config_dir(record) or "")))
+        subject=session["session_id"] + ": " + session["name"], move_id=record.get("move_id", record["request_id"]), request_id=record["request_id"],
+        config_dir=str(target.path)))
     clear_assumed(session["session_id"])
 
 
@@ -1309,8 +1331,11 @@ def _prove_move(record: SessionShutdown) -> bool:
     if not record.get("target", ""):
         return True
     directory, target = _live_config_dir(record), _target_config_dir(record)
-    if directory is None or target is None or directory.resolve() != target.resolve():
-        reason = "still on " + record.get("source_label", record["label"]) if directory is not None else "resumed account unreadable"
+    if isinstance(directory, LiveObservationUnavailable) or isinstance(target, NoRecordedConfigDir):
+        mark_restart_failed(record, "resumed account unreadable")
+        return False
+    if directory.path.resolve() != target.path.resolve():
+        reason = "still on " + record.get("source_label", record["label"])
         mark_restart_failed(record, reason)
         return False
     _confirm_move(record)
@@ -1340,7 +1365,8 @@ def clear_running_on_target(records: list[SessionShutdown]) -> TargetCheck:
             remaining.append(record)
             continue
         directory, target = _live_config_dir(record), _target_config_dir(record)
-        if directory is None or target is None or directory.resolve() != target.resolve():
+        if (isinstance(directory, LiveObservationUnavailable) or isinstance(target, NoRecordedConfigDir)
+                or directory.path.resolve() != target.path.resolve()):
             remaining.append(record)
             continue
         if record.get("target", ""):
@@ -1612,7 +1638,7 @@ def _machine_result(records: list[SessionShutdown], machine: str, label: str) ->
         machine, label, "partial" if failed or manual or pending or any(
             item["progress"]["kind"] != "restarted" for item in records
         ) else "done",
-        restarted=restarted, workers=sum(len(item["seats"]) for item in records if item["progress"]["kind"] == "restarted"),
+        restarted=restarted, workers=sum(len(item["workers"]) for item in records if item["progress"]["kind"] == "restarted"),
         failed=len(failed), manual=len(manual), failed_sessions=failed,
         manual_sessions=manual, timers_not_started=pending,
     )

@@ -80,7 +80,7 @@ class GroupTest(unittest.TestCase):
     def run_group(self, argv: list[str], moved: object, outcome: showrunner_move.Outcome = PROVEN) -> tuple[int, str]:
         output = io.StringIO()
         with patch("showrunner_move.accounts.move_group", return_value=moved) as move_group, \
-             patch("showrunner_move.accounts.account_dir", return_value=TARGET), \
+             patch("showrunner_move.accounts.claude_account_dir", return_value=TARGET), \
              patch("showrunner_move.sessions.live_sessions", return_value=live()), \
              patch.object(showrunner_move, "settle", return_value=outcome) as settle, redirect_stdout(output):
             code = showrunner_move.main(argv)
@@ -92,6 +92,16 @@ class GroupTest(unittest.TestCase):
     def test_each_moved_member_is_proven(self) -> None:
         code, text = self.run_group(["units", "claude1"], accounts.GroupMoveStarted((UNIT,), "claude1", "", "", 0))
         self.assertEqual((code, text), (0, f"nightly-review: on claude1, proven (pid 4242 runs on {TARGET})\n"))
+
+    def test_group_success_keeps_usage_notice_and_move_back_guidance(self) -> None:
+        notice = "no fresh usage reading for claude1 (last 25 minutes ago)"
+        back = ("to move them back, in this terminal: ~/.claude/scripts/lib/py "
+                + "~/.claude/scripts/accounts/accounts.py move units claude3")
+        code, text = self.run_group(["units", "claude1"], accounts.GroupMoveStarted(
+            (UNIT,), "claude1", "shutdown started\n" + notice + "\n" + back + "\n", "", 0))
+        self.assertEqual(code, 0)
+        self.assertEqual(text.splitlines(), [notice, back,
+            f"nightly-review: on claude1, proven (pid 4242 runs on {TARGET})"])
 
     def test_a_group_already_on_its_account_is_a_note_and_exits_zero(self) -> None:
         code, text = self.run_group(["units", "claude1"],
@@ -123,10 +133,18 @@ class GroupTest(unittest.TestCase):
 
 
 class MainTest(unittest.TestCase):
+    def test_help_teaches_only_numbered_claude_targets(self) -> None:
+        output = io.StringIO()
+        with redirect_stdout(output), self.assertRaises(SystemExit) as result:
+            _ = showrunner_move.main(["--help"])
+        self.assertEqual(result.exception.code, 0)
+        self.assertIn("<claudeN>", output.getvalue())
+        self.assertNotIn("default", output.getvalue())
+
     def run_main(self, argv: list[str], moved: object, outcome: showrunner_move.Outcome) -> tuple[int, str]:
         output = io.StringIO()
         with patch("showrunner_move.accounts.move", return_value=moved) as move, \
-             patch("showrunner_move.accounts.account_dir", return_value=TARGET), \
+             patch("showrunner_move.accounts.claude_account_dir", return_value=TARGET), \
              patch("showrunner_move.sessions.live_sessions", return_value=live()), \
              patch.object(showrunner_move, "settle", return_value=outcome), redirect_stdout(output):
             code = showrunner_move.main(argv)
@@ -139,6 +157,16 @@ class MainTest(unittest.TestCase):
                                    accounts.MoveStarted(UNIT, "claude1", "", "", 0), Proven(4242, TARGET))
         self.assertEqual(code, 0)
         self.assertEqual(text, f"nightly-review: on claude1, proven (pid 4242 runs on {TARGET})\n")
+
+    def test_single_success_keeps_usage_notice_and_move_back_guidance(self) -> None:
+        notice = "no fresh usage reading for claude1 (last reading unknown)"
+        back = ("to move them back, in this terminal: ~/.claude/scripts/lib/py "
+                + "~/.claude/scripts/accounts/accounts.py move " + UNIT + " claude3")
+        code, text = self.run_main(["session", "nightly-review", "claude1", "--why", "claude3 is out"],
+            accounts.MoveStarted(UNIT, "claude1", notice + "\nshutdown started\n" + back + "\n", "", 0), PROVEN)
+        self.assertEqual(code, 0)
+        self.assertEqual(text.splitlines(), [notice, back,
+            f"nightly-review: on claude1, proven (pid 4242 runs on {TARGET})"])
 
     def test_a_refused_move_exits_one_with_its_reason(self) -> None:
         code, text = self.run_main(["session", "nightly-review", "claude1", "--why", "claude3 is out"],
@@ -156,6 +184,7 @@ class MainTest(unittest.TestCase):
         ):
             with (self.subTest(outcome=outcome),
                   patch.object(accounts, "move", return_value=accounts.MoveStarted(UNIT, "claude2", "", "", 0)),
+                  patch.object(accounts, "claude_account_dir", return_value=target),
                   patch("showrunner_move.sessions.live_sessions", return_value=live()),
                   patch.object(showrunner_move, "settle", return_value=outcome)):
                 output = io.StringIO()

@@ -64,8 +64,33 @@ def refused_at(action: UserAction, priority: int) -> ActionAllowed | ActionRefus
     return ActionAllowed()
 
 
-def first_line(action: UserAction) -> str:
-    """The mandatory first line of a notification."""
+@dataclass(frozen=True)
+class SessionLine:
+    text: str
+
+
+@dataclass(frozen=True)
+class NoSessionLine:
+    pass
+
+
+NotificationSession = SessionLine | NoSessionLine
+NO_SESSION_LINE = NoSessionLine()
+
+
+def session_prefix(session: NotificationSession) -> str:
+    return f"Session: {session.text}\n" if isinstance(session, SessionLine) else ""
+
+
+def split_session(message: str) -> tuple[NotificationSession, str]:
+    line, separator, body = message.partition("\n")
+    if line.startswith("Session: "):
+        return SessionLine(line.removeprefix("Session: ")), body if separator else ""
+    return NO_SESSION_LINE, message
+
+
+def first_line(action: UserAction, session: NotificationSession = NO_SESSION_LINE) -> str:
+    """The notification header, with its session when stated."""
     if isinstance(action, ActionRequired):
-        return f"Action: {action.text}"
-    return "No action needed."
+        return session_prefix(session) + f"Action: {action.text}"
+    return session_prefix(session) + "No action needed."

@@ -196,15 +196,15 @@ def worker_session(
     *,
     owner: str | None,
     run_dirs: list[str] | None = None,
-) -> inventory.SeatSession:
+) -> inventory.WorkerSession:
     worker_owner: inventory.WorkerOwner = (
         inventory.DirectorOwner(kind="director", session_id=owner)
         if owner is not None
         else inventory.NoDirector(kind="no director")
     )
-    return inventory.SeatSession(
+    return inventory.WorkerSession(
         **common_session(session_id, run_dirs=run_dirs),
-        kind="seat",
+        kind="worker",
         host=inventory.UnknownHost(kind="unknown"),
         owner=worker_owner,
     )
@@ -218,7 +218,7 @@ def entry(
         login=LOGIN, label=LABEL, machine="natedev", requested_at=STOPPED,
         request_id="request", requested_by=record.FromTerminal(kind="terminal"),
         hold="session", then="restart", force="wait for ready", alerts="user",
-        session=session, seats=[], timers=list(timers or []),
+        session=session, workers=[], timers=list(timers or []),
         settle_message=record.SettleMessageNotSent(kind="not sent"),
         where=where or record.WhereSaid(kind="said", text=f"working on {session['name']}", at=STOPPED),
         progress=state or record.SessionStopped(kind="stopped", at=STOPPED), stop_issues=[], trail=[],
@@ -310,7 +310,7 @@ class RestartTests(ShutdownTestCase):
         _ = self.enterContext(patch.object(settle, "record_time", return_value=RESTARTED))
         _ = self.enterContext(patch.object(settle, "inventory", return_value=inventory.Inventory(machine="natedev", login=LOGIN, label=LABEL, sessions=[], unattributed=[])))
 
-    def configure_groups(self, *, units: str = "default", showrunners: str = "default") -> None:
+    def configure_groups(self, *, units: str = "claude2", showrunners: str = "claude2") -> None:
         path = accounts.groups_file()
         path.parent.mkdir(parents=True, exist_ok=True)
         _ = path.write_text(json.dumps({"units": units, "showrunners": showrunners}))
@@ -348,6 +348,73 @@ class RestartTests(ShutdownTestCase):
         self.assertEqual(failed["move_id"], saved["request_id"])
         self.assertEqual(failed["reason"], "still on claude2")
         self.assertNotEqual(self.stored_record()["progress"]["kind"], "restarted")
+
+    def test_move_proof_names_absent_environment_and_mismatch_and_confirms_only_the_target(self) -> None:
+        for observation in ("not live", "environment unreadable", "source", "target"):
+            with self.subTest(observation=observation):
+                saved = self.moved_record("proof-" + observation.replace(" ", "-"))
+                transition = "group-" + observation
+                saved["move_id"] = transition
+                _ = record.update_session(LOGIN, saved["session"]["session_id"],
+                    lambda current: current.update(move_id=transition))
+                owner = saved["session"]
+                live = [] if observation == "not live" else [sessions.SessionRecord(
+                    pid=owner["pid"], sessionId=owner["session_id"], name=owner["name"],
+                    messagingSocketPath="", updatedAt=1, tmux="", formerNames=[])]
+                directory = (None if observation == "environment unreadable" else
+                             self.root / (".claude3" if observation == "target" else ".claude2"))
+                with (patch.object(sessions, "live_sessions", return_value=live),
+                      patch.object(account_reader, "process_config_dir", return_value=directory)):
+                    result = restart._prove_move(saved)  # pyright: ignore[reportPrivateUsage]
+                self.assertEqual(result, observation == "target")
+                entries = [entry for entry in moves.read_moves() if entry["move_id"] == saved["move_id"]]
+                self.assertEqual(len(entries), 1)
+                outcome = entries[0]
+                if observation == "target":
+                    self.assertEqual(outcome["kind"], "confirmed")
+                    self.assertEqual(outcome.get("config_dir"), str(self.root / ".claude3"))
+                else:
+                    expected = "still on claude2" if observation == "source" else "resumed account unreadable"
+                    self.assertEqual(outcome.get("reason"), expected)
+                    stored = record.find_session(LOGIN, owner["session_id"])
+                    assert stored is not None
+                    self.assertEqual(stored["progress"]["kind"], "restart failed")
+
+    def test_target_cleanup_keeps_records_when_live_session_or_environment_cannot_be_observed(self) -> None:
+        for absent in (True, False):
+            with self.subTest(absent=absent):
+                saved = self.hand_restart_record("absent" if absent else "unreadable")
+                owner = saved["session"]
+                live = [] if absent else [sessions.SessionRecord(pid=owner["pid"],
+                    sessionId=owner["session_id"], name=owner["name"], messagingSocketPath="",
+                    updatedAt=1, tmux="", formerNames=[])]
+                with (patch.object(sessions, "live_sessions", return_value=live),
+                      patch.object(account_reader, "process_config_dir", return_value=None)):
+                    checked = restart.clear_running_on_target([saved])
+                self.assertEqual((checked.remaining, checked.finished), ([saved], []))
+                self.assertEqual(record.find_session(LOGIN, owner["session_id"]), saved)
+
+    def test_failed_attempt_and_successful_retry_journal_one_transition_with_separate_request_claims(self) -> None:
+        first = self.moved_record("retry-owner")
+        first["move_id"] = "durable-group-transition"
+        _ = record.update_session(LOGIN, "retry-owner", lambda current: current.update(move_id=first["move_id"]))
+        restart.mark_restart_failed(first, "first launch failed")
+        record.archive_session(LOGIN, "retry-owner")
+        retry: SessionShutdown = {**first, "request_id": "second-attempt", "progress": record.SessionWaiting(kind="waiting")}
+        self.create([retry])
+        live = self.running_on(retry, self.root / ".claude3")
+        with patch.object(sessions, "live_sessions", return_value=live):
+            self.assertTrue(restart._prove_move(retry))  # pyright: ignore[reportPrivateUsage]
+        entries = moves.read_moves()
+        self.assertEqual([entry["kind"] for entry in entries], ["failed", "confirmed"])
+        self.assertEqual({entry["move_id"] for entry in entries}, {"durable-group-transition"})
+        # A delayed result for the first attempt cannot modify its replacement.
+        restart.mark_restart_failed(first, "stale failure")
+        loaded = record.find_session(LOGIN, "retry-owner")
+        assert loaded is not None
+        self.assertEqual(loaded["request_id"], "second-attempt")
+        self.assertEqual(loaded["progress"]["kind"], "waiting")
+        self.assertEqual(len(moves.read_moves()), 2)
 
     def test_target_process_confirms_move_even_when_timer_restoration_is_pending(self) -> None:
         saved = self.moved_record()
@@ -457,6 +524,36 @@ class RestartTests(ShutdownTestCase):
         self.assertEqual(push.id, "shutdown.restart_failed")
         self.assertEqual(push.values["stopped"], "One session")
 
+    def test_legacy_default_record_restarts_on_the_numbered_home_without_rewriting_it_on_read(self) -> None:
+        saved = entry(top_level("legacy-home-move", host=tmux_host("legacy-home-move")))
+        saved["target"] = "claude2"
+        self.create([saved])
+        path = next((self.state_root / LOGIN / "sessions").glob("*.json"))
+        original = path.read_bytes().replace(b'"target": "claude2"', b'"target": "default"')
+        self.assertIn(b'"target": "default"', original)
+        _ = path.write_bytes(original)
+
+        loaded = record.session_records(LOGIN)[0]
+
+        self.assertEqual(loaded.get("target"), "claude2")
+        self.assertEqual(path.read_bytes(), original)
+        recorder = CommandRecorder()
+        with patch.object(restart, "_run", recorder):
+            result = restart._launch_session(loaded, "resume the saved checkpoint", self.desktop_state, dry_run=False)  # pyright: ignore[reportPrivateUsage]
+        self.assertIsInstance(result, restart.SessionLaunched)
+        commands = [argv[-1] for argv in recorder.calls if "-ic" in argv]
+        self.assertEqual(len(commands), 1)
+        self.assertIn("accounts.py exec claude2", commands[0])
+        self.assertNotIn("CLAUDE_CONFIG_DIR=", commands[0])
+
+    def test_resume_parts_for_both_groups_on_the_home_account_use_its_number(self) -> None:
+        self.configure_groups(units="claude2", showrunners="claude2")
+        for owner in (unit("home-unit"), showrunner("home-runner")):
+            with self.subTest(kind=owner["kind"]):
+                owner["config_dir"] = str(self.root / ".claude3")
+                parts = restart._resume_parts(owner, "continue the checkpoint")  # pyright: ignore[reportPrivateUsage]
+                self.assertEqual(parts.account, restart.MoveResumeAccount("claude2"))
+
     def test_default_target_process_confirms_main_directory_and_removes_assumption(self) -> None:
         saved = entry(top_level("default-target", host=tmux_host("default-target")))
         saved["target"] = "default"
@@ -544,7 +641,7 @@ class RestartTests(ShutdownTestCase):
         self.assert_move_resume(launch[-1], owner)
 
     def test_tmux_account_move_updates_retained_directory_for_named_and_default_targets(self) -> None:
-        for target, directory in (("claude3", self.root / ".claude3"), ("default", self.root / ".claude")):
+        for target, directory in (("claude3", self.root / ".claude3"), ("claude2", self.root / ".claude")):
             with self.subTest(target=target):
                 owner = showrunner("moved-showrunner", host=recorded_tmux_host("kept", "%move", 420))
                 owner["config_dir"] = str(self.root / ".claude1")
@@ -1107,7 +1204,7 @@ class RestartTests(ShutdownTestCase):
         """F001/F002: unrestricted unit names never reach native herdr agent launch."""
         template, _, log = self.herdr_restart_fixture()
         checkpoint = "finish Parser Review; keep 'quotes' and $(literal)"
-        for label in ("default", "claude3"):
+        for label in ("claude2", "claude3"):
             self.configure_groups(units=label)
             for moved in (False, True):
                 for already_on_group in (False, True):
@@ -1117,7 +1214,7 @@ class RestartTests(ShutdownTestCase):
                             owner = unit("parser-review", session_host="herdr", session_name="writing")
                             owner["name"] = "Parser Review"
                             owner["cwd"] = template["cwd"]
-                            directory = accounts.main_config_dir() if label == "default" else accounts.account_dir(label)
+                            directory = accounts.main_config_dir() if label == "claude2" else accounts.account_dir(label)
                             old_directory = accounts.account_dir("claude1")
                             owner["config_dir"] = str(directory if already_on_group else old_directory)
                             saved = entry(owner, where=record.WhereSaid(kind="said", text=checkpoint, at=STOPPED))
@@ -1150,7 +1247,7 @@ class RestartTests(ShutdownTestCase):
         """F001: account changes never rely on PATH inside a herdr shell."""
         template, _, log = self.herdr_restart_fixture()
         checkpoint = "continue the saved showrunner checkpoint"
-        for label in ("default", "claude3"):
+        for label in ("claude2", "claude3"):
             self.configure_groups(showrunners=label)
             for moved in (False, True):
                 for dry_run in (False, True):
@@ -1359,14 +1456,14 @@ class RestartTests(ShutdownTestCase):
         for owner in owners:
             with self.subTest(host=owner["host"]["kind"], kind=owner["kind"]):
                 saved = entry(owner, where=record.WhereNotSaid(kind="not said"))
-                saved["target"] = "default"
+                saved["target"] = "claude2"
                 saved["source_label"] = "claude3"
                 saved["why"] = "weekly limit reached"
                 note = restart.restart_note(saved, RESTARTED)
-                self.assertIn("moved from claude3 to default because weekly limit reached", note)
+                self.assertIn("moved from claude3 to claude2 because weekly limit reached", note)
                 self.assertIn("account move, not a stop", note)
                 self.assertIn("Continue where you stopped", note)
-                command = restart.resume_command(owner, "default", "claude3", "weekly limit reached")
+                command = restart.resume_command(owner, "claude2", "claude3", "weekly limit reached")
                 arguments = shlex.split(command.removesuffix("; exec zsh"))
                 self.assertIn(note, arguments[-1])
                 if owner["kind"] == "showrunner":
@@ -1587,7 +1684,7 @@ class RestartTests(ShutdownTestCase):
         self.assertEqual(len(resume_commands), 3 if sys.platform == "linux" else 4)
         for command in resume_commands:
             if "--resume named-showrunner " in command:
-                self.assertIn("accounts.py exec default", command)
+                self.assertIn("accounts.py exec claude2", command)
                 self.assertNotIn(config_dir, command)
             else:
                 launcher = "claude"
@@ -3202,12 +3299,13 @@ class RestartTests(ShutdownTestCase):
                     self.assertEqual(cast(dict[str, object], json.loads(history[-1].read_text()))["progress"], {"kind": "restarted", "at": RESTARTED})
                     alert.assert_not_called()
                     fixer_policy = policy if isinstance(command_alerts, restart.AlertWhenNotBack) else "none"
-                    fixer.assert_called_once_with("owner", 912, "resumed-start", "Owner", fixer_policy)
+                    fixer.assert_called_once_with("owner", 912, "resumed-start", "Owner", fixer_policy, "Owner")
                     self.assertIn("turning it on in the background", output.getvalue())
 
     def test_remote_control_fixer_argv_carries_effective_alert_policy(self) -> None:
         self.allow_leaf(ShutdownSendLeaf.LAUNCH_REMOTE_CONTROL_FIXER)
-        saved = entry(top_level("owner", name="Owner"))
+        saved = entry(unit("owner"))
+        saved["session"]["name"] = "Owner"
         confirmed = restart.RegistryConfirmation((sessions.SessionRecord(pid=912,
             sessionId="owner", name="Owner", procStart="resumed-start",
             messagingSocketPath="", updatedAt=1, tmux="", formerNames=[]),))
@@ -3224,11 +3322,14 @@ class RestartTests(ShutdownTestCase):
                 argv = cast(list[str], launch.call_args.args[0])
                 self.assertEqual(argv[argv.index("--alerts") + 1], expected)
                 self.assertEqual(argv[argv.index("--pid") + 1], "912")
+                self.assertEqual(argv[argv.index("--who") + 1], "owner unit")
+                self.assertEqual(argv[argv.index("--session") + 1], "Owner")
                 self.assertEqual(argv[argv.index("--proc-start") + 1], "resumed-start")
                 alert.assert_not_called()
 
     def test_remote_control_launch_failure_prints_manual_action_and_only_alerts_when_allowed(self) -> None:
-        saved = entry(top_level("owner", name="Owner"))
+        saved = entry(unit("owner"))
+        saved["session"]["name"] = "Owner"
         confirmed = restart.RegistryConfirmation((sessions.SessionRecord(pid=912,
             sessionId="owner", name="Owner", procStart="resumed-start",
             messagingSocketPath="", updatedAt=1, tmux="", formerNames=[]),))
@@ -3239,12 +3340,15 @@ class RestartTests(ShutdownTestCase):
                     output = io.StringIO()
                     with (patch.object(restart, "wait_for_remote_control", return_value=frozenset()),
                           patch.object(remote_control, "launch_fixer", side_effect=OSError("service unavailable")) as launch,
-                          patch.object(remote_control, "alert_failed") as alert, redirect_stdout(output)):
+                          patch.object(settle, "alert_user") as alert, redirect_stdout(output)):
                         _ = restart.remote_control_missing([saved], confirmed, notify=notify)
-                    launch.assert_called_once_with("owner", 912, "resumed-start", "Owner", policy if notify else "none")
+                    launch.assert_called_once_with("owner", 912, "resumed-start", "owner unit", policy if notify else "none", "Owner")
                     self.assertEqual(output.getvalue(), "Owner: Remote Control is off; turn it on at its terminal with /remote-control\n")
                     if policy == "user" and notify:
-                        alert.assert_called_once_with("Owner")
+                        alert.assert_called_once()
+                        push = cast(RenderedPush, alert.call_args.args[0])
+                        self.assertEqual(push.title, "owner unit remote-control is off")
+                        self.assertEqual(push.message, "Session: Owner\nAction: run /remote-control\nReason: Remote control is off.")
                     else:
                         alert.assert_not_called()
 

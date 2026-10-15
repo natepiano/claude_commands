@@ -105,7 +105,7 @@ Tests: `scripts/production/test_merge_gate.py`, on scratch repos.
 ## Invariants
 
 - **No test reaches live state:** `~/.codex*`, `~/.local/state/`, `/tmp/claude/delegate/active/`, the live tmux server (real tmux only with a private `TMUX_TMPDIR`), the real `codex app-server`, and phone sends.
-  - Production quota tests supply `CodexAlertPassReadings` (`scripts/whoami/quota_alert.py`), and a patched `seats_home` raises on any fallback to a live Codex home.
+  - Production quota tests supply `CodexAlertPassReadings` (`scripts/whoami/quota_alert.py`), and a patched `workers_home` raises on any fallback to a live Codex home.
   - Sockets use private temp dirs or ephemeral ports. No test depends on a fixed port: the refused-start test binds an ephemeral port and closes it.
   - No test writes into the repo.
 - **No wall-clock thresholds.** A timing claim is a work count (launches in flight, subshells traced with a DEBUG trap, barrier arrivals), a controlled clock (token clock file, injected durations), or a comparison calibrated in the same run (buildlog report: CLI CPU at full and quarter log size, three runs each). Fixture deadlines are 300 s hang guards, never pass/fail limits.

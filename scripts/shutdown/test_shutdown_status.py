@@ -115,7 +115,7 @@ def session_shutdown(machine: str = "natedev", name: str = "shutdown") -> Sessio
         login=LOGIN, label="claude2", machine=machine,
         requested_at=old["requested_at"], requested_by=old["requested_by"], request_id="request-one",
         hold="account", then="stop", force=old["force"], alerts="user",
-        session=item["session"], seats=[], timers=item["timers"],
+        session=item["session"], workers=[], timers=item["timers"],
         settle_message=item["settle_message"], where=item["where"],
         progress=cast(record_store.SessionProgress, item["progress"]), stop_issues=[], trail=[],
     )
@@ -577,7 +577,7 @@ else:
         saved["progress"] = record_store.SessionHeldByUsageLimit(kind="held by usage limit", at=saved["requested_at"])
         saved["session"]["status"] = "idle"
         self.assertTrue(record_store.create_session(saved))
-        worker = inventory.parse_session({**saved["session"], "kind": "seat", "session_id": "worker",
+        worker = inventory.parse_session({**saved["session"], "kind": "worker", "session_id": "worker",
             "name": "worker", "status": "busy", "host": {"kind": "unknown"},
             "owner": {"kind": "director", "session_id": saved["session"]["session_id"]}}, "worker")
         report = empty_inventory()
@@ -597,7 +597,7 @@ else:
         saved = session_shutdown(name="owner")
         saved["settle_message"] = {"kind": "queued", "at": saved["requested_at"], "reason": "delivery pending"}
         self.assertTrue(record_store.create_session(saved))
-        worker = inventory.parse_session({**saved["session"], "kind": "seat", "session_id": "worker",
+        worker = inventory.parse_session({**saved["session"], "kind": "worker", "session_id": "worker",
             "name": "worker", "status": "busy", "host": {"kind": "unknown"},
             "owner": {"kind": "director", "session_id": saved["session"]["session_id"]}}, "worker")
         report = empty_inventory()

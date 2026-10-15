@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Move Claude sessions to another account the one way a showrunner does: pause first, then prove it.
 
-    showrunner_move.py session <session id|name> <claudeN>|default [--why <text>]
-    showrunner_move.py units|showrunners <claudeN>|default [--dry-run] [--why <text>]
+    showrunner_move.py session <session id|name> <claudeN> [--why <text>]
+    showrunner_move.py units|showrunners <claudeN> [--dry-run] [--why <text>]
 
 Units and showrunners are each one group on one account: `units` and `showrunners` select the
 group's account and move every live member that is not on it. Each move goes through
@@ -82,7 +82,7 @@ class CommandLine(argparse.Namespace):
 
 
 def target_dir(target: str) -> Path:
-    return accounts.main_config_dir() if target == "default" else accounts.account_dir(target)
+    return accounts.claude_account_dir(target)
 
 
 def live_names() -> dict[str, tuple[str, int]]:
@@ -99,7 +99,9 @@ def start(options: CommandLine, target: str) -> tuple[list[Started], list[str], 
             return [], [f"{options.rest[0]}: not moved: {moved.reason}"], []
         if isinstance(moved, accounts.MoveStartFailed):
             return [], [f"{options.rest[0]}: not moved: {(moved.stderr or moved.stdout).strip() or 'shutdown refused'}"], []
-        return [Started(moved.session_id, live.get(moved.session_id, (moved.session_id, 0))[0])], [], []
+        notes = [text for text in moved.stdout.splitlines()
+                 if text.startswith(("no fresh usage reading for ", "to move them back, in this terminal: "))]
+        return [Started(moved.session_id, live.get(moved.session_id, (moved.session_id, 0))[0])], [], notes
     group = options.kind
     moved_group = accounts.move_group(group, target, dry_run=options.dry_run, why=options.why)
     if isinstance(moved_group, accounts.MoveRefused):
@@ -108,7 +110,8 @@ def start(options: CommandLine, target: str) -> tuple[list[Started], list[str], 
         return [], [], list(moved_group.lines)
     printed = moved_group.stdout.splitlines()
     refused = [text for text in printed if UNREGISTERED in text]
-    notes = [text for text in printed if text == f"{group}: no live session moves"]
+    notes = [text for text in printed if text == f"{group}: no live session moves"
+             or text.startswith(("no fresh usage reading for ", "to move them back, in this terminal: "))]
     if isinstance(moved_group, accounts.GroupMoveStartFailed):
         refused += [f"{group}: {text}" for text in (moved_group.stderr or moved_group.stdout).strip().splitlines()
                     if UNREGISTERED not in text and text not in notes]

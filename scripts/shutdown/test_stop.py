@@ -175,15 +175,15 @@ def worker_session(
     pid: int,
     *,
     owner: str | None,
-) -> inventory.SeatSession:
+) -> inventory.WorkerSession:
     worker_owner: inventory.WorkerOwner = (
         inventory.DirectorOwner(kind="director", session_id=owner)
         if owner is not None
         else inventory.NoDirector(kind="no director")
     )
-    return inventory.SeatSession(
+    return inventory.WorkerSession(
         **common_session(session_id, session_id, pid),
-        kind="seat",
+        kind="worker",
         host=inventory.UnknownHost(kind="unknown"),
         owner=worker_owner,
     )
@@ -206,7 +206,7 @@ def entry(session: inventory.Session, progress: str = "ready") -> record.Session
         login=LOGIN, label=LABEL, machine="natedev", requested_at=NOW,
         request_id="request", requested_by=record.FromTerminal(kind="terminal"),
         hold="session", then="stop", force="wait for ready", alerts="none",
-        session=session, seats=[], timers=[], settle_message=record.SettleMessageNotSent(kind="not sent"),
+        session=session, workers=[], timers=[], settle_message=record.SettleMessageNotSent(kind="not sent"),
         where=record.WhereNotSaid(kind="not said"), progress=state, trail=[], stop_issues=[],
     )
 
@@ -261,7 +261,7 @@ class StopTests(ShutdownTestCase):
         return stop.stop_session(
             saved, kill=lambda _pid, _signal: None, is_alive=lambda _pid: False,
             session_record_exists=lambda _pid: False,
-            fresh_inventory=lambda _login, _only: machine_inventory([saved['session'], *saved['seats']]),
+            fresh_inventory=lambda _login, _only: machine_inventory([saved['session'], *saved['workers']]),
             clock=lambda: NOW_UTC, codex_mesh=lambda _args: 0,
             tmux=lambda args: 1 if args[0] == 'has-session' else 0,
             sleep=lambda _seconds: None,
@@ -349,7 +349,7 @@ class StopTests(ShutdownTestCase):
             with (
                 self.subTest(reason=reason),
                 patch.object(sessions, "live_sessions", return_value=[] if reason == "gone" else [registered]),
-                patch.object(inventory, "_registered_productions", return_value=({}, [])),
+                patch.object(inventory, "showrunner_registrations", return_value=inventory.ShowrunnerRegistrations(())),
                 patch.object(inventory, "_unit_sessions", return_value={}),
                 patch.object(inventory, "_active_run_directories", return_value={}),
                 patch.object(inventory, "_record_matches_process", return_value=reason != "process start mismatch"),
@@ -403,7 +403,7 @@ class StopTests(ShutdownTestCase):
         saved["progress"] = record.SessionHeldByUsageLimit(kind="held by usage limit", at=NOW)
         worker = worker_session("worker", 102, owner="owner")
         worker["status"] = "busy"
-        saved["seats"] = [worker]
+        saved["workers"] = [worker]
         self.create([saved])
         finished = stop.stop_session(saved,
             kill=lambda _pid, _sent: self.fail("busy worker owner received a signal"),
@@ -448,7 +448,7 @@ class StopTests(ShutdownTestCase):
         worker = worker_session('worker', 102, owner='owner')
         unrelated = worker_session('other', 103, owner='elsewhere')
         observed = stop.fresh_session(owner, machine_inventory([owner, worker, unrelated]))
-        self.assertEqual(observed, {'kind': 'matching session', 'session': owner, 'seats': [worker]})
+        self.assertEqual(observed, {'kind': 'matching session', 'session': owner, 'workers': [worker]})
         changed = copy.deepcopy(owner)
         changed['pid'] = 201
         self.assertEqual(stop.fresh_session(owner, machine_inventory([changed])), {'kind': 'session identity lost'})
@@ -458,11 +458,11 @@ class StopTests(ShutdownTestCase):
         saved = entry(top_level('owner', 101))
         worker = worker_session('worker', 102, owner='owner')
         worker['status'] = 'busy'
-        saved['seats'] = [worker]
+        saved['workers'] = [worker]
         self.create([saved])
         self.assertEqual(self.perform(saved)['progress']['kind'], 'stop failed')
         worker['status'] = 'idle'
-        saved['seats'] = [worker]
+        saved['workers'] = [worker]
         self.assertEqual(self.perform(saved)['progress']['kind'], 'stopped')
 
     def test_cancel_during_a_stop_claim_keeps_its_record_and_timers(self) -> None:

@@ -39,7 +39,7 @@ else:
 import stop as stop_work
 # The module settle imports by its own path entry: a separate object from the package import below.
 import showrunners as settle_showrunners
-from scripts.accounts import moves
+from scripts.accounts import accounts, moves
 import usage_store
 from scripts.production import showrunners
 from account import Account
@@ -179,15 +179,15 @@ def worker_session(
     *,
     owner: str | None,
     status: str = "idle",
-) -> inventory.SeatSession:
+) -> inventory.WorkerSession:
     worker_owner: inventory.WorkerOwner = (
         inventory.DirectorOwner(kind="director", session_id=owner)
         if owner is not None
         else inventory.NoDirector(kind="no director")
     )
-    return inventory.SeatSession(
+    return inventory.WorkerSession(
         **common_session(session_id, name, status=status),
-        kind="seat",
+        kind="worker",
         host=inventory.UnknownHost(kind="unknown"),
         owner=worker_owner,
     )
@@ -215,7 +215,7 @@ def session_shutdown(session: inventory.Session, *, progress: record.SessionProg
         login=LOGIN, label=LABEL, machine="natedev", requested_at=NOW, request_id=request_id,
         requested_by={"kind": "session", "session_id": requester} if requester else {"kind": "terminal"},
         hold="session", then=then, force="wait for ready", alerts="user", session=session,
-        seats=[], timers=[], settle_message={"kind": "not sent"}, where={"kind": "not said"},
+        workers=[], timers=[], settle_message={"kind": "not sent"}, where={"kind": "not said"},
         progress=progress or {"kind": "waiting"}, trail=[], stop_issues=[],
     )
 
@@ -339,14 +339,13 @@ class SettleTests(ShutdownTestCase):
         for push in pushes:
             self.assertEqual(push.id, "shutdown.holdout")
             self.assertIn(push.values["session"], push.title)
-            self.assertIn("stuck waiting", push.title)
+            self.assertIn("is blocked", push.title)
             self.assertIn(push.values["command"], push.body)
-            self.assertIn("Ghostty window, Writing desktop", push.body)
             self.assertIn("5 minutes", push.body)
             combined = push.body + " " + cast(ActionRequired, push.action).text
-            self.assertIn("in a terminal on natedev", combined.casefold())
+            self.assertIn("(on natedev)", combined.casefold())
             self.assertIn(f"now {LOGIN} --here --only {identities[push.values['session']]}", combined)
-            self.assertIn("pause at a safe point and say ready", push.body)
+            self.assertTrue(push.body.startswith(f"Reason: {push.values['operation']} is blocked because {push.values['session']}'s claude session is not answering, and it can't proceed.\n\n"))
             self.assertIn("Stop now (recommended)", push.body)
             self.assertIn("mid-step", push.body)
             self.assertIn("Uncommitted work stays", push.body)
@@ -402,7 +401,7 @@ class SettleTests(ShutdownTestCase):
                 errors = io.StringIO()
                 with patch.object(settle, "_warm", return_value=False), redirect_stderr(errors):
                     self.assertEqual(settle.down(account, here, ids, then=then, alerts=alerts,
-                        target=target, why=why, report=report), 1)
+                        target=target, why=why, report=report, origin=accounts.HandOrigin(), move_id=""), 1)
                 command = errors.getvalue().split("Then in a terminal on natedev: ", 1)[1].strip()
                 argv = shlex.split(command)
                 self.assertEqual(argv, ["~/.claude/scripts/lib/py", "~/.claude/scripts/shutdown/shutdown.py", *expected])
@@ -414,7 +413,7 @@ class SettleTests(ShutdownTestCase):
                 ):
                     self.assertEqual(shutdown.main(argv[2:]), 0)
                 request.assert_called_once_with(account, here, ids, then=then, alerts=alerts,
-                    requested_by=None, request_id="", target=target, why=why, report=report)
+                    requested_by=None, request_id="", target="claude3" if target else "", why=why, report=report, origin=accounts.HandOrigin(), move_id="")
                 if ids:
                     resolve.assert_called_once_with(LOGIN, ids, here=here)
                 else:
@@ -624,7 +623,7 @@ class SettleTests(ShutdownTestCase):
             saved = session_shutdown(owner)
             saved["settle_message"] = record.SettleMessageSent(kind="sent", at=NOW)
             if owner is first:
-                saved["seats"] = [worker]
+                saved["workers"] = [worker]
             self.save(saved)
         with (
             patch.object(settle, "inventory", return_value=machine_inventory([first, second, worker])) as read,
@@ -651,7 +650,7 @@ class SettleTests(ShutdownTestCase):
         registry.mkdir(parents=True, exist_ok=True)
         _ = (registry / f"{owner['pid']}.json").write_text(json.dumps(
             {**registered, "status": "busy", "cwd": str(self.root)}))
-        _ = self.enterContext(patch.object(inventory, "_registered_productions", return_value=({}, [])))
+        _ = self.enterContext(patch.object(inventory, "showrunner_registrations", return_value=inventory.ShowrunnerRegistrations(())))
         _ = self.enterContext(patch.object(inventory, "_unit_sessions", return_value={}))
         _ = self.enterContext(patch.object(inventory, "_active_run_directories", return_value={}))
         _ = self.enterContext(patch.object(inventory, "_newest_unit_plans", return_value={}))
@@ -790,6 +789,19 @@ class SettleTests(ShutdownTestCase):
         self.assertEqual(failed["move_id"], saved["request_id"])
         self.assertEqual(failed["reason"], "cancelled")
 
+    def test_cancelling_a_group_member_journals_the_transition_instead_of_its_attempt_id(self) -> None:
+        saved = session_shutdown(top_level("cancel-transition", "Cancelled group member"), then="restart")
+        saved.update(target="claude3", move_id="whole-group-transition")
+        self.save(saved)
+        with (patch.object(settle, "_retire_shutdown_messages"),
+              patch.object(settle, "send_message", return_value=settle.MessageSent(kind="sent")),
+              redirect_stdout(io.StringIO())):
+            self.assertEqual(settle.cancel(Account("claude", LOGIN, LABEL), True), 0)
+        entries = moves.read_moves()
+        self.assertEqual(len(entries), 1)
+        self.assertEqual(entries[0]["move_id"], "whole-group-transition")
+        self.assertNotEqual(entries[0]["move_id"], saved["request_id"])
+
     def test_cancel_suppresses_refusal_before_a_watcher_tick_after_withdrawal(self) -> None:
         from scripts.accounts import accounts, refusal_watch
         import agent_accounts
@@ -810,11 +822,11 @@ class SettleTests(ShutdownTestCase):
         with (patch.object(record, "withdraw_session", side_effect=withdraw_then_tick),
               patch.object(sessions, "live_sessions", return_value=[live]),
               patch.object(refusal_watch, "live_owners", return_value=[owner]),
-              patch.object(accounts, "account_identity", return_value=agent_accounts.KnownClaudeAccount(LOGIN, LABEL)),
+              patch.object(accounts, "account_identity", return_value=agent_accounts.NumberedAccount(LABEL, Path.home() / ".claude", LOGIN)),
               patch.object(accounts, "pick", return_value=accounts.PickedAccount("claude3", self.root / ".claude3",
                   80, accounts.NoResetKnown())),
               patch.object(accounts, "move_sessions", return_value=(
-                  accounts.SessionMoveRequested(owner["session_id"], "replacement", "claude3"),)) as move,
+                  accounts.SessionMoveRequested(owner["session_id"], "replacement", "claude3", source_login=LOGIN),)) as move,
               patch.object(settle, "_restore_record"), redirect_stdout(io.StringIO())):
             self.assertEqual(settle.cancel(Account("claude", LOGIN, LABEL), True), 0)
         self.assertEqual(len(ticks), 1)
@@ -826,7 +838,7 @@ class SettleTests(ShutdownTestCase):
         self.assertEqual(settle.conduct(login), 0)
 
     def matching(self, saved: record.SessionShutdown) -> stop_work.FreshSession:
-        return stop_work.MatchingSession(kind="matching session", session=saved["session"], seats=saved["seats"])
+        return stop_work.MatchingSession(kind="matching session", session=saved["session"], workers=saved["workers"])
 
     def write_owner_pane(self, owner: inventory.Session, tmux: str, *, identity: str = "") -> None:
         directory = self.root / "sessions"
@@ -972,9 +984,9 @@ class SettleTests(ShutdownTestCase):
         saved = session_shutdown(top_level("owner", "Owner"), progress=record.SessionHeldByUsageLimit(kind="held by usage limit", at=NOW))
         with patch.object(settle, "_showing_form", return_value=True) as form:
             self.assertIsInstance(settle.next_step(saved, self.matching(saved), [], NOW_UTC), settle.StopSession)
-            saved["seats"] = [worker_session("worker", "Worker", owner="owner", status="busy")]
+            saved["workers"] = [worker_session("worker", "Worker", owner="owner", status="busy")]
             self.assertEqual(settle.next_step(saved, self.matching(saved), [], NOW_UTC), settle.Hold("Codex worker Worker is still running"))
-            saved["seats"] = []
+            saved["workers"] = []
             saved["session"]["status"] = "busy"
             self.assertIsInstance(settle.next_step(saved, self.matching(saved), [], NOW_UTC), settle.Hold)
             saved["session"]["status"] = "idle"
@@ -992,8 +1004,8 @@ class SettleTests(ShutdownTestCase):
     def test_one_conduct_pass_stops_limit_waiting_owner_and_ordinary_ready_owner(self) -> None:
         held = session_shutdown(top_level("held", "Held"))
         ordinary = session_shutdown(top_level("ordinary", "Ordinary"), progress={"kind": "ready", "at": NOW})
-        held["seats"] = [worker_session("held-worker", "Held worker", owner="held")]
-        ordinary["seats"] = [worker_session("ordinary-worker", "Ordinary worker", owner="ordinary")]
+        held["workers"] = [worker_session("held-worker", "Held worker", owner="held")]
+        ordinary["workers"] = [worker_session("ordinary-worker", "Ordinary worker", owner="ordinary")]
         self.save(held)
         self.save(ordinary)
         seen: list[str] = []
@@ -1006,7 +1018,7 @@ class SettleTests(ShutdownTestCase):
             self.assertEqual(saved["progress"]["kind"], "held by usage limit" if saved["session"]["session_id"] == "held" else "ready")
             seen.append(saved["session"]["session_id"])
             return self.fake_stop(saved)
-        report = machine_inventory([held["session"], ordinary["session"], *held["seats"], *ordinary["seats"]])
+        report = machine_inventory([held["session"], ordinary["session"], *held["workers"], *ordinary["workers"]])
         with patch.object(settle, "run_inventory", return_value=report) as observe, patch.object(settle, "_screen", side_effect=screen), patch.object(stop_work, "stop_session", side_effect=stop), patch.object(settle, "send_message") as sender, patch.object(settle, "report_stop"):
             self.assertEqual(settle.conduct(LOGIN), 0)
         self.assertCountEqual(seen, ["held", "ordinary"])
@@ -1075,14 +1087,14 @@ class SettleTests(ShutdownTestCase):
 
     def test_held_owner_has_no_holdout_alert_and_done_requires_stop_or_restart(self) -> None:
         saved = session_shutdown(top_level("owner", "Owner"), progress=record.SessionHeldByUsageLimit(kind="held by usage limit", at=NOW))
-        saved["seats"] = [worker_session("worker", "Worker", owner="owner", status="busy")]
+        saved["workers"] = [worker_session("worker", "Worker", owner="owner", status="busy")]
         self.save(saved)
         self.assertFalse(settle._done(saved))  # pyright: ignore[reportPrivateUsage]
         at = NOW_UTC + settle.NOT_ANSWERING_AFTER + timedelta(seconds=1)
         self.assertFalse(settle._reserve_holdout_alert(saved, at))  # pyright: ignore[reportPrivateUsage]
         def end_pass(_seconds: float) -> None:
             raise PassObserved()
-        with patch.object(settle, "now_utc", return_value=at), patch.object(settle, "_screen", return_value=settle.ScreenText("wait for limit to reset")), patch.object(settle, "run_inventory", return_value=machine_inventory([saved["session"], *saved["seats"]])), patch.object(settle, "alert_user") as alert, patch.object(settle, "send_message") as sender, patch.object(time, "sleep", side_effect=end_pass), self.assertRaises(PassObserved):
+        with patch.object(settle, "now_utc", return_value=at), patch.object(settle, "_screen", return_value=settle.ScreenText("wait for limit to reset")), patch.object(settle, "run_inventory", return_value=machine_inventory([saved["session"], *saved["workers"]])), patch.object(settle, "alert_user") as alert, patch.object(settle, "send_message") as sender, patch.object(time, "sleep", side_effect=end_pass), self.assertRaises(PassObserved):
             _ = settle.conduct(LOGIN)
         alert.assert_not_called()
         sender.assert_not_called()
@@ -1286,6 +1298,36 @@ class SettleTests(ShutdownTestCase):
         self.assertEqual(len(saved), 2)
         self.assertTrue(all(item.get("target") == "claude3" for item in saved))
 
+    def test_down_journals_the_supplied_origin_without_inheriting_a_stored_account_refusal(self) -> None:
+        from scripts.accounts import accounts, refusals
+        reset = NOW_UTC + timedelta(days=2)
+        refusals.write_refusal(refusals.AccountRefusal("claude", LOGIN,
+            refusals.KnownWindow("weekly"), refusals.KnownReset(reset), NOW_UTC))
+        for refused in (False, True):
+            identity = "origin-" + str(refused)
+            owner = top_level(identity, identity)
+            origin: accounts.MoveOrigin = accounts.RefusalOrigin("weekly", accounts.KnownReset(reset)) if refused else accounts.HandOrigin()
+            with (self.subTest(refused=refused), patch.object(settle, "_warm", return_value=True),
+                  patch.object(settle, "inventory", return_value=machine_inventory([owner])),
+                  patch.object(settle, "run_inventory", return_value=machine_inventory([owner])),
+                  patch.object(settle, "_launch_conductor"),
+                  patch.object(settle, "send_message", return_value=settle.MessageSent(kind="sent")),
+                  redirect_stdout(io.StringIO())):
+                self.assertEqual(settle.down(Account("claude", LOGIN, LABEL), True, [identity], then="restart",
+                    target="claude3", origin=origin, move_id="group-" + identity), 0)
+            saved = record.find_session(LOGIN, identity)
+            assert saved is not None
+            self.assertEqual(saved.get("move_id"), "group-" + identity)
+            requests = [entry for entry in moves.read_moves() if entry["kind"] == "requested" and entry["subject"].startswith(identity + ":")]
+            self.assertEqual(len(requests), 1)
+            self.assertEqual(requests[0]["move_id"], saved.get("move_id"))
+            self.assertEqual(requests[0].get("cause"), "refusal" if refused else "by hand")
+            self.assertEqual(requests[0]["window"], "weekly" if refused else "unknown")
+            if refused:
+                self.assertEqual(requests[0].get("reset"), reset.isoformat())
+            else:
+                self.assertNotIn("reset", requests[0])
+
     def test_down_to_persists_source_label_and_explicit_reason_beside_each_new_target(self) -> None:
         with (
             patch.object(settle, "run_inventory", return_value=machine_inventory([top_level("owner", "Owner")])),
@@ -1303,7 +1345,7 @@ class SettleTests(ShutdownTestCase):
             patch.object(settle, "run_inventory", return_value=machine_inventory([top_level("owner", "Owner")])),
             redirect_stdout(io.StringIO()),
         ):
-            saved = settle.begin(LOGIN, only=["owner"], request_id="move", then="restart", target="default")
+            saved = settle.begin(LOGIN, only=["owner"], request_id="move", then="restart", target="claude2")
         self.assertEqual(saved[0].get("why"), f"{LABEL} is out of usage")
         self.assertEqual(saved[0].get("source_label"), LABEL)
 
@@ -1342,10 +1384,10 @@ class SettleTests(ShutdownTestCase):
             redirect_stdout(io.StringIO()),
         ):
             self.assertEqual(settle.down(Account("claude", LOGIN, LABEL), False, ["remote"],
-                then="restart", target="default", why="weekly limit reached", requested_by="requester", request_id="move-request"), 0)
+                then="restart", target="claude2", why="weekly limit reached", requested_by="requester", request_id="move-request"), 0)
         arguments = cast(list[str], peer.call_args.args[0])
         self.assertEqual(arguments[:3], ["down", LOGIN, "--here"])
-        self.assertEqual(arguments[arguments.index("--to") + 1], "default")
+        self.assertEqual(arguments[arguments.index("--to") + 1], "claude2")
         self.assertEqual(arguments[arguments.index("--why") + 1], "weekly limit reached")
         self.assertEqual(arguments[arguments.index("--only") + 1], "remote")
         self.assertEqual(arguments[arguments.index("--requested-by") + 1], "requester")
@@ -1373,7 +1415,7 @@ class SettleTests(ShutdownTestCase):
         with patch.object(settle, "run_inventory", return_value=machine_inventory([first, worker, orphan])):
             added = settle.begin(LOGIN, only=["first"], request_id="one")
         self.assertEqual(len(added), 1)
-        self.assertEqual(added[0]["seats"], [worker])
+        self.assertEqual(added[0]["workers"], [worker])
         original = record.find_session(LOGIN, "first")
         with patch.object(settle, "run_inventory", return_value=machine_inventory([first, second])):
             added = settle.begin(LOGIN, only=["first", "second"], request_id="two", then="restart")
@@ -2279,7 +2321,7 @@ class SettleTests(ShutdownTestCase):
         self.assertTrue(all(push.id == "shutdown.holdout" for push in pushes))
         self.assertIn("Busy", cast(str, sender.call_args.args[2]))
 
-    def test_holdout_alert_uses_the_recorded_tmux_window_name(self) -> None:
+    def test_holdout_alert_names_the_session_and_machine_for_the_command(self) -> None:
         owner = top_level("form", "Display name")
         owner["host"] = inventory.TmuxHost(kind="tmux", tmux_session="Actual terminal",
             server=inventory.TmuxServerNotRecorded(kind="not recorded"),
@@ -2289,7 +2331,8 @@ class SettleTests(ShutdownTestCase):
             settle._send_holdout_alert([(saved, "showing a form")])  # pyright: ignore[reportPrivateUsage]
         push = cast(RenderedPush, alert.call_args.args[0])
         self.assertEqual(push.values["session"], "Display name")
-        self.assertIn("Actual terminal", push.body)
+        self.assertTrue(push.message.startswith("Session: Display name\nAction: "))
+        self.assertIn("(on natedev)", push.body)
 
     def test_pending_scheduled_jobs_remain_in_session_reports_without_a_phone_alert(self) -> None:
         saved = session_shutdown(top_level("owner", "Owner"), progress={"kind": "timers pending", "at": NOW, "timers": []}, requester="requester")
@@ -2680,7 +2723,7 @@ class SettleTests(ShutdownTestCase):
                 self.assertIn("Restored: Remote Control not on yet;", output.getvalue())
                 self.assertIsNone(record.find_session(LOGIN, restored["session"]["session_id"]))
                 alert.assert_not_called()
-                fixer.assert_called_once_with("restored-" + policy, 912, "resumed-start", "Restored", policy)
+                fixer.assert_called_once_with("restored-" + policy, 912, "resumed-start", "Restored", policy, "Restored")
                 self.assertIn("turning it on in the background", output.getvalue())
                 record.archive_session(LOGIN, other["session"]["session_id"])
 
@@ -2759,8 +2802,8 @@ class SettleTests(ShutdownTestCase):
         push = cast(RenderedPush, alert.call_args.args[0])
         self.assertIn("Held", push.title)
         self.assertIn("Shutdown", push.title)
-        self.assertIn("stuck waiting", push.title)
-        self.assertIn("in a terminal on mac", cast(ActionRequired, push.action).text.casefold())
+        self.assertIn("is blocked", push.title)
+        self.assertIn("(on mac)", push.body.casefold())
         self.assertIn(f"now {LOGIN} --here --only held", cast(str, sender.call_args.args[2]))
 
 

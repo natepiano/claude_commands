@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from scripts.whoami.note_file import NumberedAccountLabel, note_name, parse_account_label
+from scripts.whoami import agent_accounts
 
 import argparse
 import fcntl
@@ -213,7 +214,7 @@ class AddUnitTests(ShutdownTestCase):
                     "CODEX_CATALOG_SYNC_STATE_FILE": str(sync_state)}
         _ = self.env.pop("CLAUDE_CONFIG_DIR", None)
         self.quota_reading("owner@example.com", 80, 7)
-        _ = self.select_unit_account("default")
+        _ = self.select_unit_account("claude2")
 
     def quota_reading(self, login: str, left: float, reset_days: float) -> None:
         file = Path(self.env["HOME"]) / ".local/state/agent-notes/usage.json"
@@ -228,8 +229,8 @@ class AddUnitTests(ShutdownTestCase):
         with patch.dict(os.environ, self.env):
             path = accounts.groups_file()
             path.parent.mkdir(parents=True, exist_ok=True)
-            _ = path.write_text(json.dumps({"units": label, "showrunners": "default"}))
-            return accounts.main_config_dir() if label == "default" else accounts.account_dir(label)
+            _ = path.write_text(json.dumps({"units": label, "showrunners": "claude2"}))
+            return accounts.main_config_dir() if label == "claude2" else accounts.account_dir(label)
 
     def trusted_projects(self) -> dict[str, dict[str, bool]]:
         return {str(folder): {"hasTrustDialogAccepted": True}
@@ -246,7 +247,7 @@ class AddUnitTests(ShutdownTestCase):
                 result = self.cli("alpha", "--brief", "Add a feature", *mode)
                 self.assertEqual(result.returncode, 2, (result.stdout, result.stderr))
                 folder = self.root / "project-alpha"
-                self.assertIn(f"alpha-unit: Claude is not trusted in {folder} on default account. Run: "
+                self.assertIn(f"alpha-unit: Claude is not trusted in {folder} on claude2. Run: "
                               + f"cd {shlex.quote(str(self.checkout))} && "
                               + "env -u CLAUDE_CONFIG_DIR -u CLAUDE_CODE_REMOTE_MEMORY_DIR claude", result.stderr)
                 self.assert_no_launch_change(document, head)
@@ -276,7 +277,7 @@ class AddUnitTests(ShutdownTestCase):
         output = io.StringIO()
         errors = io.StringIO()
         with (patch.dict(os.environ, self.env), redirect_stdout(output), redirect_stderr(errors),
-              patch.object(accounts, "role_account", return_value=selected),
+              patch.object(add_unit, "account_for_launch", return_value=selected),
               patch.object(launch_permission, "launch_permission",
                            return_value=launch_permission.AllowedByShutdownState())):
             code = add_unit.main(["--production", str(self.doc), "alpha", "--brief", "Add a feature"])
@@ -293,7 +294,7 @@ class AddUnitTests(ShutdownTestCase):
         document = self.doc.read_text()
         head = self.git("rev-parse", "HEAD")
         result = self.cli("alpha", "--plan", "docs/plans/given.md", "--resume", "session-123",
-                          "--cwd", str(prior), "--account", "default")
+                          "--cwd", str(prior), "--account", "claude2")
         self.assertEqual(result.returncode, 2, (result.stdout, result.stderr))
         self.assertIn(f"Claude is not trusted in {prior}", result.stderr)
         self.assert_no_launch_change(document, head)
@@ -624,7 +625,7 @@ class AddUnitTests(ShutdownTestCase):
             _selected: accounts.ClaudeLaunchAccount,
             *, target: str = "", model: str = "",
         ) -> None:
-            self.assertEqual(target, "default" if isinstance(_request.session, add_unit.ResumedSession) else "")
+            self.assertEqual(target, "claude2" if isinstance(_request.session, add_unit.ResumedSession) else "")
             self.assertEqual(model, "")
             if isinstance(launch_kind, add_unit.UnitRestoreLaunch):
                 recorded = self.recorded_prompts(launch_kind.session_id)
@@ -1040,7 +1041,7 @@ class AddUnitTests(ShutdownTestCase):
             "then": "stop",
             "force": old["force"],
             "alerts": "user",
-            "seats": [],
+            "workers": [],
             **owner,
         }
         creator: subprocess.Popen[str] | None = None
@@ -1071,7 +1072,7 @@ class AddUnitTests(ShutdownTestCase):
             _selected: accounts.ClaudeLaunchAccount,
             *, target: str = "", model: str = "",
         ) -> None:
-            self.assertEqual(target, "default" if isinstance(_request.session, add_unit.ResumedSession) else "")
+            self.assertEqual(target, "claude2" if isinstance(_request.session, add_unit.ResumedSession) else "")
             self.assertEqual(model, "")
             self.assertIsNotNone(creator)
             if creator is None:
@@ -1587,8 +1588,8 @@ class AddUnitTests(ShutdownTestCase):
             "--resume", "session-123", "--cwd", str(prior), "--config-dir", str(directory))
         self.assertNotEqual(result.returncode, 0)
         self.assertEqual(len(result.stderr.splitlines()), 1)
-        self.assertIn("units account is default", result.stderr)
-        self.assertIn("--account and --config-dir must name default", result.stderr)
+        self.assertIn("units account is claude2", result.stderr)
+        self.assertIn("--account and --config-dir must name claude2", result.stderr)
         self.assertEqual(self.repository_state(), before)
         self.assertEqual(self.events("systemd-run"), [])
 
@@ -1961,7 +1962,7 @@ class AddUnitTests(ShutdownTestCase):
         self.assertEqual(args[args.index("-c") + 1], str(prior))
         command = args[-1]
         self.assertTrue(command.startswith("unset CLAUDE_CONFIG_DIR CLAUDE_CODE_REMOTE_MEMORY_DIR CLAUDE_CODE_OAUTH_TOKEN; ENABLE_TOOL_SEARCH=true command "))
-        self.assertIn("accounts.py exec default", command)
+        self.assertIn("accounts.py exec claude2", command)
         self.assertNotIn("CLAUDE_CONFIG_DIR=", command)
         self.assertIn("--model opus --effort xhigh --resume session-123 --remote-control alpha -n alpha", command)
         self.assert_director_flags("opus", "xhigh")
@@ -2088,7 +2089,7 @@ class AddUnitTests(ShutdownTestCase):
 
         command = tmux[-1]
         self.assertTrue(command.startswith("unset CLAUDE_CONFIG_DIR CLAUDE_CODE_REMOTE_MEMORY_DIR CLAUDE_CODE_OAUTH_TOKEN; ENABLE_TOOL_SEARCH=true command "))
-        self.assertIn("accounts.py exec default", command)
+        self.assertIn("accounts.py exec claude2", command)
         self.assertNotIn("CLAUDE_CONFIG_DIR=", command)
         encoded = command.split(" command ", 1)[1].rsplit("; exec zsh", 1)[0]
         claude = shlex.split(encoded)
@@ -2393,6 +2394,7 @@ class AdoptAccountTests(unittest.TestCase):
              patch.object(unit_lookup, "tmux_claude", return_value=claude), \
              patch("scripts.whoami.account.process_config_dir", return_value=folder), \
              patch.object(accounts, "main_config_dir", return_value=Path("/home/someone/.claude")), \
+             patch.object(accounts, "account_identity", return_value=agent_accounts.NumberedAccount("claude2", Path("/home/someone/.claude"), "owner@example.invalid")), \
              patch.object(accounts, "checked_named_accounts", return_value=named):
             return add_unit.adoptable(cast(add_unit.RequestedUnitLaunch, cast(object, None)), "nightly-review")
 
@@ -2403,7 +2405,7 @@ class AdoptAccountTests(unittest.TestCase):
 
     def test_a_session_on_the_main_folder_is_adopted_on_the_default_account(self) -> None:
         adopted = self.adopted(Path("/home/someone/.claude"), [])
-        self.assertEqual(cast(add_unit.Adoptable, adopted).account, accounts.DefaultAccount())
+        self.assertEqual(cast(add_unit.Adoptable, adopted).account, accounts.NamedAccount("claude2", Path("/home/someone/.claude")))
 
     def test_a_session_on_no_fit_account_is_refused(self) -> None:
         with self.assertRaises(add_unit.Refusal) as refused:

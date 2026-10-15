@@ -33,7 +33,8 @@ from typing import NotRequired, TypedDict, cast
 import review
 import push_texts
 from user_action import (FIX, REFUSED_BEFORE_SENDING, ActionAllowed, ActionRefused, ActionRequired,
-                         ActionUnstated, UserAction, first_line, parse_user_action, refused_at)
+                         ActionUnstated, UserAction, first_line, parse_user_action, refused_at,
+                         NotificationSession, NO_SESSION_LINE, split_session, session_prefix)
 
 API_URL = "https://api.pushover.net/1/messages.json"
 KEYS_FILE = Path.home() / ".config" / "pushover" / "env"
@@ -151,6 +152,7 @@ class Arguments(TypedDict):
     title: str
     message: str
     text_id: str
+    session: NotificationSession
 
 
 def parse(argv: list[str]) -> Arguments | None:
@@ -194,6 +196,7 @@ def parse(argv: list[str]) -> Arguments | None:
         else:
             action = value
         index += 2
+    session: NotificationSession = NO_SESSION_LINE
     positionals = argv[index:]
     if text_id:
         try:
@@ -207,11 +210,15 @@ def parse(argv: list[str]) -> Arguments | None:
         action = rendered.action.text if isinstance(rendered.action, ActionRequired) else None
         no_action = action is None
         positionals = [rendered.title, rendered.body]
+        session = rendered.session
     elif values:
         return None
     if len(positionals) != 2 or not all(value.strip() for value in positionals):
         return None
+    if not text_id:
+        session, positionals[1] = split_session(positionals[1])
     return {
+        "session": session,
         "priority": priority,
         "source": source,
         "action": action,
@@ -223,13 +230,13 @@ def parse(argv: list[str]) -> Arguments | None:
     }
 
 
-def trimmed_body(action: UserAction, message: str) -> str:
-    body_limit = max(MESSAGE_MAX - len(first_line(action)) - 1, 0)
+def trimmed_body(action: UserAction, message: str, session: NotificationSession = NO_SESSION_LINE) -> str:
+    body_limit = max(MESSAGE_MAX - len(first_line(action, session)) - 1, 0)
     return message[:body_limit]
 
 
-def posted_message(action: UserAction, message: str) -> str:
-    return f"{first_line(action)}\n{trimmed_body(action, message)}"
+def posted_message(action: UserAction, message: str, session: NotificationSession = NO_SESSION_LINE) -> str:
+    return f"{first_line(action, session)}\n{trimmed_body(action, message, session)}"
 
 
 def refuse(source: str, priority: str, title: str, message: str, reason: str) -> int:
@@ -253,17 +260,20 @@ def send(argv: list[str], keys_file: Path = KEYS_FILE, post: Post = http_post) -
         return refuse(source, priority, title, message, action.reason)
     if isinstance(action, ActionUnstated):
         return refuse(source, priority, title, message, "no action stated")
-    if isinstance(action, ActionRequired) and len(action.text) > ACTION_TEXT_MAX:
+    action_limit = max(ACTION_TEXT_MAX - len(session_prefix(arguments["session"])), 0)
+    if isinstance(action, ActionRequired) and len(action.text) > action_limit:
         return refuse(source, priority, title, message,
-                      f"--action may hold at most {ACTION_TEXT_MAX} characters")
+                      f"--action may hold at most {action_limit} characters")
+    if len(first_line(action, arguments["session"])) + 1 > MESSAGE_MAX:
+        return refuse(source, priority, title, message, "Session and action exceed the message limit")
     match refused_at(action, int(priority)):
         case ActionRefused(reason):
             return refuse(source, priority, title, message, reason)
         case ActionAllowed():
             pass
     draft = review.Draft(source, priority, title, action,
-                         trimmed_body(action, arguments["message"]),
-                         arguments["answerable"])
+                         trimmed_body(action, arguments["message"], arguments["session"]),
+                         arguments["answerable"], arguments["session"])
     claimed = False
     try:
         found = review.NoHold() if arguments["text_id"] else review.held_for(source)
@@ -335,7 +345,7 @@ def send(argv: list[str], keys_file: Path = KEYS_FILE, post: Post = http_post) -
     if code == 0 and isinstance(outcome, (review.Rewritten, review.Questions)):
         print("pushover: sent as rewritten:")
         print(version.title)
-        print(first_line(version.action))
+        print(first_line(version.action, version.session))
         print(version.body)
     return code
 
@@ -356,7 +366,7 @@ def deliver(draft: review.Draft, keys_file: Path = KEYS_FILE,
             post: Post = http_post, *, detail: str = "") -> int:
     """Post an already reviewed version, including expiry sends; do not review again."""
     source, priority, title = draft.source, draft.priority, draft.title
-    message = posted_message(draft.action, draft.body)
+    message = posted_message(draft.action, draft.body, draft.session)
     suffix = f", {detail}" if detail else ""
     keys = read_keys(keys_file)
     if keys is None:

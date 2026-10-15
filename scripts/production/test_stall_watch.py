@@ -16,6 +16,8 @@ from pathlib import Path
 from typing import TYPE_CHECKING, cast, override
 from zoneinfo import ZoneInfo
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
 if TYPE_CHECKING:
     from herdr import SessionListResult
 
@@ -564,6 +566,40 @@ raise SystemExit(1 if record['to'] in fail else 0)
                 _ = self.tick(START + 300)
                 self.assertEqual(len(self.sent()), bumps)
                 _ = self.process_rows.pop()
+
+    def test_detached_work_with_a_former_production_mark_prevents_a_bump(self) -> None:
+        doc = self.root / "showrunner-production.md"
+        _ = doc.write_text("## Production Context\n\n- **Formerly:** `old-showrunner`\n\n" + doc.read_text())
+        self.panes["unit-one"]["slug"] = "old-showrunner"
+        worker = subprocess.Popen(["sleep", "60"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                  env={**self.environment, "SHOWRUNNER_UNIT": "old-showrunner",
+                                       "SHOWRUNNER_UNIT_ID": "unit-one"})
+        self.children.append(worker)
+        self.process_rows.append(f"{worker.pid} 1 sleep 60")
+        for at in (START, START + 300):
+            result = self.tick(at)
+            self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.sent(), [])
+        _ = self.process_rows.pop()
+        result = self.tick(START + 600)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual({item["key"].rsplit(":", 1)[-1] for item in self.sent()}, {"bump", "tell"})
+
+    def test_detached_processes_share_one_slug_resolution_per_work_check(self) -> None:
+        import stall_watch
+        import showrunners
+
+        doc = self.root / "showrunner-production.md"
+        _ = doc.write_text("## Production Context\n\n- **Formerly:** `old-showrunner`\n\n" + doc.read_text())
+        rows = [stall_watch.Process(10, 1, "claude"), stall_watch.Process(20, 1, "build"),
+                stall_watch.Process(21, 1, "build")]
+        with (mock.patch.object(showrunners, "NOTIFIER_STATE_DIR", self.notifier),
+              mock.patch.object(stall_watch, "unit_marks", return_value=("old-showrunner", "unit-one")),
+              mock.patch.object(showrunners, "checked_doc", wraps=showrunners.checked_doc) as reads):
+            self.assertFalse(stall_watch.work_running(10, rows, ("unrelated", "unit-one")))
+            self.assertEqual(reads.call_count, 1)
+            self.assertTrue(stall_watch.work_running(10, rows, ("showrunner", "unit-one")))
+            self.assertEqual(reads.call_count, 2)
 
     def test_recent_transcript_or_subagent_activity_prevents_a_bump(self) -> None:
         _ = self.tick(START)
