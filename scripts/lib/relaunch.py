@@ -120,7 +120,7 @@ def run(argv: list[str]) -> int:
             _ = signal.signal(number, ignore)
         for number in (signal.SIGTERM, signal.SIGHUP):
             _ = signal.signal(number, forward)
-        child = subprocess.Popen(argv)
+        child = subprocess.Popen(argv, env={**os.environ, "RELAUNCH_SUPERVISED": "1"})
         code = child.wait()
     finally:
         for number, handler in previous.items():

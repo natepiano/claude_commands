@@ -349,7 +349,7 @@ class StopTests(ShutdownTestCase):
             with (
                 self.subTest(reason=reason),
                 patch.object(sessions, "live_sessions", return_value=[] if reason == "gone" else [registered]),
-                patch.object(inventory, "_registered_productions", return_value=({}, [])),
+                patch.object(inventory, "showrunner_registrations", return_value=inventory.ShowrunnerRegistrations(())),
                 patch.object(inventory, "_unit_sessions", return_value={}),
                 patch.object(inventory, "_active_run_directories", return_value={}),
                 patch.object(inventory, "_record_matches_process", return_value=reason != "process start mismatch"),
