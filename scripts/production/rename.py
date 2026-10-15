@@ -9,6 +9,9 @@ import re
 import shlex
 import subprocess
 import sys
+import time
+from contextlib import contextmanager
+from collections.abc import Generator
 from dataclasses import dataclass
 from pathlib import Path
 from typing import NamedTuple, cast
@@ -18,6 +21,7 @@ import add_unit  # noqa: E402
 import showrunners  # noqa: E402
 import stall_watch  # noqa: E402
 import tidy_wrapped  # noqa: E402
+import unit_lookup  # noqa: E402
 from rename_state import RenameRefused, _read_json, _write_json, _write_lines  # pyright: ignore[reportPrivateUsage]
 
 REVIEW_POOL_STATE = Path(os.environ.get("REVIEW_POOL_STATE") or Path.home() / ".local/state/review-pool")
@@ -464,19 +468,333 @@ def apply(old: str, new: str) -> RenamePlan:
     return result
 
 
+@contextmanager
+def _rename_journal(new: str) -> Generator[tuple[RenamePlan, dict[str, object]]]:
+    new = showrunners.canonical_slug(new)
+    _validate_slug(new)
+    path = tidy_wrapped.owned_paths(new)[-1] / "rename.json"
+    if not path.exists():
+        raise RenameRefused(f"{new} has no rename journal")
+    with (path.parent / "rename.lock").open("a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        result, completed = _load(path, new, new)
+        if completed != 7:
+            raise RenameRefused(f"{new}: apply must complete step 7 first")
+        yield result, _object(_read_json(path))
+
+
+def _unit_row(plan: RenamePlan, name: str) -> dict[str, str]:
+    rows = [row for row in add_unit.unit_table(plan.new_doc.read_text(encoding="utf-8").splitlines())
+            if add_unit.cell_value(row.get("Unit", "")) == name]
+    if len(rows) != 1:
+        raise RenameRefused(f"{name}: expected one Units row")
+    if add_unit.plan_cell_is_retired(rows[0].get("Plan", "")):
+        raise RenameRefused(f"{name} is retired and has no live worktree")
+    return rows[0]
+
+
+def _stopped_unit(plan: RenamePlan, name: str) -> None:
+    try:
+        found = unit_lookup.marked_units(plan.new, every_host=True).get(name)
+    except OSError as error:
+        raise RenameRefused(f"{name}: cannot tell whether Claude is running: {error}") from error
+    state = found.claude if found else unit_lookup.ClaudeNotRunning()
+    if isinstance(state, unit_lookup.LiveClaude):
+        raise RenameRefused(f"{name} has a live Claude; wait until its run stops")
+    if isinstance(state, unit_lookup.ClaudeUnknown):
+        raise RenameRefused(f"{name}: cannot tell whether Claude is running: {state.reason}")
+
+
+def _branch_tip(checkout: Path, branch: str) -> str:
+    return _git(checkout, "for-each-ref", "--format=%(objectname)", f"refs/heads/{branch}")
+
+
+def _remote_tip(checkout: Path, branch: str) -> str:
+    listed = _git(checkout, "ls-remote", "--heads", "origin", f"refs/heads/{branch}")
+    return listed.split("\t", 1)[0] if listed else ""
+
+
+def _delete_remote_branch(plan: RenamePlan, branch: str, tip: str) -> None:
+    remote = _remote_tip(plan.checkout, branch)
+    if remote:
+        if remote != tip:
+            try:
+                _ = _git(plan.checkout, "merge-base", "--is-ancestor", remote, tip)
+            except RenameRefused as error:
+                raise RenameRefused(f"origin branch {branch} has history outside the preserved tip") from error
+        _ = _git(plan.checkout, "push", "origin", "--delete", branch)
+
+
+def _delete_local_branch(plan: RenamePlan, branch: str, tip: str) -> None:
+    local = _branch_tip(plan.checkout, branch)
+    if local:
+        if local != tip:
+            raise RenameRefused(f"branch {branch} moved during the rename")
+        _ = _git(plan.checkout, "branch", "-D", "--", branch)
+
+
+def _delete_branch(plan: RenamePlan, branch: str, tip: str) -> None:
+    _delete_remote_branch(plan, branch, tip)
+    _delete_local_branch(plan, branch, tip)
+
+
+def _prepare_unit(plan: RenamePlan, name: str, row: dict[str, str]) -> dict[str, object]:
+    for field in ("Worktree", "Branch"):
+        if field not in row:
+            raise RenameRefused(f"{name}: Units table lacks {field} column")
+    branch = add_unit.cell_value(row.get("Branch", ""))
+    if not branch.startswith(plan.old + "-"):
+        raise RenameRefused(f"{name}: branch {branch} does not start with {plan.old}-")
+    stem = branch[len(plan.old) + 1:]
+    worktree = Path(add_unit.cell_value(row.get("Worktree", ""))).expanduser().resolve()
+    if not (worktree / ".git").is_file():
+        raise RenameRefused(f"{name}: no linked worktree at {worktree}")
+    new_branch = f"{plan.new}-{stem}"
+    if _branch_tip(plan.checkout, new_branch) or _remote_tip(plan.checkout, new_branch):
+        raise RenameRefused(f"branch {new_branch} already exists")
+    suffix = f"-{plan.old}-{stem}"
+    repository = (worktree.name[:-len(suffix)] if worktree.name.endswith(suffix) else plan.checkout.name)
+    basename = f"{repository}-{plan.new}-{stem}"
+    destination = worktree.with_name(basename)
+    if _exists(destination):
+        raise RenameRefused(f"destination already exists: {destination}")
+    if _git(worktree, "branch", "--show-current") != branch:
+        raise RenameRefused(f"{worktree} is not on {branch}")
+    if _git(plan.checkout, "branch", "--show-current") != plan.new or _git(plan.checkout, "status", "--porcelain"):
+        raise RenameRefused("showrunner checkout must be clean and on the new merge branch")
+    return {"old_branch": branch, "new_branch": new_branch, "old_worktree": str(worktree),
+            "new_worktree": str(destination), "tip": _git(worktree, "rev-parse", "HEAD"),
+            "base": _git(plan.checkout, "rev-parse", "HEAD"), "step": 0}
+
+
+def _check_unit_tip(plan: RenamePlan, record: dict[str, object]) -> None:
+    branch = _string(record, "old_branch")
+    tip = _branch_tip(plan.checkout, branch)
+    if tip and tip != _string(record, "tip"):
+        raise RenameRefused(f"branch {branch} moved during the rename")
+
+
+def _push_unit_branch(plan: RenamePlan, record: dict[str, object]) -> None:
+    _check_unit_tip(plan, record)
+    branch, tip = _string(record, "new_branch"), _string(record, "tip")
+    local, remote = _branch_tip(plan.checkout, branch), _remote_tip(plan.checkout, branch)
+    if (local and local != tip) or (remote and remote != tip):
+        raise RenameRefused(f"branch {branch} moved during the rename")
+    if not local:
+        _ = _git(plan.checkout, "branch", branch, tip)
+    _ = _git(plan.checkout, "push", "--set-upstream", "origin", f"{branch}:refs/heads/{branch}")
+
+
+def _move_unit_worktree(plan: RenamePlan, record: dict[str, object]) -> None:
+    _check_unit_tip(plan, record)
+    old = Path(_string(record, "old_worktree"))
+    new = Path(_string(record, "new_worktree"))
+    branch = _string(record, "new_branch")
+    if old.exists():
+        if _exists(new):
+            raise RenameRefused(f"destination already exists: {new}")
+        _ = _git(plan.checkout, "worktree", "move", str(old), str(new))
+    if not (new / ".git").is_file():
+        raise RenameRefused(f"unit worktree missing: {new}")
+    _ = _git(plan.checkout, "worktree", "repair", str(new))
+    current = _git(new, "branch", "--show-current")
+    if current not in (_string(record, "old_branch"), branch):
+        raise RenameRefused(f"{new} switched to {current}")
+    _check_unit_tip(plan, record)
+    _ = _git(new, "switch", branch)
+
+
+def _config_dirs() -> list[Path]:
+    directories = {path for path in Path.home().glob(".claude*") if path.is_dir()}
+    override = os.environ.get("CLAUDE_CONFIG_DIR")
+    if override:
+        directories.add(Path(override).expanduser())
+    return sorted(directories)
+
+
+def _copy_trust(path: Path, old: str, new: str) -> None:
+    config = _object(_read_json(path))
+    projects = _object(config.get("projects", {}))
+    if old not in projects:
+        return
+    trust = projects[old]
+    for attempt in range(3):
+        if attempt:
+            config = _object(_read_json(path))
+            projects = _object(config.get("projects", {}))
+        _ = projects.setdefault(old, trust)
+        projects[new] = trust
+        config["projects"] = projects
+        _write_json(path, config)
+        time.sleep(2)
+        verified = _object(_read_json(path))
+        if new in _object(verified.get("projects", {})):
+            return
+    raise RenameRefused(f"{path}: new worktree trust entry did not persist; next launch needs a trust prompt")
+
+
+def _move_unit_configs(record: dict[str, object]) -> None:
+    old, new = _string(record, "old_worktree"), _string(record, "new_worktree")
+    old_project = re.sub(r"[^A-Za-z0-9]", "-", old)
+    new_project = re.sub(r"[^A-Za-z0-9]", "-", new)
+    for directory in _config_dirs():
+        _move(PathMove(directory / "projects" / old_project, directory / "projects" / new_project))
+        config = (Path.home() / ".claude.json" if directory == Path.home() / ".claude"
+                  else directory / ".claude.json")
+        if config.exists():
+            _copy_trust(config, old, new)
+
+
+def _unit_doc(plan: RenamePlan, name: str, record: dict[str, object]) -> None:
+    lines = plan.new_doc.read_text(encoding="utf-8").splitlines(keepends=True)
+    headings = add_unit.unit_headings([line.rstrip("\n") for line in lines])
+    for field in ("Worktree", "Branch"):
+        if field not in headings:
+            raise RenameRefused(f"{name}: Units table lacks {field} column")
+    in_units = False
+    for index, line in enumerate(lines):
+        if line.startswith("## "):
+            in_units = line.strip() == "## Units"
+        if not in_units or not line.startswith("|"):
+            continue
+        cells = add_unit.row_cells(line)
+        if cells and add_unit.cell_value(cells[0]) == name:
+            for field, value in (("Worktree", _string(record, "new_worktree")),
+                                 ("Branch", _string(record, "new_branch"))):
+                column = headings.index(field)
+                cells[column] = f"`{value}`"
+            lines[index] = "| " + " | ".join(cells) + " |\n"
+            _write_lines(plan.new_doc, lines)
+            return
+    raise RenameRefused(f"{name}: Units row disappeared")
+
+
+def _commit_unit(plan: RenamePlan, name: str, record: dict[str, object]) -> None:
+    _check_unit_tip(plan, record)
+    message = f"chore({plan.new}): rename unit {name} from {plan.old}"
+    if _git(plan.checkout, "branch", "--show-current") != plan.new:
+        raise RenameRefused("showrunner checkout switched away from the new merge branch")
+    path = _relative(plan, plan.new_doc)
+    rows = add_unit.unit_table(_git(plan.checkout, "show", f"HEAD:{path}").splitlines())
+    matching = [row for row in rows if add_unit.cell_value(row.get("Unit", "")) == name]
+    committed = (len(matching) == 1
+                 and add_unit.cell_value(matching[0].get("Worktree", "")) == _string(record, "new_worktree")
+                 and add_unit.cell_value(matching[0].get("Branch", "")) == _string(record, "new_branch"))
+    changed = set(_git(plan.checkout, "diff", "--name-only", "-z", "HEAD").split("\0")) - {""}
+    changed.update(set(_git(plan.checkout, "diff", "--cached", "--name-only", "-z", "HEAD").split("\0")) - {""})
+    untracked = _git(plan.checkout, "ls-files", "--others", "--exclude-standard")
+    if changed - {path} or untracked or (committed and changed):
+        raise RenameRefused("unrelated checkout changes during unit rename")
+    if not committed:
+        _unit_doc(plan, name, record)
+        _ = _git(plan.checkout, "add", "--", path)
+        _ = _git(plan.checkout, "commit", "-m", message)
+    _check_unit_tip(plan, record)
+    _ = _git(plan.checkout, "push", "origin", f"{plan.new}:refs/heads/{plan.new}")
+
+
+def unit(new: str, name: str) -> None:
+    """Move one stopped unit, resuming recorded branch, worktree and configuration steps."""
+    with _rename_journal(new) as (result, journal):
+        row = _unit_row(result, name)
+        records = _object(journal.get("unit_moves", {}))
+        if name in records:
+            record = _object(records[name])
+        else:
+            if journal["done"]:
+                raise RenameRefused("rename is already finished")
+            if any(_object(value).get("step") != 5 for value in records.values()):
+                raise RenameRefused("complete interrupted unit moves before starting another unit")
+            _stopped_unit(result, name)
+            record = _prepare_unit(result, name, row)
+            records[name] = record
+            journal["unit_moves"] = records
+            _write_json(result.journal, journal)
+        completed = record.get("step")
+        if type(completed) is not int or not 0 <= completed <= 5:
+            raise RenameRefused(f"{name}: invalid unit rename progress")
+        if completed < 5:
+            _stopped_unit(result, name)
+            _check_unit_tip(result, record)
+        if completed < 1:
+            _push_unit_branch(result, record)
+            record["step"] = 1
+            _write_json(result.journal, journal)
+        if completed < 2:
+            _stopped_unit(result, name)
+            _move_unit_worktree(result, record)
+            record["step"] = 2
+            _write_json(result.journal, journal)
+        if completed < 3:
+            _move_unit_configs(record)
+            record["step"] = 3
+            _write_json(result.journal, journal)
+        if completed < 4:
+            _commit_unit(result, name, record)
+            record["step"] = 4
+            _write_json(result.journal, journal)
+        if completed < 5:
+            _check_unit_tip(result, record)
+            if _remote_tip(result.checkout, _string(record, "new_branch")) != _string(record, "tip"):
+                raise RenameRefused("new unit branch changed before old branch retirement")
+            _delete_branch(result, _string(record, "old_branch"), _string(record, "tip"))
+            record["step"] = 5
+            _write_json(result.journal, journal)
+        print(f"{name} moved to {_string(record, 'new_worktree')}; add_unit rewrites the tmux mark at next launch")
+
+
+def finish(new: str) -> None:
+    """Retire the recorded merge branch once all non-retired unit rows have moved."""
+    with _rename_journal(new) as (result, journal):
+        if journal["done"]:
+            return
+        rows = add_unit.unit_table(result.new_doc.read_text(encoding="utf-8").splitlines())
+        remaining = [add_unit.cell_value(row.get("Unit", "")) for row in rows
+                     if not add_unit.plan_cell_is_retired(row.get("Plan", ""))
+                     and add_unit.cell_value(row.get("Branch", "")).startswith(result.old + "-")]
+        if remaining:
+            raise RenameRefused("units still use old branches: " + ", ".join(remaining))
+        records = _object(journal.get("unit_moves", {}))
+        if any(_object(value).get("step") != 5 for value in records.values()):
+            raise RenameRefused("complete interrupted unit moves before finish")
+        if _git(result.checkout, "branch", "--show-current") != result.new:
+            raise RenameRefused("showrunner checkout must be on the new merge branch before finish")
+        _delete_remote_branch(result, result.merge_branch, result.base)
+        journal["finish_step"] = 1
+        _write_json(result.journal, journal)
+        _delete_local_branch(result, result.merge_branch, result.base)
+        journal["finish_step"] = 2
+        journal["done"] = True
+        _write_json(result.journal, journal)
+        print(f"{result.new} rename finished; retired {result.merge_branch}")
+
+
 def main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    _ = parser.add_argument("action", choices=("plan", "apply"))
-    _ = parser.add_argument("old")
-    _ = parser.add_argument("new")
+    actions = parser.add_subparsers(dest="action", required=True)
+    for name in ("plan", "apply"):
+        command = actions.add_parser(name)
+        _ = command.add_argument("old")
+        _ = command.add_argument("new")
+    command = actions.add_parser("unit")
+    _ = command.add_argument("new")
+    _ = command.add_argument("unit")
+    command = actions.add_parser("finish")
+    _ = command.add_argument("new")
     args = parser.parse_args(argv)
-    action, old, new = cast(str, args.action), cast(str, args.old), cast(str, args.new)
+    action, new = cast(str, args.action), cast(str, args.new)
     try:
-        result = plan(old, new) if action == "plan" else apply(old, new)
-        for line in _describe(result):
-            print(line)
-        if action == "apply":
-            print(f"{result.old} is now {result.new}; keep {result.merge_branch} until finish")
+        if action == "unit":
+            unit(new, cast(str, args.unit))
+        elif action == "finish":
+            finish(new)
+        else:
+            old = cast(str, args.old)
+            result = plan(old, new) if action == "plan" else apply(old, new)
+            for line in _describe(result):
+                print(line)
+            if action == "apply":
+                print(f"{result.old} is now {result.new}; keep {result.merge_branch} until finish")
     except (RenameRefused, add_unit.Refusal, tidy_wrapped.TidyRefused, OSError, UnicodeError) as error:
         print(f"rename: {error}", file=sys.stderr)
         return 1

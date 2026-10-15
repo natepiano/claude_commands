@@ -132,8 +132,19 @@ def work_running(pid: int, rows: list[Process], marks: tuple[str, str] | None = 
         current = parents[current]
     helpers = {row.pid for row in rows if row.parent == pid}
     helpers.update(child.pid for helper in tuple(helpers) for child in descendants(helper, rows))
-    return any(row.pid not in ancestors and row.pid not in helpers and not row.command.endswith(" <defunct>")
-               and unit_marks(row.pid) == marks for row in rows)
+    current_slugs: dict[str, str] = {}
+    for row in rows:
+        if row.pid in ancestors or row.pid in helpers or row.command.endswith(" <defunct>"):
+            continue
+        inherited = unit_marks(row.pid)
+        if inherited is None or inherited[1] != marks[1]:
+            continue
+        slug = inherited[0]
+        if slug not in current_slugs:
+            current_slugs[slug] = showrunners.canonical_slug(slug)
+        if (current_slugs[slug], inherited[1]) == marks:
+            return True
+    return False
 
 
 def latest_transcript_activity(session_id: str) -> float:

@@ -93,7 +93,7 @@
 - A retry after a `git mv` that moved the file but not the index removes the old doc from the index explicitly.
 - Every path honors the showrunners.py env overrides; never run against live state.
 
-### Phase 3 — rename.py unit|finish (per unit)  · status: todo
+### Phase 3 — rename.py unit|finish (per unit)  · status: done
 
 #### Work Order
 
