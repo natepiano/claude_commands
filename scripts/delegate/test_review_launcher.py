@@ -19,7 +19,7 @@ from typing import TypedDict, cast, override
 
 from scripts.delegate import wait_for_test_state
 from scripts.delegate.local_release_wait import IntervalReleasePolling
-from scripts.delegate.wait_for_test_state import wait_for_file, wait_until
+from scripts.delegate.wait_for_test_state import wait_for_file, wait_for_pid, wait_until
 from scripts.delegate.recorder_fixture import communicate_launcher, invoke_recorder
 
 
@@ -536,14 +536,14 @@ else:
         child_ready = self.root / "blocked-review-child"
         child_code = ("import os, signal, sys; from pathlib import Path; "
                       "signal.signal(signal.SIGTERM, signal.SIG_IGN); "
-                      "Path(sys.argv[1]).write_text(str(os.getpid())); signal.pause()")
+                      "p = Path(sys.argv[1]); staged = p.with_name(p.name + '.tmp'); "
+                      "staged.write_text(str(os.getpid())); os.replace(staged, p); signal.pause()")
         program = f"import subprocess, sys; child = subprocess.Popen([sys.executable, '-c', {child_code!r}, {str(child_ready)!r}]); child.wait()"
         process = subprocess.Popen([sys.executable, "-c", program], stdout=subprocess.PIPE,
                                    stderr=subprocess.PIPE, text=True, start_new_session=True)
         ready, finish = self.root / "early-ready", self.root / "early-finish"
         try:
-            wait_until(child_ready.exists, self.root, processes=(process,))
-            descriptor = os.pidfd_open(int(child_ready.read_text()))
+            descriptor = os.pidfd_open(wait_for_pid(child_ready, processes=(process,)))
             try:
                 with self.assertRaises(subprocess.TimeoutExpired):
                     _ = self.finish_early_launcher(process, ready, finish, timeout=0)

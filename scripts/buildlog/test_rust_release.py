@@ -587,9 +587,12 @@ class RustReleaseTests(unittest.TestCase):
 
     def test_timed_out_process_kills_background_child(self) -> None:
         pid_file = self.scratch / "sleep.pid"
-        args = ["sh", "-c", f"sleep 60 & echo $! > {shlex.quote(str(pid_file))}; wait"]
+        staged = shlex.quote(str(pid_file) + ".tmp")
+        # Publish by rename, and give a loaded machine time to start the shell.
+        args = ["sh", "-c", f"sleep 60 & echo $! > {staged} && mv {staged} {shlex.quote(str(pid_file))}; wait"]
         with self.assertRaises(subprocess.TimeoutExpired):
-            _ = rust_release.run_process(args, self.scratch, dict(os.environ), 1)
+            _ = rust_release.run_process(args, self.scratch, dict(os.environ), 5)
+        self.assertTrue(pid_file.exists(), "the shell was stopped before it started its background sleep")
         pid = int(pid_file.read_text().strip())
         try:
             for _ in range(20):
