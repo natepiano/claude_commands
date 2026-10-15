@@ -26,6 +26,7 @@ sys.path.insert(0, str(ROOT / "scripts" / "whoami"))
 from scripts.accounts import accounts, moves, refusals
 import account
 import agent_accounts
+from note_file import canonical_label
 import usage_store
 from quota_alert import RefusedAt, _refusal_window  # pyright: ignore[reportPrivateUsage]
 
@@ -397,7 +398,7 @@ def _run(now: datetime, dry_run: bool) -> list[str]:
     blocked_groups: set[accounts.ClaudeGroup] = set()
     tick_logins = frozenset(identity.login.casefold() for session in owners
         if isinstance(identity := accounts.account_identity(Path(session.get("config_dir", str(accounts.main_config_dir())))),
-                      agent_accounts.KnownClaudeAccount))
+                      agent_accounts.NumberedAccount))
     tick_excluded = accounts.account_labels_for_logins(tick_logins)
     # Preparation is a read-only gate: a broken destination changes no group or refusal state.
     for session in owners:
@@ -416,7 +417,7 @@ def _run(now: datetime, dry_run: bool) -> list[str]:
         if previous and previous["entry_id"] == refusal.entry_id and previous["state"] in ("requested", "cancelled", "continued", "group selected"):
             continue
         identity = accounts.account_identity(Path(session.get("config_dir", str(accounts.main_config_dir()))))
-        if isinstance(identity, agent_accounts.UnreadableClaudeAccount):
+        if not isinstance(identity, agent_accounts.NumberedAccount):
             continue
         if previous and previous["entry_id"] == refusal.entry_id and "refusal" in previous:
             first = _first_refusal(previous["refusal"])
@@ -456,7 +457,7 @@ def _run(now: datetime, dry_run: bool) -> list[str]:
         if previous and previous["entry_id"] == refusal.entry_id and previous["state"] in ("requested", "cancelled", "continued", "group selected"):
             continue
         identity = accounts.account_identity(Path(session.get("config_dir", str(accounts.main_config_dir()))))
-        if isinstance(identity, agent_accounts.UnreadableClaudeAccount):
+        if not isinstance(identity, agent_accounts.NumberedAccount):
             lines.append(f"{session['name']}: refused; account unreadable")
             continue
         if previous and previous["entry_id"] == refusal.entry_id and "refusal" in previous:
@@ -527,20 +528,17 @@ def _run(now: datetime, dry_run: bool) -> list[str]:
         if group_name in waiting_groups or group_name in blocked_groups:
             continue
         source_identity = accounts.account_identity(Path(group[0][0].get("config_dir", str(accounts.main_config_dir()))))
-        if isinstance(source_identity, agent_accounts.UnreadableClaudeAccount):
+        if not isinstance(source_identity, agent_accounts.NumberedAccount):
             continue
-        source_dir = Path(group[0][0].get("config_dir", str(accounts.main_config_dir())))
         default_identity = accounts.account_identity(accounts.main_config_dir())
-        uses_default_login = (isinstance(default_identity, agent_accounts.KnownClaudeAccount)
-                              and default_identity.login.casefold() == source_identity.login.casefold())
-        source = "default" if source_dir == accounts.main_config_dir() or uses_default_login else source_identity.label
+        source = source_identity.label
         excluded = {source, source_identity.label, *tick_excluded}
-        if isinstance(default_identity, agent_accounts.KnownClaudeAccount) and default_identity.login.casefold() in refusing_logins:
-            excluded.add("default")
+        if isinstance(default_identity, agent_accounts.NumberedAccount) and default_identity.login.casefold() in refusing_logins:
+            excluded.add(default_identity.label)
         for named in accounts.checked_named_accounts():
             identity = accounts.account_identity(named.dir)
-            if isinstance(identity, agent_accounts.KnownClaudeAccount) and identity.login.casefold() in refusing_logins:
-                excluded.add(named.label)
+            if isinstance(identity, agent_accounts.NumberedAccount) and identity.login.casefold() in refusing_logins:
+                excluded.add(canonical_label(named.label))
         if group_name == "ungrouped":
             chosen = accounts.pick("claude", now, exclude=frozenset(excluded), keep=accounts.NoKeep())
         else:
@@ -631,9 +629,9 @@ def _run(now: datetime, dry_run: bool) -> list[str]:
                                 and state["sessions"][session["session_id"]]["entry_id"] == cast(TranscriptRefusal, detected[session["session_id"]]).entry_id)]
             if not members:
                 continue
-            directory = accounts.main_config_dir() if target == "default" else accounts.account_dir(target)
+            directory = accounts.claude_account_dir(target)
             identity = accounts.account_identity(directory)
-            if isinstance(identity, agent_accounts.UnreadableClaudeAccount):
+            if not isinstance(identity, agent_accounts.NumberedAccount):
                 lines.append(f"{group_name}: move refused: account unreadable")
                 continue
             held = refusals.load().get(refusals.key("claude", identity.login))

@@ -68,8 +68,8 @@ NO_REMOVED_FIELDS: frozenset[str] = frozenset()
 def rename_legacy_notes(directory: Path) -> list[str]:
     messages: list[str] = []
     for old in sorted(directory.glob("*.md")):
-        parsed = note_file.account_stem(old.stem)
-        if not isinstance(parsed, note_file.AccountStem) or old.stem != parsed.label:
+        parsed = note_file.parse_account_label(old.stem)
+        if not isinstance(parsed, note_file.NumberedAccountLabel) or old.stem != f"{parsed.tool} {parsed.number}":
             continue
         new = directory / note_file.note_name(parsed.label)
         try:
@@ -160,7 +160,7 @@ def write_note(note: Note, updates: dict[str, str | tuple[str, ...]], *,
 
 def still_ahead(value: str | None) -> bool:
     reset = reset_time(value)
-    return reset is not None and reset > datetime.now(timezone.utc)
+    return isinstance(reset, note_file.KnownReset) and reset.value > datetime.now(timezone.utc)
 
 
 def append_readings(readings: list[StoredReading], checked_at: datetime) -> None:
@@ -357,11 +357,13 @@ def update_alert_pass(selection: ClaudeAccountsInUse, seats_home: Path) -> Updat
             updates["role"] = ("worker",) if note.label == codex_readings.selected_account.label else ()
         section: SessionsSection | KeepSections = KEEP_SECTIONS
         if isinstance(sessions, session_table.ReadSessions):
-            kept = tuple(row for row in session_table.section_rows(note.text[note.end:])
+            kept = tuple(session_table.last_seen(row) for row in session_table.section_rows(note.text[note.end:])
                          if row.machine in sessions.rows_kept)
-            rows = sessions.rows_by_label.get(note.label, ()) + kept
-            updates["sessions"] = str(len(rows))
-            section = SessionsSection(session_table.render_section(rows))
+            live = tuple(session_table.observed(row, checked_at)
+                         for row in sessions.rows_by_label.get(note.label, ()))
+            rows = live + kept
+            updates["sessions"] = str(len(live))
+            section = SessionsSection(session_table.render_section(rows, sessions.unattributed))
         _ = write_note(note, updates, remove=frozenset({"state"}), section=section, stamp=stamp)
     if readings:
         try:
@@ -375,7 +377,7 @@ def update_alert_pass(selection: ClaudeAccountsInUse, seats_home: Path) -> Updat
                          and (report.tool.lower() != "claude" or not selection.multiple_accounts
                               or (report.source.directory == Path.home() / ".claude"
                                   if isinstance(report.source, ClaudeDirectorySource)
-                                  else selection.is_default_login(report.email or "")))]
+                                  else selection.is_home_directory_login(report.email or "")))]
         messages += five_hour.watch(watch_reports, codex_readings=codex_readings)
     except (OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError) as error:
         # The 5-hour watch must never cost the notes or the weekly alerts.
@@ -408,7 +410,10 @@ def main() -> None:
         parsed = parser.parse_args(sys.argv[2:], namespace=RefusalCommandLine())
         arguments = parsed.identity
         if len(arguments) == 3:
-            identity = KnownCodexAccount(Path(arguments[0]), arguments[1], arguments[2])
+            label = note_file.parse_account_label(arguments[2])
+            if not isinstance(label, note_file.NumberedAccountLabel) or label.tool != "codex":
+                parser.error("LABEL must name a numbered Codex account, such as codex1")
+            identity = KnownCodexAccount(Path(arguments[0]), arguments[1], label.label)
         elif len(arguments) == 2:
             identity = UnknownCodexAccount(Path(arguments[0]), arguments[1])
         else:

@@ -1095,7 +1095,7 @@ class RosterTests(unittest.TestCase):
         self.assertEqual(pane.reach, roster.CannotReceiveMessages("interactive Codex in a herdr pane"))
         self.assertEqual((pane.showrunner, pane.director, pane.assignment),
                          (roster.NoShowrunner(), roster.NoDirector(), roster.NotAWorker()))
-        self.assertEqual(pane.account, roster.AccountLabel("codex 1"))
+        self.assertEqual(pane.account, roster.AccountLabel("codex1"))
         self.assertIsInstance(entries["herdr native:w1:p3"].account, roster.AccountUnread)
         self.assertIn(mock.call(991001), read_home.call_args_list)
         self.assertNotIn(mock.call(991002), read_home.call_args_list)
@@ -1233,7 +1233,7 @@ class RosterTests(unittest.TestCase):
         directory = self.account_note(3, tool="claude")
         with mock.patch.object(account, "process_config_dir", return_value=directory):
             entry = self._entries()["runner"]
-        self.assertEqual(entry.account, roster.AccountLabel("claude 3"))
+        self.assertEqual(entry.account, roster.AccountLabel("claude3"))
 
     def test_working_workers_keep_their_serving_server_account_across_a_swap(self) -> None:
         old, current = self.account_note(1), self.account_note(2)
@@ -1250,29 +1250,29 @@ class RosterTests(unittest.TestCase):
             "missing-server": {"thread_id": "lost-thread", "status": "running", "port": 49999, "launcher_pid": os.getpid()},
         }))
         entries = self._entries()
-        self.assertEqual(entries["old-impl"].account, roster.AccountLabel("codex 1"))
-        self.assertEqual(entries["new-test"].account, roster.AccountLabel("codex 2"))
-        self.assertEqual(entries["between-turns"].account, roster.AccountLabel("codex 2"))
+        self.assertEqual(entries["old-impl"].account, roster.AccountLabel("codex1"))
+        self.assertEqual(entries["new-test"].account, roster.AccountLabel("codex2"))
+        self.assertEqual(entries["between-turns"].account, roster.AccountLabel("codex2"))
         self.assertIsInstance(entries["missing-server"].account, roster.AccountUnread)
         _ = (self.director_run / "mesh_server.json").write_text(json.dumps({"port": 45678, "pid": os.getpid()}))
         entries = self._entries()
         self.assertIsInstance(entries["new-test"].account, roster.AccountUnread)
         self.assertIsInstance(entries["between-turns"].account, roster.AccountUnread)
-        self.assertEqual(entries["old-impl"].account, roster.AccountLabel("codex 1"))
+        self.assertEqual(entries["old-impl"].account, roster.AccountLabel("codex1"))
 
     def test_daemon_rows_use_the_home_holding_the_socket(self) -> None:
         home = self.account_note(1)
         _ = self.account_note(2)
         with mock.patch.object(codex_daemon, "daemon_socket", return_value=home / "app-server-control" / "daemon.sock"):
             entry = self._entries()["Codex window"]
-        self.assertEqual(entry.account, roster.AccountLabel("codex 1"))
+        self.assertEqual(entry.account, roster.AccountLabel("codex1"))
 
     def test_reviewers_require_a_readable_environment_before_using_the_default_home(self) -> None:
         _ = self.account_note(1)
         _ = self.account_note(2)
         with mock.patch.object(account, "process_codex_home", return_value=account.ProcessWithoutCodexHome()):
             entries = self._entries()
-        self.assertEqual(entries["adversary reviewer"].account, roster.AccountLabel("codex 2"))
+        self.assertEqual(entries["adversary reviewer"].account, roster.AccountLabel("codex2"))
         with mock.patch.object(process_table, "snapshot", return_value={}):
             missing = self._entries()
         self.assertIsInstance(missing["blind reviewer"].account, roster.AccountUnread)
@@ -1284,10 +1284,10 @@ class RosterTests(unittest.TestCase):
 
     def test_snapshot_without_account_decodes_as_peer_attribution_unavailable(self) -> None:
         row = replace(self._entry("Mac director", "unit director", "session:mac-id"),
-                      machine="mac", account=roster.AccountLabel("claude 3"))
+                      machine="mac", account=roster.AccountLabel("claude3"))
         encoded = roster.RosterSnapshot(roster.Roster([row], [])).encode()
         self.assertEqual(roster.RosterSnapshot.decode(encoded).result.entries[0].account,
-                         roster.AccountLabel("claude 3"))
+                         roster.AccountLabel("claude3"))
         old = cast(dict[str, object], json.loads(encoded))
         entries = cast(list[dict[str, object]], old["entries"])
         del entries[0]["account"]
@@ -1403,6 +1403,12 @@ class RosterTests(unittest.TestCase):
         self.assertEqual(len(result.problems), 1)
         self.assertIn("not reached", result.problems[0])
         self.assertEqual(len(self.ssh_calls()), 1)
+
+    def test_peer_legacy_label_decodes_to_the_numbered_account_note(self) -> None:
+        row = replace(self._entry("Mac director", "unit director", "session:mac-id"),
+                      machine="mac", account=roster.AccountLabel("claude 1"))
+        decoded = roster.RosterSnapshot.decode(roster.RosterSnapshot(roster.Roster([row], [])).encode())
+        self.assertEqual(decoded.result.entries[0].account, roster.AccountLabel("claude1"))
 
     def test_peer_snapshot_timeout_is_twenty_seconds_and_sender_ids_are_not_forwarded(self) -> None:
         calls: list[list[str]] = []

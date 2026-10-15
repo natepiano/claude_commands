@@ -126,6 +126,16 @@ class AgentIdentity(TypedDict):
     session_id: str
 
 
+@dataclass(frozen=True)
+class KnownMainIdentity:
+    identity: AgentIdentity
+
+
+@dataclass(frozen=True)
+class MainIdentityUnavailable:
+    """No readable transcript supplies a model; detection must try its fallback."""
+
+
 class CalibrationSample(TypedDict):
     percent: int
     raw_percent: int
@@ -495,11 +505,11 @@ def _append_event(state: dict[str, object], event: dict[str, object]) -> None:
         fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
 
-def _main_identity_from_codex(session_id: str) -> AgentIdentity | None:
+def _main_identity_from_codex(session_id: str) -> KnownMainIdentity | MainIdentityUnavailable:
     session_root = Path.home() / ".codex" / "sessions"
     matches = list(session_root.rglob(f"*{session_id}.jsonl"))
     if not matches:
-        return None
+        return MainIdentityUnavailable()
     model = ""
     effort = ""
     try:
@@ -518,22 +528,22 @@ def _main_identity_from_codex(session_id: str) -> AgentIdentity | None:
                 if candidate_effort:
                     effort = candidate_effort
     except OSError:
-        return None
+        return MainIdentityUnavailable()
     if not model:
-        return None
-    return AgentIdentity(
+        return MainIdentityUnavailable()
+    return KnownMainIdentity(AgentIdentity(
         family="codex",
         model=model,
         effort=effort or "unset",
         session_id=session_id,
-    )
+    ))
 
 
-def _main_identity_from_claude(session_id: str) -> AgentIdentity | None:
+def _main_identity_from_claude(session_id: str) -> KnownMainIdentity | MainIdentityUnavailable:
     project_root = Path.home() / ".claude" / "projects"
     matches = list(project_root.rglob(f"{session_id}.jsonl"))
     if not matches:
-        return None
+        return MainIdentityUnavailable()
     model = ""
     effort = ""
     try:
@@ -550,15 +560,15 @@ def _main_identity_from_claude(session_id: str) -> AgentIdentity | None:
                 if candidate_effort:
                     effort = candidate_effort
     except OSError:
-        return None
+        return MainIdentityUnavailable()
     if not model:
-        return None
-    return AgentIdentity(
+        return MainIdentityUnavailable()
+    return KnownMainIdentity(AgentIdentity(
         family="claude",
         model=model,
         effort=effort or "unset",
         session_id=session_id,
-    )
+    ))
 
 
 def _detect_main_identity(args: argparse.Namespace) -> AgentIdentity:
@@ -577,14 +587,14 @@ def _detect_main_identity(args: argparse.Namespace) -> AgentIdentity:
     codex_session = os.environ.get("CODEX_THREAD_ID", "")
     if codex_session:
         identity = _main_identity_from_codex(codex_session)
-        if identity is not None:
-            return identity
+        if isinstance(identity, KnownMainIdentity):
+            return identity.identity
 
     claude_session = os.environ.get("CLAUDE_CODE_SESSION_ID", "")
     if claude_session:
         identity = _main_identity_from_claude(claude_session)
-        if identity is not None:
-            return identity
+        if isinstance(identity, KnownMainIdentity):
+            return identity.identity
 
     return AgentIdentity(
         family=explicit_family or "unknown",

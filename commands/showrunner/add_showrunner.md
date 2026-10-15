@@ -37,7 +37,7 @@ What it does:
 - New and resumed sessions start on the configured showrunners account. An
   `--account` or `--config-dir` naming another account is refused; with the
   showrunners account not configured, it refuses and names
-  `accounts.py move showrunners "claude N"`. It carries no unit
+  `accounts.py move showrunners <claudeN>`. It carries no unit
   mark, so it is never relayed to as one of your units.
 - It waits up to three minutes for the new showrunner to register its update
   timer, then attaches it to your production and tells it so. Session records

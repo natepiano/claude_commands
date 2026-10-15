@@ -65,7 +65,7 @@ def checked(child: Production, caller: str, ending: str = "", start_in: Path | N
     `ending` names a tmux session the caller ends before the start, so it is not in the way.
     `start_in` is the folder the session starts in, the child's checkout unless given.
     """
-    from scripts.accounts.accounts import DefaultAccount, NamedAccount, account_dir, main_config_dir, trust_command
+    from scripts.accounts.accounts import NamedAccount, account_dir, home_account_label, main_config_dir, trust_command
     from scripts.herdr.herdr import Untrusted, UnreadableTrustFile, claude_trust
 
     if not caller:
@@ -90,12 +90,12 @@ def checked(child: Production, caller: str, ending: str = "", start_in: Path | N
     if isinstance(config_dir, Path) and config_dir != main_config_dir():
         label = str(config_dir)
         numbered = re.fullmatch(r"\.claude([0-9]+)", config_dir.name)
-        if numbered and config_dir == account_dir(f"claude {numbered.group(1)}"):
-            label = f"claude {numbered.group(1)}"
+        if numbered and config_dir == account_dir(f"claude{numbered.group(1)}"):
+            label = f"claude{numbered.group(1)}"
         selected = NamedAccount(label, config_dir)
     else:
-        selected = DefaultAccount()
-        label = "default account"
+        label = home_account_label("claude")
+        selected = NamedAccount(label, main_config_dir())
     trust = claude_trust(folder, claude_json(config_dir))
     if isinstance(trust, UnreadableTrustFile):
         raise Refusal(f"{child.slug}: {trust}")
@@ -106,8 +106,7 @@ def checked(child: Production, caller: str, ending: str = "", start_in: Path | N
 
 
 def account_directory(selected: ClaudeLaunchAccount) -> Path:
-    from scripts.accounts import accounts
-    return accounts.main_config_dir() if isinstance(selected, accounts.DefaultAccount) else selected.dir
+    return selected.dir
 
 
 def account_for_launch(child: Production, resume: str | None, target: str = "", config_dir: str = "") -> ClaudeLaunchAccount:

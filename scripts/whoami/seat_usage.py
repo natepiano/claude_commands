@@ -20,6 +20,7 @@ if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from scripts.usage import collect, usage_report, weights
+from scripts.whoami.note_file import NumberedAccountLabel, canonical_label, parse_account_label
 
 DEFAULT_T_LIVE = datetime(2026, 10, 10, 18, 17, tzinfo=timezone.utc)
 
@@ -184,13 +185,18 @@ def store_switch_history(db: sqlite3.Connection) -> RoleSwitchHistory:
     if not isinstance(start, str):
         return RoleSwitchHistory(NoStoredHistory(), ())
     rows = cast(Iterable[sqlite3.Row], db.execute(
-        "SELECT at FROM (SELECT at, label, lag(label) OVER "
-        + "(PARTITION BY machine ORDER BY at, label) AS previous_label "
-        + "FROM account_role_changes WHERE role = ?) "
-        + "WHERE previous_label IS NOT NULL AND label != previous_label ORDER BY at, label",
+        "SELECT machine, at, label FROM account_role_changes WHERE role = ? ORDER BY at, label",
         (accounts.CODEX_ROLE,)))
-    return RoleSwitchHistory(HistoryBeginsAt(datetime.fromisoformat(start)),
-                             tuple(datetime.fromisoformat(cast(str, row[0])) for row in rows))
+    previous: dict[str, str] = {}
+    switches: list[datetime] = []
+    for row in rows:
+        machine = cast(str, row["machine"])
+        label = canonical_label(cast(str, row["label"]).casefold())
+        if machine in previous and previous[machine] != label:
+            switches.append(datetime.fromisoformat(cast(str, row["at"])))
+        previous[machine] = label
+    return RoleSwitchHistory(HistoryBeginsAt(datetime.fromisoformat(start)), tuple(switches))
+
 
 
 NO_ROLE_HISTORY = RoleSwitchHistory(NoStoredHistory(), ())
@@ -402,11 +408,16 @@ class StoredWindowUsage:
 
 def store_readings(db: sqlite3.Connection) -> tuple[AccountReading, ...]:
     rows = cast(Iterable[sqlite3.Row], db.execute(
-        "SELECT account, at, credits_state, credits FROM account_readings "
-        + "WHERE lower(account) LIKE 'codex %' ORDER BY at, account"))
-    return tuple(AccountReading(cast(str, row["account"]), datetime.fromisoformat(cast(str, row["at"])),
-                                credit_balance(cast(object, row["credits"])) if row["credits_state"] == "read"
-                                else UnknownCreditBalance()) for row in rows)
+        "SELECT account, at, credits_state, credits FROM account_readings ORDER BY at, account"))
+    readings: list[AccountReading] = []
+    for row in rows:
+        label = parse_account_label(cast(str, row["account"]).casefold())
+        if not isinstance(label, NumberedAccountLabel) or label.tool != "codex":
+            continue
+        readings.append(AccountReading(label.label, datetime.fromisoformat(cast(str, row["at"])),
+                                       credit_balance(cast(object, row["credits"])) if row["credits_state"] == "read"
+                                       else UnknownCreditBalance()))
+    return tuple(readings)
 
 
 def mac_freshness(db: sqlite3.Connection) -> SourceFreshness:

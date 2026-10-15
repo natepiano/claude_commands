@@ -24,6 +24,7 @@ from launch_permission import launch_barrier, shutdown_state_root
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
 from user_zone import user_zone  # noqa: E402
+from scripts.whoami.note_file import canonical_label, parse_account_label, NumberedAccountLabel
 
 CLAIM_STALE_SECONDS = 120
 CONDUCTOR_LOCK_RETRY_DELAYS = (0.05,) * 5
@@ -786,7 +787,7 @@ def _record(value: object, place: str) -> _LegacyShutdownRecord:
         _ = _safe_login(login)
     except ValueError as error:
         raise InvalidRecord(f"{place}.login is unsafe for record storage") from error
-    _ = _string(_required(values, "label", place), f"{place}.label")
+    values["label"] = canonical_label(_string(_required(values, "label", place), f"{place}.label"))
     _ = _string(_required(values, "machine", place), f"{place}.machine")
     state = _string(_required(values, "state", place), f"{place}.state")
     if state not in _RECORD_STATES:
@@ -969,6 +970,7 @@ def _shutdown_request_fields(values: dict[str, object], place: str) -> None:
         raise InvalidRecord(f"{place}.login is unsafe for record storage") from error
     for field in ("label", "machine"):
         _ = _string(_required(values, field, place), f"{place}.{field}")
+    values["label"] = canonical_label(cast(str, values["label"]))
     _ = _utc_time(_required(values, "requested_at", place), f"{place}.requested_at")
     request_id = _string(_required(values, "request_id", place), f"{place}.request_id")
     if not request_id:
@@ -984,10 +986,20 @@ def _shutdown_request_fields(values: dict[str, object], place: str) -> None:
 def _session_shutdown(value: object, place: str) -> SessionShutdown:
     values = _mapping(value, place)
     _shutdown_request_fields(values, place)
+    for field in ("source_label",):
+        if isinstance(values.get(field), str):
+            values[field] = canonical_label(cast(str, values[field]))
     if "target" in values:
         target = _string(values["target"], f"{place}.target")
-        if target != "default" and not re.fullmatch(r"claude [1-9][0-9]*", target):
-            raise InvalidRecord(f"{place}.target must be default or claude N")
+        if target == "default":
+            from scripts.whoami.account import claude_account
+            home = claude_account(Path.home() / ".claude")
+            parsed_home = parse_account_label(home.label) if home is not None else None
+            target = parsed_home.label if isinstance(parsed_home, NumberedAccountLabel) else "~/.claude"
+        parsed = parse_account_label(target)
+        if target != "~/.claude" and not (isinstance(parsed, NumberedAccountLabel) and parsed.tool == "claude"):
+            raise InvalidRecord(f"{place}.target must name a numbered Claude account")
+        values["target"] = canonical_label(target)
     for field in ("source_label", "why"):
         if field in values:
             _ = _string(values[field], f"{place}.{field}")

@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Move Claude sessions to another account the one way a showrunner does: pause first, then prove it.
 
-    showrunner_move.py session <session id|name> "claude N"|default [--why <text>]
-    showrunner_move.py units|showrunners "claude N"|default [--dry-run] [--why <text>]
+    showrunner_move.py session <session id|name> <claudeN> [--why <text>]
+    showrunner_move.py units|showrunners <claudeN> [--dry-run] [--why <text>]
 
 Units and showrunners are each one group on one account: `units` and `showrunners` select the
 group's account and move every live member that is not on it. Each move goes through
@@ -34,9 +34,10 @@ from scripts.accounts import accounts, moves  # noqa: E402
 if TYPE_CHECKING:
     from scripts.shutdown import record
     from scripts.message import sessions
-    from scripts.whoami import account
+    from scripts.whoami import account, note_file
 else:
     import account
+    import note_file
     import record
     import sessions
 
@@ -81,7 +82,7 @@ class CommandLine(argparse.Namespace):
 
 
 def target_dir(target: str) -> Path:
-    return accounts.main_config_dir() if target == "default" else accounts.account_dir(target)
+    return accounts.claude_account_dir(target)
 
 
 def live_names() -> dict[str, tuple[str, int]]:
@@ -179,7 +180,7 @@ def main(argv: list[str]) -> int:
         parser.error(f"{options.kind} takes " + ("<session> <target>" if wanted_args == 2 else "<target>"))
     if options.kind == "session" and options.dry_run:
         parser.error("--dry-run applies to units and showrunners")
-    target = options.rest[-1]
+    target = note_file.canonical_label(options.rest[-1])
     since = datetime.now(timezone.utc).isoformat()
     try:
         wanted = target_dir(target)

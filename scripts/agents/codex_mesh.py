@@ -3088,9 +3088,12 @@ def _requested_worker_move(source: CodexServingState, destination: Path) -> Requ
         return NoRequestedWorkerMove()
     requests = [entry for entry in moves.read_moves() if entry["kind"] == "requested"
                 and entry["tool"] == "codex" and entry["subject"] == "seats"]
-    if (requests and codex_home_matches_label(source.home, requests[-1]["from"])
-            and codex_home_matches_label(destination, requests[-1]["to"])):
-        # Confirmation consumes the current destination label; keep the legacy journal unchanged.
+    origin = requests[-1]["from"] if requests else moves.HomeAccountUnresolved(source.home)
+    target = requests[-1]["to"] if requests else moves.HomeAccountUnresolved(destination)
+    if (requests and isinstance(origin, str) and isinstance(target, str)
+            and codex_home_matches_label(source.home, origin)
+            and codex_home_matches_label(destination, target)):
+        # The reader resolves legacy home labels from historical evidence; leave the journal unchanged.
         matched = requests[-1].copy()
         matched["to"] = codex_home_role_label(destination)
         return matched

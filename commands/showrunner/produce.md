@@ -290,7 +290,7 @@ State:
 
   * build hold: <holder> holds builds since 11:34 EDT for the frame-time lane's breakdown of what each added tool costs; expected to release 11:40 EDT (in 3 minutes)
   * Mac block: <holder> since 11:35 EDT, for the Mac-only test run - lifts Wed 12:35 EDT
-  * claude 1: …
+  * claude1: …
   * next dailies: 11:53 EDT - nothing needed
 
 
@@ -371,7 +371,7 @@ to confirm the block remains and no compaction is running. Type `/compact` with
 **Resume.** To bring back a unit director whose session ended, use
    `$HOME/.claude/scripts/lib/py $HOME/.claude/scripts/production/add_unit.py --production PRODUCTION_DOC <name> --plan <unit plan> --resume <session-id> --cwd <recorded cwd>`.
    The launcher starts it on the configured units account, keeps its recorded model, checks shutdown holds, and preserves its name and Remote Control link.
-   If it reports the units account is not configured, stop and tell the user its line: `accounts.py move units "claude N"` sets it.
+   If it reports the units account is not configured, stop and tell the user its line: `accounts.py move units <claudeN>` sets it.
 </LaunchUnits>
 
 ---
@@ -1101,7 +1101,7 @@ reaches them only as your relay (<Throughout/>). Run `python3
 --state-dir DAILIES_STATE_DIR --notice "<full notice>"`. It relays
 to every unit director and prints one `send <unit>:` receipt each. With more
 than one Claude account in use, a Claude `Quota alert:` names its account and
-roles (`claude 3 (unit directors) at …`). It reaches only the unit directors
+roles (`claude3 (unit directors) at …`). It reaches only the unit directors
 running on that account, prints `skip <unit>: it runs on <other account>` for
 the rest, and reports a unit whose account cannot be read as not told:
 - `Quota alert:` — the command picks the instruction from the notice. A Codex

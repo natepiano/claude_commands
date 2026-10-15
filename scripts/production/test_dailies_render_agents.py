@@ -129,7 +129,7 @@ class DailiesAgentsTests(unittest.TestCase):
         return output.getvalue().splitlines()
 
     def agent_lines(self, lines: list[str]) -> list[str]:
-        return [line for line in lines if line.startswith(("* claude ", "* codex ")) or line == "* none active"]
+        return [line for line in lines if line.startswith(("* claude", "* codex")) or line == "* none active"]
 
     def run_footer(self, at: str) -> str:
         output, errors = io.StringIO(), io.StringIO()
@@ -138,67 +138,67 @@ class DailiesAgentsTests(unittest.TestCase):
         self.assertEqual(code, 0, errors.getvalue())
         return output.getvalue()
 
-    def test_agents_include_role_only_and_session_only_accounts_by_spaced_label(self) -> None:
-        self.note("claude 1", count=None, limit=None)
-        self.note("codex 2", count=None, limit=None, in_use=False)
+    def test_agents_include_role_only_and_session_only_accounts_by_canonical_label(self) -> None:
+        self.note("claude1", count=None, limit=None)
+        self.note("codex2", count=None, limit=None, in_use=False)
         path = self.agents / "codex2.md"
         _ = path.write_text(path.read_text().replace("sessions: 0", "sessions: 1"))
-        self.note("claude 3", in_use=False)
+        self.note("claude3", in_use=False)
         lines = self.agent_lines(self.run_report())
-        self.assertTrue(any(line.startswith("* claude 1:") for line in lines))
-        self.assertTrue(any(line.startswith("* codex 2:") for line in lines))
-        self.assertFalse(any("claude 3" in line for line in lines))
-        self.assertFalse(any("codex2:" in line for line in lines))
+        self.assertTrue(any(line.startswith("* claude1:") for line in lines))
+        self.assertTrue(any(line.startswith("* codex2:") for line in lines))
+        self.assertFalse(any("claude3" in line for line in lines))
+        self.assertFalse(any("codex 2:" in line for line in lines))
 
     def test_pace_before_a_reset_still_counts(self) -> None:
         """The 57 points before the reset slow the pace; the 19 since it alone would say Wed 02:49."""
-        self.note("claude 1", usage="81", checked="2026-10-06T17:11:00+00:00")
+        self.note("claude1", usage="81", checked="2026-10-06T17:11:00+00:00")
         self.log(
-            *self.climb("claude 1", "2026-10-05T19:25:00+00:00", "2026-10-06T13:15:00+00:00", 58, 1),
-            *self.climb("claude 1", "2026-10-06T13:17:00+00:00", "2026-10-06T17:11:00+00:00", 100, 81),
+            *self.climb("claude1", "2026-10-05T19:25:00+00:00", "2026-10-06T13:15:00+00:00", 58, 1),
+            *self.climb("claude1", "2026-10-06T13:17:00+00:00", "2026-10-06T17:11:00+00:00", 100, 81),
         )
         self.assertEqual(self.agent_lines(self.run_report(at="2026-10-06T10:11")), [
-            "* claude 1: 19%; runs out about Wed 08:15 PDT, before its Sun 23:00 refill; 1 reset available until Oct 22",
+            "* claude1: 19%; runs out about Wed 08:15 PDT, before its Sun 23:00 refill; 1 reset available until Oct 22",
         ])
 
     def test_stamped_footer_uses_readings_through_end_of_stamped_minute(self) -> None:
         stamp = "2026-10-06T10:11"
-        self.note("claude 1", usage="81", checked="2026-10-06T17:11:30+00:00")
-        climbed = self.climb("claude 1", "2026-10-06T15:11:00+00:00", "2026-10-06T17:11:30+00:00", 91, 81)
+        self.note("claude1", usage="81", checked="2026-10-06T17:11:30+00:00")
+        climbed = self.climb("claude1", "2026-10-06T15:11:00+00:00", "2026-10-06T17:11:30+00:00", 91, 81)
         self.log(*climbed)
         before = self.run_footer(stamp)
-        self.assertIn("* claude 1: 19%", before)
-        self.note("claude 1", usage="80", checked="2026-10-06T17:12:10+00:00")
-        self.log(*climbed, ("claude 1", "2026-10-06T17:12:10+00:00", 80))
+        self.assertIn("* claude1: 19%", before)
+        self.note("claude1", usage="80", checked="2026-10-06T17:12:10+00:00")
+        self.log(*climbed, ("claude1", "2026-10-06T17:12:10+00:00", 80))
         self.assertEqual(self.run_footer(stamp), before)
-        self.assertIn("* claude 1: 20%", self.run_footer("2026-10-06T10:12"))
+        self.assertIn("* claude1: 20%", self.run_footer("2026-10-06T10:12"))
 
     def test_stamped_minute_uses_its_own_repeated_hour_reading(self) -> None:
         """Each fall-back minute ends 60 seconds after its own instant."""
-        self.note("claude 1", usage="79", resets="2026-11-07T12:00:00-08:00",
+        self.note("claude1", usage="79", resets="2026-11-07T12:00:00-08:00",
                   checked="2026-11-01T09:31:05+00:00", count=None, limit=None)
         self.log(
-            ("claude 1", "2026-11-01T08:59:30+00:00", 81),
-            ("claude 1", "2026-11-01T09:30:30+00:00", 80),
-            ("claude 1", "2026-11-01T09:31:05+00:00", 79),
+            ("claude1", "2026-11-01T08:59:30+00:00", 81),
+            ("claude1", "2026-11-01T09:30:30+00:00", 80),
+            ("claude1", "2026-11-01T09:31:05+00:00", 79),
         )
-        self.assertIn("* claude 1: 19%;", self.run_footer("2026-11-01T01:59-07:00"))
-        self.assertIn("* claude 1: 20%;", self.run_footer("2026-11-01T01:30-08:00"))
+        self.assertIn("* claude1: 19%;", self.run_footer("2026-11-01T01:59-07:00"))
+        self.assertIn("* claude1: 20%;", self.run_footer("2026-11-01T01:30-08:00"))
 
     def test_approved_lines_order_and_footer_position(self) -> None:
-        self.note("claude 1", usage="60", checked="2026-10-05T08:10:00+00:00")
-        self.note("codex 2", usage="22", resets="2026-10-11T02:25:00",
+        self.note("claude1", usage="60", checked="2026-10-05T08:10:00+00:00")
+        self.note("codex2", usage="22", resets="2026-10-11T02:25:00",
                   count="1", limit="2026-10-29T03:00:00-04:00")
-        self.note("codex 3", in_use=False)
+        self.note("codex3", in_use=False)
         self.log(
-            *self.climb("claude 1", "2026-10-05T06:10:00+00:00", "2026-10-05T08:10:00+00:00", 64, 60),
-            *self.climb("codex 2", "2026-10-05T15:45:00+00:00", "2026-10-05T19:45:00+00:00", 33, 22),
+            *self.climb("claude1", "2026-10-05T06:10:00+00:00", "2026-10-05T08:10:00+00:00", 64, 60),
+            *self.climb("codex2", "2026-10-05T15:45:00+00:00", "2026-10-05T19:45:00+00:00", 33, 22),
         )
         _ = self.readings.write_text("{bad json}\n" + self.readings.read_text())
         lines = self.run_report(waiting=True, held=True)
         self.assertEqual(self.agent_lines(lines), [
-            "* claude 1: 40%; runs out about Tue 07:10 PDT, before its Sun 23:00 refill; 1 reset available until Oct 22",
-            "* codex 2: 78%; runs out about 20:45 PDT today, before its Sun 02:25 refill; 1 reset available until Oct 29",
+            "* claude1: 40%; runs out about Tue 07:10 PDT, before its Sun 23:00 refill; 1 reset available until Oct 22",
+            "* codex2: 78%; runs out about 20:45 PDT today, before its Sun 02:25 refill; 1 reset available until Oct 29",
         ])
         chart_end = len(lines) - 1 - lines[::-1].index("```")
         hold = next(i for i, line in enumerate(lines) if line.startswith("* build hold:"))
@@ -208,7 +208,7 @@ class DailiesAgentsTests(unittest.TestCase):
         self.assertLess(hold, agents)
         self.assertEqual(lines[schedule - 1], self.agent_lines(lines)[-1])
         self.assertFalse(any("waiting on you:" in line for line in lines))
-        self.assertNotIn("codex 3", "\n".join(lines))
+        self.assertNotIn("codex3", "\n".join(lines))
 
         output = io.StringIO()
         with redirect_stdout(output):
@@ -221,37 +221,37 @@ class DailiesAgentsTests(unittest.TestCase):
 
     def test_agent_lines_use_run_out_words_for_every_usage_state(self) -> None:
         """All four known-usage states use the specified full line."""
-        self.note("claude 1", usage="60", checked="2026-10-05T08:10:00+00:00")
-        self.note("claude 2", usage="60", count="0", limit=None)
-        self.note("codex 1", usage="99", resets="2026-10-11T12:45:00", count=None, limit=None)
-        self.note("codex 2", usage="0", count=None, limit=None)
+        self.note("claude1", usage="60", checked="2026-10-05T08:10:00+00:00")
+        self.note("claude2", usage="60", count="0", limit=None)
+        self.note("codex1", usage="99", resets="2026-10-11T12:45:00", count=None, limit=None)
+        self.note("codex2", usage="0", count=None, limit=None)
         self.log(
-            *self.climb("claude 1", "2026-10-05T06:10:00+00:00", "2026-10-05T08:10:00+00:00", 64, 60),
-            *self.climb("claude 2", "2026-10-05T17:45:00+00:00", "2026-10-05T19:45:00+00:00", 60, 60),
+            *self.climb("claude1", "2026-10-05T06:10:00+00:00", "2026-10-05T08:10:00+00:00", 64, 60),
+            *self.climb("claude2", "2026-10-05T17:45:00+00:00", "2026-10-05T19:45:00+00:00", 60, 60),
         )
         lines = self.agent_lines(self.run_report())
         self.assertEqual(lines, [
-            "* claude 1: 40%; runs out about Tue 07:10 PDT, before its Sun 23:00 refill; 1 reset available until Oct 22",
-            "* claude 2: 40%; does not run out at this pace, so it hits its Sun 23:00 refill first; no resets available",
-            "* codex 1: 1%; runs out about Tue 11:45 PST, so it hits its Sun 12:45 refill first; resets unknown",
-            "* codex 2: 100%; ran out, back at its Sun 23:00 refill; resets unknown",
+            "* claude1: 40%; runs out about Tue 07:10 PDT, before its Sun 23:00 refill; 1 reset available until Oct 22",
+            "* claude2: 40%; does not run out at this pace, so it hits its Sun 23:00 refill first; no resets available",
+            "* codex1: 1%; runs out about Tue 11:45 PST, so it hits its Sun 12:45 refill first; resets unknown",
+            "* codex2: 100%; ran out, back at its Sun 23:00 refill; resets unknown",
         ])
         self.assertFalse(any("of the week used" in line or "lasts to" in line for line in lines))
 
     def test_repeated_hour_run_out_shows_pst(self) -> None:
-        self.note("claude 1", usage="20", resets="2026-11-07T12:00:00-08:00",
+        self.note("claude1", usage="20", resets="2026-11-07T12:00:00-08:00",
                   checked="2026-11-01T07:30:00+00:00", count=None, limit=None)
-        self.log(*self.climb("claude 1", "2026-11-01T05:30:00+00:00", "2026-11-01T07:30:00+00:00", 40, 20))
+        self.log(*self.climb("claude1", "2026-11-01T05:30:00+00:00", "2026-11-01T07:30:00+00:00", 40, 20))
         self.assertEqual(self.agent_lines(self.run_report(at="2026-11-01T00:45")), [
-            "* claude 1: 80%; runs out about 01:30 PST today, before its Sat 12:00 refill; resets unknown",
+            "* claude1: 80%; runs out about 01:30 PST today, before its Sat 12:00 refill; resets unknown",
         ])
 
     def test_run_out_rounds_across_fall_back(self) -> None:
-        self.note("claude 1", usage="10", resets="2026-11-07T12:00:00-08:00",
+        self.note("claude1", usage="10", resets="2026-11-07T12:00:00-08:00",
                   checked="2026-11-01T07:59:45+00:00", count=None, limit=None)
-        self.log(*self.climb("claude 1", "2026-11-01T05:59:45+00:00", "2026-11-01T07:59:45+00:00", 30, 10))
+        self.log(*self.climb("claude1", "2026-11-01T05:59:45+00:00", "2026-11-01T07:59:45+00:00", 30, 10))
         self.assertEqual(self.agent_lines(self.run_report(at="2026-11-01T01:00")), [
-            "* claude 1: 90%; runs out about 01:00 PST today, before its Sat 12:00 refill; resets unknown",
+            "* claude1: 90%; runs out about 01:00 PST today, before its Sat 12:00 refill; resets unknown",
         ])
 
     def test_agents_follow_multiple_holds_before_schedule(self) -> None:
@@ -271,78 +271,78 @@ class DailiesAgentsTests(unittest.TestCase):
 
     def test_under_an_hour_of_readings_uses_week_pace(self) -> None:
         """Ten points in half an hour would say 15:45 today."""
-        self.note("claude 1", usage="60", resets="2026-10-11T12:45:00", count=None, limit=None)
-        self.log(*self.climb("claude 1", "2026-10-05T19:15:00+00:00", "2026-10-05T19:45:00+00:00", 70, 60))
+        self.note("claude1", usage="60", resets="2026-10-11T12:45:00", count=None, limit=None)
+        self.log(*self.climb("claude1", "2026-10-05T19:15:00+00:00", "2026-10-05T19:45:00+00:00", 70, 60))
         self.assertEqual(self.agent_lines(self.run_report()), [
-            "* claude 1: 40%; runs out about Wed 00:45 PDT, before its Sun 12:45 refill; resets unknown",
+            "* claude1: 40%; runs out about Wed 00:45 PDT, before its Sun 12:45 refill; resets unknown",
         ])
 
     def test_time_logged_out_is_not_quiet_time(self) -> None:
         """Eight hours at 5 points an hour, a day logged out with no use, then one more reading: the pace stays 5 an hour."""
-        self.note("claude 1", usage="60", resets="2026-10-11T04:45:00", count=None, limit=None)
+        self.note("claude1", usage="60", resets="2026-10-11T04:45:00", count=None, limit=None)
         self.log(
-            *self.climb("claude 1", "2026-10-04T11:45:00+00:00", "2026-10-04T19:45:00+00:00", 100, 60),
-            ("claude 1", "2026-10-05T19:45:00+00:00", 60),
+            *self.climb("claude1", "2026-10-04T11:45:00+00:00", "2026-10-04T19:45:00+00:00", 100, 60),
+            ("claude1", "2026-10-05T19:45:00+00:00", 60),
         )
         self.assertEqual(self.agent_lines(self.run_report()), [
-            "* claude 1: 40%; runs out about Tue 00:45 PDT, before its Sun 04:45 refill; resets unknown",
+            "* claude1: 40%; runs out about Tue 00:45 PDT, before its Sun 04:45 refill; resets unknown",
         ])
 
     def test_quiet_recent_hours_move_the_run_out_later(self) -> None:
         """Both logs rise 20 points in 4 hours; the one whose last 2 hours were quiet runs out 44 minutes later."""
-        self.note("claude 1", usage="60", count=None, limit=None)
-        self.log(*self.climb("claude 1", "2026-10-05T15:45:00+00:00", "2026-10-05T19:45:00+00:00", 80, 60))
+        self.note("claude1", usage="60", count=None, limit=None)
+        self.log(*self.climb("claude1", "2026-10-05T15:45:00+00:00", "2026-10-05T19:45:00+00:00", 80, 60))
         self.assertEqual(self.agent_lines(self.run_report()), [
-            "* claude 1: 40%; runs out about Tue 00:45 PDT, before its Sun 23:00 refill; resets unknown",
+            "* claude1: 40%; runs out about Tue 00:45 PDT, before its Sun 23:00 refill; resets unknown",
         ])
         self.log(
-            *self.climb("claude 1", "2026-10-05T15:45:00+00:00", "2026-10-05T17:45:00+00:00", 80, 60),
-            *self.climb("claude 1", "2026-10-05T17:45:00+00:00", "2026-10-05T19:45:00+00:00", 60, 60)[1:],
+            *self.climb("claude1", "2026-10-05T15:45:00+00:00", "2026-10-05T17:45:00+00:00", 80, 60),
+            *self.climb("claude1", "2026-10-05T17:45:00+00:00", "2026-10-05T19:45:00+00:00", 60, 60)[1:],
         )
         self.assertEqual(self.agent_lines(self.run_report()), [
-            "* claude 1: 40%; runs out about Tue 01:29 PDT, before its Sun 23:00 refill; resets unknown",
+            "* claude1: 40%; runs out about Tue 01:29 PDT, before its Sun 23:00 refill; resets unknown",
         ])
 
     def test_missing_or_unreadable_log_uses_week_pace(self) -> None:
-        self.note("claude 1", usage="60", resets="2026-10-11T12:45:00", count=None, limit=None)
+        self.note("claude1", usage="60", resets="2026-10-11T12:45:00", count=None, limit=None)
         expected = [
-            "* claude 1: 40%; runs out about Wed 00:45 PDT, before its Sun 12:45 refill; resets unknown",
+            "* claude1: 40%; runs out about Wed 00:45 PDT, before its Sun 12:45 refill; resets unknown",
         ]
         self.assertEqual(self.agent_lines(self.run_report()), expected)
         self.readings.mkdir()
         self.assertEqual(self.agent_lines(self.run_report()), expected)
 
     def test_zero_rate_late_runout_and_refill_today(self) -> None:
-        self.note("claude 1", usage="60", resets="2026-10-11T12:45:00", count="0")
-        self.note("claude 2", usage="99", resets="2026-10-11T12:45:00", count="2")
-        self.note("codex 1", usage="60", resets="2026-10-05T23:00:00", count="1", limit=None)
+        self.note("claude1", usage="60", resets="2026-10-11T12:45:00", count="0")
+        self.note("claude2", usage="99", resets="2026-10-11T12:45:00", count="2")
+        self.note("codex1", usage="60", resets="2026-10-05T23:00:00", count="1", limit=None)
         self.log(
-            *self.climb("claude 1", "2026-10-05T17:45:00+00:00", "2026-10-05T19:45:00+00:00", 60, 60),
-            *self.climb("codex 1", "2026-10-05T17:45:00+00:00", "2026-10-05T19:45:00+00:00", 60, 60),
+            *self.climb("claude1", "2026-10-05T17:45:00+00:00", "2026-10-05T19:45:00+00:00", 60, 60),
+            *self.climb("codex1", "2026-10-05T17:45:00+00:00", "2026-10-05T19:45:00+00:00", 60, 60),
         )
         self.assertEqual(self.agent_lines(self.run_report()), [
-            "* claude 1: 40%; does not run out at this pace, so it hits its Sun 12:45 refill first; no resets available",
-            "* claude 2: 1%; runs out about Tue 11:45 PST, so it hits its Sun 12:45 refill first; 2 resets available until Oct 22",
-            "* codex 1: 40%; does not run out at this pace, so it hits its 23:00 today refill first; 1 reset available",
+            "* claude1: 40%; does not run out at this pace, so it hits its Sun 12:45 refill first; no resets available",
+            "* claude2: 1%; runs out about Tue 11:45 PST, so it hits its Sun 12:45 refill first; 2 resets available until Oct 22",
+            "* codex1: 40%; does not run out at this pace, so it hits its 23:00 today refill first; 1 reset available",
         ])
 
     def test_unknown_usage_and_no_active_note(self) -> None:
-        self.note("claude 1", usage="null", count=None, limit=None)
-        self.note("codex 1", resets="2026-10-04T23:00:00", count="0")
+        self.note("claude1", usage="null", count=None, limit=None)
+        self.note("codex1", resets="2026-10-04T23:00:00", count="0")
         self.assertEqual(self.agent_lines(self.run_report()), [
-            "* claude 1: week's usage unknown; refills Sun 23:00; resets unknown",
-            "* codex 1: week's usage unknown; refill time unknown; no resets available",
+            "* claude1: week's usage unknown; refills Sun 23:00; resets unknown",
+            "* codex1: week's usage unknown; refill time unknown; no resets available",
         ])
         (self.agents / "claude1.md").unlink()
         (self.agents / "codex1.md").unlink()
         self.assertEqual(self.agent_lines(self.run_report()), ["* none active"])
 
     def test_exhausted_and_missing_usage(self) -> None:
-        self.note("claude 1", usage="0", count="1")
-        self.note("codex 1", usage=None, resets=None, count=None, limit=None)
+        self.note("claude1", usage="0", count="1")
+        self.note("codex1", usage=None, resets=None, count=None, limit=None)
         self.assertEqual(self.agent_lines(self.run_report()), [
-            "* claude 1: 100%; ran out, back at its Sun 23:00 refill; 1 reset available until Oct 22",
-            "* codex 1: week's usage unknown; refill time unknown; resets unknown",
+            "* claude1: 100%; ran out, back at its Sun 23:00 refill; 1 reset available until Oct 22",
+            "* codex1: week's usage unknown; refill time unknown; resets unknown",
         ])
 
 
