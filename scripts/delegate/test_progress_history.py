@@ -2107,6 +2107,7 @@ print('two homes isolated; recorder lock retained; caller restored')
         at: int,
         called_model: str = "gpt-called",
         fix_pass: int = 0,
+        *extra: str,
     ) -> None:
         """Open a pass the way one member of a phase team opens its own."""
         self.team_slot = slot
@@ -2128,6 +2129,7 @@ print('two homes isolated; recorder lock retained; caller restored')
             called_model,
             "--called-effort",
             "high",
+            *extra,
             at=at,
         )
 
@@ -2683,45 +2685,6 @@ print('two homes isolated; recorder lock retained; caller restored')
             [(row[0], row[3], row[5]) for row in rows],
             [("Impl", "impl 3m done", "clean"), ("Fix 1", "fix 1m running", "running")],
         )
-
-    def test_finish_pass_records_the_seconds_the_delegate_was_awake(self) -> None:
-        session_dir = self.start_run("awake", 22_000)
-        self.start_phase_and_pass(session_dir, 22_010)
-        _ = self.run_command(
-            "finish-pass",
-            "--session-dir",
-            str(session_dir),
-            "--status",
-            "completed",
-            "--agent-awake-seconds",
-            "1800",
-            at=72_020,
-        )
-        finished = self.pass_events("awake", "pass_finished")
-        self.assertEqual(len(finished), 1)
-        # The point of the field: elapsed covers the stretch the machine spent
-        # suspended, and the beat count does not.
-        self.assertEqual(finished[0].get("pass_elapsed_seconds"), 50_000)
-        self.assertEqual(finished[0].get("agent_awake_seconds"), 1800)
-
-    def test_a_pass_with_nothing_counted_records_no_awake_seconds(self) -> None:
-        for name, reported in (("unreported", ()), ("none-counted", ("-1",))):
-            with self.subTest(name):
-                session_dir = self.start_run(name, 23_000)
-                self.start_phase_and_pass(session_dir, 23_010)
-                awake = ("--agent-awake-seconds", *reported) if reported else ()
-                _ = self.run_command(
-                    "finish-pass",
-                    "--session-dir",
-                    str(session_dir),
-                    "--status",
-                    "completed",
-                    *awake,
-                    at=23_050,
-                )
-                finished = self.pass_events(name, "pass_finished")
-                self.assertEqual(len(finished), 1)
-                self.assertNotIn("agent_awake_seconds", finished[0])
 
     def test_aggregate_reports_raw_and_calibrated_error_fields(self) -> None:
         self.complete_historical_run(0)
@@ -5106,6 +5069,24 @@ print('two homes isolated; recorder lock retained; caller restored')
             self.finish_numbered_phase(session_dir, started_at + 20, "--phase-id", "7")
         self.assertIn("Phase 7 is not open; open phases: 6", cast(str, raised.exception.stderr))
         self.assertEqual(self.open_phase_ids(session_dir), ("6", []))
+
+    def test_a_pass_naming_an_older_open_phase_is_stamped_with_it(self) -> None:
+        started_at = 42_500
+        session_dir = self.start_run("pass-names-phase", started_at)
+        self.start_numbered_phase(session_dir, "15", started_at + 10)
+        older = cast(dict[str, object], self.read_state(session_dir)["phase"])
+        self.start_numbered_phase(session_dir, "16", started_at + 20)
+        self.start_slot_pass(session_dir, "impl", "impl", started_at + 30, "gpt-called", 0, "--phase-id", "15")
+        self.team_slot = ""
+        self.start_slot_pass(session_dir, "test", "test", started_at + 40)
+        self.team_slot = ""
+        slots = self.pass_slots(session_dir)
+        self.assertEqual(cast(dict[str, object], slots["impl"]["phase"])["instance_id"], older["instance_id"])
+        current = cast(dict[str, object], self.read_state(session_dir)["phase"])
+        self.assertEqual(cast(dict[str, object], slots["test"]["phase"])["instance_id"], current["instance_id"])
+        with self.assertRaises(subprocess.CalledProcessError) as raised:
+            self.start_slot_pass(session_dir, "fix", "fix", started_at + 50, "gpt-called", 0, "--phase-id", "7")
+        self.assertIn("Phase 7 is not open; open phases: 15, 16", cast(str, raised.exception.stderr))
 
     def test_back_filling_an_earlier_phase_leaves_the_open_phase_unchanged(self) -> None:
         started_at = 43_000

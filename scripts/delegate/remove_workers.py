@@ -23,10 +23,10 @@ Every launch appends `<id>\\t<name>` to its run's `workers` ledger. This removes
     own cleanup ran.
 
 A run is live while a run-active marker names its session directory and the
-unit director that wrote the marker is still listed, or while its
-heartbeat log moved in the last `LIVE_HEARTBEAT_SECS`. The heartbeat test
-covers a run with no marker, which prepare_session.sh skips outside a Claude
-session: a worker still working beats every minute.
+unit director that wrote the marker is still listed, or while its heartbeat
+log moved in the last `unit_runs.LIVE_HEARTBEAT_SECS`. The heartbeat test covers
+a run with no marker, which prepare_session.sh skips outside a Claude session: a
+worker still working beats every minute.
 
 Only background sessions are ever removed, and never the session running this.
 After a successful Claude session listing, phase cleanup also asks codex_mesh to
@@ -60,8 +60,6 @@ else:
 # Run folders sit under unit/, and under delegate/ for a run started before the rename.
 DEFAULT_ROOTS = unit_runs.run_roots()
 LEDGER = "workers"
-HEARTBEAT = "heartbeat.log"
-LIVE_HEARTBEAT_SECS = 600
 CLAUDE_TIMEOUT_SECS = 30
 SHUTDOWN_TIMEOUT_SECS = 30
 SHUTDOWN = Path(__file__).resolve().parents[1] / "shutdown" / "shutdown.py"
@@ -200,8 +198,8 @@ def live_runs(roots: tuple[Path, ...], listed_sessions: set[str]) -> set[Path]:
                 lines = marker.read_text(encoding="utf-8").splitlines()
                 if lines and lines[0].strip():
                     live.add(Path(lines[0].strip()).resolve())
-        for heartbeat in root.glob(f"*/{HEARTBEAT}"):
-            if now - heartbeat.stat().st_mtime < LIVE_HEARTBEAT_SECS:
+        for heartbeat in root.glob(f"*/{unit_runs.HEARTBEAT}"):
+            if now - heartbeat.stat().st_mtime < unit_runs.LIVE_HEARTBEAT_SECS:
                 live.add(heartbeat.parent.resolve())
     return live
 
