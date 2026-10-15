@@ -45,7 +45,7 @@ The folder is the repository boundary; `crate` narrows ownership. A project with
 
 ### Vault layout
 
-The vault of record is natedev's `/home/natepiano/rust/hanadocs`. It holds one folder per project, `feature-log/{hana,natedev,cargo-liner,bevy_brp,obsidian_knife,nateroids,claude}/`, named exactly as the project keys, and the Bases at the vault root. A write creates a missing folder; `check` and `live` treat one as empty. The vault owner adds a new project's Base, `feature-log - claude.base` included. A note's path is `feature-log/<project>/<title>.md`. The vault is a git repository that agents never commit.
+The vault of record is natedev's `/home/natepiano/rust/hanadocs`. It holds one folder per project, `feature-log/{hana,natedev,cargo-liner,bevy_brp,obsidian_knife,nateroids,claude}/`, named exactly as the project keys, and the Bases at the vault root. A write creates a missing folder; `check` and `live` treat one as empty. The vault owner adds a new project's Base, `feature-log - claude.base` included. A note's path is `feature-log/<project>/<title>.md`. The vault is a git repository. Agents never commit their hand edits in it; a script commits the files it writes, and only those (the `hanadocs-commit.py` jobs in `/etc/nixos/modules/linux/`, and `change_review.py` for a change-review list).
 
 | Base | Views |
 | --- | --- |

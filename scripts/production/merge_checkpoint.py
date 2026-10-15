@@ -3,7 +3,8 @@
 
 A unit checkpoint commit without its Change-Review line is held before the merge. After the push,
 each visible change becomes a row in the change-review list the production doc names
-(`change_review.py`); the first row creates a missing list, and the file is written and never committed.
+(`change_review.py`); the first row creates a missing list, and the list commits itself when it sits in a git
+work tree. A refused commit warns and never fails the merge.
 """
 from __future__ import annotations
 

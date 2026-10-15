@@ -132,6 +132,22 @@ class ActionTest(unittest.TestCase):
         self.assertEqual(run("add", "--list", str(self.fresh), "--change", "A", "--check", "B")[1], "C1\n")
         self.assertIn(f"| C1 | A | {day} | B |", self.fresh.read_text(encoding="utf-8"))
 
+    def test_back_to_back_adds_in_one_shell_each_append_the_next_number(self) -> None:
+        changes = [("cargo-handler nests a showrunner | inside its parent", "open `cargo-handler` on natedev"),
+                   ("tile titles carry the role: showrunner, unit director", "read the tile titles"),
+                   ("cargo-tile no longer panics at startup", "start it; ~/.config/cargo-tile/panic.log gains nothing"),
+                   ("cargo-berth gives each phase its own reservation", "run `cargo-berth board | grep phase`")]
+        script = str(Path(change_review.__file__))
+        for path, first in ((self.fresh, 1), (self.path, 81)):
+            numbers = [subprocess.run([sys.executable, script, "add", "--list", str(path), "--change", change,
+                                       "--check", check, "--merged", "4ad20245"],
+                                      capture_output=True, text=True, check=True).stdout.strip()
+                       for change, check in changes]
+            self.assertEqual(numbers, [f"C{number}" for number in range(first, first + len(changes))])
+            rows = [row for row in change_review.pending(path) if row["#"] in numbers]
+            self.assertEqual([(row["#"], row["Change"], row[change_review.CHECK]) for row in rows],
+                             [(number, change, check) for number, (change, check) in zip(numbers, changes)])
+
     def test_add_refuses_an_empty_or_multi_line_part_and_writes_nothing(self) -> None:
         for change, check in (("", "Look"), ("A", " "), ("A\nB", "Look")):
             code, _, error = run("add", "--list", str(self.path), "--change", change, "--check", check)
@@ -193,6 +209,87 @@ class ActionTest(unittest.TestCase):
         self.assertEqual(run("list-path", "--production", str(doc))[:2], (1, ""))
         with mock.patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": ""}):
             self.assertIn("pass --production", run("list-path")[2])
+
+
+class CommitTest(unittest.TestCase):
+    """Each write commits the list alone when it sits in a git work tree, in a scratch repository."""
+
+    repo: Path = Path()
+    path: Path = Path()
+
+    def git(self, *arguments: str) -> str:
+        return subprocess.run(["git", "-C", str(self.repo), *arguments], capture_output=True, text=True,
+                              check=True).stdout.strip()
+
+    @override
+    def setUp(self) -> None:
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        self.repo = Path(directory.name) / "vault"
+        self.repo.mkdir()
+        _ = self.git("init", "-q", "-b", "main")
+        for key, value in (("user.name", "t"), ("user.email", "t@t"), ("commit.gpgsign", "false")):
+            _ = self.git("config", key, value)
+        _ = (self.repo / "note.md").write_text("note\n", encoding="utf-8")
+        _ = self.git("add", "note.md")
+        _ = self.git("commit", "-q", "-m", "note")
+        self.path = self.repo / "change-review" / "hana.md"
+
+    def last(self) -> tuple[str, list[str]]:
+        """The newest commit's subject and the files it changes."""
+        return self.git("log", "-1", "--format=%s"), self.git("show", "--name-only", "--format=", "HEAD").splitlines()
+
+    def test_add_commits_a_new_list_and_then_the_existing_one(self) -> None:
+        self.assertEqual(run("add", "--list", str(self.path), "--change", "A", "--check", "B"), (0, "C1\n", ""))
+        self.assertEqual(self.last(), ("change-review: hana add C1", ["change-review/hana.md"]))
+        self.assertEqual(run("add", "--list", str(self.path), "--change", "C", "--check", "D", "--merged", "4ad20245"),
+                         (0, "C2\n", ""))
+        self.assertEqual(self.last(), ("change-review: hana row C2 from 4ad20245", ["change-review/hana.md"]))
+        _ = change_review.append_rows(self.path, [Visible("E", "F"), Visible("G", "H")], date(2026, 10, 15), "61b65bbf")
+        self.assertEqual(self.last(), ("change-review: hana rows C3–C4 from 61b65bbf", ["change-review/hana.md"]))
+        self.assertEqual(self.git("status", "--porcelain"), "")
+
+    def test_a_verdict_commits_the_list(self) -> None:
+        _ = run("add", "--list", str(self.path), "--change", "A", "--check", "B")
+        self.assertEqual(run("verdict", "--list", str(self.path), "--row", "C1", "--verdict", "works"),
+                         (0, "C1 landed\n", ""))
+        self.assertEqual(self.last(), ("change-review: hana verdict C1", ["change-review/hana.md"]))
+        self.assertIn("| C1 | A | works |", self.git("show", "HEAD:change-review/hana.md"))
+
+    def test_another_staged_file_stays_staged_and_uncommitted(self) -> None:
+        _ = (self.repo / "note.md").write_text("staged edit\n", encoding="utf-8")
+        _ = (self.repo / "draft.md").write_text("new\n", encoding="utf-8")
+        _ = self.git("add", "note.md", "draft.md")
+        _ = run("add", "--list", str(self.path), "--change", "A", "--check", "B")
+        self.assertEqual(self.last(), ("change-review: hana add C1", ["change-review/hana.md"]))
+        self.assertEqual(self.git("diff", "--cached", "--name-only").splitlines(), ["draft.md", "note.md"])
+        self.assertEqual(self.git("show", ":note.md"), "staged edit")
+
+    def test_a_list_outside_any_repository_is_written_and_not_committed(self) -> None:
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        outside = Path(directory.name) / "change-review" / "hana.md"
+        self.assertEqual(run("add", "--list", str(outside), "--change", "A", "--check", "B"), (0, "C1\n", ""))
+        self.assertIn("| C1 | A |", outside.read_text(encoding="utf-8"))
+        self.assertEqual(self.git("rev-list", "--count", "HEAD"), "1")
+
+    def test_a_held_index_lock_warns_writes_and_the_next_add_commits_both_rows(self) -> None:
+        lock = self.repo / ".git" / "index.lock"
+        _ = lock.write_text("", encoding="utf-8")
+        code, output, error = run("add", "--list", str(self.path), "--change", "A", "--check", "B")
+        self.assertEqual((code, output), (0, "C1\n"))
+        self.assertEqual(len(error.splitlines()), 1)
+        self.assertIn(f"change review: {self.path} written but not committed: ", error)
+        self.assertIn("; the next write commits it", error)
+        self.assertIn("| C1 | A |", self.path.read_text(encoding="utf-8"))
+        self.assertEqual(self.git("rev-list", "--count", "HEAD"), "1")
+        lock.unlink()
+        self.assertEqual(run("add", "--list", str(self.path), "--change", "C", "--check", "D"), (0, "C2\n", ""))
+        self.assertEqual(self.last(), ("change-review: hana add C2", ["change-review/hana.md"]))
+        committed = self.git("show", "HEAD:change-review/hana.md")
+        self.assertIn("| C1 | A |", committed)
+        self.assertIn("| C2 | C |", committed)
+        self.assertEqual(self.git("status", "--porcelain"), "")
 
 
 class RepositoryTest(unittest.TestCase):

@@ -31,6 +31,13 @@ A production doc without a Change review line has no list: say so in one
 line. The showrunner adds the line (`~/.claude/docs/production_format.md`). A
 missing list file is created on its first row.
 
+Every write commits the list itself when it sits in a git repository, so never
+commit it by hand. A `written but not committed` warning needs nothing: the
+write stands and the next write commits it. The vault's Templater must exclude
+the change-review folder, since its creation trigger rewrites a new list within
+half a second and can drop a row; the vault owner sets Excluded folders →
+`change-review`.
+
 ## add
 
 For a change the user should check that no checkpoint `Change-Review:` line
