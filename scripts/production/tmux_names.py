@@ -143,8 +143,14 @@ def rename_session(pane: str, old: str, new: str) -> SessionRenamed | RenameInco
     return _rename_session(pane, old, new, panes)
 
 
-def fault(kind: str, old: str, new: str, settings: showrunners.ShowrunnerSettings) -> None:
-    key = hashlib.sha256(f"{kind}\0{old}\0{new}".encode()).hexdigest()
+def fault(kind: str, old: str, new: str | tuple[str, ...], settings: showrunners.ShowrunnerSettings) -> None:
+    """Tell the showrunner once per fault. A single new name is part of the fault; several are not,
+    because the Claude sessions sharing a tmux session come and go, and the message names them all."""
+    if isinstance(new, str):
+        identity, skipped = f"{kind}\0{old}\0{new}", f"{old} → {new}"
+    else:
+        identity, skipped = f"{kind}\0{old}", f"{old} (sessions {', '.join(sorted(new))})"
+    key = hashlib.sha256(identity.encode()).hexdigest()
     FAULT_STATE_DIR.mkdir(parents=True, exist_ok=True)
     marker = FAULT_STATE_DIR / key
     if marker.exists():
@@ -158,7 +164,7 @@ def fault(kind: str, old: str, new: str, settings: showrunners.ShowrunnerSetting
     except OSError as error:
         print(f"tmux-names: {error}", file=sys.stderr)
         return
-    message = f"tmux-names: skipped {old} → {new}: {kind}"
+    message = f"tmux-names: skipped {skipped}: {kind}"
     if socket is None:
         message += (f". {settings['faults_to']}, which {showrunners.CONFIG} names for faults, is not a live session,"
                     + " so every running showrunner that reports to no running one is told.")
@@ -205,7 +211,7 @@ def tick() -> None:
         if any(session.name == old for session in hosted):
             continue
         if len(hosted) > 1:
-            fault("more than one Claude session", old, new, settings)
+            fault("more than one Claude session", old, tuple(session.name for session in hosted), settings)
             continue
         if not hosted[0].user_named:
             continue
