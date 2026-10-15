@@ -95,38 +95,33 @@
 
 ### Phase 3 — rename.py unit|finish (per unit)  · status: done
 
-#### Work Order
+#### As-built
 
-**Goal:** `rename.py unit <new> <unit>` moves one unit's branch and worktree between its runs. `finish <new>` retires the old merge branch once every unit has moved.
-
-**Depends on:** Phase 2
-
-**Spec:**
-- `unit` refuses while the unit's tmux session has a live Claude in the worktree, or when its state cannot be told: it inspects unit_lookup's `LiveClaude | ClaudeNotRunning | ClaudeUnknown` result (the `pane` command prints a pane in every state, so its output alone is not a liveness check), refuses `LiveClaude` and `ClaudeUnknown`, and proceeds on `ClaudeNotRunning`.
-- `unit` and `finish` start only once the journal shows step 7; each records its own progress in the journal under the existing `rename.lock`, keeps the `done` flag it read, and resumes an interrupted unit move or branch deletion on rerun. `finish` run again after success is a no-op.
-- Session discovery keeps working while sessions still carry old-slug marks: `unit_lookup.py` normalizes each discovered session's production through `canonical_slug` before grouping, keeping duplicate detection, so `list` and `pane` find a unit under either slug from apply until the unit is relaunched.
-- Branch: create `<new>-<stem>` at the old tip, push it, and delete the old local and remote branch only after the push succeeds.
-- Worktree: `git worktree move` it to the new path, then `git worktree repair`, as in `relocate_legacy_worktree`.
-- For each `~/.claude*/` config dir holding them: rename `projects/<old-path-dashed>` to `projects/<new-path-dashed>`. In `.claude.json` `projects`, copy the old worktree path's entry to the new path's key and leave the old key in place, writing atomically with rename_state's writers. Live sessions on that account rewrite the whole file from memory, so read it back after 2 s and write again if the new key is gone, up to 3 tries. After that, refuse and name the file; the unit then gets one trust prompt at its next launch, which is the only cost.
-- Rewrite the unit's Units row Worktree and Branch cells in the same commit style as Phase 2.
-- The tmux mark is rewritten when the unit is next launched by add_unit; `unit` prints that.
-- `finish` refuses while any Units row still names an `<old>`-prefixed branch. It then deletes the journal's recorded `merge_branch` (read from Production Context; it may differ from `<old>`) locally and on origin and marks the journal done.
+- `rename.py unit <new> <unit>` and `finish <new>` run only once the journal (`rename.json`) shows apply step 7, and hold `rename.lock` while they run. `unit` moves one stopped unit through journal steps 0–5 in `unit_moves[<unit>]`. The steps: push `<new>-<stem>` at the recorded old tip; `git worktree move` it to `<repo>-<new>-<stem>`, then repair and switch to the new branch; move `projects/<dashed path>` in every `~/.claude*` dir and in `CLAUDE_CONFIG_DIR`, and copy the trust key in `.claude.json` (2 s read-back, 3 tries, then refuse and name the file); rewrite the unit's Units row Worktree/Branch cells and commit as `chore(<new>): rename unit <unit> from <old>`; delete the old branch on origin, then locally. A rerun resumes from the recorded step. The command prints that add_unit rewrites the tmux mark at the next launch.
+- `unit` refuses when: Claude is live or its state is unknown (`LiveClaude`/`ClaudeUnknown`); any session host is unreadable (`marked_units(new, every_host=True)`); the row is retired or missing a Worktree/Branch column; the old branch has moved past the recorded tip; another unit's move is unfinished; the rename is already done; the showrunner checkout is dirty or not on the new merge branch.
+- `finish` refuses while a non-retired row names an `<old>-` branch, a unit move is unfinished, or the checkout is off the new merge branch. It deletes the journal's `merge_branch` (which may differ from `<old>`) on origin and then locally, records `finish_step` 1–2, and sets `done: true`. A rerun after success does nothing.
+- `unit_lookup` files sessions that carry old-slug marks under the current slug, through a private `_lookup_slug`. A slug whose `showrunner-<slug>` notifier dir exists is current and needs no timer-doc read. Any other slug goes through `showrunners.canonical_slug`, once per distinct discovered slug. Duplicate detection still applies after normalization, so `list` and `pane` find a unit under either slug until it is relaunched.
+- `marked_units(slug, *, every_host=False)` / `every_marked_unit(*, include_tmux=True, every_host=False)`: on the default path a single host failure is tolerated, and the call raises only when every host fails, with each error's original text. `every_host=True` raises on any host failure, and adds the host name as a prefix only when the error text does not already start with it.
+- `stall_watch` matches detached work by canonical slug, so work with old-slug marks still counts.
 
 **Files:**
-- `scripts/production/rename.py` — `unit`, `finish`.
-- `scripts/production/unit_lookup.py` — canonical production for discovered sessions.
-- `scripts/production/test_rename.py` — tests.
-- `scripts/production/test_unit_lookup.py` — tests.
+- `scripts/production/rename.py` — `unit`, `finish` and their CLI subcommands.
+- `scripts/production/unit_lookup.py` — canonical-slug discovery via `_lookup_slug`, `every_host`.
+- `scripts/production/stall_watch.py` — canonical matching of process marks.
+- `scripts/production/test_rename.py`, `test_unit_lookup.py`, `test_stall_watch.py` — tests.
 
-**Workers:** 1 writer + 1 tester
-- `impl` — rename.py and unit_lookup.py; hub: rename.py.
-- `test` — test_rename.py and test_unit_lookup.py: a unit move on a temp repo with a worktree, and a temp config dir holding a projects dir and a `.claude.json` key; refusal while live and while unknown, success while stopped; finish refuses while a row is unmoved; retries of an interrupted unit move and finish; repeated finish; finish with a merge branch that differs from the slug; a later rename archiving the completed journal; list and pane finding an old-marked session under both slugs.
+**Binds later work:** Command doc and as-built documents the refusals listed above and states that recovery is a rerun of the same command (unit move or finish). Live check on a scratch production reaches a worktree path containing `.`/`_`, and both trust-file layouts, only through the `HOME`/`CLAUDE_CONFIG_DIR` overrides.
 
-**Constraints from prior phases:** the journal at `SHOWRUNNER_STATE_DIR/<new>/rename.json` (apply leaves it at step 7 with `done: false`; `finish` sets `done: true`); Formerly resolution; Phase 2 keeps the old merge branch until `finish`. A retired Units row (Plan cell starting `(retired`, `add_unit.plan_cell_is_retired`) has no live worktree: `unit` refuses it, and `finish` ignores retired rows when it checks for unmoved `<old>`-prefixed branches. The live build-followups doc has such rows.
+**Gotchas:**
+- Claude's projects-dir name replaces every non-alphanumeric character of the worktree path with `-`, not only `/`.
+- The default account's trust file is `~/.claude.json` in `HOME`, not inside `~/.claude/`. Other config dirs keep `<dir>/.claude.json`.
+- A single failing session host can hide live units, so `unit` uses `every_host=True`.
+- The old branch tip is re-checked before each destructive step.
+- Commit detection reads the Units row at `HEAD`, so merges onto the merge branch between steps do not block a resume.
+- `_lookup_slug` keeps the shutdown inventory within its timer-read budget: the membership check and the missing-target check share one timer read.
+- `unit_lookup.py` is shared: the shutdown (`scripts/shutdown/test_inventory.py`) and message (`scripts/message/test_roster.py`) suites exercise it. A change there needs the full merge-gate suites (`scripts/production/merge_gate.py --tests-only`), not only the production suites.
 
-**Acceptance gate:** `python3 -m unittest scripts.production.test_rename scripts.production.test_unit_lookup` green; basedpyright 0/0.
-
-### Phase 4 — Command doc and as-built  · status: todo
+### Phase 4 — Command doc and as-built  · status: done
 
 #### Work Order
 

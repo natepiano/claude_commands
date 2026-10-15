@@ -83,6 +83,7 @@ The production doc sits beside the source plan as `<source-stem>-production.md`.
 
 ## Production Context
 
+- **Formerly:** `<old>`, `<older>` — previous production slugs; omit before the first rename
 - **Source plans:** <path(s)> — split on <date> by /producer:to_production
 - **Repository:** <main checkout path>
 - **Merge branch:** `<branch>` — every unit merges here; only the showrunner pushes it
