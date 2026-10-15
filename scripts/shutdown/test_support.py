@@ -6,10 +6,11 @@ import shlex
 import unittest
 from enum import StrEnum
 from types import ModuleType
-from typing import Never, cast, override
+from typing import Literal, Never, cast, override
 from unittest.mock import patch
 
 import remote
+import remote_control
 import restart
 import settle
 import shutdown
@@ -23,6 +24,7 @@ class ShutdownSendLeaf(StrEnum):
     RESTART_RETIRE = "restart._retire"
     RUN_REMOTE = "remote.run_remote"
     LAUNCH_CONDUCTOR = "settle._launch_conductor"
+    LAUNCH_REMOTE_CONTROL_FIXER = "remote_control.launch_fixer"
     RUN_NOTIFIER = "settle.run_notifier"
 
 
@@ -44,6 +46,9 @@ _REAL_LEAF_BINDINGS: dict[ShutdownSendLeaf, tuple[tuple[ModuleType, str, object]
     ),
     ShutdownSendLeaf.LAUNCH_CONDUCTOR: (
         (settle, "_launch_conductor", settle._launch_conductor),  # pyright: ignore[reportPrivateUsage]
+    ),
+    ShutdownSendLeaf.LAUNCH_REMOTE_CONTROL_FIXER: (
+        (remote_control, "launch_fixer", remote_control.launch_fixer),
     ),
     ShutdownSendLeaf.RUN_NOTIFIER: ((settle, "run_notifier", settle.run_notifier),),
 }
@@ -73,6 +78,7 @@ class ShutdownTestCase(unittest.TestCase):
             ShutdownSendLeaf.RUN_REMOTE: self._block_run_remote,
             ShutdownSendLeaf.LAUNCH_CONDUCTOR: self._block_launch_conductor,
             ShutdownSendLeaf.RUN_NOTIFIER: self._block_run_notifier,
+            ShutdownSendLeaf.LAUNCH_REMOTE_CONTROL_FIXER: self._block_launch_remote_control,
         }
         for leaf, bindings in _REAL_LEAF_BINDINGS.items():
             for module, name, _real in bindings:
@@ -138,6 +144,12 @@ class ShutdownTestCase(unittest.TestCase):
         self._reached_send_leaf(
             ShutdownSendLeaf.LAUNCH_CONDUCTOR, f"conductor for {login}"
         )
+
+    def _block_launch_remote_control(
+        self, session_id: str, pid: int, proc_start: str, who: str, alerts: Literal["user", "none"]
+    ) -> Never:
+        del pid, proc_start, who, alerts
+        self._reached_send_leaf(ShutdownSendLeaf.LAUNCH_REMOTE_CONTROL_FIXER, f"session:{session_id}")
 
     def _block_run_notifier(self, verb: str, instance: str) -> Never:
         del verb

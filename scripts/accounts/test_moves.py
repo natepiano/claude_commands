@@ -27,7 +27,7 @@ class MoveJournalTests(unittest.TestCase):
             tool="claude" if tool == "claude" else "codex", subject=subject, move_id="transition-1")
 
     def requested(self) -> moves.RequestedMove:
-        return {**self.common(), "kind": "requested", "from": "codex 1", "to": "codex 2",
+        return {**self.common(), "kind": "requested", "from": "codex1", "to": "codex2",
             "why": "quota refusal", "window": "unknown"}
 
     def test_every_transition_kind_round_trips_without_losing_its_semantics(self) -> None:
@@ -40,7 +40,7 @@ class MoveJournalTests(unittest.TestCase):
             moves.WaitedMove(**self.common(), kind="waited", window="five_hour", reset="2026-10-13T12:19:00+00:00"),
             moves.WaitEndedMove(**self.common(), kind="wait ended"),
             moves.NoRoomMove(**self.common(), kind="no room", earliest_reset="2026-10-15T12:00:00+00:00"),
-            moves.RoomAgainMove(**self.common(), kind="room again", label="codex 2"),
+            moves.RoomAgainMove(**self.common(), kind="room again", label="codex2"),
         ]
         for entry in entries:
             moves.append_move(entry)
@@ -48,6 +48,21 @@ class MoveJournalTests(unittest.TestCase):
         path = self.home / ".local/state/accounts/moves.jsonl"
         self.assertEqual(len(path.read_text().splitlines()), len(entries))
         self.assertEqual({entry["move_id"] for entry in moves.read_moves()}, {"transition-1"})
+
+    def test_legacy_labels_are_normalized_without_rewriting_the_journal(self) -> None:
+        path = moves.store_file()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        records = [
+            {**self.requested(), "from": "codex 1", "to": "claude 2"},
+            {**self.common(), "kind": "room again", "label": "codex 1"},
+        ]
+        original = "".join(json.dumps(entry) + "\n" for entry in records).encode()
+        _ = path.write_bytes(original)
+        loaded = moves.read_moves()
+        self.assertEqual(loaded[0].get("from"), "codex1")
+        self.assertEqual(loaded[0].get("to"), "claude2")
+        self.assertEqual(loaded[1].get("label"), "codex1")
+        self.assertEqual(path.read_bytes(), original)
 
     def test_request_alone_never_implies_confirmation(self) -> None:
         requested = self.requested()

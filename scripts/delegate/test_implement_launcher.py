@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import os
+import select
 import signal
 import shutil
 import subprocess
@@ -21,7 +22,8 @@ import unittest
 from pathlib import Path
 from typing import TypedDict, cast, override
 
-from scripts.delegate.wait_for_test_state import wait_for_file, wait_until
+from scripts.delegate.wait_for_test_state import wait_for_file, wait_for_pid, wait_until
+from scripts.delegate.recorder_fixture import communicate_launcher, invoke_recorder
 
 
 DELEGATE_DIR = Path(__file__).parent
@@ -359,13 +361,7 @@ class ImplementLauncherWorkerTests(unittest.TestCase):
     def recorder(self, *arguments: str) -> None:
         environment = self.environment()
         environment["PLAN_DELEGATE_PASS_OWNER"] = "launcher"
-        result = subprocess.run(
-            ["python3", str(DELEGATE_DIR / "progress_history.py"), *arguments],
-            check=False,
-            capture_output=True,
-            text=True,
-            env=environment,
-        )
+        result = invoke_recorder(arguments, environment, Path.cwd())
         self.assertEqual(result.returncode, 0, result.stderr)
 
     def start_phase(self, name: str) -> Path:
@@ -407,6 +403,103 @@ class ImplementLauncherWorkerTests(unittest.TestCase):
         if fail:
             environment["STUB_FOLLOW_FAIL"] = "1"
         return environment
+
+    def test_identity_probes_default_to_thirty_one_second_waits_for_new_and_followed_workers(self) -> None:
+        for follow in (False, True):
+            with self.subTest(follow=follow):
+                session = self.start_phase(f"default-probes-{follow}")
+                arguments = ["bash", str(self.implement_script)]
+                if follow:
+                    initial = self.mesh_launch(session)
+                    self.assertEqual(initial.returncode, 0, initial.stderr)
+                    roster = cast("dict[str, object]", json.loads((session / "mesh_roster.json").read_text()))
+                    arguments.extend(["--to", next(iter(roster))])
+                arguments.extend([str(session), str(self.working_dir), str(self.prompt_file),
+                                  "impl", "the retry path", "impl", "writing the retry path", "0", "impl"])
+                binaries = session / "bin"
+                binaries.mkdir()
+                sleep = binaries / "sleep"
+                _ = sleep.write_text('#!/bin/bash\nprintf "%s\\n" "$*" >> "$TEST_PROBES"\n')
+                sleep.chmod(0o755)
+                watcher = self.root / "scripts/agents/heartbeat_watch.sh"
+                _ = watcher.write_text('#!/bin/bash\nif [[ -n "${TEST_PROBES_FINISHED:-}" ]]; then '
+                                       + ': > "$TEST_PROBES_FINISHED"; fi\n')
+                mesh = self.root / "scripts/agents/codex_mesh.py"
+                _ = mesh.write_text(STUB_MESH.replace(
+                    "verb = sys.argv[1]", "verb = sys.argv[1]\n"
+                    + "if verb in ('start', 'follow'):\n"
+                    + "    import subprocess\n"
+                    + "    agent_pid = pathlib.Path(os.environ['TEST_AGENT_PID'])\n"
+                    + "    agent_pid.with_name(agent_pid.name + '.tmp').write_text(str(os.getpid()))\n"
+                    + "    os.replace(agent_pid.with_name(agent_pid.name + '.tmp'), agent_pid)\n"
+                    + "    subprocess.run([sys.executable, os.environ['TEST_WAIT_HELPER'], os.environ['TEST_DEFAULT_RELEASE']], check=True)"
+                ))
+                probes = session / "probes"
+                finished = session / "probes-finished"
+                release = session / "release"
+                pid_file = session / "agent-pid"
+                environment = self.mesh_environment()
+                for key in ("PLAN_DELEGATE_WORKER_POLL_SECS", "PLAN_DELEGATE_WORKER_WAIT_ATTEMPTS",
+                            "PLAN_DELEGATE_EARLY_POLL_SECS", "PLAN_DELEGATE_TOKEN_CLOCK_FILE"):
+                    _ = environment.pop(key, None)
+                environment.update({"PATH": str(binaries) + os.pathsep + environment["PATH"],
+                                    "TEST_PROBES": str(probes), "TEST_PROBES_FINISHED": str(finished),
+                                    "TEST_AGENT_PID": str(pid_file), "TEST_DEFAULT_RELEASE": str(release)})
+                process = subprocess.Popen(arguments, env=environment, stdout=subprocess.PIPE,
+                                           stderr=subprocess.PIPE, text=True, start_new_session=True)
+                try:
+                    wait_until(lambda: finished.exists(), session, processes=(process,))
+                    os.kill(wait_for_pid(pid_file, processes=(process,)), 0)
+                    self.assertIsNone(process.poll())
+                    self.assertEqual(probes.read_text().splitlines(), ["1"] * 30)
+                    if follow:
+                        claim = cast("dict[str, object]", json.loads((session / "impl_claim_impl.json").read_text()))
+                        self.assertEqual(claim["turn_id"], "")
+                    else:
+                        self.assertFalse((session / "impl_worker_impl.json").exists())
+                finally:
+                    output, errors = self.finish_default_launcher(process, release, mesh)
+                self.assertEqual(process.returncode, 0, output + errors)
+
+    def finish_default_launcher(self, process: subprocess.Popen[str], release: Path,
+                                mesh: Path, timeout: float = 300) -> tuple[str, str]:
+        try:
+            release.touch()
+            return communicate_launcher(process, timeout)
+        finally:
+            # A timeout must also restore the fixture for the next subcase.
+            _ = mesh.write_text(STUB_MESH)
+
+    def test_default_launcher_timeout_reaps_its_group_and_restores_the_mesh(self) -> None:
+        ready = self.root / "blocked-launcher-child"
+        child_code = ("import os, signal, sys; from pathlib import Path; "
+                      "signal.signal(signal.SIGTERM, signal.SIG_IGN); "
+                      "p = Path(sys.argv[1]); staged = p.with_name(p.name + '.tmp'); "
+                      "staged.write_text(str(os.getpid())); os.replace(staged, p); signal.pause()")
+        program = f"import subprocess, sys; child = subprocess.Popen([sys.executable, '-c', {child_code!r}, {str(ready)!r}]); child.wait()"
+        process = subprocess.Popen([sys.executable, "-c", program], stdout=subprocess.PIPE,
+                                   stderr=subprocess.PIPE, text=True, start_new_session=True)
+        mesh = self.root / "scripts/agents/codex_mesh.py"
+        _ = mesh.write_text("blocked fixture")
+        try:
+            descriptor = os.pidfd_open(wait_for_pid(ready, processes=(process,)))
+            try:
+                with self.assertRaises(subprocess.TimeoutExpired):
+                    _ = self.finish_default_launcher(process, self.root / "release", mesh, timeout=0)
+                self.assertIsNotNone(process.poll())
+                self.assertEqual(select.select([descriptor], [], [], 300)[0], [descriptor])
+                self.assertEqual(mesh.read_text(), STUB_MESH)
+                self.assertTrue(process.stdout is not None and process.stdout.closed)
+                self.assertTrue(process.stderr is not None and process.stderr.closed)
+            finally:
+                os.close(descriptor)
+        finally:
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            _ = process.communicate()
+            _ = mesh.write_text(STUB_MESH)
 
     def mesh_launch(
         self, session_dir: Path, *, to: str = "", slot: str = "impl",

@@ -18,10 +18,10 @@ from collections.abc import Iterable, Mapping
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass, fields
 from pathlib import Path
-from typing import Literal, TypedDict, cast, override
+from typing import TYPE_CHECKING, Literal, NotRequired, TypedDict, cast, override
 
 SCRIPTS = Path(__file__).resolve().parents[1]
-for _directory in (SCRIPTS / "production", SCRIPTS / "delegate", SCRIPTS / "shutdown", SCRIPTS / "herdr"):
+for _directory in (SCRIPTS / "production", SCRIPTS / "delegate", SCRIPTS / "shutdown", SCRIPTS / "herdr", SCRIPTS / "whoami", SCRIPTS / "message"):
     if str(_directory) not in sys.path:
         sys.path.insert(0, str(_directory))
 
@@ -33,6 +33,12 @@ import unit_lookup  # noqa: E402
 import herdr  # noqa: E402
 import codex_daemon  # noqa: E402
 import process_table  # noqa: E402
+if TYPE_CHECKING:
+    from ..whoami import account, agent_accounts, note_file
+else:
+    import account as account
+    import agent_accounts as agent_accounts
+    import note_file as note_file
 import remote as remote  # noqa: E402
 from sessions import SessionRecord, messaging_socket_exists, running_sessions  # noqa: E402
 
@@ -171,6 +177,25 @@ Assignment = WorkerAssignment | NotAWorker
 
 
 @dataclass(frozen=True)
+class AccountLabel:
+    label: str
+
+
+@dataclass(frozen=True)
+class AccountUnread:
+    reason: str
+
+
+@dataclass(frozen=True)
+class AccountAttributionUnavailable:
+    """A peer running an older roster did not send account attribution."""
+    reason: str
+
+
+AccountAttribution = AccountLabel | AccountUnread | AccountAttributionUnavailable
+
+
+@dataclass(frozen=True)
 class RosterEntry:
     machine: str
     kind: str
@@ -184,6 +209,7 @@ class RosterEntry:
     assignment: Assignment
     thread: CodexThread | NoCodexThread = NoCodexThread()
     session: ClaudeSession | NoClaudeSession = NoClaudeSession()
+    account: AccountAttribution = AccountUnread("not read")
 
 
 @dataclass(frozen=True)
@@ -193,12 +219,12 @@ class Roster:
 
 
 SnapshotState = (MessageReach | ShowrunnerRelationship | DirectorRelationship | Assignment
-                 | CodexThread | NoCodexThread | ClaudeSession | NoClaudeSession)
+                 | CodexThread | NoCodexThread | ClaudeSession | NoClaudeSession | AccountAttribution)
 _SNAPSHOT_STATES: tuple[type[SnapshotState], ...] = (
     Messageable, CannotReceiveMessages, UnderShowrunner, RunsProduction,
     ProductionWithoutRunningShowrunner, NoShowrunner, UnderDirector, DirectsUnit,
     NoDirector, WorkerAssignment, NotAWorker, CodexThread, NoCodexThread,
-    ClaudeSession, NoClaudeSession,
+    ClaudeSession, NoClaudeSession, AccountLabel, AccountUnread, AccountAttributionUnavailable,
 )
 
 
@@ -215,6 +241,7 @@ class SnapshotEntry(TypedDict):
     assignment: dict[str, str]
     thread: dict[str, str]
     session: dict[str, str]
+    account: NotRequired[dict[str, str]]
 
 
 def _tagged_state(state: SnapshotState) -> dict[str, str]:
@@ -227,7 +254,7 @@ def _snapshot_entry(entry: RosterEntry) -> SnapshotEntry:
         status=entry.status, cwd=entry.cwd, reach=_tagged_state(entry.reach),
         showrunner=_tagged_state(entry.showrunner), director=_tagged_state(entry.director),
         assignment=_tagged_state(entry.assignment), thread=_tagged_state(entry.thread),
-        session=_tagged_state(entry.session),
+        session=_tagged_state(entry.session), account=_tagged_state(entry.account),
     )
 
 
@@ -261,7 +288,8 @@ def _decode_state(value: object) -> SnapshotState:
 
 def _decode_entry(value: object) -> RosterEntry:
     values = _snapshot_object(value)
-    if set(values) != set(SnapshotEntry.__annotations__):
+    required = set(SnapshotEntry.__annotations__) - {"account"}
+    if not required <= set(values) or set(values) - required - {"account"}:
         raise ValueError("invalid snapshot entry fields")
     reach = _decode_state(values.get("reach"))
     showrunner = _decode_state(values.get("showrunner"))
@@ -269,19 +297,24 @@ def _decode_entry(value: object) -> RosterEntry:
     assignment = _decode_state(values.get("assignment"))
     thread = _decode_state(values.get("thread"))
     session = _decode_state(values.get("session"))
+    attributed = (_decode_state(values["account"]) if "account" in values
+                  else AccountAttributionUnavailable("peer sent no account"))
     if not (isinstance(reach, Messageable | CannotReceiveMessages)
             and isinstance(showrunner, ShowrunnerRelationship)
             and isinstance(director, DirectorRelationship)
             and isinstance(assignment, Assignment)
             and isinstance(thread, CodexThread | NoCodexThread)
-            and isinstance(session, ClaudeSession | NoClaudeSession)):
+            and isinstance(session, ClaudeSession | NoClaudeSession)
+            and isinstance(attributed, AccountAttribution)):
         raise ValueError("snapshot state is in the wrong field")
+    if isinstance(attributed, AccountLabel):
+        attributed = AccountLabel(note_file.canonical_label(attributed.label))
     return RosterEntry(
         machine=_snapshot_string(values, "machine"), kind=_snapshot_string(values, "kind"),
         role=_snapshot_string(values, "role"), name=_snapshot_string(values, "name"),
         status=_snapshot_string(values, "status"), cwd=_snapshot_string(values, "cwd"),
         reach=reach, showrunner=showrunner, director=director, assignment=assignment,
-        thread=thread, session=session,
+        thread=thread, session=session, account=attributed,
     )
 
 
@@ -489,6 +522,7 @@ _ReviewerProcessState = _ReviewerProcess | _ReviewerProcessNotFound
 
 
 class _MeshWorker(TypedDict, total=False):
+    port: int
     thread_id: str
     status: str
     launcher_pid: int
@@ -828,6 +862,59 @@ def _mesh_records(run: _LiveRun, problems: list[str]) -> dict[str, _MeshWorker]:
     return records
 
 
+
+def _run_server_homes(run: _LiveRun) -> dict[int, Path]:
+    """Homes of serving servers, including turns finishing on retired servers."""
+    homes: dict[int, Path] = {}
+    records: list[dict[str, object]] = []
+    try:
+        retired = _read_object(run.path / "mesh_retired.json").get("servers", [])
+        if isinstance(retired, list):
+            for item in cast(list[object], retired):
+                if isinstance(item, dict):
+                    records.append(cast(dict[str, object], item))
+    except (OSError, UnicodeError, ValueError):
+        pass
+    try:
+        records.append(_read_object(run.path / "mesh_server.json"))
+    except (OSError, UnicodeError, ValueError):
+        pass
+    for record in records:
+        port, home = record.get("port"), record.get("codex_home")
+        if isinstance(port, int) and not isinstance(port, bool):
+            _ = homes.pop(port, None)
+            if isinstance(home, str) and home:
+                homes[port] = Path(home)
+    return homes
+
+
+def _codex_home_account(home: Path) -> AccountLabel | AccountUnread:
+    identity = agent_accounts.codex_account(home)
+    return AccountLabel(identity.label) if isinstance(identity, agent_accounts.KnownCodexAccount) else AccountUnread(identity.reason)
+
+
+def _process_account(pid: int, kind: str) -> AccountLabel | AccountUnread:
+    if kind == "claude":
+        identity = account.account_of(pid)
+        return AccountLabel(identity.label) if identity is not None else AccountUnread("process account could not be read")
+    home = account.process_codex_home(pid)
+    if isinstance(home, account.ProcessEnvironmentUnread):
+        return AccountUnread(home.reason)
+    return _codex_home_account(home.home if isinstance(home, account.ProcessCodexHome) else Path.home() / ".codex")
+
+
+def _worker_account(run: _LiveRun, worker: _MeshWorker, homes: dict[int, Path]) -> AccountLabel | AccountUnread:
+    port = worker.get("port")
+    if port is None:
+        try:
+            port = _read_object(run.path / "mesh_server.json").get("port")
+        except (OSError, UnicodeError, ValueError):
+            return AccountUnread("serving server not recorded")
+    if not isinstance(port, int) or isinstance(port, bool) or port not in homes:
+        return AccountUnread("serving server not recorded")
+    return _codex_home_account(homes[port])
+
+
 def _server_alive(run: _LiveRun, problems: list[str]) -> bool:
     path = run.path / "mesh_server.json"
     if not path.exists():
@@ -948,6 +1035,7 @@ def _claude_entries(
             director=director,
             assignment=assignment,
             session=ClaudeSession(session_id),
+            account=_process_account(record["pid"], "claude"),
         )
     return entries
 
@@ -1046,6 +1134,8 @@ def _review_workers(
             showrunner=place.showrunner,
             director=place.director,
             assignment=WorkerAssignment(slot_role, str(run.path)),
+            account=(_process_account(process.pid, process.kind) if isinstance(process, _ReviewerProcess)
+                     else AccountUnread("reviewer process not found")),
         ))
     return entries
 
@@ -1065,6 +1155,7 @@ def _delegate_workers(
     worker_threads: set[str] = set()
     for run in runs:
         server_alive = _server_alive(run, problems)
+        server_homes = _run_server_homes(run)
         place = _run_place(run, claude_entries, production_places)
         for name, record in sorted(_mesh_records(run, problems).items()):
             status = _as_string(record.get("status"))
@@ -1103,6 +1194,7 @@ def _delegate_workers(
                 director=place.director,
                 assignment=WorkerAssignment(_codex_slot_role(record), run_path),
                 thread=CodexThread(thread_id) if thread_id else NoCodexThread(),
+                account=_worker_account(run, record, server_homes),
             ))
         entries.extend(_review_workers(machine, run, place, table, problems))
     return entries, worker_threads
@@ -1120,7 +1212,9 @@ def _herdr_codex_panes(machine: str) -> Roster:
     except herdr.HerdrFailure as error:
         _problem(problems, "herdr sessions", error)
         return Roster(entries, problems)
-    cwds = {process.place: process.cwd for process in herdr.herdr_processes()}
+    processes = herdr.herdr_processes()
+    cwds = {process.place: process.cwd for process in processes}
+    codex_processes = {process.place: process for process in processes if process.command == "codex"}
     for session in sessions:
         name = session["name"]
         try:
@@ -1132,12 +1226,14 @@ def _herdr_codex_panes(machine: str) -> Roster:
             if agent.get("agent") != "codex":
                 continue
             pane = agent["pane_id"]
+            process = codex_processes.get(herdr.HerdrPlace(name, pane))
             entries.append(RosterEntry(
                 machine=machine, kind="codex", role="freestanding",
                 name=f"herdr {name}:{pane}", status=agent["agent_status"],
                 reach=CannotReceiveMessages("interactive Codex in a herdr pane"),
                 cwd=cwds.get(herdr.HerdrPlace(name, pane), ""),
                 showrunner=NoShowrunner(), director=NoDirector(), assignment=NotAWorker(),
+                account=_process_account(process.pid, "codex") if process else AccountUnread("pane process not found"),
             ))
     return Roster(entries, problems)
 
@@ -1165,7 +1261,9 @@ def _local_roster(environment: Mapping[str, str]) -> Roster:
     delegate_workers, worker_threads = _delegate_workers(
         machine, runs, claude, production_places, problems
     )
-    daemon = codex_daemon.loaded_sessions(codex_daemon.daemon_socket(environment))
+    daemon_socket = codex_daemon.daemon_socket(environment)
+    daemon = codex_daemon.loaded_sessions(daemon_socket)
+    daemon_home = daemon_socket.parent.parent
     codex_sessions: list[RosterEntry] = []
     if isinstance(daemon, codex_daemon.DaemonUnreadable):
         _problem(problems, "Codex daemon", daemon.reason)
@@ -1183,6 +1281,7 @@ def _local_roster(environment: Mapping[str, str]) -> Roster:
                 director=NoDirector(),
                 assignment=NotAWorker(),
                 thread=CodexThread(session.thread_id),
+                account=_codex_home_account(daemon_home),
             )
             for session in daemon
             if session.thread_id not in worker_threads
@@ -1193,7 +1292,13 @@ def _local_roster(environment: Mapping[str, str]) -> Roster:
     return Roster(entries, problems)
 
 
-def peer_roster(environment: Mapping[str, str]) -> Roster:
+@dataclass(frozen=True)
+class PeerNotReached:
+    host: str
+    reason: str
+
+
+def peer_snapshot(environment: Mapping[str, str]) -> Roster | PeerNotReached:
     """Read only the peer, decoding states immediately at the ssh boundary."""
     host = remote.other_machine()
     command = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", host,
@@ -1208,13 +1313,21 @@ def peer_roster(environment: Mapping[str, str]) -> Roster:
     except (OSError, subprocess.TimeoutExpired) as error:
         why = "timed out after 20 s" if isinstance(error, subprocess.TimeoutExpired) else str(error)
         lines = why.splitlines()
-        return Roster([], [f"{host}: not reached: {lines[0] if lines else type(error).__name__}"])
+        return PeerNotReached(host, lines[0] if lines else type(error).__name__)
     try:
         result = RosterSnapshot.decode(done.stdout).result
     except (ValueError, TypeError):
         detail = (done.stderr or "invalid roster snapshot").strip().splitlines()
-        return Roster([], [f"{host}: not reached: {detail[0] if detail else 'invalid roster snapshot'}"])
+        return PeerNotReached(host, detail[0] if detail else "invalid roster snapshot")
     return Roster(result.entries, [f"{host}: {problem}" for problem in result.problems])
+
+
+
+def peer_roster(environment: Mapping[str, str]) -> Roster:
+    result = peer_snapshot(environment)
+    if isinstance(result, PeerNotReached):
+        return Roster([], [f"{result.host}: not reached: {result.reason}"])
+    return result
 
 
 def roster(environment: Mapping[str, str], scope: RosterScope) -> Roster:

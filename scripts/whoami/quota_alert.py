@@ -64,6 +64,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+import note_file
 from typing import TYPE_CHECKING, Literal, NamedTuple, NotRequired, Protocol, TypedDict, cast
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
@@ -376,7 +377,7 @@ class CodexZeroEpisode(TypedDict):
 
 
 class State(TypedDict):
-    # Note name ("codex 1") -> its open episode.
+    # Account label ("codex1") -> its open episode.
     episodes: dict[str, Episode]
     codex_zero: NotRequired[dict[str, CodexZeroEpisode]]
     refusal_notices: NotRequired[dict[str, RefusalNotice]]
@@ -419,7 +420,7 @@ def _read_fallback(value: object) -> CodexQuotaFallback:
                 parsed = datetime.fromisoformat(until)
                 if parsed.tzinfo is not None:
                     hold = CreditsOffHold(parsed)
-            return AccountCodexQuotaFallback(agent_accounts.KnownCodexAccount(Path(home), login, label), at, entries, hold)
+            return AccountCodexQuotaFallback(agent_accounts.KnownCodexAccount(Path(home), login, note_file.canonical_label(label)), at, entries, hold)
     return UnknownOwnerCodexQuotaFallback(at, entries)
 
 
@@ -478,8 +479,10 @@ NO_CODEX_FALLBACK_RESTORATION = NoCodexFallbackRestoration()
 class AgentNote(Protocol):
     path: Path
     tool: str
+    label: str
 
     def get(self, key: str) -> str | None: ...
+    def get_list(self, key: str) -> tuple[str, ...]: ...
 
 
 class Job(NamedTuple):
@@ -559,6 +562,11 @@ def recipients(config: Config, here: str | None = None) -> list[str]:
     return list(dict.fromkeys(name for name in names if name != here))
 
 
+def _normalize_notice_text(notice: ZeroEpisodeNotice) -> None:
+    notice["values"] = {key: note_file.canonical_label_text(value)
+                        for key, value in notice["values"].items()}
+
+
 @contextmanager
 def state_file() -> Generator[State]:
     """The state under an exclusive lock, written back on exit.
@@ -573,11 +581,18 @@ def state_file() -> Generator[State]:
         state: State
         try:
             saved = cast(StoredState, json.loads(STATE.read_text(encoding="utf-8")))
-            state = State(episodes=saved.get("episodes", {}), fallback=_read_fallback(saved.get("switch")))
+            state = State(episodes={note_file.canonical_label(label): episode for label, episode in saved.get("episodes", {}).items()}, fallback=_read_fallback(saved.get("switch")))
             if "codex_zero" in saved:
-                state["codex_zero"] = saved["codex_zero"]
+                state["codex_zero"] = {note_file.canonical_label(label): episode for label, episode in saved["codex_zero"].items()}
+                for episode in state["codex_zero"].values():
+                    _normalize_notice_text(episode["notice"])
+                    if "forecast_notice" in episode:
+                        _normalize_notice_text(episode["forecast_notice"])
             if "refusal_notices" in saved:
-                state["refusal_notices"] = saved["refusal_notices"]
+                state["refusal_notices"] = {note_file.canonical_label(label): notice for label, notice in saved["refusal_notices"].items()}
+                for notice in state["refusal_notices"].values():
+                    if notice["kind"] == "known":
+                        notice["label"] = note_file.canonical_label(notice["label"])
             if "unseen" in saved:
                 state["unseen"] = saved["unseen"]
         except (OSError, ValueError):
@@ -593,7 +608,7 @@ def state_file() -> Generator[State]:
 def ahead(resets: str | None) -> bool:
     """Whether a note's reset is still to come."""
     reset = reset_time(resets)
-    return reset is not None and reset > datetime.now(timezone.utc)
+    return isinstance(reset, note_file.KnownReset) and reset.value > datetime.now(timezone.utc)
 
 
 def remaining(note: AgentNote) -> float | None:
@@ -609,16 +624,16 @@ def percent(note: AgentNote) -> str:
 
 
 def low(notes: list[AgentNote], threshold: float) -> list[AgentNote]:
-    """Active notes at or under the threshold in a window that has not reset."""
+    """Notes in use at or under the threshold in a window that has not reset."""
     return [note for note in notes
-            if note.get("state") == "active" and ahead(note.get("resets"))
+            if note_file.in_use(note) and ahead(note.get("resets"))
             and (value := remaining(note)) is not None and value <= threshold]
 
 
 def usable(notes: list[AgentNote], threshold: float) -> list[AgentNote]:
-    """Active notes known to be above the threshold."""
+    """Notes in use known to be above the threshold."""
     return [note for note in notes
-            if note.get("state") == "active" and (value := remaining(note)) is not None and value > threshold]
+            if note_file.in_use(note) and (value := remaining(note)) is not None and value > threshold]
 
 
 def recovered(name: str, notes: list[AgentNote], threshold: float,
@@ -626,8 +641,9 @@ def recovered(name: str, notes: list[AgentNote], threshold: float,
               codex_readings: CodexAlertPassReadings,
               episode: Episode) -> bool:
     """Known to be out of the low state. An unknown reading is not a recovery."""
-    note = next((note for note in notes if note.path.stem == name), None)
-    if name.startswith("codex "):
+    note = next((note for note in notes if note.label == name), None)
+    parsed_label = note_file.parse_account_label(name)
+    if isinstance(parsed_label, note_file.NumberedAccountLabel) and parsed_label.tool == "codex":
         reset_at = episode.get("weekly_reset")
         if reset_at:
             try:
@@ -646,16 +662,16 @@ def recovered(name: str, notes: list[AgentNote], threshold: float,
                 if value is not None and reset is not None and reset > now and value > threshold:
                     return True
         reset = reset_time(note.get("resets"))
-        return reset is not None and reset <= now
-    if selection.multiple_accounts and name.startswith("claude "):
+        return isinstance(reset, note_file.KnownReset) and reset.value <= now
+    if selection.multiple_accounts and isinstance(parsed_label, note_file.NumberedAccountLabel) and parsed_label.tool == "claude":
         if note is None:
             return False
         value = remaining(note)
         if value is not None and math.isfinite(value) and value > threshold:
             return True
         reset = reset_time(note.get("resets"))
-        return reset is not None and reset <= now
-    if note is None or note.get("state") == "inactive":
+        return isinstance(reset, note_file.KnownReset) and reset.value <= now
+    if note is None or not note_file.in_use(note):
         return True
     value = remaining(note)
     return value is not None and value > threshold
@@ -750,8 +766,8 @@ CodexWorkSwitch = CodexWorkMovedToClaude | NoWorkOnCodex | CodexWorkSwitchFailed
 def switch_to_claude(state: State, note: AgentNote, stamp: str, owner: agent_accounts.KnownCodexAccount, *,
                      credits_off_hold: CreditsOffHold | NoCreditsOffHold = NO_CREDITS_OFF_HOLD) -> CodexWorkSwitch:
     """Move Codex assignments to Claude and report what the registry confirms."""
-    episode = state["episodes"].get(note.path.stem)
-    account = f"{note.path.stem} at {percent(note)}, resets {note.get('resets')}"
+    episode = state["episodes"].get(note.label)
+    account = f"{note.label} at {percent(note)}, resets {note.get('resets')}"
     trigger = "Credits are off" if isinstance(credits_off_hold, CreditsOffHold) else "Codex refused work for quota"
     moved: list[str] = []
     try:
@@ -770,14 +786,14 @@ def switch_to_claude(state: State, note: AgentNote, stamp: str, owner: agent_acc
         state.setdefault("unseen", []).append(
             f"{trigger} ({account}), and the automatic switch to Claude failed at "
             + f"{local_time(stamp)}: {error}")
-        return CodexWorkSwitchFailed(note.path.stem, error)
+        return CodexWorkSwitchFailed(note.label, error)
     if not moved:
-        return NoWorkOnCodex(note.path.stem)
+        return NoWorkOnCodex(note.label)
     state["fallback"] = AccountCodexQuotaFallback(owner, stamp, tuple(moved), credits_off_hold)
     state.setdefault("unseen", []).append(
         f"{trigger} ({account}): {', '.join(moved)} moved to Claude at {local_time(stamp)}, "
         + "and move back when Codex recovers.")
-    return CodexWorkMovedToClaude(note.path.stem, tuple(moved))
+    return CodexWorkMovedToClaude(note.label, tuple(moved))
 
 
 def switch_back(state: State, now: datetime, readings: CodexAlertPassReadings) -> CodexFallbackRestoration:
@@ -869,15 +885,16 @@ def _readings_after_restoration(readings: CodexAlertPassReadings, back: CodexFal
 def account_line(note: AgentNote, threshold: float, selection: ClaudeAccountsInUse) -> str:
     roles = claude_roles(note, selection)
     if note.tool == "claude" and selection.multiple_accounts:
-        return (f"{note.path.stem} ({', '.join(roles) or 'spare'}) at {percent(note)} of its weekly "
+        return (f"{note.label} ({', '.join(roles) or 'spare'}) at {percent(note)} of its weekly "
                 + f"usage left (threshold {threshold:g}%); it resets {note.get('resets')}.")
-    return (f"{note.path.stem}, the active {note.tool.capitalize()} account, has {percent(note)} of its weekly "
+    return (f"{note.label}, the active {note.tool.capitalize()} account, has {percent(note)} of its weekly "
             + f"usage left (threshold {threshold:g}%); it resets {note.get('resets')}.")
 
 
 def claude_roles(note: AgentNote, selection: ClaudeAccountsInUse) -> tuple[str, ...]:
-    """Describe account use without assigning a role to its login."""
-    return ("in use",) if note.tool == "claude" and selection.is_in_use(note.get("login") or "") else ()
+    """Roles come from the account configuration written on the note."""
+    del selection
+    return note.get_list("role") if note.tool == "claude" else ()
 
 
 def unit_swap_line(note: AgentNote, _notes: list[AgentNote], selection: ClaudeAccountsInUse) -> str:
@@ -893,7 +910,7 @@ def unit_swap_line(note: AgentNote, _notes: list[AgentNote], selection: ClaudeAc
     destinations = [accounts.placement(group, now, exclude=frozenset(excluded))
                     for group in accounts.CLAUDE_GROUPS]
     selected = accounts.pick("claude", now, exclude=frozenset(excluded), keep=accounts.NoKeep())
-    label = note.path.stem
+    label = note.label
 
     def no_room(outcome: accounts.NoAccountWithRoom) -> str:
         reset = outcome.earliest_reset
@@ -913,7 +930,7 @@ def unit_swap_line(note: AgentNote, _notes: list[AgentNote], selection: ClaudeAc
 
 def credit_line(note: AgentNote) -> str:
     """The credits Codex reports for the account, which carry work once its weekly allowance is used up."""
-    name = note.path.stem
+    name = note.label
     balance = note.get("credit_balance")
     if balance == "unlimited":
         return f"Credits on {name}: unlimited."
@@ -935,7 +952,7 @@ def run_out_push(note: AgentNote, selection: ClaudeAccountsInUse, notes: list[Ag
     """The actionable push or log note when this account's episode opens."""
     from push_texts import render
 
-    name = note.path.stem
+    name = note.label
     roles = claude_roles(note, selection)
     display_name = f"{name}, used by live sessions," if roles else name
     first = f"The {display_name} account has {percent(note)} weekly usage left. It refills {user_time(note.get('resets'))}."
@@ -944,13 +961,13 @@ def run_out_push(note: AgentNote, selection: ClaudeAccountsInUse, notes: list[Ag
     candidates = [(value, candidate) for candidate in notes
                   if candidate.tool == "claude" and candidate.path != note.path
                   and (candidate.get("login") or "").casefold() != (note.get("login") or "").casefold()
-                  and candidate.get("state") in ("active", "inactive")
+                  and candidate.get("sessions") is not None
                   and (value := remaining(candidate)) is not None and math.isfinite(value) and value > 0]
     if not candidates:
         return QuotaStatusNote(name, first + " No other Claude account has weekly usage left; work waits for usage to reset.")
-    _, target = max(candidates, key=lambda candidate: (candidate[0], candidate[1].path.stem))
+    _, target = max(candidates, key=lambda candidate: (candidate[0], candidate[1].label))
     return UserPush(name, render("quota.claude", account=name, remaining=percent(note),
-                                 reset=user_time(note.get("resets")), target=target.path.stem,
+                                 reset=user_time(note.get("resets")), target=target.label,
                                  target_remaining=percent(target)))
 
 
@@ -965,7 +982,7 @@ def refusal_push(note: AgentNote, switch: CodexQuotaFallback, failed: str | None
         outcome = "New work could not move to Claude, the other coding assistant"
     else:
         outcome = "No delegated work needed to move to Claude, the other coding assistant"
-    name = note.path.stem
+    name = note.label
     credits = credit_line(note).replace(f" on {name}", "")
     if not isinstance(switch, NoCodexQuotaFallback) or not failed:
         return QuotaStatusNote(name, f"Codex refused work on {name}. {credits} {outcome}.")
@@ -994,7 +1011,7 @@ def message(note: AgentNote, notes: list[AgentNote], config: Config, switch: Cod
             codex_readings: CodexAlertPassReadings | ReadCurrentCodexReadings = READ_CURRENT_CODEX_READINGS,
             now: datetime | None = None) -> str:
     selection = _selection(selection)
-    name = note.path.stem
+    name = note.label
     tool = note.tool.capitalize()
     threshold = f"{config['threshold_percent']:g}%"
     lines = [f"Quota alert: {account_line(note, config['threshold_percent'], selection)}"]
@@ -1013,7 +1030,7 @@ def message(note: AgentNote, notes: list[AgentNote], config: Config, switch: Cod
             lines.append(f"Limit resets available on {name}: {count}, earliest expiring {note.get('limit_reset')}.")
     for other in notes:
         if other.tool == note.tool and other.path != note.path:
-            lines.append(f"{other.path.stem}: {other.get('state')}, {percent(other)} weekly usage left, "
+            lines.append(f"{other.label}: role {', '.join(other.get_list('role')) or 'none'}, {other.get('sessions') or '0'} live sessions, {percent(other)} weekly usage left, "
                          + f"resets {other.get('resets')}.")
     guidance = instruction(tool, switch, failed)
     if roles:
@@ -1021,7 +1038,7 @@ def message(note: AgentNote, notes: list[AgentNote], config: Config, switch: Cod
             f"Bring this to your user. Sessions on {name} start no new Claude work until a "
             + f'"Quota restored:" notice for {name}.'
         )
-        if "unit directors" in roles:
+        if "unit" in roles:
             guidance += " Showrunners relay this notice to their units on that account."
     lines += [
         "",
@@ -1043,7 +1060,7 @@ def restored_message(accounts: list[AgentNote], reason: str, threshold: float,
                      selection: ClaudeAccountsInUse | ReadCurrentClaudeSelection = READ_CURRENT_CLAUDE_SELECTION) -> str:
     selection = _selection(selection)
     tools = " and ".join(sorted({note.tool.capitalize() for note in accounts}))
-    names = ", ".join(note.path.stem for note in accounts)
+    names = ", ".join(note.label for note in accounts)
     first = (f"Quota restored: work on {names} can resume; {reason}."
              if selection.multiple_accounts and any(note.tool == "claude" for note in accounts)
              else f"Quota restored: delegation on {tools} can resume; {reason}.")
@@ -1225,7 +1242,7 @@ def _zero_open_notice(label: str, report: Report, credits: agent_accounts.CodexC
     values = {"account": label, "reset": reset_display(refusals.KnownReset(reset))}
     if isinstance(credits, agent_accounts.CreditsOn):
         values["credits"] = _credit_balance_text(report, label, now)
-        values["file"] = f"{label}.md"
+        values["file"] = note_file.note_name(label)
         values["machine"] = os.uname().nodename
         values["credit_action"] = "To stop paid credit use"
         values["opening"] = f"Codex account {label} is now spending paid credits until its weekly refill on {values['reset']}. {values['credits']}"
@@ -1234,16 +1251,18 @@ def _zero_open_notice(label: str, report: Report, credits: agent_accounts.CodexC
         if isinstance(off, accounts.PickedAccount) and isinstance(chosen, accounts.PickedAccount):
             values["turn_off"] = (f"Turn off (recommended): no paid spend. Within minutes, new work moves to the other account, {off.label} ({off.weekly_left:g}% of its weekly allowance left)."
                 if not accounts.codex_destination_uses_credits(off, now) else
-                f"Turn off: within minutes, new work spends the other Codex account's ({off.label}) paid credits instead.")
+                f"Turn off: within minutes, new work spends the other Codex account's ({off.label}) paid credits.")
             prefix = "Leave on:" if not accounts.codex_destination_uses_credits(off, now) else "Leave on (recommended):"
             values["leave_on"] = (f"{prefix} keep spending {label}'s paid credits without a limit."
                 if report.credit_balance == "unlimited" else
                 f"{prefix} new work spends {label}'s paid credits first, then {chosen.label}'s."
                 if accounts.codex_destination_uses_credits(chosen, now) else f"{prefix} {label} spends its credits, then work moves to {chosen.label}.")
             if accounts.codex_destination_uses_credits(off, now):
-                values["credit_action"] = f"To move paid credit use to {off.label}"
-                values["opening"] = f"Codex account {label} now spends paid credits. Weekly refill: {values['reset']}. {values['credits']}"
-                values["clarification"] = "Either way, new work spends paid credits."
+                values["credit_action"] = f"Optional: to spend {off.label}'s credits first"
+                values["opening"] = f"Codex account {label} now spends paid credits until its included usage refills {values['reset']}. {values['credits']}"
+                values["turn_off"] = f"Turn off: within minutes, new work spends {off.label}'s paid credits instead."
+                values["leave_on"] = f"Leave on (recommended, no edit needed): new work spends {label}'s credits, then {chosen.label}'s, then falls back to Claude."
+                values["clarification"] = ""
             elif values["credits"] == "The credit balance is unknown.":
                 values["turn_off"] = (f"Turn off (recommended): paid spending stops. Within minutes, new work moves to the second account, {off.label}, which has {off.weekly_left:g}% of its weekly limit left.")
                 values["leave_on"] = f"Leave on: {label} spends its credits, then new work moves to {chosen.label}."
@@ -1256,10 +1275,10 @@ def _zero_open_notice(label: str, report: Report, credits: agent_accounts.CodexC
         else:
             next_reset = reset
         values["next_reset"] = reset_display(refusals.KnownReset(next_reset))
-        values["turn_off"] = f"Turn off (recommended, so no paid credits are spent): within minutes, new work uses Claude, the other coding assistant, until {values['next_reset']}."
+        values["turn_off"] = f"Turn off (recommended, saves paid credits): within minutes, work uses Claude until {values['next_reset']}, the next Codex reset, then returns to Codex if an account has room."
         values["leave_on"] = ("Leave on: keep spending paid credits without a limit."
             if report.credit_balance == "unlimited" else
-            "Leave on: new work spends these credits, then uses Claude when they run out.")
+            "Leave on: spend these credits, then use Claude when they run out.")
         return ZeroEpisodeNotice(id="quota.codex_on_credits_last", values={key: values[key] for key in
             ("account", "reset", "credits", "file", "machine", "turn_off", "leave_on")})
     stamp = now.isoformat(timespec="seconds")
@@ -1278,7 +1297,7 @@ def _zero_open_notice(label: str, report: Report, credits: agent_accounts.CodexC
             values["reason"] = f"Workers could not move to {chosen.label} because {_worker_move_failure_cause(str(error))}."
         else:
             values["target"] = chosen.label
-            values["transition"] = (f"workers use {chosen.label}" if not accounts.codex_destination_uses_credits(chosen, now) else f"workers spend {chosen.label} credits")
+            values["transition"] = (f"Codex work now uses {chosen.label}" if not accounts.codex_destination_uses_credits(chosen, now) else "Codex work now spends paid credits")
             values["funding"] = (f"{chosen.weekly_left:g}% weekly usage left"
                                  if not accounts.codex_destination_uses_credits(chosen, now) else "its own paid credits")
             return ZeroEpisodeNotice(id="quota.codex_workers_moved", values=values)
@@ -1300,7 +1319,7 @@ def _zero_open_notice(label: str, report: Report, credits: agent_accounts.CodexC
                 candidates.append(window.reset.at)
     until = min(candidates)
     values["until"] = reset_display(refusals.KnownReset(until))
-    note = CodexQuotaAccountNote(Path(label + ".md"), {"weekly_remaining_usage": "0", "resets": reset.isoformat()})
+    note = CodexQuotaAccountNote(note_file.note_path(label), {"weekly_remaining_usage": "0", "resets": reset.isoformat()}, label)
     switched = switch_to_claude(state, note, stamp, owner, credits_off_hold=CreditsOffHold(until))
     if isinstance(switched, CodexWorkSwitchFailed):
         values["outcome"] = "work could not move"
@@ -1345,6 +1364,15 @@ def _credits_forecast_notice(label: str, report: Report, now: datetime) -> ZeroE
             forecast = (f"Workers on Codex account {label} used {usage.used:,.0f} paid credits in the last hour; "
                         + f"its {balance:,.0f} credits last until about {time}.")
     return ZeroEpisodeNotice(id="quota.codex_credits_forecast", values={"account": label, "horizon": horizon, "forecast": forecast, "destination": destination})
+
+
+
+def _current_notice(label: str, notice: ZeroEpisodeNotice) -> ZeroEpisodeNotice:
+    """Keep a pending delivery's facts while updating its account note filename."""
+    values = dict(notice["values"])
+    if "file" in values:
+        values["file"] = note_file.note_name(label)
+    return ZeroEpisodeNotice(id=notice["id"], values=values)
 
 
 def _codex_zero_alert(config: Config, readings: CodexAlertPassReadings, now: datetime) -> list[str]:
@@ -1405,7 +1433,8 @@ def _codex_zero_alert(config: Config, readings: CodexAlertPassReadings, now: dat
             log.append(f"quota credits off {label}: {result.body}")
 
         if episode["phone"] == "due":
-            notice = episode["notice"]
+            notice = _current_notice(label, episode["notice"])
+            episode["notice"] = notice
             pushes.append((QuotaNote(label, render(notice["id"], **notice["values"])), "phone", episode["since"]))
         if at_zero and episode["credits"] == "on" and now - datetime.fromisoformat(episode["forecast_at"]) >= timedelta(hours=1):
             notice = _credits_forecast_notice(label, report, now)
@@ -1417,7 +1446,8 @@ def _codex_zero_alert(config: Config, readings: CodexAlertPassReadings, now: dat
                 episode["forecast_phone"] = "due"
                 episode["forecast_notice"] = notice
         if episode.get("forecast_phone") == "due" and "forecast_notice" in episode:
-            notice = episode["forecast_notice"]
+            notice = _current_notice(label, episode["forecast_notice"])
+            episode["forecast_notice"] = notice
             pushes.append((QuotaNote(label, render(notice["id"], **notice["values"])), "forecast_phone", episode["since"]))
     log += deliver_and_record(jobs, stamp)
     for push, field, since in pushes:
@@ -1448,9 +1478,7 @@ def _alert_for_saved_readings(notes: list[AgentNote], now: datetime, selection: 
         codex_readings = _readings_after_restoration(codex_readings, back)
         for note in [*low([note for note in notes if note.tool != "codex"], threshold),
                      *_low_codex_notes(notes, threshold, codex_readings, now)]:
-            if note.tool == "claude" and not selection.is_in_use(note.get("login") or ""):
-                continue
-            name = note.path.stem
+            name = note.label
             if name in state.get("codex_zero", {}):
                 continue
             if name not in episodes:
@@ -1492,10 +1520,11 @@ def _alert_for_saved_readings(notes: list[AgentNote], now: datetime, selection: 
                                     threshold, back, selection=selection)
             jobs += [Job(identity.label, recipient, text, "restored") for recipient in recipients(config)]
     for name in closed:
-        tool = name.split(" ")[0]
+        parsed_label = note_file.parse_account_label(name)
+        tool = parsed_label.tool if isinstance(parsed_label, note_file.NumberedAccountLabel) else name
         accounts = [note for note in usable(notes, threshold) if note.tool == tool]
         if tool == "codex" or tool == "claude" and selection.multiple_accounts:
-            accounts = [note for note in notes if note.path.stem == name]
+            accounts = [note for note in notes if note.label == name]
         if (tool == "codex" and isinstance(back, SwitchBack)
                 and isinstance(codex_readings.selected_account, agent_accounts.KnownCodexAccount)
                 and name == codex_readings.selected_account.label):
@@ -1524,10 +1553,15 @@ def _alert_for_saved_readings(notes: list[AgentNote], now: datetime, selection: 
 class CodexQuotaAccountNote:
     path: Path
     fields: dict[str, str]
+    label: str
     tool: str = "codex"
 
     def get(self, key: str) -> str | None:
         return self.fields.get(key)
+
+    def get_list(self, key: str) -> tuple[str, ...]:
+        del key
+        return ()
 
 
 def _low_codex_notes(notes: list[AgentNote], threshold: float,
@@ -1609,7 +1643,7 @@ def blocked(notes: list[AgentNote], refusing_account: agent_accounts.RefusingCod
     refusals.write_refusal(refusals.AccountRefusal("codex", refusing_account.login, window, reset, refusal_time))
     note = next((note for note in notes if note.tool == "codex"
                  and (note.get("login") or "").casefold() == refusing_account.login.casefold()),
-                CodexQuotaAccountNote(Path(name + ".md"), {}))
+                CodexQuotaAccountNote(note_file.note_path(name), {}, name))
     selected = readings.selected_account
     account_status = ("the outgoing account" if isinstance(selected, agent_accounts.KnownCodexAccount)
                       else "an account whose worker selection is unknown")
@@ -1753,8 +1787,8 @@ def refresh(notes: list[AgentNote], here: str | None, now: datetime | None = Non
     lines = [f"{name}: alert closed" for name in closed]
     lines += [f"switch to claude undone: {back.describe()}"] if isinstance(back, SwitchBack) else []
     lines += _alert_for_saved_readings(notes, now, selection, codex_readings)
-    lines += [f"{note.path.stem}: {percent(note)} left, resets {note.get('resets')}"
-              for note in notes if note.get("state") == "active"]
+    lines += [f"{note.label}: {percent(note)} left, resets {note.get('resets')}"
+              for note in notes if note_file.in_use(note)]
     accounts = [note for note in usable(notes, threshold) if note.tool != "codex"]
     report = selected_codex_report(codex_readings, now)
     identity = codex_readings.selected_account
@@ -1793,6 +1827,7 @@ def tell_others(text: str, here: str | None) -> list[str]:
 
 def acknowledge(name: str = "", here: str | None = None, now: datetime | None = None) -> list[str]:
     """Silence the open episode named, or every open one, until its account recovers."""
+    name = note_file.canonical_label(name)
     stamp = (now or datetime.now(timezone.utc)).isoformat(timespec="seconds")
     silenced: list[str] = []
     lines: list[str] = []

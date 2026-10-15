@@ -201,7 +201,7 @@ herdr 0.9.0:
 - herdr creates `~/.config/herdr/` (`.plugins.lock`, `release-notes.json`, `sessions/<name>/`).
 - A standalone `agent wait` tracks the agent's lifecycle, not a turn: a worker that has not yet started its prompt reads as idle and returns at once. That is why `work` and `wait` wait for `working`.
 - A typed `/quit` does not exit Codex; close the pane. `/exit` stops Claude.
-- A Claude pane on claude 1 turns on Remote Control by itself.
+- A Claude pane on claude1 turns on Remote Control by itself.
 - Interactive Codex on `~/.codex1` uses the account's managed `codex app-server --managed-daemon`, which outlives its pane.
 
 In the code:

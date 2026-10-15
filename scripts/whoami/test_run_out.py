@@ -29,14 +29,14 @@ def step(steps: float) -> float:
 class RunOutTests(unittest.TestCase):
     def credit_history(self, values: Sequence[tuple[int, float]]) -> Path:
         path = Path(self.enterContext(tempfile.TemporaryDirectory())) / "readings.jsonl"
-        _ = path.write_text("".join(json.dumps({"account": "codex 1", "at":
+        _ = path.write_text("".join(json.dumps({"account": "codex1", "at":
             (START + timedelta(minutes=minute)).isoformat(), "remaining": 0, "credits": balance})
             + "\n" for minute, balance in values))
         return path
 
     def test_credit_use_counts_decreases_and_skips_a_purchase(self) -> None:
         path = self.credit_history([(-2, 100), (10, 90), (30, 200), (60, 170), (70, 0)])
-        used = run_out.credits_used(run_out.read_credit_readings(path), "codex 1",
+        used = run_out.credits_used(run_out.read_credit_readings(path), "codex1",
             since=START, until=START + timedelta(hours=1))
         self.assertIsInstance(used, run_out.CreditsUsed)
         assert isinstance(used, run_out.CreditsUsed)
@@ -46,7 +46,7 @@ class RunOutTests(unittest.TestCase):
 
     def test_credit_use_reports_zero_only_with_observations_covering_the_hour(self) -> None:
         path = self.credit_history([(0, 6370), (30, 6370), (60, 6370)])
-        used = run_out.credits_used(run_out.read_credit_readings(path), "codex 1",
+        used = run_out.credits_used(run_out.read_credit_readings(path), "codex1",
             since=START, until=START + timedelta(hours=1))
         self.assertIsInstance(used, run_out.CreditsUsed)
         assert isinstance(used, run_out.CreditsUsed)
@@ -55,15 +55,15 @@ class RunOutTests(unittest.TestCase):
 
     def test_credit_use_without_a_credit_line_names_the_missing_reading(self) -> None:
         path = self.credit_history([])
-        _ = path.write_text(json.dumps({"account": "codex 1", "at": START.isoformat(), "remaining": 0}) + "\n")
-        self.assertIsInstance(run_out.credits_used(run_out.read_credit_readings(path), "codex 1",
+        _ = path.write_text(json.dumps({"account": "codex1", "at": START.isoformat(), "remaining": 0}) + "\n")
+        self.assertIsInstance(run_out.credits_used(run_out.read_credit_readings(path), "codex1",
             since=START, until=START + timedelta(hours=1)), run_out.NoCreditReading)
 
     def test_credit_use_with_stale_or_short_observation_coverage_is_unknown(self) -> None:
         for values in ([(-120, 100), (-90, 90)], [(40, 100), (60, 90)], [(0, 100), (49, 90)]):
             with self.subTest(values=values):
                 path = self.credit_history(values)
-                result = run_out.credits_used(run_out.read_credit_readings(path), "codex 1",
+                result = run_out.credits_used(run_out.read_credit_readings(path), "codex1",
                     since=START, until=START + timedelta(hours=1))
                 self.assertIsInstance(result, run_out.UsageUnknown)
                 assert isinstance(result, run_out.UsageUnknown)
@@ -74,31 +74,49 @@ class RunOutTests(unittest.TestCase):
         with path.open("a") as output:
             _ = output.write("bad json\n[]\n")
             for balance in (True, -1, math.nan, "unlimited", None):
-                _ = output.write(json.dumps({"account": "codex 1", "at": START.isoformat(),
+                _ = output.write(json.dumps({"account": "codex1", "at": START.isoformat(),
                     "remaining": 0, "credits": balance}) + "\n")
-            _ = output.write(json.dumps({"account": "codex 2", "at": START.isoformat(),
+            _ = output.write(json.dumps({"account": "codex2", "at": START.isoformat(),
                 "remaining": 1, "credits": 20}) + "\n")
         readings = run_out.read_credit_readings(path)
-        self.assertEqual([reading.at for reading in readings["codex 1"]], [START, START + timedelta(hours=1)])
-        self.assertEqual(len(readings["codex 2"]), 1)
+        self.assertEqual([reading.at for reading in readings["codex1"]], [START, START + timedelta(hours=1)])
+        self.assertEqual(len(readings["codex2"]), 1)
         self.assertEqual(run_out.read_credit_readings(path.with_name("absent")), {})
 
     def test_readings_are_per_account_in_time_order_and_bad_lines_are_skipped(self) -> None:
         path = Path(self.enterContext(tempfile.TemporaryDirectory())) / "readings.jsonl"
         records: list[dict[str, object]] = [
-            {"account": "claude 1", "at": (START + timedelta(hours=1)).isoformat(), "remaining": 70},
-            {"account": "claude 1", "at": START.isoformat(), "remaining": 80},
-            {"account": "codex 2", "at": START.isoformat(), "remaining": 55.5},
-            {"account": "codex 2", "at": "2026-10-05T13:00:00", "remaining": 10},
-            {"account": "codex 2", "at": START.isoformat(), "remaining": True},
-            {"account": "codex 2", "at": START.isoformat(), "remaining": math.nan},
+            {"account": "claude1", "at": (START + timedelta(hours=1)).isoformat(), "remaining": 70},
+            {"account": "claude1", "at": START.isoformat(), "remaining": 80},
+            {"account": "codex2", "at": START.isoformat(), "remaining": 55.5},
+            {"account": "codex2", "at": "2026-10-05T13:00:00", "remaining": 10},
+            {"account": "codex2", "at": START.isoformat(), "remaining": True},
+            {"account": "codex2", "at": START.isoformat(), "remaining": math.nan},
         ]
         _ = path.write_text("{bad json}\n[]\n" + "".join(json.dumps(record) + "\n" for record in records))
         self.assertEqual(read_readings(path), {
-            "claude 1": [Reading(START, 20), Reading(START + timedelta(hours=1), 30)],
-            "codex 2": [Reading(START, 44.5)],
+            "claude1": [Reading(START, 20), Reading(START + timedelta(hours=1), 30)],
+            "codex2": [Reading(START, 44.5)],
         })
         self.assertEqual(read_readings(path.with_name("missing.jsonl")), {})
+
+    def test_legacy_and_canonical_lines_form_one_credit_and_usage_history(self) -> None:
+        path = Path(self.enterContext(tempfile.TemporaryDirectory())) / "readings.jsonl"
+        original = "".join(json.dumps({"account": label, "at": at.isoformat(),
+            "remaining": remaining, "credits": credits}) + "\n" for label, at, remaining, credits in (
+                ("codex 2", START, 80, 100),
+                ("codex2", START + timedelta(minutes=30), 60, 90),
+                ("codex 2", START + timedelta(hours=1), 40, 70),
+        )).encode()
+        _ = path.write_bytes(original)
+        self.assertEqual(read_readings(path), {"codex2": [Reading(START, 20),
+            Reading(START + timedelta(minutes=30), 40), Reading(START + timedelta(hours=1), 60)]})
+        credits = run_out.read_credit_readings(path)
+        self.assertEqual(set(credits), {"codex2"})
+        result = run_out.credits_used(credits, "codex2", since=START, until=START + timedelta(hours=1))
+        assert isinstance(result, run_out.CreditsUsed)
+        self.assertEqual(result.used, 30)
+        self.assertEqual(path.read_bytes(), original)
 
     def test_a_rise_twelve_hours_old_counts_half(self) -> None:
         self.assertEqual(HALF_LIFE, timedelta(hours=12))

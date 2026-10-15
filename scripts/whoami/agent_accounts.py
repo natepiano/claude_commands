@@ -71,18 +71,14 @@ class StoredCodexAccount(TypedDict):
 
 
 def codex_account(home: Path) -> RefusingCodexAccount:
-    from scripts.whoami.note_file import AGENTS_DIR, read_note
+    from scripts.whoami.note_file import read_notes
 
     login = codex_email_on_disk(home)
     if not login:
         return UnknownCodexAccount(home, "the home's sign-in cannot be read")
-    notes = Path(os.environ.get("AGENT_NOTES_DIR", str(AGENTS_DIR)))
-    for path in sorted(notes.glob("*.md")):
-        if not path.stem.casefold().startswith("codex"):
-            continue
-        note = read_note(path)
-        if note is not None and (note.get("login") or "").casefold() == login.casefold():
-            return KnownCodexAccount(home, login, path.stem)
+    for note in read_notes():
+        if note.tool == "codex" and (note.get("login") or "").casefold() == login.casefold():
+            return KnownCodexAccount(home, login, note.label)
     return UnknownCodexAccount(home, "the signed-in account has no named note")
 
 
@@ -101,11 +97,15 @@ CodexCreditsSetting = CreditsOn | CreditsOff
 
 
 def codex_credits_setting(label: str) -> CodexCreditsSetting:
-    from scripts.whoami.note_file import AGENTS_DIR, read_note
+    from scripts.whoami.note_file import Note, note_path, read_note
 
-    directory = Path(os.environ.get("AGENT_NOTES_DIR", str(AGENTS_DIR)))
-    note = read_note(directory / f"{label}.md")
-    value = note.get("use_credits") if note is not None else None
+    try:
+        path = note_path(label)
+    except ValueError:
+        # An unnamed home's display label has no account note or explicit setting.
+        return CreditsOn()
+    note = read_note(path)
+    value = note.get("use_credits") if isinstance(note, Note) else None
     if value == "off":
         return CreditsOff()
     if value is None or value == "on":
@@ -128,14 +128,14 @@ class CodexSetupHome:
 
 
 def codex_account_home(label: str) -> CodexHomeHoldingLogin | CodexSetupHome:
-    from scripts.whoami.note_file import AGENTS_DIR, read_note
+    from scripts.whoami.note_file import Note, NumberedAccountLabel, parse_account_label, note_path, read_note
 
-    match = re.fullmatch(r"codex ([1-9][0-9]*)", label)
-    if match is None:
-        raise ValueError(f"accounts: {label} is not a codex N label")
-    directory = Path(os.environ.get("AGENT_NOTES_DIR", str(AGENTS_DIR)))
-    note = read_note(directory / f"{label}.md")
-    login = (note.get("login") or "") if note is not None else ""
+    parsed = parse_account_label(label)
+    if not isinstance(parsed, NumberedAccountLabel) or parsed.tool != "codex":
+        raise ValueError(f"accounts: {label} is not a codexN label")
+    label = parsed.label
+    note = read_note(note_path(label))
+    login = (note.get("login") or "") if isinstance(note, Note) else ""
     if login:
         for home in codex_homes(Path.home() / ".codex"):
             if home.is_symlink() or (home / "auth.json").is_symlink():
@@ -143,7 +143,7 @@ def codex_account_home(label: str) -> CodexHomeHoldingLogin | CodexSetupHome:
             held = codex_email_on_disk(home)
             if held and held.casefold() == login.casefold():
                 return CodexHomeHoldingLogin(label, home, held)
-    return CodexSetupHome(label, Path.home() / f".codex{match.group(1)}")
+    return CodexSetupHome(label, Path.home() / f".codex{parsed.number}")
 
 
 def codex_home_role_label(home: Path) -> str:
@@ -156,9 +156,13 @@ def codex_home_matches_label(home: Path, label: str) -> bool:
     """Match a current account label or the legacy default-home alias."""
     if label == "default":
         return home == Path.home() / ".codex"
+    from scripts.whoami.note_file import canonical_label, NumberedAccountLabel, parse_account_label
+
+    label = canonical_label(label)
     if label == codex_home_role_label(home):
         return True
-    if re.fullmatch(r"codex ([1-9][0-9]*)", label):
+    parsed = parse_account_label(label)
+    if isinstance(parsed, NumberedAccountLabel) and parsed.tool == "codex":
         return codex_account_home(label).home == home
     return False
 
@@ -480,7 +484,12 @@ def seats_home() -> Path:
     if "seats" not in values:
         return Path.home() / ".codex"
     label = values["seats"]
-    if not isinstance(label, str) or re.fullmatch(r"codex [1-9][0-9]*", label) is None:
+    from scripts.whoami.note_file import NumberedAccountLabel, parse_account_label
+
+    if not isinstance(label, str):
+        raise ValueError(f"accounts: {path} has an invalid seats account")
+    parsed = parse_account_label(label)
+    if not isinstance(parsed, NumberedAccountLabel) or parsed.tool != "codex":
         raise ValueError(f"accounts: {path} has an invalid seats account")
     return codex_account_home(label).home
 
@@ -933,7 +942,7 @@ async def codex_live(home: Path) -> Report:
         numbered = re.fullmatch(r"\.codex([1-9][0-9]*)", home.name)
         if not initialized and home.parent == Path.home() and numbered is not None:
             report.codex_startup = CodexStartupFailure(
-                home, f'/showrunner:accounts setup "codex {numbered.group(1)}"',
+                home, f"/showrunner:accounts setup codex{numbered.group(1)}",
             )
             report.problem = report.codex_startup.problem
         elif report.email is None:

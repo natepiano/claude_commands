@@ -1,6 +1,6 @@
 ---
 description: Move a session, or the units or showrunners group, to another Claude account, pausing each session first and proving where it came back.
-argument-hint: 'session <session-id|name> "claude N"|default [--why <text>] | units|showrunners "claude N"|default [--dry-run] [--why <text>]'
+argument-hint: 'session <session-id|name> <claudeN>|default [--why <text>] | units|showrunners <claudeN>|default [--dry-run] [--why <text>]'
 ---
 
 # Move

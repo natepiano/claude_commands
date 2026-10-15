@@ -231,8 +231,8 @@ class InventoryTests(ShutdownTestCase):
         self.assertEqual(inventory.last_model(transcript), "claude-opus-real")
         self.assertEqual(model, inventory.ModelName(kind="model", name="claude-opus-real"))
         owner = top_level("refused", model=model)
-        self.assertIn("--model claude-opus-real", restart.resume_command(owner, "claude 3"))
-        self.assertNotIn("<synthetic>", restart.resume_command(owner, "claude 3"))
+        self.assertIn("--model claude-opus-real", restart.resume_command(owner, "claude3"))
+        self.assertNotIn("<synthetic>", restart.resume_command(owner, "claude3"))
 
     def test_only_synthetic_refusal_has_no_real_reply_model(self) -> None:
         transcript = self.home / ".claude/projects/model-fixture/refused.jsonl"
@@ -348,8 +348,8 @@ class InventoryTests(ShutdownTestCase):
         self.addCleanup(self.live_socket.close)
         self.write_account(self.target_config, TARGET_LOGIN)
         self.write_account(self.other_config, OTHER_LOGIN)
-        _ = (self.notes / "claude 2.md").write_text(
-            f"---\nlogin: {TARGET_LOGIN.upper()}\nstate: active\n---\n",
+        _ = (self.notes / "claude2.md").write_text(
+            f"---\nlogin: {TARGET_LOGIN.upper()}\nsessions: 1\n---\n",
             encoding="utf-8",
         )
         config_by_pid: dict[int, Path | None] = {
@@ -662,7 +662,7 @@ elif "comm=" in joined:
         found = inventory.inventory(TARGET_LOGIN)
 
         self.assertEqual(found["login"], TARGET_LOGIN)
-        self.assertEqual(found["label"], "claude 2")
+        self.assertEqual(found["label"], "claude2")
         by_id = {session["session_id"]: session for session in found["sessions"]}
         self.assertEqual(set(by_id), {DIRECTOR_ID, UNIT_ID, WORKER_ID, DESKTOP_ID})
         self.assertTrue(

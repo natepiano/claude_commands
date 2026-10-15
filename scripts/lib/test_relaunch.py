@@ -69,7 +69,7 @@ class RelaunchTests(ShutdownTestCase):
     def waiting_child(self) -> str:
         return (
             "import os,time; from pathlib import Path; "
-            "Path('ready').write_text(str(os.getppid())); "
+            "Path('ready.tmp').write_text(str(os.getppid())); os.replace('ready.tmp', 'ready'); "
             "\nwhile not Path('release').exists(): time.sleep(.01)\n"
             "raise SystemExit(7)"
         )
@@ -186,7 +186,8 @@ class RelaunchTests(ShutdownTestCase):
             "def interrupted(number,frame):\n"
             " Path('interrupted').write_text(str(number)); raise SystemExit(17)\n"
             "signal.signal(signal.SIGINT,interrupted)\n"
-            "Path('ready').write_text(str(os.getpgrp()))\nwhile True: time.sleep(.01)\n"
+            "Path('ready.tmp').write_text(str(os.getpgrp())); os.replace('ready.tmp', 'ready')\n"
+            "while True: time.sleep(.01)\n"
         )
         process = self.start(child)
         self.wait_for_file(self.root / "ready", process)

@@ -4,12 +4,14 @@
 # sessions -- so process count is the thing to minimise. The shell version it
 # replaced spawned seven processes per refresh (sh, cat, four jq, basename) and
 # was the second largest source of short-lived processes on this machine, behind
-# only cargo-tile. This is sh plus jq: two.
+# only cargo-tile. statusline.sh reads its inputs with builtins and execs this:
+# one process.
 #
-# Called as:  jq -r --arg pwd "$PWD" --arg account "$account" --slurpfile labels <by-label.json> -f statusline.jq
-# Input:      the status line JSON on stdin; --slurpfile labels is optional, and
-#             /dev/null stands in when the file is missing.
-# Output:     Line 1: "<machine> | <account> | <dirname> | <tokens with thousands separators> | <model [effort]>"
+# Called as:  jq -r --arg pwd "$PWD" --arg account "$account" --arg showrunners "<ids>"
+#                --slurpfile labels <by-label.json> -f statusline.jq
+# Input:      the status line JSON on stdin; --slurpfile labels and --arg showrunners
+#             are optional, and /dev/null stands in when the labels file is missing.
+# Output:     Line 1: "<role> | <account> | <dirname> | <tokens with thousands separators> | <model [effort]>"
 #             Line 2, when present: "5-hour <N>% left until <HH:MM zone> | weekly <M>% left until <Day HH:MM zone>",
 #             each " until ..." only when its window carries a reset time.
 
@@ -21,10 +23,21 @@ def commas: tostring | explode | reverse | to_entries
   | map(if .key > 0 and .key % 3 == 0 then [44, .value] else [.value] end)
   | flatten | reverse | implode;
 
-# The machine's ssh name, told apart by platform as the shell prompt does
-# (modules/common/shell.nix in the nixos repo). macOS keeps homes under /Users;
-# reading $ENV costs no process.
-def machine: if ($ENV.HOME // "" | startswith("/Users/")) then "mac" else "natedev" end;
+# The part this session plays, from the signals the production scripts use
+# (shutdown's session kinds, docs/as-built/shutdown-and-restart.md), first match wins.
+# showrunner: its session id is one a showrunner update timer targets.
+# worker:     agent_bg.sh hands a delegate worker PLAN_DELEGATE_TEAM_ROLE through
+#             --settings. It comes before unit because a background session
+#             inherits the daemon's environment, and a daemon a unit director
+#             started carries SHOWRUNNER_UNIT.
+# unit:       add_unit.py launches the unit director's tmux session with SHOWRUNNER_UNIT.
+def role:
+  (.session_id // "") as $id
+  | if $id != "" and ($ARGS.named.showrunners // "" | split(" ") | any(. == $id)) then "showrunner"
+    elif ($ENV.PLAN_DELEGATE_TEAM_ROLE // "") != "" then "worker"
+    elif ($ENV.SHOWRUNNER_UNIT // "") != "" then "unit"
+    else "unassigned"
+    end;
 
 def remaining($window):
   ($window.used_percentage? // null) as $used
@@ -41,8 +54,8 @@ def nth_sunday($year; $month; $n):
 
 # Epoch seconds as wall-clock time in the user's zone, formatted by strftime
 # $fmt and followed by the zone's abbreviation. The zone is America/New_York,
-# from config/user_zone.conf, written out here: jq cannot read that file without
-# a change to the settings.json command line, and strflocaltime would use the
+# from config/user_zone.conf, written out here: jq cannot read that file unless
+# statusline.sh passes it in, and strflocaltime would use the
 # machine's zone, which is Pacific on the Mac. EDT runs from 02:00 EST on the
 # second Sunday in March (07:00 UTC) to 02:00 EDT on the first Sunday in
 # November (06:00 UTC).
@@ -60,7 +73,7 @@ def user_time($fmt):
 # That reading stands only while it is under 10 minutes old and its window has
 # not reset; otherwise the response's figure does, so the line never goes blank.
 def window($name; $live):
-  (($ARGS.named.labels // [])[0] // {} | .[$ARGS.named.account // ""] // {} | .[$name] // null) as $stored
+  (($ARGS.named.labels // [])[0] // {} | .[(($ARGS.named.account // "") | gsub(" "; ""))] // {} | .[$name] // null) as $stored
   | if ($stored | type) == "object"
        and ($stored.at | type) == "number" and (now - $stored.at) <= 600
        and (($stored.resets_at | type) != "number" or $stored.resets_at > now)
@@ -85,7 +98,7 @@ def usage($label; $window; $fmt):
 | ((.model.display_name // "")
    + (if (.effort.level // "") == "" then "" else " " + .effort.level end)) as $m
 | ([
-     machine,
+     role,
      # A label is a note name; an address never reaches the line.
      (if $account == "" or ($account | contains("@")) then empty
       elif ($account | test("^claude [0-9]+$")) then $account | sub(" "; "")

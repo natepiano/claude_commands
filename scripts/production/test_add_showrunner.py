@@ -120,7 +120,7 @@ class AddShowrunnerTests(unittest.TestCase):
         notes = home / "notes"
         notes.mkdir()
         self.env["AGENT_NOTES_DIR"] = str(notes)
-        _ = (notes / "claude 2.md").write_text("---\nlogin: main@example.invalid\n---\n")
+        _ = (notes / "claude2.md").write_text("---\nlogin: main@example.invalid\n---\n")
         now = datetime.now(timezone.utc)
         file = home / ".local/state/agent-notes/usage.json"
         file.parent.mkdir(parents=True)
@@ -262,15 +262,15 @@ class AddShowrunnerTests(unittest.TestCase):
     def named_account(self) -> Path:
         with patch.dict(os.environ, self.env, clear=True):
             notes = Path(self.env["AGENT_NOTES_DIR"])
-            _ = (notes / "claude 3.md").write_text("---\nlogin: target@example.invalid\n---\n")
-            self.assertEqual(accounts.setup("claude 3"), [])
-            directory = accounts.account_dir("claude 3")
+            _ = (notes / "claude3.md").write_text("---\nlogin: target@example.invalid\n---\n")
+            self.assertEqual(accounts.setup("claude3"), [])
+            directory = accounts.account_dir("claude3")
             _ = (directory / ".claude.json").write_text(json.dumps({"oauthAccount": {"emailAddress": "target@example.invalid"}}))
             # The trust checks use a separate fixture, so selection does not expose any live home.
             _ = (directory / ".claude.json").write_text(json.dumps({"oauthAccount": {"emailAddress": "target@example.invalid"},
                 "projects": {str(self.root): {"hasTrustDialogAccepted": True},
                              str(self.root / "kid-checkout"): {"hasTrustDialogAccepted": True}}}))
-        _ = self.configure_groups(showrunners="claude 3")
+        _ = self.configure_groups(showrunners="claude3")
         return directory
 
     def test_new_showrunner_reads_stored_showrunners_account_despite_better_unit_reading(self) -> None:
@@ -279,10 +279,10 @@ class AddShowrunnerTests(unittest.TestCase):
         home = Path(self.env["HOME"])
         path = home / ".local/state/accounts/groups.json"
         path.parent.mkdir(parents=True, exist_ok=True)
-        _ = path.write_text(json.dumps({"units": "claude 1", "showrunners": "claude 3"}))
+        _ = path.write_text(json.dumps({"units": "claude1", "showrunners": "claude3"}))
         with patch.dict(os.environ, self.env, clear=True):
-            self.assertEqual(accounts.setup("claude 1"), [])
-            caller = accounts.account_dir("claude 1")
+            self.assertEqual(accounts.setup("claude1"), [])
+            caller = accounts.account_dir("claude1")
             _ = (caller / ".claude.json").write_text(json.dumps({"oauthAccount": {"emailAddress": "unit@example.invalid"}}))
         self.env["CLAUDE_CONFIG_DIR"] = str(caller)
         now = datetime.now(timezone.utc)
@@ -307,14 +307,14 @@ class AddShowrunnerTests(unittest.TestCase):
         for options in ((), ("--resume", "abc-123", "--cwd", str(self.root))):
             with self.subTest(options=options):
                 result = self.run_command("kid", *options)
-                self.refused(result, "accounts.py move showrunners <claude N>")
+                self.refused(result, "accounts.py move showrunners <claudeN>")
                 self.assertFalse(path.exists())
                 self.assertEqual(self.events("systemd-run"), [])
 
     def test_showrunner_launch_accepts_one_account_shared_with_units(self) -> None:
         """F004: both launch groups may use the same configured account."""
         directory = self.named_account()
-        _ = self.configure_groups(units="claude 3", showrunners="claude 3")
+        _ = self.configure_groups(units="claude3", showrunners="claude3")
         self.starts("kid-session", registers="kid")
         result = self.run_command("kid")
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -329,7 +329,7 @@ class AddShowrunnerTests(unittest.TestCase):
         path = Path(self.env["HOME"]) / ".local/state/accounts/groups.json"
         before = path.read_bytes()
         result = self.run_command("kid")
-        self.refused(result, "logged in as other@example.invalid, not claude 3")
+        self.refused(result, "logged in as other@example.invalid, not claude3")
         self.assertEqual(path.read_bytes(), before)
 
     def test_new_showrunner_refuses_configured_account_with_wrong_shared_link(self) -> None:
@@ -357,7 +357,7 @@ class AddShowrunnerTests(unittest.TestCase):
             "resets": (now + timedelta(days=1)).isoformat()}}
         _ = file.write_text(json.dumps(saved))
         result = self.run_command("kid")
-        self.refused(result, f"kid: Claude is not trusted in {self.root / 'kid-checkout'} on claude 3. Run:")
+        self.refused(result, f"kid: Claude is not trusted in {self.root / 'kid-checkout'} on claude3. Run:")
         self.assertIn(f"CLAUDE_CONFIG_DIR={shlex.quote(str(directory))}", result.stderr)
 
     def test_showrunner_resume_refuses_unconfigured_directory_before_reading_its_trust(self) -> None:
@@ -390,7 +390,7 @@ class AddShowrunnerTests(unittest.TestCase):
         _ = self.named_account()
         result = self.run_command("kid", "--resume", "abc-123", "--cwd", str(self.root),
                                   "--config-dir", str(directory))
-        self.refused(result, "claude 3")
+        self.refused(result, "claude3")
         self.assertEqual(self.events("systemd-run"), [])
 
     def test_showrunner_resume_accepts_relative_directory_of_configured_account(self) -> None:
@@ -432,14 +432,14 @@ class AddShowrunnerTests(unittest.TestCase):
                         ("--resume", "abc-123", "--cwd", str(self.root), "--account", "default")):
             with self.subTest(options=options):
                 result = self.run_command("kid", *options)
-                self.refused(result, "claude 3")
+                self.refused(result, "claude3")
                 self.assertEqual(self.events("systemd-run"), [])
 
     def test_showrunner_resume_without_recorded_account_uses_configured_group(self) -> None:
         """F004: configuration is sufficient for a resume with no retained account."""
         directory = self.named_account()
         self.starts("abc-123", registers="kid")
-        result = self.run_command("kid", "--resume", "abc-123", "--cwd", str(self.root), "--account", "claude 3")
+        result = self.run_command("kid", "--resume", "abc-123", "--cwd", str(self.root), "--account", "claude3")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn(str(directory), cast(list[str], self.started()["args"])[-1])
 

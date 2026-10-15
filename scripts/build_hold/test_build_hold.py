@@ -7,6 +7,7 @@ import io
 import fcntl
 import os
 import re
+import select
 import socket
 import subprocess
 import sys
@@ -29,6 +30,28 @@ from user_zone import user_zone
 
 SCRIPT = Path(__file__).with_name("build_hold.py")
 MEMORY_GATE = Path(__file__).resolve().parent.parent / "lint" / "memory_gate.sh"
+# Loaded by every Python process a test starts. It opens a writer on the test's
+# FIFO and passes it to each child it starts, so a detached child (the CLI's
+# hold-event recorder) holds a writer until it exits, and the test's cleanup
+# reads EOF only once nothing it started can still write into its scratch
+# directory.
+CHILD_LIFETIME = r'''import os
+import subprocess
+
+try:
+    writer = os.open(os.environ["BUILD_HOLD_TEST_LIFETIME_FIFO"], os.O_WRONLY | os.O_NONBLOCK)
+except (KeyError, OSError):
+    writer = -1
+if writer >= 0:
+    original_popen = subprocess.Popen
+
+    class LifetimeChild(original_popen):
+        def __init__(self, *args, **kwargs):
+            kwargs["pass_fds"] = (*kwargs.get("pass_fds", ()), writer)
+            super().__init__(*args, **kwargs)
+
+    subprocess.Popen = LifetimeChild
+'''
 
 
 def write_holder(folder: Path, name: str, since: str, purpose: str, release: str = "unknown") -> Path:
@@ -49,12 +72,23 @@ def recorded_hold_events(root: Path, expected: int) -> list[HoldEventRecord]:
 
 class IsolatedBuildHoldTest(unittest.TestCase):
     scratch: Path = Path()
+    lifetime_reader: int = -1
+    lifetime_writer: int = -1
 
     @override
     def setUp(self) -> None:
         self.scratch = Path(self.enterContext(tempfile.TemporaryDirectory()))
         meminfo = self.scratch / "meminfo"
         _ = meminfo.write_text("MemAvailable: 67108864 kB\n")
+        lifetime = self.scratch / "child-lifetime"
+        lifetime.mkdir()
+        _ = (lifetime / "sitecustomize.py").write_text(CHILD_LIFETIME)
+        fifo = lifetime / "writers"
+        os.mkfifo(fifo)
+        self.lifetime_reader = os.open(fifo, os.O_RDONLY | os.O_NONBLOCK)
+        # Held until cleanup, so the FIFO has had a writer and reports EOF
+        # once the last one closes, even when a test starts no child.
+        self.lifetime_writer = os.open(fifo, os.O_WRONLY | os.O_NONBLOCK)
         self.enterContext(mock.patch.dict(os.environ, {
             "HOME": str(self.scratch),
             "BUILDLOG_DIR": str(self.scratch / "buildlog"),
@@ -72,8 +106,21 @@ class IsolatedBuildHoldTest(unittest.TestCase):
             "PLAN_DELEGATE_ACTIVE_DIR": str(self.scratch / "active"),
             "PLAN_DELEGATE_BOARD_DIR": "",
             "PLAN_DELEGATE_SESSION_DIR": "",
+            "BUILD_HOLD_TEST_LIFETIME_FIFO": str(fifo),
+            "PYTHONPATH": os.pathsep.join(filter(None, (str(lifetime), os.environ.get("PYTHONPATH", "")))),
         }))
         self.addCleanup(self.reap_recorders)
+        self.addCleanup(self.wait_for_detached_writers)
+
+    def wait_for_detached_writers(self) -> None:
+        """Wait until no process a test started holds its FIFO writer."""
+        os.close(self.lifetime_writer)
+        try:
+            readable, _, _ = select.select([self.lifetime_reader], [], [], 30)
+            self.assertTrue(readable, "Detached children did not finish before scratch cleanup")
+            self.assertEqual(os.read(self.lifetime_reader, 1), b"")
+        finally:
+            os.close(self.lifetime_reader)
 
     def reap_recorders(self) -> None:
         for thread in threading.enumerate():
