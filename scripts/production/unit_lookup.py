@@ -216,10 +216,37 @@ def _claudes() -> tuple[dict[str, LiveClaude], dict[HerdrPlace, LiveClaude], str
     return tmux, native, unread
 
 
+# Starts each session's block in the one tmux call that reads every session's marks.
+MARKS_HEADER = "\x1fmarks of "
+
+
+def _every_marks(sessions: list[str]) -> dict[str, dict[str, str]]:
+    """Each session's marks from one tmux call, not one per session: under load each call cost
+    several milliseconds. A session the call did not reach, because one before it ended and tmux
+    stopped there, is asked again alone."""
+    chain: list[str] = []
+    for session in sessions:
+        chain += [*([";"] if chain else []), "display-message", "-p", "-t", session, f"{MARKS_HEADER}{session}",
+                  ";", "show-environment", "-t", session]
+    found: dict[str, dict[str, str]] = {}
+    current = ""
+    for line in (_tmux(*chain).stdout if chain else "").splitlines():
+        if line.startswith(MARKS_HEADER):
+            current = line.removeprefix(MARKS_HEADER)
+            found[current] = {}
+        elif current and "=" in line:
+            name, value = line.split("=", 1)
+            if name in (PRODUCTION_MARK, UNIT_MARK):
+                found[current][name] = value
+    return {session: found[session] if session in found else _marks(session) for session in sessions}
+
+
 def _marked_sessions(claudes: dict[str, LiveClaude], unread: str) -> Iterable[tuple[str, MarkedUnit]]:
     """Each tmux session carrying both marks, with its production slug."""
-    for session, (label, panes) in tmux_sessions().items():
-        marks = _marks(session)
+    listed = tmux_sessions()
+    every_marks = _every_marks(list(listed))
+    for session, (label, panes) in listed.items():
+        marks = every_marks[session]
         slug, unit = marks.get(PRODUCTION_MARK, ""), marks.get(UNIT_MARK, "")
         if not slug or not unit:
             continue
