@@ -46,7 +46,7 @@
 
 **Gotchas:** `updated_at` equal to or before the pause time is not an answer; only a strictly later value counts. Saved records without `updated_at` parse as 0.
 
-### Phase 2 — The pause names its own check; `move --no-alert`  · status: todo
+### Phase 2 — The pause names its own check; `move --no-alert`  · status: done
 
 **Depends on:** Phase 1
 
