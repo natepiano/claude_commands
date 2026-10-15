@@ -23,7 +23,7 @@ The status line's first row shows this session's account label, after its role. 
 | Label | The account's label. A named Claude folder keeps its own label; a Codex home shows the label of its login's note. |
 | Login | The login, `not logged in`, or `not set up` for an account that has a note and is in no folder. |
 | Role | `units` and/or `showrunners` for the selected Claude groups; `workers` for the Codex home in use, `spare` for the other Codex homes. |
-| 5-hour left, Weekly left | Percent of each window left, each with its reset time. A dash when the account has no such window. |
+| Weekly left | Percent of the weekly window left, with its reset time. A dash when the account has no weekly window. |
 | On credits | Codex only: `yes` when a window is used up and the account's credits now pay for the work. |
 | Credits left | Codex only: the credit balance, or `unlimited`. |
 | Read | When those numbers were read. |
