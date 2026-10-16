@@ -48,7 +48,7 @@ The user, via natedev, 2026-10-06 13:1x PDT: "create a long running unit directo
   - `scripts/hana_shot/hana_shot.py`, `test_hana_shot.py`, `commands/hana_shot.md` — Phase 3 recording
   - the `buildlog hourly` call site in `scripts/buildlog/` — Phase 4 (one call, like `rust_release.py`'s)
   - outside the repository: `~/.local/state/screenshot-analysis/` (history, scan cache, seed)
-- **Key files:** `~/.local/state/screenshot-analysis/seed/analysis.md` and its scripts; `scripts/hana_shot/hana_shot.py` (`stats`, the timings writer); `scripts/buildlog/` (the hourly entry and how `rust_release.py` hooks in); `commands/builds.md` (the shape of a report command).
+- **Key files:** `~/.local/state/screenshot-analysis/seed/analysis.md` and its scripts; `scripts/hana_shot/hana_shot.py` (`stats`, the timings writer); `scripts/buildlog/` (the hourly entry and how `rust_release.py` hooks in); `commands/build/report.md` (the shape of a report command; it replaced `commands/builds.md`, and it reaches this worktree with the next merge of `build-followups`).
 - **Port:** 15797, for any live Hana smoke. Never the user's default port or another unit's.
 - **Test lanes:** `scripts/shot_report/`, `scripts/hana_shot/`, `scripts/buildlog/` — `test_*.py` beside the scripts.
 - **Test:** `python3 -m unittest discover -s scripts/shot_report -p 'test_*.py'` (plus `-s scripts/hana_shot` and `-s scripts/buildlog` when touched), from the worktree root.
@@ -255,7 +255,9 @@ Measured 2026-10-06/07 on the build machine, 300 s split, Sep 9 PDT to 2026-10-0
 
 ### Phase 6 — Proposals: the next change, ranked by measured minutes saved · status: todo (standing)
 
-**Blocked by:** G1 — the next re-rank waits until Wed 2026-10-14 07:50 PDT.
+**Depends on:** Phase 10 — the next re-rank measures the week after the failure texts land.
+
+**Blocked by:** G1 — the next re-rank waits until Wed 2026-10-14 10:50 EDT (07:50 PDT).
 
 #### Work Order
 
@@ -269,6 +271,7 @@ Measured 2026-10-06/07 on the build machine, 300 s split, Sep 9 PDT to 2026-10-0
   - hana-frame settle (787 ms);
   - magick crops moved to extras' rect;
   - the parked speed plan;
+  - a fit that gets no answer on an open Screen's root (hana, 2026-10-08: the `AnimateToFit` event sent at `scripts/hana_shot/hana_shot.py:763` got no answer in 10 s, four tries, on organon's tip 6751bf6f6 with a stock new Screen open; `--mode hana-frame` on the same root shot in 2 s). The cause is on Hana's side, dated by organon to trunk's assembly staging merges, and trunk traces it after its Phase 86 gates, so it is not this unit's to fix. The tool-side candidate is a failure text that names `--mode hana-frame`; price it from the `failure_reason: timeout` records on fit shots, and drop it if Hana's fix lands first;
   - one shot tool for any BRP app, not only Hana (declined 2026-10-07, below).
 - Send natedev the top proposal only. It holds:
   - the measured cost today, with n;
@@ -288,13 +291,20 @@ Measured 2026-10-06/07 on the build machine, 300 s split, Sep 9 PDT to 2026-10-0
 
 **Seats:** none — the unit director ranks and proposes from the report; no code is written until a proposal becomes its own phase.
 
-**Constraints from prior phases:** Failure logging, Codex transcript scanning and kept-shot detection are delivered, so `analysis.md` → Next improvements entry 2, entry 3 and the failure-logging half of entry 1 are not proposed again; what fills long `/hana_shot` episodes is answered by the report's "What fills long /hana_shot episodes" section: agent thinking holds 61–67% of long minutes, other BRP calls 7–12%, file work 8–11%, retries 3–5% and shot calls 2–3%, so it is not proposed again. Its first window was under one day; re-rank from that section after a full week of `/hana_shot` data. The hourly phase supplies source-host coverage and says whether each attempt count is exact or inferred from images. The Mac catch-up delivers Codex transcripts and timings and finished in five hourly runs (`scan_status.json` → `mac_read_state`; check it before each estimate); Mac Claude transcripts stay out above 100 files or 100 MB, so every Mac estimate names that limit. A `changes.json` entry is either a product change, which is a speed candidate, or a measurement change, which the report lists separately and never counts as a speed gain; an approved proposal appends a product change carrying its effective time and affected hosts. Scale-aware `--window` (Phase 8, d1efe4c) is in `changes.json` as a product change on natedev and the Mac, effective 2026-10-07 08:04 PDT; it is not proposed again. The window-level restore (Phase 9) is in `changes.json` as a product change on natedev and the Mac, effective 2026-10-07 10:08 PDT; it is not proposed again. Since that change, a `/hana_shot` run ended by Ctrl-C, SIGTERM or SIGHUP writes its invocation record with `status: failure`, `exit_code` 130, 143 or 129 and `failure_reason: shot_failed`; before it, SIGTERM and SIGHUP left no record. When a candidate is priced from failures in `invocations.jsonl`, count records with those exit codes apart from failed shots. Price weekly agent minutes from an observed eligible weekly count, keep per-shot milliseconds distinct from episode minutes, and leave a candidate unpriced when its evidence cannot support that calculation.
+**Constraints from prior phases:** Failure logging, Codex transcript scanning and kept-shot detection are delivered, so `analysis.md` → Next improvements entry 2, entry 3 and the failure-logging half of entry 1 are not proposed again; what fills long `/hana_shot` episodes is answered by the report's "What fills long /hana_shot episodes" section: agent thinking holds 61–67% of long minutes, other BRP calls 7–12%, file work 8–11%, retries 3–5% and shot calls 2–3%, so it is not proposed again. Its first window was under one day; re-rank from that section after a full week of `/hana_shot` data. The hourly phase supplies source-host coverage and says whether each attempt count is exact or inferred from images. The Mac catch-up delivers Codex transcripts and timings and finished in five hourly runs (`scan_status.json` → `mac_read_state`; check it before each estimate); Mac Claude transcripts stay out above 100 files or 100 MB, so every Mac estimate names that limit. A `changes.json` entry is either a product change, which is a speed candidate, or a measurement change, which the report lists separately and never counts as a speed gain; an approved proposal appends a product change carrying its effective time and affected hosts. Scale-aware `--window` (Phase 8, d1efe4c) is in `changes.json` as a product change on natedev and the Mac, effective 2026-10-07 08:04 PDT; it is not proposed again. The window-level restore (Phase 9) is in `changes.json` as a product change on natedev and the Mac, effective 2026-10-07 10:08 PDT; it is not proposed again. Since that change, a `/hana_shot` run ended by Ctrl-C, SIGTERM or SIGHUP writes its invocation record with `status: failure`, `exit_code` 130, 143 or 129 and `failure_reason: shot_failed`; before it, SIGTERM and SIGHUP left no record. When a candidate is priced from failures in `invocations.jsonl`, count records with those exit codes apart from failed shots. Price weekly agent minutes from an observed eligible weekly count, keep per-shot milliseconds distinct from episode minutes, and leave a candidate unpriced when its evidence cannot support that calculation. Since Phase 10 (540c062, in `changes.json` as a product change and a measurement change on natedev and the Mac, effective 2026-10-15 11:07 EDT), every failed invocation and failed attempt carries its failure text in `error`, so a re-rank reads failure texts from the records, not from transcripts; it compares the weeks before and after that time, and does not propose the failure texts again.
 
 **Acceptance gate:** each proposal cites a report less than 24 h old whose scan covers every host it uses through a time at or after G1 (`scan_status.json` → `last_success` and `host_coverage`), the covered window and n for every number, both splits when it uses episode time, exact or inferred attempt evidence when it uses kept shots, and the calculation of expected agent-minutes saved per week. A candidate without those inputs is labeled unpriced and ranks below every priced one.
 
 **Declined:** one shot tool for any BRP app, not only Hana (about 1.5 agent-minutes a week, 2026-10-07) — not approved for now; the user approved finding out why long `/hana_shot` episodes run long instead.
 
-**Deferred:** the shot tool's refusals fix (help text for `--margin` 0–0.45 and a fix hint in the "pose needs focus and radius" and "not inside a git worktree; pass --views-file" refusals) — the user, 2026-10-07: "wait a week on the screenshot refusal fix". Deferred, not declined: when G1 clears, re-rank every candidate, this one included, from a week of data and send natedev the top one.
+**Re-rank 2026-10-14 (after G1):** report from the 15:31 EDT scan (both hosts covered through 15:31 EDT; Mac read finished; Mac Codex transcripts and timings in, Mac Claude transcripts out), window 2026-10-07 13:08 to 2026-10-14 15:31 EDT (7.10 days). All 2,429 shot records came from natedev; the Mac recorded none. 184 failed shots, priced as the time from each failure to the same session's next successful shot (at most 15 min): 151 min in the window, 149 min a week. The error text came from the transcript within 20 s of each record. Ranked by the minutes a fix would save, assuming a failure text that names its fix leaves about 10 s of recovery (the median recovery after the margin refusal, which already names its range):
+1. **Approved by the user 2026-10-15; built as Phase 10. Every failure text names its next step.** It merges the deferred refusal fix with the two largest priced failure groups. Rejected fits (the camera did not move): n=20, 21.8 min. A target that found nothing: n=10, 19.9 min, 18 of them from one stale `entity:` id. Margin out of range: n=15, 10.4 min. Pose without focus and radius, and the view-name format: n=11, 8.3 min. About 53 agent-minutes a week saved, 60 at most.
+2. The parked speed plan: about 2,245 successful shots a week at a median of 0.73 to 0.88 s each, so at most about 8 min a week even if the time is cut by 30%.
+3. Moving magick crops to extras' rect: fit with a rect crop, n=108, takes 1.36 s against 0.75 s with no crop, about 1 min a week. Hana-frame settle: n=39 at a median of 1.09 s, under 1 min a week.
+4. Unpriced: other BRP calls (52 min in long episodes at the 5-min split, but the timelines do not name the BRP calls), and the 107 failed shots with no attributable error text (74 min a week). The proposal records each failure's text so the next re-rank can price that group.
+5. Dropped: the fit-timeout text. All nine timeouts fell on 2026-10-07 and 08, and there have been none since 2026-10-08 12:48 EDT.
+
+**Deferred:** the shot tool's refusals fix (help text for `--margin` 0–0.45 and a fix hint in the "pose needs focus and radius" and "not inside a git worktree; pass --views-file" refusals) — the user, 2026-10-07: "wait a week on the screenshot refusal fix". Deferred, not declined: when G1 clears, re-rank every candidate, this one included, from a week of data and send natedev the top one. Built as Phase 10 (540c062) after the 2026-10-14 re-rank.
 
 ### Phase 7 — We know what fills a long `/hana_shot` episode, and its fix comes back priced · status: done
 
@@ -363,3 +373,59 @@ Measured 2026-10-06/07 on the build machine, 300 s split, Sep 9 PDT to 2026-10-0
 - A `timeout` parameter on `Brp.mutate` — it only repeated `Brp.call`'s default.
 - Leaving Ctrl-C on the `KeyboardInterrupt` path — one path for all three signals gives one rule and one exit-code scheme.
 
+
+### Phase 10 — Every `/hana_shot` failure names its next step, and the screenshot report follows the user's zone · status: done
+
+#### As-built
+
+- A rejected fit names `shot --target <quoted label> --mode pose --focus 0,0,0 --radius 6` (a stored `--view` ignores pose flags) or a fit on a parent with geometry. It also names the nearest cached ancestor with an AABB as `--target entity:<id> (<name>)`, from `TargetEvidence`: names, parents and the AABB set, observed from queries the run already makes. An explicit `has[AABB]` false drops an entity.
+- A target that finds nothing: an `entity:` selector says ids change when Hana restarts; `name:`/`tool:` lists up to five closest names or kinds (`difflib`). An ambiguous target lists `entity:<id> (<name>)` per match.
+- The margin refusal and `--margin` help state the range 0 to 0.45 and "fraction of the viewport kept clear on each side (0.1 = 10%)". The pose refusal names the missing flags with an example. View-name refusals (`view_name_refusal`) suggest a valid name built from the refused one.
+- Every failed invocation and failed attempt record carries `error`: one string, several failures joined by newlines; success records have none, and old records without it still read. `CaptureFailure(reason, error)` replaces the bare reason list. Argparse errors reach the record through `RequestArgumentParser`/`ArgumentExit`. A signal exit appends "terminated by SIG…" after earlier failures, so the first real `failure_reason` stays; an unhandled exception appends its type and text, then re-raises.
+- `/shot_report`: `_user_time` prints in `user_zone.conf`'s zone, the weekly heading names the zone, and baseline lines keep the instant 2026-09-09T07:00Z but print it in the user zone. No fixed zone name remains in either script dir or the two command docs. `changes.json` holds a product change and a measurement change for this, on natedev and the Mac.
+
+**Files:**
+- `scripts/hana_shot/hana_shot.py` — failure hints, `TargetEvidence`, `CaptureFailure`, `view_name_refusal`, `RequestArgumentParser`/`ArgumentExit`, `error` on failure records
+- `scripts/hana_shot/test_hana_shot.py` — a test per hint and per record path, against the fake BRP server
+- `commands/hana_shot.md` — lists the `error` field and the margin meaning
+- `scripts/shot_report/shot_report.py` — `_user_time`, zone-named weekly heading and baseline lines
+- `scripts/shot_report/test_shot_report.py` — zone tests with a pinned `USER_ZONE`
+- `commands/shot_report.md` — no fixed zone name
+
+**Binds later work:** the re-rank in "Proposals: the next change, ranked by measured minutes saved" reads failure texts from the records' `error` field, not transcripts, and compares the weeks before and after this change.
+
+**Gotchas:** the hints that need live Hana are covered by the fake BRP server only. The fake server projects only requested components, so a test that depends on parents needs the query to ask for `ChildOf`.
+
+### Phase 11 — A view can face its target along the target's own axis · status: done
+
+**Source:** the hana showrunner via natedev, 2026-10-15 16:2x EDT: "hana_shot cannot express 'face along the entity's own normal': view yaw and pitch are world angles only (hana_shot.py Pose(focus, yaw, pitch, radius)), so a tilted panel, such as Hana's Frame time panel on the tilted placement disk, cannot be shot face-on from a named view. Add a view option that faces a target entity along its local forward or normal (radius still applies), with a test."
+
+#### Work Order
+
+**Goal:** a stored view or a `shot` call can say "look at this target face-on from its own +z side", and the camera lands square to a tilted panel without anyone working out yaw and pitch.
+
+**Spec:**
+- New view key `face` and `shot` flag `--face`, one of `+x`, `-x`, `+y`, `-y`, `+z`, `-z`: a local axis of the target. The camera sits on that side of the target and looks back along the axis. Bevy's local forward is `-z`, so a panel whose readable side faces its local `+z` uses `face = "+z"`.
+- The script reads the target's `GlobalTransform` over BRP, takes the named axis column of its 3×3 part (x, y, z axes, then translation; see `affine_point`), negates it for a `-` axis, and normalizes it, so scale does not matter. It turns that world direction `d` into orbit angles with Hana's convention (`hana_lagrange` `orbit_transform.rs`: the camera offset from the focus is `rotation * (0, 0, r)` with `rotation = yaw about Y * (-pitch about X)`, so `yaw = atan2(d.x, d.z)`, `pitch = asin(d.y)`, Y up). One pure function maps a transform and an axis to `(yaw, pitch)`. The tests call it directly.
+- `face` works in the two modes that take angles:
+  - `fit`: the derived angles go to `AnimateToFit`, and margin applies as today. Stored views stay fit views where they can, because a fit follows its target.
+  - `pose`: radius applies. The focus defaults to the target's world translation, so `--focus` is optional with `face`, and `pose` with `face` needs a target. An explicit `--focus` still wins.
+  - `face` with `hana-frame` or `home` is refused with a text that names `fit` and `pose`.
+- `face` together with an explicit yaw or pitch (flag, or view key present) is refused: the two disagree. The refusal names both and says to drop one. `Shot` must tell an explicit angle from the default 0, so carry the angles as given, or as derived from the face, without a sentinel number.
+- When `d` is within 1° of straight up or down, yaw is undefined, and Hana's orbit pitch clamp keeps the camera from reaching it. Refuse with a text that says so and suggests `--yaw 0 --pitch 1.55` (or -1.55) as a pose that comes close.
+- The move key that skips an unchanged camera move (`take`, `move_key`) uses the angles derived on this run, so a repeated face view still moves when the target has turned.
+- `views add` stores `face` when it is given and leaves out yaw and pitch. `views check` runs face views like any other. `views show` prints the key. `VIEW_KEYS`, `ViewValue`, `validate_view` and `format_view` learn it; the header comment names it.
+- `pose get/set` is unchanged.
+- `commands/hana_shot.md` documents `face`/`--face` in the list of view keys and flags, with the Frame time example: `face = "+z"` on `tool:FrameTimeInfoPanel`.
+- The timing and invocation records carry `face` when it is set, as an optional field that old records lack. `/shot_report` needs no change.
+
+**Files:**
+- `scripts/hana_shot/hana_shot.py` — `face` key and flag, the axis-to-angles function, the GlobalTransform read, the refusals, the move key, views add/show
+- `scripts/hana_shot/test_hana_shot.py` — the axis-to-angles function on an identity, a yawed, a pitched and a tilted, scaled transform for all six axes (check the round trip: the camera offset built from the returned angles points along `d`); a fake-server fit shot and a pose shot with `face` (the fit event carries the derived angles; the pose mutation carries the target's translation as its focus and the given radius); the refusals for face with yaw or pitch, for hana-frame/home, and for a vertical axis; views add writing `face` without angles; a stored face view loading and validating
+- `commands/hana_shot.md` — the key, the flag and the example
+
+**Workers:** two — `impl` owns `hana_shot.py` and `commands/hana_shot.md`; `test` owns `test_hana_shot.py`. They agree the names of the new function and refusal texts by message first.
+
+**Constraints from prior phases:** failure records carry `error` (Phase 10); every refusal names its next step (Phase 10), and the new refusals follow that rule. The fake BRP server projects only requested components, so a test that reads `GlobalTransform` on the target must have the query ask for it. Python is typed throughout: no `Any`, no file-level ignores. basedpyright reports 0 errors, 0 warnings and 0 notes on each changed .py file.
+
+**Acceptance gate:** `python3 -m unittest discover -s scripts/hana_shot -p 'test_*.py'` passes, and basedpyright is clean on `scripts/hana_shot/hana_shot.py` and `test_hana_shot.py`. A live shot of `tool:FrameTimeInfoPanel` with `--face +z`, in fit mode and in pose mode, shows the panel square to the camera on Hana on port 15797. The unit director takes these shots.

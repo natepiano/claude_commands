@@ -37,14 +37,54 @@ from note_file import FIELD, Note, reset_time
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.accounts import refusals
 from scripts.whoami.agent_accounts import KnownCodexAccount, UnknownCodexAccount
-from agent_accounts import (ClaudeAccountsInUse, ClaudeDirectorySource, CodexHomeSource, EASTERN, Report,
+from agent_accounts import (ClaudeAccountsInUse, CodexHomeSource, EASTERN, Report,
                             codex_home_display, codex_homes,
                             codex_report_in_use, live_reports, workers_home as resolve_workers_home)
 from quota_alert import (AgentNote, alert, blocked, current_session, refresh, CodexAlertPassReadings,
                          codex_alert_pass, RefusedAt, RefusalTimeUnknown)
 from run_out import READINGS_LOG
 import usage_store
+from user_zone import user_zone
 
+
+# Expand at refresh time so callers can substitute HOME or an absolute test path.
+SESSIONS_SEEN = Path("~/.local/state/agent-notes/sessions_seen.json")
+
+
+def read_sessions_seen() -> dict[str, str]:
+    """Read valid machine observations; missing or damaged state never blocks notes."""
+    try:
+        data = cast(object, json.loads(SESSIONS_SEEN.expanduser().read_text(encoding="utf-8")))
+    except (OSError, UnicodeError, ValueError):
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    seen: dict[str, str] = {}
+    for machine, value in cast(dict[str, object], data).items():
+        if not isinstance(value, str):
+            continue
+        try:
+            at = datetime.fromisoformat(value)
+        except ValueError:
+            continue
+        if at.utcoffset() is not None:
+            seen[machine] = value
+    return seen
+
+
+def write_sessions_seen(seen: dict[str, str]) -> None:
+    """Replace the machine observations once, outside the vault."""
+    path = SESSIONS_SEEN.expanduser()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    output = tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=path.parent,
+                                         prefix=".sessions-seen-", delete=False)
+    temporary = Path(output.name)
+    try:
+        with output:
+            _ = output.write(json.dumps(seen, sort_keys=True) + "\n")
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 class StoredReading(TypedDict):
@@ -307,6 +347,9 @@ class UpdatedAgentNotes:
 
 def update_alert_pass(selection: ClaudeAccountsInUse, workers_home: Path) -> UpdatedAgentNotes:
     """Build the alert readings before writing any note."""
+    from scripts.accounts import accounts
+
+    accounts.sweep_claude_temp_files(datetime.now(timezone.utc))
     messages = rename_legacy_notes(note_file.notes_dir())
     notes = note_file.read_notes()
     multiple_codex_homes = len(codex_homes(workers_home)) > 1
@@ -337,7 +380,6 @@ def update_alert_pass(selection: ClaudeAccountsInUse, workers_home: Path) -> Upd
             else:
                 for key, value in updates.items():
                     _ = merged[label].setdefault(key, value)
-    from scripts.accounts import accounts
     try:
         groups = accounts.group_note_labels()
     except accounts.AccountsError as error:
@@ -345,8 +387,17 @@ def update_alert_pass(selection: ClaudeAccountsInUse, workers_home: Path) -> Upd
         groups = None
     group_roles: tuple[tuple[accounts.ClaudeGroup, str], ...] = (("showrunners", "showrunner"), ("units", "unit"))
     sessions = session_table.live_sessions(os.environ)
+    machines_seen: dict[str, str] = {}
     if isinstance(sessions, session_table.SessionsUnread):
         messages.append(f"sessions: {sessions.reason}")
+    else:
+        machines_seen = read_sessions_seen()
+        machines_seen.update({machine: checked_at.astimezone(user_zone()).isoformat(timespec="seconds")
+                              for machine in sessions.machines_read})
+        try:
+            write_sessions_seen(machines_seen)
+        except OSError as error:
+            messages.append(f"sessions seen: {error}")
     stamp = {"date_modified": f'"[[{checked_at.astimezone().strftime("%Y-%m-%d")}]]"'}
     for note in notes:
         updates = merged[note.label]
@@ -357,9 +408,9 @@ def update_alert_pass(selection: ClaudeAccountsInUse, workers_home: Path) -> Upd
             updates["role"] = ("worker",) if note.label == codex_readings.selected_account.label else ()
         section: SessionsSection | KeepSections = KEEP_SECTIONS
         if isinstance(sessions, session_table.ReadSessions):
-            kept = tuple(session_table.last_seen(row) for row in session_table.section_rows(note.text[note.end:])
+            kept = tuple(session_table.last_seen(row, machines_seen) for row in session_table.section_rows(note.text[note.end:])
                          if row.machine in sessions.rows_kept)
-            live = tuple(session_table.observed(row, checked_at)
+            live = tuple(row._replace(last_seen="", observed_at="")
                          for row in sessions.rows_by_label.get(note.label, ()))
             rows = live + kept
             updates["sessions"] = str(len(live))
@@ -371,13 +422,9 @@ def update_alert_pass(selection: ClaudeAccountsInUse, workers_home: Path) -> Upd
         except (OSError, UnicodeError) as error:
             messages.append(f"readings log: {error}")
     try:
-        # Keep the default Claude input; Codex ownership comes from the frozen pass.
         watch_reports = [report for report in reports
                          if (report.tool.lower() != "codex" or codex_report_in_use(report, workers_home))
-                         and (report.tool.lower() != "claude" or not selection.multiple_accounts
-                              or (report.source.directory == Path.home() / ".claude"
-                                  if isinstance(report.source, ClaudeDirectorySource)
-                                  else selection.is_home_directory_login(report.email or "")))]
+                         and (report.tool.lower() != "claude" or selection.is_in_use(report.email or ""))]
         messages += five_hour.watch(watch_reports, codex_readings=codex_readings)
     except (OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError) as error:
         # The 5-hour watch must never cost the notes or the weekly alerts.

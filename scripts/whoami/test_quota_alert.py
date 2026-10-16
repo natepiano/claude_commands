@@ -295,7 +295,7 @@ class QuotaAlertTests(unittest.TestCase):
             json.dumps({"oauthAccount": {"emailAddress": "showrunner@example.invalid"}}), encoding="utf-8",
         )
         _ = (self.root / "claude2.md").write_text("---\nlogin: showrunner@example.invalid\n---\n")
-        for label, login in (("claude1", "spare@example.invalid"), ("claude3", "unit@example.invalid")):
+        for label, login in (("claude1", "spare@example.invalid"), ("claude2", "showrunner@example.invalid"), ("claude3", "unit@example.invalid")):
             self.assertEqual(accounts.setup(label), [])
             _ = (self.root / note_name(label)).write_text(f"---\nlogin: {login}\n---\n")
             _ = (accounts.account_dir(label) / ".claude.json").write_text(
@@ -425,8 +425,12 @@ class QuotaAlertTests(unittest.TestCase):
         notes: Notes = [self.note("claude1.md", "active", "0", login="spare@example.invalid"),
                         self.note("claude2.md", "active", "0", login="showrunner@example.invalid"),
                         self.note("claude3.md", "active", "0", login="unit@example.invalid")]
-        def observed_account(pid: int) -> account.Account | None:
-            return identities.get(pid)
+        def observed_account(pid: int, *, home_state: account.LegacyHomeLogin | account.ConfigOnlyHome) -> account.Account | None:
+            identity = identities.get(pid)
+            if (identity is not None and isinstance(home_state, account.LegacyHomeLogin)
+                    and identity.login.casefold() == home_state.account.login.casefold()):
+                return home_state.account
+            return identity
         with (mock.patch.object(sessions, "live_sessions", return_value=owners),
               mock.patch.object(account, "account_of", side_effect=observed_account)):
             _ = self.alert(notes, self.now)
@@ -446,15 +450,19 @@ class QuotaAlertTests(unittest.TestCase):
         owners = [sessions.SessionRecord(pid=pid, sessionId=str(pid), name=str(pid),
             messagingSocketPath="/fixture.sock", updatedAt=1, tmux="", formerNames=[]) for pid in (10001, 10003)]
         directories = {10001: external, 10003: unfit}
-        logins = {self.root / ".claude": "showrunner@example.invalid", unfit: "unit@example.invalid",
+        logins = {self.root / ".claude": "showrunner@example.invalid", accounts.account_dir("claude2"): "showrunner@example.invalid",
+                  unfit: "unit@example.invalid",
                   external: "external@example.invalid", accounts.account_dir("claude1"): "spare@example.invalid"}
         _ = self.note("claude4.md", "inactive", "90", login="external@example.invalid")
         _ = self.note("claude3.md", "inactive", "90", login="unit@example.invalid")
         _ = self.note("claude2.md", "active", "90", login="showrunner@example.invalid")
-        def process_directory(pid: int) -> Path | None:
-            return directories.get(pid)
-        def process_account(pid: int) -> account.Account | None:
+        def process_directory(pid: int) -> account.ConfiguredClaudeFolder | account.ProcessEnvironmentUnread:
             directory = directories.get(pid)
+            return account.ConfiguredClaudeFolder(directory) if directory is not None else account.ProcessEnvironmentUnread("fixture")
+        def process_account(pid: int, *, home_state: account.LegacyHomeLogin | account.ConfigOnlyHome) -> account.Account | None:
+            directory = directories.get(pid)
+            if directory == Path.home() / ".claude" and isinstance(home_state, account.LegacyHomeLogin):
+                return home_state.account
             return account.Account("claude", logins[directory], "fixture") if directory is not None else None
         def live(directory: Path) -> Report:
             return Report("Claude", email=logins[directory], quotas=[Quota("Weekly", 100,

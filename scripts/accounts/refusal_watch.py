@@ -325,9 +325,10 @@ NO_SESSION_FILTER: frozenset[str] = frozenset()
 
 def live_owners(*, only: frozenset[str] = NO_SESSION_FILTER) -> list[inventory_module.Session]:
     owners: dict[str, inventory_module.Session] = {}
+    home_state = account.home_account_state()
     logins = {identity.login for session in sessions.live_sessions()
               if not only or session["sessionId"] in only
-              if (identity := account.account_of(session["pid"])) is not None}
+              if (identity := account.account_of(session["pid"], home_state=home_state)) is not None}
     for login in sorted(logins):
         for session in inventory_module.inventory(login, only, refresh_desktops=False)["sessions"]:
             if session["kind"] != "worker":

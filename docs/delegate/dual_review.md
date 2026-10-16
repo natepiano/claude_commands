@@ -16,7 +16,7 @@ is the third reader:
 | Lens | Reads for |
 | --- | --- |
 | `adversary` | the failing case — the input that violates a stated invariant, the caller that was not updated, the state the new code cannot reach, the test that passes for the wrong reason |
-| `contract` | what the Work Order says, including every part no test covers, and anything built that it never asked for; then what the change reaches without naming — callers, consumers, public API, traits, registration, plugin wiring, invariants and transitions |
+| `contract` | what the Work Order says, including every part no test covers, and anything built that it never asked for; then what the change reaches without naming — callers, consumers, public API, traits, registration, plugin wiring, invariants and transitions; and the repository's targets file (`docs/hana/targets.md` in hana), when present |
 
 The `craft` lens is off since 2026-10-04 (user: review trial ended); the unit
 director's main review audits style each phase.
@@ -39,8 +39,10 @@ concrete failing case it built, or reports plainly that it could not build one:
 "no failing case found" from a reader who was trying is evidence, and it is the
 only reading here that produces evidence by finding nothing.
 
-Findings come back as one `review_findings_<pass>_<lens>.txt` per lens. That
-file is the whole review result: <Synthesize/> reads both, tags each finding
+Findings come back as one `review_findings_<pass>_<lens>.txt` per lens, in
+`${PHASE_DIR}` because every launch names its phase with `--phase`: two phases
+reviewing at once never share a pass's files. That file is the whole review
+result: <Synthesize/> reads both, tags each finding
 with the lens that caught it, and can tell two independent findings from one
 finding found twice.
 
@@ -89,7 +91,7 @@ questions and no others; a closure review names no lens.
 
 <BroadReviewPrompt>
 Write one prompt per lens at
-`${SESSION_DIR}/review_prompt_${REVIEW_PASS}_<lens>.md`, each under
+`${PHASE_DIR}/review_prompt_${REVIEW_PASS}_<lens>.md`, each under
 <ReviewPromptContract/> with:
 
 ```
@@ -139,6 +141,8 @@ The questions are the lens, so each prompt carries only its own:
   — and what there still assumes an invariant or state transition it changed?
   4. Consistent with surrounding code? 5. Are domain types clear, and are owned
   bare Option<T> values replaced or justified at an external boundary?
+  6. Does it meet every target in the repository's targets file, when present?
+  A miss is a defect.
 
 **Early form** (an <EarlyReviewArm/> launch, which arms the `adversary` alone):
 the `## Diff` section holds the partial diff at launch, and an
@@ -188,8 +192,8 @@ of reviewing the partial diff.
    ```sh
    bash ~/.claude/scripts/delegate/review.sh --pool code \
      --lease "<slug>/<unit>/<phase>" \
-     "${SESSION_DIR}" "${WORKING_DIR}" \
-     "${SESSION_DIR}/review_prompt_${REVIEW_PASS}_<lens>.md" review \
+     --phase "<phase id>" "${SESSION_DIR}" "${WORKING_DIR}" \
+     "${PHASE_DIR}/review_prompt_${REVIEW_PASS}_<lens>.md" review \
      "<responsibility>" "<activity>" "${REVIEW_PASS}" <lens>
    ```
 
@@ -198,8 +202,8 @@ of reviewing the partial diff.
 
    ```sh
    bash ~/.claude/scripts/delegate/review.sh --to "<full-worker-name>" \
-     "${SESSION_DIR}" "${WORKING_DIR}" \
-     "${SESSION_DIR}/review_prompt_${REVIEW_PASS}_<lens>.md" review \
+     --phase "<phase id>" "${SESSION_DIR}" "${WORKING_DIR}" \
+     "${PHASE_DIR}/review_prompt_${REVIEW_PASS}_<lens>.md" review \
      "<responsibility>" "<activity>" "${REVIEW_PASS}" <lens>
    ```
 
@@ -207,8 +211,8 @@ of reviewing the partial diff.
 
    ```sh
    bash ~/.claude/scripts/delegate/review.sh --to "<full-worker-name>" \
-     "${SESSION_DIR}" "${WORKING_DIR}" \
-     "${SESSION_DIR}/review_prompt_${REVIEW_PASS}.md" review \
+     --phase "<phase id>" "${SESSION_DIR}" "${WORKING_DIR}" \
+     "${PHASE_DIR}/review_prompt_${REVIEW_PASS}.md" review \
      "<responsibility>" "<activity>" "${REVIEW_PASS}"
    ```
 
@@ -217,8 +221,8 @@ of reviewing the partial diff.
 
    ```sh
    bash ~/.claude/scripts/delegate/review.sh --slot review \
-     "${SESSION_DIR}" "${WORKING_DIR}" \
-     "${SESSION_DIR}/review_prompt_${REVIEW_PASS}_<lens>.md" review \
+     --phase "<phase id>" "${SESSION_DIR}" "${WORKING_DIR}" \
+     "${PHASE_DIR}/review_prompt_${REVIEW_PASS}_<lens>.md" review \
      "<responsibility>" "<activity>" "${REVIEW_PASS}" <lens>
    ```
 
@@ -232,7 +236,7 @@ of reviewing the partial diff.
    remaining hunks. Verify spec, extras, codebase fit, <TypeDesignContract/>, and
    `${IMPL_SUMMARY}` claims. On pass 1 only, run the style review named by
    <PhaseChecks/>: read `~/.claude/commands/unit/style_review.md` in full and
-   apply <StyleReview/> with `since <commit from ${SESSION_DIR}/phase_baseline>`
+   apply <StyleReview/> with `since <commit from ${PHASE_DIR}/phase_baseline>`
    and `${SESSION_DIR}` as its directory; supply the phase's findings ledger.
    A missing or invalid baseline stops the review. Save its table and result to
    `${SESSION_DIR}/phase_style_review_<phase-id>.md`, including `Off` or an
@@ -252,8 +256,8 @@ of reviewing the partial diff.
    `PLAN_DELEGATE_TEAM_ROLE=<worker> … finish-pass --status canceled
    --orphaned-launcher` per <PassOwnership/>, using each selected review slot
    unless the phase's arm is `pool`. On the pool arm, read each
-   review's slot from the one line in `${SESSION_DIR}/review_slot_<lens>`;
-   for a closure, use `${SESSION_DIR}/review_slot`. A missing file means that
+   review's slot from the one line in `${PHASE_DIR}/review_slot_<lens>`;
+   for a closure, use `${PHASE_DIR}/review_slot`. A missing file means that
    launcher opened no pass, so skip its cancel call. Then open and gate the
    finding and apply <FixDispatch/> with useful
    partial-review evidence. Preempt at most once per phase; never edit while an
@@ -261,7 +265,7 @@ of reviewing the partial diff.
    direct-fix agreement.
 6. Otherwise finish the main pass and let <DispatchContract/> await every blind
    reviewer by its host-specific path. Each `reviewed` loads its own
-   `review_findings_${REVIEW_PASS}_<lens>.txt` — a closure review, its unnumbered
+   `${PHASE_DIR}/review_findings_${REVIEW_PASS}_<lens>.txt` — a closure review, its unnumbered
    symlink — into `${AGENT_REVIEW}`. A lens that reports `error` is named in one
    line and the pass continues on the readings that landed, so the synthesis
    records which lens is missing rather than presenting one as two. Numbered

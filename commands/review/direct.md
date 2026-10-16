@@ -65,7 +65,7 @@ commands in order; they reuse the existing run and open phase:
 ```
 
 Report a recorder failure to the showrunner and end blocked. Do not run
-`prepare_session.sh`, create a marker under `/tmp/claude/delegate/active/`,
+`prepare_session.sh`, create a marker under `/tmp/claude/unit/active/`,
 or register a `/unit:report` notifier. Read the existing memory, then apply
 <PrimeReviewMemory/> for each type named in **Review pool**.
 
@@ -98,7 +98,9 @@ With a guide, concatenate in this order:
 3. `docs/design-decisions.md` of the repository that holds the production
    doc, when present, under `## Design decisions`: the file the helper reads
    from a unit's worktree.
-4. The `ui` section of `${POOL_DIR}/memory/repository.md`.
+4. That repository's targets file (`docs/hana/targets.md` in hana), when
+   present, under `## Targets`.
+5. The `ui` section of `${POOL_DIR}/memory/repository.md`.
 
 An absent memory section contributes no text. A missing base prompt is a
 failure to report, never another type's prompt. An unreadable guide or rule

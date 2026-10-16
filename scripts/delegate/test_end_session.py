@@ -104,6 +104,27 @@ class EndSessionTests(unittest.TestCase):
         self.assertIn(f"{self.root} --stop", calls[2])
         self.assertFalse(self.marker.exists())
 
+    def test_the_notifier_instance_follows_the_run_folder_name(self) -> None:
+        notifier = self.script.parent.parent / "message" / "notifier.sh"
+        _ = notifier.write_text("#!/usr/bin/env zsh\nprint -r -- \"notifier $*\" >> \"$END_SESSION_CALLS\"\n", encoding="utf-8")
+        for folder, instance in (("unit", "unit-new-run"), ("delegate", "delegate-new-run")):
+            with self.subTest(folder=folder):
+                run = self.root / folder / "new-run"
+                run.mkdir(parents=True)
+                _ = self.marker.write_text(f"{run}\n", encoding="utf-8")
+                self.calls.unlink(missing_ok=True)
+                environment = os.environ.copy()
+                environment.update({
+                    "HOME": str(self.root),
+                    "CLAUDE_CODE_SESSION_ID": self.session_id,
+                    "END_SESSION_CALLS": str(self.calls),
+                    "PLAN_DELEGATE_ACTIVE_DIR": str(self.marker.parent),
+                })
+                result = subprocess.run(["bash", str(self.script)], check=False, capture_output=True, text=True, env=environment)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                removals = [line for line in self.calls.read_text(encoding="utf-8").splitlines() if line.startswith("notifier remove")]
+                self.assertEqual([line.split()[2] for line in removals], [instance])
+
     def test_phase_cleanup_sweep_is_best_effort(self) -> None:
         failed = subprocess.CompletedProcess[str](["codex_mesh.py"], 2, "", "")
         with patch.object(subprocess, "run", return_value=failed) as run, \

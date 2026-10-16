@@ -8,8 +8,9 @@ We believe in three gods, Simple, Fast and Beautiful, with correctness as the
 floor beneath them.
 
 The full text of each rule follows under `## Rules`, with the UX guide's path
-and any design decisions. What those decisions record as deliberate is never
-a defect. Apply each checklist test whose rule appears there, and every
+and any design decisions and targets. What those decisions record as
+deliberate is never a defect; a shot that misses a target is one. Apply each
+checklist test whose rule appears there, and every
 additional rule's test in that section.
 
 ## Checklist

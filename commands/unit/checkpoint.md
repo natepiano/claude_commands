@@ -37,8 +37,18 @@ Loop/verbose only:
    Order; its shrink must be repaired first.
 3. Formatting is covered by <PhaseChecks/>; do not rerun it here.
 4. Mark the phase `status: done`. Never put its commit hash in the plan.
-5. Read and validate
-   `${SESSION_DIR}/delegated_phase_reservation_state.json`; never use a value
+5. First record a first touch no hook recorded. When the state is still
+   `EnrolledAwaitingFirstTouch`, this checks every path of this phase changed
+   since `${PHASE_DIR}/phase_baseline` and writes `Active` from the clear
+   answer; every other state it leaves as it is:
+
+   ```sh
+   phase_reservation.py record-active --session-dir "${SESSION_DIR}" --phase <phase id>
+   ```
+
+   Exit `1` means the check was refused: answer the overlap it names under
+   `/unit:direct` <BerthDecisions/>, then run it again. Then read and validate
+   `${PHASE_DIR}/delegated_phase_reservation_state.json`; never use a value
    remembered from conversation or the harness-session mapping.
 
    | Durable state | Action |
@@ -51,8 +61,11 @@ Loop/verbose only:
    `/unit:direct` <BerthDecisions/>:
 
    ```sh
-   cargo-berth drift --full --json
+   cargo-berth drift --full --reservation <recorded-reservation-id> --json
    ```
+
+   Name the reservation: each open phase holds its own, so a drift that picks
+   one for itself is ambiguous whenever a phase runs beside this one.
 
    Require an exit-`0` result with `payload.kind = drift`,
    `payload.data.comparison = full_phase_start`, and exactly one
@@ -88,6 +101,8 @@ Loop/verbose only:
    Every `checkpoint(...)` commit that changes more than Markdown carries
    `Change-Review: <what you see change> | <how to check it>`, one line per
    visible change, or `Change-Review: none — <why nothing visible changes>`.
+   A change the user can check outside the app counts as visible too: a
+   table's columns, a status line, a command's output.
    A hook refuses the commit without it and the merge refuses the checkpoint;
    the merge turns each visible line into a row on the change-review list.
 
@@ -163,7 +178,7 @@ Loop/verbose only:
    whether the selected reservation is outstanding or released. Report a
    matching checkpoint as recovered rather than re-made. Only after the
    first-attempt structured assertions or these recovery assertions pass, delete
-   `${SESSION_DIR}/delegated_phase_reservation_state.json`.
+   `${PHASE_DIR}/delegated_phase_reservation_state.json`.
 
    An ordinary failed release did not append anything because transaction
    validation precedes the journal write; it is not recovery, and the original

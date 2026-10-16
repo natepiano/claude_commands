@@ -4,7 +4,10 @@ from __future__ import annotations
 
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
+import math
 import os
+import re
+import shlex
 from pathlib import Path
 import signal
 import struct
@@ -17,12 +20,18 @@ from typing import NotRequired, TypedDict, cast, override
 import unittest
 import zlib
 
+from scripts.hana_shot import hana_shot
+
 
 SCRIPT = Path(__file__).with_name("hana_shot.py")
 CAMERA_ENTITY = 5
 WINDOW_ENTITY = 3
 NAME = "bevy_ecs::name::Name"
 AABB = "bevy_camera::primitives::Aabb"
+GLOBAL_TRANSFORM = "bevy_transform::components::global_transform::GlobalTransform"
+ORBIT_CAM = "hana_lagrange::orbit_cam::OrbitCam"
+ANIMATE_TO_FIT = "hana_lagrange::fit::triggers::animate::AnimateToFit"
+CHILD_OF = "bevy_ecs::hierarchy::ChildOf"
 EDITOR_CAMERA = "hana::camera::editor_camera::EditorCamera"
 SWITCH_SLIDER = "hana_catalyst::switch::SwitchSlider"
 WINDOW = "bevy_window::window::Window"
@@ -71,6 +80,12 @@ class Call(TypedDict):
     params: dict[str, object]
 
 
+class SceneEntityFixture(TypedDict):
+    entity: int
+    components: dict[str, object]
+    has: NotRequired[dict[str, bool]]
+
+
 class TimingLine(TypedDict):
     status: str
     exit_code: int
@@ -98,13 +113,16 @@ def png(width: int, height: int, brightness: int = 128) -> bytes:
     return b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", header) + chunk(b"IDAT", zlib.compress(rows)) + chunk(b"IEND", b"")
 
 
-def camera_components(physical_size: tuple[int, int] = (1280, 720), scale_factor: float = 1.0) -> dict[str, object]:
-    angles = {"yaw": 0.0, "pitch": 0.3}
+def camera_components(
+    physical_size: tuple[int, int] = (1280, 720), scale_factor: float = 1.0,
+    yaw: float = 0.0, pitch: float = 0.3, radius: float = 6.0,
+) -> dict[str, object]:
+    angles = {"yaw": yaw, "pitch": pitch}
     return {
         "hana_lagrange::orbit_cam::OrbitCam": {
             "orbit": {"current": angles, "target": angles},
             "pan": {"current": [0.0, 1.0, 0.0], "target": [0.0, 1.0, 0.0]},
-            "zoom": {"current": 6.0, "target": 6.0},
+            "zoom": {"current": radius, "target": radius},
             "update_request": "None",
         },
         "bevy_transform::components::global_transform::GlobalTransform": [1.0, 0, 0, 0, 1.0, 0, 0, 0, 1.0, 0, 2.0, 6.0],
@@ -123,6 +141,16 @@ class Fake:
 
     def __init__(self) -> None:
         self.calls: list[Call] = []
+        self.named_entities: list[SceneEntityFixture] = [
+            {"entity": entity, "components": {NAME: name}, "has": {AABB: True}}
+            for entity, name in NAMES
+        ]
+        self.named_entity_snapshots: list[list[SceneEntityFixture]] = []
+        self.tool_entities: list[tuple[int, str, int, str]] = list(TOOLS)
+        self.fit_moves_camera: bool = False
+        self.camera_yaw: float = 0.0
+        self.camera_pitch: float = 0.3
+        self.camera_radius: float = 6.0
         self.frame: int = 0
         self.screenshot: str = "ok"
         self.remote: Path | None = None
@@ -144,6 +172,11 @@ class Fake:
         with self.lock:
             self.calls.append({"method": method, "params": params})
             screenshots = sum(1 for call in self.calls if call["method"] == "brp_extras/screenshot")
+            if self.fit_moves_camera and method == "world.trigger_event" and params.get("event") == ANIMATE_TO_FIT:
+                fit = cast(dict[str, object], params["value"])
+                self.camera_yaw = cast(float, fit["yaw"])
+                self.camera_pitch = cast(float, fit["pitch"])
+                self.camera_radius = 6.0 * (1.0 + cast(float, fit["margin"]))
             if method == "world.mutate_components" and params.get("component") == WINDOW:
                 width, height = self.window_physical_size
                 if params.get("path") == ".resolution.physical_width":
@@ -166,10 +199,17 @@ class Fake:
         if method == "world.get_resources":
             return {"result": {"value": {"home": {"animation_duration_milliseconds": 2000}}}}
         if method == "world.get_components":
-            return {"result": {"components": camera_components(
-                self.window_physical_size,
-                self.window_scale_factor_override or self.window_scale_factor,
-            ), "errors": {}}}
+            entity = params["entity"]
+            components = camera_components(
+                self.window_physical_size, self.window_scale_factor_override or self.window_scale_factor,
+                self.camera_yaw, self.camera_pitch, self.camera_radius,
+            ) if entity == CAMERA_ENTITY else next(
+                (row["components"] for row in self.named_entities if row["entity"] == entity), dict[str, object](),
+            )
+            requested = cast(list[str], params["components"])
+            return {"result": {
+                "components": {path: components[path] for path in requested if path in components}, "errors": {},
+            }}
         if method == "world.list_components":
             entity = params.get("entity")
             if entity is None:
@@ -201,30 +241,52 @@ class Fake:
         return {"result": None}
 
 
-def query(fake: Fake, params: dict[str, object]) -> list[dict[str, object]]:
+def query(fake: Fake, params: dict[str, object]) -> list[SceneEntityFixture]:
     with_types = cast(dict[str, list[str]], params.get("filter") or {}).get("with", [])
     data = cast(dict[str, list[str]], params.get("data") or {})
+    rows: list[SceneEntityFixture]
     if EDITOR_CAMERA in with_types:
-        return [{"entity": CAMERA_ENTITY, "components": camera_components(
+        rows = [{"entity": CAMERA_ENTITY, "components": camera_components(
             fake.window_physical_size,
             fake.window_scale_factor_override or fake.window_scale_factor,
+            fake.camera_yaw, fake.camera_pitch, fake.camera_radius,
         )}]
-    if PRIMARY_WINDOW in with_types:
+    elif PRIMARY_WINDOW in with_types:
         width, height = fake.window_physical_size
-        return [{"entity": WINDOW_ENTITY, "components": {WINDOW: {"resolution": {
+        rows = [{"entity": WINDOW_ENTITY, "components": {WINDOW: {"resolution": {
             "physical_width": width,
             "physical_height": height,
             "scale_factor_override": fake.window_scale_factor_override,
             "scale_factor": fake.window_scale_factor,
         }, "window_level": fake.window_level}}}]
-    if SWITCH_SLIDER in with_types:
-        return [
+    elif SWITCH_SLIDER in with_types:
+        rows = [
             {"entity": entity, "components": {path: {"id": tool_id, "definition": definition}}, "has": {AABB: False}}
-            for entity, path, tool_id, definition in TOOLS
+            for entity, path, tool_id, definition in fake.tool_entities
         ]
-    if NAME in data.get("components", []):
-        return [{"entity": entity, "components": {NAME: name}, "has": {AABB: True}} for entity, name in NAMES]
-    return []
+    elif NAME in data.get("components", []) or GLOBAL_TRANSFORM in data.get("components", []):
+        if fake.named_entity_snapshots:
+            fake.named_entities = fake.named_entity_snapshots.pop(0)
+        rows = fake.named_entities
+    else:
+        rows = []
+    required = data.get("components", [])
+    requested = [*required, *data.get("option", [])]
+    result: list[SceneEntityFixture] = []
+    for row in rows:
+        components = row["components"]
+        if not all(path in components for path in required):
+            continue
+        projected: SceneEntityFixture = {
+            "entity": row["entity"],
+            "components": {path: components[path] for path in requested if path in components},
+        }
+        if data.get("has"):
+            projected["has"] = {
+                path: row.get("has", {}).get(path, path in components) for path in data["has"]
+            }
+        result.append(projected)
+    return result
 
 
 def handler_for(fake: Fake) -> type[BaseHTTPRequestHandler]:
@@ -320,6 +382,341 @@ class HanaShotTest(unittest.TestCase):
         return self.run_script("views", *args, "--views-file", str(self.scratch / "views.toml"))
 
 
+def face_transforms() -> dict[str, list[float]]:
+    half = math.sqrt(0.5)
+    sixth = 1.0 / math.sqrt(6.0)
+    third = 1.0 / math.sqrt(3.0)
+    return {
+        "identity": [1.0, 0, 0, 0, 1.0, 0, 0, 0, 1.0, 13, -7, 21],
+        "yawed": [0, 0, -1.0, 0, 1.0, 0, 1.0, 0, 0, 13, -7, 21],
+        "pitched": [1.0, 0, 0, 0, half, half, 0, -half, half, 13, -7, 21],
+        "tilted_scaled": [
+            2 * half, 2 * half, 0,
+            -3 * sixth, 3 * sixth, 6 * sixth,
+            4 * third, -4 * third, 4 * third,
+            13, -7, 21,
+        ],
+    }
+
+
+class FaceAngleTests(unittest.TestCase):
+    def test_all_local_axes_round_trip_through_hana_camera_offset(self) -> None:
+        for label, matrix in face_transforms().items():
+            for column, axis in enumerate(("x", "y", "z")):
+                for sign in ("+", "-"):
+                    face = sign + axis
+                    with self.subTest(transform=label, face=face):
+                        if label in ("identity", "yawed") and axis == "y":
+                            with self.assertRaises(hana_shot.Refused):
+                                _ = hana_shot.face_angles(matrix, face)
+                            continue
+                        direction = matrix[3 * column:3 * column + 3]
+                        length = math.sqrt(sum(value * value for value in direction))
+                        expected = [value / length * (1 if sign == "+" else -1) for value in direction]
+                        yaw, pitch = hana_shot.face_angles(matrix, face)
+                        offset = (
+                            math.sin(yaw) * math.cos(pitch),
+                            math.sin(pitch),
+                            math.cos(yaw) * math.cos(pitch),
+                        )
+                        for actual, wanted in zip(offset, expected, strict=True):
+                            self.assertAlmostEqual(actual, wanted, places=10)
+
+    def test_near_vertical_axis_refuses_inside_one_degree_and_accepts_outside(self) -> None:
+        for degrees in (0.5, 1.5):
+            angle = math.radians(degrees)
+            matrix = [1.0, 0, 0, 0, math.sin(angle), -math.cos(angle),
+                      0, math.cos(angle), math.sin(angle), 0, 0, 0]
+            for face in ("+z", "-z"):
+                with self.subTest(degrees=degrees, face=face):
+                    if degrees < 1:
+                        with self.assertRaises(hana_shot.Refused) as refused:
+                            _ = hana_shot.face_angles(matrix, face)
+                        text = str(refused.exception)
+                        self.assertIn(face, text)
+                        self.assertIn("--yaw 0", text)
+                        self.assertIn("--pitch " + ("1.55" if face == "+z" else "-1.55"), text)
+                    else:
+                        _, pitch = hana_shot.face_angles(matrix, face)
+                        self.assertAlmostEqual(abs(pitch), math.radians(88.5), places=10)
+
+
+class FaceShotTests(HanaShotTest):
+    @override
+    def setUp(self) -> None:
+        super().setUp()
+        self.fake.named_entities = [self.panel(face_transforms()["tilted_scaled"])]
+
+    def panel(self, matrix: list[float]) -> SceneEntityFixture:
+        return {"entity": 101, "components": {NAME: "Panel", GLOBAL_TRANSFORM: matrix}, "has": {AABB: False}}
+
+    def fit_events(self) -> list[dict[str, object]]:
+        return [
+            cast(dict[str, object], request["value"])
+            for request in self.fake.methods("world.trigger_event") if request.get("event") == ANIMATE_TO_FIT
+        ]
+
+    def test_face_fit_event_uses_target_axis_and_preserves_margin_and_record(self) -> None:
+        self.fake.fit_moves_camera = True
+        result = self.shot("--target", "name:Panel", "--face", "+z", "--mode", "fit", "--margin", "0.2")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        [event] = self.fit_events()
+        self.assertEqual(event["target"], 101)
+        self.assertAlmostEqual(cast(float, event["yaw"]), math.pi / 4)
+        self.assertAlmostEqual(cast(float, event["pitch"]), -math.asin(1 / math.sqrt(3)))
+        self.assertEqual(event["margin"], 0.2)
+        [line] = self.timing_lines()
+        self.assertEqual(line["face"], "+z")
+        [attempt] = cast(list[dict[str, object]], line["attempts"])
+        self.assertEqual(attempt["face"], "+z")
+
+    def test_face_pose_defaults_focus_to_translation_and_keeps_radius(self) -> None:
+        result = self.shot("--target", "name:Panel", "--face", "-z", "--mode", "pose", "--radius", "9")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        [mutation] = [request for request in self.fake.methods("world.mutate_components")
+                      if request.get("component") == ORBIT_CAM]
+        pose = cast(dict[str, dict[str, object]], mutation["value"])
+        self.assertEqual(pose["pan"]["current"], [13, -7, 21])
+        self.assertEqual(pose["pan"]["target"], [13, -7, 21])
+        self.assertEqual(pose["zoom"]["current"], 9.0)
+        angles = cast(dict[str, float], pose["orbit"]["current"])
+        self.assertAlmostEqual(angles["yaw"], -3 * math.pi / 4)
+        self.assertAlmostEqual(angles["pitch"], math.asin(1 / math.sqrt(3)))
+        [line] = self.timing_lines()
+        self.assertEqual(line["face"], "-z")
+
+    def test_face_pose_explicit_focus_wins_over_target_translation(self) -> None:
+        result = self.shot("--target", "name:Panel", "--face", "+z", "--mode", "pose",
+                           "--radius", "9", "--focus", "1,2,3")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        [mutation] = [request for request in self.fake.methods("world.mutate_components")
+                      if request.get("component") == ORBIT_CAM]
+        pose = cast(dict[str, dict[str, object]], mutation["value"])
+        self.assertEqual(pose["pan"]["current"], [1, 2, 3])
+
+    def test_face_conflicts_with_explicit_zero_yaw_or_pitch(self) -> None:
+        for flag in ("--yaw", "--pitch"):
+            with self.subTest(flag=flag):
+                result = self.shot("--target", "name:Panel", "--face", "+z", flag, "0")
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertIn("--face", result.stderr)
+                self.assertIn(flag, result.stderr)
+                self.assertRegex(result.stderr.lower(), r"drop|remove|omit")
+        self.assertEqual(self.fake.calls, [])
+
+    def test_face_refuses_modes_without_angles_and_names_supported_modes(self) -> None:
+        for mode in ("home", "hana-frame"):
+            with self.subTest(mode=mode):
+                result = self.shot("--target", "name:Panel", "--face", "+z", "--mode", mode)
+                self.assertEqual(result.returncode, 2, result.stderr)
+                for detail in ("face", mode, "fit", "pose"):
+                    self.assertIn(detail, result.stderr)
+        self.assertEqual(self.fake.calls, [])
+
+    def test_face_pose_requires_target_and_radius(self) -> None:
+        for flags, missing in (
+            (("--radius", "9"), "--target"),
+            (("--target", "name:Panel"), "--radius"),
+        ):
+            with self.subTest(missing=missing):
+                result = self.shot("--mode", "pose", "--face", "+z", *flags)
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertIn(missing, result.stderr)
+        self.assertEqual(self.fake.calls, [])
+
+    def test_vertical_face_refusal_explains_orbit_limit_and_nearby_pose(self) -> None:
+        self.fake.named_entities = [self.panel(face_transforms()["identity"])]
+        for face, pitch in (("+y", "1.55"), ("-y", "-1.55")):
+            with self.subTest(face=face):
+                result = self.shot("--target", "name:Panel", "--face=" + face,
+                                   "--mode", "pose", "--radius", "9")
+                self.assertEqual(result.returncode, 2, result.stderr)
+                for detail in (face, "yaw", "pitch", "--yaw 0", "--pitch " + pitch):
+                    self.assertIn(detail, result.stderr)
+                self.assertRegex(result.stderr.lower(), r"undefined|defin")
+                self.assertRegex(result.stderr.lower(), r"clamp|limit")
+                line = self.timing_lines()[-1]
+                self.assertEqual(line["face"], face)
+                [attempt] = cast(list[dict[str, object]], line["attempts"])
+                self.assertEqual(attempt["face"], face)
+        self.assertEqual(self.fake.methods("brp_extras/screenshot"), [])
+
+    def test_views_add_and_show_preserve_face_without_storing_angles(self) -> None:
+        for mode in ("fit", "pose"):
+            with self.subTest(mode=mode):
+                label = "panel-" + mode
+                flags = ("--radius", "9") if mode == "pose" else ()
+                result = self.views("add", label, "--target", "name:Panel", "--face", "+z", "--mode", mode, *flags)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                document = tomllib.loads((self.scratch / "views.toml").read_text())
+                view = cast(dict[str, object], document["views"][label])
+                self.assertEqual((view["face"], view["mode"], view["target"]), ("+z", mode, "name:Panel"))
+                self.assertNotIn("yaw", view)
+                self.assertNotIn("pitch", view)
+                if mode == "pose":
+                    self.assertEqual(view["radius"], 9)
+                    self.assertNotIn("focus", view)
+                shown = self.views("show", label)
+                self.assertEqual(shown.returncode, 0, shown.stderr)
+                self.assertRegex(shown.stdout, r'(?m)^face\s*=\s*"\+z"$')
+        self.assertEqual(self.fake.calls, [])
+
+    def test_stored_face_pose_loads_and_defaults_focus_to_target(self) -> None:
+        views_path = self.scratch / "views.toml"
+        _ = views_path.write_text('[views.panel]\ntarget = "name:Panel"\nmode = "pose"\nface = "+z"\nradius = 9\n')
+        result = self.shot("--view", "panel", "--views-file", str(views_path))
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        [mutation] = [request for request in self.fake.methods("world.mutate_components")
+                      if request.get("component") == ORBIT_CAM]
+        pose = cast(dict[str, dict[str, object]], mutation["value"])
+        self.assertEqual(pose["pan"]["current"], [13, -7, 21])
+        self.assertEqual(pose["zoom"]["current"], 9)
+        [line] = self.timing_lines()
+        self.assertEqual(line["face"], "+z")
+
+    def test_explicit_focus_overrides_stored_face_pose_default(self) -> None:
+        views_path = self.scratch / "views.toml"
+        _ = views_path.write_text('[views.panel]\ntarget = "name:Panel"\nmode = "pose"\nface = "+z"\nradius = 9\n')
+        result = self.shot("--view", "panel", "--views-file", str(views_path), "--focus", "1,2,3")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        [mutation] = [request for request in self.fake.methods("world.mutate_components")
+                      if request.get("component") == ORBIT_CAM]
+        pose = cast(dict[str, dict[str, object]], mutation["value"])
+        self.assertEqual(pose["pan"]["current"], [1, 2, 3])
+
+    def test_face_conflicts_are_checked_across_stored_views_and_cli_flags(self) -> None:
+        for keys, flags, detail in (
+            ('face = "+z"', ("--yaw", "0"), "--yaw"),
+            ('face = "+z"', ("--pitch", "0"), "--pitch"),
+            ('yaw = 0', ("--face", "+z"), "yaw"),
+        ):
+            with self.subTest(keys=keys, flags=flags):
+                views_path = self.scratch / "views.toml"
+                _ = views_path.write_text('[views.panel]\ntarget = "name:Panel"\nmode = "fit"\n' + keys + "\n")
+                result = self.shot("--view", "panel", "--views-file", str(views_path), *flags)
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertIn("--face", result.stderr)
+                self.assertIn(detail, result.stderr)
+                self.assertRegex(result.stderr.lower(), r"drop|remove|omit")
+        self.assertEqual(self.fake.calls, [])
+
+    def test_failed_face_fit_retains_axis_on_invocation_and_attempt(self) -> None:
+        result = self.shot("--target", "name:Panel", "--face", "+z", "--mode", "fit")
+
+        self.assertEqual(result.returncode, 1, result.stderr)
+        [line] = self.timing_lines()
+        self.assertEqual(line["face"], "+z")
+        [attempt] = cast(list[dict[str, object]], line["attempts"])
+        self.assertEqual(attempt["face"], "+z")
+        self.assertIn("name:Panel", cast(str, line["error"]))
+
+    def test_stored_face_rejects_present_zero_angles_and_unsupported_modes(self) -> None:
+        cases = (
+            ('yaw = 0', "yaw"), ('pitch = 0', "pitch"),
+            ('mode = "home"', "home"), ('mode = "hana-frame"', "hana-frame"),
+            ('face = "front"', "front"),
+        )
+        for extra, detail in cases:
+            with self.subTest(extra=extra):
+                base = '[views.panel]\ntarget = "name:Panel"\n'
+                if not extra.startswith("face"):
+                    base += 'face = "+z"\n'
+                _ = (self.scratch / "views.toml").write_text(base + extra + "\n")
+                result = self.views("show", "panel")
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertIn("face", result.stderr)
+                self.assertIn(detail, result.stderr)
+                if detail in ("home", "hana-frame"):
+                    self.assertIn("fit", result.stderr)
+                    self.assertIn("pose", result.stderr)
+        self.assertEqual(self.fake.calls, [])
+
+    def test_views_check_runs_and_stamps_a_face_fit(self) -> None:
+        self.fake.fit_moves_camera = True
+        _ = (self.scratch / "views.toml").write_text(
+            '[views.panel]\ntarget = "name:Panel"\nmode = "fit"\nface = "+z"\n',
+        )
+        fake_magick = self.scratch / "bin" / "magick"
+        fake_magick.parent.mkdir()
+        _ = fake_magick.write_text("#!/bin/sh\necho 0.5\n")
+        fake_magick.chmod(0o755)
+        result = self.views("check", "--port", str(self.port), "--out", str(self.scratch / "check"))
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("PASS panel", result.stdout)
+        document = tomllib.loads((self.scratch / "views.toml").read_text())
+        view = cast(dict[str, object], document["views"]["panel"])
+        self.assertIn("verified", view)
+        self.assertEqual(view["face"], "+z")
+        self.assertNotIn("yaw", view)
+        self.assertNotIn("pitch", view)
+        [event] = self.fit_events()
+        self.assertAlmostEqual(cast(float, event["pitch"]), -math.asin(1 / math.sqrt(3)))
+
+    def test_views_check_continues_after_face_refusal_and_stamps_passing_views(self) -> None:
+        self.fake.fit_moves_camera = True
+        self.fake.named_entities = [self.panel(face_transforms()["identity"])]
+        views_path = self.scratch / "views.toml"
+        _ = views_path.write_text("".join(
+            f'[views.{name}]\ntarget = "name:Panel"\nmode = "fit"\nface = "{face}"\n'
+            for name, face in (("first", "+z"), ("vertical", "+y"), ("last", "-z"))
+        ))
+        fake_magick = self.scratch / "bin" / "magick"
+        fake_magick.parent.mkdir()
+        _ = fake_magick.write_text("#!/bin/sh\necho 0.5\n")
+        fake_magick.chmod(0o755)
+
+        result = self.views("check", "--port", str(self.port), "--out", str(self.scratch / "check"))
+
+        self.assertEqual(result.returncode, 1, result.stderr)
+        document = tomllib.loads(views_path.read_text())
+        views = cast(dict[str, dict[str, object]], document["views"])
+        for name in ("first", "last"):
+            self.assertIn("verified", views[name])
+            self.assertIn("PASS " + name, result.stdout)
+        self.assertNotIn("verified", views["vertical"])
+        self.assertIn("FAIL vertical:", result.stderr)
+        [line] = self.timing_lines()
+        self.assertEqual((line["status"], line["failure_reason"]), ("failure", "invalid_request"))
+        attempts = cast(list[dict[str, object]], line["attempts"])
+        self.assertEqual([attempt["view"] for attempt in attempts], ["first", "vertical", "last"])
+        self.assertEqual([attempt["status"] for attempt in attempts], ["success", "failure", "success"])
+        failed = attempts[1]
+        self.assertEqual((failed["face"], failed["failure_reason"]), ("+y", "invalid_request"))
+        error = cast(str, failed["error"])
+        for detail in ("+y", "vertical", "--yaw 0", "--pitch 1.55"):
+            self.assertIn(detail, error)
+        self.assertIn(error, result.stderr)
+        self.assertIn(error, cast(str, line["error"]))
+        self.assertEqual(len(self.fake.methods("brp_extras/screenshot")), 2)
+
+    def test_repeated_face_view_moves_again_when_target_turns(self) -> None:
+        self.fake.fit_moves_camera = True
+        self.fake.named_entity_snapshots = [
+            [self.panel(face_transforms()["yawed"])],
+            [self.panel(face_transforms()["tilted_scaled"])],
+        ]
+        views_path = self.scratch / "views.toml"
+        _ = views_path.write_text('[views.panel]\ntarget = "name:Panel"\nmode = "fit"\nface = "+z"\n')
+        result = self.run_script(
+            "shot", "--port", str(self.port), "--out", str(self.scratch / "shots"),
+            "--view", "panel", "--view", "panel", "--views-file", str(views_path),
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        first, second = self.fit_events()
+        self.assertAlmostEqual(cast(float, first["yaw"]), math.pi / 2)
+        self.assertAlmostEqual(cast(float, first["pitch"]), 0.0)
+        self.assertAlmostEqual(cast(float, second["yaw"]), math.pi / 4)
+        self.assertAlmostEqual(cast(float, second["pitch"]), -math.asin(1 / math.sqrt(3)))
+        self.assertEqual(len(self.fake.methods("brp_extras/screenshot")), 2)
+
+
 class PortGuardTests(HanaShotTest):
     def test_user_port_is_refused_by_every_command(self) -> None:
         for argv in (
@@ -342,6 +739,13 @@ class PortGuardTests(HanaShotTest):
 
 
 class SelectorTests(HanaShotTest):
+    def target_queries(self) -> list[dict[str, object]]:
+        return [
+            request for request in self.fake.methods("world.query")
+            if EDITOR_CAMERA not in cast(dict[str, list[str]], request.get("filter") or {}).get("with", [])
+            and PRIMARY_WINDOW not in cast(dict[str, list[str]], request.get("filter") or {}).get("with", [])
+        ]
+
     def test_malformed_selectors_are_refused_before_any_call(self) -> None:
         for selector in ("bogus", "entity:abc", "name:", "color:red"):
             with self.subTest(selector=selector):
@@ -364,21 +768,164 @@ class SelectorTests(HanaShotTest):
                 triggers = self.fake.methods("world.trigger_event")[before:]
                 if entity is None:
                     self.assertEqual(result.returncode, 1)
-                    self.assertIn("must name exactly one entity; found 20, 30", result.stderr)
+                    for identity in ("20", "30", "Grayscale"):
+                        self.assertIn(identity, result.stderr)
                     continue
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertEqual(triggers, [{"event": ZOOM_TO_TARGET, "value": {"entity": entity}}])
 
     def test_ambiguous_and_missing_targets_fail(self) -> None:
-        for selector, found in (("name:Twin", "12, 13"), ("tool:Grayscale#5", "nothing"), ("entity:999", "nothing")):
+        for selector, found in (("name:Twin", "Twin"), ("tool:Grayscale#5", "nothing"), ("entity:999", "nothing")):
             with self.subTest(selector=selector):
                 result = self.shot("--target", selector, "--mode", "hana-frame")
                 self.assertEqual(result.returncode, 1)
-                self.assertIn(f"found {found}", result.stderr)
+                self.assertIn(found, result.stderr)
         self.assertEqual(self.fake.methods("brp_extras/screenshot"), [])
+
+    def test_stale_entity_explains_restart_and_stable_selectors(self) -> None:
+        result = self.shot("--target", "entity:999", "--mode", "hana-frame")
+
+        self.assertEqual(result.returncode, 1, result.stderr)
+        for detail in ("entity:999", "restart", "name:", "tool:", "marker:"):
+            self.assertIn(detail, result.stderr.lower())
+        self.assertEqual(len(self.fake.methods("world.list_components")), 1)
+        self.assertEqual(self.target_queries(), [])
+
+    def test_missing_name_suggests_at_most_five_nearest_names_without_another_query(self) -> None:
+        candidates = ["Panel", "PanelLeft", "PanelRight", "PanelTop", "PanelBase", "PanelRear", "Unrelated"]
+        self.fake.named_entities = [
+            {"entity": 100 + index, "components": {NAME: name}, "has": {AABB: True}}
+            for index, name in enumerate(candidates)
+        ]
+        result = self.shot("--target", "name:Panle", "--mode", "hana-frame")
+
+        self.assertEqual(result.returncode, 1, result.stderr)
+        suggested = [name for name in candidates if re.search(rf"\b{re.escape(name)}\b", result.stderr)]
+        self.assertIn("Panel", suggested)
+        self.assertGreater(len(suggested), 1)
+        self.assertLessEqual(len(suggested), 5)
+        self.assertNotIn("Unrelated", suggested)
+        self.assertEqual(len(self.target_queries()), 1)
+        self.assertTrue(all("entity" not in request for request in self.fake.methods("world.list_components")))
+
+    def test_missing_tool_suggests_kind_from_entities_already_resolved(self) -> None:
+        result = self.shot("--target", "tool:Grayscal", "--mode", "hana-frame")
+
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn("Grayscale", result.stderr)
+        self.assertEqual(len(self.target_queries()), 1)
+        self.assertTrue(all("entity" not in request for request in self.fake.methods("world.list_components")))
+
+    def test_ambiguous_name_lists_each_match_with_its_name(self) -> None:
+        result = self.shot("--target", "name:Twin", "--mode", "hana-frame")
+
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertGreaterEqual(result.stderr.count("Twin"), 2)
+        for entity in (12, 13):
+            self.assertRegex(result.stderr, rf"(?:{entity}[^\n,;]*Twin|Twin[^\n,;]*{entity})")
+
+    def test_rejected_fit_names_pose_flags_and_parent_geometry_fallback(self) -> None:
+        result = self.shot("--target", "tool:Blur", "--mode", "fit")
+
+        self.assertEqual(result.returncode, 1, result.stderr)
+        for detail in ("--mode pose", "--focus", "--radius", "parent"):
+            self.assertIn(detail, result.stderr)
+        self.assertEqual(len(self.target_queries()), 1)
+        self.assertEqual(self.fake.methods("brp_extras/screenshot"), [])
+
+    def test_rejected_fit_suggests_nearest_cached_ancestor_with_geometry(self) -> None:
+        self.fake.named_entities = [
+            {"entity": 101, "components": {NAME: "Leaf", CHILD_OF: 102}, "has": {AABB: False}},
+            {"entity": 102, "components": {NAME: "Branch", CHILD_OF: 103}, "has": {AABB: False}},
+            {"entity": 103, "components": {NAME: "Inner", CHILD_OF: 104}, "has": {AABB: True}},
+            {"entity": 104, "components": {NAME: "Outer"}, "has": {AABB: True}},
+        ]
+        result = self.shot("--target", "name:Leaf", "--mode", "fit")
+
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn("--target entity:103", result.stderr)
+        self.assertNotIn("--target entity:102", result.stderr)
+        self.assertNotIn("--target entity:104", result.stderr)
+        self.assertEqual(len(self.target_queries()), 1)
+        self.assertTrue(all(request.get("entity") == CAMERA_ENTITY for request in self.fake.methods("world.get_components")))
+        self.assertTrue(all("entity" not in request for request in self.fake.methods("world.list_components")))
+
+    def test_rejected_stored_fit_gives_a_runnable_ad_hoc_pose_for_its_target(self) -> None:
+        views_path = self.scratch / "views.toml"
+        _ = views_path.write_text('[views.front]\ntarget = "tool:Blur"\nmode = "fit"\n')
+        result = self.shot("--view", "front", "--views-file", str(views_path))
+
+        self.assertEqual(result.returncode, 1, result.stderr)
+        example = re.search(r"shot --target \S+ --mode pose --focus \S+ --radius [0-9.]+", result.stderr)
+        self.assertIsNotNone(example, result.stderr)
+        if example is not None:
+            command = shlex.split(example.group())
+            self.assertEqual(command[command.index("--target") + 1], "tool:Blur")
+            repaired = self.run_script(
+                *command, "--port", str(self.port), "--out", str(self.scratch / "repaired.png"),
+            )
+            self.assertEqual(repaired.returncode, 0, repaired.stderr)
+            self.assertTrue((self.scratch / "repaired.png").is_file())
+        self.assertRegex(result.stderr.lower(), r"set.*focus.*radius.*scene")
+
+    def test_rejected_fit_does_not_suggest_an_ancestor_whose_aabb_was_removed(self) -> None:
+        self.fake.named_entity_snapshots = [
+            [
+                {"entity": 101, "components": {NAME: "Leaf", CHILD_OF: 102}, "has": {AABB: False}},
+                {"entity": 102, "components": {NAME: "Branch"}, "has": {AABB: True}},
+            ],
+            [
+                {"entity": 101, "components": {NAME: "Leaf", CHILD_OF: 102}, "has": {AABB: False}},
+                {"entity": 102, "components": {NAME: "Branch"}, "has": {AABB: False}},
+            ],
+        ]
+        views_path = self.scratch / "views.toml"
+        _ = views_path.write_text(
+            '[views.before]\ntarget = "name:Branch"\nmode = "hana-frame"\n'
+            + '[views.after]\ntarget = "name:Leaf"\nmode = "fit"\n',
+        )
+        result = self.run_script(
+            "shot", "--port", str(self.port), "--out", str(self.scratch / "shots"),
+            "--view", "all", "--views-file", str(views_path),
+        )
+
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn("name:Leaf", result.stderr)
+        self.assertIn("parent", result.stderr)
+        self.assertNotIn("--target entity:102", result.stderr)
+        self.assertEqual(len(self.target_queries()), 2)
+        [line] = self.timing_lines()
+        attempts = cast(list[dict[str, object]], line["attempts"])
+        self.assertEqual([attempt["status"] for attempt in attempts], ["success", "failure"])
 
 
 class ViewsTests(HanaShotTest):
+    def test_signal_after_a_failed_view_preserves_its_reason_and_appends_signal_text(self) -> None:
+        views_path = self.scratch / "views.toml"
+        _ = views_path.write_text(
+            '[views.missing]\ntarget = "name:Absent"\nmode = "hana-frame"\n'
+            + '[views.held]\nmode = "home"\n',
+        )
+        self.fake.screenshot = "hold"
+        process = self.start_script(
+            "views", "check", "--port", str(self.port), "--views-file", str(views_path),
+            "--out", str(self.scratch / "check"),
+        )
+        self.addCleanup(self.stop_script, process)
+        self.assertTrue(self.fake.screenshot_started.wait(10), "the second view never reached capture")
+        process.send_signal(signal.SIGTERM)
+        _, stderr = process.communicate(timeout=60)
+
+        self.assertEqual(process.returncode, 128 + signal.SIGTERM, stderr)
+        [line] = self.timing_lines()
+        self.assertEqual(line["exit_code"], 128 + signal.SIGTERM)
+        self.assertEqual(line["failure_reason"], "no_target")
+        error = cast(str, line["error"])
+        self.assertIn("name:Absent", error)
+        self.assertRegex(error.splitlines()[-1], r"SIGTERM$")
+        [attempt] = cast(list[dict[str, object]], line["attempts"])
+        self.assertEqual(attempt["failure_reason"], "no_target")
+
     def test_empty_registry_records_a_refused_invocation(self) -> None:
         _ = (self.scratch / "views.toml").write_text("")
         shot = self.run_script(
@@ -388,6 +935,11 @@ class ViewsTests(HanaShotTest):
         self.assertEqual((shot.returncode, check.returncode), (2, 2))
         self.assertEqual([line["failure_reason"] for line in self.timing_lines()], ["invalid_request"] * 2)
         self.assertEqual([line["invocation_kind"] for line in self.timing_lines()], ["shot", "views_check"])
+        for line, result in zip(self.timing_lines(), (shot, check), strict=True):
+            error = line["error"]
+            self.assertIsInstance(error, str)
+            self.assertTrue(error)
+            self.assertIn(cast(str, error), result.stderr)
 
     def test_check_records_black_and_empty_crops_after_validation(self) -> None:
         _ = (self.scratch / "views.toml").write_text('[views.front]\nmode = "home"\n')
@@ -399,17 +951,20 @@ class ViewsTests(HanaShotTest):
         black = self.views("check", "--port", str(self.port), "--out", str(self.scratch / "check"))
         self.assertEqual(black.returncode, 1, black.stderr)
         self.assertEqual(self.timing_lines()[0]["failure_reason"], "black_capture")
+        self.assertIn("black", cast(str, self.timing_lines()[0]["error"]).lower())
 
         _ = fake_magick.write_text("#!/bin/sh\necho 0.5\n")
         self.fake.screenshot = "tiny"
         empty = self.views("check", "--port", str(self.port), "--out", str(self.scratch / "check"))
         self.assertEqual(empty.returncode, 1, empty.stderr)
         self.assertEqual(self.timing_lines()[1]["failure_reason"], "empty_crop")
+        self.assertIn(cast(str, self.timing_lines()[1]["error"]), empty.stderr)
 
         self.fake.screenshot = "ok"
         passed = self.views("check", "--port", str(self.port), "--out", str(self.scratch / "check"))
         self.assertEqual(passed.returncode, 0, passed.stderr)
         self.assertEqual(self.timing_lines()[2]["status"], "success")
+        self.assertNotIn("error", self.timing_lines()[2])
         self.assertEqual([line["invocation_kind"] for line in self.timing_lines()], ["views_check"] * 3)
 
     def test_add_list_show_and_replace(self) -> None:
@@ -437,6 +992,32 @@ class ViewsTests(HanaShotTest):
         replaced = self.views("add", "log-back", "--target", "name:Log", "--margin", "0.3", "--replace")
         self.assertEqual(replaced.returncode, 0, replaced.stderr)
         self.assertRegex(self.views("show", "log-back").stdout, r"(?m)^margin += 0\.3$")
+        self.assertEqual(self.fake.calls, [])
+
+    def test_refused_view_name_suggests_a_valid_name_derived_from_input(self) -> None:
+        for refused in ("Log Back", "42 View", "!!!"):
+            with self.subTest(refused=refused):
+                result = self.views("add", refused, "--mode", "home")
+                self.assertEqual(result.returncode, 2, result.stderr)
+                examples = [match.group(1) for match in re.finditer(r"'([a-z0-9][a-z0-9-]*)'", result.stderr)]
+                self.assertTrue(examples, result.stderr)
+                example = examples[0]
+                if refused == "Log Back":
+                    self.assertIn("log", example)
+                    self.assertIn("back", example)
+                elif refused == "42 View":
+                    self.assertIn("42", example)
+                    self.assertIn("view", example)
+                repaired = self.views("add", example, "--mode", "home")
+                self.assertEqual(repaired.returncode, 0, repaired.stderr)
+        self.assertEqual(self.fake.calls, [])
+
+    def test_invalid_registry_view_name_has_a_derived_example(self) -> None:
+        _ = (self.scratch / "views.toml").write_text('[views."Log Back"]\nmode = "home"\n')
+        result = self.views("list")
+
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertRegex(result.stderr, r"log[-_]back")
         self.assertEqual(self.fake.calls, [])
 
     def test_bad_views_are_refused(self) -> None:
@@ -473,11 +1054,62 @@ class ShotTests(HanaShotTest):
         )
         self.assertGreaterEqual(line["total_ms"], line["capture_ms"])
         self.assertEqual((line["status"], line["exit_code"]), ("success", 0))
+        self.assertNotIn("error", line)
+        self.assertNotIn("face", line)
         self.assertEqual(line["session"], {"state": "absent"})
         [attempt] = line["attempts"]
         self.assertEqual((attempt["status"], attempt["label"], attempt["view"]), ("success", "home", None))
+        self.assertNotIn("face", attempt)
         self.assertEqual(attempt["image_paths"], [str(self.scratch / "shot.png")])
         self.assertEqual([path.name for path in self.scratch.glob(".shot-*")], [])
+
+    def test_margin_help_explains_range_and_fraction(self) -> None:
+        result = self.run_script("shot", "--help")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        help_text = " ".join(result.stdout.split())
+        margin_help = help_text.split("--margin MARGIN", 2)[-1].split("--", 1)[0]
+        self.assertIn("0 to 0.45", margin_help)
+        self.assertRegex(margin_help.lower(), r"fraction|proportion|percent")
+        self.assertRegex(margin_help.lower(), r"frame|image|viewport|screen")
+
+    def test_margin_refusal_explains_range_and_viewport_fraction_before_any_brp_call(self) -> None:
+        for margin in ("-0.1", "0.46"):
+            with self.subTest(margin=margin):
+                result = self.shot("--target", "name:Log", "--margin", margin)
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertIn("--margin", result.stderr)
+                self.assertIn("0", result.stderr)
+                self.assertIn("0.45", result.stderr)
+                self.assertRegex(result.stderr.lower(), r"fraction|proportion|percent")
+                self.assertIn("viewport", result.stderr.lower())
+                self.assertIn("each side", result.stderr.lower())
+                self.assertRegex(result.stderr, r"0\.1\s*=\s*10%")
+        self.assertEqual(self.fake.calls, [])
+
+    def test_unhandled_filesystem_failure_records_its_exception_type_and_diagnostic(self) -> None:
+        result = self.shot("--view", "front", "--views-file", str(self.scratch))
+
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn("Traceback", result.stderr)
+        diagnostic = next(line for line in result.stderr.splitlines() if line.startswith("IsADirectoryError:"))
+        [line] = self.timing_lines()
+        self.assertEqual((line["status"], line["exit_code"], line["failure_reason"]),
+                         ("failure", 1, "shot_failed"))
+        self.assertIn(diagnostic, cast(str, line["error"]))
+        self.assertEqual(self.fake.calls, [])
+
+    def test_pose_refusal_names_missing_flags_and_has_a_runnable_example(self) -> None:
+        result = self.shot("--mode", "pose")
+
+        self.assertEqual(result.returncode, 2, result.stderr)
+        for flag in ("--focus", "--radius"):
+            self.assertIn(flag, result.stderr)
+        example = re.search(r"--mode pose --focus (\S+) --radius ([0-9.]+)", result.stderr)
+        self.assertIsNotNone(example, result.stderr)
+        if example is not None:
+            repaired = self.shot(*shlex.split(example.group()))
+            self.assertEqual(repaired.returncode, 0, repaired.stderr)
 
     def test_window_uses_override_scale_when_it_is_higher_than_base_scale(self) -> None:
         self.fake.window_scale_factor = 1.0
@@ -542,6 +1174,8 @@ class ShotTests(HanaShotTest):
         self.assertFalse((self.scratch / "shot.png").exists())
         [line] = self.timing_lines()
         self.assertEqual((line["exit_code"], line["failure_reason"]), (3, "timeout"))
+        self.assertIn("without resending", cast(str, line["error"]))
+        self.assertIn(cast(str, line["error"]), result.stderr)
         self.assertEqual(cast(list[dict[str, object]], line["attempts"])[0]["image_paths"], [])
 
     def test_busy_screenshot_is_resent_once(self) -> None:
@@ -567,12 +1201,21 @@ class ShotTests(HanaShotTest):
                 self.assertEqual(result.returncode, 1, result.stderr)
                 line = self.timing_lines()[-1]
                 self.assertEqual((line["status"], line["failure_reason"]), ("failure", reason))
+                error = line["error"]
+                self.assertIsInstance(error, str)
+                self.assertTrue(error)
+                self.assertIn(cast(str, error), result.stderr)
 
     def test_missing_target_and_invalid_request_are_recorded(self) -> None:
         missing = self.shot("--target", "name:Absent")
         refused = self.shot("--mode", "pose")
         self.assertEqual((missing.returncode, refused.returncode), (1, 2))
         self.assertEqual([line["failure_reason"] for line in self.timing_lines()], ["no_target", "invalid_request"])
+        missing_line, refused_line = self.timing_lines()
+        self.assertIn("name:Absent", cast(str, missing_line["error"]))
+        self.assertIn(cast(str, missing_line["error"]), missing.stderr)
+        self.assertIn("--focus", cast(str, refused_line["error"]))
+        self.assertIn(cast(str, refused_line["error"]), refused.stderr)
 
     def test_parser_error_is_recorded(self) -> None:
         result = self.run_script("shot", "--port", str(self.port), "--mode")
@@ -580,6 +1223,8 @@ class ShotTests(HanaShotTest):
         [line] = self.timing_lines()
         self.assertEqual((line["port"], line["failure_reason"], line["exit_code"]),
                          (self.port, "invalid_request", 2))
+        self.assertIn("--mode", cast(str, line["error"]))
+        self.assertIn(cast(str, line["error"]), result.stderr)
 
     def test_multi_view_failure_keeps_earlier_attempt(self) -> None:
         views = self.scratch / "views.toml"
@@ -588,6 +1233,8 @@ class ShotTests(HanaShotTest):
         self.assertEqual(result.returncode, 1, result.stderr)
         [line] = self.timing_lines()
         self.assertEqual(line["failure_reason"], "no_target")
+        self.assertIn("name:Absent", cast(str, line["error"]))
+        self.assertIn(cast(str, line["error"]), result.stderr)
         attempts = cast(list[dict[str, object]], line["attempts"])
         self.assertEqual([attempt["status"] for attempt in attempts], ["success", "failure"])
         self.assertEqual(len(cast(list[str], attempts[0]["image_paths"])), 1)
@@ -864,6 +1511,7 @@ hana_shot.Session.close = signal_before_close
         self.assertIn(["ended"], self.ssh_calls())
         [line] = self.timing_lines()
         self.assertEqual((line["invocation_kind"], line["exit_code"]), ("shot", 128 + signal.SIGINT))
+        self.assertIn("SIGINT", cast(str, line["error"]))
 
     def test_sigterm_restores_the_remote_mac_window_and_records_the_signal_exit(self) -> None:
         return_code, stderr = self.interrupt_held_remote_mac_shot(signal.SIGTERM)
@@ -873,6 +1521,7 @@ hana_shot.Session.close = signal_before_close
         self.assertIn(["ended"], self.ssh_calls())
         [line] = self.timing_lines()
         self.assertEqual((line["invocation_kind"], line["exit_code"]), ("shot", 128 + signal.SIGTERM))
+        self.assertIn("SIGTERM", cast(str, line["error"]))
 
     def test_sighup_restores_the_remote_mac_window_and_records_the_signal_exit(self) -> None:
         return_code, stderr = self.interrupt_held_remote_mac_shot(signal.SIGHUP)
@@ -882,6 +1531,7 @@ hana_shot.Session.close = signal_before_close
         self.assertIn(["ended"], self.ssh_calls())
         [line] = self.timing_lines()
         self.assertEqual((line["invocation_kind"], line["exit_code"]), ("shot", 128 + signal.SIGHUP))
+        self.assertIn("SIGHUP", cast(str, line["error"]))
 
     def test_views_check_retries_window_preparation_after_a_refused_raise(self) -> None:
         _ = self.fake_remote(copies=True, system="Darwin")

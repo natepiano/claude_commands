@@ -44,7 +44,8 @@
 #
 # A delegate session remembers passes. With PLAN_DELEGATE_BOARD_DIR or
 # PLAN_DELEGATE_SESSION_DIR set, a `test` or `lint` that exits 0 is recorded in
-# <session>/verify_cache/, keyed by the working tree as the run left it, the
+# <session>/verify_cache/, keyed by the working tree its verdict was judged on,
+# the
 # arguments, rustc -vV, lint.conf, these scripts and the RUST*/CARGO_*/NEXTEST_*
 # environment. A plain `lint <package>` leaves the package out of the key:
 # every lint stage but fmt covers the workspace, and fmt covers every member
@@ -58,8 +59,11 @@
 # and replayed with its full output and exit status, since lint on an
 # unchanged tree fails the same way (one worker ran 12 in a row on 2026-10-01).
 # A failed `test` is never recorded (tests flake), nor a run cut short by a
-# usage error, the sandbox or a kill. A `test` that changed the tree records
-# nothing, and a run outside a delegate session is never cached.
+# usage error, the sandbox or a kill. The judged tree is the tree when the run
+# starts, or for `lint` the tree its last rewrite (mend --fix, then fmt) leaves
+# for taplo, clippy and rustdoc. A run that ends on any other tree records
+# nothing: an edit landed while it ran, and its verdict belongs to neither tree.
+# A run outside a delegate session is never cached.
 # end_session.sh deletes the records when the run ends.
 #
 # Each record carries what a repeat would cost: the run's wall time minus
@@ -678,7 +682,7 @@ if [[ -n "${CACHE_SESSION_DIR}" && ( "$CMD" == test || "$CMD" == lint ) ]]; then
     CACHE_DIR="${CACHE_SESSION_DIR}/verify_cache"
 fi
 RUN_LOG=""
-RUN_KEY=""
+VERDICT_KEY=""
 RUN_STARTED=0
 CALL_NOTED=0
 TOKEN_WAIT_S=0
@@ -865,7 +869,6 @@ try_mac_test() {
         passed)
             if [[ "$FILTER_RUN" -eq 1 ]]; then
                 # A pass on the Mac is never natedev's pass record.
-                RUN_KEY=""
                 BUILDLOG_MAC=passed_filter
                 echo "verify.sh: PASS on the Mac (macOS). A filtered run is feedback, so nothing ran on natedev."
                 note_event ran "${SECONDS}" 0 "" 0 0
@@ -1084,14 +1087,17 @@ build_seconds() {
                END { printf "%d", total }'
 }
 
-# Records a pass, or a lint failure, under the tree as the run left it (lint's
-# rewrites are part of the result), before the token is released so a peer
-# queued on the same call finds it. A record replaces the other kind on the
-# same tree. Fails when there is nothing to record.
+# Records a pass, or a lint failure, under the tree its verdict was judged on
+# (VERDICT_KEY; lint's rewrites are part of it), before the token is released
+# so a peer queued on the same call finds it. A record replaces the other kind
+# on the same tree. Fails when there is nothing to record, or when the tree has
+# changed since that verdict.
 cache_record() {
     local kind=$1 repeat=$2 key verb=passed other=fail
     key="$(tree_key)"
-    if [[ -z "${key}" || ( "$CMD" == test && "${key}" != "${RUN_KEY}" ) ]]; then
+    [[ -n "${key}" && -n "${VERDICT_KEY}" ]] || return 1
+    if [[ "${key}" != "${VERDICT_KEY}" ]]; then
+        echo "verify.sh: the tree changed while ${CMD} ran, so this result was not recorded; the next ${CMD} runs again."
         return 1
     fi
     if [[ "${kind}" == fail ]]; then
@@ -1281,7 +1287,15 @@ if child:
 os.setsid()
 with (lock.parent / "cargo.guard").open("a+") as guard:
     fcntl.flock(guard, fcntl.LOCK_EX)
-    if (lock / "holder_pid").read_text() != holder:
+    # A token released or reclaimed during the memory wait leaves no holder_pid,
+    # or a holder that recorded none: either way this run no longer holds it.
+    try:
+        recorded = (lock / "holder_pid").read_text()
+    except OSError:
+        recorded = ""
+    if recorded != holder:
+        print("verify.sh: this run lost the cargo token before its step started; run it again.",
+              file=sys.stderr)
         sys.exit(125)
     record = lock / f"owned.{os.getpid()}.tmp"
     record.write_text(json.dumps({"group": os.getpid(), "start": identity(os.getpid())}))
@@ -1325,7 +1339,9 @@ fi
 RUN_STARTED=${SECONDS}
 MEM_KILL_FILE="$(mktemp)"
 if [[ -n "${CACHE_DIR}" ]] && mkdir -p "${CACHE_DIR}"; then
-    RUN_KEY="${LOOKUP_KEY}"
+    # Taken now, after the token and hold waits: an edit made while this call
+    # waited is part of the tree it runs on.
+    VERDICT_KEY="$(tree_key)"
     RUN_LOG="${CACHE_DIR}/run.$$.log"
     : > "${RUN_LOG}"
     exec > >(tee -a "${RUN_LOG}") 2> >(tee -a "${RUN_LOG}" >&2)
@@ -1466,6 +1482,10 @@ case "$CMD" in
             fi
         done <<< "$FMT_MEMBERS"
         fmt_cargo "${FMT_SCOPE[@]}"
+        # The last rewrite is done: taplo, clippy and rustdoc judge this tree.
+        if [[ -n "${RUN_LOG}" ]]; then
+            VERDICT_KEY="$(tree_key)"
+        fi
         # Cargo's workspace root can differ from the caller's directory.
         # Run there so Taplo uses the same config and scope as the push gate.
         TAPLO_WORKSPACE_ROOT="$(cargo metadata --no-deps --format-version 1 \

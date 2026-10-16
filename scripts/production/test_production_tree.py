@@ -1,0 +1,152 @@
+"""The manager tree cargo-handler polls: every edge from fixture records, none from live state."""
+from __future__ import annotations
+
+import contextlib
+import io
+import json
+import os
+import subprocess
+import sys
+import tempfile
+import time
+import unittest
+from pathlib import Path
+from typing import cast, override
+from unittest import mock
+
+import production_tree
+import showrunners
+import unit_lookup
+import unit_runs
+
+RUNNER, CHILD_RUNNER, GONE_RUNNER = "sid-runner", "sid-child-runner", "sid-gone-runner"
+DIRECTOR, OLD_DIRECTOR, ORPHAN = "sid-director", "sid-old-director", "sid-orphan"
+SCRIPT = Path(__file__).with_name("production_tree.py")
+
+
+def record(session_id: str) -> dict[str, object]:
+    return {"sessionId": session_id}
+
+
+def unit(session_id: str, name: str) -> unit_lookup.MarkedUnit:
+    claude = unit_lookup.LiveClaude(name, session_id, f"/run/{name}.sock", 1)
+    return unit_lookup.MarkedUnit(name, name, claude, unit_lookup.TmuxPlace(f"%{name}"))
+
+
+def server_recorded(run: Path) -> bool:
+    """A fixture run's server counts as running while its record exists; no pid is checked."""
+    return (run / "mesh_server.json").is_file()
+
+
+class ProductionTreeTests(unittest.TestCase):
+    root: Path = Path()
+
+    @override
+    def setUp(self) -> None:
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name)
+        notifier, state = self.root / "notifier", self.root / "showrunner"
+        for slug, session_id in (("main", RUNNER), ("child", CHILD_RUNNER), ("gone", GONE_RUNNER)):
+            (notifier / f"showrunner-{slug}").mkdir(parents=True)
+            _ = (notifier / f"showrunner-{slug}" / "conf").write_text(f"TARGET=session:{session_id}\nEVERY=30\n")
+        (state / "child").mkdir(parents=True)
+        _ = (state / "child" / "parent").write_text("main\n")
+        for patch in (
+            mock.patch.object(showrunners, "NOTIFIER_STATE_DIR", notifier),
+            mock.patch.object(showrunners, "SHOWRUNNER_STATE_DIR", state),
+            mock.patch.object(unit_runs, "RUN_ROOT", self.root / "unit"),
+            mock.patch.object(unit_runs, "FORMER_RUN_ROOT", self.root / "delegate"),
+            mock.patch.object(production_tree, "_server_running", side_effect=server_recorded),
+        ):
+            _ = self.enterContext(patch)
+
+    def run_folder(self, root: str, director: str, roster: dict[str, dict[str, object]], server: bool = True) -> Path:
+        run = self.root / root / f"run-{director}"
+        (self.root / root / "active").mkdir(parents=True, exist_ok=True)
+        run.mkdir()
+        _ = (self.root / root / "active" / director).write_text(f"{run}\n")
+        _ = (run / "mesh_roster.json").write_text(json.dumps(roster))
+        if server:
+            _ = (run / "mesh_server.json").write_text(json.dumps({"pid": 1}))
+        return run
+
+    def tree(self, running: set[str], units: dict[str, dict[str, unit_lookup.MarkedUnit]]) -> list[production_tree.Edge]:
+        marked = unit_lookup.MarkedProductions(units, {})
+        with mock.patch.object(production_tree, "running_sessions", return_value=[record(session_id) for session_id in running]), \
+                mock.patch.object(unit_lookup, "every_marked_unit", return_value=marked):
+            return production_tree.tree()
+
+    def test_every_kind_of_edge_between_running_sessions(self) -> None:
+        _ = self.run_folder("unit", DIRECTOR, {
+            "a-impl": {"thread_id": "thread-impl", "role": "impl", "status": "running"},
+            "a-test": {"thread_id": "thread-test", "status": "idle"},
+            "a-review": {"thread_id": "thread-review", "role": "review", "status": "ended"},
+        })
+        _ = self.run_folder("delegate", OLD_DIRECTOR, {
+            "b-4": {"thread_id": "thread-fix", "role": "fix", "status": "done"},
+        })
+        edges = self.tree({RUNNER, CHILD_RUNNER, DIRECTOR, OLD_DIRECTOR}, {
+            "main": {"one": unit(DIRECTOR, "one"), "two": unit(OLD_DIRECTOR, "two")},
+        })
+        self.assertEqual(edges, [
+            {"manager": RUNNER, "member": CHILD_RUNNER, "role": "showrunner"},
+            {"manager": RUNNER, "member": DIRECTOR, "role": "unit"},
+            {"manager": RUNNER, "member": OLD_DIRECTOR, "role": "unit"},
+            {"manager": DIRECTOR, "member": "thread-impl", "role": "impl"},
+            {"manager": DIRECTOR, "member": "thread-test", "role": "test"},
+            {"manager": OLD_DIRECTOR, "member": "thread-fix", "role": "fix"},
+        ])
+
+    def test_a_manager_on_another_machine_keeps_its_edges(self) -> None:
+        _ = self.run_folder("unit", DIRECTOR, {"a-impl": {"thread_id": "thread-impl", "role": "impl", "status": "running"}}, server=False)
+        _ = self.run_folder("unit", ORPHAN, {"c-impl": {"thread_id": "thread-orphan", "role": "impl", "status": "running"}})
+        edges = self.tree({CHILD_RUNNER, DIRECTOR, ORPHAN}, {
+            "main": {"one": unit(DIRECTOR, "one")},
+            "gone": {"orphan": unit(ORPHAN, "orphan")},
+        })
+        # Neither showrunner runs here, yet each timer names its session, so its child and its
+        # units keep their manager; the director's server has stopped, so its worker is gone.
+        self.assertEqual(edges, [
+            {"manager": RUNNER, "member": CHILD_RUNNER, "role": "showrunner"},
+            {"manager": GONE_RUNNER, "member": ORPHAN, "role": "unit"},
+            {"manager": RUNNER, "member": DIRECTOR, "role": "unit"},
+            {"manager": ORPHAN, "member": "thread-orphan", "role": "impl"},
+        ])
+
+    def test_a_member_that_is_not_running_here_leaves_its_edges_out(self) -> None:
+        edges = self.tree({RUNNER}, {"main": {"one": unit(DIRECTOR, "one")}})
+        self.assertEqual(edges, [])
+
+    def test_unreadable_unit_marks_keep_the_other_edges(self) -> None:
+        with mock.patch.object(production_tree, "running_sessions", return_value=[record(RUNNER), record(CHILD_RUNNER)]), \
+                mock.patch.object(unit_lookup, "every_marked_unit", side_effect=OSError("tmux: gone")), \
+                contextlib.redirect_stderr(io.StringIO()) as errors:
+            edges = production_tree.tree()
+        self.assertEqual(edges, [{"manager": RUNNER, "member": CHILD_RUNNER, "role": "showrunner"}])
+        self.assertIn("unit marks unreadable: tmux: gone", errors.getvalue())
+
+    def test_a_large_tree_answers_well_under_a_second(self) -> None:
+        directors = [f"sid-director-{number}" for number in range(40)]
+        for director in directors:
+            _ = self.run_folder("unit", director, {
+                f"w{seat}-impl": {"thread_id": f"{director}-{seat}", "role": "impl", "status": "running"} for seat in range(6)
+            })
+        started = time.perf_counter()
+        edges = self.tree({RUNNER, *directors}, {"main": {director: unit(director, director) for director in directors}})
+        self.assertLess(time.perf_counter() - started, 0.25)
+        self.assertEqual(len(edges), 40 + 40 * 6)
+
+    def test_the_command_prints_schema_one_and_starts_fast(self) -> None:
+        with mock.patch.object(production_tree, "tree", return_value=[]), contextlib.redirect_stdout(io.StringIO()) as out:
+            self.assertEqual(production_tree.main(["--json"]), 0)
+        self.assertEqual(cast(object, json.loads(out.getvalue())), {"schema": 1, "edges": []})
+        started = time.perf_counter()
+        shown = subprocess.run([sys.executable, str(SCRIPT), "--help"], capture_output=True, text=True, check=False,
+                               env={**os.environ, "NOTIFIER_STATE_DIR": str(self.root / "notifier")}, stdin=subprocess.DEVNULL)
+        self.assertEqual(shown.returncode, 0, shown.stderr)
+        self.assertLess(time.perf_counter() - started, 0.75)
+
+
+if __name__ == "__main__":
+    _ = unittest.main()

@@ -18,7 +18,7 @@ from dailies_input import (ClaudeNotRunning, Decision, SessionGone, StatusBlock,
 from unit_lookup import UnitState
 import fake_tmux
 from fake_tmux import FakeSession
-from fake_herdr import CommandResponse
+from fake_herdr import CommandResponse, herdr_listener
 from herdr import SessionEntry, SessionListResult
 from sessions import SessionRecord
 from test_session_pane import tmux_adapter
@@ -70,7 +70,8 @@ exit "$NOTIFIER_HEALTH_EXIT"
                 _ = shutil.copy2(SCRIPT.with_name(source_name), script.with_name(source_name))
             (root / "scripts" / "herdr").mkdir()
             _ = shutil.copy2(SCRIPT.parent.parent / "herdr" / "herdr.py", root / "scripts" / "herdr" / "herdr.py")
-            _ = shutil.copy2(SCRIPT.parent.parent / "lib" / "user_zone.py", script.parent.parent / "lib" / "user_zone.py")
+            for source_name in ("user_zone.py", "probe_session.py"):
+                _ = shutil.copy2(SCRIPT.parent.parent / "lib" / source_name, script.parent.parent / "lib" / source_name)
             active_dir = root / "active"
             active_dir.mkdir()
             call_log = root / "notifier_calls"
@@ -117,6 +118,7 @@ exit "$NOTIFIER_HEALTH_EXIT"
                     server = root / "proc" / "991000"
                     server.mkdir(parents=True, exist_ok=True)
                     _ = (server / "cmdline").write_bytes(f"herdr\0--session\0{unit}\0server\0".encode())
+                    herdr_listener(root / "proc", 991000, unit, environment)
                     process = root / "proc" / str(os.getpid())
                     process.mkdir(parents=True, exist_ok=True)
                     _ = (process / "cmdline").write_bytes(b"claude\0")
@@ -210,12 +212,12 @@ exit "$NOTIFIER_HEALTH_EXIT"
     def test_idle_run_reports_failed_tick_health(self) -> None:
         output, calls = self.run_status("/tmp/test-run\n", "failing: no instance", 1)
         self.assertIn("TICKS FAILING (no instance)", output)
-        self.assertEqual(calls, "health delegate-test-run\n")
+        self.assertEqual(calls, "health unit-test-run\n")
 
     def test_healthy_run_has_no_tick_warning(self) -> None:
         output, calls = self.run_status("/tmp/test-run\n", "ok", 0)
         self.assertNotIn("TICKS FAILING", output)
-        self.assertEqual(calls, "health delegate-test-run\n")
+        self.assertEqual(calls, "health unit-test-run\n")
 
     def test_missing_active_marker_skips_health(self) -> None:
         output, calls = self.run_status(None, "failing: no instance", 1)
@@ -230,7 +232,7 @@ exit "$NOTIFIER_HEALTH_EXIT"
     def test_claude_session_id_comes_from_lookup_even_with_a_different_name(self) -> None:
         output, calls = self.run_status("/tmp/test-run\n", "ok", 0)
         self.assertNotIn("CLAUDE NOT RUNNING", output)
-        self.assertEqual(calls, "health delegate-test-run\n")
+        self.assertEqual(calls, "health unit-test-run\n")
 
     def test_no_live_claude_record_reports_not_running(self) -> None:
         output, calls = self.run_status("/tmp/test-run\n", "ok", 0, stopped_units=("hook",))
@@ -404,5 +406,5 @@ exit "$NOTIFIER_HEALTH_EXIT"
         self.assertIn("=== DECISION for you from native ===", output)
         self.assertNotIn("CLAUDE NOT RUNNING", output)
         self.assertNotIn("SESSION GONE", output)
-        self.assertEqual(calls, "health delegate-native-run\n" * 2)
+        self.assertEqual(calls, "health unit-native-run\n" * 2)
         self.assertEqual(seen, "native|— gate: approve release\n")

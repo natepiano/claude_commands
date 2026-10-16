@@ -141,20 +141,11 @@ class PushTextTests(unittest.TestCase):
             + "Action: answer the open form\n"
             + "Reason: shutdown is blocked because widget's claude session is showing a form and it can't proceed.")
 
-    def test_remote_control_examples_keep_role_in_title_and_session_in_message(self) -> None:
-        entry = next(entry for entry in push_texts.catalog() if entry.id == "shutdown.remote_control")
-        expected = {
-            "typical": ("Owner", "Owner"),
-            "unit": ("trunk unit", "build-followups-trunk-unit-director"),
-            "showrunner": ("demo showrunner", "build-followups-director"),
-        }
-        for example in entry.examples:
-            with self.subTest(example=example.name):
-                who, session = expected[example.name]
-                push = push_texts.render_entry(entry, example.values)
-                self.assertEqual(push.title + "\n" + push.message,
-                    f"{who} remote-control is off\nSession: {session}\n"
-                    + "Action: run /remote-control\nReason: Remote control is off.")
+    def test_remote_control_push_is_absent_from_catalog_and_approvals(self) -> None:
+        removed_id = "shutdown." + "remote_control"
+        self.assertNotIn(removed_id, {entry.id for entry in push_texts.catalog()})
+        approvals = cast(dict[str, object], json.loads(push_texts.REVIEWED_FILE.read_text()))
+        self.assertNotIn(removed_id, approvals)
 
     def test_holdout_offers_one_stop_command_on_the_named_machine(self) -> None:
         for entry in push_texts.catalog():

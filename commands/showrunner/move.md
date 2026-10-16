@@ -19,10 +19,10 @@ When it finishes, print its output exactly as it comes, with nothing added.
   moves every live member not already on it, across all productions; for
   `showrunners`, this one included. A showrunner with no session under the id
   its timer names is left where it is and named.
-- `--dry-run`: for a group, show each off-target name/id, source account and `pause, then move` or `reap and restart now` with its reason; change nothing. In this terminal, `~/.claude/scripts/lib/py ~/.claude/scripts/accounts/accounts.py move <session-id|name> <target> --dry-run` previews one ad hoc session.
+- `--dry-run`: for a group, show each off-target name/id, source account and `move when idle` or `reap and restart now` with its reason; change nothing. In this terminal, `~/.claude/scripts/lib/py ~/.claude/scripts/accounts/accounts.py move <session-id|name> <target> --dry-run` previews one ad hoc session.
 - `--why <text>`: the reason each session reads when it is back.
 
-A fresh target at zero usage with no credits refuses before writes and gives the picker command. A missing or stale target reading is named and permits the move. Members accepting prompts get `Pause for move: …` and stop after marking ready. A transcript refusal or fresh exhausted source reading reaps and restarts immediately. Supervised windows, including sessions started by numbered account aliases, retain their window and scroll history.
+A fresh target at zero usage with no credits refuses before writes and gives the picker command. A missing or stale target reading is named and permits the move. Idle members stop with no pause; busy members get `Pause for move: …` and stop after marking ready, or once idle after the pause. A transcript refusal or fresh exhausted source reading reaps and restarts immediately. Supervised windows, including sessions started by numbered account aliases, retain their window and scroll history.
 
 A terminal `accounts.py move` follows the shutdown trail live to its summary; session or redirected calls print the exact follow command and place. `all N back on <target>` means done; `taken out` means cancelled members stayed out; an action line names what to do and where, then following continues through other source requests. Ctrl-C detaches while the shutdown continues. One group move-back command names its previous stored account, or its common source when no account was stored; mixed sources without a stored account get no command. Single-session guidance names its source.
 

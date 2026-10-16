@@ -45,6 +45,7 @@
       "root": "scripts/hooks",
       "extraPaths": [
         "scripts/hooks",
+        "scripts/delegate",
         "scripts/message",
         "scripts/notify",
         "scripts/production",

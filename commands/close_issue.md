@@ -25,7 +25,7 @@ Check the platform with `uname -s` before resolving the issue.
 ## Usage
 
 ```text
-/close_issue [<issue>] [--reason <text> | --no-reason] [--date YYYY-MM-DD | on YYYY-MM-DD]
+/close_issue [<issue>] [--reason <text> | --no-reason] [--as-built <path>] [--date YYYY-MM-DD | on YYYY-MM-DD]
 ```
 
 `$ARGUMENTS` may contain the issue selector first, followed by options:
@@ -33,6 +33,7 @@ Check the platform with `uname -s` before resolving the issue.
 - `<issue>`: one issue path, filename, stem, Obsidian wikilink, title, or unique case-insensitive substring.
 - `--reason <text>`: the concise reason the issue is being closed. The value may contain spaces; treat the text through the next recognized option or a final `on YYYY-MM-DD` date phrase as the reason.
 - `--no-reason`: explicitly close without a `reason` property. Reject this when `--reason` is also present.
+- `--as-built <path>`: the as-built doc the work landed in, repo-relative, e.g. `docs/hana/as-built/<file>.md`.
 - `--date YYYY-MM-DD`: the closure date. Reject invalid calendar dates.
 - `on YYYY-MM-DD`: a natural-language alias for `--date YYYY-MM-DD` when it is the final phrase. Reject an invocation containing both date forms.
 
@@ -82,7 +83,8 @@ Use `apply_patch` to make the smallest possible edit to the selected issue's top
 3. Set `date_modified: "[[YYYY-MM-DD]]"` to the same date.
 4. When a reason is supplied or inferred, set a single top-level `reason` property. Keep it to one line, use a plain YAML scalar when safe, and use a correctly escaped double-quoted YAML scalar when punctuation could be interpreted as YAML syntax. Insert a new reason after `project` when practical.
 5. With `--no-reason`, remove any existing top-level `reason` so the new closure is recorded without one. This matters for reopened issues that still carry metadata from an earlier closure.
-6. Preserve `stage`, all seven prioritization judgment properties, the note body, and every unrelated property and formatting choice.
+6. With `--as-built`, set a single top-level `as_built: "<path>"`; without it, keep any existing `as_built`.
+7. Preserve `stage`, all seven prioritization judgment properties, `proposed_by`, `showrunner`, `unit`, `plan`, the note body, and every unrelated property and formatting choice.
 
 `apply_patch` normally preserves the inode and APFS creation timestamp and only advances the modification timestamp. Do not depend on that here: automatic ranking below and the background rank-watcher each rewrite the file atomically — a temp file plus rename — once the status flips to `closed`, which changes the inode and resets the APFS creation timestamp to the current time. So do not assert the inode or creation timestamp are unchanged, and do not set any filesystem timestamps yet. Reconcile them from the authoritative frontmatter dates only after ranking has settled — see "Reconcile filesystem timestamps" below.
 

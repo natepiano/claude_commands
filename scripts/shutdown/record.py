@@ -15,25 +15,40 @@ import time
 from collections.abc import Callable, Generator
 from contextlib import contextmanager
 from dataclasses import dataclass
+from importlib import import_module
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Literal, NotRequired, TypedDict, cast
+from typing import Literal, NotRequired, Protocol, TypedDict, cast
 
-from inventory import Session, parse_session
+from session_types import Session, parse_session
+from session_types import (
+    ShowrunnerFooter as ShowrunnerFooter,
+    NoFooter as NoFooter,
+    TimerRestore as TimerRestore,
+    CodexSessionId as CodexSessionId,
+    CodexResumePicker as CodexResumePicker,
+    CodexLaunch as CodexLaunch,
+    SnapshotClaudeSession as SnapshotClaudeSession,
+    SnapshotCodexSession as SnapshotCodexSession,
+    SnapshotSession as SnapshotSession,
+    CompleteInventory,
+    PartialInventory,
+    KnownBoot,
+)
 from launch_permission import launch_barrier, shutdown_state_root
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
+for dependency in ("lib", "whoami"):
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / dependency))
 from user_zone import user_zone  # noqa: E402
-from scripts.whoami.note_file import canonical_label, parse_account_label, NumberedAccountLabel
+from note_file import canonical_label, parse_account_label, NumberedAccountLabel
+from account import ResolvedHistoryLabel, HistoricalAccountUnresolved
 
 CLAIM_STALE_SECONDS = 120
 CONDUCTOR_LOCK_RETRY_DELAYS = (0.05,) * 5
 
 
-class NoRemoteControl(TypedDict):
-    session_id: str
-    name: str
-    alerts: Literal["user", "none"]
+class HistoricalAccountResolver(Protocol):
+    def resolve_history_label(self, label: str, at: str, *, login: str = "") -> ResolvedHistoryLabel | HistoricalAccountUnresolved: ...
 
 
 class ReadinessClear(TypedDict):
@@ -69,7 +84,12 @@ class FromTerminal(TypedDict):
     kind: Literal["terminal"]
 
 
-RequestOrigin = FromSession | FromTerminal
+class FromSnapshot(TypedDict):
+    kind: Literal["snapshot"]
+    taken_at: str
+
+
+RequestOrigin = FromSession | FromTerminal | FromSnapshot
 
 
 class _LegacySystemdConductor(TypedDict):
@@ -164,19 +184,34 @@ _LegacyOrchestrationIssue = _LegacyStopClaimFailed | _LegacyMachineStopFailed
 _LegacyStopIssue = SessionStopIssue | _LegacyWorkerStillLive | _LegacyOrchestrationIssue
 
 
-class ShowrunnerFooter(TypedDict):
-    kind: Literal["footer"]
-    slug: str
 
 
-class NoFooter(TypedDict):
-    kind: Literal["no footer"]
+class RecoverySnapshot(TypedDict):
+    machine: str
+    login: str
+    label: str
+    taken_at: str
+    boot_id: NotRequired[str]
+    sessions: list[SnapshotSession]
 
 
-class TimerRestore(TypedDict):
-    instance: str
-    was_enabled: bool
-    footer: ShowrunnerFooter | NoFooter
+@dataclass(frozen=True)
+class NoRecoverySnapshot:
+    """No recovery snapshot has been written for this login."""
+
+
+def _codex_launch(value: object, place: str) -> CodexLaunch:
+    values = _mapping(value, place)
+    home = _string(_required(values, "home", place), f"{place}.home")
+    if not Path(home).is_absolute():
+        raise InvalidRecord(f"{place}.home must be absolute")
+    resume = _mapping(_required(values, "resume", place), f"{place}.resume")
+    kind = _kind(resume, f"{place}.resume", frozenset({"session id", "picker"}))
+    if kind == "session id":
+        session_id = _string(_required(resume, "session_id", place), f"{place}.resume.session_id")
+        if not session_id:
+            raise InvalidRecord(f"{place}.resume.session_id must not be empty")
+    return cast(CodexLaunch, cast(object, values))
 
 
 class SettleMessageNotSent(TypedDict):
@@ -376,6 +411,7 @@ class SessionShutdown(TypedDict):
     then: ShutdownContinuation
     force: StopTiming
     alerts: Literal["user", "none"]
+    probe: bool
     session: Session
     workers: list[Session]
     timers: list[TimerRestore]
@@ -384,6 +420,8 @@ class SessionShutdown(TypedDict):
     progress: SessionProgress
     trail: list[ProgressStep]
     stop_issues: list[SessionStopIssue]
+    # Presentation can fail after Claude starts; these issues do not warrant another launch.
+    restart_issues: NotRequired[list[str]]
     alerted_at: NotRequired[str]
     # The phone push for a form open in the session's pane; the user is told once.
     form_alerted_at: NotRequired[str]
@@ -407,6 +445,12 @@ class AccountHold(TypedDict):
     request_id: str
     requested_by: RequestOrigin
     then: ShutdownContinuation
+    # Legacy holds name only request_id; legacy incomplete registration stays held.
+    registration: NotRequired[Literal["in progress", "complete"]]
+    # New holds retain every covered request, including after its registration finishes.
+    request_ids: NotRequired[list[str]]
+    # A request stays here until its owner loop completes; exceptions leave it held.
+    registering_request_ids: NotRequired[list[str]]
 
 
 def stop_incomplete(saved: SessionShutdown) -> bool:
@@ -572,11 +616,13 @@ def _scope(value: object, place: str) -> _LegacyScope:
 
 def _request_origin(value: object, place: str) -> RequestOrigin:
     values = _mapping(value, place)
-    kind = _kind(values, place, frozenset({"session", "terminal"}))
+    kind = _kind(values, place, frozenset({"session", "terminal", "snapshot"}))
     if kind == "session":
         _ = _string(
             _required(values, "session_id", place), f"{place}.session_id"
         )
+    elif kind == "snapshot":
+        _ = _utc_time(_required(values, "taken_at", place), f"{place}.taken_at")
     return cast(RequestOrigin, cast(object, values))
 
 
@@ -749,6 +795,27 @@ def _orchestration_stop_issue(
     return cast(_LegacyOrchestrationIssue, cast(object, values))
 
 
+def _recover_not_ready_stop(entry: _LegacySessionEntry) -> None:
+    """Recover only the old terminal outcome for a temporary readiness refusal."""
+    progress = entry["progress"]
+    issues = entry["stop_issues"]
+    if (progress["kind"] != "stop failed"
+            or progress["reason"] != "session or worker is not idle and ready"
+            or len(issues) != 1):
+        return
+    issue = issues[0]
+    if issue["kind"] != "not ready to stop":
+        return
+    if issue["progress"] == "waiting":
+        entry["progress"] = SessionWaiting(kind="waiting")
+    elif issue["progress"] == "ready":
+        entry["progress"] = SessionReadyToStop(kind="ready", at=issue["at"])
+    elif issue["progress"] == "held by usage limit":
+        entry["progress"] = SessionHeldByUsageLimit(kind="held by usage limit", at=issue["at"])
+    else:
+        entry["progress"] = _LegacyPassiveWorkerReady(kind="passive worker ready", at=issue["at"])
+
+
 def _entry(value: object, place: str) -> _LegacySessionEntry:
     values = _mapping(value, place)
     # Earlier records duplicated this session field on the entry.
@@ -778,7 +845,9 @@ def _entry(value: object, place: str) -> _LegacySessionEntry:
         _session_stop_issue(issue, f"{place}.stop_issues[{index}]", legacy=True)
         for index, issue in enumerate(stop_issue_values)
     ]
-    return cast(_LegacySessionEntry, cast(object, values))
+    checked = cast(_LegacySessionEntry, cast(object, values))
+    _recover_not_ready_stop(checked)
+    return checked
 
 
 def _record(value: object, place: str) -> _LegacyShutdownRecord:
@@ -996,11 +1065,10 @@ def _session_shutdown(value: object, place: str) -> SessionShutdown:
             values[field] = canonical_label(cast(str, values[field]))
     if "target" in values:
         target = _string(values["target"], f"{place}.target")
-        if target == "default":
-            from scripts.whoami.account import claude_account
-            home = claude_account(Path.home() / ".claude")
-            parsed_home = parse_account_label(home.label) if home is not None else None
-            target = parsed_home.label if isinstance(parsed_home, NumberedAccountLabel) else "~/.claude"
+        if target in ("default", "~/.claude", str(Path.home() / ".claude")):
+            resolver = cast(HistoricalAccountResolver, cast(object, import_module("scripts.accounts.accounts")))
+            resolved = resolver.resolve_history_label(target, _string(values["requested_at"], f"{place}.requested_at"))
+            target = resolved.label if isinstance(resolved, ResolvedHistoryLabel) else "~/.claude"
         parsed = parse_account_label(target)
         if target != "~/.claude" and not (isinstance(parsed, NumberedAccountLabel) and parsed.tool == "claude"):
             raise InvalidRecord(f"{place}.target must name a numbered Claude account")
@@ -1016,6 +1084,10 @@ def _session_shutdown(value: object, place: str) -> SessionShutdown:
         text = _string(_required(values, field, place), f"{place}.{field}")
         if text not in allowed:
             raise InvalidRecord(f"{place}.{field} is invalid")
+    probe = values.get("probe", False)
+    if not isinstance(probe, bool):
+        raise InvalidRecord(f"{place}.probe must be a boolean")
+    values["probe"] = probe
     _ = _required(values, "stop_issues", place)
     fields = _entry(values, place)
     values["progress"] = _progress(values["progress"], f"{place}.progress")
@@ -1029,6 +1101,8 @@ def _session_shutdown(value: object, place: str) -> SessionShutdown:
         trail.append(ProgressStep(at=at, kind=kind, detail=detail))
     values["trail"] = trail
     values["stop_issues"] = [_session_stop_issue(issue, f"{place}.stop_issues") for issue in fields["stop_issues"]]
+    if "restart_issues" in values:
+        values["restart_issues"] = _strings(values["restart_issues"], f"{place}.restart_issues")
     if fields["session"]["kind"] == "worker":
         raise InvalidRecord(f"{place}.session must not be a worker")
     _ = _session_filename(fields["session"]["session_id"])
@@ -1059,6 +1133,18 @@ def _session_shutdown(value: object, place: str) -> SessionShutdown:
 def _account_hold(value: object, place: str) -> AccountHold:
     values = _mapping(value, place)
     _shutdown_request_fields(values, place)
+    if "registration" in values and values["registration"] not in ("in progress", "complete"):
+        raise InvalidRecord(f"{place}.registration must be in progress or complete")
+    request_ids = {cast(str, values["request_id"])}
+    if "request_ids" in values:
+        ids = _strings(values["request_ids"], f"{place}.request_ids")
+        if not all(ids) or len(set(ids)) != len(ids) or not request_ids.issubset(ids):
+            raise InvalidRecord(f"{place}.request_ids must be unique nonempty ids including request_id")
+        request_ids = set(ids)
+    if "registering_request_ids" in values:
+        ids = _strings(values["registering_request_ids"], f"{place}.registering_request_ids")
+        if len(set(ids)) != len(ids) or not set(ids).issubset(request_ids):
+            raise InvalidRecord(f"{place}.registering_request_ids must be unique ids from request_ids")
     return cast(AccountHold, cast(object, values))
 
 
@@ -1181,7 +1267,7 @@ def _convert_session(record: _LegacyShutdownRecord, entry: _LegacySessionEntry) 
         requested_at=record["requested_at"], requested_by=record["requested_by"],
         request_id=f"legacy-{record['machine']}-{record['requested_at']}",
         hold="account" if record["scope"]["kind"] == "all account sessions" else "session",
-        then=_legacy_continuation(record), force=record["force"], alerts="user",
+        then=_legacy_continuation(record), force=record["force"], alerts="user", probe=False,
         session=session, workers=workers, timers=entry["timers"],
         settle_message=entry["settle_message"], where=entry["where"],
         progress=cast(SessionProgress, cast(object, progress)), trail=[], stop_issues=[issue for issue in entry["stop_issues"] if issue["kind"] != "worker still live"],
@@ -1334,6 +1420,43 @@ def archive_session(login: str, session_id: str) -> None:
         os.replace(path, target)
 
 
+def restarted_history() -> list[SessionShutdown]:
+    """Read completed per-session history once, ignoring each unreadable entry.
+
+    Archived target labels are evidence, not requests to resolve today's accounts.
+    """
+    root = _state_root()
+    if not _record_directory(root):
+        return []
+    found: list[SessionShutdown] = []
+    for directory in root.iterdir():
+        try:
+            if directory.name == "snapshots" or not _record_directory(directory):
+                continue
+            history = directory / "history"
+            if not _record_directory(history):
+                continue
+            paths = list(history.iterdir())
+        except (OSError, ValueError):
+            continue
+        for path in paths:
+            try:
+                if path.suffix != ".json" or not _regular_record(path):
+                    continue
+                values = _mapping(cast(object, json.loads(path.read_text(encoding="utf-8"))), str(path))
+                _ = _worker_record_names(values)
+                target = values.pop("target", None)
+                saved = _session_shutdown(values, str(path))
+                _check_account(directory.name, saved["login"], path)
+                if target is not None:
+                    saved["target"] = canonical_label(_string(target, f"{path}.target"))
+                if saved["progress"]["kind"] == "restarted":
+                    found.append(saved)
+            except (OSError, UnicodeError, ValueError):
+                continue
+    return found
+
+
 def account_hold(login: str) -> AccountHold | None:
     """Read an explicit hold or an old account-wide record in a held state."""
     if _existing_account_directory(login) is None:
@@ -1386,6 +1509,58 @@ def set_account_hold(hold: AccountHold) -> None:
                 existing = _account_hold(_read_json(path), str(path))
                 _check_account(checked["login"], existing["login"], path)
             _write_record(path, checked)
+
+
+def _hold_request_ids(hold: AccountHold) -> set[str]:
+    return set(hold.get("request_ids", [hold["request_id"]]))
+
+
+def _registering_request_ids(hold: AccountHold) -> set[str]:
+    pending = set(hold.get("registering_request_ids", []))
+    if hold.get("registration", "complete") == "in progress":
+        pending.add(hold["request_id"])
+    return pending
+
+
+def register_account_hold_request(hold: AccountHold, *, account_wide: bool) -> None:
+    """Join an existing hold, or create an account-wide hold, before adding records."""
+    checked = _account_hold(copy.deepcopy(hold), "hold")
+    login, request_id = checked["login"], checked["request_id"]
+    with launch_barrier():
+        with _session_store_lock(login, create=True) as directory:
+            path = directory / "hold.json"
+            if _regular_record(path):
+                checked = _account_hold(_read_json(path), str(path))
+                _check_account(login, checked["login"], path)
+            elif not account_wide:
+                return
+            requests = _hold_request_ids(checked)
+            requests.update(saved["request_id"] for saved in _session_records_in_directory(directory, login))
+            requests.add(request_id)
+            pending = _registering_request_ids(checked)
+            pending.add(request_id)
+            checked["request_ids"] = sorted(requests)
+            checked["registering_request_ids"] = sorted(pending)
+            _write_record(path, checked)
+
+
+def complete_account_hold_registration(login: str, request_id: str) -> None:
+    """Finish only this request's registration, leaving overlapping requests held."""
+    if _existing_account_directory(login) is None:
+        return
+    with _session_store_lock(login, write=True) as directory:
+        path = directory / "hold.json"
+        if not _regular_record(path):
+            return
+        held = _account_hold(_read_json(path), str(path))
+        _check_account(login, held["login"], path)
+        pending = _registering_request_ids(held)
+        if request_id in pending:
+            pending.remove(request_id)
+            held["registering_request_ids"] = sorted(pending)
+            if held["request_id"] == request_id and "registration" in held:
+                held["registration"] = "complete"
+            _write_record(path, held)
 
 
 def clear_account_hold(login: str) -> None:
@@ -1594,7 +1769,11 @@ class ConductorUnavailable:
 
 
 def clear_finished_account_hold(login: str, *, request_ids: tuple[str, ...] = ()) -> None:
-    """Clear the current hold only after its last session record leaves."""
+    """Clear the owning request's hold once every covered request is finished.
+
+    Filtered cleanup must name the owner. Joined requests add protection while
+    registering or holding records; finishing one never authorizes release.
+    """
     if _existing_account_directory(login) is None:
         return
     with _session_store_lock(login, write=True) as directory:
@@ -1603,9 +1782,12 @@ def clear_finished_account_hold(login: str, *, request_ids: tuple[str, ...] = ()
             return
         held = _account_hold(_read_json(path), str(path))
         _check_account(login, held["login"], path)
+        if _registering_request_ids(held):
+            return
+        covered = _hold_request_ids(held)
         if request_ids and held["request_id"] not in request_ids:
             return
-        if not any(saved["request_id"] == held["request_id"]
+        if not any(saved["request_id"] in covered
                    for saved in _session_records_in_directory(directory, login)):
             path.unlink()
 
@@ -1661,3 +1843,234 @@ def conductor_lock(login: str) -> Generator[ConductorAcquired | ConductorAlready
             yield ConductorAcquired()
         finally:
             fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+
+
+def _snapshot_session(value: object, place: str) -> SnapshotSession:
+    values = _mapping(value, place)
+    agent = _string(_required(values, "agent", place), f"{place}.agent")
+    if agent not in {"claude", "codex"}:
+        raise InvalidRecord(f"{place}.agent is invalid")
+    try:
+        owner = parse_session(_required(values, "session", place), f"{place}.session")
+        workers = [parse_session(worker, f"{place}.workers[{index}]") for index, worker in enumerate(
+            _items(_required(values, "workers", place), f"{place}.workers"))]
+    except ValueError as error:
+        raise InvalidRecord(str(error)) from error
+    if owner["kind"] == "worker":
+        raise InvalidRecord(f"{place}.session must be an owner")
+    for worker in workers:
+        if (worker["kind"] != "worker" or worker["owner"]["kind"] != "director"
+                or worker["owner"]["session_id"] != owner["session_id"]):
+            raise InvalidRecord(f"{place}.workers must belong to this owner")
+    values["session"], values["workers"] = owner, workers
+    values["timers"] = [_timer(timer, f"{place}.timers") for timer in
+                       _items(_required(values, "timers", place), f"{place}.timers")]
+    _ = _utc_time(_required(values, "last_seen", place), f"{place}.last_seen")
+    if "crash" in values and values["crash"] not in {"reboot", "host gone"}:
+        raise InvalidRecord(f"{place}.crash is invalid")
+    if "boot_id" in values:
+        if not _string(values["boot_id"], f"{place}.boot_id"):
+            raise InvalidRecord(f"{place}.boot_id must not be empty")
+    if "host_process" in values:
+        identity = _mapping(values["host_process"], f"{place}.host_process")
+        if identity.get("kind") == "process":
+            if (not isinstance(identity.get("pid"), int) or isinstance(identity.get("pid"), bool)
+                    or cast(int, identity["pid"]) <= 0):
+                raise InvalidRecord(f"{place}.host_process.pid must be positive")
+            if not _string(_required(identity, "proc_start", place), f"{place}.host_process.proc_start"):
+                raise InvalidRecord(f"{place}.host_process.proc_start must not be empty")
+        elif identity.get("kind") != "not recorded":
+            raise InvalidRecord(f"{place}.host_process.kind is invalid")
+    if _string(_required(values, "state", place), f"{place}.state") not in {"running", "unresolved"}:
+        raise InvalidRecord(f"{place}.state is invalid")
+    if agent == "codex":
+        if owner["kind"] != "top-level" or workers:
+            raise InvalidRecord(f"{place}: Codex standalones must be top-level without workers")
+        values["codex"] = _codex_launch(_required(values, "codex", place), f"{place}.codex")
+    elif "codex" in values:
+        raise InvalidRecord(f"{place}: a Claude snapshot must not carry Codex launch metadata")
+    return cast(SnapshotSession, cast(object, values))
+
+
+def parse_snapshot(value: object) -> RecoverySnapshot:
+    """Validate a recovery snapshot, including the agent tag at its wire boundary."""
+    values = _mapping(copy.deepcopy(value), "snapshot")
+    login = _string(_required(values, "login", "snapshot"), "snapshot.login")
+    values["login"] = _safe_login(login).casefold()
+    for field in ("machine", "label"):
+        _ = _string(_required(values, field, "snapshot"), f"snapshot.{field}")
+    values["label"] = canonical_label(cast(str, values["label"]))
+    _ = _utc_time(_required(values, "taken_at", "snapshot"), "snapshot.taken_at")
+    if "boot_id" in values and not _string(values["boot_id"], "snapshot.boot_id"):
+        raise InvalidRecord("snapshot.boot_id must not be empty")
+    entries = [_snapshot_session(item, f"snapshot.sessions[{index}]") for index, item in enumerate(
+        _items(_required(values, "sessions", "snapshot"), "snapshot.sessions"))]
+    ids = [item["session"]["session_id"] for item in entries]
+    if not all(ids) or len(set(ids)) != len(ids):
+        raise InvalidRecord("snapshot.sessions must have unique nonempty session ids")
+    values["sessions"] = entries
+    return cast(RecoverySnapshot, cast(object, values))
+
+
+def _snapshot_path(login: str) -> Path:
+    return _state_root() / "snapshots" / (_safe_login(login).casefold() + ".json")
+
+
+def _read_snapshot(login: str) -> RecoverySnapshot | NoRecoverySnapshot:
+    path = _snapshot_path(login)
+    _ = _record_directory(path.parent)
+    if not _regular_record(path):
+        return NoRecoverySnapshot()
+    saved = parse_snapshot(_read_json(path))
+    _check_account(login, saved["login"], path)
+    return saved
+
+
+def read_snapshot(login: str) -> RecoverySnapshot | NoRecoverySnapshot:
+    """Read one snapshot under the same login lock as its shutdown records."""
+    if not _regular_record(_snapshot_path(login)):
+        return NoRecoverySnapshot()
+    with _session_store_lock(login, create=True):
+        return _read_snapshot(login)
+
+
+def _write_snapshot(saved: RecoverySnapshot) -> None:
+    path = _snapshot_path(saved["login"])
+    _ = _record_directory(path.parent, create=True)
+    _ = _regular_record(path)
+    _write_record(path, saved)
+
+
+def write_snapshot(snapshot: RecoverySnapshot) -> None:
+    """Atomically replace one validated snapshot under its login's lock."""
+    checked = parse_snapshot(snapshot)
+    with _session_store_lock(checked["login"], create=True):
+        _write_snapshot(checked)
+
+
+def all_snapshots() -> list[RecoverySnapshot]:
+    root = _state_root() / "snapshots"
+    if not _record_directory(root):
+        return []
+    try:
+        paths = sorted(root.iterdir())
+    except OSError as error:
+        raise InvalidRecord(f"{root} cannot be read: {error}") from error
+    found: list[RecoverySnapshot] = []
+    for path in paths:
+        if path.suffix != ".json":
+            continue
+        saved = read_snapshot(path.stem)
+        if not isinstance(saved, NoRecoverySnapshot):
+            found.append(saved)
+    return found
+
+
+def merge_snapshots(observed: CompleteInventory | PartialInventory, taken_at: str) -> list[RecoverySnapshot]:
+    """Retain missing sessions only with a reboot or host-loss signal."""
+    if isinstance(observed, PartialInventory):
+        return []
+    _ = _utc_time(taken_at, "snapshot.taken_at")
+    current: dict[str, list[SnapshotSession]] = {}
+    for login, entries in observed.sessions.items():
+        current.setdefault(_safe_login(login).casefold(), []).extend(entries)
+    current_codex = {(item["session"]["pid"], item["session"]["proc_start"])
+                     for entries in current.values() for item in entries if item["agent"] == "codex"}
+    labels = {login.casefold(): label for login, label in observed.labels.items()}
+    logins = {saved["login"] for saved in all_snapshots()} | set(current)
+    owned_ids = {saved["session"]["session_id"] for saved in all_session_records()}
+    merged: list[RecoverySnapshot] = []
+    for login in sorted(logins):
+        with _session_store_lock(login, create=True):
+            previous = _read_snapshot(login)
+            seen = {item["session"]["session_id"]: copy.deepcopy(item) for item in current.get(login, [])
+                    if item["session"]["session_id"] not in owned_ids}
+            for item in seen.values():
+                item["last_seen"], item["state"] = taken_at, "running"
+                if "crash" in item:
+                    del item["crash"]
+                if isinstance(observed.boot, KnownBoot):
+                    item["boot_id"] = observed.boot.boot_id
+            if not isinstance(previous, NoRecoverySnapshot):
+                for item in previous["sessions"]:
+                    identity = item["session"]["session_id"]
+                    same_process = (item["agent"] == "codex"
+                                    and isinstance(observed.boot, KnownBoot)
+                                    and item.get("boot_id") == observed.boot.boot_id
+                                    and (item["session"]["pid"], item["session"]["proc_start"]) in current_codex)
+                    rebooted = isinstance(observed.boot, KnownBoot) and "boot_id" in item and item["boot_id"] != observed.boot.boot_id
+                    if (identity not in seen and identity not in owned_ids and not same_process
+                            and ("crash" in item or rebooted or (login, identity) in observed.gone_hosts)):
+                        item["state"] = "unresolved"
+                        if rebooted:
+                            item["crash"] = "reboot"
+                        elif (login, identity) in observed.gone_hosts:
+                            item["crash"] = "host gone"
+                        seen[identity] = item
+            label = labels.get(login, login if isinstance(previous, NoRecoverySnapshot) else previous["label"])
+            saved = parse_snapshot(RecoverySnapshot(machine=observed.machine, login=login, label=label,
+                                                     taken_at=taken_at, sessions=list(seen.values())))
+            if isinstance(observed.boot, KnownBoot):
+                saved["boot_id"] = observed.boot.boot_id
+            _write_snapshot(saved)
+            merged.append(saved)
+    return merged
+
+
+@dataclass(frozen=True)
+class SnapshotAcknowledged:
+    """The matching recovery entry was removed."""
+
+
+@dataclass(frozen=True)
+class SnapshotAlreadyAbsent:
+    """There was no matching recovery entry to remove."""
+
+
+def acknowledge_snapshot(login: str, session_id: str) -> SnapshotAcknowledged | SnapshotAlreadyAbsent:
+    """Remove exactly one restored or forgotten session, under its login's lock."""
+    with _session_store_lock(login, create=True):
+        saved = _read_snapshot(login)
+        if isinstance(saved, NoRecoverySnapshot):
+            return SnapshotAlreadyAbsent()
+        retained = [item for item in saved["sessions"] if item["session"]["session_id"] != session_id]
+        if len(retained) == len(saved["sessions"]):
+            return SnapshotAlreadyAbsent()
+        saved["sessions"] = retained
+        _write_snapshot(saved)
+        return SnapshotAcknowledged()
+
+
+def snapshot_restore_record(snapshot: RecoverySnapshot, entry: SnapshotClaudeSession) -> SessionShutdown:
+    """Build a validated recovery request, also usable for a dry run."""
+    checked = parse_snapshot(snapshot)
+    item = _snapshot_session(copy.deepcopy(entry), "snapshot session")
+    if item["agent"] != "claude":
+        raise InvalidRecord("Codex snapshots require the Codex restore path, not a Claude shutdown record")
+    at = checked["taken_at"]
+    saved = SessionShutdown(
+        login=checked["login"], label=checked["label"], machine=checked["machine"],
+        requested_at=at, request_id=f"recovery-{at}", requested_by=FromSnapshot(kind="snapshot", taken_at=at),
+        hold="session", then="restart", force="now", alerts="user", probe=item["session"]["probe"],
+        session=item["session"], workers=item["workers"], timers=item["timers"],
+        settle_message=SettleMessageNotSent(kind="not sent"), where=WhereNotSaid(kind="not said"),
+        progress=SessionAlreadyGone(kind="already gone", at=at), trail=[], stop_issues=[],
+    )
+    return _session_shutdown(saved, "recovery record")
+
+
+def materialize_snapshot(snapshot: RecoverySnapshot, entry: SnapshotClaudeSession) -> SessionShutdown:
+    """Persist a recovery request before launch; an existing request takes precedence."""
+    saved = snapshot_restore_record(snapshot, entry)
+    login, identity = saved["login"], saved["session"]["session_id"]
+    with launch_barrier():
+        with _session_store_lock(login, create=True) as directory:
+            for existing in _session_records_in_directory(directory, login):
+                if existing["session"]["session_id"] == identity:
+                    return existing
+            target = directory / "sessions" / _session_filename(identity)
+            _ = _record_directory(target.parent, create=True)
+            if _regular_record(target):
+                raise InvalidRecord(f"{target} is used by a different session id")
+            _write_record(target, saved)
+    return saved
