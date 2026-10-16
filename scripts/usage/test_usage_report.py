@@ -9,12 +9,14 @@ import sqlite3
 import subprocess
 import sys
 import unittest
+from unittest import mock
 from contextlib import closing
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import TypedDict, cast, final, override
 from zoneinfo import ZoneInfo
 
+from scripts.usage import collect, weights
 from scripts.usage.test_collect import FIXTURES as COLLECT_FIXTURES, MacStreamReport, REPOSITORY, SNAPSHOT_COMMIT_SCRIPT, SshBehavior
 from scripts.usage.test_outcomes import OutcomeFixture
 
@@ -22,8 +24,13 @@ from scripts.usage.test_outcomes import OutcomeFixture
 FIXTURES = Path(__file__).with_name("fixtures") / "report"
 REPORT = Path(__file__).with_name("usage_report.py")
 METRICS = ("weighted", "weighted_per_checkpoint", "before_first_edit_share", "cache_read_share",
-           "output_share", "compactions_per_thread", "weighted_per_finding_closed",
+           "output_share", "compactions_per_thread", "compaction_reread_share", "weighted_per_finding_closed",
            "weighted_per_review_round", "account_switches")
+
+
+def setUpModule() -> None:
+    """The times these tests expect are Pacific; the user's zone setting must not change them."""
+    unittest.enterModuleContext(mock.patch.dict(os.environ, {"USER_ZONE": "America/Los_Angeles"}))
 
 
 class ReportFunctionCalls(TypedDict):
@@ -37,6 +44,38 @@ class EquivalentSideReport(TypedDict):
     by: str
     additive: str
     general: str
+
+
+class ModelWeightTests(unittest.TestCase):
+    def test_sol_and_astra_weights_cover_all_dates_and_token_kinds(self) -> None:
+        for model in ("gpt-6-sol", "gpt-6-astra"):
+            for at in (datetime.min.replace(tzinfo=timezone.utc), "1900-01-01T00:00:00Z",
+                       "2026-10-12T00:00:00Z", datetime.max.replace(tzinfo=timezone.utc)):
+                with self.subTest(model=model, at=at):
+                    entry = weights.weights_at(model, at)
+                    self.assertEqual(entry.model, model)
+                    self.assertEqual(entry.effective_from, datetime.min.replace(tzinfo=timezone.utc))
+                    self.assertEqual((entry.cached, entry.cache_write_5m, entry.cache_write_1h, entry.output),
+                                     (0.1, 1.25, 1.25, 5))
+                    row = {"model": model, "input": 20, "cache_read": 30,
+                           "cache_write_5m": 4, "cache_write_1h": 8, "output": 2}
+                    # 20 + 30*.1 + 4*1.25 + 8*1.25 + 2*5 = 48.
+                    self.assertEqual(weights.weighted(row, at), 48)
+
+    def test_sql_weights_agree_with_python_for_both_models_from_the_start_of_time(self) -> None:
+        relation = weights.sql_weights("t.model", "t.at")
+        query = ("WITH requests AS (SELECT ? AS model, ? AS at), weight_entries AS ("
+                 + relation.entries + ") SELECT w.cached, w.write_5m, w.write_1h, w.output, "
+                 + "20 + 30*w.cached + 4*w.write_5m + 8*w.write_1h + 2*w.output "
+                 + "FROM requests t LEFT JOIN weight_entries w ON w.weight_entry = " + relation.active_entry)
+        with closing(sqlite3.connect(":memory:")) as db:
+            for model in ("gpt-6-sol", "gpt-6-astra"):
+                for at in (datetime.min.replace(tzinfo=timezone.utc).isoformat(), "2026-10-12T00:00:00+00:00"):
+                    with self.subTest(model=model, at=at):
+                        entry = weights.weights_at(model, at)
+                        actual = cast(tuple[float, float, float, float, float], db.execute(query, (model, at)).fetchone())
+                        self.assertEqual(actual, (entry.cached, entry.cache_write_5m, entry.cache_write_1h,
+                                                  entry.output, 48))
 
 
 class ReportFixture(OutcomeFixture):
@@ -132,6 +171,198 @@ class ReportFixture(OutcomeFixture):
 
 @final
 class UsageReportTests(ReportFixture):
+    def test_new_model_turns_are_weighted_and_the_invented_model_stays_unweighted(self) -> None:
+        self.clear_metric_turns()
+        for model in ("gpt-6-sol", "gpt-6-astra", "invented-unweighted-model"):
+            self.metric_request(model, 0, 20, 30, model=model)
+        with closing(sqlite3.connect(self.db_path)) as db, db:
+            _ = db.execute("UPDATE turns SET cache_write_5m = 4, cache_write_1h = 8")
+        result = self.report("weighted", "--by", "model")
+        self.assertEqual((result.returncode, result.stderr), (0, ""))
+        # Each known model: 20 + 30*.1 + 4*1.25 + 8*1.25 + 10*5 = 88.
+        for model in ("gpt-6-sol", "gpt-6-astra"):
+            self.assertIn(f"| {model} | 88 | 1 | 88 |\n", result.stdout)
+        self.assertIn("| invented-unweighted-model | unweighted | 1 | unweighted |\n", result.stdout)
+        self.assertIn("Unweighted:\n\n| model | turns |\n| --- | --- |\n| invented-unweighted-model | 1 |\n",
+                      result.stdout)
+
+    def metric_request(self, thread: str, minute: int, uncached: int, cached: int = 0, *,
+                       key: str = "rollout-metric.jsonl:100", role: str = "impl",
+                       model: str = "gpt-5.6-sol", parent: str = "", machine: str = "natedev",
+                       activity: str = "work", wait_action: str | None = None) -> None:
+        with closing(sqlite3.connect(self.db_path)) as db, db:
+            _ = db.execute("INSERT INTO turns VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                           (machine, "codex", "worker", parent, thread, key,
+                            f"2026-10-11T12:{minute:02d}:00+00:00", model, "medium",
+                            uncached, 0, 0, cached, 10, 1, role, None, "recorded", "not_applicable",
+                            activity, wait_action))
+
+    def activity_requests(self) -> None:
+        """gpt-5.6-sol weighs cached input 0.1 and output 8; every request has 10 output, 80 weighted."""
+        self.clear_metric_turns()
+        self.metric_request("worker", 0, 100, 1000, key="rollout-metric.jsonl:0")  # 100 + 100 + 80 = 280
+        self.metric_request("worker", 1, 20, 200, key="rollout-metric.jsonl:1",
+                            activity="wait", wait_action="empty write_stdin")  # 20 + 20 + 80 = 120
+        self.metric_request("worker", 2, 0, key="rollout-metric.jsonl:2", activity="status")  # 80
+        self.metric_request("reviewer", 3, 50, role="review", key="rollout-metric.jsonl:3",
+                            activity="unclassified")  # 50 + 80 = 130
+
+    def table_rows(self, *arguments: str) -> list[list[str]]:
+        result = self.report(*arguments)
+        self.assertEqual((result.returncode, result.stderr), (0, ""))
+        lines = result.stdout.split("\nCoverage\n", 1)[0].splitlines()
+        return [[cell.strip() for cell in line.strip("|").split("|")] for line in lines
+                if line.startswith("| ") and not line.startswith("| ---")][1:]
+
+    def test_wait_status_and_context_shares_divide_their_weighted_parts_by_weighted_tokens(self) -> None:
+        self.activity_requests()
+        self.assertEqual(self.table_rows("wait_share", "--by", "role"),
+                         [["impl", "120", "480", "25.0%"], ["review", "0", "130", "0.0%"]])
+        self.assertEqual(self.table_rows("status_share", "--by", "role"),
+                         [["impl", "80", "480", "16.7%"], ["review", "0", "130", "0.0%"]])
+        self.assertEqual(self.table_rows("context_share", "--by", "role"),
+                         [["impl", "120", "480", "25.0%"], ["review", "0", "130", "0.0%"]])
+
+    def test_activity_dimension_groups_every_turn_metric_and_coverage_counts_unclassified_turns(self) -> None:
+        self.activity_requests()
+        self.assertEqual(self.table_rows("weighted", "--by", "activity"),
+                         [["status", "80", "1", "80"], ["unclassified", "130", "1", "130"],
+                          ["wait", "120", "1", "120"], ["work", "280", "1", "280"]])
+        self.assertEqual(self.table_rows("wait_share", "--by", "role,activity")[1],
+                         ["impl", "wait", "120", "120", "100.0%"])
+        result = self.report("wait_share")
+        self.assertIn("Review turns with unrecorded lens: 0.\nTurns with unclassified activity: 1.\n", result.stdout)
+        refused = self.report("compactions_per_thread", "--by", "activity")
+        self.assertEqual((refused.returncode, refused.stdout), (2, ""))
+        self.assertIn("cannot group by 'activity'", refused.stderr)
+
+    def test_activity_reads_the_same_through_a_general_aggregate(self) -> None:
+        self.activity_requests()
+        script = """
+import argparse
+from contextlib import redirect_stdout
+from io import StringIO
+from pathlib import Path
+from scripts.usage.usage_report import METRICS, Metric, ReportFormat, TurnAggregate, main
+
+parser = argparse.ArgumentParser()
+parser.add_argument('--db', type=Path, required=True)
+parser.add_argument('--production-docs', type=Path, required=True)
+paths = parser.parse_args()
+METRICS['wait_share'] = Metric('wait_share', METRICS['wait_share'].description,
+    TurnAggregate('wait', "sum(CASE WHEN activity = 'wait' THEN weighted ELSE 0 END)", weighted=True),
+    TurnAggregate('weighted', 'sum(weighted)', weighted=True), ReportFormat.SHARE)
+output = StringIO()
+with redirect_stdout(output):
+    assert main(['--db', str(paths.db), '--production-docs', str(paths.production_docs),
+                 'wait_share', '--by', 'role,activity']) == 0
+print(output.getvalue(), end='')
+"""
+        general = self.report_script(script)
+        self.assertEqual((general.returncode, general.stderr), (0, ""))
+        additive = self.report("wait_share", "--by", "role,activity")
+        self.assertEqual(general.stdout, additive.stdout)
+        self.assertIn("Turns with unclassified activity: 1.\n", general.stdout)
+
+    def metric_compaction(self, thread: str, minute: int) -> None:
+        with closing(sqlite3.connect(self.db_path)) as db, db:
+            _ = db.execute("INSERT INTO compactions VALUES (?,?,?,?,?)",
+                           ("natedev", "codex", "", thread, f"2026-10-11T12:{minute:02d}:00+00:00"))
+
+    def clear_metric_turns(self) -> None:
+        with closing(sqlite3.connect(self.db_path)) as db, db:
+            _ = db.execute("DELETE FROM turns")
+            _ = db.execute("DELETE FROM compactions")
+
+    def metric_cells(self, *arguments: str) -> dict[tuple[str, str], list[str]]:
+        result = self.report("compaction_reread_share", *arguments)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stderr, "")
+        lines = result.stdout.split("\nCoverage\n", 1)[0].splitlines()
+        return {(cells[0], cells[1]): cells[2:] for line in lines if line.startswith("| ")
+                and not line.startswith(("| role |", "| ---"))
+                if (cells := [cell.strip() for cell in line.strip("|").split("|")])}
+
+    def test_compaction_reread_sums_only_first_positive_requests_in_text_key_order(self) -> None:
+        self.clear_metric_turns()
+        self.metric_compaction("worker", 0)
+        self.metric_request("worker", 0, 999, key="rollout-metric.jsonl:0")  # Equal at is not after.
+        self.metric_request("worker", 1, 0, key="rollout-metric.jsonl:1")
+        # :100 sorts before :20; insert the wrong candidate first.
+        self.metric_request("worker", 2, 70, 30, key="rollout-metric.jsonl:20")
+        self.metric_request("worker", 2, 20, 10, key="rollout-metric.jsonl:100")
+        self.metric_compaction("worker", 3)
+        self.metric_request("worker", 4, 40, 20, key="rollout-metric.jsonl:200")
+        self.metric_compaction("worker", 5)  # No later request.
+        # Same id on another machine or under a parent must never become its successor.
+        self.metric_request("worker", 1, 500, key="rollout-metric.jsonl:foreign", machine="mac")
+        self.metric_request("worker", 1, 600, key="rollout-metric.jsonl:child", parent="parent")
+        cells = self.metric_cells()[("impl", "gpt-5.6-sol")]
+        # Numerator 20+40=60, no cached input or output. Denominator includes every turn.
+        denominator = 1079 + 80 + 153 + 101 + 122 + 580 + 680
+        self.assertEqual(cells, ["60", f"{denominator:,}", f"{60 / denominator * 100:.1f}%"])
+
+    def test_compaction_reread_window_and_dimensions_come_from_the_request(self) -> None:
+        self.clear_metric_turns()
+        self.metric_request("worker", 0, 100, role="impl", key="rollout-metric.jsonl:0")
+        self.metric_compaction("worker", 1)
+        self.metric_request("worker", 2, 25, 100, role="review", model="gpt-6.1-sol",
+                            key="rollout-metric.jsonl:1")
+        self.metric_compaction("worker", 3)
+        self.metric_request("worker", 5, 400, role="impl", key="rollout-metric.jsonl:2")
+        cells = self.metric_cells("--since", "2026-10-11T12:02:00Z",
+                                  "--until", "2026-10-11T12:05:00Z", "--zone", "UTC")
+        self.assertEqual(cells, {("review", "gpt-6.1-sol"): ["25", "80", "31.2%"]})
+
+    def test_unweighted_first_request_is_counted_and_not_replaced_by_a_later_weighted_one(self) -> None:
+        self.clear_metric_turns()
+        self.metric_compaction("worker", 0)
+        self.metric_request("worker", 1, 30, model="invented-no-weight", key="rollout-metric.jsonl:1")
+        self.metric_request("worker", 2, 50, key="rollout-metric.jsonl:2")
+        result = self.report("compaction_reread_share")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("| invented-no-weight | 1 |", result.stdout)
+        self.assertIn("| impl | gpt-5.6-sol |", result.stdout)
+        cells = self.metric_cells()
+        self.assertEqual(cells[("impl", "gpt-5.6-sol")][-1], "0.0%")
+
+    def test_exact_reread_excludes_nonrecorded_first_requests_without_selecting_a_replacement(self) -> None:
+        for attribution in ("estimated", "unassigned"):
+            with self.subTest(attribution=attribution):
+                self.clear_metric_turns()
+                self.metric_compaction("worker", 0)
+                self.metric_request("worker", 1, 100, key="rollout-metric.jsonl:1")
+                self.metric_request("worker", 2, 1, key="rollout-metric.jsonl:2")
+                with closing(sqlite3.connect(self.db_path)) as db, db:
+                    _ = db.execute("UPDATE turns SET attribution = ? WHERE turn_key = ?",
+                                   (attribution, "rollout-metric.jsonl:1"))
+                # The recorded request costs 1 input + 10 output * 8, but is not the reread.
+                self.assertEqual(self.metric_cells("--exact")[("impl", "gpt-5.6-sol")][-2:],
+                                 ["81", "0.0%"])
+                self.assertEqual(self.metric_cells()[("impl", "gpt-5.6-sol")],
+                                 ["100", "261", "38.3%"])
+
+    def test_unknown_unit_reread_coverage_counts_rows_while_the_metric_sums_tokens(self) -> None:
+        self.clear_metric_turns()
+        self.metric_compaction("unmapped-worker", 0)
+        self.metric_request("unmapped-worker", 1, 1000)
+        self.assertEqual(self.rows("SELECT * FROM folders WHERE agent_id = 'unmapped-worker'"), [])
+        result = self.report("compaction_reread_share")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stderr, "")
+        self.assertIn("| impl | gpt-5.6-sol | 1000 | 1,080 | 92.6% |", result.stdout)
+        self.assertIn("Outcome rows with unknown unit (compaction_reread): 1.\n", result.stdout)
+
+    def test_reread_counts_a_shared_successor_once_per_request_across_threads(self) -> None:
+        self.clear_metric_turns()
+        for thread in ("first-worker", "second-worker"):
+            self.metric_compaction(thread, 0)
+            self.metric_compaction(thread, 1)
+            self.metric_request(thread, 2, 100, 20)
+        # Each thread contributes its own request once, even with identical projected values.
+        self.assertEqual(self.metric_cells()[("impl", "gpt-5.6-sol")],
+                         ["200", "364", "54.9%"])
+
     def test_report_reader_keeps_working_in_the_previous_journal_mode(self) -> None:
         with closing(sqlite3.connect(self.db_path)) as db:
             self.assertEqual(db.execute("PRAGMA journal_mode=DELETE").fetchone()[0], "delete")
@@ -459,7 +690,8 @@ print(json.dumps(reports))
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stderr, "")
         reports = cast(list[EquivalentSideReport], json.loads(result.stdout))
-        turn_metrics = tuple(metric for metric in METRICS if metric not in ("compactions_per_thread", "account_switches"))
+        turn_metrics = tuple(metric for metric in METRICS if metric not in (
+            "compactions_per_thread", "compaction_reread_share", "account_switches"))
         self.assertEqual([(row["metric"], row["by"]) for row in reports],
                          [(metric, by) for metric in turn_metrics
                           for by in ("role,model", "day,machine,unit,role,lens,model,effort")])
@@ -472,23 +704,26 @@ print(json.dumps(reports))
 
     def assert_version_refused_without_writing(self, version: int) -> None:
         with closing(sqlite3.connect(self.db_path)) as database, database:
-            if version == 6:
+            if version < collect.STORE_VERSION:
                 _ = database.execute("DROP TABLE folders")
             _ = database.execute(f"PRAGMA user_version = {version}")
         before = self.db_path.read_bytes()
         result = self.report("weighted")
         self.assertEqual(result.returncode, 1)
         self.assertEqual(result.stdout, "")
-        expected = (FIXTURES / "expected" / f"store-version-{version}.txt").read_text(encoding="utf-8")
+        reason = (f"store version {version} is older than report version {collect.STORE_VERSION}; run the collector once"
+                  if version < collect.STORE_VERSION else
+                  f"store version {version} is newer than report version {collect.STORE_VERSION}; this report is older than the store")
+        expected = f"usage_report: {reason}\n"
         self.assertEqual(result.stderr, expected)
         self.assertEqual(len(result.stderr.splitlines()), 1)
         self.assertEqual(self.db_path.read_bytes(), before)
 
     def test_older_store_names_its_version_and_requires_one_collection(self) -> None:
-        self.assert_version_refused_without_writing(6)
+        self.assert_version_refused_without_writing(collect.STORE_VERSION - 1)
 
     def test_newer_store_refuses_an_older_report_without_writing(self) -> None:
-        self.assert_version_refused_without_writing(8)
+        self.assert_version_refused_without_writing(collect.STORE_VERSION + 1)
 
     def test_large_stored_counts_report_raw_and_weighted_sums_without_overflow(self) -> None:
         for directory in (self.claude_root, self.codex_root, self.history):

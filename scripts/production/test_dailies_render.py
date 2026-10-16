@@ -4,11 +4,16 @@
 from __future__ import annotations
 
 import json
+import sys
+import signal
+import dailies_render
+from cli_fixture import invoke_cli
 import os
 import subprocess
 import tempfile
 import unittest
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import ClassVar, cast, override
 from unittest import mock
@@ -97,7 +102,7 @@ def holder(release: str = "unknown", name: str = "frame-time", since: str = "202
     return {"holder": name, "since": since, "for": purpose, "release_eta": release}
 
 
-def run(arguments: list[str], scratch: str, holders: list[dict[str, str]] | None = None) -> Run:
+def run(arguments: list[str], scratch: str, holders: list[dict[str, str]] | None = None, *, subprocess_cli: bool = False) -> Run:
     # HOME puts the renderer's AGENTS_DIR and READINGS_LOG under this test directory.
     (Path(scratch) / "rust/hanadocs/agents").mkdir(parents=True, exist_ok=True)
     (Path(scratch) / ".local/state/agent-notes").mkdir(parents=True, exist_ok=True)
@@ -105,14 +110,15 @@ def run(arguments: list[str], scratch: str, holders: list[dict[str, str]] | None
     hold_dir.mkdir(exist_ok=True)
     for index, record in enumerate(holders or []):
         _ = (hold_dir / f"holder-{index}").write_text(json.dumps(record) + "\n")
-    result = subprocess.run(
-        ["python3", str(SCRIPT), *arguments],
-        capture_output=True,
-        text=True,
-        check=False,
-        env={**os.environ, "HOME": scratch, "BUILD_HOLD_DIR": str(hold_dir),
-             "MAC_TEST_STATE_DIR": str(Path(scratch) / "mac-test")},
-    )
+    environment = {**os.environ, "HOME": scratch, "BUILD_HOLD_DIR": str(hold_dir),
+                   "MAC_TEST_STATE_DIR": str(Path(scratch) / "mac-test")}
+    if subprocess_cli:
+        result = subprocess.run([sys.executable, str(SCRIPT), *arguments], env=environment,
+                                capture_output=True, text=True, check=False, timeout=300)
+    else:
+        result = invoke_cli(dailies_render, lambda: dailies_render.main(arguments), arguments,
+                            environment, Path(scratch), production_state=True)
+
     return Run(result.returncode, result.stdout.splitlines(), result.stderr)
 
 
@@ -140,6 +146,57 @@ def timeline(lines: list[str]) -> list[str]:
 
 
 class ReportFooterTests(unittest.TestCase):
+    def test_outstanding_reader_preserves_full_questions_and_distinguishes_review_results(self) -> None:
+        question = "Session: demo\nAction: choose a route\n" + "Which route? " * 120
+        with tempfile.TemporaryDirectory() as scratch:
+            path = Path(scratch) / "outstanding.json"
+            _ = path.write_text(json.dumps([
+                {"since": AT, "text": "reminder"},
+                {"since": AT, "text": "facts needed", "question": question},
+                {"since": AT, "text": "route", "question": question, "reviewed": "Use the short route?"},
+                {"since": AT, "text": "review failed", "question": question,
+                 "review_unavailable": "reviewer unavailable", "after": "2026-10-04T12:00"},
+            ]))
+            items = dailies_render.read_outstanding(path)
+            self.assertIsInstance(items[0], dailies_render.OutstandingReminder)
+            awaiting = items[1]
+            self.assertIsInstance(awaiting, dailies_render.OutstandingQuestion)
+            assert isinstance(awaiting, dailies_render.OutstandingQuestion)
+            self.assertEqual(awaiting.question, question)
+            reviewed = items[2]
+            self.assertIsInstance(reviewed, dailies_render.ReviewedOutstandingQuestion)
+            assert isinstance(reviewed, dailies_render.ReviewedOutstandingQuestion)
+            self.assertEqual(reviewed.reviewed, "Use the short route?")
+            unavailable = items[3]
+            self.assertIsInstance(unavailable, dailies_render.ReviewUnavailableOutstandingQuestion)
+            assert isinstance(unavailable, dailies_render.ReviewUnavailableOutstandingQuestion)
+            self.assertEqual(unavailable.question, question)
+            self.assertEqual(unavailable.reason, "reviewer unavailable")
+            self.assertEqual(dailies_render.due(items, datetime.fromisoformat(AT)), items[:3])
+            self.assertEqual(dailies_render.due(items, datetime(2026, 10, 4, 12)), items)
+            output = self.lines(footer("--nothing-needed", "--outstanding", str(path)))
+            self.assertFalse(output[-1].endswith(" - nothing needed"))
+            self.assertFalse(any("Which route?" in line for line in output))
+
+    def test_outstanding_reader_refuses_conflicting_or_incomplete_review_evidence(self) -> None:
+        cases: list[dict[str, object]] = [
+            {"reviewed": "Choose now?"},
+            {"question": "Choose now?", "reviewed": "Choose now?", "review_unavailable": "offline"},
+            {"question": ""},
+            {"question": "Choose now?", "reviewed": 42},
+            {"question": "Choose now?", "review_unavailable": 42},
+            {"question": None},
+            {"question": "Choose now?", "reviewed": None},
+            {"question": "Choose now?", "review_unavailable": None},
+        ]
+        with tempfile.TemporaryDirectory() as scratch:
+            path = Path(scratch) / "outstanding.json"
+            for fields in cases:
+                with self.subTest(fields=fields):
+                    _ = path.write_text(json.dumps([{"since": AT, "text": "route", **fields}]))
+                    with self.assertRaises(dailies_render.InputError):
+                        _ = dailies_render.read_outstanding(path)
+
     def lines(self, result: Run) -> list[str]:
         self.assertEqual(result.code, 0, result.error)
         return result.lines
@@ -150,6 +207,71 @@ class ReportFooterTests(unittest.TestCase):
 
     def tail(self, result: Run) -> list[str]:
         return after_timeline(self.lines(result))
+
+    def test_render_calls_keep_home_configuration_separate_and_restore_the_caller(self) -> None:
+        caller_environment = os.environ.copy()
+        caller_directory = Path.cwd()
+        caller_arguments = sys.argv.copy()
+        caller_path = sys.path.copy()
+        caller_chart = dailies_render.CHART_CONF
+        caller_signals = {sig: signal.getsignal(sig) for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)}
+        with tempfile.TemporaryDirectory() as first, tempfile.TemporaryDirectory() as second:
+            for home, chart in ((first, "ascii"), (second, "default")):
+                result = run(["--chart", chart], home)
+                self.assertEqual(result.code, 0, result.error)
+                self.assertIn(str(Path(home) / ".local/state/showrunner/dailies.conf"), result.error)
+            self.assertIn("ascii", (Path(first) / ".local/state/showrunner/dailies.conf").read_text())
+            self.assertIn("default", (Path(second) / ".local/state/showrunner/dailies.conf").read_text())
+        self.assertEqual(os.environ, caller_environment)
+        self.assertEqual(Path.cwd(), caller_directory)
+        self.assertEqual(sys.argv, caller_arguments)
+        self.assertEqual(sys.path, caller_path)
+        self.assertEqual(dailies_render.CHART_CONF, caller_chart)
+        self.assertEqual({sig: signal.getsignal(sig) for sig in caller_signals}, caller_signals)
+
+    def test_cold_imported_production_paths_return_to_the_callers_home_after_each_case(self) -> None:
+        with tempfile.TemporaryDirectory() as scratch:
+            caller = Path(scratch) / "caller"
+            caller.mkdir()
+            environment = {**os.environ, "HOME": str(caller)}
+            for name in ("SHOWRUNNERS_CONFIG", "NOTIFIER_STATE_DIR", "NOTIFIER_SESSIONS_DIR",
+                         "SHOWRUNNER_STATE_DIR", "SHOWRUNNERS_SESSIONS", "SHOWRUNNERS_SEND"):
+                _ = environment.pop(name, None)
+            program = '''import os, sys
+from pathlib import Path
+from types import ModuleType
+sys.path.insert(0, str(Path.cwd()))
+from cli_fixture import invoke_cli
+assert "showrunners" not in sys.modules
+assert "dailies_render" not in sys.modules
+caller = Path.home()
+caller_path = sys.path.copy()
+command = ModuleType("fixture_command")
+command.__file__ = "fixture_command.py"
+def paths(home):
+    import dailies_render, showrunners, note_file
+    assert dailies_render.CHART_CONF == home / ".local/state/showrunner/dailies.conf"
+    assert note_file.notes_dir() == home / "rust/hanadocs/agents"
+    assert dailies_render.READINGS_LOG == home / ".local/state/agent-notes/readings.jsonl"
+    assert showrunners.NOTIFIER_STATE_DIR == home / ".local/state/notifier"
+    assert showrunners.SESSIONS_DIR == home / ".claude/sessions"
+    assert showrunners.SHOWRUNNER_STATE_DIR == home / ".local/state/showrunner"
+for name in ("first", "second"):
+    home = caller.parent / name
+    home.mkdir()
+    def main():
+        paths(home)
+        return 0
+    result = invoke_cli(command, main, [], {**os.environ, "HOME": str(home)}, home,
+                        production_state=True)
+    assert result.returncode == 0, result.stderr
+    assert Path.home() == caller
+    assert sys.path == caller_path
+    paths(caller)
+'''
+            result = subprocess.run([sys.executable, "-c", program], env=environment,
+                                    cwd=SCRIPT.parent, capture_output=True, text=True, timeout=300)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
     def test_counts_print_on_one_line_above_the_chart_in_every_length(self) -> None:
         counts = [{"label": "nightly queue", "count": 8}, {"label": "proposals", "not_found": True}]
@@ -192,12 +314,21 @@ class ReportFooterTests(unittest.TestCase):
         self.assertTrue(any("expected to release 02:30 EST (in 180 minutes)" in line for line in tail))
 
     def test_plumbing_in_holder_purpose_is_refused_in_report_and_footer(self) -> None:
-        record = holder(purpose="the writer's timings")
-        for result in (render(report(True), holders=[record]), footer(holders=[record])):
-            with self.subTest(result=result):
-                self.refused(result, "frame-time")
-                self.assertIn("'writer'", result.error)
-                self.assertIn("/build_hold hold again with other words", result.error)
+        with tempfile.TemporaryDirectory() as scratch, mock.patch.dict(os.environ, {
+            "HOME": scratch, "BUILDLOG_DIR": str(Path(scratch) / "buildlog"),
+            "BUILD_HOLD_DIR": str(Path(scratch) / "holders"),
+            "BUILD_HOLD_RELEASE_DIR": str(Path(scratch) / "release"),
+            "MAC_TEST_STATE_DIR": str(Path(scratch) / "mac-state"),
+            "NOTIFIER_SESSIONS_DIR": str(Path(scratch) / "sessions"),
+            "PLAN_DELEGATE_ACTIVE_DIR": str(Path(scratch) / "active"),
+            "TZ": ZONE, "USER_ZONE": ZONE,
+        }):
+            record = holder(purpose="the writer's timings")
+            for result in (render(report(True), holders=[record]), footer(holders=[record])):
+                with self.subTest(result=result):
+                    self.refused(result, "frame-time")
+                    self.assertIn("'writer'", result.error)
+                    self.assertIn("have frame-time run /build:hold hold again with other words", result.error)
 
     def test_multiple_holders_share_footer(self) -> None:
         records = [holder(), holder("2026-10-04T10:54:00-07:00", "other", "2026-10-04T10:57:00-07:00")]
@@ -485,7 +616,7 @@ class TimelineWindowTests(unittest.TestCase):
             _ = input_path.write_text(json.dumps(fields))
             for chart, marker in (("default", "🟦"), ("ascii", "● ")):
                 with self.subTest(chart=chart):
-                    result = run([str(input_path), "--at", AT, "--chart", chart], scratch)
+                    result = run([str(input_path), "--at", AT, "--chart", chart], scratch, subprocess_cli=True)
                     self.assertEqual(result.code, 0, result.error)
                     row = next(line for line in timeline(result.lines) if line.startswith("widget"))
                     self.assertIn(marker, row)

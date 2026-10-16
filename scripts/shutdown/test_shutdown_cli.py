@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+from scripts.whoami.note_file import note_name
+
 import io
 import json
 import os
 import shutil
 import subprocess
 import sys
+import time
 import tempfile
 import unittest
 from collections.abc import Iterable
@@ -15,24 +18,31 @@ from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 from typing import Literal, cast, final, override
 from unittest.mock import patch
+from zoneinfo import ZoneInfo
 
-from test_support import registry_confirmation, ShutdownTestCase
+from test_support import linux_process_fixture, registry_confirmation, ShutdownTestCase
 import inventory
+import herdr
+from fake_herdr import CommandResponse
 from test_record import LegacyRecordFixture, LegacyEntryFixture, write_old
 import launch_permission
 import record
 import sessions
+import remote_control
 import shutdown
 import settle
+from scripts.accounts import accounts
+from push_texts import RenderedPush
 import restart as restart_work
 from account import Account, UnreadableAccount
 
 
 LOGIN = "owner@example.com"
-LABEL = "claude 2"
+LABEL = "claude2"
 OCTOBER = "2026-10-09T21:49:10+00:00"
 JANUARY = "2026-01-15T17:30:00+00:00"
 PERMISSION_SCRIPT = Path(__file__).with_name("launch_permission.py")
+EMPTY_HERDR_SESSIONS = json.dumps(herdr.SessionListResult(sessions=[]))
 
 
 def unit_session(session_id: str) -> inventory.UnitSession:
@@ -44,6 +54,7 @@ def unit_session(session_id: str) -> inventory.UnitSession:
         name="alpha",
         cwd="/tmp/alpha",
         status="idle",
+        updated_at=0, probe=False,
         model=inventory.NoReplyYet(kind="no reply yet"),
         checkout=inventory.NotACheckout(kind="not a checkout"),
         run_dirs=[],
@@ -54,7 +65,8 @@ def unit_session(session_id: str) -> inventory.UnitSession:
             production="demo",
             unit="alpha-unit",
             doc="/tmp/production.md",
-            tmux_session="alpha",
+            session_name="alpha",
+            session_host="tmux",
             plan=inventory.PlanFromRunRecord(kind="plan", path="/tmp/alpha.md"),
         ),
     )
@@ -102,10 +114,10 @@ def session_shutdown(
     return record.SessionShutdown(
         login=LOGIN, label=LABEL, machine="natedev", requested_at=OCTOBER,
         requested_by=old["requested_by"], hold=hold, request_id="request-one",
-        then="restart", force="wait for ready", alerts="user",
-        session=item["session"], seats=[], timers=[],
+        then="restart", force="wait for ready", alerts="user", probe=False,
+        session=item["session"], workers=[], timers=[],
         settle_message=item["settle_message"], where=item["where"],
-        progress=progress, stop_issues=[],
+        progress=progress, trail=[], stop_issues=[],
     )
 
 
@@ -114,6 +126,11 @@ def account_hold() -> record.AccountHold:
         login=LOGIN, label=LABEL, machine="natedev", requested_at=OCTOBER,
         requested_by=record.FromTerminal(kind="terminal"), then="restart", request_id="request-one",
     )
+
+
+def setUpModule() -> None:
+    """The times these tests expect are Pacific; the user's zone setting must not change them."""
+    unittest.enterModuleContext(patch.dict(os.environ, {"USER_ZONE": "America/Los_Angeles"}))
 
 
 @final
@@ -137,8 +154,8 @@ class ShutdownLaunchCliTests(ShutdownTestCase):
         )
         notes = self.root / "notes"
         notes.mkdir()
-        _ = (notes / f"{LABEL}.md").write_text(
-            f"---\nlogin: {LOGIN}\nstate: active\n---\n",
+        _ = (notes / note_name(LABEL)).write_text(
+            f"---\nlogin: {LOGIN}\nsessions: 1\n---\n",
             encoding="utf-8",
         )
         self.environment = {
@@ -153,6 +170,1090 @@ class ShutdownLaunchCliTests(ShutdownTestCase):
     def clear_state(self) -> None:
         if self.state.exists():
             shutil.rmtree(self.state)
+
+    def tmux_free_fixture(self, tmux: CommandResponse, *, native_stdout: str = EMPTY_HERDR_SESSIONS) -> Path:
+        fake = self.root / "observation-tool"
+        _ = shutil.copyfile(Path(__file__).resolve().parents[1] / "herdr/fake_herdr.py", fake)
+        fake.chmod(0o755)
+        responses = self.root / "observations.json"
+        replies: dict[str, CommandResponse] = {
+            "list-sessions -F #{session_name}": tmux,
+            "--session default session list --json": {"stdout": native_stdout, "code": 0},
+            "default": {"stdout": "unexpected command", "code": 99},
+        }
+        _ = responses.write_text(json.dumps(replies))
+        log = self.root / "observation-calls.jsonl"
+        self.enterContext(patch.dict(os.environ, {
+            "SHUTDOWN_TMUX": str(fake), "HERDR_BIN": str(fake),
+            "FAKE_HERDR_RESPONSES": str(responses), "FAKE_HERDR_LOG": str(log),
+        }))
+        return log
+
+    def tmux_free_owner(self, host: inventory.SessionHost) -> inventory.TopLevelSession:
+        return inventory.TopLevelSession(kind="top-level", session_id="writing-id", pid=123,
+            proc_start="456", name="Writing", cwd="/tmp/writing", status="idle", updated_at=0,
+            probe=False, model=inventory.NoReplyYet(kind="no reply yet"),
+            checkout=inventory.NotACheckout(kind="not a checkout"), run_dirs=[], codex_servers=[],
+            timers=[], host=host)
+
+    def test_tmux_free_accepts_empty_or_absent_tmux_without_writing_or_starting_anything(self) -> None:
+        for reply in (CommandResponse(stdout="", code=0), CommandResponse(stdout="", code=1,
+                stderr="no server running on /tmp/fake-tmux")):
+            with self.subTest(reply=reply):
+                log = self.tmux_free_fixture(reply)
+                log.unlink(missing_ok=True)
+                saved = self.recovery("retained")
+                before = {path.relative_to(self.state): path.read_bytes()
+                          for path in self.state.rglob("*") if path.is_file()}
+                with (patch.object(inventory, "snapshot_inventory", return_value=inventory.CompleteInventory(
+                        "natedev", {}, {})) as observe, redirect_stdout(io.StringIO()) as output):
+                    self.assertEqual(shutdown.main(["tmux-free"]), 0)
+                self.assertEqual(output.getvalue(), "nothing needs tmux\n")
+                observe.assert_called_once_with()
+                self.assertEqual([cast(list[str], json.loads(line)) for line in log.read_text().splitlines()], [
+                    ["list-sessions", "-F", "#{session_name}"],
+                    ["--session", "default", "session", "list", "--json"],
+                ])
+                self.assertEqual({path.relative_to(self.state): path.read_bytes()
+                    for path in self.state.rglob("*") if path.is_file()}, before)
+                self.assertEqual(record.read_snapshot(LOGIN), saved)
+
+    def test_tmux_free_allows_live_herdr_agents_and_herdr_units(self) -> None:
+        _ = self.tmux_free_fixture(CommandResponse(stdout="", code=0), native_stdout=json.dumps(
+            herdr.SessionListResult(sessions=[herdr.SessionEntry(name="writing", running=True, default=False,
+                session_dir="/tmp/writing", socket_path="/tmp/writing/herdr.sock")])))
+        owner = self.tmux_free_owner(inventory.HerdrHost(kind="herdr", herdr_session="writing", pane_id="w1:p1"))
+        unit = unit_session("unit-id")
+        unit["host"]["session_host"] = "herdr"
+        entries: list[inventory.SnapshotSession] = [
+            inventory.SnapshotClaudeSession(agent="claude", session=unit, workers=[], timers=[], last_seen=OCTOBER, state="running"),
+            inventory.SnapshotCodexSession(agent="codex", session=owner, workers=[], timers=[], last_seen=OCTOBER,
+                state="running", codex=inventory.CodexLaunch(home="/tmp/codex", resume=inventory.CodexResumePicker(kind="picker"))),
+        ]
+        with (patch.object(inventory, "snapshot_inventory", return_value=inventory.CompleteInventory(
+                "natedev", {LOGIN: entries}, {LOGIN: LABEL})), redirect_stdout(io.StringIO()) as output):
+            self.assertEqual(shutdown.main(["tmux-free"]), 0)
+        self.assertEqual(output.getvalue(), "nothing needs tmux\n")
+
+    def test_tmux_free_checks_workers_beside_a_safe_owner(self) -> None:
+        _ = self.tmux_free_fixture(CommandResponse(stdout="", code=0))
+        owner = self.tmux_free_owner(inventory.HerdrHost(kind="herdr", herdr_session="writing", pane_id="w1:p1"))
+        worker = inventory.WorkerSession(kind="worker", session_id="worker-id", pid=124, proc_start="457",
+            name="Worker", cwd="/tmp/writing", status="idle", updated_at=0, probe=False,
+            model=inventory.NoReplyYet(kind="no reply yet"), checkout=inventory.NotACheckout(kind="not a checkout"),
+            run_dirs=[], codex_servers=[], timers=[], host=inventory.UnknownHost(kind="unknown"),
+            owner=inventory.DirectorOwner(kind="director", session_id=owner["session_id"]))
+        entry = inventory.SnapshotClaudeSession(agent="claude", session=owner, workers=[worker], timers=[],
+            last_seen=OCTOBER, state="running")
+        with (patch.object(inventory, "snapshot_inventory", return_value=inventory.CompleteInventory(
+                "natedev", {LOGIN: [entry]}, {LOGIN: LABEL})), redirect_stdout(io.StringIO()) as output):
+            self.assertEqual(shutdown.main(["tmux-free"]), 1)
+        self.assertIn("Worker (worker-id) uses an unknown host", output.getvalue())
+        self.assertNotIn("Writing (writing-id)", output.getvalue())
+
+    def test_tmux_free_refuses_a_shell_only_tmux_session_after_its_claude_migrated(self) -> None:
+        _ = self.tmux_free_fixture(CommandResponse(stdout="old writing room\n", code=0))
+        owner = self.tmux_free_owner(inventory.HerdrHost(kind="herdr", herdr_session="writing", pane_id="w1:p1"))
+        entry = inventory.SnapshotClaudeSession(agent="claude", session=owner, workers=[], timers=[],
+            last_seen=OCTOBER, state="running")
+        with (patch.object(inventory, "snapshot_inventory", return_value=inventory.CompleteInventory(
+                "natedev", {LOGIN: [entry]}, {LOGIN: LABEL})), redirect_stdout(io.StringIO()) as output):
+            self.assertEqual(shutdown.main(["tmux-free"]), 1)
+        self.assertEqual(output.getvalue(),
+            "tmux session 'old writing room' is still registered; close it after moving its agents\n")
+
+    def test_tmux_free_reports_every_partial_source_including_a_config_only_home(self) -> None:
+        _ = self.tmux_free_fixture(CommandResponse(stdout="", code=0))
+        failures = ("session writing-id: bare ~/.claude is config-only; account cannot be attributed",
+                    "production alpha: unit marks unreadable")
+        with (patch.object(inventory, "snapshot_inventory", return_value=inventory.PartialInventory(failures)) as observe,
+              redirect_stdout(io.StringIO()) as output):
+            self.assertEqual(shutdown.main(["tmux-free"]), 1)
+        observe.assert_called_once_with()
+        self.assertEqual(output.getvalue().splitlines(), [f"inventory incomplete: {reason}" for reason in failures])
+
+    def test_tmux_free_refuses_unknown_tmux_and_tmux_unit_hosts_for_both_agents(self) -> None:
+        _ = self.tmux_free_fixture(CommandResponse(stdout="", code=0))
+        for agent in ("claude", "codex"):
+            for host in (inventory.UnknownHost(kind="unknown"), inventory.TmuxHost(kind="tmux",
+                    tmux_session="writing", session_ref=inventory.TmuxSessionIdNotRecorded(kind="not recorded"),
+                    server=inventory.TmuxServerNotRecorded(kind="not recorded"),
+                    pane=inventory.PaneNotRecorded(kind="not recorded"))):
+                with self.subTest(agent=agent, host=host):
+                    owner = self.tmux_free_owner(host)
+                    entry: inventory.SnapshotSession = (
+                        inventory.SnapshotCodexSession(agent="codex", session=owner, workers=[], timers=[],
+                            last_seen=OCTOBER, state="running", codex=inventory.CodexLaunch(
+                                home="/tmp/codex", resume=inventory.CodexResumePicker(kind="picker"))) if agent == "codex" else
+                        inventory.SnapshotClaudeSession(agent="claude", session=owner, workers=[], timers=[],
+                            last_seen=OCTOBER, state="running"))
+                    with (patch.object(inventory, "snapshot_inventory", return_value=inventory.CompleteInventory(
+                            "natedev", {LOGIN: [entry]}, {LOGIN: LABEL})), redirect_stdout(io.StringIO()) as output):
+                        self.assertEqual(shutdown.main(["tmux-free"]), 1)
+                    self.assertIn(f"{LOGIN}: Writing (writing-id) uses ", output.getvalue())
+                    self.assertIn("unknown host" if host["kind"] == "unknown" else "tmux session 'writing'", output.getvalue())
+        unit = inventory.SnapshotClaudeSession(agent="claude", session=unit_session("unit-id"),
+            workers=[], timers=[], last_seen=OCTOBER, state="running")
+        with (patch.object(inventory, "snapshot_inventory", return_value=inventory.CompleteInventory(
+                "natedev", {LOGIN: [unit]}, {LOGIN: LABEL})), redirect_stdout(io.StringIO()) as output):
+            self.assertEqual(shutdown.main(["tmux-free"]), 1)
+        self.assertIn("alpha (unit-id) uses tmux unit demo/alpha-unit in session 'alpha'", output.getvalue())
+
+    def test_tmux_free_collects_unreadable_tmux_herdr_and_inventory_causes(self) -> None:
+        _ = self.tmux_free_fixture(CommandResponse(stdout="", code=1, stderr="permission denied on /tmp/tmux"),
+            native_stdout="not json")
+        with (patch.object(inventory, "snapshot_inventory", return_value=inventory.PartialInventory((
+                "session registry unreadable",))) as observe, redirect_stdout(io.StringIO()) as output):
+            self.assertEqual(shutdown.main(["tmux-free"]), 1)
+        observe.assert_called_once_with()
+        lines = output.getvalue().splitlines()
+        self.assertEqual(len(lines), 3)
+        self.assertEqual(lines[0], "tmux sessions unreadable: permission denied on /tmp/tmux")
+        self.assertTrue(lines[1].startswith("herdr sessions unreadable:"), lines)
+        self.assertEqual(lines[2], "inventory incomplete: session registry unreadable")
+
+    def test_tmux_free_refuses_missing_tmux_and_inventory_read_errors(self) -> None:
+        _ = self.tmux_free_fixture(CommandResponse(stdout="", code=0))
+        with (patch.dict(os.environ, {"SHUTDOWN_TMUX": str(self.root / "missing-tmux")}),
+              patch.object(inventory, "snapshot_inventory", side_effect=OSError("proc unavailable")) as observe,
+              redirect_stdout(io.StringIO()) as output):
+            self.assertEqual(shutdown.main(["tmux-free"]), 1)
+        observe.assert_called_once_with()
+        self.assertIn("tmux sessions unreadable:", output.getvalue())
+        self.assertIn("missing-tmux", output.getvalue())
+        self.assertIn("inventory unreadable: proc unavailable", output.getvalue())
+
+    def test_missing_tmux_never_builds_during_tmux_free_or_recovery_observation(self) -> None:
+        linux_process_fixture(self)
+        proc = self.root / "proc"
+        boot = proc / "sys/kernel/random/boot_id"
+        boot.parent.mkdir(parents=True)
+        _ = boot.write_text("boot-one\n")
+        registry = self.root / "registry"
+        registry.mkdir()
+        calls: list[list[str]] = []
+
+        def run(argv: list[str], **options: object) -> subprocess.CompletedProcess[str]:
+            del options
+            calls.append(argv)
+            if argv[1:] == ["--session", "default", "session", "list", "--json"]:
+                return subprocess.CompletedProcess(argv, 0, EMPTY_HERDR_SESSIONS, "")
+            raise FileNotFoundError(f"no executable: {argv[0]}")
+
+        with (patch.dict(os.environ, {
+                  "HERDR_PROC": str(proc), "HERDR_BIN": "/missing/herdr",
+                  "UNIT_LOOKUP_TMUX": "", "SHUTDOWN_TMUX": "/missing/tmux",
+                  "NOTIFIER_SESSIONS_DIR": str(registry),
+                  "NOTIFIER_STATE_DIR": str(self.root / "notifier"),
+              }), patch.object(shutil, "which", return_value=None),
+              patch.object(subprocess, "run", side_effect=run)):
+            with redirect_stdout(io.StringIO()) as output:
+                self.assertEqual(shutdown.main(["tmux-free"]), 1)
+            self.assertIn("tmux sessions unreadable:", output.getvalue())
+            self.assertIn("inventory incomplete: shared observations: tmux is not installed", output.getvalue())
+            self.assertFalse(any(Path(argv[0]).name == "nix" for argv in calls), calls)
+            self.assertTrue(any(argv[1:] == ["--session", "default", "session", "list", "--json"]
+                                for argv in calls), calls)
+            calls.clear()
+            observed = inventory.snapshot_inventory()
+        self.assertIsInstance(observed, inventory.PartialInventory)
+        if isinstance(observed, inventory.PartialInventory):
+            self.assertTrue(any("tmux is not installed" in failure for failure in observed.failures), observed)
+        self.assertFalse(any(Path(argv[0]).name == "nix" for argv in calls), calls)
+
+    def test_elapsed_text_uses_seconds_minutes_hours_and_days(self) -> None:
+        cases = ((-1, "0s"), (0, "0s"), (59, "59s"), (60, "1m"),
+                 (3599, "59m"), (3600, "1h"), (86399, "23h"),
+                 (86400, "1d"), (172801, "2d"))
+        for seconds, expected in cases:
+            with self.subTest(seconds=seconds):
+                self.assertEqual(settle.elapsed_text(seconds), expected)
+
+    def recovery(self, *identities: str) -> record.RecoverySnapshot:
+        entries: list[record.SnapshotSession] = []
+        for identity in identities:
+            owner = unit_session(identity)
+            owner["name"] = identity + "-name"
+            entries.append(record.SnapshotClaudeSession(agent="claude", session=owner,
+                workers=[], timers=[], last_seen=OCTOBER, state="unresolved", crash="host gone"))
+        saved = record.RecoverySnapshot(machine="natedev", login=LOGIN, label=LABEL,
+            taken_at=OCTOBER, sessions=entries)
+        record.write_snapshot(saved)
+        return saved
+
+    def test_partial_snapshot_names_failed_sources_and_keeps_every_recovery_file(self) -> None:
+        saved = self.recovery("recoverable")
+        path = self.state / "snapshots" / (LOGIN + ".json")
+        before = path.read_bytes()
+        with (patch.object(inventory, "snapshot_inventory", return_value=inventory.PartialInventory(
+                ("session registry unreadable", "production marks unreadable"))), redirect_stderr(io.StringIO()) as error):
+            self.assertEqual(shutdown.main(["snapshot"]), 1)
+        self.assertEqual(path.read_bytes(), before)
+        self.assertEqual(record.read_snapshot(LOGIN), saved)
+        self.assertIn("session registry unreadable", error.getvalue())
+        self.assertIn("production marks unreadable", error.getvalue())
+        attempts = record.read_snapshot_attempts()
+        assert not isinstance(attempts, record.NoSnapshotAttempt)
+        self.assertEqual(attempts["latest"]["kind"], "failed")
+        self.assertEqual(attempts["latest"].get("reasons"), ["session registry unreadable", "production marks unreadable"])
+        self.assertEqual(attempts["last_success"], {"kind": "not recorded"})
+
+    def test_snapshot_command_retains_a_crash_confirmed_entry_during_an_empty_observation(self) -> None:
+        _ = self.recovery("recoverable")
+        with (patch.object(inventory, "snapshot_inventory", return_value=inventory.CompleteInventory(
+                "natedev", {}, {})), patch.object(settle, "record_time", return_value=JANUARY),
+              patch.object(settle, "local_machine", return_value="snapshot-host"),
+              redirect_stdout(io.StringIO())):
+            self.assertEqual(shutdown.main(["snapshot"]), 0)
+        saved = record.read_snapshot(LOGIN)
+        assert not isinstance(saved, record.NoRecoverySnapshot)
+        self.assertEqual(saved["taken_at"], JANUARY)
+        attempts = record.read_snapshot_attempts()
+        assert not isinstance(attempts, record.NoSnapshotAttempt)
+        self.assertEqual(attempts["machine"], "snapshot-host")
+        self.assertEqual(attempts["latest"], {"kind": "taken", "at": JANUARY, "accounts": 1})
+        self.assertEqual(attempts["last_success"], {"kind": "taken", "at": JANUARY})
+        self.assertEqual([(item["session"]["session_id"], item["last_seen"], item["state"])
+                          for item in saved["sessions"]], [("recoverable", OCTOBER, "unresolved")])
+
+    def test_snapshot_merge_errors_record_failure_and_keep_the_original_exit_code(self) -> None:
+        for failure in (record.InvalidRecord("invalid recovery file"), OSError("disk unavailable")):
+            with (self.subTest(failure=failure),
+                patch.object(inventory, "snapshot_inventory", return_value=inventory.CompleteInventory("natedev", {}, {})),
+                patch.object(record, "merge_snapshots", side_effect=failure),
+                patch.object(settle, "record_time", return_value=OCTOBER),
+                redirect_stderr(io.StringIO()) as error,
+            ):
+                self.assertEqual(shutdown.main(["snapshot"]), 1)
+            attempts = record.read_snapshot_attempts()
+            assert not isinstance(attempts, record.NoSnapshotAttempt)
+            self.assertEqual(attempts["latest"], {"kind": "failed", "at": OCTOBER, "reasons": [str(failure)]})
+            self.assertIn(str(failure), error.getvalue())
+
+    def test_snapshot_outcome_write_failure_keeps_success_and_partial_exit_codes(self) -> None:
+        observations = (inventory.CompleteInventory("natedev", {}, {}), inventory.PartialInventory(("registry failed",)))
+        for observed, expected in zip(observations, (0, 1)):
+            with (self.subTest(expected=expected),
+                patch.object(inventory, "snapshot_inventory", return_value=observed),
+                patch.object(record, "record_snapshot_attempt", side_effect=OSError("outcome disk full")),
+                redirect_stdout(io.StringIO()) as output,
+                redirect_stderr(io.StringIO()) as error,
+            ):
+                self.assertEqual(shutdown.main(["snapshot"]), expected)
+            self.assertIn("snapshot outcome not recorded: outcome disk full", error.getvalue())
+            if expected == 0:
+                self.assertIn("recovery snapshot saved for 0 accounts", output.getvalue())
+            else:
+                self.assertIn("snapshot incomplete: registry failed", error.getvalue())
+
+    def test_status_without_outcome_still_includes_existing_recovery_and_explicit_json_state(self) -> None:
+        _ = self.recovery("crashed")
+        report = inventory.Inventory(machine="natedev", login=LOGIN, label=LABEL, sessions=[], unattributed=[])
+        with patch.object(shutdown, "inventory", return_value=report), redirect_stdout(io.StringIO()) as output:
+            self.assertEqual(shutdown.main(["status", LABEL, "--here"]), 0)
+        self.assertIn("recovery snapshot: no successful snapshot recorded", output.getvalue())
+        self.assertIn("crashed-name: unresolved", output.getvalue())
+        with patch.object(shutdown, "inventory", return_value=report), redirect_stdout(io.StringIO()) as output:
+            self.assertEqual(shutdown.main(["status", LABEL, "--here", "--json"]), 0)
+        payload = cast(dict[str, object], json.loads(output.getvalue()))
+        self.assertEqual(payload["snapshot"], {"kind": "no outcome recorded"})
+        self.assertEqual(len(cast(list[object], payload["recovery"])), 1)
+
+    def test_status_reports_taken_then_failed_in_user_zone_only_under_the_local_machine(self) -> None:
+        local = inventory.Inventory(machine="natedev", login=LOGIN, label=LABEL, sessions=[], unattributed=[])
+        remote = inventory.Inventory(machine="Mac", login=LOGIN, label=LABEL, sessions=[], unattributed=[])
+        record.record_snapshot_attempt(record.SnapshotTaken(kind="taken", at=OCTOBER, accounts=2), "natedev")
+        failed_at = "2026-10-09T21:50:10+00:00"
+        for failed in (False, True):
+            if failed:
+                record.record_snapshot_attempt(record.SnapshotFailed(kind="failed", at=failed_at,
+                    reasons=["registry unreadable", "host unreadable"]), "natedev")
+            with (self.subTest(failed=failed),
+                patch.object(shutdown, "inventory", return_value=local),
+                patch.object(shutdown, "run_remote", return_value=(0, json.dumps(remote))),
+                patch.object(shutdown, "_remote_shutdown_records", return_value=shutdown.AccountShutdownRecords(kind="records", records=[])),
+                patch.object(shutdown, "user_zone", return_value=ZoneInfo("America/New_York")),
+                patch.object(settle, "record_time", return_value=failed_at),
+                redirect_stdout(io.StringIO()) as output,
+            ):
+                self.assertEqual(shutdown.main(["status", LABEL]), 0)
+            text = output.getvalue()
+            line = "recovery snapshot: last taken 2026-10-09 17:49:10 EDT (1m ago)"
+            self.assertIn(line, text)
+            self.assertLess(text.index(line), text.index("Mac"))
+            self.assertEqual(text.count("recovery snapshot: last taken"), 1)
+            if failed:
+                self.assertIn("recovery snapshot failed 2026-10-09 17:50:10 EDT: registry unreadable; host unreadable", text)
+            else:
+                self.assertNotIn("recovery snapshot failed", text)
+            with patch.object(shutdown, "inventory", return_value=local), redirect_stdout(io.StringIO()) as output:
+                self.assertEqual(shutdown.main(["status", LABEL, "--here", "--json"]), 0)
+            payload = cast(dict[str, object], json.loads(output.getvalue()))
+            status = cast(dict[str, object], payload["snapshot"])
+            self.assertEqual(status["kind"], "recorded")
+            self.assertEqual(status["last_success"], {"kind": "taken", "at": OCTOBER})
+            self.assertEqual(cast(dict[str, object], status["latest"])["kind"], "failed" if failed else "taken")
+            self.assertEqual(payload["recovery"], [])
+
+    def test_json_status_accepts_a_remote_report_without_snapshot_metadata(self) -> None:
+        local = inventory.Inventory(machine="natedev", login=LOGIN, label=LABEL, sessions=[], unattributed=[])
+        remote = inventory.Inventory(machine="Mac", login=LOGIN, label=LABEL, sessions=[], unattributed=[])
+        with (patch.object(shutdown, "inventory", return_value=local),
+              patch.object(shutdown, "run_remote", return_value=(0, json.dumps(remote))),
+              redirect_stdout(io.StringIO()) as output):
+            self.assertEqual(shutdown.main(["status", LABEL, "--json"]), 0)
+        reports = cast(list[dict[str, object]], json.loads(output.getvalue()))
+        self.assertEqual(reports[0]["snapshot"], {"kind": "no outcome recorded"})
+        self.assertEqual(reports[0]["recovery"], [])
+        self.assertEqual(reports[1], remote)
+
+    def test_invalid_or_unreadable_snapshot_outcome_does_not_fail_status(self) -> None:
+        report = inventory.Inventory(machine="natedev", login=LOGIN, label=LABEL, sessions=[], unattributed=[])
+        self.state.mkdir(exist_ok=True)
+        _ = (self.state / "snapshot_attempt.json").write_text("{")
+        for as_json in (False, True):
+            with self.subTest(as_json=as_json), patch.object(shutdown, "inventory", return_value=report), redirect_stdout(io.StringIO()) as output:
+                self.assertEqual(shutdown.main(["status", LABEL, "--here", *(["--json"] if as_json else [])]), 0)
+            if as_json:
+                payload = cast(dict[str, object], json.loads(output.getvalue()))
+                status = cast(dict[str, object], payload["snapshot"])
+                self.assertEqual(status["kind"], "unreadable")
+                self.assertIn("cannot be read", str(status["error"]))
+            else:
+                self.assertIn("recovery snapshot: outcome unreadable:", output.getvalue())
+        with (patch.object(record, "read_snapshot_attempts", side_effect=OSError("permission denied")),
+              patch.object(shutdown, "inventory", return_value=report), redirect_stdout(io.StringIO()) as output):
+            self.assertEqual(shutdown.main(["status", LABEL, "--here"]), 0)
+        self.assertIn("outcome unreadable: permission denied", output.getvalue())
+
+    def test_codex_status_includes_snapshot_outcome_in_text_and_json(self) -> None:
+        record.record_snapshot_attempt(record.SnapshotFailed(kind="failed", at=OCTOBER, reasons=["Codex unreadable"]), "natedev")
+        selection = shutdown.TerminalAccountSelection((Account("codex", "codex-work", "codex-work"),))
+        with (patch.object(shutdown, "_terminal_accounts", return_value=selection),
+              patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": ""}), redirect_stdout(io.StringIO()) as output):
+            self.assertEqual(shutdown.main(["status", "--here"]), 0)
+        self.assertIn("recovery snapshot: no successful snapshot recorded", output.getvalue())
+        self.assertIn("Codex unreadable", output.getvalue())
+        with (patch.object(shutdown, "_terminal_accounts", return_value=selection),
+              patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": ""}), redirect_stdout(io.StringIO()) as output):
+            self.assertEqual(shutdown.main(["status", "--here", "--json"]), 0)
+        reports = cast(list[dict[str, object]], json.loads(output.getvalue()))
+        status = cast(dict[str, object], reports[0]["snapshot"])
+        self.assertEqual(status["last_success"], {"kind": "not recorded"})
+        self.assertEqual(status["latest"], {"kind": "failed", "at": OCTOBER, "reasons": ["Codex unreadable"]})
+        self.assertEqual(reports[0]["recovery"], [])
+
+    def test_forget_removes_only_the_named_recovery_entry_and_keeps_shutdown_record(self) -> None:
+        _ = self.recovery("first", "second")
+        stopped = session_shutdown({"kind": "stopped", "at": OCTOBER}, "unrelated")
+        self.assertTrue(record.create_session(stopped))
+        with redirect_stdout(io.StringIO()):
+            self.assertEqual(shutdown.main(["forget", "first-name"]), 0)
+        saved = record.read_snapshot(LOGIN)
+        assert not isinstance(saved, record.NoRecoverySnapshot)
+        self.assertEqual([item["session"]["session_id"] for item in saved["sessions"]], ["second"])
+        self.assertEqual(record.find_session(LOGIN, "unrelated"), stopped)
+
+    def test_forget_failed_restart_removes_it_from_status_and_bring_back(self) -> None:
+        failed = session_shutdown(record.SessionRestartFailed(kind="restart failed", at=OCTOBER,
+            reason="agent exited"), "failed-id")
+        failed["session"]["name"] = "leg2probe"
+        sibling = session_shutdown(record.SessionStopped(kind="stopped", at=OCTOBER), "sibling-id")
+        sibling["session"]["name"] = "keep-me"
+        self.assertTrue(record.create_session(failed))
+        self.assertTrue(record.create_session(sibling))
+        report = inventory.Inventory(machine="natedev", login=LOGIN, label=LABEL, sessions=[], unattributed=[])
+        with patch.object(shutdown, "inventory", return_value=report), redirect_stdout(io.StringIO()) as before:
+            self.assertEqual(shutdown.main(["status", LABEL, "--here"]), 0)
+        self.assertIn("leg2probe", before.getvalue())
+        self.assertIn("restart failed", before.getvalue())
+        self.assertIn("failed-id", before.getvalue())
+        with redirect_stdout(io.StringIO()) as forgotten:
+            self.assertEqual(shutdown.main(["forget", "failed-id", "--account", LABEL]), 0)
+        self.assertEqual(forgotten.getvalue(), "leg2probe: forgotten\n")
+        with patch.object(shutdown, "inventory", return_value=report), redirect_stdout(io.StringIO()) as after:
+            self.assertEqual(shutdown.main(["status", LABEL, "--here"]), 0)
+        self.assertNotIn("leg2probe", after.getvalue())
+        self.assertNotIn("failed-id", after.getvalue())
+        self.assertNotIn("restart failed", after.getvalue())
+        self.assertIn("bring back:", after.getvalue())
+        self.assertIn("sibling-id", after.getvalue())
+        self.assertEqual(record.session_records(LOGIN), [sibling])
+
+    def test_forget_one_session_removes_both_its_snapshot_and_stopped_record(self) -> None:
+        _ = self.recovery("first", "second")
+        stopped = session_shutdown(record.SessionStopped(kind="stopped", at=OCTOBER), "first")
+        self.assertTrue(record.create_session(stopped))
+        with redirect_stdout(io.StringIO()) as output:
+            self.assertEqual(shutdown.main(["forget", "first-name"]), 0)
+        self.assertEqual(output.getvalue(), "first-name: forgotten\n")
+        self.assertEqual(record.session_records(LOGIN), [])
+        snapshot = record.read_snapshot(LOGIN)
+        assert not isinstance(snapshot, record.NoRecoverySnapshot)
+        self.assertEqual([item["session"]["session_id"] for item in snapshot["sessions"]], ["second"])
+
+    def test_forget_ambiguous_shutdown_name_lists_matches_without_removing_either(self) -> None:
+        for identity in ("first-id", "second-id"):
+            saved = session_shutdown(record.SessionNeedsManualRestart(kind="manual restart", command="resume"), identity)
+            saved["session"]["name"] = "same-name"
+            self.assertTrue(record.create_session(saved))
+        before = record.session_records(LOGIN)
+        with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()) as error:
+            self.assertEqual(shutdown.main(["forget", "same-name"]), 2)
+        self.assertIn("more than one local session", error.getvalue())
+        for identity in ("first-id", "second-id"):
+            self.assertIn(f"same-name ({identity})", error.getvalue())
+        self.assertEqual(record.session_records(LOGIN), before)
+
+    def test_forget_exact_shutdown_id_wins_over_another_sessions_name(self) -> None:
+        for identity, name in (("first-id", "second-id"), ("second-id", "second")):
+            saved = session_shutdown(record.SessionNeedsManualRestart(kind="manual restart", command="resume"), identity)
+            saved["session"]["name"] = name
+            self.assertTrue(record.create_session(saved))
+        with redirect_stdout(io.StringIO()):
+            self.assertEqual(shutdown.main(["forget", "second-id"]), 0)
+        self.assertEqual([item["session"]["session_id"] for item in record.session_records(LOGIN)], ["first-id"])
+
+    def test_forget_does_not_remove_a_snapshot_while_its_shutdown_is_still_running(self) -> None:
+        snapshot = self.recovery("active")
+        active = session_shutdown(record.SessionRestarting(kind="restarting", at=OCTOBER,
+            prior=record.SessionStopped(kind="stopped", at=OCTOBER)), "active")
+        self.assertTrue(record.create_session(active))
+        with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()) as error:
+            self.assertEqual(shutdown.main(["forget", "active"]), 1)
+        self.assertIn("cannot forget shutdown in progress (restarting)", error.getvalue())
+        self.assertEqual(record.read_snapshot(LOGIN), snapshot)
+        self.assertEqual(record.find_session(LOGIN, "active"), active)
+
+    def test_forget_account_selector_retires_one_of_two_identical_cross_account_ids(self) -> None:
+        _ = (self.root / "notes/claude3.md").write_text("---\nlogin: third@example.invalid\n---\n")
+        original = self.recovery("shared-id")
+        other: record.RecoverySnapshot = {**original, "login": "third@example.invalid", "label": "claude3"}
+        record.write_snapshot(other)
+        with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()) as error:
+            self.assertEqual(shutdown.main(["forget", "shared-id"]), 2)
+        self.assertIn("more than one local session", error.getvalue())
+        with redirect_stdout(io.StringIO()):
+            self.assertEqual(shutdown.main(["forget", "shared-id", "--account", "claude3"]), 0)
+        self.assertEqual(record.read_snapshot(LOGIN), original)
+        retired = record.read_snapshot("third@example.invalid")
+        assert not isinstance(retired, record.NoRecoverySnapshot)
+        self.assertEqual(retired["sessions"], [])
+
+    def test_forget_spaced_account_label_resolves_to_the_recorded_login(self) -> None:
+        _ = self.recovery("failed-id")
+        failed = session_shutdown(record.SessionRestartFailed(kind="restart failed", at=OCTOBER,
+            reason="agent exited"), "failed-id")
+        self.assertTrue(record.create_session(failed))
+        with redirect_stdout(io.StringIO()) as output:
+            self.assertEqual(shutdown.main(["forget", "--account", "claude 2", "failed-id"]), 0)
+        self.assertEqual(output.getvalue(), "failed-id-name: forgotten\n")
+        self.assertEqual(record.session_records(LOGIN), [])
+        snapshot = record.read_snapshot(LOGIN)
+        assert not isinstance(snapshot, record.NoRecoverySnapshot)
+        self.assertEqual(snapshot["sessions"], [])
+
+    def test_forget_unknown_account_uses_the_status_refusal_and_keeps_the_session(self) -> None:
+        saved = self.recovery("retained")
+        messages: list[str] = []
+        for arguments in (["status", "claude999", "--here"],
+                          ["forget", "retained", "--account", "claude999"]):
+            with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()) as error:
+                self.assertEqual(shutdown.main(arguments), 2)
+            messages.append(error.getvalue())
+        self.assertEqual(messages[1], messages[0])
+        self.assertIn("shutdown: unknown account claude999: give a note label such as claude2, or a login", messages[1])
+        self.assertEqual(record.read_snapshot(LOGIN), saved)
+
+    def test_snapshot_only_name_is_not_a_down_now_cancel_or_status_selection(self) -> None:
+        _ = self.recovery("crashed")
+        for verb in ("down", "now", "cancel", "status"):
+            with (self.subTest(verb=verb), patch.object(shutdown, "listing", return_value=[]),
+                  patch.object(settle, "down") as down, patch.object(settle, "now") as now,
+                  patch.object(settle, "cancel") as cancel,
+                  redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()) as error):
+                self.assertEqual(shutdown.main([verb, LABEL, "--here", "--only", "crashed-name"]), 2)
+            self.assertIn("matches no session", error.getvalue())
+            down.assert_not_called()
+            now.assert_not_called()
+            cancel.assert_not_called()
+
+    def test_restart_only_resolves_a_snapshot_only_name(self) -> None:
+        _ = self.recovery("crashed")
+        report = inventory.Inventory(machine="natedev", login=LOGIN, label=LABEL, sessions=[], unattributed=[])
+        with (patch.object(shutdown, "listing", return_value=[]),
+              patch.object(shutdown, "inventory", return_value=report),
+              patch.object(restart_work, "restart", return_value=0) as restore):
+            self.assertEqual(shutdown.main(["restart", LABEL, "--here", "--only", "crashed-name"]), 0)
+        self.assertEqual(restore.call_args.kwargs["only"], ["crashed"])
+        self.assertTrue(restore.call_args.kwargs["here"])
+
+    def test_status_lists_unresolved_snapshot_last_seen_in_user_zone(self) -> None:
+        _ = self.recovery("crashed")
+        report = inventory.Inventory(machine="natedev", login=LOGIN, label=LABEL, sessions=[], unattributed=[])
+        with (patch.object(shutdown, "inventory", return_value=report),
+              patch.object(shutdown, "user_zone", return_value=ZoneInfo("America/New_York")),
+              redirect_stdout(io.StringIO()) as output):
+            self.assertEqual(shutdown.main(["status", LABEL, "--here"]), 0)
+        self.assertIn("crashed-name: unresolved; last seen 2026-10-09 17:49:10 EDT", output.getvalue())
+
+    def test_status_places_local_recovery_before_the_remote_machine_section(self) -> None:
+        _ = self.recovery("crashed")
+        local = inventory.Inventory(machine="natedev", login=LOGIN, label=LABEL, sessions=[], unattributed=[])
+        remote = inventory.Inventory(machine="Mac", login=LOGIN, label=LABEL, sessions=[], unattributed=[])
+        with (patch.object(shutdown, "_status", return_value=[local, remote]),
+              patch.object(shutdown, "_remote_shutdown_records", return_value=shutdown.AccountShutdownRecords(
+                  kind="records", records=[])),
+              redirect_stdout(io.StringIO()) as output):
+            self.assertEqual(shutdown.main(["status", LABEL]), 0)
+        text = output.getvalue()
+        self.assertLess(text.index("natedev"), text.index("crashed-name: unresolved"))
+        self.assertLess(text.index("crashed-name: unresolved"), text.index("Mac"))
+        self.assertEqual(text.count("crashed-name: unresolved"), 1)
+
+    def test_json_status_keeps_recovery_last_seen_as_an_iso_timestamp(self) -> None:
+        _ = self.recovery("crashed")
+        report = inventory.Inventory(machine="natedev", login=LOGIN, label=LABEL, sessions=[], unattributed=[])
+        with (patch.object(shutdown, "inventory", return_value=report),
+              patch.object(shutdown, "user_zone", return_value=ZoneInfo("America/New_York")),
+              redirect_stdout(io.StringIO()) as output):
+            self.assertEqual(shutdown.main(["status", LABEL, "--here", "--json"]), 0)
+        payload = cast(dict[str, object], json.loads(output.getvalue()))
+        recovery = cast(list[dict[str, object]], payload["recovery"])
+        self.assertEqual(recovery[0]["last_seen"], OCTOBER)
+
+    def test_terminal_restart_only_finds_codex_snapshot_by_herdr_name_without_claude_account(self) -> None:
+        owner = inventory.parse_session({**unit_session("code-id"), "kind": "top-level", "name": "Code writing",
+            "host": {"kind": "herdr", "herdr_session": "code-writing", "pane_id": "w1:p1", "presentation": "detached"}}, "fixture")
+        assert owner["kind"] == "top-level"
+        codex = record.SnapshotCodexSession(agent="codex", session=owner,
+            codex=record.CodexLaunch(home=str(self.home / ".codex"), resume=record.CodexSessionId(
+                kind="session id", session_id="code-id")), workers=[], timers=[], last_seen=OCTOBER, state="unresolved", crash="host gone")
+        record.write_snapshot(record.RecoverySnapshot(machine="natedev", login="codex-.codex", label="codex-.codex",
+            taken_at=OCTOBER, sessions=[codex]))
+        with (patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": ""}),
+              patch.object(shutdown, "listing", return_value=[]),
+              patch.object(restart_work, "up", return_value=0) as restore,
+              patch.object(restart_work, "restart") as claude_restore):
+            self.assertEqual(shutdown.main(["restart", "--here", "--only", "code-writing"]), 0)
+        restore.assert_called_once_with("codex-.codex", False, ("code-id",))
+        claude_restore.assert_not_called()
+
+    def test_peer_up_json_restores_snapshot_and_keeps_the_result_protocol(self) -> None:
+        _ = self.recovery("crashed")
+        def confirmed(ids: frozenset[str], _timeout: float) -> restart_work.RegistryConfirmation:
+            return registry_confirmation(ids)
+        # Unit recovery uses its normal launcher; confirmation and launch are isolated here.
+        with (patch.object(restart_work, "_session_liveness", return_value=restart_work.SessionNotLive()),
+              patch.object(restart_work, "_live_session_ids", return_value=frozenset()),
+              patch.object(restart_work, "_retire"),
+              patch.object(restart_work, "_launch_session", return_value=restart_work.SessionLaunched()),
+              patch.object(restart_work, "wait_for_confirmation", side_effect=confirmed),
+              patch.object(restart_work, "remote_control_missing"),
+              redirect_stdout(io.StringIO()) as output):
+            self.assertEqual(shutdown.main(["up", LOGIN, "--here", "--json"]), 0)
+        result = restart_work.parse_peer_result(output.getvalue())
+        self.assertEqual(result["outcome"], "done")
+        self.assertEqual(result["refused"], [])
+        self.assertTrue(any("crashed-name: from snapshot taken" in line for line in result["lines"]))
+        remaining = record.read_snapshot(LOGIN)
+        assert not isinstance(remaining, record.NoRecoverySnapshot)
+        self.assertEqual(remaining["sessions"], [])
+
+    def test_terminal_down_without_account_starts_each_configured_account(self) -> None:
+        _ = (Path(self.environment["AGENT_NOTES_DIR"]) / "claude3.md").write_text(
+            "---\nlogin: third@example.com\n---\n")
+        def reports(login: str) -> inventory.Inventory:
+            return inventory.Inventory(machine="natedev", login=login, label=login, sessions=[], unattributed=[])
+        with (patch.dict(os.environ, {**self.environment, "CLAUDE_CODE_SESSION_ID": ""}),
+              patch.object(shutdown, "inventory", side_effect=reports),
+              patch.object(settle, "down", return_value=0) as down,
+              patch.object(shutdown, "own_claude_account", side_effect=AssertionError("terminal account inferred"))):
+            self.assertEqual(shutdown.main(["down", "--here", "--restart", "--no-alert"]), 0)
+        self.assertEqual([cast(Account, call.args[0]).login for call in down.call_args_list], [LOGIN, "third@example.com"])
+        self.assertTrue(all(call.args[1] for call in down.call_args_list))
+        self.assertTrue(all(call.kwargs["then"] == "restart" and call.kwargs["alerts"] == "none" for call in down.call_args_list))
+
+    def test_terminal_status_without_account_emits_one_json_array_for_all_accounts(self) -> None:
+        _ = (Path(self.environment["AGENT_NOTES_DIR"]) / "claude3.md").write_text(
+            "---\nlogin: third@example.com\n---\n")
+        def reports(login: str) -> inventory.Inventory:
+            return inventory.Inventory(machine="natedev", login=login, label=login, sessions=[], unattributed=[])
+        output = io.StringIO()
+        with (patch.dict(os.environ, {**self.environment, "CLAUDE_CODE_SESSION_ID": ""}),
+              patch.object(shutdown, "inventory", side_effect=reports),
+              patch.object(shutdown, "run_remote", side_effect=AssertionError("--here read peer")),
+              redirect_stdout(output)):
+            self.assertEqual(shutdown.main(["status", "--here", "--json"]), 0)
+        result = cast(list[dict[str, object]], json.loads(output.getvalue()))
+        self.assertEqual([report["login"] for report in result], [LOGIN, "third@example.com"])
+
+    def test_terminal_restart_releases_both_empty_accounts_after_down(self) -> None:
+        third = "third@example.com"
+        _ = (Path(self.environment["AGENT_NOTES_DIR"]) / "claude3.md").write_text(
+            f"---\nlogin: {third}\n---\n")
+
+        def reports(login: str) -> inventory.Inventory:
+            return inventory.Inventory(machine="natedev", login=login,
+                label=LABEL if login == LOGIN else "claude3", sessions=[], unattributed=[])
+
+        with (patch.dict(os.environ, {**self.environment, "CLAUDE_CODE_SESSION_ID": ""}),
+              patch.object(shutdown, "inventory", side_effect=reports),
+              patch.object(settle, "_warm", return_value=True),
+              patch.object(settle, "_launch_conductor"),
+              patch.object(shutdown, "run_remote", side_effect=AssertionError("--here read peer")),
+              redirect_stdout(io.StringIO())):
+            self.assertEqual(shutdown.main(["down", "--here", "--no-alert"]), 0)
+            self.assertEqual({hold["login"] for hold in record.all_account_holds()}, {LOGIN, third})
+            self.assertEqual(shutdown.main(["restart", "--here", "--no-alert"]), 0)
+        self.assertEqual(record.all_account_holds(), [])
+
+    def test_terminal_restart_includes_a_peer_hold_without_session_records(self) -> None:
+        held = account_hold()
+        held["login"], held["label"], held["machine"] = "third@example.com", "claude3", "Mac"
+
+        def peer(args: list[str]) -> tuple[int, str]:
+            return 0, json.dumps([held] if args[0] == "holds" else [])
+
+        with (patch.dict(os.environ, {**self.environment, "CLAUDE_CODE_SESSION_ID": ""}),
+              patch.object(shutdown, "run_remote", side_effect=peer),
+              patch.object(restart_work, "restart", return_value=0) as resume):
+            self.assertEqual(shutdown.main(["restart", "--no-alert"]), 0)
+        resume.assert_called_once()
+        self.assertEqual(resume.call_args.args[0], restart_work.AccountNamed(held["login"]))
+        self.assertFalse(resume.call_args.kwargs["here"])
+
+    def test_terminal_restart_without_account_uses_accounts_with_records_on_either_machine(self) -> None:
+        local = session_shutdown(record.SessionStopped(kind="stopped", at=OCTOBER))
+        peer = session_shutdown(record.SessionStopped(kind="stopped", at=OCTOBER), "peer-id")
+        peer["login"], peer["label"], peer["machine"] = "third@example.com", "claude3", "Mac"
+        self.assertTrue(record.create_session(local))
+        with (patch.dict(os.environ, {**self.environment, "CLAUDE_CODE_SESSION_ID": ""}),
+              patch.object(shutdown, "run_remote", side_effect=[(0, json.dumps([peer])), (0, "[]")]),
+              patch.object(restart_work, "restart", side_effect=[1, 0]) as resume):
+            self.assertEqual(shutdown.main(["restart", "--dry-run", "--no-alert"]), 1)
+        self.assertEqual([call.args[0] for call in resume.call_args_list],
+            [restart_work.AccountNamed(LOGIN), restart_work.AccountNamed("third@example.com")])
+        self.assertTrue(all(call.kwargs["dry_run"] and not call.kwargs["here"] for call in resume.call_args_list))
+
+    def test_terminal_restart_attempts_local_accounts_when_peer_record_discovery_fails(self) -> None:
+        self.assertTrue(record.create_session(session_shutdown(record.SessionStopped(kind="stopped", at=OCTOBER))))
+        with (patch.dict(os.environ, {**self.environment, "CLAUDE_CODE_SESSION_ID": ""}),
+              patch.object(shutdown, "run_remote", return_value=(255, "peer unavailable")),
+              patch.object(restart_work, "restart", return_value=0) as resume,
+              redirect_stderr(io.StringIO()) as error):
+            self.assertEqual(shutdown.main(["restart", "--no-alert"]), 1)
+        self.assertEqual(resume.call_args.args[0], restart_work.AccountNamed(LOGIN))
+        self.assertFalse(resume.call_args.kwargs["here"])
+        self.assertIn("shutdown records not reached", error.getvalue())
+        self.assertIn("agents restart --here", error.getvalue())
+
+    def test_in_session_no_account_keeps_own_account_for_down_status_and_restart(self) -> None:
+        selected = Account("claude", LOGIN, LABEL)
+        report = inventory.Inventory(machine="natedev", login=LOGIN, label=LABEL, sessions=[], unattributed=[])
+        with (patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": "caller-id"}),
+              patch.object(shutdown, "own_claude_account", return_value=selected),
+              patch.object(shutdown, "inventory", return_value=report),
+              patch.object(shutdown, "_terminal_accounts", side_effect=AssertionError("expanded accounts")),
+              patch.object(settle, "down", return_value=0) as down,
+              patch.object(restart_work, "restart", return_value=0) as resume,
+              redirect_stdout(io.StringIO())):
+            self.assertEqual(shutdown.main(["down", "--here"]), 0)
+            self.assertEqual(shutdown.main(["status", "--here", "--json"]), 0)
+            self.assertEqual(shutdown.main(["restart", "--here"]), 0)
+        self.assertEqual(down.call_args.args[0], selected)
+        self.assertEqual(resume.call_args.args[0], restart_work.AccountNotNamed())
+
+    def test_down_rejects_non_numbered_targets_before_creating_records_requests_or_a_conductor(self) -> None:
+        moves_file = self.home / ".local/state/accounts/moves.jsonl"
+        selected = Account("claude", LOGIN, LABEL)
+        report = inventory.Inventory(machine="natedev", login=LOGIN, label=LABEL,
+            sessions=[unit_session("session-123")], unattributed=[])
+        for target in ("default", "~/.claude", "claude", "codex1"):
+            self.clear_state()
+            moves_file.unlink(missing_ok=True)
+            with (self.subTest(target=target),
+                  patch.object(shutdown, "named_claude_account", return_value=selected),
+                  patch.object(shutdown, "inventory", return_value=report) as observed,
+                  patch.object(shutdown, "run_remote") as peer,
+                  patch.object(settle, "run_remote", return_value=(0, "")) as forwarded,
+                  patch.object(settle, "_warm", return_value=True),
+                  patch.object(settle, "send_message", return_value=settle.MessageSent(kind="sent")),
+                  patch.object(settle, "_launch_conductor") as conductor):
+                output, error = io.StringIO(), io.StringIO()
+                with redirect_stdout(output), redirect_stderr(error):
+                    try:
+                        status = shutdown.main(["down", LABEL, "--restart", "--to", target])
+                    except SystemExit as exit_error:
+                        status = exit_error.code
+                self.assertNotEqual(status, 0)
+                if target == "default":
+                    self.assertIn("name the account by number", error.getvalue())
+                    self.assertIn("~/.claude is claude2", error.getvalue())
+                else:
+                    self.assertIn(target, error.getvalue())
+                self.assertFalse(self.state.exists() and any(self.state.iterdir()))
+                self.assertFalse(moves_file.exists() and moves_file.stat().st_size)
+                conductor.assert_not_called()
+                peer.assert_not_called()
+                forwarded.assert_not_called()
+                observed.assert_not_called()
+
+    def test_down_rejects_invalid_move_origins_before_observing_or_writing_shutdown_state(self) -> None:
+        invalid = (("--refused", "bogus"),
+                   ("--refused", "weekly", "--reset", "2026-10-20T12:00:00"),
+                   ("--reset", "2026-10-20T12:00:00+00:00"))
+        for arguments in invalid:
+            with (self.subTest(arguments=arguments), patch.object(settle, "down") as down,
+                  patch.object(shutdown, "resolve_sessions") as resolve,
+                  patch.object(shutdown, "run_remote") as peer,
+                  redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO())):
+                with self.assertRaises(SystemExit) as refused:
+                    _ = shutdown.main(["down", LABEL, "--restart", "--to", "claude3", *arguments])
+                self.assertEqual(refused.exception.code, 2)
+                down.assert_not_called()
+                resolve.assert_not_called()
+                peer.assert_not_called()
+                self.assertFalse(self.state.exists() and any(self.state.iterdir()))
+                journal = self.home / ".local/state/accounts/moves.jsonl"
+                self.assertFalse(journal.exists() and journal.stat().st_size)
+
+    def test_down_passes_refusal_window_and_aware_reset_or_hand_origin_to_settle(self) -> None:
+        from scripts.accounts import accounts
+        from datetime import datetime
+        selected = Account("claude", LOGIN, LABEL)
+        for arguments, refusal in ((("--refused", "weekly", "--reset", "2026-10-20T12:00:00+03:00"), True), ((), False)):
+            with (self.subTest(arguments=arguments),
+                  patch.object(shutdown, "named_claude_account", return_value=selected),
+                  patch.object(settle, "down", return_value=0) as down):
+                self.assertEqual(shutdown.main(["down", LABEL, "--here", "--restart", "--to", "claude3", *arguments]), 0)
+                origin = cast(object, down.call_args.kwargs["origin"])
+                if refusal:
+                    self.assertIsInstance(origin, accounts.RefusalOrigin)
+                    assert isinstance(origin, accounts.RefusalOrigin)
+                    self.assertEqual(origin.window, "weekly")
+                    self.assertEqual(origin.reset, accounts.KnownReset(datetime.fromisoformat("2026-10-20T12:00:00+03:00")))
+                else:
+                    self.assertIsInstance(origin, accounts.HandOrigin)
+
+    def test_remote_control_cli_passes_identity_without_an_alert_option(self) -> None:
+        arguments = ["remote-control", "owner", "--pid", "321",
+            "--proc-start", "original", "--who", "trunk unit", "--session", "Owner"]
+        with patch.object(remote_control, "fix", return_value=remote_control.AlreadyOn()) as fix:
+            self.assertEqual(shutdown.main(arguments), 0)
+        fix.assert_called_once_with("owner", 321, "original", "trunk unit", "Owner")
+        with patch.object(remote_control, "fix") as fix, redirect_stderr(io.StringIO()):
+            with self.assertRaises(SystemExit) as rejected:
+                _ = shutdown.main([*arguments, "--alerts", "user"])
+        self.assertEqual(rejected.exception.code, 2)
+        fix.assert_not_called()
+        with redirect_stdout(help_text := io.StringIO()), self.assertRaises(SystemExit):
+            _ = shutdown.main(["remote-control", "--help"])
+        self.assertNotIn("--alerts", help_text.getvalue())
+
+    def follow_request(self, output: io.StringIO | None = None) -> tuple[int, str]:
+        output = output if output is not None else io.StringIO()
+        with (
+            patch.object(shutdown, "named_claude_account", return_value=Account("claude", LOGIN, LABEL)),
+            patch.object(shutdown, "inventory", side_effect=AssertionError("follow inventories live sessions")),
+            patch.object(shutdown, "run_remote", side_effect=AssertionError("follow reads the peer")),
+            redirect_stdout(output),
+        ):
+            result = shutdown.main(["follow", LOGIN, "--request", "request-one"])
+        return result, output.getvalue()
+
+    def test_recovered_not_ready_status_offers_cancel_and_force_while_follow_keeps_waiting(self) -> None:
+        saved = session_shutdown(record.SessionStopFailed(kind="stop failed", at=OCTOBER,
+            reason="session or worker is not idle and ready"))
+        saved["stop_issues"] = [record.NotReadyToStop(kind="not ready to stop", at=OCTOBER,
+            status="busy", progress="waiting")]
+        directory = self.state / LOGIN / "sessions"
+        directory.mkdir(parents=True)
+        _ = (directory / "session-123.json").write_text(json.dumps(saved))
+        output = io.StringIO()
+        with (
+            patch.object(shutdown, "named_claude_account", return_value=Account("claude", LOGIN, LABEL)),
+            redirect_stdout(output),
+        ):
+            self.assertEqual(shutdown.main(["status", LOGIN, "--here"]), 0)
+        text = output.getvalue()
+        self.assertIn("waiting", text)
+        self.assertIn("not stopped: busy, waiting", text)
+        self.assertIn(f"cancel {LOGIN} --here --only session-123", text)
+        self.assertIn(f"now {LOGIN} --here --only session-123", text)
+        self.assertIn("in a terminal on natedev", text)
+        self.assertNotIn("stop failed", text)
+        self.assertNotIn("bring back:", text)
+        with patch.object(time, "sleep", side_effect=KeyboardInterrupt) as wait:
+            status, text = self.follow_request()
+        wait.assert_called_once()
+        self.assertEqual(status, 130)
+        self.assertIn("the shutdown keeps running", text)
+        self.assertNotIn("stop failed", text)
+        current = record.find_session(LOGIN, "session-123")
+        assert current is not None
+        self.assertEqual(current["progress"], {"kind": "waiting"})
+
+    def test_follow_prints_each_new_step_once_and_waits_for_pending_restart(self) -> None:
+        saved = session_shutdown(record.SessionWaiting(kind="waiting"))
+        saved["session"]["name"] = "Alpha"
+        # Legacy-spelled stored targets must print as canonical labels.
+        saved["target"] = "claude 3"
+        saved["trail"] = [{"at": OCTOBER, "kind": "waiting", "detail": "pause sent"}]
+        self.assertTrue(record.create_session(saved))
+        unrelated = session_shutdown(record.SessionStopFailed(kind="stop failed", at=OCTOBER, reason="other request"), "unrelated")
+        unrelated["request_id"] = "another-request"
+        self.assertTrue(record.create_session(unrelated))
+        stages: list[record.SessionProgress] = [
+            record.SessionReadyToStop(kind="ready", at=OCTOBER),
+            record.SessionStopped(kind="stopped", at=OCTOBER),
+            record.SessionAlreadyGone(kind="already gone", at=OCTOBER),
+            record.SessionRestarting(kind="restarting", at=OCTOBER,
+                prior=record.SessionStopped(kind="stopped", at=OCTOBER)),
+            record.SessionRestarted(kind="restarted", at=OCTOBER),
+        ]
+        polls: list[float] = []
+        live_output = io.StringIO()
+        observed_kinds = ["waiting"]
+        def advance(seconds: float) -> None:
+            polls.append(seconds)
+            for kind in observed_kinds:
+                self.assertEqual(live_output.getvalue().count(f"Alpha: {kind}"), 1,
+                    "follow must print new steps before sleeping and keep old steps once")
+            if len(polls) == 1:
+                return  # An unchanged file on the next poll must not repeat the pause.
+            self.assertTrue(stages, "follow never finishes after the restart")
+            progress = stages.pop(0)
+            observed_kinds.append(progress["kind"])
+            def change(current: record.SessionShutdown) -> None:
+                current["progress"] = progress
+            _ = record.update_session(LOGIN, saved["session"]["session_id"], change)
+        with patch.object(time, "sleep", side_effect=advance):
+            status, output = self.follow_request(live_output)
+        self.assertEqual(status, 0)
+        self.assertEqual(polls, [1, 1, 1, 1, 1, 1])
+        self.assertIn("14:49:10 Alpha: waiting pause sent", output)
+        for kind in ("waiting", "ready", "stopped", "already gone", "restarting", "restarted"):
+            self.assertEqual(output.count(f"Alpha: {kind}"), 1, output)
+        self.assertNotIn("unrelated", output)
+        self.assertTrue(output.rstrip().endswith("all 1 back on claude3"), output)
+
+    def test_follow_waits_for_every_session_and_reports_total_back_on_target(self) -> None:
+        first = session_shutdown(record.SessionRestarted(kind="restarted", at=OCTOBER), "first")
+        second = session_shutdown(record.SessionWaiting(kind="waiting"), "second")
+        for saved in (first, second):
+            saved["target"] = "claude 3"
+            saved["session"]["name"] = saved["session"]["session_id"]
+            self.assertTrue(record.create_session(saved))
+        record.archive_session(LOGIN, "first")
+        def complete(_seconds: float) -> None:
+            def restarted(current: record.SessionShutdown) -> None:
+                current["progress"] = record.SessionRestarted(kind="restarted", at=OCTOBER)
+            _ = record.update_session(LOGIN, "second", restarted)
+            record.archive_session(LOGIN, "second")
+        with patch.object(time, "sleep", side_effect=complete) as polls:
+            status, output = self.follow_request()
+        self.assertEqual(status, 0)
+        self.assertEqual(polls.call_count, 1)
+        self.assertEqual(output.count("first: restarted"), 1)
+        self.assertEqual(output.count("second: restarted"), 1)
+        self.assertTrue(output.rstrip().endswith("all 2 back on claude3"), output)
+
+    def test_follow_finds_completed_request_in_history_before_starting(self) -> None:
+        for kind in ("stopped", "already gone", "restarted"):
+            with self.subTest(kind=kind):
+                self.clear_state()
+                progress: record.SessionProgress
+                if kind == "restarted":
+                    progress = record.SessionRestarted(kind="restarted", at=OCTOBER)
+                elif kind == "already gone":
+                    progress = record.SessionAlreadyGone(kind="already gone", at=OCTOBER)
+                else:
+                    progress = record.SessionStopped(kind="stopped", at=OCTOBER)
+                saved = session_shutdown(progress)
+                saved["then"] = "restart" if kind == "restarted" else "stop"
+                self.assertTrue(record.create_session(saved))
+                record.archive_session(LOGIN, saved["session"]["session_id"])
+                with patch.object(time, "sleep", side_effect=AssertionError("completed request waits")):
+                    status, output = self.follow_request()
+                self.assertEqual(status, 0)
+                self.assertIn(f"alpha: {kind}", output)
+                self.assertIn("all 1 back on" if kind == "restarted" else "all 1 stopped", output)
+
+    def test_follow_keeps_trail_when_record_is_archived_between_polls(self) -> None:
+        saved = session_shutdown(record.SessionWaiting(kind="waiting"))
+        saved["then"] = "stop"
+        self.assertTrue(record.create_session(saved))
+        def finish(_seconds: float) -> None:
+            def stopped(current: record.SessionShutdown) -> None:
+                current["progress"] = record.SessionStopped(kind="stopped", at=OCTOBER)
+            _ = record.update_session(LOGIN, saved["session"]["session_id"], stopped)
+            record.archive_session(LOGIN, saved["session"]["session_id"])
+        with patch.object(time, "sleep", side_effect=finish) as polls:
+            status, output = self.follow_request()
+        self.assertEqual(status, 0)
+        self.assertEqual(polls.call_count, 1)
+        self.assertEqual(output.count("alpha: waiting"), 1)
+        self.assertEqual(output.count("alpha: stopped"), 1)
+        self.assertTrue(output.rstrip().endswith("all 1 stopped"))
+
+    def test_follow_counts_taken_out_sessions_while_waiting_for_restart(self) -> None:
+        removed = session_shutdown(record.SessionWaiting(kind="waiting"), "removed")
+        removed["session"]["name"] = "Removed"
+        remaining = session_shutdown(record.SessionWaiting(kind="waiting"), "remaining")
+        remaining["target"] = "claude 3"
+        for saved in (removed, remaining):
+            self.assertTrue(record.create_session(saved))
+        polls = 0
+        output = io.StringIO()
+        def advance(_seconds: float) -> None:
+            nonlocal polls
+            polls += 1
+            if polls == 1:
+                _ = record.withdraw_session(LOGIN, "removed", lambda saved: None)
+            elif polls == 2:
+                self.assertEqual(output.getvalue().count("Removed: taken out"), 1)
+            elif polls == 3:
+                def restarted(current: record.SessionShutdown) -> None:
+                    current["progress"] = record.SessionRestarted(kind="restarted", at=OCTOBER)
+                _ = record.update_session(LOGIN, "remaining", restarted)
+                record.archive_session(LOGIN, "remaining")
+            else:
+                self.fail("follow did not finish after withdrawal and restart")
+        with patch.object(time, "sleep", side_effect=advance):
+            status, text = self.follow_request(output)
+        self.assertEqual(status, 0)
+        self.assertEqual(text.count("Removed: taken out"), 1)
+        self.assertTrue(text.rstrip().endswith("all 2 done: 1 back on claude3, 1 taken out"), text)
+
+    def test_follow_finishes_when_every_session_was_taken_out_before_start(self) -> None:
+        progress: list[record.SessionProgress] = [
+            record.SessionWaiting(kind="waiting"),
+            record.SessionReadyToStop(kind="ready", at=OCTOBER),
+            record.SessionHeldByUsageLimit(kind="held by usage limit", at=OCTOBER),
+            record.SessionReaping(kind="reaping", at=OCTOBER, because="account out of usage", detail="weekly limit"),
+            record.SessionStopFailed(kind="stop failed", at=OCTOBER, reason="still live"),
+        ]
+        for index, state in enumerate(progress):
+            identity = f"removed-{index}"
+            saved = session_shutdown(state, identity)
+            saved["session"]["name"] = identity
+            self.assertTrue(record.create_session(saved))
+            if state["kind"] == "stop failed":
+                _ = record.withdraw_failed_stop(LOGIN, identity, lambda saved: True, lambda saved: None)
+            else:
+                _ = record.withdraw_session(LOGIN, identity, lambda saved: None)
+        with patch.object(time, "sleep", side_effect=AssertionError("taken out request waits")):
+            status, text = self.follow_request()
+        self.assertEqual(status, 0)
+        for index in range(len(progress)):
+            self.assertEqual(text.count(f"removed-{index}: taken out"), 1)
+        self.assertTrue(text.rstrip().endswith("all 5 done: 5 taken out"), text)
+
+    def test_follow_reads_each_history_file_once_across_polls(self) -> None:
+        unrelated = session_shutdown(record.SessionWaiting(kind="waiting"), "unrelated")
+        unrelated["request_id"] = "another-request"
+        self.assertTrue(record.create_session(unrelated))
+        record.archive_session(LOGIN, "unrelated")
+        archived = next((self.state / LOGIN / "history").glob("*.json"))
+        self.assertTrue(record.create_session(session_shutdown(record.SessionWaiting(kind="waiting"))))
+        read_text = Path.read_text
+        history_reads = 0
+        def read(path: Path, encoding: str | None = None, errors: str | None = None) -> str:
+            nonlocal history_reads
+            if path == archived:
+                history_reads += 1
+                if history_reads > 1:
+                    raise PermissionError("immutable history must not be read twice")
+            return read_text(path, encoding=encoding, errors=errors)
+        polls = 0
+        def advance(_seconds: float) -> None:
+            nonlocal polls
+            polls += 1
+            if polls == 3:
+                def stopped(current: record.SessionShutdown) -> None:
+                    current["then"] = "stop"
+                    current["progress"] = record.SessionStopped(kind="stopped", at=OCTOBER)
+                _ = record.update_session(LOGIN, "session-123", stopped)
+                record.archive_session(LOGIN, "session-123")
+            elif polls > 3:
+                self.fail("follow did not read the newly archived result")
+        with patch.object(Path, "read_text", read), patch.object(time, "sleep", side_effect=advance):
+            status, text = self.follow_request()
+        self.assertEqual(status, 0)
+        self.assertEqual(history_reads, 1)
+        self.assertTrue(text.rstrip().endswith("all 1 stopped"), text)
+
+    def test_follow_needing_user_names_account_session_and_terminal(self) -> None:
+        for progress in (
+            record.SessionStopFailed(kind="stop failed", at=OCTOBER, reason="still alive"),
+            record.SessionRestartFailed(kind="restart failed", at=OCTOBER, reason="launch refused"),
+            record.ProcessIdentityLost(kind="process identity lost", at=OCTOBER),
+        ):
+            with self.subTest(kind=progress["kind"]):
+                self.clear_state()
+                self.assertTrue(record.create_session(session_shutdown(progress)))
+                sibling = session_shutdown(record.SessionReadyToStop(kind="ready", at=OCTOBER), "z-sibling")
+                sibling["session"]["name"] = "Sibling"
+                sibling["trail"] = [
+                    {"at": OCTOBER, "kind": "waiting", "detail": "pause sent"},
+                    {"at": OCTOBER, "kind": "ready", "detail": "checkpoint saved"},
+                ]
+                self.assertTrue(record.create_session(sibling))
+                with patch.object(time, "sleep", side_effect=AssertionError("user action waits")):
+                    status, output = self.follow_request()
+                self.assertEqual(status, 1)
+                self.assertEqual(output.count("14:49:10 Sibling: waiting pause sent"), 1)
+                self.assertEqual(output.count("14:49:10 Sibling: ready checkpoint saved"), 1)
+                self.assertLess(output.index("Sibling: ready"), output.index("in a terminal on natedev"))
+                self.assertIn(progress["kind"], output)
+                self.assertIn("in a terminal on natedev", output)
+                self.assertIn("~/.claude/scripts/lib/py ~/.claude/scripts/shutdown/shutdown.py", output)
+                self.assertIn(LOGIN, output)
+                self.assertIn("--only session-123", output)
+
+    def test_follow_detach_leaves_shutdown_running_and_prints_resume_command(self) -> None:
+        self.assertTrue(record.create_session(session_shutdown(record.SessionWaiting(kind="waiting"))))
+        before = record.session_records(LOGIN)
+        with patch.object(time, "sleep", side_effect=KeyboardInterrupt):
+            status, output = self.follow_request()
+        self.assertEqual(status, 130)
+        self.assertEqual(record.session_records(LOGIN), before)
+        self.assertIn("the shutdown keeps running", output)
+        self.assertIn("in this terminal: ~/.claude/scripts/lib/py ~/.claude/scripts/shutdown/shutdown.py follow", output)
+        self.assertIn(LOGIN, output)
+        self.assertIn("--request request-one", output)
+
+    def test_follow_alerted_holdout_shows_stop_action_and_exits_one(self) -> None:
+        saved = session_shutdown(record.SessionWaiting(kind="waiting"))
+        saved["alerted_at"] = OCTOBER
+        self.assertTrue(record.create_session(saved))
+        with patch.object(time, "sleep", side_effect=AssertionError("alerted holdout waits")):
+            status, output = self.follow_request()
+        self.assertEqual(status, 1)
+        self.assertIn("has not answered the pause", output)
+        self.assertIn("in a terminal on natedev", output)
+        self.assertIn(f"now {LOGIN} --here --only session-123", output)
+
+    def test_quota_notice_and_import_modes_preserve_module_package_metadata(self) -> None:
+        quota = Path(__file__).resolve().parents[1] / "whoami/quota_alert.py"
+        for mode in ("script", "quota_alert", "scripts.whoami.quota_alert"):
+            with self.subTest(mode=mode):
+                command = [sys.executable, "-Wdefault"]
+                if mode == "script":
+                    command.extend((str(quota), "notice"))
+                else:
+                    command.extend(("-c", "import importlib, sys; "
+                        + f"sys.path.insert(0, {str(quota.parent)!r}); "
+                        + f"sys.path.insert(0, {str(quota.parents[2])!r}); "
+                        + f"module = importlib.import_module({mode!r}); "
+                        + "assert module.__package__ == module.__spec__.parent"))
+                result = subprocess.run(command, capture_output=True, text=True, check=False,
+                    timeout=10, cwd=self.root,
+                    env={**self.environment, "XDG_STATE_HOME": str(self.root / "state")})
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertEqual(result.stderr, "")
+                self.assertEqual(result.stdout, "")
 
     def run_cli(self, *arguments: str) -> tuple[int, str, str]:
         output = io.StringIO()
@@ -199,18 +1300,126 @@ class ShutdownLaunchCliTests(ShutdownTestCase):
             timeout=10,
         )
 
-    def test_down_restart_passes_the_selected_scope_and_intent(self) -> None:
+    def conflicting_legacy_record(self, conflict: str) -> str:
+        self.clear_state()
+        old = shutdown_record("settling", session_id="id/one")
+        directory = self.state / LOGIN
+        if conflict == "session ids":
+            current = session_shutdown(record.SessionWaiting(kind="waiting"), "id-one")
+            self.assertTrue(record.create_session(current))
+        write_old(old)
+        (directory / "lock").touch()
+        if conflict == "history names":
+            partial = directory / "partial"
+            partial.mkdir()
+            _ = (partial / "record.json").write_text(json.dumps(old))
+            return f"{directory / 'history'} has conflicting legacy history names"
+        if conflict == "existing target":
+            history = directory / "history"
+            history.mkdir()
+            target = history / f"{OCTOBER}-record.json"
+            _ = target.write_text("retained history")
+            return f"{target} already exists"
+        if conflict == "session names":
+            other = shutdown_record("settling", session_id="id-one")
+            old["entries"].extend(other["entries"])
+            write_old(old)
+            return f"{directory / 'sessions'} has conflicting session names"
+        return f"{directory / 'sessions' / 'id-one.json'} has conflicting session ids 'id-one' and 'id/one'"
+
+    def store_contents(self) -> dict[Path, bytes]:
+        return {path.relative_to(self.state): path.read_bytes()
+                for path in self.state.rglob("*") if path.is_file()}
+
+    def test_migration_conflicts_print_one_error_and_leave_each_requested_verb_untouched(self) -> None:
+        for conflict in ("history names", "existing target", "session ids", "session names"):
+            for verb in ("down", "cancel", "now", "conduct"):
+                with self.subTest(conflict=conflict, verb=verb):
+                    diagnostic = self.conflicting_legacy_record(conflict)
+                    before = self.store_contents()
+                    directories = sorted(path.relative_to(self.state) for path in self.state.rglob("*") if path.is_dir())
+                    output, error = io.StringIO(), io.StringIO()
+                    with patch.object(sys, "platform", "darwin"), patch.object(herdr, "_PLATFORM", "darwin"), patch.object(settle, "_warm", return_value=True), patch.object(settle, "send_message") as sender, patch.object(settle, "_launch_conductor") as conductor, redirect_stdout(output), redirect_stderr(error):
+                        result = shutdown.main([verb, LOGIN, "--here"])
+                    self.assertEqual(result, 3)
+                    self.assertEqual(output.getvalue(), "")
+                    self.assertEqual(error.getvalue(), f"shutdown: {diagnostic}\n")
+                    self.assertNotIn("Traceback", error.getvalue())
+                    self.assertEqual(self.store_contents(), before)
+                    self.assertEqual(sorted(path.relative_to(self.state) for path in self.state.rglob("*") if path.is_dir()), directories)
+                    sender.assert_not_called()
+                    conductor.assert_not_called()
+
+    def test_ready_filename_conflict_prints_one_error_without_changing_records(self) -> None:
+        _ = self.conflicting_legacy_record("session ids")
+        before = self.store_contents()
+        report = inventory.Inventory(machine="natedev", login=LOGIN, label=LABEL,
+                                     sessions=[unit_session("id/one")], unattributed=[])
+        output, error = io.StringIO(), io.StringIO()
+        with patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": "id/one"}), patch.object(settle, "run_inventory", return_value=report), patch.object(settle, "blocker", return_value=record.ReadinessClear(kind="clear")), redirect_stdout(output), redirect_stderr(error):
+            result = shutdown.main(["ready", "--where", "waiting for the user"])
+        self.assertEqual(result, 3)
+        self.assertEqual(output.getvalue(), "")
+        self.assertEqual(error.getvalue(), f"shutdown: {self.state / LOGIN / 'sessions' / 'id-one.json'} is used by a different session id\n")
+        self.assertEqual(self.store_contents(), before)
+
+    def test_status_reads_filename_conflict_without_migrating_records(self) -> None:
+        _ = self.conflicting_legacy_record("session ids")
+        before = self.store_contents()
+        report = inventory.Inventory(machine="natedev", login=LOGIN, label=LABEL,
+                                     sessions=[], unattributed=[])
+        output, error = io.StringIO(), io.StringIO()
+        with patch.object(shutdown, "inventory", return_value=report), patch.object(shutdown, "conductor_status", return_value=record.ConductorNotRunning()), redirect_stdout(output), redirect_stderr(error):
+            result = shutdown.main(["status", LOGIN, "--here"])
+        self.assertEqual(result, 0)
+        self.assertEqual(error.getvalue(), "")
+        self.assertEqual(output.getvalue().count("  alpha: waiting"), 2)
+        self.assertIn(f"{LABEL} · {LOGIN}\n", output.getvalue())
+        self.assertNotIn("Traceback", output.getvalue())
+        self.assertEqual(self.store_contents(), before)
+
+    def test_down_to_passes_target_through_the_cli_to_settle(self) -> None:
         selected = Account("claude", LOGIN, LABEL)
+        report = inventory.Inventory(machine="natedev", login=LOGIN, label=LABEL,
+            sessions=[unit_session("move-id")], unattributed=[])
         with (
             patch.object(shutdown, "named_claude_account", return_value=selected),
             patch.object(settle, "down", return_value=0) as down,
-            patch.object(shutdown, "resolve_sessions", return_value=["unit-a", "unit-b"]),
+            patch.object(shutdown, "resolve_sessions", return_value=shutdown.ResolvedSessions(("move-id",), report)),
+        ):
+            self.assertEqual(shutdown.main(["down", LABEL, "--here", "--only", "move-id",
+                "--restart", "--to", "claude3"]), 0)
+        down.assert_called_once_with(selected, True, ("move-id",), then="restart", alerts="user",
+            requested_by=None, request_id="", target="claude3", why="", report=report, origin=accounts.HandOrigin(), move_id="")
+
+    def test_down_to_passes_custom_move_reason_through_the_cli_to_settle(self) -> None:
+        selected = Account("claude", LOGIN, LABEL)
+        report = inventory.Inventory(machine="natedev", login=LOGIN, label=LABEL,
+            sessions=[unit_session("move-id")], unattributed=[])
+        with (
+            patch.object(shutdown, "named_claude_account", return_value=selected),
+            patch.object(settle, "down", return_value=0) as down,
+            patch.object(shutdown, "resolve_sessions", return_value=shutdown.ResolvedSessions(("move-id",), report)),
+        ):
+            self.assertEqual(shutdown.main(["down", LABEL, "--here", "--only", "move-id",
+                "--restart", "--to", "claude3", "--why", "weekly limit reached"]), 0)
+        down.assert_called_once_with(selected, True, ("move-id",), then="restart", alerts="user",
+            requested_by=None, request_id="", target="claude3", why="weekly limit reached", report=report, origin=accounts.HandOrigin(), move_id="")
+
+    def test_down_restart_passes_the_selected_scope_and_intent(self) -> None:
+        selected = Account("claude", LOGIN, LABEL)
+        report = inventory.Inventory(machine="natedev", login=LOGIN, label=LABEL,
+            sessions=[unit_session("unit-a"), unit_session("unit-b")], unattributed=[])
+        with (
+            patch.object(shutdown, "named_claude_account", return_value=selected),
+            patch.object(settle, "down", return_value=0) as down,
+            patch.object(shutdown, "resolve_sessions", return_value=shutdown.ResolvedSessions(("unit-a", "unit-b"), report)),
         ):
             self.assertEqual(shutdown.main([
                 "down", LABEL, "--restart", "--only", "unit-a,unit-b,unit-a", "--here",
             ]), 0)
         down.assert_called_once_with(
-            selected, True, ("unit-a", "unit-b"), then="restart", alerts="user", requested_by=None, request_id=""
+            selected, True, ("unit-a", "unit-b"), then="restart", alerts="user", requested_by=None, request_id="", target="", why="", report=report, origin=accounts.HandOrigin(), move_id=""
         )
 
 
@@ -243,12 +1452,14 @@ class ShutdownLaunchCliTests(ShutdownTestCase):
 
     def test_down_without_restart_keeps_the_existing_dispatch(self) -> None:
         selected = Account("claude", LOGIN, LABEL)
+        report = inventory.Inventory(machine="natedev", login=LOGIN, label=LABEL, sessions=[], unattributed=[])
         with (
             patch.object(shutdown, "named_claude_account", return_value=selected),
             patch.object(settle, "down", return_value=0) as down,
+            patch.object(shutdown, "inventory", return_value=report),
         ):
             self.assertEqual(shutdown.main(["down", LABEL]), 0)
-        down.assert_called_once_with(selected, False, (), then="stop", alerts="user", requested_by=None, request_id="")
+        down.assert_called_once_with(selected, False, (), then="stop", alerts="user", requested_by=None, request_id="", target="", why="", report=report, origin=accounts.HandOrigin(), move_id="")
 
 
 
@@ -403,6 +1614,7 @@ class ShutdownLaunchCliTests(ShutdownTestCase):
                     self.assertTrue(record.create_session(session_shutdown(
                         record.SessionWaiting(kind="waiting"), "session-456", hold="account",
                     )))
+                    self.assertEqual(self.run_cli(LOGIN, "--restart-of", "session-123"), (1, "", ""))
                     record.set_account_hold(account_hold())
                     self.assertEqual(self.run_cli(LOGIN, "--restart-of", "session-123"), (1, "", ""))
                     self.assertEqual(self.run_cli(LOGIN)[0], 0)
@@ -462,13 +1674,13 @@ class ShutdownLaunchCliTests(ShutdownTestCase):
                 record.set_account_hold(account_hold())
                 self.assertEqual(self.run_cli(LOGIN, "--restart-of", "session-123"), expected)
 
-    def test_held_sessions_includes_owners_and_seats_sorted_once(self) -> None:
+    def test_held_sessions_includes_owners_and_workers_sorted_once(self) -> None:
         saved = session_shutdown(record.SessionWaiting(kind="waiting"), "z-owner")
         owner = saved["session"]
-        saved["seats"] = [inventory.SeatSession(
-            session_id="a-seat", pid=23456, proc_start="seat-start", name="worker",
-            cwd=owner["cwd"], status="idle", model=owner["model"], checkout=owner["checkout"],
-            run_dirs=["/tmp/run"], codex_servers=[], timers=[], kind="seat",
+        saved["workers"] = [inventory.WorkerSession(
+            session_id="a-worker", pid=23456, proc_start="worker-start", name="worker",
+            cwd=owner["cwd"], status="idle", updated_at=0, probe=False, model=owner["model"], checkout=owner["checkout"],
+            run_dirs=["/tmp/run"], codex_servers=[], timers=[], kind="worker",
             host=inventory.UnknownHost(kind="unknown"),
             owner=inventory.DirectorOwner(kind="director", session_id="z-owner"),
         )]
@@ -477,7 +1689,7 @@ class ShutdownLaunchCliTests(ShutdownTestCase):
         output = io.StringIO()
         with redirect_stdout(output):
             self.assertEqual(shutdown.main(["held-sessions"]), 0)
-        self.assertEqual(output.getvalue(), "a-seat\nm-owner\nz-owner\n")
+        self.assertEqual(output.getvalue(), "a-worker\nm-owner\nz-owner\n")
 
     def test_launch_permission_maps_exit_statuses(self) -> None:
         with patch.object(
@@ -579,7 +1791,7 @@ class ShutdownLaunchCliTests(ShutdownTestCase):
         with patch.object(subprocess, "run", side_effect=run):
             permission = launch_permission.launch_permission(
                 self.environment,
-                launch_permission.ShutdownUnitRestoreLaunchPurpose("session-123"),
+                launch_permission.RecordedSessionRestoreLaunchPurpose("session-123"),
             )
 
         self.assertIsInstance(permission, launch_permission.AllowedByShutdownState)
@@ -625,7 +1837,7 @@ class ShutdownLaunchCliTests(ShutdownTestCase):
         self.assertEqual(blocked.returncode, 0)
         self.assertEqual(
             blocked.stdout,
-            "test-job: skipped: claude 2 is held by a shutdown "
+            "test-job: skipped: claude2 is held by a shutdown "
             + "(since 2026-10-09 14:49 PDT)\n",
         )
         self.assertEqual(blocked.stderr, "")
@@ -669,9 +1881,10 @@ class ShutdownLaunchCliTests(ShutdownTestCase):
 
     def test_peer_down_receives_request_identity_origin_and_alert_policy(self) -> None:
         selected = Account("claude", LOGIN, LABEL)
-        with patch.object(shutdown, "named_claude_account", return_value=selected), patch.object(settle, "down", return_value=0) as down:
+        report = inventory.Inventory(machine="natedev", login=LOGIN, label=LABEL, sessions=[], unattributed=[])
+        with patch.object(shutdown, "named_claude_account", return_value=selected), patch.object(settle, "down", return_value=0) as down, patch.object(shutdown, "inventory", return_value=report):
             self.assertEqual(shutdown.main(["down", LOGIN, "--here", "--restart", "--no-alert", "--requested-by", "requester", "--request-id", "same-request"]), 0)
-        down.assert_called_once_with(selected, True, (), then="restart", alerts="none", requested_by="requester", request_id="same-request")
+        down.assert_called_once_with(selected, True, (), then="restart", alerts="none", requested_by="requester", request_id="same-request", target="", why="", report=report, origin=accounts.HandOrigin(), move_id="")
 
     def test_stopping_session_restore_is_held_by_name(self) -> None:
         self.assertTrue(record.create_session(session_shutdown(record.SessionStopping(kind="stopping", at=OCTOBER))))
@@ -705,11 +1918,17 @@ class OnlySessionCliTests(ShutdownTestCase):
         _ = self.enterContext(patch.object(shutdown, "named_claude_account", return_value=selected))
         _ = self.enterContext(patch.object(restart_work, "named_claude_account", return_value=selected))
         report = inventory.Inventory(machine="natedev", login=LOGIN, label=LABEL, sessions=self.owners, unattributed=[])
-        _ = self.enterContext(patch.object(shutdown, "inventory", return_value=report))
+        def listed(_login: str) -> list[inventory.ListedSession]:
+            return [inventory.ListedSession(owner["session_id"], owner["pid"], owner["proc_start"],
+                owner["name"], owner["kind"], self.root / ".claude", LOGIN,
+                owner["host"]["production"] if owner["kind"] == "unit" else "", "")
+                for owner in self.owners]
+        _ = self.enterContext(patch.object(shutdown, "listing", side_effect=listed))
         def observed(login: str, only: Iterable[str] = ()) -> inventory.Inventory:
             self.assertEqual(login, LOGIN)
             ids = tuple(only)
             return {**report, "sessions": [owner for owner in self.owners if not ids or owner["session_id"] in ids]}
+        _ = self.enterContext(patch.object(shutdown, "inventory", side_effect=observed))
         _ = self.enterContext(patch.object(settle, "run_inventory", side_effect=observed))
         _ = self.enterContext(patch.object(settle, "inventory", side_effect=observed))
         _ = self.enterContext(patch.object(settle, "inventory", side_effect=observed))
@@ -773,6 +1992,146 @@ class OnlySessionCliTests(ShutdownTestCase):
         self.assertIn("beta-id", diagnostic)
         self.assertEqual(record.session_records(LOGIN), sorted(before, key=lambda item: item["session"]["name"]))
 
+    def test_terminal_only_routes_selection_to_its_account_for_down_restart_and_status(self) -> None:
+        selected = [Account("claude", LOGIN, LABEL), Account("claude", "other@example.com", "claude3")]
+        real_resolve = shutdown.resolve_sessions
+        def resolve(login: str, items: Iterable[str], *, here: bool = False, recovery: bool = False) -> shutdown.ResolvedSessions:
+            if login != LOGIN:
+                raise shutdown.SessionNotFound("Beta: matches no session")
+            return real_resolve(login, items, here=here, recovery=recovery)
+        for verb in ("down", "restart", "status"):
+            with (self.subTest(verb=verb),
+                  patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": ""}),
+                  patch.object(shutdown, "_terminal_accounts", return_value=shutdown.TerminalAccountSelection(tuple(selected))),
+                  patch.object(shutdown, "resolve_sessions", side_effect=resolve),
+                  patch.object(settle, "down", return_value=0) as down,
+                  patch.object(restart_work, "restart", return_value=0) as resume,
+                  patch.object(shutdown, "run_remote", side_effect=AssertionError("--here read peer")),
+                  redirect_stdout(io.StringIO()) as output):
+                args = [verb, "--only", "Beta", "--here"]
+                if verb == "status":
+                    args.append("--json")
+                self.assertEqual(shutdown.main(args), 0)
+                if verb == "down":
+                    self.assertEqual(down.call_args.args[:3], (selected[0], True, ("beta-id",)))
+                elif verb == "restart":
+                    self.assertEqual(resume.call_args.args[0], restart_work.AccountNamed(LOGIN))
+                    self.assertEqual(resume.call_args.kwargs["only"], ["beta-id"])
+                else:
+                    reports = cast(list[dict[str, object]], json.loads(output.getvalue()))
+                    self.assertEqual([report["login"] for report in reports], [LOGIN])
+                    owners = cast(list[dict[str, object]], reports[0]["sessions"])
+                    self.assertEqual([owner["session_id"] for owner in owners], ["beta-id"])
+
+    def test_terminal_down_starts_both_accounts_without_following_the_first(self) -> None:
+        class InteractiveTerminalOutput(io.StringIO):
+            @override
+            def isatty(self) -> bool:
+                return True
+
+        selected = [Account("claude", LOGIN, LABEL), Account("claude", "other@example.com", "claude3")]
+        by_login = {account.login: account for account in selected}
+        owners = {LOGIN: self.owners[0], "other@example.com": unit_session("other-id")}
+        def report(login: str) -> inventory.Inventory:
+            return inventory.Inventory(machine="natedev", login=login, label=by_login[login].label,
+                sessions=[owners[login]], unattributed=[])
+        def account_for_login(login: str) -> Account:
+            return by_login[login]
+        output = InteractiveTerminalOutput()
+        with (patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": ""}),
+              patch.object(shutdown, "_terminal_accounts", return_value=shutdown.TerminalAccountSelection(tuple(selected))),
+              patch.object(shutdown, "named_claude_account", side_effect=account_for_login),
+              patch.object(shutdown, "inventory", side_effect=report),
+              patch.object(settle, "_launch_conductor") as conduct,
+              patch.object(shutdown, "follow", side_effect=AssertionError("following first account blocks second")),
+              redirect_stdout(output)):
+            self.assertEqual(shutdown.main(["down", "--here", "--no-alert"]), 0)
+        self.assertEqual([call.args[0] for call in conduct.call_args_list], [LOGIN, "other@example.com"])
+        self.assertEqual([saved["session"]["session_id"] for saved in record.session_records(LOGIN)], ["alpha-id"])
+        self.assertEqual([saved["session"]["session_id"] for saved in record.session_records("other@example.com")], ["other-id"])
+        self.assertIn("follow owner@example.com --request", output.getvalue())
+        self.assertIn("follow other@example.com --request", output.getvalue())
+
+    def test_status_only_shows_the_selected_live_session_and_its_shutdown(self) -> None:
+        _ = self.save_three({"kind": "waiting"})
+        output, error = io.StringIO(), io.StringIO()
+        with redirect_stdout(output), redirect_stderr(error):
+            self.assertEqual(shutdown.main(["status", LOGIN, "--only", "Beta", "--here"]), 0)
+        self.assertEqual(error.getvalue(), "")
+        self.assertIn("Beta", output.getvalue())
+        self.assertNotIn("Alpha", output.getvalue())
+        self.assertNotIn("Gamma", output.getvalue())
+
+    def test_selected_status_filters_peer_sessions_without_requiring_a_peer_match(self) -> None:
+        peer = inventory.Inventory(machine="Mac", login=LOGIN, label=LABEL, sessions=self.owners, unattributed=[])
+        with patch.object(shutdown, "run_remote", return_value=(0, json.dumps(peer))) as remote:
+            reports = shutdown._status(Account("claude", LOGIN, LABEL), False, ("beta-id",))  # pyright: ignore[reportPrivateUsage]
+        self.assertEqual(remote.call_args.args[0], ["status", LOGIN, "--json", "--here"])
+        self.assertEqual(len(reports), 2)
+        self.assertIn("sessions", reports[1])
+        peer_report = cast(inventory.Inventory, reports[1])
+        self.assertEqual([owner["session_id"] for owner in peer_report["sessions"]], ["beta-id"])
+
+    def test_terminal_only_ambiguous_across_accounts_starts_no_shutdown(self) -> None:
+        selected = [Account("claude", LOGIN, LABEL), Account("claude", "other@example.com", "claude3")]
+        resolved = shutdown.ResolvedSessions(("beta-id",), inventory.Inventory(machine="natedev", login=LOGIN, label=LABEL, sessions=self.owners, unattributed=[]))
+        with (patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": ""}),
+              patch.object(shutdown, "_terminal_accounts", return_value=shutdown.TerminalAccountSelection(tuple(selected))),
+              patch.object(shutdown, "resolve_sessions", return_value=resolved),
+              patch.object(settle, "down") as down,
+              redirect_stderr(io.StringIO()) as error):
+            self.assertEqual(shutdown.main(["down", "--only", "Beta", "--here"]), 2)
+        down.assert_not_called()
+        self.assertIn("claude2, claude3", error.getvalue())
+
+    def test_down_exact_name_builds_one_filtered_inventory_and_keeps_owned_workers(self) -> None:
+        worker = cast(inventory.WorkerSession, cast(object, {
+            **unit_session("owned-worker"), "kind": "worker", "name": "Worker",
+            "host": inventory.UnknownHost(kind="unknown"),
+            "owner": inventory.DirectorOwner(kind="director", session_id="beta-id"),
+        }))
+        self.owners.append(worker)
+        def filtered(login: str, *, only: frozenset[str]) -> inventory.Inventory:
+            self.assertEqual(login, LOGIN)
+            self.assertEqual(only, frozenset({"beta-id"}))
+            return inventory.Inventory(machine="natedev", login=LOGIN, label=LABEL,
+                sessions=[self.owners[1], worker], unattributed=[])
+        with (patch.object(shutdown, "inventory", side_effect=filtered) as read,
+              patch.object(settle, "run_inventory", side_effect=AssertionError("down inventories twice")),
+              patch.object(settle, "inventory", side_effect=AssertionError("begin inventories twice"))):
+            status, _, error = self.action("down", "Beta")
+        self.assertEqual((status, error), (0, ""))
+        read.assert_called_once_with(LOGIN, only=frozenset({"beta-id"}))
+        saved = record.session_records(LOGIN)
+        self.assertEqual([item["session"]["session_id"] for item in saved], ["beta-id"])
+        self.assertEqual(saved[0]["workers"], [worker])
+
+    def test_down_ambiguous_name_builds_no_full_inventory_and_starts_nothing(self) -> None:
+        self.owners[0]["name"] = self.owners[1]["name"] = "Duplicate"
+        with (patch.object(shutdown, "inventory", side_effect=AssertionError("ambiguous name builds inventory")) as read,
+              patch.object(settle, "_launch_conductor") as launch):
+            status, output, error = self.action("down", "Duplicate")
+        self.assertEqual(status, 2)
+        self.assertIn("matches more than one session", output + error)
+        self.assertIn("alpha-id", output + error)
+        self.assertIn("beta-id", output + error)
+        read.assert_not_called()
+        launch.assert_not_called()
+        self.assertEqual(record.session_records(LOGIN), [])
+
+    def test_down_without_selection_reuses_one_full_inventory(self) -> None:
+        report = inventory.Inventory(machine="natedev", login=LOGIN, label=LABEL,
+            sessions=self.owners, unattributed=[])
+        with (patch.object(shutdown, "inventory", return_value=report) as read,
+              patch.object(settle, "run_inventory", side_effect=AssertionError("begin inventories twice")),
+              patch.object(settle, "inventory", side_effect=AssertionError("down inventories twice")),
+              redirect_stdout(io.StringIO())):
+            status = shutdown.main(["down", LOGIN, "--here"])
+        self.assertEqual(status, 0)
+        read.assert_called_once_with(LOGIN)
+        self.assertEqual({saved["session"]["session_id"] for saved in record.session_records(LOGIN)},
+            {owner["session_id"] for owner in self.owners})
+
     def test_only_unknown_item_exits_two_without_starting_work(self) -> None:
         before = self.save_three({"kind": "waiting"})
         with patch.object(settle, "_launch_conductor") as conductor:
@@ -783,7 +2142,7 @@ class OnlySessionCliTests(ShutdownTestCase):
         self.assertEqual(record.session_records(LOGIN), before)
 
     def test_only_restart_refuses_waiting_ready_and_stopping_with_exact_line(self) -> None:
-        cases: list[record.SessionProgress] = [{"kind": "waiting"}, {"kind": "ready", "at": OCTOBER}, {"kind": "stopping", "at": OCTOBER}]
+        cases: list[record.SessionProgress] = [{"kind": "waiting"}, {"kind": "ready", "at": OCTOBER}, {"kind": "stopping", "at": OCTOBER}, record.SessionHeldByUsageLimit(kind="held by usage limit", at=OCTOBER)]
         for progress in cases:
             with self.subTest(progress=progress["kind"]):
                 state = self.root / "state"
@@ -801,7 +2160,7 @@ class OnlySessionCliTests(ShutdownTestCase):
         _ = self.save_three({"kind": "stopping", "at": OCTOBER})
         status, output, error = self.action("cancel", "Beta")
         self.assertEqual((status, error), (1, ""))
-        self.assertEqual(output, "Beta was not cancelled: stopping; /shutdown restart --only Beta brings it back\n")
+        self.assertEqual(output, f"Beta was not cancelled: stopping; in a terminal on natedev: ~/.claude/scripts/lib/py ~/.claude/scripts/shutdown/shutdown.py restart {LOGIN} --here --only beta-id brings it back\n")
 
     def test_only_down_resumes_existing_record_without_replacing_request_fields(self) -> None:
         before = self.save_three({"kind": "waiting"})
@@ -824,13 +2183,13 @@ class OnlySessionCliTests(ShutdownTestCase):
     def test_resolve_sessions_here_deduplicates_record_and_inventory_without_peer(self) -> None:
         _ = self.save_three({"kind": "waiting"})
         with patch.object(shutdown, "run_remote") as peer:
-            self.assertEqual(shutdown.resolve_sessions(LOGIN, ["Beta", "beta-id", "Beta"], here=True), ["beta-id"])
+            self.assertEqual(shutdown.resolve_sessions(LOGIN, ["Beta", "beta-id", "Beta"], here=True).session_ids, ("beta-id",))
         peer.assert_not_called()
 
     def test_resolve_local_id_does_not_wait_for_the_peer(self) -> None:
         _ = self.save_three({"kind": "waiting"})
         with patch.object(shutdown, "run_remote") as peer:
-            self.assertEqual(shutdown.resolve_sessions(LOGIN, ["beta-id"]), ["beta-id"])
+            self.assertEqual(shutdown.resolve_sessions(LOGIN, ["beta-id"]).session_ids, ("beta-id",))
         peer.assert_not_called()
 
     def test_resolve_peer_name_counts_its_record_and_inventory_once(self) -> None:
@@ -845,13 +2204,13 @@ class OnlySessionCliTests(ShutdownTestCase):
             self.assertEqual(arguments, ["status", LOGIN, "--json", "--here"])
             return 0, json.dumps(remote_inventory)
         with patch.object(shutdown, "run_remote", side_effect=peer), patch.object(shutdown, "other_machine", return_value="Mac"):
-            self.assertEqual(shutdown.resolve_sessions(LOGIN, ["Remote"]), ["remote-id"])
+            self.assertEqual(shutdown.resolve_sessions(LOGIN, ["Remote"]).session_ids, ("remote-id",))
 
     def test_resolve_name_with_unreachable_peer_uses_local_and_warns(self) -> None:
         _ = self.save_three({"kind": "waiting"})
         error = io.StringIO()
         with patch.object(shutdown, "run_remote", return_value=(255, "")), patch.object(shutdown, "other_machine", return_value="Mac"), redirect_stderr(error):
-            self.assertEqual(shutdown.resolve_sessions(LOGIN, ["Beta"]), ["beta-id"])
+            self.assertEqual(shutdown.resolve_sessions(LOGIN, ["Beta"]).session_ids, ("beta-id",))
         self.assertIn("Mac: not reached; names checked on natedev only\n", error.getvalue())
 
     def test_only_missing_name_with_unreachable_peer_exits_two_and_names_peer(self) -> None:
@@ -924,7 +2283,7 @@ class OnlySessionCliTests(ShutdownTestCase):
                 else:
                     record.set_account_hold(record.AccountHold(login=LOGIN, label=LABEL, machine="natedev", requested_at=OCTOBER, requested_by={"kind": "terminal"}, request_id="held", then="stop"))
                 output, error = io.StringIO(), io.StringIO()
-                with patch.object(shutdown, "own_claude_account", side_effect=UnreadableAccount("own account unreadable")), patch.object(restart_work, "own_claude_account", side_effect=UnreadableAccount("own account unreadable")), patch.object(restart_work, "run_remote", return_value=(0, "[]")), patch.object(restart_work, "_up", return_value=restart_work.MachineRestartResult("natedev", LABEL, "done")) as resume, redirect_stdout(output), redirect_stderr(error):
+                with patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": "caller-id"}), patch.object(shutdown, "own_claude_account", side_effect=UnreadableAccount("own account unreadable")), patch.object(restart_work, "own_claude_account", side_effect=UnreadableAccount("own account unreadable")), patch.object(restart_work, "run_remote", return_value=(0, "[]")), patch.object(restart_work, "_up", return_value=restart_work.MachineRestartResult("natedev", LABEL, "done")) as resume, redirect_stdout(output), redirect_stderr(error):
                     self.assertEqual(shutdown.main(["restart", "--only", "beta-id", "--here", "--no-alert"]), 0)
                 self.assertEqual(error.getvalue(), "")
                 resume.assert_called_once_with(LOGIN, False, ("beta-id",))
@@ -944,9 +2303,9 @@ class OnlySessionCliTests(ShutdownTestCase):
 
     def test_selected_restart_refusal_has_no_alert_count_or_summary(self) -> None:
         _ = self.save_three({"kind": "waiting"})
-        with patch.object(settle, "alert_user") as alert, patch.object(restart_work, "_print_result") as summary:
+        with patch.object(restart_work, "_session_liveness", return_value=restart_work.SessionLive()), patch.object(settle, "alert_user") as alert, patch.object(restart_work, "_print_result") as summary:
             status, output, error = self.action("restart", "beta-id")
-        self.assertEqual((status, output, error), (1, "Beta is waiting, not stopped; nothing to restart\n", ""))
+        self.assertEqual((status, output, error), (1, "Beta: from shutdown record\nBeta: already running; skipped\nBeta is waiting, not stopped; nothing to restart\n", ""))
         alert.assert_not_called()
         summary.assert_not_called()
 
@@ -955,15 +2314,17 @@ class OnlySessionCliTests(ShutdownTestCase):
         def wait(current: record.SessionShutdown) -> None:
             current["progress"] = {"kind": "waiting"}
         _ = record.update_session(LOGIN, "alpha-id", wait)
-        with patch.object(restart_work, "_launch_session", side_effect=OSError("window launch failed")), patch.object(restart_work, "_session_liveness", return_value=restart_work.SessionNotLive()), patch.object(settle, "alert_user") as alert:
+        def liveness(identity: str) -> restart_work.SessionLive | restart_work.SessionNotLive:
+            return restart_work.SessionLive() if identity == "alpha-id" else restart_work.SessionNotLive()
+        with patch.object(restart_work, "_launch_session", side_effect=OSError("window launch failed")), patch.object(restart_work, "_session_liveness", side_effect=liveness), patch.object(settle, "alert_user") as alert:
             status, output, error = self.action("restart", "alpha-id,beta-id")
         self.assertEqual((status, error), (1, ""))
         self.assertIn("Alpha is waiting, not stopped; nothing to restart\n", output)
         alert.assert_called_once()
-        body = cast(str, cast(object, alert.call_args.args[1]))
-        self.assertIn("Beta", body)
-        self.assertIn("window launch failed", body)
-        self.assertNotIn("2 not back", body)
+        push = cast(RenderedPush, alert.call_args.args[0])
+        self.assertEqual(push.id, "shutdown.restart_failed")
+        self.assertEqual(push.values["stopped"], "One session")
+        self.assertIn("window launch failed", output)
 
     def test_selected_now_refuses_in_progress_and_clean_stopped_records_without_work(self) -> None:
         cases: list[record.SessionProgress] = [{"kind": "stopping", "at": OCTOBER}, {"kind": "stopped", "at": OCTOBER}]
@@ -983,13 +2344,57 @@ class OnlySessionCliTests(ShutdownTestCase):
         _ = self.save_three({"kind": "waiting"})
         self.assertEqual(self.action("cancel", "beta-id"), (0, "Beta: taken out\n", ""))
 
+    def test_selected_now_forces_usage_limit_held_session_and_names_it(self) -> None:
+        before = self.save_three(record.SessionHeldByUsageLimit(kind="held by usage limit", at=OCTOBER))
+        with patch.object(settle, "_launch_conductor") as conductor:
+            self.assertEqual(self.action("now", "beta-id"), (0, "Beta: stopping now\n", ""))
+        conductor.assert_called_once_with(LOGIN, LABEL)
+        latest = record.find_session(LOGIN, "beta-id")
+        assert latest is not None
+        self.assertEqual(latest["force"], "now")
+        self.assertEqual(record.find_session(LOGIN, "alpha-id"), before[0])
+        self.assertEqual(record.find_session(LOGIN, "gamma-id"), before[2])
+
+    def test_status_stop_now_action_accepts_reaping_session_by_name(self) -> None:
+        progress = record.SessionReaping(kind="reaping", at=OCTOBER,
+            because="account out of usage", detail="weekly limit")
+        before = self.save_three(progress)
+        output = io.StringIO()
+        with redirect_stdout(output):
+            self.assertEqual(shutdown.main(["status", LOGIN, "--here"]), 0)
+        self.assertIn(f"  stop now: in a terminal on natedev: ~/.claude/scripts/lib/py ~/.claude/scripts/shutdown/shutdown.py now {LOGIN} --here --only alpha-id,beta-id,gamma-id · Alpha, Beta, Gamma\n", output.getvalue())
+        with patch.object(settle, "_launch_conductor") as conductor:
+            self.assertEqual(self.action("now", "Beta"), (0, "Beta: stopping now\n", ""))
+        conductor.assert_called_once_with(LOGIN, LABEL)
+        latest = record.find_session(LOGIN, "beta-id")
+        assert latest is not None
+        self.assertEqual(latest["force"], "now")
+        self.assertEqual(latest["progress"], progress)
+        self.assertEqual(record.find_session(LOGIN, "alpha-id"), before[0])
+        self.assertEqual(record.find_session(LOGIN, "gamma-id"), before[2])
+
+    def test_selected_cancel_takes_usage_limit_held_session_out_and_names_it(self) -> None:
+        before = self.save_three(record.SessionHeldByUsageLimit(kind="held by usage limit", at=OCTOBER))
+        self.assertEqual(self.action("cancel", "beta-id"), (0, "Beta: taken out\n", ""))
+        self.assertIsNone(record.find_session(LOGIN, "beta-id"))
+        self.assertEqual(record.find_session(LOGIN, "alpha-id"), before[0])
+        self.assertEqual(record.find_session(LOGIN, "gamma-id"), before[2])
+
+    def test_status_actions_include_usage_limit_held_session(self) -> None:
+        _ = self.save_three(record.SessionHeldByUsageLimit(kind="held by usage limit", at=OCTOBER))
+        output = io.StringIO()
+        with patch.object(settle, "_showing_form", return_value=True), patch.object(settle, "merge_in_progress", return_value=False), redirect_stdout(output):
+            self.assertEqual(shutdown.main(["status", LOGIN, "--here"]), 0)
+        self.assertIn(f"  take out: in a terminal on natedev: ~/.claude/scripts/lib/py ~/.claude/scripts/shutdown/shutdown.py cancel {LOGIN} --here --only alpha-id,beta-id,gamma-id · Alpha, Beta, Gamma\n", output.getvalue())
+        self.assertIn(f"  stop now: in a terminal on natedev: ~/.claude/scripts/lib/py ~/.claude/scripts/shutdown/shutdown.py now {LOGIN} --here --only alpha-id,beta-id,gamma-id · Alpha, Beta, Gamma\n", output.getvalue())
+
     def test_selected_restart_fresh_claim_names_existing_worker_without_launch_or_alert(self) -> None:
         _ = self.save_three({"kind": "stopped", "at": OCTOBER})
         def claim(current: record.SessionShutdown) -> None:
             current["progress"] = {"kind": "restarting", "at": settle.record_time(), "prior": {"kind": "stopped", "at": OCTOBER}}
         saved = record.update_session(LOGIN, "beta-id", claim)
         with patch.object(restart_work, "_launch_session") as launch, patch.object(settle, "alert_user") as alert:
-            self.assertEqual(self.action("restart", "beta-id"), (0, "Beta is already restarting\n", ""))
+            self.assertEqual(self.action("restart", "beta-id"), (0, "Beta: from shutdown record\nBeta is already restarting\n", ""))
         launch.assert_not_called()
         alert.assert_not_called()
         self.assertEqual(record.find_session(LOGIN, "beta-id"), saved)
@@ -1001,7 +2406,7 @@ class OnlySessionCliTests(ShutdownTestCase):
             return (0, json.dumps([saved])) if arguments[0] == "records" else (255, "")
         error = io.StringIO()
         with patch.object(shutdown, "run_remote", side_effect=peer), patch.object(shutdown, "other_machine", return_value="Mac"), redirect_stderr(error):
-            self.assertEqual(shutdown.resolve_sessions(LOGIN, ["remote-id"]), ["remote-id"])
+            self.assertEqual(shutdown.resolve_sessions(LOGIN, ["remote-id"]).session_ids, ("remote-id",))
         self.assertEqual(error.getvalue(), "Mac: not reached; names checked on natedev only\n")
 
     def test_selected_now_mixed_force_and_refusal_exits_one_and_only_forces_eligible_session(self) -> None:
@@ -1022,24 +2427,28 @@ class OnlySessionCliTests(ShutdownTestCase):
     def test_up_json_returns_one_object_with_structured_refusals(self) -> None:
         _ = self.save_three({"kind": "waiting"})
         output = io.StringIO()
-        with redirect_stdout(output):
+        with patch.object(restart_work, "_session_liveness", return_value=restart_work.SessionLive()), redirect_stdout(output):
             self.assertEqual(shutdown.main(["up", LOGIN, "--here", "--json", "--only", "beta-id"]), 1)
         result = restart_work.parse_peer_result(output.getvalue())
         self.assertEqual(result["outcome"], "nothing")
-        self.assertEqual(result["lines"], ["Beta is waiting, not stopped; nothing to restart"])
-        self.assertEqual(result["no_remote_control"], [])
+        self.assertEqual(result["lines"], ["Beta: from shutdown record", "Beta: already running; skipped",
+                                         "Beta is waiting, not stopped; nothing to restart"])
+        self.assertEqual(cast(dict[str, object], json.loads(output.getvalue()))["no_remote_control"], [])
         self.assertEqual(result["refused"], [{"kind": "not stopped", "session_id": "beta-id", "name": "Beta", "progress": "waiting"}])
 
-    def test_up_json_keeps_remote_control_diagnostic_and_archived_alert_policy(self) -> None:
+    def test_up_json_keeps_remote_control_quiet_and_emits_legacy_empty_key(self) -> None:
         _ = self.save_three({"kind": "stopped", "at": OCTOBER})
         def quiet(current: record.SessionShutdown) -> None:
             current["alerts"] = "none"
         _ = record.update_session(LOGIN, "beta-id", quiet)
-        with patch.object(restart_work, "wait_for_remote_control", return_value=frozenset()), redirect_stdout(output := io.StringIO()):
+        with patch.object(restart_work, "wait_for_remote_control", return_value=frozenset()), patch.object(remote_control, "launch_fixer") as fixer, redirect_stdout(output := io.StringIO()):
             self.assertEqual(shutdown.main(["up", LOGIN, "--here", "--json", "--only", "beta-id"]), 0)
         result = restart_work.parse_peer_result(output.getvalue())
-        self.assertIn("Beta: running, no Remote Control", result["lines"])
-        self.assertEqual(result["no_remote_control"], [{"session_id": "beta-id", "name": "Beta", "alerts": "none"}])
+        self.assertFalse(any("Remote Control" in line for line in result["lines"]))
+        fixer.assert_called_once()
+        self.assertEqual(fixer.call_args.args[0], "beta-id")
+        self.assertEqual(fixer.call_args.args[-2:], ("alpha unit", "Beta"))
+        self.assertEqual(cast(dict[str, object], json.loads(output.getvalue()))["no_remote_control"], [])
         self.assertIsNone(record.find_session(LOGIN, "beta-id"))
 
 

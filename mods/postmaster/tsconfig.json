@@ -1,0 +1,31 @@
+{
+  "compilerOptions": {
+    "target": "ES2023",
+    "module": "ESNext",
+    "moduleResolution": "Bundler",
+    "lib": [
+      "ES2023"
+    ],
+    "strict": true,
+    "noEmit": true,
+    "noUncheckedIndexedAccess": true,
+    "exactOptionalPropertyTypes": true,
+    "paths": {
+      "claude-code": [
+        "./.claude-plugin/types/claude-code/index.d.ts"
+      ]
+    },
+    "typeRoots": [
+      "./.claude-plugin/types"
+    ],
+    "types": [
+      "claude-code",
+      "claude-code-tools",
+      "claude-code-mcp"
+    ]
+  },
+  "include": [
+    "hooks/**/*.ts",
+    "tests/**/*.ts"
+  ]
+}

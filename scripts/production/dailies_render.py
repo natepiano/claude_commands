@@ -69,6 +69,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "build_hold"))
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "mac_test"))
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "whoami"))
 import run_out
+import note_file
 from run_out import READINGS_LOG, Reading
 from build_hold import NO_ADMISSION_ACK_S, ActiveHolders, DeliveryFailed, HoldCycle, HoldState, KnownReleaseEta, MemoryGateReturned, NoAdmissionAck, NoHolders, Holder, NothingToBuild, RecipientGone, ReleaseEntry, ReleaseRecordReadError, holder_directory, read_cycle, read_holders, read_release_state, release_record_error_line
 from mac_test import ActiveMacBlock, NoMacBlock, PendingMacBlock, ci_may_still_be_on, read_block, state_paths
@@ -123,10 +124,9 @@ DOT_RANGED = "●━"
 # The chart mode every showrunner's dailies use, kept in one file so no
 # session has to remember it (user, 2026-10-03). `--chart` sets it.
 CHART_CONF = Path.home() / ".local/state/showrunner/dailies.conf"
-AGENTS_DIR = Path.home() / "rust" / "hanadocs" / "agents"
 CHART_KEY = "chart"
 NOW_MARK = "▼ "
-# A unit under a /build_hold carries this marker on its timeline row; no
+# A unit under a /build:hold carries this marker on its timeline row; no
 # marker means not held (user, 2026-10-03: "Without that marker I will assume
 # it is not held"). The hold's start, purpose and release are stated once, in
 # the line after the timeline (user, 2026-10-04: "you do not need to repeat
@@ -259,10 +259,53 @@ class Topic:
 
 
 @dataclass(frozen=True)
-class Outstanding:
+class DueNow:
+    pass
+
+
+@dataclass(frozen=True)
+class DeferredUntil:
+    at: datetime
+
+
+OutstandingTiming = DueNow | DeferredUntil
+
+
+@dataclass(frozen=True)
+class OutstandingReminder:
     since: datetime
     text: str
-    after: datetime | None = None
+    timing: OutstandingTiming = DueNow()
+
+
+@dataclass(frozen=True)
+class OutstandingQuestion:
+    since: datetime
+    text: str
+    question: str
+    timing: OutstandingTiming = DueNow()
+
+
+@dataclass(frozen=True)
+class ReviewedOutstandingQuestion:
+    since: datetime
+    text: str
+    question: str
+    reviewed: str
+    timing: OutstandingTiming = DueNow()
+
+
+@dataclass(frozen=True)
+class ReviewUnavailableOutstandingQuestion:
+    since: datetime
+    text: str
+    question: str
+    reason: str
+    timing: OutstandingTiming = DueNow()
+
+
+Outstanding = (OutstandingReminder | OutstandingQuestion | ReviewedOutstandingQuestion
+               | ReviewUnavailableOutstandingQuestion)
 
 
 @dataclass(frozen=True)
@@ -849,7 +892,7 @@ def read_outstanding(path: Path | None) -> list[Outstanding]:
         if not isinstance(entry, dict):
             raise InputError(f"{where}: expected an object")
         fields = cast(dict[str, object], entry)
-        check_keys(fields, {"since", "text", "after"}, where)
+        check_keys(fields, {"since", "text", "after", "question", "reviewed", "review_unavailable"}, where)
         since, text, after = fields.get("since"), fields.get("text"), fields.get("after")
         if not isinstance(since, str) or not STARTED.match(since):
             raise InputError(f"{where}.since: expected YYYY-MM-DDTHH:MM")
@@ -858,13 +901,33 @@ def read_outstanding(path: Path | None) -> list[Outstanding]:
         if not isinstance(text, str) or not text.strip() or "\n" in text:
             raise InputError(f"{where}.text: expected one non-empty line")
         check_plumbing(text, f"{where}.text")
-        items.append(Outstanding(datetime.fromisoformat(since), text, datetime.fromisoformat(after) if after else None))
+        timing = DeferredUntil(datetime.fromisoformat(after)) if isinstance(after, str) else DueNow()
+        since_at = datetime.fromisoformat(since)
+        question = fields.get("question")
+        reviewed, unavailable = fields.get("reviewed"), fields.get("review_unavailable")
+        if "question" not in fields:
+            if "reviewed" in fields or "review_unavailable" in fields:
+                raise InputError(f"{where}: question required for a review result")
+            items.append(OutstandingReminder(since_at, text, timing))
+            continue
+        if not isinstance(question, str) or not question.strip():
+            raise InputError(f"{where}.question: expected non-empty full question")
+        if "reviewed" in fields:
+            if not isinstance(reviewed, str) or not reviewed.strip() or "review_unavailable" in fields:
+                raise InputError(f"{where}.reviewed: expected completed review without an unavailable result")
+            items.append(ReviewedOutstandingQuestion(since_at, text, question, reviewed, timing))
+        elif "review_unavailable" in fields:
+            if not isinstance(unavailable, str):
+                raise InputError(f"{where}.review_unavailable: expected reason text")
+            items.append(ReviewUnavailableOutstandingQuestion(since_at, text, question, unavailable, timing))
+        else:
+            items.append(OutstandingQuestion(since_at, text, question, timing))
     return sorted(items, key=lambda item: item.since)
 
 
 def due(items: list[Outstanding], now: datetime) -> list[Outstanding]:
     """The items the user has not deferred past `now`, a local time in the report's zone."""
-    return [item for item in items if item.after is None or item.after <= now]
+    return [item for item in items if isinstance(item.timing, DueNow) or item.timing.at <= now]
 
 
 def read_dailies_hold() -> HoldState:
@@ -875,7 +938,7 @@ def read_dailies_hold() -> HoldState:
             try:
                 check_plumbing(holder.purpose, f"build hold {holder.name!r} purpose")
             except InputError as error:
-                raise InputError(f"{error}; have {holder.name} run /build_hold hold again with other words") from None
+                raise InputError(f"{error}; have {holder.name} run /build:hold hold again with other words") from None
     return hold
 
 
@@ -891,7 +954,7 @@ def read_mac_block() -> MacBlockFooterState:
             check_plumbing(block.reason, f"Mac block {block.holder!r} reason")
         except InputError as error:
             raise InputError(
-                f"{error}; have {block.holder} run /mac_test block again with other words"
+                f"{error}; have {block.holder} run /build:mac block again with other words"
             ) from None
     return block
 
@@ -1410,24 +1473,6 @@ def agent_number(value: str | None) -> float | None:
     return number if math.isfinite(number) else None
 
 
-def agent_fields(path: Path) -> dict[str, str]:
-    try:
-        lines = path.read_text(encoding="utf-8").splitlines()
-    except (OSError, UnicodeError):
-        return {}
-    if not lines or lines[0] != "---":
-        return {}
-    if "---" not in lines[1:]:
-        return {}
-    fields: dict[str, str] = {}
-    for line in lines[1:]:
-        if line == "---":
-            break
-        if (match := re.fullmatch(r"([A-Za-z_][\w-]*):\s*(.*?)\s*", line)) is not None:
-            fields[match.group(1)] = match.group(2).strip("\"'")
-    return fields
-
-
 def agent_refill(reset: datetime, now: datetime, zone: ZoneInfo) -> str:
     local = reset.astimezone(zone)
     return f"{local:%H:%M} today" if local.date() == now.date() else f"{local:%a %H:%M}"
@@ -1486,10 +1531,12 @@ def agent_section(now: datetime, zone: ZoneInfo, *, at: str | None = None) -> li
     if stamped is not None and stamped.tzinfo is None:
         stamped = stamped.replace(tzinfo=zone)
     minute_end = stamped.timestamp() + 60 if stamped is not None else None
-    for path in sorted(AGENTS_DIR.glob("*.md")):
-        fields = agent_fields(path)
-        if fields.get("state") == "active":
-            account_readings = readings.get(path.stem, [])
+    for note in note_file.read_notes():
+        fields = {key: value for key in ("limit_reset_count", "limit_reset", "resets",
+                                        "weekly_usage_checked_at", "weekly_remaining_usage")
+                  if (value := note.get(key)) is not None}
+        if note_file.in_use(note):
+            account_readings = readings.get(note.label, [])
             if minute_end is not None:
                 account_readings = [reading for reading in account_readings if reading.at.timestamp() < minute_end]
                 checked_at = agent_time(fields.get("weekly_usage_checked_at"))
@@ -1497,7 +1544,7 @@ def agent_section(now: datetime, zone: ZoneInfo, *, at: str | None = None) -> li
                     latest = account_readings[-1]
                     fields["weekly_usage_checked_at"] = latest.at.isoformat()
                     fields["weekly_remaining_usage"] = str(100 - latest.used_percent)
-            lines.append(agent_line(path.stem, fields, account_readings, now, zone))
+            lines.append(agent_line(note.label, fields, account_readings, now, zone))
     if len(lines) == 1:
         lines.append("- none active")
     lines.append("")

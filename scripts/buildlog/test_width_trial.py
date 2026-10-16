@@ -33,6 +33,11 @@ def iso(epoch: float) -> str:
     return datetime.fromtimestamp(epoch, UTC).isoformat()
 
 
+def setUpModule() -> None:
+    """The times these tests expect are Pacific; the user's zone setting must not change them."""
+    unittest.enterModuleContext(patch.dict(os.environ, {"USER_ZONE": "America/Los_Angeles"}))
+
+
 class VerdictCase(NamedTuple):
     name: str
     physical_wait: float
@@ -237,7 +242,7 @@ class WidthTrialTests(unittest.TestCase):
             capture_output=True,
             text=True,
             check=False,
-            env={**os.environ, "BUILDLOG_DIR": str(self.root), "TZ": "America/Los_Angeles"},
+            env={**os.environ, "BUILDLOG_DIR": str(self.root), "TZ": "America/Los_Angeles", "USER_ZONE": "America/Los_Angeles"},
         )
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         return result.stdout
@@ -398,6 +403,15 @@ class WidthTrialTests(unittest.TestCase):
         """F004: an exempt cargo fmt wait is absent from the gated-step row."""
         self.populate_balanced()
         self.insert_step("fmt", BASE + 1_500, 1_000, "fmt", ["cargo", "fmt"])
+
+        output = self.report()
+
+        self.assertRegex(self.metric_line(output, "memory wait per gated"), r"10\.0\s+20\.0$")
+
+    def test_taplo_step_does_not_change_gated_wait_mean(self) -> None:
+        """invoke.sh admits taplo without the memory gate, so its wait is not a gated wait."""
+        self.populate_balanced()
+        self.insert_step("taplo", BASE + 1_500, 1_000, "lint", ["taplo", "fmt", "--check"])
 
         output = self.report()
 

@@ -12,8 +12,11 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from enum import Enum
 from pathlib import Path
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING, Literal, TypedDict, cast
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
+from user_zone import user_zone_name  # noqa: E402
 
 if TYPE_CHECKING:
     from showrunners import Place
@@ -26,7 +29,6 @@ REASON_HEAD = ("Showrunner footer missing or out of date. End this reply with th
                "then two empty lines, `Waiting on:`, an empty line, and one `* ` bullet per item. A question for the user "
                "is never restated there; while any is open, the first bullet is its count, as below:")
 STATUS = re.compile(r"Status: PRODUCTION — ([a-z]*)")
-ZONE_MARKER = "- **User zone:**"
 TIME_LINE = re.compile(r"^(\d{2}):(\d{2}) (\S+) update:$")
 RENDER_TIMEOUT_SECONDS = 10
 TIME = r"(?:[01]\d|2[0-3]):[0-5]\d(?:\+1)?"
@@ -46,6 +48,11 @@ ASK_ONCE = ("A question for the user is asked once, in full, when it first comes
             + "block never restates it or its choices; list the questions in full only when the user asks what they are. ")
 
 
+# The switch file's content when a conversation pause turned the footer off. A switch turned off
+# on purpose is empty, so the pause's resume leaves it off.
+PAUSE_MARK = "paused by a conversation pause\n"
+
+
 class FooterState(Enum):
     ON = "on"
     OFF = "off"
@@ -62,6 +69,112 @@ class NoDailiesSchedule(Enum):
 
 class FooterError(Exception):
     """The shared footer renderer could not provide an authoritative footer."""
+
+
+@dataclass(frozen=True)
+class PendingReviewedQuestion:
+    text: str
+    reviewed: str
+
+
+@dataclass(frozen=True)
+class PendingReviewUnavailableQuestion:
+    text: str
+    question: str
+    reason: str
+
+
+PendingQuestion = PendingReviewedQuestion | PendingReviewUnavailableQuestion
+
+
+@dataclass(frozen=True)
+class QuestionReplyReady:
+    pass
+
+
+@dataclass(frozen=True)
+class QuestionReplyBlocked:
+    reason: str
+
+
+class PendingReviewedQuestionRecord(TypedDict):
+    kind: Literal["reviewed"]
+    text: str
+    reviewed: str
+
+
+class PendingReviewUnavailableQuestionRecord(TypedDict):
+    kind: Literal["review unavailable"]
+    text: str
+    question: str
+    reason: str
+
+
+class PendingReviewedRecord(TypedDict):
+    items: list[PendingReviewedQuestionRecord | PendingReviewUnavailableQuestionRecord]
+
+
+def pending_reviewed_path(instance_dir: Path) -> Path:
+    return instance_dir / "pending_reviewed.json"
+
+
+def read_pending_reviewed(instance_dir: Path) -> list[PendingQuestion]:
+    path = pending_reviewed_path(instance_dir)
+    try:
+        raw = cast(object, json.loads(path.read_text(encoding="utf-8")))
+    except FileNotFoundError:
+        return []
+    if not isinstance(raw, dict):
+        raise FooterError(f"{path}: expected an object")
+    entries = cast(dict[str, object], raw).get("items")
+    if not isinstance(entries, list):
+        raise FooterError(f"{path}: expected items")
+    items: list[PendingQuestion] = []
+    for raw_item in cast(list[object], entries):
+        if not isinstance(raw_item, dict):
+            raise FooterError(f"{path}: expected a question object")
+        item = cast(dict[str, object], raw_item)
+        text = item.get("text")
+        if not isinstance(text, str) or not text.strip():
+            raise FooterError(f"{path}: expected item text")
+        if item.get("kind") == "reviewed":
+            reviewed = item.get("reviewed")
+            if not isinstance(reviewed, str) or not reviewed.strip():
+                raise FooterError(f"{path}: expected reviewed question")
+            items.append(PendingReviewedQuestion(text, reviewed))
+        elif item.get("kind") == "review unavailable":
+            question, reason = item.get("question"), item.get("reason")
+            if not isinstance(question, str) or not question.strip() or not isinstance(reason, str):
+                raise FooterError(f"{path}: expected unavailable question and reason")
+            items.append(PendingReviewUnavailableQuestion(text, question, reason))
+        else:
+            raise FooterError(f"{path}: unknown question kind")
+    return items
+
+
+def add_pending_reviewed(instance_dir: Path, items: list[PendingQuestion]) -> None:
+    combined = read_pending_reviewed(instance_dir)
+    for item in items:
+        if item not in combined:
+            combined.append(item)
+    if not combined:
+        return
+    record: PendingReviewedRecord = {"items": []}
+    for item in combined:
+        if isinstance(item, PendingReviewedQuestion):
+            record["items"].append({"kind": "reviewed", "text": item.text, "reviewed": item.reviewed})
+        else:
+            record["items"].append({"kind": "review unavailable", "text": item.text,
+                                    "question": item.question, "reason": item.reason})
+    path = pending_reviewed_path(instance_dir)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    scratch = path.with_suffix(".tmp")
+    _ = scratch.write_text(json.dumps(record, ensure_ascii=False) + "\n", encoding="utf-8")
+    _ = scratch.replace(path)
+
+
+def delete_pending_reviewed(instance_dir: Path) -> None:
+    pending_reviewed_path(instance_dir).unlink(missing_ok=True)
 
 
 @dataclass(frozen=True)
@@ -96,7 +209,7 @@ def key_values(path: Path) -> dict[str, str]:
 
 
 def outstanding_path(slug: str) -> Path:
-    return Path.home() / ".local/state/showrunner/outstanding" / f"{slug}.json"
+    return state_root() / "outstanding" / f"{slug}.json"
 
 
 def state_root() -> Path:
@@ -116,12 +229,36 @@ def footer_state(slug: str) -> FooterState:
 
 
 def set_footer_state(slug: str, state: FooterState) -> None:
+    """Switch the footer on purpose; `off` writes the switch empty, which clears any pause mark."""
     path = switch_path(slug)
     if state is FooterState.OFF:
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.touch(exist_ok=True)
+        _ = path.write_text("", encoding="utf-8")
     else:
         path.unlink(missing_ok=True)
+
+
+def pause_footer(slug: str) -> None:
+    """Turn the footer off for a conversation pause, with the mark `unpause_footer` looks for."""
+    path = switch_path(slug)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    _ = path.write_text(PAUSE_MARK, encoding="utf-8")
+
+
+def footer_paused(slug: str) -> bool:
+    """Whether the footer is off because a conversation pause turned it off, and only that."""
+    try:
+        return switch_path(slug).read_text(encoding="utf-8") == PAUSE_MARK
+    except FileNotFoundError:
+        return False
+
+
+def unpause_footer(slug: str) -> bool:
+    """Turn the footer back on if the pause's mark is still there; whether it came back."""
+    if not footer_paused(slug):
+        return False
+    switch_path(slug).unlink(missing_ok=True)
+    return True
 
 
 def targeted_instances(session_id: str) -> list[Path]:
@@ -152,14 +289,8 @@ def read_production(instance_dir: Path) -> Production | None:
         status = next((match.group(1) for line in lines if (match := STATUS.search(line))), None)
         if status != "running":
             return None
-        zone_line = next((line for line in lines if line.startswith(ZONE_MARKER)), None)
-        if zone_line is None:
-            return None
-        zone_words = zone_line[len(ZONE_MARKER):].strip().split()
-        if not zone_words:
-            return None
-        zone = zone_words[0].strip("`")
-        _ = ZoneInfo(zone)
+        # The user's zone setting; the doc's own User zone line is no longer read.
+        zone = user_zone_name()
         try:
             state = key_values(instance_dir / "state")
         except OSError:
@@ -340,8 +471,80 @@ def waiting_format_error(bullets: list[str], now: datetime) -> str | None:
     return None
 
 
+def normalised(text: str) -> str:
+    return " ".join(text.split())
+
+
+def choice_comparison_text(text: str) -> str:
+    return normalised(re.sub(r"^\s*(?:[-*+]|\d+[.)])\s+", "", text))
+
+
+def pending_question_text(item: PendingQuestion) -> str:
+    return item.reviewed if isinstance(item, PendingReviewedQuestion) else item.question
+
+
+def check_reviewed_text(instance_dirs: list[str], reply: str) -> QuestionReplyReady | QuestionReplyBlocked:
+    accepted: list[str] = []
+    slugs: set[str] = set()
+    for instance in instance_dirs:
+        for item in read_pending_reviewed(Path(instance)):
+            question = pending_question_text(item)
+            accepted.append(question)
+            if normalised(question) not in normalised(reply):
+                return QuestionReplyBlocked(f"Question {item.text!r}: paste its reviewed question into this reply:\n{question}")
+        slugs.add(Path(instance).name.removeprefix("showrunner-"))
+    notify_scripts = str(Path(__file__).resolve().parent.parent / "notify")
+    if notify_scripts not in sys.path:
+        sys.path.insert(0, notify_scripts)
+    if TYPE_CHECKING:
+        from ..notify import reply_asks
+    else:
+        import reply_asks
+    asks = reply_asks.user_reply_questions(reply)
+    if not asks.sentences and not asks.has_choices:
+        return QuestionReplyReady()
+    for slug in tuple(slugs):
+        slugs.update(place_of(slug).below)
+    for slug in slugs:
+        try:
+            raw = cast(object, json.loads(outstanding_path(slug).read_text(encoding="utf-8")))
+        except FileNotFoundError:
+            continue
+        if not isinstance(raw, list):
+            raise FooterError(f"{slug}: expected outstanding list")
+        for entry in cast(list[object], raw):
+            if isinstance(entry, dict):
+                fields = cast(dict[str, object], entry)
+                accepted.extend(value for key in ("text", "question", "reviewed")
+                                if isinstance(value := fields.get(key), str))
+    registered = [reply_asks.question_prose(choice_comparison_text(question)) for question in accepted]
+    for sentence in (*asks.sentences, *asks.choice_lines):
+        compared = reply_asks.question_prose(choice_comparison_text(sentence))
+        if compared and not any(item and (compared in item or item in compared) for item in registered):
+            return QuestionReplyBlocked(f"Unregistered ask {sentence!r}: record the item with "
+                                        + "update_registration.py footer --state and paste its reviewed question "
+                                        + "into this reply.")
+    return QuestionReplyReady()
+
+
 def block_reason(instance_dirs: list[str], reply: str,
-                 states: dict[str, FooterState]) -> str | None:
+                 states: dict[str, FooterState], *, skip_footer: bool = False) -> str | None:
+    if not instance_dirs:
+        return None
+    checked = check_reviewed_text(instance_dirs, reply)
+    if isinstance(checked, QuestionReplyBlocked):
+        return checked.reason
+    reason = footer_block_reason(instance_dirs, reply, states, skip_footer=skip_footer)
+    if reason is None:
+        for instance in instance_dirs:
+            delete_pending_reviewed(Path(instance))
+    return reason
+
+
+def footer_block_reason(instance_dirs: list[str], reply: str,
+                       states: dict[str, FooterState], *, skip_footer: bool) -> str | None:
+    if skip_footer:
+        return None
     productions = [production for path in instance_dirs if (production := read_production(Path(path))) is not None]
     if not productions or all(states[production.slug] is FooterState.OFF for production in productions):
         return None

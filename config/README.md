@@ -30,21 +30,21 @@ whose first 1M release changes, is a row here.
 Which lint checks run, everywhere they run: `cache`, `mend`, `style_review`,
 `clippy`, `doc`, `fmt`, under an `[operations]` section. Values are `on` or
 `off`; a missing key or missing file means `on`. One key per check with no
-per-consumer override — `clippy=off` means cargo clippy does not run in the
-`/clippy` skill *or* in a `/unit:direct` phase.
+per-consumer override — `clippy=off` means cargo clippy does not run in a
+`/unit:direct` phase, the lint CLI, or the fix pipeline.
 
-Use `/lint_config` to view or change them. The two consumers read it on their
+Use `/lint_config` to view or change them. Consumers read it on their
 next run, so a change is immediate:
 
-- the `/clippy` skill, at the start of every run — including runs started by
-  `/commit_prep` or a `/unit:direct` work order
-- `scripts/delegate/verify.sh` — the `lint`, `fmt`, and `final` arms
+- `/unit:style_review` — the phase's main review or a run by hand
+- `scripts/lint/invoke.sh` — the lint CLI, fix pipeline, and
+  `scripts/delegate/verify.sh`'s `lint` and `fmt` arms
 
 Deliberately not gated: `verify.sh check`/`test`/`example`, the workspace check
 and test inside `verify.sh final`, `pre_release_checks.sh`, and
 `validate_ci.sh`. Those are correctness gates rather than lints, and a release
 check that silently no-ops is worse than a noisy one. Scope is never
-configurable either — `verify.sh` pins targets per package for correctness, so
+configurable either — <PhaseChecks/> and `verify.sh` define scope and targets, so
 config decides whether a check runs, never with what flags.
 
 `scripts/lint/lint_config.sh` is both the reader and the editor: source it and
@@ -53,7 +53,7 @@ the SKIPPED line), or run it as the `/lint_config` CLI.
 
 ## mac_test.conf
 
-Controls Mac test offload and the `/mac_test` block command. It names the CI
+Controls Mac test offload and the `/build:mac` block command. It names the CI
 repository, workflow, job and repository variable; bounds each `gh` call;
 sets the default and maximum block lifetime; and sets the expiry-warning
 window. Offload settings name the SSH host and connection and probe time
@@ -64,32 +64,6 @@ Linux-only packages, and Mac nextest exclusions. A repository needs a
 the Mac. An empty `ci_repo` disables CI calls. `MAC_TEST_CONFIG` selects a
 different file for a checkout's scripts in tests. Installed scripts refuse to
 run with `MAC_TEST_CONFIG` set.
-
-## clippy.conf
-
-The `/clippy` delegation tuning file — *who* runs the checks, where `lint.conf`
-says *which* checks run. `SCAN_AGENT` puts the mend/clippy/doc stages in one
-subagent so a workspace-sized cargo log never enters the main conversation;
-`FANOUT` lets an approved fix batch split across parallel fixer agents.
-`MIN_FINDINGS` (12), `MIN_FILES` (4), `MAX_AGENTS` (4), and
-`FINDINGS_PER_AGENT` (8) decide whether a batch is large and splittable enough
-to be worth a wave and how wide it opens; `PROGRESS_INTERVAL_SECONDS` (120) is
-the gap between supervision reports while one runs.
-
-Fixers own whole files, never individual findings, so no two ever edit the same
-file — which is why `MIN_FILES` exists and why a batch concentrated in two files
-stays inline however many findings it holds. Everything past that partition is
-settled between the agents themselves over `SendMessage`, under
-`<PeerCoordinationContract/>` in `commands/clippy.md`.
-
-Hand-edited, like `delegate.conf`; `scripts/lint/clippy_config.sh` reads and
-validates it (`export`, `get <key>`, or no argument for a status listing) and
-carries no defaults. A missing file, an unset key, a non-numeric value, or a
-value below its minimum makes it print every problem it found and exit 2 —
-whereupon `/clippy` runs the whole pipeline inline and says why. The lint never
-depends on this file: inline is what the skill did before it existed.
-`/clippy no-agents` forces that path for one run, and `auto-proceed` takes it
-always, since a codex sub-session has no agent tool to launch anything with.
 
 ## delegate.conf
 
@@ -119,10 +93,11 @@ makes the notifier use 900 seconds; Codex requires a positive integer. It is
 `unit_notifier.sh --all` retimes every unit run's instance to the new value,
 or to `--all <minutes>`, and leaves each one on or off.
 
-`PLAN_DELEGATE_PROGRESS_UPDATES=on-demand` gives a new Claude unit run no
-notifier instance, so `/unit:report` runs only when someone asks for it;
-`/unit:report on` makes the instance then. `scheduled`, or no line, makes it
-at every run's start. It is `scheduled` (user, 2026-10-10).
+`PLAN_DELEGATE_PROGRESS_UPDATES=on-demand`, or no line, gives a new Claude
+unit run no notifier instance, so `/unit:report` runs only when someone asks
+for it; `/unit:report on` makes the instance then. `scheduled` makes it at
+every run's start. A resumed run that already has an instance keeps it, on or
+off. It is `on-demand` (user, 2026-10-13: no timer unless asked).
 
 `scripts/delegate/findings.py` reads the file at startup, so an edit applies to
 the next `findings.py gate` with nothing to restart. The file is authoritative:
@@ -137,15 +112,49 @@ machine's.
 The counts each production's dailies show on one line above the chart, in
 every length: `counts: nightly queue 8 · proposals 3`. A line is
 `<production slug>.<label>=lines <file> <regex>`, which counts the file's lines
-matching the regex, or `<production slug>.<label>=files <glob>`, which counts
-the matching files. The slug is the production doc's file name less
+matching the regex, `<production slug>.<label>=files <glob>`, which counts the
+matching files, or `<production slug>.<label>=issues <folder> <tag>`, which
+counts the issues directly in the folder whose frontmatter is open and tagged
+with the tag. The slug is the production doc's file name less
 `-production.md`. `~` expands, and a hyphen in the label reads as a space.
 `scripts/production/dailies_counts.py` reads it each time the dailies input is
-built, so an edit applies to the next dailies. A missing file shows as `not
-found`. A bad line leaves out the counts line, and the builder prints
+built, so an edit applies to the next dailies. A missing file or folder shows as
+`not found`. A bad line leaves out the counts line, and the builder prints
 `counts: unavailable — dailies.conf line <n>: …`. `DAILIES_COUNTS_CONFIG`
 overrides the path. Today it holds build-followups' nightly review queue and
-plan backlog, and tool-based-ui's hanadocs proposals (user, 2026-10-10).
+plan backlog, and tool-based-ui's open hanadocs proposal issues (user, 2026-10-10).
+
+## user_zone.conf
+
+The zone every time shown to the user is written in: `zone=<IANA zone name>`,
+such as `zone=America/New_York`. Reports, tables, alerts and the commands in
+skills read it through `scripts/lib/user_zone.py`, so changing the zone is this
+one line, and it applies to the next report with nothing to restart. The label
+beside a time (EDT, EST) comes from the zone. With no file, or no `zone=` line,
+the zone is America/New_York; a name that is not a zone is refused, with this
+file named.
+
+- Python imports `user_zone()`, `user_zone_name()` or `zone_label()` from the
+  script.
+- Shell and skill text run it for the name:
+  `TZ="$(~/.claude/scripts/lib/py ~/.claude/scripts/lib/user_zone.py)" date '+%H:%M %Z'`.
+- `USER_ZONE` in the environment wins over the file. Tests whose expected
+  output is in one zone pin it this way.
+
+A production keeps its own `User zone` line in its production doc, and the
+dailies read that. A time stored without an offset keeps the zone it was
+recorded in: `scripts/model_study/turns.py` names Pacific for the model study's
+roster.
+
+## statusline.conf
+
+Colors for each role and account in the status line, plus usage-level colors
+and thresholds for context tokens used and quota percentages left.
+`scripts/statusline/statusline.sh` passes it to `statusline.jq` on each refresh;
+an edit applies on the next refresh. A missing or bad entry leaves that piece
+uncolored. Colors use ANSI names (`cyan`, `bright-magenta`, and so on) or the
+named 256-color entries `orange`, `purple`, `pink`, `teal` and `brown`.
+`/new_account` adds the new Claude account's `account.` line.
 
 ## cargo-fmt-exclusions.json
 

@@ -170,16 +170,16 @@ def role_at(log: RoleLog, agent_id: str, at: datetime) -> Assignment | Unassigne
 
 
 def _review_lens(run: Path, name: str) -> Lens | None:
-    seat_name = re.compile(r"(?<![\w.-])" + re.escape(name) + r"(?![\w.-])")
+    worker_name = re.compile(r"(?<![\w.-])" + re.escape(name) + r"(?![\w.-])")
     log_name = re.compile(r"review_agent_(?:\d+_)?(" + "|".join(LENSES) + r")\.log")
     evidence_mtimes: dict[Lens, float] = {}
-    for path in sorted(run.glob("review_agent_*.log")):
+    for path in sorted([*run.glob("review_agent_*.log"), *run.glob("phases/*/review_agent_*.log")]):
         match = log_name.fullmatch(path.name)
         if match is None:
             continue
         try:
             with path.open(encoding="utf-8") as log:
-                if any(seat_name.search(line) for line in log):
+                if any(worker_name.search(line) for line in log):
                     lens = _lens(match.group(1))
                     stamp = path.stat().st_mtime
                     evidence_mtimes[lens] = max(stamp, evidence_mtimes.get(lens, float("-inf")))
@@ -189,6 +189,10 @@ def _review_lens(run: Path, name: str) -> Lens | None:
 
 
 def _run_assignments(run: Path) -> Iterator[tuple[str, Assignment]]:
+    # The remote reader loads this module without a delegate checkout.
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+    from scripts.delegate.worker_state import worker_ledger
+
     roster_path = run / "mesh_roster.json"
     try:
         if roster_path.is_file():
@@ -199,12 +203,12 @@ def _run_assignments(run: Path) -> Iterator[tuple[str, Assignment]]:
             for name, value in cast(dict[str, object], value).items():
                 if not isinstance(value, dict):
                     continue
-                seat = cast(dict[str, object], value)
-                agent_id = seat.get("thread_id")
+                worker = cast(dict[str, object], value)
+                agent_id = worker.get("thread_id")
                 if not isinstance(agent_id, str) or not agent_id.strip():
                     continue
-                role = seat.get("role")
-                previous_role = seat.get("previous_role")
+                role = worker.get("role")
+                previous_role = worker.get("previous_role")
                 if isinstance(previous_role, str) and previous_role in ROLES:
                     # The only surviving timestamp is the roster's mtime. One second
                     # earlier preserves the known order without claiming precision.
@@ -217,21 +221,39 @@ def _run_assignments(run: Path) -> Iterator[tuple[str, Assignment]]:
                     yield agent_id, Assignment(stamp, current, lens, True)
     except (OSError, ValueError, RecursionError) as exc:
         _report_problem(f"{roster_path}: {exc}")
-    seats_path = run / "seats"
+    workers_path = worker_ledger(run)
     try:
-        if seats_path.is_file():
-            stamp = datetime.fromtimestamp(seats_path.stat().st_mtime, timezone.utc)
-            for line in seats_path.read_text(encoding="utf-8").splitlines():
+        if workers_path.is_file():
+            stamp = datetime.fromtimestamp(workers_path.stat().st_mtime, timezone.utc)
+            for line in workers_path.read_text(encoding="utf-8").splitlines():
                 agent_id, separator, _name = line.partition("\t")
                 if separator and agent_id.strip():
                     yield agent_id, Assignment(stamp, "worker", None, True)
     except (OSError, ValueError) as exc:
-        _report_problem(f"{seats_path}: {exc}")
+        _report_problem(f"{workers_path}: {exc}")
 
 
-def backfill(archive: Path, live: Path) -> int:
+def _recover_directors(live: Path, recovered: list[tuple[str, Assignment]]) -> None:
+    """Add a director assignment for each marker that names a run folder under `live`."""
+    active = live / "active"
+    if not active.is_dir():
+        return
+    for marker in sorted(active.iterdir()):
+        if not marker.is_file():
+            continue
+        try:
+            run_text = marker.read_text(encoding="utf-8").strip()
+            if run_text and Path(run_text).is_dir() and Path(run_text).resolve().parent == live.resolve():
+                stamp = datetime.fromtimestamp(marker.stat().st_mtime, timezone.utc)
+                recovered.append((marker.name, Assignment(stamp, "director", None, True)))
+        except (OSError, ValueError) as exc:
+            _report_problem(exc)
+
+
+def backfill(archive: Path, *live: Path) -> int:
+    """Recover assignments from the archive and each live run root."""
     recovered: list[tuple[str, Assignment]] = []
-    for root in (archive, live):
+    for root in (archive, *live):
         if not root.exists():
             continue
         for run in sorted(root.iterdir()):
@@ -240,18 +262,8 @@ def backfill(archive: Path, live: Path) -> int:
                     recovered.extend(_run_assignments(run))
                 except (OSError, ValueError) as exc:
                     _report_problem(exc)
-    active = live / "active"
-    if active.is_dir():
-        for marker in sorted(active.iterdir()):
-            if not marker.is_file():
-                continue
-            try:
-                run_text = marker.read_text(encoding="utf-8").strip()
-                if run_text and Path(run_text).is_dir() and Path(run_text).resolve().parent == live.resolve():
-                    stamp = datetime.fromtimestamp(marker.stat().st_mtime, timezone.utc)
-                    recovered.append((marker.name, Assignment(stamp, "director", None, True)))
-            except (OSError, ValueError) as exc:
-                _report_problem(exc)
+    for root in live:
+        _recover_directors(root, recovered)
     path = state_dir() / "agents.jsonl"
     path.parent.mkdir(parents=True, exist_ok=True)
     added = 0
@@ -307,7 +319,7 @@ def main(argv: list[str] | None = None) -> int:
     _ = registrar.add_argument("--role", choices=ROLES, required=True)
     importer = commands.add_parser("backfill", help="recover surviving run assignments")
     _ = importer.add_argument("--archive", type=Path, default=Path.home() / ".local/state/usage-model/delegate-archive")
-    _ = importer.add_argument("--live", type=Path, default=Path("/tmp/claude/delegate"))
+    _ = importer.add_argument("--live", type=Path, action="append", help="a run root; default: both run-folder names")
     reader = commands.add_parser("show", help="print recorded assignments as a Markdown table")
     _ = reader.add_argument("--id")
     args = parser.parse_args(argv)
@@ -318,7 +330,10 @@ def main(argv: list[str] | None = None) -> int:
         elif command == "register":
             _ = register_default(cast(str, args.id), cast(Role, args.role), datetime.now(timezone.utc))
         elif command == "backfill":
-            added = backfill(cast(Path, args.archive), cast(Path, args.live))
+            sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+            from scripts.lib import unit_runs
+
+            added = backfill(cast(Path, args.archive), *(cast(list[Path] | None, args.live) or unit_runs.run_roots()))
             print(f"Backfilled {added} assignments.")
         else:
             _show(assignments(state_dir() / "agents.jsonl"), cast(str | None, args.id))

@@ -10,7 +10,7 @@ Bounds: unbounded <= at < unbounded; zone: America/Los_Angeles
 | natedev | director | director | not_applicable | claude-opus-4-6 | unreported | 1,000 | 1 | 1,000 |
 | natedev | loose | unassigned | not_applicable | claude-opus-4-6 | unreported | 50 | 1 | 50 |
 | natedev | unknown | review | unrecorded | claude-opus-4-6 | unreported | 30 | 1 | 30 |
-| natedev | unknown | unassigned | not_applicable | gpt-6-sol | unreported | unweighted | 1 | unweighted |
+| natedev | unknown | unassigned | not_applicable | invented-unweighted-model | unreported | unweighted | 1 | unweighted |
 
 Coverage
 
@@ -24,9 +24,10 @@ Unweighted:
 
 | model | turns |
 | --- | --- |
-| gpt-6-sol | 1 |
+| invented-unweighted-model | 1 |
 
 Review turns with unrecorded lens: 1.
+Turns with unclassified activity: 0.
 
 Sources
 

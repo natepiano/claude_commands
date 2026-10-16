@@ -7,12 +7,17 @@ import json
 import os
 import shutil
 import signal
+import select
 import subprocess
+import sys
 import tempfile
 import time
+from unittest.mock import patch
 import unittest
 from pathlib import Path
 from typing import cast, override
+
+from scripts.delegate.wait_for_test_state import wait_until
 
 VERIFY = Path(__file__).with_name("verify.sh")
 BOARD = VERIFY.with_name("board.sh")
@@ -66,7 +71,7 @@ PY
     if [ "${TEST_BLOCK:-0}" = 1 ]; then
         printf '%s\n' "$$" > "$TEST_CARGO_PID"
         : > "$TEST_RUNNING"
-        while [ ! -f "$TEST_RELEASE" ]; do sleep 0.1; done
+        python3 "$TEST_WAIT_HELPER" "$TEST_RELEASE"
     fi
     if [ "${TEST_RECLAIM_CHECK:-0}" = 1 ]; then
         old=$(cat "$TEST_CARGO_PID")
@@ -117,7 +122,8 @@ esac
         _ = meminfo.write_text("MemAvailable: 50331648 kB\n")
         self.environment = {
             **{name: value for name, value in os.environ.items()
-               if name not in {"PLAN_DELEGATE_BOARD_DIR", "PLAN_DELEGATE_TEAM_ROLE"}},
+               if name not in {"PLAN_DELEGATE_BOARD_DIR", "PLAN_DELEGATE_TEAM_ROLE", "CODEX_THREAD_ID",
+                               "CODEX_SESSION_ID", "PLAN_DELEGATE_DETACHED_RUN"}},
             "PATH": f"{stubs}:{os.environ['PATH']}",
             "HOME": str(home),
             "RUSTUP_HOME": str(Path.home() / ".rustup"),
@@ -153,6 +159,7 @@ esac
             "PLAN_DELEGATE_SESSION_DIR": str(self.root / "session"),
             "TEST_RUNNING": str(self.root / "running"),
             "TEST_RELEASE": str(self.root / "release"),
+            "TEST_WAIT_HELPER": str(VERIFY.parent / "wait_for_test_state.py"),
             "TEST_CARGO_PID": str(self.root / "cargo-pid"),
         }
 
@@ -178,9 +185,28 @@ esac
             os.killpg(group, signal.SIGKILL)
         except ProcessLookupError:
             pass
-        deadline = time.monotonic() + 3
-        while self.live_group_processes(group) and time.monotonic() < deadline:
-            time.sleep(0.05)
+        deadline = time.monotonic() + 300
+        while pids := self.live_group_processes(group):
+            descriptors: list[int] = []
+            poll_pids = False
+            try:
+                for pid in pids:
+                    try:
+                        descriptors.append(os.pidfd_open(pid))
+                    except ProcessLookupError:
+                        pass
+                    except AttributeError:
+                        poll_pids = True
+                remaining = deadline - time.monotonic()
+                self.assertGreater(remaining, 0, f"group {group} never stopped")
+                if poll_pids:
+                    time.sleep(min(0.01, remaining))
+                elif descriptors:
+                    readable, _, _ = select.select(descriptors, [], [], remaining)
+                    self.assertTrue(readable, f"group {group} never stopped")
+            finally:
+                for descriptor in descriptors:
+                    os.close(descriptor)
 
     def records(self) -> list[Record]:
         return [record for path in (self.root / "buildlog").glob("*/*.jsonl")
@@ -189,15 +215,72 @@ esac
 
     def verify(self, environment: dict[str, str]) -> subprocess.CompletedProcess[str]:
         return subprocess.run(["bash", str(VERIFY), "check", "sample"], cwd=self.root,
-                              env=environment, capture_output=True, text=True, check=False, timeout=30)
+                              env=environment, capture_output=True, text=True, check=False, timeout=300)
+
+    def wait_for_running(self, path: Path, process: subprocess.Popen[str] | subprocess.Popen[bytes]) -> None:
+        wait_until(lambda: path.exists() or process.poll() is not None, path.parent, processes=(process,))
+        self.assertTrue(path.exists(), "verify never reached its expected state")
+
+    def test_group_cleanup_ends_without_pidfd_support(self) -> None:
+        child = subprocess.Popen([sys.executable, "-c", "import signal; signal.pause()"],
+                                 start_new_session=True)
+        try:
+            # Pin the race where a killed member is still visible in the first
+            # snapshot, so portable cleanup must take its polling branch.
+            with patch.object(os, "pidfd_open", side_effect=AttributeError("pidfd_open unavailable"),
+                              create=True), patch.object(self, "live_group_processes",
+                                                         side_effect=[[child.pid], []]):
+                self.end_group(child.pid)
+            self.assertNotEqual(child.wait(timeout=300), 0)
+            self.assertEqual(self.live_group_processes(child.pid), [])
+        finally:
+            if child.poll() is None:
+                child.kill()
+            _ = child.wait(timeout=300)
 
     def test_no_token_records_zero(self) -> None:
-        result = self.verify(self.environment)
+        # A session dir alone makes this a director's run, which takes the token.
+        environment = {name: value for name, value in self.environment.items()
+                       if name != "PLAN_DELEGATE_SESSION_DIR"}
+        result = self.verify(environment)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual(len(self.records()), 1)
         self.assertEqual(self.records()[0]["token_wait_s"], 0)
         self.assertEqual((self.root / "metadata-calls").read_text().splitlines(), ["metadata"])
         self.assertTrue((self.root / "cargo-calls").read_text().startswith("check "))
+
+    def test_director_run_takes_the_token_as_slot_director(self) -> None:
+        clock = self.root / "director-clock"
+        _ = clock.write_text("100\n")
+        session = Path(self.environment["PLAN_DELEGATE_SESSION_DIR"])
+        result = self.verify({**self.environment, "PLAN_DELEGATE_TOKEN_CLOCK_FILE": str(clock)})
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(self.records()[0]["token_wait_s"], 0)
+        self.assertIn("[director] claim: token cargo acquired", (session / "board.log").read_text())
+        self.assertFalse((session / "locks" / "cargo.d").exists(), "the director's token was not released")
+
+    def test_token_wait_uses_elapsed_seconds_when_no_clock_override_is_present(self) -> None:
+        # Copy the board boundary into a disposable HOME; acquire deliberately
+        # crosses a whole second, so scheduling can only increase the wait.
+        home = self.root / "clock-home"
+        delegate = home / ".claude/scripts/delegate"
+        delegate.mkdir(parents=True)
+        for source in VERIFY.parent.parent.iterdir():
+            if source.name != "delegate":
+                (delegate.parent / source.name).symlink_to(source, target_is_directory=source.is_dir())
+        board = delegate / "board.sh"
+        _ = board.write_text('#!/bin/bash\nif [[ "$1" == acquire ]]; then sleep 1.1; fi\n'
+                             + 'exec bash "$TEST_REAL_BOARD" "$@"\n')
+        environment = {**self.environment, "HOME": str(home),
+                       "PLAN_DELEGATE_BOARD_DIR": str(self.root / "clock-board"),
+                       "PLAN_DELEGATE_TEAM_ROLE": "clock", "TEST_REAL_BOARD": str(BOARD)}
+        for key in ("PLAN_DELEGATE_WORKER_POLL_SECS", "PLAN_DELEGATE_WORKER_WAIT_ATTEMPTS",
+                    "PLAN_DELEGATE_EARLY_POLL_SECS", "PLAN_DELEGATE_TOKEN_CLOCK_FILE"):
+            _ = environment.pop(key, None)
+        result = self.verify(environment)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(len(self.records()), 1)
+        self.assertGreaterEqual(cast(int, self.records()[0]["token_wait_s"]), 1)
 
     def test_step_group_is_recorded_before_cargo_starts(self) -> None:
         board = self.root / "board"
@@ -241,6 +324,11 @@ esac
     def test_waiting_for_peer_call_records_token_seconds(self) -> None:
         board = self.root / "board"
         waiting = self.root / "waiting-for-token"
+        resume = self.root / "resume-acquisition"
+        first_clock = self.root / "first-clock"
+        second_clock = self.root / "second-clock"
+        _ = first_clock.write_text("1000\n")
+        _ = second_clock.write_text("1000\n")
         real_sleep = shutil.which("sleep")
         if real_sleep is None:
             self.fail("the token wait test needs sleep on PATH")
@@ -248,55 +336,39 @@ esac
         _ = sleep.write_text('''#!/bin/sh
 if [ "$1" = 3 ] && [ -n "${TEST_WAITING:-}" ]; then
     : > "$TEST_WAITING"
+    exec python3 "$TEST_WAIT_HELPER" "$TEST_WAIT_GATE"
 fi
 exec "$TEST_REAL_SLEEP" "$@"
 ''')
         sleep.chmod(0o755)
         first_environment = {**self.environment, "PLAN_DELEGATE_BOARD_DIR": str(board),
                              "PLAN_DELEGATE_TEAM_ROLE": "first", "TEST_BLOCK": "1",
-                             "TEST_REAL_SLEEP": real_sleep}
+                             "TEST_REAL_SLEEP": real_sleep,
+                             "PLAN_DELEGATE_TOKEN_CLOCK_FILE": str(first_clock)}
         second_environment = {**self.environment, "PLAN_DELEGATE_BOARD_DIR": str(board),
                               "PLAN_DELEGATE_TEAM_ROLE": "second", "TEST_WAITING": str(waiting),
-                              "TEST_REAL_SLEEP": real_sleep}
-        first_started_at = time.monotonic()
+                              "TEST_REAL_SLEEP": real_sleep, "TEST_WAIT_GATE": str(resume),
+                              "PLAN_DELEGATE_TOKEN_CLOCK_FILE": str(second_clock)}
         first = subprocess.Popen(["bash", str(VERIFY), "check", "sample"], cwd=self.root,
                                  env=first_environment, stdout=subprocess.PIPE,
                                  stderr=subprocess.PIPE, text=True, start_new_session=True)
         self.started_groups.add(first.pid)
         try:
-            deadline = time.monotonic() + 15
-            while not (self.root / "running").exists() and time.monotonic() < deadline:
-                if first.poll() is not None:
-                    break
-                time.sleep(0.05)
-            self.assertTrue((self.root / "running").exists(), "first verify call did not reach cargo check")
-            first_running_at = time.monotonic()
-            first_wait_upper_bound = int(first_running_at - first_started_at) + 1
+            self.wait_for_running(self.root / "running", first)
             second = subprocess.Popen(["bash", str(VERIFY), "check", "sample"], cwd=self.root,
                                       env=second_environment, stdout=subprocess.PIPE,
                                       stderr=subprocess.PIPE, text=True, start_new_session=True)
             self.started_groups.add(second.pid)
             try:
-                deadline = time.monotonic() + 30
-                while not waiting.exists() and time.monotonic() < deadline:
-                    if second.poll() is not None:
-                        break
-                    time.sleep(0.05)
-                self.assertTrue(waiting.exists(), "second verify call did not wait for the cargo token")
-                second_blocked_at = time.monotonic()
-                deadline = second_blocked_at + max(30, first_wait_upper_bound + 10)
-                while (int(time.monotonic() - second_blocked_at) - 1
-                       <= first_wait_upper_bound and time.monotonic() < deadline):
-                    time.sleep(0.05)
-                # Read before the touch: the second call's real wait can only run longer than this.
-                release_at = time.monotonic()
-                second_wait_lower_bound = int(release_at - second_blocked_at) - 1
-                self.assertGreater(second_wait_lower_bound, first_wait_upper_bound,
-                                   "second call was not observed waiting long enough")
+                self.wait_for_running(waiting, second)
                 self.assertIsNone(second.poll(), "second verify exited before the token was released")
+                self.assertEqual(len(self.records()), 0)
+                _ = second_clock.write_text("1020\n")
                 _ = (self.root / "release").touch()
-                first_output = first.communicate(timeout=20)
-                second_output = second.communicate(timeout=20)
+                first_output = first.communicate(timeout=300)
+                self.assertEqual(first.returncode, 0, first_output)
+                resume.touch()
+                second_output = second.communicate(timeout=300)
                 self.assertEqual(first.returncode, 0, first_output)
                 self.assertEqual(second.returncode, 0, second_output)
             finally:
@@ -318,26 +390,35 @@ exec "$TEST_REAL_SLEEP" "$@"
             self.fail("both verify calls must have buildlog records")
         first_wait = cast(int, first_record["token_wait_s"])
         second_wait = cast(int, second_record["token_wait_s"])
-        self.assertLessEqual(first_wait, first_wait_upper_bound)
-        self.assertGreaterEqual(second_wait, second_wait_lower_bound)
+        self.assertEqual(first_wait, 0)
+        self.assertEqual(second_wait, 20)
         self.assertGreater(second_wait, first_wait)
 
     def test_killed_verify_holder_is_reclaimed_promptly(self) -> None:
+        sleep = self.root / "stubs" / "sleep"
+        _ = sleep.write_text('''#!/bin/sh
+if [ "$1" = 3 ]; then
+    printf '%s\\n' "$1" >> "$TEST_RECLAIM_POLLS"
+fi
+exec "$TEST_REAL_SLEEP" "$@"
+''')
+        sleep.chmod(0o755)
+        real_sleep = shutil.which("sleep")
+        assert real_sleep is not None
+        polls = self.root / "reclaim-polls"
         board = self.root / "board"
         first_environment = {**self.environment, "PLAN_DELEGATE_BOARD_DIR": str(board),
                              "PLAN_DELEGATE_TEAM_ROLE": "first", "TEST_BLOCK": "1"}
         second_environment = {**self.environment, "PLAN_DELEGATE_BOARD_DIR": str(board),
-                              "PLAN_DELEGATE_TEAM_ROLE": "second"}
+                              "PLAN_DELEGATE_TEAM_ROLE": "second", "TEST_RECLAIM_POLLS": str(polls),
+                              "TEST_REAL_SLEEP": real_sleep}
+        first_environment["TEST_REAL_SLEEP"] = real_sleep
         first = subprocess.Popen(["bash", str(VERIFY), "check", "sample"], cwd=self.root,
                                  env=first_environment, stdout=subprocess.PIPE,
                                  stderr=subprocess.PIPE, text=True, start_new_session=True)
         self.started_groups.add(first.pid)
         try:
-            deadline = time.monotonic() + 15
-            while not (self.root / "running").exists() and time.monotonic() < deadline:
-                if first.poll() is not None:
-                    break
-                time.sleep(0.05)
+            self.wait_for_running((self.root / "running"), first)
             self.assertTrue((self.root / "running").exists(),
                             "first verify call did not reach cargo check")
             recorded_pid = (board / "locks" / "cargo.d" / "holder_pid").read_text()
@@ -347,19 +428,19 @@ exec "$TEST_REAL_SLEEP" "$@"
             self.started_groups.add(cast(int, step_record["group"]))
 
             self.end_group(first.pid)
-            _ = first.wait(timeout=5)
+            _ = first.wait(timeout=300)
             second = self.verify(second_environment)
             self.assertEqual(second.returncode, 0, second.stdout + second.stderr)
             records = self.records()
             self.assertEqual(len(records), 1)
-            self.assertLess(cast(int, records[0]["token_wait_s"]), 3)
+            self.assertFalse(polls.exists(), "reclaimed holder must not require a token polling sleep")
             self.assertIn(f"token cargo reclaimed from first: holder pid {first.pid} is gone",
                           (board / "board.log").read_text())
         finally:
             _ = (self.root / "release").touch()
             if first.poll() is None:
                 self.end_group(first.pid)
-            _ = first.wait(timeout=5)
+            _ = first.wait(timeout=300)
             if first.stdout is not None:
                 first.stdout.close()
             if first.stderr is not None:
@@ -376,10 +457,7 @@ exec "$TEST_REAL_SLEEP" "$@"
                                  stderr=subprocess.DEVNULL, start_new_session=True)
         self.started_groups.add(first.pid)
         try:
-            deadline = time.monotonic() + 15
-            while not (self.root / "running").exists() and time.monotonic() < deadline:
-                self.assertIsNone(first.poll(), "first verify exited before cargo")
-                time.sleep(0.05)
+            self.wait_for_running((self.root / "running"), first)
             self.assertTrue((self.root / "running").exists())
             step_record = cast(dict[str, object], json.loads(
                 (board / "locks" / "cargo.d" / "owned").read_text()))
@@ -387,7 +465,7 @@ exec "$TEST_REAL_SLEEP" "$@"
             self.started_groups.add(step_group)
             self.assertNotEqual(step_group, first.pid)
             first.kill()
-            _ = first.wait(timeout=5)
+            _ = first.wait(timeout=300)
             second = self.verify(second_environment)
             self.assertEqual(second.returncode, 0, second.stdout + second.stderr)
             self.assertEqual(self.live_group_processes(first.pid), [])
@@ -404,10 +482,7 @@ exec "$TEST_REAL_SLEEP" "$@"
                                  stderr=subprocess.PIPE, text=True, start_new_session=True)
         self.started_groups.add(first.pid)
         try:
-            deadline = time.monotonic() + 15
-            while not (self.root / "running").exists() and time.monotonic() < deadline:
-                self.assertIsNone(first.poll(), "first verify exited before cargo")
-                time.sleep(0.05)
+            self.wait_for_running((self.root / "running"), first)
             self.assertTrue((self.root / "running").exists())
             lock = board / "locks" / "cargo.d"
             step_record = cast(dict[str, object], json.loads((lock / "owned").read_text()))
@@ -420,7 +495,7 @@ exec "$TEST_REAL_SLEEP" "$@"
             _ = (lock / "expires").write_text("0")
             second = subprocess.run(["bash", str(BOARD), "acquire", str(board), "second",
                                      "cargo", "--wait", "0"], capture_output=True, text=True,
-                                    check=False, timeout=10)
+                                    check=False, timeout=300)
             self.assertEqual(second.returncode, 0, second.stdout + second.stderr)
             self.assertIn("reclaimed from first", second.stdout)
             self.assertIn("after its hold expired", (board / "board.log").read_text())
@@ -430,31 +505,31 @@ exec "$TEST_REAL_SLEEP" "$@"
 
             reclaimed_release = subprocess.run(
                 ["bash", str(BOARD), "release", str(board), "first", "cargo", "--pid", str(first.pid)],
-                capture_output=True, text=True, check=False, timeout=10)
+                capture_output=True, text=True, check=False, timeout=300)
             self.assertEqual(reclaimed_release.returncode, 3, reclaimed_release.stderr)
             self.assertIn("first does not hold cargo (holder is second)", reclaimed_release.stderr)
             wrong_process_release = subprocess.run(
                 ["bash", str(BOARD), "release", str(board), "first", "cargo", "--pid", "1"],
-                capture_output=True, text=True, check=False, timeout=10)
+                capture_output=True, text=True, check=False, timeout=300)
             self.assertEqual(wrong_process_release.returncode, 1, wrong_process_release.stderr)
             unowned_release = subprocess.run(
                 ["bash", str(BOARD), "release", str(board), "third", "cargo"],
-                capture_output=True, text=True, check=False, timeout=10)
+                capture_output=True, text=True, check=False, timeout=300)
             self.assertEqual(unowned_release.returncode, 1, unowned_release.stderr)
 
             _ = (self.root / "release").touch()
-            _, first_error = first.communicate(timeout=20)
+            _, first_error = first.communicate(timeout=300)
             self.assertEqual(first.returncode, 0, first_error)
             self.assertIn("first does not hold cargo (holder is second)", first_error)
             released = subprocess.run(["bash", str(BOARD), "release", str(board), "second",
                                        "cargo"], capture_output=True, text=True, check=False,
-                                      timeout=10)
+                                      timeout=300)
             self.assertEqual(released.returncode, 0, released.stdout + released.stderr)
         finally:
             _ = (self.root / "release").touch()
             if first.poll() is None:
                 self.end_group(first.pid)
-            _ = first.wait(timeout=5)
+            _ = first.wait(timeout=300)
             if first.stderr is not None:
                 first.stderr.close()
 
@@ -479,19 +554,14 @@ exec "$TEST_REAL_SLEEP" "$@"
         self.started_groups.add(first.pid)
         second: subprocess.Popen[str] | None = None
         try:
-            deadline = time.monotonic() + 15
-            while not first_running.exists() and time.monotonic() < deadline:
-                self.assertIsNone(first.poll(), "first verify exited before cargo")
-                time.sleep(0.05)
+            self.wait_for_running(first_running, first)
             self.assertTrue(first_running.exists(), "first cargo did not start")
             _ = (lock / "expires").write_text("0")
             second = subprocess.Popen(["bash", str(VERIFY), "check", "sample"], cwd=self.root,
                                       env=second_environment, stdout=subprocess.DEVNULL,
                                       stderr=subprocess.PIPE, text=True, start_new_session=True)
             self.started_groups.add(second.pid)
-            while not second_running.exists() and time.monotonic() < deadline:
-                self.assertIsNone(second.poll(), "second verify exited before cargo")
-                time.sleep(0.05)
+            self.wait_for_running(second_running, second)
             self.assertTrue(second_running.exists(), "second cargo did not start")
             self.assertEqual((lock / "holder_pid").read_text(), str(second.pid))
             second_record = cast(dict[str, object], json.loads((lock / "owned").read_text()))
@@ -500,7 +570,7 @@ exec "$TEST_REAL_SLEEP" "$@"
             second_cargo_pid = int((self.root / "second-cargo-pid").read_text())
 
             first_release.touch()
-            _, first_error = first.communicate(timeout=20)
+            _, first_error = first.communicate(timeout=300)
             self.assertEqual(first.returncode, 0, first_error)
             self.assertEqual((lock / "holder_pid").read_text(), str(second.pid))
             self.assertIsNone(second.poll(), "old release ended the new verify")
@@ -508,22 +578,107 @@ exec "$TEST_REAL_SLEEP" "$@"
                           "old release ended the new cargo step")
 
             second_release.touch()
-            _, second_error = second.communicate(timeout=20)
+            _, second_error = second.communicate(timeout=300)
             self.assertEqual(second.returncode, 0, second_error)
         finally:
             first_release.touch()
             second_release.touch()
             if first.poll() is None:
                 self.end_group(first.pid)
-            _ = first.wait(timeout=5)
+            _ = first.wait(timeout=300)
             if first.stderr is not None:
                 first.stderr.close()
             if second is not None:
                 if second.poll() is None:
                     self.end_group(second.pid)
-                _ = second.wait(timeout=5)
+                _ = second.wait(timeout=300)
                 if second.stderr is not None:
                     second.stderr.close()
+
+    def start_memory_waiter(self, environment: dict[str, str], errors: Path) -> subprocess.Popen[bytes]:
+        """Start a verify that takes the token and then waits on the held meminfo.
+
+        verify.sh tees its step output to stdout, so both streams go to `errors`.
+        """
+        with errors.open("wb") as stream:
+            process = subprocess.Popen(["bash", str(VERIFY), "check", "sample", "--no-cache"],
+                                       cwd=self.root, env=environment, stdout=stream,
+                                       stderr=subprocess.STDOUT, start_new_session=True)
+        self.started_groups.add(process.pid)
+        # The directory watch sees new files, not writes to this one, so poll it.
+        deadline = time.monotonic() + 300
+        while ("waiting for memory" not in errors.read_text(errors="replace")
+               and process.poll() is None and time.monotonic() < deadline):
+            time.sleep(0.01)
+        self.assertIn("waiting for memory", errors.read_text(errors="replace"))
+        self.assertIsNone(process.poll(), errors.read_text(errors="replace"))
+        return process
+
+    def test_two_phases_sharing_a_role_name_each_keep_the_token_through_a_memory_wait(self) -> None:
+        # Phases 15 and 16 of one unit share the session's board and its role
+        # names. Phase 15's launcher ending must not free phase 16's token.
+        board = self.root / "board"
+        lock = board / "locks" / "cargo.d"
+        meminfo = Path(self.environment["BUILDLOG_MEMINFO"])
+        _ = meminfo.write_text("MemAvailable: 0 kB\n")
+        environment = {**self.environment, "PLAN_DELEGATE_BOARD_DIR": str(board),
+                       "PLAN_DELEGATE_TEAM_ROLE": "impl", "BUILDLOG_MEM_POLL_S": "1"}
+        phase_16_errors = self.root / "phase-16.err"
+        phase_15_errors = self.root / "phase-15.err"
+        phase_16 = self.start_memory_waiter(environment, phase_16_errors)
+        phase_15: subprocess.Popen[bytes] | None = None
+        try:
+            self.assertEqual((lock / "holder_pid").read_text(), str(phase_16.pid))
+            launcher_release = subprocess.run(["bash", str(BOARD), "release", str(board), "impl",
+                                               "cargo"], capture_output=True, text=True,
+                                              check=False, timeout=300)
+            self.assertEqual(launcher_release.returncode, 1, launcher_release.stdout)
+            self.assertIn(f"held by live pid {phase_16.pid}", launcher_release.stderr)
+            self.assertEqual((lock / "holder_pid").read_text(), str(phase_16.pid))
+
+            with phase_15_errors.open("wb") as stream:
+                phase_15 = subprocess.Popen(["bash", str(VERIFY), "check", "sample", "--no-cache"],
+                                            cwd=self.root, env=environment,
+                                            stdout=stream, stderr=subprocess.STDOUT,
+                                            start_new_session=True)
+            self.started_groups.add(phase_15.pid)
+            _ = meminfo.write_text("MemAvailable: 50331648 kB\n")
+            self.assertEqual(phase_16.wait(timeout=300), 0, phase_16_errors.read_text())
+            self.assertEqual(phase_15.wait(timeout=300), 0, phase_15_errors.read_text())
+            self.assertNotIn("Traceback", phase_16_errors.read_text())
+            self.assertEqual((self.root / "cargo-calls").read_text().count("check"), 2)
+            self.assertFalse(lock.exists())
+        finally:
+            _ = meminfo.write_text("MemAvailable: 50331648 kB\n")
+            for process in (phase_16, phase_15):
+                if process is not None:
+                    if process.poll() is None:
+                        self.end_group(process.pid)
+                    _ = process.wait(timeout=300)
+
+    def test_a_token_lost_during_the_memory_wait_stops_the_step_with_a_reason(self) -> None:
+        board = self.root / "board"
+        meminfo = Path(self.environment["BUILDLOG_MEMINFO"])
+        _ = meminfo.write_text("MemAvailable: 0 kB\n")
+        environment = {**self.environment, "PLAN_DELEGATE_BOARD_DIR": str(board),
+                       "PLAN_DELEGATE_TEAM_ROLE": "impl", "BUILDLOG_MEM_POLL_S": "1"}
+        errors = self.root / "lost.err"
+        process = self.start_memory_waiter(environment, errors)
+        try:
+            # A peer's acquire made the directory and has not written its pid yet.
+            shutil.rmtree(board / "locks" / "cargo.d")
+            (board / "locks" / "cargo.d").mkdir()
+            _ = meminfo.write_text("MemAvailable: 50331648 kB\n")
+            self.assertNotEqual(process.wait(timeout=300), 0)
+            text = errors.read_text()
+            self.assertIn("lost the cargo token before its step started", text)
+            self.assertNotIn("Traceback", text)
+            self.assertFalse((self.root / "cargo-calls").exists())
+        finally:
+            _ = meminfo.write_text("MemAvailable: 50331648 kB\n")
+            if process.poll() is None:
+                self.end_group(process.pid)
+            _ = process.wait(timeout=300)
 
     def assert_interrupted_holder_stops_step_before_release(self, interruption: signal.Signals) -> None:
         board = self.root / "board"
@@ -537,10 +692,7 @@ exec "$TEST_REAL_SLEEP" "$@"
                                  preexec_fn=restore_sigint)
         self.started_groups.add(first.pid)
         try:
-            deadline = time.monotonic() + 15
-            while not (self.root / "running").exists() and time.monotonic() < deadline:
-                self.assertIsNone(first.poll(), "first verify exited before cargo")
-                time.sleep(0.05)
+            self.wait_for_running((self.root / "running"), first)
             self.assertTrue((self.root / "running").exists())
             lock = board / "locks" / "cargo.d"
             step_record = cast(dict[str, object], json.loads((lock / "owned").read_text()))
@@ -548,7 +700,7 @@ exec "$TEST_REAL_SLEEP" "$@"
             self.started_groups.add(step_group)
 
             os.killpg(first.pid, interruption)
-            _ = first.wait(timeout=10)
+            _ = first.wait(timeout=300)
             self.assertNotEqual(first.returncode, 0)
             self.assertFalse(lock.exists(), "interrupted verify kept its token")
             self.assertEqual(self.live_group_processes(step_group), [],
@@ -558,13 +710,57 @@ exec "$TEST_REAL_SLEEP" "$@"
         finally:
             _ = (self.root / "release").touch()
             self.end_group(first.pid)
-            _ = first.wait(timeout=5)
+            _ = first.wait(timeout=300)
 
     def test_sigterm_stops_step_before_token_release(self) -> None:
         self.assert_interrupted_holder_stops_step_before_release(signal.SIGTERM)
 
     def test_sigint_stops_step_before_token_release(self) -> None:
         self.assert_interrupted_holder_stops_step_before_release(signal.SIGINT)
+
+    def detach_environment(self, status: int) -> dict[str, str]:
+        """A Codex worker's environment whose mesh_runs.py stub records its argv and exits `status`."""
+        stub = self.root / "mesh_runs_stub.py"
+        _ = stub.write_text("import json, os, sys\n"
+                            + "with open(os.environ['TEST_MESH_RUNS_CALLS'], 'a', encoding='utf-8') as calls:\n"
+                            + "    calls.write(json.dumps(sys.argv[1:]) + '\\n')\n"
+                            + "raise SystemExit(int(os.environ['TEST_MESH_RUNS_STATUS']))\n")
+        return {**self.environment, "CODEX_THREAD_ID": "thread-worker", "VERIFY_MESH_RUNS_SCRIPT": str(stub),
+                "TEST_MESH_RUNS_CALLS": str(self.root / "mesh-runs-calls"), "TEST_MESH_RUNS_STATUS": str(status)}
+
+    def mesh_runs_calls(self) -> list[list[str]]:
+        path = self.root / "mesh-runs-calls"
+        if not path.exists():
+            return []
+        return [cast(list[str], json.loads(line)) for line in path.read_text(encoding="utf-8").splitlines()]
+
+    def test_a_codex_worker_call_detaches_and_returns_without_building(self) -> None:
+        result = self.verify(self.detach_environment(0))
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(self.mesh_runs_calls(), [[
+            "start", "--label", "verify.sh check sample", "--",
+            "bash", str(VERIFY.resolve()), "check", "sample",
+        ]])
+        self.assertFalse((self.root / "cargo-calls").exists())
+        self.assertEqual(self.records(), [])
+
+    def test_a_caller_mesh_runs_cannot_detach_runs_attached(self) -> None:
+        for status, note in ((3, False), (1, True)):
+            with self.subTest(status=status):
+                for path in (self.root / "mesh-runs-calls", self.root / "cargo-calls"):
+                    path.unlink(missing_ok=True)
+                result = self.verify(self.detach_environment(status))
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertEqual(len(self.mesh_runs_calls()), 1)
+                self.assertTrue((self.root / "cargo-calls").read_text().startswith("check "))
+                self.assertEqual("could not detach" in result.stderr, note, result.stderr)
+
+    def test_the_detached_run_itself_does_not_detach_again(self) -> None:
+        environment = {**self.detach_environment(0), "PLAN_DELEGATE_DETACHED_RUN": "1"}
+        result = self.verify(environment)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(self.mesh_runs_calls(), [])
+        self.assertTrue((self.root / "cargo-calls").read_text().startswith("check "))
 
 
 if __name__ == "__main__":

@@ -13,7 +13,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import NamedTuple, cast
 
-from add_unit import Production, Refusal, cell_value, read_production
+from add_unit import Production, read_production
+from production_units import Refusal, cell_value
 from merge_checkpoint import CodeCheckpoint, MergeEntry, git, merge_branch_history
 
 
@@ -230,15 +231,10 @@ def review_watch(production: Production, state_dir: Path) -> WatchFirstAlert | W
         if record.exists():
             return WatchRepeat(line)
         table = required(command("watch", sys.executable, str(review_script), "report", "--since", "2026-09-28"), "watch")
-        notice = f"{line}; the table is in this session"
-        send = Path.home() / ".claude/scripts/message/send.py"
-        _ = required(command("watch", sys.executable, str(send), "--to", "user", "--need", "decision",
-                             "--action", "Acknowledge the review watch in this session.",
-                             "--summary", "Hana: review watch", "--text", notice), "watch")
         moment = datetime.now(production.zone).strftime("%H:%M %Z")
         production.log.parent.mkdir(parents=True, exist_ok=True)
         with production.log.open("a", encoding="utf-8") as log:
-            _ = log.write(f"- {moment}: review watch: {line}\n")
+            _ = log.write(f"- {moment}: review watch: {line}\n{table}\n")
         write_json(record, {"alerted": datetime.now(production.zone).isoformat(timespec="seconds"), "line": line})
         return WatchFirstAlert(line, table)
 

@@ -8,7 +8,7 @@ from collections.abc import Iterable
 from dataclasses import dataclass
 from typing import Literal, cast
 
-MacRunOutcome = Literal["passed", "passed_filter", "failed"]
+MacRunOutcome = Literal["passed", "passed_filter", "passed_full", "failed"]
 OffloadDeclineReason = Literal[
     "off", "repo", "linux_only", "backoff", "blocked", "busy", "state",
     "unreachable", "mac_busy", "battery", "disk", "copy",
@@ -25,7 +25,6 @@ COUNTED_AGAINST_SHARE: tuple[ShareMissReason, ...] = (
     "busy", "mac_busy", "lost", "runner", "state", "copy",
 )
 MAC_STEP_CALLER = "verify-mac"
-OFFLOADED_STEP = "({step}.caller IS '" + MAC_STEP_CALLER + "')"
 
 
 class NoOffloadRecord:
@@ -122,7 +121,7 @@ def offload_record(
     duration = offload_seconds(seconds_value)
     if isinstance(duration, DurationNotRecorded):
         return UNRECOGNIZED_OFFLOAD_RECORD
-    if mac in ("passed", "passed_filter", "failed") and reason in (None, ""):
+    if mac in ("passed", "passed_filter", "passed_full", "failed") and reason in (None, ""):
         return MacRunCompleted(mac, duration)
     if mac == "lost" and reason in (None, ""):
         return MacRunLost(duration)
@@ -182,4 +181,4 @@ def is_mac_step(caller: object) -> bool:
 
 
 def natedev_step_predicate(step: str = "steps") -> str:
-    return f"NOT {OFFLOADED_STEP.format(step=step)}"
+    return f"{step}.host = 'natedev'"

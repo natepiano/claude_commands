@@ -8,6 +8,7 @@ import os
 import sqlite3
 import subprocess
 import sys
+import threading
 import time
 from collections.abc import Iterable
 from contextlib import closing
@@ -90,6 +91,13 @@ def save_stream_report(path: Path, report: StreamReport) -> None:
     _ = pending.replace(path)
 
 
+def relay_remote_errors(stream: BinaryIO) -> None:
+    errors = cast(BinaryIO, sys.stderr.buffer)
+    for line in cast(Iterable[bytes], stream):
+        _ = errors.write(line)
+        errors.flush()
+
+
 def main() -> int:
     configuration = cast(SshConfiguration, json.loads(
         Path(os.environ["USAGE_TEST_SSH_CONFIG"]).read_text(encoding="utf-8")))
@@ -130,11 +138,16 @@ def main() -> int:
         environment["PYTHONDONTWRITEBYTECODE"] = "1"
         with subprocess.Popen(
             ["/bin/sh", "-c", sys.argv[-1]], cwd=configuration["execution_directory"],
-            env=environment, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+            env=environment, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
         ) as process:
             try:
-                if process.stdin is None or process.stdout is None:
+                if process.stdin is None or process.stdout is None or process.stderr is None:
                     raise RuntimeError("fixture remote command has no stream")
+                # Carry remote stderr through this process, as SSH does: once the
+                # collector terminates it, a remote writer that outlives the
+                # connection can no longer reach the collector's diagnostics.
+                remote_errors = threading.Thread(target=relay_remote_errors, args=(process.stderr,), daemon=True)
+                remote_errors.start()
                 with process.stdin:
                     _ = process.stdin.write(stdin)
                 second_file_turns = 0
@@ -203,7 +216,8 @@ def main() -> int:
                         line = json.dumps(fields).encode("utf-8") + b"\n"
                         report["altered_lifecycle_records"] += 1
                     if behavior in ("malformed_record", "unknown_measurement", "missing_output",
-                                    "oversized_output", "cut_inside_record") and (
+                                    "oversized_output", "cut_inside_record", "invalid_activity",
+                                    "wait_without_action", "missing_activity") and (
                             transcript_file and report["cursor_records"] == 1 and kind == "turn" and not changed_record):
                         changed_record = True
                         if behavior == "malformed_record":
@@ -215,6 +229,13 @@ def main() -> int:
                             record = cast(dict[str, object], json.loads(line))
                             if behavior == "unknown_measurement":
                                 record["kind"] = "unknown-measurement"
+                            elif behavior == "invalid_activity":
+                                record["activity"] = "napping"
+                            elif behavior == "wait_without_action":
+                                record["activity"] = "wait"
+                                record["wait_action"] = None
+                            elif behavior == "missing_activity":
+                                del record["activity"]
                             else:
                                 tokens = cast(dict[str, object], record["tokens"])
                                 if behavior == "missing_output":
@@ -249,7 +270,10 @@ def main() -> int:
                         _ = output.write(line)
                         output.flush()
                     except BrokenPipeError:
-                        return 0
+                        # Python's documented SIGPIPE idiom: drop the unsent
+                        # buffer so the exit flush cannot report a broken pipe.
+                        _ = os.dup2(os.open(os.devnull, os.O_WRONLY), output.fileno())
+                        break
                     if behavior == "cut_inside_first_file" and kind == "turn":
                         report["role_snapshots"].append(observe_role_snapshot(configuration))
                         break
@@ -264,7 +288,17 @@ def main() -> int:
                     if behavior == "cut_inside_second_file" and second_file_turns == 2:
                         break
                 else:
-                    return process.wait()
+                    status = process.wait()
+                    remote_errors.join()
+                    return status
+                # Cut only the forwarded stream, also when the collector stopped
+                # reading. Closing the pipe or killing the shell now can leave its
+                # Python writer raising BrokenPipeError on stderr, hiding the
+                # collector's own diagnostic.
+                for _ in cast(Iterable[bytes], process.stdout):
+                    pass
+                _ = process.wait()
+                remote_errors.join()
             finally:
                 if process.poll() is None:
                     process.terminate()

@@ -206,6 +206,21 @@ with open(os.environ['TEST_FAULTS'], 'a') as out:
         self.assertEqual(self.tick().returncode, 0)
         self.assertEqual(len((self.root / "faults").read_text().splitlines()), 2)
 
+    def test_a_session_joining_or_leaving_a_shared_tmux_session_sends_no_second_fault(self) -> None:
+        _ = self.tmux.write_text(json.dumps({"old": ["%1", "%2", "%3"]}))
+        first = self.session("new", "%1")
+        _ = self.session("another", "%2")
+        self.assertEqual(self.tick().returncode, 0)
+        faults = (self.root / "faults").read_text().splitlines()
+        self.assertEqual(len(faults), 1)
+        self.assertIn("skipped old (sessions another, new): more than one Claude session", faults[0])
+        _ = self.session("third", "%3")
+        self.assertEqual(self.tick().returncode, 0)
+        (self.sessions / f"{first}.json").unlink()
+        self.assertEqual(self.tick().returncode, 0)
+        self.assertEqual((self.root / "faults").read_text().splitlines(), faults)
+        self.assertEqual(self.names(), {"old": ["%1", "%2", "%3"]})
+
     def test_a_fault_waits_for_the_next_tick_when_the_session_records_cannot_be_read(self) -> None:
         settings = showrunners.ShowrunnerSettings(threshold_percent=90.0, repeat_minutes=1.0, stall_minutes=1.0,
                                                   faults_to="director", always=[])

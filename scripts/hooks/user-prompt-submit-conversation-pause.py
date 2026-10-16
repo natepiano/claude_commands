@@ -73,11 +73,8 @@ def main() -> None:
                        conversation_pause.PromptSource.NOTICE}
                 and not return_question):
             return
-        if not return_question:
-            showrunner_session = (source is conversation_pause.PromptSource.PEER
-                                  and conversation_pause.is_showrunner_session(session_id))
-            if not conversation_pause.pauses(source, showrunner_session):
-                return
+        if not return_question and not conversation_pause.pauses(source):
+            return
         reply = conversation_pause.message_arrived(
             session_id, source, prompt, conversation_pause.now_epoch())
         if reply is conversation_pause.NoReply.NOTHING:

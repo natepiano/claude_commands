@@ -3,16 +3,24 @@
 
 from __future__ import annotations
 
+from contextlib import ExitStack
 import json
 import os
+import select
 import shutil
 import signal
 import subprocess
+import sys
 import tempfile
-import time
 import unittest
+from unittest.mock import patch
 from pathlib import Path
 from typing import TypedDict, cast, override
+
+from scripts.delegate import wait_for_test_state
+from scripts.delegate.local_release_wait import IntervalReleasePolling
+from scripts.delegate.wait_for_test_state import wait_for_file, wait_for_pid, wait_until
+from scripts.delegate.recorder_fixture import communicate_launcher, invoke_recorder
 
 
 DELEGATE_DIR = Path(__file__).parent
@@ -71,12 +79,16 @@ elif verb == 'compact':
         print('stub turn still live', file=sys.stderr)
         sys.exit(3)
     before = entry.get('context_tokens', 0)
-    entry['context_tokens'] = 12000
+    entry['context_tokens'] = ('not_measured_since_compaction'
+                              if (session / 'compact_reports_zero').exists() else 12000)
     roster_path.write_text(json.dumps(roster))
-    print(f'compacted {name}: {before} -> 12000 tokens')
+    if (session / 'compact_reports_zero').exists():
+        print(f'compacted {name}: {before} tokens, size not measured until its next turn')
+    else:
+        print(f'compacted {name}: {before} -> 12000 tokens')
 elif verb == 'can-follow':
     if entry.get('status') not in ('done', 'failed'):
-        print(f'codex_mesh: {name}: seat is busy or not followable; follow refused',
+        print(f'codex_mesh: {name}: worker is busy or not followable; follow refused',
               file=sys.stderr)
         sys.exit(2)
     entry['previous_status'] = entry['status']
@@ -107,8 +119,10 @@ elif verb == 'follow':
         pathlib.Path(option('--message-file')).read_text()
     )
     finish_file = os.environ.get('STUB_REVIEW_FINISH_FILE', '')
-    while finish_file and not pathlib.Path(finish_file).exists():
-        time.sleep(0.02)
+    if finish_file:
+        sys.path.insert(0, os.environ['TEST_WAIT_HELPER_DIR'])
+        from wait_for_test_state import wait_for_file
+        wait_for_file(pathlib.Path(finish_file))
     edit_path = os.environ.get('STUB_REVIEW_EDIT', '')
     if edit_path:
         pathlib.Path(edit_path).write_text('changed by reviewer\\n')
@@ -150,17 +164,21 @@ import sys
 
 parser = argparse.ArgumentParser()
 sub = parser.add_subparsers(dest="verb", required=True)
-for verb in ("allocate", "release"):
+for verb in ("allocate", "release", "unit-memory"):
     command = sub.add_parser(verb)
     command.add_argument("--production", required=True)
-    command.add_argument("--pid", type=int, required=True)
+    if verb != "unit-memory":
+        command.add_argument("--pid", type=int, required=True)
     if verb == "allocate":
         for flag in ("--type", "--unit", "--phase", "--pass"):
             command.add_argument(flag, required=True)
         command.add_argument("--lens", default="")
-    else:
+        command.add_argument("--fresh", action="store_true")
+    elif verb == "release":
         command.add_argument("--reviewer", required=True)
         command.add_argument("--thread-id", default="")
+    else:
+        command.add_argument("--unit", required=True)
 args = parser.parse_args()
 with Path(os.environ["STUB_POOL_CALLS"]).open("a") as calls:
     calls.write(json.dumps(vars(args)) + "\n")
@@ -169,9 +187,14 @@ if args.verb == "allocate":
         sys.exit("review_pool: allocation failed")
     if os.environ.get("STUB_POOL_RETIRED"):
         print("review_pool: retired code0: reset failed", file=sys.stderr)
-    print(json.dumps({"reviewer": "code1", "thread_id": "thread-pool",
+    print(json.dumps({"reviewer": os.environ.get("STUB_POOL_REVIEWER", "code1"), "thread_id": "thread-pool",
                       "mesh_dir": os.environ["STUB_POOL_MESH_DIR"],
-                      "lease_ordinal": 4, "prime_hash": "contract-hash"}))
+                      "lease_ordinal": int(os.environ.get("STUB_LEASE_ORDINAL", "4")),
+                      "prime_hash": "contract-hash"}))
+elif args.verb == "unit-memory":
+    if os.environ.get("STUB_UNIT_MEMORY_FAILURE"):
+        sys.exit("review_pool: unable to read unit memory")
+    sys.stdout.write(os.environ.get("STUB_UNIT_MEMORY", ""))
 '''
 
 class OpenPass(TypedDict):
@@ -199,6 +222,62 @@ gpt-blind=low,medium,high,xhigh,max
 [delegate.options]
 codex_mesh=1
 """
+
+
+class FixtureReadinessTests(unittest.TestCase):
+    def assert_exit_wakes_wait(self, *, portable: bool = False, polling: bool = False) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary) / "watched"
+            directory.mkdir()
+            child = subprocess.Popen(
+                [sys.executable, "-c", "import sys; print('ready', flush=True); sys.stdin.read()"],
+                stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True,
+            )
+            try:
+                assert child.stdout is not None and child.stdin is not None
+                self.assertEqual(child.stdout.readline(), "ready\n")
+                checks = 0
+
+                def exited() -> bool:
+                    nonlocal checks
+                    checks += 1
+                    if checks == 1:
+                        assert child.stdin is not None
+                        child.stdin.close()
+                        return False  # Exit races the wait, after registration.
+                    return child.poll() is not None
+
+                def polling_waiter(_a: Path, _b: Path) -> IntervalReleasePolling:
+                    return IntervalReleasePolling()
+
+                with ExitStack() as patches:
+                    if portable:
+                        _ = patches.enter_context(patch.object(os, "pidfd_open",
+                            side_effect=AttributeError("pidfd_open unavailable"), create=True))
+                    if polling:
+                        _ = patches.enter_context(patch.object(wait_for_test_state,
+                            "local_release_waiter", side_effect=polling_waiter))
+                    # A shortened regression guard detects a lost wakeup; success
+                    # is the exit predicate returning, without a timing assertion.
+                    wait_until(exited, directory, timeout=5, processes=(child,))
+                self.assertGreaterEqual(checks, 2)
+                self.assertEqual(child.wait(timeout=300), 0)
+                self.assertEqual(list(directory.iterdir()), [])
+            finally:
+                if child.poll() is None:
+                    child.kill()
+                _ = child.wait(timeout=300)
+                if child.stdout is not None:
+                    child.stdout.close()
+
+    def test_child_exit_wakes_a_wait_without_a_directory_write(self) -> None:
+        self.assert_exit_wakes_wait()
+
+    def test_child_exit_wakes_a_wait_without_pidfd_support(self) -> None:
+        self.assert_exit_wakes_wait(portable=True)
+
+    def test_child_exit_wakes_a_wait_without_directory_notifications(self) -> None:
+        self.assert_exit_wakes_wait(polling=True)
 
 
 class ReviewLauncherPassTests(unittest.TestCase):
@@ -287,9 +366,11 @@ class ReviewLauncherPassTests(unittest.TestCase):
         # The wrapper reaches python3 through ../lib/py, resolved from its own
         # directory.
         _ = shutil.copy2(DELEGATE_DIR.parent / "lib" / "py", lib / "py")
+        _ = shutil.copy2(DELEGATE_DIR.parent / "lib" / "user_zone.py", lib / "user_zone.py")
+        _ = shutil.copy2(DELEGATE_DIR.parent / "lib" / "unit_runs.py", lib / "unit_runs.py")
         for name in (
-            "review.sh", "implement.sh", "progress_history.py", "findings.py",
-            "board.sh", "seat_name.sh",
+            "review.sh", "implement.sh", "progress_history.py", "phase_reservation.py", "findings.py",
+            "board.sh", "worker_name.sh", "worker_state.py",
         ):
             _ = shutil.copy2(DELEGATE_DIR / name, delegate / name)
         for name in ("agents_config.sh", "heartbeat.sh"):
@@ -299,11 +380,20 @@ class ReviewLauncherPassTests(unittest.TestCase):
         _ = (agents / "heartbeat_watch.sh").write_text(
             """#!/usr/bin/env bash
 exec "$(dirname "$0")/../lib/py" -c '
-import os, sys, time
-while True:
-    try: os.kill(int(sys.argv[1]), 0)
-    except ProcessLookupError: break
-    time.sleep(0.02)
+import os, select, sys, time
+try: descriptor = os.pidfd_open(int(sys.argv[1]))
+except ProcessLookupError: pass
+except AttributeError:
+    deadline = time.monotonic() + 300
+    while True:
+        try: os.kill(int(sys.argv[1]), 0)
+        except ProcessLookupError: break
+        if time.monotonic() >= deadline: raise TimeoutError("watcher child did not exit")
+        time.sleep(0.01)
+else:
+    if not select.select([descriptor], [], [], 300)[0]:
+        raise TimeoutError("watcher child did not exit")
+    os.close(descriptor)
 ' "$3"
 """, encoding="utf-8",
         )
@@ -316,30 +406,170 @@ while True:
         _ = (delegate / "review_pool.py").write_text(STUB_POOL, encoding="utf-8")
         return delegate / "review.sh"
 
+    def test_heartbeat_watcher_ends_without_pidfd_support(self) -> None:
+        marker = self.root / "portable-watcher-ready"
+        _ = (self.root / "sitecustomize.py").write_text(
+            "import os\nfrom pathlib import Path\n"
+            + "os.__dict__.pop('pidfd_open', None)\n"
+            + f"Path({str(marker)!r}).touch()\n"
+        )
+        child = subprocess.Popen([sys.executable, "-c", "import sys; sys.stdin.read()"],
+                                 stdin=subprocess.PIPE)
+        environment = self.environment()
+        environment["PYTHONPATH"] = str(self.root)
+        watcher = subprocess.Popen(
+            ["bash", str(self.root / "scripts" / "agents" / "heartbeat_watch.sh"),
+             "fixture", "fixture", str(child.pid)],
+            env=environment, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        )
+        try:
+            wait_for_file(marker)
+            assert child.stdin is not None
+            child.stdin.close()
+            self.assertEqual(child.wait(timeout=300), 0)
+            output, errors = watcher.communicate(timeout=300)
+            self.assertEqual(watcher.returncode, 0, output + errors)
+        finally:
+            for process in (child, watcher):
+                if process.poll() is None:
+                    process.kill()
+                _ = process.wait(timeout=300)
+            if watcher.stdout is not None:
+                watcher.stdout.close()
+            if watcher.stderr is not None:
+                watcher.stderr.close()
+
+    def test_interpreter_cache_reuses_the_resolved_python_without_a_version_probe(self) -> None:
+        launcher = self.root / "scripts" / "lib" / "py"
+        binaries = self.root / "binaries"
+        binaries.mkdir()
+        interpreter = binaries / "python3"
+        calls = self.root / "python-calls"
+        _ = interpreter.write_text(
+            '#!/bin/bash\nprintf "%s\\n" "$2" >> "$CACHE_TEST_CALLS"\nexec "$CACHE_TEST_REAL_PYTHON" "$@"\n'
+        )
+        interpreter.chmod(0o755)
+        environment = self.environment()
+        environment.update({"PATH": str(binaries) + os.pathsep + environment["PATH"],
+                            "XDG_CACHE_HOME": str(self.root / "cold-cache"),
+                            "CACHE_TEST_CALLS": str(calls), "CACHE_TEST_REAL_PYTHON": sys.executable})
+        for _ in range(2):
+            result = subprocess.run(["bash", str(launcher), "-c", "print('ready')"],
+                                    env=environment, capture_output=True, text=True, timeout=300)
+            self.assertEqual((result.returncode, result.stdout), (0, "ready\n"), result.stderr)
+        commands = calls.read_text().splitlines()
+        self.assertEqual(len(commands), 3)
+        self.assertIn("sys.version_info", commands[0])
+        self.assertEqual(commands[1:], ["print('ready')"] * 2)
+        self.assertEqual((self.root / "cold-cache" / "claude" / "python3-3.10").read_text().strip(), str(interpreter))
+
     def environment(self) -> dict[str, str]:
         environment = os.environ.copy()
         environment["HOME"] = str(self.root)
+        environment["XDG_CACHE_HOME"] = str(self.root / "cache")
+        cache = self.root / "cache" / "claude" / "python3-3.10"
+        cache.parent.mkdir(parents=True, exist_ok=True)
+        _ = cache.write_text(sys.executable + "\n")
+        _ = environment.pop("CLAUDE_PYTHON", None)
+        environment["PLAN_DELEGATE_EARLY_POLL_SECS"] = "0.01"
+        environment["PLAN_DELEGATE_WORKER_POLL_SECS"] = "0.01"
+        environment["PLAN_DELEGATE_WORKER_WAIT_ATTEMPTS"] = "30000"
+        environment["PLAN_DELEGATE_SYNC_WRITES"] = "0"
+        environment["TEST_WAIT_HELPER_DIR"] = str(DELEGATE_DIR.resolve())
         environment["PLAN_DELEGATE_HISTORY_DIR"] = str(self.history_dir)
         environment["PLAN_DELEGATE_CONFIG"] = str(self.config_file)
         environment["AGENTS_CONFIG_FILE"] = str(self.root / ".claude" / "config" / "agents.conf")
         environment["TZ"] = "UTC"
+        environment["USER_ZONE"] = "UTC"
         environment["REVIEW_POOL_STATE"] = str(self.root / "pool-state")
-        _ = environment.pop("REVIEW_LEASE", None)
         _ = environment.pop("CODEX_THREAD_ID", None)
         _ = environment.pop("CLAUDE_CODE_SESSION_ID", None)
+        # Early mode starts a detached Stage 2 run; the stub records its arguments instead.
+        mesh_runs = self.root / "mesh_runs_stub.py"
+        if not mesh_runs.exists():
+            _ = mesh_runs.write_text(
+                "import json, os, sys\n"
+                + "with open(os.environ['MESH_RUNS_CALLS'], 'a', encoding='utf-8') as calls:\n"
+                + "    _ = calls.write(json.dumps(sys.argv[1:]) + '\\n')\n", encoding="utf-8")
+        environment["MESH_RUNS_SCRIPT"] = str(mesh_runs)
+        environment["MESH_RUNS_CALLS"] = str(self.root / "mesh_runs_calls.jsonl")
         return environment
 
     def recorder(self, *arguments: str) -> None:
         environment = self.environment()
         environment["PLAN_DELEGATE_PASS_OWNER"] = "launcher"
-        result = subprocess.run(
-            ["python3", str(DELEGATE_DIR / "progress_history.py"), *arguments],
-            check=False,
-            capture_output=True,
-            text=True,
-            env=environment,
-        )
+        result = invoke_recorder(arguments, environment, Path.cwd())
         self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_early_delivery_probes_default_to_five_seconds_without_test_overrides(self) -> None:
+        session = self.start_implementation("default-early-poll")
+        worker = self.open_worker(session)
+        self.finish_implementation(session)
+        ready, finish = session / "ready", session / "finish"
+        binaries = session / "bin"
+        binaries.mkdir()
+        sleep = binaries / "sleep"
+        _ = sleep.write_text('#!/bin/bash\nprintf "%s\\n" "$*" >> "$TEST_POLL_ARGUMENTS"\n'
+                             + ': > "$TEST_POLL_ENTERED"\n'
+                             + ': > "$TEST_EARLY_READY"\n')
+        sleep.chmod(0o755)
+        entered = session / "poll-entered"
+        arguments = session / "poll-arguments"
+        environment = self.environment()
+        for key in ("PLAN_DELEGATE_WORKER_POLL_SECS", "PLAN_DELEGATE_WORKER_WAIT_ATTEMPTS",
+                    "PLAN_DELEGATE_EARLY_POLL_SECS", "PLAN_DELEGATE_TOKEN_CLOCK_FILE"):
+            _ = environment.pop(key, None)
+        environment.update({"PATH": str(binaries) + os.pathsep + environment["PATH"],
+                            "TEST_POLL_ARGUMENTS": str(arguments), "TEST_POLL_ENTERED": str(entered),
+                            "TEST_EARLY_READY": str(ready), "STUB_REVIEW_FINISH_FILE": str(finish)})
+        process = subprocess.Popen(self.review_command(session, "adversary", str(ready), worker),
+                                   env=environment, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                                   start_new_session=True)
+        try:
+            wait_until(entered.exists, session, processes=(process,))
+            self.assertEqual(arguments.read_text().splitlines(), ["5"])
+            self.assertIsNone(process.poll())
+            wait_until(lambda: any(event.get("pass_kind") == "review" for event in self.pass_events(session.name)),
+                       self.history_dir / "runs", processes=(process,))
+        finally:
+            output, errors = self.finish_early_launcher(process, ready, finish)
+        self.assertEqual(process.returncode, 0, output + errors)
+
+    def finish_early_launcher(self, process: subprocess.Popen[str], ready: Path,
+                              finish: Path, timeout: float = 300) -> tuple[str, str]:
+        ready.touch()
+        finish.touch()
+        return communicate_launcher(process, timeout)
+
+    def test_early_launcher_timeout_reaps_its_group_before_fixture_cleanup(self) -> None:
+        child_ready = self.root / "blocked-review-child"
+        child_code = ("import os, signal, sys; from pathlib import Path; "
+                      "signal.signal(signal.SIGTERM, signal.SIG_IGN); "
+                      "p = Path(sys.argv[1]); staged = p.with_name(p.name + '.tmp'); "
+                      "staged.write_text(str(os.getpid())); os.replace(staged, p); signal.pause()")
+        program = f"import subprocess, sys; child = subprocess.Popen([sys.executable, '-c', {child_code!r}, {str(child_ready)!r}]); child.wait()"
+        process = subprocess.Popen([sys.executable, "-c", program], stdout=subprocess.PIPE,
+                                   stderr=subprocess.PIPE, text=True, start_new_session=True)
+        ready, finish = self.root / "early-ready", self.root / "early-finish"
+        try:
+            descriptor = os.pidfd_open(wait_for_pid(child_ready, processes=(process,)))
+            try:
+                with self.assertRaises(subprocess.TimeoutExpired):
+                    _ = self.finish_early_launcher(process, ready, finish, timeout=0)
+                self.assertIsNotNone(process.poll())
+                self.assertEqual(select.select([descriptor], [], [], 300)[0], [descriptor])
+                self.assertTrue(ready.exists())
+                self.assertTrue(finish.exists())
+                self.assertTrue(process.stdout is not None and process.stdout.closed)
+                self.assertTrue(process.stderr is not None and process.stderr.closed)
+            finally:
+                os.close(descriptor)
+        finally:
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            _ = process.communicate()
 
     def start_implementation(self, name: str) -> Path:
         session_dir = self.root / name
@@ -386,13 +616,13 @@ while True:
             capture_output=True,
             text=True,
             env=self.environment(),
-            timeout=120,
+            timeout=300,
         )
 
-    def run_seated_review(
+    def run_assigned_review(
         self,
         session_dir: Path,
-        seat: str,
+        worker: str,
         *,
         edit_path: str = "",
         commit_change: bool = False,
@@ -404,12 +634,12 @@ while True:
         if commit_change:
             environment["STUB_REVIEW_COMMIT"] = "1"
         return subprocess.run(
-            self.review_command(session_dir, "", "", seat),
+            self.review_command(session_dir, "", "", worker),
             check=False,
             capture_output=True,
             text=True,
             env=environment,
-            timeout=120,
+            timeout=300,
         )
 
     def finish_implementation(self, session_dir: Path) -> None:
@@ -417,7 +647,7 @@ while True:
             "finish-pass", "--session-dir", str(session_dir), "--status", "completed"
         )
 
-    def open_seat(
+    def open_worker(
         self, session_dir: Path, *, status: str = "done", context_tokens: int = 0
     ) -> str:
         name = "fixture-impl"
@@ -450,24 +680,26 @@ while True:
             if str(event.get("event_type", "")).startswith("pass_")
         ]
 
-    def pool_fixture(self, *, context_tokens: int = 0) -> dict[str, str]:
+    def pool_fixture(self, *, context_tokens: int = 0, reviewer_type: str = "code") -> dict[str, str]:
         mesh = self.root / "pool-state" / "production" / "mesh" / "7"
         mesh.mkdir(parents=True, exist_ok=True)
-        _ = (mesh / "mesh_roster.json").write_text(json.dumps({"code1": {
+        _ = (mesh / "mesh_roster.json").write_text(json.dumps({f"{reviewer_type}1": {
             "thread_id": "thread-pool", "status": "done", "context_tokens": context_tokens,
         }}), encoding="utf-8")
         environment = self.environment()
         environment.update({
             "STUB_POOL_MESH_DIR": str(mesh),
+            "STUB_POOL_REVIEWER": f"{reviewer_type}1",
             "STUB_POOL_CALLS": str(self.root / "pool-calls.jsonl"),
             "STUB_MESH_CALLS": str(self.root / "mesh-calls.jsonl"),
         })
         return environment
 
     def pool_command(self, session_dir: Path, *, lens: str = "contract", phase: str = "3",
-                     early: str = "") -> list[str]:
+                     early: str = "", reviewer_type: str = "code", pass_index: int = 1) -> list[str]:
         command = self.review_command(session_dir, lens, early)
-        command[2:2] = ["--pool", "code", "--lease", f"production/unit/{phase}"]
+        command[8] = str(pass_index)
+        command[2:2] = ["--pool", reviewer_type, "--lease", f"production/unit/{phase}"]
         return command
 
     def turn_records(self, session_dir: Path) -> list[dict[str, object]]:
@@ -479,6 +711,23 @@ while True:
         return [cast("dict[str, object]", json.loads(line)) for line in
                 (self.root / filename).read_text(encoding="utf-8").splitlines()]
 
+    def trace_pass_recorder(self, environment: dict[str, str]) -> None:
+        recorder = self.review_script.parent / "progress_history.py"
+        _ = recorder.rename(recorder.with_name("progress_history_real.py"))
+        _ = recorder.write_text('''import json
+import os
+from pathlib import Path
+import sys
+
+if sys.argv[1] in ("start-pass", "finish-pass"):
+    with Path(os.environ["STUB_PASS_CALLS"]).open("a") as calls:
+        calls.write(json.dumps({"verb": sys.argv[1], "argv": sys.argv[2:]}) + "\\n")
+os.execv(sys.executable, [sys.executable, str(Path(__file__).with_name("progress_history_real.py")), *sys.argv[1:]])
+''', encoding="utf-8")
+        calls = self.root / "pass-calls.jsonl"
+        calls.touch()
+        environment["STUB_PASS_CALLS"] = str(calls)
+
     def test_pool_mesh_claim_compaction_release_use_allocated_dir_and_unit_records_stay_local(self) -> None:
         session = self.start_implementation("pool-routing")
         self.finish_implementation(session)
@@ -486,7 +735,7 @@ while True:
         environment["STUB_POOL_RETIRED"] = "1"
         environment["STUB_FINDINGS"] = "1. First finding\n2) Second finding\n"
         result = subprocess.run(self.pool_command(session), env=environment, capture_output=True,
-                                text=True, check=False, timeout=120)
+                                text=True, check=False, timeout=300)
         self.assertEqual(result.returncode, 0, result.stderr)
         calls = [cast("list[str]", json.loads(line)) for line in
                  (self.root / "mesh-calls.jsonl").read_text().splitlines()]
@@ -496,6 +745,7 @@ while True:
         follow = calls[2]
         self.assertEqual(follow[follow.index("--cwd") + 1], str(self.working_dir))
         self.assertIn("--read-only", follow)
+        self.assertNotIn("--image", follow)
         for flag in ("--summary-file", "--reply-file", "--log-file"):
             self.assertEqual(Path(follow[follow.index(flag) + 1]).parent, session)
         self.assertEqual((session / "review_status_contract").read_text().strip(), "reviewed")
@@ -505,6 +755,7 @@ while True:
         self.assertFalse((Path(environment["STUB_POOL_MESH_DIR"]) / "board.log").exists())
         self.assertIn("review_pool: retired code0: reset failed", (session / "review_agent_1_contract.log").read_text())
         self.assertEqual([call["verb"] for call in self.call_records("pool-calls.jsonl")], ["allocate", "release"])
+        self.assertFalse(self.call_records("pool-calls.jsonl")[0]["fresh"])
         events = [event for event in self.pass_events(session.name) if event.get("pass_kind") == "review"]
         self.assertEqual([event.get("team_slot") for event in events], ["pool_code1", "pool_code1"])
         record, = self.turn_records(session)
@@ -515,51 +766,118 @@ while True:
         self.assertEqual(record["history_file"], state["history_file"])
         self.assertLessEqual(cast(float, record["started_at"]), cast(float, record["finished_at"]))
 
+    def test_first_pool_lease_prepends_unit_memory_and_preserves_the_source_prompt(self) -> None:
+        session = self.start_implementation("pool-memory")
+        self.finish_implementation(session)
+        environment = self.pool_fixture()
+        environment["STUB_LEASE_ORDINAL"] = "1"
+        memory = "## Unit memory\nSource: finding 3, 2026-10-12. Preserve café."
+        environment["STUB_UNIT_MEMORY"] = memory
+        command = self.pool_command(session)
+        prompt = Path(command[8])
+        original = prompt.read_text()
+        result = subprocess.run(command, env=environment, capture_output=True,
+                                text=True, check=False, timeout=300)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        delivered = (Path(environment["STUB_POOL_MESH_DIR"]) / "follow_message.txt").read_text()
+        self.assertEqual(delivered, memory + "\n\n" + original)
+        self.assertEqual(prompt.read_text(), original)
+        calls = self.call_records("pool-calls.jsonl")
+        self.assertEqual([call["verb"] for call in calls], ["allocate", "unit-memory", "release"])
+        self.assertEqual(calls[1]["production"], "production")
+        self.assertEqual(calls[1]["unit"], "unit")
+        self.assertEqual(list(session.glob("review_message_*")), [])
+
+    def test_first_pool_lease_without_unit_memory_delivers_the_original_prompt(self) -> None:
+        session = self.start_implementation("pool-no-memory")
+        self.finish_implementation(session)
+        environment = self.pool_fixture()
+        environment["STUB_LEASE_ORDINAL"] = "1"
+        command = self.pool_command(session)
+        original = Path(command[8]).read_text()
+        result = subprocess.run(command, env=environment, capture_output=True,
+                                text=True, check=False, timeout=300)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual((Path(environment["STUB_POOL_MESH_DIR"]) / "follow_message.txt").read_text(), original)
+        self.assertEqual([call["verb"] for call in self.call_records("pool-calls.jsonl")],
+                         ["allocate", "unit-memory", "release"])
+        self.assertEqual(list(session.glob("review_message_*")), [])
+
+    def test_later_pool_lease_review_does_not_read_or_prepend_unit_memory(self) -> None:
+        session = self.start_implementation("pool-later-memory")
+        self.finish_implementation(session)
+        environment = self.pool_fixture()
+        environment["STUB_UNIT_MEMORY"] = "Unit memory must only be sent at lease start."
+        command = self.pool_command(session)
+        original = Path(command[8]).read_text()
+        result = subprocess.run(command, env=environment, capture_output=True,
+                                text=True, check=False, timeout=300)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual((Path(environment["STUB_POOL_MESH_DIR"]) / "follow_message.txt").read_text(), original)
+        self.assertEqual([call["verb"] for call in self.call_records("pool-calls.jsonl")], ["allocate", "release"])
+
+    def test_unit_memory_read_failure_releases_the_pool_reviewer_without_opening_a_pass(self) -> None:
+        session = self.start_implementation("pool-memory-error")
+        self.finish_implementation(session)
+        environment = self.pool_fixture()
+        environment["STUB_LEASE_ORDINAL"] = "1"
+        environment["STUB_UNIT_MEMORY_FAILURE"] = "1"
+        result = subprocess.run(self.pool_command(session), env=environment, capture_output=True,
+                                text=True, check=False, timeout=300)
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertEqual([call["verb"] for call in self.call_records("pool-calls.jsonl")],
+                         ["allocate", "unit-memory", "release"])
+        self.assertFalse(any(event.get("pass_kind") == "review" for event in self.pass_events(session.name)))
+        self.assertEqual(self.turn_records(session)[0]["status"], "error")
+        self.assertEqual((session / "review_status_contract").read_text().strip(), "error")
+        self.assertIn("review_pool: unable to read unit memory", (session / "review_agent_1_contract.log").read_text())
+        self.assertFalse((self.root / "mesh-calls.jsonl").exists())
+        self.assertEqual(list(session.glob("review_message_*")), [])
+
     def test_pool_compaction_with_live_turn_refuses_and_releases_without_follow(self) -> None:
         session = self.start_implementation("pool-live")
         self.finish_implementation(session)
         environment = self.pool_fixture(context_tokens=100001)
         (Path(environment["STUB_POOL_MESH_DIR"]) / "compact_still_live").touch()
         result = subprocess.run(self.pool_command(session), env=environment, capture_output=True,
-                                text=True, check=False, timeout=120)
+                                text=True, check=False, timeout=300)
         self.assertEqual(result.returncode, 2, result.stderr)
         self.assertEqual((Path(environment["STUB_POOL_MESH_DIR"]) / "mesh_events.txt").read_text().splitlines(), ["compact"])
         self.assertEqual([call["verb"] for call in self.call_records("pool-calls.jsonl")], ["allocate", "release"])
         self.assertEqual((session / "review_status_contract").read_text().strip(), "error")
         self.assertEqual(self.turn_records(session)[0]["status"], "error")
 
-    def test_failed_pool_attempt_and_own_retry_leave_one_record_of_each_arm(self) -> None:
+    def test_failed_pool_attempt_and_own_retry_leave_one_record_each_and_ignore_review_lease(self) -> None:
         session = self.start_implementation("pool-retry")
         self.finish_implementation(session)
         environment = self.pool_fixture()
         environment["STUB_POOL_FAILURE"] = "1"
         failed = subprocess.run(self.pool_command(session), env=environment, capture_output=True,
-                                text=True, check=False, timeout=120)
+                                text=True, check=False, timeout=300)
         self.assertEqual(failed.returncode, 1, failed.stderr)
         self.assertEqual((session / "review_status_contract").read_text().strip(), "error")
         self.assertEqual([call["verb"] for call in self.call_records("pool-calls.jsonl")], ["allocate"])
-        seat = self.open_seat(session)
-        environment["REVIEW_LEASE"] = "production/unit/3"
-        retry = subprocess.run(self.review_command(session, "contract", "", seat), env=environment,
-                               capture_output=True, text=True, check=False, timeout=120)
+        worker = self.open_worker(session)
+        retry = subprocess.run(self.review_command(session, "contract", "", worker), env=environment,
+                               capture_output=True, text=True, check=False, timeout=300)
         self.assertEqual(retry.returncode, 0, retry.stderr)
         records = {str(record["arm"]): record for record in self.turn_records(session)}
         self.assertEqual(set(records), {"pool", "own"})
         self.assertEqual(records["pool"]["status"], "error")
         self.assertEqual(records["own"]["status"], "reviewed")
         self.assertEqual(records["own"]["thread_id"], "thread-fixture")
-        self.assertEqual(records["own"]["unit"], "unit")
+        self.assertEqual((records["own"]["unit"], records["own"]["phase"]), ("", ""))
 
     def test_own_turn_records_survive_two_phases_in_the_same_session(self) -> None:
         session = self.start_implementation("two-phases")
         self.finish_implementation(session)
-        seat = self.open_seat(session)
-        first = self.run_seated_review(session, seat)
+        worker = self.open_worker(session)
+        first = self.run_assigned_review(session, worker)
         self.assertEqual(first.returncode, 0, first.stderr)
         first_record, = self.turn_records(session)
         self.recorder("finish-phase", "--session-dir", str(session), "--status", "completed")
         self.recorder("start-phase", "--session-dir", str(session), "--phase-id", "4", "--phase-title", 'Next "phase"')
-        second = self.run_seated_review(session, seat)
+        second = self.run_assigned_review(session, worker)
         self.assertEqual(second.returncode, 0, second.stderr)
         records = self.turn_records(session)
         self.assertEqual(len(records), 2)
@@ -567,13 +885,236 @@ while True:
         self.assertEqual(len({str(record["phase_instance_id"]) for record in records}), 2)
         self.assertTrue(all(record["unit"] == record["phase"] == "" for record in records))
 
-    def test_pool_ux_lens_first_pass_records_ux_kind(self) -> None:
-        session = self.start_implementation("pool-ux")
+    def test_own_ux_lens_records_ux_kind_without_pass_calls(self) -> None:
+        session = self.start_implementation("own-ux")
         self.finish_implementation(session)
-        result = subprocess.run(self.pool_command(session, lens="ux"), env=self.pool_fixture(),
-                                capture_output=True, text=True, check=False, timeout=120)
+        worker = self.open_worker(session)
+        environment = self.environment()
+        self.trace_pass_recorder(environment)
+        result = subprocess.run(self.review_command(session, "ux", "", worker), env=environment,
+                                capture_output=True, text=True, check=False, timeout=300)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(self.turn_records(session)[0]["kind"], "ux")
+        self.assertEqual(self.call_records("pass-calls.jsonl"), [])
+
+    def test_code_pool_review_still_starts_and_finishes_a_pass(self) -> None:
+        session = self.start_implementation("code-pass")
+        self.finish_implementation(session)
+        environment = self.pool_fixture()
+        self.trace_pass_recorder(environment)
+        result = subprocess.run(self.pool_command(session), env=environment, capture_output=True,
+                                text=True, check=False, timeout=300)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual([call["verb"] for call in self.call_records("pass-calls.jsonl")],
+                         ["start-pass", "finish-pass"])
+
+    def test_a_review_naming_an_older_open_phase_starts_its_pass_in_that_phase(self) -> None:
+        session = self.start_implementation("named-phase-pass")
+        self.finish_implementation(session)
+        self.recorder("start-phase", "--session-dir", str(session), "--phase-id", "4", "--phase-title", "Next phase")
+        environment = self.pool_fixture()
+        self.trace_pass_recorder(environment)
+        command = self.pool_command(session)
+        command[2:2] = ["--phase", "3"]
+        result = subprocess.run(command, env=environment, capture_output=True, text=True, check=False, timeout=300)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        start, = [call for call in self.call_records("pass-calls.jsonl") if call["verb"] == "start-pass"]
+        self.assertEqual(cast("list[str]", start["argv"])[-2:], ["--phase-id", "3"])
+
+    def test_a_review_naming_its_phase_writes_its_files_in_that_phase_directory(self) -> None:
+        # Two phases reviewing at once each pass their own id, so neither reads the other's findings.
+        session = self.start_implementation("phase-directory-files")
+        self.finish_implementation(session)
+        environment = self.pool_fixture()
+        command = self.pool_command(session)
+        command[2:2] = ["--phase", "3"]
+        result = subprocess.run(command, env=environment, capture_output=True, text=True, check=False, timeout=300)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        phase_dir = session / "phases" / "3"
+        self.assertTrue(list(phase_dir.glob("review_findings_*.txt")))
+        self.assertTrue(list(phase_dir.glob("review_status*")))
+        self.assertEqual(sorted(path.name for path in session.glob("review_*")), [])
+
+    def test_a_phase_id_with_a_space_names_a_directory_without_it(self) -> None:
+        session = self.start_implementation("phase-directory-name")
+        self.finish_implementation(session)
+        command = self.pool_command(session)
+        command[2:2] = ["--phase", "ad hoc"]
+        result = subprocess.run(command, env=self.pool_fixture(), capture_output=True, text=True,
+                                check=False, timeout=300)
+        self.assertNotEqual(result.returncode, 2, result.stderr)
+        self.assertTrue(list((session / "phases" / "adhoc").glob("review_status*")))
+
+    def test_ui_pool_reviewed_turn_records_ux_kind_without_pass_calls_at_either_start_site(self) -> None:
+        session = self.start_implementation("ui-no-pass")
+        self.finish_implementation(session)
+        _ = (session / "ux_shots_1.txt").write_text("shot.png\n", encoding="utf-8")
+        environment = self.pool_fixture(reviewer_type="ui")
+        self.trace_pass_recorder(environment)
+        ready = session / "ready"
+        ready.touch()
+        for early in ("", str(ready)):
+            with self.subTest(early=early):
+                result = subprocess.run(self.pool_command(session, reviewer_type="ui", lens="ux", early=early),
+                                        env=environment, capture_output=True, text=True, check=False, timeout=300)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(self.call_records("pass-calls.jsonl"), [])
+                self.assertEqual((session / "review_status_ux").read_text().strip(), "reviewed")
+                self.assertTrue(all(record["kind"] == "ux" and record["status"] == "reviewed"
+                                    for record in self.turn_records(session)))
+                self.assertTrue(self.turn_records(session))
+
+    def test_ui_pool_failed_turn_records_error_without_pass_calls(self) -> None:
+        session = self.start_implementation("ui-error-no-pass")
+        self.finish_implementation(session)
+        _ = (session / "ux_shots_1.txt").write_text("shot.png\n", encoding="utf-8")
+        environment = self.pool_fixture(reviewer_type="ui")
+        environment["STUB_TURN_FAILURE"] = "1"
+        self.trace_pass_recorder(environment)
+        result = subprocess.run(self.pool_command(session, reviewer_type="ui", lens="ux"),
+                                env=environment, capture_output=True, text=True, check=False, timeout=300)
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertEqual(self.call_records("pass-calls.jsonl"), [])
+        self.assertEqual((session / "review_status_ux").read_text().strip(), "error")
+        record, = self.turn_records(session)
+        self.assertEqual((record["kind"], record["status"]), ("ux", "error"))
+
+    def test_ui_pool_refuses_non_ux_lens_before_allocation_or_turn(self) -> None:
+        session = self.start_implementation("ui-wrong-lens")
+        self.finish_implementation(session)
+        environment = self.pool_fixture(reviewer_type="ui")
+        for lens in ("", "contract", "adversary", "craft"):
+            with self.subTest(lens=lens):
+                result = subprocess.run(self.pool_command(session, reviewer_type="ui", lens=lens),
+                                        env=environment, capture_output=True, text=True, check=False, timeout=300)
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertEqual(result.stderr, "ERROR: --pool ui requires lens ux.\n")
+        self.assertFalse((self.root / "pool-calls.jsonl").exists())
+        self.assertFalse((self.root / "mesh-calls.jsonl").exists())
+
+    def test_code_pool_refuses_ux_lens_before_allocation_or_turn(self) -> None:
+        session = self.start_implementation("code-wrong-lens")
+        self.finish_implementation(session)
+        result = subprocess.run(self.pool_command(session, lens="ux"), env=self.pool_fixture(),
+                                capture_output=True, text=True, check=False, timeout=300)
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertEqual(result.stderr, "ERROR: --pool code does not accept lens ux.\n")
+        self.assertFalse((self.root / "pool-calls.jsonl").exists())
+        self.assertFalse((self.root / "mesh-calls.jsonl").exists())
+
+    def test_ui_pool_allocates_without_a_reset_and_sends_each_shot_on_the_requested_check(self) -> None:
+        session = self.start_implementation("ui-shots")
+        self.finish_implementation(session)
+        shots = [str(self.root / "shot one.png"), str(self.root / "café.png")]
+        _ = (session / "ux_shots_1.txt").write_text("unused.png\n", encoding="utf-8")
+        _ = (session / "ux_shots_2.txt").write_text(shots[0] + "\r\n\n" + shots[1], encoding="utf-8")
+        environment = self.pool_fixture(reviewer_type="ui")
+        result = subprocess.run(self.pool_command(session, reviewer_type="ui", lens="ux", pass_index=2),
+                                env=environment, capture_output=True, text=True, check=False, timeout=300)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        allocation = self.call_records("pool-calls.jsonl")[0]
+        self.assertFalse(allocation["fresh"])
+        self.assertEqual(allocation["type"], "ui")
+        self.assertEqual(allocation["lens"], "ux")
+        self.assertEqual(allocation["pass"], "2")
+        calls = [cast("list[str]", json.loads(line)) for line in
+                 (self.root / "mesh-calls.jsonl").read_text().splitlines()]
+        follow, = [call for call in calls if call[0] == "follow"]
+        self.assertEqual([follow[index + 1] for index, value in enumerate(follow) if value == "--image"], shots)
+        self.assertEqual((session / "review_slot_ux").read_text().strip(), "pool_ui1")
+        record, = self.turn_records(session)
+        self.assertEqual((record["reviewer"], record["kind"], record["pass"]), ("ui1", "ux", 2))
+
+    def test_ui_pool_failed_allocation_records_error_without_a_turn(self) -> None:
+        session = self.start_implementation("ui-allocation-error")
+        self.finish_implementation(session)
+        _ = (session / "ux_shots_1.txt").write_text("shot.png\n", encoding="utf-8")
+        environment = self.pool_fixture(reviewer_type="ui")
+        environment["STUB_POOL_FAILURE"] = "1"
+        result = subprocess.run(self.pool_command(session, reviewer_type="ui", lens="ux"),
+                                env=environment, capture_output=True, text=True, check=False, timeout=300)
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertEqual([call["verb"] for call in self.call_records("pool-calls.jsonl")], ["allocate"])
+        self.assertFalse(self.call_records("pool-calls.jsonl")[0]["fresh"])
+        self.assertFalse((self.root / "mesh-calls.jsonl").exists())
+        self.assertEqual((session / "review_status_ux").read_text().strip(), "error")
+        self.assertEqual(self.turn_records(session)[0]["status"], "error")
+
+    def test_ui_pool_later_turn_sends_the_prompt_without_unit_memory(self) -> None:
+        session = self.start_implementation("ui-memory")
+        self.finish_implementation(session)
+        _ = (session / "ux_shots_1.txt").write_text("shot.png\n", encoding="utf-8")
+        environment = self.pool_fixture(reviewer_type="ui")
+        environment["STUB_LEASE_ORDINAL"] = "2"
+        memory = "## Unit memory\nSource: finding 3. Preserve café."
+        environment["STUB_UNIT_MEMORY"] = memory
+        command = self.pool_command(session, reviewer_type="ui", lens="ux")
+        original = Path(command[8]).read_text()
+        result = subprocess.run(command, env=environment, capture_output=True,
+                                text=True, check=False, timeout=300)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual((Path(environment["STUB_POOL_MESH_DIR"]) / "follow_message.txt").read_text(), original)
+        self.assertEqual([call["verb"] for call in self.call_records("pool-calls.jsonl")],
+                         ["allocate", "release"])
+        self.assertEqual(list(session.glob("review_message_*")), [])
+
+    def test_ui_pool_missing_shots_file_records_error_without_allocation(self) -> None:
+        session = self.start_implementation("ui-missing-shots")
+        self.finish_implementation(session)
+        result = subprocess.run(self.pool_command(session, reviewer_type="ui", lens="ux"),
+                                env=self.pool_fixture(reviewer_type="ui"), capture_output=True,
+                                text=True, check=False, timeout=300)
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn("UI shots file is unreadable", result.stderr)
+        self.assertFalse((self.root / "pool-calls.jsonl").exists())
+        self.assertFalse((self.root / "mesh-calls.jsonl").exists())
+        self.assertEqual(self.turn_records(session)[0]["status"], "error")
+
+    def test_ui_pool_empty_shots_file_records_error_without_allocation(self) -> None:
+        session = self.start_implementation("ui-empty-shots")
+        self.finish_implementation(session)
+        _ = (session / "ux_shots_1.txt").write_text("\n", encoding="utf-8")
+        result = subprocess.run(self.pool_command(session, reviewer_type="ui", lens="ux"),
+                                env=self.pool_fixture(reviewer_type="ui"), capture_output=True,
+                                text=True, check=False, timeout=300)
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn("UI shots file has no paths", result.stderr)
+        self.assertFalse((self.root / "pool-calls.jsonl").exists())
+        self.assertFalse((self.root / "mesh-calls.jsonl").exists())
+        self.assertEqual(self.turn_records(session)[0]["status"], "error")
+
+    def test_ux_raised_counts_defect_rows_without_headers_candidates_or_numbered_text(self) -> None:
+        session = self.start_implementation("ux-defect-count")
+        self.finish_implementation(session)
+        _ = (session / "ux_shots_1.txt").write_text("shot.png\n", encoding="utf-8")
+        environment = self.pool_fixture(reviewer_type="ui")
+        environment["STUB_FINDINGS"] = (
+            "Verdict: defects\n\n"
+            "| Shot | Rule | Defect | Fix |\n| --- | --- | --- | --- |\n"
+            "| a.png | cables-drape-smoothly | sag crosses the face | lift the cable |\n"
+            "| b.png | no rule | label cut at the right edge | widen the field\n"
+            "| c.png | widgets-follow-macos | reads `on \\| off` as one word | split the label |\n\n"
+            "Canonical candidates\n\n"
+            "| Shot | Rule | Slot | Crop (full-size px) | Why it is clear |\n"
+            "| --- | --- | --- | --- | --- |\n"
+            "| /tmp/a.png | cables-drape-smoothly | bad | 40x40+1+1 | one cable |\n\n"
+            "1. Other text\n"
+        )
+        result = subprocess.run(self.pool_command(session, reviewer_type="ui", lens="ux"), env=environment,
+                                capture_output=True, text=True, check=False, timeout=300)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.turn_records(session)[0]["raised"], 3)
+
+    def test_ux_pass_with_only_table_headers_records_zero_raised(self) -> None:
+        session = self.start_implementation("ux-pass-count")
+        self.finish_implementation(session)
+        _ = (session / "ux_shots_1.txt").write_text("shot.png\n", encoding="utf-8")
+        environment = self.pool_fixture(reviewer_type="ui")
+        environment["STUB_FINDINGS"] = "Verdict: pass\n\n| Shot | Rule | Defect | Fix |\n| --- | --- | --- | --- |\n"
+        result = subprocess.run(self.pool_command(session, reviewer_type="ui", lens="ux"), env=environment,
+                                capture_output=True, text=True, check=False, timeout=300)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.turn_records(session)[0]["raised"], 0)
 
     def test_pool_failed_turn_releases_claim_and_pool_and_records_findings(self) -> None:
         session = self.start_implementation("pool-failed-turn")
@@ -582,7 +1123,7 @@ while True:
         environment["STUB_TURN_FAILURE"] = "1"
         environment["STUB_FINDINGS"] = "1. Partial finding\n"
         result = subprocess.run(self.pool_command(session), env=environment, capture_output=True,
-                                text=True, check=False, timeout=120)
+                                text=True, check=False, timeout=300)
         self.assertEqual(result.returncode, 1, result.stderr)
         self.assertEqual(self.turn_records(session)[0]["raised"], 1)
         self.assertEqual(self.turn_records(session)[0]["status"], "error")
@@ -595,7 +1136,7 @@ while True:
         environment = self.pool_fixture()
         environment["STUB_REVIEW_EDIT"] = str(self.working_dir / "reviewed.txt")
         result = subprocess.run(self.pool_command(session), env=environment, capture_output=True,
-                                text=True, check=False, timeout=120)
+                                text=True, check=False, timeout=300)
         self.assertEqual(result.returncode, 1, result.stderr)
         self.assertIn("changed the working tree", result.stderr)
         self.assertEqual(self.turn_records(session)[0]["status"], "error")
@@ -608,7 +1149,7 @@ while True:
             command = self.pool_command(session)
             command[2:2] = [option, "fixture-impl"]
             result = subprocess.run(command, env=environment, capture_output=True,
-                                    text=True, check=False, timeout=120)
+                                    text=True, check=False, timeout=300)
             self.assertEqual(result.returncode, 2, result.stderr)
             self.assertIn("excludes --to and --slot", result.stderr)
         self.assertFalse((self.root / "pool-calls.jsonl").exists())
@@ -618,7 +1159,7 @@ while True:
         environment = self.pool_fixture()
         environment["PLAN_DELEGATE_CODEX_MESH"] = "0"
         result = subprocess.run(self.pool_command(session), env=environment, capture_output=True,
-                                text=True, check=False, timeout=120)
+                                text=True, check=False, timeout=300)
         self.assertEqual(result.returncode, 2, result.stderr)
         self.assertIn("requires the Codex mesh", result.stderr)
         self.assertFalse((self.root / "pool-calls.jsonl").exists())
@@ -632,9 +1173,9 @@ while True:
             "thread_id": "thread-pool", "status": "running",
         }}), encoding="utf-8")
         result = subprocess.run(self.pool_command(session), env=environment, capture_output=True,
-                                text=True, check=False, timeout=120)
+                                text=True, check=False, timeout=300)
         self.assertEqual(result.returncode, 2, result.stderr)
-        self.assertIn("seat is busy or not followable", result.stderr)
+        self.assertIn("worker is busy or not followable", result.stderr)
         self.assertEqual(self.call_records("pool-calls.jsonl")[-1]["verb"], "release")
         self.assertEqual(self.turn_records(session)[0]["status"], "error")
 
@@ -647,23 +1188,21 @@ while True:
         process = subprocess.Popen(self.pool_command(session, early=str(ready)), env=environment,
                                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         try:
-            deadline = time.monotonic() + 10
             mesh = Path(environment["STUB_POOL_MESH_DIR"])
-            while not (mesh / "follow_message.txt").exists() and process.poll() is None and time.monotonic() < deadline:
-                time.sleep(0.02)
+            wait_until(lambda: (mesh / "follow_message.txt").exists() or process.poll() is not None, mesh, processes=(process,))
             self.assertIsNone(process.poll(), "review must remain active before delivery")
             self.assertTrue((mesh / "follow_message.txt").exists())
             self.assertFalse(any(event.get("pass_kind") == "review" for event in self.pass_events(session.name)))
             self.finish_implementation(session)
             ready.touch()
             finish.touch()
-            _, errors = process.communicate(timeout=15)
+            _, errors = process.communicate(timeout=300)
             self.assertEqual(process.returncode, 0, errors)
         finally:
             finish.touch()
             if process.poll() is None:
                 process.terminate()
-            _ = process.communicate(timeout=15)
+            _ = process.communicate(timeout=300)
         self.assertEqual(self.turn_records(session)[0]["status"], "reviewed")
         self.assertEqual(len([event for event in self.pass_events(session.name) if event.get("pass_kind") == "review"]), 2)
 
@@ -676,20 +1215,18 @@ while True:
         process = subprocess.Popen(self.pool_command(session), env=environment,
                                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         try:
-            deadline = time.monotonic() + 10
             mesh = Path(environment["STUB_POOL_MESH_DIR"])
-            while not (mesh / "follow_message.txt").exists() and process.poll() is None and time.monotonic() < deadline:
-                time.sleep(0.02)
+            wait_until(lambda: (mesh / "follow_message.txt").exists() or process.poll() is not None, mesh, processes=(process,))
             self.assertIsNone(process.poll(), "review must remain active until signal")
             self.assertTrue((mesh / "follow_message.txt").exists())
             process.send_signal(signal.SIGTERM)
-            _, errors = process.communicate(timeout=15)
+            _, errors = process.communicate(timeout=300)
             self.assertEqual(process.returncode, 143, errors)
         finally:
             finish.touch()
             if process.poll() is None:
                 process.terminate()
-            _ = process.communicate(timeout=15)
+            _ = process.communicate(timeout=300)
         self.assertEqual(self.call_records("pool-calls.jsonl")[-1]["verb"], "release")
         state = cast(ProgressState, json.loads((session / "progress_history_state.json").read_text()))
         self.assertEqual(state["pass"]["pool_code1"]["status"], "active")
@@ -700,7 +1237,7 @@ while True:
         canceled = subprocess.run(
             ["python3", str(DELEGATE_DIR / "progress_history.py"), "finish-pass",
              "--session-dir", str(session), "--status", "canceled", "--orphaned-launcher"],
-            env=environment, capture_output=True, text=True, check=False, timeout=10,
+            env=environment, capture_output=True, text=True, check=False, timeout=300,
         )
         self.assertEqual(canceled.returncode, 0, canceled.stderr)
         state = cast(ProgressState, json.loads((session / "progress_history_state.json").read_text()))
@@ -714,7 +1251,7 @@ while True:
                 session = self.start_implementation(f"pool-slot-{lens or 'closure'}")
                 self.finish_implementation(session)
                 result = subprocess.run(self.pool_command(session, lens=lens), env=self.pool_fixture(),
-                                        capture_output=True, text=True, check=False, timeout=120)
+                                        capture_output=True, text=True, check=False, timeout=300)
                 self.assertEqual(result.returncode, 0, result.stderr)
                 suffix = f"_{lens}" if lens else ""
                 self.assertEqual((session / f"review_slot{suffix}").read_text(), "pool_code1\n")
@@ -727,7 +1264,7 @@ while True:
         environment = self.pool_fixture()
         environment["STUB_POOL_FAILURE"] = "1"
         result = subprocess.run(self.pool_command(session), env=environment, capture_output=True,
-                                text=True, check=False, timeout=120)
+                                text=True, check=False, timeout=300)
         self.assertEqual(result.returncode, 1, result.stderr)
         self.assertFalse(slot.exists())
 
@@ -741,10 +1278,10 @@ while True:
                     command = self.pool_command(session, early=str(ready))
                 else:
                     environment = self.environment()
-                    command = self.review_command(session, "contract", str(ready), self.open_seat(session))
+                    command = self.review_command(session, "contract", str(ready), self.open_worker(session))
                 environment["STUB_FINDINGS"] = "1. A void finding\n"
                 result = subprocess.run(command, env=environment, capture_output=True,
-                                        text=True, check=False, timeout=120)
+                                        text=True, check=False, timeout=300)
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertEqual((session / "review_status_contract").read_text().strip(), "reviewed")
                 record, = self.turn_records(session)
@@ -755,7 +1292,7 @@ while True:
     def test_own_term_records_canceled_instead_of_successful_exit_trap(self) -> None:
         session = self.start_implementation("own-signal")
         self.finish_implementation(session)
-        seat = self.open_seat(session)
+        worker = self.open_worker(session)
         environment = self.environment()
         finish = self.root / "finish"
         done = self.root / "done"
@@ -764,16 +1301,14 @@ while True:
         # The own arm retains its existing child behavior. Files keep the
         # child's inherited output pipes from hiding the launcher's exit.
         with (self.root / "signal-output.txt").open("w+") as output:
-            process = subprocess.Popen(self.review_command(session, "", "", seat), env=environment,
+            process = subprocess.Popen(self.review_command(session, "", "", worker), env=environment,
                                        stdout=output, stderr=output, text=True)
             try:
-                deadline = time.monotonic() + 10
-                while not (session / "follow_message.txt").exists() and process.poll() is None and time.monotonic() < deadline:
-                    time.sleep(0.02)
+                wait_until(lambda: (session / "follow_message.txt").exists() or process.poll() is not None, session, processes=(process,))
                 self.assertIsNone(process.poll())
                 self.assertTrue((session / "follow_message.txt").exists())
                 process.send_signal(signal.SIGTERM)
-                code = process.wait(timeout=10)
+                code = process.wait(timeout=300)
                 record, = self.turn_records(session)
                 self.assertEqual(record["status"], "canceled")
                 self.assertEqual(code, 143)
@@ -781,10 +1316,8 @@ while True:
                 finish.touch()
                 if process.poll() is None:
                     process.terminate()
-                _ = process.wait(timeout=10)
-                deadline = time.monotonic() + 10
-                while not done.exists() and time.monotonic() < deadline:
-                    time.sleep(0.02)
+                _ = process.wait(timeout=300)
+                wait_for_file(done)
                 self.assertTrue(done.exists(), "the owned stub child must finish before fixture cleanup")
 
     def test_replaced_thread_is_recorded_from_the_turn_roster_and_released_to_pool(self) -> None:
@@ -797,10 +1330,10 @@ while True:
                     command = self.pool_command(session)
                 else:
                     environment = self.environment()
-                    command = self.review_command(session, "", "", self.open_seat(session))
+                    command = self.review_command(session, "", "", self.open_worker(session))
                 environment["STUB_REPLACEMENT_THREAD"] = "thread-replacement"
                 result = subprocess.run(command, env=environment, capture_output=True,
-                                        text=True, check=False, timeout=120)
+                                        text=True, check=False, timeout=300)
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertEqual(self.turn_records(session)[0]["thread_id"], "thread-replacement")
                 if arm == "pool":
@@ -811,29 +1344,28 @@ while True:
     def test_unknown_lens_lists_ux_among_accepted_lenses(self) -> None:
         session = self.start_implementation("unknown-lens")
         result = subprocess.run(self.review_command(session, "unknown", ""), env=self.environment(),
-                                capture_output=True, text=True, check=False, timeout=10)
+                                capture_output=True, text=True, check=False, timeout=300)
         self.assertEqual(result.returncode, 2, result.stderr)
         self.assertIn("adversary, contract, craft, ux", result.stderr)
 
-    def test_own_failed_closure_turn_records_lease_and_findings_count(self) -> None:
+    def test_own_failed_closure_turn_records_its_findings_count(self) -> None:
         session = self.start_implementation("own-failed")
         self.finish_implementation(session)
-        seat = self.open_seat(session)
+        worker = self.open_worker(session)
         environment = self.environment()
-        environment["REVIEW_LEASE"] = "production/unit/3"
         environment["STUB_TURN_FAILURE"] = "1"
         environment["STUB_FINDINGS"] = "1. Partial finding\n"
-        command = self.review_command(session, "", "", seat)
+        command = self.review_command(session, "", "", worker)
         command[-3] = "2"
         result = subprocess.run(command, env=environment, capture_output=True,
-                                text=True, check=False, timeout=120)
+                                text=True, check=False, timeout=300)
         self.assertEqual(result.returncode, 1, result.stderr)
         record, = self.turn_records(session)
         self.assertEqual(record["kind"], "closure")
         self.assertEqual(record["pass"], 2)
         self.assertEqual(record["raised"], 1)
         self.assertEqual(record["status"], "error")
-        self.assertEqual(record["phase"], "3")
+        self.assertEqual(record["phase"], "")
 
     def test_a_reviewer_that_finishes_before_delivery_records_no_pass(self) -> None:
         session_dir = self.start_implementation("early")
@@ -884,12 +1416,12 @@ while True:
             ],
         )
 
-    def test_a_named_open_seat_receives_the_review_and_writes_findings(self) -> None:
-        session_dir = self.start_implementation("seated")
+    def test_a_named_open_worker_receives_the_review_and_writes_findings(self) -> None:
+        session_dir = self.start_implementation("assigned")
         self.finish_implementation(session_dir)
-        seat = self.open_seat(session_dir)
+        worker = self.open_worker(session_dir)
 
-        result = self.run_seated_review(session_dir, seat)
+        result = self.run_assigned_review(session_dir, worker)
 
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(
@@ -908,9 +1440,9 @@ while True:
             "dict[str, dict[str, object]]",
             json.loads((session_dir / "mesh_roster.json").read_text(encoding="utf-8")),
         )
-        self.assertEqual(roster[seat]["role"], "review")
+        self.assertEqual(roster[worker]["role"], "review")
         reviews = [
-            event for event in self.pass_events("seated")
+            event for event in self.pass_events("assigned")
             if event.get("pass_kind") == "review"
         ]
         self.assertEqual(
@@ -918,8 +1450,8 @@ while True:
             [("pass_started", "impl"), ("pass_finished", "impl")],
         )
 
-    def test_a_review_opened_seat_has_durable_identity_for_an_implementation_claim(self) -> None:
-        session_dir = self.start_implementation("new-seat")
+    def test_a_review_opened_worker_has_durable_identity_for_an_implementation_claim(self) -> None:
+        session_dir = self.start_implementation("new-worker")
         self.finish_implementation(session_dir)
 
         result = subprocess.run(
@@ -928,7 +1460,7 @@ while True:
             capture_output=True,
             text=True,
             env=self.environment(),
-            timeout=120,
+            timeout=300,
         )
 
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -940,15 +1472,15 @@ while True:
             "dict[str, dict[str, object]]",
             json.loads((session_dir / "mesh_roster.json").read_text(encoding="utf-8")),
         )
-        seat = "project-review2"
-        self.assertEqual(roster[seat]["status"], "done")
-        self.assertEqual(roster[seat]["role"], "review")
+        worker = "project-review2"
+        self.assertEqual(roster[worker]["status"], "done")
+        self.assertEqual(roster[worker]["role"], "review")
         self.assertEqual(
             (session_dir / "review_findings_1.txt").read_text(encoding="utf-8"),
             "No findings.\n",
         )
         reviews = [
-            event for event in self.pass_events("new-seat")
+            event for event in self.pass_events("new-worker")
             if event.get("pass_kind") == "review"
         ]
         self.assertEqual(
@@ -957,20 +1489,20 @@ while True:
         )
         identity = cast(
             "dict[str, object]",
-            json.loads((session_dir / "impl_seat_review2.json").read_text()),
+            json.loads((session_dir / "impl_worker_review2.json").read_text()),
         )
         self.assertEqual(identity, {
-            "name": seat,
+            "name": worker,
             "slot": "review2",
             "family": "codex",
             "model": "gpt-called",
-            "seat_id": f"thread-{seat}",
+            "worker_id": f"thread-{worker}",
         })
 
         implementation = subprocess.run(
             [
                 "bash", str(self.review_script.with_name("implement.sh")),
-                "--to", seat, str(session_dir), str(self.working_dir),
+                "--to", worker, str(session_dir), str(self.working_dir),
                 str(self.prompt_file), "implementation", "write the repair",
                 "impl", "writing the repair", "0", "review2",
             ],
@@ -978,7 +1510,7 @@ while True:
             capture_output=True,
             text=True,
             env=self.environment(),
-            timeout=120,
+            timeout=300,
         )
         self.assertEqual(implementation.returncode, 0, implementation.stderr)
         self.assertEqual(
@@ -996,22 +1528,22 @@ while True:
             capture_output=True,
             text=True,
             env=self.environment(),
-            timeout=120,
+            timeout=300,
         )
 
         self.assertEqual(result.returncode, 2, result.stderr)
         self.assertIn("alphanumeric/_ characters", result.stderr)
         self.assertFalse((session_dir / "mesh_roster.json").exists())
 
-    def test_an_early_seated_review_baselines_after_the_writers_final_edit(self) -> None:
+    def test_an_early_assigned_review_baselines_after_the_writers_final_edit(self) -> None:
         session_dir = self.start_implementation("early-writer-edit")
-        seat = self.open_seat(session_dir)
+        worker = self.open_worker(session_dir)
         ready = session_dir / "final_diff_1.ready"
         finish_review = session_dir / "finish_review"
         environment = self.environment()
         environment["STUB_REVIEW_FINISH_FILE"] = str(finish_review)
         process = subprocess.Popen(
-            self.review_command(session_dir, "adversary", str(ready), seat),
+            self.review_command(session_dir, "adversary", str(ready), worker),
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
@@ -1023,39 +1555,45 @@ while True:
         )
         self.finish_implementation(session_dir)
         ready.touch()
-        deadline = time.monotonic() + 15
-        while time.monotonic() < deadline:
-            if any(
-                event.get("event_type") == "pass_started"
-                and event.get("pass_kind") == "review"
+        try:
+            wait_until(lambda: any(
+                event.get("event_type") == "pass_started" and event.get("pass_kind") == "review"
                 for event in self.pass_events("early-writer-edit")
-            ):
-                break
-            time.sleep(0.05)
-        else:
+            ), self.history_dir / "runs")
+        except TimeoutError:
             process.kill()
-            self.fail("the early review never started its delivered pass")
+            _ = process.communicate(timeout=300)
+            raise
         finish_review.touch()
-        _stdout, errors = process.communicate(timeout=120)
+        _stdout, errors = process.communicate(timeout=300)
 
         self.assertEqual(process.returncode, 0, errors)
         self.assertEqual(
             (session_dir / "review_status_adversary").read_text(encoding="utf-8"),
             "reviewed\n",
         )
+        calls = [cast(list[str], json.loads(line)) for line in
+                 (self.root / "mesh_runs_calls.jsonl").read_text(encoding="utf-8").splitlines()]
+        self.assertEqual(len(calls), 1)
+        call = calls[0]
+        self.assertEqual(call[:5], ["start", "--session-dir", str(session_dir), "--to", worker])
+        self.assertEqual(call[call.index("--label") + 1], "final diff ready")
+        stage_two = Path(call[call.index("--done-message-file") + 1]).read_text(encoding="utf-8")
+        self.assertIn(f"Stage 2: the final diff is at {session_dir / 'final_diff_1.diff'}", stage_two)
+        self.assertIn(str(ready), call)
 
-    def test_a_seated_early_review_before_delivery_records_no_pass(self) -> None:
-        session_dir = self.start_implementation("seated-early")
-        seat = self.open_seat(session_dir)
+    def test_a_assigned_early_review_before_delivery_records_no_pass(self) -> None:
+        session_dir = self.start_implementation("assigned-early")
+        worker = self.open_worker(session_dir)
         ready = session_dir / "final_diff_1.ready"
 
         result = subprocess.run(
-            self.review_command(session_dir, "adversary", str(ready), seat),
+            self.review_command(session_dir, "adversary", str(ready), worker),
             check=False,
             capture_output=True,
             text=True,
             env=self.environment(),
-            timeout=120,
+            timeout=300,
         )
 
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -1063,7 +1601,7 @@ while True:
             (session_dir / "review_status_adversary").read_text(encoding="utf-8"),
             "reviewed\n",
         )
-        recorded = self.pass_events("seated-early")
+        recorded = self.pass_events("assigned-early")
         self.assertEqual(
             [(event["event_type"], event.get("pass_kind")) for event in recorded],
             [("pass_started", "impl")],
@@ -1071,16 +1609,16 @@ while True:
         heartbeat = (session_dir / "heartbeat.log").read_text(encoding="utf-8")
         self.assertIn("finished before delivery", heartbeat)
 
-    def test_a_seated_reviewer_that_edits_fails_and_names_the_seat_and_path(self) -> None:
+    def test_a_assigned_reviewer_that_edits_fails_and_names_the_worker_and_path(self) -> None:
         session_dir = self.start_implementation("edited")
         self.finish_implementation(session_dir)
-        seat = self.open_seat(session_dir)
+        worker = self.open_worker(session_dir)
         edited = self.working_dir / "reviewed.txt"
 
-        result = self.run_seated_review(session_dir, seat, edit_path=str(edited))
+        result = self.run_assigned_review(session_dir, worker, edit_path=str(edited))
 
         self.assertEqual(result.returncode, 1, result.stderr)
-        self.assertIn(seat, result.stderr)
+        self.assertIn(worker, result.stderr)
         self.assertIn("reviewed.txt", result.stderr)
         self.assertEqual(
             (session_dir / "review_status").read_text(encoding="utf-8"), "error\n"
@@ -1098,17 +1636,17 @@ while True:
     def test_a_reviewer_commit_is_detected_and_names_its_changed_path(self) -> None:
         session_dir = self.start_implementation("committed-edit")
         self.finish_implementation(session_dir)
-        seat = self.open_seat(session_dir)
+        worker = self.open_worker(session_dir)
 
-        result = self.run_seated_review(
+        result = self.run_assigned_review(
             session_dir,
-            seat,
+            worker,
             edit_path=str(self.working_dir / "reviewed.txt"),
             commit_change=True,
         )
 
         self.assertEqual(result.returncode, 1, result.stderr)
-        self.assertIn(seat, result.stderr)
+        self.assertIn(worker, result.stderr)
         self.assertIn("reviewed.txt", result.stderr)
         self.assertEqual(
             (session_dir / "review_status").read_text(encoding="utf-8"), "error\n"
@@ -1117,22 +1655,22 @@ while True:
     def test_a_change_to_an_existing_untracked_file_is_detected(self) -> None:
         session_dir = self.start_implementation("untracked-edit")
         self.finish_implementation(session_dir)
-        seat = self.open_seat(session_dir)
+        worker = self.open_worker(session_dir)
         untracked = self.working_dir / "notes.txt"
         _ = untracked.write_text("before review\n", encoding="utf-8")
 
-        result = self.run_seated_review(
-            session_dir, seat, edit_path=str(untracked)
+        result = self.run_assigned_review(
+            session_dir, worker, edit_path=str(untracked)
         )
 
         self.assertEqual(result.returncode, 1, result.stderr)
-        self.assertIn(seat, result.stderr)
+        self.assertIn(worker, result.stderr)
         self.assertIn("notes.txt", result.stderr)
         self.assertEqual(
             (session_dir / "review_status").read_text(encoding="utf-8"), "error\n"
         )
 
-    def test_without_a_named_seat_the_fresh_read_only_path_is_unchanged(self) -> None:
+    def test_without_a_named_worker_the_fresh_read_only_path_is_unchanged(self) -> None:
         session_dir = self.start_implementation("fresh")
         self.finish_implementation(session_dir)
 
@@ -1142,7 +1680,7 @@ while True:
             capture_output=True,
             text=True,
             env=self.environment(),
-            timeout=120,
+            timeout=300,
         )
 
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -1155,24 +1693,24 @@ while True:
             (session_dir / "review_status").read_text(encoding="utf-8"), "reviewed\n"
         )
 
-    def test_a_busy_named_seat_is_refused_before_review_artifacts_change(self) -> None:
+    def test_a_busy_named_worker_is_refused_before_review_artifacts_change(self) -> None:
         session_dir = self.start_implementation("busy")
         self.finish_implementation(session_dir)
-        seat = self.open_seat(session_dir, status="running")
+        worker = self.open_worker(session_dir, status="running")
 
-        result = self.run_seated_review(session_dir, seat)
+        result = self.run_assigned_review(session_dir, worker)
 
         self.assertEqual(result.returncode, 2, result.stderr)
-        self.assertIn(f"codex_mesh: {seat}: seat is busy or not followable", result.stderr)
+        self.assertIn(f"codex_mesh: {worker}: worker is busy or not followable", result.stderr)
         self.assertFalse((session_dir / "review_status").exists())
         self.assertFalse((session_dir / "review_findings_1.txt").exists())
 
-    def test_a_large_named_seat_is_compacted_before_the_review_claim(self) -> None:
+    def test_a_large_named_worker_is_compacted_before_the_review_claim(self) -> None:
         session_dir = self.start_implementation("compact")
         self.finish_implementation(session_dir)
-        seat = self.open_seat(session_dir, context_tokens=100001)
+        worker = self.open_worker(session_dir, context_tokens=100001)
 
-        result = self.run_seated_review(session_dir, seat)
+        result = self.run_assigned_review(session_dir, worker)
 
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(
@@ -1180,18 +1718,49 @@ while True:
             ["compact", "can-follow", "follow"],
         )
         board = (session_dir / "board.log").read_text(encoding="utf-8")
-        self.assertIn(f"compacted {seat}: 100001 -> 12000 tokens", board)
+        self.assertIn(f"compacted {worker}: 100001 -> 12000 tokens", board)
 
-    def test_a_seat_left_with_a_live_turn_by_compaction_gets_no_review_follow_up(self) -> None:
+    def test_review_of_an_unmeasured_worker_does_not_compact_again(self) -> None:
+        session_dir = self.start_implementation("unmeasured-review")
+        self.finish_implementation(session_dir)
+        worker = self.open_worker(session_dir)
+        path = session_dir / "mesh_roster.json"
+        roster = cast(dict[str, dict[str, object]], json.loads(path.read_text(encoding="utf-8")))
+        roster[worker]["context_tokens"] = "not_measured_since_compaction"
+        _ = path.write_text(json.dumps(roster), encoding="utf-8")
+
+        result = self.run_assigned_review(session_dir, worker)
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual((session_dir / "mesh_events.txt").read_text(encoding="utf-8").splitlines(),
+                         ["can-follow", "follow"])
+        stored = cast(dict[str, dict[str, object]], json.loads(path.read_text(encoding="utf-8")))
+        self.assertEqual(stored[worker]["context_tokens"], "not_measured_since_compaction")
+
+    def test_review_posts_the_unmeasured_compaction_line_unchanged(self) -> None:
+        session_dir = self.start_implementation("compact-unmeasured-line")
+        self.finish_implementation(session_dir)
+        worker = self.open_worker(session_dir, context_tokens=100001)
+        (session_dir / "compact_reports_zero").touch()
+
+        result = self.run_assigned_review(session_dir, worker)
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual((session_dir / "mesh_events.txt").read_text(encoding="utf-8").splitlines(),
+                         ["compact", "can-follow", "follow"])
+        board = (session_dir / "board.log").read_text(encoding="utf-8")
+        self.assertIn(f"launcher: compacted {worker}: 100001 tokens, size not measured until its next turn", board)
+
+    def test_a_worker_left_with_a_live_turn_by_compaction_gets_no_review_follow_up(self) -> None:
         session_dir = self.start_implementation("compact-still-live")
         self.finish_implementation(session_dir)
-        seat = self.open_seat(session_dir, context_tokens=100001)
+        worker = self.open_worker(session_dir, context_tokens=100001)
         (session_dir / "compact_still_live").touch()
 
-        result = self.run_seated_review(session_dir, seat)
+        result = self.run_assigned_review(session_dir, worker)
 
         self.assertEqual(result.returncode, 2, result.stderr)
-        self.assertIn("still has a live turn after compaction; end the seat", result.stderr)
+        self.assertIn("still has a live turn after compaction; end the worker", result.stderr)
         self.assertEqual(
             (session_dir / "mesh_events.txt").read_text(encoding="utf-8").splitlines(),
             ["compact"],
@@ -1222,7 +1791,7 @@ while True:
             for lens in lenses
         ]
         for process in running:
-            _, errors = process.communicate(timeout=120)
+            _, errors = process.communicate(timeout=300)
             self.assertEqual(process.returncode, 0, errors)
 
         for lens in lenses:
@@ -1258,15 +1827,15 @@ while True:
         for slot in ("impl", "test"):
             self.assertIn(f"[{slot}] register:", board)
 
-    def test_three_lenses_run_at_once_each_in_a_seat_of_its_own(self) -> None:
-        """The craft lens joins the other two in the `review` seat.
+    def test_three_lenses_run_at_once_each_in_a_worker_of_its_own(self) -> None:
+        """The craft lens joins the other two in the `review` worker.
 
         No writer sits there, so its pass is a third record beside the two
         lenses' and closes neither of them.
         """
         session_dir = self.start_implementation("three-lenses")
         self.recorder("finish-pass", "--session-dir", str(session_dir), "--status", "completed")
-        seats = {"adversary": "test", "contract": "impl", "craft": "review"}
+        workers = {"adversary": "test", "contract": "impl", "craft": "review"}
 
         running = [
             subprocess.Popen(
@@ -1276,13 +1845,13 @@ while True:
                 text=True,
                 env=self.environment(),
             )
-            for lens in seats
+            for lens in workers
         ]
         for process in running:
-            _, errors = process.communicate(timeout=120)
+            _, errors = process.communicate(timeout=300)
             self.assertEqual(process.returncode, 0, errors)
 
-        for lens in seats:
+        for lens in workers:
             self.assertEqual(
                 (session_dir / f"review_status_{lens}").read_text().strip(), "reviewed"
             )
@@ -1296,7 +1865,7 @@ while True:
             sorted(
                 (event_type, slot)
                 for event_type in ("pass_started", "pass_finished")
-                for slot in seats.values()
+                for slot in workers.values()
             ),
         )
         self.assertNotIn(
@@ -1305,7 +1874,7 @@ while True:
         )
 
         board = (session_dir / "board.log").read_text(encoding="utf-8")
-        for lens, slot in seats.items():
+        for lens, slot in workers.items():
             self.assertIn(f"[{slot}] register: {lens} review up", board)
 
     def test_an_unknown_lens_is_refused_before_anything_runs(self) -> None:
@@ -1316,7 +1885,7 @@ while True:
             capture_output=True,
             text=True,
             env=self.environment(),
-            timeout=120,
+            timeout=300,
         )
         self.assertEqual(result.returncode, 2, result.stderr)
         self.assertIn("unknown review lens 'style' (adversary, contract, craft, ux)", result.stderr)

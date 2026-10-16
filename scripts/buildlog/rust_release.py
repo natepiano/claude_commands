@@ -17,11 +17,17 @@ import urllib.request
 from collections.abc import Callable
 from datetime import datetime
 from pathlib import Path
-from typing import BinaryIO, Literal, TypedDict, cast
+from typing import TYPE_CHECKING, BinaryIO, Literal, TypedDict, cast
 
 import store
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "build_hold"))
 import override_guard
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "notify"))
+if TYPE_CHECKING:
+    from ..notify import review
+    from ..notify.push_texts import RenderedPush
+else:
+    import review
 
 CHANNEL_URL = "https://static.rust-lang.org/dist/channel-rust-stable.toml"
 HANA = Path.home() / "rust/hana"
@@ -157,14 +163,16 @@ def cargo_building() -> bool:
     return bool(result.stdout.strip()) or result.returncode not in (0, 1)
 
 
-def send_release_text(title: str, message: str) -> bool:
-    sender = Path(__file__).resolve().parents[1] / "message/send.py"
-    result = subprocess.run(
-        ["python3", str(sender), "--to", "user", "--need", "note",
-         "--action", "Tell natedev to bump Rust or wait.",
-         "--summary", title, "--text", message],
-        capture_output=True, text=True, timeout=30, stdin=subprocess.DEVNULL,
-    )
+def send_release_text(push: RenderedPush) -> bool:
+    if TYPE_CHECKING:
+        from ..notify.push_texts import user_send_argv
+    else:
+        from push_texts import user_send_argv
+
+    command = user_send_argv(push)
+    command[1] = str(Path(__file__).resolve().parents[1] / "message/send.py")
+    result = subprocess.run(command, capture_output=True, text=True,
+                            timeout=review.user_send_seconds() + 15, stdin=subprocess.DEVNULL)
     return result.returncode == 0
 
 
@@ -406,6 +414,23 @@ def trial_text(trial: TrialOutcome) -> str:
     return ", ".join(parts)
 
 
+def release_push(version: str, pin: str, trial: TrialOutcome) -> RenderedPush:
+    if TYPE_CHECKING:
+        from ..notify.push_texts import render
+    else:
+        from push_texts import render
+
+    if trial["status"] != "finished":
+        raise ValueError("incomplete compiler trials are log notes, not user pushes")
+    if trial["errors"]:
+        return render("rust.errors", version=version, pin=pin, errors=str(trial["errors"]), warnings=str(trial["warnings"]))
+    if not trial["mend_builds"]:
+        return render("rust.repair_failed", version=version, pin=pin)
+    if trial["warnings"]:
+        return render("rust.warnings", version=version, pin=pin, warnings=str(trial["warnings"]))
+    return render("rust.passed", version=version, pin=pin)
+
+
 def report_line() -> list[str]:
     state = read_state()
     if state is None or state["pin"] is None or not newer_than_pin(state["stable_version"], state["pin"]):
@@ -430,7 +455,7 @@ def check_release(
     free_gib: Callable[[], float] = free_space_gib,
     held: Callable[[], bool] = build_hold_active,
     building: Callable[[], bool] = cargo_building,
-    send_text: Callable[[str, str], bool] = send_release_text,
+    send_text: Callable[[RenderedPush], bool] = send_release_text,
     trial_parent: Callable[[], Path] = default_trial_parent,
 ) -> int:
     pin = read_pin()
@@ -472,10 +497,14 @@ def check_release(
         reason = waiting_reason(held, building, free_gib)
         state["trial"] = {"status": "waiting", "version": state["stable_version"], "reason": reason} if reason else trial_release(state["stable_version"], run_command, held, trial_parent())
     write_state(state)
-    if 2 <= today.hour < 5 and not state["text_sent"]:
-        message = f"Rust {state['stable_version']} out: {trial_text(state['trial'])}. Tell natedev bump or wait."
+    if 2 <= today.hour < 5 and state["trial"]["status"] == "waiting":
+        print(f"Rust {state['stable_version']} trial is waiting: {state['trial']['reason']}")
+    elif 2 <= today.hour < 5 and state["trial"]["status"] == "failed":
+        print(f"Rust {state['stable_version']} trial could not complete: {state['trial']['reason']}")
+    elif 2 <= today.hour < 5 and not state["text_sent"]:
+        push = release_push(state["stable_version"], pin, state["trial"])
         try:
-            sent = send_text(f"Rust {state['stable_version']} out", message)
+            sent = send_text(push)
         except (OSError, subprocess.SubprocessError) as error:
             store.note_error(f"rust release text: {error}")
             return 1

@@ -3,7 +3,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from datetime import datetime, timedelta, timezone
 import json
 import os
@@ -20,11 +20,17 @@ from contextlib import redirect_stderr, redirect_stdout
 from dataclasses import fields
 import io
 from pathlib import Path
-from typing import Literal, NotRequired, TypedDict, cast, final, override
+from typing import TYPE_CHECKING, Literal, NotRequired, TypedDict, cast, final, override
 from unittest import mock
 
 import offload
+if TYPE_CHECKING:
+    from ..production.cli_fixture import invoke_cli
+else:
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "production"))
+    from cli_fixture import invoke_cli
 import mac_test
+import treekey
 
 
 SCRIPT = Path(__file__).with_name("offload.py")
@@ -47,6 +53,8 @@ class CommandFixture(TypedDict):
     run_lines: list[RemoteLine]
     run_status_reported: bool
     run_status_line: str
+    run_cleanup_line: str
+    run_ssh_status: int
     run_delay_s: float
     hold_after_first_line: bool
     cleanup_status: int
@@ -64,6 +72,7 @@ class CommandEvent(TypedDict):
     args: list[str]
     claimed: bool
     exclude: NotRequired[str]
+    copy_claim: NotRequired[bool]
 
 
 class SelectorEvent(TypedDict):
@@ -75,6 +84,7 @@ class WireResult(TypedDict):
     mac: str
     reason: str
     seconds: str
+    holder: NotRequired[str]
 
 
 class RemoteClaimRecord(TypedDict):
@@ -102,11 +112,19 @@ root = Path(os.environ["MAC_TEST_STUB_DIR"])
 fixture = json.loads((root / "fixture.json").read_text(encoding="utf-8"))
 command = Path(sys.argv[0]).name
 arguments = sys.argv[1:]
+if command == "systemd-run":
+    with (root / "systemd-run.jsonl").open("a", encoding="utf-8") as output:
+        output.write(json.dumps(arguments) + "\n")
+    raise SystemExit(0)
 event = {
     "command": command,
     "args": arguments,
-    "claimed": (Path(os.environ["MAC_TEST_STATE_DIR"]) / "run.json").exists(),
+    "claimed": (Path(os.environ["MAC_TEST_STATE_DIR"]) / "claims" / "hana.json").exists(),
 }
+try:
+    event["copy_claim"] = json.loads((Path(os.environ["MAC_TEST_STATE_DIR"]) / "claims" / "hana.json").read_text()).get("copy", False)
+except (OSError, ValueError):
+    pass
 if command == "rsync":
     exclude_argument = next(
         argument for argument in arguments if argument.startswith("--exclude-from=")
@@ -128,7 +146,7 @@ if command != "ssh":
     raise SystemExit(99)
 
 remote = arguments[-1]
-if "pgrep -f" in remote and "lsof" in remote:
+if "select_leftovers()" in remote and "lsof" in remote:
     (root / "cleanup-called").write_text("called\n", encoding="utf-8")
     time.sleep(float(fixture["cleanup_delay_s"]))
     if fixture["hold_cleanup"]:
@@ -147,7 +165,7 @@ if "pgrep -f" in remote and "lsof" in remote:
             '[ "$(command -v ' + name + ')" = ' + shlex.quote(str(selectors / name)) + ' ] || exit 99'
             for name in ("pgrep", "lsof", "sleep")
         )
-        answer = subprocess.run([*shell, "-c", checks + "\n" + remote], env=environment, capture_output=True, text=True, timeout=3)
+        answer = subprocess.run([*shell, "-c", checks + "\n" + remote], env=environment, capture_output=True, text=True, timeout=300)
         print(answer.stdout, end="", flush=True)
         print(answer.stderr, end="", file=sys.stderr, flush=True)
         (root / "selector-answer").write_text(answer.stdout)
@@ -170,7 +188,9 @@ if "lint nextest" in remote:
         time.sleep(0.02)
     if fixture["run_status_reported"]:
         print(fixture["run_status_line"], flush=True)
-    raise SystemExit(0)
+        if fixture["run_cleanup_line"]:
+            print(fixture["run_cleanup_line"], flush=True)
+    raise SystemExit(int(fixture["run_ssh_status"]))
 
 (root / "probe-started").write_text("started\n", encoding="utf-8")
 time.sleep(float(fixture["probe_delay_s"]))
@@ -180,6 +200,11 @@ for line in fixture["probe_lines"]:
     print(line, flush=True)
 raise SystemExit(int(fixture["probe_status"]))
 '''
+
+
+HANA = offload.KnownRepository("hana")
+HANA_COMMAND_PATTERN = "[.]local/state/mac-test/mirror/hana([/'\"[:space:]]|$)"
+HANA_CWD_PATTERN = "^n.*/[.]local/state/mac-test/mirror/hana(/|$)"
 
 
 SELECTOR_STUB = r'''
@@ -201,6 +226,23 @@ if command == "lsof":
 if command == "sleep":
     raise SystemExit(0)
 raise SystemExit(99)
+'''
+
+
+ACTIVITY_SELECTOR_STUB = r'''
+import json
+import os
+from pathlib import Path
+import sys
+
+root = Path(os.environ["ACTIVITY_TEST_DIR"])
+name = Path(sys.argv[0]).name
+responses = json.loads((root / "responses.json").read_text())
+with (root / "commands.jsonl").open("a") as output:
+    output.write(json.dumps({"command": name, "args": sys.argv[1:]}) + "\n")
+status, answer = responses[name]
+print(answer, end="")
+raise SystemExit(status)
 '''
 
 
@@ -232,14 +274,16 @@ def main() -> int:
                 or os.environ.get("MAC_TEST_TAKEOVER_FIRST") == "1" and actions == ["claim"]):
             record["what"] = "older tests"
             record["remote_host"] = "previous-mac"
-            (state / "run.json").write_text(json.dumps(record))
+            (state / "claims").mkdir(exist_ok=True)
+            (state / "claims" / "hana.json").write_text(json.dumps(record))
             print("leftovers: previous-mac", flush=True)
             return 13
         takeover = os.environ.get("MAC_TEST_HELD_TAKEOVER") == "1"
         if takeover:
             record["what"] = "older tests"
             record["remote_host"] = "previous-mac"
-        (state / "run.json").write_text(json.dumps(record), encoding="utf-8")
+        (state / "claims").mkdir(exist_ok=True)
+        (state / "claims" / "hana.json").write_text(json.dumps(record), encoding="utf-8")
         (root / "claim-started").write_text("started\n", encoding="utf-8")
         while not (root / "finish-claim").exists():
             time.sleep(0.01)
@@ -248,7 +292,7 @@ def main() -> int:
             return 13
         return 0
     if action == "release":
-        (state / "run.json").unlink(missing_ok=True)
+        (state / "claims" / "hana.json").unlink(missing_ok=True)
         return 0
     return 12
 
@@ -380,16 +424,17 @@ class OffloadSettingsTests(unittest.TestCase):
             with self.subTest(answer=answer):
                 response = subprocess.CompletedProcess(["ssh"], 0, answer, "")
                 with mock.patch.object(subprocess, "run", return_value=response) as run:
-                    self.assertEqual(offload.check_leftovers(config, "kept-host"), expected)
+                    self.assertEqual(offload.check_leftovers(config, "kept-host", HANA), expected)
                 arguments = cast(list[str], run.call_args.args[0])
                 self.assertEqual(arguments[:-1], ["ssh", *offload.ssh_options(config), "kept-host"])
                 self.assertEqual(run.call_args.kwargs["timeout"], 10)
-                self.assertIn("pgrep -f '[.]local/state/mac-test/mirror/'", arguments[-1])
+                self.assertIn('pgrep -u "$(id -u)" -f "$mirror_command_pattern"', arguments[-1])
+                self.assertIn(f"mirror_command_pattern={shlex.quote(HANA_COMMAND_PATTERN)}\n", arguments[-1])
         for answer in ("leftovers=0\n", "rc=0\n", "leftovers=-1\nrc=0\n", "leftovers=bad\nrc=0\n"):
             with self.subTest(answer=answer):
                 response = subprocess.CompletedProcess(["ssh"], 0, answer, "")
                 with mock.patch.object(subprocess, "run", return_value=response):
-                    result = offload.check_leftovers(config, "kept-host")
+                    result = offload.check_leftovers(config, "kept-host", HANA)
                 self.assertIsInstance(result, offload.LeftoverCheckFailed)
                 if isinstance(result, offload.LeftoverCheckFailed):
                     self.assertIn("answer could not be read", result.reason)
@@ -400,17 +445,29 @@ class OffloadSettingsTests(unittest.TestCase):
                                 (FileNotFoundError("ssh missing"), "could not start")):
             with self.subTest(error=type(error).__name__):
                 with mock.patch.object(subprocess, "run", side_effect=error):
-                    result = offload.check_leftovers(config, "kept-host")
+                    result = offload.check_leftovers(config, "kept-host", HANA)
                 self.assertIsInstance(result, offload.LeftoverCheckFailed)
                 if isinstance(result, offload.LeftoverCheckFailed):
                     self.assertIn(expected, result.reason)
                     self.assertIn("10", result.reason)
         response = subprocess.CompletedProcess(["ssh"], 255, "", "connection\n refused\tby host")
         with mock.patch.object(subprocess, "run", return_value=response):
-            result = offload.check_leftovers(config, "kept-host")
+            result = offload.check_leftovers(config, "kept-host", HANA)
         self.assertIsInstance(result, offload.LeftoverCheckFailed)
         if isinstance(result, offload.LeftoverCheckFailed):
             self.assertEqual(result.reason, "connection refused by host")
+
+    def test_leftover_check_uses_configured_timeout_and_reports_it(self) -> None:
+        _ = self.settings.write_text("leftover_timeout_s=0.125\n")
+        config = offload.read_config(self.settings)
+        with mock.patch.object(subprocess, "run", side_effect=subprocess.TimeoutExpired("ssh", 0.125)) as run:
+            result = offload.check_leftovers(config, "kept-host", HANA)
+        self.assertEqual(run.call_args.kwargs["timeout"], 0.125)
+        self.assertEqual(result, offload.LeftoverCheckFailed("SSH leftover check timed out after 0.125 s"))
+        for value in ("bad", "0", "-1", "nan", "inf"):
+            with self.subTest(value=value):
+                _ = self.settings.write_text(f"leftover_timeout_s={value}\n")
+                self.assertEqual(offload.read_config(self.settings).leftover_timeout_s, 10)
 
     def test_probe_that_cannot_start_reports_its_limit_through_run(self) -> None:
         _ = self.settings.write_text("offload=on\nlinux_only.hana=\nprobe_timeout_s=2.5\n")
@@ -434,6 +491,47 @@ class OffloadSettingsTests(unittest.TestCase):
         self.assertEqual(destination.read_text().splitlines()[:2], ["mac=declined", "reason=unreachable"])
         self.assertTrue((self.root / "state" / "unreachable_until").exists())
 
+    def test_checked_in_settings_send_cargo_liner_to_the_mac_except_cargo_berth(self) -> None:
+        config = offload.read_config(Path(__file__).resolve().parents[2] / "config" / "mac_test.conf")
+        self.assertEqual(config.values["linux_only.cargo-liner"], "cargo-berth")
+        self.assertEqual(config.default_target_budget_gib, "24")
+        self.assertNotIn("mac_budget_gib.cargo-liner", config.values)
+        offload.write_backoff(time.time() + 60)
+        expected = {"cargo-port": "backoff", "cargo-tile": "backoff", "tui_pane": "backoff", "cargo-berth": "linux_only"}
+        for package, reason in expected.items():
+            with self.subTest(package=package):
+                request = offload.OffloadRequest(self.root, package, "cargo-liner", offload.NO_RESULT_FILE, ())
+                with mock.patch.object(offload, "repository_identity",
+                                       return_value=offload.KnownRepository("cargo-liner")):
+                    result = offload.run_offload(offload.ProcessController(), config, request, time.monotonic())
+                self.assertEqual(result.reason if isinstance(result, offload.DeclinedMacRun) else result, reason)
+
+
+@final
+class BusyHolderTests(unittest.TestCase):
+    def test_busy_claim_line_keeps_the_job_and_kept_claim_description(self) -> None:
+        for what in ("cargo nextest -p hana", "leftovers of cargo test on prior-mac", "job since last week"):
+            with self.subTest(what=what):
+                self.assertEqual(offload.claim_holder(f"busy: {what} since 13:05\n"), offload.KnownMacJob(what))
+
+    def test_busy_claim_without_the_expected_line_has_unreadable_holder(self) -> None:
+        for line in ("", "busy", "busy: task", "busy: task since yesterday", "busy: task since 13:05\nextra"):
+            with self.subTest(line=line):
+                self.assertIsInstance(offload.claim_holder(line), offload.UnreadableMacHolder)
+
+    def test_only_busy_results_write_the_holder_line(self) -> None:
+        with tempfile.TemporaryDirectory() as scratch:
+            path = Path(scratch) / "result"
+            for holder, expected in ((offload.KnownMacJob("render checks"), "render checks"),
+                                     (offload.LostRunLeftovers(), "leftovers"),
+                                     (offload.UnreadableMacHolder(), "unreadable")):
+                with self.subTest(holder=expected), redirect_stdout(io.StringIO()):
+                    self.assertEqual(offload.write_result(offload.BusyMacDecline(holder, 0.25), offload.ResultFile(path)), 75)
+                    self.assertIn(f"holder={expected}\n", path.read_text())
+            with redirect_stdout(io.StringIO()):
+                _ = offload.write_result(offload.PassedOnMac(0.5), offload.ResultFile(path))
+            self.assertNotIn("holder=", path.read_text())
+
 
 @final
 class OffloadCommandTests(unittest.TestCase):
@@ -443,6 +541,7 @@ class OffloadCommandTests(unittest.TestCase):
         self.repository = Path()
         self.unknown_directory = Path()
         self.state_directory = Path()
+        self.claim_file = Path()
         self.stub_directory = Path()
         self.bin_directory = Path()
         self.config_path = Path()
@@ -459,6 +558,8 @@ class OffloadCommandTests(unittest.TestCase):
             "run_lines": [],
             "run_status_reported": True,
             "run_status_line": "mac_exit=0",
+            "run_cleanup_line": "mac_cleanup=0",
+            "run_ssh_status": 0,
             "run_delay_s": 0.0,
             "hold_after_first_line": False,
             "cleanup_status": 0,
@@ -477,6 +578,7 @@ class OffloadCommandTests(unittest.TestCase):
         self.repository = self.root / "hana"
         self.unknown_directory = self.root / "not-a-repository"
         self.state_directory = self.root / "state"
+        self.claim_file = self.state_directory / "claims" / "hana.json"
         self.stub_directory = self.root / "stub-state"
         self.bin_directory = self.root / "bin"
         self.config_path = self.root / "mac_test.conf"
@@ -502,7 +604,8 @@ class OffloadCommandTests(unittest.TestCase):
             "offload": "on",
             "host": "mac",
             "connect_timeout_s": "6",
-            "probe_timeout_s": "1",
+            "probe_timeout_s": "300",
+            "leftover_timeout_s": "300",
             "unreachable_backoff_s": "300",
             "free_floor_gib": "60",
             "mac_budget_gib": "24",
@@ -525,6 +628,8 @@ class OffloadCommandTests(unittest.TestCase):
             "run_lines": [],
             "run_status_reported": True,
             "run_status_line": "mac_exit=0",
+            "run_cleanup_line": "mac_cleanup=0",
+            "run_ssh_status": 0,
             "run_delay_s": 0.0,
             "hold_after_first_line": False,
             "cleanup_status": 0,
@@ -547,6 +652,8 @@ class OffloadCommandTests(unittest.TestCase):
             "MAC_TEST_STUB_DIR": str(self.stub_directory),
             "MAC_TEST_REAL_STATE": str(STATE_SCRIPT),
             "BUILD_HOLD_DIR": str(self.root / "holders"),
+            "BUILDLOG_DIR": str(self.root / "buildlog"),
+            "NOTIFIER_SESSIONS_DIR": str(self.root / "sessions"),
             "BUILD_HOLD_RELEASE_DIR": str(self.root / "release"),
             "PLAN_DELEGATE_ACTIVE_DIR": str(self.root / "active"),
             "BUILDLOG_CALL_ID": "", "BUILDLOG_CALLER": "",
@@ -574,10 +681,12 @@ class OffloadCommandTests(unittest.TestCase):
         *nextest_arguments: str,
         repository: Path | None = None,
         filter_run: bool = False,
-        timeout: float = 10,
+        timeout: float = 300,
+        subprocess_cli: bool = False,
         settings: Path | offload.DefaultMacSettings = offload.DEFAULT_MAC_SETTINGS,
         last_decline: str = "",
         separate_stderr: bool = False,
+        copy: bool = False,
     ) -> subprocess.CompletedProcess[str]:
         self.result_path.unlink(missing_ok=True)
         arguments = [
@@ -593,21 +702,79 @@ class OffloadCommandTests(unittest.TestCase):
         ]
         if filter_run:
             arguments.append("--filter-run")
+        if copy:
+            arguments.append("--copy")
         if isinstance(settings, Path):
             arguments.extend(["--settings", str(settings)])
         if last_decline:
             arguments.extend(["--last-decline", last_decline])
         arguments.extend(["--result", str(self.result_path), "--"])
         arguments.extend(nextest_arguments)
+        if subprocess_cli:
+            return subprocess.run(arguments, cwd=self.root, env=self.environment, stdout=subprocess.PIPE,
+                                  stderr=subprocess.PIPE if separate_stderr else subprocess.STDOUT,
+                                  text=True, check=False, timeout=timeout)
+        return invoke_cli(offload, offload.main, arguments[2:], self.environment, self.root,
+                          combined_output=not separate_stderr)
+
+    def process_command(self, *arguments: str, separate_stderr: bool = False,
+                        last_decline: str = "") -> subprocess.CompletedProcess[str]:
+        # These cases inspect a claim owned by an exited launcher. Its lifetime
+        # is part of the assertion, so use a real child rather than this process.
+        return self.command(*arguments, separate_stderr=separate_stderr,
+                            last_decline=last_decline, subprocess_cli=True)
+
+    def command_with_cleanup_clock(self, *, separate_stderr: bool = False) -> subprocess.CompletedProcess[str]:
+        # Keep elapsed_seconds real; advance its underlying clock at work boundaries.
+        program = r'''
+import subprocess
+import sys
+sys.path.insert(0, sys.argv.pop(1))
+import offload
+
+clock = [100.0]
+offload.time.monotonic = lambda: clock[0]
+real_capture = offload.ProcessController.capture
+real_stream = offload.ProcessController.stream_mac_run
+real_run = subprocess.run
+
+def capture(self, arguments, *args, **kwargs):
+    answer = real_capture(self, arguments, *args, **kwargs)
+    if arguments[0] == "ssh":
+        clock[0] = 101.0
+    elif arguments[0] == "rsync":
+        clock[0] = 102.0
+    return answer
+
+def stream(self, arguments):
+    answer = real_stream(self, arguments)
+    clock[0] = 103.0
+    return answer
+
+def run(arguments, **kwargs):
+    if arguments[0] != "ssh" or "select_leftovers()" not in arguments[-1]:
+        return real_run(arguments, **kwargs)
+    clock[0] = 105.0
+    try:
+        answer = real_run(arguments, **kwargs)
+    except subprocess.TimeoutExpired:
+        clock[0] = 113.0
+        raise
+    clock[0] = 108.0
+    return answer
+
+offload.ProcessController.capture = capture
+offload.ProcessController.stream_mac_run = stream
+subprocess.run = run
+raise SystemExit(offload.main())
+'''
         return subprocess.run(
-            arguments,
-            cwd=self.root,
-            env=self.environment,
-            stdout=subprocess.PIPE,
+            [sys.executable, "-c", program, str(SCRIPT.parent), "run",
+             "--repo-root", str(self.repository), "--package", "hana",
+             "--call-id", "call-17", "--result", str(self.result_path), "--"],
+            cwd=self.root, env=self.environment, stdout=subprocess.PIPE,
             stderr=subprocess.PIPE if separate_stderr else subprocess.STDOUT,
-            text=True,
-            check=False,
-            timeout=timeout,
+            text=True, check=False, timeout=30,
         )
 
     def start_command(
@@ -663,6 +830,9 @@ class OffloadCommandTests(unittest.TestCase):
             SCRIPT.parent.parent / "lint", target_is_directory=True
         )
         (scripts_directory / "build_hold").symlink_to(SCRIPT.parent.parent / "build_hold", target_is_directory=True)
+        (scripts_directory / "buildlog").symlink_to(
+            SCRIPT.parent.parent / "buildlog", target_is_directory=True
+        )
         return runner
 
     def state_command(self, *arguments: str) -> subprocess.CompletedProcess[str]:
@@ -693,15 +863,14 @@ class OffloadCommandTests(unittest.TestCase):
 
     def wire_result(self) -> WireResult:
         lines = self.result_path.read_text(encoding="utf-8").splitlines()
-        self.assertEqual(len(lines), 3)
         values = dict(line.split("=", 1) for line in lines)
-        self.assertEqual(set(values), {"mac", "reason", "seconds"})
+        expected = {"mac", "reason", "seconds"}
+        if values["mac"] == "declined" and values["reason"] == "busy":
+            expected.add("holder")
+        self.assertEqual(set(values), expected)
+        self.assertEqual(len(lines), len(expected))
         _ = float(values["seconds"])
-        return {
-            "mac": values["mac"],
-            "reason": values["reason"],
-            "seconds": values["seconds"],
-        }
+        return cast(WireResult, cast(object, values))
 
     def assert_wire(self, mac: str, reason: str) -> None:
         values = self.wire_result()
@@ -716,7 +885,7 @@ class OffloadCommandTests(unittest.TestCase):
         self.assertTrue(result.stdout.endswith(f"mac_test: not running on the Mac ({reason})\n"), result.stdout)
         self.assertNotIn("mac_test: running on the Mac", result.stdout)
         self.assert_wire("declined", reason)
-        self.assertFalse((self.state_directory / "run.json").exists())
+        self.assertFalse(self.claim_file.exists())
 
     def assert_claimed_commands(self) -> None:
         for event in self.events():
@@ -724,29 +893,31 @@ class OffloadCommandTests(unittest.TestCase):
                 self.assertTrue(event["claimed"], event)
 
     def leftover_events(self) -> list[CommandEvent]:
-        return [event for event in self.events_for("ssh") if "pgrep -f" in event["args"][-1]]
+        return [event for event in self.events_for("ssh") if "select_leftovers()" in event["args"][-1]]
 
     def assert_leftover_selectors(self, remote: str) -> None:
-        self.assertIn("pgrep -f '[.]local/state/mac-test/mirror/'", remote)
+        self.assertIn(f"mirror_command_pattern={shlex.quote(HANA_COMMAND_PATTERN)}\n", remote)
+        self.assertIn(f"mirror_cwd_pattern={shlex.quote(HANA_CWD_PATTERN)}\n", remote)
+        self.assertIn('pgrep -u "$(id -u)" -f "$mirror_command_pattern"', remote)
         self.assertIn('lsof -a -u "$(id -u)" -d cwd -Fpn', remote)
-        self.assertIn("awk '/^p/ { pid = substr($0, 2) } /^n.*\\/[.]local\\/state\\/mac-test\\/mirror(\\/|$)/ { print pid }'", remote)
+        self.assertIn("awk -v pattern=\"$mirror_cwd_pattern\" '/^p/ { pid = substr($0, 2) } $0 ~ pattern { print pid }'", remote)
         self.assertNotIn("pkill", remote)
         self.assertNotIn("PIPESTATUS", remote)
         self.assertNotIn(".local/state/mac-test/mirror/", remote.replace("[.]local/state/mac-test/mirror/", ""))
 
     def remote_claim(self) -> RemoteClaimRecord:
-        return cast(RemoteClaimRecord, json.loads((self.state_directory / "run.json").read_text()))
+        return cast(RemoteClaimRecord, json.loads(self.claim_file.read_text()))
 
     def write_kept_claim(self, host: str = "previous-mac") -> RemoteClaimRecord:
-        self.state_directory.mkdir(exist_ok=True)
+        self.claim_file.parent.mkdir(parents=True, exist_ok=True)
         record: RemoteClaimRecord = {"pid": 1073741824, "proc_start": "gone", "what": "older tests",
                                      "worktree": str(self.repository), "since": datetime.now(timezone.utc).isoformat(),
                                      "remote_host": host}
-        _ = (self.state_directory / "run.json").write_text(json.dumps(record))
+        _ = self.claim_file.write_text(json.dumps(record))
         return record
 
     def assert_claim_is_kept(self, host: str = "mac") -> None:
-        path = self.state_directory / "run.json"
+        path = self.claim_file
         self.assertTrue(path.exists())
         record = self.remote_claim()
         self.assertEqual(record["remote_host"], host)
@@ -758,22 +929,28 @@ class OffloadCommandTests(unittest.TestCase):
 
     def reset_leftover_case(self) -> None:
         self.clear_events()
-        (self.state_directory / "run.json").unlink(missing_ok=True)
+        self.claim_file.unlink(missing_ok=True)
         (self.state_directory / "unreachable_until").unlink(missing_ok=True)
         for name in ("run-started", "cleanup-called", "selector-events.jsonl", "selector-answer"):
             (self.stub_directory / name).unlink(missing_ok=True)
 
     def set_leftover_answer(self, outcome: str) -> None:
+        # Only deliberate timeout cases use a short deadline; ordinary fixture
+        # commands get a hang guard that does not race interpreter startup.
+        self.config["leftover_timeout_s"] = "2" if outcome == "timeout" else "300"
+        self.sync_config()
         self.fixture["cleanup_lines"] = ["leftovers=0", "rc=0"]
         self.fixture["cleanup_status"] = 0
         self.fixture["cleanup_error"] = ""
         self.fixture["cleanup_delay_s"] = 0
+        self.fixture["hold_cleanup"] = False
         if outcome == "remaining":
             self.fixture["cleanup_lines"] = ["leftovers=3", "rc=0"]
         elif outcome == "missing_status":
             self.fixture["cleanup_lines"] = ["leftovers=0"]
         elif outcome == "timeout":
-            self.fixture["cleanup_delay_s"] = 12
+            # Remain blocked until the cleanup deadline, regardless of machine load.
+            self.fixture["hold_cleanup"] = True
         elif outcome == "ssh_error":
             self.fixture["cleanup_lines"] = []
             self.fixture["cleanup_status"] = 255
@@ -786,12 +963,12 @@ class OffloadCommandTests(unittest.TestCase):
         else:
             self.assertRegex(output, r"mac_test: could not confirm that a lost run's leftovers ended: [^\n]+; the Mac stays busy\n")
             if outcome == "timeout":
-                self.assertRegex(output, r"timed out after 10(?:\.0)? s")
+                self.assertRegex(output, r"timed out after 2(?:\.0)? s")
             if outcome == "ssh_error":
                 self.assertIn("connection refused by host", output)
 
     def wait_for_path(self, path: Path) -> None:
-        deadline = time.monotonic() + 5
+        deadline = time.monotonic() + 300
         while time.monotonic() < deadline:
             if path.exists():
                 return
@@ -806,7 +983,7 @@ class OffloadCommandTests(unittest.TestCase):
             self.fail("runner output is unavailable")
         received = b""
         expected_bytes = expected.encode()
-        deadline = time.monotonic() + 5
+        deadline = time.monotonic() + 300
         while expected_bytes not in received:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
@@ -867,7 +1044,18 @@ class OffloadCommandTests(unittest.TestCase):
         self.fixture["probe_delay_s"] = 3.0
         self.sync_config()
         self.sync_fixture()
-        result = self.command(timeout=5, separate_stderr=True)
+        original_launch = subprocess.Popen
+        original_communicate = cast(Callable[[subprocess.Popen[str], str | None, float | None], tuple[str, str]],
+                                    original_launch.communicate)
+
+        def communicate(process: subprocess.Popen[str], input: str | None = None,
+                        timeout: float | None = None) -> tuple[str, str]:
+            if timeout == 0.1:
+                self.wait_for_path(self.stub_directory / "probe-started")
+            return original_communicate(process, input, timeout)
+
+        with mock.patch.object(original_launch, "communicate", communicate):
+            result = self.command(separate_stderr=True)
         self.assert_declined(result, "unreachable")
         self.assertRegex(result.stderr, r"^mac_test: could not reach the Mac: .*0\.1.*\n$")
         self.assertRegex(result.stderr, r"(?i)tim(?:e|ed).*out|limit|finish")
@@ -984,7 +1172,8 @@ class OffloadCommandTests(unittest.TestCase):
         self.assertTrue(busy.stdout.endswith("mac_test: not running on the Mac (busy)\n"), busy.stdout)
         self.assertIn("busy", busy.stdout)
         self.assert_wire("declined", "busy")
-        self.assertTrue((self.state_directory / "run.json").exists())
+        self.assertEqual(self.wire_result().get("holder"), "other tests")
+        self.assertTrue(self.claim_file.exists())
         self.assertEqual(self.events(), [])
         released = self.state_command("release", "--pid", str(os.getpid()))
         self.assertEqual(released.returncode, 0, released.stdout + released.stderr)
@@ -1028,8 +1217,9 @@ class OffloadCommandTests(unittest.TestCase):
         self.assertEqual(repeated.returncode, first.returncode)
         self.assertEqual(self.wire_result()["mac"], first_wire["mac"])
         self.assertEqual(self.wire_result()["reason"], first_wire["reason"])
+        self.assertEqual(self.wire_result().get("holder"), "other tests")
         self.assertEqual(self.events(), [])
-        self.assertTrue((self.state_directory / "run.json").exists())
+        self.assertTrue(self.claim_file.exists())
 
     def test_changed_decline_prints_normally_and_repeated_blocked_decline_is_silent(self) -> None:
         self.state_directory.mkdir()
@@ -1067,11 +1257,11 @@ class OffloadCommandTests(unittest.TestCase):
             self.assertEqual([event["command"] for event in self.events()], ["ssh", "rsync"])
             self.assert_claimed_commands()
             _ = (self.stub_directory / "continue-copy").write_text("continue\n")
-            text, _ = process.communicate(timeout=10)
+            text, _ = process.communicate(timeout=300)
         finally:
             if process.poll() is None:
                 process.kill()
-                _ = process.communicate(timeout=5)
+                _ = process.communicate(timeout=300)
         self.assertEqual(process.returncode, 0, text)
         self.assertEqual(text.count("mac_test: running on the Mac (macOS, host Mac); tree copied in "), 1)
         self.assert_wire("passed", "")
@@ -1096,12 +1286,12 @@ class OffloadCommandTests(unittest.TestCase):
                 process.send_signal(signal_number)
             self.wait_for_ignored_signals(process)
             _ = (self.stub_directory / "finish-claim").write_text("continue\n")
-            output, _ = process.communicate(timeout=15)
+            output, _ = process.communicate(timeout=300)
         finally:
             _ = (self.stub_directory / "finish-claim").write_text("continue\n")
             if process.poll() is None:
                 process.kill()
-                _ = process.communicate(timeout=5)
+                _ = process.communicate(timeout=300)
         self.assertEqual(process.returncode, 128 + signal_number, output)
         self.assertFalse(self.result_path.exists())
         self.assertFalse((self.state_directory / "unreachable_until").exists())
@@ -1109,7 +1299,7 @@ class OffloadCommandTests(unittest.TestCase):
 
     def wait_for_ignored_signals(self, process: subprocess.Popen[str]) -> None:
         expected = sum(1 << (number - 1) for number in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP))
-        deadline = time.monotonic() + 5
+        deadline = time.monotonic() + 300
         while time.monotonic() < deadline:
             if process.poll() is not None:
                 return
@@ -1130,7 +1320,7 @@ class OffloadCommandTests(unittest.TestCase):
             encoding="utf-8"
         )
         self.assertEqual(state_events.splitlines(), ["claim", "release"], output)
-        self.assertFalse((self.state_directory / "run.json").exists(), output)
+        self.assertFalse(self.claim_file.exists(), output)
         self.assertEqual(self.events_for("ssh"), [])
         self.assertFalse((self.stub_directory / "cleanup-called").exists())
 
@@ -1153,7 +1343,7 @@ class OffloadCommandTests(unittest.TestCase):
         state_events = (self.stub_directory / "state-events").read_text().splitlines()
         if outcome == "clean":
             self.assertEqual(state_events, ["claim", "release"])
-            self.assertFalse((self.state_directory / "run.json").exists())
+            self.assertFalse(self.claim_file.exists())
             self.assertEqual(output, "")
         else:
             self.assertEqual(state_events, ["claim"])
@@ -1174,7 +1364,7 @@ class OffloadCommandTests(unittest.TestCase):
         output = self.interrupt_held_claim(signal_group=True, signal_number=signal.SIGINT)
         self.assertEqual((self.stub_directory / "state-events").read_text().splitlines(),
                          ["claim", "release"], output)
-        self.assertFalse((self.state_directory / "run.json").exists())
+        self.assertFalse(self.claim_file.exists())
         self.assertEqual(self.events_for("ssh"), [])
         self.assertFalse((self.stub_directory / "cleanup-called").exists())
 
@@ -1182,7 +1372,7 @@ class OffloadCommandTests(unittest.TestCase):
         output = self.interrupt_held_claim(after_takeover=True)
         self.assertEqual((self.stub_directory / "state-events").read_text().splitlines(),
                          ["claim", "release", "claim", "release"], output)
-        self.assertFalse((self.state_directory / "run.json").exists())
+        self.assertFalse(self.claim_file.exists())
         ssh = self.events_for("ssh")
         self.assertEqual(len(ssh), 1)
         self.assertEqual(ssh[0]["args"][-2], "previous-mac")
@@ -1203,6 +1393,111 @@ class OffloadCommandTests(unittest.TestCase):
         self.assertEqual(len(self.events_for("ssh")), 1)
         self.assertEqual(len(self.events_for("rsync")), 1)
         self.assert_claimed_commands()
+
+    def commit_sent_tree(self) -> str:
+        environment = {
+            **self.environment,
+            "GIT_CONFIG_GLOBAL": os.devnull,
+            "GIT_CONFIG_NOSYSTEM": "1",
+            "GIT_AUTHOR_NAME": "test", "GIT_COMMITTER_NAME": "test",
+            "GIT_AUTHOR_EMAIL": "test@example.com", "GIT_COMMITTER_EMAIL": "test@example.com",
+        }
+        result = subprocess.run(
+            ["git", "commit", "-q", "--allow-empty", "-m", "sent tree"],
+            cwd=self.repository, env=environment, capture_output=True, text=True, check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        key = treekey.tree_key(str(self.repository))
+        self.assertIsInstance(key, str)
+        assert isinstance(key, str)
+        return key
+
+    def run_with_copy_change(self, change: Callable[[], None]) -> None:
+        self.fixture["hold_copy"] = True
+        self.sync_fixture()
+        process = self.start_command()
+        try:
+            self.wait_for_path(self.stub_directory / "copy-started")
+            change()
+            _ = (self.stub_directory / "continue-copy").write_text("continue\n")
+            output, _ = process.communicate(timeout=300)
+            self.assertEqual(process.returncode, 0, output)
+            self.assert_wire("passed", "")
+        finally:
+            if process.poll() is None:
+                process.kill()
+                _ = process.communicate(timeout=300)
+
+    def sent_command_words(self) -> list[str]:
+        self.assertEqual(len(self.events_for("rsync")), 1)
+        remote = self.events_for("ssh")[-1]["args"][-1]
+        self.assertIn("lint nextest", remote)
+        return shlex.split(remote.rpartition("; echo mac_exit=$?")[0])
+
+    def assert_stable_copy_sends_key(self) -> None:
+        # A later stable copy must send its key after the earlier copy omitted it.
+        self.clear_events()
+        self.fixture["hold_copy"] = False
+        self.sync_fixture()
+        key = self.commit_sent_tree()
+        result = self.command()
+        self.assertEqual(result.returncode, 0, result.stdout)
+        self.assertIn(f"BUILDLOG_SENT_TREE_KEY={key}", self.sent_command_words())
+
+    def test_unchanged_copy_sends_its_known_tree_key_beside_the_call_id(self) -> None:
+        key = self.commit_sent_tree()
+        result = self.command()
+        self.assertEqual(result.returncode, 0, result.stdout)
+        self.assertEqual(treekey.tree_key(str(self.repository)), key)
+        words = self.sent_command_words()
+        call_index = words.index("BUILDLOG_CALL_ID=call-17")
+        self.assertEqual(words[call_index + 1], f"BUILDLOG_SENT_TREE_KEY={key}")
+
+    def test_copy_with_different_before_and_after_tree_keys_sends_no_key(self) -> None:
+        before = self.commit_sent_tree()
+
+        def change() -> None:
+            _ = (self.repository / "during-copy.rs").write_text("changed during copy\n")
+
+        self.run_with_copy_change(change)
+        after = treekey.tree_key(str(self.repository))
+        self.assertIsInstance(after, str)
+        self.assertNotEqual(before, after)
+        self.assertFalse(any(word.startswith("BUILDLOG_SENT_TREE_KEY=") for word in self.sent_command_words()))
+        self.assert_stable_copy_sends_key()
+
+    def test_copy_with_unavailable_before_key_and_known_after_key_sends_no_key(self) -> None:
+        self.assertIsNone(treekey.tree_key(str(self.repository)))
+
+        def change() -> None:
+            _ = self.commit_sent_tree()
+
+        self.run_with_copy_change(change)
+        self.assertIsInstance(treekey.tree_key(str(self.repository)), str)
+        self.assertFalse(any(word.startswith("BUILDLOG_SENT_TREE_KEY=") for word in self.sent_command_words()))
+        self.assert_stable_copy_sends_key()
+
+    def test_copy_with_known_before_key_and_unavailable_after_key_sends_no_key(self) -> None:
+        _ = self.commit_sent_tree()
+        head_path = self.repository / ".git" / "HEAD"
+        head = head_path.read_text()
+
+        def change() -> None:
+            (self.repository / ".git" / "HEAD").unlink()
+
+        self.run_with_copy_change(change)
+        self.assertIsNone(treekey.tree_key(str(self.repository)))
+        self.assertFalse(any(word.startswith("BUILDLOG_SENT_TREE_KEY=") for word in self.sent_command_words()))
+        _ = head_path.write_text(head)
+        self.assert_stable_copy_sends_key()
+
+    def test_copy_with_both_tree_keys_unavailable_sends_no_key(self) -> None:
+        self.assertIsNone(treekey.tree_key(str(self.repository)))
+        result = self.command()
+        self.assertEqual(result.returncode, 0, result.stdout)
+        self.assertIsNone(treekey.tree_key(str(self.repository)))
+        self.assertFalse(any(word.startswith("BUILDLOG_SENT_TREE_KEY=") for word in self.sent_command_words()))
+        self.assert_stable_copy_sends_key()
 
     def test_remote_test_command_sets_development_deployment_target_before_nextest(self) -> None:
         words = ("--no-fail-fast", "unit_case")
@@ -1227,7 +1522,7 @@ class OffloadCommandTests(unittest.TestCase):
         result = self.command(*words, filter_run=True)
         self.assertEqual(result.returncode, 0, result.stdout)
         self.assert_wire("passed", "")
-        self.assertFalse((self.state_directory / "run.json").exists())
+        self.assertFalse(self.claim_file.exists())
         self.assert_claimed_commands()
 
         events = self.events()
@@ -1283,7 +1578,7 @@ class OffloadCommandTests(unittest.TestCase):
         remote = run[-1]
         run_command, separator, status_command = remote.rpartition("; echo mac_exit=$?")
         self.assertEqual(separator, "; echo mac_exit=$?")
-        self.assertEqual(status_command, "")
+        self.assertIn("mac_cleanup=", status_command)
         remote_words = shlex.split(run_command)
         lint_index = remote_words.index("~/.claude/scripts/lint/lint")
         self.assertEqual(
@@ -1321,7 +1616,7 @@ class OffloadCommandTests(unittest.TestCase):
         remote = self.events_for("ssh")[-1]["args"][-1]
         run_command, separator, status_command = remote.rpartition("; echo mac_exit=$?")
         self.assertEqual(separator, "; echo mac_exit=$?")
-        self.assertEqual(status_command, "")
+        self.assertIn("mac_cleanup=", status_command)
         remote_words = shlex.split(run_command)
         self.assertIn(f"({FILTER}) & not (test(slow) | test(gpu))", remote_words)
         self.assertNotIn(FILTER, remote_words)
@@ -1348,7 +1643,22 @@ class OffloadCommandTests(unittest.TestCase):
         self.assertEqual(positions, sorted(positions))
         self.assertNotIn("mac_exit=", result.stdout)
         self.assert_wire("passed", "")
-        self.assertFalse((self.state_directory / "run.json").exists())
+        self.assertFalse(self.claim_file.exists())
+
+    def test_copy_claims_as_a_copy_and_names_the_copy(self) -> None:
+        result = self.command("--workspace", copy=True)
+        self.assertEqual(result.returncode, 0, result.stdout)
+        self.assertTrue(result.stdout.startswith(
+            "mac_test: running a copy on the Mac while natedev compiles (host Mac); tree copied in "), result.stdout)
+        self.assertNotIn("mac_test: running on the Mac", result.stdout)
+        self.assert_wire("passed", "")
+        held = [event for event in self.events() if event["command"] in ("ssh", "rsync")]
+        self.assertTrue(held)
+        self.assertTrue(all(event.get("copy_claim") is True for event in held), held)
+        self.assertFalse(self.claim_file.exists())
+        self.clear_events()
+        self.assertEqual(self.command("--workspace").returncode, 0)
+        self.assertTrue(all(event.get("copy_claim") is False for event in self.events_for("rsync")))
 
     def test_first_remote_line_is_printed_before_the_next_line(self) -> None:
         self.fixture["run_lines"] = [
@@ -1364,10 +1674,10 @@ class OffloadCommandTests(unittest.TestCase):
             _ = (self.stub_directory / "continue-run").write_text(
                 "continue\n", encoding="utf-8"
             )
-            remaining_output, _ = process.communicate(timeout=15)
+            remaining_output, _ = process.communicate(timeout=300)
         except BaseException:
             process.send_signal(signal.SIGTERM)
-            _ = process.communicate(timeout=15)
+            _ = process.communicate(timeout=300)
             raise
         output = output_before_gate + remaining_output
         self.assertEqual(process.returncode, 0, output)
@@ -1391,7 +1701,7 @@ class OffloadCommandTests(unittest.TestCase):
         self.assertNotIn("unrelated to your change", result.stdout)
         self.assertNotIn("mac_exit=42", result.stdout)
         self.assert_wire("failed", "")
-        self.assertFalse((self.state_directory / "run.json").exists())
+        self.assertFalse(self.claim_file.exists())
 
     def test_no_test_status_runs_on_natedev_instead(self) -> None:
         self.fixture["run_status_line"] = "mac_exit=4"
@@ -1406,7 +1716,7 @@ class OffloadCommandTests(unittest.TestCase):
         )
         self.assertNotIn("mac_exit=4", result.stdout)
         self.assert_wire("declined", "no_tests")
-        self.assertFalse((self.state_directory / "run.json").exists())
+        self.assertFalse(self.claim_file.exists())
 
     def test_nextest_failure_status_remains_a_mac_failure(self) -> None:
         self.fixture["run_status_line"] = "mac_exit=1"
@@ -1417,17 +1727,99 @@ class OffloadCommandTests(unittest.TestCase):
         self.assertEqual(result.returncode, 1, result.stdout)
         self.assert_wire("failed", "")
 
+    def test_cleanup_success_keeps_the_reported_test_result_and_hides_markers(self) -> None:
+        for status in (0, 1, 42):
+            with self.subTest(status=status):
+                self.fixture["run_status_line"] = f"mac_exit={status}"
+                self.sync_fixture()
+                result = self.command()
+                self.assertEqual(result.returncode, status, result.stdout)
+                self.assert_wire("passed" if status == 0 else "failed", "")
+                self.assertNotIn("mac_exit=", result.stdout)
+                self.assertNotIn("mac_cleanup=", result.stdout)
+                self.assertNotIn("Mac build output", result.stdout)
+
+    def test_cleanup_failure_reports_once_without_changing_test_result(self) -> None:
+        for status in (0, 42):
+            with self.subTest(status=status):
+                self.fixture["run_status_line"] = f"mac_exit={status}"
+                self.fixture["run_cleanup_line"] = "mac_cleanup=7"
+                self.sync_fixture()
+                result = self.command()
+                self.assertEqual(result.returncode, status, result.stdout)
+                self.assert_wire("passed" if status == 0 else "failed", "")
+                self.assertEqual(result.stdout.count("Mac build output not removed: 7\n"), 1)
+                self.assertNotIn("mac_cleanup=", result.stdout)
+
+    def test_kept_build_output_releases_claim_without_leftover_check_or_notice(self) -> None:
+        self.fixture["run_cleanup_line"] = "mac_cleanup=kept"
+        for status in (0, 42):
+            with self.subTest(status=status):
+                self.fixture["run_status_line"] = f"mac_exit={status}"
+                self.sync_fixture()
+                result = self.command()
+                self.assertEqual(result.returncode, status, result.stdout)
+                self.assert_wire("passed" if status == 0 else "failed", "")
+                self.assertEqual(self.leftover_events(), [])
+                self.assertFalse(self.claim_file.exists())
+                self.assertNotIn("Mac build output", result.stdout)
+                self.assertNotIn("mac_cleanup=", result.stdout)
+
+    def test_other_target_dir_reports_kept_output_without_changing_test_result(self) -> None:
+        for status in (0, 42):
+            with self.subTest(status=status):
+                self.fixture["run_status_line"] = f"mac_exit={status}"
+                self.fixture["run_cleanup_line"] = "mac_cleanup=skipped"
+                self.sync_fixture()
+                result = self.command("--target-dir", "other target")
+                self.assertEqual(result.returncode, status, result.stdout)
+                self.assert_wire("passed" if status == 0 else "failed", "")
+                self.assertEqual(result.stdout.count("Mac build output kept: the run used another target dir\n"), 1)
+                self.assertNotIn("mac_cleanup=", result.stdout)
+
+    def test_disconnect_after_test_status_reports_unconfirmed_cleanup_and_keeps_result(self) -> None:
+        for status in (0, 42):
+            with self.subTest(status=status):
+                self.fixture["run_status_line"] = f"mac_exit={status}"
+                self.fixture["run_cleanup_line"] = ""
+                self.fixture["run_ssh_status"] = 255
+                self.sync_fixture()
+                result = self.command()
+                self.assertEqual(result.returncode, status, result.stdout)
+                self.assert_wire("passed" if status == 0 else "failed", "")
+                self.assertEqual(result.stdout.count("Mac build output cleanup unconfirmed\n"), 1)
+                self.assertNotIn("mac_exit=", result.stdout)
+
+    def test_unconfirmed_cleanup_checks_leftovers_before_release_and_keeps_test_result(self) -> None:
+        self.fixture["run_cleanup_line"] = ""
+        self.fixture["run_ssh_status"] = 255
+        for status in (0, 42):
+            for outcome in ("clean", "remaining", "missing_status", "ssh_error"):
+                with self.subTest(status=status, outcome=outcome):
+                    self.reset_leftover_case()
+                    self.fixture["run_status_line"] = f"mac_exit={status}"
+                    self.set_leftover_answer(outcome)
+                    result = self.process_command(separate_stderr=True)
+                    self.assertEqual(result.returncode, status, result.stdout + result.stderr)
+                    self.assert_wire("passed" if status == 0 else "failed", "")
+                    self.assertEqual(result.stdout.count("Mac build output cleanup unconfirmed\n"), 1)
+                    checks = self.leftover_events()
+                    self.assertEqual(len(checks), 1)
+                    self.assertTrue(checks[0]["claimed"], checks[0])
+                    self.assert_leftover_selectors(checks[0]["args"][-1])
+                    if outcome == "clean":
+                        self.assertFalse(self.claim_file.exists())
+                    else:
+                        self.assert_claim_is_kept()
+                        self.assert_leftover_diagnostic(result.stderr, outcome)
+
     def test_lost_run_time_includes_remote_cleanup(self) -> None:
         self.fixture["run_lines"] = [
             {"stream": "stdout", "text": "partial output"}
         ]
         self.fixture["run_status_reported"] = False
-        cleanup_seconds = 1.0
-        self.fixture["cleanup_delay_s"] = cleanup_seconds
         self.sync_fixture()
-        command_started = time.monotonic()
-        result = self.command()
-        command_seconds = time.monotonic() - command_started
+        result = self.command_with_cleanup_clock()
         self.assertEqual(result.returncode, 75, result.stdout)
         self.assertIn("partial output\n", result.stdout)
         self.assertIn(
@@ -1438,13 +1830,12 @@ class OffloadCommandTests(unittest.TestCase):
         self.assertEqual(wire["mac"], "lost")
         self.assertEqual(wire["reason"], "")
         recorded_seconds = float(wire["seconds"])
-        self.assertGreaterEqual(recorded_seconds, cleanup_seconds)
-        self.assertLess(command_seconds - recorded_seconds, cleanup_seconds)
-        self.assertFalse((self.state_directory / "run.json").exists())
+        self.assertEqual(recorded_seconds, 8.0)
+        self.assertFalse(self.claim_file.exists())
         cleanup_events = [
             event
             for event in self.events_for("ssh")
-            if "pgrep -f" in event["args"][-1]
+            if "select_leftovers()" in event["args"][-1]
         ]
         self.assertEqual(len(cleanup_events), 1, self.events())
         cleanup = cleanup_events[0]
@@ -1457,7 +1848,7 @@ class OffloadCommandTests(unittest.TestCase):
             with self.subTest(outcome=outcome):
                 self.reset_leftover_case()
                 self.set_leftover_answer(outcome)
-                result = self.command(separate_stderr=True, timeout=20)
+                result = self.command_with_cleanup_clock(separate_stderr=True)
                 self.assertEqual(result.returncode, 75, result.stdout + result.stderr)
                 self.assert_wire("lost", "")
                 self.assertIn("mac_test: the link to the Mac dropped; running on natedev instead\n", result.stdout)
@@ -1465,8 +1856,7 @@ class OffloadCommandTests(unittest.TestCase):
                 self.assert_claim_is_kept()
                 self.assertEqual(len(self.leftover_events()), 1)
                 self.assert_leftover_selectors(self.leftover_events()[0]["args"][-1])
-                if outcome == "timeout":
-                    self.assertGreaterEqual(float(self.wire_result()["seconds"]), 10)
+                self.assertEqual(float(self.wire_result()["seconds"]), 13.0 if outcome == "timeout" else 8.0)
 
     def test_signal_keeps_claim_when_leftover_check_does_not_prove_completion(self) -> None:
         self.fixture["run_delay_s"] = 30
@@ -1478,11 +1868,11 @@ class OffloadCommandTests(unittest.TestCase):
                 try:
                     self.wait_for_path(self.stub_directory / "run-started")
                     process.send_signal(signal.SIGTERM)
-                    output, _ = process.communicate(timeout=20)
+                    output, _ = process.communicate(timeout=300)
                 finally:
                     if process.poll() is None:
                         process.kill()
-                        _ = process.communicate(timeout=5)
+                        _ = process.communicate(timeout=300)
                 self.assertEqual(process.returncode, 128 + signal.SIGTERM, output)
                 self.assert_leftover_diagnostic(output, outcome)
                 self.assert_claim_is_kept()
@@ -1500,13 +1890,13 @@ class OffloadCommandTests(unittest.TestCase):
                 try:
                     self.wait_for_path(self.stub_directory / f"{stage}-started")
                     process.send_signal(signal.SIGTERM)
-                    output, _ = process.communicate(timeout=15)
+                    output, _ = process.communicate(timeout=300)
                 finally:
                     if process.poll() is None:
                         process.kill()
-                        _ = process.communicate(timeout=5)
+                        _ = process.communicate(timeout=300)
                 self.assertEqual(process.returncode, 128 + signal.SIGTERM, output)
-                self.assertFalse((self.state_directory / "run.json").exists())
+                self.assertFalse(self.claim_file.exists())
                 self.assertEqual(self.leftover_events(), [])
 
     def test_takeover_ends_leftovers_on_recorded_host_then_runs_on_settings_host(self) -> None:
@@ -1517,7 +1907,7 @@ class OffloadCommandTests(unittest.TestCase):
         result = self.command("--no-fail-fast", settings=alternate)
         self.assertEqual(result.returncode, 0, result.stdout)
         self.assert_wire("passed", "")
-        self.assertFalse((self.state_directory / "run.json").exists())
+        self.assertFalse(self.claim_file.exists())
         events = self.events()
         self.assertEqual([event["command"] for event in events], ["ssh", "ssh", "rsync", "ssh"])
         cleanup = events[0]
@@ -1532,10 +1922,11 @@ class OffloadCommandTests(unittest.TestCase):
     def test_takeover_with_remaining_leftovers_declines_busy_and_preserves_job(self) -> None:
         old = self.write_kept_claim()
         self.set_leftover_answer("remaining")
-        result = self.command(separate_stderr=True)
+        result = self.process_command(separate_stderr=True)
         self.assertEqual(result.returncode, 75, result.stdout + result.stderr)
         self.assertEqual(result.stdout, "mac_test: not running on the Mac (busy)\n")
         self.assert_wire("declined", "busy")
+        self.assertEqual(self.wire_result().get("holder"), "leftovers")
         self.assert_leftover_diagnostic(result.stderr, "remaining")
         self.assert_claim_is_kept("previous-mac")
         self.assertEqual(self.remote_claim()["what"], old["what"])
@@ -1547,14 +1938,15 @@ class OffloadCommandTests(unittest.TestCase):
     def test_second_takeover_declines_busy_without_releasing_the_new_kept_claim(self) -> None:
         process = self.start_command(script=self.claim_stub_runner(), extra={"MAC_TEST_TAKEOVER_TWICE": "1"})
         try:
-            output, _ = process.communicate(timeout=15)
+            output, _ = process.communicate(timeout=300)
         finally:
             if process.poll() is None:
                 process.kill()
-                _ = process.communicate(timeout=5)
+                _ = process.communicate(timeout=300)
         self.assertEqual(process.returncode, 75, output)
         self.assert_wire("declined", "busy")
-        self.assertTrue((self.state_directory / "run.json").exists())
+        self.assertEqual(self.wire_result().get("holder"), "leftovers")
+        self.assertTrue(self.claim_file.exists())
         self.assertEqual((self.stub_directory / "state-events").read_text().splitlines(), ["claim", "release", "claim"])
         self.assertEqual(len(self.events()), 1)
         self.assertEqual(self.leftover_events()[0]["args"][-2], "previous-mac")
@@ -1562,7 +1954,7 @@ class OffloadCommandTests(unittest.TestCase):
     def test_takeover_check_failure_declines_unreachable_keeps_claim_and_sets_backoff(self) -> None:
         _ = self.write_kept_claim()
         self.set_leftover_answer("ssh_error")
-        result = self.command(separate_stderr=True)
+        result = self.process_command(separate_stderr=True)
         self.assertEqual(result.returncode, 75, result.stdout + result.stderr)
         self.assertEqual(result.stdout, "mac_test: not running on the Mac (unreachable)\n")
         self.assert_wire("declined", "unreachable")
@@ -1571,7 +1963,7 @@ class OffloadCommandTests(unittest.TestCase):
         self.assertTrue((self.state_directory / "unreachable_until").exists())
         self.assertEqual(len(self.events()), 1)
         self.clear_events()
-        repeated = self.command()
+        repeated = self.process_command()
         self.assertEqual(repeated.returncode, 75, repeated.stdout)
         self.assert_wire("declined", "backoff")
         self.assertEqual(self.events(), [])
@@ -1592,7 +1984,7 @@ class OffloadCommandTests(unittest.TestCase):
         self.assertEqual(result.stdout, "mac_test: not running on the Mac (blocked)\n")
         self.assert_wire("declined", "blocked")
         self.assertIn("blocked by alice: restore CI first", result.stderr)
-        self.assertFalse((self.state_directory / "run.json").exists())
+        self.assertFalse(self.claim_file.exists())
         self.assertEqual(path.read_bytes(), before)
         self.assertEqual(len(self.events_for("ssh")), 1)
         self.assertEqual(self.events_for("rsync"), [])
@@ -1604,7 +1996,7 @@ class OffloadCommandTests(unittest.TestCase):
                 self.reset_leftover_case()
                 _ = self.write_kept_claim()
                 self.set_leftover_answer(outcome)
-                result = self.command(last_decline=previous_reason, separate_stderr=True)
+                result = self.process_command(last_decline=previous_reason, separate_stderr=True)
                 self.assertEqual(result.returncode, 75, result.stdout + result.stderr)
                 reason = "busy" if outcome == "remaining" else "unreachable"
                 self.assert_wire("declined", reason)
@@ -1620,6 +2012,8 @@ class OffloadCommandTests(unittest.TestCase):
         for name in ("pgrep", "lsof", "sleep"):
             self.write_executable(selectors / name, SELECTOR_STUB)
         self.fixture["run_status_reported"] = False
+        self.config["leftover_timeout_s"] = "300"
+        self.sync_config()
         for shell in ("sh", "zsh"):
             for pgrep_status, lsof_status in ((1, 1), (1, 0), (2, 0)):
                 with self.subTest(shell=shell, pgrep_status=pgrep_status, lsof_status=lsof_status):
@@ -1628,7 +2022,7 @@ class OffloadCommandTests(unittest.TestCase):
                     self.fixture["selector_pgrep_status"] = pgrep_status
                     self.fixture["selector_lsof_status"] = lsof_status
                     self.sync_fixture()
-                    result = self.command(separate_stderr=True)
+                    result = self.process_command(separate_stderr=True)
                     self.assertEqual(result.returncode, 75, result.stdout + result.stderr)
                     self.assert_wire("lost", "")
                     cleanup = self.leftover_events()
@@ -1642,14 +2036,14 @@ class OffloadCommandTests(unittest.TestCase):
                         self.assertIn("lsof", names)
                     for call in calls:
                         if call["command"] == "pgrep":
-                            self.assertEqual(call["args"], ["-f", "[.]local/state/mac-test/mirror/"])
+                            self.assertEqual(call["args"], ["-u", str(os.getuid()), "-f", HANA_COMMAND_PATTERN])
                         if call["command"] == "lsof":
                             self.assertEqual(call["args"], ["-a", "-u", str(os.getuid()), "-d", "cwd", "-Fpn"])
                     answer = (self.stub_directory / "selector-answer").read_text()
                     if pgrep_status == 1 and lsof_status == 0:
                         self.assertIn("sleep", names)
                         self.assertEqual(answer.splitlines(), ["leftovers=0", "rc=0"])
-                        self.assertFalse((self.state_directory / "run.json").exists())
+                        self.assertFalse(self.claim_file.exists())
                     else:
                         self.assertNotIn("rc=0", answer.splitlines())
                         self.assert_claim_is_kept()
@@ -1667,16 +2061,16 @@ class OffloadCommandTests(unittest.TestCase):
                 try:
                     self.wait_for_path(self.stub_directory / "run-started")
                     process.send_signal(signal_number)
-                    output, _ = process.communicate(timeout=15)
+                    output, _ = process.communicate(timeout=300)
                 except BaseException:
                     process.kill()
-                    _ = process.communicate(timeout=5)
+                    _ = process.communicate(timeout=300)
                     raise
                 self.assertEqual(process.returncode, 128 + signal_number, output)
                 self.assertTrue(
                     (self.stub_directory / "cleanup-called").exists()
                 )
-                self.assertFalse((self.state_directory / "run.json").exists())
+                self.assertFalse(self.claim_file.exists())
                 ssh_events = self.events_for("ssh")
                 self.assertEqual(len(ssh_events), 3)
                 cleanup_arguments = ssh_events[-1]["args"]
@@ -1711,18 +2105,18 @@ class OffloadCommandTests(unittest.TestCase):
             _ = (self.stub_directory / "continue-cleanup").write_text(
                 "continue\n", encoding="utf-8"
             )
-            output, _ = process.communicate(timeout=15)
+            output, _ = process.communicate(timeout=300)
         except BaseException:
             process.kill()
             _ = (self.stub_directory / "continue-cleanup").write_text(
                 "continue\n", encoding="utf-8"
             )
-            _ = process.communicate(timeout=5)
+            _ = process.communicate(timeout=300)
             raise
 
         self.assertEqual(process.returncode, 128 + signal.SIGTERM, output)
         self.assertTrue((self.stub_directory / "cleanup-called").exists())
-        self.assertFalse((self.state_directory / "run.json").exists())
+        self.assertFalse(self.claim_file.exists())
 
     def test_ignored_interrupt_becomes_default_before_claim(self) -> None:
         startup = self.root / "interrupt-startup"
@@ -1760,15 +2154,15 @@ class OffloadCommandTests(unittest.TestCase):
         try:
             self.wait_for_path(marker)
             process.send_signal(signal.SIGINT)
-            output, _ = process.communicate(timeout=15)
+            output, _ = process.communicate(timeout=300)
         except BaseException:
             process.kill()
             _ = gate.write_text("continue\n", encoding="utf-8")
-            _ = process.communicate(timeout=5)
+            _ = process.communicate(timeout=300)
             raise
 
         self.assertEqual(process.returncode, -signal.SIGINT, output)
-        self.assertFalse((self.state_directory / "run.json").exists())
+        self.assertFalse(self.claim_file.exists())
         self.assertEqual(self.events(), [])
         self.assertFalse(self.result_path.exists())
 
@@ -1781,6 +2175,351 @@ class OffloadCommandTests(unittest.TestCase):
         self.assertIn("mac_test: not running on the Mac (off)\n", result.stdout)
         self.assertIn("FileNotFoundError", result.stdout)
         self.assertFalse(self.result_path.exists())
+
+
+class MacCleanupProtocolTests(unittest.TestCase):
+    def test_status_marker_followed_by_ordinary_output_is_printed_and_not_a_result(self) -> None:
+        output = io.StringIO()
+        controller = offload.ProcessController()
+        text = "mac_exit=0\ntest still running\n"
+        with redirect_stdout(output):
+            answer = controller.stream_mac_run([
+                sys.executable, "-c", "import sys; sys.stdout.write(sys.argv[1]); sys.exit(255)", text,
+            ])
+        self.assertIsInstance(answer, offload.MissingMacStatus)
+        self.assertEqual(output.getvalue(), text)
+
+    def test_stream_returns_cleanup_outcome_beside_the_reported_test_status(self) -> None:
+        cases = (
+            ("mac_cleanup=0\n", 0, offload.CleanupDone()),
+            ("mac_cleanup=kept\n", 0, offload.CleanupKept()),
+            ("mac_cleanup=7\n", 0, offload.CleanupFailed(7)),
+            ("mac_cleanup=skipped\n", 0, offload.CleanupSkipped()),
+            ("", 255, offload.CleanupUnconfirmed()),
+        )
+        for marker, ssh_status, expected in cases:
+            with self.subTest(marker=marker, ssh_status=ssh_status):
+                output = io.StringIO()
+                controller = offload.ProcessController()
+                with redirect_stdout(output):
+                    answer = controller.stream_mac_run([
+                        sys.executable, "-c", "import sys; sys.stdout.write(sys.argv[1]); sys.exit(int(sys.argv[2]))",
+                        "test output\nmac_exit=42\n" + marker, str(ssh_status),
+                    ])
+                self.assertEqual(answer, offload.ReportedMacStatus(42, expected))
+                self.assertEqual(output.getvalue(), "test output\n")
+
+
+class MacTargetCleanupShellTests(unittest.TestCase):
+    root: Path = Path()
+    home_directory: Path = Path()
+    mirror: Path = Path()
+    temporary_directory: Path = Path()
+    bin_directory: Path = Path()
+
+    @override
+    def setUp(self) -> None:
+        self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        self.home_directory = self.root / "home with spaces"
+        self.mirror = self.home_directory / offload.remote_mirror(offload.KnownRepository("hana's project"))
+        self.mirror.mkdir(parents=True)
+        self.temporary_directory = self.root / "tmp"
+        self.temporary_directory.mkdir()
+        self.bin_directory = self.root / "bin"
+        self.bin_directory.mkdir()
+        disk_space = self.bin_directory / "df"
+        _ = disk_space.write_text(f"#!{sys.executable}\n" + r'''
+import json
+import os
+from pathlib import Path
+import sys
+
+(Path(os.environ["CLEANUP_TEST_DIR"]) / "df-arguments.json").write_text(json.dumps(sys.argv[1:]))
+print(os.environ["CLEANUP_TEST_DF_OUTPUT"], end="")
+raise SystemExit(int(os.environ["CLEANUP_TEST_DF_STATUS"]))
+''')
+        disk_space.chmod(0o755)
+        lint = self.home_directory / ".claude/scripts/lint/lint"
+        lint.parent.mkdir(parents=True)
+        _ = lint.write_text(f"#!{sys.executable}\n" + r'''
+import json
+import os
+from pathlib import Path
+import sys
+
+root = Path(os.environ["CLEANUP_TEST_DIR"])
+(root / "lint-arguments.json").write_text(json.dumps(sys.argv[1:]))
+(root / "sweep-switch").write_text(os.environ.get("LINT_SKIP_SWEEP", ""))
+target = Path("target")
+for index, word in enumerate(sys.argv[1:], 1):
+    if word == "--target-dir":
+        target = Path(sys.argv[index + 1])
+    elif word.startswith("--target-dir="):
+        target = Path(word.split("=", 1)[1])
+target.mkdir(parents=True, exist_ok=True)
+(target / "nextest-output").write_text("built\n")
+print("nextest finished", flush=True)
+raise SystemExit(int(os.environ["CLEANUP_TEST_STATUS"]))
+''')
+        lint.chmod(0o755)
+
+    def run_remote(
+        self, shell: list[str], status: int, words: tuple[str, ...] = (), *,
+        disk_output: str = "Filesystem GiB Used Available Capacity Mounted\nfixture 500 401 99 80% /\n",
+        disk_status: int = 0,
+        free_floor_gib: float = 100,
+    ) -> subprocess.CompletedProcess[str]:
+        request = offload.OffloadRequest(self.root, "hana", "cleanup-call", offload.NO_RESULT_FILE, words)
+        config = offload.OffloadConfig(
+            enabled=True, host="unused-host", connect_timeout_s=6, probe_timeout_s=1,
+            unreachable_backoff_s=300, free_floor_gib=free_floor_gib,
+            default_target_budget_gib="24", values={},
+        )
+        text = (
+            '[ "$(command -v df)" = ' + shlex.quote(str(self.bin_directory / "df")) + ' ] || exit 99\n'
+            + offload.remote_test_command(config, request, offload.KnownRepository("hana's project"))
+        )
+        return subprocess.run(
+            [*shell, "-c", text], cwd=self.home_directory,
+            env={**os.environ, "HOME": str(self.home_directory), "TMPDIR": str(self.temporary_directory),
+                 "PATH": str(self.bin_directory) + os.pathsep + os.environ["PATH"],
+                 "CLEANUP_TEST_DIR": str(self.root), "CLEANUP_TEST_STATUS": str(status),
+                 "CLEANUP_TEST_DF_OUTPUT": disk_output, "CLEANUP_TEST_DF_STATUS": str(disk_status)},
+            capture_output=True, text=True, check=False, timeout=5,
+        )
+
+    def test_remote_text_below_space_floor_removes_only_repository_target_after_pass_and_failure(self) -> None:
+        target = self.mirror / "target"
+        sibling = self.mirror / "keep-source"
+        temporary_file = self.temporary_directory / "keep-temporary"
+        other_target = self.mirror.parent / "other-repository" / "target" / "keep-build"
+        other_target.parent.mkdir(parents=True)
+        for path in (sibling, temporary_file, other_target):
+            _ = path.write_text("keep\n")
+        for shell in (["/bin/sh"], ["zsh", "-f"]):
+            for status in (0, 42):
+                with self.subTest(shell=shell, status=status):
+                    target.mkdir(exist_ok=True)
+                    _ = (target / "previous-build").write_text("old\n")
+                    answer = self.run_remote(shell, status)
+                    self.assertEqual(answer.returncode, 0, answer.stdout + answer.stderr)
+                    self.assertEqual(answer.stdout.splitlines(), ["nextest finished", f"mac_exit={status}", "mac_cleanup=0"])
+                    self.assertEqual(answer.stderr, "")
+                    self.assertFalse(target.exists())
+                    self.assertEqual((self.root / "sweep-switch").read_text(), "1")
+                    self.assertEqual(
+                        cast(list[str], json.loads((self.root / "df-arguments.json").read_text())),
+                        ["-g", str(self.home_directory)],
+                    )
+                    for path in (sibling, temporary_file, other_target):
+                        self.assertEqual(path.read_text(), "keep\n")
+
+    def test_remote_text_at_or_above_space_floor_keeps_build_output(self) -> None:
+        target = self.mirror / "target"
+        target.mkdir()
+        existing = target / "previous-build"
+        _ = existing.write_text("keep\n")
+        for shell in (["/bin/sh"], ["zsh", "-f"]):
+            for status in (0, 42):
+                for free_space, floor in ((100, 100), (101, 100), (50, 50)):
+                    with self.subTest(shell=shell, status=status, free_space=free_space, floor=floor):
+                        answer = self.run_remote(
+                            shell, status, free_floor_gib=floor,
+                            disk_output=f"Filesystem GiB Used Available Capacity Mounted\nfixture 500 400 {free_space} 80% /\n",
+                        )
+                        self.assertEqual(answer.returncode, 0, answer.stdout + answer.stderr)
+                        self.assertEqual(answer.stdout.splitlines(), ["nextest finished", f"mac_exit={status}", "mac_cleanup=kept"])
+                        self.assertEqual(existing.read_text(), "keep\n")
+                        self.assertEqual((target / "nextest-output").read_text(), "built\n")
+
+    def test_remote_text_with_unreadable_space_keeps_build_output(self) -> None:
+        target = self.mirror / "target"
+        target.mkdir()
+        existing = target / "previous-build"
+        _ = existing.write_text("keep\n")
+        for shell in (["/bin/sh"], ["zsh", "-f"]):
+            for status in (0, 42):
+                for disk_output, disk_status in (("", 0), ("header\nfixture 500 400 unavailable\n", 0), ("", 1)):
+                    with self.subTest(shell=shell, status=status, disk_output=disk_output, disk_status=disk_status):
+                        answer = self.run_remote(shell, status, disk_output=disk_output, disk_status=disk_status)
+                        self.assertEqual(answer.returncode, 0, answer.stdout + answer.stderr)
+                        self.assertEqual(answer.stdout.splitlines(), ["nextest finished", f"mac_exit={status}", "mac_cleanup=kept"])
+                        self.assertEqual(existing.read_text(), "keep\n")
+                        self.assertEqual((target / "nextest-output").read_text(), "built\n")
+
+    def test_remote_text_with_another_target_dir_keeps_every_build_directory(self) -> None:
+        target = self.mirror / "target"
+        target.mkdir()
+        existing = target / "previous-build"
+        _ = existing.write_text("keep\n")
+        other_target = self.temporary_directory / "other build"
+        for shell in (["/bin/sh"], ["zsh", "-f"]):
+            for status in (0, 42):
+                for words in (("--target-dir", str(other_target)), (f"--target-dir={other_target}",)):
+                    with self.subTest(shell=shell, status=status, words=words):
+                        answer = self.run_remote(shell, status, words)
+                        self.assertEqual(answer.returncode, 0, answer.stdout + answer.stderr)
+                        self.assertEqual(answer.stdout.splitlines(), ["nextest finished", f"mac_exit={status}", "mac_cleanup=skipped"])
+                        self.assertEqual(existing.read_text(), "keep\n")
+                        self.assertEqual((other_target / "nextest-output").read_text(), "built\n")
+                        self.assertEqual(cast(list[str], json.loads((self.root / "lint-arguments.json").read_text())), ["nextest", *words])
+
+    def test_remote_text_reports_delete_failure_after_the_test_status(self) -> None:
+        remove = self.bin_directory / "rm"
+        _ = remove.write_text(f"#!{sys.executable}\n" + r'''
+import json
+import os
+from pathlib import Path
+import sys
+
+(Path(os.environ["CLEANUP_TEST_DIR"]) / "remove-arguments.json").write_text(json.dumps(sys.argv[1:]))
+raise SystemExit(7)
+''')
+        remove.chmod(0o755)
+        with mock.patch.dict(os.environ, {"PATH": str(self.bin_directory) + os.pathsep + os.environ["PATH"]}):
+            for shell in (["/bin/sh"], ["zsh", "-f"]):
+                for status in (0, 42):
+                    with self.subTest(shell=shell, status=status):
+                        answer = self.run_remote(shell, status)
+                        self.assertEqual(answer.returncode, 0, answer.stdout + answer.stderr)
+                        self.assertEqual(answer.stdout.splitlines(), ["nextest finished", f"mac_exit={status}", "mac_cleanup=7"])
+                        self.assertTrue((self.mirror / "target" / "nextest-output").exists())
+                        arguments = cast(list[str], json.loads((self.root / "remove-arguments.json").read_text()))
+                        self.assertEqual([word for word in arguments if not word.startswith("-")], [str(self.mirror / "target")])
+
+
+class MacActivityShellTests(unittest.TestCase):
+    root: Path = Path()
+    bin_directory: Path = Path()
+
+    @override
+    def setUp(self) -> None:
+        self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        self.bin_directory = self.root / "bin"
+        self.bin_directory.mkdir()
+        for name in ("pgrep", "lsof", "ps", "id"):
+            path = self.bin_directory / name
+            _ = path.write_text(f"#!{sys.executable}\n" + ACTIVITY_SELECTOR_STUB)
+            path.chmod(0o755)
+
+    def run_activity(self, shell: list[str], responses: dict[str, tuple[int, str]]) -> subprocess.CompletedProcess[str]:
+        _ = (self.root / "responses.json").write_text(json.dumps(responses))
+        (self.root / "commands.jsonl").unlink(missing_ok=True)
+        environment = {**os.environ, "PATH": str(self.bin_directory) + os.pathsep + os.environ["PATH"],
+                       "ACTIVITY_TEST_DIR": str(self.root)}
+        checks = "\n".join(
+            '[ "$(command -v ' + name + ')" = ' + shlex.quote(str(self.bin_directory / name)) + ' ] || exit 99'
+            for name in ("pgrep", "lsof", "ps", "id")
+        )
+        text = "kill() { printf 'signal requested\\n' >&2; return 99; }\n" + checks + "\n" + mac_test.mac_activity_script()
+        return subprocess.run([*shell, "-c", text], env=environment, capture_output=True, text=True, timeout=300, check=False)
+
+    def test_activity_text_has_zero_for_only_shells_in_clones_under_sh_and_zsh(self) -> None:
+        responses = {
+            "id": (0, "501\n"), "pgrep": (1, ""),
+            "lsof": (0, "p101\nn/Users/test/rust/hana\np102\nn/Users/test/rust/other\n"),
+            "ps": (0, "101 501 /bin/zsh\n102 501 /bin/sh\n103 999 /opt/cargo\n"),
+        }
+        for shell in (["/bin/sh"], ["zsh", "-f"]):
+            with self.subTest(shell=shell):
+                answer = self.run_activity(shell, responses)
+                self.assertEqual((answer.returncode, answer.stdout, answer.stderr), (0, "active=0\nrc=0\n", ""))
+
+    def test_activity_text_counts_each_matching_user_pid_once_under_sh_and_zsh(self) -> None:
+        responses = {
+            "id": (0, "501\n"), "pgrep": (0, "101\n102\n"),
+            "lsof": (0, "p102\nn/Users/test/.local/state/mac-test/mirror/hana\n"
+                     + "p103\nn/Users/test/.local/state/mac-test/mirror\np104\nn/Users/test/rust/hana\n"),
+            "ps": (0, "101 501 /opt/rust/bin/cargo\n105 501 /opt/rust/bin/rustc\n106 501 cargo-nextest\n"
+                   + "107 501 /Users/test/rust/hana/target/debug/app\n108 999 /opt/cargo\n"
+                   + "109 501 /bin/zsh\n110 501 /opt/cargo-helper\n112 501 /Users/test/my project/target/debug/app\n"),
+        }
+        for shell in (["/bin/sh"], ["zsh", "-f"]):
+            with self.subTest(shell=shell):
+                answer = self.run_activity(shell, responses)
+                self.assertEqual((answer.returncode, answer.stdout, answer.stderr), (0, "active=7\nrc=0\n", ""))
+                calls = [cast(SelectorEvent, json.loads(line)) for line in (self.root / "commands.jsonl").read_text().splitlines()]
+                pgrep = [call for call in calls if call["command"] == "pgrep"]
+                lsof = [call for call in calls if call["command"] == "lsof"]
+                ps = [call for call in calls if call["command"] == "ps"]
+                self.assertEqual(len(pgrep), 1)
+                self.assertIn("-u", pgrep[0]["args"])
+                self.assertIn("501", pgrep[0]["args"])
+                self.assertIn("[.]local/state/mac-test/mirror/", pgrep[0]["args"])
+                self.assertEqual(lsof[0]["args"], ["-a", "-u", "501", "-d", "cwd", "-Fpn"])
+                self.assertEqual(len(ps), 1)
+
+    def test_activity_selector_failure_prints_no_success_under_sh_and_zsh(self) -> None:
+        for shell in (["/bin/sh"], ["zsh", "-f"]):
+            for name, status in (("pgrep", 2), ("lsof", 1), ("ps", 1)):
+                with self.subTest(shell=shell, selector=name):
+                    responses = {"id": (0, "501\n"), "pgrep": (1, ""), "lsof": (0, ""), "ps": (0, "")}
+                    responses[name] = (status, "")
+                    answer = self.run_activity(shell, responses)
+                    self.assertNotEqual(answer.returncode, 0)
+                    self.assertNotIn("rc=0", answer.stdout)
+                    self.assertNotIn("active=0", answer.stdout)
+                    self.assertNotIn("signal requested", answer.stderr)
+
+    def test_activity_and_leftover_texts_use_the_shared_mirror_selector(self) -> None:
+        marker = "select_leftovers() { return 1; }\n"
+        with mock.patch.object(offload, "mirror_selector_script", return_value=marker) as selector:
+            self.assertTrue(offload.leftover_check_script(HANA).startswith(marker))
+            self.assertTrue(mac_test.mac_activity_script().startswith(marker))
+        self.assertEqual(selector.call_args_list, [mock.call(HANA), mock.call(offload.ALL_MIRRORS)])
+
+    def run_selector(
+        self, shell: list[str], scope: offload.MirrorScope, responses: dict[str, tuple[int, str]],
+    ) -> subprocess.CompletedProcess[str]:
+        _ = (self.root / "responses.json").write_text(json.dumps(responses))
+        (self.root / "commands.jsonl").unlink(missing_ok=True)
+        environment = {**os.environ, "PATH": str(self.bin_directory) + os.pathsep + os.environ["PATH"],
+                       "ACTIVITY_TEST_DIR": str(self.root)}
+        text = offload.mirror_selector_script(scope) + "select_leftovers\n"
+        return subprocess.run([*shell, "-c", text], env=environment, capture_output=True, text=True, timeout=300, check=False)
+
+    def test_repository_selector_stops_at_its_own_mirror_under_sh_and_zsh(self) -> None:
+        responses = {
+            "id": (0, "501\n"), "pgrep": (1, ""),
+            "lsof": (0, "p201\nn/Users/test/.local/state/mac-test/mirror/hana\n"
+                     + "p202\nn/Users/test/.local/state/mac-test/mirror/hana/crates/hana\n"
+                     + "p203\nn/Users/test/.local/state/mac-test/mirror/hana_other\n"
+                     + "p204\nn/Users/test/.local/state/mac-test/mirror/cargo-liner\n"
+                     + "p205\nn/Users/test/.local/state/mac-test/mirror\n"
+                     + "p206\nn/Users/test/rust/hana\n"),
+        }
+        for shell in (["/bin/sh"], ["zsh", "-f"]):
+            with self.subTest(shell=shell):
+                answer = self.run_selector(shell, HANA, responses)
+                self.assertEqual((answer.returncode, answer.stdout, answer.stderr), (0, "201\n202\n", ""))
+                calls = [cast(SelectorEvent, json.loads(line)) for line in (self.root / "commands.jsonl").read_text().splitlines()]
+                pgrep = [call for call in calls if call["command"] == "pgrep"]
+                self.assertEqual(len(pgrep), 1)
+                self.assertEqual(pgrep[0]["args"], ["-u", "501", "-f", HANA_COMMAND_PATTERN])
+
+    def test_repository_command_pattern_matches_only_its_own_mirror(self) -> None:
+        responses = {"id": (0, "501\n"), "pgrep": (1, ""), "lsof": (0, "")}
+        answer = self.run_selector(["/bin/sh"], HANA, responses)
+        self.assertEqual(answer.returncode, 0, answer.stderr)
+        calls = [cast(SelectorEvent, json.loads(line)) for line in (self.root / "commands.jsonl").read_text().splitlines()]
+        pattern = next(call["args"][-1] for call in calls if call["command"] == "pgrep")
+        matching = [
+            "sh -c cd .local/state/mac-test/mirror/hana && cargo nextest run",
+            "cargo build --manifest-path /Users/test/.local/state/mac-test/mirror/hana/Cargo.toml",
+            "sh -c cd '/Users/test/.local/state/mac-test/mirror/hana' && cargo test",
+            "sh -c cd \"/Users/test/.local/state/mac-test/mirror/hana\"",
+            "ls /Users/test/.local/state/mac-test/mirror/hana",
+        ]
+        other = [
+            "sh -c cd .local/state/mac-test/mirror/hana_other && cargo nextest run",
+            "sh -c cd .local/state/mac-test/mirror/cargo-liner && cargo nextest run",
+            "sh -c cd .local/state/mac-test/mirror/hanabi && cargo test",
+            "sh -c cd /Users/test/rust/hana && cargo test",
+        ]
+        selected = subprocess.run(["grep", "-E", "-e", pattern], input="\n".join(matching + other) + "\n",
+                                  capture_output=True, text=True, timeout=30, check=False)
+        self.assertEqual(selected.returncode, 0, selected.stderr)
+        self.assertEqual(selected.stdout.splitlines(), matching)
 
 
 if __name__ == "__main__":

@@ -11,13 +11,56 @@ import subprocess
 import unittest
 import tempfile
 from contextlib import closing
+from datetime import datetime
 from pathlib import Path
 from typing import Protocol, cast, final, override
+from unittest.mock import patch
 
-from scripts.usage import outcomes
+from scripts.usage import collect, outcomes, usage_report
+from scripts.whoami import worker_usage
 from scripts.usage.test_collect import (
     CollectorFixture, FIXTURES as COLLECT_FIXTURES, MacRun, MacStreamReport, SshBehavior,
 )
+
+
+class DefaultSourcesTests(unittest.TestCase):
+    def test_first_read_accepts_a_concurrent_baseline_conversion(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            state = home / ".local/state/usage-model"
+            previous = state / "seats-baseline"
+            previous.mkdir(parents=True)
+            _ = (previous / "readings-2026-10-10.jsonl").write_text("old reading\n")
+            rename = Path.rename
+
+            def convert_before_rename(path: Path, target: str | Path) -> Path:
+                _ = rename(path, target)
+                return rename(path, target)
+
+            with (patch.object(Path, "home", return_value=home),
+                  patch.object(Path, "rename", convert_before_rename)):
+                sources = outcomes.default_sources()
+                self.assertEqual(sources.baseline_readings.read_text(), "old reading\n")
+                self.assertEqual(sources.baseline_readings.parent, state / "workers-baseline")
+                self.assertFalse(previous.exists())
+                self.assertEqual(outcomes.default_sources(), sources)
+
+    def test_first_read_moves_the_old_baseline_and_later_reads_use_only_workers(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            state = home / ".local/state/usage-model"
+            previous = state / "seats-baseline"
+            previous.mkdir(parents=True)
+            _ = (previous / "readings-2026-10-10.jsonl").write_text("old reading\n")
+            with patch.object(Path, "home", return_value=home):
+                sources = outcomes.default_sources()
+                self.assertEqual(sources.baseline_readings.read_text(), "old reading\n")
+                self.assertEqual(sources.baseline_readings.parent, state / "workers-baseline")
+                self.assertFalse(previous.exists())
+                previous.mkdir()
+                _ = (previous / "readings-2026-10-10.jsonl").write_text("later old reading\n")
+                self.assertEqual(outcomes.default_sources(), sources)
+                self.assertEqual(sources.baseline_readings.read_text(), "old reading\n")
 
 
 FIXTURES = Path(__file__).with_name("fixtures") / "outcomes"
@@ -114,6 +157,55 @@ class OutcomeFixture(CollectorFixture):
         self.assertEqual(self.values(rows, "parent_id", "agent_id", "at"), [("", CORRECTED_THREAD, at)])
 
 
+class StoredWorkerRoleTests(unittest.TestCase):
+    def test_store_upgrade_preserves_switches_before_and_across_the_worker_rename(self) -> None:
+        with closing(sqlite3.connect(":memory:")) as db:
+            db.row_factory = sqlite3.Row
+            _ = db.executescript(collect.SCHEMA)
+            _ = db.execute(f"PRAGMA user_version = {collect.FILE_NAMED_CODEX_KEYS_VERSION}")
+            _ = db.executemany("INSERT INTO account_role_changes VALUES (?, ?, ?, ?)", (
+                ("natedev", "2026-10-01T00:00:00+00:00", "seats", "codex1"),
+                ("natedev", "2026-10-02T00:00:00+00:00", "seats", "codex2"),
+                ("natedev", "2026-10-03T00:00:00+00:00", "workers", "codex3"),
+            ))
+            collect.migrate_store(db)
+            history = worker_usage.store_switch_history(db)
+            self.assertEqual(history.switches, (
+                datetime.fromisoformat("2026-10-02T00:00:00+00:00"),
+                datetime.fromisoformat("2026-10-03T00:00:00+00:00"),
+            ))
+            outcome = usage_report.OUTCOMES["account_switches"]
+            assert isinstance(outcome, usage_report.QueryOutcome)
+            self.assertEqual(db.execute("SELECT count(*) FROM (" + outcome.query + ")").fetchone()[0], 2)
+            rows = cast(list[sqlite3.Row], db.execute(
+                "SELECT machine, at, role, label FROM account_role_changes ORDER BY at").fetchall())
+            self.assertEqual([tuple(cast(object, row[column]) for column in ("machine", "at", "role", "label"))
+                              for row in rows], [
+                ("natedev", "2026-10-01T00:00:00+00:00", "workers", "codex1"),
+                ("natedev", "2026-10-02T00:00:00+00:00", "workers", "codex2"),
+                ("natedev", "2026-10-03T00:00:00+00:00", "workers", "codex3"),
+            ])
+            changes = db.total_changes
+            collect.migrate_store(db)
+            self.assertEqual(db.total_changes, changes)
+
+    def test_store_upgrade_merges_old_roles_with_their_recollected_worker_records(self) -> None:
+        with closing(sqlite3.connect(":memory:")) as db:
+            _ = db.executescript(collect.SCHEMA)
+            _ = db.execute(f"PRAGMA user_version = {collect.FILE_NAMED_CODEX_KEYS_VERSION}")
+            _ = db.executemany("INSERT INTO account_role_changes VALUES (?, ?, ?, ?)", (
+                ("natedev", "2026-10-01T00:00:00+00:00", "seats", "codex1"),
+                ("natedev", "2026-10-01T00:00:00+00:00", "workers", "codex1"),
+            ))
+            collect.migrate_store(db)
+            self.assertEqual(outcomes.save_account_role(db, {
+                "at": "2026-10-01T00:00:00Z", "role": "workers", "label": "codex1",
+            }), 0)
+            self.assertEqual(db.execute("SELECT * FROM account_role_changes").fetchall(), [
+                ("natedev", "2026-10-01T00:00:00+00:00", "workers", "codex1"),
+            ])
+
+
 class ProductionPathsTests(unittest.TestCase):
     def test_production_documents_contribute_repositories_and_worktrees(self) -> None:
         directory = tempfile.TemporaryDirectory()
@@ -134,6 +226,24 @@ class ProductionPathsTests(unittest.TestCase):
 
 
 class OutcomeTests(OutcomeFixture):
+    def test_late_old_role_append_is_canonicalized_after_its_complete_line_arrives(self) -> None:
+        _ = self.collect()
+        path = self.root / "account-roles.jsonl"
+        previous = self.cursor_for(path)
+        self.append_bytes(path, b'not json\n{"at":"2026-10-10T22:00:00Z","role":"seats","label":"codex2"}')
+        _ = self.collect()
+        self.assertEqual(self.cursor_for(path), previous + len(b"not json\n"))
+        self.assertEqual(self.rows("SELECT * FROM account_role_changes WHERE label = 'codex2'"), [])
+        self.append_bytes(path, b"\n")
+        output = self.collect()
+        self.assert_outcomes_added(output, "account_roles", 1)
+        self.assertEqual(self.values(self.rows("SELECT * FROM account_role_changes WHERE label = 'codex2'"),
+                                     "machine", "at", "role", "label"), [
+            ("natedev", "2026-10-10T22:00:00+00:00", "workers", "codex2"),
+        ])
+        self.assertEqual(self.cursor_for(path), path.stat().st_size)
+        self.assert_outcomes_added(self.collect(), "account_roles", 0)
+
     def test_baseline_only_reading_has_its_own_source_and_cursor(self) -> None:
         baseline = self.root / "baseline-readings.jsonl"
         _ = baseline.write_text('{"account":"codex fixture","at":"2026-10-03T18:17:00Z",' +
@@ -176,7 +286,7 @@ class OutcomeTests(OutcomeFixture):
         self.assertEqual(self.values(columns, "name"),
                          [("machine",), ("family",), ("parent_id",), ("agent_id",), ("folder",)])
         self.assertEqual(self.values(columns, "pk"), [(1,), (2,), (3,), (4,), (0,)])
-        self.assertEqual(cast(int, self.rows("PRAGMA user_version")[0][0]), 7)
+        self.assertEqual(cast(int, self.rows("PRAGMA user_version")[0][0]), 10)
         self.assertEqual(self.values(self.rows("PRAGMA index_info(turns_at)"), "name"), [("at",)])
 
     def test_claude_folder_uses_first_cwd_even_after_saved_cursor(self) -> None:
@@ -206,22 +316,19 @@ class OutcomeTests(OutcomeFixture):
         _ = self.collect()
         self.assertEqual(self.all_values(self.rows("SELECT * FROM folders")), before)
 
-    def test_version_six_store_replays_folders_once_and_preserves_turns(self) -> None:
+    def test_version_six_store_is_refused_without_replaying_folders_or_turns(self) -> None:
         path = self.claude_root / "project/folder-session.jsonl"
         _ = shutil.copyfile(FIXTURES / "updates/claude-folders.jsonl", path)
         _ = self.collect()
-        turns = self.all_values(self.rows("SELECT * FROM turns ORDER BY family, agent_id, turn_key"))
         with closing(sqlite3.connect(self.db_path)) as database, database:
-            _ = database.execute("DROP TABLE folders")
-            _ = database.execute("DROP INDEX turns_at")
             _ = database.execute("PRAGMA user_version = 6")
-        _ = self.collect()
-        self.assertEqual(cast(int, self.rows("PRAGMA user_version")[0][0]), 7)
-        self.assertEqual(self.values(self.rows("SELECT * FROM folders"), "agent_id", "folder"),
-                         [("folder-session", "/invented/first")])
-        self.assertEqual(self.all_values(self.rows("SELECT * FROM turns ORDER BY family, agent_id, turn_key")), turns)
         before = self.snapshot()
-        _ = self.collect()
+        result = self.cli(db=self.db_path)
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(result.stdout, "")
+        self.assertEqual(result.stderr, "collect: store version 6 predates file-named Codex keys; "
+                         + f"delete {self.db_path} and run the collector again to rebuild it\n")
+        self.assertEqual(cast(int, self.rows("PRAGMA user_version")[0][0]), 6)
         self.assertEqual(self.snapshot(), before)
 
     def test_outcome_schema_keeps_identity_and_source_event_without_finding_details(self) -> None:
@@ -549,7 +656,7 @@ class OutcomeTests(OutcomeFixture):
                 expected.append(offset)
             offset += len(line)
         codex = [row for row in edits if row["family"] == "codex"]
-        self.assertEqual([int(cast(str, row["edit_key"])) for row in codex], expected)
+        self.assertEqual(self.values(codex, "edit_key"), [(f"{path.name}:{offset}",) for offset in expected])
         self.assertEqual(self.values(codex, "at"), [("2026-10-11T00:01:05+00:00",), ("2026-10-11T00:01:06+00:00",)])
         last_turn = self.rows("SELECT max(at) AS at FROM turns WHERE agent_id = ?", (THREAD,))
         self.assertTrue(all(cast(str, row["at"]) > cast(str, last_turn[0]["at"]) for row in codex))
@@ -701,20 +808,20 @@ class MacOutcomeTests(OutcomeFixture):
                                            (str(self.mac_home / '.claude/projects/project/folder-session.jsonl'),)))
                 self.assert_family_state(run.output, "mac", "claude", "partial")
 
-    def test_version_six_mac_store_replays_folders_once_without_new_turns(self) -> None:
+    def test_version_six_mac_store_is_refused_without_reading_remote_sources(self) -> None:
         _ = self.add_folder_files(self.mac_home)
         _ = self.mac_collect()
-        turns = self.all_values(self.rows("SELECT * FROM turns ORDER BY machine, family, agent_id, turn_key"))
         with closing(sqlite3.connect(self.db_path)) as database, database:
-            _ = database.execute("DELETE FROM folders")
             _ = database.execute("PRAGMA user_version = 6")
-        replayed = self.mac_collect()
-        self.assertEqual(replayed.stream["folder_records"], 3)
-        self.assertEqual(len(self.rows("SELECT * FROM folders WHERE machine = 'mac'")), 2)
-        self.assertEqual(self.all_values(self.rows("SELECT * FROM turns ORDER BY machine, family, agent_id, turn_key")), turns)
-        repeated = self.mac_collect()
-        self.assertEqual(repeated.stream["folder_records"], 0)
-        self.assertEqual(repeated.stream["measurement_records"], 0)
+        before = self.snapshot()
+        result = self.cli(db=self.db_path, mac_pass="fixture")
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(result.stdout, "")
+        self.assertEqual(result.stderr, "collect: store version 6 predates file-named Codex keys; "
+                         + f"delete {self.db_path} and run the collector again to rebuild it\n")
+        self.assertEqual(cast(int, self.rows("PRAGMA user_version")[0][0]), 6)
+        self.assertEqual(self.snapshot(), before)
+        self.assertFalse((self.root / "ssh-report.json").exists())
 
     def test_mac_outcomes_and_lifecycle_equal_local_rows_without_remote_checkout(self) -> None:
         before = {str(path.relative_to(self.mac_home)): path.read_bytes()

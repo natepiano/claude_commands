@@ -3,7 +3,9 @@
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
+import io
 import json
 import os
 import subprocess
@@ -11,13 +13,18 @@ import sys
 import tempfile
 import time
 import unittest
+from types import ModuleType, SimpleNamespace
+from unittest.mock import Mock, patch
 from pathlib import Path
 from typing import cast, override
 
 
+from scripts.delegate import review_pool
+from scripts.delegate.wait_for_test_state import wait_until
+
 SCRIPT = Path(__file__).with_name("review_pool.py")
 
-# A gate controls completion, not a guessed duration. Each invocation records
+# A gate controls completion, not a fixed delay. Each invocation records
 # its own event file so concurrent subprocesses cannot corrupt a shared log.
 STUB_MESH = r'''#!/usr/bin/env python3
 import argparse
@@ -30,7 +37,7 @@ import time
 
 parser = argparse.ArgumentParser()
 verbs = parser.add_subparsers(dest="verb", required=True)
-for verb in ("prime", "fork", "reset", "end", "stop"):
+for verb in ("prime", "fork", "reset", "end", "stop", "set-instructions"):
     command = verbs.add_parser(verb)
     command.add_argument("--session-dir", required=True)
     if verb == "prime":
@@ -44,6 +51,9 @@ for verb in ("prime", "fork", "reset", "end", "stop"):
         command.add_argument("--name", required=True)
     elif verb in ("reset", "end"):
         command.add_argument("--to", required=True)
+    elif verb == "set-instructions":
+        command.add_argument("--to", required=True)
+        command.add_argument("--instructions-file", required=True)
 args = parser.parse_args()
 session = Path(args.session_dir)
 with (Path(os.environ["REVIEW_POOL_STATE"]) / "production" / "pool.lock").open("a+") as lock:
@@ -70,12 +80,16 @@ if args.verb == "prime":
         sys.exit("prime needs an existing cwd")
     event["instructions"] = instructions.read_text()
     event["cwd_entries"] = [path.name for path in Path(args.cwd).iterdir()]
+if args.verb == "set-instructions":
+    event["instructions"] = Path(args.instructions_file).read_text()
 temporary = events / (str(os.getpid()) + ".tmp")
 temporary.write_text(json.dumps(event))
 temporary.rename(events / (str(os.getpid()) + "-" + str(time.time_ns()) + ".json"))
 gate = setting.get("gate", "")
-while gate and not Path(gate).exists():
-    time.sleep(0.01)
+if gate:
+    sys.path.insert(0, os.environ["POOL_TEST_HELPER_DIR"])
+    from wait_for_test_state import wait_for_file
+    wait_for_file(Path(gate))
 if previous < setting.get("failures", 10**9):
     failure = setting.get("exit", 0)
     if failure:
@@ -91,6 +105,14 @@ if args.verb in ("prime", "fork"):
         roster[name] = {"thread_id": thread_id, "status": "done"}
         roster_path.write_text(json.dumps(roster))
     print(thread_id)
+if args.verb == "set-instructions":
+    session.mkdir(parents=True, exist_ok=True)
+    with (session / "roster.lock").open("a+") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        roster_path = session / "mesh_roster.json"
+        roster = json.loads(roster_path.read_text()) if roster_path.exists() else {}
+        roster.setdefault(name, {})["instructions_file"] = args.instructions_file
+        roster_path.write_text(json.dumps(roster))
 '''
 
 
@@ -117,6 +139,7 @@ class ReviewPoolTests(unittest.TestCase):
 
     @override
     def setUp(self) -> None:
+        self.enterContext(patch.dict(os.environ, {"PLAN_DELEGATE_SYNC_WRITES": "0"}))
         self.temporary = tempfile.TemporaryDirectory()
         self.root = Path(self.temporary.name)
         self.pool = self.root / "state" / "production"
@@ -138,11 +161,32 @@ class ReviewPoolTests(unittest.TestCase):
             gate.touch()
         for process in self.processes:
             try:
-                _ = process.communicate(timeout=5)
+                _ = process.communicate(timeout=300)
             except subprocess.TimeoutExpired:
                 process.kill()
-                _ = process.communicate(timeout=5)
+                _ = process.communicate(timeout=300)
         self.temporary.cleanup()
+
+    def test_pool_write_syncs_by_default_and_flushes_without_sync_for_disposable_state(self) -> None:
+        production = review_pool.ProductionPool(self.pool)
+
+        def flushed(descriptor: int) -> None:
+            self.assertGreaterEqual(descriptor, 0)
+            temporary, = self.pool.glob(".pool-*")
+            self.assertTrue(temporary.read_text())
+
+        for durable in (True, False):
+            with self.subTest(durable=durable), patch.dict(os.environ), patch.object(os, "fsync", side_effect=flushed) as sync:
+                if durable:
+                    _ = os.environ.pop("PLAN_DELEGATE_SYNC_WRITES", None)
+                else:
+                    os.environ["PLAN_DELEGATE_SYNC_WRITES"] = "0"
+                with production.locked() as pool:
+                    pool.generation += 1
+                    generation = pool.generation
+                self.assertEqual(sync.call_count, int(durable))
+                self.assertEqual(json.loads((self.pool / "pool.json").read_text())["generation"], generation)
+                self.assertEqual(list(self.pool.glob(".pool-*")), [])
 
     def environment(self) -> dict[str, str]:
         environment = os.environ.copy()
@@ -151,6 +195,7 @@ class ReviewPoolTests(unittest.TestCase):
             "REVIEW_POOL_MESH": str(self.stub),
             "POOL_STUB_CONTROL": str(self.control_file),
             "POOL_STUB_EVENTS": str(self.events_dir),
+            "POOL_TEST_HELPER_DIR": str(SCRIPT.parent),
         })
         return environment
 
@@ -160,7 +205,7 @@ class ReviewPoolTests(unittest.TestCase):
     def run_pool(self, *arguments: str) -> subprocess.CompletedProcess[str]:
         return subprocess.run(
             self.command(*arguments), env=self.environment(), capture_output=True,
-            text=True, check=False, timeout=10,
+            text=True, check=False, timeout=300,
         )
 
     def succeed(self, *arguments: str) -> str:
@@ -177,7 +222,7 @@ class ReviewPoolTests(unittest.TestCase):
         return process
 
     def finish(self, process: subprocess.Popen[str]) -> tuple[int, str, str]:
-        output, errors = process.communicate(timeout=10)
+        output, errors = process.communicate(timeout=300)
         assert process.returncode is not None
         return process.returncode, output.strip(), errors
 
@@ -209,15 +254,15 @@ class ReviewPoolTests(unittest.TestCase):
         self.assertEqual(len(issued), len(set(issued)), issued)
 
     def await_event(self, verb: str, name: str, process: subprocess.Popen[str]) -> dict[str, object]:
-        deadline = time.monotonic() + 10
-        while time.monotonic() < deadline:
-            for event in self.events(verb):
-                if event["name"] == name:
-                    return event
+        def ready() -> bool:
+            if any(event["name"] == name for event in self.events(verb)):
+                return True
             if process.poll() is not None:
                 self.fail(f"process exited before {verb}:{name}: {self.finish(process)}")
-            time.sleep(0.01)
-        self.fail(f"no {verb}:{name} event before deadline")
+            return False
+
+        wait_until(ready, self.events_dir, processes=(process,))
+        return next(event for event in self.events(verb) if event["name"] == name)
 
     def state(self) -> dict[str, object]:
         return parse_object((self.pool / "pool.json").read_text(encoding="utf-8"))
@@ -232,22 +277,27 @@ class ReviewPoolTests(unittest.TestCase):
         self.pool.mkdir(parents=True, exist_ok=True)
         _ = (self.pool / "pool.json").write_text(json.dumps(state), encoding="utf-8")
 
-    def seed(self, entries: dict[str, object], split: str = "hash") -> None:
+    def seed(self, entries: dict[str, object]) -> None:
         self.write_state({
-            "split": split, "generation": 0,
+            "generation": 0,
             "templates": {"code": {"name": "code-template-current", "thread_id": "template-thread",
                                     "prime_hash": "current"}},
             "reviewers": entries,
         })
 
-    def idle(self, unit: str = "", phase: str = "phase1", *, prime_hash: str = "current",
-             served: tuple[tuple[str, str], ...] = ()) -> dict[str, object]:
+    def idle(self, unit: str = "", *, prime_hash: str = "current") -> dict[str, object]:
         return {
             "type": "code", "thread_id": "existing-thread", "prime_hash": prime_hash,
-            "lease": {"unit": unit, "phase": phase, "ordinal": 3} if unit else None,
-            "busy_pid": None, "served": [list(entry) for entry in served], "reviews": 5,
-            "last_allocated": time.time(),
+            "lease": {"unit": unit, "ordinal": 3} if unit else None,
+            "busy_pid": None, "reviews": 5, "last_allocated": time.time(),
         }
+
+    def fork_sources(self) -> list[str]:
+        sources: list[str] = []
+        for event in self.events("fork"):
+            argv = cast("list[str]", event["argv"])
+            sources.append(argv[argv.index("--from") + 1])
+        return sources
 
     def allocation_args(self, unit: str = "unit", phase: str = "phase1", review_pass: str = "1",
                         lens: str = "contract", reviewer_type: str = "code") -> list[str]:
@@ -269,11 +319,11 @@ class ReviewPoolTests(unittest.TestCase):
     def release(self, name: str) -> None:
         _ = self.succeed("release", "--reviewer", name, "--pid", str(os.getpid()))
 
-    def test_new_pool_uses_default_split_and_generation_and_content_addressed_prime(self) -> None:
+    def test_new_pool_uses_default_generation_and_content_addressed_prime(self) -> None:
         expected = hashlib.sha256(self.instructions.read_bytes()).hexdigest()
         self.assertEqual(self.prime(), expected)
         state = self.state()
-        self.assertEqual(state["split"], "hash")
+        self.assertNotIn("split", state)
         self.assertEqual(state["generation"], 0)
         self.assertEqual(state["next_index"], {"code": 1, "ui": 1})
         self.assertEqual(state["reviewers"], {})
@@ -296,59 +346,118 @@ class ReviewPoolTests(unittest.TestCase):
         self.assertEqual(self.prime(), digest)
         self.assertEqual(len(self.events("prime")), 1)
 
-    def test_changed_prime_preserves_old_file_for_reviewer_and_new_lease_uses_new_hash(self) -> None:
+    def test_changed_prime_gives_old_and_new_reviewers_the_new_hash(self) -> None:
         old_hash = self.prime()
         old = self.allocate()
         self.release(str(old["reviewer"]))
         _ = self.instructions.write_text("A changed standing contract.\n", encoding="utf-8")
         new_hash = self.prime()
         self.assertNotEqual(new_hash, old_hash)
-        self.assertEqual((self.pool / "prime" / f"{old_hash}.md").read_text(encoding="utf-8"),
-                         "Review only.\nPreserve café.\n")
+        self.assertFalse((self.pool / "prime" / f"{old_hash}.md").exists())
         new = self.allocate(unit="another-unit")
         self.assertNotEqual(new["reviewer"], old["reviewer"])
         self.assertEqual(new["prime_hash"], new_hash)
-        self.assertEqual(self.reviewer(str(old["reviewer"]))["prime_hash"], old_hash)
+        self.assertEqual(self.reviewer(str(old["reviewer"]))["prime_hash"], new_hash)
 
-    def test_changed_prime_retires_unleased_old_contract_and_deletes_its_unused_file(self) -> None:
-        old_hash = self.prime()
-        old = self.allocate()
-        old_name = str(old["reviewer"])
-        self.release(old_name)
-        _ = self.succeed("end-lease", "--unit", "unit")
-        self.assertIsNone(self.reviewer(old_name)["lease"])
-        old_file = self.pool / "prime" / f"{old_hash}.md"
-        self.assertTrue(old_file.is_file())
-
-        _ = self.instructions.write_text("Replacement contract.\n", encoding="utf-8")
-        new_hash = self.prime()
-
-        self.assertNotEqual(new_hash, old_hash)
-        self.assertNotIn(old_name, self.reviewers())
-        self.assertEqual([event["name"] for event in self.events("end")], [old_name])
-        self.assertFalse(old_file.exists())
-        self.assertTrue((self.pool / "prime" / f"{new_hash}.md").is_file())
-        replacement = self.allocate()
-        self.assertEqual(replacement["reviewer"], "code2")
-        self.assertEqual(replacement["prime_hash"], new_hash)
-        self.assertEqual(replacement["mesh_dir"], old["mesh_dir"])
-        self.assert_fork_names_are_unique_per_generation()
-
-    def test_changed_prime_leaves_old_contract_phase_lease_and_its_file_untouched(self) -> None:
+    def test_changed_prime_repoints_an_idle_reviewer_and_keeps_its_thread(self) -> None:
         old_hash = self.prime()
         old = self.allocate()
         old_name = str(old["reviewer"])
         self.release(old_name)
         before = self.reviewer(old_name)
         old_file = self.pool / "prime" / f"{old_hash}.md"
+
+        _ = self.instructions.write_text("Replacement contract.\n", encoding="utf-8")
+        new_hash = self.prime()
+
+        self.assertNotEqual(new_hash, old_hash)
+        self.assertEqual(self.reviewer(old_name), {**before, "prime_hash": new_hash})
+        repointed = self.events("set-instructions")
+        self.assertEqual([event["name"] for event in repointed], [old_name])
+        self.assertEqual(repointed[0]["instructions"], "Replacement contract.\n")
+        self.assertEqual(self.events("end"), [])
+        self.assertFalse(old_file.exists())
+        new_file = self.pool / "prime" / f"{new_hash}.md"
+        roster = parse_object((Path(str(old["mesh_dir"])) / "mesh_roster.json").read_text(encoding="utf-8"))
+        self.assertEqual(json_object(roster[old_name])["instructions_file"], str(new_file))
+        again = self.allocate()
+        self.assertEqual((again["reviewer"], again["thread_id"], again["prime_hash"]),
+                         (old_name, old["thread_id"], new_hash))
+        self.assertEqual(len(self.events("set-instructions")), 1)
+
+    def test_changed_prime_leaves_a_busy_reviewer_until_its_next_allocate(self) -> None:
+        old_hash = self.prime()
+        old = self.allocate()
+        old_name = str(old["reviewer"])
+        before = self.reviewer(old_name)
+        old_file = self.pool / "prime" / f"{old_hash}.md"
         old_content = old_file.read_bytes()
 
         _ = self.instructions.write_text("Replacement contract.\n", encoding="utf-8")
-        self.assertNotEqual(self.prime(), old_hash)
+        new_hash = self.prime()
 
         self.assertEqual(self.reviewer(old_name), before)
-        self.assertEqual(self.events("end"), [])
+        self.assertEqual(self.events("set-instructions"), [])
         self.assertEqual(old_file.read_bytes(), old_content)
+        self.release(old_name)
+        again = self.allocate()
+        self.assertEqual((again["reviewer"], again["prime_hash"]), (old_name, new_hash))
+        self.assertEqual([event["name"] for event in self.events("set-instructions")], [old_name])
+        self.assertFalse(old_file.exists())
+
+    def test_a_refused_repoint_keeps_the_old_prompt_and_reports_the_hash_follow_sends(self) -> None:
+        old_hash = self.prime()
+        old_name = str(self.allocate()["reviewer"])
+        self.release(old_name)
+        self.control({"set-instructions": {"exit": 2}})
+        _ = self.instructions.write_text("Replacement contract.\n", encoding="utf-8")
+        result = self.run_pool("prime", "--type", "code", "--instructions-file", str(self.instructions))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(f"{old_name} keeps its standing prompt", result.stderr)
+        self.assertEqual(self.reviewer(old_name)["prime_hash"], old_hash)
+        self.assertIsNone(self.reviewer(old_name)["busy_pid"])
+        self.assertTrue((self.pool / "prime" / f"{old_hash}.md").is_file())
+        self.assertEqual(self.allocate()["prime_hash"], old_hash)
+
+    def test_unit_memory_prints_only_the_named_unit_file_without_added_newline(self) -> None:
+        memory = self.pool / "memory"
+        memory.mkdir(parents=True)
+        content = "## Unit memory\n2026-10-12 — Source: finding 2. Preserve café."
+        _ = (memory / "unit.md").write_text(content, encoding="utf-8")
+        _ = (memory / "other.md").write_text("Another unit.", encoding="utf-8")
+        _ = (memory / "repository.md").write_text("Repository memory.", encoding="utf-8")
+        result = self.run_pool("unit-memory", "--unit", "unit")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, content)
+        self.assertEqual(result.stderr, "")
+        self.assertFalse((self.pool / "pool.json").exists())
+        self.assertEqual(self.events(), [])
+
+    def test_unit_memory_is_empty_when_the_file_is_absent(self) -> None:
+        result = self.run_pool("unit-memory", "--unit", "unit")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, "")
+        self.assertEqual(result.stderr, "")
+        self.assertFalse(self.pool.exists())
+
+    def test_unit_memory_refuses_a_unit_outside_the_memory_directory(self) -> None:
+        result = self.run_pool("unit-memory", "--unit", "../other")
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("unit must name one memory file", result.stderr)
+        self.assertEqual(result.stdout, "")
+
+    def test_closure_after_a_memory_change_resumes_the_same_reviewer_with_the_new_prompt(self) -> None:
+        old_hash = self.prime()
+        broad = self.allocate()
+        self.release(str(broad["reviewer"]))
+        _ = self.instructions.write_text("Standing contract with new repository memory.\n", encoding="utf-8")
+        new_hash = self.prime()
+        self.assertNotEqual(new_hash, old_hash)
+        closure = self.allocate(review_pass="2", lens="")
+        self.assertEqual(closure["reviewer"], broad["reviewer"])
+        self.assertEqual((closure["thread_id"], closure["prime_hash"]), (broad["thread_id"], new_hash))
+        self.assertEqual(closure["lease_ordinal"], 2)
+        self.assertEqual(len(self.events("fork")), 1)
 
     def test_prime_failure_does_not_publish_a_template(self) -> None:
         self.control({"prime": {"exit": 1}})
@@ -357,50 +466,65 @@ class ReviewPoolTests(unittest.TestCase):
         self.assertIn("failure", result.stderr)
         self.assertEqual(self.state()["templates"], {})
 
-    def test_arm_without_pool_or_without_code_template_is_own(self) -> None:
-        self.assertEqual(self.succeed("arm", "--unit", "unit", "--phase", "phase1"), "own")
+    def test_a_pool_written_with_a_split_loads_and_drops_it_on_the_next_write(self) -> None:
         self.write_state({"split": "all", "generation": 0, "templates": {}, "reviewers": {}})
-        self.assertEqual(self.succeed("arm", "--unit", "unit", "--phase", "phase1"), "own")
+        _ = self.prime()
+        self.assertNotIn("split", self.state())
 
-    def test_split_all_and_off_select_the_requested_arm(self) -> None:
+    def test_arm_and_split_are_gone(self) -> None:
         self.seed({})
-        for split, arm in (("all", "pool"), ("off", "own")):
-            with self.subTest(split=split):
-                _ = self.succeed("split", "--set", split)
-                self.assertEqual(self.state()["split"], split)
-                self.assertEqual(self.succeed("arm", "--unit", "unit", "--phase", "phase1"), arm)
+        for arguments in (("arm", "--unit", "unit", "--phase", "phase1"), ("split", "--set", "all")):
+            with self.subTest(verb=arguments[0]):
+                result = self.run_pool(*arguments)
+                self.assertEqual(result.returncode, 2, result.stdout)
+                self.assertIn("invalid choice", result.stderr)
 
-    def test_hash_arm_uses_first_byte_of_unit_newline_phase(self) -> None:
-        self.seed({})
-        observed: set[str] = set()
-        for index in range(12):
-            unit = f"unit-{index}"
-            digest = hashlib.sha256(f"{unit}\nphase1".encode()).digest()
-            expected = "pool" if digest[0] % 2 == 0 else "own"
-            self.assertEqual(self.succeed("arm", "--unit", unit, "--phase", "phase1"), expected)
-            observed.add(expected)
-        self.assertEqual(observed, {"own", "pool"})
-
-    def test_allocation_prefers_existing_phase_lease_over_unleased_reviewer(self) -> None:
+    def test_allocation_prefers_the_units_reviewer_over_unleased_reviewer(self) -> None:
         self.seed({"code1": self.idle(), "code2": self.idle("unit")})
         result = self.allocate()
         self.assertEqual(result["reviewer"], "code2")
         self.assertEqual(result["lease_ordinal"], 4)
         self.assertEqual(self.reviewer("code2")["busy_pid"], os.getpid())
-        self.assertEqual(self.reviewer("code2")["served"], [["1", "contract"]])
         self.assertEqual(self.events(), [])
 
-    def test_allocation_reuses_same_lens_but_excludes_other_lens_on_same_pass(self) -> None:
-        self.seed({"code1": self.idle("unit", served=(("1", "contract"),)), "code2": self.idle()})
-        self.assertEqual(self.allocate()["reviewer"], "code1")
-        self.release("code1")
-        self.assertEqual(self.allocate(lens="adversary")["reviewer"], "code2")
+    def test_later_phases_passes_and_lenses_reuse_the_units_one_reviewer(self) -> None:
+        self.seed({"code1": self.idle("unit"), "code2": self.idle()})
+        for phase, review_pass, lens in (("phase1", "1", "contract"), ("phase1", "1", "adversary"),
+                                         ("phase2", "1", "contract"), ("phase3", "2", "")):
+            with self.subTest(phase=phase, review_pass=review_pass, lens=lens):
+                self.assertEqual(self.allocate(phase=phase, review_pass=review_pass, lens=lens)["reviewer"], "code1")
+                self.release("code1")
+        self.assertEqual(self.reviewer("code1")["lease"], {"unit": "unit", "ordinal": 7})
+        self.assertIsNone(self.reviewer("code2")["lease"])
+        self.assertEqual(self.events(), [])
 
-    def test_previous_pass_other_lens_does_not_exclude_phase_reviewer(self) -> None:
-        self.seed({"code1": self.idle("unit", served=(("1", "adversary"),))})
-        self.assertEqual(self.allocate(review_pass="2")["reviewer"], "code1")
+    def test_concurrent_review_forks_the_units_newest_reviewer_not_the_template(self) -> None:
+        older = {**self.idle("unit"), "busy_pid": os.getpid(), "last_allocated": time.time() - 60}
+        newest = {**self.idle("unit", prime_hash="old"), "busy_pid": os.getpid()}
+        self.seed({"code1": older, "code2": newest, "code3": self.idle(), "code4": self.idle("other-unit")})
+        result = self.allocate()
+        self.assertEqual(result["reviewer"], "code5")
+        self.assertEqual(result["lease_ordinal"], 4)
+        self.assertEqual(result["prime_hash"], "old")
+        self.assertEqual(self.fork_sources(), ["code2"])
+        self.assertEqual(self.reviewer("code5")["lease"], {"unit": "unit", "ordinal": 4})
+        self.release("code5")
+        self.assertEqual(self.allocate(phase="phase2")["reviewer"], "code5")
+        self.assertEqual(len(self.events("fork")), 1)
 
-    def test_old_hash_phase_lease_is_reused_until_lease_end(self) -> None:
+    def test_failed_fork_of_the_units_reviewer_falls_back_to_the_template(self) -> None:
+        self.seed({"code1": {**self.idle("unit"), "busy_pid": os.getpid()}})
+        self.control({"fork:code2": {"exit": 1, "failures": 1}})
+        result = self.run_pool(*self.allocation_args())
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(parse_object(result.stdout)["reviewer"], "code2")
+        self.assertEqual(self.fork_sources(), ["code1", "code-template-current"])
+        self.assertIn("fork of code1 failed", result.stderr)
+        self.assertEqual(self.reviewer("code2")["thread_id"], "thread-code2")
+        # The template fork has none of the unit's context, so its first turn carries the unit memory.
+        self.assertEqual(parse_object(result.stdout)["lease_ordinal"], 1)
+
+    def test_unit_reviewer_with_an_old_hash_is_reused_not_forked(self) -> None:
         self.seed({"code1": self.idle("unit", prime_hash="old"), "code2": self.idle()})
         result = self.allocate()
         self.assertEqual(result["reviewer"], "code1")
@@ -421,19 +545,19 @@ class ReviewPoolTests(unittest.TestCase):
         result = self.allocate()
         self.assertEqual(result["reviewer"], "code1")
         self.assertEqual(result["lease_ordinal"], 1)
-        self.assertEqual(self.reviewer("code1")["lease"], {"unit": "unit", "phase": "phase1", "ordinal": 1})
+        self.assertEqual(self.reviewer("code1")["lease"], {"unit": "unit", "ordinal": 1})
 
-    def test_allocation_skips_busy_wrong_type_other_phase_and_old_unleased_reviewers(self) -> None:
-        busy = {**self.idle("unit"), "busy_pid": os.getpid()}
+    def test_first_review_skips_busy_wrong_type_other_unit_and_old_unleased_reviewers(self) -> None:
+        busy = {**self.idle(), "busy_pid": os.getpid()}
         ui = {**self.idle("unit"), "type": "ui"}
-        self.seed({"code1": busy, "ui1": ui, "code2": self.idle("unit", "phase2"),
+        self.seed({"code1": busy, "ui1": ui, "code2": self.idle("other-unit"),
                    "code3": self.idle(prime_hash="old"), "code4": self.idle()})
         self.assertEqual(self.allocate()["reviewer"], "code4")
         self.assertEqual(self.events("fork"), [])
 
     def test_dead_owner_is_idle_and_last_allocated_is_refreshed(self) -> None:
         child = subprocess.Popen([sys.executable, "-c", "pass"])
-        _ = child.wait(timeout=5)
+        _ = child.wait(timeout=300)
         self.seed({"code1": {**self.idle("unit"), "busy_pid": child.pid, "last_allocated": 0}})
         self.assertEqual(self.allocate()["reviewer"], "code1")
         self.assertNotEqual(self.reviewer("code1")["last_allocated"], 0)
@@ -525,7 +649,11 @@ class ReviewPoolTests(unittest.TestCase):
         self.assertEqual(after["thread_id"], "replacement-thread")
         self.assertIsNone(after["busy_pid"])
         self.assertEqual(after["reviews"], 6)
-        self.assertEqual(after["lease"], before["lease"])
+        # A new thread holds none of the unit memory, so the next review counts as the first.
+        self.assertEqual(after["lease"], {"unit": "unit", "ordinal": 0})
+        again = self.allocate()
+        self.assertEqual((again["reviewer"], again["thread_id"], again["lease_ordinal"]),
+                         ("code1", "replacement-thread", 1))
 
     def test_stalled_fork_reservation_does_not_block_concurrent_allocation(self) -> None:
         self.seed({})
@@ -550,148 +678,61 @@ class ReviewPoolTests(unittest.TestCase):
         self.seed({"code1": {**self.idle(), "thread_id": "", "busy_pid": None}})
         self.assertEqual(self.allocate()["reviewer"], "code2")
 
-    def test_fresh_resets_chosen_reviewer_before_publishing_and_keeps_lease(self) -> None:
+    def test_fresh_is_accepted_and_resets_nothing(self) -> None:
         self.seed({"code1": self.idle("unit")})
-        gate = self.hold("reset:code1")
-        process = self.start_pool(*self.allocation_args(), "--fresh")
-        _ = self.await_event("reset", "code1", process)
-        self.assertEqual(self.reviewer("code1")["busy_pid"], os.getpid())
-        self.assertIsNone(process.poll())
-        gate.touch()
-        code, output, errors = self.finish(process)
-        self.assertEqual(code, 0, errors)
-        self.assertEqual(parse_object(output)["lease_ordinal"], 4)
-        self.assertEqual(self.reviewer("code1")["lease"], {"unit": "unit", "phase": "phase1", "ordinal": 4})
-        self.assertEqual(self.reviewer("code1")["busy_pid"], os.getpid())
-
-    def test_fresh_reset_failure_retires_reviewer_and_retries_allocation(self) -> None:
-        self.seed({"code1": self.idle("unit")})
-        self.control({"reset": {"exit": 2, "failures": 1}})
-        result = self.run_pool(*self.allocation_args(), "--fresh")
-        self.assertEqual(result.returncode, 0, result.stderr)
-        allocated = parse_object(result.stdout)
-        self.assertNotEqual(allocated["thread_id"], "existing-thread")
-        self.assertTrue(self.events("end"))
-        self.assertIn("code1", result.stderr)
-        self.assertTrue(self.events("fork"))
-
-    def test_fresh_returns_a_new_fork_without_resetting_it(self) -> None:
-        self.seed({})
         result = parse_object(self.succeed(*self.allocation_args(), "--fresh"))
-        self.assertEqual(result["reviewer"], "code1")
-        self.assertEqual(len(self.events("fork")), 1)
-        self.assertEqual(self.events("reset"), [])
-        self.assertEqual(self.reviewer("code1")["busy_pid"], os.getpid())
-
-    def test_fresh_reset_request_failure_also_retires_and_retries(self) -> None:
-        self.seed({"code1": self.idle("unit")})
-        self.control({"reset": {"exit": 1, "failures": 1}})
-        result = self.run_pool(*self.allocation_args(), "--fresh")
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertNotEqual(parse_object(result.stdout)["thread_id"], "existing-thread")
-        self.assertIn("code1", result.stderr)
-        self.assertEqual(len(self.events("end")), 1)
-
-    def test_fresh_with_persistent_reset_failure_returns_one_replacement_fork(self) -> None:
-        self.seed({"code1": self.idle("unit")})
-        self.control({"reset": {"exit": 1}})
-        process = self.start_pool(*self.allocation_args(), "--fresh")
-        code, output, errors = self.finish(process)
-        self.assertEqual(code, 0, errors)
-        self.assertEqual(len(output.splitlines()), 1)
-        allocation = parse_object(output)
-        self.assertNotEqual(allocation["thread_id"], "existing-thread")
-        self.assertEqual(len(self.events("reset")), 1)
-        self.assertEqual(len(self.events("end")), 1)
-        self.assertEqual(len(self.events("fork")), 1)
-        self.assertEqual(self.reviewer(str(allocation["reviewer"]))["thread_id"], allocation["thread_id"])
-
-    def test_fresh_retirement_never_reissues_the_retired_reviewer_name(self) -> None:
-        self.seed({})
-        original = self.allocate()
-        self.assertEqual(original["reviewer"], "code1")
-        self.release("code1")
-        self.control({"reset": {"exit": 1}})
-
-        result = self.run_pool(*self.allocation_args(), "--fresh")
-
-        self.assertEqual(result.returncode, 0, result.stderr)
-        replacement = parse_object(result.stdout)
-        self.assertEqual(replacement["reviewer"], "code2")
-        self.assertEqual(replacement["mesh_dir"], original["mesh_dir"])
-        self.assertNotIn("code1", self.reviewers())
-        self.assertEqual([event["name"] for event in self.events("reset")], ["code1"])
-        self.assertEqual([event["name"] for event in self.events("end")], ["code1"])
-        self.assert_fork_names_are_unique_per_generation()
-
-    def test_end_lease_resets_idle_reviewer_and_clears_lease_served_and_owner(self) -> None:
-        self.seed({"code1": self.idle("unit", served=(("1", "contract"),)),
-                   "code2": self.idle("other-unit"), "code3": self.idle("unit", "phase2")})
-        before_other = self.reviewer("code2")
-        before_phase = self.reviewer("code3")
-        _ = self.succeed("end-lease", "--unit", "unit", "--phase", "phase1")
-        record = self.reviewer("code1")
-        self.assertIsNone(record["lease"])
-        self.assertIsNone(record["busy_pid"])
-        self.assertEqual(record["served"], [])
-        self.assertEqual(record["reviews"], 5)
-        self.assertEqual(self.reviewer("code2"), before_other)
-        self.assertEqual(self.reviewer("code3"), before_phase)
-        self.assertEqual([event["name"] for event in self.events("reset")], ["code1"])
-        reused = self.allocate(unit="new-unit")
-        self.assertEqual(reused["reviewer"], "code1")
-        self.assertEqual(reused["lease_ordinal"], 1)
-        self.assertEqual(self.events("fork"), [])
-
-    def test_end_lease_without_phase_clears_every_phase_for_the_unit(self) -> None:
-        self.seed({"code1": self.idle("unit"), "code2": self.idle("unit", "phase2")})
-        _ = self.succeed("end-lease", "--unit", "unit")
-        self.assertIsNone(self.reviewer("code1")["lease"])
-        self.assertIsNone(self.reviewer("code2")["lease"])
-
-    def test_end_lease_leaves_busy_reviewer_and_names_it_on_stderr(self) -> None:
-        record = {**self.idle("unit"), "busy_pid": os.getpid()}
-        self.seed({"code1": record})
-        result = self.run_pool("end-lease", "--unit", "unit")
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("code1", result.stderr)
-        self.assertEqual(self.reviewer("code1"), record)
+        self.assertEqual((result["reviewer"], result["thread_id"]), ("code1", "existing-thread"))
         self.assertEqual(self.events(), [])
 
-    def test_end_lease_and_health_remove_reservations_with_dead_owners(self) -> None:
-        child = subprocess.Popen([sys.executable, "-c", "pass"])
-        _ = child.wait(timeout=5)
-        for arguments in (("end-lease", "--unit", "unit"), ("health",)):
-            with self.subTest(verb=arguments[0]):
-                self.seed({"code1": {
-                    **self.idle("unit"), "thread_id": "", "busy_pid": child.pid,
-                    "last_allocated": time.time() - 13 * 3600,
-                }})
-                result = self.run_pool(*arguments)
-                self.assertEqual(result.returncode, 0, result.stderr)
-                self.assertNotIn("code1", self.reviewers())
-                self.assertIn("code1", result.stderr)
-                self.assertEqual(self.events("reset"), [])
+    def test_phase_end_lease_leaves_the_units_reviewer(self) -> None:
+        self.seed({"code1": self.idle("unit")})
+        before = self.reviewer("code1")
+        _ = self.succeed("end-lease", "--unit", "unit", "--phase", "phase1")
+        self.assertEqual(self.reviewer("code1"), before)
+        self.assertEqual(self.events(), [])
 
-    def test_end_lease_and_health_leave_live_reservations_and_report_them_busy(self) -> None:
-        record = {
-            **self.idle("unit"), "thread_id": "", "busy_pid": os.getpid(),
-            "last_allocated": time.time() - 13 * 3600,
-        }
-        for arguments in (("end-lease", "--unit", "unit"), ("health",)):
-            with self.subTest(verb=arguments[0]):
+    def test_end_lease_ends_nothing_and_health_is_gone(self) -> None:
+        self.seed({"code1": {**self.idle("unit"), "last_allocated": time.time() - 13 * 3600}})
+        self.assertEqual(self.run_pool("health").returncode, 2)
+        before = self.reviewers()
+        for arguments in (("end-lease", "--unit", "unit"), ("end-lease", "--unit", "unit", "--phase", "phase1")):
+            with self.subTest(arguments=arguments):
+                self.assertEqual(self.succeed(*arguments), "")
+                self.assertEqual(self.reviewers(), before)
+        self.assertEqual(self.events(), [])
+
+    def test_retire_ends_every_reviewer_of_the_unit_and_no_other(self) -> None:
+        self.seed({"code1": self.idle("unit"), "ui1": {**self.idle("unit"), "type": "ui"},
+                   "code2": self.idle("other"), "code3": self.idle("unit-unit")})
+        other = self.reviewer("code2")
+        self.assertEqual(sorted(self.succeed("retire", "--unit", "unit").splitlines()), ["code1", "code3", "ui1"])
+        self.assertEqual(self.reviewers(), {"code2": other})
+        self.assertEqual(sorted(str(event["name"]) for event in self.events("end")), ["code1", "code3", "ui1"])
+
+    def test_retire_removes_a_reservation_whose_owner_died(self) -> None:
+        child = subprocess.Popen([sys.executable, "-c", "pass"])
+        _ = child.wait(timeout=300)
+        self.seed({"code1": {**self.idle("unit"), "thread_id": "", "busy_pid": child.pid}})
+        self.assertEqual(self.succeed("retire", "--unit", "unit"), "code1")
+        self.assertNotIn("code1", self.reviewers())
+        self.assertEqual(self.events(), [])
+
+    def test_retire_leaves_a_reviewing_reviewer_and_names_it(self) -> None:
+        for record in ({**self.idle("unit"), "busy_pid": os.getpid()},
+                       {**self.idle("unit"), "thread_id": "", "busy_pid": os.getpid()}):
+            with self.subTest(thread_id=record["thread_id"]):
                 self.seed({"code1": record})
-                result = self.run_pool(*arguments)
+                result = self.run_pool("retire", "--unit", "unit")
                 self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stdout, "")
+                self.assertIn("code1 is reviewing", result.stderr)
                 self.assertEqual(self.reviewer("code1"), record)
-                self.assertIn("code1", result.stderr)
-                self.assertIn("busy", result.stderr.lower())
                 self.assertEqual(self.events(), [])
 
     def test_removed_dead_reservation_does_not_free_its_issued_reviewer_name(self) -> None:
         self.seed({})
         child = subprocess.Popen([sys.executable, "-c", "pass"])
-        _ = child.wait(timeout=5)
+        _ = child.wait(timeout=300)
         gate = self.hold("fork:code1")
         arguments = self.allocation_args()
         arguments[arguments.index("--pid") + 1] = str(child.pid)
@@ -699,9 +740,9 @@ class ReviewPoolTests(unittest.TestCase):
         first_event = self.await_event("fork", "code1", pending)
         self.assertEqual(self.reviewer("code1")["thread_id"], "")
 
-        ended = self.run_pool("end-lease", "--unit", "unit")
+        ended = self.run_pool("retire", "--unit", "unit")
         self.assertEqual(ended.returncode, 0, ended.stderr)
-        self.assertIn("code1", ended.stderr)
+        self.assertEqual(ended.stdout.strip(), "code1")
         self.assertNotIn("code1", self.reviewers())
         self.control({})
         replacement = self.allocate()
@@ -717,54 +758,17 @@ class ReviewPoolTests(unittest.TestCase):
         roster = parse_object((Path(str(replacement["mesh_dir"])) / "mesh_roster.json").read_text(encoding="utf-8"))
         self.assertEqual(json_object(roster["code2"])["thread_id"], replacement["thread_id"])
 
-    def test_end_lease_retires_reviewer_on_each_reset_failure_exit(self) -> None:
-        for exit_code in (1, 2):
-            with self.subTest(exit_code=exit_code):
-                self.seed({"code1": self.idle("unit")})
-                self.control({"reset": {"exit": exit_code}})
-                result = self.run_pool("end-lease", "--unit", "unit")
-                self.assertEqual(result.returncode, 0, result.stderr)
-                self.assertIn("code1", result.stderr)
-                self.assertEqual(self.reviewers(), {})
-                self.assertEqual(self.events("end")[-1]["name"], "code1")
-                self.assertNotEqual(self.allocate()["thread_id"], "existing-thread")
-
-    def test_end_lease_retires_old_hash_without_reset(self) -> None:
-        self.seed({"code1": self.idle("unit", prime_hash="old")})
-        result = self.run_pool("end-lease", "--unit", "unit")
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("code1", result.stderr)
-        self.assertEqual(self.reviewers(), {})
-        self.assertEqual(self.events("reset"), [])
-        self.assertEqual(self.events("end")[0]["name"], "code1")
-
-    def test_end_lease_reserves_resetting_reviewer_without_blocking_allocation(self) -> None:
-        self.seed({"code1": self.idle("unit")})
-        gate = self.hold("reset:code1")
-        ending = self.start_pool("end-lease", "--unit", "unit")
-        _ = self.await_event("reset", "code1", ending)
-        self.assertEqual(self.reviewer("code1")["busy_pid"], ending.pid)
-        second = self.allocate()
-        self.assertEqual(second["reviewer"], "code2")
-        self.assertIsNone(ending.poll())
-        gate.touch()
-        code, _output, errors = self.finish(ending)
-        self.assertEqual(code, 0, errors)
-        self.assertIsNone(self.reviewer("code1")["lease"])
-
-    def test_stop_clears_templates_and_reviewers_preserves_split_and_advances_generation(self) -> None:
-        self.seed({}, split="all")
+    def test_stop_clears_templates_and_reviewers_and_advances_generation(self) -> None:
+        self.seed({})
         original = self.allocate()
         self.assertEqual(original["reviewer"], "code1")
         _ = self.succeed("stop")
         state = self.state()
         self.assertEqual(state["templates"], {})
         self.assertEqual(state["reviewers"], {})
-        self.assertEqual(state["split"], "all")
         self.assertEqual(state["generation"], 1)
         self.assertEqual(state["next_index"], {"code": 1, "ui": 1})
         self.assertEqual(len(self.events("stop")), 1)
-        self.assertEqual(self.succeed("arm", "--unit", "unit", "--phase", "phase1"), "own")
         _ = self.prime()
         self.assertTrue(json_object(self.state()["templates"])["code"])
         replacement = self.allocate()
@@ -772,6 +776,36 @@ class ReviewPoolTests(unittest.TestCase):
         self.assertNotEqual(replacement["mesh_dir"], original["mesh_dir"])
         self.assertEqual(self.event_mesh_dir(self.events("stop")[0]), Path(str(original["mesh_dir"])))
         self.assert_fork_names_are_unique_per_generation()
+
+    def test_stop_clears_ui_adoption_and_prime_keeps_the_new_pool_in_shadow(self) -> None:
+        _ = self.prime("ui")
+        adoption = self.pool / "ui_adopted"
+        adoption.touch()
+        result = self.run_pool("stop")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(adoption.exists())
+        self.assertIn("review_pool: ui adoption cleared", result.stderr)
+        _ = self.prime("ui")
+        self.assertFalse(adoption.exists())
+        self.assertTrue(json_object(self.state()["templates"])["ui"])
+
+    def test_failed_stop_still_clears_ui_adoption(self) -> None:
+        self.seed({})
+        adoption = self.pool / "ui_adopted"
+        adoption.touch()
+        self.control({"stop": {"exit": 1}})
+        result = self.run_pool("stop")
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertFalse(adoption.exists())
+        self.assertIn("review_pool: ui adoption cleared", result.stderr)
+        self.assertTrue(self.state().get("stopping", False))
+
+    def test_stop_without_ui_adoption_does_not_report_an_adoption_change(self) -> None:
+        self.seed({})
+        result = self.run_pool("stop")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("ui adoption cleared", result.stderr)
+        self.assertFalse((self.pool / "ui_adopted").exists())
 
     def test_stop_during_fork_drops_late_thread_instead_of_repopulating_pool(self) -> None:
         self.seed({})
@@ -895,28 +929,15 @@ class ReviewPoolTests(unittest.TestCase):
         _ = self.prime()
         self.assertEqual(self.event_mesh_dir(self.events("prime")[0]), self.pool / "mesh" / "1")
 
-    def test_stop_during_end_lease_reset_drops_late_publication(self) -> None:
+    def test_stop_during_retire_drops_late_publication(self) -> None:
         self.seed({"code1": self.idle("unit")})
-        gate = self.hold("reset:code1")
-        ending = self.start_pool("end-lease", "--unit", "unit")
-        _ = self.await_event("reset", "code1", ending)
+        gate = self.hold("end:code1")
+        ending = self.start_pool("retire", "--unit", "unit")
+        _ = self.await_event("end", "code1", ending)
         _ = self.succeed("stop")
         gate.touch()
         code, _output, errors = self.finish(ending)
         self.assertEqual(code, 1, errors)
-        self.assertIn("stop", errors.lower())
-        self.assertEqual(self.reviewers(), {})
-
-    def test_stop_during_fresh_reset_drops_late_allocation(self) -> None:
-        self.seed({"code1": self.idle("unit")})
-        gate = self.hold("reset:code1")
-        allocating = self.start_pool(*self.allocation_args(), "--fresh")
-        _ = self.await_event("reset", "code1", allocating)
-        _ = self.succeed("stop")
-        gate.touch()
-        code, output, errors = self.finish(allocating)
-        self.assertEqual(code, 1, errors)
-        self.assertEqual(output, "")
         self.assertIn("stop", errors.lower())
         self.assertEqual(self.reviewers(), {})
 
@@ -927,23 +948,108 @@ class ReviewPoolTests(unittest.TestCase):
         self.assertEqual(len(lines), 2)
         leased = next(line for line in lines if "code1" in line)
         busy = next(line for line in lines if "code2" in line)
-        for text in ("code", "unit", "phase1", "idle", "5"):
+        for text in ("code", "unit:3", "idle", "5"):
             self.assertIn(text, leased)
         self.assertIn("busy", busy)
 
-    def test_health_ends_only_stale_leases_and_reports_them(self) -> None:
-        self.seed({"code1": {**self.idle("old-unit"), "last_allocated": time.time() - 13 * 3600},
-                   "code2": self.idle("new-unit")})
-        output = self.succeed("health")
-        self.assertIn("code1", output)
-        self.assertIsNone(self.reviewer("code1")["lease"])
-        self.assertIsNotNone(self.reviewer("code2")["lease"])
-        self.assertEqual([event["name"] for event in self.events("reset")], ["code1"])
+    def migrate(self, running: set[str], *, apply: bool) -> list[list[str]]:
+        arguments = review_pool.PoolArguments()
+        arguments.production = "production"
+        arguments.apply = apply
+        output = io.StringIO()
+        with (patch.dict(os.environ, self.environment()),
+              patch.object(review_pool, "running_units", return_value=running) as units,
+              contextlib.redirect_stdout(output)):
+            self.assertEqual(review_pool.command_migrate(arguments), 0)
+        units.assert_called_once_with("production")
+        return [line.split("\t") for line in output.getvalue().splitlines()]
 
-    def test_health_stale_hours_override_changes_expiry(self) -> None:
-        self.seed({"code1": {**self.idle("unit"), "last_allocated": time.time() - 2 * 3600}})
-        _ = self.succeed("health", "--stale-hours", "1")
-        self.assertIsNone(self.reviewer("code1")["lease"])
+    def seed_tool_based_ui(self) -> None:
+        """The tool-based-ui pool's layout: phase leases left on every finished phase's reviewers."""
+        now = time.time()
+
+        def phase_leased(unit: str, phase: str, age: int) -> dict[str, object]:
+            return {"type": "code", "thread_id": f"thread-{unit}-{phase}-{age}", "prime_hash": "current",
+                    "lease": {"unit": unit, "phase": phase, "ordinal": 1}, "busy_pid": None,
+                    "served": [["1", "contract"]], "reviews": 1, "last_allocated": now - age}
+
+        self.seed({
+            "code49": phase_leased("widget-unit", "14", 900), "code71": phase_leased("widget-unit", "phase15", 500),
+            "code80": phase_leased("widget-unit", "15", 100),
+            "code74": phase_leased("trunk", "127", 700), "code78": phase_leased("trunk", "128", 300),
+            "code63": phase_leased("gone-unit", "26", 800),
+            "code81": {**self.idle(), "thread_id": "thread-spare"},
+            "code82": {**phase_leased("widget-unit", "16", 50), "busy_pid": os.getpid()},
+        })
+
+    def test_migrate_prints_its_plan_and_changes_nothing_without_apply(self) -> None:
+        self.seed_tool_based_ui()
+        before = self.state()
+        plan = self.migrate({"widget-unit", "trunk-unit"}, apply=False)
+        self.assertEqual({row[1]: row[0] for row in plan}, {
+            "code82": "keep", "code80": "keep", "code71": "retire", "code49": "retire",
+            "code78": "keep", "code74": "retire", "code63": "retire", "code81": "retire",
+        })
+        self.assertEqual(self.state(), before)
+        self.assertEqual(self.events(), [])
+
+    def test_migrate_apply_keeps_one_reviewer_per_running_unit_and_ends_the_rest(self) -> None:
+        self.seed_tool_based_ui()
+        _ = self.migrate({"widget-unit", "trunk-unit"}, apply=True)
+        self.assertEqual(sorted(self.reviewers()), ["code78", "code80", "code82"])
+        self.assertEqual(sorted(str(event["name"]) for event in self.events("end")),
+                         ["code49", "code63", "code71", "code74", "code81"])
+        self.assertEqual(self.reviewer("code80")["lease"], {"unit": "widget-unit", "ordinal": 1})
+        self.assertNotIn("served", self.reviewer("code80"))
+        self.assertEqual(self.allocate(unit="trunk", phase="140")["reviewer"], "code78")
+        self.assertEqual(self.events("fork"), [])
+
+    def test_migrate_apply_leaves_a_reviewer_allocation_took_after_the_plan(self) -> None:
+        plan = [review_pool.MigrationStep("code2", "existing-thread", False, "unit keeps a newer code reviewer")]
+        self.seed({"code1": self.idle("unit"), "code2": {**self.idle("unit"), "busy_pid": os.getpid()}})
+        with patch.object(review_pool, "migration_plan", return_value=plan):
+            arguments = review_pool.PoolArguments()
+            arguments.production = "production"
+            arguments.apply = True
+            errors = io.StringIO()
+            with (patch.dict(os.environ, self.environment()),
+                  patch.object(review_pool, "running_units", return_value={"unit"}),
+                  contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(errors)):
+                self.assertEqual(review_pool.command_migrate(arguments), 0)
+        self.assertIn("code2", self.reviewers())
+        self.assertIn("code2 changed since the plan", errors.getvalue())
+        self.assertEqual(self.events(), [])
+
+    def test_running_units_counts_a_unit_of_unknown_state_as_running(self) -> None:
+        # A stand-in module keeps tmux, herdr and the top-level showrunners module out of this suite.
+        class ClaudeNotRunning:
+            pass
+
+        class LiveClaude:
+            pass
+
+        class ClaudeUnknown:
+            pass
+
+        marked = {unit: SimpleNamespace(claude=claude()) for unit, claude in (
+            ("live-unit", LiveClaude), ("unknown-unit", ClaudeUnknown), ("stopped-unit", ClaudeNotRunning))}
+        lookup = Mock(return_value=marked)
+        stand_in = ModuleType("unit_lookup")
+        stand_in.__dict__.update(ClaudeNotRunning=ClaudeNotRunning, marked_units=lookup)
+        with patch.dict(sys.modules, {"unit_lookup": stand_in}):
+            self.assertEqual(review_pool.running_units("production"), {"live-unit", "unknown-unit"})
+        lookup.assert_called_once_with("production", every_host=True)
+
+class UIStandingPromptTests(unittest.TestCase):
+    def test_ui_standing_prompt_defines_report_and_measurement_without_rule_reads(self) -> None:
+        prompt = (SCRIPT.parents[2] / "config" / "review_pool" / "ui.md").read_text(encoding="utf-8")
+        self.assertRegex(prompt, r"Verdict:\s*pass\b")
+        self.assertRegex(prompt, r"Verdict:\s*(?:pass\s*\|\s*)?defects\b")
+        self.assertIn("| Shot | Rule | Defect | Fix |", prompt)
+        self.assertIn("measure_text.py", prompt)
+        instructions = " ".join(prompt.split())
+        self.assertNotIn("Follow `~/.claude/commands/ux_eval.md`", instructions)
+        self.assertNotIn("Read a rule's full text", instructions)
 
 
 if __name__ == "__main__":

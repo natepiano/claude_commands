@@ -18,9 +18,10 @@ Unweighted:
 
 | model | turns |
 | --- | --- |
-| gpt-6-sol | 1 |
+| invented-unweighted-model | 1 |
 
 Review turns with unrecorded lens: 1.
+Turns with unclassified activity: 0.
 Outcome rows with unknown unit (compactions): 0.
 Outcome rows with unknown unit (threads): 2.
 

@@ -48,6 +48,9 @@ import store
 import sync
 import treekey
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
+from user_zone import user_zone_name  # noqa: E402
+
 # Covers shot_report.py's 330 s Mac SSH timeout plus a measured 120-175 s cold local scan and report under load, with room inside the 3,600 s job interval.
 SCREENSHOT_HOURLY_TIMEOUT_SECONDS = 900
 
@@ -222,7 +225,14 @@ def hourly() -> int:
     return status
 
 
+def run_in_user_zone() -> None:
+    """Make the user's zone this process's zone: every printed time and every `localtime` day in the SQL follows it."""
+    os.environ["TZ"] = user_zone_name()
+    time.tzset()
+
+
 def main(argv: list[str]) -> int:
+    run_in_user_zone()
     command, rest = (argv[0], argv[1:]) if argv else ("", [])
     if command == "query":
         return query(rest)

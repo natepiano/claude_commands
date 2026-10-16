@@ -5,6 +5,7 @@ from __future__ import annotations
 import importlib
 import json
 import os
+import shlex
 import shutil
 import sqlite3
 import stat
@@ -22,6 +23,11 @@ from typing import Literal, Protocol, TypedDict, cast, final, override
 
 REPOSITORY = Path(__file__).resolve().parents[2]
 COLLECTOR = Path(__file__).with_name("collect.py")
+FAILING_WATCH = """import sys
+print("waste_watch: fixture watch failure", file=sys.stderr)
+print("second line", file=sys.stderr)
+raise SystemExit(1)
+"""
 FIXTURES = Path(__file__).with_name("fixtures") / "collect"
 SESSION = "a1b2c3d4-1111-4111-8111-111111111111"
 THREAD = "a1b2c3d4-2222-4222-8222-222222222222"
@@ -33,13 +39,25 @@ MAC_SECOND = "00000002-2222-4222-8222-222222222222"
 MAC_THREAD = "00000003-3333-4333-8333-333333333333"
 MAC_CHILD = "a0000000000000001"
 READABLE_SESSION = "11223344-3333-4333-8333-333333333333"
+ACTIVITY_THREAD = "a1b2c3d4-5555-4555-8555-555555555555"
+ACTIVITY_SESSION = "a1b2c3d4-6666-4666-8666-666666666666"
+BOARD = "bash ~/.claude/scripts/delegate/board.sh"
+# One request per entry, in time order: (activity, wait_action).
+CODEX_ACTIVITIES: list[tuple[object, ...]] = [
+    ("wait", "empty write_stdin"), ("status", None), ("wait", "sleep tool"),
+    ("work", None), ("work", None), ("work", None), ("wait", "empty write_stdin"),
+]
+CLAUDE_ACTIVITIES: list[tuple[object, ...]] = [
+    ("wait", "sleep"), ("wait", "Read *.output"), ("status", None), ("work", None), ("work", None),
+]
 BLOCKED_SESSION = "55667788-4444-4444-8444-444444444444"
 SshBehavior = Literal["complete", "cut_after_first_cursor", "cut_inside_second_file",
                       "cut_inside_first_file", "cut_before_status", "cut_inside_record",
                       "unreachable", "early_disconnect", "wait_for_release", "python_error", "malformed_record", "unknown_measurement",
                       "missing_output", "oversized_output", "missing_evidence_field", "malformed_evidence_field",
                       "cut_inside_history", "cut_after_history_cursor", "missing_outcome_field",
-                      "missing_opening_time", "invalid_edit_time", "missing_folder", "invalid_folder"]
+                      "missing_opening_time", "invalid_edit_time", "missing_folder", "invalid_folder",
+                      "invalid_activity", "wait_without_action", "missing_activity"]
 SourceState = Literal["ready", "missing", "unreadable", "partial", "skipped", "unreachable"]
 
 
@@ -150,7 +168,7 @@ class CollectorFixture(unittest.TestCase):
         environment["PATH"] = f"{self.root / 'bin'}:{environment.get('PATH', '')}"
         environment["PLAN_DELEGATE_HISTORY_DIR"] = (
             "" if history_override == "empty" else str(self.root / ".local/state/plan-delegate"))
-        command = [sys.executable, str(COLLECTOR), "--db", str(db),
+        command = [sys.executable, str(COLLECTOR), "--db", str(db), "--durability", "off",
                    "--machine", machine, "--claude-root", str(self.claude_root),
                    "--codex-root", str(self.codex_root), "--agents-log", str(self.agents_path),
                    "--readings", str(self.root / "readings.jsonl"),
@@ -167,6 +185,15 @@ class CollectorFixture(unittest.TestCase):
             environment["USAGE_TEST_SSH_CONFIG"] = str(configuration)
         return command, environment
 
+    def cli_with_watch(self, watch_program: str) -> subprocess.CompletedProcess[str]:
+        """Run the collector with `USAGE_WASTE_WATCH_SCRIPT` naming a stub watch that runs `watch_program`."""
+        stub = self.root / "waste_watch_stub.py"
+        _ = stub.write_text(watch_program)
+        command, environment = self.collector_invocation(db=self.db_path)
+        environment["USAGE_WASTE_WATCH_SCRIPT"] = str(stub)
+        return subprocess.run(command, cwd=REPOSITORY, env=environment, capture_output=True, text=True,
+                              check=False, timeout=60)
+
     def cli(self, *, db: Path, machine: str = "natedev",
             history_override: Literal["configured", "empty"] = "configured",
             mac_pass: Literal["skipped", "fixture"] = "skipped") -> subprocess.CompletedProcess[str]:
@@ -181,6 +208,35 @@ class CollectorFixture(unittest.TestCase):
             timeout=30,
             check=False,
         )
+
+    def assert_cli_durability(self, selection: list[str], expected: str) -> None:
+        command, environment = self.collector_invocation(db=self.db_path)
+        # Remove the fixture's disposable default to exercise the actual CLI default too.
+        position = command.index("--durability")
+        del command[position:position + 2]
+        trace = self.root / "durability-sql.jsonl"
+        program = f'''import json, runpy, sqlite3, sys
+from pathlib import Path
+trace = Path({str(trace)!r})
+original_connect = sqlite3.connect
+def record(statement):
+    with trace.open("a") as output:
+        output.write(json.dumps(statement) + "\\n")
+def connect(*args, **kwargs):
+    database = original_connect(*args, **kwargs)
+    database.set_trace_callback(record)
+    return database
+sqlite3.connect = connect
+sys.argv.pop(0)
+runpy.run_path(sys.argv[0], run_name="__main__")
+'''
+        result = subprocess.run([sys.executable, "-c", program, *command[1:], *selection],
+                                env=environment, cwd=REPOSITORY, capture_output=True,
+                                text=True, check=False, timeout=300)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        statements = [cast(str, json.loads(line)) for line in trace.read_text().splitlines()]
+        self.assertEqual([sql for sql in statements if sql.startswith("PRAGMA synchronous=")], [expected])
+        self.assertGreater(len(self.rows("SELECT * FROM turns")), 0)
 
     def collect(self, *, machine: str = "natedev",
                 history_override: Literal["configured", "empty"] = "configured",
@@ -209,6 +265,86 @@ class CollectorFixture(unittest.TestCase):
         if family == "claude":
             return self.claude_root / "project" / f"{SESSION}.jsonl"
         return self.codex_root / "2026/10/10/rollout-example.jsonl"
+
+    def write_codex_session(self, path: Path, thread: str = THREAD) -> tuple[int, int]:
+        records = (
+            {"timestamp": "2026-10-10T21:34:57Z", "type": "session_meta",
+             "payload": {"id": thread, "cwd": "/invented/π"}},
+            {"timestamp": "2026-10-10T21:34:58Z", "type": "turn_context",
+             "payload": {"model": "gpt-5.6-sol", "effort": "medium"}},
+            {"timestamp": "2026-10-10T21:34:59Z", "type": "event_msg",
+             "payload": {"type": "token_count", "info": {"last_token_usage": {
+                 "input_tokens": 30, "cached_input_tokens": 10, "output_tokens": 2}}}},
+            {"timestamp": "2026-10-10T21:35:01Z", "type": "response_item",
+             "payload": {"type": "custom_tool_call", "name": "apply_patch", "input": "invented edit"}},
+        )
+        lines = [(json.dumps(record, ensure_ascii=False) + "\n").encode("utf-8") for record in records]
+        path.parent.mkdir(parents=True, exist_ok=True)
+        _ = path.write_bytes(b"".join(lines))
+        return sum(map(len, lines[:2])), sum(map(len, lines[:3]))
+
+    def write_activity_rollout(self, path: Path, thread: str = ACTIVITY_THREAD) -> None:
+        """Requests whose items match CODEX_ACTIVITIES; each token count ends one request."""
+        def item(payload: dict[str, object]) -> dict[str, object]:
+            return {"timestamp": "2026-10-10T21:35:00Z", "type": "response_item", "payload": payload}
+
+        def exec_cell(source: str) -> dict[str, object]:
+            return item({"type": "custom_tool_call", "name": "exec", "input": source})
+
+        requests: list[list[dict[str, object]]] = [
+            [item({"type": "reasoning", "summary": []}),
+             exec_cell('await tools.write_stdin({session_id: 3, chars: "", yield_time_ms: 30000});')],
+            [exec_cell('await tools.exec_command({cmd: "' + BOARD.replace('"', '\\"')
+                       + ' post /tmp/board impl status \\"build started\\""});')],
+            [item({"type": "function_call", "name": "sleep", "arguments": '{"duration_ms":45000}'}),
+             item({"type": "function_call_output", "output": "slept"})],
+            [exec_cell('await tools.exec_command({cmd: "cargo build 2>&1 | tail -5"});')],
+            [item({"type": "function_call", "name": "wait", "arguments": '{"cell_id":"7"}'}),
+             item({"type": "message", "role": "assistant", "phase": "final_answer", "content": []})],
+            [],
+            [exec_cell('await tools.exec_command({cmd: "sleep 30; tail -3 /tmp/build.log"});\n'
+                       + 'await tools.write_stdin({session_id: 3, chars: ""});')],
+        ]
+        records: list[dict[str, object]] = [
+            {"timestamp": "2026-10-10T21:34:57Z", "type": "session_meta", "payload": {"id": thread, "cwd": "/invented"}},
+            {"timestamp": "2026-10-10T21:34:58Z", "type": "turn_context",
+             "payload": {"model": "gpt-6.1-sol", "effort": "medium"}},
+        ]
+        for second, items in enumerate(requests):
+            records.extend(items)
+            records.append({"timestamp": f"2026-10-10T21:36:{second:02d}Z", "type": "event_msg",
+                            "payload": {"type": "token_count", "info": {"last_token_usage": {
+                                "input_tokens": 10, "cached_input_tokens": 4, "output_tokens": 1}}}})
+        path.parent.mkdir(parents=True, exist_ok=True)
+        _ = path.write_text("".join(json.dumps(record) + "\n" for record in records), encoding="utf-8")
+
+    def claude_line(self, message_id: str, second: int, *blocks: dict[str, object]) -> bytes:
+        record = {"type": "assistant", "timestamp": f"2026-10-10T21:37:{second:02d}Z", "requestId": f"request-{message_id}",
+                  "message": {"id": message_id, "model": "claude-opus-4-6", "content": list(blocks),
+                              "usage": {"input_tokens": 1, "output_tokens": second + 1}}}
+        return (json.dumps(record) + "\n").encode("utf-8")
+
+    def bash(self, command: str) -> dict[str, object]:
+        return {"type": "tool_use", "name": "Bash", "input": {"command": command}}
+
+    def write_activity_transcript(self, path: Path) -> None:
+        """Messages whose blocks match CLAUDE_ACTIVITIES."""
+        path.parent.mkdir(parents=True, exist_ok=True)
+        _ = path.write_bytes(b"".join((
+            self.claude_line("activity-one", 0, {"type": "thinking", "thinking": "build runs"},
+                             self.bash("sleep 45; tail -2 /tmp/claude-1000/project/session/tasks/build3.log")),
+            self.claude_line("activity-two", 1, {"type": "tool_use", "name": "Read", "input": {
+                "file_path": "/tmp/claude-1000/project/session/tasks/b37sx2o7k.output"}}),
+            self.claude_line("activity-three", 2, self.bash(f'{BOARD} post /tmp/board impl status "tests running"')),
+            self.claude_line("activity-four", 3, self.bash("sleep 5"),
+                             {"type": "tool_use", "name": "Edit", "input": {"file_path": "invented.py"}}),
+            self.claude_line("activity-five", 4, {"type": "text", "text": "Done."}),
+        )))
+
+    def activities(self, machine: str, family: str, agent_id: str) -> list[tuple[object, ...]]:
+        return self.values(self.rows("SELECT activity, wait_action FROM turns WHERE machine = ? AND family = ? "
+                                     + "AND agent_id = ? ORDER BY at", (machine, family, agent_id)),
+                           "activity", "wait_action")
 
     def cursor(self, path: Path) -> int:
         matches = [row for row in self.rows("SELECT path, offset FROM cursors WHERE machine = 'natedev'")
@@ -266,6 +402,202 @@ class CollectorFixture(unittest.TestCase):
 
 
 class CollectTests(CollectorFixture):
+    def test_collector_cli_keeps_durable_commits_by_default(self) -> None:
+        self.assert_cli_durability([], "PRAGMA synchronous=FULL")
+
+    def test_collector_cli_can_disable_sync_for_disposable_ledgers(self) -> None:
+        self.assert_cli_durability(["--durability", "off"], "PRAGMA synchronous=OFF")
+
+    def two_codex_sessions(self) -> tuple[Path, Path, int, int]:
+        shutil.rmtree(self.codex_root)
+        first = self.codex_root / "2026/10/10/rollout-first.jsonl"
+        second = self.codex_root / "2026/10/11/rollout-second.jsonl"
+        turn_offset, edit_offset = self.write_codex_session(first)
+        self.assertEqual(self.write_codex_session(second), (turn_offset, edit_offset))
+        return first, second, turn_offset, edit_offset
+
+    def test_two_session_files_keep_requests_at_the_same_byte_offset(self) -> None:
+        first, second, offset, _ = self.two_codex_sessions()
+        output = self.collect()
+        turns = self.turns("codex", THREAD)
+        self.assertEqual(len(turns), 2)
+        self.assertCountEqual(self.values(turns, "turn_key"),
+                              [(f"{first.name}:{offset}",), (f"{second.name}:{offset}",)])
+        self.assertEqual(self.values(turns, "input", "cache_read", "output"), [(20, 10, 2), (20, 10, 2)])
+        self.assert_source_additions(output, "codex", 2)
+
+    def test_two_session_files_keep_edits_at_the_same_byte_offset(self) -> None:
+        first, second, _, offset = self.two_codex_sessions()
+        _ = self.collect()
+        edits = self.rows("SELECT * FROM edits WHERE family = 'codex' AND agent_id = ?", (THREAD,))
+        self.assertEqual(len(edits), 2)
+        self.assertCountEqual(self.values(edits, "edit_key"),
+                              [(f"{first.name}:{offset}",), (f"{second.name}:{offset}",)])
+
+    def test_repeated_cursor_reads_replayed_files_and_relocation_keep_each_event_once(self) -> None:
+        shutil.rmtree(self.codex_root)
+        path = self.codex_root / "2026/10/10/rollout-movable.jsonl"
+        turn_offset, edit_offset = self.write_codex_session(path)
+        _ = self.collect()
+        turns = self.all_values(self.turns("codex", THREAD))
+        edits = self.all_values(self.rows("SELECT * FROM edits WHERE family = 'codex'"))
+        self.assertEqual(self.values(self.turns("codex", THREAD), "turn_key"), [(f"{path.name}:{turn_offset}",)])
+        self.assertEqual(self.values(self.rows("SELECT * FROM edits WHERE family = 'codex'"), "edit_key"),
+                         [(f"{path.name}:{edit_offset}",)])
+        for step in ("cursor", "replay", "relocate"):
+            with self.subTest(step=step):
+                if step == "replay":
+                    with closing(sqlite3.connect(self.db_path)) as database, database:
+                        _ = database.execute("DELETE FROM cursors WHERE path = ?", (str(path),))
+                elif step == "relocate":
+                    destination = self.codex_root / "2026/10/12" / path.name
+                    destination.parent.mkdir(parents=True)
+                    path = path.rename(destination)
+                output = self.collect()
+                self.assert_source_additions(output, "codex", 0)
+                self.assertEqual(self.all_values(self.turns("codex", THREAD)), turns)
+                self.assertEqual(self.all_values(self.rows("SELECT * FROM edits WHERE family = 'codex'")), edits)
+                self.assertEqual(self.values(self.rows("SELECT sum(input), sum(cache_read), sum(output) "
+                                                      + "FROM turns WHERE family = 'codex'"), "sum(input)",
+                                             "sum(cache_read)", "sum(output)"), [(20, 10, 2)])
+                self.assertEqual(self.rows("SELECT offset FROM cursors WHERE path = ?", (str(path),))[0][0],
+                                 path.stat().st_size)
+
+    def test_offset_key_store_versions_are_refused_without_changing_rows_or_cursors(self) -> None:
+        _ = self.collect()
+        with closing(sqlite3.connect(self.db_path)) as database, database:
+            _ = database.execute("UPDATE turns SET turn_key = substr(turn_key, instr(turn_key, ':') + 1) "
+                                 + "WHERE family = 'codex'")
+            _ = database.execute("UPDATE edits SET edit_key = substr(edit_key, instr(edit_key, ':') + 1) "
+                                 + "WHERE family = 'codex'")
+        self.assertTrue(all(cast(str, row["turn_key"]).isdigit() for row in self.turns("codex", THREAD)))
+        legacy_edits = self.rows("SELECT edit_key FROM edits WHERE family = 'codex'")
+        self.assertTrue(legacy_edits)
+        self.assertTrue(all(cast(str, row["edit_key"]).isdigit() for row in legacy_edits))
+        for version in (7, 1):
+            with self.subTest(version=version):
+                with closing(sqlite3.connect(self.db_path)) as database, database:
+                    _ = database.execute(f"PRAGMA user_version = {version}")
+                before = {cast(str, row["name"]): self.all_values(self.rows(
+                    'SELECT * FROM "' + cast(str, row["name"]) + '"'))
+                    for row in self.rows("SELECT name FROM sqlite_master WHERE type = 'table'")}
+                result = self.cli(db=self.db_path)
+                self.assertEqual(result.returncode, 1)
+                self.assertEqual(result.stdout, "")
+                self.assertEqual(result.stderr, f"collect: store version {version} predates file-named Codex keys; "
+                                 + f"delete {self.db_path} and run the collector again to rebuild it\n")
+                self.assertEqual(self.rows("PRAGMA user_version")[0][0], version)
+                for table, rows in before.items():
+                    self.assertEqual(self.all_values(self.rows('SELECT * FROM "' + table + '"')), rows, table)
+
+    def test_legacy_store_refusal_preserves_bytes_journal_and_schema(self) -> None:
+        _ = self.collect()
+        with closing(sqlite3.connect(self.db_path)) as database:
+            _ = database.execute("DROP TABLE folders")
+            _ = database.execute("PRAGMA user_version = 6")
+            self.assertEqual(database.execute("PRAGMA journal_mode=DELETE").fetchone()[0], "delete")
+        schema_query = "SELECT type, name, tbl_name, sql FROM sqlite_master ORDER BY type, name"
+        schema = self.all_values(self.rows(schema_query))
+        tables = [cast(str, row["name"]) for row in self.rows(
+            "SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name")]
+        self.assertNotIn("folders", tables)
+        rows = {table: self.all_values(self.rows('SELECT * FROM "' + table + '"')) for table in tables}
+        before = self.db_path.read_bytes()
+
+        result = self.cli(db=self.db_path)
+
+        self.assertEqual((result.returncode, result.stdout, result.stderr), (
+            1, "", "collect: store version 6 predates file-named Codex keys; "
+            + f"delete {self.db_path} and run the collector again to rebuild it\n",
+        ))
+        self.assertTrue(self.db_path.read_bytes() == before, "Refusal changed the store file's bytes")
+        self.assertEqual(self.rows("PRAGMA journal_mode")[0][0], "delete")
+        self.assertEqual(self.rows("PRAGMA user_version")[0][0], 6)
+        self.assertEqual(self.all_values(self.rows(schema_query)), schema)
+        for table, before_rows in rows.items():
+            self.assertEqual(self.all_values(self.rows('SELECT * FROM "' + table + '"')), before_rows, table)
+
+    def test_new_store_is_stamped_with_the_request_activity_version(self) -> None:
+        _ = self.collect()
+        self.assertEqual(self.rows("PRAGMA user_version")[0][0], 10)
+
+    def test_codex_requests_record_wait_status_and_work(self) -> None:
+        self.write_activity_rollout(self.codex_root / "2026/10/10/rollout-activity.jsonl")
+        output = self.collect()
+        self.assert_source_additions(output, "codex", 4 + len(CODEX_ACTIVITIES))
+        self.assertEqual(self.activities("natedev", "codex", ACTIVITY_THREAD), CODEX_ACTIVITIES)
+        self.assertEqual(self.activities("natedev", "codex", THREAD), [("work", None)] * 4)
+
+    def test_claude_requests_record_wait_status_and_work(self) -> None:
+        self.write_activity_transcript(self.claude_root / "project" / f"{ACTIVITY_SESSION}.jsonl")
+        _ = self.collect()
+        self.assertEqual(self.activities("natedev", "claude", ACTIVITY_SESSION), CLAUDE_ACTIVITIES)
+        self.assertEqual(self.activities("natedev", "claude", SESSION), [("work", None)] * 4)
+
+    def test_claude_message_lines_merge_into_one_request_activity(self) -> None:
+        source = self.claude_root / "project" / f"{ACTIVITY_SESSION}.jsonl"
+        source.parent.mkdir(parents=True, exist_ok=True)
+        _ = source.write_bytes(self.claude_line("growing", 0, {"type": "text", "text": "Waiting on the build."}))
+        _ = self.collect()
+        self.assertEqual(self.activities("natedev", "claude", ACTIVITY_SESSION), [("work", None)])
+        self.append_bytes(source, self.claude_line("growing", 1, self.bash("sleep 30")))
+        output = self.collect()
+        self.assert_source_additions(output, "claude", 0)
+        self.assertEqual(self.activities("natedev", "claude", ACTIVITY_SESSION), [("wait", "sleep")])
+        tool_result = {"type": "user", "timestamp": "2026-10-10T21:37:02Z",
+                       "message": {"content": [{"type": "tool_result", "content": "slept"}]}}
+        self.append_bytes(source, (json.dumps(tool_result) + "\n").encode("utf-8")
+                          + self.claude_line("growing", 3, {"type": "tool_use", "name": "Write",
+                                                            "input": {"file_path": "invented.py"}})
+                          + self.claude_line("next", 4, self.bash("ps -p 123")))
+        output = self.collect()
+        self.assert_source_additions(output, "claude", 1)
+        self.assertEqual(self.activities("natedev", "claude", ACTIVITY_SESSION), [("work", None), ("wait", "ps")])
+        self.assertEqual(self.values(self.turns("claude", ACTIVITY_SESSION), "output"), [(4,), (5,)])
+
+    def test_version_nine_store_gains_activity_columns_and_reads_every_source_again(self) -> None:
+        _ = self.collect()
+        before = self.rows("SELECT machine, family, agent_id, turn_key, input, output FROM turns ORDER BY 1, 2, 3, 4")
+        with closing(sqlite3.connect(self.db_path)) as database:
+            _ = database.execute("ALTER TABLE turns DROP COLUMN wait_action")
+            _ = database.execute("ALTER TABLE turns DROP COLUMN activity")
+            with database:
+                _ = database.execute("INSERT INTO turns VALUES (" + ",".join("?" * 19) + ")", (
+                    "natedev", "codex", "thread", "", "gone-thread", "rollout-gone.jsonl:0",
+                    "2026-10-09T12:00:00+00:00", "gpt-6.1-sol", "high", 5, 0, 0, 1, 1, 1, None, None,
+                    "unassigned", "not_applicable"))
+                _ = database.execute("PRAGMA user_version = 9")
+        cursors = len(self.rows("SELECT * FROM cursors"))
+        self.assertGreater(cursors, 0)
+        output = self.collect()
+        self.assert_source_additions(output, "claude", 0)
+        self.assert_source_additions(output, "codex", 0)
+        self.assertEqual(self.rows("PRAGMA user_version")[0][0], 10)
+        self.assertEqual([cast(str, row["name"]) for row in self.rows("PRAGMA table_info(turns)")][-2:],
+                         ["activity", "wait_action"])
+        after = self.rows("SELECT machine, family, agent_id, turn_key, input, output FROM turns "
+                          + "WHERE agent_id != 'gone-thread' ORDER BY 1, 2, 3, 4")
+        self.assertEqual(self.all_values(after), self.all_values(before))
+        self.assertEqual(self.values(self.rows("SELECT activity, COUNT(*) AS turns FROM turns GROUP BY activity "
+                                               + "ORDER BY activity"), "activity", "turns"),
+                         [("unclassified", 1), ("work", len(before))])
+        self.assertEqual(self.activities("natedev", "codex", "gone-thread"), [("unclassified", None)])
+        self.assertEqual(len(self.rows("SELECT * FROM cursors")), cursors)
+        for family in ("claude", "codex"):
+            self.assertEqual(self.cursor(self.source_path(family)), self.source_path(family).stat().st_size)
+
+    def test_waste_watch_failure_leaves_the_pass_successful(self) -> None:
+        result = self.cli_with_watch(FAILING_WATCH)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(result.stderr, "waste_watch: exit 1: fixture watch failure second line\n")
+        self.assertEqual(len(self.rows("SELECT * FROM turns")), 10)
+
+    def test_claude_request_keys_keep_the_message_and_request_identity(self) -> None:
+        _ = self.collect()
+        self.assertEqual([json.loads(cast(str, row["turn_key"])) for row in self.turns("claude", SESSION)],
+                         [["message-one", "request-one"], ["message-two", "request-two"],
+                          ["message-three", "request-two"], ["message-one", "request-four"]])
+
     def test_held_pass_lock_exits_without_opening_or_changing_the_store(self) -> None:
         _ = self.collect()
         before = self.db_path.read_bytes()
@@ -376,7 +708,7 @@ with open(sys.argv[1], 'a') as lock:
             "turns": (
                 ("machine", "family", "kind", "parent_id", "agent_id", "turn_key", "at", "model",
                  "effort", "input", "cache_write_5m", "cache_write_1h", "cache_read", "output",
-                 "before_first_edit", "role", "lens", "attribution", "lens_state"),
+                 "before_first_edit", "role", "lens", "attribution", "lens_state", "activity", "wait_action"),
                 ("machine", "family", "parent_id", "agent_id", "turn_key"),
             ),
             "compactions": (
@@ -495,7 +827,7 @@ with open(sys.argv[1], 'a') as lock:
             ("unknown-future-model", None, 5, 0, 0, 2, 1),
         ])
 
-    def test_codex_turn_keys_are_byte_offsets(self) -> None:
+    def test_codex_turn_keys_use_the_file_name_and_byte_offset(self) -> None:
         _ = self.collect()
         expected_offsets: list[int] = []
         offset = 0
@@ -506,8 +838,8 @@ with open(sys.argv[1], 'a') as lock:
             if record["type"] == "event_msg" and payload.get("type") == "token_count" and "last_token_usage" in info:
                 expected_offsets.append(offset)
             offset += len(line)
-        actual_offsets = [int(cast(str, row["turn_key"])) for row in self.turns("codex", THREAD)]
-        self.assertEqual(actual_offsets, expected_offsets)
+        self.assertEqual(self.values(self.turns("codex", THREAD), "turn_key"),
+                         [(f"{self.source_path('codex').name}:{offset}",) for offset in expected_offsets])
 
     def test_edit_boundaries_and_compactions_are_per_agent(self) -> None:
         _ = self.collect()
@@ -1010,6 +1342,46 @@ class MacCollectTests(CollectorFixture):
         report_path.unlink()
         return MacRun(output, report)
 
+    def test_remote_session_files_keep_matching_request_and_edit_offsets_as_text_keys(self) -> None:
+        sessions = self.mac_home / ".codex/sessions"
+        shutil.rmtree(sessions)
+        first = sessions / "2026/10/10/rollout-first.jsonl"
+        second = sessions / "2026/10/11/rollout-second.jsonl"
+        turn_offset, edit_offset = self.write_codex_session(first, MAC_THREAD)
+        self.assertEqual(self.write_codex_session(second, MAC_THREAD), (turn_offset, edit_offset))
+        run = self.mac_collect()
+        turns = self.rows("SELECT * FROM turns WHERE machine = 'mac' AND family = 'codex'")
+        edits = self.rows("SELECT * FROM edits WHERE machine = 'mac' AND family = 'codex'")
+        self.assertEqual(len(turns), 2)
+        self.assertEqual(len(edits), 2)
+        self.assertCountEqual(self.values(turns, "turn_key"),
+                              [(f"{first.name}:{turn_offset}",), (f"{second.name}:{turn_offset}",)])
+        self.assertCountEqual(self.values(edits, "edit_key"),
+                              [(f"{first.name}:{edit_offset}",), (f"{second.name}:{edit_offset}",)])
+        self.assertEqual(self.values(turns, "input", "cache_read", "output"), [(20, 10, 2), (20, 10, 2)])
+        self.assertEqual(run.stream["edit_records"], 4, "Two Codex edits and the fixture's two Claude edits")
+        before_turns, before_edits = self.all_values(turns), self.all_values(edits)
+        repeated = self.mac_collect()
+        self.assertEqual(repeated.stream["measurement_records"], 0)
+        with closing(sqlite3.connect(self.db_path)) as database, database:
+            _ = database.execute("DELETE FROM cursors WHERE machine = 'mac' AND path = ?", (str(first),))
+        moved = sessions / "2026/10/12" / second.name
+        moved.parent.mkdir(parents=True)
+        _ = second.rename(moved)
+        replayed = self.mac_collect()
+        self.assert_source_additions(replayed.output, "codex", 0, "mac")
+        self.assertEqual(self.all_values(self.rows("SELECT * FROM turns WHERE machine = 'mac' AND family = 'codex'")),
+                         before_turns)
+        self.assertEqual(self.all_values(self.rows("SELECT * FROM edits WHERE machine = 'mac' AND family = 'codex'")),
+                         before_edits)
+
+    def test_mac_wire_carries_request_activity(self) -> None:
+        self.write_activity_rollout(self.mac_home / ".codex/sessions/2026/10/13/rollout-activity.jsonl")
+        self.write_activity_transcript(self.mac_home / ".claude/projects/project" / f"{ACTIVITY_SESSION}.jsonl")
+        _ = self.mac_collect()
+        self.assertEqual(self.activities("mac", "codex", ACTIVITY_THREAD), CODEX_ACTIVITIES)
+        self.assertEqual(self.activities("mac", "claude", ACTIVITY_SESSION), CLAUDE_ACTIVITIES)
+
     def test_running_pass_keeps_its_lock_through_the_mac_read_until_exit(self) -> None:
         report = self.root / "ssh-report.json"
         waiting = report.with_suffix(".waiting")
@@ -1152,7 +1524,7 @@ class MacCollectTests(CollectorFixture):
         run = self.mac_collect()
         turn_columns = ("family, kind, parent_id, agent_id, turn_key, at, model, effort, input, "
                         + "cache_write_5m, cache_write_1h, cache_read, output, before_first_edit, "
-                        + "role, lens, attribution, lens_state")
+                        + "role, lens, attribution, lens_state, activity, wait_action")
         for table, columns, order in (
             ("turns", turn_columns, "family, parent_id, agent_id, turn_key"),
             ("compactions", "family, parent_id, agent_id, at", "family, parent_id, agent_id, at"),
@@ -1473,7 +1845,7 @@ class MacCollectTests(CollectorFixture):
         run = self.mac_collect()
         columns = ("family, kind, parent_id, agent_id, turn_key, at, model, effort, input, "
                    + "cache_write_5m, cache_write_1h, cache_read, output, before_first_edit, "
-                   + "role, lens, attribution, lens_state")
+                   + "role, lens, attribution, lens_state, activity, wait_action")
         order = "family, parent_id, agent_id, turn_key"
         remote = self.rows(f"SELECT {columns} FROM turns WHERE machine = 'mac' ORDER BY {order}")
         local = self.rows(f"SELECT {columns} FROM turns WHERE machine = 'natedev' ORDER BY {order}")
@@ -1545,7 +1917,8 @@ class MacCollectTests(CollectorFixture):
                     self.assertEqual(self.all_values(self.mac_rows(table)), before, table)
 
     def test_invalid_remote_measurements_end_pass_without_defaults_or_second_file_commit(self) -> None:
-        behaviors: tuple[SshBehavior, ...] = ("malformed_record", "unknown_measurement", "missing_output")
+        behaviors: tuple[SshBehavior, ...] = ("malformed_record", "unknown_measurement", "missing_output",
+                                              "invalid_activity", "wait_without_action", "missing_activity")
         for behavior in behaviors:
             with self.subTest(behavior=behavior):
                 self.db_path = self.state / f"{behavior}.db"
@@ -1557,6 +1930,8 @@ class MacCollectTests(CollectorFixture):
                 self.assertEqual(self.values(self.mac_rows("role_log_sources"), "problems", "state"), [(1, "ready")])
                 if behavior == "malformed_record":
                     self.assertIn("partial (invalid remote stream)", run.output)
+                if behavior in ("invalid_activity", "wait_without_action", "missing_activity"):
+                    self.assertIn("activity", run.output)
 
     def test_oversized_wire_count_ends_pass_and_records_sources_without_second_file_commit(self) -> None:
         run = self.mac_collect("oversized_output")
@@ -1575,6 +1950,35 @@ class MacCollectTests(CollectorFixture):
             lines = [line for line in run.output.splitlines() if line.startswith(f"mac {family}:")]
             self.assertRegex(lines[0], r"\bcut\b")
             self.assertNotIn("invalid remote stream", lines[0])
+
+    def test_cut_stream_drains_remote_writer_before_reaping_shell(self) -> None:
+        report = self.root / "ssh-report.json"
+        finished = self.root / "remote-writer-finished"
+        configuration = {"home": str(self.mac_home), "execution_directory": str(self.execution_directory),
+                         "report": str(report), "behavior": "cut_inside_record", "database": str(self.db_path),
+                         "previous_role_read_at": ""}
+        config = self.root / "ssh-configuration.json"
+        _ = config.write_text(json.dumps(configuration), encoding="utf-8")
+        records = ('{"type":"file","kind":"claude"}\n{"type":"cursor"}\n'
+                   '{"type":"file","kind":"claude"}\n{"type":"turn"}\n')
+        writer = (
+            "import sys; from pathlib import Path; "
+            f"sys.stdout.write({records!r}); sys.stdout.flush(); "
+            "sys.stdout.write('{}\\n' * 100000); sys.stdout.flush(); "
+            "Path(sys.argv[1]).write_text('finished')"
+        )
+        remote_command = shlex.join((sys.executable, "-c", writer, str(finished))) + '; printf "\\nrc=%s\\n" "$?"'
+        result = subprocess.run(
+            [str(self.root / "bin/ssh"), remote_command],
+            input=b"fixture request", capture_output=True, timeout=30, check=False,
+            env={**os.environ, "USAGE_TEST_SSH_CONFIG": str(config)},
+        )
+        self.assertEqual(result.stderr, b"", result.stderr.decode(errors="replace"))
+        self.assertEqual(result.returncode, 0)
+        self.assertTrue(finished.is_file(), "A cut fixture must reap the writer after it finishes")
+        lines = records.splitlines(keepends=True)
+        expected = "".join(lines[:-1]) + lines[-1][:len(lines[-1]) // 2]
+        self.assertEqual(result.stdout, expected.encode())
 
 
 if __name__ == "__main__":

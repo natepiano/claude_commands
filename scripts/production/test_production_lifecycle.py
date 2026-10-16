@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import re
 import subprocess
@@ -15,6 +16,7 @@ import fake_tmux
 from fake_tmux import FakeSession
 
 
+# Script completion deadlines only bound hangs; startup can be slow under load.
 SCRIPT = Path(__file__).with_name("production_lifecycle.py")
 STUB = '''#!__PYTHON__
 import os
@@ -38,6 +40,20 @@ if name == "cargo-berth" and sys.argv[1:2] == ["board"]:
 if name in ("notifier.sh", "showrunners.py", "cargo-berth", "py"):
     raise SystemExit(0)
 raise SystemExit(99)
+'''
+# The session records and the message sender showrunners.py reads: nothing real is looked up or sent.
+SESSIONS = '''import json, os, pathlib, sys
+command, target = sys.argv[1:]
+for path in pathlib.Path(os.environ["NOTIFIER_SESSIONS_DIR"]).glob("*.json"):
+    record = json.loads(path.read_text())
+    if command == "socket" and target == "session:" + record["sessionId"]:
+        print(record["messagingSocketPath"])
+        raise SystemExit(0)
+raise SystemExit(1)
+'''
+SEND = '''import json, os, sys
+with open(os.environ["TEST_SENT"], "a") as handle:
+    handle.write(json.dumps(sys.argv[1:]) + "\\n")
 '''
 
 
@@ -89,7 +105,12 @@ class LifecycleTests(unittest.TestCase):
                     "SHOWRUNNER_SESSION": "environment-showrunner",
                     "NOTIFIER_STATE_DIR": str(self.state / "notifier"),
                     "NOTIFIER_SESSIONS_DIR": str(self.state / "sessions"),
-                    "PHASE_TABLE_VAULT": str(self.phase_table_vault)}
+                    "PHASE_TABLE_VAULT": str(self.phase_table_vault),
+                    "SHOWRUNNER_STATE_DIR": str(self.state / "showrunner"),
+                    "SHOWRUNNERS_SESSIONS": str(self.root / "sessions.py"),
+                    "SHOWRUNNERS_SEND": str(self.root / "send.py"), "TEST_SENT": str(self.state / "sent.jsonl")}
+        self.write(self.root / "sessions.py", SESSIONS)
+        self.write(self.root / "send.py", SEND)
         self.checkout.mkdir()
         _ = self.git("init", "--bare", str(self.origin), cwd=self.root)
         _ = self.git("init", "-b", "main", cwd=self.checkout)
@@ -164,7 +185,7 @@ class LifecycleTests(unittest.TestCase):
     def run_lifecycle(self, action: str, *extra: str) -> subprocess.CompletedProcess[str]:
         return subprocess.run([sys.executable, str(SCRIPT), action, "--production", str(self.doc),
                                *extra], cwd=self.checkout, env=self.env, capture_output=True,
-                              text=True, check=False, timeout=25)
+                              text=True, check=False, timeout=300)
 
     def assert_step(self, result: subprocess.CompletedProcess[str], state: str) -> None:
         self.assertRegex(result.stdout, rf"(?m)^[\w-]+: {state} — .+")
@@ -201,6 +222,35 @@ class LifecycleTests(unittest.TestCase):
         _ = self.git("config", "user.name", "Lifecycle Test", cwd=destination)
         _ = self.git("config", "user.email", "lifecycle@example.invalid", cwd=destination)
         return destination
+
+    def showrunner(self, slug: str, *, live: bool = False) -> None:
+        """An update timer for `slug`'s showrunner, and with `live` a running session it is addressed to."""
+        doc = self.root / f"{slug}-production.md"
+        self.write(doc, f"# {slug}\n")
+        self.write(self.state / "notifier" / f"showrunner-{slug}" / "conf",
+                   f"TARGET=session:{slug}-session\nCHECK=zsh /x/production_check.sh {doc}\n")
+        if live:
+            # This test's own process stands in for the session's: it is alive while the lifecycle runs.
+            self.write(self.state / "sessions" / f"{os.getpid()}.json",
+                       json.dumps({"pid": os.getpid(), "name": f"{slug}-name", "sessionId": f"{slug}-session",
+                                   "messagingSocketPath": str(self.root / f"{slug}.sock")}))
+
+    def reports_to(self, child: str, parent: str) -> Path:
+        path = self.state / "showrunner" / child / "parent"
+        self.write(path, parent + "\n")
+        return path
+
+    def sent(self) -> list[list[str]]:
+        path = self.state / "sent.jsonl"
+        if not path.exists():
+            return []
+        return [cast(list[str], json.loads(line)) for line in path.read_text(encoding="utf-8").splitlines()]
+
+    def merged_units(self) -> None:
+        self.running()
+        _ = self.side_commit(self.alpha, "alpha-branch", "alpha-unit", "1")
+        _ = self.side_commit(self.beta, "beta-branch", "beta-unit", "1")
+        _ = self.git("push", "origin", "production")
 
     def calls(self) -> str:
         return (self.state / "calls").read_text() if (self.state / "calls").exists() else ""
@@ -665,6 +715,65 @@ class LifecycleTests(unittest.TestCase):
         self.assertNotIn("showrunners.py", calls)
         self.assertNotIn("gh ", calls)
         self.assertNotIn("ssh ", calls)
+        self.assertIn("tree: ok — no parent and no child showrunners", result.stdout)
+        self.assertEqual(self.sent(), [])
+
+    def test_wrap_names_herdr_and_tmux_sessions_for_close_out(self) -> None:
+        self.merged_units()
+        result = self.run_lifecycle("wrap", "--no-ci")
+        self.assert_step(result, "ok")
+        self.assertIn("| Next | close herdr or tmux sessions |", result.stdout)
+
+    def test_wrap_detaches_from_its_parent_and_leaves_each_child_a_root(self) -> None:
+        self.merged_units()
+        for slug in ("top", "kid", "other"):
+            self.showrunner(slug, live=slug == "top")
+        own = self.reports_to("example", "top")
+        kid = self.reports_to("kid", "example")
+        other = self.reports_to("other", "top")
+        result = self.run_lifecycle("wrap", "--no-ci")
+        self.assert_step(result, "ok")
+        self.assertFalse(own.exists())
+        self.assertFalse(kid.exists())
+        self.assertEqual(other.read_text(encoding="utf-8"), "top\n")
+        self.assertRegex(result.stdout, r"(?m)^tree: ok — detached from top; kid now root; told top; "
+                         + r"kid is not running: tell it when it starts$")
+        [sent] = self.sent()
+        self.assertEqual(sent[sent.index("--to") + 1], f"uds:{self.root / 'top.sock'}")
+        self.assertEqual(sent[sent.index("--text") + 1], "example wrapped, so it no longer reports to you.")
+        self.assertIn("wrapped", self.doc.read_text())
+
+    def test_wrap_deletes_its_own_state_files_and_keeps_other_productions(self) -> None:
+        self.merged_units()
+        state = self.state / "showrunner"
+        own = (state / "footers-off/example", state / "review-paused/example.json",
+               state / "outstanding/example.json", state / "example/prompt.txt")
+        other = (state / "footers-off/other", state / "outstanding/other.json", state / "other/prompt.txt")
+        for path in (*own, *other):
+            self.write(path, "[]\n")
+        result = self.run_lifecycle("wrap", "--no-ci")
+        self.assert_step(result, "ok")
+        self.assertRegex(result.stdout, r"(?m)^tidy: ok — removed footers-off/example, review-paused/example.json, "
+                         + r"outstanding/example.json, example/$")
+        self.assertFalse(any(path.exists() for path in own))
+        self.assertFalse((state / "example").exists())
+        self.assertTrue(all(path.exists() for path in other))
+
+    def test_wrap_holds_while_a_child_showrunner_runs(self) -> None:
+        self.merged_units()
+        self.showrunner("kid", live=True)
+        self.showrunner("idle")
+        kid = self.reports_to("kid", "example")
+        idle = self.reports_to("idle", "example")
+        result = self.run_lifecycle("wrap", "--no-ci")
+        self.assert_step(result, "held")
+        self.assertRegex(result.stdout, r"(?m)^children: held — kid still reports to example; wrap each first")
+        self.assertNotIn("idle", result.stdout)
+        self.assertTrue(kid.exists())
+        self.assertTrue(idle.exists())
+        self.assertTrue(self.alpha.exists())
+        self.assertNotIn("notifier.sh", self.calls())
+        self.assertIn("**Status: PRODUCTION — running.**", self.doc.read_text())
 
     def test_wrap_archives_owned_phase_note_and_keeps_other_files(self) -> None:
         self.running()
@@ -715,3 +824,17 @@ class LifecycleTests(unittest.TestCase):
 
 if __name__ == "__main__":
     _ = unittest.main()
+
+
+class PermanentUnitTests(unittest.TestCase):
+    def test_wrap_neither_waits_on_nor_retires_a_permanent_unit(self) -> None:
+        sys.path.insert(0, str(SCRIPT.parent))
+        import production_lifecycle
+        from add_unit import Production
+        from zoneinfo import ZoneInfo
+
+        lines = ["## Units", "", "| Unit | Plan | Worktree | Branch | Port | Owns |", "| --- | --- | --- | --- | --- | --- |",
+                 "| alpha-unit | docs/plans/alpha.md | /w/alpha | demo-alpha | — | — |",
+                 "| nightly-review-unit | permanent | /w/nightly | demo-nightly-review | — | — |", ""]
+        production = Production(Path("/c/docs/demo-production.md"), "demo", "demo", Path("/c"), Path("/c/log.md"), ZoneInfo("UTC"))
+        self.assertEqual([row.name for row in production_lifecycle.units(lines, production)], ["alpha-unit"])

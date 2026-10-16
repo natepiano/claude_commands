@@ -16,7 +16,6 @@ import subprocess
 import sys
 from pathlib import Path
 from typing import NamedTuple, TypedDict, cast
-from zoneinfo import ZoneInfo
 
 CONFIG = Path(os.environ.get("SHOWRUNNERS_CONFIG") or Path(__file__).resolve().parents[2] / "config/showrunners.json")
 NOTIFIER_STATE_DIR = Path(os.environ.get("NOTIFIER_STATE_DIR") or Path.home() / ".local/state/notifier")
@@ -25,6 +24,9 @@ SESSIONS = Path(os.environ.get("SHOWRUNNERS_SESSIONS") or Path(__file__).resolve
 SHOWRUNNER_STATE_DIR = Path(os.environ.get("SHOWRUNNER_STATE_DIR") or Path.home() / ".local/state/showrunner")
 SEND = Path(os.environ.get("SHOWRUNNERS_SEND") or Path(__file__).resolve().parent.parent / "message/send.py")
 PARENT_FILE = "parent"
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
+from user_zone import user_zone_name  # noqa: E402
+
 RULES = "Read the Nested showrunners rules in ~/.claude/commands/showrunner/produce.md."
 
 
@@ -37,7 +39,7 @@ class Showrunner(TypedDict):
     socket: str
     # The production's slug, which names the showrunner whatever its session is called.
     slug: str
-    # The user's zone, read from the production doc.
+    # The user's zone setting. A production doc's own User zone line is no longer read.
     zone: str
     # The production doc, whose Units table says which units the showrunner has.
     doc: str
@@ -159,22 +161,12 @@ def _session_name(session_id: str) -> str:
     raise ValueError(f"session {session_id} has no live named process")
 
 
-def _doc_zone(doc: Path) -> str:
-    """The user's zone, from the production doc's own User zone line."""
-    prefix = "- **User zone:** "
+def _readable(doc: Path) -> None:
+    """Refuse a production doc that cannot be read."""
     try:
-        lines = doc.read_text(encoding="utf-8").splitlines()
+        _ = doc.read_text(encoding="utf-8")
     except (OSError, UnicodeError) as error:
         raise ValueError(f"production doc could not be read: {error}") from error
-    found = next((re.search(r"[A-Za-z][\w+-]*(?:/[\w+-]+)*", line[len(prefix):]) for line in lines
-                  if line.startswith(prefix)), None)
-    if found is None:
-        raise ValueError("production doc lacks User zone")
-    try:
-        _ = ZoneInfo(found.group(0))
-    except (KeyError, ValueError) as error:
-        raise ValueError(f"production doc has an invalid User zone: {error}") from error
-    return found.group(0)
 
 
 def _timer(instance: Path) -> Timer:
@@ -185,7 +177,8 @@ def _timer(instance: Path) -> Timer:
     doc = checked_doc(instance)
     if isinstance(doc, NoCheckedDoc):
         raise ValueError(doc.reason)
-    return Timer(instance.name.removeprefix("showrunner-"), target, doc.path, _doc_zone(doc.path))
+    _readable(doc.path)
+    return Timer(instance.name.removeprefix("showrunner-"), target, doc.path, user_zone_name())
 
 
 def _registered(instance: Path) -> Showrunner:
@@ -235,23 +228,53 @@ def production_slug(doc: str) -> str:
     return slug
 
 
+def canonical_slug(slug: str, state_dir: Path | None = None) -> str:
+    """Map a former production name to its current slug; leave other slugs unchanged."""
+    timers: list[Timer] = []
+    for instance in sorted((state_dir or NOTIFIER_STATE_DIR).glob("showrunner-*")):
+        try:
+            timer = _timer(instance)
+        except (OSError, KeyError, ValueError, UnicodeError):
+            continue
+        if timer.slug == slug:
+            return slug
+        timers.append(timer)
+    for timer in timers:
+        try:
+            text = timer.doc.read_text(encoding="utf-8")
+        except (OSError, UnicodeError):
+            continue
+        # Only Production Context carries the line; an example elsewhere in the doc claims nothing.
+        context = re.search(r"^## Production Context\n(.*?)(?=^## |\Z)", text, re.MULTILINE | re.DOTALL)
+        formerly = re.search(r"^- \*\*Formerly:\*\*(.*)$", context[1] if context else "", re.MULTILINE)
+        if formerly and slug in re.findall(r"`([^`]+)`", formerly[1]):
+            return timer.slug
+    return slug
+
+
 def current_name(slug: str) -> str:
     """The name now of the production's showrunner. Empty while it is not running or has no update timer."""
+    slug = canonical_slug(slug)
     return next((runner["session"] for runner in registered_showrunners() if runner["slug"] == slug), "")
 
 
 def current_address(slug: str) -> str:
     """Where `SendMessage` reaches the production's showrunner now: its session on this machine.
     Empty while it is not running or has no update timer."""
+    slug = canonical_slug(slug)
     socket = next((runner["socket"] for runner in registered_showrunners() if runner["slug"] == slug), "")
     return f"uds:{socket}" if socket else ""
 
 
 def named(showrunner: str) -> Showrunner:
     """The showrunner called `showrunner` now, or whose production has that slug."""
-    for runner in registered_showrunners():
-        if showrunner and showrunner in (runner["session"], runner["slug"]):
-            return runner
+    slug = canonical_slug(showrunner)
+    runners = registered_showrunners()
+    # The production a slug resolves to wins over a session that happens to share the name.
+    found = (next((runner for runner in runners if runner["slug"] == slug), None)
+             or next((runner for runner in runners if runner["session"] == showrunner), None))
+    if showrunner and found:
+        return found
     raise ValueError(f"no showrunner with an update timer is called {showrunner} or runs that production")
 
 
@@ -395,6 +418,8 @@ def own_slug() -> str:
 
 def attach(child: str, parent: str) -> None:
     """Store that `child` reports to `parent`. Raises ValueError naming why it cannot."""
+    child = canonical_slug(child)
+    parent = canonical_slug(parent)
     known = timer_slugs()
     for slug in (child, parent):
         if slug not in known:
@@ -419,11 +444,39 @@ def attach(child: str, parent: str) -> None:
 
 def detach(child: str) -> str:
     """Remove `child`'s parent file and return the parent it named. Raises ValueError when it has none."""
+    child = canonical_slug(child)
     parent = _stored_parent(child)
     if not parent:
         raise ValueError(f"{child} reports to no one")
     (SHOWRUNNER_STATE_DIR / child / PARENT_FILE).unlink()
     return parent
+
+
+class Released(NamedTuple):
+    """The edges a wrapped production left: each one's parent file is gone."""
+
+    # The production it reported to. Empty when it had none.
+    parent: str
+    # The productions that reported to it, each a root now.
+    orphans: list[str]
+
+
+def stored_children(slug: str) -> list[str]:
+    """Every production whose parent file names `slug`, whether or not that edge counts."""
+    return sorted(path.parent.name for path in SHOWRUNNER_STATE_DIR.glob(f"*/{PARENT_FILE}")
+                  if path.parent.name != slug and _stored_parent(path.parent.name) == slug)
+
+
+def release_edges(slug: str) -> Released:
+    """Remove `slug`'s parent file and every parent file that names it, so a wrap leaves no edge behind.
+
+    An edge to a wrapped production already counts for nothing; its file would come back to life if a
+    production of the same slug ran again.
+    """
+    released = Released(_stored_parent(slug), stored_children(slug))
+    for child in ([slug] if released.parent else []) + released.orphans:
+        (SHOWRUNNER_STATE_DIR / child / PARENT_FILE).unlink(missing_ok=True)
+    return released
 
 
 def tell(slug: str, key: str, text: str) -> str:
@@ -484,7 +537,7 @@ def main(argv: list[str]) -> int:
                 raise ValueError(f"the showrunner of {slug} is not running")
             print(found)
         elif action in ("parent", "children", "root"):
-            slug = cast(str, args.slug)
+            slug = canonical_slug(cast(str, args.slug))
             if slug not in timer_slugs():
                 raise ValueError(f"{slug} has no update timer")
             # A root prints no parent and no children: an empty answer is the answer.
@@ -496,10 +549,11 @@ def main(argv: list[str]) -> int:
             for line in tree_lines(registered_showrunners()):
                 print(line)
         elif action == "attach":
-            child = cast(str, args.child)
+            child = canonical_slug(cast(str, args.child))
             parent = cast(str | None, args.parent) or own_slug()
             if not parent:
                 raise ValueError("name the parent: this session runs no production")
+            parent = canonical_slug(parent)
             attach(child, parent)
             top = root_of(parent)
             print(f"{child} now reports to {parent}")
@@ -510,7 +564,7 @@ def main(argv: list[str]) -> int:
             }, f"showrunner-tree:{child}"):
                 print(line)
         elif action == "detach":
-            child = cast(str, args.child)
+            child = canonical_slug(cast(str, args.child))
             parent = detach(child)
             print(f"{child} no longer reports to {parent}")
             text = f"{child} no longer reports to {parent}. {child} is a root again."

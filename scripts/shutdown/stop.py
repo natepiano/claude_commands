@@ -18,11 +18,13 @@ from pathlib import Path
 from typing import Literal, Protocol, TypedDict, cast
 
 SCRIPTS = Path(__file__).resolve().parents[1]
-for dependency in ("message", "production"):
+for dependency in ("message", "production", "herdr", "lib"):
     sys.path.insert(0, str(SCRIPTS / dependency))
 
 import sessions
-from inventory import Inventory, Session, terminal_kind
+import herdr
+import relaunch
+from inventory import Inventory, Session, terminal_kind, live_supervisor
 from record import (
     CLAIM_STALE_SECONDS,
     NoLiveRecord,
@@ -36,6 +38,8 @@ from record import (
 )
 
 class ShutdownReadiness(Protocol):
+    def stoppable_status(self, status: str) -> bool: ...
+
     def blocker(self, session: Session) -> ReadinessCheck: ...
 
 
@@ -54,6 +58,13 @@ FreshInventory = Callable[[str, frozenset[str]], Inventory]
 Clock = Callable[[], datetime]
 CommandRunner = Callable[[list[str]], int | None]
 Sleeper = Callable[[float], None]
+IdleStopReason = Literal[
+    "not an idle stop",
+    "idle; nothing in progress",
+    "idle after the pause message; no ready line",
+    "idle; nothing in progress; a background shell was running",
+    "idle after the pause message; no ready line; a background shell was running",
+]
 
 
 class StopClaimLost(Exception):
@@ -86,7 +97,7 @@ class StopClaim:
 class MatchingSession(TypedDict):
     kind: Literal["matching session"]
     session: Session
-    seats: list[Session]
+    workers: list[Session]
 
 
 class SessionAbsent(TypedDict):
@@ -163,7 +174,7 @@ def _timestamp(clock: Clock) -> str:
 def _fresh_inventory(login: str, only: frozenset[str]) -> Inventory:
     from inventory import inventory
 
-    return inventory(login, only)
+    return inventory(login, only=only, refresh_desktops=False)
 
 
 def fresh_session(stored: Session, report: Inventory) -> FreshSession:
@@ -180,9 +191,9 @@ def fresh_session(stored: Session, report: Inventory) -> FreshSession:
             return {"kind": "session identity lost"}
         return {
             "kind": "matching session", "session": current,
-            "seats": [
+            "workers": [
                 item for item in report["sessions"]
-                if item["kind"] == "seat"
+                if item["kind"] == "worker"
                 and item["owner"]["kind"] == "director"
                 and item["owner"]["session_id"] == session_id
             ],
@@ -293,14 +304,14 @@ def _run_directories(session: Session) -> list[str]:
     )
 
 
-def _end_busy_codex_seats(
+def _end_busy_codex_workers(
     session: Session, codex_mesh: CommandRunner, claim: StopClaim
 ) -> None:
     for server in session["codex_servers"]:
-        for seat in server["busy_seats"]:
+        for worker in server["busy_workers"]:
             claim.check()
             _ = codex_mesh(
-                ["end", "--session-dir", server["run_dir"], "--to", seat]
+                ["end", "--session-dir", server["run_dir"], "--to", worker]
             )
 
 
@@ -332,14 +343,15 @@ def _stop_codex_servers(
 def _stop_unit_tmux(
     session: Session, tmux: CommandRunner, clock: Clock, claim: StopClaim
 ) -> list[SessionStopIssue]:
-    if session["kind"] != "unit":
+    if session["kind"] != "unit" or session["host"]["session_host"] != "tmux":
         return []
-    tmux_session = session["host"]["tmux_session"]
+    tmux_session = session["host"]["session_name"]
     target = f"={tmux_session}"
     issue: SessionStopIssue = {
-        "kind": "unit tmux session left running",
+        "kind": "unit session left running",
         "at": _timestamp(clock),
-        "tmux_session": tmux_session,
+        "host": "tmux",
+        "session_name": tmux_session,
         "cause": "stop not confirmed",
     }
     try:
@@ -354,6 +366,37 @@ def _stop_unit_tmux(
     if remaining is None or remaining == 0:
         return [issue]
     return []
+
+
+def _stop_unit_session(
+    session: Session, tmux: CommandRunner, clock: Clock, claim: StopClaim
+) -> list[SessionStopIssue]:
+    if session["kind"] != "unit":
+        return []
+    if session["host"]["session_host"] == "tmux":
+        return _stop_unit_tmux(session, tmux, clock, claim)
+    name = session["host"]["session_name"]
+    issue: SessionStopIssue = {
+        "kind": "unit session left running",
+        "at": _timestamp(clock),
+        "host": "herdr",
+        "session_name": name,
+        "cause": "stop not confirmed",
+    }
+    claim.check()
+    try:
+        herdr.stop_session(name)
+    except (herdr.HerdrFailure, OSError, subprocess.TimeoutExpired):
+        pass
+    finally:
+        claim.check()
+    try:
+        remaining = herdr.live_sessions()
+    except (herdr.HerdrFailure, OSError, subprocess.TimeoutExpired):
+        return [issue]
+    finally:
+        claim.check()
+    return [issue] if any(row["name"] == name for row in remaining) else []
 
 
 def _process_row(pid: int) -> tuple[int, str] | None:
@@ -413,12 +456,17 @@ def _stop_owner_resources(
     tmux: CommandRunner,
     clock: Clock,
     claim: StopClaim,
+    retain_window: bool = False,
 ) -> list[SessionStopIssue]:
-    _close_ghostty_window(session, kill=kill, is_alive=is_alive, claim=claim)
+    if not retain_window:
+        _close_ghostty_window(session, kill=kill, is_alive=is_alive, claim=claim)
     issues = _stop_codex_servers(
         session, codex_mesh=codex_mesh, is_alive=is_alive, clock=clock, claim=claim
     )
-    issues.extend(_stop_unit_tmux(session, tmux, clock, claim))
+    if session["host"]["kind"] == "herdr":
+        # Leave the pane and server running; herdr session cleanup is manual for now.
+        return issues
+    issues.extend(_stop_unit_session(session, tmux, clock, claim))
     return issues
 
 
@@ -437,9 +485,10 @@ def _owner_identity_lost_issues(
     if session["kind"] == "unit":
         issues.append(
             {
-                "kind": "unit tmux session left running",
+                "kind": "unit session left running",
                 "at": _timestamp(clock),
-                "tmux_session": session["host"]["tmux_session"],
+                "host": session["host"]["session_host"],
+                "session_name": session["host"]["session_name"],
                 "cause": "owner identity lost",
             }
         )
@@ -460,7 +509,7 @@ def _retry_owner_cleanup(
         issue for issue in entry["stop_issues"]
         if (
             issue["kind"] == "codex server left running"
-            or issue["kind"] == "unit tmux session left running"
+            or issue["kind"] == "unit session left running"
         ) and issue["cause"] == "stop not confirmed"
     ]
     if not pending:
@@ -475,9 +524,23 @@ def _retry_owner_cleanup(
     issues.extend(_stop_codex_servers(
         session, codex_mesh=codex_mesh, is_alive=is_alive, clock=clock, claim=claim
     ))
-    if any(issue["kind"] == "unit tmux session left running" for issue in pending):
-        issues.extend(_stop_unit_tmux(session, tmux, clock, claim))
+    if any(issue["kind"] == "unit session left running" for issue in pending):
+        issues.extend(_stop_unit_session(session, tmux, clock, claim))
     _ = _replace_stop_issues(claim, issues)
+
+
+def _hold_supervised_window(entry: SessionShutdown, claim: StopClaim) -> bool:
+    """Write a restart's hold before Claude exits, so its supervisor keeps the window."""
+    host = entry["session"]["host"]
+    if entry["then"] != "restart" or not (host["kind"] == "ghostty" or (
+            host["kind"] == "terminal" and sys.platform == "darwin")):
+        return False
+    supervisor = live_supervisor(host)
+    if supervisor["kind"] != "supervisor":
+        return False
+    claim.check()
+    relaunch.write_hold(supervisor["pid"])
+    return True
 
 
 def _stop_owner(
@@ -485,6 +548,7 @@ def _stop_owner(
     entry: SessionShutdown,
     *,
     prior: SessionProgress,
+    idle_reason: IdleStopReason,
     force_now: bool,
     kill: KillProcess,
     is_alive: LivenessCheck,
@@ -496,6 +560,7 @@ def _stop_owner(
     sleep: Sleeper,
 ) -> None:
     stored = entry["session"]
+    retain_window = False
     report = fresh_inventory(claim.login, frozenset({stored["session_id"]}))
     match = fresh_session(stored, report)
     if match["kind"] == "session identity lost":
@@ -514,6 +579,11 @@ def _stop_owner(
         )
         return
     if match["kind"] == "session absent":
+        try:
+            retain_window = _hold_supervised_window(entry, claim)
+        except OSError as error:
+            _ = _set_stop_outcome(claim, "stop failed", clock, [], str(error))
+            return
         issues = _stop_owner_resources(
             stored,
             kill=kill,
@@ -522,6 +592,7 @@ def _stop_owner(
             tmux=tmux,
             clock=clock,
             claim=claim,
+            retain_window=retain_window,
         )
         _ = _set_stop_outcome(
             claim, "already gone", clock, issues
@@ -529,24 +600,38 @@ def _stop_owner(
         return
 
     current = match["session"]
-    if not force_now and (
-        prior["kind"] not in {"ready", "stopping", "stop failed"}
-        or current["status"] != "idle"
-        or any(seat["status"] != "idle" for seat in match["seats"])
+    if not force_now and prior["kind"] != "reaping" and (
+        (prior["kind"] not in {"ready", "held by usage limit", "stopping", "stop failed"}
+         and not (prior["kind"] == "waiting" and idle_reason != "not an idle stop"))
+        or not settle.stoppable_status(current["status"])
+        or any(worker["status"] != "idle" for worker in match["workers"])
         or settle.blocker(current)["kind"] != "clear"
     ):
         issue = NotReadyToStop(
             kind="not ready to stop", at=_timestamp(clock),
             status=current["status"],
-            progress="ready" if prior["kind"] == "ready" else "waiting",
+            progress=("held by usage limit" if prior["kind"] == "held by usage limit"
+                      else "ready" if prior["kind"] == "ready" else "waiting"),
         )
-        _ = _set_stop_outcome(
-            claim, "stop failed", clock, [issue],
-            "session or seat is not idle and ready",
-        )
+        def wait_until_ready(changing: SessionShutdown) -> None:
+            claim.require(changing)
+            if issue["progress"] == "held by usage limit":
+                changing["progress"] = {"kind": "held by usage limit", "at": issue["at"]}
+            elif issue["progress"] == "ready":
+                changing["progress"] = {"kind": "ready", "at": issue["at"]}
+            else:
+                changing["progress"] = {"kind": "waiting"}
+            changing["stop_issues"] = [issue]
+
+        _ = update_session(claim.login, claim.session_id, wait_until_ready)
         return
     if force_now:
-        _end_busy_codex_seats(current, codex_mesh, claim)
+        _end_busy_codex_workers(current, codex_mesh, claim)
+    try:
+        retain_window = _hold_supervised_window(entry, claim)
+    except OSError as error:
+        _ = _set_stop_outcome(claim, "stop failed", clock, [], str(error))
+        return
     try:
         claim.check()
         kill(stored["pid"], signal.SIGTERM)
@@ -559,6 +644,7 @@ def _stop_owner(
             tmux=tmux,
             clock=clock,
             claim=claim,
+            retain_window=retain_window,
         )
         _ = _set_stop_outcome(
             claim, "already gone", clock, issues
@@ -667,6 +753,7 @@ def _stop_owner(
         tmux=tmux,
         clock=clock,
         claim=claim,
+        retain_window=retain_window,
     )
     _ = _set_stop_outcome(
         claim, stopped_progress, clock, issues
@@ -676,6 +763,7 @@ def _stop_owner(
 def stop_session(
     record: SessionShutdown,
     *,
+    idle_reason: IdleStopReason = "not an idle stop",
     kill: KillProcess = os.kill,
     is_alive: LivenessCheck = process_is_alive,
     session_record_exists: SessionRecordPresence = session_record_exists,
@@ -699,11 +787,13 @@ def stop_session(
             if age < CLAIM_STALE_SECONDS:
                 return
         elif progress["kind"] not in {
-            "waiting", "ready", "stop failed", "stopped", "already gone", "process identity lost", "restart failed",
+            "waiting", "ready", "held by usage limit", "reaping", "stop failed", "stopped", "already gone", "process identity lost", "restart failed",
         }:
             return
         prior = copy.deepcopy(progress)
         current["progress"] = {"kind": "stopping", "at": _timestamp(clock)}
+        if idle_reason != "not an idle stop" and prior["kind"] == "waiting":
+            current["where"] = {"kind": "said", "text": idle_reason, "at": current["progress"]["at"]}
         claimed = True
 
     current = update_session(record["login"], record["session"]["session_id"], claim)
@@ -726,7 +816,7 @@ def stop_session(
 
             return update_session(current["login"], current["session"]["session_id"], restore_progress)
         _stop_owner(
-            owned, current, prior=prior,
+            owned, current, prior=prior, idle_reason=idle_reason,
             force_now=current["force"] == "now",
             kill=kill, is_alive=is_alive,
             session_record_exists=session_record_exists,

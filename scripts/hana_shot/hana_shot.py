@@ -9,6 +9,7 @@ from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import closing, contextmanager
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
+from difflib import get_close_matches
 from enum import StrEnum
 import http.client
 import json
@@ -16,6 +17,7 @@ import math
 import os
 from pathlib import Path
 import re
+import shlex
 import shutil
 import signal
 import socket
@@ -26,7 +28,7 @@ import tempfile
 import time
 import tomllib
 from types import FrameType
-from typing import IO, Literal, NamedTuple, NotRequired, TypedDict, cast
+from typing import IO, Literal, NamedTuple, NoReturn, NotRequired, TypedDict, cast, override
 
 
 REFUSED_PORT = 15702
@@ -73,6 +75,7 @@ HOME_DURATION = ".home.animation_duration_milliseconds"
 READY_LOG_LINE = "scene revealed"
 
 MODES = ("fit", "pose", "hana-frame", "home")
+FACES = ("+x", "-x", "+y", "-y", "+z", "-z")
 CROPS = ("entity", "none")
 SELECTOR = re.compile(r"(name|marker|tool|entity):(.+)")
 TOOL_INDEX = re.compile(r"(.+)#([1-9][0-9]*)")
@@ -80,13 +83,14 @@ WINDOW_SIZE = re.compile(r"([1-9][0-9]{1,4})x([1-9][0-9]{1,4})")
 VIEW_NAME = re.compile(r"[a-z0-9][a-z0-9-]{0,63}")
 LABEL_UNSAFE = re.compile(r"[^A-Za-z0-9._-]+")
 VIEW_KEYS = (
-    "target", "mode", "yaw", "pitch", "margin", "focus", "radius", "crop",
+    "target", "mode", "face", "yaw", "pitch", "margin", "focus", "radius", "crop",
     "padding", "window", "setup", "settle", "note", "verified",
 )
 VIEWS_HEADER = """\
 # Known Hana camera views for hana_shot (~/.claude/scripts/hana_shot/hana_shot.py).
 # `hana_shot.py views add` writes a view; `views check` stamps `verified` on a pass.
 # Prefer fit views: they follow their target. Selectors: name:, marker:, tool:<Kind>[#n].
+# face = "+z" faces the target's local +z side; replaces world yaw/pitch in fit or pose.
 """
 
 
@@ -327,6 +331,7 @@ class VerifiedValue(TypedDict):
 class ViewValue(TypedDict, total=False):
     target: str
     mode: str
+    face: str
     yaw: float
     pitch: float
     margin: float
@@ -350,6 +355,7 @@ class TimingRecord(TypedDict):
     view: str | None
     target: str | None
     mode: str
+    face: NotRequired[str]
     crop: str
     window: str
     frame_ms: float | None
@@ -403,6 +409,8 @@ class FailedAttempt(TypedDict):
     view: str | None
     image_paths: list[str]
     failure_reason: FailureReason
+    error: str
+    face: NotRequired[str]
 
 
 class SuccessfulInvocation(TimingRecord):
@@ -421,8 +429,15 @@ class FailedInvocation(TypedDict):
     invocation_kind: Literal["shot", "views_check"]
     exit_code: int
     failure_reason: FailureReason
+    error: str
+    face: NotRequired[str]
     session: PresentSession | AbsentSession
     attempts: list[SuccessfulAttempt | FailedAttempt]
+
+
+class CaptureFailure(NamedTuple):
+    reason: FailureReason
+    error: str
 
 
 @dataclass
@@ -430,7 +445,8 @@ class InProgressCaptureInvocation:
     kind: Literal["shot", "views_check"] = "shot"
     attempts: list[SuccessfulAttempt | FailedAttempt] = field(default_factory=list)
     successful_timings: list[TimingRecord] = field(default_factory=list)
-    failures: list[FailureReason] = field(default_factory=list)
+    failures: list[CaptureFailure] = field(default_factory=list)
+    orientation: DefaultAngles | ExplicitAngles | TargetFace | ResolvedTargetFace = field(default_factory=lambda: DefaultAngles())
 
 
 class LaunchState(TypedDict):
@@ -505,6 +521,28 @@ class Bounds(NamedTuple):
 
 
 @dataclass(frozen=True)
+class DefaultAngles:
+    """No angles supplied: use world yaw and pitch zero."""
+
+
+class ExplicitAngles(NamedTuple):
+    yaw: float
+    pitch: float
+
+
+class TargetFace(NamedTuple):
+    """A target-local axis awaiting this run's world transform."""
+
+    axis: str
+
+
+class ResolvedTargetFace(NamedTuple):
+    axis: str
+    yaw: float
+    pitch: float
+
+
+@dataclass(frozen=True)
 class Shot:
     """One normalized shot request, from a stored view or from the command line."""
 
@@ -512,8 +550,7 @@ class Shot:
     view: str | None
     target: str | None
     mode: str
-    yaw: float = 0.0
-    pitch: float = 0.0
+    orientation: DefaultAngles | ExplicitAngles | TargetFace | ResolvedTargetFace = DefaultAngles()
     margin: float = 0.1
     focus: Vec3 | None = None
     radius: float | None = None
@@ -522,6 +559,18 @@ class Shot:
     window: str | None = None
     setup: str | None = None
     settle: int = 0
+
+    @property
+    def yaw(self) -> float:
+        if isinstance(self.orientation, TargetFace):
+            raise RuntimeError("target face must be resolved before reading yaw")
+        return 0.0 if isinstance(self.orientation, DefaultAngles) else self.orientation.yaw
+
+    @property
+    def pitch(self) -> float:
+        if isinstance(self.orientation, TargetFace):
+            raise RuntimeError("target face must be resolved before reading pitch")
+        return 0.0 if isinstance(self.orientation, DefaultAngles) else self.orientation.pitch
 
 
 @dataclass
@@ -545,11 +594,48 @@ POOL = ThreadPoolExecutor(max_workers=6)
 # BRP
 
 
+@dataclass
+class TargetEvidence:
+    """Names and geometry already read this run, for hints without another BRP call."""
+
+    names: dict[int, str] = field(default_factory=dict)
+    parents: dict[int, int] = field(default_factory=dict)
+    aabb_entities: set[int] = field(default_factory=set)
+    selector_candidates: list[str] = field(default_factory=list)
+
+    def observe(self, rows: list[QueryRow]) -> None:
+        for row in rows:
+            entity, components = row["entity"], row["components"]
+            name = components.get(NAME)
+            if isinstance(name, str):
+                self.names[entity] = name
+            parent = components.get(CHILD_OF)
+            if isinstance(parent, int):
+                self.parents[entity] = parent
+            if AABB in components or row.get("has", {}).get(AABB, False):
+                self.aabb_entities.add(entity)
+            elif row.get("has", {}).get(AABB) is False:
+                self.aabb_entities.discard(entity)
+
+    def parent_fit_hint(self, entity: int) -> str:
+        visited = {entity}
+        while entity in self.parents:
+            entity = self.parents[entity]
+            if entity in visited:
+                break
+            visited.add(entity)
+            if entity in self.aabb_entities:
+                name = f" ({self.names[entity]})" if entity in self.names else ""
+                return f"; nearest ancestor with an AABB: --target entity:{entity}{name}"
+        return ""
+
+
 class Brp:
     """JSON-RPC over HTTP to one Hana instance; each call uses its own connection."""
 
     def __init__(self, port: int) -> None:
         self.port: int = port
+        self.target_evidence: TargetEvidence = TargetEvidence()
 
     def call(self, method: str, params: object = None, timeout: float = CALL_TIMEOUT) -> object:
         body: dict[str, object] = {"jsonrpc": "2.0", "id": 1, "method": method}
@@ -577,7 +663,9 @@ class Brp:
         return reply.get("result")
 
     def query(self, params: dict[str, object]) -> list[QueryRow]:
-        return cast(list[QueryRow], self.call("world.query", params))
+        rows = cast(list[QueryRow], self.call("world.query", params))
+        self.target_evidence.observe(rows)
+        return rows
 
     def components(self, entity: int, paths: list[str]) -> dict[str, object]:
         reply = cast(ComponentsReply, self.call("world.get_components", {"entity": entity, "components": paths}))
@@ -809,6 +897,10 @@ def move(session: Session, shot: Shot, target: Target | None, before: CameraStat
             raise Failure(
                 f"fit on {target.label} was rejected: the camera did not move "
                 + "(no visible geometry under the target, or an animation owns the camera)"
+                + f"; retry without --view: shot --target {shlex.quote(target.label)} --mode pose "
+                + "--focus 0,0,0 --radius 6 (set the focus and radius for your scene), "
+                + "or fit a parent target that has geometry"
+                + session.brp.target_evidence.parent_fit_hint(target.entity)
             )
         session.fit(target.entity, shot, shot.margin)
         settled = session.settle(probed.state, extra)
@@ -892,7 +984,7 @@ def tool_rows(session: Session) -> list[ToolRow]:
         registered = cast(list[str], session.brp.call("world.list_components"))
         session.tool_types = [path for path in registered if path.startswith(TOOL_PREFIX)]
     rows = session.brp.query({
-        "data": {"option": session.tool_types, "has": [AABB]},
+        "data": {"option": [*session.tool_types, NAME, CHILD_OF], "has": [AABB]},
         "filter": {"with": [SWITCH_SLIDER]},
     })
     tools: list[ToolRow] = []
@@ -901,6 +993,7 @@ def tool_rows(session: Session) -> list[ToolRow]:
             if path.startswith(TOOL_PREFIX):
                 tool = cast(ToolValue, value)
                 tools.append(ToolRow(row["entity"], tool_kind(path), tool["id"], tool["definition"], row.get("has", {}).get(AABB, False)))
+                _ = session.brp.target_evidence.names.setdefault(row["entity"], f"{tool_kind(path)} ({tool['definition']})")
     tools.sort(key=lambda tool: tool.tool_id)
     return tools
 
@@ -908,6 +1001,8 @@ def tool_rows(session: Session) -> list[ToolRow]:
 def resolve(session: Session, text: str) -> list[Target]:
     """Every entity the selector names right now; ids change on every launch."""
     selector = parse_selector(text)
+    evidence = session.brp.target_evidence
+    evidence.selector_candidates = []
     if selector.kind == "entity":
         entity = int(selector.value)
         try:
@@ -916,7 +1011,8 @@ def resolve(session: Session, text: str) -> list[Target]:
             return []
         return [Target(entity, text, AABB in present)]
     if selector.kind == "name":
-        rows = session.brp.query({"data": {"components": [NAME], "has": [AABB]}})
+        rows = session.brp.query({"data": {"components": [NAME], "option": [CHILD_OF], "has": [AABB]}})
+        evidence.selector_candidates = [cast(str, row["components"][NAME]) for row in rows]
         return [
             Target(row["entity"], text, row.get("has", {}).get(AABB, False))
             for row in rows
@@ -924,13 +1020,18 @@ def resolve(session: Session, text: str) -> list[Target]:
         ]
     if selector.kind == "marker":
         try:
-            rows = session.brp.query({"data": {"has": [AABB]}, "filter": {"with": [selector.value]}})
+            rows = session.brp.query({
+                "data": {"option": [NAME, CHILD_OF], "has": [AABB]},
+                "filter": {"with": [selector.value]},
+            })
         except BrpCallError as exc:
             raise Failure(f"marker {selector.value} is not a registered component: {exc.message}") from exc
         return [Target(row["entity"], text, row.get("has", {}).get(AABB, False)) for row in rows]
     wanted = selector.value.lower()
+    tools = tool_rows(session)
+    evidence.selector_candidates = sorted({tool.kind for tool in tools})
     matches = [
-        tool for tool in tool_rows(session)
+        tool for tool in tools
         if tool.kind.lower() == wanted or tool.definition.lower() == wanted
     ]
     if selector.ordinal is not None:
@@ -947,8 +1048,21 @@ def resolve_one(session: Session, shot: Shot) -> Target | None:
     if not targets and shot.setup is not None:
         targets = run_setup(session, shot)
     if len(targets) != 1:
-        found = ", ".join(str(target.entity) for target in targets) or "nothing"
-        raise Failure(f"{shot.target} must name exactly one entity; found {found}")
+        evidence = session.brp.target_evidence
+        found = ", ".join(
+            f"entity:{target.entity} ({evidence.names.get(target.entity, 'unnamed')})" for target in targets
+        ) or "nothing"
+        hint = ""
+        if not targets:
+            selector = parse_selector(shot.target)
+            if selector.kind == "entity":
+                hint = "; entity ids change when Hana restarts; select by name:, tool: or marker: instead"
+            elif selector.kind in ("name", "tool"):
+                candidates = {candidate.lower(): candidate for candidate in evidence.selector_candidates}
+                closest = get_close_matches(selector.value.lower(), sorted(candidates), n=5)
+                if closest:
+                    hint = "; closest: " + ", ".join(f"{selector.kind}:{candidates[name]}" for name in closest)
+        raise Failure(f"{shot.target} must name exactly one entity; found {found}{hint}")
     return targets[0]
 
 
@@ -1031,6 +1145,41 @@ def affine_point(matrix: list[float], point: Vec3) -> Vec3:
         matrix[1] * x + matrix[4] * y + matrix[7] * z + matrix[10],
         matrix[2] * x + matrix[5] * y + matrix[8] * z + matrix[11],
     )
+
+
+def face_angles(matrix: list[float], axis: str) -> tuple[float, float]:
+    """Orbit yaw/pitch for the camera offset along a target-local axis."""
+    if axis not in FACES:
+        raise Refused(f"--face {axis!r} is invalid; choose one of {', '.join(FACES)}")
+    if len(matrix) != 12 or not all(math.isfinite(value) for value in matrix):
+        raise Refused("--face needs a finite GlobalTransform; choose another --target or drop --face and use --yaw/--pitch")
+    offset = "xyz".index(axis[1]) * 3
+    sign = -1.0 if axis[0] == "-" else 1.0
+    direction = [sign * value for value in matrix[offset:offset + 3]]
+    length = math.hypot(*direction)
+    if length == 0.0:
+        raise Refused(f"--face {axis} has a zero-length axis; choose another --face or use --yaw/--pitch")
+    x, y, z = (value / length for value in direction)
+    if abs(y) >= math.cos(math.radians(1.0)):
+        pitch = "1.55" if y > 0 else "-1.55"
+        raise Refused(
+            f"--face {axis} is within 1 degree of vertical: yaw is undefined and Hana's orbit pitch clamp prevents reaching it; "
+            + f"drop --face and use --mode pose --yaw 0 --pitch {pitch} with --focus x,y,z --radius R to come close"
+        )
+    return math.atan2(x, z), math.asin(max(-1.0, min(1.0, y)))
+
+
+def resolve_face(session: Session, shot: Shot, target: Target | None) -> Shot:
+    if not isinstance(shot.orientation, (TargetFace, ResolvedTargetFace)):
+        return shot
+    assert target is not None
+    components = session.brp.components(target.entity, [GLOBAL_TRANSFORM])
+    matrix = cast(list[float], components[GLOBAL_TRANSFORM])
+    yaw, pitch = face_angles(matrix, shot.orientation.axis)
+    focus = shot.focus
+    if shot.mode == "pose" and focus is None:
+        focus = affine_point(matrix, (0.0, 0.0, 0.0))
+    return replace(shot, orientation=ResolvedTargetFace(shot.orientation.axis, yaw, pitch), focus=focus)
 
 
 def inverse_affine_point(matrix: list[float], point: Vec3) -> Vec3:
@@ -1242,6 +1391,7 @@ def take(session: Session, shot: Shot, final: Path) -> Result:
     target_future = POOL.submit(resolve_one, session, shot)
     before = session.read_camera()
     target = target_future.result()
+    shot = resolve_face(session, shot, target)
     phases["resolve_ms"] = elapsed_ms(start)
 
     move_key = (shot.mode, target.entity if target else None, shot.yaw, shot.pitch, shot.margin, shot.focus, shot.radius)
@@ -1476,6 +1626,8 @@ def timing_record(
         "height": result.height,
         "bytes": result.size_bytes,
     }
+    if isinstance(result.shot.orientation, (TargetFace, ResolvedTargetFace)):
+        record["face"] = result.shot.orientation.axis
     return record
 
 
@@ -1517,15 +1669,18 @@ def failure_reason(exc: Refused | Failure | CaptureTimeout) -> FailureReason:
     return FailureReason.SHOT_FAILED
 
 
-def failed_attempt(shot: Shot, path: Path, reason: FailureReason, started_ns: int) -> FailedAttempt:
+def failed_attempt(shot: Shot, path: Path, reason: FailureReason, started_ns: int, error: str) -> FailedAttempt:
     try:
         image_paths = [str(path)] if path.is_file() and path.stat().st_mtime_ns >= started_ns else []
     except OSError:
         image_paths = []
-    return {
+    attempt: FailedAttempt = {
         "status": "failure", "label": shot.label, "view": shot.view,
-        "image_paths": image_paths, "failure_reason": reason,
+        "image_paths": image_paths, "failure_reason": reason, "error": error,
     }
+    if isinstance(shot.orientation, (TargetFace, ResolvedTargetFace)):
+        attempt["face"] = shot.orientation.axis
+    return attempt
 
 
 def append_invocation(invocation: InProgressCaptureInvocation, port: int, remote: str | None, exit_code: int) -> None:
@@ -1542,9 +1697,12 @@ def append_invocation(invocation: InProgressCaptureInvocation, port: int, remote
         "host": socket.gethostname() if remote is None else remote.rsplit("@", 1)[-1],
         "port": port, "status": "failure", "exit_code": exit_code,
         "invocation_kind": invocation.kind,
-        "failure_reason": invocation.failures[0] if invocation.failures else FailureReason.SHOT_FAILED,
+        "failure_reason": invocation.failures[0].reason if invocation.failures else FailureReason.SHOT_FAILED,
+        "error": "\n".join(failure.error for failure in invocation.failures) or f"shot failed with exit code {exit_code}",
         "session": session_evidence(), "attempts": invocation.attempts,
     }
+    if isinstance(invocation.orientation, (TargetFace, ResolvedTargetFace)):
+        failure["face"] = invocation.orientation.axis
     append_timing(failure)
 
 
@@ -1600,9 +1758,14 @@ def load_views(path: Path) -> dict[str, ViewValue]:
     return views
 
 
+def view_name_refusal(name: str) -> Refused:
+    example = re.sub(r"[^a-z0-9-]+", "-", name.lower()).strip("-")[:64] or "view"
+    return Refused(f"view name {name!r} must be lowercase letters, digits and hyphens; use {example!r}, for example")
+
+
 def validate_view(name: str, value: object) -> ViewValue:
     if VIEW_NAME.fullmatch(name) is None:
-        raise Refused(f"view name {name!r} must be lowercase letters, digits and hyphens")
+        raise view_name_refusal(name)
     if not isinstance(value, dict):
         raise Refused(f"view {name} must be a table")
     table = cast(dict[str, object], value)
@@ -1614,7 +1777,7 @@ def validate_view(name: str, value: object) -> ViewValue:
         if key in table and (not isinstance(table[key], kind) or isinstance(table[key], bool)):
             raise Refused(f"view {name}: {key} has the wrong type")
 
-    for key in ("target", "mode", "crop", "window", "setup", "note"):
+    for key in ("target", "mode", "face", "crop", "window", "setup", "note"):
         expect(key, str)
     for key in ("yaw", "pitch", "margin", "radius"):
         expect(key, (int, float))
@@ -1642,6 +1805,19 @@ def number(value: float | int | None, fallback: float) -> float:
     return fallback if value is None else float(value)
 
 
+def request_orientation(face: str | None, yaw: float | None, pitch: float | None) -> DefaultAngles | ExplicitAngles | TargetFace:
+    """Convert optional parser/TOML values into the requested orientation's meaning."""
+    if face is not None:
+        if face not in FACES:
+            raise Refused(f"--face {face!r} is invalid; choose one of {', '.join(FACES)}")
+        if yaw is not None or pitch is not None:
+            raise Refused("--face conflicts with explicit --yaw or --pitch (view keys yaw/pitch); drop --face or drop both angle options")
+        return TargetFace(face)
+    if yaw is not None or pitch is not None:
+        return ExplicitAngles(number(yaw, 0.0), number(pitch, 0.0))
+    return DefaultAngles()
+
+
 def shot_from_view(name: str, view: ViewValue) -> Shot:
     focus_values = view.get("focus")
     shot = Shot(
@@ -1649,8 +1825,7 @@ def shot_from_view(name: str, view: ViewValue) -> Shot:
         view=name,
         target=view.get("target"),
         mode=view.get("mode", "fit"),
-        yaw=number(view.get("yaw"), 0.0),
-        pitch=number(view.get("pitch"), 0.0),
+        orientation=request_orientation(view.get("face"), view.get("yaw"), view.get("pitch")),
         margin=number(view.get("margin"), 0.1),
         focus=None if focus_values is None else (float(focus_values[0]), float(focus_values[1]), float(focus_values[2])),
         radius=view.get("radius"),
@@ -1670,14 +1845,23 @@ def validate_shot(shot: Shot) -> None:
         raise Refused(f"{where}: mode must be one of {', '.join(MODES)}, got {shot.mode!r}")
     if shot.crop not in CROPS:
         raise Refused(f"{where}: crop must be entity or none, got {shot.crop!r}")
+    face = isinstance(shot.orientation, (TargetFace, ResolvedTargetFace))
+    if face and shot.target is None:
+        raise Refused(f"{where}: --face needs a target; add --target name:<Name> or --target tool:<Kind>")
+    if face and shot.mode not in ("fit", "pose"):
+        raise Refused(f"{where}: --face requires angles; use --mode fit or --mode pose instead of {shot.mode}")
     if shot.mode in ("fit", "hana-frame") and shot.target is None:
         raise Refused(f"{where}: {shot.mode} needs a target")
-    if shot.mode == "pose" and (shot.focus is None or shot.radius is None):
-        raise Refused(f"{where}: pose needs focus and radius")
+    if shot.mode == "pose" and ((shot.focus is None and not face) or shot.radius is None):
+        missing = (["--focus"] if shot.focus is None and not face else []) + (["--radius"] if shot.radius is None else [])
+        raise Refused(f"{where}: pose needs {' and '.join(missing)}; example: --mode pose --focus 0,0,0 --radius 6")
     if shot.crop == "entity" and shot.target is None:
         raise Refused(f"{where}: crop entity needs a target")
     if not 0.0 <= shot.margin <= MAX_MARGIN:
-        raise Refused(f"{where}: margin must be 0 to {MAX_MARGIN}")
+        raise Refused(
+            f"{where}: --margin must be 0 to {MAX_MARGIN}; "
+            + "fraction of the viewport kept clear on each side (0.1 = 10%)"
+        )
     if shot.padding < 0 or shot.settle < 0:
         raise Refused(f"{where}: padding and settle cannot be negative")
     if shot.target is not None:
@@ -1903,6 +2087,7 @@ class Arguments(argparse.Namespace):
     view: list[str] | None = None
     target: str | None = None
     mode: str | None = None
+    face: str | None = None
     yaw: float | None = None
     pitch: float | None = None
     margin: float | None = None
@@ -1947,8 +2132,7 @@ def shot_from_arguments(args: Arguments) -> Shot:
         view=None,
         target=target,
         mode=mode,
-        yaw=args.yaw if args.yaw is not None else 0.0,
-        pitch=args.pitch if args.pitch is not None else 0.0,
+        orientation=request_orientation(args.face, args.yaw, args.pitch),
         margin=args.margin if args.margin is not None else 0.1,
         focus=parse_focus(args.focus) if args.focus else None,
         radius=args.radius,
@@ -1964,10 +2148,19 @@ def shot_from_arguments(args: Arguments) -> Shot:
 
 def with_overrides(shot: Shot, args: Arguments) -> Shot:
     """Apply run-wide flags that also make sense on a stored view."""
+    if args.face is not None:
+        if isinstance(shot.orientation, ExplicitAngles):
+            raise Refused("--face conflicts with explicit view yaw/pitch; drop --face or remove the view's yaw/pitch keys")
+        shot = replace(shot, orientation=request_orientation(args.face, args.yaw, args.pitch))
+    elif isinstance(shot.orientation, (TargetFace, ResolvedTargetFace)) and (args.yaw is not None or args.pitch is not None):
+        _ = request_orientation(shot.orientation.axis, args.yaw, args.pitch)
+    if isinstance(shot.orientation, (TargetFace, ResolvedTargetFace)) and shot.mode == "pose" and args.focus is not None:
+        shot = replace(shot, focus=parse_focus(args.focus))
     if args.window is not None:
         shot = replace(shot, window=args.window)
     if args.settle is not None:
         shot = replace(shot, settle=args.settle)
+    validate_shot(shot)
     return shot
 
 
@@ -1980,13 +2173,14 @@ def run_shots(
         sha = git_sha(Path.cwd())
         results: list[Result] = []
         for shot, path in zip(shots, output_paths(out, [shot.label for shot in shots]), strict=True):
+            invocation.orientation = shot.orientation
             started_ns = time.time_ns()
             try:
                 result = take(session, shot, path)
             except (Refused, Failure, CaptureTimeout) as exc:
                 reason = failure_reason(exc)
-                invocation.attempts.append(failed_attempt(shot, path, reason, started_ns))
-                invocation.failures.append(reason)
+                invocation.attempts.append(failed_attempt(shot, path, reason, started_ns, str(exc)))
+                invocation.failures.append(CaptureFailure(reason, str(exc)))
                 raise
             window = session.last_state.size if session.last_state else (0, 0)
             timing = timing_record(result, brp.port, sha, session.frame_ms, window, remote)
@@ -2014,6 +2208,7 @@ def command_shot(args: Arguments, invocation: InProgressCaptureInvocation) -> in
             raise Refused(f"no views to shoot in {path}")
     else:
         shots = [shot_from_arguments(args)]
+    invocation.orientation = shots[0].orientation
     with instance(args.port, args.launch, args.shutdown, args.worktree, args.binary) as brp:
         _ = run_shots(brp, shots, args.out, args.remote, report, invocation)
     return 0
@@ -2155,9 +2350,11 @@ def command_views(args: Arguments, invocation: InProgressCaptureInvocation | Non
 
 
 def views_add(args: Arguments, path: Path) -> int:
+    if args.from_current and args.face is not None:
+        raise Refused("--face conflicts with --from-current camera angles; drop --from-current to store --face or drop --face")
     name = args.name or ""
     if VIEW_NAME.fullmatch(name) is None:
-        raise Refused(f"view name {name!r} must be lowercase letters, digits and hyphens")
+        raise view_name_refusal(name)
     views = load_views(path) if path.exists() else {}
     if name in views and not args.replace:
         raise Refused(f"view {name} exists; pass --replace to overwrite it")
@@ -2173,13 +2370,17 @@ def views_add(args: Arguments, path: Path) -> int:
     else:
         assert shot is not None
         if mode in ("fit", "pose"):
-            view["yaw"] = shot.yaw
-            view["pitch"] = shot.pitch
+            if isinstance(shot.orientation, TargetFace):
+                view["face"] = shot.orientation.axis
+            else:
+                view["yaw"] = shot.yaw
+                view["pitch"] = shot.pitch
         if mode == "fit":
             view["margin"] = shot.margin
         if mode == "pose":
-            assert shot.focus is not None and shot.radius is not None
-            view["focus"] = list(shot.focus)
+            assert shot.radius is not None
+            if shot.focus is not None:
+                view["focus"] = list(shot.focus)
             view["radius"] = shot.radius
     view["crop"] = args.crop or "none"
     if args.padding:
@@ -2212,7 +2413,7 @@ def from_current(session: Session, args: Arguments, mode: str) -> ViewValue:
         raise Refused("--from-current takes --mode pose, or a fit view with --target")
     target = resolve_one(session, Shot(label="add", view=None, target=args.target, mode="fit"))
     assert target is not None
-    shot = Shot(label="add", view=None, target=args.target, mode="fit", yaw=pose.yaw, pitch=pose.pitch)
+    shot = Shot(label="add", view=None, target=args.target, mode="fit", orientation=ExplicitAngles(pose.yaw, pose.pitch))
 
     def radius_at(margin: float, before: CameraState) -> tuple[float, CameraState]:
         session.fit(target.entity, shot, margin)
@@ -2251,6 +2452,7 @@ def views_check(args: Arguments, path: Path, invocation: InProgressCaptureInvoca
     missing = [name for name in names if name not in views]
     if missing:
         raise Refused(f"no view named {', '.join(missing)} in {path}")
+    invocation.orientation = with_overrides(shot_from_view(names[0], views[names[0]]), args).orientation
     out = args.out or tempfile.mkdtemp(prefix="hana-shot-check-")
     failures: list[str] = []
     passed: list[str] = []
@@ -2263,13 +2465,14 @@ def views_check(args: Arguments, path: Path, invocation: InProgressCaptureInvoca
         today = datetime.now().strftime("%Y-%m-%d")
         for name, final in zip(names, output_paths(out, names), strict=True):
             shot = with_overrides(shot_from_view(name, views[name]), args)
+            invocation.orientation = shot.orientation
             started_ns = time.time_ns()
             try:
                 result = take(session, shot, final)
-            except (Failure, CaptureTimeout) as exc:
+            except (Refused, Failure, CaptureTimeout) as exc:
                 reason = failure_reason(exc)
-                invocation.attempts.append(failed_attempt(shot, final, reason, started_ns))
-                invocation.failures.append(reason)
+                invocation.attempts.append(failed_attempt(shot, final, reason, started_ns, str(exc)))
+                invocation.failures.append(CaptureFailure(reason, f"{name}: {exc}"))
                 failures.append(f"FAIL {name}: {exc}")
                 print(failures[-1], file=sys.stderr)
                 continue
@@ -2278,21 +2481,23 @@ def views_check(args: Arguments, path: Path, invocation: InProgressCaptureInvoca
                 peak = brightest(result.path)
             except Failure as exc:
                 reason = failure_reason(exc)
-                invocation.attempts.append(failed_attempt(shot, result.path, reason, started_ns))
-                invocation.failures.append(reason)
+                invocation.attempts.append(failed_attempt(shot, result.path, reason, started_ns, str(exc)))
+                invocation.failures.append(CaptureFailure(reason, f"{name}: {exc}"))
                 failures.append(f"FAIL {name}: {exc}")
                 print(failures[-1], file=sys.stderr)
                 continue
             if peak < BLACK_MAXIMUM:
-                invocation.attempts.append(failed_attempt(shot, result.path, FailureReason.BLACK_CAPTURE, started_ns))
-                invocation.failures.append(FailureReason.BLACK_CAPTURE)
-                failures.append(f"FAIL {name}: the shot is black (brightest {peak:.3f}) at {result.path}")
+                error = f"the shot is black (brightest {peak:.3f}) at {result.path}"
+                invocation.attempts.append(failed_attempt(shot, result.path, FailureReason.BLACK_CAPTURE, started_ns, error))
+                invocation.failures.append(CaptureFailure(FailureReason.BLACK_CAPTURE, f"{name}: {error}"))
+                failures.append(f"FAIL {name}: {error}")
                 print(failures[-1], file=sys.stderr)
                 continue
             if result.width < 2 or result.height < 2:
-                invocation.attempts.append(failed_attempt(shot, result.path, FailureReason.EMPTY_CROP, started_ns))
-                invocation.failures.append(FailureReason.EMPTY_CROP)
-                failures.append(f"FAIL {name}: the crop is empty ({result.width}x{result.height})")
+                error = f"the crop is empty ({result.width}x{result.height})"
+                invocation.attempts.append(failed_attempt(shot, result.path, FailureReason.EMPTY_CROP, started_ns, error))
+                invocation.failures.append(CaptureFailure(FailureReason.EMPTY_CROP, f"{name}: {error}"))
+                failures.append(f"FAIL {name}: {error}")
                 print(failures[-1], file=sys.stderr)
                 continue
             timing = timing_record(result, brp.port, sha, session.frame_ms, window, args.remote)
@@ -2325,9 +2530,10 @@ def command_shutdown(args: Arguments) -> int:
 def add_shot_flags(parser: argparse.ArgumentParser) -> None:
     _ = parser.add_argument("--target", help="selector: name:<Name>, marker:<type path>, tool:<Kind>[#n], entity:<id>")
     _ = parser.add_argument("--mode", choices=MODES)
+    _ = parser.add_argument("--face", choices=FACES, help="target-local side to face in fit or pose; replaces --yaw/--pitch")
     _ = parser.add_argument("--yaw", type=float)
     _ = parser.add_argument("--pitch", type=float)
-    _ = parser.add_argument("--margin", type=float)
+    _ = parser.add_argument("--margin", type=float, help="0 to 0.45; fraction of the viewport reserved on each side of a fit (0.1 = 10%%)")
     _ = parser.add_argument("--focus", help="x,y,z (pose mode)")
     _ = parser.add_argument("--radius", type=float)
     _ = parser.add_argument("--crop", choices=CROPS)
@@ -2352,8 +2558,24 @@ def add_run_flags(parser: argparse.ArgumentParser, port_required: bool = True) -
     _ = parser.add_argument("--binary")
 
 
+class ArgumentExit(SystemExit):
+    """A parser exit retaining its diagnostic for the invocation record."""
+
+    def __init__(self, status: int, error: str) -> None:
+        super().__init__(status)
+        self.error: str = error
+
+
+class RequestArgumentParser(argparse.ArgumentParser):
+    @override
+    def exit(self, status: int = 0, message: str | None = None) -> NoReturn:
+        if message:
+            _ = sys.stderr.write(message)
+        raise ArgumentExit(status, message.strip() if message else "")
+
+
 def arguments(argv: list[str]) -> Arguments:
-    parser = argparse.ArgumentParser(description=__doc__)
+    parser = RequestArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
 
     shot = commands.add_parser("shot", help="frame and capture one or more views")
@@ -2392,7 +2614,17 @@ def arguments(argv: list[str]) -> Arguments:
     shutdown_parser = commands.add_parser("shutdown", help="stop a launched Hana and remove its scratch")
     _ = shutdown_parser.add_argument("--port", type=int, required=True)
 
-    return parser.parse_args(argv, namespace=Arguments())
+    # argparse otherwise mistakes the -x/-y/-z values for option names.
+    normalized: list[str] = []
+    index = 0
+    while index < len(argv):
+        if argv[index] == "--face" and index + 1 < len(argv) and argv[index + 1] in FACES:
+            normalized.append(f"--face={argv[index + 1]}")
+            index += 2
+        else:
+            normalized.append(argv[index])
+            index += 1
+    return parser.parse_args(normalized, namespace=Arguments())
 
 
 def exit_for_signal(number: int, _frame: FrameType | None) -> None:
@@ -2414,7 +2646,10 @@ def main(argv: list[str]) -> int:
                     except ValueError:
                         pass
             kind: Literal["shot", "views_check"] = "shot" if argv[:1] == ["shot"] else "views_check"
-            write_invocation(InProgressCaptureInvocation(kind=kind, failures=[FailureReason.INVALID_REQUEST]), port, None, code)
+            error = exc.error if isinstance(exc, ArgumentExit) else "arguments refused"
+            write_invocation(InProgressCaptureInvocation(
+                kind=kind, failures=[CaptureFailure(FailureReason.INVALID_REQUEST, error)],
+            ), port, None, code)
         return code
     handlers: dict[str, Callable[[Arguments], int]] = {
         "pose": command_pose,
@@ -2425,6 +2660,8 @@ def main(argv: list[str]) -> int:
     }
     invocation = (InProgressCaptureInvocation(kind="shot" if args.command == "shot" else "views_check")
                   if args.command == "shot" or args.command == "views" and args.action == "check" else None)
+    if invocation is not None and args.face is not None:
+        invocation.orientation = TargetFace(args.face)
     EXIT_SIGNAL_LATCH.reset()
     _ = signal.signal(signal.SIGINT, exit_for_signal)
     _ = signal.signal(signal.SIGTERM, exit_for_signal)
@@ -2447,19 +2684,27 @@ def main(argv: list[str]) -> int:
         print(f"hana_shot: refused: {exc}", file=sys.stderr)
         exit_code = 2
         if invocation is not None and not invocation.failures:
-            invocation.failures.append(failure_reason(exc))
+            invocation.failures.append(CaptureFailure(failure_reason(exc), str(exc)))
     except CaptureTimeout as exc:
         print(f"hana_shot: {exc}", file=sys.stderr)
         exit_code = 3
         if invocation is not None and not invocation.failures:
-            invocation.failures.append(failure_reason(exc))
+            invocation.failures.append(CaptureFailure(failure_reason(exc), str(exc)))
     except Failure as exc:
         print(f"hana_shot: {exc}", file=sys.stderr)
         exit_code = 1
         if invocation is not None and not invocation.failures:
-            invocation.failures.append(failure_reason(exc))
+            invocation.failures.append(CaptureFailure(failure_reason(exc), str(exc)))
     except ExitSignal as exc:
         exit_code = 128 + exc.number
+        error = f"terminated by {signal.Signals(exc.number).name}"
+        print(f"hana_shot: {error}", file=sys.stderr)
+        if invocation is not None:
+            invocation.failures.append(CaptureFailure(FailureReason.SHOT_FAILED, error))
+    except Exception as exc:
+        if invocation is not None:
+            invocation.failures.append(CaptureFailure(FailureReason.SHOT_FAILED, f"{type(exc).__name__}: {exc}"))
+        raise
     finally:
         if invocation is not None:
             write_invocation(invocation, args.port, args.remote, exit_code)

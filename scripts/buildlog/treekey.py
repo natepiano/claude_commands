@@ -91,8 +91,11 @@ def tree_key(directory: str) -> str | None:
     top, tree = lines
     key = hashlib.sha256(tree + b"\n")
     # Each entry is "XY PATH"; a path both staged and untracked (git rm --cached) comes twice.
-    for path in sorted({entry[3:] for entry in status.split(b"\0") if len(entry) > 3}):
-        key.update(path + b"\0" + content(os.path.join(top, path)))
+    try:
+        for path in sorted({entry[3:] for entry in status.split(b"\0") if len(entry) > 3}):
+            key.update(path + b"\0" + content(os.path.join(top, path)))
+    except OSError:
+        return None
     return key.hexdigest()
 
 
