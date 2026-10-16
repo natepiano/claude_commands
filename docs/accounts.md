@@ -127,7 +127,7 @@ On Linux, in a terminal after its legacy sessions have stopped:
 ~/.claude/scripts/lib/py ~/.claude/scripts/accounts/accounts.py cutover-home claude2
 ```
 
-On Linux this moves the login into `~/.claude2` by rename, refuses an occupied destination and live legacy sessions, and journals the operation before moving identity files. Rerun after an interruption to finish. `cutover-home --undo` reverses it after sessions on the destination stop. No live cutover is part of installing this code. natedev cut over on 2026-10-15: there `~/.claude` holds no login and claude2's login lives in `~/.claude2`. The Mac keeps its current home-login attribution until its own cutover.
+On Linux this moves the login into `~/.claude2` by rename, refuses an occupied destination and live legacy sessions, and journals the operation before moving identity files. Rerun after an interruption to finish. `cutover-home --undo` reverses it after sessions on the destination stop. No live cutover is part of installing this code. natedev cut over on 2026-10-15 and the Mac on 2026-10-16: on both machines `~/.claude` holds no login and claude2's login lives in `~/.claude2`.
 
 For the Mac's separate step, the director first prepares `~/.claude2` and arranges for legacy sessions to stop. The user launches that numbered account and runs `/login` once inside it:
 
@@ -135,7 +135,7 @@ For the Mac's separate step, the director first prepares `~/.claude2` and arrang
 ~/.claude/scripts/lib/py ~/.claude/scripts/accounts/accounts.py exec claude2
 ```
 
-After the new login is checked, exit that session and run:
+After the new login is checked, exit that session and run this in a Terminal on the Mac. An ssh session cannot see the login keychain:
 
 ```sh
 ~/.claude/scripts/lib/py ~/.claude/scripts/accounts/accounts.py cutover-home claude2
