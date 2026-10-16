@@ -56,32 +56,22 @@ Add-on, 2026-10-16 (the showrunner, approved by the user): an accounts view in t
 ### Phase 1 — Every stated ETA is recorded  · status: done
 **Depends on:** none
 
-#### Work Order
+#### As-built
 
-**Goal:** every ETA a unit director states — in a checkpoint notice, an `/unit:eta` answer or any message — is an `eta_stated` event for the phase it names, including a phase that has not started yet.
-
-**Spec:**
-- `progress_history.py eta` gains `--phase-id <id>`. Every `eta_stated` event gains `eta_phase_id`: the given id, else the active phase's id. With no active phase and no `--phase-id`, keep today's refusal.
-- An ETA for a phase other than the active one (the checkpoint notice's `Phase <next> ETA`, sent after the code commit and before the next `start-phase`) is recorded with that phase id. The event still carries the common `_event` fields; the phase fields describe the active phase if any, so readers use `eta_phase_id`, never `phase_id`, to place an ETA.
-- A past `--time` is still refused. `basis` values used by callers: `checkpoint` (the notice), `eta-command` (`/unit:eta`), `stated` (any other message).
-- `phase_table._newest_open_instance` and `_latest_stated_eta` select `eta_stated` events by `eta_phase_id` (falling back to `phase_id` for events written before this phase, which lack `eta_phase_id`). An event recorded before its phase started applies to that phase's instance once it starts.
-- `docs/production_format.md` item 3 and `docs/delegate/phase_end.md` step 2: before sending the checkpoint notice, run `~/.claude/scripts/lib/py ~/.claude/scripts/delegate/progress_history.py eta --session-dir <SESSION_DIR> --phase-id <next> --time <HH:MM> --basis checkpoint`; the notice's ETA is the recorded one.
-- `commands/unit/direct.md` `<ProgressContract>` (586–622): one rule — every ETA the unit director states anywhere (a message to the showrunner, a reply, a notice) is recorded first with `progress_history.py eta` (`--phase-id` when it names a phase other than the active one), and states the time the recorder printed.
-- `commands/unit/eta.md` and `commands/unit/eta_breakdown.md`: pass `--basis eta-command`.
+- `progress_history.py eta` takes `--phase-id <id>`; every `eta_stated` event carries `eta_phase_id` — the given id, else the active phase's id. No active phase and no `--phase-id` refuses.
+- `--time`, `--earliest` and `--latest` take `HH:MM` (today, user zone) or `YYYY-MM-DDTHH:MM`; past times are refused. `basis` values: `checkpoint` (the checkpoint notice), `eta-command` (`/unit:eta`, `/unit:eta_breakdown`), `stated` (any other message).
+- `phase_table._instance_eta_events(runs, instance)` selects an instance's `eta_stated` events by `eta_phase_id` (falling back to `phase_id` for older events) within the same run, after the previous start or finish of that phase id and before the next start of it, so an ETA recorded before its phase starts counts for that phase. `_latest_stated_eta(runs, instance)` builds on it.
+- `commands/unit/direct.md` `<ProgressContract>` records every ETA the unit director states before stating it (`--phase-id` for a phase other than the active one) and states the recorder's printed time. `docs/delegate/phase_end.md` step 2 and `docs/production_format.md` item 3 record the next-phase ETA with `--basis checkpoint` before the notice. `commands/unit/eta.md` and `commands/unit/eta_breakdown.md` use `--basis eta-command`; `eta_breakdown` records on every answer.
 
 **Files:**
-- `scripts/delegate/progress_history.py` — `--phase-id` on `eta`; `eta_phase_id` on `eta_stated`.
-- `scripts/delegate/phase_table.py` — select stated ETAs by `eta_phase_id`.
-- `scripts/delegate/test_progress_history.py`, `scripts/delegate/test_phase_table.py` — cases below.
+- `scripts/delegate/progress_history.py` — `eta` subcommand with `--phase-id` and `eta_phase_id`; short-time expansion in `_local_eta_epoch`.
+- `scripts/delegate/phase_table.py` — `_instance_eta_events`, `_latest_stated_eta`.
+- `scripts/delegate/test_progress_history.py`, `scripts/delegate/test_phase_table.py` — target, default, refusal, pre-start, legacy and short-time cases.
 - `docs/production_format.md`, `docs/delegate/phase_end.md`, `commands/unit/direct.md`, `commands/unit/eta.md`, `commands/unit/eta_breakdown.md` — the recording rule.
 
-**Workers:** 1 writer + 1 tester
-- `impl` — every file above except the two tests; hub: `scripts/delegate/progress_history.py` (the event shape both tests read).
-- `test` — in `test_progress_history.py`: `eta --phase-id 3` with phase 2 active writes `eta_phase_id: "3"`; no active phase and no `--phase-id` refuses; `eta_phase_id` defaults to the active phase. In `test_phase_table.py`: an ETA recorded for phase 3 before `start-phase 3` is phase 3's ETA once it starts and is not phase 2's; an old event with only `phase_id` still counts. Use `recorder_fixture.invoke_recorder` and the env overrides `PLAN_DELEGATE_HISTORY_DIR`, `PLAN_DELEGATE_NOW_EPOCH`, `PHASE_TABLE_VAULT`, `PLAN_DELEGATE_SYNC_WRITES=0`, `USER_ZONE=UTC` as the existing `setUp`s do.
+**Binds later work:** a phase record's `first_eta` and `eta_trail` come from `_instance_eta_events`, so a checkpoint-notice ETA counts as first; `moves` counts only time changes, since unchanged restatements are recorded too. Board display of `eta_phase_id` ETAs belongs to "Board data" and "The board mod".
 
-**Constraints from prior phases:** none.
-
-**Acceptance gate:** the Test and Lint lines of Delegation Context green; the new cases pass.
+**Gotchas:** readers place an ETA by `eta_phase_id`, never `phase_id` (which names the phase active when it was recorded). `HH:MM` means today only; a later-day ETA needs the full date.
 
 ### Phase 2 — Predictions chain from the stated ETA  · status: todo
 **Depends on:** 1
@@ -109,7 +99,7 @@ Add-on, 2026-10-16 (the showrunner, approved by the user): an accounts view in t
 - `impl` — `phase_table.py`, `progress_history.py`; hub: `scripts/delegate/phase_table.py` (the record type both tests read).
 - `test` — open phase with a stated ETA at 18:30 and two todo phases: predictions start at 18:30 plus gap; a passed stated ETA chains from now; a timed gate row moves the gated phase to its time and prints `gated until`; an untimed gate prints `gated by G<k>` for it and later phases, and the Project row reads `after G<k>`; a cleared gate is ignored; the Project ETA equals the last predicted finish (not percent arithmetic); the phase record's `moves`, `delta_minutes`, `fix_rounds` and `findings` from a scripted event stream.
 
-**Constraints from prior phases:** `eta_stated` carries `eta_phase_id` (Phase "Every stated ETA is recorded"); select by it, falling back to `phase_id`.
+**Constraints from prior phases:** `eta_stated` carries `eta_phase_id` (Phase "Every stated ETA is recorded"); select by it, falling back to `phase_id`. `phase_table._instance_eta_events(runs, instance)` already returns one phase instance's `eta_stated` events in order, including an ETA recorded before the phase started (same run, after the previous start or finish of that phase id); build `first_eta` and `eta_trail` on it so a checkpoint notice's ETA counts as first. Unchanged ETAs are re-recorded on every statement, so `moves` counts only events whose time differs from the one before. `eta --time` takes `HH:MM` (today in the user's zone) or `YYYY-MM-DDTHH:MM`.
 
 **Acceptance gate:** the Test and Lint lines of Delegation Context green; for mul_add's 2026-10-16 shape (Phase 5 stated 17:15 → 17:45 → 18:30) the vault note predicts Phase 6 after 18:30.
 
@@ -175,7 +165,14 @@ Add-on, 2026-10-16 (the showrunner, approved by the user): an accounts view in t
 - **Install.** The user runs once per machine: `/plugin marketplace add ~/.claude/mods` then `/plugin install unit-board` at user scope. The unit director adds that to the change review (`/change_review`) with the live check below; it never edits `settings.json`.
 - **Live check** (unit director): load with `command claude --plugin-dir <worktree>/mods/unit-board` in a throwaway tmux session on a private socket (`tmux -L unitboard`), at 170 columns: `/unit-board` from the trunk checkout draws A with real data, from this worktree draws B; close it and confirm with a fake source touch that no generator runs while closed. Capture both panes as text. The phone check (Remote Control, `/unit-board` from the phone) goes to the change review for the user.
 
-**Files:** `mods/unit-board/` — `.claude-plugin/plugin.json`, `hooks/hooks.json`, `hooks/register.tsx`, `hooks/data.ts`, `hooks/geometry.ts`, `hooks/board.tsx`, `hooks/unit.tsx`, `types/index.d.ts`, `tsconfig.json`, `tests/*.test.ts`; `mods/.claude-plugin/marketplace.json`.
+**Files:**
+- `mods/unit-board/.claude-plugin/plugin.json`, `mods/unit-board/hooks/hooks.json`, `mods/unit-board/tsconfig.json` — the plugin's manifest, module list and type-check config.
+- `mods/unit-board/hooks/register.tsx` — wiring only: commands, open/close, refresh.
+- `mods/unit-board/hooks/data.ts`, `mods/unit-board/hooks/geometry.ts` — load and refresh; strip, ruler and runs.
+- `mods/unit-board/hooks/board.tsx`, `mods/unit-board/hooks/unit.tsx` — views A and B.
+- `mods/unit-board/types/index.d.ts` — plugin state.
+- `mods/unit-board/tests/` — geometry and register tests.
+- `mods/.claude-plugin/marketplace.json` — the local folder marketplace.
 
 **Workers:** 1 writer + 1 tester
 - `impl` — every file except `tests/`; hub: `mods/unit-board/types/index.d.ts` (plugin state both sides use).
@@ -198,7 +195,10 @@ Add-on, 2026-10-16 (the showrunner, approved by the user): an accounts view in t
 - `commands/unit/report.md`: the report's sections become phase and stage, the ETA line, the worker table, the summary sentences, and one line naming `/unit-board` as the place to see the board.
 - The vault note keeps the full phase list.
 
-**Files:** `scripts/delegate/progress_history.py`, `scripts/delegate/test_progress_history.py`, `commands/unit/report.md`.
+**Files:**
+- `scripts/delegate/progress_history.py` — the ETA line and `progress --tables`.
+- `scripts/delegate/test_progress_history.py` — the line forms and the tables flag.
+- `commands/unit/report.md` — tables only on request; names `/unit-board`.
 
 **Workers:** 1 writer + 1 tester
 - `impl` — `progress_history.py`, `commands/unit/report.md`; hub: `scripts/delegate/progress_history.py`.
@@ -224,7 +224,11 @@ Add-on, 2026-10-16 (the showrunner, approved by the user): an accounts view in t
 - **Tests** (`tests/accounts.test.ts`): `/accounts-board` opens and draws a fixture with its login field; no `$.fs` call names a `.claude.json` or `auth.json` path; a changed `usage.json` mtime runs the stored read once and an unchanged one runs nothing; closed → nothing over a fake-clock minute; the command result holds no address.
 - **Live check:** in the throwaway session, `/accounts-board` draws the table; touching `usage.json` redraws within 10 s; closing stops every stat. Capture the pane to a scratchpad file and confirm it by headings and row count only, never pasting rows into a reply or message.
 
-**Files:** `mods/unit-board/hooks/accounts.tsx`, `hooks/register.tsx`, `types/accounts.d.ts`, `tests/accounts.test.ts`.
+**Files:**
+- `mods/unit-board/hooks/accounts.tsx` — the accounts view.
+- `mods/unit-board/hooks/register.tsx` — two wiring lines for `/accounts-board`.
+- `mods/unit-board/types/accounts.d.ts` — the stored-status JSON shape.
+- `mods/unit-board/tests/accounts.test.ts` — the view's tests.
 
 **Workers:** 1 writer + 1 tester
 - `impl` — `hooks/accounts.tsx`, `types/accounts.d.ts`; hub: `mods/unit-board/hooks/register.tsx` (two wiring lines).
