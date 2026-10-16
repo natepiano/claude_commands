@@ -261,6 +261,20 @@ class ShutdownLaunchCliTests(ShutdownTestCase):
             self.assertEqual(shutdown.main(["status", LABEL, "--here"]), 0)
         self.assertIn("crashed-name: unresolved; last seen 2026-10-09 17:49:10 EDT", output.getvalue())
 
+    def test_status_places_local_recovery_before_the_remote_machine_section(self) -> None:
+        _ = self.recovery("crashed")
+        local = inventory.Inventory(machine="natedev", login=LOGIN, label=LABEL, sessions=[], unattributed=[])
+        remote = inventory.Inventory(machine="Mac", login=LOGIN, label=LABEL, sessions=[], unattributed=[])
+        with (patch.object(shutdown, "_status", return_value=[local, remote]),
+              patch.object(shutdown, "_remote_shutdown_records", return_value=shutdown.AccountShutdownRecords(
+                  kind="records", records=[])),
+              redirect_stdout(io.StringIO()) as output):
+            self.assertEqual(shutdown.main(["status", LABEL]), 0)
+        text = output.getvalue()
+        self.assertLess(text.index("natedev"), text.index("crashed-name: unresolved"))
+        self.assertLess(text.index("crashed-name: unresolved"), text.index("Mac"))
+        self.assertEqual(text.count("crashed-name: unresolved"), 1)
+
     def test_json_status_keeps_recovery_last_seen_as_an_iso_timestamp(self) -> None:
         _ = self.recovery("crashed")
         report = inventory.Inventory(machine="natedev", login=LOGIN, label=LABEL, sessions=[], unattributed=[])

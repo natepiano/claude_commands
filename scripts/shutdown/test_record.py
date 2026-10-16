@@ -1509,10 +1509,54 @@ class RecoverySnapshotTests(ShutdownTestCase):
         self.assertEqual(persisted["workers"], saved["sessions"][0]["workers"])
         self.assertEqual(persisted["timers"], saved["sessions"][0]["timers"])
         self.assertEqual((persisted["requested_at"], persisted["request_id"], persisted["requested_by"]),
-                         (NOW, "recovery-" + NOW, {"kind": "snapshot", "taken_at": NOW}))
+                         (NOW, "recovery-" + NOW, {"kind": "snapshot", "taken_at": NOW, "recovery": {"kind": "not recorded"}}))
         self.assertEqual((persisted["hold"], persisted["then"], persisted["progress"], persisted["trail"], persisted["stop_issues"]),
                          ("session", "restart", {"kind": "already gone", "at": NOW}, [], []))
         self.assertIsNone(record.account_hold(saved["login"]))
+
+    def test_recovery_origin_round_trip_keeps_crash_signal_and_last_seen(self) -> None:
+        snapshot = self.snapshot(1)
+        item = snapshot["sessions"][0]
+        assert item["agent"] == "claude"
+        snapshot["taken_at"] = LATER
+        for signal in ("reboot", "host gone"):
+            with self.subTest(signal=signal):
+                item["crash"] = signal
+                saved = record.snapshot_restore_record(snapshot, item)
+                self.assertTrue(record.create_session(saved))
+                loaded = record.session_records(snapshot["login"])[0]
+                self.assertEqual(loaded["requested_by"], {
+                    "kind": "snapshot", "taken_at": LATER,
+                    "recovery": {"kind": signal, "last_seen": NOW},
+                })
+                path = self.directory / "sessions/session-1.json"
+                path.unlink()
+
+    def test_older_snapshot_origin_normalizes_missing_crash_evidence(self) -> None:
+        snapshot = self.snapshot(1)
+        item = snapshot["sessions"][0]
+        assert item["agent"] == "claude"
+        saved = record.snapshot_restore_record(snapshot, item)
+        wire = cast(dict[str, object], json.loads(json.dumps(saved)))
+        wire["requested_by"] = {"kind": "snapshot", "taken_at": NOW}
+        parsed = record.parse_session_records(json.dumps([wire]))[0]
+        self.assertEqual(parsed["requested_by"], {
+            "kind": "snapshot", "taken_at": NOW, "recovery": {"kind": "not recorded"},
+        })
+        self.assertEqual(record.parse_session_records(json.dumps([parsed]))[0], parsed)
+
+    def test_recovery_origin_refuses_invalid_crash_signal_or_last_seen(self) -> None:
+        snapshot = self.snapshot(1)
+        item = snapshot["sessions"][0]
+        assert item["agent"] == "claude"
+        wire = cast(dict[str, object], json.loads(json.dumps(record.snapshot_restore_record(snapshot, item))))
+        for context in ({"kind": "shutdown", "last_seen": NOW},
+                        {"kind": "reboot", "last_seen": "yesterday"},
+                        {"kind": "host gone"}):
+            with self.subTest(context=context):
+                wire["requested_by"] = {"kind": "snapshot", "taken_at": NOW, "recovery": context}
+                with self.assertRaises(record.InvalidRecord):
+                    _ = record.parse_session_records(json.dumps([wire]))
 
     def test_materialization_never_overwrites_an_existing_shutdown_request(self) -> None:
         existing = session_shutdown(progress=record.SessionWaiting(kind="waiting"))
