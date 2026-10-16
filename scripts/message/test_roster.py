@@ -168,6 +168,7 @@ class RosterTests(unittest.TestCase):
         pid: int | None = None,
         with_socket: bool = True,
         proc_start: str = "",
+        entrypoint: str = "cli",
     ) -> None:
         socket_path = self.sessions / f"{file_name}.sock"
         if with_socket:
@@ -189,6 +190,7 @@ class RosterTests(unittest.TestCase):
             "tmux": tmux,
             "cwd": str(cwd),
             "status": status,
+            "entrypoint": entrypoint,
         }), encoding="utf-8")
 
     def _write_showrunner_timer(self) -> None:
@@ -780,6 +782,15 @@ class RosterTests(unittest.TestCase):
         self.assertEqual((entry.cwd, entry.status), (
             str(self.home / "projects" / "free"), "ready",
         ))
+
+    def test_a_relay_named_like_a_session_is_left_out_of_the_roster(self) -> None:
+        # send.py's relay is a newer `claude -p` run started with `-n free-claude`.
+        self._write_session("relay", "free-claude", "sid-relay", self.home / "projects" / "relay",
+                            status="relaying", updated=9, entrypoint="sdk-cli")
+        with mock.patch.object(codex_daemon, "loaded_sessions", return_value=self._daemon_sessions()):
+            found = roster.roster(os.environ, roster.ThisMachine())
+        named = [entry.session for entry in found.entries if entry.name == "free-claude"]
+        self.assertEqual(named, [roster.ClaudeSession("sid-free")])
 
     def test_socketless_record_with_another_process_start_is_absent_from_the_roster(self) -> None:
         self._write_session(
