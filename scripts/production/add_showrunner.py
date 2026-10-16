@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Start a lower production's showrunner in a detached tmux session, attached to this showrunner's production.
+"""Start a lower production's showrunner in a named herdr session, attached to this showrunner's production.
 
 Usage: add_showrunner.py --production <child production doc> --model <id> --effort <level>
                          [--resume <session id> --cwd <dir> [--account <label> | --config-dir <dir>]] [--check]
@@ -11,15 +11,15 @@ timer addressed to a live session, the child is attached to the caller's product
 every refusal and starts nothing. The session must start in a folder the selected account's login
 already trusts, since a showrunner never answers Claude's folder-trust prompt.
 
-Exit 0 when the child is attached, or --check found nothing in the way; 1 when the session started
-and no showrunner appeared in WAIT_S seconds (the session is left running); 2 on a refusal.
+Exit 0 when the child is attached, or --check found nothing in the way; 1 when the prompt was sent
+but the showrunner did not appear or attach (the session is left running); 2 on a refusal;
+3 (SESSION_NOT_READY) when the session is open but not ready and its opening prompt was not sent.
 """
 from __future__ import annotations
 
 import argparse
 import os
 import re
-import shlex
 import subprocess
 import sys
 import time
@@ -27,8 +27,10 @@ from pathlib import Path
 from typing import TYPE_CHECKING, cast
 
 import showrunners
-import unit_lookup
-from add_unit import Production, Refusal, launch_environment, read_production, tmux_live
+from add_unit import Production, Refusal, read_production
+import herdr
+# Promotion still imports this tmux-only helper until its launcher migrates.
+from add_unit import tmux_live as tmux_live
 
 if TYPE_CHECKING:
     from scripts.accounts.accounts import ClaudeLaunchAccount
@@ -36,6 +38,7 @@ if TYPE_CHECKING:
 WAIT_S = float(os.environ.get("ADD_SHOWRUNNER_WAIT_S") or 180)
 # The session registry has no notification interface; callers may choose its retry interval.
 POLL_S = float(os.environ.get("ADD_SHOWRUNNER_POLL_S") or 2.0)
+SESSION_NOT_READY = 3
 
 
 def running(slug: str) -> bool:
@@ -52,10 +55,10 @@ def claude_json(config_dir: Path) -> Path:
     return Path(os.environ.get("ADD_SHOWRUNNER_CLAUDE_JSON") or config_dir / ".claude.json")
 
 
-def checked(child: Production, caller: str, ending: str = "", start_in: Path | None = None, *, config_dir: Path) -> str:
-    """The tmux to start `child`'s showrunner with. Raises Refusal naming what is in the way.
+def checked(child: Production, caller: str, ending: str = "", start_in: Path | None = None, *, config_dir: Path) -> None:
+    """Check whether `child` can start; raise Refusal naming what is in the way.
 
-    `ending` names a tmux session the caller ends before the start, so it is not in the way.
+    `ending` names a session the caller ends before the start, so it is not in the way.
     `start_in` is the folder the session starts in, the child's checkout unless given.
     """
     from scripts.accounts.accounts import NamedAccount, account_dir, trust_command
@@ -73,12 +76,6 @@ def checked(child: Production, caller: str, ending: str = "", start_in: Path | N
         raise Refusal(str(error)) from error
     if taken:
         raise Refusal(f"{child.slug} already has a running showrunner")
-    try:
-        tmux = unit_lookup.tmux_binary()
-    except (OSError, subprocess.CalledProcessError) as error:
-        raise Refusal(f"no tmux to start the session in: {error}") from error
-    if child.slug != ending and tmux_live(tmux, child.slug):
-        raise Refusal(f"a tmux session named {child.slug} is already live")
     folder = start_in or child.checkout
     label = str(config_dir)
     numbered = re.fullmatch(r"\.claude([0-9]+)", config_dir.name)
@@ -91,7 +88,16 @@ def checked(child: Production, caller: str, ending: str = "", start_in: Path | N
     if isinstance(trust, Untrusted):
         raise Refusal(f"{child.slug}: Claude is not trusted in {folder} on {label}. "
                       + f"Run: {trust_command(folder, selected)}")
-    return tmux
+    try:
+        if child.slug != ending and herdr_session_running(child.slug):
+            raise Refusal(f"a herdr session named {child.slug} is already live")
+    except herdr.HerdrFailure as error:
+        raise Refusal(str(error)) from error
+
+
+def herdr_session_running(name: str) -> bool:
+    """Whether a running herdr session already owns this name."""
+    return any(session["name"] == name for session in herdr.live_sessions())
 
 
 def account_directory(selected: ClaudeLaunchAccount) -> Path:
@@ -109,23 +115,21 @@ def account_for_launch(child: Production, resume: str | None, target: str = "", 
         raise Refusal(str(error)) from error
 
 
-def launch(child: Production, tmux: str, model: str, effort: str, resume: str | None, cwd: Path, selected: ClaudeLaunchAccount) -> None:
-    """Launch and retain its account and model on the tmux session."""
-    from scripts.accounts import accounts
+def launch(child: Production, model: str, effort: str, resume: str | None, cwd: Path, selected: ClaudeLaunchAccount) -> None:
+    """Start Claude in the child's named herdr session and prompt it once."""
+    from scripts.whoami.account import named_account_environment
+
     prompt = f"/showrunner:produce {child.doc}" + (" resume" if resume else "")
-    argv = ["claude", "--model", model, "--effort", effort]
+    arguments = ["--model", model, "--effort", effort]
     if resume:
-        argv.extend(["--resume", resume])
-    argv.extend(["--remote-control", child.slug, "-n", child.slug, "--settings", '{"disableAgentView": true}', prompt])
-    prefix = accounts.account_prefix(selected)
-    command = "unset CLAUDE_CONFIG_DIR CLAUDE_CODE_REMOTE_MEMORY_DIR CLAUDE_CODE_OAUTH_TOKEN; " + prefix + "ENABLE_TOOL_SEARCH=true command " + shlex.join(argv) + "; exec zsh"
-    scope = f"--unit={re.sub(r'[^A-Za-z0-9_.-]', '-', child.slug)}-{int(time.time())}"
-    _ = subprocess.run(["systemd-run", "--user", "--scope", scope, tmux, "new-session", "-d", "-s", child.slug,
-                        "-c", str(cwd), "zsh", "-ic", command],
-                       env=launch_environment(), text=True, capture_output=True, check=True)
-    for option, value in (("@claude_config_dir", str(account_directory(selected))), ("@claude_model", model)):
-        _ = subprocess.run([tmux, "set-option", "-t", f"={child.slug}:", option, value],
-                           env=launch_environment(), text=True, capture_output=True, check=True)
+        arguments.extend(["--resume", resume])
+    arguments.extend(["--remote-control", child.slug, "-n", child.slug, "--settings", '{"disableAgentView": true}'])
+    environment = {"ENABLE_TOOL_SEARCH": "true"}
+    environment.update(named_account_environment(selected.dir))
+    herdr.start_new_server(child.slug, 90_000)
+    pane = herdr.open_pane(child.slug, child.slug, str(cwd), environment)
+    herdr.start_agent(child.slug, pane, kind="claude", agent_arguments=arguments,
+                      opening=herdr.OpeningPrompt(prompt), timeout_ms=90_000)
 
 
 def showrunner_appeared(slug: str) -> bool:
@@ -151,7 +155,7 @@ def showrunner_appeared(slug: str) -> bool:
 
 
 def main(argv: list[str]) -> int:
-    parser = argparse.ArgumentParser(description="Start a lower production's showrunner in tmux and attach it.")
+    parser = argparse.ArgumentParser(description="Start a lower production's showrunner in herdr and attach it.")
     _ = parser.add_argument("--production", required=True, type=Path)
     _ = parser.add_argument("--model", required=True, help="pass your own model id")
     _ = parser.add_argument("--effort", required=True, help="pass your own effort level")
@@ -169,7 +173,7 @@ def main(argv: list[str]) -> int:
     try:
         child = read_production(cast(Path, args.production))
         selected = account_for_launch(child, resume, cast(str, args.account), cast(str, args.config_dir))
-        tmux = checked(child, caller, start_in=cwd, config_dir=account_directory(selected))
+        checked(child, caller, start_in=cwd, config_dir=account_directory(selected))
         if resume:
             from scripts.message import sessions
             if any(item["sessionId"] == resume for item in sessions.live_sessions()):
@@ -182,14 +186,20 @@ def main(argv: list[str]) -> int:
         print(f"check: ok — would start {child.slug} in {where} and attach it to {caller}")
         return 0
     try:
-        launch(child, tmux, cast(str, args.model), cast(str, args.effort), resume, where, selected)
-    except (OSError, subprocess.CalledProcessError) as error:
+        launch(child, cast(str, args.model), cast(str, args.effort), resume, where, selected)
+    except herdr.SessionTaken as error:
+        print(f"add_showrunner: {error}", file=sys.stderr)
+        return 2
+    except herdr.AgentNotReady as error:
+        print(f"add_showrunner: the session is not ready:\n{error.screen}", file=sys.stderr)
+        return SESSION_NOT_READY
+    except (OSError, subprocess.SubprocessError, herdr.HerdrFailure) as error:
         said = cast(object, error.stderr) if isinstance(error, subprocess.CalledProcessError) else None
         detail = said.strip() if isinstance(said, str) and said.strip() else str(error)
         print(f"add_showrunner: the session did not start: {detail}", file=sys.stderr)
         return 2
-    print(f"started {child.slug} in tmux session {child.slug}")
-    later = (f"Its session is still running: look at it with `tmux attach -t {child.slug}`, then run "
+    print(f"started {child.slug}: herdr session attach {child.slug}")
+    later = (f"Its session is still running: look at it with `herdr session attach {child.slug}`, then run "
              + f"`showrunners.py attach {child.slug} {caller}` once it has an update timer.")
     try:
         appeared = showrunner_appeared(child.slug)

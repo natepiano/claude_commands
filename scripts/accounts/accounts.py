@@ -36,6 +36,7 @@ sys.path.insert(0, str(SCRIPTS / "whoami"))
 import account  # noqa: E402
 from account import ResolvedHistoryLabel as ResolvedHistoryLabel, HistoricalAccountUnresolved as HistoricalAccountUnresolved  # noqa: E402
 from scripts.lib import unit_runs  # noqa: E402
+from scripts.lib.probe_session import PROBE_ENV  # noqa: E402
 import agent_accounts  # noqa: E402
 import note_file  # noqa: E402
 import usage_store  # noqa: E402
@@ -420,6 +421,7 @@ class CommandLine(argparse.Namespace):
     dry_run: bool = False
     alerts: MoveAlerts = "user"
     claude_args: list[str] = []
+    probe: bool = False
     session: str = ""
     source: str = ""
     target: str = ""
@@ -1069,7 +1071,7 @@ def prepared_account(label: str, *, resume: bool) -> PreparedAccount | AccountRe
     return PreparedAccount(account.named_account_environment(selected.dir), remove)
 
 
-def exec_account(label: str, arguments: list[str]) -> None:
+def exec_account(label: str, arguments: list[str], *, probe: bool = False) -> None:
     """Replace this process with Claude on the selected, safe directory."""
     label = note_file.canonical_label(label)
     prepared = prepared_account(label, resume="--resume" in arguments)
@@ -1079,6 +1081,8 @@ def exec_account(label: str, arguments: list[str]) -> None:
     for name in prepared.remove:
         _ = environment.pop(name, None)
     environment.update(prepared.variables)
+    if probe:
+        environment[PROBE_ENV] = "1"
     try:
         if sys.stdin.isatty() and "RELAUNCH_SUPERVISED" not in environment:
             os.execvpe(sys.executable, [sys.executable, str(SCRIPTS / "lib" / "relaunch.py"),
@@ -3457,6 +3461,7 @@ def _parser() -> argparse.ArgumentParser:
     _ = picker.add_argument("--keep", default="")
     _ = picker.add_argument("--explain", action="store_true")
     exec_command = commands.add_parser("exec")
+    _ = exec_command.add_argument("--probe", action="store_true", help="mark the session as a throwaway probe: no shutdown, restart or move for it ever pushes to the phone")
     _ = exec_command.add_argument("label")
     _ = exec_command.add_argument("claude_args", nargs=argparse.REMAINDER)
     move_command = commands.add_parser("move")
@@ -3508,7 +3513,7 @@ def main(argv: list[str]) -> int:
                     print(_pick_explanation(reason))
             return 0 if isinstance(chosen, PickedAccount) else 1
         if options.action == "exec":
-            exec_account(options.label, options.claude_args)
+            exec_account(options.label, options.claude_args, probe=options.probe)
             return 0
         if options.action == "move":
             if options.session in CLAUDE_GROUPS:

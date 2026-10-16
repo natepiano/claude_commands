@@ -109,6 +109,7 @@ PROJECTS: dict[str, ProjectSpec] = {
     "nateroids": ProjectSpec(
         "natepiano/nateroids", frozenset({"nateroids"}), frozenset()
     ),
+    "claude": ProjectSpec("natepiano/claude_commands", frozenset(), frozenset()),
 }
 
 KINDS = ("feature", "fix", "change", "perf", "deprecation", "removal", "security")
@@ -428,7 +429,8 @@ DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 VERSION_RE = re.compile(
     r"^(?:Unreleased|\d+\.\d+\.\d+(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?)$"
 )
-REVIEW_ROW_RE = re.compile(r"^[AC]\d+$")
+# A bare row is a row of Hana's list; a row of a production's own list names it: build-followups/C3.
+REVIEW_ROW_RE = re.compile(r"^(?:[A-Za-z0-9][A-Za-z0-9_-]*/)?[AC]\d+$")
 BODY_SECTION_HEADINGS = frozenset({"## See it", "## Evidence"})
 UNSAFE_BARE_SCALAR_PREFIXES = frozenset("-?:,[]{}#&*!|>'\"%@`")
 
@@ -728,9 +730,9 @@ def _validate_project(project: str) -> ProjectSpec:
 def _validate_crates(project: str, crates: list[str]) -> list[str]:
     spec = _validate_project(project)
     unique = sorted(set(crates))
-    if project == "natedev":
+    if not spec.crates:
         if unique:
-            raise FeatureLogError("natedev does not accept crates")
+            raise FeatureLogError(f"{project} does not accept crates")
         return []
     if not unique:
         raise FeatureLogError(f"project {project} requires at least one crate")
@@ -826,10 +828,6 @@ def validate_note(note: Note, expected_project: str | None = None) -> None:
         raise FeatureLogError("a live note must have replaced_by: []")
     if note["state"] == "superseded" and not note["replaced_by"]:
         raise FeatureLogError("a superseded note must name a replacement")
-    if note["project"] != "hana" and note["production"] is not None:
-        raise FeatureLogError("production is only valid for hana")
-    if note["project"] != "hana" and note["unit"]:
-        raise FeatureLogError("unit is only valid for hana")
     if note["production"] is not None and not note["production"].strip():
         raise FeatureLogError("production is empty")
     if any(not unit.strip() for unit in note["unit"]):
@@ -876,10 +874,6 @@ def _new_note(arguments: argparse.Namespace) -> Note:
     )
     production = cast(str | None, arguments.production)
     units = sorted(set(_flatten(cast(list[list[str]] | None, arguments.unit))))
-    if project != "hana" and production is not None:
-        raise FeatureLogError("--production is only valid for hana")
-    if project != "hana" and units:
-        raise FeatureLogError("--unit is only valid for hana")
     if production is not None and not production.strip():
         raise FeatureLogError("production is empty")
     if any(not unit.strip() for unit in units):
@@ -1372,7 +1366,7 @@ def _run_supersede(arguments: argparse.Namespace, policy: ReplacementPolicy) -> 
 
 def _review_row(value: str) -> str:
     if not REVIEW_ROW_RE.fullmatch(value):
-        raise FeatureLogError("review row must match A<number> or C<number>")
+        raise FeatureLogError("review row must match A<number>, C<number> or <list>/C<number>")
     return value
 
 
@@ -1580,6 +1574,9 @@ def _validate_proposal_old_notes(note: Note, old_titles: list[str]) -> None:
 def _run_propose(arguments: argparse.Namespace) -> int:
     row = _review_row(cast(str, arguments.review))
     _require_new_note_arguments(arguments)
+    project = cast(str, arguments.project)
+    if "/" not in row and project != "hana":
+        raise FeatureLogError(f"a {project} review row names its list: <list>/{row}")
     old_titles = _proposal_old_titles(arguments)
     verb: Literal["add", "supersede"] = "supersede" if old_titles else "add"
     with locked():

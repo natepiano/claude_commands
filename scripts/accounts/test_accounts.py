@@ -465,6 +465,42 @@ class AccountsTests(unittest.TestCase):
         self.assertFalse(accounts.accounts_config_file().exists())
         self.assertFalse(accounts.roles_history_file().exists())
 
+    def test_exec_probe_marks_the_launched_environment_and_consumes_its_option(self) -> None:
+        self.login_directory("claude2", "main@example.invalid", default=True)
+        cases = ((False, ["claude2"]), (True, ["--probe", "claude2"]))
+        for probe, account_options in cases:
+            with self.subTest(account_options=account_options), patch.dict(os.environ):
+                _ = os.environ.pop("CLAUDE_PROBE_SESSION", None)
+                with patch.object(os, "execvpe") as launch:
+                    self.assertEqual(self.run_cli("exec", *account_options,
+                                                  "-n", "throwaway", "--version"), (0, "", ""))
+                launch.assert_called_once()
+                self.assertEqual(launch.call_args.args[:2], ("claude", ["claude", "-n", "throwaway", "--version"]))
+                environment = cast(dict[str, str], launch.call_args.args[2])
+                if probe:
+                    self.assertEqual(environment["CLAUDE_PROBE_SESSION"], "1")
+                else:
+                    self.assertNotIn("CLAUDE_PROBE_SESSION", environment)
+
+    def test_exec_probe_preserves_claude_options_that_share_accounts_option_names(self) -> None:
+        self.login_directory("claude2", "main@example.invalid", default=True)
+        arguments = ["--model", "haiku", "--help", "--detail"]
+        with patch.object(os, "execvpe") as launch:
+            self.assertEqual(self.run_cli("exec", "--probe", "claude2", *arguments), (0, "", ""))
+        launch.assert_called_once()
+        self.assertEqual(launch.call_args.args[:2], ("claude", ["claude", *arguments]))
+        self.assertEqual(launch.call_args.args[2]["CLAUDE_PROBE_SESSION"], "1")
+
+    def test_exec_probe_after_the_account_passes_through_to_claude_unmarked(self) -> None:
+        self.login_directory("claude2", "main@example.invalid", default=True)
+        with patch.dict(os.environ):
+            _ = os.environ.pop("CLAUDE_PROBE_SESSION", None)
+            with patch.object(os, "execvpe") as launch:
+                self.assertEqual(self.run_cli("exec", "claude2", "--probe"), (0, "", ""))
+        launch.assert_called_once()
+        self.assertEqual(launch.call_args.args[:2], ("claude", ["claude", "--probe"]))
+        self.assertNotIn("CLAUDE_PROBE_SESSION", cast(dict[str, str], launch.call_args.args[2]))
+
     def test_legacy_exec_alias_selects_the_numbered_configuration(self) -> None:
         self.login_directory("claude1", "main@example.invalid", default=True)
         self.login_directory("claude2", "two@example.invalid")

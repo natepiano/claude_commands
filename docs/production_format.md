@@ -33,9 +33,9 @@ must not drift from it:
   branch. A unit is named `<area>-unit`, e.g. `widget-unit`. Its plan, worktree,
   branch, phases, checkpoints and ETA are the unit's.
 - **Unit director** — the Claude session that runs a unit: the `/unit:direct`
-  session the showrunner launches in tmux. It receives messages, decides, writes
-  Work Orders, dispatches workers, runs gates, checkpoints and reports. It writes
-  no implementation code.
+  session the showrunner launches in its own herdr session. It receives messages,
+  decides, writes Work Orders, dispatches workers, runs gates, checkpoints and
+  reports. It writes no implementation code.
 - **Worker** — a Codex worker thread the unit director dispatches. Implementation
   workers open once per run, continue across phases and repairs in whatever role
   is needed, attempt compaction above `PLAN_DELEGATE_COMPACT_ABOVE_TOKENS` but
@@ -100,15 +100,14 @@ The production doc sits beside the source plan as `<source-stem>-production.md`.
 - **Capacity:** <cores and memory read by /producer:greenlight, and the unit count it allows>
 - **UX guide:** <path to the project's UX rules, e.g. `~/rust/hanadocs/ux`>; omit when
   nothing users see changes
-- **Change review:** <path to the user's change-review list, e.g.
-  `~/rust/hanadocs/change-review.md`>; `merge_checkpoint.py` adds a row per
-  `Change-Review:` line a merged checkpoint names. Omit when the production keeps none; its
-  checkpoints still carry the lines
+- **Change review:** <path to the user's change-review list>; required. A new production
+  uses `~/rust/hanadocs/change-review/<slug>.md`; Hana keeps `~/rust/hanadocs/change-review.md`.
+  `merge_checkpoint.py` adds a row per `Change-Review:` line a merged checkpoint names, and
+  `/change_review` adds the rest; a missing file is created on its first row
 - **Review pool:** code (or `code, ui`); omit when the production has none
-- **Proposals:** <folder for finished proposals, e.g. `~/rust/hanadocs/proposals`>; its
-  `index.md` holds one row for each, `| Date | Proposal | Unit | Summary | Status |`,
-  added by the showrunner, and `/showrunner:proposals` shows every row whose Status is
-  not closed; omit when the production keeps no such folder
+- **Proposals:** <the issues folder the production files its proposals in, e.g.
+  `~/rust/hanadocs/issues`>; `/showrunner:proposals` lists every open issue there tagged
+  `proposal`; omit when the production keeps none
 
 The showrunner's session name is not in the doc: a name can change, so it is
 looked up when needed. `~/.claude/scripts/lib/py
@@ -129,8 +128,8 @@ one standing phase that stays `todo`; `/review:direct` writes it when absent.
 
 The Unit value names the unit everywhere: in the log, the dailies, the waits and every
 tool's arguments. A unit's session name is written nowhere, because the user may rename
-a session at any time. The unit's tmux session carries the production's slug and the
-unit's id as marks, set at launch. To reach a unit, look it up at that moment:
+a session at any time. The unit's herdr or tmux session carries the production's
+slug and the unit's id as marks, set at launch. To reach a unit, look it up at that moment:
 `$HOME/.claude/scripts/lib/py $HOME/.claude/scripts/production/unit_lookup.py pane <slug> <unit>`
 prints its pane, and `unit_lookup.py list <slug>` prints every unit's pane and its
 session name now. `<slug>` is this doc's file name without `-production.md`; a former
@@ -402,4 +401,17 @@ A run that stopped, failed, or waits on a decision has no finish in its record, 
     positional arguments. On `own`, export
     `REVIEW_LEASE=<slug>/<unit>/<phase>` and review as today. `<slug>` is the
     production doc's file name without `-production.md`.
+
+17. **Proposals.** A finished proposal you write is a hanadocs issue, filed
+    through `/issue` with tag `proposal`, `proposed_by` your unit's name, and
+    its five ranking values proposed on a `Proposed ranking:` line. Send the
+    showrunner its path and one line; there is no proposals index. When the
+    showrunner sends back an approved one, write its work into your plan as
+    phases that cite it and add it to the plan's `> **Issues:**` line; your
+    run marks it active and its end-of-run as-built pass closes it
+    (`/showrunner:proposal`).
+18. **Change review.** Every change the user can see or check carries a
+    `Change-Review:` line in its checkpoint (`/unit:checkpoint`). A change
+    outside a checkpoint goes on the list through `/change_review add`. Never
+    ask the user to check something directly.
 </ProductionUnit>

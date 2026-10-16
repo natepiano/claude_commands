@@ -78,6 +78,7 @@ def common_session(
         "session_id": session_id,
         "pid": pid,
         "proc_start": proc_start or f"start-{session_id}",
+        "probe": False,
         "name": name,
         "cwd": f"/tmp/{session_id}",
         "status": status,
@@ -206,7 +207,7 @@ def entry(session: inventory.Session, progress: str = "ready") -> record.Session
     return record.SessionShutdown(
         login=LOGIN, label=LABEL, machine="natedev", requested_at=NOW,
         request_id="request", requested_by=record.FromTerminal(kind="terminal"),
-        hold="session", then="stop", force="wait for ready", alerts="none",
+        hold="session", then="stop", force="wait for ready", alerts="none", probe=False,
         session=session, workers=[], timers=[], settle_message=record.SettleMessageNotSent(kind="not sent"),
         where=record.WhereNotSaid(kind="not said"), progress=state, trail=[], stop_issues=[],
     )
@@ -750,8 +751,8 @@ class StopTests(ShutdownTestCase):
                 self.assertEqual(signals, [signal.SIGTERM] if state == "present" else [])
                 self.assertEqual(self.herdr_commands(), [
                     ["--session", "same-name-as-tmux", "server", "stop"],
-                    ["--user", "is-active", "herdr-same-name-as-tmux"],
-                    ["--user", "stop", "herdr-same-name-as-tmux"],
+                    ["--user", "is-active", "herdr-same-name-as-tmux.service"],
+                    ["--user", "stop", "herdr-same-name-as-tmux.service"],
                     ["--session", "default", "session", "list", "--json"],
                 ])
                 self.assertEqual(report["stop_issues"], [])

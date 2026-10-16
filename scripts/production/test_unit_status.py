@@ -18,7 +18,7 @@ from dailies_input import (ClaudeNotRunning, Decision, SessionGone, StatusBlock,
 from unit_lookup import UnitState
 import fake_tmux
 from fake_tmux import FakeSession
-from fake_herdr import CommandResponse
+from fake_herdr import CommandResponse, herdr_listener
 from herdr import SessionEntry, SessionListResult
 from sessions import SessionRecord
 from test_session_pane import tmux_adapter
@@ -70,7 +70,8 @@ exit "$NOTIFIER_HEALTH_EXIT"
                 _ = shutil.copy2(SCRIPT.with_name(source_name), script.with_name(source_name))
             (root / "scripts" / "herdr").mkdir()
             _ = shutil.copy2(SCRIPT.parent.parent / "herdr" / "herdr.py", root / "scripts" / "herdr" / "herdr.py")
-            _ = shutil.copy2(SCRIPT.parent.parent / "lib" / "user_zone.py", script.parent.parent / "lib" / "user_zone.py")
+            for source_name in ("user_zone.py", "probe_session.py"):
+                _ = shutil.copy2(SCRIPT.parent.parent / "lib" / source_name, script.parent.parent / "lib" / source_name)
             active_dir = root / "active"
             active_dir.mkdir()
             call_log = root / "notifier_calls"
@@ -117,6 +118,7 @@ exit "$NOTIFIER_HEALTH_EXIT"
                     server = root / "proc" / "991000"
                     server.mkdir(parents=True, exist_ok=True)
                     _ = (server / "cmdline").write_bytes(f"herdr\0--session\0{unit}\0server\0".encode())
+                    herdr_listener(root / "proc", 991000, unit, environment)
                     process = root / "proc" / str(os.getpid())
                     process.mkdir(parents=True, exist_ok=True)
                     _ = (process / "cmdline").write_bytes(b"claude\0")

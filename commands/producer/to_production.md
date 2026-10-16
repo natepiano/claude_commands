@@ -73,6 +73,8 @@ and merged units.
    - title `# <source title> — <unit>`, the delegate-ready status line, and the
      source's `As-built disposition` line when it has one;
    - the **Production line** from the production format;
+   - the source's **Issues** line when it has one, naming only the issues whose
+     phases this unit takes;
    - **Delegation Context** copied from the source. Narrow **Layout**, **Key
      files**, **Test lanes** and the **Build / Test / Lint** lines to this unit's
      files and packages. Keep **Invariants** whole. Leave out **Project
@@ -89,7 +91,8 @@ and merged units.
      \`<merge branch>\``;
    - every phase number mentioned in moved text is rewritten to its new number,
      or to the other unit's name and number. Substitute highest-first.
-4. **Header line.** Add the Production line to the kept source plan too.
+4. **Header line.** Add the Production line to the kept source plan too, and
+   narrow its Issues line to the issues whose phases it keeps.
 </WriteUnitPlans>
 
 ---
@@ -101,7 +104,7 @@ production format, with status `planned`:
 - **Units:**
   - **Worktree:** `<parent of ${REPO}>/<name>-<area>`, with a branch of the
     same name.
-  - **Session:** the unit name. If a tmux session with that name already
+  - **Session:** the unit name. If a herdr or tmux session with that name already
     exists, add the production name as a prefix.
   - **Port:** a distinct app port per unit, only when the project launches an
     app for smoke tests. Never the user's default port. The repository's
@@ -112,6 +115,9 @@ production format, with status `planned`:
   one exists.
 - **Log:** `docs/handoff/<name>-production-log.md`.
 - **Updates:** every 15 minutes (user, 2026-09-28).
+- **Change review:** `~/rust/hanadocs/change-review/<source-stem>.md`, named
+  like the production doc; a Hana production keeps
+  `~/rust/hanadocs/change-review.md`.
 - **Close-out:** the source plans' production-level steps, meaning work that
   no one unit owns or that runs after the last merge. Examples: data or
   saved-state migrations, checks on other machines, final validation.

@@ -798,9 +798,9 @@ class LocalReviewTests(unittest.TestCase):
                     _ = review.main(arguments)
                 self.assertEqual(error.exception.code, 2)
             texts.assert_not_called()
-            self.assertEqual(review.main(["texts", "--id", "shutdown.remote_control", "--approve",
+            self.assertEqual(review.main(["texts", "--id", "shutdown.holdout", "--approve",
                                           "--user-spec", "User words"]), 0)
-        texts.assert_called_once_with(["shutdown.remote_control"], True, authority=review.UserSpecifiedText("User words"))
+        texts.assert_called_once_with(["shutdown.holdout"], True, authority=review.UserSpecifiedText("User words"))
 
     def test_retiring_a_rejected_claim_preserves_a_newer_hold_from_the_same_source(self) -> None:
         original = self.held()

@@ -90,6 +90,7 @@ if TYPE_CHECKING:
     from ..whoami.account import named_account_environment
 import review  # noqa: E402
 from user_zone import user_zone  # noqa: E402
+from probe_session import PROBE_ENV  # noqa: E402
 from user_action import (FIX, REFUSED_BEFORE_SENDING, ActionRefused, ActionRequired, ActionUnstated,
                          UserAction, NoActionRequired, first_line, parse_user_action,
                          SessionLine, split_session, session_prefix)  # noqa: E402
@@ -1455,7 +1456,11 @@ def main(argv: list[str]) -> int:
         case ["ack" | "reopen" | "pending", *_]:
             usage_error(f"usage: send.py {argv[0]} {'[NAME]' if argv[0] == 'pending' else 'KEY'}")
         case _:
-            result = send(parse(argv))
+            options = parse(argv)
+            if options.to == USER and os.environ.get(PROBE_ENV) == "1":
+                print("not sent: probe sessions never push to the phone")
+                return 0
+            result = send(options)
             print(f"{result.outcome.upper()}: {result.detail}")
             if isinstance(result.failure, FailedPush):
                 failed = result.failure

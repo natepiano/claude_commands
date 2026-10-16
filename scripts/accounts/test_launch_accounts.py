@@ -30,6 +30,10 @@ def names(node: ast.AST) -> set[str]:
 def starts_claude(node: ast.AST) -> bool:
     parents = {child: parent for parent in ast.walk(node) for child in ast.iter_child_nodes(parent)}
     for child in ast.walk(node):
+        if isinstance(child, ast.Call) and called(child) == "start_agent" and any(
+                key.arg == "kind" and isinstance(key.value, ast.Constant) and key.value.value == "claude"
+                for key in child.keywords):
+            return True
         if isinstance(child, (ast.List, ast.Tuple)) and child.elts:
             parent = parents.get(child)
             if (isinstance(parent, ast.Subscript) and parent.slice is child
@@ -185,6 +189,19 @@ def launch():
                 with self.subTest(selection=selection, arguments=arguments):
                     problems = launch_account_violations(source, "fixture.py")
                     self.assertTrue(any("selects with" in problem for problem in problems), problems)
+
+    def test_native_herdr_launches_reject_independent_account_selection(self) -> None:
+        source = '''
+def launch():
+    selected = accounts.role_account("unit")
+    herdr.open_pane("unit", "unit", cwd, named_account_environment(selected.dir))
+    herdr.start_agent("unit", pane, kind="claude", agent_arguments=[])
+'''
+        problems = launch_account_violations(source, "fixture.py")
+        self.assertTrue(any("selects with" in problem for problem in problems), problems)
+        resolved = source.replace('accounts.role_account("unit")',
+                                  'accounts.account_for_group_launch("unit", resume=False)')
+        self.assertEqual(launch_account_violations(resolved, "fixture.py"), [])
 
     def test_rendering_a_resolved_account_or_a_recorded_target_is_allowed(self) -> None:
         for setup, render in ((

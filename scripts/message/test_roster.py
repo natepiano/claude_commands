@@ -30,7 +30,7 @@ import remove_workers
 import roster
 import unit_runs
 import herdr
-from fake_herdr import CommandResponse
+from fake_herdr import CommandResponse, herdr_listener
 import sessions
 import showrunners
 import unit_lookup
@@ -959,7 +959,7 @@ class RosterTests(unittest.TestCase):
                     heartbeat = run / "heartbeat.log"
                     heartbeat.touch()
                     if liveness == "dead run":
-                        old = time.time() - remove_workers.LIVE_HEARTBEAT_SECS - 5
+                        old = time.time() - unit_runs.LIVE_HEARTBEAT_SECS - 5
                         os.utime(heartbeat, (old, old))
                 before = self._entries()
                 self._write_mesh(run, records, server_pid=999_999_999)
@@ -1127,6 +1127,8 @@ class RosterTests(unittest.TestCase):
         _ = (path / "cmdline").write_bytes("\0".join(argv).encode())
         _ = (path / "environ").write_bytes("\0".join(f"{key}={value}" for key, value in environment.items()).encode())
         (path / "cwd").symlink_to(self.home)
+        if argv[:2] == ["herdr", "--session"] and argv[3:] == ["server"]:
+            herdr_listener(path.parent, pid, argv[2], os.environ)
 
     def _herdr_sessions(self) -> dict[str, CommandResponse]:
         return {"--session default session list --json": {"code": 0, "stdout": json.dumps({
@@ -1286,7 +1288,7 @@ class RosterTests(unittest.TestCase):
 
     def test_recent_heartbeat_is_live_but_an_old_one_is_not(self) -> None:
         orphan = self.delegate / "orphan-run" / "heartbeat.log"
-        old = time.time() - remove_workers.LIVE_HEARTBEAT_SECS - 5
+        old = time.time() - unit_runs.LIVE_HEARTBEAT_SECS - 5
         os.utime(orphan, (old, old))
         entries = self._entries()
         self.assertNotIn("orphan-impl", entries)

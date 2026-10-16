@@ -369,7 +369,7 @@ class ReviewLauncherPassTests(unittest.TestCase):
         _ = shutil.copy2(DELEGATE_DIR.parent / "lib" / "user_zone.py", lib / "user_zone.py")
         _ = shutil.copy2(DELEGATE_DIR.parent / "lib" / "unit_runs.py", lib / "unit_runs.py")
         for name in (
-            "review.sh", "implement.sh", "progress_history.py", "findings.py",
+            "review.sh", "implement.sh", "progress_history.py", "phase_reservation.py", "findings.py",
             "board.sh", "worker_name.sh", "worker_state.py",
         ):
             _ = shutil.copy2(DELEGATE_DIR / name, delegate / name)
@@ -713,7 +713,7 @@ import sys
 
 if sys.argv[1] in ("start-pass", "finish-pass"):
     with Path(os.environ["STUB_PASS_CALLS"]).open("a") as calls:
-        calls.write(json.dumps({"verb": sys.argv[1]}) + "\\n")
+        calls.write(json.dumps({"verb": sys.argv[1], "argv": sys.argv[2:]}) + "\\n")
 os.execv(sys.executable, [sys.executable, str(Path(__file__).with_name("progress_history_real.py")), *sys.argv[1:]])
 ''', encoding="utf-8")
         calls = self.root / "pass-calls.jsonl"
@@ -900,6 +900,43 @@ os.execv(sys.executable, [sys.executable, str(Path(__file__).with_name("progress
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual([call["verb"] for call in self.call_records("pass-calls.jsonl")],
                          ["start-pass", "finish-pass"])
+
+    def test_a_review_naming_an_older_open_phase_starts_its_pass_in_that_phase(self) -> None:
+        session = self.start_implementation("named-phase-pass")
+        self.finish_implementation(session)
+        self.recorder("start-phase", "--session-dir", str(session), "--phase-id", "4", "--phase-title", "Next phase")
+        environment = self.pool_fixture()
+        self.trace_pass_recorder(environment)
+        command = self.pool_command(session)
+        command[2:2] = ["--phase", "3"]
+        result = subprocess.run(command, env=environment, capture_output=True, text=True, check=False, timeout=300)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        start, = [call for call in self.call_records("pass-calls.jsonl") if call["verb"] == "start-pass"]
+        self.assertEqual(cast("list[str]", start["argv"])[-2:], ["--phase-id", "3"])
+
+    def test_a_review_naming_its_phase_writes_its_files_in_that_phase_directory(self) -> None:
+        # Two phases reviewing at once each pass their own id, so neither reads the other's findings.
+        session = self.start_implementation("phase-directory-files")
+        self.finish_implementation(session)
+        environment = self.pool_fixture()
+        command = self.pool_command(session)
+        command[2:2] = ["--phase", "3"]
+        result = subprocess.run(command, env=environment, capture_output=True, text=True, check=False, timeout=300)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        phase_dir = session / "phases" / "3"
+        self.assertTrue(list(phase_dir.glob("review_findings_*.txt")))
+        self.assertTrue(list(phase_dir.glob("review_status*")))
+        self.assertEqual(sorted(path.name for path in session.glob("review_*")), [])
+
+    def test_a_phase_id_with_a_space_names_a_directory_without_it(self) -> None:
+        session = self.start_implementation("phase-directory-name")
+        self.finish_implementation(session)
+        command = self.pool_command(session)
+        command[2:2] = ["--phase", "ad hoc"]
+        result = subprocess.run(command, env=self.pool_fixture(), capture_output=True, text=True,
+                                check=False, timeout=300)
+        self.assertNotEqual(result.returncode, 2, result.stderr)
+        self.assertTrue(list((session / "phases" / "adhoc").glob("review_status*")))
 
     def test_ui_pool_reviewed_turn_records_ux_kind_without_pass_calls_at_either_start_site(self) -> None:
         session = self.start_implementation("ui-no-pass")

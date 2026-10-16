@@ -398,7 +398,8 @@ class MergeGateTests(unittest.TestCase):
         checkpoint = self.checkpoint_commit("checkpoint(fixture): grid fades\n\nChange-Review: none — the gate script")
         result = self.run_gate("--production", str(doc), checkpoint=checkpoint)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertNotIn("Change review:", result.stdout)
+        self.assertIn("Change review: the production doc has no Change review line; no rows written",
+                      result.stdout)
 
     def test_green_gate_pushes_no_ff_merge_with_subject_body_and_all_modules(self) -> None:
         self.write(self.state / "types-barrier", "overlap")

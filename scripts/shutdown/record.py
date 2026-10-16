@@ -36,12 +36,6 @@ class HistoricalAccountResolver(Protocol):
     def resolve_history_label(self, label: str, at: str, *, login: str = "") -> ResolvedHistoryLabel | HistoricalAccountUnresolved: ...
 
 
-class NoRemoteControl(TypedDict):
-    session_id: str
-    name: str
-    alerts: Literal["user", "none"]
-
-
 class ReadinessClear(TypedDict):
     kind: Literal["clear"]
 
@@ -382,6 +376,7 @@ class SessionShutdown(TypedDict):
     then: ShutdownContinuation
     force: StopTiming
     alerts: Literal["user", "none"]
+    probe: bool
     session: Session
     workers: list[Session]
     timers: list[TimerRestore]
@@ -390,6 +385,8 @@ class SessionShutdown(TypedDict):
     progress: SessionProgress
     trail: list[ProgressStep]
     stop_issues: list[SessionStopIssue]
+    # Presentation can fail after Claude starts; these issues do not warrant another launch.
+    restart_issues: NotRequired[list[str]]
     alerted_at: NotRequired[str]
     # The phone push for a form open in the session's pane; the user is told once.
     form_alerted_at: NotRequired[str]
@@ -413,6 +410,12 @@ class AccountHold(TypedDict):
     request_id: str
     requested_by: RequestOrigin
     then: ShutdownContinuation
+    # Legacy holds name only request_id; legacy incomplete registration stays held.
+    registration: NotRequired[Literal["in progress", "complete"]]
+    # New holds retain every covered request, including after its registration finishes.
+    request_ids: NotRequired[list[str]]
+    # A request stays here until its owner loop completes; exceptions leave it held.
+    registering_request_ids: NotRequired[list[str]]
 
 
 def stop_incomplete(saved: SessionShutdown) -> bool:
@@ -1044,6 +1047,10 @@ def _session_shutdown(value: object, place: str) -> SessionShutdown:
         text = _string(_required(values, field, place), f"{place}.{field}")
         if text not in allowed:
             raise InvalidRecord(f"{place}.{field} is invalid")
+    probe = values.get("probe", False)
+    if not isinstance(probe, bool):
+        raise InvalidRecord(f"{place}.probe must be a boolean")
+    values["probe"] = probe
     _ = _required(values, "stop_issues", place)
     fields = _entry(values, place)
     values["progress"] = _progress(values["progress"], f"{place}.progress")
@@ -1057,6 +1064,8 @@ def _session_shutdown(value: object, place: str) -> SessionShutdown:
         trail.append(ProgressStep(at=at, kind=kind, detail=detail))
     values["trail"] = trail
     values["stop_issues"] = [_session_stop_issue(issue, f"{place}.stop_issues") for issue in fields["stop_issues"]]
+    if "restart_issues" in values:
+        values["restart_issues"] = _strings(values["restart_issues"], f"{place}.restart_issues")
     if fields["session"]["kind"] == "worker":
         raise InvalidRecord(f"{place}.session must not be a worker")
     _ = _session_filename(fields["session"]["session_id"])
@@ -1087,6 +1096,18 @@ def _session_shutdown(value: object, place: str) -> SessionShutdown:
 def _account_hold(value: object, place: str) -> AccountHold:
     values = _mapping(value, place)
     _shutdown_request_fields(values, place)
+    if "registration" in values and values["registration"] not in ("in progress", "complete"):
+        raise InvalidRecord(f"{place}.registration must be in progress or complete")
+    request_ids = {cast(str, values["request_id"])}
+    if "request_ids" in values:
+        ids = _strings(values["request_ids"], f"{place}.request_ids")
+        if not all(ids) or len(set(ids)) != len(ids) or not request_ids.issubset(ids):
+            raise InvalidRecord(f"{place}.request_ids must be unique nonempty ids including request_id")
+        request_ids = set(ids)
+    if "registering_request_ids" in values:
+        ids = _strings(values["registering_request_ids"], f"{place}.registering_request_ids")
+        if len(set(ids)) != len(ids) or not set(ids).issubset(request_ids):
+            raise InvalidRecord(f"{place}.registering_request_ids must be unique ids from request_ids")
     return cast(AccountHold, cast(object, values))
 
 
@@ -1209,7 +1230,7 @@ def _convert_session(record: _LegacyShutdownRecord, entry: _LegacySessionEntry) 
         requested_at=record["requested_at"], requested_by=record["requested_by"],
         request_id=f"legacy-{record['machine']}-{record['requested_at']}",
         hold="account" if record["scope"]["kind"] == "all account sessions" else "session",
-        then=_legacy_continuation(record), force=record["force"], alerts="user",
+        then=_legacy_continuation(record), force=record["force"], alerts="user", probe=False,
         session=session, workers=workers, timers=entry["timers"],
         settle_message=entry["settle_message"], where=entry["where"],
         progress=cast(SessionProgress, cast(object, progress)), trail=[], stop_issues=[issue for issue in entry["stop_issues"] if issue["kind"] != "worker still live"],
@@ -1414,6 +1435,58 @@ def set_account_hold(hold: AccountHold) -> None:
                 existing = _account_hold(_read_json(path), str(path))
                 _check_account(checked["login"], existing["login"], path)
             _write_record(path, checked)
+
+
+def _hold_request_ids(hold: AccountHold) -> set[str]:
+    return set(hold.get("request_ids", [hold["request_id"]]))
+
+
+def _registering_request_ids(hold: AccountHold) -> set[str]:
+    pending = set(hold.get("registering_request_ids", []))
+    if hold.get("registration", "complete") == "in progress":
+        pending.add(hold["request_id"])
+    return pending
+
+
+def register_account_hold_request(hold: AccountHold, *, account_wide: bool) -> None:
+    """Join an existing hold, or create an account-wide hold, before adding records."""
+    checked = _account_hold(copy.deepcopy(hold), "hold")
+    login, request_id = checked["login"], checked["request_id"]
+    with launch_barrier():
+        with _session_store_lock(login, create=True) as directory:
+            path = directory / "hold.json"
+            if _regular_record(path):
+                checked = _account_hold(_read_json(path), str(path))
+                _check_account(login, checked["login"], path)
+            elif not account_wide:
+                return
+            requests = _hold_request_ids(checked)
+            requests.update(saved["request_id"] for saved in _session_records_in_directory(directory, login))
+            requests.add(request_id)
+            pending = _registering_request_ids(checked)
+            pending.add(request_id)
+            checked["request_ids"] = sorted(requests)
+            checked["registering_request_ids"] = sorted(pending)
+            _write_record(path, checked)
+
+
+def complete_account_hold_registration(login: str, request_id: str) -> None:
+    """Finish only this request's registration, leaving overlapping requests held."""
+    if _existing_account_directory(login) is None:
+        return
+    with _session_store_lock(login, write=True) as directory:
+        path = directory / "hold.json"
+        if not _regular_record(path):
+            return
+        held = _account_hold(_read_json(path), str(path))
+        _check_account(login, held["login"], path)
+        pending = _registering_request_ids(held)
+        if request_id in pending:
+            pending.remove(request_id)
+            held["registering_request_ids"] = sorted(pending)
+            if held["request_id"] == request_id and "registration" in held:
+                held["registration"] = "complete"
+            _write_record(path, held)
 
 
 def clear_account_hold(login: str) -> None:
@@ -1622,7 +1695,11 @@ class ConductorUnavailable:
 
 
 def clear_finished_account_hold(login: str, *, request_ids: tuple[str, ...] = ()) -> None:
-    """Clear the current hold only after its last session record leaves."""
+    """Clear the owning request's hold once every covered request is finished.
+
+    Filtered cleanup must name the owner. Joined requests add protection while
+    registering or holding records; finishing one never authorizes release.
+    """
     if _existing_account_directory(login) is None:
         return
     with _session_store_lock(login, write=True) as directory:
@@ -1631,9 +1708,12 @@ def clear_finished_account_hold(login: str, *, request_ids: tuple[str, ...] = ()
             return
         held = _account_hold(_read_json(path), str(path))
         _check_account(login, held["login"], path)
+        if _registering_request_ids(held):
+            return
+        covered = _hold_request_ids(held)
         if request_ids and held["request_id"] not in request_ids:
             return
-        if not any(saved["request_id"] == held["request_id"]
+        if not any(saved["request_id"] in covered
                    for saved in _session_records_in_directory(directory, login)):
             path.unlink()
 

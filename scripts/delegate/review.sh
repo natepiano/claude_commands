@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # review.sh — Invoke the configured delegate agent for a review.
 #
-# Usage: review.sh [--to <worker> | --slot <new-slot> | --pool <type> --lease <slug>/<unit>/<phase>] <session_dir>
+# Usage: review.sh [--to <worker> | --slot <new-slot> | --pool <type> --lease <slug>/<unit>/<phase>]
+#                  [--phase <id>] <session_dir>
 #                  [working_dir] [prompt_file] [task]
 #                  [role_description] [pass_activity] [pass_index] [lens]
 #                  [early_ready_file]
@@ -27,6 +28,11 @@
 #   The unit director creates the sentinel after the implementation pass has
 #   finished and the final diff is written.
 #
+#   --phase <id> names the phase this review belongs to: start-pass stamps the
+#   pass with it, and every per-pass file below is written to
+#   <session_dir>/phases/<id>/ instead of <session_dir>, so two phases reviewing
+#   at once never overwrite each other. heartbeat.log stays run-wide.
+#
 # Produces (every name below takes a `_<lens>` suffix when a lens is given):
 #   <session_dir>/review_status            — "reviewing" while running, "reviewed" on success, "error" on failure
 #   <session_dir>/review_pid               — this wrapper's pid, so a progress
@@ -45,12 +51,6 @@
 #                                        reviewers are read-only; assigned reviewers
 #                                        are checked for an unchanged tree after
 #                                        their turn.
-#   <session_dir>/review_awake         — seconds the beat loop has counted for
-#                                        this dispatch, which excludes time the
-#                                        machine was suspended; stamped on the
-#                                        pass. An early launch starts the loop
-#                                        before its pass opens, so the total can
-#                                        exceed the pass it is recorded on.
 
 set -euo pipefail
 
@@ -58,12 +58,15 @@ FOLLOW_TO=""
 NEW_SLOT=""
 POOL_TYPE=""
 POOL_LEASE=""
+# A phase running beside the current one names itself, so start-pass stamps this pass with it.
+PHASE_ID=""
 while [[ "${1:-}" == --* ]]; do
   case "$1" in
     --to) FOLLOW_TO="${2:?--to requires a worker}" ;;
     --slot) NEW_SLOT="${2:?--slot requires a slot}" ;;
     --pool) POOL_TYPE="${2:?--pool requires a type}" ;;
     --lease) POOL_LEASE="${2:?--lease requires slug/unit/phase}" ;;
+    --phase) PHASE_ID="${2:?--phase requires a phase id}" ;;
     *) echo "ERROR: unknown review option '$1'." >&2; exit 2 ;;
   esac
   shift 2
@@ -97,8 +100,20 @@ elif [[ -n "${POOL_LEASE}" ]]; then
 fi
 
 SESSION_DIR="${1:?Usage: review.sh <session_dir> [working_dir] [prompt_file] [task] [role_description]}"
+# A named phase keeps its review files in its own directory, so two phases reviewing at once
+# never write the same pass's findings, status or log. Run-wide files stay in the session.
+ARTIFACT_DIR="${SESSION_DIR}"
+if [[ -n "${PHASE_ID}" ]]; then
+  # The directory keeps only the id's letters, digits, `.`, `_` and `-`: `ad hoc` is `adhoc`.
+  PHASE_DIR_NAME="${PHASE_ID//[^[:alnum:]._-]/}"
+  if [[ -z "${PHASE_DIR_NAME}" || "${PHASE_DIR_NAME}" == . || "${PHASE_DIR_NAME}" == .. ]]; then
+    echo "ERROR: phase id names no directory: ${PHASE_ID}" >&2
+    exit 2
+  fi
+  ARTIFACT_DIR="${SESSION_DIR}/phases/${PHASE_DIR_NAME}"
+fi
 WORKING_DIR="${2:-$(pwd)}"
-PROMPT_FILE="${3:-${SESSION_DIR}/review_prompt.md}"
+PROMPT_FILE="${3:-${ARTIFACT_DIR}/review_prompt.md}"
 SUBTASK="${4:-review}"
 ROLE_DESC="${5:-blind review of the current diff against its spec}"
 PASS_ACTIVITY="${6:-reviewing the current diff against its work order}"
@@ -195,20 +210,20 @@ TURN_FINDINGS_READY=0
 TURN_RAISED=0
 TURN_COUNT_READY=0
 TURN_RECORD_STATUS="error"
-FINDINGS_FILE="${SESSION_DIR}/review_findings_${PASS_INDEX}${SUFFIX}.txt"
-STATUS_FILE="${SESSION_DIR}/review_status${SUFFIX}"
-SLOT_FILE="${SESSION_DIR}/review_slot${SUFFIX}"
-LOG_FILE="${SESSION_DIR}/review_agent_${PASS_INDEX}${SUFFIX}.log"
-REPLY_FILE="${SESSION_DIR}/review_reply_${PASS_INDEX}${SUFFIX}.$$.txt"
+mkdir -p "${ARTIFACT_DIR}"
+FINDINGS_FILE="${ARTIFACT_DIR}/review_findings_${PASS_INDEX}${SUFFIX}.txt"
+STATUS_FILE="${ARTIFACT_DIR}/review_status${SUFFIX}"
+SLOT_FILE="${ARTIFACT_DIR}/review_slot${SUFFIX}"
+LOG_FILE="${ARTIFACT_DIR}/review_agent_${PASS_INDEX}${SUFFIX}.log"
+REPLY_FILE="${ARTIFACT_DIR}/review_reply_${PASS_INDEX}${SUFFIX}.$$.txt"
 if [[ -n "${POOL_TYPE}" ]]; then
   rm -f "${SLOT_FILE}"
 fi
 
-AGENT_FILE="${SESSION_DIR}/review_agent${SUFFIX}"
+AGENT_FILE="${ARTIFACT_DIR}/review_agent${SUFFIX}"
 HEARTBEAT_HELPER="${SCRIPT_DIR}/../agents/heartbeat.sh"
 BOARD_HELPER="${SCRIPT_DIR}/board.sh"
 HEARTBEAT_FILE="${SESSION_DIR}/heartbeat.log"
-AWAKE_FILE="${SESSION_DIR}/review_awake${SUFFIX}"
 PROGRESS_HELPER="${SCRIPT_DIR}/progress_history.py"
 PROGRESS_STATE="${SESSION_DIR}/progress_history_state.json"
 HEARTBEAT_INTERVAL_SECS=60
@@ -217,9 +232,9 @@ initialize_review_artifacts() {
   # Every reader of the unnumbered paths — the unit director's mid-run
   # preemption read, the heartbeat digest — keeps working while the per-pass
   # history is kept.
-  ln -sfn "review_findings_${PASS_INDEX}${SUFFIX}.txt" "${SESSION_DIR}/review_findings${SUFFIX}.txt"
-  ln -sfn "review_agent_${PASS_INDEX}${SUFFIX}.log" "${SESSION_DIR}/review_agent${SUFFIX}.log"
-  rm -f "${AWAKE_FILE}" "${REPLY_FILE}"
+  ln -sfn "review_findings_${PASS_INDEX}${SUFFIX}.txt" "${ARTIFACT_DIR}/review_findings${SUFFIX}.txt"
+  ln -sfn "review_agent_${PASS_INDEX}${SUFFIX}.log" "${ARTIFACT_DIR}/review_agent${SUFFIX}.log"
+  rm -f "${REPLY_FILE}"
   if [[ -n "${REVIEW_WORKER}" ]]; then
     : > "${FINDINGS_FILE}"
     TURN_FINDINGS_READY=1
@@ -227,19 +242,7 @@ initialize_review_artifacts() {
   echo "reviewing" > "${STATUS_FILE}"
   # Only meaningful while an early launch is showing in the progress report,
   # and read there only if written after the review was armed.
-  echo "$$" > "${SESSION_DIR}/review_pid${SUFFIX}"
-}
-
-# -1 says the beat loop counted nothing, which a review shorter than one
-# interval always does. The previous review's file is removed before this one
-# launches, so a leftover total can never be read as this pass's.
-awake_seconds() {
-  local counted
-  counted="$(cat "${AWAKE_FILE}" 2>/dev/null || true)"
-  case "${counted}" in
-    ''|*[!0-9]*) echo "-1" ;;
-    *) echo "${counted}" ;;
-  esac
+  echo "$$" > "${ARTIFACT_DIR}/review_pid${SUFFIX}"
 }
 
 # A assigned reviewer opens a new occupancy of a chair a writer has just left.
@@ -633,7 +636,7 @@ if [[ -n "${POOL_TYPE}" ]]; then
   POOL_FRESH_ARGS=()
   if [[ "${POOL_TYPE}" == ui ]]; then
     POOL_FRESH_ARGS=(--fresh)
-    SHOTS_FILE="${SESSION_DIR}/ux_shots_${PASS_INDEX}.txt"
+    SHOTS_FILE="${ARTIFACT_DIR}/ux_shots_${PASS_INDEX}.txt"
     if [[ ! -r "${SHOTS_FILE}" ]]; then
       echo "ERROR: UI shots file is unreadable: ${SHOTS_FILE}." >&2
       exit 1
@@ -670,7 +673,7 @@ if [[ -n "${POOL_TYPE}" ]]; then
   printf '%s\n' "${TEAM_SLOT}" > "${SLOT_FILE}"
   export PLAN_DELEGATE_TEAM_ROLE="${TEAM_SLOT}"
   if [[ "${POOL_TYPE}" == ui || "${LEASE_ORDINAL}" -eq 1 ]]; then
-    POOL_PROMPT_FILE="$(mktemp "${SESSION_DIR}/review_message_${PASS_INDEX}${SUFFIX}.XXXXXX")"
+    POOL_PROMPT_FILE="$(mktemp "${ARTIFACT_DIR}/review_message_${PASS_INDEX}${SUFFIX}.XXXXXX")"
     "$PY" "${POOL_HELPER}" unit-memory --production "${POOL_PRODUCTION}" \
       --unit "${POOL_UNIT}" > "${POOL_PROMPT_FILE}" 2>>"${LOG_FILE}"
     if [[ -s "${POOL_PROMPT_FILE}" ]]; then
@@ -744,7 +747,8 @@ record_pass_start() {
     --called-task "${TASK}" \
     --called-family "${AGENT_FAMILY}" \
     --called-model "${AGENT_MODEL}" \
-    --called-effort "${AGENT_EFFORT:-unset}"; then
+    --called-effort "${AGENT_EFFORT:-unset}" \
+    ${PHASE_ID:+--phase-id "${PHASE_ID}"}; then
     return 1
   fi
   PASS_STARTED=1
@@ -789,8 +793,7 @@ AGENT_PID=$!
 # streamed log (the tool it is running, the file it is reading, and its
 # prompt-instructed narration lines).
 bash "${SCRIPT_DIR}/../agents/heartbeat_watch.sh" \
-  "${HEARTBEAT_FILE}" "${BEAT_TAG}" "${AGENT_PID}" "${LOG_FILE}" "${HEARTBEAT_INTERVAL_SECS}" \
-  "${AWAKE_FILE}" &
+  "${HEARTBEAT_FILE}" "${BEAT_TAG}" "${AGENT_PID}" "${LOG_FILE}" "${HEARTBEAT_INTERVAL_SECS}" &
 HEARTBEAT_LOOP_PID=$!
 
 if [[ -n "${EARLY_READY_FILE}" ]]; then
@@ -870,8 +873,7 @@ if [[ "${AGENT_CODE}" -eq 0 && "${TREE_CHANGED}" -eq 0 ]]; then
   fi
   if [[ -f "${PROGRESS_STATE}" && "${PASS_STARTED}" -eq 1 ]]; then
     if ! PLAN_DELEGATE_PASS_OWNER=launcher "$PY" "${PROGRESS_HELPER}" finish-pass \
-      --session-dir "${SESSION_DIR}" --status completed \
-      --agent-awake-seconds "$(awake_seconds)"; then
+      --session-dir "${SESSION_DIR}" --status completed; then
       echo "ERROR: unable to record the review pass completion." >&2
       echo "error" > "${STATUS_FILE}"
       exit 1
@@ -894,7 +896,6 @@ else
   if [[ -f "${PROGRESS_STATE}" && "${PASS_STARTED}" -eq 1 ]]; then
     PLAN_DELEGATE_PASS_OWNER=launcher "$PY" "${PROGRESS_HELPER}" finish-pass \
       --session-dir "${SESSION_DIR}" --status error \
-      --agent-awake-seconds "$(awake_seconds)" \
       || echo "ERROR: unable to record the review pass error." >&2
   fi
   if [[ "${TREE_CHANGED}" -eq 1 ]]; then

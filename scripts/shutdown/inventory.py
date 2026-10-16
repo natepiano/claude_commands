@@ -21,6 +21,7 @@ for dependency in ("whoami", "message", "production", "herdr", "delegate", "lib"
     sys.path.insert(0, str(SCRIPTS / dependency))
 
 import account
+from probe_session import PROBE_ENV
 import unit_runs
 if TYPE_CHECKING:
     from ..delegate.worker_state import worker_ledger
@@ -97,6 +98,12 @@ class HerdrHost(TypedDict):
     kind: Literal["herdr"]
     herdr_session: str
     pane_id: str
+    presentation: NotRequired[Literal["attached window", "detached"]]
+
+
+def herdr_presentation(host: HerdrHost) -> Literal["attached window", "detached"]:
+    """Records made before window presentation was saved remain detached."""
+    return host.get("presentation", "detached")
 
 
 class NamedDesktop(TypedDict):
@@ -234,6 +241,7 @@ class SessionFields(TypedDict):
     cwd: str
     # Legacy absence requires the shutdown record's login or dated cutover evidence on resume.
     config_dir: NotRequired[str]
+    probe: bool
     status: str
     updated_at: int
     model: LastModel
@@ -508,6 +516,9 @@ def _parse_host(value: object, place: str, allow_unit: bool) -> Host:
             ),
         }
     if kind == "herdr":
+        presentation = _wire_string(data.get("presentation", "detached"), f"{place}.presentation")
+        if presentation not in {"attached window", "detached"}:
+            raise InvalidInventory(f"{place}.presentation: expected attached window or detached")
         return {
             "kind": "herdr",
             "herdr_session": _wire_string(
@@ -516,6 +527,7 @@ def _parse_host(value: object, place: str, allow_unit: bool) -> Host:
             "pane_id": _wire_string(
                 _wire_required(data, "pane_id", place), f"{place}.pane_id"
             ),
+            "presentation": cast(Literal["attached window", "detached"], presentation),
         }
     if kind == "tmux":
         pane: TmuxPane | PaneNotRecorded = (
@@ -732,6 +744,10 @@ def parse_session(value: object, place: str, *, require_updated_at: bool = False
             _wire_required(data, "timers", place), f"{place}.timers"
         ),
     }
+    probe = data.get("probe", False)
+    if not isinstance(probe, bool):
+        raise InvalidInventory(f"{place}.probe must be a boolean")
+    parsed["probe"] = probe
     if "config_dir" in data:
         parsed["config_dir"] = _wire_string(
             data["config_dir"], f"{place}.config_dir"
@@ -1330,7 +1346,9 @@ def _host(
         )
     place = herdr.herdr_place_of(session.get("pid", 0))
     if isinstance(place, herdr.HerdrPlace):
-        return {"kind": "herdr", "herdr_session": place.session, "pane_id": place.pane}
+        clients = herdr.attached_clients(place.session)
+        return {"kind": "herdr", "herdr_session": place.session, "pane_id": place.pane,
+                "presentation": "attached window" if isinstance(clients, herdr.ClientsAttached) else "detached"}
     desktop_name = desktops.get(session_id)
     desktop: Desktop = (
         {"kind": "named", "name": desktop_name}
@@ -1597,6 +1615,7 @@ def inventory(
             "name": entry.name,
             "cwd": cwd,
             "config_dir": str(entry.config_dir),
+            "probe": _process_environment(entry.pid).get(PROBE_ENV) == "1",
             "status": _string(record.get("status"), "unknown"),
             "updated_at": _wire_integer(record.get("updatedAt", 0), "session.updatedAt"),
             "model": _model(session_id, entry.config_dir),

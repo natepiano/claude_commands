@@ -718,6 +718,12 @@ class LifecycleTests(unittest.TestCase):
         self.assertIn("tree: ok — no parent and no child showrunners", result.stdout)
         self.assertEqual(self.sent(), [])
 
+    def test_wrap_names_herdr_and_tmux_sessions_for_close_out(self) -> None:
+        self.merged_units()
+        result = self.run_lifecycle("wrap", "--no-ci")
+        self.assert_step(result, "ok")
+        self.assertIn("| Next | close herdr or tmux sessions |", result.stdout)
+
     def test_wrap_detaches_from_its_parent_and_leaves_each_child_a_root(self) -> None:
         self.merged_units()
         for slug in ("top", "kid", "other"):

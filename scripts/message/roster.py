@@ -766,13 +766,13 @@ def _live_runs(
     for root in roots:
         _read_run_markers(root / "active", live_session_ids, by_path, problems)
         try:
-            heartbeats.extend(root.glob(f"*/{remove_workers.HEARTBEAT}"))
+            heartbeats.extend(root.glob(f"*/{unit_runs.HEARTBEAT}"))
         except OSError as error:
             _problem(problems, f"unit runs in {root}", error)
     now = time.time()
     for heartbeat in heartbeats:
         try:
-            if now - heartbeat.stat().st_mtime < remove_workers.LIVE_HEARTBEAT_SECS:
+            if now - heartbeat.stat().st_mtime < unit_runs.LIVE_HEARTBEAT_SECS:
                 _ = by_path.setdefault(heartbeat.parent.resolve(), _NoRunningDirector())
         except OSError as error:
             _problem(problems, f"delegate heartbeat {heartbeat}", error)
@@ -1098,7 +1098,8 @@ def _review_workers(
 ) -> list[RosterEntry]:
     entries: list[RosterEntry] = []
     try:
-        statuses = sorted(run.path.glob("review_status*"))
+        # A launch that names its phase writes in that phase's directory.
+        statuses = sorted([*run.path.glob("review_status*"), *run.path.glob("phases/*/review_status*")])
     except OSError as error:
         _problem(problems, f"review state in {run.path}", error)
         return entries
@@ -1114,7 +1115,7 @@ def _review_workers(
             continue
         if status != "reviewing":
             continue
-        pid_path = run.path / f"review_pid{suffix}"
+        pid_path = status_path.parent / f"review_pid{suffix}"
         try:
             launcher_pid = int(pid_path.read_text(encoding="utf-8").strip())
         except (OSError, UnicodeError, ValueError) as error:

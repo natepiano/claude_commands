@@ -583,7 +583,7 @@ print('two homes isolated; recorder lock retained; caller restored')
                 "",
                 "| Scope   |   % |  Elapsed |         ETA | Unchanged |              ETA low |             ETA high |",
                 "| ------- | --: | -------: | ----------: | --------- | -------------------: | -------------------: |",
-                "| Project |  80 | 00:01:40 | today 05:35 |           | today 05:35 (-00:00) | today 05:35 (+00:00) |",
+                "| Project |  80 | 00:01:40 | today 05:40 |           | today 05:36 (-00:03) | today 05:46 (+00:06) |",
                 "| Phase 3 |  25 | 00:01:40 | today 05:40 |           | today 05:36 (-00:03) | today 05:46 (+00:06) |",
                 "",
                 "**Phase 3: Retry handling**",
@@ -624,7 +624,7 @@ print('two homes isolated; recorder lock retained; caller restored')
             at=started_at + 160,
         )
         self.assertIn(
-            "| Project |  80 | 00:02:40 | today 05:36 | 00:01:00  |",
+            "| Project |  80 | 00:02:40 | today 05:44 | 00:01:00  |",
             unchanged_header,
         )
         self.assertIn(
@@ -659,7 +659,7 @@ print('two homes isolated; recorder lock retained; caller restored')
             at=started_at + 180,
         )
         self.assertIn(
-            "| Project |  85 | 00:03:00 | today 05:36 |           |",
+            "| Project |  85 | 00:03:00 | today 05:45 |           |",
             independently_changed,
         )
         self.assertIn(
@@ -1185,7 +1185,7 @@ print('two homes isolated; recorder lock retained; caller restored')
                     "",
                     "| Scope   |   % |  Elapsed |         ETA | Unchanged |              ETA low |             ETA high |",
                     "| ------- | --: | -------: | ----------: | --------- | -------------------: | -------------------: |",
-                    "| Project |  40 | 00:01:40 | today 05:37 |           | today 05:36 (-00:00) | today 05:38 (+00:01) |",
+                    "| Project |  40 | 00:01:40 | today 05:38 |           | today 05:37 (-00:01) | today 05:41 (+00:02) |",
                     "| Phase 3 |  30 | 00:01:40 | today 05:38 |           | today 05:37 (-00:01) | today 05:41 (+00:02) |",
                     "",
                     "**Phase 3: Retry handling**",
@@ -2107,6 +2107,7 @@ print('two homes isolated; recorder lock retained; caller restored')
         at: int,
         called_model: str = "gpt-called",
         fix_pass: int = 0,
+        *extra: str,
     ) -> None:
         """Open a pass the way one member of a phase team opens its own."""
         self.team_slot = slot
@@ -2128,6 +2129,7 @@ print('two homes isolated; recorder lock retained; caller restored')
             called_model,
             "--called-effort",
             "high",
+            *extra,
             at=at,
         )
 
@@ -2684,8 +2686,9 @@ print('two homes isolated; recorder lock retained; caller restored')
             [("Impl", "impl 3m done", "clean"), ("Fix 1", "fix 1m running", "running")],
         )
 
-    def test_finish_pass_records_the_seconds_the_delegate_was_awake(self) -> None:
-        session_dir = self.start_run("awake", 22_000)
+    def test_finish_pass_ignores_awake_seconds_from_an_older_launcher(self) -> None:
+        """A launcher started before the flag was retired still finishes its pass."""
+        session_dir = self.start_run("older-launcher", 22_000)
         self.start_phase_and_pass(session_dir, 22_010)
         _ = self.run_command(
             "finish-pass",
@@ -2694,34 +2697,12 @@ print('two homes isolated; recorder lock retained; caller restored')
             "--status",
             "completed",
             "--agent-awake-seconds",
-            "1800",
-            at=72_020,
+            "2100",
+            at=22_200,
         )
-        finished = self.pass_events("awake", "pass_finished")
+        finished = self.pass_events("older-launcher", "pass_finished")
         self.assertEqual(len(finished), 1)
-        # The point of the field: elapsed covers the stretch the machine spent
-        # suspended, and the beat count does not.
-        self.assertEqual(finished[0].get("pass_elapsed_seconds"), 50_000)
-        self.assertEqual(finished[0].get("agent_awake_seconds"), 1800)
-
-    def test_a_pass_with_nothing_counted_records_no_awake_seconds(self) -> None:
-        for name, reported in (("unreported", ()), ("none-counted", ("-1",))):
-            with self.subTest(name):
-                session_dir = self.start_run(name, 23_000)
-                self.start_phase_and_pass(session_dir, 23_010)
-                awake = ("--agent-awake-seconds", *reported) if reported else ()
-                _ = self.run_command(
-                    "finish-pass",
-                    "--session-dir",
-                    str(session_dir),
-                    "--status",
-                    "completed",
-                    *awake,
-                    at=23_050,
-                )
-                finished = self.pass_events(name, "pass_finished")
-                self.assertEqual(len(finished), 1)
-                self.assertNotIn("agent_awake_seconds", finished[0])
+        self.assertNotIn("agent_awake_seconds", finished[0])
 
     def test_aggregate_reports_raw_and_calibrated_error_fields(self) -> None:
         self.complete_historical_run(0)
@@ -3875,6 +3856,21 @@ print('two homes isolated; recorder lock retained; caller restored')
             "delegate.review",
             at=at,
         )
+
+    def test_an_early_review_naming_its_phase_watches_that_phase_directory(self) -> None:
+        """`review.sh --phase` writes its status there, so the marker must watch the same file."""
+        self.write_agents_registry()
+        started_at = 90_000
+        session_dir = self.start_run("early-phase", started_at)
+        self.start_phase_and_pass(session_dir, started_at)
+        _ = self.run_command(
+            "arm-review", "--session-dir", str(session_dir), "--phase-id", "3", "--lens", "adversary",
+            "--activity", "reviewing the diff the writer is still producing", at=started_at + 100,
+        )
+        state = cast(dict[str, object], json.loads((session_dir / "progress_history_state.json").read_text()))
+        armed = cast(dict[str, object], state["early_review"])
+        self.assertEqual(armed["status_file"], str(session_dir / "phases" / "3" / "review_status_adversary"))
+        self.assertEqual(armed["pid_file"], str(session_dir / "phases" / "3" / "review_pid_adversary"))
 
     def test_an_early_review_runs_as_its_own_row_beside_the_open_pass(self) -> None:
         """The one moment two agents work at once, shown as two running rows."""
@@ -5107,6 +5103,24 @@ print('two homes isolated; recorder lock retained; caller restored')
         self.assertIn("Phase 7 is not open; open phases: 6", cast(str, raised.exception.stderr))
         self.assertEqual(self.open_phase_ids(session_dir), ("6", []))
 
+    def test_a_pass_naming_an_older_open_phase_is_stamped_with_it(self) -> None:
+        started_at = 42_500
+        session_dir = self.start_run("pass-names-phase", started_at)
+        self.start_numbered_phase(session_dir, "15", started_at + 10)
+        older = cast(dict[str, object], self.read_state(session_dir)["phase"])
+        self.start_numbered_phase(session_dir, "16", started_at + 20)
+        self.start_slot_pass(session_dir, "impl", "impl", started_at + 30, "gpt-called", 0, "--phase-id", "15")
+        self.team_slot = ""
+        self.start_slot_pass(session_dir, "test", "test", started_at + 40)
+        self.team_slot = ""
+        slots = self.pass_slots(session_dir)
+        self.assertEqual(cast(dict[str, object], slots["impl"]["phase"])["instance_id"], older["instance_id"])
+        current = cast(dict[str, object], self.read_state(session_dir)["phase"])
+        self.assertEqual(cast(dict[str, object], slots["test"]["phase"])["instance_id"], current["instance_id"])
+        with self.assertRaises(subprocess.CalledProcessError) as raised:
+            self.start_slot_pass(session_dir, "fix", "fix", started_at + 50, "gpt-called", 0, "--phase-id", "7")
+        self.assertIn("Phase 7 is not open; open phases: 15, 16", cast(str, raised.exception.stderr))
+
     def test_back_filling_an_earlier_phase_leaves_the_open_phase_unchanged(self) -> None:
         started_at = 43_000
         session_dir = self.start_run("back-filled-phase", started_at)
@@ -5448,6 +5462,104 @@ class PublicPhaseHelperTests(unittest.TestCase):
             {"PLAN_DELEGATE_HISTORY_DIR": str(self.root / "history")},
         ):
             self.assertEqual(progress_history.plan_runs(plan), [])
+
+
+WorkSeconds = Callable[[list[dict[str, object]], str, float, float], int]
+SummaryTable = Callable[[str, dict[str, int], dict[str, int], dict[str, object], float, float, float], list[str]]
+CalibrationSamples = Callable[[list[dict[str, object]]], list[dict[str, object]]]
+
+
+def private(name: str) -> object:
+    found = vars(progress_history).get(name)
+    if not callable(found):
+        raise AssertionError(f"progress recorder function is unavailable: {name}")
+    return found
+
+
+def window(kind: str, key: str, started_at: float, finished_at: float | None) -> list[dict[str, object]]:
+    """A pass or activity window of phase `p`, open when `finished_at` is None."""
+    id_field = f"{kind}_instance_id"
+    events: list[dict[str, object]] = [
+        {"phase_instance_id": "p", "event_type": f"{kind}_started", id_field: key, "timestamp_epoch": started_at}
+    ]
+    if finished_at is not None:
+        events.append(
+            {"phase_instance_id": "p", "event_type": f"{kind}_finished", id_field: key, "timestamp_epoch": finished_at}
+        )
+    return events
+
+
+class EtaWorkClockTests(unittest.TestCase):
+    """The phase clock leaves idle stretches out, and the project never lands before its phase.
+
+    herdr-trial, 2026-10-15: a phase whose clock ran through a night quoted the next
+    evening for an hour of work, and the project row arrived hours before it.
+    """
+
+    @property
+    def grace(self) -> int:
+        grace = vars(progress_history).get("IDLE_GRACE_SECONDS")
+        if not isinstance(grace, int):
+            raise AssertionError("progress recorder idle grace is unavailable")
+        return grace
+
+    def work_seconds(self, events: list[dict[str, object]], phase_instance_id: str, started_at: float, until: float) -> int:
+        return cast(WorkSeconds, private("_work_seconds"))(events, phase_instance_id, started_at, until)
+
+    def test_an_overnight_gap_between_dispatches_counts_only_the_grace(self) -> None:
+        night = 10 * 3600
+        events = window("pass", "a", 100, 1_100) + window("pass", "b", 1_100 + night, 2_100 + night)
+        self.assertEqual(self.work_seconds(events, "p", 0, 2_100 + night), 100 + 1_000 + self.grace + 1_000)
+
+    def test_an_open_window_counts_up_to_now(self) -> None:
+        events = window("activity", "a", 0, None)
+        self.assertEqual(self.work_seconds(events, "p", 0, 5 * 3600), 5 * 3600)
+
+    def test_a_wait_after_the_last_window_counts_only_the_grace(self) -> None:
+        events = window("pass", "a", 0, 600)
+        self.assertEqual(self.work_seconds(events, "p", 0, 600 + 8 * 3600), 600 + self.grace)
+
+    def test_overlapping_windows_count_once(self) -> None:
+        events = window("pass", "a", 0, 1_000) + window("activity", "b", 500, 1_500)
+        self.assertEqual(self.work_seconds(events, "p", 0, 1_500), 1_500)
+
+    def test_another_phase_windows_do_not_count(self) -> None:
+        events = [{**event, "phase_instance_id": "q"} for event in window("pass", "a", 0, 10_000)]
+        events += window("pass", "b", 0, 600)
+        self.assertEqual(self.work_seconds(events, "p", 0, 10_000), 600 + self.grace)
+
+    def test_a_phase_with_no_windows_keeps_the_wall_clock(self) -> None:
+        self.assertEqual(self.work_seconds([], "p", 1_000, 1_000 + 9 * 3600), 9 * 3600)
+
+    def test_the_project_eta_is_never_earlier_than_its_phase(self) -> None:
+        summary_table = cast(SummaryTable, private("_summary_table"))
+        # The project reads 90% after ten hours, an hour left; the phase reads 20%
+        # after one hour, four left. Unfloored, the project lands three hours early.
+        project = {"percent": 90, "elapsed": 10 * 3600, "unchanged": 0}
+        phase = {"percent": 20, "elapsed": 3600, "unchanged": 0}
+        rows = [
+            [cell.strip() for cell in line.strip("|").split("|")]
+            for line in summary_table("7", project, phase, {}, 10.0, 0.0, 0.0)
+            if line.startswith("| Project") or line.startswith("| Phase")
+        ]
+        project_row, phase_row = rows
+        self.assertEqual(project_row[3], phase_row[3])
+        self.assertEqual(project_row[5:], phase_row[5:])
+
+    def test_calibration_measures_time_spent_in_work_time(self) -> None:
+        calibration_samples = cast(CalibrationSamples, private("_calibration_samples"))
+        night = 10 * 3600
+        phase: dict[str, object] = {"phase_instance_id": "p", "phase_started_at": 0}
+        events: list[dict[str, object]] = [
+            *window("pass", "a", 0, 3_600),
+            *window("pass", "b", 3_600 + night, 7_200 + night),
+            {**phase, "event_type": "progress_reported", "timestamp_epoch": 7_000 + night, "raw_percent": 90, "percent": 90},
+            {**phase, "event_type": "phase_finished", "status": "completed", "timestamp_epoch": 7_200 + night},
+        ]
+        sample, = calibration_samples(events)
+        # Work time: 3600 + grace + 3400 of 3600 + grace + 3600. Wall time read 79%.
+        expected = 100.0 * (7_000 + self.grace) / (7_200 + self.grace)
+        self.assertAlmostEqual(cast(float, sample["temporal_percent"]), expected, places=3)
 
 
 if __name__ == "__main__":
