@@ -2711,6 +2711,16 @@ class AccountsTests(unittest.TestCase):
         self.assertEqual(second, first)
         self.codex_reads.assert_awaited_once_with(self.home / ".codex")
 
+    def test_status_table_displays_both_groups_on_the_same_account_in_group_order(self) -> None:
+        self.login_directory("claude2", "shared@example.invalid")
+        groups = accounts.groups_file()
+        groups.parent.mkdir(parents=True, exist_ok=True)
+        _ = groups.write_text('{"showrunners": "claude2", "units": "claude2"}')
+        code, output, error = self.run_cli("status", "--stored")
+        self.assertEqual((code, error), (0, ""))
+        row = next(line for line in output.splitlines() if "| claude2 " in line)
+        self.assertEqual([cell.strip() for cell in row.split("|")][4], "units, showrunners")
+
     def json_status_fixture(self) -> tuple[datetime, datetime]:
         self.login_directory("claude2", "main@example.invalid")
         self.login_directory("claude3", "unit@example.invalid")

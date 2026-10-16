@@ -48,7 +48,7 @@ RequestedFields = TypedDict("RequestedFields", {"from": HistoricalAccountLabel, 
 
 class RequestedMove(MoveCommon, RequestedFields):
     kind: Literal["requested"]
-    cause: NotRequired[Literal["refusal", "credits off", "by hand"]]
+    cause: NotRequired[Literal["refusal", "credits off", "by hand", "auto"]]
 
 
 class ConfirmedMove(MoveCommon):
@@ -174,7 +174,7 @@ def _valid(value: object) -> bool:
     if "window" in fields and fields["window"] not in ("weekly", "five_hour", "unknown"):
         return False
     kind = fields.get("kind")
-    if "cause" in fields and (kind != "requested" or fields["cause"] not in ("refusal", "credits off", "by hand")):
+    if "cause" in fields and (kind != "requested" or fields["cause"] not in ("refusal", "credits off", "by hand", "auto")):
         return False
     if kind in ("requested", "waited") and "reset" in fields:
         if not isinstance(fields["reset"], str) or not fields["reset"]:

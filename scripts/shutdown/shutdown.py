@@ -96,6 +96,7 @@ class CommandLine(argparse.Namespace):
     why: str = ""
     move_id: str = ""
     refused: str = ""
+    auto: bool = False
     reset: datetime | None = None
     session_id: str = ""
     pid: int = 0
@@ -943,7 +944,9 @@ def main(arguments: list[str] | None = None) -> int:
                 raise argparse.ArgumentError(self, "--reset requires an aware ISO time") from error
             namespace.reset = reset
 
-    _ = down.add_argument("--refused", choices=("weekly", "five_hour", "unknown"), default="")
+    origin = down.add_mutually_exclusive_group()
+    _ = origin.add_argument("--refused", choices=("weekly", "five_hour", "unknown"), default="")
+    _ = origin.add_argument("--auto", action="store_true", help="move requested by an automatic account rule")
     _ = down.add_argument("--reset", action=AwareReset)
     _ = down.add_argument("--move-id", default="", help=argparse.SUPPRESS)
     _ = down.add_argument("--why", default="", help="reason for the account move")
@@ -1301,7 +1304,9 @@ def _dispatch(options: CommandLine) -> int:
             from scripts.accounts import accounts
             from scripts.accounts.refusals import KnownReset, NoResetKnown
             move_origin: accounts.MoveOrigin = accounts.HandOrigin()
-            if options.refused:
+            if options.auto:
+                move_origin = accounts.AutoOrigin()
+            elif options.refused:
                 move_origin = accounts.RefusalOrigin(cast(Literal["weekly", "five_hour", "unknown"], options.refused),
                     KnownReset(options.reset) if options.reset is not None else NoResetKnown())
             return settle.down(
