@@ -41,6 +41,7 @@ from typing import Callable, Literal, TextIO, TypedDict, cast, final, override
 from unittest.mock import MagicMock, patch
 
 from scripts.agents import codex_mesh
+from scripts.message import sessions
 from scripts.usage import agents_log
 from scripts.accounts import accounts, moves, refusals
 from scripts.whoami import agent_accounts
@@ -110,6 +111,12 @@ CAPACITY = "Selected model is at capacity. Please try a different model."
 STALE_SIGN_IN = ("Your access token could not be refreshed because you have since logged out or signed in to "
                  "another account. Please sign in again.")
 THREAD_ID = "thread-capacity-test"
+
+
+def running_holder(session_id: str) -> sessions.SessionRecord:
+    """A process-validated holder with no messaging socket is still running."""
+    return sessions.SessionRecord(pid=os.getpid(), sessionId=session_id, name=session_id,
+        messagingSocketPath="", updatedAt=1, tmux="", formerNames=[])
 
 
 def _read_exact(sock: socket.socket, count: int) -> bytes:
@@ -2815,6 +2822,8 @@ class MeshCommandTests(unittest.TestCase):
         active = run.parent / "active"
         active.mkdir()
         _ = (active / "scratch-holder").write_text(str(run) + "\n")
+        _ = self.patches.enter_context(patch.object(sessions, "running_sessions",
+                                                   return_value=[running_holder("scratch-holder")]))
         self.outcomes = ["disconnect", "completed"]
         self.server.hold_turn_completion = True
         respond = self.server.respond
@@ -2851,8 +2860,34 @@ class MeshCommandTests(unittest.TestCase):
         self.assertTrue(resumes)
         self.assertTrue(all(_as_test_dict(request["params"])["threadId"] == THREAD_ID for request in resumes))
 
-    def assert_waiting_launcher_account_move(self, *, sign_in_change: bool) -> None:
+    def assert_waiting_launcher_account_move(self, *, sign_in_change: bool, ended_run: bool = False) -> None:
         target, new = self.prepare_running_account_swap()
+        ended_runs: list[tuple[Path, StubAppServer]] = []
+        if ended_run:
+            ended = self.session_dir.with_name("ended-run")
+            ended.mkdir()
+            def idle(request: dict[str, object]) -> list[dict[str, object]]:
+                method = request.get("method")
+                if method == "thread/loaded/list":
+                    return [_reply(request, {"data": ["ended-thread"]})]
+                if method == "thread/read":
+                    return [_reply(request, {"thread": {"id": "ended-thread", "status": {"type": "idle"}, "turns": []}})]
+                self.assertNotIn(method, ("turn/interrupt", "turn/start", "thread/resume"))
+                return [_reply(request, {})]
+            server = StubAppServer(idle)
+            _ = self.patches.callback(server.close)
+            ended_runs.append((ended, server))
+            def process_alive(pid: int) -> bool:
+                return pid in (os.getpid(), 81234)
+            _ = self.patches.enter_context(patch.object(codex_mesh, "_pid_alive",
+                side_effect=process_alive))
+            _ = (ended / codex_mesh.SERVER_FILE).write_text(json.dumps({"pid": 81234,
+                "port": server.port, "codex_home": str(target.parent / ".codex")}))
+            # Stale roster and launcher survive their holder; neither makes the run live.
+            _ = (ended / codex_mesh.ROSTER_FILE).write_text(json.dumps({"unread-worker": {
+                "thread_id": "ended-thread", "turn_id": "stale-turn", "status": "running",
+                "launcher_pid": os.getpid(), "role": "impl", "port": server.port}}))
+            _ = (ended.parent / "active/dead-holder").write_text(str(ended) + "\n")
         label = "codex9" if sign_in_change else "codex1"
         if sign_in_change:
             _ = cast(object, self.patches.enter_context(patch.dict(os.environ, {"CODEX_HOME": str(target.parent / ".codex")})))
@@ -2875,7 +2910,8 @@ class MeshCommandTests(unittest.TestCase):
                 if sign_in_change:
                     def old_sign_in(_pid: int, _home: Path) -> bool:
                         path = self.session_dir / codex_mesh.SERVER_FILE
-                        return path.exists() and _as_test_dict(cast(object, json.loads(path.read_text()))).get("port") == self.server.port
+                        return _pid == 81234 or (path.exists() and
+                            _as_test_dict(cast(object, json.loads(path.read_text()))).get("port") == self.server.port)
                     with patch.object(codex_mesh, "_holds_old_sign_in", side_effect=old_sign_in):
                         self.assertEqual(codex_mesh.command_signin_changed(argparse.Namespace(
                             root=str(self.session_dir.parent))), 0)
@@ -2887,9 +2923,20 @@ class MeshCommandTests(unittest.TestCase):
             finally:
                 self.server.release_held_turn.set()
         mover = threading.Thread(target=swap, daemon=True)
+        def stop(_roots: tuple[Path, ...] | None, _pid: int, port: int,
+                 ownership: codex_mesh.ServerOwnership) -> bool:
+            for folder, server in ended_runs:
+                if port == server.port:
+                    self.assertEqual(ownership, codex_mesh.RetiredRunServer(folder))
+                    self.assertEqual(codex_mesh._busy_threads(port, {"ended-thread": "unread-worker"}), ())  # pyright: ignore[reportPrivateUsage]
+                    return True
+            return False
         with (patch.object(codex_mesh.Client, "next_frame", frame),
               patch.object(codex_mesh, "_notify_holder") as notify,
-              contextlib.redirect_stdout(io.StringIO())):
+              patch.object(codex_mesh, "_resume_account_move_detached",
+                           side_effect=AssertionError("a live holder's launcher resumes its own worker")) as detach,
+              patch.object(codex_mesh, "_stop_unused", side_effect=stop) as stopped,
+              contextlib.redirect_stdout(io.StringIO()) as output):
             mover.start()
             try:
                 code, errors = self.run_start()
@@ -2916,9 +2963,142 @@ class MeshCommandTests(unittest.TestCase):
         self.assertNotIn("finish first", notice)
         self.assertEqual(notify.call_args.args[2], codex_mesh.CodexNoticeKind.SIGN_IN_CHANGED if sign_in_change
                          else codex_mesh.CodexNoticeKind.WORKERS_CHANGED)
+        self.assertEqual(notify.call_args.args[0], "scratch-holder")
+        detach.assert_not_called()
+        for folder, server in ended_runs:
+            self.assertFalse((folder / "unread-worker.account-move.json").exists())
+            self.assertFalse((folder / codex_mesh.SERVER_FILE).exists())
+            self.assertFalse(any(request.get("method") in ("turn/interrupt", "turn/start", "thread/resume")
+                                 for request in server.requests))
+            self.assertTrue(any(call.args == (None, 81234, server.port, codex_mesh.RetiredRunServer(folder))
+                                for call in stopped.call_args_list))
+            if sign_in_change:
+                self.assertIn("1 leftover servers from ended sessions, 1 stopped", output.getvalue())
+            else:
+                leftover = next(run for run in switches if run.folder == folder)
+                self.assertEqual((leftover.workers, leftover.holders, leftover.leftover_servers,
+                                  leftover.stopped_servers), ((), (), 1, 1))
         if not sign_in_change:
-            self.assertEqual(len(switches), 1)
-            self.assertTrue(switches[0].workers[0].mid_turn)
+            live = [run for run in switches if run.workers]
+            self.assertEqual(len(live), 1)
+            self.assertTrue(live[0].workers[0].mid_turn)
+
+    def test_swap_resumes_socketless_live_holder_but_leaves_dead_holders_worker_alone(self) -> None:
+        self.assert_waiting_launcher_account_move(sign_in_change=False, ended_run=True)
+
+    def test_sign_in_change_resumes_live_holder_but_leaves_dead_holders_worker_alone(self) -> None:
+        self.assert_waiting_launcher_account_move(sign_in_change=True, ended_run=True)
+
+    def assert_ended_busy_server_is_left_running(self, *, sign_in_change: bool) -> None:
+        target, new = self.prepare_running_account_swap()
+        self.live_turn = "turn-1"
+        self.write_pool_roster({"worker": {"thread_id": THREAD_ID, "turn_id": "turn-1", "status": "running",
+            "launcher_pid": os.getpid(), "role": "impl", "port": self.server.port}})
+        if sign_in_change:
+            current = self.session_dir / codex_mesh.SERVER_FILE
+            _ = (self.session_dir / codex_mesh.RETIRED_FILE).write_text(json.dumps({
+                "servers": [json.loads(current.read_text())]}))
+            current.unlink()
+        before = {path.name: path.read_bytes() for path in self.session_dir.iterdir() if path.is_file()}
+        with (patch.object(sessions, "running_sessions", return_value=[]),
+              patch.object(codex_mesh, "_client_counts", return_value={}),
+              patch.object(codex_mesh, "_stop_unused", return_value=False) as stop,
+              patch.object(codex_mesh, "_notify_holder") as notify,
+              patch.object(codex_mesh, "_resume_account_move_detached") as detach,
+              contextlib.redirect_stdout(io.StringIO()) as output):
+            preview = codex_mesh.retire_workers_servers(target, "codex1", dry_run=True)
+            stop.assert_not_called()
+            self.assertFalse((self.session_dir / "worker.account-move.json").exists())
+            self.assertEqual({path.name: path.read_bytes() for path in self.session_dir.iterdir()
+                              if path.is_file() and path.name in before}, before)
+            self.assertEqual((preview[0].workers, preview[0].holders, preview[0].leftover_servers), ((), (), 1))
+            kept = preview[0].kept_servers
+            self.assertEqual([(server.pid, server.port) for server in kept], [(os.getpid(), self.server.port)])
+            self.assertIn("conversation", kept[0].reason)
+            self.assertIn("worker", kept[0].reason)
+            if sign_in_change:
+                with (patch.dict(os.environ, {"CODEX_HOME": str(target.parent / ".codex")}),
+                      patch.object(codex_mesh, "_sign_in_changed_at", return_value=2000),
+                      patch.object(codex_mesh, "_holds_old_sign_in", return_value=True)):
+                    self.assertEqual(codex_mesh.command_signin_changed(argparse.Namespace(
+                        root=str(self.session_dir.parent))), 0)
+                text = output.getvalue()
+                self.assertIn("1 leftover servers from ended sessions, 0 stopped", text)
+                self.assertIn(f"left running: {os.getpid()} on port {self.server.port} ({self.session_dir}):", text)
+                self.assertIn("conversation", text)
+            else:
+                switched = codex_mesh.retire_workers_servers(target, "codex1")
+                self.assertEqual((switched[0].workers, switched[0].stopped_servers), ((), 0))
+                self.assertEqual(switched[0].kept_servers, kept)
+            stop.assert_called_once_with(None, os.getpid(), self.server.port,
+                                         codex_mesh.RetiredRunServer(self.session_dir))
+            notify.assert_not_called()
+            detach.assert_not_called()
+        self.assertEqual(self.methods("turn/interrupt"), [])
+        self.assertEqual(new.requests, [])
+        self.assertEqual(self.live_turn, "turn-1")
+        self.assertFalse((self.session_dir / "worker.account-move.json").exists())
+        self.assertFalse((self.session_dir / codex_mesh.SERVER_FILE).exists())
+
+    def test_swap_keeps_ended_run_busy_server_and_preview_never_interrupts_it(self) -> None:
+        self.assert_ended_busy_server_is_left_running(sign_in_change=False)
+
+    def test_sign_in_change_finds_ended_retired_only_busy_server_and_names_why_it_stays(self) -> None:
+        self.assert_ended_busy_server_is_left_running(sign_in_change=True)
+
+    def test_swap_without_holders_requires_a_live_launcher_and_any_running_holder_keeps_a_run_live(self) -> None:
+        target, _ = self.prepare_running_account_swap()
+        active = self.session_dir.parent / "active"
+        (active / "scratch-holder").unlink()
+        cases = (
+            ((), (), os.getpid(), True),
+            ((), (), 99999999, False),
+            (("dead-holder",), (), os.getpid(), False),
+            (("dead-holder", "socketless-holder"), ("socketless-holder",), 99999999, True),
+        )
+        for holders, running, launcher, expected_live in cases:
+            with self.subTest(holders=holders, running=running, live_launcher=launcher == os.getpid()):
+                for marker in active.iterdir():
+                    marker.unlink()
+                for holder in holders:
+                    _ = (active / holder).write_text(str(self.session_dir) + "\n")
+                self.write_pool_roster({"worker": {"thread_id": THREAD_ID, "status": "running",
+                    "turn_id": "turn-1", "launcher_pid": launcher, "port": self.server.port}})
+                with (patch.object(sessions, "running_sessions", return_value=[running_holder(holder) for holder in running]),
+                      patch.object(sessions, "live_sessions", side_effect=AssertionError("sockets do not decide liveness")),
+                      patch.object(codex_mesh, "_client_counts", return_value={}),
+                      patch.object(codex_mesh, "_stop_unused") as stop):
+                    preview = codex_mesh.retire_workers_servers(target, "codex1", dry_run=True)
+                self.assertEqual(bool(preview[0].workers), expected_live)
+                self.assertEqual(preview[0].leftover_servers, 0 if expected_live else 1)
+                stop.assert_not_called()
+        self.assertEqual(self.methods("turn/interrupt"), [])
+
+    def test_sign_in_change_stops_ended_retired_only_server_without_resuming_its_workers(self) -> None:
+        target, new = self.prepare_running_account_swap()
+        current = self.session_dir / codex_mesh.SERVER_FILE
+        _ = (self.session_dir / codex_mesh.RETIRED_FILE).write_text(json.dumps({"servers": [json.loads(current.read_text())]}))
+        current.unlink()
+        self.write_pool_roster({"worker": {"thread_id": THREAD_ID, "status": "running", "turn_id": "stale-turn",
+            "launcher_pid": os.getpid(), "port": self.server.port, "role": "impl"}})
+        with (patch.dict(os.environ, {"CODEX_HOME": str(target.parent / ".codex")}),
+              patch.object(sessions, "running_sessions", return_value=[]),
+              patch.object(codex_mesh, "_sign_in_changed_at", return_value=2000),
+              patch.object(codex_mesh, "_holds_old_sign_in", return_value=True),
+              patch.object(codex_mesh, "_stop_unused", return_value=True) as stop,
+              patch.object(codex_mesh, "_notify_holder") as notify,
+              patch.object(codex_mesh, "_resume_account_move_detached") as detach,
+              contextlib.redirect_stdout(io.StringIO()) as output):
+            self.assertEqual(codex_mesh.command_signin_changed(argparse.Namespace(root=str(self.session_dir.parent))), 0)
+        stop.assert_called_once_with(None, os.getpid(), self.server.port,
+                                     codex_mesh.RetiredRunServer(self.session_dir))
+        self.assertIn("1 leftover servers from ended sessions, 1 stopped", output.getvalue())
+        self.assertNotIn("left running:", output.getvalue())
+        self.assertEqual(self.methods("turn/interrupt"), [])
+        self.assertEqual(new.requests, [])
+        self.assertFalse((self.session_dir / "worker.account-move.json").exists())
+        notify.assert_not_called()
+        detach.assert_not_called()
 
     def assert_account_move_interrupts_all_runs_before_waiting(self, *, sign_in_change: bool) -> None:
         target, new = self.prepare_running_account_swap()
@@ -6001,6 +6181,7 @@ class SignInChangeTests(unittest.TestCase):
             told.append((session_id, line))
 
         with patch.object(codex_mesh, "_sign_in_changed_at", return_value=2000.0), \
+                patch.object(sessions, "running_sessions", return_value=[running_holder("session-a")]), \
                 patch.object(codex_mesh, "_server_started_at", side_effect=starts.get), \
                 patch.object(codex_mesh, "_stop_unused", return_value=stops) as stop, \
                 patch.object(codex_mesh, "_start_watcher") as watch, \
@@ -6044,6 +6225,14 @@ class SignInChangeTests(unittest.TestCase):
                 process.kill()
                 _ = process.wait(timeout=5)
 
+    def test_a_holder_that_ends_while_earlier_runs_move_leaves_its_run_ended(self) -> None:
+        with tempfile.TemporaryDirectory() as directory, \
+                patch.object(sessions, "running_sessions", side_effect=[
+                    [running_holder("session-a"), running_holder("session-b")], [running_holder("session-a")]]):
+            folder = Path(directory)
+            self.assertTrue(codex_mesh._run_is_live(folder, ("session-a",)))  # pyright: ignore[reportPrivateUsage]
+            self.assertFalse(codex_mesh._run_is_live(folder, ("session-b",)))  # pyright: ignore[reportPrivateUsage]
+
     def test_an_idle_run_has_its_old_server_stopped_at_once(self) -> None:
         old = subprocess.Popen(["sleep", "30"])
         try:
@@ -6055,10 +6244,48 @@ class SignInChangeTests(unittest.TestCase):
                 told, watched = self.signin_changed(root, {old.pid: 1000.0}, stops=True)
                 # No run-active marker names it, so there is no one to tell.
                 self.assertEqual((told, watched), ([], []))
-                self.assertIn("stopped", (root / "run-a" / codex_mesh.SERVER_LOG).read_text())
+                self.assertTrue((root / "run-a" / codex_mesh.RETIRED_FILE).exists())
         finally:
             old.kill()
             _ = old.wait(timeout=5)
+
+    def test_live_run_with_only_retired_old_sign_in_is_not_moved_or_notified(self) -> None:
+        for has_current in (False, True):
+            with self.subTest(has_current=has_current), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                run = root / "already-moved"
+                run.mkdir()
+                (root / "active").mkdir()
+                _ = (root / "active" / "session-a").write_text(str(run) + "\n")
+                home = root / "home"
+                retired = run / codex_mesh.RETIRED_FILE
+                _ = retired.write_text(json.dumps({"servers": [
+                    {"port": 4001, "pid": 101, "codex_home": str(home)}]}))
+                if has_current:
+                    _ = (run / codex_mesh.SERVER_FILE).write_text(json.dumps(
+                        {"port": 4002, "pid": 102, "codex_home": str(home)}))
+                _ = (run / codex_mesh.ROSTER_FILE).write_text(json.dumps({"worker": {
+                    "thread_id": "same-thread", "turn_id": "live-turn", "status": "running", "port": 4002}}))
+                before = {path.name: path.read_bytes() for path in run.iterdir()}
+                with (patch.dict(os.environ, {"CODEX_HOME": str(home)}),
+                      patch.object(sessions, "running_sessions", return_value=[running_holder("session-a")]),
+                      patch.object(codex_mesh, "_sign_in_changed_at", return_value=2000.0),
+                      patch.object(codex_mesh, "_server_started_at", side_effect={101: 1000.0, 102: 3000.0}.get),
+                      patch.object(codex_mesh, "_pid_alive", return_value=True),
+                      patch.object(codex_mesh, "_switch_run_workers") as switch,
+                      patch.object(codex_mesh, "_stop_unused") as stop,
+                      patch.object(codex_mesh, "_start_watcher") as watch,
+                      patch.object(codex_mesh, "_notify_holder") as notify,
+                      contextlib.redirect_stdout(io.StringIO()) as output):
+                    self.assertEqual(codex_mesh.command_signin_changed(argparse.Namespace(root=str(root))), 0)
+                self.assertIn("0 run(s) moved", output.getvalue())
+                switch.assert_not_called()
+                stop.assert_not_called()
+                watch.assert_not_called()
+                notify.assert_not_called()
+                for name, contents in before.items():
+                    self.assertEqual((run / name).read_bytes(), contents)
+                self.assertFalse((run / "worker.account-move.json").exists())
 
     def test_a_resident_worker_moves_to_the_new_server_between_turns(self) -> None:
         calls: list[tuple[int, str]] = []
@@ -6296,6 +6523,14 @@ class WorkersHomeTests(unittest.TestCase):
         self.session_dir = root / "run"
         self.session_dir.mkdir()
         _ = cast(object, self.enterContext(patch.dict(os.environ, {"HOME": str(self.home), "AGENT_NOTES_DIR": str(self.home)}, clear=True)))
+        _ = self.enterContext(patch.object(sessions, "running_sessions", return_value=[
+            running_holder(holder) for holder in ("director-one", "director-two", "holder-id", "test-holder")]))
+
+    def mark_live_holder(self) -> None:
+        active = self.session_dir.parent / "active"
+        active.mkdir(exist_ok=True)
+        _ = (active / "test-holder").write_text(str(self.session_dir) + "\n")
+        _ = self.enterContext(patch.object(codex_mesh, "_notify_holder"))
 
     def select(self, label: str = "codex1") -> Path:
         home = self.home / ("." + note_name(label).removesuffix(".md"))
@@ -6401,6 +6636,7 @@ class WorkersHomeTests(unittest.TestCase):
         self.assertIn("next task", (self.session_dir / "worker.pending.json").read_text())
 
     def test_swap_reads_legacy_source_as_default_home(self) -> None:
+        self.mark_live_holder()
         home = self.select()
         _ = (self.session_dir / codex_mesh.SERVER_FILE).write_text(json.dumps({"port": 4001, "pid": os.getpid()}))
         with patch.object(codex_mesh, "SWEEP_ROOTS", (self.session_dir.parent,)), patch.object(codex_mesh, "_stop_unused", return_value=True):
@@ -6615,6 +6851,7 @@ class WorkersHomeTests(unittest.TestCase):
         self.assertIn("once that turn ends", result.reason)
 
     def test_both_notices_use_the_shared_user_zone(self) -> None:
+        self.mark_live_holder()
         home = self.select()
         root = self.session_dir.parent
         for zone in (ZoneInfo("Asia/Tokyo"), None):
@@ -6827,8 +7064,24 @@ class ServerRecordTests(unittest.TestCase):
                 patch.object(codex_mesh, "SERVER_IDLE_SECS", 60.0), \
                 patch.object(sys, "executable", str(stub)):
             process = codex_mesh._start_watcher(str(self.session_dir), pid, 4321)  # pyright: ignore[reportPrivateUsage]
+        assert isinstance(process, subprocess.Popen)
         self.spawned.append(process)
         return process, calls
+
+    def test_repeated_retirement_keeps_one_watcher_until_that_watcher_exits(self) -> None:
+        pid = self.sleeper()
+        self.write_server(4321, pid)
+        process, calls = self.watcher(pid)
+        with patch.object(subprocess, "Popen", wraps=subprocess.Popen) as launch:
+            existing = codex_mesh._start_watcher(str(self.session_dir), pid, 4321)  # pyright: ignore[reportPrivateUsage]
+        self.assertIsInstance(existing, codex_mesh.ExistingServerWatcher)
+        launch.assert_not_called()
+        self.assertFalse(calls.exists())
+        old = time.time() - 7200
+        os.utime(self.session_dir / codex_mesh.SERVER_FILE, (old, old))
+        _ = process.wait(timeout=10)
+        replacement = self.watcher(pid)[0]
+        self.assertNotEqual(replacement.pid, process.pid)
 
     def test_the_watcher_asks_only_about_a_record_gone_untouched_and_then_leaves(self) -> None:
         pid = self.sleeper()

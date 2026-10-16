@@ -2971,6 +2971,73 @@ class AccountsTests(unittest.TestCase):
         self.assertEqual(self.role_files(), before)
         retire.assert_not_called()
 
+    def test_workers_swap_folds_same_holder_slot_across_runs_without_hiding_failures_or_other_holders(self) -> None:
+        for dry_run in (True, False):
+            with self.subTest(dry_run=dry_run):
+                _ = self.workers_fixture()
+                commands = ("mesh resume-account-move --to plan-c-review", "mesh resume-account-move --to plan-d-review")
+                switches = (
+                    codex_mesh.WorkersRunSwitch(self.root / "plan-a", ("holder-a",), (
+                        codex_mesh.SwitchingWorker("plan-a-review", False),
+                        codex_mesh.SwitchingWorker("plan-a-impl", False))),
+                    codex_mesh.WorkersRunSwitch(self.root / "plan-b", ("holder-a",), (
+                        codex_mesh.SwitchingWorker("plan-b-review-worker", True, codex_mesh.WorkerMoveResumed()),
+                        codex_mesh.SwitchingWorker("plan-b-impl", False))),
+                    codex_mesh.WorkersRunSwitch(self.root / "failures", ("holder-a",), (
+                        codex_mesh.SwitchingWorker("plan-c-review", True,
+                            codex_mesh.WorkerMoveFailed("interrupt failed: denied", commands[0])),
+                        codex_mesh.SwitchingWorker("plan-d-review", True,
+                            codex_mesh.WorkerMoveFailed("resume failed: refused", commands[1])))),
+                    codex_mesh.WorkersRunSwitch(self.root / "different-holder", ("holder-b",), (
+                        codex_mesh.SwitchingWorker("plan-e-review", False),)),
+                )
+                # Identical display names still describe two distinct holder identities.
+                listing = roster.Roster([roster.RosterEntry(
+                    machine="here", kind="claude", role="unit director", name="director", status="running",
+                    reach=roster.Messageable(f"session:{holder}"), cwd="",
+                    showrunner=roster.UnderShowrunner("build", "natedev", "session:showrunner"),
+                    director=roster.DirectsUnit("two-accounts"), assignment=roster.NotAWorker(),
+                    session=roster.ClaudeSession(holder)) for holder in ("holder-a", "holder-b")], [])
+                with (patch.object(codex_mesh, "retire_workers_servers", return_value=switches),
+                      patch.object(roster, "roster", return_value=listing),
+                      patch.object(roster, "machine_name", return_value="here")):
+                    code, output, errors = self.run_cli("swap", "workers", "codex1", *(["--dry-run"] if dry_run else []))
+                self.assertEqual((code, errors), (0, ""))
+                rows = output.splitlines()[1:]
+                self.assertEqual(len(rows), 5)
+                self.assertIn("  natedev · two-accounts · review-worker → codex1, interrupted and resumed ×2", rows)
+                self.assertIn("  natedev · two-accounts · impl-worker → codex1 ×2", rows)
+                self.assertIn("  natedev · two-accounts · review-worker → codex1", rows)
+                for reason, command in zip(("interrupt failed: denied", "resume failed: refused"), commands, strict=True):
+                    failed = next(row for row in rows if reason in row)
+                    self.assertIn(command, failed)
+                    self.assertNotIn("×", failed)
+
+    def test_workers_swap_prints_ended_server_totals_and_each_busy_reason_in_both_modes(self) -> None:
+        run = self.root / "ended-run"
+        reason = "a conversation is not idle: unread-worker: ThreadLive"
+        for dry_run in (True, False):
+            with self.subTest(dry_run=dry_run):
+                _ = self.workers_fixture()
+                before = self.role_files()
+                switches = (codex_mesh.WorkersRunSwitch(run, (), (), leftover_servers=3,
+                    stopped_servers=0 if dry_run else 1, kept_servers=(
+                        codex_mesh.KeptWorkersServer(101, 4001, reason),
+                        codex_mesh.KeptWorkersServer(102, 4002, "1 client connection(s) on its port"))),)
+                with (patch.object(codex_mesh, "retire_workers_servers", return_value=switches),
+                      patch.object(roster, "roster", side_effect=AssertionError("ended runs need no worker roster"))):
+                    code, output, errors = self.run_cli("swap", "workers", "codex1", *(["--dry-run"] if dry_run else []))
+                self.assertEqual((code, errors), (0, ""))
+                summary = ("3 leftover servers from ended sessions: 1 can be stopped, 2 would stay" if dry_run
+                           else "3 leftover servers from ended sessions, 1 stopped")
+                prefix = "would stay" if dry_run else "left running"
+                self.assertEqual(output.splitlines()[1:], [summary,
+                    f"{prefix}: 101 on port 4001 ({run}): {reason}",
+                    f"{prefix}: 102 on port 4002 ({run}): 1 client connection(s) on its port"])
+                self.assertNotIn("unknown session", output)
+                if dry_run:
+                    self.assertEqual(self.role_files(), before)
+
     def test_workers_swap_uses_saved_holder_name_when_roster_cannot_list_it(self) -> None:
         records = self.home / ".claude/sessions"
         records.mkdir(parents=True, exist_ok=True)

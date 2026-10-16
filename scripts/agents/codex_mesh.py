@@ -72,7 +72,7 @@ import struct
 import subprocess
 import sys
 import time
-from collections.abc import Callable, Generator, Mapping
+from collections.abc import Callable, Generator, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from enum import Enum
@@ -81,6 +81,7 @@ from typing import TYPE_CHECKING, Literal, NoReturn, NotRequired, TextIO, TypedD
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.lib import unit_runs
+from scripts.message import sessions
 from scripts.usage import agents_log
 from scripts.whoami.agent_accounts import (
     workers_home, codex_home, codex_home_display, user_zone,
@@ -1663,7 +1664,12 @@ def _holds_old_sign_in(pid: int, home: Path) -> bool:
     return started is not None and started < changed
 
 
-def _start_watcher(session_dir: str, pid: int, port: int) -> subprocess.Popen[bytes]:
+@dataclass(frozen=True)
+class ExistingServerWatcher:
+    """Another watcher already holds this server's lifetime lock."""
+
+
+def _start_watcher(session_dir: str, pid: int, port: int) -> subprocess.Popen[bytes] | ExistingServerWatcher:
     """Leave a sleeping shell behind that has the server stop itself once nothing uses it.
 
     The server is detached so it outlives each delegate, and only a run's end step stops one; a
@@ -1672,7 +1678,8 @@ def _start_watcher(session_dir: str, pid: int, port: int) -> subprocess.Popen[by
     run `idle-stop`, which stops the server or touches the record. A server RETIRED_FILE lists is
     asked about at every wake instead: the run's newer server keeps the record fresh. Its cost is a shell and a
     `sleep`, under 1 MB of their own memory, one `find` per wake, and one short Python run about
-    twice an hour while the server is in use. It leaves with the server.
+    twice an hour while the server is in use. It leaves with the server. Its inherited lock
+    prevents repeated retirement passes from starting another watcher for the same server.
     """
     script = (
         'while kill -0 "$1" 2>/dev/null; do sleep "$5"; '
@@ -1680,13 +1687,18 @@ def _start_watcher(session_dir: str, pid: int, port: int) -> subprocess.Popen[by
         + '&& ! grep -Eq "\\"pid\\": $1([^0-9]|\\$)" "$3/$8" 2>/dev/null && continue; '
         + '"$4" "$0" idle-stop --session-dir "$3" --pid "$1" --port "$2" && exit 0; done'
     )
-    return subprocess.Popen(
-        ["sh", "-c", script, str(Path(__file__).resolve()), str(pid), str(port),
-         str(Path(session_dir).resolve()), sys.executable, str(WATCH_WAKE_SECS), SERVER_FILE,
-         str(int(SERVER_IDLE_SECS // 60)), RETIRED_FILE],
-        stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-        start_new_session=True,
-    )
+    with _session_path(session_dir, f"mesh-watcher-{pid}-{port}.lock").open("a") as lock:
+        try:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return ExistingServerWatcher()
+        return subprocess.Popen(
+            ["sh", "-c", script, str(Path(__file__).resolve()), str(pid), str(port),
+             str(Path(session_dir).resolve()), sys.executable, str(WATCH_WAKE_SECS), SERVER_FILE,
+             str(int(SERVER_IDLE_SECS // 60)), RETIRED_FILE],
+            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            start_new_session=True, pass_fds=(lock.fileno(),),
+        )
 
 
 def server_record_home(record: dict[str, object]) -> Path:
@@ -4440,6 +4452,17 @@ def _marker_sessions(roots: tuple[Path, ...], folder: Path) -> list[str]:
     return holders
 
 
+def _run_is_live(folder: Path, holders: tuple[str, ...]) -> bool:
+    """A holder takes precedence over a surviving launcher from an ended session.
+
+    Sessions are read per run, under its lock, so a holder that ends while earlier runs move is
+    already ended here."""
+    if holders:
+        running = {record["sessionId"] for record in sessions.running_sessions()}
+        return any(holder in running for holder in holders)
+    return bool(_live_launchers(folder))
+
+
 class CodexNoticeKind(Enum):
     WORKERS_CHANGED = "workers_changed"
     SIGN_IN_CHANGED = "sign_in_changed"
@@ -4477,28 +4500,47 @@ def command_signin_changed(args: argparse.Namespace) -> int:
         print("codex_mesh: no Codex sign-in file; nothing moved")
         return 0
     at = datetime.fromtimestamp(changed).astimezone(user_zone()).strftime("%H:%M %Z")
-    runs: list[WorkersRunMove] = []
-    for record_path in sorted(path for root in roots for path in root.glob(f"*/{SERVER_FILE}")):
-        folder = record_path.parent
+    runs: list[WorkersRunMove | EndedWorkersRun] = []
+    folders = sorted({path.parent for root in roots for filename in (SERVER_FILE, RETIRED_FILE)
+                      for path in root.glob(f"*/{filename}")})
+    for folder in folders:
         with _server_lock(str(folder)):
-            record = _read_json_object(record_path)
-            port, pid = record.get("port"), record.get("pid")
-            recorded_home = server_record_home(record)
-            if not (recorded_home == home
-                    and isinstance(port, int) and isinstance(pid, int) and _pid_alive(pid)
-                    and _holds_old_sign_in(pid, recorded_home)):
+            current = _read_json_object(folder / SERVER_FILE)
+            holders = tuple(_marker_sessions(roots, folder))
+            live = _run_is_live(folder, holders)
+            outgoing: dict[int, int] = {}
+            records = [current] if live else _recorded_run_servers(str(folder))
+            for record in records:
+                port, pid = record.get("port"), record.get("pid")
+                recorded_home = server_record_home(record)
+                if (recorded_home == home
+                        and isinstance(port, int) and isinstance(pid, int) and _pid_alive(pid)
+                        and _holds_old_sign_in(pid, recorded_home)):
+                    outgoing[port] = pid
+            if not outgoing:
                 continue
-            _retire_record(str(folder), record)
-        workers = _switch_run_workers(folder, port, codex_home_role_label(workers_home()), dry_run=False)
-        runs.append(WorkersRunMove(folder, tuple(_marker_sessions(roots, folder)), ((port, pid),), workers))
+            current_port = current.get("port")
+            if isinstance(current_port, int) and current_port in outgoing:
+                _retire_record(str(folder), current)
+        if not live:
+            runs.append(EndedWorkersRun(folder, tuple(outgoing.items())))
+            continue
+        workers = tuple(worker for port in outgoing for worker in _switch_run_workers(
+            folder, port, codex_home_role_label(workers_home()), dry_run=False))
+        runs.append(WorkersRunMove(folder, holders, tuple(outgoing.items()), workers))
     switches = _finish_run_moves(runs)
     for run, switched in zip(runs, switches, strict=True):
+        if isinstance(run, EndedWorkersRun):
+            continue
         folder = run.folder
-        port, pid = run.servers[0]
-        stopped = _stop_unused(None, pid, port, RetiredRunServer(folder))
-        if not stopped:
-            _ = _start_watcher(str(folder), pid, port)
-        old = "is stopped" if stopped else "stops once nothing uses it"
+        stopped = 0
+        for port, pid in run.servers:
+            if _stop_unused(None, pid, port, RetiredRunServer(folder)):
+                stopped += 1
+            else:
+                _ = _start_watcher(str(folder), pid, port)
+        old = "is stopped" if stopped == len(run.servers) else "stops once nothing uses it"
+        pid = run.servers[0][1]
         line = (f"Codex sign-in changed at {at}: run {folder.name}'s app-server {pid} started before it, so the "
                 + "run's running workers were interrupted and resumed on a new server; "
                 + f"idle workers move at their next turn; the old server {old}.")
@@ -4510,7 +4552,9 @@ def command_signin_changed(args: argparse.Namespace) -> int:
         for session_id in switched.holders:
             _notify_holder(session_id, line, CodexNoticeKind.SIGN_IN_CHANGED)
         print(line)
-    print(f"{len(switches)} run(s) moved off the old sign-in")
+    for line in leftover_server_lines(switches, dry_run=False):
+        print(line)
+    print(f"{sum(isinstance(run, WorkersRunMove) for run in runs)} run(s) moved off the old sign-in")
     return 0
 
 
@@ -4549,10 +4593,30 @@ class SwitchingWorker:
 
 
 @dataclass(frozen=True)
+class KeptWorkersServer:
+    """An ended run's server that could not safely be stopped."""
+
+    pid: int
+    port: int
+    reason: str
+
+
+@dataclass(frozen=True)
 class WorkersRunSwitch:
     folder: Path
     holders: tuple[str, ...]
     workers: tuple[SwitchingWorker, ...]
+    leftover_servers: int = 0
+    stopped_servers: int = 0
+    kept_servers: tuple[KeptWorkersServer, ...] = ()
+
+
+@dataclass(frozen=True)
+class EndedWorkersRun:
+    """Outgoing servers to clean up without touching an ended run's workers."""
+
+    folder: Path
+    servers: tuple[tuple[int, int], ...]  # port, pid
 
 
 @dataclass(frozen=True)
@@ -4683,14 +4747,62 @@ def _wait_account_move_resumes(
     return outcomes
 
 
-def _finish_run_moves(runs: list[WorkersRunMove]) -> tuple[WorkersRunSwitch, ...]:
+def _leftover_server_verdict(folder: Path, pid: int, port: int) -> SweepVerdict:
+    """Use the sweep's retired-server rules even in a preview before retirement."""
+    try:
+        clients = _client_counts().get(port, 0)
+    except (OSError, subprocess.CalledProcessError) as error:
+        return ServerInUse(f"client connections could not be read ({error})")
+    facts = ServerFacts(pid, port, 0, clients, RetiredRunServer(folder), folder.is_dir(),
+                        UncheckedRunLifecycle(), (), None)
+    return _sweep_verdict(facts, lambda: _busy_threads(port, _roster_threads(folder)))
+
+
+def _finish_ended_run(run: EndedWorkersRun, *, dry_run: bool) -> WorkersRunSwitch:
+    stopped = 0
+    kept: list[KeptWorkersServer] = []
+    for port, pid in run.servers:
+        if not dry_run and _stop_unused(None, pid, port, RetiredRunServer(run.folder)):
+            stopped += 1
+            continue
+        verdict = _leftover_server_verdict(run.folder, pid, port)
+        if isinstance(verdict, ServerInUse):
+            kept.append(KeptWorkersServer(pid, port, verdict.reason))
+        elif not dry_run:
+            kept.append(KeptWorkersServer(pid, port, "not stopped at the second safety check"))
+        if not dry_run:
+            _ = _start_watcher(str(run.folder), pid, port)
+    return WorkersRunSwitch(run.folder, (), (), len(run.servers), stopped, tuple(kept))
+
+
+def leftover_server_lines(switches: Sequence[WorkersRunSwitch], *, dry_run: bool) -> tuple[str, ...]:
+    total = sum(run.leftover_servers for run in switches)
+    if not total:
+        return ()
+    kept = sum(len(run.kept_servers) for run in switches)
+    line = f"{total} leftover servers from ended sessions"
+    if dry_run:
+        line += f": {total - kept} can be stopped, {kept} would stay"
+    else:
+        line += f", {sum(run.stopped_servers for run in switches)} stopped"
+    return (line, *(f"{'would stay' if dry_run else 'left running'}: {server.pid} on port {server.port} "
+                    + f"({run.folder}): {server.reason}"
+                    for run in switches for server in run.kept_servers))
+
+
+def _finish_run_moves(
+    runs: list[WorkersRunMove | EndedWorkersRun], *, dry_run: bool = False,
+) -> tuple[WorkersRunSwitch, ...]:
     outcomes = _wait_account_move_resumes(tuple(
-        worker for run in runs for worker in run.workers if isinstance(worker, InterruptedWorkerMove)
+        worker for run in runs if isinstance(run, WorkersRunMove)
+        for worker in run.workers if isinstance(worker, InterruptedWorkerMove)
     ))
-    return tuple(WorkersRunSwitch(run.folder, run.holders, tuple(
-        SwitchingWorker(worker.name, True, outcomes[(worker.session_dir, worker.name)])
-        if isinstance(worker, InterruptedWorkerMove) else worker for worker in run.workers
-    )) for run in runs)
+    return tuple(
+        _finish_ended_run(run, dry_run=dry_run) if isinstance(run, EndedWorkersRun)
+        else WorkersRunSwitch(run.folder, run.holders, tuple(
+            SwitchingWorker(worker.name, True, outcomes[(worker.session_dir, worker.name)])
+            if isinstance(worker, InterruptedWorkerMove) else worker for worker in run.workers
+        )) for run in runs)
 
 
 def _interrupt_worker_for_account_move(session_dir: str, name: str, entry: dict[str, object],
@@ -4758,7 +4870,7 @@ def retire_workers_servers(workers_home: Path, label: str, *, dry_run: bool = Fa
     """Retire run servers, interrupt running turns, and confirm their continuations."""
     notices: dict[str, list[str]] = {}
     notice_failures: dict[str, list[str]] = {}
-    runs: list[WorkersRunMove] = []
+    runs: list[WorkersRunMove | EndedWorkersRun] = []
     at = datetime.now().astimezone(user_zone()).strftime("%H:%M %Z")
     folders = sorted({path.parent for root in SWEEP_ROOTS
                       for filename in (SERVER_FILE, RETIRED_FILE) for path in root.glob(f"*/{filename}")})
@@ -4774,14 +4886,20 @@ def retire_workers_servers(workers_home: Path, label: str, *, dry_run: bool = Fa
             if not outgoing:
                 continue
             holders = tuple(_marker_sessions(SWEEP_ROOTS, folder))
+            live = _run_is_live(folder, holders)
             current_port = current.get("port")
             if not dry_run and isinstance(current_port, int) and current_port in outgoing:
                 _retire_record(str(folder), current)
+        if not live:
+            runs.append(EndedWorkersRun(folder, tuple(outgoing.items())))
+            continue
         workers = tuple(worker for port in outgoing
                         for worker in _switch_run_workers(folder, port, label, dry_run=dry_run))
         runs.append(WorkersRunMove(folder, holders, tuple(outgoing.items()), workers))
-    switches = _finish_run_moves(runs)
+    switches = _finish_run_moves(runs, dry_run=dry_run)
     for run, switched in zip(runs, switches, strict=True):
+        if isinstance(run, EndedWorkersRun):
+            continue
         folder, holders, workers = switched.folder, switched.holders, switched.workers
         line = (
             f"Workers account {'would move' if dry_run else 'changed'} at {at} to {label} "
