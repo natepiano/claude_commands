@@ -6,18 +6,19 @@ from scripts.whoami.note_file import note_name
 import io
 import json
 import os
+import socket
 import subprocess
 import tempfile
 import unittest
-from contextlib import redirect_stderr, redirect_stdout
-from collections.abc import Mapping
+from contextlib import contextmanager, redirect_stderr, redirect_stdout
+from collections.abc import Generator, Mapping
 from datetime import datetime, timedelta, timezone, tzinfo
 from pathlib import Path
 from importlib import import_module
 from typing import TYPE_CHECKING, Literal, Self, cast, final, override
 from unittest.mock import patch
 
-from scripts.accounts import accounts, moves, refusal_watch, refusals
+from scripts.accounts import accounts, moves, refusal_watch, refusals, role_map
 from scripts.production import showrunners
 import account
 import agent_accounts
@@ -67,13 +68,16 @@ class RefusalWatchTests(unittest.TestCase):
 
     @override
     def setUp(self) -> None:
-        self.home = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        self.home = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
         _ = cast(object, self.enterContext(patch.dict(os.environ, {
             "HOME": str(self.home), "PATH": os.defpath, "AGENT_NOTES_DIR": str(self.home / "notes"),
             "SHUTDOWN_STATE_DIR": str(self.home / "shutdown"),
             "NOTIFIER_SESSIONS_DIR": str(self.home / "sessions"), "USER_ZONE": "America/New_York",
         }, clear=True)))
         (self.home / "notes").mkdir()
+        _ = self.enterContext(patch.object(socket, "gethostname", return_value="natedev"))
+        _ = self.enterContext(patch.object(role_map, "is_role_map_host", return_value=True))
+        _ = self.enterContext(patch.object(role_map, "ssh_role_map", side_effect=AssertionError("watcher reached ssh")))
         (self.home / ".claude").mkdir()
         (self.home / "notifier").mkdir()
         _ = self.enterContext(patch.object(showrunners, "NOTIFIER_STATE_DIR", self.home / "notifier"))
@@ -150,7 +154,7 @@ class RefusalWatchTests(unittest.TestCase):
             run_dirs=[], codex_servers=[], timers=[], config_dir=str(accounts.account_dir(label)))
         if host == "unit":
             owner: inventory.Session = inventory.UnitSession(**fields, kind="unit", host=inventory.UnitHost(
-                kind="unit", production="fixture", unit=identity, doc="/fixture.md", session_name=identity, session_host="tmux",
+                kind="unit", production="fixture", unit=identity, doc=str(self.home / "fixture-production.md"), session_name=identity, session_host="tmux",
                 plan=inventory.NoRunRecord(kind="no run record")))
         elif host == "tmux":
             owner = inventory.ShowrunnerSession(**fields, kind="showrunner", production="fixture", doc="/fixture.md",
@@ -214,6 +218,8 @@ class RefusalWatchTests(unittest.TestCase):
         ids = command[command.index("--only") + 1].split(",")
         target = command[command.index("--to") + 1]
         why = command[command.index("--why") + 1]
+        if why.startswith("auto: "):
+            self.assertIn("--auto", command)
         for identity in ids:
             owner = next(owner for owner in self.owners if owner["session_id"] == identity)
             source = self.process_account(owner["pid"], home_state=account.home_account_state())
@@ -221,7 +227,8 @@ class RefusalWatchTests(unittest.TestCase):
             saved = record.SessionShutdown(login=source.login, label=source.label, machine="natedev",
                 requested_at=WatchTime.at.isoformat(), request_id=f"batch-{len(self.commands)}",
                 requested_by=record.FromTerminal(kind="terminal"), hold="session", then="restart",
-                force="wait for ready", alerts="user", probe=False, session=owner, workers=[], timers=[],
+                force="wait for ready", alerts="none" if "--no-alert" in command else "user", probe=False,
+                session=owner, workers=[], timers=[],
                 settle_message=record.SettleMessageNotSent(kind="not sent"), where=record.WhereNotSaid(kind="not said"),
                 progress=record.SessionWaiting(kind="waiting"), trail=[], stop_issues=[], target=target,
                 source_label=source.label, why=why, move_id=command[command.index("--move-id") + 1])
@@ -233,6 +240,301 @@ class RefusalWatchTests(unittest.TestCase):
         path.parent.mkdir(parents=True, exist_ok=True)
         _ = path.write_text(json.dumps({"units": units, "showrunners": showrunners}))
         return path
+
+    def auto_rules(self, *rules: dict[str, object]) -> None:
+        path = accounts.accounts_config_file()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        _ = path.write_text(json.dumps({"auto_moves": list(rules)}))
+
+    def low_rule(self, name: str = "units-low", *, group: str = "units", target: str = "claude2",
+                 threshold: float = 1) -> dict[str, object]:
+        return {"name": name, "group": group, "to": target, "when": {"left_at_most": threshold}}
+
+    def test_automatic_low_rule_holds_at_two_percent_and_moves_at_one_with_one_transition(self) -> None:
+        path = self.groups()
+        _ = self.owner("unit", host="unit")
+        self.auto_rules(self.low_rule())
+        self.reading(SOURCE_LOGIN, 2)
+        _ = self.cli()
+        self.assertEqual(self.commands, [])
+        self.assertEqual(stored_group_labels(path)["units"], "claude1")
+        self.reading(SOURCE_LOGIN, 1)
+        _, output, error = self.cli()
+        self.assertEqual(error, "")
+        self.assertIn("units-low", output)
+        self.assertEqual(stored_group_labels(path)["units"], "claude2")
+        self.assertEqual(len(self.commands), 1)
+        self.assertIn("--no-alert", self.commands[0])
+        history = [cast(dict[str, object], json.loads(line))
+                   for line in accounts.roles_history_file().read_text().splitlines()]
+        requested = [entry for entry in moves.read_moves() if entry["kind"] == "requested"]
+        self.assertEqual(len(history), 1)
+        self.assertEqual(len(requested), 1)
+        self.assertEqual((history[0]["cause"], history[0]["why"], history[0]["label"]),
+                         ("auto", "auto: units-low", "claude2"))
+        self.assertEqual((requested[0].get("cause"), requested[0]["why"], requested[0]["to"]),
+                         ("auto", "auto: units-low", "claude2"))
+        self.assertEqual(requested[0]["move_id"], history[0]["move_id"])
+        self.assertEqual(self.notifications, [])
+        _ = self.cli()
+        self.assertEqual(len(self.commands), 1)
+
+    def test_automatic_low_rule_requires_a_fresh_source_reading(self) -> None:
+        path = self.groups()
+        _ = self.owner("unit", host="unit")
+        self.auto_rules(self.low_rule())
+        self.reading(SOURCE_LOGIN, 1, at=NOW - timedelta(minutes=11))
+        _ = self.cli()
+        self.assertEqual(self.commands, [])
+        self.assertEqual(stored_group_labels(path)["units"], "claude1")
+        self.reading(SOURCE_LOGIN, 1)
+        _ = self.cli()
+        self.assertEqual(stored_group_labels(path)["units"], "claude2")
+        self.assertEqual(len(self.commands), 1)
+
+    def test_retained_stopped_unit_record_does_not_block_an_automatic_low_rule(self) -> None:
+        path = self.groups()
+        _ = self.owner("old-unit", host="unit")
+        self.auto_rules(self.low_rule())
+        _ = self.down(["/fake/shutdown.py", "--only", "old-unit", "--to", "claude3",
+                       "--why", "older stop", "--move-id", "older-transition"],
+                      env={"REFUSAL_WATCH_INVENTORY": "read existing"})
+        saved = record.all_session_records()[0]
+        def finish(current: record.SessionShutdown) -> None:
+            current["then"] = "stop"
+            current["progress"] = record.SessionStopped(kind="stopped", at=NOW.isoformat())
+        saved = record.update_session(saved["login"], "old-unit", finish)
+        self.owners.clear()
+        self.commands.clear()
+        code, _, error = self.cli()
+        self.assertEqual((code, error), (0, ""))
+        self.assertEqual(stored_group_labels(path)["units"], "claude2")
+        self.assertEqual(record.all_session_records(), [saved])
+        self.assertEqual(self.commands, [])
+
+    def test_automatic_completion_retry_preserves_the_rule_reason_and_transition_in_the_journal(self) -> None:
+        path = self.groups()
+        _ = self.owner("unit", host="unit")
+        self.auto_rules(self.low_rule())
+        with patch.object(accounts, "move_sessions", return_value=(
+                accounts.SessionMoveRefused("unit", "synthetic delivery refusal"),)):
+            _ = self.cli()
+        self.assertEqual(stored_group_labels(path)["units"], "claude2")
+        self.assertEqual(record.all_session_records(), [])
+        history = accounts.roles_history_file().read_bytes()
+        transition = cast(dict[str, object], json.loads(path.read_text())["units"])
+        code, _, error = self.cli()
+        self.assertEqual((code, error), (0, ""))
+        requested = [entry for entry in moves.read_moves() if entry["kind"] == "requested"]
+        self.assertEqual(len(requested), 1)
+        self.assertEqual((requested[0].get("cause"), requested[0]["why"], requested[0]["move_id"]),
+                         ("auto", "auto: units-low", transition["move_id"]))
+        self.assertEqual(accounts.roles_history_file().read_bytes(), history)
+        self.assertEqual(len(self.commands), 1)
+        self.assertIn("--auto", self.commands[0])
+
+    def test_unavailable_automatic_target_is_reported_and_a_later_valid_rule_still_moves(self) -> None:
+        path = self.groups()
+        self.auto_rules(self.low_rule("missing-target", target="claude99"), self.low_rule("valid-target"))
+        code, output, error = self.cli()
+        self.assertEqual((code, error), (0, ""))
+        self.assertIn("missing-target", output)
+        self.assertIn("claude99", output)
+        self.assertIn("valid-target", output)
+        self.assertEqual(stored_group_labels(path)["units"], "claude2")
+        history = [cast(dict[str, object], json.loads(line))
+                   for line in accounts.roles_history_file().read_text().splitlines()]
+        self.assertEqual([entry["why"] for entry in history], ["auto: valid-target"])
+
+    def test_automatic_rule_refuses_low_stale_missing_and_unresolved_target_readings(self) -> None:
+        path = self.groups()
+        _ = self.owner("unit", host="unit")
+        self.auto_rules(self.low_rule())
+        for state in ("at threshold", "below threshold", "stale", "missing", "unresolved refusal"):
+            with self.subTest(state=state):
+                self.reading("main@example.invalid", 1 if state == "at threshold" else 0 if state == "below threshold" else 80,
+                             at=NOW - timedelta(minutes=11) if state == "stale" else NOW)
+                if state == "missing":
+                    saved = usage_store.load()
+                    del saved[usage_store.key("Claude", "main@example.invalid")]
+                    usage_store.write(saved)
+                if state == "unresolved refusal":
+                    refusals.write_refusal(refusals.AccountRefusal("claude", "main@example.invalid",
+                        refusals.UnknownWindow(), refusals.NoResetKnown(), NOW))
+                _ = self.cli()
+                self.assertEqual(self.commands, [])
+                self.assertEqual(stored_group_labels(path)["units"], "claude1")
+                self.assertFalse(accounts.roles_history_file().exists())
+
+    def test_automatic_rule_does_not_prepare_or_reselect_the_current_account(self) -> None:
+        path = self.groups(units="claude2")
+        _ = self.owner("unit", host="unit", label="claude2")
+        self.auto_rules(self.low_rule())
+        self.reading("main@example.invalid", 1)
+        before = path.read_bytes()
+        with patch.object(accounts, "prepared_account", side_effect=AssertionError("same-account rule prepared a move")):
+            _ = self.cli()
+        self.assertEqual(path.read_bytes(), before)
+        self.assertEqual(self.commands, [])
+
+    def test_automatic_rules_allow_both_groups_to_share_one_target_and_move_only_off_target_members(self) -> None:
+        path = self.groups()
+        _ = self.owner("unit", host="unit")
+        _ = self.owner("arrived-unit", host="unit", label="claude2")
+        _ = self.owner("runner", host="tmux", label="claude3")
+        self.reading(SOURCE_LOGIN, 1)
+        self.reading(TARGET_LOGIN, 1)
+        self.auto_rules(self.low_rule(), self.low_rule("showrunners-low", group="showrunners"))
+        _ = self.cli()
+        self.assertEqual(stored_group_labels(path), {"units": "claude2", "showrunners": "claude2"})
+        self.assertEqual({identity for command in self.commands
+                          for identity in command[command.index("--only") + 1].split(",")}, {"unit", "runner"})
+        self.assertTrue(all("--no-alert" in command for command in self.commands))
+        self.assertEqual(self.notifications, [])
+
+    def test_automatic_reset_rule_observes_first_then_fires_once_for_each_passed_reset(self) -> None:
+        path = self.groups()
+        self.auto_rules({"name": "units-reset", "group": "units", "to": "claude3", "when": {"after_reset": True}},
+                        self.low_rule(threshold=7))
+        first_reset = NOW + timedelta(minutes=5)
+        self.reading(SOURCE_LOGIN, 80)
+        self.reading(TARGET_LOGIN, 90, reset=first_reset)
+        _ = self.cli()
+        self.assertEqual(stored_group_labels(path)["units"], "claude1")
+        self.assertFalse(accounts.roles_history_file().exists())
+        WatchTime.at = first_reset + timedelta(seconds=1)
+        next_reset = WatchTime.at + timedelta(days=7)
+        # Room must be above every configured low threshold, even a non-seed value.
+        self.reading(TARGET_LOGIN, 7, at=WatchTime.at, reset=next_reset)
+        self.reading(SOURCE_LOGIN, 80, at=WatchTime.at)
+        _ = self.cli()
+        self.assertEqual(stored_group_labels(path)["units"], "claude1")
+        self.reading(TARGET_LOGIN, 8, at=WatchTime.at, reset=next_reset)
+        _ = self.cli()
+        self.assertEqual(stored_group_labels(path)["units"], "claude3")
+        _ = self.groups()
+        _ = self.cli()
+        self.assertEqual(stored_group_labels(path)["units"], "claude1")
+        history = accounts.roles_history_file().read_text().splitlines()
+        self.assertEqual(len(history), 1)
+        WatchTime.at = next_reset + timedelta(seconds=1)
+        self.reading(TARGET_LOGIN, 90, at=WatchTime.at, reset=WatchTime.at + timedelta(days=7))
+        self.reading(SOURCE_LOGIN, 80, at=WatchTime.at, reset=WatchTime.at + timedelta(days=7))
+        _ = self.cli()
+        self.assertEqual(stored_group_labels(path)["units"], "claude3")
+        self.assertEqual(len(accounts.roles_history_file().read_text().splitlines()), 2)
+
+    def test_automatic_rules_report_malformed_entries_and_still_apply_valid_configured_thresholds(self) -> None:
+        path = self.groups()
+        self.reading(SOURCE_LOGIN, 6)
+        self.reading(TARGET_LOGIN, 90)
+        self.auto_rules({"name": "bad-rule", "group": "other", "to": "claude2", "when": {"after_reset": True}},
+                        self.low_rule("custom-limit", threshold=6, target="claude3"))
+        _, output, error = self.cli()
+        self.assertEqual(error, "")
+        self.assertIn("bad-rule", output)
+        self.assertIn("custom-limit", output)
+        self.assertEqual(stored_group_labels(path)["units"], "claude3")
+
+    def test_automatic_move_commits_while_the_refusal_watch_lock_is_held(self) -> None:
+        _ = self.groups()
+        self.auto_rules(self.low_rule())
+        lock_held = False
+        select = accounts.set_group_account
+        @contextmanager
+        def locked() -> Generator[None]:
+            nonlocal lock_held
+            self.assertFalse(lock_held)
+            lock_held = True
+            try:
+                yield
+            finally:
+                lock_held = False
+        def select_while_locked(group: accounts.ClaudeGroup, label: str, *, why: str,
+                                now: datetime | accounts.AccountDecisionNow = accounts.ACCOUNT_DECISION_NOW,
+                                origin: accounts.MoveOrigin = accounts.HAND_ORIGIN,
+                                move_id: str = "") -> accounts.GroupTransition:
+            self.assertTrue(lock_held, "automatic group selection escaped the refusal lock")
+            return select(group, label, why=why, now=now, origin=origin, move_id=move_id)
+        with (patch.object(refusal_watch, "_watch_lock", side_effect=locked),
+              patch.object(accounts, "set_group_account", side_effect=select_while_locked) as selected):
+            _ = self.cli()
+        selected.assert_called_once()
+        self.assertFalse(lock_held)
+
+    def test_automatic_rules_do_not_run_off_natedev(self) -> None:
+        path = self.groups()
+        self.auto_rules(self.low_rule())
+        before = path.read_bytes()
+        with patch.object(socket, "gethostname", return_value="macbook"):
+            _ = self.cli()
+        self.assertEqual(path.read_bytes(), before)
+        self.assertEqual(self.commands, [])
+
+    def test_automatic_rule_keeps_selection_when_target_preparation_refuses(self) -> None:
+        path = self.groups()
+        self.auto_rules(self.low_rule())
+        with patch.object(accounts, "prepared_account", return_value=accounts.AccountRefused("target clash")):
+            _, output, error = self.cli()
+        self.assertEqual(error, "")
+        self.assertIn("target clash", output)
+        self.assertEqual(stored_group_labels(path)["units"], "claude1")
+        self.assertFalse(accounts.roles_history_file().exists())
+        self.assertEqual(self.commands, [])
+
+    def test_automatic_rule_keeps_a_group_with_an_open_transition_on_its_committed_target(self) -> None:
+        path = self.groups()
+        _ = self.owner("unit", host="unit")
+        _ = accounts.move_group("units", "claude3", why="pending hand move")
+        self.assertEqual(len(record.all_session_records()), 1)
+        history = accounts.roles_history_file().read_bytes()
+        self.auto_rules(self.low_rule())
+        _ = self.cli()
+        self.assertEqual(stored_group_labels(path)["units"], "claude3")
+        self.assertEqual(accounts.roles_history_file().read_bytes(), history)
+        self.assertEqual(len(self.commands), 1)
+
+    def test_reset_rule_does_not_override_a_group_moved_by_the_refusal_pass_this_tick(self) -> None:
+        path = self.groups()
+        reset = NOW + timedelta(minutes=1)
+        self.reading(SOURCE_LOGIN, 80)
+        self.reading(TARGET_LOGIN, 90, reset=reset)
+        self.auto_rules({"name": "units-reset", "group": "units", "to": "claude3", "when": {"after_reset": True}})
+        _ = self.cli()
+        _ = self.owner("refused-unit", host="unit")
+        WatchTime.at = reset + timedelta(seconds=1)
+        _ = self.transcript("refused-unit", at=WatchTime.at)
+        self.reading(SOURCE_LOGIN, 0, at=WatchTime.at)
+        self.reading("main@example.invalid", 80, at=WatchTime.at)
+        self.reading(TARGET_LOGIN, 90, at=WatchTime.at, reset=WatchTime.at + timedelta(days=7))
+        placed = accounts.GroupPlacement("units", "claude2", accounts.account_dir("claude2"), accounts.UnitsResetSoonest())
+        with patch.object(accounts, "placement", return_value=placed):
+            _ = self.cli()
+        self.assertEqual(stored_group_labels(path)["units"], "claude2")
+        history = [cast(dict[str, object], json.loads(line))
+                   for line in accounts.roles_history_file().read_text().splitlines()]
+        self.assertEqual([entry["cause"] for entry in history], ["refusal"])
+        self.assertEqual(len(self.commands), 1)
+
+    def test_automatic_move_uses_the_refusal_showrunner_notice_without_a_phone_alert(self) -> None:
+        _ = self.groups()
+        _ = self.owner("unit", host="unit")
+        self.auto_rules(self.low_rule())
+        _ = self.cli()
+        saved = record.all_session_records()
+        self.assertEqual(len(saved), 1)
+        self.assertEqual(saved[0]["alerts"], "none")
+        with (patch.object(import_module("showrunners"), "current_name", return_value="fixture-showrunner"),
+              patch.object(settle, "send_message", return_value=settle.MessageSent(kind="sent")) as delivery,
+              patch.object(settle, "alert_user") as phone):
+            settle.tell_showrunner_stopping(saved[0])
+            settle.tell_showrunner_stopping(record.all_session_records()[0])
+        delivery.assert_called_once()
+        self.assertEqual(delivery.call_args.args[0], "fixture-showrunner")
+        self.assertIn("auto: units-low", cast(str, delivery.call_args.args[1]))
+        self.assertIn("claude2", cast(str, delivery.call_args.args[2]))
+        phone.assert_not_called()
+        self.assertEqual(self.notifications, [])
 
     def test_proof_moves_its_probe_without_changing_account_refusals_or_other_sessions_picker(self) -> None:
         _ = self.owner("probe")
