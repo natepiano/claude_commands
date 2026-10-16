@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import shlex
 import sys
 from pathlib import Path
 
@@ -61,21 +62,30 @@ def _launch(verb: str, arguments: list[str]) -> int:
         raise ValueError(f"{folder}: not a directory")
     if options.name is not None:
         _ = herdr.server_unit(options.name)
-    config_dir = Path(options.config_dir or os.environ.get("CLAUDE_CONFIG_DIR") or accounts.main_config_dir()).expanduser().resolve()
-    selected = accounts.NamedAccount(str(config_dir), config_dir)
-    pane_environment = account.named_account_environment(config_dir) if config_dir != accounts.main_config_dir() else {}
+    selected = accounts.account_for_unscoped_launch(
+        dict(os.environ, CLAUDE_CONFIG_DIR=options.config_dir) if options.config_dir else os.environ)
     unset_variables = {"CLAUDE_CODE_OAUTH_TOKEN"}
-    if config_dir == accounts.main_config_dir():
+    if isinstance(selected, accounts.LegacyHomeLaunch):
+        config_dir = accounts.main_config_dir()
+        pane_environment: dict[str, str] = {}
         unset_variables.update(account.NAMED_ACCOUNT_VARIABLES)
+        claude_json = Path.home() / ".claude.json"
+    else:
+        config_dir = selected.dir
+        pane_environment = account.named_account_environment(config_dir)
+        claude_json = config_dir / ".claude.json"
     environment = dict(os.environ)
     for variable in unset_variables:
         _ = environment.pop(variable, None)
     environment.update(pane_environment)
-    claude_json = Path.home() / ".claude.json" if config_dir == accounts.main_config_dir() else config_dir / ".claude.json"
     trust = herdr.claude_trust(folder, claude_json)
     if isinstance(trust, (herdr.Untrusted, herdr.UnreadableTrustFile)):
         reason = str(trust) if isinstance(trust, herdr.UnreadableTrustFile) else f"Claude has not trusted {folder}"
-        print(f"herdr_sessions: {reason}. Run: {accounts.trust_command(folder, selected)}", file=sys.stderr)
+        trust_command = (f"cd {shlex.quote(str(folder))} && env -u CLAUDE_CONFIG_DIR "
+                         + "-u CLAUDE_CODE_REMOTE_MEMORY_DIR -u CLAUDE_CODE_OAUTH_TOKEN claude"
+                         if isinstance(selected, accounts.LegacyHomeLaunch)
+                         else accounts.trust_command(folder, selected))
+        print(f"herdr_sessions: {reason}. Run: {trust_command}", file=sys.stderr)
         return 1
     opening: herdr.OpeningPrompt | herdr.NoOpeningPrompt = herdr.NoOpeningPrompt()
     if options.prompt_file:

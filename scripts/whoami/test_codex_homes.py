@@ -252,9 +252,9 @@ class CodexHomesTests(unittest.TestCase):
                 [CodexHomeSource(home) for home in homes])
             self.assertCountEqual(codex.await_args_list, [call(home) for home in homes])
             if selection.multiple_accounts:
-                self.assertCountEqual(claude.call_args_list, [call(self.home / ".claude"), call(named.directory)])
+                self.assertCountEqual(claude.call_args_list, [call(named.directory)])
             else:
-                claude.assert_called_once_with(self.home / ".claude")
+                claude.assert_not_called()
 
     def test_whoami_prints_each_codex_account_and_marks_only_the_selected_home(self) -> None:
         default = self.home / ".codex"

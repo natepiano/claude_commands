@@ -15,9 +15,10 @@ import time
 from collections.abc import Callable, Generator
 from contextlib import contextmanager
 from dataclasses import dataclass
+from importlib import import_module
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Literal, NotRequired, TypedDict, cast
+from typing import Literal, NotRequired, Protocol, TypedDict, cast
 
 from inventory import Session, parse_session
 from launch_permission import launch_barrier, shutdown_state_root
@@ -25,9 +26,14 @@ from launch_permission import launch_barrier, shutdown_state_root
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
 from user_zone import user_zone  # noqa: E402
 from scripts.whoami.note_file import canonical_label, parse_account_label, NumberedAccountLabel
+from account import ResolvedHistoryLabel, HistoricalAccountUnresolved
 
 CLAIM_STALE_SECONDS = 120
 CONDUCTOR_LOCK_RETRY_DELAYS = (0.05,) * 5
+
+
+class HistoricalAccountResolver(Protocol):
+    def resolve_history_label(self, label: str, at: str, *, login: str = "") -> ResolvedHistoryLabel | HistoricalAccountUnresolved: ...
 
 
 class ReadinessClear(TypedDict):
@@ -1022,11 +1028,10 @@ def _session_shutdown(value: object, place: str) -> SessionShutdown:
             values[field] = canonical_label(cast(str, values[field]))
     if "target" in values:
         target = _string(values["target"], f"{place}.target")
-        if target == "default":
-            from scripts.whoami.account import claude_account
-            home = claude_account(Path.home() / ".claude")
-            parsed_home = parse_account_label(home.label) if home is not None else None
-            target = parsed_home.label if isinstance(parsed_home, NumberedAccountLabel) else "~/.claude"
+        if target in ("default", "~/.claude", str(Path.home() / ".claude")):
+            resolver = cast(HistoricalAccountResolver, cast(object, import_module("scripts.accounts.accounts")))
+            resolved = resolver.resolve_history_label(target, _string(values["requested_at"], f"{place}.requested_at"))
+            target = resolved.label if isinstance(resolved, ResolvedHistoryLabel) else "~/.claude"
         parsed = parse_account_label(target)
         if target != "~/.claude" and not (isinstance(parsed, NumberedAccountLabel) and parsed.tool == "claude"):
             raise InvalidRecord(f"{place}.target must name a numbered Claude account")

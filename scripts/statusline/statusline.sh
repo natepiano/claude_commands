@@ -9,6 +9,8 @@
 #
 # It hands jq everything statusline.jq cannot read for itself:
 #   account      the session's label, from its config dir's account-label.
+#   legacy_home  whether that cache needs the legacy home login to remain valid.
+#   home_config  the home JSON for that check, /dev/null for numbered folders.
 #   labels       agent_notes' readings by label, /dev/null when missing.
 #   colors       config/statusline.conf, /dev/null when missing or unreadable.
 #   showrunners  the session ids every showrunner's update timer targets: the
@@ -25,6 +27,13 @@
 config="${CLAUDE_CONFIG_DIR:-$HOME/.claude}"
 account=
 { read -r account < "$config/account-label"; } 2>/dev/null
+# The cache in the config home is valid only while its legacy login remains.
+home_config=/dev/null
+if [ "$config" = "$HOME/.claude" ] && [ -f "$HOME/.claude.json" ] && [ -r "$HOME/.claude.json" ]; then
+  home_config="$HOME/.claude.json"
+fi
+legacy_home=
+[ "$config" != "$HOME/.claude" ] || legacy_home=1
 
 labels="$HOME/.local/state/agent-notes/by-label.json"
 [ -r "$labels" ] || labels=/dev/null
@@ -75,5 +84,6 @@ fi
 
 # shellcheck disable=SC2154 # statusline is set by the command that sources this.
 exec jq -r --arg pwd "$PWD" --arg account "$account" --arg showrunners "$showrunners" \
+  --arg legacy_home "$legacy_home" --rawfile home_config "$home_config" \
   --arg showrunner "$showrunner" --slurpfile labels "$labels" \
   --rawfile colors "$colors" -f "$statusline/statusline.jq"

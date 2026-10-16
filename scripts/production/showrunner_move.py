@@ -128,9 +128,10 @@ def prove(session_id: str, wanted: Path) -> Outcome:
     live = live_names().get(session_id)
     if live is None:
         return NotMoved("no live process after the move")
-    directory = account.process_config_dir(live[1])
-    if directory is None:
+    setting = account.process_account_directory(account.process_config_dir(live[1]))
+    if not isinstance(setting, account.ConfiguredClaudeFolder):
         return NotMoved(f"account of pid {live[1]} unreadable")
+    directory = setting.path
     if directory.resolve() != wanted.resolve():
         return NotMoved(f"pid {live[1]} runs on {directory}, not {wanted}")
     return Proven(live[1], directory)
