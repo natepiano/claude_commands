@@ -230,6 +230,17 @@ class AccountTests(unittest.TestCase):
         self.assertEqual(selected, record.setting)
         self.assertNotIn("private-marker", repr(record))
 
+    def test_mac_kernel_executable_is_retained_independently_of_a_spoofed_argument_zero(self) -> None:
+        executable = "/Applications/ChatGPT.app/Contents/MacOS/codex"
+        payload = (int(3).to_bytes(4, sys.byteorder, signed=True)
+                   + os.fsencode(executable) + b"\0\0codex\0app-server\0daemon\0HOME=/scratch\0")
+        with patch.object(account, "_kern_procargs2", return_value=payload):
+            record = account.mac_process_record(321)
+        self.assertIsInstance(record, account.MacProcessRecord)
+        assert isinstance(record, account.MacProcessRecord)
+        self.assertEqual(record.executable, Path(executable))
+        self.assertEqual(record.arguments, ("codex", "app-server", "daemon"))
+
     def test_mac_refused_or_malformed_kernel_record_is_unreadable_instead_of_default_home(self) -> None:
         malformed = (
             b"", b"\x01\x00",
