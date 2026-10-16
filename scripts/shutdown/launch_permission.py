@@ -21,13 +21,18 @@ class NewWorkLaunchPurpose:
 
 
 @dataclass(frozen=True)
-class ShutdownUnitRestoreLaunchPurpose:
-    """A launch that restores one unit recorded by shutdown."""
+class RecordedSessionRestoreLaunchPurpose:
+    """Restore any session held in a shutdown record.
+
+    Stopped, already gone, process identity lost, restarting, restart failed
+    and manual restart permit launch even under an account hold. Other
+    progress blocks it. Without a record, the account hold alone decides.
+    This purpose by itself does not authorize a restore."""
 
     session_id: str
 
 
-LaunchPurpose = NewWorkLaunchPurpose | ShutdownUnitRestoreLaunchPurpose
+LaunchPurpose = NewWorkLaunchPurpose | RecordedSessionRestoreLaunchPurpose
 
 
 @dataclass(frozen=True)
@@ -112,7 +117,7 @@ def launch_permission(
         str(Path(__file__).with_name("shutdown.py")),
         "launch-blocked",
     ]
-    if isinstance(purpose, ShutdownUnitRestoreLaunchPurpose):
+    if isinstance(purpose, RecordedSessionRestoreLaunchPurpose):
         command.extend(("--restart-of", purpose.session_id))
     try:
         completed = subprocess.run(

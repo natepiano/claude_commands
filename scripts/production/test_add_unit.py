@@ -370,6 +370,19 @@ class AddUnitTests(ShutdownTestCase):
         self.assertEqual(result.returncode, 0, (args, result.stdout, result.stderr))
         return result.stdout.strip()
 
+    def server_listener(self, server: Path, name: str) -> None:
+        config = Path(self.env.get("XDG_CONFIG_HOME", str(Path(self.env["HOME"]) / ".config"))) / "herdr"
+        table = self.root / "proc/net/unix"
+        table.parent.mkdir(parents=True, exist_ok=True)
+        line = f"0: 2 0 00010000 0001 01 {server.name} {config}/sessions/{name}/herdr.sock\n"
+        previous = table.read_text() if table.exists() else ""
+        if line not in previous:
+            _ = table.write_text(previous + line)
+        (server / "fd").mkdir(exist_ok=True)
+        (server / "fd/3").unlink(missing_ok=True)
+        (server / "fd/3").symlink_to(f"socket:[{server.name}]")
+
+
     def configure_herdr(self, request: add_unit.UnitLaunch | add_unit.NoMarkedUnit = NO_LAUNCH_FIXTURE) -> None:
         responses: dict[str, CommandResponse | list[CommandResponse]] = {
             "--session default session list --json": CommandResponse(code=0, stdout='{"sessions": []}'),
@@ -406,6 +419,7 @@ class AddUnitTests(ShutdownTestCase):
                     _ = (path / "status").write_text(f"Uid:\t{os.getuid()}\t{os.getuid()}\t{os.getuid()}\t{os.getuid()}\n")
                 (process / "cwd").unlink(missing_ok=True)
                 (process / "cwd").symlink_to(request.session_cwd)
+            self.server_listener(server, name)
             environment = {"HERDR_PANE_ID": "w1:p1", "SHOWRUNNER_UNIT": request.production.slug,
                            "SHOWRUNNER_UNIT_ID": request.identity.unit}
             running = CommandResponse(code=0, stdout=json.dumps(herdr.SessionListResult(sessions=[
@@ -863,6 +877,16 @@ class AddUnitTests(ShutdownTestCase):
         self.assertFalse(any(row[2:4] in (["agent", "prompt"], ["pane", "send-keys"], ["pane", "send-text"])
                              for row in self.herdr_calls()))
 
+    def test_unit_launch_passes_a_typed_opening_prompt_once(self) -> None:
+        with patch.object(herdr, "start_agent", wraps=herdr.start_agent) as start:
+            result = self.successful("alpha", "--plan", "docs/plans/given.md")
+        self.assertEqual(result.returncode, 0)
+        start.assert_called_once()
+        opening = cast(object, start.call_args.kwargs["opening"])
+        self.assertIsInstance(opening, herdr.OpeningPrompt)
+        assert isinstance(opening, herdr.OpeningPrompt)
+        self.assertEqual(opening.text, "/unit:direct docs/plans/given.md")
+
     def test_server_start_timeout_exits_one_with_its_text_instead_of_a_traceback(self) -> None:
         timeout = subprocess.TimeoutExpired("fixture server start", 10)
         errors = io.StringIO()
@@ -964,6 +988,7 @@ class AddUnitTests(ShutdownTestCase):
             _ = (process / "cmdline").write_bytes("\0".join(arguments).encode())
             _ = (process / "environ").write_text("HERDR_PANE_ID=w2:p1\0SHOWRUNNER_UNIT=build-followups\0SHOWRUNNER_UNIT_ID=alpha-unit" if pid == 202 else "")
             (process / "cwd").symlink_to(cwd)
+        self.server_listener(self.root / "proc/201", name)
         (Path(self.env["HOME"]) / ".claude/sessions").mkdir(exist_ok=True)
         self.herdr_overrides["--session default session list --json"] = CommandResponse(code=0, stdout=json.dumps(herdr.SessionListResult(sessions=[
                 herdr.SessionEntry(name=name, running=True, default=False, session_dir="/fixture", socket_path="/fixture/socket")])))
@@ -1624,11 +1649,11 @@ class AddUnitTests(ShutdownTestCase):
                          "build-followups-alpha")
         self.assertEqual(self.git("rev-parse", "HEAD", cwd=worktree),
                          self.git("rev-parse", "build-followups"))
-        self.assertEqual(self.servers_started(), [["--user", "--unit=herdr-alpha", "--collect",
+        self.assertEqual(self.servers_started(), [["--user", "--unit=herdr-alpha.service", "--collect",
             self.env["HERDR_BIN"], "--session", "alpha", "server"]])
         self.assertEqual(self.opened()[4:8], ["--label", "alpha", "--cwd", str(worktree)])
         self.assertEqual(self.pane_environment(), {"SHOWRUNNER_UNIT": "build-followups",
-            "SHOWRUNNER_UNIT_ID": "alpha-unit", "ENABLE_TOOL_SEARCH": "true"})
+            "SHOWRUNNER_UNIT_ID": "alpha-unit", "ENABLE_TOOL_SEARCH": "true", "HERDR_AGENT_PANE": "1"})
         self.assertEqual(self.agent_arguments(), ["--model", "opus", "--effort", "xhigh",
             "--remote-control", "alpha", "-n", "alpha", "--settings", '{"disableAgentView": true}'])
         self.assertEqual(self.opening_prompt(), "/unit:direct docs/plans/given.md")
@@ -1976,6 +2001,8 @@ class AddUnitTests(ShutdownTestCase):
         _ = self.successful("alpha", "--plan", "docs/plans/given.md")
         _ = (self.state / "herdr-live-alpha").rename(self.state / "herdr-live-renamed")
         _ = (self.root / "proc/101/cmdline").write_bytes(b"herdr\0--session\0renamed\0server\0")
+        sockets = self.root / "proc/net/unix"
+        _ = sockets.write_text(sockets.read_text().replace("/sessions/alpha/herdr.sock", "/sessions/renamed/herdr.sock"))
         self.herdr_overrides["--session renamed pane read w1:p1 --source recent --lines 60"] = CommandResponse(
             code=0, stdout="/remote-control is active")
         result = self.successful("alpha", "--plan", "docs/plans/given.md")
@@ -2378,7 +2405,7 @@ class AddUnitTests(ShutdownTestCase):
         self.assertEqual(recorded, (existing_prompt, prompt))
         self.assertIs(conversation_pause.prompt_source(prompt, frozenset, lambda: recorded),
                       conversation_pause.PromptSource.SCHEDULED)
-        self.assertEqual(self.servers_started()[0][1], "--unit=herdr-restore----")
+        self.assertEqual(self.servers_started()[0][1], "--unit=herdr-restore----.service")
 
     def test_restore_refuses_launch_when_prompt_cannot_be_recorded(self) -> None:
         self.commit_prepared_row(self.unit_row())

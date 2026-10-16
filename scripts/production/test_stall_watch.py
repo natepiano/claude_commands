@@ -17,6 +17,9 @@ from typing import TYPE_CHECKING, cast, override
 from zoneinfo import ZoneInfo
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "herdr"))
+
+from fake_herdr import herdr_listener
 
 if TYPE_CHECKING:
     from herdr import SessionListResult
@@ -296,6 +299,7 @@ raise SystemExit(1 if record['to'] in fail else 0)
             _ = (path / "cmdline").write_bytes("\0".join(argv).encode())
             _ = (path / "environ").write_bytes("\0".join(f"{key}={value}" for key, value in environment.items()).encode())
             (path / "cwd").symlink_to(self.root)
+        herdr_listener(self.root / "proc", 991000, "native", self.environment)
         sessions: SessionListResult = {"sessions": [{
             "name": "native", "running": True, "default": False,
             "session_dir": "/fixture", "socket_path": "/fixture/socket"}]}

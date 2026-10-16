@@ -51,7 +51,10 @@ from inventory import (  # noqa: E402
     TmuxServerNotRecorded,
     TmuxSessionId,
     TmuxSessionIdNotRecorded,
-    WindowHost,
+    Desktop,
+    Host,
+    DesktopNotInSnapshot,
+    herdr_presentation,
     live_supervisor,
 )
 from record import (  # noqa: E402
@@ -759,17 +762,8 @@ def _desktop_numbers() -> dict[str, int]:
     return found
 
 
-def _window_launch(
-    command: str,
-    session: Session,
-    desktop_state: DesktopLaunchState,
-    *,
-    dry_run: bool,
-) -> None:
-    host = session["host"]
-    if host["kind"] not in {"ghostty", "zed"}:
-        raise ValueError("window launch needs a window host")
-    window_host = cast(WindowHost, cast(object, host))
+def _open_window(command: str, desktop: Desktop, desktop_state: DesktopLaunchState, *, dry_run: bool) -> None:
+    """Open one Ghostty window, selecting a recorded desktop when available."""
     kdotool = os.environ.get("SHUTDOWN_KDOTOOL", "kdotool")
     if not desktop_state.starting_desktop:
         get_desktop = [kdotool, "get_desktop"]
@@ -780,7 +774,6 @@ def _window_launch(
             desktop_state.starting_desktop = result.stdout.strip()
     if not dry_run and desktop_state.started_windows:
         time.sleep(WINDOW_DELAY_SECONDS)
-    desktop = window_host["desktop"]
     number = (
         _desktop_numbers().get(desktop["name"])
         if desktop["kind"] == "named"
@@ -1062,7 +1055,10 @@ def _herdr_launch(
             reason = (str(trust) if isinstance(trust, herdr.UnreadableTrustFile)
                       else f"{parts.cwd}: Claude has not trusted this folder")
             raise OSError(f"{reason}. Run: {trust_command(Path(parts.cwd), account)}")
-        herdr.start_server(name, 90_000)
+        if isinstance(destination, NewHerdrSession):
+            herdr.start_new_server(name, 90_000)
+        else:
+            herdr.start_server(name, 90_000)
         server_environment = herdr.server_environment(name)
         for variable in sorted(unset_variables):
             if variable in server_environment:
@@ -1088,9 +1084,39 @@ def _herdr_launch(
                 raise OSError(f"herdr {name}:{destination.pane_id}: pane runs {', '.join(activity.commands)}")
         pane = herdr.open_pane(name, name, parts.cwd, environment)
         client.start_agent(session["name"], pane, kind="claude", agent_arguments=list(parts.claude_arguments),
-                           opening_prompt=parts.opening_prompt, timeout_ms=90_000)
+                           opening=herdr.OpeningPrompt(parts.opening_prompt), timeout_ms=90_000)
     except herdr.HerdrFailure as error:
         raise OSError(str(error)) from error
+
+
+def launches_window(host: Host) -> bool:
+    """Window hosts and attached herdr hosts share serialized presentation."""
+    return host["kind"] in {"ghostty", "zed", "terminal"} or (
+        host["kind"] == "herdr" and herdr_presentation(host) == "attached window")
+
+
+def _herdr_attach_command(name: str, cwd: str) -> str:
+    argv = [str(SCRIPTS / "lib" / "py"), str(SCRIPTS / "lib" / "relaunch.py"),
+            "run", "--", "herdr", "session", "attach", name]
+    return f"cd {shlex.quote(cwd)} && {shlex.join(argv)}; exec zsh"
+
+
+def _herdr_window(
+    record: SessionShutdown, name: str, cwd: str, desktop: Desktop,
+    desktop_state: DesktopLaunchState, *, dry_run: bool,
+) -> None:
+    """Report a failed attachment without turning a launched agent into another launch."""
+    try:
+        _open_window(_herdr_attach_command(name, cwd), desktop, desktop_state, dry_run=dry_run)
+    except (OSError, subprocess.SubprocessError) as error:
+        attach = shlex.join(["herdr", "session", "attach", name])
+        issue = f"window not opened: {_error_reason(error)}; {attach}"
+        print(f"{record['machine']}: {record['session']['name']} restart issue: {issue}")
+        if not dry_run:
+            def remember(current: SessionShutdown) -> None:
+                if _same_relaunch_claim(record, current):
+                    current.setdefault("restart_issues", []).append(issue)
+            _ = update_session(record["login"], record["session"]["session_id"], remember)
 
 
 def _launch_session(
@@ -1123,21 +1149,48 @@ def _launch_session(
     if host["kind"] == "herdr":
         _herdr_launch(parts, RecordedHerdrPane(host["herdr_session"], host["pane_id"]),
                       session, dry_run=dry_run)
+        name = host["herdr_session"]
+        if herdr_presentation(host) == "attached window":
+            match herdr.attached_clients(name):
+                case herdr.NoClientAttached():
+                    _herdr_window(record, name, parts.cwd, DesktopNotInSnapshot(kind="not in snapshot"),
+                                  desktop_state, dry_run=dry_run)
+                case herdr.ClientsUnreadable():
+                    print(shlex.join(["herdr", "session", "attach", name]))
+                case herdr.ClientsAttached():
+                    pass
+        else:
+            print(shlex.join(["herdr", "session", "attach", name]))
         return SessionLaunched()
     if host["kind"] == "tmux" and session["kind"] == "showrunner":
-        name = re.sub(r"[^A-Za-z0-9_.-]", "-", host["tmux_session"])
+        name = herdr.generated_session_name(host["tmux_session"])
         _herdr_launch(parts, NewHerdrSession(name), session, dry_run=dry_run)
         return SessionLaunched()
-    window_launch = host["kind"] in {"ghostty", "zed"} or (
-        host["kind"] == "terminal" and sys.platform == "darwin"
-    )
+    if host["kind"] == "ghostty" or host["kind"] == "zed":
+        name = herdr.generated_session_name(session["name"])
+        _herdr_launch(parts, NewHerdrSession(name), session, dry_run=dry_run)
+        if host["kind"] == "ghostty":
+            supervisor = live_supervisor(host)
+            if supervisor["kind"] == "supervisor":
+                request = relaunch.RelaunchRequest(
+                    argv=["herdr", "session", "attach", name], cwd=parts.cwd,
+                    environment={}, unset=[],
+                    written_at=datetime.now(timezone.utc).isoformat(timespec="seconds"), note=note)
+                if dry_run:
+                    print(f"restart in window via supervisor {supervisor['pid']}: {shlex.join(request['argv'])}")
+                else:
+                    relaunch.write_request(supervisor["pid"], request)
+                return SessionLaunched()
+        _herdr_window(record, name, parts.cwd, host["desktop"], desktop_state, dry_run=dry_run)
+        return SessionLaunched()
+    window_launch = host["kind"] == "terminal" and sys.platform == "darwin"
     command = _resume_shell(parts, supervised=True) if window_launch else _resume_shell(parts)
     if host["kind"] == "unknown" or (host["kind"] == "terminal" and sys.platform == "linux"):
         return ManualRestartRequired(command)
     _record_scheduled_restart_prompt(
         session["session_id"], prompt, dry_run=dry_run
     )
-    if host["kind"] == "ghostty" or (host["kind"] == "terminal" and sys.platform == "darwin"):
+    if host["kind"] == "terminal" and sys.platform == "darwin":
         supervisor = live_supervisor(host)
         if supervisor["kind"] == "supervisor":
             request = _relaunch_request(parts, note)
@@ -1147,8 +1200,6 @@ def _launch_session(
                 relaunch.write_request(supervisor["pid"], request)
             return SessionLaunched()
     match host["kind"]:
-        case "ghostty" | "zed":
-            _window_launch(command, session, desktop_state, dry_run=dry_run)
         case "terminal":
             if not dry_run and desktop_state.started_windows:
                 time.sleep(WINDOW_DELAY_SECONDS)
@@ -1913,10 +1964,10 @@ def _up(login: str, dry_run: bool, only: Iterable[str] = ()) -> MachineRestartRe
         with ThreadPoolExecutor(max_workers=RESTART_LAUNCH_WORKERS) as executor:
             workers = [
                 (record, executor.submit(relaunch_session, record, dry_run=False, desktop_state=state))
-                for record in others if record["session"]["host"]["kind"] not in {"ghostty", "zed", "terminal"}
+                for record in others if not launches_window(record["session"]["host"])
             ]
             for record in others:
-                if record["session"]["host"]["kind"] in {"ghostty", "zed", "terminal"}:
+                if launches_window(record["session"]["host"]):
                     current = relaunch_session(record, dry_run=False, desktop_state=state)
                     if current["progress"]["kind"] == "restarting" and not owns_relaunch_claim(record, current):
                         continue

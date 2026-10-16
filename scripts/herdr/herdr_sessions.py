@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
-"""List running herdr sessions and attach to one by name."""
+"""List, attach, start or resume standalone Claude sessions in herdr."""
 
 from __future__ import annotations
 
+import argparse
 import os
 import sys
 from pathlib import Path
@@ -16,7 +17,115 @@ from sessions import SessionRecord, UnreadableSessionRecord, live_session, read_
 sys.path.insert(0, str(SCRIPTS / "production"))
 from showrunners import registered_showrunners  # noqa: E402
 
-USAGE = "usage: herdr_sessions.py list | attach <name>"
+sys.path.insert(0, str(SCRIPTS.parent))
+from scripts.shutdown import launch_permission  # noqa: E402
+from scripts.accounts import accounts  # noqa: E402
+from scripts.whoami import account  # noqa: E402
+
+USAGE = "usage: herdr_sessions.py list | attach <name> | start [--name N] [--cwd D] [-- <claude args>] | resume <name> --session-id ID --cwd D [--config-dir D] [--restore] [--prompt-file P] [--attach] [-- <claude args>]"
+
+
+class LaunchOptions(argparse.Namespace):
+    name: str | None = None
+    cwd: str = ""
+    session_id: str = ""
+    config_dir: str = ""
+    restore: bool = False
+    prompt_file: str = ""
+    attach: bool = False
+
+
+def _attach(name: str) -> None:
+    binary = herdr.herdr_binary()
+    os.execvp(binary, [binary, "session", "attach", name])
+
+
+def _launch(verb: str, arguments: list[str]) -> int:
+    parser = argparse.ArgumentParser(prog=f"herdr_sessions.py {verb}")
+    if verb == "start":
+        _ = parser.add_argument("--name")
+        _ = parser.add_argument("--cwd", default=os.getcwd())
+    else:
+        _ = parser.add_argument("name")
+        _ = parser.add_argument("--session-id", required=True)
+        _ = parser.add_argument("--cwd", required=True)
+        _ = parser.add_argument("--config-dir", default="")
+        _ = parser.add_argument("--restore", action="store_true")
+        _ = parser.add_argument("--prompt-file", default="")
+        _ = parser.add_argument("--attach", action="store_true")
+    separator = arguments.index("--") if "--" in arguments else len(arguments)
+    options = parser.parse_args(arguments[:separator], namespace=LaunchOptions())
+    claude_arguments = arguments[separator + 1:]
+    folder = Path(options.cwd).expanduser().resolve(strict=True)
+    if not folder.is_dir():
+        raise ValueError(f"{folder}: not a directory")
+    if options.name is not None:
+        _ = herdr.server_unit(options.name)
+    config_dir = Path(options.config_dir or os.environ.get("CLAUDE_CONFIG_DIR") or accounts.main_config_dir()).expanduser().resolve()
+    selected = accounts.NamedAccount(str(config_dir), config_dir)
+    pane_environment = account.named_account_environment(config_dir) if config_dir != accounts.main_config_dir() else {}
+    unset_variables = {"CLAUDE_CODE_OAUTH_TOKEN"}
+    if config_dir == accounts.main_config_dir():
+        unset_variables.update(account.NAMED_ACCOUNT_VARIABLES)
+    environment = dict(os.environ)
+    for variable in unset_variables:
+        _ = environment.pop(variable, None)
+    environment.update(pane_environment)
+    claude_json = Path.home() / ".claude.json" if config_dir == accounts.main_config_dir() else config_dir / ".claude.json"
+    trust = herdr.claude_trust(folder, claude_json)
+    if isinstance(trust, (herdr.Untrusted, herdr.UnreadableTrustFile)):
+        reason = str(trust) if isinstance(trust, herdr.UnreadableTrustFile) else f"Claude has not trusted {folder}"
+        print(f"herdr_sessions: {reason}. Run: {accounts.trust_command(folder, selected)}", file=sys.stderr)
+        return 1
+    opening: herdr.OpeningPrompt | herdr.NoOpeningPrompt = herdr.NoOpeningPrompt()
+    if options.prompt_file:
+        opening = herdr.OpeningPrompt(Path(options.prompt_file).read_text())
+    purpose: launch_permission.LaunchPurpose = (
+        launch_permission.RecordedSessionRestoreLaunchPurpose(options.session_id)
+        if options.restore else launch_permission.NewWorkLaunchPurpose()
+    )
+    try:
+        barrier = launch_permission.launch_barrier()
+        _ = barrier.__enter__()
+    except OSError as error:
+        print(f"herdr_sessions: shutdown state unreadable: launch barrier: {error}", file=sys.stderr)
+        return 1
+    try:
+        permission = launch_permission.launch_permission(environment, purpose)
+        if isinstance(permission, launch_permission.BlockedByShutdown):
+            print(f"herdr_sessions: {permission.reason}", file=sys.stderr)
+            return 1
+        if isinstance(permission, launch_permission.ShutdownStateUnreadable):
+            print(f"herdr_sessions: shutdown state unreadable: {permission.detail}", file=sys.stderr)
+            return 1
+        suffix = 1
+        while True:
+            name = options.name or herdr.generated_session_name(folder.name, str(suffix))
+            try:
+                herdr.start_new_server(name, 90_000)
+                break
+            except herdr.SessionTaken:
+                if options.name:
+                    raise
+                suffix += 1
+        pane = herdr.open_pane(name, name, str(folder), pane_environment)
+        server_environment = herdr.server_environment(name)
+        for variable in sorted(unset_variables):
+            if variable in server_environment:
+                raise herdr.HerdrFailure(
+                    f"herdr server {name} carries {variable} from where it started; "
+                    + f"stop it with herdr --session {name} server stop and try again"
+                )
+        if verb == "resume":
+            claude_arguments.extend(["--resume", options.session_id])
+        claude_arguments.extend(["-n", name])
+        herdr.start_agent(name, pane, kind="claude", agent_arguments=claude_arguments,
+                          opening=opening, timeout_ms=90_000)
+    finally:
+        _ = barrier.__exit__(None, None, None)
+    if verb == "start" or options.attach:
+        _attach(name)
+    return 0
 
 
 def claude_names() -> dict[str, str]:
@@ -51,6 +160,12 @@ def unit_roles() -> dict[str, str]:
 
 
 def main(argv: list[str]) -> int:
+    if len(argv) > 1 and argv[1] in ("start", "resume"):
+        try:
+            return _launch(argv[1], argv[2:])
+        except (herdr.HerdrFailure, OSError, ValueError) as error:
+            print(f"herdr_sessions: {error}", file=sys.stderr)
+            return 1
     if argv[1:] != ["list"] and not (len(argv) == 3 and argv[1] == "attach" and argv[2]):
         print(USAGE, file=sys.stderr)
         return 2
@@ -62,8 +177,7 @@ def main(argv: list[str]) -> int:
                 names = ", ".join(session["name"] for session in running) or "none"
                 print(f"herdr_sessions: {name} is not running; running sessions: {names}", file=sys.stderr)
                 return 1
-            binary = herdr.herdr_binary()
-            os.execvp(binary, [binary, "session", "attach", name])
+            _attach(name)
         if not running:
             return 0
         names = claude_names()

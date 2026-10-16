@@ -200,7 +200,7 @@ Moved to unit `herdr-panes-unit`, run in parallel with Phase 5; shipped as `docs
 
 **Ruled out:** probing pane process info to detect shell readiness (herdr sends no distinguishing shape); killing an in-flight `agent start` at the deadline (leaves a half-started agent); copying the caller's environment into a restored pane (only named marks pass).
 
-### Phase 8 — Standalone sessions in herdr  · status: todo
+### Phase 8 — Standalone sessions in herdr  · status: done
 
 **Depends on:** Phase 7
 

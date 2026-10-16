@@ -20,7 +20,7 @@ import session_pane
 import herdr
 from fake_tmux import FakeSession
 from herdr import AgentBlocked, HerdrPlace, HerdrRefusal, SessionListResult
-from fake_herdr import CommandResponse
+from fake_herdr import CommandResponse, herdr_listener
 from sessions import SessionRecord
 from unit_lookup import TmuxPlace
 
@@ -68,6 +68,7 @@ class SessionPaneTests(unittest.TestCase):
                         screens={"%41": "tmux screen\n"})})
         self.responses()
         self.process(991000, 0, ["herdr", "--session", "native", "server"], {})
+        herdr_listener(self.root / "proc", 991000, "native", self.environment)
         self.process(991001, 991000, ["zsh"], {"HERDR_PANE_ID": "w1:p1",
                      "SHOWRUNNER_UNIT": "show", "SHOWRUNNER_UNIT_ID": "herdr-unit"})
 

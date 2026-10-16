@@ -791,7 +791,9 @@ def host_session_name(request: UnitLaunch) -> str:
     """The destination name, limited to characters supported by named herdr sessions."""
     name = (request.launch_kind.host_session if isinstance(request.launch_kind, UnitRestoreLaunch)
             else request.identity.session)
-    return re.sub(r"[^A-Za-z0-9_.-]", "-", name)
+    import herdr
+
+    return herdr.generated_session_name(name)
 
 
 def launch_session(
@@ -836,7 +838,7 @@ def launch_session(
     herdr.start_new_server(name, timeout_ms)
     pane = herdr.open_pane(name, name, str(request.session_cwd), environment)
     herdr.start_agent(name, pane, kind="claude", agent_arguments=arguments,
-                      opening_prompt=prompt, timeout_ms=timeout_ms)
+                      opening=herdr.OpeningPrompt(prompt), timeout_ms=timeout_ms)
 
 
 def launch_environment() -> dict[str, str]:
@@ -1117,7 +1119,7 @@ def main(argv: list[str]) -> int:
             ) from error
         try:
             purpose: launch_permission.LaunchPurpose = (
-                launch_permission.ShutdownUnitRestoreLaunchPurpose(
+                launch_permission.RecordedSessionRestoreLaunchPurpose(
                     request.launch_kind.session_id
                 )
                 if isinstance(request.launch_kind, UnitRestoreLaunch)
