@@ -4,6 +4,7 @@ from __future__ import annotations
 import fcntl
 import json
 import os
+import pwd
 import re
 import shlex
 import socket
@@ -150,8 +151,35 @@ def role_map_cache_file() -> Path:
     return groups_file().with_name("role_map_cache.json")
 
 
+@dataclass(frozen=True)
+class LoginHome:
+    path: Path
+
+
+@dataclass(frozen=True)
+class LoginHomeUnread:
+    """The password database did not supply the current uid's home."""
+
+
+def _login_home() -> LoginHome | LoginHomeUnread:
+    """Read the current uid's home independently of the process's HOME."""
+    try:
+        return LoginHome(Path(pwd.getpwuid(os.getuid()).pw_dir))
+    except (KeyError, OSError):
+        return LoginHomeUnread()
+
+
 def is_role_map_host() -> bool:
-    return socket.gethostname().split(".", 1)[0] == ROLE_MAP_HOST
+    if socket.gethostname().split(".", 1)[0] == ROLE_MAP_HOST:
+        return True
+    login_home = _login_home()
+    if isinstance(login_home, LoginHomeUnread):
+        return True
+    try:
+        return Path.home().resolve() != login_home.path.resolve()
+    except (OSError, RuntimeError):
+        # An unconfirmed home must never reach the real remote map.
+        return True
 
 
 def ssh_role_map(arguments: tuple[str, ...]) -> str:
