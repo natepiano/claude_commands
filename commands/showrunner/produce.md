@@ -503,7 +503,7 @@ whatever arrived:
 | the user asks for a status | `/showrunner:dailies`, `gantt` unless they name a length |
 | the user asks which phase or task each unit is on | `/showrunner:units` |
 | the user asks which proposals are open | `/showrunner:proposals` |
-| the user asks for "change review" or "the next change" | `/change_review` show; each verdict through <CloseChangeReview/>. The user is returning to the terminal: show the current unconfirmed row in full, what changed and how to check it, even if already shown. Never show a later row until the user gives a verdict on the current one (user, 2026-10-16) |
+| the user asks for "change review" or "the next change" | `/change_review` show; each verdict through <CloseChangeReview/> |
 | a change for the user to check that no checkpoint `Change-Review:` line carries | `/change_review` add |
 | a unit's finished proposal, or the user approves, declines or re-rates one | `/showrunner:proposal` |
 | the user asks for the nightly improvement list | `/showrunner:nightly` |

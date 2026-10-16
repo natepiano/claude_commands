@@ -67,6 +67,10 @@ merged, or `nothing to review`. Walk the rows one at a time, in order. For each,
 say what changed and how to check it in plain words, then wait for the user's
 verdict in their reply. Never use a form; ask in one plain-text line.
 
+A request for "the next change" means the user is returning to the terminal:
+show the current unconfirmed row in full, even if already shown. Never show a
+later row until the current one has a verdict (user, 2026-10-16).
+
 ## verdict
 
 A verdict beginning `works` or `fine` lands the row; any other returns it to
