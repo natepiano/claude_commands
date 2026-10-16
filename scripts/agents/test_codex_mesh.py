@@ -43,7 +43,7 @@ from unittest.mock import MagicMock, patch
 from scripts.agents import codex_mesh
 from scripts.message import process_table, sessions
 from scripts.usage import agents_log
-from scripts.accounts import accounts, moves, refusals
+from scripts.accounts import accounts, moves, refusals, role_map
 from scripts.whoami import agent_accounts
 
 
@@ -79,12 +79,34 @@ def set_environment(name: str, value: str) -> Callable[[], None]:
     return restore
 
 
+def select_fixture_workers(home: Path) -> None:
+    """Give fake-server tests an explicit selection backed by a synthetic sign-in."""
+    default = home / ".codex"
+    default.mkdir(exist_ok=True)
+    login = "mesh-fixture@example.invalid"
+    claims = base64.urlsafe_b64encode(json.dumps({"email": login}).encode()).decode().rstrip("=")
+    auth = default / "auth.json"
+    _ = auth.write_text(json.dumps({"tokens": {"id_token": f"header.{claims}.signature"}}))
+    os.utime(auth, (1, 1))
+    notes = Path(os.environ["AGENT_NOTES_DIR"])
+    notes.mkdir(parents=True, exist_ok=True)
+    _ = (notes / "codex9.md").write_text(f"---\nlogin: {login}\n---\n")
+    config = home / ".claude/config/accounts.json"
+    config.parent.mkdir(parents=True, exist_ok=True)
+    _ = config.write_text('{"workers": "codex9"}')
+
+
 def setUpModule() -> None:
-    # No test sees the real Codex sign-in: with none, no server counts as holding an old one.
+    # No test sees a real sign-in; the synthetic selection predates every fake server.
     home = tempfile.TemporaryDirectory()
     usage = tempfile.TemporaryDirectory()
     restore_usage = set_environment("USAGE_STATE_DIR", usage.name)
     restore_home = set_environment("HOME", home.name)
+    restore_notes = set_environment("AGENT_NOTES_DIR", home.name)
+    authority = patch.object(role_map, "is_role_map_host", return_value=True)
+    _ = authority.start()
+    unittest.addModuleCleanup(authority.stop)
+    select_fixture_workers(Path(home.name))
     previous = os.environ.get("CODEX_HOME")
     os.environ["CODEX_HOME"] = str(Path(home.name) / ".codex")
 
@@ -95,6 +117,7 @@ def setUpModule() -> None:
             os.environ["CODEX_HOME"] = previous
         restore_usage()
         restore_home()
+        restore_notes()
         usage.cleanup()
         home.cleanup()
 
@@ -361,6 +384,7 @@ class MeshCommandTests(unittest.TestCase):
         self.waits = []
         self.elapsed = 0.0
         self.start_args_timeout = 300.0
+        select_fixture_workers(Path.home())
         self.server = StubAppServer(self.respond)
         _ = (self.session_dir / codex_mesh.SERVER_FILE).write_text(
             json.dumps({"port": self.server.port, "pid": os.getpid(), "codex_home": str(agent_accounts.workers_home()), "auto_compact_tokens": codex_mesh.AUTO_COMPACT_TOKENS}),
@@ -2556,6 +2580,7 @@ class MeshCommandTests(unittest.TestCase):
         claims = base64.urlsafe_b64encode(json.dumps({"email": login}).encode()).decode().rstrip("=")
         _ = (selected / "auth.json").write_text(json.dumps({"tokens": {"id_token": f"header.{claims}.signature"}}))
         _ = (notes / "codex2.md").write_text(f"---\nlogin: {login}\n---\n")
+        self.assertEqual(accounts.main(["set-role", "workers", "codex2"]), 0)
         _ = (self.session_dir / codex_mesh.SERVER_FILE).write_text(json.dumps({
             "port": self.server.port, "pid": os.getpid(), "codex_home": str(selected), "auto_compact_tokens": codex_mesh.AUTO_COMPACT_TOKENS,
         }))
@@ -2751,6 +2776,10 @@ class MeshCommandTests(unittest.TestCase):
     def test_unreadable_serving_sign_in_reports_an_explicit_unknown_account(self) -> None:
         account = self.prepare_refusing_account()
         (account.home / "auth.json").unlink()
+        select_fixture_workers(Path.home())
+        selected = Path.home() / ".codex9"
+        selected.mkdir()
+        _ = (account.home / "auth.json").rename(selected / "auth.json")
         original = self.respond
         def respond(request: dict[str, object]) -> list[dict[str, object]] | None:
             return self.quota_completion(request) if request.get("method") == "turn/start" else original(request)
@@ -2831,6 +2860,7 @@ class MeshCommandTests(unittest.TestCase):
         source_claims = base64.urlsafe_b64encode(json.dumps({"email": source_login}).encode()).decode().rstrip("=")
         _ = (source / "auth.json").write_text(json.dumps({"tokens": {"id_token": f"header.{source_claims}.signature"}}))
         _ = (home / "codex9.md").write_text(f"---\nlogin: {source_login}\n---\n")
+        self.assertEqual(accounts.main(["set-role", "workers", "codex9"]), 0)
         _ = (self.session_dir / codex_mesh.SERVER_FILE).write_text(json.dumps({
             "port": self.server.port, "pid": os.getpid(), "codex_home": str(home / ".codex"), "auto_compact_tokens": codex_mesh.AUTO_COMPACT_TOKENS,
         }))
@@ -3472,6 +3502,10 @@ class MeshCommandTests(unittest.TestCase):
         target, rejected = self.prepare_workers_move()
         final_home = target.parent / ".codex2"
         final_home.mkdir()
+        login = "recovered@example.invalid"
+        claims = base64.urlsafe_b64encode(json.dumps({"email": login}).encode()).decode().rstrip("=")
+        _ = (final_home / "auth.json").write_text(json.dumps({"tokens": {"id_token": f"header.{claims}.signature"}}))
+        _ = (final_home.parent / "codex2.md").write_text(f"---\nlogin: {login}\n---\n")
         recovered = StubAppServer(self.respond)
         _ = self.patches.callback(recovered.close)
         respond = self.server.respond
@@ -6619,6 +6653,7 @@ class WorkersHomeTests(unittest.TestCase):
         self.session_dir = root / "run"
         self.session_dir.mkdir()
         _ = cast(object, self.enterContext(patch.dict(os.environ, {"HOME": str(self.home), "AGENT_NOTES_DIR": str(self.home)}, clear=True)))
+        select_fixture_workers(self.home)
         _ = self.enterContext(patch.object(sessions, "running_sessions", return_value=[
             running_holder(holder) for holder in ("director-one", "director-two", "holder-id", "test-holder")]))
 

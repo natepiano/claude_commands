@@ -23,7 +23,7 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "scripts" / "shutdown"))
 sys.path.insert(0, str(ROOT / "scripts" / "whoami"))
-from scripts.accounts import accounts, moves, refusals
+from scripts.accounts import accounts, moves, refusals, role_map
 import account
 import agent_accounts
 from note_file import canonical_label
@@ -535,7 +535,7 @@ def _run(now: datetime, dry_run: bool, proof_group: frozenset[str] = NO_SESSION_
     if dry_run:
         lines.insert(0, accounts.group_status_line(selected_groups))
     all_members: dict[accounts.ClaudeGroup, list[inventory_module.ListedSession]] = (accounts.live_group_members()
-        if not proof_group and (any(key.startswith("group:") for key in groups) or accounts.groups_file().exists())
+        if not proof_group and (any(key.startswith("group:") for key in groups) or bool(selected_groups))
         else {"units": [], "showrunners": []})
     moved_groups: set[accounts.ClaudeGroup] = set()
     no_room_groups: set[accounts.ClaudeGroup] = set()
@@ -637,7 +637,7 @@ def _run(now: datetime, dry_run: bool, proof_group: frozenset[str] = NO_SESSION_
             if isinstance(outcome, accounts.SessionMoveRefused):
                 lines.append(f"{outcome.session_id}: move refused: {outcome.reason}")
     # A committed group choice is stable. Complete its off-target members without choosing again.
-    if not proof_group and accounts.groups_file().exists():
+    if not proof_group and selected_groups:
         for group_name in accounts.CLAUDE_GROUPS:
             if group_name in moved_groups or group_name in waiting_groups or group_name in blocked_groups or group_name in no_room_groups:
                 continue
@@ -676,6 +676,7 @@ def _run(now: datetime, dry_run: bool, proof_group: frozenset[str] = NO_SESSION_
     return lines
 
 
+@role_map.role_map_command
 def run(now: datetime | None = None, *, dry_run: bool = False, proof_group: frozenset[str] = NO_SESSION_FILTER) -> list[str]:
     at = now or datetime.now(timezone.utc)
     if dry_run:

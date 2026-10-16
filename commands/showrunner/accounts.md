@@ -22,6 +22,7 @@ and print its output exactly as it comes, with nothing added.
   Keep `CODEX_HOME` on it: without it, `codex login` signs `~/.codex` out and in, stopping workers using that home.
 - `pick claude|codex [--explain]`: picks room with the soonest weekly reset; `--keep <label>` keeps a working account, and repeated `--exclude <label>` skips accounts.
 - `placement --explain`: room and each group's destination on refusal. Low or 0% is room until refused; healthy groups stay put.
+- natedev holds the role map for both machines. Mac writes run over `ssh natedev`; reads fetch it once per command and cache it beside `groups.json`. Offline reads print `role map from <local time>; natedev unreachable`; without a cache they refuse. A mapped account missing or signed out here refuses launches with its setup or login step; status prints that problem under the table. Never substitute another account.
 - Configuration decides every new and resumed launch: `claude-unit` and `role unit` use units; `role showrunner` uses showrunners. Set it with `accounts.py move <group> claudeN`; an unconfigured group refuses with that command.
 - In this terminal, a showrunner uses `/showrunner:move` to prove where each session came back. A terminal `accounts.py move` follows each source request live; session and redirected callers receive scoped follow commands.
 - `move <session-id|name> claudeN [--dry-run]`: moves or previews one local ad hoc session; grouped sessions use the group command. `--why <text>` explains the move on resume. A manual restart outcome gives its command and place.
