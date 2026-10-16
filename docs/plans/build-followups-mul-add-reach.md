@@ -73,14 +73,14 @@ Evidence, outside the repository, read-only: `~/.local/state/mul-add-hook/reach-
   - Python is typed throughout with no `Any` and no file-level type ignores (the user's `CLAUDE.md`).
   - The words in `~/rust/nate_style/rust/forbidden-words.md` never appear in code, comments or docs (the user's `CLAUDE.md`).
   - `~/.claude` main is the live configuration; each merged phase reaches it at once (production rule), so each phase is safe alone.
-  - Times carry their zone: this plan states PDT; buildlog stamps are UTC.
+  - Times carry their zone: this plan states EDT (America/New_York) in its remaining work and PDT in its finished records; buildlog stamps are UTC.
 
 ## Gates
 
 | Gate | Waiting | Waits on | Clears when |
 | --- | --- | --- | --- |
 | G1 | Phase 3 | Phase 2's checkpoint in the live configuration | `git -C ~/.claude merge-base --is-ancestor <Phase 2 checkpoint> HEAD` succeeds |
-| G2 | Phase 4 | 96 hours after T_reach (2026-10-12 11:13:42 PDT) | the clock reads 2026-10-16 11:13:42 PDT or later |
+| G2 | Phase 4 | 96 hours after T_reach (2026-10-12 14:13:42 EDT) | the clock reads 2026-10-16 14:13:42 EDT or later |
 
 ## Phases
 
@@ -174,9 +174,9 @@ The wider detector is confirmed live on natedev for both agents. T_reach, the ti
 
 **Gotchas:** the hook reads text and never compiles, so the scratch function need not build. The block log writes one record per reported expression, each with its own `at`; the records of one hook response share no id.
 
-### Phase 4 — Re-measure  · status: todo
+### Phase 4 — Re-measure  · status: done
 
-**Blocked by:** G2 — 96 hours after T_reach: 2026-10-16 11:13:42 PDT.
+**Blocked by:** G2 — 96 hours after T_reach: 2026-10-16 14:13:42 EDT.
 
 #### Work Order
 
@@ -193,7 +193,7 @@ Work in the worktree `/home/natepiano/worktrees/claude-build-followups-mul-add`,
    - of the window's warnings, how many had an earlier record for the same file and expression in `~/.local/state/mul-add-hook/blocks.jsonl`, and how many had none. Split those with none in two by running the detector on a stub, as `gate.py` does: the stub is reported, so today's detector sees the shape and the hook stayed silent for a cause the log cannot name (the line was not written by the edit, the edit came from outside the hooks, or the log write failed), counted as unknown; or the stub is not reported, counted under the rule that skips it on the stub;
    - blocks in the window, where one block is one record in `blocks.jsonl`, that is one reported expression (a hook response that reports several expressions writes several records, each with its own `at` and no shared id): total, by agent, and how many were followed by a `mul_add` on that line in the next commit touching the file (a sample of 30 is enough).
 3. Each limit gets PASS or FAIL. A FAIL names its largest remaining cause with counts. A window with no sole-cause failure, or with failures and no later lint call, still gives its sums and a verdict: write the median and the percentile as unavailable, never computed from an empty sample (`cost.py` and `loop.py` compute them unconditionally).
-4. Write the result as a "Detector reach, re-measure" table and paragraph under "Measured outcome" in `docs/as-built/build-followups-mul-add.md`.
+4. Write the result as a "Detector reach, re-measure" table and paragraph under "Measured outcome" in `docs/as-built/build-followups-mul-add.md`. State every time in EDT (America/New_York), the user's zone since 2026-10-12, with the UTC time beside any time a query uses. The "Detector reach, live check" paragraph above it gives T_reach in PDT: restate that one time as 2026-10-12 14:13:42 EDT (America/New_York, UTC-04:00), so the section reads in one zone.
 
 **Files:**
 - `docs/as-built/build-followups-mul-add.md` — the "Detector reach, re-measure" table and paragraph
@@ -202,7 +202,7 @@ Work in the worktree `/home/natepiano/worktrees/claude-build-followups-mul-add`,
 - `impl` — `docs/as-built/build-followups-mul-add.md`
 - `test` — opens as impl; no file
 
-**Constraints from prior phases:** T_reach is 2026-10-12 11:13:42 PDT (2026-10-12T18:13:42Z), the committer time of the merge that brought Phase 2's checkpoint into `~/.claude`; the window ends 2026-10-16 11:13:42 PDT (2026-10-16T18:13:42Z). Phase 3's live check wrote two records into `blocks.jsonl` inside the window, at 2026-10-12T18:18:04Z (`agent` `claude`) and 2026-10-12T18:21:28Z (`agent` `codex`), both with `expression` `top + metrics.button.height * 0.5` and a `file` under `live_check_claude/` or `live_check_codex/`; they come from scratch crates, so leave them out of every block count and say so beside the counts. "Measured outcome" in the as-built doc opens with Phase 3's "Detector reach, live check" paragraph; put the re-measure's table and paragraph directly after it. Phase 2 changed the block's wording, so match blocks to warnings by `file` and `expression` in `blocks.jsonl`, never by message text. From Phase 2 on, `expression` is the detector's `expr`: the sum's source text with each run of whitespace outside string and char literals collapsed to one space and comments left out; a record from before T_reach holds the raw source slice. To compare a clippy warning with a record, run `mul_add_lib.mul_add_findings(path)` on the warning's stub as `gate.py` does (it returns the lint scope and a list of findings with `line`, `expr` and `rewrite`) and compare `expr`. On Phase 2's checkpoint `gate.py` reports 160 of the 168 recorded warnings; the `VECTOR` pattern in `mul_add_lib.py` skips the other eight (a `.min(` or `.max(` call with an argument, three; a `.left` member, three; a `.size()` call, one; a `Transform` type token, one).
+**Constraints from prior phases:** T_reach is 2026-10-12 14:13:42 EDT (2026-10-12T18:13:42Z), the committer time of the merge that brought Phase 2's checkpoint into `~/.claude`; the window ends 2026-10-16 14:13:42 EDT (2026-10-16T18:13:42Z). Phase 3's live check wrote two records into `blocks.jsonl` inside the window, at 2026-10-12T18:18:04Z (`agent` `claude`) and 2026-10-12T18:21:28Z (`agent` `codex`), both with `expression` `top + metrics.button.height * 0.5` and a `file` under `live_check_claude/` or `live_check_codex/`; they come from scratch crates, so leave them out of every block count and say so beside the counts. "Measured outcome" in the as-built doc opens with Phase 3's "Detector reach, live check" paragraph; put the re-measure's table and paragraph directly after it. Phase 2 changed the block's wording, so match blocks to warnings by `file` and `expression` in `blocks.jsonl`, never by message text. From Phase 2 on, `expression` is the detector's `expr`: the sum's source text with each run of whitespace outside string and char literals collapsed to one space and comments left out; a record from before T_reach holds the raw source slice. To compare a clippy warning with a record, run `mul_add_lib.mul_add_findings(path)` on the warning's stub as `gate.py` does (it returns the lint scope and a list of findings with `line`, `expr` and `rewrite`) and compare `expr`. On Phase 2's checkpoint `gate.py` reports 160 of the 168 recorded warnings; the `VECTOR` pattern in `mul_add_lib.py` skips the other eight (a `.min(` or `.max(` call with an argument, three; a `.left` member, three; a `.size()` call, one; a `Transform` type token, one).
 
 **Acceptance gate:** both limits reported with PASS or FAIL from the 96-hour window; every number traces to a query the report names.
 
