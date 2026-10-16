@@ -1161,46 +1161,16 @@ After a worker launch's own turn has ended, a move to the selected seats home th
 
 ### Phase 36 — A swap leaves ended sessions' workers alone  · status: done
 
-**Depends on:** Phase 35
+#### As-built
 
-#### Work Order
-
-**Goal:** a workers swap or Codex sign-in change touches only workers some live session is waiting on. Workers of ended sessions are never interrupted or resumed, since resuming them spends credits on work nobody reads. Their rows leave the output, and their leftover app-servers are stopped. Showrunner, 2026-10-16: "a swap must never interrupt or resume a worker whose unit session is gone".
-
-**Constraints from prior phases:**
-
-- `codex_mesh.retire_workers_servers` (swap) and `command_signin_changed` (sign-in change) collect one `WorkersRunMove` per run folder whose recorded server's home is outgoing. They interrupt running workers through `_switch_run_workers` → `_interrupt_worker_for_account_move`, then confirm resumes in `_finish_run_moves`.
-- A run's holders are `_marker_sessions(roots, folder)`: the run-active markers under `<root>/active`, each named for a session id.
-- `scripts.message.sessions.running_sessions()` returns every running session record (process-validated, sockets not required), with a `sessionId` field; `live_sessions()` would wrongly drop a running session without a socket. The roster's `launcher_pid` shows whether a launcher still waits; a launcher's turn loop never checks its holder.
-- `command_signin_changed` scans only current server records (`*/mesh_server.json`), while the swap scans current and retired ones (`mesh_server.json`, `mesh_retired.json`).
-- `_stop_unused(None, pid, port, RetiredRunServer(folder))` stops a server only when a second look finds it unused. For a retired server, unused means no client and no conversation mid-turn (`_sweep_verdict`). It never kills by any other path.
-- `accounts._workers_swap_lines` prints one row per roster entry. It shortens each name to `<slot>-worker`, so one run folder whose roster holds several plans' workers prints the same row several times. A holder it cannot name prints as `unknown session (<run folder>)`.
-- A live `swap workers codex2 --dry-run` on 2026-10-16 printed 52 rows, most of them from ended sessions.
-
-**Spec:**
-
-1. **Live and ended runs.** A run with holders is live when any holder is a running session (`running_sessions()`); when every holder has died it is ended, even if a launcher survives. A run with no holder at all is live only while some roster worker's `launcher_pid` is alive. Every other run is ended. The check is one helper in codex_mesh, used by both the swap and the sign-in change.
-2. **No interrupt or resume.** An ended run's workers are never interrupted, never resumed, and never sent a detached resume. No marker is written for them, and their holders get no notice.
-3. **Stop leftover servers.** A non-dry-run swap or sign-in change retires an ended run's outgoing server record, as it does today. It then stops each of that run's outgoing servers through `_stop_unused` only. The sign-in change also finds ended runs whose only server holding the old sign-in is a retired one, as the swap does. A server it does not stop, such as one with a conversation mid-turn, is left running and named.
-4. **Output.** Ended runs get no rows. In their place comes one line: `N leftover servers from ended sessions`, plus `, M stopped` for a real run. A server that was kept gets its own line, `left running: <pid> on port <port> (<run folder>): <reason>`. `--dry-run` prints `N leftover servers from ended sessions: M can be stopped, K would stay` plus one `would stay:` line per busy server with its reason, and stops nothing.
-5. **One row per worker.** Rows fold to one per distinct `(holder, slot)`. Where a fold hides several roster entries, the row ends with ` ×N`. A row that folds a mid-turn worker keeps `, interrupted and resumed`. A failure never folds away: every failed entry keeps its own reason and resume command.
-6. **Docs.** `docs/accounts.md` and `commands/showrunner/accounts.md` describe the ended-session line and the folding.
+- `_run_is_live(folder, holders)` in `codex_mesh.py`: a run with holders is live only while one of them is in `sessions.running_sessions()`, read per run under its lock; a run with no holder is live only while a roster `launcher_pid` is alive. The swap (`retire_workers_servers`) and the sign-in change both use it.
+- An ended run (`EndedWorkersRun`) gets no marker, interrupt, resume or holder notice. Its outgoing servers stop only through `_stop_unused`; a busy one stays running as `KeptWorkersServer` (pid, port, reason) with a watcher.
+- `codex_mesh.leftover_server_lines` is the one source of `N leftover servers from ended sessions, M stopped` with `left running:` lines, and the dry run's `…: M can be stopped, K would stay` with `would stay:` lines. `accounts.py` `_workers_swap_lines` folds rows per (holder, slot) through `FoldedWorkerRow` with ` ×N`; failed entries keep their own rows.
+- The sign-in change moves a live run only on its current record's server; retired old-sign-in servers count only for ended runs. `_start_watcher` holds `mesh-watcher-<pid>-<port>.lock` for the watcher's life and returns `ExistingServerWatcher` when one already runs.
 
 **Files:**
+- `scripts/agents/codex_mesh.py` — liveness, ended-run cleanup, leftover lines, watcher lock.
+- `scripts/accounts/accounts.py` — folded swap rows.
+- `docs/accounts.md`, `commands/showrunner/accounts.md` — ended-session line and folding.
 
-- `scripts/agents/codex_mesh.py`, `scripts/agents/test_codex_mesh.py` — the live-run test, skipping ended runs, stopping leftover servers, and the ended-run counts on `WorkersRunSwitch`.
-- `scripts/accounts/accounts.py`, `scripts/accounts/test_accounts.py` — the folded rows and the leftover-servers line.
-- `docs/accounts.md`, `commands/showrunner/accounts.md` — swap text.
-
-**Workers:** `impl` (codex_mesh), `test` (both test files and the accounts swap lines).
-
-**Acceptance gate:**
-
-- One test sets up a fake app-server with two runs, one with a live holder and one ended, each with a worker mid-turn. The swap interrupts and resumes only the live run's worker. The ended run gets no marker, no interrupt and no resume, and its idle server is stopped through `_stop_unused`.
-- A second test gives an ended run a conversation mid-turn. Its server is left running and named, and a dry run reports it as staying.
-- A dead holder with a surviving launcher is ended; a running holder without a messaging socket is live and still gets its resume.
-- A sign-in change stops an ended run's retired-only old-sign-in server.
-- A fold of a resumed worker and two failed ones keeps both failures' reasons and resume commands.
-- The same coverage exists for the sign-in change.
-- `--dry-run` prints the leftover line and folded rows, and stops and interrupts nothing.
-- merge_gate `--tests-only` is green.
+**Ruled out:** one row per holder for a run two holders share, because a worker belongs to its run.
