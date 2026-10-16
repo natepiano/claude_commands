@@ -6,6 +6,7 @@ import json
 import os
 import shlex
 import socket
+import subprocess
 import tempfile
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
@@ -299,6 +300,118 @@ class RoleMapTests(unittest.TestCase):
         self.assertEqual(str(refused.exception),
                          "accounts: cannot read role map from natedev; no usable map")
         self.assertEqual(self.files(self.home), before)
+
+    def test_status_refuses_an_unavailable_remote_map_unless_stored(self) -> None:
+        self.seed(self.home, groups={"units": "claude3", "showrunners": "claude2"}, workers="codex3")
+        expected = "accounts: cannot read role map from natedev; no usable map"
+        self.assertFalse(role_map.role_map_cache_file().exists())
+        before = self.files(self.home)
+        with (patch.object(role_map, "is_role_map_host", return_value=False),
+              patch.object(role_map, "ssh_role_map", side_effect=OSError("synthetic offline")) as ssh,
+              patch.object(agent_accounts, "claude_live", side_effect=AssertionError("no signed-in Claude")),
+              patch.object(accounts, "_codex_live", side_effect=AssertionError("no signed-in Codex")),
+              patch.object(subprocess, "run", side_effect=AssertionError("unexpected subprocess")),
+              patch.object(subprocess, "Popen", side_effect=AssertionError("unexpected Popen"))):
+            for flags in ((), ("--json",)):
+                with self.subTest(flags=flags):
+                    self.assertEqual(self.cli("status", *flags), (1, "", expected + "\n"))
+            self.assertEqual(ssh.call_count, 2)
+            ssh.reset_mock()
+            code, output, error = self.cli("status", "--json", "--stored")
+            ssh.assert_not_called()
+        self.assertEqual((code, error), (0, ""))
+        document = cast(dict[str, object], json.loads(output))
+        rows = cast(list[dict[str, object]], document["accounts"])
+        self.assertTrue(rows)
+        self.assertTrue(all(row["roles"] == [] for row in rows))
+        self.assertIn(expected, cast(list[str], document["problems"]))
+        self.assertEqual(self.files(self.home), before)
+
+    def test_stored_role_map_uses_old_cache_without_transport_or_writes_then_restores_remote_reads(self) -> None:
+        self.seed(self.home, groups={"units": "claude3"}, workers="codex3")
+        self.seed(self.server_home, groups={"units": "claude2", "showrunners": "claude1"}, workers="codex1")
+        cache = role_map.role_map_cache_file()
+        _ = cache.write_text(json.dumps({"at": "2001-01-02T03:04:00+00:00", "map": {
+            "groups": {"units": "claude1", "showrunners": "claude2"}, "workers": "codex3"}}))
+        before = self.files(self.home)
+        cache_stat = cache.stat()
+        with (patch.object(role_map, "is_role_map_host", return_value=False),
+              patch.object(role_map, "ssh_role_map", side_effect=AssertionError("stored role map reached ssh")),
+              patch.object(subprocess, "run", side_effect=AssertionError("stored role map spawned a process")),
+              patch.object(subprocess, "Popen", side_effect=AssertionError("stored role map spawned Popen")),
+              role_map.stored_role_map()):
+            selected = role_map.read_role_map()
+            again = role_map.read_role_map()
+        self.assertEqual((selected.groups, selected.workers),
+                         ({"units": "claude1", "showrunners": "claude2"}, "codex3"))
+        self.assertEqual(again, selected)
+        self.assertEqual(self.files(self.home), before)
+        self.assertEqual((cache.stat().st_ino, cache.stat().st_mtime_ns), (cache_stat.st_ino, cache_stat.st_mtime_ns))
+        with patch.object(role_map, "ssh_role_map", side_effect=self.remote) as ssh:
+            refreshed = role_map.read_role_map()
+        ssh.assert_called_once_with(("role-map-read",))
+        self.assertEqual((refreshed.groups, refreshed.workers),
+                         ({"units": "claude2", "showrunners": "claude1"}, "codex1"))
+
+    def test_stored_status_without_usable_remote_cache_has_empty_roles_and_the_role_problem(self) -> None:
+        self.seed(self.home, groups={"units": "claude3", "showrunners": "claude2"}, workers="codex3")
+        expected = "accounts: cannot read role map from natedev; no usable map"
+        cache = role_map.role_map_cache_file()
+        for contents in (None, "not JSON", '{"at": "invalid", "map": {}}'):
+            if contents is None:
+                cache.unlink(missing_ok=True)
+            else:
+                _ = cache.write_text(contents)
+            before = self.files(self.home)
+            with (self.subTest(cache=contents),
+                  patch.object(role_map, "is_role_map_host", return_value=False),
+                  patch.object(role_map, "ssh_role_map", side_effect=AssertionError("stored status reached ssh")),
+                  patch.object(agent_accounts, "claude_live", side_effect=AssertionError("stored Claude read")),
+                  patch.object(accounts, "_codex_live", side_effect=AssertionError("stored Codex read")),
+                  patch.object(subprocess, "run", side_effect=AssertionError("stored subprocess")),
+                  patch.object(subprocess, "Popen", side_effect=AssertionError("stored Popen"))):
+                code, output, error = self.cli("status", "--json", "--stored")
+            self.assertEqual((code, error), (0, ""))
+            document = cast(dict[str, object], json.loads(output))
+            rows = cast(list[dict[str, object]], document["accounts"])
+            self.assertTrue(rows)
+            self.assertTrue(all(row["roles"] == [] for row in rows))
+            self.assertIn(expected, cast(list[str], document["problems"]))
+            self.assertEqual(self.files(self.home), before)
+
+    def test_stored_status_uses_cached_group_assignments_and_workers_instead_of_local_selections(self) -> None:
+        self.seed(self.home, groups={"units": "claude3"}, workers="codex3")
+        self.assertEqual(accounts.setup("claude2"), [])
+        _ = (self.home / ".claude2/.claude.json").write_text(json.dumps({
+            "oauthAccount": {"emailAddress": "claude2@example.invalid"}}))
+        cache = role_map.role_map_cache_file()
+        _ = cache.write_text(json.dumps({"at": "2001-01-02T03:04:00+00:00", "map": {
+            "groups": {"units": "claude2", "showrunners": "claude2"}, "workers": "codex1"}}))
+        before = self.files(self.home)
+        with (patch.object(role_map, "is_role_map_host", return_value=False),
+              patch.object(role_map, "ssh_role_map", side_effect=AssertionError("stored status reached ssh")),
+              patch.object(agent_accounts, "claude_live", side_effect=AssertionError("stored Claude read")),
+              patch.object(accounts, "_codex_live", side_effect=AssertionError("stored Codex read"))):
+            code, output, error = self.cli("status", "--json", "--stored")
+        self.assertEqual((code, error), (0, ""))
+        document = cast(dict[str, object], json.loads(output))
+        rows = cast(list[dict[str, object]], document["accounts"])
+        selected = next(row for row in rows if row["label"] == "claude2")
+        self.assertEqual(selected["roles"], ["units", "showrunners"])
+        self.assertIn("accounts: workers is on codex1, which is not set up on this machine; run accounts.py setup codex1",
+                      cast(list[str], document["problems"]))
+        self.assertEqual(self.files(self.home), before)
+
+    def test_json_status_fetches_the_role_map_once_like_the_table(self) -> None:
+        self.seed(self.server_home, groups={"units": "claude2", "showrunners": "claude2"}, workers="codex1")
+        for flags in ((), ("--json",)):
+            with (self.subTest(flags=flags),
+                  patch.object(role_map, "ssh_role_map", side_effect=self.remote) as ssh,
+                  patch.object(agent_accounts, "claude_live", side_effect=AssertionError("no signed-in Claude")),
+                  patch.object(accounts, "_codex_live", side_effect=AssertionError("no signed-in Codex"))):
+                code, _, error = self.cli("status", *flags)
+            self.assertEqual((code, error), (0, ""))
+            ssh.assert_called_once_with(("role-map-read",))
 
     def test_unset_workers_role_refuses_instead_of_resolving_a_default_home(self) -> None:
         self.seed(self.server_home, groups={})
