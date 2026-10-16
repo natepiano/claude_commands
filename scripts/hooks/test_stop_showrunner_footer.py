@@ -279,7 +279,7 @@ class ShowrunnerFooterHookTests(unittest.TestCase):
 
     def test_unregistered_requests_block_with_footers_off_and_on_hook_retries(self) -> None:
         self.assertEqual(self.run_switch("off").returncode, 0)
-        # Short excerpts from Phase 7 replies 1, 8, 15, 17, 18 and 19.
+        # Short excerpts of real showrunner replies that asked the user without registering.
         requests = ('Say "go" and I\'ll make the change.',
                     "Tell me if you want that traced in full, or if you're thinking of retiring it.",
                     "Want me to have it added?",
@@ -357,7 +357,7 @@ class ShowrunnerFooterHookTests(unittest.TestCase):
     def test_relayed_peer_question_and_attributed_unit_choice_pass_unregistered(self) -> None:
         self.assertEqual(self.run_switch("off").returncode, 0)
         replies = (
-            # Phase 7 reply 28's recipient paragraph, without the unrelated status report.
+            # A real relay paragraph to another showrunner, without its unrelated status report.
             '**Also sent to the hana showrunner:** distant picking is listed as "waiting for review", '
             + 'but it\'s already written into trunk Phase 123. Did you approve it? '
             + 'It stays "waiting for review" until hana answers.',
