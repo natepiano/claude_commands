@@ -802,6 +802,13 @@ class HerdrTests(unittest.TestCase):
         self.assertEqual(herdr.open_pane("fixture", "worker", "/repo", {"SHOWRUNNER_UNIT": "prod", "CLAUDE_CONFIG_DIR": "/account"}), "pane-1")
         self.assertEqual(self.commands(), [["--session", "fixture", *arguments], ["--session", "fixture", "pane", "rename", "pane-1", "worker"]])
 
+    def test_focus_workspace_targets_the_named_session_and_reports_refusal(self) -> None:
+        self.herdr.focus_workspace("w3")
+        self.assertEqual(self.commands(), [["--session", "fixture", "workspace", "focus", "w3"]])
+        self.configure_herdr(["workspace", "focus", "w3"], code=1, stderr="workspace no longer exists")
+        with self.assertRaisesRegex(herdr.HerdrFailure, "workspace no longer exists"):
+            self.herdr.focus_workspace("w3")
+
     def test_promptless_start_never_sends_input(self) -> None:
         self.herdr.start_agent("worker", "pane-1", "claude", ["-n", "solo"], herdr.NoOpeningPrompt(), 90_000)
         self.assertEqual(self.start_commands(), [["--session", "fixture", "agent", "start", "worker", "--kind",

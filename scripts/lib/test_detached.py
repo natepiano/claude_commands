@@ -42,15 +42,30 @@ class DetachedTests(unittest.TestCase):
             "import json,os,sys,time; from pathlib import Path; "
             "print('stdout',flush=True); print('stderr',file=sys.stderr,flush=True); "
             f"Path({str(ready.with_suffix('.tmp'))!r}).write_text(json.dumps([os.getpid(),os.getpgrp(),os.getsid(0),"
-            "sys.stdin.read(),os.environ['DETACHED_MARKER']])); "
+            "sys.stdin.read(),os.environ['DETACHED_MARKER'],'DETACHED_PARENT_ONLY' in os.environ])); "
             f"os.replace({str(ready.with_suffix('.tmp'))!r},{str(ready)!r}); time.sleep(30)"
         )
-        pid = detached.start_detached([sys.executable, "-c", code], ready=ready.exists,
-            within=10, log=log, environment={**os.environ, "DETACHED_MARKER": "kept"})
+        with patch.dict(os.environ, {"DETACHED_PARENT_ONLY": "not passed"}):
+            pid = detached.start_detached([sys.executable, "-c", code], ready=ready.exists,
+                within=10, output=detached.AppendLog(log),
+                environment=detached.ExplicitEnvironment({"DETACHED_MARKER": "kept"}))
         self.addCleanup(self.stop, pid)
-        self.assertEqual(cast(object, json.loads(ready.read_text())), [pid, pid, pid, "", "kept"])
+        self.assertEqual(cast(object, json.loads(ready.read_text())), [pid, pid, pid, "", "kept", False])
         os.kill(pid, 0)
         self.assertEqual(log.read_text(), "previous output\nstdout\nstderr\n")
+
+    def test_discarded_output_and_inherited_environment_still_allow_readiness(self) -> None:
+        ready = self.root / "ready"
+        code = ("import json,os,stat,sys,time; from pathlib import Path; "
+                "print('discarded',flush=True); print('discarded error',file=sys.stderr,flush=True); "
+                f"Path({str(ready)!r}).write_text(json.dumps([os.environ['DETACHED_MARKER'],"
+                "all(stat.S_ISCHR(os.fstat(fd).st_mode) and os.fstat(fd).st_rdev == os.stat(os.devnull).st_rdev "
+                "for fd in (0,1,2))])); time.sleep(30)")
+        with patch.dict(os.environ, {"DETACHED_MARKER": "inherited"}):
+            pid = detached.start_detached([sys.executable, "-c", code], ready=ready.exists,
+                within=10, output=detached.DiscardOutput(), environment=detached.InheritEnvironment())
+        self.addCleanup(self.stop, pid)
+        self.assertEqual(cast(object, json.loads(ready.read_text())), ["inherited", True])
 
     def test_child_exit_reports_exit_status_instead_of_waiting_for_readiness(self) -> None:
         with self.assertRaisesRegex(detached.DetachedStartFailure, "did not start: exited with status 23"):

@@ -353,7 +353,10 @@ class RemoteControlTests(ShutdownTestCase):
         self.allow_leaf(ShutdownSendLeaf.LAUNCH_REMOTE_CONTROL_FIXER)
         paths: list[Path] = []
 
-        def start(argv: Sequence[str], *, ready: Callable[[], bool], within: float, log: Path) -> int:
+        def start(argv: Sequence[str], *, ready: Callable[[], bool], within: float,
+                  output: detached.AppendLog, environment: detached.ExplicitEnvironment) -> int:
+            log = output.path
+            self.assertEqual(environment.mapping[detached.STARTUP_SIGNAL_ENV], "1")
             self.assertEqual(list(argv), ["env", "PYTHONUNBUFFERED=1", sys.executable, "-u",
                 str(Path(remote_control.__file__).with_name("shutdown.py")), "remote-control", "owner-identifier",
                 "--pid", "321", "--proc-start", "original start", "--who", "trunk unit", "--session", "Owner"])
@@ -364,9 +367,17 @@ class RemoteControlTests(ShutdownTestCase):
             self.assertFalse(ready())
             _ = log.write_text("unrelated output\n")
             self.assertFalse(ready())
-            with (log.open("a") as output, redirect_stderr(output), redirect_stdout(io.StringIO()),
-                  patch.object(remote_control, "_fix", return_value=remote_control.AlreadyOn())):
+            def already_on(session_id: str, pid: int, proc_start: str,
+                           clock: remote_control.Clock) -> remote_control.AlreadyOn:
+                del session_id, pid, proc_start, clock
+                self.assertNotIn(detached.STARTUP_SIGNAL_ENV, os.environ)
+                return remote_control.AlreadyOn()
+
+            with (log.open("a") as stream, redirect_stderr(stream), redirect_stdout(io.StringIO()),
+                  patch.dict(os.environ, environment.mapping, clear=True),
+                  patch.object(remote_control, "_fix", side_effect=already_on)):
                 _ = remote_control.fix("owner-identifier", 321, "original start", "trunk unit", "Owner")
+                self.assertNotIn(detached.STARTUP_SIGNAL_ENV, os.environ)
             self.assertTrue(ready(), "the child entry point must publish its startup line")
             return 4321
 
@@ -377,11 +388,24 @@ class RemoteControlTests(ShutdownTestCase):
                 remote_control.launch_fixer("owner-identifier", 321, "original start", "trunk unit", "Owner")
         self.assertEqual(len(paths), 2)
 
+    def test_plain_darwin_fixer_does_not_print_a_detached_startup_line(self) -> None:
+        environment = {key: value for key, value in os.environ.items() if key != detached.STARTUP_SIGNAL_ENV}
+        with (patch.object(sys, "platform", "darwin"), patch.object(herdr, "_PLATFORM", "darwin"),
+              patch.dict(os.environ, environment, clear=True),
+              patch.object(remote_control, "_fix", return_value=remote_control.AlreadyOn()),
+              redirect_stderr(io.StringIO()) as error, redirect_stdout(io.StringIO()) as output):
+            _ = remote_control.fix("id", 321, "start", "Owner", "Owner")
+        self.assertEqual(error.getvalue(), "")
+        self.assertEqual(output.getvalue(), "Owner: Remote Control already on\n")
+
     def test_darwin_fixer_failed_child_reports_service_and_keeps_its_log(self) -> None:
         self.allow_leaf(ShutdownSendLeaf.LAUNCH_REMOTE_CONTROL_FIXER)
         paths: list[Path] = []
 
-        def fail(argv: Sequence[str], *, ready: Callable[[], bool], within: float, log: Path) -> int:
+        def fail(argv: Sequence[str], *, ready: Callable[[], bool], within: float,
+                  output: detached.AppendLog, environment: detached.ExplicitEnvironment) -> int:
+            log = output.path
+            self.assertEqual(environment.mapping[detached.STARTUP_SIGNAL_ENV], "1")
             del argv, within
             self.assertFalse(ready())
             paths.append(log)
@@ -392,6 +416,7 @@ class RemoteControlTests(ShutdownTestCase):
               patch.object(detached, "start_detached", side_effect=fail),
               patch.object(subprocess, "run", side_effect=AssertionError("service manager used")),
               self.assertRaisesRegex(RuntimeError,
-                  "could not start Remote Control fixer shutdown-remote-control-owner-identi-321: child exited with status 1")):
+                  "could not start Remote Control fixer shutdown-remote-control-owner-identi-321: child exited with status 1") as failure):
             remote_control.launch_fixer("owner-identifier", 321, "original start", "trunk unit", "Owner")
         self.assertEqual(paths[0].read_text(), "child import failed\n")
+        self.assertIn(str(paths[0]), str(failure.exception))

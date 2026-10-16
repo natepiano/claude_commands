@@ -471,6 +471,10 @@ class Herdr:
         _ = self.run("pane", "rename", pane, label)
         return pane
 
+    def focus_workspace(self, workspace_id: str) -> None:
+        """Show a workspace in the session's attached clients."""
+        _ = self.run("workspace", "focus", workspace_id)
+
     def start_agent(self, name: str, pane: str, kind: str, agent_arguments: list[str],
                     opening: OpeningPrompt | NoOpeningPrompt, timeout_ms: int) -> None:
         """Wait through busy-pane refusals, start the executable, then prompt once."""
@@ -803,7 +807,7 @@ def _server_start_failure(name: str) -> HerdrFailure:
 
 
 def _start_darwin_server(client: Herdr, timeout_ms: int, *, exclusive: bool) -> ServerCreated | ServerAdopted:
-    from detached import DetachedChildExited, DetachedStartFailure, start_detached
+    from detached import DiscardOutput, InheritEnvironment, DetachedChildExited, DetachedStartFailure, start_detached
 
     deadline = time.monotonic() + min(10.0, timeout_ms / 1000)
     try:
@@ -835,7 +839,8 @@ def _start_darwin_server(client: Herdr, timeout_ms: int, *, exclusive: bool) -> 
         return False
 
     try:
-        pid = start_detached(client.argv("server"), ready=ready, within=deadline - time.monotonic())
+        pid = start_detached(client.argv("server"), ready=ready, within=deadline - time.monotonic(),
+                             output=DiscardOutput(), environment=InheritEnvironment())
     except DetachedChildExited as error:
         if holders and holders != {error.pid}:
             if exclusive:

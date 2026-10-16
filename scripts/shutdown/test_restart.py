@@ -1334,6 +1334,35 @@ class RestartTests(ShutdownTestCase):
         assert not isinstance(remaining, record.NoRecoverySnapshot)
         self.assertEqual(remaining["sessions"], [])
 
+    def test_codex_restoration_focuses_its_workspace_and_acknowledges_despite_focus_failure(self) -> None:
+        snapshot, saved, responses, log = self.codex_recovery_fixture()
+        name = "trusted-folder-codex-01f232c067f3d73a"
+        for platform, failed in (("linux", False), ("darwin", False), ("darwin", True)):
+            with self.subTest(platform=platform, failed=failed):
+                record.write_snapshot(snapshot)
+                log.unlink(missing_ok=True)
+                replies = cast(dict[str, CommandResponse | list[CommandResponse]], json.loads(responses.read_text()))
+                replies[f"--session {name} workspace focus w2"] = {
+                    "stdout": "", "code": 1 if failed else 0, "stderr": "focus refused" if failed else ""}
+                _ = responses.write_text(json.dumps(replies))
+                with (patch.object(sys, "platform", platform), patch.object(herdr, "_PLATFORM", platform),
+                      patch.object(herdr, "start_new_server"), patch.object(herdr, "stop_session") as stop,
+                      redirect_stdout(io.StringIO()) as output):
+                    restart._launch_codex_snapshot(snapshot, saved, self.desktop_state, dry_run=False)  # pyright: ignore[reportPrivateUsage]
+                stop.assert_not_called()
+                calls = self.herdr_calls(log)
+                focus = ["--session", name, "workspace", "focus", "w2"]
+                self.assertIn(focus, calls)
+                start = next(row for row in calls if row[2:4] == ["agent", "start"])
+                self.assertLess(calls.index(start), calls.index(focus))
+                remaining = record.read_snapshot(snapshot["login"])
+                assert not isinstance(remaining, record.NoRecoverySnapshot)
+                self.assertEqual(remaining["sessions"], [])
+                issues = [line for line in output.getvalue().splitlines() if "restart issue:" in line]
+                self.assertEqual(len(issues), 1 if failed else 0)
+                if failed:
+                    self.assertIn("focus refused", issues[0])
+
     def test_codex_snapshot_without_id_opens_picker_and_reattaches_in_one_window(self) -> None:
         snapshot, _saved, _responses, log = self.codex_recovery_fixture(picker=True, attached=True)
         with (patch.object(herdr, "attached_clients", return_value=herdr.NoClientAttached()),
@@ -1827,6 +1856,45 @@ class RestartTests(ShutdownTestCase):
         calls = self.herdr_calls(log)
         self.assertFalse(any(row[2:4] == ["pane", "close"] for row in calls))
         self.assertEqual(len([row for row in calls if row[2:4] == ["workspace", "create"]]), 1)
+
+    def test_adopted_server_focuses_the_restored_workspace_and_preserves_the_attached_shell(self) -> None:
+        owner, responses, log = self.herdr_restart_fixture()
+        replies = cast(dict[str, CommandResponse | list[CommandResponse]], json.loads(responses.read_text()))
+        replies["--session writing pane list"] = {"stdout": json.dumps({"result": {
+            "panes": [{"pane_id": "w9:p1", "label": "attached shell"}]}}), "code": 0}
+        replies["--session writing workspace list"] = {"stdout": json.dumps({"result": {
+            "workspaces": [{"workspace_id": "w9", "focused": True}]}}), "code": 0}
+        _ = responses.write_text(json.dumps(replies))
+        for platform in ("linux", "darwin"):
+            log.unlink(missing_ok=True)
+            with (self.subTest(platform=platform), patch.object(sys, "platform", platform),
+                  patch.object(herdr, "_PLATFORM", platform),
+                  patch.object(herdr, "start_server", return_value=herdr.ServerAdopted()),
+                  redirect_stdout(io.StringIO())):
+                result = restart._launch_session(entry(owner), "restart", self.desktop_state, dry_run=False)  # pyright: ignore[reportPrivateUsage]
+            self.assertIsInstance(result, restart.SessionLaunched)
+            calls = self.herdr_calls(log)
+            focus = ["--session", "writing", "workspace", "focus", "w2"]
+            self.assertIn(focus, calls)
+            prompted = next(row for row in calls if row[2:4] == ["agent", "prompt"])
+            self.assertLess(calls.index(prompted), calls.index(focus))
+            self.assertFalse(any(row[2:4] in (["workspace", "close"], ["pane", "close"])
+                                 for row in calls))
+
+    def test_workspace_focus_failure_is_one_issue_without_failing_or_relaunching_claude(self) -> None:
+        owner, responses, log = self.herdr_restart_fixture()
+        replies = cast(dict[str, CommandResponse | list[CommandResponse]], json.loads(responses.read_text()))
+        replies["--session writing workspace focus w2"] = {"stdout": "", "code": 1, "stderr": "focus refused"}
+        _ = responses.write_text(json.dumps(replies))
+        with (patch.object(herdr, "start_server", return_value=herdr.ServerAdopted()),
+              patch.object(herdr, "stop_session") as stop, redirect_stdout(io.StringIO()) as output):
+            result = restart._launch_session(entry(owner), "restart", self.desktop_state, dry_run=False)  # pyright: ignore[reportPrivateUsage]
+        self.assertIsInstance(result, restart.SessionLaunched)
+        stop.assert_not_called()
+        self.assertEqual(len([row for row in self.herdr_calls(log) if row[2:4] == ["agent", "start"]]), 1)
+        issues = [line for line in output.getvalue().splitlines() if "restart issue:" in line]
+        self.assertEqual(len(issues), 1)
+        self.assertIn("focus refused", issues[0])
 
     def test_herdr_restart_does_not_open_a_replacement_when_the_stale_pane_will_not_close(self) -> None:
         owner, responses, log = self.herdr_restart_fixture()

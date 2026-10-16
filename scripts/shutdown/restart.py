@@ -1018,12 +1018,21 @@ def _herdr_launch(
             if isinstance(server, herdr.ServerCreated):
                 herdr.stop_session(name)
             raise
+        if isinstance(server, herdr.ServerAdopted):
+            _focus_restored_pane(client, pane, session["name"])
         if isinstance(parts.conversation, StartFreshConversation):
             print(f"{session['name']}: no conversation to resume; started a new one")
     except herdr.SessionTaken as error:
         raise HerdrDestinationTaken(str(error)) from error
     except herdr.HerdrFailure as error:
         raise OSError(str(error)) from error
+
+
+def _focus_restored_pane(client: herdr.Herdr, pane: str, name: str) -> None:
+    try:
+        client.focus_workspace(pane.split(":", 1)[0])
+    except herdr.HerdrFailure as error:
+        print(f"{name} restart issue: restored workspace not focused: {error}")
 
 
 def launches_window(host: Host) -> bool:
@@ -2015,6 +2024,7 @@ def _launch_codex_snapshot(
     except (herdr.HerdrFailure, OSError, subprocess.SubprocessError):
         herdr.stop_session(name)
         raise
+    _focus_restored_pane(herdr.Herdr(name), pane, owner["name"])
     _acknowledge_restored_snapshots(owner["session_id"])
     attach = shlex.join(["herdr", "session", "attach", name])
     if launches_window(owner["host"]):

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Mapping, Sequence
 from contextlib import nullcontext
+from dataclasses import dataclass
 import math
 import os
 from pathlib import Path
@@ -11,6 +12,33 @@ import signal
 import subprocess
 import threading
 import time
+
+
+STARTUP_SIGNAL_ENV = "DETACHED_STARTUP_SIGNAL"
+
+
+@dataclass(frozen=True)
+class DiscardOutput:
+    """The child needs no retained output."""
+
+
+@dataclass(frozen=True)
+class AppendLog:
+    path: Path
+
+
+@dataclass(frozen=True)
+class InheritEnvironment:
+    """The child uses its parent's environment."""
+
+
+@dataclass(frozen=True)
+class ExplicitEnvironment:
+    mapping: Mapping[str, str]
+
+
+_DISCARD_OUTPUT = DiscardOutput()
+_INHERIT_ENVIRONMENT = InheritEnvironment()
 
 
 class DetachedStartFailure(Exception):
@@ -42,11 +70,12 @@ def _terminate_group(child: subprocess.Popen[bytes]) -> None:
 
 
 def start_detached(argv: Sequence[str], *, ready: Callable[[], bool], within: float,
-                   log: Path | None = None, environment: Mapping[str, str] | None = None) -> int:
+                   output: DiscardOutput | AppendLog = _DISCARD_OUTPUT,
+                   environment: InheritEnvironment | ExplicitEnvironment = _INHERIT_ENVIRONMENT) -> int:
     """Return the private-session child's pid after readiness while it is alive.
 
     Readiness probes must bound their own blocking work to the startup deadline.
-    Output appends to log when supplied; otherwise all standard streams use /dev/null.
+    Output is either appended to the named log or discarded.
     A failed or interrupted readiness probe stops this attempt's process group.
     """
     program = argv[0] if argv else "program"
@@ -54,9 +83,10 @@ def start_detached(argv: Sequence[str], *, ready: Callable[[], bool], within: fl
         raise DetachedStartFailure(f"{program} did not start: startup time must be positive and finite")
     deadline = time.monotonic() + within
     try:
-        with log.open("ab") if log is not None else nullcontext(subprocess.DEVNULL) as output:
+        with output.path.open("ab") if isinstance(output, AppendLog) else nullcontext(subprocess.DEVNULL) as stream:
             child = subprocess.Popen(argv, start_new_session=True, stdin=subprocess.DEVNULL,
-                                     stdout=output, stderr=output, close_fds=True, env=environment)
+                                     stdout=stream, stderr=stream, close_fds=True,
+                                     env=environment.mapping if isinstance(environment, ExplicitEnvironment) else None)
     except OSError as error:
         raise DetachedStartFailure(f"{program} did not start: {error}") from error
     try:

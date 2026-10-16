@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import subprocess
 import sys
@@ -106,10 +107,15 @@ def launch_fixer(session_id: str, pid: int, proc_start: str, who: str, session: 
             logs.mkdir(parents=True, exist_ok=True)
             with tempfile.NamedTemporaryFile(dir=logs, prefix=service + "-", suffix=".log", delete=False) as output:
                 log = Path(output.name)
-            _ = detached.start_detached(command, within=15,
-                ready=lambda: "Remote Control fixer started\n" in log.read_text(encoding="utf-8"), log=log)
-        except (detached.DetachedStartFailure, OSError) as error:
+        except OSError as error:
             raise RuntimeError(f"could not start Remote Control fixer {service}: {error}") from error
+        try:
+            _ = detached.start_detached(command, within=15,
+                ready=lambda: "Remote Control fixer started\n" in log.read_text(encoding="utf-8"),
+                output=detached.AppendLog(log),
+                environment=detached.ExplicitEnvironment({**os.environ, detached.STARTUP_SIGNAL_ENV: "1"}))
+        except (detached.DetachedStartFailure, OSError) as error:
+            raise RuntimeError(f"could not start Remote Control fixer {service}: {error}; log: {log}") from error
         return
     launch = ["systemd-run", "--user", "--collect", "--quiet", "--no-block", "--unit", service, *command]
     result = subprocess.run(launch, check=False, timeout=15, capture_output=True)
@@ -207,7 +213,7 @@ def _fix(session_id: str, pid: int, proc_start: str, clock: Clock) -> RemoteCont
 
 
 def fix(session_id: str, pid: int, proc_start: str, who: str, session: str, *, clock: Clock = _SYSTEM_CLOCK) -> RemoteControlOutcome:
-    if sys.platform == "darwin":
+    if os.environ.pop(detached.STARTUP_SIGNAL_ENV, "") == "1":
         print("Remote Control fixer started", file=sys.stderr, flush=True)
     outcome = _fix(session_id, pid, proc_start, clock)
     if isinstance(outcome, SessionGone):

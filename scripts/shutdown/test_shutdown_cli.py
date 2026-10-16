@@ -20,7 +20,7 @@ from typing import Literal, cast, final, override
 from unittest.mock import patch
 from zoneinfo import ZoneInfo
 
-from test_support import registry_confirmation, ShutdownTestCase
+from test_support import linux_process_fixture, registry_confirmation, ShutdownTestCase
 import inventory
 import herdr
 from fake_herdr import CommandResponse
@@ -324,6 +324,7 @@ class ShutdownLaunchCliTests(ShutdownTestCase):
         self.assertIn("inventory unreadable: proc unavailable", output.getvalue())
 
     def test_missing_tmux_never_builds_during_tmux_free_or_recovery_observation(self) -> None:
+        linux_process_fixture(self)
         proc = self.root / "proc"
         boot = proc / "sys/kernel/random/boot_id"
         boot.parent.mkdir(parents=True)
@@ -1338,7 +1339,7 @@ class ShutdownLaunchCliTests(ShutdownTestCase):
                     before = self.store_contents()
                     directories = sorted(path.relative_to(self.state) for path in self.state.rglob("*") if path.is_dir())
                     output, error = io.StringIO(), io.StringIO()
-                    with patch.object(settle, "_warm", return_value=True), patch.object(settle, "send_message") as sender, patch.object(settle, "_launch_conductor") as conductor, redirect_stdout(output), redirect_stderr(error):
+                    with patch.object(sys, "platform", "darwin"), patch.object(herdr, "_PLATFORM", "darwin"), patch.object(settle, "_warm", return_value=True), patch.object(settle, "send_message") as sender, patch.object(settle, "_launch_conductor") as conductor, redirect_stdout(output), redirect_stderr(error):
                         result = shutdown.main([verb, LOGIN, "--here"])
                     self.assertEqual(result, 3)
                     self.assertEqual(output.getvalue(), "")

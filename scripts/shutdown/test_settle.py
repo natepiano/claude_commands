@@ -755,7 +755,10 @@ class SettleTests(ShutdownTestCase):
         self.allow_leaf(ShutdownSendLeaf.LAUNCH_CONDUCTOR)
         paths: list[Path] = []
 
-        def start(argv: Sequence[str], *, ready: Callable[[], bool], within: float, log: Path) -> int:
+        def start(argv: Sequence[str], *, ready: Callable[[], bool], within: float,
+                  output: detached.AppendLog, environment: detached.ExplicitEnvironment) -> int:
+            log = output.path
+            self.assertEqual(environment.mapping[detached.STARTUP_SIGNAL_ENV], "1")
             self.assertEqual(list(argv), ["env", "REFUSAL_WATCH_INVENTORY=read existing", "env",
                 "PYTHONUNBUFFERED=1", sys.executable, "-u", str(settle.SHUTDOWN), "conduct", LOGIN])
             self.assertEqual(within, 15)
@@ -768,9 +771,11 @@ class SettleTests(ShutdownTestCase):
             @contextmanager
             def already_running(login: str) -> Generator[record.ConductorAlreadyRunning, None, None]:
                 self.assertEqual(login, LOGIN)
+                self.assertNotIn(detached.STARTUP_SIGNAL_ENV, os.environ)
                 yield record.ConductorAlreadyRunning()
 
-            with (log.open("a") as output, redirect_stderr(output),
+            with (log.open("a") as stream, redirect_stderr(stream),
+                  patch.dict(os.environ, environment.mapping, clear=True),
                   patch.object(record, "conductor_lock", side_effect=already_running)):
                 self.assertEqual(settle.conduct(LOGIN), 0)
             self.assertTrue(ready(), "the child entry point must publish its startup line")
@@ -790,7 +795,10 @@ class SettleTests(ShutdownTestCase):
         self.allow_leaf(ShutdownSendLeaf.LAUNCH_CONDUCTOR)
         paths: list[Path] = []
 
-        def fail(argv: Sequence[str], *, ready: Callable[[], bool], within: float, log: Path) -> int:
+        def fail(argv: Sequence[str], *, ready: Callable[[], bool], within: float,
+                  output: detached.AppendLog, environment: detached.ExplicitEnvironment) -> int:
+            log = output.path
+            self.assertEqual(environment.mapping[detached.STARTUP_SIGNAL_ENV], "1")
             del argv, within
             self.assertFalse(ready())
             paths.append(log)
@@ -801,9 +809,10 @@ class SettleTests(ShutdownTestCase):
               patch.object(detached, "start_detached", side_effect=fail),
               patch.object(subprocess, "run", side_effect=AssertionError("service manager used")),
               self.assertRaisesRegex(RuntimeError,
-                  r"could not start shutdown conductor shutdown-claude2-.*: child exited with status 1")):
+                  r"could not start shutdown conductor shutdown-claude2-.*: child exited with status 1") as failure):
             settle._launch_conductor(LOGIN, LABEL)  # pyright: ignore[reportPrivateUsage]
         self.assertEqual(paths[0].read_text(), "child import failed\n")
+        self.assertIn(str(paths[0]), str(failure.exception))
 
     def test_ghostty_transcript_refusal_enters_usage_hold_without_a_screen(self) -> None:
         owner = top_level("ghostty-refusal", "Ghostty owner")
