@@ -41,7 +41,7 @@ from typing import Callable, Literal, TextIO, TypedDict, cast, final, override
 from unittest.mock import MagicMock, patch
 
 from scripts.agents import codex_mesh
-from scripts.message import sessions
+from scripts.message import process_table, sessions
 from scripts.usage import agents_log
 from scripts.accounts import accounts, moves, refusals
 from scripts.whoami import agent_accounts
@@ -105,6 +105,10 @@ def setUpModule() -> None:
     grace = patch.object(codex_mesh, "REAP_WAIT_SECS", 0.05)
     _ = grace.start()
     unittest.addModuleCleanup(grace.stop)
+    # Holderless legacy fixtures have no synthetic ancestry; never inspect this test runner's parents.
+    processes = patch.object(process_table, "snapshot", return_value={})
+    _ = processes.start()
+    unittest.addModuleCleanup(processes.stop)
 
 USAGE_LIMIT = "You've hit your usage limit. Visit https://chatgpt.com/codex/settings/usage"
 CAPACITY = "Selected model is at capacity. Please try a different model."
@@ -1432,6 +1436,35 @@ class MeshCommandTests(unittest.TestCase):
 
         self.assertEqual((code, errors), (0, ""))
         self.assert_instruction_resume(path)
+
+    def test_set_instructions_repoints_an_idle_reviewer_and_its_next_resume_sends_the_new_prompt(self) -> None:
+        old = self.standing_instructions()
+        self.seed_instruction_thread(old)
+        new = old.with_name("new-standing.md")
+        _ = new.write_text("new standing prompt\n", encoding="utf-8")
+
+        code, _output, errors = self.run_mesh(["set-instructions", "--to", "worker", "--instructions-file", str(new)])
+
+        self.assertEqual((code, errors), (0, ""))
+        self.assertEqual(self.worker_record()["thread_id"], THREAD_ID)
+        self.assertEqual(self.worker_record().get("instructions_file"), str(new))
+        self.server.requests.clear()
+        code, _output, errors = self.run_mesh(["reset", "--to", "worker"])
+        self.assertEqual((code, errors), (0, ""))
+        self.assert_instruction_resume(new)
+
+    def test_set_instructions_refuses_a_busy_reviewer_and_a_missing_file(self) -> None:
+        old = self.standing_instructions()
+        self.seed_instruction_thread(old)
+        code, _output, errors = self.run_mesh(["set-instructions", "--to", "worker", "--instructions-file",
+                                               str(old.with_name("absent.md"))])
+        self.assertEqual(code, 1)
+        self.assertIn("no instructions file", errors)
+        record = self.worker_record()
+        self.write_pool_roster({"worker": {**record, "status": "running"}})
+        code, _output, errors = self.run_mesh(["set-instructions", "--to", "worker", "--instructions-file", str(old)])
+        self.assertEqual(code, 2)
+        self.assertIn("instructions unchanged", errors)
 
     def test_follow_completion_keeps_the_standing_instructions_path(self) -> None:
         path = self.standing_instructions()
@@ -6506,6 +6539,69 @@ class SignInChangeTests(unittest.TestCase):
             self.assertNotIn("thread/start", calls)
             self.assertNotIn("turn/start", calls)
             self.assertEqual(cast(dict[str, dict[str, object]], json.loads((Path(directory) / codex_mesh.ROSTER_FILE).read_text()))["worker"]["thread_id"], "old-thread")
+
+
+@final
+class LauncherSessionSwapTests(unittest.TestCase):
+    def test_swap_holderless_launcher_finds_nearest_session_with_matching_process_start(self) -> None:
+        cases: tuple[tuple[dict[int, str], tuple[str, ...]], ...] = (
+            ({700: "start-700", 600: "start-600"}, ("near-session",)),
+            ({700: "reused-pid", 600: "start-600"}, ("far-session",)),
+            ({700: "", 600: "start-600"}, ("far-session",)),
+            ({}, ()),
+        )
+        for registered, expected in cases:
+            with self.subTest(registered=registered), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                run = root / "runs/holderless-run"
+                run.mkdir(parents=True)
+                registry = root / "home/.claude/sessions"
+                registry.mkdir(parents=True)
+                for pid, started in registered.items():
+                    _ = (registry / f"{pid}.json").write_text(json.dumps(sessions.SessionRecord(
+                        pid=pid, sessionId="near-session" if pid == 700 else "far-session",
+                        name="launching director", procStart=started, messagingSocketPath="",
+                        updatedAt=1, tmux="", formerNames=[])))
+                _ = (run / codex_mesh.SERVER_FILE).write_text(json.dumps({
+                    "pid": 800, "port": 4001, "codex_home": str(root / "outgoing-home")}))
+                _ = (run / codex_mesh.ROSTER_FILE).write_text(json.dumps({
+                    "project-test": {"thread_id": "scratch-thread", "status": "running",
+                                     "turn_id": "scratch-turn", "launcher_pid": 900, "port": 4001}}))
+                table = {
+                    900: process_table.Process(900, 850, "python3", "python3 codex_mesh.py start"),
+                    850: process_table.Process(850, 700, "sh", "sh -c launch"),
+                    700: process_table.Process(700, 600, "claude", "claude"),
+                    600: process_table.Process(600, 1, "claude", "claude"),
+                }
+                def alive(pid: int) -> bool:
+                    return pid in {*table, 800}
+                def started_at(pid: int) -> str:
+                    return f"start-{pid}"
+                before = {path.name: path.read_bytes() for path in run.iterdir()}
+                with (patch.dict(os.environ, {"HOME": str(root / "home"),
+                                             "NOTIFIER_SESSIONS_DIR": str(registry)}, clear=True),
+                      patch.object(codex_mesh, "SWEEP_ROOTS", (run.parent,)),
+                      patch.object(codex_mesh, "_pid_alive", side_effect=alive),
+                      patch.object(process_table, "snapshot", return_value=table),
+                      patch.object(sessions, "process_start", side_effect=started_at),
+                      # A record without a process start runs while its socket exists.
+                      patch.object(sessions, "messaging_socket_exists", return_value=True),
+                      patch.object(os, "kill"),
+                      patch.object(codex_mesh, "_stop_unused") as stop,
+                      patch.object(codex_mesh, "_interrupt_worker_for_account_move") as interrupt,
+                      patch.object(codex_mesh, "_resume_account_move_detached") as detach):
+                    switches = codex_mesh.retire_workers_servers(root / "target-home", "codex2", dry_run=True)
+                self.assertEqual(len(switches), 1)
+                self.assertEqual(switches[0].launcher_sessions, expected)
+                self.assertEqual(switches[0].holders, ())
+                self.assertEqual([worker.name for worker in switches[0].workers], ["project-test"])
+                self.assertEqual(switches[0].leftover_servers, 0)
+                self.assertEqual({path.name: path.read_bytes() for path in run.iterdir()
+                                  if path.name in before}, before)
+                self.assertFalse((run / "project-test.account-move.json").exists())
+                stop.assert_not_called()
+                interrupt.assert_not_called()
+                detach.assert_not_called()
 
 
 @final

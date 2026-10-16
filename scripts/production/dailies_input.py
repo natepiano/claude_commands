@@ -15,7 +15,8 @@ from zoneinfo import ZoneInfo
 
 import showrunners
 import unit_lookup
-from add_unit import Production, Refusal, cell_value, live_unit_table, read_production, unit_table
+from add_unit import Production, read_production
+from production_units import Refusal, cell_value, live_unit_table, unit_table
 from ci_points import PointFailure, WatchFirstAlert, WatchRepeat, review_watch
 from dailies_counts import CountsFailure, production_counts
 from dailies_render import (LENGTHS, InputError, StateRefused, as_list, as_map, check_render_state, due, last_report,

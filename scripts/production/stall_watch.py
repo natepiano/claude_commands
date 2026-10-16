@@ -17,6 +17,7 @@ from typing import TYPE_CHECKING, NamedTuple, TypedDict, cast
 from zoneinfo import ZoneInfo
 
 import add_unit
+import production_units
 import showrunners
 import unit_lookup
 from session_pane import HerdrFailure, read_place
@@ -279,10 +280,10 @@ def tick(now: float) -> None:
         try:
             slug = showrunners.production_slug(configured["doc"])
             lines = Path(configured["doc"]).read_text(encoding="utf-8").splitlines()
-            live = {add_unit.cell_value(cells.get("Unit", "")): add_unit.cell_value(cells.get("Worktree", ""))
-                    for cells in add_unit.live_unit_table(lines, slug)}
+            live = {production_units.cell_value(cells.get("Unit", "")): production_units.cell_value(cells.get("Worktree", ""))
+                    for cells in production_units.live_unit_table(lines, slug)}
             marked = unit_lookup.marked_units(slug)
-        except (OSError, UnicodeError, ValueError, add_unit.Refusal) as error:
+        except (OSError, UnicodeError, ValueError, production_units.Refusal) as error:
             print(f"stall-watch: {configured['slug']}: its units are not watched: {error}", file=sys.stderr)
             continue
         for name, unit in marked.items():

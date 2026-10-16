@@ -92,7 +92,7 @@ def decide(raw: str) -> int:
             return 0
         if answer.status != phase_reservation.CLEAR:
             return _refuse(f"{answer.status}: {answer.message or 'no detail'}.")
-        acquisition = phase_reservation.own_acquisition(answer)
+        acquisition = phase_reservation.own_acquisition(answer, root, phases, session_id)
         if phase is not None and acquisition is not None:
             try:
                 _ = phase_reservation.record_active(phase.directory, acquisition)

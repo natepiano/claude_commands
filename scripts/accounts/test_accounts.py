@@ -3043,6 +3043,51 @@ class AccountsTests(unittest.TestCase):
                     self.assertEqual(lines[1:], (
                         f"  natedev · two-accounts · test-worker → codex2{suffix}",))
 
+    def test_workers_swap_names_launcher_session_and_folds_with_that_sessions_holder_rows(self) -> None:
+        holder = roster.RosterEntry(
+            machine="here", kind="claude", role="unit director", name="director", status="running",
+            reach=roster.Messageable("session:launching-director"), cwd="",
+            showrunner=roster.UnderShowrunner("build", "natedev", "session:showrunner"),
+            director=roster.DirectsUnit("two-accounts"), assignment=roster.NotAWorker(),
+            session=roster.ClaudeSession("launching-director"))
+        switches = (
+            codex_mesh.WorkersRunSwitch(self.root / "holderless-run", (), (
+                codex_mesh.SwitchingWorker("plan-a-test", False),),
+                launcher_sessions=("launching-director",)),
+            codex_mesh.WorkersRunSwitch(self.root / "marked-run", ("launching-director",), (
+                codex_mesh.SwitchingWorker("plan-b-test", True, codex_mesh.WorkerMoveResumed()),)),
+            codex_mesh.WorkersRunSwitch(self.root / "unresolved-run", (), (
+                codex_mesh.SwitchingWorker("plan-c-impl", False),)),
+        )
+        for dry_run in (True, False):
+            with self.subTest(dry_run=dry_run):
+                _ = self.workers_fixture()
+                with (patch.object(codex_mesh, "retire_workers_servers", return_value=switches),
+                      patch.object(roster, "roster", return_value=roster.Roster([holder], [])),
+                      patch.object(roster, "machine_name", return_value="here")):
+                    code, output, errors = self.run_cli("swap", "workers", "codex1", *(["--dry-run"] if dry_run else []))
+                self.assertEqual((code, errors), (0, ""))
+                self.assertEqual(output.splitlines()[1:], [
+                    "  natedev · two-accounts · test-worker → codex1 ×2, 1 interrupted and resumed",
+                    "  unknown session (unresolved-run) · impl-worker → codex1",
+                ])
+
+    def test_workers_swap_uses_saved_launcher_session_name_when_roster_cannot_name_it(self) -> None:
+        records = self.home / ".claude/sessions"
+        records.mkdir(parents=True, exist_ok=True)
+        _ = (records / "321.json").write_text(json.dumps({
+            "pid": 321, "sessionId": "launching-director", "name": "saved launching director",
+            "messagingSocketPath": "", "updatedAt": 10}))
+        switches = (codex_mesh.WorkersRunSwitch(self.root / "holderless-run", (), (
+            codex_mesh.SwitchingWorker("project-impl", False),), launcher_sessions=("launching-director",)),)
+        for dry_run in (True, False):
+            with self.subTest(dry_run=dry_run):
+                previous, _ = self.workers_fixture()
+                with patch.object(roster, "roster", return_value=roster.Roster([], [])):
+                    lines = accounts._workers_swap_lines(  # pyright: ignore[reportPrivateUsage]
+                        switches, previous, "codex1", dry_run=dry_run)
+                self.assertEqual(lines[1:], ("  saved launching director · impl-worker → codex1",))
+
     def test_workers_swap_prints_ended_server_totals_and_each_busy_reason_in_both_modes(self) -> None:
         run = self.root / "ended-run"
         reason = "a conversation is not idle: unread-worker: ThreadLive"

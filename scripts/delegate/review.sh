@@ -95,7 +95,7 @@ if [[ -n "${POOL_TYPE}" ]]; then
   POOL_UNIT="${BASH_REMATCH[2]}"
   POOL_PHASE="${BASH_REMATCH[3]}"
 elif [[ -n "${POOL_LEASE}" ]]; then
-  echo "ERROR: --lease requires --pool; use REVIEW_LEASE for an own review." >&2
+  echo "ERROR: --lease requires --pool." >&2
   exit 2
 fi
 
@@ -563,7 +563,7 @@ interrupt_pool_review() {
 
 if [[ -n "${POOL_TYPE}" || -n "${FOLLOW_TO}" ]]; then
   TURN_STARTED_AT="$(date +%s)"
-  TURN_LEASE="${POOL_LEASE:-${REVIEW_LEASE:-}}"
+  TURN_LEASE="${POOL_LEASE}"
   TURN_PROGRESS="$("$PY" - "${PROGRESS_STATE}" "${SESSION_DIR}" "${FOLLOW_TO}" <<'PY'
 import json
 import sys
@@ -633,9 +633,7 @@ if [[ -n "${POOL_TYPE}" ]]; then
     echo "ERROR: --pool requires the Codex mesh." >&2
     exit 2
   fi
-  POOL_FRESH_ARGS=()
   if [[ "${POOL_TYPE}" == ui ]]; then
-    POOL_FRESH_ARGS=(--fresh)
     SHOTS_FILE="${ARTIFACT_DIR}/ux_shots_${PASS_INDEX}.txt"
     if [[ ! -r "${SHOTS_FILE}" ]]; then
       echo "ERROR: UI shots file is unreadable: ${SHOTS_FILE}." >&2
@@ -654,7 +652,7 @@ if [[ -n "${POOL_TYPE}" ]]; then
   if ! POOL_ALLOCATION="$("$PY" "${POOL_HELPER}" allocate \
     --production "${POOL_PRODUCTION}" --type "${POOL_TYPE}" \
     --unit "${POOL_UNIT}" --phase "${POOL_PHASE}" --pass "${PASS_INDEX}" \
-    "${LENS_ARGS[@]}" "${POOL_FRESH_ARGS[@]}" --pid "$$" 2>>"${LOG_FILE}")"; then
+    "${LENS_ARGS[@]}" --pid "$$" 2>>"${LOG_FILE}")"; then
     echo "ERROR: pool allocation failed; see ${LOG_FILE}." >&2
     exit 1
   fi
@@ -672,7 +670,8 @@ if [[ -n "${POOL_TYPE}" ]]; then
   TEAM_SLOT="pool_${REVIEW_WORKER}"
   printf '%s\n' "${TEAM_SLOT}" > "${SLOT_FILE}"
   export PLAN_DELEGATE_TEAM_ROLE="${TEAM_SLOT}"
-  if [[ "${POOL_TYPE}" == ui || "${LEASE_ORDINAL}" -eq 1 ]]; then
+  # A reviewer's thread already holds the unit memory after its first turn.
+  if [[ "${LEASE_ORDINAL}" -eq 1 ]]; then
     POOL_PROMPT_FILE="$(mktemp "${ARTIFACT_DIR}/review_message_${PASS_INDEX}${SUFFIX}.XXXXXX")"
     "$PY" "${POOL_HELPER}" unit-memory --production "${POOL_PRODUCTION}" \
       --unit "${POOL_UNIT}" > "${POOL_PROMPT_FILE}" 2>>"${LOG_FILE}"

@@ -497,10 +497,10 @@ def check_reviewed_text(instance_dirs: list[str], reply: str) -> QuestionReplyRe
     if notify_scripts not in sys.path:
         sys.path.insert(0, notify_scripts)
     if TYPE_CHECKING:
-        from ..notify import review
+        from ..notify import reply_asks
     else:
-        import review
-    asks = review.user_reply_questions(reply)
+        import reply_asks
+    asks = reply_asks.user_reply_questions(reply)
     if not asks.sentences and not asks.has_choices:
         return QuestionReplyReady()
     for slug in tuple(slugs):
@@ -517,9 +517,9 @@ def check_reviewed_text(instance_dirs: list[str], reply: str) -> QuestionReplyRe
                 fields = cast(dict[str, object], entry)
                 accepted.extend(value for key in ("text", "question", "reviewed")
                                 if isinstance(value := fields.get(key), str))
-    registered = [review.question_prose(choice_comparison_text(question)) for question in accepted]
+    registered = [reply_asks.question_prose(choice_comparison_text(question)) for question in accepted]
     for sentence in (*asks.sentences, *asks.choice_lines):
-        compared = review.question_prose(choice_comparison_text(sentence))
+        compared = reply_asks.question_prose(choice_comparison_text(sentence))
         if compared and not any(item and (compared in item or item in compared) for item in registered):
             return QuestionReplyBlocked(f"Unregistered ask {sentence!r}: record the item with "
                                         + "update_registration.py footer --state and paste its reviewed question "

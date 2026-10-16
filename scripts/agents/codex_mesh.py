@@ -4463,6 +4463,37 @@ def _run_is_live(folder: Path, holders: tuple[str, ...]) -> bool:
     return bool(_live_launchers(folder))
 
 
+def _launcher_sessions(folder: Path) -> tuple[str, ...]:
+    """Name live launchers by their nearest process-validated Claude session ancestor."""
+    roster = _read_json_object(folder / ROSTER_FILE)
+    pids = tuple(pid for entry in roster.values()
+                 for pid in [_as_dict(entry).get("launcher_pid")]
+                 if isinstance(pid, int) and _pid_alive(pid))
+    if not pids:
+        return ()
+    from scripts.message import process_table
+
+    try:
+        table = process_table.snapshot()
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return ()
+    names: dict[int, str] = {}
+    for record in sessions.running_sessions():
+        # Only a recorded process start proves the pid still belongs to this session.
+        started = record.get("procStart", "")
+        if started and started == sessions.process_start(record["pid"]):
+            _ = names.setdefault(record["pid"], record["sessionId"])
+    found: list[str] = []
+    for pid in pids:
+        process = table.get(pid)
+        if process is None:
+            continue
+        session_id = process_table.nearest_named(process, table, names)
+        if session_id is not None and session_id not in found:
+            found.append(session_id)
+    return tuple(found)
+
+
 class CodexNoticeKind(Enum):
     WORKERS_CHANGED = "workers_changed"
     SIGN_IN_CHANGED = "sign_in_changed"
@@ -4525,9 +4556,10 @@ def command_signin_changed(args: argparse.Namespace) -> int:
         if not live:
             runs.append(EndedWorkersRun(folder, tuple(outgoing.items())))
             continue
+        launcher_sessions = _launcher_sessions(folder) if not holders else ()
         workers = tuple(worker for port in outgoing for worker in _switch_run_workers(
             folder, port, codex_home_role_label(workers_home()), dry_run=False))
-        runs.append(WorkersRunMove(folder, holders, tuple(outgoing.items()), workers))
+        runs.append(WorkersRunMove(folder, holders, tuple(outgoing.items()), workers, launcher_sessions))
     switches = _finish_run_moves(runs)
     for run, switched in zip(runs, switches, strict=True):
         if isinstance(run, EndedWorkersRun):
@@ -4609,6 +4641,7 @@ class WorkersRunSwitch:
     leftover_servers: int = 0
     stopped_servers: int = 0
     kept_servers: tuple[KeptWorkersServer, ...] = ()
+    launcher_sessions: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -4637,6 +4670,7 @@ class WorkersRunMove:
     holders: tuple[str, ...]
     servers: tuple[tuple[int, int], ...]  # port, pid
     workers: tuple[SwitchingWorker | InterruptedWorkerMove, ...]
+    launcher_sessions: tuple[str, ...] = ()
 
 
 def _account_move_command(session_dir: str, name: str) -> str:
@@ -4802,7 +4836,7 @@ def _finish_run_moves(
         else WorkersRunSwitch(run.folder, run.holders, tuple(
             SwitchingWorker(worker.name, True, outcomes[(worker.session_dir, worker.name)])
             if isinstance(worker, InterruptedWorkerMove) else worker for worker in run.workers
-        )) for run in runs)
+        ), launcher_sessions=run.launcher_sessions) for run in runs)
 
 
 def _interrupt_worker_for_account_move(session_dir: str, name: str, entry: dict[str, object],
@@ -4893,9 +4927,10 @@ def retire_workers_servers(workers_home: Path, label: str, *, dry_run: bool = Fa
         if not live:
             runs.append(EndedWorkersRun(folder, tuple(outgoing.items())))
             continue
+        launcher_sessions = _launcher_sessions(folder) if not holders else ()
         workers = tuple(worker for port in outgoing
                         for worker in _switch_run_workers(folder, port, label, dry_run=dry_run))
-        runs.append(WorkersRunMove(folder, holders, tuple(outgoing.items()), workers))
+        runs.append(WorkersRunMove(folder, holders, tuple(outgoing.items()), workers, launcher_sessions))
     switches = _finish_run_moves(runs, dry_run=dry_run)
     for run, switched in zip(runs, switches, strict=True):
         if isinstance(run, EndedWorkersRun):
@@ -5051,6 +5086,43 @@ def command_fork(args: argparse.Namespace) -> int:
     finally:
         if client is not None:
             client.close()
+
+
+def command_set_instructions(args: argparse.Namespace) -> int:
+    """Point an idle reviewer's standing prompt at a new file; its next resume sends that file.
+
+    The thread and its turns stay. A reviewer that is busy or not followable is refused (exit 2),
+    so a turn already running keeps the prompt it started with.
+    """
+    session_dir = _as_str(_attr(args, "session_dir"))
+    name = _as_str(_attr(args, "to"))
+    instructions = Path(_as_str(_attr(args, "instructions_file"))).resolve()
+    if not instructions.is_file():
+        print(f"codex_mesh: {name}: no instructions file at {instructions}", file=sys.stderr)
+        return 1
+    state = _lookup_state(session_dir, name)
+    if not isinstance(state, FollowableThread):
+        reason = state.reason if isinstance(state, InvalidThread) else "worker is busy or not followable"
+        print(f"codex_mesh: {name}: {reason}; instructions unchanged", file=sys.stderr)
+        return 2
+    path = _session_path(session_dir, ROSTER_FILE)
+    with path.open("a+", encoding="utf-8") as handle:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        _ = handle.seek(0)
+        roster = _as_dict(_loads(handle.read()))
+        entry = _as_dict(roster.get(name))
+        if entry.get("thread_id") != state.thread_id or entry.get("status") != "done":
+            print(f"codex_mesh: {name}: worker changed while setting instructions; instructions unchanged",
+                  file=sys.stderr)
+            return 2
+        entry["instructions_file"] = str(instructions)
+        _advance_roster_revision(entry)
+        roster[name] = entry
+        _ = handle.seek(0)
+        _ = handle.truncate()
+        _ = handle.write(json.dumps(roster, indent=2, sort_keys=True))
+        handle.flush()
+    return 0
 
 
 def _clear_reset_context(session_dir: str, name: str, thread_id: str, launcher_pid: int) -> bool:
@@ -5216,6 +5288,12 @@ def main(argv: list[str] | None = None) -> int:
     _ = fork.add_argument("--from", dest="from_name", required=True)
     _ = fork.add_argument("--name", required=True)
     fork.set_defaults(handler=command_fork)
+
+    set_instructions = subparsers.add_parser("set-instructions", help="point an idle reviewer at a new standing prompt")
+    _ = set_instructions.add_argument("--session-dir", required=True)
+    _ = set_instructions.add_argument("--to", required=True)
+    _ = set_instructions.add_argument("--instructions-file", required=True)
+    set_instructions.set_defaults(handler=command_set_instructions)
 
     reset = subparsers.add_parser("reset", help="remove all turns from an idle reviewer")
     _ = reset.add_argument("--session-dir", required=True)

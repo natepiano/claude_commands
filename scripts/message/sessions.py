@@ -15,6 +15,10 @@ from pathlib import Path
 from typing import Literal, NotRequired, TypedDict, cast
 
 
+# Claude's entrypoint for a print-mode run starts with this; an interactive session's is "cli".
+HEADLESS_ENTRYPOINT_PREFIX = "sdk-"
+
+
 class SessionRecord(TypedDict):
     pid: int
     sessionId: str
@@ -27,6 +31,9 @@ class SessionRecord(TypedDict):
     tmux: str
     # Every name the session had before the one it has now.
     formerNames: list[str]
+    # How Claude was started: "cli" for an interactive session, "sdk-cli" for a `claude -p` run.
+    # Older records and callers may omit it; read_session normalizes absence to empty.
+    entrypoint: NotRequired[str]
 
 
 class UnreadableSessionRecord(Enum):
@@ -90,6 +97,7 @@ def parse_session(parsed: object) -> RegistryEntry:
     proc_start = data.get("procStart")
     tmux = data.get("tmux")
     former = data.get("formerNames")
+    entrypoint = data.get("entrypoint")
     if (
         not isinstance(pid, int)
         or isinstance(pid, bool)
@@ -111,6 +119,7 @@ def parse_session(parsed: object) -> RegistryEntry:
         tmux=tmux if isinstance(tmux, str) else "",
         formerNames=[name for name in cast(list[object], former) if isinstance(name, str)]
         if isinstance(former, list) else [],
+        entrypoint=entrypoint if isinstance(entrypoint, str) else "",
     )
 
 
@@ -162,8 +171,18 @@ def process_start(pid: int) -> str | None:
         return None
 
 
+def headless(record: SessionRecord) -> bool:
+    """A `claude -p` run, such as send.py's relay, which takes its sender's name for one message.
+
+    It is no session: no roster lists it, and no name lookup finds it.
+    """
+    return record.get("entrypoint", "").startswith(HEADLESS_ENTRYPOINT_PREFIX)
+
+
 def running_session(record: SessionRecord) -> bool:
-    """The pid runs with its recorded start, or an older record has its socket."""
+    """The pid runs with its recorded start, or an older record has its socket. A headless run never counts."""
+    if headless(record):
+        return False
     try:
         os.kill(record["pid"], 0)
     except PermissionError:

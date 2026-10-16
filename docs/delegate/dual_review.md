@@ -21,9 +21,9 @@ is the third reader:
 The `craft` lens is off since 2026-10-04 (user: review trial ended); the unit
 director's main review audits style each phase.
 
-When the production doc names a review pool and the phase's arm is `pool`,
-the launcher allocates each lens's reviewer; the worker choice and role
-reassignment below do not apply.
+When the production doc names a review pool, the launcher allocates each
+lens's reviewer from the unit's own; the worker choice and role reassignment
+below do not apply.
 
 Otherwise each lens gets a different open worker. Prefer a worker that did not
 write the files it reviews. When the other workers are busy, a writer may take the
@@ -52,8 +52,8 @@ the same few hunks.
 </TeamReview>
 
 <ReviewPromptContract>
-When the production doc names a review pool and the phase's arm is `pool`,
-every code review prompt opens with:
+When the production doc names a review pool, every code review prompt opens
+with:
 
 ```
 You are a pooled reviewer for <unit>, phase <N>. Edit nothing. Your first command is git -C <worktree> rev-parse HEAD; if it is not <head>, report error. Re-read the tree; trust nothing from memory about its state.
@@ -186,15 +186,13 @@ final diff only.
    `${REVIEW_PASS}`. Pass 1 is the phase's broad review and runs the two
    lenses of <TeamReview/> over <BroadReviewPrompt/>; later passes are one
    reviewer over one repair, per <ClosureReview/>.
-2. Apply <ReviewDiffContract/>. On the pool arm of a production whose doc
-   names a review pool, create each prompt with <ReviewPromptContract/>'s
-   pooled opening. Otherwise choose each lens's open worker under
+2. Apply <ReviewDiffContract/>. In a production whose doc names a review
+   pool, create each prompt with <ReviewPromptContract/>'s pooled opening. Otherwise choose each lens's open worker under
    <TeamReview/>, apply <RoleReassignment/> when its role changes, and create
    the prompt with that slot's role-switch opening.
 3. Launch each reviewer under <DispatchContract/>, pass 1's in one message so
    they run concurrently — `contract` alone when the adversary was armed early,
-   both otherwise. When the production doc names a review pool and the
-   phase's arm is `pool`:
+   both otherwise. When the production doc names a review pool:
 
    ```sh
    bash ~/.claude/scripts/delegate/review.sh --pool code \
@@ -262,7 +260,7 @@ final diff only.
    close each one's own pass with
    `PLAN_DELEGATE_TEAM_ROLE=<worker> … finish-pass --status canceled
    --orphaned-launcher` per <PassOwnership/>, using each selected review slot
-   unless the phase's arm is `pool`. On the pool arm, read each
+   unless the production doc names a review pool. With a pool, read each
    review's slot from the one line in `${PHASE_DIR}/review_slot_<lens>`;
    for a closure, use `${PHASE_DIR}/review_slot`. A missing file means that
    launcher opened no pass, so skip its cancel call. Then open and gate the

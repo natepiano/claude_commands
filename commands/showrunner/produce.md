@@ -369,9 +369,10 @@ Then launch `review-unit` first:
 `$HOME/.claude/scripts/lib/py $HOME/.claude/scripts/production/add_unit.py --production PRODUCTION_DOC review --plan <review plan> --owns "—"`.
 It has an ordinary Units row, worktree and branch; its opening runs
 `/review:direct <absolute production doc path>`. Its standing phase stays
-`todo` and has no final checkpoint. Ask it for <ReviewPoolDailies/> at each
-dailies (`commands/review/direct.md`) and carry its tables and source warnings
-with the report.
+`todo` and has no final checkpoint. Each unit keeps one permanent reviewer per type, and every
+code review goes to it (`docs/production_format.md`, unit rule 16). Before
+you mark a unit `retired`, run `review_pool.py retire` for it
+(`docs/production_format.md`, Units).
 
 For each unit without a live unit director, run
 `$HOME/.claude/scripts/lib/py $HOME/.claude/scripts/production/add_unit.py --production PRODUCTION_DOC <name> --plan <unit plan>`.

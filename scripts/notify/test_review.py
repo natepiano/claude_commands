@@ -21,6 +21,7 @@ from unittest import mock
 
 import pushover
 import review
+import reply_asks
 import push_texts
 from user_action import ActionRequired, NoActionRequired, SessionLine, first_line
 
@@ -500,7 +501,7 @@ class LocalReviewTests(unittest.TestCase):
               redirect_stdout(io.StringIO()) as output):
             self.assertEqual(review.sample([path], 0, since=datetime.fromisoformat("2026-10-15T00:00:00Z"),
                                            runner=runner), 0)
-        self.assertEqual(review.reply_questions(body).sentences, ("Did you approve it?",))
+        self.assertEqual(reply_asks.reply_questions(body).sentences, ("Did you approve it?",))
         self.assertIn("sample: 0 replies", output.getvalue())
         self.assertIn("replies with unregistered questions: 1", output.getvalue())
         runner.assert_not_called()
@@ -512,25 +513,25 @@ class LocalReviewTests(unittest.TestCase):
                     "Please choose a version."]
         for request in requests:
             with self.subTest(request=request):
-                self.assertEqual(review.reply_questions("The check passed. " + request), review.ReplyAsks((request,), False))
-        self.assertEqual(review.reply_questions("Upgrade (recommended): use the new compiler."),
-                         review.ReplyAsks((), True, ("Upgrade (recommended): use the new compiler.",)))
-        self.assertEqual(review.reply_questions("- Choose a version.\n2. Confirm the version."),
-                         review.ReplyAsks(("Choose a version.", "Confirm the version."), False))
-        self.assertEqual(review.reply_questions(
+                self.assertEqual(reply_asks.reply_questions("The check passed. " + request), reply_asks.ReplyAsks((request,), False))
+        self.assertEqual(reply_asks.reply_questions("Upgrade (recommended): use the new compiler."),
+                         reply_asks.ReplyAsks((), True, ("Upgrade (recommended): use the new compiler.",)))
+        self.assertEqual(reply_asks.reply_questions("- Choose a version.\n2. Confirm the version."),
+                         reply_asks.ReplyAsks(("Choose a version.", "Confirm the version."), False))
+        self.assertEqual(reply_asks.reply_questions(
             "> Reply upgrade or wait.\n```\nChoose a version.\n```\n~~~\nApprove it.\n~~~\n"
-            + "The example is `Tell me which version.` and ``Choose a version.``."), review.ReplyAsks((), False))
+            + "The example is `Tell me which version.` and ``Choose a version.``."), reply_asks.ReplyAsks((), False))
 
     def test_choice_lines_include_questions_but_skip_quotes_and_code(self) -> None:
         line = "Retry (recommended) or stop?"
-        asks = review.reply_questions(line + "\n> Use stable (recommended).\n"
+        asks = reply_asks.reply_questions(line + "\n> Use stable (recommended).\n"
             + "```\nUse nightly (recommended).\n```\nExample: `Upgrade (recommended)`")
         self.assertEqual(asks.choice_lines, (line,))
         self.assertIn(line, asks.sentences)
 
     def test_detected_choice_lines_keep_inline_code_for_record_matching(self) -> None:
         line = "Run `retry build-42` (recommended), or stop?"
-        asks = review.reply_questions(line + "\nExample: `Stop (recommended)`")
+        asks = reply_asks.reply_questions(line + "\nExample: `Stop (recommended)`")
         self.assertEqual(asks.choice_lines, (line,))
 
     def test_user_asks_exclude_explicit_peer_recipient_headings_and_lead_ins(self) -> None:
@@ -542,13 +543,13 @@ class LocalReviewTests(unittest.TestCase):
         )
         for relay in relays:
             with self.subTest(relay=relay):
-                self.assertEqual(review.user_reply_questions(relay), review.ReplyAsks((), False))
+                self.assertEqual(reply_asks.user_reply_questions(relay), reply_asks.ReplyAsks((), False))
 
     def test_attributed_unit_choices_are_exempt_without_changing_measurement_choices(self) -> None:
         choice = '"Run phases 1 and 2 (recommended), or wait."'
         reply = "The handler-enh unit director said, in its own words:\n\n" + choice
-        self.assertEqual(review.reply_questions(reply).choice_lines, (choice,))
-        self.assertEqual(review.user_reply_questions(reply), review.ReplyAsks((), False))
+        self.assertEqual(reply_asks.reply_questions(reply).choice_lines, (choice,))
+        self.assertEqual(reply_asks.user_reply_questions(reply), reply_asks.ReplyAsks((), False))
 
     def test_naming_a_unit_as_the_subject_or_executor_keeps_the_user_ask(self) -> None:
         # Real user decisions that name a unit as subject or executor.
@@ -556,8 +557,8 @@ class LocalReviewTests(unittest.TestCase):
         request = "Say go and I'll have cargo-liner do it."
         choice = ("Allow (recommended, since both requests are a day old): "
                   + "the shutdown unit runs the cancel once, then moves dashboard-unit to claude 4.")
-        self.assertEqual(review.user_reply_questions(question + "\n" + request + "\n" + choice),
-                         review.ReplyAsks((question, request), True, (choice,)))
+        self.assertEqual(reply_asks.user_reply_questions(question + "\n" + request + "\n" + choice),
+                         reply_asks.ReplyAsks((question, request), True, (choice,)))
 
     def test_peer_recipient_scope_ends_before_the_next_user_paragraph(self) -> None:
         relay = "**Also sent to the hana showrunner:** Did you approve it?"
@@ -565,8 +566,8 @@ class LocalReviewTests(unittest.TestCase):
         choice = "Leave on (recommended), or turn off."
         for separator in ("\n\n", "\n\n**Question for you:**\n"):
             with self.subTest(separator=separator):
-                self.assertEqual(review.user_reply_questions(relay + separator + question + "\n" + choice),
-                                 review.ReplyAsks((question,), True, (choice,)))
+                self.assertEqual(reply_asks.user_reply_questions(relay + separator + question + "\n" + choice),
+                                 reply_asks.ReplyAsks((question,), True, (choice,)))
 
     def test_quoted_or_code_recipient_headings_do_not_hide_a_user_request(self) -> None:
         request = "Say go and I'll run it."
@@ -577,13 +578,13 @@ class LocalReviewTests(unittest.TestCase):
         )
         for prefix in prefixes:
             with self.subTest(prefix=prefix):
-                self.assertEqual(review.user_reply_questions(prefix + request), review.ReplyAsks((request,), False))
+                self.assertEqual(reply_asks.user_reply_questions(prefix + request), reply_asks.ReplyAsks((request,), False))
 
     def test_a_peer_message_in_code_does_not_extend_recipient_scope_to_the_user(self) -> None:
         request = "Want me to have it added?"
         reply = ("**To the hana showrunner:**\n\n"
                  + "```text\nDid you approve it?\n```\n\n" + request)
-        self.assertEqual(review.user_reply_questions(reply), review.ReplyAsks((request,), False))
+        self.assertEqual(reply_asks.user_reply_questions(reply), reply_asks.ReplyAsks((request,), False))
 
     def test_purpose_headings_keep_user_requests_and_choices(self) -> None:
         request = "Say go and I'll cancel the two requests."
@@ -591,15 +592,15 @@ class LocalReviewTests(unittest.TestCase):
         for heading in ("To unblock the shutdown unit:", "To finish the worker move:",
                         "For review by the hana showrunner:"):
             with self.subTest(heading=heading):
-                self.assertEqual(review.user_reply_questions(heading + "\n" + request + "\n" + choice),
-                                 review.ReplyAsks((request,), True, (choice,)))
+                self.assertEqual(reply_asks.user_reply_questions(heading + "\n" + request + "\n" + choice),
+                                 reply_asks.ReplyAsks((request,), True, (choice,)))
 
     def test_inline_return_to_user_retains_the_user_question_and_inline_code(self) -> None:
         question = "should I retire `handler-enh` (recommended), or wait?"
         for marker in ("Back to you:", "For you:", "Question for you:", "To you:", "Your decision:"):
             with self.subTest(marker=marker):
                 reply = "**To the hana showrunner:** Did you approve it? " + marker + " " + question
-                self.assertEqual(review.user_reply_questions(reply), review.reply_questions(question))
+                self.assertEqual(reply_asks.user_reply_questions(reply), reply_asks.reply_questions(question))
 
     def test_recipient_headings_without_colons_exempt_only_their_next_paragraph(self) -> None:
         user_question = "Want me to stop it?"
@@ -608,7 +609,7 @@ class LocalReviewTests(unittest.TestCase):
             for separator in ("\n", "\n\n"):
                 with self.subTest(heading=heading, separator=separator):
                     reply = heading + separator + "Did you approve it?\n\n" + user_question
-                    self.assertEqual(review.user_reply_questions(reply), review.ReplyAsks((user_question,), False))
+                    self.assertEqual(reply_asks.user_reply_questions(reply), reply_asks.ReplyAsks((user_question,), False))
 
     def test_subject_headings_keep_the_question_addressed_to_the_user(self) -> None:
         cases = (
@@ -619,18 +620,18 @@ class LocalReviewTests(unittest.TestCase):
         )
         for reply, question in cases:
             with self.subTest(reply=reply):
-                self.assertEqual(review.user_reply_questions(reply), review.ReplyAsks((question,), False))
+                self.assertEqual(reply_asks.user_reply_questions(reply), reply_asks.ReplyAsks((question,), False))
 
     def test_inline_code_recipient_and_return_markers_do_not_change_the_addressee(self) -> None:
         question = "Want me to use it?"
         reply = "`To the hana showrunner:` is only an example. " + question
-        self.assertEqual(review.user_reply_questions(reply), review.ReplyAsks((question,), False))
+        self.assertEqual(reply_asks.user_reply_questions(reply), reply_asks.ReplyAsks((question,), False))
         reply = "**To the hana showrunner:** The example says `Back to you:`. Did you approve it?"
-        self.assertEqual(review.user_reply_questions(reply), review.ReplyAsks((), False))
+        self.assertEqual(reply_asks.user_reply_questions(reply), reply_asks.ReplyAsks((), False))
 
     def test_session_address_colon_keeps_the_following_paragraph_addressed_to_the_peer(self) -> None:
         reply = "To session:other:\n\nDid you approve it?\n\nWant me to stop it?"
-        self.assertEqual(review.user_reply_questions(reply), review.ReplyAsks(("Want me to stop it?",), False))
+        self.assertEqual(reply_asks.user_reply_questions(reply), reply_asks.ReplyAsks(("Want me to stop it?",), False))
 
     def test_reviewed_question_is_registered_from_outstanding_and_after_closing(self) -> None:
         cutoff = datetime.now(timezone.utc) - timedelta(minutes=1)
@@ -712,7 +713,7 @@ class LocalReviewTests(unittest.TestCase):
 
     def test_sample_matches_each_question_sentence_on_the_same_line(self) -> None:
         first, second = "Would you retry the build?", "Which version should it use?"
-        self.assertEqual(review.reply_questions(first + " " + second), review.ReplyAsks((first, second), False))
+        self.assertEqual(reply_asks.reply_questions(first + " " + second), reply_asks.ReplyAsks((first, second), False))
         path = self.transcript("questions.jsonl", [("2026-10-13T10:00:00Z", first + " " + second, "end_turn")])
         registration = self.root / "showrunner/outstanding/build.json"
         registration.parent.mkdir(parents=True)

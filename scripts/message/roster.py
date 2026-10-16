@@ -25,7 +25,7 @@ for _directory in (SCRIPTS / "production", SCRIPTS / "delegate", SCRIPTS / "shut
     if str(_directory) not in sys.path:
         sys.path.insert(0, str(_directory))
 
-import add_unit  # noqa: E402
+import production_units  # noqa: E402
 import remove_workers  # noqa: E402
 from worker_state import worker_ledger  # noqa: E402
 import showrunners  # noqa: E402
@@ -639,7 +639,7 @@ def _showrunner_ids(
     return found
 
 
-class _ProductionUnitMarks(add_unit.SessionMarks):
+class _ProductionUnitMarks(production_units.SessionMarks):
     """Use the roster's known marks, retaining rows when those marks are unreadable."""
 
     def __init__(self, slug: str, every: unit_lookup.MarkedProductions | OSError) -> None:
@@ -660,7 +660,7 @@ def _production_rows(
 ) -> list[dict[str, str]]:
     lines = doc.read_text(encoding="utf-8").splitlines()
     marks = _ProductionUnitMarks(slug, every)
-    return [row for row in add_unit.unit_table(lines) if not add_unit.unit_is_retired(row, marks)]
+    return [row for row in production_units.unit_table(lines) if not production_units.unit_is_retired(row, marks)]
 
 
 def _every_marked_unit(*, include_tmux: bool) -> unit_lookup.MarkedProductions | OSError:
@@ -697,11 +697,11 @@ def _production_places(
                 raise OSError(every.faults[runner["slug"]])
             rows = _production_rows(doc, runner["slug"], every)
             units = every.units.get(runner["slug"], {})
-        except (OSError, UnicodeError, ValueError, add_unit.Refusal) as error:
+        except (OSError, UnicodeError, ValueError, production_units.Refusal) as error:
             _problem(problems, f"unit hosts for {runner['slug']} were not read", error)
         else:
             for row in rows:
-                unit_name = add_unit.cell_value(row.get("Unit", ""))
+                unit_name = production_units.cell_value(row.get("Unit", ""))
                 marked = units.get(unit_name)
                 if marked is None:
                     continue
@@ -723,12 +723,12 @@ def _production_places(
         # Worktree ownership is a fallback only when neither host could be read.
         try:
             rows = _production_rows(doc, runner["slug"], every)
-        except (OSError, UnicodeError, ValueError, add_unit.Refusal) as fallback_error:
+        except (OSError, UnicodeError, ValueError, production_units.Refusal) as fallback_error:
             _problem(problems, f"units in {doc}", fallback_error)
             continue
         for row in rows:
-            unit_name = add_unit.cell_value(row.get("Unit", ""))
-            worktree = add_unit.cell_value(row.get("Worktree", ""))
+            unit_name = production_units.cell_value(row.get("Unit", ""))
+            worktree = production_units.cell_value(row.get("Worktree", ""))
             for record in records:
                 if (record["sessionId"] not in ledger_workers and worktree
                         and details[record["sessionId"]].cwd == worktree):

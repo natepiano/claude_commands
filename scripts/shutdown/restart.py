@@ -39,7 +39,7 @@ from account import (  # noqa: E402
     own_claude_account,
     NAMED_ACCOUNT_VARIABLES,
 )
-import add_unit  # noqa: E402
+import production_units  # noqa: E402
 import herdr  # noqa: E402
 import inventory as inventory_work  # noqa: E402
 import conversation_pause  # noqa: E402
@@ -823,13 +823,13 @@ def _units_row_plan(doc: str, unit: str) -> str | None:
     A run record's plan can differ from it: the plan moves to as-built, or a later run uses another doc.
     """
     try:
-        table = add_unit.unit_table(Path(doc).read_text(encoding="utf-8").splitlines())
-    except (OSError, UnicodeError, add_unit.Refusal):
+        table = production_units.unit_table(Path(doc).read_text(encoding="utf-8").splitlines())
+    except (OSError, UnicodeError, production_units.Refusal):
         return None
-    rows = [row for row in table if add_unit.cell_value(row.get("Unit", "")) == unit]
+    rows = [row for row in table if production_units.cell_value(row.get("Unit", "")) == unit]
     if len(rows) != 1 or "Plan" not in rows[0]:
         return None
-    return add_unit.cell_value(rows[0]["Plan"])
+    return production_units.cell_value(rows[0]["Plan"])
 
 
 def _unit_argv(record: SessionShutdown) -> list[str]:
