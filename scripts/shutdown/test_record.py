@@ -1707,6 +1707,33 @@ class RecoverySnapshotTests(ShutdownTestCase):
         self.assertEqual((result["progress"], result.get("target"), result["requested_by"]),
                          (existing["progress"], "claude2", existing["requested_by"]))
 
+    def test_newer_snapshot_replaces_materialized_recovery_and_keeps_new_host_on_disk(self) -> None:
+        snapshot = self.snapshot(1)
+        candidate = snapshot["sessions"][0]
+        assert candidate["agent"] == "claude"
+        previous = record.materialize_snapshot(snapshot, candidate)
+        snapshot["taken_at"] = LATER
+        owner = candidate["session"]
+        assert owner["kind"] == "top-level"
+        owner["host"] = inventory.HerdrHost(kind="herdr", herdr_session="new-host",
+            pane_id="w2:p1", presentation="attached window")
+        current = record.materialize_snapshot(snapshot, candidate)
+        self.assertNotEqual(current["request_id"], previous["request_id"])
+        self.assertEqual(current["session"]["host"], candidate["session"]["host"])
+        self.assertEqual(record.session_records(snapshot["login"]), [current])
+        self.assertEqual(current["requested_by"]["kind"], "snapshot")
+        self.assertEqual(current["requested_at"], LATER)
+
+    def test_shutdown_request_newer_than_snapshot_is_not_replaced(self) -> None:
+        existing = session_shutdown()
+        existing["requested_at"] = LATER
+        self.assertTrue(record.create_session(existing))
+        snapshot = self.snapshot(1)
+        candidate = snapshot["sessions"][0]
+        assert candidate["agent"] == "claude"
+        self.assertEqual(record.materialize_snapshot(snapshot, candidate), existing)
+        self.assertEqual(record.session_records(snapshot["login"]), [existing])
+
     def test_codex_snapshot_preserves_resume_id_or_picker_and_cannot_become_a_claude_record(self) -> None:
         for resume in (record.CodexSessionId(kind="session id", session_id="rollout-id"), record.CodexResumePicker(kind="picker")):
             with self.subTest(resume=resume):
