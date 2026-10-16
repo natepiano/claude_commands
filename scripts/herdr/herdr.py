@@ -77,6 +77,61 @@ class ServerAdopted:
     """The server was already running and belongs to an earlier launch."""
 
 
+@dataclass(frozen=True)
+class DesktopSession:
+    """The caller belongs to the Mac desktop's Aqua security session."""
+
+
+@dataclass(frozen=True)
+class NonDesktopSession:
+    """The caller cannot start a server with desktop keychain access."""
+
+
+@dataclass(frozen=True)
+class SessionKindUnreadable:
+    reason: str
+
+
+@dataclass(frozen=True)
+class NotMacSession:
+    """Security-session routing is unnecessary on this platform."""
+
+
+SecuritySession = DesktopSession | NonDesktopSession | SessionKindUnreadable | NotMacSession
+
+
+@dataclass(frozen=True)
+class SessionKindNotRead:
+    """A command boundary still needs to determine its security session."""
+
+
+_SESSION_KIND_NOT_READ = SessionKindNotRead()
+MAC_DESKTOP_REQUIRED = "the Mac desktop is not signed in: restart from the Mac"
+
+
+class MacDesktopUnavailable(HerdrFailure):
+    def __init__(self) -> None:
+        super().__init__(MAC_DESKTOP_REQUIRED, "mac_desktop_unavailable")
+
+
+@dataclass(frozen=True)
+class WindowServerCreated:
+    """A desktop window started this server; the user owns its cleanup."""
+
+
+def security_session() -> SecuritySession:
+    """Read the command's security context once; a failed query grants no access."""
+    if _PLATFORM != "darwin":
+        return NotMacSession()
+    try:
+        result = run_program([os.environ.get("LAUNCHCTL", "launchctl"), "managername"])
+    except (OSError, subprocess.SubprocessError, HerdrFailure) as error:
+        return SessionKindUnreadable(str(error))
+    if result.returncode:
+        return SessionKindUnreadable(result.stderr.strip() or "launchctl managername failed")
+    return DesktopSession() if result.stdout.strip() == "Aqua" else NonDesktopSession()
+
+
 class AgentNotReady(HerdrFailure):
     """Startup stopped before interactive readiness, with its visible screen."""
 
@@ -806,7 +861,7 @@ def _server_start_failure(name: str) -> HerdrFailure:
     return HerdrFailure(message)
 
 
-def _start_darwin_server(client: Herdr, timeout_ms: int, *, exclusive: bool) -> ServerCreated | ServerAdopted:
+def _start_darwin_server(client: Herdr, timeout_ms: int, *, exclusive: bool, session_kind: SecuritySession) -> ServerCreated | ServerAdopted:
     from detached import DiscardOutput, InheritEnvironment, DetachedChildExited, DetachedStartFailure, start_detached
 
     deadline = time.monotonic() + min(10.0, timeout_ms / 1000)
@@ -820,6 +875,8 @@ def _start_darwin_server(client: Herdr, timeout_ms: int, *, exclusive: bool) -> 
         pass
     if time.monotonic() >= deadline:
         raise _server_start_failure(client.session)
+    if not isinstance(session_kind, DesktopSession):
+        raise MacDesktopUnavailable()
     holders: set[int] = set()
 
     def ready() -> bool:
@@ -862,12 +919,14 @@ def _start_darwin_server(client: Herdr, timeout_ms: int, *, exclusive: bool) -> 
     return ServerCreated()
 
 
-def start_server(name: str, timeout_ms: int) -> ServerCreated | ServerAdopted:
+def start_server(name: str, timeout_ms: int, *,
+                 session_kind: SecuritySession | SessionKindNotRead = _SESSION_KIND_NOT_READ) -> ServerCreated | ServerAdopted:
     _validate_session_name(name)
     _timeout(timeout_ms)
     herdr = Herdr(name)
     if _PLATFORM == "darwin":
-        return _start_darwin_server(herdr, timeout_ms, exclusive=False)
+        return _start_darwin_server(herdr, timeout_ms, exclusive=False,
+            session_kind=security_session() if isinstance(session_kind, SessionKindNotRead) else session_kind)
     deadline = time.monotonic() + timeout_ms / 1000
     try:
         if server_answering(run_program(herdr.argv("status", "server"), timeout=max(0.001, timeout_ms / 1000))):
@@ -892,13 +951,15 @@ def start_server(name: str, timeout_ms: int) -> ServerCreated | ServerAdopted:
             time.sleep(min(0.1, remaining))
 
 
-def start_new_server(name: str, timeout_ms: int) -> None:
+def start_new_server(name: str, timeout_ms: int, *,
+                     session_kind: SecuritySession | SessionKindNotRead = _SESSION_KIND_NOT_READ) -> None:
     """Create an exclusive server; never adopt a server another launch started."""
     _validate_session_name(name)
     _timeout(timeout_ms)
     herdr = Herdr(name)
     if _PLATFORM == "darwin":
-        _ = _start_darwin_server(herdr, timeout_ms, exclusive=True)
+        _ = _start_darwin_server(herdr, timeout_ms, exclusive=True,
+            session_kind=security_session() if isinstance(session_kind, SessionKindNotRead) else session_kind)
         return
     deadline = time.monotonic() + timeout_ms / 1000
     try:
@@ -927,6 +988,60 @@ def start_new_server(name: str, timeout_ms: int) -> None:
         remaining = deadline - time.monotonic()
         if remaining > 0:
             time.sleep(min(0.1, remaining))
+
+
+def restore_server(name: str, timeout_ms: int, *, session_kind: SecuritySession,
+                   attached_window: bool, exclusive: bool) -> ServerCreated | ServerAdopted | WindowServerCreated:
+    """Start in Aqua directly, or let a desktop attach window bootstrap its server."""
+    _validate_session_name(name)
+    _timeout(timeout_ms)
+    if _PLATFORM != "darwin" or isinstance(session_kind, DesktopSession):
+        if exclusive:
+            if _PLATFORM == "darwin":
+                start_new_server(name, timeout_ms, session_kind=session_kind)
+            else:
+                start_new_server(name, timeout_ms)
+            return ServerCreated()
+        if _PLATFORM == "darwin":
+            return start_server(name, timeout_ms, session_kind=session_kind)
+        return start_server(name, timeout_ms)
+    client = Herdr(name)
+    deadline = time.monotonic() + min(15.0, timeout_ms / 1000)
+    try:
+        if server_answering(run_program(client.argv("status", "server"),
+                                        timeout=max(0.001, deadline - time.monotonic()))):
+            if exclusive:
+                raise SessionTaken(name)
+            return ServerAdopted()
+        if not attached_window:
+            raise MacDesktopUnavailable()
+        # An existing listener that has not answered yet is also another launch's.
+        if any(item.path == _session_socket(name) for item in _darwin_bound_sockets(
+                timeout=max(0.001, deadline - time.monotonic()))):
+            raise SessionTaken(name)
+        require_success(run_program([
+            os.environ.get("SHUTDOWN_OPEN", "open"), "-na", "/Applications/Nix Apps/Ghostty.app",
+            "--args", "-e", herdr_binary(), "session", "attach", name,
+        ], timeout=max(0.001, deadline - time.monotonic())), "open Mac desktop window")
+        while time.monotonic() < deadline:
+            remaining = deadline - time.monotonic()
+            if server_answering(run_program(client.argv("status", "server"), timeout=max(0.001, remaining))):
+                return WindowServerCreated()
+            remaining = deadline - time.monotonic()
+            if remaining > 0:
+                time.sleep(min(0.1, remaining))
+    except SessionTaken:
+        raise
+    except (OSError, subprocess.SubprocessError, HerdrFailure) as error:
+        raise MacDesktopUnavailable() from error
+    raise MacDesktopUnavailable()
+
+
+def stop_created_server(name: str, ownership: ServerCreated | ServerAdopted | WindowServerCreated) -> None:
+    """Only directly created servers are ours to stop; desktop windows stay open."""
+    if isinstance(ownership, (ServerAdopted, WindowServerCreated)):
+        return
+    stop_session(name)
 
 
 def stop_session(name: str) -> None:

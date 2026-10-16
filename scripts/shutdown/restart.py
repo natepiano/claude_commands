@@ -387,8 +387,19 @@ class MachineRestartResult:
         return 0 if self.status in {"done", "nothing"} and not self.failed and not self.refused else 1
 
 
+_SESSION_KIND_NOT_READ = herdr.SessionKindNotRead()
+_COMMAND_SECURITY_SESSION: ContextVar[herdr.SecuritySession | herdr.SessionKindNotRead] = ContextVar(
+    "restart_security_session", default=_SESSION_KIND_NOT_READ)
+
+
+def _command_security_session() -> herdr.SecuritySession:
+    known = _COMMAND_SECURITY_SESSION.get()
+    return herdr.security_session() if isinstance(known, herdr.SessionKindNotRead) else known
+
+
 @dataclass
 class DesktopLaunchState:
+    session_kind: herdr.SecuritySession = field(default_factory=lambda: herdr.SessionKindUnreadable("command session not supplied"))
     starting_desktop: str = ""
     started_windows: int = 0
 
@@ -947,8 +958,9 @@ def restore_desktop(state: DesktopLaunchState, *, dry_run: bool = False) -> None
 
 
 def _herdr_launch(
-    parts: ResumeParts, destination: HerdrDestination, session: Session, *, dry_run: bool
-) -> None:
+    parts: ResumeParts, destination: HerdrDestination, session: Session, *, dry_run: bool,
+    session_kind: herdr.SecuritySession | herdr.SessionKindNotRead = _SESSION_KIND_NOT_READ,
+) -> herdr.ServerCreated | herdr.ServerAdopted | herdr.WindowServerCreated:
     """Resume Claude with its own arguments and one separate opening prompt."""
     unset_variables: set[str] = {"CLAUDE_CODE_OAUTH_TOKEN"}
     if isinstance(parts.account, MoveResumeAccount):
@@ -969,7 +981,7 @@ def _herdr_launch(
         location = (destination.pane_id if isinstance(destination, RecordedHerdrPane)
                     else "a new pane")
         print(f"herdr {name}: resume {session['session_id']} in {location}")
-        return
+        return herdr.ServerAdopted()
     try:
         from scripts.accounts.accounts import NamedAccount, trust_command
 
@@ -981,11 +993,9 @@ def _herdr_launch(
             reason = (str(trust) if isinstance(trust, herdr.UnreadableTrustFile)
                       else f"{parts.cwd}: Claude has not trusted this folder")
             raise OSError(f"{reason}. Run: {trust_command(Path(parts.cwd), account)}")
-        if isinstance(destination, NewHerdrSession):
-            herdr.start_new_server(name, 90_000)
-            server = herdr.ServerCreated()
-        else:
-            server = herdr.start_server(name, 90_000)
+        server = herdr.restore_server(name, 90_000,
+            session_kind=herdr.security_session() if isinstance(session_kind, herdr.SessionKindNotRead) else session_kind,
+            attached_window=launches_window(session["host"]), exclusive=isinstance(destination, NewHerdrSession))
         server_environment = herdr.server_environment(name)
         for variable in sorted(unset_variables):
             if variable in server_environment:
@@ -1015,13 +1025,15 @@ def _herdr_launch(
             client.start_agent(session["name"], pane, kind="claude", agent_arguments=list(parts.claude_arguments),
                                opening=herdr.OpeningPrompt(parts.opening_prompt), timeout_ms=90_000)
         except herdr.AgentExited:
-            if isinstance(server, herdr.ServerCreated):
-                herdr.stop_session(name)
+            herdr.stop_created_server(name, server)
             raise
-        if isinstance(server, herdr.ServerAdopted):
+        if isinstance(server, (herdr.ServerAdopted, herdr.WindowServerCreated)):
             _focus_restored_pane(client, pane, session["name"])
         if isinstance(parts.conversation, StartFreshConversation):
             print(f"{session['name']}: no conversation to resume; started a new one")
+        return server
+    except herdr.MacDesktopUnavailable:
+        raise
     except herdr.SessionTaken as error:
         raise HerdrDestinationTaken(str(error)) from error
     except herdr.HerdrFailure as error:
@@ -1122,9 +1134,11 @@ def _launch_session(
     parts = _resume_parts(session, prompt, record.get("target", ""), login=record["login"],
                           at=record["requested_at"], probe=record.get("probe", False))
     if host["kind"] == "herdr":
-        _herdr_launch(parts, RecordedHerdrPane(host["herdr_session"], host["pane_id"]),
-                      session, dry_run=dry_run)
+        server = _herdr_launch(parts, RecordedHerdrPane(host["herdr_session"], host["pane_id"]),
+                      session, dry_run=dry_run, session_kind=desktop_state.session_kind)
         name = host["herdr_session"]
+        if isinstance(server, herdr.WindowServerCreated):
+            return SessionLaunched()
         if herdr_presentation(host) == "attached window":
             match herdr.attached_clients(name):
                 case herdr.NoClientAttached():
@@ -1142,14 +1156,18 @@ def _launch_session(
         while True:
             name = herdr.generated_session_name(host["tmux_session"], str(suffix) if suffix else "")
             try:
-                _herdr_launch(parts, NewHerdrSession(name), session, dry_run=dry_run)
+                _ = _herdr_launch(parts, NewHerdrSession(name), session, dry_run=dry_run,
+                    session_kind=desktop_state.session_kind)
                 break
             except HerdrDestinationTaken:
                 suffix += 1
         return SessionLaunched()
     if host["kind"] == "ghostty" or host["kind"] == "zed" or (host["kind"] == "terminal" and sys.platform == "darwin"):
         name = herdr.generated_session_name(session["name"])
-        _herdr_launch(parts, NewHerdrSession(name), session, dry_run=dry_run)
+        server = _herdr_launch(parts, NewHerdrSession(name), session, dry_run=dry_run,
+                    session_kind=desktop_state.session_kind)
+        if isinstance(server, herdr.WindowServerCreated):
+            return SessionLaunched()
         if host["kind"] == "ghostty" or host["kind"] == "terminal":
             supervisor = live_supervisor(host)
             if supervisor["kind"] == "supervisor":
@@ -1640,6 +1658,12 @@ def launch_entry(
         launch = _launch_recovery_record(
             record, note, desktop_state, dry_run=dry_run
         )
+    except herdr.MacDesktopUnavailable as error:
+        if dry_run:
+            print(str(error))
+        else:
+            mark_restart_failed(record, str(error))
+        return EntrySettled()
     except ScheduledRestartPromptNotRecorded as error:
         if not dry_run:
             mark_restart_failed(
@@ -1766,7 +1790,7 @@ def _print_result(result: MachineRestartResult, *,
     displayed = replace(result, manual_sessions=tuple(item for item in result.manual_sessions
                                                      if item not in already_reported))
     for line in _result_lines(displayed):
-        print(line)
+        print(herdr.MAC_DESKTOP_REQUIRED if herdr.MAC_DESKTOP_REQUIRED in line else line)
 
 
 def _prior_progress(record: SessionShutdown) -> SessionProgress:
@@ -1934,12 +1958,14 @@ _RESTORE_HISTORY: ContextVar[UnsharedRestoreHistory | CompletedRestoreHistory] =
 
 @contextmanager
 def restore_history_pass() -> Generator[None, None, None]:
-    """Share one archive observation across an account-wide restart command."""
+    """Share archive evidence and the security session across an account-wide command."""
     history = CompletedRestoreHistory(tuple(recovery_store.restarted_history()))
     token = _RESTORE_HISTORY.set(history)
+    security_token = _COMMAND_SECURITY_SESSION.set(_command_security_session())
     try:
         yield
     finally:
+        _COMMAND_SECURITY_SESSION.reset(security_token)
         _RESTORE_HISTORY.reset(token)
 
 
@@ -2016,16 +2042,19 @@ def _launch_codex_snapshot(
     if dry_run:
         print(f"herdr {name}: CODEX_HOME={launch['home']} codex {shlex.join(arguments)} in {owner['cwd']}")
         return
-    herdr.start_new_server(name, 90_000)
+    server = herdr.restore_server(name, 90_000, session_kind=state.session_kind,
+                                  attached_window=launches_window(owner["host"]), exclusive=True)
     try:
         pane = herdr.open_pane(name, name, owner["cwd"], {"CODEX_HOME": launch["home"]})
         herdr.start_agent(name, pane, kind="codex", agent_arguments=arguments,
                           opening=herdr.NoOpeningPrompt(), timeout_ms=90_000)
     except (herdr.HerdrFailure, OSError, subprocess.SubprocessError):
-        herdr.stop_session(name)
+        herdr.stop_created_server(name, server)
         raise
     _focus_restored_pane(herdr.Herdr(name), pane, owner["name"])
     _acknowledge_restored_snapshots(owner["session_id"])
+    if isinstance(server, herdr.WindowServerCreated):
+        return
     attach = shlex.join(["herdr", "session", "attach", name])
     if launches_window(owner["host"]):
         clients = herdr.attached_clients(name)
@@ -2088,7 +2117,10 @@ class RecoveryCrashCheck:
         return NoCrashSignal()
 
 
-def _up(login: str, dry_run: bool, only: Iterable[str] = ()) -> MachineRestartResult:
+def _up(login: str, dry_run: bool, only: Iterable[str] = (), *,
+        session_kind: herdr.SecuritySession | herdr.SessionKindNotRead = _SESSION_KIND_NOT_READ) -> MachineRestartResult:
+    if isinstance(session_kind, herdr.SessionKindNotRead):
+        session_kind = _command_security_session()
     if not dry_run:
         for line in migrate(login):
             print(line)
@@ -2248,7 +2280,7 @@ def _up(login: str, dry_run: bool, only: Iterable[str] = ()) -> MachineRestartRe
         return MachineRestartResult(machine, label, "partial" if recovery_failures else "nothing",
             failed=len(recovery_failures), failed_sessions=tuple(recovery_failures),
             refused=refused, local_session_ids=frozenset(local_ids))
-    state = DesktopLaunchState()
+    state = DesktopLaunchState(session_kind=session_kind)
     started_at = time.monotonic()
     attempted: list[SessionShutdown] = []
     codex_restarted = 0
@@ -2538,11 +2570,16 @@ def restart(
         print(f"shutdown: {error}", file=sys.stderr)
         return 1
 
+    session_kind = _command_security_session()
     notify = isinstance(alerts, AlertWhenNotBack) and not dry_run
     ids = tuple(only)
     local_ids: set[str] = set()
     try:
-        local = _up(selected.login, dry_run, ids)
+        token = _COMMAND_SECURITY_SESSION.set(session_kind)
+        try:
+            local = _up(selected.login, dry_run, ids)
+        finally:
+            _COMMAND_SECURITY_SESSION.reset(token)
         local_ids = set(local.local_session_ids)
     except (
         InvalidRecord,

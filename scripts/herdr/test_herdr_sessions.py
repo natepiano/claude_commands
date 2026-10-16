@@ -480,6 +480,25 @@ class StandaloneLaunchTests(unittest.TestCase):
         self.assertIn(f"CLAUDE_CODE_REMOTE_MEMORY_DIR={Path.home() / '.claude'}", workspace)
         self.assertEqual(len(self.agent_starts()), 1)
 
+    def test_mac_start_and_resume_refuse_non_desktop_before_any_server_or_agent(self) -> None:
+        for verb, arguments in (
+            ("start", ["--name", "solo", "--cwd", str(self.root)]),
+            ("resume", ["solo", "--session-id", "saved-id", "--cwd", str(self.root)]),
+        ):
+            for kind in (herdr.NonDesktopSession(), herdr.SessionKindUnreadable("query failed")):
+                with (self.subTest(verb=verb, kind=kind),
+                      patch.object(sys, "platform", "darwin"), patch.object(herdr, "_PLATFORM", "darwin"),
+                      patch.object(herdr, "security_session", return_value=kind) as query,
+                      patch.object(herdr, "start_new_server") as start,
+                      patch.object(herdr, "start_agent") as agent,
+                      redirect_stdout(io.StringIO()) as output):
+                    self.assertEqual(self.call(verb, *arguments), (1, ""))
+                self.assertEqual(output.getvalue().splitlines(), [herdr.MAC_DESKTOP_REQUIRED])
+                query.assert_called_once_with()
+                start.assert_not_called()
+                agent.assert_not_called()
+                self.assertEqual(self.attachments, [])
+
     def test_start_opens_promptless_default_account_and_attaches(self) -> None:
         self.destination("solo")
         self.assertEqual(self.call("start", "--name", "solo", "--cwd", str(self.root), "--", "--model", "opus"), (0, ""))
