@@ -607,28 +607,19 @@ Moved to unit `herdr-panes-unit`, run in parallel with Phase 5; shipped as `docs
 
 ### Phase 22 — Codex restores land in their conversation  · status: done
 
-**Depends on:** Phase 21
+#### As-built
 
-**User sees:** before — a Codex session restored after a crash opens Codex's resume list, and with two or more sessions the user must remember which one was theirs; after — it opens straight into the conversation it left. A session that never talked still opens the resume list.
-
-#### Work Order
-
-**Goal:** a recovery snapshot records each Codex session's conversation id, so restart runs `codex resume <id>`.
-
-**Spec:**
-
-1. Measured cause (2026-10-16 18:11 EDT, Mac, Codex v0.163.0, `CODEX_HOME=~/.codex1`): a Codex that had answered one prompt was snapshotted as `CodexResumePicker`. The snapshot reads the id only from a rollout file the process holds open (`inventory.py`: Darwin `rollout()` through `herdr.darwin_open_files`, Linux `_codex_resume` through `/proc/<pid>/fd`), and Codex writes `sessions/YYYY/MM/DD/rollout-<time>-<id>.jsonl` and then closes it (mtime 18:10:59, nothing open at 18:11:20). The file's first line is `session_meta` with `payload.id`, `payload.cwd` and `payload.timestamp`; `CODEX_HOME/session_index.jsonl` also exists.
-2. When no rollout is open, find the id from the files on disk: the rollout under `<CODEX_HOME>/sessions` whose `session_meta` `cwd` equals the process cwd and whose session started at or after the process start. Exactly one match gives `CodexSessionId`; none gives `CodexResumePicker` (a session that never talked); more than one is ambiguous and also gives `CodexResumePicker`: the snapshot never picks one of several candidates. If `session_index.jsonl` gives a cheaper exact answer, use it instead and say why in the summary. An open rollout still wins. The same rule serves Darwin and Linux.
-3. Reading stays cheap: snapshots run often, so look only at day folders from the process start date on, and read only each candidate's first line.
-4. `restart.py` already runs `codex resume <id>` for `session id`; no change there unless a test shows otherwise.
-5. Live, on the Mac: the user starts `codex` in a probe pane and sends it one prompt; snapshot; `herdr --session <probe> server stop`; `shutdown.py restart --here --no-alert` over ssh; the restored Codex opens the conversation, not the list.
+- A recovery snapshot records a talked-to Codex session as `CodexSessionId`, so restart runs `codex resume <id>` and opens the conversation; a session that never talked stays `CodexResumePicker`. `restart.py` is unchanged.
+- `_observed_codex_resume(reader, process, home, cwd) -> CodexSessionId | CodexResumePicker` tries `reader.rollout(process, home)` first (open rollout via `/proc/<pid>/fd` on Linux, `herdr.darwin_open_files` on Darwin; `CodexDescriptorsUnreadable` counts as picker), then falls back to `_codex_disk_resume(home, cwd, reader.started_at(process))`. The same fallback serves both platforms.
+- `_codex_disk_resume(home: Path, cwd: str, started: datetime)` reads only the first line (`session_meta`) of each `rollout-<time>-<id>.jsonl` and keeps those whose `payload.cwd` equals the process cwd, `payload.timestamp` is at or after process start, and `payload.id` matches the filename id. One match gives the id; none or several give the picker. Vanished or unparseable rollouts are skipped. `session_index.jsonl` is not used.
+- `_codex_rollout_paths(root: Path, first_day: date) -> Iterator[Path]` walks `<CODEX_HOME>/sessions/YYYY/MM/DD` with `iterdir` from the process start's local date on; any `OSError` other than a missing root raises `ObservationFailure`, which makes the snapshot partial.
+- `started_at(process) -> datetime` on each reader returns the process start in UTC: Linux from `/proc` start ticks plus `btime`, Darwin from `lstart` read with `LC_ALL=C TZ=UTC`.
 
 **Files:**
-- `scripts/shutdown/inventory.py`, `scripts/shutdown/test_inventory.py` — id from the rollout files on disk.
-- `scripts/shutdown/restart.py`, `scripts/shutdown/test_restart.py` — only if a change is needed.
+- `scripts/shutdown/inventory.py` — open-rollout lookup, disk fallback, readers' `started_at`.
+- `scripts/shutdown/test_inventory.py` — disk id, none, two matches, pre-start rollout ignored, open rollout preferred, local-date folders, unreadable folder.
+- `scripts/lib/test_user_zone.py` — lists `inventory.py` in `USES_THE_MACHINE_ZONE`.
 
-**Workers:** 1 writer, `test` (as impl).
+**Gotchas:** Codex closes its rollout file between turns, so the open-file lookup alone misses idle sessions. Codex names day folders by the machine's local date, not UTC. `Path.glob` hides unreadable folders; enumerate with `iterdir`.
 
-**Constraints from prior phases:** Mac restarts outside the desktop start herdr through the attach window and refuse with `the Mac desktop is locked or signed out: unlock it and restart` (Phase 21). Every herdr command names `--session`. The Mac clone `~/scratch/herdr-mac` pulls the pushed branch.
-
-**Acceptance gate:** tests that fail without the fix for: an id found on disk with no open rollout, none found (picker), two matches (picker), a rollout from before the process started ignored, an open rollout still preferred; `merge_gate.py --tests-only` green; `basedpyright scripts/lib scripts/herdr scripts/shutdown` clean; Mac `scripts/shutdown` suite green; Spec 5 passes on the Mac.
+**Ruled out:** picking one of several matching rollouts — ambiguity always yields the picker.
