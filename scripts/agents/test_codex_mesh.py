@@ -5037,6 +5037,8 @@ class SweepTests(unittest.TestCase):
             ["codex", "-c", "thread_unload_delay_secs=0", "app-server", "--listen", "ws://127.0.0.1:47165"],
             ["codex", "-c", "thread_unload_delay_secs=0", "-c", "model_auto_compact_token_limit=200000",
              "app-server", "--listen", "ws://127.0.0.1:47165"],
+            ["codex", "-c", "thread_unload_delay_secs=0", "-c", "model_auto_compact_token_limit=200000",
+             "-c", "background_terminal_max_timeout=300000", "app-server", "--listen", "ws://127.0.0.1:47165"],
         )
         for command in commands:
             with self.subTest(command=command), patch.object(subprocess, "run", return_value=subprocess.CompletedProcess([], 0, "111 7200 " + " ".join(command) + "\n", "")):
@@ -5939,6 +5941,7 @@ class WorkersHomeTests(unittest.TestCase):
         command = cast(list[str], launch.call_args.args[0])
         self.assertIn("thread_unload_delay_secs=0", command)
         self.assertIn(f"model_auto_compact_token_limit={codex_mesh.AUTO_COMPACT_TOKENS}", command)
+        self.assertIn("background_terminal_max_timeout=300000", command)
         environment = cast(dict[str, str], launch.call_args.kwargs["env"])
         self.assertEqual(environment["CODEX_HOME"], str(home))
         record = cast(dict[str, object], json.loads((self.session_dir / codex_mesh.SERVER_FILE).read_text()))
