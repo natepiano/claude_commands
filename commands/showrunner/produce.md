@@ -369,9 +369,7 @@ Then launch `review-unit` first:
 `$HOME/.claude/scripts/lib/py $HOME/.claude/scripts/production/add_unit.py --production PRODUCTION_DOC review --plan <review plan> --owns "—"`.
 It has an ordinary Units row, worktree and branch; its opening runs
 `/review:direct <absolute production doc path>`. Its standing phase stays
-`todo` and has no final checkpoint. Ask it for <ReviewPoolDailies/> at each
-dailies (`commands/review/direct.md`) and carry its tables and source warnings
-with the report. Each unit keeps one permanent reviewer per type, and every
+`todo` and has no final checkpoint. Each unit keeps one permanent reviewer per type, and every
 code review goes to it (`docs/production_format.md`, unit rule 16). Before
 you mark a unit `retired`, run `review_pool.py retire` for it
 (`docs/production_format.md`, Units).
@@ -642,7 +640,7 @@ message.
    --state-dir DAILIES_STATE_DIR` after each code checkpoint. Give the user its
    table on the first alert. A shrink adds no review-ledger row or CI count. While the
    watch exits 3, the dailies `Review watch` topic needs the user, and every
-   build report (`/build:report`, every 4 hours) carries it and pushes again. Run
+   build report (`/build:report`) carries it and pushes again. Run
    `review_regime.py ack` only on the user's own acknowledgment. Pass `--no-ci`
    to `due` when the production rules say CI does not apply.
    When the production doc has a **Review pool** line, send `review-unit`
