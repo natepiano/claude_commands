@@ -568,11 +568,8 @@ def user_words(instances: tuple[str, ...] | list[str],
         words.append("footer")
     if any(name.startswith(unit_runs.INSTANCE_PREFIXES) for name in instance_set):
         words.append("status reports")
-    if "report-builds" in instance_set:
-        words.append("build report")
     known = {name for name in instance_set
-             if name.startswith(("showrunner-", *unit_runs.INSTANCE_PREFIXES))
-             or name == "report-builds"}
+             if name.startswith(("showrunner-", *unit_runs.INSTANCE_PREFIXES))}
     words.extend(sorted(instance_set - known))
     return tuple(words)
 

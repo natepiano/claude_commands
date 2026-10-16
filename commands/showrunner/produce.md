@@ -640,7 +640,7 @@ message.
    --state-dir DAILIES_STATE_DIR` after each code checkpoint. Give the user its
    table on the first alert. A shrink adds no review-ledger row or CI count. While the
    watch exits 3, the dailies `Review watch` topic needs the user, and every
-   build report (`/build:report`, every 4 hours) carries it and pushes again. Run
+   build report (`/build:report`) carries it and pushes again. Run
    `review_regime.py ack` only on the user's own acknowledgment. Pass `--no-ci`
    to `due` when the production rules say CI does not apply.
    When the production doc has a **Review pool** line, send `review-unit`
