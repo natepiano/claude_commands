@@ -1090,7 +1090,7 @@ After a worker launch's own turn has ended, a move to the selected seats home th
 - Launcher tests that copy a script tree must copy `claude_account.sh`.
 - Two folders on one login break token refresh; `cutover-home` renames, never copies.
 
-### Phase 32 — Cutover on natedev: claude2 moves into ~/.claude2  · status: todo
+### Phase 32 — Cutover on natedev: claude2 moves into ~/.claude2  · status: done
 
 **Depends on:** Phase 31
 
@@ -1110,7 +1110,7 @@ After a worker launch's own turn has ended, a move to the selected seats home th
 
 **Files:**
 
-- `docs/accounts.md` — the natedev cutover line.
+- `docs/accounts.md` — the natedev cutover line (carried by Phase 33's checkpoint, which edits the same guide).
 
 **Workers:** none; the director runs each step.
 
@@ -1118,13 +1118,13 @@ After a worker launch's own turn has ended, a move to the selected seats home th
 
 ### Phase 33 — Cutover on the Mac  · status: todo
 
-**Depends on:** Phase 32
+**Depends on:** Phase 31 for the code (Spec 1–3); the live step (Spec 4) runs after Phase 32
 
 #### Work Order
 
 **Goal:** on the Mac, claude2's login lives in `~/.claude2` (keychain entry keyed to that folder), `~/.claude` holds no login, usage readings work for the named folder, and plain `claude` launches on the showrunners group's account. One user `/login` in `~/.claude2`; never `/logout`.
 
-**Constraints from prior phases:** the Mac's login is keychain-only plus `$HOME/.claude.json` `oauthAccount`; ssh cannot read its keychain, so names are read from a session on the Mac. `cutover-home` refuses on macOS. `scripts/whoami/agent_accounts.py` `claude_credentials` reads the keychain only for the legacy home. The Mac has no account aliases and no showrunners group set. Showrunner, 2026-10-15: deleting the old local keychain entry is approved with three conditions — (1) it runs only after the `~/.claude2` login is checked to be the same account as the old entry, comparing identifiers in code and never printing them; if they differ it refuses and changes nothing; (2) it reads and deletes by service name only, never prints contents, never runs `/logout`; (3) the user is told as part of the one live step: once the new login works, the old copy in `~/.claude` is removed from the Mac's keychain, and the server login is not touched.
+**Constraints from prior phases:** the Mac's login is keychain-only plus `$HOME/.claude.json` `oauthAccount`; ssh cannot read its keychain, so names are read from a session on the Mac. `cutover-home` refuses on macOS. `scripts/whoami/agent_accounts.py` `claude_credentials` reads the keychain only for the legacy home. The Mac has no account aliases and no showrunners group set. Claude Code 2.1.296 names a folder's keychain service `Claude Code-credentials` when `CLAUDE_CONFIG_DIR` is unset, else `Claude Code-credentials-<first 8 hex of sha256 of the NFC-normalized CLAUDE_CONFIG_DIR value>`; the hash is over the exact string the launch sets, so it must match what `accounts.py` puts in `CLAUDE_CONFIG_DIR`. Showrunner, 2026-10-15: deleting the old local keychain entry is approved with three conditions — (1) it runs only after the `~/.claude2` login is checked to be the same account as the old entry, comparing identifiers in code and never printing them; if they differ it refuses and changes nothing; (2) it reads and deletes by service name only, never prints contents, never runs `/logout`; (3) the user is told as part of the one live step: once the new login works, the old copy in `~/.claude` is removed from the Mac's keychain, and the server login is not touched.
 
 **Spec:**
 
@@ -1132,12 +1132,16 @@ After a worker launch's own turn has ended, a move to the selected seats home th
 2. On macOS, `cutover-home claude2` (after the user's `/login` in `~/.claude2`) removes `oauthAccount` from `$HOME/.claude.json` keeping every other key, deletes the old legacy keychain entry under the three conditions, writes the same journal and dated `home_cutovers` record, refuses while any Claude process uses `~/.claude`, and `--undo` restores `oauthAccount` (the keychain entry needs a `/login` in `~/.claude`, said in its line).
 3. The Mac `claude` alias text (`accounts.py exec showrunners`, same flags as natedev) goes to the showrunner for the darwin side of `shell.nix`; the Mac's showrunners group is set with `accounts.py move showrunners <claudeN>`.
 4. Live: ask the showrunner for the user's `/login` in `~/.claude2` with the condition-3 line; move every Mac process on `~/.claude`; run the cutover; `docs/accounts.md` records that `~/.claude` holds no login on either machine.
+5. Add-on (showrunner, 2026-10-15; the user: "i would want to know the name of the showrunner-unit director-worker that is switching and to what it is switching to"): `accounts.py swap workers codexN` prints a header `Workers moving codex2 → codex1:` (dry run `Workers would move codex2 → codex1:`), then one line per switching worker with no run ids — `natedev · two-accounts · impl-worker → codex1`, with `(mid-turn; switches when its turn ends)` for a worker mid-turn. Parts: showrunner, unit (else the session name), worker name; the host first only when it is not this machine; an unresolved holder shows the session name, else `unknown session` and the run id. Per-run text stays in the server log and the holder notices.
+6. Add-on (showrunner, 2026-10-15; the user ran bare `codex`, got codex2 and did not know how to start codex1): `accounts.py exec codexN [codex args]` resolves the label to the home holding its note's login, with the resolution `swap` uses (`codex2` → `~/.codex`), sets `CODEX_HOME` and execs `codex`; `exec workers [codex args]` does the same for the account `role workers` selects. An unknown or signed-out label is refused with the existing wording; `--probe` stays Claude-only. The showrunner adds the `codex1`, `codex2` and bare `codex` (→ `exec workers`) aliases after promotion.
 
 **Files:**
 
 - `scripts/accounts/accounts.py`, `scripts/accounts/test_cutover_home.py` — the macOS cutover.
 - `scripts/whoami/agent_accounts.py`, `scripts/whoami/test_agent_accounts.py` — named-folder keychain lookup.
 - `docs/accounts.md` — the Mac step.
+- `scripts/agents/codex_mesh.py`, `scripts/accounts/test_accounts.py`, `commands/showrunner/accounts.md` — the per-worker swap output.
+- `scripts/accounts/accounts.py`, `scripts/accounts/test_accounts.py`, `docs/accounts.md`, `commands/showrunner/accounts.md` — Codex labels in `exec`.
 
 **Workers:** 1 writer + 1 tester. `impl` takes `scripts/accounts/` and `scripts/whoami/`; `test` writes the tests (keychain calls stubbed by service name; never a real keychain) and the docs.
 
