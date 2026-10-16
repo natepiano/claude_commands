@@ -10,7 +10,7 @@
 
 Build the approved style showrunner proposal ~/.local/state/plan-backlog/2026-10-16-style-showrunner.md (revision 3, approved by the user 2026-10-16): Phases 1-3, then the Phase 4 pilot under cargo-liner's showrunner; Phase 5 retirement and Phase 6 roll-out only after the pilot meets its pass criteria.
 
-Mapping (style-unit's choice, 2026-10-16): the proposal's Phases 1-3 are this plan's Phases 1-10, its Phase 4 pilot is Phase 11, its Phase 5 retirement is Phase 12 and its Phase 6 roll-out is Phase 13. The proposal file stays the design record; this plan does not edit it.
+Mapping (style-unit's choice, 2026-10-16): the proposal's Phases 1-3 are this plan's Phases 1-11, its Phase 4 pilot is Phase 12, its Phase 5 retirement is Phase 13 and its Phase 6 roll-out is Phase 14. The proposal file stays the design record; this plan does not edit it.
 
 ## Delegation Context
 
@@ -18,10 +18,10 @@ Mapping (style-unit's choice, 2026-10-16): the proposal's Phases 1-3 are this pl
 - **Project started:** 2026-10-16T19:43:43.983+00:00
 - **Stack:** Python ≥3.12 in practice through `~/.claude/scripts/lib/py` (`typing.override` throughout the tests; natedev has 3.13); basedpyright 1.39; stdlib `sqlite3` (as in `scripts/buildlog/index.py`); markdown command and doc files; zsh/bash scripts; nix in `/etc/nixos`; Rust read only (the cargo-berth source at `~/rust/cargo-liner/crates/cargo-berth/src`). Style rules are markdown with YAML-like frontmatter in `~/rust/nate_style/rust/*.md` (a separate git repo on `main`; other sessions leave uncommitted files there).
 - **Layout:**
-  - `scripts/fix/` — the fix pipeline; retired in Phase 12 except the pieces Phase 1 moves.
+  - `scripts/fix/` — the fix pipeline; retired in Phase 13 except the pieces Phase 1 moves.
   - `scripts/style/` — new home of the style scripts: `candidate_generators.py`, `style_admin.py`, `style_rules.py`, `rules.py`, `style_ledger.py`, `style_plan.py`, `style_footprint.py`, `style_sync.py`, `add_style.py`, `style_proposals.py`, tests beside them.
   - `scripts/production/` — merge_checkpoint, merge_gate, add_unit, add_showrunner, showrunners, production_lifecycle, dailies_render, dailies_input, proposal_issue.
-  - `scripts/lib/` — shared helpers (`user_zone.py`, `py`); `berth_board.py` is new in Phase 6.
+  - `scripts/lib/` — shared helpers (`user_zone.py`, `py`); `berth_board.py` is new in Phase 7.
   - `commands/` — top-level style and fix commands, `showrunner/`, `unit/direct.md`, `nightly_*`.
   - `docs/` — `production_format.md`, `delegate_plan_format.md`, `delegate/phase_end.md`, `style_production.md` (new), as-built and plans.
   - `config/agents.conf`, `pyrightconfig.json`, `settings.json`, `CLAUDE.md`.
@@ -30,7 +30,7 @@ Mapping (style-unit's choice, 2026-10-16): the proposal's Phases 1-3 are this pl
   - `scripts/style/candidate_generators.py` — `CandidatesSpec` :37 (kind, origin, pattern, exclude_pattern, globs, paths, paths_exempt, structs, field_type_pattern); `read_candidates_spec` :78; `GENERATORS` (15 kinds); `enumerate_candidates` :1166, returns every site (no cap).
   - `scripts/fix/style_admin.py` — 260 lines; `from style_history import HISTORY_DIR, NATE_STYLE_DIR, HistoryRow` :12; `RUST_STYLE_DIR` :14. Used by `commands/style_rename.md:23`, `commands/style_delete.md:27`.
   - `scripts/fix/style_history.py` — 2089 lines; imports candidate_generators :25; `NATE_STYLE_DIR` :28, `HISTORY_DIR` :29, `HistoryRow` :129; `normalize_guideline_id` :152, `parse_frontmatter` :180, `list_style_files` :575, `_build_units_from_files` :590, `resolve_focus_targets` :628, `focused_units` :673; `focused-eval` subparser :1949, handler :2071; `enumerate_candidates` call sites :1228, :1305, :2057.
-  - `scripts/fix/style_report.py`, `scripts/fix/backpopulate_settings.py` (called from `fix.sh:219`) — retired in Phase 12.
+  - `scripts/fix/style_report.py`, `scripts/fix/backpopulate_settings.py` (called from `fix.sh:219`) — retired in Phase 13.
   - `scripts/fix/fix.conf` — the fix config (there is no `config/fix.conf`); sections `[style_eval]` :12, `[style_fix]` :26, `[project_env]` :41, `[projects]` :52, `[active_checkout]` :94.
   - `scripts/fix/docs/candidate-enumeration-design.md` — generator design; enums-over-bool narrowed to struct fields at :325-326; generator table :163.
   - `scripts/fix/tests/` — fix pipeline tests, not in the merge gate.
@@ -43,7 +43,7 @@ Mapping (style-unit's choice, 2026-10-16): the proposal's Phases 1-3 are this pl
   - `scripts/new_rust_project/rust_generate.sh` — fix enrollment block :153-~:207 (`CONF` :154), message :208.
   - `config/agents.conf` — `[fix.codex]` :82, `[fix.claude]` :88 (header comment :80); `style_fix_review=` :70 and :76.
   - Other fix consumers: `scripts/agents/test_agent_exec.py:111-115` (reads `scripts/fix/style-*.sh`; in the `agents` merge-gate suite), `scripts/whoami/test_quota_alert.py:61-63`, `scripts/cli_agent/cli_agent.sh:20,38,42`, `settings.json:155` (`style_usage`), `CLAUDE.md:4` (`/style_eval`), `scripts/bevy_migration_plan/bevy_migration_ensure_repo.sh:32`, `docs/as-built/agent-registry.md:318-322`, `pyrightconfig.json` (the `scripts/fix` environment).
-  - `docs/as-built/fix-pipeline.md`, `docs/plans/fix-pipeline-deferred.md` — retired in Phase 12.
+  - `docs/as-built/fix-pipeline.md`, `docs/plans/fix-pipeline-deferred.md` — retired in Phase 13.
   - `commands/nightly_review.md` — `<Scope mode="rust">` :19-24, weight line :20; `commands/nightly_weights.md`; `scripts/nightly_review/weights.py` (`COMMAND` :22) and `test_weights.py`; `scripts/nightly_review/nightly_review.py` `MODES` :42; `commands/nightly_next.md`, `commands/showrunner/nightly.md` (both use `candidates.py`; kept).
   - `/etc/nixos/modules/common/style-fix.nix`, `/etc/nixos/modules/linux/style-fix.nix`; imports `modules/common/default.nix:20` and `configuration.nix:64`; `nightly-review.nix` imported at `configuration.nix:60` (kept). Comments citing style-fix.nix: common/{claude-to-codex-sync:10, hanadocs-prioritize:59, session-notifier:10, codex-catalog-sync:9, checkouts:158, development:65}, linux/{usage-collect:4, buildlog:11}, darwin/nate-backend.nix:11,86; `shell.nix:134` style-fix alias.
   - `scripts/accounts/role_map.py` — `Role` :26; workers map :302, :328.
@@ -84,7 +84,7 @@ Mapping (style-unit's choice, 2026-10-16): the proposal's Phases 1-3 are this pl
   - No new launch or account code: style sessions launch through `add_showrunner.py`, `add_unit.py` and `implement.sh`, on the existing role map (design, section 2).
   - Style units own no files: they take what the berth board, live units' unmerged branches and their dirty worktree files leave free, and product work always wins a conflict (design, section 6).
   - Rules stay in `~/rust/nate_style`; the style production's procedure lives in `~/.claude/docs/style_production.md` (design, section 2).
-  - A fix is applied without asking only when it is mechanical (Phase 6, `style_footprint.py`); every other change is held as a proposal and shown only when asked (design, section 7).
+  - A fix is applied without asking only when it is mechanical (Phase 7, `style_footprint.py`); every other change is held as a proposal and shown only when asked (design, section 7).
 
 ## Phases
 
@@ -93,7 +93,7 @@ Mapping (style-unit's choice, 2026-10-16): the proposal's Phases 1-3 are this pl
      Never a letter suffix (`4a`, `2b1a`) — those stop sorting and make ranges
      unreadable. Any spine edit (insert, split, merge, reorder, delete)
      resequences from the edit point to the end AND updates every cross-reference:
-     substitute highest-first so `Phase 8` does not corrupt `Phase 12`, and
+     substitute highest-first so `Phase 9` does not corrupt `Phase 13`, and
      re-check that each `Phases X–Y` range still spans the same set.
      Insert after the last `done` phase where possible — a done phase's number
      is baked into its checkpoint commit message and cannot be rewritten; if one
@@ -124,55 +124,60 @@ Mapping (style-unit's choice, 2026-10-16): the proposal's Phases 1-3 are this pl
 **Ruled out:** Holding the new tests to Python 3.10 — the repo already uses `typing.override`.
 
 ### Phase 2 — Rule metadata: tier, family, input scope and generator surface  · status: done
-**Depends on:** Phase 1
+
+#### As-built
+
+- Every global rule in `~/rust/nate_style/rust/*.md` declares `tier` (A14/B20/C10/D7/E2), `family: names|values|types|modules` on B, C and D, and `input_scope: file|crate|manifest` (absent means `crate`; only `workspace-dependencies` is `manifest`). All 22 `candidates:` blocks declare `surface: partial` with an `uncovered` line.
+- Validation: tier A iff `mechanism` is clippy, mend or rustfmt; tier B requires `candidates:` or `pre_filter:`; B, C and D require `family`, A and E forbid it; a repo-local rule must declare `tier` and `family`. Each failure raises `RuleValidationError(path, reason)`.
+- `CandidatesSpec` carries `surface: Literal["whole","partial"]` and `uncovered: str`; `read_candidates_spec` raises `CandidatesSpecError(ValueError)`, naming the rule, when `kind` is missing, `surface` is not whole or partial, or partial has no `uncovered`.
+- `style_rules.parse_frontmatter` returns top-level `tier`, `family`, `input_scope`, `mechanism` and `mode` as one-element lists, quotes stripped; `read_pre_filter` honors only an unindented top-level `pre_filter:` line.
+- `rules.py` defines aliases `Tier`, `Family`, `InputScope`, `RuleOrigin` and frozen `Rule(name, path, tier, family, input_scope, mode_propose, candidates, pre_filter, blob, origin)`; `load_rules(repo_root) -> tuple[Rule, ...]` reads global rules plus the repo's `docs/style` and `docs/*/style` rules. `rules.py list [--repo] [--json]` exits 2 on a validation error.
+
+**Files:**
+- `scripts/style/rules.py` — `Rule`, `load_rules`, `RuleValidationError`, `list` CLI
+- `scripts/style/candidate_generators.py` — `CandidatesSpec.surface`/`uncovered`, `CandidatesSpecError`
+- `scripts/style/style_rules.py` — scalar metadata keys, top-level `pre_filter`
+- `scripts/style/test_rules.py` — loader and validation tests; `test_candidate_generators.py` fixtures declare `surface: whole`
+- `~/rust/nate_style/rust/*.md` — tier, family, input_scope, surface/uncovered
+
+**Binds later work:** the `Rule`, `load_rules`, `CandidatesSpec` and error signatures above; nate_style metadata lives in commits bc8ca57 and a4549af, local to natedev and never pushed by this unit (nate_style main carries other sessions' commits), so another machine lacks it; the Missing rule metadata reads as unclassified phase handles that, and later work never counts an unclassified rule as current. No generator rule is whole, so every listed rule's uncovered surface needs a tier-C read in its family. `~/rust/cargo-liner`'s 11 local rules stay untagged until the pilot's bootstrap.
+
+**Gotchas:** never push nate_style from this unit; `review-charter.md` and `rust/public-failures-return-named-errors.md` belong to other sessions and are never staged (stage nate_style files by explicit path, never `git add -A`); `rules.py` forks `git hash-object` once per rule (`--stdin-paths` would batch it).
+
+**Ruled out:** discovery through `load-rust-style.sh` — its filters drop tool-enforced and Bevy rules, so `load_rules` reads the directory layout directly; `surface: whole` for any generator — both candidates missed cases (unlisted registrations, bare-name trait counting).
+
+### Phase 3 — Missing rule metadata reads as unclassified  · status: todo
+**Depends on:** Phase 2
 
 #### Work Order
 
-**Goal:** every style rule declares its tier, family and input scope, every generator rule declares how much of its rule the generator lists, and `scripts/style/rules.py` reads the rule set (global plus a repo's local rules) into typed records.
+**Goal:** the Phase 2 code runs on a machine whose `~/rust/nate_style` predates the rule metadata (the Mac until nate_style is pushed and pulled): a missing `surface` or `tier` reads as unclassified, never a crash and never a false current.
 
 **Spec:**
-- New frontmatter keys on every rule in `~/rust/nate_style/rust/*.md` (53 files; one commit in that repo, only these files):
-  - `tier: A|B|C|D|E` — A: tool mechanism (clippy, mend, rustfmt), 14 rules; B: listed (a `candidates:` generator, or `forbidden-words`), 20; C: read, 10; D: structure, once per crate, 7 (the six `scope: review` rules — module-roots-as-table-of-contents, name-submodules-after-anchor-types, when-to-split-a-module, split-by-type-ownership, workspace-dependencies, types-live-with-their-behavior — plus module-structure); E: process, not swept, 2 (public-api-changes-require-explicit-approval, fix-root-causes-never-workarounds).
-  - `family: names|values|types|modules` on every B, C and D rule; absent on A and E. The assignment, verbatim from the design:
-
-    | Family (unit) | Listed (B) | Read (C) |
-    | --- | --- | --- |
-    | `names` | dont-repeat-type-name-in-fields, dont-repeat-enum-domain-in-variant-names, avoid-repeated-field-affixes, forbidden-words | spell-out-names, name-bindings-to-match-parameters, prefer-type-named-fields-and-bindings, comments-name-code-constructs |
-    | `values` | never-prefix-unused-fields-or-variables-with, import-constants-at-the-top, derive-test-values-from-production-constants, test-module-allow-boilerplate, agent-must-review-allows, always-use-nextest | no-magic-values, constants-file-organization, prefer-functional-patterns, tests-live-with-the-type-under-test, prefer-observers-over-polling, system-params-carry-their-behavior |
-    | `types` | enums-over-bool-for-owned-booleans, if-else-chains-signal-missing-types, dont-create-traits-for-single-implementations, prefer-from-impl-over-named-constructors, public-failures-return-named-errors, bevy-plugin-ownership, bevy-reflection-registration, extract-observer-run-conditions, prefer-events-over-messages, use-bevy_kana-in-all-bevy-crates | the uncovered surfaces of its listed rules |
-    | `modules` | module-roots-as-table-of-contents, name-submodules-after-anchor-types, workspace-dependencies | module-structure, when-to-split-a-module, split-by-type-ownership, types-live-with-their-behavior |
-
-    The three `modules` generator rules are tier D (they carry `scope: review`); every `modules` rule is tier D.
-  - `input_scope: file|crate|manifest` — what a judgment depends on. A rule with no `input_scope` is `crate`. This phase sets only `workspace-dependencies: manifest`; every other rule stays `crate` until the pilot shows it is file-local (design, settled).
-  - Inside each of the 22 `candidates:` blocks, `surface: whole|partial` and, for `partial`, `uncovered: '<what the generator does not list>'`. The audit: read each rule's text against its generator kind in `scripts/style/candidate_generators.py` and the narrowing record in `scripts/fix/docs/candidate-enumeration-design.md` (:163 table, :325-326). Known: enums-over-bool-for-owned-booleans is `partial`, `uncovered: 'function arguments, return types, local accumulators'` (the generator lists struct fields only). The uncovered surface of a `partial` rule is a tier-C read in the same family.
-- `CandidatesSpec` (`candidate_generators.py:37`) gains `surface: Literal["whole", "partial"]` and `uncovered: str`; `read_candidates_spec` (:78) reads them and refuses a spec missing `surface`.
-- New `scripts/style/rules.py`:
-  - `Rule` (frozen dataclass): `name`, `path`, `tier`, `family` (or None), `input_scope`, `mode_propose: bool` (from `mode: propose`), `candidates: CandidatesSpec | None`, `pre_filter: str | None`, `blob: str` (git blob hash of the rule file, `git hash-object`), `origin: Literal["global", "local"]`.
-  - `load_rules(repo_root: Path | None) -> tuple[Rule, ...]` — global rules from `NATE_STYLE_DIR/rust`, plus repo-local rules from `$repo_root/docs/<member>/style/` (the same lookup as `load-rust-style.sh:73`; reuse `style_rules.list_style_files` or the script's `--list-files` output). Uses `style_rules.parse_frontmatter`.
-  - Validation, each failure a named error listing the rule: tier A iff mechanism is clippy, mend or rustfmt; tier B requires `candidates:` or `pre_filter:`; B, C and D require `family`; A and E forbid it; `input_scope` is one of the three. A repo-local rule must declare `tier` and `family` (it joins the family whose subject it fits — the rule author chooses).
-  - CLI: `rules.py list [--repo <root>] [--json]` prints name, tier, family, input scope, surface.
-- Tests `scripts/style/test_rules.py`: a temp rule dir covering each tier; each validation error; a `partial` surface; a repo-local rule merged in; default `input_scope` is `crate`.
-- Also run once against the real tree: `rules.py list` shows 14 A, 20 B, 10 C, 7 D, 2 E.
+- Why: nate_style's metadata commits (bc8ca57, a4549af) are local to natedev; `~/rust/nate_style` main also carries three commits from other sessions, so this unit never pushes it. `~/.claude` reaches the Mac first. There, `read_candidates_spec` raises `CandidatesSpecError` on every `candidates:` block without `surface`, which breaks `scripts/fix/style_history.py` `unit_candidates_spec` (:1349, the focused-eval path) and `enumerate-candidates` (:1805), and `rules.py list` exits 2 on the first rule without `tier`.
+- `CandidatesSpec.surface` (`scripts/style/candidate_generators.py`) becomes `Literal["whole", "partial", "unclassified"]`; a block with no `surface` key reads as `unclassified` with no error. A present but invalid `surface`, a missing `kind`, and `partial` without `uncovered` stay `CandidatesSpecError`. Enumeration is unchanged for every surface value.
+- `scripts/style/rules.py`: a global rule with no `tier` loads as unclassified, not an error: `Rule.tier` becomes `Tier | Literal["unclassified"]`, family and input-scope checks are skipped for it, and `rules.py list` prints `unclassified`. A global rule that declares any metadata key is validated in full, as now. A repo-local rule missing `tier` or `family` stays a named `RuleValidationError` (local rules have no older checkout to tolerate).
+- Downstream readers never count an unclassified rule as current: a later phase that needs the tier of an unclassified rule treats the rule as not yet classified, and Phase 4's coverage ledger records no cell for it.
 
 **Files:**
-- `~/rust/nate_style/rust/*.md` — 53 rules: `tier`, `family`, `input_scope`, `surface`/`uncovered` (outside this repo; commit the 52 tracked files there; `public-failures-return-named-errors.md` is another session's uncommitted rule: add its keys, never stage or commit it)
-- `scripts/style/candidate_generators.py` — `surface`, `uncovered` in `CandidatesSpec` and its reader
-- `scripts/style/rules.py` — new
-- `scripts/style/test_rules.py` — new
+- `scripts/style/candidate_generators.py` — `surface` gains `unclassified`
+- `scripts/style/rules.py` — unclassified global rules
+- `scripts/style/test_rules.py` — tests
+- `scripts/style/test_candidate_generators.py` — tests
 
-**Workers:** 2 writers — the rule files split from the code.
-- `impl` — `scripts/style/candidate_generators.py`, `scripts/style/rules.py`, `scripts/style/test_rules.py`
-- `test` (opens as impl) — the 53 rule files in `~/rust/nate_style/rust/` and the surface audit; commits the 52 tracked ones in that repo by explicit path (never `git add -A`: `review-charter.md` and `rust/public-failures-return-named-errors.md` are other sessions' uncommitted work)
+**Workers:** 1 writer + 1 tester — the code is one small change across two modules; the tester writes the regression tests from this Spec.
+- `impl` — `scripts/style/candidate_generators.py`, `scripts/style/rules.py`
+- `test` — `scripts/style/test_rules.py`, `scripts/style/test_candidate_generators.py`: a temp rule dir holding pre-Phase-2 frontmatter (a `candidates:` block with no `surface`, rules with no `tier`) loads and lists as unclassified; `read_candidates_spec` on a block without `surface` enumerates the same sites as before; an invalid `surface` and a local rule without `tier` still raise named errors.
 
-**Constraints from prior phases:** Phase 1 moved `candidate_generators.py` to `scripts/style/` (no cap), and put `parse_frontmatter`, `list_style_files`, `NATE_STYLE_DIR`, `extract_title`, `read_pre_filter`, `normalize_guideline_id` and the `Unit` dataclass in `scripts/style/style_rules.py`; reuse them rather than copying. `scripts/fix/style_history.py` re-exports moved names with `X as X` for `style_report.py`. `scripts/style` is a merge-gate suite with its own pyright environment; a new merge-gate suite must be listed in both `TEST_SUITES` and `scripts/production/test_merge_gate.py` `EXPECTED_SUITES`. The repo's Python floor is 3.12 in practice (`typing.override` is used across the tests).
+**Constraints from prior phases:** Phase 2: `CandidatesSpec` has `surface` and `uncovered`; `CandidatesSpecError` (a `ValueError`) names the rule; `rules.py` `load_rules(repo_root) -> tuple[Rule, ...]`, `RuleValidationError(path, reason)`, `Tier`, `Family`, `InputScope` aliases; `style_rules.parse_frontmatter` returns `tier`, `family`, `input_scope`, `mechanism`, `mode` as one-element lists when present; `read_pre_filter` honors only a top-level key. All 22 `candidates:` blocks in nate_style at bc8ca57/a4549af are `partial`. Never push `~/rust/nate_style`.
 
 **Acceptance gate:**
-- `python3 -m unittest discover -s scripts/style -p 'test_*.py'` green; `basedpyright scripts/style` `0 errors, 0 warnings`; merge gate `--tests-only` green.
-- `~/.claude/scripts/lib/py scripts/style/rules.py list` loads all 53 global rules with no validation error and counts 14/20/10/7/2 by tier; a test builds a temp repo with `docs/<member>/style/` rules and shows `load_rules(repo)` merges them, and that a local rule missing `tier` or `family` is a named error. No writes to `~/rust/cargo-liner`: tagging its 11 local rules is the pilot's bootstrap (Phase 11), through its showrunner.
-- `git -C ~/rust/nate_style log -1 --stat` shows only rule files, and `git -C ~/rust/nate_style status --short` still lists `review-charter.md` and `rust/public-failures-return-named-errors.md` as other sessions' uncommitted work.
+- `python3 -m unittest discover -s scripts/style -p 'test_*.py'` green; `basedpyright scripts/style` `0 errors, 0 warnings`; `~/.claude/scripts/lib/py scripts/production/merge_gate.py --tests-only` green.
+- Against nate_style as the Mac has it: `git -C ~/rust/nate_style archive origin/main rust | tar -x -C <tmp>` then `rules.py list` with `NATE_STYLE_DIR` pointed at `<tmp>` (a test may patch it) exits 0 and lists every rule as unclassified; `style_history.py enumerate-candidates` for a generator rule from that tree prints its candidates.
+- `~/.claude/scripts/lib/py scripts/style/rules.py list` on the current tree still counts 53 rules, 14/20/10/7/2.
 
-### Phase 3 — Coverage ledger: judgments, cells and the tier A lint record  · status: todo
-**Depends on:** Phase 2
+### Phase 4 — Coverage ledger: judgments, cells and the tier A lint record  · status: todo
+**Depends on:** Phase 2, Phase 3
 
 #### Work Order
 
@@ -191,7 +196,7 @@ Mapping (style-unit's choice, 2026-10-16): the proposal's Phases 1-3 are this pl
   An `exception` row is a row like any other, so it expires when its inputs change. `held` and `waived` verdicts count as current while their fingerprint matches; the report shows held separately.
 - **Tier B rule with `surface: whole`:** a generator run that lists no site in a file records `clean` for that file. With `surface: partial`, the file still needs its tier-C read: model the read as the pseudo-rule `<rule>#uncovered`, a tier C cell in the same family.
 - **Tier A lint record:** table `lint_runs`: `tip`, `tree` (the tip's root tree hash), `tool` (`clippy` | `mend` | `rustfmt`), `scope` (workspace), `config_hash` (sha256 of the lint config files the tool reads: `clippy.toml`/`.clippy.toml`, the workspace `[lints]` tables, `rustfmt.toml`, mend's config; hash what exists), `passed`, `diagnostics_json` (file → count). A tier-A cell is current only when a `lint_runs` row for its tool exists at the synced tip's tree with the current config hash and lists no diagnostic in that file; otherwise `stale` (or `open` if no run exists). Tier A rule → tool by its `mechanism`.
-- **Synced tip:** table `sync` holds the current synced branch-point tip per repo (`set-tip` writes it; Phase 4 adds processed-tip bookkeeping).
+- **Synced tip:** table `sync` holds the current synced branch-point tip per repo (`set-tip` writes it; Phase 5 adds processed-tip bookkeeping).
 - CLI (`argparse`, every write idempotent on its natural key):
   - `style_ledger.py record --repo R --rule N --path P --commit C --verdict V [--detail D] --ticket T --worker W` — computes scope and fingerprint itself from `rules.load_rules`.
   - `style_ledger.py lint-record --repo R --tip C --tool T --passed 0|1 --diagnostics FILE.json` — computes tree and config hash.
@@ -215,15 +220,15 @@ Mapping (style-unit's choice, 2026-10-16): the proposal's Phases 1-3 are this pl
 - `python3 -m unittest discover -s scripts/style -p 'test_*.py'` green; `basedpyright scripts/style` `0 errors, 0 warnings`; merge gate `--tests-only` green.
 - `style_ledger.py set-tip --repo cargo-liner --tip $(git -C ~/rust/cargo-liner rev-parse main)` then `status --repo cargo-liner` prints every rule with all cells `open`, in under 10 s.
 
-### Phase 4 — Ledger work state: tickets, hand-offs, processed tips, reconcile  · status: todo
-**Depends on:** Phase 3
+### Phase 5 — Ledger work state: tickets, hand-offs, processed tips, reconcile  · status: todo
+**Depends on:** Phase 4
 
 #### Work Order
 
 **Goal:** the ledger also holds tickets, hand-offs and processed tips with idempotent transitions, and `reconcile` makes them agree with git after any restart.
 
 **Spec:**
-- Tables in the Phase 3 ledger (schema version +1):
+- Tables in the Phase 4 ledger (schema version +1):
   - `tickets`: `id` (`<unit>-<n>`), `unit`, `kind` (`read` | `listed` | `structure`), `family`, `rule` (listed only), `crate`, `files` (JSON list), `sites` (JSON, listed only), `state` (`queued` → `assigned` → `checkpointed` → `merged`; any non-final → `dropped`), `checkpoint` (commit), `created_at`, `updated_at`.
   - `handoffs`: `checkpoint` (style merge branch commit, primary key), `state` (`pending` → `sent` → `merged`), `merge_commit`, `sent_to` (parent slug), `created_at`, `updated_at`.
   - `processed_tips`: `tip`, `processed_at`.
@@ -238,8 +243,8 @@ Mapping (style-unit's choice, 2026-10-16): the proposal's Phases 1-3 are this pl
   - a `checkpointed` ticket becomes `merged` when `S` contains its checkpoint;
   - an `assigned` ticket whose unit branch no longer exists is `dropped`;
   - prints every change it made.
-- `merge` on a hand-off is accepted only after the same ancestry check (the acknowledgment message in Phase 8 calls it).
-- `style_ledger.py summary --repo R --json` — the dailies object fields (Phase 9 consumes): `rules_done`, `rules_total`, `cells_current_pct`, `stale`, `proposals` (count of `held` cells' distinct issues), `waiting_to_merge_back` (hand-offs not `merged`), `oldest_waiting` (UTC ISO or null), `synced_at`, `synced_tip`. A rule is done when every in-scope cell at the synced tip is `current` (held and waived count).
+- `merge` on a hand-off is accepted only after the same ancestry check (the acknowledgment message in Phase 9 calls it).
+- `style_ledger.py summary --repo R --json` — the dailies object fields (Phase 10 consumes): `rules_done`, `rules_total`, `cells_current_pct`, `stale`, `proposals` (count of `held` cells' distinct issues), `waiting_to_merge_back` (hand-offs not `merged`), `oldest_waiting` (UTC ISO or null), `synced_at`, `synced_tip`. A rule is done when every in-scope cell at the synced tip is `current` (held and waived count).
 - Tests in `scripts/style/test_style_ledger.py` (extend): each transition, repeats, rejects; reconcile against a temp repo with a merged and an unmerged hand-off; `ticket open` after an interruption returns the assigned ticket; `summary` keys.
 
 **Files:**
@@ -250,14 +255,14 @@ Mapping (style-unit's choice, 2026-10-16): the proposal's Phases 1-3 are this pl
 - `impl` — `scripts/style/style_ledger.py`
 - `test` — the new cases in `scripts/style/test_style_ledger.py`
 
-**Constraints from prior phases:** Phase 3: ledger at `~/.local/state/style/<repo>/ledger.sqlite` written only by `scripts/style/style_ledger.py`; schema version table; cell states `current`/`stale`/`open`/`awaiting merge`; `sync` table with `set-tip`; `open_ledger(repo)`, `Ledger.cells(...)`; tier A via `lint_runs`.
+**Constraints from prior phases:** Phase 4: ledger at `~/.local/state/style/<repo>/ledger.sqlite` written only by `scripts/style/style_ledger.py`; schema version table; cell states `current`/`stale`/`open`/`awaiting merge`; `sync` table with `set-tip`; `open_ledger(repo)`, `Ledger.cells(...)`; tier A via `lint_runs`.
 
 **Acceptance gate:**
 - `python3 -m unittest discover -s scripts/style -p 'test_*.py'` green; `basedpyright scripts/style` `0 errors, 0 warnings`; merge gate `--tests-only` green.
-- On the Phase 3 cargo-liner ledger: `summary --repo cargo-liner --json` prints all keys; `reconcile` on an empty work state prints no change.
+- On the Phase 4 cargo-liner ledger: `summary --repo cargo-liner --json` prints all keys; `reconcile` on an empty work state prints no change.
 
-### Phase 5 — Style production bootstrap: instruction doc, format fields and /showrunner:add_style  · status: todo
-**Depends on:** Phase 4
+### Phase 6 — Style production bootstrap: instruction doc, format fields and /showrunner:add_style  · status: todo
+**Depends on:** Phase 5
 
 #### Work Order
 
@@ -267,25 +272,25 @@ Mapping (style-unit's choice, 2026-10-16): the proposal's Phases 1-3 are this pl
 - `docs/production_format.md` (Production Context fields :84-117): add after `Merge branch` (:90):
   - `**Kind:** style` — optional; absent means a product production. A style production reads `docs/style_production.md`.
   - `**Branch point:** <branch>` — style productions only: the parent's merge branch the style branch syncs from and hands back to.
-  - `**Parent production:** <path to parent production doc>` — style productions only: where hand-offs go, and the doc a root style showrunner merges through (Phase 8).
+  - `**Parent production:** <path to parent production doc>` — style productions only: where hand-offs go, and the doc a root style showrunner merges through (Phase 9).
   and note that `**Proposals:**` (:114) is required for a style production (held changes are filed there).
-- `docs/delegate_plan_format.md` (header fields :29-45): add the optional header `> **Standing:** style_plan.py` — a standing plan never closes its run; `<NextPhase/>` refills it (Phase 7). A standing plan is git-excluded: the ledger is its record, so checkpoint and shrink never commit it.
+- `docs/delegate_plan_format.md` (header fields :29-45): add the optional header `> **Standing:** style_plan.py` — a standing plan never closes its run; `<NextPhase/>` refills it (Phase 8). A standing plan is git-excluded: the ledger is its record, so checkpoint and shrink never commit it.
 - `commands/showrunner/produce.md`: after it reads `production_format.md` (:17), one conditional: when `PRODUCTION_DOC` carries `**Kind:** style`, read `~/.claude/docs/style_production.md` and follow it wherever it differs from this file.
 - New `docs/style_production.md` (the instruction document; rules stay in `~/rust/nate_style`). Sections:
   - **Tiers** — the A-E table (A: lint run per synced tip; B: generator sites judged by a worker, the uncovered surface read as C; C: a worker reads the file; D: once per crate; E: governs how fixes are made, not swept).
   - **Families** — the four units and their rules (as in `rules.py list`); one unit director per family applies an exception decided in one crate the same way in every crate.
   - **Ticket queue** — one ticket per phase; read ticket = (family, one slice of about 5,000 lines in one module subtree, 10-25 files); listed ticket = (rule, crate) with its sites, split above about 150; structure ticket = one crate. Tier D first. A repair phase always comes before a new ticket. After an interruption the unit director resumes its open ticket (`style_ledger.py ticket open`), never takes a second one. Backlog clears cargo-liner before hana.
   - **Ledger** — cell states, what makes a cell stale, verdicts.
-  - **Sync** — the five steps on a sync message (Phase 7 fills the command lines).
-  - **Merging back** — the style showrunner merges each unit checkpoint into the style merge branch as soon as it arrives (that clears berth protection), then sends the hand-off (Phase 8 fills the contract).
+  - **Sync** — the five steps on a sync message (Phase 8 fills the command lines).
+  - **Merging back** — the style showrunner merges each unit checkpoint into the style merge branch as soon as it arrives (that clears berth protection), then sends the hand-off (Phase 9 fills the contract).
   - **Yielding** — selection skips any file reserved on the board, changed on a live unit's unmerged branch, or dirty in its worktree; a merge conflict on a style ticket drops every finding touching that file with all its edits in other files, releases reservations no remaining finding touches, reruns the gate; product work always wins. Style units obey build holds and memory admission like any unit.
-  - **Big changes** — the mechanical criteria (Phase 6) and the proposal path (Phase 10).
-  - **Report** — `/showrunner:style_report` (Phase 9).
-  - **Lifetime** — standing; while a root it merges its own hand-offs (Phase 8); a parent's wrap detaches it (Phase 10).
+  - **Big changes** — the mechanical criteria (Phase 7) and the proposal path (Phase 11).
+  - **Report** — `/showrunner:style_report` (Phase 10).
+  - **Lifetime** — standing; while a root it merges its own hand-offs (Phase 9); a parent's wrap detaches it (Phase 11).
   Later phases append their command lines to these sections.
 - New `scripts/style/add_style.py` and `commands/showrunner/add_style.md`. Run by a repo's main showrunner from its checkout:
   1. Reads the caller's production doc (`add_unit.read_production`, `production_field`): repository, merge branch (the branch point), `**Proposals:**` (refuse with a one-line message naming the field if absent), slug.
-  2. Looks for a standing style production for (repo, branch point): `<repo main checkout>/../<repo>-style` checkout holding `docs/<repo>-style-production.md` with the same `**Branch point:**`. If found: `showrunners.py attach <repo>-style <caller slug>`, rewrites its `**Parent production:**` and `**Proposals:**` to the caller's, and re-sends every `style_ledger.py handoff pending` hand-off to the caller (Phase 8 message form; until Phase 8 lands, print them). Stops there. A main showrunner on a different branch point starts a separate style production for that branch (slug `<repo>-style-<branch point with / as ->`).
+  2. Looks for a standing style production for (repo, branch point): `<repo main checkout>/../<repo>-style` checkout holding `docs/<repo>-style-production.md` with the same `**Branch point:**`. If found: `showrunners.py attach <repo>-style <caller slug>`, rewrites its `**Parent production:**` and `**Proposals:**` to the caller's, and re-sends every `style_ledger.py handoff pending` hand-off to the caller (Phase 9 message form; until Phase 9 lands, print them). Stops there. A main showrunner on a different branch point starts a separate style production for that branch (slug `<repo>-style-<branch point with / as ->`).
   3. Otherwise creates the style merge branch `style/<branch point with / as ->` (`style/main`, `style/init-catalyst`) from the branch point tip, and the showrunner checkout as a git worktree at `<parent dir of the repo checkout>/<repo>-style` on that branch.
   4. Writes `docs/<repo>-style-production.md` in that checkout from a template in `add_style.py`: title `# Production — <repo>-style`, status running, Production Context (`**Kind:** style`, `**Repository:**`, `**Merge branch:** style/...`, `**Branch point:**`, `**Parent production:**`, `**Showrunner checkout:**`, `**Log:** docs/<repo>-style-log.md`, `**Proposals:**`, `**Updates:** on demand`, `**Push:** git`, `**Merge tests:**` copied from the parent), a `## Units` table with the four units (`names-unit`, `values-unit`, `types-unit`, `modules-unit`), each Owns `none — takes what the board leaves free`, plans `docs/style/<unit>.md`.
   5. Writes each unit's standing plan `docs/style/<unit>.md`: title, `> **Production: <repo>-style** — unit ...`, `> **Standing:** style_plan.py`, a Delegation Context naming the repo, its `verify.sh` lines, the family's rules and the yield and mechanical rules (pointing at `docs/style_production.md`), and no phases (the refill writes them).
@@ -309,15 +314,15 @@ Mapping (style-unit's choice, 2026-10-16): the proposal's Phases 1-3 are this pl
 - `impl` — `scripts/style/add_style.py`, `scripts/style/test_add_style.py`, `commands/showrunner/add_style.md`; hub: `pyrightconfig.json`
 - `test` (opens as impl) — `docs/production_format.md`, `docs/delegate_plan_format.md`, `commands/showrunner/produce.md`, `docs/style_production.md`
 
-**Constraints from prior phases:** Phase 2: `rules.py list` gives each family's rules. Phase 3: `style_ledger.py set-tip --repo R --tip C`. Phase 4: `style_ledger.py handoff pending --repo R`, `ticket open --repo R --unit U`, `reconcile`. `add_showrunner.py --production <doc>` attaches the child under the caller; `add_unit.read_production` needs Merge branch, Showrunner checkout, relative Log, a `## Units` line and a `-production.md` name. `add_unit.py` sets each unit's berth target to the production's merge branch (`style/...`) when `.claude/config/berth.toml` exists.
+**Constraints from prior phases:** Phase 2: `rules.py list` gives each family's rules. Phase 4: `style_ledger.py set-tip --repo R --tip C`. Phase 5: `style_ledger.py handoff pending --repo R`, `ticket open --repo R --unit U`, `reconcile`. `add_showrunner.py --production <doc>` attaches the child under the caller; `add_unit.read_production` needs Merge branch, Showrunner checkout, relative Log, a `## Units` line and a `-production.md` name. `add_unit.py` sets each unit's berth target to the production's merge branch (`style/...`) when `.claude/config/berth.toml` exists.
 
 **Acceptance gate:**
 - `python3 -m unittest discover -s scripts/style -p 'test_*.py'` and `-s scripts/production` green; `basedpyright scripts/style` `0 errors, 0 warnings`; merge gate `--tests-only` green.
 - `add_style.py --check` from `/home/natepiano/rust/cargo-liner` with the remove-running-section doc prints the seven steps and refuses on the missing `**Proposals:**` line.
 - `git grep -n 'Kind:\*\* style' docs/production_format.md commands/showrunner/produce.md` finds both.
 
-### Phase 6 — Ticket selection and the mechanical-fix filter  · status: todo
-**Depends on:** Phase 2, Phase 4
+### Phase 7 — Ticket selection and the mechanical-fix filter  · status: todo
+**Depends on:** Phase 2, Phase 5
 
 #### Work Order
 
@@ -329,9 +334,9 @@ Mapping (style-unit's choice, 2026-10-16): the proposal's Phases 1-3 are this pl
   - **Busy files** for a repo: every path a blocking reservation covers (`berth_board`), every path changed on a live unit's unmerged branch (`git diff --name-only <merge branch>...<unit branch>` for each Units row of the parent production and of the style production, from `scripts/production/live_units.py` or the production doc's Units table), and every dirty path in those units' worktrees (`git status --porcelain`). Style units' own open tickets count as busy for other style units.
   - **Slices:** group in-scope `.rs` files by module subtree (directory under each crate's `src/`), walk depth-first, and cut slices of about 5,000 lines and 10-25 files without splitting a directory unless it alone exceeds the bound. Deterministic for a given tip.
   - **Ticket kinds:** `structure` — one crate, family `modules`, all its tier D rules; `listed` — (rule, crate) with its generator sites from `candidate_generators.enumerate_candidates`, split into tickets of at most 150 sites (the cap moved here from the generator); `read` — (family, slice), covering the family's tier C rules and `#uncovered` pseudo-rules. A ticket covers only cells that are `open` or `stale`.
-  - **Order** for one unit: its open ticket first (`style_ledger.py ticket open`; resume, never a second); then `modules` structure tickets before any other family's work in that crate (tier D first); then the crate with the most stale cells; cargo-liner's backlog clears before hana's (by scheduling: only one repo per style production, so this is the roll-out order in Phase 13).
+  - **Order** for one unit: its open ticket first (`style_ledger.py ticket open`; resume, never a second); then `modules` structure tickets before any other family's work in that crate (tier D first); then the crate with the most stale cells; cargo-liner's backlog clears before hana's (by scheduling: only one repo per style production, so this is the roll-out order in Phase 14).
   - A candidate ticket loses every file that is busy; a ticket left with no files is skipped. For a listed ticket, a busy file drops its sites.
-  - `style_plan.py next-phase --unit U --plan <path> --repo R`: if a repair phase is todo in the plan, prints `repair first` and exits 0 without writing. Else removes the plan's `done` ticket phase (the ledger holds the record), picks the next ticket, records it `queued` then `assigned`, and appends `### Phase <n> — <ticket id>  · status: todo` with a Work Order: Goal (the rules and files), Spec (each rule's file path in `~/rust/nate_style/rust/` or the repo-local dir; for listed tickets the sites; the yield rule; the mechanical rule and that non-mechanical findings are recorded `held` for Phase 10's filing; record every judged cell with `style_ledger.py record`), Files (the ticket's files), Workers (`2 writers` splitting files by subtree when over 12 files, else `1 writer + 1 tester` with the tester opening as impl and re-reading the diff against the rules), Acceptance gate (the repo's `verify.sh check/test/lint` for each touched package, `style_footprint.py check`, and every ticket cell recorded). If no ticket is available, prints `waiting for sync` and exits 3, writing nothing.
+  - `style_plan.py next-phase --unit U --plan <path> --repo R`: if a repair phase is todo in the plan, prints `repair first` and exits 0 without writing. Else removes the plan's `done` ticket phase (the ledger holds the record), picks the next ticket, records it `queued` then `assigned`, and appends `### Phase <n> — <ticket id>  · status: todo` with a Work Order: Goal (the rules and files), Spec (each rule's file path in `~/rust/nate_style/rust/` or the repo-local dir; for listed tickets the sites; the yield rule; the mechanical rule and that non-mechanical findings are recorded `held` for Phase 11's filing; record every judged cell with `style_ledger.py record`), Files (the ticket's files), Workers (`2 writers` splitting files by subtree when over 12 files, else `1 writer + 1 tester` with the tester opening as impl and re-reading the diff against the rules), Acceptance gate (the repo's `verify.sh check/test/lint` for each touched package, `style_footprint.py check`, and every ticket cell recorded). If no ticket is available, prints `waiting for sync` and exits 3, writing nothing.
   - `style_plan.py queue --repo R [--unit U]` prints the tickets it would make, in order, with file counts (read only).
 - New `scripts/style/style_footprint.py`: `style_footprint.py check --repo R --base B --head H [--finding-map FILE.json]`. A finding is **mechanical** when all hold (design, section 7, verbatim):
   1. no file is added, deleted, renamed or moved, and no `mod` line changes;
@@ -355,14 +360,14 @@ Mapping (style-unit's choice, 2026-10-16): the proposal's Phases 1-3 are this pl
 - `impl` — `scripts/lib/berth_board.py`, `scripts/lib/test_berth_board.py`, `scripts/style/style_plan.py`, `scripts/style/test_style_plan.py`; hub: `docs/style_production.md`
 - `test` (opens as impl) — `scripts/style/style_footprint.py`, `scripts/style/test_style_footprint.py`; sends its command line to `impl` for the doc
 
-**Constraints from prior phases:** Phase 1: `enumerate_candidates` has no cap. Phase 2: `rules.load_rules` (tier, family, input scope, surface; `#uncovered` pseudo-rules are tier C in the same family per Phase 3). Phase 3: `Ledger.cells(rule, crate)` with states; `style_ledger.py record`. Phase 4: `style_ledger.py ticket add|assign|checkpoint|merge|drop|open`. Phase 5: unit plans at `docs/style/<unit>.md` carry `> **Standing:** style_plan.py` and are git-excluded; `docs/style_production.md` exists with the sections named there; the style production doc lists four units and its parent in `**Parent production:**`.
+**Constraints from prior phases:** Phase 1: `enumerate_candidates` has no cap. Phase 2: `rules.load_rules` (tier, family, input scope, surface; `#uncovered` pseudo-rules are tier C in the same family per Phase 4). Phase 4: `Ledger.cells(rule, crate)` with states; `style_ledger.py record`. Phase 5: `style_ledger.py ticket add|assign|checkpoint|merge|drop|open`. Phase 6: unit plans at `docs/style/<unit>.md` carry `> **Standing:** style_plan.py` and are git-excluded; `docs/style_production.md` exists with the sections named there; the style production doc lists four units and its parent in `**Parent production:**`.
 
 **Acceptance gate:**
 - `python3 -m unittest discover -s scripts/style -p 'test_*.py'` and `-s scripts/lib` green; `basedpyright scripts/style scripts/lib` `0 errors, 0 warnings`; merge gate `--tests-only` green.
 - `style_plan.py queue --repo cargo-liner` against the real board prints structure tickets first and no file the live board reserves.
 
-### Phase 7 — Standing-plan refill in /unit:direct and the sync trigger  · status: todo
-**Depends on:** Phase 5, Phase 6
+### Phase 8 — Standing-plan refill in /unit:direct and the sync trigger  · status: todo
+**Depends on:** Phase 6, Phase 7
 
 #### Work Order
 
@@ -404,14 +409,14 @@ Mapping (style-unit's choice, 2026-10-16): the proposal's Phases 1-3 are this pl
 - `impl` — `scripts/style/style_sync.py`, `scripts/style/test_style_sync.py`, `scripts/style/add_style.py`, `scripts/production/merge_checkpoint.py`, `test_merge_checkpoint.py`, `scripts/production/merge_gate.py`, `test_merge_gate.py`, `scripts/delegate/verify.sh`
 - `test` (opens as impl) — `commands/unit/direct.md`, `docs/delegate/phase_end.md`; hub: `docs/style_production.md`
 
-**Constraints from prior phases:** Phase 4: `style_ledger.py tip seen|done`, `ticket open|checkpoint`, `lint-record` (Phase 3), `set-tip`, `status`. Phase 5: standing plans carry `> **Standing:** style_plan.py`, live at `docs/style/<unit>.md`, git-excluded; `add_style.py` holds the lookup of a standing style production by (repo, branch point); `docs/style_production.md` has a Sync section to fill. Phase 6: `style_plan.py next-phase --unit U --plan P --repo R` exits 0 (phase written, or `repair first`) or 3 (`waiting for sync`).
+**Constraints from prior phases:** Phase 5: `style_ledger.py tip seen|done`, `ticket open|checkpoint`, `lint-record` (Phase 4), `set-tip`, `status`. Phase 6: standing plans carry `> **Standing:** style_plan.py`, live at `docs/style/<unit>.md`, git-excluded; `add_style.py` holds the lookup of a standing style production by (repo, branch point); `docs/style_production.md` has a Sync section to fill. Phase 7: `style_plan.py next-phase --unit U --plan P --repo R` exits 0 (phase written, or `repair first`) or 3 (`waiting for sync`).
 
 **Acceptance gate:**
 - `python3 -m unittest discover -s scripts/style -p 'test_*.py'` and `-s scripts/production` green; `basedpyright scripts/style scripts/production` `0 errors, 0 warnings`; merge gate `--tests-only` green.
 - `style_sync.py notify --repo-dir ~/rust/cargo-liner --branch main --tip HEAD` exits 0 and sends nothing (no style production yet).
 
-### Phase 8 — Child hand-off contract  · status: todo
-**Depends on:** Phase 4, Phase 5
+### Phase 9 — Child hand-off contract  · status: todo
+**Depends on:** Phase 5, Phase 6
 
 #### Work Order
 
@@ -423,11 +428,11 @@ Mapping (style-unit's choice, 2026-10-16): the proposal's Phases 1-3 are this pl
   - Checks, each refusal one line: the child is attached under this production (`showrunners.py` `parent_of(child) == parent slug`), or the child itself is running it as a root (`parent_of(child)` is empty and the caller passes `--root-self`); the hash is on the child's merge branch (read from the child's production doc, found through `showrunners.py` and the child's `**Showrunner checkout:**`); it descends from the child's last merged hand-off.
   - Fixed metadata: phase `style hand-off`, no review trial, `--delivers`/`--parallel` not asked.
   - Merge subject `Merge <child slug> hand-off (<hash7>) into <branch point>`. Extend `merge_branch_history` (:333, regex :336) with a second pattern `^Merge (.+?) hand-off \(([0-9a-f]+)\)` so the last merged hand-off is read from merge history like a unit's checkpoint; existing unit entries parse unchanged.
-  - Push as the production pushes today (`push_git` or `push_validate`), then the Phase 7 `style_sync.py notify` call, then an acknowledgment: `send.py --to $(showrunners.py address <child>) --text 'From the showrunner of <parent slug>: hand-off <hash7> merged as <merge7>.'`.
+  - Push as the production pushes today (`push_git` or `push_validate`), then the Phase 8 `style_sync.py notify` call, then an acknowledgment: `send.py --to $(showrunners.py address <child>) --text 'From the showrunner of <parent slug>: hand-off <hash7> merged as <merge7>.'`.
 - `commands/showrunner/produce.md`: replace "A child showrunner is never a unit. It has no Units row, and you never merge its branch" (:114-115) with that rule plus one exception: a style child in the same repo (`**Kind:** style`) hands its merge branch off through `merge_checkpoint.py --from-child`, and every hand-off gets a correctness review (the same review a unit checkpoint gets, on the hand-off's diff against the branch point) before the merge. The parent merges on receipt of `From the showrunner of <style slug>: hand-off <hash>`.
 - Append to `docs/style_production.md` **Merging back**:
   - after merging a unit checkpoint into the style merge branch, the style showrunner runs `style_ledger.py handoff add --checkpoint <style branch tip>` and sends `From the showrunner of <style slug>: hand-off <hash>` to `showrunners.py address <parent>`, then `handoff send`. Style work never waits for a sync to go home.
-  - on the acknowledgment: `style_ledger.py handoff merged --checkpoint <hash> --merge-commit <m>`, which accepts only after the ancestry check (Phase 4).
+  - on the acknowledgment: `style_ledger.py handoff merged --checkpoint <hash> --merge-commit <m>`, which accepts only after the ancestry check (Phase 5).
   - while a root (no parent): merge its own hand-offs into the branch point with `merge_checkpoint.py --from-child <own slug> --root-self --production <the doc in **Parent production:**>`; no other production writes that branch then. Hand-offs a departing parent had not merged stay pending in the ledger and are merged this way.
   - at startup: `style_ledger.py reconcile`, then resend every `sent` hand-off whose parent changed.
 - Tests in `scripts/production/test_merge_checkpoint.py`: an attached child's hand-off merges with the new subject and acknowledges; an unattached child is refused; a hash off the child's branch is refused; a non-descending hash is refused; `--root-self` with no parent merges; `merge_branch_history` reads both entry kinds.
@@ -442,14 +447,14 @@ Mapping (style-unit's choice, 2026-10-16): the proposal's Phases 1-3 are this pl
 - `impl` — `scripts/production/merge_checkpoint.py`, `commands/showrunner/produce.md`, `docs/style_production.md`
 - `test` — the new cases in `scripts/production/test_merge_checkpoint.py`
 
-**Constraints from prior phases:** Phase 4: `style_ledger.py handoff add|send|merged|pending`, `reconcile` (merged only by ancestry). Phase 5: style docs carry `**Kind:** style`, `**Branch point:**`, `**Parent production:**`, `**Showrunner checkout:**`; `add_style.py` re-sends pending hand-offs on re-attach in the message form above. Phase 7: `merge_checkpoint.py run` calls `style_sync.py notify` after its push; the hand-off path reuses that call.
+**Constraints from prior phases:** Phase 5: `style_ledger.py handoff add|send|merged|pending`, `reconcile` (merged only by ancestry). Phase 6: style docs carry `**Kind:** style`, `**Branch point:**`, `**Parent production:**`, `**Showrunner checkout:**`; `add_style.py` re-sends pending hand-offs on re-attach in the message form above. Phase 8: `merge_checkpoint.py run` calls `style_sync.py notify` after its push; the hand-off path reuses that call.
 
 **Acceptance gate:**
 - `python3 -m unittest discover -s scripts/production -p 'test_*.py'` green; `basedpyright scripts/production` `0 errors, 0 warnings`; merge gate `--tests-only` green.
 - `merge_checkpoint.py --from-child nobody --checkpoint HEAD --production docs/plans/build-followups-production.md --started now` is refused with the not-attached line.
 
-### Phase 9 — Style report and the dailies style line  · status: todo
-**Depends on:** Phase 4, Phase 5
+### Phase 10 — Style report and the dailies style line  · status: todo
+**Depends on:** Phase 5, Phase 6
 
 #### Work Order
 
@@ -475,7 +480,7 @@ Mapping (style-unit's choice, 2026-10-16): the proposal's Phases 1-3 are this pl
   A rule is done when every in-scope file at the synced tip is current for it; new files make it not done again until their tickets land. Rules counted exclude tier E. "Since last report" compares with a snapshot the command saves under `~/.local/state/style/<repo>/last_report.json`. `--rule` prints that one row plus its open tickets; `--crate` prints the same table for one crate plus the oldest open ticket.
 - New `commands/showrunner/style_report.md`: run in the style showrunner or any showrunner above it; resolves the repo from the style production (below the caller via `showrunners.py children`, or the caller itself) and prints `style_ledger.py report`.
 - Dailies (`dailies_render.py:731` `parse_child_report` → `check_keys` :734 rejects unknown keys; `last_report()` :1806 is pure; saving is `dailies_input.py` `save_last_report` :784, called :1069):
-  - the saved report gains an optional `style` object: `rules_done`, `rules_total`, `cells_current_pct`, `stale`, `proposals`, `waiting_to_merge_back`, `oldest_waiting`, `synced_at` (the `style_ledger.py summary` keys, Phase 4);
+  - the saved report gains an optional `style` object: `rules_done`, `rules_total`, `cells_current_pct`, `stale`, `proposals`, `waiting_to_merge_back`, `oldest_waiting`, `synced_at` (the `style_ledger.py summary` keys, Phase 5);
   - `dailies_input.py` fills it when the production doc carries `**Kind:** style`, from `style_ledger.py summary --repo R --json`;
   - `parse_child_report` accepts `style` as an optional key (add it to `ChildReport` :395 as `StyleSummary | None`), and a report without it parses as today;
   - `child_row` (:1690) prints it under the child's row: `hana-style  rules done 21/51 · cells 62% · stale 1,402 · proposals 3 · synced 14:05`. A hand-off waiting over 4 hours adds ` · hand-off waiting <h>h` as a flag.
@@ -494,14 +499,14 @@ Mapping (style-unit's choice, 2026-10-16): the proposal's Phases 1-3 are this pl
 - `impl` — `scripts/style/style_ledger.py`, `scripts/style/test_style_ledger.py`, `commands/showrunner/style_report.md`; hub: `docs/style_production.md`
 - `test` (opens as impl) — `scripts/production/dailies_render.py`, `test_dailies_render.py`, `dailies_input.py`, `test_dailies_input.py`
 
-**Constraints from prior phases:** Phase 3: cell states and `lint_runs`. Phase 4: `style_ledger.py summary --repo R --json` keys `rules_done`, `rules_total`, `cells_current_pct`, `stale`, `proposals`, `waiting_to_merge_back`, `oldest_waiting`, `synced_at`, `synced_tip`; hand-off states. Phase 5: style docs carry `**Kind:** style` and live in `<repo>-style` checkouts found through `showrunners.py`.
+**Constraints from prior phases:** Phase 4: cell states and `lint_runs`. Phase 5: `style_ledger.py summary --repo R --json` keys `rules_done`, `rules_total`, `cells_current_pct`, `stale`, `proposals`, `waiting_to_merge_back`, `oldest_waiting`, `synced_at`, `synced_tip`; hand-off states. Phase 6: style docs carry `**Kind:** style` and live in `<repo>-style` checkouts found through `showrunners.py`.
 
 **Acceptance gate:**
 - `python3 -m unittest discover -s scripts/style -p 'test_*.py'` and `-s scripts/production` green; `basedpyright scripts/style scripts/production` `0 errors, 0 warnings`; merge gate `--tests-only` green.
-- `style_ledger.py report --repo cargo-liner` on the Phase 3 ledger prints the header and one row per rule.
+- `style_ledger.py report --repo cargo-liner` on the Phase 4 ledger prints the header and one row per rule.
 
-### Phase 10 — Proposal batching and wrap detaching a style child  · status: todo
-**Depends on:** Phase 3, Phase 5, Phase 6, Phase 9
+### Phase 11 — Proposal batching and wrap detaching a style child  · status: todo
+**Depends on:** Phase 4, Phase 6, Phase 7, Phase 10
 
 #### Work Order
 
@@ -509,12 +514,12 @@ Mapping (style-unit's choice, 2026-10-16): the proposal's Phases 1-3 are this pl
 
 **Spec:**
 - New `scripts/style/style_proposals.py file --repo R --proposals <dir> --parent <slug>`: groups `held` cells with no issue yet into batches — one issue per (rule, crate) for renames and type changes, one per crate for a restructure (every tier D finding and every `mode: propose` rule's finding goes this way) — and writes each as a hanadocs issue through `scripts/production/proposal_issue.py` (read its CLI; tags `proposal` and `style`), with: the sites, before and after for each, the live units holding those files (from `style_plan`'s busy-file lookup), and a recommended answer. Then sets each cell's verdict detail to the issue path (`style_ledger.py record ... --verdict held --detail <issue>`).
-  - Held findings come from workers: the unit's ticket Work Order (Phase 6) records a non-mechanical finding as `held` with a JSON detail (site, before, after, kind `rename|type|restructure`); `file` reads those.
-  - **Asked** the way proposals already are, never unasked: the count shows in the report and the dailies line (Phase 9), `/showrunner:proposals` lists them (confirm `proposals_table.py` picks up the `style` tag; add it if the table filters by tag), `/adhoc_review` walks them.
+  - Held findings come from workers: the unit's ticket Work Order (Phase 7) records a non-mechanical finding as `held` with a JSON detail (site, before, after, kind `rename|type|restructure`); `file` reads those.
+  - **Asked** the way proposals already are, never unasked: the count shows in the report and the dailies line (Phase 10), `/showrunner:proposals` lists them (confirm `proposals_table.py` picks up the `style` tag; add it if the table filters by tag), `/adhoc_review` walks them.
   - **Approved:** built as a style phase — `style_plan.py` gains a `proposal` ticket kind that turns an approved issue into a ticket; when it moves files a live unit holds, the parent schedules it through `<CrossUnitChange>` (`produce.md` :1070-1093). **Declined:** `style_proposals.py decline --issue <path> --words '<the user's words>'` sets the cells to `waived <words>`; a general reason becomes a repo-local rule through `/local_style`.
 - `scripts/production/production_lifecycle.py`:
   - `refuse_running_children` (:335): a running child whose production doc carries `**Kind:** style` is detached (`showrunners.detach`) and told `<parent> wrapped, so you are a root now: merge your own hand-offs (docs/style_production.md, Merging back).`; any other running child still holds the wrap.
-  - `retire_reservations` (:308) reads the board through `scripts/lib/berth_board.py` (Phase 6) instead of the top-level `reservations` list, which holds ids, not dicts, so today it releases nothing. (style-unit's fix, found while planning this phase; a one-line revert if the showrunner disagrees.)
+  - `retire_reservations` (:308) reads the board through `scripts/lib/berth_board.py` (Phase 7) instead of the top-level `reservations` list, which holds ids, not dicts, so today it releases nothing. (style-unit's fix, found while planning this phase; a one-line revert if the showrunner disagrees.)
 - Append to `docs/style_production.md` **Big changes** and **Lifetime**: the `file` and `decline` commands, when to run `file` (after each ticket checkpoint that recorded held cells), the approved path, and the wrap detach.
 - Tests: `scripts/style/test_style_proposals.py` (batching by kind; issue fields; decline waives; with `proposal_issue.py` stubbed); `scripts/production/test_production_lifecycle.py` (a style child detached and told; a product child still refuses; reservations released from a board fixture).
 
@@ -529,13 +534,13 @@ Mapping (style-unit's choice, 2026-10-16): the proposal's Phases 1-3 are this pl
 - `impl` — `scripts/style/style_proposals.py`, `test_style_proposals.py`, `scripts/style/style_plan.py`, `test_style_plan.py`, `scripts/production/proposals_table.py`; hub: `docs/style_production.md`
 - `test` (opens as impl) — `scripts/production/production_lifecycle.py`, `test_production_lifecycle.py`
 
-**Constraints from prior phases:** Phase 3: verdicts `held`/`waived` with `verdict_detail`; `style_ledger.py record`. Phase 5: style docs carry `**Kind:** style` and `**Proposals:**` (required). Phase 6: `scripts/lib/berth_board.py` (`read_board`, `Board.reservations()`, `Reservation.reservation_id`, `holder_worktree_root`); `style_plan.py` ticket kinds and busy-file lookup. Phase 9: the report and dailies line count proposals.
+**Constraints from prior phases:** Phase 4: verdicts `held`/`waived` with `verdict_detail`; `style_ledger.py record`. Phase 6: style docs carry `**Kind:** style` and `**Proposals:**` (required). Phase 7: `scripts/lib/berth_board.py` (`read_board`, `Board.reservations()`, `Reservation.reservation_id`, `holder_worktree_root`); `style_plan.py` ticket kinds and busy-file lookup. Phase 10: the report and dailies line count proposals.
 
 **Acceptance gate:**
 - `python3 -m unittest discover -s scripts/style -p 'test_*.py'` and `-s scripts/production` green; `basedpyright scripts/style scripts/production` `0 errors, 0 warnings`; merge gate `--tests-only` green.
 
-### Phase 11 — Pilot under cargo-liner's showrunner  · status: todo
-**Depends on:** Phase 7, Phase 8, Phase 9, Phase 10
+### Phase 12 — Pilot under cargo-liner's showrunner  · status: todo
+**Depends on:** Phase 8, Phase 9, Phase 10, Phase 11
 
 #### Work Order
 
@@ -547,7 +552,7 @@ Mapping (style-unit's choice, 2026-10-16): the proposal's Phases 1-3 are this pl
   1b. cargo-liner's 11 local rules (`docs/cargo-mend/style/` 5, `docs/cargo-port/style/` 6) gain `tier` and `family` (and `input_scope` where not `crate`), committed in cargo-liner through its showrunner's normal flow, so `rules.py list --repo ~/rust/cargo-liner` loads them without a validation error;
   2. its showrunner runs `/showrunner:add_style`, which creates `style/main`, the `cargo-liner-style` checkout, doc and four standing plans, and starts the style showrunner attached under it;
   3. the style showrunner launches only `modules-unit` (all crates), `names-unit` (scope limited to crate `cargo-handler`) and `types-unit` (one crate: the one with the largest `style_plan.py queue` candidate count for the types family); `values-unit` stays unlaunched. Scope limits go into each unit plan's Delegation Context as `**Pilot scope:** <crates>`; `style_plan.py next-phase` honors that line (add it in this phase if missing).
-- Measure, all before Phase 12 (design, pass criteria, verbatim):
+- Measure, all before Phase 13 (design, pass criteria, verbatim):
   - **Recall:** on 20 hand-checked files per family, the family pass finds at least 95% of what one-rule passes find. Method: pick 20 files per launched family the pass has checked; rerun each family rule alone on them (one worker per rule, same model); the union of one-rule findings is the denominator.
   - **Hold time:** median claim to clear under 2 hours, none over 6. From cargo-berth: claim time to the time `edit_blocking_status` reads Clear (not to release).
   - **Quiet-branch hand-off:** a style checkpoint reaches `main` within 4 hours with no product merge in between.
@@ -556,7 +561,7 @@ Mapping (style-unit's choice, 2026-10-16): the proposal's Phases 1-3 are this pl
   Also measured for the record: family recall per rule (shrink families if recall drops), which rules proved file-local (candidates for `input_scope: file`), tickets per hour per unit.
 - Report: `docs/plans/build-followups-style-pilot.md` (in this worktree) with one table per criterion, pass or fail, the numbers and their source commands. Send its pass/fail line to the build-followups showrunner.
 - Fixes the pilot shows are needed go into the style scripts in this worktree as their own commits in this phase, each named in the report.
-- If any criterion fails: stop after the report; Phases 12 and 13 stay blocked, and the report names what failed and the proposed change.
+- If any criterion fails: stop after the report; Phases 13 and 14 stay blocked, and the report names what failed and the proposed change.
 
 **Files:**
 - `docs/plans/build-followups-style-pilot.md` — new, the pilot report
@@ -567,15 +572,15 @@ Mapping (style-unit's choice, 2026-10-16): the proposal's Phases 1-3 are this pl
 - `impl` — the bootstrap, hold time, quiet-branch, restart and yielding measurements, `style_plan.py` scope line and its test, and any script fixes
 - `test` (opens as impl) — the recall study (one-rule reruns on the 20-file samples) and its table in `docs/plans/build-followups-style-pilot.md`
 
-**Constraints from prior phases:** Phases 1-10 merged to `~/.claude` main (the production rule: each merged phase goes to main at once), so `/showrunner:add_style`, `/showrunner:style_report`, `style_plan.py`, `style_sync.py`, `merge_checkpoint.py --from-child` and the standing refill in `/unit:direct` are live. Style units' berth target is `style/main` (`add_unit.py:638-642`; cargo-liner has `.claude/config/berth.toml`). cargo-liner pushes through validate_and_push `--quick` (no `**Push:**` line), which skips clippy; tier A comes from `style_sync.py lint`.
+**Constraints from prior phases:** Phases 1-11 merged to `~/.claude` main (the production rule: each merged phase goes to main at once), so `/showrunner:add_style`, `/showrunner:style_report`, `style_plan.py`, `style_sync.py`, `merge_checkpoint.py --from-child` and the standing refill in `/unit:direct` are live. Style units' berth target is `style/main` (`add_unit.py:638-642`; cargo-liner has `.claude/config/berth.toml`). cargo-liner pushes through validate_and_push `--quick` (no `**Push:**` line), which skips clippy; tier A comes from `style_sync.py lint`.
 
 **Acceptance gate:**
 - `docs/plans/build-followups-style-pilot.md` holds a pass or fail with numbers for all five criteria.
 - `/showrunner:style_report` in cargo-liner's showrunner prints the `cargo-liner-style` table; the parent's dailies show its style line.
 - Any script fixed in this phase: its folder's tests green, `basedpyright` clean, merge gate `--tests-only` green.
 
-### Phase 12 — Retire the fix pipeline and narrow the nightly rust mode  · status: todo
-**Depends on:** Phase 11
+### Phase 13 — Retire the fix pipeline and narrow the nightly rust mode  · status: todo
+**Depends on:** Phase 12
 **Blocked by:** pilot pass — every criterion in `docs/plans/build-followups-style-pilot.md` reads pass, and the build-followups showrunner gives the go.
 
 #### Work Order
@@ -611,7 +616,7 @@ Mapping (style-unit's choice, 2026-10-16): the proposal's Phases 1-3 are this pl
 - `impl` — `scripts/fix/`, `scripts/nightly_review/weights.py`, `test_weights.py`, `scripts/make_a_worktree/retarget_fix.py`, `scripts/worktree_delete/perform_deletion.sh`, `scripts/new_rust_project/rust_generate.sh`, `config/agents.conf`, `scripts/cli_agent/cli_agent.sh`, `scripts/whoami/test_quota_alert.py`, `scripts/agents/test_agent_exec.py`, `settings.json`, `scripts/bevy_migration_plan/bevy_migration_ensure_repo.sh`; hub: `pyrightconfig.json`
 - `test` (opens as impl) — `commands/fix.md`, `commands/style_eval.md`, `commands/style_fix_review.md`, `commands/style_usage.md`, `commands/nightly_weights.md`, `commands/nightly_review.md`, `commands/make_a_worktree.md`, `commands/worktree_delete.md`, `commands/lint_config.md`, `CLAUDE.md`, `docs/as-built/fix-pipeline.md`, `docs/plans/fix-pipeline-deferred.md`, `docs/as-built/agent-registry.md`; the nix list message
 
-**Constraints from prior phases:** Phase 1 moved `candidate_generators.py`, `style_admin.py` and the `focused-eval` code to `scripts/style/` (`style_rules.py`) and repointed `/focused_eval`, `/style_rename`, `/style_delete`; `style_history.py` imports from `scripts/style` and has no other kept consumer. Phase 11's pilot report is in `docs/plans/build-followups-style-pilot.md`.
+**Constraints from prior phases:** Phase 1 moved `candidate_generators.py`, `style_admin.py` and the `focused-eval` code to `scripts/style/` (`style_rules.py`) and repointed `/focused_eval`, `/style_rename`, `/style_delete`; `style_history.py` imports from `scripts/style` and has no other kept consumer. Phase 12's pilot report is in `docs/plans/build-followups-style-pilot.md`.
 
 **Acceptance gate:**
 - Merge gate `--tests-only` green (the `agents` and `whoami` suites included); `basedpyright scripts` `0 errors, 0 warnings`.
@@ -619,9 +624,9 @@ Mapping (style-unit's choice, 2026-10-16): the proposal's Phases 1-3 are this pl
 - Each kept command runs once with no missing-path error (recorded in the phase report).
 - The nix list is sent to the showrunner (the rebuild is the user's).
 
-### Phase 13 — Roll-out  · status: todo
-**Depends on:** Phase 11, Phase 12
-**Blocked by:** pilot pass (as Phase 12).
+### Phase 14 — Roll-out  · status: todo
+**Depends on:** Phase 12, Phase 13
+**Blocked by:** pilot pass (as Phase 13).
 
 #### Work Order
 
@@ -640,7 +645,7 @@ Mapping (style-unit's choice, 2026-10-16): the proposal's Phases 1-3 are this pl
 - `impl` — the roll-out steps, the report section and any script fix
 - `test` (opens as impl) — tests for any script fix, beside the module
 
-**Constraints from prior phases:** Phase 11: `cargo-liner-style` runs under `remove-running-section` with three pilot units and `**Pilot scope:**` lines; pilot report in `docs/plans/build-followups-style-pilot.md`. Phase 12: the fix pipeline is gone; `scripts/style/` is the only style tooling.
+**Constraints from prior phases:** Phase 12: `cargo-liner-style` runs under `remove-running-section` with three pilot units and `**Pilot scope:**` lines; pilot report in `docs/plans/build-followups-style-pilot.md`. Phase 13: the fix pipeline is gone; `scripts/style/` is the only style tooling.
 
 **Acceptance gate:**
 - `/showrunner:style_report` for `cargo-liner-style` shows every tier A-D rule done.
