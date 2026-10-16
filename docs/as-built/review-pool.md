@@ -348,7 +348,7 @@ A reason given beside its mechanism above is not repeated here.
 ## History
 
 - **2026-10-10 to 2026-10-13: built as a trial** (`docs/plans/proposal-review-unit.md`, removed once built). Leases were per phase and reset with `thread/revert` at phase end; a hash of unit and phase sent half of the phases to the pool and half to the unit's own workers, and the report compared the two. The four directors asked then (hana, organon, widget, trunk) wanted no queue in front of a review, findings in the unit's own files with triage kept by its director, the guides and rulings kept, and each diff and tree belief forgotten; the user's rule replaced queueing with forking, and the review memory holds what they asked to keep.
-- **2026-10-16: permanent reviewers** (`docs/plans/build-followups-review-pool-permanent.md`). Phase 1 made leases per unit and added `migrate`; Phase 2 removed the arm, the split and the resets, and added `retire` and re-pointing; Phase 3 removed `health`, the director's timer and dailies report, and the report's arm comparison.
+- **2026-10-16: permanent reviewers** (`docs/plans/build-followups-review-pool-permanent.md`, removed once built). Phase 1 made leases per unit and added `migrate`; Phase 2 removed the arm, the split and the resets, and added `retire` and re-pointing; Phase 3 removed `health`, the director's timer and dailies report, and the report's arm comparison.
 
 ## Tests
 
