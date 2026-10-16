@@ -995,7 +995,7 @@ def _herdr_launch(
             raise OSError(f"{reason}. Run: {trust_command(Path(parts.cwd), account)}")
         server = herdr.restore_server(name, 90_000,
             session_kind=herdr.security_session() if isinstance(session_kind, herdr.SessionKindNotRead) else session_kind,
-            attached_window=launches_window(session["host"]), exclusive=isinstance(destination, NewHerdrSession))
+            exclusive=isinstance(destination, NewHerdrSession))
         server_environment = herdr.server_environment(name)
         for variable in sorted(unset_variables):
             if variable in server_environment:
@@ -1790,7 +1790,9 @@ def _print_result(result: MachineRestartResult, *,
     displayed = replace(result, manual_sessions=tuple(item for item in result.manual_sessions
                                                      if item not in already_reported))
     for line in _result_lines(displayed):
-        print(herdr.MAC_DESKTOP_REQUIRED if herdr.MAC_DESKTOP_REQUIRED in line else line)
+        message = next((message for message in (herdr.MAC_DESKTOP_REQUIRED, herdr.MAC_DESKTOP_TERMINAL_REQUIRED)
+                        if message in line), line)
+        print(message)
 
 
 def _prior_progress(record: SessionShutdown) -> SessionProgress:
@@ -2043,7 +2045,7 @@ def _launch_codex_snapshot(
         print(f"herdr {name}: CODEX_HOME={launch['home']} codex {shlex.join(arguments)} in {owner['cwd']}")
         return
     server = herdr.restore_server(name, 90_000, session_kind=state.session_kind,
-                                  attached_window=launches_window(owner["host"]), exclusive=True)
+                                  exclusive=True)
     try:
         pane = herdr.open_pane(name, name, owner["cwd"], {"CODEX_HOME": launch["home"]})
         herdr.start_agent(name, pane, kind="codex", agent_arguments=arguments,
@@ -2130,7 +2132,7 @@ def _up(login: str, dry_run: bool, only: Iterable[str] = (), *,
     choices = _restore_choices(all_session_records(), snapshots)
     recovery_failures: list[FailedSessionRestart] = []
     sources: dict[str, RecoverySnapshot] = {}
-    recorded_ids = {saved["session"]["session_id"] for saved in all_records}
+    recorded = {saved["session"]["session_id"]: saved for saved in all_records}
     live_ids = _live_session_ids()
     codex_entries: list[tuple[RecoverySnapshot, SnapshotCodexSession]] = []
     snapshot_ids: set[str] = set()
@@ -2141,7 +2143,8 @@ def _up(login: str, dry_run: bool, only: Iterable[str] = (), *,
         for entry in snapshot["sessions"]:
             identity, name = entry["session"]["session_id"], entry["session"]["name"]
             snapshot_ids.add(identity)
-            if identity in recorded_ids or (ids and identity not in ids):
+            if (ids and identity not in ids) or (identity in recorded
+                    and not recovery_store.snapshot_supersedes_record(snapshot, recorded[identity])):
                 continue
             print(f"{name}: {snapshot_source(entry['last_seen'])}")
             decision = choices[identity]
@@ -2193,8 +2196,9 @@ def _up(login: str, dry_run: bool, only: Iterable[str] = (), *,
             saved = (recovery_store.snapshot_restore_record(snapshot, verified_entry) if dry_run
                      else materialize_snapshot(snapshot, verified_entry))
             saved = _restore_target(saved, decision, dry_run=dry_run)
+            all_records = [current for current in all_records if current["session"]["session_id"] != identity]
             all_records.append(saved)
-            recorded_ids.add(identity)
+            recorded[identity] = saved
             sources[identity] = snapshot
     hold_outcome = lookup_account_hold(login)
     records = [saved for saved in all_records if not ids or saved["session"]["session_id"] in ids]

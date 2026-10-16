@@ -116,7 +116,7 @@ def _launch(verb: str, arguments: list[str]) -> int:
     claude_arguments = arguments[separator + 1:]
     session_kind = herdr.security_session()
     if not isinstance(session_kind, (herdr.DesktopSession, herdr.NotMacSession)):
-        print(herdr.MAC_DESKTOP_REQUIRED)
+        print(herdr.MAC_DESKTOP_TERMINAL_REQUIRED)
         return 1
     folder = Path(options.cwd).expanduser().resolve(strict=True)
     if not folder.is_dir():

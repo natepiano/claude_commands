@@ -106,12 +106,18 @@ class SessionKindNotRead:
 
 
 _SESSION_KIND_NOT_READ = SessionKindNotRead()
-MAC_DESKTOP_REQUIRED = "the Mac desktop is not signed in: restart from the Mac"
+MAC_DESKTOP_REQUIRED = "the Mac desktop is locked or signed out: unlock it and restart"
+MAC_DESKTOP_TERMINAL_REQUIRED = "herdr must start from the Mac desktop: run this from a Mac terminal"
 
 
 class MacDesktopUnavailable(HerdrFailure):
     def __init__(self) -> None:
         super().__init__(MAC_DESKTOP_REQUIRED, "mac_desktop_unavailable")
+
+
+class MacDesktopTerminalRequired(HerdrFailure):
+    def __init__(self) -> None:
+        super().__init__(MAC_DESKTOP_TERMINAL_REQUIRED, "mac_desktop_terminal_required")
 
 
 @dataclass(frozen=True)
@@ -876,7 +882,7 @@ def _start_darwin_server(client: Herdr, timeout_ms: int, *, exclusive: bool, ses
     if time.monotonic() >= deadline:
         raise _server_start_failure(client.session)
     if not isinstance(session_kind, DesktopSession):
-        raise MacDesktopUnavailable()
+        raise MacDesktopTerminalRequired()
     holders: set[int] = set()
 
     def ready() -> bool:
@@ -991,7 +997,7 @@ def start_new_server(name: str, timeout_ms: int, *,
 
 
 def restore_server(name: str, timeout_ms: int, *, session_kind: SecuritySession,
-                   attached_window: bool, exclusive: bool) -> ServerCreated | ServerAdopted | WindowServerCreated:
+                   exclusive: bool) -> ServerCreated | ServerAdopted | WindowServerCreated:
     """Start in Aqua directly, or let a desktop attach window bootstrap its server."""
     _validate_session_name(name)
     _timeout(timeout_ms)
@@ -1013,8 +1019,6 @@ def restore_server(name: str, timeout_ms: int, *, session_kind: SecuritySession,
             if exclusive:
                 raise SessionTaken(name)
             return ServerAdopted()
-        if not attached_window:
-            raise MacDesktopUnavailable()
         # An existing listener that has not answered yet is also another launch's.
         if any(item.path == _session_socket(name) for item in _darwin_bound_sockets(
                 timeout=max(0.001, deadline - time.monotonic()))):

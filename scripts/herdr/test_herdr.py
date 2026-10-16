@@ -203,7 +203,7 @@ class HerdrTests(unittest.TestCase):
         self.configure_herdr(["status", "server"], "status: stopped\n")
         with patch.object(detached, "start_detached") as spawn:
             for start in (herdr.start_server, herdr.start_new_server):
-                with self.subTest(start=start.__name__), self.assertRaises(herdr.MacDesktopUnavailable):
+                with self.subTest(start=start.__name__), self.assertRaisesRegex(herdr.MacDesktopTerminalRequired, "herdr must start from the Mac desktop: run this from a Mac terminal"):
                     _ = start("fixture", 1000)
             spawn.assert_not_called()
         self.assertEqual(self.commands().count(["managername"]), 2)
@@ -221,7 +221,7 @@ class HerdrTests(unittest.TestCase):
             clock.elapsed += seconds
         with patch.object(herdr, "time", SimpleNamespace(monotonic=lambda: clock.elapsed, sleep=advance)):
             owned = herdr.restore_server("fixture", 2000, session_kind=herdr.NonDesktopSession(),
-                                         attached_window=True, exclusive=True)
+                                         exclusive=True)
         self.assertEqual(owned, herdr.WindowServerCreated())
         calls = self.commands()
         opener = ["-na", "/Applications/Nix Apps/Ghostty.app", "--args", "-e", str(self.fake),
@@ -239,7 +239,7 @@ class HerdrTests(unittest.TestCase):
             {"workspace_id": "w1"}, {"workspace_id": "w2"}]}}))
         with patch.object(herdr, "run_program", side_effect=self.run_fake):
             ownership = herdr.restore_server("fixture", 2000, session_kind=herdr.NonDesktopSession(),
-                                             attached_window=True, exclusive=True)
+                                             exclusive=True)
         self.assertIsInstance(ownership, herdr.WindowServerCreated)
         self.assertEqual(self.commands(), [
             ["--session", "fixture", "status", "server"],
@@ -251,7 +251,7 @@ class HerdrTests(unittest.TestCase):
             ["--session", "fixture", "workspace", "close", "w1"],
             ["--session", "fixture", "workspace", "close", "w2"]])
 
-    def test_non_desktop_refuses_detached_missing_servers_and_window_failures(self) -> None:
+    def test_non_desktop_window_failure_or_unanswered_server_names_locked_or_signed_out_desktop(self) -> None:
         self.darwin()
         self.configure_herdr(["status", "server"], "status: stopped\n")
         execute = herdr.run_program
@@ -262,8 +262,8 @@ class HerdrTests(unittest.TestCase):
             return execute(argv, timeout=10.0)
         opener = ["-na", "/Applications/Nix Apps/Ghostty.app", "--args", "-e", str(self.fake),
                   "session", "attach", "fixture"]
-        for attached, failure in ((False, False), (True, True), (True, False)):
-            with self.subTest(attached=attached, failure=failure):
+        for failure in (True, False):
+            with self.subTest(failure=failure):
                 self.log.unlink(missing_ok=True)
                 self.darwin_sockets("")
                 self.configure(opener, code=1 if failure else 0)
@@ -272,11 +272,11 @@ class HerdrTests(unittest.TestCase):
                     clock.elapsed += seconds
                 with (patch.object(herdr, "time", SimpleNamespace(monotonic=lambda: clock.elapsed, sleep=advance)),
                       patch.object(herdr, "run_program", side_effect=clocked_command),
-                      self.assertRaisesRegex(herdr.MacDesktopUnavailable, herdr.MAC_DESKTOP_REQUIRED)):
+                      self.assertRaisesRegex(herdr.MacDesktopUnavailable, "the Mac desktop is locked or signed out: unlock it and restart")):
                     _ = herdr.restore_server("fixture", 200, session_kind=herdr.SessionKindUnreadable("no manager"),
-                                             attached_window=attached, exclusive=True)
+                                             exclusive=True)
                 calls = self.commands()
-                self.assertEqual(opener in calls, attached)
+                self.assertIn(opener, calls)
                 self.assertFalse(any("--collect" in row or row[2:] == ["server"] for row in calls))
                 self.assertLessEqual(clock.elapsed, 0.2)
 
@@ -289,11 +289,11 @@ class HerdrTests(unittest.TestCase):
                 self.darwin_sockets(f"p77\nf3\nn{self.root}/config/herdr/sessions/fixture/herdr.sock\n")
                 with self.assertRaises(herdr.SessionTaken):
                     _ = herdr.restore_server("fixture", 1000, session_kind=herdr.NonDesktopSession(),
-                                             attached_window=True, exclusive=True)
+                                             exclusive=True)
                 self.assertFalse(any("-na" in row or row[2:4] == ["server", "stop"] for row in self.commands()))
         self.configure_herdr(["status", "server"], "status: running\n")
         owned = herdr.restore_server("fixture", 1000, session_kind=herdr.NonDesktopSession(),
-                                     attached_window=False, exclusive=False)
+                                     exclusive=False)
         self.assertIsInstance(owned, herdr.ServerAdopted)
 
     def test_window_server_cleanup_leaves_the_listener_and_user_window_running(self) -> None:

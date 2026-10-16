@@ -994,8 +994,9 @@ class RestartTests(ShutdownTestCase):
     def test_ssh_mac_restart_bootstraps_before_resume_then_focuses_without_a_second_window(self) -> None:
         owner, responses, log = self.herdr_restart_fixture()
         for host in (inventory.TerminalHost(kind="terminal"), inventory.HerdrHost(kind="herdr",
-                     herdr_session="writing", pane_id="w1:p1", presentation="attached window")):
-            with self.subTest(host=host["kind"]):
+                     herdr_session="writing", pane_id="w1:p1", presentation="attached window"),
+                     inventory.HerdrHost(kind="herdr", herdr_session="writing", pane_id="w1:p1", presentation="detached")):
+            with self.subTest(host=host):
                 owner["host"] = host
                 name = "kept-name" if host["kind"] == "terminal" else "writing"
                 self.configure_mac_bootstrap(responses, name)
@@ -1026,9 +1027,14 @@ class RestartTests(ShutdownTestCase):
         second["session_id"], second["name"] = "second-id", "second"
         second["host"] = inventory.HerdrHost(kind="herdr", herdr_session="second", pane_id="w1:p1", presentation="detached")
         self.create([entry(owner), entry(second)])
+        for name in ("writing", "second"):
+            self.configure_mac_bootstrap(responses, name)
         replies = cast(dict[str, CommandResponse], json.loads(responses.read_text()))
         for name in ("writing", "second"):
             replies[f"--session {name} status server"] = {"stdout": "status: stopped\n", "code": 0}
+            replies[f"-na /Applications/Nix Apps/Ghostty.app --args -e {os.environ['HERDR_BIN']} session attach {name}"] = {
+                "stdout": "", "stderr": "desktop locked", "code": 1}
+        replies[f"-n -P -a -U -u {os.getuid()} -F pfn"] = {"stdout": "", "code": 0}
         _ = responses.write_text(json.dumps(replies))
         with (patch.object(sys, "platform", "darwin"), patch.object(herdr, "_PLATFORM", "darwin"),
               patch.object(herdr, "security_session", return_value=herdr.NonDesktopSession()) as query,
@@ -1038,7 +1044,7 @@ class RestartTests(ShutdownTestCase):
             peer = restart.up_result(LOGIN)
         query.assert_called_once_with()
         self.assertEqual(peer["outcome"], "partial")
-        self.assertEqual(peer["lines"].count(herdr.MAC_DESKTOP_REQUIRED), 2)
+        self.assertEqual(peer["lines"].count("the Mac desktop is locked or signed out: unlock it and restart"), 2)
         restored = record.session_records(LOGIN)
         self.assertEqual(len(restored), 2)
         self.assertTrue(all(saved["progress"]["kind"] == "restart failed" for saved in restored))
@@ -3554,6 +3560,60 @@ class RestartTests(ShutdownTestCase):
         retained = record.read_snapshot(LOGIN)
         assert not isinstance(retained, record.NoRecoverySnapshot)
         self.assertEqual(retained["sessions"], [])
+
+    def test_newer_snapshot_supersedes_failed_recovery_record_and_launches_its_host(self) -> None:
+        owner = top_level("new-observation", host=inventory.HerdrHost(kind="herdr", herdr_session="windowless",
+            pane_id="w1:p1", presentation="detached"))
+        snapshot = self.recovery([owner])
+        candidate = snapshot["sessions"][0]
+        assert candidate["agent"] == "claude"
+        previous = record.materialize_snapshot(snapshot, candidate)
+        _ = record.update_session(LOGIN, owner["session_id"], lambda current: current.update(
+            progress=record.SessionRestartFailed(kind="restart failed", at=STOPPED, reason="desktop locked")))
+        observed_owner = candidate["session"]
+        assert observed_owner["kind"] == "top-level"
+        observed_owner["host"] = inventory.HerdrHost(kind="herdr", herdr_session="attached-now",
+            pane_id="w3:p1", presentation="attached window")
+        snapshot["taken_at"] = RESTARTED
+        candidate["last_seen"] = RESTARTED
+        record.write_snapshot(snapshot)
+        with (patch.object(restart, "_owner_liveness", return_value=restart.SessionNotLive()),
+              patch.object(restart, "_session_liveness", return_value=restart.SessionNotLive()),
+              patch.object(restart, "_live_session_ids", return_value=EMPTY_SESSION_IDS),
+              patch.object(restart, "_retire"),
+              patch.object(restart, "_launch_session", return_value=restart.SessionLaunched()) as launch,
+              patch.object(restore_permission, "launch_permission", return_value=restore_permission.AllowedByShutdownState()),
+              patch.object(restart, "wait_for_confirmation", side_effect=self.all_sessions_live),
+              redirect_stdout(io.StringIO()) as output):
+            self.assertEqual(restart.up(LOGIN), 0)
+        launch.assert_called_once()
+        current = cast(SessionShutdown, launch.call_args.args[0])
+        self.assertEqual(current["session"]["host"], candidate["session"]["host"])
+        self.assertNotEqual(current["request_id"], previous["request_id"])
+        self.assertIn("new-observation: from snapshot taken", output.getvalue())
+        self.assertNotIn("from shutdown record", output.getvalue())
+
+    def test_shutdown_record_newer_than_snapshot_keeps_its_host_and_source(self) -> None:
+        owner = top_level("recent-shutdown", host=tmux_host("current-host"))
+        current = entry(owner)
+        current["requested_at"] = RESTARTED
+        self.create([current])
+        stale = copy.deepcopy(owner)
+        stale["host"] = inventory.TerminalHost(kind="terminal")
+        _ = self.recovery([stale])
+        with (patch.object(restart, "_retire"),
+              patch.object(restart, "_session_liveness", return_value=restart.SessionNotLive()),
+              patch.object(restart, "_live_session_ids", return_value=EMPTY_SESSION_IDS),
+              patch.object(restart, "_launch_session", return_value=restart.SessionLaunched()) as launch,
+              patch.object(restart, "wait_for_confirmation", side_effect=self.all_sessions_live),
+              redirect_stdout(io.StringIO()) as output):
+            self.assertEqual(restart.up(LOGIN), 0)
+        launch.assert_called_once()
+        restored = cast(SessionShutdown, launch.call_args.args[0])
+        self.assertEqual(restored["session"]["host"], owner["host"])
+        self.assertEqual(restored["request_id"], current["request_id"])
+        self.assertIn("recent-shutdown: from shutdown record", output.getvalue())
+        self.assertNotIn("from snapshot taken", output.getvalue())
 
     def test_snapshot_retry_uses_persisted_crash_context_without_the_snapshot(self) -> None:
         snapshot = self.recovery([top_level("rebooted", host=tmux_host("rebooted")),

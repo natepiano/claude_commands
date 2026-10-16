@@ -493,7 +493,7 @@ class StandaloneLaunchTests(unittest.TestCase):
                       patch.object(herdr, "start_agent") as agent,
                       redirect_stdout(io.StringIO()) as output):
                     self.assertEqual(self.call(verb, *arguments), (1, ""))
-                self.assertEqual(output.getvalue().splitlines(), [herdr.MAC_DESKTOP_REQUIRED])
+                self.assertEqual(output.getvalue().splitlines(), [herdr.MAC_DESKTOP_TERMINAL_REQUIRED])
                 query.assert_called_once_with()
                 start.assert_not_called()
                 agent.assert_not_called()
