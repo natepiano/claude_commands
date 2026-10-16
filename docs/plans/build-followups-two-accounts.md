@@ -1197,3 +1197,57 @@ After a worker launch's own turn has ended, a move to the selected seats home th
 - `scripts/agents/codex_mesh.py` — launcher sessions.
 - `scripts/accounts/accounts.py` — naming from a launcher session.
 - `docs/accounts.md`, `commands/showrunner/accounts.md` — swap row naming.
+
+### Phase 39 — The accounts script has no import cycles  · status: done
+
+**Depends on:** Phase 38
+
+#### Work Order
+
+**Goal:** basedpyright over the whole project reports no import cycle through `scripts/accounts/accounts.py`. Showrunner, 2026-10-16: three cycles go through live_units, codex_winddown, broadcast, add_unit and roster.
+
+**Constraints from prior phases:** Phase 38's `_launcher_sessions` in `scripts/agents/codex_mesh.py` imports `codex_winddown.owner` (the process-ancestry walk) behind a `sys.path` insertion, and `codex_winddown` reaches `add_unit` through `broadcast` → `roster` and through `live_units`. Phase 35's `_workers_swap_lines` in `scripts/accounts/accounts.py` imports `roster`, and `roster` imports `add_unit` only to read the production doc's Units table; `add_unit` imports `accounts`. Function-local and `TYPE_CHECKING` imports count as edges. No file-level ignores; every changed file reads 0 errors, 0 warnings.
+
+**Spec:**
+
+1. The ancestry walk moves into `scripts/message/process_table.py` as `nearest_named(process, table, names) -> str | None`: the name of the nearest ancestor (the process included) that `names` holds, `None` when the chain reaches none or loops. `codex_winddown` counts with it, `NO_SESSION` standing for `None`, and `owner` is removed. `_launcher_sessions` imports only `process_table` and drops its `sys.path` insertion.
+2. A new `scripts/production/production_units.py` reads the production doc's Units table: `Refusal`, `cell_value`, `unit_rows`, `row_cells`, `unit_headings`, `unit_table`, `plan_cell_is_retired`, `worktree_is_linked`, `SessionMarks`, `unit_is_retired`, `live_unit_table` and `retired_units` move there unchanged. It imports no module that reaches `accounts`.
+3. Every user of a moved name imports it from `production_units`, `add_unit` included; no name keeps a second home in `add_unit`. `roster` and `live_units` no longer import `add_unit`.
+4. Behavior is unchanged: the same rows, the same `Refusal` messages, the same swap lines.
+
+**Files:**
+
+- `scripts/message/process_table.py` — `nearest_named`.
+- `scripts/production/codex_winddown.py` — counts with `nearest_named`.
+- `scripts/agents/codex_mesh.py` — `_launcher_sessions` imports.
+- `scripts/production/production_units.py` — new; the Units table reading.
+- `scripts/production/add_unit.py` — the moved names removed, imported.
+- `scripts/message/roster.py` — imports the moved names from `production_units`.
+- `scripts/production/live_units.py` — imports the moved names from `production_units`.
+- `scripts/bevy_upgrade/bevy_upgrade.py` — imports the moved names from `production_units`.
+- `scripts/nightly_review/nightly_review.py` — imports the moved names from `production_units`.
+- `scripts/shutdown/restart.py` — imports the moved names from `production_units`.
+- `scripts/production/add_showrunner.py` — imports the moved names from `production_units`.
+- `scripts/production/adopt.py` — imports the moved names from `production_units`.
+- `scripts/production/ci_points.py` — imports the moved names from `production_units`.
+- `scripts/production/dailies_input.py` — imports the moved names from `production_units`.
+- `scripts/production/log_backup.py` — imports the moved names from `production_units`.
+- `scripts/production/merge_checkpoint.py` — imports the moved names from `production_units`.
+- `scripts/production/production_lifecycle.py` — imports the moved names from `production_units`.
+- `scripts/production/promote_showrunner.py` — imports the moved names from `production_units`.
+- `scripts/production/proposals_table.py` — imports the moved names from `production_units`.
+- `scripts/production/rename.py` — imports the moved names from `production_units`.
+- `scripts/production/stall_watch.py` — imports the moved names from `production_units`.
+- `scripts/production/unit_run.py` — imports the moved names from `production_units`.
+- `scripts/production/units_table.py` — imports the moved names from `production_units`.
+- `scripts/production/update_registration.py` — imports the moved names from `production_units`.
+- `scripts/production/waiting.py` — imports the moved names from `production_units`.
+- `scripts/production/test_add_unit.py` — imports the moved names from `production_units`.
+- `scripts/production/test_promote_showrunner.py` — imports the moved names from `production_units`.
+- `scripts/message/test_process_table.py` — `nearest_named`.
+
+Any other user of a moved name the search finds is updated the same way and named in the summary.
+
+**Workers:** 1 writer + 1 tester. impl: every production file above. test: `scripts/message/test_process_table.py`, `scripts/production/test_add_unit.py`, `scripts/production/test_promote_showrunner.py` and any other test file that imports a moved name.
+
+**Acceptance gate:** `basedpyright` over the whole project lists no `reportImportCycles` error for `scripts/accounts/accounts.py`; every changed file reads 0 errors, 0 warnings; a test pins `nearest_named` (found, none, a loop); the merge gate is green.

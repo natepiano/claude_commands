@@ -10,7 +10,6 @@ import json
 import math
 import os
 import pwd
-import re
 import shlex
 import shutil
 import subprocess
@@ -24,6 +23,8 @@ from datetime import datetime, timedelta
 from enum import Enum
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal, NotRequired, Protocol, TypedDict, cast
+
+import reply_asks
 
 from user_action import (ActionRequired, NoActionRequired, UserAction, first_line, parse_user_action,
                          NotificationSession, NO_SESSION_LINE, SessionLine, split_session)
@@ -1269,10 +1270,6 @@ class QuestionRegistration(TypedDict):
     question: NotRequired[str]
 
 
-def question_prose(text: str) -> str:
-    return " ".join(re.sub(r"(`+).*?\1", "", text).split())
-
-
 def registered_questions(since: datetime) -> list[str]:
     """Read outstanding questions and registrations made within the sample window."""
     root = Path(os.environ.get("SHOWRUNNER_STATE_DIR") or Path.home() / ".local/state/showrunner")
@@ -1287,7 +1284,7 @@ def registered_questions(since: datetime) -> list[str]:
                 for field in ("text", "reviewed", "question"):
                     text = record.get(field)
                     if isinstance(text, str) and text.strip():
-                        prose = question_prose(text)
+                        prose = reply_asks.question_prose(text)
                         if prose:
                             questions.append(prose)
         except (OSError, ValueError):
@@ -1306,48 +1303,12 @@ def registered_questions(since: datetime) -> list[str]:
                     for field in ("text", "reviewed", "question"):
                         text = record.get(field)
                         if isinstance(text, str) and text.strip():
-                            prose = question_prose(text)
+                            prose = reply_asks.question_prose(text)
                             if prose:
                                 questions.append(prose)
             except ValueError:
                 continue
     return questions
-
-
-@dataclass(frozen=True)
-class ReplyAsks:
-    sentences: tuple[str, ...]
-    has_choices: bool
-    choice_lines: tuple[str, ...] = ()
-
-
-def reply_questions(text: str) -> ReplyAsks:
-    """Separate asking sentences from choices, excluding code and quoted examples."""
-    questions: list[str] = []
-    choice_lines: list[str] = []
-    fence = ""
-    for line in text.splitlines():
-        stripped = line.lstrip()
-        marker = re.match(r"^(`{3,}|~{3,})", stripped)
-        if marker:
-            if not fence:
-                fence = marker.group(1)
-            elif stripped.startswith(fence):
-                fence = ""
-            continue
-        if fence or stripped.startswith(">"):
-            continue
-        prose = question_prose(line)
-        if "(recommended" in prose.lower():
-            choice_lines.append(" ".join(line.split()))
-        for sentence in re.split(r"(?<=[.!?])\s+", prose):
-            sentence = re.sub(r"^(?:[-*+]\s+|\d+[.)]\s+)", "", sentence).strip()
-            request = re.match(
-                r"(?i)^(?:please\s+)?(?:reply|choose|pick|confirm|decide|approve|tell me|let me know|say|"
-                + r"would you|do you want|shall I|should I)\b", sentence)
-            if sentence.endswith("?") or request:
-                questions.append(" ".join(sentence.split()))
-    return ReplyAsks(tuple(questions), bool(choice_lines), tuple(choice_lines))
 
 
 def sample(paths: list[Path], limit: int = 20, *, since: datetime | None = None,
@@ -1366,12 +1327,12 @@ def sample(paths: list[Path], limit: int = 20, *, since: datetime | None = None,
     eligible: list[TranscriptReply] = []
     unregistered = 0
     for reply in replies:
-        asks = reply_questions(reply.text)
+        asks = reply_asks.reply_questions(reply.text)
         if asks.sentences:
             unregistered += int(any(not any(question in item or item in question for item in registered)
                                     for question in asks.sentences))
         elif asks.has_choices:
-            unregistered += int(not any(item in question_prose(reply.text) for item in registered))
+            unregistered += int(not any(item in reply_asks.question_prose(reply.text) for item in registered))
         else:
             eligible.append(reply)
     failed, unreviewed, passed = 0, 0, 0

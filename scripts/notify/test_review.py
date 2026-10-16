@@ -21,6 +21,7 @@ from unittest import mock
 
 import pushover
 import review
+import reply_asks
 import push_texts
 from user_action import ActionRequired, NoActionRequired, SessionLine, first_line
 
@@ -497,25 +498,25 @@ class LocalReviewTests(unittest.TestCase):
                     "Please choose a version."]
         for request in requests:
             with self.subTest(request=request):
-                self.assertEqual(review.reply_questions("The check passed. " + request), review.ReplyAsks((request,), False))
-        self.assertEqual(review.reply_questions("Upgrade (recommended): use the new compiler."),
-                         review.ReplyAsks((), True, ("Upgrade (recommended): use the new compiler.",)))
-        self.assertEqual(review.reply_questions("- Choose a version.\n2. Confirm the version."),
-                         review.ReplyAsks(("Choose a version.", "Confirm the version."), False))
-        self.assertEqual(review.reply_questions(
+                self.assertEqual(reply_asks.reply_questions("The check passed. " + request), reply_asks.ReplyAsks((request,), False))
+        self.assertEqual(reply_asks.reply_questions("Upgrade (recommended): use the new compiler."),
+                         reply_asks.ReplyAsks((), True, ("Upgrade (recommended): use the new compiler.",)))
+        self.assertEqual(reply_asks.reply_questions("- Choose a version.\n2. Confirm the version."),
+                         reply_asks.ReplyAsks(("Choose a version.", "Confirm the version."), False))
+        self.assertEqual(reply_asks.reply_questions(
             "> Reply upgrade or wait.\n```\nChoose a version.\n```\n~~~\nApprove it.\n~~~\n"
-            + "The example is `Tell me which version.` and ``Choose a version.``."), review.ReplyAsks((), False))
+            + "The example is `Tell me which version.` and ``Choose a version.``."), reply_asks.ReplyAsks((), False))
 
     def test_choice_lines_include_questions_but_skip_quotes_and_code(self) -> None:
         line = "Retry (recommended) or stop?"
-        asks = review.reply_questions(line + "\n> Use stable (recommended).\n"
+        asks = reply_asks.reply_questions(line + "\n> Use stable (recommended).\n"
             + "```\nUse nightly (recommended).\n```\nExample: `Upgrade (recommended)`")
         self.assertEqual(asks.choice_lines, (line,))
         self.assertIn(line, asks.sentences)
 
     def test_detected_choice_lines_keep_inline_code_for_record_matching(self) -> None:
         line = "Run `retry build-42` (recommended), or stop?"
-        asks = review.reply_questions(line + "\nExample: `Stop (recommended)`")
+        asks = reply_asks.reply_questions(line + "\nExample: `Stop (recommended)`")
         self.assertEqual(asks.choice_lines, (line,))
 
     def test_reviewed_question_is_registered_from_outstanding_and_after_closing(self) -> None:
@@ -598,7 +599,7 @@ class LocalReviewTests(unittest.TestCase):
 
     def test_sample_matches_each_question_sentence_on_the_same_line(self) -> None:
         first, second = "Would you retry the build?", "Which version should it use?"
-        self.assertEqual(review.reply_questions(first + " " + second), review.ReplyAsks((first, second), False))
+        self.assertEqual(reply_asks.reply_questions(first + " " + second), reply_asks.ReplyAsks((first, second), False))
         path = self.transcript("questions.jsonl", [("2026-10-13T10:00:00Z", first + " " + second, "end_turn")])
         registration = self.root / "showrunner/outstanding/build.json"
         registration.parent.mkdir(parents=True)

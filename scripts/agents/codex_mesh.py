@@ -4471,12 +4471,6 @@ def _launcher_sessions(folder: Path) -> tuple[str, ...]:
                  if isinstance(pid, int) and _pid_alive(pid))
     if not pids:
         return ()
-    # Reuse wind-down's cross-platform ancestry walk and its process-table reader.
-    for directory in ("message", "production"):
-        path = str(Path(__file__).resolve().parents[1] / directory)
-        if path not in sys.path:
-            sys.path.insert(0, path)
-    from scripts.production.codex_winddown import NO_SESSION, owner
     from scripts.message import process_table
 
     try:
@@ -4494,8 +4488,8 @@ def _launcher_sessions(folder: Path) -> tuple[str, ...]:
         process = table.get(pid)
         if process is None:
             continue
-        session_id = owner(process, table, names)
-        if session_id != NO_SESSION and session_id not in found:
+        session_id = process_table.nearest_named(process, table, names)
+        if session_id is not None and session_id not in found:
             found.append(session_id)
     return tuple(found)
 

@@ -513,12 +513,12 @@ def check_reviewed_text(instance_dirs: list[str], reply: str) -> QuestionReplyRe
     if notify_scripts not in sys.path:
         sys.path.insert(0, notify_scripts)
     if TYPE_CHECKING:
-        from ..notify import review
+        from ..notify import reply_asks
     else:
-        import review
+        import reply_asks
     recorded_choices = {choice_comparison_text(line) for question in accepted
-                        for line in review.reply_questions(question).choice_lines}
-    for line in review.reply_questions(reply).choice_lines:
+                        for line in reply_asks.reply_questions(question).choice_lines}
+    for line in reply_asks.reply_questions(reply).choice_lines:
         compared = choice_comparison_text(line)
         if compared not in recorded_choices and not any(compared in choice_comparison_text(question) for question in accepted):
             return QuestionReplyBlocked(f"Unrecorded choice {line!r}: record the item and paste its reviewed question "
