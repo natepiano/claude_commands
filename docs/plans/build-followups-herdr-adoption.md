@@ -623,3 +623,33 @@ Moved to unit `herdr-panes-unit`, run in parallel with Phase 5; shipped as `docs
 **Gotchas:** Codex closes its rollout file between turns, so the open-file lookup alone misses idle sessions. Codex names day folders by the machine's local date, not UTC. `Path.glob` hides unreadable folders; enumerate with `iterdir`.
 
 **Ruled out:** picking one of several matching rollouts — ambiguity always yields the picker.
+
+### Phase 23 — Restored windows show only what was restored  · status: done
+
+**Depends on:** Phase 22
+
+**User sees:** before — every herdr window a Mac restart opens shows two workspaces: the restored agent and herdr's own empty `~` shell; after — the window shows only the restored agent.
+
+#### Work Order
+
+**Goal:** a Mac restart that opens the attach window closes herdr's startup workspace when it is still the untouched empty shell.
+
+**Spec:**
+
+1. Measured (2026-10-16 19:00 EDT, Mac, Phase 22 live check): after `restore_server` returns `WindowServerCreated` and the restart creates, resumes and focuses the agent workspace, `workspace list` shows a second workspace: label `~`, one tab, one pane, `agent_status` `unknown`, the pane has no `agent` field, `cwd` and `foreground_cwd` are the home folder, `revision` 0, `max_offset_from_bottom` 0. `_clear_restored_workspaces` (`herdr.py` ~833) runs as soon as the server answers, before the attach client makes this workspace, so it never sees it. Seen in both the restored Claude (`herdr-mac-check`) and Codex (`herdr-mac-codex-*`) windows.
+2. After the restored workspace is focused on the window path (`restart.py`: the Claude herdr host ~1140, the new-session hosts ~1169, the Codex path ~2058), close every other workspace that is still the untouched startup shell: one tab, one pane, no agent, the pane's cwd and foreground cwd equal to the home folder, no scrollback. Any other workspace, and anything the user has typed into, stays. One helper in `herdr.py` decides "untouched", from `workspace list` and `pane list`; it is private until a second caller exists.
+3. A failure to read or close the startup workspace never fails the restore: the agent is already running and focused. Print one line naming the session and leave the workspace open.
+4. Detached starts (desktop, Linux) make no startup workspace; they are unchanged.
+5. Live, on the Mac (desktop unlocked): the Phase 22 check again — Codex in a probe pane, one prompt, snapshot, `server stop`, `restart --here --no-alert` over ssh — and the Claude probe `herdr-mac-check` restored in the same run. Each restored window shows one workspace, the agent's.
+
+6. Showrunner add-on (2026-10-16): `test_herdr` `test_non_desktop_exclusive_restore_refuses_existing_or_competing_listener` failed under a one-minute load near 190 with `MacDesktopUnavailable`. `restore_server` (`herdr.py` ~1023) gives `_darwin_bound_sockets` `timeout=max(0.001, deadline - time.monotonic())`; the faked `lsof` (`HERDR_LSOF`, a Python fake) runs past it, and the `TimeoutExpired` caught at ~1040 becomes `MacDesktopUnavailable`. It passes alone. Make the test hold under load, and fix the timeout handling as well if the real path has the same exposure (a slow `lsof` read as a locked desktop).
+
+**Files:**
+- `scripts/herdr/herdr.py`, `scripts/herdr/test_herdr.py` — the untouched startup-shell check and close.
+- `scripts/shutdown/restart.py`, `scripts/shutdown/test_restart.py` — call it after focus on the window path.
+
+**Workers:** 1 writer, `test` (as impl).
+
+**Constraints from prior phases:** outside the desktop a Mac restore always opens the Ghostty attach window and a window-started server is never stopped by cleanup (Phase 21). The refusal text is `the Mac desktop is locked or signed out: unlock it and restart`. Every herdr command names `--session`; never probe the default herdr server. The Mac clone `~/scratch/herdr-mac` pulls the pushed branch.
+
+**Acceptance gate:** tests that fail without the fix for: the untouched `~` shell closed after a window restore; a startup workspace with scrollback, a second pane, an agent, or another cwd kept; a close failure leaves the agent restored with one printed line; a detached start never lists or closes workspaces. The listener-refusal test passes under load (Spec 6). `merge_gate.py --tests-only` green; `basedpyright scripts/lib scripts/herdr scripts/shutdown` clean; Mac `scripts/herdr` and `scripts/shutdown` suites green; Spec 5 passes on the Mac.

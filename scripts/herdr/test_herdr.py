@@ -282,6 +282,8 @@ class HerdrTests(unittest.TestCase):
 
     def test_non_desktop_exclusive_restore_refuses_existing_or_competing_listener(self) -> None:
         self.darwin()
+        # Refusal is independent of scheduling a Python command fake under load.
+        _ = self.enterContext(patch.object(herdr, "run_program", side_effect=self.run_fake))
         for answering in (True, False):
             with self.subTest(answering=answering):
                 self.log.unlink(missing_ok=True)
@@ -295,6 +297,29 @@ class HerdrTests(unittest.TestCase):
         owned = herdr.restore_server("fixture", 1000, session_kind=herdr.NonDesktopSession(),
                                      exclusive=False)
         self.assertIsInstance(owned, herdr.ServerAdopted)
+
+    def test_non_desktop_listener_probe_timeout_preserves_the_session_without_blaming_the_desktop(self) -> None:
+        self.darwin()
+        self.configure_herdr(["status", "server"], "status: stopped\n")
+        for failed_probe in ("status", "lsof"):
+            with self.subTest(failed_probe=failed_probe):
+                self.log.unlink(missing_ok=True)
+                clock = StartupClock()
+                def probe(argv: list[str], timeout: float = 10.0) -> subprocess.CompletedProcess[str]:
+                    self.assertGreater(timeout, 0)
+                    if argv[1] == ("--session" if failed_probe == "status" else "-n"):
+                        clock.elapsed += timeout
+                        raise subprocess.TimeoutExpired(argv, timeout)
+                    clock.elapsed += 0.95
+                    return self.run_fake(argv, timeout)
+                with (patch.object(herdr, "time", SimpleNamespace(monotonic=lambda: clock.elapsed)),
+                      patch.object(herdr, "run_program", side_effect=probe),
+                      self.assertRaises(herdr.HerdrFailure) as failed):
+                    _ = herdr.restore_server("fixture", 1000, session_kind=herdr.NonDesktopSession(), exclusive=True)
+                self.assertNotIsInstance(failed.exception, herdr.MacDesktopUnavailable)
+                self.assertIn("fixture: could not check existing listener", str(failed.exception))
+                self.assertIsInstance(failed.exception.__cause__, subprocess.TimeoutExpired)
+                self.assertFalse(any("-na" in row or row[2:4] == ["server", "stop"] for row in self.commands()))
 
     def test_window_server_cleanup_leaves_the_listener_and_user_window_running(self) -> None:
         self.darwin()
@@ -931,6 +956,94 @@ class HerdrTests(unittest.TestCase):
         self.configure_herdr(["workspace", "focus", "w3"], code=1, stderr="workspace no longer exists")
         with self.assertRaisesRegex(herdr.HerdrFailure, "workspace no longer exists"):
             self.herdr.focus_workspace("w3")
+
+    def test_startup_cleanup_closes_only_the_untouched_home_shell_and_preserves_the_restored_workspace(self) -> None:
+        workspaces = [dict(workspace_id=name, label="~", tab_count=1,
+            pane_count=1, agent_status="unknown") for name in ("w1", "w2", "w3")]
+        panes = [dict(pane_id=name + ":p1", agent_status="unknown", cwd=str(Path.home()),
+            foreground_cwd=str(Path.home()), revision=0, max_offset_from_bottom=0) for name in ("w1", "w2", "w3")]
+        self.configure_herdr(["workspace", "list"], json.dumps({"result": {"workspaces": workspaces}}))
+        self.configure_herdr(["pane", "list"], json.dumps({"result": {"panes": panes}}))
+        self.herdr.close_startup_workspaces("w2")
+        self.assertEqual(self.commands(), [
+            ["--session", "fixture", "workspace", "list"],
+            ["--session", "fixture", "workspace", "list"],
+            ["--session", "fixture", "pane", "list"],
+            ["--session", "fixture", "workspace", "close", "w1"],
+            ["--session", "fixture", "workspace", "list"],
+            ["--session", "fixture", "pane", "list"],
+            ["--session", "fixture", "workspace", "close", "w3"]])
+
+    def test_startup_cleanup_preserves_workspace_changed_while_another_workspace_closes(self) -> None:
+        for change in ("typed input", "renamed workspace", "removed workspace"):
+            with self.subTest(change=change):
+                self.log.unlink(missing_ok=True)
+                workspaces = [dict(workspace_id=name, label="~", tab_count=1,
+                    pane_count=1, agent_status="unknown") for name in ("w1", "w2", "w3")]
+                panes = [dict(pane_id=name + ":p1", agent_status="unknown", cwd=str(Path.home()),
+                    foreground_cwd=str(Path.home()), revision=0, max_offset_from_bottom=0)
+                    for name in ("w1", "w2", "w3")]
+                self.configure_herdr(["workspace", "list"], json.dumps({"result": {"workspaces": workspaces}}))
+                self.configure_herdr(["pane", "list"], json.dumps({"result": {"panes": panes}}))
+                def close_then_change(argv: list[str], timeout: float = 10.0) -> subprocess.CompletedProcess[str]:
+                    result = self.run_fake(argv, timeout)
+                    if argv[1:] == ["--session", "fixture", "workspace", "close", "w1"]:
+                        if change == "typed input":
+                            self.configure_herdr(["pane", "list"], json.dumps({"result": {"panes": [
+                                {**pane, "revision": 1} if pane["pane_id"] == "w3:p1" else pane for pane in panes]}}))
+                        else:
+                            remaining = [workspace for workspace in workspaces if workspace["workspace_id"] != "w1"
+                                         and (change != "removed workspace" or workspace["workspace_id"] != "w3")]
+                            self.configure_herdr(["workspace", "list"], json.dumps({"result": {"workspaces": [
+                                {**workspace, "label": "my shell"} if workspace["workspace_id"] == "w3" else workspace
+                                for workspace in remaining]}}))
+                    return result
+                with patch.object(herdr, "run_program", side_effect=close_then_change):
+                    self.herdr.close_startup_workspaces("w2")
+                self.assertEqual([command for command in self.commands() if command[2:4] == ["workspace", "close"]],
+                                 [["--session", "fixture", "workspace", "close", "w1"]])
+
+    def test_startup_cleanup_preserves_workspaces_with_activity_or_incomplete_evidence(self) -> None:
+        _ = self.enterContext(patch.object(herdr, "run_program", side_effect=self.run_fake))
+        workspace: dict[str, object] = dict(workspace_id="w1", label="~", tab_count=1,
+            pane_count=1, agent_status="unknown")
+        pane: dict[str, object] = dict(pane_id="w1:p1", agent_status="unknown", cwd=str(Path.home()),
+            foreground_cwd=str(Path.home()), revision=0, max_offset_from_bottom=0)
+        changed: list[tuple[str, dict[str, object], list[dict[str, object]]]] = [
+            ("scrollback", {**workspace}, [{**pane, "max_offset_from_bottom": 1}]),
+            ("typed input", {**workspace}, [{**pane, "revision": 1}]),
+            ("second pane", {**workspace}, [{**pane}, {**pane, "pane_id": "w1:p2"}]),
+            ("missing pane", {**workspace}, []),
+            ("pane belongs elsewhere", {**workspace}, [{**pane, "pane_id": "w3:p1"}]),
+            ("second tab", {**workspace, "tab_count": 2}, [{**pane}]),
+            ("agent", {**workspace}, [{**pane, "agent": "claude"}]),
+            ("agent status", {**workspace, "agent_status": "running"}, [{**pane}]),
+            ("pane agent status", {**workspace}, [{**pane, "agent_status": "running"}]),
+            ("cwd", {**workspace}, [{**pane, "cwd": str(self.root / "work")}]),
+            ("foreground cwd", {**workspace}, [{**pane, "foreground_cwd": str(self.root / "work")}]),
+            ("renamed", {**workspace, "label": "my shell"}, [{**pane}]),
+            ("missing screen state", {**workspace}, [{"pane_id": "w1:p1", "cwd": str(Path.home()),
+                "foreground_cwd": str(Path.home())}]),
+            ("boolean revision", {**workspace}, [{**pane, "revision": False}]),
+            ("boolean scrollback", {**workspace}, [{**pane, "max_offset_from_bottom": False}]),
+            ("boolean tab count", {**workspace, "tab_count": True}, [{**pane}]),
+            ("boolean pane count", {**workspace, "pane_count": True}, [{**pane}]),
+        ]
+        changed.extend((f"missing workspace {field}", {key: value for key, value in workspace.items() if key != field},
+                        [{**pane}]) for field in ("label", "tab_count", "pane_count", "agent_status"))
+        changed.extend((f"missing pane {field}", {**workspace},
+                        [{key: value for key, value in pane.items() if key != field}])
+                       for field in ("agent_status", "cwd", "foreground_cwd", "revision", "max_offset_from_bottom"))
+        for reason, candidate, members in changed:
+            with self.subTest(reason=reason):
+                self.log.unlink(missing_ok=True)
+                self.configure_herdr(["workspace", "list"], json.dumps({"result": {"workspaces": [candidate]}}))
+                self.configure_herdr(["pane", "list"], json.dumps({"result": {"panes": members}}))
+                self.herdr.close_startup_workspaces("w2")
+                self.assertEqual(self.commands(), [
+                    ["--session", "fixture", "workspace", "list"],
+                    ["--session", "fixture", "workspace", "list"],
+                    ["--session", "fixture", "pane", "list"]])
 
     def test_promptless_start_never_sends_input(self) -> None:
         self.herdr.start_agent("worker", "pane-1", "claude", ["-n", "solo"], herdr.NoOpeningPrompt(), 90_000)

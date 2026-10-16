@@ -25,6 +25,7 @@ import subprocess
 import sys
 import time
 from dataclasses import dataclass
+from enum import Enum
 from pathlib import Path
 from typing import NamedTuple, NotRequired, TypedDict, cast, override
 
@@ -372,6 +373,23 @@ class TabIdentity(TypedDict):
     tab_id: str
 
 
+class _StartupShellEvidence(Enum):
+    UNTOUCHED = "untouched startup shell"
+    PRESERVE = "activity or incomplete startup evidence"
+
+
+@dataclass(frozen=True)
+class _WorkspaceStartupState:
+    workspace_id: str
+    evidence: _StartupShellEvidence
+
+
+@dataclass(frozen=True)
+class _PaneStartupState:
+    pane_id: str
+    evidence: _StartupShellEvidence
+
+
 class AgentLifecycle(TypedDict):
     agent_status: str
 
@@ -535,6 +553,22 @@ class Herdr:
     def focus_workspace(self, workspace_id: str) -> None:
         """Show a workspace in the session's attached clients."""
         _ = self.run("workspace", "focus", workspace_id)
+
+    def close_startup_workspaces(self, restored_workspace: str) -> None:
+        """Remove only untouched home shells left by this restore's attach window."""
+        candidates = [_workspace_startup_state(item) for item in json_items(
+            self.result("workspace", "list").get("workspaces"), "herdr workspace list")]
+        for candidate in candidates:
+            if candidate.workspace_id == restored_workspace:
+                continue
+            # A previous close can take long enough for another shell to receive input.
+            workspaces = [_workspace_startup_state(item) for item in json_items(
+                self.result("workspace", "list").get("workspaces"), "herdr workspace list")]
+            panes = [_pane_startup_state(item) for item in json_items(
+                self.result("pane", "list").get("panes"), "herdr pane list")]
+            if any(workspace.workspace_id == candidate.workspace_id and _untouched_startup_shell(workspace, panes)
+                   for workspace in workspaces):
+                _ = self.run("workspace", "close", candidate.workspace_id)
 
     def start_agent(self, name: str, pane: str, kind: str, agent_arguments: list[str],
                     opening: OpeningPrompt | NoOpeningPrompt, timeout_ms: int) -> None:
@@ -830,6 +864,34 @@ def server_answering(status: subprocess.CompletedProcess[str]) -> bool:
     return status.returncode == 0 and "status: running" in status.stdout.splitlines()
 
 
+def _workspace_startup_state(value: object) -> _WorkspaceStartupState:
+    workspace = json_object(value, "herdr workspace")
+    workspace_id = json_text(workspace.get("workspace_id"), "herdr workspace id")
+    tab_count, pane_count = workspace.get("tab_count"), workspace.get("pane_count")
+    untouched = (workspace.get("label") == "~" and type(tab_count) is int and tab_count == 1
+                 and type(pane_count) is int and pane_count == 1 and workspace.get("agent_status") == "unknown")
+    return _WorkspaceStartupState(workspace_id,
+        _StartupShellEvidence.UNTOUCHED if untouched else _StartupShellEvidence.PRESERVE)
+
+
+def _pane_startup_state(value: object) -> _PaneStartupState:
+    pane = json_object(value, "herdr pane")
+    pane_id = json_text(pane.get("pane_id"), "herdr pane id")
+    revision, scrollback = pane.get("revision"), pane.get("max_offset_from_bottom")
+    untouched = (pane.get("agent") is None and pane.get("agent_status") == "unknown"
+                 and pane.get("cwd") == str(Path.home()) and pane.get("foreground_cwd") == str(Path.home())
+                 and type(revision) is int and revision == 0 and type(scrollback) is int and scrollback == 0)
+    return _PaneStartupState(pane_id,
+        _StartupShellEvidence.UNTOUCHED if untouched else _StartupShellEvidence.PRESERVE)
+
+
+def _untouched_startup_shell(workspace: _WorkspaceStartupState, panes: list[_PaneStartupState]) -> bool:
+    """Missing evidence preserves the workspace rather than risking live work."""
+    members = [pane for pane in panes if pane.pane_id.split(":", 1)[0] == workspace.workspace_id]
+    return (workspace.evidence is _StartupShellEvidence.UNTOUCHED and len(members) == 1
+            and members[0].evidence is _StartupShellEvidence.UNTOUCHED)
+
+
 def _clear_restored_workspaces(client: Herdr) -> None:
     """A server we just spawned holds restored layout, never live work."""
     result = client.result("workspace", "list")
@@ -1023,6 +1085,11 @@ def restore_server(name: str, timeout_ms: int, *, session_kind: SecuritySession,
         if any(item.path == _session_socket(name) for item in _darwin_bound_sockets(
                 timeout=max(0.001, deadline - time.monotonic()))):
             raise SessionTaken(name)
+    except SessionTaken:
+        raise
+    except (OSError, subprocess.SubprocessError, HerdrFailure) as error:
+        raise HerdrFailure(f"herdr session {name}: could not check existing listener: {error}") from error
+    try:
         require_success(run_program([
             os.environ.get("SHUTDOWN_OPEN", "open"), "-na", "/Applications/Nix Apps/Ghostty.app",
             "--args", "-e", herdr_binary(), "session", "attach", name,
@@ -1035,8 +1102,6 @@ def restore_server(name: str, timeout_ms: int, *, session_kind: SecuritySession,
             remaining = deadline - time.monotonic()
             if remaining > 0:
                 time.sleep(min(0.1, remaining))
-    except SessionTaken:
-        raise
     except (OSError, subprocess.SubprocessError, HerdrFailure) as error:
         raise MacDesktopUnavailable() from error
     raise MacDesktopUnavailable()
