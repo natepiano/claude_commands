@@ -124,7 +124,19 @@ class CommandRoleMap:
     value: RoleMap | MapNotRead | MapReadRefused
 
 
+@dataclass(frozen=True)
+class FetchRoleMap:
+    """Read the authority, falling back to its last usable cache."""
+
+
+@dataclass(frozen=True)
+class StoredRoleMap:
+    """Read local authority or saved cache without contacting a remote host."""
+
+
+RoleMapSource = FetchRoleMap | StoredRoleMap
 _command_map: ContextVar[CommandRoleMap | MapNotRead] = ContextVar("role_map", default=MapNotRead())
+_role_map_source: ContextVar[RoleMapSource] = ContextVar("role_map_source", default=FetchRoleMap())
 P = ParamSpec("P")
 R = TypeVar("R")
 
@@ -141,6 +153,18 @@ def role_map_command(function: Callable[P, R]) -> Callable[P, R]:
         finally:
             _command_map.reset(token)
     return command
+
+
+@contextmanager
+def stored_role_map() -> Generator[None]:
+    """Read local authority or saved cache only, within an independent scope."""
+    source_token = _role_map_source.set(StoredRoleMap())
+    map_token = _command_map.set(CommandRoleMap(MapNotRead()))
+    try:
+        yield
+    finally:
+        _command_map.reset(map_token)
+        _role_map_source.reset(source_token)
 
 
 def groups_file() -> Path:
@@ -274,6 +298,17 @@ def _atomic_write(path: Path, contents: str) -> None:
         temporary.unlink(missing_ok=True)
 
 
+def _cached_role_map() -> tuple[RoleMap, datetime]:
+    saved = _object(role_map_cache_file())
+    at = saved["at"]
+    if not isinstance(at, str):
+        raise ValueError("invalid cache time")
+    stamp = datetime.fromisoformat(at)
+    if stamp.tzinfo is None:
+        raise ValueError("invalid cache time")
+    return decode_role_map(json.dumps(saved["map"])), stamp
+
+
 def read_role_map() -> RoleMap:
     scope = _command_map.get()
     if isinstance(scope, CommandRoleMap) and isinstance(scope.value, RoleMap):
@@ -283,18 +318,13 @@ def read_role_map() -> RoleMap:
     try:
         if is_role_map_host():
             result = _local_role_map()
+        elif isinstance(_role_map_source.get(), StoredRoleMap):
+            result, _ = _cached_role_map()
         else:
             try:
                 result = decode_role_map(ssh_role_map(("role-map-read",)))
             except (OSError, ValueError, subprocess.SubprocessError):
-                saved = _object(role_map_cache_file())
-                at = saved["at"]
-                if not isinstance(at, str):
-                    raise ValueError("invalid cache time")
-                stamp = datetime.fromisoformat(at)
-                if stamp.tzinfo is None:
-                    raise ValueError("invalid cache time")
-                result = decode_role_map(json.dumps(saved["map"]))
+                result, stamp = _cached_role_map()
                 print(f"role map from {stamp.astimezone(user_zone()).strftime('%Y-%m-%d %H:%M %Z')}; "
                       + f"{ROLE_MAP_HOST} unreachable", file=sys.stderr)
             else:
