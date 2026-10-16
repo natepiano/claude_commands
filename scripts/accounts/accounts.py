@@ -3004,7 +3004,7 @@ def codex_home_label(home: Path) -> str:
 class FoldedWorkerRow:
     index: int
     context: str
-    mid_turn: bool
+    mid_turn_count: int
     count: int
 
 
@@ -3066,12 +3066,17 @@ def _workers_swap_lines(switches: Sequence[WorkersRunSwitch], previous: Path,
                 lines.append(f"  {context} → {target}, {worker.failure}; resume with {worker.resume_command}")
                 continue
             key = (holder_id, slot)
-            previous_row = folded.get(key, FoldedWorkerRow(len(lines), context, False, 0))
-            row = replace(previous_row, mid_turn=previous_row.mid_turn or worker.mid_turn,
+            previous_row = folded.get(key, FoldedWorkerRow(len(lines), context, 0, 0))
+            row = replace(previous_row, mid_turn_count=previous_row.mid_turn_count + int(worker.mid_turn),
                           count=previous_row.count + 1)
-            suffix = ", interrupted and resumed" if row.mid_turn else ""
             copies = f" ×{row.count}" if row.count > 1 else ""
-            line = f"  {row.context} → {target}{suffix}{copies}"
+            if row.mid_turn_count == 0:
+                suffix = ""
+            elif row.count == 1:
+                suffix = ", interrupted and resumed"
+            else:
+                suffix = f", {row.mid_turn_count} interrupted and resumed"
+            line = f"  {row.context} → {target}{copies}{suffix}"
             if row.index == len(lines):
                 lines.append(line)
             else:

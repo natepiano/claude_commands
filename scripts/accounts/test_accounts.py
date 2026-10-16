@@ -3005,13 +3005,43 @@ class AccountsTests(unittest.TestCase):
                 self.assertEqual((code, errors), (0, ""))
                 rows = output.splitlines()[1:]
                 self.assertEqual(len(rows), 5)
-                self.assertIn("  natedev · two-accounts · review-worker → codex1, interrupted and resumed ×2", rows)
+                self.assertIn("  natedev · two-accounts · review-worker → codex1 ×2, 1 interrupted and resumed", rows)
                 self.assertIn("  natedev · two-accounts · impl-worker → codex1 ×2", rows)
                 self.assertIn("  natedev · two-accounts · review-worker → codex1", rows)
                 for reason, command in zip(("interrupt failed: denied", "resume failed: refused"), commands, strict=True):
                     failed = next(row for row in rows if reason in row)
                     self.assertIn(command, failed)
                     self.assertNotIn("×", failed)
+
+    def test_workers_swap_fold_counts_mid_turn_entries_and_preserves_single_rows_in_both_modes(self) -> None:
+        previous, _ = self.workers_fixture()
+        holder = roster.RosterEntry(
+            machine="here", kind="claude", role="unit director", name="director", status="running",
+            reach=roster.Messageable("session:holder"), cwd="",
+            showrunner=roster.UnderShowrunner("build", "natedev", "session:showrunner"),
+            director=roster.DirectsUnit("two-accounts"), assignment=roster.NotAWorker(),
+            session=roster.ClaudeSession("holder"))
+        cases = (
+            ((False,) * 11 + (True,), " ×12, 1 interrupted and resumed"),
+            ((False, True, True, False), " ×4, 2 interrupted and resumed"),
+            ((True, True, True), " ×3, 3 interrupted and resumed"),
+            ((False, False, False), " ×3"),
+            ((True,), ", interrupted and resumed"),
+            ((False,), ""),
+        )
+        for dry_run in (True, False):
+            for mid_turns, suffix in cases:
+                with self.subTest(dry_run=dry_run, mid_turns=mid_turns):
+                    switches = tuple(codex_mesh.WorkersRunSwitch(
+                        self.root / f"plan-{index}", ("holder",), (
+                            codex_mesh.SwitchingWorker(f"plan-{index}-test", mid_turn),))
+                        for index, mid_turn in enumerate(mid_turns))
+                    with (patch.object(roster, "roster", return_value=roster.Roster([holder], [])),
+                          patch.object(roster, "machine_name", return_value="here")):
+                        lines = accounts._workers_swap_lines(  # pyright: ignore[reportPrivateUsage]
+                            switches, previous, "codex2", dry_run=dry_run)
+                    self.assertEqual(lines[1:], (
+                        f"  natedev · two-accounts · test-worker → codex2{suffix}",))
 
     def test_workers_swap_prints_ended_server_totals_and_each_busy_reason_in_both_modes(self) -> None:
         run = self.root / "ended-run"
