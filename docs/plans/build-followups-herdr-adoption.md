@@ -570,7 +570,7 @@ Moved to unit `herdr-panes-unit`, run in parallel with Phase 5; shipped as `docs
 - On the Mac `/tmp` resolves to `/private/tmp`; a child reports the resolved path, so tests compare against the resolved temp root.
 - A test that fakes a platform's process reader pins that platform, or the Darwin `ps` reader fails first (`ps: no executable: ps`).
 
-### Phase 20 — Crash recovery on the Mac, live check with the user  · status: todo
+### Phase 20 — Crash recovery on the Mac, live check with the user  · status: done
 
 **Depends on:** Phase 19
 
@@ -583,8 +583,8 @@ Moved to unit `herdr-panes-unit`, run in parallel with Phase 5; shipped as `docs
 **Spec:**
 
 1. The user's Mac check: `herdr_sessions.py start` in a Mac Ghostty window; over ssh the unit director confirms the server environment, that a second start is refused, and `agents down`/`agents restart --only <name> --here --no-alert`; the user confirms the reopened window shows the conversation.
-2. Crash recovery: a throwaway session, a snapshot, a simulated host loss, `agents restart` brings it back attached, Codex included. The Remote Control fixer is proven live: a restarted session missing Remote Control gets it from the detached fixer.
-3. Any defect found is fixed here, with a test that fails without the fix.
+2. Crash recovery: a snapshot, a simulated host loss (`herdr --session <name> server stop`), and `agents restart --only <name> --here --no-alert` brings the session back with the note "Restored after a crash: its host was lost (last seen …, restored …)", in a reopened Ghostty window, the conversation focused.
+3. A defect found moves to the next phase with its evidence. The signed-in crash recheck, the Remote Control fixer check and the Codex fixture need that phase's fix, so they run there.
 
 **Files:**
 - `scripts/shutdown/` — repairs the live checks call for.
@@ -594,4 +594,36 @@ Moved to unit `herdr-panes-unit`, run in parallel with Phase 5; shipped as `docs
 
 **Constraints from prior phases:** the Mac clone `~/scratch/herdr-mac` pulls the pushed branch; copying the worktree to the Mac is refused, so every Mac run is from a pushed commit. Throwaway sessions are picked with `--only <name> --here --no-alert`, and every herdr command names `--session`. `accounts.py exec --probe '<account>' -n <name>` launches only Claude, never inside herdr and never Codex; a herdr-hosted Claude probe on the Mac is `herdr_sessions.py start --name <probe> --cwd <a trusted folder>` from a Mac Ghostty window (ssh cannot open it), a Codex fixture is `codex` run by hand in a pane of that probe session, and cleanup is `herdr --session <probe> server stop` plus removing `~/.config/herdr/sessions/<probe>`. Mac background programs start through `scripts/lib/detached.py`, never launchd. A restart that adopts a running herdr server focuses the restored workspace (`Herdr.focus_workspace`) and never closes the empty shell workspace herdr gives a still-attached window; a failed focus is one `restart issue` line. A detached conductor or fixer prints its readiness line only when `DETACHED_STARTUP_SIGNAL=1` is in its environment, and a failed start names its log under `shutdown_state_root()/logs`.
 
-**Acceptance gate:** both live checks pass on the Mac; if a check changed code, `merge_gate.py --tests-only` green on natedev, `basedpyright scripts/lib scripts/herdr scripts/shutdown` clean, and the Mac `scripts/herdr`, `scripts/shutdown` and `scripts/lib` suites green from the pushed commit.
+**Acceptance gate:** check 1 and check 2 pass on the Mac; if a check changed code, `merge_gate.py --tests-only` green on natedev, `basedpyright scripts/lib scripts/herdr scripts/shutdown` clean, and the Mac `scripts/herdr`, `scripts/shutdown` and `scripts/lib` suites green from the pushed commit.
+
+### Phase 21 — Mac restarts start herdr from the desktop  · status: todo
+
+**Depends on:** Phase 20
+
+**User sees:** before — a Mac session restarted after a crash, by `agents restart` over ssh or from natedev, comes back saying "Not logged in"; after — it comes back signed in, or the restart stops with one line: "the Mac desktop is not signed in: restart from the Mac".
+
+#### Work Order
+
+**Goal:** never start a Mac herdr server from an ssh login, since Claude inside it cannot read its sign-in from the keychain.
+
+**Spec:**
+
+1. Measured cause (2026-10-16 14:36 EDT): restart over ssh found no herdr server for `herdr-mac-check`, started one through `herdr.start_server` → `_start_darwin_server` → `detached.start_detached`, and the Claude resumed in it printed "Not logged in · Please run /login". From an ssh login, `security show-keychain-info ~/Library/Keychains/login.keychain-db` fails with "User interaction is not allowed"; a process started there keeps that login's security session after it detaches.
+2. On the Mac, when the caller is not in the desktop session and no server is answering, the server is started by the attach window: `open -na "/Applications/Nix Apps/Ghostty.app" --args -e <herdr> session attach <name>` (the window restart already opens, now opened before the resume), and the restart waits for that server to answer, then adopts it and resumes Claude into it. The caller's session kind is read once, at the start, from one query (`launchctl managername` prints `Aqua` in the desktop session; read-only, it starts nothing). In the desktop session the current detached start is kept.
+3. When that window's server does not answer within the wait (no one signed in at the Mac desktop, or `open` fails), the restart starts nothing from ssh and reports one line for that session: `the Mac desktop is not signed in: restart from the Mac`. It is a `restart issue` line, recorded on the session like the other restart issues, and the session stays restartable.
+4. `herdr_sessions.py start` and `resume` on the Mac follow the same rule: outside the desktop session they never start a server, and say the same line.
+5. A natedev-driven restart of Mac sessions (`remote.py` running `shutdown.py restart` on the Mac over ssh) takes the same path; its output carries the one line back to natedev unchanged.
+6. Live, on the Mac, after the fix is pushed and pulled into `~/scratch/herdr-mac`: restart the signed-out `herdr-mac-check` (down, then restart over ssh) and see it signed in; repeat the crash check (snapshot, `herdr --session herdr-mac-check server stop`, restart over ssh) and see the crash note with a signed-in Claude; the Remote Control fixer check (a restarted session missing Remote Control gets it from the detached fixer); the Codex fixture (`codex` run by hand by the user in a pane of a probe session) restored by restart.
+
+**Files:**
+- `scripts/herdr/herdr.py` — desktop-session check; Mac server start through the attach window.
+- `scripts/herdr/test_herdr.py` — tests for both session kinds, the wait and the refusal.
+- `scripts/herdr/herdr_sessions.py`, `scripts/herdr/test_herdr_sessions.py` — start and resume outside the desktop session.
+- `scripts/shutdown/restart.py`, `scripts/shutdown/test_restart.py` — window before resume on the Mac, the one-line issue.
+- `scripts/shutdown/remote.py`, `scripts/shutdown/test_remote.py` — the line reaches natedev (only if a change is needed).
+
+**Workers:** 1 writer, `test` (as impl), for all files above.
+
+**Constraints from prior phases:** Mac background programs start through `scripts/lib/detached.py`, never launchd; `launchctl managername` is a read-only query and the only launchctl call. A restart that adopts a running herdr server focuses the restored workspace (`Herdr.focus_workspace`) and never closes the empty shell workspace herdr gives an attached window. Every herdr command names `--session`. The Mac clone `~/scratch/herdr-mac` pulls the pushed branch; copying the worktree to the Mac is refused. Throwaway sessions are picked with `--only <name> --here --no-alert`.
+
+**Acceptance gate:** a test fails without the fix for each of Spec 2–5; `merge_gate.py --tests-only` green on natedev; `basedpyright scripts/lib scripts/herdr scripts/shutdown` clean; the Mac `scripts/herdr`, `scripts/shutdown` and `scripts/lib` suites green from the pushed commit; Spec 6 passes on the Mac.
