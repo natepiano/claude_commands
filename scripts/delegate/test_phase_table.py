@@ -1047,6 +1047,90 @@ class PhaseTableTests(unittest.TestCase):
         self.assertEqual(current.fix_rounds, 1)
         self.assertEqual(current.findings, {"blocker": 0, "minor": 0, "nit": 1})
 
+    def test_fix_rounds_split_completed_and_running_passes_across_instances(self) -> None:
+        self.write_plan(plan_text("### Phase 1 — Repeated delivery  · status: todo"))
+        _ = self.write_run(
+            "older", 800,
+            self.phase_event("phase_started", "1", "old-one", 900,
+                             phase_title="Repeated delivery"),
+            self.phase_event("pass_started", "1", "old-one", 920,
+                             pass_instance_id="old-fix", pass_kind="fix"),
+            self.phase_event("pass_finished", "1", "old-one", 950,
+                             pass_instance_id="old-fix", pass_kind="fix",
+                             status="completed", pass_elapsed_seconds=30),
+            self.phase_event("phase_finished", "1", "old-one", 1_000,
+                             status="completed", phase_elapsed_seconds=100),
+        )
+        events = [
+            self.phase_event("phase_started", "1", "new-one", 1_200,
+                             phase_title="Repeated delivery"),
+            self.phase_event("pass_started", "1", "new-one", 1_220,
+                             pass_instance_id="review", pass_kind="review"),
+            self.phase_event("pass_finished", "1", "new-one", 1_250,
+                             pass_instance_id="review", pass_kind="review",
+                             status="completed", pass_elapsed_seconds=30),
+            self.phase_event("pass_started", "1", "new-one", 1_260,
+                             pass_instance_id="finished-fix", pass_kind="fix"),
+            self.phase_event("pass_finished", "1", "new-one", 1_300,
+                             pass_instance_id="finished-fix", pass_kind="fix",
+                             status="completed", pass_elapsed_seconds=40),
+            self.phase_event("pass_started", "1", "new-one", 1_310,
+                             pass_instance_id="running-fix", pass_kind="fix"),
+        ]
+        _ = self.write_run("current", 1_100, *events)
+        self.write_state(None)
+
+        current = self.build(1_400).current
+
+        assert isinstance(current, phase_table.OpenPhase)
+        self.assertEqual((current.fix_done, current.fix_running), (2, 1))
+        self.assertEqual(current.fix_rounds, 3)
+
+        events.append(self.phase_event(
+            "pass_finished", "1", "new-one", 1_450,
+            pass_instance_id="running-fix", pass_kind="fix",
+            status="completed", pass_elapsed_seconds=140,
+        ))
+        _ = self.write_run("current", 1_100, *events)
+        current = self.build(1_500).current
+
+        assert isinstance(current, phase_table.OpenPhase)
+        self.assertEqual((current.fix_done, current.fix_running), (3, 0))
+        self.assertEqual(current.fix_rounds, 3)
+
+    def test_running_fix_indicator_is_binary_while_total_keeps_all_open_passes(self) -> None:
+        self.write_plan(plan_text("### Phase 1 — Current delivery  · status: todo"))
+        events = [
+            self.phase_event("phase_started", "1", "one", 900,
+                             phase_title="Current delivery"),
+            self.phase_event("pass_started", "1", "one", 920,
+                             pass_instance_id="finished", pass_kind="fix"),
+            self.phase_event("pass_finished", "1", "one", 950,
+                             pass_instance_id="finished", status="completed"),
+            self.phase_event("pass_started", "1", "one", 960,
+                             pass_instance_id="first-open", pass_kind="fix"),
+            self.phase_event("pass_started", "1", "one", 980,
+                             pass_instance_id="second-open", pass_kind="fix"),
+        ]
+        self.write_state(None)
+
+        for closed, expected_done in ((0, 1), (1, 2), (2, 3)):
+            with self.subTest(closed=closed):
+                _ = self.write_run("current", 800, *events)
+                current = self.build(1_200).current
+
+                assert isinstance(current, phase_table.OpenPhase)
+                self.assertEqual(current.fix_done, expected_done)
+                self.assertEqual(current.fix_running, 0 if closed == 2 else 1)
+                self.assertEqual(current.fix_rounds, 3)
+
+                if closed < 2:
+                    events.append(self.phase_event(
+                        "pass_finished", "1", "one", 1_000 + closed * 100,
+                        pass_instance_id="first-open" if closed == 0 else "second-open",
+                        status="completed",
+                    ))
+
     def test_phase_finished_before_its_last_eta_has_a_negative_delta(self) -> None:
         self.write_plan(plan_text("### Phase 1 — Finished delivery  · status: done"))
         _ = self.write_run(
