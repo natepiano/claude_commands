@@ -18,6 +18,7 @@ from typing import NamedTuple, cast
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import add_unit  # noqa: E402
+import production_units  # noqa: E402
 import showrunners  # noqa: E402
 import stall_watch  # noqa: E402
 import tidy_wrapped  # noqa: E402
@@ -107,7 +108,7 @@ def _merge_line(text: str, branch: str) -> str:
         if lines[index].startswith("- **Merge branch:**"):
             prefix = "- **Merge branch:**"
             raw = lines[index][len(prefix):]
-            value = add_unit.cell_value(raw.strip())
+            value = production_units.cell_value(raw.strip())
             updated = raw.replace(f"`{value}`", f"`{branch}`", 1) if "`" in raw else raw.replace(value, branch, 1)
             lines[index] = prefix + updated
             return "".join(lines)
@@ -184,13 +185,13 @@ def _build(old: str, new: str) -> RenamePlan:
     lines = production.doc.read_text(encoding="utf-8").splitlines()
     units: list[str] = []
     plans: list[Path] = []
-    for row in add_unit.unit_table(lines):
-        unit = add_unit.cell_value(row.get("Unit", ""))
+    for row in production_units.unit_table(lines):
+        unit = production_units.cell_value(row.get("Unit", ""))
         if not unit:
             raise RenameRefused("Units row has no unit name")
         units.append(unit)
         raw = row.get("Plan", "")
-        if add_unit.plan_cell_is_retired(raw):
+        if production_units.plan_cell_is_retired(raw):
             continue
         if raw.strip() in ("", "—", "-", "permanent"):
             continue
@@ -503,11 +504,11 @@ def _rename_journal(new: str) -> Generator[tuple[RenamePlan, dict[str, object]]]
 
 
 def _unit_row(plan: RenamePlan, name: str) -> dict[str, str]:
-    rows = [row for row in add_unit.unit_table(plan.new_doc.read_text(encoding="utf-8").splitlines())
-            if add_unit.cell_value(row.get("Unit", "")) == name]
+    rows = [row for row in production_units.unit_table(plan.new_doc.read_text(encoding="utf-8").splitlines())
+            if production_units.cell_value(row.get("Unit", "")) == name]
     if len(rows) != 1:
         raise RenameRefused(f"{name}: expected one Units row")
-    if add_unit.plan_cell_is_retired(rows[0].get("Plan", "")):
+    if production_units.plan_cell_is_retired(rows[0].get("Plan", "")):
         raise RenameRefused(f"{name} is retired and has no live worktree")
     return rows[0]
 
@@ -561,11 +562,11 @@ def _prepare_unit(plan: RenamePlan, name: str, row: dict[str, str]) -> dict[str,
     for field in ("Worktree", "Branch"):
         if field not in row:
             raise RenameRefused(f"{name}: Units table lacks {field} column")
-    branch = add_unit.cell_value(row.get("Branch", ""))
+    branch = production_units.cell_value(row.get("Branch", ""))
     if not branch.startswith(plan.old + "-"):
         raise RenameRefused(f"{name}: branch {branch} does not start with {plan.old}-")
     stem = branch[len(plan.old) + 1:]
-    worktree = Path(add_unit.cell_value(row.get("Worktree", ""))).expanduser().resolve()
+    worktree = Path(production_units.cell_value(row.get("Worktree", ""))).expanduser().resolve()
     if not (worktree / ".git").is_file():
         raise RenameRefused(f"{name}: no linked worktree at {worktree}")
     new_branch = f"{plan.new}-{stem}"
@@ -666,7 +667,7 @@ def _move_unit_configs(record: dict[str, object]) -> None:
 
 def _unit_doc(plan: RenamePlan, name: str, record: dict[str, object]) -> None:
     lines = plan.new_doc.read_text(encoding="utf-8").splitlines(keepends=True)
-    headings = add_unit.unit_headings([line.rstrip("\n") for line in lines])
+    headings = production_units.unit_headings([line.rstrip("\n") for line in lines])
     for field in ("Worktree", "Branch"):
         if field not in headings:
             raise RenameRefused(f"{name}: Units table lacks {field} column")
@@ -676,8 +677,8 @@ def _unit_doc(plan: RenamePlan, name: str, record: dict[str, object]) -> None:
             in_units = line.strip() == "## Units"
         if not in_units or not line.startswith("|"):
             continue
-        cells = add_unit.row_cells(line)
-        if cells and add_unit.cell_value(cells[0]) == name:
+        cells = production_units.row_cells(line)
+        if cells and production_units.cell_value(cells[0]) == name:
             for field, value in (("Worktree", _string(record, "new_worktree")),
                                  ("Branch", _string(record, "new_branch"))):
                 column = headings.index(field)
@@ -694,11 +695,11 @@ def _commit_unit(plan: RenamePlan, name: str, record: dict[str, object]) -> None
     if _git(plan.checkout, "branch", "--show-current") != plan.new:
         raise RenameRefused("showrunner checkout switched away from the new merge branch")
     path = _relative(plan, plan.new_doc)
-    rows = add_unit.unit_table(_git(plan.checkout, "show", f"HEAD:{path}").splitlines())
-    matching = [row for row in rows if add_unit.cell_value(row.get("Unit", "")) == name]
+    rows = production_units.unit_table(_git(plan.checkout, "show", f"HEAD:{path}").splitlines())
+    matching = [row for row in rows if production_units.cell_value(row.get("Unit", "")) == name]
     committed = (len(matching) == 1
-                 and add_unit.cell_value(matching[0].get("Worktree", "")) == _string(record, "new_worktree")
-                 and add_unit.cell_value(matching[0].get("Branch", "")) == _string(record, "new_branch"))
+                 and production_units.cell_value(matching[0].get("Worktree", "")) == _string(record, "new_worktree")
+                 and production_units.cell_value(matching[0].get("Branch", "")) == _string(record, "new_branch"))
     changed = set(_git(plan.checkout, "diff", "--name-only", "-z", "HEAD").split("\0")) - {""}
     changed.update(set(_git(plan.checkout, "diff", "--cached", "--name-only", "-z", "HEAD").split("\0")) - {""})
     untracked = _git(plan.checkout, "ls-files", "--others", "--exclude-standard")
@@ -767,10 +768,10 @@ def finish(new: str) -> None:
     with _rename_journal(new) as (result, journal):
         if journal["done"]:
             return
-        rows = add_unit.unit_table(result.new_doc.read_text(encoding="utf-8").splitlines())
-        remaining = [add_unit.cell_value(row.get("Unit", "")) for row in rows
-                     if not add_unit.plan_cell_is_retired(row.get("Plan", ""))
-                     and add_unit.cell_value(row.get("Branch", "")).startswith(result.old + "-")]
+        rows = production_units.unit_table(result.new_doc.read_text(encoding="utf-8").splitlines())
+        remaining = [production_units.cell_value(row.get("Unit", "")) for row in rows
+                     if not production_units.plan_cell_is_retired(row.get("Plan", ""))
+                     and production_units.cell_value(row.get("Branch", "")).startswith(result.old + "-")]
         if remaining:
             raise RenameRefused("units still use old branches: " + ", ".join(remaining))
         records = _object(journal.get("unit_moves", {}))
@@ -814,7 +815,7 @@ def main(argv: list[str]) -> int:
                 print(line)
             if action == "apply":
                 print(f"{result.old} is now {result.new}; keep {result.merge_branch} until finish")
-    except (RenameRefused, add_unit.Refusal, tidy_wrapped.TidyRefused, OSError, UnicodeError) as error:
+    except (RenameRefused, production_units.Refusal, tidy_wrapped.TidyRefused, OSError, UnicodeError) as error:
         print(f"rename: {error}", file=sys.stderr)
         return 1
     return 0

@@ -13,7 +13,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import NamedTuple, cast
 
-from add_unit import Production, Refusal, cell_value, read_production
+from add_unit import Production, read_production
+from production_units import Refusal, cell_value
 from merge_checkpoint import CodeCheckpoint, MergeEntry, git, merge_branch_history
 
 
