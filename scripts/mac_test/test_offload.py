@@ -72,6 +72,7 @@ class CommandEvent(TypedDict):
     args: list[str]
     claimed: bool
     exclude: NotRequired[str]
+    copy_claim: NotRequired[bool]
 
 
 class SelectorEvent(TypedDict):
@@ -120,6 +121,10 @@ event = {
     "args": arguments,
     "claimed": (Path(os.environ["MAC_TEST_STATE_DIR"]) / "claims" / "hana.json").exists(),
 }
+try:
+    event["copy_claim"] = json.loads((Path(os.environ["MAC_TEST_STATE_DIR"]) / "claims" / "hana.json").read_text()).get("copy", False)
+except (OSError, ValueError):
+    pass
 if command == "rsync":
     exclude_argument = next(
         argument for argument in arguments if argument.startswith("--exclude-from=")
@@ -681,6 +686,7 @@ class OffloadCommandTests(unittest.TestCase):
         settings: Path | offload.DefaultMacSettings = offload.DEFAULT_MAC_SETTINGS,
         last_decline: str = "",
         separate_stderr: bool = False,
+        copy: bool = False,
     ) -> subprocess.CompletedProcess[str]:
         self.result_path.unlink(missing_ok=True)
         arguments = [
@@ -696,6 +702,8 @@ class OffloadCommandTests(unittest.TestCase):
         ]
         if filter_run:
             arguments.append("--filter-run")
+        if copy:
+            arguments.append("--copy")
         if isinstance(settings, Path):
             arguments.extend(["--settings", str(settings)])
         if last_decline:
@@ -1636,6 +1644,21 @@ raise SystemExit(offload.main())
         self.assertNotIn("mac_exit=", result.stdout)
         self.assert_wire("passed", "")
         self.assertFalse(self.claim_file.exists())
+
+    def test_copy_claims_as_a_copy_and_names_the_copy(self) -> None:
+        result = self.command("--workspace", copy=True)
+        self.assertEqual(result.returncode, 0, result.stdout)
+        self.assertTrue(result.stdout.startswith(
+            "mac_test: running a copy on the Mac while natedev compiles (host Mac); tree copied in "), result.stdout)
+        self.assertNotIn("mac_test: running on the Mac", result.stdout)
+        self.assert_wire("passed", "")
+        held = [event for event in self.events() if event["command"] in ("ssh", "rsync")]
+        self.assertTrue(held)
+        self.assertTrue(all(event.get("copy_claim") is True for event in held), held)
+        self.assertFalse(self.claim_file.exists())
+        self.clear_events()
+        self.assertEqual(self.command("--workspace").returncode, 0)
+        self.assertTrue(all(event.get("copy_claim") is False for event in self.events_for("rsync")))
 
     def test_first_remote_line_is_printed_before_the_next_line(self) -> None:
         self.fixture["run_lines"] = [

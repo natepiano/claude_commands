@@ -5,6 +5,7 @@ description: Answer a question about build, lint, test and CI timings, failures 
 `$ARGUMENTS` is the question.
 
 Step tables, Rebuilds, Memory pressure and Summary count natedev's steps; the Mac section holds the Mac's steps.
+Mac copies counts Mac copies of still-compiling natedev tests and estimates the time the winners saved.
 The Power profile section compares passing natedev steps before and after each profile change in the last 7 days.
 
 Empty, or only a date → run `~/.claude/scripts/buildlog/buildlog report [YYYY-MM-DD]` (default today; its times are in the user's zone) and show its markdown unchanged. Add at most one line after it, only for something the tables do not show.

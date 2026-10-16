@@ -30,11 +30,17 @@ from urllib.parse import quote
 
 import store
 
-SCHEMA_VERSION = 16
+SCHEMA_VERSION = 17
 LOCK_NAME = "index.lock"
 MARK_BYTES = 256
 BUSY_TIMEOUT_MS = 30_000
-COUNTED_FAILURE = "status != 0 AND NOT (caller IS 'verify-mac' AND step IS 'nextest' AND status = 4)"
+# A Mac "no tests to run" (status 4) and a natedev nextest step stopped because
+# a Mac copy of its call finished first keep their raw status without counting.
+COUNTED_FAILURE = (
+    "status != 0 AND NOT (caller IS 'verify-mac' AND step IS 'nextest' AND status = 4)"
+    + " AND NOT (host IS 'natedev' AND step IS 'nextest'"
+    + " AND call_id IN (SELECT id FROM calls WHERE copy = 'won'))"
+)
 
 Column = tuple[str, str, str]
 
@@ -145,6 +151,15 @@ CALL_COLUMNS: list[Column] = [
     ("mac_s", "REAL", "seconds spent deciding or running on the Mac"),
     ("target", "TEXT", "where the call was when it ended: mac, natedev, or empty"),
     ("hold_wait_s", "REAL", "seconds waited on a held target, each declined Mac retry included; memory waits are not counted"),
+    (
+        "copy",
+        "TEXT",
+        "Mac copy of a still-compiling natedev test: won, natedev_won, passed_full, gave_way, declined or lost"
+        + " (the last copy's outcome); empty when no copy started, NULL in old rows",
+    ),
+    ("copy_s", "REAL", "seconds Mac copies of this call held the Mac, every copy summed"),
+    ("copy_count", "INTEGER", "Mac copies started for this call"),
+    ("copy_natedev_s", "REAL", "seconds the natedev nextest step had run (from its first cargo line) when the result was decided"),
     ("wall_s", "INTEGER", "seconds the run took"),
     ("build_s", "INTEGER", "cargo's own build seconds, NULL when unmeasured"),
     ("saved_s", "INTEGER", "seconds a reused or replayed record saved"),

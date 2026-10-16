@@ -64,7 +64,7 @@ GROUP_AS_SCRATCH = f"({SCRATCH} AND caller != 'brp-launch')"
 SCRATCH_LABEL = "scratch (temp folders)"
 ON_DAY = "date(started_at, 'localtime') = ?"
 COMMON_HEAD = ["Runs", "Failed", "Avg", "p95", "Range"]
-COMMON_SQL = "count(*), sum(status <> 0), avg(duration_s), min(duration_s), max(duration_s), group_concat(duration_s)"
+COMMON_SQL = f"count(*), sum({index.COUNTED_FAILURE}), avg(duration_s), min(duration_s), max(duration_s), group_concat(duration_s)"
 CI_STALE_AFTER_S = 2 * 3600
 MAX_SAMPLE_GAP_S = 5 * 60
 MIN_PROFILE_RUNS = 10
@@ -85,6 +85,10 @@ CASCADE_LABEL = f"cascade ({CASCADE_MIN_CRATES}–{CASCADE_MAX_CRATES} crates)"
 COLD_BUILD_LABEL = f"cold ({COLD_BUILD_MIN_CRATES}+ crates)"
 REBUILD_LABELS = (NO_REBUILD_LABEL, EDITED_CRATE_LABEL, CASCADE_LABEL, COLD_BUILD_LABEL)
 PACKAGE_PATTERN = re.compile(r"package\(([^)&|\s]+)\)")
+COPY_WON = "won"
+COPY_NATEDEV_WON = "natedev_won"
+COPY_GAVE_WAY = "gave_way"
+MIN_SAME_COMMAND_STEPS = 3
 
 Row = tuple[object, ...]
 ReportedWait = tuple[float, str, str, str]
@@ -122,6 +126,10 @@ class ReportedTestCall:
     token_wait_seconds: float | DurationNotRecorded
     target_recorded: bool
     candidate: bool
+    copy: str
+    copy_seconds: float | DurationNotRecorded
+    copy_count: int
+    copy_natedev_seconds: float | DurationNotRecorded
 
 
 @dataclass
@@ -145,6 +153,46 @@ class PackageNatedevTests:
     wall_seconds: list[float] = field(default_factory=list)
     token_wait_seconds: list[float] = field(default_factory=list)
     ran: int = 0
+
+
+@dataclass(frozen=True)
+class ComparableNatedevStep:
+    """A natedev nextest step of a test call that ran to its end, for the copy saving estimate."""
+
+    command: str
+    package: str
+    duration_s: float
+
+
+@dataclass
+class PackageMacCopies:
+    """One package's Mac copies of still-compiling natedev tests."""
+
+    copies: int = 0
+    won: int = 0
+    natedev_won: int = 0
+    gave_way: int = 0
+    other: int = 0
+    saved_seconds: float = 0.0
+    not_won_calls: int = 0
+    not_won_mac_seconds: float = 0.0
+
+
+@dataclass(frozen=True)
+class DailyMacCopies:
+    packages: dict[str, PackageMacCopies]
+
+    @property
+    def started(self) -> int:
+        return sum(package.copies for package in self.packages.values())
+
+    @property
+    def won(self) -> int:
+        return sum(package.won for package in self.packages.values())
+
+    @property
+    def saved_seconds(self) -> float:
+        return sum(package.saved_seconds for package in self.packages.values())
 
 
 def seconds(value: object) -> str:
@@ -1010,7 +1058,8 @@ def reported_mac_calls(connection: sqlite3.Connection, day: str) -> list[Reporte
     rows = fetch(
         connection,
         "SELECT id, host, started_at, package, worktree, command, status, mac, mac_reason,"
-        + " local_reason, mac_s, outcome, wall_s, token_wait_s, target FROM calls"
+        + " local_reason, mac_s, outcome, wall_s, token_wait_s, target,"
+        + " coalesce(copy, ''), copy_s, copy_count, copy_natedev_s FROM calls"
         + " WHERE started_at >= ? AND started_at < ? AND tool = 'verify.sh' AND verb = 'test'"
         + " AND (started_at < ? OR (mac = 'declined' AND mac_reason = 'local_flag'))"
         + " ORDER BY started_at, id",
@@ -1028,11 +1077,13 @@ def reported_mac_calls(connection: sqlite3.Connection, day: str) -> list[Reporte
     local_calls = {(str(call_id), str(host)) for call_id, host in steps}
     calls: list[ReportedTestCall] = []
     for (call_id, host, started_at, package, worktree, command, status, mac, mac_reason,
-         local_reason, mac_s, outcome, wall_s, token_wait_s, target) in rows:
+         local_reason, mac_s, outcome, wall_s, token_wait_s, target,
+         copy, copy_s, copy_count, copy_natedev_s) in rows:
         result = offload_record(mac, mac_reason, local_reason, mac_s, outcome)
         if isinstance(result, CacheReuse):
             continue
-        ran_on_natedev = (str(call_id), str(host)) in local_calls
+        # A copy win stopped the natedev step, so the call's time is not a natedev run's.
+        ran_on_natedev = (str(call_id), str(host)) in local_calls and copy != COPY_WON
         if isinstance(result, NoOffloadRecord) and not ran_on_natedev:
             continue
         calls.append(ReportedTestCall(
@@ -1043,6 +1094,8 @@ def reported_mac_calls(connection: sqlite3.Connection, day: str) -> list[Reporte
             str(started_at) < end,
             offload_seconds(wall_s), offload_seconds(token_wait_s),
             target is not None, is_mac_candidate(result),
+            str(copy), offload_seconds(copy_s), copy_count if isinstance(copy_count, int) else 0,
+            offload_seconds(copy_natedev_s),
         ))
     return calls
 
@@ -1137,6 +1190,96 @@ def mac_section(connection: sqlite3.Connection, day: str) -> list[str]:
     ]
 
 
+def comparable_natedev_steps(connection: sqlite3.Connection, day: str) -> list[ComparableNatedevStep]:
+    """The day's natedev nextest steps of test calls that ran to their end; a step a copy win stopped is left out."""
+    start, end = day_range(day)
+    rows = fetch(
+        connection,
+        "SELECT c.command, c.package, s.duration_s FROM steps s JOIN calls c ON c.id = s.call_id"
+        + " WHERE s.started_at >= ? AND s.started_at < ? AND s.step = 'nextest' AND s.status < 128"
+        + f" AND s.duration_s IS NOT NULL AND {natedev_step_predicate('s')}"
+        + f" AND c.tool = 'verify.sh' AND c.verb = 'test' AND coalesce(c.copy, '') <> '{COPY_WON}'",
+        start, end,
+    )
+    return [
+        ComparableNatedevStep(str(command or ''), str(package or '(unknown)'), float(cast(float, duration)))
+        for command, package, duration in rows
+    ]
+
+
+def copy_saving_estimate(call: ReportedTestCall, steps: Sequence[ComparableNatedevStep]) -> float:
+    """The time natedev would still have needed when the copy won: the median remaining time of comparable steps that lasted longer."""
+    elapsed = call.copy_natedev_seconds
+    if isinstance(elapsed, DurationNotRecorded):
+        return 0.0
+    same_command = [step.duration_s for step in steps if step.command == call.command]
+    durations = same_command if len(same_command) >= MIN_SAME_COMMAND_STEPS else [
+        step.duration_s for step in steps if step.package == call.package
+    ]
+    remaining = [duration - elapsed for duration in durations if duration > elapsed]
+    return nearest_rank(remaining, 50) if remaining else 0.0
+
+
+def daily_mac_copies(connection: sqlite3.Connection, day: str, calls: Sequence[ReportedTestCall]) -> DailyMacCopies:
+    copied = [call for call in calls if call.on_report_day and call.copy]
+    steps = comparable_natedev_steps(connection, day) if any(call.copy == COPY_WON for call in copied) else []
+    packages: dict[str, PackageMacCopies] = {}
+    for call in copied:
+        package = packages.setdefault(call.package, PackageMacCopies())
+        package.copies += max(1, call.copy_count)
+        if call.copy == COPY_WON:
+            package.won += 1
+            package.saved_seconds += copy_saving_estimate(call, steps)
+            continue
+        if call.copy == COPY_NATEDEV_WON:
+            package.natedev_won += 1
+        elif call.copy == COPY_GAVE_WAY:
+            package.gave_way += 1
+        else:
+            package.other += 1
+        package.not_won_calls += 1
+        if isinstance(call.copy_seconds, float):
+            package.not_won_mac_seconds += call.copy_seconds
+    return DailyMacCopies(packages)
+
+
+def mac_copies_lines(copies: DailyMacCopies) -> list[str]:
+    if not copies.started:
+        return ["Mac copies: none started.", ""]
+    body = [
+        [
+            name,
+            count(package.copies),
+            count(package.won),
+            count(package.natedev_won),
+            count(package.gave_way),
+            count(package.other),
+            seconds(package.saved_seconds) if package.won else "—",
+            seconds(package.not_won_mac_seconds) if package.not_won_calls else "—",
+        ]
+        for name, package in sorted(copies.packages.items())
+    ]
+    head = ["Package", "Copies", "Mac won", "natedev won", "Gave way", "Other", "Est. saved",
+            "Mac time on copies that did not win"]
+    return [
+        "### Mac copies", "", *table(head, body),
+        "Source: `verify.sh test` calls whose natedev run was still compiling when a copy of it started on the Mac;"
+        + " the outcome columns count calls by their last copy's outcome, and Other is a full-run Mac pass"
+        + " (natedev still gates), a declined copy or a lost one.",
+        "Est. saved is an estimate: for each Mac win, with t the time the stopped natedev step had run, the median"
+        + " (nearest rank) of duration minus t over that day's natedev nextest steps that ran to their end and lasted"
+        + f" longer than t, of the same command when there are at least {MIN_SAME_COMMAND_STEPS} such steps, else of"
+        + " the same package; 0 when none lasted longer or t is unknown.",
+        "",
+    ]
+
+
+def mac_copies_lead_lines(copies: DailyMacCopies) -> list[str]:
+    if not copies.started:
+        return []
+    return [f"Mac copies: {copies.won} of {copies.started} finished first, about {seconds(copies.saved_seconds)} saved (estimated)."]
+
+
 def mac_tests_section(connection: sqlite3.Connection, day: str) -> list[str]:
     return tests_by_target_lines(reported_mac_calls(connection, day))
 
@@ -1229,6 +1372,7 @@ def tests_by_target_lines(calls: Sequence[ReportedTestCall]) -> list[str]:
         call
         for call in calls
         if isinstance(call.offload, MacRunCompleted)
+        and call.copy != COPY_WON
         and (
             call.offload.outcome == "passed_filter"
             or call.offload.outcome == "failed"
@@ -1588,7 +1732,9 @@ def mac_note() -> str:
     return prefix + (f"Mac rows as of the {when} sync." if status.ok else f"Mac: the last sync failed; last good sync {when}.")
 
 
-def lead_block(connection: sqlite3.Connection, day: str, calls: Sequence[ReportedTestCall], waits: DailyWaits) -> list[str]:
+def lead_block(
+    connection: sqlite3.Connection, day: str, calls: Sequence[ReportedTestCall], waits: DailyWaits, copies: DailyMacCopies,
+) -> list[str]:
     """The day's routing, waits, failures and saved work, before the tables."""
     start, end = day_range(day)
     share = usable_share(connection, start, end)
@@ -1602,7 +1748,7 @@ def lead_block(connection: sqlite3.Connection, day: str, calls: Sequence[Reporte
         lines.append(f"Longest wait: {seconds(longest)} for {name}.")
     failures, flaky = fetch(
         connection,
-        "SELECT sum(status <> 0), sum(tests_flaky) FROM steps WHERE started_at >= ? AND started_at < ?"
+        f"SELECT sum({index.COUNTED_FAILURE}), sum(tests_flaky) FROM steps WHERE started_at >= ? AND started_at < ?"
         + f" AND {natedev_step_predicate()}",
         start, end,
     )[0]
@@ -1623,6 +1769,7 @@ def lead_block(connection: sqlite3.Connection, day: str, calls: Sequence[Reporte
             instant = latest.started_at.astimezone(user_zone())
             shown = instant.strftime('%H:%M' if day == datetime.now(user_zone()).date().isoformat() else '%Y-%m-%d %H:%M %Z')
             lines.append(f"Mac unreachable as of {shown}")
+    lines += mac_copies_lead_lines(copies)
     return [*lines, ""] if lines else []
 
 
@@ -1640,7 +1787,8 @@ def report(connection: sqlite3.Connection, day: str) -> str:
     test_calls = reported_mac_calls(connection, day)
     lines = [f"## Builds, {date.fromisoformat(day).strftime('%A %Y-%m-%d')}", ""]
     waits = daily_waits(connection, day)
-    lines += lead_block(connection, day, test_calls, waits)
+    copies = daily_mac_copies(connection, day, test_calls)
+    lines += lead_block(connection, day, test_calls, waits, copies)
     lines += waiting_lines(waits)
     lines += rebuilds_section(connection, day)
     for kind in found:
@@ -1655,6 +1803,7 @@ def report(connection: sqlite3.Connection, day: str) -> str:
         + power_profile_section(connection, day)
         + tests_by_target_lines(test_calls)
         + mac_section(connection, day)
+        + mac_copies_lines(copies)
         + port_lint
         + ci
         + tests_per_edit_section(connection, day)

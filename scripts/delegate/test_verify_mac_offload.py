@@ -56,6 +56,10 @@ class RoutingRecord(TypedDict):
     target: str
     hold_wait_s: float
     mem_wait_s: str
+    copy: str
+    copy_s: str
+    copy_count: str
+    copy_natedev_s: str
 
 
 class CallRecord(TypedDict):
@@ -121,6 +125,25 @@ if arguments[:1] == ["metadata"]:
     raise SystemExit(0)
 if arguments[:2] == ["nextest", "--version"]:
     raise SystemExit(0)
+if arguments[:2] == ["nextest", "run"] and os.environ.get("TEST_CARGO_HOLD") == "1":
+    # A natedev step still compiling: a cargo line, then a wait for
+    # cargo-release (tests start) or SIGTERM (a Mac copy won).
+    import signal
+    import time
+
+    root = Path(os.environ["TEST_RUNNER_STATE"])
+
+    def stop(signal_number: int, _frame: object) -> None:
+        (root / "cargo-stopped").write_text(str(signal_number), encoding="utf-8")
+        raise SystemExit(128 + signal_number)
+
+    signal.signal(signal.SIGTERM, stop)
+    print("   Compiling sample v0.1.0", flush=True)
+    (root / "cargo-compiling").write_text("compiling\n", encoding="utf-8")
+    while not (root / "cargo-release").exists():
+        time.sleep(0.01)
+    if os.environ.get("TEST_CARGO_STARTING", "1") == "1":
+        print("     Starting 1 test", flush=True)
 if arguments[:2] == ["nextest", "run"]:
     raise SystemExit(int(os.environ.get("TEST_LOCAL_STATUS", "0")))
 raise SystemExit(0)
@@ -177,6 +200,48 @@ import time
 arguments = sys.argv[1:]
 root = Path(os.environ["TEST_RUNNER_STATE"])
 result = Path(arguments[arguments.index("--result") + 1])
+
+if "--copy" in arguments:
+    # A Mac copy started by copy_watch.py. With TEST_COPY_CLAIM (mac_test.py)
+    # it holds a real copy claim; with TEST_COPY_WAIT=1 it waits for
+    # copy-release or SIGTERM; then it writes TEST_COPY_MAC and exits
+    # TEST_COPY_STATUS. SIGTERM releases the claim and exits 143.
+    import subprocess
+
+    mac_test = os.environ.get("TEST_COPY_CLAIM", "")
+    claimed = False
+
+    def release_copy_claim() -> None:
+        if claimed:
+            subprocess.run([sys.executable, mac_test, "release", "--pid", str(os.getpid())],
+                           check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+    def stop_copy(signal_number: int, _frame: object) -> None:
+        release_copy_claim()
+        (root / "copy-signal").write_text(str(signal_number), encoding="utf-8")
+        raise SystemExit(128 + signal_number)
+
+    signal.signal(signal.SIGTERM, stop_copy)
+    if mac_test:
+        claim = subprocess.run(
+            [sys.executable, mac_test, "claim", "--copy", "--pid", str(os.getpid()), "--what", "nextest sample",
+             "--worktree", arguments[arguments.index("--repo-root") + 1]],
+            check=False, capture_output=True, text=True)
+        if claim.returncode != 0:
+            print("copy claim failed: " + claim.stdout + claim.stderr, file=sys.stderr, flush=True)
+            raise SystemExit(99)
+        claimed = True
+    with (root / "copy-events.jsonl").open("a", encoding="utf-8") as output:
+        output.write(json.dumps(arguments) + "\n")
+    (root / "copy-started").write_text(str(os.getpid()), encoding="utf-8")
+    if os.environ.get("TEST_COPY_WAIT") == "1":
+        while not (root / "copy-release").exists():
+            time.sleep(0.01)
+    result.write_text("mac=" + os.environ.get("TEST_COPY_MAC", "failed") + "\nreason=\nseconds="
+                      + os.environ.get("TEST_COPY_SECONDS", "2.5") + "\n", encoding="utf-8")
+    release_copy_claim()
+    raise SystemExit(int(os.environ.get("TEST_COPY_STATUS", "1")))
+
 event = {
     "args": arguments,
     "token_held": Path(os.environ["TEST_TOKEN_RECORD"]).exists(),
@@ -347,7 +412,11 @@ import sys
 if sys.argv[1:2] == ["call"]:
     event = {"target": os.environ.get("BUILDLOG_TARGET", ""),
              "hold_wait_s": float(os.environ.get("BUILDLOG_HOLD_WAIT_S", "0")),
-             "mem_wait_s": os.environ.get("BUILDLOG_MEM_WAIT_S", "0")}
+             "mem_wait_s": os.environ.get("BUILDLOG_MEM_WAIT_S", "0"),
+             "copy": os.environ.get("BUILDLOG_MAC_COPY", ""),
+             "copy_s": os.environ.get("BUILDLOG_MAC_COPY_S", ""),
+             "copy_count": os.environ.get("BUILDLOG_MAC_COPY_COUNT", ""),
+             "copy_natedev_s": os.environ.get("BUILDLOG_MAC_COPY_NATEDEV_S", "")}
     with (Path(os.environ["TEST_RUNNER_STATE"]) / "routing-records.jsonl").open("a") as output:
         output.write(json.dumps(event) + "\n")
 sys.path.insert(0, str(Path(os.environ["TEST_REAL_RECORD"]).parent))
@@ -519,6 +588,7 @@ class VerifyMacOffloadTests(unittest.TestCase):
             "PLAN_DELEGATE_BOARD_DIR": str(self.board),
             "PLAN_DELEGATE_TEAM_ROLE": "test",
             "VERIFY_MAC_RUNNER": str(self.runner),
+            "VERIFY_MAC_COPY_WATCH": str(VERIFY.parent.parent / "mac_test" / "copy_watch.py"),
             "VERIFY_MAC_TEST_SCRIPT": str(self.root / "free-now.py"),
             "TEST_RUNNER_STATE": str(self.runner_state),
             "TEST_CARGO_EVENTS": str(self.cargo_events_path),
@@ -1745,6 +1815,104 @@ local_release_wait.wait_for_local_release(float(sys.argv[1]), sys.argv[2])
         self.assertEqual(self.local_runs(), [])
         self.assertFalse(Path(self.environment["TEST_TOKEN_RECORD"]).exists())
         self.assertEqual(list((self.root / "tmp").iterdir()), [])
+
+    def start_copy_call(self, *words: str, copy: dict[str, str]) -> tuple[subprocess.Popen[str], int]:
+        """Start a call the busy Mac sends to natedev, where its step compiles
+        until cargo-release; return it with the pid of the Mac copy it starts."""
+        process = self.start_verify("test", "sample", *words, "--no-cache", extra={
+            "TEST_RUNNER_BUSY_UNTIL": str(self.runner_state / "mac-free"),
+            "TEST_CARGO_HOLD": "1", **copy})
+        self.addCleanup(self.stop_verify, process)
+        started = self.runner_state / "copy-started"
+        self.wait_for_path(started, (process,))
+        self.assertTrue((self.runner_state / "cargo-compiling").exists())
+        self.assertEqual(len(self.runner_events()), 1)
+        return process, int(started.read_text(encoding="utf-8"))
+
+    def wait_for_reaped(self, pid: int, processes: Sequence[subprocess.Popen[str]]) -> None:
+        # Only the watcher collects its copy, and it reads the copy's result
+        # when it does: a gone pid means the watcher has taken the result.
+        self.wait_until(lambda: not Path(f"/proc/{pid}").exists(), f"the copy {pid} to be collected", processes)
+
+    def assert_copy_record(self, outcome: str, target: str) -> None:
+        record = self.routing_record()
+        self.assertEqual((record["copy"], record["copy_count"], record["target"]), (outcome, "1", target))
+        self.assertGreaterEqual(float(record["copy_s"]), 0)
+        self.assertGreaterEqual(float(record["copy_natedev_s"]), 0)
+
+    def test_copy_failure_first_stops_natedev_and_exits_with_the_copy_status(self) -> None:
+        process, _ = self.start_copy_call(copy={"TEST_COPY_MAC": "failed", "TEST_COPY_STATUS": "42"})
+        output, errors = process.communicate(timeout=HANG_GUARD_S)
+        self.assertEqual(process.returncode, 42, output + errors)
+        self.assertEqual((self.runner_state / "cargo-stopped").read_text(), str(signal.SIGTERM))
+        self.assertEqual(self.saved_results(), [])
+        self.assert_copy_record("won", "mac")
+        record = self.last_call()
+        self.assertEqual((record["status"], record["mac"], record["mac_reason"], record["mac_s"]),
+                         (42, "failed", "", 2.5))
+
+    def test_copy_filtered_pass_first_stops_natedev_without_a_pass_record(self) -> None:
+        process, _ = self.start_copy_call("--filter", "alpha", copy={"TEST_COPY_MAC": "passed", "TEST_COPY_STATUS": "0"})
+        output, errors = process.communicate(timeout=HANG_GUARD_S)
+        self.assertEqual(process.returncode, 0, output + errors)
+        self.assertIn("PASS on the Mac (macOS). A filtered run is feedback, so nothing ran on natedev.", output)
+        self.assertEqual((self.runner_state / "cargo-stopped").read_text(), str(signal.SIGTERM))
+        self.assertEqual(self.saved_results(), [])
+        self.assert_copy_record("won", "mac")
+        record = self.last_call()
+        self.assertEqual((record["status"], record["mac"], record["mac_s"]), (0, "passed_filter", 2.5))
+
+    def test_copy_full_pass_leaves_natedev_to_finish_as_the_gate(self) -> None:
+        process, copy = self.start_copy_call(copy={"TEST_COPY_MAC": "passed", "TEST_COPY_STATUS": "0"})
+        self.wait_for_reaped(copy, (process,))
+        self.assertIsNone(process.poll())
+        _ = (self.runner_state / "cargo-release").write_text("release\n")
+        output, errors = process.communicate(timeout=HANG_GUARD_S)
+        self.assertEqual(process.returncode, 0, output + errors)
+        self.assertFalse((self.runner_state / "cargo-stopped").exists())
+        self.assertEqual(len(self.local_runs()), 1)
+        self.assertEqual(len(self.saved_results()), 1)
+        self.assert_copy_record("passed_full", "natedev")
+        record = self.last_call()
+        self.assertEqual((record["status"], record["mac"], record["mac_reason"]), (0, "declined", "busy"))
+
+    def test_natedev_finishing_first_stops_the_copy_and_its_result_stands(self) -> None:
+        process, _ = self.start_copy_call(copy={"TEST_COPY_WAIT": "1"})
+        _ = (self.runner_state / "cargo-release").write_text("release\n")
+        output, errors = process.communicate(timeout=HANG_GUARD_S)
+        self.assertEqual(process.returncode, 0, output + errors)
+        self.assertEqual((self.runner_state / "copy-signal").read_text(), str(signal.SIGTERM))
+        self.assertFalse((self.runner_state / "cargo-stopped").exists())
+        self.assertEqual(len(self.saved_results()), 1)
+        self.assert_copy_record("natedev_won", "natedev")
+        record = self.last_call()
+        self.assertEqual((record["status"], record["mac"], record["mac_reason"]), (0, "declined", "busy"))
+
+    def test_new_test_claim_makes_the_copy_give_way_and_natedev_continues(self) -> None:
+        mac_test_script = str(VERIFY.parent.parent / "mac_test" / "mac_test.py")
+        # No second copy after the first gives way: the next check is an hour off.
+        self.environment["BUILD_TARGETS_POLL_S"] = "3600"
+        process, copy = self.start_copy_call(copy={"TEST_COPY_WAIT": "1", "TEST_COPY_CLAIM": mac_test_script})
+
+        def claim(*words: str) -> subprocess.CompletedProcess[str]:
+            return subprocess.run([sys.executable, mac_test_script, *words, "--pid", str(os.getpid())],
+                                  env=self.environment, capture_output=True, text=True, check=False,
+                                  timeout=HANG_GUARD_S)
+
+        new_test = claim("claim", "--what", "nextest other", "--worktree", str(self.root))
+        self.addCleanup(claim, "release")
+        self.assertEqual(new_test.returncode, 0, new_test.stdout + new_test.stderr)
+        self.assertIn("claimed", new_test.stdout)
+        self.assertEqual((self.runner_state / "copy-signal").read_text(), str(signal.SIGTERM))
+        self.wait_for_reaped(copy, (process,))
+        self.assertIsNone(process.poll())
+        _ = (self.runner_state / "cargo-release").write_text("release\n")
+        output, errors = process.communicate(timeout=HANG_GUARD_S)
+        self.assertEqual(process.returncode, 0, output + errors)
+        self.assertFalse((self.runner_state / "cargo-stopped").exists())
+        self.assertEqual(len(self.saved_results()), 1)
+        self.assert_copy_record("gave_way", "natedev")
+        self.assertEqual(claim("release").returncode, 0)
 
 
 if __name__ == "__main__":
