@@ -75,9 +75,9 @@ heartbeat path and never receives `${IMPL_SUMMARY}`. `review.sh` verifies that
 the working tree did not change.
 
 Do not repeat the implementer's listed verification or audit style. A reviewer
-may ask for one specific omitted check only when a plausible regression lies
-outside the listed gate, and must name that command; a Codex reviewer asks
-through a `Run request:` per the `## Builds and tests` section of
+may run one specific omitted check only when a plausible regression lies
+outside the listed gate, and must name that command; a Codex reviewer runs it
+with `verify.sh` per the `## Builds and tests` section of
 <WritePromptContract/> item 3, which every Codex review prompt carries verbatim. Broad reviews apply
 <TypeDesignContract/>; closure reviews apply only <ClosureReview/>.
 
@@ -164,11 +164,10 @@ surrounding code, callers, and consumers it touches. Draft provisional
 findings. Emit no verdict.
 
 Then end your turn: your final answer is the provisional findings, headed
-`Stage 1 — provisional, no verdict`. Do not poll for the final diff, sleep or
-wait for it.
+`Stage 1 — provisional, no verdict`. Never poll for the final diff or sleep.
 
-Stage 2 — fire: when the implementation finishes, the unit director writes
-<final diff path> and sends it to you as your next message. Read it — it
+Stage 2 — fire: when the final diff is ready, a message naming
+<final diff path> arrives as your next turn. Read it — it
 supersedes the partial snapshot — and review it in full, concentrating on
 hunks that changed since the snapshot. Reconcile your provisional findings
 against the final diff; drop any the final code resolves. Then answer the
@@ -180,9 +179,10 @@ final diff only.
 <DualReview>
 1. If `EARLY_REVIEW=launched`, the `adversary` is already armed and
    `${REVIEW_PASS}` already incremented: apply <ReviewDiffContract/> to the
-   completed tree, deliver the final diff and ready sentinel and dispatch
-   that reviewer's Stage 2 per <EarlyReviewArm/>, reset `EARLY_REVIEW=none`,
-   and keep `${REVIEW_DISPATCH_HANDLE}` as that lens's handle. Otherwise increment
+   completed tree, deliver the final diff and ready sentinel per
+   <EarlyReviewArm/> (`review.sh`'s run then sends that reviewer its Stage 2),
+   reset `EARLY_REVIEW=none`, and keep `${REVIEW_DISPATCH_HANDLE}` as that
+   lens's handle. Otherwise increment
    `${REVIEW_PASS}`. Pass 1 is the phase's broad review and runs the two
    lenses of <TeamReview/> over <BroadReviewPrompt/>; later passes are one
    reviewer over one repair, per <ClosureReview/>.
@@ -308,7 +308,7 @@ Design questions.
 partial repair diff at launch, and the prompt opens with the same
 `## Implementation status` staging block as <BroadReviewPrompt/>'s early form —
 arm on the open ids, their surrounding code, and the partial diff, then end
-the turn; fire on the final path-limited diff when the unit director sends it;
+the turn; fire on the final path-limited diff when its message arrives;
 answer the questions from the final diff only.
 
 After the main pass agrees, record `accepted` for fixed, `still_open` for not

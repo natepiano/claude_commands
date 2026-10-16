@@ -485,6 +485,15 @@ else:
         _ = environment.pop("REVIEW_LEASE", None)
         _ = environment.pop("CODEX_THREAD_ID", None)
         _ = environment.pop("CLAUDE_CODE_SESSION_ID", None)
+        # Early mode starts a detached Stage 2 run; the stub records its arguments instead.
+        mesh_runs = self.root / "mesh_runs_stub.py"
+        if not mesh_runs.exists():
+            _ = mesh_runs.write_text(
+                "import json, os, sys\n"
+                + "with open(os.environ['MESH_RUNS_CALLS'], 'a', encoding='utf-8') as calls:\n"
+                + "    _ = calls.write(json.dumps(sys.argv[1:]) + '\\n')\n", encoding="utf-8")
+        environment["MESH_RUNS_SCRIPT"] = str(mesh_runs)
+        environment["MESH_RUNS_CALLS"] = str(self.root / "mesh_runs_calls.jsonl")
         return environment
 
     def recorder(self, *arguments: str) -> None:
@@ -1568,6 +1577,15 @@ os.execv(sys.executable, [sys.executable, str(Path(__file__).with_name("progress
             (session_dir / "review_status_adversary").read_text(encoding="utf-8"),
             "reviewed\n",
         )
+        calls = [cast(list[str], json.loads(line)) for line in
+                 (self.root / "mesh_runs_calls.jsonl").read_text(encoding="utf-8").splitlines()]
+        self.assertEqual(len(calls), 1)
+        call = calls[0]
+        self.assertEqual(call[:5], ["start", "--session-dir", str(session_dir), "--to", worker])
+        self.assertEqual(call[call.index("--label") + 1], "final diff ready")
+        stage_two = Path(call[call.index("--done-message-file") + 1]).read_text(encoding="utf-8")
+        self.assertIn(f"Stage 2: the final diff is at {session_dir / 'final_diff_1.diff'}", stage_two)
+        self.assertIn(str(ready), call)
 
     def test_a_assigned_early_review_before_delivery_records_no_pass(self) -> None:
         session_dir = self.start_implementation("assigned-early")
