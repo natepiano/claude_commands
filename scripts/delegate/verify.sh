@@ -112,7 +112,11 @@
 #                                          exact call already passed (or lint
 #                                          failed) on this tree, a flake hunt;
 #                                          the result replaces the record
-#   verify.sh test <package> --local "<why>"   run on natedev; only for a test that must run on Linux
+#   verify.sh test <package> --local "<why>"   run on natedev; only for a test that cannot pass on macOS.
+#                                          Before CI either machine answers a test,
+#                                          merge gates included; CI is the protection
+#                                          (user, 2026-10-16). A pass the Mac ran
+#                                          does not answer --local
 #   verify.sh example <package> <name>     clippy one example (only when the
 #                                          phase changed that example)
 #   verify.sh final                        full workspace gate; refuse examples
@@ -637,7 +641,7 @@ while [[ $# -gt 0 ]]; do
             ;;
         --local)
             if [[ $# -lt 2 || "${2:-}" =~ ^[[:space:]]*$ || "${2:-}" == --* ]]; then
-                echo 'verify.sh: --local needs a reason: --local "<why this test must run on Linux>". Leave it off to run on the Mac.' >&2
+                echo 'verify.sh: --local needs a reason: --local "<why this test cannot pass on macOS>". Leave it off to run on the Mac.' >&2
                 exit 2
             fi
             LOCAL_ONLY=1
@@ -806,6 +810,7 @@ COPY_WATCH_DIR=""
 VERIFY_STEP_INFO_FILE=""
 COPY_WORD="" COPY_MAC="" COPY_REASON="" COPY_SECONDS="" COPY_RUNNER_STATUS="" COPY_STOPPED=""
 MAC_RESULT_FILE=""
+MAC_LOG_FILE=""
 MAC_RUNNER_PID=""
 # The Mac settings a local test may still leave for (run_local_test): a Mac
 # that declined busy or blocked. MAC_LEAVE_REASON is that decline, passed back
@@ -826,6 +831,9 @@ forward_mac_runner_signal() {
         else
             rm -f "$MAC_RESULT_FILE"
         fi
+    fi
+    if [[ -n "$MAC_LOG_FILE" ]]; then
+        rm -f "$MAC_LOG_FILE"
     fi
     note_event interrupted "$SECONDS" 0 "" 0 "$exit_status"
     exit "$exit_status"
@@ -852,7 +860,13 @@ try_mac_test() {
     runner_args+=(-- "${NEXTEST_ARGS[@]}")
 
     export BUILDLOG_TARGET=mac
-    "$PY" "$MAC_RUNNER" "${runner_args[@]}" &
+    # A Mac pass is recorded like a natedev one, judged on the tree as it was
+    # when the Mac run began, with the output it printed.
+    if [[ -n "${CACHE_DIR}" ]]; then
+        VERDICT_KEY="$(tree_key)"
+    fi
+    MAC_LOG_FILE="$(mktemp)"
+    "$PY" "$MAC_RUNNER" "${runner_args[@]}" > >(tee "$MAC_LOG_FILE") 2> >(tee -a "$MAC_LOG_FILE" >&2) &
     MAC_RUNNER_PID=$!
     if wait "$MAC_RUNNER_PID"; then
         runner_status=0
@@ -893,6 +907,8 @@ try_mac_test() {
         BUILDLOG_MAC_REASON=runner
         BUILDLOG_MAC_S=""
         BUILDLOG_MAC_HOLDER=""
+        rm -f "$MAC_LOG_FILE"
+        MAC_LOG_FILE=""
         export BUILDLOG_TARGET=""
         return
     fi
@@ -906,24 +922,35 @@ try_mac_test() {
     fi
     case "$result_word" in
         declined|lost)
+            rm -f "$MAC_LOG_FILE"
+            MAC_LOG_FILE=""
             export BUILDLOG_TARGET=""
             return
             ;;
         failed)
+            rm -f "$MAC_LOG_FILE"
+            MAC_LOG_FILE=""
             note_event failed "${SECONDS}" 0 "" 0 "$runner_status"
             exit "$runner_status"
             ;;
         passed)
-            if [[ "$FILTER_RUN" -eq 1 ]]; then
-                # A pass on the Mac is never natedev's pass record.
-                BUILDLOG_MAC=passed_filter
-                echo "verify.sh: PASS on the Mac (macOS). A filtered run is feedback, so nothing ran on natedev."
-                note_event ran "${SECONDS}" 0 "" 0 0
-                exit 0
-            fi
-            echo "verify.sh: passed on the Mac (macOS); now confirming on natedev, which is the gate."
+            finish_mac_pass "$MAC_LOG_FILE" "$result_seconds"
             ;;
     esac
+}
+
+# Ends the call on a Mac pass, filtered or full. Before CI either machine
+# answers a test; CI is the protection (user, 2026-10-16).
+finish_mac_pass() {
+    if [[ "$FILTER_RUN" -eq 1 ]]; then
+        BUILDLOG_MAC=passed_filter
+    else
+        BUILDLOG_MAC=passed_full
+    fi
+    record_mac_pass "$1" "$2"
+    echo "verify.sh: PASS on the Mac (macOS), so nothing ran on natedev."
+    note_event ran "${SECONDS}" 0 "" 0 0
+    exit 0
 }
 
 # Registration is local demand, not a reservation to retain while another
@@ -998,8 +1025,8 @@ route_test() {
                 MAC_LEAVE_SETTINGS="$settings" MAC_LEAVE_REASON="$BUILDLOG_MAC_REASON"
             fi
         else
-            # A full Mac pass needs the local gate; a lost attempt or another
-            # decline needs the existing local wait, without more Mac tries.
+            # A lost attempt or another decline needs the existing local
+            # wait, without more Mac tries.
             MAC_LEAVE_SETTINGS="" MAC_LEAVE_REASON=""
             return 0
         fi
@@ -1111,35 +1138,34 @@ stop_copy_watch() {
 }
 
 # The Mac copy finished first and stopped the natedev step: end the call as
-# try_mac_test ends it for a Mac failure or a filtered Mac pass. A Mac pass
-# never becomes natedev's pass record, so the run log goes first.
+# try_mac_test ends it for a Mac result. The run log holds both machines'
+# output; a pass keeps it as the Mac's pass record.
 finish_copy_win() {
+    local log="$RUN_LOG"
     BUILDLOG_MAC="$COPY_MAC"
     BUILDLOG_MAC_REASON="$COPY_REASON"
     BUILDLOG_MAC_S="$COPY_SECONDS"
     BUILDLOG_MAC_HOLDER=""
     export BUILDLOG_TARGET=mac
-    if [[ -n "$RUN_LOG" ]]; then
-        rm -f "$RUN_LOG"
-        RUN_LOG=""
-    fi
+    RUN_LOG=""
     if [[ "$COPY_MAC" == failed ]]; then
+        [[ -z "$log" ]] || rm -f "$log"
         note_event failed "${SECONDS}" 0 "" 0 "$COPY_RUNNER_STATUS"
         exit "$COPY_RUNNER_STATUS"
     fi
-    BUILDLOG_MAC=passed_filter
-    echo "verify.sh: PASS on the Mac (macOS). A filtered run is feedback, so nothing ran on natedev."
-    note_event ran "${SECONDS}" 0 "" 0 0
-    exit 0
+    if [[ -z "$log" ]]; then
+        log="$(mktemp)"
+    fi
+    finish_mac_pass "$log" "$COPY_SECONDS"
 }
 
 # Runs the tests on natedev. While MAC_LEAVE_SETTINGS names a Mac, a run held
 # in the memory wait leaves once mac_test.py free-now says that Mac is free,
-# and its Mac result counts as one from route_test: a failure or a filtered
-# pass ends the call; busy or blocked waits here again, still free to leave; a
-# full pass, a lost run or another decline runs here with no way out. Once the
-# step compiles, copy_watch.py may run a copy on the Mac; a copy failure or
-# filtered pass that finishes first ends the call (finish_copy_win).
+# and its Mac result counts as one from route_test: a failure or a pass ends
+# the call; busy or blocked waits here again, still free to leave; a lost run
+# or another decline runs here with no way out. Once the step compiles,
+# copy_watch.py may run a copy on the Mac; a copy result that finishes first
+# ends the call (finish_copy_win).
 run_local_test() {
     local status hook copy_watch
     while true; do
@@ -1163,7 +1189,7 @@ run_local_test() {
             stop_copy_watch
             if [[ "$COPY_WORD" == won ]]; then
                 if [[ "$COPY_STOPPED" == 1 && "$status" -ne 0 \
-                      && ( "$COPY_MAC" == failed || ( "$COPY_MAC" == passed && "$FILTER_RUN" -eq 1 ) ) ]]; then
+                      && ( "$COPY_MAC" == failed || "$COPY_MAC" == passed ) ]]; then
                     finish_copy_win
                 fi
                 # natedev ended before the stop reached it: its result stands.
@@ -1193,7 +1219,8 @@ cache_lookup() {
     LOOKUP_KEY="$(tree_key)"
     [[ -n "${LOOKUP_KEY}" && "${NO_CACHE}" -eq 0 ]] || return 1
     record="${CACHE_DIR}/${LOOKUP_KEY}"
-    if [[ -f "${record}.pass" ]]; then
+    # --local asks for Linux: a pass the Mac ran does not answer it.
+    if [[ -f "${record}.pass" && ! ( "${LOCAL_ONLY}" -eq 1 && "$(sed -n 's/^host=//p' "${record}.pass")" == mac ) ]]; then
         record+=.pass outcome=reused word=PASS
     elif [[ -f "${record}.fail" ]]; then
         record+=.fail outcome=replayed word=FAIL
@@ -1236,10 +1263,11 @@ build_seconds() {
 # Records a pass, or a lint failure, under the tree its verdict was judged on
 # (VERDICT_KEY; lint's rewrites are part of it), before the token is released
 # so a peer queued on the same call finds it. A record replaces the other kind
-# on the same tree. Fails when there is nothing to record, or when the tree has
-# changed since that verdict.
+# on the same tree. A third word `mac` marks a pass the Mac ran (`host=mac`),
+# which a --local call does not reuse. Fails when there is nothing to record,
+# or when the tree has changed since that verdict.
 cache_record() {
-    local kind=$1 repeat=$2 key verb=passed other=fail
+    local kind=$1 repeat=$2 host=${3:-} key verb=passed other=fail
     key="$(tree_key)"
     [[ -n "${key}" && -n "${VERDICT_KEY}" ]] || return 1
     if [[ "${key}" != "${VERDICT_KEY}" ]]; then
@@ -1248,14 +1276,43 @@ cache_record() {
     fi
     if [[ "${kind}" == fail ]]; then
         verb="failed with status ${EXIT_STATUS}" other=pass
+    elif [[ "${host}" == mac ]]; then
+        verb="passed on the Mac"
     fi
     mv -f "${RUN_LOG}" "${CACHE_DIR}/${key}.log"
-    printf '`verify.sh %s` %s %s, run by %s\nsaved_s=%d\nstatus=%d\n' \
-        "$CMD${ARGS[*]:+ ${ARGS[*]}}" "${verb}" "$(date '+%Y-%m-%d %H:%M:%S')" \
-        "${PLAN_DELEGATE_TEAM_ROLE:-the unit director}" "${repeat}" "${EXIT_STATUS}" \
-        > "${CACHE_DIR}/${key}.${kind}.tmp"
+    {
+        printf '`verify.sh %s` %s %s, run by %s\nsaved_s=%d\nstatus=%d\n' \
+            "$CMD${ARGS[*]:+ ${ARGS[*]}}" "${verb}" "$(date '+%Y-%m-%d %H:%M:%S')" \
+            "${PLAN_DELEGATE_TEAM_ROLE:-the unit director}" "${repeat}" "${EXIT_STATUS}"
+        if [[ "${host}" == mac ]]; then
+            printf 'host=mac\n'
+        fi
+    } > "${CACHE_DIR}/${key}.${kind}.tmp"
     mv -f "${CACHE_DIR}/${key}.${kind}.tmp" "${CACHE_DIR}/${key}.${kind}"
     rm -f "${CACHE_DIR}/${key}.${other}"
+}
+
+# Records a Mac pass, whose output is in the file $1, as this call's pass
+# record. The tree is read before the Mac run (VERDICT_KEY) and again now, so
+# an edit made while the Mac ran leaves nothing recorded. $2 is the Mac's
+# seconds, what a reuse saves.
+record_mac_pass() {
+    local log=$1 mac_seconds=${2%%.*}
+    if [[ -z "${CACHE_DIR}" ]] || ! mkdir -p "${CACHE_DIR}"; then
+        rm -f "$log" "${RUN_LOG}"
+        RUN_LOG=""
+        return 0
+    fi
+    # A natedev log from before the Mac took the call has nothing to keep.
+    if [[ -n "${RUN_LOG}" && "${RUN_LOG}" != "$log" ]]; then
+        rm -f "${RUN_LOG}"
+    fi
+    RUN_LOG="$log"
+    EXIT_STATUS=0
+    if ! cache_record pass "${mac_seconds:-0}" mac; then
+        rm -f "$log"
+    fi
+    RUN_LOG=""
 }
 
 # A failed lint is the tree's own answer unless the run never reached a

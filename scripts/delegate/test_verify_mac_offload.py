@@ -1589,7 +1589,7 @@ local_release_wait.wait_for_local_release(float(sys.argv[1]), sys.argv[2])
                 self.assertEqual(record["mac_reason"], "runner")
                 self.assertIsNone(record["mac_s"])
 
-    def test_full_mac_pass_is_confirmed_locally_and_records_local_pass(self) -> None:
+    def test_full_mac_pass_ends_the_call_with_a_mac_pass_record(self) -> None:
         result = self.verify(
             "test",
             "sample",
@@ -1597,19 +1597,32 @@ local_release_wait.wait_for_local_release(float(sys.argv[1]), sys.argv[2])
             extra={"TEST_RUNNER_MAC": "passed", "TEST_RUNNER_STATUS": "0"},
         )
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertIn(
-            "passed on the Mac (macOS); now confirming on natedev, which is the gate.",
-            result.stdout,
-        )
-        self.assertEqual(len(self.local_runs()), 1)
-        self.assertTrue(self.local_runs()[0]["token_held"])
-        self.assertEqual(len(self.saved_results()), 1)
+        self.assertIn("PASS on the Mac (macOS), so nothing ran on natedev.", result.stdout)
+        self.assertEqual(self.local_runs(), [])
+        saved = self.saved_results()
+        self.assertEqual(len(saved), 1)
+        self.assertIn("passed on the Mac", saved[0].read_text())
+        self.assertIn("host=mac\n", saved[0].read_text())
         record = self.last_call()
-        self.assertEqual(record["mac"], "passed")
-        self.assertEqual(record["mac_s"], 3.25)
-        self.assertEqual(self.routing_record()["target"], "natedev")
+        self.assertEqual((record["status"], record["mac"], record["mac_s"]), (0, "passed_full", 3.25))
 
-    def test_filtered_mac_pass_ends_without_local_run_or_pass_record(self) -> None:
+        self.clear_observations()
+        again = self.verify("test", "sample", extra={"TEST_RUNNER_MAC": "failed", "TEST_RUNNER_STATUS": "42"})
+        self.assertEqual(again.returncode, 0, again.stdout + again.stderr)
+        self.assertIn("PASS (recorded)", again.stdout)
+        self.assertEqual(self.runner_events(), [])
+
+        # --local asks for Linux, so the Mac's pass does not answer it.
+        self.clear_observations()
+        local = self.verify("test", "sample", "--local", "needs Linux process behavior")
+        self.assertEqual(local.returncode, 0, local.stdout + local.stderr)
+        self.assertNotIn("PASS (recorded)", local.stdout)
+        self.assertEqual(len(self.local_runs()), 1)
+        saved = self.saved_results()
+        self.assertEqual(len(saved), 1)
+        self.assertNotIn("host=mac", saved[0].read_text())
+
+    def test_filtered_mac_pass_ends_the_call_with_a_mac_pass_record(self) -> None:
         result = self.verify(
             "test",
             "sample",
@@ -1619,12 +1632,11 @@ local_release_wait.wait_for_local_release(float(sys.argv[1]), sys.argv[2])
             extra={"TEST_RUNNER_MAC": "passed", "TEST_RUNNER_STATUS": "0"},
         )
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertIn(
-            "PASS on the Mac (macOS). A filtered run is feedback, so nothing ran on natedev.",
-            result.stdout,
-        )
+        self.assertIn("PASS on the Mac (macOS), so nothing ran on natedev.", result.stdout)
         self.assertEqual(self.local_runs(), [])
-        self.assertEqual(self.saved_results(), [])
+        saved = self.saved_results()
+        self.assertEqual(len(saved), 1)
+        self.assertIn("host=mac\n", saved[0].read_text())
         record = self.last_call()
         self.assertEqual(record["status"], 0)
         self.assertEqual(record["mac"], "passed_filter")
@@ -1632,8 +1644,8 @@ local_release_wait.wait_for_local_release(float(sys.argv[1]), sys.argv[2])
 
     def test_local_flag_requires_a_non_option_reason_before_any_work(self) -> None:
         expected = (
-            'verify.sh: --local needs a reason: --local "<why this test must run on '
-            'Linux>". Leave it off to run on the Mac.\n'
+            'verify.sh: --local needs a reason: --local "<why this test cannot pass on '
+            'macOS>". Leave it off to run on the Mac.\n'
         )
         cases = (
             ("test", "sample", "--local"),
@@ -1851,30 +1863,31 @@ local_release_wait.wait_for_local_release(float(sys.argv[1]), sys.argv[2])
         self.assertEqual((record["status"], record["mac"], record["mac_reason"], record["mac_s"]),
                          (42, "failed", "", 2.5))
 
-    def test_copy_filtered_pass_first_stops_natedev_without_a_pass_record(self) -> None:
+    def test_copy_filtered_pass_first_stops_natedev_and_records_a_mac_pass(self) -> None:
         process, _ = self.start_copy_call("--filter", "alpha", copy={"TEST_COPY_MAC": "passed", "TEST_COPY_STATUS": "0"})
         output, errors = process.communicate(timeout=HANG_GUARD_S)
         self.assertEqual(process.returncode, 0, output + errors)
-        self.assertIn("PASS on the Mac (macOS). A filtered run is feedback, so nothing ran on natedev.", output)
+        self.assertIn("PASS on the Mac (macOS), so nothing ran on natedev.", output)
         self.assertEqual((self.runner_state / "cargo-stopped").read_text(), str(signal.SIGTERM))
-        self.assertEqual(self.saved_results(), [])
+        saved = self.saved_results()
+        self.assertEqual(len(saved), 1)
+        self.assertIn("host=mac\n", saved[0].read_text())
         self.assert_copy_record("won", "mac")
         record = self.last_call()
         self.assertEqual((record["status"], record["mac"], record["mac_s"]), (0, "passed_filter", 2.5))
 
-    def test_copy_full_pass_leaves_natedev_to_finish_as_the_gate(self) -> None:
-        process, copy = self.start_copy_call(copy={"TEST_COPY_MAC": "passed", "TEST_COPY_STATUS": "0"})
-        self.wait_for_reaped(copy, (process,))
-        self.assertIsNone(process.poll())
-        _ = (self.runner_state / "cargo-release").write_text("release\n")
+    def test_copy_full_pass_first_stops_natedev_and_ends_the_call(self) -> None:
+        process, _ = self.start_copy_call(copy={"TEST_COPY_MAC": "passed", "TEST_COPY_STATUS": "0"})
         output, errors = process.communicate(timeout=HANG_GUARD_S)
         self.assertEqual(process.returncode, 0, output + errors)
-        self.assertFalse((self.runner_state / "cargo-stopped").exists())
-        self.assertEqual(len(self.local_runs()), 1)
-        self.assertEqual(len(self.saved_results()), 1)
-        self.assert_copy_record("passed_full", "natedev")
+        self.assertIn("PASS on the Mac (macOS), so nothing ran on natedev.", output)
+        self.assertEqual((self.runner_state / "cargo-stopped").read_text(), str(signal.SIGTERM))
+        saved = self.saved_results()
+        self.assertEqual(len(saved), 1)
+        self.assertIn("host=mac\n", saved[0].read_text())
+        self.assert_copy_record("won", "mac")
         record = self.last_call()
-        self.assertEqual((record["status"], record["mac"], record["mac_reason"]), (0, "declined", "busy"))
+        self.assertEqual((record["status"], record["mac"], record["mac_s"]), (0, "passed_full", 2.5))
 
     def test_natedev_finishing_first_stops_the_copy_and_its_result_stands(self) -> None:
         process, _ = self.start_copy_call(copy={"TEST_COPY_WAIT": "1"})

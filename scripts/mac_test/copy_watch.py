@@ -6,9 +6,9 @@ still leave for the Mac. It reads the step's process group and log from the
 file run() writes, and registers the call as a copy candidate while cargo
 compiles and nextest has not started its tests. When the Mac is free counting
 copies as busy, the repository's newest candidate starts `offload.py run
---copy`. A Mac failure, or a Mac pass of a filtered run, stops the natedev
-step; any other copy result leaves natedev to finish. The result file tells
-verify.sh which finished first.
+--copy`. A Mac failure or pass stops the natedev step; any other copy result
+leaves natedev to finish. The result file tells verify.sh which finished
+first.
 """
 
 from __future__ import annotations
@@ -50,7 +50,7 @@ FINAL_DECLINE_REASONS = frozenset({"no_tests", "off", "repo", "linux_only"})
 COPY_STOP_TIMEOUT_S = 60.0
 STOPPED_BY_TERM = 128 + signal.SIGTERM
 
-CopyOutcome = Literal["won", "natedev_won", "passed_full", "gave_way", "declined", "lost"]
+CopyOutcome = Literal["won", "natedev_won", "gave_way", "declined", "lost"]
 LineKind = Literal["cargo", "tests", "other"]
 
 
@@ -136,7 +136,7 @@ class MacWords:
 
 @dataclass(frozen=True)
 class CopyWin:
-    """A copy result that ends the call: a failure, or a filtered pass."""
+    """A copy result that ends the call: a failure or a pass."""
 
     words: MacWords
     runner_status: int
@@ -313,19 +313,15 @@ def read_mac_words(path: Path) -> MacWords | None:
     return MacWords(macs[0], reason, seconds)
 
 
-def copy_result(words: MacWords | None, status: int, filter_run: bool) -> CopyWin | CopyEnded:
+def copy_result(words: MacWords | None, status: int) -> CopyWin | CopyEnded:
     """What a copy that ended without the watcher stopping it means for the call."""
     if status == STOPPED_BY_TERM:
         # Only a new test's claim stops a copy this watcher did not stop.
         return CopyEnded("gave_way", final=False)
     if words is None or (words.mac == "passed" and status != 0) or (words.mac == "failed" and status == 0):
         return CopyEnded("lost", final=False)
-    if words.mac == "failed":
+    if words.mac in ("failed", "passed"):
         return CopyWin(words, status)
-    if words.mac == "passed":
-        # A Mac pass never stands as natedev's pass record: a full run still
-        # needs natedev, the gate.
-        return CopyWin(words, status) if filter_run else CopyEnded("passed_full", final=True)
     if words.mac == "declined":
         return CopyEnded("declined", final=words.reason in FINAL_DECLINE_REASONS)
     return CopyEnded("lost", final=False)
@@ -477,7 +473,7 @@ class Watch:
             return None
         self.copy_seconds += time.monotonic() - copy.started
         self.copy = NO_COPY
-        result = copy_result(read_mac_words(copy.result), status, self.request.filter_run)
+        result = copy_result(read_mac_words(copy.result), status)
         copy.result.unlink(missing_ok=True)
         if isinstance(result, CopyWin):
             return result
