@@ -1264,58 +1264,54 @@ After a worker launch's own turn has ended, a move to the selected seats home th
 
 **Depends on:** Phase 41
 
-#### Work Order
+#### As-built
 
-**Goal:** the Mac cleans up stale and stray Codex servers exactly as natedev does. The user, 2026-10-16 (via the showrunner): "make sure we clean these up on the mac just as we do on natedev - this is a miss to me".
-
-**Constraints from prior phases:** natedev's cleanup has no timer. It is the per-server idle watcher (`codex_mesh.py` `_start_watcher`, a 300 s loop calling `idle-stop` after `SERVER_IDLE_SECS`), `sweep --stop` from `end_session.sh`, `remove_workers.py`, `shutdown/stop.py` and `end_friend.sh`, and `signin-changed` from the codex-signin path watch. On the Mac every one of them judges nothing: `_running_servers` runs `ps -eo pid=,etimes=,args=` (macOS `ps` has no `etimes`), `_client_counts` runs `ss`, and `_server_folder` reads `/proc/<pid>/fd/2`. The resulting `OSError` is caught, so `sweep` reports nothing judged and `idle-stop` keeps every server; only an explicit `stop` works. `_running_servers` matches only `app-server --listen ws://`, so Codex's own `app-server daemon` (and its `pid-update-loop`/`--remote-control` children) is stopped by nothing on either machine; one ran on `~/.codex` on natedev from 10-01 and on the Mac from 10-08 until stopped by hand on 10-16. Since Phase 41's live cutovers (natedev 2026-10-16 11:53 EDT, the Mac 12:00 EDT), `~/.codex` holds no login on either machine, so a server on it cannot work, though an undo or a new sign-in can put one back. The Mac's ChatGPT desktop app runs its own bundled `codex` (inside `ChatGPT.app`) on `~/.codex`; it is the user's and is never stopped. A periodic sweep on both machines is a nix job in the nixos repo, which this unit does not own: the showrunner was sent `nate.jobs.codex-mesh-sweep` (modules/common, every 1800 s, `codex_mesh.py sweep --stop`).
-
-**Spec:**
-
-1. `_running_servers`, `_client_counts` and `_server_folder` work on macOS: `ps -eo pid=,etime=,args=` with `etime` parsed from `[[dd-]hh:]mm:ss`; `lsof -nP -iTCP -sTCP:ESTABLISHED` for established connections per local port; `lsof -p <pid> -a -d 2 -Fn` for the server's stderr log. Linux keeps its current commands. A command that fails still refuses to judge, naming the command, never treating a failure as no servers or no clients. `lsof` exits 1 with no output when nothing matches; that is zero clients (or no log), not a failure, while a missing or denied command or any other exit is a failure. The server folder has three outcomes as types, not `Path | None`: a mesh log found, a readable stderr that names no mesh log, and an unread one; an unread folder is a named keep reason in `sweep`, `idle-stop` and `signin-changed`, never an unowned server.
-2. `sweep` (and `sweep --stop`) also lists a Codex `app-server daemon` whose home is `~/.codex` (no `CODEX_HOME`, or `CODEX_HOME` naming `~/.codex`), judged unused only while `~/.codex/auth.json` is confirmed absent (a cutover can be undone, or `~/.codex` signed in again); when its presence cannot be established the daemon is kept with that reason. `--stop` checks the absence again, and the daemon's pid, start time and command, just before signalling, then stops the daemon and its descendants. A daemon target and a WebSocket server target are distinct types (no optional or sentinel port); the existing single-pid reaper stays for servers. It never stops a daemon on a numbered home, a process whose environment cannot be read, or a `codex` executable inside an application bundle (`*.app/Contents/`). A process's home comes from `account.process_codex_home(pid)` (`scripts/whoami/account.py`), which reads the kernel's argument record on the Mac and `/proc` on Linux, as Phase 41's cutover does; an unreadable record keeps the process. macOS `ps -o ucomm=` pads the name with trailing spaces, so a name match strips it.
-3. `idle-stop` and `signin-changed` reach the same verdicts on the Mac as on natedev.
-4. A workers change keeps every other key of `config/accounts.json`, the `home_cutovers` rows included: a regression test in `test_role_map.py` pins `role_map.write_role_map` (before Phase 40 the role writer kept only `workers`, which erased the Mac's claude2 row on 2026-10-16). Showrunner, 2026-10-16: add-on, current.
+- The Mac judges Codex servers as natedev does: `sweep`, `sweep --stop`, the per-server idle watcher (`idle-stop`) and `signin-changed` reach the same verdicts on both machines. `_running_servers()` → `list[WebSocketServer]` (`pid`, `port`, `age_secs`) reads `ps -eo pid=,etime=,args=` on the Mac (`etime` parsed from `[[dd-]hh:]mm:ss`) and `etimes` on Linux; `_client_counts()` reads `lsof -nP -iTCP -sTCP:ESTABLISHED` on the Mac and `ss` on Linux; `_server_folder(pid)` reads `lsof -p <pid> -a -d 2 -Fn` on the Mac and `/proc/<pid>/fd/2` on Linux.
+- Every cleanup command goes through `_cleanup_command`, which raises `OSError` naming the command (never its output) on a missing, denied or timed-out (10 s) command, a non-zero exit or any stderr; `lsof`'s exit 1 with no output is an empty selection (zero clients, no log). A failed command refuses to judge: `sweep` prints `nothing judged` and exits 1, `idle-stop` and cleanup keep the server and print why.
+- The server folder is `MeshServerLog(folder) | NonMeshServerStderr | UnreadServerStderr(reason)`. An unread one becomes `UnreadServerOwnership(reason)` with a `ServerInUse` verdict, a named keep reason in `sweep`, `idle-stop` and `signin-changed`, never an unowned server. On the Mac an empty stderr selection counts as no mesh log only when `ps -o uid=` confirms the pid is this user's.
+- A WebSocket server or daemon whose executable sits inside an application bundle (`*.app/Contents/`, judged by `_process_executable`, the kernel's path, never argv[0]) is never judged unused or signalled; an unreadable executable path keeps the server.
+- `sweep` also lists Codex's own `app-server daemon`. `_running_daemons()` lists this user's `codex` processes (`ps -u <uid>`, `ucomm=` stripped on the Mac) and classifies each by `_process_identity` (`ProcessIdentity(pid, started, arguments, executable)`, start time read before and after) into `CodexDaemon | UnclassifiedCodexProcess | UnreadCodexProcess`; config flags before the subcommand are skipped, and an `exec` prompt naming a daemon stays unclassified. `_process_cleanup_verdict` judges a daemon unused only when its home (`account.process_codex_home`) is `~/.codex` and `~/.codex/auth.json` is confirmed absent; a numbered home, an unread environment, an existing login or an unconfirmed absence keeps it with that reason. The daemon line is `<pid>\tdaemon\t<label>\t<reason>\t~/.codex`, an unread record prints `<pid>\tunclassified\tkept\t<reason>\t-`, and the count line includes daemons.
+- `sweep --stop` stops an unused daemon with `_stop_daemon`: it snapshots the family (`_daemon_process_tree`, identities bound to two `process_table` snapshots), then SIGSTOPs the parent and its descendants to a fixed point, tracking members by identity so a reparented child stays tracked, and checks `_process_cleanup_verdict` before each STOP and again at the fixed point. It then SIGKILLs children before the parent, rechecking the parent's verdict and every member's identity and stopped state before each signal, and reports success only when every member is gone within `REAP_WAIT_SECS`. Any refusal prints `codex_mesh: daemon family not stopped: pid <pid>: <reason>`, and `_resume_daemon_family` sends SIGCONT, by pid plus start time, only to members this cleanup stopped (`FrozenDaemonMember(identity, stopped_by_cleanup)`); a member it cannot resume is named as "may still be stopped".
+- `account.MacProcessRecord` carries `executable: Path` from the kernel argument record. `role_map.write_role_map` keeps every other key of `config/accounts.json`, `home_cutovers` included.
+- Live, sweep judging only on 2026-10-16: natedev listed 15 servers in use and kept a daemon on `~/.codex1`; the Mac listed none.
 
 **Files:**
-
-- `scripts/agents/codex_mesh.py` — macOS listing, client counts, server folder, the daemon verdict.
-- `scripts/agents/test_codex_mesh.py` — macOS faked `ps`/`lsof` output, the daemon verdict, the bundle and numbered-home exclusions, a failed command refusing.
-- `scripts/accounts/test_role_map.py` — a workers change keeps `home_cutovers`.
-- `scripts/whoami/account.py` — the Mac kernel record keeps the executable path, for the bundle exclusion.
+- `scripts/agents/codex_mesh.py` — platform listing, client counts and server folder, the unread-ownership keep, daemon discovery, verdict and family stop.
+- `scripts/agents/test_codex_mesh.py` — faked `ps`/`lsof` for the Mac (`MacCleanupTests`), daemon verdicts (`CodexDaemonCleanupTests`), process state (`DaemonProcessStateTests`), freeze, kill and resume (`DaemonFamilySafetyTests`).
+- `scripts/whoami/account.py` — `MacProcessRecord.executable`.
 - `scripts/whoami/test_account.py` — the executable path read from the kernel record.
+- `scripts/accounts/test_role_map.py` — a workers change keeps `home_cutovers` and every other key.
 
-**Workers:** 1 writer + 1 tester. impl: `codex_mesh.py`, `account.py`. test: `test_codex_mesh.py`, `test_role_map.py`, `test_account.py`.
+**Binds later work:** No Codex daemon descendant escapes the stop builds on `FrozenDaemonMember`, `_freeze_daemon_process`, `_resume_daemon_family`, `_daemon_process_tree`, `_process_identity` and `sessions.process_start`; any session sweep it adds checks `_process_cleanup_verdict` before SIGSTOP, and it states that a process that called `setsid` is out of reach. `_stop_daemon` takes no lock, and the daemon line's home column is fixed at `~/.codex`.
 
-**Live (director):** after merge and promote, on the Mac run `codex_mesh.py sweep` (judging only, no `--stop`) and check each server line; on natedev the same. Never stop a server of another session by hand.
+**Gotchas:**
+- Codex `app-server --listen` calls `setsid`, so the daemon's session id does not cover its family; a process born and orphaned between two listings escapes snapshot ancestry and survives the stop.
+- macOS `ps -o ucomm=` pads the name with trailing spaces; strip before matching, and keep fake listings padded.
+- The ChatGPT desktop app's bundled `codex` runs on `~/.codex`; the bundle exclusion is what keeps it running.
+- The periodic `sweep --stop` on both machines is a nix job in the nixos repo (`nate.jobs.codex-mesh-sweep`, every 1800 s), not code in this repo.
 
-**Acceptance gate:** macOS listing, client counts and folder, `lsof`'s empty selection against its failure, the unread folder as a keep reason in `sweep`, `idle-stop` and `signin-changed`, the daemon verdict with `~/.codex` signed in, signed out and unreadable, its descendants stopped, identity checked again before signalling, its exclusions, and a failed command refusing are pinned by tests with faked commands; a workers change keeps `home_cutovers`; every changed file reads 0 errors, 0 warnings; the merge gate is green.
+**Ruled out:** SIGTERM before SIGKILL — resuming a stopped process to let it handle TERM lets it fork again; re-listing the family by parent pid at kill time — it loses reparented children.
 
 ### Phase 43 — Codex cutover finishes the first startup  · status: done
 
 **Depends on:** Phase 41
 
-#### Work Order
+#### As-built
 
-**Goal:** `cutover-home codexN` leaves a home that starts. Showrunner, 2026-10-16 (urgent, ahead of the shell-snapshots fix): the user ran `codex2` on natedev at about 13:02 EDT and it failed with "app server did not become ready on ~/.codex2/app-server-control/app-server-control.sock"; the daemon log said "timed out waiting for state db backfill after 30s (status: running)".
-
-**Constraints from prior phases:** `setup codexN` (`_setup_codex_home`) links the home, prints the wait line, and runs `agent_accounts.prepare_codex_home`, which starts `codex app-server --listen stdio://` on the home and waits up to `CODEX_HOME_PREPARATION_SECONDS` for `initialize`, retrying servers that exit unanswered, while Codex builds its state database (the backfill over the shared sessions). An interrupted backfill leaves `backfill_state.status = running`, and Codex holds startup for 15 minutes on that lease. Phase 41's `cutover_codex_home` links the home and renames `auth.json` but never runs that first startup, so natedev's `~/.codex2` met its first backfill when the user ran `codex2`, the daemon gave up after 30 s and left the lease. On 2026-10-16 the director repaired natedev by running `setup codex2`; the Mac's `~/.codex2` backfill reads `complete` (12:01 EDT), because its status check started Codex.
-
-**Spec:**
-
-1. After the login move, `cutover-home codexN` prints the same wait line as setup, runs `prepare_codex_home` on the new home, and reports done only once it answers `initialize`.
-2. A preparation that fails leaves the login move complete (the journal stays `complete`, so the cutover is not repeated) and exits non-zero with one line naming the home and the step: `accounts.py setup codexN` finishes the index.
-3. The undo path is unchanged.
+- `accounts._prepare_codex_home(label)` prints setup's wait line and runs `agent_accounts.prepare_codex_home` on the numbered home (`codex app-server --listen stdio://`, waiting up to `CODEX_HOME_PREPARATION_SECONDS`, 1200 s, for `initialize` while Codex builds its state database over the shared sessions). `setup codexN` (`_setup_codex_home`) and `cutover-home codexN` share it.
+- `cutover_codex_home` runs it after the login rename, the `home_cutovers` row and the `complete` journal write, and prints `<label> (~/.codexN) login moved; shared session index ready.` only once Codex answers `initialize`.
+- A failed preparation leaves the journal `complete` and raises `AccountsError` with one line: `accounts: ~/.codexN login moved, but its shared session index is not ready (<cause>); run accounts.py setup codexN to finish the index`. A rerun of a complete cutover and `--undo` run no preparation.
+- `docs/accounts.md`'s cutover section describes the first startup, its wait of up to 20 minutes, and the `setup codexN` recovery.
 
 **Files:**
+- `scripts/accounts/accounts.py` — `_prepare_codex_home`, shared by setup and the Codex cutover.
+- `scripts/accounts/test_cutover_home.py` — with a faked preparation: login moved before preparation, the ready line, the failure line with the journal `complete`, a rerun after failure, undo without preparation.
+- `docs/accounts.md` — the cutover's first startup and recovery.
 
-- `scripts/accounts/accounts.py` — `cutover_codex_home` runs the first startup.
-- `scripts/accounts/test_cutover_home.py` — preparation run after the move, success, failure leaving the move complete with the setup step, undo untouched.
-- `docs/accounts.md` — the cutover section describes the first startup and its setup recovery.
-
-**Workers:** 1 writer + 1 tester. impl: `accounts.py`. test: `test_cutover_home.py`.
-
-**Acceptance gate:** tests with a faked `prepare_codex_home` pin the order (login moved, then preparation), the success line, the failure line and exit, and the journal state; every changed file reads 0 errors, 0 warnings; the merge gate is green.
+**Gotchas:**
+- Preparation runs under the exclusive cutover lock for up to 1200 s, so an undo cannot rename the login back while Codex starts on it.
+- An interrupted backfill leaves `backfill_state.status = running`, and Codex holds startup for 15 minutes on that lease; a `codexN` run that meets a first backfill fails with "app server did not become ready", and `accounts.py setup codexN` repairs the home.
+- Tests fake `prepare_codex_home`; a suite run against the real one starts Codex.
 
 ### Phase 44 — Shared links repair themselves  · status: todo
 
