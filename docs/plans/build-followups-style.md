@@ -16,7 +16,7 @@ Mapping (style-unit's choice, 2026-10-16): the proposal's Phases 1-3 are this pl
 
 - **Project:** `~/.claude` (claude_commands), worktree `/home/natepiano/worktrees/claude-build-followups-style`, branch `build-followups-style`. Every Work Order runs in that worktree. This plan builds the style showrunner (design: `~/.local/state/plan-backlog/2026-10-16-style-showrunner.md`, revision 3).
 - **Project started:** 2026-10-16T19:43:43.983+00:00
-- **Stack:** Python ≥3.10 through `~/.claude/scripts/lib/py` (natedev has 3.13; the Mac is older); basedpyright 1.39; stdlib `sqlite3` (as in `scripts/buildlog/index.py`); markdown command and doc files; zsh/bash scripts; nix in `/etc/nixos`; Rust read only (the cargo-berth source at `~/rust/cargo-liner/crates/cargo-berth/src`). Style rules are markdown with YAML-like frontmatter in `~/rust/nate_style/rust/*.md` (a separate git repo on `main`; other sessions leave uncommitted files there).
+- **Stack:** Python ≥3.12 in practice through `~/.claude/scripts/lib/py` (`typing.override` throughout the tests; natedev has 3.13); basedpyright 1.39; stdlib `sqlite3` (as in `scripts/buildlog/index.py`); markdown command and doc files; zsh/bash scripts; nix in `/etc/nixos`; Rust read only (the cargo-berth source at `~/rust/cargo-liner/crates/cargo-berth/src`). Style rules are markdown with YAML-like frontmatter in `~/rust/nate_style/rust/*.md` (a separate git repo on `main`; other sessions leave uncommitted files there).
 - **Layout:**
   - `scripts/fix/` — the fix pipeline; retired in Phase 12 except the pieces Phase 1 moves.
   - `scripts/style/` — new home of the style scripts: `candidate_generators.py`, `style_admin.py`, `style_rules.py`, `rules.py`, `style_ledger.py`, `style_plan.py`, `style_footprint.py`, `style_sync.py`, `add_style.py`, `style_proposals.py`, tests beside them.
@@ -27,7 +27,7 @@ Mapping (style-unit's choice, 2026-10-16): the proposal's Phases 1-3 are this pl
   - `config/agents.conf`, `pyrightconfig.json`, `settings.json`, `CLAUDE.md`.
   - Outside the repo: `~/rust/nate_style/rust/` (rule frontmatter); `/etc/nixos` (`configuration.nix`, `modules/common`, `modules/linux`); `~/.local/state/style/<repo>/` (ledger, new).
 - **Key files:**
-  - `scripts/fix/candidate_generators.py` — 1185 lines; `MAX_CANDIDATES = 150` :31; `CandidatesSpec` :42 (kind, origin, pattern, exclude_pattern, globs, paths, paths_exempt, structs, field_type_pattern); `read_candidates_spec` :83; `GENERATORS` :1152 (15 kinds); `enumerate_candidates` :1171, cap raise :1179-1184.
+  - `scripts/style/candidate_generators.py` — `CandidatesSpec` :37 (kind, origin, pattern, exclude_pattern, globs, paths, paths_exempt, structs, field_type_pattern); `read_candidates_spec` :78; `GENERATORS` (15 kinds); `enumerate_candidates` :1166, returns every site (no cap).
   - `scripts/fix/style_admin.py` — 260 lines; `from style_history import HISTORY_DIR, NATE_STYLE_DIR, HistoryRow` :12; `RUST_STYLE_DIR` :14. Used by `commands/style_rename.md:23`, `commands/style_delete.md:27`.
   - `scripts/fix/style_history.py` — 2089 lines; imports candidate_generators :25; `NATE_STYLE_DIR` :28, `HISTORY_DIR` :29, `HistoryRow` :129; `normalize_guideline_id` :152, `parse_frontmatter` :180, `list_style_files` :575, `_build_units_from_files` :590, `resolve_focus_targets` :628, `focused_units` :673; `focused-eval` subparser :1949, handler :2071; `enumerate_candidates` call sites :1228, :1305, :2057.
   - `scripts/fix/style_report.py`, `scripts/fix/backpopulate_settings.py` (called from `fix.sh:219`) — retired in Phase 12.
@@ -74,7 +74,7 @@ Mapping (style-unit's choice, 2026-10-16): the proposal's Phases 1-3 are this pl
 - **Invariants:**
   - basedpyright reports zero errors and zero warnings; no file-level ignores; no `Any` (TypedDict for known-key dicts, annotate every `json.loads` result); line-level `# pyright: ignore[...]` only as a last resort (user, CLAUDE.md).
   - Every module has `from __future__ import annotations`; discarded results are written `_ = …`; test classes use `@final`/`@override`; sum types are small NamedTuple/dataclass variants (repo convention).
-  - Scripts run through `~/.claude/scripts/lib/py`; Python ≥3.10 for the Mac (repo convention).
+  - Scripts run through `~/.claude/scripts/lib/py`; Python ≥3.12 (the tests already use `typing.override`).
   - State lives under `~/.local/state/`; user-facing times go through `scripts/lib/user_zone.py` (America/New_York) (user, 2026-10-12).
   - Scripts message sessions only through `scripts/message/send.py`, and address a showrunner by `showrunners.py address <slug>`, never by a stored name (repo convention).
   - The forbidden-words list (`~/rust/nate_style/rust/forbidden-words.md`) applies to code, comments, docs and commits; hooks block a match (user).
@@ -101,45 +101,27 @@ Mapping (style-unit's choice, 2026-10-16): the proposal's Phases 1-3 are this pl
      Full procedure: /plan:to_phased_plan → <PhaseNumbering/>. -->
 
 ### Phase 1 — Move the kept style scripts into scripts/style  · status: done
-**Depends on:** none
 
-#### Work Order
+#### As-built
 
-**Goal:** `candidate_generators.py`, `style_admin.py` and the rule-reading part of `style_history.py` live in `scripts/style/`, every kept caller uses them there, the 150 cap is gone from the generator, and `scripts/style` is a merge-gate suite.
-
-**Spec:**
-- `git mv scripts/fix/candidate_generators.py scripts/style/candidate_generators.py` and `git mv scripts/fix/style_admin.py scripts/style/style_admin.py`.
-- New `scripts/style/style_rules.py` takes from `style_history.py`, unchanged in behavior: `NATE_STYLE_DIR` (:28), `HISTORY_DIR` (:29), `HistoryRow` (:129), `normalize_guideline_id` (:152), `parse_frontmatter` (:180), `list_style_files` (:575), `_build_units_from_files` (:590, renamed `build_units_from_files` since it is now imported), `resolve_focus_targets` (:628), `focused_units` (:673), and the `focused-eval` subcommand (subparser :1949, handler :2071) as `style_rules.py focused-eval` with the same arguments and output. `style_history.py` deletes those definitions and imports them from `style_rules` (no second copy); it stays in `scripts/fix/` until Phase 12.
-- `style_admin.py` imports `HISTORY_DIR, NATE_STYLE_DIR, HistoryRow` from `style_rules`.
-- `style_history.py` imports `CandidatesSpec, Enumeration, enumerate_candidates, read_candidates_spec` from `scripts/style/candidate_generators.py`: add `scripts/style` to the `scripts/fix` environment's `extraPaths` in `pyrightconfig.json`, and insert `scripts/style` on `sys.path` at the top of `style_history.py` the way other cross-folder scripts in the repo do (read one existing example, e.g. a `sys.path.insert` in `scripts/production/`).
-- The cap leaves the generator: delete `MAX_CANDIDATES` (:31) and the raise at :1179-1184; `enumerate_candidates` returns every site. The ticket splitter (Phase 6) owns the 150 limit. The fix pipeline is off (all three stages), so its callers at `style_history.py:1228, :1305, :2057` need no replacement cap.
-- Repoint callers: `commands/focused_eval.md:36` → `~/.claude/scripts/lib/py ~/.claude/scripts/style/style_rules.py focused-eval`; `commands/style_rename.md:23` and `commands/style_delete.md:27` → `scripts/style/style_admin.py`; `scripts/fix/README.md` rows for the two moved files point at their new home; `scripts/fix/docs/candidate-enumeration-design.md:277` names the new path.
-- `pyrightconfig.json`: add an `executionEnvironments` entry `{ "root": "scripts/style", "extraPaths": [".", "scripts/style", "scripts/lib"] }` (copy the field set of a sibling entry such as `scripts/production`'s and keep its other keys).
-- `scripts/production/merge_gate.py` `TEST_SUITES` (:40-45): add `"style"`.
-- Tests, new in `scripts/style/`: `test_candidate_generators.py` (one regex rule and one struct-field rule against a small temp crate; a spec yielding 200 sites returns all 200), `test_style_rules.py` (`parse_frontmatter` on a sample with a `candidates:` block; `focused_units` on a temp rule dir), `test_style_admin.py` (one rename against a temp `NATE_STYLE_DIR`).
+- `scripts/style/` holds `candidate_generators.py` (no 150 cap; `enumerate_candidates` returns every site), `style_admin.py` (imports `HISTORY_DIR`, `NATE_STYLE_DIR`, `HistoryRow` from `style_rules`) and the new `style_rules.py`.
+- `style_rules.py` owns rule reading, the history TypedDicts, `Unit`, and the `focused-eval` CLI, whose output matches the old `style_history.py focused-eval`.
+- `scripts/fix/style_history.py` deletes the moved definitions and imports them from `scripts/style` through a `sys.path` insert; it stays in `scripts/fix/` until its retirement.
+- `/focused_eval`, `/style_rename` and `/style_delete` call the new paths through `~/.claude/scripts/lib/py`; `scripts/style` has its own pyright environment and is a merge-gate suite.
 
 **Files:**
-- `scripts/style/candidate_generators.py` — moved; cap removed
-- `scripts/style/style_admin.py` — moved; imports from style_rules
-- `scripts/style/style_rules.py` — new; rule reading and `focused-eval`
-- `scripts/style/test_candidate_generators.py`, `scripts/style/test_style_rules.py`, `scripts/style/test_style_admin.py` — new
-- `scripts/fix/style_history.py` — imports moved names; definitions deleted
-- `scripts/fix/README.md`, `scripts/fix/docs/candidate-enumeration-design.md` — paths
-- `commands/focused_eval.md`, `commands/style_rename.md`, `commands/style_delete.md` — paths
-- `pyrightconfig.json` — `scripts/style` env; `scripts/style` in the `scripts/fix` env
-- `scripts/production/merge_gate.py` — `"style"` suite
+- `scripts/style/style_rules.py` — rule reading, `Unit`, `HistoryRow`/`Outcome`/`ReviewedUnit`, `focused-eval`
+- `scripts/style/candidate_generators.py` — generators; `CandidatesSpec` at :37, `read_candidates_spec` at :78
+- `scripts/style/style_admin.py` — rule rename and delete
+- `scripts/style/test_candidate_generators.py`, `test_style_rules.py`, `test_style_admin.py` — tests for the three modules
+- `scripts/production/merge_gate.py`, `scripts/production/test_merge_gate.py` — `style` suite
+- `pyrightconfig.json` — `scripts/style` environment; `scripts/style` in the `scripts/fix` extraPaths
 
-**Workers:** 1 writer + 1 tester — the move is one connected edit; the tester writes the new tests against the moved modules' existing behavior.
-- `impl` — every file above except the three test files; hub: `pyrightconfig.json` (both environments)
-- `test` — `scripts/style/test_candidate_generators.py`, `test_style_rules.py`, `test_style_admin.py`, from the Spec and the moved functions' current behavior
+**Binds later work:** `style_rules.py` holds `parse_frontmatter`, `list_style_files`, `NATE_STYLE_DIR`, `HISTORY_DIR`, `RUST_DIR`, `LOAD_STYLE_SCRIPT`, `extract_title`, `read_pre_filter`, `normalize_guideline_id`, `Unit`, `HistoryRow`/`Outcome`/`ReviewedUnit`, `build_units_from_files`, `resolve_focus_targets`, `focused_units` and the `focused-eval` CLI. `candidate_generators.py` returns every site with no cap; any limit belongs to its callers. `style_history.py` re-exports moved names with `X as X` because `style_report.py` imports them from there. `scripts/style` is a merge-gate suite.
 
-**Constraints from prior phases:** none.
+**Gotchas:** A new merge-gate suite goes in both `TEST_SUITES` in `merge_gate.py` and `EXPECTED_SUITES` in `test_merge_gate.py`. The repo's Python floor is 3.12 in practice: `typing.override` and `enterContext` appear in 194 scripts.
 
-**Acceptance gate:**
-- `python3 -m unittest discover -s scripts/style -p 'test_*.py'` green; `basedpyright scripts/style` and `basedpyright scripts/fix` report `0 errors, 0 warnings`.
-- `~/.claude/scripts/lib/py scripts/production/merge_gate.py --tests-only` green with the `style` suite.
-- `~/.claude/scripts/lib/py scripts/style/style_rules.py focused-eval` with the arguments `/focused_eval` passes prints the same units as `scripts/fix/style_history.py focused-eval` did on the base commit for one rule and one project.
-- `git grep -n 'scripts/fix/\(candidate_generators\|style_admin\)'` finds nothing outside `docs/as-built/` and `docs/plans/`.
+**Ruled out:** Holding the new tests to Python 3.10 — the repo already uses `typing.override`.
 
 ### Phase 2 — Rule metadata: tier, family, input scope and generator surface  · status: todo
 **Depends on:** Phase 1
@@ -163,7 +145,7 @@ Mapping (style-unit's choice, 2026-10-16): the proposal's Phases 1-3 are this pl
     The three `modules` generator rules are tier D (they carry `scope: review`); every `modules` rule is tier D.
   - `input_scope: file|crate|manifest` — what a judgment depends on. A rule with no `input_scope` is `crate`. This phase sets only `workspace-dependencies: manifest`; every other rule stays `crate` until the pilot shows it is file-local (design, settled).
   - Inside each of the 22 `candidates:` blocks, `surface: whole|partial` and, for `partial`, `uncovered: '<what the generator does not list>'`. The audit: read each rule's text against its generator kind in `scripts/style/candidate_generators.py` and the narrowing record in `scripts/fix/docs/candidate-enumeration-design.md` (:163 table, :325-326). Known: enums-over-bool-for-owned-booleans is `partial`, `uncovered: 'function arguments, return types, local accumulators'` (the generator lists struct fields only). The uncovered surface of a `partial` rule is a tier-C read in the same family.
-- `CandidatesSpec` (`candidate_generators.py:42`) gains `surface: Literal["whole", "partial"]` and `uncovered: str`; `read_candidates_spec` (:83) reads them and refuses a spec missing `surface`.
+- `CandidatesSpec` (`candidate_generators.py:37`) gains `surface: Literal["whole", "partial"]` and `uncovered: str`; `read_candidates_spec` (:78) reads them and refuses a spec missing `surface`.
 - New `scripts/style/rules.py`:
   - `Rule` (frozen dataclass): `name`, `path`, `tier`, `family` (or None), `input_scope`, `mode_propose: bool` (from `mode: propose`), `candidates: CandidatesSpec | None`, `pre_filter: str | None`, `blob: str` (git blob hash of the rule file, `git hash-object`), `origin: Literal["global", "local"]`.
   - `load_rules(repo_root: Path | None) -> tuple[Rule, ...]` — global rules from `NATE_STYLE_DIR/rust`, plus repo-local rules from `$repo_root/docs/<member>/style/` (the same lookup as `load-rust-style.sh:73`; reuse `style_rules.list_style_files` or the script's `--list-files` output). Uses `style_rules.parse_frontmatter`.
@@ -173,21 +155,21 @@ Mapping (style-unit's choice, 2026-10-16): the proposal's Phases 1-3 are this pl
 - Also run once against the real tree: `rules.py list` shows 14 A, 20 B, 10 C, 7 D, 2 E.
 
 **Files:**
-- `~/rust/nate_style/rust/*.md` — 53 rules: `tier`, `family`, `input_scope`, `surface`/`uncovered` (outside this repo; commit there)
+- `~/rust/nate_style/rust/*.md` — 53 rules: `tier`, `family`, `input_scope`, `surface`/`uncovered` (outside this repo; commit the 52 tracked files there; `public-failures-return-named-errors.md` is another session's uncommitted rule: add its keys, never stage or commit it)
 - `scripts/style/candidate_generators.py` — `surface`, `uncovered` in `CandidatesSpec` and its reader
 - `scripts/style/rules.py` — new
 - `scripts/style/test_rules.py` — new
 
 **Workers:** 2 writers — the rule files split from the code.
 - `impl` — `scripts/style/candidate_generators.py`, `scripts/style/rules.py`, `scripts/style/test_rules.py`
-- `test` (opens as impl) — the 53 rule files in `~/rust/nate_style/rust/` and the surface audit; commits them in that repo
+- `test` (opens as impl) — the 53 rule files in `~/rust/nate_style/rust/` and the surface audit; commits the 52 tracked ones in that repo by explicit path (never `git add -A`: `review-charter.md` and `rust/public-failures-return-named-errors.md` are other sessions' uncommitted work)
 
-**Constraints from prior phases:** Phase 1 moved `candidate_generators.py` to `scripts/style/` (no cap), and put `parse_frontmatter`, `list_style_files`, `NATE_STYLE_DIR` in `scripts/style/style_rules.py`. `scripts/style` is a merge-gate suite with its own pyright environment.
+**Constraints from prior phases:** Phase 1 moved `candidate_generators.py` to `scripts/style/` (no cap), and put `parse_frontmatter`, `list_style_files`, `NATE_STYLE_DIR`, `extract_title`, `read_pre_filter`, `normalize_guideline_id` and the `Unit` dataclass in `scripts/style/style_rules.py`; reuse them rather than copying. `scripts/fix/style_history.py` re-exports moved names with `X as X` for `style_report.py`. `scripts/style` is a merge-gate suite with its own pyright environment; a new merge-gate suite must be listed in both `TEST_SUITES` and `scripts/production/test_merge_gate.py` `EXPECTED_SUITES`. The repo's Python floor is 3.12 in practice (`typing.override` is used across the tests).
 
 **Acceptance gate:**
 - `python3 -m unittest discover -s scripts/style -p 'test_*.py'` green; `basedpyright scripts/style` `0 errors, 0 warnings`; merge gate `--tests-only` green.
-- `~/.claude/scripts/lib/py scripts/style/rules.py list` loads all 53 global rules with no validation error and counts 14/20/10/7/2 by tier; `rules.py list --repo ~/rust/cargo-liner` adds cargo-liner's 9 local rules (each with a tier and family — the writer adds them in cargo-liner's `docs/*/style/` only if missing, as a separate commit there, and says so in the phase report).
-- `git -C ~/rust/nate_style log -1 --stat` shows only rule files.
+- `~/.claude/scripts/lib/py scripts/style/rules.py list` loads all 53 global rules with no validation error and counts 14/20/10/7/2 by tier; a test builds a temp repo with `docs/<member>/style/` rules and shows `load_rules(repo)` merges them, and that a local rule missing `tier` or `family` is a named error. No writes to `~/rust/cargo-liner`: tagging its 11 local rules is the pilot's bootstrap (Phase 11), through its showrunner.
+- `git -C ~/rust/nate_style log -1 --stat` shows only rule files, and `git -C ~/rust/nate_style status --short` still lists `review-charter.md` and `rust/public-failures-return-named-errors.md` as other sessions' uncommitted work.
 
 ### Phase 3 — Coverage ledger: judgments, cells and the tier A lint record  · status: todo
 **Depends on:** Phase 2
@@ -562,6 +544,7 @@ Mapping (style-unit's choice, 2026-10-16): the proposal's Phases 1-3 are this pl
 **Spec:**
 - Bootstrap (through the build-followups showrunner, which relays to cargo-liner's showrunner, production `remove-running-section`, session `cargo-liner`, doc `/home/natepiano/rust/cargo-liner/docs/cargo-port/remove-running-section-production.md`):
   1. that doc gains `**Proposals:**` (its showrunner picks the folder; recommend `~/rust/hanadocs/issues`, as hana uses);
+  1b. cargo-liner's 11 local rules (`docs/cargo-mend/style/` 5, `docs/cargo-port/style/` 6) gain `tier` and `family` (and `input_scope` where not `crate`), committed in cargo-liner through its showrunner's normal flow, so `rules.py list --repo ~/rust/cargo-liner` loads them without a validation error;
   2. its showrunner runs `/showrunner:add_style`, which creates `style/main`, the `cargo-liner-style` checkout, doc and four standing plans, and starts the style showrunner attached under it;
   3. the style showrunner launches only `modules-unit` (all crates), `names-unit` (scope limited to crate `cargo-handler`) and `types-unit` (one crate: the one with the largest `style_plan.py queue` candidate count for the types family); `values-unit` stays unlaunched. Scope limits go into each unit plan's Delegation Context as `**Pilot scope:** <crates>`; `style_plan.py next-phase` honors that line (add it in this phase if missing).
 - Measure, all before Phase 12 (design, pass criteria, verbatim):
