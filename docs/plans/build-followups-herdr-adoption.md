@@ -490,36 +490,16 @@ Moved to unit `herdr-panes-unit`, run in parallel with Phase 5; shipped as `docs
 
 ### Phase 16 — herdr and shutdown tests green on the Mac  · status: done
 
-**Depends on:** Phase 14
+#### As-built
 
-**User sees:** before — on the Mac, 10 herdr and shutdown tests fail on this branch that pass on the merge branch; after — they pass on the Mac and on natedev, so the Mac work (Phase 14) can merge.
-
-#### Work Order
-
-**Goal:** fix the 10 tests this branch newly fails on the Mac (run 2026-10-16 from a clone of checkpoint c5410fca, `PYTHONPATH=<clone> python -m unittest discover -s scripts/<suite> -p "test_*.py"`; `merge_gate.py` refuses on the Mac for want of `/dev/shm`). The 38 Mac failures also red on the merge branch belong to Phase 17.
-
-**Spec:**
-
-1. Make these pass on the Mac without breaking natedev: `test_list_roles_and_newest_live_claude_name`, `test_partial_unit_marks_do_not_make_a_unit_role`, `test_unit_marks_are_visible_without_a_claude_record`, `test_unit_role_takes_precedence_over_showrunner` (test_herdr_sessions); `test_herdr_host_comes_from_the_process_server_ancestor`, `test_herdr_inventory_records_attached_clients_and_defaults_unreadable_clients_to_detached`, `test_herdr_unit_records_its_host_and_live_session_name`, `test_old_herdr_inventory_reads_detached_and_rejects_invalid_presentation` (shutdown inventory); `test_account_move_uses_the_target_transcript_instead_of_the_source`, `test_dead_owner_in_stopping_finishes_cleanup_before_restore_and_keeps_intent` (test_restart). Find each cause first (a Linux-only fake such as `/proc` reached on Darwin, `/tmp` resolving to `/private/tmp`, a platform branch the test does not pin); fix the code when the code is wrong on the Mac, the test when only the test assumes Linux.
-2. The unit director re-runs both suites on the Mac from the pushed checkpoint.
+- The ten tests that failed only on the Mac were Linux fixtures reaching the Darwin backend; no product code changed.
+- `test_inventory.InventoryTests.setUp` and `test_herdr_sessions` (`setUpModule`) pin `herdr._PLATFORM` to `"linux"` for their `/proc` fixtures.
+- `test_restart.RestartTests` resolves its temporary root (macOS `/tmp` is `/private/tmp`), so trust keys match what `herdr.claude_trust` checks; the dead-owner cleanup test also fakes `restart._process_liveness`.
 
 **Files:**
-- `scripts/herdr/herdr.py`
-- `scripts/herdr/test_herdr.py`
-- `scripts/herdr/herdr_sessions.py`
-- `scripts/herdr/test_herdr_sessions.py`
-- `scripts/shutdown/inventory.py`
-- `scripts/shutdown/test_inventory.py`
-- `scripts/shutdown/restart.py`
-- `scripts/shutdown/test_restart.py`
+- `scripts/shutdown/test_inventory.py`, `scripts/herdr/test_herdr_sessions.py`, `scripts/shutdown/test_restart.py` — platform pins and resolved fixture paths.
 
-**Workers:** 2 writers.
-- `impl` — `herdr.py`, `test_herdr.py`, `inventory.py`, `test_inventory.py`.
-- `test` — `restart.py`, `test_restart.py`, `herdr_sessions.py`, `test_herdr_sessions.py`.
-
-**Constraints from prior phases:** `herdr._PLATFORM` is `sys.platform` read once at import, so patching `sys.platform` later changes nothing: a Linux-faking test selects the backend through `herdr._PLATFORM`, and a Darwin case fakes `LAUNCHCTL`, `HERDR_PS` and `HERDR_LSOF`. Workers cannot reach the Mac; only the unit director runs the Mac suites (from a clone of the pushed branch, `PYTHONPATH=<clone> ~/.claude/scripts/lib/py -m unittest discover -s scripts/<suite> -p 'test_*.py'`) and hands the workers the failure text. The four inventory tests share `InventoryTests.setUp` with several Phase 17 failures; a shared fixture repair lands here.
-
-**Acceptance gate:** `merge_gate.py --tests-only` green on natedev; the 10 tests pass on the Mac; no Mac test that passed on c5410fca fails; `basedpyright scripts/herdr scripts/shutdown` clean.
+**Gotchas:** a test that builds Linux `/proc` files pins `herdr._PLATFORM`; patching `sys.platform` after import changes nothing.
 
 ### Phase 17 — Mac test parity  · status: todo
 
