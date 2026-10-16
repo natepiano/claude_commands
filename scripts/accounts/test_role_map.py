@@ -133,6 +133,30 @@ class RoleMapTests(unittest.TestCase):
             "account_label": "codex3", "why": "quota exhausted", "at": change.at,
             "move_id": "worker-move", "cause": "refusal", "window": "five_hour", "reset": change.reset})
 
+    def test_authoritative_workers_write_preserves_home_cutovers_and_every_other_configuration_key(self) -> None:
+        self.seed(self.home, groups={"units": "claude2"}, workers="codex1")
+        configuration = accounts.accounts_config_file()
+        original: dict[str, object] = {
+            "workers": "codex1",
+            "home_cutovers": [
+                {"label": "claude2", "login": "claude@example.invalid", "at": "2026-10-16T12:00:00Z"},
+                {"label": "codex2", "login": "codex@example.invalid", "at": "2026-10-16T16:00:00Z"},
+            ],
+            "unit": "codex2",
+            "future_setting": {"enabled": True, "values": [1, "kept", None]},
+        }
+        _ = configuration.write_text(json.dumps(original))
+        groups_before = accounts.groups_file().read_bytes()
+        change = role_map.RoleMapChange("workers", "codex3", "operator choice",
+                                        RoleMapReadTime.now(timezone.utc).isoformat())
+        with patch.object(socket, "gethostname", return_value="natedev"):
+            role_map.write_role_map(change)
+        self.assertEqual(json.loads(configuration.read_text()), {**original, "workers": "codex3"})
+        self.assertEqual(accounts.groups_file().read_bytes(), groups_before)
+        entries = (accounts.groups_file().parent / "roles.jsonl").read_text().splitlines()
+        self.assertEqual(len(entries), 1)
+        self.assertEqual(json.loads(entries[0])["label"], "codex3")
+
     def test_mac_cli_workers_selection_writes_natedev_without_requiring_a_local_account(self) -> None:
         self.seed(self.home, groups={"units": "claude3"}, workers="codex1")
         self.seed(self.server_home, groups={"units": "claude2"})

@@ -226,6 +226,7 @@ class ProcessEnvironmentUnread:
 class MacProcessRecord:
     arguments: tuple[str, ...]
     setting: ProcessCodexHome | ProcessWithoutCodexHome
+    executable: Path
 
 
 def _kern_procargs2(pid: int) -> bytes:
@@ -274,7 +275,7 @@ def mac_process_record(pid: int) -> MacProcessRecord | ProcessEnvironmentUnread:
             return unread
         if key == b"CODEX_HOME":
             setting = ProcessCodexHome(Path(os.fsdecode(value))) if value else ProcessWithoutCodexHome()
-    return MacProcessRecord(arguments, setting)
+    return MacProcessRecord(arguments, setting, Path(os.fsdecode(payload[4:executable_end])))
 
 
 def process_codex_home(pid: int) -> ProcessCodexHome | ProcessWithoutCodexHome | ProcessEnvironmentUnread:

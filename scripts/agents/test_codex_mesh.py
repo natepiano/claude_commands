@@ -44,7 +44,7 @@ from scripts.agents import codex_mesh
 from scripts.message import process_table, sessions
 from scripts.usage import agents_log
 from scripts.accounts import accounts, moves, refusals, role_map
-from scripts.whoami import agent_accounts
+from scripts.whoami import account, agent_accounts
 
 
 LegacyWorkerMoveRequest = TypedDict("LegacyWorkerMoveRequest", {
@@ -132,6 +132,13 @@ def setUpModule() -> None:
     processes = patch.object(process_table, "snapshot", return_value={})
     _ = processes.start()
     unittest.addModuleCleanup(processes.stop)
+    # Legacy server fixtures must never inspect native daemon processes.
+    daemons = patch.object(codex_mesh, "_running_daemons", return_value=[])
+    _ = daemons.start()
+    unittest.addModuleCleanup(daemons.stop)
+    executable = patch.object(codex_mesh, "_process_executable", return_value=Path("/opt/bin/codex"))
+    _ = executable.start()
+    unittest.addModuleCleanup(executable.stop)
 
 USAGE_LIMIT = "You've hit your usage limit. Visit https://chatgpt.com/codex/settings/usage"
 CAPACITY = "Selected model is at capacity. Please try a different model."
@@ -2877,6 +2884,8 @@ class MeshCommandTests(unittest.TestCase):
         return target, new
 
     def prepare_running_account_swap(self) -> tuple[Path, StubAppServer]:
+        _ = self.patches.enter_context(patch.object(codex_mesh, "_server_folder",
+                                                   return_value=codex_mesh.NonMeshServerStderr()))
         run = self.session_dir / "scratch-runs" / "run"
         run.mkdir(parents=True)
         _ = (run / "prompt.txt").write_text("Original delegate task")
@@ -5575,8 +5584,793 @@ class ReplyDeliveryTests(unittest.TestCase):
         )
 
 
+@final
+class MacCleanupTests(unittest.TestCase):
+    home: Path = Path()
+    read_executable: Callable[[int], Path] = staticmethod(codex_mesh._process_executable)  # pyright: ignore[reportPrivateUsage]
+
+    @override
+    def setUp(self) -> None:
+        self.home = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        _ = cast(object, self.enterContext(patch.dict(os.environ, {"HOME": str(self.home)}, clear=True)))
+        _ = self.enterContext(patch.object(sys, "platform", "darwin"))
+        _ = self.enterContext(patch.object(subprocess, "run", side_effect=AssertionError("unconfigured command")))
+        _ = self.enterContext(patch.object(account, "mac_process_record", side_effect=AssertionError("no native process record")))
+        _ = self.enterContext(patch.object(account, "process_codex_home", side_effect=AssertionError("no native environment")))
+        _ = self.enterContext(patch.object(sessions, "process_start", side_effect=AssertionError("no native process start")))
+        _ = self.enterContext(patch.object(os, "kill", side_effect=AssertionError("no real signal")))
+
+    def test_mac_server_listing_parses_all_elapsed_forms_and_excludes_non_websocket_targets(self) -> None:
+        listing = ("101 03:04 codex app-server --listen ws://127.0.0.1:4101\n"
+                   "102 02:03:04 /opt/bin/codex -c key=value app-server --listen ws://[::1]:4102\n"
+                   "103 2-03:04:05 codex app-server --listen ws://0.0.0.0:4103\n"
+                   "104 03:04 codex app-server daemon\n"
+                   "105 03:04 codex app-server --listen unix:///scratch/socket\n"
+                   "106 03:04 python tool.py codex app-server --listen ws://localhost:4106\n"
+                   "107 03:04 /Applications/ChatGPT.app/Contents/MacOS/codex app-server --listen ws://localhost:4107\n")
+        def executable(pid: int) -> Path:
+            return Path("/Applications/ChatGPT.app/Contents/MacOS/codex" if pid == 107 else "/opt/bin/codex")
+        with (patch.object(subprocess, "run", return_value=subprocess.CompletedProcess([], 0, listing, "")) as run,
+              patch.object(codex_mesh, "_process_executable", side_effect=executable)):
+            found = codex_mesh._running_servers()  # pyright: ignore[reportPrivateUsage]
+        self.assertEqual(found, [(101, 4101, 184.0), (102, 4102, 7384.0), (103, 4103, 183845.0)])
+        self.assertEqual(cast(tuple[str, ...], run.call_args.args[0]), ("ps", "-eo", "pid=,etime=,args="))
+
+    def test_bundled_codex_executable_cannot_hide_behind_plain_argument_zero_on_either_platform(self) -> None:
+        executable = Path("/Applications/ChatGPT.app/Contents/MacOS/codex")
+        for platform in ("darwin", "linux"):
+            elapsed = "02:00:00" if platform == "darwin" else "7200"
+            with (self.subTest(platform=platform), patch.object(sys, "platform", platform),
+                  patch.object(codex_mesh, "_list_server_processes", return_value=f"101 {elapsed} codex app-server --listen ws://localhost:4101\n"),
+                  patch.object(codex_mesh, "_process_executable", side_effect=self.read_executable),
+                  patch.object(account, "mac_process_record", return_value=account.MacProcessRecord(
+                      ("codex", "app-server", "daemon"), account.ProcessWithoutCodexHome(), executable)),
+                  patch.object(Path, "read_bytes", return_value=b"codex\0app-server\0daemon\0"),
+                  patch.object(os, "readlink", return_value=str(executable)),
+                  patch.object(sessions, "process_start", return_value="start-101")):
+                self.assertEqual(codex_mesh._running_servers(), [])  # pyright: ignore[reportPrivateUsage]
+                target = codex_mesh._daemon_record(101)  # pyright: ignore[reportPrivateUsage]
+            self.assertIsInstance(target, codex_mesh.UnclassifiedCodexProcess)
+
+    def test_unread_executable_path_keeps_a_websocket_server_instead_of_judging_it_unused(self) -> None:
+        with (patch.object(codex_mesh, "_process_executable", side_effect=PermissionError("denied")),
+              patch.object(codex_mesh, "_server_folder", return_value=codex_mesh.NonMeshServerStderr()),
+              patch.object(codex_mesh, "_busy_threads", return_value=()),
+              patch.object(codex_mesh, "_reap") as reap):
+            judgment = codex_mesh._judge((self.home,), 101, 4101, 7200, 0)  # pyright: ignore[reportPrivateUsage]
+        self.assertIsInstance(judgment.verdict, codex_mesh.ServerInUse)
+        self.assertIn("executable", judgment.verdict.reason)
+        reap.assert_not_called()
+
+    def test_mac_connections_count_only_the_local_endpoint_for_ipv4_and_ipv6(self) -> None:
+        listing = ("COMMAND PID USER FD TYPE DEVICE SIZE/OFF NODE NAME\n"
+                   "codex 101 user 12u IPv4 0x0 0t0 TCP 127.0.0.1:4101->127.0.0.1:60001 (ESTABLISHED)\n"
+                   "codex 101 user 13u IPv6 0x0 0t0 TCP [::1]:4101->[::1]:60002 (ESTABLISHED)\n"
+                   "python 202 user 4u IPv4 0x0 0t0 TCP 127.0.0.1:60001->127.0.0.1:4101 (ESTABLISHED)\n")
+        with patch.object(subprocess, "run", return_value=subprocess.CompletedProcess([], 0, listing, "")) as run:
+            counts = codex_mesh._client_counts()  # pyright: ignore[reportPrivateUsage]
+        self.assertEqual(counts, {4101: 2, 60001: 1})
+        self.assertEqual(cast(tuple[str, ...], run.call_args.args[0]), ("lsof", "-nP", "-iTCP", "-sTCP:ESTABLISHED"))
+
+    def test_mac_stderr_distinguishes_a_mesh_log_a_non_mesh_log_and_an_unread_handle(self) -> None:
+        cases = (
+            (subprocess.CompletedProcess([], 0, "p101\nf2\nn/scratch/run with spaces/mesh_server.log\n", ""),
+             codex_mesh.MeshServerLog(Path("/scratch/run with spaces"))),
+            (subprocess.CompletedProcess([], 0, "p101\nf2\nn/dev/null\n", ""), codex_mesh.NonMeshServerStderr()),
+        )
+        for result, expected in cases:
+            with self.subTest(expected=expected), patch.object(subprocess, "run", return_value=result) as run:
+                self.assertEqual(codex_mesh._server_folder(101), expected)  # pyright: ignore[reportPrivateUsage]
+            self.assertEqual(cast(tuple[str, ...], run.call_args.args[0]), ("lsof", "-p", "101", "-a", "-d", "2", "-Fn"))
+        for result in (subprocess.CompletedProcess([], 1, "", "permission denied"),
+                       subprocess.CompletedProcess([], 2, "", "")):
+            with self.subTest(code=result.returncode), patch.object(subprocess, "run", return_value=result):
+                unread = codex_mesh._server_folder(101)  # pyright: ignore[reportPrivateUsage]
+            self.assertIsInstance(unread, codex_mesh.UnreadServerStderr)
+            assert isinstance(unread, codex_mesh.UnreadServerStderr)
+            self.assertIn("lsof", unread.reason)
+
+    def test_empty_mac_stderr_selection_requires_positive_evidence_that_the_pid_is_ours(self) -> None:
+        for ours in (False, True):
+            def command(arguments: tuple[str, ...], **_options: object) -> subprocess.CompletedProcess[str]:
+                if arguments[0] == "ps":
+                    return subprocess.CompletedProcess(arguments, 0, f"{os.getuid() if ours else os.getuid() + 1}\n", "")
+                self.assertEqual(arguments[0], "lsof")
+                if "-d" not in arguments and ours:
+                    return subprocess.CompletedProcess(arguments, 0, "p101\n", "")
+                return subprocess.CompletedProcess(arguments, 1, "", "")
+            with self.subTest(ours=ours), patch.object(subprocess, "run", side_effect=command):
+                stderr = codex_mesh._server_folder(101)  # pyright: ignore[reportPrivateUsage]
+            if ours:
+                self.assertIsInstance(stderr, codex_mesh.NonMeshServerStderr)
+            else:
+                self.assertIsInstance(stderr, codex_mesh.UnreadServerStderr)
+                assert isinstance(stderr, codex_mesh.UnreadServerStderr)
+                self.assertTrue(stderr.reason)
+
+    def test_empty_lsof_selection_means_zero_clients_but_missing_denied_and_other_exits_refuse(self) -> None:
+        with patch.object(subprocess, "run", return_value=subprocess.CompletedProcess([], 1, "", "")):
+            self.assertEqual(codex_mesh._client_counts(), {})  # pyright: ignore[reportPrivateUsage]
+        failures = (FileNotFoundError("missing"),
+                    subprocess.CompletedProcess([], 1, "", "denied"),
+                    subprocess.CompletedProcess([], 2, "", ""))
+        for failure in failures:
+            with self.subTest(failure=type(failure).__name__), patch.object(
+                subprocess, "run", side_effect=[failure]
+            ):
+                with self.assertRaisesRegex(OSError, "lsof.*ESTABLISHED"):
+                    _ = codex_mesh._client_counts()  # pyright: ignore[reportPrivateUsage]
+
+    def test_failed_mac_ps_or_connection_listing_keeps_sweep_and_idle_stop_from_signalling(self) -> None:
+        for failed_command in ("ps", "lsof"):
+            def command(arguments: tuple[str, ...], **_options: object) -> subprocess.CompletedProcess[str]:
+                if arguments[0] == failed_command:
+                    return subprocess.CompletedProcess(arguments, 2, "", "denied")
+                return subprocess.CompletedProcess(arguments, 0,
+                    "101 02:00:00 codex app-server --listen ws://localhost:4101\n", "")
+            with (self.subTest(command=failed_command), patch.object(subprocess, "run", side_effect=command),
+                  patch.object(codex_mesh, "_reap") as reap,
+                  contextlib.redirect_stderr(io.StringIO()) as errors):
+                self.assertEqual(codex_mesh.command_sweep(argparse.Namespace(root=str(self.home), stop=True)), 1)
+                self.assertEqual(codex_mesh.command_idle_stop(argparse.Namespace(
+                    session_dir=str(self.home), pid=101, port=4101)), 1)
+            self.assertIn(failed_command, errors.getvalue())
+            self.assertIn("nothing judged", errors.getvalue())
+            reap.assert_not_called()
+
+    def test_mac_sweep_and_idle_stop_apply_the_same_idle_and_connected_server_verdicts(self) -> None:
+        for operation in ("sweep", "idle-stop"):
+            for connected in (False, True):
+                with self.subTest(operation=operation, connected=connected):
+                    run = self.home / f"{operation}-{connected}"
+                    run.mkdir()
+                    record = run / codex_mesh.SERVER_FILE
+                    _ = record.write_text(json.dumps({"pid": 101, "port": 4101}))
+                    old = time.time() - codex_mesh.SERVER_IDLE_SECS - 60
+                    os.utime(record, (old, old))
+                    def command(arguments: tuple[str, ...], **_options: object) -> subprocess.CompletedProcess[str]:
+                        if arguments[0] == "ps":
+                            text = "101 02:00:00 codex app-server --listen ws://localhost:4101\n"
+                        elif "-p" in arguments:
+                            text = f"p101\nf2\nn{run / codex_mesh.SERVER_LOG}\n"
+                        else:
+                            text = ("codex 101 u 12u IPv4 x 0t0 TCP 127.0.0.1:4101->127.0.0.1:6000 (ESTABLISHED)\n"
+                                    if connected else "")
+                        return subprocess.CompletedProcess(arguments, 0, text, "")
+                    with (patch.object(subprocess, "run", side_effect=command),
+                          patch.object(codex_mesh, "_busy_threads", return_value=()),
+                          patch.object(codex_mesh, "_reap", return_value=True) as reap,
+                          contextlib.redirect_stdout(io.StringIO()) as output):
+                        if operation == "sweep":
+                            code = codex_mesh.command_sweep(argparse.Namespace(root=str(self.home), stop=True))
+                            self.assertEqual(code, 0)
+                            self.assertIn("\tin use\t" if connected else "\tstopped\t", output.getvalue())
+                        else:
+                            code = codex_mesh.command_idle_stop(argparse.Namespace(session_dir=str(run), pid=101, port=4101))
+                            self.assertEqual(code, 1 if connected else 0)
+                    self.assertEqual([call.args[0] for call in reap.call_args_list], [] if connected else [101])
+                    self.assertEqual(record.exists(), connected)
+
+    def test_unread_mac_stderr_keeps_and_names_the_server_in_sweep_and_idle_stop(self) -> None:
+        run = self.home / "runs/ended-run"
+        run.mkdir(parents=True)
+        home = self.home / ".codex"
+        record = run / codex_mesh.SERVER_FILE
+        for operation in ("sweep", "idle-stop"):
+            with self.subTest(operation=operation):
+                _ = record.write_text(json.dumps({"pid": 101, "port": 4101, "codex_home": str(home)}))
+                def command(arguments: tuple[str, ...], **_options: object) -> subprocess.CompletedProcess[str]:
+                    if arguments[0] == "ps":
+                        return subprocess.CompletedProcess(arguments, 0,
+                            "101 02:00:00 codex app-server --listen ws://localhost:4101\n", "")
+                    return subprocess.CompletedProcess(arguments, 2 if "-p" in arguments else 0, "", "")
+                with (patch.object(subprocess, "run", side_effect=command),
+                      patch.object(codex_mesh, "_pid_alive", return_value=True),
+                      patch.object(sessions, "running_sessions", return_value=[]),
+                      patch.object(codex_mesh, "_sign_in_changed_at", return_value=2000),
+                      patch.object(codex_mesh, "_holds_old_sign_in", return_value=True),
+                      patch.object(codex_mesh, "_start_watcher"),
+                      patch.object(codex_mesh, "_busy_threads", return_value=()),
+                      patch.object(codex_mesh, "_reap") as reap,
+                      contextlib.redirect_stdout(io.StringIO()) as output):
+                    if operation == "sweep":
+                        self.assertEqual(codex_mesh.command_sweep(argparse.Namespace(root=str(run.parent), stop=True)), 0)
+                    elif operation == "idle-stop":
+                        self.assertEqual(codex_mesh.command_idle_stop(argparse.Namespace(
+                            session_dir=str(run), pid=101, port=4101)), 1)
+                    self.assertIn("stderr log could not be read", output.getvalue())
+                    self.assertIn("lsof", output.getvalue())
+                    reap.assert_not_called()
+
+    def test_signin_change_retires_an_unread_server_and_moves_live_workers_before_keeping_it(self) -> None:
+        run = self.home / "runs/live-run"
+        run.mkdir(parents=True)
+        _ = (run / codex_mesh.SERVER_FILE).write_text(json.dumps({
+            "pid": 101, "port": 4101, "codex_home": str(self.home / ".codex")}))
+        with (patch.object(codex_mesh, "_pid_alive", return_value=True),
+              patch.object(codex_mesh, "_marker_sessions", return_value=("director",)),
+              patch.object(codex_mesh, "_run_is_live", return_value=True),
+              patch.object(codex_mesh, "_sign_in_changed_at", return_value=2000),
+              patch.object(codex_mesh, "_holds_old_sign_in", return_value=True),
+              patch.object(codex_mesh, "_server_folder", return_value=codex_mesh.UnreadServerStderr("lsof: denied")),
+              patch.object(codex_mesh, "_running_servers", return_value=[(101, 4101, 7200.0)]),
+              patch.object(codex_mesh, "_client_counts", return_value={}),
+              patch.object(codex_mesh, "_switch_run_workers", return_value=()) as switch,
+              patch.object(codex_mesh, "workers_home", return_value=self.home / ".codex1"),
+              patch.object(codex_mesh, "codex_home_role_label", return_value="codex1"),
+              patch.object(codex_mesh, "_notify_holder"),
+              patch.object(codex_mesh, "_start_watcher") as watcher,
+              patch.object(codex_mesh, "_reap") as reap,
+              contextlib.redirect_stdout(io.StringIO()) as output):
+            self.assertEqual(codex_mesh.command_signin_changed(argparse.Namespace(root=str(run.parent))), 0)
+        switch.assert_called_once_with(run, 4101, "codex1", dry_run=False)
+        self.assertFalse((run / codex_mesh.SERVER_FILE).exists())
+        retired = cast(dict[str, object], json.loads((run / codex_mesh.RETIRED_FILE).read_text()))
+        self.assertIn({"pid": 101, "port": 4101, "codex_home": str(self.home / ".codex")},
+                      cast(list[dict[str, object]], retired["servers"]))
+        self.assertIn("1 run(s) moved", output.getvalue())
+        watcher.assert_called_once_with(str(run), 101, 4101)
+        reap.assert_not_called()
+
+    def test_mac_signin_change_stops_an_idle_ended_server_through_the_same_second_look(self) -> None:
+        run = self.home / "runs/ended-run"
+        run.mkdir(parents=True)
+        _ = (run / codex_mesh.SERVER_FILE).write_text(json.dumps({
+            "pid": 101, "port": 4101, "codex_home": str(self.home / ".codex")}))
+        def command(arguments: tuple[str, ...], **_options: object) -> subprocess.CompletedProcess[str]:
+            if arguments[0] == "ps":
+                output = "101 02:00:00 codex app-server --listen ws://localhost:4101\n"
+            elif "-p" in arguments:
+                output = f"p101\nf2\nn{run / codex_mesh.SERVER_LOG}\n"
+            else:
+                return subprocess.CompletedProcess(arguments, 1, "", "")
+            return subprocess.CompletedProcess(arguments, 0, output, "")
+        with (patch.object(subprocess, "run", side_effect=command),
+              patch.object(codex_mesh, "_pid_alive", return_value=True),
+              patch.object(sessions, "running_sessions", return_value=[]),
+              patch.object(codex_mesh, "_sign_in_changed_at", return_value=2000),
+              patch.object(codex_mesh, "_holds_old_sign_in", return_value=True),
+              patch.object(codex_mesh, "_busy_threads", return_value=()),
+              patch.object(codex_mesh, "_start_watcher") as watcher,
+              patch.object(codex_mesh, "_reap", return_value=True) as reap,
+              contextlib.redirect_stdout(io.StringIO()) as output):
+            self.assertEqual(codex_mesh.command_signin_changed(argparse.Namespace(root=str(run.parent))), 0)
+        reap.assert_called_once_with(101)
+        watcher.assert_not_called()
+        self.assertFalse((run / codex_mesh.SERVER_FILE).exists())
+        self.assertIn("1 leftover servers from ended sessions, 1 stopped", output.getvalue())
+
+    def test_mac_signin_change_keeps_the_record_and_names_a_failed_start_time_command(self) -> None:
+        run = self.home / "runs/ended-run"
+        run.mkdir(parents=True)
+        record = run / codex_mesh.SERVER_FILE
+        _ = record.write_text(json.dumps({"pid": 101, "port": 4101,
+                                         "codex_home": str(self.home / ".codex")}))
+        before = record.read_bytes()
+        with (patch.object(subprocess, "run", side_effect=PermissionError("denied")),
+              patch.object(codex_mesh, "_pid_alive", return_value=True),
+              patch.object(sessions, "running_sessions", return_value=[]),
+              patch.object(codex_mesh, "_sign_in_changed_at", return_value=2000),
+              patch.object(codex_mesh, "_switch_run_workers") as switch,
+              patch.object(codex_mesh, "_reap") as reap,
+              contextlib.redirect_stderr(io.StringIO()) as errors,
+              contextlib.redirect_stdout(io.StringIO())):
+            self.assertEqual(codex_mesh.command_signin_changed(argparse.Namespace(root=str(run.parent))), 0)
+        self.assertIn("ps -o etime= -p 101", errors.getvalue())
+        self.assertIn("kept", errors.getvalue())
+        self.assertEqual(record.read_bytes(), before)
+        self.assertFalse((run / codex_mesh.RETIRED_FILE).exists())
+        switch.assert_not_called()
+        reap.assert_not_called()
+
+
+@final
+class CodexDaemonCleanupTests(unittest.TestCase):
+    home: Path = Path()
+    discover: Callable[[], list[codex_mesh.DaemonTarget]] = staticmethod(codex_mesh._running_daemons)  # pyright: ignore[reportPrivateUsage]
+
+    @override
+    def setUp(self) -> None:
+        self.home = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        (self.home / ".codex").mkdir()
+        _ = cast(object, self.enterContext(patch.dict(os.environ, {"HOME": str(self.home)}, clear=True)))
+        _ = self.enterContext(patch.object(sys, "platform", "darwin"))
+        _ = self.enterContext(patch.object(subprocess, "run", side_effect=AssertionError("no native commands")))
+        _ = self.enterContext(patch.object(os, "kill", side_effect=AssertionError("no real signal")))
+        _ = self.enterContext(patch.object(account, "mac_process_record", side_effect=AssertionError("no native arguments")))
+        _ = self.enterContext(patch.object(account, "process_codex_home", side_effect=AssertionError("no native environment")))
+        def process_start(pid: int) -> str:
+            return f"start-{pid}"
+        _ = self.enterContext(patch.object(sessions, "process_start", side_effect=process_start))
+        _ = self.enterContext(patch.object(codex_mesh, "_daemon_process_tree", return_value={}))
+
+    def test_sweep_lists_and_stops_only_signed_out_shared_home_daemons_and_their_descendants(self) -> None:
+        settings = {
+            101: account.ProcessWithoutCodexHome(),
+            102: account.ProcessCodexHome(self.home / ".codex"),
+            103: account.ProcessCodexHome(self.home / ".codex1"),
+            104: account.ProcessEnvironmentUnread("denied"),
+            105: account.ProcessWithoutCodexHome(),
+        }
+        def record(pid: int) -> account.MacProcessRecord | account.ProcessEnvironmentUnread:
+            if pid == 106:
+                return account.ProcessEnvironmentUnread("denied")
+            executable = "/Applications/ChatGPT.app/Contents/MacOS/codex" if pid == 105 else "/opt/bin/codex"
+            return account.MacProcessRecord((executable, "app-server", "daemon"), account.ProcessWithoutCodexHome(), Path(executable))
+        parents = {101: 1, 102: 1, 103: 1, 104: 1, 105: 1, 201: 101, 202: 201, 203: 102, 999: 1}
+        table = {pid: codex_mesh.FamilyProcess(parent, codex_mesh.ProcessIdentity(
+            pid, f"start-{pid}", ("/opt/bin/codex", "app-server", "daemon"), Path("/opt/bin/codex")))
+                 for pid, parent in parents.items()}
+        table[105] = codex_mesh.FamilyProcess(1, dataclasses.replace(
+            cast(codex_mesh.ProcessIdentity, table[105].identity),
+            executable=Path("/Applications/ChatGPT.app/Contents/MacOS/codex")))
+        def selected(pid: int) -> account.ProcessCodexHome | account.ProcessWithoutCodexHome | account.ProcessEnvironmentUnread:
+            return settings.get(pid, account.ProcessWithoutCodexHome())
+        stopped: set[int] = set()
+        killed: list[int] = []
+        def identity(pid: int) -> codex_mesh.ProcessIdentity | codex_mesh.UnreadCodexProcess:
+            member = table.get(pid)
+            return member.identity if member is not None else codex_mesh.UnreadCodexProcess(pid, "process record could not be read")
+        def state(pid: int) -> codex_mesh.ProcessRunState:
+            if pid not in table:
+                return codex_mesh.ProcessRunState.GONE
+            return codex_mesh.ProcessRunState.STOPPED if pid in stopped else codex_mesh.ProcessRunState.RUNNING
+        def signal_process(pid: int, sig: int) -> None:
+            if sig == signal.SIGSTOP:
+                stopped.add(pid)
+            elif sig == signal.SIGCONT:
+                stopped.discard(pid)
+            elif sig == signal.SIGKILL:
+                self.assertIn(pid, stopped)
+                killed.append(pid)
+                stopped.remove(pid)
+                del table[pid]
+            else:
+                self.fail(f"unexpected signal {sig}")
+        def command(arguments: tuple[str, ...], **_options: object) -> subprocess.CompletedProcess[str]:
+            self.assertEqual(arguments[0], "ps")
+            if "-eo" not in arguments:
+                self.assertEqual(arguments, ("ps", "-u", str(os.getuid()), "-o", "pid=,ucomm="))
+            listing = "" if "-eo" in arguments else (
+                "101 codex   \n102 codex\n103 codex\n104 codex\n105 codex\n106 codex\n999 python\n")
+            return subprocess.CompletedProcess(arguments, 0, listing, "")
+        for stop in (False, True):
+            with (self.subTest(stop=stop), patch.object(subprocess, "run", side_effect=command),
+                  patch.object(codex_mesh, "_client_counts", return_value={}),
+                  patch.object(codex_mesh, "_running_daemons", side_effect=self.discover),
+                  patch.object(account, "mac_process_record", side_effect=record),
+                  patch.object(account, "process_codex_home", side_effect=selected),
+                  patch.object(codex_mesh, "_daemon_process_tree", return_value=table),
+                  patch.object(codex_mesh, "_process_identity", side_effect=identity),
+                  patch.object(codex_mesh, "_daemon_process_state", side_effect=state),
+                  patch.object(os, "kill", side_effect=signal_process),
+                  contextlib.redirect_stdout(io.StringIO()) as output):
+                self.assertEqual(codex_mesh.command_sweep(argparse.Namespace(root=str(self.home), stop=stop)), 0)
+            rows = {int(parts[0]): parts for line in output.getvalue().splitlines()
+                    if len(parts := line.split("\t")) == 5}
+            self.assertEqual(set(rows), {101, 102, 103, 104, 106})
+            for pid in (101, 102):
+                self.assertEqual(rows[pid][1:3], ["daemon", "stopped" if stop else "unused"])
+            for pid in (103, 104):
+                self.assertEqual(rows[pid][2], "in use")
+            self.assertIn("another Codex home", rows[103][3])
+            self.assertIn("could not be read", rows[104][3])
+            self.assertEqual(rows[106][1:3], ["unclassified", "kept"])
+            self.assertIn("could not be read", rows[106][3])
+            self.assertIn("4 app-server(s)", output.getvalue())
+            self.assertEqual(killed, [202, 201, 101, 203, 102] if stop else [])
+            self.assertEqual(stopped, set())
+
+    def test_daemon_is_kept_when_shared_home_auth_exists_or_its_absence_cannot_be_confirmed(self) -> None:
+        target = codex_mesh.CodexDaemon(101, "start-101", ("codex", "app-server", "daemon"), Path("/opt/bin/codex"))
+        identity = self.home / ".codex/auth.json"
+        lstat = Path.lstat
+        def denied(path: Path) -> os.stat_result:
+            if path == identity:
+                raise PermissionError("denied")
+            return lstat(path)
+        with patch.object(account, "process_codex_home", return_value=account.ProcessWithoutCodexHome()):
+            self.assertIsInstance(codex_mesh._daemon_verdict(target), codex_mesh.ServerUnused)  # pyright: ignore[reportPrivateUsage]
+            with patch.object(Path, "lstat", denied):
+                verdict = codex_mesh._daemon_verdict(target)  # pyright: ignore[reportPrivateUsage]
+            self.assertIsInstance(verdict, codex_mesh.ServerInUse)
+            self.assertIn("cannot establish", verdict.reason)
+            _ = identity.write_text("synthetic identity presence only")
+            verdict = codex_mesh._daemon_verdict(target)  # pyright: ignore[reportPrivateUsage]
+            self.assertIsInstance(verdict, codex_mesh.ServerInUse)
+            self.assertIn("login", verdict.reason)
+
+    def test_unread_codex_invocation_is_reported_without_being_counted_as_an_app_server(self) -> None:
+        with (patch.object(codex_mesh, "_running_servers", return_value=[]),
+              patch.object(codex_mesh, "_client_counts", return_value={}),
+              patch.object(codex_mesh, "_list_codex_processes", return_value="106 codex   \n"),
+              patch.object(codex_mesh, "_running_daemons", side_effect=self.discover),
+              patch.object(account, "mac_process_record", return_value=account.ProcessEnvironmentUnread("denied")),
+              patch.object(codex_mesh, "_reap") as reap,
+              contextlib.redirect_stdout(io.StringIO()) as output):
+            self.assertEqual(codex_mesh.command_sweep(argparse.Namespace(root=str(self.home), stop=True)), 0)
+        self.assertIn("106\t", output.getvalue())
+        self.assertIn("could not be read", output.getvalue())
+        self.assertIn("0 app-server(s), 0 unused; 0 stopped", output.getvalue())
+        self.assertNotIn("106\tdaemon\t", output.getvalue())
+        reap.assert_not_called()
+
+    def test_linux_daemon_discovery_reads_cmdline_and_uses_the_same_home_and_login_verdict(self) -> None:
+        with (patch.object(sys, "platform", "linux"),
+              patch.object(subprocess, "run", return_value=subprocess.CompletedProcess([], 0, "101 codex\n", "")) as command,
+              patch.object(Path, "read_bytes", return_value=b"/opt/bin/codex\0app-server\0daemon\0") as arguments,
+              patch.object(account, "process_codex_home", return_value=account.ProcessWithoutCodexHome())):
+            found = self.discover()
+            self.assertEqual(found, [codex_mesh.CodexDaemon(101, "start-101", ("/opt/bin/codex", "app-server", "daemon"), Path("/opt/bin/codex"))])
+            self.assertIsInstance(codex_mesh._daemon_verdict(found[0]), codex_mesh.ServerUnused)  # pyright: ignore[reportPrivateUsage]
+        self.assertEqual(cast(tuple[str, ...], command.call_args.args[0]), ("ps", "-u", str(os.getuid()), "-o", "pid=,comm="))
+        arguments.assert_called_once_with()
+
+    def test_daemon_discovery_excludes_exec_prompts_and_accepts_real_subcommands_after_config_flags(self) -> None:
+        arguments = {
+            101: ("codex", "exec", "app-server", "daemon"),
+            102: ("codex", "exec", "app-server daemon"),
+            103: ("codex", "-c", "prompt=app-server daemon", "exec", "task"),
+            104: ("codex", "-c", "key=value", "--enable=feature", "app-server", "daemon"),
+        }
+        def record(pid: int) -> account.MacProcessRecord:
+            return account.MacProcessRecord(arguments[pid], account.ProcessWithoutCodexHome(), Path("/opt/bin/codex"))
+        listing = "".join(f"{pid} codex\n" for pid in arguments)
+        with (patch.object(subprocess, "run", return_value=subprocess.CompletedProcess([], 0, listing, "")),
+              patch.object(account, "mac_process_record", side_effect=record)):
+            found = self.discover()
+        self.assertEqual(found, [codex_mesh.CodexDaemon(104, "start-104", arguments[104], Path("/opt/bin/codex"))])
+
+    def test_readable_codex_exec_record_is_unclassified_even_when_its_prompt_names_a_daemon(self) -> None:
+        arguments = ("codex", "exec", "app-server", "daemon")
+        with patch.object(account, "mac_process_record", return_value=account.MacProcessRecord(
+                arguments, account.ProcessWithoutCodexHome(), Path("/opt/bin/codex"))):
+            target = codex_mesh._daemon_record(101)  # pyright: ignore[reportPrivateUsage]
+        self.assertIsInstance(target, codex_mesh.UnclassifiedCodexProcess)
+        assert isinstance(target, codex_mesh.UnclassifiedCodexProcess)
+        self.assertEqual(target.arguments, arguments)
+
+
+
+@final
+class DaemonProcessStateTests(unittest.TestCase):
+    def test_mac_process_state_distinguishes_stopped_running_zombie_and_gone(self) -> None:
+        cases = (("T+\n", 0, codex_mesh.ProcessRunState.STOPPED),
+                 ("S\n", 0, codex_mesh.ProcessRunState.RUNNING),
+                 ("Z\n", 0, codex_mesh.ProcessRunState.GONE),
+                 ("", 1, codex_mesh.ProcessRunState.GONE))
+        for output, exit_code, expected in cases:
+            with (self.subTest(output=output), patch.object(sys, "platform", "darwin"),
+                  patch.object(subprocess, "run", return_value=subprocess.CompletedProcess([], exit_code, output, "")) as command):
+                self.assertEqual(codex_mesh._daemon_process_state(101), expected)  # pyright: ignore[reportPrivateUsage]
+            self.assertEqual(cast(tuple[str, ...], command.call_args.args[0]), ("ps", "-p", "101", "-o", "stat="))
+
+    def test_linux_process_state_reads_state_after_the_complete_parenthesized_command(self) -> None:
+        for state, expected in (("T", codex_mesh.ProcessRunState.STOPPED),
+                                ("S", codex_mesh.ProcessRunState.RUNNING),
+                                ("Z", codex_mesh.ProcessRunState.GONE)):
+            with (self.subTest(state=state), patch.object(sys, "platform", "linux"),
+                  patch.object(Path, "read_text", return_value=f"101 (codex with ) in name) {state} 1 0 0"),
+                  patch.object(subprocess, "run", side_effect=AssertionError("Linux reads only fake stat"))):
+                self.assertEqual(codex_mesh._daemon_process_state(101), expected)  # pyright: ignore[reportPrivateUsage]
+
+    def test_denied_process_state_refuses_instead_of_claiming_a_process_is_gone(self) -> None:
+        for platform in ("linux", "darwin"):
+            with (self.subTest(platform=platform), patch.object(sys, "platform", platform),
+                  patch.object(Path, "read_text", side_effect=PermissionError("denied")),
+                  patch.object(subprocess, "run", return_value=subprocess.CompletedProcess([], 2, "", "denied"))):
+                with self.assertRaises(OSError):
+                    _ = codex_mesh._daemon_process_state(101)  # pyright: ignore[reportPrivateUsage]
+
+
+@final
+class DaemonFamilySafetyTests(unittest.TestCase):
+    home: Path = Path()
+    identities: dict[int, codex_mesh.ProcessIdentity | codex_mesh.UnreadCodexProcess] = {}
+    parents: dict[int, int] = {}
+    starts: dict[int, str] = {}
+    stopped: set[int] = set()
+    signals: list[tuple[int, int]] = []
+    target = codex_mesh.CodexDaemon(101, "parent-start", ("codex", "app-server", "daemon"), Path("/opt/bin/codex"))
+    child = codex_mesh.ProcessIdentity(201, "child-start", ("codex", "--remote-control"), Path("/opt/bin/codex"))
+    snapshot: Callable[[], dict[int, codex_mesh.FamilyProcess]] = staticmethod(codex_mesh._daemon_process_tree)  # pyright: ignore[reportPrivateUsage]
+
+    @override
+    def setUp(self) -> None:
+        self.home = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        (self.home / ".codex").mkdir()
+        _ = cast(object, self.enterContext(patch.dict(os.environ, {"HOME": str(self.home)}, clear=True)))
+        _ = self.enterContext(patch.object(sys, "platform", "darwin"))
+        _ = self.enterContext(patch.object(subprocess, "run", side_effect=AssertionError("no native command")))
+        _ = self.enterContext(patch.object(account, "mac_process_record", side_effect=AssertionError("no native record")))
+        self.identities = {101: self.target, 201: self.child}
+        self.parents = {101: 1, 201: 101}
+        self.starts = {101: self.target.started, 201: self.child.started}
+        _ = self.enterContext(patch.object(sessions, "process_start", side_effect=self.starts.__getitem__))
+        self.stopped = set()
+        self.signals = []
+        _ = self.enterContext(patch.object(account, "process_codex_home", return_value=account.ProcessWithoutCodexHome()))
+        _ = self.enterContext(patch.object(codex_mesh, "_process_identity", side_effect=self.identity))
+        _ = self.enterContext(patch.object(codex_mesh, "_daemon_process_tree", side_effect=self.tree))
+        _ = self.enterContext(patch.object(os, "kill", side_effect=self.signal_process))
+        _ = self.enterContext(patch.object(codex_mesh, "_daemon_process_state", side_effect=self.state))
+        _ = self.enterContext(patch.object(time, "sleep", side_effect=AssertionError("no real sleep")))
+
+    def identity(self, pid: int) -> codex_mesh.ProcessIdentity | codex_mesh.UnreadCodexProcess:
+        return self.identities.get(pid, codex_mesh.UnreadCodexProcess(pid, "process exited"))
+
+    def tree(self) -> dict[int, codex_mesh.FamilyProcess]:
+        return {pid: codex_mesh.FamilyProcess(parent, self.identities[pid]) for pid, parent in self.parents.items()}
+
+    def state(self, pid: int) -> codex_mesh.ProcessRunState:
+        if pid not in self.parents:
+            return codex_mesh.ProcessRunState.GONE
+        return codex_mesh.ProcessRunState.STOPPED if pid in self.stopped else codex_mesh.ProcessRunState.RUNNING
+
+    def signal_process(self, pid: int, sig: int) -> None:
+        self.assertIn(pid, self.parents)
+        self.signals.append((pid, sig))
+        if sig == signal.SIGSTOP:
+            self.stopped.add(pid)
+        elif sig == signal.SIGCONT:
+            self.stopped.discard(pid)
+        elif sig == signal.SIGKILL:
+            self.assertIn(pid, self.stopped, "only a confirmed frozen process may be killed")
+            self.stopped.remove(pid)
+            del self.parents[pid]
+            del self.identities[pid]
+        else:
+            self.fail(f"unexpected daemon family signal {sig}")
+
+    def test_signed_out_family_is_frozen_parent_first_and_killed_children_first(self) -> None:
+        self.assertTrue(codex_mesh._stop_daemon(self.target))  # pyright: ignore[reportPrivateUsage]
+        self.assertEqual(self.signals, [(101, signal.SIGSTOP), (201, signal.SIGSTOP),
+                                        (201, signal.SIGKILL), (101, signal.SIGKILL)])
+        self.assertEqual(self.parents, {})
+        self.assertEqual(self.stopped, set())
+
+    def test_reparented_member_remains_tracked_until_frozen_and_killed(self) -> None:
+        def signal_process(pid: int, sig: int) -> None:
+            self.signal_process(pid, sig)
+            if (pid, sig) == (101, signal.SIGSTOP):
+                self.parents[201] = 1
+        with patch.object(os, "kill", side_effect=signal_process):
+            self.assertTrue(codex_mesh._stop_daemon(self.target))  # pyright: ignore[reportPrivateUsage]
+        self.assertEqual(self.signals, [(101, signal.SIGSTOP), (201, signal.SIGSTOP),
+                                        (201, signal.SIGKILL), (101, signal.SIGKILL)])
+        self.assertNotIn(201, self.parents)
+
+    def test_reparented_member_must_be_gone_before_shutdown_reports_success(self) -> None:
+        pending: set[int] = set()
+        waited: list[int] = []
+        def signal_process(pid: int, sig: int) -> None:
+            if sig == signal.SIGKILL:
+                self.assertIn(pid, self.stopped)
+                self.signals.append((pid, sig))
+                pending.add(pid)
+            else:
+                self.signal_process(pid, sig)
+                if (pid, sig) == (101, signal.SIGSTOP):
+                    self.parents[201] = 1
+        def advance_shutdown(duration: float) -> None:
+            self.assertGreaterEqual(duration, 0)
+            self.assertTrue(pending, "only a killed member may need an exit wait")
+            for pid in tuple(pending):
+                waited.append(pid)
+                pending.remove(pid)
+                self.stopped.remove(pid)
+                del self.parents[pid]
+                del self.identities[pid]
+        with (patch.object(os, "kill", side_effect=signal_process),
+              patch.object(time, "sleep", side_effect=advance_shutdown)):
+            self.assertTrue(codex_mesh._stop_daemon(self.target))  # pyright: ignore[reportPrivateUsage]
+        self.assertIn(201, waited)
+        self.assertEqual(self.parents, {})
+        self.assertEqual(pending, set())
+
+    def test_stop_signal_is_confirmed_by_process_state_before_any_member_is_killed(self) -> None:
+        confirmed: set[int] = set()
+        needs_confirmation: set[int] = set()
+        def state(pid: int) -> codex_mesh.ProcessRunState:
+            value = self.state(pid)
+            if value == codex_mesh.ProcessRunState.STOPPED:
+                if pid not in needs_confirmation:
+                    needs_confirmation.add(pid)
+                    return codex_mesh.ProcessRunState.RUNNING
+                confirmed.add(pid)
+            return value
+        def signal_process(pid: int, sig: int) -> None:
+            if sig == signal.SIGKILL:
+                self.assertEqual(confirmed, {101, 201})
+            self.signal_process(pid, sig)
+        with (patch.object(codex_mesh, "_daemon_process_state", side_effect=state),
+              patch.object(os, "kill", side_effect=signal_process),
+              patch.object(time, "sleep", return_value=None)):
+            self.assertTrue(codex_mesh._stop_daemon(self.target))  # pyright: ignore[reportPrivateUsage]
+        self.assertEqual(confirmed, {101, 201})
+
+    def test_member_exiting_before_freeze_resumes_the_family_and_reports_unconfirmed_absence(self) -> None:
+        def signal_process(pid: int, sig: int) -> None:
+            self.signal_process(pid, sig)
+            if (pid, sig) == (101, signal.SIGSTOP):
+                del self.parents[201]
+                del self.identities[201]
+                self.parents[202] = 1
+                self.identities[202] = dataclasses.replace(self.child, pid=202, started="orphan-start")
+        with (patch.object(os, "kill", side_effect=signal_process),
+              contextlib.redirect_stderr(io.StringIO()) as errors):
+            self.assertFalse(codex_mesh._stop_daemon(self.target))  # pyright: ignore[reportPrivateUsage]
+        self.assertIn("member exited before the family was frozen; family absence is unconfirmed", errors.getvalue())
+        self.assertEqual(self.signals, [(101, signal.SIGSTOP), (101, signal.SIGCONT)])
+        self.assertEqual(self.stopped, set())
+        self.assertIn(202, self.parents)
+
+    def test_child_born_while_freezing_is_discovered_on_the_next_pass_before_any_kill(self) -> None:
+        def signal_process(pid: int, sig: int) -> None:
+            if (pid, sig) == (201, signal.SIGSTOP):
+                self.parents[202] = 201
+                self.identities[202] = dataclasses.replace(self.child, pid=202, started="late-child-start")
+            self.signal_process(pid, sig)
+        with patch.object(os, "kill", side_effect=signal_process):
+            self.assertTrue(codex_mesh._stop_daemon(self.target))  # pyright: ignore[reportPrivateUsage]
+        self.assertEqual(self.signals, [(101, signal.SIGSTOP), (201, signal.SIGSTOP), (202, signal.SIGSTOP),
+                                        (202, signal.SIGKILL), (201, signal.SIGKILL), (101, signal.SIGKILL)])
+        self.assertEqual(self.parents, {})
+
+    def test_excluded_member_found_after_freeze_resumes_every_stopped_member_without_killing(self) -> None:
+        for setting in (account.ProcessCodexHome(self.home / ".codex1"), account.ProcessEnvironmentUnread("denied")):
+            def selected(pid: int) -> account.ProcessCodexHome | account.ProcessWithoutCodexHome | account.ProcessEnvironmentUnread:
+                return setting if pid == 201 and self.stopped == {101, 201} else account.ProcessWithoutCodexHome()
+            self.signals = []
+            with self.subTest(setting=setting), patch.object(account, "process_codex_home", side_effect=selected):
+                self.assertFalse(codex_mesh._stop_daemon(self.target))  # pyright: ignore[reportPrivateUsage]
+            self.assertEqual(self.signals[:2], [(101, signal.SIGSTOP), (201, signal.SIGSTOP)])
+            self.assertCountEqual(self.signals[2:], [(101, signal.SIGCONT), (201, signal.SIGCONT)])
+            self.assertEqual(self.stopped, set())
+            self.assertEqual(set(self.parents), {101, 201})
+
+    def test_identity_unread_after_stop_still_resumes_the_member_by_pid_and_start(self) -> None:
+        def signal_process(pid: int, sig: int) -> None:
+            self.signal_process(pid, sig)
+            if (pid, sig) == (201, signal.SIGSTOP):
+                self.identities[201] = codex_mesh.UnreadCodexProcess(201, "argv and executable unavailable")
+        with (patch.object(os, "kill", side_effect=signal_process),
+              contextlib.redirect_stderr(io.StringIO()) as errors):
+            self.assertFalse(codex_mesh._stop_daemon(self.target))  # pyright: ignore[reportPrivateUsage]
+        self.assertIn("pid 201", errors.getvalue())
+        self.assertEqual(self.signals, [(101, signal.SIGSTOP), (201, signal.SIGSTOP),
+                                        (201, signal.SIGCONT), (101, signal.SIGCONT)])
+        self.assertEqual(self.stopped, set())
+        self.assertIsInstance(self.identities[201], codex_mesh.UnreadCodexProcess)
+        self.assertEqual(set(self.parents), {101, 201})
+
+    def test_unconfirmed_start_after_stop_keeps_the_member_stopped_and_names_it(self) -> None:
+        for start in ("", "replacement-start", PermissionError("synthetic start denied")):
+            self.identities[201] = self.child
+            self.stopped = set()
+            self.signals = []
+            def signal_process(pid: int, sig: int) -> None:
+                self.signal_process(pid, sig)
+                if (pid, sig) == (201, signal.SIGSTOP):
+                    self.identities[201] = codex_mesh.UnreadCodexProcess(201, "argv and executable unavailable")
+            def process_start(pid: int) -> str:
+                if pid == 201:
+                    if isinstance(start, OSError):
+                        raise start
+                    return start
+                return self.starts[pid]
+            with (self.subTest(start=start), patch.object(os, "kill", side_effect=signal_process),
+                  patch.object(sessions, "process_start", side_effect=process_start),
+                  contextlib.redirect_stderr(io.StringIO()) as errors):
+                self.assertFalse(codex_mesh._stop_daemon(self.target))  # pyright: ignore[reportPrivateUsage]
+            self.assertIn("pid 201", errors.getvalue())
+            self.assertIn("may still be stopped", errors.getvalue())
+            self.assertEqual(self.signals, [(101, signal.SIGSTOP), (201, signal.SIGSTOP),
+                                            (101, signal.SIGCONT)])
+            self.assertEqual(self.stopped, {201})
+            self.assertEqual(set(self.parents), {101, 201})
+
+    def test_exclusion_after_freezing_resumes_only_members_stopped_by_cleanup(self) -> None:
+        self.stopped = {201}
+        excluded: list[int] = []
+        snapshots = 0
+        def tree() -> dict[int, codex_mesh.FamilyProcess]:
+            nonlocal snapshots
+            snapshots += 1
+            return self.tree()
+        def selected(pid: int) -> account.ProcessCodexHome | account.ProcessWithoutCodexHome:
+            if pid == 201 and snapshots >= 2:
+                self.assertEqual(self.stopped, {101, 201})
+                excluded.append(pid)
+                return account.ProcessCodexHome(self.home / ".codex1")
+            return account.ProcessWithoutCodexHome()
+        with (patch.object(account, "process_codex_home", side_effect=selected),
+              patch.object(codex_mesh, "_daemon_process_tree", side_effect=tree)):
+            self.assertFalse(codex_mesh._stop_daemon(self.target))  # pyright: ignore[reportPrivateUsage]
+        self.assertEqual(excluded, [201])
+        self.assertEqual(self.signals, [(101, signal.SIGSTOP), (101, signal.SIGCONT)])
+        self.assertEqual(self.stopped, {201})
+        self.assertEqual(set(self.parents), {101, 201})
+
+    def test_failed_child_stop_resumes_the_parent_without_killing_any_member(self) -> None:
+        def signal_process(pid: int, sig: int) -> None:
+            if (pid, sig) == (201, signal.SIGSTOP):
+                raise PermissionError("synthetic stop denied")
+            self.signal_process(pid, sig)
+        with patch.object(os, "kill", side_effect=signal_process):
+            self.assertFalse(codex_mesh._stop_daemon(self.target))  # pyright: ignore[reportPrivateUsage]
+        self.assertEqual(self.signals, [(101, signal.SIGSTOP), (101, signal.SIGCONT)])
+        self.assertEqual(self.stopped, set())
+
+    def test_failed_frozen_child_kill_resumes_every_surviving_member(self) -> None:
+        def signal_process(pid: int, sig: int) -> None:
+            if sig == signal.SIGKILL:
+                raise PermissionError("synthetic kill denied")
+            self.signal_process(pid, sig)
+        with patch.object(os, "kill", side_effect=signal_process):
+            self.assertFalse(codex_mesh._stop_daemon(self.target))  # pyright: ignore[reportPrivateUsage]
+        self.assertEqual(self.signals[:2], [(101, signal.SIGSTOP), (201, signal.SIGSTOP)])
+        self.assertCountEqual(self.signals[2:], [(101, signal.SIGCONT), (201, signal.SIGCONT)])
+        self.assertEqual(self.stopped, set())
+        self.assertEqual(set(self.parents), {101, 201})
+
+    def test_unrelated_snapshot_processes_do_not_prevent_verified_family_shutdown(self) -> None:
+        snapshot_pid = 900
+        def tree() -> dict[int, codex_mesh.FamilyProcess]:
+            nonlocal snapshot_pid
+            snapshot_pid += 1
+            unrelated = codex_mesh.ProcessIdentity(snapshot_pid, f"ps-{snapshot_pid}", ("ps", "-eo", "pid,ppid"), Path("/bin/ps"))
+            return {**self.tree(), snapshot_pid: codex_mesh.FamilyProcess(1, unrelated)}
+        with patch.object(codex_mesh, "_daemon_process_tree", side_effect=tree):
+            self.assertTrue(codex_mesh._stop_daemon(self.target))  # pyright: ignore[reportPrivateUsage]
+        self.assertTrue(all(event[0] in (101, 201) for event in self.signals))
+        self.assertEqual(self.parents, {})
+
+    def test_bundled_descendant_with_plain_argument_zero_is_never_signalled(self) -> None:
+        self.identities[201] = dataclasses.replace(self.child, executable=Path("/Applications/ChatGPT.app/Contents/MacOS/codex"))
+        self.assertFalse(codex_mesh._stop_daemon(self.target))  # pyright: ignore[reportPrivateUsage]
+        self.assertFalse(any(event[0] == 201 for event in self.signals))
+        self.assertFalse(any(event[1] == signal.SIGKILL for event in self.signals))
+        self.assertEqual(self.stopped, set())
+
+    def test_changed_child_identity_is_never_signalled_and_parent_is_resumed(self) -> None:
+        snapshot = self.tree()
+        self.identities[201] = dataclasses.replace(self.child, started="reused-start")
+        with patch.object(codex_mesh, "_daemon_process_tree", return_value=snapshot):
+            self.assertFalse(codex_mesh._stop_daemon(self.target))  # pyright: ignore[reportPrivateUsage]
+        self.assertFalse(any(event[0] == 201 for event in self.signals))
+        self.assertEqual(self.stopped, set())
+
+    def test_pid_reused_between_ancestry_listing_and_identity_read_is_not_a_trusted_child(self) -> None:
+        before = {
+            101: process_table.Process(101, 1, "codex", "codex app-server daemon"),
+            201: process_table.Process(201, 101, "codex", "codex --remote-control"),
+        }
+        after = {**before, 201: process_table.Process(201, 1, "codex", "codex exec unrelated")}
+        self.identities[201] = dataclasses.replace(self.child, started="replacement-start", arguments=("codex", "exec", "unrelated"))
+        with patch.object(process_table, "snapshot", side_effect=[before, after]):
+            snapshot = self.snapshot()
+        self.assertIsInstance(snapshot[201].identity, codex_mesh.UnreadCodexProcess)
+        self.assertEqual(self.signals, [])
+
+    def test_changed_parent_or_returned_login_never_kills_the_family(self) -> None:
+        self.identities[101] = dataclasses.replace(self.target, started="new-start")
+        self.assertFalse(codex_mesh._stop_daemon(self.target))  # pyright: ignore[reportPrivateUsage]
+        self.assertEqual(self.signals, [])
+        self.identities[101] = self.target
+        _ = (self.home / ".codex/auth.json").write_text("synthetic presence only")
+        self.assertFalse(codex_mesh._stop_daemon(self.target))  # pyright: ignore[reportPrivateUsage]
+        self.assertFalse(any(event[1] == signal.SIGKILL for event in self.signals))
+        self.assertEqual(self.stopped, set())
+
+
+
 class SweepTests(unittest.TestCase):
     """The report of app-servers nothing is using. Every doubt must read as in use."""
+
+    @override
+    def setUp(self) -> None:
+        _ = self.enterContext(patch.object(sys, "platform", "linux"))
 
     @staticmethod
     def facts(**changes: object) -> codex_mesh.ServerFacts:
@@ -5714,17 +6508,17 @@ class SweepTests(unittest.TestCase):
     def test_the_run_folder_comes_from_the_servers_own_log_handle(self) -> None:
         folder = codex_mesh._server_folder  # pyright: ignore[reportPrivateUsage]
         with patch.object(os, "readlink", return_value="/tmp/x/run-a/mesh_server.log"):
-            self.assertEqual(folder(5), Path("/tmp/x/run-a"))
+            self.assertEqual(folder(5), codex_mesh.MeshServerLog(Path("/tmp/x/run-a")))
         with patch.object(os, "readlink", return_value="/tmp/x/gone/mesh_server.log (deleted)"):
-            self.assertEqual(folder(5), Path("/tmp/x/gone"))
+            self.assertEqual(folder(5), codex_mesh.MeshServerLog(Path("/tmp/x/gone")))
         with patch.object(os, "readlink", return_value="/dev/null"):
-            self.assertIsNone(folder(5))
+            self.assertIsInstance(folder(5), codex_mesh.NonMeshServerStderr)
         with patch.object(os, "readlink", side_effect=OSError("no such process")):
-            self.assertIsNone(folder(5))
+            self.assertIsInstance(folder(5), codex_mesh.UnreadServerStderr)
 
     def test_judgment_preserves_the_explicit_unowned_without_log_state(self) -> None:
         with tempfile.TemporaryDirectory() as directory, \
-                patch.object(codex_mesh, "_server_folder", return_value=None), \
+                patch.object(codex_mesh, "_server_folder", return_value=codex_mesh.NonMeshServerStderr()), \
                 patch.object(codex_mesh, "_busy_threads", return_value=()):
             judgment = codex_mesh._judge(  # pyright: ignore[reportPrivateUsage]
                 (Path(directory),), 5, 4005, codex_mesh.SERVER_IDLE_SECS + 60, 0
@@ -5815,7 +6609,9 @@ class SweepTests(unittest.TestCase):
                 patch.object(codex_mesh, "_running_servers", return_value=[(1, 4001, old), (2, 4002, old), (3, 4003, old)]), \
                 patch.object(codex_mesh, "_client_counts", return_value={4001: 1}), \
                 patch.object(codex_mesh, "_server_folder",
-                             side_effect=[Path(directory) / "gone", Path(directory) / "gone", None]), \
+                             side_effect=[codex_mesh.MeshServerLog(Path(directory) / "gone"),
+                                          codex_mesh.MeshServerLog(Path(directory) / "gone"),
+                                          codex_mesh.NonMeshServerStderr()]), \
                 patch.object(codex_mesh, "_busy_threads", return_value=()) as busy, \
                 patch.object(codex_mesh, "_stop_unused", side_effect=stopper), \
                 contextlib.redirect_stdout(io.StringIO()) as printed:
@@ -5853,7 +6649,7 @@ class SweepTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory, \
                 patch.object(codex_mesh, "_running_servers", return_value=[(8, 4008, old)]), \
                 patch.object(codex_mesh, "_client_counts", return_value={}), \
-                patch.object(codex_mesh, "_server_folder", return_value=None), \
+                patch.object(codex_mesh, "_server_folder", return_value=codex_mesh.NonMeshServerStderr()), \
                 patch.object(codex_mesh, "_busy_threads", return_value=()), \
                 patch.object(codex_mesh, "_reap", side_effect=reap), \
                 contextlib.redirect_stdout(io.StringIO()) as printed:
@@ -5893,7 +6689,7 @@ class SweepTests(unittest.TestCase):
 
                 with patch.object(codex_mesh, "_running_servers", return_value=[(9, 4009, old)]), \
                         patch.object(codex_mesh, "_client_counts", return_value={}), \
-                        patch.object(codex_mesh, "_server_folder", return_value=run), \
+                        patch.object(codex_mesh, "_server_folder", return_value=codex_mesh.MeshServerLog(run)), \
                         patch.object(codex_mesh, "_busy_threads", return_value=()), \
                         patch.object(codex_mesh, "_reap", side_effect=reap), \
                         contextlib.redirect_stdout(io.StringIO()) as printed:
@@ -6046,7 +6842,7 @@ class SweepTests(unittest.TestCase):
             _ = record.write_text(json.dumps({"pid": 2, "port": 4002}))
             old = time.time() - codex_mesh.SERVER_IDLE_SECS - 60
             os.utime(record, (old, old))
-            with patch.object(codex_mesh, "_server_folder", return_value=run), \
+            with patch.object(codex_mesh, "_server_folder", return_value=codex_mesh.MeshServerLog(run)), \
                     patch.object(codex_mesh, "_marked_active", return_value=True) as marked, \
                     patch.object(codex_mesh, "_busy_threads", return_value=()):
                 judge = codex_mesh._judge  # pyright: ignore[reportPrivateUsage]
@@ -6066,7 +6862,7 @@ class SweepTests(unittest.TestCase):
             run = root / "run-a"
             run.mkdir()
             _ = (run / codex_mesh.RETIRED_FILE).write_text(json.dumps({"servers": [{"port": 4002, "pid": 2}]}))
-            with patch.object(codex_mesh, "_server_folder", return_value=run), \
+            with patch.object(codex_mesh, "_server_folder", return_value=codex_mesh.MeshServerLog(run)), \
                     patch.object(codex_mesh, "_marked_active", return_value=True), \
                     patch.object(codex_mesh, "_busy_threads", return_value=()):
                 judge = codex_mesh._judge  # pyright: ignore[reportPrivateUsage]
@@ -6094,7 +6890,7 @@ class SweepTests(unittest.TestCase):
             os.utime(ended / codex_mesh.SERVER_FILE, (old, old))
             (root / "active").mkdir()
             _ = (root / "active" / "session-1").write_text(f"{live}\n", encoding="utf-8")
-            with patch.object(codex_mesh, "_server_folder", return_value=ended), \
+            with patch.object(codex_mesh, "_server_folder", return_value=codex_mesh.MeshServerLog(ended)), \
                     patch.object(codex_mesh, "_busy_threads", return_value=()):
                 judgment = codex_mesh._judge(  # pyright: ignore[reportPrivateUsage]
                     (root,), 2, 4002, 9000.0, 0
@@ -6120,7 +6916,7 @@ class SweepTests(unittest.TestCase):
             os.utime(stale / codex_mesh.SERVER_FILE, (old, old))
 
             ownership = codex_mesh._server_ownership(  # pyright: ignore[reportPrivateUsage]
-                (root,), 2, 4002, stale
+                (root,), 2, 4002, codex_mesh.MeshServerLog(stale)
             )
 
         self.assertEqual(ownership, codex_mesh.RetiredRunServer(retired))
@@ -6199,6 +6995,10 @@ class SweepTests(unittest.TestCase):
 
 class SignInChangeTests(unittest.TestCase):
     """Moving runs off an app-server that holds a Codex sign-in from before the last change."""
+
+    @override
+    def setUp(self) -> None:
+        _ = self.enterContext(patch.object(codex_mesh, "_server_folder", return_value=codex_mesh.NonMeshServerStderr()))
 
     def test_the_time_a_server_has_run_is_read_from_ps(self) -> None:
         elapsed = codex_mesh._elapsed_secs  # pyright: ignore[reportPrivateUsage]
@@ -6654,6 +7454,7 @@ class WorkersHomeTests(unittest.TestCase):
         self.session_dir.mkdir()
         _ = cast(object, self.enterContext(patch.dict(os.environ, {"HOME": str(self.home), "AGENT_NOTES_DIR": str(self.home)}, clear=True)))
         select_fixture_workers(self.home)
+        _ = self.enterContext(patch.object(codex_mesh, "_server_folder", return_value=codex_mesh.NonMeshServerStderr()))
         _ = self.enterContext(patch.object(sessions, "running_sessions", return_value=[
             running_holder(holder) for holder in ("director-one", "director-two", "holder-id", "test-holder")]))
 
@@ -7442,7 +8243,7 @@ class RunFolderNameSweepTests(unittest.TestCase):
             (former / "active").mkdir()
             _ = (run / codex_mesh.SERVER_FILE).write_text(json.dumps({"pid": 4242, "port": 5151}))
             _ = (former / "active" / "director").write_text(f"{run}\n")
-            owner = codex_mesh._server_ownership((new, former), 4242, 5151, None)  # pyright: ignore[reportPrivateUsage]
+            owner = codex_mesh._server_ownership((new, former), 4242, 5151, codex_mesh.NonMeshServerStderr())  # pyright: ignore[reportPrivateUsage]
         self.assertEqual(owner, codex_mesh.CurrentRunServer(run))
 
 

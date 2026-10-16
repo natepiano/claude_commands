@@ -1260,7 +1260,7 @@ After a worker launch's own turn has ended, a move to the selected seats home th
 - The Mac's ChatGPT desktop app runs its bundled `codex` (inside `ChatGPT.app`) on `~/.codex`: the cutover refuses until the app quits, and the app is signed out of `~/.codex` afterwards.
 - Codex rewrites `auth.json` on token refresh, so a process left on `~/.codex` would put a login back. `auth.json` is only renamed, never read, printed, copied or logged.
 
-### Phase 42 — Codex server cleanup on the Mac  · status: todo
+### Phase 42 — Codex server cleanup on the Mac  · status: done
 
 **Depends on:** Phase 41
 
@@ -1282,9 +1282,89 @@ After a worker launch's own turn has ended, a move to the selected seats home th
 - `scripts/agents/codex_mesh.py` — macOS listing, client counts, server folder, the daemon verdict.
 - `scripts/agents/test_codex_mesh.py` — macOS faked `ps`/`lsof` output, the daemon verdict, the bundle and numbered-home exclusions, a failed command refusing.
 - `scripts/accounts/test_role_map.py` — a workers change keeps `home_cutovers`.
+- `scripts/whoami/account.py` — the Mac kernel record keeps the executable path, for the bundle exclusion.
+- `scripts/whoami/test_account.py` — the executable path read from the kernel record.
 
-**Workers:** 1 writer + 1 tester. impl: `codex_mesh.py`. test: `test_codex_mesh.py`, `test_role_map.py`.
+**Workers:** 1 writer + 1 tester. impl: `codex_mesh.py`, `account.py`. test: `test_codex_mesh.py`, `test_role_map.py`, `test_account.py`.
 
 **Live (director):** after merge and promote, on the Mac run `codex_mesh.py sweep` (judging only, no `--stop`) and check each server line; on natedev the same. Never stop a server of another session by hand.
 
 **Acceptance gate:** macOS listing, client counts and folder, `lsof`'s empty selection against its failure, the unread folder as a keep reason in `sweep`, `idle-stop` and `signin-changed`, the daemon verdict with `~/.codex` signed in, signed out and unreadable, its descendants stopped, identity checked again before signalling, its exclusions, and a failed command refusing are pinned by tests with faked commands; a workers change keeps `home_cutovers`; every changed file reads 0 errors, 0 warnings; the merge gate is green.
+
+### Phase 43 — Codex cutover finishes the first startup  · status: todo
+
+**Depends on:** Phase 41
+
+#### Work Order
+
+**Goal:** `cutover-home codexN` leaves a home that starts. Showrunner, 2026-10-16 (urgent, ahead of the shell-snapshots fix): the user ran `codex2` on natedev at about 13:02 EDT and it failed with "app server did not become ready on ~/.codex2/app-server-control/app-server-control.sock"; the daemon log said "timed out waiting for state db backfill after 30s (status: running)".
+
+**Constraints from prior phases:** `setup codexN` (`_setup_codex_home`) links the home, prints the wait line, and runs `agent_accounts.prepare_codex_home`, which starts `codex app-server --listen stdio://` on the home and waits up to `CODEX_HOME_PREPARATION_SECONDS` for `initialize`, retrying servers that exit unanswered, while Codex builds its state database (the backfill over the shared sessions). An interrupted backfill leaves `backfill_state.status = running`, and Codex holds startup for 15 minutes on that lease. Phase 41's `cutover_codex_home` links the home and renames `auth.json` but never runs that first startup, so natedev's `~/.codex2` met its first backfill when the user ran `codex2`, the daemon gave up after 30 s and left the lease. On 2026-10-16 the director repaired natedev by running `setup codex2`; the Mac's `~/.codex2` backfill reads `complete` (12:01 EDT), because its status check started Codex.
+
+**Spec:**
+
+1. After the login move, `cutover-home codexN` prints the same wait line as setup, runs `prepare_codex_home` on the new home, and reports done only once it answers `initialize`.
+2. A preparation that fails leaves the login move complete (the journal stays `complete`, so the cutover is not repeated) and exits non-zero with one line naming the home and the step: `accounts.py setup codexN` finishes the index.
+3. The undo path is unchanged.
+
+**Files:**
+
+- `scripts/accounts/accounts.py` — `cutover_codex_home` runs the first startup.
+- `scripts/accounts/test_cutover_home.py` — preparation run after the move, success, failure leaving the move complete with the setup step, undo untouched.
+
+**Workers:** 1 writer + 1 tester. impl: `accounts.py`. test: `test_cutover_home.py`.
+
+**Acceptance gate:** tests with a faked `prepare_codex_home` pin the order (login moved, then preparation), the success line, the failure line and exit, and the journal state; every changed file reads 0 errors, 0 warnings; the merge gate is green.
+
+### Phase 44 — Shared links repair themselves  · status: todo
+
+**Depends on:** Phase 43
+
+#### Work Order
+
+**Goal:** the user never sees "is a real file; move it aside or merge it into ~/.claude". Showrunner, 2026-10-16: on the Mac, the user's herdr start refused with "accounts: ~/.claude1/shell-snapshots is a real file; move it aside or merge it into ~/.claude". The Mac had no `~/.claude/shell-snapshots`, so no account dir linked it, and a claude1 session created an empty real folder at 12:40 EDT; claude2–4 had no entry. The showrunner repaired it by hand.
+
+**Constraints from prior phases:** `_repair_link(path, target, shared_home)` in `accounts.py` relinks a wrong link and refuses a real entry with `_real_entry_problem`. Setup and the repair path call it for each shared name of a Claude account dir and of a Codex home (`_link_codex_home`). A missing target is skipped, so an account dir gets no link, and Claude then creates a real folder there.
+
+**Spec:**
+
+1. Setup and repair create a missing shared target in the shared home (`~/.claude` or `~/.codex`) before linking, as the kind the shared entry is (a folder for `shell-snapshots`), with private permissions.
+2. An empty real folder where a link belongs is removed and linked, with no message.
+3. A non-empty real folder is merged into the shared target, each entry moved, when no name exists in both; the folder is then removed and linked, and one line says what was merged. A name in both keeps everything in place and prints a repair step naming the clashing entries; it is never the old refusal wording, and no file is overwritten or deleted.
+4. A real file (not a folder) where a link belongs keeps today's refusal.
+
+**Files:**
+
+- `scripts/accounts/accounts.py` — `_repair_link` and its callers: create, replace, merge.
+- `scripts/accounts/test_accounts.py` — missing target created, empty folder replaced, merge without clash, clash kept with the step, real file refused; Codex home the same.
+
+**Workers:** 1 writer + 1 tester. impl: `accounts.py`. test: `test_accounts.py`.
+
+**Live (director):** after merge and promote, run `accounts.py check` for every account on both machines and confirm no shared-link problem.
+
+**Acceptance gate:** each case above pinned by tests on scratch homes; every changed file reads 0 errors, 0 warnings; the merge gate is green.
+
+### Phase 45 — No Codex daemon descendant escapes the stop  · status: todo
+
+**Depends on:** Phase 42
+
+#### Work Order
+
+**Goal:** `_stop_daemon` reports success only when no process the daemon family spawned survives. Follow-up from Phase 42 under the hard-landing rule: after two repairs (re-listing, then freezing the family with SIGSTOP to a fixed point), a process that a not-yet-frozen member spawns, which forks again and exits between two listings, leaves an orphan under pid 1 outside the tracked set. It is not a regression, an unused daemon runs no turns, so it does not show in normal use, and no gate fails.
+
+**Constraints from prior phases:** Phase 42 freezes members by identity (pid, start time, argv, executable), checks every exclusion before each STOP and again at the fixed point, kills with SIGKILL, and resumes only members it stopped. On natedev the daemon is a session leader, and its `app-server --listen` child calls `setsid`, so one session id does not cover the family. See the project memory attempts log `attempts-daemon-family-escape`.
+
+**Spec:**
+
+1. After the family is frozen, sweep every session led by a frozen member: a process of this user in such a session and not yet tracked joins the family (exclusions checked first) and is frozen, repeated to a fixed point, before any kill.
+2. After the kill, a surviving process in any of those sessions reports the family as not stopped, naming the pid.
+3. A process that left the session with its own `setsid` is out of reach; the doc comment says so.
+
+**Files:**
+
+- `scripts/agents/codex_mesh.py` — session sweep in `_stop_daemon`.
+- `scripts/agents/test_codex_mesh.py` — the unseen-intermediate orphan found by session, a survivor reported, exclusions before STOP.
+
+**Workers:** 1 writer + 1 tester. impl: `codex_mesh.py`. test: `test_codex_mesh.py`.
+
+**Acceptance gate:** the orphan case is pinned by a test that fails on Phase 42's code; every changed file reads 0 errors, 0 warnings; the merge gate is green.
