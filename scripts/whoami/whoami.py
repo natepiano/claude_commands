@@ -11,7 +11,7 @@ from pathlib import Path
 from account import label_for
 from agent_accounts import (ClaudeAccountsInUse, CodexHomeSource, Quota, Report,
                             codex_home_display, codex_homes, codex_report_in_use, live_reports,
-                            workers_home as resolve_workers_home)
+                            observe_workers_home as resolve_workers_home, NoWorkersHome)
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
 from user_zone import user_zone  # noqa: E402
 
@@ -28,7 +28,7 @@ def quota_line(quota: Quota) -> str:
     return f"  {quota.label}: {remaining}; resets {reset_time(quota.resets_at)}"
 
 
-def render(report: Report, selection: ClaudeAccountsInUse, workers_home: Path) -> list[str]:
+def render(report: Report, selection: ClaudeAccountsInUse, workers_home: Path | NoWorkersHome) -> list[str]:
     multiple_codex_homes = report.tool == "Codex" and len(codex_homes(workers_home)) > 1
     codex_workers = multiple_codex_homes and codex_report_in_use(report, workers_home)
     header = report.tool
@@ -71,6 +71,8 @@ async def main() -> None:
 
     selection = accounts.claude_account_selection()
     workers_home = resolve_workers_home()
+    if isinstance(workers_home, NoWorkersHome):
+        print(workers_home.reason, file=sys.stderr)
     reports = await live_reports(selection, workers_home)
     reports = [report for report in reports
                if report.tool != "Claude" or report.email is None or selection.is_in_use(report.email)]

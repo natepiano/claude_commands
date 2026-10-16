@@ -183,7 +183,7 @@ class WaitingTests(unittest.TestCase):
             "FAKE_HERDR_LOG": str(self.root / "herdr.jsonl"),
             "FAKE_HERDR_RESPONSES": str(self.root / "herdr-responses.json"),
             "SHOWRUNNERS_CONFIG": str(self.root / "showrunners.json")}))
-        _ = self.enterContext(mock.patch.object(quota_alert, "workers_home", side_effect=AssertionError(
+        _ = self.enterContext(mock.patch.object(quota_alert, "observe_workers_home", side_effect=AssertionError(
             "quota tests must supply Codex readings instead of resolving a live home")))
         self.write(self.root / "tmux.json", json.dumps({
             f"${index}": {"label": "any-label", "panes": [f"%{index}"],

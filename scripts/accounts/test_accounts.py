@@ -26,7 +26,7 @@ from typing import Self, TextIO, cast, final, override
 from unittest.mock import AsyncMock, MagicMock, call, patch
 from zoneinfo import ZoneInfo
 
-from scripts.accounts import accounts, refusals
+from scripts.accounts import accounts, refusals, role_map
 from scripts.production import showrunners
 from scripts.agents import codex_mesh
 from scripts.message import roster
@@ -54,6 +54,7 @@ def setUpModule() -> None:
     root = Path(unittest.enterModuleContext(tempfile.TemporaryDirectory()))
     _ = unittest.enterModuleContext(patch.object(showrunners, "NOTIFIER_STATE_DIR", root))
     _ = unittest.enterModuleContext(patch.object(accounts, "WORKERS_RUN_ROOTS", (root / "worker-runs",)))
+    _ = unittest.enterModuleContext(patch.object(role_map, "is_role_map_host", return_value=True))
 
 
 def named_prefix(config_dir: Path) -> str:
@@ -113,7 +114,7 @@ class RoleWriteTime(datetime):
 
 
 # The Codex home's row when nothing is signed in to it.
-CODEX_HOME_ROW = ("~/.codex", "~/.codex", "not logged in", "workers", *("—",) * 5)
+CODEX_HOME_ROW = ("~/.codex", "~/.codex", "not logged in", "spare", *("—",) * 5)
 
 
 @final
@@ -193,6 +194,7 @@ class AccountsTests(unittest.TestCase):
         self.assertIn("units:", output.splitlines()[0])
 
     def test_status_shows_each_owed_continuation_and_its_hold_reason(self) -> None:
+        _ = self.workers_fixture()
         run = self.root / "worker-runs/run-one"
         run.mkdir(parents=True)
         _ = (run / "mesh_server.json").write_text(json.dumps({"pid": os.getpid()}))
@@ -210,6 +212,7 @@ class AccountsTests(unittest.TestCase):
         self.assertNotIn("run-one/done", output)
 
     def test_status_shows_owed_continuations_under_either_run_folder_name(self) -> None:
+        _ = self.workers_fixture()
         roots = (self.root / "worker-runs", self.root / "former-worker-runs")
         for root, name in zip(roots, ("run-new", "run-old")):
             run = root / name
@@ -223,6 +226,7 @@ class AccountsTests(unittest.TestCase):
         self.assertIn("run-old/worker: continuation owed", output)
 
     def test_status_omits_owed_continuations_from_runs_without_a_live_mesh_server(self) -> None:
+        _ = self.workers_fixture()
         for name, server in (("live", {"pid": 901}), ("dead", {"pid": 902}),
                              ("missing", None), ("malformed", {"pid": "901"}),
                              ("invalid-pid", {"pid": True})):
@@ -286,6 +290,7 @@ class AccountsTests(unittest.TestCase):
         self.assertIn("room again: claude3", output)
 
     def test_status_shows_sessions_workers_and_moves_only_with_detail(self) -> None:
+        _ = self.workers_fixture()
         from scripts.message import sessions
         self.login_directory("claude2", "main@example.invalid", default=True)
         owner = sessions.SessionRecord(pid=12345, sessionId="live-identity", name="Live director",
@@ -2184,6 +2189,9 @@ class AccountsTests(unittest.TestCase):
         self.codex_login("Workers@example.invalid")
         self.write_note("codex1", "other@example.invalid")
         self.write_note("codex2", "workers@example.invalid")
+        config = accounts.accounts_config_file()
+        config.parent.mkdir(parents=True, exist_ok=True)
+        _ = config.write_text('{"workers": "codex2"}')
         now = datetime.now(timezone.utc)
         read = now - timedelta(minutes=1)
         later = now + timedelta(days=3)
@@ -2228,7 +2236,7 @@ class AccountsTests(unittest.TestCase):
         second = self.status_rows()[-1]
 
         # A login with no account note is identified by its home folder.
-        self.assertEqual(first[:4], ("~/.codex", "~/.codex", "workers@example.invalid", "workers"))
+        self.assertEqual(first[:4], ("~/.codex", "~/.codex", "workers@example.invalid", "spare"))
         self.assertEqual((first[4], first[6], first[7]), ("70%", "no", "5"))
         self.assertNotEqual(first[8], "—")
         self.assertEqual(second, first)
@@ -2449,6 +2457,9 @@ class AccountsTests(unittest.TestCase):
         self.codex_login("unknown@example.invalid", self.home / ".codex4")
         (self.home / ".codex10").mkdir()
 
+        config = accounts.accounts_config_file()
+        config.parent.mkdir(parents=True, exist_ok=True)
+        _ = config.write_text('{"workers": "codex1"}')
         rows = self.status_rows()[1:]
 
         self.assertEqual([row[:4] for row in rows], [
@@ -2713,12 +2724,18 @@ class AccountsTests(unittest.TestCase):
         self.codex_reads.return_value = agent_accounts.Report("Codex", email="target@example.invalid",
             source=agent_accounts.CodexHomeSource(target), five_hour=agent_accounts.Quota("5-hour", 20, now + timedelta(hours=3)),
             quotas=[agent_accounts.Quota("Weekly", 30, now + timedelta(days=3))], credit_balance="0")
+        config = accounts.accounts_config_file()
+        config.parent.mkdir(parents=True, exist_ok=True)
+        _ = config.write_text('{"workers": "codex2"}\n')
         return default, target
 
-    def test_workers_role_defaults_independently_of_the_callers_home(self) -> None:
+    def test_unset_workers_role_refuses_independently_of_the_callers_home(self) -> None:
         with patch.dict(os.environ, {"CODEX_HOME": str(self.root / "caller")}):
-            self.assertEqual(self.run_cli("role", "workers"), (0, "~/.codex\n", ""))
-            self.assertEqual(agent_accounts.workers_home(), self.home / ".codex")
+            message = "accounts: workers has no mapped account; run accounts.py set-role workers <codexN>"
+            self.assertEqual(self.run_cli("role", "workers"), (1, "", message + "\n"))
+            with self.assertRaises(ValueError) as refused:
+                _ = agent_accounts.workers_home()
+            self.assertEqual(str(refused.exception), message)
         self.assertEqual(self.role_files(), {})
 
     def test_old_selected_worker_account_is_shared_by_accounts_and_whoami_until_normal_write(self) -> None:
@@ -2782,7 +2799,8 @@ class AccountsTests(unittest.TestCase):
                              named_environment(accounts.account_dir("claude2")))
             self.assertEqual({name: os.environ[name] for name in account.NAMED_ACCOUNT_VARIABLES}, inherited)
 
-    def test_default_prefixes_keep_claude_unassigned_and_codex_explicit(self) -> None:
+    def test_role_prefixes_use_the_explicit_claude_and_codex_selections(self) -> None:
+        default, _ = self.workers_fixture()
         path = accounts.groups_file()
         path.parent.mkdir(parents=True, exist_ok=True)
         _ = path.write_text(json.dumps({"units": "claude2"}))
@@ -2792,7 +2810,7 @@ class AccountsTests(unittest.TestCase):
             unit = accounts.role_account("unit")
             workers = accounts.role_account("workers")
             self.assertIsInstance(workers, accounts.CodexWorkersAccount)
-            self.assertEqual((workers.home, workers.label), (self.home / ".codex", "~/.codex"))
+            self.assertEqual((workers.home, workers.label), (default, "codex2"))
             self.assertEqual(accounts.account_prefix(unit), named_prefix(accounts.account_dir("claude2")))
             self.assertEqual(shlex.split(accounts.account_prefix(workers)), [f"CODEX_HOME={self.home / '.codex'}"])
             self.assertEqual(accounts.launch_prefix("workers"), accounts.account_prefix(workers))
@@ -2848,10 +2866,16 @@ class AccountsTests(unittest.TestCase):
         self.login_directory("claude3", "unit@example.invalid")
         self.select_named_unit("claude3")
         before = self.role_files()
-        with patch.object(accounts, "_append_role_change", side_effect=OSError("disk full")):
+        open_file = os.open
+        def open_without_history(path: str | bytes | os.PathLike[str] | os.PathLike[bytes],
+                                 flags: int, mode: int = 0o777) -> int:
+            if path == accounts.roles_history_file():
+                raise OSError("disk full")
+            return open_file(path, flags, mode)
+        with patch.object(os, "open", side_effect=open_without_history):
             result, _, stderr = self.run_cli("set-role", "workers", "codex1")
         self.assertNotEqual(result, 0)
-        self.assertIn("disk full", stderr)
+        self.assertIn("could not write workers", stderr)
         self.assertEqual(self.role_files(), before)
 
     def test_burn_skips_group_history_between_legacy_unit_and_workers_entries(self) -> None:
@@ -3429,12 +3453,15 @@ _ = sys.stdin.read()
         self.assertIn("limit", lines[0].lower())
         self.assertLess(stdout.index("initialize"), stdout.index("CODEX_HOME=~/.codex1 codex login"))
 
-    def test_legacy_unit_role_file_still_resolves_workers_to_default(self) -> None:
+    def test_legacy_unit_role_file_leaves_workers_unconfigured(self) -> None:
         config = accounts.accounts_config_file()
         config.parent.mkdir(parents=True, exist_ok=True)
         _ = config.write_text('{"unit": "claude3"}')
-        self.assertEqual(self.run_cli("role", "workers"), (0, "~/.codex\n", ""))
-        self.assertEqual(agent_accounts.workers_home(), self.home / ".codex")
+        message = "accounts: workers has no mapped account; run accounts.py set-role workers <codexN>"
+        self.assertEqual(self.run_cli("role", "workers"), (1, "", message + "\n"))
+        with self.assertRaises(ValueError) as refused:
+            _ = agent_accounts.workers_home()
+        self.assertEqual(str(refused.exception), message)
 
 
 @final
@@ -3663,7 +3690,7 @@ class PickerTests(unittest.TestCase):
         _ = accounts.set_group_account("showrunners", "claude1", why="numbered selection", now=self.now)
         self.assertEqual(stored_group_labels(path), {"units": "default", "showrunners": "claude1"})
 
-    def test_missing_or_unreadable_note_refuses_destination_and_leaves_group_storage_untouched(self) -> None:
+    def test_missing_or_unreadable_note_refuses_local_destination_and_preserves_group_storage(self) -> None:
         groups = self.groups()
         original = groups.read_bytes()
         note = self.home / "notes/claude3.md"
@@ -3752,13 +3779,14 @@ class PickerTests(unittest.TestCase):
         self.assertEqual(json.loads(config.read_text()), {"workers": "codex2"})
         self.assertNotIn('"default"', accounts.roles_history_file().read_text())
 
-    def test_absent_workers_key_reports_the_codex_home_number_without_writing(self) -> None:
+    def test_absent_workers_key_refuses_without_using_the_signed_in_home_or_writing(self) -> None:
         self.codex("default", "worker@example.invalid")
         config = accounts.accounts_config_file()
         config.parent.mkdir(parents=True, exist_ok=True)
         _ = config.write_text('{"unit": "claude3"}')
         original = config.read_bytes()
-        self.assertEqual(self.group_cli("role", "workers"), (0, "codex1\n", ""))
+        self.assertEqual(self.group_cli("role", "workers"), (1, "",
+            "accounts: workers has no mapped account; run accounts.py set-role workers <codexN>\n"))
         self.assertEqual(config.read_bytes(), original)
         self.assertFalse(accounts.roles_history_file().exists())
 

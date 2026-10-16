@@ -1206,3 +1206,36 @@ After a worker launch's own turn has ended, a move to the selected seats home th
 - `scripts/message/process_table.py`, `scripts/production/codex_winddown.py`, `scripts/agents/codex_mesh.py` — the ancestry walk.
 - `scripts/production/production_units.py` and its importers across `scripts/production`, `scripts/message/roster.py`, `scripts/delegate/phase_table.py`, `scripts/nightly_review`, `scripts/bevy_upgrade` and `scripts/shutdown/restart.py` — the Units table.
 - `scripts/notify/reply_asks.py`, `scripts/notify/review.py`, `scripts/hooks/showrunner_footer.py` — the reply-question parser.
+
+### Phase 40 — One role map for both machines  · status: done
+
+**Depends on:** Phase 34
+
+#### Work Order
+
+**Goal:** showrunners, units and workers sit on the same accounts on natedev and the Mac. The user, 2026-10-16: "showrunners and units and workers should all run in the same accounts regardless of which machine we are on - the intent is for account management to be consistent". A machine missing the account a role points at says so loudly and never falls back.
+
+**Constraints from prior phases:** each machine keeps its own map. The Claude groups (`showrunners`, `units`) live in `groups_file()` (`~/.local/state/accounts/groups.json`, under `groups_file().with_suffix(".lock")`), written by `set_group_account` and read by `group_accounts()`. The workers account lives under `"workers"` in `accounts_config_file()` (`~/.claude/config/accounts.json`, git-ignored, `worker_names` lock), written by `set_role`. `agent_accounts.workers_home()` quietly returns `~/.codex` when that file is missing. Every change appends a `roles.jsonl` line (`{at, group|role, label, why, move_id, cause, window}`). Writers include `move`/`move_group`, `swap`, `set-role`, the refusal watcher's automatic group and worker moves (`refusal_watch.py`, natedev's two-minute timer), and the Codex sign-in change. On 2026-10-16 natedev reads showrunners → claude1, units → claude4, workers → codex1; the Mac reads showrunners → claude2, units not configured, workers unset (`~/.codex`, codex2). natedev reaches the Mac as `ssh mac`, and the Mac reaches natedev as `ssh natedev` (BatchMode). An ssh session on the Mac cannot read the login keychain (Phase 34). Never print, copy or log credential contents.
+
+**Spec:**
+
+1. natedev holds the one map: the groups and the workers label are read and written only through one module-level pair (`read_role_map()` / `write_role_map(change)`), keeping the existing files, locks and `roles.jsonl` history on natedev.
+2. On any machine that is not natedev (the Mac), `write_role_map` runs the write on natedev over `ssh natedev` through `accounts.py` there, with the same arguments, why, cause and move id, so no second copy is ever written. A failed remote write refuses with one line naming natedev and the change, and nothing changes locally.
+3. On the Mac, `read_role_map` reads natedev's map over ssh (one call per command) and saves it as a cache beside `groups_file()`. When natedev is unreachable it uses the cache and prints one line: `role map from <time in the user's zone>; natedev unreachable`. With no cache it refuses with one line. It never picks an account by itself.
+4. A role whose mapped account is not set up or not logged in on this machine refuses every launch for that role with one line: `accounts: <role> is on <label>, which is not set up on this machine; <setup step>` (or `… not logged in on this machine; <login step>`). Status prints the same problem under the table. `agent_accounts.workers_home()`'s silent `~/.codex` fallback becomes that refusal when the map names no workers account.
+5. Which machine holds the map comes from one constant or setting (natedev's hostname), never inferred; tests choose it.
+6. `docs/accounts.md` and `commands/showrunner/accounts.md` describe the one map, the ssh write and read, the cache line and the refusals.
+
+**Files:**
+
+- `scripts/accounts/accounts.py` — `read_role_map`, `write_role_map`, every writer and reader through them, the refusals.
+- `scripts/whoami/agent_accounts.py` — `workers_home()` without the silent fallback.
+- `scripts/accounts/refusal_watch.py` — automatic moves through `write_role_map`.
+- `scripts/accounts/test_accounts.py`, `scripts/accounts/test_role_map.py` (new) — the map with ssh faked: a Mac write runs on natedev, a Mac read uses natedev's map, the cache line, the refusals.
+- `docs/accounts.md`, `commands/showrunner/accounts.md`.
+
+**Workers:** 1 writer + 1 tester. impl: every production file and both docs. test: the two test files and any test that patches a moved reader or writer.
+
+**Live (director, with the user):** run `accounts.py setup` over ssh on the Mac for each account the map names that the Mac lacks (claude1, claude4, codex1), after `git -C ~/rust/hanadocs pull --ff-only` there if the showrunner agrees. Then the user does one `/login` (or `codex login`) per account in a Terminal on the Mac. Check that a Mac launch per role lands on natedev's account, and that a by-hand move on natedev shows on the Mac at once.
+
+**Acceptance gate:** both machines print the same role map; a Mac write lands in natedev's map and `roles.jsonl`; the cache line and the not-set-up and not-logged-in refusals are pinned by tests; no launch falls back to another account; every changed file reads 0 errors, 0 warnings; the merge gate is green.

@@ -21,6 +21,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Literal, NotRequired, TypedDict, cast, override
 
 SCRIPTS = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(SCRIPTS.parent))
 for _directory in (SCRIPTS / "production", SCRIPTS / "delegate", SCRIPTS / "shutdown", SCRIPTS / "herdr", SCRIPTS / "whoami", SCRIPTS / "message", SCRIPTS / "lib"):
     if str(_directory) not in sys.path:
         sys.path.insert(0, str(_directory))
@@ -35,8 +36,10 @@ import herdr  # noqa: E402
 import codex_daemon  # noqa: E402
 import process_table  # noqa: E402
 if TYPE_CHECKING:
+    from ..accounts.role_map import role_map_command
     from ..whoami import account, agent_accounts, note_file
 else:
+    from scripts.accounts.role_map import role_map_command
     import account as account
     import agent_accounts as agent_accounts
     import note_file as note_file
@@ -927,7 +930,10 @@ def _worker_account(run: _LiveRun, worker: _MeshWorker, homes: dict[int, Path]) 
     if isinstance(port, int) and not isinstance(port, bool) and port in homes:
         return _codex_home_account(homes[port])
     # Idle shutdown removes server metadata; the next turn uses the workers home.
-    return _codex_home_account(agent_accounts.workers_home())
+    try:
+        return _codex_home_account(agent_accounts.workers_home())
+    except ValueError as error:
+        return AccountUnread(str(error))
 
 
 def _worker_status(status: str) -> str:
@@ -1326,6 +1332,7 @@ def peer_roster(environment: Mapping[str, str]) -> Roster:
     return result
 
 
+@role_map_command
 def roster(environment: Mapping[str, str], scope: RosterScope) -> Roster:
     match scope:
         case ThisMachine():

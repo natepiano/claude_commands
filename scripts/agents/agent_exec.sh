@@ -90,7 +90,10 @@ agents_exec_main() {
 import sys
 sys.path.insert(0, sys.argv[1])
 from agent_accounts import workers_home
-print(workers_home())
+try:
+    print(workers_home())
+except (OSError, ValueError) as error:
+    sys.exit(str(error))
 PY
             )"
             family_args_line="$(agents_codex_args)"
