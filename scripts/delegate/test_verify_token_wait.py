@@ -239,12 +239,25 @@ esac
             _ = child.wait(timeout=300)
 
     def test_no_token_records_zero(self) -> None:
-        result = self.verify(self.environment)
+        # A session dir alone makes this a director's run, which takes the token.
+        environment = {name: value for name, value in self.environment.items()
+                       if name != "PLAN_DELEGATE_SESSION_DIR"}
+        result = self.verify(environment)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual(len(self.records()), 1)
         self.assertEqual(self.records()[0]["token_wait_s"], 0)
         self.assertEqual((self.root / "metadata-calls").read_text().splitlines(), ["metadata"])
         self.assertTrue((self.root / "cargo-calls").read_text().startswith("check "))
+
+    def test_director_run_takes_the_token_as_slot_director(self) -> None:
+        clock = self.root / "director-clock"
+        _ = clock.write_text("100\n")
+        session = Path(self.environment["PLAN_DELEGATE_SESSION_DIR"])
+        result = self.verify({**self.environment, "PLAN_DELEGATE_TOKEN_CLOCK_FILE": str(clock)})
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(self.records()[0]["token_wait_s"], 0)
+        self.assertIn("[director] claim: token cargo acquired", (session / "board.log").read_text())
+        self.assertFalse((session / "locks" / "cargo.d").exists(), "the director's token was not released")
 
     def test_token_wait_uses_elapsed_seconds_when_no_clock_override_is_present(self) -> None:
         # Copy the board boundary into a disposable HOME; acquire deliberately
