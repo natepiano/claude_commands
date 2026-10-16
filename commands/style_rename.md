@@ -20,5 +20,5 @@ The admin script auto-appends `.md` to either argument when the source file exis
 
 Run:
 ```bash
-python3 ~/.claude/scripts/fix/style_admin.py rename $ARGUMENTS
+~/.claude/scripts/lib/py ~/.claude/scripts/style/style_admin.py rename $ARGUMENTS
 ```
