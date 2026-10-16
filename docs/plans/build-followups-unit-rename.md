@@ -54,7 +54,7 @@ name. "Today" says what a hand rename of the Units row alone would do.
 | 11 | `branch.<br>.remote/.merge` | br | `push --set-upstream` | git | reset by the push |
 | 12 | `branch.<br>.cargoBerthTarget` (repos with `berth.toml`) | br | `add_unit.py:638-642` | cargo-berth | breaks silently; **`rename.py` does not copy it either** |
 | 13 | Worktree directory and `.git/worktrees/<name>` | wt | `add_unit.py:636` | git, everything | must change (`git worktree move` + `repair`) |
-| 14 | Unit plan header `> **Production:**` | production only | to_production | `/unit:direct` | unaffected |
+| 14 | Unit plan header `> **Production:**` | id (the header names the unit: `phase_table.py:1236` `PRODUCTION_PATTERN`, `to_production.md:84`) | to_production | `/unit:direct`, `phase_table.py` | breaks note ownership; **corrected by the team review** (was "production only") |
 
 ### Sessions
 
@@ -66,6 +66,7 @@ name. "Today" says what a hand rename of the Units row alone would do.
 | 18 | herdr session name, tmux session name | sess | `herdr.generated_session_name` at launch (`herdr.py:731`); `tmux_names.py` follows Claude names | people | label; lookups go by marks |
 | 19 | Claude transcript folder `~/.claude*/projects/<encoded wt>/` | wt | Claude | `--resume` (needs the cwd to match) | breaks resume; `rename.py:656` moves it |
 | 20 | Trust entry `projects[<wt>]` in each account's `.claude.json` | wt | Claude | Claude at launch | trust prompt; `rename.py:635` copies it |
+| 21a | Fix-pipeline checkout redirect `fix.conf [active_checkout]` (`retarget_fix.py:10`), path relative to `~/rust`, member suffixes | wt | `retarget_fix.py apply` | `fix-usage.sh:131`, `agent_assignments.sh:21` | fixes target a removed checkout; **added by the team review** |
 | 21 | Shutdown restart record (`~/.local/state/shutdown/(masked)/…`): `host.unit`, `session_name`, plan path, cwd | id, sess, wt | `shutdown/session_types.py:21-28` | `agents restart` → `add_unit --resume` | breaks a pending restore |
 | 22 | Message queue for an offline name `message/queue/<name>.jsonl` | sess | `send.py:463-480` | `send.py:649` | harmless: keyed by session id when live |
 
@@ -77,17 +78,21 @@ name. "Today" says what a hand rename of the Units row alone would do.
 | 29 | `showrunner/<slug>/dailies_last.json` rows | short label | `dailies_input.py:34` | the next dailies' "what changed" | self-heals after one report |
 | 30 | Stall-watch stretch `stall-watch/sha256(slug\0id).json` | id | `stall_watch.py:207` | `stall_watch.py` | stall timer resets |
 | 31 | Review memory `review-pool/<slug>/memory/<id>.md` | id | `/review:direct` | `review_pool.py:331-340` | lost: the reviewer forgets the unit |
-| 32 | Run records `plan-delegate/runs/*.jsonl`, `working_dir` of `run_started` | wt | `/unit:direct` | `unit_lookup.py:112-136`, `units_table.py`, ETA and phase tables | an **open** run is lost (unit reads standing-by); closed runs are history |
+| 31a | Reviewer leases `review-pool/<slug>/pool.json` `reviewers.*.lease.unit` | id | `review_pool.py:166` | `review_pool.py:412` `_unit_reviewers` | the unit gets a new reviewer; a later unit reusing the old id inherits the old context; **added by the team review** |
+| 32 | Run records `plan-delegate/runs/*.jsonl`: `working_dir`, `worktree`, `branch`, absolute `plan_doc` / `project_plan_doc` | wt, br | `/unit:direct` | `unit_lookup.py:112-136`, `units_table.py`, ETA and phase tables (`phase_table.py:952`) | an **open** run is lost (unit reads standing-by); closed runs are history |
+| 32a | Recorder state `<session_dir>/progress_history_state.json`: the same fields; `_event` stamps every new event from it (`progress_history.py:1183`) | wt, br | `progress_history.py start-run` | the recorder | the next event writes the old names back; **added by the team review** |
 | 33 | `buildlog/launches_state.json` cursor keyed by transcript path | wt | `buildlog/launches.py` | the same | one harmless re-read (launch files are named by session and time) |
 | 34 | Usage attribution by folder | wt | derived from the Units Worktree cell (`usage_report.py:332-340`) | `/usage` | older folders fall back to the folder name: history |
-| 35 | Hanadocs proposal issues, frontmatter `unit:` | id | `proposal_issue.py:138` | `proposals_table.py:116` ("being built by …") | stale label on active issues; closed ones are history |
+| 35 | Hanadocs proposal issues, frontmatter `unit:` (scoped by its `showrunner` field: the folder is shared across productions) | id | `proposal_issue.py:138` | `proposals_table.py:116` ("being built by …") | stale label on active issues; closed ones are history |
+| 35a | Hanadocs phase notes, frontmatter `unit:` | id | `phase_table.py refresh` | `phase_table.py:1294` `_note_ownership`, `prune` (`:1577`) | refresh duplicates the note or prune archives the live one; **added by the team review** |
+| 35b | Rename journals `rename_unit.json`, `rename.json` | id, br, wt | the renames | the renames | recovery data: kept, classified for verify |
 | 36 | Review ledger `~/.claude/data/review_regime.jsonl` `unit` | id | `merge_checkpoint.py:835` | `review_regime.py report` | history |
 | 37 | Outstanding items `showrunner/outstanding/<slug>.json` | prose | showrunner | dailies | stale prose, rare |
 | 38 | Logs: `message/log.jsonl`, `message/relay/*`, `notify/*.jsonl`, `accounts/moves.jsonl`, `showrunner/<slug>/log-backups/`, `outstanding/*.history.jsonl`, `nightly-review/*`, `model-study/*`, `claude-model-study/*`, `plan-delegate/review_turns/*`, feature log `--unit` | any | many | reports | history |
 | 39 | Hard-coded ids: `NIGHTLY_REVIEW_UNIT` (`add_unit.py:71`, `nightly_review.py:223`), `"review-unit"` (`add_unit.py:243`) | id | code | launch profile, review pool | breaks the special launch: refuse renaming these |
 | 40 | Docs and memories naming units by hand (production doc prose, `~/.claude/projects/*/memory/*.md`) | any | people | people | history and provenance |
 
-**Total: 40 places** (scratch rows 23-28 count as six).
+**Total: 46 places** (scratch rows 23-28 count as six; 21a, 31a, 32a, 35a, 35b were added by the team review).
 
 ## Reducing the places
 
@@ -116,6 +121,97 @@ Physical edits left for a person: **none**. The user's only action is the go.
 - **Plans that never bake the worktree path.** Would remove place 5. It changes the
   shared plan format (`plan:to_phased_plan`, `/unit:direct`), so it is a separate
   proposal. The script rewrites live plans instead.
+
+## Team review, 2026-10-16 (the user's goal: the smallest rename surface)
+
+The user asked for a team review of this plan before building on, with one goal:
+remove every redundant place a name is written, so a rename touches the smallest
+surface, with automation and config files driving the names. Four reviewers (names
+and derivation; registry completeness; risk and resume; simplicity) read the plan and
+the Phase 2 code. Their findings, and what this plan now does about each:
+
+### Names now derived instead of stored
+
+| Was stored | Now | Places dropped from the rename |
+| --- | --- | --- |
+| Three naming rules: `add_unit.launch_request`, `rename_unit._build`, `rename._prepare_unit`. They disagree: the real `mul_add-unit` (branch `build-followups-mul-add`) cannot be renamed, and a retried `foo_bar` refuses its own journal | One naming module, `unit_names.py`: id normalisation (strip one `-unit`, add `-unit`, the character rule), the filesystem stem (`_` to `-`), and the production's branch and worktree defaults. Creation and both renames call it; the Branch and Worktree cells are written by it, never hand-built | The cells stay (adopted units and retired rows keep their own values), but no caller derives them on its own |
+| Worktree path and branch baked into plan Work Orders (place 5) | `/unit:direct` composes each Work Order with the worktree and branch it reads from git at dispatch (`git rev-parse --show-toplevel`, `git branch --show-current`); a path in plan text is never the source. `plan:to_phased_plan` stops writing the absolute worktree path, and `add_unit.prompt_for` names the rule | 5: rename_unit no longer edits plan prose. That also removes the whole-token plan edit that rewrote `docs/plans/demo-alpha.md` to `demo-beta.md` |
+| Shutdown restart record: cwd, plan path, session name (place 21) | `restart._unit_argv` resolves the worktree, plan and session name from the Units row by unit id (it already reads the Plan cell); the record keeps them only as the recovery snapshot | 21 shrinks to one field, `host.unit` |
+| `cargoBerthTarget` copied verbatim | The value is the production's merge branch unless set otherwise: a unit rename keeps it; a production rename maps a target equal to the old merge branch to the new one and keeps any other | none, but the production rename no longer leaves a target on a deleted branch |
+| `launches_state.json` cursor keys (place 33) | Not moved: one harmless re-read. Apply step 5 no longer lists it (the plan said both) | 33 |
+
+**Considered and not taken: a permanent internal unit key.** Reviewer 1 proposed an
+immutable key for the stores keyed by unit id (23-28, 30, 31, 31a, 32, 35), with the
+readable id kept for display. My call: no. The costly half of a rename is the part
+that must carry the readable name: the branch, the worktree, Claude's transcript
+folders and trust entries, process env marks and the relaunch. A key removes only the
+cheap half (atomic moves of files the script already owns, each journaled), and adds a
+second identity that every reader resolves and every person debugging the files has
+to look up. Risk: if renames become frequent the cheap half grows; the registry makes
+adding the key later a contained change.
+
+### Correctness and resume (recorded; built in Phases 2 and 3)
+
+- **Journal first.** `apply` saves the validated request as step 0 before any
+  mutation; a resumed run checks the request against the journal (normalised the same
+  way) before reading progress, and `plan` refuses an unfinished journal for a
+  different request, naming its resume command. Fresh preflight and recovery are
+  separate: recovery accepts the destinations this journal created.
+- **Revalidate at each step.** Before each step: the checkout is on the merge branch
+  and clean, the unit is still stopped, no worker or process has its cwd inside the
+  worktree (`/proc/*/cwd`, plus the run's worker inventory), and the tips match.
+- **One production lock.** `rename.py` and `rename_unit.py` take the same lock, kept
+  outside every directory a rename moves (`~/.local/state/showrunner/rename.lock`),
+  and each refuses while the other's journal is unfinished.
+- **A rename claim.** While a `rename_unit.json` names a unit, `add_unit.py` and
+  `agents restart` refuse to launch it under either name except through the rename.
+- **Doc commit by hash.** The journal records the rename commit's hash before the push;
+  recovery checks it is on the merge branch and retries only the push.
+- **The rename reaches the unit.** After the doc commit, apply merges it into the new
+  unit branch in the moved worktree while the unit is stopped (abort and refuse on a
+  conflict), pushes that tip, and verify reads it.
+- **Retire by lease.** The old branch is deleted on origin with
+  `--force-with-lease=<branch>:<tip>` and locally with `git update-ref -d <ref> <tip>`;
+  a moved ref leaves the step open and names the tip.
+- **Open run and recorder state together.** `progress_history.py` gains one
+  recorder-owned operation that moves an open run (record and `progress_history_state.json`,
+  absolute plan paths included). Both renames call it; run discovery is shared with
+  `unit_lookup`.
+- **Newest run, finished too.** `unit_lookup.run_state` reads the newest run for the
+  worktree, so the newest finished run moves as well as an open one; otherwise a finished
+  unit reads standing-by (production-rename review).
+- **Merge before move.** Before the git step, apply merges `origin/<merge branch>` into the
+  unit branch in the old worktree while the unit is stopped; a conflict aborts and leaves
+  the unit under its old name. The journal keeps the original and merged tips apart.
+- **Reviewer leases** move with the memory file under `pool.lock`, thread ids and
+  ordinals kept.
+- **Proposal issues** are changed only when their `showrunner` field names this
+  production.
+- **Phase notes** (35a): the rename rewrites `unit:` in the production's notes through
+  `phase_table.py`'s own reader, then refreshes.
+- **Hub and Gates** edits touch only the Owner and Other cells and the Waiting and
+  Waits-on cells, never a File cell.
+- **Plan headers** (14): the `> **Production:**` header's unit id in the unit's live plans
+  is rewritten, and other units' live plans keep their prose (history).
+- **fix.conf redirects** (21a) under the old worktree are rewritten, member suffixes kept.
+- **Mac.** A unit whose session the cross-machine inventory places on the Mac, or whose
+  machine cannot be established, is refused.
+- **Trust copy.** `.claude.json` is rewritten by running sessions, so the
+  read-modify-write stays one tight read, write and read-back (as `rename.py` does
+  today); the risk of losing another session's write in that window is accepted.
+- **Verify by field.** Each registry place states its postcondition: the new value
+  required, the old value allowed (the retained `projects[<old wt>]` trust entry), or
+  recovery data (the journals). A test injects one stale live reference and expects a
+  failure.
+
+### Simplicity (recorded)
+
+- The registry is data in `rename_unit.py`: `plan` prints from it with concrete old and
+  new values and runs every read-only refusal check; `apply` and `verify` walk it.
+- `rename.py` calls `unit_move` directly; the `_git`, `_exists`, `_move`, `_plan_paths`
+  aliases and the three deletion wrappers go.
+- `rename_state` exposes a small public persistence API (`read_json`, `write_json`,
+  `write_lines` over one atomic writer); no `reportPrivateUsage` suppressions.
 
 ## The command
 
@@ -162,14 +258,18 @@ Prints every registry place with its old and new value, and the refusals below.
 3. **Claude**: move transcript folders and copy trust entries in every `~/.claude*`
    config dir (existing helpers).
 4. **Doc commit** on the merge branch, one commit, subject
-   `chore(<slug>): rename unit <old> to <new>`: Unit, Worktree, Branch cells; Hub and
-   open Gates cells (whole-token match, not substring); old worktree path and branch
-   in the unit's live plan files (Plan cell paths that are not as-built or retired).
+   `chore(<slug>): rename unit <old> to <new>`: Unit, Worktree, Branch cells; Hub Owner
+   and Other cells and open Gates Waiting and Waits-on cells (whole-token match); the
+   `> **Production:**` header in the unit's live plans. Plan prose is not edited (Work
+   Orders read the worktree from git). Then merge that commit into the new unit branch
+   in the moved worktree and push it.
 5. **State**: `rename_state.rename_scratch(old, new, scratch)`; move the stall-watch
-   stretch and the review memory file; rewrite `working_dir` in the open run's records;
-   move the `launches_state.json` keys; set `unit:` on active proposal issues.
-6. **Restart record**: rewrite the unit's one shutdown record (unit id, cwd, plan
-   path, session name). More than one record, or a restore already running: refuse.
+   stretch, the review memory file and the reviewer leases; move the open run (record
+   and recorder state); set `unit:` on this production's active proposal issues and
+   phase notes; rewrite `fix.conf` redirects under the old worktree.
+6. **Restart record**: rewrite `host.unit` in the unit's one shutdown record; restart
+   resolves the worktree, plan and session name from the Units row. More than one
+   record, or a restore already running: refuse.
 7. **Relaunch**: `agents restart --only <unit>`. The restart note says "You are now
    `<new>`; worktree `<path>`, branch `<branch>`; your plan is at `<path>`." The
    session is named after the new stem (see question 1).
@@ -212,11 +312,20 @@ Each phase is one checkpoint on `build-followups-enh-showrunner`, gated with
 
 ### Phase 2 — shared unit moves, `rename_unit.py plan` and `apply` (L)
 
+- `scripts/production/unit_names.py`: the one naming rule (team review). `add_unit.py`,
+  `rename.py` and `rename_unit.py` call it.
 - `scripts/production/unit_move.py` takes `rename.py`'s unit helpers (branch create and push,
   worktree move and repair, transcript folders, trust entries) so both renames use one copy, and
-  adds the three missing moves: `branch.<br>.cargoBerthTarget`, the open run's `run_started`
-  `working_dir`, and the `buildlog/launches_state.json` cursor keys. `rename.py unit` uses it,
-  which closes its own `cargoBerthTarget` and open-run gaps.
+  adds the missing moves: `branch.<br>.cargoBerthTarget` (kept, or mapped to the new merge
+  branch by a production rename), and the open run through `progress_history.py`'s own move
+  (record and recorder state). `rename.py unit` uses it, which closes its own
+  `cargoBerthTarget` and open-run gaps. `rename.py` calls it directly (no aliases).
+- The team review's resume and safety items: journal at step 0, request check, revalidation
+  at each step, the shared production lock, the rename claim honoured by `add_unit.py`, the
+  doc commit by hash, the merge into the unit branch, retire by lease, leases, proposal and
+  phase-note scoping, Hub and Gates cell limits, `fix.conf` redirects, the Mac refusal.
+- Work Orders read the worktree and branch from git at dispatch
+  (`docs/delegate/compose_work_order.md`, `add_unit.prompt_for`, `plan:to_phased_plan`).
 - `scripts/production/rename_unit.py plan|apply <slug> <old> <new>`: `<old>` and `<new>` take an
   id or a stem and normalise to `<stem>-unit`. `plan` writes nothing and prints every registry
   place with its old and new value and every refusal. `apply` is journaled under a lock and
@@ -230,7 +339,8 @@ Each phase is one checkpoint on `build-followups-enh-showrunner`, gated with
   value, merge history still holds the old id as control) and the broad sweep over
   `~/.local/state`, `~/.claude/data`, every `~/.claude*/` config dir, the showrunner checkout and
   the new worktree, where an unclassified hit fails and names its file, shutdown paths masked.
-- The shutdown restart record rewrite (step 6), with its refusals.
+- The shutdown restart record (step 6): `restart._unit_argv` resolves worktree, plan and
+  session name from the Units row; the rename rewrites `host.unit` only, with its refusals.
 - `/showrunner:rename_unit` (`commands/showrunner/rename_unit.md`) and the `/unit:rename` stub
   that forwards to it; a paragraph in `docs/production_format.md` (Units); the as-built
   (`docs/as-built/unit-rename.md`), and this plan removed.

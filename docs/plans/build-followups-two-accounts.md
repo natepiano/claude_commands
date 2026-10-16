@@ -1351,3 +1351,35 @@ After a worker launch's own turn has ended, a move to the selected seats home th
 **Gotchas:** `getsid` on an exited pid is `SessionGone`, never a refusal; match on the type, never the message. macOS `ps comm` is a full path with spaces, so the own-user table splits only pid and ppid. macOS `os.getsid` reads every own-user process, so the session sweep works on Darwin. A stopped process with a controlling terminal is a job-control stop and is never resumed. A descendant that calls `setsid` itself leaves every tracked session and is out of reach; the `_stop_daemon_locked` doc comment states this limit.
 
 **Ruled out:** resuming every stopped `~/.codex` process (wakes a user's Ctrl-Z job); sweeping a session whose leader is outside the family; reading identities for every process on the machine.
+
+### Phase 46 — Role map stays inside a test's home  · status: done
+
+**Depends on:** Phase 40
+
+#### Work Order
+
+**Goal:** a process whose `HOME` is not the login's own home reads and writes only that home's role map, on both machines, so a test can never reach natedev's real map.
+
+**Why:** on the Mac, `scripts/herdr/test_herdr_sessions.py` `StandaloneLaunchTests.test_start_after_cutover_uses_showrunners_account_for_pane_and_admission` fails: it writes `showrunners: claude4` to its scratch `groups.json`, but `start` refuses with "showrunners is on claude1, which is not set up on this machine". `role_map.is_role_map_host()` asks only the hostname, so off natedev `read_role_map()` fetches the real map over ssh (`ssh_role_map`), and the scratch `groups.json` is never read. The same rule sends `write_role_map` from a scratch home on the Mac to natedev's real map. It passes on natedev only because natedev is the host. Phase 40 defect, found by herdr-trial.
+
+**Constraints from prior phases:** Phase 40 made natedev (`ROLE_MAP_HOST`) the one role map; the Mac reads it over ssh with `role_map_cache.json` as fallback and writes through `role-map-write`. Callers of `is_role_map_host()`: `read_role_map`, `write_role_map`, `accounts.set_group_account`, `accounts.set_role`, and `accounts.main`'s `role-map-read`/`role-map-write` refusal. Tests that pin `is_role_map_host` stay valid.
+
+**Spec:**
+
+1. `role_map.is_role_map_host()` is true on natedev, and also on any machine when `Path.home()` is not the login's own home (the password-database home for the current uid, compared after resolving both). A scratch `HOME` therefore holds its own map: reads come from its `groups.json` and `config/accounts.json`, writes go to its own files and `roles.jsonl`, and no ssh runs. An unreadable login home counts as a scratch home.
+2. The login-home read is one small private function, so tests pin it beside the hostname.
+3. On the Mac with the real `HOME`, behavior is unchanged: ssh to natedev, cache on success, cache fallback when unreachable.
+4. The remote side (`role-map-read`/`role-map-write` on natedev) is unchanged.
+
+**Tests** (`scripts/accounts/test_role_map.py`; fake hostname, login home and `ssh_role_map`; scratch homes only):
+- off natedev with a scratch `HOME`: `read_role_map()` returns the scratch `groups.json` selection and `ssh_role_map` is never called; `write_role_map` writes the scratch `groups.json` and `roles.jsonl` and never calls ssh;
+- off natedev with `HOME` equal to the login home: read and write go through `ssh_role_map` as today (existing remote tests pin the login home to their `HOME` so they keep testing that path);
+- an unreadable login home is a scratch home.
+
+**Live check:** on the Mac, from a scratch copy of this branch's tree, run `StandaloneLaunchTests.test_start_after_cutover_uses_showrunners_account_for_pane_and_admission`, then `scripts/accounts/test_role_map.py`; both pass. The same pair passes on natedev.
+
+**Files:**
+- `scripts/accounts/role_map.py` — `is_role_map_host` and its login-home reader.
+- `scripts/accounts/test_role_map.py` — the tests above; existing remote tests pin the login home.
+
+**Workers:** impl takes `role_map.py`, test takes `test_role_map.py`.
