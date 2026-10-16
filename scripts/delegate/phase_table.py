@@ -133,8 +133,19 @@ class PhaseHistory:
     eta_trail: list[tuple[datetime, datetime]] = field(default_factory=list)
     finished_at: datetime | PhaseNotFinished = PhaseNotFinished()
     delta_minutes: float | FinishDeltaUnavailable = FinishDeltaUnavailable()
-    fix_rounds: int = 0
+    fix_done: int = 0
+    fix_open_passes: int = 0
     findings: dict[str, int] = field(default_factory=lambda: dict.fromkeys(FINDING_SEVERITIES, 0))
+
+    @property
+    def fix_running(self) -> int:
+        """Whether any fix pass is still open."""
+        return int(self.fix_open_passes > 0)
+
+    @property
+    def fix_rounds(self) -> int:
+        """All fix passes started, including parallel open passes."""
+        return self.fix_done + self.fix_open_passes
 
 
 class NoGate(NamedTuple):
@@ -178,6 +189,8 @@ class OpenPhase(PhaseHistory):
     progress: ReportedPhaseProgress | PhaseProgressNotReported
     eta: StatedEta | ProjectedEta | EtaUnavailable
     first_stated: FirstStatedEtaTarget | EtaNeverStated
+    instance_id: str
+    schedule_end: datetime | EtaUnavailable = EtaUnavailable()
 
 
 @dataclass(frozen=True)
@@ -924,10 +937,11 @@ def _phase_history(
         for event in _instance_eta_events(runs, instance)
     }
     trail: list[tuple[datetime, datetime]] = []
-    fix_rounds = 0
+    fix_passes: set[str] = set()
+    finished_fixes: set[str] = set()
     findings: dict[str, int] = dict.fromkeys(FINDING_SEVERITIES, 0)
     for events in runs:
-        for event in events:
+        for index, event in enumerate(events):
             if id(event) in eta_events:
                 target = _moment(event.get("eta_at"))
                 stated = _moment(event.get("timestamp_epoch"))
@@ -937,7 +951,9 @@ def _phase_history(
                 continue
             event_type = _text(event.get("event_type"))
             if event_type == "pass_started" and event.get("pass_kind") == "fix":
-                fix_rounds += 1
+                fix_passes.add(_text(event.get("pass_instance_id")) or f"{id(events)}:{index}")
+            if event_type == "pass_finished":
+                finished_fixes.add(_text(event.get("pass_instance_id")))
             if event_type == "finding_opened":
                 severity = _text(event.get("severity"))
                 if severity in findings:
@@ -954,7 +970,8 @@ def _phase_history(
         eta_trail=trail,
         finished_at=finished,
         delta_minutes=delta,
-        fix_rounds=fix_rounds,
+        fix_done=len(fix_passes & finished_fixes),
+        fix_open_passes=len(fix_passes - finished_fixes),
         findings=findings,
     )
 
@@ -972,7 +989,8 @@ def _with_history(
         eta_trail=history.eta_trail,
         finished_at=history.finished_at,
         delta_minutes=history.delta_minutes,
-        fix_rounds=history.fix_rounds,
+        fix_done=history.fix_done,
+        fix_open_passes=history.fix_open_passes,
         findings=history.findings,
     )
 
@@ -1087,6 +1105,7 @@ def build_plan(plan_path: Path) -> PhaseRecord:
                 progress=open_instance.progress,
                 eta=open_instance.eta,
                 first_stated=open_instance.first_stated,
+                instance_id=open_instance.phase.instance_id,
             )
             rows.append(current)
             open_ids.add(phase["id"])
@@ -1119,6 +1138,7 @@ def build_plan(plan_path: Path) -> PhaseRecord:
             progress=open_instance.progress,
             eta=open_instance.eta,
             first_stated=open_instance.first_stated,
+            instance_id=open_instance.phase.instance_id,
         )
 
     durations = [
@@ -1151,6 +1171,13 @@ def build_plan(plan_path: Path) -> PhaseRecord:
                 now,
                 current.started + timedelta(seconds=typical.seconds),
             )
+    if isinstance(current, OpenPhase) and (
+        isinstance(current.eta, StatedEta | ProjectedEta)
+        or isinstance(typical, TypicalDuration)
+    ):
+        scheduled = replace(current, schedule_end=previous_finish)
+        rows = [scheduled if row is current else row for row in rows]
+        current = scheduled
     blocked: UntimedGate | NoGate = NoGate()
     for index, row in enumerate(rows):
         if not isinstance(row, TodoPhase):

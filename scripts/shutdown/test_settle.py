@@ -57,6 +57,7 @@ NOW_UTC = datetime(2026, 10, 9, 21, 49, 10, tzinfo=timezone.utc)
 
 
 def setUpModule() -> None:
+    _ = unittest.enterModuleContext(patch.object(herdr, "security_session", return_value=herdr.NotMacSession()))
     root = Path(unittest.enterModuleContext(tempfile.TemporaryDirectory()))
     _ = unittest.enterModuleContext(patch.object(showrunners, "NOTIFIER_STATE_DIR", root))
     _ = unittest.enterModuleContext(patch.object(settle_showrunners, "NOTIFIER_STATE_DIR", root))
@@ -2757,7 +2758,9 @@ class SettleTests(ShutdownTestCase):
             launches.append(saved["session"]["session_id"])
             states.append(desktop_state)
             return self.fake_launch(saved, dry_run=dry_run, desktop_state=desktop_state)
+        session_kind = herdr.NonDesktopSession()
         with (
+            patch.object(herdr, "security_session", return_value=session_kind) as session_query,
             patch.object(settle, "run_inventory", return_value=machine_inventory(owners)),
             patch.object(restart_work, "relaunch_session", side_effect=launch),
             patch.object(restart_work, "wait_for_confirmation", side_effect=self.all_live),
@@ -2767,6 +2770,8 @@ class SettleTests(ShutdownTestCase):
             self.assertEqual(settle.conduct(LOGIN), 0)
         self.assertEqual(launches, ["a", "b", "c"])
         self.assertTrue(all(state is states[0] for state in states))
+        self.assertTrue(all(state.session_kind is session_kind for state in states))
+        session_query.assert_called_once_with()
 
     def test_conductor_serializes_attached_herdr_windows_and_pools_detached_hosts(self) -> None:
         owners: list[inventory.Session] = []
