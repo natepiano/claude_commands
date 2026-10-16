@@ -96,46 +96,26 @@ Add-on, 2026-10-16 (the showrunner, approved by the user): an accounts view in t
 - Tests patch `plan_history.now_epoch` for the clock.
 
 ### Phase 3 — Board data  · status: done
-**Depends on:** 2
 
-#### Work Order
+#### As-built
 
-**Goal:** `board_json.py` writes one JSON file per production holding everything the board draws, and lists the files whose change makes it stale.
-
-**Spec:**
-- CLI: `~/.claude/scripts/lib/py ~/.claude/scripts/delegate/board_json.py (--cwd <path> | --production <slug>)`. It writes each resolved production's file atomically (temp file in the same dir, then `os.replace`) to `${UNIT_BOARD_DIR:-${XDG_STATE_HOME:-~/.local/state}/unit-board}/<slug>.json`, and prints one JSON line `{"files": [<paths>], "focus": <unit key or null>}`. Exit 0 with `"files": []` when nothing resolves.
-- **Resolve.** `--cwd`: a cwd inside a unit's worktree (a `Worktree` cell of any registered showrunner's production, `showrunners.registered_showrunners()` + `production_units.live_unit_table`) → that production, `focus` = the unit; inside a showrunner checkout → its production; anything else → every production whose showrunner is running, `focus` null.
-- **Per unit** (rows of `live_unit_table`), with the run from `unit_run.local_run(history_root, worktree)` and the session dir `<run_root>/<run_id>` (`unit_runs.run_roots()`, first that exists):
-  - `key` (Unit cell less `-unit`), `plan` (Plan cell), `state` (`unit_lookup.run_state`).
-  - `phase` `{id, of, title}` of the open phase, or null; `phases`: every plan phase with `status` (`done` | `open` | `todo` | `gated`), `title`, and the phase record from "Predictions chain from the stated ETA" (`took` seconds, `fix_done`, `fix_running`, `findings {blocker, minor, nit}`, `eta {first, trail, finished, delta_minutes}`), the predicted `start`/`finish` for todo phases, and each todo phase's `gate` (below). `status` is `gated` for a todo phase whose gate is not `none`.
-  - `finish`: the unit's plan finish, `{"kind": "predicted", "at": <time>}`, `{"kind": "finished", "at": <time>}`, `{"kind": "after_gate", "gate", "waits_on"}` (`GateBlockedFinish`) or `{"kind": "unknown"}`.
-  - `stage`: open pass `impl` → `Build`, `test` → `Tests`, `review` → `Review`, `fix` → `Repair round <fix_pass>`; else the open activity's label (`units_table.open_step`); else `Run done`, `Standing by`, or `Waiting on G<k>`.
-  - `eta`: `{at, first, trail, moved, delta_minutes, schedule_end, fix_done, fix_running}` for the open phase, or null. `at`, `first` and `trail` are stated promises only; `delta_minutes` is `at` − `first` (the slip so far); `schedule_end` is the end the chain uses, which is now when the promise has passed — never a promise, never a trail entry.
-  - `summary`: the newest `progress_reported` `activity` text of the run.
-  - `steps`: the open phase instance's passes and activities in order, `[state, what, started, took_seconds]`.
-  - `workers`: one per `mesh_roster.json` entry: `slot`, `role`, `state` (its `status`), `model` (`impl_worker_<slot>.json` `family/model`), `doing` (the body of that agent's newest `board.log` line, ≤ 80 chars).
-- **Gates.** Each todo phase's `gate` is `{"kind": "none"}`, `{"kind": "timed", "gate": "G<k>", "until": <time>, "waits_on"}` or `{"kind": "untimed", "gate", "waits_on"}`, from `build_plan`'s `NoGate` / `TimedGate` / `UntimedGate`. A cleared gate is `none`.
-- **Fix rounds.** `fix_done` counts fix passes that finished, `fix_running` is 1 while one is open, else 0. Split the phase record's `fix_rounds` in `phase_table` into these two (and keep every existing reader's meaning: the sum).
-- **Times.** Every time is `{"at": <epoch seconds>, "text": "<HH:MM>"}` in the production zone, `text` `ddd DD Mon HH:MM` when not today. Top level: `production`, `as_of`, `zone`, `utc_offset_minutes` (at `as_of`, for the mod's `now` label), `units`, and `sources`.
-- **`sources`:** absolute paths whose mtime moving means the file is stale: each unit's run `.jsonl`, `mesh_roster.json`, `board.log`, every `impl_worker_<slot>.json`, plan doc, every run `.jsonl` of the plan the predictions read (`plan_history.plan_runs`), and the production doc; plus, for discovery, each unit's session dir and the history `runs/` dir, whose mtimes move when a run or file is created there, so a pane opened before a run exists sees it start. Only paths that exist.
-- **Types.** The JSON shape is also written as TypeScript in `mods/unit-board/types/board.d.ts` (the mod phase reads it), field for field, so the two cannot drift silently; the test below checks the field names against it.
-- No recorder change: the recorder does not write the board file (the mod asks for it while open).
-- Cost: one run reads only the production's units' files. Log nothing.
+- `~/.claude/scripts/lib/py ~/.claude/scripts/delegate/board_json.py (--cwd <path> | --production <slug>)` writes each resolved production's board atomically (temp file in the same dir, then `os.replace`) to `${UNIT_BOARD_DIR:-${XDG_STATE_HOME:-~/.local/state}/unit-board}/<slug>.json` and prints one line `{"files": [<paths>], "focus": <unit key or null>}`; nothing resolved exits 0 with `"files": []`. It logs nothing and reads only the production's units' files.
+- Resolve: `--cwd` inside a unit worktree (`showrunners.registered_showrunners()` + `production_units.live_unit_table`) gives that production with `focus` = the unit; inside a showrunner checkout, its production; anywhere else, every production whose showrunner is running, `focus` null.
+- Top level: `production`, `as_of`, `zone`, `utc_offset_minutes` (at `as_of`), `units`, `sources`. Every time is `{"at": <epoch s>, "text": "HH:MM"}` in the production zone, `ddd DD Mon HH:MM` when not today.
+- Per unit: `key` (Unit cell less `-unit`), `plan`, `state`, `phase {id, of, title}` or null, `phases` (each with `status` `done|open|todo|gated`, `title`, record `took`/`fix_done`/`fix_running`/`findings {blocker, minor, nit}`/`eta {first, trail, finished, delta_minutes}`, todo `start`/`finish`, and `gate` `{kind: none}` | `{kind: timed, gate, until, waits_on}` | `{kind: untimed, gate, waits_on}`; a non-`none` gate makes the status `gated`), `finish` (`predicted` | `finished` with `at`, `after_gate` with `gate`/`waits_on`, or `unknown`), `stage` (`Build`/`Tests`/`Review`/`Repair round <n>` from the open pass, else the open activity label, else `Run done`/`Standing by`/`Waiting on G<k>`), `eta {at, first, trail, moved, delta_minutes, schedule_end, fix_done, fix_running}` or null, `summary` (newest `progress_reported` text), `steps` (`[state, what, started, took_seconds]`), `workers` (`slot`, `role`, `state`, `model`, `doing` ≤ 80 chars from `board.log`).
+- `phase_table` exposes `OpenPhase.instance_id`, `OpenPhase.schedule_end` (the chain's open end for a stated, projected or duration-only estimate) and `PhaseHistory.fix_open_passes`; `fix_running` is a 0/1 property and `fix_rounds` stays the sum of done and open fix passes. Tests pin resolve and focus, every stage, gate and `finish` kind, the promise/schedule split, the fix split, existing-only `sources`, the atomic write, and every output key against `board.d.ts`.
 
 **Files:**
-- `scripts/delegate/board_json.py` — new.
-- `scripts/delegate/test_board_json.py` — new.
-- `mods/unit-board/types/board.d.ts` — new, the JSON contract.
-- `scripts/delegate/phase_table.py` — the `fix_done`/`fix_running` split, and a public accessor if the record needs one.
-- `scripts/delegate/test_phase_table.py` — the split.
+- `scripts/delegate/board_json.py` — the board data generator.
+- `scripts/delegate/test_board_json.py` — its tests.
+- `mods/unit-board/types/board.d.ts` — the JSON contract, field for field.
+- `scripts/delegate/phase_table.py`, `scripts/delegate/test_phase_table.py` — fix split, open instance id, schedule end.
 
-**Workers:** 1 writer + 1 tester
-- `impl` — `board_json.py`, `types/board.d.ts`, `phase_table.py`; hub: `mods/unit-board/types/board.d.ts` (the contract the test checks).
-- `test` — `test_board_json.py` and the split's cases in `test_phase_table.py`: a temp production doc, a showrunner conf under `NOTIFIER_STATE_DIR`, a unit worktree with a plan, a run stream under `PLAN_DELEGATE_HISTORY_DIR` and a session dir with `mesh_roster.json`, `impl_worker_1.json` and `board.log`: `--cwd <worktree>` focuses the unit; `--cwd /` lists every running production; stages for each pass kind; timed, untimed and cleared gates, each with and without an open phase, and every `finish` kind; an overdue unchanged promise adds no `trail` entry and its `schedule_end` is now; a running fix counts in `fix_running` only; `sources` lists only existing files; with no run yet, creating the run and session files moves a listed dir's mtime; the write is atomic (no partial file on a failed write); every key in the output appears in `types/board.d.ts`.
+**Binds later work:** the CLI and its `{"files", "focus"}` output line; the `<slug>.json` location under `UNIT_BOARD_DIR`; `board.d.ts` as the contract the output is tested against; `eta.at`/`first`/`trail` are stated promises only, while `schedule_end` is the chain's end (now once a promise has passed) and never a trail entry; `fix_done` counts finished fix passes and `fix_running` is 0 or 1; `state` comes from the unit's own newest run (standing-by, running, run-finished); `steps` and `stage` follow `build_plan`'s selected open instance; `OpenPhase.instance_id` and `OpenPhase.schedule_end`; `fix_open_passes` with `fix_rounds` as the sum. `sources` lists existing paths only: each unit's run `.jsonl`, `mesh_roster.json`, `board.log`, every `impl_worker_<slot>.json`, the plan doc, every `plan_history.plan_runs` `.jsonl`, the production doc, plus each session dir and the history `runs/` dir so a run that starts later moves a watched mtime. The recorder does not write the board file.
 
-**Constraints from prior phases:** stated ETAs select by `eta_phase_id`; `phase_table` builds the chain with gates and exposes the per-phase record (`first_eta`, `moves`, `eta_trail`, `finished_at`, `delta_minutes`, `fix_rounds`, `findings`), read only from the row's own title family (a retired task's attempts under a reused number are excluded). The plan readers live in `scripts/delegate/plan_history.py` (`plan_runs`, `plan_phases`, `PlanPhase`, `history_root`, `now_epoch`, `resolve_plan_path`, `eta_band_seconds`); `phase_table` imports it, never `progress_history`; tests patch `plan_history.now_epoch` for the clock. Todo rows carry `gate`: `NoGate`, `TimedGate(gate, until, waits_on)` or `UntimedGate(gate, waits_on)`; `plan_finish` may be `GateBlockedFinish(gate, waits_on)`. An overdue open phase's `StatedEta.time` is already advanced to now for scheduling, while `eta_trail` keeps the real promises. `phase_table show --json` omits gates and turns `GateBlockedFinish` into null, so build from `build_plan`'s record, not that JSON.
+**Gotchas:** `build_plan` can select an older resumed phase as open, so the newest `phase_started` is the wrong instance for `steps`/`stage`. `phase_table show --json` drops gates and turns `GateBlockedFinish` into null; the board builds from `build_plan`'s record instead.
 
-**Acceptance gate:** the Test and Lint lines of Delegation Context green; `board_json.py --production build-followups` on natedev writes a file whose units match `/showrunner:units`.
+**Ruled out:** `unit_lookup.run_state` for `state`, which reads every history run file per unit.
 
 ### Phase 4 — The board mod  · status: todo
 **Depends on:** 3
@@ -176,7 +156,7 @@ Add-on, 2026-10-16 (the showrunner, approved by the user): an accounts view in t
 - `impl` — every file except `tests/`; hub: `mods/unit-board/types/index.d.ts` (plugin state both sides use).
 - `test` — `tests/geometry.test.ts` from the ruler and strip rules above, and `tests/register.test.ts` from the command, refresh and closed-quiet rules, against `types/board.d.ts` fixtures.
 
-**Constraints from prior phases:** the generator CLI, output line `{"files", "focus"}`, file location and JSON contract `mods/unit-board/types/board.d.ts` (Phase "Board data"); times are `{at, text}`; `sources` lists the files and discovery dirs to stat. Todo phases carry a tagged `gate` (`none`, `timed`, `untimed`) and each unit a tagged `finish` (`predicted`, `finished`, `after_gate`, `unknown`); `eta.at`, `eta.first` and `eta.trail` are promises, `eta.schedule_end` is not; fix rounds come as `fix_done` and `fix_running`.
+**Constraints from prior phases:** the generator CLI, output line `{"files", "focus"}`, file location and JSON contract `mods/unit-board/types/board.d.ts` (Phase "Board data"); times are `{at, text}`; `sources` lists the files and discovery dirs to stat. Todo phases carry a tagged `gate` (`none`, `timed`, `untimed`) and each unit a tagged `finish` (`predicted`, `finished`, `after_gate`, `unknown`); `eta.at`, `eta.first` and `eta.trail` are promises, `eta.schedule_end` is not; fix rounds come as `fix_done` and `fix_running` (0 or 1). `state` is read from the unit's own newest run (`standing-by`, `running`, `run-finished`); `steps` and `stage` follow the phase instance `build_plan` selects as open, which can be an older resumed phase.
 
 **Acceptance gate:** `tsc`, `command claude plugin validate --strict mods/unit-board` and `command claude plugin test mods/unit-board` exit 0; the live check's captures match the mockups' layout.
 
@@ -203,7 +183,7 @@ Add-on, 2026-10-16 (the showrunner, approved by the user): an accounts view in t
 - `impl` — `progress_history.py`, `commands/unit/report.md`; hub: `scripts/delegate/progress_history.py`.
 - `test` — `progress` prints the ETA line forms above, the stage and worker lines, and no tables; `progress --tables` prints both tables as before; between windows (`_print_last_recorded`) the same short form prints; an activity still open after its phase finished still shows as the stage; an overdue unchanged promise prints `passed`, never a new time.
 
-**Constraints from prior phases:** the phase record (`first_eta`, `moves`, `eta_trail`, `delta_minutes`, `fix_done`, `fix_running`) and the gate text come from `phase_table` (`build_plan`, gates `NoGate`/`TimedGate`/`UntimedGate`); plan readers from `plan_history`, and tests patch `plan_history.now_epoch`. An overdue open phase's `StatedEta.time` is the schedule end, not a promise. The board command is `/unit-board`.
+**Constraints from prior phases:** the phase record (`first_eta`, `moves`, `eta_trail`, `delta_minutes`, `fix_done`, `fix_running`) and the gate text come from `phase_table` (`build_plan`, gates `NoGate`/`TimedGate`/`UntimedGate`); plan readers from `plan_history`, and tests patch `plan_history.now_epoch`. An overdue open phase's `StatedEta.time` is the schedule end, not a promise; `OpenPhase.schedule_end` holds the chain's end for the open phase, also from a duration estimate, and `OpenPhase.instance_id` names the open instance. `PhaseHistory.fix_running` is 0 or 1, `fix_open_passes` counts open fix passes, and `fix_rounds` is `fix_done + fix_open_passes`. The board command is `/unit-board`.
 
 **Acceptance gate:** the Test and Lint lines of Delegation Context green.
 
