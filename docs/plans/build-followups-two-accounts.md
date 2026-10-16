@@ -1184,3 +1184,16 @@ After a worker launch's own turn has ended, a move to the selected seats home th
 **Files:**
 - `scripts/accounts/accounts.py` — mid-turn count on folded rows.
 - `docs/accounts.md`, `commands/showrunner/accounts.md` — the count in the swap output description.
+
+### Phase 38 — Swap rows name a run's launching session  · status: done
+
+#### As-built
+
+- `_launcher_sessions(folder)` in `scripts/agents/codex_mesh.py` names a run with no holder by each live roster `launcher_pid`'s nearest ancestor that a running session record names, counting only records whose `procStart` matches the process. It reuses `codex_winddown.owner` and `process_table.snapshot`, so it works on Linux and macOS.
+- `WorkersRunSwitch` and `WorkersRunMove` carry `launcher_sessions`; the swap and the sign-in change fill it for live runs with no holder. Liveness, interrupts, resumes and leftover servers are unchanged.
+- `_workers_swap_lines` names and folds such a run like a holder (`showrunner · unit · worker`); `unknown session (<run folder>)` remains only when nothing resolves.
+
+**Files:**
+- `scripts/agents/codex_mesh.py` — launcher sessions.
+- `scripts/accounts/accounts.py` — naming from a launcher session.
+- `docs/accounts.md`, `commands/showrunner/accounts.md` — swap row naming.

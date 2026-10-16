@@ -4463,6 +4463,43 @@ def _run_is_live(folder: Path, holders: tuple[str, ...]) -> bool:
     return bool(_live_launchers(folder))
 
 
+def _launcher_sessions(folder: Path) -> tuple[str, ...]:
+    """Name live launchers by their nearest process-validated Claude session ancestor."""
+    roster = _read_json_object(folder / ROSTER_FILE)
+    pids = tuple(pid for entry in roster.values()
+                 for pid in [_as_dict(entry).get("launcher_pid")]
+                 if isinstance(pid, int) and _pid_alive(pid))
+    if not pids:
+        return ()
+    # Reuse wind-down's cross-platform ancestry walk and its process-table reader.
+    for directory in ("message", "production"):
+        path = str(Path(__file__).resolve().parents[1] / directory)
+        if path not in sys.path:
+            sys.path.insert(0, path)
+    from scripts.production.codex_winddown import NO_SESSION, owner
+    from scripts.message import process_table
+
+    try:
+        table = process_table.snapshot()
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return ()
+    names: dict[int, str] = {}
+    for record in sessions.running_sessions():
+        # Only a recorded process start proves the pid still belongs to this session.
+        started = record.get("procStart", "")
+        if started and started == sessions.process_start(record["pid"]):
+            _ = names.setdefault(record["pid"], record["sessionId"])
+    found: list[str] = []
+    for pid in pids:
+        process = table.get(pid)
+        if process is None:
+            continue
+        session_id = owner(process, table, names)
+        if session_id != NO_SESSION and session_id not in found:
+            found.append(session_id)
+    return tuple(found)
+
+
 class CodexNoticeKind(Enum):
     WORKERS_CHANGED = "workers_changed"
     SIGN_IN_CHANGED = "sign_in_changed"
@@ -4525,9 +4562,10 @@ def command_signin_changed(args: argparse.Namespace) -> int:
         if not live:
             runs.append(EndedWorkersRun(folder, tuple(outgoing.items())))
             continue
+        launcher_sessions = _launcher_sessions(folder) if not holders else ()
         workers = tuple(worker for port in outgoing for worker in _switch_run_workers(
             folder, port, codex_home_role_label(workers_home()), dry_run=False))
-        runs.append(WorkersRunMove(folder, holders, tuple(outgoing.items()), workers))
+        runs.append(WorkersRunMove(folder, holders, tuple(outgoing.items()), workers, launcher_sessions))
     switches = _finish_run_moves(runs)
     for run, switched in zip(runs, switches, strict=True):
         if isinstance(run, EndedWorkersRun):
@@ -4609,6 +4647,7 @@ class WorkersRunSwitch:
     leftover_servers: int = 0
     stopped_servers: int = 0
     kept_servers: tuple[KeptWorkersServer, ...] = ()
+    launcher_sessions: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -4637,6 +4676,7 @@ class WorkersRunMove:
     holders: tuple[str, ...]
     servers: tuple[tuple[int, int], ...]  # port, pid
     workers: tuple[SwitchingWorker | InterruptedWorkerMove, ...]
+    launcher_sessions: tuple[str, ...] = ()
 
 
 def _account_move_command(session_dir: str, name: str) -> str:
@@ -4802,7 +4842,7 @@ def _finish_run_moves(
         else WorkersRunSwitch(run.folder, run.holders, tuple(
             SwitchingWorker(worker.name, True, outcomes[(worker.session_dir, worker.name)])
             if isinstance(worker, InterruptedWorkerMove) else worker for worker in run.workers
-        )) for run in runs)
+        ), launcher_sessions=run.launcher_sessions) for run in runs)
 
 
 def _interrupt_worker_for_account_move(session_dir: str, name: str, entry: dict[str, object],
@@ -4893,9 +4933,10 @@ def retire_workers_servers(workers_home: Path, label: str, *, dry_run: bool = Fa
         if not live:
             runs.append(EndedWorkersRun(folder, tuple(outgoing.items())))
             continue
+        launcher_sessions = _launcher_sessions(folder) if not holders else ()
         workers = tuple(worker for port in outgoing
                         for worker in _switch_run_workers(folder, port, label, dry_run=dry_run))
-        runs.append(WorkersRunMove(folder, holders, tuple(outgoing.items()), workers))
+        runs.append(WorkersRunMove(folder, holders, tuple(outgoing.items()), workers, launcher_sessions))
     switches = _finish_run_moves(runs, dry_run=dry_run)
     for run, switched in zip(runs, switches, strict=True):
         if isinstance(run, EndedWorkersRun):
