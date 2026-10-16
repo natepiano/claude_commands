@@ -1902,6 +1902,24 @@ class MeshCommandTests(unittest.TestCase):
         self.assertIn(f"worker continues as new thread {THREAD_ID}",
                       (self.session_dir / "board.log").read_text(encoding="utf-8"))
 
+    def test_follow_carries_held_messages_to_a_replacement_thread(self) -> None:
+        self.write_pool_roster({"worker": {"thread_id": "old-follow-thread", "status": "done",
+                                       "role": "impl", "port": self.server.port}})
+        with codex_mesh._pending_file(str(self.session_dir), "worker") as handle:  # pyright: ignore[reportPrivateUsage]
+            codex_mesh._write_pending(handle, "old-follow-thread", ["Run finished: verify.sh check"])  # pyright: ignore[reportPrivateUsage]
+        self.failing_method = "thread/resume"
+
+        self.assertEqual(self.run_follow("next launch prompt"), (0, ""))
+
+        self.assertEqual(self.worker_record()["thread_id"], THREAD_ID)
+        starts = self.methods("turn/start")
+        self.assertEqual([_as_test_dict(request["params"]).get("threadId") for request in starts], [THREAD_ID])
+        inputs = cast(list[dict[str, object]], _as_test_dict(starts[0]["params"])["input"])
+        self.assertEqual([item["text"] for item in inputs], ["next launch prompt", "Run finished: verify.sh check"])
+        pending = cast(codex_mesh.WorkerPendingMessages,
+                       json.loads((self.session_dir / "worker.pending.json").read_text(encoding="utf-8")))
+        self.assertEqual((pending["thread_id"], pending["messages"]), (THREAD_ID, []))
+
     def test_start_records_the_assigned_role(self) -> None:
         code, errors = self.run_start()
 
