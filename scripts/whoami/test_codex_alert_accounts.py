@@ -21,7 +21,7 @@ import quota_alert
 import agent_accounts as sibling_agent_accounts
 from scripts.whoami import agent_accounts
 from agent_accounts import CodexHomeSource, Quota, Report
-from scripts.accounts import accounts, moves, refusals
+from scripts.accounts import accounts, moves, refusals, role_map
 from scripts.production import showrunners
 import usage_store
 from push_texts import RenderedPush
@@ -41,6 +41,7 @@ class CodexAccountAlertTests(unittest.TestCase):
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
         self.now = datetime.now(timezone.utc).replace(microsecond=0)
         self.sent = []
+        _ = self.enterContext(patch.object(role_map, "is_role_map_host", return_value=True))
         _ = cast(object, self.enterContext(patch.dict(os.environ, {
             "HOME": str(self.root), "AGENT_NOTES_DIR": str(self.root),
             "CODEX_CONFIG_FILE": str(self.root / "absent"),

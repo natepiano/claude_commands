@@ -36,10 +36,11 @@ from session_table import SessionsSection, KeepSections, KEEP_SECTIONS
 from note_file import FIELD, Note, reset_time
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.accounts import refusals
+from scripts.accounts.role_map import role_map_command
 from scripts.whoami.agent_accounts import KnownCodexAccount, UnknownCodexAccount
 from agent_accounts import (ClaudeAccountsInUse, CodexHomeSource, EASTERN, Report,
                             codex_home_display, codex_homes,
-                            codex_report_in_use, live_reports, workers_home as resolve_workers_home)
+                            codex_report_in_use, live_reports, observe_workers_home as resolve_workers_home, NoWorkersHome)
 from quota_alert import (AgentNote, alert, blocked, current_session, refresh, CodexAlertPassReadings,
                          codex_alert_pass, RefusedAt, RefusalTimeUnknown)
 from run_out import READINGS_LOG
@@ -326,6 +327,7 @@ def apply(
     return QuotaUpdates(by_label, tuple(messages), tuple(readings))
 
 
+@role_map_command
 def update() -> list[str]:
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
     from scripts.accounts import accounts
@@ -334,7 +336,7 @@ def update() -> list[str]:
     return update_for_selection(accounts.claude_account_selection(), workers_home)
 
 
-def update_for_selection(selection: ClaudeAccountsInUse, workers_home: Path) -> list[str]:
+def update_for_selection(selection: ClaudeAccountsInUse, workers_home: Path | NoWorkersHome) -> list[str]:
     """Update notes and watch using one live pass."""
     return list(update_alert_pass(selection, workers_home).messages)
 
@@ -345,12 +347,15 @@ class UpdatedAgentNotes:
     codex_readings: CodexAlertPassReadings
 
 
-def update_alert_pass(selection: ClaudeAccountsInUse, workers_home: Path) -> UpdatedAgentNotes:
+@role_map_command
+def update_alert_pass(selection: ClaudeAccountsInUse, workers_home: Path | NoWorkersHome) -> UpdatedAgentNotes:
     """Build the alert readings before writing any note."""
     from scripts.accounts import accounts
 
     accounts.sweep_claude_temp_files(datetime.now(timezone.utc))
     messages = rename_legacy_notes(note_file.notes_dir())
+    if isinstance(workers_home, NoWorkersHome):
+        messages.append(workers_home.reason)
     notes = note_file.read_notes()
     multiple_codex_homes = len(codex_homes(workers_home)) > 1
     reports = asyncio.run(live_reports(selection, workers_home))
@@ -448,6 +453,7 @@ class RefusalCommandLine(argparse.Namespace):
     refused_at: str = ""
 
 
+@role_map_command
 def main() -> None:
     if sys.argv[1:2] == ["blocked"]:
         parser = argparse.ArgumentParser(prog="agent_notes.py blocked")

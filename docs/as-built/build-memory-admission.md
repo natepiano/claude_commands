@@ -72,7 +72,7 @@ In `invoke.sh`, `run_once` checks natedev holds before memory admission, runs th
 
 ### Build log: records and schema
 
-Index `SCHEMA_VERSION = 16` (`scripts/buildlog/index.py`; `open_for_update` rebuilds on a mismatch). Memory and coordination columns:
+Index `SCHEMA_VERSION = 17` (`scripts/buildlog/index.py`; `open_for_update` rebuilds on a mismatch). Memory and coordination columns:
 
 | Table | Column | Meaning |
 | --- | --- | --- |

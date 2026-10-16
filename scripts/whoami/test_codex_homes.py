@@ -14,7 +14,7 @@ import unittest
 from contextlib import redirect_stdout
 from pathlib import Path
 from datetime import datetime, timedelta, timezone
-from scripts.accounts import accounts
+from scripts.accounts import accounts, role_map
 from scripts.production import showrunners
 from typing import cast, override
 from unittest.mock import MagicMock, call, patch
@@ -47,6 +47,7 @@ class CodexHomesTests(unittest.TestCase):
             "HOME": str(self.home), "AGENT_NOTES_DIR": str(self.home), "PATH": os.defpath,
         }, clear=True)))
         del environment_context
+        _ = self.enterContext(patch.object(role_map, "is_role_map_host", return_value=True))
         _ = self.enterContext(patch.object(note_file, "AGENTS_DIR", self.home))
         _ = self.enterContext(patch.object(showrunners, "NOTIFIER_STATE_DIR", self.home / "notifier"))
 
@@ -150,7 +151,7 @@ class CodexHomesTests(unittest.TestCase):
             self.assertEqual(agent_accounts.user_zone(), ZoneInfo("Europe/Paris"))
 
     def test_discovery_includes_default_even_when_no_codex_home_exists(self) -> None:
-        self.assertEqual(agent_accounts.codex_homes(agent_accounts.workers_home()), [self.home / ".codex"])
+        self.assertEqual(agent_accounts.codex_homes(self.home / ".codex"), [self.home / ".codex"])
         self.assertEqual(agent_accounts.codex_home(), self.home / ".codex")
         self.assertEqual(list(self.home.iterdir()), [])
 
@@ -159,7 +160,7 @@ class CodexHomesTests(unittest.TestCase):
             (self.home / name).mkdir()
         _ = (self.home / ".codex3").write_text("a file")
 
-        self.assertEqual(agent_accounts.codex_homes(agent_accounts.workers_home()), [
+        self.assertEqual(agent_accounts.codex_homes(self.home / ".codex"), [
             self.home / name for name in (".codex", ".codex1", ".codex2", ".codex10")
         ])
 
@@ -247,7 +248,7 @@ class CodexHomesTests(unittest.TestCase):
                 patch.object(agent_accounts, "claude_live", return_value=Report("Claude")) as claude,
                 patch.object(agent_accounts, "codex_live", side_effect=self.live_fixture) as codex,
             ):
-                reports = asyncio.run(agent_accounts.live_reports(selection, agent_accounts.workers_home()))
+                reports = asyncio.run(agent_accounts.live_reports(selection, self.home / ".codex"))
             self.assertEqual([report.source for report in reports if report.tool == "Codex"],
                 [CodexHomeSource(home) for home in homes])
             self.assertCountEqual(codex.await_args_list, [call(home) for home in homes])
@@ -282,7 +283,7 @@ class CodexHomesTests(unittest.TestCase):
     def test_whoami_with_one_codex_home_keeps_the_original_output(self) -> None:
         _ = (self.home / "codex1.md").write_text("---\nlogin: workers@example.invalid\n---\n")
         report = Report("Codex", email="workers@example.invalid", source=CodexHomeSource(self.home / ".codex"))
-        self.assertEqual(whoami.render(report, self.legacy_selection(), agent_accounts.workers_home()), [
+        self.assertEqual(whoami.render(report, self.legacy_selection(), self.home / ".codex"), [
             "Codex", "  Account: codex1 — workers@example.invalid", "  Plan: unavailable",
             "  Limit resets available: unavailable",
         ])
@@ -317,10 +318,8 @@ class CodexHomesTests(unittest.TestCase):
             Report("Codex", problem="Not logged in", source=CodexHomeSource(default)),
             Report("Codex", problem="Not logged in", source=CodexHomeSource(spare)),
         ]
-        output = io.StringIO()
-        with patch.object(whoami, "live_reports", return_value=reports), redirect_stdout(output):
-            asyncio.run(whoami.main())
-        self.assertEqual(output.getvalue().strip().split("\n\n"), [
+        blocks = ["\n".join(whoami.render(report, self.legacy_selection(), default)) for report in reports]
+        self.assertEqual(blocks, [
             "Codex (~/.codex, workers)\n  Not logged in",
             "Codex (~/.codex1)\n  Not logged in",
         ])
@@ -329,7 +328,7 @@ class CodexHomesTests(unittest.TestCase):
         spare = self.home / ".codex1"
         spare.mkdir()
         report = Report("Codex", source=CodexHomeSource(spare))
-        self.assertEqual(whoami.render(report, self.legacy_selection(), agent_accounts.workers_home()), [
+        self.assertEqual(whoami.render(report, self.legacy_selection(), self.home / ".codex"), [
             "Codex (~/.codex1)", "  Account: email unavailable", "  Plan: unavailable",
             "  Limit resets available: unavailable",
         ])
@@ -346,7 +345,7 @@ class CodexHomesTests(unittest.TestCase):
         for problem in ("unavailable", "Not logged in"):
             with self.subTest(problem=problem):
                 report = Report("Codex", problem=problem, source=CodexHomeSource(self.home / ".codex"))
-                self.assertEqual(whoami.render(report, self.legacy_selection(), agent_accounts.workers_home()), ["Codex", f"  {problem}"])
+                self.assertEqual(whoami.render(report, self.legacy_selection(), self.home / ".codex"), ["Codex", f"  {problem}"])
 
     def test_whoami_uses_one_workers_role_when_it_changes_during_live_reads(self) -> None:
         selected = self.select_workers("codex2")
@@ -364,12 +363,14 @@ class CodexHomesTests(unittest.TestCase):
         self.assertNotIn("workers", blocks[1])
         self.assertEqual(agent_accounts.workers_home(), self.home / ".codex3")
 
-    def test_selected_workers_home_is_listed_even_when_its_directory_is_missing(self) -> None:
+    def test_missing_selected_workers_home_refuses_resolution_but_discovery_still_lists_its_path(self) -> None:
         selected = self.select_workers("codex2")
         (selected / "auth.json").unlink()
         selected.rmdir()
         with patch.dict(os.environ, {"CODEX_HOME": str(self.home / "caller")}):
-            self.assertEqual(agent_accounts.codex_homes(agent_accounts.workers_home()), [self.home / ".codex", selected])
+            with self.assertRaisesRegex(ValueError, "workers is on codex2, which is not set up on this machine"):
+                _ = agent_accounts.workers_home()
+            self.assertEqual(agent_accounts.codex_homes(selected), [self.home / ".codex", selected])
 
     def test_codex_work_readiness_reads_both_current_windows_and_credits(self) -> None:
         now = datetime.now(timezone.utc)

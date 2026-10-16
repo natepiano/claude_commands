@@ -5,6 +5,7 @@ description: Answer a question about build, lint, test and CI timings, failures 
 `$ARGUMENTS` is the question.
 
 Step tables, Rebuilds, Memory pressure and Summary count natedev's steps; the Mac section holds the Mac's steps.
+Mac copies counts Mac copies of still-compiling natedev tests and estimates the time the winners saved.
 The Power profile section compares passing natedev steps before and after each profile change in the last 7 days.
 
 Empty, or only a date → run `~/.claude/scripts/buildlog/buildlog report [YYYY-MM-DD]` (default today; its times are in the user's zone) and show its markdown unchanged. Add at most one line after it, only for something the tables do not show.
@@ -17,13 +18,6 @@ Otherwise:
 2. Write SQL and run `~/.claude/scripts/buildlog/buildlog query "<SQL>"` (read-only; single quotes inside). Add `--json` only when you need exact values to compute from.
 3. Answer the question in a few lines, with the numbers. Per kind of step, split by caller unless asked otherwise. Mac rows arrive with natedev's hourly sync.
 
-## Owner session
+## On demand only
 
-In the build-report session, point the schedule at the running session and check its status:
-
-```sh
-zsh ~/.claude/scripts/message/notifier.sh new report-builds --to "session:$CLAUDE_CODE_SESSION_ID" --every 240 --from report-builds --command 'Scheduled report (builds, every 4 hours): run /build:report with no argument and show its output unchanged. Do nothing else for this message.'
-zsh ~/.claude/scripts/message/notifier.sh status report-builds
-```
-
-Repeated `new` retargets the report without moving its clock. The owner reruns it after a session restart because the session id changes.
+The report runs only when someone asks for it. No schedule sends it, and no session creates a `report-builds` notifier. User, 2026-10-16: "stop having the builder report be automatic - i want to only have it called on demand".

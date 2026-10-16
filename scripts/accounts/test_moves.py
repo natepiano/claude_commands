@@ -187,6 +187,60 @@ class MoveJournalTests(unittest.TestCase):
         self.assertEqual(path.read_bytes(), original)
         self.assertEqual(roles.read_bytes(), role_bytes)
 
+    def test_codex_home_cutover_resolves_only_earlier_moves_and_never_uses_claude_evidence(self) -> None:
+        configuration = self.home / ".claude/config/accounts.json"
+        configuration.parent.mkdir(parents=True)
+        evidence = {"home_cutovers": [
+            {"at": "2026-10-12T00:00:00Z", "label": "claude4", "login": "claude@example.invalid"},
+            {"at": "2026-10-14T00:00:00Z", "label": "codex2", "login": "codex@example.invalid"},
+        ]}
+        _ = configuration.write_text(json.dumps(evidence))
+        path = moves.store_file()
+        path.parent.mkdir(parents=True)
+        records: list[dict[str, object]] = [
+            {**self.requested(), "from": "~/.codex", "to": "codex1"},
+            {**self.requested(), "move_id": "absolute-home", "from": "codex1", "to": str(self.home / ".codex")},
+            {**self.common(), "kind": "room again", "label": "~/.codex"},
+            {**self.common(), "at": "2026-10-14T00:00:00Z", "kind": "room again", "label": "~/.codex"},
+            {**self.common(), "at": "2026-10-15T00:00:00Z", "kind": "room again", "label": "~/.codex"},
+            {**self.common(tool="claude"), "kind": "room again", "label": "~/.claude"},
+        ]
+        original = "".join(json.dumps(entry) + "\n" for entry in records)
+        _ = path.write_text(original)
+        config_before = configuration.read_bytes()
+        loaded = moves.read_journal()
+        self.assertEqual(loaded[0].get("from"), "codex2")
+        self.assertEqual(loaded[1].get("to"), "codex2")
+        self.assertEqual(loaded[2].get("label"), "codex2")
+        for entry, home in ((loaded[3], self.home / ".codex"), (loaded[4], self.home / ".codex"),
+                            (loaded[5], self.home / ".claude")):
+            unresolved = entry.get("label")
+            self.assertIsInstance(unresolved, moves.HomeAccountUnresolved)
+            assert isinstance(unresolved, moves.HomeAccountUnresolved)
+            self.assertEqual(unresolved.home, home)
+        self.assertEqual(path.read_text(), original)
+        self.assertEqual(configuration.read_bytes(), config_before)
+
+    def test_codex_home_spelling_without_a_cutover_remains_unresolved_despite_todays_login(self) -> None:
+        path = moves.store_file()
+        path.parent.mkdir(parents=True)
+        original = json.dumps({**self.requested(), "from": "~/.codex"}) + "\n"
+        _ = path.write_text(original)
+        notes = self.home / "notes"
+        notes.mkdir()
+        _ = (notes / "codex9.md").write_text("---\nlogin: current@example.invalid\n---\n")
+        home = self.home / ".codex"
+        home.mkdir()
+        claims = base64.urlsafe_b64encode(json.dumps({"email": "current@example.invalid"}).encode()).decode().rstrip("=")
+        _ = (home / "auth.json").write_text(json.dumps({"tokens": {"id_token": f"header.{claims}.signature"}}))
+        with patch.dict(os.environ, {"AGENT_NOTES_DIR": str(notes)}):
+            loaded = moves.read_moves()
+        unresolved = loaded[0].get("from")
+        self.assertIsInstance(unresolved, moves.HomeAccountUnresolved)
+        assert isinstance(unresolved, moves.HomeAccountUnresolved)
+        self.assertEqual(unresolved.home, home)
+        self.assertEqual(path.read_text(), original)
+
     def test_request_alone_never_implies_confirmation(self) -> None:
         requested = self.requested()
         moves.append_move(requested)

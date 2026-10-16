@@ -14,6 +14,7 @@ import json
 import math
 import os
 from pathlib import Path
+import signal
 import subprocess
 import sys
 import tempfile
@@ -57,6 +58,7 @@ class ClaimOwnerRecord(TypedDict):
     since: str
     holder_session: NotRequired[str]
     idle_since: NotRequired[str]
+    copy: NotRequired[bool]
 
 
 class ProcessBoundClaim(ClaimOwnerRecord):
@@ -111,7 +113,14 @@ class ClaimBusy:
     holder: RunRecord
 
 
-ClaimAttempt = ClaimFinished | ClaimBusy
+@dataclass(frozen=True)
+class ClaimHeldByCopy:
+    """A claim attempt whose overlapping live claims are all copies, which give way."""
+
+    holders: tuple[RunRecord, ...]
+
+
+ClaimAttempt = ClaimFinished | ClaimBusy | ClaimHeldByCopy
 
 
 class NoRemoteJob:
@@ -419,6 +428,7 @@ class CliArguments(argparse.Namespace):
         self.showrunner: str = ""
         self.settings: str = ""
         self.repo_root: str = ""
+        self.copy: bool = False
 
 
 class StatePaths:
@@ -543,6 +553,10 @@ def read_run(path: Path) -> RunState:
         idle_since = values["idle_since"]
         _ = aware_timestamp(idle_since, path, "idle_since")
         record["idle_since"] = cast(str, idle_since)
+    if "copy" in values:
+        if values["copy"] is not True:
+            raise StateReadError(f"{path} has an invalid copy")
+        record["copy"] = True
     if "remote_host" not in values:
         return record
     host = values["remote_host"]
@@ -830,6 +844,14 @@ def run_is_live(run: RunRecord) -> bool:
 
 def run_is_kept(run: RunRecord) -> TypeGuard[RemoteJobClaim]:
     return "remote_host" in run and process_start_time(run["pid"]) != run["proc_start"]
+
+
+def copy_gives_way(run: RunRecord) -> bool:
+    """A live copy claim whose process still runs, so a new test can stop it.
+
+    A kept copy claim holds leftovers like any other kept claim and never gives way.
+    """
+    return run.get("copy") is True and process_start_time(run["pid"]) == run["proc_start"]
 
 
 def claim_scope(worktree: str) -> ClaimScope:
@@ -1785,6 +1807,10 @@ def take_over_kept_claim(args: CliArguments, claim: HeldClaim, kept: RemoteJobCl
         return ClaimFinished(1)
     kept["pid"] = args.pid
     kept["proc_start"] = proc_start
+    if args.copy:
+        kept["copy"] = True
+    else:
+        _ = kept.pop("copy", None)
     write_json(claim.path, kept)
     print(f"leftovers: {kept['remote_host']}")
     return ClaimFinished(13)
@@ -1812,6 +1838,9 @@ def claim_once(args: CliArguments, paths: StatePaths, scope: ClaimScope) -> Clai
         print(f"blocked by {block.holder}: {block.reason}")
         return ClaimFinished(10)
     if overlapping:
+        # A copy gives way to any new test; a copy never replaces a copy.
+        if not args.copy and all(copy_gives_way(claim.record) for claim in overlapping):
+            return ClaimHeldByCopy(tuple(claim.record for claim in overlapping))
         return ClaimBusy(overlapping[0].record)
     proc_start = process_start_time(args.pid)
     if proc_start is None:
@@ -1824,6 +1853,8 @@ def claim_once(args: CliArguments, paths: StatePaths, scope: ClaimScope) -> Clai
         "worktree": args.worktree,
         "since": timestamp(utc_now()),
     }
+    if args.copy:
+        claimed["copy"] = True
     if isinstance(args.remote, str):
         remote_claim: RemoteJobClaim = {**claimed, "remote_host": args.remote}
         claimed = remote_claim
@@ -1841,9 +1872,29 @@ def claim_once(args: CliArguments, paths: StatePaths, scope: ClaimScope) -> Clai
     return ClaimFinished(0)
 
 
+def copy_yield_seconds() -> float:
+    try:
+        seconds = float(os.environ.get("MAC_TEST_COPY_YIELD_S", "60"))
+    except ValueError:
+        return 60.0
+    return seconds if math.isfinite(seconds) and seconds > 0 else 60.0
+
+
+def stop_copy(holder: RunRecord) -> None:
+    """SIGTERM a copy claim's runner, never a process that reused its pid."""
+    if process_start_time(holder["pid"]) != holder["proc_start"]:
+        return
+    try:
+        os.kill(holder["pid"], signal.SIGTERM)
+    except (ProcessLookupError, PermissionError):
+        pass
+
+
 def command_claim(args: CliArguments, paths: StatePaths) -> int:
     scope = claim_scope(args.worktree)
     deadline = time.monotonic() + max(args.wait, 0.0)
+    yield_deadline = 0.0
+    stopped: set[tuple[int, str]] = set()
     while True:
         with locked(paths.lock):
             attempt = claim_once(args, paths, scope)
@@ -1851,6 +1902,21 @@ def command_claim(args: CliArguments, paths: StatePaths) -> int:
             if attempt.status in (0, 13):
                 start_claim_watcher(paths)
             return attempt.status
+        if isinstance(attempt, ClaimHeldByCopy):
+            # Signal outside state.lock, then wait for each copy's runner to
+            # clean up and release; the lock is never held while waiting.
+            if not stopped:
+                yield_deadline = time.monotonic() + copy_yield_seconds()
+            for holder in attempt.holders:
+                if (holder["pid"], holder["proc_start"]) not in stopped:
+                    stopped.add((holder["pid"], holder["proc_start"]))
+                    stop_copy(holder)
+            if time.monotonic() < yield_deadline:
+                time.sleep(0.1)
+                continue
+            busy_run = attempt.holders[0]
+            print(f"busy: {busy_run['what']} since {local_time(busy_run['since'], include_zone=False)}")
+            return 11
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             busy_run = attempt.holder
@@ -1884,14 +1950,16 @@ def command_release(args: CliArguments, paths: StatePaths) -> int:
 
 
 def free_now(
-    paths: StatePaths, settings: Path | offload.DefaultMacSettings, repo_root: Path,
+    paths: StatePaths, settings: Path | offload.DefaultMacSettings, repo_root: Path, copy: bool = False,
 ) -> FreeNowAnswer:
     """Whether a claim for repo_root's repository made now could start a Mac run.
 
     Read from local records alone, and cheap enough for LINT_QUEUE_LEAVE_HOOK,
     which runs it on every held memory poll: no SSH, no gh and no lock. CI is
     not read, since a claim does not consult it; the claim itself still decides
-    under its lock. Another repository's claim leaves the answer free.
+    under its lock. Another repository's claim leaves the answer free. A copy
+    claim gives way to a new test, so it holds the scope only for another copy
+    (`copy`).
     """
     if not offload.read_config(settings).enabled:
         return "off"
@@ -1904,13 +1972,18 @@ def free_now(
         claims = read_claims(paths)
     except (OSError, StateReadError):
         return "state"
-    held = any(scopes_overlap(claim.scope, scope) and run_is_live(claim.record) for claim in claims)
+    held = any(
+        scopes_overlap(claim.scope, scope)
+        and run_is_live(claim.record)
+        and (copy or not copy_gives_way(claim.record))
+        for claim in claims
+    )
     return "busy" if held else "free"
 
 
 def command_free_now(args: CliArguments, paths: StatePaths) -> int:
     settings = Path(args.settings) if args.settings else offload.DEFAULT_MAC_SETTINGS
-    answer = free_now(paths, settings, Path(args.repo_root))
+    answer = free_now(paths, settings, Path(args.repo_root), args.copy)
     print(answer)
     return 0 if answer == "free" else 1
 
@@ -2167,8 +2240,9 @@ def command_status(paths: StatePaths, config: MacTestConfig) -> int:
                       + f"since {local_time(run['since'])}, kept under pid {run['pid']}"
                       + claim_idle_clause(run))
             else:
+                copy_words = "copy of " if run.get("copy") is True else ""
                 print(
-                    f"running: {run['what']} ({run['worktree']}) "
+                    f"running: {copy_words}{run['what']} ({run['worktree']}) "
                     + f"since {local_time(run['since'])}"
                     + claim_idle_clause(run)
                 )
@@ -2244,6 +2318,7 @@ def parser() -> argparse.ArgumentParser:
     _ = claim.add_argument("--worktree", default=os.getcwd())
     _ = claim.add_argument("--wait", type=float, default=0.0)
     _ = claim.add_argument("--remote", type=remote_host_argument, default=NO_REMOTE_JOB)
+    _ = claim.add_argument("--copy", action="store_true")
 
     release = commands.add_parser("release")
     _ = release.add_argument("--pid", type=int, required=True)
@@ -2260,6 +2335,7 @@ def parser() -> argparse.ArgumentParser:
     free = commands.add_parser("free-now")
     _ = free.add_argument("--settings", default="")
     _ = free.add_argument("--repo-root", default=os.getcwd())
+    _ = free.add_argument("--copy", action="store_true")
 
     _ = commands.add_parser("status")
     _ = commands.add_parser("watch")

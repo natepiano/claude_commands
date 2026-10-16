@@ -197,6 +197,73 @@ class AccountTests(unittest.TestCase):
             assert isinstance(unreadable, account.ProcessEnvironmentUnread)
             self.assertTrue(unreadable.reason)
 
+    def test_mac_prompt_assignment_is_an_argument_and_never_selects_a_codex_home(self) -> None:
+        arguments = ("/Applications/Codex Tools/codex", "exec", "-c", "key=value", "", "CODEX_HOME=/scratch/other")
+        for environment in (b"HOME=/scratch\0", b"HOME=/scratch\0CODEX_HOME=\0"):
+            with self.subTest(empty_setting=b"CODEX_HOME=" in environment):
+                payload = (len(arguments).to_bytes(4, sys.byteorder, signed=True)
+                           + os.fsencode(arguments[0]) + b"\0\0\0"
+                           + b"\0".join(os.fsencode(word) for word in arguments) + b"\0" + environment)
+                with (patch.object(sys, "platform", "darwin"),
+                      patch.object(account, "_kern_procargs2", return_value=payload),
+                      patch.object(subprocess, "run", side_effect=AssertionError("ps text cannot identify environment"))):
+                    record = account.mac_process_record(321)
+                    selected = account.process_codex_home(321)
+                self.assertIsInstance(record, account.MacProcessRecord)
+                assert isinstance(record, account.MacProcessRecord)
+                self.assertEqual(record.arguments, arguments)
+                self.assertIsInstance(record.setting, account.ProcessWithoutCodexHome)
+                self.assertIsInstance(selected, account.ProcessWithoutCodexHome)
+
+    def test_mac_codex_home_comes_only_from_environment_after_the_exact_argument_count(self) -> None:
+        payload = (int(3).to_bytes(4, sys.byteorder, signed=True)
+                   + b"/opt/codex\0\0codex\0exec\0CODEX_HOME=/scratch/prompt\0"
+                   + b"CODEX_HOME=/scratch/selected home\0FIXTURE_VALUE=private-marker\0")
+        with (patch.object(sys, "platform", "darwin"),
+              patch.object(account, "_kern_procargs2", return_value=payload)):
+            record = account.mac_process_record(321)
+            selected = account.process_codex_home(321)
+        self.assertIsInstance(record, account.MacProcessRecord)
+        assert isinstance(record, account.MacProcessRecord)
+        self.assertEqual(record.arguments, ("codex", "exec", "CODEX_HOME=/scratch/prompt"))
+        self.assertEqual(record.setting, account.ProcessCodexHome(Path("/scratch/selected home")))
+        self.assertEqual(selected, record.setting)
+        self.assertNotIn("private-marker", repr(record))
+
+    def test_mac_kernel_executable_is_retained_independently_of_a_spoofed_argument_zero(self) -> None:
+        executable = "/Applications/ChatGPT.app/Contents/MacOS/codex"
+        payload = (int(3).to_bytes(4, sys.byteorder, signed=True)
+                   + os.fsencode(executable) + b"\0\0codex\0app-server\0daemon\0HOME=/scratch\0")
+        with patch.object(account, "_kern_procargs2", return_value=payload):
+            record = account.mac_process_record(321)
+        self.assertIsInstance(record, account.MacProcessRecord)
+        assert isinstance(record, account.MacProcessRecord)
+        self.assertEqual(record.executable, Path(executable))
+        self.assertEqual(record.arguments, ("codex", "app-server", "daemon"))
+
+    def test_mac_refused_or_malformed_kernel_record_is_unreadable_instead_of_default_home(self) -> None:
+        malformed = (
+            b"", b"\x01\x00",
+            int(0).to_bytes(4, sys.byteorder, signed=True) + b"/opt/codex\0\0",
+            int(-1).to_bytes(4, sys.byteorder, signed=True) + b"/opt/codex\0\0",
+            int(1).to_bytes(4, sys.byteorder, signed=True) + b"unterminated-executable",
+            int(3).to_bytes(4, sys.byteorder, signed=True) + b"/opt/codex\0\0codex\0",
+            int(1).to_bytes(4, sys.byteorder, signed=True) + b"/opt/codex\0\0codex",
+            int(1).to_bytes(4, sys.byteorder, signed=True) + b"/opt/codex\0\0codex\0invalid-environment\0",
+        )
+        with patch.object(sys, "platform", "darwin"):
+            for index, payload in enumerate(malformed):
+                with self.subTest(case=index), patch.object(account, "_kern_procargs2", return_value=payload):
+                    record = account.mac_process_record(321)
+                    selected = account.process_codex_home(321)
+                self.assertIsInstance(record, account.ProcessEnvironmentUnread)
+                self.assertIsInstance(selected, account.ProcessEnvironmentUnread)
+                assert isinstance(selected, account.ProcessEnvironmentUnread)
+                self.assertTrue(selected.reason)
+            with patch.object(account, "_kern_procargs2", side_effect=PermissionError("denied")):
+                self.assertIsInstance(account.mac_process_record(321), account.ProcessEnvironmentUnread)
+                self.assertIsInstance(account.process_codex_home(321), account.ProcessEnvironmentUnread)
+
     def test_legacy_note_alone_still_resolves_the_spaced_account_label(self) -> None:
         self.write_note("claude 2.md", "legacy@example.invalid")
         with patch.dict(os.environ, {"AGENT_NOTES_DIR": str(self.notes)}):
