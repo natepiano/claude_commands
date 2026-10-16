@@ -183,8 +183,9 @@ def _marks(session: str) -> dict[str, str]:
     return {name: value for name, value in pairs if name in (PRODUCTION_MARK, UNIT_MARK)}
 
 
-def _claudes() -> tuple[dict[str, LiveClaude], dict[HerdrPlace, LiveClaude], str]:
+def _claudes(native_processes: list[herdr.HerdrProcess]) -> tuple[dict[str, LiveClaude], dict[HerdrPlace, LiveClaude], str]:
     """Newest live Claude per tmux or herdr pane, and any unread records."""
+    native_places = {process.pid: process.place for process in native_processes}
     try:
         paths = sorted(path for path in sessions_dir().iterdir() if path.suffix == ".json")
     except OSError as error:
@@ -204,9 +205,14 @@ def _claudes() -> tuple[dict[str, LiveClaude], dict[HerdrPlace, LiveClaude], str
                 continue
             place: Place = TmuxPlace(pane)
         else:
-            found = herdr.herdr_place_of(record["pid"])
-            if isinstance(found, herdr.NotInHerdr):
-                continue
+            found = native_places.get(record["pid"])
+            if found is None:
+                # A live registry PID may be absent from the snapshot because
+                # its working directory was deleted. Placement needs no cwd.
+                placement = herdr.herdr_place_of(record["pid"])
+                if isinstance(placement, herdr.NotInHerdr):
+                    continue
+                found = placement
             place = found
         if place not in newest or record["updatedAt"] > newest[place][0]:
             newest[place] = (record["updatedAt"], LiveClaude(record["name"], record["sessionId"],
@@ -256,11 +262,12 @@ def _marked_sessions(claudes: dict[str, LiveClaude], unread: str) -> Iterable[tu
         yield slug, MarkedUnit(unit, label, claude, TmuxPlace(pane))
 
 
-def _herdr_marked(claudes: dict[HerdrPlace, LiveClaude], unread: str) -> Iterable[tuple[str, MarkedUnit]]:
+def _herdr_marked(claudes: dict[HerdrPlace, LiveClaude], unread: str,
+                  processes: list[herdr.HerdrProcess]) -> Iterable[tuple[str, MarkedUnit]]:
     """Each running herdr pane carrying both marks, once per place."""
     running = {session["name"] for session in herdr.live_sessions()}
     seen: set[HerdrPlace] = set()
-    for process in herdr.herdr_processes():
+    for process in processes:
         place = process.place
         if place.session not in running or place in seen:
             continue
@@ -285,10 +292,11 @@ def every_marked_unit(*, include_tmux: bool = True, every_host: bool = False) ->
     With every_host, any included source failure is unreadable. Duplicate marks leave that
     production out; callers must never pick one host.
     """
-    tmux_claudes, herdr_claudes, unread = _claudes()
+    native_processes = herdr.herdr_processes()
+    tmux_claudes, herdr_claudes, unread = _claudes(native_processes)
     marked_units: list[tuple[str, MarkedUnit]] = []
     failures: list[tuple[str, str]] = []
-    sources = [("herdr", _herdr_marked(herdr_claudes, unread))]
+    sources = [("herdr", _herdr_marked(herdr_claudes, unread, native_processes))]
     if include_tmux:
         sources.insert(0, ("tmux", _marked_sessions(tmux_claudes, unread)))
     for host, source in sources:
@@ -336,7 +344,7 @@ def marked_units(slug: str, *, every_host: bool = False) -> dict[str, MarkedUnit
 
 def tmux_claude(label: str) -> Claude:
     """The live Claude in the tmux session named `label`, marked or not."""
-    claudes, _, unread = _claudes()
+    claudes, _, unread = _claudes([])
     panes = next((panes for name, panes in tmux_sessions().values() if name == label), None)
     if panes is None:
         return ClaudeNotRunning()

@@ -375,6 +375,7 @@ class InventoryTests(ShutdownTestCase):
             "FAKE_TMUX_STATE": str(self.tmux_state),
             "HERDR_BIN": str(Path(__file__).parents[1] / "herdr" / "fake_herdr.py"),
             "HERDR_PROC": str(self.proc),
+            "XDG_CONFIG_HOME": str(self.home / ".config"),
             "FAKE_HERDR_LOG": str(self.herdr_log),
             "FAKE_HERDR_RESPONSES": str(responses),
             "PATH": str(self.bin) + os.pathsep + os.environ.get("PATH", ""),
@@ -462,6 +463,16 @@ class InventoryTests(ShutdownTestCase):
             ("\0".join(f"{key}={value}" for key, value in environment.items()) + "\0").encode()
         )
         (process / "cwd").symlink_to(self.checkout)
+        if arguments and Path(arguments[0]).name == "herdr" and arguments[-1] == "server":
+            name = arguments[arguments.index("--session") + 1] if "--session" in arguments else "default"
+            config = self.home / ".config/herdr"
+            directory = config if name == "default" else config / "sessions" / name
+            sockets = self.proc / "net/unix"
+            sockets.parent.mkdir(exist_ok=True)
+            previous = sockets.read_text() if sockets.exists() else ""
+            _ = sockets.write_text(previous + f"000: 00000002 00000000 00010000 0001 01 {pid} {directory}/herdr.sock\n")
+            (process / "fd").mkdir()
+            (process / "fd/3").symlink_to(f"socket:[{pid}]")
 
     def herdr_sessions(self, names: list[str]) -> None:
         entries = [herdr.SessionEntry(name=name, running=True, default=False,
@@ -861,9 +872,39 @@ elif "comm=" in joined:
         self.assertEqual(herdr.herdr_place_of(DESKTOP_PID), herdr.HerdrPlace("writing", "w1:p1"))
         found = inventory.inventory(TARGET_LOGIN)
         desktop = next(session for session in found["sessions"] if session["session_id"] == DESKTOP_ID)
-        self.assertEqual(desktop["host"], {"kind": "herdr", "herdr_session": "writing", "pane_id": "w1:p1"})
+        self.assertEqual(desktop["host"], {"kind": "herdr", "herdr_session": "writing", "pane_id": "w1:p1", "presentation": "detached"})
         self.assertEqual(inventory.parse_inventory(json.dumps(found)), found)
         self.assertEqual(shutdown._host_text(desktop["host"]), "herdr writing")  # pyright: ignore[reportPrivateUsage]
+
+    def test_herdr_inventory_records_attached_clients_and_defaults_unreadable_clients_to_detached(self) -> None:
+        self.herdr_process(71_001, 1, ["/fixture/herdr", "--session", "writing", "server"], {})
+        self.herdr_process(DESKTOP_PID, 71_001, ["/bin/claude"], {"HERDR_PANE_ID": "w1:p1"})
+        for clients, expected in ((herdr.ClientsAttached(2), "attached window"),
+                                  (herdr.NoClientAttached(), "detached"),
+                                  (herdr.ClientsUnreadable("cannot read processes"), "detached")):
+            with self.subTest(clients=clients), patch.object(herdr, "attached_clients", return_value=clients):
+                found = inventory.inventory(TARGET_LOGIN)
+            desktop = next(session for session in found["sessions"] if session["session_id"] == DESKTOP_ID)
+            self.assertEqual(desktop["host"].get("presentation"), expected)
+            parsed = inventory.parse_inventory(json.dumps(found))
+            self.assertEqual(parsed, found)
+
+    def test_old_herdr_inventory_reads_detached_and_rejects_invalid_presentation(self) -> None:
+        self.herdr_process(71_001, 1, ["/fixture/herdr", "--session", "writing", "server"], {})
+        self.herdr_process(DESKTOP_PID, 71_001, ["/bin/claude"], {"HERDR_PANE_ID": "w1:p1"})
+        found = inventory.inventory(TARGET_LOGIN)
+        wire = cast(dict[str, object], json.loads(json.dumps(found)))
+        owners = cast(list[dict[str, object]], wire["sessions"])
+        host = cast(dict[str, object], next(owner for owner in owners if owner["session_id"] == DESKTOP_ID)["host"])
+        _ = host.pop("presentation")
+        parsed = inventory.parse_inventory(json.dumps(wire))
+        desktop = next(owner for owner in parsed["sessions"] if owner["session_id"] == DESKTOP_ID)
+        self.assertEqual(desktop["host"].get("presentation"), "detached")
+        for invalid in ("window", 3, {"kind": "invalid"}, None):
+            with self.subTest(invalid=invalid):
+                host["presentation"] = invalid
+                with self.assertRaises(inventory.InvalidInventory):
+                    _ = inventory.parse_inventory(json.dumps(wire))
 
     def test_herdr_unit_records_its_host_and_live_session_name(self) -> None:
         self.herdr_sessions(["unit-herdr"])
@@ -890,7 +931,7 @@ elif "comm=" in joined:
         session = cast(inventory.TopLevelSession, next(
             item for item in inventory.inventory(TARGET_LOGIN)["sessions"] if item["session_id"] == DESKTOP_ID
         ))
-        session["host"] = inventory.HerdrHost(kind="herdr", herdr_session="writing", pane_id="w1:p1")
+        session["host"] = inventory.HerdrHost(kind="herdr", herdr_session="writing", pane_id="w1:p1", presentation="detached")
         with patch.object(stop, "_stop_unit_tmux") as tmux_cleanup, patch.object(stop, "_close_ghostty_window"):
             issues = stop._stop_owner_resources(  # pyright: ignore[reportPrivateUsage]
                 session, kill=lambda _pid, _signal: self.fail("unexpected kill"), is_alive=lambda _pid: False,

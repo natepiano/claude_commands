@@ -167,6 +167,110 @@ class ShutdownLaunchCliTests(ShutdownTestCase):
         if self.state.exists():
             shutil.rmtree(self.state)
 
+    def test_terminal_down_without_account_starts_each_configured_account(self) -> None:
+        _ = (Path(self.environment["AGENT_NOTES_DIR"]) / "claude3.md").write_text(
+            "---\nlogin: third@example.com\n---\n")
+        def reports(login: str) -> inventory.Inventory:
+            return inventory.Inventory(machine="natedev", login=login, label=login, sessions=[], unattributed=[])
+        with (patch.dict(os.environ, {**self.environment, "CLAUDE_CODE_SESSION_ID": ""}),
+              patch.object(shutdown, "inventory", side_effect=reports),
+              patch.object(settle, "down", return_value=0) as down,
+              patch.object(shutdown, "own_claude_account", side_effect=AssertionError("terminal account inferred"))):
+            self.assertEqual(shutdown.main(["down", "--here", "--restart", "--no-alert"]), 0)
+        self.assertEqual([cast(Account, call.args[0]).login for call in down.call_args_list], [LOGIN, "third@example.com"])
+        self.assertTrue(all(call.args[1] for call in down.call_args_list))
+        self.assertTrue(all(call.kwargs["then"] == "restart" and call.kwargs["alerts"] == "none" for call in down.call_args_list))
+
+    def test_terminal_status_without_account_emits_one_json_array_for_all_accounts(self) -> None:
+        _ = (Path(self.environment["AGENT_NOTES_DIR"]) / "claude3.md").write_text(
+            "---\nlogin: third@example.com\n---\n")
+        def reports(login: str) -> inventory.Inventory:
+            return inventory.Inventory(machine="natedev", login=login, label=login, sessions=[], unattributed=[])
+        output = io.StringIO()
+        with (patch.dict(os.environ, {**self.environment, "CLAUDE_CODE_SESSION_ID": ""}),
+              patch.object(shutdown, "inventory", side_effect=reports),
+              patch.object(shutdown, "run_remote", side_effect=AssertionError("--here read peer")),
+              redirect_stdout(output)):
+            self.assertEqual(shutdown.main(["status", "--here", "--json"]), 0)
+        result = cast(list[dict[str, object]], json.loads(output.getvalue()))
+        self.assertEqual([report["login"] for report in result], [LOGIN, "third@example.com"])
+
+    def test_terminal_restart_releases_both_empty_accounts_after_down(self) -> None:
+        third = "third@example.com"
+        _ = (Path(self.environment["AGENT_NOTES_DIR"]) / "claude3.md").write_text(
+            f"---\nlogin: {third}\n---\n")
+
+        def reports(login: str) -> inventory.Inventory:
+            return inventory.Inventory(machine="natedev", login=login,
+                label=LABEL if login == LOGIN else "claude3", sessions=[], unattributed=[])
+
+        with (patch.dict(os.environ, {**self.environment, "CLAUDE_CODE_SESSION_ID": ""}),
+              patch.object(shutdown, "inventory", side_effect=reports),
+              patch.object(settle, "_warm", return_value=True),
+              patch.object(settle, "_launch_conductor"),
+              patch.object(shutdown, "run_remote", side_effect=AssertionError("--here read peer")),
+              redirect_stdout(io.StringIO())):
+            self.assertEqual(shutdown.main(["down", "--here", "--no-alert"]), 0)
+            self.assertEqual({hold["login"] for hold in record.all_account_holds()}, {LOGIN, third})
+            self.assertEqual(shutdown.main(["restart", "--here", "--no-alert"]), 0)
+        self.assertEqual(record.all_account_holds(), [])
+
+    def test_terminal_restart_includes_a_peer_hold_without_session_records(self) -> None:
+        held = account_hold()
+        held["login"], held["label"], held["machine"] = "third@example.com", "claude3", "Mac"
+
+        def peer(args: list[str]) -> tuple[int, str]:
+            return 0, json.dumps([held] if args[0] == "holds" else [])
+
+        with (patch.dict(os.environ, {**self.environment, "CLAUDE_CODE_SESSION_ID": ""}),
+              patch.object(shutdown, "run_remote", side_effect=peer),
+              patch.object(restart_work, "restart", return_value=0) as resume):
+            self.assertEqual(shutdown.main(["restart", "--no-alert"]), 0)
+        resume.assert_called_once()
+        self.assertEqual(resume.call_args.args[0], restart_work.AccountNamed(held["login"]))
+        self.assertFalse(resume.call_args.kwargs["here"])
+
+    def test_terminal_restart_without_account_uses_accounts_with_records_on_either_machine(self) -> None:
+        local = session_shutdown(record.SessionStopped(kind="stopped", at=OCTOBER))
+        peer = session_shutdown(record.SessionStopped(kind="stopped", at=OCTOBER), "peer-id")
+        peer["login"], peer["label"], peer["machine"] = "third@example.com", "claude3", "Mac"
+        self.assertTrue(record.create_session(local))
+        with (patch.dict(os.environ, {**self.environment, "CLAUDE_CODE_SESSION_ID": ""}),
+              patch.object(shutdown, "run_remote", side_effect=[(0, json.dumps([peer])), (0, "[]")]),
+              patch.object(restart_work, "restart", side_effect=[1, 0]) as resume):
+            self.assertEqual(shutdown.main(["restart", "--dry-run", "--no-alert"]), 1)
+        self.assertEqual([call.args[0] for call in resume.call_args_list],
+            [restart_work.AccountNamed(LOGIN), restart_work.AccountNamed("third@example.com")])
+        self.assertTrue(all(call.kwargs["dry_run"] and not call.kwargs["here"] for call in resume.call_args_list))
+
+    def test_terminal_restart_attempts_local_accounts_when_peer_record_discovery_fails(self) -> None:
+        self.assertTrue(record.create_session(session_shutdown(record.SessionStopped(kind="stopped", at=OCTOBER))))
+        with (patch.dict(os.environ, {**self.environment, "CLAUDE_CODE_SESSION_ID": ""}),
+              patch.object(shutdown, "run_remote", return_value=(255, "peer unavailable")),
+              patch.object(restart_work, "restart", return_value=0) as resume,
+              redirect_stderr(io.StringIO()) as error):
+            self.assertEqual(shutdown.main(["restart", "--no-alert"]), 1)
+        self.assertEqual(resume.call_args.args[0], restart_work.AccountNamed(LOGIN))
+        self.assertFalse(resume.call_args.kwargs["here"])
+        self.assertIn("shutdown records not reached", error.getvalue())
+        self.assertIn("agents restart --here", error.getvalue())
+
+    def test_in_session_no_account_keeps_own_account_for_down_status_and_restart(self) -> None:
+        selected = Account("claude", LOGIN, LABEL)
+        report = inventory.Inventory(machine="natedev", login=LOGIN, label=LABEL, sessions=[], unattributed=[])
+        with (patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": "caller-id"}),
+              patch.object(shutdown, "own_claude_account", return_value=selected),
+              patch.object(shutdown, "inventory", return_value=report),
+              patch.object(shutdown, "_terminal_accounts", side_effect=AssertionError("expanded accounts")),
+              patch.object(settle, "down", return_value=0) as down,
+              patch.object(restart_work, "restart", return_value=0) as resume,
+              redirect_stdout(io.StringIO())):
+            self.assertEqual(shutdown.main(["down", "--here"]), 0)
+            self.assertEqual(shutdown.main(["status", "--here", "--json"]), 0)
+            self.assertEqual(shutdown.main(["restart", "--here"]), 0)
+        self.assertEqual(down.call_args.args[0], selected)
+        self.assertEqual(resume.call_args.args[0], restart_work.AccountNotNamed())
+
     def test_down_rejects_non_numbered_targets_before_creating_records_requests_or_a_conductor(self) -> None:
         moves_file = self.home / ".local/state/accounts/moves.jsonl"
         selected = Account("claude", LOGIN, LABEL)
@@ -917,6 +1021,7 @@ class ShutdownLaunchCliTests(ShutdownTestCase):
                     self.assertTrue(record.create_session(session_shutdown(
                         record.SessionWaiting(kind="waiting"), "session-456", hold="account",
                     )))
+                    self.assertEqual(self.run_cli(LOGIN, "--restart-of", "session-123"), (1, "", ""))
                     record.set_account_hold(account_hold())
                     self.assertEqual(self.run_cli(LOGIN, "--restart-of", "session-123"), (1, "", ""))
                     self.assertEqual(self.run_cli(LOGIN)[0], 0)
@@ -1093,7 +1198,7 @@ class ShutdownLaunchCliTests(ShutdownTestCase):
         with patch.object(subprocess, "run", side_effect=run):
             permission = launch_permission.launch_permission(
                 self.environment,
-                launch_permission.ShutdownUnitRestoreLaunchPurpose("session-123"),
+                launch_permission.RecordedSessionRestoreLaunchPurpose("session-123"),
             )
 
         self.assertIsInstance(permission, launch_permission.AllowedByShutdownState)
@@ -1294,6 +1399,98 @@ class OnlySessionCliTests(ShutdownTestCase):
         self.assertIn("beta-id", diagnostic)
         self.assertEqual(record.session_records(LOGIN), sorted(before, key=lambda item: item["session"]["name"]))
 
+    def test_terminal_only_routes_selection_to_its_account_for_down_restart_and_status(self) -> None:
+        selected = [Account("claude", LOGIN, LABEL), Account("claude", "other@example.com", "claude3")]
+        real_resolve = shutdown.resolve_sessions
+        def resolve(login: str, items: Iterable[str], *, here: bool = False) -> shutdown.ResolvedSessions:
+            if login != LOGIN:
+                raise shutdown.SessionNotFound("Beta: matches no session")
+            return real_resolve(login, items, here=here)
+        for verb in ("down", "restart", "status"):
+            with (self.subTest(verb=verb),
+                  patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": ""}),
+                  patch.object(shutdown, "_terminal_accounts", return_value=shutdown.TerminalAccountSelection(tuple(selected))),
+                  patch.object(shutdown, "resolve_sessions", side_effect=resolve),
+                  patch.object(settle, "down", return_value=0) as down,
+                  patch.object(restart_work, "restart", return_value=0) as resume,
+                  patch.object(shutdown, "run_remote", side_effect=AssertionError("--here read peer")),
+                  redirect_stdout(io.StringIO()) as output):
+                args = [verb, "--only", "Beta", "--here"]
+                if verb == "status":
+                    args.append("--json")
+                self.assertEqual(shutdown.main(args), 0)
+                if verb == "down":
+                    self.assertEqual(down.call_args.args[:3], (selected[0], True, ("beta-id",)))
+                elif verb == "restart":
+                    self.assertEqual(resume.call_args.args[0], restart_work.AccountNamed(LOGIN))
+                    self.assertEqual(resume.call_args.kwargs["only"], ["beta-id"])
+                else:
+                    reports = cast(list[dict[str, object]], json.loads(output.getvalue()))
+                    self.assertEqual([report["login"] for report in reports], [LOGIN])
+                    owners = cast(list[dict[str, object]], reports[0]["sessions"])
+                    self.assertEqual([owner["session_id"] for owner in owners], ["beta-id"])
+
+    def test_terminal_down_starts_both_accounts_without_following_the_first(self) -> None:
+        class InteractiveTerminalOutput(io.StringIO):
+            @override
+            def isatty(self) -> bool:
+                return True
+
+        selected = [Account("claude", LOGIN, LABEL), Account("claude", "other@example.com", "claude3")]
+        by_login = {account.login: account for account in selected}
+        owners = {LOGIN: self.owners[0], "other@example.com": unit_session("other-id")}
+        def report(login: str) -> inventory.Inventory:
+            return inventory.Inventory(machine="natedev", login=login, label=by_login[login].label,
+                sessions=[owners[login]], unattributed=[])
+        def account_for_login(login: str) -> Account:
+            return by_login[login]
+        output = InteractiveTerminalOutput()
+        with (patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": ""}),
+              patch.object(shutdown, "_terminal_accounts", return_value=shutdown.TerminalAccountSelection(tuple(selected))),
+              patch.object(shutdown, "named_claude_account", side_effect=account_for_login),
+              patch.object(shutdown, "inventory", side_effect=report),
+              patch.object(settle, "_launch_conductor") as conduct,
+              patch.object(shutdown, "follow", side_effect=AssertionError("following first account blocks second")),
+              redirect_stdout(output)):
+            self.assertEqual(shutdown.main(["down", "--here", "--no-alert"]), 0)
+        self.assertEqual([call.args[0] for call in conduct.call_args_list], [LOGIN, "other@example.com"])
+        self.assertEqual([saved["session"]["session_id"] for saved in record.session_records(LOGIN)], ["alpha-id"])
+        self.assertEqual([saved["session"]["session_id"] for saved in record.session_records("other@example.com")], ["other-id"])
+        self.assertIn("follow owner@example.com --request", output.getvalue())
+        self.assertIn("follow other@example.com --request", output.getvalue())
+
+    def test_status_only_shows_the_selected_live_session_and_its_shutdown(self) -> None:
+        _ = self.save_three({"kind": "waiting"})
+        output, error = io.StringIO(), io.StringIO()
+        with redirect_stdout(output), redirect_stderr(error):
+            self.assertEqual(shutdown.main(["status", LOGIN, "--only", "Beta", "--here"]), 0)
+        self.assertEqual(error.getvalue(), "")
+        self.assertIn("Beta", output.getvalue())
+        self.assertNotIn("Alpha", output.getvalue())
+        self.assertNotIn("Gamma", output.getvalue())
+
+    def test_selected_status_filters_peer_sessions_without_requiring_a_peer_match(self) -> None:
+        peer = inventory.Inventory(machine="Mac", login=LOGIN, label=LABEL, sessions=self.owners, unattributed=[])
+        with patch.object(shutdown, "run_remote", return_value=(0, json.dumps(peer))) as remote:
+            reports = shutdown._status(Account("claude", LOGIN, LABEL), False, ("beta-id",))  # pyright: ignore[reportPrivateUsage]
+        self.assertEqual(remote.call_args.args[0], ["status", LOGIN, "--json", "--here"])
+        self.assertEqual(len(reports), 2)
+        self.assertIn("sessions", reports[1])
+        peer_report = cast(inventory.Inventory, reports[1])
+        self.assertEqual([owner["session_id"] for owner in peer_report["sessions"]], ["beta-id"])
+
+    def test_terminal_only_ambiguous_across_accounts_starts_no_shutdown(self) -> None:
+        selected = [Account("claude", LOGIN, LABEL), Account("claude", "other@example.com", "claude3")]
+        resolved = shutdown.ResolvedSessions(("beta-id",), inventory.Inventory(machine="natedev", login=LOGIN, label=LABEL, sessions=self.owners, unattributed=[]))
+        with (patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": ""}),
+              patch.object(shutdown, "_terminal_accounts", return_value=shutdown.TerminalAccountSelection(tuple(selected))),
+              patch.object(shutdown, "resolve_sessions", return_value=resolved),
+              patch.object(settle, "down") as down,
+              redirect_stderr(io.StringIO()) as error):
+            self.assertEqual(shutdown.main(["down", "--only", "Beta", "--here"]), 2)
+        down.assert_not_called()
+        self.assertIn("claude2, claude3", error.getvalue())
+
     def test_down_exact_name_builds_one_filtered_inventory_and_keeps_owned_workers(self) -> None:
         worker = cast(inventory.WorkerSession, cast(object, {
             **unit_session("owned-worker"), "kind": "worker", "name": "Worker",
@@ -1493,7 +1690,7 @@ class OnlySessionCliTests(ShutdownTestCase):
                 else:
                     record.set_account_hold(record.AccountHold(login=LOGIN, label=LABEL, machine="natedev", requested_at=OCTOBER, requested_by={"kind": "terminal"}, request_id="held", then="stop"))
                 output, error = io.StringIO(), io.StringIO()
-                with patch.object(shutdown, "own_claude_account", side_effect=UnreadableAccount("own account unreadable")), patch.object(restart_work, "own_claude_account", side_effect=UnreadableAccount("own account unreadable")), patch.object(restart_work, "run_remote", return_value=(0, "[]")), patch.object(restart_work, "_up", return_value=restart_work.MachineRestartResult("natedev", LABEL, "done")) as resume, redirect_stdout(output), redirect_stderr(error):
+                with patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": "caller-id"}), patch.object(shutdown, "own_claude_account", side_effect=UnreadableAccount("own account unreadable")), patch.object(restart_work, "own_claude_account", side_effect=UnreadableAccount("own account unreadable")), patch.object(restart_work, "run_remote", return_value=(0, "[]")), patch.object(restart_work, "_up", return_value=restart_work.MachineRestartResult("natedev", LABEL, "done")) as resume, redirect_stdout(output), redirect_stderr(error):
                     self.assertEqual(shutdown.main(["restart", "--only", "beta-id", "--here", "--no-alert"]), 0)
                 self.assertEqual(error.getvalue(), "")
                 resume.assert_called_once_with(LOGIN, False, ("beta-id",))

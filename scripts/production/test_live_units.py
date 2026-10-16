@@ -11,6 +11,9 @@ import unittest
 from pathlib import Path
 from typing import override
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "herdr"))
+
+from fake_herdr import herdr_listener
 import fake_showrunner
 import fake_tmux
 from fake_tmux import FakeSession
@@ -114,6 +117,7 @@ class LiveUnitsTests(unittest.TestCase):
             _ = (directory / "cmdline").write_bytes("\0".join(argv).encode())
             _ = (directory / "environ").write_bytes("\0".join(f"{key}={value}" for key, value in environment.items()).encode())
             (directory / "cwd").symlink_to(self.root)
+        herdr_listener(self.root / "proc", 991000, "native", self.environment)
         self.claude("native-claude", "")
         result = self.run_script()
         self.assertEqual(result.returncode, 0, result.stderr)

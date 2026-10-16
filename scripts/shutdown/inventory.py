@@ -98,6 +98,12 @@ class HerdrHost(TypedDict):
     kind: Literal["herdr"]
     herdr_session: str
     pane_id: str
+    presentation: NotRequired[Literal["attached window", "detached"]]
+
+
+def herdr_presentation(host: HerdrHost) -> Literal["attached window", "detached"]:
+    """Records made before window presentation was saved remain detached."""
+    return host.get("presentation", "detached")
 
 
 class NamedDesktop(TypedDict):
@@ -510,6 +516,9 @@ def _parse_host(value: object, place: str, allow_unit: bool) -> Host:
             ),
         }
     if kind == "herdr":
+        presentation = _wire_string(data.get("presentation", "detached"), f"{place}.presentation")
+        if presentation not in {"attached window", "detached"}:
+            raise InvalidInventory(f"{place}.presentation: expected attached window or detached")
         return {
             "kind": "herdr",
             "herdr_session": _wire_string(
@@ -518,6 +527,7 @@ def _parse_host(value: object, place: str, allow_unit: bool) -> Host:
             "pane_id": _wire_string(
                 _wire_required(data, "pane_id", place), f"{place}.pane_id"
             ),
+            "presentation": cast(Literal["attached window", "detached"], presentation),
         }
     if kind == "tmux":
         pane: TmuxPane | PaneNotRecorded = (
@@ -1332,7 +1342,9 @@ def _host(
         )
     place = herdr.herdr_place_of(session.get("pid", 0))
     if isinstance(place, herdr.HerdrPlace):
-        return {"kind": "herdr", "herdr_session": place.session, "pane_id": place.pane}
+        clients = herdr.attached_clients(place.session)
+        return {"kind": "herdr", "herdr_session": place.session, "pane_id": place.pane,
+                "presentation": "attached window" if isinstance(clients, herdr.ClientsAttached) else "detached"}
     desktop_name = desktops.get(session_id)
     desktop: Desktop = (
         {"kind": "named", "name": desktop_name}

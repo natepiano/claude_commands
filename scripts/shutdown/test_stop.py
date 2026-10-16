@@ -751,8 +751,8 @@ class StopTests(ShutdownTestCase):
                 self.assertEqual(signals, [signal.SIGTERM] if state == "present" else [])
                 self.assertEqual(self.herdr_commands(), [
                     ["--session", "same-name-as-tmux", "server", "stop"],
-                    ["--user", "is-active", "herdr-same-name-as-tmux"],
-                    ["--user", "stop", "herdr-same-name-as-tmux"],
+                    ["--user", "is-active", "herdr-same-name-as-tmux.service"],
+                    ["--user", "stop", "herdr-same-name-as-tmux.service"],
                     ["--session", "default", "session", "list", "--json"],
                 ])
                 self.assertEqual(report["stop_issues"], [])

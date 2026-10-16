@@ -279,12 +279,12 @@ class AddShowrunnerTests(unittest.TestCase):
         # The parent ran the command and reads its output; only the child is told.
         self.assertEqual(self.sent_to(), [f"uds:{self.root / 'kid-session.sock'}"])
         calls = self.herdr_calls()
-        self.assertIn(["--user", "--unit=herdr-kid", "--collect", self.env["HERDR_BIN"],
+        self.assertIn(["--user", "--unit=herdr-kid.service", "--collect", self.env["HERDR_BIN"],
                        "--session", "kid", "server"], calls)
         opened = self.opened()
         self.assertEqual(opened[:8], ["--session", "kid", "workspace", "create", "--label", "kid",
                                      "--cwd", str(self.root / "kid-checkout")])
-        self.assertEqual(opened[8:], ["--env", "ENABLE_TOOL_SEARCH=true", "--no-focus"])
+        self.assertEqual(opened[8:], ["--env", "ENABLE_TOOL_SEARCH=true", "--env", "HERDR_AGENT_PANE=1", "--no-focus"])
         started = self.started()
         self.assertEqual(started[started.index("--") + 1:], ["--model", "opus", "--effort", "high",
             "--remote-control", "kid", "-n", "kid", "--settings", '{"disableAgentView": true}'])
@@ -549,7 +549,7 @@ class AddShowrunnerTests(unittest.TestCase):
         self.starts("kid-session", registers="kid")
         result = self.run_command("kid")
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(self.opened()[8:], ["--env", "ENABLE_TOOL_SEARCH=true", "--no-focus"])
+        self.assertEqual(self.opened()[8:], ["--env", "ENABLE_TOOL_SEARCH=true", "--env", "HERDR_AGENT_PANE=1", "--no-focus"])
         self.assertNotIn("caller-token", json.dumps(self.herdr_calls()))
         self.assertEqual(self.events("tmux"), [])
 
@@ -572,7 +572,7 @@ class AddShowrunnerTests(unittest.TestCase):
 
     def test_showrunner_start_failure_is_reported_without_attaching(self) -> None:
         self.herdr_overrides["--session kid workspace create --label kid --cwd "
-            + str(self.root / "kid-checkout") + " --env ENABLE_TOOL_SEARCH=true --no-focus"] = CommandResponse(
+            + str(self.root / "kid-checkout") + " --env ENABLE_TOOL_SEARCH=true --env HERDR_AGENT_PANE=1 --no-focus"] = CommandResponse(
                 code=1, stdout="", stderr="fixture could not open workspace")
         result = self.run_command("kid")
         self.assertEqual(result.returncode, 2, result.stdout + result.stderr)

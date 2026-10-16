@@ -30,7 +30,7 @@ import remove_workers
 import roster
 import unit_runs
 import herdr
-from fake_herdr import CommandResponse
+from fake_herdr import CommandResponse, herdr_listener
 import sessions
 import showrunners
 import unit_lookup
@@ -1127,6 +1127,8 @@ class RosterTests(unittest.TestCase):
         _ = (path / "cmdline").write_bytes("\0".join(argv).encode())
         _ = (path / "environ").write_bytes("\0".join(f"{key}={value}" for key, value in environment.items()).encode())
         (path / "cwd").symlink_to(self.home)
+        if argv[:2] == ["herdr", "--session"] and argv[3:] == ["server"]:
+            herdr_listener(path.parent, pid, argv[2], os.environ)
 
     def _herdr_sessions(self) -> dict[str, CommandResponse]:
         return {"--session default session list --json": {"code": 0, "stdout": json.dumps({

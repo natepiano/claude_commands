@@ -142,7 +142,7 @@ def launch(child: Production, model: str, effort: str, resume: str | None, cwd: 
     herdr.start_new_server(child.slug, 90_000)
     pane = herdr.open_pane(child.slug, child.slug, str(cwd), environment)
     herdr.start_agent(child.slug, pane, kind="claude", agent_arguments=arguments,
-                      opening_prompt=prompt, timeout_ms=90_000)
+                      opening=herdr.OpeningPrompt(prompt), timeout_ms=90_000)
 
 
 def showrunner_appeared(slug: str) -> bool:

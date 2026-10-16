@@ -489,10 +489,10 @@ class SessionRecordTests(ShutdownTestCase):
     def test_herdr_hosts_round_trip_for_owners_and_their_workers(self) -> None:
         saved = session_shutdown()
         owner = session()
-        owner["host"] = inventory.HerdrHost(kind="herdr", herdr_session="director", pane_id="w1:p1")
+        owner["host"] = inventory.HerdrHost(kind="herdr", herdr_session="director", pane_id="w1:p1", presentation="detached")
         saved["session"] = owner
         worker = owned_worker()
-        worker["host"] = inventory.HerdrHost(kind="herdr", herdr_session="director", pane_id="w1:p2")
+        worker["host"] = inventory.HerdrHost(kind="herdr", herdr_session="director", pane_id="w1:p2", presentation="detached")
         saved["workers"] = [worker]
         self.assertTrue(record.create_session(saved))
         self.assertEqual(record.find_session(saved["login"], "session-1"), saved)
@@ -658,6 +658,53 @@ class SessionRecordTests(ShutdownTestCase):
         record.clear_account_hold(hold["login"])
         self.assertIsNone(record.account_hold(hold["login"]))
 
+    def test_finishing_registration_cannot_release_a_replacement_requests_hold(self) -> None:
+        held = account_hold()
+        held["registration"] = "in progress"
+        held["request_id"] = "replacement"
+        record.set_account_hold(held)
+        record.complete_account_hold_registration(held["login"], "original")
+        record.clear_finished_account_hold(held["login"])
+        self.assertEqual(record.account_hold(held["login"]), held)
+        record.complete_account_hold_registration(held["login"], "replacement")
+        record.clear_finished_account_hold(held["login"])
+        self.assertIsNone(record.account_hold(held["login"]))
+
+    def test_hold_waits_for_every_registration_and_every_covered_requests_records(self) -> None:
+        first = account_hold()
+        second = account_hold()
+        second["request_id"] = "second"
+        record.register_account_hold_request(first, account_wide=True)
+        record.register_account_hold_request(second, account_wide=True)
+        record.complete_account_hold_registration(first["login"], first["request_id"])
+        record.clear_finished_account_hold(first["login"])
+        self.assertIsInstance(record.lookup_account_hold(first["login"]), record.AccountHeld)
+
+        saved = session_shutdown()
+        saved["request_id"] = second["request_id"]
+        self.assertTrue(record.create_session(saved))
+        record.complete_account_hold_registration(second["login"], second["request_id"])
+        record.clear_finished_account_hold(first["login"])
+        self.assertIsInstance(record.lookup_account_hold(first["login"]), record.AccountHeld)
+        record.archive_session(saved["login"], saved["session"]["session_id"])
+        record.clear_finished_account_hold(first["login"], request_ids=(second["request_id"],))
+        self.assertIsInstance(record.lookup_account_hold(first["login"]), record.AccountHeld)
+        record.clear_finished_account_hold(first["login"], request_ids=(first["request_id"],))
+        self.assertIsInstance(record.lookup_account_hold(first["login"]), record.AccountOpen)
+
+    def test_account_hold_registration_includes_requests_that_already_have_records(self) -> None:
+        saved = session_shutdown()
+        saved["request_id"] = "already-waiting"
+        self.assertTrue(record.create_session(saved))
+        held = account_hold()
+        record.register_account_hold_request(held, account_wide=True)
+        record.complete_account_hold_registration(held["login"], held["request_id"])
+        record.clear_finished_account_hold(held["login"])
+        self.assertIsInstance(record.lookup_account_hold(held["login"]), record.AccountHeld)
+        record.archive_session(saved["login"], saved["session"]["session_id"])
+        record.clear_finished_account_hold(held["login"])
+        self.assertIsInstance(record.lookup_account_hold(held["login"]), record.AccountOpen)
+
     def test_all_account_holds_include_explicit_and_empty_old_accounts_in_request_order(self) -> None:
         explicit = account_hold()
         explicit["label"] = "Alpha"
@@ -730,6 +777,10 @@ class SessionRecordTests(ShutdownTestCase):
         for field, value in (
             ("login", "../other"), ("requested_at", "not a time"),
             ("requested_by", {"kind": "unknown"}), ("then", "continue"),
+            ("registration", "unknown"), ("registration", {}),
+            ("request_ids", "not a list"), ("request_ids", []),
+            ("request_ids", ["unknown"]), ("registering_request_ids", ["unknown"]),
+            ("registering_request_ids", [1]),
         ):
             with self.subTest(field=field):
                 hold = cast(dict[str, object], cast(object, account_hold()))
