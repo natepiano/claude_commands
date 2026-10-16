@@ -167,7 +167,7 @@ Mapping (style-unit's choice, 2026-10-16): the proposal's Phases 1-3 are this pl
 
 **Ruled out:** tolerating a surface-less `candidates:` block on a classified rule.
 
-### Phase 4 — Coverage ledger: judgments, cells and the tier A lint record  · status: todo
+### Phase 4 — Coverage ledger: judgments, cells and the tier A lint record  · status: done
 **Depends on:** Phase 2, Phase 3
 
 #### Work Order
