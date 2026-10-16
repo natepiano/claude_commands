@@ -526,45 +526,31 @@ Moved to unit `herdr-panes-unit`, run in parallel with Phase 5; shipped as `docs
 
 ### Phase 18 — Crash recovery on the Mac  · status: done
 
-**Depends on:** Phase 17
+#### As-built
 
-**User sees:** before — after a Mac crash `agents restart` cannot bring sessions back, because every Mac recovery snapshot is partial, and a Codex session restored on the Mac tries to open its window the Linux way; after — Mac crash recovery works as on natedev: complete snapshots, sessions restored in herdr, Codex sessions in an attached Ghostty window.
-
-#### Work Order
-
-**Goal:** native Darwin recovery snapshots and Codex snapshot restore on the Mac (showrunner, 2026-10-16: the user wants the Mac to match natedev).
-
-**Spec:**
-
-1. `inventory.snapshot_inventory()` on Darwin reads no `/proc`: the boot identity from `sysctl kern.boottime` (or `kern.bootsessionuuid`), processes and environments through `herdr.py`'s `ps`/`lsof` paths, socket owners through `lsof`. A Mac snapshot of a healthy machine is complete; host loss is shown by a changed boot identity; anything it cannot read makes the snapshot partial and adds no entry for it. Tests fake `HERDR_PS`, `HERDR_LSOF` and the sysctl program.
-2. `restart._launch_codex_snapshot` on the Mac opens `Ghostty.app` attached to the restored herdr session, as `_herdr_window` does for Claude sessions; if the window fails to open, the session stays running and the line prints the attach command. Darwin argv and failure tests.
-3. The Mac starts background programs without launchd. `launchctl submit` records a job and never runs it on this Mac (measured 2026-10-16: no pid, no output, LastExitStatus 0), which hung the user's first Mac check and silently skipped the shutdown conductor and the Remote Control fixer. One shared helper, `scripts/lib/detached.py`, starts a program in its own session with stdin closed and output to a log, and returns only once the caller's readiness check passes while the child is still alive; a child that exits, fails to start, or is not ready in time fails in plain words, and a child that never became ready is stopped. The herdr server (ready: its session socket is held by our child; 10 s bound, the caller's timeout when smaller), the shutdown conductor and the Remote Control fixer (ready: their first sign of life; 15 s) all start through it on Darwin. Darwin stop is `herdr --session <name> server stop`. Linux `systemd-run` is unchanged. `herdr_sessions.py` exits 130 with one line on Ctrl-C and prints a start failure without a traceback (showrunner, 2026-10-16).
-4. The Mac process reader takes each executable from `ps -o comm=` (macOS prints `command=` unquoted, so `/Applications/Nix Apps/Ghostty.app/...` must not split at its space), and a process whose arguments macOS cannot read (`(codex)`) makes the snapshot partial and Codex liveness unknown, never absent.
+- `inventory.snapshot_inventory()` on Darwin reads no `/proc`: boot identity from `sysctl kern.boottime`, processes through `herdr.darwin_process_identity` (`ps`), socket owners through `herdr.darwin_open_files` (`lsof`). A healthy Mac yields a complete snapshot; host loss shows as a changed boot identity; anything unreadable makes the snapshot partial and adds no entry. Tests fake `HERDR_PS`, `HERDR_LSOF` and the sysctl program.
+- `restart._launch_codex_snapshot` on the Mac opens `Ghostty.app` attached to the restored herdr session, as `_herdr_window` does for Claude; if the window fails, the session stays running and the line prints the attach command.
+- `scripts/lib/detached.py` `start_detached` starts a program in its own session with stdin closed, takes `DiscardOutput | AppendLog` for output and `InheritEnvironment | ExplicitEnvironment` for the environment, and returns only once the caller's readiness probe passes while the child is alive. Exit, start failure or timeout raise `DetachedStartFailure` / `DetachedChildExited` in plain words, and a child that never became ready has its process group stopped. Per-launch logs go under `shutdown_state_root()/logs` and are never cleaned.
+- On Darwin the herdr server (ready: the session socket listener is our own child; 10 s, or the caller's smaller timeout), the shutdown conductor and the Remote Control fixer (ready: first stderr line; 15 s) start through `start_detached`; their readiness line prints only under a detached start. Darwin stop is `herdr --session <name> server stop`. Linux keeps `systemd-run`.
+- `herdr_sessions.py` exits 130 with one line on Ctrl-C and prints a start failure without a traceback.
 
 **Files:**
-- `scripts/shutdown/inventory.py` — Darwin snapshot.
-- `scripts/shutdown/test_inventory.py` — Darwin snapshot cases.
+- `scripts/lib/detached.py` — shared detached start; `scripts/lib/test_detached.py` — its tests.
+- `scripts/herdr/herdr.py` — Mac server start/stop and process reader (`darwin_process_identity`, `darwin_open_files`).
+- `scripts/herdr/herdr_sessions.py` — quiet Ctrl-C, traceback-free start failure.
+- `scripts/shutdown/inventory.py` — Darwin snapshot (`_snapshot_reads_tmux`, ps/lsof readers).
 - `scripts/shutdown/restart.py` — Codex restore window on the Mac.
-- `scripts/shutdown/test_restart.py` — that case.
-- `scripts/lib/detached.py` — the shared detached start (new).
-- `scripts/lib/test_detached.py` — its tests (new).
-- `scripts/herdr/herdr.py` — Mac server start, stop and process reader.
-- `scripts/herdr/test_herdr.py` — those cases.
-- `scripts/herdr/herdr_sessions.py` — quiet Ctrl-C and start failure.
-- `scripts/herdr/test_herdr_sessions.py` — those cases.
-- `scripts/shutdown/settle.py` — shutdown conductor start on the Mac.
-- `scripts/shutdown/test_settle.py` — that case.
-- `scripts/shutdown/remote_control.py` — Remote Control fixer start on the Mac.
-- `scripts/shutdown/test_remote_control.py` — that case.
+- `scripts/shutdown/settle.py`, `scripts/shutdown/remote_control.py` — Darwin detached starts.
 
-**Workers:** 3 writers.
-- `impl` — `inventory.py`, `test_inventory.py`.
-- `test` (opens as impl) — `restart.py`, `test_restart.py`; then `settle.py`, `remote_control.py` and their tests.
-- `fix2` — `detached.py`, `herdr.py`, `herdr_sessions.py` and their tests.
+**Binds later work:** tmux path removal in `inventory.py`, `settle.py` and `shutdown.py` keeps the Darwin snapshot branch and the detached start intact. Cross-machine sessions start a remote Mac server over ssh through `herdr_sessions.py start`, which uses the detached start. A Darwin test pins Darwin (`sys.platform`, `herdr._PLATFORM`) and passes on both machines.
 
-**Constraints from prior phases:** `herdr._PLATFORM` is fixed at import; Darwin fakes are `HERDR_PS` and `HERDR_LSOF` (Phase 18 removed the `LAUNCHCTL` server path); only the unit director runs the Mac suites and the live check. Phase 17 made both suites green on the Mac: a test that fakes `/proc` or systemd calls `test_support.linux_process_fixture` (pins `sys.platform` and `herdr._PLATFORM`), `ShutdownTestCase` pins the host name to `natedev`, and temp roots are `.resolve()`d because macOS `/tmp` is `/private/tmp`; a new Darwin test pins Darwin the same way and must pass on both machines.
+**Gotchas:**
+- `launchctl submit` runs nothing on this Mac: no pid, no output, LastExitStatus 0, even for `/bin/sh` (measured 2026-10-16).
+- macOS `ps -o command=` prints arguments unquoted, so `/Applications/Nix Apps/Ghostty.app/...` splits at its space; `comm=` is the executable. `(codex)` means macOS cannot read the arguments: the snapshot is partial and Codex liveness is unknown, never absent.
+- Mac start readiness is "the socket listener is our own child", not "a socket exists"; otherwise an exclusive start adopts a concurrent launch's server.
+- Readiness lines on stderr change CLI output that tests pin as one-error output.
 
-**Acceptance gate:** `merge_gate.py --tests-only` green on natedev; `scripts/herdr` and `scripts/shutdown` green on the Mac; `basedpyright scripts/lib scripts/herdr scripts/shutdown` clean; a herdr session starts over ssh on the Mac from the pushed branch and survives the ssh exit.
+**Ruled out:** launchd plist bootstrap and `launchctl submit` — launchd never spawns herdr on this Mac.
 
 ### Phase 19 — Mac suites green and restart focus  · status: done
 
@@ -623,6 +609,6 @@ Moved to unit `herdr-panes-unit`, run in parallel with Phase 5; shipped as `docs
 
 **Workers:** none until a live check finds a defect; then 1 writer, `test` (as impl), for the files that defect names.
 
-**Constraints from prior phases:** the Mac clone `~/scratch/herdr-mac` pulls the pushed branch; copying the worktree to the Mac is refused, so every Mac run is from a pushed commit. Throwaway sessions are picked with `--only <name> --here --no-alert`, and every herdr command names `--session`. `accounts.py exec --probe '<account>' -n <name>` launches only Claude, never inside herdr and never Codex; a herdr-hosted Claude probe on the Mac is `herdr_sessions.py start --name <probe> --cwd <a trusted folder>` from a Mac Ghostty window (ssh cannot open it), a Codex fixture is `codex` run by hand in a pane of that probe session, and cleanup is `herdr --session <probe> server stop` plus removing `~/.config/herdr/sessions/<probe>`. Mac background programs start through `scripts/lib/detached.py`, never launchd.
+**Constraints from prior phases:** the Mac clone `~/scratch/herdr-mac` pulls the pushed branch; copying the worktree to the Mac is refused, so every Mac run is from a pushed commit. Throwaway sessions are picked with `--only <name> --here --no-alert`, and every herdr command names `--session`. `accounts.py exec --probe '<account>' -n <name>` launches only Claude, never inside herdr and never Codex; a herdr-hosted Claude probe on the Mac is `herdr_sessions.py start --name <probe> --cwd <a trusted folder>` from a Mac Ghostty window (ssh cannot open it), a Codex fixture is `codex` run by hand in a pane of that probe session, and cleanup is `herdr --session <probe> server stop` plus removing `~/.config/herdr/sessions/<probe>`. Mac background programs start through `scripts/lib/detached.py`, never launchd. A restart that adopts a running herdr server focuses the restored workspace (`Herdr.focus_workspace`) and never closes the empty shell workspace herdr gives a still-attached window; a failed focus is one `restart issue` line. A detached conductor or fixer prints its readiness line only when `DETACHED_STARTUP_SIGNAL=1` is in its environment, and a failed start names its log under `shutdown_state_root()/logs`.
 
 **Acceptance gate:** both live checks pass on the Mac; if a check changed code, `merge_gate.py --tests-only` green on natedev, `basedpyright scripts/lib scripts/herdr scripts/shutdown` clean, and the Mac `scripts/herdr`, `scripts/shutdown` and `scripts/lib` suites green from the pushed commit.
