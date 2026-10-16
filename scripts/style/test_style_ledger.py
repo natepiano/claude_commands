@@ -90,7 +90,8 @@ class StyleLedgerTests(unittest.TestCase):
         return f"global:rust/{name}.md"
 
     def blob(self, rule_id: str) -> str:
-        return next(rule.blob for rule in rules.load_rules(self.repo) if rule.rule_id == rule_id)
+        parent_id = rule_id.removesuffix("#uncovered")
+        return next(rule.blob for rule in rules.load_rules(self.repo) if rule.rule_id == parent_id)
 
     def cli(self, *arguments: str, success: bool = True) -> subprocess.CompletedProcess[str]:
         result = subprocess.run(
@@ -148,7 +149,7 @@ class StyleLedgerTests(unittest.TestCase):
         self.assertEqual(self.cells(process), [])
         ledger = self.ledger()
         progress = {rule.rule_id: rule for rule in ledger.rules()}
-        self.assertFalse(progress[listed].done)
+        self.assertTrue(progress[listed].done)
         self.assertEqual(progress[listed].cells_total, 0)
         self.assertEqual(progress[file_rule].cells_total, 4)
         self.assertFalse(progress[file_rule].done)
@@ -159,6 +160,305 @@ class StyleLedgerTests(unittest.TestCase):
         self.assertIn(file_rule, status)
         self.assertIn(listed, status)
         self.assertNotIn("unclassified:", status)
+
+    def test_zero_site_partial_rule_requires_uncovered_cells_and_counts_only_its_parent(self) -> None:
+        rule_id = self.rule(
+            "partial", "tier: B\nfamily: names\ninput_scope: file\ncandidates:\n"
+            + "  kind: regex\n  pattern: absent_marker\n  surface: partial\n  uncovered: other sites\n",
+        )
+        uncovered = rule_id + "#uncovered"
+        self.set_tip(self.initial_tip)
+        ledger = self.ledger()
+
+        self.assertEqual(ledger.listed_sites(rule_id), ())
+        self.assertEqual(self.states(uncovered), dict.fromkeys(self.sources, "open"))
+        self.assertEqual({cell.rule for cell in ledger.cells()}, {uncovered})
+        self.assertEqual({cell.tier for cell in ledger.cells()}, {"C"})
+        self.assertEqual({cell.family for cell in ledger.cells()}, {"names"})
+        progress, = ledger.rules()
+        self.assertEqual((progress.rule_id, progress.cells_current, progress.cells_total, progress.done),
+                         (rule_id, 0, 4, False))
+
+        for path in self.sources:
+            self.record(uncovered, path, self.initial_tip)
+
+        progress, = ledger.rules()
+        self.assertEqual((progress.rule_id, progress.cells_current, progress.cells_total, progress.done),
+                         (rule_id, 4, 4, True))
+        row = next(line.split("\t") for line in self.cli("status").stdout.splitlines()
+                   if line.startswith(rule_id + "\t"))
+        self.assertEqual((row[1], row[-1]), ("4", "true"))
+        self.assertNotIn(uncovered + "\t", self.cli("status").stdout)
+
+    def test_partial_listed_rule_is_done_only_after_both_components_are_current(self) -> None:
+        rule_id = self.rule(
+            "partial", "tier: B\nfamily: types\ninput_scope: file\ncandidates:\n"
+            + "  kind: regex\n  pattern: value\n  surface: partial\n  uncovered: other sites\n",
+        )
+        uncovered = rule_id + "#uncovered"
+        self.set_tip(self.initial_tip)
+        for path in self.sources:
+            self.record(uncovered, path, self.initial_tip)
+        ledger = self.ledger()
+        progress, = ledger.rules()
+        self.assertEqual((progress.cells_current, progress.cells_total, progress.done), (4, 8, False))
+
+        for path in self.sources:
+            self.record(rule_id, path, self.initial_tip)
+
+        progress, = ledger.rules()
+        self.assertEqual((progress.rule_id, progress.cells_current, progress.cells_total, progress.done),
+                         (rule_id, 8, 8, True))
+        rule_path = self.rule_dir / "partial.md"
+        _ = rule_path.write_text(rule_path.read_text() + "Another requirement\n")
+        self.assertEqual({cell.state for cell in ledger.cells()}, {"stale"})
+
+    def test_partial_structure_rule_keeps_crate_cells_without_uncovered_pseudo_rule(self) -> None:
+        rule_id = self.rule(
+            "structure", "tier: D\nfamily: modules\ncandidates:\n  kind: regex\n"
+            + "  pattern: value\n  surface: partial\n  uncovered: crate structure\n",
+        )
+        self.set_tip(self.initial_tip)
+        ledger = self.ledger()
+
+        self.assertEqual({site.path for site in ledger.listed_sites(rule_id)}, set(self.sources))
+        self.assertEqual({(cell.rule, cell.path, cell.tier) for cell in ledger.cells()}, {
+            (rule_id, "crates/alpha", "D"), (rule_id, "crates/beta", "D"),
+        })
+        self.record(rule_id, "crates/alpha", self.initial_tip)
+        self.record(rule_id, "crates/beta", self.initial_tip)
+        progress, = ledger.rules()
+        self.assertEqual((progress.rule_id, progress.cells_current, progress.cells_total, progress.done),
+                         (rule_id, 2, 2, True))
+
+    def test_pre_filter_lists_matching_rust_lines_and_accepts_a_file_judgment(self) -> None:
+        rule_id = self.rule("words", "tier: B\nfamily: names\ninput_scope: file\npre_filter: '\\bbanned\\b'\n")
+        self.write(self.sources[0], "// banned name\npub fn banned() {}\n// unbanned\n")
+        tip = self.commit("Add forbidden word hits")
+        self.set_tip(tip)
+        ledger = self.ledger()
+
+        self.assertEqual([(site.rule, site.path, site.crate, site.line, site.text)
+                          for site in ledger.listed_sites(rule_id)], [
+            (rule_id, self.sources[0], "crates/alpha", 1, "// banned name"),
+            (rule_id, self.sources[0], "crates/alpha", 2, "pub fn banned() {}"),
+        ])
+        self.assertEqual(self.states(rule_id), {self.sources[0]: "open"})
+        self.record(rule_id, self.sources[0], tip)
+        self.assertEqual(self.states(rule_id), {self.sources[0]: "current"})
+        progress, = ledger.rules()
+        self.assertTrue(progress.done)
+
+    def test_shell_sites_are_rule_specific_file_cells_even_for_crate_scoped_rules(self) -> None:
+        rule_id = self.rule(
+            "nextest", "tier: B\nfamily: values\ninput_scope: crate\ncandidates:\n"
+            + "  kind: regex\n  pattern: cargo test\n  globs: ['*.sh']\n  surface: whole\n",
+        )
+        read_rule = self.rule("read")
+        script = "crates/alpha/check.sh"
+        self.write(script, "#!/bin/sh\ncargo test\ncargo test --workspace\n")
+        tip = self.commit("Add test script")
+        self.set_tip(tip)
+        ledger = self.ledger()
+
+        self.assertEqual([(site.path, site.crate, site.line) for site in ledger.listed_sites(rule_id)], [
+            (script, "crates/alpha", 2), (script, "crates/alpha", 3),
+        ])
+        self.assertEqual(self.states(rule_id), {script: "open"})
+        self.assertEqual(set(self.states(read_rule)), set(self.sources))
+        self.record(rule_id, script, tip)
+        self.assertEqual(self.states(rule_id), {script: "current"})
+
+        self.write(self.sources[0], "pub fn unrelated_change() {}\n")
+        self.set_tip(self.commit("Change source in script crate"))
+        self.assertEqual(self.states(rule_id), {script: "current"})
+        self.write(script, "#!/bin/sh\ncargo test --all-features\n")
+        self.set_tip(self.commit("Change listed script"))
+        self.assertEqual(self.states(rule_id), {script: "stale"})
+
+    def test_site_export_uses_synced_objects_and_excludes_untracked_vendor_and_ignored_paths(self) -> None:
+        rule_id = self.rule(
+            "scripts", "tier: B\nfamily: values\ncandidates:\n  kind: regex\n"
+            + "  pattern: cargo test\n  globs: ['*.sh']\n  surface: whole\n",
+        )
+        self.write("check.sh", "cargo test\n")
+        self.write("vendor/check.sh", "cargo test\n")
+        self.write("crates/alpha/vendor/check.sh", "cargo test\n")
+        self.write("ignored/check.sh", "cargo test\n")
+        self.write("rustfmt.toml", 'ignore = ["ignored"]\n')
+        tip = self.commit("Add tracked scripts and exclusions")
+        self.write("check.sh", "cargo nextest run\n")
+        self.write("untracked.sh", "cargo test\n")
+        self.set_tip(tip)
+
+        self.assertEqual([(site.path, site.line, site.text) for site in self.ledger().listed_sites(rule_id)],
+                         [("check.sh", 1, "cargo test")])
+        self.assertEqual(self.states(rule_id), {"check.sh": "open"})
+
+    def test_listed_sites_ignore_archive_attributes_and_preserve_committed_text(self) -> None:
+        listed = self.rule(
+            "attributes", "tier: B\nfamily: names\ninput_scope: file\ncandidates:\n"
+            + "  kind: regex\n  pattern: attribute_marker\n  surface: whole\n",
+        )
+        words = self.rule("words", "tier: B\nfamily: names\npre_filter: attribute_marker\n")
+        ignored, substituted = self.sources[:2]
+        ignored_text = "// attribute_marker in an export-ignored file"
+        substituted_text = "// attribute_marker $Format:%H$"
+        self.write(ignored, ignored_text + "\n")
+        self.write(substituted, substituted_text + "\n")
+        self.write(".gitattributes", f"{ignored} export-ignore\n{substituted} export-subst\n")
+        self.set_tip(self.commit("Add archive attributes to tracked sources"))
+
+        status = cast(LedgerStatus, json.loads(self.cli("status", "--json").stdout))
+
+        self.assertEqual({(cell["rule"], cell["path"], cell["state"]) for cell in status["cells"]}, {
+            (rule_id, path, "open") for rule_id in (listed, words) for path in (ignored, substituted)
+        })
+        ledger = self.ledger()
+        for rule_id in (listed, words):
+            with self.subTest(rule=rule_id):
+                self.assertEqual([(site.path, site.line, site.text) for site in ledger.listed_sites(rule_id)], [
+                    (ignored, 1, ignored_text), (substituted, 1, substituted_text),
+                ])
+
+    def test_member_listed_and_uncovered_components_stay_inside_member_reach(self) -> None:
+        local_dir = self.repo / "docs/alpha/style"
+        local_dir.mkdir(parents=True)
+        _ = (local_dir / "local.md").write_text(
+            "---\ntier: B\nfamily: names\ninput_scope: file\ncandidates:\n  kind: regex\n"
+            + "  pattern: value\n  surface: partial\n  uncovered: other names\n---\n# Local\n"
+        )
+        rule_id = "local:docs/alpha/style/local.md"
+        self.set_tip(self.initial_tip)
+        ledger = self.ledger()
+
+        self.assertEqual({site.path for site in ledger.listed_sites(rule_id)}, set(self.sources[:2]))
+        self.assertEqual({(cell.rule, cell.path) for cell in ledger.cells()}, {
+            (component, path) for component in (rule_id, rule_id + "#uncovered") for path in self.sources[:2]
+        })
+        self.assertEqual(ledger.listed_sites(rule_id, crate="crates/beta"), ())
+        for component in (rule_id, rule_id + "#uncovered"):
+            with self.subTest(component=component):
+                refusal = self.cli(
+                    "record", "--rule", component, "--path", self.sources[2], "--commit", self.initial_tip,
+                    "--rule-blob", self.blob(rule_id), "--verdict", "clean", "--ticket", "unit-1",
+                    "--worker", "test-worker", success=False,
+                )
+                self.assertEqual(refusal.returncode, 2)
+                self.assertIn(component, refusal.stderr)
+
+    def test_status_refreshes_changed_generator_at_the_same_tip(self) -> None:
+        rule_id = self.rule(
+            "listed", "tier: B\nfamily: names\ninput_scope: file\ncandidates:\n"
+            + "  kind: regex\n  pattern: first_marker\n  surface: whole\n",
+        )
+        self.write(self.sources[0], "pub fn first_marker() {}\n")
+        self.write(self.sources[2], "pub fn second_marker() {}\n")
+        tip = self.commit("Add distinct candidate markers")
+        self.set_tip(tip)
+        self.record(rule_id, self.sources[0], tip)
+        ledger = self.ledger()
+        self.assertEqual({site.path for site in ledger.listed_sites(rule_id)}, {self.sources[0]})
+        rule_path = self.rule_dir / "listed.md"
+        _ = rule_path.write_text(rule_path.read_text().replace("first_marker", "second_marker"))
+
+        status = cast(LedgerStatus, json.loads(self.cli("status", "--json").stdout))
+
+        self.assertEqual([(cell["rule"], cell["path"], cell["state"]) for cell in status["cells"]],
+                         [(rule_id, self.sources[2], "open")])
+        self.assertEqual({site.path for site in ledger.listed_sites(rule_id)}, {self.sources[2]})
+        self.assertEqual({cell.path for cell in ledger.cells()}, {self.sources[2]})
+
+    def test_same_tip_refresh_adds_newly_classified_rules_and_removes_legacy_sites(self) -> None:
+        rule_id = self.rule("legacy", "mechanism: llm\ncandidates:\n  kind: regex\n  pattern: value\n")
+        self.set_tip(self.initial_tip)
+        ledger = self.ledger()
+        self.assertEqual(ledger.listed_sites(rule_id), ())
+        self.assertEqual(list(ledger.cells()), [])
+        _ = self.rule(
+            "legacy", "tier: B\nfamily: names\ninput_scope: file\ncandidates:\n"
+            + "  kind: regex\n  pattern: value\n  surface: whole\n",
+        )
+
+        status = cast(LedgerStatus, json.loads(self.cli("status", "--json").stdout))
+
+        self.assertEqual({cell["path"] for cell in status["cells"]}, set(self.sources))
+        self.assertEqual(status["unclassified_rules"], [])
+        self.assertEqual({site.path for site in ledger.listed_sites(rule_id)}, set(self.sources))
+        _ = self.rule("legacy", "mechanism: llm\ncandidates:\n  kind: regex\n  pattern: value\n")
+        self.assertEqual(ledger.listed_sites(rule_id), ())
+        self.assertEqual(list(ledger.cells()), [])
+
+    def test_zero_site_markers_survive_repeated_reads_and_refresh_to_new_sites(self) -> None:
+        rule_id = self.rule(
+            "empty", "tier: B\nfamily: names\ncandidates:\n  kind: regex\n"
+            + "  pattern: absent_marker\n  surface: whole\n",
+        )
+        self.set_tip(self.initial_tip)
+        ledger = self.ledger()
+        for _ in range(2):
+            self.assertEqual(ledger.listed_sites(rule_id), ())
+            progress, = ledger.rules()
+            self.assertTrue(progress.done)
+        with closing(sqlite3.connect(ledger.database)) as connection:
+            markers = cast(list[tuple[str, str, str]], connection.execute(
+                "SELECT rule,rule_blob,tip FROM listed_rules",
+            ).fetchall())
+        self.assertEqual(markers, [(rule_id, self.blob(rule_id), self.initial_tip)])
+
+        rule_path = self.rule_dir / "empty.md"
+        _ = rule_path.write_text(rule_path.read_text().replace("absent_marker", "value"))
+
+        self.assertEqual({site.path for site in ledger.listed_sites(rule_id)}, set(self.sources))
+        progress, = ledger.rules()
+        self.assertFalse(progress.done)
+
+    def test_pre_filter_also_reads_non_rust_files_named_by_other_listed_rules(self) -> None:
+        _ = self.rule(
+            "scripts", "tier: B\nfamily: values\ncandidates:\n  kind: regex\n"
+            + "  pattern: cargo test\n  globs: ['*.sh']\n  surface: whole\n",
+        )
+        words = self.rule("words", "tier: B\nfamily: names\npre_filter: banned\n")
+        self.write("check.sh", "cargo test # banned\n")
+        self.write("unlisted.md", "banned\n")
+        self.set_tip(self.commit("Add non-Rust word hits"))
+
+        self.assertEqual([(site.path, site.line) for site in self.ledger().listed_sites(words)], [("check.sh", 1)])
+        self.assertEqual(self.states(words), {"check.sh": "open"})
+
+    def test_version_two_migration_preserves_judgments_and_fills_listed_sites(self) -> None:
+        read_rule = self.rule("read")
+        listed = self.rule(
+            "listed", "tier: B\nfamily: names\ninput_scope: file\ncandidates:\n"
+            + "  kind: regex\n  pattern: value\n  surface: whole\n",
+        )
+        state_file = self.root / "state/sample/ledger.sqlite"
+        state_file.parent.mkdir(parents=True)
+        with closing(sqlite3.connect(state_file)) as connection:
+            _ = connection.executescript(style_ledger.MIGRATIONS[1])
+            _ = connection.executescript(style_ledger.MIGRATIONS[2])
+            _ = connection.execute("CREATE TABLE schema_version (version INTEGER NOT NULL)")
+            _ = connection.execute("INSERT INTO schema_version VALUES (2)")
+            _ = connection.execute("INSERT INTO sync VALUES (1, ?, ?)", (self.initial_tip, "refs/heads/style/main"))
+            _ = connection.execute(
+                'INSERT INTO judgments(rule,rule_blob,input_scope,input_fingerprint,path,"commit",verdict,verdict_detail,ticket,worker,recorded_at) '
+                + 'VALUES (?,?,?,?,?,?,?,?,?,?,?)',
+                (read_rule, self.blob(read_rule), "file", self.git("rev-parse", f"{self.initial_tip}:{self.sources[0]}"),
+                 self.sources[0], self.initial_tip, "clean", "", "old-ticket", "worker", "2026-10-16T00:00:00+00:00"),
+            )
+            connection.commit()
+
+        ledger = self.ledger()
+
+        self.assertEqual({cell.path: cell.state for cell in ledger.cells(read_rule)}, {
+            self.sources[0]: "current", **dict.fromkeys(self.sources[1:], "open"),
+        })
+        self.assertEqual({site.path for site in ledger.listed_sites(listed)}, set(self.sources))
+        with closing(sqlite3.connect(state_file)) as connection:
+            versions = cast(list[tuple[int]], connection.execute("SELECT version FROM schema_version").fetchall())
+            sync = cast(list[tuple[str, str]], connection.execute("SELECT tip,style_branch FROM sync").fetchall())
+        self.assertEqual(versions, [(3,)])
+        self.assertEqual(sync, [(self.initial_tip, "refs/heads/style/main")])
 
     def test_file_judgment_becomes_stale_only_for_changed_committed_file(self) -> None:
         rule_id = self.rule("read")

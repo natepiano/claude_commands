@@ -197,7 +197,7 @@ Mapping (style-unit's choice, 2026-10-16): the proposal's Phases 1-3 are this pl
 
 **Ruled out:** inferring the style branch from ref names; per-site progress inside a listed file cell — tickets split at file boundaries instead.
 
-### Phase 5 — Listed-site coverage: listed sites, partial components and non-.rs cells  · status: todo
+### Phase 5 — Listed-site coverage: listed sites, partial components and non-.rs cells  · status: done
 **Depends on:** Phase 4
 
 #### Work Order

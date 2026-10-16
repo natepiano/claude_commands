@@ -8,11 +8,13 @@ import fnmatch
 import hashlib
 import json
 import os
+import re
 import sqlite3
 import subprocess
+import tempfile
 import tomllib
 from collections.abc import Iterator
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 from types import TracebackType
@@ -20,6 +22,7 @@ from typing import Literal, cast
 
 import rules as rule_catalog
 import style_rules
+from candidate_generators import enumerate_candidates
 from rules import Family, InputScope, MemberReach, Rule, Tier
 
 CellState = Literal["current", "stale", "open", "awaiting merge"]
@@ -39,6 +42,15 @@ class Cell:
     tier: Tier
     family: Family | None
     state: CellState
+
+
+@dataclass(frozen=True)
+class ListedSite:
+    rule: str
+    path: str
+    crate: str
+    line: int
+    text: str
 
 
 @dataclass(frozen=True)
@@ -144,6 +156,29 @@ def _tip(repo: Path, commit: str) -> RepositoryTip:
     return RepositoryTip(commit, tree, blobs, directories, files)
 
 
+def _export_blobs(repo: Path, tip: RepositoryTip, export: Path) -> None:
+    with tempfile.TemporaryFile() as contents:
+        result = subprocess.run(
+            ["git", "-C", str(repo), "cat-file", "--batch"],
+            input="".join(f"{blob}\n" for blob in tip.blobs.values()).encode(),
+            stdout=contents, stderr=subprocess.PIPE, check=False,
+        )
+        if result.returncode:
+            raise LedgerError(result.stderr.decode(errors="replace").strip() or "could not export synced blobs")
+        _ = contents.seek(0)
+        for path, blob in tip.blobs.items():
+            header = contents.readline().split()
+            if len(header) != 3 or header[:2] != [blob.encode(), b"blob"]:
+                raise LedgerError(f"{path}: invalid Git blob response")
+            size = int(header[2])
+            content = contents.read(size)
+            if len(content) != size or contents.read(1) != b"\n":
+                raise LedgerError(f"{path}: incomplete Git blob response")
+            destination = export / path
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            _ = destination.write_bytes(content)
+
+
 def _fingerprint(repo: Path, tip: RepositoryTip, scope: InputScope, path: str) -> str:
     if scope == "manifest":
         paths = {"Cargo.toml", *(str(PurePosixPath(directory) / "Cargo.toml") for directory in tip.crate_dirs)}
@@ -208,6 +243,18 @@ MIGRATIONS = {
     2: """
         ALTER TABLE judgments DROP COLUMN branch;
         ALTER TABLE sync ADD COLUMN style_branch TEXT NOT NULL DEFAULT '';
+    """,
+    3: """
+        CREATE TABLE listed_rules (
+            rule TEXT NOT NULL, rule_blob TEXT NOT NULL, tip TEXT NOT NULL,
+            PRIMARY KEY(rule, rule_blob, tip)
+        );
+        CREATE TABLE listed_sites (
+            rule TEXT NOT NULL, rule_blob TEXT NOT NULL, tip TEXT NOT NULL,
+            path TEXT NOT NULL, line INTEGER NOT NULL, text TEXT NOT NULL,
+            PRIMARY KEY(rule, rule_blob, tip, path, line, text),
+            FOREIGN KEY(rule, rule_blob, tip) REFERENCES listed_rules(rule, rule_blob, tip) ON DELETE CASCADE
+        );
     """,
 }
 
@@ -289,6 +336,87 @@ class Ledger:
                 "INSERT INTO sync(id,tip,style_branch) VALUES (1,?,?) ON CONFLICT(id) DO UPDATE SET tip=excluded.tip,style_branch=COALESCE(?,sync.style_branch)",
                 (commit, style_branch or "", style_branch),
             )
+            self._catalog = rule_catalog.load_rules(self.repo)
+            self._refresh_sites(self._tip(commit))
+
+    def _refresh_sites(self, tip: RepositoryTip) -> None:
+        definitions = [
+            rule for rule in self._catalog
+            if (rule.tier in ("B", "D") and rule.candidates is not None)
+            or (rule.tier == "B" and rule.pre_filter is not None)
+        ]
+        markers = cast(list[tuple[str, str]], self._connection.execute(
+            "SELECT rule,rule_blob FROM listed_rules WHERE tip=?", (tip.commit,),
+        ).fetchall())
+        if set(markers) == {(rule.rule_id, rule.blob) for rule in definitions}:
+            return
+
+        # Refresh together: pre-filter rules also see non-Rust files named by generators.
+        sites: set[ListedSite] = set()
+        with tempfile.TemporaryDirectory(prefix="style-listed-") as scratch:
+            root = Path(scratch)
+            export = root / "export"
+            export.mkdir()
+            _export_blobs(self.repo, tip, export)
+            ignored: list[str] = []
+            for config in (".claude/config/berth.toml", "rustfmt.toml", ".rustfmt.toml"):
+                if config in tip.blobs:
+                    ignored.extend(_ignored_paths(_table(tomllib.loads(_git(self.repo, "show", f"{tip.commit}:{config}")))))
+            for definition in definitions:
+                if definition.candidates is None:
+                    continue
+                try:
+                    enumeration = enumerate_candidates(definition.candidates, export)
+                except (SystemExit, re.error) as error:
+                    raise LedgerError(f"{definition.rule_id}: {error}") from error
+                for candidate in enumeration.candidates:
+                    path = self._path(candidate.file)
+                    if path not in tip.blobs or _is_ignored(path, tuple(ignored)):
+                        continue
+                    if isinstance(definition.reach, MemberReach) and not _under(path, definition.reach.crate_dir.as_posix()):
+                        continue
+                    sites.add(ListedSite(definition.rule_id, path, tip.crate(path), candidate.line, candidate.text))
+            universe = set(tip.rust_files) | {site.path for site in sites}
+            for definition in definitions:
+                if definition.candidates is not None or definition.pre_filter is None:
+                    continue
+                try:
+                    pattern = re.compile(definition.pre_filter)
+                except re.error as error:
+                    raise LedgerError(f"{definition.rule_id}: invalid pre_filter: {error}") from error
+                for path in sorted(universe):
+                    if isinstance(definition.reach, MemberReach) and not _under(path, definition.reach.crate_dir.as_posix()):
+                        continue
+                    for line, text in enumerate((export / path).read_text().splitlines(), 1):
+                        if pattern.search(text):
+                            sites.add(ListedSite(definition.rule_id, path, tip.crate(path), line, text))
+        blobs = {rule.rule_id: rule.blob for rule in definitions}
+        with self._connection:
+            _ = self._connection.execute("DELETE FROM listed_rules WHERE tip=?", (tip.commit,))
+            _ = self._connection.executemany(
+                "INSERT INTO listed_rules(rule,rule_blob,tip) VALUES (?,?,?)",
+                [(rule.rule_id, rule.blob, tip.commit) for rule in definitions],
+            )
+            _ = self._connection.executemany(
+                "INSERT INTO listed_sites(rule,rule_blob,tip,path,line,text) VALUES (?,?,?,?,?,?)",
+                [(site.rule, blobs[site.rule], tip.commit, site.path, site.line, site.text)
+                 for site in sorted(sites, key=lambda site: (site.rule, site.path, site.line, site.text))],
+            )
+
+    def _listed_sites(self, rule: str, tip: RepositoryTip) -> tuple[ListedSite, ...]:
+        rows = cast(list[tuple[str, int, str]], self._connection.execute(
+            "SELECT path,line,text FROM listed_sites WHERE rule=? AND tip=? ORDER BY path,line,text",
+            (rule, tip.commit),
+        ).fetchall())
+        return tuple(ListedSite(rule, path, tip.crate(path), line, text) for path, line, text in rows)
+
+    def listed_sites(self, rule: str, crate: str | None = None) -> tuple[ListedSite, ...]:
+        self._catalog = rule_catalog.load_rules(self.repo)
+        if not any(definition.rule_id == rule for definition in self._catalog):
+            raise LedgerError(f"unknown rule {rule}")
+        tip = self._synced_tip()
+        self._refresh_sites(tip)
+        return tuple(site for site in self._listed_sites(rule, tip) if crate is None or site.crate == crate)
 
     def unclassified_rules(self) -> tuple[str, ...]:
         self._catalog = rule_catalog.load_rules(self.repo)
@@ -302,6 +430,14 @@ class Ledger:
             raise LedgerError(f"unclassified rule {rule_id}")
         return rule
 
+    def _component_rule(self, rule_id: str) -> Rule:
+        definition = self._rule(rule_id.removesuffix("#uncovered"))
+        if rule_id.endswith("#uncovered"):
+            if definition.tier != "B" or definition.candidates is None or definition.candidates.surface != "partial":
+                raise LedgerError(f"unknown rule {rule_id}")
+            return replace(definition, rule_id=rule_id, tier="C")
+        return definition
+
     def _path(self, path: str) -> str:
         candidate = PurePosixPath(path)
         if candidate.is_absolute() or ".." in candidate.parts:
@@ -313,26 +449,40 @@ class Ledger:
         detail: str = "", ticket: str = "", worker: str = "",
     ) -> None:
         self._catalog = rule_catalog.load_rules(self.repo)
-        definition = self._rule(rule)
+        definition = self._component_rule(rule)
         path = self._path(path)
         if isinstance(definition.reach, MemberReach) and not _under(path, definition.reach.crate_dir.as_posix()):
             raise LedgerError(f"{rule}: {path} is outside rule reach")
-        if definition.tier in ("A", "B", "E"):
+        if definition.tier in ("A", "E"):
             raise LedgerError(f"{rule}: tier {definition.tier} has no judgment cells in this phase")
         tip = self._tip(commit)
-        if definition.tier == "D":
+        scope = definition.input_scope
+        if definition.tier == "B":
+            synced = self._synced_tip()
+            self._refresh_sites(synced)
+            if path not in {site.path for site in self._listed_sites(rule, synced)}:
+                raise LedgerError(f"{rule}: {path} holds no listed site at the synced tip")
+            if not path.endswith(".rs"):
+                scope = "file"
+            if path not in tip.blobs:
+                raise LedgerError(f"{rule}: {path} is not a file at {tip.commit}")
+        elif definition.tier == "D":
             crates = {tip.crate(file) for file in tip.rust_files}
+            if definition.candidates is not None:
+                synced = self._synced_tip()
+                self._refresh_sites(synced)
+                crates.update(site.crate for site in self._listed_sites(rule, synced))
             if path not in crates:
-                raise LedgerError(f"{rule}: {path} must name a crate with Rust files")
+                raise LedgerError(f"{rule}: {path} must name a crate with included files")
         elif path not in tip.rust_files:
             raise LedgerError(f"{rule}: {path} is not an included Rust file")
-        fingerprint = self._fingerprint(tip, definition.input_scope, path)
+        fingerprint = self._fingerprint(tip, scope, path)
         with self._connection:
             _ = self._connection.execute(
                 'INSERT INTO judgments(rule,rule_blob,input_scope,input_fingerprint,path,"commit",verdict,verdict_detail,ticket,worker,recorded_at) '
                 + 'VALUES (?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(rule,path,"commit",rule_blob,input_scope,input_fingerprint,ticket,worker) '
                 + 'DO UPDATE SET verdict=excluded.verdict,verdict_detail=excluded.verdict_detail,recorded_at=excluded.recorded_at',
-                (rule, rule_blob, definition.input_scope, fingerprint, path, tip.commit, verdict, detail, ticket, worker,
+                (rule, rule_blob, scope, fingerprint, path, tip.commit, verdict, detail, ticket, worker,
                  datetime.now(timezone.utc).isoformat()),
             )
 
@@ -402,36 +552,53 @@ class Ledger:
         self._catalog = rule_catalog.load_rules(self.repo)
         self._branch_tips.clear()
         tip = self._synced_tip()
+        self._refresh_sites(tip)
         lint_tools: dict[LintTool, LintCoverage] = {}
-        if rule_id is not None and not any(rule.rule_id == rule_id for rule in self._catalog):
-            raise LedgerError(f"unknown rule {rule_id}")
+        if rule_id is not None:
+            if rule_id.endswith("#uncovered"):
+                _ = self._component_rule(rule_id)
+            elif not any(rule.rule_id == rule_id for rule in self._catalog):
+                raise LedgerError(f"unknown rule {rule_id}")
         for definition in self._catalog:
-            if rule_id is not None and definition.rule_id != rule_id:
+            if rule_id is not None and definition.rule_id != rule_id.removesuffix("#uncovered"):
                 continue
-            if definition.tier in ("B", "E", "unclassified"):
+            if definition.tier in ("E", "unclassified"):
                 continue
             files = [path for path in tip.rust_files if not isinstance(definition.reach, MemberReach)
                      or _under(path, definition.reach.crate_dir.as_posix())]
-            paths = sorted({tip.crate(path) for path in files}) if definition.tier == "D" else files
+            sites = self._listed_sites(definition.rule_id, tip) if definition.tier in ("B", "D") else ()
+            if definition.tier == "B":
+                paths = sorted({site.path for site in sites})
+            elif definition.tier == "D":
+                paths = sorted({tip.crate(path) for path in files} | {site.crate for site in sites})
+            else:
+                paths = files
+            components = [(definition, paths)]
+            if definition.tier == "B" and definition.candidates is not None and definition.candidates.surface == "partial":
+                components.append((replace(definition, rule_id=definition.rule_id + "#uncovered", tier="C"), files))
             lint_coverage = LintCoverage(False, False, {}, {})
             if definition.tier == "A":
                 tool = cast(LintTool, style_rules.parse_frontmatter(definition.path)["mechanism"][0])
                 if tool not in lint_tools:
                     lint_tools[tool] = self._lint_coverage(tool, tip)
                 lint_coverage = lint_tools[tool]
-            for path in paths:
-                cell_crate = path if definition.tier == "D" else tip.crate(path)
-                if crate is not None and cell_crate != crate:
+            for component, component_paths in components:
+                if rule_id is not None and rule_id.endswith("#uncovered") and component.rule_id != rule_id:
                     continue
-                if definition.tier == "A":
-                    state: CellState = "open"
-                    if lint_coverage.has_runs:
-                        state = "current" if (lint_coverage.passed and lint_coverage.diagnostics.get(path, 0) == 0
-                                              and lint_coverage.rule_blobs.get(definition.rule_id) == definition.blob) else "stale"
-                    verdict = ""
-                else:
-                    state, verdict = self._judgment_state(definition, path, tip)
-                yield Cell(definition.rule_id, path, cell_crate, definition.tier, definition.family, state), verdict
+                for path in component_paths:
+                    cell_crate = path if component.tier == "D" else tip.crate(path)
+                    if crate is not None and cell_crate != crate:
+                        continue
+                    if component.tier == "A":
+                        state: CellState = "open"
+                        if lint_coverage.has_runs:
+                            state = "current" if (lint_coverage.passed and lint_coverage.diagnostics.get(path, 0) == 0
+                                                  and lint_coverage.rule_blobs.get(component.rule_id) == component.blob) else "stale"
+                        verdict = ""
+                    else:
+                        judgment_rule = replace(component, input_scope="file") if component.tier == "B" and not path.endswith(".rs") else component
+                        state, verdict = self._judgment_state(judgment_rule, path, tip)
+                    yield Cell(component.rule_id, path, cell_crate, cast(Tier, component.tier), component.family, state), verdict
 
     def cells(self, rule: str | None = None, crate: str | None = None) -> Iterator[Cell]:
         for cell, _ in self._coverage(rule, crate):
@@ -442,10 +609,10 @@ class Ledger:
         for definition in self._catalog:
             if definition.tier == "unclassified":
                 continue
-            own = [cell for cell in cells if cell.rule == definition.rule_id]
+            own = [cell for cell in cells if cell.rule in (definition.rule_id, definition.rule_id + "#uncovered")]
             current = sum(cell.state == "current" for cell in own)
             yield RuleProgress(definition.rule_id, definition.tier, definition.family, current, len(own),
-                               definition.tier != "B" and current == len(own))
+                               current == len(own))
 
 
     def status(self, rule: str | None = None, crate: str | None = None, as_json: bool = False) -> None:
@@ -458,9 +625,9 @@ class Ledger:
                 print(f"unclassified: {len(unclassified)} rules — pull nate_style")
             print("rule\tcurrent\tstale\topen\tawaiting merge\theld\tdone")
             for progress in self.rules():
-                if rule and progress.rule_id != rule:
+                if rule and progress.rule_id != rule.removesuffix("#uncovered"):
                     continue
-                own = [(cell, verdict) for cell, verdict in coverage if cell.rule == progress.rule_id]
+                own = [(cell, verdict) for cell, verdict in coverage if cell.rule in (progress.rule_id, progress.rule_id + "#uncovered")]
                 counts = [str(sum(cell.state == state for cell, _ in own)) for state in ("current", "stale", "open", "awaiting merge")]
                 held = sum(cell.state == "current" and verdict == "held" for cell, verdict in own)
                 print("\t".join([progress.rule_id, *counts, str(held), str(progress.done).lower()]))
