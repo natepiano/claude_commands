@@ -1397,23 +1397,18 @@ After a worker launch's own turn has ended, a move to the selected seats home th
 
 **Depends on:** Phase 47
 
-#### Work Order
+#### As-built
 
-**Goal:** `scripts.accounts.test_accounts`, `test_role_map` and `test_cutover_home` pass on the Mac as they do on natedev; 32 tests fail there today (22 failures, 10 errors, the same on 36043d45).
-
-**Constraints from prior phases:** tests never touch live directories, never run ssh, and never read a real keychain, process or credential file. Since Phase 46 a scratch `HOME` holds its own role map on any machine. The production darwin branches (`_cutover_home_macos`, `_mac_oauth_account`, `_mac_process_arguments`, `MAC_HOME_LOGIN_STEP`, `account.mac_process_record`) are correct on the Mac and keep their own tests, which patch `sys.platform` to `"darwin"`.
-
-**Spec:** the cause is in the tests, not the code; production files do not change.
-1. `/tmp` is a symlink to `/private/tmp` on macOS, so a test that compares `path.resolve()` against a path built from the unresolved temporary directory fails (18 failures). Every test class resolves its temporary root once where it creates it (`Path(...TemporaryDirectory()).resolve()`, `test_accounts.py` module and class setups, `test_cutover_home.py` and `test_role_map.py` class setups), so every derived path is already resolved; no individual assertion changes.
-2. Tests that fake the Linux process and login reads (`/proc` environments, socketless Claude processes, `oauthAccount` in `~/.claude.json`) reach the darwin branch on the Mac and read the real process table or keychain (`cannot read process 321 arguments`, `cutover cannot establish the account identifier`; 10 errors, 3 failures). `HomeCutoverTests` pins `sys.platform` to `"linux"` in `setUp`, as the darwin classes pin `"darwin"`; a test inside it that needs darwin keeps patching it locally.
-3. `test_status_describes_accounts_without_creating_any` expects natedev's home step (`run accounts.py cutover-home`); pin `sys.platform` to `"linux"` for it, and assert the Mac's step (`MAC_HOME_LOGIN_STEP`) in a sibling case under `"darwin"`, so each platform's line is pinned on both machines.
-4. Any other test that depends on the machine it runs on gets the same treatment: pin the platform it fakes; never skip a test by platform.
+- `scripts.accounts.test_accounts`, `test_role_map` and `test_cutover_home` pass on the Mac as on natedev, 376 tests on both; production files are unchanged.
+- Every test class, and `test_accounts`' module setup, resolves its temporary root where it creates it (`Path(...TemporaryDirectory()).resolve()`), so every derived path is already resolved; the `MacHomeCutoverTests` interruption test resolves its per-subtest home and sets `HOME` from it.
+- `HomeCutoverTests.setUp` pins `sys.platform` to `"linux"`, matching its `/proc`, socketless-process and `~/.claude.json` login fakes; a darwin test inside it patches locally.
+- `test_status_describes_accounts_without_creating_any` runs under `"linux"` (`run accounts.py cutover-home`) and `test_mac_status_describes_accounts_without_creating_any` under `"darwin"` (`accounts.MAC_HOME_LOGIN_STEP`), both through `assert_status_describes_accounts_without_creating_any(home_step)`.
 
 **Files:**
-- `scripts/accounts/test_accounts.py`
-- `scripts/accounts/test_cutover_home.py`
-- `scripts/accounts/test_role_map.py`
+- `scripts/accounts/test_accounts.py` — resolved module and class roots; the per-platform status pair and its shared helper.
+- `scripts/accounts/test_cutover_home.py` — resolved class and subtest homes; the linux pin in `HomeCutoverTests`.
+- `scripts/accounts/test_role_map.py` — fixture root resolved before both scratch homes.
 
-**Workers:** one worker, `test`, owns all three files; nothing else changes.
+**Gotchas:** macOS `/tmp` links to `/private/tmp`, so a fixture compared against `resolve()` resolves its temporary root at creation; a symlinked `TMPDIR` on natedev reproduces it. A test that fakes one platform's process or login reads pins `sys.platform` to that platform; unpinned, the Mac takes the darwin branch and reads the real process table or keychain. Run the account suites on the Mac from a scratch copy of the tree with a scratch `HOME`.
 
-**Acceptance gate:** the three suites pass on natedev and on the Mac from a scratch copy of the tree with a scratch `HOME` (`python3 -m unittest scripts.accounts.test_accounts scripts.accounts.test_role_map scripts.accounts.test_cutover_home`), with the same test count on both; the merge gate is green.
+**Ruled out:** skipping a test by platform (each platform's case is pinned and runs on both machines).
