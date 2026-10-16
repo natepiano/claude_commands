@@ -121,6 +121,7 @@ class ShutdownServices(Protocol):
 
     def record_time(self) -> str: ...
     def local_machine(self) -> str: ...
+    def elapsed_text(self, seconds: int) -> str: ...
     def stopped_sessions_text(self, count: int) -> str: ...
     def shutdown_command(self, *arguments: str) -> str: ...
     def retire_command(self, login: str, session_id: str) -> list[str]: ...
@@ -587,7 +588,7 @@ def restart_note(
     record: SessionShutdown, restarted_at: str
 ) -> str:
     """Build the exact first prompt given to a resumed session."""
-    if "target" in record:
+    if "target" in record and record["requested_by"]["kind"] != "snapshot":
         note = account_move_note(record["session"], record["target"],
                                  record.get("source_label", record["label"]), record.get("why", ""))
         where = record["where"]
@@ -595,11 +596,27 @@ def restart_note(
             punctuation = "" if where["text"].endswith((".", "!", "?")) else "."
             note += f" Before it you wrote: {where['text']}{punctuation}"
         return note
-    opening = (
-        f"Restarted after /shutdown of {record['label']} "
-        f"(stopped {_user_time(record['requested_at'])}, "
-        f"restarted {_user_time(restarted_at)}). "
-    )
+    origin = record["requested_by"]
+    if origin["kind"] == "snapshot":
+        context = origin["recovery"]
+        if context["kind"] == "not recorded":
+            opening = (
+                "Restored after a crash (crash evidence and last-seen time were not recorded; "
+                f"restored {_user_time(restarted_at)}). "
+            )
+        else:
+            signal = "the machine rebooted" if context["kind"] == "reboot" else "its host was lost"
+            opening = (
+                f"Restored after a crash: {signal} "
+                f"(last seen {_user_time(context['last_seen'])}, "
+                f"restored {_user_time(restarted_at)}). "
+            )
+    else:
+        opening = (
+            f"Restarted after /shutdown of {record['label']} "
+            f"(stopped {_user_time(record['requested_at'])}, "
+            f"restarted {_user_time(restarted_at)}). "
+        )
     where = record["where"]
     if where["kind"] == "said":
         punctuation = "" if where["text"].endswith((".", "!", "?")) else "."
@@ -1177,8 +1194,9 @@ def _herdr_launch(
             raise OSError(f"{reason}. Run: {trust_command(Path(parts.cwd), account)}")
         if isinstance(destination, NewHerdrSession):
             herdr.start_new_server(name, 90_000)
+            server = herdr.ServerCreated()
         else:
-            herdr.start_server(name, 90_000)
+            server = herdr.start_server(name, 90_000)
         server_environment = herdr.server_environment(name)
         for variable in sorted(unset_variables):
             if variable in server_environment:
@@ -1203,8 +1221,13 @@ def _herdr_launch(
             else:
                 raise OSError(f"herdr {name}:{destination.pane_id}: pane runs {', '.join(activity.commands)}")
         pane = herdr.open_pane(name, name, parts.cwd, environment)
-        client.start_agent(session["name"], pane, kind="claude", agent_arguments=list(parts.claude_arguments),
-                           opening=herdr.OpeningPrompt(parts.opening_prompt), timeout_ms=90_000)
+        try:
+            client.start_agent(session["name"], pane, kind="claude", agent_arguments=list(parts.claude_arguments),
+                               opening=herdr.OpeningPrompt(parts.opening_prompt), timeout_ms=90_000)
+        except herdr.AgentExited:
+            if isinstance(server, herdr.ServerCreated):
+                herdr.stop_session(name)
+            raise
     except herdr.HerdrFailure as error:
         raise OSError(str(error)) from error
 
@@ -1270,7 +1293,7 @@ def _launch_session(
         return SessionLaunched()
 
     prompt = _showrunner_prompt(session) if session["kind"] == "showrunner" else note
-    if session["kind"] == "showrunner" and "target" in record:
+    if session["kind"] == "showrunner" and ("target" in record or record["requested_by"]["kind"] == "snapshot"):
         prompt += " " + note
     parts = _resume_parts(session, prompt, record.get("target", ""), login=record["login"],
                           at=record["requested_at"], probe=record.get("probe", False))
@@ -1885,7 +1908,7 @@ def confirm_entry(
         return
     if not _prove_move(record):
         return
-    if record["session"]["kind"] == "showrunner":
+    if record["session"]["kind"] == "showrunner" and record["requested_by"]["kind"] != "snapshot":
         note = restart_note(record, restarted_at)
         if not _restart_note_delivered(record, note, dry_run=False):
             return
@@ -2099,9 +2122,8 @@ def _acknowledge_restored_snapshots(identity: str) -> None:
 
 def snapshot_source(last_seen: str) -> str:
     taken = datetime.fromisoformat(last_seen)
-    age = max(0, int((datetime.now(timezone.utc) - taken).total_seconds()))
-    elapsed = f"{age}s" if age < 60 else f"{age // 60}m" if age < 3600 else f"{age // 3600}h"
-    return "from snapshot taken " + taken.astimezone(user_zone()).strftime("%Y-%m-%d %H:%M:%S %Z") + f" ({elapsed} ago)"
+    age = int((datetime.now(timezone.utc) - taken).total_seconds())
+    return "from snapshot taken " + taken.astimezone(user_zone()).strftime("%Y-%m-%d %H:%M:%S %Z") + f" ({settle.elapsed_text(age)} ago)"
 
 
 @dataclass(frozen=True)
@@ -2235,6 +2257,8 @@ class CrashNotChecked:
 class CrashConfirmed:
     """A recorded or current boot/host observation proves a crash signal."""
 
+    signal: Literal["reboot", "host gone"]
+
 
 @dataclass(frozen=True)
 class NoCrashSignal:
@@ -2252,7 +2276,7 @@ class RecoveryCrashCheck:
 
     def check(self, snapshot: RecoverySnapshot, entry: SnapshotSession) -> CrashConfirmed | NoCrashSignal | CrashEvidenceUnreadable:
         if "crash" in entry:
-            return CrashConfirmed()
+            return CrashConfirmed(entry["crash"])
         if isinstance(self.observation, CrashNotChecked):
             self.observation = inventory_work.snapshot_inventory()
         observed = self.observation
@@ -2261,9 +2285,9 @@ class RecoveryCrashCheck:
         previous_boot = entry.get("boot_id", snapshot.get("boot_id", ""))
         if (isinstance(observed.boot, inventory_work.KnownBoot) and previous_boot
                 and previous_boot != observed.boot.boot_id):
-            return CrashConfirmed()
+            return CrashConfirmed("reboot")
         if (snapshot["login"], entry["session"]["session_id"]) in observed.gone_hosts:
-            return CrashConfirmed()
+            return CrashConfirmed("host gone")
         return NoCrashSignal()
 
 
@@ -2336,8 +2360,9 @@ def _up(login: str, dry_run: bool, only: Iterable[str] = ()) -> MachineRestartRe
             if isinstance(evidence, NoCrashSignal):
                 print(f"{name}: no crash signal; skipped")
                 continue
-            saved = (recovery_store.snapshot_restore_record(snapshot, entry) if dry_run
-                     else materialize_snapshot(snapshot, entry))
+            verified_entry: recovery_store.SnapshotClaudeSession = {**entry, "crash": evidence.signal}
+            saved = (recovery_store.snapshot_restore_record(snapshot, verified_entry) if dry_run
+                     else materialize_snapshot(snapshot, verified_entry))
             saved = _restore_target(saved, decision, dry_run=dry_run)
             all_records.append(saved)
             recorded_ids.add(identity)

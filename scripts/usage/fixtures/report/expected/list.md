@@ -8,3 +8,6 @@ compaction_reread_share — Share of weighted tokens spent on the first request 
 weighted_per_finding_closed — Weighted tokens per accepted finding
 weighted_per_review_round — Weighted tokens per review pass
 account_switches — Account switches
+wait_share — Share of weighted tokens spent on requests that only waited
+status_share — Share of weighted tokens spent on requests that only posted a status
+context_share — Cache reads at their weight as a share of weighted tokens

@@ -2192,7 +2192,7 @@ class CodexZeroEpisodeTests(unittest.TestCase):
         with quota_alert.state_file() as state:
             self.assertEqual(state.get("codex_zero", {}), {})
 
-    def test_zero_opening_names_unlimited_or_unknown_balance_truthfully(self) -> None:
+    def test_zero_opening_names_unlimited_or_unknown_balance(self) -> None:
         for balance in ("unlimited", None):
             with self.subTest(balance=balance):
                 quota_alert.STATE.unlink(missing_ok=True)

@@ -22,6 +22,7 @@ from dataclasses import replace
 from pathlib import Path
 from typing import Literal, TypedDict, cast, final, override
 from unittest.mock import patch
+from zoneinfo import ZoneInfo
 
 from test_support import registry_confirmation, ShutdownSendLeaf, ShutdownTestCase
 import inventory
@@ -1553,6 +1554,39 @@ class RestartTests(ShutdownTestCase):
         self.assertIn(["--session", "writing", "pane", "read", "w2:p1", "--source", "visible"], calls)
         self.assertFalse(any("send-keys" in row or "send-text" in row or "prompt" in row for row in calls))
 
+    def test_herdr_restart_cleans_up_only_a_created_server_after_confirmed_agent_exit(self) -> None:
+        owner, _, log = self.herdr_restart_fixture()
+        destinations: tuple[tuple[restart.HerdrDestination, herdr.ServerCreated | herdr.ServerAdopted], ...] = (
+            (restart.RecordedHerdrPane("writing", "w1:p1"), herdr.ServerCreated()),
+            (restart.RecordedHerdrPane("writing", "w1:p1"), herdr.ServerAdopted()),
+            (restart.NewHerdrSession("writing"), herdr.ServerCreated()),
+        )
+        for destination, outcome in destinations:
+            with (self.subTest(destination=destination, outcome=outcome),
+                  patch.object(herdr, "start_server", return_value=outcome),
+                  patch.object(herdr, "start_new_server", return_value=None),
+                  patch.object(herdr.Herdr, "start_agent", side_effect=herdr.AgentExited("writing", "w2:p1")),
+                  patch.object(herdr, "stop_session") as stop,
+                  self.assertRaisesRegex(OSError, "agent process exited before startup completed")):
+                restart._herdr_launch(restart._resume_parts(owner, "restart"), destination, owner, dry_run=False)  # pyright: ignore[reportPrivateUsage]
+            if isinstance(outcome, herdr.ServerCreated):
+                stop.assert_called_once_with("writing")
+            else:
+                stop.assert_not_called()
+        self.assertFalse(any(row[2:4] == ["agent", "prompt"] for row in self.herdr_calls(log)))
+
+    def test_herdr_restart_keeps_its_created_server_when_the_agent_requires_input(self) -> None:
+        owner, responses, log = self.herdr_restart_fixture()
+        self.write_herdr_responses(responses, [], not_ready=True)
+        with (patch.object(herdr, "start_server", return_value=herdr.ServerCreated()),
+              patch.object(herdr, "stop_session") as stop,
+              self.assertRaisesRegex(OSError, "Do you trust this folder")):
+            restart._herdr_launch(restart._resume_parts(owner, "restart"),  # pyright: ignore[reportPrivateUsage]
+                restart.RecordedHerdrPane("writing", "w1:p1"), owner, dry_run=False)
+        stop.assert_not_called()
+        self.assertFalse(any("send-keys" in row or "send-text" in row or "prompt" in row
+                             for row in self.herdr_calls(log)))
+
     def test_herdr_new_session_starts_server_pane_and_agent(self) -> None:
         owner, responses, log = self.herdr_restart_fixture()
         replies = cast(dict[str, object], json.loads(responses.read_text()))
@@ -3074,7 +3108,7 @@ class RestartTests(ShutdownTestCase):
 
     def test_snapshot_retry_allows_a_reused_pid_even_when_signalling_it_would_be_denied(self) -> None:
         saved = entry(top_level("reused", host=tmux_host("reused")))
-        saved["requested_by"] = record.FromSnapshot(kind="snapshot", taken_at=STOPPED)
+        saved["requested_by"] = record.FromSnapshot(kind="snapshot", taken_at=STOPPED, recovery=record.RecoveryEvidenceNotRecorded(kind="not recorded"))
         with (patch.object(restart, "_session_liveness", return_value=restart.SessionNotLive()),
               patch.object(os, "kill", side_effect=PermissionError("different owner")),
               patch.object(sessions, "process_start", return_value="new-process-start"),
@@ -3089,7 +3123,7 @@ class RestartTests(ShutdownTestCase):
         owner = top_level("legacy-owner", host=tmux_host("legacy-owner"))
         owner["proc_start"] = ""
         saved = entry(owner)
-        saved["requested_by"] = record.FromSnapshot(kind="snapshot", taken_at=STOPPED)
+        saved["requested_by"] = record.FromSnapshot(kind="snapshot", taken_at=STOPPED, recovery=record.RecoveryEvidenceNotRecorded(kind="not recorded"))
         with (patch.object(restart, "_session_liveness", return_value=restart.SessionNotLive()),
               patch.object(os, "kill"), patch.object(sessions, "process_start", return_value="present"),
               patch.object(restart, "_live_session_ids", return_value=frozenset()),
@@ -3261,6 +3295,102 @@ class RestartTests(ShutdownTestCase):
         retained = record.read_snapshot(LOGIN)
         assert not isinstance(retained, record.NoRecoverySnapshot)
         self.assertEqual(retained["sessions"], [])
+
+    def test_snapshot_retry_uses_persisted_crash_context_without_the_snapshot(self) -> None:
+        snapshot = self.recovery([top_level("rebooted", host=tmux_host("rebooted")),
+                                  top_level("host-lost", host=tmux_host("host-lost"))])
+        snapshot["taken_at"] = RESTARTED
+        for item in snapshot["sessions"]:
+            del item["crash"]
+            item["boot_id"] = "previous-boot" if item["session"]["session_id"] == "rebooted" else "current-boot"
+        record.write_snapshot(snapshot)
+        observed = inventory.CompleteInventory("natedev", {}, {}, inventory.KnownBoot("current-boot"),
+            frozenset({(LOGIN, "host-lost")}))
+        prompts: dict[str, list[str]] = {}
+        def fail(current: SessionShutdown, note: str, _desktop: restart.DesktopLaunchState, *, dry_run: bool) -> restart.SessionLaunched:
+            self.assertFalse(dry_run)
+            prompts.setdefault(current["session"]["session_id"], []).append(note)
+            persisted = record.find_session(LOGIN, current["session"]["session_id"])
+            assert persisted is not None
+            self.assertEqual(persisted["requested_by"], current["requested_by"])
+            raise OSError("launcher unavailable")
+        with (patch.object(restart, "_retire"),
+              patch.object(restart, "_owner_liveness", return_value=restart.SessionNotLive()),
+              patch.object(restart, "_session_liveness", return_value=restart.SessionNotLive()),
+              patch.object(restart, "_live_session_ids", return_value=frozenset()),
+              patch.object(restart, "_launch_session", side_effect=fail),
+              patch.object(restore_permission, "launch_permission", return_value=restore_permission.AllowedByShutdownState()),
+              patch.object(restart, "user_zone", return_value=ZoneInfo("America/New_York")),
+              redirect_stdout(io.StringIO())):
+            with patch.object(inventory, "snapshot_inventory", return_value=observed) as observation:
+                self.assertEqual(restart.up(LOGIN), 1)
+            observation.assert_called_once()
+            for identity, signal in (("rebooted", "reboot"), ("host-lost", "host gone")):
+                saved = record.find_session(LOGIN, identity)
+                assert saved is not None
+                self.assertEqual(saved["requested_by"], {"kind": "snapshot", "taken_at": RESTARTED,
+                    "recovery": {"kind": signal, "last_seen": STOPPED}})
+                _ = record.acknowledge_snapshot(LOGIN, identity)
+            with patch.object(inventory, "snapshot_inventory", side_effect=AssertionError("retry read crash evidence again")):
+                self.assertEqual(restart.up(LOGIN), 1)
+        for identity, signal in (("rebooted", "the machine rebooted"), ("host-lost", "its host was lost")):
+            self.assertEqual(len(prompts[identity]), 2)
+            self.assertEqual(prompts[identity][0], prompts[identity][1])
+            note = prompts[identity][1]
+            self.assertIn("Restored after a crash: " + signal, note)
+            self.assertIn("last seen 2026-10-09 17:49 EDT", note)
+            self.assertNotIn("after /shutdown", note)
+            self.assertNotIn("stopped ", note)
+            self.assertIn("send.py pending", note)
+            self.assertIn("if you were waiting on the user, keep waiting", note)
+
+    def test_older_recovery_note_names_missing_evidence_without_inventing_a_stop_time(self) -> None:
+        wire = cast(dict[str, object], json.loads(json.dumps(entry(top_level("legacy-recovery")))))
+        wire["requested_by"] = {"kind": "snapshot", "taken_at": STOPPED}
+        saved = record.parse_session_records(json.dumps([wire]))[0]
+        note = restart.restart_note(saved, RESTARTED)
+        self.assertIn("Restored after a crash", note)
+        self.assertIn("crash evidence and last-seen time were not recorded", note)
+        self.assertNotIn("after /shutdown", note)
+        self.assertNotIn("stopped ", note)
+        self.assertIn("send.py pending", note)
+
+    def test_snapshot_showrunner_receives_crash_note_beside_its_resume_command(self) -> None:
+        snapshot = self.recovery([showrunner("crashed-runner", host=tmux_host("crashed-runner"))])
+        item = snapshot["sessions"][0]
+        assert item["agent"] == "claude"
+        saved = record.snapshot_restore_record(snapshot, item)
+        variants: tuple[SessionShutdown, ...] = (saved, {**saved, "target": "claude3"})
+        for current in variants:
+            self.configure_groups(showrunners=current.get("target", LABEL))
+            note = restart.restart_note(current, RESTARTED)
+            with self.subTest(target=current.get("target")), patch.object(restart, "_herdr_launch") as launch:
+                _ = restart._launch_session(current, note, self.desktop_state, dry_run=False)  # pyright: ignore[reportPrivateUsage]
+            prompt = cast(restart.ResumeParts, launch.call_args.args[0]).opening_prompt
+            self.assertTrue(prompt.startswith("/showrunner:produce "))
+            self.assertIn(" resume Restored after a crash: its host was lost", prompt)
+            self.assertEqual(prompt.count("send.py pending"), 1)
+            self.assertNotIn("after /shutdown", prompt)
+
+    def test_snapshot_showrunner_confirmation_succeeds_without_a_second_note_when_sender_fails(self) -> None:
+        snapshot = self.recovery([showrunner("crashed-runner", host=tmux_host("crashed-runner"))])
+        item = snapshot["sessions"][0]
+        assert item["agent"] == "claude"
+        saved = record.snapshot_restore_record(snapshot, item)
+        saved["timers"] = [TimerRestore(instance="timer", was_enabled=True,
+            footer=record.NoFooter(kind="no footer"))]
+        self.create([saved])
+        with (patch.object(restart, "_herdr_launch") as launch,
+              patch.object(restart, "_send_restart_note", side_effect=OSError("sender unavailable")) as sender,
+              patch.object(settle, "run_notifier") as timers,
+              redirect_stdout(io.StringIO())):
+            _ = restart._launch_session(saved, restart.restart_note(saved, RESTARTED),  # pyright: ignore[reportPrivateUsage]
+                self.desktop_state, dry_run=False)
+            restart.confirm_entry(saved, RESTARTED, True)
+        launch.assert_called_once()
+        sender.assert_not_called()
+        timers.assert_called_once_with("start", "timer")
+        self.assertEqual(self.stored_record()["progress"], {"kind": "restarted", "at": RESTARTED})
 
     def test_failed_snapshot_restart_keeps_materialized_request_and_snapshot_for_retry(self) -> None:
         original = self.recovery([top_level("crashed", host=tmux_host("crashed"))])
@@ -3577,7 +3707,7 @@ class RestartTests(ShutdownTestCase):
             TimerRestore(instance=name, was_enabled=True, footer=record.NoFooter(kind="no footer"))
             for name in ("done", "pending")
         ])
-        saved["requested_by"] = record.FromSnapshot(kind="snapshot", taken_at=STOPPED)
+        saved["requested_by"] = record.FromSnapshot(kind="snapshot", taken_at=STOPPED, recovery=record.RecoveryEvidenceNotRecorded(kind="not recorded"))
         self.create([saved])
         with (patch.object(restart, "_session_liveness", return_value=restart.SessionLive()),
               patch.object(settle, "run_notifier") as timers):

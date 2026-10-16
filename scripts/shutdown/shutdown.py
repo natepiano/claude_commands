@@ -123,8 +123,27 @@ class UnresolvedRecoverySession(TypedDict):
     last_seen: str
 
 
+class SnapshotOutcomeRecorded(TypedDict):
+    kind: Literal["recorded"]
+    last_success: recovery_store.LastSuccessfulSnapshot | recovery_store.NoSuccessfulSnapshotRecorded
+    latest: recovery_store.SnapshotTaken | recovery_store.SnapshotFailed
+
+
+class NoSnapshotOutcomeRecorded(TypedDict):
+    kind: Literal["no outcome recorded"]
+
+
+class SnapshotOutcomeUnreadable(TypedDict):
+    kind: Literal["unreadable"]
+    error: str
+
+
+SnapshotStatus = SnapshotOutcomeRecorded | NoSnapshotOutcomeRecorded | SnapshotOutcomeUnreadable
+
+
 class RecoveryStatusInventory(Inventory):
     recovery: list[UnresolvedRecoverySession]
+    snapshot: SnapshotStatus
 
 
 MachineStatusReport = Inventory | UnreachableMachine | UnavailableMachine
@@ -241,8 +260,7 @@ def _unavailable(machine: str, rc: int, reason: str) -> UnavailableMachine:
 def _status(selected: Account, here: bool, only: tuple[str, ...] = ()) -> list[MachineStatusReport]:
     local = inventory(selected.login, only=frozenset(only)) if only else inventory(selected.login)
     unresolved = _unresolved_snapshot_status(selected.login, only)
-    if unresolved:
-        local = RecoveryStatusInventory(**local, recovery=unresolved)
+    local = RecoveryStatusInventory(**local, recovery=unresolved, snapshot=_snapshot_status())
     reports: list[MachineStatusReport] = [local]
     if here:
         return reports
@@ -488,12 +506,52 @@ def resolve_sessions(login: str, items: Iterable[str], *, here: bool = False, re
 
 def _snapshot() -> int:
     observed = inventory_work.snapshot_inventory()
+    at = settle.record_time()
     if isinstance(observed, inventory_work.PartialInventory):
+        _record_snapshot_outcome(recovery_store.SnapshotFailed(kind="failed", at=at, reasons=list(observed.failures)))
         print("snapshot incomplete: " + "; ".join(observed.failures), file=sys.stderr)
         return 1
-    saved = recovery_store.merge_snapshots(observed, settle.record_time())
+    try:
+        saved = recovery_store.merge_snapshots(observed, at)
+    except (InvalidRecord, OSError) as error:
+        _record_snapshot_outcome(recovery_store.SnapshotFailed(kind="failed", at=at, reasons=[str(error)]))
+        raise
+    _record_snapshot_outcome(recovery_store.SnapshotTaken(kind="taken", at=at, accounts=len(saved)))
     print(f"recovery snapshot saved for {len(saved)} accounts")
     return 0
+
+
+def _record_snapshot_outcome(outcome: recovery_store.SnapshotTaken | recovery_store.SnapshotFailed) -> None:
+    try:
+        recovery_store.record_snapshot_attempt(outcome, settle.local_machine())
+    except (InvalidRecord, OSError) as error:
+        print(f"snapshot outcome not recorded: {error}", file=sys.stderr)
+
+
+def _snapshot_status() -> SnapshotStatus:
+    try:
+        attempts = recovery_store.read_snapshot_attempts()
+    except (InvalidRecord, OSError) as error:
+        return SnapshotOutcomeUnreadable(kind="unreadable", error=str(error))
+    if isinstance(attempts, recovery_store.NoSnapshotAttempt):
+        return NoSnapshotOutcomeRecorded(kind="no outcome recorded")
+    return SnapshotOutcomeRecorded(kind="recorded", last_success=attempts["last_success"], latest=attempts["latest"])
+
+
+def _snapshot_outcome_lines(status: SnapshotStatus) -> list[str]:
+    if status["kind"] == "unreadable":
+        return [f"  recovery snapshot: outcome unreadable: {status['error']}"]
+    lines = ["  recovery snapshot: no successful snapshot recorded"]
+    if status["kind"] == "recorded":
+        success = status["last_success"]
+        if success["kind"] == "taken":
+            elapsed = datetime.fromisoformat(settle.record_time()) - datetime.fromisoformat(success["at"])
+            age = settle.elapsed_text(int(elapsed.total_seconds()))
+            lines = [f"  recovery snapshot: last taken {_local_time(success['at'])} ({age} ago)"]
+        latest = status["latest"]
+        if latest["kind"] == "failed":
+            lines.append(f"  recovery snapshot failed {_local_time(latest['at'])}: {'; '.join(latest['reasons'])}")
+    return lines
 
 
 def _forget(text: str, account: str = "") -> int:
@@ -985,11 +1043,12 @@ def _all_accounts(options: CommandLine) -> int:
                 status = max(status, restart_work.up(account.login, options.dry_run, ids))
             elif options.command == "status" and not options.as_json:
                 print(f"{account.label} · {account.login}")
+                print("\n".join(_snapshot_outcome_lines(_snapshot_status())))
                 print("\n".join(_unresolved_snapshot_lines(account.login, ids)))
             elif options.command == "status":
                 reports.append(RecoveryStatusInventory(machine=settle.local_machine(), login=account.login,
                     label=account.label, sessions=[], unattributed=[],
-                    recovery=_unresolved_snapshot_status(account.login, ids)))
+                    recovery=_unresolved_snapshot_status(account.login, ids), snapshot=_snapshot_status()))
             continue
         if options.command == "status" and options.as_json:
             try:
@@ -1200,8 +1259,11 @@ def _dispatch(options: CommandLine) -> int:
                     record_lines.extend(_status_actions(outcome["records"], ownership))
                 if record_lines:
                     print("\n".join(record_lines))
-            for line in _unresolved_snapshot_lines(selected.login, status_ids):
-                print(line)
+                if index == 0:
+                    for line in _snapshot_outcome_lines(_snapshot_status()):
+                        print(line)
+                    for line in _unresolved_snapshot_lines(selected.login, status_ids):
+                        print(line)
         return 0
     except SessionSelectionError as error:
         print(f"shutdown: {error}", file=sys.stderr)
