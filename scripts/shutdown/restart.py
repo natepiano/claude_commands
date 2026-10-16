@@ -121,6 +121,7 @@ class ShutdownServices(Protocol):
 
     def record_time(self) -> str: ...
     def local_machine(self) -> str: ...
+    def elapsed_text(self, seconds: int) -> str: ...
     def stopped_sessions_text(self, count: int) -> str: ...
     def shutdown_command(self, *arguments: str) -> str: ...
     def retire_command(self, login: str, session_id: str) -> list[str]: ...
@@ -2121,9 +2122,8 @@ def _acknowledge_restored_snapshots(identity: str) -> None:
 
 def snapshot_source(last_seen: str) -> str:
     taken = datetime.fromisoformat(last_seen)
-    age = max(0, int((datetime.now(timezone.utc) - taken).total_seconds()))
-    elapsed = f"{age}s" if age < 60 else f"{age // 60}m" if age < 3600 else f"{age // 3600}h"
-    return "from snapshot taken " + taken.astimezone(user_zone()).strftime("%Y-%m-%d %H:%M:%S %Z") + f" ({elapsed} ago)"
+    age = int((datetime.now(timezone.utc) - taken).total_seconds())
+    return "from snapshot taken " + taken.astimezone(user_zone()).strftime("%Y-%m-%d %H:%M:%S %Z") + f" ({settle.elapsed_text(age)} ago)"
 
 
 @dataclass(frozen=True)
