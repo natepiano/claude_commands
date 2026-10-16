@@ -26,11 +26,6 @@ from pathlib import Path
 from typing import Callable
 from typing import cast
 
-# A generator returning more candidates than this is a mis-tuned spec, not a
-# dirty project — refuse loudly instead of flooding the agent prompt.
-MAX_CANDIDATES = 150
-
-
 @dataclass(frozen=True)
 class Candidate:
     file: str  # path relative to the project root
@@ -1175,11 +1170,4 @@ def enumerate_candidates(spec: CandidatesSpec, project_root: Path) -> Enumeratio
         raise SystemExit(
             f"candidates kind '{spec.kind}' in {spec.origin} has no generator in candidate_generators.py"
         )
-    enumeration = generator(spec, project_root)
-    if len(enumeration.candidates) > MAX_CANDIDATES:
-        raise SystemExit(
-            f"candidates generator '{spec.kind}' for {spec.origin} produced"
-            + f" {len(enumeration.candidates)} candidates (cap {MAX_CANDIDATES});"
-            + " tune the spec's excludes before this unit can be evaluated"
-        )
-    return enumeration
+    return generator(spec, project_root)

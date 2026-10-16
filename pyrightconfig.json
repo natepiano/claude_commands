@@ -66,6 +66,15 @@
       "root": "scripts/fix",
       "extraPaths": [
         "scripts/fix",
+        "scripts/style",
+        "scripts/lib"
+      ]
+    },
+    {
+      "root": "scripts/style",
+      "extraPaths": [
+        ".",
+        "scripts/style",
         "scripts/lib"
       ]
     },
