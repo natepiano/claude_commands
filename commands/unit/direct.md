@@ -868,10 +868,13 @@ yourself. Either way, report what was decided in one line.
 An answer is `cargo-berth claim <paths> --reservation <id> --<choice> <holder>
 --overlap-why "<why>"`, `<choice>` one of `before`, `after`, `defer`,
 `override`, and `<id>` the asking phase's recorded reservation; it records in
-one step and exits 0. Until the installed engine takes `--reservation` on
-`claim`, leave it out with one phase open; with two, send the overlap and hold
-that phase's dispatch. If another holder also conflicts, it is refused and
-records nothing: split the claim so each call meets one holder.
+one step and exits 0. `before` and `after` widen only that phase's reservation,
+with the ordering edge; `defer` records the answer and takes no paths, so the
+phase holds its dispatch on them. An id the ledger does not know is refused.
+A `duplicate_ordering_edge` refusal (exit 2) means that edge is already
+recorded: the answer stands, so do not repeat it. If another holder also
+conflicts, it is refused and records nothing: split the claim so each call
+meets one holder.
 
 Every cargo-berth call is one plain command run in `${WORKING_DIR}`: no pipe,
 loop, `;`, `&&`, `$(...)`, redirect or env-var prefix. cargo-berth reads
