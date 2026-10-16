@@ -161,7 +161,7 @@ that production. Read `~/.claude/docs/production_format.md` → <ProductionUnit/
 in full at <PrepareSession/> and after every compaction, and apply it
 throughout. It changes six things in this command:
 - it adds one commit kind to <CoreContract/>: merging the production's merge
-  branch into this branch;
+  branch into this branch, at every phase start and when asked;
 - it replaces <PeriodicCI/> and <CICleanup/>, because the showrunner runs CI;
 - it sends checkpoint and shrink notices at <PhaseEnd/>'s points;
 - it runs independent phases in parallel, mapped at plan start and at each

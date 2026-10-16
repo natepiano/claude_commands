@@ -290,9 +290,10 @@ A run that stopped, failed, or waits on a decision has no finish in its record, 
    Push only your own branch; <PushCheckpoint/> does it at each checkpoint.
    <PeriodicCI/> and <CICleanup/> do not run in a unit; the showrunner runs CI
    on the merge branch.
-5. **One more commit kind.** Besides checkpoints, a unit director may merge the
-   merge branch into the unit's branch, when a gate clears or the showrunner asks:
-   `git merge --no-ff -m "merge(<plan-slug>): <merge branch> at <short hash> — <reason>" <merge branch>`.
+5. **One more commit kind.** Besides checkpoints, a unit director merges the
+   merge branch into the unit's branch at the start of every phase, before
+   dispatch (user, 2026-10-16), and also when a gate clears or the showrunner asks:
+   `git fetch origin <merge branch> && git merge --no-ff -m "merge(<plan-slug>): <merge branch> at <short hash> — <reason>" origin/<merge branch>`.
    Resolve conflicts on your side, build and test, then continue.
 6. **Gates.** A phase with `**Blocked by:** G<k>` starts only once
    `git merge-base --is-ancestor <gating checkpoint> <merge branch>` succeeds.
