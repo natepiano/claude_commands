@@ -1437,6 +1437,35 @@ class MeshCommandTests(unittest.TestCase):
         self.assertEqual((code, errors), (0, ""))
         self.assert_instruction_resume(path)
 
+    def test_set_instructions_repoints_an_idle_reviewer_and_its_next_resume_sends_the_new_prompt(self) -> None:
+        old = self.standing_instructions()
+        self.seed_instruction_thread(old)
+        new = old.with_name("new-standing.md")
+        _ = new.write_text("new standing prompt\n", encoding="utf-8")
+
+        code, _output, errors = self.run_mesh(["set-instructions", "--to", "worker", "--instructions-file", str(new)])
+
+        self.assertEqual((code, errors), (0, ""))
+        self.assertEqual(self.worker_record()["thread_id"], THREAD_ID)
+        self.assertEqual(self.worker_record().get("instructions_file"), str(new))
+        self.server.requests.clear()
+        code, _output, errors = self.run_mesh(["reset", "--to", "worker"])
+        self.assertEqual((code, errors), (0, ""))
+        self.assert_instruction_resume(new)
+
+    def test_set_instructions_refuses_a_busy_reviewer_and_a_missing_file(self) -> None:
+        old = self.standing_instructions()
+        self.seed_instruction_thread(old)
+        code, _output, errors = self.run_mesh(["set-instructions", "--to", "worker", "--instructions-file",
+                                               str(old.with_name("absent.md"))])
+        self.assertEqual(code, 1)
+        self.assertIn("no instructions file", errors)
+        record = self.worker_record()
+        self.write_pool_roster({"worker": {**record, "status": "running"}})
+        code, _output, errors = self.run_mesh(["set-instructions", "--to", "worker", "--instructions-file", str(old)])
+        self.assertEqual(code, 2)
+        self.assertIn("instructions unchanged", errors)
+
     def test_follow_completion_keeps_the_standing_instructions_path(self) -> None:
         path = self.standing_instructions()
         self.seed_instruction_thread(path)

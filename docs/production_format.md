@@ -145,7 +145,13 @@ the current slug.
 A retired unit keeps its row. Its Plan cell begins with `retired`, alone or inside
 an opening parenthesis, as in `(retired by the user 2026-10-07, worktree removed)`.
 The status script, the dailies, the waits and the stall watch then skip it. The word
-anywhere else in the cell changes nothing.
+anywhere else in the cell changes nothing. With a **Review pool** line, the
+showrunner first runs
+`~/.claude/scripts/lib/py ~/.claude/scripts/delegate/review_pool.py retire --production <slug> --unit <unit>`,
+which ends the unit's reviewers and prints their names. One still reviewing is
+named on stderr and left in place; run `retire` again once its review ends. A
+unit's plan run ending retires nothing, because the unit's next plan keeps
+the same reviewer.
 
 ## Hub files
 
@@ -399,14 +405,13 @@ A run that stopped, failed, or waits on a decision has no finish in its record, 
     and the shots are no worse than the merge branch. A fix the showrunner asks
     for comes after that checkpoint, unless the waiting unit needs it. This is
     packaging under `<DecisionEconomy/>`; state it in one line.
-16. **Review pool.** With a `**Review pool:**` line in the production doc, at
-    each phase's start run
-    `~/.claude/scripts/lib/py ~/.claude/scripts/delegate/review_pool.py arm --production <slug> --unit <unit> --phase <phase>`.
-    On `pool`, send that phase's code reviews through
+16. **Review pool.** With a `**Review pool:**` line in the production doc, send
+    every code review through
     `review.sh --pool code --lease <slug>/<unit>/<phase>` with the usual
-    positional arguments. On `own`, export
-    `REVIEW_LEASE=<slug>/<unit>/<phase>` and review as today. `<slug>` is the
-    production doc's file name without `-production.md`.
+    positional arguments. The unit's reviewer is permanent: each review
+    resumes its thread, and the pool forks a second one only while two reviews
+    run at once. `<slug>` is the production doc's file name without
+    `-production.md`.
 
 17. **Proposals.** A finished proposal you write is a hanadocs issue, filed
     through `/issue` with tag `proposal`, `proposed_by` your unit's name, and

@@ -111,8 +111,9 @@ Run `~/.claude/scripts/lib/py ~/.claude/scripts/delegate/review_pool.py prime
 --production <slug> --type <type> --instructions-file <absolute standing file>`.
 It prints the prompt hash. Never edit or remove the copies under `prime/`.
 A turn record's `prime_hash` names the memory the reviewer received; keep no
-separate version count. A changed prompt starts a new template; leased
-reviewers keep their earlier prompt through closure and retire at lease end.
+separate version count. A changed prompt starts a new template and points
+every idle reviewer at it, so each one's next turn carries it; a reviewer busy
+at prime time gets it at its next allocation.
 </PrimeReviewMemory>
 
 <ReviewMemory>
@@ -146,8 +147,8 @@ fits.
 Store rules and defect classes, never diffs, code, shots or complete review
 output.
 After each repository section changes, apply <PrimeReviewMemory/> for that
-type. The launcher sends the unit file at lease ordinal 1 for `code` and on
-every `ui` turn, through
+type. The launcher sends the unit file on a reviewer's first turn, for both
+types, through
 `~/.claude/scripts/lib/py ~/.claude/scripts/delegate/review_pool.py unit-memory
 --production <slug> --unit <unit>`; that prints the file, or nothing when absent.
 </ReviewMemory>
