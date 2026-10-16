@@ -43,8 +43,23 @@ def main(arguments: list[str]) -> int:
     if not path.exists():
         print("no server running on /tmp/fake", file=sys.stderr)
         return 1
+    if ";" in arguments:
+        # tmux runs `a ; b` in order and stops at the first command that fails.
+        segments: list[list[str]] = [[]]
+        for argument in arguments:
+            if argument == ";":
+                segments.append([])
+            else:
+                segments[-1].append(argument)
+        return next((code for segment in segments if (code := main(segment)) != 0), 0)
     sessions = read(path)
     match arguments:
+        case ["display-message", "-p", "-t", target, message]:
+            if _find(sessions, target) is None:
+                print(f"can't find session: {target}", file=sys.stderr)
+                return 1
+            print(message)
+            return 0
         case ["list-panes", "-a", "-F", _]:
             for key, session in sessions.items():
                 for pane in session["panes"]:

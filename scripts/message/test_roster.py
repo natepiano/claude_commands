@@ -20,6 +20,7 @@ from typing import TYPE_CHECKING, cast, override
 from unittest import mock
 
 SCRIPTS = Path(__file__).parents[1]
+sys.path.insert(0, str(Path(__file__).parent))
 sys.path.insert(0, str(SCRIPTS / "production"))
 sys.path.insert(0, str(SCRIPTS / "delegate"))
 
@@ -27,15 +28,17 @@ import codex_daemon
 import process_table
 import remove_workers
 import roster
+import unit_runs
 import herdr
-from fake_herdr import CommandResponse
+from fake_herdr import CommandResponse, herdr_listener
 import sessions
 import showrunners
 import unit_lookup
 if TYPE_CHECKING:
-    from ..whoami import account
+    from ..whoami import account, agent_accounts
 else:
     account = roster.account
+    agent_accounts = roster.agent_accounts
 
 
 ENTRY_FIELDS = {
@@ -165,6 +168,7 @@ class RosterTests(unittest.TestCase):
         pid: int | None = None,
         with_socket: bool = True,
         proc_start: str = "",
+        entrypoint: str = "cli",
     ) -> None:
         socket_path = self.sessions / f"{file_name}.sock"
         if with_socket:
@@ -186,6 +190,7 @@ class RosterTests(unittest.TestCase):
             "tmux": tmux,
             "cwd": str(cwd),
             "status": status,
+            "entrypoint": entrypoint,
         }), encoding="utf-8")
 
     def _write_showrunner_timer(self) -> None:
@@ -480,7 +485,7 @@ class RosterTests(unittest.TestCase):
         self.assertNotIn("contract reviewer", entries)
         self.assertEqual(entries["orphan-impl"].director, roster.NoDirector())
         self.assertNotIn("alpha-ended", entries)
-        self.assertNotIn("dead-impl", entries)
+        self.assertIn("dead-impl", entries)
         self.assertNotIn("stale-impl", entries)
 
         self.assertEqual(entries["Codex window"].role, "freestanding")
@@ -741,6 +746,32 @@ class RosterTests(unittest.TestCase):
         ]
         self.assertEqual(len(addresses), len(set(addresses)))
 
+    def test_a_run_under_the_former_folder_name_is_still_listed(self) -> None:
+        former = self.root / "former"
+        second_run = former / "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+        self._write_mesh(second_run, {
+            "alpha-impl": {
+                "thread_id": "thread-other-run", "turn_id": "turn-other-run",
+                "status": "running", "launcher_pid": os.getpid(), "role": "impl",
+            },
+        })
+        (second_run / "heartbeat.log").touch()
+        environment = {name: value for name, value in os.environ.items() if name != "ROSTER_DELEGATE_ROOT"}
+
+        with mock.patch.dict(os.environ, environment, clear=True), \
+                mock.patch.object(unit_runs, "RUN_ROOT", self.delegate), \
+                mock.patch.object(unit_runs, "FORMER_RUN_ROOT", former), \
+                mock.patch.object(codex_daemon, "loaded_sessions", return_value=[]):
+            found = roster.roster(os.environ, roster.ThisMachine())
+
+        self.assertEqual(
+            {entry.reach for entry in found.entries if entry.name == "alpha-impl"},
+            {
+                roster.Messageable("worker:director-run/alpha-impl"),
+                roster.Messageable("worker:aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee/alpha-impl"),
+            },
+        )
+
     def test_newer_dead_record_does_not_supply_live_session_details(self) -> None:
         dead_cwd = self.home / "projects" / "dead-resume"
         self._write_session(
@@ -751,6 +782,15 @@ class RosterTests(unittest.TestCase):
         self.assertEqual((entry.cwd, entry.status), (
             str(self.home / "projects" / "free"), "ready",
         ))
+
+    def test_a_relay_named_like_a_session_is_left_out_of_the_roster(self) -> None:
+        # send.py's relay is a newer `claude -p` run started with `-n free-claude`.
+        self._write_session("relay", "free-claude", "sid-relay", self.home / "projects" / "relay",
+                            status="relaying", updated=9, entrypoint="sdk-cli")
+        with mock.patch.object(codex_daemon, "loaded_sessions", return_value=self._daemon_sessions()):
+            found = roster.roster(os.environ, roster.ThisMachine())
+        named = [entry.session for entry in found.entries if entry.name == "free-claude"]
+        self.assertEqual(named, [roster.ClaudeSession("sid-free")])
 
     def test_socketless_record_with_another_process_start_is_absent_from_the_roster(self) -> None:
         self._write_session(
@@ -881,6 +921,78 @@ class RosterTests(unittest.TestCase):
             ),
         )
         self.assertNotIn("contract reviewer", entries)
+
+    def test_review_status_in_a_phase_directory_finds_its_reviewer(self) -> None:
+        phase = self.director_run / "phases" / "4"
+        phase.mkdir(parents=True)
+        for name in ("review_status_adversary", "review_pid_adversary"):
+            _ = (self.director_run / name).rename(phase / name)
+        with mock.patch.object(os, "readlink", return_value="/review/cwd"):
+            entries = self._entries()
+        reviewer = entries["adversary reviewer"]
+        self.assertEqual(
+            (reviewer.kind, reviewer.assignment),
+            ("codex", roster.WorkerAssignment("review (adversary)", str(self.director_run))),
+        )
+
+    def test_review_markers_without_a_process_add_no_rows_or_unattributed_sessions(self) -> None:
+        _ = self.account_note(2)
+        processes = self.ps_state.read_text()
+        _ = self.ps_state.write_text("")
+        statuses = [self.director_run / "review_status", self.director_run / "review_status_adversary"]
+        for status in statuses:
+            _ = status.write_text("reviewed\n")
+        before = self._entries()
+
+        for status in statuses:
+            _ = status.write_text("reviewing\n")
+        reviewing = self._entries()
+        self.assertEqual(set(reviewing), set(before))
+        self.assertEqual(
+            {name for name, entry in reviewing.items() if isinstance(entry.account, roster.AccountUnread)},
+            {name for name, entry in before.items() if isinstance(entry.account, roster.AccountUnread)},
+        )
+        self.assertNotIn("blind reviewer", reviewing)
+        self.assertNotIn("adversary reviewer", reviewing)
+        self.assertIn("alpha-research", reviewing)
+
+        _ = self.ps_state.write_text(processes)
+        with mock.patch.object(account, "process_codex_home", return_value=account.ProcessWithoutCodexHome()):
+            running = self._entries()
+        for name in ("blind reviewer", "adversary reviewer"):
+            with self.subTest(reviewer=name):
+                self.assertEqual(running[name].status, "running")
+                self.assertEqual(running[name].account, roster.AccountLabel("codex2"))
+
+    def test_live_run_workers_survive_server_exit_but_ended_workers_and_dead_runs_do_not(self) -> None:
+        for liveness in ("active marker", "fresh heartbeat", "dead run"):
+            with self.subTest(liveness=liveness):
+                run = self.delegate / liveness.replace(" ", "-")
+                records: dict[str, dict[str, object]] = {
+                    f"{run.name}-{status}": {
+                        "thread_id": f"{run.name}-{status}-thread",
+                        "status": status,
+                        "launcher_pid": 999_999_999,
+                    }
+                    for status in ("running", "done", "failed", "ended")
+                }
+                self._write_mesh(run, records)
+                if liveness == "active marker":
+                    _ = (self.delegate / "active" / "sid-director").write_text(str(run) + "\n")
+                else:
+                    heartbeat = run / "heartbeat.log"
+                    heartbeat.touch()
+                    if liveness == "dead run":
+                        old = time.time() - unit_runs.LIVE_HEARTBEAT_SECS - 5
+                        os.utime(heartbeat, (old, old))
+                before = self._entries()
+                self._write_mesh(run, records, server_pid=999_999_999)
+                after = self._entries()
+                expected: set[str] = set(records) - {f"{run.name}-ended"} if liveness != "dead run" else set()
+                self.assertEqual(set(before) & set(records), expected)
+                self.assertEqual(set(after) & set(records), expected)
+                for name in expected:
+                    self.assertEqual(after[name], before[name])
 
     def test_kind_codex_keeps_only_needed_claude_context(self) -> None:
         result, lines, errors = self._run_main("--kind", "codex")
@@ -1039,6 +1151,8 @@ class RosterTests(unittest.TestCase):
         _ = (path / "cmdline").write_bytes("\0".join(argv).encode())
         _ = (path / "environ").write_bytes("\0".join(f"{key}={value}" for key, value in environment.items()).encode())
         (path / "cwd").symlink_to(self.home)
+        if argv[:2] == ["herdr", "--session"] and argv[3:] == ["server"]:
+            herdr_listener(path.parent, pid, argv[2], os.environ)
 
     def _herdr_sessions(self) -> dict[str, CommandResponse]:
         return {"--session default session list --json": {"code": 0, "stdout": json.dumps({
@@ -1198,7 +1312,7 @@ class RosterTests(unittest.TestCase):
 
     def test_recent_heartbeat_is_live_but_an_old_one_is_not(self) -> None:
         orphan = self.delegate / "orphan-run" / "heartbeat.log"
-        old = time.time() - remove_workers.LIVE_HEARTBEAT_SECS - 5
+        old = time.time() - unit_runs.LIVE_HEARTBEAT_SECS - 5
         os.utime(orphan, (old, old))
         entries = self._entries()
         self.assertNotIn("orphan-impl", entries)
@@ -1229,14 +1343,33 @@ class RosterTests(unittest.TestCase):
             _ = (home / ".claude.json").write_text(json.dumps({"oauthAccount": {"emailAddress": login}}))
         return home
 
+    def test_roster_keeps_one_home_identity_per_pass_and_refreshes_after_cutover(self) -> None:
+        _ = self.account_note(2, tool="claude")
+        home_json = self.home / ".claude.json"
+        _ = home_json.write_text(json.dumps({"oauthAccount": {"emailAddress": "claude2@example.invalid"}}))
+
+        def cutover_during_process_read(_pid: int) -> account.NoAccountSetting:
+            _ = home_json.write_text("{}")
+            return account.NoAccountSetting()
+
+        with (mock.patch.object(account, "process_config_dir", side_effect=cutover_during_process_read),
+              mock.patch.object(account, "home_account_state", wraps=account.home_account_state) as home_reads):
+            before = self._entries()
+            after = self._entries()
+        for name in ("runner", "free-claude"):
+            self.assertEqual(before[name].account, roster.AccountLabel("claude2"))
+            self.assertIsInstance(after[name].account, roster.AccountUnread)
+        self.assertEqual(home_reads.call_count, 2)
+
     def test_claude_roster_account_comes_from_its_process_configuration(self) -> None:
         directory = self.account_note(3, tool="claude")
-        with mock.patch.object(account, "process_config_dir", return_value=directory):
+        with mock.patch.object(account, "process_config_dir", return_value=account.ConfiguredClaudeFolder(directory)):
             entry = self._entries()["runner"]
         self.assertEqual(entry.account, roster.AccountLabel("claude3"))
 
     def test_working_workers_keep_their_serving_server_account_across_a_swap(self) -> None:
         old, current = self.account_note(1), self.account_note(2)
+        _ = self.enterContext(mock.patch.object(agent_accounts, "workers_home", return_value=current))
         _ = (self.director_run / "mesh_server.json").write_text(json.dumps({
             "port": 45678, "pid": os.getpid(), "codex_home": str(current),
         }))
@@ -1253,12 +1386,30 @@ class RosterTests(unittest.TestCase):
         self.assertEqual(entries["old-impl"].account, roster.AccountLabel("codex1"))
         self.assertEqual(entries["new-test"].account, roster.AccountLabel("codex2"))
         self.assertEqual(entries["between-turns"].account, roster.AccountLabel("codex2"))
-        self.assertIsInstance(entries["missing-server"].account, roster.AccountUnread)
+        self.assertEqual(entries["missing-server"].account, roster.AccountLabel("codex2"))
         _ = (self.director_run / "mesh_server.json").write_text(json.dumps({"port": 45678, "pid": os.getpid()}))
         entries = self._entries()
-        self.assertIsInstance(entries["new-test"].account, roster.AccountUnread)
-        self.assertIsInstance(entries["between-turns"].account, roster.AccountUnread)
+        self.assertEqual(entries["new-test"].account, roster.AccountLabel("codex2"))
+        self.assertEqual(entries["between-turns"].account, roster.AccountLabel("codex2"))
         self.assertEqual(entries["old-impl"].account, roster.AccountLabel("codex1"))
+
+    def test_live_workers_keep_their_account_when_idle_stop_deletes_server_metadata(self) -> None:
+        home = self.account_note(2)
+        _ = (self.director_run / "mesh_server.json").write_text(json.dumps({
+            "port": 45678, "pid": os.getpid(), "codex_home": str(home),
+        }))
+        _ = (self.director_run / "mesh_roster.json").write_text(json.dumps({
+            "idle-worker": {"thread_id": "idle-thread", "status": "done", "port": 45678},
+            "legacy-worker": {"thread_id": "legacy-thread", "status": "done"},
+        }))
+        with mock.patch.object(agent_accounts, "workers_home", return_value=home):
+            before = self._entries()
+            (self.director_run / "mesh_server.json").unlink()
+            after = self._entries()
+        for name in ("idle-worker", "legacy-worker"):
+            with self.subTest(worker=name):
+                self.assertEqual(before[name].account, roster.AccountLabel("codex2"))
+                self.assertEqual(after[name], before[name])
 
     def test_daemon_rows_use_the_home_holding_the_socket(self) -> None:
         home = self.account_note(1)
@@ -1275,7 +1426,7 @@ class RosterTests(unittest.TestCase):
         self.assertEqual(entries["adversary reviewer"].account, roster.AccountLabel("codex2"))
         with mock.patch.object(process_table, "snapshot", return_value={}):
             missing = self._entries()
-        self.assertIsInstance(missing["blind reviewer"].account, roster.AccountUnread)
+        self.assertNotIn("blind reviewer", missing)
         with mock.patch.object(account, "process_codex_home", return_value=account.ProcessEnvironmentUnread("access denied")):
             entries = self._entries()
         self.assertIsInstance(entries["adversary reviewer"].account, roster.AccountUnread)

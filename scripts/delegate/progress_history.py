@@ -26,6 +26,8 @@ from typing import NamedTuple, NoReturn, TypedDict, cast
 
 if not __package__:
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from scripts.delegate import phase_reservation  # noqa: E402
+from scripts.lib import unit_runs  # noqa: E402
 from scripts.lib.user_zone import user_zone  # noqa: E402
 
 
@@ -42,6 +44,11 @@ MIN_CALIBRATION_SAMPLES = 5
 # have shown; a run with enough matching samples replaces it with its own
 # measured error, so this only ever governs the first runs of a fresh history.
 DEFAULT_PERCENT_SPREAD = 10.0
+# How long a stretch with no pass or activity open still counts as phase work: the unit
+# director reviews, gates and writes the next prompt between dispatches. Past it the phase
+# waited, and an overnight wait counted in full turned a phase with an hour left into one
+# finishing the next evening (herdr-trial, 2026-10-15).
+IDLE_GRACE_SECONDS = 30 * 60
 # How far apart two entered percentages may sit and still calibrate each other.
 # The entered percent is itself off by about DEFAULT_PERCENT_SPREAD, so history
 # ten points either side describes the same moment of a phase as well as history
@@ -1259,7 +1266,6 @@ def _close_slot_pass(
     slot: str,
     status: str,
     now: float,
-    agent_awake_seconds: int = -1,
 ) -> bool:
     """Close one slot's open pass, reporting whether there was one to close.
 
@@ -1280,17 +1286,6 @@ def _close_slot_pass(
         0,
         int(now - _number(current_pass.get("started_at"), now)),
     )
-    # Elapsed time cannot separate an agent that worked for fourteen hours from
-    # a laptop suspended for six of them. heartbeat_watch.sh counts only the
-    # intervals it slept all the way through, so its total is time the machine
-    # was awake with the delegate alive, to one beat interval. Absent when the
-    # loop never beat: a pass shorter than one interval has nothing to report,
-    # and a zero would read as a measurement instead of the lack of one. It
-    # describes the delegate process, not this window -- review.sh starts the
-    # loop before an early review's pass opens, so that pass can report more
-    # awake seconds than it was open.
-    if agent_awake_seconds >= 0:
-        event["agent_awake_seconds"] = agent_awake_seconds
     _append_event(state, event)
     current_pass["status"] = status
     current_pass["finished_at"] = now
@@ -1503,7 +1498,13 @@ def _start_pass(args: argparse.Namespace) -> None:
     )
     team_slot = _team_slot()
     state = _read_state(session_dir)
-    phase = _object_dict(state.get("phase"))
+    # A phase running beside the current one names itself, so its pass is not stamped with
+    # the current phase's.
+    phase_id = _optional_arg(args, "phase_id")
+    phase = _open_phase_named(state, phase_id) if phase_id else _object_dict(state.get("phase"))
+    if phase_id and phase is None:
+        open_ids = ", ".join(_open_phase_ids(state)) or "none"
+        raise SystemExit(f"Phase {phase_id} is not open; open phases: {open_ids}")
     if phase is None or _string(phase.get("status")) != "active":
         raise SystemExit("Start a phase before starting a pass")
     now = now_epoch()
@@ -1558,14 +1559,7 @@ def _finish_pass(args: argparse.Namespace) -> None:
     # still running.
     slot = _team_slot()
     state = _read_state(session_dir)
-    closed = _close_slot_pass(
-        session_dir,
-        state,
-        slot,
-        status,
-        now_epoch(),
-        _arg_integer(args, "agent_awake_seconds", -1),
-    )
+    closed = _close_slot_pass(session_dir, state, slot, status, now_epoch())
     if orphaned and not closed:
         raise SystemExit(
             "No pass is open in this slot, so no launcher was orphaned and "
@@ -1619,9 +1613,10 @@ def _arm_review(args: argparse.Namespace) -> None:
     """
     session_dir = _session_dir(args)
     state = _read_state(session_dir)
-    phase = _object_dict(state.get("phase"))
+    phase_id = _arg_string(args, "phase_id")
+    phase = _open_phase_named(state, phase_id) if phase_id else _object_dict(state.get("phase"))
     if phase is None or _string(phase.get("status")) != "active":
-        raise SystemExit("Start a phase before arming an early review")
+        raise SystemExit(f"Phase {phase_id} is not open" if phase_id else "Start a phase before arming an early review")
     if _reporting_pass(state) is None:
         raise SystemExit(
             "An early review is the reviewer that overlaps a running dispatch, so "
@@ -1632,6 +1627,8 @@ def _arm_review(args: argparse.Namespace) -> None:
     called_task = _arg_string(args, "called_task", "delegate.review") or "delegate.review"
     lens = _arg_string(args, "lens")
     suffix = f"_{lens}" if lens else ""
+    # `review.sh --phase` writes its files in the phase's directory, so the marker names the same one.
+    artifact_dir = phase_reservation.phase_directory(session_dir, phase_id) if phase_id else session_dir
     armed: dict[str, object] = {
         "instance_id": str(uuid.uuid4()),
         "kind": "review",
@@ -1643,8 +1640,8 @@ def _arm_review(args: argparse.Namespace) -> None:
         # `review.sh` suffixes both files with its lens, so an armed reviewer
         # must name the same pair the launcher it precedes will write. Empty is
         # the single-reviewer layout and the unsuffixed names.
-        "status_file": str(session_dir / f"review_status{suffix}"),
-        "pid_file": str(session_dir / f"review_pid{suffix}"),
+        "status_file": str(artifact_dir / f"review_status{suffix}"),
+        "pid_file": str(artifact_dir / f"review_pid{suffix}"),
         "status": "armed",
     }
     state[ARMED_REVIEW_KEY] = armed
@@ -1745,6 +1742,7 @@ def _calibration_samples(events: list[dict[str, object]]) -> list[CalibrationSam
         phase_finished_at = phase_finishes.get(phase_instance_id)
         if phase_finished_at is None:
             continue
+        phase_events = [event for event in events if _string(event.get("phase_instance_id")) == phase_instance_id]
         reports.sort(key=lambda event: _number(event.get("timestamp_epoch")))
         index = 0
         while index < len(reports):
@@ -1767,10 +1765,12 @@ def _calibration_samples(events: list[dict[str, object]]) -> list[CalibrationSam
                 seen_raw_percentages.add(raw_percent)
                 reported_at = _number(report.get("timestamp_epoch"))
                 phase_started_at = _number(report.get("phase_started_at"))
-                phase_duration = phase_finished_at - phase_started_at
-                if phase_duration <= 0 or reported_at < phase_started_at:
+                if phase_finished_at <= phase_started_at or reported_at < phase_started_at:
                     continue
-                phase_elapsed = reported_at - phase_started_at
+                phase_duration = _work_seconds(phase_events, phase_instance_id, phase_started_at, phase_finished_at)
+                phase_elapsed = _work_seconds(phase_events, phase_instance_id, phase_started_at, reported_at)
+                if phase_duration <= 0:
+                    continue
                 temporal_percent = max(0.0, min(100.0, 100.0 * phase_elapsed / phase_duration))
                 suggested_percent = _integer(report.get("suggested_percent"), raw_percent)
                 main_model, main_effort = _agent_fields(report, "main_agent")
@@ -2197,6 +2197,44 @@ def _prefixed_decision(scope: str, decision: dict[str, object]) -> dict[str, obj
     return {f"{scope}_{key}": value for key, value in decision.items()}
 
 
+def _work_seconds(
+    events: list[dict[str, object]], phase_instance_id: str, started_at: float, until: float
+) -> int:
+    """The phase's working time from `started_at` to `until`, idle stretches left out.
+
+    A pass or an activity open is work. A stretch with none open counts up to
+    `IDLE_GRACE_SECONDS`, the unit director's own work between dispatches; the rest of
+    it is waiting, and an ETA extended from a clock that ran through a night quotes
+    that night again for the work left.
+    """
+    opened: dict[str, float] = {}
+    windows: list[tuple[float, float]] = []
+    for event in events:
+        if _string(event.get("phase_instance_id")) != phase_instance_id:
+            continue
+        event_type = _string(event.get("event_type"))
+        key = _string(event.get("pass_instance_id" if event_type.startswith("pass_") else "activity_instance_id"))
+        at = min(until, max(started_at, _number(event.get("timestamp_epoch"))))
+        if event_type in ("pass_started", "activity_started") and key:
+            opened[key] = at
+        elif event_type in ("pass_finished", "activity_finished") and key in opened:
+            windows.append((opened.pop(key), at))
+    windows.extend((start, until) for start in opened.values())
+    if not windows:
+        # History with no windows says nothing about idleness, so the wall clock stands.
+        return max(0, int(until - started_at))
+    work, idle_from = 0.0, started_at
+    for start, end in sorted(windows):
+        if start > idle_from:
+            work += min(start - idle_from, IDLE_GRACE_SECONDS)
+        if end > idle_from:
+            work += end - max(start, idle_from)
+            idle_from = end
+    if until > idle_from:
+        work += min(until - idle_from, IDLE_GRACE_SECONDS)
+    return int(work)
+
+
 def _eta_seconds(percent: int, elapsed: int) -> int | None:
     """Project the time left by extending the rate the clock has run so far.
 
@@ -2223,7 +2261,7 @@ def _restart_unit_notifier(session_dir: Path) -> int | None:
         environment["NOTIFIER_NOW_EPOCH"] = configured_now
     try:
         result = subprocess.run(
-            [zsh, str(notifier), "restart", f"delegate-{session_dir.name}"],
+            [zsh, str(notifier), "restart", unit_runs.instance(session_dir)],
             capture_output=True,
             text=True,
             timeout=10,
@@ -3694,7 +3732,7 @@ def _arrival_label(arrival_epoch: float, now: float) -> str:
     return f"{arrival:%Y-%m-%d %H:%M}"
 
 
-def _eta_cell(percent: int, elapsed: int, as_of: float, now: float) -> str:
+def _eta_cell(percent: int, elapsed: int, as_of: float, now: float, floor: int = 0) -> str:
     """When the work is expected to land, as a clock time rather than a duration.
 
     A remaining duration has to be added to the current time by hand every time
@@ -3704,7 +3742,7 @@ def _eta_cell(percent: int, elapsed: int, as_of: float, now: float) -> str:
     its last recorded moment; the day is still named from `now`.
     """
     eta = _eta_seconds(percent, elapsed)
-    return "" if eta is None else _arrival_label(as_of + eta, now)
+    return "" if eta is None else _arrival_label(as_of + max(eta, floor), now)
 
 
 def _format_offset(seconds: int) -> str:
@@ -3725,6 +3763,7 @@ def _eta_band_cells(
     as_of: float,
     now: float,
     spread: float,
+    floor: EtaBand | None = None,
 ) -> tuple[str, str]:
     """The best and worst arrival the percentage beside it still allows.
 
@@ -3746,6 +3785,12 @@ def _eta_band_cells(
     band = eta_band_seconds(percent, elapsed, spread)
     if isinstance(band, EtaProjectionUnavailable):
         return "", ""
+    if floor is not None:
+        band = EtaBand(
+            remaining=max(band.remaining, floor.remaining),
+            earliest=max(band.earliest, floor.earliest),
+            latest=max(band.latest, floor.latest),
+        )
     return (
         f"{_arrival_label(as_of + band.earliest, now)} "
         + f"(-{_format_offset(band.remaining - band.earliest)})",
@@ -3967,12 +4012,12 @@ def _reported_window(
     return NoReportedWindow()
 
 
-def _scope_row(label: str, clock: ScopeClock, as_of: float, now: float) -> list[str]:
+def _scope_row(label: str, clock: ScopeClock, as_of: float, now: float, floor: int = 0) -> list[str]:
     return [
         label,
         str(clock["percent"]),
         _format_duration(clock["elapsed"]),
-        _eta_cell(clock["percent"], clock["elapsed"], as_of, now),
+        _eta_cell(clock["percent"], clock["elapsed"], as_of, now, floor),
         _unchanged_cell(clock["unchanged"]),
     ]
 
@@ -3992,7 +4037,11 @@ def _summary_table(
     the two differ only in a report between windows.
     """
     headers = list(SUMMARY_HEADERS)
-    project_row = _scope_row("Project", project, as_of, now)
+    # Each ETA extends its own clock, so nothing else stops the project from landing
+    # before the phase still running inside it; the phase's projection is its floor.
+    phase_band = eta_band_seconds(phase["percent"], phase["elapsed"], phase_spread)
+    floor = None if isinstance(phase_band, EtaProjectionUnavailable) else phase_band
+    project_row = _scope_row("Project", project, as_of, now, floor.remaining if floor else 0)
     phase_row = _scope_row(f"Phase {phase_id}", phase, as_of, now)
     if plan_phase_counts.get("available") is True:
         headers.append("Phases")
@@ -4006,7 +4055,7 @@ def _summary_table(
     headers.extend(("ETA low", "ETA high"))
     project_row.extend(
         _eta_band_cells(
-            project["percent"], project["elapsed"], as_of, now, DEFAULT_PERCENT_SPREAD
+            project["percent"], project["elapsed"], as_of, now, DEFAULT_PERCENT_SPREAD, floor
         )
     )
     phase_row.extend(
@@ -4146,7 +4195,9 @@ def _recorded_report(
         ),
         phase=ScopeClock(
             percent=phase_percent,
-            elapsed=max(0, int(at - _number(phase.get("started_at"), at))),
+            elapsed=_integer(
+                fields.get("phase_elapsed_seconds"), max(0, int(at - _number(phase.get("started_at"), at)))
+            ),
             unchanged=_integer(fields.get("phase_same_percent_elapsed_seconds")),
         ),
         calibration=_object_dict(fields.get("phase_calibration")),
@@ -4338,7 +4389,9 @@ def _report_progress(args: argparse.Namespace) -> None:
             now,
         )
 
-    phase_elapsed = max(0, int(now - _number(phase.get("started_at"), now)))
+    phase_elapsed = _work_seconds(
+        _run_events(state), _string(phase.get("instance_id")), _number(phase.get("started_at"), now), now
+    )
     pass_elapsed = max(0, int(now - _number(current_pass.get("started_at"), now)))
     total_elapsed = max(0, int(now - _number(state.get("project_started_at"), now)))
     next_report_at = _next_report_at(session_dir, now, notifier_due)
@@ -4768,6 +4821,7 @@ def _build_parser() -> argparse.ArgumentParser:
     _ = start_pass.add_argument("--called-family", required=True)
     _ = start_pass.add_argument("--called-model", required=True)
     _ = start_pass.add_argument("--called-effort", default="unset")
+    _ = start_pass.add_argument("--phase-id", default="", help="the open phase this pass belongs to; default the current one")
     start_pass.set_defaults(handler=_start_pass)
 
     finish_pass = subparsers.add_parser("finish-pass")
@@ -4783,12 +4837,13 @@ def _build_parser() -> argparse.ArgumentParser:
         help="close this slot's open pass when the unit director killed its "
         + "launcher (--status canceled only)",
     )
+    # Accepted and ignored: implement.sh and review.sh launchers started before
+    # 2026-10-15 18:00 EDT still pass it, since bash keeps the script it began
+    # with. Remove after 2026-10-22.
     _ = finish_pass.add_argument(
         "--agent-awake-seconds",
-        type=int,
-        default=-1,
-        help="seconds the heartbeat loop counted while the delegate ran, which "
-        + "excludes time the machine was suspended; omit when it counted none",
+        default=argparse.SUPPRESS,
+        help=argparse.SUPPRESS,
     )
     finish_pass.set_defaults(handler=_finish_pass)
 
@@ -4801,6 +4856,7 @@ def _build_parser() -> argparse.ArgumentParser:
     _ = arm_review.add_argument("--activity", required=True)
     _ = arm_review.add_argument("--called-task", default="delegate.review")
     _ = arm_review.add_argument("--lens", default="")
+    _ = arm_review.add_argument("--phase-id", default="", help="the open phase the review belongs to, as review.sh --phase names it")
     arm_review.set_defaults(handler=_arm_review)
 
     disarm_review = subparsers.add_parser(

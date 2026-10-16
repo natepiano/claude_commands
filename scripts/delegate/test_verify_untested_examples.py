@@ -39,6 +39,9 @@ if [ "$1" = metadata ]; then
     exec "$REAL_CARGO" "$@"
 fi
 printf "%s\n" "$*" >> "$CARGO_CALLS"
+if [ "$1 $2" = "nextest run" ] && [ -n "$EDIT_DURING_TEST" ]; then
+    printf "// changed during the test run\n" >> "$PACKAGE_ROOT/src/lib.rs"
+fi
 case "$1 $2" in
     "nextest --version"|"nextest run"|"+nightly fmt"|"check --workspace") exit 0 ;;
     *) exit 97 ;;
@@ -50,7 +53,7 @@ esac
 case " $* " in
     *"rev-parse --show-toplevel"*) printf "%s\n" "$PACKAGE_ROOT" ;;
     *"rev-parse HEAD^{tree}"*) printf "fixed-tree\n" ;;
-    *"status --porcelain"*) : ;;
+    *"status --porcelain"*) [ -z "$TREE_DIRTY" ] || printf " M src/lib.rs\000" ;;
     *) exit 1 ;;
 esac
 ''')
@@ -68,7 +71,8 @@ esac
         self.environment = {
             **{
                 name: value for name, value in os.environ.items()
-                if name not in {"PLAN_DELEGATE_BOARD_DIR", "PLAN_DELEGATE_TEAM_ROLE"}
+                if name not in {"PLAN_DELEGATE_BOARD_DIR", "PLAN_DELEGATE_TEAM_ROLE", "CODEX_THREAD_ID",
+                                "CODEX_SESSION_ID", "PLAN_DELEGATE_DETACHED_RUN"}
             },
             "PATH": f"{stubs}:{os.environ['PATH']}",
             "HOME": str(self.root),
@@ -287,6 +291,20 @@ esac
         self.assertNotIn("PASS (recorded)", result.stdout + result.stderr)
         self.assertEqual(self.calls_made(), first_calls)
         self.assertEqual(self.metadata_count(), 2)
+
+    def test_edit_during_the_test_run_records_no_pass(self) -> None:
+        _ = self.package()
+        self.environment.update({"TREE_DIRTY": "1", "EDIT_DURING_TEST": "1"})
+        result = self.verify("test", "sample")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("the tree changed while test ran, so this result was not recorded", result.stdout)
+        self.assertEqual(list((self.root / "session" / "verify_cache").glob("*.pass")), [])
+
+        self.environment["EDIT_DURING_TEST"] = ""
+        result = self.verify("test", "sample")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertNotIn("PASS (recorded)", result.stdout)
+        self.assertEqual(len(list((self.root / "session" / "verify_cache").glob("*.pass"))), 1)
 
     def test_final_checks_every_workspace_member_before_workspace_gate(self) -> None:
         _ = (self.root / "Cargo.toml").write_text('[workspace]\nmembers = ["alpha", "beta"]\nresolver = "2"\n')

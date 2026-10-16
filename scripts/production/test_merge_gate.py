@@ -26,8 +26,10 @@ EXPECTED_SUITES = (
     "lib", "hooks", "message", "accounts", "whoami", "agents", "build_hold",
     "mac_test", "usage", "bevy_upgrade", "production", "delegate", "buildlog",
     "lint", "nightly_review", "build_targets", "shutdown", "feature_log",
-    "model_study", "herdr", "notify", "statusline",
+    "model_study", "herdr", "notify", "statusline", "astra",
 )
+# Each suite's fixture holds test_first.py, and lib also test_second.py.
+MODULES = len(EXPECTED_SUITES) + 1
 
 TOOL_STUB = '''#!/usr/bin/env python3
 import json
@@ -398,7 +400,8 @@ class MergeGateTests(unittest.TestCase):
         checkpoint = self.checkpoint_commit("checkpoint(fixture): grid fades\n\nChange-Review: none — the gate script")
         result = self.run_gate("--production", str(doc), checkpoint=checkpoint)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertNotIn("Change review:", result.stdout)
+        self.assertIn("Change review: the production doc has no Change review line; no rows written",
+                      result.stdout)
 
     def test_green_gate_pushes_no_ff_merge_with_subject_body_and_all_modules(self) -> None:
         self.write(self.state / "types-barrier", "overlap")
@@ -414,7 +417,7 @@ class MergeGateTests(unittest.TestCase):
         starts = [row for row in self.module_events() if row["event"] == "start"]
         self.assertCountEqual([(row["suite"], row["module"]) for row in starts],
                               [(suite, "test_first.py") for suite in EXPECTED_SUITES] + [("lib", "test_second.py")])
-        self.assertEqual(len({row["pid"] for row in starts}), 23)
+        self.assertEqual(len({row["pid"] for row in starts}), MODULES)
         self.assertEqual(len({row["tmpdir"] for row in starts}), 1)
         self.assertFalse(Path(starts[0]["tmpdir"]).exists())
         type_calls = [call for call in self.calls() if call["tool"] == "basedpyright"]
@@ -429,7 +432,7 @@ class MergeGateTests(unittest.TestCase):
         self.assertGreater(float(peak.group(1)), 0)
         self.assertRegex(result.stdout, r"(?m)^Largest module peak: [\d.]+ GiB \(sampled RSS\); module: (?:\w+/test_\w+\.py|\(not sampled\))$")
         launches = [call for call in self.calls() if call["tool"] == "suite-python"]
-        self.assertEqual(len(launches), 23)
+        self.assertEqual(len(launches), MODULES)
         for call in launches:
             self.assertIn("discover", call["args"])
             self.assertEqual(call["cwd"], str(self.checkout))
@@ -451,7 +454,7 @@ class MergeGateTests(unittest.TestCase):
             peak = max(peak, len(active))
         self.assertGreaterEqual(peak, 2)
         self.assertEqual(active, set())
-        self.assertEqual(len(events), 46)
+        self.assertEqual(len(events), 2 * MODULES)
         self.assertIn("sampled RSS cap 268 MiB", result.stdout)
         self.assertEqual(self.git(self.checkout, "rev-parse", "HEAD"), self.base)
         self.assert_not_pushed()
@@ -461,7 +464,7 @@ class MergeGateTests(unittest.TestCase):
         result = self.run_gate("--tests-only", "--memory-cap-mib", "48")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         events = self.module_events()
-        self.assertEqual(len(events), 46)
+        self.assertEqual(len(events), 2 * MODULES)
         for start, finish in zip(events[::2], events[1::2], strict=True):
             self.assertEqual((start["event"], finish["event"]), ("start", "finish"))
             self.assertEqual(start["pid"], finish["pid"])
@@ -498,7 +501,7 @@ class MergeGateTests(unittest.TestCase):
         for suite, module in (("lib", "test_first.py"), ("lib", "test_second.py"), ("hooks", "test_first.py")):
             self.assertIn(f"fixture failure in {suite}/{module}", result.stdout + result.stderr)
         starts = [row for row in self.module_events() if row["event"] == "start"]
-        self.assertEqual(len(starts), 23)
+        self.assertEqual(len(starts), MODULES)
 
     def test_type_failure_resets_merge_and_does_not_push(self) -> None:
         self.write(self.state / "types-red", "red")
@@ -556,7 +559,7 @@ class MergeGateTests(unittest.TestCase):
         updated = cast(object, json.loads((self.state / "runner" / "module_seconds.json").read_text()))
         self.assertIsInstance(updated, dict)
         assert isinstance(updated, dict)
-        self.assertEqual(len(cast(dict[str, object], updated)), 23)
+        self.assertEqual(len(cast(dict[str, object], updated)), MODULES)
 
     def test_termination_signals_roll_back_and_clean_module_groups(self) -> None:
         for sig in (signal.SIGTERM, signal.SIGHUP):
@@ -695,7 +698,7 @@ class MergeGateTests(unittest.TestCase):
         with mock.patch.dict(os.environ, self.environment), mock.patch.object(merge_gate, "process_memory_mib", return_value={os.getpid(): 100.0}), redirect_stdout(output):
             result = merge_gate.run_suites(self.checkout, 48)
         self.assertFalse(result.passed)
-        self.assertEqual(len(result.jobs), 23)
+        self.assertEqual(len(result.jobs), MODULES)
         self.assertIn("sampled RSS exceeded the cap", output.getvalue())
 
     def test_runner_reports_load_at_its_own_start_and_end(self) -> None:
@@ -708,7 +711,7 @@ class MergeGateTests(unittest.TestCase):
             if calls == 1:
                 return 10.0
             events = self.state / "modules.jsonl"
-            return 20.0 if events.exists() and len(events.read_text().splitlines()) == 46 else 60.0
+            return 20.0 if events.exists() and len(events.read_text().splitlines()) == 2 * MODULES else 60.0
 
         with mock.patch.dict(os.environ, self.environment), mock.patch.object(merge_gate, "one_minute_load", side_effect=measured_load), redirect_stdout(output):
             result = merge_gate.run_suites(self.checkout)

@@ -8,9 +8,16 @@ from dataclasses import dataclass
 from importlib import import_module
 from datetime import datetime
 from pathlib import Path
-from typing import Literal, NotRequired, TypedDict, Protocol, cast, override, assert_never
+from typing import TYPE_CHECKING, Literal, NotRequired, TypedDict, Protocol, cast, override, assert_never
 
 from scripts.accounts import worker_names
+
+if TYPE_CHECKING:
+    from scripts.whoami.account import ResolvedHistoryLabel, HistoricalAccountUnresolved
+
+
+class HistoryResolver(Protocol):
+    def resolve_history_label(self, label: str, at: str, *, login: str = "") -> ResolvedHistoryLabel | HistoricalAccountUnresolved: ...
 
 
 @dataclass(frozen=True)
@@ -243,9 +250,12 @@ def read_journal() -> list[JournalEntry]:
     def historical(entry: MoveEntry, field: str) -> HistoricalAccountLabel:
         tool = entry["tool"]
         home = homes[tool]
+        recorded_login = dict(entry).get("login", "") if field == "from" else ""
         for record in shutdown:
-            if record.get("request_id") != entry["move_id"]:
+            if record.get("request_id") != entry.get("request_id", entry["move_id"]):
                 continue
+            if field == "from" and isinstance(record.get("login"), str):
+                recorded_login = record["login"]
             if field == "to":
                 label = numbered(record.get("target"), tool)
                 if isinstance(label, str):
@@ -258,6 +268,11 @@ def read_journal() -> list[JournalEntry]:
                     label = numbered(record.get("source_label", record.get("label")), tool)
                     if isinstance(label, str):
                         return label
+        from scripts.whoami.account import ResolvedHistoryLabel
+        resolver = cast(HistoryResolver, cast(object, import_module("scripts.accounts.accounts")))
+        resolved = resolver.resolve_history_label(f"~/.{tool}", entry["at"], login=recorded_login if isinstance(recorded_login, str) else "")
+        if isinstance(resolved, ResolvedHistoryLabel):
+            return resolved.label
         at = datetime.fromisoformat(entry["at"])
         matching = sorted((item for item in evidence if item.tool == tool and item.at <= at), key=lambda item: item.at)
         return numbered(matching[-1].label, tool) if matching else HomeAccountUnresolved(home)
@@ -283,7 +298,7 @@ def read_journal() -> list[JournalEntry]:
             entry = _canonical_entry(cast(MoveEntry, value))
             fields: dict[str, object] = dict(entry)
             for field in ("from", "to", "label"):
-                if fields.get(field) == "default":
+                if fields.get(field) in ("default", f"~/.{entry['tool']}", str(homes[entry["tool"]])):
                     fields[field] = historical(entry, field)
             if fields["kind"] == "requested":
                 _ = fields.setdefault("cause", "refusal")

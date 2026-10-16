@@ -7,8 +7,8 @@ import os
 import subprocess
 import sys
 import tempfile
-from collections.abc import Callable
-from contextlib import redirect_stdout
+from collections.abc import Callable, Sequence
+from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 from typing import Literal, TypedDict, cast, final, override
 from unittest.mock import patch
@@ -16,9 +16,11 @@ from unittest.mock import patch
 from test_support import ShutdownSendLeaf, ShutdownTestCase
 from test_restart import entry, showrunner, top_level, unit
 import remote_control
+import herdr
 import sessions
 import session_pane
 import settle
+import detached
 from push_texts import RenderedPush
 from unit_lookup import TmuxPlace
 from herdr import AgentBlocked
@@ -80,7 +82,7 @@ class RemoteControlTests(ShutdownTestCase):
         super().setUp()
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
-        self.root = Path(temporary.name)
+        self.root = Path(temporary.name).resolve()
         self.registry = self.root / "registry"
         self.registry.mkdir()
         _ = cast(object, self.enterContext(patch.dict(os.environ, {
@@ -115,10 +117,10 @@ class RemoteControlTests(ShutdownTestCase):
         self.assertEqual(current["procStart"], "original", "replacement must never receive input")
         self.typed.append((self.clock.at, text))
 
-    def run_fix(self, alerts: Literal["user", "none"] = "user") -> tuple[remote_control.RemoteControlOutcome, str, list[RenderedPush]]:
+    def run_fix(self) -> tuple[remote_control.RemoteControlOutcome, str, list[RenderedPush]]:
         output = io.StringIO()
         with patch.object(settle, "alert_user") as alert, redirect_stdout(output):
-            outcome = remote_control.fix("owner", 321, "original", "trunk unit", alerts, "Owner", clock=self.clock)
+            outcome = remote_control.fix("owner", 321, "original", "trunk unit", "Owner", clock=self.clock)
         lines = output.getvalue().splitlines()
         self.assertEqual(len(lines), 1, output.getvalue())
         self.assertTrue(lines[0].startswith("trunk unit:"))
@@ -197,18 +199,15 @@ class RemoteControlTests(ShutdownTestCase):
         self.assertEqual(self.typed, [(75.0, "/remote-control")])
         self.assertEqual(pushes, [])
 
-    def test_three_unsuccessful_attempts_push_once_after_last_confirmation_wait(self) -> None:
+    def test_three_unsuccessful_attempts_only_journal_after_last_confirmation_wait(self) -> None:
         outcome, text, pushes = self.run_fix()
         self.assertIsInstance(outcome, remote_control.Failed)
         self.assertEqual(self.typed, [(60.0, "/remote-control"), (90.0, "/remote-control"), (120.0, "/remote-control")])
         self.assertEqual(self.clock.at, 150.0)
         self.assertIn("Remote Control failed", text)
-        self.assertEqual(len(pushes), 1)
-        self.assertEqual(pushes[0].id, "shutdown.remote_control")
-        self.assertEqual(pushes[0].title, "trunk unit remote-control is off")
-        self.assertEqual(pushes[0].message, "Session: Owner\nAction: run /remote-control\nReason: Remote control is off.")
+        self.assertEqual(pushes, [])
 
-    def test_missing_pane_waits_for_launch_flag_then_pushes_without_typing(self) -> None:
+    def test_missing_pane_waits_for_launch_flag_without_typing_or_pushing(self) -> None:
         with patch.object(session_pane, "record_place", side_effect=session_pane.NoSuchTarget("owner")):
             outcome, _text, pushes = self.run_fix()
         self.assertIsInstance(outcome, remote_control.Failed)
@@ -216,7 +215,7 @@ class RemoteControlTests(ShutdownTestCase):
             self.assertEqual(outcome.reason, "no pane to type into")
         self.assertEqual(self.clock.at, 60.0)
         self.assertEqual(self.typed, [])
-        self.assertEqual(len(pushes), 1)
+        self.assertEqual(pushes, [])
 
     def test_replaced_process_or_registry_ends_without_typing_or_push(self) -> None:
         for replacement in ("process", "registry"):
@@ -296,17 +295,7 @@ class RemoteControlTests(ShutdownTestCase):
                 self.assertEqual(len(self.typed), int(already_typed))
                 self.assertEqual(pushes, [])
 
-    def test_failed_repair_respects_push_policy_without_skipping_attempts(self) -> None:
-        for policy in ("user", "none"):
-            with self.subTest(policy=policy):
-                self.clock = FakeClock()
-                self.typed.clear()
-                outcome, _text, pushes = self.run_fix(policy)
-                self.assertIsInstance(outcome, remote_control.Failed)
-                self.assertEqual(len(self.typed), 3)
-                self.assertEqual(len(pushes), int(policy == "user"))
-
-    def test_transient_input_failure_retries_and_exhausted_input_failures_push_once(self) -> None:
+    def test_transient_input_failure_retries_and_exhausted_input_failures_never_push(self) -> None:
         for recover in (True, False):
             with self.subTest(recover=recover):
                 self.clock = FakeClock()
@@ -326,7 +315,7 @@ class RemoteControlTests(ShutdownTestCase):
                 self.assertEqual(len(attempted), 2 if recover else 3)
                 self.assertIsInstance(outcome, remote_control.TurnedOn if recover else remote_control.Failed)
                 self.assertEqual(len(self.typed), int(recover))
-                self.assertEqual(len(pushes), 0 if recover else 1)
+                self.assertEqual(pushes, [])
 
     def test_blocked_herdr_input_is_not_counted_as_a_successful_attempt(self) -> None:
         def blocked(_place: object, _text: str) -> None:
@@ -336,7 +325,7 @@ class RemoteControlTests(ShutdownTestCase):
         self.assertIsInstance(outcome, remote_control.Failed)
         self.assertEqual(self.clock.at, 900.0)
         self.assertEqual(self.typed, [])
-        self.assertEqual(len(pushes), 1)
+        self.assertEqual(pushes, [])
 
     def test_who_names_the_unit_production_or_plain_session(self) -> None:
         for saved, expected in ((entry(unit("trunk")), "trunk unit"),
@@ -347,17 +336,87 @@ class RemoteControlTests(ShutdownTestCase):
 
     def test_detached_launch_carries_process_identity_unbuffered_python_and_who(self) -> None:
         self.allow_leaf(ShutdownSendLeaf.LAUNCH_REMOTE_CONTROL_FIXER)
-        for platform in ("linux", "darwin"):
-            with self.subTest(platform=platform), patch.object(sys, "platform", platform), patch.object(subprocess, "run", return_value=subprocess.CompletedProcess([], 0)) as launch:
-                remote_control.launch_fixer("owner-identifier", 321, "original start", "trunk unit", "none", "Owner")
-            launch.assert_called_once()
-            argv = cast(list[str], launch.call_args.args[0])
-            self.assertEqual(argv[0], "launchctl" if platform == "darwin" else "systemd-run")
-            env = argv.index("env")
-            self.assertEqual(argv[env:], ["env", "PYTHONUNBUFFERED=1", sys.executable, "-u",
+        with patch.object(sys, "platform", "linux"), patch.object(subprocess, "run", return_value=subprocess.CompletedProcess([], 0)) as launch:
+            remote_control.launch_fixer("owner-identifier", 321, "original start", "trunk unit", "Owner")
+        launch.assert_called_once()
+        argv = cast(list[str], launch.call_args.args[0])
+        self.assertEqual(argv[0], "systemd-run")
+        env = argv.index("env")
+        self.assertEqual(argv[env:], ["env", "PYTHONUNBUFFERED=1", sys.executable, "-u",
+            str(Path(remote_control.__file__).with_name("shutdown.py")), "remote-control", "owner-identifier",
+            "--pid", "321", "--proc-start", "original start", "--who", "trunk unit", "--session", "Owner"])
+        service = argv[argv.index("--unit") + 1]
+        self.assertEqual(service, "shutdown-remote-control-owner-identi-321")
+        self.assertTrue({"--user", "--collect", "--quiet", "--no-block"}.issubset(argv))
+
+    def test_darwin_fixer_launch_waits_for_its_start_line_and_preserves_process_identity(self) -> None:
+        self.allow_leaf(ShutdownSendLeaf.LAUNCH_REMOTE_CONTROL_FIXER)
+        paths: list[Path] = []
+
+        def start(argv: Sequence[str], *, ready: Callable[[], bool], within: float,
+                  output: detached.AppendLog, environment: detached.ExplicitEnvironment) -> int:
+            log = output.path
+            self.assertEqual(environment.mapping[detached.STARTUP_SIGNAL_ENV], "1")
+            self.assertEqual(list(argv), ["env", "PYTHONUNBUFFERED=1", sys.executable, "-u",
                 str(Path(remote_control.__file__).with_name("shutdown.py")), "remote-control", "owner-identifier",
-                "--pid", "321", "--proc-start", "original start", "--who", "trunk unit", "--alerts", "none", "--session", "Owner"])
-            service = argv[argv.index("-l" if platform == "darwin" else "--unit") + 1]
-            self.assertEqual(service, "shutdown-remote-control-owner-identi-321")
-            if platform == "linux":
-                self.assertTrue({"--user", "--collect", "--quiet", "--no-block"}.issubset(argv))
+                "--pid", "321", "--proc-start", "original start", "--who", "trunk unit", "--session", "Owner"])
+            self.assertEqual(within, 15)
+            self.assertEqual(log.parent, self.root / "shutdown" / "logs")
+            self.assertNotIn(log, paths)
+            paths.append(log)
+            self.assertFalse(ready())
+            _ = log.write_text("unrelated output\n")
+            self.assertFalse(ready())
+            def already_on(session_id: str, pid: int, proc_start: str,
+                           clock: remote_control.Clock) -> remote_control.AlreadyOn:
+                del session_id, pid, proc_start, clock
+                self.assertNotIn(detached.STARTUP_SIGNAL_ENV, os.environ)
+                return remote_control.AlreadyOn()
+
+            with (log.open("a") as stream, redirect_stderr(stream), redirect_stdout(io.StringIO()),
+                  patch.dict(os.environ, environment.mapping, clear=True),
+                  patch.object(remote_control, "_fix", side_effect=already_on)):
+                _ = remote_control.fix("owner-identifier", 321, "original start", "trunk unit", "Owner")
+                self.assertNotIn(detached.STARTUP_SIGNAL_ENV, os.environ)
+            self.assertTrue(ready(), "the child entry point must publish its startup line")
+            return 4321
+
+        with (patch.object(sys, "platform", "darwin"), patch.object(herdr, "_PLATFORM", "darwin"),
+              patch.object(detached, "start_detached", side_effect=start),
+              patch.object(subprocess, "run", side_effect=AssertionError("service manager used"))):
+            for _ in range(2):
+                remote_control.launch_fixer("owner-identifier", 321, "original start", "trunk unit", "Owner")
+        self.assertEqual(len(paths), 2)
+
+    def test_plain_darwin_fixer_does_not_print_a_detached_startup_line(self) -> None:
+        environment = {key: value for key, value in os.environ.items() if key != detached.STARTUP_SIGNAL_ENV}
+        with (patch.object(sys, "platform", "darwin"), patch.object(herdr, "_PLATFORM", "darwin"),
+              patch.dict(os.environ, environment, clear=True),
+              patch.object(remote_control, "_fix", return_value=remote_control.AlreadyOn()),
+              redirect_stderr(io.StringIO()) as error, redirect_stdout(io.StringIO()) as output):
+            _ = remote_control.fix("id", 321, "start", "Owner", "Owner")
+        self.assertEqual(error.getvalue(), "")
+        self.assertEqual(output.getvalue(), "Owner: Remote Control already on\n")
+
+    def test_darwin_fixer_failed_child_reports_service_and_keeps_its_log(self) -> None:
+        self.allow_leaf(ShutdownSendLeaf.LAUNCH_REMOTE_CONTROL_FIXER)
+        paths: list[Path] = []
+
+        def fail(argv: Sequence[str], *, ready: Callable[[], bool], within: float,
+                  output: detached.AppendLog, environment: detached.ExplicitEnvironment) -> int:
+            log = output.path
+            self.assertEqual(environment.mapping[detached.STARTUP_SIGNAL_ENV], "1")
+            del argv, within
+            self.assertFalse(ready())
+            paths.append(log)
+            _ = log.write_text("child import failed\n")
+            raise detached.DetachedStartFailure("child exited with status 1")
+
+        with (patch.object(sys, "platform", "darwin"), patch.object(herdr, "_PLATFORM", "darwin"),
+              patch.object(detached, "start_detached", side_effect=fail),
+              patch.object(subprocess, "run", side_effect=AssertionError("service manager used")),
+              self.assertRaisesRegex(RuntimeError,
+                  "could not start Remote Control fixer shutdown-remote-control-owner-identi-321: child exited with status 1") as failure):
+            remote_control.launch_fixer("owner-identifier", 321, "original start", "trunk unit", "Owner")
+        self.assertEqual(paths[0].read_text(), "child import failed\n")
+        self.assertIn(str(paths[0]), str(failure.exception))

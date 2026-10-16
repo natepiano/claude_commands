@@ -3,16 +3,17 @@
 from __future__ import annotations
 
 import argparse
+import json
+from collections.abc import Iterator
 import os
 import re
-import shlex
 import subprocess
 import sys
 import time
 from dataclasses import dataclass, replace
 from datetime import datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, NamedTuple, cast, override
+from typing import TYPE_CHECKING, NamedTuple, TypedDict, cast, override
 from zoneinfo import ZoneInfo
 
 SCRIPTS = Path(__file__).resolve().parents[1]
@@ -21,9 +22,11 @@ sys.path.insert(0, str(SCRIPTS / "hooks"))
 sys.path.insert(0, str(SCRIPTS / "shutdown"))
 
 import unit_lookup
+from production_units import Refusal, cell_value, unit_rows, unit_headings, unit_table
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
 from user_zone import user_zone  # noqa: E402
+from probe_session import PROBE_ENV  # noqa: E402
 
 if TYPE_CHECKING:
     from scripts.accounts.accounts import ClaudeLaunchAccount
@@ -101,6 +104,7 @@ class UnitRestoreLaunch(NamedTuple):
     session_name: str
     # The unit's tmux or herdr session it is restored into.
     host_session: str
+    probe: bool = False
 
 
 class DefaultEffort(NamedTuple):
@@ -221,24 +225,14 @@ class ReadyToLaunch(NamedTuple):
 
 @dataclass(frozen=True)
 class MarkedUnitFound:
-    """The unit already has a tmux session carrying its marks."""
+    """The unit already has a session carrying its marks."""
 
     unit: unit_lookup.MarkedUnit
 
 
 @dataclass(frozen=True)
 class NoMarkedUnit:
-    """No tmux session carries the requested unit's marks."""
-
-
-class Refusal(Exception):
-    """An invalid request that must leave the production unchanged."""
-
-
-def cell_value(value: str) -> str:
-    """Read the value before a cell's commentary."""
-    quoted = re.search(r"`([^`]+)`", value)
-    return quoted.group(1) if quoted else value.split(" — ", 1)[0].strip()
+    """No session carries the requested unit's marks."""
 
 
 def is_review_unit(unit: str, lines: list[str]) -> bool:
@@ -344,6 +338,9 @@ def launch_request(args: argparse.Namespace) -> RequestedUnitLaunch:
         )
     if restart_note is not None and resumed is None:
         raise Refusal("restart launch flags require --resume")
+    probe = cast(bool, args.probe)
+    if probe and restart_note is None:
+        raise Refusal("--probe requires a shutdown restore with --restart-note")
     if (resumed is None) != (cwd is None):
         raise Refusal("--resume and --cwd must be given together")
     if resumed is not None and isinstance(plan, BriefGiven):
@@ -365,6 +362,7 @@ def launch_request(args: argparse.Namespace) -> RequestedUnitLaunch:
             Path(restart_note).expanduser(),
             session_name,
             host_session,
+            probe,
         )
     else:
         launch_kind = NewWorkLaunch()
@@ -388,99 +386,6 @@ def launch_request(args: argparse.Namespace) -> RequestedUnitLaunch:
         launch_kind=launch_kind,
         timeout=timeout,
     )
-
-
-def unit_rows(lines: list[str]) -> tuple[int, list[str]]:
-    try:
-        start = lines.index("## Units")
-    except ValueError as error:
-        raise Refusal("production doc lacks Units table") from error
-    end = next((i for i in range(start + 1, len(lines)) if lines[i].startswith("## ")), len(lines))
-    rows = [line for line in lines[start + 1:end] if line.startswith("|")]
-    if len(rows) < 2 or not rows[0].startswith("| Unit |"):
-        raise Refusal("production doc has invalid Units table")
-    insert_at = max(i for i in range(start + 1, end) if lines[i].startswith("|")) + 1
-    return insert_at, rows[2:]
-
-
-def row_cells(row: str) -> list[str]:
-    return [cell.strip() for cell in row.strip().strip("|").split("|")]
-
-
-def unit_headings(lines: list[str]) -> list[str]:
-    """The Units table's column headings, in the doc's own order."""
-    _ = unit_rows(lines)
-    return row_cells(next(line for line in lines[lines.index("## Units"):] if line.startswith("| Unit |")))
-
-
-def unit_table(lines: list[str]) -> list[dict[str, str]]:
-    """Each Units row as its cells by column heading, as written.
-
-    Reading by heading lets a doc that still has the retired Session column read like one without it.
-    """
-    headings = unit_headings(lines)
-    _, rows = unit_rows(lines)
-    return [dict(zip(headings, row_cells(row), strict=False)) for row in rows]
-
-
-def plan_cell_is_retired(plan_cell: str) -> bool:
-    """Return whether a Plan cell begins with the retired marker."""
-    return re.match(r"^\s*\(?retired\b", plan_cell) is not None
-
-
-def worktree_is_linked(worktree: str) -> bool:
-    """Return whether `worktree` is a linked worktree on disk.
-
-    A main checkout, where `.git` is a directory, is shared and is no unit's own worktree.
-    """
-    return bool(worktree) and (Path(worktree) / ".git").is_file()
-
-
-class SessionMarks:
-    """Which of a production's units have a tmux session, asked of tmux once and only when a row needs it."""
-
-    def __init__(self, slug: str) -> None:
-        self._slug: str = slug
-        self._units: set[str] | None = None
-        self._unknown: bool = False
-
-    def has(self, unit: str) -> bool:
-        """Whether a tmux session carries the unit's mark. A tmux that cannot say has not said no."""
-        if self._units is None:
-            try:
-                self._units = set(unit_lookup.marked_units(self._slug))
-            except OSError:
-                self._units, self._unknown = set(), True
-        return self._unknown or unit in self._units
-
-
-def unit_is_retired(cells: dict[str, str], marks: SessionMarks) -> bool:
-    """Return whether a Units row's unit is retired.
-
-    It is when its Plan cell says so, or when its worktree and its tmux session are both gone
-    (user 2026-10-08): such a unit has nothing left to address. The worktree is asked first, so a
-    unit whose session is only restarting keeps its row, and tmux is asked only about a unit
-    with no worktree of its own. The session is the one carrying the unit's mark, whatever its name.
-    """
-    if plan_cell_is_retired(cells.get("Plan", "")):
-        return True
-    if "Worktree" not in cells:
-        return False
-    return (not worktree_is_linked(cell_value(cells["Worktree"]))
-            and not marks.has(cell_value(cells.get("Unit", ""))))
-
-
-def live_unit_table(lines: list[str], slug: str) -> list[dict[str, str]]:
-    """Return Units rows, by column heading, whose unit is not retired."""
-    marks = SessionMarks(slug)
-    return [cells for cells in unit_table(lines) if not unit_is_retired(cells, marks)]
-
-
-def retired_units(lines: list[str], slug: str) -> set[str]:
-    """Return unit names from Units rows whose unit is retired."""
-    marks = SessionMarks(slug)
-    retired = {cell_value(cells.get("Unit", "")) for cells in unit_table(lines) if unit_is_retired(cells, marks)}
-    return retired - {""}
 
 
 def desired_row(request: UnitLaunch, headings: list[str]) -> str:
@@ -591,7 +496,7 @@ def director_agent(request: UnitLaunch) -> DirectorAgent:
 
 
 def preflight(request: RequestedUnitLaunch, selected: ClaudeLaunchAccount) -> ReadyToLaunch:
-    from scripts.accounts.accounts import main_config_dir, trust_command
+    from scripts.accounts.accounts import trust_command
     from scripts.herdr.herdr import Untrusted, UnreadableTrustFile, claude_trust, repository_trust_key
 
     production = request.production
@@ -623,7 +528,7 @@ def preflight(request: RequestedUnitLaunch, selected: ClaudeLaunchAccount) -> Re
         timeout=request.timeout,
     )
     account = selected
-    account_file = Path.home() / ".claude.json" if account.dir == main_config_dir() else account.dir / ".claude.json"
+    account_file = account.dir / ".claude.json"
     folder = request.session_cwd
     check_folder = (repository_trust_key(production.checkout)
                     if isinstance(request.session, NewSession) and not folder.exists() else folder)
@@ -780,9 +685,17 @@ def prompt_for(request: UnitLaunch) -> str:
             f"approval before you run /unit:direct {plan}.")
 
 
+def host_session_name(request: UnitLaunch) -> str:
+    """The destination name, limited to characters supported by named herdr sessions."""
+    name = (request.launch_kind.host_session if isinstance(request.launch_kind, UnitRestoreLaunch)
+            else request.identity.session)
+    import herdr
+
+    return herdr.generated_session_name(name)
+
+
 def launch_session(
     request: UnitLaunch,
-    tmux: str,
     director: DirectorAgent,
     prompt: str,
     selected: ClaudeLaunchAccount,
@@ -790,49 +703,50 @@ def launch_session(
     target: str = "",
     model: str = "",
 ) -> None:
-    """Start the unit's session in a tmux session marked as this unit of this production.
+    """Start Claude in its own herdr session carrying this unit's marks."""
+    import herdr
+    from scripts.accounts import accounts
+    from scripts.whoami.account import named_account_environment
 
-    The marks are what finds the unit afterwards; its name is only what it is called at launch.
-    """
-    from scripts.accounts.accounts import account_prefix
-
-    marks = {unit_lookup.PRODUCTION_MARK: request.production.slug, unit_lookup.UNIT_MARK: request.identity.unit}
-    launch_model = model or director.model
-    argv = ["claude", "--model", launch_model]
+    environment = {unit_lookup.PRODUCTION_MARK: request.production.slug,
+                   unit_lookup.UNIT_MARK: request.identity.unit, "ENABLE_TOOL_SEARCH": "true"}
+    if target:
+        if target != selected.label:
+            raise Refusal("resume target must match the selected group account")
+        prepared = accounts.prepared_account(selected.label, resume=True)
+        if isinstance(prepared, accounts.AccountRefused):
+            raise Refusal(prepared.reason)
+        environment.update(prepared.variables)
+        for key in prepared.remove:
+            _ = environment.pop(key, None)
+    else:
+        environment.update(named_account_environment(selected.dir))
+    arguments = ["--model", model or director.model]
     if isinstance(director.effort, Effort):
-        argv.extend(["--effort", director.effort.value])
+        arguments.extend(["--effort", director.effort.value])
     if isinstance(request.session, ResumedSession):
-        argv.extend(["--resume", request.session.session_id])
-    session_name = (request.launch_kind.session_name
-                    if isinstance(request.launch_kind, UnitRestoreLaunch)
-                    else request.identity.session)
-    tmux_session = (request.launch_kind.host_session
-                    if isinstance(request.launch_kind, UnitRestoreLaunch)
+        arguments.extend(["--resume", request.session.session_id])
+    session_name = (request.launch_kind.session_name if isinstance(request.launch_kind, UnitRestoreLaunch)
                     else request.identity.session)
     profile = request.profile
     flags = profile.flags if isinstance(profile, ProfiledLaunch) else ("--settings", '{"disableAgentView": true}')
-    argv.extend(["--remote-control", session_name, "-n", session_name, *flags, prompt])
-    prefix = account_prefix(selected)
-    if target:
-        argv = [sys.executable, str(SCRIPTS / "accounts" / "accounts.py"), "exec", target, *argv[1:]]
-        prefix = ""
-    command = "unset CLAUDE_CONFIG_DIR CLAUDE_CODE_REMOTE_MEMORY_DIR CLAUDE_CODE_OAUTH_TOKEN; " + prefix + "ENABLE_TOOL_SEARCH=true command " + shlex.join(argv) + "; exec zsh"
-    environment = launch_environment()
-    scope_name = re.sub(r"[^A-Za-z0-9_.-]", "-", tmux_session)
-    scope = f"--unit={scope_name}-{int(time.time())}"
-    _ = subprocess.run(["systemd-run", "--user", "--scope", scope, tmux,
-                        "new-session", "-d", "-s", tmux_session, "-c", str(request.session_cwd),
-                        *(argument for name, value in marks.items() for argument in ("-e", f"{name}={value}")),
-                        "zsh", "-ic", command],
-                       env=environment, text=True, capture_output=True, check=True)
-    directory = selected.dir
-    for option, value in (("@claude_config_dir", str(directory)), ("@claude_model", launch_model)):
-        _ = subprocess.run([tmux, "set-option", "-t", f"={tmux_session}:", option, value],
-                           env=environment, text=True, capture_output=True, check=True)
+    if isinstance(request.launch_kind, UnitRestoreLaunch) and request.launch_kind.probe:
+        environment[PROBE_ENV] = "1"
+    arguments.extend(["--remote-control", session_name, "-n", session_name, *flags])
+    name = host_session_name(request)
+    timeout_ms = int(request.timeout * 1000)
+    herdr.start_new_server(name, timeout_ms)
+    pane = herdr.open_pane(name, name, str(request.session_cwd), environment)
+    try:
+        herdr.start_agent(name, pane, kind="claude", agent_arguments=arguments,
+                          opening=herdr.OpeningPrompt(prompt), timeout_ms=timeout_ms)
+    except herdr.AgentExited:
+        herdr.stop_session(name)
+        raise
 
 
 def launch_environment() -> dict[str, str]:
-    """The environment inherited by a unit's Claude process."""
+    """The sanitized caller environment used by the launch-permission check."""
     return {
         key: value
         for key, value in os.environ.items()
@@ -855,18 +769,16 @@ def record_scheduled_restore_prompt(session_id: str, prompt: str) -> None:
 
 
 def launched_unit(request: UnitLaunch | RequestedUnitLaunch) -> MarkedUnitFound | NoMarkedUnit:
-    """The unit's tmux session, found by its mark."""
+    """The unit's session, found by its mark."""
     unit = unit_lookup.marked_units(request.production.slug).get(
         request.unit if isinstance(request, RequestedUnitLaunch) else request.identity.unit
     )
     return NoMarkedUnit() if unit is None else MarkedUnitFound(unit)
 
 
-def wait_for_remote_control(request: UnitLaunch, tmux: str) -> unit_lookup.MarkedUnit:
+def wait_for_remote_control(request: UnitLaunch) -> unit_lookup.MarkedUnit:
     from session_pane import HerdrFailure, read_place
 
-    # Keep the launch caller's argument; the pane library now resolves the host.
-    del tmux
     found = launched_unit(request)
     if isinstance(found, NoMarkedUnit):
         raise RuntimeError(f"{request.identity.unit}: no session carries its mark")
@@ -907,6 +819,58 @@ def account_for_launch(request: RequestedUnitLaunch, target: str = "", config_di
         raise Refusal(str(error)) from error
 
 
+class TranscriptMessage(TypedDict, total=False):
+    model: str
+
+
+class TranscriptEntry(TypedDict, total=False):
+    type: str
+    message: TranscriptMessage
+
+
+def transcript_lines_from_end(path: Path) -> Iterator[str]:
+    """Read newest entries first without loading the whole conversation."""
+    with path.open("rb") as stream:
+        offset = stream.seek(0, os.SEEK_END)
+        pending = b""
+        while offset:
+            size = min(offset, 65536)
+            offset -= size
+            _ = stream.seek(offset)
+            lines = (stream.read(size) + pending).split(b"\n")
+            pending = lines[0]
+            for line in reversed(lines[1:]):
+                yield line.decode("utf-8", errors="replace")
+        if pending:
+            yield pending.decode("utf-8", errors="replace")
+
+
+def transcript_model(session_id: str) -> str:
+    """The newest real assistant model in the newest transcript for this session."""
+    try:
+        matches = list((Path.home() / ".claude/projects").rglob(f"{session_id}.jsonl"))
+        if not matches:
+            return ""
+        path = max(matches, key=lambda path: path.stat().st_mtime)
+        for line in transcript_lines_from_end(path):
+            try:
+                value = cast(object, json.loads(line))
+            except ValueError:
+                continue
+            if not isinstance(value, dict):
+                continue
+            entry = cast(TranscriptEntry, cast(object, value))
+            message = cast(object, entry.get("message"))
+            if entry.get("type") != "assistant" or not isinstance(message, dict):
+                continue
+            model = cast(object, cast(TranscriptMessage, cast(object, message)).get("model", ""))
+            if isinstance(model, str) and model and model != "<synthetic>":
+                return model
+    except OSError:
+        pass
+    return ""
+
+
 def model_for_resume(request: RequestedUnitLaunch, explicit: str = "") -> str:
     """Use the recorded model when available, with --model as the restore boundary."""
     if isinstance(request.session, NewSession):
@@ -925,6 +889,9 @@ def model_for_resume(request: RequestedUnitLaunch, explicit: str = "") -> str:
         return saved[0]["session"]["model"]["name"]
     found = launched_unit(request)
     if isinstance(found, MarkedUnitFound):
+        import herdr
+        if isinstance(found.unit.place, herdr.HerdrPlace):
+            return transcript_model(request.session.session_id)
         result = subprocess.run([unit_lookup.tmux_binary(), "show-options", "-v", "-t",
                                  f"={found.unit.label}:", "@claude_model"],
                                 capture_output=True, text=True, check=False)
@@ -949,25 +916,27 @@ class AlreadyAdopted:
 
 def adoptable(request: RequestedUnitLaunch, label: str) -> Adoptable | AlreadyAdopted:
     from scripts.accounts import accounts
-    from scripts.whoami.account import process_config_dir
+    from scripts.whoami import account as account_reader
     from scripts.whoami.agent_accounts import NumberedAccount
 
     found = launched_unit(request)
     if isinstance(found, MarkedUnitFound):
-        if found.unit.label == label:
+        if found.unit.label == label and isinstance(found.unit.place, unit_lookup.TmuxPlace):
             return AlreadyAdopted(label)
         raise Refusal(f"{request.unit} already runs in {found.unit.label}")
     taken = [f"{unit} of {slug}" for slug, units in unit_lookup.every_marked_unit().units.items()
-             for unit, marked in units.items() if marked.label == label]
+             for unit, marked in units.items()
+             if isinstance(marked.place, unit_lookup.TmuxPlace) and marked.label == label]
     if taken:
         raise Refusal(f"tmux session {label} is already {taken[0]}")
     claude = unit_lookup.tmux_claude(label)
     if not isinstance(claude, unit_lookup.LiveClaude):
         reason = claude.reason if isinstance(claude, unit_lookup.ClaudeUnknown) else "no Claude runs in it"
         raise Refusal(f"tmux session {label} cannot be adopted: {reason}")
-    directory = process_config_dir(claude.pid)
-    if directory is None:
+    setting = account_reader.process_account_directory(account_reader.process_config_dir(claude.pid))
+    if not isinstance(setting, account_reader.ConfiguredClaudeFolder):
         raise Refusal(f"tmux session {label} cannot be adopted: the account of pid {claude.pid} is unreadable")
+    directory = setting.path
     if directory.resolve() == accounts.main_config_dir().resolve():
         identity = accounts.account_identity(directory)
         if not isinstance(identity, NumberedAccount):
@@ -1014,29 +983,34 @@ def main(argv: list[str]) -> int:
     _ = parser.add_argument("--restart-note")
     _ = parser.add_argument("--session-name")
     _ = parser.add_argument("--host-session")
+    _ = parser.add_argument("--probe", action="store_true", help=argparse.SUPPRESS)
     _ = parser.add_argument("--check", action="store_true")
     args = parser.parse_args(argv)
+    import herdr
     try:
         request = launch_request(args)
         # Table readers import this module from copied trees without accounts.
         from scripts.accounts import accounts
 
         adopt = cast(str | None, args.adopt)
+        if adopt is not None:
+            import shutil
+
+            if not shutil.which(os.environ.get("UNIT_LOOKUP_TMUX") or "tmux"):
+                raise Refusal("--adopt needs tmux; no tmux binary is available")
         adopted = adoptable(request, adopt) if adopt is not None else None
         if adopted is not None and isinstance(adopted, AlreadyAdopted):
             print(f"{request.unit} already adopted: tmux attach -t {adopted.label}")
             return 0
         unit_account = (adopted.account if adopted is not None
                         else account_for_launch(request, cast(str, args.account), cast(str, args.config_dir)))
-        if unit_account.dir != accounts.main_config_dir():
-            problems = accounts.check(unit_account.label)
-            if problems:
-                raise Refusal(
-                    f"unit account {unit_account.label}: {problems[0]}; /showrunner:accounts"
-                )
+        problems = accounts.check(unit_account.label)
+        if problems:
+            raise Refusal(
+                f"unit account {unit_account.label}: {problems[0]}; /showrunner:accounts"
+            )
         resume_model = model_for_resume(request, cast(str, args.model))
-        # Imported only on the launch path: table readers import add_unit from
-        # copied trees that do not include scripts/shutdown.
+        # Read the shutdown launch barrier only when a unit is launched.
         import launch_permission
 
         barrier = launch_permission.launch_barrier()
@@ -1048,15 +1022,14 @@ def main(argv: list[str]) -> int:
             ) from error
         try:
             purpose: launch_permission.LaunchPurpose = (
-                launch_permission.ShutdownUnitRestoreLaunchPurpose(
+                launch_permission.RecordedSessionRestoreLaunchPurpose(
                     request.launch_kind.session_id
                 )
                 if isinstance(request.launch_kind, UnitRestoreLaunch)
                 else launch_permission.NewWorkLaunchPurpose()
             )
             permission_environment = launch_environment()
-            if unit_account.dir != accounts.main_config_dir():
-                permission_environment["CLAUDE_CONFIG_DIR"] = str(unit_account.dir)
+            permission_environment["CLAUDE_CONFIG_DIR"] = str(unit_account.dir)
             permission = launch_permission.launch_permission(
                 permission_environment, purpose
             )
@@ -1075,7 +1048,6 @@ def main(argv: list[str]) -> int:
             request = ready.launch
             if cast(bool, args.check):
                 return 0
-            tmux = unit_lookup.tmux_binary()
             marked_unit = launched_unit(request)
             if (
                 isinstance(request.session, ResumedSession)
@@ -1090,31 +1062,26 @@ def main(argv: list[str]) -> int:
                 if isinstance(unit.claude, unit_lookup.ClaudeNotRunning):
                     if isinstance(unit.place, unit_lookup.TmuxPlace):
                         _ = subprocess.run(
-                            [tmux, "kill-session", "-t", unit.place.pane],
+                            [unit_lookup.tmux_binary(), "kill-session", "-t", unit.place.pane],
                             capture_output=True,
                             text=True,
                             check=True,
                         )
                     else:
-                        import herdr
-
                         try:
-                            herdr.stop_session(unit.label)
+                            herdr.stop_session(unit.place.session)
                         except herdr.HerdrFailure as error:
                             raise Refusal(f"cannot end session {unit.label}: {error}") from error
                     marked_unit = NoMarkedUnit()
-            tmux_session = (
-                request.launch_kind.host_session
-                if isinstance(request.launch_kind, UnitRestoreLaunch)
-                else request.identity.session
-            )
-            if adopted is None and isinstance(marked_unit, NoMarkedUnit) and tmux_live(
-                tmux, tmux_session
-            ):
-                raise Refusal(
-                    f"tmux session {tmux_session} is already live and is not marked as "
-                    + request.identity.unit
-                )
+            name = host_session_name(request)
+            if adopted is None and isinstance(marked_unit, NoMarkedUnit):
+                try:
+                    running = any(entry["name"] == name for entry in herdr.live_sessions())
+                except herdr.HerdrFailure as error:
+                    raise Refusal(str(error)) from error
+                if running:
+                    raise Refusal(f"herdr session {name} is already live and is not marked as "
+                                  + request.identity.unit)
             write_stub(request)
             append_row(request, ready.row)
             commit_unit(request)
@@ -1122,7 +1089,7 @@ def main(argv: list[str]) -> int:
             if not isinstance(request.launch_kind, UnitRestoreLaunch):
                 ensure_worktree(request)
             if adopted is not None:
-                adopt_session(request, adopted, tmux)
+                adopt_session(request, adopted, unit_lookup.tmux_binary())
                 record(request)
                 print(f"{request.identity.unit} adopted: tmux attach -t {adopted.label}")
                 return 0
@@ -1132,30 +1099,32 @@ def main(argv: list[str]) -> int:
                     record_scheduled_restore_prompt(
                         request.launch_kind.session_id, prompt
                     )
-                launch_session(request, tmux, ready.director, prompt, unit_account,
-                               target=unit_account.label
+                launch_session(request, ready.director, prompt, unit_account, target=unit_account.label
                                if isinstance(request.session, ResumedSession) else "", model=resume_model)
         finally:
             _ = barrier.__exit__(None, None, None)
         if isinstance(request.launch_kind, UnitRestoreLaunch):
             record(request)
-            restored_tmux_session = (
-                marked_unit.unit.label
-                if isinstance(marked_unit, MarkedUnitFound)
-                else request.launch_kind.host_session
-            )
-            print(
-                f"{request.identity.unit} restore launched: tmux attach -t {restored_tmux_session}"
-            )
+            attach = f"herdr session attach {host_session_name(request)}"
+            if isinstance(marked_unit, MarkedUnitFound):
+                unit = marked_unit.unit
+                attach = (f"tmux attach -t {unit.label}" if isinstance(unit.place, unit_lookup.TmuxPlace)
+                          else f"herdr session attach {unit.label}")
+            print(f"{request.identity.unit} restore launched: {attach}")
             return 0
-        launched = wait_for_remote_control(request, tmux)
+        launched = wait_for_remote_control(request)
         record(request)
-        print(f"{request.identity.unit} started: tmux attach -t {launched.label}")
+        attach = (f"tmux attach -t {launched.label}" if isinstance(launched.place, unit_lookup.TmuxPlace)
+                  else f"herdr session attach {launched.label}")
+        print(f"{request.identity.unit} started: {attach}")
         return 0
-    except Refusal as error:
+    except herdr.AgentNotReady as error:
+        print(f"add_unit: the session is not ready:\n{error.screen}", file=sys.stderr)
+        return 1
+    except (Refusal, herdr.SessionTaken) as error:
         print(f"add_unit: {error}", file=sys.stderr)
         return 2
-    except (OSError, UnicodeError, subprocess.CalledProcessError, RuntimeError, ValueError) as error:
+    except (OSError, UnicodeError, subprocess.SubprocessError, RuntimeError, ValueError, herdr.HerdrFailure) as error:
         detail = str(error)
         print(f"add_unit: {detail}", file=sys.stderr)
         return 1

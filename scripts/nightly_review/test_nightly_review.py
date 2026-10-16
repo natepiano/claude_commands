@@ -131,7 +131,7 @@ class NightlyReviewTests(unittest.TestCase):
             name="natedev", sessionId="sid", cwd="/work", pid=42)))
         with (mock.patch.object(nightly_review, "SESSIONS_DIR", sessions),
               mock.patch.object(showrunners, "registered_showrunners", return_value=[]),
-              mock.patch.object(account, "process_config_dir", return_value=config) as directory):
+              mock.patch.object(account, "process_config_dir", return_value=account.ConfiguredClaudeFolder(config)) as directory):
             self.assertEqual(nightly_review.showrunner_transcripts(since), [path])
         directory.assert_called_once_with(42)
 
@@ -148,6 +148,18 @@ class NightlyReviewTests(unittest.TestCase):
         _ = path.write_text("\n".join(json.dumps(record) for record in records) + '\n{"time":{},"verdict":"ask"}\n')
         self.assertEqual(nightly_review.live_message_counts(path, since),
                          nightly_review.LiveMessageCounts(4, 2, 1, (("reader-starts-cold", 2),)))
+
+    def test_question_review_records_leave_live_push_totals_unchanged(self) -> None:
+        since = datetime(2026, 10, 13, tzinfo=timezone.utc)
+        path = self.root / "review.jsonl"
+        push = nightly_review.NightlyVerdictRecord(time=since.isoformat(), verdict="send", failed_rules=[])
+        _ = path.write_text(json.dumps(push) + "\n")
+        before = nightly_review.live_message_counts(path, since)
+        for verdict in ("send", "ask", "failed", "unreviewed: timeout"):
+            with path.open("a") as output:
+                _ = output.write(json.dumps(dict(push, kind="question", verdict=verdict,
+                                                 failed_rules=["reader-starts-cold"])) + "\n")
+        self.assertEqual(nightly_review.live_message_counts(path, since), before)
 
     def test_failed_and_withheld_live_pushes_count_and_registry_failures_are_attributed(self) -> None:
         since = datetime(2026, 10, 13, tzinfo=timezone.utc)

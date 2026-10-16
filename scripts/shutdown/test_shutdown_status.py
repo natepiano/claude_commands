@@ -51,6 +51,11 @@ def empty_inventory(machine: str = "natedev") -> Inventory:
     }
 
 
+def empty_recovery_inventory() -> shutdown.RecoveryStatusInventory:
+    return shutdown.RecoveryStatusInventory(**empty_inventory(), recovery=[],
+        snapshot=shutdown.NoSnapshotOutcomeRecorded(kind="no outcome recorded"))
+
+
 def complete_session(*, host: object) -> dict[str, object]:
     return {
         "session_id": "11111111-1111-1111-1111-111111111111",
@@ -59,7 +64,9 @@ def complete_session(*, host: object) -> dict[str, object]:
         "name": "shutdown",
         "cwd": "/tmp/checkout",
         "kind": "top-level",
+        "probe": False,
         "status": "idle",
+        "updated_at": 0,
         "host": host,
         "model": {"kind": "model", "name": "opus"},
         "checkout": {
@@ -114,7 +121,7 @@ def session_shutdown(machine: str = "natedev", name: str = "shutdown") -> Sessio
     return SessionShutdown(
         login=LOGIN, label="claude2", machine=machine,
         requested_at=old["requested_at"], requested_by=old["requested_by"], request_id="request-one",
-        hold="account", then="stop", force=old["force"], alerts="user",
+        hold="account", then="stop", force=old["force"], alerts="user", probe=False,
         session=item["session"], workers=[], timers=item["timers"],
         settle_message=item["settle_message"], where=item["where"],
         progress=cast(record_store.SessionProgress, item["progress"]), stop_issues=[], trail=[],
@@ -311,6 +318,7 @@ else:
     def test_unreadable_own_account_exits_two(self) -> None:
         errors = io.StringIO()
         with (
+            patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": "current-session"}),
             redirect_stderr(errors),
             patch.object(
                 shutdown,
@@ -354,7 +362,7 @@ else:
         self.assertEqual(result, 0)
         self.assertEqual(
             output,
-            json.dumps([empty_inventory(), expected], sort_keys=True) + "\n",
+            json.dumps([empty_recovery_inventory(), expected], sort_keys=True) + "\n",
         )
         self.assertEqual(error, "")
 
@@ -380,7 +388,7 @@ else:
         self.assertEqual(result, 0)
         self.assertEqual(
             output,
-            json.dumps([empty_inventory(), expected], sort_keys=True) + "\n",
+            json.dumps([empty_recovery_inventory(), expected], sort_keys=True) + "\n",
         )
         self.assertEqual(error, "")
 
@@ -766,7 +774,7 @@ else:
         self.assertEqual(result, 0)
         self.assertEqual(
             output,
-            json.dumps([empty_inventory(), expected], sort_keys=True) + "\n",
+            json.dumps([empty_recovery_inventory(), expected], sort_keys=True) + "\n",
         )
         self.assertEqual(error, "")
 
@@ -780,7 +788,7 @@ else:
         self.assertEqual(
             output,
             json.dumps(
-                [empty_inventory(), {"machine": "Mac", "unreachable": True}],
+                [empty_recovery_inventory(), {"machine": "Mac", "unreachable": True}],
                 sort_keys=True,
             )
             + "\n",
@@ -961,6 +969,7 @@ else:
                 action_line("take out", "cancel", "failed, hana, nixos", machine),
                 action_line("stop now", "now", "failed, hana, nixos", machine),
                 action_line("bring back", "restart", "bevy, failed", machine),
+                *(["  recovery snapshot: no successful snapshot recorded"] if machine == "natedev" else []),
             ])
         self.assertEqual(output.getvalue().splitlines(), expected)
 
@@ -981,6 +990,7 @@ else:
             "  conductor ownership unavailable: cannot read lock",
             action_line("take out", "cancel", "hana, nixos"),
             action_line("stop now", "now", "hana, nixos"),
+            "  recovery snapshot: no successful snapshot recorded",
         ])
 
 

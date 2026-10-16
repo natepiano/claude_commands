@@ -78,7 +78,7 @@ class RefusalWatchTests(unittest.TestCase):
         (self.home / "notifier").mkdir()
         _ = self.enterContext(patch.object(showrunners, "NOTIFIER_STATE_DIR", self.home / "notifier"))
         _ = (self.home / ".claude.json").write_text(json.dumps({"oauthAccount": {"emailAddress": "main@example.invalid"}}))
-        for label, login in (("claude1", SOURCE_LOGIN), ("claude3", TARGET_LOGIN)):
+        for label, login in (("claude1", SOURCE_LOGIN), ("claude2", "main@example.invalid"), ("claude3", TARGET_LOGIN)):
             self.assertEqual(accounts.setup(label), [])
             _ = (accounts.account_dir(label) / ".claude.json").write_text(json.dumps({"oauthAccount": {"emailAddress": login}}))
             _ = (self.home / "notes" / note_name(label)).write_text(f"---\nlogin: {login}\n---\n")
@@ -103,22 +103,24 @@ class RefusalWatchTests(unittest.TestCase):
         self.reading(SOURCE_LOGIN, 0)
         self.reading(TARGET_LOGIN, 1, reset=NOW + timedelta(days=1))
 
-    def process_dir(self, pid: int) -> Path | None:
+    def process_dir(self, pid: int) -> account.ConfiguredClaudeFolder | account.ProcessEnvironmentUnread:
         found = next((owner for owner in self.owners if owner["pid"] == pid), None)
-        return Path(found["config_dir"]) if found is not None and "config_dir" in found else None
+        return account.ConfiguredClaudeFolder(Path(found["config_dir"])) if found is not None and "config_dir" in found else account.ProcessEnvironmentUnread("fixture")
 
-    def process_account(self, pid: int) -> account.Account | None:
+    def process_account(self, pid: int, *, home_state: account.LegacyHomeLogin | account.ConfigOnlyHome) -> account.Account | None:
         directory = self.process_dir(pid)
-        if directory is None:
+        if not isinstance(directory, account.ConfiguredClaudeFolder):
             return None
-        identity = accounts.account_identity(directory)
+        if directory.path == self.home / ".claude" and isinstance(home_state, account.LegacyHomeLogin):
+            return home_state.account
+        identity = accounts.account_identity(directory.path)
         return account.Account("claude", identity.login, identity.label) if isinstance(identity, agent_accounts.NumberedAccount) else None
 
     def inventory_for(self, login: str, only: frozenset[str] = NO_SESSION_FILTER, *,
                       refresh_desktops: bool = True) -> inventory.Inventory:
         self.assertFalse(refresh_desktops, "the watcher must read the desktop snapshot without invoking its timer")
         owners = [owner for owner in self.owners
-                  if (identity := self.process_account(owner["pid"])) is not None
+                  if (identity := self.process_account(owner["pid"], home_state=account.home_account_state())) is not None
                   and identity.login.casefold() == login.casefold()
                   and (not only or owner["session_id"] in only)]
         return inventory.Inventory(machine="natedev", login=login,
@@ -129,7 +131,7 @@ class RefusalWatchTests(unittest.TestCase):
         del registrations
         result: list[inventory.ListedSession] = []
         for owner in self.owners:
-            identity = self.process_account(owner["pid"])
+            identity = self.process_account(owner["pid"], home_state=account.home_account_state())
             if identity is None or login is not None and identity.login != login:
                 continue
             production = (owner["production"] if owner["kind"] == "showrunner" else
@@ -142,8 +144,8 @@ class RefusalWatchTests(unittest.TestCase):
 
     def owner(self, identity: str, *, host: str = "terminal", label: str = "claude1") -> inventory.Session:
         fields = inventory.SessionFields(session_id=identity, pid=1000 + len(self.owners),
-            proc_start="fixture-start", name="owner " + identity, cwd=str(self.home / "checkout"),
-            status="idle", model=inventory.ModelName(kind="model", name="opus-real"),
+            proc_start="fixture-start", name="owner " + identity, cwd=str(self.home / "checkout"), probe=False,
+            status="idle", updated_at=0, model=inventory.ModelName(kind="model", name="opus-real"),
             checkout=inventory.NotACheckout(kind="not a checkout"),
             run_dirs=[], codex_servers=[], timers=[], config_dir=str(accounts.account_dir(label)))
         if host == "unit":
@@ -214,12 +216,12 @@ class RefusalWatchTests(unittest.TestCase):
         why = command[command.index("--why") + 1]
         for identity in ids:
             owner = next(owner for owner in self.owners if owner["session_id"] == identity)
-            source = self.process_account(owner["pid"])
+            source = self.process_account(owner["pid"], home_state=account.home_account_state())
             assert source is not None
             saved = record.SessionShutdown(login=source.login, label=source.label, machine="natedev",
                 requested_at=WatchTime.at.isoformat(), request_id=f"batch-{len(self.commands)}",
                 requested_by=record.FromTerminal(kind="terminal"), hold="session", then="restart",
-                force="wait for ready", alerts="user", session=owner, workers=[], timers=[],
+                force="wait for ready", alerts="user", probe=False, session=owner, workers=[], timers=[],
                 settle_message=record.SettleMessageNotSent(kind="not sent"), where=record.WhereNotSaid(kind="not said"),
                 progress=record.SessionWaiting(kind="waiting"), trail=[], stop_issues=[], target=target,
                 source_label=source.label, why=why, move_id=command[command.index("--move-id") + 1])
@@ -942,6 +944,42 @@ class RefusalWatchTests(unittest.TestCase):
         self.assertEqual(self.snapshot(), before)
         self.assertEqual(moves.read_moves(), [])
 
+    def test_preview_accepts_repairable_destinations_without_changing_any_home_entry(self) -> None:
+        _ = self.groups(units="claude3")
+        _ = self.owner("off-target-unit", host="unit")
+        _ = self.transcript("off-target-unit")
+        _ = self.owner("scratch-refusal", host="terminal")
+        _ = self.transcript("scratch-refusal")
+        destination = accounts.account_dir("claude3")
+        shared = self.home / ".claude"
+        (destination / "shell-snapshots").unlink()
+        (destination / "shell-snapshots").mkdir()
+        for label in ("claude1", "claude2", "claude3"):
+            (accounts.account_dir(label) / "skills").unlink()
+        (shared / "skills").rmdir()
+        _ = (destination / "settings.json").write_bytes(b"adoptable local settings")
+
+        def listing() -> dict[str, tuple[int, int, int, int, str]]:
+            entries: dict[str, tuple[int, int, int, int, str]] = {}
+            for path in self.home.rglob("*"):
+                stat = path.lstat()
+                entries[str(path.relative_to(self.home))] = (
+                    stat.st_ino, stat.st_mode, stat.st_size, stat.st_mtime_ns,
+                    os.readlink(path) if path.is_symlink() else "")
+            return entries
+
+        before = listing()
+        code, output, error = self.cli("--dry-run")
+        self.assertIn(code, (0, None))
+        self.assertEqual(error, "")
+        self.assertIn("off-target-unit", output)
+        self.assertIn("scratch-refusal", output)
+        self.assertIn("claude3", output)
+        self.assertNotIn("refused:", output)
+        self.assertEqual(listing(), before)
+        self.assertEqual((destination / "settings.json").read_bytes(), b"adoptable local settings")
+        self.assertEqual(self.commands, [])
+
     def test_only_last_entry_with_all_refusal_markers_is_detected(self) -> None:
         for identity, tail in (
             ("user-last", {"type": "user", "message": {"content": "hello"}}),
@@ -1143,7 +1181,7 @@ class RefusalWatchTests(unittest.TestCase):
         self.assertEqual([entry["kind"] for entry in entries], ["waited", "wait ended"])
         self.assertEqual(entries[0]["move_id"], entries[1]["move_id"])
         self.assertEqual(self.commands, [])
-        self.assertEqual(self.process_dir(self.owners[0]["pid"]), accounts.account_dir("claude1"))
+        self.assertEqual(self.process_dir(self.owners[0]["pid"]), account.ConfiguredClaudeFolder(accounts.account_dir("claude1")))
         _ = self.transcript("refused", "weekly limit", at=reset, entry_id="later-refusal")
         _ = self.cli()
         self.assertEqual(len(self.commands), 1)
@@ -1391,7 +1429,7 @@ class RefusalWatchTests(unittest.TestCase):
         _ = self.transcript(owner["session_id"])
         _ = self.cli()
         fields = inventory.SessionFields(session_id="worker-refused", pid=12345, proc_start="fixture-start",
-            name="worker", cwd=owner["cwd"], status="idle", model=owner["model"], checkout=owner["checkout"],
+            name="worker", cwd=owner["cwd"], status="idle", updated_at=0, probe=False, model=owner["model"], checkout=owner["checkout"],
             run_dirs=[], codex_servers=[], timers=[], config_dir=str(accounts.account_dir("claude1")))
         worker = inventory.WorkerSession(**fields, kind="worker", host=inventory.UnknownHost(kind="unknown"),
             owner=inventory.DirectorOwner(kind="director", session_id=owner["session_id"]))
@@ -1435,7 +1473,7 @@ class RefusalWatchTests(unittest.TestCase):
         transition = accounts.group_transition("showrunners")
         assert isinstance(transition, accounts.GroupTransition)
         move.assert_called_once_with(("first", "second"), "claude3", why="weekly refusal",
-                                     origin=accounts.HandOrigin(), move_id=transition.move_id)
+                                     origin=accounts.HandOrigin(), move_id=transition.move_id, alerts="user")
 
     def test_named_window_without_known_reset_moves(self) -> None:
         _ = self.owner("refused")

@@ -1,25 +1,27 @@
 #!/usr/bin/env python3
-"""Enable Remote Control for one proven restarted process before asking the user."""
+"""Quietly enable Remote Control for one proven restarted process."""
 from __future__ import annotations
 
 import json
+import os
 import re
 import subprocess
 import sys
+import tempfile
 import time
 from dataclasses import dataclass
-from importlib import import_module
 from pathlib import Path
-from typing import Literal, Protocol, cast
+from typing import Protocol, cast
 
 SCRIPTS = Path(__file__).resolve().parents[1]
-for dependency in ("message", "production", "notify", "herdr"):
+for dependency in ("message", "production", "notify", "herdr", "lib"):
     sys.path.insert(0, str(SCRIPTS / dependency))
 
+import detached
+from launch_permission import shutdown_state_root
 import session_pane
 import sessions
 from herdr import AgentBlocked
-from push_texts import RenderedPush, render
 from record import SessionShutdown
 
 FLAG_WAIT = 60.0
@@ -32,11 +34,6 @@ POLL_SECONDS = 0.5
 class Clock(Protocol):
     def monotonic(self) -> float: ...
     def sleep(self, seconds: float) -> None: ...
-
-
-class ShutdownAlerts(Protocol):
-    def local_machine(self) -> str: ...
-    def alert_user(self, push: RenderedPush, *, machine: str = "") -> None: ...
 
 
 class SystemClock:
@@ -95,7 +92,7 @@ def remote_control_who(saved: SessionShutdown) -> str:
     return session["name"]
 
 
-def launch_fixer(session_id: str, pid: int, proc_start: str, who: str, alerts: Literal["user", "none"], session: str) -> None:
+def launch_fixer(session_id: str, pid: int, proc_start: str, who: str, session: str) -> None:
     """Start the local fixer independently of the conductor or restart command."""
     if pid <= 0 or not proc_start:
         raise ValueError("Remote Control fixer requires a process identity")
@@ -103,10 +100,25 @@ def launch_fixer(session_id: str, pid: int, proc_start: str, who: str, alerts: L
     service = f"shutdown-remote-control-{prefix}-{pid}"
     command = ["env", "PYTHONUNBUFFERED=1", sys.executable, "-u",
                str(Path(__file__).with_name("shutdown.py")), "remote-control", session_id,
-               "--pid", str(pid), "--proc-start", proc_start, "--who", who, "--alerts", alerts, "--session", session]
-    launch = (["launchctl", "submit", "-l", service, "--", *command] if sys.platform == "darwin"
-              else ["systemd-run", "--user", "--collect", "--quiet", "--no-block", "--unit", service, *command])
-    result = subprocess.run(launch, check=False, timeout=15)
+               "--pid", str(pid), "--proc-start", proc_start, "--who", who, "--session", session]
+    if sys.platform == "darwin":
+        try:
+            logs = shutdown_state_root() / "logs"
+            logs.mkdir(parents=True, exist_ok=True)
+            with tempfile.NamedTemporaryFile(dir=logs, prefix=service + "-", suffix=".log", delete=False) as output:
+                log = Path(output.name)
+        except OSError as error:
+            raise RuntimeError(f"could not start Remote Control fixer {service}: {error}") from error
+        try:
+            _ = detached.start_detached(command, within=15,
+                ready=lambda: "Remote Control fixer started\n" in log.read_text(encoding="utf-8"),
+                output=detached.AppendLog(log),
+                environment=detached.ExplicitEnvironment({**os.environ, detached.STARTUP_SIGNAL_ENV: "1"}))
+        except (detached.DetachedStartFailure, OSError) as error:
+            raise RuntimeError(f"could not start Remote Control fixer {service}: {error}; log: {log}") from error
+        return
+    launch = ["systemd-run", "--user", "--collect", "--quiet", "--no-block", "--unit", service, *command]
+    result = subprocess.run(launch, check=False, timeout=15, capture_output=True)
     if result.returncode:
         raise RuntimeError(f"could not start Remote Control fixer {service}")
 
@@ -200,14 +212,9 @@ def _fix(session_id: str, pid: int, proc_start: str, clock: Clock) -> RemoteCont
             clock.sleep(min(POLL_SECONDS, remaining))
 
 
-def alert_failed(who: str, session: str) -> None:
-    alerts = cast(ShutdownAlerts, cast(object, import_module("settle")))
-    machine = alerts.local_machine()
-    alerts.alert_user(render("shutdown.remote_control", who=who, session=session),
-                      machine="natedev" if machine.casefold() == "mac" else "")
-
-
-def fix(session_id: str, pid: int, proc_start: str, who: str, alerts: Literal["user", "none"], session: str, *, clock: Clock = _SYSTEM_CLOCK) -> RemoteControlOutcome:
+def fix(session_id: str, pid: int, proc_start: str, who: str, session: str, *, clock: Clock = _SYSTEM_CLOCK) -> RemoteControlOutcome:
+    if os.environ.pop(detached.STARTUP_SIGNAL_ENV, "") == "1":
+        print("Remote Control fixer started", file=sys.stderr, flush=True)
     outcome = _fix(session_id, pid, proc_start, clock)
     if isinstance(outcome, SessionGone):
         text = "session gone; Remote Control fixer finished"
@@ -217,7 +224,5 @@ def fix(session_id: str, pid: int, proc_start: str, who: str, alerts: Literal["u
         text = "Remote Control on after typing its command"
     else:
         text = f"Remote Control failed: {outcome.reason}"
-    print(f"{who}: {text}", flush=True)
-    if isinstance(outcome, Failed) and alerts == "user":
-        alert_failed(who, session)
+    print(f"{who or session}: {text}", flush=True)
     return outcome

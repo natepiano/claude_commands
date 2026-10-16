@@ -63,6 +63,12 @@ if arguments[:1] == ["metadata"]:
     print(os.environ["TEST_METADATA"])
 elif arguments[:1] not in (["mend"], ["clippy"], ["doc"], ["+nightly"]):
     raise SystemExit("unexpected cargo invocation: " + repr(arguments))
+# A file changes while this stage runs: mend's own rewrite, or a writer's edit.
+if arguments[:1] == [os.environ.get("TEST_EDIT_DURING", "")]:
+    with Path(os.environ["PACKAGE_ROOT"], "src", "lib.rs").open("a", encoding="utf-8") as source:
+        source.write("// changed during " + arguments[0] + "\n")
+if arguments[:1] == ["clippy"]:
+    raise SystemExit(int(os.environ.get("TEST_CLIPPY_STATUS", "0")))
 '''
 
 
@@ -103,7 +109,10 @@ if "rev-parse" in arguments:
         raise SystemExit(1)
 elif "diff" in arguments and "--name-only" in arguments:
     sys.stdout.write("src/lib.rs\0")
-elif "status" not in arguments and "ls-files" not in arguments:
+elif "status" in arguments:
+    if os.environ.get("TEST_GIT_DIRTY"):
+        sys.stdout.write(" M src/lib.rs\0")
+elif "ls-files" not in arguments:
     raise SystemExit(1)
 '''
 
@@ -174,7 +183,7 @@ class VerifyLintScopeTests(unittest.TestCase):
         self.environment = {
             name: value for name, value in os.environ.items()
             if not name.startswith(("BUILD", "PLAN_DELEGATE_", "LINT_", "MAC_TEST_",
-                                    "CARGO_", "RUST", "NEXTEST_", "CLAUDE_CODE_"))
+                                    "CARGO_", "RUST", "NEXTEST_", "CLAUDE_CODE_", "CODEX_"))
         }
         self.environment.update({
             "HOME": str(home),
@@ -385,6 +394,51 @@ class VerifyLintScopeTests(unittest.TestCase):
         self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
         self.assertIn("FAIL (recorded)", result.stdout)
         self.assertEqual(self.taplo_calls(), [])
+
+    def dirty_cache(self) -> Path:
+        """Turn the cache on with src/lib.rs uncommitted, so its content is in the tree key."""
+        self.environment["TEST_GIT_DIRTY"] = "1"
+        return self.enable_cache()
+
+    def clippy_ran(self) -> bool:
+        return self.events.exists() and bool(self.calls("clippy"))
+
+    def test_edit_while_clippy_fails_records_nothing_and_the_next_lint_runs(self) -> None:
+        cache = self.dirty_cache()
+        self.environment.update({"TEST_EDIT_DURING": "clippy", "TEST_CLIPPY_STATUS": "101"})
+        result = self.invoke_verify("lint", "sample", cwd=self.root)
+        self.assertEqual(result.returncode, 101, result.stdout + result.stderr)
+        self.assertIn("the tree changed while lint ran, so this result was not recorded", result.stdout)
+        self.assertEqual(sorted(path.name for path in cache.iterdir()), [])
+
+        self.environment.update({"TEST_EDIT_DURING": "", "TEST_CLIPPY_STATUS": "0"})
+        result = self.invoke_verify("lint", "sample", cwd=self.root)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertNotIn("(recorded)", result.stdout)
+        self.assertTrue(self.clippy_ran())
+        self.assertEqual(len(list(cache.glob("*.pass"))), 1)
+
+    def test_edit_while_clippy_passes_records_nothing(self) -> None:
+        cache = self.dirty_cache()
+        self.environment["TEST_EDIT_DURING"] = "clippy"
+        result = self.invoke_verify("lint", "sample", cwd=self.root)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("the tree changed while lint ran", result.stdout)
+        self.assertEqual(sorted(path.name for path in cache.iterdir()), [])
+
+    def test_mend_rewrite_is_recorded_under_the_tree_it_leaves(self) -> None:
+        cache = self.dirty_cache()
+        self.environment["TEST_EDIT_DURING"] = "mend"
+        result = self.invoke_verify("lint", "sample", cwd=self.root)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertNotIn("the tree changed", result.stdout)
+        self.assertEqual(len(list(cache.glob("*.pass"))), 1)
+
+        self.environment["TEST_EDIT_DURING"] = ""
+        result = self.invoke_verify("lint", "sample", cwd=self.root)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("PASS (recorded)", result.stdout)
+        self.assertFalse(self.clippy_ran())
 
 
 if __name__ == "__main__":

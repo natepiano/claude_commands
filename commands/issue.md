@@ -49,15 +49,12 @@ If the shorthand doesn't match any of these, tell the user and stop.
 
 3. **Title length check**: If the derived filename (without `.md`) exceeds 50 characters, the title is too long for a filename. Ask the user to pick a shorter filename by offering 3 concise alternatives (3-6 words each) as options. The original long title then becomes a `##` heading at the top of the issue body.
 
-4. Before creating the file, collect metadata from the user. Combine the area/category prompt with step 3 into a single prompt if the title is too long.
+4. Before creating the file, propose the metadata in one reply, combined with step 3's filename choice when the title is too long. The user confirms or changes it in their reply; write the file only after that. Never ask field by field, and never through a form.
 
-   **Area and category:**
-   - **Area**: What area is this issue in? (e.g. cursor, networking, ui, rendering, animation, testing, tooling — or press enter for "unfiled")
-   - **Category**: What category? Options: bug, feature, enhancement, docs, example, refactor, idea, research, business (or press enter for "unfiled")
-
-   **Prioritization survey (required — every new issue is fully rated at creation).** Ask in one plain-text line naming `backlog_goal`, `backlog_alignment`, `backlog_impact`, `backlog_urgency`, and `backlog_effort`, with a recommended count for each based on the definitions below (urgency defaults to 1). The user answers in their next message with five counts, for example `4 3 5 2 4`: the first selects goal 1–4; the other four give star counts 1–5. Present the definitions below as reference. Store `backlog_goal` as a scalar (e.g. `1 - Ship Hana`) and each rating as a double-quoted YAML text scalar of one-to-five `⭐` characters. Do NOT collect or write `backlog_score` / `backlog_rank`; the vault's background watcher computes those from these inputs.
-
-   **Dependencies (optional).** Ask which existing open issues, if any, must rank ahead of this issue. Record each answer as a wikilink in `depends_on`; use `[]` when there are none. Before creating the issue, resolve every supplied wikilink to an issue file. Closed targets are satisfied and are ignored by ranking. An unresolved link, duplicate target, self-reference, or open dependency missing prioritization metadata is invalid; a dependency cycle prevents ranking.
+   - **Area**: freeform (e.g. cursor, networking, ui, rendering, animation, testing, tooling), or "unfiled".
+   - **Category**: one of bug, feature, enhancement, docs, example, refactor, idea, research, business, or "unfiled".
+   - **Ranking (required — every new issue is fully rated at creation).** All five values in one plain-text line, each with the value you propose from the definitions below (urgency defaults to one star), for example `goal 1 - Ship Hana · alignment ⭐⭐⭐ · impact ⭐⭐⭐ · urgency ⭐ · effort ⭐⭐`. Store `backlog_goal` as a scalar (e.g. `1 - Ship Hana`) and each rating as a double-quoted YAML text scalar of one-to-five `⭐` characters. Do NOT collect or write `backlog_score` / `backlog_rank`; the vault's background watcher computes those from these inputs.
+   - **Dependencies (optional).** The existing open issues, if any, you propose must rank ahead of this issue. Record each as a wikilink in `depends_on`; use `[]` when there are none. Before creating the issue, resolve every supplied wikilink to an issue file. Closed targets are satisfied and are ignored by ranking. An unresolved link, duplicate target, self-reference, or open dependency missing prioritization metadata is invalid; a dependency cycle prevents ranking.
 
    - **`backlog_goal`** — the one goal this issue most directly advances (pick exactly one):
      - `1 - Ship Hana` — make Hana a coherent, usable, releasable product
@@ -93,18 +90,24 @@ If the shorthand doesn't match any of these, tell the user and stop.
      - `⭐⭐⭐⭐` — L: broad work requiring substantial coordination or integration
      - `⭐⭐⭐⭐⭐` — XL: a multi-phase initiative or epic, likely a decomposition candidate
 
+   A proposal filed from a session with no user in it, such as a unit's, leaves the five ranking fields empty and puts its proposed values on a `Proposed ranking:` line at the top of the body; they are written when the user confirms them on review (`/showrunner:proposal`).
+
 5. Read the template at `~/rust/hanadocs/.claude/templates/issue.yaml` and fill in:
    - `{{PROJECT}}` — the full project link name
    - `{{SHORT}}` — the project shorthand
    - `{{DATE}}` — today's date in YYYY-MM-DD format
-   - `{{AREA}}` — the area the user provided (or "unfiled" if skipped)
-   - `{{CATEGORY}}` — the category the user provided (or "unfiled" if skipped)
-   - `{{BACKLOG_GOAL}}` — the selected goal string, e.g. `1 - Ship Hana`
-   - `{{BACKLOG_ALIGNMENT}}` — the chosen alignment stars (one to five `⭐`)
-   - `{{BACKLOG_IMPACT}}` — the chosen impact stars
-   - `{{BACKLOG_URGENCY}}` — the chosen urgency stars
-   - `{{BACKLOG_EFFORT}}` — the chosen effort stars
+   - `{{AREA}}` — the confirmed area (or "unfiled")
+   - `{{CATEGORY}}` — the confirmed category (or "unfiled")
+   - `{{BACKLOG_GOAL}}` — the confirmed goal string, e.g. `1 - Ship Hana`
+   - `{{BACKLOG_ALIGNMENT}}` — the confirmed alignment stars (one to five `⭐`)
+   - `{{BACKLOG_IMPACT}}` — the confirmed impact stars
+   - `{{BACKLOG_URGENCY}}` — the confirmed urgency stars
+   - `{{BACKLOG_EFFORT}}` — the confirmed effort stars
    - `{{DEPENDS_ON}}` — a YAML inline list of existing issue wikilinks, e.g. `["[[render backend]]"]`, or `[]`
+   - `{{PROPOSED_BY}}` — for a proposal, the unit or session that wrote it; empty otherwise
+   - `{{SHOWRUNNER}}`, `{{UNIT}}`, `{{PLAN}}`, `{{AS_BUILT}}` — empty unless already known; `proposal_issue.py` sets them as the work is approved and built (`/showrunner:proposal`)
+
+   A proposal's `tags` are `[issue, proposal]`.
 
 6. If the category is "unfiled", set the category frontmatter to:
    ```yaml

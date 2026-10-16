@@ -9,7 +9,7 @@ per-run JSONL files under:
 ```
 
 The live session cache remains in
-`/tmp/claude/delegate/<run-id>/progress_history_state.json`. Deleting `/tmp`
+`/tmp/claude/unit/<run-id>/progress_history_state.json` (under `/tmp/claude/delegate/` for a run started before the folder rename). Deleting `/tmp`
 does not remove the durable event stream.
 
 ## Event model
@@ -164,10 +164,14 @@ was a fresh blind review of a now-larger diff, with no memory of what had alread
 been accepted, so it always returned something.
 
 State lives in `findings_state.json` beside the progress state and holds the
-ledger of the progress state's current `phase.instance_id`. When the current
-phase changes, the ledger it displaces is copied to
-`findings_state-<instance_id>.json` and read back when that phase is current
-again; a phase with no ledger yet starts fresh. Findings get stable
+ledger of the newest open phase. When the current phase changes, the ledger it
+displaces is copied to `findings_state-<instance_id>.json` and read back when
+that phase is current again; a phase with no ledger yet starts fresh. Every
+command takes `--phase <id>`: a named older open phase reads and writes its
+parked file, so its repair never moves the newest phase's ledger. A named phase
+that is not open exits with `Phase <id> is not open (open phases: …)`; with two
+or more open and none named, `<N> phases are open (<ids>); name one with
+--phase`. implement.sh passes its `--phase` to `landed` and `abandon`. Findings get stable
 ids (`F001…`) that survive across rounds, so "the same finding came back" is a
 fact the script can check rather than a judgment the unit director has to make.
 Each finding is `open`, `fixed_pending_review`, or `accepted`.
@@ -220,11 +224,11 @@ as slow, not where it is cut off.
 ## Commands
 
 ```text
-findings.py open --session-dir <dir> --severity blocker|minor|nit --title <text> --caught-by delegate|main|both [--file <path>] [--line <N>] [--detail <text>]
-findings.py verdict --session-dir <dir> --id <F00N> --state accepted|still_open|reopened [--evidence <hunk>]
-findings.py gate --session-dir <dir>
-findings.py dispatch --session-dir <dir> --covers F001,F002,...
-findings.py status --session-dir <dir>
+findings.py open --session-dir <dir> [--phase <id>] --severity blocker|minor|nit --title <text> --caught-by delegate|main|both [--file <path>] [--line <N>] [--detail <text>]
+findings.py verdict --session-dir <dir> [--phase <id>] --id <F00N> --state accepted|still_open|reopened [--evidence <hunk>]
+findings.py gate --session-dir <dir> [--phase <id>]
+findings.py dispatch --session-dir <dir> [--phase <id>] --covers F001,F002,...
+findings.py status --session-dir <dir> [--phase <id>]
 ```
 
 ```text
@@ -516,7 +520,7 @@ tick lands on a later day. The elapsed and unchanged columns are durations, whic
 say how long but never when, and an ETA says when the work lands rather than when
 this report was made; this line is what tells a reader whether the report in
 front of them is current and how long until the next one. The next tick comes
-from the Claude unit's `delegate-<run id>` notifier instance: every `progress`
+from the Claude unit's `unit-<run id>` notifier instance (`delegate-<run id>` for a run started before the folder rename): every `progress`
 call runs `notifier.sh restart` on it as its first act, before it reads state,
 and a rendered report names the `next_due` that restart prints. A refused call
 (no active phase, a failed percent check, a missing override reason or

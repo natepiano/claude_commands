@@ -31,9 +31,8 @@ anything.
     error's class name, never the file's contents.
 - `trust_command(folder, account: ClaudeLaunchAccount) -> str` is the line the
   user runs, accepts the prompt in, then leaves with `/exit`:
-  `cd <folder> && <account prefix> claude`. The default account's prefix is
-  `env -u CLAUDE_CONFIG_DIR -u CLAUDE_CODE_REMOTE_MEMORY_DIR`, so an inherited
-  account directory never redirects it; a named account uses `account_prefix`.
+  `cd <folder> && <account prefix> claude`. Every account uses `account_prefix`
+  with its numbered `CLAUDE_CONFIG_DIR` and the shared memory directory.
 - Callers, each refusing with
   `<unit | child slug | session>: Claude is not trusted in <folder> on <account label>. Run: <trust_command>`
   or `<prefix>: <UnreadableTrustFile text>`:
@@ -45,10 +44,10 @@ anything.
     `promote_showrunner.py`. `ADD_SHOWRUNNER_CLAUDE_JSON` overrides the account
     file in tests.
   - `scripts/nightly_review/nightly_review.py`, on the account its spawn uses.
-- Launchers pick their account by room; each check reads that account's file:
-  `~/.claude.json` for the default account, `<CLAUDE_CONFIG_DIR>/.claude.json`
-  for a named one.
-- `scripts/herdr/trust_survey.py` is a read-only survey. Per account file
+- Launchers use the configured group account; each trust check reads
+  `<CLAUDE_CONFIG_DIR>/.claude.json` in that numbered folder.
+  `~/.claude.json` remains the seed and MCP baseline.
+- `scripts/herdr/trust_survey.py` is a read-only survey. For the seed and each account file
   (`~/.claude.json` and every `~/.claude[0-9]/.claude.json`) it prints
   `<account> <key> <accepted> <kind>`, the kind being main checkout, worktree
   of `<main>`, plain folder, or ancestor of `<n>` repositories, nested
@@ -79,9 +78,8 @@ anything.
 - An absent key alone does not show that a folder launched without a prompt;
   that needs runtime evidence such as a Claude project directory. The one
   uncovered worktree in the survey had none, so it never ran.
-- When `nightly_review.py` picks the default account but inherits
-  `CLAUDE_CONFIG_DIR`, it checks trust on the inherited directory, the one the
-  spawned session reads.
+- Nightly review launches through `add_unit.py` on the configured units
+  account, whose numbered directory supplies its trust file.
 
 ### Ruled out
 
@@ -144,7 +142,8 @@ prompt is refused with a line saying so; nothing is typed into the prompt.
   - `stall_watch.py` hashes `read_place(place, 400, joined=True)`.
   - `add_unit.wait_for_remote_control` polls `read_place` for
     `/remote-control is active`. Its resume path stops a tmux unit with
-    `kill-session` and a herdr unit with `herdr.stop_session(label)`.
+    `kill-session` and a herdr unit with
+    `herdr.stop_session(place.session)`.
   - `live_units.py` prints `unit_lookup.place_text(place)`: the bare pane id
     for tmux, `herdr:<session>:<pane>` for herdr. `adopt.py` refuses a unit not
     in tmux.
@@ -160,7 +159,8 @@ prompt is refused with a line saying so; nothing is typed into the prompt.
     with `record_place` on the registry record it just observed, reads it with
     `read_place` for `/remote-control is active`, and types `/remote-control`
     with `type_place` while the registry shows the session idle; herdr
-    `AgentBlocked` uses no attempt.
+    `AgentBlocked` uses no attempt. Recovery and failures stay in the service
+    log; no Remote Control message or phone push is sent.
 - `promote_showrunner.py` refuses before anything stops when `read_place`
   fails or `unit_effort.verdict` skips the screen. `stop` types `/exit` with
   `type_place`, waits for the pid to exit, then ends the host session: tmux
@@ -182,8 +182,9 @@ prompt is refused with a line saying so; nothing is typed into the prompt.
   `unit_effort.verdict` first.
 - One account reader: a herdr unit's account comes from
   `account.process_config_dir`, never a second process-environment reader.
-- A herdr unit's name never exempts a tmux session from promotion's name
-  collision check: only a tmux unit passes its label as `ending`.
+- A tmux unit's name never exempts a herdr session from promotion's name
+  collision check (`add_showrunner.herdr_session_running`): only a herdr unit
+  passes its label as `ending`.
 
 ### Gotchas
 
@@ -191,6 +192,12 @@ prompt is refused with a line saying so; nothing is typed into the prompt.
   output is never read for it.
 - `herdr agent start … -- claude` adds the binary to argv itself; callers pass
   only the extra arguments.
+- A new pane's zsh takes about 2.3 s to start, so `Herdr.start_agent` retries
+  `agent_pane_busy` using herdr's own available-shell check, only while more
+  than 3000 ms remains; the initial call keeps the caller's timeout unchanged.
+  The deadline bounds when the last try begins, and each subprocess retains
+  its ten-second grace because killing an in-flight start could leave a
+  half-started agent.
 - Trust checks go only through `herdr.claude_trust` and `trust_command`, exact
   keys only (see "Claude trust before every launch").
 - `read --ansi` dimmed-suggestion detection (`\e[2m` after `❯`, which
@@ -198,9 +205,12 @@ prompt is refused with a line saying so; nothing is typed into the prompt.
   on herdr belongs to the live run with a herdr-hosted Claude in the herdr
   adoption plan's standalone-sessions phase.
 - `add_unit.account_for_launch`, resuming a unit with no shutdown record and
-  no `--account` or `--config-dir`, still reads the tmux `@claude_config_dir`
-  option, herdr units included; a herdr unit's resume account is later work in
-  the herdr adoption plan.
+  no `--account` or `--config-dir`, reads the tmux `@claude_config_dir` option
+  only for a unit in a tmux place; a unit in a herdr place takes
+  `accounts.role_account("unit")`, and `model_for_resume` reads its model from
+  the transcript's last assistant message (`transcript_model`) in place of
+  `@claude_model`. `add_showrunner.account_for_launch` does the same for a
+  herdr resume (`resume_uses_herdr`).
 
 ### Ruled out
 

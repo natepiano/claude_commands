@@ -14,13 +14,14 @@ import unittest
 import urllib.parse
 from contextlib import redirect_stderr, redirect_stdout
 from dataclasses import dataclass, replace
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal, TypedDict, cast, final, override
 from unittest import mock
 
 import pushover
 import review
+import reply_asks
 import push_texts
 from user_action import ActionRequired, NoActionRequired, SessionLine, first_line
 
@@ -129,10 +130,12 @@ class LocalReviewTests(unittest.TestCase):
         _ = (notes / "claude2.md").write_text("---\nlogin: reviewer@example.invalid\n---\n")
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {
             "HOME": str(self.root), "AGENT_NOTES_DIR": str(notes), "NOTIFY_STATE_DIR": str(self.root / "state")})))
+        self.assertEqual(accounts.setup("claude2"), [])
+        _ = (accounts.account_dir("claude2") / ".claude.json").write_text(json.dumps({"oauthAccount": {"emailAddress": "reviewer@example.invalid"}}))
         guide = self.root / "guide"
         guide.mkdir()
         _ = self.enterContext(mock.patch.object(review, "GUIDE", guide))
-        _ = self.enterContext(mock.patch.object(accounts, "role_account", return_value=accounts.NamedAccount("claude2", accounts.main_config_dir())))
+        _ = self.enterContext(mock.patch.object(accounts, "role_account", return_value=accounts.NamedAccount("claude2", accounts.account_dir("claude2"))))
         # Calls without an explicit fake must never start a reviewer or notifier.
         _ = self.enterContext(mock.patch.object(subprocess, "run", side_effect=AssertionError("real process")))
         _ = self.enterContext(mock.patch.object(review, "schedule"))
@@ -146,6 +149,94 @@ class LocalReviewTests(unittest.TestCase):
         _ = binary.write_text("fake reviewer\n")
         binary.chmod(0o700)
         _ = self.enterContext(mock.patch.object(shutil, "which", return_value=str(binary)))
+
+    def test_questions_keep_multiline_headers_and_long_text_without_push_limits(self) -> None:
+        for prefix in ("Session: Owner", "Action: choose one", "No action needed."):
+            question = prefix + "\n" + "Question context. " * 80 + "\nChoose retry (recommended) or stop?"
+            draft = review.Draft("demo", "0", "", NoActionRequired(), question, False)
+            runner = FakeReviewer(verdict(draft))
+            key = review.QuestionKey("demo", prefix)
+            with (mock.patch.object(review, "length_failures", side_effect=AssertionError("push count")),
+                  mock.patch.object(review, "split_session", side_effect=AssertionError("push header"))):
+                self.assertEqual(review.review_question(key, question, runner=runner),
+                                 review.QuestionAccepted(question))
+            self.assertIn(question, runner.calls[-1].argv[-1])
+            self.assertIn("question,all", runner.calls[0].argv)
+        self.assertEqual([item["kind"] for item in self.entries()], ["question"] * 3)
+        self.assertFalse(pushover.LOG_FILE.exists())
+
+    def test_question_holds_revise_independently_by_summary_and_never_expire_to_post(self) -> None:
+        first = review.QuestionKey("demo", "Retry build")
+        second = review.QuestionKey("demo", "Choose compiler")
+        question = "Retry the build?"
+        draft = review.Draft("demo", "0", "", NoActionRequired(), question, False)
+        asking = FakeReviewer(verdict(draft, "ask", questions=["Which build?"]))
+        for key in (first, second):
+            self.assertIsInstance(review.review_question(key, question, runner=asking), review.QuestionAwaitingFacts)
+        reworded = "Retry build 42 (recommended) or stop?"
+        revised_draft = replace(draft, body=reworded)
+        unresolved = FakeReviewer(verdict(revised_draft, "ask", questions=["Which machine?"]))
+        self.assertIsInstance(review.review_question(first, reworded, runner=unresolved), review.QuestionAwaitingFacts)
+        self.assertIn("Revision: true", unresolved.calls[-1].argv[-1])
+        passed = FakeReviewer(verdict(revised_draft))
+        self.assertEqual(review.review_question(first, reworded, runner=passed), review.QuestionAccepted(reworded))
+        paths = list((review.state_path() / "questions").glob("*.json"))
+        self.assertEqual([path.stem for path in paths], [second.digest])
+        with mock.patch.object(pushover, "http_post", side_effect=AssertionError("question posted")) as post:
+            self.assertEqual(review.due(post=post), 0)
+        post.assert_not_called()
+        self.assertFalse((review.state_path() / "held").exists())
+
+    def test_question_rewrite_needs_approval_and_recheck_failures_stay_held(self) -> None:
+        key = review.QuestionKey("demo", "Retry")
+        draft = review.Draft("demo", "0", "", NoActionRequired(), "Retry it?", False)
+        rewritten = replace(draft, body="Retry build 42 (recommended) or stop?")
+        for decision in ("ask", "rewrite", "send", "timeout"):
+            with self.subTest(recheck=decision):
+                first = FakeReviewer(verdict(draft, "rewrite", body=rewritten.body))
+                second = FakeReviewer(verdict(rewritten, decision if decision != "timeout" else "send",
+                                              questions=["Which machine?"] if decision == "ask" else []),
+                                      failure="timeout" if decision == "timeout" else "none")
+                calls = 0
+                def runner(argv: list[str], *, timeout: float,
+                           env: dict[str, str]) -> subprocess.CompletedProcess[str]:
+                    nonlocal calls
+                    if Path(argv[0]).name == "claude":
+                        calls += 1
+                    return (second if calls > 1 else first)(argv, timeout=timeout, env=env)
+                outcome = review.review_question(key, draft.body, runner=runner)
+                self.assertEqual(calls, 2)
+                if decision == "send":
+                    self.assertEqual(outcome, review.QuestionAccepted(rewritten.body))
+                else:
+                    self.assertIsInstance(outcome, (review.QuestionAwaitingFacts, review.QuestionReviewFailed))
+                    self.assertTrue((review.state_path() / "questions" / (key.digest + ".json")).exists())
+
+    def test_unavailable_question_review_preserves_original_and_logs_reason(self) -> None:
+        draft = review.Draft("demo", "0", "", NoActionRequired(), "Retry build 42?", False)
+        runner = FakeReviewer(verdict(draft), failure="timeout")
+        self.assertEqual(review.review_question(review.QuestionKey("demo", "Retry"), draft.body, runner=runner),
+                         review.QuestionReviewUnavailable(draft.body, "timeout"))
+        record = self.entries()[0]
+        self.assertEqual(record["kind"], "question")
+        self.assertEqual(record["verdict"], "unreviewed: timeout")
+
+    def test_content_reviews_reject_blank_rewrites(self) -> None:
+        draft = review.Draft("demo", "0", "", NoActionRequired(), "Retry build 42?", False)
+        for body in ("", " \n\t"):
+            for mode in ("reply", "question"):
+                with self.subTest(body=body, mode=mode):
+                    outcome = review.validate(verdict(draft, "rewrite", body=body), draft, False,
+                                              reply=mode == "reply", question=mode == "question")
+                    self.assertIsInstance(outcome, review.Unreviewed)
+                    assert isinstance(outcome, review.Unreviewed)
+                    self.assertIn("rewrite needs nonempty text", outcome.why)
+
+    def test_blank_question_input_is_rejected_before_review(self) -> None:
+        runner = mock.Mock(side_effect=AssertionError("blank question reached reviewer"))
+        with self.assertRaisesRegex(ValueError, "question needs nonempty text"):
+            _ = review.review_question(review.QuestionKey("demo", "Retry"), " \n\t", runner=runner)
+        runner.assert_not_called()
 
     def test_session_survives_review_hold_records_and_repeated_headers(self) -> None:
         draft = replace(self.draft, session=SessionLine("Owner"))
@@ -400,6 +491,21 @@ class LocalReviewTests(unittest.TestCase):
         self.assertEqual(sample.call_args.args, ([Path("one.jsonl"), Path("two.jsonl")], 2))
         self.assertEqual(sample.call_args.kwargs["since"], datetime.fromisoformat("2026-10-12T00:00:00+00:00"))
 
+    def test_sample_still_counts_a_relayed_question_as_a_detected_ask(self) -> None:
+        # Recipient filtering belongs to the Stop check, not to the sample count.
+        body = ('**Also sent to the hana showrunner:** distant picking is listed as "waiting for review". '
+                + 'Did you approve it? It stays "waiting for review" until hana answers.')
+        path = self.transcript("relay.jsonl", [("2026-10-15T21:49:10Z", body, "end_turn")])
+        runner = mock.Mock(side_effect=AssertionError("relayed ask reached the reviewer"))
+        with (mock.patch.dict(os.environ, {"SHOWRUNNER_STATE_DIR": str(self.root / "showrunner")}),
+              redirect_stdout(io.StringIO()) as output):
+            self.assertEqual(review.sample([path], 0, since=datetime.fromisoformat("2026-10-15T00:00:00Z"),
+                                           runner=runner), 0)
+        self.assertEqual(reply_asks.reply_questions(body).sentences, ("Did you approve it?",))
+        self.assertIn("sample: 0 replies", output.getvalue())
+        self.assertIn("replies with unregistered questions: 1", output.getvalue())
+        runner.assert_not_called()
+
     def test_request_sentences_and_recommended_choices_are_asks(self) -> None:
         requests = ["Reply upgrade or wait.", "Choose upgrade or wait.", "Pick a version.",
                     "Confirm the version.", "Decide whether to upgrade.", "Approve the upgrade.",
@@ -407,14 +513,142 @@ class LocalReviewTests(unittest.TestCase):
                     "Please choose a version."]
         for request in requests:
             with self.subTest(request=request):
-                self.assertEqual(review.reply_questions("The check passed. " + request), review.ReplyAsks((request,), False))
-        self.assertEqual(review.reply_questions("Upgrade (recommended): use the new compiler."),
-                         review.ReplyAsks((), True))
-        self.assertEqual(review.reply_questions("- Choose a version.\n2. Confirm the version."),
-                         review.ReplyAsks(("Choose a version.", "Confirm the version."), False))
-        self.assertEqual(review.reply_questions(
+                self.assertEqual(reply_asks.reply_questions("The check passed. " + request), reply_asks.ReplyAsks((request,), False))
+        self.assertEqual(reply_asks.reply_questions("Upgrade (recommended): use the new compiler."),
+                         reply_asks.ReplyAsks((), True, ("Upgrade (recommended): use the new compiler.",)))
+        self.assertEqual(reply_asks.reply_questions("- Choose a version.\n2. Confirm the version."),
+                         reply_asks.ReplyAsks(("Choose a version.", "Confirm the version."), False))
+        self.assertEqual(reply_asks.reply_questions(
             "> Reply upgrade or wait.\n```\nChoose a version.\n```\n~~~\nApprove it.\n~~~\n"
-            + "The example is `Tell me which version.` and ``Choose a version.``."), review.ReplyAsks((), False))
+            + "The example is `Tell me which version.` and ``Choose a version.``."), reply_asks.ReplyAsks((), False))
+
+    def test_choice_lines_include_questions_but_skip_quotes_and_code(self) -> None:
+        line = "Retry (recommended) or stop?"
+        asks = reply_asks.reply_questions(line + "\n> Use stable (recommended).\n"
+            + "```\nUse nightly (recommended).\n```\nExample: `Upgrade (recommended)`")
+        self.assertEqual(asks.choice_lines, (line,))
+        self.assertIn(line, asks.sentences)
+
+    def test_detected_choice_lines_keep_inline_code_for_record_matching(self) -> None:
+        line = "Run `retry build-42` (recommended), or stop?"
+        asks = reply_asks.reply_questions(line + "\nExample: `Stop (recommended)`")
+        self.assertEqual(asks.choice_lines, (line,))
+
+    def test_user_asks_exclude_explicit_peer_recipient_headings_and_lead_ins(self) -> None:
+        relays = (
+            '**Also sent to the hana showrunner:** distant picking is listed as "waiting for review". '
+            + 'Did you approve it? It stays "waiting for review" until hana answers.',
+            "**To the hana showrunner:**\nDid you approve it?",
+            "I asked the handler-enh unit director: Should we start phase 3?",
+        )
+        for relay in relays:
+            with self.subTest(relay=relay):
+                self.assertEqual(reply_asks.user_reply_questions(relay), reply_asks.ReplyAsks((), False))
+
+    def test_attributed_unit_choices_are_exempt_without_changing_measurement_choices(self) -> None:
+        choice = '"Run phases 1 and 2 (recommended), or wait."'
+        reply = "The handler-enh unit director said, in its own words:\n\n" + choice
+        self.assertEqual(reply_asks.reply_questions(reply).choice_lines, (choice,))
+        self.assertEqual(reply_asks.user_reply_questions(reply), reply_asks.ReplyAsks((), False))
+
+    def test_naming_a_unit_as_the_subject_or_executor_keeps_the_user_ask(self) -> None:
+        # Real user decisions that name a unit as subject or executor.
+        question = "Should handler-enh go ahead with phases 1 and 2?"
+        request = "Say go and I'll have cargo-liner do it."
+        choice = ("Allow (recommended, since both requests are a day old): "
+                  + "the shutdown unit runs the cancel once, then moves dashboard-unit to claude 4.")
+        self.assertEqual(reply_asks.user_reply_questions(question + "\n" + request + "\n" + choice),
+                         reply_asks.ReplyAsks((question, request), True, (choice,)))
+
+    def test_peer_recipient_scope_ends_before_the_next_user_paragraph(self) -> None:
+        relay = "**Also sent to the hana showrunner:** Did you approve it?"
+        question = "Want me to stop the nine idle ones now?"
+        choice = "Leave on (recommended), or turn off."
+        for separator in ("\n\n", "\n\n**Question for you:**\n"):
+            with self.subTest(separator=separator):
+                self.assertEqual(reply_asks.user_reply_questions(relay + separator + question + "\n" + choice),
+                                 reply_asks.ReplyAsks((question,), True, (choice,)))
+
+    def test_quoted_or_code_recipient_headings_do_not_hide_a_user_request(self) -> None:
+        request = "Say go and I'll run it."
+        prefixes = (
+            "`To the hana showrunner:`\n\n",
+            "```text\nTo the handler-enh unit director:\nChoose retry (recommended).\n```\n\n",
+            "**To the hana showrunner:**\n> Did you approve it?\n\n",
+        )
+        for prefix in prefixes:
+            with self.subTest(prefix=prefix):
+                self.assertEqual(reply_asks.user_reply_questions(prefix + request), reply_asks.ReplyAsks((request,), False))
+
+    def test_a_peer_message_in_code_does_not_extend_recipient_scope_to_the_user(self) -> None:
+        request = "Want me to have it added?"
+        reply = ("**To the hana showrunner:**\n\n"
+                 + "```text\nDid you approve it?\n```\n\n" + request)
+        self.assertEqual(reply_asks.user_reply_questions(reply), reply_asks.ReplyAsks((request,), False))
+
+    def test_purpose_headings_keep_user_requests_and_choices(self) -> None:
+        request = "Say go and I'll cancel the two requests."
+        choice = "Cancel (recommended), or wait."
+        for heading in ("To unblock the shutdown unit:", "To finish the worker move:",
+                        "For review by the hana showrunner:"):
+            with self.subTest(heading=heading):
+                self.assertEqual(reply_asks.user_reply_questions(heading + "\n" + request + "\n" + choice),
+                                 reply_asks.ReplyAsks((request,), True, (choice,)))
+
+    def test_inline_return_to_user_retains_the_user_question_and_inline_code(self) -> None:
+        question = "should I retire `handler-enh` (recommended), or wait?"
+        for marker in ("Back to you:", "For you:", "Question for you:", "To you:", "Your decision:"):
+            with self.subTest(marker=marker):
+                reply = "**To the hana showrunner:** Did you approve it? " + marker + " " + question
+                self.assertEqual(reply_asks.user_reply_questions(reply), reply_asks.reply_questions(question))
+
+    def test_recipient_headings_without_colons_exempt_only_their_next_paragraph(self) -> None:
+        user_question = "Want me to stop it?"
+        for heading in ("**To the hana showrunner**", "# For the handler-enh unit director",
+                        "To the hana showrunner"):
+            for separator in ("\n", "\n\n"):
+                with self.subTest(heading=heading, separator=separator):
+                    reply = heading + separator + "Did you approve it?\n\n" + user_question
+                    self.assertEqual(reply_asks.user_reply_questions(reply), reply_asks.ReplyAsks((user_question,), False))
+
+    def test_subject_headings_keep_the_question_addressed_to_the_user(self) -> None:
+        cases = (
+            ("**Hana session**\nWant me to restart it?", "Want me to restart it?"),
+            ("### Shutdown unit\nShould I cancel the two old requests?", "Should I cancel the two old requests?"),
+            ("Trunk unit: remote control is off. Want me to turn it on?", "Want me to turn it on?"),
+            ("hana showrunner\nDid you approve it?", "Did you approve it?"),
+        )
+        for reply, question in cases:
+            with self.subTest(reply=reply):
+                self.assertEqual(reply_asks.user_reply_questions(reply), reply_asks.ReplyAsks((question,), False))
+
+    def test_inline_code_recipient_and_return_markers_do_not_change_the_addressee(self) -> None:
+        question = "Want me to use it?"
+        reply = "`To the hana showrunner:` is only an example. " + question
+        self.assertEqual(reply_asks.user_reply_questions(reply), reply_asks.ReplyAsks((question,), False))
+        reply = "**To the hana showrunner:** The example says `Back to you:`. Did you approve it?"
+        self.assertEqual(reply_asks.user_reply_questions(reply), reply_asks.ReplyAsks((), False))
+
+    def test_session_address_colon_keeps_the_following_paragraph_addressed_to_the_peer(self) -> None:
+        reply = "To session:other:\n\nDid you approve it?\n\nWant me to stop it?"
+        self.assertEqual(reply_asks.user_reply_questions(reply), reply_asks.ReplyAsks(("Want me to stop it?",), False))
+
+    def test_reviewed_question_is_registered_from_outstanding_and_after_closing(self) -> None:
+        cutoff = datetime.now(timezone.utc) - timedelta(minutes=1)
+        directory = self.root / "showrunner/outstanding"
+        directory.mkdir(parents=True)
+        accepted = "Build 42 failed.\nRetry (recommended) or stop?"
+        item = {"since": "2026-10-15T10:00", "text": "Retry build",
+                "question": "Retry it?", "reviewed": accepted}
+        current = directory / "demo.json"
+        _ = current.write_text(json.dumps([item]))
+        with mock.patch.dict(os.environ, {"SHOWRUNNER_STATE_DIR": str(directory.parent)}):
+            self.assertIn(" ".join(accepted.split()), review.registered_questions(cutoff))
+            _ = current.write_text("[]")
+            history = review.QuestionRegistration(time=datetime.now(timezone.utc).isoformat(),
+                text=item["text"], question=item["question"], reviewed=accepted)
+            _ = current.with_suffix(".history.jsonl").write_text(json.dumps(history) + "\n")
+            self.assertIn(" ".join(accepted.split()), review.registered_questions(cutoff))
 
     def test_sample_matches_registered_asks_without_matching_their_choice_lines(self) -> None:
         question = "Would you retry the build?"
@@ -439,6 +673,30 @@ class LocalReviewTests(unittest.TestCase):
                 self.assertIn(f"replies with unregistered questions: {expected}", output.getvalue())
         runner.assert_not_called()
 
+    def test_sample_recognises_reviewed_inline_code_before_and_after_closing(self) -> None:
+        cutoff = datetime.fromisoformat("2026-10-12T00:00:00+00:00")
+        question = "Run `check.py` (recommended), or wait?"
+        path = self.transcript("inline-code.jsonl", [
+            ("2026-10-13T10:00:00Z", question, "end_turn"),
+            ("2026-10-13T11:00:00Z", "The build passed.", "end_turn")])
+        registration = self.root / "showrunner/outstanding/build.json"
+        registration.parent.mkdir(parents=True)
+        item = {"text": "Run check", "question": question, "reviewed": question}
+        _ = registration.write_text(json.dumps([item]))
+        draft = review.Draft("review.sample", "0", "", NoActionRequired(), "The build passed.", False)
+        for closed in (False, True):
+            with self.subTest(closed=closed):
+                if closed:
+                    _ = registration.write_text("[]")
+                    _ = registration.with_suffix(".history.jsonl").write_text(
+                        json.dumps(dict(item, time="2026-10-13T10:00:00+00:00")) + "\n")
+                runner = FakeReviewer(verdict(draft))
+                with (mock.patch.dict(os.environ, {"SHOWRUNNER_STATE_DIR": str(registration.parents[1])}),
+                      redirect_stdout(io.StringIO()) as output):
+                    self.assertEqual(review.sample([path], since=cutoff, runner=runner), 0)
+                self.assertIn("sample: 1 replies; passed: 1", output.getvalue())
+                self.assertIn("replies with unregistered questions: 0", output.getvalue())
+
     def test_sample_excludes_imperative_requests_from_replies_that_ask_nothing(self) -> None:
         path = self.transcript("requests.jsonl", [
             ("2026-10-13T10:00:00Z", "Reply upgrade or wait.", "end_turn"),
@@ -455,7 +713,7 @@ class LocalReviewTests(unittest.TestCase):
 
     def test_sample_matches_each_question_sentence_on_the_same_line(self) -> None:
         first, second = "Would you retry the build?", "Which version should it use?"
-        self.assertEqual(review.reply_questions(first + " " + second), review.ReplyAsks((first, second), False))
+        self.assertEqual(reply_asks.reply_questions(first + " " + second), reply_asks.ReplyAsks((first, second), False))
         path = self.transcript("questions.jsonl", [("2026-10-13T10:00:00Z", first + " " + second, "end_turn")])
         registration = self.root / "showrunner/outstanding/build.json"
         registration.parent.mkdir(parents=True)
@@ -655,9 +913,9 @@ class LocalReviewTests(unittest.TestCase):
                     _ = review.main(arguments)
                 self.assertEqual(error.exception.code, 2)
             texts.assert_not_called()
-            self.assertEqual(review.main(["texts", "--id", "shutdown.remote_control", "--approve",
+            self.assertEqual(review.main(["texts", "--id", "shutdown.holdout", "--approve",
                                           "--user-spec", "User words"]), 0)
-        texts.assert_called_once_with(["shutdown.remote_control"], True, authority=review.UserSpecifiedText("User words"))
+        texts.assert_called_once_with(["shutdown.holdout"], True, authority=review.UserSpecifiedText("User words"))
 
     def test_retiring_a_rejected_claim_preserves_a_newer_hold_from_the_same_source(self) -> None:
         original = self.held()
@@ -984,15 +1242,16 @@ class LocalReviewTests(unittest.TestCase):
         self.assertEqual(result.why, "timeout")
         self.assertEqual(elapsed[0], 90)
 
-    def test_default_account_cannot_use_the_callers_login(self) -> None:
+    def test_claude2_reviewer_uses_its_numbered_folder_instead_of_the_callers_login(self) -> None:
         runner = FakeReviewer(verdict(self.draft))
         with mock.patch.dict(os.environ, {"CLAUDE_CODE_OAUTH_TOKEN": "writer token",
                                          "ANTHROPIC_API_KEY": "writer key", "CLAUDE_CONFIG_DIR": "writer config",
                                          "MESSAGE_TEST_KEEP": "kept"}):
             _ = review.review(self.draft, False, runner=runner)
         for call in runner.calls:
-            for key in ("CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_API_KEY", "CLAUDE_CONFIG_DIR"):
+            for key in ("CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_API_KEY"):
                 self.assertNotIn(key, call.environment)
+            self.assertEqual(call.environment["CLAUDE_CONFIG_DIR"], str(self.root / ".claude2"))
             self.assertEqual(call.environment["MESSAGE_TEST_KEEP"], "kept")
 
     def test_named_unit_account_replaces_the_callers_directory(self) -> None:

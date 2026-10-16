@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import TypedDict, cast, final, override
 from unittest.mock import patch
 
-from test_support import ShutdownSendLeaf, ShutdownTestCase
+from test_support import linux_process_fixture, ShutdownSendLeaf, ShutdownTestCase
 import remote
 
 
@@ -31,6 +31,7 @@ class RemoteTests(ShutdownTestCase):
     @override
     def setUp(self) -> None:
         super().setUp()
+        linux_process_fixture(self)
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
         self.bin = self.root / "bin"
         self.bin.mkdir()

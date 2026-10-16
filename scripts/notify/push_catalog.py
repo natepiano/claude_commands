@@ -9,13 +9,23 @@ from push_texts import ActionTemplate, NoActionNeeded, PushExample, PushText, Se
 
 ENTRIES = (
     PushText("shutdown.holdout", "shutdown", "decision", "{session} {operation} is blocked",
-        ActionTemplate("answer the open form, or run the command below to stop {session}"),
-        "Reason: {operation} is blocked because {session}'s claude session is not answering, and it can't proceed.\n\n"
-        + "Stop now (recommended): ends {session} mid-step so the {request} goes on. Uncommitted work stays; {after_stop}\n\n"
-        + "Do nothing: the {request} keeps waiting. It has waited {elapsed} so far.\n\nCommand: {command} (on {machine})",
-        (PushExample("typical", {"session": "Owner", "machine": "natedev",
-            "elapsed": "4 minutes", "operation": "Restart", "request": "restart", "after_stop": "the restart brings it back.",
-            "command": "~/.claude/scripts/lib/py ~/.claude/scripts/shutdown/shutdown.py now 'claude 2' --here --only owner"}),),
+        ActionTemplate("answer the open form"),
+        "Reason: {operation} is blocked because {session}'s claude session is showing a form and it can't proceed.\n\n"
+        + "Or stop it instead, and the {operation} goes on without it. In a terminal on {machine}: {command}",
+        (PushExample("typical", {"session": "pm-move-ghostty", "machine": "natedev",
+            "operation": "restart",
+            "command": "~/.claude/scripts/lib/py ~/.claude/scripts/shutdown/shutdown.py now claude4 --here --only d5b35898-290f-4b44-8e6f-6f2586c975a8"}),),
+        session=SessionTemplate("{session}")),
+    PushText("shutdown.holdout_unanswered", "shutdown", "decision", "{session} {operation} is blocked",
+        ActionTemplate("in a terminal on {machine}, stop {session} with the command below"),
+        "Reason: {operation} is blocked because {session}'s claude session has not paused for it and it can't proceed.\n\n"
+        + "Stopping ends only that session, and the {operation} goes on. In a terminal on {machine}: {command}",
+        (PushExample("typical", {"session": "pm-move-ghostty", "machine": "natedev",
+            "operation": "restart",
+            "command": "~/.claude/scripts/lib/py ~/.claude/scripts/shutdown/shutdown.py now claude4 --here --only d5b35898-290f-4b44-8e6f-6f2586c975a8"}),
+         PushExample("long_session", {"session": "build-followups-director", "machine": "Mac",
+            "operation": "shutdown",
+            "command": "~/.claude/scripts/lib/py ~/.claude/scripts/shutdown/shutdown.py now claude2 --here --only 5b3a1624-bb7e-46af-8cb1-4d960d719a32"})),
         session=SessionTemplate("{session}")),
     # Shutdown examples use test_settle.py and test_restart.py facts.
     # The failing shutdown deliveries are recorded in notify/review.jsonl, 2026-10-14T02:05Z.
@@ -44,13 +54,6 @@ ENTRIES = (
         + "Its terminal cannot restart on its own. Its shutdown record holds the command to resume it.",
         (PushExample("typical", {"machine": "natedev", "session": "Owner"}),
          PushExample("long_session", {"machine": "Mac", "session": "build-followups-message-clarity-unit-director-session-12"}))),
-    PushText("shutdown.remote_control", "shutdown", "decision", "{who} remote-control is off",
-        ActionTemplate("run /remote-control"),
-        "Reason: Remote control is off.",
-        (PushExample("typical", {"who": "Owner", "session": "Owner"}),
-         PushExample("unit", {"who": "trunk unit", "session": "build-followups-trunk-unit-director"}),
-         PushExample("showrunner", {"who": "demo showrunner", "session": "build-followups-director"})),
-        session=SessionTemplate("{session}")),
     PushText("quota.claude", "quota_alert", "decision", "Coding may stop: Claude account out of usage",
         ActionTemplate("In a Claude terminal on natedev, run /login and sign in to account {target}."),
         "Claude account {account} has {remaining} of its weekly usage left. Its coding work may stop until {reset}. "

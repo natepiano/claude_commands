@@ -67,7 +67,7 @@ The flag is cleared by any `item/completed` from the worker's own work, but not 
 
 - **`--pool code|ui --lease …`**: reviews on a pooled reviewer of the production, on a read-only turn. `docs/as-built/review-pool.md` describes this path.
 - **`--to <worker>`**: reviews on an open worker.
-  - It writes one turn record per attempt and marks it `canceled` on TERM, INT or HUP, exiting 143, 130 or 129 (`docs/as-built/review-pool.md`, Turn record). `REVIEW_LEASE=<slug>/<unit>/<phase>` in the environment names the unit and phase in that record.
+  - It writes one turn record per attempt and marks it `canceled` on TERM, INT or HUP, exiting 143, 130 or 129 (`docs/as-built/review-pool.md`, Turn record). Only a pool review's `--lease` names the unit and phase in that record.
   - The recorder slot is the worker name's last hyphen segment. It must match `^[A-Za-z0-9][A-Za-z0-9_-]{0,31}$`.
   - The family must be Codex with the mesh on.
   - Under `impl_worker_claim.lock`, it compacts when the recorded size is an integer above the threshold (best-effort, one board line), then claims with `can-follow --role review`.

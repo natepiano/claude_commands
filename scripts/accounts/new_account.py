@@ -33,6 +33,17 @@ import note_file  # noqa: E402
 # The alias loop in the nixos shell module reads the notes folder; its path is the marker.
 ALIAS_LOOP_MARKER = "hanadocs/agents/claude"
 
+STATUSLINE_PALETTE = (
+    "black", "red", "green", "yellow", "blue", "magenta", "cyan", "white",
+    "bright-black", "bright-red", "bright-green", "bright-yellow", "bright-blue",
+    "bright-magenta", "bright-cyan", "bright-white",
+    "orange", "purple", "pink", "teal", "brown",
+)
+STATUSLINE_EXCLUDED_COLORS = frozenset({
+    "black", "white", "bright-black", "bright-white",
+    "red", "green", "yellow", "bright-red", "bright-green", "bright-yellow",
+})
+
 
 @dataclass(frozen=True)
 class Step:
@@ -210,6 +221,55 @@ def nightly_review_step(account: NewAccount) -> Step:
     return Step(True, f"nightly review cannot edit ~/.{account.name}")
 
 
+def statusline_color_step(account: NewAccount) -> Step:
+    path = accounts.main_config_dir() / "config" / "statusline.conf"
+    try:
+        text = path.read_bytes().decode("utf-8")
+    except FileNotFoundError:
+        return Step(True, f"{account.label} stays uncolored (no status line config {path})")
+    except (OSError, UnicodeError) as error:
+        return Step(False, f"could not update {path}: {error}")
+
+    lines = text.splitlines(keepends=True)
+    entries: dict[str, str] = {}
+    insertion = len(lines)
+    for index, line in enumerate(lines):
+        content = line.split("#", 1)[0].strip()
+        if "=" not in content:
+            continue
+        key, value = (part.strip() for part in content.split("=", 1))
+        entries[key] = value
+        if key.startswith("account."):
+            insertion = index + 1
+    key = f"account.{account.label}"
+    if key in entries:
+        return Step(True, f"status line color {entries[key]} for {account.label}")
+
+    palette = [color for color in STATUSLINE_PALETTE if color not in STATUSLINE_EXCLUDED_COLORS]
+    account_colors = {value for key, value in entries.items() if key.startswith("account.")}
+    role_colors = {value for key, value in entries.items() if key.startswith("role.")}
+    color = next((color for color in palette if color not in account_colors | role_colors), "")
+    if not color:
+        color = next((color for color in palette if color not in account_colors), "")
+    if not color:
+        return Step(True, f"{account.label} stays uncolored (no unused status line color)")
+
+    prefix = "\n" if insertion and not lines[insertion - 1].endswith(("\n", "\r")) else ""
+    lines.insert(insertion, f"{prefix}{key}={color}\n")
+    try:
+        permissions = path.stat().st_mode & 0o7777
+        temporary = path.with_name(".statusline.new-account.tmp")
+        try:
+            _ = temporary.write_text("".join(lines), encoding="utf-8", newline="")
+            os.chmod(temporary, permissions)
+            _ = temporary.replace(path)
+        finally:
+            temporary.unlink(missing_ok=True)
+    except OSError as error:
+        return Step(False, f"could not update {path}: {error}")
+    return Step(True, f"status line color {color} for {account.label}")
+
+
 def settings_step(account: NewAccount) -> Step:
     path = accounts.main_config_dir() / "settings.json"
     try:
@@ -261,6 +321,7 @@ def new_account(account: NewAccount, identity: HomeLogin | NoHomeLogin) -> list[
     steps.append(claude_login_step(account) if steps[-1].done else claude_login_instruction(account))
     steps.append(settings_step(account))
     steps.append(nightly_review_step(account))
+    steps.append(statusline_color_step(account))
     if (alias := alias_step(account)) is not None:
         steps.append(alias)
     return steps

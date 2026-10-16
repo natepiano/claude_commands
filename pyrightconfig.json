@@ -20,6 +20,16 @@
       ]
     },
     {
+      "root": "scripts/delegate",
+      "extraPaths": [
+        ".",
+        "scripts/production",
+        "scripts/message",
+        "scripts/herdr",
+        "scripts/lib"
+      ]
+    },
+    {
       "root": "scripts/accounts",
       "extraPaths": [
         ".",
@@ -45,6 +55,7 @@
       "root": "scripts/hooks",
       "extraPaths": [
         "scripts/hooks",
+        "scripts/delegate",
         "scripts/message",
         "scripts/notify",
         "scripts/production",

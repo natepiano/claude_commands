@@ -82,12 +82,14 @@ def change_old(login: str, change: Callable[[LegacyRecordFixture], None]) -> Non
 def session(number: int = 1) -> inventory.TopLevelSession:
     return inventory.TopLevelSession(
         kind="top-level",
+        probe=False,
         session_id=f"session-{number}",
         pid=10_000 + number,
         proc_start=f"start-{number}",
         name=f"Claude {number}",
         cwd=f"/tmp/checkout-{number}",
         status="idle",
+        updated_at=0,
         model=inventory.NoReplyYet(kind="no reply yet"),
         checkout=inventory.NotACheckout(kind="not a checkout"),
         run_dirs=[],
@@ -156,7 +158,7 @@ def session_shutdown(
         login=login, label=login.split("@", 1)[0], machine="natedev",
         requested_at=requested_at, requested_by=record.FromTerminal(kind="terminal"),
         request_id=f"legacy-natedev-{NOW}",
-        hold=hold, then="stop", force="wait for ready", alerts="user",
+        hold=hold, then="stop", force="wait for ready", alerts="user", probe=False,
         session=saved_entry["session"], workers=[], timers=saved_entry["timers"],
         settle_message=saved_entry["settle_message"], where=saved_entry["where"],
         progress=cast(record.SessionProgress, saved_entry["progress"]), trail=[], stop_issues=[],
@@ -173,8 +175,8 @@ def account_hold(login: str = "owner@example.com") -> record.AccountHold:
 
 def owned_worker(owner: str = "session-1") -> inventory.WorkerSession:
     return inventory.WorkerSession(
-        kind="worker", session_id="worker-1", pid=20001, proc_start="worker-start",
-        name="worker", cwd="/tmp/worker", status="idle",
+        kind="worker", probe=False, session_id="worker-1", pid=20001, proc_start="worker-start",
+        name="worker", cwd="/tmp/worker", status="idle", updated_at=0,
         model=inventory.NoReplyYet(kind="no reply yet"),
         checkout=inventory.NotACheckout(kind="not a checkout"),
         run_dirs=[], codex_servers=[], timers=[], host=inventory.UnknownHost(kind="unknown"),
@@ -196,6 +198,55 @@ class SessionRecordTests(ShutdownTestCase):
             "HOME": str(self.root), "SHUTDOWN_STATE_DIR": str(self.root / "shutdown"),
         })))
         del context
+
+    def test_legacy_not_ready_failure_recovers_at_every_record_read_boundary(self) -> None:
+        for index, progress in enumerate(("waiting", "ready", "held by usage limit")):
+            with self.subTest(progress=progress):
+                saved = session_shutdown(index + 1, progress={"kind": "stop failed", "at": LATER,
+                    "reason": "session or worker is not idle and ready"})
+                saved["stop_issues"] = [record.NotReadyToStop(kind="not ready to stop", at=NOW,
+                    status="busy", progress=progress)]
+                directory = self.directory / "sessions"
+                directory.mkdir(parents=True, exist_ok=True)
+                _ = (directory / f"{saved["session"]["session_id"]}.json").write_text(json.dumps(saved))
+                expected: record.SessionProgress = {"kind": "waiting"} if progress == "waiting" else (
+                    record.SessionReadyToStop(kind="ready", at=NOW) if progress == "ready" else
+                    record.SessionHeldByUsageLimit(kind="held by usage limit", at=NOW))
+                identity = saved["session"]["session_id"]
+                for loaded in (record.find_session(saved["login"], identity),
+                               next(item for item in record.all_session_records() if item["session"]["session_id"] == identity),
+                               record.parse_session_records(json.dumps([saved]))[0]):
+                    assert loaded is not None
+                    self.assertEqual(loaded["progress"], expected)
+                    self.assertEqual(loaded["stop_issues"], saved["stop_issues"])
+                    self.assertFalse(record.stop_incomplete(loaded))
+
+    def test_old_account_record_recovers_not_ready_failure_before_conversion(self) -> None:
+        old = shutdown_record(progress={"kind": "stop failed", "at": LATER,
+            "reason": "session or worker is not idle and ready"})
+        old["entries"][0]["stop_issues"] = [record.NotReadyToStop(kind="not ready to stop",
+            at=NOW, status="busy", progress="ready")]
+        write_old(old)
+        loaded = record.find_session(old["login"], "session-1")
+        assert loaded is not None
+        self.assertEqual(loaded["progress"], {"kind": "ready", "at": NOW})
+        self.assertEqual(loaded["stop_issues"], old["entries"][0]["stop_issues"])
+
+    def test_real_stop_failure_with_not_ready_issue_is_not_normalized(self) -> None:
+        for number, reason, extra_issue in ((1, "signal refused", False),
+                (2, "session or worker is not idle and ready", True)):
+            with self.subTest(reason=reason, extra_issue=extra_issue):
+                saved = session_shutdown(number, progress={"kind": "stop failed", "at": LATER, "reason": reason})
+                saved["stop_issues"] = [record.NotReadyToStop(kind="not ready to stop", at=NOW,
+                    status="busy", progress="ready")]
+                if extra_issue:
+                    saved["stop_issues"].append(record.StillRunningAfterStop(kind="still running", at=LATER, reason="still alive"))
+                directory = self.directory / "sessions"
+                directory.mkdir(parents=True, exist_ok=True)
+                _ = (directory / f"{saved["session"]["session_id"]}.json").write_text(json.dumps(saved))
+                loaded = record.find_session(saved["login"], saved["session"]["session_id"])
+                self.assertEqual(loaded, saved)
+                self.assertEqual(record.parse_session_records(json.dumps([saved])), [saved])
 
     def test_transition_id_round_trips_beside_the_independent_request_id_without_migrating_old_records(self) -> None:
         current = session_shutdown()
@@ -232,23 +283,30 @@ class SessionRecordTests(ShutdownTestCase):
                          ("claude2", "claude2", "claude2"))
         self.assertEqual(path.read_bytes(), original)
 
-    def test_legacy_default_target_reads_as_the_home_number_without_rewriting_the_record(self) -> None:
+    def test_legacy_home_move_target_uses_cutover_evidence_instead_of_the_source_login(self) -> None:
         notes = self.root / "notes"
         notes.mkdir()
+        _ = (notes / "claude1.md").write_text("---\nlogin: owner@example.com\n---\n")
         _ = (notes / "claude2.md").write_text("---\nlogin: home@example.invalid\n---\n")
-        _ = (self.root / ".claude.json").write_text(json.dumps({"oauthAccount": {"emailAddress": "home@example.invalid"}}))
+        configuration = self.root / ".claude/config/accounts.json"
+        configuration.parent.mkdir(parents=True, exist_ok=True)
+        _ = configuration.write_text(json.dumps({"home_cutovers": [{
+            "label": "claude2", "login": "home@example.invalid", "at": LATER}]}))
+        _ = (self.root / ".claude.json").write_text(json.dumps({"oauthAccount": {"emailAddress": "different@example.invalid"}}))
         saved = session_shutdown()
         saved["target"] = "claude2"
         self.assertTrue(record.create_session(saved))
         path = next((self.directory / "sessions").glob("*.json"))
-        original = path.read_bytes().replace(b'"target": "claude2"', b'"target": "default"')
-        self.assertIn(b'"target": "default"', original)
-        _ = path.write_bytes(original)
-        with patch.dict(os.environ, {"AGENT_NOTES_DIR": str(notes)}):
-            loaded = record.find_session(saved["login"], "session-1")
-        assert loaded is not None
-        self.assertEqual(loaded.get("target"), "claude2")
-        self.assertEqual(path.read_bytes(), original)
+        original = path.read_bytes()
+        for target in ("default", "~/.claude"):
+            with self.subTest(target=target):
+                legacy = original.replace(b'"target": "claude2"', f'"target": "{target}"'.encode())
+                _ = path.write_bytes(legacy)
+                with patch.dict(os.environ, {"AGENT_NOTES_DIR": str(notes)}):
+                    loaded = record.find_session(saved["login"], "session-1")
+                assert loaded is not None
+                self.assertEqual(loaded.get("target"), "claude2")
+                self.assertEqual(path.read_bytes(), legacy)
 
     def test_first_read_converts_nested_worker_ownership_and_fields_without_rewriting_again(self) -> None:
         saved = session_shutdown(progress=record.SessionStopping(kind="stopping", at=LATER))
@@ -438,10 +496,10 @@ class SessionRecordTests(ShutdownTestCase):
     def test_herdr_hosts_round_trip_for_owners_and_their_workers(self) -> None:
         saved = session_shutdown()
         owner = session()
-        owner["host"] = inventory.HerdrHost(kind="herdr", herdr_session="director", pane_id="w1:p1")
+        owner["host"] = inventory.HerdrHost(kind="herdr", herdr_session="director", pane_id="w1:p1", presentation="detached")
         saved["session"] = owner
         worker = owned_worker()
-        worker["host"] = inventory.HerdrHost(kind="herdr", herdr_session="director", pane_id="w1:p2")
+        worker["host"] = inventory.HerdrHost(kind="herdr", herdr_session="director", pane_id="w1:p2", presentation="detached")
         saved["workers"] = [worker]
         self.assertTrue(record.create_session(saved))
         self.assertEqual(record.find_session(saved["login"], "session-1"), saved)
@@ -594,6 +652,71 @@ class SessionRecordTests(ShutdownTestCase):
             record.archive_session("owner@example.com", "missing")
         self.assertFalse(self.directory.exists())
 
+    def test_forget_archives_abandoned_restores_under_the_account_lock_and_keeps_the_hold(self) -> None:
+        held = account_hold()
+        record.set_account_hold(held)
+        sibling = session_shutdown(9)
+        self.assertTrue(record.create_session(sibling))
+        progress: tuple[record.SessionProgress, ...] = (
+            record.SessionRestartFailed(kind="restart failed", at=NOW, reason="agent exited"),
+            record.SessionNeedsManualRestart(kind="manual restart", command="resume"),
+            record.SessionStopped(kind="stopped", at=NOW),
+            record.SessionAlreadyGone(kind="already gone", at=NOW),
+            record.ProcessIdentityLost(kind="process identity lost", at=NOW),
+        )
+        replace = os.replace
+
+        def archive(source: Path, target: Path) -> None:
+            with (self.directory / "lock").open("a+") as contender:
+                with self.assertRaises(BlockingIOError):
+                    fcntl.flock(contender.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            replace(source, target)
+
+        for number, state in enumerate(progress, 1):
+            with self.subTest(kind=state["kind"]):
+                saved = session_shutdown(number, progress=state)
+                self.assertTrue(record.create_session(saved))
+                with patch.object(os, "replace", side_effect=archive):
+                    result = record.forget_session(saved["login"], saved["session"]["session_id"], "natedev")
+                self.assertIsInstance(result, record.SessionForgotten)
+                self.assertIsNone(record.find_session(saved["login"], saved["session"]["session_id"]))
+                archived = self.directory / "history" / f"{NOW}-session-{number}.json"
+                self.assertEqual(json.loads(archived.read_text()), saved)
+        self.assertEqual(record.session_records(held["login"]), [sibling])
+        self.assertEqual(record.account_hold(held["login"]), held)
+
+    def test_forget_rechecks_progress_and_retains_in_progress_or_foreign_records(self) -> None:
+        states: tuple[record.SessionProgress, ...] = (
+            record.SessionWaiting(kind="waiting"),
+            record.SessionStopping(kind="stopping", at=NOW),
+            record.SessionRestarting(kind="restarting", at=NOW, prior=record.SessionStopped(kind="stopped", at=NOW)),
+            record.SessionRestoredTimersPending(kind="timers pending", at=NOW, timers=[]),
+        )
+        for number, progress in enumerate(states, 1):
+            saved = session_shutdown(number, progress=progress)
+            self.assertTrue(record.create_session(saved))
+            with self.subTest(kind=progress["kind"]):
+                self.assertIsInstance(record.forget_session(saved["login"], saved["session"]["session_id"], "natedev"), record.SessionRetained)
+                self.assertEqual(record.find_session(saved["login"], saved["session"]["session_id"]), saved)
+        foreign = session_shutdown(9, progress=record.SessionStopped(kind="stopped", at=NOW))
+        foreign["machine"] = "Mac"
+        self.assertTrue(record.create_session(foreign))
+        self.assertIsInstance(record.forget_session(foreign["login"], "session-9", "natedev"), record.SessionRetained)
+        self.assertEqual(record.find_session(foreign["login"], "session-9"), foreign)
+        self.assertFalse((self.directory / "history").exists())
+
+    def test_forget_legacy_restore_does_not_reappear_and_preserves_siblings_and_hold(self) -> None:
+        old = shutdown_record(state="restart partial",
+            progress=record.SessionRestartFailed(kind="restart failed", at=NOW, reason="not live"))
+        old["entries"].append(entry(number=2))
+        write_old(old)
+        held = record.account_hold(old["login"])
+        outcome = record.forget_session(old["login"], "session-1", "natedev")
+        self.assertIsInstance(outcome, record.SessionForgotten)
+        self.assertEqual([saved["session"]["session_id"] for saved in record.session_records(old["login"])], ["session-2"])
+        self.assertEqual(record.account_hold(old["login"]), held)
+        self.assertIsInstance(record.forget_session(old["login"], "session-1", "natedev"), record.NoShutdown)
+
     def test_session_records_hold_file_persists_without_any_session(self) -> None:
         hold = account_hold("Owner@Example.com")
         record.set_account_hold(hold)
@@ -606,6 +729,53 @@ class SessionRecordTests(ShutdownTestCase):
         record.clear_account_hold(hold["login"])
         record.clear_account_hold(hold["login"])
         self.assertIsNone(record.account_hold(hold["login"]))
+
+    def test_finishing_registration_cannot_release_a_replacement_requests_hold(self) -> None:
+        held = account_hold()
+        held["registration"] = "in progress"
+        held["request_id"] = "replacement"
+        record.set_account_hold(held)
+        record.complete_account_hold_registration(held["login"], "original")
+        record.clear_finished_account_hold(held["login"])
+        self.assertEqual(record.account_hold(held["login"]), held)
+        record.complete_account_hold_registration(held["login"], "replacement")
+        record.clear_finished_account_hold(held["login"])
+        self.assertIsNone(record.account_hold(held["login"]))
+
+    def test_hold_waits_for_every_registration_and_every_covered_requests_records(self) -> None:
+        first = account_hold()
+        second = account_hold()
+        second["request_id"] = "second"
+        record.register_account_hold_request(first, account_wide=True)
+        record.register_account_hold_request(second, account_wide=True)
+        record.complete_account_hold_registration(first["login"], first["request_id"])
+        record.clear_finished_account_hold(first["login"])
+        self.assertIsInstance(record.lookup_account_hold(first["login"]), record.AccountHeld)
+
+        saved = session_shutdown()
+        saved["request_id"] = second["request_id"]
+        self.assertTrue(record.create_session(saved))
+        record.complete_account_hold_registration(second["login"], second["request_id"])
+        record.clear_finished_account_hold(first["login"])
+        self.assertIsInstance(record.lookup_account_hold(first["login"]), record.AccountHeld)
+        record.archive_session(saved["login"], saved["session"]["session_id"])
+        record.clear_finished_account_hold(first["login"], request_ids=(second["request_id"],))
+        self.assertIsInstance(record.lookup_account_hold(first["login"]), record.AccountHeld)
+        record.clear_finished_account_hold(first["login"], request_ids=(first["request_id"],))
+        self.assertIsInstance(record.lookup_account_hold(first["login"]), record.AccountOpen)
+
+    def test_account_hold_registration_includes_requests_that_already_have_records(self) -> None:
+        saved = session_shutdown()
+        saved["request_id"] = "already-waiting"
+        self.assertTrue(record.create_session(saved))
+        held = account_hold()
+        record.register_account_hold_request(held, account_wide=True)
+        record.complete_account_hold_registration(held["login"], held["request_id"])
+        record.clear_finished_account_hold(held["login"])
+        self.assertIsInstance(record.lookup_account_hold(held["login"]), record.AccountHeld)
+        record.archive_session(saved["login"], saved["session"]["session_id"])
+        record.clear_finished_account_hold(held["login"])
+        self.assertIsInstance(record.lookup_account_hold(held["login"]), record.AccountOpen)
 
     def test_all_account_holds_include_explicit_and_empty_old_accounts_in_request_order(self) -> None:
         explicit = account_hold()
@@ -679,6 +849,10 @@ class SessionRecordTests(ShutdownTestCase):
         for field, value in (
             ("login", "../other"), ("requested_at", "not a time"),
             ("requested_by", {"kind": "unknown"}), ("then", "continue"),
+            ("registration", "unknown"), ("registration", {}),
+            ("request_ids", "not a list"), ("request_ids", []),
+            ("request_ids", ["unknown"]), ("registering_request_ids", ["unknown"]),
+            ("registering_request_ids", [1]),
         ):
             with self.subTest(field=field):
                 hold = cast(dict[str, object], cast(object, account_hold()))
@@ -877,6 +1051,7 @@ class SessionRecordTests(ShutdownTestCase):
                 self.assertEqual(converted[0]["hold"], "account")
                 self.assertEqual(converted[0]["then"], "restart")
                 self.assertEqual(converted[0]["alerts"], "user")
+                self.assertFalse(converted[0]["probe"])
                 self.assertEqual(converted[0]["force"], "now")
                 expected = "stopped" if state in {"down", "restarting"} else "waiting"
                 self.assertEqual(converted[0]["progress"]["kind"], expected)
@@ -1318,6 +1493,328 @@ class SessionRecordTests(ShutdownTestCase):
                 self.assertIsInstance(duplicate, record.ConductorAlreadyRunning)
         self.assertEqual(sleep.call_count, 5)
         self.assertEqual([call.args for call in sleep.call_args_list], [(0.05,)] * 5)
+
+
+class RecoverySnapshotTests(ShutdownTestCase):
+    root: Path = Path()
+    directory: Path = Path()
+
+    @override
+    def setUp(self) -> None:
+        super().setUp()
+        self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        self.directory = self.root / "shutdown" / "owner@example.com"
+        _ = cast(object, self.enterContext(patch.dict(os.environ, {
+            "HOME": str(self.root), "SHUTDOWN_STATE_DIR": str(self.root / "shutdown"),
+        })))
+
+    def snapshot(self, *numbers: int) -> record.RecoverySnapshot:
+        entries: list[record.SnapshotSession] = []
+        for number in numbers:
+            entries.append(record.SnapshotClaudeSession(agent="claude", session=session(number), workers=[],
+                timers=[record.TimerRestore(instance=f"timer-{number}", was_enabled=True,
+                    footer=record.ShowrunnerFooter(kind="footer", slug="show"))], last_seen=NOW, state="running", boot_id="boot-one"))
+        return record.RecoverySnapshot(machine="natedev", login="owner@example.com", label="owner",
+                                       taken_at=NOW, sessions=entries, boot_id="boot-one")
+
+    def test_snapshot_attempt_success_and_failure_keep_the_last_success_across_reads(self) -> None:
+        self.assertIsInstance(record.read_snapshot_attempts(), record.NoSnapshotAttempt)
+        record.record_snapshot_attempt(record.SnapshotTaken(kind="taken", at=NOW, accounts=2), "snapshot-host")
+        first = record.read_snapshot_attempts()
+        assert not isinstance(first, record.NoSnapshotAttempt)
+        self.assertEqual(first["latest"], {"kind": "taken", "at": NOW, "accounts": 2})
+        self.assertEqual(first["last_success"], {"kind": "taken", "at": NOW})
+        self.assertEqual(first["machine"], "snapshot-host")
+        record.record_snapshot_attempt(record.SnapshotFailed(kind="failed", at=LATER, reasons=["registry unreadable"]), "snapshot-host")
+        failed = record.read_snapshot_attempts()
+        assert not isinstance(failed, record.NoSnapshotAttempt)
+        self.assertEqual(failed["last_success"], first["last_success"])
+        self.assertEqual(failed["latest"], {"kind": "failed", "at": LATER, "reasons": ["registry unreadable"]})
+        record.record_snapshot_attempt(record.SnapshotTaken(kind="taken", at=LATER, accounts=0), "snapshot-host")
+        recovered = record.read_snapshot_attempts()
+        assert not isinstance(recovered, record.NoSnapshotAttempt)
+        self.assertEqual(recovered["last_success"], {"kind": "taken", "at": LATER})
+        self.assertEqual(recovered["latest"], {"kind": "taken", "at": LATER, "accounts": 0})
+        self.assertEqual(recovered["machine"], first["machine"])
+
+    def test_first_failed_attempt_does_not_claim_a_success_for_existing_snapshots(self) -> None:
+        saved = self.snapshot(1)
+        record.write_snapshot(saved)
+        record.record_snapshot_attempt(record.SnapshotFailed(kind="failed", at=LATER, reasons=["host lookup failed"]), "natedev")
+        loaded = record.read_snapshot_attempts()
+        assert not isinstance(loaded, record.NoSnapshotAttempt)
+        self.assertEqual(loaded["last_success"], {"kind": "not recorded"})
+        self.assertEqual(record.all_snapshots(), [saved])
+
+    def test_snapshot_attempt_parser_rejects_invalid_times_counts_and_missing_success(self) -> None:
+        path = self.root / "shutdown/snapshot_attempt.json"
+        path.parent.mkdir()
+        good: dict[str, object] = {"machine": "natedev", "latest": {"kind": "taken", "at": NOW, "accounts": 1},
+                                   "last_success": {"kind": "taken", "at": NOW}}
+        invalid: list[dict[str, object]] = [
+            {"machine": "natedev", "latest": good["latest"]},
+            {**good, "latest": {"kind": "taken", "at": "yesterday", "accounts": 1}},
+            {**good, "latest": {"kind": "taken", "at": NOW, "accounts": -1}},
+            {**good, "latest": {"kind": "taken", "at": NOW, "accounts": True}},
+            {**good, "last_success": {"kind": "taken", "at": "2026-10-09T17:49:10-04:00"}},
+            {**good, "latest": {"kind": "failed", "at": NOW, "reasons": [7]}},
+        ]
+        for value in invalid:
+            with self.subTest(value=value):
+                _ = path.write_text(json.dumps(value))
+                with self.assertRaises(record.InvalidRecord):
+                    _ = record.read_snapshot_attempts()
+        _ = path.write_text("{")
+        with self.assertRaises(record.InvalidRecord):
+            _ = record.read_snapshot_attempts()
+
+    def test_snapshot_attempt_metadata_and_leftover_write_keep_account_enumeration_intact(self) -> None:
+        saved = self.snapshot(1)
+        record.write_snapshot(saved)
+        shutdown = session_shutdown()
+        self.assertTrue(record.create_session(shutdown))
+        hold = account_hold()
+        record.set_account_hold(hold)
+        record.record_snapshot_attempt(record.SnapshotTaken(kind="taken", at=NOW, accounts=1), "natedev")
+        self.assertTrue((self.root / "shutdown/snapshot_attempt.lock").is_file())
+        _ = (self.root / "shutdown/.record.interrupted.tmp").write_text("unfinished outcome")
+        self.assertEqual(record.all_snapshots(), [saved])
+        self.assertEqual(record.all_session_records(), [shutdown])
+        self.assertEqual(record.all_account_holds(), [hold])
+        for name in ("stray", "record.interrupted.tmp"):
+            stray = self.root / "shutdown" / name
+            _ = stray.write_text("not account metadata")
+            for read in (record.all_session_records, record.all_account_holds):
+                with self.subTest(reader=read.__name__, name=name), self.assertRaises(record.InvalidRecord):
+                    _ = read()
+            stray.unlink()
+
+    def test_snapshot_round_trip_preserves_workers_timers_and_canonical_login(self) -> None:
+        saved = self.snapshot(1)
+        saved["login"] = "OWNER@example.com"
+        saved["sessions"][0]["workers"].append(owned_worker())
+        record.write_snapshot(saved)
+        loaded = record.read_snapshot("owner@example.com")
+        assert not isinstance(loaded, record.NoRecoverySnapshot)
+        self.assertEqual(loaded["login"], "owner@example.com")
+        self.assertEqual(loaded["sessions"], saved["sessions"])
+        self.assertEqual(record.all_snapshots(), [loaded])
+        self.assertEqual(record.all_session_records(), [])
+        self.assertIsNone(record.account_hold("owner@example.com"))
+
+    def test_partial_observation_keeps_snapshot_bytes_and_timestamp(self) -> None:
+        record.write_snapshot(self.snapshot(1))
+        path = self.root / "shutdown/snapshots/owner@example.com.json"
+        before, stamp = path.read_bytes(), path.stat().st_mtime_ns
+        _ = record.merge_snapshots(inventory.PartialInventory(("registry unreadable",)), LATER)
+        self.assertEqual((path.read_bytes(), path.stat().st_mtime_ns), (before, stamp))
+
+    def test_reboot_retains_absent_sessions_until_seen_again(self) -> None:
+        saved = self.snapshot(1, 2)
+        record.write_snapshot(saved)
+        merged = record.merge_snapshots(inventory.CompleteInventory("natedev", {}, {}, inventory.KnownBoot("boot-two")), LATER)
+        self.assertEqual([(item["session"]["session_id"], item["state"], item["last_seen"]) for item in merged[0]["sessions"]],
+                         [("session-1", "unresolved", NOW), ("session-2", "unresolved", NOW)])
+        observed = self.snapshot(2)["sessions"]
+        updated = record.merge_snapshots(inventory.CompleteInventory("natedev", {saved["login"]: observed},
+                                            {saved["login"]: "owner"}), LATER)[0]
+        self.assertEqual({item["session"]["session_id"]: (item["state"], item["last_seen"]) for item in updated["sessions"]},
+                         {"session-1": ("unresolved", NOW), "session-2": ("running", LATER)})
+
+    def test_acknowledgement_removes_only_the_named_session(self) -> None:
+        saved = self.snapshot(1, 2)
+        record.write_snapshot(saved)
+        other = self.snapshot(3)
+        other["login"] = "other@example.com"
+        record.write_snapshot(other)
+        self.assertIsInstance(record.acknowledge_snapshot(saved["login"], "session-1"), record.SnapshotAcknowledged)
+        self.assertIsInstance(record.acknowledge_snapshot(saved["login"], "missing"), record.SnapshotAlreadyAbsent)
+        loaded = record.read_snapshot(saved["login"])
+        assert not isinstance(loaded, record.NoRecoverySnapshot)
+        self.assertEqual([item["session"]["session_id"] for item in loaded["sessions"]], ["session-2"])
+        self.assertEqual(record.read_snapshot(other["login"]), other)
+
+    def test_materialization_persists_complete_restart_mapping_without_an_account_hold(self) -> None:
+        saved = self.snapshot(1)
+        saved["sessions"][0]["workers"].append(owned_worker())
+        created = record.materialize_snapshot(saved, cast(record.SnapshotClaudeSession, saved["sessions"][0]))
+        persisted = record.session_records(saved["login"])[0]
+        self.assertEqual(persisted, created)
+        self.assertEqual((persisted["login"], persisted["label"], persisted["machine"]),
+                         (saved["login"], saved["label"], saved["machine"]))
+        self.assertEqual(persisted["session"], saved["sessions"][0]["session"])
+        self.assertEqual(persisted["workers"], saved["sessions"][0]["workers"])
+        self.assertEqual(persisted["timers"], saved["sessions"][0]["timers"])
+        self.assertEqual((persisted["requested_at"], persisted["request_id"], persisted["requested_by"]),
+                         (NOW, "recovery-" + NOW, {"kind": "snapshot", "taken_at": NOW, "recovery": {"kind": "not recorded"}}))
+        self.assertEqual((persisted["hold"], persisted["then"], persisted["progress"], persisted["trail"], persisted["stop_issues"]),
+                         ("session", "restart", {"kind": "already gone", "at": NOW}, [], []))
+        self.assertIsNone(record.account_hold(saved["login"]))
+
+    def test_recovery_origin_round_trip_keeps_crash_signal_and_last_seen(self) -> None:
+        snapshot = self.snapshot(1)
+        item = snapshot["sessions"][0]
+        assert item["agent"] == "claude"
+        snapshot["taken_at"] = LATER
+        for signal in ("reboot", "host gone"):
+            with self.subTest(signal=signal):
+                item["crash"] = signal
+                saved = record.snapshot_restore_record(snapshot, item)
+                self.assertTrue(record.create_session(saved))
+                loaded = record.session_records(snapshot["login"])[0]
+                self.assertEqual(loaded["requested_by"], {
+                    "kind": "snapshot", "taken_at": LATER,
+                    "recovery": {"kind": signal, "last_seen": NOW},
+                })
+                path = self.directory / "sessions/session-1.json"
+                path.unlink()
+
+    def test_older_snapshot_origin_normalizes_missing_crash_evidence(self) -> None:
+        snapshot = self.snapshot(1)
+        item = snapshot["sessions"][0]
+        assert item["agent"] == "claude"
+        saved = record.snapshot_restore_record(snapshot, item)
+        wire = cast(dict[str, object], json.loads(json.dumps(saved)))
+        wire["requested_by"] = {"kind": "snapshot", "taken_at": NOW}
+        parsed = record.parse_session_records(json.dumps([wire]))[0]
+        self.assertEqual(parsed["requested_by"], {
+            "kind": "snapshot", "taken_at": NOW, "recovery": {"kind": "not recorded"},
+        })
+        self.assertEqual(record.parse_session_records(json.dumps([parsed]))[0], parsed)
+
+    def test_recovery_origin_refuses_invalid_crash_signal_or_last_seen(self) -> None:
+        snapshot = self.snapshot(1)
+        item = snapshot["sessions"][0]
+        assert item["agent"] == "claude"
+        wire = cast(dict[str, object], json.loads(json.dumps(record.snapshot_restore_record(snapshot, item))))
+        for context in ({"kind": "shutdown", "last_seen": NOW},
+                        {"kind": "reboot", "last_seen": "yesterday"},
+                        {"kind": "host gone"}):
+            with self.subTest(context=context):
+                wire["requested_by"] = {"kind": "snapshot", "taken_at": NOW, "recovery": context}
+                with self.assertRaises(record.InvalidRecord):
+                    _ = record.parse_session_records(json.dumps([wire]))
+
+    def test_materialization_never_overwrites_an_existing_shutdown_request(self) -> None:
+        existing = session_shutdown(progress=record.SessionWaiting(kind="waiting"))
+        existing["target"] = "claude2"
+        self.assertTrue(record.create_session(existing))
+        path = self.directory / "sessions/session-1.json"
+        before = path.read_bytes()
+        snapshot = self.snapshot(1)
+        result = record.materialize_snapshot(snapshot, cast(record.SnapshotClaudeSession, snapshot["sessions"][0]))
+        self.assertEqual(path.read_bytes(), before)
+        self.assertEqual((result["progress"], result.get("target"), result["requested_by"]),
+                         (existing["progress"], "claude2", existing["requested_by"]))
+
+    def test_codex_snapshot_preserves_resume_id_or_picker_and_cannot_become_a_claude_record(self) -> None:
+        for resume in (record.CodexSessionId(kind="session id", session_id="rollout-id"), record.CodexResumePicker(kind="picker")):
+            with self.subTest(resume=resume):
+                owner = session(1 if resume["kind"] == "session id" else 2)
+                saved = record.RecoverySnapshot(machine="natedev", login="codex-work", label="codex-work", taken_at=NOW,
+                    sessions=[record.SnapshotCodexSession(agent="codex", session=owner,
+                        codex=record.CodexLaunch(home=str(self.root / "work"), resume=resume),
+                        workers=[], timers=[], last_seen=NOW, state="running")])
+                record.write_snapshot(saved)
+                self.assertEqual(record.read_snapshot(saved["login"]), saved)
+                with self.assertRaisesRegex(record.InvalidRecord, "Codex restore path"):
+                    _ = record.materialize_snapshot(saved, cast(record.SnapshotClaudeSession, saved["sessions"][0]))
+                self.assertEqual(record.session_records(saved["login"]), [])
+
+    def test_unknown_agent_and_unsafe_login_cannot_replace_a_snapshot(self) -> None:
+        saved = self.snapshot(1)
+        record.write_snapshot(saved)
+        invalid = cast(dict[str, object], json.loads(json.dumps(saved)))
+        invalid["login"] = "../escape"
+        with self.assertRaises(ValueError):
+            _ = record.parse_snapshot(invalid)
+        invalid = cast(dict[str, object], json.loads(json.dumps(saved)))
+        values = cast(list[dict[str, object]], invalid["sessions"])
+        values[0]["agent"] = "other"
+        with self.assertRaisesRegex(record.InvalidRecord, "agent"):
+            _ = record.parse_snapshot(invalid)
+        self.assertEqual(record.read_snapshot(saved["login"]), saved)
+
+    def test_rollout_identity_replaces_the_same_codex_process_picker_entry(self) -> None:
+        owner = session(1)
+        owner["session_id"] = "codex-1001-12345"
+        entry = record.SnapshotCodexSession(agent="codex", session=owner,
+            codex=record.CodexLaunch(home=str(self.root / "codex"), resume=record.CodexResumePicker(kind="picker")),
+            workers=[], timers=[], last_seen=NOW, state="running", boot_id="boot-one")
+        saved = record.RecoverySnapshot(machine="natedev", login="codex-work", label="codex-work", taken_at=NOW,
+                                        sessions=[entry], boot_id="boot-one")
+        record.write_snapshot(saved)
+        promoted = record.parse_snapshot(saved)["sessions"][0]
+        assert promoted["agent"] == "codex"
+        promoted["session"]["session_id"] = "12345678-1234-1234-1234-123456789abc"
+        promoted["codex"]["resume"] = record.CodexSessionId(kind="session id", session_id=promoted["session"]["session_id"])
+        merged = record.merge_snapshots(inventory.CompleteInventory("natedev", {"codex-work": [promoted]},
+            {"codex-work": "codex-work"}, inventory.KnownBoot("boot-one")), LATER)[0]
+        self.assertEqual([(item["session"]["session_id"], item["state"]) for item in merged["sessions"]],
+                         [(promoted["session"]["session_id"], "running")])
+
+    def test_reboot_pid_and_start_reuse_keeps_the_crashed_codex_rollout(self) -> None:
+        owner = session(1)
+        owner["session_id"] = "12345678-1234-1234-1234-123456789abc"
+        entry = record.SnapshotCodexSession(agent="codex", session=owner,
+            codex=record.CodexLaunch(home=str(self.root / "codex"), resume=record.CodexSessionId(
+                kind="session id", session_id=owner["session_id"])),
+            workers=[], timers=[], last_seen=NOW, state="running", boot_id="boot-one")
+        saved = record.RecoverySnapshot(machine="natedev", login="codex-work", label="codex-work", taken_at=NOW,
+                                        sessions=[entry], boot_id="boot-one")
+        record.write_snapshot(saved)
+        current = record.parse_snapshot(saved)["sessions"][0]
+        assert current["agent"] == "codex"
+        current["boot_id"] = "boot-two"
+        current["session"]["session_id"] = "87654321-4321-4321-4321-cba987654321"
+        current["codex"]["resume"] = record.CodexSessionId(kind="session id", session_id=current["session"]["session_id"])
+        _ = record.merge_snapshots(inventory.CompleteInventory("natedev", {"codex-work": [current]},
+            {"codex-work": "codex-work"}, inventory.KnownBoot("boot-two")), LATER)
+        loaded = record.read_snapshot("codex-work")
+        assert not isinstance(loaded, record.NoRecoverySnapshot)
+        entries = {item["session"]["session_id"]: item for item in loaded["sessions"]}
+        self.assertEqual(set(entries), {owner["session_id"], current["session"]["session_id"]})
+        crashed = entries[owner["session_id"]]
+        self.assertEqual((crashed["state"], crashed.get("crash"), crashed["last_seen"], crashed.get("boot_id")),
+                         ("unresolved", "reboot", NOW, "boot-one"))
+        running = entries[current["session"]["session_id"]]
+        self.assertEqual((running["state"], running["last_seen"], running.get("boot_id")),
+                         ("running", LATER, "boot-two"))
+
+    def test_clean_exit_is_removed_and_shutdown_records_own_stopped_session_recovery(self) -> None:
+        saved = self.snapshot(1, 2)
+        record.write_snapshot(saved)
+        clean = record.merge_snapshots(inventory.CompleteInventory("natedev", {}, {}, inventory.KnownBoot("boot-one")), LATER)[0]
+        self.assertEqual(clean["sessions"], [])
+        record.write_snapshot(saved)
+        _ = record.create_session(session_shutdown())
+        rebooted = record.merge_snapshots(inventory.CompleteInventory("natedev", {}, {}, inventory.KnownBoot("boot-two")), LATER)[0]
+        self.assertEqual([item["session"]["session_id"] for item in rebooted["sessions"]], ["session-2"])
+        self.assertEqual(record.session_records(saved["login"])[0]["session"]["session_id"], "session-1")
+
+    def test_restarted_history_skips_bad_files_and_preserves_stale_target_without_resolving(self) -> None:
+        history = self.directory / "history"
+        history.mkdir(parents=True)
+        saved = session_shutdown(progress=record.SessionRestarted(kind="restarted", at=LATER))
+        saved["target"] = "claude999"
+        _ = (history / "good.json").write_text(json.dumps(saved))
+        _ = (history / "invalid.json").write_text("{broken")
+        _ = (history / "unreadable.json").write_text(json.dumps(saved))
+        (history / "linked.json").symlink_to(history / "good.json")
+        original = Path.read_text
+        reads: list[Path] = []
+
+        def read(path: Path, encoding: str | None = None, errors: str | None = None) -> str:
+            reads.append(path)
+            if path.name == "unreadable.json":
+                raise PermissionError("history denied")
+            return original(path, encoding=encoding, errors=errors)
+
+        with patch.object(Path, "read_text", read):
+            found = record.restarted_history()
+        self.assertEqual([(item["session"]["session_id"], item.get("target")) for item in found], [("session-1", "claude999")])
+        self.assertEqual(reads.count(history / "good.json"), 1)
+        self.assertNotIn(history / "linked.json", reads)
 
 
 if __name__ == "__main__":

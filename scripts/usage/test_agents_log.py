@@ -521,6 +521,25 @@ for index in range(20):
         self.assertTrue(all(record["role"] == "worker" for record in records))
         self.assertEqual(agents_log.assignments(self.log_path).problems, ())
 
+    def test_backfill_reads_runs_and_directors_under_both_run_folder_names(self) -> None:
+        archive, live, _roster_at, _ledger_at = self.backfill_fixture()
+        former = self.root / "former"
+        former_run = former / "former-run"
+        former_run.mkdir(parents=True)
+        _ = (former_run / "mesh_roster.json").write_text(json.dumps({
+            "project-fix": {"thread_id": "former-thread", "role": "fix", "status": "done"},
+        }), encoding="utf-8")
+        (former / "active").mkdir()
+        _ = (former / "active" / "former-director").write_text(f"{former_run}\n", encoding="utf-8")
+
+        result = self.cli("backfill", "--archive", str(archive), "--live", str(live), "--live", str(former))
+
+        self.assertEqual((result.returncode, result.stderr), (0, ""))
+        log = agents_log.assignments(self.log_path)
+        self.assertEqual(log.assignments["former-thread"][0].role, "fix")
+        self.assertEqual(log.assignments["former-director"][0].role, "director")
+        self.assertEqual(log.assignments["director-session"][0].role, "director")
+
     def test_backfill_recovers_previous_role_workers_director_and_review_lens(self) -> None:
         archive, live, roster_at, ledger_at = self.backfill_fixture()
 
@@ -670,6 +689,23 @@ exec(compile(sys.stdin.read(), module.__file__, 'exec'), module.__dict__)
         unrelated = run / "review_agent_3_ux.log"
         _ = unrelated.write_text("workers: project-test2 other-project-test\n", encoding="utf-8")
         for index, path in enumerate((old_log, newest_matching, unrelated)):
+            stamp = 1_700_000_000 + index * 100
+            os.utime(path, (stamp, stamp))
+
+        result = self.cli("backfill", "--archive", str(archive), "--live", str(live))
+
+        self.assertEqual((result.returncode, result.stderr), (0, ""))
+        self.assertEqual(agents_log.assignments(self.log_path).assignments["archived-thread"][-1].lens,
+                         "contract")
+
+    def test_backfill_reads_review_logs_in_phase_directories(self) -> None:
+        archive, live, _, _ = self.backfill_fixture()
+        run = archive / "archived-run"
+        old_log = run / "review_agent_adversary.log"
+        phase_log = run / "phases" / "4" / "review_agent_2_contract.log"
+        phase_log.parent.mkdir(parents=True)
+        _ = phase_log.write_text("worker=project-test; role=review\n", encoding="utf-8")
+        for index, path in enumerate((old_log, phase_log)):
             stamp = 1_700_000_000 + index * 100
             os.utime(path, (stamp, stamp))
 

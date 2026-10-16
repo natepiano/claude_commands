@@ -90,7 +90,10 @@ agents_exec_main() {
 import sys
 sys.path.insert(0, sys.argv[1])
 from agent_accounts import workers_home
-print(workers_home())
+try:
+    print(workers_home())
+except (OSError, ValueError) as error:
+    sys.exit(str(error))
 PY
             )"
             family_args_line="$(agents_codex_args)"
@@ -123,6 +126,8 @@ PY
             "${command[@]}" < "$prompt_file" > "$log_file" 2>&1
             ;;
         claude)
+            source "$script_dir/claude_account.sh"
+            claude_launch_environment || return 1
             family_args_line="$(agents_claude_args)"
             read -r -a family_args <<< "$family_args_line"
             command=(claude --print)

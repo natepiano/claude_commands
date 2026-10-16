@@ -23,7 +23,7 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "scripts" / "shutdown"))
 sys.path.insert(0, str(ROOT / "scripts" / "whoami"))
-from scripts.accounts import accounts, moves, refusals
+from scripts.accounts import accounts, moves, refusals, role_map
 import account
 import agent_accounts
 from note_file import canonical_label
@@ -325,9 +325,10 @@ NO_SESSION_FILTER: frozenset[str] = frozenset()
 
 def live_owners(*, only: frozenset[str] = NO_SESSION_FILTER) -> list[inventory_module.Session]:
     owners: dict[str, inventory_module.Session] = {}
+    home_state = account.home_account_state()
     logins = {identity.login for session in sessions.live_sessions()
               if not only or session["sessionId"] in only
-              if (identity := account.account_of(session["pid"])) is not None}
+              if (identity := account.account_of(session["pid"], home_state=home_state)) is not None}
     for login in sorted(logins):
         for session in inventory_module.inventory(login, only, refresh_desktops=False)["sessions"]:
             if session["kind"] != "worker":
@@ -412,7 +413,7 @@ def _run(now: datetime, dry_run: bool, proof_group: frozenset[str] = NO_SESSION_
         if isinstance(identity := accounts.account_identity(Path(session.get("config_dir", str(accounts.main_config_dir())))),
                       agent_accounts.NumberedAccount))
     tick_excluded = accounts.account_labels_for_logins(tick_logins)
-    # Preparation is a read-only gate: a broken destination changes no group or refusal state.
+    # Preview preparation judges repairs without changing any account content.
     for session in owners:
         group_name = accounts.session_group(session)
         if group_name == "ungrouped":
@@ -454,7 +455,8 @@ def _run(now: datetime, dry_run: bool, proof_group: frozenset[str] = NO_SESSION_
         chosen = accounts.placement(group_name, now, exclude=tick_excluded)
         if not isinstance(chosen.reason, accounts.GroupNoRoom):
             assert isinstance(chosen.label, str)
-            prepared = accounts.prepared_account(chosen.label, resume=True)
+            prepared = (accounts.prepared_account_preview(chosen.label, resume=True) if dry_run
+                        else accounts.prepared_account(chosen.label, resume=True))
             if isinstance(prepared, accounts.AccountRefused):
                 blocked_groups.add(group_name)
                 lines.append(f"{group_name}: move refused: {prepared.reason}")
@@ -534,7 +536,7 @@ def _run(now: datetime, dry_run: bool, proof_group: frozenset[str] = NO_SESSION_
     if dry_run:
         lines.insert(0, accounts.group_status_line(selected_groups))
     all_members: dict[accounts.ClaudeGroup, list[inventory_module.ListedSession]] = (accounts.live_group_members()
-        if not proof_group and (any(key.startswith("group:") for key in groups) or accounts.groups_file().exists())
+        if not proof_group and (any(key.startswith("group:") for key in groups) or bool(selected_groups))
         else {"units": [], "showrunners": []})
     moved_groups: set[accounts.ClaudeGroup] = set()
     no_room_groups: set[accounts.ClaudeGroup] = set()
@@ -636,7 +638,7 @@ def _run(now: datetime, dry_run: bool, proof_group: frozenset[str] = NO_SESSION_
             if isinstance(outcome, accounts.SessionMoveRefused):
                 lines.append(f"{outcome.session_id}: move refused: {outcome.reason}")
     # A committed group choice is stable. Complete its off-target members without choosing again.
-    if not proof_group and accounts.groups_file().exists():
+    if not proof_group and selected_groups:
         for group_name in accounts.CLAUDE_GROUPS:
             if group_name in moved_groups or group_name in waiting_groups or group_name in blocked_groups or group_name in no_room_groups:
                 continue
@@ -659,7 +661,8 @@ def _run(now: datetime, dry_run: bool, proof_group: frozenset[str] = NO_SESSION_
             if held is not None and not refusals.resolved(held, refusals.stored_reading("claude", identity.login, now), now):
                 lines.append(f"{group_name}: move refused: {target} holds an unresolved refusal")
                 continue
-            prepared = accounts.prepared_account(target, resume=True)
+            prepared = (accounts.prepared_account_preview(target, resume=True) if dry_run
+                        else accounts.prepared_account(target, resume=True))
             if isinstance(prepared, accounts.AccountRefused):
                 lines.append(f"{group_name}: move refused: {prepared.reason}")
                 continue
@@ -675,6 +678,7 @@ def _run(now: datetime, dry_run: bool, proof_group: frozenset[str] = NO_SESSION_
     return lines
 
 
+@role_map.role_map_command
 def run(now: datetime | None = None, *, dry_run: bool = False, proof_group: frozenset[str] = NO_SESSION_FILTER) -> list[str]:
     at = now or datetime.now(timezone.utc)
     if dry_run:

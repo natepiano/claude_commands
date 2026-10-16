@@ -21,21 +21,25 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Literal, NotRequired, TypedDict, cast, override
 
 SCRIPTS = Path(__file__).resolve().parents[1]
-for _directory in (SCRIPTS / "production", SCRIPTS / "delegate", SCRIPTS / "shutdown", SCRIPTS / "herdr", SCRIPTS / "whoami", SCRIPTS / "message"):
+sys.path.insert(0, str(SCRIPTS.parent))
+for _directory in (SCRIPTS / "production", SCRIPTS / "delegate", SCRIPTS / "shutdown", SCRIPTS / "herdr", SCRIPTS / "whoami", SCRIPTS / "message", SCRIPTS / "lib"):
     if str(_directory) not in sys.path:
         sys.path.insert(0, str(_directory))
 
-import add_unit  # noqa: E402
+import production_units  # noqa: E402
 import remove_workers  # noqa: E402
 from worker_state import worker_ledger  # noqa: E402
 import showrunners  # noqa: E402
 import unit_lookup  # noqa: E402
+import unit_runs  # noqa: E402
 import herdr  # noqa: E402
 import codex_daemon  # noqa: E402
 import process_table  # noqa: E402
 if TYPE_CHECKING:
+    from ..accounts.role_map import role_map_command
     from ..whoami import account, agent_accounts, note_file
 else:
+    from scripts.accounts.role_map import role_map_command
     import account as account
     import agent_accounts as agent_accounts
     import note_file as note_file
@@ -638,7 +642,7 @@ def _showrunner_ids(
     return found
 
 
-class _ProductionUnitMarks(add_unit.SessionMarks):
+class _ProductionUnitMarks(production_units.SessionMarks):
     """Use the roster's known marks, retaining rows when those marks are unreadable."""
 
     def __init__(self, slug: str, every: unit_lookup.MarkedProductions | OSError) -> None:
@@ -659,7 +663,7 @@ def _production_rows(
 ) -> list[dict[str, str]]:
     lines = doc.read_text(encoding="utf-8").splitlines()
     marks = _ProductionUnitMarks(slug, every)
-    return [row for row in add_unit.unit_table(lines) if not add_unit.unit_is_retired(row, marks)]
+    return [row for row in production_units.unit_table(lines) if not production_units.unit_is_retired(row, marks)]
 
 
 def _every_marked_unit(*, include_tmux: bool) -> unit_lookup.MarkedProductions | OSError:
@@ -696,11 +700,11 @@ def _production_places(
                 raise OSError(every.faults[runner["slug"]])
             rows = _production_rows(doc, runner["slug"], every)
             units = every.units.get(runner["slug"], {})
-        except (OSError, UnicodeError, ValueError, add_unit.Refusal) as error:
+        except (OSError, UnicodeError, ValueError, production_units.Refusal) as error:
             _problem(problems, f"unit hosts for {runner['slug']} were not read", error)
         else:
             for row in rows:
-                unit_name = add_unit.cell_value(row.get("Unit", ""))
+                unit_name = production_units.cell_value(row.get("Unit", ""))
                 marked = units.get(unit_name)
                 if marked is None:
                     continue
@@ -722,12 +726,12 @@ def _production_places(
         # Worktree ownership is a fallback only when neither host could be read.
         try:
             rows = _production_rows(doc, runner["slug"], every)
-        except (OSError, UnicodeError, ValueError, add_unit.Refusal) as fallback_error:
+        except (OSError, UnicodeError, ValueError, production_units.Refusal) as fallback_error:
             _problem(problems, f"units in {doc}", fallback_error)
             continue
         for row in rows:
-            unit_name = add_unit.cell_value(row.get("Unit", ""))
-            worktree = add_unit.cell_value(row.get("Worktree", ""))
+            unit_name = production_units.cell_value(row.get("Unit", ""))
+            worktree = production_units.cell_value(row.get("Worktree", ""))
             for record in records:
                 if (record["sessionId"] not in ledger_workers and worktree
                         and details[record["sessionId"]].cwd == worktree):
@@ -735,35 +739,43 @@ def _production_places(
     return places
 
 
+def _read_run_markers(
+    active: Path, live_session_ids: set[str], by_path: dict[Path, _RunDirector], problems: list[str]
+) -> None:
+    """Add the run each live director's marker names."""
+    if not active.is_dir():
+        return
+    try:
+        markers = list(active.iterdir())
+    except OSError as error:
+        _problem(problems, f"unit run markers in {active}", error)
+        return
+    for marker in markers:
+        if marker.name not in live_session_ids:
+            continue
+        try:
+            lines = marker.read_text(encoding="utf-8").splitlines()
+            if lines and lines[0].strip():
+                by_path[Path(lines[0].strip()).resolve()] = _DirectorSession(marker.name)
+        except (OSError, UnicodeError) as error:
+            _problem(problems, f"unit run marker {marker}", error)
+
+
 def _live_runs(
-    root: Path, live_session_ids: set[str], problems: list[str]
+    roots: tuple[Path, ...], live_session_ids: set[str], problems: list[str]
 ) -> list[_LiveRun]:
     by_path: dict[Path, _RunDirector] = {}
-    active = root / "active"
-    if active.is_dir():
+    heartbeats: list[Path] = []
+    for root in roots:
+        _read_run_markers(root / "active", live_session_ids, by_path, problems)
         try:
-            markers = list(active.iterdir())
+            heartbeats.extend(root.glob(f"*/{unit_runs.HEARTBEAT}"))
         except OSError as error:
-            _problem(problems, f"delegate markers in {active}", error)
-            markers = []
-        for marker in markers:
-            if marker.name not in live_session_ids:
-                continue
-            try:
-                lines = marker.read_text(encoding="utf-8").splitlines()
-                if lines and lines[0].strip():
-                    by_path[Path(lines[0].strip()).resolve()] = _DirectorSession(marker.name)
-            except (OSError, UnicodeError) as error:
-                _problem(problems, f"delegate marker {marker}", error)
-    try:
-        heartbeats = list(root.glob(f"*/{remove_workers.HEARTBEAT}"))
-    except OSError as error:
-        _problem(problems, f"delegate runs in {root}", error)
-        heartbeats = []
+            _problem(problems, f"unit runs in {root}", error)
     now = time.time()
     for heartbeat in heartbeats:
         try:
-            if now - heartbeat.stat().st_mtime < remove_workers.LIVE_HEARTBEAT_SECS:
+            if now - heartbeat.stat().st_mtime < unit_runs.LIVE_HEARTBEAT_SECS:
                 _ = by_path.setdefault(heartbeat.parent.resolve(), _NoRunningDirector())
         except OSError as error:
             _problem(problems, f"delegate heartbeat {heartbeat}", error)
@@ -893,9 +905,14 @@ def _codex_home_account(home: Path) -> AccountLabel | AccountUnread:
     return AccountLabel(identity.label) if isinstance(identity, agent_accounts.KnownCodexAccount) else AccountUnread(identity.reason)
 
 
-def _process_account(pid: int, kind: str) -> AccountLabel | AccountUnread:
+_HOME_ACCOUNT_UNCHECKED = account.HomeAccountUnchecked()
+
+
+def _process_account(pid: int, kind: str, *,
+                     home_state: account.LegacyHomeLogin | account.ConfigOnlyHome | account.HomeAccountUnchecked = _HOME_ACCOUNT_UNCHECKED,
+                     ) -> AccountLabel | AccountUnread:
     if kind == "claude":
-        identity = account.account_of(pid)
+        identity = account.account_of(pid, home_state=home_state)
         return AccountLabel(identity.label) if identity is not None else AccountUnread("process account could not be read")
     home = account.process_codex_home(pid)
     if isinstance(home, account.ProcessEnvironmentUnread):
@@ -909,22 +926,14 @@ def _worker_account(run: _LiveRun, worker: _MeshWorker, homes: dict[int, Path]) 
         try:
             port = _read_object(run.path / "mesh_server.json").get("port")
         except (OSError, UnicodeError, ValueError):
-            return AccountUnread("serving server not recorded")
-    if not isinstance(port, int) or isinstance(port, bool) or port not in homes:
-        return AccountUnread("serving server not recorded")
-    return _codex_home_account(homes[port])
-
-
-def _server_alive(run: _LiveRun, problems: list[str]) -> bool:
-    path = run.path / "mesh_server.json"
-    if not path.exists():
-        return False
+            pass
+    if isinstance(port, int) and not isinstance(port, bool) and port in homes:
+        return _codex_home_account(homes[port])
+    # Idle shutdown removes server metadata; the next turn uses the workers home.
     try:
-        pid = _read_object(path).get("pid")
-    except (OSError, UnicodeError, ValueError, json.JSONDecodeError) as error:
-        _problem(problems, f"Codex server {path}", error)
-        return False
-    return isinstance(pid, int) and not isinstance(pid, bool) and _pid_alive(pid)
+        return _codex_home_account(agent_accounts.workers_home())
+    except ValueError as error:
+        return AccountUnread(str(error))
 
 
 def _worker_status(status: str) -> str:
@@ -968,7 +977,8 @@ def _claude_entries(
     machine: str, records: list[SessionRecord], details: Mapping[str, _ClaudeDetails],
     runner_ids: Mapping[str, showrunners.Showrunner],
     production_places: Mapping[str, _ProductionPlace], runs: list[_LiveRun],
-    workers: Mapping[str, _WorkerPlace],
+    workers: Mapping[str, _WorkerPlace], *,
+    home_state: account.LegacyHomeLogin | account.ConfigOnlyHome,
 ) -> dict[str, RosterEntry]:
     marker_directors = {
         run.director.session_id
@@ -1035,7 +1045,7 @@ def _claude_entries(
             director=director,
             assignment=assignment,
             session=ClaudeSession(session_id),
-            account=_process_account(record["pid"], "claude"),
+            account=_process_account(record["pid"], "claude", home_state=home_state),
         )
     return entries
 
@@ -1080,9 +1090,7 @@ def _reviewer_process(
     return claude
 
 
-def _reviewer_cwd(process: _ReviewerProcessState, fallback: str) -> str:
-    if isinstance(process, _ReviewerProcessNotFound):
-        return fallback
+def _reviewer_cwd(process: _ReviewerProcess, fallback: str) -> str:
     try:
         return os.readlink(f"/proc/{process.pid}/cwd")
     except OSError:
@@ -1091,11 +1099,13 @@ def _reviewer_cwd(process: _ReviewerProcessState, fallback: str) -> str:
 
 def _review_workers(
     machine: str, run: _LiveRun, place: _RunPlace,
-    table: Mapping[int, process_table.Process], problems: list[str],
+    table: Mapping[int, process_table.Process], problems: list[str], *,
+    home_state: account.LegacyHomeLogin | account.ConfigOnlyHome,
 ) -> list[RosterEntry]:
     entries: list[RosterEntry] = []
     try:
-        statuses = sorted(run.path.glob("review_status*"))
+        # A launch that names its phase writes in that phase's directory.
+        statuses = sorted([*run.path.glob("review_status*"), *run.path.glob("phases/*/review_status*")])
     except OSError as error:
         _problem(problems, f"review state in {run.path}", error)
         return entries
@@ -1111,7 +1121,7 @@ def _review_workers(
             continue
         if status != "reviewing":
             continue
-        pid_path = run.path / f"review_pid{suffix}"
+        pid_path = status_path.parent / f"review_pid{suffix}"
         try:
             launcher_pid = int(pid_path.read_text(encoding="utf-8").strip())
         except (OSError, UnicodeError, ValueError) as error:
@@ -1120,12 +1130,13 @@ def _review_workers(
         if not _pid_alive(launcher_pid):
             continue
         process = _reviewer_process(launcher_pid, table)
-        kind: Kind = process.kind if isinstance(process, _ReviewerProcess) else "codex"
+        if isinstance(process, _ReviewerProcessNotFound):
+            continue
         name = f"{lens} reviewer" if lens else "blind reviewer"
         slot_role = f"review ({lens})" if lens else "review"
         entries.append(RosterEntry(
             machine=machine,
-            kind=kind,
+            kind=process.kind,
             role="worker",
             name=name,
             status="running",
@@ -1134,8 +1145,7 @@ def _review_workers(
             showrunner=place.showrunner,
             director=place.director,
             assignment=WorkerAssignment(slot_role, str(run.path)),
-            account=(_process_account(process.pid, process.kind) if isinstance(process, _ReviewerProcess)
-                     else AccountUnread("reviewer process not found")),
+            account=_process_account(process.pid, process.kind, home_state=home_state),
         ))
     return entries
 
@@ -1143,7 +1153,7 @@ def _review_workers(
 def _delegate_workers(
     machine: str, runs: list[_LiveRun], claude_entries: Mapping[str, RosterEntry],
     production_places: Mapping[str, _ProductionPlace],
-    problems: list[str],
+    problems: list[str], *, home_state: account.LegacyHomeLogin | account.ConfigOnlyHome,
 ) -> tuple[list[RosterEntry], set[str]]:
     try:
         table = process_table.snapshot()
@@ -1154,20 +1164,11 @@ def _delegate_workers(
     entries: list[RosterEntry] = []
     worker_threads: set[str] = set()
     for run in runs:
-        server_alive = _server_alive(run, problems)
         server_homes = _run_server_homes(run)
         place = _run_place(run, claude_entries, production_places)
         for name, record in sorted(_mesh_records(run, problems).items()):
             status = _as_string(record.get("status"))
             if status == "ended":
-                continue
-            launcher = record.get("launcher_pid")
-            launcher_alive = (
-                isinstance(launcher, int)
-                and not isinstance(launcher, bool)
-                and _pid_alive(launcher)
-            )
-            if not server_alive and not launcher_alive:
                 continue
             thread_id = _as_string(record.get("thread_id"))
             if thread_id:
@@ -1196,7 +1197,7 @@ def _delegate_workers(
                 thread=CodexThread(thread_id) if thread_id else NoCodexThread(),
                 account=_worker_account(run, record, server_homes),
             ))
-        entries.extend(_review_workers(machine, run, place, table, problems))
+        entries.extend(_review_workers(machine, run, place, table, problems, home_state=home_state))
     return entries, worker_threads
 
 
@@ -1243,23 +1244,24 @@ def machine_name() -> str:
 
 
 def _local_roster(environment: Mapping[str, str]) -> Roster:
+    home_state = account.home_account_state()
     problems: list[str] = []
     machine = machine_name()
     records = _newest_sessions()
     details = _raw_session_details(records, problems)
     registered = _registered_showrunners(environment, problems)
     runner_ids = _showrunner_ids(records, registered)
-    root = Path(environment.get("ROSTER_DELEGATE_ROOT", "/tmp/claude/delegate"))
-    runs = _live_runs(root, {record["sessionId"] for record in records}, problems)
+    roots = unit_runs.run_roots(environment.get("ROSTER_DELEGATE_ROOT"))
+    runs = _live_runs(roots, {record["sessionId"] for record in records}, problems)
     workers = _ledger_workers(runs, records, problems)
     production_places = _production_places(
         records, details, registered, runner_ids, set(workers), problems
     )
     claude = _claude_entries(
-        machine, records, details, runner_ids, production_places, runs, workers
+        machine, records, details, runner_ids, production_places, runs, workers, home_state=home_state
     )
     delegate_workers, worker_threads = _delegate_workers(
-        machine, runs, claude, production_places, problems
+        machine, runs, claude, production_places, problems, home_state=home_state
     )
     daemon_socket = codex_daemon.daemon_socket(environment)
     daemon = codex_daemon.loaded_sessions(daemon_socket)
@@ -1330,6 +1332,7 @@ def peer_roster(environment: Mapping[str, str]) -> Roster:
     return result
 
 
+@role_map_command
 def roster(environment: Mapping[str, str], scope: RosterScope) -> Roster:
     match scope:
         case ThisMachine():

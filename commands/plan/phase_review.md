@@ -64,7 +64,7 @@ If the conversation does not make the phase obvious, ask the user one clarifying
    remaining-phase review and closeout shrink; it never enters the repository.
    Read **Split observed** from `${SESSION_DIR}/board.log` — the `register`
    and `handoff` posts say which worker held which role, and when — and from the
-   two `impl_summary_<slot>.txt`; never reconstruct it from memory. It is what
+   two `${PHASE_DIR}/impl_summary_<slot>.txt`; never reconstruct it from memory. It is what
    `<MaintainWorkOrders/>` assigns workers to the remaining Work Orders from.
 
 <StateAndConsequenceAudit>

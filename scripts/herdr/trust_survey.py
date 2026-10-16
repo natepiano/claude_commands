@@ -75,11 +75,12 @@ def accepted(projects: dict[str, ProjectTrustEntry], key: Path) -> bool:
 
 def main() -> None:
     home = Path.home()
-    account_files = [home / ".claude.json", *sorted(
+    # The home file is the seed and trust baseline, rather than a launch account.
+    trust_files = [home / ".claude.json", *sorted(
         directory / ".claude.json" for directory in home.glob(".claude[1-9]*")
         if directory.is_dir() and directory.name[len(".claude"):].isdigit()
     )]
-    accounts = [(account_file, project_trust(account_file)) for account_file in account_files]
+    accounts = [(account_file, project_trust(account_file)) for account_file in trust_files]
     kinds: dict[str, str] = {}
     for account_file, projects in accounts:
         for key, entry in sorted(projects.items()):

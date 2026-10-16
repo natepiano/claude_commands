@@ -5,6 +5,7 @@ from __future__ import annotations
 import io
 import json
 import os
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -60,12 +61,13 @@ class AccountMoveTests(ShutdownTestCase):
             "oauthAccount": {"emailAddress": "default@example.invalid"},
         }), encoding="utf-8")
         self.note("claude2", "default@example.invalid")
+        self.named_account("claude2", "default@example.invalid")
         self.named_account("claude1", "current@example.invalid")
         self.named_account("claude3", "target@example.invalid")
         self.owner = top_level("move-id", name="kept name", host=tmux_host("kept tmux"))
         self.owner["config_dir"] = str(accounts.account_dir("claude1"))
         _ = self.enterContext(patch.object(sessions, "live_sessions", side_effect=self.live_registry))
-        _ = self.enterContext(patch.object(account, "process_config_dir", return_value=accounts.account_dir("claude1")))
+        _ = self.enterContext(patch.object(account, "process_config_dir", return_value=account.ConfiguredClaudeFolder(accounts.account_dir("claude1"))))
         _ = self.enterContext(patch.object(inventory, "inventory", side_effect=AssertionError("accounts must use the listing")))
         _ = self.enterContext(patch.object(inventory, "listing", side_effect=self.current_listing))
         at = datetime.now(timezone.utc)
@@ -175,8 +177,10 @@ class AccountMoveTests(ShutdownTestCase):
         self.owner = worker_session("move-id", owner="director")
         self.refuses_without_change("workers move with their unit director")
 
-    def test_move_refuses_the_targets_first_check_problem_without_change(self) -> None:
-        with patch.object(accounts, "check", return_value=["accounts: first target problem", "second problem"]):
+    def test_move_refuses_the_targets_first_preparation_problem_without_change(self) -> None:
+        with patch.object(accounts, "prepared_account", return_value=accounts.AccountRefused(
+            "accounts: first target problem\naccounts: second target problem"
+        )):
             self.refuses_without_change("first target problem")
 
     def test_move_refuses_its_current_login_without_change(self) -> None:
@@ -201,12 +205,12 @@ class AccountMoveTests(ShutdownTestCase):
         process.assert_called_once()
         arguments = cast(tuple[str, ...], process.call_args.args[0])
         self.assertEqual(arguments[arguments.index("--to") + 1], target)
-        self.assertEqual(accounts.claude_account_dir(arguments[arguments.index("--to") + 1]), self.root / ".claude")
+        self.assertEqual(accounts.claude_account_dir(arguments[arguments.index("--to") + 1]), self.root / f".{target}")
 
-    def test_move_to_the_home_logins_note_number_uses_its_home(self) -> None:
+    def test_move_to_claude2_uses_its_numbered_folder(self) -> None:
         self.assert_move_to_the_home_number("claude2")
 
-    def test_move_to_a_named_directory_sharing_the_home_login_uses_its_home(self) -> None:
+    def test_move_to_a_named_directory_sharing_the_legacy_login_keeps_the_numbered_folder(self) -> None:
         self.named_account("claude4", "default@example.invalid")
         self.assert_move_to_the_home_number("claude4")
 
@@ -236,6 +240,94 @@ class AccountMoveTests(ShutdownTestCase):
             self.assertEqual(accounts.main(["move", "move-id", "claude3", "--why", "weekly limit reached"]), 0)
         arguments = cast(tuple[str, ...], process.call_args.args[0])
         self.assertEqual(arguments[arguments.index("--why") + 1], "weekly limit reached")
+
+    def test_single_move_forwards_no_alert_only_when_requested(self) -> None:
+        for flags in ((), ("--no-alert",)):
+            with (
+                self.subTest(flags=flags),
+                patch.dict(os.environ, {"SHUTDOWN_STATE_DIR": str(self.root / ("quiet" if flags else "alert"))}),
+                patch.object(subprocess, "run", side_effect=self.start_one) as process,
+                redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()),
+            ):
+                self.assertEqual(accounts.main(["move", "move-id", "claude3", *flags]), 0)
+                process.assert_called_once()
+                command = cast(tuple[str, ...], process.call_args.args[0])
+                self.assertEqual(command[2:4], ("down", "claude1"))
+                self.assertEqual(command[command.index("--only") + 1], "move-id")
+                self.assertEqual(command.count("--no-alert"), len(flags))
+
+    def alert_move_members(self) -> list[inventory.ListedSession]:
+        report = self.showrunner_inventory()
+        first, second = report["sessions"][0], report["sessions"][2]
+        second["config_dir"] = str(self.root / ".claude")
+        return [*self.listed(inventory.Inventory(machine=report["machine"], login=report["login"],
+                    label=report["label"], sessions=[first], unattributed=[])),
+                *self.listed(inventory.Inventory(machine=report["machine"], login="default@example.invalid",
+                    label="claude2", sessions=[second], unattributed=[]))]
+
+    def test_group_move_forwards_no_alert_to_every_source_only_when_requested(self) -> None:
+        members = self.alert_move_members()
+
+        def start(command: tuple[str, ...], **_options: object) -> subprocess.CompletedProcess[str]:
+            selected = command[command.index("--only") + 1].split(",")
+            for member in members:
+                if member.session_id in selected:
+                    saved = entry(showrunner(member.session_id))
+                    saved["login"], saved["label"] = member.login, command[3]
+                    saved["target"] = command[command.index("--to") + 1]
+                    self.assertTrue(record.create_session(saved))
+            return subprocess.CompletedProcess(command, 0, "", "")
+
+        for flags in ((), ("--no-alert",)):
+            with (
+                self.subTest(flags=flags),
+                patch.dict(os.environ, {"SHUTDOWN_STATE_DIR": str(self.root / ("quiet" if flags else "alert"))}),
+                patch.object(inventory, "listing", return_value=members),
+                patch.object(subprocess, "run", side_effect=start) as process,
+                redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()),
+            ):
+                self.assertEqual(accounts.main(["move", "showrunners", "claude3", *flags]), 0)
+                commands = [cast(tuple[str, ...], call.args[0]) for call in process.call_args_list]
+                self.assertEqual(len(commands), 2)
+                self.assertEqual({command[3] for command in commands}, {"claude1", "claude2"})
+                self.assertEqual({command[command.index("--only") + 1] for command in commands},
+                                 {"sr-one", "sr-two"})
+                for command in commands:
+                    self.assertEqual(command[2], "down")
+                    self.assertEqual(command.count("--no-alert"), len(flags))
+
+    def test_move_dry_run_preserves_no_alert_in_each_planned_command_without_writes(self) -> None:
+        members = [self.listed(inventory.Inventory(machine="natedev", login="current@example.invalid",
+                    label="claude1", sessions=[self.owner], unattributed=[]))[0], *self.alert_move_members()]
+        for subject, expected_sources in (("move-id", {"claude1"}), ("showrunners", {"claude1", "claude2"})):
+            for flags in ((), ("--no-alert",)):
+                with self.subTest(subject=subject, flags=flags):
+                    before = self.disk_state()
+                    output, error = io.StringIO(), io.StringIO()
+                    with (
+                        patch.object(inventory, "listing", return_value=members),
+                        patch.object(subprocess, "run") as process,
+                        redirect_stdout(output), redirect_stderr(error),
+                    ):
+                        result = accounts.main(["move", subject, "claude3", "--dry-run", *flags])
+                    self.assertEqual((result, error.getvalue()), (0, ""))
+                    commands = [shlex.split(line)
+                                for line in output.getvalue().splitlines() if "shutdown.py down " in line]
+                    if flags:
+                        self.assertEqual(len(commands), len(expected_sources), output.getvalue())
+                        self.assertEqual({command[3] for command in commands}, expected_sources)
+                        selected: set[str] = set()
+                        for command in commands:
+                            self.assertEqual(command.count("--no-alert"), 1)
+                            self.assertIn("--here", command)
+                            self.assertIn("--restart", command)
+                            self.assertEqual(command[command.index("--to") + 1], "claude3")
+                            selected.update(command[command.index("--only") + 1].split(","))
+                        self.assertEqual(selected, {"move-id"} if subject == "move-id" else {"sr-one", "sr-two"})
+                    else:
+                        self.assertNotIn("--no-alert", output.getvalue())
+                    self.assertEqual(self.disk_state(), before)
+                    process.assert_not_called()
 
     def test_move_defaults_its_reason_to_the_source_label_being_out_of_usage(self) -> None:
         with patch.object(subprocess, "run", side_effect=self.start_one) as process:
@@ -370,7 +462,7 @@ class AccountMoveTests(ShutdownTestCase):
         director = unit("director", doc="/tmp/demo-production.md")
         director["config_dir"] = str(accounts.account_dir("claude1"))
         director["checkout"] = inventory.NotACheckout(kind="not a checkout")
-        director["status"] = "idle"
+        director["status"] = "busy"
         report = inventory.Inventory(machine="natedev", login="current@example.invalid", label="claude1",
                                      sessions=[director], unattributed=[])
         commands: list[list[str]] = []
@@ -392,7 +484,8 @@ class AccountMoveTests(ShutdownTestCase):
                 self.assertIn("shutdown.py ready --where", text)
             return {"kind": "sent"}
 
-        def stopped(saved: record.SessionShutdown) -> record.SessionShutdown:
+        def stopped(saved: record.SessionShutdown, *, idle_reason: stop_work.IdleStopReason = "not an idle stop") -> record.SessionShutdown:
+            self.assertEqual(idle_reason, "not an idle stop")
             events.append("stop")
             self.assertEqual(saved["progress"]["kind"], "ready")
             checkpoint = saved["where"]
@@ -440,6 +533,7 @@ class AccountMoveTests(ShutdownTestCase):
             self.assertNotIsInstance(settle.next_step(saved, observed, [saved], datetime.now(timezone.utc)),
                                      settle.StopSession)
             stop.assert_not_called()
+            director["status"] = "idle"
             with patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": "director"}):
                 self.assertEqual(shutdown.main(["ready", "--where", "finish the checkpoint"]), 0)
             saved = record.session_records(report["login"])[0]
@@ -616,7 +710,9 @@ class AccountMoveTests(ShutdownTestCase):
         process.assert_not_called()
 
     def test_group_move_refuses_first_preparation_problem_without_change(self) -> None:
-        with patch.object(accounts, "check", return_value=["accounts: target problem"]):
+        with patch.object(accounts, "prepared_account", return_value=accounts.AccountRefused(
+            "accounts: target problem\naccounts: second target problem"
+        )):
             self.batch_refuses_without_change("target problem")
 
     def assert_group_alias_moves_to_default(self, target: str) -> None:
@@ -669,7 +765,7 @@ class AccountMoveTests(ShutdownTestCase):
         self.assertEqual(added["target"], "claude3")
         self.assertNotEqual(self.disk_state(), before)
 
-    def test_group_preview_uses_only_listing_and_explains_pause_or_reap_without_writes(self) -> None:
+    def test_group_preview_uses_only_listing_and_explains_wait_or_reap_without_writes(self) -> None:
         report = self.showrunner_inventory()
         before = self.disk_state()
         states = [settle.TakesPrompts("room"),
@@ -683,7 +779,7 @@ class AccountMoveTests(ShutdownTestCase):
         listing.assert_called()
         self.assertIn("sr-one", output)
         self.assertIn("first showrunner:", output)
-        self.assertIn("pause, then move (claude1 has room)", output)
+        self.assertIn("move when idle (claude1 has room)", output)
         self.assertIn("sr-two", output)
         self.assertIn("second showrunner:", output)
         self.assertIn("reap and restart now (claude1 out of usage: weekly limit, resets Thu 9:00 AM)", output)
@@ -760,6 +856,24 @@ class AccountMoveTests(ShutdownTestCase):
                     self.assertEqual(self.disk_state(), before)
                 process.assert_not_called()
 
+    def test_recovered_not_ready_record_still_refuses_a_second_move(self) -> None:
+        saved = entry(self.owner)
+        saved["login"], saved["label"] = "current@example.invalid", "claude1"
+        saved["progress"] = {"kind": "stop failed", "at": saved["requested_at"],
+            "reason": "session or worker is not idle and ready"}
+        saved["stop_issues"] = [record.NotReadyToStop(kind="not ready to stop", at=saved["requested_at"],
+            status="busy", progress="waiting")]
+        directory = self.root / "shutdown" / saved["login"] / "sessions"
+        directory.mkdir(parents=True)
+        _ = (directory / "move-id.json").write_text(json.dumps(saved))
+        before = self.disk_state()
+        with patch.object(subprocess, "run") as process:
+            result, output, error = self.cli()
+        self.assertEqual(result, 1)
+        self.assertIn("already has a shutdown in progress", output + error)
+        self.assertEqual(self.disk_state(), before)
+        process.assert_not_called()
+
     def test_single_preview_uses_listing_and_writes_nothing(self) -> None:
         before = self.disk_state()
         output, error = io.StringIO(), io.StringIO()
@@ -770,7 +884,7 @@ class AccountMoveTests(ShutdownTestCase):
         self.assertEqual((result, error.getvalue()), (0, ""))
         self.assertIn("kept name:", output.getvalue())
         self.assertIn("move-id", output.getvalue())
-        self.assertIn("pause, then move", output.getvalue())
+        self.assertIn("move when idle", output.getvalue())
         self.assertEqual(self.disk_state(), before)
         process.assert_not_called()
 

@@ -15,6 +15,19 @@ ln -s "$SCRIPT_DIR/../lib/py" "$HOME/.claude/scripts/lib/py"
 ln -s "$SCRIPT_DIR/../whoami" "$HOME/.claude/scripts/whoami"
 ln -s "$SCRIPT_DIR/../accounts" "$HOME/.claude/scripts/accounts"
 unset CODEX_HOME
+export AGENT_NOTES_DIR="$TEST_DIR/notes"
+mkdir -p "$AGENT_NOTES_DIR"
+python3 - "$SCRIPT_DIR/../.." <<'PYTHON'
+import json, sys
+from pathlib import Path
+sys.path.insert(0, str(Path(sys.argv[1]).resolve()))
+from scripts.accounts import accounts
+notes = Path.home().parent / "notes"
+_ = (notes / "claude2.md").write_text("---\nlogin: launcher@example.invalid\n---\n")
+assert accounts.setup("claude2") == []
+_ = (accounts.account_dir("claude2") / ".claude.json").write_text(json.dumps({"oauthAccount": {"emailAddress": "launcher@example.invalid"}}))
+PYTHON
+export CLAUDE_CONFIG_DIR="$HOME/.claude2"
 
 export AGENTS_CONFIG_FILE="$TEST_DIR/agents.conf"
 export CODEX_CONFIG_FILE="$TEST_DIR/codex.toml"

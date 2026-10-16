@@ -16,7 +16,7 @@ from pathlib import Path
 from typing import override
 from unittest.mock import patch
 
-import account
+from scripts.whoami import account, agent_accounts
 
 
 STATUS_LINE = Path(__file__).parents[1] / "statusline" / "statusline.jq"
@@ -197,11 +197,102 @@ class AccountTests(unittest.TestCase):
             assert isinstance(unreadable, account.ProcessEnvironmentUnread)
             self.assertTrue(unreadable.reason)
 
+    def test_mac_prompt_assignment_is_an_argument_and_never_selects_a_codex_home(self) -> None:
+        arguments = ("/Applications/Codex Tools/codex", "exec", "-c", "key=value", "", "CODEX_HOME=/scratch/other")
+        for environment in (b"HOME=/scratch\0", b"HOME=/scratch\0CODEX_HOME=\0"):
+            with self.subTest(empty_setting=b"CODEX_HOME=" in environment):
+                payload = (len(arguments).to_bytes(4, sys.byteorder, signed=True)
+                           + os.fsencode(arguments[0]) + b"\0\0\0"
+                           + b"\0".join(os.fsencode(word) for word in arguments) + b"\0" + environment)
+                with (patch.object(sys, "platform", "darwin"),
+                      patch.object(account, "_kern_procargs2", return_value=payload),
+                      patch.object(subprocess, "run", side_effect=AssertionError("ps text cannot identify environment"))):
+                    record = account.mac_process_record(321)
+                    selected = account.process_codex_home(321)
+                self.assertIsInstance(record, account.MacProcessRecord)
+                assert isinstance(record, account.MacProcessRecord)
+                self.assertEqual(record.arguments, arguments)
+                self.assertIsInstance(record.setting, account.ProcessWithoutCodexHome)
+                self.assertIsInstance(selected, account.ProcessWithoutCodexHome)
+
+    def test_mac_codex_home_comes_only_from_environment_after_the_exact_argument_count(self) -> None:
+        payload = (int(3).to_bytes(4, sys.byteorder, signed=True)
+                   + b"/opt/codex\0\0codex\0exec\0CODEX_HOME=/scratch/prompt\0"
+                   + b"CODEX_HOME=/scratch/selected home\0FIXTURE_VALUE=private-marker\0")
+        with (patch.object(sys, "platform", "darwin"),
+              patch.object(account, "_kern_procargs2", return_value=payload)):
+            record = account.mac_process_record(321)
+            selected = account.process_codex_home(321)
+        self.assertIsInstance(record, account.MacProcessRecord)
+        assert isinstance(record, account.MacProcessRecord)
+        self.assertEqual(record.arguments, ("codex", "exec", "CODEX_HOME=/scratch/prompt"))
+        self.assertEqual(record.setting, account.ProcessCodexHome(Path("/scratch/selected home")))
+        self.assertEqual(selected, record.setting)
+        self.assertNotIn("private-marker", repr(record))
+
+    def test_mac_kernel_executable_is_retained_independently_of_a_spoofed_argument_zero(self) -> None:
+        executable = "/Applications/ChatGPT.app/Contents/MacOS/codex"
+        payload = (int(3).to_bytes(4, sys.byteorder, signed=True)
+                   + os.fsencode(executable) + b"\0\0codex\0app-server\0daemon\0HOME=/scratch\0")
+        with patch.object(account, "_kern_procargs2", return_value=payload):
+            record = account.mac_process_record(321)
+        self.assertIsInstance(record, account.MacProcessRecord)
+        assert isinstance(record, account.MacProcessRecord)
+        self.assertEqual(record.executable, Path(executable))
+        self.assertEqual(record.arguments, ("codex", "app-server", "daemon"))
+
+    def test_mac_refused_or_malformed_kernel_record_is_unreadable_instead_of_default_home(self) -> None:
+        malformed = (
+            b"", b"\x01\x00",
+            int(0).to_bytes(4, sys.byteorder, signed=True) + b"/opt/codex\0\0",
+            int(-1).to_bytes(4, sys.byteorder, signed=True) + b"/opt/codex\0\0",
+            int(1).to_bytes(4, sys.byteorder, signed=True) + b"unterminated-executable",
+            int(3).to_bytes(4, sys.byteorder, signed=True) + b"/opt/codex\0\0codex\0",
+            int(1).to_bytes(4, sys.byteorder, signed=True) + b"/opt/codex\0\0codex",
+            int(1).to_bytes(4, sys.byteorder, signed=True) + b"/opt/codex\0\0codex\0invalid-environment\0",
+        )
+        with patch.object(sys, "platform", "darwin"):
+            for index, payload in enumerate(malformed):
+                with self.subTest(case=index), patch.object(account, "_kern_procargs2", return_value=payload):
+                    record = account.mac_process_record(321)
+                    selected = account.process_codex_home(321)
+                self.assertIsInstance(record, account.ProcessEnvironmentUnread)
+                self.assertIsInstance(selected, account.ProcessEnvironmentUnread)
+                assert isinstance(selected, account.ProcessEnvironmentUnread)
+                self.assertTrue(selected.reason)
+            with patch.object(account, "_kern_procargs2", side_effect=PermissionError("denied")):
+                self.assertIsInstance(account.mac_process_record(321), account.ProcessEnvironmentUnread)
+                self.assertIsInstance(account.process_codex_home(321), account.ProcessEnvironmentUnread)
+
     def test_legacy_note_alone_still_resolves_the_spaced_account_label(self) -> None:
         self.write_note("claude 2.md", "legacy@example.invalid")
         with patch.dict(os.environ, {"AGENT_NOTES_DIR": str(self.notes)}):
             self.assertEqual(account.label_for("claude", "legacy@example.invalid"), "claude2")
             self.assertEqual(account.named_claude_account("claude 2").login, "legacy@example.invalid")
+
+    def test_attribution_pass_reads_home_once_and_observes_cutover_on_next_pass(self) -> None:
+        home = self.home / ".claude"
+        home.mkdir()
+        seed = self.home / ".claude.json"
+        self.write_claude_config(seed, "old@example.invalid")
+        self.write_note("claude2.md", "old@example.invalid")
+        with (patch.dict(os.environ, self.environment_without_claude_config_dir(), clear=True),
+              patch.object(account, "claude_on_disk", wraps=agent_accounts.claude_on_disk) as read_home,
+              patch.object(account, "process_config_dir", return_value=account.NoAccountSetting())):
+            state = account.home_account_state()
+            # A pass retains one consistent snapshot even if the home changes mid-pass.
+            _ = seed.write_text("{}")
+            for pid in (101, 102):
+                self.assertEqual(account.process_account_directory(account.NoAccountSetting(), home_state=state),
+                                 account.ConfiguredClaudeFolder(home))
+                self.assertEqual(account.account_of(pid, home_state=state),
+                                 account.Account("claude", "old@example.invalid", "claude2"))
+            read_home.assert_called_once_with(home)
+            next_state = account.home_account_state()
+            self.assertIsInstance(account.process_account_directory(account.NoAccountSetting(), home_state=next_state),
+                                  account.NoAccountSetting)
+            self.assertIsNone(account.account_of(103, home_state=next_state))
+            self.assertEqual(read_home.call_count, 2)
 
     def test_process_config_dir_reads_set_variable_from_linux_process_environment(self) -> None:
         environ = b"USER=test\0CLAUDE_CONFIG_DIR=/tmp/claude-two\0PATH=/usr/bin\0"
@@ -212,10 +303,10 @@ class AccountTests(unittest.TestCase):
         ):
             config_dir = account.process_config_dir(4321)
 
-        self.assertEqual(config_dir, Path("/tmp/claude-two"))
+        self.assertEqual(config_dir, account.ConfiguredClaudeFolder(Path("/tmp/claude-two")))
         read_bytes.assert_called_once_with(Path("/proc/4321/environ"))
 
-    def test_process_config_dir_defaults_to_dot_claude_when_variable_is_unset(self) -> None:
+    def test_process_config_dir_keeps_an_absent_account_setting(self) -> None:
         with (
             patch.object(sys, "platform", "linux"),
             patch.object(Path, "home", return_value=self.home),
@@ -223,30 +314,30 @@ class AccountTests(unittest.TestCase):
         ):
             config_dir = account.process_config_dir(4321)
 
-        self.assertEqual(config_dir, self.home / ".claude")
+        self.assertIsInstance(config_dir, account.NoAccountSetting)
 
-    def test_process_config_dir_returns_none_when_environment_is_unreadable(self) -> None:
+    def test_process_config_dir_names_an_unreadable_environment(self) -> None:
         with (
             patch.object(sys, "platform", "linux"),
             patch.object(Path, "read_bytes", side_effect=PermissionError),
         ):
             config_dir = account.process_config_dir(4321)
 
-        self.assertIsNone(config_dir)
+        self.assertIsInstance(config_dir, account.ProcessEnvironmentUnread)
 
     def test_darwin_process_owned_by_another_uid_is_unreadable(self) -> None:
         output = "0 /sbin/launchd HOME=/var/root CLAUDE_CONFIG_DIR=/root/.claude"
 
         config_dir = account.parse_darwin_config_dir(output, expected_uid=501)
 
-        self.assertIsNone(config_dir)
+        self.assertIsInstance(config_dir, account.ProcessEnvironmentUnread)
 
     def test_darwin_process_without_visible_home_environment_is_unreadable(self) -> None:
         output = "501 /usr/bin/claude --resume session-id"
 
         config_dir = account.parse_darwin_config_dir(output, expected_uid=501)
 
-        self.assertIsNone(config_dir)
+        self.assertIsInstance(config_dir, account.ProcessEnvironmentUnread)
 
     def test_darwin_process_with_visible_environment_defaults_when_config_dir_is_unset(
         self,
@@ -257,7 +348,7 @@ class AccountTests(unittest.TestCase):
                 expected_uid=501,
             )
 
-        self.assertEqual(config_dir, self.home / ".claude")
+        self.assertIsInstance(config_dir, account.NoAccountSetting)
 
     def test_darwin_process_with_apostrophe_and_visible_environment_uses_config_dir(
         self,
@@ -269,9 +360,9 @@ class AccountTests(unittest.TestCase):
 
         config_dir = account.parse_darwin_config_dir(output, expected_uid=501)
 
-        self.assertEqual(config_dir, Path("/from-environment"))
+        self.assertEqual(config_dir, account.ConfiguredClaudeFolder(Path("/from-environment")))
 
-    def test_darwin_process_config_dir_returns_none_when_ps_fails(self) -> None:
+    def test_darwin_process_config_dir_names_a_failed_observation(self) -> None:
         result = subprocess.CompletedProcess(["ps"], 1, "", "failed")
         with (
             patch.object(sys, "platform", "darwin"),
@@ -279,7 +370,7 @@ class AccountTests(unittest.TestCase):
         ):
             config_dir = account.process_config_dir(4321)
 
-        self.assertIsNone(config_dir)
+        self.assertIsInstance(config_dir, account.ProcessEnvironmentUnread)
         run.assert_called_once()
 
     def test_write_label_does_not_rewrite_unchanged_content(self) -> None:

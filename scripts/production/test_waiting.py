@@ -32,7 +32,7 @@ import waiting
 from cli_fixture import invoke_cli
 import unit_lookup
 import herdr
-from fake_herdr import CommandResponse
+from fake_herdr import CommandResponse, herdr_listener
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "whoami"))
 import account
@@ -183,7 +183,7 @@ class WaitingTests(unittest.TestCase):
             "FAKE_HERDR_LOG": str(self.root / "herdr.jsonl"),
             "FAKE_HERDR_RESPONSES": str(self.root / "herdr-responses.json"),
             "SHOWRUNNERS_CONFIG": str(self.root / "showrunners.json")}))
-        _ = self.enterContext(mock.patch.object(quota_alert, "workers_home", side_effect=AssertionError(
+        _ = self.enterContext(mock.patch.object(quota_alert, "observe_workers_home", side_effect=AssertionError(
             "quota tests must supply Codex readings instead of resolving a live home")))
         self.write(self.root / "tmux.json", json.dumps({
             f"${index}": {"label": "any-label", "panes": [f"%{index}"],
@@ -1165,6 +1165,7 @@ runpy.run_path(sys.argv[0], run_name='__main__')
             (directory / "cwd").symlink_to(self.alpha)
 
         process(991000, 0, ["herdr", "--session", "native", "server"])
+        herdr_listener(self.root / "proc", 991000, "native", self.env)
         process(os.getpid(), 991000, ["claude"], HERDR_PANE_ID="w1:p1",
                 SHOWRUNNER_UNIT="example", SHOWRUNNER_UNIT_ID=ALPHA)
         path = self.root / "sessions/1.json"

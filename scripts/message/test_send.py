@@ -17,7 +17,7 @@ import unittest
 from contextlib import AbstractContextManager, redirect_stderr, redirect_stdout
 from datetime import timedelta
 from pathlib import Path
-from typing import TextIO, cast, override
+from typing import TYPE_CHECKING, TextIO, cast, override
 from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -32,6 +32,10 @@ import record as shutdown_record
 import restart
 import roster
 import settle
+if TYPE_CHECKING:
+    from ..accounts import accounts
+else:
+    from scripts.accounts import accounts
 from test_support import ShutdownTestCase, ShutdownSendLeaf
 from user_action import REFUSED_BEFORE_SENDING, ActionRequired, NoActionRequired, first_line
 
@@ -41,6 +45,59 @@ def stream(*events: dict[str, object]) -> str:
 
 
 INIT: dict[str, object] = {"type": "system", "subtype": "init", "permissionMode": "auto"}
+
+
+class RelayAccountTests(unittest.TestCase):
+    def test_relay_before_cutover_keeps_home_login_without_requiring_numbered_folders(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            (home / ".claude").mkdir()
+            _ = (home / ".claude.json").write_text(json.dumps({
+                "oauthAccount": {"emailAddress": "legacy@example.invalid"}}))
+            with (mock.patch.dict(os.environ, {"HOME": str(home), "CLAUDE_CODE_SESSION_ID": "caller",
+                                              "CLAUDE_CODE_REMOTE_MEMORY_DIR": "inherited-memory"}, clear=True),
+                  mock.patch.object(send, "claude_binary", return_value="claude"),
+                  mock.patch.object(send, "STATE", home / "message-state"),
+                  mock.patch.object(send, "run", return_value=(0, "", "")) as launch):
+                _ = send.relay(send.Message("uds:/unused", "test", "hello", "body", None), 10)
+            launch.assert_called_once()
+            environment = cast(dict[str, str], launch.call_args.args[3])
+            self.assertNotIn("CLAUDE_CONFIG_DIR", environment)
+            self.assertNotIn("CLAUDE_CODE_REMOTE_MEMORY_DIR", environment)
+            self.assertNotIn("CLAUDE_CODE_SESSION_ID", environment)
+            self.assertEqual(list(home.glob(".claude[0-9]*")), [])
+
+    def test_relay_uses_the_caller_account_or_showrunners_without_inheriting_session_identity(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            notes = home / "notes"
+            notes.mkdir()
+            with mock.patch.dict(os.environ, {"HOME": str(home), "AGENT_NOTES_DIR": str(notes)}, clear=True):
+                (home / ".claude").mkdir()
+                _ = (home / ".claude.json").write_text("{}")
+                for label in ("claude1", "claude3"):
+                    _ = (notes / f"{label}.md").write_text(f"---\nlogin: {label}@example.invalid\n---\n")
+                    self.assertEqual(accounts.setup(label), [])
+                    _ = (accounts.account_dir(label) / ".claude.json").write_text(json.dumps({
+                        "oauthAccount": {"emailAddress": f"{label}@example.invalid"}}))
+                groups = accounts.groups_file()
+                groups.parent.mkdir(parents=True, exist_ok=True)
+                _ = groups.write_text(json.dumps({"showrunners": "claude3"}))
+                for caller, expected in (("claude1", "claude1"), ("", "claude3")):
+                    with self.subTest(caller=caller):
+                        if caller:
+                            os.environ["CLAUDE_CONFIG_DIR"] = str(accounts.account_dir(caller))
+                        else:
+                            _ = os.environ.pop("CLAUDE_CONFIG_DIR", None)
+                        os.environ["CLAUDE_CODE_SESSION_ID"] = "caller-session"
+                        with (mock.patch.object(send, "claude_binary", return_value="claude"),
+                              mock.patch.object(send, "STATE", home / "message-state"),
+                              mock.patch.object(send, "run", return_value=(0, "", "")) as launch):
+                            _ = send.relay(send.Message("uds:/unused", "test", "hello", "body", None), 10)
+                        environment = cast(dict[str, str], launch.call_args.args[3])
+                        self.assertEqual(environment["CLAUDE_CONFIG_DIR"], str(accounts.account_dir(expected)))
+                        self.assertEqual(environment["CLAUDE_CODE_REMOTE_MEMORY_DIR"], str(home / ".claude"))
+                        self.assertNotIn("CLAUDE_CODE_SESSION_ID", environment)
 
 
 def call(text: str, tool_id: str = "t1") -> dict[str, object]:
@@ -1218,6 +1275,23 @@ runpy.run_path(sys.argv[0], run_name="__main__")
             deliver.assert_called_once()
         entry = cast(send.TemplateFixErrorRecord, json.loads((self.root / "notify/template-fix-errors.jsonl").read_text()))
         self.assertEqual((entry["text_id"], entry["error"]), ("quota", "timed out"))
+
+    def test_probe_user_send_exits_successfully_before_review_delivery_or_logging(self) -> None:
+        arguments = ["--to", "user", "--from", "probe", "--summary", "Throwaway",
+                     "--no-action", "--text", "A probe must never reach the phone."]
+        with (mock.patch.dict(os.environ, {"CLAUDE_PROBE_SESSION": "1"}),
+              mock.patch.object(send, "run", side_effect=AssertionError("probe invoked a transport")) as transport,
+              mock.patch.object(send, "log", side_effect=AssertionError("probe wrote a message log")) as log,
+              mock.patch.object(review, "review_timeout_seconds", side_effect=AssertionError("probe began review")) as reviewed,
+              redirect_stdout(output := io.StringIO()), redirect_stderr(error := io.StringIO())):
+            self.assertEqual(send.main(arguments), 0)
+        self.assertIn("not sent: probe sessions never push to the phone", output.getvalue())
+        self.assertEqual(error.getvalue(), "")
+        transport.assert_not_called()
+        log.assert_not_called()
+        reviewed.assert_not_called()
+        self.assertFalse((self.root / "log.jsonl").exists())
+        self.assertEqual(self.relayed, [])
 
     def test_user_delivery_wait_uses_the_review_limit_locally_and_across_machines(self) -> None:
         arguments = ["--to", "user", "--from", "script", "--summary", "Build choice",

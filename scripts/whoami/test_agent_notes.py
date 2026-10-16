@@ -33,7 +33,7 @@ from agent_accounts import (ClaudeDirectorySource, CodexHomeSource, CodexRateLim
                             codex_credits, reset_credits)
 from agent_notes import local_reset
 from note_file import Note, read_note
-from scripts.accounts import accounts, refusal_watch, refusals
+from scripts.accounts import accounts, refusal_watch, refusals, role_map
 from scripts.production import showrunners
 
 
@@ -54,6 +54,7 @@ def apply_quota_and_write(notes: list[Note], report: Report, checked_at: datetim
 
 
 def setUpModule() -> None:
+    _ = unittest.enterModuleContext(patch.object(role_map, "is_role_map_host", return_value=True))
     root = Path(unittest.enterModuleContext(tempfile.TemporaryDirectory()))
     _ = unittest.enterModuleContext(patch.object(showrunners, "NOTIFIER_STATE_DIR", root))
 
@@ -86,7 +87,41 @@ class AgentNotesTests(unittest.TestCase):
     def snapshot(self, reports: list[Report]) -> agent_notes.UpdatedAgentNotes:
         selection = agent_accounts.ClaudeAccountsInUse(agent_accounts.UnreadableIdentity(Path.home() / ".claude", "fixture identity unavailable"), False, (), frozenset())
         with patch.object(agent_notes, "live_reports", return_value=reports), patch.object(five_hour, "watch", return_value=[]):
-            return agent_notes.update_alert_pass(selection, agent_accounts.workers_home())
+            return agent_notes.update_alert_pass(selection, agent_accounts.observe_workers_home())
+
+    def test_unmapped_workers_keep_observations_without_selecting_the_signed_in_home(self) -> None:
+        self.codex_login(self.root / ".codex", "spare@example.invalid")
+        note = self.note("codex2.md", "spare@example.invalid")
+        report = Report("Codex", email="spare@example.invalid",
+                        source=CodexHomeSource(self.root / ".codex"),
+                        quotas=[Quota("Weekly", 40, self.future)])
+        with (patch.object(agent_notes, "live_reports", return_value=[report]),
+              patch.object(five_hour, "watch", return_value=[]) as watch):
+            messages = agent_notes.update()
+        updated = read_note(note.path)
+        assert isinstance(updated, Note)
+        self.assertEqual(updated.get("weekly_remaining_usage"), "60")
+        self.assertIn("accounts: workers has no mapped account; run accounts.py set-role workers <codexN>", messages)
+        self.assertEqual(watch.call_args.args[0], [])
+        readings = cast(object, watch.call_args.kwargs["codex_readings"])
+        assert isinstance(readings, quota_alert.CodexAlertPassReadings)
+        self.assertIsInstance(readings.workers, agent_accounts.NoWorkersHome)
+        self.assertIsInstance(readings.selected_account, agent_accounts.NoWorkersHome)
+        self.assertEqual([reading.home for reading in readings.checked_homes], [self.root / ".codex"])
+
+    def test_each_updater_run_sweeps_stale_claude_temps_once_with_multiple_account_notes(self) -> None:
+        _ = self.note("claude1.md", "unit@example.invalid")
+        _ = self.note("claude2.md", "spare@example.invalid")
+        stale = self.root / ".claude.json.tmp.1234.abandoned"
+        old = time.time() - timedelta(days=2).total_seconds()
+        for run in range(2):
+            with self.subTest(run=run):
+                _ = stale.write_text("stale atomic write", encoding="utf-8")
+                os.utime(stale, (old, old))
+                with patch.object(accounts, "sweep_claude_temp_files", wraps=accounts.sweep_claude_temp_files) as sweep:
+                    _ = self.snapshot([])
+                sweep.assert_called_once()
+                self.assertFalse(stale.exists())
 
     def test_first_snapshot_renames_legacy_notes_without_changing_body_or_mode(self) -> None:
         old = self.root / "codex 2.md"
@@ -139,6 +174,7 @@ class AgentNotesTests(unittest.TestCase):
         _ = self.note("claude2.md", "spare@example.invalid")
         self.codex_login(self.root / ".codex", "worker@example.invalid")
         _ = self.note("codex2.md", "worker@example.invalid")
+        self.select_workers("codex2")
         _ = accounts.set_group_account("units", "claude1", why="fixture", now=self.now)
         _ = accounts.set_group_account("showrunners", "claude1", why="fixture", now=self.now)
         row = session_table.SessionRow("director", "unit", "natedev", "/home/nate/project", "sid-1")
@@ -188,6 +224,7 @@ class AgentNotesTests(unittest.TestCase):
     def test_fresh_quota_and_table_changes_share_one_note_replace_and_one_reading(self) -> None:
         note = self.note("codex2.md", "worker@example.invalid")
         self.codex_login(self.root / ".codex", "worker@example.invalid")
+        self.select_workers("codex2")
         row = session_table.SessionRow("impl", "worker", "natedev", "~/project", "thread-1")
         self.rows.return_value = session_table.ReadSessions({"codex2": (row,)}, frozenset())
         report = Report("Codex", email="worker@example.invalid", source=CodexHomeSource(self.root / ".codex"),
@@ -244,6 +281,53 @@ class AgentNotesTests(unittest.TestCase):
         result = self.snapshot([])
         self.assertEqual(note.path.read_text(), before)
         self.assertTrue(any("sessions: local registry unreadable" in line for line in result.messages))
+
+    def test_machine_observations_replace_once_for_all_notes_and_keep_unreached_times(self) -> None:
+        _ = self.note("claude1.md", "unit@example.invalid")
+        _ = self.note("claude2.md", "spare@example.invalid")
+        path = self.root / "seen.json"
+        previous = (self.now - timedelta(hours=2)).isoformat()
+        _ = path.write_text(json.dumps({"mac": previous}))
+        self.rows.return_value = session_table.ReadSessions({}, frozenset({"mac"}),
+                                                            machines_read=frozenset({"natedev"}))
+        with patch.object(agent_notes, "SESSIONS_SEEN", path), patch.object(os, "replace", wraps=os.replace) as replace:
+            started = datetime.now(timezone.utc).replace(microsecond=0)
+            _ = self.snapshot([])
+            state_replaces = [event for event in replace.call_args_list if event.args[1] == path]
+            self.assertEqual(len(state_replaces), 1)
+            source = Path(cast(str | Path, cast(object, state_replaces[0].args[0])))
+            self.assertEqual(source.parent, path.parent)
+            self.assertFalse(source.exists())
+            seen = agent_notes.read_sessions_seen()
+            self.assertEqual(seen["mac"], previous)
+            self.assertGreaterEqual(datetime.fromisoformat(seen["natedev"]), started)
+            self.assertLessEqual(datetime.fromisoformat(seen["natedev"]), datetime.now(timezone.utc))
+            self.rows.return_value = session_table.SessionsUnread("registry unavailable")
+            before = path.read_bytes()
+            _ = self.snapshot([])
+            self.assertEqual(path.read_bytes(), before)
+
+    def test_missing_or_damaged_machine_observations_do_not_block_refresh(self) -> None:
+        note = self.note("claude1.md", "unit@example.invalid")
+        path = self.root / "seen.json"
+        self.rows.return_value = session_table.ReadSessions({}, frozenset(), machines_read=frozenset({"natedev"}))
+        with patch.object(agent_notes, "SESSIONS_SEEN", path):
+            for data in (None, b"not json", b"\xff", b"[]", b'{"mac":"not a time"}',
+                         b'{"mac":"2026-10-14T12:00:00"}', b'{"mac":42}'):
+                with self.subTest(data=data):
+                    path.unlink(missing_ok=True)
+                    if data is not None:
+                        _ = path.write_bytes(data)
+                    messages = self.snapshot([]).messages
+                    self.assertFalse(any(message.startswith("sessions seen:") for message in messages))
+                    self.assertEqual(set(agent_notes.read_sessions_seen()), {"natedev"})
+                    self.assertIn("No live sessions.", note.path.read_text())
+            path.unlink()
+            path.mkdir()
+            messages = self.snapshot([]).messages
+            self.assertTrue(any(message.startswith("sessions seen:") for message in messages))
+            self.assertIn("No live sessions.", note.path.read_text())
+            self.assertEqual(list(self.root.glob(".sessions-seen-*")), [])
 
     def test_writer_replaces_role_blocks_and_owned_sections_without_disturbing_user_text(self) -> None:
         note = self.note("claude1.md", "unit@example.invalid", "return:\n  - \"[[agents.base]]\"\nrole:\n  - old\n  - orphan\nstate: active\n")
@@ -459,6 +543,7 @@ class AgentNotesTests(unittest.TestCase):
                 agent_notes.main()
             self.assertEqual(len(passes), 2)
             self.assertIs(passes[0], passes[1])
+            assert isinstance(passes[0].workers, accounts.CodexWorkersAccount)
             self.assertEqual(passes[0].workers.home, default)
             self.assertEqual([reading.home for reading in passes[0].checked_homes], [default, spare])
             self.assertTrue(all(reading.observed_at.tzinfo is not None for reading in passes[0].checked_homes))
@@ -501,6 +586,7 @@ class AgentNotesTests(unittest.TestCase):
         _ = self.note("codex1.md", "WORKERS@example.com")
         _ = self.note("codex2.md", "spare@example.com")
         _ = self.note("codex3.md", "missing@example.com")
+        self.select_workers("codex1")
         workers_report = Report("Codex", email="workers@example.com", source=CodexHomeSource(default),
             quotas=[Quota("Weekly", 20, self.future)], credit_balance="7", limit_reset_count=1,
             limit_reset_expirations=[self.future])
@@ -566,8 +652,10 @@ class AgentNotesTests(unittest.TestCase):
         default = self.root / ".codex"
         spare = self.root / ".codex2"
         self.codex_login(default, "shared@example.com")
-        self.codex_login(spare, "shared@example.com")
         _ = self.note("codex1.md", "shared@example.com")
+        self.select_workers("codex1")
+        # A later duplicate sign-in must not change this pass's selected home.
+        self.codex_login(spare, "shared@example.com")
         workers_report = Report("Codex", email="shared@example.com", source=CodexHomeSource(default))
         spare_report = Report("Codex", email="shared@example.com", source=CodexHomeSource(spare))
         for current_login in ("shared@example.com", None):
@@ -608,7 +696,7 @@ class AgentNotesTests(unittest.TestCase):
             patch.object(agent_notes, "live_reports", return_value=[spare_report, workers_report]),
             patch.object(five_hour, "watch", return_value=[]) as watch,
         ):
-            _ = agent_notes.update_for_selection(selection, agent_accounts.workers_home())
+            _ = agent_notes.update_for_selection(selection, agent_accounts.observe_workers_home())
 
         notes = {note.label: note for note in note_file.read_notes()}
         self.assertEqual(notes["codex1"].get_list("role"), ("worker",))
@@ -685,6 +773,7 @@ class AgentNotesTests(unittest.TestCase):
         home = self.root / ".codex"
         self.codex_login(home, "workers@example.com")
         current = self.note("codex1.md", "workers@example.com")
+        self.select_workers("codex1")
         spare = self.note("codex2.md", "spare@example.com")
         report = Report("Codex", email="workers@example.com", source=CodexHomeSource(home),
             quotas=[Quota("Weekly", 20, self.future)], credit_balance="7")
@@ -785,8 +874,8 @@ class AgentNotesTests(unittest.TestCase):
                               [("claude2", 80), ("claude3", 4), ("claude1", 90)])
         watched = cast(list[Report], watch.call_args.args[0])
         self.assertEqual([(report.tool, report.email) for report in watched],
-                         [("Claude", "main@example.com"), ("Codex", None)])
-        self.assertEqual(watched[0].source, ClaudeDirectorySource(default))
+                         [("Claude", "unit@example.com"), ("Claude", "main@example.com")])
+        self.assertEqual(watched[1].source, ClaudeDirectorySource(default))
 
     def test_two_account_fixture_writes_two_readings(self) -> None:
         _ = self.account_dir("default", "main@example.com", "main-token")
@@ -850,14 +939,18 @@ class AgentNotesTests(unittest.TestCase):
                       10003: account.Account("claude", "third@example.com", "claude3")}
         reports = [Report("Claude", email=login, quotas=[Quota("Weekly", 20, self.future)])
                    for login in ("main@example.com", "first@example.com", "third@example.com")]
-        def observed_account(pid: int) -> account.Account | None:
-            return identities.get(pid)
+        def observed_account(pid: int, *, home_state: account.LegacyHomeLogin | account.ConfigOnlyHome) -> account.Account | None:
+            identity = identities.get(pid)
+            if (identity is not None and isinstance(home_state, account.LegacyHomeLogin)
+                    and identity.login.casefold() == home_state.account.login.casefold()):
+                return home_state.account
+            return identity
         with (patch.object(sessions, "live_sessions", return_value=owners),
               patch.object(account, "account_of", side_effect=observed_account),
               patch.object(agent_notes, "live_reports", return_value=reports),
               patch.object(five_hour, "watch", return_value=[])):
             selection = accounts.claude_account_selection()
-            _ = agent_notes.update_for_selection(selection, agent_accounts.workers_home())
+            _ = agent_notes.update_for_selection(selection, agent_accounts.observe_workers_home())
             output = io.StringIO()
             with patch.object(whoami, "live_reports", return_value=reports), redirect_stdout(output):
                 asyncio.run(whoami.main())
@@ -869,6 +962,7 @@ class AgentNotesTests(unittest.TestCase):
         default = self.account_dir("default", "main@example.com", "main-token")
         unfit = self.account_dir("claude3", "unfit@example.com", "unfit-token")
         (unfit / "projects").unlink()
+        _ = (unfit / "projects").write_text("local file against the shared projects folder")
         external = self.root / "external account"
         external.mkdir()
         _ = (external / ".claude.json").write_text(json.dumps({"oauthAccount": {"emailAddress": "external@example.com"}}))
@@ -879,10 +973,13 @@ class AgentNotesTests(unittest.TestCase):
         owners = [sessions.SessionRecord(pid=pid, sessionId=str(pid), name=str(pid),
             messagingSocketPath="/fixture.sock", updatedAt=1, tmux="", formerNames=[]) for pid in directories]
         logins = {default: "main@example.com", unfit: "unfit@example.com", external: "external@example.com"}
-        def process_directory(pid: int) -> Path | None:
-            return directories.get(pid)
-        def process_account(pid: int) -> account.Account | None:
+        def process_directory(pid: int) -> account.ConfiguredClaudeFolder | account.ProcessEnvironmentUnread:
             directory = directories.get(pid)
+            return account.ConfiguredClaudeFolder(directory) if directory is not None else account.ProcessEnvironmentUnread("fixture")
+        def process_account(pid: int, *, home_state: account.LegacyHomeLogin | account.ConfigOnlyHome) -> account.Account | None:
+            directory = directories.get(pid)
+            if directory == Path.home() / ".claude" and isinstance(home_state, account.LegacyHomeLogin):
+                return home_state.account
             return account.Account("claude", logins[directory], "fixture") if directory is not None else None
         def live(directory: Path) -> Report:
             return Report("Claude", email=logins[directory], quotas=[Quota("Weekly", 96, self.future)],
@@ -911,8 +1008,8 @@ class AgentNotesTests(unittest.TestCase):
         for login in logins.values():
             self.assertIn(login, output.getvalue())
 
-    def test_five_hour_watch_uses_the_default_directory_independent_of_report_order(self) -> None:
-        """Order, shared logins and missing emails cannot select the named reading."""
+    def test_five_hour_watch_uses_live_logins_without_privileging_the_config_home(self) -> None:
+        """A numbered account in use is eligible independently of the config home."""
         default = self.account_dir("default", "shared@example.com", "main-token")
         named = self.account_dir("claude3", "shared@example.com", "named-token")
         self.select_unit("claude3")
@@ -930,7 +1027,7 @@ class AgentNotesTests(unittest.TestCase):
             ):
                 _ = agent_notes.update()
             watched = cast(list[Report], watch.call_args.args[0])
-            self.assertEqual(watched, [codex, main])
+            self.assertEqual(watched, [unit, main] if main_email else [unit])
 
     def test_updater_and_alert_share_the_same_role_snapshot(self) -> None:
         """The timer entry point resolves roles once for writes and notices."""
@@ -953,7 +1050,7 @@ class AgentNotesTests(unittest.TestCase):
         ):
             agent_notes.main()
         resolve.assert_called_once_with()
-        collect.assert_called_once_with(selection, agent_accounts.workers_home())
+        collect.assert_called_once_with(selection, agent_accounts.observe_workers_home())
         notice_roles = cast(object, alert.call_args.kwargs["selection"])
         self.assertIs(notice_roles, selection)
 
@@ -1008,10 +1105,11 @@ class AgentNotesTests(unittest.TestCase):
         named = self.root / ".claude3"
         named.mkdir()
         with (patch.object(sys, "platform", "darwin"),
-              patch.object(agent_accounts, "command_json") as command):
+              patch.object(agent_accounts, "command_json", side_effect=RuntimeError("unavailable")) as command):
             with self.assertRaisesRegex(RuntimeError, "usage credentials unavailable"):
                 _ = agent_accounts.claude_credentials(named)
-        command.assert_not_called()
+        command.assert_called_once_with("security", "find-generic-password", "-s",
+                                        agent_accounts.claude_keychain_service(named), "-w")
 
     def test_explicit_default_credentials_use_the_keychain_even_from_a_named_shell(self) -> None:
         with (patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": str(self.root / ".claude3")}),
@@ -1075,7 +1173,7 @@ class AgentNotesTests(unittest.TestCase):
     def test_legacy_whoami_account_line_is_unchanged(self) -> None:
         _ = self.note("claude2.md", "main@example.com")
         self.assertEqual(whoami.render(Report("Claude", email="main@example.com"),
-                                      accounts.claude_account_selection(), agent_accounts.workers_home()), [
+                                      accounts.claude_account_selection(), agent_accounts.observe_workers_home()), [
             "Claude", "  Account: claude2 — main@example.com", "  Plan: unavailable",
         ])
 
