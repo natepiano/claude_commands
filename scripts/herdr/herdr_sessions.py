@@ -6,7 +6,9 @@ from __future__ import annotations
 import argparse
 import os
 import shlex
+import subprocess
 import sys
+from dataclasses import dataclass
 from pathlib import Path
 
 import herdr
@@ -23,7 +25,42 @@ from scripts.shutdown import launch_permission  # noqa: E402
 from scripts.accounts import accounts  # noqa: E402
 from scripts.whoami import account  # noqa: E402
 
-USAGE = "usage: herdr_sessions.py list | attach <name> | start [--name N] [--cwd D] [-- <claude args>] | resume <name> --session-id ID --cwd D [--config-dir D] [--restore] [--prompt-file P] [--attach] [-- <claude args>]"
+USAGE = "usage: herdr_sessions.py list [--on <host>] | attach <name> | attach-remote <host> <name> | start [--name N] [--cwd D] [-- <claude args>] | resume <name> --session-id ID --cwd D [--config-dir D] [--restore] [--prompt-file P] [--attach] [-- <claude args>]"
+REMOTE_LIST_TIMEOUT = 15
+
+
+@dataclass(frozen=True)
+class RemoteHost:
+    target: str
+
+    def __post_init__(self) -> None:
+        if not self.target or self.target.startswith("-") or any(character.isspace() for character in self.target):
+            raise ValueError("remote host must be an SSH target, such as mac or user@mac")
+
+
+def _remote_list(host: RemoteHost) -> int:
+    try:
+        result = subprocess.run(
+            ["ssh", host.target, "~/.claude/scripts/lib/py", "~/.claude/scripts/herdr/herdr_sessions.py", "list"],
+            capture_output=True, text=True, check=False, timeout=REMOTE_LIST_TIMEOUT,
+        )
+    except subprocess.TimeoutExpired:
+        print(f"herdr_sessions: {host.target}: remote list timed out after {REMOTE_LIST_TIMEOUT} seconds", file=sys.stderr)
+        return 1
+    except OSError as error:
+        print(f"herdr_sessions: {host.target}: remote list failed: {' '.join(str(error).split())}", file=sys.stderr)
+        return 1
+    if result.returncode:
+        reason = " ".join(result.stderr.split()) or "no error message"
+        print(f"herdr_sessions: {host.target}: remote list failed (ssh exit {result.returncode}): {reason}", file=sys.stderr)
+        return 1
+    print(result.stdout, end="")
+    return 0
+
+
+def _attach_remote(host: RemoteHost, name: str) -> None:
+    binary = herdr.herdr_binary()
+    os.execvp(binary, [binary, "--remote", host.target, "--session", name])
 
 
 class LaunchOptions(argparse.Namespace):
@@ -196,6 +233,27 @@ def unit_roles() -> dict[str, str]:
 
 
 def _main(argv: list[str]) -> int:
+    if argv[1:] in (["--help"], ["-h"]):
+        print(USAGE + "\n\nlist --on <host>: list herdr sessions on that host over SSH."
+              + "\nattach-remote <host> <name>: attach to that host's herdr session.")
+        return 0
+    remote_list = len(argv) == 4 and argv[1:3] == ["list", "--on"]
+    remote_attach = len(argv) == 4 and argv[1] == "attach-remote" and bool(argv[3])
+    if remote_list or remote_attach:
+        target = argv[3] if remote_list else argv[2]
+        try:
+            host = RemoteHost(target)
+        except ValueError as error:
+            print(f"herdr_sessions: {error}", file=sys.stderr)
+            return 2
+        if remote_list:
+            return _remote_list(host)
+        try:
+            _attach_remote(host, argv[3])
+            return 0
+        except (herdr.HerdrFailure, OSError) as error:
+            print(f"herdr_sessions: {host.target}: attach failed: {' '.join(str(error).split())}", file=sys.stderr)
+            return 1
     if len(argv) > 1 and argv[1] in ("start", "resume"):
         try:
             return _launch(argv[1], argv[2:])
