@@ -141,10 +141,13 @@ def showrunner_transcripts(since: datetime) -> list[Path]:
             if recorded:
                 candidates = [Path(recorded)]
             else:
-                directory = Path(config) if config else (account.process_config_dir(pid) if pid > 0 else None)
-                if directory is None:
+                setting = (account.ConfiguredClaudeFolder(Path(config)) if config else
+                           account.process_account_directory(account.process_config_dir(pid)) if pid > 0 else
+                           account.NoAccountSetting())
+                if not isinstance(setting, account.ConfiguredClaudeFolder):
                     print(f"messages: account directory unavailable for {session}", file=sys.stderr)
                     continue
+                directory = setting.path
                 cwd = record.get("cwd", "")
                 candidates = ([directory / "projects" / re.sub(r"[^a-zA-Z0-9]", "-", cwd) / f"{session}.jsonl"]
                               if cwd else list((directory / "projects").glob(f"*/{session}.jsonl")))

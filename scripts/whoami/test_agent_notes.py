@@ -88,6 +88,20 @@ class AgentNotesTests(unittest.TestCase):
         with patch.object(agent_notes, "live_reports", return_value=reports), patch.object(five_hour, "watch", return_value=[]):
             return agent_notes.update_alert_pass(selection, agent_accounts.workers_home())
 
+    def test_each_updater_run_sweeps_stale_claude_temps_once_with_multiple_account_notes(self) -> None:
+        _ = self.note("claude1.md", "unit@example.invalid")
+        _ = self.note("claude2.md", "spare@example.invalid")
+        stale = self.root / ".claude.json.tmp.1234.abandoned"
+        old = time.time() - timedelta(days=2).total_seconds()
+        for run in range(2):
+            with self.subTest(run=run):
+                _ = stale.write_text("stale atomic write", encoding="utf-8")
+                os.utime(stale, (old, old))
+                with patch.object(accounts, "sweep_claude_temp_files", wraps=accounts.sweep_claude_temp_files) as sweep:
+                    _ = self.snapshot([])
+                sweep.assert_called_once()
+                self.assertFalse(stale.exists())
+
     def test_first_snapshot_renames_legacy_notes_without_changing_body_or_mode(self) -> None:
         old = self.root / "codex 2.md"
         text = "---\nlogin: legacy@example.invalid\nuse_credits: off\n---\nMy untouched account notes.\n"
@@ -832,8 +846,8 @@ class AgentNotesTests(unittest.TestCase):
                               [("claude2", 80), ("claude3", 4), ("claude1", 90)])
         watched = cast(list[Report], watch.call_args.args[0])
         self.assertEqual([(report.tool, report.email) for report in watched],
-                         [("Claude", "main@example.com"), ("Codex", None)])
-        self.assertEqual(watched[0].source, ClaudeDirectorySource(default))
+                         [("Claude", "unit@example.com"), ("Claude", "main@example.com"), ("Codex", None)])
+        self.assertEqual(watched[1].source, ClaudeDirectorySource(default))
 
     def test_two_account_fixture_writes_two_readings(self) -> None:
         _ = self.account_dir("default", "main@example.com", "main-token")
@@ -897,8 +911,12 @@ class AgentNotesTests(unittest.TestCase):
                       10003: account.Account("claude", "third@example.com", "claude3")}
         reports = [Report("Claude", email=login, quotas=[Quota("Weekly", 20, self.future)])
                    for login in ("main@example.com", "first@example.com", "third@example.com")]
-        def observed_account(pid: int) -> account.Account | None:
-            return identities.get(pid)
+        def observed_account(pid: int, *, home_state: account.LegacyHomeLogin | account.ConfigOnlyHome) -> account.Account | None:
+            identity = identities.get(pid)
+            if (identity is not None and isinstance(home_state, account.LegacyHomeLogin)
+                    and identity.login.casefold() == home_state.account.login.casefold()):
+                return home_state.account
+            return identity
         with (patch.object(sessions, "live_sessions", return_value=owners),
               patch.object(account, "account_of", side_effect=observed_account),
               patch.object(agent_notes, "live_reports", return_value=reports),
@@ -926,10 +944,13 @@ class AgentNotesTests(unittest.TestCase):
         owners = [sessions.SessionRecord(pid=pid, sessionId=str(pid), name=str(pid),
             messagingSocketPath="/fixture.sock", updatedAt=1, tmux="", formerNames=[]) for pid in directories]
         logins = {default: "main@example.com", unfit: "unfit@example.com", external: "external@example.com"}
-        def process_directory(pid: int) -> Path | None:
-            return directories.get(pid)
-        def process_account(pid: int) -> account.Account | None:
+        def process_directory(pid: int) -> account.ConfiguredClaudeFolder | account.ProcessEnvironmentUnread:
             directory = directories.get(pid)
+            return account.ConfiguredClaudeFolder(directory) if directory is not None else account.ProcessEnvironmentUnread("fixture")
+        def process_account(pid: int, *, home_state: account.LegacyHomeLogin | account.ConfigOnlyHome) -> account.Account | None:
+            directory = directories.get(pid)
+            if directory == Path.home() / ".claude" and isinstance(home_state, account.LegacyHomeLogin):
+                return home_state.account
             return account.Account("claude", logins[directory], "fixture") if directory is not None else None
         def live(directory: Path) -> Report:
             return Report("Claude", email=logins[directory], quotas=[Quota("Weekly", 96, self.future)],
@@ -958,8 +979,8 @@ class AgentNotesTests(unittest.TestCase):
         for login in logins.values():
             self.assertIn(login, output.getvalue())
 
-    def test_five_hour_watch_uses_the_default_directory_independent_of_report_order(self) -> None:
-        """Order, shared logins and missing emails cannot select the named reading."""
+    def test_five_hour_watch_uses_live_logins_without_privileging_the_config_home(self) -> None:
+        """A numbered account in use is eligible independently of the config home."""
         default = self.account_dir("default", "shared@example.com", "main-token")
         named = self.account_dir("claude3", "shared@example.com", "named-token")
         self.select_unit("claude3")
@@ -977,7 +998,7 @@ class AgentNotesTests(unittest.TestCase):
             ):
                 _ = agent_notes.update()
             watched = cast(list[Report], watch.call_args.args[0])
-            self.assertEqual(watched, [codex, main])
+            self.assertEqual(watched, [unit, codex, main] if main_email else [unit, codex])
 
     def test_updater_and_alert_share_the_same_role_snapshot(self) -> None:
         """The timer entry point resolves roles once for writes and notices."""

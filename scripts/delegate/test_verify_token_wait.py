@@ -581,6 +581,91 @@ exec "$TEST_REAL_SLEEP" "$@"
                 if second.stderr is not None:
                     second.stderr.close()
 
+    def start_memory_waiter(self, environment: dict[str, str], errors: Path) -> subprocess.Popen[bytes]:
+        """Start a verify that takes the token and then waits on the held meminfo.
+
+        verify.sh tees its step output to stdout, so both streams go to `errors`.
+        """
+        with errors.open("wb") as stream:
+            process = subprocess.Popen(["bash", str(VERIFY), "check", "sample", "--no-cache"],
+                                       cwd=self.root, env=environment, stdout=stream,
+                                       stderr=subprocess.STDOUT, start_new_session=True)
+        self.started_groups.add(process.pid)
+        # The directory watch sees new files, not writes to this one, so poll it.
+        deadline = time.monotonic() + 300
+        while ("waiting for memory" not in errors.read_text(errors="replace")
+               and process.poll() is None and time.monotonic() < deadline):
+            time.sleep(0.01)
+        self.assertIn("waiting for memory", errors.read_text(errors="replace"))
+        self.assertIsNone(process.poll(), errors.read_text(errors="replace"))
+        return process
+
+    def test_two_phases_sharing_a_role_name_each_keep_the_token_through_a_memory_wait(self) -> None:
+        # Phases 15 and 16 of one unit share the session's board and its role
+        # names. Phase 15's launcher ending must not free phase 16's token.
+        board = self.root / "board"
+        lock = board / "locks" / "cargo.d"
+        meminfo = Path(self.environment["BUILDLOG_MEMINFO"])
+        _ = meminfo.write_text("MemAvailable: 0 kB\n")
+        environment = {**self.environment, "PLAN_DELEGATE_BOARD_DIR": str(board),
+                       "PLAN_DELEGATE_TEAM_ROLE": "impl", "BUILDLOG_MEM_POLL_S": "1"}
+        phase_16_errors = self.root / "phase-16.err"
+        phase_15_errors = self.root / "phase-15.err"
+        phase_16 = self.start_memory_waiter(environment, phase_16_errors)
+        phase_15: subprocess.Popen[bytes] | None = None
+        try:
+            self.assertEqual((lock / "holder_pid").read_text(), str(phase_16.pid))
+            launcher_release = subprocess.run(["bash", str(BOARD), "release", str(board), "impl",
+                                               "cargo"], capture_output=True, text=True,
+                                              check=False, timeout=300)
+            self.assertEqual(launcher_release.returncode, 1, launcher_release.stdout)
+            self.assertIn(f"held by live pid {phase_16.pid}", launcher_release.stderr)
+            self.assertEqual((lock / "holder_pid").read_text(), str(phase_16.pid))
+
+            with phase_15_errors.open("wb") as stream:
+                phase_15 = subprocess.Popen(["bash", str(VERIFY), "check", "sample", "--no-cache"],
+                                            cwd=self.root, env=environment,
+                                            stdout=stream, stderr=subprocess.STDOUT,
+                                            start_new_session=True)
+            self.started_groups.add(phase_15.pid)
+            _ = meminfo.write_text("MemAvailable: 50331648 kB\n")
+            self.assertEqual(phase_16.wait(timeout=300), 0, phase_16_errors.read_text())
+            self.assertEqual(phase_15.wait(timeout=300), 0, phase_15_errors.read_text())
+            self.assertNotIn("Traceback", phase_16_errors.read_text())
+            self.assertEqual((self.root / "cargo-calls").read_text().count("check"), 2)
+            self.assertFalse(lock.exists())
+        finally:
+            _ = meminfo.write_text("MemAvailable: 50331648 kB\n")
+            for process in (phase_16, phase_15):
+                if process is not None:
+                    if process.poll() is None:
+                        self.end_group(process.pid)
+                    _ = process.wait(timeout=300)
+
+    def test_a_token_lost_during_the_memory_wait_stops_the_step_with_a_reason(self) -> None:
+        board = self.root / "board"
+        meminfo = Path(self.environment["BUILDLOG_MEMINFO"])
+        _ = meminfo.write_text("MemAvailable: 0 kB\n")
+        environment = {**self.environment, "PLAN_DELEGATE_BOARD_DIR": str(board),
+                       "PLAN_DELEGATE_TEAM_ROLE": "impl", "BUILDLOG_MEM_POLL_S": "1"}
+        errors = self.root / "lost.err"
+        process = self.start_memory_waiter(environment, errors)
+        try:
+            # A peer's acquire made the directory and has not written its pid yet.
+            shutil.rmtree(board / "locks" / "cargo.d")
+            (board / "locks" / "cargo.d").mkdir()
+            _ = meminfo.write_text("MemAvailable: 50331648 kB\n")
+            self.assertNotEqual(process.wait(timeout=300), 0)
+            text = errors.read_text()
+            self.assertIn("lost the cargo token before its step started", text)
+            self.assertNotIn("Traceback", text)
+            self.assertFalse((self.root / "cargo-calls").exists())
+        finally:
+            _ = meminfo.write_text("MemAvailable: 50331648 kB\n")
+            if process.poll() is None:
+                self.end_group(process.pid)
+            _ = process.wait(timeout=300)
+
     def assert_interrupted_holder_stops_step_before_release(self, interruption: signal.Signals) -> None:
         board = self.root / "board"
         first_environment = {**self.environment, "PLAN_DELEGATE_BOARD_DIR": str(board),

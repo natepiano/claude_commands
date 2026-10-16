@@ -21,6 +21,7 @@ from fake_herdr import CommandResponse
 from sessions import SessionRecord, UnreadableSessionRecord, read_session
 import showrunners
 from scripts.shutdown import launch_permission
+from scripts.accounts import accounts
 
 
 class SessionListReply(TypedDict):
@@ -290,7 +291,7 @@ class StandaloneLaunchTests(unittest.TestCase):
         }}), "code": 0}}
         _ = (home / ".claude.json").write_text(json.dumps({"projects": {
             str(self.root): {"hasTrustDialogAccepted": True},
-        }}))
+        }, "oauthAccount": {"emailAddress": "legacy@example.invalid"}}))
         self.save()
         _ = self.enterContext(patch.object(launch_permission, "launch_barrier", side_effect=lambda: nullcontext()))
         _ = self.enterContext(patch.object(launch_permission, "launch_permission", return_value=launch_permission.AllowedByShutdownState()))
@@ -330,6 +331,35 @@ class StandaloneLaunchTests(unittest.TestCase):
     def agent_starts(self) -> list[list[str]]:
         return [command for command in self.commands() if command[2:4] == ["agent", "start"]]
 
+    def numbered_account(self) -> Path:
+        notes = self.root / "notes"
+        notes.mkdir(exist_ok=True)
+        os.environ["AGENT_NOTES_DIR"] = str(notes)
+        _ = (notes / "claude4.md").write_text("---\nlogin: numbered@example.invalid\n---\n")
+        self.assertEqual(accounts.setup("claude4"), [])
+        directory = accounts.account_dir("claude4")
+        _ = (directory / ".claude.json").write_text(json.dumps({
+            "oauthAccount": {"emailAddress": "numbered@example.invalid"},
+            "projects": {str(self.root): {"hasTrustDialogAccepted": True}},
+        }))
+        return directory
+
+    def test_start_after_cutover_uses_showrunners_account_for_pane_and_admission(self) -> None:
+        directory = self.numbered_account()
+        groups = accounts.groups_file()
+        groups.parent.mkdir(parents=True, exist_ok=True)
+        _ = groups.write_text(json.dumps({"showrunners": "claude4"}))
+        _ = (Path.home() / ".claude.json").write_text("{}")
+        self.destination("solo")
+        with patch.object(launch_permission, "launch_permission", return_value=launch_permission.AllowedByShutdownState()) as permission:
+            self.assertEqual(self.call("start", "--name", "solo", "--cwd", str(self.root)), (0, ""))
+        environment = cast(dict[str, str], permission.call_args.args[0])
+        self.assertEqual(environment["CLAUDE_CONFIG_DIR"], str(directory))
+        workspace, = [command for command in self.commands() if command[2:4] == ["workspace", "create"]]
+        self.assertIn(f"CLAUDE_CONFIG_DIR={directory}", workspace)
+        self.assertIn(f"CLAUDE_CODE_REMOTE_MEMORY_DIR={Path.home() / '.claude'}", workspace)
+        self.assertEqual(len(self.agent_starts()), 1)
+
     def test_start_opens_promptless_default_account_and_attaches(self) -> None:
         self.destination("solo")
         self.assertEqual(self.call("start", "--name", "solo", "--cwd", str(self.root), "--", "--model", "opus"), (0, ""))
@@ -343,9 +373,7 @@ class StandaloneLaunchTests(unittest.TestCase):
         self.assertEqual(self.attachments, [(binary, [binary, "session", "attach", "solo"])])
 
     def test_start_inherits_named_account_for_pane_and_new_work_admission(self) -> None:
-        directory = self.root / ".claude4"
-        directory.mkdir()
-        _ = (directory / ".claude.json").write_text(json.dumps({"projects": {str(self.root): {"hasTrustDialogAccepted": True}}}))
+        directory = self.numbered_account()
         self.destination("solo")
         with patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": str(directory), "CLAUDE_CODE_OAUTH_TOKEN": "unrelated"}), patch.object(launch_permission, "launch_permission", return_value=launch_permission.AllowedByShutdownState()) as permission:
             self.assertEqual(self.call("start", "--name", "solo", "--cwd", str(self.root)), (0, ""))
@@ -381,9 +409,7 @@ class StandaloneLaunchTests(unittest.TestCase):
         self.assertEqual(self.agent_starts(), [])
 
     def test_resume_named_account_sends_multiline_file_once_and_preserves_arguments(self) -> None:
-        directory = self.root / ".claude4"
-        directory.mkdir()
-        _ = (directory / ".claude.json").write_text(json.dumps({"projects": {str(self.root): {"hasTrustDialogAccepted": True}}}))
+        directory = self.numbered_account()
         prompt = self.root / "prompt"
         _ = prompt.write_text("first line\nsecond line\n")
         self.destination("solo")
@@ -418,7 +444,7 @@ class StandaloneLaunchTests(unittest.TestCase):
         self.assertFalse(any(command[2:4] == ["agent", "prompt"] for command in self.commands()))
 
     def test_untrusted_folder_refuses_with_account_trust_command_before_server_start(self) -> None:
-        _ = (self.root / "home/.claude.json").write_text('{"projects": {}}')
+        _ = (self.root / "home/.claude.json").write_text('{"projects": {}, "oauthAccount": {"emailAddress": "legacy@example.invalid"}}')
         for verb in (("start", "--name", "solo"), ("resume", "solo", "--session-id", "recorded")):
             code, error = self.call(*verb, "--cwd", str(self.root))
             self.assertEqual(code, 1)

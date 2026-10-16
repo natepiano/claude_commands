@@ -29,6 +29,7 @@ import session_pane
 from herdr import HerdrPlace
 from add_unit import cell_value, live_unit_table, plan_cell_is_retired, retired_units
 from scripts.accounts import accounts
+from scripts.whoami import account as account_reader
 from scripts.whoami import agent_accounts
 from scripts.whoami.note_file import NumberedAccountLabel, note_name, parse_account_label
 import herdr
@@ -229,6 +230,9 @@ class AddUnitTests(ShutdownTestCase):
         _ = self.env.pop("CLAUDE_CONFIG_DIR", None)
         self.configure_herdr()
         self.quota_reading("owner@example.com", 80, 7)
+        with patch.dict(os.environ, self.env):
+            self.assertEqual(accounts.setup("claude2"), [])
+            _ = (accounts.account_dir("claude2") / ".claude.json").write_text(json.dumps({"oauthAccount": {"emailAddress": "owner@example.com"}, "projects": self.trusted_projects()}))
         _ = self.select_unit_account("claude2")
         self.prepare_herdr_launch("alpha", "--plan", "docs/plans/given.md")
 
@@ -246,14 +250,14 @@ class AddUnitTests(ShutdownTestCase):
             path = accounts.groups_file()
             path.parent.mkdir(parents=True, exist_ok=True)
             _ = path.write_text(json.dumps({"units": label, "showrunners": "claude2"}))
-            return accounts.main_config_dir() if label == "claude2" else accounts.account_dir(label)
+            return accounts.account_dir(label)
 
     def trusted_projects(self) -> dict[str, dict[str, bool]]:
         return {str(folder): {"hasTrustDialogAccepted": True}
                 for folder in (self.checkout, self.root / "prior-session", self.root / "prior session")}
 
     def test_untrusted_new_worktree_refuses_before_stub_row_or_worktree(self) -> None:
-        config = Path(self.env["HOME"]) / ".claude.json"
+        config = Path(self.env["HOME"]) / ".claude2/.claude.json"
         _ = config.write_text(json.dumps({"oauthAccount": {"emailAddress": "owner@example.com"},
                                          "projects": {str(self.root): {"hasTrustDialogAccepted": True}}}))
         document = self.doc.read_text()
@@ -265,7 +269,8 @@ class AddUnitTests(ShutdownTestCase):
                 folder = self.root / "project-alpha"
                 self.assertIn(f"alpha-unit: Claude is not trusted in {folder} on claude2. Run: "
                               + f"cd {shlex.quote(str(self.checkout))} && "
-                              + "env -u CLAUDE_CONFIG_DIR -u CLAUDE_CODE_REMOTE_MEMORY_DIR claude", result.stderr)
+                              + f"CLAUDE_CONFIG_DIR={shlex.quote(str(Path(self.env['HOME']) / '.claude2'))} "
+                              + f"CLAUDE_CODE_REMOTE_MEMORY_DIR={shlex.quote(str(Path(self.env['HOME']) / '.claude'))} claude", result.stderr)
                 self.assert_no_launch_change(document, head)
                 self.assertFalse((self.checkout / "docs/plans/build-followups-alpha.md").exists())
                 self.assertNotIn("build-followups-alpha", self.git("branch", "--list"))
@@ -283,10 +288,10 @@ class AddUnitTests(ShutdownTestCase):
         self.assertIn(f"CLAUDE_CONFIG_DIR={shlex.quote(str(directory))}", result.stderr)
         self.assert_no_launch_change(document, head)
 
-    def test_unreadable_trust_file_names_the_unit_and_refuses_before_any_write(self) -> None:
+    def test_trust_file_becoming_unreadable_after_account_check_refuses_before_any_write(self) -> None:
         with patch.dict(os.environ, self.env):
             selected = accounts.role_account("unit")
-        config = Path(self.env["HOME"]) / ".claude.json"
+        config = Path(self.env["HOME"]) / ".claude2/.claude.json"
         _ = config.write_text('{"oauthAccount": "SECRET-EMAIL", ')
         document = self.doc.read_text()
         head = self.git("rev-parse", "HEAD")
@@ -294,6 +299,7 @@ class AddUnitTests(ShutdownTestCase):
         errors = io.StringIO()
         with (patch.dict(os.environ, self.env), redirect_stdout(output), redirect_stderr(errors),
               patch.object(add_unit, "account_for_launch", return_value=selected),
+              patch.object(accounts, "check", return_value=[]),
               patch.object(launch_permission, "launch_permission",
                            return_value=launch_permission.AllowedByShutdownState())):
             code = add_unit.main(["--production", str(self.doc), "alpha", "--brief", "Add a feature"])
@@ -661,7 +667,7 @@ class AddUnitTests(ShutdownTestCase):
         _ = note.write_text("Resume this unit.", encoding="utf-8")
         return self.cli(name, "--plan", "docs/plans/given.md", "--resume", "session-123", "--cwd", str(cwd),
                         "--restart-note", str(note), "--session-name", "recorded-name",
-                        "--host-session", "recorded-tmux", "--config-dir", str(Path(self.env["HOME"]) / ".claude"))
+                        "--host-session", "recorded-tmux", "--config-dir", str(Path(self.env["HOME"]) / ".claude2"))
 
     def repository_state(self) -> tuple[str, str, str]:
         """The production doc, every branch with its commit, and every worktree with its branch."""
@@ -779,7 +785,7 @@ class AddUnitTests(ShutdownTestCase):
         ):
             arguments = ["--production", "unused", "alpha", "--plan", "unused"]
             if isinstance(launch_kind, add_unit.UnitRestoreLaunch):
-                arguments.extend(("--config-dir", str(Path(self.env["HOME"]) / ".claude")))
+                arguments.extend(("--config-dir", str(Path(self.env["HOME"]) / ".claude2")))
             result = add_unit.main(arguments)
         if result == 0:
             if isinstance(launch_kind, add_unit.UnitRestoreLaunch):
@@ -978,7 +984,7 @@ class AddUnitTests(ShutdownTestCase):
         self.persist_herdr_unit("alpha", prior)
         _ = self.successful("alpha", "--plan", "docs/plans/given.md", "--resume", "session-123", "--cwd", str(prior))
         self.assertEqual(self.agent_arguments()[:2], ["--model", "sonnet"])
-        self.assertNotIn("CLAUDE_CONFIG_DIR", self.pane_environment())
+        self.assertEqual(self.pane_environment()["CLAUDE_CONFIG_DIR"], str(Path(self.env["HOME"]) / ".claude2"))
 
     def persist_herdr_unit(self, name: str, cwd: Path) -> None:
         for pid, parent, arguments in ((201, 1, ["herdr", "--session", name, "server"]), (202, 201, ["zsh"])):
@@ -1115,7 +1121,7 @@ class AddUnitTests(ShutdownTestCase):
             "--resume", "session-123", "--cwd", str(prior),
             "--restart-note", str(note),
             "--session-name", "recorded-name", "--host-session", "recorded-tmux",
-         "--config-dir", str(Path(self.env["HOME"]) / ".claude"))
+         "--config-dir", str(Path(self.env["HOME"]) / ".claude2"))
 
         self.assertEqual(result.returncode, 2, (result.stdout, result.stderr))
         self.assertEqual(
@@ -1139,7 +1145,7 @@ class AddUnitTests(ShutdownTestCase):
         document = self.doc.read_text()
         head = self.git("rev-parse", "HEAD")
         promote = ("--resume", "session-123", "--cwd", str(recorded),
-                   "--config-dir", str(Path(self.env["HOME"]) / ".claude"))
+                   "--config-dir", str(Path(self.env["HOME"]) / ".claude2"))
         for launch, flags in (("new work", ()), ("promote", promote)):
             with self.subTest(launch=launch):
                 result = self.cli("trunk", "--plan", "docs/plans/given.md", *flags)
@@ -1198,7 +1204,7 @@ class AddUnitTests(ShutdownTestCase):
             "recorded-name",
             "--host-session",
             "recorded-tmux",
-         "--config-dir", str(Path(self.env["HOME"]) / ".claude"))
+         "--config-dir", str(Path(self.env["HOME"]) / ".claude2"))
 
         self.assertEqual(result.returncode, 2, (result.stdout, result.stderr))
         self.assertIn("/shutdown restart first", result.stderr)
@@ -1228,7 +1234,7 @@ class AddUnitTests(ShutdownTestCase):
             "recorded-name",
             "--host-session",
             "recorded-tmux",
-         "--config-dir", str(Path(self.env["HOME"]) / ".claude"))
+         "--config-dir", str(Path(self.env["HOME"]) / ".claude2"))
 
         self.assertEqual(result.returncode, 2, (result.stdout, result.stderr))
         self.assertIn("/shutdown restart first", result.stderr)
@@ -1400,7 +1406,7 @@ class AddUnitTests(ShutdownTestCase):
         ):
             result = add_unit.main(
                 ["--production", "unused", "alpha", "--plan", "unused",
-                 "--config-dir", str(Path(self.env["HOME"]) / ".claude")]
+                 "--config-dir", str(Path(self.env["HOME"]) / ".claude2")]
             )
             finish_shutdown()
 
@@ -1539,13 +1545,14 @@ class AddUnitTests(ShutdownTestCase):
     def test_the_nightly_review_unit_runs_from_rust_under_the_review_settings(self) -> None:
         folder = Path(self.env["HOME"]) / "rust"
         folder.mkdir()
-        config = Path(self.env["HOME"]) / ".claude.json"
+        config = Path(self.env["HOME"]) / ".claude2/.claude.json"
         _ = config.write_text(json.dumps({
             "oauthAccount": {"emailAddress": "owner@example.com"},
             "projects": {**self.trusted_projects(), str(folder): {"hasTrustDialogAccepted": True}}}))
         result = self.successful("nightly-review", "--permanent")
         self.assertIn("nightly-review-unit started: herdr session attach nightly-review", result.stdout)
         self.assertEqual(self.opened()[7], str(folder))
+        self.assertEqual(self.pane_environment()["CLAUDE_CONFIG_DIR"], str(config.parent))
         arguments = self.agent_arguments()
         self.assertEqual(arguments[arguments.index("--remote-control"):], [
             "--remote-control", "nightly-review", "-n", "nightly-review",
@@ -1572,14 +1579,14 @@ class AddUnitTests(ShutdownTestCase):
             + "path.write_text(json.dumps(sys.argv[1:]))\n")
         claude = unit_lookup.LiveClaude("existing", "conversation", "/fixture/socket", 4242)
         with (patch.object(unit_lookup, "tmux_claude", return_value=claude),
-              patch("scripts.whoami.account.process_config_dir", return_value=Path(self.env["HOME"]) / ".claude"),
+              patch("scripts.whoami.account.process_config_dir", return_value=account_reader.ConfiguredClaudeFolder(Path(self.env["HOME"]) / ".claude2")),
               patch.object(add_unit, "SCRIPTS", scripts)):
             result = self.successful("alpha", "--permanent", "--adopt", "existing")
         self.assertIn("alpha-unit adopted: tmux attach -t existing", result.stdout)
         self.assertEqual(self.marks("existing"), {
             "SHOWRUNNER_UNIT": "build-followups", "SHOWRUNNER_UNIT_ID": "alpha-unit"})
         options = cast(dict[str, str], json.loads((self.state / "options-existing.json").read_text()))
-        self.assertEqual(options["@claude_config_dir"], self.env["HOME"] + "/.claude")
+        self.assertEqual(options["@claude_config_dir"], self.env["HOME"] + "/.claude2")
         sent = cast(list[str], json.loads((self.state / "sent.json").read_text()))
         self.assertEqual(sent[sent.index("--to") + 1], "uds:/fixture/socket")
         self.assertIn("You are now alpha-unit", sent[sent.index("--text") + 1])
@@ -1653,7 +1660,9 @@ class AddUnitTests(ShutdownTestCase):
             self.env["HERDR_BIN"], "--session", "alpha", "server"]])
         self.assertEqual(self.opened()[4:8], ["--label", "alpha", "--cwd", str(worktree)])
         self.assertEqual(self.pane_environment(), {"SHOWRUNNER_UNIT": "build-followups",
-            "SHOWRUNNER_UNIT_ID": "alpha-unit", "ENABLE_TOOL_SEARCH": "true", "HERDR_AGENT_PANE": "1"})
+            "SHOWRUNNER_UNIT_ID": "alpha-unit", "ENABLE_TOOL_SEARCH": "true", "HERDR_AGENT_PANE": "1",
+            "CLAUDE_CONFIG_DIR": str(Path(self.env["HOME"]) / ".claude2"),
+            "CLAUDE_CODE_REMOTE_MEMORY_DIR": str(Path(self.env["HOME"]) / ".claude")})
         self.assertEqual(self.agent_arguments(), ["--model", "opus", "--effort", "xhigh",
             "--remote-control", "alpha", "-n", "alpha", "--settings", '{"disableAgentView": true}'])
         self.assertEqual(self.opening_prompt(), "/unit:direct docs/plans/given.md")
@@ -1687,7 +1696,7 @@ class AddUnitTests(ShutdownTestCase):
     def test_promoted_review_unit_uses_review_direct_with_its_identity(self) -> None:
         _ = self.doc.write_text(self.doc.read_text().replace("## Units", "- **Review pool:** code\n\n## Units"))
         _ = self.successful("review-unit", "--plan", "docs/plans/given.md",
-                            "--resume", "session-123", "--cwd", str(self.checkout), "--config-dir", str(Path(self.env["HOME"]) / ".claude"))
+                            "--resume", "session-123", "--cwd", str(self.checkout), "--config-dir", str(Path(self.env["HOME"]) / ".claude2"))
         command = self.launch_command()
         self.assertIn("You are now review-unit in production build-followups", command)
         self.assertIn(f"Run /review:direct {self.doc}.", command)
@@ -1740,8 +1749,8 @@ class AddUnitTests(ShutdownTestCase):
 
         self.assertEqual(self.pane_environment()["CLAUDE_CONFIG_DIR"], str(directory))
 
-    def test_default_unit_guard_environment_is_unchanged(self) -> None:
-        """F001: default selection preserves the original sanitized guard environment."""
+    def test_claude2_guard_environment_selects_its_numbered_folder(self) -> None:
+        """The guard sees the selected folder, never the caller or config home."""
         self.env["CLAUDE_CONFIG_DIR"] = str(self.root / "caller account")
         with (
             patch.dict(os.environ, self.env),
@@ -1760,6 +1769,7 @@ class AddUnitTests(ShutdownTestCase):
             ])
 
         self.assertEqual(result, 0)
+        expected["CLAUDE_CONFIG_DIR"] = str(Path(self.env["HOME"]) / ".claude2")
         permission.assert_called_once_with(
             expected, launch_permission.NewWorkLaunchPurpose()
         )
@@ -1796,10 +1806,10 @@ class AddUnitTests(ShutdownTestCase):
                 accounts.NamedAccount("claude3", directory),
             )
 
-    def test_new_default_unit_passes_no_named_account_variables(self) -> None:
+    def test_new_claude2_unit_passes_its_numbered_account_variables(self) -> None:
         _ = self.successful("alpha", "--plan", "docs/plans/given.md")
-        self.assertNotIn("CLAUDE_CONFIG_DIR", self.pane_environment())
-        self.assertNotIn("CLAUDE_CODE_REMOTE_MEMORY_DIR", self.pane_environment())
+        self.assertEqual(self.pane_environment()["CLAUDE_CONFIG_DIR"], str(Path(self.env["HOME"]) / ".claude2"))
+        self.assertEqual(self.pane_environment()["CLAUDE_CODE_REMOTE_MEMORY_DIR"], str(Path(self.env["HOME"]) / ".claude"))
 
     def test_new_named_unit_passes_selected_account_variables(self) -> None:
         directory = self.prepare_unit_account("claude3")
@@ -2122,7 +2132,7 @@ class AddUnitTests(ShutdownTestCase):
         document = self.doc.read_text()
         head = self.git("rev-parse", "HEAD")
         result = self.cli("alpha", "--plan", "docs/plans/given.md", "--resume", "session-123",
-                          "--cwd", str(self.root / "prior-session"), "--check", "--config-dir", str(Path(self.env["HOME"]) / ".claude"))
+                          "--cwd", str(self.root / "prior-session"), "--check", "--config-dir", str(Path(self.env["HOME"]) / ".claude2"))
         self.assertEqual(result.returncode, 0, (result.stdout, result.stderr))
         self.assertEqual(result.stdout, "")
         self.assertEqual(result.stderr, "")
@@ -2132,7 +2142,7 @@ class AddUnitTests(ShutdownTestCase):
         document = self.doc.read_text()
         head = self.git("rev-parse", "HEAD")
         result = self.cli("new director", "--plan", "docs/plans/given.md", "--resume", "session-123",
-                          "--cwd", str(self.root / "prior-session"), "--check", "--config-dir", str(Path(self.env["HOME"]) / ".claude"))
+                          "--cwd", str(self.root / "prior-session"), "--check", "--config-dir", str(Path(self.env["HOME"]) / ".claude2"))
         self.assertEqual(result.returncode, 2, (result.stdout, result.stderr))
         self.assertEqual(len(result.stderr.strip().splitlines()), 1)
         self.assertIn("name must contain only letters", result.stderr)
@@ -2268,9 +2278,9 @@ class AddUnitTests(ShutdownTestCase):
         prior = self.root / "prior-session"
         prior.mkdir()
         _ = self.successful("alpha", "--plan", "docs/plans/given.md", "--resume", "session-123",
-                            "--cwd", str(prior), "--config-dir", str(Path(self.env["HOME"]) / ".claude"))
+                            "--cwd", str(prior), "--config-dir", str(Path(self.env["HOME"]) / ".claude2"))
         self.assertEqual(self.opened()[7], str(prior))
-        self.assertNotIn("CLAUDE_CONFIG_DIR", self.pane_environment())
+        self.assertEqual(self.pane_environment()["CLAUDE_CONFIG_DIR"], str(Path(self.env["HOME"]) / ".claude2"))
         self.assertEqual(self.agent_arguments(), [
             "--model", "opus", "--effort", "xhigh", "--resume", "session-123",
             "--remote-control", "alpha", "-n", "alpha", "--settings", '{"disableAgentView": true}',
@@ -2389,7 +2399,7 @@ class AddUnitTests(ShutdownTestCase):
             "--restart-note", str(note),
             "--session-name", recorded_session,
             "--host-session", recorded_tmux,
-         "--config-dir", str(Path(self.env["HOME"]) / ".claude"))
+         "--config-dir", str(Path(self.env["HOME"]) / ".claude2"))
 
         self.assertEqual(self.opened()[1], "restore----")
         self.assertEqual(self.opened()[7], str(prior))
@@ -2423,7 +2433,7 @@ class AddUnitTests(ShutdownTestCase):
             "--restart-note", str(note),
             "--session-name", "recorded-name",
             "--host-session", "recorded-tmux",
-         "--config-dir", str(Path(self.env["HOME"]) / ".claude"))
+         "--config-dir", str(Path(self.env["HOME"]) / ".claude2"))
 
         self.assertEqual(result.returncode, 1, (result.stdout, result.stderr))
         self.assertEqual(len(result.stderr.splitlines()), 1)
@@ -2532,7 +2542,7 @@ class AddUnitTests(ShutdownTestCase):
         self.checkout = renamed
         self.doc = renamed / "docs/plans/build-followups-production.md"
         self.plan = renamed / "docs/plans/given.md"
-        _ = (Path(self.env["HOME"]) / ".claude.json").write_text(json.dumps({
+        _ = (Path(self.env["HOME"]) / ".claude2/.claude.json").write_text(json.dumps({
             "oauthAccount": {"emailAddress": "owner@example.com"},
             "projects": self.trusted_projects()}), encoding="utf-8")
         _ = self.doc.write_text(self.production_doc(), encoding="utf-8")
@@ -2679,7 +2689,7 @@ class AdoptAccountTests(unittest.TestCase):
         with patch.object(add_unit, "launched_unit", return_value=None), \
              patch.object(unit_lookup, "every_marked_unit", return_value=unit_lookup.MarkedProductions({}, {})), \
              patch.object(unit_lookup, "tmux_claude", return_value=claude), \
-             patch("scripts.whoami.account.process_config_dir", return_value=folder), \
+             patch("scripts.whoami.account.process_config_dir", return_value=account_reader.ConfiguredClaudeFolder(folder)), \
              patch.object(accounts, "main_config_dir", return_value=Path("/home/someone/.claude")), \
              patch.object(accounts, "account_identity", return_value=agent_accounts.NumberedAccount("claude2", Path("/home/someone/.claude"), "owner@example.invalid")), \
              patch.object(accounts, "checked_named_accounts", return_value=named):

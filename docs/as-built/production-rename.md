@@ -160,7 +160,7 @@ unit commits. Unrelated checkout changes still refuse.
 Every `~/.claude*/` directory and `CLAUDE_CONFIG_DIR` is checked for project
 data. Project directory names replace each character outside `[A-Za-z0-9]`
 in the full worktree path with `-`. Trust lives at `~/.claude.json` for the
-default `~/.claude` account, and `<config-dir>/.claude.json` for other accounts.
+shared seed and MCP baseline, and `<config-dir>/.claude.json` for numbered accounts.
 The old path's `projects` entry is copied to the new key, keeping the old
 key and unrelated settings. Each atomic write is read back after two seconds,
 with at most three attempts if the new key disappears. Persistent loss refuses
@@ -219,8 +219,9 @@ and 2 for invalid arguments.
 
 - Claude's projects-dir name replaces every non-alphanumeric character of the
   worktree path with `-`, not only `/`.
-- The default account's trust file is `~/.claude.json` in `HOME`, not inside
-  `~/.claude/`.
+- The shared seed and trust baseline is `~/.claude.json` in `HOME`; each
+  numbered account has its own `.claude.json`. Relaunches use the configured
+  group account with an explicit numbered `CLAUDE_CONFIG_DIR`.
 - CHECK is rewritten by shell-parsed token (the argument after
   `production_check.sh`) and re-quoted with `shlex.quote`, since it can hold a
   shell-escaped path.

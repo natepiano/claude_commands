@@ -46,8 +46,11 @@ State:
 - `PHASE_DIR`: `${SESSION_DIR}/phases/<phase id>`, one per open phase, so a
   later phase running beside the current one keeps its own state. It holds that
   phase's reservation state, its `phase_baseline` and `progress_baseline_status`,
-  and its `files` list. Run-wide files (`board.log`, `mesh_server.json`,
-  `mesh_roster.json`, `impl_status_<slot>`) stay in `${SESSION_DIR}`.
+  its `files` list, its prompts, and every file its launchers write: each
+  launch names the phase with `--phase`, so status, summaries, findings and
+  logs never collide with a phase running beside it. Run-wide files
+  (`board.log`, `heartbeat.log`, `mesh_server.json`, `mesh_roster.json`, the
+  findings ledger and recorder state) stay in `${SESSION_DIR}`.
 - `DELEGATED_PHASE_RESERVATION_STATE`: the tagged state persisted at
   `${PHASE_DIR}/delegated_phase_reservation_state.json`; see
   <DelegatedPhaseReservationContract/>.
@@ -560,9 +563,10 @@ before that phase's first dispatch. Recording them late attributes the new
 phase's work to the finished one — its title, its elapsed clock, and its pass
 counts all describe the wrong phase. A phase opened beside one still running
 leaves that one open: `start-phase` parks it, and `finish-phase --phase-id <id>`
-closes each at its own end. While two phases are open, name the phase on every
-launch, or its pass is stamped with the newest phase: `implement.sh`'s tenth
-argument and `review.sh --phase <id>`.
+closes each at its own end. Name the phase on every launch,
+`implement.sh --phase <id>` and `review.sh --phase <id>`: the pass is stamped
+with it, where a launch without one takes the newest open phase, and the
+launcher writes its files to that phase's `${PHASE_DIR}`.
 </PassOwnership>
 
 <ProgressContract>
@@ -838,11 +842,16 @@ Do not dispatch until this contract reaches one of its four persisted states.
    atomically acquires exact `file:` scopes before the edit. A Codex seat's
    `apply_patch` runs `scripts/hooks/pre-tool-use-berth.py`, which gives each
    path to its open phase (the only one, else the one whose `files` list covers
-   it, refusing a path no single list owns), checks under this session's id and
-   replaces that phase's `EnrolledAwaitingFirstTouch` with `Active` from the
-   returned facts; a Claude edit's hook protects the paths but writes
-   no state, so a first touch of your own leaves the state for the checkpoint
-   backstop (<CheckpointCommit/> step 5). A blocked check refuses the edit and
+   it, refusing a path no single list owns), checks as that phase's own berth
+   session, `<this session's id>.phase-<phase>`, and replaces that phase's
+   `EnrolledAwaitingFirstTouch` with `Active` from the returned facts. A path a
+   sibling phase already holds is allowed and records nothing: the engine
+   answers `left_unmapped` with the sibling's reservation. A Claude edit's hook
+   protects the paths but writes no state, so a first touch of your own leaves
+   the state for the checkpoint backstop (<CheckpointCommit/> step 5). With two
+   phases holding reservations, your own edit is refused as ambiguous until you
+   name its phase: `cargo-berth check <path> --reservation <that phase's
+   reservation id> --json` acquires the path for it, and the edit then clears. A blocked check refuses the edit and
    leaves the pending state intact; a seat reports the refusal to you, and you
    answer the overlap under <BerthDecisions/>. An unreadable ledger stops
    without facts. Beyond those answers, do not call `cargo-berth claim` on
@@ -856,10 +865,16 @@ paths, answer choices — and record the answer it picks; that answer is a
 decision, not a relayed user approval. With no showrunner, pick the answer
 yourself. Either way, report what was decided in one line.
 
-An answer is `cargo-berth claim <paths> --<choice> <holder> --overlap-why
-"<why>"`, `<choice>` one of `before`, `after`, `defer`, `override`; it records
-in one step and exits 0. If another holder also conflicts, it is refused and
-records nothing: split the claim so each call meets one holder.
+An answer is `cargo-berth claim <paths> --reservation <id> --<choice> <holder>
+--overlap-why "<why>"`, `<choice>` one of `before`, `after`, `defer`,
+`override`, and `<id>` the asking phase's recorded reservation; it records in
+one step and exits 0. `before` and `after` widen only that phase's reservation,
+with the ordering edge; `defer` records the answer and takes no paths, so the
+phase holds its dispatch on them. An id the ledger does not know is refused.
+A `duplicate_ordering_edge` refusal (exit 2) means that edge is already
+recorded: the answer stands, so do not repeat it. If another holder also
+conflicts, it is refused and records nothing: split the claim so each call
+meets one holder.
 
 Every cargo-berth call is one plain command run in `${WORKING_DIR}`: no pipe,
 loop, `;`, `&&`, `$(...)`, redirect or env-var prefix. cargo-berth reads
@@ -912,11 +927,11 @@ At an eligible tick, in that same tick:
 
 1. Increment `${REVIEW_PASS}` now; <DualReview/> will not increment it again.
 2. **Delete every stale delivery artifact and prove they are gone.**
-   `${SESSION_DIR}` spans the whole run but `${REVIEW_PASS}` resets with every
-   phase, so earlier phases' artifacts already sit on disk under the exact names
-   this phase's launches will poll.
+   A resumed or repeated phase reuses `${PHASE_DIR}`, so an earlier delivery's
+   artifacts can already sit on disk under the exact names this launch will
+   poll.
 
-   `rm -f "${SESSION_DIR}"/final_diff_*.diff "${SESSION_DIR}"/final_diff_*.ready`
+   `rm -f "${PHASE_DIR}"/final_diff_*.diff "${PHASE_DIR}"/final_diff_*.ready`
 
    Clear the whole glob, not just the current index — later passes in this phase
    collide the same way — then confirm no sentinel remains before continuing. A
@@ -936,8 +951,8 @@ At an eligible tick, in that same tick:
    worker's role changes; when every open worker is busy, name a new `review` worker
    and keep it after the turn. On the pool arm, read `${EARLY_REVIEW_SLOT}`
    when a cancel call needs it:
-   the one line in `${SESSION_DIR}/review_slot_adversary` for pass 1, or
-   `${SESSION_DIR}/review_slot` for a closure. A missing file means the launcher
+   the one line in `${PHASE_DIR}/review_slot_adversary` for pass 1, or
+   `${PHASE_DIR}/review_slot` for a closure. A missing file means the launcher
    opened no pass, so record nothing.
    Write the applicable early-form prompt — the `adversary`
    lens of
@@ -952,16 +967,16 @@ At an eligible tick, in that same tick:
    a review pool and the phase's arm is `pool`; otherwise with `--to` for an
    open worker or `--slot "${EARLY_REVIEW_SLOT}"` for the new worker, and
    `adversary` as its lens for pass 1 — appending one extra final argument:
-   `${SESSION_DIR}/final_diff_${REVIEW_PASS}.ready`. Save the
+   `${PHASE_DIR}/final_diff_${REVIEW_PASS}.ready`. Save the
    handle as `${REVIEW_DISPATCH_HANDLE}` and set `EARLY_REVIEW=launched`. Leave
    `${DISPATCH_HANDLE}` untouched.
 6. Before the recorder call in <ProgressReport/> step 5, put the reviewer in
    the round table:
 
-   `python3 ~/.claude/scripts/delegate/progress_history.py arm-review --session-dir "${SESSION_DIR}" --activity "<what this reviewer is checking>" --called-task delegate.review [--lens adversary]`
+   `python3 ~/.claude/scripts/delegate/progress_history.py arm-review --session-dir "${SESSION_DIR}" --phase-id "<phase id>" --activity "<what this reviewer is checking>" --called-task delegate.review [--lens adversary]`
 
-   Pass the same lens the launch carries, and none where the launch carries
-   none: the marker names the status and pid files it will watch for, and a
+   Pass the same lens and phase the launch carries, and no lens where the
+   launch carries none: the marker names the status and pid files it will watch for, and a
    marker watching the unsuffixed pair while the launcher writes the suffixed
    one retires the row on its first tick, reporting a live reviewer as gone.
    It is a presentation marker, not a pass event, so it cannot forge anything
@@ -978,7 +993,7 @@ always may — early launch is opportunistic, never required.
 
 | Event | Required action |
 | --- | --- |
-| Primary completes | After <LaunchImplementation/> step 7, write the final diff to `${SESSION_DIR}/final_diff_${REVIEW_PASS}.diff` — a closure review stays limited to its paths per <ClosureReview/> — then create `${SESSION_DIR}/final_diff_${REVIEW_PASS}.ready`. **Never create the sentinel before the diff is fully written.** |
+| Primary completes | After <LaunchImplementation/> step 7, write the final diff to `${PHASE_DIR}/final_diff_${REVIEW_PASS}.diff` — a closure review stays limited to its paths per <ClosureReview/> — then create `${PHASE_DIR}/final_diff_${REVIEW_PASS}.ready`. **Never create the sentinel before the diff is fully written.** |
 | Primary errors, or the run stops | Kill the early reviewer. If the sentinel exists, close its pass with `PLAN_DELEGATE_TEAM_ROLE=${EARLY_REVIEW_SLOT} … finish-pass --status canceled --orphaned-launcher` per <PassOwnership/>; on the pool arm, read the slot per step 4 and skip this call if the file is missing. Before the sentinel no pass was recorded, so record nothing — a pre-sentinel kill counts toward no advisory, including the blind-review cancellation one. |
 | Reviewer errors before delivery | Report it in one line, clear `${REVIEW_DISPATCH_HANDLE}` and `${EARLY_REVIEW_SLOT}`, set `EARLY_REVIEW=none`, and leave the numbered artifacts. The primary continues and is reviewed synchronously at completion under the next `${REVIEW_PASS}` index. |
 | A verdict arrives before delivery | **It is void.** The reviewer cannot have read a diff that does not exist yet, so discard its findings entirely rather than reading them as evidence: open nothing in the ledger, preempt nothing, route no blocker into a fix dispatch. Say in one line that it is discarded and why, then follow the reviewer-error row. A void verdict is often fluent and specific — a stale diff supports confident claims about missing work — so the check is the timing, never how convincing the text reads. |
@@ -1260,7 +1275,7 @@ instructions name; with none, skip and say so in one line.
      results; stop the helper with TaskStop. When the marker exists, run no
      helper and use only the pool's result.
    - Save the full helper verdict, when run, and the successful pool verdict
-     from `${SESSION_DIR}/review_findings_${PASS_INDEX}_ux.txt` beside the turn
+     from `${PHASE_DIR}/review_findings_${PASS_INDEX}_ux.txt` beside the turn
      records in `${PLAN_DELEGATE_HISTORY_DIR:-$HOME/.local/state/plan-delegate}/review_turns/<session dir name>/`,
      as `ux_<phase>_<k>_helper.txt` and `ux_<phase>_<k>_pool.txt`. Preserve each
      pair. A failed shadow pool check leaves its pool file missing and gets

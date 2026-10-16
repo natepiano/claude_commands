@@ -26,6 +26,7 @@ from typing import NamedTuple, NoReturn, TypedDict, cast
 
 if not __package__:
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from scripts.delegate import phase_reservation  # noqa: E402
 from scripts.lib import unit_runs  # noqa: E402
 from scripts.lib.user_zone import user_zone  # noqa: E402
 
@@ -1612,9 +1613,10 @@ def _arm_review(args: argparse.Namespace) -> None:
     """
     session_dir = _session_dir(args)
     state = _read_state(session_dir)
-    phase = _object_dict(state.get("phase"))
+    phase_id = _arg_string(args, "phase_id")
+    phase = _open_phase_named(state, phase_id) if phase_id else _object_dict(state.get("phase"))
     if phase is None or _string(phase.get("status")) != "active":
-        raise SystemExit("Start a phase before arming an early review")
+        raise SystemExit(f"Phase {phase_id} is not open" if phase_id else "Start a phase before arming an early review")
     if _reporting_pass(state) is None:
         raise SystemExit(
             "An early review is the reviewer that overlaps a running dispatch, so "
@@ -1625,6 +1627,8 @@ def _arm_review(args: argparse.Namespace) -> None:
     called_task = _arg_string(args, "called_task", "delegate.review") or "delegate.review"
     lens = _arg_string(args, "lens")
     suffix = f"_{lens}" if lens else ""
+    # `review.sh --phase` writes its files in the phase's directory, so the marker names the same one.
+    artifact_dir = phase_reservation.phase_directory(session_dir, phase_id) if phase_id else session_dir
     armed: dict[str, object] = {
         "instance_id": str(uuid.uuid4()),
         "kind": "review",
@@ -1636,8 +1640,8 @@ def _arm_review(args: argparse.Namespace) -> None:
         # `review.sh` suffixes both files with its lens, so an armed reviewer
         # must name the same pair the launcher it precedes will write. Empty is
         # the single-reviewer layout and the unsuffixed names.
-        "status_file": str(session_dir / f"review_status{suffix}"),
-        "pid_file": str(session_dir / f"review_pid{suffix}"),
+        "status_file": str(artifact_dir / f"review_status{suffix}"),
+        "pid_file": str(artifact_dir / f"review_pid{suffix}"),
         "status": "armed",
     }
     state[ARMED_REVIEW_KEY] = armed
@@ -4852,6 +4856,7 @@ def _build_parser() -> argparse.ArgumentParser:
     _ = arm_review.add_argument("--activity", required=True)
     _ = arm_review.add_argument("--called-task", default="delegate.review")
     _ = arm_review.add_argument("--lens", default="")
+    _ = arm_review.add_argument("--phase-id", default="", help="the open phase the review belongs to, as review.sh --phase names it")
     arm_review.set_defaults(handler=_arm_review)
 
     disarm_review = subparsers.add_parser(

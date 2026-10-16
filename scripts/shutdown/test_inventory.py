@@ -262,7 +262,7 @@ class InventoryTests(ShutdownTestCase):
                 _ = stream.write(padding)
             _ = stream.write(b'{"type":"assistant","message":{"model":"large-file-model"}}\n')
             _ = stream.write(b'{"type":"last-prompt","content":"after the reply"}\n')
-        with patch.object(account, "process_config_dir", return_value=self.target_config):
+        with patch.object(account, "process_config_dir", return_value=account.ConfiguredClaudeFolder(self.target_config)):
             listed = inventory.listing(TARGET_LOGIN)
         self.assertEqual({session.session_id for session in listed}, identities)
         self.assertGreaterEqual(transcript.stat().st_size, 50 * 1024 * 1024)
@@ -431,8 +431,9 @@ class InventoryTests(ShutdownTestCase):
             OTHER_PID: self.other_config,
             UNKNOWN_PID: None,
         }
-        def config_dir_for_pid(pid: int) -> Path | None:
-            return config_by_pid.get(pid)
+        def config_dir_for_pid(pid: int) -> account.ConfiguredClaudeFolder | account.ProcessEnvironmentUnread:
+            directory = config_by_pid.get(pid)
+            return account.ConfiguredClaudeFolder(directory) if directory is not None else account.ProcessEnvironmentUnread("unreadable")
 
         _account_context: object = self.enterContext(
             patch.object(
@@ -1303,19 +1304,59 @@ elif "comm=" in joined:
             encoding="utf-8",
         )
 
-        with patch.object(account, "process_config_dir", return_value=default_dir):
+        with patch.object(account, "process_config_dir", return_value=account.ConfiguredClaudeFolder(default_dir)):
             found = inventory.inventory(TARGET_LOGIN, only=frozenset({DESKTOP_ID}))
 
         self.assertEqual(len(found["sessions"]), 1)
         self.assertEqual(found["sessions"][0].get("config_dir"), str(default_dir))
 
+    def test_process_without_an_account_setting_is_attributed_only_until_home_cutover(self) -> None:
+        home_json = self.home / ".claude.json"
+        _ = home_json.write_text(json.dumps({"oauthAccount": {"emailAddress": TARGET_LOGIN}}))
+        with patch.object(account, "process_config_dir", return_value=account.NoAccountSetting()):
+            before = inventory.inventory(TARGET_LOGIN, only=frozenset({DESKTOP_ID}))
+            _ = home_json.write_text("{}")
+            after = inventory.inventory(TARGET_LOGIN, only=frozenset({DESKTOP_ID}))
+        self.assertEqual([item["session_id"] for item in before["sessions"]], [DESKTOP_ID])
+        self.assertEqual(before["sessions"][0].get("config_dir"), str(self.home / ".claude"))
+        self.assertEqual(after["sessions"], [])
+        self.assertEqual(after["unattributed"], [{"pid": DESKTOP_PID, "name": "notes", "reason": "account unreadable"}])
+
+    def test_listing_and_inventory_share_home_identity_until_the_next_pass(self) -> None:
+        identities = frozenset({DESKTOP_ID, UNIT_ID})
+        owners = [record for record in sessions.live_sessions() if record["sessionId"] in identities]
+        self.assertEqual(len(owners), 2)
+        home_json = self.home / ".claude.json"
+
+        def cutover_during_process_read(_pid: int) -> account.NoAccountSetting:
+            _ = home_json.write_text("{}")
+            return account.NoAccountSetting()
+
+        for consumer in ("listing", "inventory"):
+            with self.subTest(consumer=consumer):
+                _ = home_json.write_text(json.dumps({"oauthAccount": {"emailAddress": TARGET_LOGIN}}))
+                with (patch.object(sessions, "live_sessions", return_value=owners),
+                      patch.object(account, "process_config_dir", side_effect=cutover_during_process_read),
+                      patch.object(account, "home_account_state", wraps=account.home_account_state) as home_reads):
+                    if consumer == "listing":
+                        before = inventory.listing(TARGET_LOGIN)
+                        after = inventory.listing(TARGET_LOGIN)
+                        found_ids = {item.session_id for item in before}
+                    else:
+                        found = inventory.inventory(TARGET_LOGIN, only=identities)
+                        found_ids = {item["session_id"] for item in found["sessions"]}
+                        after = inventory.inventory(TARGET_LOGIN, only=identities)["sessions"]
+                self.assertEqual(found_ids, identities)
+                self.assertEqual(after, [])
+                self.assertEqual(home_reads.call_count, 2)
+
     def test_account_identity_and_config_dir_share_one_process_lookup(self) -> None:
         """F007: capture the account and directory from the same environment read."""
         looked_up: list[int] = []
 
-        def config_dir_for_pid(pid: int) -> Path:
+        def config_dir_for_pid(pid: int) -> account.ConfiguredClaudeFolder:
             looked_up.append(pid)
-            return self.target_config if len(looked_up) == 1 else self.other_config
+            return account.ConfiguredClaudeFolder(self.target_config if len(looked_up) == 1 else self.other_config)
 
         with patch.object(account, "process_config_dir", side_effect=config_dir_for_pid):
             found = inventory.inventory(TARGET_LOGIN, only=frozenset({DESKTOP_ID}))
@@ -1329,7 +1370,7 @@ elif "comm=" in joined:
         for reader in ("process_config_dir", "claude_account"):
             with (
                 self.subTest(reader=reader),
-                patch.object(account, reader, return_value=None),
+                patch.object(account, reader, return_value=account.ProcessEnvironmentUnread("unreadable") if reader == "process_config_dir" else None),
             ):
                 found = inventory.inventory(TARGET_LOGIN, only=frozenset({DESKTOP_ID}))
 
@@ -1620,6 +1661,33 @@ class RecoveryInventoryTests(unittest.TestCase):
         self.assertEqual((timers.call_count, units.call_count), (1, 1))
         desktops.assert_called_once_with(refresh=False)
         self.assertEqual(found.sessions[TARGET_LOGIN][0]["session"]["cwd"], str(self.root))
+
+    def test_snapshot_without_account_setting_keeps_home_identity_only_until_cutover(self) -> None:
+        self.claude()
+        self.claude(1002, identity="second-owner")
+        for pid in (1001, 1002):
+            _ = (self.proc / str(pid) / "environ").write_bytes(b"HOME=fixture\0")
+        seed = self.root / ".claude.json"
+        _ = seed.write_text(json.dumps({"oauthAccount": {"emailAddress": TARGET_LOGIN}}))
+        with patch.object(account, "home_account_state", wraps=account.home_account_state) as home_reads:
+            before = inventory.snapshot_inventory()
+            _ = seed.write_text("{}")
+            after = inventory.snapshot_inventory()
+        assert isinstance(before, inventory.CompleteInventory), before
+        self.assertEqual({entry["session"]["session_id"] for entry in before.sessions[TARGET_LOGIN]},
+                         {"owner-id", "second-owner"})
+        self.assertTrue(all(entry["session"].get("config_dir") == str(self.root / ".claude")
+                            for entry in before.sessions[TARGET_LOGIN]))
+        assert isinstance(after, inventory.PartialInventory), after
+        self.assertEqual(sum("account attribution" in failure for failure in after.failures), 2)
+        self.assertEqual(home_reads.call_count, 2)
+
+    def test_snapshot_explicit_config_home_without_a_login_is_not_an_account(self) -> None:
+        self.claude(config=self.root / ".claude")
+        _ = (self.root / ".claude.json").write_text("{}")
+        found = inventory.snapshot_inventory()
+        assert isinstance(found, inventory.PartialInventory), found
+        self.assertTrue(any("account attribution" in failure for failure in found.failures))
 
     def test_snapshot_reports_unreadable_registry_and_account_instead_of_absence(self) -> None:
         self.claude()

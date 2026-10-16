@@ -12,9 +12,11 @@ A unit's Codex seats edit through `apply_patch`, which none of these see.
 `scripts/hooks/pre-tool-use-berth.py` is their `PreToolUse` check: for a seat
 of a running unit it gives each path to its open phase (the only one, else the
 one whose `phases/<id>/files` list covers it), runs `cargo-berth check <paths>
---json` under the unit director's session id, refuses the edit on any answer
+--json` as that phase's berth session `<director session id>.phase-<id>`, so
+two open phases hold separate reservations, refuses the edit on any answer
 but `clear` or `unconfigured`, and turns that phase's
-`enrolled_awaiting_first_touch` state `Active` from the acquired reservation. `scripts/hooks/codex_hooks.py install`
+`enrolled_awaiting_first_touch` state `Active` from the acquired reservation.
+A `left_unmapped` answer names a sibling phase's reservation and records nothing. `scripts/hooks/codex_hooks.py install`
 registers and trusts it in `~/.codex/hooks.json` with the other Codex hooks.
 
 Each one checks that `cargo-berth` is on `PATH` and then `exec`s

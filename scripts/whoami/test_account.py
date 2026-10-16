@@ -16,7 +16,7 @@ from pathlib import Path
 from typing import override
 from unittest.mock import patch
 
-import account
+from scripts.whoami import account, agent_accounts
 
 
 STATUS_LINE = Path(__file__).parents[1] / "statusline" / "statusline.jq"
@@ -203,6 +203,30 @@ class AccountTests(unittest.TestCase):
             self.assertEqual(account.label_for("claude", "legacy@example.invalid"), "claude2")
             self.assertEqual(account.named_claude_account("claude 2").login, "legacy@example.invalid")
 
+    def test_attribution_pass_reads_home_once_and_observes_cutover_on_next_pass(self) -> None:
+        home = self.home / ".claude"
+        home.mkdir()
+        seed = self.home / ".claude.json"
+        self.write_claude_config(seed, "old@example.invalid")
+        self.write_note("claude2.md", "old@example.invalid")
+        with (patch.dict(os.environ, self.environment_without_claude_config_dir(), clear=True),
+              patch.object(account, "claude_on_disk", wraps=agent_accounts.claude_on_disk) as read_home,
+              patch.object(account, "process_config_dir", return_value=account.NoAccountSetting())):
+            state = account.home_account_state()
+            # A pass retains one consistent snapshot even if the home changes mid-pass.
+            _ = seed.write_text("{}")
+            for pid in (101, 102):
+                self.assertEqual(account.process_account_directory(account.NoAccountSetting(), home_state=state),
+                                 account.ConfiguredClaudeFolder(home))
+                self.assertEqual(account.account_of(pid, home_state=state),
+                                 account.Account("claude", "old@example.invalid", "claude2"))
+            read_home.assert_called_once_with(home)
+            next_state = account.home_account_state()
+            self.assertIsInstance(account.process_account_directory(account.NoAccountSetting(), home_state=next_state),
+                                  account.NoAccountSetting)
+            self.assertIsNone(account.account_of(103, home_state=next_state))
+            self.assertEqual(read_home.call_count, 2)
+
     def test_process_config_dir_reads_set_variable_from_linux_process_environment(self) -> None:
         environ = b"USER=test\0CLAUDE_CONFIG_DIR=/tmp/claude-two\0PATH=/usr/bin\0"
 
@@ -212,10 +236,10 @@ class AccountTests(unittest.TestCase):
         ):
             config_dir = account.process_config_dir(4321)
 
-        self.assertEqual(config_dir, Path("/tmp/claude-two"))
+        self.assertEqual(config_dir, account.ConfiguredClaudeFolder(Path("/tmp/claude-two")))
         read_bytes.assert_called_once_with(Path("/proc/4321/environ"))
 
-    def test_process_config_dir_defaults_to_dot_claude_when_variable_is_unset(self) -> None:
+    def test_process_config_dir_keeps_an_absent_account_setting(self) -> None:
         with (
             patch.object(sys, "platform", "linux"),
             patch.object(Path, "home", return_value=self.home),
@@ -223,30 +247,30 @@ class AccountTests(unittest.TestCase):
         ):
             config_dir = account.process_config_dir(4321)
 
-        self.assertEqual(config_dir, self.home / ".claude")
+        self.assertIsInstance(config_dir, account.NoAccountSetting)
 
-    def test_process_config_dir_returns_none_when_environment_is_unreadable(self) -> None:
+    def test_process_config_dir_names_an_unreadable_environment(self) -> None:
         with (
             patch.object(sys, "platform", "linux"),
             patch.object(Path, "read_bytes", side_effect=PermissionError),
         ):
             config_dir = account.process_config_dir(4321)
 
-        self.assertIsNone(config_dir)
+        self.assertIsInstance(config_dir, account.ProcessEnvironmentUnread)
 
     def test_darwin_process_owned_by_another_uid_is_unreadable(self) -> None:
         output = "0 /sbin/launchd HOME=/var/root CLAUDE_CONFIG_DIR=/root/.claude"
 
         config_dir = account.parse_darwin_config_dir(output, expected_uid=501)
 
-        self.assertIsNone(config_dir)
+        self.assertIsInstance(config_dir, account.ProcessEnvironmentUnread)
 
     def test_darwin_process_without_visible_home_environment_is_unreadable(self) -> None:
         output = "501 /usr/bin/claude --resume session-id"
 
         config_dir = account.parse_darwin_config_dir(output, expected_uid=501)
 
-        self.assertIsNone(config_dir)
+        self.assertIsInstance(config_dir, account.ProcessEnvironmentUnread)
 
     def test_darwin_process_with_visible_environment_defaults_when_config_dir_is_unset(
         self,
@@ -257,7 +281,7 @@ class AccountTests(unittest.TestCase):
                 expected_uid=501,
             )
 
-        self.assertEqual(config_dir, self.home / ".claude")
+        self.assertIsInstance(config_dir, account.NoAccountSetting)
 
     def test_darwin_process_with_apostrophe_and_visible_environment_uses_config_dir(
         self,
@@ -269,9 +293,9 @@ class AccountTests(unittest.TestCase):
 
         config_dir = account.parse_darwin_config_dir(output, expected_uid=501)
 
-        self.assertEqual(config_dir, Path("/from-environment"))
+        self.assertEqual(config_dir, account.ConfiguredClaudeFolder(Path("/from-environment")))
 
-    def test_darwin_process_config_dir_returns_none_when_ps_fails(self) -> None:
+    def test_darwin_process_config_dir_names_a_failed_observation(self) -> None:
         result = subprocess.CompletedProcess(["ps"], 1, "", "failed")
         with (
             patch.object(sys, "platform", "darwin"),
@@ -279,7 +303,7 @@ class AccountTests(unittest.TestCase):
         ):
             config_dir = account.process_config_dir(4321)
 
-        self.assertIsNone(config_dir)
+        self.assertIsInstance(config_dir, account.ProcessEnvironmentUnread)
         run.assert_called_once()
 
     def test_write_label_does_not_rewrite_unchanged_content(self) -> None:

@@ -24,7 +24,8 @@ opening in <ReviewPromptContract/>.
    committed.` A replacement thread uses opening wording instead.
 2. Boundaries: do not commit, branch, or touch unrelated files; summarize files,
    reasons, and deviations when done, and **write that summary to this slot's
-   `impl_summary_<slot>.txt` as the last act before finishing** — a background
+   `${PHASE_DIR}/impl_summary_<slot>.txt`, its path written out in full, as the
+   last act before finishing** — a background
    session has no output redirect, so a summary left only in the reply is a
    summary the unit director never sees. State this slot's file set and the
    peer's file set per <TeamFilePartition/>, and that a peer's file is blocked
@@ -172,7 +173,7 @@ open Codex worker with `--to <full-worker-name>`, then apply
 the Claude phase; the Codex poll covers its phase. <LaunchImplementation/> owns
 the rest of the procedure.
 
-The phase is complete only when every slot has a terminal `impl_status_<slot>`,
+The phase is complete only when every slot has a terminal `${PHASE_DIR}/impl_status_<slot>`,
 not when the first one lands. Reading one slot's `implemented` as the phase's
 result is the same defect as reading a completion notification as a finished
 assignment. Completion ends the turns, not their Codex threads.

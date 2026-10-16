@@ -1287,7 +1287,15 @@ if child:
 os.setsid()
 with (lock.parent / "cargo.guard").open("a+") as guard:
     fcntl.flock(guard, fcntl.LOCK_EX)
-    if (lock / "holder_pid").read_text() != holder:
+    # A token released or reclaimed during the memory wait leaves no holder_pid,
+    # or a holder that recorded none: either way this run no longer holds it.
+    try:
+        recorded = (lock / "holder_pid").read_text()
+    except OSError:
+        recorded = ""
+    if recorded != holder:
+        print("verify.sh: this run lost the cargo token before its step started; run it again.",
+              file=sys.stderr)
         sys.exit(125)
     record = lock / f"owned.{os.getpid()}.tmp"
     record.write_text(json.dumps({"group": os.getpid(), "start": identity(os.getpid())}))

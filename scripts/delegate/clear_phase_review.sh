@@ -33,6 +33,10 @@ FILES=(
   "${SESSION_DIR}"/review_findings_*
   "${SESSION_DIR}"/review_agent_*
   "${SESSION_DIR}"/review_status_*
+  # A launch that names its phase keeps its review files in that phase's directory,
+  # so only this phase's are cleared and a phase running beside it keeps its own.
+  "${SESSION_DIR}/phases/${PHASE_ID}"/review_*
+  "${SESSION_DIR}/phases/${PHASE_ID}"/ux_shots_*
 )
 
 if ((${#FILES[@]})); then

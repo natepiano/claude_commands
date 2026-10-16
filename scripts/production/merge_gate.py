@@ -12,8 +12,8 @@ OS allocation limit; unexpected job growth can still exceed the cap.
 --tests-only runs the same suite runner without performing any git operations.
 A unit checkpoint commit without its Change-Review line is refused before the merge. After the
 push, each visible change becomes a row in the change-review list that --change-review names, or
-that --production's `- **Change review:**` line names; the gate writes that file and never
-commits it.
+--production's top-level showrunner keeps (`change_review.list_path`), with the doc stamped into
+its frontmatter; the first row creates a missing list, and the list commits itself in its vault.
 """
 from __future__ import annotations
 
@@ -502,30 +502,40 @@ def merge_checkpoint(args: GateArguments) -> int:
     _ = checked_git(repo, "push", "origin", str(args.merge_branch))
     print(f"Pushed {args.merge_branch}: {checked_git(repo, 'rev-parse', '--short', 'HEAD')}", flush=True)
     if review_list is not None:
-        record_changes(repo, review_list, commits, str(args.merge_branch))
+        record_changes(repo, review_list, Path(str(args.production)).expanduser(), commits, str(args.merge_branch))
     if args.promote:
         promote(args)
     return 0
 
 
 def change_review_list(args: GateArguments) -> Path | None:
-    """The list the merge adds rows to: --change-review, else the production doc's header, else none."""
+    """The list the merge adds rows to: --change-review, else the production's, else none.
+
+    Rows always name their production, so --change-review needs --production too.
+    """
+    if not args.production:
+        if args.change_review:
+            raise GateRefused("--change-review needs --production: every row's list names its production")
+        return None
     if args.change_review:
         return Path(str(args.change_review)).expanduser()
-    if not args.production:
-        return None
     try:
-        return change_review.list_path(Path(str(args.production)).expanduser())
+        found = change_review.list_path(Path(str(args.production)).expanduser())
     except OSError as error:
         raise GateRefused(f"production doc unreadable: {error}") from error
+    if found is None:
+        print("Change review: the production doc has no Change review line; no rows written", flush=True)
+    return found
 
 
-def record_changes(repo: Path, review_list: Path, commits: list[change_review.Commit], merge_branch: str) -> None:
+def record_changes(repo: Path, review_list: Path, production: Path, commits: list[change_review.Commit],
+                   merge_branch: str) -> None:
     """Add a row per visible change to the list, then name any landed merge still missing its rows."""
     merged = checked_git(repo, "rev-parse", f"--short={change_review.SHORT}", "HEAD")
     try:
-        rows = change_review.append_rows(review_list, change_review.visible(commits), change_review.today(), merged)
-        drifted = change_review.drift(repo, merge_branch, review_list.read_text(encoding="utf-8"), change_review.LANDED)
+        rows = change_review.append_rows(review_list, change_review.visible(commits), change_review.today(), merged,
+                                         production)
+        drifted = change_review.drift(repo, merge_branch, change_review.read(review_list), change_review.LANDED)
     except (change_review.ChangeReviewError, OSError) as error:
         raise GateRefused(f"pushed {merged}; change review list {review_list} not written: {error}") from error
     for row in rows:
