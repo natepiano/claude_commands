@@ -80,6 +80,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Literal, NoReturn, NotRequired, TextIO, TypedDict, cast, final
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from scripts.accounts.role_map import role_map_command, RoleMapUnavailable, RoleAccountUnavailable  # noqa: E402
 from scripts.lib import unit_runs
 from scripts.message import sessions
 from scripts.usage import agents_log
@@ -3329,6 +3330,7 @@ def _release_other_worker_writers(
     return _ReleasedWorkerThread()
 
 
+@role_map_command
 def _move_resident(
     args: argparse.Namespace, session_dir: str, name: str, thread_id: str, client: Client,
     *, message: str = "",
@@ -4514,6 +4516,7 @@ def _notify_holder(session_id: str, line: str, kind: CodexNoticeKind) -> None:
         print(f"codex_mesh: could not tell session {session_id}: {sent.stderr.strip()}", file=sys.stderr)
 
 
+@role_map_command
 def command_signin_changed(args: argparse.Namespace) -> int:
     """Move every run off an app-server started before the Codex sign-in last changed.
 
@@ -5374,7 +5377,11 @@ def main(argv: list[str] | None = None) -> int:
 
     args = parser.parse_args(argv)
     handler = cast("Callable[[argparse.Namespace], int]", _attr(args, "handler"))
-    return handler(args)
+    try:
+        return handler(args)
+    except (RoleMapUnavailable, RoleAccountUnavailable) as error:
+        print(error, file=sys.stderr)
+        return 1
 
 
 if __name__ == "__main__":

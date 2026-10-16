@@ -268,12 +268,11 @@ def read_journal() -> list[JournalEntry]:
                     label = numbered(record.get("source_label", record.get("label")), tool)
                     if isinstance(label, str):
                         return label
-        if tool == "claude":
-            from scripts.whoami.account import ResolvedHistoryLabel
-            resolver = cast(HistoryResolver, cast(object, import_module("scripts.accounts.accounts")))
-            resolved = resolver.resolve_history_label("default", entry["at"], login=recorded_login if isinstance(recorded_login, str) else "")
-            if isinstance(resolved, ResolvedHistoryLabel):
-                return resolved.label
+        from scripts.whoami.account import ResolvedHistoryLabel
+        resolver = cast(HistoryResolver, cast(object, import_module("scripts.accounts.accounts")))
+        resolved = resolver.resolve_history_label(f"~/.{tool}", entry["at"], login=recorded_login if isinstance(recorded_login, str) else "")
+        if isinstance(resolved, ResolvedHistoryLabel):
+            return resolved.label
         at = datetime.fromisoformat(entry["at"])
         matching = sorted((item for item in evidence if item.tool == tool and item.at <= at), key=lambda item: item.at)
         return numbered(matching[-1].label, tool) if matching else HomeAccountUnresolved(home)
@@ -299,7 +298,7 @@ def read_journal() -> list[JournalEntry]:
             entry = _canonical_entry(cast(MoveEntry, value))
             fields: dict[str, object] = dict(entry)
             for field in ("from", "to", "label"):
-                if fields.get(field) in ("default", "~/.claude", str(Path.home() / ".claude")):
+                if fields.get(field) in ("default", f"~/.{entry['tool']}", str(homes[entry["tool"]])):
                     fields[field] = historical(entry, field)
             if fields["kind"] == "requested":
                 _ = fields.setdefault("cause", "refusal")

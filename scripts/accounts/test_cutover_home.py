@@ -2,13 +2,16 @@
 from __future__ import annotations
 
 import ctypes
+import base64
 import io
 import json
 import os
+import shlex
 import subprocess
 import sys
 import tempfile
 import unittest
+from collections.abc import Callable, Sequence
 from contextlib import redirect_stderr, redirect_stdout
 from datetime import datetime, timezone
 from pathlib import Path
@@ -16,8 +19,9 @@ from typing import cast, override
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
-from scripts.accounts import accounts
+from scripts.accounts import accounts, role_map
 from scripts.message import sessions
+from scripts.whoami import agent_accounts
 from scripts.whoami.test_agent_accounts import ServiceKeychain, folder_service
 import account
 
@@ -246,11 +250,448 @@ class HomeCutoverTests(unittest.TestCase):
         self.assertIsNone(account.claude_account(self.home / ".claude"))
 
 
+class CodexHomeCutoverTests(unittest.TestCase):
+    """Only a rename transfers the scratch login, with both directions recoverable."""
+
+    home: Path = Path()
+    source: Path = Path()
+    target: Path = Path()
+    journal: Path = Path()
+    auth_inode: int = 0
+    output: io.StringIO = io.StringIO()
+    errors: io.StringIO = io.StringIO()
+    process_lister: Callable[[], list[accounts.CodexHomeProcess]] = staticmethod(accounts.list_codex_home_processes)
+
+    @override
+    def setUp(self) -> None:
+        self.home = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        _ = cast(object, self.enterContext(patch.dict(os.environ, {
+            "HOME": str(self.home), "AGENT_NOTES_DIR": str(self.home / "notes")}, clear=True)))
+        _ = self.enterContext(patch.object(role_map, "is_role_map_host", return_value=True))
+        self.process_lister = accounts.list_codex_home_processes
+        _ = self.enterContext(patch.object(accounts, "list_codex_home_processes", return_value=[]))
+        _ = self.enterContext(patch.object(subprocess, "run", side_effect=AssertionError("no real process or keychain calls")))
+        self.source = self.home / ".codex"
+        self.target = self.home / ".codex2"
+        self.source.mkdir()
+        (self.home / "notes").mkdir()
+        _ = (self.home / "notes/codex2.md").write_text("---\nlogin: codex-cutover@example.invalid\n---\n")
+        _ = (self.home / "notes/codex3.md").write_text("---\nlogin: other@example.invalid\n---\n")
+        claims = base64.urlsafe_b64encode(json.dumps({"email": "codex-cutover@example.invalid"}).encode()).decode().rstrip("=")
+        # Synthetic identity only; assertions inspect its inode, never credential bytes.
+        _ = (self.source / "auth.json").write_text(json.dumps({"tokens": {"id_token": f"header.{claims}.signature"}}))
+        self.auth_inode = (self.source / "auth.json").stat().st_ino
+        _ = (self.source / "config.toml").write_text('model = "fixture"\n')
+        (self.source / "sessions").mkdir()
+        _ = (self.source / "sessions/kept.jsonl").write_text("synthetic session seed\n")
+        self.journal = self.home / ".local/state/accounts/cutover-codex-home.json"
+        self.output, self.errors = io.StringIO(), io.StringIO()
+        _ = self.enterContext(redirect_stdout(self.output))
+        _ = self.enterContext(redirect_stderr(self.errors))
+
+    def run_cutover(self, *, undo: bool = False) -> int:
+        return accounts.main(["cutover-home", "codex2", *(["--undo"] if undo else [])])
+
+    def journal_record(self) -> dict[str, str]:
+        return cast(dict[str, str], json.loads(self.journal.read_text()))
+
+    def history(self) -> list[dict[str, str]]:
+        configuration = cast(dict[str, object], json.loads(accounts.accounts_config_file().read_text()))
+        return cast(list[dict[str, str]], configuration["home_cutovers"])
+
+    def assert_login_moved(self) -> None:
+        self.assertFalse((self.source / "auth.json").exists())
+        self.assertEqual((self.target / "auth.json").stat().st_ino, self.auth_inode)
+        self.assertEqual(self.journal_record()["state"], "complete")
+        self.assertEqual(len(self.history()), 1)
+        self.assertEqual(self.history()[0], {key: self.journal_record()[key] for key in ("label", "login", "at")})
+        selected = agent_accounts.codex_account_home("codex2")
+        self.assertIsInstance(selected, agent_accounts.CodexHomeHoldingLogin)
+        self.assertEqual(selected.home, self.target)
+
+    def test_codex_cutover_prepares_shared_links_and_renames_login_with_dated_history(self) -> None:
+        original_seed = (self.source / "config.toml").read_bytes()
+        began = datetime.now(timezone.utc)
+        self.assertEqual(self.run_cutover(), 0)
+        self.assert_login_moved()
+        self.assertTrue(began <= datetime.fromisoformat(self.history()[0]["at"]) <= datetime.now(timezone.utc))
+        for name in ("config.toml", "sessions"):
+            self.assertTrue((self.target / name).is_symlink())
+            self.assertEqual((self.target / name).resolve(), self.source / name)
+        self.assertEqual((self.source / "config.toml").read_bytes(), original_seed)
+        self.assertEqual((self.target / "sessions/kept.jsonl").read_text(), "synthetic session seed\n")
+        self.assertFalse((self.home / ".local/state/accounts/cutover-home.json").exists())
+
+    def test_plain_codex_setup_keeps_duplicate_login_refusal_but_cutover_can_prepare_the_home(self) -> None:
+        self.assertTrue(any("already holds its login" in problem for problem in accounts.setup("codex2")))
+        self.assertFalse(self.target.exists())
+        self.assertEqual(self.run_cutover(), 0)
+        self.assert_login_moved()
+
+    def test_complete_codex_cutover_rerun_changes_no_identity_journal_or_history(self) -> None:
+        self.assertEqual(self.run_cutover(), 0)
+        before = (self.journal.read_bytes(), accounts.accounts_config_file().read_bytes(),
+                  (self.target / "auth.json").stat())
+        with patch.object(accounts, "list_codex_home_processes", side_effect=AssertionError("completed move needs no process check")):
+            self.assertEqual(self.run_cutover(), 0)
+        self.assertEqual((self.journal.read_bytes(), accounts.accounts_config_file().read_bytes(),
+                          (self.target / "auth.json").stat()), before)
+
+    def test_completed_codex_cutover_can_move_a_new_legacy_login_to_its_own_numbered_home(self) -> None:
+        self.assertEqual(self.run_cutover(), 0)
+        first = self.history()[0]
+        claims = base64.urlsafe_b64encode(json.dumps({"email": "other@example.invalid"}).encode()).decode().rstrip("=")
+        _ = (self.source / "auth.json").write_text(json.dumps({"tokens": {"id_token": f"header.{claims}.signature"}}))
+        replacement_inode = (self.source / "auth.json").stat().st_ino
+        self.assertEqual(accounts.main(["cutover-home", "codex3"]), 0)
+        self.assertFalse((self.source / "auth.json").exists())
+        self.assertEqual((self.home / ".codex3/auth.json").stat().st_ino, replacement_inode)
+        self.assertEqual((self.target / "auth.json").stat().st_ino, self.auth_inode)
+        self.assertEqual(self.journal_record()["label"], "codex3")
+        self.assertEqual(self.journal_record()["state"], "complete")
+        self.assertEqual(self.history(), [first, {key: self.journal_record()[key] for key in ("label", "login", "at")}])
+
+    def test_completed_cutover_with_a_new_source_login_still_refuses_an_occupied_numbered_home(self) -> None:
+        self.assertEqual(self.run_cutover(), 0)
+        before = (self.journal.read_bytes(), accounts.accounts_config_file().read_bytes())
+        _ = (self.source / "auth.json").write_text("synthetic replacement identity")
+        replacement_inode = (self.source / "auth.json").stat().st_ino
+        with patch.object(agent_accounts, "codex_email_on_disk", return_value="codex-cutover@example.invalid"):
+            self.assertNotEqual(self.run_cutover(), 0)
+        self.assertIn("already holds auth.json", self.errors.getvalue())
+        self.assertEqual((self.journal.read_bytes(), accounts.accounts_config_file().read_bytes()), before)
+        self.assertEqual((self.source / "auth.json").stat().st_ino, replacement_inode)
+        self.assertEqual((self.target / "auth.json").stat().st_ino, self.auth_inode)
+
+    def test_completed_cutover_revalidates_the_new_source_login_against_the_requested_account(self) -> None:
+        self.assertEqual(self.run_cutover(), 0)
+        os.replace(self.target / "auth.json", self.source / "auth.json")
+        before = (self.journal.read_bytes(), accounts.accounts_config_file().read_bytes())
+        self.assertNotEqual(accounts.main(["cutover-home", "codex3"]), 0)
+        self.assertEqual(self.errors.getvalue(), "accounts: ~/.codex does not hold codex3's login\n")
+        self.assertEqual((self.journal.read_bytes(), accounts.accounts_config_file().read_bytes()), before)
+        self.assertEqual((self.source / "auth.json").stat().st_ino, self.auth_inode)
+        self.assertFalse((self.home / ".codex3").exists())
+
+    def test_undone_codex_cutover_starts_a_fresh_move_with_new_dated_history(self) -> None:
+        self.assertEqual(self.run_cutover(), 0)
+        first = self.history()[0]
+        self.assertEqual(self.run_cutover(undo=True), 0)
+        self.assertEqual(self.run_cutover(), 0)
+        self.assertFalse((self.source / "auth.json").exists())
+        self.assertEqual((self.target / "auth.json").stat().st_ino, self.auth_inode)
+        self.assertEqual(self.journal_record()["state"], "complete")
+        self.assertEqual(len(self.history()), 2)
+        self.assertEqual(self.history()[0], first)
+        self.assertGreater(self.history()[1]["at"], first["at"])
+
+    def test_codex_undo_renames_login_back_and_preserves_cutover_history(self) -> None:
+        self.assertEqual(self.run_cutover(), 0)
+        history = accounts.accounts_config_file().read_bytes()
+        self.assertEqual(self.run_cutover(undo=True), 0)
+        self.assertEqual((self.source / "auth.json").stat().st_ino, self.auth_inode)
+        self.assertFalse((self.target / "auth.json").exists())
+        self.assertEqual(self.journal_record()["state"], "undone")
+        self.assertEqual(accounts.accounts_config_file().read_bytes(), history)
+        self.assertEqual(agent_accounts.codex_account_home("codex2").home, self.source)
+        self.assertEqual(self.run_cutover(undo=True), 0)
+
+    def test_codex_processes_on_legacy_home_refuse_before_journal_preparation_or_rename(self) -> None:
+        processes = [
+            accounts.CodexHomeProcess(321, "codex app-server daemon", account.ProcessWithoutCodexHome()),
+            accounts.CodexHomeProcess(654, "codex --remote-control", account.ProcessCodexHome(self.source)),
+        ]
+        with patch.object(accounts, "list_codex_home_processes", return_value=processes):
+            self.assertNotEqual(self.run_cutover(), 0)
+        for process in processes:
+            self.assertIn(f"{process.pid} ({process.command})", self.errors.getvalue())
+        self.assertIn("stop it, then rerun cutover-home", self.errors.getvalue())
+        self.assertFalse(self.journal.exists())
+        self.assertFalse(self.target.exists())
+        self.assertFalse(accounts.accounts_config_file().exists())
+        self.assertEqual((self.source / "auth.json").stat().st_ino, self.auth_inode)
+
+    def test_codex_process_on_numbered_home_refuses_undo_without_changing_completed_move(self) -> None:
+        self.assertEqual(self.run_cutover(), 0)
+        before = (self.journal.read_bytes(), accounts.accounts_config_file().read_bytes())
+        process = accounts.CodexHomeProcess(321, "codex app-server daemon", account.ProcessCodexHome(self.target))
+        with patch.object(accounts, "list_codex_home_processes", return_value=[process]):
+            self.assertNotEqual(self.run_cutover(undo=True), 0)
+        self.assertIn("321 (codex app-server daemon)", self.errors.getvalue())
+        self.assertIn("stop it, then rerun cutover-home", self.errors.getvalue())
+        self.assertEqual((self.journal.read_bytes(), accounts.accounts_config_file().read_bytes()), before)
+        self.assert_login_moved()
+
+    def test_unreadable_codex_process_environment_refuses_forward_and_undo_without_mutation(self) -> None:
+        process = accounts.CodexHomeProcess(987, "codex app-server daemon", account.ProcessEnvironmentUnread("denied"))
+        with patch.object(accounts, "list_codex_home_processes", return_value=[process]):
+            self.assertNotEqual(self.run_cutover(), 0)
+        self.assertFalse(self.journal.exists())
+        self.assertFalse(self.target.exists())
+        self.assertEqual((self.source / "auth.json").stat().st_ino, self.auth_inode)
+        self.assertIn("cannot read environment of process 987 (codex app-server daemon)", self.errors.getvalue())
+        self.assertIn("stop it, then rerun cutover-home", self.errors.getvalue())
+        self.assertEqual(self.run_cutover(), 0)
+        before = self.journal.read_bytes()
+        with patch.object(accounts, "list_codex_home_processes", return_value=[process]):
+            self.assertNotEqual(self.run_cutover(undo=True), 0)
+        self.assertEqual(self.journal.read_bytes(), before)
+        self.assert_login_moved()
+
+    def test_codex_process_on_another_home_does_not_block_forward_or_undo(self) -> None:
+        process = accounts.CodexHomeProcess(321, "codex exec fixture", account.ProcessCodexHome(self.home / ".codex3"))
+        with patch.object(accounts, "list_codex_home_processes", return_value=[process]):
+            self.assertEqual(self.run_cutover(), 0)
+            self.assert_login_moved()
+            self.assertEqual(self.run_cutover(undo=True), 0)
+        self.assertEqual((self.source / "auth.json").stat().st_ino, self.auth_inode)
+
+    def test_wrong_source_login_refuses_without_preparing_target_or_writing_journal(self) -> None:
+        self.assertNotEqual(accounts.main(["cutover-home", "codex3"]), 0)
+        self.assertIn("~/.codex does not hold codex3's login", self.errors.getvalue())
+        self.assertFalse(self.journal.exists())
+        self.assertFalse((self.home / ".codex3").exists())
+        self.assertEqual((self.source / "auth.json").stat().st_ino, self.auth_inode)
+
+    def test_missing_source_login_without_journal_refuses_without_creating_a_target(self) -> None:
+        (self.source / "auth.json").unlink()
+        self.assertNotEqual(self.run_cutover(), 0)
+        self.assertFalse(self.journal.exists())
+        self.assertFalse(self.target.exists())
+        self.assertIn("home login", self.errors.getvalue())
+
+    def test_existing_numbered_auth_is_never_overwritten_by_forward_cutover(self) -> None:
+        self.target.mkdir()
+        _ = (self.target / "auth.json").write_text("synthetic occupied identity")
+        occupied = (self.target / "auth.json").stat().st_ino
+        self.assertNotEqual(self.run_cutover(), 0)
+        self.assertIn("already holds auth.json", self.errors.getvalue())
+        self.assertFalse(self.journal.exists())
+        self.assertEqual((self.target / "auth.json").stat().st_ino, occupied)
+        self.assertEqual((self.source / "auth.json").stat().st_ino, self.auth_inode)
+
+    def test_codex_cutover_on_mac_bypasses_claude_keychain_checks_in_both_directions(self) -> None:
+        with (patch.object(sys, "platform", "darwin"),
+              patch.object(accounts, "_mac_login_keychain_visible", side_effect=AssertionError("Codex never uses keychain"))):
+            self.assertEqual(self.run_cutover(), 0)
+            self.assert_login_moved()
+            self.assertEqual(self.run_cutover(undo=True), 0)
+        self.assertEqual((self.source / "auth.json").stat().st_ino, self.auth_inode)
+
+    def test_durable_moving_journal_before_rename_finishes_on_rerun(self) -> None:
+        replace = os.replace
+        def interrupted(source: str | os.PathLike[str], destination: str | os.PathLike[str]) -> None:
+            if Path(source) == self.source / "auth.json":
+                self.assertEqual(self.journal_record()["state"], "moving")
+                raise OSError("synthetic interruption before rename")
+            replace(source, destination)
+        with patch.object(os, "replace", side_effect=interrupted):
+            self.assertNotEqual(self.run_cutover(), 0)
+        self.assertEqual(self.journal_record()["state"], "moving")
+        self.assertEqual((self.source / "auth.json").stat().st_ino, self.auth_inode)
+        self.assertEqual(self.run_cutover(), 0)
+        self.assert_login_moved()
+
+    def test_pending_codex_cutover_refuses_a_changed_or_unreadable_source_login_without_mutation(self) -> None:
+        journal = {"label": "codex2", "login": "codex-cutover@example.invalid",
+                   "at": "2026-10-16T12:00:00Z", "state": "moving"}
+        self.journal.parent.mkdir(parents=True)
+        _ = self.journal.write_text(json.dumps(journal))
+        before = (self.journal.read_bytes(), (self.source / "auth.json").stat())
+        for login in ("replacement@example.invalid", ""):
+            with self.subTest(readable=bool(login)):
+                _ = self.errors.seek(0)
+                _ = self.errors.truncate()
+                with patch.object(agent_accounts, "codex_email_on_disk", return_value=login):
+                    self.assertNotEqual(self.run_cutover(), 0)
+                self.assertEqual(self.errors.getvalue(),
+                    "accounts: ~/.codex now holds another login than the recorded cutover; undo it first\n")
+                self.assertEqual((self.journal.read_bytes(), (self.source / "auth.json").stat()), before)
+                self.assertFalse(self.target.exists())
+                self.assertFalse(accounts.accounts_config_file().exists())
+
+    def test_pending_codex_cutover_accepts_the_recorded_source_login_case_insensitively(self) -> None:
+        journal = {"label": "codex2", "login": "CODEX-CUTOVER@EXAMPLE.INVALID",
+                   "at": "2026-10-16T12:00:00Z", "state": "moving"}
+        self.journal.parent.mkdir(parents=True)
+        _ = self.journal.write_text(json.dumps(journal))
+        self.assertEqual(self.run_cutover(), 0)
+        self.assert_login_moved()
+
+    def test_mac_assignment_prompt_cannot_hide_a_process_using_the_legacy_home(self) -> None:
+        listing = subprocess.CompletedProcess([], 0, "321 codex\n", "")
+        arguments = ("/Applications/Codex Tools/codex", "exec", "CODEX_HOME=/scratch/other", "-c", "key=value")
+        payload = (len(arguments).to_bytes(4, sys.byteorder, signed=True)
+                   + os.fsencode(arguments[0]) + b"\0\0"
+                   + b"\0".join(os.fsencode(word) for word in arguments) + b"\0HOME=/scratch\0")
+        with (patch.object(sys, "platform", "darwin"),
+              patch.object(subprocess, "run", return_value=listing),
+              patch.object(account, "_kern_procargs2", return_value=payload),
+              patch.object(accounts, "list_codex_home_processes", side_effect=self.process_lister)):
+            self.assertNotEqual(self.run_cutover(), 0)
+        self.assertIn(f"321 ({shlex.join(arguments)}) uses {self.source}", self.errors.getvalue())
+        self.assertIn("stop it, then rerun cutover-home", self.errors.getvalue())
+        self.assertFalse(self.journal.exists())
+        self.assertFalse(self.target.exists())
+        self.assertFalse(accounts.accounts_config_file().exists())
+        self.assertEqual((self.source / "auth.json").stat().st_ino, self.auth_inode)
+
+    def test_interruption_after_auth_rename_recovers_when_source_is_already_gone(self) -> None:
+        replace = os.replace
+        def interrupted(source: str | os.PathLike[str], destination: str | os.PathLike[str]) -> None:
+            replace(source, destination)
+            if Path(source) == self.source / "auth.json":
+                raise OSError("synthetic interruption after rename")
+        with patch.object(os, "replace", side_effect=interrupted):
+            self.assertNotEqual(self.run_cutover(), 0)
+        self.assertFalse((self.source / "auth.json").exists())
+        self.assertEqual(self.journal_record()["state"], "moving")
+        self.assertEqual(self.run_cutover(), 0)
+        self.assert_login_moved()
+
+    def test_interruption_after_history_write_reruns_without_duplicate_evidence(self) -> None:
+        record = accounts._record_home_cutover  # pyright: ignore[reportPrivateUsage]
+        def interrupted(journal: accounts.HomeCutover) -> None:
+            record(journal)
+            raise OSError("synthetic interruption after history")
+        with patch.object(accounts, "_record_home_cutover", side_effect=interrupted):
+            self.assertNotEqual(self.run_cutover(), 0)
+        before = accounts.accounts_config_file().read_bytes()
+        self.assertEqual(self.journal_record()["state"], "moving")
+        self.assertEqual(self.run_cutover(), 0)
+        self.assert_login_moved()
+        self.assertEqual(accounts.accounts_config_file().read_bytes(), before)
+
+    def test_interruption_after_undo_rename_finishes_when_numbered_auth_is_already_gone(self) -> None:
+        self.assertEqual(self.run_cutover(), 0)
+        replace = os.replace
+        def interrupted(source: str | os.PathLike[str], destination: str | os.PathLike[str]) -> None:
+            replace(source, destination)
+            if Path(source) == self.target / "auth.json":
+                raise OSError("synthetic interruption after undo rename")
+        with patch.object(os, "replace", side_effect=interrupted):
+            self.assertNotEqual(self.run_cutover(undo=True), 0)
+        self.assertEqual(self.journal_record()["state"], "undoing")
+        self.assertEqual((self.source / "auth.json").stat().st_ino, self.auth_inode)
+        self.assertEqual(self.run_cutover(undo=True), 0)
+        self.assertFalse((self.target / "auth.json").exists())
+        self.assertEqual(self.journal_record()["state"], "undone")
+        self.assertEqual(len(self.history()), 1)
+
+    def test_moving_journal_with_both_auth_files_gone_reports_loss_without_false_completion(self) -> None:
+        journal = {"label": "codex2", "login": "codex-cutover@example.invalid",
+                   "at": "2026-10-16T12:00:00Z", "state": "moving"}
+        self.journal.parent.mkdir(parents=True)
+        _ = self.journal.write_text(json.dumps(journal))
+        (self.source / "auth.json").unlink()
+        before = self.journal.read_bytes()
+        self.assertNotEqual(self.run_cutover(), 0)
+        self.assertIn("neither Codex home holds auth.json", self.errors.getvalue())
+        self.assertEqual(self.journal.read_bytes(), before)
+        self.assertFalse(accounts.accounts_config_file().exists())
+
+    def test_dated_codex_cutover_resolves_historical_home_but_not_later_or_claude_records(self) -> None:
+        self.assertEqual(self.run_cutover(), 0)
+        at = self.journal_record()["at"]
+        for spelling in ("~/.codex", str(self.source)):
+            self.assertEqual(accounts.resolve_history_label(spelling, "2026-01-01T00:00:00Z"),
+                             accounts.ResolvedHistoryLabel("codex2"))
+            for later in (at, "2999-01-01T00:00:00Z"):
+                self.assertIsInstance(accounts.resolve_history_label(spelling, later), accounts.HistoricalAccountUnresolved)
+        self.assertIsInstance(accounts.resolve_history_label("~/.claude", "2026-01-01T00:00:00Z"),
+                              accounts.HistoricalAccountUnresolved)
+
+    def test_status_names_legacy_login_only_until_cutover_and_omits_signed_out_default_row(self) -> None:
+        with patch.object(accounts, "_stored_usage", return_value={}):
+            before = accounts.status_report()
+            self.assertIn("~/.codex holds a login; run accounts.py cutover-home codex2", before)
+            self.assertEqual(self.run_cutover(), 0)
+            after = accounts.status_report()
+            self.assertNotIn("~/.codex holds a login", after)
+            self.assertNotIn("~/.codex", [row.folder for row in accounts.codex_statuses(self.target)])
+            self.assertIn("~/.codex2", after)
+            self.assertEqual(self.run_cutover(undo=True), 0)
+            self.assertIn("~/.codex holds a login; run accounts.py cutover-home codex2", accounts.status_report())
+
+
+class CodexCutoverProcessListingTests(unittest.TestCase):
+    """Platform adapters preserve actionable commands without exposing environments."""
+
+    def test_linux_codex_listing_keeps_command_and_reads_only_candidate_home_settings(self) -> None:
+        listing = subprocess.CompletedProcess([], 0,
+            "321 codex codex app-server daemon\n654 codex /opt/codex --remote-control\n777 python python worker.py\n", "")
+        settings = [account.ProcessWithoutCodexHome(), account.ProcessEnvironmentUnread("denied")]
+        with (patch.object(sys, "platform", "linux"),
+              patch.object(subprocess, "run", return_value=listing),
+              patch.object(account, "process_codex_home", side_effect=settings) as read_home):
+            found = accounts.list_codex_home_processes()
+        self.assertEqual([process.pid for process in found], [321, 654])
+        self.assertEqual([process.command for process in found], ["codex app-server daemon", "/opt/codex --remote-control"])
+        self.assertEqual([process.setting for process in found], settings)
+        self.assertEqual([call.args for call in read_home.call_args_list], [(321,), (654,)])
+
+    def test_mac_codex_listing_keeps_full_kernel_argv_without_environment_and_fails_closed_on_unreadable_records(self) -> None:
+        arguments = {
+            321: ("/Applications/Codex Tools/codex", "-c", "key=value", "exec", "user's prompt"),
+            654: ("codex", "exec", "CODEX_HOME=/scratch/prompt"),
+        }
+        environments = {
+            321: b"HOME=/scratch\0CODEX_HOME=/scratch/selected home\0FIXTURE_VALUE=private-marker\0",
+            654: b"HOME=/scratch\0FIXTURE_VALUE=private-marker\0",
+        }
+        def kernel_record(pid: int) -> bytes:
+            if pid == 987:
+                raise PermissionError("denied")
+            argv = arguments[pid]
+            return (len(argv).to_bytes(4, sys.byteorder, signed=True)
+                    + os.fsencode(argv[0]) + b"\0\0\0"
+                    + b"\0".join(os.fsencode(word) for word in argv) + b"\0" + environments[pid])
+        listing = subprocess.CompletedProcess([], 0, "  321 codex           \n  654 codex           \n  987 codex           \n  777 python          \n  888 Codex (Service) \n", "")
+        with (patch.object(sys, "platform", "darwin"),
+              patch.object(subprocess, "run", return_value=listing) as listed,
+              patch.object(account, "_kern_procargs2", side_effect=kernel_record),
+              patch.object(account, "process_codex_home", wraps=account.process_codex_home) as read_home):
+            found = accounts.list_codex_home_processes()
+        listed.assert_called_once_with(("ps", "-u", str(os.getuid()), "-o", "pid=,ucomm="),
+                                       capture_output=True, text=True, check=True, timeout=5)
+        self.assertEqual([process.pid for process in found], [321, 654, 987])
+        self.assertEqual([process.command for process in found],
+                         [shlex.join(arguments[321]), shlex.join(arguments[654]), "codex"])
+        self.assertEqual(found[0].setting, account.ProcessCodexHome(Path("/scratch/selected home")))
+        self.assertIsInstance(found[1].setting, account.ProcessWithoutCodexHome)
+        self.assertIsInstance(found[2].setting, account.ProcessEnvironmentUnread)
+        self.assertEqual([call.args for call in read_home.call_args_list], [(321,), (654,), (987,)])
+        self.assertTrue(all("private-marker" not in process.command for process in found))
+
+    def test_codex_process_listing_failure_refuses_instead_of_assuming_no_live_process(self) -> None:
+        with patch.object(subprocess, "run", side_effect=PermissionError("denied")):
+            with self.assertRaisesRegex(accounts.AccountsError, "cannot list Codex processes; no login moved"):
+                _ = accounts.list_codex_home_processes()
+
+
+class CutoverKeychain(ServiceKeychain):
+    """A service-only fake with the effective keychain search list."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.search_list: tuple[Path, ...] = ()
+        self.search_calls: list[tuple[str, ...]] = []
+
+    @override
+    def run(self, arguments: Sequence[str], **_options: object) -> subprocess.CompletedProcess[str]:
+        argv = tuple(arguments)
+        if argv == ("security", "list-keychains"):
+            self.search_calls.append(argv)
+            return subprocess.CompletedProcess(argv, 0,
+                "".join(f"    {json.dumps(str(path))}\n" for path in self.search_list), "")
+        return super().run(arguments, **_options)
+
+
 class MacHomeCutoverTests(unittest.TestCase):
     """A verified named login permits removal of the Mac's legacy local copy."""
 
     home: Path = Path()
-    keychain: ServiceKeychain = ServiceKeychain()
+    keychain: CutoverKeychain = CutoverKeychain()
     output: io.StringIO = io.StringIO()
     errors: io.StringIO = io.StringIO()
     identity: dict[str, str] = {}
@@ -260,7 +701,7 @@ class MacHomeCutoverTests(unittest.TestCase):
         self.home = Path(self.enterContext(tempfile.TemporaryDirectory()))
         self.enterContext(patch.dict(os.environ, {"HOME": str(self.home),
             "AGENT_NOTES_DIR": str(self.home / "notes")}, clear=True))
-        self.keychain = ServiceKeychain()
+        self.keychain = CutoverKeychain()
         _ = self.enterContext(patch.object(subprocess, "run", side_effect=self.keychain.run))
         _ = self.enterContext(patch.object(sys, "platform", "darwin"))
         _ = self.enterContext(patch.object(sessions, "live_sessions", return_value=[]))
@@ -272,6 +713,7 @@ class MacHomeCutoverTests(unittest.TestCase):
         self.initialize_home()
 
     def initialize_home(self) -> None:
+        self.keychain.search_list = (self.home / "Library/Keychains/login.keychain-db",)
         (self.home / ".claude").mkdir()
         (self.home / "notes").mkdir()
         _ = (self.home / "notes/claude2.md").write_text("---\nlogin: synthetic-owner@example.invalid\n---\n")
@@ -298,6 +740,38 @@ class MacHomeCutoverTests(unittest.TestCase):
 
     def deletes(self) -> list[tuple[str, ...]]:
         return [call for call in self.keychain.calls if call[1] == "delete-generic-password"]
+
+    def test_system_only_search_list_refuses_before_journal_identity_or_keychain_changes(self) -> None:
+        self.keychain.search_list = (Path("/Library/Keychains/System.keychain"),)
+        before = self.snapshot()
+        self.assertNotEqual(accounts.main(["cutover-home", "claude2"]), 0)
+        self.assertIn("accounts: this session cannot see the Mac's login keychain; "
+                      + "run cutover-home in a Terminal on the Mac", self.errors.getvalue())
+        self.assertTrue(self.snapshot() == before, "search-list refusal changed identity or keychain state")
+        self.assertFalse((self.home / ".local/state/accounts/cutover-home.json").exists())
+        self.assertEqual(self.keychain.calls, [])
+        self.assertEqual(self.keychain.search_calls, [("security", "list-keychains")])
+
+    def test_completed_cutover_undo_needs_no_login_keychain_or_keychain_calls(self) -> None:
+        original = self.snapshot()
+        self.assertEqual(accounts.main(["cutover-home", "claude2"]), 0)
+        self.keychain.search_list = (Path("/Library/Keychains/System.keychain"),)
+        self.keychain.calls.clear()
+        self.keychain.search_calls.clear()
+        entries_before = dict(self.keychain.entries)
+        self.assertEqual(accounts.main(["cutover-home", "--undo"]), 0)
+        restored = cast(dict[str, object], json.loads((self.home / ".claude.json").read_text()))
+        self.assertTrue(restored["oauthAccount"] == self.identity)
+        self.assertTrue((self.home / ".claude2/.claude.json").read_bytes() == original[1])
+        self.assertTrue(self.keychain.entries == entries_before, "undo changed keychain state")
+        self.assertEqual(self.keychain.calls, [])
+        self.assertEqual(self.keychain.search_calls, [])
+
+    def test_forward_cutover_accepts_the_legacy_login_keychain_filename(self) -> None:
+        self.keychain.search_list = (self.home / "Library/Keychains/login.keychain",)
+        self.assertEqual(accounts.main(["cutover-home", "claude2"]), 0)
+        self.assertIsInstance(account.home_account_state(), account.ConfigOnlyHome)
+        self.assertEqual(len(self.deletes()), 1)
 
     def test_completed_undo_allows_another_forward_cutover(self) -> None:
         self.assertEqual(accounts.main(["cutover-home", "claude2"]), 0)

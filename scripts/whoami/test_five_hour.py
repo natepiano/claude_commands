@@ -194,6 +194,7 @@ class AccountHoldTests(unittest.TestCase):
         before = {path.name: path.read_text() for path in five_hour.STATE.glob("*.notice")}
         self.sent.clear()
         b = self.readings(2, None)
+        assert isinstance(b.workers, accounts.CodexWorkersAccount)
         unknown = quota_alert.CodexAlertPassReadings(b.workers,
             UnknownCodexAccount(b.workers.home, "unreadable login"), b.checked_homes)
         _ = five_hour.watch([], codex_readings=unknown)
