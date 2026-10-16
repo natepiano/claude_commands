@@ -501,8 +501,11 @@ recording the result.
 
 <FindingsLedger>
 Use `python3 ~/.claude/scripts/delegate/findings.py <command> --session-dir
-"${SESSION_DIR}"` for confirmed style violations in the main review, or after
-<Synthesize/> confirms another issue.
+"${SESSION_DIR}" --phase "<phase id>"` for confirmed style violations in the
+main review, or after <Synthesize/> confirms another issue. Each open phase has
+its own ledger, and `--phase` names which one: with two phases open, a call
+naming none is refused. Every launch names its phase (<PassOwnership/>), so the
+launcher's own `landed` and `abandon` reach that phase's ledger.
 
 | Command | Purpose |
 | --- | --- |
@@ -872,9 +875,10 @@ one step and exits 0. `before` and `after` widen only that phase's reservation,
 with the ordering edge; `defer` records the answer and takes no paths, so the
 phase holds its dispatch on them. An id the ledger does not know is refused.
 A `duplicate_ordering_edge` refusal (exit 2) means that edge is already
-recorded: the answer stands, so do not repeat it. If another holder also
-conflicts, it is refused and records nothing: split the claim so each call
-meets one holder.
+recorded: the answer stands, so do not repeat it. When several holders
+conflict, name every one in the same claim, one flag each: `--before`,
+`--after` and `--defer` repeat once per holder and mix, as in `cargo-berth
+claim <paths> --reservation <id> --before <A> --after <B> --overlap-why "<why>"`.
 
 Every cargo-berth call is one plain command run in `${WORKING_DIR}`: no pipe,
 loop, `;`, `&&`, `$(...)`, redirect or env-var prefix. cargo-berth reads

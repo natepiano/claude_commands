@@ -884,8 +884,8 @@ it needs. Every other wait is yours to clear, and fast.
    what to run, and log the call. Each unit director runs its own cargo-berth
    commands. When a unit director sends an overlap, reply in that turn with the
    answer it records —
-   `--before`, `--after`, `--defer` or `--override` on the named holder — and a
-   one-line why.
+   `--before`, `--after`, `--defer` or `--override` on each named holder, all
+   in one claim — and a one-line why.
    1. The holding unit checkpoints what is green; merge it, and its
       reservations release.
    2. Release in batches: the holder releases what it is done with, you merge,
