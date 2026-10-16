@@ -1200,8 +1200,9 @@ def _dispatch(options: CommandLine) -> int:
                     record_lines.extend(_status_actions(outcome["records"], ownership))
                 if record_lines:
                     print("\n".join(record_lines))
-            for line in _unresolved_snapshot_lines(selected.login, status_ids):
-                print(line)
+                if index == 0:
+                    for line in _unresolved_snapshot_lines(selected.login, status_ids):
+                        print(line)
         return 0
     except SessionSelectionError as error:
         print(f"shutdown: {error}", file=sys.stderr)

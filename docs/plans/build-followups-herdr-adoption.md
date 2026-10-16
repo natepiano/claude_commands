@@ -257,7 +257,7 @@ Moved to unit `herdr-panes-unit`, run in parallel with Phase 5; shipped as `docs
 **Ruled out:**
 - A second parser of the vault's markdown; restoring an `agents down` session from the snapshot instead of its record.
 
-### Phase 10 — Phase 9 follow-ups: crash restore wording, status heading, failed herdr start  · status: todo
+### Phase 10 — Phase 9 follow-ups: crash restore wording, status heading, failed herdr start  · status: done
 
 **Depends on:** Phase 9
 

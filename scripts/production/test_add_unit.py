@@ -880,8 +880,34 @@ class AddUnitTests(ShutdownTestCase):
         result = self.cli("alpha", "--plan", "docs/plans/given.md")
         self.assertEqual(result.returncode, 1, result.stderr)
         self.assertIn("add_unit: the session is not ready:\n" + screen, result.stderr)
+        self.assertFalse(any(row[2:4] == ["server", "stop"] for row in self.herdr_calls()))
         self.assertFalse(any(row[2:4] in (["agent", "prompt"], ["pane", "send-keys"], ["pane", "send-text"])
                              for row in self.herdr_calls()))
+
+    def test_failed_unit_restore_stops_its_created_server_after_agent_exit(self) -> None:
+        prior = self.root / "prior-session"
+        prior.mkdir()
+        note = self.root / "restart-note"
+        _ = note.write_text("Resume this unit.")
+        with (patch.dict(os.environ, self.env),
+              patch.object(herdr, "start_agent", side_effect=herdr.AgentExited("restored-unit", "w1:p1")),
+              patch.object(herdr, "stop_session") as stopped):
+            request = add_unit.UnitLaunch(
+                production=add_unit.read_production(self.doc),
+                identity=add_unit.UnitIdentity("alpha-unit", "alpha"),
+                branch="build-followups-alpha", worktree=self.root / "project-alpha",
+                plan=add_unit.PlanGiven(Path("docs/plans/given.md")),
+                port=add_unit.OmittedCell(), owns=add_unit.OmittedCell(),
+                session=add_unit.ResumedSession("session-123", prior),
+                launch_kind=add_unit.UnitRestoreLaunch("session-123", note, "recorded-name", "alpha"),
+                timeout=90,
+            )
+            with self.assertRaises(herdr.AgentExited):
+                add_unit.launch_session(request, add_unit.DirectorAgent("opus", add_unit.DefaultEffort()),
+                                        "Resume this unit.", accounts.role_account("unit"))
+        stopped.assert_called_once_with("alpha")
+        self.assertTrue(any(row[:2] == ["--user", "--unit=herdr-alpha.service"] for row in self.herdr_calls()))
+        self.assertFalse(any(row[2:4] == ["agent", "prompt"] for row in self.herdr_calls()))
 
     def test_unit_launch_passes_a_typed_opening_prompt_once(self) -> None:
         with patch.object(herdr, "start_agent", wraps=herdr.start_agent) as start:

@@ -84,9 +84,27 @@ class FromTerminal(TypedDict):
     kind: Literal["terminal"]
 
 
+class RebootRecovery(TypedDict):
+    kind: Literal["reboot"]
+    last_seen: str
+
+
+class LostHostRecovery(TypedDict):
+    kind: Literal["host gone"]
+    last_seen: str
+
+
+class RecoveryEvidenceNotRecorded(TypedDict):
+    kind: Literal["not recorded"]
+
+
+RecoveryContext = RebootRecovery | LostHostRecovery | RecoveryEvidenceNotRecorded
+
+
 class FromSnapshot(TypedDict):
     kind: Literal["snapshot"]
     taken_at: str
+    recovery: RecoveryContext
 
 
 RequestOrigin = FromSession | FromTerminal | FromSnapshot
@@ -623,6 +641,12 @@ def _request_origin(value: object, place: str) -> RequestOrigin:
         )
     elif kind == "snapshot":
         _ = _utc_time(_required(values, "taken_at", place), f"{place}.taken_at")
+        if "recovery" not in values:
+            values["recovery"] = RecoveryEvidenceNotRecorded(kind="not recorded")
+        context = _mapping(values["recovery"], f"{place}.recovery")
+        signal = _kind(context, f"{place}.recovery", frozenset({"reboot", "host gone", "not recorded"}))
+        if signal != "not recorded":
+            _ = _utc_time(_required(context, "last_seen", place), f"{place}.recovery.last_seen")
     return cast(RequestOrigin, cast(object, values))
 
 
@@ -2048,9 +2072,14 @@ def snapshot_restore_record(snapshot: RecoverySnapshot, entry: SnapshotClaudeSes
     if item["agent"] != "claude":
         raise InvalidRecord("Codex snapshots require the Codex restore path, not a Claude shutdown record")
     at = checked["taken_at"]
+    context: RecoveryContext = RecoveryEvidenceNotRecorded(kind="not recorded")
+    if item.get("crash") == "reboot":
+        context = RebootRecovery(kind="reboot", last_seen=item["last_seen"])
+    elif item.get("crash") == "host gone":
+        context = LostHostRecovery(kind="host gone", last_seen=item["last_seen"])
     saved = SessionShutdown(
         login=checked["login"], label=checked["label"], machine=checked["machine"],
-        requested_at=at, request_id=f"recovery-{at}", requested_by=FromSnapshot(kind="snapshot", taken_at=at),
+        requested_at=at, request_id=f"recovery-{at}", requested_by=FromSnapshot(kind="snapshot", taken_at=at, recovery=context),
         hold="session", then="restart", force="now", alerts="user", probe=item["session"]["probe"],
         session=item["session"], workers=item["workers"], timers=item["timers"],
         settle_message=SettleMessageNotSent(kind="not sent"), where=WhereNotSaid(kind="not said"),
