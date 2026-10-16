@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import ctypes
 import json
 import os
 import shlex
@@ -11,6 +12,7 @@ import subprocess
 import sys
 import tempfile
 from dataclasses import dataclass
+from collections.abc import Callable
 from pathlib import Path
 from typing import Literal, TypedDict, cast
 
@@ -220,26 +222,66 @@ class ProcessEnvironmentUnread:
     reason: str
 
 
+@dataclass(frozen=True)
+class MacProcessRecord:
+    arguments: tuple[str, ...]
+    setting: ProcessCodexHome | ProcessWithoutCodexHome
+
+
+def _kern_procargs2(pid: int) -> bytes:
+    """Read one kernel argument record, without exposing it in diagnostics."""
+    query = (ctypes.c_int * 3)(1, 49, pid)  # CTL_KERN, KERN_PROCARGS2
+    buffer = ctypes.create_string_buffer(1024 * 1024)
+    size = ctypes.c_size_t(ctypes.sizeof(buffer))
+    try:
+        sysctl = cast(Callable[[object, int, object, object, object, int], int],
+                      ctypes.CDLL(None, use_errno=True).sysctl)
+    except AttributeError as error:
+        raise OSError("kernel process reader unavailable") from error
+    if sysctl(query, 3, buffer, ctypes.byref(size), None, 0) != 0:
+        raise OSError(ctypes.get_errno(), "kernel process record unavailable")
+    if size.value > ctypes.sizeof(buffer):
+        raise OSError("kernel process record exceeds buffer")
+    return buffer.raw[:size.value]
+
+
+def mac_process_record(pid: int) -> MacProcessRecord | ProcessEnvironmentUnread:
+    """Separate exactly argc arguments from the following environment strings."""
+    unread = ProcessEnvironmentUnread("process argument record could not be read")
+    try:
+        payload = _kern_procargs2(pid)
+    except OSError:
+        return unread
+    if len(payload) < 5 or not payload.endswith(b"\0"):
+        return unread
+    count = int.from_bytes(payload[:4], sys.byteorder, signed=True)
+    executable_end = payload.find(b"\0", 4)
+    if count <= 0 or executable_end <= 4:
+        return unread
+    offset = executable_end + 1
+    while offset < len(payload) and payload[offset] == 0:
+        offset += 1
+    words = payload[offset:].split(b"\0")
+    if len(words) <= count or not words[0]:
+        return unread
+    arguments = tuple(os.fsdecode(word) for word in words[:count])
+    setting: ProcessCodexHome | ProcessWithoutCodexHome = ProcessWithoutCodexHome()
+    for entry in words[count:]:
+        if not entry:
+            continue
+        key, separator, value = entry.partition(b"=")
+        if not separator or not key:
+            return unread
+        if key == b"CODEX_HOME":
+            setting = ProcessCodexHome(Path(os.fsdecode(value))) if value else ProcessWithoutCodexHome()
+    return MacProcessRecord(arguments, setting)
+
+
 def process_codex_home(pid: int) -> ProcessCodexHome | ProcessWithoutCodexHome | ProcessEnvironmentUnread:
     """Distinguish an absent variable from an unreadable process environment."""
     if sys.platform == "darwin":
-        try:
-            result = subprocess.run(
-                ("ps", "eww", "-o", "uid=,command=", "-p", str(pid)),
-                capture_output=True, text=True, timeout=5,
-            )
-        except (OSError, subprocess.TimeoutExpired) as error:
-            return ProcessEnvironmentUnread(str(error))
-        fields = result.stdout.split(maxsplit=1)
-        if result.returncode or len(fields) != 2 or fields[0] != str(os.getuid()):
-            return ProcessEnvironmentUnread("process environment could not be read")
-        words = fields[1].split()
-        if not any(word.startswith("HOME=") for word in words):
-            return ProcessEnvironmentUnread("process environment could not be read")
-        for word in reversed(words):
-            if word.startswith("CODEX_HOME="):
-                return ProcessCodexHome(Path(word.removeprefix("CODEX_HOME=")))
-        return ProcessWithoutCodexHome()
+        record = mac_process_record(pid)
+        return record.setting if isinstance(record, MacProcessRecord) else record
     try:
         environment = Path(f"/proc/{pid}/environ").read_bytes()
     except OSError as error:

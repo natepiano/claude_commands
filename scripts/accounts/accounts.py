@@ -5,7 +5,6 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-import ctypes
 import fcntl
 import json
 import math
@@ -18,7 +17,7 @@ import subprocess
 import sys
 import tempfile
 from concurrent.futures import ThreadPoolExecutor
-from collections.abc import Callable, Generator, Mapping, Sequence
+from collections.abc import Generator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta, timezone, tzinfo
@@ -903,6 +902,23 @@ def _setup_codex_home(label: str) -> list[str]:
                 f"accounts: cannot set up {label}: {_codex_folder(home)} already holds its login; "
                 + "two homes on one login break token refresh"
             ]
+    problems = _link_codex_home(label)
+    if not problems:
+        print(
+            f"Wait for {label} ({_codex_folder(destination)}) to finish its shared session index "
+            + "and answer initialize; an interrupted index can hold startup for 15 minutes, "
+            + f"then indexing must finish; limit {agent_accounts.CODEX_HOME_PREPARATION_SECONDS / 60:g} minutes.",
+            flush=True,
+        )
+        prepared = asyncio.run(agent_accounts.prepare_codex_home(destination))
+        if isinstance(prepared, agent_accounts.CodexHomePreparationFailed):
+            problems.append(f"accounts: {prepared.problem}")
+    return problems
+
+
+def _link_codex_home(label: str) -> list[str]:
+    """Prepare private storage and shared links without starting a Codex process."""
+    destination = codex_setup_home(label)
     if destination.is_symlink():
         return [f"accounts: {destination} is a link; an account home must be a real directory"]
     if destination.exists() and not destination.is_dir():
@@ -926,16 +942,6 @@ def _setup_codex_home(label: str) -> list[str]:
                 problems.append(f"accounts: {path} has no shared entry in ~/.codex")
         except OSError as error:
             problems.append(f"accounts: could not link {path}: {error}")
-    if not problems:
-        print(
-            f"Wait for {label} ({_codex_folder(destination)}) to finish its shared session index "
-            + "and answer initialize; an interrupted index can hold startup for 15 minutes, "
-            + f"then indexing must finish; limit {agent_accounts.CODEX_HOME_PREPARATION_SECONDS / 60:g} minutes.",
-            flush=True,
-        )
-        prepared = asyncio.run(agent_accounts.prepare_codex_home(destination))
-        if isinstance(prepared, agent_accounts.CodexHomePreparationFailed):
-            problems.append(f"accounts: {prepared.problem}")
     return problems
 
 
@@ -1886,11 +1892,12 @@ def resolve_history_label(label: str, at: str, *, login: str = "") -> ResolvedHi
     parsed = note_file.parse_account_label(label)
     if isinstance(parsed, note_file.NumberedAccountLabel):
         return ResolvedHistoryLabel(parsed.label)
-    if label not in ("default", "~/.claude", str(main_config_dir())):
+    tool: Literal["claude", "codex"] = "codex" if label in ("~/.codex", str(accounts_home() / ".codex")) else "claude"
+    if label not in ("default", f"~/.{tool}", str(accounts_home() / f".{tool}")):
         return HistoricalAccountUnresolved()
     if login:
-        parsed = note_file.parse_account_label(account.label_for("claude", login))
-        if isinstance(parsed, note_file.NumberedAccountLabel) and parsed.tool == "claude":
+        parsed = note_file.parse_account_label(account.label_for(tool, login))
+        if isinstance(parsed, note_file.NumberedAccountLabel) and parsed.tool == tool:
             return ResolvedHistoryLabel(parsed.label)
     try:
         rows = _read_json_object(accounts_config_file()).get("home_cutovers", [])
@@ -1909,7 +1916,7 @@ def resolve_history_label(label: str, at: str, *, login: str = "") -> ResolvedHi
             parsed = note_file.parse_account_label(number)
             if (end.tzinfo is not None and stamp < end
                     and (not login or row.get("login") == login)
-                    and isinstance(parsed, note_file.NumberedAccountLabel) and parsed.tool == "claude"):
+                    and isinstance(parsed, note_file.NumberedAccountLabel) and parsed.tool == tool):
                 evidence.append((end, parsed.label))
         if evidence:
             return ResolvedHistoryLabel(min(evidence)[1])
@@ -2074,23 +2081,10 @@ def _record_home_cutover(journal: HomeCutover) -> None:
 
 def _mac_process_arguments(pid: int) -> list[str]:
     """Read the kernel's NUL-separated argv, preserving spaces and prompt quotes."""
-    # KERN_PROCARGS2 returns argc, the executable path, padding, then argv.
-    query = (ctypes.c_int * 3)(1, 49, pid)  # CTL_KERN, KERN_PROCARGS2
-    buffer = ctypes.create_string_buffer(1024 * 1024)
-    size = ctypes.c_size_t(ctypes.sizeof(buffer))
-    sysctl = cast(Callable[[object, int, object, object, object, int], int],
-                  ctypes.CDLL(None, use_errno=True).sysctl)
-    if sysctl(query, 3, buffer, ctypes.byref(size), None, 0) != 0:
+    record = account.mac_process_record(pid)
+    if isinstance(record, account.ProcessEnvironmentUnread):
         raise AccountsError(f"accounts: cannot read process {pid} arguments; no identity moved")
-    payload = buffer.raw[:size.value]
-    count = int.from_bytes(payload[:4], sys.byteorder, signed=True)
-    executable_end = payload.find(b"\0", 4)
-    if count <= 0 or executable_end < 0:
-        raise AccountsError(f"accounts: cannot read process {pid} arguments; no identity moved")
-    arguments = payload[executable_end + 1:].lstrip(b"\0").split(b"\0")
-    if len(arguments) <= count or not arguments[0]:
-        raise AccountsError(f"accounts: cannot read process {pid} arguments; no identity moved")
-    return [os.fsdecode(word) for word in arguments[:count]]
+    return list(record.arguments)
 
 
 def _claude_process_ids() -> list[int]:
@@ -2287,12 +2281,154 @@ def _cutover_home_macos(label: str, *, undo: bool) -> None:
         _atomic_write(path, json.dumps(journal) + "\n")
 
 
+@dataclass(frozen=True)
+class CodexHomeProcess:
+    pid: int
+    command: str
+    setting: account.ProcessCodexHome | account.ProcessWithoutCodexHome | account.ProcessEnvironmentUnread
+
+
+def list_codex_home_processes() -> list[CodexHomeProcess]:
+    """Keep Codex argv and home selection, excluding environment text from diagnostics."""
+    command = (("ps", "-u", str(os.getuid()), "-o", "pid=,ucomm=")
+               if sys.platform == "darwin" else
+               ("ps", "-u", str(os.getuid()), "-o", "pid=,comm=,args="))
+    try:
+        listing = subprocess.run(command, capture_output=True, text=True, check=True, timeout=5)
+    except (OSError, subprocess.SubprocessError) as error:
+        raise AccountsError("accounts: cannot list Codex processes; no login moved") from error
+    found: list[CodexHomeProcess] = []
+    for line in listing.stdout.splitlines():
+        fields = line.split(maxsplit=1 if sys.platform == "darwin" else 2)
+        if len(fields) < 2 or not fields[0].isdigit():
+            continue
+        pid = int(fields[0])
+        executable = fields[1].strip()
+        if (executable if sys.platform == "darwin" else Path(executable).name) != "codex":
+            continue
+        setting: account.ProcessCodexHome | account.ProcessWithoutCodexHome | account.ProcessEnvironmentUnread
+        if sys.platform == "darwin":
+            record = account.mac_process_record(pid)
+            setting = account.process_codex_home(pid)
+            if isinstance(record, account.MacProcessRecord):
+                process_command = shlex.join(record.arguments)
+            else:
+                process_command = "codex"
+                setting = record
+        else:
+            process_command = fields[2] if len(fields) == 3 else executable
+            setting = account.process_codex_home(pid)
+        found.append(CodexHomeProcess(pid, process_command, setting))
+    return found
+
+
+def _codex_cutover_process_check(folder: Path) -> None:
+    problems: list[str] = []
+    for process in list_codex_home_processes():
+        setting = process.setting
+        if isinstance(setting, account.ProcessEnvironmentUnread):
+            problems.append(f"cannot read environment of process {process.pid} ({process.command})")
+            continue
+        selected = (setting.home if isinstance(setting, account.ProcessCodexHome)
+                    else accounts_home() / ".codex")
+        if selected.expanduser().resolve() == folder.resolve():
+            problems.append(f"process {process.pid} ({process.command}) uses {folder}")
+    if problems:
+        raise AccountsError("accounts: " + "; ".join(problems) + "; stop it, then rerun cutover-home")
+
+
+def cutover_codex_home(label: str, *, undo: bool = False) -> None:
+    """Rename only auth.json; durable intent lets either direction resume safely."""
+    label = numbered_account_label(label, "codex").label
+    source = accounts_home() / ".codex"
+    destination = codex_setup_home(label)
+    path = accounts_home() / ".local/state/accounts/cutover-codex-home.json"
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    with path.with_suffix(".lock").open("a") as lock:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        try:
+            raw = _read_json_object(path)
+        except FileNotFoundError:
+            raw = {}
+        if raw and not undo and raw.get("state") in ("complete", "undone") and _codex_home_login(source):
+            raw = {}
+        if raw:
+            if (not all(isinstance(raw.get(key), str) and raw[key] for key in ("label", "login", "at"))
+                    or raw.get("state") not in ("moving", "complete", "undoing", "undone")
+                    or not _label_is(str(raw.get("label")), "codex")):
+                raise AccountsError("accounts: Codex cutover journal is unreadable; no login moved")
+            if raw["label"] != label:
+                raise AccountsError("accounts: finish or undo the recorded cutover first")
+            if raw["state"] == ("undone" if undo else "complete"):
+                return
+            if not undo and raw["state"] == "undone":
+                raw = {}
+        home_auth, numbered_auth = source / "auth.json", destination / "auth.json"
+        _codex_cutover_process_check(destination if undo else source)
+        if source.is_symlink() or destination.is_symlink():
+            raise AccountsError("accounts: cutover homes must be real directories")
+        if not source.is_dir() or destination.exists() and not destination.is_dir():
+            raise AccountsError("accounts: cutover homes must be real directories")
+        if home_auth.is_symlink() or numbered_auth.is_symlink():
+            raise AccountsError("accounts: cutover identity files must not be links")
+        if any(path.exists() and not path.is_file() for path in (home_auth, numbered_auth)):
+            raise AccountsError("accounts: cutover identity files must be regular files")
+        if home_auth.exists() and numbered_auth.exists():
+            raise AccountsError(f"accounts: {source if undo else destination} already holds auth.json")
+        if not raw:
+            if undo:
+                raise AccountsError("accounts: no Codex cutover to undo")
+            expected = _account_note(label)
+            login = agent_accounts.codex_email_on_disk(source)
+            if not isinstance(expected, ExpectedAccountLogin) or not login:
+                raise AccountsError("accounts: cutover-home requires a readable account note and home login")
+            if expected.login.casefold() != login.casefold():
+                raise AccountsError(f"accounts: ~/.codex does not hold {label}'s login")
+            if numbered_auth.exists():
+                raise AccountsError(f"accounts: {destination} already holds auth.json")
+            journal = HomeCutover(label=label, login=login,
+                                  at=datetime.now(timezone.utc).isoformat(), state="moving")
+        else:
+            journal = cast(HomeCutover, cast(object, raw))
+        if undo:
+            journal["state"] = "undoing"
+            _atomic_write(path, json.dumps(journal) + "\n")
+            if numbered_auth.exists():
+                os.replace(numbered_auth, home_auth)
+            elif not home_auth.exists():
+                raise AccountsError("accounts: neither Codex home holds auth.json; no login moved")
+            journal["state"] = "undone"
+            _atomic_write(path, json.dumps(journal) + "\n")
+            return
+        if journal["state"] == "undoing":
+            raise AccountsError("accounts: finish undo before starting the Codex cutover again")
+        if raw and journal["state"] == "moving" and home_auth.exists():
+            login = agent_accounts.codex_email_on_disk(source)
+            if not login or login.casefold() != journal["login"].casefold():
+                raise AccountsError("accounts: ~/.codex now holds another login than the recorded cutover; undo it first")
+        if not home_auth.exists() and not numbered_auth.exists():
+            raise AccountsError("accounts: neither Codex home holds auth.json; no login moved")
+        if not raw:
+            _atomic_write(path, json.dumps(journal) + "\n")
+        problems = _link_codex_home(label)
+        if problems:
+            raise AccountsError("; ".join(problems))
+        if home_auth.exists():
+            os.replace(home_auth, numbered_auth)
+        _record_home_cutover(journal)
+        journal["state"] = "complete"
+        _atomic_write(path, json.dumps(journal) + "\n")
+
+
 def cutover_home(label: str = "", *, undo: bool = False) -> None:
     """Move the legacy home identity, retaining a recoverable intent before mutation.
 
     Credentials are only renamed. The identity block moves between atomic JSON
     replacements; the journal lets either direction resume after any replacement.
     """
+    if _label_is(label, "codex"):
+        cutover_codex_home(label, undo=undo)
+        return
     if sys.platform == "darwin":
         _cutover_home_macos(label, undo=undo)
         return
@@ -3144,6 +3280,8 @@ def codex_statuses(workers_home: Path) -> list[CodexStatus]:
         folder = _codex_folder(home)
         safe = not home.is_symlink() and not (home / "auth.json").is_symlink()
         login = _codex_home_login(home)
+        if home == accounts_home() / ".codex" and not login:
+            continue
         label = codex_home_label(home)
         match = re.fullmatch(r"\.codex([1-9][0-9]*)", home.name) if home.parent == accounts_home() else None
         problems = _check_codex_home(label, workers_home) if _label_is(label, "codex") else _check_default_codex_home(workers_home) if home == accounts_home() / ".codex" else []
@@ -3402,6 +3540,8 @@ def status_report(*, detail: bool = False) -> str:
         *role_problems,
         *([f"~/.claude holds a login; {home_step}"]
           if account.claude_account(main_config_dir()) is not None else []),
+        *([f"~/.codex holds a login; run accounts.py cutover-home {home_account_label('codex')}"]
+          if _codex_home_login(accounts_home() / ".codex") else []),
         *(note for status in statuses for note in _status_notes(status, detail=detail)),
         *(problem for status in codex for problem in status.problems),
         *(f"{status.folder}: unclassified: {', '.join(status.unclassified)}"
@@ -3622,6 +3762,8 @@ def main(argv: list[str]) -> int:
         if options.action == "cutover-home":
             try:
                 cutover_home(options.label, undo=bool(getattr(options, "undo", False)))
+            except AccountsError:
+                raise
             except (OSError, ValueError) as error:
                 raise AccountsError(f"accounts: cutover-home: {error}") from error
             return 0

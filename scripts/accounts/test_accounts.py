@@ -113,10 +113,6 @@ class RoleWriteTime(datetime):
         return cls(2026, 10, 8, tzinfo=timezone.utc).astimezone(tz)
 
 
-# The Codex home's row when nothing is signed in to it.
-CODEX_HOME_ROW = ("~/.codex", "~/.codex", "not logged in", "spare", *("—",) * 5)
-
-
 @final
 class AccountsTests(unittest.TestCase):
     def __init__(self, methodName: str = "runTest") -> None:
@@ -2080,7 +2076,7 @@ class AccountsTests(unittest.TestCase):
     ) -> agent_accounts.Report:
         return agent_accounts.Report("Claude", email=login, quotas=[weekly], five_hour=five_hour)
 
-    def test_status_table_has_a_row_for_every_folder_logged_in_or_not(self) -> None:
+    def test_status_table_lists_numbered_folders_but_omits_the_signed_out_shared_codex_home(self) -> None:
         self.write_main_config()
         self.login_directory("claude2", "main@example.invalid", default=True)
         self.login_directory("claude3", "unit@example.invalid")
@@ -2109,7 +2105,6 @@ class AccountsTests(unittest.TestCase):
             ("~/.claude3", "claude3", "unit@example.invalid", "units",
              "12%", weekly_cell, "—", "—", read_cell),
             ("~/.claude4", "claude4", "not logged in", "", *("—",) * 5),
-            CODEX_HOME_ROW,
         ])
         self.assertIn("PDT", read_cell + weekly_cell)
         self.live_reads.assert_not_called()
@@ -2161,8 +2156,8 @@ class AccountsTests(unittest.TestCase):
 
         self.assertEqual((result, stderr), (0, ""))
         lines = [line for line in stdout.split("\n\n")[0].splitlines() if line.startswith("|")]
-        # The heading, the rule, the default folder, and the Codex home.
-        self.assertEqual(len(lines), 4)
+        # The heading, the rule, and the numbered Claude folder.
+        self.assertEqual(len(lines), 3)
         self.assertEqual(len({len(line) for line in lines}), 1)
         self.assertEqual(set(lines[1]), {"|", " ", "-"})
         self.assertEqual([cell.strip() for cell in lines[2].strip("|").split("|")][:4], ["~/.claude2", "claude2", "main@example.invalid", ""])
