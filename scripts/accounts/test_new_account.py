@@ -17,6 +17,32 @@ import agent_accounts
 import note_file
 
 
+def shipped_color_expectations(text: str) -> tuple[str, str, bytes]:
+    account_colors: set[str] = set()
+    role_colors: set[str] = set()
+    account_lines: list[str] = []
+    for line in text.splitlines(keepends=True):
+        key, separator, value = line.split("#", 1)[0].strip().partition("=")
+        key = key.strip()
+        if separator and key.startswith(("account.", "role.")):
+            if key.startswith("account."):
+                account_colors.add(value.strip())
+                account_lines.append(line)
+            else:
+                role_colors.add(value.strip())
+    available = [color for color in new_account.STATUSLINE_PALETTE
+                 if color not in new_account.STATUSLINE_EXCLUDED_COLORS and color not in account_colors]
+    # Once distinct colors run out, new accounts may share the existing role colors.
+    free = [color for color in available if color not in role_colors]
+    free.extend(color for color in available if color in role_colors)
+    return free[0], free[1], account_lines[-1].encode("utf-8")
+
+
+SHIPPED_STATUSLINE = (Path(__file__).resolve().parents[2] / "config/statusline.conf").read_bytes()
+FIRST_FREE_COLOR, SECOND_FREE_COLOR, LAST_SHIPPED_ACCOUNT_LINE = shipped_color_expectations(
+    SHIPPED_STATUSLINE.decode("utf-8"))
+
+
 class NewAccountTests(unittest.TestCase):
     def __init__(self, methodName: str = "runTest") -> None:
         super().__init__(methodName)
@@ -50,8 +76,7 @@ class NewAccountTests(unittest.TestCase):
         _ = nightly.write_text(json.dumps({"permissions": {"deny": ["Edit(~/.claude/**)"]}}))
         self.colors = self.home / ".claude/config/statusline.conf"
         self.colors.parent.mkdir()
-        shipped = Path(__file__).resolve().parents[2] / "config/statusline.conf"
-        _ = self.colors.write_bytes(shipped.read_bytes())
+        _ = self.colors.write_bytes(SHIPPED_STATUSLINE)
 
     def write_settings(self, folders: list[str]) -> None:
         settings = {
@@ -176,28 +201,33 @@ class NewAccountTests(unittest.TestCase):
         self.assertTrue(stdout.endswith("claude4 is ready; /showrunner:accounts shows its row.\n"))
         self.assertIsInstance(accounts.account_directory_readiness("claude4"), accounts.AccountDirectoryReady)
 
-    def test_new_claude_account_inserts_pink_after_the_last_shipped_account_without_changing_other_bytes(self) -> None:
+    def test_new_claude_account_inserts_the_first_free_color_after_the_last_shipped_account_without_changing_other_bytes(self) -> None:
         before = self.colors.read_bytes()
 
         _, stdout, stderr = self.run_cli("claude5")
 
         self.assertEqual(stderr, "")
-        self.assertIn("done: status line color pink for claude5", stdout)
+        self.assertIn(f"done: status line color {FIRST_FREE_COLOR} for claude5", stdout)
         self.assertLess(stdout.index("nightly review cannot edit ~/.claude5"),
-                        stdout.index("status line color pink for claude5"))
+                        stdout.index(f"status line color {FIRST_FREE_COLOR} for claude5"))
         self.assertEqual(self.colors.read_bytes(), before.replace(
-            b"account.claude4=orange\n",
-            b"account.claude4=orange\naccount.claude5=pink\n", 1))
+            LAST_SHIPPED_ACCOUNT_LINE,
+            LAST_SHIPPED_ACCOUNT_LINE + f"account.claude5={FIRST_FREE_COLOR}\n".encode("utf-8"), 1))
 
-    def test_next_claude_account_gets_teal_after_pink_is_taken(self) -> None:
+    def test_next_claude_account_gets_the_second_free_color_after_the_first_is_taken(self) -> None:
+        before = self.colors.read_bytes()
         first = new_account.statusline_color_step(new_account.parse_account("claude", "claude5"))
 
         second = new_account.statusline_color_step(new_account.parse_account("claude", "claude6"))
 
         self.assertTrue(first.done, first.text)
         self.assertTrue(second.done, second.text)
-        self.assertEqual(second.text, "status line color teal for claude6")
-        self.assertIn(b"account.claude5=pink\naccount.claude6=teal\n", self.colors.read_bytes())
+        self.assertEqual(first.text, f"status line color {FIRST_FREE_COLOR} for claude5")
+        self.assertEqual(second.text, f"status line color {SECOND_FREE_COLOR} for claude6")
+        self.assertEqual(self.colors.read_bytes(), before.replace(
+            LAST_SHIPPED_ACCOUNT_LINE,
+            LAST_SHIPPED_ACCOUNT_LINE + (f"account.claude5={FIRST_FREE_COLOR}\n"
+                + f"account.claude6={SECOND_FREE_COLOR}\n").encode("utf-8"), 1))
 
     def test_adding_an_account_color_preserves_restrictive_config_permissions_under_a_looser_umask(self) -> None:
         before = self.colors.read_bytes()
@@ -212,7 +242,7 @@ class NewAccountTests(unittest.TestCase):
                     _ = os.umask(previous_umask)
 
                 self.assertTrue(step.done, step.text)
-                self.assertIn("account.claude5=pink\n", self.colors.read_text(encoding="utf-8"))
+                self.assertIn(f"account.claude5={FIRST_FREE_COLOR}\n", self.colors.read_text(encoding="utf-8"))
                 self.assertEqual(stat.S_IMODE(self.colors.stat().st_mode), mode)
 
     def test_existing_account_color_is_reported_without_rewriting_the_file(self) -> None:
@@ -225,7 +255,7 @@ class NewAccountTests(unittest.TestCase):
             repeated = new_account.statusline_color_step(account)
 
         self.assertTrue(repeated.done, repeated.text)
-        self.assertEqual(repeated.text, "status line color pink for claude5")
+        self.assertEqual(repeated.text, f"status line color {FIRST_FREE_COLOR} for claude5")
         self.assertEqual(repeated, first)
         self.assertEqual(self.colors.read_bytes(), before)
         self.assertEqual((self.colors.stat().st_ino, self.colors.stat().st_mtime_ns),
