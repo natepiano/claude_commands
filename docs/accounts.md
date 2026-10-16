@@ -12,7 +12,7 @@ The status line's first row shows this session's account label, after its role. 
 
 ## Every account in one table
 
-`/showrunner:accounts` prints one table: a row for each numbered `~/.claudeN`, logged in or not; `~/.claude` is the shared config home and has no account row, then a row for `~/.codex` and each `~/.codexN`. Noted accounts whose home is absent or blocked by a file or broken link, and whose login no home holds, get `not set up` rows. In a terminal:
+`/showrunner:accounts` prints one table: a row for each numbered `~/.claudeN`, logged in or not; `~/.claude` is the shared config home and has no account row, then a row for each `~/.codexN`. The legacy `~/.codex` has a row only while it holds a login. Noted accounts whose home is absent or blocked by a file or broken link, and whose login no home holds, get `not set up` rows. In a terminal:
 
 ```sh
 ~/.claude/scripts/lib/py ~/.claude/scripts/accounts/accounts.py status
@@ -59,7 +59,7 @@ These aliases come from natedev's shell configuration after a rebuild; the Mac h
 
 For Claude labels and groups, arguments pass through to `claude`. Every Claude launch sets `CLAUDE_CONFIG_DIR` to a numbered folder; claude2 uses `~/.claude2` just like the other accounts. `--probe` goes before the label: `accounts.py exec --probe claude3 -n check-idle` sets `CLAUDE_PROBE_SESSION=1` for a throwaway session. Its shutdown record always has `probe: true` and `alerts: "none"`; restart and move preserve the marker. Even a direct `send.py --to user` from that session sends no phone push.
 
-For `codexN` or `workers`, arguments pass through to `codex` and the launch sets `CODEX_HOME` to the home holding that account's login: today codex2 uses `~/.codex` and codex1 uses `~/.codex1`. The `codex1`, `codex2` and bare `codex` aliases are being added to the shell configuration; bare `codex` will follow `exec workers`. `--probe` applies only to Claude accounts.
+For `codexN` or `workers`, arguments pass through to `codex` and the launch sets `CODEX_HOME` to the home holding that account's login. After the Codex cutover, codex2 uses `~/.codex2` and codex1 uses `~/.codex1`. The `codex1`, `codex2` and bare `codex` shell aliases follow these launchers; bare `codex` follows `exec workers`. `--probe` applies only to Claude accounts.
 
 Configuration decides the account every launch starts on: new, standby and resumed units and nightly reviews use the units account; new and resumed showrunners use the showrunners account. Set a group with `accounts.py move units|showrunners claudeN`. An unconfigured group refuses with that command; an `--account` or `--config-dir` override must name its configured account. New unit launches use herdr panes carrying the selected account variables; legacy tmux options remain available for observation and model recovery, and never choose a resume account. Every selected account runs in its own numbered folder, with the shared memory directory set to `~/.claude`. The launch removes any inherited OAuth token. Commands accept account numbers and the launch groups; `default` refuses.
 
@@ -143,7 +143,19 @@ After the new login is checked, exit that session and run this in a Terminal on 
 
 The command checks that the new and legacy logins are the same account before changing anything. It keeps the shared seed's other settings, removes its `oauthAccount`, and removes only the old local `Claude Code-credentials` keychain copy by service name. The server login is untouched. Never `/logout`. Named-folder usage readings use that folder's own keychain entry and never fall back to the old copy. An interrupted cutover can be finished by rerunning the command. On the Mac, `--undo` restores the home identity settings; signing in to `~/.claude` again requires `/login`, as its output explains.
 
-Historical `default` or `~/.claude` records resolve from their own login or a dated cutover entry in `config/accounts.json`, covering only records before that cutover. Without evidence they stay unresolved; today's login never names a past record. A resolved resume uses the numbered account's folder.
+Historical `default`, `~/.claude` or `~/.codex` records resolve from their own login or a dated cutover entry in `config/accounts.json`, covering only records before that cutover and matching the tool. Without evidence they stay unresolved; today's login never names a past record. A resolved resume uses the numbered account's folder.
+
+### Moving the Codex login
+
+On each machine, stop every Codex process using `~/.codex`, including its long-lived app-server daemon, then run:
+
+```sh
+~/.claude/scripts/lib/py ~/.claude/scripts/accounts/accounts.py cutover-home codex2
+```
+
+The command verifies the account note, prepares the numbered home's shared links, and renames only `auth.json`; it never copies credentials or runs Codex. A live process on the source, or an unreadable process environment, refuses the move with its pid and the step to stop it. The private `cutover-codex-home.json` journal lets a rerun finish after an interruption. A completed rerun changes nothing. `cutover-home codex2 --undo` renames the login back after all processes on `~/.codex2` stop; bare `cutover-home --undo` still applies to Claude.
+
+After this cutover on natedev and the Mac, `~/.codex` holds no login on either machine and remains the shared configuration and session store. Running the Codex executable without `CODEX_HOME` is signed out; the `codex` alias (`accounts.py exec workers`) still selects the mapped numbered home. Until cutover, status prints `~/.codex holds a login; run accounts.py cutover-home codex2`; afterwards that home has no account row.
 
 ## Move a session
 
@@ -254,7 +266,7 @@ Run the printed command in a terminal and sign in as codex1:
 CODEX_HOME=~/.codex1 codex login
 ```
 
-Keep `CODEX_HOME` on that command. Without it, `codex login` signs `~/.codex` out and in, leaving its workers unable to work until login finishes; workers always use their mapped account.
+Keep `CODEX_HOME` on that command so the login stays in the numbered home; workers always use their mapped account. Do not sign in to the shared `~/.codex` home.
 
 Then run `/showrunner:accounts`. The new home's row shows `spare` and its own numbers until selected for workers. To check the home directly, use `/showrunner:accounts check codex1`. Problems under the table name missing, broken or replaced shared links, the wrong login, or a login held by another home; `--detail` also lists unknown entries. Keep each login in one home: two homes on one login break token refresh.
 
