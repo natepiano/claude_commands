@@ -230,7 +230,7 @@ Moved to unit `herdr-panes-unit`, run in parallel with Phase 5; shipped as `docs
 - Matching pane ids from environments, because sessions sharing one scope can reuse the same ids.
 - Treating membership in a hold's `request_ids` as permission to release it; opening a window on every attached herdr restart, since the existing client already shows the session.
 
-### Phase 9 — One restore: agents restart after a crash  · status: todo
+### Phase 9 — One restore: agents restart after a crash  · status: done
 
 **Depends on:** Phase 8
 
@@ -254,6 +254,7 @@ Moved to unit `herdr-panes-unit`, run in parallel with Phase 5; shipped as `docs
    Shared observations are collected once per pass for every account. The desktop map comes from the existing vault snapshot (`_snapshot_desktops(refresh=False)`, 1234): one pass never runs `agent-sessions-snapshot`, whose run refreshes account notes, prunes and commits. Timer enablement and pause and footer restoration intent are read without `conversation_pause.release` (`settle._pause_timers` 364 releases) and without stopping a timer. A partial observation never replaces recovery data, and unreadable liveness never means a session is absent.
 2. Recovery snapshot (`record.py`): `RecoverySnapshot {machine, login (canonical), taken_at, sessions: list[SnapshotSession]}`, one file per login at `<shutdown state>/snapshots/<login>.json` (temporary file, then rename; `_safe_login` applies). `SnapshotSession` holds the owner `Session`, its workers, its timer restores, `last_seen` and `state: "running" | "unresolved"`.
    - `shutdown.py snapshot`: a `PartialInventory` keeps every previous file and exits 1 naming the sources. A complete inventory rewrites each login's file: sessions seen now are `running`; a previous session not seen now becomes `unresolved` with its `last_seen` kept. A readable empty inventory never drops a populated snapshot's sessions: they stay `unresolved`, across reboot (the state directory is on disk).
+   - **Crash signal (showrunner, option 1, 2026-10-15).** Only a session that vanished with a crash signal is restored: the boot id changed, or its host is gone (the herdr or tmux server, or the terminal window process). A session whose host is still alive ended on its own and is dropped. Sessions stopped by `agents down` come back through shutdown's own record, never through the snapshot; the two paths stay separate. Tests cover reboot, host loss and a clean exit.
    - A session leaves the snapshot only when acknowledged: `agents restart` restored it (Spec 3), or `agents forget <name|id>` (`shutdown.py forget`) retired it. `agents status` lists unresolved sessions with their `last_seen` in the user zone.
    - Running `snapshot` changes nothing in any session.
 3. `shutdown.py restart` and internal `up` (`restart._up`, 1855) choose sources per session id:
@@ -271,8 +272,11 @@ Moved to unit `herdr-panes-unit`, run in parallel with Phase 5; shipped as `docs
    - `agent-sessions-restore.py` and its wrapper (`agent-sessions.nix` 50–64) are removed once this phase merges and its live check passes.
    - The `agents` wrapper gains `forget`.
 
+6. **Standalone launches choose an account (two-accounts, 2026-10-15).** After two-accounts' Phase 32 cutover `~/.claude` holds no login. `herdr_sessions.py start` calls `accounts.account_for_unscoped_launch(os.environ)` (two-accounts Phase 31, 69952e72) before any herdr server or pane starts: `AccountsError` refuses with its message; `LegacyHomeLaunch` sets nothing; otherwise the pane gets `named_account_environment(selected.dir)` and trust is checked against that account's folder. An explicit `--config-dir` keeps priority. Delivered by two-accounts in its merge 7288c1b5 (resolving Phase 31 against Phases 7–8), which reached build-followups beside 69952e72; this branch takes it by merging build-followups right after the Phase 9 checkpoint, and that merge's gate runs both units' tests. two-accounts holds `cutover-home` until that merge lands.
+
 **Files:**
 - `scripts/message/sessions.py` — registry read with unreadable paths.
+- `scripts/herdr/herdr_sessions.py`, `scripts/herdr/test_herdr_sessions.py` — account resolution through the shared resolver (Spec 6).
 - `scripts/message/test_sessions.py` — an unreadable directory and record reported.
 - `scripts/shutdown/inventory.py` — `snapshot_inventory`, shared observations once, read-only timer and pause intent.
 - `scripts/shutdown/test_inventory.py` — each source failure makes a `PartialInventory`; a faulted production never yields a standalone; no `release` and no snapshotter run.
@@ -293,9 +297,35 @@ Moved to unit `herdr-panes-unit`, run in parallel with Phase 5; shipped as `docs
 
 **Acceptance gate:** `python3 -m unittest discover` for `scripts/message` and `scripts/shutdown` green; `basedpyright scripts/message scripts/shutdown` prints `0 errors, 0 warnings`. Live (not a test), after the user's rebuild: `shutdown.py snapshot` writes one file per login and changes no session; a throwaway herdr session `herdr-crash-check` (`herdr-claude --name herdr-crash-check` in a trusted scratch folder) is in it; with no shutdown record, stopping its herdr server by hand (`herdr --session herdr-crash-check server stop`, the crash) and running `snapshot` again leaves it `unresolved`; `agents restart` brings it back in herdr, prints `from snapshot taken ...`, answers a question about its earlier turn, and leaves it out of the snapshot. Remove the check session afterwards.
 
-### Phase 10 — Remove tmux from productions and sessions on Linux  · status: todo
+### Phase 10 — Phase 9 follow-ups: crash restore wording, status heading, failed herdr start  · status: todo
 
-**Depends on:** Phase 7, Phase 8, Phase 9
+**Depends on:** Phase 9
+
+**User sees:** before — `agents status` prints a crashed natedev session under the Mac's heading; a session restored after a crash is told it was restarted after `/shutdown`; a restore whose Claude exits at once waits 90 s and leaves an empty herdr session behind. After — the crashed session is listed under its own machine, the restored session is told it came back after a crash, and a failed start is reported at once with its new herdr session removed.
+
+Found by the Phase 9 live check (2026-10-15) after the third repair round; moved here under the landing rule.
+
+#### Work Order
+
+**Goal:** the three Phase 9 restore defects above are fixed, each with a regression test.
+
+**Spec:**
+1. `shutdown.py status` (text form) prints `_unresolved_snapshot_lines` for the local machine inside the local machine's section (the report at index 0), not after the last machine's section. Recovery snapshots are machine-local, so a remote section never carries them.
+2. `restart.restart_note` gives a record materialized from a recovery snapshot (`requested_by` kind `snapshot`) its own opening: restored after a crash, naming the crash signal the snapshot recorded (reboot, or its host was lost) and the last-seen time in the user zone, never "after /shutdown" or a stop time. The rest of the note (pending messages, keep waiting on the user) stays.
+3. A herdr restart whose agent process exits before startup completes is reported as soon as it exits, not after the start timeout, and the herdr server that restart opened for it is stopped, as the Codex restore already does for its failed start (Phase 9 F005). A server the session already had is left alone.
+
+**Files:**
+- `scripts/shutdown/shutdown.py`, `scripts/shutdown/test_shutdown_cli.py` — Spec 1.
+- `scripts/shutdown/restart.py`, `scripts/shutdown/test_restart.py` — Specs 2 and 3.
+- `scripts/herdr/herdr.py`, `scripts/herdr/test_herdr.py` — Spec 3, if the early exit is detected in `start_agent`.
+
+**Workers:** 1 writer; one file set.
+
+**Acceptance gate:** `merge_gate.py --tests-only` green and `basedpyright scripts/message scripts/shutdown scripts/herdr` prints `0 errors, 0 warnings`. Live: repeat Phase 9's crash check and read the restored session's first prompt and `agents status` placement; restore a snapshot session whose transcript is missing and see the failure reported within seconds with no herdr session left.
+
+### Phase 11 — Remove tmux from productions and sessions on Linux  · status: todo
+
+**Depends on:** Phase 7, Phase 8, Phase 9, Phase 10
 
 **Blocked by:** `shutdown.py tmux-free` (Spec 2) exits 0 on natedev: tmux answers and lists no session, every herdr source answers, and every account's inventory is complete with no session on a tmux or unknown host. `unit_lookup.every_marked_unit` alone is no proof: it returns partial results when one host answers (253–272).
 
@@ -398,6 +428,6 @@ Move them at their next idle points rather than waiting for productions to end, 
 
 **Acceptance gate:** `python3 -m unittest discover` for `scripts/production`, `scripts/shutdown`, `scripts/message`, `scripts/hooks`, `scripts/nightly_review` and `scripts/herdr` green; `basedpyright scripts/production scripts/shutdown scripts/message scripts/hooks scripts/nightly_review scripts/herdr` prints `0 errors, 0 warnings`; `grep -rln tmux scripts/production scripts/shutdown scripts/message commands/showrunner` names only lines kept on purpose (legacy-record parsing and its manual commands), each listed in the phase report. Tests cover the standalone tmux migration (Spec 1) and legacy hosts and leftovers in records and snapshots through parsing, `status`, `now` and restart, never as herdr names and never cleared silently. The phase report quotes `tmux-free`'s passing output from before Spec 4.
 
-### Phase 11 — herdr on the Mac  · status: moved
+### Phase 12 — herdr on the Mac  · status: moved
 
-Moved to its own unit (showrunner, 2026-10-15): `docs/plans/build-followups-herdr-mac.md`. It starts after Phase 10 merges.
+Moved to its own unit (showrunner, 2026-10-15): `docs/plans/build-followups-herdr-mac.md`. It starts after Phase 11 merges.
